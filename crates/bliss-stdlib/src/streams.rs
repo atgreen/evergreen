@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{type_id, ObjectHeader};
-use bliss_rt::value::{BlissVal, EOF, NIL, T, TAG_HEAP_OBJECT};
+use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
 // ── Gray streams protocol ──────────────────────────────────────────
 
@@ -81,7 +81,7 @@ enum StreamInner {
         output: BlissVal,
     },
     Synonym {
-        symbol: BlissVal,
+        _symbol: BlissVal,
     },
 }
 
@@ -501,7 +501,7 @@ pub fn make_echo_stream(input: BlissVal, output: BlissVal) -> Result<BlissVal, B
 }
 
 pub fn make_synonym_stream(symbol: BlissVal) -> Result<BlissVal, BlissError> {
-    Ok(alloc_stream(StreamInner::Synonym { symbol }))
+    Ok(alloc_stream(StreamInner::Synonym { _symbol: symbol }))
 }
 
 // ── Stream queries ─────────────────────────────────────────────────

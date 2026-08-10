@@ -14,9 +14,9 @@ use std::collections::HashSet;
 struct RestartEntry {
     name: BlissVal,
     function: BlissVal,
-    report_function: Option<BlissVal>,
+    _report_function: Option<BlissVal>,
     interactive_function: Option<BlissVal>,
-    test_function: Option<BlissVal>,
+    _test_function: Option<BlissVal>,
 }
 
 /// Per-thread condition system state.
@@ -147,7 +147,7 @@ pub fn error_condition(condition: BlissVal) -> Result<(), BlissError> {
     });
 
     // Check if any handler handles this condition
-    let mut handled = false;
+    let handled = false;
     for frame in handlers.iter().rev() {
         for (condition_type, handler_fn) in frame {
             if condition_type_matches(condition, *condition_type) {
@@ -185,9 +185,9 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
     let continue_restart = RestartEntry {
         name: BlissVal::from_symbol_index(0), // symbol for CONTINUE
         function: BlissVal::from_fixnum(0),    // identity function
-        report_function: None,
+        _report_function: None,
         interactive_function: None,
-        test_function: None,
+        _test_function: None,
     };
 
     STATE.with(|s| {
@@ -199,7 +199,7 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
         s.borrow().handler_stack.clone()
     });
 
-    let mut handled = false;
+    let handled = false;
     for frame in handlers.iter().rev() {
         for (condition_type, handler_fn) in frame {
             if condition_type_matches(condition, *condition_type) {
@@ -227,9 +227,9 @@ pub fn warn_condition(_condition: BlissVal) -> Result<(), BlissError> {
     let muffle_restart = RestartEntry {
         name: BlissVal::from_symbol_index(1), // symbol for MUFFLE-WARNING
         function: BlissVal::from_fixnum(0),
-        report_function: None,
+        _report_function: None,
         interactive_function: None,
-        test_function: None,
+        _test_function: None,
     };
 
     STATE.with(|s| {
@@ -334,9 +334,9 @@ pub fn restart_bind(
             state.restart_registry.push(RestartEntry {
                 name: spec.name,
                 function: spec.function,
-                report_function: spec.report_function,
+                _report_function: spec.report_function,
                 interactive_function: spec.interactive_function,
-                test_function: spec.test_function,
+                _test_function: spec.test_function,
             });
         }
     });

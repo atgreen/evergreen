@@ -45,7 +45,7 @@ fn stream_io_error_fields() {
 
 #[test]
 fn end_of_file_field() {
-    match &StdlibError::EndOfFile { stream: "s".into() } {
+    match &(StdlibError::EndOfFile { stream: "s".into() }) {
         StdlibError::EndOfFile { stream } => assert_eq!(stream, "s"),
         _ => panic!("wrong variant"),
     }
@@ -92,7 +92,7 @@ fn format_error_fields() {
 
 #[test]
 fn clos_error_field() {
-    match &StdlibError::ClosError { message: "no method".into() } {
+    match &(StdlibError::ClosError { message: "no method".into() }) {
         StdlibError::ClosError { message } => assert_eq!(message, "no method"),
         _ => panic!("wrong variant"),
     }
@@ -138,7 +138,7 @@ fn sequence_bounds_error_fields() {
 
 #[test]
 fn hash_table_error_field() {
-    match &StdlibError::HashTableError { message: "bad".into() } {
+    match &(StdlibError::HashTableError { message: "bad".into() }) {
         StdlibError::HashTableError { message } => assert_eq!(message, "bad"),
         _ => panic!("wrong variant"),
     }
@@ -146,7 +146,7 @@ fn hash_table_error_field() {
 
 #[test]
 fn sort_error_field() {
-    match &StdlibError::SortError { message: "bad pred".into() } {
+    match &(StdlibError::SortError { message: "bad pred".into() }) {
         StdlibError::SortError { message } => assert_eq!(message, "bad pred"),
         _ => panic!("wrong variant"),
     }
@@ -154,7 +154,7 @@ fn sort_error_field() {
 
 #[test]
 fn print_not_readable_field() {
-    match &StdlibError::PrintNotReadable { object: "#<fn>".into() } {
+    match &(StdlibError::PrintNotReadable { object: "#<fn>".into() }) {
         StdlibError::PrintNotReadable { object } => assert_eq!(object, "#<fn>"),
         _ => panic!("wrong variant"),
     }
@@ -294,7 +294,7 @@ fn unicode_string_fields() {
 
 #[test]
 fn sequence_bounds_zero_length_zero_index() {
-    match &StdlibError::SequenceBoundsError { sequence_length: 0, index: 0 } {
+    match &(StdlibError::SequenceBoundsError { sequence_length: 0, index: 0 }) {
         StdlibError::SequenceBoundsError { sequence_length, index } => {
             assert_eq!(*sequence_length, 0);
             assert_eq!(*index, 0);
@@ -305,7 +305,7 @@ fn sequence_bounds_zero_length_zero_index() {
 
 #[test]
 fn format_error_max_position() {
-    match &StdlibError::FormatError { control_string: "x".into(), position: usize::MAX, message: "m".into() } {
+    match &(StdlibError::FormatError { control_string: "x".into(), position: usize::MAX, message: "m".into() }) {
         StdlibError::FormatError { position, .. } => assert_eq!(*position, usize::MAX),
         _ => panic!("wrong variant"),
     }

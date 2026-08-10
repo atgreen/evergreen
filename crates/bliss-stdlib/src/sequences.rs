@@ -5,7 +5,7 @@
 
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{ConsCell, ObjectHeader, type_id};
-use bliss_rt::value::{BlissVal, NIL, T, TAG_CONS, TAG_HEAP_OBJECT, TAG_MASK};
+use bliss_rt::value::{BlissVal, NIL};
 
 // ── Internal helpers ──────────────────────────────────────────────
 
@@ -687,7 +687,7 @@ pub fn substitute(
 
 /// Compare two BlissVals using predicate. T means < for fixnums.
 fn compare_with_predicate(
-    predicate: BlissVal,
+    _predicate: BlissVal,
     key: Option<BlissVal>,
     a: BlissVal,
     b: BlissVal,
