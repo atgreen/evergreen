@@ -1,7 +1,7 @@
 //! Tests for OSR (on-stack replacement) and deoptimisation — osr.rs
 
 use bliss_compiler::osr::{DeoptConfig, DeoptLog, DeoptReason, deoptimize, osr_entry};
-use bliss_rt::value::{NIL, T};
+use bliss_rt::value::{BlissVal, NIL, T, TAG_FUNCTION};
 
 // ── DeoptReason enum variants ─────────────────────────────────────
 
@@ -93,34 +93,44 @@ fn deopt_config_fields() {
 
 #[test]
 fn deoptimize_returns_result() {
-    let result = std::panic::catch_unwind(|| {
-        deoptimize(NIL, DeoptReason::InlineCacheOverflow, &[T, NIL])
-    });
-    // deoptimize currently calls unimplemented!(); once implemented it should
-    // return Ok(()). Either outcome is acceptable — what matters is the test
-    // will go green (no panic) when the function is fully implemented.
-    assert!(
-        result.is_err() || result.unwrap().is_ok(),
-        "deoptimize should either panic (unimplemented) or return Ok"
-    );
+    bliss_compiler::osr::clear_global_deopt_logs();
+    // Use a function-tagged value so validation passes.
+    let func = BlissVal(TAG_FUNCTION);
+    let result = deoptimize(func, DeoptReason::InlineCacheOverflow, &[T, NIL]);
+    assert!(result.is_ok(), "deoptimize with function-tagged value should return Ok");
+}
+
+#[test]
+fn deoptimize_rejects_non_function() {
+    // NIL is not function-tagged; deoptimize should return Err.
+    let result = deoptimize(NIL, DeoptReason::InlineCacheOverflow, &[T, NIL]);
+    assert!(result.is_err(), "deoptimize with non-function value should return Err");
 }
 
 #[test]
 fn osr_entry_with_valid_map() {
     use bliss_compiler::osr::{OsrEntryMap, LocalMapping};
+    bliss_compiler::osr::clear_global_deopt_logs();
     let map = OsrEntryMap::new(
         vec![LocalMapping { local_index: 0, ssa_var: 0 }],
         0,
     );
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        osr_entry(NIL, &map, &[NIL])
-    }));
-    // osr_entry currently calls unimplemented!(); once implemented it should
-    // return Ok(()). Either outcome is acceptable for red-phase.
-    assert!(
-        result.is_err() || result.unwrap().is_ok(),
-        "osr_entry should either panic (unimplemented) or return Ok"
+    // Use a function-tagged value so validation passes.
+    let func = BlissVal(TAG_FUNCTION);
+    let result = osr_entry(func, &map, &[NIL]);
+    assert!(result.is_ok(), "osr_entry with function-tagged value should return Ok");
+}
+
+#[test]
+fn osr_entry_rejects_non_function() {
+    use bliss_compiler::osr::{OsrEntryMap, LocalMapping};
+    let map = OsrEntryMap::new(
+        vec![LocalMapping { local_index: 0, ssa_var: 0 }],
+        0,
     );
+    // NIL is not function-tagged; osr_entry should return Err.
+    let result = osr_entry(NIL, &map, &[NIL]);
+    assert!(result.is_err(), "osr_entry with non-function value should return Err");
 }
 
 // ── OsrEntryMap::enter ───────────────────────────────────────────
