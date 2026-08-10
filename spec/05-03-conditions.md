@@ -25,12 +25,13 @@ binding and dispatch, restart machinery, signalling protocol (`SIGNAL`,
 | R5.102 | `SIGNAL` MUST search handlers, invoke matching handlers (non-unwound), and return `NIL` if no handler transfers control. |
 | R5.103 | `ERROR` MUST signal and, if no handler transfers control, enter the debugger. It MUST NOT return. |
 | R5.104 | `WARN` MUST signal a `WARNING`; if the `MUFFLE-WARNING` restart is invoked the warning is suppressed. If no handler handles, a message MUST be printed to `*ERROR-OUTPUT*`. |
-| R5.105 | `CERROR` MUST signal a `CONTINUABLE-ERROR` with a `CONTINUE` restart. If the restart is invoked, `CERROR` returns `NIL`. |
+| R5.105 | `CERROR` MUST signal an error condition (typically `SIMPLE-ERROR`) with a `CONTINUE` restart established. If the restart is invoked, `CERROR` returns `NIL`. |
 | R5.106 | `UNWIND-PROTECT` cleanup forms MUST execute even when a handler or restart transfers control via non-local exit. |
 | R5.107 | Condition objects MUST be full CLOS instances; `DEFINE-CONDITION` MUST expand to `DEFCLASS` with metaclass `CONDITION-CLASS`. |
 | R5.108 | Handler stacks and restart stacks MUST be thread-local. Each thread begins with empty stacks. |
 | R5.109 | Handler establishment (`HANDLER-BIND`, `HANDLER-CASE`) MUST NOT heap-allocate in the common case; stack-allocated clusters are REQUIRED. |
 | R5.110 | The runtime MUST pre-allocate `STORAGE-CONDITION` instances at startup for use when heap memory is exhausted. |
+| R5.111 | When `*BREAK-ON-SIGNALS*` is non-NIL, the signalling functions (`SIGNAL`, `ERROR`, `WARN`, `CERROR`) MUST test `(TYPEP condition *BREAK-ON-SIGNALS*)` and, if true, call `BREAK` before performing handler search. |
 
 ---
 
@@ -48,10 +49,10 @@ condition
 │   ├── error
 │   │   ├── arithmetic-error
 │   │   │   ├── division-by-zero
-│   │   │   └── floating-point-overflow
-│   │   │       floating-point-underflow
-│   │   │       floating-point-inexact
-│   │   │       floating-point-invalid-operation
+│   │   │   ├── floating-point-overflow
+│   │   │   ├── floating-point-underflow
+│   │   │   ├── floating-point-inexact
+│   │   │   └── floating-point-invalid-operation
 │   │   ├── cell-error
 │   │   │   ├── unbound-variable
 │   │   │   ├── undefined-function
@@ -63,10 +64,10 @@ condition
 │   │   ├── print-not-readable
 │   │   ├── program-error
 │   │   ├── stream-error
-│   │   │   └── end-of-file
-│   │   ├── type-error
-│   │   │   └── simple-type-error  [also inherits simple-condition]
-│   │   └── reader-error           [also inherits parse-error]
+│   │   │   ├── end-of-file
+│   │   │   └── reader-error       [also inherits parse-error]
+│   │   └── type-error
+│   │       └── simple-type-error  [also inherits simple-condition]
 │   └── storage-condition
 ├── warning
 │   ├── simple-warning             [also inherits simple-condition]
@@ -202,6 +203,14 @@ Invoked by `SIGNAL`, `ERROR`, `WARN`, and `CERROR`.
 
 ```text
 function signal-handler-search(condition):
+    // R5.111: *break-on-signals* check before handler search
+    if *break-on-signals* ≠ NIL:
+        bos ← *break-on-signals*
+        *break-on-signals* ← NIL   // prevent recursive break
+        if typep(condition, bos):
+            break(condition)        // enter debugger via BREAK
+        *break-on-signals* ← bos   // restore
+
     cluster ← current-thread.handler_stack
     // Save the handler stack pointer BEFORE searching so we can
     // rebind it during handler invocation (ANSI 9.1.4.1 semantics).
