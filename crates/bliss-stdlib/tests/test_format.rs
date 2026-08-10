@@ -345,10 +345,9 @@ fn format_directive_tilde_question_recursive() {
     // This should either succeed (if the implementation handles the recursive
     // directive) or return a type error (non-string passed as control string).
     // It should NOT panic except from unimplemented!() in red phase.
-    assert!(
-        result.is_ok() || result.is_err(),
-        "~? should return a Result, not panic (except unimplemented)"
-    );
+    // ~? with a non-string control arg should return an error (type error).
+    assert!(result.is_err(),
+        "~? with a non-string (fixnum) as control string should return Err (type error)");
 }
 
 // ~@? — recursive processing using enclosing arg list (R5.159)
@@ -360,10 +359,9 @@ fn format_directive_tilde_at_question_recursive_enclosing() {
         BlissVal::from_fixnum(0), // placeholder: should be a string "~D"
         BlissVal::from_fixnum(42), // this would be consumed by the recursive format
     ]);
-    assert!(
-        result.is_ok() || result.is_err(),
-        "~@? should return a Result"
-    );
+    // ~@? with a non-string control arg should return an error (type error).
+    assert!(result.is_err(),
+        "~@? with a non-string (fixnum) as control string should return Err (type error)");
 }
 
 // ~{ ~} — iteration (R5.160)
@@ -383,10 +381,9 @@ fn format_directive_tilde_brace_iteration_empty() {
 fn format_directive_tilde_colon_brace_iteration_sublists() {
     // ~:{body~} — each element is a sublist, one per iteration (R5.160)
     let result = format_nil("~:{~A ~}", &[NIL]);
-    assert!(
-        result.is_ok() || result.is_err(),
-        "~:{{~A ~}} should return a Result"
-    );
+    // ~:{...~} with NIL (empty list of sublists) should succeed
+    assert!(result.is_ok(),
+        "~:{{~A ~}} with empty list should succeed");
 }
 
 #[test]
@@ -410,10 +407,9 @@ fn format_directive_tilde_at_brace_iteration_remaining() {
 fn format_directive_tilde_colon_at_brace_iteration_remaining_sublists() {
     // ~:@{body~} — remaining args are sublists (R5.160)
     let result = format_nil("~:@{~A~}", &[NIL, NIL]);
-    assert!(
-        result.is_ok() || result.is_err(),
-        "~:@{{~A~}} should return a Result"
-    );
+    // ~:@{...~} with NIL args (empty sublists) should succeed
+    assert!(result.is_ok(),
+        "~:@{{~A~}} with NIL args should succeed");
 }
 
 // ~[ ~] — conditional (R5.161)
@@ -601,10 +597,9 @@ fn format_directive_tilde_slash_user_dispatch() {
     let result = format_nil("~/my-format-fn/", &[BlissVal::from_fixnum(42)]);
     // This will either succeed (if a function named my-format-fn is found)
     // or error (function not found). Either is acceptable in red phase.
-    assert!(
-        result.is_ok() || result.is_err(),
-        "~/name/ should return a Result"
-    );
+    // ~/name/ with an unknown function name should return an error.
+    assert!(result.is_err(),
+        "~/my-format-fn/ with unregistered function should return Err");
 }
 
 // ── ~< ~> — justification / logical-block (R5.162) ──────────────
@@ -625,10 +620,9 @@ fn format_directive_tilde_angle_justification() {
 fn format_directive_tilde_colon_angle_logical_block() {
     // ~:<...~:> logical-block mode for pretty-printer
     let result = format_nil("~:<~A ~A~:>", &[BlissVal::from_fixnum(1), BlissVal::from_fixnum(2)]);
-    assert!(
-        result.is_ok() || result.is_err(),
-        "~:<...~:> logical-block should return a Result"
-    );
+    // ~:<...~:> logical block should succeed with valid arguments.
+    assert!(result.is_ok(),
+        "~:<...~:> logical-block should succeed");
 }
 
 // ── format() with destination T ───────────────────────────────────
@@ -653,10 +647,9 @@ fn format_destination_stream() {
     let stream = BlissVal::from_fixnum(0); // placeholder for a stream
     let result = format(stream, "hello ~A", &[BlissVal::from_fixnum(42)]);
     // Should either succeed (write to stream, return NIL) or error (invalid stream type)
-    assert!(
-        result.is_ok() || result.is_err(),
-        "format with stream dest should return a Result"
-    );
+    // A fixnum is not a valid stream, so format should return a type error.
+    assert!(result.is_err(),
+        "format with an invalid stream (fixnum) should return Err (type error)");
 }
 
 // ── format() with string-with-fill-pointer destination (R5.156) ──
@@ -668,10 +661,9 @@ fn format_destination_string_with_fill_pointer() {
     // but we test the interface shape.
     let string_val = BlissVal::from_fixnum(0); // placeholder
     let result = format(string_val, "appended ~D", &[BlissVal::from_fixnum(42)]);
-    assert!(
-        result.is_ok() || result.is_err(),
-        "format with string-fill-pointer dest should return a Result"
-    );
+    // A fixnum is not a valid string-with-fill-pointer, so this should error.
+    assert!(result.is_err(),
+        "format with an invalid string dest (fixnum) should return Err (type error)");
 }
 
 // ── format() with NIL returns a string type ──────────────────────

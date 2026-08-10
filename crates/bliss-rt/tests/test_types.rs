@@ -567,13 +567,15 @@ fn typep_with_fixnum_returns_meaningful_result() {
     // should return true. We use mk_sym(0) as a stand-in for the FIXNUM type symbol;
     // once the symbol table is bootstrapped, this should map to the real FIXNUM symbol.
     let result: bool = typep(mk_fix(42), mk_sym(0));
-    // At minimum, verify the function returns without panicking and produces a bool.
-    // A more specific assertion: typep of a fixnum against its own type should be true.
-    assert!(result || !result, "typep must return a valid bool");
+    // A fixnum checked against its own type specifier should return true.
+    assert!(result, "typep of a fixnum against the fixnum type specifier should return true");
+
     // Verify that typep returns false for an obviously wrong type:
     // A fixnum should not satisfy a cons type predicate.
     // (Assuming mk_sym(1) maps to a different type specifier than fixnum.)
-    let _ = typep(mk_fix(42), mk_sym(1));
+    let wrong_type_result = typep(mk_fix(42), mk_sym(1));
+    assert!(!wrong_type_result,
+        "typep of a fixnum against a non-fixnum type specifier should return false");
 }
 
 #[test]

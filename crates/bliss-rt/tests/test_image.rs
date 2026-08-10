@@ -137,15 +137,13 @@ fn save_image_returns_result() {
         purify: false,
     };
     // save_image should either succeed or return an error (not panic).
-    // At this stage with unimplemented code it will fail, but the test
-    // validates the interface and that the error path is clean.
     let result = save_image(path, &opts);
     // Clean up if it somehow succeeded
     if result.is_ok() {
         std::fs::remove_file(path).ok();
     }
-    // We just assert it returns a Result (Ok or Err), not a panic
-    let _ = result;
+    // Assert the result is Ok (save should succeed with valid path and options)
+    assert!(result.is_ok(), "save_image with valid path should succeed");
 }
 
 #[test]
@@ -160,10 +158,15 @@ fn save_image_with_compression() {
     if result.is_ok() {
         std::fs::remove_file(path).ok();
     }
-    let _ = result;
+    assert!(result.is_ok(), "save_image with Zstd compression should succeed");
 }
 
 #[test]
-fn find_appended_image_does_not_panic() {
-    let _ = find_appended_image();
+fn find_appended_image_returns_result() {
+    let result = find_appended_image();
+    // For a non-appended test binary, find_appended_image should return None/Err
+    // indicating no appended image was found. The key assertion: it completes
+    // and returns a meaningful result.
+    assert!(result.is_none(),
+        "find_appended_image on a test binary should return None (no appended image)");
 }

@@ -141,6 +141,58 @@ fn register_allocation_can_be_stored_and_used() {
     let _reg_alloc2: RegisterAllocation = alloc2.allocate(&graph2).unwrap();
 }
 
+// ── NativeCodeBuffer content after emit ──────────────────────────
+
+#[test]
+fn x86_64_emit_produces_nonempty_code_buffer() {
+    use bliss_compiler::ir::{Edge, EdgeKind, IrGraph, NodeKind};
+    let mut backend = X86_64Backend::new();
+    // Build a minimal graph: Start -> Return
+    let mut graph = IrGraph::new();
+    let s = graph.add_node(NodeKind::Start);
+    let r = graph.add_node(NodeKind::Return);
+    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+
+    let buf = backend.emit(&graph).expect("emit should succeed for minimal graph");
+    // A compiled function (even trivial) should produce at least some machine code bytes.
+    assert!(!buf.is_empty(), "emitted code buffer should not be empty");
+    assert!(buf.len() > 0, "emitted code length should be > 0");
+    assert_eq!(buf.code().len(), buf.len(),
+        "code() length should match len()");
+}
+
+#[test]
+fn aarch64_emit_produces_nonempty_code_buffer() {
+    use bliss_compiler::ir::{Edge, EdgeKind, IrGraph, NodeKind};
+    let mut backend = Aarch64Backend::new();
+    let mut graph = IrGraph::new();
+    let s = graph.add_node(NodeKind::Start);
+    let r = graph.add_node(NodeKind::Return);
+    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+
+    let buf = backend.emit(&graph).expect("emit should succeed for minimal graph");
+    assert!(!buf.is_empty(), "emitted code buffer should not be empty");
+    assert!(buf.len() > 0, "emitted code length should be > 0");
+}
+
+#[test]
+fn emit_with_constant_produces_code() {
+    use bliss_compiler::ir::{Edge, EdgeKind, IrGraph, NodeKind};
+    use bliss_rt::value::NIL;
+    let mut backend = X86_64Backend::new();
+    let mut graph = IrGraph::new();
+    let s = graph.add_node(NodeKind::Start);
+    let c = graph.add_node(NodeKind::Constant(NIL));
+    let r = graph.add_node(NodeKind::Return);
+    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+    graph.add_edge(Edge { from: c, to: r, kind: EdgeKind::Data, input_index: 1 });
+
+    let buf = backend.emit(&graph).expect("emit with constant should succeed");
+    // Code that returns a constant should be non-empty.
+    assert!(!buf.is_empty(),
+        "code that loads and returns a constant should produce machine code");
+}
+
 // ── patch_code ────────────────────────────────────────────────────
 
 #[test]
@@ -148,4 +200,16 @@ fn patch_code_with_null_pointer_errors() {
     use bliss_compiler::codegen::patch_code;
     let result = unsafe { patch_code(std::ptr::null_mut(), std::ptr::null()) };
     assert!(result.is_err());
+}
+
+#[test]
+fn patch_code_with_valid_buffer() {
+    use bliss_compiler::codegen::patch_code;
+    // Allocate a mutable buffer simulating a code region.
+    let mut code = vec![0u8; 64];
+    let target = code.as_ptr().wrapping_add(32);
+    let site = code.as_mut_ptr();
+    // patch_code with a valid site and target should succeed.
+    let result = unsafe { patch_code(site, target) };
+    assert!(result.is_ok(), "patch_code with valid pointers should succeed");
 }

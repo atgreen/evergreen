@@ -147,6 +147,108 @@ fn pass_manager_on_graph_with_constant() {
     assert!(pm.run_all(&mut g).is_ok(), "pass manager should succeed on graph with constant");
 }
 
+// ── DCE on graph with dead code ──────────────────────────────────
+
+/// Build a graph with a dead (unreferenced) constant node.
+/// DCE should detect and remove it.
+fn graph_with_dead_node() -> IrGraph {
+    let mut g = IrGraph::new();
+    let s = g.add_node(NodeKind::Start);
+    // This constant is dead — nothing uses it.
+    let _dead = g.add_node(NodeKind::Constant(NIL));
+    let r = g.add_node(NodeKind::Return);
+    g.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+    g
+}
+
+#[test]
+fn dce_removes_dead_constant() {
+    let mut g = graph_with_dead_node();
+    let before = g.node_count();
+    // There should be 3 nodes: Start, dead Constant, Return
+    assert_eq!(before, 3, "graph should have 3 nodes before DCE");
+
+    let changed = DeadCodeElimination.run(&mut g)
+        .expect("DCE should succeed");
+    // DCE should have removed the dead constant node.
+    assert!(changed, "DCE should report changes when dead code exists");
+    assert!(g.node_count() < before,
+        "DCE should reduce node count by removing dead nodes (was {}, now {})",
+        before, g.node_count());
+    assert_eq!(g.node_count(), 2,
+        "after DCE, only Start and Return should remain");
+}
+
+// ── Constant folding on constant expressions ─────────────────────
+
+/// Build a graph with two constants feeding into an arithmetic operation.
+/// Constant folding should evaluate the expression at compile time.
+fn graph_with_foldable_expression() -> IrGraph {
+    use bliss_rt::value::BlissVal;
+    let mut g = IrGraph::new();
+    let s = g.add_node(NodeKind::Start);
+    let c1 = g.add_node(NodeKind::Constant(BlissVal::from_fixnum(2)));
+    let c2 = g.add_node(NodeKind::Constant(BlissVal::from_fixnum(3)));
+    // A Call node representing an addition of two constants
+    let call = g.add_node(NodeKind::Call);
+    let r = g.add_node(NodeKind::Return);
+    g.add_edge(Edge { from: s, to: call, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge { from: c1, to: call, kind: EdgeKind::Data, input_index: 1 });
+    g.add_edge(Edge { from: c2, to: call, kind: EdgeKind::Data, input_index: 2 });
+    g.add_edge(Edge { from: call, to: r, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge { from: call, to: r, kind: EdgeKind::Data, input_index: 1 });
+    g
+}
+
+#[test]
+fn constant_folding_folds_constant_expression() {
+    let mut g = graph_with_foldable_expression();
+    let before = g.node_count();
+    let result = ConstantFolding.run(&mut g);
+    assert!(result.is_ok(), "constant folding should succeed on foldable graph");
+    // If the implementation folds the constant expression, node count should decrease
+    // (the Call + two Constant nodes replaced by one Constant).
+    let changed = result.unwrap();
+    if changed {
+        assert!(g.node_count() < before,
+            "constant folding should reduce node count when folding occurs");
+    }
+}
+
+// ── CSE (common subexpression elimination via pass manager) ──────
+
+/// Build a graph with redundant loads from the same offset.
+fn graph_with_redundant_loads() -> IrGraph {
+    let mut g = IrGraph::new();
+    let s = g.add_node(NodeKind::Start);
+    let p = g.add_node(NodeKind::Parameter(0));
+    // Two loads from the same offset — redundant
+    let ld1 = g.add_node(NodeKind::MemLoad { offset: 8 });
+    let ld2 = g.add_node(NodeKind::MemLoad { offset: 8 });
+    let r = g.add_node(NodeKind::Return);
+    g.add_edge(Edge { from: s, to: ld1, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge { from: p, to: ld1, kind: EdgeKind::Data, input_index: 1 });
+    g.add_edge(Edge { from: ld1, to: ld2, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge { from: p, to: ld2, kind: EdgeKind::Data, input_index: 1 });
+    g.add_edge(Edge { from: ld2, to: r, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge { from: ld1, to: r, kind: EdgeKind::Data, input_index: 1 });
+    g.add_edge(Edge { from: ld2, to: r, kind: EdgeKind::Data, input_index: 2 });
+    g
+}
+
+#[test]
+fn pass_manager_handles_redundant_loads() {
+    let mut pm = PassManager::new();
+    let mut g = graph_with_redundant_loads();
+    let before = g.node_count();
+    let result = pm.run_all(&mut g);
+    assert!(result.is_ok(), "pass manager should succeed on graph with redundant loads");
+    // After optimization, redundant loads could be eliminated,
+    // reducing node count. At minimum, graph should be valid.
+    assert!(g.node_count() <= before,
+        "optimization should not increase node count for redundant loads");
+}
+
 // ── InliningConfig ────────────────────────────────────────────────
 
 #[test]

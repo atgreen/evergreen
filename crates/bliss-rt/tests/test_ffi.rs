@@ -101,23 +101,21 @@ fn ffi_call_null_fn_ptr_fails() {
 #[test]
 fn ffi_call_with_known_c_function() {
     // Load libc and call abs(-42) which should return 42
-    let libc = load_foreign_library("libc.so.6")
+    let lib = load_foreign_library("libc.so.6")
         .or_else(|_| load_foreign_library("libSystem.B.dylib"))
-        .or_else(|_| load_foreign_library("libc.so"));
-    if let Ok(lib) = libc {
-        unsafe {
-            let abs_ptr = foreign_symbol(lib, "abs");
-            if let Ok(abs_fn) = abs_ptr {
-                let result = ffi_call(
-                    abs_fn,
-                    &AlienType::Int { signed: true, bits: 32 },
-                    &[AlienType::Int { signed: true, bits: 32 }],
-                    &[(-42i32 as u32) as u64],
-                );
-                assert!(result.is_ok());
-                assert_eq!(result.unwrap() as i32, 42);
-            }
-        }
+        .or_else(|_| load_foreign_library("libc.so"))
+        .expect("should be able to load libc on any supported platform");
+    unsafe {
+        let abs_fn = foreign_symbol(lib, "abs")
+            .expect("libc should export 'abs'");
+        let result = ffi_call(
+            abs_fn,
+            &AlienType::Int { signed: true, bits: 32 },
+            &[AlienType::Int { signed: true, bits: 32 }],
+            &[(-42i32 as u32) as u64],
+        );
+        assert!(result.is_ok(), "ffi_call to abs should succeed");
+        assert_eq!(result.unwrap() as i32, 42, "abs(-42) should return 42");
     }
 }
 
@@ -125,10 +123,10 @@ fn ffi_call_with_known_c_function() {
 
 #[test]
 fn callback_drop_does_not_panic() {
-    let cb = Callback::new(NIL, AlienType::Void, vec![]);
-    if let Ok(cb) = cb {
-        drop(cb); // explicitly drop to exercise Drop impl
-    }
+    let cb = Callback::new(NIL, AlienType::Void, vec![])
+        .expect("Callback::new should succeed");
+    drop(cb); // explicitly drop to exercise Drop impl
+    // If we reach here without panic, the Drop impl is correct.
 }
 
 // ── Issue #8: marshal/unmarshal non-trivial cases ─────────────────

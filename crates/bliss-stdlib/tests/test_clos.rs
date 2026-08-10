@@ -135,18 +135,22 @@ fn class_hierarchy_accessors() {
     let cls = BlissVal::from_fixnum(301);
     set_find_class(sym(301), cls).unwrap();
 
-    // Direct superclasses should return a vector (possibly empty for a root class)
+    // Direct superclasses: a class registered via set_find_class should have
+    // at least one superclass (standard-object or T in the CLOS hierarchy).
     let supers = class_direct_superclasses(cls);
-    // Result is a Vec, which is fine even if empty — but it must be a valid vector
-    assert!(supers.len() >= 0, "class_direct_superclasses must return a valid vector");
+    assert!(supers.len() >= 1,
+        "a registered class should have at least one superclass (e.g., standard-object)");
 
     // Direct subclasses of a fresh class with no children should be empty
     let subs = class_direct_subclasses(cls);
     assert!(subs.is_empty(), "fresh class should have no direct subclasses yet");
 
-    // Slots should return a vector (possibly empty for a class with no slots)
+    // Slots: a class defined without explicit slots might have zero,
+    // but class_slots must return a valid (possibly empty) vector.
     let slots = class_slots(cls);
-    assert!(slots.len() >= 0, "class_slots must return a valid vector");
+    // We just verify the call succeeded and returned a vector.
+    // For a class with no explicitly defined slots, empty is acceptable.
+    let _ = slots.len(); // ensure it's accessible
 }
 
 #[test]
