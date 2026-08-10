@@ -83,7 +83,61 @@ re-exported via `SB-THREAD`.
 (barrier kind) ;; Macro. KIND ∈ {:READ :WRITE :FULL :DATA-DEPENDENCY}. Default :FULL.
 ```
 
-### 9.2.6  Data Structures
+### 9.2.6  Atomic Operations (CAS)
+
+**R9.37** Bliss MUST provide SBCL-compatible atomic operations in `BLISS-THREADS`,
+re-exported via `SB-EXT` and `SB-THREAD`.
+
+```lisp
+(cas place old new)
+  ;; Macro. Atomically: if PLACE holds OLD (by EQ), store NEW, return OLD value.
+  ;; If PLACE does not hold OLD, return actual current value; no store.
+  ;; Applicable place types: special variables, structure slots (defstruct),
+  ;;   SVREF, CAR, CDR, SYMBOL-PLIST, SYMBOL-VALUE, SLOT-VALUE.
+  ;; Expansion: compiler-generated CAS intrinsic per place type.
+  ;; Thread-safety: lock-free; full memory barrier on success.
+
+(atomic-incf place &optional (delta 1))
+  ;; Atomically increment PLACE by DELTA (a fixnum). Returns previous value.
+  ;; Applicable places: fixnum-typed special variables, structure slots
+  ;;   declared (type fixnum), SVREF of (simple-array fixnum).
+  ;; Thread-safety: lock-free fetch-and-add.
+
+(atomic-decf place &optional (delta 1))
+  ;; Atomically decrement PLACE by DELTA (a fixnum). Returns previous value.
+  ;; Same applicable places and semantics as ATOMIC-INCF.
+```
+
+**D9.08 — CAS Expansion:** The `CAS` macro expands to a `%COMPARE-AND-SWAP` compiler
+intrinsic selected by place type. For struct slots, the compiler resolves the slot
+offset at compile time. For special variables, CAS operates on the TLS cell (§2.4)
+with fallback to the global cell. Overflow from fixnum arithmetic in `ATOMIC-INCF`/
+`ATOMIC-DECF` signals `ARITHMETIC-ERROR` (not undefined behaviour).
+
+### 9.2.7  Recursive Locks
+
+**R9.38** Bliss MUST provide recursive mutexes compatible with SBCL's `sb-thread:make-lock`.
+
+```lisp
+(make-lock &key name)
+  ;; → recursive-lock (D9.09). A lock may be acquired multiple times by the
+  ;; owning thread without deadlock; each GRAB-LOCK must be matched by RELEASE-LOCK.
+
+(grab-lock lock &key waitp timeout)
+  ;; waitp=NIL → try-lock. Returns T on success, NIL on failure/timeout.
+  ;; If already held by current thread, increments recursion count.
+
+(release-lock lock &key if-not-owner)
+  ;; Decrements recursion count; releases when count reaches zero.
+  ;; if-not-owner ∈ {:WARN :FORCE :ERROR} (default :ERROR).
+
+(with-lock (lock &key waitp timeout) &body body)
+  ;; UNWIND-PROTECT wrapper; releases one recursion level on exit.
+```
+
+**D9.09 — Recursive-Lock:** `header(8) | name(8) | owner:AtomicU64(8) | state:AtomicU32(4) | recursion-count:u32(4) | futex(4) | pad(4)` — 40 bytes.
+
+### 9.2.8  Data Structures
 
 **D9.01 — Thread:** `header(8) | name(8) | state:AtomicU8(1) | ephemeral(1) | pad(6) | os-handle(8) | result(8) | mailbox-head:AtomicPtr(8) | join-waiters:AtomicPtr(8)` — 56 bytes. State ∈ {:BORN :RUNNING :DEAD :ABORTED}.
 
@@ -95,7 +149,7 @@ re-exported via `SB-THREAD`.
 
 **D9.05 — Semaphore-Notification:** `header(8) | status:AtomicU8(1)` — 16 bytes (padded).
 
-### 9.2.7  Compatibility: Bliss vs SBCL
+### 9.2.9  Compatibility: Bliss vs SBCL
 
 | Feature | SBCL | Bliss | Divergence |
 |---------|------|-------|------------|
@@ -105,6 +159,11 @@ re-exported via `SB-THREAD`.
 | `destroy-thread` | `terminate-thread` | `destroy-thread` + alias | name differs |
 | `condition-wait` spurious | possible | possible | identical |
 | `barrier` | internal | exported | Bliss addition |
+| `cas` | `sb-ext:cas` macro | `bliss-ext:cas` macro | identical semantics |
+| `atomic-incf`/`decf` | `sb-ext:atomic-incf` | `bliss-ext:atomic-incf` | identical; overflow signals error |
+| CAS places | specials, struct, svref, car/cdr | same set | identical |
+| `make-lock` (recursive) | `sb-thread:make-lock` | `bliss-threads:make-lock` | identical |
+| Recursive lock semantics | re-entrant, counted | re-entrant, counted | identical |
 
 ---
 
@@ -152,16 +211,58 @@ re-exported via `SB-THREAD`.
 **R9.11** `:WEAKNESS` → `:KEY`, `:VALUE`, `:KEY-AND-VALUE`, `:KEY-OR-VALUE`.
 **R9.12** `WITH-LOCKED-HASH-TABLE` → multi-operation atomicity.
 
+### 9.5.1  API
+
+```lisp
+(make-hash-table &key test size rehash-size rehash-threshold
+                      hash-function synchronized weakness)
+  ;; Extended lambda list — SBCL-compatible keyword args:
+  ;; synchronized — if T, all accesses protected by an internal RW lock.
+  ;; weakness     — NIL | :KEY | :VALUE | :KEY-AND-VALUE | :KEY-OR-VALUE
+  ;;   :KEY            — entry cleared when key is unreachable
+  ;;   :VALUE          — entry cleared when value is unreachable
+  ;;   :KEY-AND-VALUE  — cleared when both are unreachable
+  ;;   :KEY-OR-VALUE   — cleared when either is unreachable
+  ;; hash-function — (function (t) (values fixnum)) overriding default for TEST.
+  ;; Returns → hash-table.
+
+(with-locked-hash-table (hash-table) &body body)
+  ;; Acquires exclusive (write) lock on HASH-TABLE for the dynamic extent of BODY.
+  ;; If HASH-TABLE is not :SYNCHRONIZED, executes BODY without locking.
+  ;; Returns → the values of the last form in BODY.
+  ;; Thread-safety: re-entrant for the owning thread (recursive lock).
+
+(hash-table-synchronized-p hash-table)  ;; → boolean
+(hash-table-weakness hash-table)        ;; → NIL | weakness keyword
+```
+
+### 9.5.2  Compatibility
+
 | Feature | SBCL | Bliss | Divergence |
 |---------|------|-------|------------|
 | `:synchronized` | RW lock | RW lock | identical |
+| `:weakness` keywords | 4 modes | 4 modes | identical |
+| `with-locked-hash-table` | exclusive lock | exclusive lock | identical |
+| `hash-table-synchronized-p` | supported | supported | identical |
+| `hash-table-weakness` | supported | supported | identical |
+| `:hash-function` | supported | supported | identical |
 | Concurrent resize | stop-the-world | incremental rehash | Bliss avoids long pauses |
 
 ---
 
 ## 9.6  Sequence Extensions
 
-**R9.13** `SB-SEQUENCE:DEFINE-SEQUENCE-CLASS` — user-defined sequences. MAY be deferred to v2.
+**R9.13** Extensible sequences via `SB-SEQUENCE:DEFINE-SEQUENCE-CLASS`.
+
+**Status:** Out-of-scope for v1. **Rationale:** The SBCL extensible sequence
+protocol requires deep integration with every standard sequence function
+(~40 functions). Ecosystem usage is limited (primarily `trivial-extensible-sequences`,
+few Quicklisp libraries depend on it). The implementation cost is disproportionate
+to adoption benefit for v1. Will be revisited for v2 based on user demand.
+
+**R9.40** When user code calls `sb-sequence:define-sequence-class` in Bliss v1,
+the macro MUST signal a `BLISS-EXT:NOT-YET-IMPLEMENTED` error with a descriptive
+message referencing v2.
 
 ---
 
@@ -185,6 +286,22 @@ All symbols exported from `BLISS-MOP`, re-exported via `SB-MOP`.
 | `class-direct-default-initargs` | `(class)` | list of (name form fn) | safe |
 | `class-finalized-p` | `(class)` | boolean | safe |
 | `class-prototype` | `(class)` | instance | lazy-alloc; safe |
+
+### 9.7.1b  MOP Metaclasses
+
+**R9.39** Bliss MUST export the following metaclass and slot-definition classes
+from `BLISS-MOP` (re-exported via `SB-MOP`):
+
+| Class | Superclass | Purpose |
+|-------|------------|---------|
+| `funcallable-standard-class` | `standard-class` | Metaclass for funcallable instances (GFs) |
+| `forward-referenced-class` | `class` | Placeholder for not-yet-defined superclasses |
+| `standard-direct-slot-definition` | `direct-slot-definition` | Default direct slot-def class |
+| `standard-effective-slot-definition` | `effective-slot-definition` | Default effective slot-def class |
+
+`funcallable-standard-class` instances support `set-funcallable-instance-function` (§9.7.5).
+`forward-referenced-class` is replaced by the real class on `defclass`; `finalize-inheritance`
+signals an error if any superclass remains forward-referenced.
 
 ### 9.7.2  Slot Definition Accessors
 
@@ -239,8 +356,17 @@ All symbols exported from `BLISS-MOP`, re-exported via `SB-MOP`.
 
 ### 9.7.5  Class Finalization & Mutation
 
+**Finalization protocol:** `finalize-inheritance` invokes the following generic
+functions in order: `compute-class-precedence-list`, `compute-slots`,
+`compute-effective-slot-definition` (per slot), `compute-default-initargs`.
+Each is a documented customization point.
+
 | Symbol | Signature | Notes |
 |--------|-----------|-------|
+| `compute-class-precedence-list` | `(class)` | → list of classes; called by `finalize-inheritance` |
+| `compute-slots` | `(class)` | → list of effective-slot-defs; collects direct slots from CPL |
+| `compute-effective-slot-definition` | `(class name direct-slots)` | → single effective-slot-def |
+| `compute-default-initargs` | `(class)` | → list of (name form function) triples |
 | `finalize-inheritance` | `(class)` | compute CPL + effective slots |
 | `ensure-class` | `(name &rest initargs)` | find-or-create class |
 | `ensure-class-using-class` | `(class name &rest initargs)` | with existing class |
@@ -261,6 +387,14 @@ All symbols exported from `BLISS-MOP`, re-exported via `SB-MOP`.
 | `validate-superclass` default | T for standard-class | T for standard-class | identical |
 | `set-funcallable-instance-function` | supported | supported | identical |
 | `add-method` locking | acquires GF lock | GF lock + IC flush (§4.8) | Bliss also flushes inline caches |
+| `compute-class-precedence-list` | supported | supported | identical |
+| `compute-slots` | supported | supported | identical |
+| `compute-effective-slot-definition` | supported | supported | identical |
+| `compute-default-initargs` | supported | supported | identical |
+| `funcallable-standard-class` | supported | supported | identical |
+| `forward-referenced-class` | supported | supported | identical |
+| `standard-direct-slot-definition` | supported | supported | identical |
+| `standard-effective-slot-definition` | supported | supported | identical |
 | Closer-MOP test suite | passes | passes (R9.03) | identical |
 
 ---
@@ -314,9 +448,20 @@ Bliss name: `SAVE-IMAGE`; compatibility alias provided.
   ;;          if NIL, runs in the dedicated timer thread.  Returns → timer (D9.07).
 
 (schedule-timer timer time &key repeat-interval absolute-p catch-up)
-  ;; time — seconds from now (or universal-time if absolute-p)
-  ;; repeat-interval — recurring period or NIL.  catch-up — replay missed iterations.
+  ;; time — seconds from now (real number), or universal-time if absolute-p is T.
+  ;; repeat-interval — recurring period in seconds, or NIL.
+  ;; catch-up — if T, replay missed iterations synchronously on wake.
   ;; Thread-safety: acquires timer-queue lock.
+  ;;
+  ;; Clock conversion (absolute-p = T):
+  ;;   The universal-time value is converted to monotonic nanoseconds at schedule
+  ;;   time via: fire-time = monotonic-now + (time - get-universal-time) * 1e9.
+  ;;   This means the timer is immune to NTP clock adjustments after scheduling.
+  ;;   Wall-clock skew (NTP jumps) that occurs between schedule and fire does NOT
+  ;;   affect the timer — it fires at the monotonic equivalent of the wall-clock
+  ;;   instant that was current when scheduled. This matches SBCL's real-time
+  ;;   semantics in practice (SBCL uses CLOCK_REALTIME but is also subject to
+  ;;   drift). Note: D9.07 stores fire-time as monotonic nanoseconds.
 
 (unschedule-timer timer)  ;; Remove from schedule. Blocks if currently executing. Idempotent.
 (timer-scheduled-p timer &key delta)  ;; delta: true only if firing within delta seconds.
@@ -416,6 +561,14 @@ asserted type for downstream propagation and specialised code selection.
 **R9.28** Compiler MUST elide unbound checks. If unbound at runtime: undefined
 behaviour (UNBOUND-MARKER treated as valid object; no GC corruption).
 
+**R9.41** The compiler's declaration-identifier resolver MUST recognise both
+`bliss-ext:always-bound` and `sb-ext:always-bound` as equivalent declaration
+identifiers. Declarations are resolved by symbol identity (via the compatibility
+package re-export in R9.02), so `(declaim (sb-ext:always-bound *var*))` MUST
+work identically. The same applies to `freeze-type` and `muffle-conditions` /
+`unmuffle-conditions` — all four declaration identifiers MUST be recognised
+under both `BLISS-EXT` and `SB-EXT` prefixes.
+
 ### 9.12.3  `freeze-type`
 
 ```lisp
@@ -443,10 +596,10 @@ behaviour (UNBOUND-MARKER treated as valid object; no GC corruption).
 | Feature | SBCL | Bliss | Divergence |
 |---------|------|-------|------------|
 | `truly-the` | special form | special form | identical |
-| `always-bound` | declaration | declaration | identical |
-| `freeze-type` | declaration | declaration | identical |
+| `always-bound` | declaration (`sb-ext:`) | declaration (`bliss-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
+| `freeze-type` | declaration (`sb-ext:`) | declaration (`bliss-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
 | `freeze-type` redef | `style-warning` | `style-warning` + continuable `error` at load | Bliss stricter |
-| `muffle-conditions` | declaration | declaration | identical |
+| `muffle-conditions` | declaration (`sb-ext:`) | declaration (`bliss-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
 | Trust violation | undefined | undefined (but GC-safe) | Bliss guarantees no GC corruption |
 
 ---
@@ -466,7 +619,7 @@ Debug builds MUST assert correct ordering (§8).
 
 | Section | Test file | Key coverage |
 |---------|-----------|-------------|
-| §9.2 Threading | `test_threading_ext` | make/join/interrupt, mutex contention, condvar |
+| §9.2 Threading | `test_threading_ext` | make/join/interrupt, mutex contention, condvar, CAS, atomic-incf/decf, recursive locks |
 | §9.4 Weak refs | `test_weak_ext` | GC clearing, finalizer ordering |
 | §9.7 MOP | `test_mop_compat.lisp` | Closer-MOP suite |
 | §9.10 Timers | `test_timer_ext` | one-shot, repeat, cancel, catch-up |
