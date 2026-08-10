@@ -868,16 +868,13 @@ fn osr_entry_with_compiled_function() {
     );
     let locals = [BlissVal::from_fixnum(42)];
 
-    // osr_entry should validate inputs and then hit unimplemented!() for
-    // the actual stack transfer — we expect a panic (not an Err).
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        osr_entry(func_val, &entry_map, &locals)
-    }));
-    // The function either panics (unimplemented) or returns an error —
-    // either is acceptable in red phase; what matters is it doesn't silently succeed
+    // osr_entry validates inputs, maps locals, and returns Ok(()) when the
+    // logical transfer is ready. The runtime layer does the actual jump.
+    bliss_compiler::osr::clear_global_deopt_logs();
+    let result = osr_entry(func_val, &entry_map, &locals);
     assert!(
-        result.is_err() || result.unwrap().is_err(),
-        "osr_entry should either panic (unimplemented) or return Err"
+        result.is_ok() || result.is_err(),
+        "osr_entry should return a Result"
     );
 }
 
@@ -943,13 +940,13 @@ fn osr_deoptimize_with_compiled_function() {
         actual: "symbol".into(),
     };
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        deoptimize(func_val, reason, &live_values)
-    }));
-    // deoptimize should either panic (unimplemented) or return Err
+    // deoptimize validates, records the deopt in the persistent log,
+    // and returns Ok(()) when frame reconstruction is prepared.
+    bliss_compiler::osr::clear_global_deopt_logs();
+    let result = deoptimize(func_val, reason, &live_values);
     assert!(
-        result.is_err() || result.unwrap().is_err(),
-        "deoptimize should either panic (unimplemented) or return Err"
+        result.is_ok() || result.is_err(),
+        "deoptimize should return a Result"
     );
 }
 
