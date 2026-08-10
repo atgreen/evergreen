@@ -17,7 +17,7 @@ knobs.
 | R3.01 | The heap MUST be divided into nursery (young-gen) and old-gen regions. | MUST |
 | R3.02 | Each mutator thread MUST own a Thread-Local Allocation Buffer (TLAB) of configurable size (default ~2 MB). | MUST |
 | R3.03 | Allocation within a TLAB MUST use a bump-pointer and require no locks or atomic operations. | MUST |
-| R3.04 | When a TLAB is exhausted the allocator MUST refill from the nursery or fall back to old-gen (§3.4). | MUST |
+| R3.04 | When a TLAB is exhausted the allocator MUST refill from the nursery or fall back to old-gen (§3.3.2). | MUST |
 | R3.05 | Objects larger than half a region (default >1 MB) MUST be allocated directly in dedicated large-object regions in old-gen. | MUST |
 | R3.06 | Minor GC MUST be stop-the-world and copy live nursery objects into survivor space or promote to old-gen. | MUST |
 | R3.07 | Minor GC SHOULD complete in < 2 ms for a 64 MB nursery on typical workloads. | SHOULD |
@@ -27,7 +27,7 @@ knobs.
 | R3.11 | Cross-generation pointers MUST be tracked via a remembered set so minor GC does not scan old-gen. | MUST |
 | R3.12 | Finalization MUST be deferred: objects with finalizers are enqueued on a finalization queue after becoming unreachable, and finalizers run on a dedicated thread. | MUST |
 | R3.13 | The runtime MUST support weak references (weak pointers) that are cleared atomically during GC. | MUST |
-| R3.14 | All GC activity MUST respect safepoints; mutator threads MUST NOT be suspended asynchronously (no signal-based stop). | MUST |
+| R3.14 | All GC activity MUST respect safepoints; mutator threads MUST NOT be suspended via asynchronous signals (e.g. `SIGUSR1`). Safepoint polling MAY use a synchronous page-fault trap (`mprotect` / `SIGSEGV`) initiated by the thread itself. | MUST |
 | R3.15 | Heap size, nursery size, pause-time target, and promotion threshold MUST be configurable at startup. | MUST |
 | R3.16 | The GC MUST maintain a consistent heap even if a finalizer signals a CL condition; finalizer errors MUST NOT corrupt GC state. | MUST |
 | R3.17 | GC metadata (mark bits, region headers) MUST reside in side tables, not in object headers, to allow concurrent access without racing with mutator field writes. | MUST |
@@ -91,14 +91,21 @@ struct Tlab {
 
 - Default TLAB size: 2 MB (one full region) but may be a sub-region
   slice when regions are shared under high thread counts.
-- When `cursor == limit`, the thread requests a new TLAB (§3.4).
+- When `cursor == limit`, the thread requests a new TLAB (§3.3.2).
 
 ### 3.2.3  Survivor Spaces
 
-Two semi-spaces (from-space/to-space), each sized to ~25 % of nursery.
-Objects surviving a minor GC copy into to-space with incremented
-`gen_age`. When `gen_age ≥ promotion_threshold` (default 4), the object
-is promoted to old-gen instead.
+Survivor space is composed of regions drawn from the global region pool,
+tagged `Survivor`. Two logical semi-spaces (from-space/to-space) are
+maintained, each targeting ~25 % of nursery capacity. At the default
+configuration (nursery = 32 regions = 64 MB), each semi-space comprises
+8 regions (16 MB). Regions are added or released dynamically as survivor
+occupancy fluctuates; the 25 % target is a soft guideline, not a hard
+limit.
+
+Objects surviving a minor GC are copied into to-space regions with
+incremented `gen_age`. When `gen_age ≥ promotion_threshold` (default 4),
+the object is promoted to old-gen instead.
 
 ### 3.2.4  Old Generation
 
@@ -335,6 +342,41 @@ SATB queue = mark phase complete.
 
 ---
 
+## 3.6.4  Minor GC During Concurrent Marking
+
+A minor GC (§3.5) may be triggered while a concurrent old-gen mark cycle
+(§3.6) is in progress. The two must interact correctly:
+
+1. **Concurrent marker is paused during minor GC.** Minor GC is STW, so
+   all threads — including GC marker threads — are at a safepoint. The
+   marker resumes when mutators resume.
+
+2. **Promoted objects are implicitly marked.** Objects promoted from
+   nursery/survivor to old-gen during a minor GC are allocated above the
+   region's TAMS pointer (or in fresh regions whose TAMS is their base).
+   Per the TAMS rule (§3.4), objects above TAMS are implicitly live —
+   they need not be explicitly grey-marked. This ensures promoted
+   objects are not incorrectly reclaimed by the in-progress marking
+   cycle.
+
+3. **Minor GC updates remembered sets consistently.** When minor GC
+   copies objects and updates references, any old→young references that
+   become old→old (because the young object was promoted) are reflected
+   in card-table state. Cards containing promoted-to regions are not
+   dirtied unless they contain genuine old→young pointers post-GC.
+
+4. **SATB buffers are flushed.** As part of the minor GC STW pause, all
+   per-thread SATB buffers are flushed to the global SATB queue. This
+   ensures that reference overwrites performed by the minor GC's
+   forwarding-pointer installation are captured by the concurrent
+   marker when it resumes.
+
+This interaction mirrors HotSpot G1's approach: young GCs are
+orthogonal to concurrent marking and can occur freely during any phase
+of the old-gen mark cycle.
+
+---
+
 ## 3.7  Remembered Sets
 
 Cross-generation pointers (old→young) must be tracked so minor GC can
@@ -353,18 +395,44 @@ card_index = (addr - old_gen_base) / 512
 | Clean | `0x00` | No old→young pointers in this card |
 | Dirty | `0xFF` | Card may contain old→young pointer; must be scanned |
 
-**Write barrier for remembered set** (distinct from SATB barrier; both
-fire on reference stores):
+**Combined write barrier:** Both the SATB barrier (§3.6.2) and the card
+barrier fire on reference stores. To avoid two separate conditional
+branches per store, the compiler emits a single combined barrier
+sequence:
 
 ```rust
+/// Emitted by the JIT at every reference-store site.
+/// Single function, two fast-path checks, to minimise branch overhead.
 #[inline(always)]
-fn card_write_barrier(slot_addr: *mut BlissVal, new_val: BlissVal) {
+fn combined_write_barrier(
+    slot_addr: *mut BlissVal,
+    old_val: BlissVal,
+    new_val: BlissVal,
+) {
+    // 1. SATB barrier (only when concurrent marking is active)
+    if gc_marking_in_progress() {
+        if is_heap_pointer(old_val) {
+            let buf = current_thread().satb_buffer;
+            buf.push(old_val);
+            if buf.is_full() {
+                flush_satb_buffer(buf);
+            }
+        }
+    }
+
+    // 2. Card barrier (unconditional — independent of marking state)
     if is_young_pointer(new_val) && is_old_gen(slot_addr) {
         let idx = (slot_addr as usize - OLD_GEN_BASE) / CARD_SIZE;
         CARD_TABLE[idx] = DIRTY;
     }
 }
 ```
+
+When marking is **not** in progress, the SATB branch is a single
+load + test-and-branch that falls through, leaving only the card check
+on the fast path. When marking **is** active, the combined cost is two
+conditional branches plus (rarely) the SATB buffer push. This is
+comparable to HotSpot G1's post-write barrier overhead.
 
 At minor GC, dirty cards are scanned to discover old→young references
 and add them to the root set (A3.01 step 2). After scanning, cards are
@@ -421,8 +489,12 @@ is a MAY for v2+.
 ## 3.9  Safepoint Protocol
 
 Mutator threads must reach a **safepoint** before GC can proceed. Bliss
-uses a polling-based safepoint mechanism (R3.14 — no POSIX signals for
-thread suspension).
+uses a polling-based safepoint mechanism (R3.14 — no asynchronous
+signal-based suspension). The mechanism uses a synchronous page-fault
+trap: the GC thread `mprotect`s a polling page, causing the mutator
+thread itself to fault into a handler that parks the thread. This is a
+self-initiated synchronous trap, not an externally-delivered async
+signal like `SIGUSR1`.
 
 ### 3.9.1  Safepoint Polls
 
@@ -486,7 +558,7 @@ At a safepoint, each thread's state is fully walkable:
 ```rust
 struct WeakPointer {
     header: ObjectHeader,
-    referent: AtomicPtr<BlissVal>,  // cleared to NIL when referent dies
+    referent: AtomicU64,   // holds a BlissVal (tagged 64-bit value); cleared to NIL when referent dies
     broken: AtomicBool,
 }
 ```
