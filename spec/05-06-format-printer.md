@@ -30,7 +30,7 @@ variables. Implements ANSI CL §22 (Printer) and §22.3 (FORMAT).
 | R5.173 | `*print-miser-width*` MUST enable miser mode when available width ≤ threshold. | MUST |
 | R5.174 | `*print-right-margin*` MUST control the right margin; `nil` → auto-detect terminal width. | MUST |
 | R5.175 | Array printing MUST respect `*print-array*`, `*print-level*`, `*print-length*`, `*print-readably*`. | MUST |
-| R5.176 | Hash-table printing: `#<HASH-TABLE ...>` by default; re-readable form when `*print-readably*` is true. | MUST |
+| R5.176 | Hash-table printing: `#<HASH-TABLE :TEST eql :COUNT n>` by default. When `*print-readably*` is true, signal `print-not-readable` (per R5.171), since ANSI CL defines no standard readable syntax for hash tables. See §5.9.15 for a Bliss-extension reader macro that may be provided separately. | MUST |
 | R5.177 | Structure printing MUST use print-function/print-object, falling back to `#S(...)`. | MUST |
 | R5.178 | CLOS objects MUST dispatch through `print-object`. | MUST |
 | R5.179 | Pretty-printer directives `~W`, `~I`, `~:T`, `~_` MUST work within FORMAT. | MUST |
@@ -53,6 +53,8 @@ enum FormatOp {
     Tab { colon: bool, at: bool, colnum: Param, colinc: Param },
     GoTo { colon: bool, at: bool, count: Param },
     Recursive { at: bool },
+    Plural { colon: bool, at: bool },
+    CaseConversion { kind: CaseKind, body: Vec<FormatOp> },
     Conditional { kind: CondKind, clauses: Vec<Vec<FormatOp>>, default: Option<usize> },
     Iteration { colon: bool, at: bool, body: Vec<FormatOp>, max_iter: Param },
     Justify(JustifyOp),
@@ -68,6 +70,7 @@ enum CondKind { Numeric, Boolean, TrueTest }
 enum FloatKind { Fixed, Exponential, General, Dollars }
 enum SimpleKind { Newline(Param), FreshLine(Param), Page(Param), Tilde(Param) }
 enum NewlineKind { Linear, Fill, Miser, Mandatory }
+enum CaseKind { Downcase, Capitalize, CapitalizeFirst, Upcase }
 ```
 
 ### D5.26 JustifyOp
@@ -230,7 +233,7 @@ thread-local LRU (capacity: 256, keyed by string `eq`).
 | `~T` | Tab. `~@T` relative. `~:T`/`~:@T` logical-block tab. |
 | `~*` | Skip args forward. `~:*` backward. `~@*` absolute goto. |
 | `~?` | Recursive FORMAT. `~@?` uses remaining args. |
-| `~P` | Plural "s" if ≠ 1. `~:P` backs up. `~@P` "y"/"ies". |
+| `~P` | Plural "s" if ≠ 1. `~:P` backs up one arg. `~@P` "y"/"ies". `~:@P` backs up then "y"/"ies". |
 | `~(..~)` | Case: `~(` downcase, `~:(` capitalize, `~@(` cap-first, `~:@(` upcase. |
 
 ### Conditional `~[...~]`
@@ -252,12 +255,12 @@ thread-local LRU (capacity: 256, keyed by string `eq`).
 
 ### Justification `~<...~>`
 
-- **Text mode** (no `~:;` first): segments spaced within mincol. `~@<` right, `~:<` pre-pad, `~:@<` center.
-- **Logical-block mode** (first segment ends `~:;`): prefix/suffix/body, closed with `~:>`.
+- **Text mode** (no `~:;` as first separator, and no colon modifier on `~<`): segments spaced within mincol. `~@<` right-justify, `~:@<` center. MUST be closed with `~>` (not `~:>`).
+- **Logical-block mode**: triggered by `~:<` (colon modifier on the opening directive) OR by `~:;` appearing as the first segment separator. Provides prefix/suffix/body for the pretty-printer. MUST be closed with `~:>` (colon modifier on the closing directive). Using `~>` to close a logical block, or `~:>` to close a text justification, is an error (`format-error`).
 
 ### Up-and-Out `~^`
 
-Exits iteration body or suppresses justification segments. `~n^` if n=0; `~n,m^` if n=m; `~n,m,k^` if n≤k≤m. `~:^` exits outer `~:{` iteration.
+Exits iteration body or suppresses justification segments. `~n^` if n=0; `~n,m^` if n=m; `~n,m,k^` if n≤m≤k (the three parameters are tested for monotonic non-decreasing order per ANSI CL §22.3.9.2). `~:^` exits outer `~:{` iteration.
 
 ### User Dispatch `~/name/`
 
@@ -295,7 +298,12 @@ PROCEDURE attempt_output(xp):
         IF emit: output newline + per-line-prefix + indentation
           IF *print-lines* exceeded: output " ..", abort
       Indent{kind, amount} → update block indentation
-      BlockStart / BlockEnd → pop from queue
+      BlockStart{prefix, per_line, section_end}:
+        push_section(xp, xp.column, check_miser(xp), per_line prefix)
+        IF prefix: write prefix to target, advance column
+      BlockEnd{suffix}:
+        IF suffix: write suffix to target, advance column
+        pop_section(xp)
 
 FUNCTION section_fits(xp, section_end) -> bool:
   // Sum text widths in queue[0..section_end]; return true if ≤ line_width.
@@ -315,11 +323,22 @@ PROCEDURE pprint_dispatch(object, table) -> function:
   best = nil; best_priority = -∞
   FOR entry IN table.entries:
     IF typep(object, entry.type_specifier):
-      IF entry.priority > best_priority OR
-         (entry.priority == best_priority AND subtypep(entry.type, best.type)):
+      IF entry.priority > best_priority:
         best = entry
+      ELSE IF entry.priority == best_priority:
+        // ANSI CL §22.2.1.4: behavior is unspecified when priorities are equal.
+        // Bliss extension: prefer the more specific type via subtypep.
+        // When neither type is a subtype of the other, the most recently
+        // added entry wins (stable-order tiebreak).
+        IF subtypep(entry.type, best.type) AND NOT subtypep(best.type, entry.type):
+          best = entry
   RETURN best.function OR default_print_function
 ```
+
+> **Note (Bliss extension):** The `subtypep` tiebreaker when priorities are
+> equal is a Bliss design choice. ANSI CL §22.2.1.4 leaves this behavior
+> unspecified (implementation-dependent). When neither type is a subtype of the
+> other, Bliss uses insertion order as the final tiebreak.
 
 ### Default Entries (R5.168)
 
@@ -350,7 +369,13 @@ PROCEDURE walk(det, object):
   IF immediate(object): RETURN
   IF det.visits[object] exists: det.visits[object] += 1; RETURN
   det.visits.insert(object, 1)
-  recurse into sub-components (car/cdr, vector elts, struct slots, etc.)
+  recurse into sub-components:
+    - cons: car, cdr
+    - vector: each element
+    - array: each element (row-major order)
+    - structure: each slot value (via structure-class slot definitions)
+    - CLOS object: each bound slot value (via class-slots / slot-value; R5.178)
+    - hash-table: each key and value
 
 // Pass 2: Assign labels to objects with visit count > 1.
 FOR (obj, count) IN det.visits WHERE count > 1:
@@ -369,7 +394,7 @@ FOR (obj, count) IN det.visits WHERE count > 1:
 | `*print-escape*` | T | → T | Backslash / `#\` in output |
 | `*print-readably*` | NIL | (master) | Re-readable output or signal error |
 | `*print-pretty*` | NIL | — | Enable XP pretty-printer |
-| `*print-circle*` | NIL | impl-dep | Circularity detection |
+| `*print-circle*` | NIL | → T | Circularity detection (Bliss forces T under `*print-readably*` to guarantee re-readable output for circular structures) |
 | `*print-level*` | NIL | → NIL | Depth truncation (`#`) |
 | `*print-length*` | NIL | → NIL | Length truncation (`...`) |
 | `*print-lines*` | NIL | — | Line count limit |
@@ -437,7 +462,19 @@ approximate character position.
 
 ---
 
-## 5.9.14 Test Strategy
+## 5.9.15 Bliss Extension: Hash-Table Readable Syntax (Future)
+
+ANSI CL defines no standard readable syntax for hash tables. Bliss MAY provide
+an optional reader macro (e.g., `#H((:test eql) (k1 v1) (k2 v2))`) as a
+non-standard extension to enable readable hash-table output. Until such a macro
+is defined and documented, `*print-readably*` with a hash-table argument MUST
+signal `print-not-readable` per R5.171. If a readable hash-table syntax is
+adopted, R5.176 will be updated accordingly and the reader macro will be
+documented in the reader specification (§5.3).
+
+---
+
+## 5.9.16 Test Strategy
 
 | Area | Method |
 |------|--------|
