@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 use bliss_rt::error::BlissError;
 use bliss_rt::value::{BlissVal, TAG_CONS, TAG_MASK};
 
-use crate::reader::symbol_name;
+use crate::reader::{intern_symbol, symbol_name};
 
 // ── Constants ─────────────────────────────────────────────────────
 
@@ -600,6 +600,76 @@ pub fn macroexpand(form: BlissVal, env: &Environment) -> Result<(BlissVal, bool)
     }
 }
 
+/// Get the name of a symbol, if it is one (and not NIL or T).
+fn get_symbol_name(val: BlissVal) -> Option<String> {
+    if !val.is_symbol() || val.is_nil() || val.0 == bliss_rt::value::T.0 {
+        return None;
+    }
+    let idx = val.as_symbol_index();
+    symbol_name(idx)
+}
+
+/// Check if a BlissVal is a symbol with the given name.
+fn is_symbol_named(val: BlissVal, name: &str) -> bool {
+    match get_symbol_name(val) {
+        Some(n) => n == name,
+        None => false,
+    }
+}
+
+/// Intern a CL symbol name and return it as a BlissVal.
+fn make_symbol(name: &str) -> BlissVal {
+    BlissVal::from_symbol_index(intern_symbol(name))
+}
+
+/// Collect cons list elements into a Vec (proper list only).
+fn cons_to_vec(form: BlissVal) -> Vec<BlissVal> {
+    let mut result = Vec::new();
+    let mut current = form;
+    while current.is_cons() {
+        result.push(unsafe { cons_car(current) });
+        current = unsafe { cons_cdr(current) };
+    }
+    result
+}
+
+/// Build a proper cons list from a slice.
+fn vec_to_cons(items: &[BlissVal]) -> BlissVal {
+    let mut result = bliss_rt::value::NIL;
+    for item in items.iter().rev() {
+        result = alloc_cons(*item, result);
+    }
+    result
+}
+
+/// Expand a list of forms, returning a new list.
+fn expand_body(forms: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let items = cons_to_vec(forms);
+    let mut expanded_items = Vec::with_capacity(items.len());
+    let mut changed = false;
+    for item in &items {
+        let exp = macroexpand_all(*item, env)?;
+        if exp != *item {
+            changed = true;
+        }
+        expanded_items.push(exp);
+    }
+    if !changed {
+        Ok(forms)
+    } else {
+        Ok(vec_to_cons(&expanded_items))
+    }
+}
+
+/// Check if operator is a lambda expression: (LAMBDA params body...)
+fn is_lambda_expression(val: BlissVal) -> bool {
+    if !val.is_cons() {
+        return false;
+    }
+    let car = unsafe { cons_car(val) };
+    is_symbol_named(car, "LAMBDA")
+}
+
 /// Fully expand a form and all its subforms (recursive code-walk).
 ///
 /// Implements the `expand-form` algorithm from spec §4.2.3 Phase 3:
@@ -608,10 +678,12 @@ pub fn macroexpand(form: BlissVal, env: &Environment) -> Result<(BlissVal, bool)
 /// 3. If the result is a cons (compound form):
 ///    a. Check for QUOTE — quoted data is opaque, no sub-form expansion
 ///       occurs (spec §4.2.7).
-///    b. Check for compiler macros (spec §4.2.4, R4.12) — if a compiler
+///    b. Dispatch to special-form handlers for special operators (spec §4.2.7).
+///    c. Handle lambda expressions in operator position (spec §4.2.3 step 4.c).
+///    d. Check for compiler macros (spec §4.2.4, R4.12) — if a compiler
 ///       macro exists for the operator and notinline is NOT declared,
 ///       invoke it. If it declines (returns form unchanged), fall through.
-///    c. Per spec §4.2.3 Phase 3 step 4.d.ii, the operator is NOT
+///    e. Per spec §4.2.3 Phase 3 step 4.d.ii, the operator is NOT
 ///       recursively code-walked (only arguments are expanded). The
 ///       operator was already checked for macros by macroexpand above.
 pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
@@ -633,44 +705,767 @@ pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
         return Ok(expanded);
     }
 
-    // Step 3.b: Compiler macro check (spec §4.2.4, R4.12).
+    // Step 3.b: Special operator dispatch (spec §4.2.7).
+    // Special operators have structural subforms (binding names, block names,
+    // tag labels) that must NOT be expanded as expressions.
+    let is_special = matches!(env.function_information(operator), Some(FunctionInfo::SpecialOperator));
+    if is_special || (operator.is_symbol() && is_known_special_operator(operator)) {
+        return expand_special_form(operator, expanded, env);
+    }
+
+    // Step 3.c: Lambda expression in operator position (spec §4.2.3 step 4.c).
+    // A form like ((lambda (x) x) 42) should have its lambda body expanded.
+    if is_lambda_expression(operator) {
+        return expand_lambda_call(operator, expanded, env);
+    }
+
+    // Step 3.d: Compiler macro check (spec §4.2.4, R4.12).
     // Only applies to function-call forms (not special operators or macros
     // after full macroexpansion).
-    if !matches!(env.function_information(operator), Some(FunctionInfo::SpecialOperator)) {
-        if !env.is_notinline(operator) {
-            if let Some(cm_fn) = lookup_compiler_macro(operator) {
-                let cm_result = cm_fn(expanded, env)?;
-                // If the compiler macro returns a form that is NOT pointer-equal
-                // to the input, it accepted — re-enter expand-form on the result.
-                if cm_result.0 != expanded.0 {
-                    return macroexpand_all(cm_result, env);
-                }
-                // Otherwise it declined — fall through to normal expansion.
+    if !env.is_notinline(operator) {
+        if let Some(cm_fn) = lookup_compiler_macro(operator) {
+            let cm_result = cm_fn(expanded, env)?;
+            // If the compiler macro returns a form that is NOT pointer-equal
+            // to the input, it accepted — re-enter expand-form on the result.
+            if cm_result.0 != expanded.0 {
+                return macroexpand_all(cm_result, env);
             }
+            // Otherwise it declined — fall through to normal expansion.
         }
     }
 
-    // Step 3.c: Recursively walk the arguments (CDR) only, not the operator.
-    // Per spec §4.2.3 Phase 3 step 4.d.ii, only the arguments (not the
-    // operator) should be recursively expanded for function calls.
-    let cdr = unsafe { cons_cdr(expanded) };
+    // Step 3.e: Function call — expand arguments only, not the operator.
+    // Per spec §4.2.3 Phase 3 step 4.d.ii.
+    expand_function_call_args(operator, expanded, env)
+}
+
+/// Expand the arguments of a function call form, leaving the operator untouched.
+fn expand_function_call_args(operator: BlissVal, form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let cdr = unsafe { cons_cdr(form) };
     let expanded_cdr = if cdr.is_cons() {
         walk_cons(cdr, env)?
     } else if !cdr.is_nil() {
-        // Dotted pair tail — expand as atom
         let (expanded_cdr_val, _) = macroexpand(cdr, env)?;
         expanded_cdr_val
     } else {
         cdr
     };
 
-    // If nothing changed, return the original form to preserve identity.
     if expanded_cdr == cdr {
-        return Ok(expanded);
+        Ok(form)
+    } else {
+        Ok(alloc_cons(operator, expanded_cdr))
+    }
+}
+
+/// Check if a symbol names a known CL special operator.
+fn is_known_special_operator(val: BlissVal) -> bool {
+    match get_symbol_name(val) {
+        Some(name) => matches!(name.as_str(),
+            "BLOCK" | "CATCH" | "EVAL-WHEN" | "FLET" | "FUNCTION" | "GO" | "IF"
+            | "LABELS" | "LET" | "LET*" | "LOAD-TIME-VALUE" | "LOCALLY"
+            | "MACROLET" | "MULTIPLE-VALUE-CALL" | "MULTIPLE-VALUE-PROG1"
+            | "PROGN" | "PROGV" | "QUOTE" | "RETURN-FROM" | "SETQ"
+            | "SYMBOL-MACROLET" | "TAGBODY" | "THE" | "THROW"
+            | "UNWIND-PROTECT"
+        ),
+        None => false,
+    }
+}
+
+/// Dispatch to the correct special-form expansion handler (spec §4.2.7).
+fn expand_special_form(operator: BlissVal, form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let name = get_symbol_name(operator);
+    let name_str = name.as_deref().unwrap_or("");
+
+    match name_str {
+        "QUOTE" => Ok(form),
+        "GO" => Ok(form),
+        "BLOCK" => expand_block(form, env),
+        "RETURN-FROM" => expand_return_from(form, env),
+        "TAGBODY" => expand_tagbody(form, env),
+        "SETQ" => expand_setq(form, env),
+        "THE" => expand_the(form, env),
+        "EVAL-WHEN" => expand_eval_when(form, env),
+        "FUNCTION" => expand_function_special(form, env),
+        "LET" => expand_let(form, env, false),
+        "LET*" => expand_let(form, env, true),
+        "FLET" => expand_flet(form, env),
+        "LABELS" => expand_labels(form, env),
+        "LOCALLY" => expand_locally(form, env),
+        "MACROLET" => expand_macrolet(form, env),
+        "SYMBOL-MACROLET" => expand_symbol_macrolet(form, env),
+        // For IF, PROGN, CATCH, THROW, UNWIND-PROTECT, MULTIPLE-VALUE-CALL,
+        // MULTIPLE-VALUE-PROG1, PROGV, LOAD-TIME-VALUE — all subforms are
+        // expression positions, so the generic walk is correct.
+        _ => expand_function_call_args(operator, form, env),
+    }
+}
+
+// ── Special form handlers ─────────────────────────────────────────
+
+/// Expand BLOCK: (block name body...)
+/// Block name is NOT expanded; body forms are expanded.
+/// The block name is registered in the environment.
+fn expand_block(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let args = unsafe { cons_cdr(form) };
+    if !args.is_cons() {
+        return Ok(form);
+    }
+    let block_name = unsafe { cons_car(args) };
+    let body = unsafe { cons_cdr(args) };
+
+    // Augment env with block name
+    let new_env = env.augment_block(block_name);
+    let expanded_body = expand_body(body, &new_env)?;
+
+    if expanded_body == body {
+        Ok(form)
+    } else {
+        Ok(alloc_cons(operator, alloc_cons(block_name, expanded_body)))
+    }
+}
+
+/// Expand RETURN-FROM: (return-from name result-form)
+/// Block name is NOT expanded; result form is expanded.
+fn expand_return_from(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let args = unsafe { cons_cdr(form) };
+    if !args.is_cons() {
+        return Ok(form);
+    }
+    let block_name = unsafe { cons_car(args) };
+    let rest = unsafe { cons_cdr(args) };
+
+    if !rest.is_cons() {
+        return Ok(form);
+    }
+    let result_form = unsafe { cons_car(rest) };
+    let expanded_result = macroexpand_all(result_form, env)?;
+
+    if expanded_result == result_form {
+        Ok(form)
+    } else {
+        Ok(alloc_cons(operator, alloc_cons(block_name, alloc_cons(expanded_result, bliss_rt::value::NIL))))
+    }
+}
+
+/// Expand TAGBODY: (tagbody {tag|form}*)
+/// Tags (symbols and integers) are NOT expanded. Non-tag forms are expanded.
+fn expand_tagbody(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let body = unsafe { cons_cdr(form) };
+
+    // First pass: register all tags in the environment
+    let mut new_env = env.clone();
+    let items = cons_to_vec(body);
+    for item in &items {
+        // Tags are symbols or integers (atoms that are not cons)
+        if item.is_symbol() && !item.is_nil() {
+            new_env = new_env.augment_tag(*item);
+        }
     }
 
-    // Build a new cons cell with the operator unchanged and expanded arguments.
-    Ok(alloc_cons(operator, expanded_cdr))
+    // Second pass: expand non-tag forms
+    let mut expanded_items = Vec::with_capacity(items.len());
+    let mut changed = false;
+    for item in &items {
+        if (item.is_symbol() && !item.is_nil()) || item.is_fixnum() {
+            // Tags: symbols and integers are NOT expanded
+            expanded_items.push(*item);
+        } else {
+            let exp = macroexpand_all(*item, &new_env)?;
+            if exp != *item {
+                changed = true;
+            }
+            expanded_items.push(exp);
+        }
+    }
+
+    if !changed {
+        Ok(form)
+    } else {
+        Ok(alloc_cons(operator, vec_to_cons(&expanded_items)))
+    }
+}
+
+/// Expand SETQ: (setq {var value}*)
+/// For each pair: if var is a symbol macro, convert to (setf expansion expanded-value).
+/// Otherwise, expand value only (var is NOT expanded).
+/// Spec §4.2.6, R4.13.
+fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let args = unsafe { cons_cdr(form) };
+    let items = cons_to_vec(args);
+
+    if items.len() % 2 != 0 {
+        return Err(BlissError::Internal("SETQ requires an even number of arguments".into()));
+    }
+
+    let mut result_pairs = Vec::new();
+    let mut any_symbol_macro = false;
+    let mut changed = false;
+
+    for i in (0..items.len()).step_by(2) {
+        let var = items[i];
+        let val_form = items[i + 1];
+
+        // Check if var is a symbol macro
+        if let Some(VariableInfo::SymbolMacro(expansion)) = env.variable_information(var) {
+            // Convert (setq sym val) -> (setf expansion expanded-val)
+            any_symbol_macro = true;
+            let expanded_val = macroexpand_all(val_form, env)?;
+            let setf_sym = make_symbol("SETF");
+            let setf_form = alloc_cons(setf_sym, alloc_cons(expansion, alloc_cons(expanded_val, bliss_rt::value::NIL)));
+            // Re-enter expand-form on the setf form
+            let expanded_setf = macroexpand_all(setf_form, env)?;
+            result_pairs.push((var, val_form, Some(expanded_setf)));
+        } else {
+            // Normal case: expand value, don't expand var
+            let expanded_val = macroexpand_all(val_form, env)?;
+            if expanded_val != val_form {
+                changed = true;
+            }
+            result_pairs.push((var, val_form, None));
+        }
+    }
+
+    if any_symbol_macro {
+        // If we have multiple pairs and any had symbol-macro conversion,
+        // wrap in PROGN for multiple setf forms, or return single form.
+        let mut setf_forms = Vec::new();
+        let mut normal_pairs = Vec::new();
+        for (var, val_form, setf_result) in &result_pairs {
+            if let Some(setf_form) = setf_result {
+                // Flush any accumulated normal setq pairs
+                if !normal_pairs.is_empty() {
+                    let setq_sym = operator;
+                    let mut setq_args = Vec::new();
+                    for (v, expanded_v) in normal_pairs.drain(..) {
+                        setq_args.push(v);
+                        setq_args.push(expanded_v);
+                    }
+                    setf_forms.push(alloc_cons(setq_sym, vec_to_cons(&setq_args)));
+                }
+                setf_forms.push(*setf_form);
+            } else {
+                let expanded_val = macroexpand_all(*val_form, env)?;
+                normal_pairs.push((*var, expanded_val));
+            }
+        }
+        // Flush remaining normal pairs
+        if !normal_pairs.is_empty() {
+            let setq_sym = operator;
+            let mut setq_args = Vec::new();
+            for (v, expanded_v) in normal_pairs.drain(..) {
+                setq_args.push(v);
+                setq_args.push(expanded_v);
+            }
+            setf_forms.push(alloc_cons(setq_sym, vec_to_cons(&setq_args)));
+        }
+
+        if setf_forms.len() == 1 {
+            return Ok(setf_forms.into_iter().next().unwrap());
+        } else {
+            let progn_sym = make_symbol("PROGN");
+            return Ok(alloc_cons(progn_sym, vec_to_cons(&setf_forms)));
+        }
+    }
+
+    if !changed {
+        return Ok(form);
+    }
+
+    // Reconstruct with expanded values
+    let mut new_args = Vec::with_capacity(items.len());
+    for (var, _, _) in &result_pairs {
+        new_args.push(*var);
+    }
+    // Re-expand to get the right values
+    let mut final_args = Vec::with_capacity(items.len());
+    for i in (0..items.len()).step_by(2) {
+        final_args.push(items[i]); // var unchanged
+        final_args.push(macroexpand_all(items[i + 1], env)?); // expand value
+    }
+    Ok(alloc_cons(operator, vec_to_cons(&final_args)))
+}
+
+/// Expand THE: (the type-spec value-form)
+/// Type specifier is NOT expanded; value form is expanded.
+fn expand_the(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let args = unsafe { cons_cdr(form) };
+    if !args.is_cons() {
+        return Ok(form);
+    }
+    let type_spec = unsafe { cons_car(args) };
+    let rest = unsafe { cons_cdr(args) };
+    if !rest.is_cons() {
+        return Ok(form);
+    }
+    let value_form = unsafe { cons_car(rest) };
+    let expanded_value = macroexpand_all(value_form, env)?;
+
+    if expanded_value == value_form {
+        Ok(form)
+    } else {
+        Ok(alloc_cons(operator, alloc_cons(type_spec, alloc_cons(expanded_value, bliss_rt::value::NIL))))
+    }
+}
+
+/// Expand EVAL-WHEN: (eval-when (situation...) body...)
+/// Situations list is NOT expanded; body forms are expanded.
+fn expand_eval_when(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let args = unsafe { cons_cdr(form) };
+    if !args.is_cons() {
+        return Ok(form);
+    }
+    let situations = unsafe { cons_car(args) };
+    let body = unsafe { cons_cdr(args) };
+
+    let expanded_body = expand_body(body, env)?;
+
+    if expanded_body == body {
+        Ok(form)
+    } else {
+        Ok(alloc_cons(operator, alloc_cons(situations, expanded_body)))
+    }
+}
+
+/// Expand FUNCTION special form: (function name) or (function (lambda ...))
+/// If the argument is a lambda expression, expand the lambda body.
+/// If it's a function name, no expansion.
+fn expand_function_special(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let args = unsafe { cons_cdr(form) };
+    if !args.is_cons() {
+        return Ok(form);
+    }
+    let arg = unsafe { cons_car(args) };
+
+    // Check if the argument is a lambda expression
+    if is_lambda_expression(arg) {
+        let expanded_lambda = expand_lambda_expression(arg, env)?;
+        if expanded_lambda == arg {
+            Ok(form)
+        } else {
+            Ok(alloc_cons(operator, alloc_cons(expanded_lambda, bliss_rt::value::NIL)))
+        }
+    } else {
+        // (function name) — no expansion
+        Ok(form)
+    }
+}
+
+/// Expand a lambda expression: (lambda (params...) body...)
+/// Parameters are NOT expanded (they are binding names).
+/// Body is expanded in an env augmented with param bindings.
+fn expand_lambda_expression(lambda: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let lambda_sym = unsafe { cons_car(lambda) }; // LAMBDA
+    let rest = unsafe { cons_cdr(lambda) };
+    if !rest.is_cons() {
+        return Ok(lambda);
+    }
+    let params = unsafe { cons_car(rest) }; // parameter list
+    let body = unsafe { cons_cdr(rest) }; // body forms
+
+    // Augment environment with parameter bindings (shadow any symbol macros)
+    let mut new_env = env.clone();
+    let param_list = cons_to_vec(params);
+    for param in &param_list {
+        if param.is_symbol() && !param.is_nil() {
+            // Skip lambda list keywords (&optional, &rest, &key, &body, &allow-other-keys, &aux, &whole, &environment)
+            if let Some(name) = get_symbol_name(*param) {
+                if name.starts_with('&') {
+                    continue;
+                }
+            }
+            new_env = new_env.augment_variable(*param, VariableInfo::Lexical);
+        }
+    }
+
+    let expanded_body = expand_body(body, &new_env)?;
+
+    if expanded_body == body {
+        Ok(lambda)
+    } else {
+        Ok(alloc_cons(lambda_sym, alloc_cons(params, expanded_body)))
+    }
+}
+
+/// Expand a lambda call: ((lambda (params...) body...) arg1 arg2 ...)
+/// Expand the lambda body AND the arguments.
+fn expand_lambda_call(operator: BlissVal, form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let args = unsafe { cons_cdr(form) };
+
+    // Expand the lambda expression
+    let expanded_lambda = expand_lambda_expression(operator, env)?;
+
+    // Expand the arguments
+    let expanded_args = if args.is_cons() {
+        walk_cons(args, env)?
+    } else {
+        args
+    };
+
+    if expanded_lambda == operator && expanded_args == args {
+        Ok(form)
+    } else {
+        Ok(alloc_cons(expanded_lambda, expanded_args))
+    }
+}
+
+/// Expand LET or LET*: (let/let* ((var init)...) decl* body*)
+/// Binding variable names are NOT expanded. Init forms are expanded.
+/// Body is expanded in an env augmented with the new bindings (shadowing symbol macros).
+/// For LET, all init-forms are expanded in the outer env.
+/// For LET*, each init-form is expanded in an env augmented by prior bindings.
+fn expand_let(form: BlissVal, env: &Environment, sequential: bool) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let args = unsafe { cons_cdr(form) };
+    if !args.is_cons() {
+        return Ok(form);
+    }
+    let bindings_list = unsafe { cons_car(args) };
+    let body = unsafe { cons_cdr(args) };
+
+    let bindings = cons_to_vec(bindings_list);
+
+    // Expand init-forms and collect variable names
+    let mut expanded_bindings = Vec::with_capacity(bindings.len());
+    let mut bindings_changed = false;
+    let mut current_env = env.clone();
+
+    for binding in &bindings {
+        if binding.is_cons() {
+            // (var init-form) pair
+            let var = unsafe { cons_car(*binding) };
+            let init_rest = unsafe { cons_cdr(*binding) };
+            let init_form = if init_rest.is_cons() {
+                unsafe { cons_car(init_rest) }
+            } else {
+                bliss_rt::value::NIL
+            };
+
+            // For LET*, expand in the progressively-augmented env
+            // For LET, expand in the outer env
+            let expand_env = if sequential { &current_env } else { env };
+            let expanded_init = macroexpand_all(init_form, expand_env)?;
+
+            if expanded_init != init_form {
+                bindings_changed = true;
+            }
+            // Reconstruct binding: (var expanded-init)
+            expanded_bindings.push(alloc_cons(var, alloc_cons(expanded_init, bliss_rt::value::NIL)));
+
+            // For LET*, augment env after each binding
+            if sequential {
+                current_env = current_env.augment_variable(var, VariableInfo::Lexical);
+            }
+        } else {
+            // Bare symbol — (let (x) ...) means (let ((x nil)) ...)
+            expanded_bindings.push(*binding);
+        }
+    }
+
+    // Build augmented env for the body
+    let mut body_env = if sequential { current_env } else { env.clone() };
+    if !sequential {
+        for binding in &bindings {
+            let var = if binding.is_cons() {
+                unsafe { cons_car(*binding) }
+            } else {
+                *binding
+            };
+            if var.is_symbol() && !var.is_nil() {
+                body_env = body_env.augment_variable(var, VariableInfo::Lexical);
+            }
+        }
+    }
+
+    let expanded_body = expand_body(body, &body_env)?;
+
+    if !bindings_changed && expanded_body == body {
+        Ok(form)
+    } else {
+        let new_bindings = vec_to_cons(&expanded_bindings);
+        Ok(alloc_cons(operator, alloc_cons(new_bindings, expanded_body)))
+    }
+}
+
+/// Expand FLET: (flet ((name (params) fn-body...) ...) body...)
+/// Function names are NOT expanded. Function bodies are expanded in the outer env.
+/// Body is expanded in an env augmented with the function bindings.
+fn expand_flet(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let args = unsafe { cons_cdr(form) };
+    if !args.is_cons() {
+        return Ok(form);
+    }
+    let fn_defs = unsafe { cons_car(args) };
+    let body = unsafe { cons_cdr(args) };
+
+    let defs = cons_to_vec(fn_defs);
+    let mut expanded_defs = Vec::with_capacity(defs.len());
+    let mut defs_changed = false;
+
+    // FLET: function bodies are expanded in the OUTER env (not the augmented one)
+    for def in &defs {
+        if !def.is_cons() {
+            expanded_defs.push(*def);
+            continue;
+        }
+        let fn_name = unsafe { cons_car(*def) };
+        let fn_rest = unsafe { cons_cdr(*def) };
+        if !fn_rest.is_cons() {
+            expanded_defs.push(*def);
+            continue;
+        }
+        let params = unsafe { cons_car(fn_rest) };
+        let fn_body = unsafe { cons_cdr(fn_rest) };
+
+        // Augment env with params for expanding the function body
+        let mut fn_env = env.clone();
+        let param_list = cons_to_vec(params);
+        for param in &param_list {
+            if param.is_symbol() && !param.is_nil() {
+                if let Some(name) = get_symbol_name(*param) {
+                    if name.starts_with('&') {
+                        continue;
+                    }
+                }
+                fn_env = fn_env.augment_variable(*param, VariableInfo::Lexical);
+            }
+        }
+
+        let expanded_fn_body = expand_body(fn_body, &fn_env)?;
+        if expanded_fn_body != fn_body {
+            defs_changed = true;
+        }
+        expanded_defs.push(alloc_cons(fn_name, alloc_cons(params, expanded_fn_body)));
+    }
+
+    // Augment env with function names for the body
+    let mut body_env = env.clone();
+    for def in &defs {
+        if def.is_cons() {
+            let fn_name = unsafe { cons_car(*def) };
+            body_env = body_env.augment_function(fn_name, FunctionInfo::Lexical);
+        }
+    }
+
+    let expanded_body = expand_body(body, &body_env)?;
+
+    if !defs_changed && expanded_body == body {
+        Ok(form)
+    } else {
+        let new_defs = vec_to_cons(&expanded_defs);
+        Ok(alloc_cons(operator, alloc_cons(new_defs, expanded_body)))
+    }
+}
+
+/// Expand LABELS: (labels ((name (params) fn-body...) ...) body...)
+/// Like FLET, but function bodies ARE expanded in the augmented env
+/// (functions are visible in their own bodies — recursive).
+fn expand_labels(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let args = unsafe { cons_cdr(form) };
+    if !args.is_cons() {
+        return Ok(form);
+    }
+    let fn_defs = unsafe { cons_car(args) };
+    let body = unsafe { cons_cdr(args) };
+
+    let defs = cons_to_vec(fn_defs);
+
+    // LABELS: first augment env with ALL function names (recursive visibility)
+    let mut augmented_env = env.clone();
+    for def in &defs {
+        if def.is_cons() {
+            let fn_name = unsafe { cons_car(*def) };
+            augmented_env = augmented_env.augment_function(fn_name, FunctionInfo::Lexical);
+        }
+    }
+
+    // Now expand function bodies in the augmented env
+    let mut expanded_defs = Vec::with_capacity(defs.len());
+    let mut defs_changed = false;
+    for def in &defs {
+        if !def.is_cons() {
+            expanded_defs.push(*def);
+            continue;
+        }
+        let fn_name = unsafe { cons_car(*def) };
+        let fn_rest = unsafe { cons_cdr(*def) };
+        if !fn_rest.is_cons() {
+            expanded_defs.push(*def);
+            continue;
+        }
+        let params = unsafe { cons_car(fn_rest) };
+        let fn_body = unsafe { cons_cdr(fn_rest) };
+
+        // Augment with params
+        let mut fn_env = augmented_env.clone();
+        let param_list = cons_to_vec(params);
+        for param in &param_list {
+            if param.is_symbol() && !param.is_nil() {
+                if let Some(name) = get_symbol_name(*param) {
+                    if name.starts_with('&') {
+                        continue;
+                    }
+                }
+                fn_env = fn_env.augment_variable(*param, VariableInfo::Lexical);
+            }
+        }
+
+        let expanded_fn_body = expand_body(fn_body, &fn_env)?;
+        if expanded_fn_body != fn_body {
+            defs_changed = true;
+        }
+        expanded_defs.push(alloc_cons(fn_name, alloc_cons(params, expanded_fn_body)));
+    }
+
+    let expanded_body = expand_body(body, &augmented_env)?;
+
+    if !defs_changed && expanded_body == body {
+        Ok(form)
+    } else {
+        let new_defs = vec_to_cons(&expanded_defs);
+        Ok(alloc_cons(operator, alloc_cons(new_defs, expanded_body)))
+    }
+}
+
+/// Expand LOCALLY: (locally decl* body*)
+/// Declarations are processed but NOT expanded. Body is expanded.
+fn expand_locally(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let operator = unsafe { cons_car(form) };
+    let body = unsafe { cons_cdr(form) };
+
+    // Skip declarations (forms starting with DECLARE), expand the rest
+    let items = cons_to_vec(body);
+    let mut decls = Vec::new();
+    let mut body_forms = Vec::new();
+    let mut in_decls = true;
+    for item in &items {
+        if in_decls && item.is_cons() {
+            let car = unsafe { cons_car(*item) };
+            if is_symbol_named(car, "DECLARE") {
+                decls.push(*item);
+                continue;
+            }
+        }
+        in_decls = false;
+        body_forms.push(*item);
+    }
+
+    let mut expanded_body_forms = Vec::with_capacity(body_forms.len());
+    let mut changed = false;
+    for bf in &body_forms {
+        let exp = macroexpand_all(*bf, env)?;
+        if exp != *bf {
+            changed = true;
+        }
+        expanded_body_forms.push(exp);
+    }
+
+    if !changed {
+        Ok(form)
+    } else {
+        let mut all_items = decls;
+        all_items.extend(expanded_body_forms);
+        Ok(alloc_cons(operator, vec_to_cons(&all_items)))
+    }
+}
+
+/// Expand MACROLET: (macrolet ((name lambda-list macro-body...) ...) body...)
+/// Install local macro definitions into a new environment.
+/// Expand body in the augmented env. Strip MACROLET from output (spec §4.2.7).
+fn expand_macrolet(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let args = unsafe { cons_cdr(form) };
+    if !args.is_cons() {
+        return Ok(form);
+    }
+    let macro_defs = unsafe { cons_car(args) };
+    let body = unsafe { cons_cdr(args) };
+
+    // Install macro definitions in a new environment frame
+    let mut augmented_env = env.clone();
+    let defs = cons_to_vec(macro_defs);
+    for def in &defs {
+        if !def.is_cons() {
+            continue;
+        }
+        let macro_name = unsafe { cons_car(*def) };
+        let _macro_rest = unsafe { cons_cdr(*def) };
+        // The expander is the macro definition itself — store the def as the expander.
+        // In a full implementation, parse-macro + enclose would compile this.
+        // For now, register as a Macro binding so macroexpand_1 can find it.
+        augmented_env = augmented_env.augment_function(macro_name, FunctionInfo::Macro(*def));
+    }
+
+    // Expand body in augmented env
+    let expanded_body = expand_body(body, &augmented_env)?;
+
+    // Strip MACROLET wrapper: output as (LOCALLY expanded-body...) or
+    // if single body form, just return it.
+    let body_items = cons_to_vec(expanded_body);
+    if body_items.len() == 1 {
+        Ok(body_items[0])
+    } else {
+        let progn_sym = make_symbol("PROGN");
+        Ok(alloc_cons(progn_sym, expanded_body))
+    }
+}
+
+/// Expand SYMBOL-MACROLET: (symbol-macrolet ((sym expansion)...) body...)
+/// Install symbol-macro bindings in the environment.
+/// Expand body in the augmented env. Strip SYMBOL-MACROLET from output (spec §4.2.7).
+fn expand_symbol_macrolet(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let args = unsafe { cons_cdr(form) };
+    if !args.is_cons() {
+        return Ok(form);
+    }
+    let bindings_list = unsafe { cons_car(args) };
+    let body = unsafe { cons_cdr(args) };
+
+    // Install symbol-macro bindings
+    let mut augmented_env = env.clone();
+    let bindings = cons_to_vec(bindings_list);
+    for binding in &bindings {
+        if !binding.is_cons() {
+            continue;
+        }
+        let sym = unsafe { cons_car(*binding) };
+        let expansion_rest = unsafe { cons_cdr(*binding) };
+        let expansion = if expansion_rest.is_cons() {
+            unsafe { cons_car(expansion_rest) }
+        } else {
+            bliss_rt::value::NIL
+        };
+
+        // Validate: symbol-macrolet of a special variable is an error
+        if let Some(VariableInfo::Special) = env.variable_information(sym) {
+            return Err(BlissError::Internal(
+                "SYMBOL-MACROLET: cannot define symbol macro for special variable".into(),
+            ));
+        }
+
+        augmented_env = augmented_env.augment_variable(sym, VariableInfo::SymbolMacro(expansion));
+    }
+
+    // Expand body in augmented env
+    let expanded_body = expand_body(body, &augmented_env)?;
+
+    // Strip SYMBOL-MACROLET wrapper from output
+    let body_items = cons_to_vec(expanded_body);
+    if body_items.len() == 1 {
+        Ok(body_items[0])
+    } else {
+        let progn_sym = make_symbol("PROGN");
+        Ok(alloc_cons(progn_sym, expanded_body))
+    }
 }
 
 /// Check if a BlissVal is the QUOTE symbol.

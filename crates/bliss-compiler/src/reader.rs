@@ -20,7 +20,7 @@ struct SymbolTable {
     next_index: u32,
 }
 
-fn intern_symbol(name: &str) -> u32 {
+pub fn intern_symbol(name: &str) -> u32 {
     let mut guard = SYMBOL_TABLE.lock().unwrap();
     let table = guard.get_or_insert_with(|| SymbolTable {
         name_to_index: HashMap::new(),
