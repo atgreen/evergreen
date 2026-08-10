@@ -68,7 +68,7 @@ pub struct MethodCounters {
 pub const MAX_BACKEDGE_COUNTERS: usize = 8;
 ```
 
-**Layout (128 bytes total):**
+**Layout (64 bytes total):**
 
 | Offset | Size | Field |
 |--------|------|-------|
@@ -76,12 +76,13 @@ pub const MAX_BACKEDGE_COUNTERS: usize = 8;
 | 4 | 1 | `hot_flag` |
 | 5 | 27 | padding |
 | 32 | 4×8 = 32 | `backedge_counts[0..8]` |
-| 64 | 64 | reserved / future (second cache line) |
 
 **Invariants:**
 
-- `invoke_count` is monotonically non-decreasing; wrapping past `u32::MAX`
-  saturates at `u32::MAX` (checked increment).
+- `invoke_count` is monotonically non-decreasing. The hardware `lock inc`
+  instruction wraps at `u32::MAX` → 0; this is harmless because any
+  value near `u32::MAX` has long since exceeded every promotion threshold,
+  and wrapping to 0 merely delays (never causes) a redundant re-promotion.
 - `hot_flag` transitions 0→1 exactly once per compilation cycle. Reset
   to 0 only by the compilation scheduler after enqueuing the function
   for T2 compilation.
@@ -256,6 +257,15 @@ impl MethodCounters {
         self.backedge_counts[idx].load(Ordering::Relaxed)
     }
 
+    /// Set the hot flag (called by mutator on threshold crossing).
+    /// Release ordering ensures that the counter increment that
+    /// triggered this store is visible to the scheduler's subsequent
+    /// Acquire load.
+    #[inline]
+    pub fn set_hot(&self) {
+        self.hot_flag.store(1, Ordering::Release);
+    }
+
     /// Check and clear the hot flag (called by scheduler).
     /// Uses Acquire ordering so that counter reads that follow
     /// observe at least the values that preceded the flag set.
@@ -350,11 +360,12 @@ FUNCTION compute_priority(counters) → u32:
 ### Priority queue
 
 The `CompileQueue` is a lock-free MPSC (multi-producer, single-consumer)
-queue. The single consumer is the T2 compilation thread. When multiple
-requests are pending, the T2 thread dequeues in priority order
-(highest `priority` first). Duplicate requests for the same function are
-deduplicated by checking the function's `hot_flag` state before starting
-compilation.
+FIFO queue. The single consumer is the T2 compilation thread. The queue
+itself imposes no ordering beyond insertion order; when the T2 thread
+drains the queue it sorts the batch of pending requests by `priority`
+(highest first) before processing them. Duplicate requests for the same
+function are deduplicated by checking the function's `hot_flag` state
+before starting compilation.
 
 ### Demotion / deoptimisation feedback
 
@@ -483,7 +494,7 @@ The overhead budget is allocated as follows:
 | JIT-dump file open/write failure | Log warning; disable JIT-dump for the session. Execution continues normally. |
 | Perf map file write failure | Log warning; disable perf map. No effect on execution. |
 | CompileQueue full (back-pressure) | Drop lowest-priority request; log at debug level. Function stays at T1 until next poll cycle. |
-| Counter overflow (`u32::MAX`) | Saturate; function is already far past promotion threshold. |
+| Counter wrap (`u32::MAX` → 0) | Benign; function is already far past promotion threshold. No corrective action needed (see §4.9.2 invariants). |
 
 ---
 
