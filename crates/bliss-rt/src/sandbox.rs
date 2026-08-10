@@ -24,44 +24,81 @@ pub struct SandboxPolicy {
 }
 
 impl Default for SandboxPolicy {
+    /// Per spec §8.2.2 R8.02: default set MUST be empty (deny-all).
     fn default() -> Self {
-        unimplemented!("SandboxPolicy::default")
+        SandboxPolicy {
+            allow_filesystem: false,
+            allow_network: false,
+            allow_ffi: false,
+            allow_subprocess: false,
+            max_heap_bytes: 0,
+            max_threads: 0,
+            allowed_paths: Vec::new(),
+        }
     }
 }
 
 /// The active sandbox, enforcing resource limits.
 pub struct Sandbox {
-    _private: (),
+    policy: SandboxPolicy,
 }
 
 impl Sandbox {
     /// Create a new sandbox with the given policy.
     pub fn new(policy: SandboxPolicy) -> Result<Self, BlissError> {
-        unimplemented!("Sandbox::new")
+        Ok(Sandbox { policy })
     }
 
     /// Check if a filesystem path is accessible under the current policy.
     pub fn check_path(&self, path: &str) -> Result<(), BlissError> {
-        unimplemented!("Sandbox::check_path")
+        if self.policy.allow_filesystem {
+            return Ok(());
+        }
+        // Check if path falls under any allowed_paths exception
+        for allowed in &self.policy.allowed_paths {
+            if path.starts_with(allowed.as_str()) {
+                return Ok(());
+            }
+        }
+        Err(BlissError::SandboxViolation(format!(
+            "filesystem access denied: {}",
+            path
+        )))
     }
 
     /// Check if network access is allowed.
     pub fn check_network(&self) -> Result<(), BlissError> {
-        unimplemented!("Sandbox::check_network")
+        if self.policy.allow_network {
+            Ok(())
+        } else {
+            Err(BlissError::SandboxViolation(
+                "network access denied".into(),
+            ))
+        }
     }
 
     /// Check if FFI calls are allowed.
     pub fn check_ffi(&self) -> Result<(), BlissError> {
-        unimplemented!("Sandbox::check_ffi")
+        if self.policy.allow_ffi {
+            Ok(())
+        } else {
+            Err(BlissError::SandboxViolation("FFI access denied".into()))
+        }
     }
 
     /// Check if subprocess creation is allowed.
     pub fn check_subprocess(&self) -> Result<(), BlissError> {
-        unimplemented!("Sandbox::check_subprocess")
+        if self.policy.allow_subprocess {
+            Ok(())
+        } else {
+            Err(BlissError::SandboxViolation(
+                "subprocess creation denied".into(),
+            ))
+        }
     }
 
     /// Get the current policy.
     pub fn policy(&self) -> &SandboxPolicy {
-        unimplemented!("Sandbox::policy")
+        &self.policy
     }
 }
