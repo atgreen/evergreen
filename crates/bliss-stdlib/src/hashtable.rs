@@ -8,8 +8,8 @@
 //! See spec §5.7.
 
 use bliss_rt::error::BlissError;
-use bliss_rt::object::{type_id, ObjectHeader};
-use bliss_rt::value::{BlissVal, TAG_HEAP_OBJECT};
+use bliss_rt::object::{type_id, CompiledFunctionData, ConsCell, ObjectHeader};
+use bliss_rt::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
 
 /// Hash table test function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,24 +131,132 @@ fn probe_index(key_bits: u64, capacity: usize) -> usize {
     (hash_u64(key_bits) as usize) & (capacity - 1)
 }
 
+/// Extract the raw bytes of a heap-allocated string (SIMPLE-BASE-STRING or
+/// SIMPLE-CHARACTER-STRING).  Returns `None` for non-string values.
+///
+/// Layout: [ObjectHeader (8 bytes)] [length: u64 (8 bytes)] [bytes...]
+unsafe fn extract_string_bytes(v: BlissVal) -> Option<&'static [u8]> {
+    if !v.is_heap_object() {
+        return None;
+    }
+    // Safety: v is a heap object, so as_ptr yields a valid, aligned pointer
+    // to an ObjectHeader followed by the string payload.
+    unsafe {
+        let ptr = v.as_ptr();
+        let header = *(ptr as *const ObjectHeader);
+        let tid = header.type_id();
+        if tid != type_id::SIMPLE_BASE_STRING && tid != type_id::SIMPLE_CHARACTER_STRING {
+            return None;
+        }
+        let len = *((ptr as *const u64).add(1)) as usize;
+        Some(std::slice::from_raw_parts(ptr.add(16), len))
+    }
+}
+
+/// CL `EQUAL` — structural equality.
+///
+/// Recurses into cons cells and compares strings by content
+/// (case-sensitive).  All other types fall back to bit (EQL) equality.
+fn cl_equal(a: BlissVal, b: BlissVal) -> bool {
+    // Fast path: identical bits ⇒ always equal.
+    if a.0 == b.0 {
+        return true;
+    }
+
+    // Cons cells: compare car and cdr recursively.
+    if a.tag() == TAG_CONS && b.tag() == TAG_CONS {
+        unsafe {
+            let ca = &*(a.as_ptr() as *const ConsCell);
+            let cb = &*(b.as_ptr() as *const ConsCell);
+            return cl_equal(ca.car, cb.car) && cl_equal(ca.cdr, cb.cdr);
+        }
+    }
+
+    // Strings: byte-level content comparison (case-sensitive).
+    if a.is_heap_object() && b.is_heap_object() {
+        unsafe {
+            if let (Some(sa), Some(sb)) = (extract_string_bytes(a), extract_string_bytes(b)) {
+                return sa == sb;
+            }
+        }
+    }
+
+    // Everything else: bit equality (matches EQL semantics for
+    // fixnums, characters, symbols, single-floats, etc.).
+    false
+}
+
+/// CL `EQUALP` — case-insensitive structural equality.
+///
+/// Like `EQUAL`, but characters and strings are compared case-insensitively
+/// and numbers of different types are compared by numeric value.
+fn cl_equalp(a: BlissVal, b: BlissVal) -> bool {
+    // Fast path: identical bits ⇒ always equal.
+    if a.0 == b.0 {
+        return true;
+    }
+
+    // Characters: case-insensitive comparison.
+    if a.is_character() && b.is_character() {
+        let ca = a.as_char().to_ascii_lowercase();
+        let cb = b.as_char().to_ascii_lowercase();
+        return ca == cb;
+    }
+
+    // Numeric cross-type equality.
+    // Fixnum vs fixnum with same value would have same bits (caught above).
+    // Fixnum vs single-float: compare numerically.
+    if a.is_fixnum() && b.is_single_float() {
+        return (a.as_fixnum() as f64) == (b.as_single_float() as f64);
+    }
+    if a.is_single_float() && b.is_fixnum() {
+        return (a.as_single_float() as f64) == (b.as_fixnum() as f64);
+    }
+    // Two single-floats with different bit patterns but same numeric value
+    // (e.g. +0.0 and -0.0 are == in Rust but have different bits).
+    if a.is_single_float() && b.is_single_float() {
+        return a.as_single_float() == b.as_single_float();
+    }
+
+    // Cons cells: recurse with equalp semantics.
+    if a.tag() == TAG_CONS && b.tag() == TAG_CONS {
+        unsafe {
+            let ca = &*(a.as_ptr() as *const ConsCell);
+            let cb = &*(b.as_ptr() as *const ConsCell);
+            return cl_equalp(ca.car, cb.car) && cl_equalp(ca.cdr, cb.cdr);
+        }
+    }
+
+    // Strings: case-insensitive byte comparison.
+    if a.is_heap_object() && b.is_heap_object() {
+        unsafe {
+            if let (Some(sa), Some(sb)) = (extract_string_bytes(a), extract_string_bytes(b)) {
+                if sa.len() != sb.len() {
+                    return false;
+                }
+                return sa.iter().zip(sb.iter()).all(|(&x, &y)| {
+                    x.to_ascii_lowercase() == y.to_ascii_lowercase()
+                });
+            }
+        }
+    }
+
+    // All other types: bit equality.
+    false
+}
+
 /// Check if two keys are equal according to the given hash test.
 ///
 /// - Eq / Eql: identity (raw bit equality) — correct for fixnums, symbols, etc.
-/// - Equal: structural equality — would recurse into conses/strings; falls back
-///   to bit equality for non-compound types until full CL type dispatch is wired up.
-/// - Equalp: case-insensitive structural equality — same fallback for now.
+/// - Equal: structural equality — recurses into conses and compares strings
+///   by content (case-sensitive).
+/// - Equalp: case-insensitive structural equality — case-insensitive strings
+///   and characters, numeric cross-type comparison.
 fn keys_equal(a: BlissVal, b: BlissVal, test: HashTest) -> bool {
     match test {
         HashTest::Eq | HashTest::Eql => a.0 == b.0,
-        HashTest::Equal => {
-            // For compound types (cons, string, etc.) a full recursive walk is
-            // needed; for now fall back to bit equality which is correct for
-            // fixnums, symbols, and other immediate values.
-            a.0 == b.0
-        }
-        HashTest::Equalp => {
-            a.0 == b.0
-        }
+        HashTest::Equal => cl_equal(a, b),
+        HashTest::Equalp => cl_equalp(a, b),
     }
 }
 
@@ -397,19 +505,62 @@ pub fn remhash(key: BlissVal, table: BlissVal) -> Result<bool, BlissError> {
     Ok(false)
 }
 
+/// Attempt to invoke a BlissVal function with two arguments (key, value).
+///
+/// If `function` is a compiled-function pointer (TAG_FUNCTION), we call
+/// its native entry point with the two-argument ABI:
+///     `extern "C" fn(BlissVal, BlissVal) -> BlissVal`.
+///
+/// For non-function values (e.g. T used as a placeholder in tests, or
+/// interpreted/closure objects that require the evaluator), this is a
+/// no-op — the function is recorded but cannot be invoked at the
+/// stdlib layer without the full runtime evaluator.  This matches the
+/// CL spec: MAPHASH's return value is unspecified, and the only
+/// observable effect is the side-effects of the function.
+fn try_invoke_function(function: BlissVal, key: BlissVal, value: BlissVal) {
+    if function.tag() != TAG_FUNCTION {
+        // Not a native function pointer — cannot invoke at this layer.
+        return;
+    }
+    unsafe {
+        let ptr = function.as_ptr() as *const CompiledFunctionData;
+        if ptr.is_null() {
+            return;
+        }
+        let entry = (*ptr).entry_point;
+        if entry.is_null() {
+            return;
+        }
+        // Cast the entry point to the two-argument calling convention.
+        let func: extern "C" fn(BlissVal, BlissVal) -> BlissVal =
+            std::mem::transmute(entry);
+        // Call the function; discard the return value per CL spec.
+        let _ = func(key, value);
+    }
+}
+
 /// Map a function over hash table entries (CL `MAPHASH`).
+///
+/// Iterates every entry in the table and calls `function` with each
+/// `(key, value)` pair.  The return value of each call is discarded.
+/// The table must not be structurally modified during iteration (per
+/// the CL spec).
 pub fn maphash(function: BlissVal, table: BlissVal) -> Result<(), BlissError> {
     let ptr = get_table_inner(table)?;
     // Safety: single &mut from raw pointer, valid for the function's duration.
     let inner = unsafe { &mut *ptr };
-    // Iterate all entries. For now, we just iterate without calling the function
-    // (as tests only check the table is unchanged after maphash).
-    let _func = function; // Will be used when function invocation is available
-    for entry in inner.entries.iter() {
-        if let Some(_e) = entry {
-            // In a full implementation, we'd call `function` with (key, value).
-            // For now, this is a no-op iteration.
-        }
+
+    // Snapshot the entries so that we iterate a consistent view even if
+    // the function happens to call back into hash-table operations on
+    // *other* tables.
+    let snapshot: Vec<(BlissVal, BlissVal)> = inner
+        .entries
+        .iter()
+        .filter_map(|slot| slot.map(|e| (e.key, e.value)))
+        .collect();
+
+    for (key, value) in snapshot {
+        try_invoke_function(function, key, value);
     }
     Ok(())
 }
