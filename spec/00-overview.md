@@ -91,6 +91,8 @@ cross-referencing. Code modules reference spec sections as `§N.M`.
 | `07-ops-portability.md` | §7 Ops & Portability | Image save/load, deployment, platform matrix, config |
 | `08-security-robustness.md` | §8 Security | Sandboxing, safe FFI, resource limits, signal safety |
 | `09-extensions.md` | §9 SBCL Extensions | Adopted SBCL-compatible extensions, rationale, compatibility |
+| `10-testing-validation.md` | §10 Testing & Validation | ANSI test suite, benchmarks, CI, fuzzing strategy |
+| `11-phasing-roadmap.md` | §11 Phasing & Roadmap | Bootstrap phases, milestones, self-hosting path |
 
 ## 3  Directory Structure (Source Tree)
 
