@@ -126,9 +126,17 @@ fn apply_key(key: Option<BlissVal>, val: BlissVal) -> BlissVal {
                     if val.is_fixnum() {
                         return BlissVal::from_fixnum(-val.as_fixnum());
                     }
+                    return val;
                 }
+                // Unrecognised symbol key — cannot invoke without VM.
+                // Panic rather than silently returning identity.
+                panic!("apply_key: unsupported key function (symbol index {}); VM callback required", idx);
             }
-            // Default: identity
+            if k.tag() == bliss_rt::value::TAG_FUNCTION {
+                // Compiled closure / function pointer — cannot invoke without VM.
+                panic!("apply_key: TAG_FUNCTION key requires VM callback to invoke");
+            }
+            // Default: identity for T or other immediate values used as key
             val
         }
     }
@@ -140,6 +148,8 @@ const SYMBOL_CUSTOM_TEST: u32 = 2;
 const SYMBOL_SUBTRACTION: u32 = 5;
 /// Symbol index constant for multiplication.
 const SYMBOL_MULTIPLICATION: u32 = 6;
+/// Symbol index constant for VECTOR result-type.
+const SYMBOL_VECTOR: u32 = 7;
 
 /// Test two values for equality using the given test function.
 /// - NIL (default): EQL semantics — raw BlissVal equality (works for fixnums, chars, symbols).
@@ -169,6 +179,20 @@ fn test_equal(test: BlissVal, a: BlissVal, b: BlissVal) -> bool {
                     let cell_b = unsafe { &*(b.as_ptr() as *const ConsCell) };
                     return test_equal(test, cell_a.car, cell_b.car)
                         && test_equal(test, cell_a.cdr, cell_b.cdr);
+                }
+                // For vectors, compare element-by-element.
+                if is_vector(a) && is_vector(b) {
+                    let len_a = vector_length(a);
+                    let len_b = vector_length(b);
+                    if len_a != len_b {
+                        return false;
+                    }
+                    for i in 0..len_a {
+                        if !test_equal(test, vector_elt(a, i), vector_elt(b, i)) {
+                            return false;
+                        }
+                    }
+                    return true;
                 }
                 return false;
             }
@@ -270,8 +294,9 @@ fn apply_fn(func: BlissVal, args: &[BlissVal]) -> BlissVal {
         }
     } else if func.tag() == bliss_rt::value::TAG_FUNCTION {
         // TAG_FUNCTION: a compiled closure / function pointer.
-        // Without the VM dispatch loop we cannot invoke it here, so fall back.
-        if args.is_empty() { NIL } else { args[0] }
+        // Cannot invoke without the VM dispatch loop — signal an error
+        // rather than silently returning wrong results.
+        panic!("apply_fn: TAG_FUNCTION requires VM callback to invoke");
     } else {
         // T, NIL, or anything else used as a function — fall back.
         if args.is_empty() { NIL } else { args[0] }
@@ -462,9 +487,17 @@ pub fn nreverse(sequence: BlissVal) -> Result<BlissVal, BlissError> {
     })
 }
 
+/// Check if a result_type BlissVal indicates VECTOR.
+fn result_type_is_vector(result_type: BlissVal) -> bool {
+    if result_type.tag() == bliss_rt::value::TAG_SYMBOL {
+        return result_type.as_symbol_index() == SYMBOL_VECTOR;
+    }
+    false
+}
+
 /// Concatenate sequences (CL `CONCATENATE`). R5.30.
 pub fn concatenate(
-    _result_type: BlissVal,
+    result_type: BlissVal,
     sequences: &[BlissVal],
 ) -> Result<BlissVal, BlissError> {
     let mut all_elems = Vec::new();
@@ -472,8 +505,11 @@ pub fn concatenate(
         let elems = collect_elements(seq)?;
         all_elems.extend(elems);
     }
-    // Build as list (result_type T or LIST — for now always list)
-    Ok(build_list(&all_elems))
+    if result_type_is_vector(result_type) {
+        Ok(build_vector(&all_elems))
+    } else {
+        Ok(build_list(&all_elems))
+    }
 }
 
 // ── Search and comparison ──────────────────────────────────────────
@@ -566,7 +602,7 @@ pub fn count(
 
 /// Map a function over sequences (CL `MAP`).
 pub fn map(
-    _result_type: BlissVal,
+    result_type: BlissVal,
     function: BlissVal,
     sequences: &[BlissVal],
 ) -> Result<BlissVal, BlissError> {
@@ -584,7 +620,11 @@ pub fn map(
         results.push(result);
     }
 
-    Ok(build_list(&results))
+    if result_type_is_vector(result_type) {
+        Ok(build_vector(&results))
+    } else {
+        Ok(build_list(&results))
+    }
 }
 
 /// Reduce a sequence (CL `REDUCE`).
