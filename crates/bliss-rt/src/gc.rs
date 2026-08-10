@@ -5,6 +5,8 @@
 use crate::error::BlissError;
 use crate::value::BlissVal;
 
+use std::alloc::{self, Layout};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::collections::HashMap;
 
@@ -21,6 +23,11 @@ pub enum RegionKind {
 }
 
 /// Per-region metadata (stored in side array, not in-region). D3.01.
+///
+/// The public fields use plain types for ergonomic access in single-threaded
+/// contexts and tests. For concurrent GC paths (concurrent old-gen marking),
+/// use the `_atomic` accessor methods which perform atomic operations via
+/// `addr_of!` + `AtomicU32::from_ptr` to avoid aliasing UB.
 #[repr(C)]
 pub struct RegionHeader {
     pub kind: RegionKind,
@@ -30,6 +37,51 @@ pub struct RegionHeader {
     pub alloc_limit: *const u8,
     pub next_free: u32,
     pub mark_bitmap_offset: u32,
+}
+
+impl RegionHeader {
+    /// Atomically load `live_bytes`. Used by concurrent old-gen marker.
+    ///
+    /// Uses `addr_of!` to obtain a raw pointer without creating an intermediate
+    /// `&u32` reference, then `AtomicU32::from_ptr` for a sound atomic load.
+    /// The RegionHeader is only stored behind the HeapState mutex and in stable
+    /// heap memory, satisfying `from_ptr`'s validity requirements.
+    pub fn load_live_bytes_atomic(&self) -> u32 {
+        let ptr = std::ptr::addr_of!(self.live_bytes) as *mut u32;
+        // Safety: ptr is aligned (u32 in repr(C) struct), non-null, and
+        // stable (HeapRegion is heap-allocated in a Vec behind a Mutex).
+        unsafe { AtomicU32::from_ptr(ptr).load(Ordering::Acquire) }
+    }
+
+    /// Atomically store `live_bytes`. Used by concurrent old-gen marker.
+    pub fn store_live_bytes_atomic(&self, val: u32) {
+        let ptr = std::ptr::addr_of!(self.live_bytes) as *mut u32;
+        unsafe { AtomicU32::from_ptr(ptr).store(val, Ordering::Release) }
+    }
+
+    /// Atomically load `alloc_top`. Used by concurrent old-gen marker.
+    pub fn load_alloc_top_atomic(&self) -> *mut u8 {
+        let ptr = std::ptr::addr_of!(self.alloc_top) as *mut *mut u8;
+        unsafe { AtomicPtr::from_ptr(ptr).load(Ordering::Acquire) }
+    }
+
+    /// Atomically store `alloc_top`. Used by allocator bump-pointer update.
+    pub fn store_alloc_top_atomic(&self, val: *mut u8) {
+        let ptr = std::ptr::addr_of!(self.alloc_top) as *mut *mut u8;
+        unsafe { AtomicPtr::from_ptr(ptr).store(val, Ordering::Release) }
+    }
+
+    /// Atomically load `next_free`. Used during concurrent region free-list access.
+    pub fn load_next_free_atomic(&self) -> u32 {
+        let ptr = std::ptr::addr_of!(self.next_free) as *mut u32;
+        unsafe { AtomicU32::from_ptr(ptr).load(Ordering::Acquire) }
+    }
+
+    /// Atomically store `next_free`.
+    pub fn store_next_free_atomic(&self, val: u32) {
+        let ptr = std::ptr::addr_of!(self.next_free) as *mut u32;
+        unsafe { AtomicU32::from_ptr(ptr).store(val, Ordering::Release) }
+    }
 }
 
 /// Thread-Local Allocation Buffer. D3.02.
@@ -82,6 +134,1011 @@ pub trait WriteBarrier {
     fn write_barrier(&self, slot_addr: *mut BlissVal, old_val: BlissVal, new_val: BlissVal);
 }
 
+// ── Global marking flag ───────────────────────────────────────────
+
+/// Global flag indicating whether concurrent old-gen marking is in progress.
+/// Per spec §3.6.2, the SATB barrier should only fire when marking is active.
+static GC_MARKING_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Query whether concurrent marking is currently active.
+pub fn gc_marking_in_progress() -> bool {
+    GC_MARKING_IN_PROGRESS.load(Ordering::Acquire)
+}
+
+/// Set the concurrent marking flag. Called by the collector at marking
+/// phase start/end.
+pub fn set_gc_marking_in_progress(active: bool) {
+    GC_MARKING_IN_PROGRESS.store(active, Ordering::Release);
+}
+
+// ── Object header layout ──────────────────────────────────────────
+
+/// Size of the per-object header used in the bootstrap heap layout.
+/// Layout: [type_id: u8, padding: 3 bytes, size: u32] = 8 bytes.
+const OBJECT_HEADER_SIZE: usize = 8;
+
+/// Alignment for objects in the heap (spec §3.3.1: 16-byte minimum).
+const OBJECT_ALIGNMENT: usize = 16;
+
+/// Forwarding pointer marker. When type_id byte is 0xFF, the object
+/// has been forwarded; bytes 8..16 contain the new location pointer.
+const FORWARDED_TYPE_ID: u8 = 0xFF;
+
+/// Write an object header at `ptr`. The header is 8 bytes:
+/// byte 0: type_id, bytes 1-3: padding (zeroed), bytes 4-7: body_size (u32 LE).
+///
+/// Safety: `ptr` must be valid for writes of at least OBJECT_HEADER_SIZE bytes.
+unsafe fn write_object_header(ptr: *mut u8, type_id: u8, body_size: u32) {
+    *ptr = type_id;
+    // bytes 1-3 are padding, already zeroed from alloc_zeroed
+    let size_ptr = ptr.add(4) as *mut u32;
+    *size_ptr = body_size;
+}
+
+/// Read an object header at `ptr`. Returns (type_id, body_size).
+///
+/// Safety: `ptr` must be valid for reads of at least OBJECT_HEADER_SIZE bytes.
+unsafe fn read_object_header(ptr: *const u8) -> (u8, u32) {
+    let type_id = *ptr;
+    let size_ptr = ptr.add(4) as *const u32;
+    let body_size = *size_ptr;
+    (type_id, body_size)
+}
+
+/// Align `size` up to OBJECT_ALIGNMENT (16 bytes), per spec §3.3.1.
+fn align_up(size: usize, align: usize) -> usize {
+    (size + align - 1) & !(align - 1)
+}
+
+// ── Concrete Allocator: HeapAllocator ──────────────────────────────
+
+/// Concrete allocator backed by the global HeapState.
+/// Implements bump-pointer TLAB allocation, TLAB refill with minor GC
+/// triggering, and large-object region allocation.
+pub struct HeapAllocator {
+    /// The thread-local allocation buffer for this allocator.
+    pub tlab: Tlab,
+    /// Configuration snapshot (region_size, tlab_size, etc.).
+    region_size: usize,
+    tlab_size: usize,
+}
+
+// Safety: HeapAllocator owns its TLAB and only the owning thread uses it.
+unsafe impl Send for HeapAllocator {}
+
+impl HeapAllocator {
+    /// Create a new HeapAllocator. The heap must already be initialized via `init_heap`.
+    pub fn new() -> Result<Self, BlissError> {
+        let guard = heap_state().lock().unwrap();
+        let state = guard.as_ref().ok_or_else(|| {
+            BlissError::Internal("heap not initialized".into())
+        })?;
+        let region_size = state.config.region_size;
+        let tlab_size = state.config.tlab_size;
+        drop(guard);
+
+        let mut alloc = HeapAllocator {
+            tlab: Tlab {
+                cursor: std::ptr::null_mut(),
+                limit: std::ptr::null(),
+                region_idx: 0,
+            },
+            region_size,
+            tlab_size,
+        };
+        // Try to get an initial TLAB from a nursery region.
+        alloc.refill_tlab()?;
+        Ok(alloc)
+    }
+
+    /// Refill the TLAB from a nursery region. If no nursery space is available,
+    /// lazily converts a Free region to Nursery and retries. Returns OOM only
+    /// if no nursery region with space and no free region can be found.
+    fn refill_tlab(&mut self) -> Result<(), BlissError> {
+        let mut guard = heap_state().lock().unwrap();
+        let state = guard.as_mut().ok_or_else(|| {
+            BlissError::Internal("heap not initialized".into())
+        })?;
+
+        // Find a nursery region with enough space for a TLAB.
+        for (idx, region) in state.regions.iter_mut().enumerate() {
+            if region.header.kind != RegionKind::Nursery {
+                continue;
+            }
+            let top = region.header.alloc_top as usize;
+            let limit = region.header.alloc_limit as usize;
+            let available = limit.saturating_sub(top);
+            if available >= self.tlab_size {
+                // Carve out a TLAB from this region.
+                self.tlab.cursor = region.header.alloc_top;
+                self.tlab.limit = unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
+                self.tlab.region_idx = idx as u16;
+                // Advance the region's alloc_top past the TLAB.
+                region.header.alloc_top = unsafe { region.header.alloc_top.add(self.tlab_size) };
+                return Ok(());
+            }
+        }
+
+        // No nursery region with space — convert a Free region to Nursery.
+        for (idx, region) in state.regions.iter_mut().enumerate() {
+            if region.header.kind != RegionKind::Free {
+                continue;
+            }
+            // Convert Free → Nursery.
+            region.header.kind = RegionKind::Nursery;
+            region.header.gen_age = 0;
+            region.header.alloc_top = region.base;
+            region.header.live_bytes = 0;
+            state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
+
+            let top = region.header.alloc_top as usize;
+            let limit = region.header.alloc_limit as usize;
+            let available = limit.saturating_sub(top);
+            if available >= self.tlab_size {
+                self.tlab.cursor = region.header.alloc_top;
+                self.tlab.limit = unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
+                self.tlab.region_idx = idx as u16;
+                region.header.alloc_top = unsafe { region.header.alloc_top.add(self.tlab_size) };
+                return Ok(());
+            }
+        }
+
+        // No nursery space available — signal that a minor GC is needed.
+        Err(BlissError::Oom)
+    }
+
+    /// Update live_bytes for the nursery region that contains the TLAB
+    /// after a successful allocation of `bytes` bytes.
+    fn update_nursery_live_bytes(&self, bytes: usize) {
+        let mut guard = heap_state().lock().unwrap();
+        if let Some(state) = guard.as_mut() {
+            let idx = self.tlab.region_idx as usize;
+            if idx < state.regions.len() {
+                state.regions[idx].header.live_bytes += bytes as u32;
+                state.stats.bytes_allocated += bytes as u64;
+                state.stats.nursery_used += bytes as u64;
+            }
+        }
+    }
+}
+
+impl Allocator for HeapAllocator {
+    fn alloc_fast(&mut self, size: usize) -> Option<*mut u8> {
+        if size == 0 {
+            return None;
+        }
+        // Total allocation = object header + body, aligned to 16 bytes (spec §3.3.1).
+        let total_size = align_up(OBJECT_HEADER_SIZE + size, OBJECT_ALIGNMENT);
+        let cursor = self.tlab.cursor as usize;
+        let limit = self.tlab.limit as usize;
+        let new_cursor = cursor.checked_add(total_size)?;
+        if new_cursor <= limit {
+            let header_ptr = self.tlab.cursor;
+            self.tlab.cursor = new_cursor as *mut u8;
+            // Write the object header (type_id=0 placeholder, caller sets real type).
+            unsafe {
+                write_object_header(header_ptr, 0, size as u32);
+            }
+            // Update live_bytes on the nursery region.
+            self.update_nursery_live_bytes(total_size);
+            // Return pointer past the header (to the object body).
+            Some(unsafe { header_ptr.add(OBJECT_HEADER_SIZE) })
+        } else {
+            None
+        }
+    }
+
+    fn alloc_slow(&mut self, size: usize) -> Result<*mut u8, BlissError> {
+        if size == 0 {
+            return Err(BlissError::Internal("zero-size allocation".into()));
+        }
+        // Large objects go through alloc_large.
+        if size > self.region_size / 2 {
+            return self.alloc_large(size);
+        }
+
+        // Try to refill the TLAB.
+        self.refill_tlab()?;
+
+        // Retry fast-path allocation after refill.
+        self.alloc_fast(size).ok_or(BlissError::Oom)
+    }
+
+    fn alloc_large(&mut self, size: usize) -> Result<*mut u8, BlissError> {
+        if size == 0 {
+            return Err(BlissError::Internal("zero-size large alloc".into()));
+        }
+        let total_size = align_up(OBJECT_HEADER_SIZE + size, OBJECT_ALIGNMENT);
+
+        let mut guard = heap_state().lock().unwrap();
+        let state = guard.as_mut().ok_or_else(|| {
+            BlissError::Internal("heap not initialized".into())
+        })?;
+
+        // Find a Free region large enough, convert to LargeObject.
+        let regions_needed = (total_size + self.region_size - 1) / self.region_size;
+
+        if regions_needed == 1 {
+            for region in state.regions.iter_mut() {
+                if region.header.kind == RegionKind::Free {
+                    region.header.kind = RegionKind::LargeObject;
+                    region.header.gen_age = 0;
+                    let ptr = region.base;
+                    region.header.alloc_top = unsafe { region.base.add(total_size) };
+                    region.header.live_bytes = total_size as u32;
+                    state.stats.large_object_bytes += total_size as u64;
+                    state.stats.bytes_allocated += total_size as u64;
+                    state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
+                    // Write object header.
+                    unsafe {
+                        write_object_header(ptr, 0, size as u32);
+                    }
+                    return Ok(unsafe { ptr.add(OBJECT_HEADER_SIZE) });
+                }
+            }
+        } else {
+            let total = state.regions.len();
+            'outer: for start in 0..total {
+                if start + regions_needed > total {
+                    break;
+                }
+                for offset in 0..regions_needed {
+                    if state.regions[start + offset].header.kind != RegionKind::Free {
+                        continue 'outer;
+                    }
+                }
+                let ptr = state.regions[start].base;
+                for offset in 0..regions_needed {
+                    state.regions[start + offset].header.kind = RegionKind::LargeObject;
+                    state.regions[start + offset].header.gen_age = 0;
+                }
+                state.regions[start].header.alloc_top =
+                    unsafe { ptr.add(total_size) };
+                state.regions[start].header.live_bytes = total_size as u32;
+                state.stats.large_object_bytes += total_size as u64;
+                state.stats.bytes_allocated += total_size as u64;
+                state.stats.regions_free = state.stats.regions_free.saturating_sub(regions_needed as u32);
+                // Write object header.
+                unsafe {
+                    write_object_header(ptr, 0, size as u32);
+                }
+                return Ok(unsafe { ptr.add(OBJECT_HEADER_SIZE) });
+            }
+        }
+
+        Err(BlissError::Oom)
+    }
+}
+
+// ── Concrete Collector: HeapCollector ──────────────────────────────
+
+/// Concrete GC collector that operates on the global HeapState.
+/// Implements stop-the-world minor GC (nursery copy), concurrent
+/// old-gen marking + evacuation, and full GC.
+pub struct HeapCollector {
+    /// Local copy of stats counters for this collector instance.
+    gc_stats: GcStats,
+    /// Promotion threshold: objects with gen_age >= this are promoted to old-gen.
+    promotion_threshold: u8,
+}
+
+impl HeapCollector {
+    /// Create a new collector. The heap must already be initialized.
+    pub fn new() -> Self {
+        let stats = heap_stats();
+        let threshold = {
+            let guard = heap_state().lock().unwrap();
+            guard.as_ref().map_or(15, |s| s.config.promotion_threshold)
+        };
+        HeapCollector {
+            gc_stats: stats,
+            promotion_threshold: threshold,
+        }
+    }
+
+    /// Find or allocate a target region of the given kind. Returns the index
+    /// into the regions vec. If no suitable region exists, converts a Free region.
+    fn find_or_create_target_region(
+        state: &mut HeapState,
+        kind: RegionKind,
+        gen_age: u8,
+    ) -> Option<usize> {
+        // First, look for an existing region of the right kind with space.
+        for (idx, region) in state.regions.iter().enumerate() {
+            if region.header.kind == kind {
+                let top = region.header.alloc_top as usize;
+                let limit = region.header.alloc_limit as usize;
+                if limit.saturating_sub(top) > OBJECT_HEADER_SIZE + OBJECT_ALIGNMENT {
+                    return Some(idx);
+                }
+            }
+        }
+        // Convert a Free region.
+        for (idx, region) in state.regions.iter_mut().enumerate() {
+            if region.header.kind == RegionKind::Free {
+                region.header.kind = kind;
+                region.header.gen_age = gen_age;
+                region.header.alloc_top = region.base;
+                region.header.live_bytes = 0;
+                state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Copy a single object (header_ptr points to the object header in the source
+    /// region) into the target region at index `target_idx`. Returns the new body
+    /// pointer (past header) or None if the target region is full.
+    ///
+    /// Also installs a forwarding pointer at the old location: sets type_id to
+    /// FORWARDED_TYPE_ID and writes the new body pointer at offset 8.
+    fn copy_object(
+        state: &mut HeapState,
+        source_header: *mut u8,
+        body_size: u32,
+        target_idx: usize,
+    ) -> Option<*mut u8> {
+        let total_size = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+        let target = &mut state.regions[target_idx];
+        let top = target.header.alloc_top as usize;
+        let limit = target.header.alloc_limit as usize;
+
+        if top + total_size > limit {
+            return None; // Target region full.
+        }
+
+        let new_header = target.header.alloc_top;
+        let new_body = unsafe { new_header.add(OBJECT_HEADER_SIZE) };
+
+        // Copy the entire object (header + body) to the new location.
+        unsafe {
+            std::ptr::copy_nonoverlapping(source_header, new_header, total_size);
+        }
+
+        // Advance the target region's alloc_top.
+        target.header.alloc_top = unsafe { new_header.add(total_size) };
+        target.header.live_bytes += total_size as u32;
+
+        // Install forwarding pointer at old location:
+        // type_id = FORWARDED_TYPE_ID, and we store the new body ptr at offset 8.
+        unsafe {
+            *source_header = FORWARDED_TYPE_ID;
+            // Ensure there's room for the forwarding pointer (need 16 bytes total).
+            // Since minimum allocation is OBJECT_HEADER_SIZE + body with 16-byte alignment,
+            // the minimum slot is 16 bytes, enough for header(8) + pointer(8).
+            if total_size >= OBJECT_HEADER_SIZE + std::mem::size_of::<usize>() {
+                let fwd_ptr_slot = source_header.add(OBJECT_HEADER_SIZE) as *mut *mut u8;
+                *fwd_ptr_slot = new_body;
+            }
+        }
+
+        Some(new_body)
+    }
+}
+
+impl Collector for HeapCollector {
+    /// Stop-the-world minor (nursery) collection.
+    /// Cheney-style scavenge: copies live nursery objects into survivor space
+    /// or promotes to old-gen based on gen_age vs promotion_threshold.
+    fn minor_gc(&mut self) -> Result<(), BlissError> {
+        let start = std::time::Instant::now();
+
+        let mut guard = heap_state().lock().unwrap();
+        let state = guard.as_mut().ok_or_else(|| {
+            BlissError::Internal("heap not initialized".into())
+        })?;
+
+        let promotion_threshold = self.promotion_threshold;
+
+        // Phase 1: Ensure we have a survivor region to copy into.
+        let survivor_idx = Self::find_or_create_target_region(
+            state,
+            RegionKind::Survivor,
+            1,
+        );
+
+        // Phase 2: Walk each nursery region, copy live objects to survivor/old-gen.
+        let mut bytes_promoted: u64 = 0;
+        let mut _nursery_used: u64 = 0;
+
+        // Collect nursery region indices first (to avoid borrow issues).
+        let nursery_indices: Vec<usize> = state
+            .regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.header.kind == RegionKind::Nursery)
+            .map(|(i, _)| i)
+            .collect();
+
+        for &nursery_idx in &nursery_indices {
+            let base = state.regions[nursery_idx].base as usize;
+            let top = state.regions[nursery_idx].header.alloc_top as usize;
+            let used = top.saturating_sub(base) as u64;
+            _nursery_used += used;
+
+            if top <= base {
+                continue; // Empty nursery region.
+            }
+
+            // Scan objects in this nursery region from base to alloc_top.
+            let mut cursor = base;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let header_ptr = cursor as *mut u8;
+                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+
+                if body_size == 0 && type_id == 0 {
+                    break; // End of allocated objects (zeroed memory).
+                }
+
+                // Skip already-forwarded objects.
+                if type_id == FORWARDED_TYPE_ID {
+                    let total = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                    cursor += total;
+                    continue;
+                }
+
+                let total_size = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+
+                // Decide target: promote to old-gen if region age >= threshold,
+                // otherwise copy to survivor.
+                let nursery_age = state.regions[nursery_idx].header.gen_age;
+                let (target_kind, target_gen_age) = if nursery_age >= promotion_threshold {
+                    (RegionKind::OldGen, 0)
+                } else {
+                    (RegionKind::Survivor, nursery_age + 1)
+                };
+
+                // Find target region. We may need to allocate new ones as they fill up.
+                let mut target_idx_opt = if target_kind == RegionKind::Survivor {
+                    survivor_idx
+                } else {
+                    Self::find_or_create_target_region(state, target_kind, target_gen_age)
+                };
+
+                // Try to copy the object.
+                let mut copied = false;
+                if let Some(tidx) = target_idx_opt {
+                    if Self::copy_object(state, header_ptr, body_size, tidx).is_some() {
+                        copied = true;
+                    }
+                }
+
+                // If copy failed (target full), get a new target region and retry.
+                if !copied {
+                    target_idx_opt =
+                        Self::find_or_create_target_region(state, target_kind, target_gen_age);
+                    if let Some(tidx) = target_idx_opt {
+                        Self::copy_object(state, header_ptr, body_size, tidx);
+                    }
+                    // If still no space, the object is lost (OOM during GC).
+                }
+
+                bytes_promoted += total_size as u64;
+                cursor += total_size;
+            }
+
+            // Phase 3: Run finalizers for dead (non-forwarded) objects before
+            // zeroing the region. An object is dead if it was NOT forwarded
+            // (i.e., its type_id is not FORWARDED_TYPE_ID and it has a valid header).
+            {
+                let base = state.regions[nursery_idx].base as usize;
+                let top = state.regions[nursery_idx].header.alloc_top as usize;
+                let mut fcursor = base;
+                while fcursor + OBJECT_HEADER_SIZE <= top {
+                    let header_ptr = fcursor as *const u8;
+                    let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                    if body_size == 0 && type_id == 0 {
+                        break;
+                    }
+                    let total_size = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                    // Non-forwarded objects in a nursery being collected are dead.
+                    if type_id != FORWARDED_TYPE_ID {
+                        // Construct a BlissVal for the object body pointer.
+                        let body_ptr = unsafe { header_ptr.add(OBJECT_HEADER_SIZE) };
+                        let obj_val = BlissVal::from_raw(body_ptr as u64);
+                        run_finalizers_for(obj_val);
+                    }
+                    fcursor += total_size;
+                }
+            }
+
+            // Phase 4: Reset the nursery region for reuse.
+            let region = &mut state.regions[nursery_idx];
+            // Zero the region memory so walk_heap doesn't see stale forwarding pointers.
+            let region_used = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
+            if region_used > 0 {
+                unsafe {
+                    std::ptr::write_bytes(region.base, 0, region_used);
+                }
+            }
+            region.header.alloc_top = region.base;
+            region.header.live_bytes = 0;
+            region.header.gen_age = 0;
+        }
+
+        // Break weak pointers to objects that were in nursery regions (now freed).
+        // After resetting, any pointer into these regions is dead.
+        {
+            let nursery_ranges: Vec<(usize, usize)> = nursery_indices.iter().map(|&idx| {
+                let base = state.regions[idx].base as usize;
+                let limit = state.regions[idx].header.alloc_limit as usize;
+                (base, limit)
+            }).collect();
+            break_dead_weak_pointers(&|val: BlissVal| {
+                let addr = val.to_raw() as usize;
+                nursery_ranges.iter().any(|&(base, limit)| addr >= base && addr < limit)
+            });
+        }
+
+        // Update stats.
+        state.stats.minor_gc_count += 1;
+        state.stats.bytes_promoted += bytes_promoted;
+        state.stats.nursery_used = 0; // nursery was just collected
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        state.stats.total_minor_pause_us += elapsed_us;
+
+        // Update local stats copy.
+        self.gc_stats = state.stats.clone();
+
+        Ok(())
+    }
+
+    /// Concurrent old-gen marking + evacuation cycle (A3.02).
+    ///
+    /// Simplified sequential implementation that runs under the heap lock:
+    /// 1. Mark phase: walk all old-gen/survivor/large-object regions, scan objects
+    ///    from base to alloc_top, and compute accurate live_bytes per region.
+    /// 2. Region selection: identify regions with high garbage ratio
+    ///    (live_bytes / used_bytes < 0.5) as candidates for evacuation.
+    /// 3. Evacuation: copy live objects from selected regions to fresh old-gen
+    ///    regions, install forwarding pointers, and free evacuated regions.
+    fn major_gc(&mut self) -> Result<(), BlissError> {
+        let start = std::time::Instant::now();
+
+        // Set marking flag (§3.6.2: SATB barrier only fires when marking active).
+        set_gc_marking_in_progress(true);
+
+        let mut guard = heap_state().lock().unwrap();
+        let state = guard.as_mut().ok_or_else(|| {
+            set_gc_marking_in_progress(false);
+            BlissError::Internal("heap not initialized".into())
+        })?;
+
+        // Phase 1: Mark phase — conservative pointer tracing.
+        //
+        // We use a mark bitmap (one bit per OBJECT_ALIGNMENT-byte slot) to track
+        // which objects are reachable. The algorithm:
+        //   1. Build an index of all object start addresses in old-gen/survivor/LO regions.
+        //   2. Scan all non-free regions (including nursery) for pointer-like values
+        //      that point to indexed objects, marking them live.
+        //   3. Transitively mark objects referenced by newly-marked objects.
+        //   4. Compute live_bytes from the mark bitmap.
+        //
+        // This is a conservative approach: any aligned 8-byte value that happens to
+        // match an object address will mark that object as live (false retention is
+        // possible, but false collection is not).
+        let region_count = state.regions.len();
+        let heap_base_addr = state.heap_base as usize;
+        let heap_size = state.config.heap_size;
+        let region_size = state.config.region_size;
+
+        // Record TAMS (Top-At-Mark-Start) per region.
+        let mut tams: Vec<usize> = Vec::with_capacity(region_count);
+        for region in state.regions.iter() {
+            tams.push(region.header.alloc_top as usize);
+        }
+
+        // Build a set of valid object body addresses in old-gen/survivor/LO regions,
+        // along with their sizes. We store (body_addr, total_size, region_idx).
+        let mut object_index: std::collections::HashMap<usize, (usize, usize)> =
+            std::collections::HashMap::new();
+        for (idx, region) in state.regions.iter().enumerate() {
+            match region.header.kind {
+                RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject => {
+                    let base = region.base as usize;
+                    let top = tams[idx];
+                    if top <= base {
+                        continue;
+                    }
+                    let mut cursor = base;
+                    while cursor + OBJECT_HEADER_SIZE <= top {
+                        let header_ptr = cursor as *const u8;
+                        let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                        if body_size == 0 && type_id == 0 {
+                            break;
+                        }
+                        let total_size =
+                            align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                        if type_id != FORWARDED_TYPE_ID {
+                            let body_addr = cursor + OBJECT_HEADER_SIZE;
+                            object_index.insert(body_addr, (total_size, idx));
+                        }
+                        cursor += total_size;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Mark bitmap: track which object body addresses are marked live.
+        let mut marked: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // Conservative scan: scan ALL non-free regions for pointer-like values
+        // that match known object addresses.
+        let mut scan_worklist: Vec<usize> = Vec::new();
+        for (idx, region) in state.regions.iter().enumerate() {
+            if region.header.kind == RegionKind::Free {
+                continue;
+            }
+            // For old-gen/survivor/LO regions being marked, skip scanning their
+            // own objects as roots — they will only be live if referenced from
+            // nursery regions or other roots. But we conservatively scan nursery
+            // regions as roots (they contain the live set from the last minor GC).
+            let base = region.base as usize;
+            let top = tams[idx].min(region.header.alloc_top as usize);
+            if top <= base {
+                continue;
+            }
+            // Scan memory in this region for pointer-sized values.
+            let mut scan = base;
+            while scan + 8 <= top {
+                let val = unsafe { *(scan as *const usize) };
+                if val >= heap_base_addr && val < heap_base_addr + heap_size {
+                    if object_index.contains_key(&val) && !marked.contains(&val) {
+                        marked.insert(val);
+                        scan_worklist.push(val);
+                    }
+                }
+                scan += 8; // scan every 8-byte aligned slot
+            }
+        }
+
+        // Transitive closure: scan newly marked objects for more pointers.
+        while let Some(obj_addr) = scan_worklist.pop() {
+            if let Some(&(total_size, _)) = object_index.get(&obj_addr) {
+                let body_size = total_size.saturating_sub(OBJECT_HEADER_SIZE);
+                let mut scan = obj_addr;
+                let scan_end = obj_addr + body_size;
+                while scan + 8 <= scan_end {
+                    let val = unsafe { *(scan as *const usize) };
+                    if val >= heap_base_addr && val < heap_base_addr + heap_size {
+                        if object_index.contains_key(&val) && !marked.contains(&val) {
+                            marked.insert(val);
+                            scan_worklist.push(val);
+                        }
+                    }
+                    scan += 8;
+                }
+            }
+        }
+
+        // Compute live_bytes per region from mark results.
+        // Also run finalizers for dead objects and break their weak pointers.
+        let mut dead_object_vals: Vec<BlissVal> = Vec::new();
+        for (idx, region) in state.regions.iter_mut().enumerate() {
+            match region.header.kind {
+                RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject => {
+                    let base = region.base as usize;
+                    let top = tams[idx];
+                    if top <= base {
+                        region.header.live_bytes = 0;
+                        continue;
+                    }
+
+                    let mut live = 0u32;
+                    let mut cursor = base;
+                    while cursor + OBJECT_HEADER_SIZE <= top {
+                        let header_ptr = cursor as *const u8;
+                        let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                        if body_size == 0 && type_id == 0 {
+                            break;
+                        }
+                        let total_size =
+                            align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                        if type_id != FORWARDED_TYPE_ID {
+                            let body_addr = cursor + OBJECT_HEADER_SIZE;
+                            if marked.contains(&body_addr) {
+                                live += total_size as u32;
+                            } else {
+                                // Object is dead — queue for finalization.
+                                let obj_val = BlissVal::from_raw(body_addr as u64);
+                                dead_object_vals.push(obj_val);
+                            }
+                        }
+                        cursor += total_size;
+                    }
+
+                    region.header.live_bytes = live;
+                }
+                _ => {}
+            }
+        }
+
+        // Run finalizers for dead objects (R3.12).
+        for obj_val in &dead_object_vals {
+            run_finalizers_for(*obj_val);
+        }
+
+        // Break weak pointers to dead objects (R3.13).
+        {
+            let dead_set: std::collections::HashSet<u64> =
+                dead_object_vals.iter().map(|v| v.to_raw()).collect();
+            break_dead_weak_pointers(&|val: BlissVal| dead_set.contains(&val.to_raw()));
+        }
+
+        // Phase 2: Region selection — find old-gen regions with high garbage ratio.
+        // A region is a candidate if live_bytes < 50% of used bytes (i.e. mostly garbage).
+        let mut evacuation_set: Vec<usize> = Vec::new();
+        for (idx, region) in state.regions.iter().enumerate() {
+            if region.header.kind != RegionKind::OldGen {
+                continue;
+            }
+            let base = region.base as usize;
+            let top = region.header.alloc_top as usize;
+            let used = top.saturating_sub(base) as u32;
+            if used == 0 {
+                continue;
+            }
+
+            if region.header.live_bytes == 0 {
+                // Entirely garbage — will be freed directly below.
+                continue;
+            }
+
+            // Select regions where less than half the used space is live.
+            if (region.header.live_bytes as u64) < (used as u64 / 2) {
+                evacuation_set.push(idx);
+            }
+        }
+
+        // Phase 3: Evacuation — copy live objects from selected regions to fresh ones.
+        for &evac_idx in &evacuation_set {
+            let target_idx = Self::find_or_create_target_region(state, RegionKind::OldGen, 0);
+            let target_idx = match target_idx {
+                Some(idx) if idx != evac_idx => idx,
+                _ => continue, // No space for evacuation, skip this region.
+            };
+
+            let base = state.regions[evac_idx].base as usize;
+            let top = state.regions[evac_idx].header.alloc_top as usize;
+
+            let mut cursor = base;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let header_ptr = cursor as *mut u8;
+                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+
+                if body_size == 0 && type_id == 0 {
+                    break;
+                }
+
+                let total_size =
+                    align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+
+                // Only copy non-forwarded, marked (live) objects.
+                let body_addr = cursor + OBJECT_HEADER_SIZE;
+                if type_id != FORWARDED_TYPE_ID && marked.contains(&body_addr) {
+                    // Try to copy; if target fills up, find another.
+                    if Self::copy_object(state, header_ptr, body_size, target_idx).is_none() {
+                        if let Some(new_target) =
+                            Self::find_or_create_target_region(state, RegionKind::OldGen, 0)
+                        {
+                            if new_target != evac_idx {
+                                let _ =
+                                    Self::copy_object(state, header_ptr, body_size, new_target);
+                            }
+                        }
+                    }
+                }
+
+                cursor += total_size;
+            }
+
+            // Free the evacuated region.
+            let region = &mut state.regions[evac_idx];
+            let region_used = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
+            if region_used > 0 {
+                unsafe {
+                    std::ptr::write_bytes(region.base, 0, region_used);
+                }
+            }
+            region.header.kind = RegionKind::Free;
+            region.header.alloc_top = region.base;
+            region.header.live_bytes = 0;
+            region.header.gen_age = 0;
+            state.stats.regions_free += 1;
+        }
+
+        // Free old-gen and large-object regions with zero live bytes.
+        let mut old_gen_used: u64 = 0;
+        let mut regions_freed: u32 = 0;
+
+        for region in state.regions.iter_mut() {
+            match region.header.kind {
+                RegionKind::OldGen => {
+                    let base = region.base as usize;
+                    let top = region.header.alloc_top as usize;
+                    let used = top.saturating_sub(base);
+
+                    if region.header.live_bytes == 0 && used > 0 {
+                        // Zero the region memory.
+                        unsafe {
+                            std::ptr::write_bytes(region.base, 0, used);
+                        }
+                        region.header.kind = RegionKind::Free;
+                        region.header.alloc_top = region.base;
+                        region.header.gen_age = 0;
+                        regions_freed += 1;
+                    } else {
+                        old_gen_used += region.header.live_bytes as u64;
+                    }
+                }
+                RegionKind::LargeObject => {
+                    if region.header.live_bytes == 0 {
+                        let size = (region.header.alloc_top as usize)
+                            .saturating_sub(region.base as usize);
+                        state.stats.large_object_bytes =
+                            state.stats.large_object_bytes.saturating_sub(size as u64);
+                        if size > 0 {
+                            unsafe {
+                                std::ptr::write_bytes(region.base, 0, size);
+                            }
+                        }
+                        region.header.kind = RegionKind::Free;
+                        region.header.alloc_top = region.base;
+                        region.header.gen_age = 0;
+                        regions_freed += 1;
+                    }
+                }
+                RegionKind::Survivor => {
+                    // Promote survivors that have aged past threshold to OldGen.
+                    if region.header.gen_age >= self.promotion_threshold {
+                        region.header.kind = RegionKind::OldGen;
+                        region.header.gen_age = 0;
+                    }
+                    let base = region.base as usize;
+                    let top = region.header.alloc_top as usize;
+                    if top > base {
+                        old_gen_used += region.header.live_bytes as u64;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        state.stats.major_gc_count += 1;
+        state.stats.old_gen_used = old_gen_used;
+        state.stats.regions_free += regions_freed;
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        state.stats.total_major_pause_us += elapsed_us;
+
+        self.gc_stats = state.stats.clone();
+
+        // Clear marking flag.
+        drop(guard);
+        set_gc_marking_in_progress(false);
+
+        Ok(())
+    }
+
+    /// Full GC: runs minor + major collections. Used before image save.
+    fn full_gc(&mut self) -> Result<(), BlissError> {
+        // Drop the lock between phases to avoid deadlock (minor_gc and major_gc
+        // each acquire the lock internally).
+        self.minor_gc()?;
+        self.major_gc()?;
+        Ok(())
+    }
+
+    fn stats(&self) -> GcStats {
+        self.gc_stats.clone()
+    }
+}
+
+// ── Concrete Write Barrier: SatbCardBarrier ────────────────────────
+
+/// Combined SATB (Snapshot-At-The-Beginning) + card table write barrier.
+/// Per spec R3.09 and R3.11.
+///
+/// - SATB component: logs the old reference value into a per-thread SATB buffer
+///   before overwriting, ensuring the concurrent marker sees all pre-mutation
+///   references (tri-colour invariant preservation). Only fires when concurrent
+///   marking is active (§3.6.2, §3.7.1).
+/// - Card component: marks the card containing `slot_addr` as dirty so that
+///   minor GC knows to scan old-gen → nursery pointers without a full old-gen scan.
+pub struct SatbCardBarrier {
+    /// SATB log buffer — stores old reference values for the concurrent marker.
+    /// Protected by a mutex for thread safety (in the JIT fast-path, a thread-local
+    /// buffer is used; this mutex-guarded buffer is the fallback).
+    satb_buffer: Mutex<Vec<BlissVal>>,
+    /// Card table — one byte per 512-byte card. A non-zero byte means the card is dirty.
+    /// In a full implementation this would be a fixed-size array mapped over the heap;
+    /// here we use a Vec sized to cover the configured heap.
+    card_table: Mutex<Vec<u8>>,
+    /// Card size in bytes (default 512).
+    card_shift: u32,
+    /// Heap base address, used to compute card index from a slot address.
+    heap_base: usize,
+}
+
+impl SatbCardBarrier {
+    /// Create a new SATB+card barrier for the initialized heap.
+    pub fn new() -> Result<Self, BlissError> {
+        let guard = heap_state().lock().unwrap();
+        let state = guard.as_ref().ok_or_else(|| {
+            BlissError::Internal("heap not initialized".into())
+        })?;
+        let card_shift = 9; // 512-byte cards → shift by 9
+        let card_count = (state.config.heap_size >> card_shift) + 1;
+        let heap_base = state.heap_base as usize;
+        Ok(SatbCardBarrier {
+            satb_buffer: Mutex::new(Vec::with_capacity(state.config.satb_buffer_size)),
+            card_table: Mutex::new(vec![0u8; card_count]),
+            card_shift,
+            heap_base,
+        })
+    }
+
+    /// Drain the SATB buffer, returning all logged old values.
+    /// Called by the concurrent marker during marking termination.
+    pub fn drain_satb_buffer(&self) -> Vec<BlissVal> {
+        let mut buf = self.satb_buffer.lock().unwrap();
+        std::mem::take(&mut *buf)
+    }
+
+    /// Check if a card is dirty. Used by minor GC to find old→young pointers.
+    pub fn is_card_dirty(&self, slot_addr: usize) -> bool {
+        if slot_addr < self.heap_base {
+            return false;
+        }
+        let card_idx = (slot_addr - self.heap_base) >> self.card_shift;
+        let table = self.card_table.lock().unwrap();
+        card_idx < table.len() && table[card_idx] != 0
+    }
+
+    /// Clear all dirty cards. Called after minor GC processes remembered sets.
+    pub fn clear_cards(&self) {
+        let mut table = self.card_table.lock().unwrap();
+        for byte in table.iter_mut() {
+            *byte = 0;
+        }
+    }
+}
+
+impl WriteBarrier for SatbCardBarrier {
+    fn write_barrier(&self, slot_addr: *mut BlissVal, old_val: BlissVal, new_val: BlissVal) {
+        // SATB component: log the old value so the concurrent marker can trace it.
+        // Per §3.6.2 and §3.7.1, only log when concurrent marking is active.
+        if gc_marking_in_progress() {
+            let old_tag = old_val.tag();
+            if old_tag == crate::value::TAG_CONS
+                || old_tag == crate::value::TAG_HEAP_OBJECT
+                || old_tag == crate::value::TAG_FUNCTION
+            {
+                let mut buf = self.satb_buffer.lock().unwrap();
+                buf.push(old_val);
+            }
+        }
+
+        // Card component: mark the card containing slot_addr as dirty
+        // if the new value is a young-gen pointer (cross-generation store).
+        let new_tag = new_val.tag();
+        if new_tag == crate::value::TAG_CONS
+            || new_tag == crate::value::TAG_HEAP_OBJECT
+            || new_tag == crate::value::TAG_FUNCTION
+        {
+            let addr = slot_addr as usize;
+            if addr >= self.heap_base {
+                let card_idx = (addr - self.heap_base) >> self.card_shift;
+                let mut table = self.card_table.lock().unwrap();
+                if card_idx < table.len() {
+                    table[card_idx] = 1; // dirty
+                }
+            }
+        }
+    }
+}
+
 // ── Weak references ────────────────────────────────────────────────
 
 /// A weak pointer that is cleared when its referent is collected.
@@ -108,28 +1165,155 @@ impl WeakPointer {
             (self.referent, false)
         }
     }
+
+    /// Break this weak pointer, clearing the referent. Called by the GC
+    /// when the referent becomes unreachable (per R3.13).
+    pub fn break_ref(&mut self) {
+        self.broken = true;
+        self.referent = crate::value::NIL;
+    }
+
+    /// Returns whether this weak pointer has been broken.
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+}
+
+// ── Weak pointer registry ─────────────────────────────────────────
+
+/// Wrapper around raw pointer to WeakPointer for Send/Sync.
+/// Safety: access is always guarded by the registry mutex.
+struct WeakPtrHandle(*mut WeakPointer);
+unsafe impl Send for WeakPtrHandle {}
+unsafe impl Sync for WeakPtrHandle {}
+
+/// Global registry of weak pointers so the GC can break them during collection.
+fn weak_pointer_registry() -> &'static Mutex<Vec<WeakPtrHandle>> {
+    static REGISTRY: OnceLock<Mutex<Vec<WeakPtrHandle>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register a weak pointer with the GC so it can be broken when its referent
+/// is collected. The caller must ensure the WeakPointer lives at least until
+/// it is unregistered or broken.
+pub fn register_weak_pointer(wp: &mut WeakPointer) {
+    let ptr: *mut WeakPointer = wp;
+    let mut registry = weak_pointer_registry().lock().unwrap();
+    registry.push(WeakPtrHandle(ptr));
+}
+
+/// Unregister a weak pointer from the GC registry.
+pub fn unregister_weak_pointer(wp: &WeakPointer) {
+    let ptr = wp as *const WeakPointer;
+    let mut registry = weak_pointer_registry().lock().unwrap();
+    registry.retain(|h| h.0 as *const WeakPointer != ptr);
+}
+
+/// Break all weak pointers whose referent is in a dead region (one being freed).
+/// Called by the collector during minor_gc and major_gc.
+/// `is_dead` returns true if the given BlissVal's referent is unreachable.
+fn break_dead_weak_pointers<F>(is_dead: &F)
+where
+    F: Fn(BlissVal) -> bool,
+{
+    let mut registry = weak_pointer_registry().lock().unwrap();
+    for handle in registry.iter() {
+        // Safety: the weak pointer was registered by the owner and is still alive.
+        let wp = unsafe { &mut *handle.0 };
+        if !wp.is_broken() {
+            let (referent, _) = wp.value();
+            if is_dead(referent) {
+                wp.break_ref();
+            }
+        }
+    }
+    // Remove broken weak pointers from the registry.
+    registry.retain(|handle| {
+        let wp = unsafe { &*handle.0 };
+        !wp.is_broken()
+    });
 }
 
 // ── Finalization ───────────────────────────────────────────────────
 
+/// Entry in the finalizer registry: maps an object to its finalizer callback.
+struct FinalizerEntry {
+    object: BlissVal,
+    finalizer: BlissVal,
+    /// Rust-level callback that performs the actual invocation of the finalizer.
+    /// This is set by `set_finalizer_dispatch` and called with (finalizer, object).
+    callback: Option<fn(BlissVal, BlissVal)>,
+}
+
+/// Global finalizer registry.
+fn finalizer_registry() -> &'static Mutex<Vec<FinalizerEntry>> {
+    static REGISTRY: OnceLock<Mutex<Vec<FinalizerEntry>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Global finalizer dispatch function. Set by the runtime during startup
+/// to wire finalizer invocation through the evaluator/function-call mechanism.
+/// Signature: fn(finalizer: BlissVal, object: BlissVal)
+static FINALIZER_DISPATCH: OnceLock<fn(BlissVal, BlissVal)> = OnceLock::new();
+
+/// Set the global finalizer dispatch function. Called once during runtime
+/// initialization to register how finalizer BlissVal functions are invoked.
+pub fn set_finalizer_dispatch(dispatch: fn(BlissVal, BlissVal)) {
+    let _ = FINALIZER_DISPATCH.set(dispatch);
+}
+
 /// Register a finalizer for a heap object.
 /// The finalizer function will be called when the object is about to be collected.
-/// In the bootstrap implementation, finalizers are recorded but only invoked
-/// during full_gc (which is called before image save).
 pub fn register_finalizer(object: BlissVal, finalizer: BlissVal) -> Result<(), BlissError> {
-    let mut guard = heap_state().lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        // Replace any existing finalizer for the same object.
-        if let Some(existing) = state.finalizers.iter_mut().find(|f| f.object == object) {
-            existing.finalizer_fn = finalizer;
-        } else {
-            state.finalizers.push(Finalizer {
-                object,
-                finalizer_fn: finalizer,
-            });
-        }
+    let dispatch = FINALIZER_DISPATCH.get().copied();
+    let mut registry = finalizer_registry().lock().unwrap();
+    // Replace existing finalizer for the same object, or add new entry
+    if let Some(entry) = registry.iter_mut().find(|e| e.object == object) {
+        entry.finalizer = finalizer;
+        entry.callback = dispatch;
+    } else {
+        registry.push(FinalizerEntry {
+            object,
+            finalizer,
+            callback: dispatch,
+        });
     }
     Ok(())
+}
+
+/// Run all registered finalizers for the given object (called during collection
+/// for unreachable objects). Actually invokes each finalizer callback on the object.
+/// Returns the list of finalizer BlissVals that were invoked (for testing/debugging).
+///
+/// Per R3.16, finalizer errors must not corrupt GC state — any panic or error
+/// from a finalizer invocation is caught and silently discarded.
+pub fn run_finalizers_for(object: BlissVal) -> Vec<BlissVal> {
+    let mut registry = finalizer_registry().lock().unwrap();
+    let mut invoked = Vec::new();
+    // Collect all finalizers for the given object
+    let mut i = 0;
+    while i < registry.len() {
+        if registry[i].object == object {
+            let entry = registry.remove(i);
+            // Actually invoke the finalizer callback on the object.
+            if let Some(dispatch) = entry.callback {
+                // R3.16: finalizer errors must not corrupt GC state.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch(entry.finalizer, object);
+                }));
+            } else if let Some(global_dispatch) = FINALIZER_DISPATCH.get() {
+                // Fall back to the global dispatch if the entry didn't capture one.
+                let dispatch = *global_dispatch;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch(entry.finalizer, object);
+                }));
+            }
+            invoked.push(entry.finalizer);
+        } else {
+            i += 1;
+        }
+    }
+    invoked
 }
 
 // ── GC statistics ──────────────────────────────────────────────────
@@ -169,57 +1353,46 @@ pub struct GcConfig {
     pub old_occupancy_trigger: f64,
 }
 
-/// A single object allocation record in the bootstrap heap.
-/// Stores the raw bytes of the object so they can be iterated by `walk_heap`
-/// and serialised by image save.
-struct HeapObject {
-    /// The type_id from the ObjectHeader (first 8 bytes), cached for fast filtering.
-    type_id: u8,
-    /// The raw bytes of the object (including the ObjectHeader prefix).
-    data: Vec<u8>,
+/// A single heap region backed by real memory.
+struct HeapRegion {
+    header: RegionHeader,
+    /// Base pointer of the region's backing memory.
+    base: *mut u8,
+    /// Size of the backing memory allocation (retained for dealloc/walk).
+    #[allow(dead_code)]
+    size: usize,
 }
 
-/// A registered finalizer for a heap object.
-struct Finalizer {
-    /// The object this finalizer is registered on.
-    object: BlissVal,
-    /// The finalizer function to call when the object is collected.
-    finalizer_fn: BlissVal,
-}
+// Safety: HeapRegion is only accessed under the HeapState mutex.
+unsafe impl Send for HeapRegion {}
 
-/// A package entry in the runtime package registry.
-struct PackageEntry {
-    /// The package name (e.g. "COMMON-LISP", "COMMON-LISP-USER").
-    name: String,
-}
-
-/// A compiled code cache entry.
-struct CodeCacheEntry {
-    /// The compiled code bytes.
-    code: Vec<u8>,
-}
-
-/// Bootstrap heap state — stores the GC configuration, stats, and
-/// all allocated objects so that `walk_heap` can iterate them and
-/// image save can serialise real heap data.
+/// Bootstrap heap state — stores the GC configuration, allocated regions,
+/// and stats so that queries can report capacity values after initialization.
 struct HeapState {
+    #[allow(dead_code)]
     config: GcConfig,
     stats: GcStats,
-    /// All live objects in the bootstrap heap.
-    objects: Vec<HeapObject>,
-    /// A stable base address used for relocation bookkeeping.
-    /// Set once at init time.
-    base_address: u64,
-    /// Monotonically increasing GC generation counter.
-    gc_generation: u32,
-    /// Registered finalizers for heap objects.
-    finalizers: Vec<Finalizer>,
-    /// Runtime symbol intern table. Maps symbol name → value.
-    symbols: HashMap<String, u64>,
-    /// Runtime package registry.
-    packages: Vec<PackageEntry>,
-    /// Compiled code cache.
-    code_cache: Vec<CodeCacheEntry>,
+    /// All heap regions, backed by real allocated memory.
+    regions: Vec<HeapRegion>,
+    /// Base pointer of the contiguous heap allocation.
+    heap_base: *mut u8,
+    /// Layout used for the heap allocation (needed for dealloc).
+    heap_layout: Layout,
+}
+
+// Safety: HeapState is only accessed under the global mutex.
+unsafe impl Send for HeapState {}
+
+impl Drop for HeapState {
+    fn drop(&mut self) {
+        if !self.heap_base.is_null() {
+            // Safety: heap_base was allocated with heap_layout in init_heap.
+            unsafe {
+                alloc::dealloc(self.heap_base, self.heap_layout);
+            }
+            self.heap_base = std::ptr::null_mut();
+        }
+    }
 }
 
 /// Global heap state, initialized by `init_heap`.
@@ -243,16 +1416,58 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     if config.region_size == 0 {
         return Err(BlissError::Internal("region_size must be non-zero".into()));
     }
+    // tlab_size must be a non-zero power of two. The power-of-two constraint
+    // also implicitly rejects region_size+1 (never a power of two when region_size
+    // is a power of two), preventing TLAB sizes that can't fit in a single region.
     if config.tlab_size == 0 || (config.tlab_size & (config.tlab_size - 1)) != 0 {
         return Err(BlissError::Internal("tlab_size must be a power of two".into()));
     }
-
     let regions_total = (config.heap_size / config.region_size) as u32;
+
+    // Allocate real heap memory as a single contiguous block.
+    // We use page-level alignment (4096) which the system allocator supports,
+    // rather than region_size alignment which may be too large.
+    let align = 4096.min(config.region_size);
+    let heap_layout = Layout::from_size_align(config.heap_size, align)
+        .map_err(|e| BlissError::Internal(format!("invalid heap layout: {}", e)))?;
+
+    // Safety: layout is valid (non-zero size, power-of-two alignment).
+    let heap_base = unsafe { alloc::alloc_zeroed(heap_layout) };
+    if heap_base.is_null() {
+        return Err(BlissError::Oom);
+    }
+
+    // Set up region metadata. Divide the heap into regions.
+    // All regions start as Free — nursery regions are lazily converted
+    // from Free→Nursery on the first TLAB refill (see refill_tlab).
+    let mut regions = Vec::with_capacity(regions_total as usize);
+
+    for i in 0..regions_total {
+        let region_base = unsafe { heap_base.add(i as usize * config.region_size) };
+        let region_limit = unsafe { region_base.add(config.region_size) } as *const u8;
+
+        let header = RegionHeader {
+            kind: RegionKind::Free,
+            gen_age: 0,
+            live_bytes: 0,
+            alloc_top: region_base, // nothing allocated yet
+            alloc_limit: region_limit,
+            next_free: if i + 1 < regions_total { i + 1 } else { u32::MAX },
+            mark_bitmap_offset: 0,
+        };
+
+        regions.push(HeapRegion {
+            header,
+            base: region_base,
+            size: config.region_size,
+        });
+    }
+
     let mut stats = GcStats::default();
     stats.nursery_capacity = config.nursery_size as u64;
     stats.old_gen_capacity = (config.heap_size - config.nursery_size) as u64;
     stats.regions_total = regions_total;
-    stats.regions_free = regions_total;
+    stats.regions_free = regions_total; // all regions start Free
 
     // Use the address of the heap_state mutex itself as a stable base address
     // for relocation tracking.  This gives a deterministic, non-zero value that
@@ -262,13 +1477,9 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     let state = HeapState {
         config: config.clone(),
         stats,
-        objects: Vec::new(),
-        base_address,
-        gc_generation: 0,
-        finalizers: Vec::new(),
-        symbols: HashMap::new(),
-        packages: Vec::new(),
-        code_cache: Vec::new(),
+        regions,
+        heap_base,
+        heap_layout,
     };
     *heap_state().lock().unwrap() = Some(state);
 
@@ -297,508 +1508,55 @@ where
     F: FnMut(*const u8, u8, usize) -> bool,
 {
     let guard = heap_state().lock().unwrap();
-    if let Some(state) = &*guard {
-        for obj in &state.objects {
-            let should_continue = callback(obj.data.as_ptr(), obj.type_id, obj.data.len());
-            if !should_continue {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Record an object in the bootstrap heap so that `walk_heap` can
-/// enumerate it and `save_image` can serialise it.
-pub fn record_object(type_id: u8, data: Vec<u8>) {
-    let mut guard = heap_state().lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.stats.bytes_allocated += data.len() as u64;
-        state.objects.push(HeapObject { type_id, data });
-    }
-}
-
-/// Perform a full GC cycle (minor + major). In the bootstrap heap
-/// this is a no-op in terms of reclamation (there are no unreachable
-/// objects in the Vec-backed store), but it increments the GC
-/// generation counter and updates stats, fulfilling the contract that
-/// image save triggers a full GC before serialisation.
-pub fn full_gc() -> Result<(), BlissError> {
-    let mut guard = heap_state().lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.gc_generation += 1;
-        state.stats.minor_gc_count += 1;
-        state.stats.major_gc_count += 1;
-    }
-    Ok(())
-}
-
-/// Return the heap base address recorded at init time.
-/// Used by image save to populate `original_base` in the header.
-pub fn heap_base_address() -> u64 {
-    let guard = heap_state().lock().unwrap();
-    match &*guard {
-        Some(state) => state.base_address,
-        None => 0,
-    }
-}
-
-/// Return the current GC generation counter.
-pub fn gc_generation() -> u32 {
-    let guard = heap_state().lock().unwrap();
-    match &*guard {
-        Some(state) => state.gc_generation,
-        None => 0,
-    }
-}
-
-/// Restore heap objects from a serialised byte buffer produced by
-/// `save_image`. The buffer is a concatenation of length-prefixed
-/// records: each record is `[u8 type_id][u32 len][len bytes data]`.
-/// Clears any existing objects and replaces them with the restored set.
-pub fn restore_heap(serialized: &[u8]) -> Result<(), BlissError> {
-    let mut guard = heap_state().lock().unwrap();
-    let state = match guard.as_mut() {
+    let state = match &*guard {
         Some(s) => s,
-        None => {
-            // If the heap hasn't been initialised, create a minimal state
-            // so that the restored objects are accessible.
-            *guard = Some(HeapState {
-                config: GcConfig {
-                    heap_size: 64 * 1024 * 1024,
-                    heap_max: 256 * 1024 * 1024,
-                    nursery_size: 16 * 1024 * 1024,
-                    tlab_size: 8192,
-                    region_size: 1024 * 1024,
-                    promotion_threshold: 15,
-                    pause_target_ms: 10,
-                    gc_workers: 1,
-                    satb_buffer_size: 1024,
-                    old_occupancy_trigger: 0.45,
-                },
-                stats: GcStats::default(),
-                objects: Vec::new(),
-                base_address: heap_state() as *const _ as u64,
-                gc_generation: 0,
-                finalizers: Vec::new(),
-                symbols: HashMap::new(),
-                packages: Vec::new(),
-                code_cache: Vec::new(),
-            });
-            guard.as_mut().unwrap()
-        }
+        None => return Ok(()), // No heap initialized, nothing to walk.
     };
 
-    state.objects.clear();
-    state.stats.bytes_allocated = 0;
-
-    let mut offset = 0;
-    while offset < serialized.len() {
-        // Each record: [u8 type_id][u32 len (LE)][len bytes]
-        if offset + 5 > serialized.len() {
-            return Err(BlissError::InvalidImage(
-                "truncated heap object record".into(),
-            ));
-        }
-        let type_id = serialized[offset];
-        offset += 1;
-        let len = u32::from_le_bytes([
-            serialized[offset],
-            serialized[offset + 1],
-            serialized[offset + 2],
-            serialized[offset + 3],
-        ]) as usize;
-        offset += 4;
-        if offset + len > serialized.len() {
-            return Err(BlissError::InvalidImage(
-                "truncated heap object data".into(),
-            ));
-        }
-        let data = serialized[offset..offset + len].to_vec();
-        offset += len;
-        state.stats.bytes_allocated += data.len() as u64;
-        state.objects.push(HeapObject { type_id, data });
-    }
-
-    Ok(())
-}
-
-/// Serialise all live heap objects into a byte buffer using the
-/// length-prefixed record format expected by `restore_heap`.
-pub fn serialize_heap_objects() -> Vec<u8> {
-    let guard = heap_state().lock().unwrap();
-    let mut buf = Vec::new();
-    if let Some(state) = &*guard {
-        for obj in &state.objects {
-            buf.push(obj.type_id);
-            buf.extend_from_slice(&(obj.data.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&obj.data);
-        }
-    }
-    buf
-}
-
-// ── Entry continuation ────────────────────────────────────────────
-
-/// Global entry continuation stored by the runtime. Used by image save/load
-/// to persist the continuation to resume on load (§7.2.3).
-fn entry_continuation_state() -> &'static Mutex<BlissVal> {
-    static STATE: OnceLock<Mutex<BlissVal>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(crate::value::NIL))
-}
-
-/// Set the entry continuation that will be stored in the next image save.
-pub fn set_entry_continuation(val: BlissVal) {
-    *entry_continuation_state().lock().unwrap() = val;
-}
-
-/// Retrieve the current entry continuation value.
-pub fn get_entry_continuation() -> BlissVal {
-    *entry_continuation_state().lock().unwrap()
-}
-
-// ── GC metadata serialization ─────────────────────────────────────
-
-/// Serialize all GcStats fields into a byte buffer for the GcMeta image section.
-/// Format: 13 fields as little-endian, u64 for the first 11, u32 for the last 2.
-pub fn serialize_gc_metadata() -> Vec<u8> {
-    let stats = heap_stats();
-    let gc_gen = gc_generation();
-    let mut buf = Vec::with_capacity(8 * 11 + 4 * 2 + 4);
-    // GC generation (u32 LE)
-    buf.extend_from_slice(&gc_gen.to_le_bytes());
-    // All u64 stats fields
-    buf.extend_from_slice(&stats.minor_gc_count.to_le_bytes());
-    buf.extend_from_slice(&stats.major_gc_count.to_le_bytes());
-    buf.extend_from_slice(&stats.total_minor_pause_us.to_le_bytes());
-    buf.extend_from_slice(&stats.total_major_pause_us.to_le_bytes());
-    buf.extend_from_slice(&stats.bytes_allocated.to_le_bytes());
-    buf.extend_from_slice(&stats.bytes_promoted.to_le_bytes());
-    buf.extend_from_slice(&stats.nursery_used.to_le_bytes());
-    buf.extend_from_slice(&stats.nursery_capacity.to_le_bytes());
-    buf.extend_from_slice(&stats.old_gen_used.to_le_bytes());
-    buf.extend_from_slice(&stats.old_gen_capacity.to_le_bytes());
-    buf.extend_from_slice(&stats.large_object_bytes.to_le_bytes());
-    // u32 fields
-    buf.extend_from_slice(&stats.regions_total.to_le_bytes());
-    buf.extend_from_slice(&stats.regions_free.to_le_bytes());
-    buf
-}
-
-/// Restore GC metadata (stats + generation) from the serialized GcMeta section.
-pub fn restore_gc_metadata(data: &[u8]) -> Result<(), BlissError> {
-    // Minimum size: 4 (gen) + 11*8 (u64 fields) + 2*4 (u32 fields) = 100 bytes
-    if data.len() < 100 {
-        if data.is_empty() {
-            return Ok(()); // empty section is valid (bootstrap)
-        }
-        return Err(BlissError::InvalidImage(
-            "GC metadata section too small".into(),
-        ));
-    }
-    let mut off = 0usize;
-    let read_u32 = |o: &mut usize| -> u32 {
-        let v = u32::from_le_bytes([data[*o], data[*o+1], data[*o+2], data[*o+3]]);
-        *o += 4;
-        v
-    };
-    let read_u64 = |o: &mut usize| -> u64 {
-        let v = u64::from_le_bytes([
-            data[*o], data[*o+1], data[*o+2], data[*o+3],
-            data[*o+4], data[*o+5], data[*o+6], data[*o+7],
-        ]);
-        *o += 8;
-        v
-    };
-
-    let gc_gen = read_u32(&mut off);
-    let minor_gc_count = read_u64(&mut off);
-    let major_gc_count = read_u64(&mut off);
-    let total_minor_pause_us = read_u64(&mut off);
-    let total_major_pause_us = read_u64(&mut off);
-    let bytes_allocated = read_u64(&mut off);
-    let bytes_promoted = read_u64(&mut off);
-    let nursery_used = read_u64(&mut off);
-    let nursery_capacity = read_u64(&mut off);
-    let old_gen_used = read_u64(&mut off);
-    let old_gen_capacity = read_u64(&mut off);
-    let large_object_bytes = read_u64(&mut off);
-    let regions_total = read_u32(&mut off);
-    let regions_free = read_u32(&mut off);
-
-    let mut guard = heap_state().lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.gc_generation = gc_gen;
-        state.stats.minor_gc_count = minor_gc_count;
-        state.stats.major_gc_count = major_gc_count;
-        state.stats.total_minor_pause_us = total_minor_pause_us;
-        state.stats.total_major_pause_us = total_major_pause_us;
-        state.stats.bytes_allocated = bytes_allocated;
-        state.stats.bytes_promoted = bytes_promoted;
-        state.stats.nursery_used = nursery_used;
-        state.stats.nursery_capacity = nursery_capacity;
-        state.stats.old_gen_used = old_gen_used;
-        state.stats.old_gen_capacity = old_gen_capacity;
-        state.stats.large_object_bytes = large_object_bytes;
-        state.stats.regions_total = regions_total;
-        state.stats.regions_free = regions_free;
-    }
-    Ok(())
-}
-
-// ── Symbol table serialization (§7.2.7) ───────────────────────────
-
-/// Intern a symbol in the runtime symbol table.
-pub fn intern_symbol(name: &str, value: u64) {
-    let mut guard = heap_state().lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.symbols.insert(name.to_string(), value);
-    }
-}
-
-/// Serialize the symbol intern table.
-/// Format: [u32 count LE] [for each: u32 name_len LE, name bytes, u64 value LE]
-pub fn serialize_symbols() -> Vec<u8> {
-    let guard = heap_state().lock().unwrap();
-    let mut buf = Vec::new();
-    if let Some(state) = &*guard {
-        let count = state.symbols.len() as u32;
-        buf.extend_from_slice(&count.to_le_bytes());
-        // Sort by name for deterministic output
-        let mut entries: Vec<(&String, &u64)> = state.symbols.iter().collect();
-        entries.sort_by_key(|(k, _)| k.as_str());
-        for (name, value) in entries {
-            let name_bytes = name.as_bytes();
-            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(name_bytes);
-            buf.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    buf
-}
-
-/// Restore the symbol intern table from serialized data.
-/// Format: [u32 count LE] [for each: u32 name_len LE, name bytes, u64 value LE]
-pub fn restore_symbols(data: &[u8]) -> Result<(), BlissError> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    if data.len() < 4 {
-        return Err(BlissError::InvalidImage("symbol section too small".into()));
-    }
-    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut off = 4usize;
-    let mut restored_symbols = HashMap::with_capacity(count);
-    for _ in 0..count {
-        if off + 4 > data.len() {
-            return Err(BlissError::InvalidImage("truncated symbol record".into()));
-        }
-        let name_len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-        off += 4;
-        if off + name_len + 8 > data.len() {
-            return Err(BlissError::InvalidImage("truncated symbol data".into()));
-        }
-        let name = String::from_utf8(data[off..off + name_len].to_vec())
-            .map_err(|_| BlissError::InvalidImage("invalid UTF-8 in symbol name".into()))?;
-        off += name_len;
-        let value = u64::from_le_bytes([
-            data[off], data[off+1], data[off+2], data[off+3],
-            data[off+4], data[off+5], data[off+6], data[off+7],
-        ]);
-        off += 8;
-        restored_symbols.insert(name, value);
-    }
-
-    let mut guard = heap_state().lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.symbols = restored_symbols;
-    }
-    Ok(())
-}
-
-// ── Package registry serialization (§7.2.8) ──────────────────────
-
-/// Register a package in the runtime package registry.
-pub fn register_package(name: &str) {
-    let mut guard = heap_state().lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        // Avoid duplicate registrations.
-        if !state.packages.iter().any(|p| p.name == name) {
-            state.packages.push(PackageEntry {
-                name: name.to_string(),
-            });
-        }
-    }
-}
-
-/// Serialize the package registry.
-/// Format: [u32 count LE] [for each: u32 name_len LE, name bytes]
-pub fn serialize_packages() -> Vec<u8> {
-    let guard = heap_state().lock().unwrap();
-    let mut buf = Vec::new();
-    if let Some(state) = &*guard {
-        let count = state.packages.len() as u32;
-        buf.extend_from_slice(&count.to_le_bytes());
-        for pkg in &state.packages {
-            let name_bytes = pkg.name.as_bytes();
-            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(name_bytes);
-        }
-    }
-    buf
-}
-
-/// Restore the package registry from serialized data.
-/// Format: [u32 count LE] [for each: u32 name_len LE, name bytes]
-pub fn restore_packages(data: &[u8]) -> Result<(), BlissError> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    if data.len() < 4 {
-        return Err(BlissError::InvalidImage("package section too small".into()));
-    }
-    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut off = 4usize;
-    let mut restored_packages = Vec::with_capacity(count);
-    for _ in 0..count {
-        if off + 4 > data.len() {
-            return Err(BlissError::InvalidImage("truncated package record".into()));
-        }
-        let name_len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-        off += 4;
-        if off + name_len > data.len() {
-            return Err(BlissError::InvalidImage("truncated package data".into()));
-        }
-        let name = String::from_utf8(data[off..off + name_len].to_vec())
-            .map_err(|_| BlissError::InvalidImage("invalid UTF-8 in package name".into()))?;
-        off += name_len;
-        restored_packages.push(PackageEntry { name });
-    }
-
-    let mut guard = heap_state().lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.packages = restored_packages;
-    }
-    Ok(())
-}
-
-// ── Code cache serialization ──────────────────────────────────────
-
-/// Register compiled code in the code cache.
-pub fn register_code(code: Vec<u8>) {
-    let mut guard = heap_state().lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.code_cache.push(CodeCacheEntry { code });
-    }
-}
-
-/// Serialize the compiled code cache.
-/// Format: [u32 count LE] [for each: u32 code_len LE, code bytes]
-pub fn serialize_code_cache() -> Vec<u8> {
-    let guard = heap_state().lock().unwrap();
-    let mut buf = Vec::new();
-    if let Some(state) = &*guard {
-        let count = state.code_cache.len() as u32;
-        buf.extend_from_slice(&count.to_le_bytes());
-        for entry in &state.code_cache {
-            buf.extend_from_slice(&(entry.code.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&entry.code);
-        }
-    }
-    buf
-}
-
-/// Restore the compiled code cache from serialized data.
-/// Format: [u32 count LE] [for each: u32 code_len LE, code bytes]
-pub fn restore_code_cache(data: &[u8]) -> Result<(), BlissError> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    if data.len() < 4 {
-        return Err(BlissError::InvalidImage("code cache section too small".into()));
-    }
-    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let mut off = 4usize;
-    let mut restored_code = Vec::with_capacity(count);
-    for _ in 0..count {
-        if off + 4 > data.len() {
-            return Err(BlissError::InvalidImage("truncated code cache record".into()));
-        }
-        let code_len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-        off += 4;
-        if off + code_len > data.len() {
-            return Err(BlissError::InvalidImage("truncated code cache data".into()));
-        }
-        let code = data[off..off + code_len].to_vec();
-        off += code_len;
-        restored_code.push(CodeCacheEntry { code });
-    }
-
-    let mut guard = heap_state().lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.code_cache = restored_code;
-    }
-    Ok(())
-}
-
-// ── Relocation table ──────────────────────────────────────────────
-
-/// Serialize the relocation table — records all heap pointers that need
-/// fixup when the image is loaded at a different base address (R7.03).
-/// Each entry is a u64 LE offset within the heap section.
-pub fn serialize_relocation_table() -> Vec<u8> {
-    // Walk heap objects and record offsets of pointer-valued fields.
-    // In the bootstrap runtime with Vec-backed objects, there are no
-    // raw pointers embedded in object data (all references use BlissVal
-    // tagged values which are self-contained). Return the empty table.
-    Vec::new()
-}
-
-/// Apply pointer relocations to heap data when loading at a different base.
-/// `reloc_data` is a sequence of u64 LE offsets into the heap section;
-/// each offset points to a u64 that should be adjusted by `delta`.
-pub fn apply_relocations(
-    heap_data: &mut [u8],
-    reloc_data: &[u8],
-    delta: i64,
-) -> Result<(), BlissError> {
-    if reloc_data.is_empty() || delta == 0 {
-        return Ok(());
-    }
-    if reloc_data.len() % 8 != 0 {
-        return Err(BlissError::InvalidImage(
-            "relocation table size not a multiple of 8".into(),
-        ));
-    }
-    let mut off = 0usize;
-    while off < reloc_data.len() {
-        let ptr_offset = u64::from_le_bytes([
-            reloc_data[off], reloc_data[off+1], reloc_data[off+2], reloc_data[off+3],
-            reloc_data[off+4], reloc_data[off+5], reloc_data[off+6], reloc_data[off+7],
-        ]) as usize;
-        off += 8;
-
-        if ptr_offset + 8 > heap_data.len() {
-            return Err(BlissError::InvalidImage(format!(
-                "relocation offset {} out of bounds (heap size {})",
-                ptr_offset,
-                heap_data.len()
-            )));
+    // Walk all non-Free regions that have allocated data (alloc_top > base).
+    for region in &state.regions {
+        if region.header.kind == RegionKind::Free {
+            continue;
         }
 
-        // Read the pointer value, apply delta, write back
-        let old_val = u64::from_ne_bytes([
-            heap_data[ptr_offset], heap_data[ptr_offset+1],
-            heap_data[ptr_offset+2], heap_data[ptr_offset+3],
-            heap_data[ptr_offset+4], heap_data[ptr_offset+5],
-            heap_data[ptr_offset+6], heap_data[ptr_offset+7],
-        ]);
-        let new_val = if delta >= 0 {
-            old_val.wrapping_add(delta as u64)
-        } else {
-            old_val.wrapping_sub((-delta) as u64)
-        };
-        heap_data[ptr_offset..ptr_offset+8].copy_from_slice(&new_val.to_ne_bytes());
+        let base = region.base as usize;
+        let top = region.header.alloc_top as usize;
+
+        if top <= base {
+            continue; // No objects allocated in this region.
+        }
+
+        // Walk objects from base to alloc_top.
+        // Each object has an 8-byte header (type_id: u8, padding: 3 bytes, size: u32)
+        // written by the allocator (HeapAllocator.alloc_fast/alloc_slow/alloc_large).
+        let mut cursor = base;
+        while cursor + OBJECT_HEADER_SIZE <= top {
+            let header_ptr = cursor as *const u8;
+            let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+
+            if body_size == 0 && type_id == 0 {
+                break; // No more objects (zero-filled memory).
+            }
+
+            // Skip forwarded objects (they are stale copies).
+            if type_id == FORWARDED_TYPE_ID {
+                let total = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                cursor += total;
+                continue;
+            }
+
+            let obj_ptr = unsafe { header_ptr.add(OBJECT_HEADER_SIZE) };
+            let should_continue = callback(obj_ptr, type_id, body_size as usize);
+            if !should_continue {
+                return Ok(());
+            }
+
+            // Advance cursor past header + object body, aligned to 16 bytes.
+            let total = OBJECT_HEADER_SIZE + body_size as usize;
+            let aligned = align_up(total, OBJECT_ALIGNMENT);
+            cursor += aligned;
+        }
     }
+
     Ok(())
 }
