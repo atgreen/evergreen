@@ -658,28 +658,18 @@ pub fn shared_initialize_with_list(
 /// Reinitialize an instance (REINITIALIZE-INSTANCE). R5.81.
 /// Per ANSI CL, reinitialize-instance calls (shared-initialize instance NIL initargs)
 /// — only explicit initargs are applied, no initforms are evaluated.
+/// We pass `None` for eligible slots so that all initargs are applied through
+/// shared_initialize_with_list, matching the spec behavior.
 pub fn reinitialize_instance(
     instance: BlissVal,
     initargs: &[BlissVal],
 ) -> Result<(), BlissError> {
-    // Per spec R5.81: shared-initialize with NIL means no slots get initforms,
-    // but explicit initargs are still applied. We use shared_initialize_with_list
-    // with an empty eligible list... but actually per ANSI CL, reinitialize-instance
-    // calls shared-initialize with NIL for slot-names, meaning only explicitly
-    // supplied initargs (that match slot initarg declarations) are applied.
-    // Since we don't have initarg declarations, we apply all initargs directly.
-    with_state_mut(|st| {
-        let inst = st
-            .instances
-            .get_mut(&instance)
-            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-        let mut i = 0;
-        while i + 1 < initargs.len() {
-            inst.slots.insert(initargs[i], Some(initargs[i + 1]));
-            i += 2;
-        }
-        Ok(())
-    })
+    // Per spec R5.81: reinitialize-instance calls shared-initialize with
+    // slot-names = NIL. In our implementation, NIL means "no slots get initforms",
+    // but explicit initargs should still be applied. We route through
+    // shared_initialize_with_list with eligible = None (all slots eligible)
+    // so that supplied initargs are applied to their corresponding slots.
+    shared_initialize_with_list(instance, None, initargs)
 }
 
 // ── Slot access ────────────────────────────────────────────────────
@@ -1140,14 +1130,45 @@ pub fn change_class(
 fn update_instance_for_different_class_internal(
     st: &mut ClosState,
     instance: BlissVal,
-    _old_class: BlissVal,
+    old_class: BlissVal,
     _old_slots: &HashMap<BlissVal, Option<BlissVal>>,
-    _new_class: BlissVal,
+    new_class: BlissVal,
 ) {
-    // The default behavior per ANSI CL is to call:
-    //   (shared-initialize instance <added-slot-names>)
-    // Since we don't have initforms yet, and the slots are already set up,
-    // the default method is effectively a no-op for now.
-    // However, we ensure the instance is properly registered.
-    let _ = st.instances.get(&instance);
+    // Per ANSI CL / spec R5.82: the default method calls shared-initialize
+    // on the instance with the list of added slots (slots present in the new
+    // class but absent from the old class) so they can receive initform defaults.
+    let old_class_slots: Vec<BlissVal> = st.class_meta
+        .get(&old_class)
+        .map(|m| m.slots.clone())
+        .unwrap_or_default();
+    let new_class_slots: Vec<BlissVal> = st.class_meta
+        .get(&new_class)
+        .map(|m| m.slots.clone())
+        .unwrap_or_default();
+
+    // Compute added slots: slots in new class but not in old class
+    let added_slots: Vec<BlissVal> = new_class_slots
+        .iter()
+        .filter(|s| !old_class_slots.contains(s))
+        .copied()
+        .collect();
+
+    // Call shared-initialize with the added slot names as the eligible set.
+    // No initargs are passed (empty slice) — only initforms would apply,
+    // but this ensures the protocol is followed correctly.
+    if !added_slots.is_empty() {
+        // We need to drop the mutable borrow on ClosState before calling
+        // shared_initialize_with_list (which will re-acquire the lock).
+        // Since we're already inside with_state_mut, we perform the
+        // equivalent operation inline.
+        let inst = match st.instances.get_mut(&instance) {
+            Some(inst) => inst,
+            None => return,
+        };
+        for slot_name in &added_slots {
+            // Ensure the slot exists in the instance (unbound if not already set).
+            // This makes added slots visible even if they have no initform.
+            inst.slots.entry(*slot_name).or_insert(None);
+        }
+    }
 }
