@@ -31,3 +31,8 @@ pub mod devtools;
 
 // ── Error types ──────────────────────────────────────────────────
 pub mod error;
+
+// ── Re-exports for convenience ────────────────────────────────────
+pub use error::StdlibError;
+pub use packages::PackageRegistry;
+pub use streams::GrayStream;

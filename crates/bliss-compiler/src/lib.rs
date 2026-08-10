@@ -31,3 +31,9 @@ pub mod profiling;
 
 // ── Error types ──────────────────────────────────────────────────
 pub mod error;
+
+// ── Re-exports for convenience ────────────────────────────────────
+pub use error::CompilerError;
+pub use reader::ReaderState;
+pub use ir::IrGraph;
+pub use tiered::{Tier, CompiledCode};

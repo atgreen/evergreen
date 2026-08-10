@@ -107,8 +107,10 @@ impl Frame {
         if self.num_locals == 0 {
             return &[];
         }
-        let locals_ptr = (self as *const Frame).add(1) as *const BlissVal;
-        std::slice::from_raw_parts(locals_ptr, self.num_locals as usize)
+        unsafe {
+            let locals_ptr = (self as *const Frame).add(1) as *const BlissVal;
+            std::slice::from_raw_parts(locals_ptr, self.num_locals as usize)
+        }
     }
 }
 

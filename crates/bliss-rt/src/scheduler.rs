@@ -5,7 +5,7 @@
 use crate::error::BlissError;
 use crate::thread::GreenThreadId;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// Scheduler configuration.

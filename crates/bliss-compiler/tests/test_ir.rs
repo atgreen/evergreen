@@ -20,21 +20,27 @@ fn add_node_returns_unique_ids() {
 #[test]
 fn node_kind_round_trips() {
     let mut g = IrGraph::new();
-    assert!(matches!(g.node_kind(g.add_node(NodeKind::Start)), NodeKind::Start));
-    match g.node_kind(g.add_node(NodeKind::Constant(NIL))) {
+    let id = g.add_node(NodeKind::Start);
+    assert!(matches!(g.node_kind(id), NodeKind::Start));
+    let id = g.add_node(NodeKind::Constant(NIL));
+    match g.node_kind(id) {
         NodeKind::Constant(v) => assert_eq!(*v, NIL),
         _ => panic!("expected Constant"),
     }
-    match g.node_kind(g.add_node(NodeKind::Parameter(3))) {
+    let id = g.add_node(NodeKind::Parameter(3));
+    match g.node_kind(id) {
         NodeKind::Parameter(i) => assert_eq!(*i, 3),
         _ => panic!("expected Parameter"),
     }
-    assert!(matches!(g.node_kind(g.add_node(NodeKind::TypeCheck { expected_type: NIL })), NodeKind::TypeCheck { .. }));
-    match g.node_kind(g.add_node(NodeKind::MemLoad { offset: -8 })) {
+    let id = g.add_node(NodeKind::TypeCheck { expected_type: NIL });
+    assert!(matches!(g.node_kind(id), NodeKind::TypeCheck { .. }));
+    let id = g.add_node(NodeKind::MemLoad { offset: -8 });
+    match g.node_kind(id) {
         NodeKind::MemLoad { offset } => assert_eq!(*offset, -8),
         _ => panic!("expected MemLoad"),
     }
-    match g.node_kind(g.add_node(NodeKind::MemStore { offset: 16 })) {
+    let id = g.add_node(NodeKind::MemStore { offset: 16 });
+    match g.node_kind(id) {
         NodeKind::MemStore { offset } => assert_eq!(*offset, 16),
         _ => panic!("expected MemStore"),
     }
