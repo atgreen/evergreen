@@ -7,27 +7,53 @@
 use bliss_rt::error::BlissError;
 use bliss_rt::value::{BlissVal, NIL};
 use bliss_stdlib::pathnames::*;
+use bliss_stdlib::streams;
 
 // ── Helper ────────────────────────────────────────────────────────────
 
-/// Build a BlissVal representing a string namestring.
+/// Build a BlissVal representing a string.
+///
+/// Uses `BlissVal::from_raw()` with a deterministic hash and heap-object tag (010).
+/// This produces a sentinel value that the implementation must recognise as a
+/// string for tests to pass — a trivial store-and-return will match raw bits,
+/// but parsing / filesystem operations must actually interpret the string content.
+///
+/// NOTE: These are *placeholder* constructors. When real string allocation lands
+/// (e.g. `BlissVal::from_string(&str, &mut Heap) -> BlissVal`), these helpers
+/// should be replaced with calls to the real constructor so that tests exercise
+/// actual heap-allocated string objects.
 fn make_string_val(s: &str) -> BlissVal {
+    // We need a deterministic mapping from &str -> u64 with tag 010.
+    // FNV-1a is used purely for determinism; the resulting value is a
+    // sentinel, not a real heap pointer.
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    BlissVal((h & !0b111) | 0b010)
+    BlissVal::from_raw((h & !0b111) | 0b010)
 }
 
-/// Make a keyword-ish BlissVal (symbol-index tag 101).
+/// Make a keyword-style BlissVal (symbol-index tag 101).
+///
+/// Same caveats as `make_string_val` — this is a sentinel, not a real symbol
+/// table entry. Replace with real keyword constructor when available.
 fn make_keyword_val(s: &str) -> BlissVal {
     let mut h: u64 = 0x517cc1b727220a95;
     for b in s.bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    BlissVal((h & !0b111) | 0b101)
+    BlissVal::from_raw((h & !0b111) | 0b101)
+}
+
+/// Generate a unique temporary path using the test name and a counter-like suffix.
+fn temp_path(label: &str) -> String {
+    format!(
+        "/tmp/bliss_test_{}_{}",
+        label,
+        std::process::id()
+    )
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -47,7 +73,11 @@ fn parse_namestring_with_host() {
     let input = make_string_val("/tmp/test.lisp");
     let host = make_string_val("localhost");
     let (pathname, _) = parse_namestring(input, Some(host), None).unwrap();
-    assert_eq!(pathname_host(pathname), host);
+    // Verify host was stored — the real implementation must return the host
+    // that was provided, not an arbitrary value.
+    let got_host = pathname_host(pathname);
+    assert_ne!(got_host, NIL, "host should be set when provided to parse_namestring");
+    assert_eq!(got_host, host);
 }
 
 #[test]
@@ -83,6 +113,9 @@ fn make_pathname_all_components() {
     let version = make_keyword_val("NEWEST");
     let pn = make_pathname(host, device, directory, name, type_field, version).unwrap();
     assert_ne!(pn, NIL);
+    // Each accessor must return the exact component that was passed in.
+    // Since these are sentinel values, bit-equality is the baseline check.
+    // Once real string constructors exist, we should also verify string content.
     assert_eq!(pathname_host(pn), host);
     assert_eq!(pathname_device(pn), device);
     assert_eq!(pathname_directory(pn), directory);
@@ -113,7 +146,9 @@ fn merge_pathnames_fills_missing_components() {
         make_string_val("txt"), make_keyword_val("NEWEST"),
     ).unwrap();
     let merged = merge_pathnames(name_only, default_pn, make_keyword_val("NEWEST")).unwrap();
+    // name came from primary
     assert_eq!(pathname_name(merged), make_string_val("foo"));
+    // host, device, type came from default (since primary had NIL)
     assert_eq!(pathname_host(merged), make_string_val("defaulthost"));
     assert_eq!(pathname_device(merged), make_string_val("dev0"));
     assert_eq!(pathname_type(merged), make_string_val("txt"));
@@ -283,6 +318,7 @@ fn wild_pathname_p_specific_field_type_not_wild() {
 fn wild_pathname_p_wild_in_type() {
     let pn = make_pathname(NIL, NIL, NIL, make_string_val("foo"), make_keyword_val("WILD"), NIL).unwrap();
     assert!(wild_pathname_p(pn, Some(make_keyword_val("TYPE"))));
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // 8. Logical pathname translation
@@ -333,34 +369,90 @@ fn truename_resolves_pathname() {
 
 #[test]
 fn directory_lists_contents() {
+    // /tmp should always have entries on a Unix system
     let entries = directory(make_string_val("/tmp/*")).unwrap();
-    let _ = entries.len(); // valid vec returned
+    assert!(
+        !entries.is_empty(),
+        "directory() on /tmp/* should return at least one entry"
+    );
+    // Each entry should be a non-NIL pathname
+    for entry in &entries {
+        assert_ne!(*entry, NIL, "directory entry should not be NIL");
+    }
 }
 
 #[test]
 fn ensure_directories_exist_creates_dirs() {
-    let path = make_string_val("/tmp/bliss_test_ensure_dirs/a/b/c/file.txt");
+    let dir_path = temp_path("ensure_dirs");
+    let full_path = format!("{}/a/b/c/file.txt", dir_path);
+
+    // Clean up before test to ensure idempotency
+    let _ = std::fs::remove_dir_all(&dir_path);
+
+    let path = make_string_val(&full_path);
     let (returned_pn, created) = ensure_directories_exist(path).unwrap();
     assert_ne!(returned_pn, NIL);
-    assert!(created);
+    assert!(created, "directories should have been freshly created");
+
+    // Verify the directory structure actually exists on disk
+    let parent = std::path::Path::new(&full_path).parent().unwrap();
+    assert!(parent.is_dir(), "parent directory should exist after ensure_directories_exist");
+
+    // Clean up after test
+    let _ = std::fs::remove_dir_all(&dir_path);
 }
 
 #[test]
 fn delete_file_removes_existing_file() {
-    let path = make_string_val("/tmp/bliss_test_delete_file.tmp");
-    let result = delete_file(path);
-    assert!(result.is_ok() || matches!(result, Err(BlissError::FileError(_))));
+    let file_path = temp_path("delete_file.tmp");
+
+    // Actually create the file first
+    std::fs::write(&file_path, b"test content").expect("failed to create temp file for test");
+    assert!(
+        std::path::Path::new(&file_path).exists(),
+        "temp file should exist before delete_file"
+    );
+
+    let path = make_string_val(&file_path);
+    delete_file(path).expect("delete_file should succeed on existing file");
+
+    // Verify the file is actually gone
+    assert!(
+        !std::path::Path::new(&file_path).exists(),
+        "file should no longer exist after delete_file"
+    );
 }
 
 #[test]
 fn rename_file_returns_three_values() {
-    let old = make_string_val("/tmp/bliss_test_rename_old.tmp");
-    let new_name = make_string_val("/tmp/bliss_test_rename_new.tmp");
-    match rename_file(old, new_name) {
-        Ok((d, o, n)) => { assert_ne!(d, NIL); assert_ne!(o, NIL); assert_ne!(n, NIL); }
-        Err(BlissError::FileError(_)) => {} // source may not exist
-        Err(e) => panic!("Unexpected error: {:?}", e),
-    }
+    let old_path = temp_path("rename_old.tmp");
+    let new_path = temp_path("rename_new.tmp");
+
+    // Create source file and ensure destination doesn't exist
+    std::fs::write(&old_path, b"rename test content").expect("failed to create source file");
+    let _ = std::fs::remove_file(&new_path);
+
+    let old = make_string_val(&old_path);
+    let new_name = make_string_val(&new_path);
+    let (defaulted_new, old_truename, new_truename) =
+        rename_file(old, new_name).expect("rename_file should succeed");
+
+    assert_ne!(defaulted_new, NIL, "defaulted-new-name should not be NIL");
+    assert_ne!(old_truename, NIL, "old-truename should not be NIL");
+    assert_ne!(new_truename, NIL, "new-truename should not be NIL");
+
+    // Verify old file is gone and new file exists
+    assert!(
+        !std::path::Path::new(&old_path).exists(),
+        "old file should not exist after rename"
+    );
+    assert!(
+        std::path::Path::new(&new_path).exists(),
+        "new file should exist after rename"
+    );
+
+    // Clean up
+    let _ = std::fs::remove_file(&new_path);
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -393,6 +485,25 @@ fn translate_logical_pathname_no_translations_set() {
     let logical_pn = make_string_val("UNDEFINED-HOST:FILE.LISP");
     let (pn, _) = parse_namestring(logical_pn, None, None).unwrap();
     assert!(translate_logical_pathname(pn).is_err());
+}
+
+#[test]
+fn open_with_nonexistent_directory_errors() {
+    // CL `OPEN` with :direction :output on a path whose parent directory
+    // does not exist should signal a FILE-ERROR.
+    let path = make_string_val("/nonexistent_dir_bliss_test/subdir/file.lisp");
+    let result = streams::open(
+        path,
+        streams::StreamDirection::Output,
+        NIL,  // default element-type
+        NIL,  // if-exists
+        NIL,  // if-does-not-exist
+        streams::ExternalFormat::Utf8,
+    );
+    assert!(
+        matches!(result, Err(BlissError::FileError(_))),
+        "open on path with non-existent directory should return FileError"
+    );
 }
 
 #[test]
