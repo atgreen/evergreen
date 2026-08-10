@@ -4,7 +4,7 @@
 //! Implements the algorithm from spec §4.2 / A4.01.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::cell::Cell;
 
 use bliss_rt::error::BlissError;
 use bliss_rt::value::BlissVal;
@@ -104,18 +104,18 @@ fn default_hook(expander: BlissVal, _form: BlissVal, _env: &Environment) -> Resu
     Ok(expander)
 }
 
-static MACROEXPAND_HOOK: Mutex<MacroexpandHook> = Mutex::new(default_hook as MacroexpandHook);
+thread_local! {
+    static MACROEXPAND_HOOK: Cell<MacroexpandHook> = const { Cell::new(default_hook as MacroexpandHook) };
+}
 
 /// Set the macroexpand hook.
 pub fn set_macroexpand_hook(hook: MacroexpandHook) {
-    let mut guard = MACROEXPAND_HOOK.lock().unwrap();
-    *guard = hook;
+    MACROEXPAND_HOOK.with(|cell| cell.set(hook));
 }
 
 /// Get the current macroexpand hook.
 fn get_macroexpand_hook() -> MacroexpandHook {
-    let guard = MACROEXPAND_HOOK.lock().unwrap();
-    *guard
+    MACROEXPAND_HOOK.with(|cell| cell.get())
 }
 
 // ── Expansion functions ────────────────────────────────────────────
