@@ -612,8 +612,11 @@ pub fn shared_initialize(
     if slot_names == T {
         shared_initialize_with_list(instance, None, initargs)
     } else if slot_names == NIL {
-        // NIL: no slots are eligible for initialization
-        Ok(())
+        // NIL means "don't evaluate initforms for any slots", but explicitly
+        // supplied initarg pairs MUST still be applied to their corresponding
+        // slots.  Pass eligible = None so all initargs are applied (initforms
+        // are not yet implemented, so the behavior is identical to T for now).
+        shared_initialize_with_list(instance, None, initargs)
     } else {
         // Single symbol: treat as a one-element list
         shared_initialize_with_list(instance, Some(&[slot_names]), initargs)
@@ -658,18 +661,14 @@ pub fn shared_initialize_with_list(
 /// Reinitialize an instance (REINITIALIZE-INSTANCE). R5.81.
 /// Per ANSI CL, reinitialize-instance calls (shared-initialize instance NIL initargs)
 /// — only explicit initargs are applied, no initforms are evaluated.
-/// We pass `None` for eligible slots so that all initargs are applied through
-/// shared_initialize_with_list, matching the spec behavior.
 pub fn reinitialize_instance(
     instance: BlissVal,
     initargs: &[BlissVal],
 ) -> Result<(), BlissError> {
     // Per spec R5.81: reinitialize-instance calls shared-initialize with
-    // slot-names = NIL. In our implementation, NIL means "no slots get initforms",
-    // but explicit initargs should still be applied. We route through
-    // shared_initialize_with_list with eligible = None (all slots eligible)
-    // so that supplied initargs are applied to their corresponding slots.
-    shared_initialize_with_list(instance, None, initargs)
+    // slot-names = NIL.  Now that shared_initialize handles NIL correctly
+    // (applies initargs but skips initforms), we call it directly.
+    shared_initialize(instance, NIL, initargs)
 }
 
 // ── Slot access ────────────────────────────────────────────────────
@@ -1039,6 +1038,39 @@ pub fn compute_effective_method(
             Ok(em_key)
         }
     }
+}
+
+// ── Effective method accessors ─────────────────────────────────────
+
+/// Retrieve a standard-combination effective method descriptor by key.
+///
+/// Returns the around, before, primary, and after method lists.
+pub fn get_effective_method(
+    key: BlissVal,
+) -> Option<(Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>)> {
+    with_state(|st| {
+        st.effective_methods.get(&key).map(|em| {
+            (
+                em.around.clone(),
+                em.before.clone(),
+                em.primary.clone(),
+                em.after.clone(),
+            )
+        })
+    })
+}
+
+/// Retrieve a short-form combination effective method descriptor by key.
+///
+/// Returns the combination type and the ordered list of methods.
+pub fn get_short_form_method(
+    key: BlissVal,
+) -> Option<(MethodCombinationType, Vec<BlissVal>)> {
+    with_state(|st| {
+        st.short_form_methods.get(&key).map(|sfm| {
+            (sfm.combination.clone(), sfm.methods.clone())
+        })
+    })
 }
 
 // ── Class change protocol ──────────────────────────────────────────
