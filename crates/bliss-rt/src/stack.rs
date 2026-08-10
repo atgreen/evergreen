@@ -8,39 +8,49 @@ use crate::value::BlissVal;
 /// CL stack for a green thread.
 /// Default usable size: 512 KiB (configurable via BLISS_STACK_SIZE).
 pub struct BlissStack {
-    _private: (),
+    /// Allocated memory buffer for the stack.
+    memory: Vec<u8>,
+    /// Stack pointer offset from base (grows upward from base).
+    sp_offset: usize,
+    /// Frame pointer (null if no frames pushed).
+    fp: *const Frame,
 }
 
 impl BlissStack {
     /// Allocate a new stack with the given usable size in bytes.
     /// Sets up guard pages for overflow detection.
     pub fn new(size: usize) -> Self {
-        unimplemented!("BlissStack::new")
+        let memory = vec![0u8; size];
+        BlissStack {
+            memory,
+            sp_offset: 0,
+            fp: std::ptr::null(),
+        }
     }
 
     /// Get the base (lowest) address of the stack.
     pub fn base(&self) -> *const u8 {
-        unimplemented!("BlissStack::base")
+        self.memory.as_ptr()
     }
 
     /// Get the current stack pointer.
     pub fn sp(&self) -> *const u8 {
-        unimplemented!("BlissStack::sp")
+        unsafe { self.memory.as_ptr().add(self.sp_offset) }
     }
 
     /// Get the current frame pointer.
     pub fn fp(&self) -> *const Frame {
-        unimplemented!("BlissStack::fp")
+        self.fp
     }
 
     /// Returns total usable size in bytes.
     pub fn capacity(&self) -> usize {
-        unimplemented!("BlissStack::capacity")
+        self.memory.len()
     }
 
     /// Returns bytes currently in use.
     pub fn used(&self) -> usize {
-        unimplemented!("BlissStack::used")
+        self.sp_offset
     }
 }
 
@@ -77,17 +87,28 @@ pub enum FrameType {
 }
 
 impl Frame {
-    /// Extract the frame type from flags.
+    /// Extract the frame type from the low 2 bits of flags.
     pub fn frame_type(&self) -> FrameType {
-        unimplemented!("Frame::frame_type")
+        match self.flags & 0b11 {
+            0b00 => FrameType::Call,
+            0b01 => FrameType::Catch,
+            0b10 => FrameType::Unwind,
+            0b11 => FrameType::Special,
+            _ => unreachable!(),
+        }
     }
 
     /// Get a slice of local variables in this frame.
+    /// Locals are stored contiguously right after the Frame header.
     ///
     /// # Safety
     /// Frame must be valid and `num_locals` must be correct.
     pub unsafe fn locals(&self) -> &[BlissVal] {
-        unimplemented!("Frame::locals")
+        if self.num_locals == 0 {
+            return &[];
+        }
+        let locals_ptr = (self as *const Frame).add(1) as *const BlissVal;
+        std::slice::from_raw_parts(locals_ptr, self.num_locals as usize)
     }
 }
 
@@ -101,13 +122,13 @@ pub struct CodeInfo {
 
 impl CodeInfo {
     /// Look up the source location for a given PC offset.
-    pub fn source_location(&self, pc_offset: usize) -> Option<SourceLocation> {
-        unimplemented!("CodeInfo::source_location")
+    pub fn source_location(&self, _pc_offset: usize) -> Option<SourceLocation> {
+        None
     }
 
     /// Get the GC stack map for a given safepoint PC offset.
-    pub fn stack_map(&self, pc_offset: usize) -> Option<&[u8]> {
-        unimplemented!("CodeInfo::stack_map")
+    pub fn stack_map(&self, _pc_offset: usize) -> Option<&[u8]> {
+        None
     }
 }
 
@@ -123,16 +144,16 @@ pub struct SourceLocation {
 
 /// Iterator over CL stack frames via the prev_fp chain.
 pub struct FrameWalker {
-    _private: (),
+    current: *const Frame,
 }
 
 impl FrameWalker {
     /// Create a frame walker starting from the given frame pointer.
     ///
     /// # Safety
-    /// `fp` must point to a valid `Frame`.
+    /// `fp` must point to a valid `Frame` or be null.
     pub unsafe fn new(fp: *const Frame) -> Self {
-        unimplemented!("FrameWalker::new")
+        FrameWalker { current: fp }
     }
 }
 
@@ -140,6 +161,12 @@ impl Iterator for FrameWalker {
     type Item = *const Frame;
 
     fn next(&mut self) -> Option<Self::Item> {
-        unimplemented!("FrameWalker::next")
+        if self.current.is_null() {
+            return None;
+        }
+        let frame = self.current;
+        // Walk to the previous frame via prev_fp.
+        self.current = unsafe { (*frame).prev_fp as *const Frame };
+        Some(frame)
     }
 }

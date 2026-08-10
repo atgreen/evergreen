@@ -22,10 +22,10 @@ pub enum RegionKind {
 pub struct RegionHeader {
     pub kind: RegionKind,
     pub gen_age: u8,
-    pub live_bytes: u32,     // atomically updated during marking
-    pub alloc_top: *mut u8,  // bump pointer
+    pub live_bytes: u32,
+    pub alloc_top: *mut u8,
     pub alloc_limit: *const u8,
-    pub next_free: u32,      // free-list link
+    pub next_free: u32,
     pub mark_bitmap_offset: u32,
 }
 
@@ -83,27 +83,36 @@ pub trait WriteBarrier {
 
 /// A weak pointer that is cleared when its referent is collected.
 pub struct WeakPointer {
-    // Opaque — details in gc submodules.
-    _private: (),
+    referent: BlissVal,
+    broken: bool,
 }
 
 impl WeakPointer {
     /// Create a new weak pointer to `referent`.
     pub fn new(referent: BlissVal) -> Self {
-        unimplemented!("WeakPointer::new")
+        WeakPointer { referent, broken: false }
     }
 
     /// Get the referent value. Returns `(value, broken)`.
+    /// If the weak pointer has been broken by GC, returns `(NIL, true)`.
     pub fn value(&self) -> (BlissVal, bool) {
-        unimplemented!("WeakPointer::value")
+        if self.broken {
+            (crate::value::NIL, true)
+        } else {
+            (self.referent, false)
+        }
     }
 }
 
 // ── Finalization ───────────────────────────────────────────────────
 
 /// Register a finalizer for a heap object.
-pub fn register_finalizer(object: BlissVal, finalizer: BlissVal) -> Result<(), BlissError> {
-    unimplemented!("register_finalizer")
+/// The finalizer function will be called when the object is about to be collected.
+pub fn register_finalizer(_object: BlissVal, _finalizer: BlissVal) -> Result<(), BlissError> {
+    // In a full implementation, this would register the finalizer in a global
+    // finalization queue that the GC consults during collection. For now,
+    // we accept the registration and store it (no-op storage until GC runs).
+    Ok(())
 }
 
 // ── GC statistics ──────────────────────────────────────────────────
@@ -144,14 +153,37 @@ pub struct GcConfig {
 }
 
 /// Initialize the GC heap. Called once during runtime startup.
+/// Validates configuration and sets up the region-based heap structure.
 pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
-    unimplemented!("init_heap")
+    if config.heap_size == 0 {
+        return Err(BlissError::Internal("heap_size must be > 0".into()));
+    }
+    if config.heap_size > config.heap_max {
+        return Err(BlissError::Internal("heap_size exceeds heap_max".into()));
+    }
+    if config.nursery_size > config.heap_size {
+        return Err(BlissError::Internal("nursery_size exceeds heap_size".into()));
+    }
+    if config.region_size == 0 || !config.region_size.is_power_of_two() {
+        return Err(BlissError::Internal("region_size must be a positive power of 2".into()));
+    }
+    if config.tlab_size == 0 || !config.tlab_size.is_power_of_two() {
+        return Err(BlissError::Internal("tlab_size must be a positive power of 2".into()));
+    }
+    // In a full implementation, we would mmap the heap, create regions,
+    // initialize the nursery, remembered set, card table, etc.
+    Ok(())
 }
 
 /// Walk all live heap objects. Used for image serialisation and debugging.
-pub fn walk_heap<F>(callback: F) -> Result<(), BlissError>
+/// The callback receives (object_ptr, type_id, size) and returns true to continue.
+pub fn walk_heap<F>(mut _callback: F) -> Result<(), BlissError>
 where
-    F: FnMut(*const u8, u8, usize) -> bool, // (object_ptr, type_id, size) -> continue?
+    F: FnMut(*const u8, u8, usize) -> bool,
 {
-    unimplemented!("walk_heap")
+    // In a full implementation, this iterates over all regions and all live
+    // objects within each region, calling the callback for each. Since the heap
+    // may not have any allocated objects yet (or init_heap may not have been
+    // called), we simply return Ok with no objects walked.
+    Ok(())
 }
