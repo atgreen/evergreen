@@ -1,0 +1,10 @@
+[package]
+name = "bliss-compiler"
+description = "Bliss Common Lisp compiler: reader, macroexpand, IR, tiered compilation, codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bliss-rt.workspace = true

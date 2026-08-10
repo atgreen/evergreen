@@ -1,0 +1,11 @@
+[package]
+name = "bliss-stdlib"
+description = "Bliss Common Lisp standard library: packages, CLOS, conditions, streams, sequences"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bliss-rt.workspace = true
+bliss-compiler.workspace = true

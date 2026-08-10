@@ -1,0 +1,7 @@
+[package]
+name = "bliss-rt"
+description = "Bliss Common Lisp runtime: object model, GC, threads, FFI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true

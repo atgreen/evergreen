@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bliss-rt",
+    "crates/bliss-compiler",
+    "crates/bliss-stdlib",
+    "crates/bliss-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+bliss-rt = { path = "crates/bliss-rt" }
+bliss-compiler = { path = "crates/bliss-compiler" }
+bliss-stdlib = { path = "crates/bliss-stdlib" }
