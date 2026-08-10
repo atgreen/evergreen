@@ -187,6 +187,18 @@ fn header_set_marked() {
 }
 
 #[test]
+fn header_set_marked_idempotent() {
+    let h = ObjectHeader::new(0x01, 1);
+    let first = h.set_marked();
+    assert!(first); // first call succeeds (was unmarked)
+    assert!(h.is_marked());
+
+    let second = h.set_marked();
+    assert!(!second); // second call returns false (CAS detects already-set)
+    assert!(h.is_marked()); // still marked
+}
+
+#[test]
 fn header_is_forwarded_initially_false() {
     let h = ObjectHeader::new(0x01, 1);
     assert!(!h.is_forwarded());
