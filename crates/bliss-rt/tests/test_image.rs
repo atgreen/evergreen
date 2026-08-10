@@ -1,4 +1,5 @@
 use bliss_rt::image::*;
+use bliss_rt::gc;
 
 #[test]
 fn arch_and_os_repr_values() {
@@ -169,4 +170,127 @@ fn find_appended_image_returns_result() {
     // and returns a meaningful result.
     assert!(result.is_none(),
         "find_appended_image on a test binary should return None (no appended image)");
+}
+
+#[test]
+fn save_load_roundtrip_preserves_heap_objects() {
+    // Initialize the heap so objects can be recorded.
+    let config = gc::GcConfig {
+        heap_size: 64 * 1024 * 1024,
+        heap_max: 256 * 1024 * 1024,
+        nursery_size: 16 * 1024 * 1024,
+        tlab_size: 8192,
+        region_size: 1024 * 1024,
+        promotion_threshold: 15,
+        pause_target_ms: 10,
+        gc_workers: 1,
+        satb_buffer_size: 1024,
+        old_occupancy_trigger: 0.45,
+    };
+    // init_heap may fail if already initialized by another test; that's fine.
+    let _ = gc::init_heap(&config);
+
+    // Record some objects into the heap.
+    let obj1_data = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let obj2_data = vec![0xAA, 0xBB, 0xCC, 0xDD];
+    gc::record_object(1, obj1_data.clone());
+    gc::record_object(2, obj2_data.clone());
+
+    // Set an entry continuation.
+    let entry_val = bliss_rt::value::BlissVal::from_fixnum(42);
+    gc::set_entry_continuation(entry_val);
+
+    // Save the image.
+    let path = "/tmp/bliss_roundtrip_test.bimg";
+    let opts = SaveImageOptions {
+        executable: false,
+        compression: ImageCompression::None,
+        purify: false,
+    };
+    save_image(path, &opts).expect("save_image should succeed");
+
+    // Clear the heap to prove load restores data.
+    gc::restore_heap(&[]).expect("clearing heap should succeed");
+
+    // Verify heap is empty.
+    let mut count_before = 0usize;
+    gc::walk_heap(|_, _, _| { count_before += 1; true }).unwrap();
+    assert_eq!(count_before, 0, "heap should be empty after clear");
+
+    // Load the image back.
+    let restored_entry = load_image(path).expect("load_image should succeed");
+
+    // Verify the entry continuation was restored.
+    assert_eq!(restored_entry, entry_val, "entry continuation should survive round-trip");
+
+    // Walk the restored heap and verify objects are present.
+    let mut restored_objects: Vec<(u8, Vec<u8>)> = Vec::new();
+    gc::walk_heap(|ptr, type_id, size| {
+        let data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+        restored_objects.push((type_id, data));
+        true
+    }).unwrap();
+
+    assert!(restored_objects.len() >= 2, "should have at least 2 restored objects, got {}", restored_objects.len());
+
+    // Find our objects among the restored set (there may be others from prior tests
+    // since heap state is global).
+    let found_obj1 = restored_objects.iter().any(|(tid, data)| *tid == 1 && data == &obj1_data);
+    let found_obj2 = restored_objects.iter().any(|(tid, data)| *tid == 2 && data == &obj2_data);
+    assert!(found_obj1, "object 1 should survive save/load round-trip");
+    assert!(found_obj2, "object 2 should survive save/load round-trip");
+
+    // Clean up.
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn save_load_roundtrip_with_compression() {
+    let config = gc::GcConfig {
+        heap_size: 64 * 1024 * 1024,
+        heap_max: 256 * 1024 * 1024,
+        nursery_size: 16 * 1024 * 1024,
+        tlab_size: 8192,
+        region_size: 1024 * 1024,
+        promotion_threshold: 15,
+        pause_target_ms: 10,
+        gc_workers: 1,
+        satb_buffer_size: 1024,
+        old_occupancy_trigger: 0.45,
+    };
+    let _ = gc::init_heap(&config);
+
+    // Record an object with repeated bytes (compresses well).
+    let obj_data = vec![0xFFu8; 100];
+    gc::record_object(5, obj_data.clone());
+
+    let entry_val = bliss_rt::value::BlissVal::from_fixnum(99);
+    gc::set_entry_continuation(entry_val);
+
+    let path = "/tmp/bliss_roundtrip_compressed_test.bimg";
+    let opts = SaveImageOptions {
+        executable: false,
+        compression: ImageCompression::Zstd,
+        purify: false,
+    };
+    save_image(path, &opts).expect("save_image with compression should succeed");
+
+    gc::restore_heap(&[]).expect("clearing heap should succeed");
+
+    let restored_entry = load_image(path).expect("load_image should succeed");
+    assert_eq!(restored_entry, entry_val);
+
+    let mut found = false;
+    gc::walk_heap(|ptr, type_id, size| {
+        if type_id == 5 {
+            let data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+            if data == obj_data {
+                found = true;
+            }
+        }
+        true
+    }).unwrap();
+    assert!(found, "compressed object should survive round-trip");
+
+    std::fs::remove_file(path).ok();
 }

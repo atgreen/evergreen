@@ -6,6 +6,7 @@ use crate::error::BlissError;
 use crate::value::BlissVal;
 
 use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
 
 // ── Region model ───────────────────────────────────────────────────
 
@@ -113,11 +114,21 @@ impl WeakPointer {
 
 /// Register a finalizer for a heap object.
 /// The finalizer function will be called when the object is about to be collected.
-pub fn register_finalizer(_object: BlissVal, _finalizer: BlissVal) -> Result<(), BlissError> {
-    // Finalizer registration is recorded; the GC will invoke finalizers
-    // during collection when the object becomes unreachable.
-    // In the current bootstrap implementation, finalizers are accepted
-    // but not invoked (no concurrent GC cycle is running yet).
+/// In the bootstrap implementation, finalizers are recorded but only invoked
+/// during full_gc (which is called before image save).
+pub fn register_finalizer(object: BlissVal, finalizer: BlissVal) -> Result<(), BlissError> {
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        // Replace any existing finalizer for the same object.
+        if let Some(existing) = state.finalizers.iter_mut().find(|f| f.object == object) {
+            existing.finalizer_fn = finalizer;
+        } else {
+            state.finalizers.push(Finalizer {
+                object,
+                finalizer_fn: finalizer,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -168,6 +179,26 @@ struct HeapObject {
     data: Vec<u8>,
 }
 
+/// A registered finalizer for a heap object.
+struct Finalizer {
+    /// The object this finalizer is registered on.
+    object: BlissVal,
+    /// The finalizer function to call when the object is collected.
+    finalizer_fn: BlissVal,
+}
+
+/// A package entry in the runtime package registry.
+struct PackageEntry {
+    /// The package name (e.g. "COMMON-LISP", "COMMON-LISP-USER").
+    name: String,
+}
+
+/// A compiled code cache entry.
+struct CodeCacheEntry {
+    /// The compiled code bytes.
+    code: Vec<u8>,
+}
+
 /// Bootstrap heap state — stores the GC configuration, stats, and
 /// all allocated objects so that `walk_heap` can iterate them and
 /// image save can serialise real heap data.
@@ -181,6 +212,14 @@ struct HeapState {
     base_address: u64,
     /// Monotonically increasing GC generation counter.
     gc_generation: u32,
+    /// Registered finalizers for heap objects.
+    finalizers: Vec<Finalizer>,
+    /// Runtime symbol intern table. Maps symbol name → value.
+    symbols: HashMap<String, u64>,
+    /// Runtime package registry.
+    packages: Vec<PackageEntry>,
+    /// Compiled code cache.
+    code_cache: Vec<CodeCacheEntry>,
 }
 
 /// Global heap state, initialized by `init_heap`.
@@ -226,6 +265,10 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
         objects: Vec::new(),
         base_address,
         gc_generation: 0,
+        finalizers: Vec::new(),
+        symbols: HashMap::new(),
+        packages: Vec::new(),
+        code_cache: Vec::new(),
     };
     *heap_state().lock().unwrap() = Some(state);
 
@@ -337,6 +380,10 @@ pub fn restore_heap(serialized: &[u8]) -> Result<(), BlissError> {
                 objects: Vec::new(),
                 base_address: heap_state() as *const _ as u64,
                 gc_generation: 0,
+                finalizers: Vec::new(),
+                symbols: HashMap::new(),
+                packages: Vec::new(),
+                code_cache: Vec::new(),
             });
             guard.as_mut().unwrap()
         }
@@ -501,29 +548,47 @@ pub fn restore_gc_metadata(data: &[u8]) -> Result<(), BlissError> {
 
 // ── Symbol table serialization (§7.2.7) ───────────────────────────
 
-/// Serialize the symbol intern table. In the bootstrap runtime, symbols
-/// are managed by bliss-stdlib's packages module. This function serializes
-/// whatever symbol state the runtime tracks directly.
+/// Intern a symbol in the runtime symbol table.
+pub fn intern_symbol(name: &str, value: u64) {
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        state.symbols.insert(name.to_string(), value);
+    }
+}
+
+/// Serialize the symbol intern table.
+/// Format: [u32 count LE] [for each: u32 name_len LE, name bytes, u64 value LE]
 pub fn serialize_symbols() -> Vec<u8> {
-    // The bootstrap runtime does not maintain its own symbol table;
-    // symbols are managed by bliss-stdlib. Return empty data —
-    // the call-site wiring is established for when stdlib hooks in.
-    Vec::new()
+    let guard = heap_state().lock().unwrap();
+    let mut buf = Vec::new();
+    if let Some(state) = &*guard {
+        let count = state.symbols.len() as u32;
+        buf.extend_from_slice(&count.to_le_bytes());
+        // Sort by name for deterministic output
+        let mut entries: Vec<(&String, &u64)> = state.symbols.iter().collect();
+        entries.sort_by_key(|(k, _)| k.as_str());
+        for (name, value) in entries {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    buf
 }
 
 /// Restore the symbol intern table from serialized data.
+/// Format: [u32 count LE] [for each: u32 name_len LE, name bytes, u64 value LE]
 pub fn restore_symbols(data: &[u8]) -> Result<(), BlissError> {
     if data.is_empty() {
         return Ok(());
     }
-    // Parse symbol records and rebuild the intern table.
-    // Format: [u32 count LE] [for each: u32 name_len LE, name bytes, u64 value LE]
-    let mut off = 0usize;
     if data.len() < 4 {
         return Err(BlissError::InvalidImage("symbol section too small".into()));
     }
     let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    off += 4;
+    let mut off = 4usize;
+    let mut restored_symbols = HashMap::with_capacity(count);
     for _ in 0..count {
         if off + 4 > data.len() {
             return Err(BlissError::InvalidImage("truncated symbol record".into()));
@@ -533,34 +598,68 @@ pub fn restore_symbols(data: &[u8]) -> Result<(), BlissError> {
         if off + name_len + 8 > data.len() {
             return Err(BlissError::InvalidImage("truncated symbol data".into()));
         }
-        // Skip name bytes and value — in bootstrap, symbols are managed by stdlib
-        off += name_len + 8;
+        let name = String::from_utf8(data[off..off + name_len].to_vec())
+            .map_err(|_| BlissError::InvalidImage("invalid UTF-8 in symbol name".into()))?;
+        off += name_len;
+        let value = u64::from_le_bytes([
+            data[off], data[off+1], data[off+2], data[off+3],
+            data[off+4], data[off+5], data[off+6], data[off+7],
+        ]);
+        off += 8;
+        restored_symbols.insert(name, value);
+    }
+
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        state.symbols = restored_symbols;
     }
     Ok(())
 }
 
 // ── Package registry serialization (§7.2.8) ──────────────────────
 
+/// Register a package in the runtime package registry.
+pub fn register_package(name: &str) {
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        // Avoid duplicate registrations.
+        if !state.packages.iter().any(|p| p.name == name) {
+            state.packages.push(PackageEntry {
+                name: name.to_string(),
+            });
+        }
+    }
+}
+
 /// Serialize the package registry.
+/// Format: [u32 count LE] [for each: u32 name_len LE, name bytes]
 pub fn serialize_packages() -> Vec<u8> {
-    // In the bootstrap runtime, packages are managed by bliss-stdlib.
-    // Return empty data — call-site wiring established.
-    Vec::new()
+    let guard = heap_state().lock().unwrap();
+    let mut buf = Vec::new();
+    if let Some(state) = &*guard {
+        let count = state.packages.len() as u32;
+        buf.extend_from_slice(&count.to_le_bytes());
+        for pkg in &state.packages {
+            let name_bytes = pkg.name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+        }
+    }
+    buf
 }
 
 /// Restore the package registry from serialized data.
+/// Format: [u32 count LE] [for each: u32 name_len LE, name bytes]
 pub fn restore_packages(data: &[u8]) -> Result<(), BlissError> {
     if data.is_empty() {
         return Ok(());
     }
-    // Parse package records.
-    // Format: [u32 count LE] [for each: u32 name_len LE, name bytes]
-    let mut off = 0usize;
     if data.len() < 4 {
         return Err(BlissError::InvalidImage("package section too small".into()));
     }
     let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    off += 4;
+    let mut off = 4usize;
+    let mut restored_packages = Vec::with_capacity(count);
     for _ in 0..count {
         if off + 4 > data.len() {
             return Err(BlissError::InvalidImage("truncated package record".into()));
@@ -570,34 +669,57 @@ pub fn restore_packages(data: &[u8]) -> Result<(), BlissError> {
         if off + name_len > data.len() {
             return Err(BlissError::InvalidImage("truncated package data".into()));
         }
+        let name = String::from_utf8(data[off..off + name_len].to_vec())
+            .map_err(|_| BlissError::InvalidImage("invalid UTF-8 in package name".into()))?;
         off += name_len;
+        restored_packages.push(PackageEntry { name });
+    }
+
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        state.packages = restored_packages;
     }
     Ok(())
 }
 
 // ── Code cache serialization ──────────────────────────────────────
 
+/// Register compiled code in the code cache.
+pub fn register_code(code: Vec<u8>) {
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        state.code_cache.push(CodeCacheEntry { code });
+    }
+}
+
 /// Serialize the compiled code cache.
+/// Format: [u32 count LE] [for each: u32 code_len LE, code bytes]
 pub fn serialize_code_cache() -> Vec<u8> {
-    // In the bootstrap runtime, no compiled code is cached at the GC level.
-    // The compiler crate manages its own code; this wiring exists for the
-    // full implementation to hook into.
-    Vec::new()
+    let guard = heap_state().lock().unwrap();
+    let mut buf = Vec::new();
+    if let Some(state) = &*guard {
+        let count = state.code_cache.len() as u32;
+        buf.extend_from_slice(&count.to_le_bytes());
+        for entry in &state.code_cache {
+            buf.extend_from_slice(&(entry.code.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&entry.code);
+        }
+    }
+    buf
 }
 
 /// Restore the compiled code cache from serialized data.
+/// Format: [u32 count LE] [for each: u32 code_len LE, code bytes]
 pub fn restore_code_cache(data: &[u8]) -> Result<(), BlissError> {
     if data.is_empty() {
         return Ok(());
     }
-    // Parse code cache records.
-    // Format: [u32 count LE] [for each: u32 code_len LE, code bytes]
-    let mut off = 0usize;
     if data.len() < 4 {
         return Err(BlissError::InvalidImage("code cache section too small".into()));
     }
     let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    off += 4;
+    let mut off = 4usize;
+    let mut restored_code = Vec::with_capacity(count);
     for _ in 0..count {
         if off + 4 > data.len() {
             return Err(BlissError::InvalidImage("truncated code cache record".into()));
@@ -607,7 +729,14 @@ pub fn restore_code_cache(data: &[u8]) -> Result<(), BlissError> {
         if off + code_len > data.len() {
             return Err(BlissError::InvalidImage("truncated code cache data".into()));
         }
+        let code = data[off..off + code_len].to_vec();
         off += code_len;
+        restored_code.push(CodeCacheEntry { code });
+    }
+
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        state.code_cache = restored_code;
     }
     Ok(())
 }

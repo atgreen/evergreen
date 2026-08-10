@@ -246,8 +246,10 @@ fn bytes_to_struct<T: Sized + Copy>(data: &[u8]) -> Option<T> {
     if data.len() < std::mem::size_of::<T>() {
         return None;
     }
-    // SAFETY: We checked the length; T is repr(C)+Copy so any bit pattern is valid for our types.
-    Some(unsafe { std::ptr::read(data.as_ptr() as *const T) })
+    // SAFETY: We checked the length; T is repr(C)+Copy. We use read_unaligned
+    // to avoid undefined behaviour on platforms with strict alignment requirements
+    // (the byte buffer from file I/O is not guaranteed to be aligned to T's alignment).
+    Some(unsafe { std::ptr::read_unaligned(data.as_ptr() as *const T) })
 }
 
 /// Compute the SHA-256 of the header with the checksum field zeroed
