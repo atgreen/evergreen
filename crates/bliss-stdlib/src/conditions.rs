@@ -95,6 +95,17 @@ fn is_condition(val: BlissVal) -> bool {
     STATE.with(|s| s.borrow().condition_registry.contains(&val.to_raw()))
 }
 
+/// Check if a handler's condition-type specification matches a given condition.
+///
+/// In a full ANSI CL implementation, this would walk the type hierarchy
+/// (e.g., `simple-error` is a subtype of `error`, which is a subtype of
+/// `condition`). In this simplified implementation, any clause type matches
+/// any registered condition, since all conditions created by
+/// `make_simple_error`/`make_type_error` are of the broad `condition` type.
+fn condition_type_matches(condition: BlissVal, _clause_type: BlissVal) -> bool {
+    is_condition(condition)
+}
+
 // ── Signalling ────────────────────────────────────────────────────
 
 /// Signal a condition (CL `SIGNAL`). Does not unwind.
@@ -108,15 +119,20 @@ pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
     });
 
     for frame in handlers.iter().rev() {
-        for (_condition_type, _handler_fn) in frame {
-            // In a full implementation, we'd check if the condition matches
-            // the condition type and invoke the handler function.
-            // For now, signal simply returns Ok if no handler actively handles it.
-            // Handlers established via handler_bind would be invoked here.
+        for (condition_type, handler_fn) in frame {
+            if condition_type_matches(condition, *condition_type) {
+                // Handler matched this condition type.
+                // In a full implementation we would invoke handler_fn here.
+                // Since handler functions are BlissVal values (not Rust closures),
+                // we cannot directly call them in this layer.  Per CL SIGNAL
+                // semantics, if a handler returns normally the system continues
+                // searching the next handler — so we continue the loop.
+                let _ = handler_fn; // acknowledge the matched handler
+            }
         }
     }
 
-    // No handler matched or all handlers declined — return Ok
+    // No handler handled the condition (all declined) — return Ok per CL SIGNAL
     Ok(())
 }
 
@@ -125,7 +141,7 @@ pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
 /// Like signal_condition, but if no handler handles the error, the debugger
 /// is entered. If a debugger hook is set, it is invoked first.
 pub fn error_condition(condition: BlissVal) -> Result<(), BlissError> {
-    // First try to signal normally
+    // First try to signal normally through the handler stack
     let handlers: Vec<Vec<(BlissVal, BlissVal)>> = STATE.with(|s| {
         s.borrow().handler_stack.clone()
     });
@@ -133,9 +149,17 @@ pub fn error_condition(condition: BlissVal) -> Result<(), BlissError> {
     // Check if any handler handles this condition
     let mut handled = false;
     for frame in handlers.iter().rev() {
-        for (_condition_type, _handler_fn) in frame {
-            // In a full implementation, check type match and invoke handler.
-            // If handler returns normally, the condition is handled.
+        for (condition_type, handler_fn) in frame {
+            if condition_type_matches(condition, *condition_type) {
+                // Handler matched — in a full implementation we would invoke
+                // handler_fn and, if it returns normally, mark as handled.
+                // Since handler functions are BlissVal (not Rust closures),
+                // we acknowledge the match.  Per CL ERROR semantics, the first
+                // matching handler that does not decline handles the condition.
+                let _ = handler_fn; // acknowledge matched handler
+                // In the current simplified layer we cannot invoke the handler,
+                // so we treat the match as "declined" and continue searching.
+            }
         }
     }
 
@@ -177,8 +201,11 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
 
     let mut handled = false;
     for frame in handlers.iter().rev() {
-        for (_condition_type, _handler_fn) in frame {
-            // Check type match and invoke handler
+        for (condition_type, handler_fn) in frame {
+            if condition_type_matches(condition, *condition_type) {
+                // Handler matched — acknowledge but cannot invoke in this layer.
+                let _ = handler_fn;
+            }
         }
     }
 
@@ -258,16 +285,19 @@ pub fn handler_case(
     form: BlissVal,
     clauses: &[(BlissVal, BlissVal)],
 ) -> Result<BlissVal, BlissError> {
-    // Check if form is a registered condition
-    if !clauses.is_empty() && is_condition(form) {
-        // The form is a condition — check if any clause matches.
-        // In this simplified implementation, any clause matches any condition.
-        // Return the first matching clause's handler value.
-        let (_clause_type, handler_val) = clauses[0];
-        return Ok(handler_val);
+    // Check if form is a registered condition and find a matching clause
+    if is_condition(form) {
+        for (clause_type, handler_val) in clauses {
+            if condition_type_matches(form, *clause_type) {
+                // Clause's condition-type matches the signalled condition.
+                // Per CL HANDLER-CASE semantics, the stack is unwound and
+                // the clause's handler value is returned.
+                return Ok(*handler_val);
+            }
+        }
     }
 
-    // No condition signalled or no clauses — return form value
+    // No condition signalled, no clauses, or no clause matched — return form value
     Ok(form)
 }
 
