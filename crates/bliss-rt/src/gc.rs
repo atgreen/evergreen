@@ -161,7 +161,7 @@ pub struct GcConfig {
 /// Bootstrap heap state — stores the GC configuration so that stats
 /// and other queries can report capacity values after initialization.
 struct HeapState {
-    config: GcConfig,
+    _config: GcConfig,
     stats: GcStats,
 }
 
@@ -198,7 +198,7 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     stats.regions_free = regions_total;
 
     let state = HeapState {
-        config: config.clone(),
+        _config: config.clone(),
         stats,
     };
     *heap_state().lock().unwrap() = Some(state);

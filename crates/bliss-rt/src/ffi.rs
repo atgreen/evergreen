@@ -122,39 +122,39 @@ pub unsafe fn ffi_call(
         // All-i32 fast path
         match args.len() {
             0 => {
-                let f: extern "C" fn() -> i32 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn() -> i32 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f() as u32 as u64)
             }
             1 => {
-                let f: extern "C" fn(i32) -> i32 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0] as i32) as u32 as u64)
             }
             2 => {
-                let f: extern "C" fn(i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0] as i32, args[1] as i32) as u32 as u64)
             }
             3 => {
-                let f: extern "C" fn(i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0] as i32, args[1] as i32, args[2] as i32) as u32 as u64)
             }
             4 => {
-                let f: extern "C" fn(i32, i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(i32, i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32) as u32 as u64)
             }
             5 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(i32, i32, i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32) as u32 as u64)
             }
             6 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(i32, i32, i32, i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32, args[5] as i32) as u32 as u64)
             }
             7 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32, args[5] as i32, args[6] as i32) as u32 as u64)
             }
             8 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32, args[5] as i32, args[6] as i32, args[7] as i32) as u32 as u64)
             }
             _ => Err(BlissError::FfiError(format!(
@@ -166,39 +166,39 @@ pub unsafe fn ffi_call(
         // Generic u64 path (works for pointers, 64-bit ints, etc.)
         match args.len() {
             0 => {
-                let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f())
             }
             1 => {
-                let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0]))
             }
             2 => {
-                let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0], args[1]))
             }
             3 => {
-                let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0], args[1], args[2]))
             }
             4 => {
-                let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0], args[1], args[2], args[3]))
             }
             5 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0], args[1], args[2], args[3], args[4]))
             }
             6 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0], args[1], args[2], args[3], args[4], args[5]))
             }
             7 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0], args[1], args[2], args[3], args[4], args[5], args[6]))
             }
             8 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]))
             }
             _ => Err(BlissError::FfiError(format!(
@@ -436,11 +436,11 @@ pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), 
         .map_err(|_| BlissError::FfiError("symbol name contains null byte".into()))?;
 
     // Clear any existing error
-    libc::dlerror();
-    let sym = libc::dlsym(library as *mut libc::c_void, c_name.as_ptr());
-    let err = libc::dlerror();
+    unsafe { libc::dlerror() };
+    let sym = unsafe { libc::dlsym(library as *mut libc::c_void, c_name.as_ptr()) };
+    let err = unsafe { libc::dlerror() };
     if !err.is_null() {
-        let msg = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
+        let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_string_lossy().into_owned();
         Err(BlissError::FfiError(format!(
             "symbol '{}' not found: {}",
             name, msg
