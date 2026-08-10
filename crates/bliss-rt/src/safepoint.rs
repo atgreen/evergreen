@@ -11,12 +11,15 @@
 //!    on the global `SafepointPage`, setting the `requested` flag.
 //! 2. Each mutator thread polls via `poll_safepoint()` at every safepoint
 //!    site. When the flag is observed, the thread calls `enter_safepoint()`.
-//! 3. `enter_safepoint()` increments the `arrived` counter and parks on a
-//!    condvar until the safepoint is cleared.
+//! 3. `enter_safepoint()` publishes the thread's stack top (sp/fp) so the
+//!    GC can walk the thread's CL stack, increments the `arrived` counter,
+//!    and parks on a condvar until the safepoint is cleared.
 //! 4. `wait_for_all_threads()` spins/waits until `arrived` equals the
 //!    number of registered mutator threads minus the requesting thread.
 //! 5. `resume_all_threads()` clears the flag, resets the counter, and
 //!    broadcasts the condvar to wake all parked threads.
+//! 6. After being unparked, each thread checks its per-thread yield flag
+//!    and yields to the scheduler if preemption was requested (§2.5.3 step 4).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -146,42 +149,73 @@ pub fn poll_safepoint() {
     }
 }
 
-/// Enter a safepoint: signal arrival, then park until the requester
-/// resumes all threads.
+/// Enter a safepoint: publish stack top, signal arrival, then park until
+/// the requester resumes all threads.
 ///
 /// This function is called by mutator threads when they observe that a
 /// safepoint has been requested (either via `poll_safepoint` or at an
 /// explicit safepoint such as allocation or backward branch).
 ///
 /// Protocol:
-/// 1. Increment the `arrived` counter.
-/// 2. Notify the GC requester (via `arrival_condvar`) that another
+/// 1. Publish the thread's stack top (sp/fp) so the GC can scan it (§2.5.3).
+/// 2. Increment the `arrived` counter (under `arrival_mutex`).
+/// 3. Notify the GC requester (via `arrival_condvar`) that another
 ///    thread has arrived.
-/// 3. Wait on `park_condvar` until `parked` is cleared.
+/// 4. Wait on `park_condvar` until `parked` is cleared.
+/// 5. After waking, check the per-thread yield flag and yield if set (§2.5.3 step 4).
+///
+/// Note: this function only coordinates when called through the
+/// `wait_for_all_threads`/`resume_all_threads` protocol. The `parked`
+/// flag (set by `wait_for_all_threads` before requesting the safepoint)
+/// gates participation: if `parked` is false, no coordination cycle is
+/// active, so the thread publishes its stack top but does not
+/// increment `arrived` or park. Callers of `request_safepoint()` that
+/// want threads to coordinate MUST go through `wait_for_all_threads`.
 pub fn enter_safepoint() {
     let coord = coordinator();
 
-    // If no safepoint coordination is active (parked == false and no
-    // one is waiting), just return — this handles the case where
-    // poll_safepoint fires but no wait_for_all_threads is pending.
+    // §2.5.3: Publish the thread's stack top (sp/fp) to its thread
+    // descriptor so the GC can scan the CL stack while parked.
+    let thread = crate::thread::current_thread();
+    thread.stack().publish_top();
+
+    // Issue #1 fix: if no coordination cycle is active (`parked` is
+    // false), return immediately — the thread has already published its
+    // stack top. `request_safepoint()` alone does NOT cause coordination;
+    // only `wait_for_all_threads` (which sets `parked = true` before
+    // requesting) triggers the full arrive-and-park protocol.
     if !coord.parked.load(Ordering::SeqCst) {
         return;
     }
 
-    // Signal arrival.
-    let prev = coord.arrived.fetch_add(1, Ordering::SeqCst);
-    let expected = coord.expected.load(Ordering::SeqCst);
-
-    // If we are the last expected thread, wake the requester.
-    if prev + 1 >= expected {
+    // Issue #5 fix: increment `arrived` while holding `arrival_mutex`
+    // so the notification cannot be lost between the increment and
+    // the condvar wait in `wait_for_all_threads`.
+    //
+    // Note: we do NOT re-check `parked` under the lock here. The
+    // ordering guarantee is that `wait_for_all_threads` sets
+    // `parked = true` (SeqCst) BEFORE `request_safepoint()`, and
+    // `resume_all_threads` clears `parked` AFTER all threads have
+    // been accounted for. So if we saw `parked == true` above, the
+    // coordination cycle is active and we must participate.
+    {
         let _lock = coord.arrival_mutex.lock().unwrap();
+        coord.arrived.fetch_add(1, Ordering::SeqCst);
         coord.arrival_condvar.notify_all();
     }
 
     // Park until the requester clears `parked`.
-    let mut guard = coord.park_mutex.lock().unwrap();
-    while coord.parked.load(Ordering::SeqCst) {
-        guard = coord.park_condvar.wait(guard).unwrap();
+    {
+        let mut guard = coord.park_mutex.lock().unwrap();
+        while coord.parked.load(Ordering::SeqCst) {
+            guard = coord.park_condvar.wait(guard).unwrap();
+        }
+    }
+
+    // §2.5.3 step 4: check per-thread yield flag and yield if preemption
+    // was requested.
+    if thread.check_and_clear_yield() {
+        crate::thread::thread_yield();
     }
 }
 
@@ -222,6 +256,9 @@ pub fn wait_for_all_threads() -> Result<(), BlissError> {
     page.request_safepoint()?;
 
     // Wait until all expected threads have arrived.
+    // Issue #5 fix: `arrived` is now incremented under `arrival_mutex`,
+    // so we hold the same lock when checking and waiting, preventing
+    // lost notifications.
     let mut guard = coord.arrival_mutex.lock().unwrap();
     while coord.arrived.load(Ordering::SeqCst) < other_count {
         // Use a timed wait to avoid deadlock if a thread died before
@@ -257,9 +294,13 @@ pub fn resume_all_threads() -> Result<(), BlissError> {
     // Clear the safepoint page — new polls will no longer enter.
     page.resume()?;
 
-    // Clear the parked flag and wake all waiting threads.
-    coord.parked.store(false, Ordering::SeqCst);
-    coord.park_condvar.notify_all();
+    // Issue #4 fix: acquire park_mutex before storing parked = false
+    // and notifying, so the condvar notification cannot be lost.
+    {
+        let _guard = coord.park_mutex.lock().unwrap();
+        coord.parked.store(false, Ordering::SeqCst);
+        coord.park_condvar.notify_all();
+    }
 
     // Reset counters for the next safepoint cycle.
     coord.arrived.store(0, Ordering::SeqCst);
