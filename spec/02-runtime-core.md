@@ -53,8 +53,8 @@ Source lives in `crates/bliss-rt/src/` (see §0 directory map).
  │                                                             │
  │ 4. Image load                                               │
  │    ├─ mmap .bimg (§0.5.4) or fall back to bootstrap reader  │
- │    ├─ relocate heap pointers                                │
- │    └─ restore symbol table + package registry               │
+ │    ├─ verify image header + magic number                    │
+ │    └─ restore symbol table + package registry (offset-based)│
  │                                                             │
  │ 5. Worker-pool start                                        │
  │    └─ spawn N OS threads (§2.3), each with TLAB (§3)        │
@@ -67,8 +67,18 @@ Source lives in `crates/bliss-rt/src/` (see §0 directory map).
 ```
 
 **R2.02** is satisfied by executing steps 1–6 in strict order.
-Steps 1–3 target < 5 ms total; step 4 (image mmap) is O(1) via
-demand paging; step 5 is bounded by `pthread_create` latency.
+Steps 1–3 target < 5 ms total; step 5 is bounded by
+`pthread_create` latency.
+
+**Image load cost model (step 4):** The `.bimg` format uses
+position-independent tagged values (heap offsets, not absolute
+pointers). This makes step 4 a true O(1) `mmap` — no relocation
+pass is required, and pages are populated on demand by the OS.
+The symbol table and package registry are reconstructed from
+offset-based indices embedded in the image header, which is a
+small fixed-size read (< 4 KiB). This design ensures cold-start
+image load is dominated by kernel `mmap` setup (< 1 ms), well
+within the R2.01 50 ms budget.
 
 ### 2.2.1 Bootstrap vs Image Boot
 
@@ -103,20 +113,46 @@ ms) and is only used during development and cross-compilation (§0.4.5).
 ### 2.3.2 State Machine
 
 ```text
- ┌──────────┐  yield/preempt   ┌──────────┐
- │ Runnable │◄────────────────►│ Blocked  │
- └────┬─────┘                  └──────────┘
-      │ FFI call                    ▲
-      ▼                             │ I/O ready
- ┌──────────┐                  ┌────┴─────┐
- │  Native  │                  │  Waiting  │
- └──────────┘                  └──────────┘
-      │ return / callback
-      ▼
+                    mutex/condvar wait
+ ┌──────────┐ ──────────────────────► ┌──────────┐
+ │ Runnable │ ◄────────────────────── │ Blocked  │
+ └──────────┘     notify/unlock       └──────────┘
+   │      ▲                              
+   │      │ FFI return /                 
+   │      │ callback entry               
+   │      │                              
+   │  ┌───┴──────┐                       
+   │  │  Native  │                       
+   │  └──────────┘                       
+   │      ▲                              
+   │      │ FFI call                     
+   │      │                              
+   │  ┌───┴──────┐     async I/O         
+   ├──┤          │ ◄── submit ───────── (from Runnable)
+   │  └──────────┘                       
+   │                                     
+   │  async I/O          ┌──────────┐    
+   ├─── submit ────────► │ Waiting  │    
+   │                     └────┬─────┘    
+   │                          │ I/O ready
+   │ ◄────────────────────────┘          
+   │                                     
+   │  entry fn returns / kill            
+   ▼                                     
  ┌──────────┐
  │   Dead   │
  └──────────┘
 ```
+
+Transitions summary:
+
+- **Runnable → Blocked:** mutex lock, condvar wait, channel receive.
+- **Blocked → Runnable:** mutex unlock, condvar notify, channel send.
+- **Runnable → Native:** FFI call (§2.7).
+- **Native → Runnable:** FFI return, or callback entry back into CL.
+- **Runnable → Waiting:** async I/O submit.
+- **Waiting → Runnable:** I/O ready (epoll/kqueue notification).
+- **any → Dead:** entry function returns or thread is killed.
 
 - **Runnable:** On a worker's run-queue; may be executing.
 - **Blocked:** Waiting on a mutex, condition variable, or channel.
@@ -378,6 +414,8 @@ they use fixed-arity, non-variadic signatures.
 | `STRING` | `Pointer(Int{8})` | CL→C | UTF-8 copy with null terminator; pinned |
 | `(ALIEN *)` | `Pointer` | Both | Raw pointer, no GC tracking |
 | `STRUCT` | `Struct` by value | Both | Stack copy via `libffi` (R2.14) |
+| `(SIMPLE-ARRAY (UNSIGNED-BYTE 8))` | `Pointer(Int{8})` + length | CL→C | Data pointer into the array's backing store (pinned for duration of call); length passed as a separate `size_t` argument. Caller must declare layout via `DEFINE-ALIEN-ROUTINE`. |
+| `(SIMPLE-ARRAY <element-type>)` | `Pointer(<alien>)` + length | CL→C | Same pin-and-pass strategy; element type maps per this table. The C side receives a raw pointer to contiguous element data. |
 
 ### 2.7.4 Call Flow
 
