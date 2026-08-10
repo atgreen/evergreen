@@ -8,6 +8,7 @@ use bliss_rt::value::BlissVal;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 // ── Internal package data ─────────────────────────────────────────
@@ -18,10 +19,11 @@ static NEXT_PACKAGE_ID: AtomicI64 = AtomicI64::new(1);
 /// Counter for generating unique symbol values (globally unique across threads).
 static NEXT_SYMBOL_ID: AtomicI64 = AtomicI64::new(1);
 
-/// Thread-local package store so parallel tests don't interfere.
-/// In production, a single-threaded runtime or explicit locking wraps access.
+/// Thread-local pointer to the currently-active PackageStore.
+/// Set by `PackageRegistry::new()` so that free functions (`intern`, `find_symbol`, etc.)
+/// can access the store without an explicit registry reference.
 thread_local! {
-    static PACKAGE_STORE: RefCell<PackageStore> = RefCell::new(PackageStore::new());
+    static CURRENT_STORE: RefCell<Option<Rc<RefCell<PackageStore>>>> = RefCell::new(None);
 }
 
 struct PackageStore {
@@ -84,34 +86,53 @@ fn pkg_id(handle: BlissVal) -> i64 {
     handle.as_fixnum()
 }
 
-/// Helper: run a closure with mutable access to the thread-local store.
+/// Helper: run a closure with mutable access to the current thread-local store.
+/// Panics if no `PackageRegistry` has been created on this thread.
 fn with_store_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut PackageStore) -> R,
 {
-    PACKAGE_STORE.with(|cell| f(&mut cell.borrow_mut()))
+    CURRENT_STORE.with(|cell| {
+        let borrow = cell.borrow();
+        let store_rc = borrow.as_ref().expect("No active PackageRegistry on this thread");
+        f(&mut store_rc.borrow_mut())
+    })
 }
 
-/// Helper: run a closure with read access to the thread-local store.
+/// Helper: run a closure with read access to the current thread-local store.
+/// Panics if no `PackageRegistry` has been created on this thread.
 fn with_store<F, R>(f: F) -> R
 where
     F: FnOnce(&PackageStore) -> R,
 {
-    PACKAGE_STORE.with(|cell| f(&cell.borrow()))
+    CURRENT_STORE.with(|cell| {
+        let borrow = cell.borrow();
+        let store_rc = borrow.as_ref().expect("No active PackageRegistry on this thread");
+        f(&store_rc.borrow())
+    })
 }
 
 // ── Package registry ───────────────────────────────────────────────
 
-/// Global package registry. Thread-safe (RwLock-protected).
+/// Package registry that owns its package store.
+///
+/// Creating a new `PackageRegistry` installs it as the current store for this
+/// thread, so that free functions like `intern` and `find_symbol` can access it.
+/// Each registry owns independent state — creating a second registry does **not**
+/// wipe the first's data, though it does replace the thread-local pointer (the
+/// first registry's data is still accessible via its methods).
 pub struct PackageRegistry {
-    _private: (),
+    store: Rc<RefCell<PackageStore>>,
 }
 
 impl PackageRegistry {
-    /// Create a new empty registry.
+    /// Create a new empty registry and install it as the current store for this thread.
     pub fn new() -> Self {
-        with_store_mut(|store| store.clear());
-        PackageRegistry { _private: () }
+        let store = Rc::new(RefCell::new(PackageStore::new()));
+        CURRENT_STORE.with(|cell| {
+            *cell.borrow_mut() = Some(Rc::clone(&store));
+        });
+        PackageRegistry { store }
     }
 
     /// Initialize with the standard packages (CL, CL-USER, KEYWORD, BLISS, etc.).
@@ -124,9 +145,8 @@ impl PackageRegistry {
 
     /// Find a package by name or nickname. O(1) amortised (R5.05).
     pub fn find_package(&self, name: &str) -> Option<BlissVal> {
-        with_store(|store| {
-            store.name_index.get(name).map(|&id| BlissVal::from_fixnum(id))
-        })
+        let store = self.store.borrow();
+        store.name_index.get(name).map(|&id| BlissVal::from_fixnum(id))
     }
 
     /// Create a new package.
@@ -136,75 +156,73 @@ impl PackageRegistry {
         nicknames: &[&str],
         use_list: &[&str],
     ) -> Result<BlissVal, BlissError> {
-        with_store_mut(|store| {
-            // Check for duplicate name or nickname conflicts.
-            if store.name_index.contains_key(name) {
+        let mut store = self.store.borrow_mut();
+
+        // Check for duplicate name or nickname conflicts.
+        if store.name_index.contains_key(name) {
+            return Err(BlissError::PackageError(
+                format!("Package named {:?} already exists", name),
+            ));
+        }
+        for nick in nicknames {
+            if store.name_index.contains_key(*nick) {
                 return Err(BlissError::PackageError(
-                    format!("Package named {:?} already exists", name),
+                    format!("Nickname {:?} conflicts with an existing package", nick),
                 ));
             }
-            for nick in nicknames {
-                if store.name_index.contains_key(*nick) {
+        }
+
+        // Resolve use_list package names to IDs.
+        let mut resolved_uses: Vec<BlissVal> = Vec::new();
+        for use_name in use_list {
+            match store.name_index.get(*use_name) {
+                Some(&id) => resolved_uses.push(BlissVal::from_fixnum(id)),
+                None => {
                     return Err(BlissError::PackageError(
-                        format!("Nickname {:?} conflicts with an existing package", nick),
+                        format!("Package {:?} not found for use-list", use_name),
                     ));
                 }
             }
+        }
 
-            // Resolve use_list package names to IDs.
-            let mut resolved_uses: Vec<BlissVal> = Vec::new();
-            for use_name in use_list {
-                match store.name_index.get(*use_name) {
-                    Some(&id) => resolved_uses.push(BlissVal::from_fixnum(id)),
-                    None => {
-                        return Err(BlissError::PackageError(
-                            format!("Package {:?} not found for use-list", use_name),
-                        ));
-                    }
-                }
-            }
+        let (id, handle) = alloc_package_id();
+        let mut pkg = Package::new(name);
+        pkg.nicknames = nicknames.iter().map(|s| s.to_string()).collect();
+        pkg.use_list = resolved_uses;
 
-            let (id, handle) = alloc_package_id();
-            let mut pkg = Package::new(name);
-            pkg.nicknames = nicknames.iter().map(|s| s.to_string()).collect();
-            pkg.use_list = resolved_uses;
+        // Register name and nicknames.
+        store.name_index.insert(name.to_string(), id);
+        for nick in nicknames {
+            store.name_index.insert(nick.to_string(), id);
+        }
+        store.packages.insert(id, pkg);
 
-            // Register name and nicknames.
-            store.name_index.insert(name.to_string(), id);
-            for nick in nicknames {
-                store.name_index.insert(nick.to_string(), id);
-            }
-            store.packages.insert(id, pkg);
-
-            Ok(handle)
-        })
+        Ok(handle)
     }
 
     /// Delete a package.
     pub fn delete_package(&mut self, name: &str) -> Result<(), BlissError> {
-        with_store_mut(|store| {
-            let id = store.name_index.get(name).copied().ok_or_else(|| {
-                BlissError::PackageError(format!("Package {:?} not found", name))
-            })?;
+        let mut store = self.store.borrow_mut();
+        let id = store.name_index.get(name).copied().ok_or_else(|| {
+            BlissError::PackageError(format!("Package {:?} not found", name))
+        })?;
 
-            let pkg = store.packages.remove(&id).unwrap();
-            store.name_index.remove(&pkg.name);
-            for nick in &pkg.nicknames {
-                store.name_index.remove(nick);
-            }
-            Ok(())
-        })
+        let pkg = store.packages.remove(&id).unwrap();
+        store.name_index.remove(&pkg.name);
+        for nick in &pkg.nicknames {
+            store.name_index.remove(nick);
+        }
+        Ok(())
     }
 
     /// List all packages.
     pub fn list_all_packages(&self) -> Vec<BlissVal> {
-        with_store(|store| {
-            store
-                .packages
-                .keys()
-                .map(|&id| BlissVal::from_fixnum(id))
-                .collect()
-        })
+        let store = self.store.borrow();
+        store
+            .packages
+            .keys()
+            .map(|&id| BlissVal::from_fixnum(id))
+            .collect()
     }
 }
 
