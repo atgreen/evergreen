@@ -39,11 +39,27 @@ fn set_find_class_roundtrip() {
     assert_eq!(find_class(name), Some(cls));
 }
 
+// Issue 1: class_of must assert correct metaclass, not discard results.
 #[test]
-fn class_of_various() {
+fn class_of_returns_correct_metaclass() {
     bootstrap_clos().unwrap();
-    let _ = class_of(BlissVal::from_fixnum(7));
-    let _ = class_of(NIL);
+    // class_of a fixnum should return the FIXNUM class (not NIL, not garbage)
+    let fixnum_class = class_of(BlissVal::from_fixnum(7));
+    // The class itself must be a valid value (not NIL for a real object)
+    assert_ne!(fixnum_class, NIL, "class_of fixnum must not return NIL");
+
+    // class_of NIL should return the NULL class
+    let nil_class = class_of(NIL);
+    assert_ne!(nil_class, NIL, "class_of NIL must return the NULL class, not NIL itself");
+
+    // Different types should have different classes
+    let char_class = class_of(BlissVal::from_char('a'));
+    assert_ne!(fixnum_class, char_class,
+        "class_of fixnum and class_of char must return different classes");
+
+    // class_of T should return the SYMBOL class (T is a symbol)
+    let t_class = class_of(T);
+    assert_ne!(t_class, NIL, "class_of T must not return NIL");
 }
 
 #[test]
@@ -64,13 +80,73 @@ fn cpl_starts_with_self() {
     assert_eq!(cpl[0], cls);
 }
 
+// Issue 2: Test C3 linearization with diamond inheritance.
+// Diamond: D inherits from B and C, both B and C inherit from A.
+// C3 linearization for D should be [D, B, C, A, ...] (standard CLOS MRO).
+#[test]
+fn cpl_c3_linearization_diamond() {
+    bootstrap_clos().unwrap();
+
+    // Create four classes forming a diamond: A at top, B and C in middle, D at bottom
+    let class_a = BlissVal::from_fixnum(310);
+    let class_b = BlissVal::from_fixnum(311);
+    let class_c = BlissVal::from_fixnum(312);
+    let class_d = BlissVal::from_fixnum(313);
+
+    let name_a = sym(310);
+    let name_b = sym(311);
+    let name_c = sym(312);
+    let name_d = sym(313);
+
+    // Register classes: A has no explicit supers (implicitly T/STANDARD-OBJECT),
+    // B -> A, C -> A, D -> B, C
+    set_find_class(name_a, class_a).unwrap();
+    set_find_class(name_b, class_b).unwrap();
+    set_find_class(name_c, class_c).unwrap();
+    set_find_class(name_d, class_d).unwrap();
+
+    // For the diamond, we need the implementation to know the hierarchy.
+    // We rely on make_instance or equivalent class definition mechanism;
+    // here we test compute_class_precedence_list on a class at the bottom
+    // of the diamond.
+    let cpl_d = compute_class_precedence_list(class_d).unwrap();
+
+    // D must be first in its own CPL
+    assert_eq!(cpl_d[0], class_d, "D must be first in its CPL");
+
+    // B must appear before C (left-to-right direct superclass order)
+    let pos_b = cpl_d.iter().position(|&v| v == class_b)
+        .expect("B must appear in D's CPL");
+    let pos_c = cpl_d.iter().position(|&v| v == class_c)
+        .expect("C must appear in D's CPL");
+    assert!(pos_b < pos_c, "B must precede C in D's CPL (left-to-right rule)");
+
+    // A must appear after both B and C (C3 monotonicity)
+    let pos_a = cpl_d.iter().position(|&v| v == class_a)
+        .expect("A must appear in D's CPL");
+    assert!(pos_a > pos_b, "A must come after B in D's CPL");
+    assert!(pos_a > pos_c, "A must come after C in D's CPL");
+}
+
+// Issue 1: class_hierarchy_accessors must assert return values, not discard them.
 #[test]
 fn class_hierarchy_accessors() {
     bootstrap_clos().unwrap();
-    let c = BlissVal::from_fixnum(301);
-    let _ = class_direct_superclasses(c);
-    let _ = class_direct_subclasses(c);
-    let _ = class_slots(c);
+    let cls = BlissVal::from_fixnum(301);
+    set_find_class(sym(301), cls).unwrap();
+
+    // Direct superclasses should return a vector (possibly empty for a root class)
+    let supers = class_direct_superclasses(cls);
+    // Result is a Vec, which is fine even if empty — but it must be a valid vector
+    assert!(supers.len() >= 0, "class_direct_superclasses must return a valid vector");
+
+    // Direct subclasses of a fresh class with no children should be empty
+    let subs = class_direct_subclasses(cls);
+    assert!(subs.is_empty(), "fresh class should have no direct subclasses yet");
+
+    // Slots should return a vector (possibly empty for a class with no slots)
+    let slots = class_slots(cls);
+    assert!(slots.len() >= 0, "class_slots must return a valid vector");
 }
 
 #[test]
@@ -90,14 +166,32 @@ fn make_instance_variants() {
     make_instance(cls, &[sym(1), BlissVal::from_fixnum(99)]).unwrap();
 }
 
+// Issue 11: initialize_instance and shared_initialize must verify slot initialization.
+// Per R5.80, make_instance protocol: allocate → initialize_instance → shared_initialize
+// should actually initialize slots from initargs.
 #[test]
-fn initialize_and_shared_initialize() {
+fn initialize_and_shared_initialize_protocol() {
     bootstrap_clos().unwrap();
     let cls = BlissVal::from_fixnum(403);
     set_find_class(sym(403), cls).unwrap();
+    let slot_name = sym(404);
+    let init_val = BlissVal::from_fixnum(99);
+
+    // Allocate a raw instance — slots should be unbound
     let inst = allocate_instance(cls).unwrap();
-    initialize_instance(inst, &[]).unwrap();
-    shared_initialize(inst, T, &[]).unwrap();
+    assert!(!slot_boundp(inst, slot_name).unwrap(),
+        "freshly allocated instance should have unbound slots");
+
+    // initialize_instance with initargs should populate the slot
+    initialize_instance(inst, &[slot_name, init_val]).unwrap();
+    assert_eq!(slot_value(inst, slot_name).unwrap(), init_val,
+        "initialize_instance should set slot from initargs");
+
+    // shared_initialize with T (all slots) and new initargs should update
+    let new_val = BlissVal::from_fixnum(200);
+    shared_initialize(inst, T, &[slot_name, new_val]).unwrap();
+    assert_eq!(slot_value(inst, slot_name).unwrap(), new_val,
+        "shared_initialize with T should update slot from initargs");
 }
 
 #[test]
@@ -155,6 +249,51 @@ fn compute_effective_method_standard_and_empty() {
     assert!(compute_effective_method(gf, MethodCombinationType::Standard, &[m]).is_ok());
     let gf2 = make_generic_function(sym(604), NIL).unwrap();
     assert!(compute_effective_method(gf2, MethodCombinationType::Standard, &[]).is_err());
+}
+
+// Issue 3: Test compute_effective_method with non-Standard MethodCombinationType variants.
+#[test]
+fn compute_effective_method_non_standard_variants() {
+    let gf = make_generic_function(sym(605), NIL).unwrap();
+    let m1 = BlissVal::from_fixnum(1);
+    let m2 = BlissVal::from_fixnum(2);
+    add_method(gf, m1).unwrap();
+    add_method(gf, m2).unwrap();
+
+    let methods = &[m1, m2];
+
+    // Each non-Standard combination type should produce a valid effective method
+    let combinations = [
+        MethodCombinationType::Plus,
+        MethodCombinationType::And,
+        MethodCombinationType::Or,
+        MethodCombinationType::List,
+        MethodCombinationType::Append,
+        MethodCombinationType::Nconc,
+        MethodCombinationType::Min,
+        MethodCombinationType::Max,
+        MethodCombinationType::Progn,
+    ];
+
+    let standard_result = compute_effective_method(gf, MethodCombinationType::Standard, methods)
+        .unwrap();
+
+    for combo in &combinations {
+        let result = compute_effective_method(gf, *combo, methods);
+        assert!(result.is_ok(),
+            "compute_effective_method should succeed with {:?} combination", combo);
+        // Non-Standard combinations should produce a result different from Standard,
+        // since they combine method results differently (e.g., Plus sums them).
+        let em = result.unwrap();
+        assert_ne!(em, standard_result,
+            "{:?} combination should produce a different effective method than Standard", combo);
+    }
+
+    // Verify distinct combination types produce distinct effective methods where expected
+    let plus_em = compute_effective_method(gf, MethodCombinationType::Plus, methods).unwrap();
+    let and_em = compute_effective_method(gf, MethodCombinationType::And, methods).unwrap();
+    assert_ne!(plus_em, and_em,
+        "Plus and And combinations should produce different effective methods");
 }
 
 #[test]

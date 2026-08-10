@@ -188,3 +188,27 @@ fn shadow_creates_if_absent() {
     shadow(&["NEW-SYM"], pkg).unwrap();
     assert!(find_symbol("NEW-SYM", pkg).unwrap().is_some());
 }
+
+// Issue 9: Test make_package with non-empty use_list to verify that
+// the new package inherits exported symbols from the used package.
+#[test]
+fn make_package_with_use_list_inherits() {
+    let mut reg = fresh_registry();
+    // Create provider package and export a symbol from it
+    let prov = reg.make_package("USE-PROV", &[], &[]).unwrap();
+    let (exported_sym, _) = intern("INHERITED-SYM", prov).unwrap();
+    export(&[exported_sym], prov).unwrap();
+
+    // Create consumer package with use_list referencing the provider
+    let cons = reg.make_package("USE-CONS", &[], &["USE-PROV"]).unwrap();
+
+    // The consumer should inherit the exported symbol from the provider
+    let found = find_symbol("INHERITED-SYM", cons).unwrap();
+    assert!(found.is_some(),
+        "package created with use_list should inherit exported symbols");
+    let (found_sym, status) = found.unwrap();
+    assert_eq!(found_sym, exported_sym,
+        "inherited symbol should be the same as the exported one");
+    assert_eq!(status, InternStatus::Inherited,
+        "symbol from use_list should have Inherited status");
+}
