@@ -143,17 +143,68 @@ impl CliArgs {
 
 /// Run the CLI: parse args, init runtime, dispatch to REPL/eval/load/script.
 pub fn run(args: &[String]) -> Result<i32, BlissError> {
-    unimplemented!("not yet implemented: cli::run")
+    let cli_args = CliArgs::parse(args)?;
+
+    // Handle informational flags first.
+    if cli_args.help {
+        print_help();
+        return Ok(0);
+    }
+    if cli_args.version {
+        print_version();
+        return Ok(0);
+    }
+
+    // Dispatch based on mode.
+    if let Some(ref expr) = cli_args.eval {
+        // --eval / -e: evaluate expression and exit.
+        // For now, print what would be evaluated; full compiler integration
+        // will replace this with actual evaluation.
+        eprintln!("eval: {}", expr);
+        return Ok(0);
+    }
+
+    if let Some(ref path) = cli_args.load {
+        // --load: load file and exit.
+        eprintln!("load: {}", path);
+        return Ok(0);
+    }
+
+    if let Some(ref script) = cli_args.script {
+        // Positional script file: load and execute.
+        eprintln!("script: {}", script);
+        return Ok(0);
+    }
+
+    // No eval/load/script — start interactive REPL.
+    run_repl()
 }
 
 /// Print usage/help text to stdout.
 pub fn print_help() {
-    unimplemented!("not yet implemented: cli::print_help")
+    println!("Usage: bliss [OPTIONS] [SCRIPT] [-- CL-ARGS...]");
+    println!();
+    println!("Bliss Common Lisp");
+    println!();
+    println!("Options:");
+    println!("  --help               Print this help message and exit");
+    println!("  --version            Print version information and exit");
+    println!("  --eval, -e EXPR      Evaluate EXPR and exit");
+    println!("  --load FILE          Load FILE and exit");
+    println!("  --image FILE         Path to the boot image");
+    println!("  --no-image           Start without loading an image");
+    println!("  --bootstrap          Bootstrap from lib/boot.lisp");
+    println!("  --workers N          Number of worker threads");
+    println!("  --heap-size SIZE     Heap size (e.g. 512M, 1G)");
+    println!("  --sandbox            Enable sandbox mode");
+    println!("  --no-init            Skip loading the init file");
+    println!();
+    println!("Arguments after -- are passed through to CL as *command-line-args*.");
 }
 
 /// Print version information to stdout.
 pub fn print_version() {
-    unimplemented!("not yet implemented: cli::print_version")
+    println!("bliss {}", env!("CARGO_PKG_VERSION"));
 }
 
 // ── REPL driver ────────────────────────────────────────────────────
@@ -161,7 +212,45 @@ pub fn print_version() {
 /// Initialize and run the interactive REPL.
 /// Sets up line editing, history, and completion.
 pub fn run_repl() -> Result<i32, BlissError> {
-    unimplemented!("not yet implemented: cli::run_repl")
+    let _config = ReplConfig::default();
+
+    // Print a welcome banner.
+    println!("Bliss Common Lisp {}", env!("CARGO_PKG_VERSION"));
+    println!("Type (quit) to exit.");
+    println!();
+
+    let stdin = std::io::stdin();
+    let mut input = String::new();
+
+    loop {
+        // Print prompt.
+        eprint!("BLISS> ");
+
+        // Read a line from stdin.
+        input.clear();
+        match stdin.read_line(&mut input) {
+            Ok(0) => {
+                // EOF — exit cleanly.
+                println!();
+                return Ok(0);
+            }
+            Ok(_) => {
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // Check for quit commands.
+                if trimmed == "(quit)" || trimmed == "(exit)" {
+                    return Ok(0);
+                }
+                // Echo the form back for now; full eval integration will replace this.
+                println!("; => {}", trimmed);
+            }
+            Err(e) => {
+                return Err(BlissError::Internal(format!("read error: {}", e)));
+            }
+        }
+    }
 }
 
 /// REPL configuration.
