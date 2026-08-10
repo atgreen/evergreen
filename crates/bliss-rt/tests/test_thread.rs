@@ -81,6 +81,13 @@ fn interrupt_thread_invalid_id_fails() {
 }
 
 #[test]
+fn interrupt_thread_valid_id_succeeds() {
+    let id = make_thread(NIL).unwrap();
+    let result = interrupt_thread(id, T);
+    assert!(result.is_ok());
+}
+
+#[test]
 fn all_thread_ids_includes_current() {
     let all = all_thread_ids();
     assert!(!all.is_empty());

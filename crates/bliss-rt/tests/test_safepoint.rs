@@ -43,6 +43,11 @@ fn wait_and_resume_all_threads() {
 }
 
 #[test]
+fn poll_safepoint_does_not_panic() {
+    poll_safepoint();
+}
+
+#[test]
 fn enter_safepoint_does_not_panic() {
     enter_safepoint();
 }

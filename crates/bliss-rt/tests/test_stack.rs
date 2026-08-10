@@ -1,5 +1,5 @@
 use bliss_rt::stack::*;
-use bliss_rt::value::NIL;
+use bliss_rt::value::{BlissVal, NIL};
 
 #[test]
 fn stack_capacity_matches_requested() {
@@ -57,6 +57,49 @@ fn frame_type_extraction() {
             _pad: 0,
         };
         assert_eq!(frame.frame_type(), expected, "flags={:#06x}", flag_bits);
+    }
+}
+
+#[test]
+fn stack_fp_within_bounds() {
+    let stack = BlissStack::new(4096);
+    let fp = stack.fp() as usize;
+    let base = stack.base() as usize;
+    // fp should be null (empty stack) or within the stack region
+    if fp != 0 {
+        assert!(fp >= base && fp <= base + stack.capacity());
+    }
+}
+
+#[test]
+fn frame_locals_returns_correct_slice() {
+    use std::ptr;
+    // Build a frame with 3 locals backed by a contiguous array.
+    // Frame layout: [Frame header][local0][local1][local2]
+    let locals_data: [BlissVal; 3] = [
+        BlissVal::from_raw(10 << 3),
+        BlissVal::from_raw(20 << 3),
+        BlissVal::from_raw(30 << 3),
+    ];
+    // Allocate frame + locals contiguously
+    let mut buf = vec![0u8; std::mem::size_of::<Frame>() + 3 * std::mem::size_of::<BlissVal>()];
+    let frame_ptr = buf.as_mut_ptr() as *mut Frame;
+    unsafe {
+        (*frame_ptr).prev_fp = ptr::null_mut();
+        (*frame_ptr).return_pc = ptr::null();
+        (*frame_ptr).function = NIL;
+        (*frame_ptr).code_info = ptr::null();
+        (*frame_ptr).flags = 0;
+        (*frame_ptr).num_locals = 3;
+        (*frame_ptr)._pad = 0;
+        // Copy locals right after the frame header
+        let locals_dst = frame_ptr.add(1) as *mut BlissVal;
+        std::ptr::copy_nonoverlapping(locals_data.as_ptr(), locals_dst, 3);
+        let locals = (*frame_ptr).locals();
+        assert_eq!(locals.len(), 3);
+        assert_eq!(locals[0], locals_data[0]);
+        assert_eq!(locals[1], locals_data[1]);
+        assert_eq!(locals[2], locals_data[2]);
     }
 }
 

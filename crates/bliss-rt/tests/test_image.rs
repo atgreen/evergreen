@@ -129,6 +129,41 @@ fn validate_image_header_bad_magic_fails() {
 }
 
 #[test]
+fn save_image_returns_result() {
+    let path = "/tmp/bliss_test_save_image.bimg";
+    let opts = SaveImageOptions {
+        executable: false,
+        compression: ImageCompression::None,
+        purify: false,
+    };
+    // save_image should either succeed or return an error (not panic).
+    // At this stage with unimplemented code it will fail, but the test
+    // validates the interface and that the error path is clean.
+    let result = save_image(path, &opts);
+    // Clean up if it somehow succeeded
+    if result.is_ok() {
+        std::fs::remove_file(path).ok();
+    }
+    // We just assert it returns a Result (Ok or Err), not a panic
+    let _ = result;
+}
+
+#[test]
+fn save_image_with_compression() {
+    let path = "/tmp/bliss_test_save_image_zstd.bimg";
+    let opts = SaveImageOptions {
+        executable: true,
+        compression: ImageCompression::Zstd,
+        purify: true,
+    };
+    let result = save_image(path, &opts);
+    if result.is_ok() {
+        std::fs::remove_file(path).ok();
+    }
+    let _ = result;
+}
+
+#[test]
 fn find_appended_image_does_not_panic() {
     let _ = find_appended_image();
 }
