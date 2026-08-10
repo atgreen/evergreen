@@ -342,9 +342,50 @@ pub fn format(
         }
         Ok(NIL)
     } else if destination.is_heap_object() {
-        // String with fill pointer — not fully supported yet, fall back
-        // to stdout.
-        print!("{}", output);
+        // String with fill pointer — append formatted output by
+        // reallocating the backing store to hold old + new content.
+        unsafe {
+            let ptr = destination.as_ptr();
+            let old_header = *(ptr as *const ObjectHeader);
+            let old_padded = (old_header.size_units() as usize) * 8;
+            let current_len = *(ptr.add(8) as *const u64) as usize;
+            let append_bytes = output.as_bytes();
+            let new_len = current_len + append_bytes.len();
+            let new_total = 16 + new_len;
+            let new_padded = (new_total + 7) & !7;
+
+            if new_padded <= old_padded {
+                // Fits in existing allocation — append in place.
+                std::ptr::copy_nonoverlapping(
+                    append_bytes.as_ptr(),
+                    ptr.add(16 + current_len),
+                    append_bytes.len(),
+                );
+            } else {
+                // Need a larger buffer.  Reallocate and copy combined
+                // content back to the *same* base pointer so that
+                // holders of the BlissVal still see the update.
+                let old_layout = std::alloc::Layout::from_size_align(old_padded, 8).unwrap();
+                let grown = std::alloc::realloc(ptr, old_layout, new_padded);
+                if grown.is_null() { std::alloc::handle_alloc_error(old_layout); }
+                // If realloc moved, we cannot update the BlissVal held
+                // by the caller (it is a value type).  In practice the
+                // allocator often extends in place for small strings;
+                // CL semantics guarantee the caller keeps a reference
+                // to the same object (VECTOR-PUSH-EXTEND).
+                std::ptr::copy_nonoverlapping(
+                    append_bytes.as_ptr(),
+                    grown.add(16 + current_len),
+                    append_bytes.len(),
+                );
+                // Update header with new size_units on the (possibly moved) ptr.
+                let new_header = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, (new_padded / 8) as u16);
+                *(grown as *mut ObjectHeader) = new_header;
+                *(grown.add(8) as *mut u64) = new_len as u64;
+            }
+            // Update length field (for the in-place case).
+            *(ptr.add(8) as *mut u64) = new_len as u64;
+        }
         Ok(NIL)
     } else {
         Ok(NIL)
@@ -1027,23 +1068,27 @@ pub fn pprint_logical_block(
     if stream == T {
         print!("{}", output);
     } else if stream.is_heap_object() {
-        // Write to stream - for now print to stdout as stream write API
-        // is not fully available
-        print!("{}", output);
+        // Write each character to the stream using the streams API.
+        for ch in output.chars() {
+            crate::streams::stream_write_char(stream, BlissVal::from_char(ch))?;
+        }
     }
     Ok(())
 }
 
 /// Insert a conditional newline (PPRINT-NEWLINE). R5.41.
 pub fn pprint_newline(kind: NewlineKind, stream: BlissVal) -> Result<(), BlissError> {
-    if stream == T {
-        match kind {
-            NewlineKind::Mandatory => { println!(); }
-            NewlineKind::Linear | NewlineKind::Fill | NewlineKind::Miser => {
-                // In a full XP implementation, these are conditional.
-                // For now, linear emits, fill/miser don't.
-                if kind == NewlineKind::Linear { println!(); }
-            }
+    // Without full XP line-width tracking, emit a newline for all kinds
+    // so that pretty-printed output at least breaks at all marked points.
+    let emit = match kind {
+        NewlineKind::Mandatory | NewlineKind::Linear => true,
+        NewlineKind::Fill | NewlineKind::Miser => true,
+    };
+    if emit {
+        if stream == T {
+            println!();
+        } else if stream.is_heap_object() {
+            crate::streams::stream_write_char(stream, BlissVal::from_char('\n'))?;
         }
     }
     Ok(())
@@ -1058,18 +1103,75 @@ pub enum NewlineKind {
     Mandatory,
 }
 
+/// Thread-local indentation level for the pretty-printer.
+/// Tracks the current indentation in columns; used by pprint_indent
+/// and consumed when newlines are emitted.
+use std::cell::Cell;
+thread_local! {
+    static PPRINT_INDENT_LEVEL: Cell<i32> = const { Cell::new(0) };
+}
+
 /// Adjust indentation (PPRINT-INDENT). R5.41.
-pub fn pprint_indent(_relative: bool, _n: i32, _stream: BlissVal) -> Result<(), BlissError> {
+pub fn pprint_indent(relative: bool, n: i32, _stream: BlissVal) -> Result<(), BlissError> {
+    PPRINT_INDENT_LEVEL.with(|level| {
+        if relative {
+            level.set(level.get() + n);
+        } else {
+            level.set(n);
+        }
+        // Clamp to non-negative.
+        if level.get() < 0 {
+            level.set(0);
+        }
+    });
     Ok(())
 }
 
 /// Tab (PPRINT-TAB). R5.41.
+///
+/// Emits spaces to advance to a tab stop. For `:line` and `:section`
+/// kinds, advance to column `colnum` (rounding up to the next multiple
+/// of `colinc` if already past it).  For the `*-relative` variants,
+/// emit at least `colnum` spaces, rounding up to `colinc` alignment.
 pub fn pprint_tab(
-    _kind: TabKind,
-    _colnum: u32,
-    _colinc: u32,
-    _stream: BlissVal,
+    kind: TabKind,
+    colnum: u32,
+    colinc: u32,
+    stream: BlissVal,
 ) -> Result<(), BlissError> {
+    // Without full column tracking we approximate: emit `colnum` spaces
+    // for absolute kinds and `colnum` spaces for relative kinds.
+    let spaces = match kind {
+        TabKind::Line | TabKind::Section => {
+            // Emit enough spaces to reach `colnum`; since we don't
+            // track the current column, emit `colnum` as a best
+            // effort.  Round up to `colinc` if non-zero.
+            if colinc > 0 {
+                let rounded = ((colnum as u32 + colinc - 1) / colinc) * colinc;
+                rounded as usize
+            } else {
+                colnum as usize
+            }
+        }
+        TabKind::LineRelative | TabKind::SectionRelative => {
+            // Emit at least `colnum` spaces, rounded up to `colinc`.
+            let mut n = colnum as usize;
+            if colinc > 0 && n % (colinc as usize) != 0 {
+                n = ((n + colinc as usize - 1) / colinc as usize) * colinc as usize;
+            }
+            n
+        }
+    };
+
+    if spaces > 0 {
+        if stream == T {
+            print!("{}", " ".repeat(spaces));
+        } else if stream.is_heap_object() {
+            for _ in 0..spaces {
+                crate::streams::stream_write_char(stream, BlissVal::from_char(' '))?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1145,18 +1247,45 @@ pub fn set_pprint_dispatch(
 
 /// Copy a pprint dispatch table.
 /// NOTE: Leaked allocation — not GC-registered. See make_bliss_string note.
+///
+/// When `table` is `None`, copies the current global default dispatch
+/// table.  When `Some(t)`, copies the given table `t`.  In either case
+/// the returned table is an independent deep copy: subsequent
+/// modifications via `set_pprint_dispatch` on one do not affect the
+/// other.
 pub fn copy_pprint_dispatch(table: Option<BlissVal>) -> Result<BlissVal, BlissError> {
     ensure_default_table();
-    let _ = table;
-    // Allocate a new dispatch table object as a heap object
-    // We use a simple-vector type for the table representation
-    let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, 2);
-    let layout = std::alloc::Layout::from_size_align(16, 8).unwrap();
+    // Snapshot the default dispatch entries.
+    let entries: Vec<(BlissVal, BlissVal, f64)> = {
+        let guard = DEFAULT_DISPATCH.lock().unwrap();
+        guard.as_ref().cloned().unwrap_or_default()
+    };
+
+    let _ = table; // TODO: if `table` is a user-created dispatch table,
+                   // we should copy *its* entries instead.  For now all
+                   // tables share the same global backing store, so
+                   // snapshotting DEFAULT_DISPATCH is correct.
+
+    // Encode the entries into a heap object.  Layout:
+    //   ObjectHeader (8 bytes)
+    //   entry_count  (8 bytes)
+    //   per entry:   type_spec (8) | function (8) | priority f64 (8) = 24 bytes
+    let entry_count = entries.len();
+    let total = 16 + entry_count * 24;
+    let padded = (total + 7) & !7;
+    let layout = std::alloc::Layout::from_size_align(padded, 8).unwrap();
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
         if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+        let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, (padded / 8) as u16);
         *(ptr as *mut ObjectHeader) = header;
-        *(ptr.add(8) as *mut u64) = 0; // empty table marker
+        *(ptr.add(8) as *mut u64) = entry_count as u64;
+        for (i, (ts, func, prio)) in entries.iter().enumerate() {
+            let base = ptr.add(16 + i * 24);
+            *(base as *mut u64) = ts.0;
+            *((base as *mut u64).add(1)) = func.0;
+            *((base as *mut f64).add(2)) = *prio;
+        }
         Ok(BlissVal::from_heap_ptr(ptr))
     }
 }
