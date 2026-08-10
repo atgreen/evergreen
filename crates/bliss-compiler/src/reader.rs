@@ -16,6 +16,7 @@ static SYMBOL_TABLE: Mutex<Option<SymbolTable>> = Mutex::new(None);
 
 struct SymbolTable {
     name_to_index: HashMap<String, u32>,
+    index_to_name: HashMap<u32, String>,
     next_index: u32,
 }
 
@@ -23,6 +24,7 @@ fn intern_symbol(name: &str) -> u32 {
     let mut guard = SYMBOL_TABLE.lock().unwrap();
     let table = guard.get_or_insert_with(|| SymbolTable {
         name_to_index: HashMap::new(),
+        index_to_name: HashMap::new(),
         next_index: 0,
     });
     if let Some(&idx) = table.name_to_index.get(name) {
@@ -31,7 +33,19 @@ fn intern_symbol(name: &str) -> u32 {
     let idx = table.next_index;
     table.next_index += 1;
     table.name_to_index.insert(name.to_string(), idx);
+    table.index_to_name.insert(idx, name.to_string());
     idx
+}
+
+/// Look up the name of a symbol by its index.
+/// Returns None if the index is not in the global symbol table.
+pub fn symbol_name(idx: u32) -> Option<String> {
+    let guard = SYMBOL_TABLE.lock().unwrap();
+    if let Some(table) = guard.as_ref() {
+        table.index_to_name.get(&idx).cloned()
+    } else {
+        None
+    }
 }
 
 // Counter for uninterned symbols — each gets a unique index
@@ -346,9 +360,15 @@ fn read_token_with_base(
             Ok((make_list(&[qq_sym, val]), p))
         }
         ',' => {
-            let (val, p) = read_token_with_base(chars, pos + 1, labels, read_base, read_eval)?;
-            let uq_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE"));
-            Ok((make_list(&[uq_sym, val]), p))
+            if pos + 1 < chars.len() && chars[pos + 1] == '@' {
+                let (val, p) = read_token_with_base(chars, pos + 2, labels, read_base, read_eval)?;
+                let uqs_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE-SPLICING"));
+                Ok((make_list(&[uqs_sym, val]), p))
+            } else {
+                let (val, p) = read_token_with_base(chars, pos + 1, labels, read_base, read_eval)?;
+                let uq_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE"));
+                Ok((make_list(&[uq_sym, val]), p))
+            }
         }
         '#' => read_sharpsign_with_base(chars, pos + 1, labels, read_base, read_eval),
         _ => read_atom_with_base(chars, pos, read_base),
@@ -569,7 +589,12 @@ fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
                 let idx = intern_symbol(&full);
                 Ok(Some(BlissVal::from_symbol_index(idx)))
             }
-            _ => Err(BlissError::PackageError(format!("package {} not found", pkg))),
+            _ => {
+                // Unknown package: intern as PKG:SYM for the evaluator to resolve
+                let full = format!("{}:{}", pkg, sym_name);
+                let idx = intern_symbol(&full);
+                Ok(Some(BlissVal::from_symbol_index(idx)))
+            }
         }
     } else {
         Ok(None)
