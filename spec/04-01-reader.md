@@ -151,6 +151,9 @@ PROCEDURE read(state: &mut ReaderState) → BlissVal:
 
   STEP 5 — If X is a TERMINATING or NON-TERMINATING MACRO character:
     Call the associated reader macro function with (stream, X).
+    [If read_suppress: the macro function still runs (to consume
+     tokens syntactically) but its return value is discarded;
+     return NIL.]
     If the macro function returns zero values → go to Step 1 (comment).
     If it returns one value → return that value.
 
@@ -191,13 +194,46 @@ PROCEDURE read(state: &mut ReaderState) → BlissVal:
 
   STEP 10 — Token complete.  Interpret the accumulated token:
     a) Apply readtable case conversion to non-escaped characters.
-    b) Attempt to parse as a number (→ Algorithm A4.06).
+    b) If read_suppress is true → return NIL (do not construct any
+       object, do not intern symbols, do not signal package/symbol
+       errors — see READ-SUPPRESS rules below).
+    c) Attempt to parse as a number (→ Algorithm A4.06).
        If successful → return the numeric object.
-    c) Otherwise, interpret as a symbol name.
+    d) Otherwise, interpret as a symbol name.
        Resolve package qualification (§4.1.4).
        Intern or find the symbol in the appropriate package.
        Return the symbol.
 ```
+
+**`*READ-SUPPRESS*` semantics (CLHS §2.2):**
+
+When `*READ-SUPPRESS*` is true (bound by `#+` / `#-` to skip forms):
+
+1. **No object construction:** The reader MUST NOT construct objects.
+   Top-level `read` returns NIL. Recursive reads for skipped forms
+   also return NIL.
+2. **No interning:** Symbols MUST NOT be interned. The reader still
+   parses tokens to consume the correct number of s-expressions, but
+   symbol names are discarded.
+3. **Suppressed errors:** The following errors MUST NOT be signalled
+   under `*READ-SUPPRESS*`:
+   - Undefined package (`pkg:sym` where `pkg` does not exist).
+   - Symbol not external (`pkg:sym` where `sym` is not exported).
+   - Undefined `#n#` circle label reference.
+   - Invalid `#` dispatch sub-characters (except structurally
+     malformed input that prevents determining how much to skip).
+   - Invalid radix digits, malformed numbers, etc.
+4. **Syntactic parsing preserved:** The reader MUST still parse
+   syntactically to correctly determine token boundaries, balancing
+   of parentheses, strings, and `|...|` escapes. This is essential
+   for `#+` / `#-` to skip exactly one form.
+5. **Interaction with reader macros:** Standard reader macros (list,
+   string, `#(...)`, etc.) MUST still recursively read sub-forms to
+   consume them, but discard the results. Dispatch macros that take a
+   numeric argument still read the argument.
+6. **Interaction with `#=` / `##`:** `#n=` still reads the sub-form
+   (to consume it) but MUST NOT store a label. `#n#` MUST NOT signal
+   an error for undefined labels; it returns NIL.
 
 **Case conversion rules (Step 10a):**
 
@@ -263,10 +299,26 @@ PHASE 2 — Classify token form by scanning for '/', '.', exponent markers.
     Return Single-Float or Double-Float per marker.
 
   CASE D — POTENTIAL NUMBER (CLHS §2.3.1.1):
+    A token is a potential number if and only if ALL of these hold:
+      (a) It consists entirely of digits, sign characters (+/-),
+          ratio markers (/), decimal points (.), extension characters
+          (^, _), and number markers (letters that are not adjacent
+          to other letters — used as exponent markers, etc.).
+      (b) It contains at least one digit (a character whose digit-
+          weight in *READ-BASE* is non-NIL, or a decimal digit if a
+          decimal point is present).
+      (c) It starts with a digit, sign, decimal point, or extension
+          character.
+      (d) It does not end with a sign.
+      (e) It contains no package marker (colon).
+
     If the token satisfies potential-number syntax but does not
-    parse as any of the above → FAIL (treat as symbol).
-    This allows future numeric extensions without breaking existing
-    code (per the standard's intent).
+    match any concrete number syntax (integer, ratio, or float)
+    above → Bliss signals a READER-ERROR with the message
+    "token has potential number syntax but is not a valid number".
+    (Rationale: silently treating these as symbols masks typos;
+    signalling an error is the safest portable-compatible choice and
+    matches the behaviour of SBCL and CCL.)
 ```
 
 **Complex numbers** are handled by the `#C` dispatch macro (§4.1.6),
@@ -324,8 +376,69 @@ Returning `None` means "no value produced" (e.g., comments).
 | `'` | `read_quote` | Read next object X, return `(QUOTE X)`. |
 | `;` | `read_semicolon` | Skip to end of line, return no values. |
 | `"` | `read_double_quote` | Accumulate chars until unescaped `"`. Handle `\` escapes: `\\` → `\`, `\"` → `"`. Return a string object. |
-| `` ` `` | `read_backquote` | Read next form X, return backquote expansion template (implementation-dependent internal representation — Bliss uses `SYS:BQ-LIST`, `SYS:BQ-APPEND`, `SYS:BQ-QUOTE` forms). |
-| `,` | `read_comma` | Must appear inside backquote. Read next form. If next char is `@`, read form and wrap in `SYS:BQ-SPLICE`. Else wrap in `SYS:BQ-UNQUOTE`. Signal READER-ERROR if outside backquote. |
+| `` ` `` | `read_backquote` | Read next form X, return backquote expansion template (see §4.1.5.1 below). |
+| `,` | `read_comma` | Must appear inside backquote. Read next form. If next char is `@`, read form and wrap in `SYS:BQ-SPLICE`. If next char is `.`, read form and wrap in `SYS:BQ-NSPLICE` (destructive splice). Else wrap in `SYS:BQ-UNQUOTE`. Signal READER-ERROR if outside backquote. |
+
+### 4.1.5.1 Backquote Expansion Algorithm
+
+Backquote (quasiquote) expansion is implementation-dependent per CLHS
+§2.4.6, but MUST produce forms that, when evaluated, yield the
+structure described by the template. Bliss follows the algorithm
+described in **Alan Bawden, "Quasiquotation in Lisp" (1999)**, which
+correctly handles arbitrary nesting depths. Guy Steele's Appendix C
+from CLtL2 is an acceptable alternative reference.
+
+**Internal BQ-* forms:**
+
+The reader produces an intermediate representation using the following
+internal symbols in the `SYS` package. These are NOT part of the public
+API and MUST NOT appear in fully expanded code after the backquote
+expander runs.
+
+| Form | Meaning |
+|------|---------|
+| `(SYS:BQ-QUOTE x)` | A self-evaluating or quoted datum — equivalent to `'x`. |
+| `(SYS:BQ-UNQUOTE x)` | An unquoted form — evaluates `x` at runtime. Produced by `,x`. |
+| `(SYS:BQ-SPLICE x)` | A splicing unquote — `x` must evaluate to a list whose elements are spliced in. Produced by `,@x`. |
+| `(SYS:BQ-NSPLICE x)` | A destructive splicing unquote — like `BQ-SPLICE` but may use `NCONC`. Produced by `,.x`. |
+| `(SYS:BQ-LIST x1 ... xn)` | Constructs a list from evaluated sub-forms. |
+| `(SYS:BQ-LIST* x1 ... xn tail)` | Constructs a dotted list — like `LIST*`. |
+| `(SYS:BQ-APPEND x1 ... xn)` | Appends evaluated list-valued sub-forms. |
+| `(SYS:BQ-NCONC x1 ... xn)` | Destructive version of `BQ-APPEND`. |
+| `(SYS:BQ-VECTOR contents)` | Backquoted vector `#(...)` — expands `contents` then coerces to simple-vector. |
+
+**Expansion phases:**
+
+1. **Read phase** (in the reader): `` `form `` is read as
+   `(SYS:BQ-QUOTE form)` for atoms, or recursively walks list/vector
+   structure to produce a tree of BQ-* forms. Nested backquotes
+   increment a depth counter; commas decrement it. A comma at depth 0
+   is an error. A comma at depth > 1 produces a *nested* BQ-UNQUOTE
+   that is expanded only when the outer backquote is expanded.
+
+2. **Simplification phase** (called after read, before the form is
+   returned): The BQ-* tree is simplified:
+   - `(BQ-APPEND (BQ-LIST a b) (BQ-LIST c d))` → `(BQ-LIST a b c d)`
+   - `(BQ-LIST* a b ... (BQ-LIST c d))` → `(BQ-LIST a b ... c d)`
+   - Constant sub-trees are folded into `BQ-QUOTE`.
+   - Splice/nsplice are validated to appear only in list context; a
+     splice in dotted-tail or atom context signals READER-ERROR.
+
+3. **Code generation** (at macro-expansion time or compile time):
+   The simplified BQ-* tree is lowered to standard CL forms:
+   - `BQ-QUOTE` → `QUOTE`
+   - `BQ-UNQUOTE` → the form itself
+   - `BQ-LIST` → `LIST`
+   - `BQ-LIST*` → `LIST*`
+   - `BQ-APPEND` → `APPEND`
+   - `BQ-NCONC` → `NCONC`
+
+**Nested backquote invariant:** At nesting depth *d*, only commas
+at depth *d* are expanded; inner commas remain as literal BQ-*
+forms in the output structure. This is the key correctness property
+for nested backquotes: `` `(a `(b ,,x)) `` must expand such that
+the inner `,x` is evaluated when the *outer* backquote's result is
+itself evaluated as a backquote template.
 
 ---
 
@@ -420,7 +533,7 @@ During bootstrap these are Rust functions; after self-hosting, CL wrappers deleg
 
 | Function | Signature | Key semantics |
 |----------|-----------|---------------|
-| `COPY-READTABLE` | `&optional from to` | NIL from → copy `*READTABLE*`; T from → copy standard readtable; NIL to → fresh object. Deep copy: modifying copy MUST NOT affect original. |
+| `COPY-READTABLE` | `&optional from to` | Per CLHS: `from` is a readtable designator — if omitted, defaults to the current value of `*READTABLE*`; if NIL, designates the *standard* readtable; if a readtable object, uses that readtable. `to`: if NIL or omitted → return a fresh copy; if a readtable → modify it destructively to be a copy of `from` and return it. Deep copy: modifying the result MUST NOT affect the original. Note: T is NOT a valid readtable designator and MUST signal a `TYPE-ERROR`. |
 | `MAKE-DISPATCH-MACRO-CHARACTER` | `char &optional non-term-p rt` | Set `char` as macro char with empty dispatch table. Non-term-p controls syntax type. Returns T. |
 | `SET-MACRO-CHARACTER` | `char fn &optional non-term-p rt` | Install `fn` as reader macro for `char`, set syntax type. Returns T. |
 | `GET-MACRO-CHARACTER` | `char &optional rt` | Returns two values: macro function (or NIL) and non-terminating-p. |
