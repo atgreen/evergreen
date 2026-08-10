@@ -45,7 +45,7 @@ fn thread_registry() -> &'static Mutex<HashMap<GreenThreadId, Arc<GreenThread>>>
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Thread-local cache of the current green thread.
+// Thread-local cache of the current green thread.
 thread_local! {
     static CURRENT_THREAD: Arc<GreenThread> = {
         let id = GreenThreadId(NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed));

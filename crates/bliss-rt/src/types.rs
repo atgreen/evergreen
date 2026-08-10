@@ -4,17 +4,15 @@
 //! See §1.16–§1.17 of the spec.
 
 use crate::object::{ObjectHeader, type_id, ElementTypeTag};
-use crate::value::{BlissVal, TAG_FIXNUM, TAG_CONS, TAG_CHARACTER, TAG_SINGLE_FLOAT,
-                   TAG_SYMBOL, TAG_FUNCTION, TAG_HEAP_OBJECT,
-                   NIL_BITS, T_BITS};
+use crate::value::BlissVal;
 
 /// Extract the `type_id` from a heap object's header.
 ///
 /// # Safety
 /// Caller must ensure `v` is a heap-object-tagged `BlissVal` (tag `010`).
 pub unsafe fn type_id_of(v: BlissVal) -> u8 {
-    let ptr = v.as_ptr() as *const ObjectHeader;
-    (*ptr).type_id()
+    let ptr = unsafe { v.as_ptr() } as *const ObjectHeader;
+    unsafe { (*ptr).type_id() }
 }
 
 /// Helper: if v is a heap object, return its type_id; otherwise None.

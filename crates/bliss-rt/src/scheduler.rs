@@ -17,7 +17,7 @@ pub struct SchedulerConfig {
 /// The global scheduler instance.
 pub struct Scheduler {
     /// Number of OS worker threads.
-    num_workers: usize,
+    _num_workers: usize,
     /// Set of thread IDs that have been submitted and are active (not dead).
     active: Mutex<HashSet<GreenThreadId>>,
     /// Whether the scheduler has been shut down.
@@ -33,7 +33,7 @@ impl Scheduler {
             ));
         }
         Ok(Scheduler {
-            num_workers: config.num_workers,
+            _num_workers: config.num_workers,
             active: Mutex::new(HashSet::new()),
             shut_down: Mutex::new(false),
         })
