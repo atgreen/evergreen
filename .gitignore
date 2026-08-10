@@ -1,0 +1,60 @@
+# Rust
+target/
+**/*.rs.bk
+
+# C/C++
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+*.out
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+.venv/
+venv/
+
+# Node / JS / TS
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.next/
+dist/
+
+# Java / JVM
+*.class
+*.jar
+*.war
+*.ear
+hs_err_pid*
+
+# Go
+*.test
+
+# General build dirs
+build/
+out/
+cmake-build-*/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Claude / Bureau internals
+.claude/
+_bureau_*
