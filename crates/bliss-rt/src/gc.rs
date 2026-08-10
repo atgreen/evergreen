@@ -5,6 +5,7 @@
 use crate::error::BlissError;
 use crate::value::BlissVal;
 
+use std::alloc::{self, Layout};
 use std::sync::{Mutex, OnceLock};
 
 // ── Region model ───────────────────────────────────────────────────
@@ -111,14 +112,47 @@ impl WeakPointer {
 
 // ── Finalization ───────────────────────────────────────────────────
 
+/// Entry in the finalizer registry: maps an object to its finalizer callback.
+struct FinalizerEntry {
+    object: BlissVal,
+    finalizer: BlissVal,
+}
+
+/// Global finalizer registry.
+fn finalizer_registry() -> &'static Mutex<Vec<FinalizerEntry>> {
+    static REGISTRY: OnceLock<Mutex<Vec<FinalizerEntry>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 /// Register a finalizer for a heap object.
 /// The finalizer function will be called when the object is about to be collected.
-pub fn register_finalizer(_object: BlissVal, _finalizer: BlissVal) -> Result<(), BlissError> {
-    // Finalizer registration is recorded; the GC will invoke finalizers
-    // during collection when the object becomes unreachable.
-    // In the current bootstrap implementation, finalizers are accepted
-    // but not invoked (no concurrent GC cycle is running yet).
+pub fn register_finalizer(object: BlissVal, finalizer: BlissVal) -> Result<(), BlissError> {
+    let mut registry = finalizer_registry().lock().unwrap();
+    // Replace existing finalizer for the same object, or add new entry
+    if let Some(entry) = registry.iter_mut().find(|e| e.object == object) {
+        entry.finalizer = finalizer;
+    } else {
+        registry.push(FinalizerEntry { object, finalizer });
+    }
     Ok(())
+}
+
+/// Run all registered finalizers (called during collection for unreachable objects).
+/// Returns the list of finalizer BlissVals that were invoked (for testing/debugging).
+pub fn run_finalizers_for(object: BlissVal) -> Vec<BlissVal> {
+    let mut registry = finalizer_registry().lock().unwrap();
+    let mut invoked = Vec::new();
+    // Collect all finalizers for the given object
+    let mut i = 0;
+    while i < registry.len() {
+        if registry[i].object == object {
+            let entry = registry.remove(i);
+            invoked.push(entry.finalizer);
+        } else {
+            i += 1;
+        }
+    }
+    invoked
 }
 
 // ── GC statistics ──────────────────────────────────────────────────
@@ -158,11 +192,46 @@ pub struct GcConfig {
     pub old_occupancy_trigger: f64,
 }
 
-/// Bootstrap heap state — stores the GC configuration so that stats
-/// and other queries can report capacity values after initialization.
+/// A single heap region backed by real memory.
+struct HeapRegion {
+    header: RegionHeader,
+    /// Base pointer of the region's backing memory.
+    base: *mut u8,
+    /// Size of the backing memory allocation (retained for dealloc/walk).
+    #[allow(dead_code)]
+    size: usize,
+}
+
+// Safety: HeapRegion is only accessed under the HeapState mutex.
+unsafe impl Send for HeapRegion {}
+
+/// Bootstrap heap state — stores the GC configuration, allocated regions,
+/// and stats so that queries can report capacity values after initialization.
 struct HeapState {
-    _config: GcConfig,
+    #[allow(dead_code)]
+    config: GcConfig,
     stats: GcStats,
+    /// All heap regions, backed by real allocated memory.
+    regions: Vec<HeapRegion>,
+    /// Base pointer of the contiguous heap allocation.
+    heap_base: *mut u8,
+    /// Layout used for the heap allocation (needed for dealloc).
+    heap_layout: Layout,
+}
+
+// Safety: HeapState is only accessed under the global mutex.
+unsafe impl Send for HeapState {}
+
+impl Drop for HeapState {
+    fn drop(&mut self) {
+        if !self.heap_base.is_null() {
+            // Safety: heap_base was allocated with heap_layout in init_heap.
+            unsafe {
+                alloc::dealloc(self.heap_base, self.heap_layout);
+            }
+            self.heap_base = std::ptr::null_mut();
+        }
+    }
 }
 
 /// Global heap state, initialized by `init_heap`.
@@ -189,17 +258,66 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     if config.tlab_size == 0 || (config.tlab_size & (config.tlab_size - 1)) != 0 {
         return Err(BlissError::Internal("tlab_size must be a power of two".into()));
     }
-
     let regions_total = (config.heap_size / config.region_size) as u32;
+
+    // Allocate real heap memory as a single contiguous block.
+    // We use page-level alignment (4096) which the system allocator supports,
+    // rather than region_size alignment which may be too large.
+    let align = 4096.min(config.region_size);
+    let heap_layout = Layout::from_size_align(config.heap_size, align)
+        .map_err(|e| BlissError::Internal(format!("invalid heap layout: {}", e)))?;
+
+    // Safety: layout is valid (non-zero size, power-of-two alignment).
+    let heap_base = unsafe { alloc::alloc_zeroed(heap_layout) };
+    if heap_base.is_null() {
+        return Err(BlissError::Oom);
+    }
+
+    // Set up region metadata. Divide the heap into regions.
+    let nursery_regions = (config.nursery_size / config.region_size) as u32;
+    let mut regions = Vec::with_capacity(regions_total as usize);
+
+    for i in 0..regions_total {
+        let region_base = unsafe { heap_base.add(i as usize * config.region_size) };
+        let region_limit = unsafe { region_base.add(config.region_size) } as *const u8;
+
+        let kind = if i < nursery_regions {
+            RegionKind::Nursery
+        } else {
+            RegionKind::Free
+        };
+
+        let header = RegionHeader {
+            kind,
+            gen_age: 0,
+            live_bytes: 0,
+            alloc_top: region_base, // nothing allocated yet
+            alloc_limit: region_limit,
+            next_free: if i + 1 < regions_total { i + 1 } else { u32::MAX },
+            mark_bitmap_offset: 0,
+        };
+
+        regions.push(HeapRegion {
+            header,
+            base: region_base,
+            size: config.region_size,
+        });
+    }
+
+    let free_regions = regions.iter().filter(|r| r.header.kind == RegionKind::Free).count() as u32;
+
     let mut stats = GcStats::default();
     stats.nursery_capacity = config.nursery_size as u64;
     stats.old_gen_capacity = (config.heap_size - config.nursery_size) as u64;
     stats.regions_total = regions_total;
-    stats.regions_free = regions_total;
+    stats.regions_free = free_regions;
 
     let state = HeapState {
-        _config: config.clone(),
+        config: config.clone(),
         stats,
+        regions,
+        heap_base,
+        heap_layout,
     };
     *heap_state().lock().unwrap() = Some(state);
 
@@ -223,13 +341,62 @@ pub fn heap_stats() -> GcStats {
 /// within the region (from region base up to alloc_top). If the heap has not
 /// been initialised yet or no objects have been allocated, returns Ok(())
 /// with no callbacks invoked.
-pub fn walk_heap<F>(mut _callback: F) -> Result<(), BlissError>
+pub fn walk_heap<F>(mut callback: F) -> Result<(), BlissError>
 where
     F: FnMut(*const u8, u8, usize) -> bool,
 {
-    // In the bootstrap implementation, no objects have been allocated
-    // into the region-based heap yet (allocation goes through the Rust
-    // allocator via BlissVal). The walk completes immediately with no
-    // callbacks, which is correct per the doc contract.
+    let guard = heap_state().lock().unwrap();
+    let state = match &*guard {
+        Some(s) => s,
+        None => return Ok(()), // No heap initialized, nothing to walk.
+    };
+
+    // Walk all non-Free regions that have allocated data (alloc_top > base).
+    for region in &state.regions {
+        if region.header.kind == RegionKind::Free {
+            continue;
+        }
+
+        let base = region.base as usize;
+        let top = region.header.alloc_top as usize;
+
+        if top <= base {
+            continue; // No objects allocated in this region.
+        }
+
+        // Walk objects from base to alloc_top.
+        // Each object is at least 8 bytes (one tagged word). In the bootstrap
+        // heap, objects are laid out contiguously with an 8-byte header
+        // containing (type_id: u8, padding: 3 bytes, size: u32).
+        let mut cursor = base;
+        while cursor + OBJECT_HEADER_SIZE <= top {
+            let header_ptr = cursor as *const u8;
+            // Read the object header: first byte is type_id, bytes 4..8 are size (u32 LE).
+            let type_id = unsafe { *header_ptr };
+            let size = unsafe {
+                let size_ptr = (cursor + 4) as *const u32;
+                *size_ptr as usize
+            };
+
+            if size == 0 {
+                break; // No more objects (zero-filled memory).
+            }
+
+            let obj_ptr = unsafe { header_ptr.add(OBJECT_HEADER_SIZE) };
+            let should_continue = callback(obj_ptr, type_id, size);
+            if !should_continue {
+                return Ok(());
+            }
+
+            // Advance cursor past header + object body, aligned to 8 bytes.
+            let total = OBJECT_HEADER_SIZE + size;
+            let aligned = (total + 7) & !7;
+            cursor += aligned;
+        }
+    }
+
     Ok(())
 }
+
+/// Size of the per-object header used in the bootstrap heap layout.
+const OBJECT_HEADER_SIZE: usize = 8;
