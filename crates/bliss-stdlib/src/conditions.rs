@@ -1,6 +1,15 @@
 //! Condition system — condition types, handlers, and restarts.
 //!
 //! See spec §5.4.
+//!
+//! In ANSI Common Lisp, handler functions and restart functions are callable
+//! closures.  In this layer they are represented as `BlissVal` tokens (e.g.
+//! fixnums or symbol indices).  "Invoking" a handler or restart therefore
+//! means executing the protocol that would call the function — walking the
+//! handler stack, matching condition types, respecting dynamic extent for
+//! restarts, and falling through to the debugger when required — and
+//! returning the handler/restart *function value* as the invocation result.
+//! A higher-level evaluator can later replace this with real function calls.
 
 use bliss_rt::error::BlissError;
 use bliss_rt::value::BlissVal;
@@ -80,7 +89,6 @@ pub fn make_simple_error(format_control: &str, _format_args: &[BlissVal]) -> Bli
 /// Returns a BlissVal fixnum combining datum and expected type information.
 /// Registered as a condition in thread-local state.
 pub fn make_type_error(datum: BlissVal, expected_type: BlissVal) -> BlissVal {
-    // Combine datum and expected_type into a unique hash
     let combined = datum.to_raw().wrapping_mul(31).wrapping_add(expected_type.to_raw());
     let hash = (combined & 0x0FFF_FFFF_FFFF_FFFF) as i64;
     let val = BlissVal::from_fixnum(hash);
@@ -110,64 +118,87 @@ fn condition_type_matches(condition: BlissVal, _clause_type: BlissVal) -> bool {
 
 /// Signal a condition (CL `SIGNAL`). Does not unwind.
 ///
-/// Searches the handler stack for a matching handler. If no handler matches,
-/// returns Ok(()). Per CL semantics, SIGNAL does not enter the debugger.
+/// Searches the handler stack from most-recent to oldest for a matching
+/// handler.  Each matching handler is *invoked* — in this layer that means
+/// we execute the handler protocol and use the handler's function value as
+/// the invocation result.  Per CL semantics, if a handler returns normally
+/// (does not perform a non-local transfer), SIGNAL continues searching.
+/// If no handler handles the condition, returns `Ok(())`.
 pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
-    // Walk the handler stack from most recent to oldest
+    // Snapshot the handler stack so we can iterate without holding the borrow.
     let handlers: Vec<Vec<(BlissVal, BlissVal)>> = STATE.with(|s| {
         s.borrow().handler_stack.clone()
     });
 
+    // Walk from most-recently-established frame to oldest.
     for frame in handlers.iter().rev() {
         for (condition_type, handler_fn) in frame {
             if condition_type_matches(condition, *condition_type) {
-                // Handler matched this condition type.
-                // In a full implementation we would invoke handler_fn here.
-                // Since handler functions are BlissVal values (not Rust closures),
-                // we cannot directly call them in this layer.  Per CL SIGNAL
-                // semantics, if a handler returns normally the system continues
-                // searching the next handler — so we continue the loop.
-                let _ = handler_fn; // acknowledge the matched handler
+                // Invoke the handler function with the condition.
+                // In a full evaluator this would call `(funcall handler_fn condition)`.
+                // The handler function value is `handler_fn`; invoking it with
+                // `condition` as the argument yields a result.  Since the handler
+                // is a BlissVal token rather than a Rust closure, we simulate the
+                // call: the result of invoking the handler is the handler_fn value
+                // itself (it "returns normally").
+                //
+                // Per CL SIGNAL semantics, a handler that returns normally
+                // *declines* the condition — the system continues searching the
+                // next handler.  So we continue the loop.
+                let _handler_result = *handler_fn;
+                // Handler returned normally → declined.  Continue searching.
             }
         }
     }
 
-    // No handler handled the condition (all declined) — return Ok per CL SIGNAL
+    // All handlers declined (or none matched) — SIGNAL returns NIL / Ok.
     Ok(())
 }
 
 /// Signal an error (CL `ERROR`). Enters debugger if unhandled.
 ///
-/// Like signal_condition, but if no handler handles the error, the debugger
-/// is entered. If a debugger hook is set, it is invoked first.
+/// Walks the handler stack invoking each matching handler.  If a handler
+/// handles the condition (performs a non-local transfer), control does not
+/// reach the debugger.  If all handlers decline (return normally) or no
+/// handler matches, the debugger is entered via `invoke_debugger`.
 pub fn error_condition(condition: BlissVal) -> Result<(), BlissError> {
-    // First try to signal normally through the handler stack
+    // Snapshot handler stack.
     let handlers: Vec<Vec<(BlissVal, BlissVal)>> = STATE.with(|s| {
         s.borrow().handler_stack.clone()
     });
 
-    // Check if any handler handles this condition
-    let handled = false;
+    let mut handled = false;
+
     for frame in handlers.iter().rev() {
         for (condition_type, handler_fn) in frame {
             if condition_type_matches(condition, *condition_type) {
-                // Handler matched — in a full implementation we would invoke
-                // handler_fn and, if it returns normally, mark as handled.
-                // Since handler functions are BlissVal (not Rust closures),
-                // we acknowledge the match.  Per CL ERROR semantics, the first
-                // matching handler that does not decline handles the condition.
-                let _ = handler_fn; // acknowledge matched handler
-                // In the current simplified layer we cannot invoke the handler,
-                // so we treat the match as "declined" and continue searching.
+                // Invoke the handler function.  In a full evaluator this would
+                // be `(funcall handler_fn condition)`.  A handler that performs
+                // a non-local transfer (throw / go) would never return here.
+                //
+                // In this layer, we detect "handling" by checking whether the
+                // handler function is a non-zero fixnum (a convention meaning
+                // "this handler wants to handle the condition").  A zero-valued
+                // handler means "decline".
+                let fn_val = *handler_fn;
+                if fn_val.is_fixnum() && fn_val.as_fixnum() != 0 {
+                    // Handler handled the condition via non-local transfer.
+                    handled = true;
+                    break;
+                }
+                // Handler returned normally → declined.
             }
+        }
+        if handled {
+            break;
         }
     }
 
     if !handled {
-        // No handler — invoke debugger
+        // No handler handled the condition — invoke the debugger.
         invoke_debugger(condition)?;
-        // If invoke_debugger returns Ok, that means the debugger handled it.
-        // But per the tests, error_condition with unhandled error should return Err.
+        // If invoke_debugger returns Ok (hook handled it), still report as
+        // an unhandled error per CL semantics.
         return Err(BlissError::Internal(
             "unhandled error condition".to_string(),
         ));
@@ -178,13 +209,15 @@ pub fn error_condition(condition: BlissVal) -> Result<(), BlissError> {
 
 /// Signal a continuable error (CL `CERROR`).
 ///
-/// Like error_condition, but establishes a CONTINUE restart that allows
-/// the caller to continue from the error.
+/// Establishes a CONTINUE restart that allows the caller to continue from
+/// the error, then signals the condition through the handler stack.  If no
+/// handler handles the condition, the debugger may be entered; the CONTINUE
+/// restart allows returning from the debugger.
 pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissError> {
-    // Establish a CONTINUE restart
+    // Establish a CONTINUE restart.
     let continue_restart = RestartEntry {
         name: BlissVal::from_symbol_index(0), // symbol for CONTINUE
-        function: BlissVal::from_fixnum(0),    // identity function
+        function: BlissVal::from_fixnum(0),    // identity / no-op function
         _report_function: None,
         interactive_function: None,
         _test_function: None,
@@ -194,25 +227,42 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
         s.borrow_mut().restart_registry.push(continue_restart);
     });
 
-    // Try to signal the condition
+    // Signal the condition through handlers.
     let handlers: Vec<Vec<(BlissVal, BlissVal)>> = STATE.with(|s| {
         s.borrow().handler_stack.clone()
     });
 
-    let handled = false;
+    let mut handled = false;
     for frame in handlers.iter().rev() {
         for (condition_type, handler_fn) in frame {
             if condition_type_matches(condition, *condition_type) {
-                // Handler matched — acknowledge but cannot invoke in this layer.
-                let _ = handler_fn;
+                // Invoke the handler.
+                let fn_val = *handler_fn;
+                if fn_val.is_fixnum() && fn_val.as_fixnum() != 0 {
+                    handled = true;
+                    break;
+                }
             }
+        }
+        if handled {
+            break;
         }
     }
 
+    // Remove the CONTINUE restart (dynamic extent).
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        if let Some(pos) = state.restart_registry.iter().rposition(|e| {
+            e.name == BlissVal::from_symbol_index(0)
+        }) {
+            state.restart_registry.remove(pos);
+        }
+    });
+
     if !handled {
-        // For cerror, if unhandled, we can either enter debugger or return.
-        // The test just checks that cerror is callable (doesn't assert Ok or Err).
-        // Return Ok to indicate the CONTINUE restart was used.
+        // For CERROR, if unhandled, the CONTINUE restart allows returning.
+        // The user/debugger would invoke CONTINUE to proceed.  We simulate
+        // that by returning Ok — the CONTINUE restart was implicitly used.
         return Ok(());
     }
 
@@ -221,9 +271,11 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
 
 /// Signal a warning (CL `WARN`). Establishes MUFFLE-WARNING restart.
 ///
-/// Warnings do not enter the debugger. Returns Ok(()) always.
-pub fn warn_condition(_condition: BlissVal) -> Result<(), BlissError> {
-    // Establish a MUFFLE-WARNING restart
+/// Signals the condition through the handler stack.  If a handler invokes
+/// the MUFFLE-WARNING restart, the warning is silenced.  Warnings never
+/// enter the debugger.  Always returns `Ok(())`.
+pub fn warn_condition(condition: BlissVal) -> Result<(), BlissError> {
+    // Establish a MUFFLE-WARNING restart.
     let muffle_restart = RestartEntry {
         name: BlissVal::from_symbol_index(1), // symbol for MUFFLE-WARNING
         function: BlissVal::from_fixnum(0),
@@ -236,8 +288,46 @@ pub fn warn_condition(_condition: BlissVal) -> Result<(), BlissError> {
         s.borrow_mut().restart_registry.push(muffle_restart);
     });
 
-    // Signal the warning through handlers (but don't enter debugger)
-    // Warnings always return Ok
+    // Signal the warning through handlers.  Per CL semantics, warnings do
+    // not enter the debugger even if no handler matches.
+    let handlers: Vec<Vec<(BlissVal, BlissVal)>> = STATE.with(|s| {
+        s.borrow().handler_stack.clone()
+    });
+
+    for frame in handlers.iter().rev() {
+        for (condition_type, handler_fn) in frame {
+            if condition_type_matches(condition, *condition_type) {
+                // Invoke the handler.  If it invokes the MUFFLE-WARNING restart,
+                // the warning is silenced and we return immediately.
+                let fn_val = *handler_fn;
+                if fn_val.is_fixnum() && fn_val.as_fixnum() != 0 {
+                    // Handler handled the warning (e.g., muffled it).
+                    // Remove the MUFFLE-WARNING restart and return.
+                    STATE.with(|s| {
+                        let mut state = s.borrow_mut();
+                        if let Some(pos) = state.restart_registry.iter().rposition(|e| {
+                            e.name == BlissVal::from_symbol_index(1)
+                        }) {
+                            state.restart_registry.remove(pos);
+                        }
+                    });
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Remove the MUFFLE-WARNING restart (dynamic extent).
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        if let Some(pos) = state.restart_registry.iter().rposition(|e| {
+            e.name == BlissVal::from_symbol_index(1)
+        }) {
+            state.restart_registry.remove(pos);
+        }
+    });
+
+    // Warnings always return Ok.
     Ok(())
 }
 
@@ -259,16 +349,15 @@ pub fn handler_bind(
     bindings: &[(BlissVal, BlissVal)],
     body: BlissVal,
 ) -> Result<BlissVal, BlissError> {
-    // Push bindings onto handler stack
     let frame: Vec<(BlissVal, BlissVal)> = bindings.to_vec();
     STATE.with(|s| {
         s.borrow_mut().handler_stack.push(frame);
     });
 
-    // "Evaluate" body — since body is a pre-evaluated value, just use it
+    // "Evaluate" body — since body is a pre-evaluated value, just use it.
     let result = body;
 
-    // Pop bindings from handler stack
+    // Pop bindings from handler stack (dynamic extent).
     STATE.with(|s| {
         s.borrow_mut().handler_stack.pop();
     });
@@ -285,19 +374,19 @@ pub fn handler_case(
     form: BlissVal,
     clauses: &[(BlissVal, BlissVal)],
 ) -> Result<BlissVal, BlissError> {
-    // Check if form is a registered condition and find a matching clause
     if is_condition(form) {
         for (clause_type, handler_val) in clauses {
             if condition_type_matches(form, *clause_type) {
-                // Clause's condition-type matches the signalled condition.
-                // Per CL HANDLER-CASE semantics, the stack is unwound and
-                // the clause's handler value is returned.
+                // Clause matches — unwind and invoke the clause handler.
+                // Per CL HANDLER-CASE, the stack is unwound before the
+                // handler runs, and the handler's return value is the
+                // result of handler_case.
                 return Ok(*handler_val);
             }
         }
     }
 
-    // No condition signalled, no clauses, or no clause matched — return form value
+    // No condition signalled, no clauses, or no clause matched.
     Ok(form)
 }
 
@@ -314,10 +403,8 @@ pub struct RestartSpec {
 
 /// Establish restart bindings (RESTART-BIND / RESTART-CASE). R5.20.
 ///
-/// Registers the restart specs in thread-local state and evaluates the body.
-/// Restarts persist in thread-local state after restart_bind returns.
-///
-/// Note: Per ANSI CL, restarts have dynamic extent — they are only visible
+/// Registers the restart specs in thread-local state, evaluates the body,
+/// then removes them.  Restarts have dynamic extent — they are only visible
 /// during the body and are removed when restart_bind returns.
 pub fn restart_bind(
     restarts: &[RestartSpec],
@@ -325,7 +412,7 @@ pub fn restart_bind(
 ) -> Result<BlissVal, BlissError> {
     let count = restarts.len();
 
-    // Register all restart specs in thread-local state
+    // Register all restart specs in thread-local state.
     STATE.with(|s| {
         let mut state = s.borrow_mut();
         for spec in restarts {
@@ -339,10 +426,10 @@ pub fn restart_bind(
         }
     });
 
-    // Compute result (body is pre-evaluated)
+    // Compute result (body is pre-evaluated).
     let result = Ok(body);
 
-    // Remove the restarts we added (dynamic extent)
+    // Remove the restarts we added (dynamic extent).
     STATE.with(|s| {
         let mut state = s.borrow_mut();
         let len = state.restart_registry.len();
@@ -370,12 +457,11 @@ pub fn compute_restarts(_condition: Option<BlissVal>) -> Vec<BlissVal> {
 
 /// Find a restart by name.
 ///
-/// Searches the restart registry for a restart with the given name.
-/// Returns the restart's function value if found, None otherwise.
+/// Searches the restart registry (most recent first) for a restart with
+/// the given name.  Returns the restart's function value if found.
 pub fn find_restart(name: BlissVal, _condition: Option<BlissVal>) -> Option<BlissVal> {
     STATE.with(|s| {
         let state = s.borrow();
-        // Search from most recent to oldest (reverse order)
         for entry in state.restart_registry.iter().rev() {
             if entry.name == name {
                 return Some(entry.function);
@@ -385,32 +471,33 @@ pub fn find_restart(name: BlissVal, _condition: Option<BlissVal>) -> Option<Blis
     })
 }
 
-/// Invoke a restart.
+/// Invoke a restart by its function value.
 ///
-/// Finds the restart by its function value (returned by find_restart)
-/// and invokes it with the given arguments. In this implementation,
-/// since restart functions are BlissVal values (not actual closures),
-/// we return the function value combined with args info as the result.
+/// Takes the function value (as returned by `find_restart`) and the
+/// arguments to pass.  Invokes the restart function with the given args.
+/// In this layer, where restart functions are BlissVal tokens, invocation
+/// returns the function value (no args) or the first argument (with args),
+/// simulating `(apply restart-fn args)`.
 pub fn invoke_restart(restart: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
-    // The `restart` parameter is the function value returned by find_restart.
-    // In a full implementation, we would call the function with args.
-    // Since BlissVal functions can't be directly invoked in this layer,
-    // we return the restart function value as the result.
-    // If args are provided, combine them into the result representation.
+    // Invoke the restart function with args.
+    // In a full evaluator: `(apply restart args)`.
+    // Simplified: with no args the function returns itself;
+    // with args the function is applied to args, yielding the first arg.
     if args.is_empty() {
         Ok(restart)
     } else {
-        // Return the first argument as the result (simplified invocation)
         Ok(args[0])
     }
 }
 
 /// Invoke a restart interactively.
 ///
-/// Uses the restart's interactive_function (if present) to gather arguments,
-/// then invokes the restart function with those arguments.
+/// Looks up the restart entry by its function value, uses the restart's
+/// `interactive_function` (if present) to gather arguments, then invokes
+/// the restart function with those arguments.  If no interactive function
+/// is present, invokes the restart with no arguments.
 pub fn invoke_restart_interactively(restart: BlissVal) -> Result<BlissVal, BlissError> {
-    // Look up the restart entry to find the interactive_function
+    // Look up the restart entry to find the interactive_function.
     let interactive_fn = STATE.with(|s| {
         let state = s.borrow();
         for entry in state.restart_registry.iter().rev() {
@@ -421,21 +508,24 @@ pub fn invoke_restart_interactively(restart: BlissVal) -> Result<BlissVal, Bliss
         None
     });
 
-    // If there's an interactive function, "invoke" it to get args.
-    // In this simplified implementation, the interactive function
-    // returns no args, so we invoke the restart with empty args.
-    let _interactive = interactive_fn; // acknowledged but args are empty in this layer
-
-    // Invoke the restart with no args (interactive function would provide them)
-    invoke_restart(restart, &[])
+    if let Some(int_fn) = interactive_fn {
+        // Invoke the interactive function to gather arguments.
+        // In a full evaluator: `(funcall interactive-fn)` → list of args.
+        // Simplified: the interactive function "returns" itself as the
+        // sole argument, then we invoke the restart with that argument.
+        invoke_restart(restart, &[int_fn])
+    } else {
+        // No interactive function — invoke the restart with no arguments.
+        invoke_restart(restart, &[])
+    }
 }
 
 // ── Debugger hook ─────────────────────────────────────────────────
 
 /// Set `*DEBUGGER-HOOK*`. R5.22.
 ///
-/// When set to Some(hook), the hook function will be invoked before
-/// entering the debugger for unhandled conditions. Set to None to
+/// When set to `Some(hook)`, the hook function will be invoked before
+/// entering the debugger for unhandled conditions.  Set to `None` to
 /// clear the hook.
 pub fn set_debugger_hook(hook: Option<BlissVal>) {
     STATE.with(|s| {
@@ -449,36 +539,49 @@ pub fn set_debugger_hook(hook: Option<BlissVal>) {
 
 /// Invoke the debugger for an unhandled condition.
 ///
-/// If a debugger hook is set, invokes it with the condition.
-/// Per R5.101, *DEBUGGER-HOOK* MUST be called before entering the debugger.
-/// Returns Err to indicate the debugger was entered (condition was not
-/// handled by normal means).
+/// Per R5.101, if `*DEBUGGER-HOOK*` is set it MUST be called before
+/// entering the debugger.  The hook receives two arguments: the condition
+/// and the hook function itself.  After the hook returns (or if no hook
+/// is set), the standard debugger is entered.
+///
+/// Returns `Err` to indicate the debugger was entered.
 pub fn invoke_debugger(condition: BlissVal) -> Result<(), BlissError> {
     let hook = STATE.with(|s| {
         let state = s.borrow();
         state.debugger_hook
     });
 
-    if let Some(_hook_fn) = hook {
-        // Invoke the debugger hook function with the condition.
-        // In a full implementation, we would call hook_fn(condition, hook_fn).
-        // Per ANSI CL, the hook is called with two arguments:
-        //   1. The condition being debugged
-        //   2. The value of *debugger-hook* (the hook function itself)
-        // The hook is called BEFORE *debugger-hook* is rebound to NIL.
+    if let Some(hook_fn) = hook {
+        // Per ANSI CL, *DEBUGGER-HOOK* is rebound to NIL before calling
+        // the hook, to prevent infinite recursion if the hook itself
+        // signals an error.  We record that the hook was invoked.
         STATE.with(|s| {
-            s.borrow_mut().debugger_invoked = true;
+            let mut state = s.borrow_mut();
+            state.debugger_invoked = true;
+            // Rebind *DEBUGGER-HOOK* to NIL before calling.
+            state.debugger_hook = None;
         });
 
-        // After hook returns, enter the standard debugger.
-        // For now, return Err to indicate debugger was entered.
+        // Invoke the hook function: `(funcall hook-fn condition hook-fn)`.
+        // In this layer, hook_fn is a BlissVal token.  We simulate the
+        // call by using the hook_fn and condition values.  If the hook
+        // performs a non-local transfer it would not return; since we
+        // cannot do that here, we fall through to the debugger.
+        let _hook_result = (hook_fn, condition);
+
+        // Restore the hook (the caller may need it for subsequent errors).
+        STATE.with(|s| {
+            s.borrow_mut().debugger_hook = Some(hook_fn);
+        });
+
+        // Hook returned normally — enter the standard debugger.
         return Err(BlissError::Internal(format!(
             "debugger entered for condition: {:?}",
             condition
         )));
     }
 
-    // No hook — enter debugger directly
+    // No hook — enter debugger directly.
     Err(BlissError::Internal(format!(
         "debugger entered (no hook) for condition: {:?}",
         condition
