@@ -154,6 +154,8 @@ impl ConditionState {
 
 thread_local! {
     static STATE: RefCell<ConditionState> = RefCell::new(ConditionState::new());
+    /// Flag set by the MUFFLE-WARNING restart to suppress warning output.
+    static WARNING_MUFFLED: RefCell<bool> = RefCell::new(false);
 }
 
 // ── Condition construction ────────────────────────────────────────
@@ -304,9 +306,11 @@ pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
                     s.borrow_mut().handler_stack = handlers.clone();
                 });
 
+                // If the handler itself errored, propagate the error
+                // (after having already restored the handler stack above).
+                handler_result?;
                 // Per CL SIGNAL semantics, a handler that returns normally
                 // *declines* the condition — continue searching the next handler.
-                let _ = handler_result;
             }
         }
     }
@@ -401,6 +405,9 @@ pub fn warn_condition(condition: BlissVal) -> Result<(), BlissError> {
         test_function: None,
     };
 
+    // Reset the muffled flag before signalling.
+    WARNING_MUFFLED.with(|m| *m.borrow_mut() = false);
+
     STATE.with(|s| {
         s.borrow_mut().restart_registry.push(muffle_restart);
     });
@@ -421,9 +428,11 @@ pub fn warn_condition(condition: BlissVal) -> Result<(), BlissError> {
         }
     });
 
-    // Per R5.104: when no handler handles the warning, print to *error-output*.
-    // In this layer we write to stderr, which represents *error-output*.
-    eprintln!("WARNING: condition {:?}", condition);
+    // Per R5.104: only print the warning if MUFFLE-WARNING was NOT invoked.
+    let muffled = WARNING_MUFFLED.with(|m| *m.borrow());
+    if !muffled {
+        eprintln!("WARNING: condition {:?}", condition);
+    }
 
     Ok(())
 }
@@ -432,9 +441,28 @@ pub fn warn_condition(condition: BlissVal) -> Result<(), BlissError> {
 
 /// A condition handler binding.
 ///
-/// Represents a binding between a condition type and a handler function.
+/// Represents a binding between a condition type and a handler function,
+/// used to construct bindings for `handler_bind` / `handler_bind_fn`.
 pub struct HandlerBinding {
-    _private: (),
+    /// The condition type this handler matches against.
+    pub condition_type: BlissVal,
+    /// The handler function to invoke when the condition type matches.
+    pub handler_fn: BlissVal,
+}
+
+impl HandlerBinding {
+    /// Create a new handler binding.
+    pub fn new(condition_type: BlissVal, handler_fn: BlissVal) -> Self {
+        HandlerBinding {
+            condition_type,
+            handler_fn,
+        }
+    }
+
+    /// Convert to the tuple representation used by handler_bind.
+    pub fn as_tuple(&self) -> (BlissVal, BlissVal) {
+        (self.condition_type, self.handler_fn)
+    }
 }
 
 /// Establish handler bindings (without unwinding — HANDLER-BIND). R5.19.
@@ -648,14 +676,26 @@ pub fn compute_restarts(condition: Option<BlissVal>) -> Vec<BlissVal> {
 
 /// Find a restart by name.
 ///
-/// Searches the restart registry (most recent first) for a restart with
-/// the given name.  Returns the restart's function value if found.
-pub fn find_restart(name: BlissVal, _condition: Option<BlissVal>) -> Option<BlissVal> {
+/// Searches the restart registry (most recent first) for the most recently
+/// established *applicable* restart with the given name.  Per R5.98, when
+/// a condition is provided, restarts whose test_function rejects the
+/// condition are skipped.  Returns the restart's function value if found.
+pub fn find_restart(name: BlissVal, condition: Option<BlissVal>) -> Option<BlissVal> {
     STATE.with(|s| {
         let state = s.borrow();
         for entry in state.restart_registry.iter().rev() {
             if entry.name == name {
-                return Some(entry.function);
+                // Apply test_function filtering when a condition is provided,
+                // consistent with compute_restarts (per R5.98).
+                if let (Some(test_fn), Some(cond)) = (entry.test_function, condition) {
+                    match funcall(test_fn, &[cond]) {
+                        Ok(result) if !result.is_nil() => return Some(entry.function),
+                        _ => continue, // test rejected or errored — skip
+                    }
+                } else {
+                    // No test function — restart is applicable.
+                    return Some(entry.function);
+                }
             }
         }
         None
@@ -672,15 +712,26 @@ pub fn find_restart(name: BlissVal, _condition: Option<BlissVal>) -> Option<Blis
 /// a CONTROL-ERROR is signalled per §5.4.9.
 pub fn invoke_restart(restart: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
     // Look up the restart entry by function value or name.
-    let restart_fn = STATE.with(|s| {
+    let restart_entry = STATE.with(|s| {
         let state = s.borrow();
         for entry in state.restart_registry.iter().rev() {
             if entry.function == restart || entry.name == restart {
-                return Some(entry.function);
+                return Some((entry.function, entry.name));
             }
         }
         None
     });
+
+    // If invoking MUFFLE-WARNING, set the muffled flag so warn_condition
+    // knows to suppress the warning message (issue 2 fix).
+    if let Some((_, name)) = restart_entry {
+        let muffle_name = BlissVal::from_symbol_index(SYMBOL_MUFFLE_WARNING);
+        if name == muffle_name {
+            WARNING_MUFFLED.with(|m| *m.borrow_mut() = true);
+        }
+    }
+
+    let restart_fn = restart_entry.map(|(f, _)| f);
 
     match restart_fn {
         Some(func) => {
