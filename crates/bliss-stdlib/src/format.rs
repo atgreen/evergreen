@@ -4,7 +4,7 @@
 
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{ObjectHeader, type_id};
-use bliss_rt::value::{BlissVal, TAG_HEAP_OBJECT, NIL, T};
+use bliss_rt::value::{BlissVal, NIL, T};
 
 // ── String allocation ─────────────────────────────────────────────
 
@@ -235,6 +235,7 @@ fn char_name(c: char) -> String {
 #[derive(Debug, Clone)]
 enum Param { Num(i64), V, Hash, None }
 
+#[allow(dead_code)]
 struct Directive {
     params: Vec<Param>,
     colon: bool,
@@ -244,6 +245,7 @@ struct Directive {
     end: usize,
 }
 
+#[allow(dead_code)]
 fn parse_directives(control: &str) -> Result<Vec<Directive>, BlissError> {
     let chars: Vec<char> = control.chars().collect();
     let mut directives = Vec::new();
@@ -854,6 +856,7 @@ fn format_impl(
                 while i < chars.len() && chars[i] != '/' { i += 1; }
                 let name: String = chars[name_start..i].iter().collect();
                 if i < chars.len() { i += 1; } // skip closing /
+                let _ = i; // suppress unused assignment warning (we return below)
                 // Consume one argument as per CL spec
                 if *arg_idx >= args.len() { return Err(BlissError::Internal(format!("too few args for ~/{}/", name))); }
                 let _arg = args[*arg_idx]; *arg_idx += 1;
@@ -1124,6 +1127,7 @@ pub enum TabKind {
 // ── Pprint dispatch ────────────────────────────────────────────────
 
 /// Dispatch table entry.
+#[allow(dead_code)]
 struct DispatchEntry {
     _type_spec: BlissVal,
     function: BlissVal,
@@ -1131,6 +1135,7 @@ struct DispatchEntry {
 }
 
 /// A simple pprint dispatch table stored as a heap object.
+#[allow(dead_code)]
 struct PprintDispatchTable {
     entries: Vec<DispatchEntry>,
 }

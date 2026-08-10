@@ -19,9 +19,9 @@ static NEXT_PACKAGE_ID: AtomicI64 = AtomicI64::new(1);
 /// Counter for generating unique symbol values (globally unique across threads).
 static NEXT_SYMBOL_ID: AtomicI64 = AtomicI64::new(1);
 
-/// Thread-local pointer to the currently-active PackageStore.
-/// Set by `PackageRegistry::new()` so that free functions (`intern`, `find_symbol`, etc.)
-/// can access the store without an explicit registry reference.
+// Thread-local pointer to the currently-active PackageStore.
+// Set by `PackageRegistry::new()` so that free functions (`intern`, `find_symbol`, etc.)
+// can access the store without an explicit registry reference.
 thread_local! {
     static CURRENT_STORE: RefCell<Option<Rc<RefCell<PackageStore>>>> = RefCell::new(None);
 }
@@ -40,7 +40,7 @@ impl PackageStore {
         }
     }
 
-    fn clear(&mut self) {
+    fn _clear(&mut self) {
         self.packages.clear();
         self.name_index.clear();
     }

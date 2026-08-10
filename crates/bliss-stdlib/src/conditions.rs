@@ -14,9 +14,9 @@ use std::collections::HashSet;
 struct RestartEntry {
     name: BlissVal,
     function: BlissVal,
-    report_function: Option<BlissVal>,
+    _report_function: Option<BlissVal>,
     interactive_function: Option<BlissVal>,
-    test_function: Option<BlissVal>,
+    _test_function: Option<BlissVal>,
 }
 
 /// Per-thread condition system state.
@@ -147,7 +147,7 @@ pub fn error_condition(condition: BlissVal) -> Result<(), BlissError> {
     });
 
     // Check if any handler handles this condition
-    let mut handled = false;
+    let handled = false;
     for frame in handlers.iter().rev() {
         for (condition_type, handler_fn) in frame {
             if condition_type_matches(condition, *condition_type) {
@@ -185,9 +185,9 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
     let continue_restart = RestartEntry {
         name: BlissVal::from_symbol_index(0), // symbol for CONTINUE
         function: BlissVal::from_fixnum(0),    // identity function
-        report_function: None,
+        _report_function: None,
         interactive_function: None,
-        test_function: None,
+        _test_function: None,
     };
 
     STATE.with(|s| {
@@ -199,7 +199,7 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
         s.borrow().handler_stack.clone()
     });
 
-    let mut handled = false;
+    let handled = false;
     for frame in handlers.iter().rev() {
         for (condition_type, handler_fn) in frame {
             if condition_type_matches(condition, *condition_type) {
@@ -227,9 +227,9 @@ pub fn warn_condition(_condition: BlissVal) -> Result<(), BlissError> {
     let muffle_restart = RestartEntry {
         name: BlissVal::from_symbol_index(1), // symbol for MUFFLE-WARNING
         function: BlissVal::from_fixnum(0),
-        report_function: None,
+        _report_function: None,
         interactive_function: None,
-        test_function: None,
+        _test_function: None,
     };
 
     STATE.with(|s| {
@@ -317,16 +317,14 @@ pub struct RestartSpec {
 /// Registers the restart specs in thread-local state and evaluates the body.
 /// Restarts persist in thread-local state after restart_bind returns.
 ///
-/// Note: Per ANSI CL, restarts should have dynamic extent (only visible
-/// during the body). However, since the body is a pre-evaluated BlissVal
-/// and not a closure, there is no way to call find_restart/compute_restarts
-/// "during" the body. The tests that call find_restart after restart_bind
-/// require restarts to persist. Restarts are naturally cleaned up when the
-/// test thread exits (thread-local storage).
+/// Note: Per ANSI CL, restarts have dynamic extent — they are only visible
+/// during the body and are removed when restart_bind returns.
 pub fn restart_bind(
     restarts: &[RestartSpec],
     body: BlissVal,
 ) -> Result<BlissVal, BlissError> {
+    let count = restarts.len();
+
     // Register all restart specs in thread-local state
     STATE.with(|s| {
         let mut state = s.borrow_mut();
@@ -334,15 +332,24 @@ pub fn restart_bind(
             state.restart_registry.push(RestartEntry {
                 name: spec.name,
                 function: spec.function,
-                report_function: spec.report_function,
+                _report_function: spec.report_function,
                 interactive_function: spec.interactive_function,
-                test_function: spec.test_function,
+                _test_function: spec.test_function,
             });
         }
     });
 
-    // Return the body value (no restart was invoked)
-    Ok(body)
+    // Compute result (body is pre-evaluated)
+    let result = Ok(body);
+
+    // Remove the restarts we added (dynamic extent)
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let len = state.restart_registry.len();
+        state.restart_registry.truncate(len - count);
+    });
+
+    result
 }
 
 /// Compute available restarts for a condition.

@@ -3,7 +3,7 @@
 //! See spec §6.
 
 use bliss_rt::error::BlissError;
-use bliss_rt::value::{BlissVal, NIL, T};
+use bliss_rt::value::{BlissVal, T};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -132,6 +132,7 @@ struct BreakpointInfo {
     _condition: Option<BlissVal>,
 }
 
+#[allow(dead_code)]
 enum BreakpointTarget {
     Entry(BlissVal),
     SourceLocation { file: String, line: u32 },
