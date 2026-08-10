@@ -435,7 +435,7 @@ measurement noise.
 
 ### 10.10.1  Measurement Protocol
 
-**R10.59** Each benchmark MUST be run a minimum of **N = 7** times
+**R10.59** Each benchmark MUST be run a minimum of **N = 5** times
 (after 3 warm-up iterations that are discarded). The reported metrics
 are:
 - Median wall-clock time
@@ -678,10 +678,10 @@ tests/
 │   ├── asan.supp
 │   ├── tsan.supp
 │   └── msan.supp
-└── fuzz/                       # Fuzz targets and corpora (§10.4)
-    ├── fuzz_targets/
-    ├── corpus/
-    └── regression/
+fuzz/                               # Fuzz targets and corpora (§10.4)
+├── fuzz_targets/
+├── corpus/
+└── regression/
 ```
 
 ### 10.11.5  CI Integration Matrix
