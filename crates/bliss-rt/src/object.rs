@@ -86,10 +86,27 @@ pub mod gc_bit {
 }
 
 impl ObjectHeader {
+    /// Get an atomic reference to the inner u64, avoiding forming `&u64` first.
+    ///
+    /// # Safety
+    /// Uses `addr_of!` to obtain a raw pointer without an intermediate `&u64`,
+    /// then reinterprets as `&AtomicU64`. `AtomicU64` has the same size/alignment
+    /// as `u64` (guaranteed by `repr(transparent)`). The caller must ensure no
+    /// non-atomic writes race with atomic operations on the same header.
+    #[inline(always)]
+    fn as_atomic(&self) -> &AtomicU64 {
+        unsafe { &*(std::ptr::addr_of!(self.0) as *const AtomicU64) }
+    }
+
+    /// Atomically read the full header word.
+    #[inline(always)]
+    fn atomic_load(&self) -> u64 {
+        self.as_atomic().load(Ordering::Acquire)
+    }
+
     /// Atomically read mark bit.
     pub fn is_marked(&self) -> bool {
-        let atomic = unsafe { &*((&self.0) as *const u64 as *const AtomicU64) };
-        let bits = atomic.load(Ordering::Acquire);
+        let bits = self.atomic_load();
         let gc = ((bits & GC_BITS_MASK) >> GC_BITS_SHIFT) as u8;
         gc & (1 << gc_bit::MARK) != 0
     }
@@ -98,7 +115,7 @@ impl ObjectHeader {
     /// Returns true if the bit was successfully set (was previously unset).
     /// Returns false if the mark bit was already set.
     pub fn set_marked(&self) -> bool {
-        let atomic = unsafe { &*((&self.0) as *const u64 as *const AtomicU64) };
+        let atomic = self.as_atomic();
         let mark_bit_in_word: u64 = 1u64 << (GC_BITS_SHIFT + gc_bit::MARK as u32);
         loop {
             let old = atomic.load(Ordering::Acquire);
@@ -113,15 +130,17 @@ impl ObjectHeader {
         }
     }
 
-    /// Check if object has been forwarded (evacuated by GC).
+    /// Atomically check if object has been forwarded (evacuated by GC).
     pub fn is_forwarded(&self) -> bool {
-        let gc = self.gc_bits();
+        let bits = self.atomic_load();
+        let gc = ((bits & GC_BITS_MASK) >> GC_BITS_SHIFT) as u8;
         gc & (1 << gc_bit::FORWARDED) != 0
     }
 
-    /// Check if object is pinned (must not be moved by GC).
+    /// Atomically check if object is pinned (must not be moved by GC).
     pub fn is_pinned(&self) -> bool {
-        let gc = self.gc_bits();
+        let bits = self.atomic_load();
+        let gc = ((bits & GC_BITS_MASK) >> GC_BITS_SHIFT) as u8;
         gc & (1 << gc_bit::PINNED) != 0
     }
 }
