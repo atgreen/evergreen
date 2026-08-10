@@ -1,0 +1,530 @@
+//! End-to-end acceptance tests for the Bliss CLI binary.
+//!
+//! These tests build and invoke the real `bliss` binary via std::process::Command,
+//! asserting on exit codes, stdout, and stderr output. They exercise every
+//! top-level user-facing capability from the spec:
+//!   - --help, --version informational output
+//!   - --eval expression evaluation
+//!   - --load file loading
+//!   - Script file execution
+//!   - REPL interaction (piped stdin)
+//!   - Argument conflicts and error handling
+//!   - --sandbox, --bootstrap, --no-image modes
+//!   - Passthrough CL args via --
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+/// Get the path to the bliss binary built by cargo.
+fn bliss_bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_bliss-cli"))
+}
+
+// ══════════════════════════════════════════════════════════════════
+// --help
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn help_flag_prints_usage_and_exits_zero() {
+    let output = bliss_bin()
+        .arg("--help")
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "exit code should be 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Usage:"),
+        "help output should contain 'Usage:', got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("--eval"),
+        "help output should mention --eval"
+    );
+    assert!(
+        stdout.contains("--load"),
+        "help output should mention --load"
+    );
+    assert!(
+        stdout.contains("--image"),
+        "help output should mention --image"
+    );
+    assert!(
+        stdout.contains("--sandbox"),
+        "help output should mention --sandbox"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// --version
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn version_flag_prints_version_and_exits_zero() {
+    let output = bliss_bin()
+        .arg("--version")
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("bliss"),
+        "version output should contain 'bliss', got: {}",
+        stdout
+    );
+    // Should contain a version number (at least major.minor.patch)
+    assert!(
+        stdout.contains("0.1.0") || stdout.contains('.'),
+        "version output should contain a version number"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// --eval / -e: expression evaluation
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn eval_simple_arithmetic_returns_correct_value() {
+    // When --eval is fully wired, (+ 1 2) should print "3".
+    // This test will fail until the evaluator is connected, which is correct
+    // for red-phase TDD.
+    let output = bliss_bin()
+        .args(["--eval", "(+ 1 2)"])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "exit code should be 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().contains('3'),
+        "--eval '(+ 1 2)' should output 3, got stdout: '{}', stderr: '{}'",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn eval_short_flag_works() {
+    let output = bliss_bin()
+        .args(["-e", "(quote hello)"])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_uppercase().contains("HELLO"),
+        "-e '(quote hello)' should output HELLO, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn eval_string_expression() {
+    let output = bliss_bin()
+        .args(["--eval", "(format nil \"hello ~A\" 'world)"])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello") && stdout.to_uppercase().contains("WORLD"),
+        "format should produce 'hello WORLD', got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn eval_prints_multiple_values() {
+    // (values 1 2 3) should print all three values
+    let output = bliss_bin()
+        .args(["--eval", "(values 1 2 3)"])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains('1') && stdout.contains('2') && stdout.contains('3'),
+        "multiple values should all appear, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn eval_nil_expression() {
+    let output = bliss_bin()
+        .args(["--eval", "nil"])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_uppercase().contains("NIL"),
+        "evaluating nil should output NIL, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn eval_t_expression() {
+    let output = bliss_bin()
+        .args(["--eval", "t"])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.to_uppercase().contains('T'),
+        "evaluating t should output T, got: '{}'",
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// --load: file loading
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn load_file_executes_and_exits() {
+    // Create a temporary .lisp file
+    let dir = std::env::temp_dir().join("bliss_test_load");
+    let _ = std::fs::create_dir_all(&dir);
+    let file_path = dir.join("test_load.lisp");
+    std::fs::write(&file_path, "(print 42)\n").expect("failed to write test file");
+
+    let output = bliss_bin()
+        .args(["--load", file_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run bliss");
+
+    // Clean up
+    let _ = std::fs::remove_file(&file_path);
+    let _ = std::fs::remove_dir(&dir);
+
+    assert_eq!(output.status.code(), Some(0), "exit code should be 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("42"),
+        "--load should execute the file and print 42, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn load_nonexistent_file_fails() {
+    let output = bliss_bin()
+        .args(["--load", "/tmp/bliss_nonexistent_file_12345.lisp"])
+        .output()
+        .expect("failed to run bliss");
+    // Should exit with non-zero code or print an error
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.code() != Some(0) || stderr.contains("error") || stderr.contains("cannot"),
+        "loading nonexistent file should fail, exit={:?}, stderr='{}'",
+        output.status.code(),
+        stderr
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Script file execution (positional arg)
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn script_file_executes_and_exits() {
+    let dir = std::env::temp_dir().join("bliss_test_script");
+    let _ = std::fs::create_dir_all(&dir);
+    let file_path = dir.join("test_script.lisp");
+    std::fs::write(&file_path, "(print \"hello from script\")\n")
+        .expect("failed to write test file");
+
+    let output = bliss_bin()
+        .arg(file_path.to_str().unwrap())
+        .output()
+        .expect("failed to run bliss");
+
+    let _ = std::fs::remove_file(&file_path);
+    let _ = std::fs::remove_dir(&dir);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from script"),
+        "script should print its output, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn script_receives_cl_args() {
+    let dir = std::env::temp_dir().join("bliss_test_clargs");
+    let _ = std::fs::create_dir_all(&dir);
+    let file_path = dir.join("test_args.lisp");
+    // Script that prints *command-line-args*
+    std::fs::write(&file_path, "(print *command-line-args*)\n")
+        .expect("failed to write test file");
+
+    let output = bliss_bin()
+        .arg(file_path.to_str().unwrap())
+        .args(["--", "foo", "bar"])
+        .output()
+        .expect("failed to run bliss");
+
+    let _ = std::fs::remove_file(&file_path);
+    let _ = std::fs::remove_dir(&dir);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("foo") && stdout.contains("bar"),
+        "CL args should be accessible, got: '{}'",
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// REPL interaction
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn repl_evaluates_expression_and_prints_result() {
+    let mut child = bliss_bin()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bliss");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        stdin
+            .write_all(b"(+ 2 3)\n(quit)\n")
+            .expect("failed to write to stdin");
+    }
+
+    let output = child.wait_with_output().expect("failed to wait on bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains('5'),
+        "REPL should evaluate (+ 2 3) to 5, got stdout: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn repl_shows_prompt() {
+    let mut child = bliss_bin()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bliss");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        stdin
+            .write_all(b"(quit)\n")
+            .expect("failed to write to stdin");
+    }
+
+    let output = child.wait_with_output().expect("failed to wait on bliss");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("BLISS>") || stderr.contains("bliss>"),
+        "REPL should display a prompt, stderr: '{}'",
+        stderr
+    );
+}
+
+#[test]
+fn repl_exit_command_exits_cleanly() {
+    let mut child = bliss_bin()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bliss");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        stdin
+            .write_all(b"(exit)\n")
+            .expect("failed to write to stdin");
+    }
+
+    let output = child.wait_with_output().expect("failed to wait on bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "(exit) should cleanly exit with code 0"
+    );
+}
+
+#[test]
+fn repl_eof_exits_cleanly() {
+    let mut child = bliss_bin()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bliss");
+
+    // Close stdin immediately (EOF)
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait on bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "EOF on stdin should exit cleanly with code 0"
+    );
+}
+
+#[test]
+fn repl_defun_and_call() {
+    let mut child = bliss_bin()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bliss");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        stdin
+            .write_all(b"(defun square (x) (* x x))\n(square 7)\n(quit)\n")
+            .expect("failed to write to stdin");
+    }
+
+    let output = child.wait_with_output().expect("failed to wait on bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("49"),
+        "REPL should evaluate (square 7) to 49, got: '{}'",
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Error handling — bad flags / conflicts
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn unknown_flag_exits_nonzero() {
+    let output = bliss_bin()
+        .arg("--frobnicate")
+        .output()
+        .expect("failed to run bliss");
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "unknown flag should cause non-zero exit"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown") || stderr.contains("frobnicate"),
+        "error message should mention the bad flag, got: '{}'",
+        stderr
+    );
+}
+
+#[test]
+fn conflicting_image_no_image_exits_nonzero() {
+    let output = bliss_bin()
+        .args(["--image", "core.img", "--no-image"])
+        .output()
+        .expect("failed to run bliss");
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "--image + --no-image should fail"
+    );
+}
+
+#[test]
+fn eval_missing_value_exits_nonzero() {
+    let output = bliss_bin()
+        .arg("--eval")
+        .output()
+        .expect("failed to run bliss");
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "--eval without value should fail"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Bootstrap and sandbox modes
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn bootstrap_mode_starts_without_image() {
+    // --bootstrap --no-init should start without needing an image file
+    let mut child = bliss_bin()
+        .args(["--bootstrap"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bliss");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        stdin
+            .write_all(b"(quit)\n")
+            .expect("failed to write to stdin");
+    }
+
+    let output = child.wait_with_output().expect("failed to wait on bliss");
+    // Bootstrap mode should at least start up (even if reduced functionality)
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "bootstrap mode should start and exit cleanly"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Workers and heap-size runtime config
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn workers_flag_accepted() {
+    let mut child = bliss_bin()
+        .args(["--workers", "2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bliss");
+
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait on bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "--workers 2 should be accepted"
+    );
+}
+
+#[test]
+fn heap_size_flag_accepted() {
+    let mut child = bliss_bin()
+        .args(["--heap-size", "128M"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bliss");
+
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().expect("failed to wait on bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "--heap-size 128M should be accepted"
+    );
+}
