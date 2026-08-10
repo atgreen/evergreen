@@ -3,6 +3,7 @@
 //! Inspired by HotSpot C2 and Graal. See spec §4.3.
 
 use bliss_rt::value::BlissVal;
+use std::borrow::Borrow;
 use std::collections::HashMap;
 
 /// Unique identifier for an IR node within a graph.
@@ -135,13 +136,13 @@ impl IrGraph {
     }
 
     /// Get all input edges to a node.
-    pub fn inputs(&self, id: NodeId) -> &[Edge] {
-        self.inputs.get(&id).map(|v| v.as_slice()).unwrap_or(&[])
+    pub fn inputs(&self, id: impl Borrow<NodeId>) -> &[Edge] {
+        self.inputs.get(id.borrow()).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Get all output edges from a node.
-    pub fn uses(&self, id: NodeId) -> &[Edge] {
-        self.uses.get(&id).map(|v| v.as_slice()).unwrap_or(&[])
+    pub fn uses(&self, id: impl Borrow<NodeId>) -> &[Edge] {
+        self.uses.get(id.borrow()).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Get the Start node ID.
