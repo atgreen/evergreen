@@ -640,6 +640,29 @@ pub fn logical_pathname_translations(host: &str) -> Result<BlissVal, BlissError>
 
 // ── Filesystem operations ──────────────────────────────────────────
 
+/// Resolve a relative path by walking up parent directories from CWD.
+/// If the path exists as-is or is absolute, return it unchanged.
+/// Otherwise try prepending parent directory prefixes (../, ../../, etc.)
+/// to find the file. This handles Cargo workspace layouts where CWD is
+/// a crate subdirectory but paths are workspace-relative.
+fn resolve_relative_path(path_str: &str) -> String {
+    let path = std::path::Path::new(path_str);
+    if path.is_absolute() || path.exists() {
+        return path_str.to_string();
+    }
+    // Try walking up parent directories (up to 5 levels)
+    let mut prefix = std::path::PathBuf::from("..");
+    for _ in 0..5 {
+        let candidate = prefix.join(path_str);
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+        prefix = prefix.join("..");
+    }
+    // Return original if not found
+    path_str.to_string()
+}
+
 /// Extract a filesystem path string from a BlissVal.
 /// Tries the string registry first, then the pathname record's reconstructed path.
 fn extract_path_string(val: BlissVal) -> Result<String, BlissError> {
@@ -672,6 +695,7 @@ fn extract_path_string(val: BlissVal) -> Result<String, BlissError> {
 /// Probe whether a file exists (CL `PROBE-FILE`).
 pub fn probe_file(pathname: BlissVal) -> Result<Option<BlissVal>, BlissError> {
     let path_str = extract_path_string(pathname)?;
+    let path_str = resolve_relative_path(&path_str);
     let path = std::path::Path::new(&path_str);
     if path.exists() {
         let canon = path
@@ -687,6 +711,7 @@ pub fn probe_file(pathname: BlissVal) -> Result<Option<BlissVal>, BlissError> {
 /// Get the truename of a pathname (CL `TRUENAME`).
 pub fn truename(pathname: BlissVal) -> Result<BlissVal, BlissError> {
     let path_str = extract_path_string(pathname)?;
+    let path_str = resolve_relative_path(&path_str);
     let path = std::path::Path::new(&path_str);
     let canon = path
         .canonicalize()

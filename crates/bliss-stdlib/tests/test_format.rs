@@ -36,17 +36,32 @@ fn format_nil_string(control: &str, args: &[BlissVal]) -> String {
     bliss_string_to_rust(val)
 }
 
-/// Placeholder string extraction — will be backed by real implementation.
-/// Panics with `unimplemented` until the runtime is filled in (red phase).
-fn bliss_string_to_rust(_val: BlissVal) -> String {
-    // In the real implementation this would read the string data from the
-    // heap object.  For red-phase tests, the format() call above will
-    // already panic at `unimplemented!("format")`, so we never reach here.
-    // When format() is implemented, this must also be implemented to
-    // complete the test.
-    unimplemented!(
-        "bliss_string_to_rust: extract Rust String from a BlissVal string heap object"
-    )
+/// Extract a Rust `String` from a `BlissVal` simple-string heap object.
+///
+/// Mirrors the heap layout that bliss-stdlib's FORMAT produces —
+/// `[ObjectHeader (8 bytes)][length: u64 (8 bytes)][UTF-8 data...]` — after
+/// asserting the value really is a string-typed heap object.
+fn bliss_string_to_rust(val: BlissVal) -> String {
+    use bliss_rt::object::{type_id, ObjectHeader};
+
+    assert!(
+        val.is_heap_object(),
+        "expected a heap-allocated string value"
+    );
+    unsafe {
+        let ptr = val.as_ptr();
+        let header = *(ptr as *const ObjectHeader);
+        let tid = header.type_id();
+        assert!(
+            tid == type_id::SIMPLE_BASE_STRING
+                || tid == type_id::SIMPLE_CHARACTER_STRING,
+            "expected a simple string heap object, got type_id {:#x}",
+            tid
+        );
+        let length = *(ptr.add(8) as *const u64) as usize;
+        let bytes = std::slice::from_raw_parts(ptr.add(16), length);
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 // ── NewlineKind enum ──────────────────────────────────────────────

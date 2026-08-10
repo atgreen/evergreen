@@ -511,11 +511,12 @@ fn format_impl(
 
         match directive {
             'A' => {
+                // Resolve V/# params BEFORE consuming the main argument
+                let mincol = if !params.is_empty() { resolve_param(&params[0], 0, arg_idx)? as usize } else { 0 };
                 if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~A".into())); }
                 let val = args[*arg_idx]; *arg_idx += 1;
                 let s = if colon && val.is_nil() { "()".into() }
                         else { blissval_to_print_string(val, false) };
-                let mincol = if !params.is_empty() { resolve_param(&params[0], 0, arg_idx)? as usize } else { 0 };
                 if s.len() < mincol {
                     let pad = mincol - s.len();
                     if at_sign { for _ in 0..pad { output.push(' '); } output.push_str(&s); }
@@ -523,11 +524,12 @@ fn format_impl(
                 } else { output.push_str(&s); }
             }
             'S' => {
+                // Resolve V/# params BEFORE consuming the main argument
+                let mincol = if !params.is_empty() { resolve_param(&params[0], 0, arg_idx)? as usize } else { 0 };
                 if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~S".into())); }
                 let val = args[*arg_idx]; *arg_idx += 1;
                 let s = if colon && val.is_nil() { "()".into() }
                         else { blissval_to_print_string(val, true) };
-                let mincol = if !params.is_empty() { resolve_param(&params[0], 0, arg_idx)? as usize } else { 0 };
                 if s.len() < mincol {
                     let pad = mincol - s.len();
                     if at_sign { for _ in 0..pad { output.push(' '); } output.push_str(&s); }
@@ -535,25 +537,27 @@ fn format_impl(
                 } else { output.push_str(&s); }
             }
             'D' | 'B' | 'O' | 'X' => {
+                let radix = match directive { 'B'=>2, 'O'=>8, 'X'=>16, _=>10 };
+                // Resolve V/# params BEFORE consuming the main argument
+                let mincol = if !params.is_empty() { resolve_param(&params[0], 0, arg_idx)? as usize } else { 0 };
+                let padchar = if params.len() > 1 { resolve_param(&params[1], ' ' as i64, arg_idx)? as u8 as char } else { ' ' };
                 if *arg_idx >= args.len() { return Err(BlissError::Internal(format!("too few args for ~{}", directive))); }
                 let val = args[*arg_idx]; *arg_idx += 1;
                 if !val.is_fixnum() {
                     return Err(BlissError::TypeError { datum: val, expected: "integer".into() });
                 }
-                let radix = match directive { 'B'=>2, 'O'=>8, 'X'=>16, _=>10 };
-                let mincol = if !params.is_empty() { resolve_param(&params[0], 0, arg_idx)? as usize } else { 0 };
-                let padchar = if params.len() > 1 { resolve_param(&params[1], ' ' as i64, arg_idx)? as u8 as char } else { ' ' };
                 output.push_str(&format_integer(val.as_fixnum(), radix, colon, at_sign, mincol, padchar));
             }
             'R' => {
+                // Resolve V/# params BEFORE consuming the main argument
+                let radix_param = if !params.is_empty() { Some(resolve_param(&params[0], 10, arg_idx)? as u32) } else { None };
                 if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~R".into())); }
                 let val = args[*arg_idx]; *arg_idx += 1;
                 if !val.is_fixnum() {
                     return Err(BlissError::TypeError { datum: val, expected: "integer".into() });
                 }
                 let n = val.as_fixnum();
-                if !params.is_empty() {
-                    let radix = resolve_param(&params[0], 10, arg_idx)? as u32;
+                if let Some(radix) = radix_param {
                     output.push_str(&format_integer(n, radix, colon, at_sign, 0, ' '));
                 } else if colon && at_sign {
                     output.push_str(&to_roman(n, true));
@@ -676,10 +680,10 @@ fn format_impl(
                 }
             }
             'P' => {
-                // ~P: plural. ~:P backs up one arg first. Plain ~P consumes next arg.
-                if colon {
-                    if *arg_idx > 0 { *arg_idx -= 1; }
-                }
+                // ~P and ~:P both back up one arg, peek at it for the plural
+                // decision, then restore arg_idx (no net consumption).
+                // ~@P does the y/ies variant; plain ~P does s/empty.
+                if *arg_idx > 0 { *arg_idx -= 1; }
                 if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~P".into())); }
                 let val = args[*arg_idx]; *arg_idx += 1;
                 let is_one = val.is_fixnum() && val.as_fixnum() == 1;

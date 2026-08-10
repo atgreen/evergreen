@@ -31,7 +31,11 @@ fn make_string_val(s: &str) -> BlissVal {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    BlissVal::from_raw((h & !0b111) | 0b010)
+    let val = BlissVal::from_raw((h & !0b111) | 0b010);
+    // Register the string content so the implementation can extract it
+    // for parsing and filesystem operations.
+    register_string(val, s);
+    val
 }
 
 /// Make a keyword-style BlissVal (symbol-index tag 101).
