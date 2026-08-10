@@ -70,15 +70,17 @@ Source lives in `crates/bliss-rt/src/` (see §0 directory map).
 Steps 1–3 target < 5 ms total; step 5 is bounded by
 `pthread_create` latency.
 
-**Image load cost model (step 4):** The `.bimg` format uses
-position-independent tagged values (heap offsets, not absolute
-pointers). This makes step 4 a true O(1) `mmap` — no relocation
-pass is required, and pages are populated on demand by the OS.
-The symbol table and package registry are reconstructed from
-offset-based indices embedded in the image header, which is a
-small fixed-size read (< 4 KiB). This design ensures cold-start
-image load is dominated by kernel `mmap` setup (< 1 ms), well
-within the R2.01 50 ms budget.
+**Image load cost model (step 4):** The `.bimg` format stores
+absolute heap pointers.  Step 4 `mmap`s the heap section and, if the
+mapped base differs from `original_base` recorded in the image header,
+executes an O(n) pointer relocation pass (A7.01, §7.2.10) over the
+relocation table.  When the OS maps the image at the original base
+(the common case), relocation is skipped and load is a near-O(1)
+`mmap`.  The symbol table and package registry are stored as separate
+image sections (§7.2.7, §7.2.8) and are read via fixed-size directory
+entries.  Under typical conditions (no relocation, 64 MB image) the
+cold-start image load completes in < 50 ms (R7.02), well within the
+R2.01 budget.
 
 ### 2.2.1 Bootstrap vs Image Boot
 
@@ -470,7 +472,8 @@ declaration. Hand-rolled stubs avoid the ~50 ns overhead of
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BLISS_HEAP_SIZE` | `512m` | Initial old-gen heap reservation |
-| `BLISS_NURSERY_SIZE` | `2m` | Per-thread nursery (TLAB) size |
+| `BLISS_TLAB_SIZE` | `2m` | Per-thread TLAB size (§3.2.2, `--tlab-size`) |
+| `BLISS_NURSERY_SIZE` | `64m` | Total nursery region pool (§3.2.2, `--nursery-size`) |
 | `BLISS_STACK_SIZE` | `512k` | CL stack size per green thread |
 | `BLISS_WORKERS` | `nproc` | OS worker thread count |
 | `BLISS_IMAGE` | `bliss.bimg` | Path to boot image |

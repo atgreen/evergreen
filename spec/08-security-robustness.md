@@ -431,16 +431,16 @@ Every `.bimg` image file includes:
 | Magic number | 8 bytes | `BLISSIMG` ASCII |
 | Version | 4 bytes | Image format version |
 | Platform tag | 8 bytes | Architecture + OS hash |
-| Heap checksum | 32 bytes | BLAKE3 hash of the heap region |
-| Code checksum | 32 bytes | BLAKE3 hash of the compiled-code region |
+| Heap checksum | 32 bytes | SHA-256 hash of the heap region |
+| Code checksum | 32 bytes | SHA-256 hash of the compiled-code region |
 | Total size | 8 bytes | Expected file size |
 
 On load:
 
 1. Verify magic number and version.
 2. Verify file size matches `total_size`.
-3. Compute BLAKE3 of heap and code regions and compare against stored
-   checksums.
+3. Compute SHA-256 of heap and code regions and compare against stored
+   checksums (consistent with the image header checksum at §7.2.3).
 4. Reject with `BLISS-EXT:CORRUPT-IMAGE-ERROR` on mismatch.
 
 ### 8.9.2  Graceful Handling of Corrupted Images

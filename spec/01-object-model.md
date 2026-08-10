@@ -94,20 +94,24 @@ exception — they carry no header to save space (R1.13).
 | Field | Bits | Description |
 |-------|------|-------------|
 | `type_id` | 63:56 | Discriminator for the heap type (see §1.3.1). Up to 256 types. |
-| `gc_bits` | 55:48 | GC mark bits (2), forwarding flag (1), pinned (1), remembered-set (1), reserved (3). See §3. |
+| `gc_bits` | 55:48 | Structural GC flags: forwarding (1), pinned (1), remembered-set (1), reserved (5). Written only during STW phases. **Note:** marking state (mark-white/black, mark-grey) is tracked in the global mark bitmap (§3.4, R3.17), not in these header bits. See §3. |
 | `hash` | 47:16 | 32-bit identity-hash cache. Zero means "not yet computed." Lazily filled on first `SXHASH` call (R1.19). 32 bits provides ~4 billion distinct hashes, sufficient to avoid excessive collisions in EQ-based hash tables even with millions of live objects. |
-| `size` | 15:0 | Object size in 8-byte units including header. Max inline size = 65 535 × 8 = 524 280 bytes. Objects exceeding this use a **large-object extension**: the `size` field is set to `0xFFFF` (sentinel), and the true 64-bit byte size is stored as a `u64` immediately following the header at offset 8, with the object's payload beginning at offset 16 instead of offset 8. Large objects (≥ 512 KiB) are allocated directly in the old generation per `BLISS_LARGE_OBJECT_THRESHOLD` (§1.21). |
+| `size` | 15:0 | Object size in 8-byte units including header. Max inline size = 65 535 × 8 = 524 280 bytes. Objects exceeding this use a **large-object extension**: the `size` field is set to `0xFFFF` (sentinel), and the true 64-bit byte size is stored as a `u64` immediately following the header at offset 8, with the object's payload beginning at offset 16 instead of offset 8. Objects exceeding `region_size / 2` (default 1 MB with a 2 MB region) are allocated directly in large-object regions (§3.2.5). |
 
 ### 1.3.1  GC Bits Layout
 
 ```text
-Bit 55: mark-white / mark-black (tri-colour: toggled each GC cycle)
-Bit 54: mark-grey (in concurrent mark worklist)
+Bits 55:54: reserved (MUST be zero; mark state lives in side-table bitmap, §3.4)
 Bit 53: forwarded (object has been evacuated; rest of object = forwarding address)
 Bit 52: pinned (object must not be moved)
 Bit 51: remembered (in remembered-set for generational barrier)
 Bits 50:48: reserved for future use (MUST be zero)
 ```
+
+> **Design note:** Marking bits (white/black/grey) are intentionally
+> excluded from the object header to avoid data races between concurrent
+> marking threads and mutator field writes (R3.17).  The global mark
+> bitmap (§3.4) provides the authoritative marking state.
 
 ### 1.3.2  Heap Type IDs
 
@@ -802,7 +806,7 @@ non-recoverable runtime error.
 | `BLISS_SYMBOL_TABLE_INIT` | 8192 | Initial symbol table capacity |
 | `BLISS_HASH_TABLE_DEFAULT_SIZE` | 16 | Default bucket count for `MAKE-HASH-TABLE` |
 | `BLISS_CONS_PAGE_SIZE` | 2 MiB | Size of cons-only allocation pages |
-| `BLISS_LARGE_OBJECT_THRESHOLD` | 8 KiB | Objects above this go directly to old-gen |
+| `BLISS_LARGE_OBJECT_THRESHOLD` | `region_size / 2` (1 MB) | Objects above this go to large-object regions (§3.2.5). Derived from region size; not directly settable. |
 
 ---
 

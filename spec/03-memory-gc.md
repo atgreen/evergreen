@@ -30,7 +30,7 @@ knobs.
 | R3.14 | All GC activity MUST respect safepoints; mutator threads MUST NOT be suspended via asynchronous signals (e.g. `SIGUSR1`). Safepoint polling MAY use a synchronous page-fault trap (`mprotect` / `SIGSEGV`) initiated by the thread itself. | MUST |
 | R3.15 | Heap size, nursery size, pause-time target, and promotion threshold MUST be configurable at startup. | MUST |
 | R3.16 | The GC MUST maintain a consistent heap even if a finalizer signals a CL condition; finalizer errors MUST NOT corrupt GC state. | MUST |
-| R3.17 | GC metadata (mark bits, region headers) MUST reside in side tables, not in object headers, to allow concurrent access without racing with mutator field writes. | MUST |
+| R3.17 | GC marking state (mark-white/black, mark-grey) MUST be tracked in side tables (the global mark bitmap, §3.4), not in object headers, to allow concurrent marking without racing with mutator field writes.  Structural GC bits that are only written by stop-the-world phases (forwarded, pinned, remembered-set) MAY reside in the `ObjectHeader.gc_bits` field (D1.02, §1.3.1). | MUST |
 | R3.18 | The GC MUST support heap walking for image serialisation (§7) and debugging (§6). | MUST |
 | R3.19 | Large-object regions MUST NOT be moved; they are freed in bulk when unmarked. | MUST |
 | R3.20 | The runtime SHOULD provide GC statistics (pause times, bytes promoted, regions evacuated) via an introspection API (§6). | SHOULD |
