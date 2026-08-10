@@ -9,6 +9,7 @@ use crate::value::BlissVal;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Runtime configuration parsed from env vars and CLI flags.
 /// See §2.8 of the spec.
@@ -421,6 +422,9 @@ struct BootstrapStore {
 struct BootLambda {
     params: Vec<String>,
     body: SExpr,
+    /// Captured lexical environment (flattened vars and fns at definition time).
+    captured_vars: HashMap<String, BlissVal>,
+    captured_fns: HashMap<String, (Vec<String>, SExpr)>,
 }
 
 impl BootstrapStore {
@@ -506,21 +510,26 @@ fn boot_make_string(s: &str) -> BlissVal {
     })
 }
 
-fn boot_make_lambda(params: Vec<String>, body: SExpr) -> BlissVal {
+fn boot_make_lambda(
+    params: Vec<String>,
+    body: SExpr,
+    captured_vars: HashMap<String, BlissVal>,
+    captured_fns: HashMap<String, (Vec<String>, SExpr)>,
+) -> BlissVal {
     BOOT_STORE.with(|store| {
         let mut s = store.borrow_mut();
         let id = s.lambda_counter;
         s.lambda_counter += 1;
-        s.lambdas.insert(id, BootLambda { params, body });
+        s.lambdas.insert(id, BootLambda { params, body, captured_vars, captured_fns });
         BlissVal((id << 3) | crate::value::TAG_FUNCTION)
     })
 }
 
-fn boot_get_lambda(val: BlissVal) -> Option<(Vec<String>, SExpr)> {
+fn boot_get_lambda(val: BlissVal) -> Option<BootLambda> {
     if val.tag() != crate::value::TAG_FUNCTION { return None; }
     let id = val.0 >> 3;
     BOOT_STORE.with(|store| {
-        store.borrow().lambdas.get(&id).map(|l| (l.params.clone(), l.body.clone()))
+        store.borrow().lambdas.get(&id).cloned()
     })
 }
 
@@ -538,10 +547,11 @@ enum SExpr {
 }
 
 /// Bootstrap evaluation environment with lexical bindings and function defs.
+/// Uses Rc-shared parent pointers to avoid O(depth²) deep cloning.
 struct BootEnv {
     vars: HashMap<String, BlissVal>,
     fns: HashMap<String, (Vec<String>, SExpr)>,
-    parent: Option<Box<BootEnv>>,
+    parent: Option<Rc<BootEnv>>,
 }
 
 impl BootEnv {
@@ -549,21 +559,61 @@ impl BootEnv {
         BootEnv { vars: HashMap::new(), fns: HashMap::new(), parent: None }
     }
 
-    fn child(&self) -> BootEnv {
-        // Full clone: child sees entire parent chain via lookup
+    /// Create a child environment from a mutable reference by snapshotting
+    /// the current env into an Rc and creating a new child.
+    fn child_from_mut(env: &BootEnv) -> BootEnv {
+        let snapshot = Rc::new(BootEnv {
+            vars: env.vars.clone(),
+            fns: env.fns.clone(),
+            parent: env.parent.clone(),
+        });
         BootEnv {
             vars: HashMap::new(),
             fns: HashMap::new(),
-            parent: Some(Box::new(self.deep_clone())),
+            parent: Some(snapshot),
         }
     }
 
-    fn deep_clone(&self) -> BootEnv {
+    /// Create a child environment from captured closure variables.
+    fn child_from_captured(
+        captured_vars: &HashMap<String, BlissVal>,
+        captured_fns: &HashMap<String, (Vec<String>, SExpr)>,
+    ) -> BootEnv {
+        let snapshot = Rc::new(BootEnv {
+            vars: captured_vars.clone(),
+            fns: captured_fns.clone(),
+            parent: None,
+        });
         BootEnv {
-            vars: self.vars.clone(),
-            fns: self.fns.clone(),
-            parent: self.parent.as_ref().map(|p| Box::new(p.deep_clone())),
+            vars: HashMap::new(),
+            fns: HashMap::new(),
+            parent: Some(snapshot),
         }
+    }
+
+    /// Flatten all visible variables into a single HashMap (for closure capture).
+    fn flatten_vars(&self) -> HashMap<String, BlissVal> {
+        let mut result = HashMap::new();
+        // Walk parent chain first so inner scopes shadow outer
+        if let Some(ref p) = self.parent {
+            result = p.flatten_vars();
+        }
+        for (k, v) in &self.vars {
+            result.insert(k.clone(), *v);
+        }
+        result
+    }
+
+    /// Flatten all visible function definitions (for closure capture).
+    fn flatten_fns(&self) -> HashMap<String, (Vec<String>, SExpr)> {
+        let mut result = HashMap::new();
+        if let Some(ref p) = self.parent {
+            result = p.flatten_fns();
+        }
+        for (k, v) in &self.fns {
+            result.insert(k.clone(), v.clone());
+        }
+        result
     }
 
     fn lookup(&self, name: &str) -> Option<BlissVal> {
@@ -602,6 +652,11 @@ fn tokenize(input: &str) -> Vec<String> {
             '(' => { tokens.push("(".into()); i += 1; }
             ')' => { tokens.push(")".into()); i += 1; }
             '\'' => { tokens.push("'".into()); i += 1; }
+            '#' if i + 1 < chars.len() && chars[i + 1] == '\'' => {
+                // #'name → (FUNCTION name)
+                tokens.push("#'".into());
+                i += 2;
+            }
             '"' => {
                 let mut s = String::new();
                 i += 1;
@@ -657,6 +712,10 @@ fn parse_sexpr(tokens: &[String], pos: usize) -> Result<(SExpr, usize), String> 
         "'" => {
             let (expr, next) = parse_sexpr(tokens, pos + 1)?;
             Ok((SExpr::List(vec![SExpr::Symbol("QUOTE".into()), expr]), next))
+        }
+        "#'" => {
+            let (expr, next) = parse_sexpr(tokens, pos + 1)?;
+            Ok((SExpr::List(vec![SExpr::Symbol("FUNCTION".into()), expr]), next))
         }
         tok => {
             // String literal
@@ -761,7 +820,10 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
                             progn.extend_from_slice(&elems[2..]);
                             SExpr::List(progn)
                         };
-                        return Ok(boot_make_lambda(params, body));
+                        // Capture the lexical environment at definition time (closure)
+                        let captured_vars = env.flatten_vars();
+                        let captured_fns = env.flatten_fns();
+                        return Ok(boot_make_lambda(params, body, captured_vars, captured_fns));
                     }
                     "+" => return eval_arith(elems, env, ArithOp::Add),
                     "-" => return eval_arith(elems, env, ArithOp::Sub),
@@ -783,12 +845,92 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
                     "AND" => return eval_and(elems, env),
                     "OR" => return eval_or(elems, env),
                     "COND" => return eval_cond(elems, env),
-                    "PRINT" | "PRINC" | "WRITE" => {
-                        // Bootstrap print: evaluate arg, return it
+                    "PRINT" => {
+                        // (print obj) — output a newline, then obj with escapes, then a space
                         if elems.len() >= 2 {
-                            return eval_sexpr(&elems[1], env);
+                            let val = eval_sexpr(&elems[1], env)?;
+                            let repr = boot_print_val(val, true);
+                            print!("\n{} ", repr);
+                            return Ok(val);
                         }
                         return Ok(crate::value::NIL);
+                    }
+                    "PRINC" => {
+                        // (princ obj) — output obj without escapes
+                        if elems.len() >= 2 {
+                            let val = eval_sexpr(&elems[1], env)?;
+                            let repr = boot_print_val(val, false);
+                            print!("{}", repr);
+                            return Ok(val);
+                        }
+                        return Ok(crate::value::NIL);
+                    }
+                    "WRITE" => {
+                        // (write obj) — output obj with escapes
+                        if elems.len() >= 2 {
+                            let val = eval_sexpr(&elems[1], env)?;
+                            let repr = boot_print_val(val, true);
+                            print!("{}", repr);
+                            return Ok(val);
+                        }
+                        return Ok(crate::value::NIL);
+                    }
+                    "FUNCTION" => {
+                        // (function name) — look up a named function and return it as a lambda value
+                        if elems.len() < 2 {
+                            return Err(BlissError::Internal("FUNCTION requires an argument".into()));
+                        }
+                        match &elems[1] {
+                            SExpr::Symbol(fname) => {
+                                if let Some((params, body)) = env.lookup_fn(fname) {
+                                    let captured_vars = env.flatten_vars();
+                                    let captured_fns = env.flatten_fns();
+                                    return Ok(boot_make_lambda(params, body, captured_vars, captured_fns));
+                                }
+                                // Check for built-in functions
+                                return Ok(boot_intern_builtin(fname));
+                            }
+                            SExpr::List(_inner) => {
+                                // (function (lambda (params) body))
+                                return eval_sexpr(&elems[1], env);
+                            }
+                            _ => return Err(BlissError::Internal("FUNCTION: invalid argument".into())),
+                        }
+                    }
+                    "FUNCALL" => {
+                        // (funcall fn arg1 arg2 ...)
+                        if elems.len() < 2 {
+                            return Err(BlissError::Internal("FUNCALL requires at least a function argument".into()));
+                        }
+                        let func_val = eval_sexpr(&elems[1], env)?;
+                        return eval_lambda_call(func_val, &elems[2..], env);
+                    }
+                    "APPLY" => {
+                        // (apply fn arg1 ... argN list)
+                        if elems.len() < 3 {
+                            return Err(BlissError::Internal("APPLY requires a function and at least one argument".into()));
+                        }
+                        let func_val = eval_sexpr(&elems[1], env)?;
+                        // Evaluate all args except the last normally; the last must be a list
+                        let mut evaled_args = Vec::new();
+                        for a in &elems[2..elems.len()-1] {
+                            evaled_args.push(eval_sexpr(a, env)?);
+                        }
+                        // Last arg: evaluate it, then spread the list
+                        let last = eval_sexpr(&elems[elems.len()-1], env)?;
+                        // Walk the cons list and append each element
+                        let mut cur = last;
+                        while !cur.is_nil() {
+                            if cur.is_cons() {
+                                evaled_args.push(boot_car(cur));
+                                cur = boot_cdr(cur);
+                            } else {
+                                // Dotted list or atom — just push it
+                                evaled_args.push(cur);
+                                break;
+                            }
+                        }
+                        return eval_lambda_call_with_vals(func_val, &evaled_args, env);
                     }
                     _ => {
                         // User-defined function call
@@ -803,25 +945,7 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
             // Non-symbol in function position — check for lambda call
             // e.g. ((lambda (x) (+ x 1)) 5)
             let func_val = eval_sexpr(&elems[0], env)?;
-            if let Some((params, body)) = boot_get_lambda(func_val) {
-                let mut child = env.child();
-                let mut evaled_args = Vec::new();
-                for a in &elems[1..] {
-                    evaled_args.push(eval_sexpr(a, env)?);
-                }
-                for (i, p) in params.iter().enumerate() {
-                    let val = evaled_args.get(i).copied().unwrap_or(crate::value::NIL);
-                    child.vars.insert(p.clone(), val);
-                }
-                let result = eval_sexpr(&body, &mut child)?;
-                // Propagate function definitions back
-                for (k, v) in child.fns.drain() {
-                    env.fns.insert(k, v);
-                }
-                Ok(result)
-            } else {
-                Err(BlissError::Internal(format!("invalid function call: not a function")))
-            }
+            eval_lambda_call(func_val, &elems[1..], env)
         }
     }
 }
@@ -854,7 +978,7 @@ fn eval_progn(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError
 fn eval_let(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     // (let ((var1 val1) (var2 val2) ...) body...)
     if elems.len() < 2 { return Ok(crate::value::NIL); }
-    let mut child = env.child();
+    let mut child = BootEnv::child_from_mut(env);
     if let SExpr::List(bindings) = &elems[1] {
         for b in bindings {
             match b {
@@ -934,7 +1058,13 @@ fn eval_arith(elems: &[SExpr], env: &mut BootEnv, op: ArithOp) -> Result<BlissVa
             ArithOp::Sub | ArithOp::Div => 0,
         }));
     }
-    let mut acc = if args[0].is_fixnum() { args[0].as_fixnum() } else { 0 };
+    if !args[0].is_fixnum() {
+        return Err(BlissError::TypeError {
+            datum: args[0],
+            expected: "number".into(),
+        });
+    }
+    let mut acc = args[0].as_fixnum();
     if args.len() == 1 {
         return Ok(match op {
             ArithOp::Sub => BlissVal::from_fixnum(-acc),
@@ -942,7 +1072,13 @@ fn eval_arith(elems: &[SExpr], env: &mut BootEnv, op: ArithOp) -> Result<BlissVa
         });
     }
     for a in &args[1..] {
-        let n = if a.is_fixnum() { a.as_fixnum() } else { 0 };
+        if !a.is_fixnum() {
+            return Err(BlissError::TypeError {
+                datum: *a,
+                expected: "number".into(),
+            });
+        }
+        let n = a.as_fixnum();
         acc = match op {
             ArithOp::Add => acc.wrapping_add(n),
             ArithOp::Sub => acc.wrapping_sub(n),
@@ -1090,7 +1226,7 @@ fn eval_funcall(
     args: &[SExpr],
     env: &mut BootEnv,
 ) -> Result<BlissVal, BlissError> {
-    let mut child = env.child();
+    let mut child = BootEnv::child_from_mut(env);
     // Evaluate arguments in the caller's environment
     let mut evaled_args = Vec::new();
     for a in args {
@@ -1107,4 +1243,209 @@ fn eval_funcall(
         env.fns.insert(k, v);
     }
     Ok(result)
+}
+
+/// Call a lambda/closure value with unevaluated argument s-expressions.
+/// Evaluates args in the caller's env, then invokes the closure in its captured env.
+fn eval_lambda_call(func_val: BlissVal, arg_exprs: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
+    // Check for built-in function symbols first
+    if let Some(builtin_name) = boot_builtin_name(func_val) {
+        return eval_builtin_call(&builtin_name, arg_exprs, env);
+    }
+    if boot_get_lambda(func_val).is_some() {
+        let mut evaled_args = Vec::new();
+        for a in arg_exprs {
+            evaled_args.push(eval_sexpr(a, env)?);
+        }
+        eval_lambda_call_with_vals(func_val, &evaled_args, env)
+    } else {
+        Err(BlissError::Internal("invalid function call: not a function".into()))
+    }
+}
+
+/// Call a lambda/closure value with already-evaluated argument values.
+fn eval_lambda_call_with_vals(func_val: BlissVal, args: &[BlissVal], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
+    // Check for built-in function symbols first
+    if let Some(builtin_name) = boot_builtin_name(func_val) {
+        return eval_builtin_call_with_vals(&builtin_name, args, env);
+    }
+    if let Some(lam) = boot_get_lambda(func_val) {
+        // Create child environment from the closure's captured environment
+        let mut child = BootEnv::child_from_captured(&lam.captured_vars, &lam.captured_fns);
+        for (i, p) in lam.params.iter().enumerate() {
+            let val = args.get(i).copied().unwrap_or(crate::value::NIL);
+            child.vars.insert(p.clone(), val);
+        }
+        let result = eval_sexpr(&lam.body, &mut child)?;
+        // Propagate function definitions back
+        for (k, v) in child.fns.drain() {
+            env.fns.insert(k, v);
+        }
+        Ok(result)
+    } else {
+        Err(BlissError::Internal("invalid function call: not a function".into()))
+    }
+}
+
+/// Bootstrap print: format a BlissVal as a string for output.
+/// If `escape` is true, strings are printed with quotes (like PRINT/WRITE).
+fn boot_print_val(val: BlissVal, escape: bool) -> String {
+    if val.is_nil() {
+        return "NIL".to_string();
+    }
+    if val == crate::value::T {
+        return "T".to_string();
+    }
+    if val.is_fixnum() {
+        return format!("{}", val.as_fixnum());
+    }
+    if val.is_single_float() {
+        return format!("{}", val.as_single_float());
+    }
+    if val.tag() == crate::value::TAG_SYMBOL {
+        if let Some(name) = boot_symbol_name(val) {
+            return name;
+        }
+        return format!("#<SYMBOL {}>", val.as_symbol_index());
+    }
+    if val.tag() == crate::value::TAG_HEAP_OBJECT {
+        // Might be a bootstrap string
+        let id = val.0 >> 3;
+        let s = BOOT_STORE.with(|store| {
+            store.borrow().strings.get(&id).cloned()
+        });
+        if let Some(s) = s {
+            return if escape { format!("\"{}\"", s) } else { s };
+        }
+        return format!("#<HEAP-OBJECT {:#x}>", val.0);
+    }
+    if val.is_cons() {
+        let mut parts = Vec::new();
+        let mut cur = val;
+        while cur.is_cons() && !cur.is_nil() {
+            parts.push(boot_print_val(boot_car(cur), escape));
+            cur = boot_cdr(cur);
+        }
+        if cur.is_nil() {
+            return format!("({})", parts.join(" "));
+        } else {
+            return format!("({} . {})", parts.join(" "), boot_print_val(cur, escape));
+        }
+    }
+    if val.tag() == crate::value::TAG_FUNCTION {
+        return format!("#<FUNCTION>");
+    }
+    format!("#<UNKNOWN {:#x}>", val.0)
+}
+
+/// Map of built-in function names to unique tag values for FUNCALL/APPLY.
+/// We use symbol values to represent built-in functions referenced via #'name.
+fn boot_intern_builtin(name: &str) -> BlissVal {
+    // Reuse the symbol interning — when funcall'd, we check for known builtins
+    boot_intern(&format!("__BUILTIN_{}", name))
+}
+
+/// Check if a value is a built-in function reference and return its name.
+fn boot_builtin_name(val: BlissVal) -> Option<String> {
+    if let Some(name) = boot_symbol_name(val) {
+        if let Some(stripped) = name.strip_prefix("__BUILTIN_") {
+            return Some(stripped.to_string());
+        }
+    }
+    None
+}
+
+/// Call a built-in function by name with unevaluated args.
+fn eval_builtin_call(name: &str, arg_exprs: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
+    let mut evaled = Vec::new();
+    for a in arg_exprs {
+        evaled.push(eval_sexpr(a, env)?);
+    }
+    eval_builtin_call_with_vals(name, &evaled, env)
+}
+
+/// Call a built-in function by name with already-evaluated args.
+fn eval_builtin_call_with_vals(name: &str, args: &[BlissVal], _env: &mut BootEnv) -> Result<BlissVal, BlissError> {
+    match name {
+        "+" => arith_builtin(args, ArithOp::Add),
+        "-" => arith_builtin(args, ArithOp::Sub),
+        "*" => arith_builtin(args, ArithOp::Mul),
+        "/" => arith_builtin(args, ArithOp::Div),
+        "CONS" => {
+            if args.len() < 2 { return Ok(crate::value::NIL); }
+            Ok(boot_cons(args[0], args[1]))
+        }
+        "CAR" | "FIRST" => {
+            if args.is_empty() { return Ok(crate::value::NIL); }
+            Ok(boot_car(args[0]))
+        }
+        "CDR" | "REST" => {
+            if args.is_empty() { return Ok(crate::value::NIL); }
+            Ok(boot_cdr(args[0]))
+        }
+        "LIST" => {
+            let mut result = crate::value::NIL;
+            for v in args.iter().rev() {
+                result = boot_cons(*v, result);
+            }
+            Ok(result)
+        }
+        "EQ" => {
+            if args.len() < 2 { return Ok(crate::value::T); }
+            Ok(if args[0].0 == args[1].0 { crate::value::T } else { crate::value::NIL })
+        }
+        "EQL" | "=" => {
+            if args.len() < 2 { return Ok(crate::value::T); }
+            Ok(if args[0] == args[1] { crate::value::T } else { crate::value::NIL })
+        }
+        "NULL" | "NOT" => {
+            if args.is_empty() { return Ok(crate::value::T); }
+            Ok(if args[0].is_nil() { crate::value::T } else { crate::value::NIL })
+        }
+        _ => Err(BlissError::Internal(format!("undefined function: {}", name))),
+    }
+}
+
+/// Arithmetic on pre-evaluated BlissVal args (for built-in funcall/apply).
+fn arith_builtin(args: &[BlissVal], op: ArithOp) -> Result<BlissVal, BlissError> {
+    if args.is_empty() {
+        return Ok(BlissVal::from_fixnum(match op {
+            ArithOp::Add => 0, ArithOp::Mul => 1,
+            ArithOp::Sub | ArithOp::Div => 0,
+        }));
+    }
+    if !args[0].is_fixnum() {
+        return Err(BlissError::TypeError {
+            datum: args[0],
+            expected: "number".into(),
+        });
+    }
+    let mut acc = args[0].as_fixnum();
+    if args.len() == 1 {
+        return Ok(match op {
+            ArithOp::Sub => BlissVal::from_fixnum(-acc),
+            _ => args[0],
+        });
+    }
+    for a in &args[1..] {
+        if !a.is_fixnum() {
+            return Err(BlissError::TypeError {
+                datum: *a,
+                expected: "number".into(),
+            });
+        }
+        let n = a.as_fixnum();
+        acc = match op {
+            ArithOp::Add => acc.wrapping_add(n),
+            ArithOp::Sub => acc.wrapping_sub(n),
+            ArithOp::Mul => acc.wrapping_mul(n),
+            ArithOp::Div => {
+                if n == 0 {
+                    return Err(BlissError::ArithmeticError("division by zero".into()));
+                }
+                acc / n
+            }
+        };
+    }
+    Ok(BlissVal::from_fixnum(acc))
 }
