@@ -5,6 +5,8 @@
 use crate::error::BlissError;
 use crate::value::BlissVal;
 
+use std::sync::{Mutex, OnceLock};
+
 // ── Region model ───────────────────────────────────────────────────
 
 /// The kind of a heap region.
@@ -156,6 +158,19 @@ pub struct GcConfig {
     pub old_occupancy_trigger: f64,
 }
 
+/// Bootstrap heap state — stores the GC configuration so that stats
+/// and other queries can report capacity values after initialization.
+struct HeapState {
+    config: GcConfig,
+    stats: GcStats,
+}
+
+/// Global heap state, initialized by `init_heap`.
+fn heap_state() -> &'static Mutex<Option<HeapState>> {
+    static STATE: OnceLock<Mutex<Option<HeapState>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
 /// Initialize the GC heap. Called once during runtime startup.
 /// Validates configuration and sets up the region-based heap structure.
 pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
@@ -171,10 +186,34 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     if config.region_size == 0 {
         return Err(BlissError::Internal("region_size must be non-zero".into()));
     }
-    if config.tlab_size > config.region_size {
-        return Err(BlissError::Internal("tlab_size exceeds region_size".into()));
+    if config.tlab_size == 0 || (config.tlab_size & (config.tlab_size - 1)) != 0 {
+        return Err(BlissError::Internal("tlab_size must be a power of two".into()));
     }
+
+    let regions_total = (config.heap_size / config.region_size) as u32;
+    let mut stats = GcStats::default();
+    stats.nursery_capacity = config.nursery_size as u64;
+    stats.old_gen_capacity = (config.heap_size - config.nursery_size) as u64;
+    stats.regions_total = regions_total;
+    stats.regions_free = regions_total;
+
+    let state = HeapState {
+        config: config.clone(),
+        stats,
+    };
+    *heap_state().lock().unwrap() = Some(state);
+
     Ok(())
+}
+
+/// Query the current heap stats. Returns default (zeroed) stats if the
+/// heap has not been initialized yet.
+pub fn heap_stats() -> GcStats {
+    let guard = heap_state().lock().unwrap();
+    match &*guard {
+        Some(state) => state.stats.clone(),
+        None => GcStats::default(),
+    }
 }
 
 /// Walk all live heap objects. Used for image serialisation and debugging.
