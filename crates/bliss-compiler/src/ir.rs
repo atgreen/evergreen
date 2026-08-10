@@ -212,6 +212,16 @@ impl IrGraph {
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
+
+    /// Check whether a node with the given ID exists in the graph.
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.nodes.contains_key(&id)
+    }
+
+    /// Return an iterator over all node IDs currently in the graph.
+    pub fn node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes.keys().copied()
+    }
 }
 
 // ── IR builder ─────────────────────────────────────────────────────

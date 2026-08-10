@@ -28,7 +28,7 @@ fn graph_with_constant() -> IrGraph {
 fn pass_names() {
     assert_eq!(TypePropagation.name(), "type-propagation");
     assert_eq!(ConstantFolding.name(), "constant-folding");
-    assert_eq!(Inlining { config: InliningConfig { budget: 50, max_depth: 5 } }.name(), "inlining");
+    assert_eq!(Inlining { config: InliningConfig { budget: 50, max_depth: 5, small_threshold: 30 }, registry: FunctionRegistry::new() }.name(), "inlining");
     assert_eq!(EscapeAnalysis.name(), "escape-analysis");
     assert_eq!(Licm.name(), "licm");
     assert_eq!(StrengthReduction.name(), "strength-reduction");
@@ -56,7 +56,7 @@ fn constant_folding_run_on_constant_graph() {
 
 #[test]
 fn inlining_zero_budget_no_changes() {
-    let mut pass = Inlining { config: InliningConfig { budget: 0, max_depth: 0 } };
+    let mut pass = Inlining { config: InliningConfig { budget: 0, max_depth: 0, small_threshold: 30 }, registry: FunctionRegistry::new() };
     let mut g = minimal_graph();
     let changed = pass.run(&mut g).expect("inlining should succeed on minimal graph");
     assert!(!changed, "inlining with zero budget should make no changes");
@@ -253,7 +253,7 @@ fn pass_manager_handles_redundant_loads() {
 
 #[test]
 fn inlining_config_values() {
-    let c = InliningConfig { budget: 100, max_depth: 10 };
+    let c = InliningConfig { budget: 100, max_depth: 10, small_threshold: 30 };
     assert_eq!(c.budget, 100);
     assert_eq!(c.max_depth, 10);
 }
