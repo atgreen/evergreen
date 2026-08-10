@@ -128,12 +128,11 @@ D4.08 — Type Lattice
 | `⊥` (`nil`) | Bottom — no value can inhabit this type | Indicates unreachable code |
 
 **Meet** (`∧`, `type-intersection`): greatest lower bound — the most
-specific type that is a supertype of both operands. Used at merge
-points (φ-nodes).
+specific type that is a subtype of (or equal to) both operands.
 
 **Join** (`∨`, `type-union`): least upper bound — the most general
-type that is a subtype of both operands. Used rarely; meet is the
-primary merge operation at control-flow joins.
+type that is a supertype of (or equal to) both operands. Used at
+merge points (φ-nodes) where incoming alternatives are combined.
 
 Rules:
 
@@ -172,7 +171,7 @@ Algorithm: TypePropagation(IR)
 | `Arg(i)` with declared type τ | τ |
 | `Add(a, b)` | `numeric-contagion(type(a), type(b))` — follows CL rules (§12.1) |
 | `TypeCheck(v, τ)` | On true-branch: `meet(type(v), τ)`. On false-branch: `type-difference(type(v), τ)` |
-| `Phi(v₁, v₂, …)` | `meet(type(v₁), type(v₂), …)` |
+| `Phi(v₁, v₂, …)` | `join(type(v₁), type(v₂), …)` |
 | `Call(f, args)` | Derived from `ftype` declarations or inferred return types |
 | `Cons(car, cdr)` | `cons` |
 | `Car(v)` | if `type(v) ⊆ cons` then `T` else `⊤` (may signal error path) |
