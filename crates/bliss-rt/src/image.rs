@@ -409,9 +409,8 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Collect the entry continuation value. Walk the heap to serialize
-    // all live objects into the heap section.
-    let entry_val = crate::value::NIL;
+    // Retrieve the entry continuation from the runtime (§7.2.3).
+    let entry_val = crate::gc::get_entry_continuation();
 
     // Build the heap section: first 8 bytes are the entry continuation,
     // followed by serialised heap objects from gc::serialize_heap_objects().
@@ -421,30 +420,28 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
     heap_data_raw.extend_from_slice(&serialized_objects);
     let heap_uncompressed_size = heap_data_raw.len();
 
-    // Build the symbol table section (empty in bootstrap — placeholder for
-    // the symbol table serialisation required by §7.2.7).
-    let symbol_data_raw: Vec<u8> = Vec::new();
+    // Build the symbol table section (§7.2.7) by calling into the
+    // symbol table subsystem.
+    let symbol_data_raw: Vec<u8> = crate::gc::serialize_symbols();
     let symbol_uncompressed_size = symbol_data_raw.len();
 
-    // Build the package registry section (empty in bootstrap — placeholder
-    // for the package registry serialisation required by §7.2.8).
-    let package_data_raw: Vec<u8> = Vec::new();
+    // Build the package registry section (§7.2.8) by calling into the
+    // package registry subsystem.
+    let package_data_raw: Vec<u8> = crate::gc::serialize_packages();
     let package_uncompressed_size = package_data_raw.len();
 
-    // Build the compiled code cache section (empty in bootstrap).
-    let code_data_raw: Vec<u8> = Vec::new();
+    // Build the compiled code cache section by calling into the code
+    // cache subsystem.
+    let code_data_raw: Vec<u8> = crate::gc::serialize_code_cache();
     let code_uncompressed_size = code_data_raw.len();
 
-    // Build the relocation table section (empty in bootstrap).
-    let reloc_data_raw: Vec<u8> = Vec::new();
+    // Build the relocation table section (R7.03) by scanning heap for
+    // pointer-valued fields that need fixup on load.
+    let reloc_data_raw: Vec<u8> = crate::gc::serialize_relocation_table();
     let reloc_uncompressed_size = reloc_data_raw.len();
 
-    // Build the GC metadata section.
-    let gc_stats = crate::gc::heap_stats();
-    let mut gc_meta_raw: Vec<u8> = Vec::new();
-    gc_meta_raw.extend_from_slice(&gc_stats.minor_gc_count.to_le_bytes());
-    gc_meta_raw.extend_from_slice(&gc_stats.major_gc_count.to_le_bytes());
-    gc_meta_raw.extend_from_slice(&gc_stats.bytes_allocated.to_le_bytes());
+    // Build the GC metadata section with all GcStats fields + generation.
+    let gc_meta_raw: Vec<u8> = crate::gc::serialize_gc_metadata();
     let gc_meta_uncompressed_size = gc_meta_raw.len();
 
     // Apply compression if requested.
@@ -458,12 +455,24 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
     // Section count: Heap, Symbols, Packages, Code, Reloc, GcMeta
     let section_count: u32 = 6;
 
+    // Page alignment constant (4 KiB) — §7.2.2 requires sections after
+    // the directory to be page-aligned to allow mmap with MAP_FIXED (R7.02).
+    const PAGE_SIZE: usize = 4096;
+
     // Compute section directory layout.
     let section_dir_offset = HEADER_SIZE;
-    let data_start = section_dir_offset + (section_count as usize) * SECTION_ENTRY_SIZE;
+    let data_start_unaligned = section_dir_offset + (section_count as usize) * SECTION_ENTRY_SIZE;
+    // Round up to next page boundary for the first section.
+    let data_start = (data_start_unaligned + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
-    // Lay out sections sequentially after the directory.
+    // Lay out sections page-aligned after the directory.
     let mut current_offset = data_start;
+
+    /// Round up to the next page boundary.
+    fn align_to_page(offset: usize) -> usize {
+        const PAGE: usize = 4096;
+        (offset + PAGE - 1) & !(PAGE - 1)
+    }
 
     let heap_section = SectionEntry {
         section_type: SectionType::Heap as u32,
@@ -472,7 +481,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         size: heap_data.len() as u64,
         uncompressed_size: heap_uncompressed_size as u64,
     };
-    current_offset += heap_data.len();
+    current_offset = align_to_page(current_offset + heap_data.len());
 
     let symbol_section = SectionEntry {
         section_type: SectionType::Symbols as u32,
@@ -481,7 +490,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         size: symbol_data.len() as u64,
         uncompressed_size: symbol_uncompressed_size as u64,
     };
-    current_offset += symbol_data.len();
+    current_offset = align_to_page(current_offset + symbol_data.len());
 
     let package_section = SectionEntry {
         section_type: SectionType::Packages as u32,
@@ -490,7 +499,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         size: package_data.len() as u64,
         uncompressed_size: package_uncompressed_size as u64,
     };
-    current_offset += package_data.len();
+    current_offset = align_to_page(current_offset + package_data.len());
 
     let code_section = SectionEntry {
         section_type: SectionType::Code as u32,
@@ -499,7 +508,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         size: code_data.len() as u64,
         uncompressed_size: code_uncompressed_size as u64,
     };
-    current_offset += code_data.len();
+    current_offset = align_to_page(current_offset + code_data.len());
 
     let reloc_section = SectionEntry {
         section_type: SectionType::Reloc as u32,
@@ -508,7 +517,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         size: reloc_data.len() as u64,
         uncompressed_size: reloc_uncompressed_size as u64,
     };
-    current_offset += reloc_data.len();
+    current_offset = align_to_page(current_offset + reloc_data.len());
 
     let gc_meta_offset = current_offset as u64;
     let gc_meta_section = SectionEntry {
@@ -557,22 +566,36 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
             .map_err(|e| BlissError::FileError(format!("cannot write image header: {}", e)))?;
 
         // Write section directory entries
-        for section in &[
+        let sections = [
             heap_section, symbol_section, package_section,
             code_section, reloc_section, gc_meta_section,
-        ] {
+        ];
+        for section in &sections {
             let section_bytes = struct_to_bytes(section);
             file.write_all(&section_bytes)
                 .map_err(|e| BlissError::FileError(format!("cannot write section directory: {}", e)))?;
         }
 
-        // Write section data
-        for data in &[
+        // Write section data with page-alignment padding between sections.
+        // Each section's file_offset was computed with page alignment, so
+        // we pad to match those offsets.
+        let section_data_slices: [&[u8]; 6] = [
             &heap_data, &symbol_data, &package_data,
             &code_data, &reloc_data, &gc_meta_data,
-        ] {
+        ];
+        let mut write_pos = section_dir_offset + sections.len() * SECTION_ENTRY_SIZE;
+        for (idx, data) in section_data_slices.iter().enumerate() {
+            let target_offset = sections[idx].file_offset as usize;
+            // Write padding zeros to reach the page-aligned offset.
+            if target_offset > write_pos {
+                let padding = vec![0u8; target_offset - write_pos];
+                file.write_all(&padding)
+                    .map_err(|e| BlissError::FileError(format!("cannot write section padding: {}", e)))?;
+                write_pos = target_offset;
+            }
             file.write_all(data)
                 .map_err(|e| BlissError::FileError(format!("cannot write section data: {}", e)))?;
+            write_pos += data.len();
         }
 
         file.flush()
@@ -696,8 +719,15 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
         }
     };
 
-    // Find and restore all sections.
-    let mut heap_restored = false;
+    // Collect all sections first so we can process them in the right order.
+    // We need the relocation table before restoring the heap if bases differ.
+    let mut heap_entry: Option<SectionEntry> = None;
+    let mut symbol_entry: Option<SectionEntry> = None;
+    let mut package_entry: Option<SectionEntry> = None;
+    let mut code_entry: Option<SectionEntry> = None;
+    let mut reloc_entry: Option<SectionEntry> = None;
+    let mut gc_meta_entry: Option<SectionEntry> = None;
+
     for i in 0..header.section_count as usize {
         let entry_offset = section_dir_start + i * SECTION_ENTRY_SIZE;
         let entry: SectionEntry =
@@ -706,72 +736,93 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
             })?;
 
         match entry.section_type {
-            t if t == SectionType::Heap as u32 => {
-                let heap_bytes = read_section_data(&entry)?;
-
-                // The heap section's first 8 bytes encode the entry continuation
-                // as a native-endian u64. The rest is serialised heap objects.
-                if heap_bytes.len() >= 8 {
-                    let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&heap_bytes[..8]);
-                    let raw = u64::from_ne_bytes(buf);
-                    if raw != header.entry_continuation {
-                        return Err(BlissError::InvalidImage(
-                            "heap entry continuation does not match header".into(),
-                        ));
-                    }
-
-                    // Restore heap objects (bytes after the entry continuation word)
-                    // into the GC subsystem so they are accessible at runtime.
-                    let object_data = &heap_bytes[8..];
-                    if !object_data.is_empty() {
-                        crate::gc::restore_heap(object_data)?;
-                    }
-                } else if !heap_bytes.is_empty() {
-                    return Err(BlissError::InvalidImage(
-                        "heap section too small to contain entry continuation".into(),
-                    ));
-                }
-
-                heap_restored = true;
-            }
-            t if t == SectionType::Symbols as u32 => {
-                let _symbol_bytes = read_section_data(&entry)?;
-                // Symbol table restoration: in the bootstrap runtime, the symbol
-                // table is managed by the stdlib packages module. The bytes are
-                // validated here; a full implementation would call into the symbol
-                // table subsystem to rebuild the intern table.
-            }
-            t if t == SectionType::Packages as u32 => {
-                let _package_bytes = read_section_data(&entry)?;
-                // Package registry restoration: similarly handled by stdlib.
-            }
-            t if t == SectionType::Code as u32 => {
-                let _code_bytes = read_section_data(&entry)?;
-                // Compiled code cache restoration.
-            }
-            t if t == SectionType::Reloc as u32 => {
-                let _reloc_bytes = read_section_data(&entry)?;
-                // Relocation table: would be used to fixup pointers if
-                // original_base differs from the current heap base.
-            }
-            t if t == SectionType::GcMeta as u32 => {
-                let _gc_meta_bytes = read_section_data(&entry)?;
-                // GC metadata restoration.
-            }
+            t if t == SectionType::Heap as u32 => heap_entry = Some(entry),
+            t if t == SectionType::Symbols as u32 => symbol_entry = Some(entry),
+            t if t == SectionType::Packages as u32 => package_entry = Some(entry),
+            t if t == SectionType::Code as u32 => code_entry = Some(entry),
+            t if t == SectionType::Reloc as u32 => reloc_entry = Some(entry),
+            t if t == SectionType::GcMeta as u32 => gc_meta_entry = Some(entry),
             _ => {
                 // Unknown section type — skip for forward compatibility.
             }
         }
     }
 
-    if !heap_restored {
+    // Read the relocation table first — needed before heap restore if bases differ.
+    let reloc_data = if let Some(entry) = reloc_entry {
+        read_section_data(&entry)?
+    } else {
+        Vec::new()
+    };
+
+    // Restore the heap section.
+    let heap_entry = heap_entry.ok_or_else(|| {
+        BlissError::InvalidImage("image contains no heap section".into())
+    })?;
+    let mut heap_bytes = read_section_data(&heap_entry)?;
+
+    if heap_bytes.len() >= 8 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&heap_bytes[..8]);
+        let raw = u64::from_ne_bytes(buf);
+        if raw != header.entry_continuation {
+            return Err(BlissError::InvalidImage(
+                "heap entry continuation does not match header".into(),
+            ));
+        }
+
+        // Apply pointer relocations if the current heap base differs
+        // from the original base recorded in the header (R7.03).
+        let current_base = crate::gc::heap_base_address();
+        if current_base != 0 && header.original_base != 0 && current_base != header.original_base {
+            let delta = current_base as i64 - header.original_base as i64;
+            // Apply relocations to the object data portion (after the 8-byte entry continuation).
+            if heap_bytes.len() > 8 {
+                crate::gc::apply_relocations(&mut heap_bytes[8..], &reloc_data, delta)?;
+            }
+        }
+
+        // Restore heap objects (bytes after the entry continuation word)
+        // into the GC subsystem so they are accessible at runtime.
+        let object_data = &heap_bytes[8..];
+        if !object_data.is_empty() {
+            crate::gc::restore_heap(object_data)?;
+        }
+    } else if !heap_bytes.is_empty() {
         return Err(BlissError::InvalidImage(
-            "image contains no heap section".into(),
+            "heap section too small to contain entry continuation".into(),
         ));
     }
 
-    Ok(BlissVal::from_raw(header.entry_continuation))
+    // Restore the symbol table (§7.2.7).
+    if let Some(entry) = symbol_entry {
+        let symbol_bytes = read_section_data(&entry)?;
+        crate::gc::restore_symbols(&symbol_bytes)?;
+    }
+
+    // Restore the package registry (§7.2.8).
+    if let Some(entry) = package_entry {
+        let package_bytes = read_section_data(&entry)?;
+        crate::gc::restore_packages(&package_bytes)?;
+    }
+
+    // Restore the compiled code cache.
+    if let Some(entry) = code_entry {
+        let code_bytes = read_section_data(&entry)?;
+        crate::gc::restore_code_cache(&code_bytes)?;
+    }
+
+    // Restore GC metadata (stats + generation).
+    if let Some(entry) = gc_meta_entry {
+        let gc_meta_bytes = read_section_data(&entry)?;
+        crate::gc::restore_gc_metadata(&gc_meta_bytes)?;
+    }
+
+    // Store the restored entry continuation so the runtime can retrieve it.
+    let entry_cont = BlissVal::from_raw(header.entry_continuation);
+    crate::gc::set_entry_continuation(entry_cont);
+
+    Ok(entry_cont)
 }
 
 // ── Appended image detection ───────────────────────────────────────
