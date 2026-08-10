@@ -465,10 +465,16 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::FileIo { file, write_buf, .. } => {
+            StreamInner::FileIo { file, write_buf, line, col, .. } => {
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
                 write_buf.extend_from_slice(encoded.as_bytes());
+                if c == '\n' {
+                    *line += 1;
+                    *col = 0;
+                } else {
+                    *col += 1;
+                }
                 if write_buf.len() >= FILE_BUF_SIZE {
                     file_flush_write_buf(file, write_buf)?;
                 }
@@ -518,8 +524,14 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::FileIo { file, write_buf, .. } => {
+            StreamInner::FileIo { file, write_buf, line, col, .. } => {
                 write_buf.push(b);
+                if b == b'\n' {
+                    *line += 1;
+                    *col = 0;
+                } else {
+                    *col += 1;
+                }
                 if write_buf.len() >= FILE_BUF_SIZE {
                     file_flush_write_buf(file, write_buf)?;
                 }
@@ -563,11 +575,12 @@ impl GrayStream for StreamMutableState {
                 .unwrap_or(s.len())
         };
         let slice = &s.as_bytes()[byte_start..byte_end];
+        let str_slice = &s[byte_start..byte_end];
         match &mut self.inner {
             StreamInner::StringOutput { buffer, line, col } => {
                 buffer.extend_from_slice(slice);
-                for &b in slice {
-                    if b == b'\n' {
+                for c in str_slice.chars() {
+                    if c == '\n' {
                         *line += 1;
                         *col = 0;
                     } else {
@@ -578,8 +591,8 @@ impl GrayStream for StreamMutableState {
             }
             StreamInner::FileOutput { file, write_buf, line, col, .. } => {
                 write_buf.extend_from_slice(slice);
-                for &b in slice {
-                    if b == b'\n' {
+                for c in str_slice.chars() {
+                    if c == '\n' {
                         *line += 1;
                         *col = 0;
                     } else {
@@ -591,8 +604,16 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::FileIo { file, write_buf, .. } => {
+            StreamInner::FileIo { file, write_buf, line, col, .. } => {
                 write_buf.extend_from_slice(slice);
+                for c in str_slice.chars() {
+                    if c == '\n' {
+                        *line += 1;
+                        *col = 0;
+                    } else {
+                        *col += 1;
+                    }
+                }
                 if write_buf.len() >= FILE_BUF_SIZE {
                     file_flush_write_buf(file, write_buf)?;
                 }
