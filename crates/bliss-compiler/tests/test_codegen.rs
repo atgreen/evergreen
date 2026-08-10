@@ -85,11 +85,24 @@ fn x86_64_backend_target_arch() {
 }
 
 #[test]
-fn x86_64_backend_emit_accepts_ir_graph() {
+fn x86_64_backend_emit_accepts_minimal_graph() {
+    use bliss_compiler::ir::{Edge, EdgeKind, IrGraph, NodeKind};
+    let mut backend = X86_64Backend::new();
+    // Build a minimal valid graph: Start -> Return
+    let mut graph = IrGraph::new();
+    let s = graph.add_node(NodeKind::Start);
+    let r = graph.add_node(NodeKind::Return);
+    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+    assert!(backend.emit(&graph).is_ok(), "emit should succeed for a minimal valid Start->Return graph");
+}
+
+#[test]
+fn x86_64_backend_emit_rejects_empty_graph() {
     use bliss_compiler::ir::IrGraph;
     let mut backend = X86_64Backend::new();
     let graph = IrGraph::new();
-    assert!(backend.emit(&graph).is_ok());
+    // An empty graph (zero nodes, no Start) is malformed; emit should reject it
+    assert!(backend.emit(&graph).is_err(), "emit should reject an empty graph with no nodes");
 }
 
 // ── Aarch64Backend ────────────────────────────────────────────────
@@ -101,11 +114,24 @@ fn aarch64_backend_target_arch() {
 }
 
 #[test]
-fn aarch64_backend_emit_accepts_ir_graph() {
+fn aarch64_backend_emit_accepts_minimal_graph() {
+    use bliss_compiler::ir::{Edge, EdgeKind, IrGraph, NodeKind};
+    let mut backend = Aarch64Backend::new();
+    // Build a minimal valid graph: Start -> Return
+    let mut graph = IrGraph::new();
+    let s = graph.add_node(NodeKind::Start);
+    let r = graph.add_node(NodeKind::Return);
+    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+    assert!(backend.emit(&graph).is_ok(), "emit should succeed for a minimal valid Start->Return graph");
+}
+
+#[test]
+fn aarch64_backend_emit_rejects_empty_graph() {
     use bliss_compiler::ir::IrGraph;
     let mut backend = Aarch64Backend::new();
     let graph = IrGraph::new();
-    assert!(backend.emit(&graph).is_ok());
+    // An empty graph (zero nodes, no Start) is malformed; emit should reject it
+    assert!(backend.emit(&graph).is_err(), "emit should reject an empty graph with no nodes");
 }
 
 // ── LinearScanAllocator ───────────────────────────────────────────
@@ -117,11 +143,24 @@ fn linear_scan_allocator_new_both_archs() {
 }
 
 #[test]
-fn linear_scan_allocator_allocate_returns_result() {
+fn linear_scan_allocator_allocate_with_minimal_graph() {
+    use bliss_compiler::ir::{Edge, EdgeKind, IrGraph, NodeKind};
+    let mut alloc = LinearScanAllocator::new(TargetArch::X86_64);
+    // Use a minimal valid graph: Start -> Return
+    let mut graph = IrGraph::new();
+    let s = graph.add_node(NodeKind::Start);
+    let r = graph.add_node(NodeKind::Return);
+    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+    assert!(alloc.allocate(&graph).is_ok(), "allocate should succeed for a minimal valid graph");
+}
+
+#[test]
+fn linear_scan_allocator_allocate_rejects_empty_graph() {
     use bliss_compiler::ir::IrGraph;
     let mut alloc = LinearScanAllocator::new(TargetArch::X86_64);
     let graph = IrGraph::new();
-    assert!(alloc.allocate(&graph).is_ok());
+    // Register allocation on an empty graph (no nodes) should fail
+    assert!(alloc.allocate(&graph).is_err(), "allocate should reject an empty graph with no nodes");
 }
 
 // ── RegisterAllocation struct ────────────────────────────────────
@@ -129,15 +168,22 @@ fn linear_scan_allocator_allocate_returns_result() {
 #[test]
 fn register_allocation_can_be_stored_and_used() {
     use bliss_compiler::codegen::RegisterAllocation;
-    use bliss_compiler::ir::IrGraph;
+    use bliss_compiler::ir::{Edge, EdgeKind, IrGraph, NodeKind};
     let mut alloc = LinearScanAllocator::new(TargetArch::X86_64);
-    let graph = IrGraph::new();
+    // Use a minimal valid graph: Start -> Return
+    let mut graph = IrGraph::new();
+    let s = graph.add_node(NodeKind::Start);
+    let r = graph.add_node(NodeKind::Return);
+    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
     let reg_alloc: RegisterAllocation = alloc.allocate(&graph).unwrap();
     // Verify the RegisterAllocation value is usable: can be moved/stored
     let _stored = reg_alloc;
     // Also verify Debug is available if derived
     let mut alloc2 = LinearScanAllocator::new(TargetArch::Aarch64);
-    let graph2 = IrGraph::new();
+    let mut graph2 = IrGraph::new();
+    let s2 = graph2.add_node(NodeKind::Start);
+    let r2 = graph2.add_node(NodeKind::Return);
+    graph2.add_edge(Edge { from: s2, to: r2, kind: EdgeKind::Control, input_index: 0 });
     let _reg_alloc2: RegisterAllocation = alloc2.allocate(&graph2).unwrap();
 }
 
