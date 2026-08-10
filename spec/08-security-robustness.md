@@ -15,7 +15,7 @@ strategy that validates all of the above.
 |----|-------------|-------|
 | R8.01 | Bliss MUST provide a *restricted evaluation mode* (sandbox) that disables file I/O, network access, FFI calls, and OS process spawning. | MUST |
 | R8.02 | Sandbox capability grants MUST be whitelist-based; the default set MUST be empty (deny-all). | MUST |
-| R8.03 | All `unsafe` Rust blocks in the runtime MUST be confined to `crates/bliss-rt/src/ffi.rs` and clearly documented with `// SAFETY:` comments. | MUST |
+| R8.03 | All `unsafe` Rust blocks in the runtime MUST be confined to `crates/bliss-rt/src/ffi.rs`, `crates/bliss-rt/src/gc/*.rs`, and `crates/bliss-rt/src/signal.rs`; each block MUST be documented with a `// SAFETY:` comment. | MUST |
 | R8.04 | FFI pointer arguments MUST be validated (non-null, alignment, bounds) before dereference. | MUST |
 | R8.05 | No raw pointer value MUST ever be directly accessible to user CL code. | MUST |
 | R8.06 | The runtime MUST enforce a configurable maximum heap size hard cap; allocation beyond the cap MUST signal a `STORAGE-CONDITION`. | MUST |
@@ -76,10 +76,18 @@ D8.02 — `SandboxContext`: holds `capabilities: CapabilitySet`,
 `max_heap_bytes`, `max_cpu_ms`, `alloc_rate_limit: Option<BytesPerSec>`,
 and `max_stack_depth`.
 
-The context is stored in a thread-local `Option<&SandboxContext>`.
+The context is stored in a thread-local `Option<Arc<SandboxContext>>`.
 Every guarded operation calls `check_capability(cap)` which returns
 `Ok(())` outside a sandbox or when the capability is granted, and
 `Err(BlissError::capability_denied(cap))` otherwise.
+
+**Thread propagation (R8.20):** When a new thread is spawned inside a
+sandbox (via `CAP_THREADS`), the runtime MUST propagate the parent
+thread's `SandboxContext` to the child thread by cloning the `Arc` into
+the child's thread-local slot before any user code executes. A child
+thread MUST NOT run with a wider capability set than its parent.
+Spawning a thread without `CAP_THREADS` MUST signal
+`BlissError::capability_denied(CAP_THREADS)`.
 
 ### 8.2.4  Sandbox Entry API
 
@@ -111,10 +119,22 @@ The following operations are intercepted inside a sandbox:
 
 ### 8.3.1  Unsafe Code Confinement (R8.03)
 
-All `unsafe` blocks live in `crates/bliss-rt/src/ffi.rs`. No other
-module may contain `unsafe` code. The `#![deny(unsafe_code)]` attribute
-is set at crate level in `bliss-rt`, `bliss-compiler`, and `bliss-cli`,
-with a per-module `#[allow(unsafe_code)]` only in `ffi.rs`.
+All `unsafe` blocks MUST be confined to the following modules:
+
+- **`crates/bliss-rt/src/ffi.rs`** — C-ABI bridge, pointer validation,
+  alien value marshalling.
+- **`crates/bliss-rt/src/gc/*.rs`** — raw memory manipulation required
+  by the garbage collector: bump-pointer TLAB allocation, object header
+  access, `mmap`/`mprotect` for memory-mapped heap regions, and write
+  barrier implementations.
+- **`crates/bliss-rt/src/signal.rs`** — POSIX signal handler registration
+  (`sigaction`), `mprotect` for stack guard pages, and
+  async-signal-safe flag operations.
+
+No other module may contain `unsafe` code. The `#![deny(unsafe_code)]`
+attribute is set at crate level in `bliss-rt`, `bliss-compiler`, and
+`bliss-cli`, with per-module `#[allow(unsafe_code)]` only in the three
+locations listed above.
 
 ### 8.3.2  Pointer Validation (R8.04)
 
@@ -240,8 +260,17 @@ HotSpot model:
 | `SIGBUS` | Same as `SIGSEGV` | Signal `MEMORY-FAULT-ERROR` |
 | `SIGFPE` | Set `pending_fpe` flag | Signal `ARITHMETIC-ERROR` |
 | `SIGPIPE` | Set `pending_pipe` flag | Signal `STREAM-ERROR` on next I/O |
-| `SIGUSR1` | GC safepoint request | Thread enters safepoint |
+| `SIGUSR1` | Set `pending_safepoint` flag (fallback only — see note) | Thread enters safepoint |
 | `SIGTERM` | Set `shutdown_requested` flag | Orderly shutdown sequence |
+
+**Note on SIGUSR1:** The primary safepoint mechanism is polling-based —
+safepoint checks are inserted at loop back-edges and function prologues
+(§4.3). `SIGUSR1` is used **only** as a fallback to interrupt threads
+that are blocked in long-running system calls (e.g., `read`, `poll`,
+`futex_wait`) and therefore cannot reach a poll-based safepoint in a
+timely manner. The `SIGUSR1` handler merely sets a flag; it does not
+suspend the thread directly. This is consistent with §4.3's statement
+that there is no signal-based suspension.
 
 ### 8.5.3  Guard Pages
 
