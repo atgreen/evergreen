@@ -238,29 +238,293 @@ impl IrBuilder {
     }
 
     /// Build an IR graph from a CL form.
+    ///
+    /// Walks the AST recursively and builds SSA IR nodes.
+    /// Self-evaluating forms produce Constant nodes.
+    /// Cons cells (compound forms) are translated into their IR equivalents:
+    /// function calls become Call nodes, special forms produce appropriate
+    /// control flow (Branch, Region, Phi).
     pub fn build(&mut self, form: BlissVal) -> Result<IrGraph, crate::error::CompilerError> {
         let mut graph = IrGraph::new();
         let start = graph.add_node(NodeKind::Start);
-        // For a self-evaluating form, create a constant node and a return node
-        let constant = graph.add_node(NodeKind::Constant(form));
-        let ret = graph.add_node(NodeKind::Return);
 
-        // Wire: Start -> Return (control)
+        // Build IR for the body form
+        let result_node = self.build_form(&mut graph, form, start)?;
+
+        // Create Return node wired to the result
+        let ret = graph.add_node(NodeKind::Return);
         graph.add_edge(Edge {
             from: start,
             to: ret,
             kind: EdgeKind::Control,
             input_index: 0,
         });
-        // Wire: Constant -> Return (data)
         graph.add_edge(Edge {
-            from: constant,
+            from: result_node,
             to: ret,
             kind: EdgeKind::Data,
             input_index: 1,
         });
 
         Ok(graph)
+    }
+
+    /// Recursively build IR nodes for a form.
+    fn build_form(&mut self, graph: &mut IrGraph, form: BlissVal, ctrl: NodeId) -> Result<NodeId, crate::error::CompilerError> {
+        use bliss_rt::value::{NIL_BITS, T_BITS, TAG_SPECIAL, TAG_SYMBOL, TAG_CONS};
+
+        // Self-evaluating forms: produce a Constant node
+        if form.is_fixnum() || form.is_character() || form.is_single_float()
+            || form.is_heap_object() || form.0 == NIL_BITS || form.0 == T_BITS
+            || form.tag() == TAG_SPECIAL || form.is_function()
+        {
+            return Ok(graph.add_node(NodeKind::Constant(form)));
+        }
+
+        // Symbols: produce a Constant node
+        // (In a full implementation, this would look up the variable binding;
+        //  for IR building, we represent it as a Constant of the symbol value
+        //  since resolution happens at runtime.)
+        if form.tag() == TAG_SYMBOL {
+            return Ok(graph.add_node(NodeKind::Constant(form)));
+        }
+
+        // Cons cells: compound forms (function calls or special forms)
+        if form.tag() == TAG_CONS {
+            let ptr = (form.0 & !bliss_rt::value::TAG_MASK) as *const u64;
+            if ptr.is_null() {
+                return Ok(graph.add_node(NodeKind::Constant(form)));
+            }
+            let operator = BlissVal(unsafe { *ptr });
+            let args_form = BlissVal(unsafe { *ptr.add(1) });
+
+            // Check for special forms by looking up the symbol name
+            if operator.tag() == TAG_SYMBOL {
+                let sym_idx = (operator.0 >> 3) as u32;
+                if let Some(name) = crate::reader::symbol_name(sym_idx) {
+                    match name.as_str() {
+                        "QUOTE" => {
+                            // (QUOTE datum) -> Constant(datum)
+                            if args_form.tag() == TAG_CONS {
+                                let ap = (args_form.0 & !bliss_rt::value::TAG_MASK) as *const u64;
+                                if !ap.is_null() {
+                                    let datum = BlissVal(unsafe { *ap });
+                                    return Ok(graph.add_node(NodeKind::Constant(datum)));
+                                }
+                            }
+                            return Ok(graph.add_node(NodeKind::Constant(form)));
+                        }
+                        "IF" => {
+                            return self.build_if(graph, args_form, ctrl);
+                        }
+                        "LAMBDA" => {
+                            return self.build_lambda(graph, args_form, ctrl);
+                        }
+                        "PROGN" => {
+                            return self.build_progn(graph, args_form, ctrl);
+                        }
+                        "DEFUN" => {
+                            // (DEFUN name (params) body...) - treat like lambda for IR purposes
+                            // Skip the name, build lambda from params+body
+                            if args_form.tag() == TAG_CONS {
+                                let ap = (args_form.0 & !bliss_rt::value::TAG_MASK) as *const u64;
+                                if !ap.is_null() {
+                                    let rest = BlissVal(unsafe { *ap.add(1) }); // (params body...)
+                                    return self.build_lambda(graph, rest, ctrl);
+                                }
+                            }
+                            return Ok(graph.add_node(NodeKind::Constant(form)));
+                        }
+                        _ => {} // fall through to function call handling
+                    }
+                }
+            }
+
+            // For other compound forms, build a Call node
+            let operator_node = self.build_form(graph, operator, ctrl)?;
+
+            // Collect argument nodes
+            let mut arg_nodes = Vec::new();
+            let mut cur = args_form;
+            while cur.tag() == TAG_CONS {
+                let ap = (cur.0 & !bliss_rt::value::TAG_MASK) as *const u64;
+                if ap.is_null() { break; }
+                let arg_form = BlissVal(unsafe { *ap });
+                let arg_node = self.build_form(graph, arg_form, ctrl)?;
+                arg_nodes.push(arg_node);
+                cur = BlissVal(unsafe { *ap.add(1) });
+            }
+
+            // Create Call node
+            let call = graph.add_node(NodeKind::Call);
+            graph.add_edge(Edge {
+                from: ctrl,
+                to: call,
+                kind: EdgeKind::Control,
+                input_index: 0,
+            });
+            graph.add_edge(Edge {
+                from: operator_node,
+                to: call,
+                kind: EdgeKind::Data,
+                input_index: 1,
+            });
+            for (i, &arg) in arg_nodes.iter().enumerate() {
+                graph.add_edge(Edge {
+                    from: arg,
+                    to: call,
+                    kind: EdgeKind::Data,
+                    input_index: (i + 2) as u32,
+                });
+            }
+            return Ok(call);
+        }
+
+        // Fallback: treat as constant
+        Ok(graph.add_node(NodeKind::Constant(form)))
+    }
+
+    /// Collect a cons-list into a Vec of BlissVal.
+    fn collect_list(list: BlissVal) -> Vec<BlissVal> {
+        use bliss_rt::value::TAG_CONS;
+        let mut result = Vec::new();
+        let mut cur = list;
+        while cur.tag() == TAG_CONS {
+            let ap = (cur.0 & !bliss_rt::value::TAG_MASK) as *const u64;
+            if ap.is_null() { break; }
+            result.push(BlissVal(unsafe { *ap }));
+            cur = BlissVal(unsafe { *ap.add(1) });
+        }
+        result
+    }
+
+    /// Build IR for an IF form: (IF test then [else])
+    fn build_if(&mut self, graph: &mut IrGraph, args_form: BlissVal, ctrl: NodeId) -> Result<NodeId, crate::error::CompilerError> {
+        use bliss_rt::value::NIL_BITS;
+
+        let args = Self::collect_list(args_form);
+
+        if args.is_empty() {
+            return Ok(graph.add_node(NodeKind::Constant(BlissVal(NIL_BITS))));
+        }
+
+        // Build test expression
+        let test_node = self.build_form(graph, args[0], ctrl)?;
+
+        // Branch node
+        let branch = graph.add_node(NodeKind::Branch);
+        graph.add_edge(Edge {
+            from: ctrl,
+            to: branch,
+            kind: EdgeKind::Control,
+            input_index: 0,
+        });
+        graph.add_edge(Edge {
+            from: test_node,
+            to: branch,
+            kind: EdgeKind::Data,
+            input_index: 1,
+        });
+
+        // Then branch
+        let then_node = if args.len() > 1 {
+            self.build_form(graph, args[1], branch)?
+        } else {
+            graph.add_node(NodeKind::Constant(BlissVal(NIL_BITS)))
+        };
+
+        // Else branch
+        let else_node = if args.len() > 2 {
+            self.build_form(graph, args[2], branch)?
+        } else {
+            graph.add_node(NodeKind::Constant(BlissVal(NIL_BITS)))
+        };
+
+        // Region (merge point)
+        let region = graph.add_node(NodeKind::Region);
+        graph.add_edge(Edge {
+            from: branch,
+            to: region,
+            kind: EdgeKind::Control,
+            input_index: 0,
+        });
+        graph.add_edge(Edge {
+            from: branch,
+            to: region,
+            kind: EdgeKind::Control,
+            input_index: 1,
+        });
+
+        // Phi (merge values)
+        let phi = graph.add_node(NodeKind::Phi);
+        graph.add_edge(Edge {
+            from: region,
+            to: phi,
+            kind: EdgeKind::Data,
+            input_index: 0,
+        });
+        graph.add_edge(Edge {
+            from: then_node,
+            to: phi,
+            kind: EdgeKind::Data,
+            input_index: 1,
+        });
+        graph.add_edge(Edge {
+            from: else_node,
+            to: phi,
+            kind: EdgeKind::Data,
+            input_index: 2,
+        });
+
+        Ok(phi)
+    }
+
+    /// Build IR for a LAMBDA form: (LAMBDA (params...) body...)
+    /// Creates Parameter nodes for each parameter and builds the body.
+    fn build_lambda(&mut self, graph: &mut IrGraph, args_form: BlissVal, ctrl: NodeId) -> Result<NodeId, crate::error::CompilerError> {
+        use bliss_rt::value::NIL_BITS;
+
+        let args = Self::collect_list(args_form);
+        if args.is_empty() {
+            return Ok(graph.add_node(NodeKind::Constant(BlissVal(NIL_BITS))));
+        }
+
+        // First element is the parameter list
+        let param_list = Self::collect_list(args[0]);
+
+        // Create Parameter nodes for each lambda parameter
+        let mut _param_nodes = Vec::new();
+        for (i, _param) in param_list.iter().enumerate() {
+            let param_node = graph.add_node(NodeKind::Parameter(i as u32));
+            _param_nodes.push(param_node);
+        }
+
+        // Build the body forms (like PROGN)
+        if args.len() > 1 {
+            let mut result_node = graph.add_node(NodeKind::Constant(BlissVal(NIL_BITS)));
+            for i in 1..args.len() {
+                result_node = self.build_form(graph, args[i], ctrl)?;
+            }
+            Ok(result_node)
+        } else {
+            Ok(graph.add_node(NodeKind::Constant(BlissVal(NIL_BITS))))
+        }
+    }
+
+    /// Build IR for a PROGN form: (PROGN form1 form2 ... formN)
+    fn build_progn(&mut self, graph: &mut IrGraph, args_form: BlissVal, ctrl: NodeId) -> Result<NodeId, crate::error::CompilerError> {
+        use bliss_rt::value::NIL_BITS;
+
+        let forms = Self::collect_list(args_form);
+        if forms.is_empty() {
+            return Ok(graph.add_node(NodeKind::Constant(BlissVal(NIL_BITS))));
+        }
+
+        let mut result_node = graph.add_node(NodeKind::Constant(BlissVal(NIL_BITS)));
+        for form in forms {
+            result_node = self.build_form(graph, form, ctrl)?;
+        }
+        Ok(result_node)
     }
 }
 
