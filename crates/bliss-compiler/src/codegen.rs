@@ -929,7 +929,7 @@ pub unsafe fn patch_code(site: *mut u8, new_target: *const u8) -> Result<(), Bli
     // We write an 8-byte absolute address for simplicity.
     let target_bytes = (new_target as u64).to_le_bytes();
     for (i, &byte) in target_bytes.iter().enumerate() {
-        site.add(i).write(byte);
+        unsafe { site.add(i).write(byte); }
     }
     Ok(())
 }
