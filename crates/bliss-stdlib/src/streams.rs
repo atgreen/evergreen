@@ -173,6 +173,9 @@ impl GrayStream for StreamState {
                 }
                 Ok(EOF)
             }
+            StreamInner::Synonym { .. } => {
+                Err(BlissError::StreamError("synonym stream resolution not yet supported".into()))
+            }
             _ => Err(BlissError::StreamError("not an input stream".into())),
         }
     }
@@ -193,6 +196,9 @@ impl GrayStream for StreamState {
                 } else {
                     Err(BlissError::StreamError("no streams in concatenated stream".into()))
                 }
+            }
+            StreamInner::Synonym { .. } => {
+                Err(BlissError::StreamError("synonym stream resolution not yet supported".into()))
             }
             _ => Err(BlissError::StreamError("not an input stream".into())),
         }
@@ -227,6 +233,9 @@ impl GrayStream for StreamState {
             StreamInner::TwoWay { output, .. } | StreamInner::Echo { output, .. } => {
                 crate::streams::stream_write_char(*output, ch)
             }
+            StreamInner::Synonym { .. } => {
+                Err(BlissError::StreamError("synonym stream resolution not yet supported".into()))
+            }
             _ => Err(BlissError::StreamError("not an output stream".into())),
         }
     }
@@ -247,6 +256,9 @@ impl GrayStream for StreamState {
             }
             StreamInner::TwoWay { output, .. } | StreamInner::Echo { output, .. } => {
                 crate::streams::stream_write_byte(*output, byte)
+            }
+            StreamInner::Synonym { .. } => {
+                Err(BlissError::StreamError("synonym stream resolution not yet supported".into()))
             }
             _ => Err(BlissError::StreamError("not an output stream".into())),
         }
@@ -270,6 +282,9 @@ impl GrayStream for StreamState {
             }
             StreamInner::TwoWay { output, .. } | StreamInner::Echo { output, .. } => {
                 crate::streams::stream_write_string(*output, string, start, Some(end))
+            }
+            StreamInner::Synonym { .. } => {
+                Err(BlissError::StreamError("synonym stream resolution not yet supported".into()))
             }
             _ => Err(BlissError::StreamError("not an output stream".into())),
         }
@@ -301,6 +316,9 @@ impl GrayStream for StreamState {
             }
             StreamInner::TwoWay { input, .. } | StreamInner::Echo { input, .. } => {
                 crate::streams::stream_listen(*input)
+            }
+            StreamInner::Synonym { .. } => {
+                Err(BlissError::StreamError("synonym stream resolution not yet supported".into()))
             }
             _ => Ok(false),
         }
