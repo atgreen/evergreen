@@ -28,7 +28,7 @@ be designed to accommodate them.
 Every ANSI sequence function is implemented as a thin entry point that:
 
 1. Resolves the concrete sequence type via `SEQ-TYPE-TAG` (a 4-bit tag
-   derived from the object header; see D5.20).
+   derived from the object header; see D1.01 in §1).
 2. Indexes into a dispatch table (`SEQ-DISPATCH-TABLE`, D5.21) keyed by
    `(function-id × type-tag)`.
 3. Tail-calls the specialized implementation.
@@ -282,7 +282,7 @@ struct BlissHashTable {
     eq_fn:        fn(BlissVal, BlissVal) -> bool,
     rehash_size:  f32,             // growth factor (default 2.0)
     rehash_threshold: f32,         // load factor trigger (default 0.75)
-    lock:         Option<Mutex>,   // present only for synchronized tables
+    lock:         Option<RwLock>,  // present only for synchronized tables
 }
 
 struct Entry {
@@ -316,7 +316,7 @@ insert(table, key, value):
             return
         if entry.psl > slot.psl:
             swap(entry, slot)        // Robin Hood displacement
-            table.entries[idx] ← slot
+            table.entries[idx] ← entry
         entry.psl ← entry.psl + 1
         idx ← (idx + 1) & mask
         if entry.psl > PSL_CAP (= 128):
@@ -412,8 +412,8 @@ Bliss offers two levels of thread safety for hash tables:
 
 #### Mutex-Based Synchronized Table
 
-A synchronized hash table wraps a standard Robin Hood table with a
-`Mutex` (D5.20, `lock` field).  Granularity: **table-level lock**.
+A synchronized hash table wraps a standard Robin Hood table with an
+`RwLock` (D5.20, `lock` field).  Granularity: **table-level lock**.
 
 - Every public operation (`GETHASH`, `(SETF GETHASH)`, `REMHASH`,
   `CLRHASH`, `MAPHASH`, `WITH-HASH-TABLE-ITERATOR`) acquires the mutex.
@@ -439,31 +439,79 @@ an epoch counter to enable future migration.
 
 ```lisp
 (defmacro with-hash-table-iterator ((name hash-table) &body body)
-  (let ((entries (gensym "ENTRIES"))
+  (let ((ht      (gensym "HT"))
         (index   (gensym "INDEX"))
         (cap     (gensym "CAP")))
-    `(let* ((,entries (%%ht-entries ,hash-table))
-            (,index   0)
-            (,cap     (%%ht-capacity ,hash-table)))
+    `(let* ((,ht     ,hash-table)
+            (,index  0)
+            (,cap    (%%ht-capacity ,ht)))
        (macrolet ((,name ()
-                    `(loop
-                       (when (>= ,',index ,',cap)
-                         (return (values nil nil nil)))
-                       (let ((entry (%%entry-ref ,',entries ,',index)))
-                         (incf ,',index)
-                         (unless (%%entry-empty-p entry)
-                           (return (values t
-                                           (%%entry-key entry)
-                                           (%%entry-value entry))))))))
+                    `(%%with-ht-read-lock ,',ht    ;; acquire read lock per call
+                       (loop
+                         (when (>= ,',index ,',cap)
+                           (return (values nil nil nil)))
+                         (let ((entry (%%entry-ref (%%ht-entries ,',ht) ,',index)))
+                           (incf ,',index)
+                           (unless (%%entry-empty-p entry)
+                             (return (values t
+                                             (%%entry-key entry)
+                                             (%%entry-value entry)))))))))
          ,@body))))
 ```
 
-**R5.149b** — `WITH-HASH-TABLE-ITERATOR` MUST NOT hold the hash-table
-lock for the entire body; it MUST acquire the lock only during each
+**R5.156** — `WITH-HASH-TABLE-ITERATOR` MUST NOT hold the hash-table
+lock for the entire body; it MUST acquire the read lock only during each
 `(name)` call to advance the iterator.  Consequence: concurrent
 mutations between iterator calls MAY cause skipped or duplicated entries
 (ANSI allows this — the standard says consequences are undefined when
 modifying during iteration except via `(SETF GETHASH)` on the current key).
+
+### 5.7.6  MAPHASH Specification
+
+**R5.157** — `MAPHASH` MUST call the given function on every key/value
+pair in the hash table.  Order of traversal is unspecified.
+
+**R5.158** — For synchronized hash tables, `MAPHASH` MUST acquire the
+read lock for the **entire** traversal (unlike `WITH-HASH-TABLE-ITERATOR`,
+which acquires per-call).  Rationale: `MAPHASH` guarantees a consistent
+snapshot — each entry is visited exactly once, with no skips or
+duplicates from concurrent mutations.
+
+**R5.159** — During `MAPHASH`, calling `(SETF GETHASH)` on the current
+key is permitted (ANSI §18.1.1).  Calling `REMHASH` on any key or
+`(SETF GETHASH)` on a key other than the current one has undefined
+consequences.  The implementation MAY (but is not required to) detect
+such violations and signal a `PROGRAM-ERROR`.
+
+Implementation:
+
+```text
+maphash(function, table):
+    acquire read-lock(table)   // entire traversal under lock
+    for idx from 0 below table.capacity:
+        slot ← table.entries[idx]
+        if slot is not EMPTY:
+            funcall(function, slot.key, slot.value)
+    release read-lock(table)
+```
+
+### 5.7.7  MAKE-HASH-TABLE Parameter Handling
+
+**R5.160** — `MAKE-HASH-TABLE` MUST accept the following keyword arguments
+per ANSI CL and handle them as specified:
+
+| Keyword | ANSI Type | Internal Handling |
+|---------|-----------|-------------------|
+| `:TEST` | `{EQ, EQL, EQUAL, EQUALP}` or designator | Resolve to `HashTestTag` enum; signal `TYPE-ERROR` for unsupported tests.  Default: `EQL`. |
+| `:SIZE` | Non-negative integer | Advisory initial capacity hint.  Actual capacity = next power of two ≥ `max(size, 16)`.  Default: 16. |
+| `:REHASH-SIZE` | Integer ≥ 1, or float > 1.0 | If integer: convert to float (`(float rehash-size)`).  If float ≤ 1.0: signal `TYPE-ERROR`.  Stored as `rehash_size: f32` in D5.20.  Default: `2.0`. |
+| `:REHASH-THRESHOLD` | Real in `(0, 1]` | Clamp to `[0.1, 1.0]` (values below 0.1 waste too much memory).  If ≤ 0 or > 1: signal `TYPE-ERROR`.  Stored as `rehash_threshold: f32` in D5.20.  Default: `0.75`. |
+| `:SYNCHRONIZED` | Boolean (SBCL extension, §9) | If true, allocate `RwLock` in the `lock` field of D5.20.  Default: `NIL`. |
+
+**R5.161** — Capacity rounding to a power of two MUST be transparent to
+the user: `HASH-TABLE-SIZE` returns the actual (rounded) capacity, while
+`HASH-TABLE-REHASH-SIZE` and `HASH-TABLE-REHASH-THRESHOLD` return the
+values as supplied by the user (or defaults).
 
 ---
 
