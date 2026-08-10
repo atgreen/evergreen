@@ -84,19 +84,19 @@ cons cells) begins with an 8-byte header. Cons cells are the sole
 exception — they carry no header to save space (R1.13).
 
 ```text
-63          56 55    48 47         32 31                    0
-┌────────────┬────────┬─────────────┬───────────────────────┐
-│  type_id   │ gc_bits│   hash      │       size            │
-│  (8 bits)  │(8 bits)│  (16 bits)  │     (32 bits)         │
-└────────────┴────────┴─────────────┴───────────────────────┘
+63          56 55    48 47                 16 15             0
+┌────────────┬────────┬─────────────────────┬───────────────┐
+│  type_id   │ gc_bits│       hash          │    size        │
+│  (8 bits)  │(8 bits)│     (32 bits)       │  (16 bits)    │
+└────────────┴────────┴─────────────────────┴───────────────┘
 ```
 
 | Field | Bits | Description |
 |-------|------|-------------|
 | `type_id` | 63:56 | Discriminator for the heap type (see §1.3.1). Up to 256 types. |
 | `gc_bits` | 55:48 | GC mark bits (2), forwarding flag (1), pinned (1), remembered-set (1), reserved (3). See §3. |
-| `hash` | 47:32 | Identity-hash cache. Zero means "not yet computed." Lazily filled on first `SXHASH` call (R1.19). |
-| `size` | 31:0 | Total object size in bytes including header. Max single object 4 GiB. |
+| `hash` | 47:16 | 32-bit identity-hash cache. Zero means "not yet computed." Lazily filled on first `SXHASH` call (R1.19). 32 bits provides ~4 billion distinct hashes, sufficient to avoid excessive collisions in EQ-based hash tables even with millions of live objects. |
+| `size` | 15:0 | Object size in 8-byte units including header. Max inline size = 65 535 × 8 = 524 280 bytes. Objects exceeding this use a **large-object extension**: the `size` field is set to `0xFFFF` (sentinel), and the true 64-bit byte size is stored as a `u64` immediately following the header at offset 8, with the object's payload beginning at offset 16 instead of offset 8. Large objects (≥ 512 KiB) are allocated directly in the old generation per `BLISS_LARGE_OBJECT_THRESHOLD` (§1.21). |
 
 ### 1.3.1  GC Bits Layout
 
@@ -217,10 +217,28 @@ points directly at byte offset 0 of the cons cell; untag by
 
 Headerless cons cells mean the GC must identify cons cells by their
 allocation region (nursery cons pages vs. object pages) or by the
-`BlissVal` tag of the referring pointer. When a cons is forwarded
-during evacuation, the `car` field is overwritten with a forwarding
-pointer (tag `010`, type_id `0x01` in the target's header). The `cdr`
-field stores the forwarding address.
+`BlissVal` tag of the referring pointer.
+
+**Cons forwarding protocol.** When a cons is evacuated during GC, it is
+copied to another cons page (remaining headerless at the destination —
+it does NOT gain an `ObjectHeader`). The original cell is then
+overwritten in place as follows:
+
+- `car` ← a **forwarding sentinel**: the special `BlissVal` bit pattern
+  `0x0000_0000_0000_0017` (`UNBOUND`). Because `UNBOUND` can never
+  legitimately appear as a `car` value, its presence signals that the
+  cell has been forwarded.
+- `cdr` ← the new address of the evacuated cons, encoded as a raw
+  `BlissVal` with tag `001` (cons pointer to the destination cell).
+
+During GC pointer-fix-up, any cons reference is checked by loading the
+`car` field of the target cell: if it equals the `UNBOUND` sentinel,
+the reference is updated to the forwarding address stored in `cdr`.
+
+The type_id `0x01` in the Heap Type ID table (§1.3.2) is reserved for
+GC metadata and internal type-dispatch tables; it is never stored in an
+`ObjectHeader` for cons cells (since they remain headerless throughout
+their lifetime, including after evacuation).
 
 ---
 
@@ -515,7 +533,7 @@ Offset  Size     Field
  24       8      external_symbols: BlissVal — hash-table (string → symbol)
  32       8      use_list: BlissVal       — list of used packages
  40       8      nicknames: BlissVal      — list of strings
- 48       8      lock: RwLock<()>         — per-package reader-writer lock
+ 48       8      lock: *mut RwLock<()>    — pointer to heap-allocated per-package reader-writer lock
 ```
 
 ---
@@ -525,7 +543,7 @@ Offset  Size     Field
 ```text
 Offset  Size     Field
   0       8      ObjectHeader { type_id=0x13 }
-  8       8      direction: u8       — :input=0 :output=1 :io=2
+  8       1      direction: u8       — :input=0 :output=1 :io=2
   9       1      element_type: u8    — 0=character 1=byte
  10       6      padding
  16       8      ops: *const StreamOps — vtable: read_char, write_char, read_byte, ...
@@ -650,9 +668,82 @@ fn type_id_of(v: BlissVal) -> u8 {
     (unsafe { *ptr } >> 56) as u8
 }
 fn stringp(v: BlissVal) -> bool {
-    heap_object_p(v) && matches!(type_id_of(v), 0x05 | 0x06)
+    if !heap_object_p(v) { return false; }
+    let tid = type_id_of(v);
+    // Simple strings: direct type_id check
+    if tid == 0x05 || tid == 0x06 { return true; }
+    // Complex (adjustable/displaced) strings: a COMPLEX-ARRAY whose
+    // element_type_tag indicates character or base-char elements.
+    if tid == 0x07 {
+        let ptr = (v.0 & !0x7) as *const u8;
+        let elt_tag = unsafe { *ptr.add(33) }; // rank is at offset 33
+        // Actually: element_type_tag is stored on the underlying simple
+        // array. Dereference the `underlying` field (offset 8) and read
+        // its element_type_tag (offset 17).
+        let underlying = unsafe { *((ptr.add(8)) as *const u64) };
+        let und_ptr = (underlying & !0x7) as *const u8;
+        let elt = unsafe { *und_ptr.add(17) };  // element_type_tag at offset 17
+        return elt == 12 || elt == 13; // CHARACTER or BASE-CHAR
+    }
+    false
+}
+
+// VECTORP: rank-1 arrays (simple-vector, simple strings, simple
+// specialised arrays with rank=1, or complex arrays with rank=1).
+fn vectorp(v: BlissVal) -> bool {
+    if !heap_object_p(v) { return false; }
+    let tid = type_id_of(v);
+    // Simple-vector and simple strings are always vectors (rank 1)
+    if matches!(tid, 0x03 | 0x05 | 0x06) { return true; }
+    // Simple specialised array: check rank == 1
+    if tid == 0x04 {
+        let ptr = (v.0 & !0x7) as *const u8;
+        return unsafe { *ptr.add(16) } == 1; // rank at offset 16
+    }
+    // Complex array: check rank == 1
+    if tid == 0x07 {
+        let ptr = (v.0 & !0x7) as *const u8;
+        return unsafe { *ptr.add(33) } == 1; // rank at offset 33
+    }
+    false
+}
+
+// ARRAYP: any array type
+fn arrayp(v: BlissVal) -> bool {
+    heap_object_p(v) && matches!(type_id_of(v), 0x03 | 0x04 | 0x05 | 0x06 | 0x07)
+}
+
+// BIT-VECTOR-P: rank-1 array with BIT element type
+fn bit_vector_p(v: BlissVal) -> bool {
+    if !heap_object_p(v) { return false; }
+    let tid = type_id_of(v);
+    if tid == 0x04 {
+        let ptr = (v.0 & !0x7) as *const u8;
+        let rank = unsafe { *ptr.add(16) };
+        let elt = unsafe { *ptr.add(17) };
+        return rank == 1 && elt == 1; // rank 1, element_type_tag BIT
+    }
+    if tid == 0x07 {
+        // Complex array: must be rank 1 with BIT underlying
+        let ptr = (v.0 & !0x7) as *const u8;
+        let rank = unsafe { *ptr.add(33) };
+        if rank != 1 { return false; }
+        let underlying = unsafe { *((ptr.add(8)) as *const u64) };
+        let und_ptr = (underlying & !0x7) as *const u8;
+        let elt = unsafe { *und_ptr.add(17) };
+        return elt == 1; // BIT
+    }
+    false
 }
 ```
+
+**Note on compound type predicates.** ANSI CL requires `STRINGP`,
+`VECTORP`, `BIT-VECTOR-P`, and `ARRAYP` to return `T` for both simple
+and complex (adjustable/displaced) variants. The predicates above
+handle this by checking type_id `0x07` (COMPLEX-ARRAY) and inspecting
+the `rank` and/or the underlying array's `element_type_tag`. The
+compiler (§4) SHOULD emit specialised inline sequences for these common
+predicates rather than falling through to generic `TYPEP`.
 
 `TYPEP` for compound types (`(AND ...)`, `(OR ...)`, `(SATISFIES ...)`)
 is expanded by the compiler into compositions of these primitives (§4).
