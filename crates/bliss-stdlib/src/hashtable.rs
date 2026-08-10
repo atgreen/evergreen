@@ -1,5 +1,10 @@
 //! Hash tables — Robin Hood hashing with open addressing.
 //!
+//! Robin Hood hashing: on insert, each entry tracks its probe distance
+//! (displacement from its natural slot). When an incoming entry has a
+//! longer probe distance than the occupant, they swap — this bounds
+//! the variance of probe lengths, giving O(log n) worst-case lookup.
+//!
 //! See spec §5.7.
 
 use bliss_rt::error::BlissError;
@@ -48,12 +53,21 @@ impl Default for MakeHashTableOptions {
 
 // ── Internal representation ───────────────────────────────────────
 
+/// An entry in the Robin Hood table, tracking its probe distance.
+#[derive(Clone, Copy)]
+struct RHEntry {
+    key: BlissVal,
+    value: BlissVal,
+    /// Distance from the entry's natural (home) slot.
+    probe_dist: usize,
+}
+
 /// The internal data structure for a hash table, stored on the heap.
 #[repr(C)]
 struct HashTableInner {
     header: ObjectHeader,
     test: HashTest,
-    entries: Vec<Option<(BlissVal, BlissVal)>>,
+    entries: Vec<Option<RHEntry>>,
     count: usize,
     capacity: usize,
     rehash_size: f64,
@@ -84,8 +98,11 @@ fn hash_u64(val: u64) -> u64 {
     h
 }
 
-/// Extract a pointer to HashTableInner from a BlissVal, validating it is a hash table.
-fn get_table_inner(table: BlissVal) -> Result<&'static mut HashTableInner, BlissError> {
+/// Extract a raw pointer to HashTableInner from a BlissVal, validating it is a hash table.
+///
+/// Returns a raw pointer to avoid creating multiple `&mut` references (UB).
+/// Callers use unsafe raw-pointer operations to access the inner data.
+fn get_table_inner(table: BlissVal) -> Result<*mut HashTableInner, BlissError> {
     if table.tag() != TAG_HEAP_OBJECT {
         return Err(BlissError::TypeError {
             datum: table,
@@ -99,14 +116,14 @@ fn get_table_inner(table: BlissVal) -> Result<&'static mut HashTableInner, Bliss
             expected: "HASH-TABLE".to_string(),
         });
     }
-    let inner = unsafe { &mut *ptr };
-    if inner.header.type_id() != type_id::HASH_TABLE {
+    // Safety: ptr is non-null and was created from a valid heap allocation
+    if unsafe { (*ptr).header.type_id() } != type_id::HASH_TABLE {
         return Err(BlissError::TypeError {
             datum: table,
             expected: "HASH-TABLE".to_string(),
         });
     }
-    Ok(inner)
+    Ok(ptr)
 }
 
 /// Compute the probe index for a key in a table of the given capacity.
@@ -114,9 +131,25 @@ fn probe_index(key_bits: u64, capacity: usize) -> usize {
     (hash_u64(key_bits) as usize) & (capacity - 1)
 }
 
-/// Check if two keys are equal (using raw bit equality for all test modes in this base impl).
-fn keys_equal(a: BlissVal, b: BlissVal) -> bool {
-    a.0 == b.0
+/// Check if two keys are equal according to the given hash test.
+///
+/// - Eq / Eql: identity (raw bit equality) — correct for fixnums, symbols, etc.
+/// - Equal: structural equality — would recurse into conses/strings; falls back
+///   to bit equality for non-compound types until full CL type dispatch is wired up.
+/// - Equalp: case-insensitive structural equality — same fallback for now.
+fn keys_equal(a: BlissVal, b: BlissVal, test: HashTest) -> bool {
+    match test {
+        HashTest::Eq | HashTest::Eql => a.0 == b.0,
+        HashTest::Equal => {
+            // For compound types (cons, string, etc.) a full recursive walk is
+            // needed; for now fall back to bit equality which is correct for
+            // fixnums, symbols, and other immediate values.
+            a.0 == b.0
+        }
+        HashTest::Equalp => {
+            a.0 == b.0
+        }
+    }
 }
 
 // ── Hash table operations ──────────────────────────────────────────
@@ -165,16 +198,25 @@ pub fn gethash(
     table: BlissVal,
     default: BlissVal,
 ) -> Result<(BlissVal, bool), BlissError> {
-    let inner = get_table_inner(table)?;
+    let ptr = get_table_inner(table)?;
+    // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
+    // We create exactly one &mut reference from the raw pointer per call.
+    let inner = unsafe { &mut *ptr };
     let cap = inner.capacity;
+    let test = inner.test;
     let key_bits = key.0;
     let mut idx = probe_index(key_bits, cap);
 
-    for _ in 0..cap {
+    for dist in 0..cap {
         match &inner.entries[idx] {
-            Some((k, v)) => {
-                if keys_equal(*k, key) {
-                    return Ok((*v, true));
+            Some(entry) => {
+                // Robin Hood: if the occupant's probe distance is less than
+                // our current search distance, the key can't be present.
+                if entry.probe_dist < dist {
+                    return Ok((default, false));
+                }
+                if keys_equal(entry.key, key, test) {
+                    return Ok((entry.value, true));
                 }
             }
             None => {
@@ -188,18 +230,35 @@ pub fn gethash(
 
 /// Resize the table when load factor exceeds threshold.
 fn resize_table(inner: &mut HashTableInner) {
-    let new_capacity = inner.capacity * (inner.rehash_size as usize).max(2);
-    let new_capacity = next_power_of_two(new_capacity);
-    let mut new_entries = vec![None; new_capacity];
+    // Issue #1 fix: use float multiplication to preserve fractional rehash_size
+    let new_capacity = (inner.capacity as f64 * inner.rehash_size) as usize;
+    let new_capacity = next_power_of_two(new_capacity.max(inner.capacity + 1));
+    let mut new_entries: Vec<Option<RHEntry>> = vec![None; new_capacity];
 
     for entry in inner.entries.iter() {
-        if let Some((k, v)) = entry {
-            let mut idx = probe_index(k.0, new_capacity);
+        if let Some(e) = entry {
+            let mut idx = probe_index(e.key.0, new_capacity);
+            let mut incoming = RHEntry {
+                key: e.key,
+                value: e.value,
+                probe_dist: 0,
+            };
             loop {
-                if new_entries[idx].is_none() {
-                    new_entries[idx] = Some((*k, *v));
-                    break;
+                match &new_entries[idx] {
+                    None => {
+                        new_entries[idx] = Some(incoming);
+                        break;
+                    }
+                    Some(occupant) => {
+                        // Robin Hood: swap if incoming has traveled farther
+                        if incoming.probe_dist > occupant.probe_dist {
+                            let displaced = *occupant;
+                            new_entries[idx] = Some(incoming);
+                            incoming = displaced;
+                        }
+                    }
                 }
+                incoming.probe_dist += 1;
                 idx = (idx + 1) & (new_capacity - 1);
             }
         }
@@ -215,24 +274,36 @@ pub fn set_gethash(
     table: BlissVal,
     value: BlissVal,
 ) -> Result<(), BlissError> {
-    let inner = get_table_inner(table)?;
+    let ptr = get_table_inner(table)?;
+    // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
+    // We create exactly one &mut reference from the raw pointer per call.
+    let inner = unsafe { &mut *ptr };
+    let test = inner.test;
+    let key_bits = key.0;
 
     // Check if key already exists and update in place
-    let cap = inner.capacity;
-    let key_bits = key.0;
-    let mut idx = probe_index(key_bits, cap);
-
-    for _ in 0..cap {
-        match &inner.entries[idx] {
-            Some((k, _)) => {
-                if keys_equal(*k, key) {
-                    inner.entries[idx] = Some((key, value));
-                    return Ok(());
+    {
+        let cap = inner.capacity;
+        let mut idx = probe_index(key_bits, cap);
+        for dist in 0..cap {
+            match &inner.entries[idx] {
+                Some(entry) => {
+                    if entry.probe_dist < dist {
+                        break; // Robin Hood: key can't be present beyond this point
+                    }
+                    if keys_equal(entry.key, key, test) {
+                        inner.entries[idx] = Some(RHEntry {
+                            key,
+                            value,
+                            probe_dist: entry.probe_dist,
+                        });
+                        return Ok(());
+                    }
                 }
+                None => break,
             }
-            None => break,
+            idx = (idx + 1) & (cap - 1);
         }
-        idx = (idx + 1) & (cap - 1);
     }
 
     // Check load factor and resize if needed
@@ -241,55 +312,75 @@ pub fn set_gethash(
         resize_table(inner);
     }
 
-    // Insert into (possibly resized) table
+    // Insert into (possibly resized) table using Robin Hood insertion
     let cap = inner.capacity;
     let mut idx = probe_index(key_bits, cap);
+    let mut incoming = RHEntry {
+        key,
+        value,
+        probe_dist: 0,
+    };
     loop {
-        if inner.entries[idx].is_none() {
-            inner.entries[idx] = Some((key, value));
-            inner.count += 1;
-            return Ok(());
+        match &inner.entries[idx] {
+            None => {
+                inner.entries[idx] = Some(incoming);
+                inner.count += 1;
+                return Ok(());
+            }
+            Some(occupant) => {
+                // Robin Hood: if incoming has traveled farther, swap
+                if incoming.probe_dist > occupant.probe_dist {
+                    let displaced = *occupant;
+                    inner.entries[idx] = Some(incoming);
+                    incoming = displaced;
+                }
+            }
         }
+        incoming.probe_dist += 1;
         idx = (idx + 1) & (cap - 1);
     }
 }
 
 /// Remove an entry (CL `REMHASH`).
 pub fn remhash(key: BlissVal, table: BlissVal) -> Result<bool, BlissError> {
-    let inner = get_table_inner(table)?;
+    let ptr = get_table_inner(table)?;
+    // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
+    // We create exactly one &mut reference from the raw pointer per call.
+    let inner = unsafe { &mut *ptr };
     let cap = inner.capacity;
+    let test = inner.test;
     let key_bits = key.0;
     let mut idx = probe_index(key_bits, cap);
 
-    for _ in 0..cap {
+    for dist in 0..cap {
         match &inner.entries[idx] {
-            Some((k, _)) => {
-                if keys_equal(*k, key) {
-                    // Remove the entry
+            Some(entry) => {
+                if entry.probe_dist < dist {
+                    return Ok(false); // Robin Hood: key not present
+                }
+                if keys_equal(entry.key, key, test) {
+                    // Remove the entry and backward-shift to maintain
+                    // Robin Hood invariant
                     inner.entries[idx] = None;
                     inner.count -= 1;
 
-                    // Re-insert displaced entries (backward-shift deletion)
+                    // Backward-shift: move subsequent entries back to fill
+                    // the gap, decrementing their probe distances.
                     let mut j = (idx + 1) & (cap - 1);
                     loop {
-                        if inner.entries[j].is_none() {
-                            break;
-                        }
-                        let entry = inner.entries[j].unwrap();
-                        let natural = probe_index(entry.0 .0, cap);
-                        // Check if entry at j would prefer to be at idx
-                        // i.e., idx is between natural and j (circularly)
-                        let should_move = if j >= idx {
-                            // no wrap: natural <= idx or natural > j
-                            natural <= idx || natural > j
-                        } else {
-                            // wrapped: natural <= idx AND natural > j
-                            natural <= idx && natural > j
-                        };
-                        if should_move {
-                            inner.entries[idx] = Some(entry);
-                            inner.entries[j] = None;
-                            idx = j;
+                        match inner.entries[j] {
+                            None => break,
+                            Some(next) => {
+                                if next.probe_dist == 0 {
+                                    break; // entry is at its natural slot
+                                }
+                                inner.entries[idx] = Some(RHEntry {
+                                    probe_dist: next.probe_dist - 1,
+                                    ..next
+                                });
+                                inner.entries[j] = None;
+                                idx = j;
+                            }
                         }
                         j = (j + 1) & (cap - 1);
                     }
@@ -308,12 +399,14 @@ pub fn remhash(key: BlissVal, table: BlissVal) -> Result<bool, BlissError> {
 
 /// Map a function over hash table entries (CL `MAPHASH`).
 pub fn maphash(function: BlissVal, table: BlissVal) -> Result<(), BlissError> {
-    let inner = get_table_inner(table)?;
+    let ptr = get_table_inner(table)?;
+    // Safety: single &mut from raw pointer, valid for the function's duration.
+    let inner = unsafe { &mut *ptr };
     // Iterate all entries. For now, we just iterate without calling the function
     // (as tests only check the table is unchanged after maphash).
     let _func = function; // Will be used when function invocation is available
     for entry in inner.entries.iter() {
-        if let Some((_key, _value)) = entry {
+        if let Some(_e) = entry {
             // In a full implementation, we'd call `function` with (key, value).
             // For now, this is a no-op iteration.
         }
@@ -323,7 +416,9 @@ pub fn maphash(function: BlissVal, table: BlissVal) -> Result<(), BlissError> {
 
 /// Clear all entries (CL `CLRHASH`).
 pub fn clrhash(table: BlissVal) -> Result<(), BlissError> {
-    let inner = get_table_inner(table)?;
+    let ptr = get_table_inner(table)?;
+    // Safety: single &mut from raw pointer, valid for the function's duration.
+    let inner = unsafe { &mut *ptr };
     for entry in inner.entries.iter_mut() {
         *entry = None;
     }
@@ -333,32 +428,33 @@ pub fn clrhash(table: BlissVal) -> Result<(), BlissError> {
 
 /// Get the number of entries (CL `HASH-TABLE-COUNT`).
 pub fn hash_table_count(table: BlissVal) -> Result<usize, BlissError> {
-    let inner = get_table_inner(table)?;
-    Ok(inner.count)
+    let ptr = get_table_inner(table)?;
+    // Safety: single shared read from raw pointer.
+    Ok(unsafe { (*ptr).count })
 }
 
 /// Get the hash table test (CL `HASH-TABLE-TEST`).
 pub fn hash_table_test(table: BlissVal) -> Result<HashTest, BlissError> {
-    let inner = get_table_inner(table)?;
-    Ok(inner.test)
+    let ptr = get_table_inner(table)?;
+    Ok(unsafe { (*ptr).test })
 }
 
 /// Get the hash table size (capacity).
 pub fn hash_table_size(table: BlissVal) -> Result<usize, BlissError> {
-    let inner = get_table_inner(table)?;
-    Ok(inner.capacity)
+    let ptr = get_table_inner(table)?;
+    Ok(unsafe { (*ptr).capacity })
 }
 
 /// Get the rehash size.
 pub fn hash_table_rehash_size(table: BlissVal) -> Result<f64, BlissError> {
-    let inner = get_table_inner(table)?;
-    Ok(inner.rehash_size)
+    let ptr = get_table_inner(table)?;
+    Ok(unsafe { (*ptr).rehash_size })
 }
 
 /// Get the rehash threshold.
 pub fn hash_table_rehash_threshold(table: BlissVal) -> Result<f64, BlissError> {
-    let inner = get_table_inner(table)?;
-    Ok(inner.rehash_threshold)
+    let ptr = get_table_inner(table)?;
+    Ok(unsafe { (*ptr).rehash_threshold })
 }
 
 // ── SXHASH ─────────────────────────────────────────────────────────
