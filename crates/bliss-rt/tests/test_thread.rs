@@ -98,3 +98,23 @@ fn all_thread_ids_includes_current() {
 fn max_tls_is_4096() {
     assert_eq!(MAX_TLS, 4096);
 }
+
+// ── WorkerThread ─────────────────────────────────────────────────
+
+#[test]
+fn worker_thread_struct_exists_and_is_constructible() {
+    // WorkerThread is a public struct — verify it can be instantiated.
+    // It currently has a private field `_private: ()`, so we use the fact
+    // that it's exported and check its size (should be zero-sized).
+    assert_eq!(
+        std::mem::size_of::<WorkerThread>(),
+        0,
+        "WorkerThread should be a zero-sized type"
+    );
+}
+
+#[test]
+fn worker_thread_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<WorkerThread>();
+}

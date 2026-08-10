@@ -528,3 +528,278 @@ fn heap_size_flag_accepted() {
         "--heap-size 128M should be accepted"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════
+// Condition handling (handler-bind / handler-case)
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn eval_handler_case_catches_error() {
+    let output = bliss_bin()
+        .args(["--eval", "(handler-case (error \"boom\") (error (c) (format nil \"caught: ~A\" c)))"])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "exit code should be 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("caught"),
+        "handler-case should catch the error and print 'caught: ...', got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn eval_handler_bind_invokes_handler() {
+    let expr = r#"(let ((result nil))
+  (handler-bind ((error (lambda (c) (setq result "handled"))))
+    (signal (make-condition 'error)))
+  result)"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("handled"),
+        "handler-bind should invoke handler, got: '{}'",
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// CLOS (defclass / defmethod)
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn eval_defclass_and_make_instance() {
+    let expr = r#"(progn
+  (defclass point () ((x :initarg :x :accessor point-x) (y :initarg :y :accessor point-y)))
+  (let ((p (make-instance 'point :x 3 :y 4)))
+    (format nil "~A,~A" (point-x p) (point-y p))))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("3") && stdout.contains("4"),
+        "defclass + make-instance should produce object with correct slots, got: '{}'",
+        stdout
+    );
+}
+
+#[test]
+fn eval_defmethod_dispatches_correctly() {
+    let expr = r#"(progn
+  (defclass animal () ())
+  (defclass dog (animal) ())
+  (defmethod speak ((a animal)) "generic")
+  (defmethod speak ((d dog)) "woof")
+  (speak (make-instance 'dog)))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("woof"),
+        "defmethod should dispatch to most specific method, got: '{}'",
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Package system (defpackage / in-package)
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn eval_defpackage_and_intern() {
+    let expr = r#"(progn
+  (defpackage :test-pkg (:use :cl) (:export :hello))
+  (in-package :test-pkg)
+  (defun hello () "hi from test-pkg")
+  (in-package :cl-user)
+  (test-pkg:hello))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hi from test-pkg"),
+        "defpackage + exported symbol should be accessible, got: '{}'",
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Macro definition (defmacro)
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn eval_defmacro_and_expansion() {
+    let expr = r#"(progn
+  (defmacro when-true (test &body body)
+    `(if ,test (progn ,@body)))
+  (when-true t (format nil "macro-expanded")))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("macro-expanded"),
+        "defmacro should define a working macro, got: '{}'",
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Multiple values (multiple-value-bind)
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn eval_multiple_value_bind() {
+    let expr = r#"(multiple-value-bind (q r) (floor 17 5)
+  (format nil "~A ~A" q r))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains('3') && stdout.contains('2'),
+        "multiple-value-bind of (floor 17 5) should yield 3 and 2, got: '{}'",
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Error signaling (error / cerror)
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn eval_error_produces_nonzero_exit() {
+    let output = bliss_bin()
+        .args(["--eval", "(error \"fatal error test\")"])
+        .output()
+        .expect("failed to run bliss");
+    // An unhandled error should cause a non-zero exit or print the error
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.code() != Some(0)
+            || stderr.contains("fatal error test")
+            || stdout.contains("fatal error test"),
+        "unhandled (error ...) should produce non-zero exit or error message, exit={:?}, stderr='{}', stdout='{}'",
+        output.status.code(),
+        stderr,
+        stdout
+    );
+}
+
+#[test]
+fn eval_cerror_with_handler_continues() {
+    let expr = r#"(handler-bind ((error (lambda (c) (invoke-restart 'continue))))
+  (cerror "Continue anyway" "soft error")
+  (format nil "continued"))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("continued"),
+        "cerror with continue restart should resume, got: '{}'",
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Sandbox mode (restricts filesystem/network operations)
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn sandbox_mode_restricts_file_access() {
+    let output = bliss_bin()
+        .args([
+            "--sandbox",
+            "--eval",
+            "(with-open-file (s \"/etc/passwd\" :direction :input) (read-line s))",
+        ])
+        .output()
+        .expect("failed to run bliss");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // In sandbox mode, file access should be denied
+    assert!(
+        output.status.code() != Some(0)
+            || stderr.to_uppercase().contains("DENIED")
+            || stderr.to_uppercase().contains("SANDBOX")
+            || stderr.to_uppercase().contains("PERMISSION")
+            || stderr.to_uppercase().contains("ERROR")
+            || stdout.to_uppercase().contains("DENIED")
+            || stdout.to_uppercase().contains("ERROR"),
+        "sandbox mode should deny file access, exit={:?}, stderr='{}', stdout='{}'",
+        output.status.code(),
+        stderr,
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Image save/load cycle
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn image_save_and_load_cycle() {
+    let dir = std::env::temp_dir().join("bliss_test_image");
+    let _ = std::fs::create_dir_all(&dir);
+    let image_path = dir.join("test.image");
+
+    // Step 1: Define a function and save an image
+    let save_expr = format!(
+        "(progn (defun my-fn () 99) (save-image \"{}\"))",
+        image_path.to_str().unwrap().replace('\\', "\\\\")
+    );
+    let output = bliss_bin()
+        .args(["--eval", &save_expr])
+        .output()
+        .expect("failed to run bliss for save");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "save-image should succeed, stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Step 2: Load the image and call the function
+    let output = bliss_bin()
+        .args([
+            "--image",
+            image_path.to_str().unwrap(),
+            "--eval",
+            "(my-fn)",
+        ])
+        .output()
+        .expect("failed to run bliss for load");
+
+    // Clean up
+    let _ = std::fs::remove_file(&image_path);
+    let _ = std::fs::remove_dir(&dir);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("99"),
+        "loading image should restore my-fn returning 99, got: '{}'",
+        stdout
+    );
+}

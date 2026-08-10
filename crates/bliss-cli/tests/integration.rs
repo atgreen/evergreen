@@ -86,9 +86,13 @@ fn runtime_run_with_eval_form() {
 fn eval_integer_literal() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("42");
-    assert!(result.is_ok(), "eval of integer literal should not error");
-    // When wired: result should be fixnum 42
+    let result = rt.eval("42").expect("eval of integer literal should not error");
+    assert_eq!(
+        result,
+        BlissVal::from_fixnum(42),
+        "eval of '42' should return fixnum 42, got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
@@ -96,8 +100,13 @@ fn eval_integer_literal() {
 fn eval_quoted_symbol() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("'foo");
-    assert!(result.is_ok(), "eval of quoted symbol should not error");
+    let result = rt.eval("'foo").expect("eval of quoted symbol should not error");
+    // Result should be a symbol named FOO (CL upcases by default)
+    assert!(
+        result.is_symbol(),
+        "eval of 'foo should return a symbol, got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
@@ -105,8 +114,12 @@ fn eval_quoted_symbol() {
 fn eval_string_literal() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("\"hello\"");
-    assert!(result.is_ok(), "eval of string literal should not error");
+    let result = rt.eval("\"hello\"").expect("eval of string literal should not error");
+    assert!(
+        result.is_string(),
+        "eval of '\"hello\"' should return a string, got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
@@ -114,9 +127,13 @@ fn eval_string_literal() {
 fn eval_cons_construction() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("(cons 1 2)");
-    assert!(result.is_ok(), "eval of cons should not error");
-    // When wired: result should be a cons cell (1 . 2)
+    let result = rt.eval("(cons 1 2)").expect("eval of cons should not error");
+    // Result should be a cons cell (1 . 2)
+    assert!(
+        result.is_cons(),
+        "eval of '(cons 1 2)' should return a cons cell, got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
@@ -124,8 +141,13 @@ fn eval_cons_construction() {
 fn eval_list_construction() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("(list 1 2 3)");
-    assert!(result.is_ok(), "eval of list should not error");
+    let result = rt.eval("(list 1 2 3)").expect("eval of list should not error");
+    // Result should be a cons cell (a proper list)
+    assert!(
+        result.is_cons(),
+        "eval of '(list 1 2 3)' should return a cons (list), got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
@@ -133,9 +155,13 @@ fn eval_list_construction() {
 fn eval_lambda_application() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("((lambda (x) (* x x)) 5)");
-    assert!(result.is_ok(), "eval of lambda application should not error");
-    // When wired: result should be fixnum 25
+    let result = rt.eval("((lambda (x) (* x x)) 5)").expect("eval of lambda application should not error");
+    assert_eq!(
+        result,
+        BlissVal::from_fixnum(25),
+        "eval of '((lambda (x) (* x x)) 5)' should return 25, got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
@@ -143,9 +169,13 @@ fn eval_lambda_application() {
 fn eval_let_binding() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("(let ((x 10) (y 20)) (+ x y))");
-    assert!(result.is_ok(), "eval of let should not error");
-    // When wired: result should be fixnum 30
+    let result = rt.eval("(let ((x 10) (y 20)) (+ x y))").expect("eval of let should not error");
+    assert_eq!(
+        result,
+        BlissVal::from_fixnum(30),
+        "eval of '(let ((x 10) (y 20)) (+ x y))' should return 30, got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
@@ -153,9 +183,13 @@ fn eval_let_binding() {
 fn eval_if_true_branch() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("(if t 'yes 'no)");
-    assert!(result.is_ok(), "eval of if should not error");
-    // When wired: result should be symbol YES
+    let result = rt.eval("(if t 'yes 'no)").expect("eval of if should not error");
+    // Result should be the symbol YES
+    assert!(
+        result.is_symbol(),
+        "eval of '(if t 'yes 'no)' should return a symbol, got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
@@ -163,9 +197,13 @@ fn eval_if_true_branch() {
 fn eval_if_false_branch() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("(if nil 'yes 'no)");
-    assert!(result.is_ok(), "eval of if (false) should not error");
-    // When wired: result should be symbol NO
+    let result = rt.eval("(if nil 'yes 'no)").expect("eval of if (false) should not error");
+    // Result should be the symbol NO
+    assert!(
+        result.is_symbol(),
+        "eval of '(if nil 'yes 'no)' should return a symbol, got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
@@ -178,13 +216,11 @@ fn eval_unbound_variable_signals_error() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
     let result = rt.eval("nonexistent-variable-xyz");
-    // When wired, this should return Err (unbound variable condition)
-    // In bootstrap mode, this may succeed with NIL; the test documents intent
-    // that once real eval exists, unbound variables must signal an error.
-    if result.is_ok() {
-        // Bootstrap mode — acceptable for now, will fail when eval is real
-        // and the variable is truly unbound
-    }
+    assert!(
+        result.is_err(),
+        "eval of unbound variable should return an error, got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
@@ -193,8 +229,11 @@ fn eval_malformed_expression_signals_error() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
     let result = rt.eval("(+ 1");
-    // Unbalanced parentheses should be a reader error
-    // In bootstrap this may not error; test documents the requirement
+    assert!(
+        result.is_err(),
+        "unbalanced parens should be a reader error, got: {:?}",
+        result
+    );
     rt.shutdown().unwrap();
 }
 
