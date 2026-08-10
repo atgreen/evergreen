@@ -105,7 +105,7 @@ Each entry in the section directory:
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0x00 | 4 | `section_type` — enum: Heap=1, Symbols=2, Packages=3, Code=4, Reloc=5, GcMeta=6 |
+| 0x00 | 4 | `section_type` — enum: Heap=1, Symbols=2, Packages=3, Code=4, Reloc=5, GcMeta=6, Settings=7 |
 | 0x04 | 4 | `flags` — per-section flags (compression, alignment) |
 | 0x08 | 8 | `file_offset` — byte offset from start of file |
 | 0x10 | 8 | `size` — byte length in file (compressed size if applicable) |
@@ -186,16 +186,32 @@ deltas) for compactness.
 reloc_entry ::= delta: u32   // byte offset from previous reloc site
 ```
 
+When the gap between two consecutive relocatable pointers exceeds
+2^32 − 2 bytes (≈ 4 GiB), a single u32 delta is insufficient.  The
+escape encoding `delta = 0xFFFFFFFF` signals that the next 8 bytes
+encode the actual delta as a little-endian u64:
+
+```text
+escape_entry ::= 0xFFFFFFFF: u32, extended_delta: u64
+```
+
+This supports arbitrarily large heaps while keeping the common-case
+entry compact (4 bytes).  A delta value of `0xFFFFFFFF` MUST NOT be
+used literally; all gaps of exactly 0xFFFFFFFF bytes MUST also use the
+escape encoding.
+
 **A7.01 — Pointer relocation algorithm:**
 
 ```text
 1. offset_delta ← load_base − original_base
 2. IF offset_delta = 0 THEN skip relocation
 3. pos ← 0
-4. FOR EACH delta IN relocation_table:
-5.     pos ← pos + delta
-6.     *(u64 *)(heap + pos) += offset_delta
-7. Flush instruction cache for code regions
+4. FOR EACH entry IN relocation_table:
+5.     delta ← read_u32(entry)
+6.     IF delta = 0xFFFFFFFF THEN delta ← read_u64(entry + 4)   // escape
+7.     pos ← pos + delta
+8.     *(u64 *)(heap + pos) += offset_delta
+9. Flush instruction cache for code regions
 ```
 
 This runs in O(n) where n = number of relocatable pointers.  Typical
@@ -246,12 +262,15 @@ Load is performed by the runtime startup code
 
 1. Open image file, read and validate header (magic, version,
    platform tag, header SHA-256).
-2. Read section directory.
-3. `mmap` heap section with `MAP_PRIVATE`.
-4. If load base ≠ `original_base`, execute relocation (A7.01).
-5. Deserialise symbol table; reconstruct package registry.
-6. Map compiled code cache as RX pages; apply code relocations.
-7. Verify trailing checksum (full-file SHA-256).
+2. Verify trailing checksum (full-file SHA-256) over all bytes
+   preceding the 32-byte trailer.  This MUST occur before any heap
+   data is interpreted or relocated, so that corrupt or tampered
+   images are rejected before processing (R7.04).
+3. Read section directory.
+4. `mmap` heap section with `MAP_PRIVATE`.
+5. If load base ≠ `original_base`, execute relocation (A7.01).
+6. Deserialise symbol table; reconstruct package registry.
+7. Map compiled code cache as RX pages; apply code relocations.
 8. Resume from `entry_continuation`.
 
 Load from a read-only filesystem is supported because `MAP_PRIVATE`
@@ -281,11 +300,15 @@ fn find_appended_image(exe_path: &Path) -> Option<MappedImage> {
     let len = file.metadata()?.len();
     let trailer: [u8; 8] = read_at(&file, len - 8)?;
     let img_offset = u64::from_le_bytes(trailer);
-    if img_offset > 0 && img_offset < len - 8 {
-        mmap_image(&file, img_offset)
-    } else {
-        None
+    if img_offset == 0 || img_offset >= len - 8 {
+        return None;
     }
+    // Validate .bimg magic number at the computed offset before mmap.
+    let magic: [u8; 8] = read_at(&file, img_offset)?;
+    if u64::from_le_bytes(magic) != 0x424C4953_53494D47 {
+        return None; // Not a valid .bimg payload
+    }
+    mmap_image(&file, img_offset)
 }
 ```
 
@@ -393,15 +416,24 @@ in-image defaults  →  environment variables  →  CLI flags
 | `--gc-log` | `BLISS_GC_LOG` | `--gc-log` |
 | `--jit-log` | `BLISS_JIT_LOG` | `--jit-log` |
 | `--eval`, `-e` | — | `-e '(print 42)'` |
-| `--no-image` | — | Start with an empty heap (bootstrap) |
+| `--no-image` | — | Start with an empty heap (no CL environment loaded) |
+| `--bootstrap` | — | Load `lib/boot.lisp` bootstrap sequence without a pre-existing image (see §0 section 3); provides enough CL to run `SAVE-IMAGE` |
 | `--version` | — | Print version and exit |
 
 ### 7.6.4  In-Image Defaults
 
-At save time, the current configuration values are serialised into the
-image header's reserved section (or a dedicated settings section).
-These act as the lowest-priority defaults on next load, allowing
-application-specific tuning to persist across restarts.
+At save time, the current configuration values are serialised into a
+dedicated Settings section (`section_type = Settings = 7` in the
+section directory, D7.02).  The Settings section contains a
+length-prefixed array of key–value pairs (both UTF-8 strings) encoding
+the configuration keys listed in §7.6.2.  On load, the runtime reads
+this section before environment variable and CLI resolution, so these
+values act as the lowest-priority defaults, allowing application-
+specific tuning to persist across restarts.
+
+> **Note:** The header's `reserved` field (offset 0x48, 24 bytes) MUST
+> remain zero-filled per D7.01 and MUST NOT be used for settings
+> storage.
 
 ---
 
@@ -478,8 +510,11 @@ class Bliss < Formula
     system "cargo", "build", "--release"
     bin.install "target/release/bliss"
     lib.install "target/release/libbliss.dylib"
-    # Build default image
-    system bin/"bliss", "--no-image", "--eval",
+    # Build default image via the bootstrap sequence (see §0 section 3,
+    # lib/boot.lisp).  --bootstrap loads the minimal runtime from
+    # lib/boot.lisp without requiring a pre-existing image, providing
+    # enough of the CL environment to execute SAVE-IMAGE.
+    system bin/"bliss", "--bootstrap", "--eval",
            "(bliss:save-image \"#{lib}/bliss/bliss.bimg\")"
   end
 end
