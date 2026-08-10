@@ -4,7 +4,8 @@
 
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{
-    ConsCell, ComplexData, ElementTypeTag, ObjectHeader, RatioData, ReadtableData, type_id,
+    ConsCell, ComplexData, ElementTypeTag, ObjectHeader, PathnameData, RatioData, ReadtableData,
+    type_id,
 };
 use bliss_rt::value::{BlissVal, EOF, NIL, T, TAG_HEAP_OBJECT};
 use std::collections::HashMap;
@@ -143,6 +144,36 @@ fn alloc_readtable() -> BlissVal {
         dispatch_table: NIL,
     }));
     unsafe { BlissVal::from_heap_ptr(data as *mut ReadtableData as *mut u8) }
+}
+
+fn alloc_pathname(namestring: BlissVal) -> BlissVal {
+    let data = Box::leak(Box::new(PathnameData {
+        header: ObjectHeader::new(type_id::PATHNAME, 7),
+        host: NIL,
+        device: NIL,
+        directory: NIL,
+        name: namestring,
+        type_field: NIL,
+        version: NIL,
+    }));
+    unsafe { BlissVal::from_heap_ptr(data as *mut PathnameData as *mut u8) }
+}
+
+fn alloc_structure(name: BlissVal, slots: &[BlissVal]) -> BlissVal {
+    // Layout: ObjectHeader (8) + name (8) + n_slots (8) + slot data
+    let total_size = 8 + 8 + 8 + slots.len() * 8;
+    let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout);
+        let header = ObjectHeader::new(type_id::STRUCTURE, ((total_size + 7) / 8) as u16);
+        *(ptr as *mut ObjectHeader) = header;
+        *(ptr.add(8) as *mut BlissVal) = name;
+        *(ptr.add(16) as *mut u64) = slots.len() as u64;
+        for (i, &slot) in slots.iter().enumerate() {
+            *(ptr.add(24 + i * 8) as *mut BlissVal) = slot;
+        }
+        BlissVal::from_heap_ptr(ptr)
+    }
 }
 
 /// Build a proper list from elements: (a b c) = cons(a, cons(b, cons(c, NIL)))
@@ -574,6 +605,8 @@ fn read_sharpsign(
             let name: String = token.iter().map(|&(c, esc)| if esc { c } else { c.to_ascii_uppercase() }).collect();
             Ok((make_uninterned_symbol(&name), end))
         }
+        'P' | 'p' => read_pathname_literal(chars, pos),
+        'S' | 's' => read_struct_literal(chars, pos, labels),
         '<' => Err(BlissError::StreamError("unreadable object #<".into())),
         '+' => read_feature_expr(chars, pos, labels, true),
         '-' => read_feature_expr(chars, pos, labels, false),
@@ -733,11 +766,113 @@ fn read_feature_expr(
 }
 
 fn try_eval(form: BlissVal) -> Option<BlissVal> {
-    // Minimal eval for #. — only handles simple (+ n m) forms
-    if !form.is_cons() { return None; }
-    // We can't easily destructure cons cells without unsafe, so return None
-    // to trigger the error path — tests accept this
-    None
+    // Minimal eval for #. — handles simple arithmetic forms like (+ n m)
+    if !form.is_cons() {
+        // Self-evaluating atoms
+        if form.is_fixnum() || form.is_single_float() || form.is_character() {
+            return Some(form);
+        }
+        return None;
+    }
+    // Destructure (op arg1 arg2) from cons cells
+    unsafe {
+        let cell = form.as_ptr() as *const ConsCell;
+        let op = (*cell).car;
+        let rest = (*cell).cdr;
+        if !op.is_symbol() || !rest.is_cons() {
+            return None;
+        }
+        let rest_cell = rest.as_ptr() as *const ConsCell;
+        let arg1_form = (*rest_cell).car;
+        let rest2 = (*rest_cell).cdr;
+
+        // Recursively evaluate arguments
+        let arg1 = try_eval(arg1_form)?;
+
+        // Unary or binary?
+        if rest2.is_nil() {
+            // Unary: e.g. (- x)
+            if !arg1.is_fixnum() { return None; }
+            let a = arg1.as_fixnum();
+            let minus_idx = intern_symbol("-");
+            if op == BlissVal::from_symbol_index(minus_idx) {
+                return Some(BlissVal::from_fixnum(-a));
+            }
+            return None;
+        }
+
+        if !rest2.is_cons() { return None; }
+        let rest2_cell = rest2.as_ptr() as *const ConsCell;
+        let arg2_form = (*rest2_cell).car;
+        let rest3 = (*rest2_cell).cdr;
+        if !rest3.is_nil() { return None; } // only binary ops
+
+        let arg2 = try_eval(arg2_form)?;
+
+        if !arg1.is_fixnum() || !arg2.is_fixnum() { return None; }
+        let a = arg1.as_fixnum();
+        let b = arg2.as_fixnum();
+
+        let plus_idx = intern_symbol("+");
+        let minus_idx = intern_symbol("-");
+        let star_idx = intern_symbol("*");
+
+        if op == BlissVal::from_symbol_index(plus_idx) {
+            Some(BlissVal::from_fixnum(a + b))
+        } else if op == BlissVal::from_symbol_index(minus_idx) {
+            Some(BlissVal::from_fixnum(a - b))
+        } else if op == BlissVal::from_symbol_index(star_idx) {
+            Some(BlissVal::from_fixnum(a * b))
+        } else {
+            None
+        }
+    }
+}
+
+fn read_pathname_literal(chars: &[char], pos: usize) -> Result<(BlissVal, usize), BlissError> {
+    // #P"string" — parse the string that follows
+    if pos >= chars.len() || chars[pos] != '"' {
+        return Err(BlissError::StreamError("expected string after #P".into()));
+    }
+    let (string_val, end) = read_string(chars, pos + 1)?;
+    Ok((alloc_pathname(string_val), end))
+}
+
+fn read_struct_literal(
+    chars: &[char], mut pos: usize, labels: &mut CircularLabels,
+) -> Result<(BlissVal, usize), BlissError> {
+    // #S(name slot-key slot-value ...) — parse struct literal
+    pos = skip_whitespace_and_comments(chars, pos);
+    if pos >= chars.len() || chars[pos] != '(' {
+        return Err(BlissError::StreamError("expected ( after #S".into()));
+    }
+    pos += 1;
+    pos = skip_whitespace_and_comments(chars, pos);
+    if pos >= chars.len() {
+        return Err(BlissError::StreamError("unterminated #S literal".into()));
+    }
+    if chars[pos] == ')' {
+        return Err(BlissError::StreamError("#S() requires a struct name".into()));
+    }
+    // Read struct name
+    let (name_val, p) = read_token(chars, pos, labels)?;
+    pos = p;
+    // Read remaining slot key-value pairs as a flat list
+    let mut slots = Vec::new();
+    loop {
+        pos = skip_whitespace_and_comments(chars, pos);
+        if pos >= chars.len() {
+            return Err(BlissError::StreamError("unterminated #S literal".into()));
+        }
+        if chars[pos] == ')' {
+            pos += 1;
+            break;
+        }
+        let (val, p) = read_token(chars, pos, labels)?;
+        slots.push(val);
+        pos = p;
+    }
+    Ok((alloc_structure(name_val, &slots), pos))
 }
 
 // ── Readtable operations ──────────────────────────────────────────
