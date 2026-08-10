@@ -105,3 +105,33 @@ fn osr_entry_not_yet_implemented() {
     let map_ref = unsafe { &*map.as_ptr() };
     let _ = osr_entry(NIL, map_ref, &[NIL]);
 }
+
+// ── OsrEntryMap::enter ───────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "OsrEntryMap::enter")]
+fn osr_entry_map_enter() {
+    use bliss_compiler::osr::OsrEntryMap;
+    let map = std::mem::MaybeUninit::<OsrEntryMap>::uninit();
+    let map_ref = unsafe { &*map.as_ptr() };
+    let target_pc: *const u8 = std::ptr::null();
+    let _ = map_ref.enter(&[NIL, T], target_pc);
+}
+
+// ── DeoptLog blacklisting ────────────────────────────────────────
+
+#[test]
+fn deopt_log_becomes_blacklisted_after_threshold() {
+    let mut log = DeoptLog::new();
+    let config = DeoptConfig { blacklist_threshold: 3, backoff_seconds: 10 };
+    // Record enough deopts to exceed the threshold
+    for _ in 0..config.blacklist_threshold {
+        log.record(DeoptReason::InlineCacheOverflow);
+    }
+    assert!(
+        log.is_blacklisted(),
+        "DeoptLog should be blacklisted after {} deopts (threshold={})",
+        log.count(),
+        config.blacklist_threshold,
+    );
+}

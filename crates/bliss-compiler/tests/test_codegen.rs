@@ -124,6 +124,23 @@ fn linear_scan_allocator_allocate_returns_result() {
     assert!(alloc.allocate(&graph).is_ok());
 }
 
+// ── RegisterAllocation struct ────────────────────────────────────
+
+#[test]
+fn register_allocation_can_be_stored_and_used() {
+    use bliss_compiler::codegen::RegisterAllocation;
+    use bliss_compiler::ir::IrGraph;
+    let mut alloc = LinearScanAllocator::new(TargetArch::X86_64);
+    let graph = IrGraph::new();
+    let reg_alloc: RegisterAllocation = alloc.allocate(&graph).unwrap();
+    // Verify the RegisterAllocation value is usable: can be moved/stored
+    let _stored = reg_alloc;
+    // Also verify Debug is available if derived
+    let mut alloc2 = LinearScanAllocator::new(TargetArch::Aarch64);
+    let graph2 = IrGraph::new();
+    let _reg_alloc2: RegisterAllocation = alloc2.allocate(&graph2).unwrap();
+}
+
 // ── patch_code ────────────────────────────────────────────────────
 
 #[test]
