@@ -93,6 +93,7 @@ pub struct MachBlock {
 | `IRLoad(base, off)` | `Mov64rm` | Folds base+idx*scale+disp |
 | `IRStore(base, off, val)` | `Mov64mr` | Same addressing |
 | `IRFAdd/FMul` f64 | `Addsd` / `Mulsd` | SSE2; AVX2 prefers `VADDSD` (3-op) |
+| `IRRound(x, mode)` f64 | `Roundsd` | SSE4.1; see §4.7.4.3 fallback |
 | `IRCall` | `Call64r` / `Call64m` | System V ABI |
 | `IRBranch(cmp, t, f)` | `Jcc` | Fused compare-and-branch |
 | `IRSafepoint` | `Nop` + stack map | Metadata only |
@@ -124,6 +125,25 @@ SSE2 scalar: `ADDSD/SUBSD/MULSD/DIVSD/UCOMISD` (double),
 `ADDSS/SUBSS/…` (single). Conversions: `CVTSI2SD`, `CVTTSD2SI`.
 `UCOMISD` sets PF+ZF — backend MUST check both for CL `=` semantics.
 MXCSR FTZ/DAZ MUST NOT be set (ANSI CL requires valid denormals).
+
+**SSE4.1 instructions (when `BLISS_ENABLE_SSE41 ≠ off`):**
+
+| Instruction | CL Use | Notes |
+|-------------|--------|-------|
+| `ROUNDSD imm8` | `ROUND`, `TRUNCATE`, `FLOOR`, `CEILING` | imm8 mode: 0=round-nearest, 1=floor, 2=ceil, 3=truncate |
+| `ROUNDSS imm8` | Same, single-precision | |
+| `PTEST` | Efficient bit-vector zero test | Used for type-tag checking, `LOGTEST` |
+| `BLENDVPD` | Branchless conditional float select | Pattern: `(if test float-a float-b)` |
+
+`ROUNDSD` is the primary motivation for SSE4.1 support — without it, CL
+rounding functions (`ROUND`, `TRUNCATE`, `FLOOR`, `CEILING`) require a
+multi-instruction software sequence: save MXCSR, set rounding mode,
+`CVTSD2SI`, `CVTSI2SD`, restore MXCSR (5+ instructions vs. 1).
+
+**SSE4.1 fallback (SSE2-only):** When SSE4.1 is unavailable, rounding
+operations MUST use the MXCSR rounding-mode sequence. The backend MUST
+save and restore MXCSR around each rounding operation to avoid corrupting
+the rounding mode for subsequent FP instructions.
 
 ---
 
@@ -309,7 +329,53 @@ safepoint. Failures abort installation with `compiler-bug` condition.
 
 ---
 
-## 4.7.10 Code Region Management
+## 4.7.10 Unwind Information
+
+Bliss emits DWARF `.eh_frame`-compatible unwind information for every
+installed function. This enables: (1) debugger stack walks (§6),
+(2) condition/restart stack unwinding (§5), and (3) OS signal-handler
+cooperation (recovering from SIGSEGV/SIGFPE at safepoints).
+
+```rust
+pub struct UnwindInfo {
+    pub format: UnwindFormat,
+    pub fde_bytes: Vec<u8>,           // Frame Description Entry, DWARF .eh_frame
+    pub personality: Option<*const u8>, // pointer to Bliss personality routine
+    pub lsda: Option<Vec<u8>>,        // Language-Specific Data Area for condition handlers
+}
+
+pub enum UnwindFormat {
+    DwarfEhFrame,     // Linux, macOS, FreeBSD — .eh_frame / __eh_frame
+    WindowsSeh,       // Windows x86-64 — RUNTIME_FUNCTION + UNWIND_INFO
+}
+```
+
+**Generation:** Unwind info is constructed during code emission alongside
+the `CodeBuffer`. The emitter tracks frame-pointer adjustments, callee-save
+register pushes/pops, and stack pointer changes, recording each as a DWARF
+CFA (Call Frame Address) instruction in the FDE.
+
+| Event during emission | CFA action |
+|-----------------------|------------|
+| `push rbp` / `stp x29, x30` | `DW_CFA_def_cfa_register(RBP)` |
+| `sub rsp, N` / stack alloc | `DW_CFA_def_cfa_offset(N)` |
+| Callee-save push | `DW_CFA_offset(reg, slot)` |
+| Callee-save pop (epilogue) | `DW_CFA_restore(reg)` |
+
+**Registration:** At code installation (§4.7.11), the FDE is registered with
+the runtime's `.eh_frame` table. On Linux/macOS this uses
+`__register_frame` (libgcc/libunwind). On Windows, `RtlAddFunctionTable`
+registers `RUNTIME_FUNCTION` entries. Deregistration occurs when the
+enclosing `CodeRegion` transitions to `Dead`.
+
+**Personality routine:** Bliss installs a custom DWARF personality routine
+(`bliss_personality`) that cooperates with the CL condition system (§5).
+It reads the LSDA to determine active `HANDLER-BIND`/`HANDLER-CASE`
+frames and routes conditions to the appropriate restart.
+
+---
+
+## 4.7.11 Code Region Management
 
 ```rust
 pub struct CodeRegion {
@@ -333,8 +399,10 @@ pub struct InstalledFunction {
 
 **Installation protocol:** (1) Acquire region write lock. (2) `mprotect`
 → RW. (3) Copy code. (4) Apply relocations. (5) Validate stack maps.
-(6) Register in global code index. (7) `mprotect` → RX. (8) AArch64:
-I-cache invalidation. (9) Advance cursor (16-byte aligned). (10) Release.
+(6) Register unwind info (§4.7.10) via `__register_frame` or
+`RtlAddFunctionTable`. (7) Register in global code index. (8) `mprotect`
+→ RX. (9) AArch64: I-cache invalidation. (10) Advance cursor (16-byte
+aligned). (11) Release.
 
 **Lifecycle:** Active → Full (no space) → Dead (all functions superseded;
 region unmapped). Region size: 2 MB default (one huge page). No code
@@ -343,7 +411,7 @@ the entire region is dead.
 
 ---
 
-## 4.7.11 Error Handling
+## 4.7.12 Error Handling
 
 | Error | Response |
 |-------|----------|
@@ -353,10 +421,11 @@ the entire region is dead.
 | Code region exhaustion | Allocate new region; `storage-condition` if OS refuses |
 | Stack map validation failure | Abort installation; `compiler-bug` condition |
 | `mprotect` failure | `system-error` with errno |
+| Unwind registration failure | Abort installation; `system-error` with details |
 
 ---
 
-## 4.7.12 Concurrency
+## 4.7.13 Concurrency
 
 - **Installation** serialised per region (mutex); multiple regions concurrent.
 - **Patching** lock-free (atomic writes), coordinated via GC safepoints.
@@ -365,7 +434,7 @@ the entire region is dead.
 
 ---
 
-## 4.7.13 Configuration
+## 4.7.14 Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -379,7 +448,7 @@ the entire region is dead.
 
 ---
 
-## 4.7.14 Test Strategy
+## 4.7.15 Test Strategy
 
 | Category | Method |
 |----------|--------|
@@ -391,3 +460,5 @@ the entire region is dead.
 | Code region lifecycle | Fill regions → supersede → verify unmapping via `/proc/self/maps` |
 | Branch overflow | Large functions exceeding `rel8`/26-bit limits; verify veneers |
 | Float edge cases | NaN comparisons, denormal arithmetic, ±0 semantics |
+| Unwind info | Stack walk via `_Unwind_Backtrace`; verify frames match expected call chain |
+| SSE4.1 rounding | `ROUND`/`TRUNCATE`/`FLOOR`/`CEILING` correctness with/without SSE4.1 |
