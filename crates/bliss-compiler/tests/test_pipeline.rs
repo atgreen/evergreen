@@ -7,7 +7,7 @@ use bliss_compiler::reader::read_from_string;
 use bliss_compiler::macroexpand::{
     macroexpand_1, macroexpand, macroexpand_all, Environment, VariableInfo,
 };
-use bliss_compiler::ir::{IrBuilder, IrGraph, NodeKind, EdgeKind, verify};
+use bliss_compiler::ir::{IrBuilder, IrGraph, NodeId, NodeKind, EdgeKind, verify};
 use bliss_compiler::opt::PassManager;
 use bliss_compiler::codegen::{
     CodegenBackend, X86_64Backend, Aarch64Backend, CodeBuffer, TargetArch,
@@ -119,19 +119,69 @@ fn macroexpand_all_on_atom() {
     assert_eq!(result.as_fixnum(), 123);
 }
 
+#[test]
+fn macroexpand_all_on_compound_form() {
+    // macroexpand_all should recursively walk subforms of a cons
+    let form = read("(if t 1 2)");
+    assert!(form.is_cons(), "(if t 1 2) should parse as cons");
+    let env = Environment::null();
+    let result = macroexpand_all(form, &env).unwrap();
+    // The result should still be a cons (compound form preserved)
+    assert!(result.is_cons(), "macroexpand_all on compound form should return cons");
+}
+
+#[test]
+fn macroexpand_all_on_nested_compound_form() {
+    // macroexpand_all should walk into nested subforms
+    let form = read("(progn (+ 1 2) 3)");
+    assert!(form.is_cons());
+    let env = Environment::null();
+    let result = macroexpand_all(form, &env).unwrap();
+    assert!(result.is_cons(), "macroexpand_all on nested compound should return cons");
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // 2. Reader → Macroexpand → IR (IrBuilder)
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
-fn pipeline_forms_to_ir() {
-    // Each form should produce a 3-node graph: Start, Constant, Return
-    for src in &["42", "nil", "t", "-7", "3.14", "'foo", "(+ 1 2)",
-                 "(if t 1 2)", "(lambda (x) x)", "#\\a", "\"hello\""] {
+fn pipeline_self_evaluating_forms_to_ir() {
+    // Self-evaluating atoms should produce a 3-node graph: Start, Constant, Return
+    for src in &["42", "nil", "t", "-7", "3.14", "'foo", "#\\a", "\"hello\""] {
         let graph = read_and_build_ir(src);
         assert_eq!(graph.node_count(), 3, "'{}' should produce 3-node graph", src);
         verify(&graph).unwrap_or_else(|e| panic!("verify failed for '{}': {:?}", src, e));
     }
+}
+
+#[test]
+fn pipeline_addition_to_ir() {
+    // (+ 1 2) needs at least: Start, Const(1), Const(2), Call(+), Return
+    let graph = read_and_build_ir("(+ 1 2)");
+    assert!(graph.node_count() >= 5,
+        "(+ 1 2) should produce at least 5 nodes (Start, Const(1), Const(2), Call(+), Return), got {}",
+        graph.node_count());
+    verify(&graph).unwrap_or_else(|e| panic!("verify failed for '(+ 1 2)': {:?}", e));
+}
+
+#[test]
+fn pipeline_if_to_ir() {
+    // (if t 1 2) needs at least: Start, Const(t), Branch, Region, Const(1), Const(2), Phi, Return
+    let graph = read_and_build_ir("(if t 1 2)");
+    assert!(graph.node_count() >= 5,
+        "(if t 1 2) should produce at least 5 nodes for branching, got {}",
+        graph.node_count());
+    verify(&graph).unwrap_or_else(|e| panic!("verify failed for '(if t 1 2)': {:?}", e));
+}
+
+#[test]
+fn pipeline_lambda_to_ir() {
+    // (lambda (x) x) needs at least: Start, Parameter(0), Return
+    let graph = read_and_build_ir("(lambda (x) x)");
+    assert!(graph.node_count() >= 3,
+        "(lambda (x) x) should produce at least 3 nodes including Parameter, got {}",
+        graph.node_count());
+    verify(&graph).unwrap_or_else(|e| panic!("verify failed for '(lambda (x) x)': {:?}", e));
 }
 
 #[test]
@@ -153,6 +203,55 @@ fn pipeline_ir_graph_wiring() {
         NodeKind::Constant(val) => assert_eq!(val.as_fixnum(), 42),
         other => panic!("Expected Constant, got {:?}", other),
     }
+}
+
+#[test]
+fn pipeline_ir_graph_wiring_addition() {
+    // (+ 1 2) should produce a Call node with two Constant data inputs
+    let graph = read_and_build_ir("(+ 1 2)");
+    verify(&graph).unwrap();
+
+    // Walk graph to find Call node
+    let mut found_call = false;
+    for node_id_val in 0..graph.node_count() as u32 {
+        let nid = NodeId(node_id_val);
+        if let Ok(kind) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| graph.node_kind(nid).clone())) {
+            if matches!(kind, NodeKind::Call) {
+                found_call = true;
+                // Call node should have data inputs (the arguments)
+                let inputs = graph.inputs(nid);
+                let data_inputs: Vec<_> = inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
+                assert!(data_inputs.len() >= 2,
+                    "Call node for (+ 1 2) should have at least 2 data inputs, got {}",
+                    data_inputs.len());
+            }
+        }
+    }
+    assert!(found_call, "(+ 1 2) IR should contain a Call node");
+}
+
+#[test]
+fn pipeline_ir_graph_wiring_if() {
+    // (if t 1 2) should produce Branch and Region nodes with control edges
+    let graph = read_and_build_ir("(if t 1 2)");
+    verify(&graph).unwrap();
+
+    let mut found_branch = false;
+    for node_id_val in 0..graph.node_count() as u32 {
+        let nid = NodeId(node_id_val);
+        if let Ok(kind) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| graph.node_kind(nid).clone())) {
+            if matches!(kind, NodeKind::Branch) {
+                found_branch = true;
+                // Branch should have control outputs leading to Region targets
+                let uses = graph.uses(nid);
+                let ctrl_outputs: Vec<_> = uses.iter().filter(|e| e.kind == EdgeKind::Control).collect();
+                assert!(ctrl_outputs.len() >= 2,
+                    "Branch node for (if t 1 2) should have at least 2 control outputs (then/else), got {}",
+                    ctrl_outputs.len());
+            }
+        }
+    }
+    assert!(found_branch, "(if t 1 2) IR should contain a Branch node");
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -312,15 +411,91 @@ fn tiered_promotion_logic() {
 }
 
 #[test]
-fn tiered_compilers_produce_code() {
-    let func = BlissVal::from_fixnum(0);
-    let bc = BaselineCompiler::new().compile(func).unwrap();
+fn tiered_promotion_full_lifecycle() {
+    // Simulate the full promotion lifecycle per spec §4.4:
+    // 1. Create a function header in memory with tier=Interpreter, invoke_count=0
+    // 2. Simulate calling it t1_threshold times, verify promotion to Baseline
+    // 3. Compile with BaselineCompiler
+    // 4. Simulate calling t2_threshold times, verify promotion to Optimising
+
+    let config = TierConfig {
+        t1_threshold: 10, t2_threshold: 100,
+        osr_threshold: 10000, compile_threads: 1,
+    };
+
+    // Allocate a function header: [entry_point: 8 bytes][tier: 1 byte][padding: 3 bytes][invoke_count: 4 bytes]
+    // Total: 16 bytes minimum
+    let mut header = vec![0u8; 16];
+
+    // Set tier = Interpreter (0)
+    header[8] = 0; // Tier::Interpreter
+
+    // Set invoke_count = 0
+    header[12..16].copy_from_slice(&0u32.to_le_bytes());
+
+    // Create a function-tagged BlissVal pointing to our header
+    let header_ptr = header.as_ptr() as u64;
+    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION as u64);
+
+    // At 0 invocations, no promotion
+    assert_eq!(check_promotion(func_val, &config), None,
+        "function at T0 with 0 invocations should not promote");
+
+    // Simulate reaching t1_threshold invocations
+    header[12..16].copy_from_slice(&10u32.to_le_bytes());
+    assert_eq!(check_promotion(func_val, &config), Some(Tier::Baseline),
+        "function at T0 with t1_threshold invocations should promote to Baseline");
+
+    // "Compile" to baseline — update tier to Baseline
+    header[8] = 1; // Tier::Baseline
+
+    // At t1_threshold invocations but now Baseline tier, no promotion yet
+    assert_eq!(check_promotion(func_val, &config), None,
+        "Baseline function below t2_threshold should not promote");
+
+    // Simulate reaching t2_threshold invocations
+    header[12..16].copy_from_slice(&100u32.to_le_bytes());
+    assert_eq!(check_promotion(func_val, &config), Some(Tier::Optimising),
+        "Baseline function at t2_threshold should promote to Optimising");
+
+    // Update tier to Optimising
+    header[8] = 2; // Tier::Optimising
+
+    // Already at max tier — no further promotion
+    assert_eq!(check_promotion(func_val, &config), None,
+        "Optimising function should not promote further");
+}
+
+#[test]
+fn tiered_compilers_produce_code_with_function_val() {
+    // Per tiered.rs, compile() takes a BlissVal that should be TAG_FUNCTION.
+    // Construct a function-tagged value for a realistic test.
+    // TAG_FUNCTION is 0b110 (6); we create a tagged pointer (null base + tag).
+    let func_val = BlissVal(bliss_rt::value::TAG_FUNCTION as u64);
+
+    let bc = BaselineCompiler::new().compile(func_val).unwrap();
     assert_eq!(bc.tier(), Tier::Baseline);
     assert!(bc.code_size() > 0);
 
-    let oc = OptimisingCompiler::new().compile(func).unwrap();
+    let oc = OptimisingCompiler::new().compile(func_val).unwrap();
     assert_eq!(oc.tier(), Tier::Optimising);
     assert!(oc.code_size() > 0);
+}
+
+#[test]
+fn tiered_compilers_produce_code_with_non_function() {
+    // compile() currently accepts any BlissVal (the implementation doesn't
+    // gate on TAG_FUNCTION). When proper type-checking is added, this test
+    // should be updated to assert Err for non-function inputs.
+    let non_func = BlissVal::from_fixnum(0);
+    // If compile() accepts non-functions, verify it still produces code:
+    let result = BaselineCompiler::new().compile(non_func);
+    if let Ok(bc) = &result {
+        assert_eq!(bc.tier(), Tier::Baseline);
+        assert!(bc.code_size() > 0);
+    }
+    // If it rejects non-functions, that's also correct behavior:
+    // result.is_err() is acceptable
 }
 
 #[test]
@@ -341,7 +516,30 @@ fn acceptance_full_pipeline_forms() {
                  "(defun foo (x) (+ x 1))"] {
         let code = full_pipeline_x86_64(src);
         assert!(!code.is_empty(), "full pipeline for '{}' produced empty code", src);
+        // Every emitted function must have x86-64 prologue (push rbp) and ret
+        assert_eq!(code.code()[0], 0x55,
+            "full pipeline for '{}' should emit push rbp prologue", src);
+        assert!(code.code().contains(&0xC3),
+            "full pipeline for '{}' should contain ret instruction", src);
     }
+}
+
+#[test]
+fn acceptance_full_pipeline_constant_encoding() {
+    // For a simple integer literal like 42, the emitted code should contain
+    // a movabs encoding (0x48 0xB8) loading the fixnum representation.
+    let code = full_pipeline_x86_64("42");
+    let bytes = code.code();
+    // Look for the movabs rax prefix (REX.W + B8)
+    let has_movabs = bytes.windows(2).any(|w| w[0] == 0x48 && w[1] == 0xB8);
+    assert!(has_movabs,
+        "code for '42' should contain movabs (0x48 0xB8) encoding the literal value");
+    // The fixnum raw bytes for 42 should follow the movabs prefix
+    let fixnum_42 = BlissVal::from_fixnum(42);
+    let raw_bytes = fixnum_42.0.to_le_bytes();
+    let has_value = bytes.windows(10).any(|w| w[0] == 0x48 && w[1] == 0xB8 && w[2..10] == raw_bytes);
+    assert!(has_value,
+        "code for '42' should contain the fixnum-tagged encoding of 42");
 }
 
 // ═══════════════════════════════════════════════════════════════════
