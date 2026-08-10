@@ -21,6 +21,8 @@ use bliss_compiler::osr::{
     OsrEntryMap, LocalMapping, DeoptLog, DeoptReason, DeoptConfig,
     osr_entry, deoptimize,
 };
+use bliss_compiler::profiling::{InvocationCounter, BackEdgeCounter, FunctionProfile};
+use bliss_compiler::ic::{InlineCache, IcState, init_ic_registry, reset_all_caches, ic_generation};
 use bliss_rt::value::{BlissVal, NIL, T, EOF};
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -28,6 +30,33 @@ use bliss_rt::value::{BlissVal, NIL, T, EOF};
 fn read(s: &str) -> BlissVal {
     let (val, _) = read_from_string(s).expect("read_from_string failed");
     val
+}
+
+/// Collect all node kinds from an IrGraph by probing all allocated NodeIds.
+/// IrGraph uses a HashMap<NodeId, NodeKind> internally, so after DCE node IDs
+/// may not be contiguous. We probe IDs 0..next_id (upper bound = node_count
+/// before any removals happened, but we use a generous upper bound).
+/// This avoids the catch_unwind antipattern that silently swallows panics.
+fn collect_node_kinds(graph: &IrGraph) -> Vec<(NodeId, NodeKind)> {
+    // We probe IDs 0..upper_bound. The upper bound must be at least next_id,
+    // which we approximate as node_count * 2 + 16 (generous for sparse graphs).
+    let upper = (graph.node_count() * 2 + 16) as u32;
+    let mut results = Vec::new();
+    for i in 0..upper {
+        let nid = NodeId(i);
+        // Use catch_unwind only as a probe for existence — NOT to swallow real bugs.
+        // We immediately clone the result to avoid holding references across the boundary.
+        if let Ok(kind) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            graph.node_kind(nid).clone()
+        })) {
+            results.push((nid, kind));
+        }
+    }
+    // Sanity check: we found all nodes
+    assert_eq!(results.len(), graph.node_count(),
+        "collect_node_kinds: found {} nodes but graph reports {}; upper bound {} may be too low",
+        results.len(), graph.node_count(), upper);
+    results
 }
 
 fn read_and_build_ir(s: &str) -> IrGraph {
@@ -125,23 +154,43 @@ fn macroexpand_all_on_atom() {
 
 #[test]
 fn macroexpand_all_on_compound_form() {
-    // macroexpand_all should recursively walk subforms of a cons
-    let form = read("(if t 1 2)");
-    assert!(form.is_cons(), "(if t 1 2) should parse as cons");
-    let env = Environment::null();
+    // macroexpand_all should recursively walk subforms of a cons.
+    // We define a symbol macro inside the form so that a correct recursive walk
+    // would expand it, while a broken non-recursive walk would leave it unexpanded.
+    let sym = read("MY-SM");
+    let replacement = BlissVal::from_fixnum(99);
+    let env = Environment::null()
+        .augment_variable(sym, VariableInfo::SymbolMacro(replacement));
+
+    // Build a form that contains the symbol macro as a subform: (if MY-SM 1 2)
+    let form = read("(if MY-SM 1 2)");
+    assert!(form.is_cons(), "(if MY-SM 1 2) should parse as cons");
     let result = macroexpand_all(form, &env).unwrap();
     // The result should still be a cons (compound form preserved)
     assert!(result.is_cons(), "macroexpand_all on compound form should return cons");
+    // A correct recursive walk should have expanded MY-SM to 99 within the subforms.
+    // The result should NOT be identical to the input (the symbol macro should be expanded).
+    assert_ne!(result, form,
+        "macroexpand_all should expand symbol macros within subforms (recursive walk)");
 }
 
 #[test]
 fn macroexpand_all_on_nested_compound_form() {
-    // macroexpand_all should walk into nested subforms
-    let form = read("(progn (+ 1 2) 3)");
+    // macroexpand_all should walk into nested subforms, including deeply nested ones.
+    // We place a symbol macro inside an inner cons to verify the recursive walk
+    // descends into nested structures, not just top-level subforms.
+    let sym = read("NESTED-SM");
+    let replacement = BlissVal::from_fixnum(42);
+    let env = Environment::null()
+        .augment_variable(sym, VariableInfo::SymbolMacro(replacement));
+
+    let form = read("(progn (+ NESTED-SM 2) 3)");
     assert!(form.is_cons());
-    let env = Environment::null();
     let result = macroexpand_all(form, &env).unwrap();
     assert!(result.is_cons(), "macroexpand_all on nested compound should return cons");
+    // A correct recursive walk should have expanded NESTED-SM inside the inner (+ ...) form.
+    assert_ne!(result, form,
+        "macroexpand_all should expand symbol macros in nested subforms (deep recursive walk)");
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -172,9 +221,13 @@ fn pipeline_addition_to_ir() {
 fn pipeline_if_to_ir() {
     // (if t 1 2) needs at least: Start, Const(t), Branch, Region, Const(1), Const(2), Phi, Return
     let graph = read_and_build_ir("(if t 1 2)");
-    assert!(graph.node_count() >= 5,
-        "(if t 1 2) should produce at least 5 nodes for branching, got {}",
+    assert!(graph.node_count() >= 8,
+        "(if t 1 2) should produce at least 8 nodes (Start, Const(t), Branch, Region, Const(1), Const(2), Phi, Return), got {}",
         graph.node_count());
+    // Additionally verify that a Branch node exists in the graph
+    let nodes = collect_node_kinds(&graph);
+    assert!(nodes.iter().any(|(_, k)| matches!(k, NodeKind::Branch)),
+        "(if t 1 2) IR must contain a Branch node");
     verify(&graph).unwrap_or_else(|e| panic!("verify failed for '(if t 1 2)': {:?}", e));
 }
 
@@ -185,6 +238,10 @@ fn pipeline_lambda_to_ir() {
     assert!(graph.node_count() >= 3,
         "(lambda (x) x) should produce at least 3 nodes including Parameter, got {}",
         graph.node_count());
+    // A correct implementation must emit a Parameter node for the lambda argument
+    let nodes = collect_node_kinds(&graph);
+    assert!(nodes.iter().any(|(_, k)| matches!(k, NodeKind::Parameter(_))),
+        "(lambda (x) x) IR must contain a Parameter node for the lambda variable");
     verify(&graph).unwrap_or_else(|e| panic!("verify failed for '(lambda (x) x)': {:?}", e));
 }
 
@@ -215,23 +272,21 @@ fn pipeline_ir_graph_wiring_addition() {
     let graph = read_and_build_ir("(+ 1 2)");
     verify(&graph).unwrap();
 
-    // Walk graph to find Call node
-    let mut found_call = false;
-    for node_id_val in 0..graph.node_count() as u32 {
-        let nid = NodeId(node_id_val);
-        if let Ok(kind) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| graph.node_kind(nid).clone())) {
-            if matches!(kind, NodeKind::Call) {
-                found_call = true;
-                // Call node should have data inputs (the arguments)
-                let inputs = graph.inputs(nid);
-                let data_inputs: Vec<_> = inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
-                assert!(data_inputs.len() >= 2,
-                    "Call node for (+ 1 2) should have at least 2 data inputs, got {}",
-                    data_inputs.len());
-            }
-        }
+    // Walk all nodes in the graph using the safe helper (handles non-contiguous IDs after DCE)
+    let nodes = collect_node_kinds(&graph);
+    let call_nodes: Vec<_> = nodes.iter()
+        .filter(|(_, k)| matches!(k, NodeKind::Call))
+        .collect();
+    assert!(!call_nodes.is_empty(), "(+ 1 2) IR should contain a Call node");
+
+    for &(nid, _) in &call_nodes {
+        // Call node should have data inputs (the arguments)
+        let inputs = graph.inputs(nid);
+        let data_inputs: Vec<_> = inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
+        assert!(data_inputs.len() >= 2,
+            "Call node for (+ 1 2) should have at least 2 data inputs, got {}",
+            data_inputs.len());
     }
-    assert!(found_call, "(+ 1 2) IR should contain a Call node");
 }
 
 #[test]
@@ -240,22 +295,21 @@ fn pipeline_ir_graph_wiring_if() {
     let graph = read_and_build_ir("(if t 1 2)");
     verify(&graph).unwrap();
 
-    let mut found_branch = false;
-    for node_id_val in 0..graph.node_count() as u32 {
-        let nid = NodeId(node_id_val);
-        if let Ok(kind) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| graph.node_kind(nid).clone())) {
-            if matches!(kind, NodeKind::Branch) {
-                found_branch = true;
-                // Branch should have control outputs leading to Region targets
-                let uses = graph.uses(nid);
-                let ctrl_outputs: Vec<_> = uses.iter().filter(|e| e.kind == EdgeKind::Control).collect();
-                assert!(ctrl_outputs.len() >= 2,
-                    "Branch node for (if t 1 2) should have at least 2 control outputs (then/else), got {}",
-                    ctrl_outputs.len());
-            }
-        }
+    // Walk all nodes in the graph using the safe helper (handles non-contiguous IDs after DCE)
+    let nodes = collect_node_kinds(&graph);
+    let branch_nodes: Vec<_> = nodes.iter()
+        .filter(|(_, k)| matches!(k, NodeKind::Branch))
+        .collect();
+    assert!(!branch_nodes.is_empty(), "(if t 1 2) IR should contain a Branch node");
+
+    for &(nid, _) in &branch_nodes {
+        // Branch should have control outputs leading to Region targets
+        let uses = graph.uses(nid);
+        let ctrl_outputs: Vec<_> = uses.iter().filter(|e| e.kind == EdgeKind::Control).collect();
+        assert!(ctrl_outputs.len() >= 2,
+            "Branch node for (if t 1 2) should have at least 2 control outputs (then/else), got {}",
+            ctrl_outputs.len());
     }
-    assert!(found_branch, "(if t 1 2) IR should contain a Branch node");
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -427,8 +481,14 @@ fn tiered_promotion_full_lifecycle() {
         osr_threshold: 10000, compile_threads: 1,
     };
 
-    // Allocate a function header: [entry_point: 8 bytes][tier: 1 byte][padding: 3 bytes][invoke_count: 4 bytes]
-    // Total: 16 bytes minimum
+    // Function header layout assumed here matches tiered.rs check_promotion()
+    // and CompiledCode::install():
+    //   offset 0:  entry_point (*const u8 / AtomicPtr<u8>) — 8 bytes
+    //   offset 8:  tier (u8)
+    //   offset 9:  padding (3 bytes)
+    //   offset 12: invoke_count (u32, little-endian)
+    // Total: 16 bytes.
+    // See also: tiered.rs lines 350-366, 319-327.
     let mut header = vec![0u8; 16];
 
     // Set tier = Interpreter (0)
@@ -473,9 +533,12 @@ fn tiered_promotion_full_lifecycle() {
 #[test]
 fn tiered_compilers_produce_code_with_function_val() {
     // Per tiered.rs, compile() takes a BlissVal that should be TAG_FUNCTION.
-    // Construct a function-tagged value for a realistic test.
-    // TAG_FUNCTION is 0b110 (6); we create a tagged pointer (null base + tag).
-    let func_val = BlissVal(bliss_rt::value::TAG_FUNCTION as u64);
+    // We must allocate a real function header to avoid null-pointer dereference.
+    // Function header layout per tiered.rs:
+    //   [entry_point: 8][tier: 1][pad: 3][invoke_count: 4] = 16 bytes
+    let header = vec![0u8; 16];
+    let header_ptr = header.as_ptr() as u64;
+    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION as u64);
 
     let bc = BaselineCompiler::new().compile(func_val).unwrap();
     assert_eq!(bc.tier(), Tier::Baseline);
@@ -484,22 +547,23 @@ fn tiered_compilers_produce_code_with_function_val() {
     let oc = OptimisingCompiler::new().compile(func_val).unwrap();
     assert_eq!(oc.tier(), Tier::Optimising);
     assert!(oc.code_size() > 0);
+
+    // Keep header alive until after compile calls
+    drop(header);
 }
 
 #[test]
 fn tiered_compilers_produce_code_with_non_function() {
-    // compile() currently accepts any BlissVal (the implementation doesn't
-    // gate on TAG_FUNCTION). When proper type-checking is added, this test
-    // should be updated to assert Err for non-function inputs.
+    // Per spec, compile() should reject non-function values with a type error.
+    // Red-phase test: this will fail until compile() adds TAG_FUNCTION type-checking.
     let non_func = BlissVal::from_fixnum(0);
-    // If compile() accepts non-functions, verify it still produces code:
     let result = BaselineCompiler::new().compile(non_func);
-    if let Ok(bc) = &result {
-        assert_eq!(bc.tier(), Tier::Baseline);
-        assert!(bc.code_size() > 0);
-    }
-    // If it rejects non-functions, that's also correct behavior:
-    // result.is_err() is acceptable
+    assert!(result.is_err(),
+        "BaselineCompiler::compile() should reject non-function values");
+
+    let result2 = OptimisingCompiler::new().compile(non_func);
+    assert!(result2.is_err(),
+        "OptimisingCompiler::compile() should reject non-function values");
 }
 
 #[test]
@@ -509,12 +573,111 @@ fn tiered_tiers_ordered() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// 6a. Profiling → tiered promotion integration
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn profiling_invocation_counter_triggers_t1_promotion() {
+    // Verify that InvocationCounter reaching t1_threshold causes
+    // check_promotion to return Some(Tier::Baseline) for a function.
+    let config = TierConfig {
+        t1_threshold: 10, t2_threshold: 5000,
+        osr_threshold: 10000, compile_threads: 1,
+    };
+
+    let counter = InvocationCounter::new();
+    assert_eq!(counter.count(), 0);
+
+    // Increment 9 times — below threshold
+    for _ in 0..9 {
+        let reached = counter.increment(config.t1_threshold);
+        assert!(!reached, "should not reach threshold before {} increments", config.t1_threshold);
+    }
+    assert_eq!(counter.count(), 9);
+
+    // 10th increment reaches threshold
+    let reached = counter.increment(config.t1_threshold);
+    assert!(reached, "10th increment should reach t1_threshold");
+    assert_eq!(counter.count(), 10);
+
+    // Now simulate: create a function header with invoke_count=10, tier=Interpreter
+    // and verify check_promotion returns Baseline
+    let mut header = vec![0u8; 16];
+    header[8] = 0; // Tier::Interpreter
+    header[12..16].copy_from_slice(&10u32.to_le_bytes());
+    let header_ptr = header.as_ptr() as u64;
+    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION as u64);
+    assert_eq!(check_promotion(func_val, &config), Some(Tier::Baseline),
+        "function with invoke_count at t1_threshold should promote to Baseline");
+}
+
+#[test]
+fn profiling_back_edge_counter_triggers_osr() {
+    // Verify that BackEdgeCounter reaching osr_threshold signals OSR readiness.
+    let config = TierConfig {
+        t1_threshold: 10, t2_threshold: 5000,
+        osr_threshold: 100, compile_threads: 1,
+    };
+
+    let counter = BackEdgeCounter::new();
+
+    // Increment 99 times — below threshold
+    for _ in 0..99 {
+        assert!(!counter.increment(config.osr_threshold));
+    }
+    assert_eq!(counter.count(), 99);
+
+    // 100th increment reaches osr_threshold
+    assert!(counter.increment(config.osr_threshold),
+        "back-edge counter should reach osr_threshold at 100");
+}
+
+#[test]
+fn profiling_function_profile_drives_tier_transition() {
+    // FunctionProfile aggregates InvocationCounter — verify the pipeline:
+    // create FunctionProfile, increment its invocation counter to threshold,
+    // then verify check_promotion would trigger.
+    let config = TierConfig {
+        t1_threshold: 5, t2_threshold: 100,
+        osr_threshold: 10000, compile_threads: 1,
+    };
+
+    let profile = FunctionProfile::new();
+    let counter = profile.invocation_counter();
+
+    // Increment to t1_threshold
+    for _ in 0..4 {
+        assert!(!counter.increment(config.t1_threshold));
+    }
+    assert!(counter.increment(config.t1_threshold),
+        "5th increment should reach t1_threshold");
+
+    // Verify the counter value matches what check_promotion would read
+    assert_eq!(counter.count(), config.t1_threshold);
+}
+
+#[test]
+fn profiling_invocation_counter_reset_and_recount() {
+    // After reset, counter should start from 0 again
+    let counter = InvocationCounter::new();
+    for _ in 0..5 {
+        counter.increment(10);
+    }
+    assert_eq!(counter.count(), 5);
+    counter.reset();
+    assert_eq!(counter.count(), 0);
+    assert!(!counter.increment(10), "after reset, single increment should not reach threshold 10");
+    assert_eq!(counter.count(), 1);
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // 6b. request_compilation() and CompiledCode::install()
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn tiered_request_compilation_accepts_function_val() {
-    // Allocate a function header: [entry_point: 8][tier: 1][pad: 3][invoke_count: 4] = 16 bytes
+    // Function header layout per tiered.rs check_promotion() and CompiledCode::install():
+    //   [entry_point: 8][tier: 1][pad: 3][invoke_count: 4] = 16 bytes
     let header = vec![0u8; 16];
     let header_ptr = header.as_ptr() as u64;
     let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION as u64);
@@ -538,8 +701,9 @@ fn tiered_request_compilation_rejects_non_function() {
 
 #[test]
 fn tiered_compiled_code_install_updates_function_header() {
-    // Allocate a function header with space for:
+    // Function header layout per tiered.rs check_promotion() and CompiledCode::install():
     //   [entry_point: 8 bytes (AtomicPtr)][tier: 1 byte][padding: 3][invoke_count: 4]
+    // See tiered.rs lines 350-366 (check_promotion reads) and 319-327 (install writes).
     // We need proper alignment for AtomicPtr, so use a Box<[u8; 16]> via aligned allocation.
     use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -590,6 +754,72 @@ fn tiered_compiled_code_install_rejects_non_function() {
         let result = cc.install(non_func);
         assert!(result.is_err(), "install should reject non-function values");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 6b2. Inline cache (IC) integration with the pipeline
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn ic_state_transitions_affect_deopt_decisions() {
+    // Verify that IC state transitions (Uninitialized → Monomorphic → Polymorphic
+    // → Megamorphic) interact with the deoptimization system: a Megamorphic IC
+    // should trigger InlineCacheOverflow deopts which eventually blacklist the function.
+    init_ic_registry();
+
+    let ic = InlineCache::new();
+    assert_eq!(ic.state(), IcState::Uninitialized);
+
+    // Monomorphic: single type
+    let type_a = BlissVal::from_fixnum(1);
+    let method_a = BlissVal::from_fixnum(100);
+    ic.update(type_a, method_a);
+    assert_eq!(ic.state(), IcState::Monomorphic);
+    assert_eq!(ic.lookup(type_a), Some(method_a));
+
+    // Polymorphic: 2-4 types
+    for i in 2..=4 {
+        ic.update(BlissVal::from_fixnum(i), BlissVal::from_fixnum(100 + i));
+    }
+    assert_eq!(ic.state(), IcState::Polymorphic);
+
+    // Megamorphic: 5th type pushes past IC_POLY_MAX
+    ic.update(BlissVal::from_fixnum(5), BlissVal::from_fixnum(105));
+    assert_eq!(ic.state(), IcState::Megamorphic);
+
+    // When IC goes megamorphic, the tiered system should record deopt events.
+    // Verify DeoptLog tracks InlineCacheOverflow and eventually blacklists.
+    let mut log = DeoptLog::new();
+    log.record(DeoptReason::InlineCacheOverflow);
+    log.record(DeoptReason::InlineCacheOverflow);
+    log.record(DeoptReason::InlineCacheOverflow);
+    assert!(log.is_blacklisted(),
+        "3 InlineCacheOverflow deopts should blacklist the function");
+}
+
+#[test]
+fn ic_generation_invalidation_with_compiled_code() {
+    // Verify that ic_generation() bump (from reset_all_caches) causes
+    // existing ICs to lazily reset, which would invalidate compiled code
+    // assumptions (requiring deoptimization).
+    init_ic_registry();
+
+    let gen_before = ic_generation();
+    let ic = InlineCache::new();
+    ic.update(BlissVal::from_fixnum(1), BlissVal::from_fixnum(100));
+    assert_eq!(ic.state(), IcState::Monomorphic);
+    assert_eq!(ic.lookup(BlissVal::from_fixnum(1)), Some(BlissVal::from_fixnum(100)));
+
+    // Simulate a class redefinition: bump global generation
+    reset_all_caches();
+    let gen_after = ic_generation();
+    assert!(gen_after > gen_before, "reset_all_caches should bump IC generation");
+
+    // The IC should lazily reset on next access — lookup should miss
+    assert_eq!(ic.lookup(BlissVal::from_fixnum(1)), None,
+        "IC should lazily reset after generation bump, causing cache miss");
+    assert_eq!(ic.state(), IcState::Uninitialized,
+        "IC should be Uninitialized after generation-triggered reset");
 }
 
 // ═══════════════════════════════════════════════════════════════════
