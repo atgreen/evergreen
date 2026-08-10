@@ -4,7 +4,8 @@
 
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{
-    ConsCell, ComplexData, ElementTypeTag, ObjectHeader, RatioData, ReadtableData, type_id,
+    ConsCell, ComplexData, ElementTypeTag, ObjectHeader, PathnameData, RatioData, ReadtableData,
+    type_id,
 };
 use bliss_rt::value::{BlissVal, EOF, NIL, T, TAG_HEAP_OBJECT};
 use std::collections::HashMap;
@@ -53,6 +54,11 @@ struct CircularLabels {
 }
 
 // ── Heap allocation helpers ───────────────────────────────────────
+// NOTE(tech-debt): All alloc_* functions below use Box::leak / alloc_zeroed
+// without integrating with the GC (bliss_rt::gc). Every object created by
+// the reader is permanently leaked. This is acceptable during bootstrap but
+// must be wired into the GC's allocation path before production use.
+// Tracked as tech-debt for a future phase.
 
 fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
     let cell = Box::leak(Box::new(ConsCell { car, cdr }));
@@ -145,6 +151,36 @@ fn alloc_readtable() -> BlissVal {
     unsafe { BlissVal::from_heap_ptr(data as *mut ReadtableData as *mut u8) }
 }
 
+fn alloc_pathname(namestring: BlissVal) -> BlissVal {
+    let data = Box::leak(Box::new(PathnameData {
+        header: ObjectHeader::new(type_id::PATHNAME, 7),
+        host: NIL,
+        device: NIL,
+        directory: NIL,
+        name: namestring,
+        type_field: NIL,
+        version: NIL,
+    }));
+    unsafe { BlissVal::from_heap_ptr(data as *mut PathnameData as *mut u8) }
+}
+
+fn alloc_structure(name: BlissVal, slots: &[BlissVal]) -> BlissVal {
+    // Layout: ObjectHeader (8) + name (8) + n_slots (8) + slot data
+    let total_size = 8 + 8 + 8 + slots.len() * 8;
+    let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout);
+        let header = ObjectHeader::new(type_id::STRUCTURE, ((total_size + 7) / 8) as u16);
+        *(ptr as *mut ObjectHeader) = header;
+        *(ptr.add(8) as *mut BlissVal) = name;
+        *(ptr.add(16) as *mut u64) = slots.len() as u64;
+        for (i, &slot) in slots.iter().enumerate() {
+            *(ptr.add(24 + i * 8) as *mut BlissVal) = slot;
+        }
+        BlissVal::from_heap_ptr(ptr)
+    }
+}
+
 /// Build a proper list from elements: (a b c) = cons(a, cons(b, cons(c, NIL)))
 fn make_list(elems: &[BlissVal]) -> BlissVal {
     let mut result = NIL;
@@ -214,21 +250,80 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
         }
         return Ok(EOF);
     }
+    // For a real stream input, extract string content and read from it
     if state.read_suppress {
         return Ok(NIL);
     }
-    Ok(EOF)
+    // Try to read the stream as a string-backed object
+    let input = state.input;
+    if input.tag() == TAG_HEAP_OBJECT {
+        unsafe {
+            let ptr = input.as_ptr();
+            let header = *(ptr as *const ObjectHeader);
+            if header.type_id() == type_id::SIMPLE_BASE_STRING {
+                let len = *(ptr.add(8) as *const u64) as usize;
+                let data = std::slice::from_raw_parts(ptr.add(16), len);
+                if let Ok(s) = std::str::from_utf8(data) {
+                    let chars: Vec<char> = s.chars().collect();
+                    let mut labels = CircularLabels { labels: HashMap::new() };
+
+                    // Consult readtable for custom macro characters if one is set
+                    if state.readtable != NIL && state.readtable.tag() == TAG_HEAP_OBJECT {
+                        let rt_key = state.readtable.0 & !bliss_rt::value::TAG_MASK;
+                        let guard = MACRO_CHARS.lock().unwrap();
+                        if let Some(table) = guard.as_ref() {
+                            // Check first non-whitespace character against readtable
+                            let first_pos = skip_whitespace_and_comments(&chars, 0);
+                            if first_pos < chars.len() {
+                                let first_ch = chars[first_pos];
+                                if let Some(&(_func, _non_term)) = table.get(&(rt_key, first_ch)) {
+                                    // Custom macro character found — for now, we delegate
+                                    // to the standard reader which handles built-in macros.
+                                    // Full readtable dispatch (calling user functions) requires
+                                    // the evaluator; tracked as future work.
+                                    drop(guard);
+                                    let (val, _pos) = read_token_with_base(&chars, 0, &mut labels, state.read_base, state.read_eval)?;
+                                    return Ok(val);
+                                }
+                            }
+                        }
+                        drop(guard);
+                    }
+
+                    let (val, _pos) = read_token_with_base(&chars, 0, &mut labels, state.read_base, state.read_eval)?;
+                    return Ok(val);
+                }
+            }
+            // Heap object but not a SIMPLE_BASE_STRING — unsupported stream type
+            return Err(BlissError::StreamError(format!(
+                "unsupported stream type for read (type_id={})",
+                header.type_id()
+            )));
+        }
+    }
+    // Non-heap, non-NIL input — cannot read from it
+    Err(BlissError::StreamError("unsupported input type for read".into()))
 }
 
 pub fn read_from_string(s: &str) -> Result<(BlissVal, usize), BlissError> {
+    read_from_string_with_base(s, 10, true)
+}
+
+pub fn read_from_string_with_base(s: &str, read_base: u32, read_eval: bool) -> Result<(BlissVal, usize), BlissError> {
     let chars: Vec<char> = s.chars().collect();
     let mut labels = CircularLabels { labels: HashMap::new() };
-    let (val, pos) = read_token(&chars, 0, &mut labels)?;
+    let (val, pos) = read_token_with_base(&chars, 0, &mut labels, read_base, read_eval)?;
     Ok((val, pos))
 }
 
 fn read_token(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels,
+    chars: &[char], pos: usize, labels: &mut CircularLabels,
+) -> Result<(BlissVal, usize), BlissError> {
+    read_token_with_base(chars, pos, labels, 10, true)
+}
+
+fn read_token_with_base(
+    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     // Skip whitespace and line comments
     pos = skip_whitespace_and_comments(chars, pos);
@@ -237,26 +332,26 @@ fn read_token(
     }
     let ch = chars[pos];
     match ch {
-        '(' => read_list(chars, pos + 1, labels),
+        '(' => read_list_with_base(chars, pos + 1, labels, read_base, read_eval),
         ')' => Err(BlissError::StreamError("unexpected ')'".into())),
         '"' => read_string(chars, pos + 1),
         '\'' => {
-            let (val, p) = read_token(chars, pos + 1, labels)?;
+            let (val, p) = read_token_with_base(chars, pos + 1, labels, read_base, read_eval)?;
             let quote_sym = BlissVal::from_symbol_index(intern_symbol("QUOTE"));
             Ok((make_list(&[quote_sym, val]), p))
         }
         '`' => {
-            let (val, p) = read_token(chars, pos + 1, labels)?;
+            let (val, p) = read_token_with_base(chars, pos + 1, labels, read_base, read_eval)?;
             let qq_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::QUASIQUOTE"));
             Ok((make_list(&[qq_sym, val]), p))
         }
         ',' => {
-            let (val, p) = read_token(chars, pos + 1, labels)?;
+            let (val, p) = read_token_with_base(chars, pos + 1, labels, read_base, read_eval)?;
             let uq_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE"));
             Ok((make_list(&[uq_sym, val]), p))
         }
-        '#' => read_sharpsign(chars, pos + 1, labels),
-        _ => read_atom(chars, pos),
+        '#' => read_sharpsign_with_base(chars, pos + 1, labels, read_base, read_eval),
+        _ => read_atom_with_base(chars, pos, read_base),
     }
 }
 
@@ -275,7 +370,13 @@ fn skip_whitespace_and_comments(chars: &[char], mut pos: usize) -> usize {
 }
 
 fn read_list(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels,
+    chars: &[char], pos: usize, labels: &mut CircularLabels,
+) -> Result<(BlissVal, usize), BlissError> {
+    read_list_with_base(chars, pos, labels, 10, true)
+}
+
+fn read_list_with_base(
+    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     let mut elements: Vec<BlissVal> = Vec::new();
     loop {
@@ -294,7 +395,7 @@ fn read_list(
                 }
                 pos += 1;
                 pos = skip_whitespace_and_comments(chars, pos);
-                let (cdr_val, p) = read_token(chars, pos, labels)?;
+                let (cdr_val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
                 pos = skip_whitespace_and_comments(chars, p);
                 if pos >= chars.len() || chars[pos] != ')' {
                     // Check for illegal (a . b . c)
@@ -308,7 +409,7 @@ fn read_list(
                 return Ok((result, pos + 1));
             }
         }
-        let (val, p) = read_token(chars, pos, labels)?;
+        let (val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
         elements.push(val);
         pos = p;
     }
@@ -340,8 +441,12 @@ fn read_string(chars: &[char], mut pos: usize) -> Result<(BlissVal, usize), Blis
 }
 
 fn read_atom(chars: &[char], pos: usize) -> Result<(BlissVal, usize), BlissError> {
+    read_atom_with_base(chars, pos, 10)
+}
+
+fn read_atom_with_base(chars: &[char], pos: usize, read_base: u32) -> Result<(BlissVal, usize), BlissError> {
     let (token, end, has_escape) = collect_token(chars, pos)?;
-    parse_token(&token, has_escape)
+    parse_token_with_base(&token, has_escape, read_base)
         .map(|v| (v, end))
 }
 
@@ -391,6 +496,10 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(Vec<(char, bool)>, u
 }
 
 fn parse_token(token: &[(char, bool)], has_escape: bool) -> Result<BlissVal, BlissError> {
+    parse_token_with_base(token, has_escape, 10)
+}
+
+fn parse_token_with_base(token: &[(char, bool)], has_escape: bool, read_base: u32) -> Result<BlissVal, BlissError> {
     // Build the upcased name (upcased for non-escaped chars)
     let name: String = token.iter().map(|&(c, escaped)| {
         if escaped { c } else { c.to_ascii_uppercase() }
@@ -417,7 +526,7 @@ fn parse_token(token: &[(char, bool)], has_escape: bool) -> Result<BlissVal, Bli
             return Ok(BlissVal::from_symbol_index(idx));
         }
         // Try numeric parse
-        match try_parse_number(&name) {
+        match try_parse_number_with_base(&name, read_base) {
             Ok(Some(val)) => return Ok(val),
             Ok(None) => {} // Not a number, fall through to symbol
             Err(e) => return Err(e), // e.g. division by zero in ratio
@@ -468,12 +577,21 @@ fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
 }
 
 fn try_parse_number(s: &str) -> Result<Option<BlissVal>, BlissError> {
+    try_parse_number_with_base(s, 10)
+}
+
+fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal>, BlissError> {
     // Ratio: num/denom
     if let Some(slash_pos) = s.find('/') {
         if slash_pos > 0 && slash_pos < s.len() - 1 {
             let num_str = &s[..slash_pos];
             let den_str = &s[slash_pos + 1..];
-            if let (Ok(n), Ok(d)) = (num_str.parse::<i64>(), den_str.parse::<i64>()) {
+            if let (Ok(n), Ok(d)) = (
+                i64::from_str_radix(num_str.trim_start_matches('+'), read_base),
+                i64::from_str_radix(den_str.trim_start_matches('+'), read_base),
+            ) {
+                let n = if num_str.starts_with('-') { -n.abs() } else { n };
+                let d = if den_str.starts_with('-') { -d.abs() } else { d };
                 if d == 0 {
                     return Err(BlissError::ArithmeticError("division by zero in ratio".into()));
                 }
@@ -485,22 +603,31 @@ fn try_parse_number(s: &str) -> Result<Option<BlissVal>, BlissError> {
         }
         return Ok(None);
     }
-    // Float: contains '.' or 'E'/'e' with digits
-    if s.contains('.') || (s.contains('e') || s.contains('E')) && !s.chars().all(|c| c.is_ascii_hexdigit() || c == '+' || c == '-') {
-        if let Ok(f) = s.parse::<f32>() {
-            return Ok(Some(BlissVal::from_single_float(f)));
+    // Float: contains '.' or 'E'/'e' with digits (only for base 10)
+    if read_base == 10 {
+        if s.contains('.') || (s.contains('e') || s.contains('E')) && !s.chars().all(|c| c.is_ascii_hexdigit() || c == '+' || c == '-') {
+            if let Ok(f) = s.parse::<f32>() {
+                return Ok(Some(BlissVal::from_single_float(f)));
+            }
+            return Ok(None);
         }
-        return Ok(None);
     }
-    // Integer
-    if let Ok(n) = s.parse::<i64>() {
+    // Integer with read_base
+    let trimmed = s.trim_start_matches('+');
+    if let Ok(n) = i64::from_str_radix(trimmed, read_base) {
         return Ok(Some(BlissVal::from_fixnum(n)));
     }
     Ok(None)
 }
 
 fn read_sharpsign(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels,
+    chars: &[char], pos: usize, labels: &mut CircularLabels,
+) -> Result<(BlissVal, usize), BlissError> {
+    read_sharpsign_with_base(chars, pos, labels, 10, true)
+}
+
+fn read_sharpsign_with_base(
+    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     if pos >= chars.len() {
         return Err(BlissError::StreamError("unexpected end after #".into()));
@@ -523,7 +650,7 @@ fn read_sharpsign(
                 // Pre-allocate a placeholder cons cell for circular references
                 let placeholder = alloc_cons(NIL, NIL);
                 labels.labels.insert(num, placeholder);
-                let (val, p) = read_token(chars, pos, labels)?;
+                let (val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
                 // If the result is a cons, copy its car/cdr into the placeholder
                 if val.is_cons() {
                     unsafe {
@@ -552,13 +679,13 @@ fn read_sharpsign(
     pos += 1;
     match dispatch {
         '\'' => {
-            let (val, p) = read_token(chars, pos, labels)?;
+            let (val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
             let func_sym = BlissVal::from_symbol_index(intern_symbol("FUNCTION"));
             Ok((make_list(&[func_sym, val]), p))
         }
         '\\' => read_char_literal(chars, pos),
-        '(' => read_vector_literal(chars, pos, labels),
-        'C' | 'c' => read_complex_literal(chars, pos, labels),
+        '(' => read_vector_literal_with_base(chars, pos, labels, read_base, read_eval),
+        'C' | 'c' => read_complex_literal_with_base(chars, pos, labels, read_base, read_eval),
         '*' => read_bit_vector(chars, pos),
         'b' | 'B' => read_radix_integer(chars, pos, 2),
         'o' | 'O' => read_radix_integer(chars, pos, 8),
@@ -566,7 +693,7 @@ fn read_sharpsign(
         '|' => {
             // Block comment #| ... |# — possibly nested
             let p = skip_block_comment(chars, pos)?;
-            read_token(chars, p, labels)
+            read_token_with_base(chars, p, labels, read_base, read_eval)
         }
         ':' => {
             // Uninterned symbol
@@ -574,12 +701,19 @@ fn read_sharpsign(
             let name: String = token.iter().map(|&(c, esc)| if esc { c } else { c.to_ascii_uppercase() }).collect();
             Ok((make_uninterned_symbol(&name), end))
         }
+        'P' | 'p' => read_pathname_literal(chars, pos),
+        'S' | 's' => read_struct_literal_with_base(chars, pos, labels, read_base, read_eval),
         '<' => Err(BlissError::StreamError("unreadable object #<".into())),
-        '+' => read_feature_expr(chars, pos, labels, true),
-        '-' => read_feature_expr(chars, pos, labels, false),
+        '+' => read_feature_expr_with_base(chars, pos, labels, true, read_base, read_eval),
+        '-' => read_feature_expr_with_base(chars, pos, labels, false, read_base, read_eval),
         '.' => {
-            // Read-eval: #.(form)
-            let (form, p) = read_token(chars, pos, labels)?;
+            // Read-eval: #.(form) — check *read-eval* first
+            if !read_eval {
+                return Err(BlissError::StreamError(
+                    "can't read #. while *READ-EVAL* is false".into(),
+                ));
+            }
+            let (form, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
             // Try simple evaluation of (+ 1 2)
             match try_eval(form) {
                 Some(val) => Ok((val, p)),
@@ -625,7 +759,13 @@ fn read_char_literal(chars: &[char], pos: usize) -> Result<(BlissVal, usize), Bl
 }
 
 fn read_vector_literal(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels,
+    chars: &[char], pos: usize, labels: &mut CircularLabels,
+) -> Result<(BlissVal, usize), BlissError> {
+    read_vector_literal_with_base(chars, pos, labels, 10, true)
+}
+
+fn read_vector_literal_with_base(
+    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     let mut elements = Vec::new();
     loop {
@@ -636,14 +776,20 @@ fn read_vector_literal(
         if chars[pos] == ')' {
             return Ok((alloc_vector(&elements), pos + 1));
         }
-        let (val, p) = read_token(chars, pos, labels)?;
+        let (val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
         elements.push(val);
         pos = p;
     }
 }
 
 fn read_complex_literal(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels,
+    chars: &[char], pos: usize, labels: &mut CircularLabels,
+) -> Result<(BlissVal, usize), BlissError> {
+    read_complex_literal_with_base(chars, pos, labels, 10, true)
+}
+
+fn read_complex_literal_with_base(
+    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     pos = skip_whitespace_and_comments(chars, pos);
     if pos >= chars.len() || chars[pos] != '(' {
@@ -651,9 +797,9 @@ fn read_complex_literal(
     }
     pos += 1;
     pos = skip_whitespace_and_comments(chars, pos);
-    let (real, p) = read_token(chars, pos, labels)?;
+    let (real, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
     pos = skip_whitespace_and_comments(chars, p);
-    let (imag, p) = read_token(chars, pos, labels)?;
+    let (imag, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
     pos = skip_whitespace_and_comments(chars, p);
     if pos >= chars.len() || chars[pos] != ')' {
         return Err(BlissError::StreamError("expected ) after #C(real imag".into()));
@@ -707,10 +853,17 @@ fn skip_block_comment(chars: &[char], mut pos: usize) -> Result<usize, BlissErro
 }
 
 fn read_feature_expr(
+    chars: &[char], pos: usize, labels: &mut CircularLabels, include_if_present: bool,
+) -> Result<(BlissVal, usize), BlissError> {
+    read_feature_expr_with_base(chars, pos, labels, include_if_present, 10, true)
+}
+
+fn read_feature_expr_with_base(
     chars: &[char], mut pos: usize, labels: &mut CircularLabels, include_if_present: bool,
+    read_base: u32, read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     // Read the feature expression (a keyword symbol like :bliss)
-    let (feature, p) = read_token(chars, pos, labels)?;
+    let (feature, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
     pos = p;
     // Check if feature is :bliss (our implementation)
     let bliss_kw_idx = intern_symbol("KEYWORD:BLISS");
@@ -718,26 +871,177 @@ fn read_feature_expr(
 
     if (include_if_present && feature_present) || (!include_if_present && !feature_present) {
         // Include the next form
-        read_token(chars, pos, labels)
+        read_token_with_base(chars, pos, labels, read_base, read_eval)
     } else {
         // Skip the next form, then read the one after
-        let (_skipped, p) = read_token(chars, pos, labels)?;
+        let (_skipped, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
         pos = p;
         // Try to read the next form; if nothing follows, return EOF
         pos = skip_whitespace_and_comments(chars, pos);
         if pos >= chars.len() {
             return Ok((EOF, pos));
         }
-        read_token(chars, pos, labels)
+        read_token_with_base(chars, pos, labels, read_base, read_eval)
+    }
+}
+
+/// Coerce a numeric BlissVal to f64 for mixed-type arithmetic.
+fn numeric_to_f64(v: BlissVal) -> Option<f64> {
+    if v.is_fixnum() {
+        Some(v.as_fixnum() as f64)
+    } else if v.is_single_float() {
+        Some(v.as_single_float() as f64)
+    } else {
+        None
     }
 }
 
 fn try_eval(form: BlissVal) -> Option<BlissVal> {
-    // Minimal eval for #. — only handles simple (+ n m) forms
-    if !form.is_cons() { return None; }
-    // We can't easily destructure cons cells without unsafe, so return None
-    // to trigger the error path — tests accept this
-    None
+    // Minimal eval for #. — handles self-evaluating atoms and simple arithmetic
+    // on fixnums and floats: (+, -, *) with recursive argument evaluation.
+    if !form.is_cons() {
+        // Self-evaluating atoms: numbers, floats, characters, strings
+        if form.is_fixnum() || form.is_single_float() || form.is_character() {
+            return Some(form);
+        }
+        // Strings are self-evaluating
+        if form.is_heap_object() {
+            unsafe {
+                let ptr = form.as_ptr();
+                let header = *(ptr as *const ObjectHeader);
+                if header.type_id() == type_id::SIMPLE_BASE_STRING {
+                    return Some(form);
+                }
+            }
+        }
+        return None;
+    }
+    // Destructure (op arg1 arg2) from cons cells
+    unsafe {
+        let cell = form.as_ptr() as *const ConsCell;
+        let op = (*cell).car;
+        let rest = (*cell).cdr;
+        if !op.is_symbol() || !rest.is_cons() {
+            return None;
+        }
+        let rest_cell = rest.as_ptr() as *const ConsCell;
+        let arg1_form = (*rest_cell).car;
+        let rest2 = (*rest_cell).cdr;
+
+        // Recursively evaluate arguments
+        let arg1 = try_eval(arg1_form)?;
+
+        let plus_idx = intern_symbol("+");
+        let minus_idx = intern_symbol("-");
+        let star_idx = intern_symbol("*");
+
+        // Unary or binary?
+        if rest2.is_nil() {
+            // Unary: e.g. (- x)
+            if op == BlissVal::from_symbol_index(minus_idx) {
+                if arg1.is_fixnum() {
+                    return Some(BlissVal::from_fixnum(-arg1.as_fixnum()));
+                } else if arg1.is_single_float() {
+                    return Some(BlissVal::from_single_float(-arg1.as_single_float()));
+                }
+            }
+            // Unary + is identity
+            if op == BlissVal::from_symbol_index(plus_idx) {
+                if arg1.is_fixnum() || arg1.is_single_float() {
+                    return Some(arg1);
+                }
+            }
+            return None;
+        }
+
+        if !rest2.is_cons() { return None; }
+        let rest2_cell = rest2.as_ptr() as *const ConsCell;
+        let arg2_form = (*rest2_cell).car;
+        let rest3 = (*rest2_cell).cdr;
+        if !rest3.is_nil() { return None; } // only binary ops
+
+        let arg2 = try_eval(arg2_form)?;
+
+        // Both fixnum — stay in fixnum domain
+        if arg1.is_fixnum() && arg2.is_fixnum() {
+            let a = arg1.as_fixnum();
+            let b = arg2.as_fixnum();
+            if op == BlissVal::from_symbol_index(plus_idx) {
+                return Some(BlissVal::from_fixnum(a + b));
+            } else if op == BlissVal::from_symbol_index(minus_idx) {
+                return Some(BlissVal::from_fixnum(a - b));
+            } else if op == BlissVal::from_symbol_index(star_idx) {
+                return Some(BlissVal::from_fixnum(a * b));
+            }
+            return None;
+        }
+
+        // Mixed or both float — promote to float
+        let a = numeric_to_f64(arg1)?;
+        let b = numeric_to_f64(arg2)?;
+
+        if op == BlissVal::from_symbol_index(plus_idx) {
+            Some(BlissVal::from_single_float((a + b) as f32))
+        } else if op == BlissVal::from_symbol_index(minus_idx) {
+            Some(BlissVal::from_single_float((a - b) as f32))
+        } else if op == BlissVal::from_symbol_index(star_idx) {
+            Some(BlissVal::from_single_float((a * b) as f32))
+        } else {
+            None
+        }
+    }
+}
+
+fn read_pathname_literal(chars: &[char], pos: usize) -> Result<(BlissVal, usize), BlissError> {
+    // #P"string" — parse the string that follows
+    if pos >= chars.len() || chars[pos] != '"' {
+        return Err(BlissError::StreamError("expected string after #P".into()));
+    }
+    let (string_val, end) = read_string(chars, pos + 1)?;
+    Ok((alloc_pathname(string_val), end))
+}
+
+fn read_struct_literal(
+    chars: &[char], pos: usize, labels: &mut CircularLabels,
+) -> Result<(BlissVal, usize), BlissError> {
+    read_struct_literal_with_base(chars, pos, labels, 10, true)
+}
+
+fn read_struct_literal_with_base(
+    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
+) -> Result<(BlissVal, usize), BlissError> {
+    // #S(name slot-key slot-value ...) — parse struct literal
+    pos = skip_whitespace_and_comments(chars, pos);
+    if pos >= chars.len() || chars[pos] != '(' {
+        return Err(BlissError::StreamError("expected ( after #S".into()));
+    }
+    pos += 1;
+    pos = skip_whitespace_and_comments(chars, pos);
+    if pos >= chars.len() {
+        return Err(BlissError::StreamError("unterminated #S literal".into()));
+    }
+    if chars[pos] == ')' {
+        return Err(BlissError::StreamError("#S() requires a struct name".into()));
+    }
+    // Read struct name
+    let (name_val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+    pos = p;
+    // Read remaining slot key-value pairs as a flat list
+    let mut slots = Vec::new();
+    loop {
+        pos = skip_whitespace_and_comments(chars, pos);
+        if pos >= chars.len() {
+            return Err(BlissError::StreamError("unterminated #S literal".into()));
+        }
+        if chars[pos] == ')' {
+            pos += 1;
+            break;
+        }
+        let (val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+        slots.push(val);
+        pos = p;
+    }
+    Ok((alloc_structure(name_val, &slots), pos))
 }
 
 // ── Readtable operations ──────────────────────────────────────────
