@@ -151,18 +151,13 @@ fn ir_builder_build_constant_produces_ok_graph() {
 }
 
 #[test]
-fn ir_builder_build_if_produces_branch_and_region() {
-    // Build a form representing (IF NIL NIL NIL), which should produce Branch and Region nodes.
-    // We construct a simple cons-list representation: (IF test then else).
-    // The exact BlissVal encoding depends on the runtime, but the builder must handle IF.
-    // For now we test via the IrBuilder interface — if the form is valid it returns Ok
-    // with a graph containing control-flow nodes.
+fn ir_builder_build_nil_produces_graph_with_start_node() {
+    // Building NIL (a self-evaluating constant) should produce a well-formed graph
+    // containing at least a Start node and a Constant node.
     let mut builder = IrBuilder::new();
-    // Even if we can't construct a proper IF form as BlissVal here,
-    // we verify the builder handles NIL (a valid self-evaluating form) correctly.
     let graph = builder.build(NIL).expect("NIL should build successfully");
     // Verify the graph is non-trivial
-    assert!(graph.node_count() > 0, "built graph must contain nodes");
+    assert!(graph.node_count() >= 2, "built graph for NIL must contain at least Start + Constant nodes");
     // Verify the graph has a Start node
     let start_id = graph.start();
     assert!(matches!(graph.node_kind(start_id), NodeKind::Start));

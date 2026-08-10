@@ -392,8 +392,12 @@ fn read_suppress_mode_suppresses_errors() {
     state.set_input(NIL);
     // With *read-suppress*, even malformed tokens should not signal errors
     let result = read(&mut state);
-    // Should not panic — suppress mode should handle gracefully
-    let _ = result;
+    // Should either return Ok(NIL) (suppressed) or Err for EOF on empty input —
+    // but should never panic. If Ok, the value must be NIL per spec.
+    match result {
+        Ok(val) => assert_eq!(val, NIL, "read with *read-suppress* should return NIL"),
+        Err(_) => { /* EOF on empty input is acceptable */ }
+    }
 }
 
 // ── Edge cases: read() with ReaderState (Issue #10) ──────────────
@@ -425,8 +429,11 @@ fn read_with_reader_state_custom_readtable() {
     state.set_readtable(rt);
     state.set_input(NIL);
     let result = read(&mut state);
-    // Should not panic — the readtable should be accepted
-    let _ = result;
+    // With a custom readtable and empty/NIL input, expect EOF or an error
+    match result {
+        Ok(val) => assert_eq!(val, EOF, "reading from empty input with custom readtable should return EOF"),
+        Err(_) => { /* EOF error on empty input is acceptable */ }
+    }
 }
 
 // ── Edge cases: set_read_base affects parsing (Issue #11) ────────
@@ -539,19 +546,38 @@ fn read_sharpsign_dot_with_read_eval_disabled_is_error() {
     let mut state = ReaderState::new();
     state.set_read_eval(false);
     state.set_input(NIL);
-    // Can't easily test via read_from_string (which uses default state),
-    // but we can verify the setting is respected
+    // With read-eval disabled, attempting to read should either:
+    // - Return Err (EOF on empty input, or read-eval-disabled error)
+    // - Return Ok(EOF) for empty input
+    // It must NOT return Ok with a non-EOF, non-NIL evaluated result.
     let result = read(&mut state);
-    let _ = result; // just ensure no panic; the real test is below
+    match result {
+        Ok(val) => assert!(
+            val == EOF || val == NIL,
+            "with read-eval disabled and empty input, should get EOF or NIL, not an evaluated result"
+        ),
+        Err(_) => { /* Error (e.g. EOF) is acceptable */ }
+    }
 }
 
 #[test]
 fn read_sharpsign_dot_syntax() {
     // #.(+ 1 2) with read-eval enabled should evaluate and return 3
-    // This requires eval support; at minimum verify it parses
+    // This requires eval support; with *read-eval* true (default),
+    // the reader should either successfully evaluate and return a fixnum,
+    // or return an error if eval is not yet wired up.
     let result = read_from_string("#.(+ 1 2)");
-    // With *read-eval* true (default), this should work or fail gracefully
-    let _ = result;
+    match result {
+        Ok((val, _)) => {
+            // If eval is working, #.(+ 1 2) should produce 3
+            assert!(val.is_fixnum(), "#.(+ 1 2) should evaluate to a fixnum");
+            assert_eq!(val.as_fixnum(), 3, "#.(+ 1 2) should evaluate to 3");
+        }
+        Err(_) => {
+            // Acceptable if eval is not yet implemented — but it must not silently succeed
+            // with a wrong value
+        }
+    }
 }
 
 // ── #C complex numbers (Issue #4) ────────────────────────────────
