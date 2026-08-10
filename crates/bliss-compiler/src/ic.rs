@@ -4,6 +4,7 @@
 
 use bliss_rt::value::BlissVal;
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Inline cache state machine. D4.03.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,9 +32,17 @@ pub struct IcEntry {
 }
 
 /// An inline cache site.
+///
+/// Each IC tracks a local `generation` counter that is compared against
+/// the global `IC_GENERATION` on every lookup/update. If the global
+/// generation has advanced (due to `reset_all_caches`), the IC lazily
+/// resets itself before proceeding. This implements the epoch-based
+/// bulk invalidation scheme from §4.8.8.
 pub struct InlineCache {
     state: Cell<IcState>,
     entries: RefCell<Vec<IcEntry>>,
+    /// Local generation — compared against the global IC_GENERATION counter.
+    generation: Cell<u64>,
 }
 
 impl InlineCache {
@@ -42,17 +51,31 @@ impl InlineCache {
         InlineCache {
             state: Cell::new(IcState::Uninitialized),
             entries: RefCell::new(Vec::new()),
+            generation: Cell::new(IC_GENERATION.load(Ordering::Acquire)),
+        }
+    }
+
+    /// Check if the global IC generation has advanced past our local
+    /// generation, and if so, lazily reset this IC.
+    fn check_generation(&self) {
+        let global_gen = IC_GENERATION.load(Ordering::Acquire);
+        if self.generation.get() != global_gen {
+            self.entries.borrow_mut().clear();
+            self.state.set(IcState::Uninitialized);
+            self.generation.set(global_gen);
         }
     }
 
     /// Get the current state.
     pub fn state(&self) -> IcState {
+        self.check_generation();
         self.state.get()
     }
 
     /// Look up the cached target for a given class.
     /// Returns None on cache miss.
     pub fn lookup(&self, class: BlissVal) -> Option<BlissVal> {
+        self.check_generation();
         let entries = self.entries.borrow();
         for entry in entries.iter() {
             if entry.class == class {
@@ -65,6 +88,7 @@ impl InlineCache {
     /// Record a new type→method mapping. May transition the IC state.
     /// The update is atomic with respect to concurrent callers (R4.50).
     pub fn update(&self, class: BlissVal, method: BlissVal) {
+        self.check_generation();
         let mut entries = self.entries.borrow_mut();
 
         // Check if this class is already cached — if so, update in place
@@ -94,18 +118,59 @@ impl InlineCache {
     pub fn reset(&self) {
         self.entries.borrow_mut().clear();
         self.state.set(IcState::Uninitialized);
+        self.generation.set(IC_GENERATION.load(Ordering::Acquire));
     }
 
     /// Get the current entries (for diagnostics).
     pub fn entries(&self) -> Vec<IcEntry> {
+        self.check_generation();
         self.entries.borrow().clone()
     }
 }
 
-/// Reset all inline caches (e.g., after a method redefinition).
+// ── Global IC Registry ────────────────────────────────────────────
+//
+// The global IC registry uses an epoch-based invalidation scheme (§4.8.8):
+// - A global generation counter (`IC_GENERATION`) is incremented on bulk
+//   invalidation events (class redefinition, method changes).
+// - Each InlineCache stores the generation it was last synchronised at.
+// - On lookup, if the local generation is behind the global one, the IC
+//   lazily resets itself before proceeding.
+// - The registry must be explicitly initialised before `reset_all_caches`
+//   can be called (mirrors the runtime bootstrap sequence).
+
+/// Global IC generation counter — incremented by `reset_all_caches`.
+static IC_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the global IC registry has been initialised.
+static IC_REGISTRY_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Initialise the global IC registry. Must be called during runtime
+/// bootstrap before any calls to `reset_all_caches`.
+pub fn init_ic_registry() {
+    IC_REGISTRY_INITIALIZED.store(true, Ordering::Release);
+    IC_GENERATION.store(0, Ordering::Release);
+}
+
+/// Get the current global IC generation counter.
+pub fn ic_generation() -> u64 {
+    IC_GENERATION.load(Ordering::Acquire)
+}
+
+/// Reset all inline caches by bumping the global generation counter.
+///
+/// After this call, every `InlineCache` will lazily reset itself on its
+/// next `lookup` or `update` operation when it detects its local generation
+/// is stale. This is O(1) — no scanning of IC sites required (§4.8.8
+/// epoch-based bulk invalidation).
+///
+/// # Panics
+///
+/// Panics if the global IC registry has not been initialised via
+/// `init_ic_registry()`.
 pub fn reset_all_caches() {
-    // In a full implementation, this would iterate a global registry of all
-    // inline cache sites and reset each one. For now, this is a placeholder
-    // that signals the operation is not yet wired to the global IC registry.
-    panic!("reset_all_caches: global IC registry not yet initialized");
+    if !IC_REGISTRY_INITIALIZED.load(Ordering::Acquire) {
+        panic!("reset_all_caches: global IC registry not yet initialized");
+    }
+    IC_GENERATION.fetch_add(1, Ordering::Release);
 }
