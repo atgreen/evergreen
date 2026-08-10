@@ -359,10 +359,17 @@ fn heap_stats_returns_zeroed_before_init() {
     // should return a valid GcStats. If no heap is initialized, all
     // counters should be zero/default.
     let stats = heap_stats();
-    // We can't guarantee init_heap hasn't been called by another test,
-    // but we can verify the return type is well-formed.
-    assert!(stats.minor_gc_count == 0 || true, "stats should be queryable");
-    assert!(stats.major_gc_count == 0 || true, "stats should be queryable");
+    // We can't guarantee init_heap hasn't been called by another test
+    // in parallel, but we can verify the return type is well-formed:
+    // the stats struct must have sensible values (counts are non-negative
+    // by type, and capacity fields should not be absurdly large).
+    // If no heap was initialized, all values should be zero (default).
+    // If another test did init, capacities may be non-zero but counts
+    // should still be zero (no GC has run).
+    assert!(stats.bytes_allocated <= stats.nursery_capacity + stats.old_gen_capacity + stats.large_object_bytes,
+        "bytes_allocated should not exceed total capacity");
+    assert!(stats.regions_free <= stats.regions_total,
+        "regions_free should not exceed regions_total");
 }
 
 #[test]
