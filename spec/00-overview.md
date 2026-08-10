@@ -10,6 +10,10 @@ Bliss is a from-scratch Common Lisp implementation written in Rust (bootstrap
 runtime) and, eventually, Common Lisp itself (compiler, optimiser, large parts
 of the standard library). The project targets ANSI X3.226-1994 (CLtL2 + ANSI
 errata) with SBCL-compatible extensions where the standard is silent.
+SBCL extensions are adopted when they are (a) widely depended upon by portable
+libraries (e.g., `sb-ext:defglobal`, `sb-thread` API shapes) and (b) do not
+conflict with ANSI semantics. Each adopted extension MUST be listed in
+`spec/09-extensions.md` with its rationale and compatibility notes.
 
 ### 0.1  Primary Goals
 
@@ -37,14 +41,14 @@ errata) with SBCL-compatible extensions where the standard is silent.
 │                      User Code (CL)                      │
 ├───────────────────────┬──────────────────────────────────┤
 │   Standard Library    │     CLOS / Conditions / Streams  │
-│   (§6 — mostly CL)   │     (§6 — CL + Rust glue)       │
+│   (§5 — mostly CL)   │     (§5 — CL + Rust glue)       │
 ├───────────────────────┼──────────────────────────────────┤
 │   Compiler Pipeline   │     Debugger / Profiler          │
-│   (§4)                │     (§7)                         │
+│   (§4)                │     (§6)                         │
 ├───────────────────────┴──────────────────────────────────┤
-│              Object Model & Type System (§3)             │
+│              Object Model & Type System (§1)             │
 ├──────────────────────────────────────────────────────────┤
-│           Memory Manager / Garbage Collector (§5)        │
+│           Memory Manager / Garbage Collector (§3)        │
 ├──────────────────────────────────────────────────────────┤
 │          Runtime Core (§2): threads, FFI, I/O            │
 ├──────────────────────────────────────────────────────────┤
@@ -86,6 +90,7 @@ cross-referencing. Code modules reference spec sections as `§N.M`.
 | `06-devtools.md` | §6 Developer Tools | REPL, debugger, profiler, disassembler, IDE protocol |
 | `07-ops-portability.md` | §7 Ops & Portability | Image save/load, deployment, platform matrix, config |
 | `08-security-robustness.md` | §8 Security | Sandboxing, safe FFI, resource limits, signal safety |
+| `09-extensions.md` | §9 SBCL Extensions | Adopted SBCL-compatible extensions, rationale, compatibility |
 
 ## 3  Directory Structure (Source Tree)
 
