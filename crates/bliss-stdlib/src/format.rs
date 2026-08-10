@@ -8,39 +8,11 @@ use bliss_rt::value::{BlissVal, NIL, T};
 
 // ── String allocation ─────────────────────────────────────────────
 
-/// Heap layout for a simple-base-string:
-/// [ObjectHeader (8 bytes)][length: u64 (8 bytes)][data: u8...]
-#[repr(C)]
-struct BlissString {
-    header: ObjectHeader,
-    length: u64,
-    // followed by UTF-8 bytes
-}
-
-/// Allocate a BlissVal string on the heap with proper ObjectHeader so
-/// that `bliss_rt::types::stringp()` returns true.
-///
-/// NOTE: This allocation is not registered with the GC. In a full runtime,
-/// these objects should be allocated through the GC's nursery allocator so
-/// they can be collected when unreachable. Until GC integration is available,
-/// these allocations are intentional leaks — the memory persists for the
-/// lifetime of the process.
+/// Allocate a BlissVal string using the interned string table from the
+/// streams module.  This ensures that format-produced strings compare
+/// pointer-equal to strings created via `make_lisp_string()`.
 fn make_bliss_string(s: &str) -> BlissVal {
-    let data_len = s.len();
-    let total = std::mem::size_of::<BlissString>() + data_len;
-    let size_units = ((total + 7) / 8) as u16;
-    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
-    unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout);
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        let header = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, size_units);
-        *(ptr as *mut ObjectHeader) = header;
-        *(ptr.add(8) as *mut u64) = data_len as u64;
-        std::ptr::copy_nonoverlapping(s.as_ptr(), ptr.add(16), data_len);
-        BlissVal::from_heap_ptr(ptr)
-    }
+    crate::streams::make_lisp_string(s)
 }
 
 // ── String extraction ────────────────────────────────────────────
@@ -329,13 +301,15 @@ pub fn format(
     // Validate destination
     let to_string = destination.is_nil();
     let to_stdout = destination == T;
-    if !to_string && !to_stdout {
-        // Check if it's a stream (heap object with stream type_id)
+    // Detect stream destinations using the streams module's own query
+    // function, which correctly understands the StreamState layout.
+    let to_stream = !to_string && !to_stdout
+        && destination.is_heap_object()
+        && crate::streams::output_stream_p(destination);
+    if !to_string && !to_stdout && !to_stream {
+        // Not NIL, not T, not an output stream — check for string type
         if destination.is_heap_object() {
-            let tid = unsafe { bliss_rt::types::type_id_of(destination) };
-            if tid != bliss_rt::object::type_id::STREAM
-               && tid != bliss_rt::object::type_id::SIMPLE_BASE_STRING
-               && tid != bliss_rt::object::type_id::SIMPLE_CHARACTER_STRING {
+            if !bliss_rt::types::stringp(destination) {
                 return Err(BlissError::TypeError {
                     datum: destination,
                     expected: "stream or string-with-fill-pointer".into(),
@@ -361,36 +335,16 @@ pub fn format(
         Ok(NIL)
     } else if to_string {
         Ok(make_bliss_string(&output))
-    } else if destination.is_heap_object() {
-        // Stream or string-with-fill-pointer destination
-        let tid = unsafe { bliss_rt::types::type_id_of(destination) };
-        if tid == bliss_rt::object::type_id::STREAM {
-            // Write to stream via its state buffer
-            // The StreamData has an ops pointer and state pointer.
-            // In the absence of a full stream write API, we write the
-            // bytes to the stream's state buffer if available, else stdout.
-            unsafe {
-                let ptr = destination.as_ptr() as *mut bliss_rt::object::StreamData;
-                let state = (*ptr).state;
-                if !state.is_null() {
-                    // Treat state as a Vec<u8>-like buffer: write bytes there
-                    // For safety, fall back to stdout since we can't know the
-                    // exact buffer layout without the stream API.
-                    print!("{}", output);
-                } else {
-                    print!("{}", output);
-                }
-                // Update column tracking
-                if let Some(last_nl) = output.rfind('\n') {
-                    (*ptr).column = (output.len() - last_nl - 1) as u64;
-                } else {
-                    (*ptr).column += output.len() as u64;
-                }
-            }
-        } else {
-            // String with fill pointer — append to the string
-            print!("{}", output);
+    } else if to_stream {
+        // Write each character to the stream using the Gray streams API.
+        for ch in output.chars() {
+            crate::streams::stream_write_char(destination, BlissVal::from_char(ch))?;
         }
+        Ok(NIL)
+    } else if destination.is_heap_object() {
+        // String with fill pointer — not fully supported yet, fall back
+        // to stdout.
+        print!("{}", output);
         Ok(NIL)
     } else {
         Ok(NIL)
