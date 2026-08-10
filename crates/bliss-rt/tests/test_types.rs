@@ -154,19 +154,19 @@ fn functionp_false_cases() {
 #[test]
 fn functionp_false_for_heap_function_types() {
     unsafe {
-        let mut s1 = [0u64; 8];
+        let mut s1 = [0u64; 2];
         let interp = mk_heap(&mut s1, type_id::FUNCTION_INTERPRETED);
         // A heap object with FUNCTION_INTERPRETED type_id has heap tag (010),
         // not function tag (110), so tag-based functionp returns false.
         assert!(!functionp(interp),
             "heap FUNCTION_INTERPRETED should not satisfy tag-based functionp");
 
-        let mut s2 = [0u64; 8];
+        let mut s2 = [0u64; 2];
         let compiled = mk_heap(&mut s2, type_id::COMPILED_FUNCTION);
         assert!(!functionp(compiled),
             "heap COMPILED_FUNCTION should not satisfy tag-based functionp");
 
-        let mut s3 = [0u64; 4];
+        let mut s3 = [0u64; 2];
         let closure = mk_heap(&mut s3, type_id::CLOSURE);
         assert!(!functionp(closure),
             "heap CLOSURE should not satisfy tag-based functionp");

@@ -49,23 +49,28 @@ pub const EOF: BlissVal = BlissVal(EOF_BITS);
 
 impl BlissVal {
     /// Create a fixnum value from a 61-bit signed integer.
+    /// The value is left-shifted by 3 bits; tag bits are 000.
     pub fn from_fixnum(n: i64) -> Self {
-        unimplemented!("BlissVal::from_fixnum")
+        // Arithmetic left shift by 3 gives us tag 000 in the low bits.
+        // Cast to u64 to do the shift, preserving the sign bit pattern.
+        BlissVal(((n << 3) as u64) | TAG_FIXNUM)
     }
 
     /// Create a character value from a Unicode codepoint.
     pub fn from_char(c: char) -> Self {
-        unimplemented!("BlissVal::from_char")
+        BlissVal(((c as u64) << 3) | TAG_CHARACTER)
     }
 
     /// Create a single-float immediate from an f32.
+    /// The f32 bits are stored in bits 63:32, tag in bits 2:0.
     pub fn from_single_float(f: f32) -> Self {
-        unimplemented!("BlissVal::from_single_float")
+        let bits = f.to_bits() as u64;
+        BlissVal((bits << 32) | TAG_SINGLE_FLOAT)
     }
 
     /// Create a symbol-index value.
     pub fn from_symbol_index(idx: u32) -> Self {
-        unimplemented!("BlissVal::from_symbol_index")
+        BlissVal(((idx as u64) << 3) | TAG_SYMBOL)
     }
 
     /// Create a cons-tagged pointer.
@@ -73,7 +78,7 @@ impl BlissVal {
     /// # Safety
     /// `ptr` must be 8-byte aligned and point to a valid cons cell.
     pub unsafe fn from_cons_ptr(ptr: *mut u8) -> Self {
-        unimplemented!("BlissVal::from_cons_ptr")
+        BlissVal((ptr as u64) | TAG_CONS)
     }
 
     /// Create a heap-object-tagged pointer.
@@ -81,7 +86,7 @@ impl BlissVal {
     /// # Safety
     /// `ptr` must be 8-byte aligned and point to a valid `ObjectHeader`.
     pub unsafe fn from_heap_ptr(ptr: *mut u8) -> Self {
-        unimplemented!("BlissVal::from_heap_ptr")
+        BlissVal((ptr as u64) | TAG_HEAP_OBJECT)
     }
 
     /// Create a function-tagged pointer.
@@ -89,7 +94,7 @@ impl BlissVal {
     /// # Safety
     /// `ptr` must be 8-byte aligned and point to a valid function header.
     pub unsafe fn from_function_ptr(ptr: *mut u8) -> Self {
-        unimplemented!("BlissVal::from_function_ptr")
+        BlissVal((ptr as u64) | TAG_FUNCTION)
     }
 }
 
@@ -99,61 +104,61 @@ impl BlissVal {
     /// Extract the 3-bit tag.
     #[inline(always)]
     pub fn tag(self) -> u64 {
-        unimplemented!("BlissVal::tag")
+        self.0 & TAG_MASK
     }
 
     /// True if this value is a fixnum (tag `000`).
     #[inline(always)]
     pub fn is_fixnum(self) -> bool {
-        unimplemented!("BlissVal::is_fixnum")
+        self.tag() == TAG_FIXNUM
     }
 
     /// True if this value is a cons cell (tag `001`).
     #[inline(always)]
     pub fn is_cons(self) -> bool {
-        unimplemented!("BlissVal::is_cons")
+        self.tag() == TAG_CONS
     }
 
     /// True if this value is a general heap object (tag `010`).
     #[inline(always)]
     pub fn is_heap_object(self) -> bool {
-        unimplemented!("BlissVal::is_heap_object")
+        self.tag() == TAG_HEAP_OBJECT
     }
 
     /// True if this value is a character (tag `011`).
     #[inline(always)]
     pub fn is_character(self) -> bool {
-        unimplemented!("BlissVal::is_character")
+        self.tag() == TAG_CHARACTER
     }
 
     /// True if this value is a single-float (tag `100`).
     #[inline(always)]
     pub fn is_single_float(self) -> bool {
-        unimplemented!("BlissVal::is_single_float")
+        self.tag() == TAG_SINGLE_FLOAT
     }
 
     /// True if this value is a symbol (tag `101` or special NIL/T).
     #[inline(always)]
     pub fn is_symbol(self) -> bool {
-        unimplemented!("BlissVal::is_symbol")
+        self.tag() == TAG_SYMBOL || self.0 == NIL_BITS || self.0 == T_BITS
     }
 
     /// True if this value is a function (tag `110`).
     #[inline(always)]
     pub fn is_function(self) -> bool {
-        unimplemented!("BlissVal::is_function")
+        self.tag() == TAG_FUNCTION
     }
 
     /// True if this value is NIL.
     #[inline(always)]
     pub fn is_nil(self) -> bool {
-        unimplemented!("BlissVal::is_nil")
+        self.0 == NIL_BITS
     }
 
     /// True if this value is a list (cons or NIL).
     #[inline(always)]
     pub fn is_list(self) -> bool {
-        unimplemented!("BlissVal::is_list")
+        self.is_cons() || self.is_nil()
     }
 }
 
@@ -162,22 +167,30 @@ impl BlissVal {
 impl BlissVal {
     /// Extract the fixnum value. Panics if not a fixnum.
     pub fn as_fixnum(self) -> i64 {
-        unimplemented!("BlissVal::as_fixnum")
+        assert!(self.is_fixnum(), "BlissVal::as_fixnum called on non-fixnum");
+        // Arithmetic right shift to recover the signed integer
+        (self.0 as i64) >> 3
     }
 
     /// Extract the character value. Panics if not a character.
     pub fn as_char(self) -> char {
-        unimplemented!("BlissVal::as_char")
+        assert!(self.is_character(), "BlissVal::as_char called on non-character");
+        let cp = (self.0 >> 3) as u32;
+        // Safety: we only store valid chars via from_char
+        char::from_u32(cp).expect("invalid codepoint in BlissVal character")
     }
 
     /// Extract the single-float value. Panics if not a single-float.
     pub fn as_single_float(self) -> f32 {
-        unimplemented!("BlissVal::as_single_float")
+        assert!(self.is_single_float(), "BlissVal::as_single_float called on non-single-float");
+        let bits = (self.0 >> 32) as u32;
+        f32::from_bits(bits)
     }
 
     /// Extract the symbol table index. Panics if not a symbol.
     pub fn as_symbol_index(self) -> u32 {
-        unimplemented!("BlissVal::as_symbol_index")
+        assert!(self.tag() == TAG_SYMBOL, "BlissVal::as_symbol_index called on non-symbol");
+        (self.0 >> 3) as u32
     }
 
     /// Extract the raw pointer (mask off tag bits).
@@ -185,7 +198,7 @@ impl BlissVal {
     /// # Safety
     /// Caller must ensure the tag is a pointer tag (001, 010, or 110).
     pub unsafe fn as_ptr(self) -> *mut u8 {
-        unimplemented!("BlissVal::as_ptr")
+        (self.0 & !TAG_MASK) as *mut u8
     }
 
     /// Pass this value across FFI as a raw u64.
@@ -203,6 +216,33 @@ impl BlissVal {
 
 impl core::fmt::Debug for BlissVal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        unimplemented!("BlissVal::Debug")
+        match self.tag() {
+            TAG_FIXNUM => write!(f, "Fixnum({})", self.as_fixnum()),
+            TAG_CONS => write!(f, "Cons({:#x})", self.0 & !TAG_MASK),
+            TAG_HEAP_OBJECT => write!(f, "HeapObj({:#x})", self.0 & !TAG_MASK),
+            TAG_CHARACTER => write!(f, "Char({:?})", self.as_char()),
+            TAG_SINGLE_FLOAT => write!(f, "SingleFloat({})", self.as_single_float()),
+            TAG_SYMBOL => {
+                if self.0 == NIL_BITS {
+                    write!(f, "NIL")
+                } else if self.0 == T_BITS {
+                    write!(f, "T")
+                } else {
+                    write!(f, "Symbol({})", (self.0 >> 3) as u32)
+                }
+            }
+            TAG_FUNCTION => write!(f, "Function({:#x})", self.0 & !TAG_MASK),
+            TAG_SPECIAL => {
+                match self.0 {
+                    NIL_BITS => write!(f, "NIL"),
+                    T_BITS => write!(f, "T"),
+                    UNBOUND_BITS => write!(f, "UNBOUND"),
+                    MISSING_BITS => write!(f, "MISSING"),
+                    EOF_BITS => write!(f, "EOF"),
+                    _ => write!(f, "Special({:#x})", self.0),
+                }
+            }
+            _ => write!(f, "BlissVal({:#x})", self.0),
+        }
     }
 }
