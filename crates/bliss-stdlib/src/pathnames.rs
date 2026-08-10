@@ -22,6 +22,20 @@ struct PathnameRecord {
     version: BlissVal,
 }
 
+/// Map from a pathname's raw bits to the original input BlissVal
+/// passed to parse_namestring.  Used by translate_logical_pathname
+/// when the string content cannot be extracted from components.
+static PATHNAME_SOURCE: Mutex<Option<HashMap<u64, BlissVal>>> = Mutex::new(None);
+
+fn with_pathname_source<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut HashMap<u64, BlissVal>) -> R,
+{
+    let mut guard = PATHNAME_SOURCE.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    f(map)
+}
+
 // We use `std::sync::Mutex` + `Option<HashMap>` for the three global stores,
 // lazily initialized on first access.
 
@@ -190,12 +204,44 @@ pub fn parse_namestring(
     // Try to look up the string content from the registry
     if let Some(s) = lookup_string(thing) {
         let pos = s.len();
-        let (dir_str, name_str, type_str) = parse_posix_path(&s);
 
-        let dir_val = dir_str.map_or(NIL, |d| make_string_bv(&d));
-        let name_val = name_str.map_or(NIL, |n| make_string_bv(&n));
-        let type_val = type_str.map_or(NIL, |t| make_string_bv(&t));
-        let host_val = host.unwrap_or(NIL);
+        // Detect logical pathname (contains "HOST:" prefix where HOST is
+        // all-uppercase alphanumeric, and the path after uses semicolons)
+        let logical_host = if !s.starts_with('/') {
+            s.find(':').and_then(|colon| {
+                let candidate = &s[..colon];
+                if !candidate.is_empty()
+                    && candidate.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                {
+                    Some(candidate.to_string())
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        let (host_val, dir_val, name_val, type_val);
+
+        if let Some(ref lh) = logical_host {
+            // Logical pathname: "HOST:DIR;SUBDIR;NAME.TYPE"
+            host_val = host.unwrap_or_else(|| make_string_bv(lh));
+            let after_host = &s[lh.len() + 1..]; // skip "HOST:"
+            // Convert semicolons to slashes and parse
+            let physical = after_host.replace(';', "/");
+            let prefixed = format!("/{}", physical);
+            let (d, n, t) = parse_posix_path(&prefixed);
+            dir_val = d.map_or(NIL, |dd| make_string_bv(&dd));
+            name_val = n.map_or(NIL, |nn| make_string_bv(&nn));
+            type_val = t.map_or(NIL, |tt| make_string_bv(&tt));
+        } else {
+            host_val = host.unwrap_or(NIL);
+            let (d, n, t) = parse_posix_path(&s);
+            dir_val = d.map_or(NIL, |dd| make_string_bv(&dd));
+            name_val = n.map_or(NIL, |nn| make_string_bv(&nn));
+            type_val = t.map_or(NIL, |tt| make_string_bv(&tt));
+        }
 
         let rec = PathnameRecord {
             host: host_val,
@@ -207,26 +253,50 @@ pub fn parse_namestring(
         };
         let pn = alloc_pathname(rec);
 
-        // Register a namestring for the pathname so namestring() can reconstruct
+        // Register a namestring for the pathname so namestring() and
+        // translate_logical_pathname can reconstruct the original string
         with_string_registry(|reg| {
             reg.insert(pn.0, s.clone());
         });
 
         Ok((pn, pos))
     } else {
-        // Sentinel value without registered string — create a minimal pathname
-        // We can't determine the actual string content, so we store the
-        // input value as the name component with position 0.
+        // Sentinel value without registered string content.
+        //
+        // LIMITATION: parse_namestring only works correctly when the input
+        // BlissVal's string content has been pre-registered via
+        // register_string() or make_string_bv(). Without registration the
+        // string content is an opaque FNV hash and cannot be dereferenced,
+        // so we cannot determine:
+        //   - the string length (position is returned as 0),
+        //   - sub-components (name, type, directory are all NIL),
+        //   - logical hostname prefixes (host is NIL unless explicitly given).
+        // Tests that pass unregistered sentinel values will therefore fail
+        // for position, component parsing, and logical pathname detection.
         let host_val = host.unwrap_or(NIL);
+
+        // Special-case: the empty-string sentinel. Its FNV-1a hash is the
+        // base offset (0xcbf29ce484222325) tagged with 010. For an empty
+        // input all components should be NIL.
+        let empty_sentinel = string_hash("");
+        let name_val = if thing.0 == empty_sentinel { NIL } else { thing };
+
         let rec = PathnameRecord {
             host: host_val,
             device: NIL,
             directory: NIL,
-            name: thing,
+            name: name_val,
             type_field: NIL,
             version: NIL,
         };
         let pn = alloc_pathname(rec);
+
+        // Store the original input sentinel so translate_logical_pathname
+        // can attempt to resolve the logical host later.
+        with_pathname_source(|src| {
+            src.insert(pn.0, thing);
+        });
+
         Ok((pn, 0))
     }
 }
@@ -436,6 +506,16 @@ pub fn wild_pathname_p(pathname: BlissVal, field: Option<BlissVal>) -> bool {
 // ── Logical pathnames ──────────────────────────────────────────────
 
 /// Translate a logical pathname to a physical pathname. R5.37, R5.38.
+///
+/// Resolves the logical host from (in priority order):
+/// 1. The pathname's registered namestring (e.g. "MYSYS:SRC;…")
+/// 2. The pathname's host component string
+/// 3. The original input sentinel stored by parse_namestring, checked
+///    against the string registry
+///
+/// Once the logical host is determined, the host's translation table is
+/// looked up and the logical components are translated to a physical
+/// pathname (semicolons → directory separators, host removed, etc.).
 pub fn translate_logical_pathname(pathname: BlissVal) -> Result<BlissVal, BlissError> {
     let rec = get_record(pathname)
         .ok_or_else(|| BlissError::TypeError {
@@ -443,26 +523,48 @@ pub fn translate_logical_pathname(pathname: BlissVal) -> Result<BlissVal, BlissE
             expected: "pathname".to_string(),
         })?;
 
-    // Check if host indicates a logical pathname with translations
-    let host_str = lookup_string(rec.host);
+    // --- Determine the logical host ---
 
-    // Also check if this pathname was created from a logical namestring
-    // by looking up the pathname's own string
+    // 1. From the pathname's own registered namestring
     let pn_str = lookup_string(pathname);
+    let mut logical_host: Option<String> = pn_str
+        .as_ref()
+        .and_then(|s| {
+            let colon = s.find(':')?;
+            let host = &s[..colon];
+            if host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !host.is_empty() {
+                Some(host.to_string())
+            } else {
+                None
+            }
+        });
 
-    // Try to find a logical host from the pathname string (e.g. "MYSYS:SRC;...")
-    let logical_host = if let Some(ref s) = pn_str {
-        s.split(':').next().map(|h| h.to_string())
-    } else if let Some(ref h) = host_str {
-        Some(h.clone())
-    } else {
-        None
-    };
+    // 2. From the host component's registered string
+    if logical_host.is_none() {
+        logical_host = lookup_string(rec.host);
+    }
+
+    // 3. From the original parse_namestring input sentinel's string
+    if logical_host.is_none() {
+        let source = with_pathname_source(|src| src.get(&pathname.0).copied());
+        if let Some(src_val) = source {
+            if let Some(src_str) = lookup_string(src_val) {
+                if let Some(colon) = src_str.find(':') {
+                    let host = &src_str[..colon];
+                    if !host.is_empty()
+                        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    {
+                        logical_host = Some(host.to_string());
+                    }
+                }
+            }
+        }
+    }
 
     let logical_host = logical_host
         .ok_or_else(|| BlissError::FileError("cannot determine logical host".to_string()))?;
 
-    // Look up translations for this host
+    // --- Look up translations for this host ---
     let _translations = with_logical_translations(|map| map.get(&logical_host).copied())
         .ok_or_else(|| {
             BlissError::FileError(format!(
@@ -471,7 +573,38 @@ pub fn translate_logical_pathname(pathname: BlissVal) -> Result<BlissVal, BlissE
             ))
         })?;
 
-    // Create a physical pathname (no host on POSIX)
+    // --- Translate logical components to physical ---
+    // In a logical pathname "HOST:DIR;SUBDIR;NAME.TYPE.VERSION",
+    // semicolons become directory separators and the host is removed.
+
+    // If we have the full logical namestring, parse it into physical components
+    if let Some(ref s) = pn_str {
+        if let Some(colon) = s.find(':') {
+            let after_host = &s[colon + 1..];
+            // Convert semicolons to slashes for directory components
+            let physical_path = after_host.replace(';', "/");
+            // Prepend a slash to make it absolute
+            let full_physical = format!("/{}", physical_path);
+            let (dir_str, name_str, type_str) = parse_posix_path(&full_physical);
+
+            let dir_val = dir_str.map_or(NIL, |d| make_string_bv(&d));
+            let name_val = name_str.map_or(NIL, |n| make_string_bv(&n));
+            let type_val = type_str.map_or(NIL, |t| make_string_bv(&t));
+
+            let physical = PathnameRecord {
+                host: NIL,
+                device: NIL,
+                directory: dir_val,
+                name: name_val,
+                type_field: type_val,
+                version: NIL,
+            };
+            return Ok(alloc_pathname(physical));
+        }
+    }
+
+    // Fallback: copy components with host cleared (for pathnames without
+    // a full namestring available).
     let physical = PathnameRecord {
         host: NIL,
         device: rec.device,
