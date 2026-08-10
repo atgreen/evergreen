@@ -231,8 +231,8 @@ condition
  │    │    └── print-not-readable
  │    └── storage-condition
  └── warning
+      ├── style-warning
       └── simple-warning
-           └── style-warning
  simple-condition (mixin)
  simple-error, simple-type-error, simple-warning (via multiple inheritance)
 ```
@@ -298,7 +298,7 @@ specialised paths:
 
 **R5.28** Sort algorithms:
 - `SORT` on vectors: **Introsort** (quicksort → heapsort fallback on
-  depth limit). MUST NOT be stable.
+  depth limit). NEED NOT be stable.
 - `STABLE-SORT` on vectors: **Timsort** (merge sort variant). MUST be
   stable.
 - `SORT` / `STABLE-SORT` on lists: **Merge sort**. MUST be stable. MUST
@@ -315,7 +315,7 @@ length and allocate once.
 
 ## 5.7  Hash Tables
 
-Detailed specification in `spec/05-05-sequences.md` §5.7 subsection. Summary:
+Detailed specification in `spec/05-05-sequences-hashtables.md` §5.7 subsection. Summary:
 
 **R5.31** Hash table implementation MUST use **Robin Hood hashing** with
 open addressing and backward-shift deletion.
@@ -350,6 +350,8 @@ on the current key) has undefined consequences.
 ---
 
 ## 5.8  Pathnames and Logical Pathnames
+
+Detailed specification in `spec/05-07-pathnames.md`. Summary:
 
 **R5.35** Pathname components MUST be: `host`, `device`, `directory`,
 `name`, `type`, `version` per ANSI spec.
