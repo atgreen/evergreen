@@ -19,7 +19,7 @@ Source: `crates/bliss-compiler/src/macroexpand.rs`
 | R4.11 | `macroexpand` MUST iterate `macroexpand-1` until the result is no longer a macro form. It MUST NOT recurse into sub-forms — that is the code-walker's responsibility. | MUST |
 | R4.12 | `define-compiler-macro` MUST associate a compiler macro with a function name. The compiler MUST consult compiler macros before ordinary macros during compilation. If the compiler macro declines (returns the `&whole` form unchanged), the compiler MUST fall through to the ordinary macro, then to function call. | MUST |
 | R4.13 | `define-symbol-macro` and `symbol-macrolet` MUST cause symbol macro expansion of symbols in variable position. A symbol macro MUST NOT be expanded when the symbol appears in a position that would be subject to `setq` without an intervening `macroexpand` — `setq` of a symbol macro MUST be converted to `setf` of its expansion. | MUST |
-| R4.14 | The environment protocol MUST provide `variable-information`, `function-information`, and `declaration-information` (CLtL2 §8.5 / SBCL `sb-cltl2` compatible). These MUST return accurate information about bindings visible at macro-expansion time. | MUST |
+| R4.14 | The environment protocol MUST provide `variable-information`, `function-information`, `declaration-information`, `augment-environment`, `parse-macro`, and `enclose` (CLtL2 §8.5 / SBCL `sb-cltl2` compatible). These MUST return accurate information about bindings visible at macro-expansion time. `parse-macro` and `enclose` MUST be used for correct `macrolet` processing. | MUST |
 | R4.15 | `*macroexpand-hook*` MUST be called by `macroexpand-1` to perform the actual expansion. Its default value MUST be `funcall`. User code MAY rebind it to intercept or instrument expansion. | MUST |
 | R4.16 | The macro expander MUST detect circular expansion (a form expanding back to itself or to a previously-seen form in the same expansion chain) and signal an error of type `program-error`. | MUST |
 
@@ -184,7 +184,10 @@ FUNCTION expand-form(form, env) → expanded_form:
           Expand as ((lambda ...) args...).
      d. Otherwise (function call):
           i.  COMPILER MACRO CHECK (§4.2.4):
-              If compiler macro exists and does not decline:
+              If compiler macro exists for operator
+              AND notinline is NOT declared for operator in env
+              AND the compiler macro does not decline (returns a form
+                  not EQ to the &whole argument):
                 Return expand-form(cm_result, env).
           ii. Expand each argument via expand-form.
           iii. Return (operator . expanded-args).
@@ -199,17 +202,26 @@ FUNCTION expand-form(form, env) → expanded_form:
 
 ### Consultation order
 
-During compilation (not interpretation), when a function call form
-`(f arg1 arg2 ...)` is encountered:
+Compiler macros apply only to forms that have already been fully
+macroexpanded and resolved to function calls — they do NOT compete
+with ordinary macros for the same form. The `expand-form` code-walker
+(§4.2.3 Phase 3) first calls `macroexpand` to exhaust all ordinary
+macro expansion, then classifies the result. Only forms that survive
+as function calls (step 4.d) reach the compiler macro check.
 
-1. **Compiler macro first:** Look up `f` in the `CompilerMacroTable`.
-   If found, invoke the compiler macro function with `(form, env)`.
+Within step 4.d, the order for a function call form
+`(f arg1 arg2 ...)` is:
+
+1. **Compiler macro check:** Look up `f` in the `CompilerMacroTable`.
+   Skip if `notinline` is declared for `f` in the current environment.
+   If found and not skipped, invoke the compiler macro function with
+   `(form, env)`.
    - If it returns a form `eq` to the `&whole` argument → **declined**.
      Proceed to step 2.
-   - Otherwise → use the returned form; re-enter `expand-form`.
-2. **Ordinary macro:** Look up `f` in the environment. If it is a macro,
-   expand via `macroexpand-1`.
-3. **Function call:** Generate a normal call.
+   - Otherwise → use the returned form; re-enter `expand-form`
+     (which will re-run `macroexpand` on the result, so ordinary
+     macros in the expansion are handled correctly).
+2. **Function call:** Expand arguments and generate a normal call.
 
 ### `define-compiler-macro`
 
@@ -438,6 +450,36 @@ Creates a new environment augmented with given bindings and declarations.
 Keywords: `:variable` (list of symbols), `:symbol-macro` (alist),
 `:function` (list of names), `:macro` (alist of name→function),
 `:declare` (declaration specifiers).
+
+### `parse-macro`
+
+```lisp
+(parse-macro name lambda-list body &optional env) → macro-function
+```
+
+Takes a macro name (a symbol), a macro lambda-list, a body (list of
+forms), and an optional environment. Returns a macro expander function
+(a `MacroFunction`) suitable for use with `macrolet` or
+`augment-environment`. The returned function accepts two arguments
+`(form env)` and destructures `form` according to `lambda-list`.
+
+This is used internally by `macrolet` processing (§4.2.7) to compile
+local macro definitions in the correct lexical environment.
+
+### `enclose`
+
+```lisp
+(enclose lambda-expression &optional env) → function
+```
+
+Takes a lambda expression and an optional environment and returns a
+function object that is the result of closing the lambda expression
+over the given environment. This is needed for `macrolet` processing
+(§4.2.7) where macro expander functions must capture the enclosing
+lexical environment — specifically, the environment that includes
+the enclosing macros but not the current `macrolet`'s own definitions
+(per ANSI 3.2.3.1). `parse-macro` produces the lambda expression;
+`enclose` closes it in the correct environment.
 
 ---
 
