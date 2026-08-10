@@ -3,7 +3,7 @@
 //! Passes run in a fixed, deterministic order. See spec §4.5 / A4.02.
 
 use crate::ir::{Edge, EdgeKind, IrGraph, NodeId, NodeKind};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// An optimisation pass that transforms an IR graph.
 pub trait Pass {
@@ -39,7 +39,9 @@ impl PassManager {
                 config: InliningConfig {
                     budget: 50,
                     max_depth: 5,
+                    small_threshold: 30,
                 },
+                registry: FunctionRegistry::new(),
             }),
             Box::new(EscapeAnalysis),
             Box::new(TypePropagation), // re-run
@@ -451,6 +453,57 @@ pub struct InliningConfig {
     pub budget: u32,
     /// Max inlining depth (default: 5).
     pub max_depth: u32,
+    /// Functions at or below this size are always inlined (unless NOTINLINE). Default: 30.
+    pub small_threshold: u32,
+}
+
+/// Function registry for inlining — maps callee constant values to their IR graphs.
+pub struct FunctionRegistry {
+    /// Map from the raw bits of a BlissVal function constant to its IR graph.
+    entries: HashMap<u64, FunctionEntry>,
+}
+
+/// Entry in the function registry for a single function.
+struct FunctionEntry {
+    /// The callee's IR graph.
+    ir: IrGraph,
+    /// Whether the function is declared NOTINLINE.
+    notinline: bool,
+    /// Whether the function is declared INLINE or has (optimize (speed 3)).
+    inline_priority_high: bool,
+    /// Whether PGO data marks this call site as hot (≥ HOT_THRESHOLD).
+    pgo_hot: bool,
+}
+
+impl FunctionRegistry {
+    /// Create a new empty function registry.
+    pub fn new() -> Self {
+        FunctionRegistry {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Register a function's IR graph for inlining.
+    pub fn register(
+        &mut self,
+        callee_val: bliss_rt::value::BlissVal,
+        ir: IrGraph,
+        notinline: bool,
+        inline_priority_high: bool,
+        pgo_hot: bool,
+    ) {
+        self.entries.insert(callee_val.0, FunctionEntry {
+            ir,
+            notinline,
+            inline_priority_high,
+            pgo_hot,
+        });
+    }
+
+    /// Look up a callee's entry by its BlissVal constant.
+    fn lookup(&self, callee_val: bliss_rt::value::BlissVal) -> Option<&FunctionEntry> {
+        self.entries.get(&callee_val.0)
+    }
 }
 
 /// Inlining — profile-guided, budget-limited function inlining (spec §4.5.4, A4.09).
@@ -460,6 +513,9 @@ pub struct InliningConfig {
 /// their IR subgraph into the caller.
 pub struct Inlining {
     pub config: InliningConfig,
+    /// Registry mapping function constants to their IR graphs. When empty,
+    /// no inlining can occur (the pass is a no-op).
+    pub registry: FunctionRegistry,
 }
 
 /// Perform the actual inlining of `callee` into `graph` at the given `call_id`.
@@ -482,31 +538,12 @@ fn inline_call_site(
 
     let cost = callee.node_count() as u32;
 
-    // Collect callee node info: we iterate by probing sequential IDs
-    // (callee uses sequential NodeId allocation starting from 0).
-    let mut callee_nodes: Vec<(NodeId, NodeKind)> = Vec::new();
-    for probe in 0..(cost * 2 + 16) {
-        let cid = NodeId(probe);
-        // Try to access the node; if it panics we skip (we can't query existence directly)
-        // Use the inputs list as a proxy: if it returns a slice, the node exists
-        let inputs = callee.inputs(cid);
-        let uses = callee.uses(cid);
-        // A node exists if it has edges OR if it's the start
-        // Better approach: just try node_kind. We wrap in a helper.
-        // Since node_kind panics on missing nodes, we check via inputs/uses presence.
-        if inputs.is_empty() && uses.is_empty() && callee_nodes.len() < cost as usize {
-            // Might still be a leaf node with no edges — try to detect via start
-            if probe == callee.start().0 {
-                callee_nodes.push((cid, callee.node_kind(cid).clone()));
-            }
-            // Otherwise skip — we can't safely probe without a contains() method
-            continue;
-        }
-        if callee_nodes.len() >= cost as usize {
-            break;
-        }
-        callee_nodes.push((cid, callee.node_kind(cid).clone()));
-    }
+    // Collect callee node info using the graph's node_ids() iterator
+    // for reliable enumeration (no sequential-ID probing heuristic).
+    let callee_nodes: Vec<(NodeId, NodeKind)> = callee
+        .node_ids()
+        .map(|cid| (cid, callee.node_kind(cid).clone()))
+        .collect();
 
     if callee_nodes.is_empty() {
         return None;
@@ -648,9 +685,16 @@ impl Pass for Inlining {
         }
 
         // Evaluate each call site against the A4.09 inlining decision flowchart
+        let mut current_depth: u32 = 0;
+
         for call_id in call_sites {
             if remaining_budget == 0 {
                 break; // Budget exhausted — stop inlining (§4.5.11)
+            }
+
+            // Re-check that the call node still exists (a previous inline may have removed it)
+            if !graph.contains(call_id) {
+                continue;
             }
 
             let callee_inputs = graph.inputs(call_id);
@@ -664,28 +708,68 @@ impl Pass for Inlining {
 
                 // A4.09 step 3: Is the callee known / compiled?
                 match graph.node_kind(callee_src) {
-                    NodeKind::Constant(_callee_val) => {
-                        // The callee is a known function constant.
-                        // A4.09 step 4-7: Check cost vs budget, depth vs max_depth.
-                        //
-                        // To perform inlining we need the callee's IR graph.
-                        // This requires a function registry (mapping function constants
-                        // to their compiled IrGraphs) which is wired in by the tiered
-                        // compilation pipeline. When available, look up the callee:
-                        //
-                        //   if let Some(callee_ir) = registry.lookup(*_callee_val) {
-                        //       let cost = callee_ir.node_count() as u32;
-                        //       if cost <= remaining_budget {
-                        //           if let Some(used) = inline_call_site(graph, call_id, callee_ir) {
-                        //               remaining_budget = remaining_budget.saturating_sub(used);
-                        //               changed = true;
-                        //           }
-                        //       }
-                        //   }
-                        //
-                        // Without a registry bound to this pass instance, we cannot
-                        // resolve the callee IR — the call site is skipped.
-                        let _ = remaining_budget;
+                    NodeKind::Constant(callee_val) => {
+                        let callee_val = *callee_val;
+
+                        // Look up the callee in the function registry
+                        let entry = self.registry.lookup(callee_val);
+                        let entry = match entry {
+                            Some(e) => e,
+                            None => continue, // A4.09 step 3: unknown/not compiled → skip
+                        };
+
+                        // A4.09 step 1: Is F declared NOTINLINE?
+                        if entry.notinline {
+                            continue; // Do NOT inline
+                        }
+
+                        // A4.09 step 2: Set priority
+                        let priority_high = entry.inline_priority_high;
+
+                        // A4.09 step 4: Compute cost(F)
+                        let cost = entry.ir.node_count() as u32;
+
+                        // A4.09 step 5: cost ≤ SMALL_THRESHOLD → inline unconditionally
+                        if cost <= self.config.small_threshold {
+                            if let Some(used) = inline_call_site(graph, call_id, &entry.ir) {
+                                remaining_budget = remaining_budget.saturating_sub(used);
+                                current_depth += 1;
+                                changed = true;
+                            }
+                            continue;
+                        }
+
+                        // A4.09 step 6: depth ≥ MAX_INLINE_DEPTH → do NOT inline
+                        if current_depth >= self.config.max_depth {
+                            continue;
+                        }
+
+                        // A4.09 step 7: remaining budget ≥ cost?
+                        if remaining_budget < cost {
+                            continue;
+                        }
+
+                        // A4.09 step 8: PGO data — if hot, inline
+                        if entry.pgo_hot {
+                            if let Some(used) = inline_call_site(graph, call_id, &entry.ir) {
+                                remaining_budget = remaining_budget.saturating_sub(used);
+                                current_depth += 1;
+                                changed = true;
+                            }
+                            continue;
+                        }
+
+                        // A4.09 step 9: priority HIGH → inline
+                        if priority_high {
+                            if let Some(used) = inline_call_site(graph, call_id, &entry.ir) {
+                                remaining_budget = remaining_budget.saturating_sub(used);
+                                current_depth += 1;
+                                changed = true;
+                            }
+                            continue;
+                        }
+
+                        // Default: do NOT inline (normal priority, not small, not hot)
                     }
                     _ => {
                         // Unknown callee — cannot inline (A4.09 step 3: NO)
