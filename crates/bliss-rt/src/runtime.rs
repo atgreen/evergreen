@@ -1053,10 +1053,13 @@ fn eval_arith(elems: &[SExpr], env: &mut BootEnv, op: ArithOp) -> Result<BlissVa
         .map(|e| eval_sexpr(e, env))
         .collect::<Result<_, _>>()?;
     if args.is_empty() {
-        return Ok(BlissVal::from_fixnum(match op {
-            ArithOp::Add => 0, ArithOp::Mul => 1,
-            ArithOp::Sub | ArithOp::Div => 0,
-        }));
+        return match op {
+            ArithOp::Add => Ok(BlissVal::from_fixnum(0)),
+            ArithOp::Mul => Ok(BlissVal::from_fixnum(1)),
+            ArithOp::Sub | ArithOp::Div => Err(BlissError::Internal(
+                format!("wrong number of arguments for {}", match op { ArithOp::Sub => "-", _ => "/" })
+            )),
+        };
     }
     if !args[0].is_fixnum() {
         return Err(BlissError::TypeError {
@@ -1108,10 +1111,13 @@ fn eval_numcmp(elems: &[SExpr], env: &mut BootEnv, cmp: NumCmp) -> Result<BlissV
     if elems.len() < 3 { return Ok(crate::value::T); }
     let a = eval_sexpr(&elems[1], env)?;
     let b = eval_sexpr(&elems[2], env)?;
-    let (na, nb) = (
-        if a.is_fixnum() { a.as_fixnum() } else { 0 },
-        if b.is_fixnum() { b.as_fixnum() } else { 0 },
-    );
+    if !a.is_fixnum() {
+        return Err(BlissError::TypeError { datum: a, expected: "number".into() });
+    }
+    if !b.is_fixnum() {
+        return Err(BlissError::TypeError { datum: b, expected: "number".into() });
+    }
+    let (na, nb) = (a.as_fixnum(), b.as_fixnum());
     let res = match cmp {
         NumCmp::Lt => na < nb, NumCmp::Gt => na > nb,
         NumCmp::Le => na <= nb, NumCmp::Ge => na >= nb,
@@ -1409,10 +1415,13 @@ fn eval_builtin_call_with_vals(name: &str, args: &[BlissVal], _env: &mut BootEnv
 /// Arithmetic on pre-evaluated BlissVal args (for built-in funcall/apply).
 fn arith_builtin(args: &[BlissVal], op: ArithOp) -> Result<BlissVal, BlissError> {
     if args.is_empty() {
-        return Ok(BlissVal::from_fixnum(match op {
-            ArithOp::Add => 0, ArithOp::Mul => 1,
-            ArithOp::Sub | ArithOp::Div => 0,
-        }));
+        return match op {
+            ArithOp::Add => Ok(BlissVal::from_fixnum(0)),
+            ArithOp::Mul => Ok(BlissVal::from_fixnum(1)),
+            ArithOp::Sub | ArithOp::Div => Err(BlissError::Internal(
+                format!("wrong number of arguments for {}", match op { ArithOp::Sub => "-", _ => "/" })
+            )),
+        };
     }
     if !args[0].is_fixnum() {
         return Err(BlissError::TypeError {
