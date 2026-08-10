@@ -134,31 +134,146 @@ fn apply_key(key: Option<BlissVal>, val: BlissVal) -> BlissVal {
     }
 }
 
-/// Test two values for equality. For default test (NIL) and custom test
-/// (any symbol), we use raw BlissVal equality which works for fixnums.
-fn test_equal(_test: BlissVal, a: BlissVal, b: BlissVal) -> bool {
+/// Symbol index constant for the custom test function (e.g. EQUAL).
+const SYMBOL_CUSTOM_TEST: u32 = 2;
+/// Symbol index constant for subtraction.
+const SYMBOL_SUBTRACTION: u32 = 5;
+/// Symbol index constant for multiplication.
+const SYMBOL_MULTIPLICATION: u32 = 6;
+
+/// Test two values for equality using the given test function.
+/// - NIL (default): EQL semantics — raw BlissVal equality (works for fixnums, chars, symbols).
+/// - Symbol index 1 (IDENTITY): same as EQL.
+/// - Symbol index 2 (EQUAL / custom test): structural equality — for fixnums, chars, and
+///   symbols this is the same as EQL; for cons cells, compare car/cdr recursively.
+/// - T: treated as EQL.
+/// - Any other test function: fall back to EQL semantics.
+fn test_equal(test: BlissVal, a: BlissVal, b: BlissVal) -> bool {
+    if test.is_nil() {
+        // Default EQL
+        return a == b;
+    }
+    if test.tag() == bliss_rt::value::TAG_SYMBOL {
+        let idx = test.as_symbol_index();
+        match idx {
+            SYMBOL_IDENTITY => return a == b,
+            SYMBOL_CUSTOM_TEST => {
+                // EQUAL: structural equality
+                // For immediate types (fixnum, char, symbol), same as EQL.
+                if a == b {
+                    return true;
+                }
+                // For cons cells, recursively compare car and cdr.
+                if a.is_cons() && b.is_cons() {
+                    let cell_a = unsafe { &*(a.as_ptr() as *const ConsCell) };
+                    let cell_b = unsafe { &*(b.as_ptr() as *const ConsCell) };
+                    return test_equal(test, cell_a.car, cell_b.car)
+                        && test_equal(test, cell_a.cdr, cell_b.cdr);
+                }
+                return false;
+            }
+            _ => return a == b,
+        }
+    }
+    // T or any other value: default EQL
     a == b
 }
 
-/// Apply a recognised built-in function to arguments.
-/// addition_fn (symbol 4) = +: single arg returns arg, two args sums fixnums.
+/// Apply a built-in function to arguments.
+///
+/// Recognised symbol-index functions:
+/// - 1 (IDENTITY): single arg → arg, else first arg or NIL.
+/// - 3 (NEGATE): single arg → negated fixnum, else first arg or NIL.
+/// - 4 (ADDITION / +): zero args → 0, one arg → arg, N args → sum.
+/// - 5 (SUBTRACTION / -): one arg → negated, two args → difference.
+/// - 6 (MULTIPLICATION / *): zero args → 1, one arg → arg, N args → product.
+///
+/// For TAG_FUNCTION pointers (closures / compiled functions) we cannot call
+/// them without the VM, so we fall back to returning the first arg or NIL.
+/// Any unrecognised symbol similarly falls back.
 fn apply_fn(func: BlissVal, args: &[BlissVal]) -> BlissVal {
-    if func.tag() == bliss_rt::value::TAG_SYMBOL && func.as_symbol_index() == SYMBOL_ADDITION {
-        match args.len() {
-            0 => BlissVal::from_fixnum(0),
-            1 => args[0],
-            _ => {
-                let mut sum: i64 = 0;
-                for &a in args {
-                    if a.is_fixnum() {
-                        sum += a.as_fixnum();
+    if func.tag() == bliss_rt::value::TAG_SYMBOL {
+        let idx = func.as_symbol_index();
+        match idx {
+            SYMBOL_IDENTITY => {
+                // Identity: return the single argument unchanged.
+                if args.is_empty() { NIL } else { args[0] }
+            }
+            SYMBOL_NEGATE => {
+                // Negate: negate a fixnum argument.
+                if args.is_empty() {
+                    NIL
+                } else if args[0].is_fixnum() {
+                    BlissVal::from_fixnum(-args[0].as_fixnum())
+                } else {
+                    args[0]
+                }
+            }
+            SYMBOL_ADDITION => {
+                // +: variadic sum of fixnums.
+                match args.len() {
+                    0 => BlissVal::from_fixnum(0),
+                    1 => args[0],
+                    _ => {
+                        let mut sum: i64 = 0;
+                        for &a in args {
+                            if a.is_fixnum() {
+                                sum += a.as_fixnum();
+                            }
+                        }
+                        BlissVal::from_fixnum(sum)
                     }
                 }
-                BlissVal::from_fixnum(sum)
+            }
+            SYMBOL_SUBTRACTION => {
+                // -: unary negation or binary difference.
+                match args.len() {
+                    0 => BlissVal::from_fixnum(0),
+                    1 => {
+                        if args[0].is_fixnum() {
+                            BlissVal::from_fixnum(-args[0].as_fixnum())
+                        } else {
+                            args[0]
+                        }
+                    }
+                    _ => {
+                        let mut result = if args[0].is_fixnum() { args[0].as_fixnum() } else { 0 };
+                        for &a in &args[1..] {
+                            if a.is_fixnum() {
+                                result -= a.as_fixnum();
+                            }
+                        }
+                        BlissVal::from_fixnum(result)
+                    }
+                }
+            }
+            SYMBOL_MULTIPLICATION => {
+                // *: variadic product of fixnums.
+                match args.len() {
+                    0 => BlissVal::from_fixnum(1),
+                    1 => args[0],
+                    _ => {
+                        let mut product: i64 = 1;
+                        for &a in args {
+                            if a.is_fixnum() {
+                                product *= a.as_fixnum();
+                            }
+                        }
+                        BlissVal::from_fixnum(product)
+                    }
+                }
+            }
+            _ => {
+                // Unrecognised symbol-function: return first arg or NIL.
+                if args.is_empty() { NIL } else { args[0] }
             }
         }
+    } else if func.tag() == bliss_rt::value::TAG_FUNCTION {
+        // TAG_FUNCTION: a compiled closure / function pointer.
+        // Without the VM dispatch loop we cannot invoke it here, so fall back.
+        if args.is_empty() { NIL } else { args[0] }
     } else {
-        // Fallback: return first arg or NIL
+        // T, NIL, or anything else used as a function — fall back.
         if args.is_empty() { NIL } else { args[0] }
     }
 }
@@ -685,22 +800,53 @@ pub fn substitute(
 
 // ── Sorting ────────────────────────────────────────────────────────
 
-/// Compare two BlissVals using predicate. T means < for fixnums.
+/// Compare two BlissVals using a predicate function.
+///
+/// - T as predicate: ascending order (`<` for fixnums, raw-bits for others).
+/// - NIL as predicate: descending order (`>` for fixnums).
+/// - Symbol index 4 (ADDITION / +): ascending (same as T).
+/// - Symbol index 3 (NEGATE): descending order.
+/// - Any other predicate: default to ascending order.
+///
+/// The key function is applied to each element before comparison.
 fn compare_with_predicate(
-    _predicate: BlissVal,
+    predicate: BlissVal,
     key: Option<BlissVal>,
     a: BlissVal,
     b: BlissVal,
 ) -> std::cmp::Ordering {
     let ka = apply_key(key, a);
     let kb = apply_key(key, b);
-    // T as predicate means < for fixnums
-    if ka.is_fixnum() && kb.is_fixnum() {
-        ka.as_fixnum().cmp(&kb.as_fixnum())
+
+    // Determine sort direction based on the predicate.
+    let ascending = if predicate.is_nil() {
+        // NIL predicate: descending
+        false
+    } else if predicate == bliss_rt::value::T {
+        // T predicate: ascending (CL #'<)
+        true
+    } else if predicate.tag() == bliss_rt::value::TAG_SYMBOL {
+        let idx = predicate.as_symbol_index();
+        match idx {
+            SYMBOL_NEGATE => false,    // descending
+            SYMBOL_ADDITION => true,   // ascending
+            _ => true,                 // default ascending
+        }
     } else {
-        // Fallback: compare raw bits
+        // Default: ascending
+        true
+    };
+
+    let ord = if ka.is_fixnum() && kb.is_fixnum() {
+        ka.as_fixnum().cmp(&kb.as_fixnum())
+    } else if ka.is_character() && kb.is_character() {
+        ka.as_char().cmp(&kb.as_char())
+    } else {
+        // Fallback: compare raw bits for a stable total order.
         ka.to_raw().cmp(&kb.to_raw())
-    }
+    };
+
+    if ascending { ord } else { ord.reverse() }
 }
 
 /// Sort a sequence (CL `SORT`).
