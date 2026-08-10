@@ -36,59 +36,72 @@ fn pass_names() {
     assert_eq!(NullCheckElimination.name(), "null-check-elimination");
 }
 
-// ── Pass::run ─────────────────────────────────────────────────────
+// ── Pass::run — Issue #3: assert Ok and check changed boolean ────
 
 #[test]
 fn type_propagation_run() {
     let mut g = minimal_graph();
-    let _ = TypePropagation.run(&mut g);
+    // On a minimal graph with no typed nodes, type propagation should succeed
+    // and report no changes.
+    let changed = TypePropagation.run(&mut g).expect("type propagation should succeed on minimal graph");
+    assert!(!changed, "type propagation on minimal graph (no typed nodes) should report no changes");
 }
 
 #[test]
 fn constant_folding_run_on_constant_graph() {
     let mut g = graph_with_constant();
-    let _ = ConstantFolding.run(&mut g);
+    let result = ConstantFolding.run(&mut g);
+    assert!(result.is_ok(), "constant folding should succeed on graph with constant");
 }
 
 #[test]
 fn inlining_zero_budget_no_changes() {
     let mut pass = Inlining { config: InliningConfig { budget: 0, max_depth: 0 } };
     let mut g = minimal_graph();
-    if let Ok(changed) = pass.run(&mut g) {
-        assert!(!changed);
-    }
+    let changed = pass.run(&mut g).expect("inlining should succeed on minimal graph");
+    assert!(!changed, "inlining with zero budget should make no changes");
 }
 
 #[test]
 fn escape_analysis_run() {
     let mut g = minimal_graph();
-    let _ = EscapeAnalysis.run(&mut g);
+    // On a minimal graph with no allocations, escape analysis should succeed
+    // and report no changes.
+    let changed = EscapeAnalysis.run(&mut g).expect("escape analysis should succeed on minimal graph");
+    assert!(!changed, "escape analysis on minimal graph (no allocations) should report no changes");
 }
 
 #[test]
 fn licm_run() {
     let mut g = minimal_graph();
-    let _ = Licm.run(&mut g);
+    // On a minimal graph with no loops, LICM should succeed and report no changes.
+    let changed = Licm.run(&mut g).expect("LICM should succeed on minimal graph");
+    assert!(!changed, "LICM on minimal graph (no loops) should report no changes");
 }
 
 #[test]
 fn strength_reduction_run() {
     let mut g = minimal_graph();
-    let _ = StrengthReduction.run(&mut g);
+    // On a minimal graph with no multiplications, strength reduction should succeed
+    // and report no changes.
+    let changed = StrengthReduction.run(&mut g).expect("strength reduction should succeed on minimal graph");
+    assert!(!changed, "strength reduction on minimal graph (no multiplications) should report no changes");
 }
 
 #[test]
 fn dce_on_minimal_no_changes() {
     let mut g = minimal_graph();
-    if let Ok(changed) = DeadCodeElimination.run(&mut g) {
-        assert!(!changed);
-    }
+    let changed = DeadCodeElimination.run(&mut g).expect("DCE should succeed on minimal graph");
+    assert!(!changed, "DCE on minimal graph should make no changes");
 }
 
 #[test]
 fn null_check_elimination_run() {
     let mut g = minimal_graph();
-    let _ = NullCheckElimination.run(&mut g);
+    // On a minimal graph with no null checks, the pass should succeed
+    // and report no changes.
+    let changed = NullCheckElimination.run(&mut g).expect("null-check elimination should succeed on minimal graph");
+    assert!(!changed, "null-check elimination on minimal graph (no null checks) should report no changes");
 }
 
 // ── PassManager ───────────────────────────────────────────────────
@@ -101,21 +114,29 @@ fn pass_manager_run_all_on_minimal_graph() {
 }
 
 #[test]
-fn pass_manager_preserves_or_shrinks_graph() {
+fn pass_manager_preserves_count_on_no_call_graph() {
+    // Issue #7: The old test asserted node_count() <= before, which is wrong
+    // because inlining can increase node count. Scope this test to a graph
+    // with no Call nodes — only DCE/folding behavior applies, so count
+    // should be preserved or shrink.
     let mut pm = PassManager::new();
-    let mut g = minimal_graph();
+    let mut g = minimal_graph(); // no Call nodes, so inlining won't expand
     let before = g.node_count();
-    let _ = pm.run_all(&mut g);
-    assert!(g.node_count() <= before);
+    pm.run_all(&mut g).expect("pass manager should succeed on minimal graph");
+    assert!(
+        g.node_count() <= before,
+        "on a graph with no Call nodes, passes should preserve or shrink node count (was {}, now {})",
+        before, g.node_count()
+    );
 }
 
 #[test]
 fn pass_manager_idempotent() {
     let mut pm = PassManager::new();
     let mut g = minimal_graph();
-    let _ = pm.run_all(&mut g);
+    pm.run_all(&mut g).expect("first run should succeed");
     let after_first = g.node_count();
-    let _ = pm.run_all(&mut g);
+    pm.run_all(&mut g).expect("second run should succeed");
     assert_eq!(g.node_count(), after_first);
 }
 
@@ -123,7 +144,7 @@ fn pass_manager_idempotent() {
 fn pass_manager_on_graph_with_constant() {
     let mut pm = PassManager::new();
     let mut g = graph_with_constant();
-    let _ = pm.run_all(&mut g); // must not panic
+    assert!(pm.run_all(&mut g).is_ok(), "pass manager should succeed on graph with constant");
 }
 
 // ── InliningConfig ────────────────────────────────────────────────
