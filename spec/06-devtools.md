@@ -37,7 +37,7 @@ programmatically from CL code or an IDE protocol connection.
 | R6.14 | Bliss MUST support breakpoints on function entry via `(bliss-debug:break-on-entry 'fn)`. | MUST |
 | R6.15 | Bliss MUST support breakpoints on source location via `(bliss-debug:break-at file line)`. | MUST |
 | R6.16 | Bliss MUST support conditional breakpoints: `(bliss-debug:break-on-entry 'fn :when expr)`. | MUST |
-| R6.17 | Bliss SHOULD support watchpoints: `(bliss-debug:watch 'var :test #'predicate)` triggering the debugger when a watched binding changes and the predicate returns true. | SHOULD |
+| R6.17 | Bliss SHOULD support watchpoints: `(bliss-debug:watch 'var :test #'predicate)` triggering the debugger when a watched binding changes and the predicate returns true. Special (dynamic) variable watchpoints MUST work at all debug levels. Lexical variable watchpoints require `(optimize (debug 3))` and compiler instrumentation (see A6.04a). | SHOULD |
 | R6.18 | The debugger MUST allow evaluation of arbitrary forms in the lexical environment of the selected frame. | MUST |
 | R6.19 | Debug information MUST be preserved according to the `debug` optimize quality: 0 = name only; 1 = name + source location; 2 = all locals; 3 = all locals + stepping. | MUST |
 | R6.20 | When running under an IDE protocol connection, debugger events MUST be forwarded to the IDE rather than presented on the terminal. | MUST |
@@ -59,10 +59,11 @@ programmatically from CL code or an IDE protocol connection.
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R6.29 | `(disassemble 'fn)` MUST display the native machine code for compiled functions. | MUST |
+| R6.29 | `(disassemble 'fn)` MUST display the native machine code for compiled functions. By default, the highest-tier compiled code currently installed is shown. | MUST |
 | R6.30 | Disassembly output MUST be annotated with source-location markers mapping instructions back to CL source forms. | MUST |
 | R6.31 | Disassembly SHOULD show IR-level annotations (e.g., type inferences) when `(>= debug 2)`. | SHOULD |
 | R6.32 | For interpreted (T0) functions, `disassemble` MUST print a notice that the function has not been compiled and offer to compile it. | MUST |
+| R6.32a | `disassemble` MUST accept a `:tier` keyword argument — `(disassemble 'fn :tier :t1)` — to request a specific tier's code. When the function exists at multiple tiers simultaneously (e.g., T1 code being replaced by T2 via OSR, see §4), the output MUST indicate which tier is displayed and list the other available tiers. If the requested tier is not available, a `simple-error` is signalled. | MUST |
 
 ### 6.1.5 IDE Protocol
 
@@ -129,10 +130,17 @@ A runtime representation of a single stack frame exposed to the debugger.
 (defstruct breakpoint
   (id          0      :type fixnum)
   (kind        :entry :type (member :entry :location :watchpoint))
-  (target      nil)                 ; function-name | (file . line) | variable-name
+  (target      nil)                 ; function-name | (file . line) | watch-target (see below)
   (condition   nil    :type (or null function))  ; predicate for conditional breakpoints
   (enabled-p   t      :type boolean)
   (hit-count   0      :type fixnum))
+
+;; For watchpoints (kind = :watchpoint), target is a watch-target:
+(defstruct watch-target
+  (name        nil    :type symbol)             ; variable name
+  (scope       :special :type (member :special :lexical))
+  (thread      nil    :type (or null thread))   ; nil = all threads
+  (frame       nil    :type (or null debug-frame)))  ; lexical scope anchor (when scope = :lexical)
 ```
 
 ### D6.04 — `profiler-sample`
@@ -253,9 +261,73 @@ breakpoint traps (`int3` on x86-64, `brk` on AArch64):
   (skip calls).
 - **Out:** patch the return address of the current frame.
 
-After the trap fires, the original instruction is restored and the
-debugger is re-entered. The patch/restore is thread-local: other
-threads are not affected.
+**Thread-locality of trap patches.** Because code pages are shared
+across threads, patching a code byte with a trap instruction is
+inherently process-wide — all threads executing through that address
+will hit the trap. Bliss achieves thread-local stepping semantics via
+a **thread-check in the trap handler**:
+
+1. When a stepping command is issued, the stepping thread's ID is
+   recorded in the thread-local `*stepping-thread*` variable, and the
+   trap address(es) are registered in a global **stepping-trap table**
+   mapping `pc → (thread-id, original-byte, step-kind)`.
+2. When any thread hits an `int3`/`brk` trap, the trap handler
+   consults the stepping-trap table:
+   - If `current-thread-id = entry.thread-id`, the trap is consumed:
+     the original instruction byte is restored, the debugger is
+     re-entered on the stepping thread, and new traps are installed
+     for the next step.
+   - If `current-thread-id ≠ entry.thread-id`, the trap is
+     **transparent**: the handler single-steps past the patched
+     instruction (using the processor's single-step flag on x86-64,
+     or a temporary instruction restore + re-patch on AArch64) and
+     resumes the non-stepping thread without entering the debugger.
+3. The stepping-trap table is protected by a spinlock (held only
+   during the brief lookup/update in the trap handler). At most one
+   thread may be stepping at a time per code address; if a second
+   thread requests stepping through an already-patched address, its
+   stepping request is queued until the first thread's trap fires.
+
+### 6.3.4a Watchpoint Implementation — A6.04a
+
+Watchpoints monitor variable bindings for changes and trigger the
+debugger when a predicate is satisfied. The mechanism differs by
+variable scope:
+
+- **Special (dynamic) variables:** The runtime intercepts writes to
+  watched special variable bindings by replacing the symbol's value
+  cell with a **guarded cell** — a wrapper that invokes the watchpoint
+  check on each `setq`/`set`/`setf symbol-value`. The guard is
+  installed by `bliss-debug:watch` and removed by
+  `bliss-debug:unwatch`. No compiler support is needed; all writes to
+  special variables go through the value-cell indirection already.
+
+- **Lexical variables:** Watching lexical variable mutations requires
+  **compiler support** and is only available when the function is
+  compiled with `(optimize (debug 3))`. At debug level 3, the
+  compiler emits write-barrier instrumentation around every `setq` of
+  a watched lexical variable: after each write, a check calls
+  `bliss-debug::%check-watchpoint` with the new value. The watched set
+  is consulted via a thread-local table indexed by the
+  `(function, variable-index)` pair from the debug info.
+
+```text
+PROCEDURE check-watchpoint(watch, old-value, new-value):
+  IF watch.enabled-p AND
+     (watch.thread = NIL OR watch.thread = current-thread) AND
+     (watch.condition = NIL OR funcall(watch.condition, old-value, new-value))
+  THEN
+    increment watch.hit-count
+    invoke-debugger(make-condition 'watchpoint-hit
+                     :variable watch.name
+                     :old-value old-value
+                     :new-value new-value)
+```
+
+If a lexical watchpoint is requested for a function compiled below
+`debug` 3, `bliss-debug:watch` signals a `simple-warning` explaining
+that the function must be recompiled with `(debug 3)` for lexical
+watchpoints and offers a restart to recompile.
 
 ### 6.3.5 Sampling Profiler — A6.05
 
@@ -317,33 +389,75 @@ connection's `pending-returns` table is protected by a lock.
 
 ## 6.4 Trace / Untrace Facility
 
-`trace` wraps the target function's `fdefinition` with an
-around-advice function:
+`trace` uses an **encapsulation** mechanism rather than raw
+`fdefinition` replacement, so that generic function identity and
+dispatch are preserved. The encapsulation layer wraps the function's
+invocation without replacing the function object in the symbol's
+function cell.
+
+#### 6.4.1 Regular Functions
+
+For ordinary (non-generic) functions, encapsulation stores the
+original function and installs a wrapper that calls through:
 
 ```lisp
-;; Conceptual implementation of TRACE wrapping
+;; Conceptual implementation for ordinary functions
 (defun install-trace (fname &key break condition report)
   (let* ((original (fdefinition fname))
-         (depth    (bliss-debug::trace-depth))
          (wrapper  (lambda (&rest args)
-                     (let ((*trace-depth* (1+ depth)))
+                     (let ((*trace-depth* (1+ *trace-depth*)))
                        (when (or (null condition)
                                  (apply condition args))
                          (format *trace-output* "~V@T~D: (~S ~{~S~^ ~})~%"
-                                 (* 2 depth) depth fname args)
+                                 (* 2 (1- *trace-depth*)) (1- *trace-depth*)
+                                 fname args)
                          (when break (break "Trace break on ~S" fname)))
                        (let ((values (multiple-value-list
                                       (apply original args))))
                          (format *trace-output* "~V@T~D: ~S returned ~{~S~^ ~}~%"
-                                 (* 2 depth) depth fname values)
+                                 (* 2 (1- *trace-depth*)) (1- *trace-depth*)
+                                 fname values)
                          (values-list values))))))
-    (setf (fdefinition fname) wrapper)
+    (bliss-debug:encapsulate fname wrapper :type :trace)
     (record-trace fname original wrapper)))
 ```
 
-`untrace` restores the original `fdefinition`. Tracing MUST be
-thread-safe: the `fdefinition` swap uses `CAS` to prevent lost updates
-when multiple threads trace/untrace concurrently.
+`bliss-debug:encapsulate` records the encapsulation in a global table
+keyed by `(fname, type)` and swaps the fdefinition. `untrace` calls
+`bliss-debug:unencapsulate` to restore the original.
+
+#### 6.4.2 Generic Functions
+
+For generic functions, directly replacing the `fdefinition` would
+destroy the GF dispatch function and its method table. Instead,
+tracing a generic function MUST use one of two strategies selected by
+the user:
+
+- **GF-entry tracing** (default): The GF's `:around` method
+  combination is augmented with a tracing around-method that logs
+  entry/exit without replacing the GF object. This preserves GF
+  identity, method dispatch, and MOP protocols.
+- **Per-method tracing**: `(trace fname :methods t)` individually
+  traces specific methods. Each method's function is encapsulated
+  independently, so the user sees entry/exit for each applicable
+  method rather than the top-level GF call.
+
+#### 6.4.3 Setf Functions and Compiler Macros
+
+- **Setf functions**: `(trace (setf foo))` MUST work by encapsulating
+  the `fdefinition` of the setf function name `(setf foo)`, following
+  the same ordinary-function encapsulation path.
+- **Compiler macros**: Tracing a function that has an associated
+  compiler macro MUST temporarily inhibit the compiler macro for
+  traced calls so the trace wrapper is actually invoked at runtime.
+  The compiler macro is restored on `untrace`.
+
+#### 6.4.4 Thread Safety
+
+Tracing MUST be thread-safe: the encapsulation/unencapsulation
+operations use `CAS` on the `fdefinition` cell to prevent lost updates
+when multiple threads trace/untrace concurrently. The global trace
+registry is protected by a reader-writer lock.
 
 ---
 
@@ -410,6 +524,12 @@ per-type breakdowns), `nil` (one-line summary), or no argument
 
 ## 6.7 `time` Macro
 
+The `time` macro MUST use `unwind-protect` so that timing information
+is reported even when `form` performs a non-local exit (e.g., `throw`,
+`return-from`, `go` to an outer tagbody). On non-local exit the report
+is prefixed with `"(aborted)"` to indicate the form did not complete
+normally.
+
 ```lisp
 (defmacro time (form)
   `(let* ((gc-count-before   (bliss-gc:gc-count))
@@ -418,8 +538,11 @@ per-type breakdowns), `nil` (one-line summary), or no argument
           (faults-before     (bliss-sys:page-faults))
           (start-real        (bliss-sys:monotonic-ns))
           (start-user        (bliss-sys:cpu-user-ns))
-          (start-sys         (bliss-sys:cpu-system-ns)))
-     (multiple-value-prog1 ,form
+          (start-sys         (bliss-sys:cpu-system-ns))
+          (completed-p       nil))
+     (unwind-protect
+         (multiple-value-prog1 ,form
+           (setq completed-p t))
        (let ((elapsed-real (- (bliss-sys:monotonic-ns) start-real))
              (elapsed-user (- (bliss-sys:cpu-user-ns) start-user))
              (elapsed-sys  (- (bliss-sys:cpu-system-ns) start-sys))
@@ -428,12 +551,13 @@ per-type breakdowns), `nil` (one-line summary), or no argument
              (gc-time      (- (bliss-gc:total-gc-time-ns) gc-time-before))
              (page-faults  (- (bliss-sys:page-faults) faults-before)))
          (format *trace-output*
-                 "~&Evaluation took:~%  ~,3F seconds of real time~%  ~
+                 "~&~:[(aborted) ~;~]Evaluation took:~%  ~,3F seconds of real time~%  ~
                   ~,3F seconds of user run time~%  ~
                   ~,3F seconds of system run time~%  ~
                   ~:D bytes consed~%  ~
                   ~D GC pauses totalling ~,3F seconds~%  ~
                   ~D page faults~%"
+                 completed-p
                  (/ elapsed-real 1e9) (/ elapsed-user 1e9) (/ elapsed-sys 1e9)
                  bytes-consed gc-pauses (/ gc-time 1e9) page-faults)))))
 ```
