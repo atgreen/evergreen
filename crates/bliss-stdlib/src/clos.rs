@@ -59,12 +59,46 @@ struct InstanceData {
     slots: HashMap<BlissVal, Option<BlissVal>>,
 }
 
+/// Qualifier for a method (for method combination).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodQualifier {
+    Primary,
+    Before,
+    After,
+    Around,
+}
+
+/// Metadata for a method: specializers and qualifier.
+#[derive(Clone)]
+struct MethodMeta {
+    /// Per-argument specializer classes. Empty means no specialization (T).
+    specializers: Vec<BlissVal>,
+    qualifier: MethodQualifier,
+}
+
 #[derive(Clone)]
 struct GFData {
     #[allow(dead_code)]
     name: BlissVal,
     #[allow(dead_code)]
     lambda_list: BlissVal,
+    methods: Vec<BlissVal>,
+}
+
+
+/// Standard method combination effective method descriptor.
+#[derive(Clone)]
+struct EffectiveMethod {
+    around: Vec<BlissVal>,
+    before: Vec<BlissVal>,
+    primary: Vec<BlissVal>,
+    after: Vec<BlissVal>,
+}
+
+/// Short-form method combination effective method descriptor.
+#[derive(Clone)]
+struct ShortFormMethod {
+    combination: MethodCombinationType,
     methods: Vec<BlissVal>,
 }
 
@@ -77,6 +111,12 @@ struct ClosState {
     instances: HashMap<BlissVal, InstanceData>,
     /// gf id → generic function data
     generic_functions: HashMap<BlissVal, GFData>,
+    /// method id → method metadata (specializers, qualifier)
+    method_meta: HashMap<BlissVal, MethodMeta>,
+    /// effective method key → standard combination descriptor
+    effective_methods: HashMap<BlissVal, EffectiveMethod>,
+    /// effective method key → short-form combination descriptor
+    short_form_methods: HashMap<BlissVal, ShortFormMethod>,
     next_instance_id: i64,
     next_gf_id: i64,
     // Built-in class values
@@ -102,6 +142,9 @@ impl ClosState {
             class_meta: HashMap::new(),
             instances: HashMap::new(),
             generic_functions: HashMap::new(),
+            method_meta: HashMap::new(),
+            effective_methods: HashMap::new(),
+            short_form_methods: HashMap::new(),
             next_instance_id: 100_000,
             next_gf_id: 200_000,
             fixnum_class: NIL,
@@ -268,6 +311,55 @@ pub fn set_find_class(name: BlissVal, class: BlissVal) -> Result<(), BlissError>
             // Update name mapping
             st.class_meta.get_mut(&class).unwrap().name = name;
         }
+        Ok(())
+    })
+}
+
+/// Define a class with explicit name, superclasses, and slots.
+///
+/// This is the proper API for class definition, replacing the heuristic-based
+/// inference used when classes are registered with `set_find_class` alone.
+/// `direct_supers` should list the direct superclass values. If empty,
+/// the class defaults to having STANDARD-OBJECT as its sole superclass.
+pub fn define_class(
+    name: BlissVal,
+    class: BlissVal,
+    direct_supers: &[BlissVal],
+    slots: &[BlissVal],
+) -> Result<(), BlissError> {
+    with_state_mut(|st| {
+        // Track fixnum registration order (for diamond-hierarchy inference)
+        if class.is_fixnum() {
+            let fv = class.as_fixnum();
+            if !st.fixnum_registrations.iter().any(|(v, _)| *v == fv) {
+                st.fixnum_registrations.push((fv, class));
+            }
+        }
+
+        st.class_registry.insert(name, class);
+
+        let supers = if direct_supers.is_empty() && st.bootstrapped && st.standard_object_class != NIL {
+            vec![st.standard_object_class]
+        } else {
+            direct_supers.to_vec()
+        };
+
+        // Register as subclass of each superclass
+        for &s in &supers {
+            if let Some(meta) = st.class_meta.get_mut(&s) {
+                if !meta.direct_subs.contains(&class) {
+                    meta.direct_subs.push(class);
+                }
+            }
+        }
+
+        st.class_meta.insert(class, ClassMeta {
+            name,
+            direct_supers: supers,
+            direct_subs: vec![],
+            slots: slots.to_vec(),
+        });
+
         Ok(())
     })
 }
@@ -490,9 +582,54 @@ pub fn make_instance(class: BlissVal, initargs: &[BlissVal]) -> Result<BlissVal,
 }
 
 /// Initialize an instance (INITIALIZE-INSTANCE).
+/// Per ANSI CL, initialize-instance calls (shared-initialize instance T initargs).
 /// Initargs are pairwise (slot-name, value).
 pub fn initialize_instance(
     instance: BlissVal,
+    initargs: &[BlissVal],
+) -> Result<(), BlissError> {
+    // Per spec R5.80: initialize-instance calls shared-initialize with T (all slots)
+    shared_initialize(instance, T, initargs)
+}
+
+/// Shared initialize (SHARED-INITIALIZE).
+///
+/// `slot_names` controls which slots are eligible for initialization:
+/// - `T` — all slots are eligible; every initarg pair is applied.
+/// - `NIL` — no slots are eligible; initargs are ignored.
+/// - A symbol value — only the slot with that name is eligible.
+/// - A list of symbol values (stored as a Rust slice via `shared_initialize_with_list`)
+///   — only slots whose names appear in the list are eligible.
+///
+/// In full CLOS, `slot_names` also controls which slots receive their
+/// `:initform` default values. Since Bliss does not yet store initforms,
+/// only the initarg filtering behaviour is implemented.
+pub fn shared_initialize(
+    instance: BlissVal,
+    slot_names: BlissVal,
+    initargs: &[BlissVal],
+) -> Result<(), BlissError> {
+    if slot_names == T {
+        shared_initialize_with_list(instance, None, initargs)
+    } else if slot_names == NIL {
+        // NIL means "don't evaluate initforms for any slots", but explicitly
+        // supplied initarg pairs MUST still be applied to their corresponding
+        // slots.  Pass eligible = None so all initargs are applied (initforms
+        // are not yet implemented, so the behavior is identical to T for now).
+        shared_initialize_with_list(instance, None, initargs)
+    } else {
+        // Single symbol: treat as a one-element list
+        shared_initialize_with_list(instance, Some(&[slot_names]), initargs)
+    }
+}
+
+/// Shared initialize with an explicit list of eligible slot names.
+///
+/// If `eligible` is `None`, all slots are eligible (equivalent to T).
+/// If `eligible` is `Some(list)`, only slot names in that list are eligible.
+pub fn shared_initialize_with_list(
+    instance: BlissVal,
+    eligible: Option<&[BlissVal]>,
     initargs: &[BlissVal],
 ) -> Result<(), BlissError> {
     with_state_mut(|st| {
@@ -500,34 +637,38 @@ pub fn initialize_instance(
             .instances
             .get_mut(&instance)
             .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+
         let mut i = 0;
         while i + 1 < initargs.len() {
-            inst.slots.insert(initargs[i], Some(initargs[i + 1]));
+            let slot_name = initargs[i];
+            let value = initargs[i + 1];
+
+            let is_eligible = match eligible {
+                None => true, // T: all slots eligible
+                Some(names) => names.contains(&slot_name),
+            };
+
+            if is_eligible {
+                inst.slots.insert(slot_name, Some(value));
+            }
+
             i += 2;
         }
         Ok(())
     })
 }
 
-/// Shared initialize (SHARED-INITIALIZE).
-/// When `slot_names` is T, all slots are eligible for initialization.
-pub fn shared_initialize(
+/// Reinitialize an instance (REINITIALIZE-INSTANCE). R5.81.
+/// Per ANSI CL, reinitialize-instance calls (shared-initialize instance NIL initargs)
+/// — only explicit initargs are applied, no initforms are evaluated.
+pub fn reinitialize_instance(
     instance: BlissVal,
-    _slot_names: BlissVal,
     initargs: &[BlissVal],
 ) -> Result<(), BlissError> {
-    with_state_mut(|st| {
-        let inst = st
-            .instances
-            .get_mut(&instance)
-            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-        let mut i = 0;
-        while i + 1 < initargs.len() {
-            inst.slots.insert(initargs[i], Some(initargs[i + 1]));
-            i += 2;
-        }
-        Ok(())
-    })
+    // Per spec R5.81: reinitialize-instance calls shared-initialize with
+    // slot-names = NIL.  Now that shared_initialize handles NIL correctly
+    // (applies initargs but skips initforms), we call it directly.
+    shared_initialize(instance, NIL, initargs)
 }
 
 // ── Slot access ────────────────────────────────────────────────────
@@ -642,20 +783,156 @@ pub fn remove_method(
     })
 }
 
+/// Register specializer and qualifier metadata for a method.
+/// Specializers are a list of class values, one per required parameter.
+/// An empty specializers list means the method is unspecialized (applies to all).
+pub fn set_method_specializers(
+    method: BlissVal,
+    specializers: Vec<BlissVal>,
+    qualifier: MethodQualifier,
+) {
+    with_state_mut(|st| {
+        st.method_meta.insert(method, MethodMeta { specializers, qualifier });
+    });
+}
+
+/// Check if a method's specializer at position `i` is applicable to argument
+/// class `arg_class`, i.e. `arg_class` is a subtype of the specializer.
+fn specializer_applicable(st: &ClosState, specializer: BlissVal, arg_class: BlissVal) -> bool {
+    if specializer == st.t_class_val {
+        return true; // T matches everything
+    }
+    if specializer == arg_class {
+        return true; // exact match
+    }
+    // Walk the CPL of arg_class to check if specializer appears
+    if let Ok(cpl) = c3_linearize(st, arg_class) {
+        cpl.contains(&specializer)
+    } else {
+        false
+    }
+}
+
+/// Compute a specificity score for sorting: position in CPL (lower = more specific).
+/// Returns the sum of positions across all specializer args.
+fn method_specificity(st: &ClosState, method: BlissVal, arg_classes: &[BlissVal]) -> usize {
+    let meta = match st.method_meta.get(&method) {
+        Some(m) => m,
+        None => return usize::MAX, // unspecialized methods are least specific
+    };
+    let mut score = 0usize;
+    for (i, spec) in meta.specializers.iter().enumerate() {
+        if i >= arg_classes.len() {
+            break;
+        }
+        if *spec == st.t_class_val || *spec == NIL {
+            score += 1000; // T specializer: least specific
+        } else if let Ok(cpl) = c3_linearize(st, arg_classes[i]) {
+            if let Some(pos) = cpl.iter().position(|&c| c == *spec) {
+                score += pos;
+            } else {
+                score += 1000;
+            }
+        } else {
+            score += 1000;
+        }
+    }
+    score
+}
+
 /// Compute the applicable methods for given arguments.
-/// Without specialiser metadata, returns an empty vec.
+///
+/// Filters the generic function's methods to those whose specializers
+/// are supertypes of the corresponding argument classes, then sorts
+/// most-specific-first using CPL position.
 pub fn compute_applicable_methods(
-    _generic_function: BlissVal,
-    _args: &[BlissVal],
+    generic_function: BlissVal,
+    args: &[BlissVal],
 ) -> Vec<BlissVal> {
-    Vec::new()
+    with_state(|st| {
+        let gf = match st.generic_functions.get(&generic_function) {
+            Some(gf) => gf,
+            None => return Vec::new(),
+        };
+
+        if gf.methods.is_empty() {
+            return Vec::new();
+        }
+
+        // Compute argument classes
+        let arg_classes: Vec<BlissVal> = args.iter().map(|a| {
+            // Inline class_of logic (we already hold the borrow)
+            if let Some(inst) = st.instances.get(a) {
+                inst.class
+            } else if *a == NIL {
+                st.null_class
+            } else if *a == T {
+                st.symbol_class
+            } else if a.is_fixnum() {
+                st.fixnum_class
+            } else if a.is_character() {
+                st.character_class
+            } else if a.is_symbol() {
+                st.symbol_class
+            } else if a.is_cons() {
+                st.cons_class
+            } else if a.is_single_float() {
+                st.float_class
+            } else if a.is_function() {
+                st.function_class
+            } else if a.is_heap_object() {
+                st.heap_object_class
+            } else {
+                st.t_class_val
+            }
+        }).collect();
+
+        // Filter: keep methods whose specializers match the argument classes
+        let mut applicable: Vec<BlissVal> = gf.methods.iter().copied().filter(|&m| {
+            match st.method_meta.get(&m) {
+                Some(meta) => {
+                    // Each specializer must be applicable to the corresponding arg
+                    for (i, spec) in meta.specializers.iter().enumerate() {
+                        if i >= arg_classes.len() {
+                            break;
+                        }
+                        if !specializer_applicable(st, *spec, arg_classes[i]) {
+                            return false;
+                        }
+                    }
+                    true
+                }
+                None => {
+                    // No specializer metadata: method is unspecialized,
+                    // applicable to all arguments
+                    true
+                }
+            }
+        }).collect();
+
+        // Sort by specificity: most specific first (lowest score)
+        applicable.sort_by_key(|&m| method_specificity(st, m, &arg_classes));
+
+        applicable
+    })
 }
 
 /// Compute the effective method for a set of applicable methods.
 ///
-/// * `Standard` — primary method is the first applicable method.
-/// * Other variants encode their discriminant into the result so every
-///   combination type produces a distinct `BlissVal`.
+/// For `Standard` combination, the effective method is determined by
+/// method qualifiers:
+/// - `:around` methods wrap the call chain (outermost first)
+/// - `:before` methods run before the primary
+/// - The most-specific primary method is the core
+/// - `:after` methods run after the primary (least-specific first)
+///
+/// Without qualifier metadata, the first method is the primary.
+///
+/// For non-Standard combinations (Plus, And, Or, etc.), the combination
+/// type's discriminant is encoded into the result so every combination
+/// produces a distinct effective method value. In a full implementation
+/// these would invoke each primary method and combine results via
+/// the operator (e.g., `+` for Plus, `and` for And).
 pub fn compute_effective_method(
     _generic_function: BlissVal,
     combination: MethodCombinationType,
@@ -666,15 +943,147 @@ pub fn compute_effective_method(
             "no applicable methods for effective method computation".into(),
         ));
     }
+
     match combination {
-        MethodCombinationType::Standard => Ok(methods[0]),
-        other => Ok(BlissVal::from_fixnum(10_000 + other.discriminant())),
+        MethodCombinationType::Standard => {
+            // Standard method combination: separate methods by qualifier,
+            // build the effective method chain per ANSI CL / spec §5.2.9 R5.77.
+            //
+            // The effective method executes:
+            // 1. :around methods (most-specific-first), each can call-next-method
+            // 2. :before methods (most-specific-first)
+            // 3. Primary methods (most-specific-first), with call-next-method chain
+            // 4. :after methods (least-specific-first, i.e. reversed)
+            //
+            // We represent the effective method as a composite: we store the
+            // method chain in EFFECTIVE_METHODS and return a synthetic key.
+            // For the simple case (no :around), the primary method value is
+            // returned directly. When there are auxiliary methods, we build
+            // an EffectiveMethod descriptor.
+
+            let (around, before, primary, after) = with_state(|st| {
+                let mut around = Vec::new();
+                let mut before = Vec::new();
+                let mut primary = Vec::new();
+                let mut after = Vec::new();
+
+                for &m in methods {
+                    match st.method_meta.get(&m) {
+                        Some(meta) => match meta.qualifier {
+                            MethodQualifier::Around => around.push(m),
+                            MethodQualifier::Before => before.push(m),
+                            MethodQualifier::Primary => primary.push(m),
+                            MethodQualifier::After => after.push(m),
+                        },
+                        None => primary.push(m), // no metadata = primary
+                    }
+                }
+
+                // :after methods execute least-specific-first
+                after.reverse();
+
+                (around, before, primary, after)
+            });
+
+            if primary.is_empty() {
+                return Err(BlissError::Internal(
+                    "no primary method found in standard combination".into(),
+                ));
+            }
+
+            // Store the effective method chain for later invocation
+            let em_key = with_state_mut(|st| {
+                let key = st.alloc_instance_id();
+                st.effective_methods.insert(key, EffectiveMethod {
+                    around,
+                    before,
+                    primary,
+                    after,
+                });
+                key
+            });
+
+            Ok(em_key)
+        }
+        other => {
+            // Non-standard (short-form) combinations per spec §5.2.9 R5.78/R5.79.
+            // These apply an operator to the results of all primary methods.
+            // We store the method list and combination type for later invocation.
+
+            let primary_methods: Vec<BlissVal> = with_state(|st| {
+                methods.iter().copied().filter(|m| {
+                    match st.method_meta.get(m) {
+                        Some(meta) => meta.qualifier == MethodQualifier::Primary,
+                        None => true, // no metadata = primary
+                    }
+                }).collect()
+            });
+
+            if primary_methods.is_empty() {
+                return Err(BlissError::Internal(
+                    "no primary methods for short-form combination".into(),
+                ));
+            }
+
+            // Store the short-form effective method for later invocation
+            let em_key = with_state_mut(|st| {
+                let key = st.alloc_instance_id();
+                st.short_form_methods.insert(key, ShortFormMethod {
+                    combination: other,
+                    methods: primary_methods,
+                });
+                key
+            });
+
+            Ok(em_key)
+        }
     }
+}
+
+// ── Effective method accessors ─────────────────────────────────────
+
+/// Retrieve a standard-combination effective method descriptor by key.
+///
+/// Returns the around, before, primary, and after method lists.
+pub fn get_effective_method(
+    key: BlissVal,
+) -> Option<(Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>)> {
+    with_state(|st| {
+        st.effective_methods.get(&key).map(|em| {
+            (
+                em.around.clone(),
+                em.before.clone(),
+                em.primary.clone(),
+                em.after.clone(),
+            )
+        })
+    })
+}
+
+/// Retrieve a short-form combination effective method descriptor by key.
+///
+/// Returns the combination type and the ordered list of methods.
+pub fn get_short_form_method(
+    key: BlissVal,
+) -> Option<(MethodCombinationType, Vec<BlissVal>)> {
+    with_state(|st| {
+        st.short_form_methods.get(&key).map(|sfm| {
+            (sfm.combination.clone(), sfm.methods.clone())
+        })
+    })
 }
 
 // ── Class change protocol ──────────────────────────────────────────
 
-/// Change the class of an instance (CHANGE-CLASS). R5.16.
+/// Change the class of an instance (CHANGE-CLASS). R5.16, R5.82 §5.2.11.
+///
+/// Per the spec, change-class must:
+/// 1. Snapshot the old instance state (old class, old slots).
+/// 2. Determine which slots are shared between old and new class.
+/// 3. Copy values of shared slots to the new instance.
+/// 4. Swap the class pointer (wrapper) to the new class.
+/// 5. Call update-instance-for-different-class with the old snapshot
+///    and the updated instance.
 pub fn change_class(
     instance: BlissVal,
     new_class: BlissVal,
@@ -682,9 +1091,116 @@ pub fn change_class(
     with_state_mut(|st| {
         let inst = st
             .instances
-            .get_mut(&instance)
+            .get(&instance)
             .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+
+        // Step 1: Snapshot old instance state
+        let old_class = inst.class;
+        let old_slots = inst.slots.clone();
+
+        // Step 2: Determine shared slot names (slots defined in both old and new class)
+        let old_class_slots: Vec<BlissVal> = st.class_meta
+            .get(&old_class)
+            .map(|m| m.slots.clone())
+            .unwrap_or_default();
+        let new_class_slots: Vec<BlissVal> = st.class_meta
+            .get(&new_class)
+            .map(|m| m.slots.clone())
+            .unwrap_or_default();
+
+        // Step 3: Build new slot map — copy shared slot values, leave new slots unbound
+        let mut new_slots = HashMap::new();
+
+        // If both classes have explicit slots defined, use those to determine sharing.
+        // Otherwise, carry over all old slots that have values (pragmatic approach
+        // matching real CL implementations when slot metadata isn't fully available).
+        if !old_class_slots.is_empty() || !new_class_slots.is_empty() {
+            for slot_name in &new_class_slots {
+                if old_class_slots.contains(slot_name) {
+                    // Shared slot: copy value from old instance
+                    if let Some(val) = old_slots.get(slot_name) {
+                        new_slots.insert(*slot_name, *val);
+                    }
+                }
+                // New slots that weren't in old class: left unbound (not inserted)
+            }
+            // Also carry over any slot values that were set but not in the class's
+            // declared slot list (dynamic slots), if they appear in new class slots
+            for (slot_name, val) in &old_slots {
+                if new_class_slots.contains(slot_name) || new_class_slots.is_empty() {
+                    new_slots.entry(*slot_name).or_insert_with(|| *val);
+                }
+            }
+        } else {
+            // Neither class has explicit slot definitions: carry over all old slots
+            new_slots = old_slots.clone();
+        }
+
+        // Step 4: Swap wrapper — update the instance's class and slots
+        let inst = st.instances.get_mut(&instance).unwrap();
         inst.class = new_class;
+        inst.slots = new_slots;
+
+        // Step 5: Call update-instance-for-different-class
+        // In a full implementation this would be a generic function call.
+        // We call our internal version which handles slot initialization
+        // for added slots.
+        update_instance_for_different_class_internal(
+            st, instance, old_class, &old_slots, new_class,
+        );
+
         Ok(())
     })
+}
+
+/// Internal implementation of update-instance-for-different-class.
+///
+/// Per ANSI CL, this is called after the instance's class has been changed.
+/// It receives the old instance state (as a snapshot) and the updated instance.
+/// The default method calls shared-initialize on the instance with the list
+/// of newly added slots (so they can get initform defaults).
+fn update_instance_for_different_class_internal(
+    st: &mut ClosState,
+    instance: BlissVal,
+    old_class: BlissVal,
+    _old_slots: &HashMap<BlissVal, Option<BlissVal>>,
+    new_class: BlissVal,
+) {
+    // Per ANSI CL / spec R5.82: the default method calls shared-initialize
+    // on the instance with the list of added slots (slots present in the new
+    // class but absent from the old class) so they can receive initform defaults.
+    let old_class_slots: Vec<BlissVal> = st.class_meta
+        .get(&old_class)
+        .map(|m| m.slots.clone())
+        .unwrap_or_default();
+    let new_class_slots: Vec<BlissVal> = st.class_meta
+        .get(&new_class)
+        .map(|m| m.slots.clone())
+        .unwrap_or_default();
+
+    // Compute added slots: slots in new class but not in old class
+    let added_slots: Vec<BlissVal> = new_class_slots
+        .iter()
+        .filter(|s| !old_class_slots.contains(s))
+        .copied()
+        .collect();
+
+    // Call shared-initialize with the added slot names as the eligible set.
+    // No initargs are passed (empty slice) — only initforms would apply,
+    // but this ensures the protocol is followed correctly.
+    if !added_slots.is_empty() {
+        // We need to drop the mutable borrow on ClosState before calling
+        // shared_initialize_with_list (which will re-acquire the lock).
+        // Since we're already inside with_state_mut, we perform the
+        // equivalent operation inline.
+        let inst = match st.instances.get_mut(&instance) {
+            Some(inst) => inst,
+            None => return,
+        };
+        for slot_name in &added_slots {
+            // Ensure the slot exists in the instance (unbound if not already set).
+            // This makes added slots visible even if they have no initform.
+            inst.slots.entry(*slot_name).or_insert(None);
+        }
+    }
 }
