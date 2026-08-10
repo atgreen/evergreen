@@ -7,7 +7,7 @@ use crate::stack::BlissStack;
 use crate::value::BlissVal;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Unique identifier for a green thread.
@@ -54,6 +54,7 @@ thread_local! {
             state: Mutex::new(ThreadState::Runnable),
             stack: BlissStack::new(DEFAULT_STACK_SIZE),
             tls: Mutex::new(vec![crate::value::NIL; MAX_TLS]),
+            yield_requested: AtomicBool::new(false),
         });
         thread_registry().lock().unwrap().insert(id, Arc::clone(&thread));
         thread
@@ -66,6 +67,8 @@ pub struct GreenThread {
     state: Mutex<ThreadState>,
     stack: BlissStack,
     tls: Mutex<Vec<BlissVal>>,
+    /// Per-thread yield flag for cooperative preemption at safepoints (§2.5.3 step 4).
+    yield_requested: AtomicBool,
 }
 
 // Safety: GreenThread access is controlled by the scheduler and thread registry.
@@ -98,6 +101,17 @@ impl GreenThread {
         }
     }
 
+    /// Check and clear the per-thread yield flag (§2.5.3 step 4).
+    /// Returns `true` if a yield was requested.
+    pub fn check_and_clear_yield(&self) -> bool {
+        self.yield_requested.swap(false, Ordering::SeqCst)
+    }
+
+    /// Request this thread to yield at its next safepoint.
+    pub fn request_yield(&self) {
+        self.yield_requested.store(true, Ordering::SeqCst);
+    }
+
     /// Set this thread's TLS slot at the given index.
     pub fn tls_set(&self, index: u32, value: BlissVal) {
         let mut tls = self.tls.lock().unwrap();
@@ -123,6 +137,7 @@ pub fn make_thread(_entry: BlissVal) -> Result<GreenThreadId, BlissError> {
         state: Mutex::new(ThreadState::Runnable),
         stack: BlissStack::new(DEFAULT_STACK_SIZE),
         tls: Mutex::new(vec![crate::value::NIL; MAX_TLS]),
+        yield_requested: AtomicBool::new(false),
     });
     thread_registry().lock().unwrap().insert(id, thread);
     Ok(id)

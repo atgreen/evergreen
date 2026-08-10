@@ -3,6 +3,8 @@
 //! Each green thread owns a `BlissStack` — a contiguous virtual memory
 //! region for CL control/value frames. See §2.4 of the spec.
 
+use std::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
+
 use crate::value::BlissVal;
 
 /// CL stack for a green thread.
@@ -14,6 +16,10 @@ pub struct BlissStack {
     sp_offset: usize,
     /// Frame pointer (null if no frames pushed).
     fp: *const Frame,
+    /// Published stack pointer for GC scanning while thread is parked at a safepoint.
+    published_sp: AtomicUsize,
+    /// Published frame pointer for GC scanning while thread is parked at a safepoint.
+    published_fp: AtomicPtr<Frame>,
 }
 
 impl BlissStack {
@@ -25,6 +31,8 @@ impl BlissStack {
             memory,
             sp_offset: 0,
             fp: std::ptr::null(),
+            published_sp: AtomicUsize::new(0),
+            published_fp: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -51,6 +59,23 @@ impl BlissStack {
     /// Returns bytes currently in use.
     pub fn used(&self) -> usize {
         self.sp_offset
+    }
+
+    /// Publish the current sp and fp so the GC can scan this thread's
+    /// stack while it is parked at a safepoint (§2.5.3).
+    pub fn publish_top(&self) {
+        self.published_sp.store(self.sp_offset, Ordering::Release);
+        self.published_fp.store(self.fp as *mut Frame, Ordering::Release);
+    }
+
+    /// Read the published stack pointer offset (for GC scanning).
+    pub fn published_sp(&self) -> usize {
+        self.published_sp.load(Ordering::Acquire)
+    }
+
+    /// Read the published frame pointer (for GC scanning).
+    pub fn published_fp(&self) -> *const Frame {
+        self.published_fp.load(Ordering::Acquire)
     }
 }
 
