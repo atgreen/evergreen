@@ -41,6 +41,14 @@ where
 
 static PATHNAME_STORE: Mutex<Option<HashMap<u64, PathnameRecord>>> = Mutex::new(None);
 static STRING_REGISTRY: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
+/// Reverse registry: string content → BlissVal. Ensures that when a
+/// BlissVal for a given string has already been registered (e.g. via
+/// `register_string` from `make_lisp_string`), `make_string_bv` reuses
+/// it instead of creating a hash-based sentinel.  This is the key to
+/// normalising representations between `make_pathname` (which stores
+/// caller-provided BlissVals) and `parse_namestring` (which internally
+/// decomposes a path string into component strings).
+static STRING_REVERSE_REGISTRY: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
 static LOGICAL_TRANSLATIONS: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
 static PATHNAME_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -58,6 +66,15 @@ where
     F: FnOnce(&mut HashMap<u64, String>) -> R,
 {
     let mut guard = STRING_REGISTRY.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    f(map)
+}
+
+fn with_string_reverse_registry<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut HashMap<String, BlissVal>) -> R,
+{
+    let mut guard = STRING_REVERSE_REGISTRY.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
     f(map)
 }
@@ -93,11 +110,27 @@ fn string_hash(s: &str) -> u64 {
     (h & !0b111) | 0b010
 }
 
-/// Create a BlissVal representing a string (sentinel, same as test helper).
+/// Create or retrieve a BlissVal representing a string.
+///
+/// If a BlissVal for this string content has already been registered
+/// (e.g. via `register_string` from external code like `make_lisp_string`),
+/// that existing BlissVal is returned so that component equality is
+/// preserved across `make_pathname` and `parse_namestring`.  Otherwise
+/// a new hash-based sentinel is created and registered in both the
+/// forward and reverse registries.
 fn make_string_bv(s: &str) -> BlissVal {
+    // Check reverse registry first for an existing BlissVal with this content.
+    let existing = with_string_reverse_registry(|rev| rev.get(s).copied());
+    if let Some(bv) = existing {
+        return bv;
+    }
+    // No existing registration — create a hash-based sentinel.
     let bv = BlissVal::from_raw(string_hash(s));
     with_string_registry(|reg| {
         reg.insert(bv.0, s.to_string());
+    });
+    with_string_reverse_registry(|rev| {
+        rev.insert(s.to_string(), bv);
     });
     bv
 }
@@ -113,9 +146,19 @@ fn lookup_string(val: BlissVal) -> Option<String> {
 }
 
 /// Register a string for a BlissVal in the global registry.
+///
+/// This populates both the forward registry (BlissVal → String) and
+/// the reverse registry (String → BlissVal).  The reverse entry is
+/// only inserted if no mapping for this string content exists yet,
+/// so the *first* registered BlissVal wins — ensuring that
+/// `make_string_bv` returns a consistent value for the same content.
 pub fn register_string(val: BlissVal, s: &str) {
     with_string_registry(|reg| {
         reg.insert(val.0, s.to_string());
+    });
+    with_string_reverse_registry(|rev| {
+        // First registration wins — don't overwrite if already present.
+        rev.entry(s.to_string()).or_insert(val);
     });
 }
 
