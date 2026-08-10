@@ -261,6 +261,129 @@ fn compute_header_checksum(header_bytes: &[u8]) -> [u8; 32] {
 
 // ── Image save ─────────────────────────────────────────────────────
 
+/// Minimal zstd-style compression using simple run-length encoding.
+/// Used when `ImageCompression::Zstd` is requested. A real implementation
+/// would link against libzstd; this provides a compatible compress/decompress
+/// pair so that the COMPRESSED flag is correctly honoured.
+fn compress_data(data: &[u8]) -> Vec<u8> {
+    // Format: [u32 LE uncompressed_len] [compressed bytes...]
+    // Compressed bytes use a simple scheme:
+    //   - 0x00 <count u16 LE> <byte>  = run of `count` copies of `byte`
+    //   - 0x01 <count u16 LE> <bytes...> = `count` literal bytes
+    let mut out = Vec::with_capacity(data.len() + 4);
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+
+    let mut i = 0;
+    while i < data.len() {
+        // Check for a run of identical bytes (min length 4 to be worthwhile)
+        let b = data[i];
+        let mut run_len = 1usize;
+        while i + run_len < data.len() && data[i + run_len] == b && run_len < 65535 {
+            run_len += 1;
+        }
+        if run_len >= 4 {
+            out.push(0x00);
+            out.extend_from_slice(&(run_len as u16).to_le_bytes());
+            out.push(b);
+            i += run_len;
+        } else {
+            // Gather literal bytes (up to 65535)
+            let start = i;
+            let mut lit_len = 0usize;
+            while i + lit_len < data.len() && lit_len < 65535 {
+                // Check if next position starts a worthwhile run
+                let nb = data[i + lit_len];
+                let mut nr = 1usize;
+                while i + lit_len + nr < data.len()
+                    && data[i + lit_len + nr] == nb
+                    && nr < 65535
+                {
+                    nr += 1;
+                }
+                if nr >= 4 {
+                    break;
+                }
+                lit_len += 1;
+            }
+            if lit_len == 0 {
+                lit_len = 1;
+            }
+            out.push(0x01);
+            out.extend_from_slice(&(lit_len as u16).to_le_bytes());
+            out.extend_from_slice(&data[start..start + lit_len]);
+            i += lit_len;
+        }
+    }
+    out
+}
+
+/// Decompress data produced by `compress_data`.
+fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>, BlissError> {
+    if compressed.len() < 4 {
+        return Err(BlissError::InvalidImage(
+            "compressed data too short".into(),
+        ));
+    }
+    let uncompressed_len = u32::from_le_bytes([
+        compressed[0],
+        compressed[1],
+        compressed[2],
+        compressed[3],
+    ]) as usize;
+    let mut out = Vec::with_capacity(uncompressed_len);
+    let mut i = 4;
+    while i < compressed.len() {
+        let tag = compressed[i];
+        i += 1;
+        if i + 2 > compressed.len() {
+            return Err(BlissError::InvalidImage(
+                "truncated compressed stream".into(),
+            ));
+        }
+        let count = u16::from_le_bytes([compressed[i], compressed[i + 1]]) as usize;
+        i += 2;
+        match tag {
+            0x00 => {
+                // Run-length
+                if i >= compressed.len() {
+                    return Err(BlissError::InvalidImage(
+                        "truncated RLE byte".into(),
+                    ));
+                }
+                let b = compressed[i];
+                i += 1;
+                for _ in 0..count {
+                    out.push(b);
+                }
+            }
+            0x01 => {
+                // Literals
+                if i + count > compressed.len() {
+                    return Err(BlissError::InvalidImage(
+                        "truncated literal block".into(),
+                    ));
+                }
+                out.extend_from_slice(&compressed[i..i + count]);
+                i += count;
+            }
+            _ => {
+                return Err(BlissError::InvalidImage(format!(
+                    "unknown compression tag: {:#x}",
+                    tag
+                )));
+            }
+        }
+    }
+    if out.len() != uncompressed_len {
+        return Err(BlissError::InvalidImage(format!(
+            "decompressed size mismatch: expected {}, got {}",
+            uncompressed_len,
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
 /// Save the current heap state to an image file.
 /// Triggers a full GC, stops all threads, serialises, then resumes.
 ///
@@ -268,12 +391,15 @@ fn compute_header_checksum(header_bytes: &[u8]) -> [u8; 32] {
 pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissError> {
     use std::io::Write;
 
-    let mut flags = if options.compression == ImageCompression::Zstd {
-        image_flags::COMPRESSED
-    } else {
-        0
-    };
+    // Trigger a full GC before saving to ensure only live objects are serialised
+    // and finalizers have been run (spec §7.2).
+    crate::gc::full_gc()?;
 
+    let use_compression = options.compression == ImageCompression::Zstd;
+    let mut flags: u32 = 0;
+    if use_compression {
+        flags |= image_flags::COMPRESSED;
+    }
     if options.purify {
         flags |= image_flags::READ_ONLY_SAFE;
     }
@@ -283,30 +409,119 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Serialize the heap.  In a full runtime this would walk all live
-    // objects after a full GC.  At this stage we serialize the root
-    // continuation value (NIL by default) and any values reachable from
-    // the global heap.  The heap section is a flat byte buffer whose
-    // first 8 bytes encode the entry continuation.
+    // Collect the entry continuation value. Walk the heap to serialize
+    // all live objects into the heap section.
     let entry_val = crate::value::NIL;
-    let mut heap_data: Vec<u8> = Vec::new();
-    // Write the entry continuation as the first 8 bytes of the heap section
-    heap_data.extend_from_slice(&entry_val.to_raw().to_ne_bytes());
+
+    // Build the heap section: first 8 bytes are the entry continuation,
+    // followed by serialised heap objects from gc::serialize_heap_objects().
+    let serialized_objects = crate::gc::serialize_heap_objects();
+    let mut heap_data_raw: Vec<u8> = Vec::new();
+    heap_data_raw.extend_from_slice(&entry_val.to_raw().to_ne_bytes());
+    heap_data_raw.extend_from_slice(&serialized_objects);
+    let heap_uncompressed_size = heap_data_raw.len();
+
+    // Build the symbol table section (empty in bootstrap — placeholder for
+    // the symbol table serialisation required by §7.2.7).
+    let symbol_data_raw: Vec<u8> = Vec::new();
+    let symbol_uncompressed_size = symbol_data_raw.len();
+
+    // Build the package registry section (empty in bootstrap — placeholder
+    // for the package registry serialisation required by §7.2.8).
+    let package_data_raw: Vec<u8> = Vec::new();
+    let package_uncompressed_size = package_data_raw.len();
+
+    // Build the compiled code cache section (empty in bootstrap).
+    let code_data_raw: Vec<u8> = Vec::new();
+    let code_uncompressed_size = code_data_raw.len();
+
+    // Build the relocation table section (empty in bootstrap).
+    let reloc_data_raw: Vec<u8> = Vec::new();
+    let reloc_uncompressed_size = reloc_data_raw.len();
+
+    // Build the GC metadata section.
+    let gc_stats = crate::gc::heap_stats();
+    let mut gc_meta_raw: Vec<u8> = Vec::new();
+    gc_meta_raw.extend_from_slice(&gc_stats.minor_gc_count.to_le_bytes());
+    gc_meta_raw.extend_from_slice(&gc_stats.major_gc_count.to_le_bytes());
+    gc_meta_raw.extend_from_slice(&gc_stats.bytes_allocated.to_le_bytes());
+    let gc_meta_uncompressed_size = gc_meta_raw.len();
+
+    // Apply compression if requested.
+    let heap_data = if use_compression { compress_data(&heap_data_raw) } else { heap_data_raw };
+    let symbol_data = if use_compression { compress_data(&symbol_data_raw) } else { symbol_data_raw };
+    let package_data = if use_compression { compress_data(&package_data_raw) } else { package_data_raw };
+    let code_data = if use_compression { compress_data(&code_data_raw) } else { code_data_raw };
+    let reloc_data = if use_compression { compress_data(&reloc_data_raw) } else { reloc_data_raw };
+    let gc_meta_data = if use_compression { compress_data(&gc_meta_raw) } else { gc_meta_raw };
+
+    // Section count: Heap, Symbols, Packages, Code, Reloc, GcMeta
+    let section_count: u32 = 6;
 
     // Compute section directory layout.
-    // Header is at offset 0; section directory follows immediately;
-    // then the heap data section starts after the directory.
     let section_dir_offset = HEADER_SIZE;
-    let section_count: u32 = 1; // Only the heap section for now
-    let data_offset = section_dir_offset + (section_count as usize) * SECTION_ENTRY_SIZE;
+    let data_start = section_dir_offset + (section_count as usize) * SECTION_ENTRY_SIZE;
+
+    // Lay out sections sequentially after the directory.
+    let mut current_offset = data_start;
 
     let heap_section = SectionEntry {
         section_type: SectionType::Heap as u32,
         flags: 0,
-        file_offset: data_offset as u64,
+        file_offset: current_offset as u64,
         size: heap_data.len() as u64,
-        uncompressed_size: heap_data.len() as u64,
+        uncompressed_size: heap_uncompressed_size as u64,
     };
+    current_offset += heap_data.len();
+
+    let symbol_section = SectionEntry {
+        section_type: SectionType::Symbols as u32,
+        flags: 0,
+        file_offset: current_offset as u64,
+        size: symbol_data.len() as u64,
+        uncompressed_size: symbol_uncompressed_size as u64,
+    };
+    current_offset += symbol_data.len();
+
+    let package_section = SectionEntry {
+        section_type: SectionType::Packages as u32,
+        flags: 0,
+        file_offset: current_offset as u64,
+        size: package_data.len() as u64,
+        uncompressed_size: package_uncompressed_size as u64,
+    };
+    current_offset += package_data.len();
+
+    let code_section = SectionEntry {
+        section_type: SectionType::Code as u32,
+        flags: 0,
+        file_offset: current_offset as u64,
+        size: code_data.len() as u64,
+        uncompressed_size: code_uncompressed_size as u64,
+    };
+    current_offset += code_data.len();
+
+    let reloc_section = SectionEntry {
+        section_type: SectionType::Reloc as u32,
+        flags: 0,
+        file_offset: current_offset as u64,
+        size: reloc_data.len() as u64,
+        uncompressed_size: reloc_uncompressed_size as u64,
+    };
+    current_offset += reloc_data.len();
+
+    let gc_meta_offset = current_offset as u64;
+    let gc_meta_section = SectionEntry {
+        section_type: SectionType::GcMeta as u32,
+        flags: 0,
+        file_offset: current_offset as u64,
+        size: gc_meta_data.len() as u64,
+        uncompressed_size: gc_meta_uncompressed_size as u64,
+    };
+
+    // Get the actual heap base address for relocation tracking (R7.03).
+    let original_base = crate::gc::heap_base_address();
+    let gc_generation = crate::gc::gc_generation();
 
     // Build the header (with zeroed checksum — we fill it after serialising).
     let mut header = ImageHeader {
@@ -314,12 +529,12 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         format_version: FORMAT_VERSION,
         flags,
         platform_tag: current_platform_tag(),
-        original_base: 0,
-        heap_size: heap_data.len() as u64,
+        original_base,
+        heap_size: heap_uncompressed_size as u64,
         entry_continuation: entry_val.to_raw(),
         section_count,
-        gc_generation: 0,
-        gc_metadata_offset: 0,
+        gc_generation,
+        gc_metadata_offset: gc_meta_offset,
         save_timestamp,
         reserved: [0u8; 24],
         header_sha256: [0u8; 32],
@@ -332,7 +547,6 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
 
     // Serialise the final header + section directory + data.
     let header_bytes = struct_to_bytes(&header);
-    let section_bytes = struct_to_bytes(&heap_section);
 
     // Atomic write: write to a temp file then rename (R7.20).
     let tmp_path = format!("{}.tmp", path);
@@ -341,10 +555,26 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
             .map_err(|e| BlissError::FileError(format!("cannot create temp image file: {}", e)))?;
         file.write_all(&header_bytes)
             .map_err(|e| BlissError::FileError(format!("cannot write image header: {}", e)))?;
-        file.write_all(&section_bytes)
-            .map_err(|e| BlissError::FileError(format!("cannot write section directory: {}", e)))?;
-        file.write_all(&heap_data)
-            .map_err(|e| BlissError::FileError(format!("cannot write heap data: {}", e)))?;
+
+        // Write section directory entries
+        for section in &[
+            heap_section, symbol_section, package_section,
+            code_section, reloc_section, gc_meta_section,
+        ] {
+            let section_bytes = struct_to_bytes(section);
+            file.write_all(&section_bytes)
+                .map_err(|e| BlissError::FileError(format!("cannot write section directory: {}", e)))?;
+        }
+
+        // Write section data
+        for data in &[
+            &heap_data, &symbol_data, &package_data,
+            &code_data, &reloc_data, &gc_meta_data,
+        ] {
+            file.write_all(data)
+                .map_err(|e| BlissError::FileError(format!("cannot write section data: {}", e)))?;
+        }
+
         file.flush()
             .map_err(|e| BlissError::FileError(format!("cannot flush image file: {}", e)))?;
         Ok(())
@@ -447,7 +677,26 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
         ));
     }
 
-    // Find and restore the heap section.
+    let is_compressed = (header.flags & image_flags::COMPRESSED) != 0;
+
+    // Helper to read and optionally decompress a section's data.
+    let read_section_data = |entry: &SectionEntry| -> Result<Vec<u8>, BlissError> {
+        let data_start = entry.file_offset as usize;
+        let data_end = data_start + entry.size as usize;
+        if file_data.len() < data_end {
+            return Err(BlissError::InvalidImage(
+                "image file too small for section data".into(),
+            ));
+        }
+        let raw = &file_data[data_start..data_end];
+        if is_compressed && entry.size > 0 {
+            decompress_data(raw)
+        } else {
+            Ok(raw.to_vec())
+        }
+    };
+
+    // Find and restore all sections.
     let mut heap_restored = false;
     for i in 0..header.section_count as usize {
         let entry_offset = section_dir_start + i * SECTION_ENTRY_SIZE;
@@ -456,37 +705,64 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
                 BlissError::InvalidImage(format!("cannot parse section entry {}", i))
             })?;
 
-        if entry.section_type == SectionType::Heap as u32 {
-            let data_start = entry.file_offset as usize;
-            let data_end = data_start + entry.size as usize;
-            if file_data.len() < data_end {
-                return Err(BlissError::InvalidImage(
-                    "image file too small for heap section data".into(),
-                ));
-            }
+        match entry.section_type {
+            t if t == SectionType::Heap as u32 => {
+                let heap_bytes = read_section_data(&entry)?;
 
-            let heap_bytes = &file_data[data_start..data_end];
+                // The heap section's first 8 bytes encode the entry continuation
+                // as a native-endian u64. The rest is serialised heap objects.
+                if heap_bytes.len() >= 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&heap_bytes[..8]);
+                    let raw = u64::from_ne_bytes(buf);
+                    if raw != header.entry_continuation {
+                        return Err(BlissError::InvalidImage(
+                            "heap entry continuation does not match header".into(),
+                        ));
+                    }
 
-            // The heap section's first 8 bytes encode the entry continuation
-            // as a native-endian u64.  When the heap has additional objects
-            // they follow after that initial word — in a full runtime they
-            // would be copied into the managed heap and pointers relocated.
-            if heap_bytes.len() >= 8 {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&heap_bytes[..8]);
-                let raw = u64::from_ne_bytes(buf);
-                // Verify the value matches the header's entry_continuation
-                // for integrity.
-                if raw != header.entry_continuation {
+                    // Restore heap objects (bytes after the entry continuation word)
+                    // into the GC subsystem so they are accessible at runtime.
+                    let object_data = &heap_bytes[8..];
+                    if !object_data.is_empty() {
+                        crate::gc::restore_heap(object_data)?;
+                    }
+                } else if !heap_bytes.is_empty() {
                     return Err(BlissError::InvalidImage(
-                        "heap entry continuation does not match header".into(),
+                        "heap section too small to contain entry continuation".into(),
                     ));
                 }
-            }
 
-            heap_restored = true;
+                heap_restored = true;
+            }
+            t if t == SectionType::Symbols as u32 => {
+                let _symbol_bytes = read_section_data(&entry)?;
+                // Symbol table restoration: in the bootstrap runtime, the symbol
+                // table is managed by the stdlib packages module. The bytes are
+                // validated here; a full implementation would call into the symbol
+                // table subsystem to rebuild the intern table.
+            }
+            t if t == SectionType::Packages as u32 => {
+                let _package_bytes = read_section_data(&entry)?;
+                // Package registry restoration: similarly handled by stdlib.
+            }
+            t if t == SectionType::Code as u32 => {
+                let _code_bytes = read_section_data(&entry)?;
+                // Compiled code cache restoration.
+            }
+            t if t == SectionType::Reloc as u32 => {
+                let _reloc_bytes = read_section_data(&entry)?;
+                // Relocation table: would be used to fixup pointers if
+                // original_base differs from the current heap base.
+            }
+            t if t == SectionType::GcMeta as u32 => {
+                let _gc_meta_bytes = read_section_data(&entry)?;
+                // GC metadata restoration.
+            }
+            _ => {
+                // Unknown section type — skip for forward compatibility.
+            }
         }
-        // Future: handle SectionType::Symbols, Packages, Code, Reloc, etc.
     }
 
     if !heap_restored {

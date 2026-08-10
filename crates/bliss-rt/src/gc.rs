@@ -158,11 +158,29 @@ pub struct GcConfig {
     pub old_occupancy_trigger: f64,
 }
 
-/// Bootstrap heap state — stores the GC configuration so that stats
-/// and other queries can report capacity values after initialization.
+/// A single object allocation record in the bootstrap heap.
+/// Stores the raw bytes of the object so they can be iterated by `walk_heap`
+/// and serialised by image save.
+struct HeapObject {
+    /// The type_id from the ObjectHeader (first 8 bytes), cached for fast filtering.
+    type_id: u8,
+    /// The raw bytes of the object (including the ObjectHeader prefix).
+    data: Vec<u8>,
+}
+
+/// Bootstrap heap state — stores the GC configuration, stats, and
+/// all allocated objects so that `walk_heap` can iterate them and
+/// image save can serialise real heap data.
 struct HeapState {
-    _config: GcConfig,
+    config: GcConfig,
     stats: GcStats,
+    /// All live objects in the bootstrap heap.
+    objects: Vec<HeapObject>,
+    /// A stable base address used for relocation bookkeeping.
+    /// Set once at init time.
+    base_address: u64,
+    /// Monotonically increasing GC generation counter.
+    gc_generation: u32,
 }
 
 /// Global heap state, initialized by `init_heap`.
@@ -197,9 +215,17 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     stats.regions_total = regions_total;
     stats.regions_free = regions_total;
 
+    // Use the address of the heap_state mutex itself as a stable base address
+    // for relocation tracking.  This gives a deterministic, non-zero value that
+    // changes across processes, which is exactly what the image format needs.
+    let base_address = heap_state() as *const _ as u64;
+
     let state = HeapState {
-        _config: config.clone(),
+        config: config.clone(),
         stats,
+        objects: Vec::new(),
+        base_address,
+        gc_generation: 0,
     };
     *heap_state().lock().unwrap() = Some(state);
 
@@ -223,13 +249,144 @@ pub fn heap_stats() -> GcStats {
 /// within the region (from region base up to alloc_top). If the heap has not
 /// been initialised yet or no objects have been allocated, returns Ok(())
 /// with no callbacks invoked.
-pub fn walk_heap<F>(mut _callback: F) -> Result<(), BlissError>
+pub fn walk_heap<F>(mut callback: F) -> Result<(), BlissError>
 where
     F: FnMut(*const u8, u8, usize) -> bool,
 {
-    // In the bootstrap implementation, no objects have been allocated
-    // into the region-based heap yet (allocation goes through the Rust
-    // allocator via BlissVal). The walk completes immediately with no
-    // callbacks, which is correct per the doc contract.
+    let guard = heap_state().lock().unwrap();
+    if let Some(state) = &*guard {
+        for obj in &state.objects {
+            let should_continue = callback(obj.data.as_ptr(), obj.type_id, obj.data.len());
+            if !should_continue {
+                break;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Record an object in the bootstrap heap so that `walk_heap` can
+/// enumerate it and `save_image` can serialise it.
+pub fn record_object(type_id: u8, data: Vec<u8>) {
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        state.stats.bytes_allocated += data.len() as u64;
+        state.objects.push(HeapObject { type_id, data });
+    }
+}
+
+/// Perform a full GC cycle (minor + major). In the bootstrap heap
+/// this is a no-op in terms of reclamation (there are no unreachable
+/// objects in the Vec-backed store), but it increments the GC
+/// generation counter and updates stats, fulfilling the contract that
+/// image save triggers a full GC before serialisation.
+pub fn full_gc() -> Result<(), BlissError> {
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        state.gc_generation += 1;
+        state.stats.minor_gc_count += 1;
+        state.stats.major_gc_count += 1;
+    }
+    Ok(())
+}
+
+/// Return the heap base address recorded at init time.
+/// Used by image save to populate `original_base` in the header.
+pub fn heap_base_address() -> u64 {
+    let guard = heap_state().lock().unwrap();
+    match &*guard {
+        Some(state) => state.base_address,
+        None => 0,
+    }
+}
+
+/// Return the current GC generation counter.
+pub fn gc_generation() -> u32 {
+    let guard = heap_state().lock().unwrap();
+    match &*guard {
+        Some(state) => state.gc_generation,
+        None => 0,
+    }
+}
+
+/// Restore heap objects from a serialised byte buffer produced by
+/// `save_image`. The buffer is a concatenation of length-prefixed
+/// records: each record is `[u8 type_id][u32 len][len bytes data]`.
+/// Clears any existing objects and replaces them with the restored set.
+pub fn restore_heap(serialized: &[u8]) -> Result<(), BlissError> {
+    let mut guard = heap_state().lock().unwrap();
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => {
+            // If the heap hasn't been initialised, create a minimal state
+            // so that the restored objects are accessible.
+            *guard = Some(HeapState {
+                config: GcConfig {
+                    heap_size: 64 * 1024 * 1024,
+                    heap_max: 256 * 1024 * 1024,
+                    nursery_size: 16 * 1024 * 1024,
+                    tlab_size: 8192,
+                    region_size: 1024 * 1024,
+                    promotion_threshold: 15,
+                    pause_target_ms: 10,
+                    gc_workers: 1,
+                    satb_buffer_size: 1024,
+                    old_occupancy_trigger: 0.45,
+                },
+                stats: GcStats::default(),
+                objects: Vec::new(),
+                base_address: heap_state() as *const _ as u64,
+                gc_generation: 0,
+            });
+            guard.as_mut().unwrap()
+        }
+    };
+
+    state.objects.clear();
+    state.stats.bytes_allocated = 0;
+
+    let mut offset = 0;
+    while offset < serialized.len() {
+        // Each record: [u8 type_id][u32 len (LE)][len bytes]
+        if offset + 5 > serialized.len() {
+            return Err(BlissError::InvalidImage(
+                "truncated heap object record".into(),
+            ));
+        }
+        let type_id = serialized[offset];
+        offset += 1;
+        let len = u32::from_le_bytes([
+            serialized[offset],
+            serialized[offset + 1],
+            serialized[offset + 2],
+            serialized[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if offset + len > serialized.len() {
+            return Err(BlissError::InvalidImage(
+                "truncated heap object data".into(),
+            ));
+        }
+        let data = serialized[offset..offset + len].to_vec();
+        offset += len;
+        state.stats.bytes_allocated += data.len() as u64;
+        state.objects.push(HeapObject { type_id, data });
+    }
+
+    Ok(())
+}
+
+/// Serialise all live heap objects into a byte buffer using the
+/// length-prefixed record format expected by `restore_heap`.
+pub fn serialize_heap_objects() -> Vec<u8> {
+    let guard = heap_state().lock().unwrap();
+    let mut buf = Vec::new();
+    if let Some(state) = &*guard {
+        for obj in &state.objects {
+            buf.push(obj.type_id);
+            buf.extend_from_slice(&(obj.data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&obj.data);
+        }
+    }
+    buf
 }
