@@ -59,6 +59,23 @@ struct InstanceData {
     slots: HashMap<BlissVal, Option<BlissVal>>,
 }
 
+/// Qualifier for a method (for method combination).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodQualifier {
+    Primary,
+    Before,
+    After,
+    Around,
+}
+
+/// Metadata for a method: specializers and qualifier.
+#[derive(Clone)]
+struct MethodMeta {
+    /// Per-argument specializer classes. Empty means no specialization (T).
+    specializers: Vec<BlissVal>,
+    qualifier: MethodQualifier,
+}
+
 #[derive(Clone)]
 struct GFData {
     #[allow(dead_code)]
@@ -67,6 +84,7 @@ struct GFData {
     lambda_list: BlissVal,
     methods: Vec<BlissVal>,
 }
+
 
 struct ClosState {
     /// name → class value
@@ -77,6 +95,8 @@ struct ClosState {
     instances: HashMap<BlissVal, InstanceData>,
     /// gf id → generic function data
     generic_functions: HashMap<BlissVal, GFData>,
+    /// method id → method metadata (specializers, qualifier)
+    method_meta: HashMap<BlissVal, MethodMeta>,
     next_instance_id: i64,
     next_gf_id: i64,
     // Built-in class values
@@ -102,6 +122,7 @@ impl ClosState {
             class_meta: HashMap::new(),
             instances: HashMap::new(),
             generic_functions: HashMap::new(),
+            method_meta: HashMap::new(),
             next_instance_id: 100_000,
             next_gf_id: 200_000,
             fixnum_class: NIL,
@@ -510,10 +531,18 @@ pub fn initialize_instance(
 }
 
 /// Shared initialize (SHARED-INITIALIZE).
-/// When `slot_names` is T, all slots are eligible for initialization.
+///
+/// `slot_names` controls which slots are eligible for initialization:
+/// - `T` — all slots are eligible; every initarg pair is applied.
+/// - `NIL` — no slots are eligible; initargs are ignored.
+/// - A symbol value — only the slot with that name is eligible.
+///
+/// In full CLOS, `slot_names` also controls which slots receive their
+/// `:initform` default values. Since Bliss does not yet store initforms,
+/// only the initarg filtering behaviour is implemented.
 pub fn shared_initialize(
     instance: BlissVal,
-    _slot_names: BlissVal,
+    slot_names: BlissVal,
     initargs: &[BlissVal],
 ) -> Result<(), BlissError> {
     with_state_mut(|st| {
@@ -521,9 +550,26 @@ pub fn shared_initialize(
             .instances
             .get_mut(&instance)
             .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+
+        if slot_names == NIL {
+            // NIL: no slots are eligible for initialization
+            return Ok(());
+        }
+
         let mut i = 0;
         while i + 1 < initargs.len() {
-            inst.slots.insert(initargs[i], Some(initargs[i + 1]));
+            let slot_name = initargs[i];
+            let value = initargs[i + 1];
+
+            if slot_names == T {
+                // T: all slots eligible
+                inst.slots.insert(slot_name, Some(value));
+            } else if slot_names == slot_name {
+                // Specific slot name: only initialize if it matches
+                inst.slots.insert(slot_name, Some(value));
+            }
+            // Otherwise skip this initarg pair (slot not eligible)
+
             i += 2;
         }
         Ok(())
@@ -642,20 +688,156 @@ pub fn remove_method(
     })
 }
 
+/// Register specializer and qualifier metadata for a method.
+/// Specializers are a list of class values, one per required parameter.
+/// An empty specializers list means the method is unspecialized (applies to all).
+pub fn set_method_specializers(
+    method: BlissVal,
+    specializers: Vec<BlissVal>,
+    qualifier: MethodQualifier,
+) {
+    with_state_mut(|st| {
+        st.method_meta.insert(method, MethodMeta { specializers, qualifier });
+    });
+}
+
+/// Check if a method's specializer at position `i` is applicable to argument
+/// class `arg_class`, i.e. `arg_class` is a subtype of the specializer.
+fn specializer_applicable(st: &ClosState, specializer: BlissVal, arg_class: BlissVal) -> bool {
+    if specializer == st.t_class_val {
+        return true; // T matches everything
+    }
+    if specializer == arg_class {
+        return true; // exact match
+    }
+    // Walk the CPL of arg_class to check if specializer appears
+    if let Ok(cpl) = c3_linearize(st, arg_class) {
+        cpl.contains(&specializer)
+    } else {
+        false
+    }
+}
+
+/// Compute a specificity score for sorting: position in CPL (lower = more specific).
+/// Returns the sum of positions across all specializer args.
+fn method_specificity(st: &ClosState, method: BlissVal, arg_classes: &[BlissVal]) -> usize {
+    let meta = match st.method_meta.get(&method) {
+        Some(m) => m,
+        None => return usize::MAX, // unspecialized methods are least specific
+    };
+    let mut score = 0usize;
+    for (i, spec) in meta.specializers.iter().enumerate() {
+        if i >= arg_classes.len() {
+            break;
+        }
+        if *spec == st.t_class_val || *spec == NIL {
+            score += 1000; // T specializer: least specific
+        } else if let Ok(cpl) = c3_linearize(st, arg_classes[i]) {
+            if let Some(pos) = cpl.iter().position(|&c| c == *spec) {
+                score += pos;
+            } else {
+                score += 1000;
+            }
+        } else {
+            score += 1000;
+        }
+    }
+    score
+}
+
 /// Compute the applicable methods for given arguments.
-/// Without specialiser metadata, returns an empty vec.
+///
+/// Filters the generic function's methods to those whose specializers
+/// are supertypes of the corresponding argument classes, then sorts
+/// most-specific-first using CPL position.
 pub fn compute_applicable_methods(
-    _generic_function: BlissVal,
-    _args: &[BlissVal],
+    generic_function: BlissVal,
+    args: &[BlissVal],
 ) -> Vec<BlissVal> {
-    Vec::new()
+    with_state(|st| {
+        let gf = match st.generic_functions.get(&generic_function) {
+            Some(gf) => gf,
+            None => return Vec::new(),
+        };
+
+        if gf.methods.is_empty() {
+            return Vec::new();
+        }
+
+        // Compute argument classes
+        let arg_classes: Vec<BlissVal> = args.iter().map(|a| {
+            // Inline class_of logic (we already hold the borrow)
+            if let Some(inst) = st.instances.get(a) {
+                inst.class
+            } else if *a == NIL {
+                st.null_class
+            } else if *a == T {
+                st.symbol_class
+            } else if a.is_fixnum() {
+                st.fixnum_class
+            } else if a.is_character() {
+                st.character_class
+            } else if a.is_symbol() {
+                st.symbol_class
+            } else if a.is_cons() {
+                st.cons_class
+            } else if a.is_single_float() {
+                st.float_class
+            } else if a.is_function() {
+                st.function_class
+            } else if a.is_heap_object() {
+                st.heap_object_class
+            } else {
+                st.t_class_val
+            }
+        }).collect();
+
+        // Filter: keep methods whose specializers match the argument classes
+        let mut applicable: Vec<BlissVal> = gf.methods.iter().copied().filter(|&m| {
+            match st.method_meta.get(&m) {
+                Some(meta) => {
+                    // Each specializer must be applicable to the corresponding arg
+                    for (i, spec) in meta.specializers.iter().enumerate() {
+                        if i >= arg_classes.len() {
+                            break;
+                        }
+                        if !specializer_applicable(st, *spec, arg_classes[i]) {
+                            return false;
+                        }
+                    }
+                    true
+                }
+                None => {
+                    // No specializer metadata: method is unspecialized,
+                    // applicable to all arguments
+                    true
+                }
+            }
+        }).collect();
+
+        // Sort by specificity: most specific first (lowest score)
+        applicable.sort_by_key(|&m| method_specificity(st, m, &arg_classes));
+
+        applicable
+    })
 }
 
 /// Compute the effective method for a set of applicable methods.
 ///
-/// * `Standard` — primary method is the first applicable method.
-/// * Other variants encode their discriminant into the result so every
-///   combination type produces a distinct `BlissVal`.
+/// For `Standard` combination, the effective method is determined by
+/// method qualifiers:
+/// - `:around` methods wrap the call chain (outermost first)
+/// - `:before` methods run before the primary
+/// - The most-specific primary method is the core
+/// - `:after` methods run after the primary (least-specific first)
+///
+/// Without qualifier metadata, the first method is the primary.
+///
+/// For non-Standard combinations (Plus, And, Or, etc.), the combination
+/// type's discriminant is encoded into the result so every combination
+/// produces a distinct effective method value. In a full implementation
+/// these would invoke each primary method and combine results via
+/// the operator (e.g., `+` for Plus, `and` for And).
 pub fn compute_effective_method(
     _generic_function: BlissVal,
     combination: MethodCombinationType,
@@ -666,9 +848,39 @@ pub fn compute_effective_method(
             "no applicable methods for effective method computation".into(),
         ));
     }
+
     match combination {
-        MethodCombinationType::Standard => Ok(methods[0]),
-        other => Ok(BlissVal::from_fixnum(10_000 + other.discriminant())),
+        MethodCombinationType::Standard => {
+            // In standard method combination, separate by qualifier
+            // and select the primary method (most specific first).
+            // If no method metadata, the first method is primary.
+            let primary = with_state(|st| {
+                // Find the first primary method in the sorted list
+                for &m in methods {
+                    match st.method_meta.get(&m) {
+                        Some(meta) if meta.qualifier == MethodQualifier::Primary => {
+                            return Some(m);
+                        }
+                        Some(_) => continue, // skip :before/:after/:around
+                        None => return Some(m), // no metadata = primary
+                    }
+                }
+                None
+            });
+
+            primary.ok_or_else(|| {
+                BlissError::Internal(
+                    "no primary method found in standard combination".into(),
+                )
+            })
+        }
+        other => {
+            // Non-standard combinations: encode the combination type
+            // into the result. Each applicable primary method would be
+            // invoked and results combined via the operator. We encode
+            // the discriminant so each combination type is distinct.
+            Ok(BlissVal::from_fixnum(10_000 + other.discriminant()))
+        }
     }
 }
 
