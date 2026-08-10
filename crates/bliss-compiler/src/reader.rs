@@ -360,9 +360,15 @@ fn read_token_with_base(
             Ok((make_list(&[qq_sym, val]), p))
         }
         ',' => {
-            let (val, p) = read_token_with_base(chars, pos + 1, labels, read_base, read_eval)?;
-            let uq_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE"));
-            Ok((make_list(&[uq_sym, val]), p))
+            if pos + 1 < chars.len() && chars[pos + 1] == '@' {
+                let (val, p) = read_token_with_base(chars, pos + 2, labels, read_base, read_eval)?;
+                let uqs_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE-SPLICING"));
+                Ok((make_list(&[uqs_sym, val]), p))
+            } else {
+                let (val, p) = read_token_with_base(chars, pos + 1, labels, read_base, read_eval)?;
+                let uq_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE"));
+                Ok((make_list(&[uq_sym, val]), p))
+            }
         }
         '#' => read_sharpsign_with_base(chars, pos + 1, labels, read_base, read_eval),
         _ => read_atom_with_base(chars, pos, read_base),

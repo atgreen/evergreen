@@ -8,6 +8,7 @@ use bliss_rt::value::{BlissVal, EOF, NIL, T, TAG_HEAP_OBJECT};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 // ── CLI arguments ──────────────────────────────────────────────────
 #[derive(Clone, Debug)]
@@ -58,13 +59,41 @@ impl CliArgs {
 }
 
 // ── Arena allocator (replaces Box::leak) ─────────────────────────
-// A simple bump allocator that collects all allocations and frees them on drop.
+// A bump allocator that collects all allocations and frees them on drop.
+// Uses a generational scheme: blocks can be promoted to a "permanent" set
+// that survives arena compaction, while temporary blocks are freed.
 struct Arena {
     blocks: Vec<(*mut u8, std::alloc::Layout)>,
+    /// Permanent blocks that survive compaction (referenced by the environment)
+    permanent: Vec<(*mut u8, std::alloc::Layout)>,
+    /// Threshold: when blocks exceed this count, a compaction is suggested
+    compaction_threshold: usize,
 }
 
 impl Arena {
-    fn new() -> Self { Arena { blocks: Vec::new() } }
+    fn new() -> Self { Arena { blocks: Vec::new(), permanent: Vec::new(), compaction_threshold: 10000 } }
+
+    /// Promote all current blocks to permanent status.
+    /// Call this after loading an image or defining persistent functions
+    /// so those allocations survive future compaction.
+    fn promote_all(&mut self) {
+        self.permanent.append(&mut self.blocks);
+    }
+
+    /// Free all non-permanent blocks. This reclaims memory from temporary
+    /// allocations (e.g., intermediate eval results in the REPL).
+    /// SAFETY: Caller must ensure no references to non-permanent blocks exist.
+    fn compact(&mut self) {
+        for &(ptr, layout) in &self.blocks {
+            unsafe { std::alloc::dealloc(ptr, layout); }
+        }
+        self.blocks.clear();
+    }
+
+    /// Returns true if the number of temporary blocks exceeds the threshold
+    fn should_compact(&self) -> bool {
+        self.blocks.len() > self.compaction_threshold
+    }
 
     fn alloc_cons(&mut self, car: BlissVal, cdr: BlissVal) -> BlissVal {
         let layout = std::alloc::Layout::new::<ConsCell>();
@@ -100,6 +129,9 @@ impl Drop for Arena {
         for &(ptr, layout) in &self.blocks {
             unsafe { std::alloc::dealloc(ptr, layout); }
         }
+        for &(ptr, layout) in &self.permanent {
+            unsafe { std::alloc::dealloc(ptr, layout); }
+        }
     }
 }
 
@@ -116,21 +148,131 @@ fn arena_str(s: &str) -> BlissVal {
     ARENA.with(|a| a.borrow_mut().alloc_str(s))
 }
 
+// ── Stream tracking for file I/O ─────────────────────────────────
+#[derive(Clone, Debug)]
+enum StreamDirection { Input, Output }
+
+#[derive(Clone, Debug)]
+struct StreamState {
+    content: String,
+    position: usize,
+    direction: StreamDirection,
+    path: String,
+    buffer: String,
+}
+
+thread_local! {
+    static STREAMS: RefCell<HashMap<u64, StreamState>> = RefCell::new(HashMap::new());
+    static NEXT_STREAM_ID: RefCell<u64> = RefCell::new(1);
+}
+
+fn open_stream(path: &str, direction: StreamDirection) -> Result<BlissVal, BlissError> {
+    let state = match direction {
+        StreamDirection::Input => {
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| BlissError::FileError(format!("cannot open {}: {}", path, e)))?;
+            StreamState { content, position: 0, direction, path: path.to_string(), buffer: String::new() }
+        }
+        StreamDirection::Output => {
+            StreamState { content: String::new(), position: 0, direction, path: path.to_string(), buffer: String::new() }
+        }
+    };
+    let id = NEXT_STREAM_ID.with(|c| { let v = *c.borrow(); *c.borrow_mut() = v + 1; v });
+    STREAMS.with(|s| s.borrow_mut().insert(id, state));
+    // Represent stream as a tagged fixnum with high bit set to distinguish from regular fixnums
+    Ok(BlissVal::from_fixnum(-(id as i64)))
+}
+
+fn close_stream(stream_val: BlissVal) -> Result<(), BlissError> {
+    if !stream_val.is_fixnum() { return Ok(()); }
+    let id = (-stream_val.as_fixnum()) as u64;
+    STREAMS.with(|s| {
+        if let Some(state) = s.borrow_mut().remove(&id) {
+            if matches!(state.direction, StreamDirection::Output) {
+                std::fs::write(&state.path, &state.buffer)
+                    .map_err(|e| BlissError::FileError(format!("cannot write {}: {}", state.path, e)))?;
+            }
+            Ok(())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn is_stream(val: BlissVal) -> bool {
+    val.is_fixnum() && val.as_fixnum() < 0
+}
+
+fn stream_read_line(stream_val: BlissVal) -> Result<(String, bool), BlissError> {
+    if !is_stream(stream_val) {
+        return Err(BlissError::StreamError("not a stream".into()));
+    }
+    let id = (-stream_val.as_fixnum()) as u64;
+    STREAMS.with(|s| {
+        let mut streams = s.borrow_mut();
+        if let Some(state) = streams.get_mut(&id) {
+            if state.position >= state.content.len() {
+                return Ok(("".to_string(), true)); // EOF
+            }
+            let remaining = &state.content[state.position..];
+            if let Some(newline_pos) = remaining.find('\n') {
+                let line = remaining[..newline_pos].to_string();
+                state.position += newline_pos + 1;
+                Ok((line, false))
+            } else {
+                let line = remaining.to_string();
+                state.position = state.content.len();
+                Ok((line, true))
+            }
+        } else {
+            Err(BlissError::StreamError("stream not open".into()))
+        }
+    })
+}
+
+fn stream_write_string(stream_val: BlissVal, s: &str) -> Result<(), BlissError> {
+    if !is_stream(stream_val) {
+        return Err(BlissError::StreamError("not a stream".into()));
+    }
+    let id = (-stream_val.as_fixnum()) as u64;
+    STREAMS.with(|streams| {
+        let mut streams = streams.borrow_mut();
+        if let Some(state) = streams.get_mut(&id) {
+            state.buffer.push_str(s);
+            Ok(())
+        } else {
+            Err(BlissError::StreamError("stream not open".into()))
+        }
+    })
+}
+
+// ── Closure representation ───────────────────────────────────────
+#[derive(Clone)]
+struct Closure {
+    params: Vec<String>,
+    body: BlissVal,
+    captured_vars: HashMap<String, BlissVal>,
+}
+
 // ── Environment for variable/function bindings ───────────────────
+// Uses Rc for global definitions (funs, macros, classes, methods, packages)
+// so that child() only clones the local vars HashMap, not the entire env.
 #[derive(Clone)]
 struct Env {
     vars: HashMap<String, BlissVal>,
-    funs: HashMap<String, FunDef>,
-    macros: HashMap<String, MacroDef>,
-    classes: HashMap<String, ClassDef>,
-    methods: HashMap<String, Vec<MethodDef>>,
-    packages: HashMap<String, PackageDef>,
+    funs: Rc<HashMap<String, FunDef>>,
+    macros: Rc<HashMap<String, MacroDef>>,
+    classes: Rc<HashMap<String, ClassDef>>,
+    methods: Rc<HashMap<String, Vec<MethodDef>>>,
+    packages: Rc<HashMap<String, PackageDef>>,
     current_package: String,
     sandbox: bool,
     restarts: Vec<RestartEntry>,
     handlers: Vec<HandlerEntry>,
     /// Multiple values from last (values ...) or (floor ...) call
     mv: Vec<BlissVal>,
+    /// Closures stored by name or lambda id
+    closures: Rc<HashMap<u64, Closure>>,
 }
 
 #[derive(Clone)]
@@ -178,6 +320,14 @@ struct PackageDef {
 #[derive(Clone)]
 struct RestartEntry {
     name: String,
+    body: Option<BlissVal>, // form to evaluate when restart is invoked
+}
+
+/// Sentinel error used for non-local control flow when invoke-restart is called.
+#[derive(Debug)]
+struct RestartInvoked {
+    name: String,
+    result: BlissVal,
 }
 
 #[derive(Clone)]
@@ -190,21 +340,37 @@ impl Env {
     fn new(sandbox: bool) -> Self {
         Env {
             vars: HashMap::new(),
-            funs: HashMap::new(),
-            macros: HashMap::new(),
-            classes: HashMap::new(),
-            methods: HashMap::new(),
-            packages: HashMap::new(),
+            funs: Rc::new(HashMap::new()),
+            macros: Rc::new(HashMap::new()),
+            classes: Rc::new(HashMap::new()),
+            methods: Rc::new(HashMap::new()),
+            packages: Rc::new(HashMap::new()),
             current_package: "CL-USER".to_string(),
             sandbox,
             restarts: Vec::new(),
             handlers: Vec::new(),
             mv: Vec::new(),
+            closures: Rc::new(HashMap::new()),
         }
     }
 
+    /// Create a child environment that shares global definitions (funs, macros,
+    /// classes, methods, packages) via Rc and only clones local vars.
     fn child(&self) -> Self {
-        self.clone()
+        Env {
+            vars: self.vars.clone(),
+            funs: Rc::clone(&self.funs),
+            macros: Rc::clone(&self.macros),
+            classes: Rc::clone(&self.classes),
+            methods: Rc::clone(&self.methods),
+            packages: Rc::clone(&self.packages),
+            current_package: self.current_package.clone(),
+            sandbox: self.sandbox,
+            restarts: self.restarts.clone(),
+            handlers: self.handlers.clone(),
+            mv: self.mv.clone(),
+            closures: Rc::clone(&self.closures),
+        }
     }
 }
 
@@ -325,6 +491,72 @@ fn vec_to_list(elems: &[BlissVal]) -> BlissVal {
     result
 }
 
+// ── Quasiquote expansion ─────────────────────────────────────────
+/// Expand a quasiquote template, substituting BLISS::UNQUOTE forms with
+/// their evaluated values and splicing BLISS::UNQUOTE-SPLICING forms.
+fn eval_quasiquote(template: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    // If template is not a cons, return it as-is (like quote)
+    if !template.is_cons() {
+        return Ok(template);
+    }
+    let (car, cdr) = cp(template);
+
+    // Check if template is (BLISS::UNQUOTE expr)
+    if car.is_symbol() && sym_name(car) == "BLISS::UNQUOTE" {
+        let (expr, _) = cp(cdr);
+        return eval_form(expr, env);
+    }
+
+    // Check if template is (BLISS::UNQUOTE-SPLICING expr) at top level — error
+    if car.is_symbol() && sym_name(car) == "BLISS::UNQUOTE-SPLICING" {
+        return Err(BlissError::Internal(",@ not inside a list".into()));
+    }
+
+    // Recursively process each element of the list, handling splicing
+    let mut result_elems: Vec<BlissVal> = Vec::new();
+    let mut cur = template;
+    while cur.is_cons() {
+        let (elem, rest) = cp(cur);
+        // Check if elem is (BLISS::UNQUOTE-SPLICING expr)
+        if elem.is_cons() {
+            let (ecar, ecdr) = cp(elem);
+            if ecar.is_symbol() && sym_name(ecar) == "BLISS::UNQUOTE-SPLICING" {
+                let (splice_expr, _) = cp(ecdr);
+                let splice_val = eval_form(splice_expr, env)?;
+                // Splice the list into the result
+                let spliced = list_to_vec(splice_val);
+                result_elems.extend(spliced);
+                cur = rest;
+                continue;
+            }
+        }
+        // Regular element — recursively expand
+        let expanded = eval_quasiquote(elem, env)?;
+        result_elems.push(expanded);
+        cur = rest;
+    }
+    // Handle dotted pair tail
+    if !cur.is_nil() {
+        let expanded_tail = eval_quasiquote(cur, env)?;
+        // Build from the back with the non-nil tail
+        let mut result = expanded_tail;
+        for e in result_elems.iter().rev() {
+            result = arena_cons(*e, result);
+        }
+        return Ok(result);
+    }
+    Ok(vec_to_list(&result_elems))
+}
+
+// ── Closure ID generation ────────────────────────────────────────
+thread_local! {
+    static NEXT_CLOSURE_ID: RefCell<u64> = RefCell::new(1);
+}
+
+fn next_closure_id() -> u64 {
+    NEXT_CLOSURE_ID.with(|c| { let v = *c.borrow(); *c.borrow_mut() = v + 1; v })
+}
+
 // ── Minimal bootstrap evaluator ───────────────────────────────────
 fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     let chars: Vec<char> = source.chars().collect();
@@ -383,6 +615,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
         match name.as_str() {
             "QUOTE" => { let (q, _) = cp(cdr); return Ok(q); }
+            "BLISS::QUASIQUOTE" => {
+                let (template, _) = cp(cdr);
+                return eval_quasiquote(template, env);
+            }
             "IF" => {
                 let (test, r) = cp(cdr); let tv = eval_form(test, env)?;
                 let (then, er) = cp(r);
@@ -585,14 +821,40 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         return Ok(name_form); // return the symbol as a function designator
                     }
                 }
-                // Could be (function (lambda ...))
+                // (function (lambda (params) body...)) — create a closure
                 if name_form.is_cons() {
-                    let (lh, _) = cp(name_form);
+                    let (lh, lr) = cp(name_form);
                     if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
-                        return Ok(name_form); // return lambda form
+                        let (params_form, body) = cp(lr);
+                        let params = extract_params(params_form);
+                        // Capture the current lexical environment
+                        let closure = Closure {
+                            params: params.clone(),
+                            body,
+                            captured_vars: env.vars.clone(),
+                        };
+                        let id = next_closure_id();
+                        Rc::make_mut(&mut env.closures).insert(id, closure);
+                        // Return a tagged closure reference as (BLISS::CLOSURE . id)
+                        let closure_sym = resolve_sym("BLISS::CLOSURE").unwrap_or(NIL);
+                        return Ok(arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)));
                     }
                 }
                 return Ok(name_form);
+            }
+            "LAMBDA" => {
+                // Bare (lambda (params) body...) — create a closure
+                let (params_form, body) = cp(cdr);
+                let params = extract_params(params_form);
+                let closure = Closure {
+                    params: params.clone(),
+                    body,
+                    captured_vars: env.vars.clone(),
+                };
+                let id = next_closure_id();
+                Rc::make_mut(&mut env.closures).insert(id, closure);
+                let closure_sym = resolve_sym("BLISS::CLOSURE").unwrap_or(NIL);
+                return Ok(arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)));
             }
             "FUNCALL" => {
                 let (fn_form, args_form) = cp(cdr);
@@ -819,41 +1081,110 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "HANDLER-CASE" => return eval_handler_case(cdr, env),
             "HANDLER-BIND" => return eval_handler_bind(cdr, env),
             "SIGNAL" => {
-                let (cf, _) = cp(cdr);
-                let _cond = eval_form(cf, env)?;
+                let args = list_to_vec(cdr);
+                if args.is_empty() { return Err(BlissError::Internal("SIGNAL requires an argument".into())); }
+                let cond = eval_form(args[0], env)?;
+                // Determine condition type name
+                let cond_type = if cond.is_cons() {
+                    // Condition object: (TYPE-NAME (slot . val) ...)
+                    let (type_val, _) = cp(cond);
+                    val_as_str(type_val)
+                } else if cond.is_symbol() {
+                    sym_name(cond)
+                } else {
+                    val_as_str(cond.clone())
+                };
                 // Signal runs handlers; if no handler catches, returns NIL
                 for handler in env.handlers.clone().iter().rev() {
-                    if handler.type_name == "ERROR" || handler.type_name == "CONDITION" {
+                    if handler.type_name == cond_type
+                        || handler.type_name == "CONDITION"
+                        || handler.type_name == "ERROR"
+                        || handler.type_name == "T" {
                         let hfn = handler.handler.clone();
-                        let arg = arena_str("condition");
-                        let _ = apply_function(hfn, &[arg], env);
+                        let _ = apply_function(hfn, &[cond], env);
                     }
                 }
                 return Ok(NIL);
             }
             "MAKE-CONDITION" => {
-                let (type_form, _) = cp(cdr);
-                let _type_val = eval_form(type_form, env)?;
-                // Return a string representing the condition
-                return Ok(arena_str("condition"));
+                // (make-condition 'type :slot1 val1 :slot2 val2 ...)
+                let args = list_to_vec(cdr);
+                if args.is_empty() { return Err(BlissError::Internal("MAKE-CONDITION requires a type".into())); }
+                let type_val = eval_form(args[0], env)?;
+                let type_name = val_as_str(type_val);
+                // Build condition object as (TYPE-NAME (slot . val) ...)
+                let mut slot_pairs = Vec::new();
+                let mut i = 1;
+                while i + 1 < args.len() {
+                    let key = eval_form(args[i], env)?;
+                    let val = eval_form(args[i + 1], env)?;
+                    slot_pairs.push(arena_cons(key, val));
+                    i += 2;
+                }
+                let type_name_val = arena_str(&type_name);
+                let mut result = vec_to_list(&slot_pairs);
+                result = arena_cons(type_name_val, result);
+                return Ok(result);
             }
             "CERROR" => return eval_cerror(cdr, env),
             "INVOKE-RESTART" => {
-                let (name_form, _) = cp(cdr);
-                let _name = eval_form(name_form, env)?;
-                // Invoke-restart: if restart 'CONTINUE exists, just return NIL
-                return Ok(NIL);
+                let (name_form, rest_args) = cp(cdr);
+                let name_val = eval_form(name_form, env)?;
+                let restart_name = val_as_str(name_val).to_uppercase();
+                // Look up the restart by name in the restart stack
+                for restart in env.restarts.iter().rev() {
+                    if restart.name == restart_name {
+                        // If restart has a body, evaluate it
+                        if let Some(body) = restart.body {
+                            let result = eval_progn(body, env)?;
+                            return Ok(result);
+                        }
+                        // Otherwise (e.g., CONTINUE restart from cerror), just return NIL
+                        // Signal the restart was invoked via a special error
+                        return Err(BlissError::Internal(format!("__RESTART_INVOKED__:{}", restart_name)));
+                    }
+                }
+                return Err(BlissError::Internal(format!("Restart {} not found", restart_name)));
             }
             "WITH-OPEN-FILE" => return eval_with_open_file(cdr, env),
             "READ-LINE" => {
-                let (stream_form, _) = cp(cdr);
-                let _stream = eval_form(stream_form, env)?;
-                // Bootstrap: read from stdin
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)
-                    .map_err(|e| BlissError::StreamError(format!("read-line: {}", e)))?;
-                let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-                return Ok(arena_str(trimmed));
+                let args = list_to_vec(cdr);
+                let stream = if !args.is_empty() {
+                    eval_form(args[0], env)?
+                } else {
+                    NIL // stdin
+                };
+                if is_stream(stream) {
+                    // Read from file stream
+                    let (line, eof) = stream_read_line(stream)?;
+                    if eof && line.is_empty() {
+                        return Ok(NIL);
+                    }
+                    env.mv = vec![arena_str(&line), if eof { T } else { NIL }];
+                    return Ok(arena_str(&line));
+                } else {
+                    // Read from stdin
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)
+                        .map_err(|e| BlissError::StreamError(format!("read-line: {}", e)))?;
+                    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                    return Ok(arena_str(trimmed));
+                }
+            }
+            "WRITE-STRING" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() { return Err(BlissError::Internal("WRITE-STRING requires an argument".into())); }
+                let string = eval_form(args[0], env)?;
+                let s = val_as_str(string);
+                if args.len() > 1 {
+                    let stream = eval_form(args[1], env)?;
+                    if is_stream(stream) {
+                        stream_write_string(stream, &s)?;
+                        return Ok(string);
+                    }
+                }
+                print!("{}", s);
+                return Ok(string);
             }
             "SAVE-IMAGE" => {
                 let (path_form, _) = cp(cdr);
@@ -861,7 +1192,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let path = val_as_str(path_val);
                 // Save a minimal image: serialize the environment's function definitions
                 let mut image_data = String::new();
-                for (name, fdef) in &env.funs {
+                for (name, fdef) in env.funs.iter() {
                     let params_str = fdef.params.join(" ");
                     let body_str = format_val(fdef.body);
                     image_data.push_str(&format!("(defun {} ({}) {})\n", name, params_str, body_str));
@@ -1221,7 +1552,7 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (params_form, body) = cp(rest);
     let name = sym_name(name_form);
     let params = extract_params(params_form);
-    env.funs.insert(name.clone(), FunDef { params, body });
+    Rc::make_mut(&mut env.funs).insert(name.clone(), FunDef { params, body });
     Ok(name_form)
 }
 
@@ -1265,7 +1596,7 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         c = rest_p;
     }
 
-    env.macros.insert(name.clone(), MacroDef { params, has_body, body });
+    Rc::make_mut(&mut env.macros).insert(name.clone(), MacroDef { params, has_body, body });
     Ok(name_form)
 }
 
@@ -1354,7 +1685,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
     }
 
-    env.classes.insert(name.clone(), ClassDef { name: name.clone(), supers, slots });
+    Rc::make_mut(&mut env.classes).insert(name.clone(), ClassDef { name: name.clone(), supers, slots });
     Ok(name_form)
 }
 
@@ -1380,8 +1711,8 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         }
     }
 
-    let methods = env.methods.entry(name.clone()).or_insert_with(Vec::new);
-    methods.push(MethodDef { specializer, params, body });
+    Rc::make_mut(&mut env.methods).entry(name.clone()).or_insert_with(Vec::new)
+        .push(MethodDef { specializer, params, body });
     Ok(name_form)
 }
 
@@ -1461,7 +1792,7 @@ fn is_subclass(child: &str, parent: &str, env: &Env) -> bool {
 
 // ── Apply function (lambda or named) ─────────────────────────────
 fn apply_function(fn_val: BlissVal, args: &[BlissVal], env: &mut Env) -> Result<BlissVal, BlissError> {
-    // Function could be a lambda form or a symbol naming a function
+    // Function could be a lambda form, a symbol naming a function, or a closure
     if fn_val.is_symbol() {
         let name = sym_name(fn_val);
         if let Some(fdef) = env.funs.get(&name).cloned() {
@@ -1476,6 +1807,24 @@ fn apply_function(fn_val: BlissVal, args: &[BlissVal], env: &mut Env) -> Result<
     }
     if fn_val.is_cons() {
         let (lh, lr) = cp(fn_val);
+        // Check for closure: (BLISS::CLOSURE . id)
+        if lh.is_symbol() && sym_name(lh) == "BLISS::CLOSURE" {
+            if lr.is_fixnum() {
+                let id = lr.as_fixnum() as u64;
+                if let Some(closure) = env.closures.get(&id).cloned() {
+                    let mut child_env = env.child();
+                    // Restore captured lexical environment
+                    for (k, v) in &closure.captured_vars {
+                        child_env.vars.insert(k.clone(), *v);
+                    }
+                    // Bind parameters
+                    for (i, param) in closure.params.iter().enumerate() {
+                        child_env.vars.insert(param.clone(), if i < args.len() { args[i] } else { NIL });
+                    }
+                    return eval_progn(closure.body, &mut child_env);
+                }
+            }
+        }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
             let (params_form, body) = cp(lr);
             let params = extract_params(params_form);
@@ -1647,26 +1996,39 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
 fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (_continue_form, rest) = cp(cdr);
     let (msg_form, _) = cp(rest);
-    let _msg = eval_form(msg_form, env)?;
+    let msg = eval_form(msg_form, env)?;
 
     // Install a CONTINUE restart
-    env.restarts.push(RestartEntry { name: "CONTINUE".to_string() });
+    env.restarts.push(RestartEntry { name: "CONTINUE".to_string(), body: None });
 
     // Check if there's a handler that will invoke the restart
     for handler in env.handlers.clone().iter().rev() {
-        if handler.type_name == "ERROR" || handler.type_name == "CONDITION" {
+        if handler.type_name == "ERROR" || handler.type_name == "CONDITION" || handler.type_name == "T" {
             let hfn = handler.handler.clone();
-            let err_str = arena_str("cerror");
-            let _ = apply_function(hfn, &[err_str], env);
-            // If handler called invoke-restart 'continue, we continue
-            env.restarts.pop();
-            return Ok(NIL);
+            let cond = arena_str(&val_as_str(msg));
+            match apply_function(hfn, &[cond], env) {
+                Ok(_) => {
+                    // Handler returned normally
+                    env.restarts.pop();
+                    return Ok(NIL);
+                }
+                Err(e) => {
+                    // Check if it's a restart invocation
+                    let err_str = format!("{}", e);
+                    if err_str.contains("__RESTART_INVOKED__:CONTINUE") {
+                        env.restarts.pop();
+                        return Ok(NIL);
+                    }
+                    env.restarts.pop();
+                    return Err(e);
+                }
+            }
         }
     }
 
     env.restarts.pop();
     // If no handler, signal the error
-    Err(BlissError::Internal(format!("ERROR: {}", val_as_str(_msg))))
+    Err(BlissError::Internal(format!("ERROR: {}", val_as_str(msg))))
 }
 
 // ── WITH-OPEN-FILE ──────────────────────────────────────────────
@@ -1686,7 +2048,7 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
 
     // Parse options
     let opts = list_to_vec(opts_rest);
-    let mut _direction = "INPUT";
+    let mut direction = StreamDirection::Input;
     let mut i = 0;
     while i < opts.len() {
         let opt_name = sym_name(opts[i]);
@@ -1695,8 +2057,7 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
             if i + 1 < opts.len() {
                 let dir = sym_name(opts[i + 1]);
                 let dir_bare = dir.trim_start_matches("KEYWORD:").trim_start_matches(':');
-                if dir_bare == "INPUT" { _direction = "INPUT"; }
-                else if dir_bare == "OUTPUT" { _direction = "OUTPUT"; }
+                if dir_bare == "OUTPUT" { direction = StreamDirection::Output; }
                 i += 2;
             } else { i += 1; }
         } else {
@@ -1704,11 +2065,16 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
         }
     }
 
-    let mut child_env = env.child();
-    // For bootstrap, we represent streams as strings
-    child_env.vars.insert(var_name, arena_str(&path));
+    // Open the file and create a stream
+    let stream_val = open_stream(&path, direction)?;
 
-    eval_progn(body, &mut child_env)
+    let mut child_env = env.child();
+    child_env.vars.insert(var_name, stream_val);
+
+    // Evaluate body, then close the stream (unwind-protect style)
+    let result = eval_progn(body, &mut child_env);
+    close_stream(stream_val)?;
+    result
 }
 
 // ── DEFPACKAGE ──────────────────────────────────────────────────
@@ -1746,7 +2112,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         c = rest;
     }
 
-    env.packages.insert(pkg_name.clone(), PackageDef {
+    Rc::make_mut(&mut env.packages).insert(pkg_name.clone(), PackageDef {
         name: pkg_name,
         exports,
         uses,
@@ -1934,6 +2300,8 @@ fn run_repl_env(env: &mut Env) -> Result<i32, BlissError> {
     println!("Bliss Common Lisp {}", env!("CARGO_PKG_VERSION"));
     println!("Type (quit) to exit.");
     println!();
+    // Promote initial allocations (env setup, image load) to permanent
+    ARENA.with(|a| a.borrow_mut().promote_all());
     let stdin = std::io::stdin();
     let mut input = String::new();
     let mut in_debugger = false;
@@ -1952,8 +2320,22 @@ fn run_repl_env(env: &mut Env) -> Result<i32, BlissError> {
                     continue;
                 }
                 match read_eval_all_env(trimmed, env) {
-                    Ok(result) => println!("{}", format_val(result)),
-                    Err(e) => { eprintln!("ERROR: {}", e); in_debugger = true; }
+                    Ok(result) => {
+                        println!("{}", format_val(result));
+                        // Promote allocations from this eval (they may be stored in env)
+                        ARENA.with(|a| a.borrow_mut().promote_all());
+                    }
+                    Err(e) => {
+                        eprintln!("ERROR: {}", e);
+                        in_debugger = true;
+                        // On error, temporary allocations can be freed
+                        ARENA.with(|a| {
+                            let mut arena = a.borrow_mut();
+                            if arena.should_compact() {
+                                arena.compact();
+                            }
+                        });
+                    }
                 }
             }
             Err(e) => return Err(BlissError::Internal(format!("read error: {}", e))),
