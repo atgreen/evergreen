@@ -9,7 +9,7 @@ use crate::value::BlissVal;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Unique identifier for a green thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -103,7 +103,7 @@ pub struct WorkerThread {
 static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
 struct ThreadRegistry {
-    threads: HashMap<u64, Box<GreenThread>>,
+    threads: HashMap<u64, Arc<GreenThread>>,
 }
 
 static REGISTRY: std::sync::LazyLock<Mutex<ThreadRegistry>> =
@@ -117,9 +117,9 @@ fn allocate_thread_id() -> GreenThreadId {
     GreenThreadId(NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-fn new_green_thread(entry: BlissVal) -> Box<GreenThread> {
+fn new_green_thread(entry: BlissVal) -> Arc<GreenThread> {
     let id = allocate_thread_id();
-    Box::new(GreenThread {
+    Arc::new(GreenThread {
         inner: UnsafeCell::new(GreenThreadInner {
             id,
             state: ThreadState::Runnable,
@@ -134,6 +134,9 @@ fn new_green_thread(entry: BlissVal) -> Box<GreenThread> {
 
 thread_local! {
     static CURRENT_THREAD_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Cached Arc to the current thread, avoiding repeated registry lookups.
+    static CURRENT_THREAD_ARC: std::cell::RefCell<Option<Arc<GreenThread>>> =
+        std::cell::RefCell::new(None);
 }
 
 fn ensure_current_thread() {
@@ -142,6 +145,9 @@ fn ensure_current_thread() {
             // Bootstrap: create a thread for the current OS thread.
             let thread = new_green_thread(crate::value::NIL);
             let id = thread.id().0;
+            CURRENT_THREAD_ARC.with(|arc_cell| {
+                *arc_cell.borrow_mut() = Some(Arc::clone(&thread));
+            });
             let mut reg = REGISTRY.lock().unwrap();
             reg.threads.insert(id, thread);
             cell.set(id);
@@ -181,16 +187,25 @@ pub fn current_thread_id() -> GreenThreadId {
 }
 
 /// Get a reference to the current green thread.
+///
+/// # Safety rationale
+/// The GreenThread is held in an `Arc` stored both in the global registry
+/// and in a thread-local cache (`CURRENT_THREAD_ARC`). The thread-local
+/// Arc clone keeps the allocation alive for at least the lifetime of the
+/// OS thread, so the returned `&'static` reference is valid as long as
+/// the calling OS thread is alive — which is always true for code running
+/// on that thread.
 pub fn current_thread() -> &'static GreenThread {
     ensure_current_thread();
-    let id = CURRENT_THREAD_ID.with(|cell| cell.get());
-    let reg = REGISTRY.lock().unwrap();
-    let thread = reg.threads.get(&id).expect("current thread not in registry");
-    // Safety: GreenThread is heap-allocated in a Box stored in the registry.
-    // The registry only grows (threads are not removed during normal operation),
-    // so the pointer remains valid for 'static lifetime.
-    let ptr: *const GreenThread = &**thread;
-    unsafe { &*ptr }
+    CURRENT_THREAD_ARC.with(|arc_cell| {
+        let borrow = arc_cell.borrow();
+        let arc = borrow.as_ref().expect("current thread Arc not set");
+        // Safety: The Arc in the thread-local keeps the GreenThread alive for
+        // the lifetime of this OS thread. Since we only return this reference
+        // on the same OS thread, the 'static lifetime is sound.
+        let ptr: *const GreenThread = Arc::as_ptr(arc);
+        unsafe { &*ptr }
+    })
 }
 
 /// Yield the current green thread at the next safepoint.
