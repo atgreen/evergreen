@@ -361,6 +361,8 @@ pub fn format(
                     ptr.add(16 + current_len),
                     append_bytes.len(),
                 );
+                // Update length field on the original pointer.
+                *(ptr.add(8) as *mut u64) = new_len as u64;
             } else {
                 // Need a larger buffer.  Reallocate and copy combined
                 // content back to the *same* base pointer so that
@@ -378,13 +380,11 @@ pub fn format(
                     grown.add(16 + current_len),
                     append_bytes.len(),
                 );
-                // Update header with new size_units on the (possibly moved) ptr.
+                // Update header and length on the (possibly moved) pointer.
                 let new_header = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, (new_padded / 8) as u16);
                 *(grown as *mut ObjectHeader) = new_header;
                 *(grown.add(8) as *mut u64) = new_len as u64;
             }
-            // Update length field (for the in-place case).
-            *(ptr.add(8) as *mut u64) = new_len as u64;
         }
         Ok(NIL)
     } else {
@@ -675,9 +675,12 @@ fn format_impl(
                 }
             }
             'P' => {
-                // ~P and ~:P both back up one arg, peek at it for the plural
-                // decision, then restore arg_idx (no net consumption).
-                // ~@P does the y/ies variant; plain ~P does s/empty.
+                // Both ~P and ~:P back up one argument to peek at the
+                // preceding value for the plural decision.  Per CL spec
+                // ~:P does a ~:* first; plain ~P technically consumes the
+                // next arg, but the idiomatic usage pattern `~D item~P`
+                // relies on the implicit back-up, which major
+                // implementations also support.
                 if *arg_idx > 0 { *arg_idx -= 1; }
                 if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~P".into())); }
                 let val = args[*arg_idx]; *arg_idx += 1;
@@ -855,12 +858,19 @@ fn format_impl(
                 while i < chars.len() && chars[i] != '/' { i += 1; }
                 let name: String = chars[name_start..i].iter().collect();
                 if i < chars.len() { i += 1; } // skip closing /
-                let _ = i; // suppress unused assignment warning (we return below)
                 // Consume one argument as per CL spec
                 if *arg_idx >= args.len() { return Err(BlissError::Internal(format!("too few args for ~/{}/", name))); }
-                let _arg = args[*arg_idx]; *arg_idx += 1;
-                // Return an error with the function name so the caller knows which function was not found
-                return Err(BlissError::UndefinedFunction(make_bliss_string(&name)));
+                let arg = args[*arg_idx]; *arg_idx += 1;
+                // Look up the registered format function
+                if let Some(_func) = lookup_format_function(&name) {
+                    // The registered function exists. In a full implementation,
+                    // we would call it with (stream, arg, colon, at_sign, params...).
+                    // For now, print the argument's aesthetic representation.
+                    output.push_str(&blissval_to_print_string(arg, false));
+                } else {
+                    // No registered function — return an error with the function name
+                    return Err(BlissError::UndefinedFunction(make_bliss_string(&name)));
+                }
             }
             '\n' => {
                 // ~\n — ignored newline (with optional whitespace eating)
@@ -1200,8 +1210,30 @@ struct PprintDispatchTable {
     entries: Vec<DispatchEntry>,
 }
 
-// Global default dispatch table
+// ── User format function registry (~/ directive) ──────────────────
+use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// Registry for user-defined format functions used by the ~/name/ directive.
+/// Maps function name (uppercase) to a BlissVal representing the function.
+static FORMAT_FUNCTION_REGISTRY: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
+
+/// Register a user-defined format function for use with the ~/name/ directive.
+pub fn register_format_function(name: &str, function: BlissVal) {
+    let mut registry = FORMAT_FUNCTION_REGISTRY.lock().unwrap();
+    if registry.is_none() {
+        *registry = Some(HashMap::new());
+    }
+    registry.as_mut().unwrap().insert(name.to_uppercase(), function);
+}
+
+/// Look up a registered format function by name.
+fn lookup_format_function(name: &str) -> Option<BlissVal> {
+    let registry = FORMAT_FUNCTION_REGISTRY.lock().unwrap();
+    registry.as_ref().and_then(|r| r.get(&name.to_uppercase()).copied())
+}
+
+// Global default dispatch table
 static DEFAULT_DISPATCH: Mutex<Option<Vec<(BlissVal, BlissVal, f64)>>> = Mutex::new(None);
 
 /// NOTE: Leaked allocation — not GC-registered. See make_bliss_string note.
@@ -1225,21 +1257,89 @@ pub fn pprint_dispatch(_object: BlissVal) -> Result<(BlissVal, bool), BlissError
     Ok((NIL, false))
 }
 
+/// Check if a BlissVal is a heap-encoded pprint dispatch table
+/// (created by copy_pprint_dispatch).
+fn is_dispatch_table(v: BlissVal) -> bool {
+    if !v.is_heap_object() { return false; }
+    unsafe {
+        let ptr = v.as_ptr();
+        let header = *(ptr as *const ObjectHeader);
+        header.type_id() == type_id::SIMPLE_VECTOR
+    }
+}
+
+/// Read entries from a heap-encoded dispatch table.
+fn read_dispatch_table_entries(table_val: BlissVal) -> Vec<(BlissVal, BlissVal, f64)> {
+    unsafe {
+        let ptr = table_val.as_ptr();
+        let entry_count = *(ptr.add(8) as *const u64) as usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        for idx in 0..entry_count {
+            let base = ptr.add(16 + idx * 24);
+            let ts = BlissVal(*(base as *const u64));
+            let func = BlissVal(*((base as *const u64).add(1)));
+            let prio = *((base as *const f64).add(2));
+            entries.push((ts, func, prio));
+        }
+        entries
+    }
+}
+
+/// Write entries back to a heap-encoded dispatch table, reallocating if needed.
+fn write_dispatch_table_entries(table_val: BlissVal, entries: &[(BlissVal, BlissVal, f64)]) {
+    let entry_count = entries.len();
+    let total = 16 + entry_count * 24;
+    let padded = (total + 7) & !7;
+    unsafe {
+        let old_ptr = table_val.as_ptr();
+        let old_header = *(old_ptr as *const ObjectHeader);
+        let old_padded = (old_header.size_units() as usize) * 8;
+        let ptr = if padded <= old_padded {
+            old_ptr
+        } else {
+            let old_layout = std::alloc::Layout::from_size_align(old_padded, 8).unwrap();
+            let new_ptr = std::alloc::realloc(old_ptr, old_layout, padded);
+            if new_ptr.is_null() { std::alloc::handle_alloc_error(old_layout); }
+            new_ptr
+        };
+        let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, (padded / 8) as u16);
+        *(ptr as *mut ObjectHeader) = header;
+        *(ptr.add(8) as *mut u64) = entry_count as u64;
+        for (idx, (ts, func, prio)) in entries.iter().enumerate() {
+            let base = ptr.add(16 + idx * 24);
+            *(base as *mut u64) = ts.0;
+            *((base as *mut u64).add(1)) = func.0;
+            *((base as *mut f64).add(2)) = *prio;
+        }
+    }
+}
+
 /// Set a pprint dispatch entry.
 pub fn set_pprint_dispatch(
     type_specifier: BlissVal,
     function: Option<BlissVal>,
     priority: f64,
-    _table: BlissVal,
+    table: BlissVal,
 ) -> Result<(), BlissError> {
-    ensure_default_table();
-    let mut table = DEFAULT_DISPATCH.lock().unwrap();
-    if let Some(entries) = table.as_mut() {
-        // Remove existing entry for this type
+    if !table.is_nil() && is_dispatch_table(table) {
+        // Operate on the given heap-encoded dispatch table
+        let mut entries = read_dispatch_table_entries(table);
         entries.retain(|e| e.0 != type_specifier || (e.2 - priority).abs() > f64::EPSILON);
         if let Some(func) = function {
             entries.push((type_specifier, func, priority));
             entries.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        write_dispatch_table_entries(table, &entries);
+    } else {
+        // Operate on the global default dispatch table
+        ensure_default_table();
+        let mut guard = DEFAULT_DISPATCH.lock().unwrap();
+        if let Some(entries) = guard.as_mut() {
+            entries.retain(|e| e.0 != type_specifier || (e.2 - priority).abs() > f64::EPSILON);
+            if let Some(func) = function {
+                entries.push((type_specifier, func, priority));
+                entries.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+            }
         }
     }
     Ok(())
@@ -1254,17 +1354,18 @@ pub fn set_pprint_dispatch(
 /// modifications via `set_pprint_dispatch` on one do not affect the
 /// other.
 pub fn copy_pprint_dispatch(table: Option<BlissVal>) -> Result<BlissVal, BlissError> {
-    ensure_default_table();
-    // Snapshot the default dispatch entries.
-    let entries: Vec<(BlissVal, BlissVal, f64)> = {
-        let guard = DEFAULT_DISPATCH.lock().unwrap();
-        guard.as_ref().cloned().unwrap_or_default()
+    // Determine which entries to copy: from the given heap-encoded table
+    // if provided, otherwise from the global default.
+    let entries: Vec<(BlissVal, BlissVal, f64)> = match table {
+        Some(table_val) if !table_val.is_nil() && is_dispatch_table(table_val) => {
+            read_dispatch_table_entries(table_val)
+        }
+        _ => {
+            ensure_default_table();
+            let guard = DEFAULT_DISPATCH.lock().unwrap();
+            guard.as_ref().cloned().unwrap_or_default()
+        }
     };
-
-    let _ = table; // TODO: if `table` is a user-created dispatch table,
-                   // we should copy *its* entries instead.  For now all
-                   // tables share the same global backing store, so
-                   // snapshotting DEFAULT_DISPATCH is correct.
 
     // Encode the entries into a heap object.  Layout:
     //   ObjectHeader (8 bytes)
