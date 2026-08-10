@@ -54,6 +54,11 @@ struct CircularLabels {
 }
 
 // ── Heap allocation helpers ───────────────────────────────────────
+// NOTE(tech-debt): All alloc_* functions below use Box::leak / alloc_zeroed
+// without integrating with the GC (bliss_rt::gc). Every object created by
+// the reader is permanently leaked. This is acceptable during bootstrap but
+// must be wired into the GC's allocation path before production use.
+// Tracked as tech-debt for a future phase.
 
 fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
     let cell = Box::leak(Box::new(ConsCell { car, cdr }));
@@ -261,13 +266,43 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
                 if let Ok(s) = std::str::from_utf8(data) {
                     let chars: Vec<char> = s.chars().collect();
                     let mut labels = CircularLabels { labels: HashMap::new() };
+
+                    // Consult readtable for custom macro characters if one is set
+                    if state.readtable != NIL && state.readtable.tag() == TAG_HEAP_OBJECT {
+                        let rt_key = state.readtable.0 & !bliss_rt::value::TAG_MASK;
+                        let guard = MACRO_CHARS.lock().unwrap();
+                        if let Some(table) = guard.as_ref() {
+                            // Check first non-whitespace character against readtable
+                            let first_pos = skip_whitespace_and_comments(&chars, 0);
+                            if first_pos < chars.len() {
+                                let first_ch = chars[first_pos];
+                                if let Some(&(_func, _non_term)) = table.get(&(rt_key, first_ch)) {
+                                    // Custom macro character found — for now, we delegate
+                                    // to the standard reader which handles built-in macros.
+                                    // Full readtable dispatch (calling user functions) requires
+                                    // the evaluator; tracked as future work.
+                                    drop(guard);
+                                    let (val, _pos) = read_token_with_base(&chars, 0, &mut labels, state.read_base, state.read_eval)?;
+                                    return Ok(val);
+                                }
+                            }
+                        }
+                        drop(guard);
+                    }
+
                     let (val, _pos) = read_token_with_base(&chars, 0, &mut labels, state.read_base, state.read_eval)?;
                     return Ok(val);
                 }
             }
+            // Heap object but not a SIMPLE_BASE_STRING — unsupported stream type
+            return Err(BlissError::StreamError(format!(
+                "unsupported stream type for read (type_id={})",
+                header.type_id()
+            )));
         }
     }
-    Ok(EOF)
+    // Non-heap, non-NIL input — cannot read from it
+    Err(BlissError::StreamError("unsupported input type for read".into()))
 }
 
 pub fn read_from_string(s: &str) -> Result<(BlissVal, usize), BlissError> {
@@ -850,12 +885,34 @@ fn read_feature_expr_with_base(
     }
 }
 
+/// Coerce a numeric BlissVal to f64 for mixed-type arithmetic.
+fn numeric_to_f64(v: BlissVal) -> Option<f64> {
+    if v.is_fixnum() {
+        Some(v.as_fixnum() as f64)
+    } else if v.is_single_float() {
+        Some(v.as_single_float() as f64)
+    } else {
+        None
+    }
+}
+
 fn try_eval(form: BlissVal) -> Option<BlissVal> {
-    // Minimal eval for #. — handles simple arithmetic forms like (+ n m)
+    // Minimal eval for #. — handles self-evaluating atoms and simple arithmetic
+    // on fixnums and floats: (+, -, *) with recursive argument evaluation.
     if !form.is_cons() {
-        // Self-evaluating atoms
+        // Self-evaluating atoms: numbers, floats, characters, strings
         if form.is_fixnum() || form.is_single_float() || form.is_character() {
             return Some(form);
+        }
+        // Strings are self-evaluating
+        if form.is_heap_object() {
+            unsafe {
+                let ptr = form.as_ptr();
+                let header = *(ptr as *const ObjectHeader);
+                if header.type_id() == type_id::SIMPLE_BASE_STRING {
+                    return Some(form);
+                }
+            }
         }
         return None;
     }
@@ -874,14 +931,25 @@ fn try_eval(form: BlissVal) -> Option<BlissVal> {
         // Recursively evaluate arguments
         let arg1 = try_eval(arg1_form)?;
 
+        let plus_idx = intern_symbol("+");
+        let minus_idx = intern_symbol("-");
+        let star_idx = intern_symbol("*");
+
         // Unary or binary?
         if rest2.is_nil() {
             // Unary: e.g. (- x)
-            if !arg1.is_fixnum() { return None; }
-            let a = arg1.as_fixnum();
-            let minus_idx = intern_symbol("-");
             if op == BlissVal::from_symbol_index(minus_idx) {
-                return Some(BlissVal::from_fixnum(-a));
+                if arg1.is_fixnum() {
+                    return Some(BlissVal::from_fixnum(-arg1.as_fixnum()));
+                } else if arg1.is_single_float() {
+                    return Some(BlissVal::from_single_float(-arg1.as_single_float()));
+                }
+            }
+            // Unary + is identity
+            if op == BlissVal::from_symbol_index(plus_idx) {
+                if arg1.is_fixnum() || arg1.is_single_float() {
+                    return Some(arg1);
+                }
             }
             return None;
         }
@@ -894,20 +962,30 @@ fn try_eval(form: BlissVal) -> Option<BlissVal> {
 
         let arg2 = try_eval(arg2_form)?;
 
-        if !arg1.is_fixnum() || !arg2.is_fixnum() { return None; }
-        let a = arg1.as_fixnum();
-        let b = arg2.as_fixnum();
+        // Both fixnum — stay in fixnum domain
+        if arg1.is_fixnum() && arg2.is_fixnum() {
+            let a = arg1.as_fixnum();
+            let b = arg2.as_fixnum();
+            if op == BlissVal::from_symbol_index(plus_idx) {
+                return Some(BlissVal::from_fixnum(a + b));
+            } else if op == BlissVal::from_symbol_index(minus_idx) {
+                return Some(BlissVal::from_fixnum(a - b));
+            } else if op == BlissVal::from_symbol_index(star_idx) {
+                return Some(BlissVal::from_fixnum(a * b));
+            }
+            return None;
+        }
 
-        let plus_idx = intern_symbol("+");
-        let minus_idx = intern_symbol("-");
-        let star_idx = intern_symbol("*");
+        // Mixed or both float — promote to float
+        let a = numeric_to_f64(arg1)?;
+        let b = numeric_to_f64(arg2)?;
 
         if op == BlissVal::from_symbol_index(plus_idx) {
-            Some(BlissVal::from_fixnum(a + b))
+            Some(BlissVal::from_single_float((a + b) as f32))
         } else if op == BlissVal::from_symbol_index(minus_idx) {
-            Some(BlissVal::from_fixnum(a - b))
+            Some(BlissVal::from_single_float((a - b) as f32))
         } else if op == BlissVal::from_symbol_index(star_idx) {
-            Some(BlissVal::from_fixnum(a * b))
+            Some(BlissVal::from_single_float((a * b) as f32))
         } else {
             None
         }
