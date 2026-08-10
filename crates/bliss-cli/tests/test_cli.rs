@@ -288,31 +288,32 @@ fn repl_config_default_syntax_highlighting_enabled() {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// CLI driver functions — smoke tests (expect panics from unimplemented)
+// CLI driver functions — smoke tests
 // ══════════════════════════════════════════════════════════════════
 
 #[test]
-#[should_panic(expected = "not yet implemented")]
-fn run_panics_until_implemented() {
-    let _ = bliss_cli::cli::run(&args(&[]));
+fn run_with_help_returns_ok() {
+    let result = bliss_cli::cli::run(&args(&["--help"]));
+    assert!(result.is_ok(), "run(--help) should return Ok");
+    assert_eq!(result.unwrap(), 0);
 }
 
 #[test]
-#[should_panic(expected = "not yet implemented")]
-fn print_help_panics_until_implemented() {
+fn print_help_does_not_panic() {
     bliss_cli::cli::print_help();
 }
 
 #[test]
-#[should_panic(expected = "not yet implemented")]
-fn print_version_panics_until_implemented() {
+fn print_version_does_not_panic() {
     bliss_cli::cli::print_version();
 }
 
 #[test]
-#[should_panic(expected = "not yet implemented")]
-fn run_repl_panics_until_implemented() {
-    let _ = bliss_cli::cli::run_repl();
+fn run_repl_returns_ok_on_eof() {
+    // In test context, stdin is at EOF so run_repl exits immediately with Ok(0).
+    let result = bliss_cli::cli::run_repl();
+    assert!(result.is_ok(), "run_repl should return Ok on EOF stdin");
+    assert_eq!(result.unwrap(), 0);
 }
 
 #[test]
