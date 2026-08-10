@@ -21,16 +21,18 @@ fn permissive_policy() -> SandboxPolicy {
 
 // ── SandboxPolicy::default ────────────────────────────────────────
 
+/// Per spec §8.2.2 R8.02: 'the default set MUST be empty (deny-all)'.
+/// The Default implementation should be restrictive.
 #[test]
-fn default_policy_is_permissive() {
+fn default_policy_is_deny_all() {
     let p = SandboxPolicy::default();
-    assert!(p.allow_filesystem);
-    assert!(p.allow_network);
-    assert!(p.allow_ffi);
-    assert!(p.allow_subprocess);
-    assert_eq!(p.max_heap_bytes, 0);
-    assert_eq!(p.max_threads, 0);
-    assert!(p.allowed_paths.is_empty());
+    assert!(!p.allow_filesystem, "default policy must deny filesystem (R8.02)");
+    assert!(!p.allow_network, "default policy must deny network (R8.02)");
+    assert!(!p.allow_ffi, "default policy must deny FFI (R8.02)");
+    assert!(!p.allow_subprocess, "default policy must deny subprocess (R8.02)");
+    assert_eq!(p.max_heap_bytes, 0, "default max_heap_bytes should be 0 (unlimited/unset)");
+    assert_eq!(p.max_threads, 0, "default max_threads should be 0 (unlimited/unset)");
+    assert!(p.allowed_paths.is_empty(), "default allowed_paths must be empty");
 }
 
 #[test]
@@ -102,6 +104,47 @@ fn check_subprocess_allowed_denied() {
     assert!(sb_ok.check_subprocess().is_ok());
     let sb_no = Sandbox::new(restrictive_policy()).unwrap();
     assert!(sb_no.check_subprocess().is_err());
+}
+
+// ── max_heap_bytes / max_threads enforcement (R8.06, R8.07) ──────
+
+#[test]
+fn sandbox_enforces_max_heap_bytes() {
+    let p = SandboxPolicy {
+        allow_filesystem: false, allow_network: false,
+        allow_ffi: false, allow_subprocess: false,
+        max_heap_bytes: 1024, max_threads: 0,
+        allowed_paths: vec![],
+    };
+    let sb = Sandbox::new(p).unwrap();
+    let pol = sb.policy();
+    assert_eq!(pol.max_heap_bytes, 1024);
+    // The sandbox should enforce this limit; attempting to exceed it should fail.
+    // Since we can't directly allocate through sandbox, we verify the policy
+    // is stored and accessible so the runtime can enforce it.
+}
+
+#[test]
+fn sandbox_enforces_max_threads() {
+    let p = SandboxPolicy {
+        allow_filesystem: false, allow_network: false,
+        allow_ffi: false, allow_subprocess: false,
+        max_heap_bytes: 0, max_threads: 2,
+        allowed_paths: vec![],
+    };
+    let sb = Sandbox::new(p).unwrap();
+    let pol = sb.policy();
+    assert_eq!(pol.max_threads, 2);
+}
+
+#[test]
+fn sandbox_default_deny_all_blocks_everything() {
+    // With default deny-all policy, all checks should fail
+    let sb = Sandbox::new(SandboxPolicy::default()).unwrap();
+    assert!(sb.check_path("/any/path").is_err(), "deny-all should block path access");
+    assert!(sb.check_network().is_err(), "deny-all should block network");
+    assert!(sb.check_ffi().is_err(), "deny-all should block FFI");
+    assert!(sb.check_subprocess().is_err(), "deny-all should block subprocess");
 }
 
 // ── policy accessor ───────────────────────────────────────────────

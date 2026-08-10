@@ -26,7 +26,13 @@ fn scheduler_init_single_worker() {
     assert!(Scheduler::init(&SchedulerConfig { num_workers: 1 }).is_ok());
 }
 
-// ── submit / unpark / yield / active_thread_count ─────────────────
+#[test]
+fn scheduler_init_zero_workers_errors() {
+    assert!(Scheduler::init(&SchedulerConfig { num_workers: 0 }).is_err(),
+        "zero workers should fail initialization");
+}
+
+// ── submit / park / unpark / yield / active_thread_count ──────────
 
 #[test]
 fn submit_valid_thread() {
@@ -57,6 +63,28 @@ fn active_count_increments_after_submit() {
     let s = Scheduler::init(&SchedulerConfig { num_workers: 2 }).unwrap();
     s.submit(GreenThreadId(1)).unwrap();
     assert!(s.active_thread_count() >= 1);
+}
+
+// ── park_current ─────────────────────────────────────────────────
+
+#[test]
+fn park_current_does_not_panic() {
+    let s = Scheduler::init(&SchedulerConfig { num_workers: 2 }).unwrap();
+    // Submit a thread first so there's something to park
+    s.submit(GreenThreadId(1)).unwrap();
+    // park_current transitions the current green thread to Blocked state.
+    // It returns () — we just verify it doesn't panic.
+    s.park_current();
+}
+
+#[test]
+fn park_and_unpark_roundtrip() {
+    let s = Scheduler::init(&SchedulerConfig { num_workers: 2 }).unwrap();
+    s.submit(GreenThreadId(1)).unwrap();
+    s.park_current();
+    // Unparking a previously parked thread should succeed
+    assert!(s.unpark(GreenThreadId(1)).is_ok(),
+        "unparking a parked thread should succeed");
 }
 
 // ── shutdown ──────────────────────────────────────────────────────

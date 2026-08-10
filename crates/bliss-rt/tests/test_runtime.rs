@@ -2,6 +2,7 @@
 //! parse_cli, and install_signal_handlers.
 
 use bliss_rt::runtime::*;
+use bliss_rt::runtime::LogLevel;
 
 // ── RuntimeConfig::from_env ───────────────────────────────────────
 
@@ -15,6 +16,13 @@ fn from_env_returns_sane_defaults() {
     assert!(!cfg.no_image);
     assert!(cfg.eval_form.is_none());
     assert!(cfg.load_file.is_none());
+    // Additional fields that should have sane defaults
+    assert!(cfg.image_path.is_some(), "image_path should default to Some(\"bliss.bimg\") or similar");
+    assert!(cfg.gc_log.is_none(), "gc_log should default to None");
+    assert!(!cfg.jit_dump, "jit_dump should default to false");
+    assert!(cfg.safepoint_spin > 0, "safepoint_spin should have a non-zero default");
+    assert!(cfg.ffi_pool_pages > 0, "ffi_pool_pages should have a non-zero default");
+    assert_eq!(cfg.log_level, LogLevel::Info, "default log level should be Info");
 }
 
 // ── RuntimeConfig::apply_cli_args ─────────────────────────────────
@@ -45,6 +53,43 @@ fn apply_cli_args_load() {
     let mut cfg = RuntimeConfig::from_env();
     cfg.apply_cli_args(&["--load".into(), "boot.lisp".into()]);
     assert_eq!(cfg.load_file.as_deref(), Some("boot.lisp"));
+}
+
+#[test]
+fn apply_cli_args_gc_log() {
+    let mut cfg = RuntimeConfig::from_env();
+    cfg.apply_cli_args(&["--gc-log".into(), "/tmp/gc.log".into()]);
+    assert_eq!(cfg.gc_log.as_deref(), Some("/tmp/gc.log"));
+}
+
+#[test]
+fn apply_cli_args_jit_dump() {
+    let mut cfg = RuntimeConfig::from_env();
+    cfg.apply_cli_args(&["--jit-dump".into()]);
+    assert!(cfg.jit_dump);
+}
+
+#[test]
+fn apply_cli_args_log_level() {
+    let mut cfg = RuntimeConfig::from_env();
+    cfg.apply_cli_args(&["--log-level".into(), "debug".into()]);
+    assert_eq!(cfg.log_level, LogLevel::Debug);
+}
+
+#[test]
+#[should_panic]
+fn apply_cli_args_unknown_flag_errors() {
+    let mut cfg = RuntimeConfig::from_env();
+    // Unknown flags should cause an error (panic or Result::Err)
+    cfg.apply_cli_args(&["--unknown-flag-xyz".into()]);
+}
+
+#[test]
+#[should_panic]
+fn apply_cli_args_eval_missing_value_errors() {
+    let mut cfg = RuntimeConfig::from_env();
+    // --eval with no following argument should error
+    cfg.apply_cli_args(&["--eval".into()]);
 }
 
 // ── gc_config / scheduler_config ──────────────────────────────────
@@ -102,6 +147,17 @@ fn runtime_init_and_config() {
 fn runtime_eval_simple_form() {
     let mut rt = Runtime::init(RuntimeConfig::from_env()).expect("init");
     assert!(rt.eval("(+ 1 2)").is_ok());
+}
+
+#[test]
+fn runtime_run_returns_exit_code() {
+    let mut cfg = RuntimeConfig::from_env();
+    cfg.eval_form = Some("(+ 1 2)".into());
+    let mut rt = Runtime::init(cfg).expect("init");
+    let result = rt.run();
+    assert!(result.is_ok(), "Runtime::run should return Ok(exit_code)");
+    // Conventionally, successful exit returns 0
+    assert_eq!(result.unwrap(), 0);
 }
 
 #[test]
