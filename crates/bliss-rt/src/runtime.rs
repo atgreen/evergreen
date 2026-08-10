@@ -7,6 +7,7 @@ use crate::gc::GcConfig;
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::value::BlissVal;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// Runtime configuration parsed from env vars and CLI flags.
@@ -327,11 +328,11 @@ impl Runtime {
         let tokens = tokenize(form);
         let mut pos = 0;
         let mut result = crate::value::NIL;
+        let mut env = BootEnv::new();
         while pos < tokens.len() {
             let (sexpr, next) = parse_sexpr(&tokens, pos)
                 .map_err(|e| BlissError::Internal(format!("read error: {}", e)))?;
             pos = next;
-            let mut env = BootEnv::new();
             result = eval_sexpr(&sexpr, &mut env)?;
         }
         Ok(result)
@@ -400,6 +401,129 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
 // integration before the compiler crate is wired up.
 // ══════════════════════════════════════════════════════════════════
 
+// ── Bootstrap side-tables ────────────────────────────────────────
+// These thread-local stores let the bootstrap evaluator represent cons
+// cells, symbols, strings, and lambdas without GC heap allocation.
+
+struct BootstrapStore {
+    cons_cells: HashMap<u64, (BlissVal, BlissVal)>,
+    cons_counter: u64,
+    symbol_to_idx: HashMap<String, u32>,
+    idx_to_symbol: HashMap<u32, String>,
+    symbol_counter: u32,
+    strings: HashMap<u64, String>,
+    string_counter: u64,
+    lambdas: HashMap<u64, BootLambda>,
+    lambda_counter: u64,
+}
+
+#[derive(Clone)]
+struct BootLambda {
+    params: Vec<String>,
+    body: SExpr,
+}
+
+impl BootstrapStore {
+    fn new() -> Self {
+        BootstrapStore {
+            cons_cells: HashMap::new(),
+            cons_counter: 1, // start at 1 to avoid zero-tagged values
+            symbol_to_idx: HashMap::new(),
+            idx_to_symbol: HashMap::new(),
+            symbol_counter: 1, // reserve 0
+            strings: HashMap::new(),
+            string_counter: 1,
+            lambdas: HashMap::new(),
+            lambda_counter: 1,
+        }
+    }
+}
+
+thread_local! {
+    static BOOT_STORE: RefCell<BootstrapStore> = RefCell::new(BootstrapStore::new());
+}
+
+fn boot_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
+    BOOT_STORE.with(|store| {
+        let mut s = store.borrow_mut();
+        let id = s.cons_counter;
+        s.cons_counter += 1;
+        s.cons_cells.insert(id, (car, cdr));
+        BlissVal((id << 3) | crate::value::TAG_CONS)
+    })
+}
+
+fn boot_car(val: BlissVal) -> BlissVal {
+    if val.is_nil() { return crate::value::NIL; }
+    if val.tag() != crate::value::TAG_CONS { return crate::value::NIL; }
+    let id = val.0 >> 3;
+    BOOT_STORE.with(|store| {
+        store.borrow().cons_cells.get(&id).map(|(car, _)| *car).unwrap_or(crate::value::NIL)
+    })
+}
+
+fn boot_cdr(val: BlissVal) -> BlissVal {
+    if val.is_nil() { return crate::value::NIL; }
+    if val.tag() != crate::value::TAG_CONS { return crate::value::NIL; }
+    let id = val.0 >> 3;
+    BOOT_STORE.with(|store| {
+        store.borrow().cons_cells.get(&id).map(|(_, cdr)| *cdr).unwrap_or(crate::value::NIL)
+    })
+}
+
+fn boot_intern(name: &str) -> BlissVal {
+    BOOT_STORE.with(|store| {
+        let mut s = store.borrow_mut();
+        if let Some(&idx) = s.symbol_to_idx.get(name) {
+            BlissVal::from_symbol_index(idx)
+        } else {
+            let idx = s.symbol_counter;
+            s.symbol_counter += 1;
+            s.symbol_to_idx.insert(name.to_string(), idx);
+            s.idx_to_symbol.insert(idx, name.to_string());
+            BlissVal::from_symbol_index(idx)
+        }
+    })
+}
+
+fn boot_symbol_name(val: BlissVal) -> Option<String> {
+    if val.tag() != crate::value::TAG_SYMBOL { return None; }
+    let idx = val.as_symbol_index();
+    BOOT_STORE.with(|store| {
+        store.borrow().idx_to_symbol.get(&idx).cloned()
+    })
+}
+
+fn boot_make_string(s: &str) -> BlissVal {
+    BOOT_STORE.with(|store| {
+        let mut st = store.borrow_mut();
+        let id = st.string_counter;
+        st.string_counter += 1;
+        st.strings.insert(id, s.to_string());
+        // Use heap-object tag with ID as "pointer" — safe for bootstrap,
+        // these values won't be dereferenced by is_string().
+        BlissVal((id << 3) | crate::value::TAG_HEAP_OBJECT)
+    })
+}
+
+fn boot_make_lambda(params: Vec<String>, body: SExpr) -> BlissVal {
+    BOOT_STORE.with(|store| {
+        let mut s = store.borrow_mut();
+        let id = s.lambda_counter;
+        s.lambda_counter += 1;
+        s.lambdas.insert(id, BootLambda { params, body });
+        BlissVal((id << 3) | crate::value::TAG_FUNCTION)
+    })
+}
+
+fn boot_get_lambda(val: BlissVal) -> Option<(Vec<String>, SExpr)> {
+    if val.tag() != crate::value::TAG_FUNCTION { return None; }
+    let id = val.0 >> 3;
+    BOOT_STORE.with(|store| {
+        store.borrow().lambdas.get(&id).map(|l| (l.params.clone(), l.body.clone()))
+    })
+}
+
 /// Internal s-expression representation used by the bootstrap evaluator.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -426,15 +550,19 @@ impl BootEnv {
     }
 
     fn child(&self) -> BootEnv {
-        // Shallow clone: child sees parent's bindings via lookup chain
+        // Full clone: child sees entire parent chain via lookup
         BootEnv {
             vars: HashMap::new(),
             fns: HashMap::new(),
-            parent: Some(Box::new(BootEnv {
-                vars: self.vars.clone(),
-                fns: self.fns.clone(),
-                parent: None, // flatten for simplicity
-            })),
+            parent: Some(Box::new(self.deep_clone())),
+        }
+    }
+
+    fn deep_clone(&self) -> BootEnv {
+        BootEnv {
+            vars: self.vars.clone(),
+            fns: self.fns.clone(),
+            parent: self.parent.as_ref().map(|p| Box::new(p.deep_clone())),
         }
     }
 
@@ -564,7 +692,23 @@ fn sexpr_to_blissval(s: &SExpr) -> BlissVal {
         SExpr::Nil => crate::value::NIL,
         SExpr::Bool(true) => crate::value::T,
         SExpr::Bool(false) => crate::value::NIL,
-        SExpr::Symbol(_) | SExpr::Str(_) | SExpr::List(_) => crate::value::NIL,
+        SExpr::Symbol(name) => {
+            match name.as_str() {
+                "T" => crate::value::T,
+                "NIL" => crate::value::NIL,
+                _ => boot_intern(name),
+            }
+        }
+        SExpr::Str(s) => boot_make_string(s),
+        SExpr::List(elems) => {
+            // Build a cons list from the elements
+            let mut result = crate::value::NIL;
+            for e in elems.iter().rev() {
+                let val = sexpr_to_blissval(e);
+                result = boot_cons(val, result);
+            }
+            result
+        }
     }
 }
 
@@ -575,7 +719,7 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
         SExpr::Nil => Ok(crate::value::NIL),
         SExpr::Bool(true) => Ok(crate::value::T),
         SExpr::Bool(false) => Ok(crate::value::NIL),
-        SExpr::Str(_) => Ok(crate::value::NIL), // strings not fully supported in bootstrap
+        SExpr::Str(s) => Ok(boot_make_string(s)),
         SExpr::Symbol(name) => {
             match name.as_str() {
                 "T" => Ok(crate::value::T),
@@ -598,7 +742,27 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
                     "LET" => return eval_let(elems, env),
                     "DEFUN" => return eval_defun(elems, env),
                     "SETQ" | "SETF" => return eval_setq(elems, env),
-                    "LAMBDA" => return Ok(crate::value::NIL), // lambda as value — stub
+                    "LAMBDA" => {
+                        // (lambda (params...) body...)
+                        if elems.len() < 3 {
+                            return Err(BlissError::Internal("lambda requires params and body".into()));
+                        }
+                        let params = if let SExpr::List(ps) = &elems[1] {
+                            ps.iter().filter_map(|p| {
+                                if let SExpr::Symbol(s) = p { Some(s.clone()) } else { None }
+                            }).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let body = if elems.len() == 3 {
+                            elems[2].clone()
+                        } else {
+                            let mut progn = vec![SExpr::Symbol("PROGN".into())];
+                            progn.extend_from_slice(&elems[2..]);
+                            SExpr::List(progn)
+                        };
+                        return Ok(boot_make_lambda(params, body));
+                    }
                     "+" => return eval_arith(elems, env, ArithOp::Add),
                     "-" => return eval_arith(elems, env, ArithOp::Sub),
                     "*" => return eval_arith(elems, env, ArithOp::Mul),
@@ -631,21 +795,33 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
                         if let Some((params, body)) = env.lookup_fn(op) {
                             return eval_funcall(op, &params, &body, &elems[1..], env);
                         }
-                        // Unknown function — evaluate all args, return NIL
-                        // This allows forms like (format t "~a" x) to not crash
-                        for arg in &elems[1..] {
-                            eval_sexpr(arg, env)?;
-                        }
-                        return Ok(crate::value::NIL);
+                        // Unknown/undefined function — signal an error
+                        return Err(BlissError::Internal(format!("undefined function: {}", op)));
                     }
                 }
             }
-            // Non-symbol in function position — evaluate all, return last
-            let mut result = crate::value::NIL;
-            for e in elems {
-                result = eval_sexpr(e, env)?;
+            // Non-symbol in function position — check for lambda call
+            // e.g. ((lambda (x) (+ x 1)) 5)
+            let func_val = eval_sexpr(&elems[0], env)?;
+            if let Some((params, body)) = boot_get_lambda(func_val) {
+                let mut child = env.child();
+                let mut evaled_args = Vec::new();
+                for a in &elems[1..] {
+                    evaled_args.push(eval_sexpr(a, env)?);
+                }
+                for (i, p) in params.iter().enumerate() {
+                    let val = evaled_args.get(i).copied().unwrap_or(crate::value::NIL);
+                    child.vars.insert(p.clone(), val);
+                }
+                let result = eval_sexpr(&body, &mut child)?;
+                // Propagate function definitions back
+                for (k, v) in child.fns.drain() {
+                    env.fns.insert(k, v);
+                }
+                Ok(result)
+            } else {
+                Err(BlissError::Internal(format!("invalid function call: not a function")))
             }
-            Ok(result)
         }
     }
 }
@@ -726,7 +902,7 @@ fn eval_defun(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError
             SExpr::List(progn)
         };
         env.fns.insert(name.clone(), (params, body));
-        return Ok(BlissVal::from_fixnum(0)); // return the symbol name as fixnum 0 placeholder
+        return Ok(boot_intern(name)); // return the function name as a symbol
     }
     Ok(crate::value::NIL)
 }
@@ -814,38 +990,39 @@ fn eval_eq(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     Ok(if a.0 == b.0 { crate::value::T } else { crate::value::NIL })
 }
 
-/// Bootstrap cons: stores car/cdr as a pair encoded in two fixnums.
-/// Since we can't allocate real cons cells without GC integration,
-/// we return a list-like representation via fixnum encoding.
+/// Bootstrap cons: stores car/cdr pairs in a thread-local side-table,
+/// keyed by a monotonic counter encoded as a cons-tagged BlissVal.
 fn eval_cons(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     if elems.len() < 3 { return Ok(crate::value::NIL); }
     let car = eval_sexpr(&elems[1], env)?;
-    let _cdr = eval_sexpr(&elems[2], env)?;
-    // Bootstrap: return the car value (cons cells need heap allocation)
-    Ok(car)
+    let cdr = eval_sexpr(&elems[2], env)?;
+    Ok(boot_cons(car, cdr))
 }
 
 fn eval_car(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     if elems.len() < 2 { return Ok(crate::value::NIL); }
-    let _val = eval_sexpr(&elems[1], env)?;
-    Ok(crate::value::NIL) // Bootstrap: no real cons cells
+    let val = eval_sexpr(&elems[1], env)?;
+    Ok(boot_car(val))
 }
 
 fn eval_cdr(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     if elems.len() < 2 { return Ok(crate::value::NIL); }
-    let _val = eval_sexpr(&elems[1], env)?;
-    Ok(crate::value::NIL) // Bootstrap: no real cons cells
+    let val = eval_sexpr(&elems[1], env)?;
+    Ok(boot_cdr(val))
 }
 
 fn eval_list(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     if elems.len() < 2 { return Ok(crate::value::NIL); }
-    // Bootstrap: evaluate all args, return the first (no heap cons cells)
-    let mut first = crate::value::NIL;
-    for (i, e) in elems[1..].iter().enumerate() {
-        let v = eval_sexpr(e, env)?;
-        if i == 0 { first = v; }
+    // Evaluate all args, then build a proper cons list
+    let mut vals = Vec::new();
+    for e in &elems[1..] {
+        vals.push(eval_sexpr(e, env)?);
     }
-    Ok(first)
+    let mut result = crate::value::NIL;
+    for v in vals.into_iter().rev() {
+        result = boot_cons(v, result);
+    }
+    Ok(result)
 }
 
 fn eval_null(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
@@ -924,5 +1101,10 @@ fn eval_funcall(
         let val = evaled_args.get(i).copied().unwrap_or(crate::value::NIL);
         child.vars.insert(p.clone(), val);
     }
-    eval_sexpr(body, &mut child)
+    let result = eval_sexpr(body, &mut child)?;
+    // Propagate function definitions from callee back to caller
+    for (k, v) in child.fns.drain() {
+        env.fns.insert(k, v);
+    }
+    Ok(result)
 }
