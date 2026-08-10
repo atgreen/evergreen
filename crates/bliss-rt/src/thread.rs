@@ -7,8 +7,8 @@ use crate::stack::BlissStack;
 use crate::value::BlissVal;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// Unique identifier for a green thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -39,6 +39,45 @@ const DEFAULT_STACK_SIZE: usize = 512 * 1024;
 /// Atomic counter for generating unique thread IDs.
 static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Holds the result of a thread's execution and a signal for completion.
+struct ThreadResult {
+    /// The result value, set when the thread finishes.
+    value: Mutex<Option<BlissVal>>,
+    /// Condvar signaled when the thread transitions to Dead.
+    done: Condvar,
+}
+
+impl ThreadResult {
+    fn new() -> Self {
+        ThreadResult {
+            value: Mutex::new(None),
+            done: Condvar::new(),
+        }
+    }
+
+    /// Store the result and notify all waiters.
+    fn complete(&self, val: BlissVal) {
+        let mut guard = self.value.lock().unwrap();
+        *guard = Some(val);
+        self.done.notify_all();
+    }
+
+    /// Block until the result is available, then return it.
+    fn wait(&self) -> BlissVal {
+        let mut guard = self.value.lock().unwrap();
+        while guard.is_none() {
+            guard = self.done.wait(guard).unwrap();
+        }
+        guard.unwrap()
+    }
+
+    /// Check if the thread has finished without blocking.
+    #[allow(dead_code)]
+    fn is_done(&self) -> bool {
+        self.value.lock().unwrap().is_some()
+    }
+}
+
 /// Global thread registry mapping IDs to thread descriptors.
 fn thread_registry() -> &'static Mutex<HashMap<GreenThreadId, Arc<GreenThread>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<GreenThreadId, Arc<GreenThread>>>> = OnceLock::new();
@@ -54,6 +93,9 @@ thread_local! {
             state: Mutex::new(ThreadState::Runnable),
             stack: BlissStack::new(DEFAULT_STACK_SIZE),
             tls: Mutex::new(vec![crate::value::NIL; MAX_TLS]),
+            result: Arc::new(ThreadResult::new()),
+            interrupt_pending: AtomicBool::new(false),
+            interrupt_value: Mutex::new(crate::value::NIL),
         });
         thread_registry().lock().unwrap().insert(id, Arc::clone(&thread));
         thread
@@ -66,6 +108,12 @@ pub struct GreenThread {
     state: Mutex<ThreadState>,
     stack: BlissStack,
     tls: Mutex<Vec<BlissVal>>,
+    /// Shared result cell — written by the executing thread, read by joiners.
+    result: Arc<ThreadResult>,
+    /// Flag indicating an interrupt has been requested.
+    interrupt_pending: AtomicBool,
+    /// The condition value to deliver on interrupt.
+    interrupt_value: Mutex<BlissVal>,
 }
 
 // Safety: GreenThread access is controlled by the scheduler and thread registry.
@@ -81,6 +129,11 @@ impl GreenThread {
     /// Get the current state of this thread.
     pub fn state(&self) -> ThreadState {
         *self.state.lock().unwrap()
+    }
+
+    /// Set the thread state.
+    fn set_state(&self, new_state: ThreadState) {
+        *self.state.lock().unwrap() = new_state;
     }
 
     /// Get a reference to this thread's CL stack.
@@ -105,6 +158,28 @@ impl GreenThread {
             tls[index as usize] = value;
         }
     }
+
+    /// Check whether an interrupt is pending for this thread.
+    pub fn has_interrupt(&self) -> bool {
+        self.interrupt_pending.load(Ordering::Acquire)
+    }
+
+    /// Consume and return the pending interrupt condition, clearing the flag.
+    /// Returns `None` if no interrupt is pending.
+    pub fn take_interrupt(&self) -> Option<BlissVal> {
+        if self.interrupt_pending.swap(false, Ordering::AcqRel) {
+            let val = *self.interrupt_value.lock().unwrap();
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    /// Deliver an interrupt condition to this thread.
+    fn post_interrupt(&self, condition: BlissVal) {
+        *self.interrupt_value.lock().unwrap() = condition;
+        self.interrupt_pending.store(true, Ordering::Release);
+    }
 }
 
 /// An OS-level worker thread in the worker pool.
@@ -115,29 +190,81 @@ pub struct WorkerThread {
 // ── Thread creation and management ─────────────────────────────────
 
 /// Create a new green thread that will execute `entry`.
-/// The thread starts in `Runnable` state.
-pub fn make_thread(_entry: BlissVal) -> Result<GreenThreadId, BlissError> {
+/// The thread starts in `Runnable` state and is immediately scheduled
+/// on an OS worker thread. The entry value is treated as the thread's
+/// body; in the current bootstrap runtime the entry value is not
+/// callable, so the thread immediately completes with NIL as its result.
+/// A full evaluator would invoke `entry` as a zero-argument function.
+pub fn make_thread(entry: BlissVal) -> Result<GreenThreadId, BlissError> {
     let id = GreenThreadId(NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed));
+    let result_cell = Arc::new(ThreadResult::new());
     let thread = Arc::new(GreenThread {
         id,
         state: Mutex::new(ThreadState::Runnable),
         stack: BlissStack::new(DEFAULT_STACK_SIZE),
         tls: Mutex::new(vec![crate::value::NIL; MAX_TLS]),
+        result: Arc::clone(&result_cell),
+        interrupt_pending: AtomicBool::new(false),
+        interrupt_value: Mutex::new(crate::value::NIL),
     });
-    thread_registry().lock().unwrap().insert(id, thread);
+
+    // Register the thread before spawning so it is visible to other threads.
+    thread_registry()
+        .lock()
+        .unwrap()
+        .insert(id, Arc::clone(&thread));
+
+    // Clone what we need for the OS thread closure.
+    let thread_handle = Arc::clone(&thread);
+    let _entry = entry;
+
+    // Spawn an OS worker thread that runs the green thread's body.
+    std::thread::Builder::new()
+        .name(format!("bliss-green-{}", id.0))
+        .spawn(move || {
+            // The thread is now running.
+            thread_handle.set_state(ThreadState::Runnable);
+
+            // In a full implementation this would invoke `_entry` through
+            // the evaluator.  For the bootstrap runtime we simply produce
+            // NIL as the result since we have no evaluator to call the
+            // entry function.  Any pending interrupt is checked and would
+            // be delivered here in a full implementation.
+            let result_val = crate::value::NIL;
+
+            // Mark thread as dead and publish the result.
+            thread_handle.set_state(ThreadState::Dead);
+            result_cell.complete(result_val);
+        })
+        .map_err(|e| BlissError::Internal(format!("failed to spawn thread: {}", e)))?;
+
     Ok(id)
 }
 
 /// Wait for a green thread to finish, returning its result value.
+///
+/// Blocks the calling thread until the target green thread transitions
+/// to `Dead` state and its result is available. Returns the result
+/// value that the thread's entry function produced. If the thread ID
+/// is not found in the registry, returns an error.
 pub fn join_thread(id: GreenThreadId) -> Result<BlissVal, BlissError> {
-    let registry = thread_registry().lock().unwrap();
-    if registry.contains_key(&id) {
-        // In the bootstrap implementation, threads don't truly execute.
-        // Return NIL as the result value.
-        Ok(crate::value::NIL)
-    } else {
-        Err(BlissError::Internal(format!("no thread with id {}", id.0)))
-    }
+    // Look up the thread descriptor to get its result cell.
+    let result_cell = {
+        let registry = thread_registry().lock().unwrap();
+        match registry.get(&id) {
+            Some(thread) => Arc::clone(&thread.result),
+            None => {
+                return Err(BlissError::Internal(format!(
+                    "no thread with id {}",
+                    id.0
+                )));
+            }
+        }
+    };
+
+    // Block until the thread completes, then return the result.
+    let val = result_cell.wait();
+    Ok(val)
 }
 
 /// Get the current green thread's ID.
@@ -163,20 +290,32 @@ pub fn current_thread() -> &'static GreenThread {
 }
 
 /// Yield the current green thread at the next safepoint.
+///
+/// Hints to the OS scheduler that this thread is willing to give up
+/// its time slice. In the M:N model this would switch to the next
+/// green thread on the same worker; in the bootstrap implementation
+/// it delegates to `std::thread::yield_now()`.
 pub fn thread_yield() {
-    // In the bootstrap implementation, yielding is a no-op since
-    // there is no preemptive scheduling yet.
+    std::thread::yield_now();
 }
 
 /// Interrupt a green thread, delivering a condition to it.
-pub fn interrupt_thread(id: GreenThreadId, _condition: BlissVal) -> Result<(), BlissError> {
+///
+/// Sets the interrupt-pending flag on the target thread and stores the
+/// condition value. The target thread will observe the interrupt at its
+/// next safepoint poll (or when it calls `take_interrupt`). If the
+/// thread ID is not found, returns an error.
+pub fn interrupt_thread(id: GreenThreadId, condition: BlissVal) -> Result<(), BlissError> {
     let registry = thread_registry().lock().unwrap();
-    if registry.contains_key(&id) {
-        // In the bootstrap implementation, interrupts are accepted but
-        // not delivered (no scheduler is running to deliver them).
-        Ok(())
-    } else {
-        Err(BlissError::Internal(format!("no thread with id {}", id.0)))
+    match registry.get(&id) {
+        Some(thread) => {
+            thread.post_interrupt(condition);
+            Ok(())
+        }
+        None => Err(BlissError::Internal(format!(
+            "no thread with id {}",
+            id.0
+        ))),
     }
 }
 
