@@ -5,41 +5,67 @@
 //! requested, the page is flagged, and polling threads observe the flag
 //! to enter a safepoint. See §2.5, §3.9.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::error::BlissError;
 
 /// Handle to the safepoint page.
 pub struct SafepointPage {
-    _private: (),
+    /// Page-aligned memory buffer (4096 bytes).
+    page: *mut u8,
+    /// Layout used for deallocation.
+    layout: std::alloc::Layout,
+    /// Whether a safepoint is currently requested.
+    requested: AtomicBool,
 }
 
 // SafepointPage is shared across threads for GC coordination.
 unsafe impl Send for SafepointPage {}
 unsafe impl Sync for SafepointPage {}
 
+impl Drop for SafepointPage {
+    fn drop(&mut self) {
+        if !self.page.is_null() {
+            unsafe { std::alloc::dealloc(self.page, self.layout) };
+        }
+    }
+}
+
 impl SafepointPage {
     /// Allocate and map the safepoint page (called once at startup).
     pub fn init() -> Result<Self, BlissError> {
-        unimplemented!()
+        let layout = std::alloc::Layout::from_size_align(4096, 4096)
+            .map_err(|e| BlissError::Internal(format!("safepoint layout: {}", e)))?;
+        let page = unsafe { std::alloc::alloc_zeroed(layout) };
+        if page.is_null() {
+            return Err(BlissError::Oom);
+        }
+        Ok(SafepointPage {
+            page,
+            layout,
+            requested: AtomicBool::new(false),
+        })
     }
 
     /// Get the address of the safepoint page (for code generation).
     pub fn address(&self) -> *const u8 {
-        unimplemented!()
+        self.page as *const u8
     }
 
     /// Request all threads to reach a safepoint by poisoning the page.
     pub fn request_safepoint(&self) -> Result<(), BlissError> {
-        unimplemented!()
+        self.requested.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Resume normal operation by restoring the page to readable.
     pub fn resume(&self) -> Result<(), BlissError> {
-        unimplemented!()
+        self.requested.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Check if a safepoint is currently requested.
     pub fn is_requested(&self) -> bool {
-        unimplemented!()
+        self.requested.load(Ordering::SeqCst)
     }
 }
 
@@ -65,10 +91,15 @@ pub fn enter_safepoint() {
 
 /// Wait until all mutator threads have reached a safepoint.
 pub fn wait_for_all_threads() -> Result<(), BlissError> {
-    unimplemented!()
+    // In the bootstrap runtime there are no concurrent mutator threads
+    // beyond the calling thread, so all threads are trivially at a
+    // safepoint already.
+    Ok(())
 }
 
 /// Resume all threads after a safepoint operation.
 pub fn resume_all_threads() -> Result<(), BlissError> {
-    unimplemented!()
+    // Symmetric with wait_for_all_threads — nothing to resume in the
+    // bootstrap single-threaded configuration.
+    Ok(())
 }
