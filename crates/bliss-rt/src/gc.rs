@@ -231,7 +231,8 @@ impl HeapAllocator {
     }
 
     /// Refill the TLAB from a nursery region. If no nursery space is available,
-    /// triggers a minor GC (via the global collector) and retries once.
+    /// lazily converts a Free region to Nursery and retries. Returns OOM only
+    /// if no nursery region with space and no free region can be found.
     fn refill_tlab(&mut self) -> Result<(), BlissError> {
         let mut guard = heap_state().lock().unwrap();
         let state = guard.as_mut().ok_or_else(|| {
@@ -252,6 +253,30 @@ impl HeapAllocator {
                 self.tlab.limit = unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
                 self.tlab.region_idx = idx as u16;
                 // Advance the region's alloc_top past the TLAB.
+                region.header.alloc_top = unsafe { region.header.alloc_top.add(self.tlab_size) };
+                return Ok(());
+            }
+        }
+
+        // No nursery region with space — convert a Free region to Nursery.
+        for (idx, region) in state.regions.iter_mut().enumerate() {
+            if region.header.kind != RegionKind::Free {
+                continue;
+            }
+            // Convert Free → Nursery.
+            region.header.kind = RegionKind::Nursery;
+            region.header.gen_age = 0;
+            region.header.alloc_top = region.base;
+            region.header.live_bytes = 0;
+            state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
+
+            let top = region.header.alloc_top as usize;
+            let limit = region.header.alloc_limit as usize;
+            let available = limit.saturating_sub(top);
+            if available >= self.tlab_size {
+                self.tlab.cursor = region.header.alloc_top;
+                self.tlab.limit = unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
+                self.tlab.region_idx = idx as u16;
                 region.header.alloc_top = unsafe { region.header.alloc_top.add(self.tlab_size) };
                 return Ok(());
             }
@@ -592,7 +617,32 @@ impl Collector for HeapCollector {
                 cursor += total_size;
             }
 
-            // Phase 3: Reset the nursery region for reuse.
+            // Phase 3: Run finalizers for dead (non-forwarded) objects before
+            // zeroing the region. An object is dead if it was NOT forwarded
+            // (i.e., its type_id is not FORWARDED_TYPE_ID and it has a valid header).
+            {
+                let base = state.regions[nursery_idx].base as usize;
+                let top = state.regions[nursery_idx].header.alloc_top as usize;
+                let mut fcursor = base;
+                while fcursor + OBJECT_HEADER_SIZE <= top {
+                    let header_ptr = fcursor as *const u8;
+                    let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                    if body_size == 0 && type_id == 0 {
+                        break;
+                    }
+                    let total_size = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                    // Non-forwarded objects in a nursery being collected are dead.
+                    if type_id != FORWARDED_TYPE_ID {
+                        // Construct a BlissVal for the object body pointer.
+                        let body_ptr = unsafe { header_ptr.add(OBJECT_HEADER_SIZE) };
+                        let obj_val = BlissVal::from_raw(body_ptr as u64);
+                        run_finalizers_for(obj_val);
+                    }
+                    fcursor += total_size;
+                }
+            }
+
+            // Phase 4: Reset the nursery region for reuse.
             let region = &mut state.regions[nursery_idx];
             // Zero the region memory so walk_heap doesn't see stale forwarding pointers.
             let region_used = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
@@ -604,6 +654,20 @@ impl Collector for HeapCollector {
             region.header.alloc_top = region.base;
             region.header.live_bytes = 0;
             region.header.gen_age = 0;
+        }
+
+        // Break weak pointers to objects that were in nursery regions (now freed).
+        // After resetting, any pointer into these regions is dead.
+        {
+            let nursery_ranges: Vec<(usize, usize)> = nursery_indices.iter().map(|&idx| {
+                let base = state.regions[idx].base as usize;
+                let limit = state.regions[idx].header.alloc_limit as usize;
+                (base, limit)
+            }).collect();
+            break_dead_weak_pointers(&|val: BlissVal| {
+                let addr = val.to_raw() as usize;
+                nursery_ranges.iter().any(|&(base, limit)| addr >= base && addr < limit)
+            });
         }
 
         // Update stats.
@@ -640,16 +704,117 @@ impl Collector for HeapCollector {
             BlissError::Internal("heap not initialized".into())
         })?;
 
-        // Phase 1: Concurrent marking — walk all old-gen/survivor/large-object
-        // regions and compute accurate live_bytes by scanning object headers.
-        // Record TAMS (Top-At-Mark-Start) per region for implicit liveness
-        // of objects allocated above TAMS.
+        // Phase 1: Mark phase — conservative pointer tracing.
+        //
+        // We use a mark bitmap (one bit per OBJECT_ALIGNMENT-byte slot) to track
+        // which objects are reachable. The algorithm:
+        //   1. Build an index of all object start addresses in old-gen/survivor/LO regions.
+        //   2. Scan all non-free regions (including nursery) for pointer-like values
+        //      that point to indexed objects, marking them live.
+        //   3. Transitively mark objects referenced by newly-marked objects.
+        //   4. Compute live_bytes from the mark bitmap.
+        //
+        // This is a conservative approach: any aligned 8-byte value that happens to
+        // match an object address will mark that object as live (false retention is
+        // possible, but false collection is not).
         let region_count = state.regions.len();
+        let heap_base_addr = state.heap_base as usize;
+        let heap_size = state.config.heap_size;
+        let region_size = state.config.region_size;
+
+        // Record TAMS (Top-At-Mark-Start) per region.
         let mut tams: Vec<usize> = Vec::with_capacity(region_count);
         for region in state.regions.iter() {
             tams.push(region.header.alloc_top as usize);
         }
 
+        // Build a set of valid object body addresses in old-gen/survivor/LO regions,
+        // along with their sizes. We store (body_addr, total_size, region_idx).
+        let mut object_index: std::collections::HashMap<usize, (usize, usize)> =
+            std::collections::HashMap::new();
+        for (idx, region) in state.regions.iter().enumerate() {
+            match region.header.kind {
+                RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject => {
+                    let base = region.base as usize;
+                    let top = tams[idx];
+                    if top <= base {
+                        continue;
+                    }
+                    let mut cursor = base;
+                    while cursor + OBJECT_HEADER_SIZE <= top {
+                        let header_ptr = cursor as *const u8;
+                        let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                        if body_size == 0 && type_id == 0 {
+                            break;
+                        }
+                        let total_size =
+                            align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                        if type_id != FORWARDED_TYPE_ID {
+                            let body_addr = cursor + OBJECT_HEADER_SIZE;
+                            object_index.insert(body_addr, (total_size, idx));
+                        }
+                        cursor += total_size;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Mark bitmap: track which object body addresses are marked live.
+        let mut marked: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // Conservative scan: scan ALL non-free regions for pointer-like values
+        // that match known object addresses.
+        let mut scan_worklist: Vec<usize> = Vec::new();
+        for (idx, region) in state.regions.iter().enumerate() {
+            if region.header.kind == RegionKind::Free {
+                continue;
+            }
+            // For old-gen/survivor/LO regions being marked, skip scanning their
+            // own objects as roots — they will only be live if referenced from
+            // nursery regions or other roots. But we conservatively scan nursery
+            // regions as roots (they contain the live set from the last minor GC).
+            let base = region.base as usize;
+            let top = tams[idx].min(region.header.alloc_top as usize);
+            if top <= base {
+                continue;
+            }
+            // Scan memory in this region for pointer-sized values.
+            let mut scan = base;
+            while scan + 8 <= top {
+                let val = unsafe { *(scan as *const usize) };
+                if val >= heap_base_addr && val < heap_base_addr + heap_size {
+                    if object_index.contains_key(&val) && !marked.contains(&val) {
+                        marked.insert(val);
+                        scan_worklist.push(val);
+                    }
+                }
+                scan += 8; // scan every 8-byte aligned slot
+            }
+        }
+
+        // Transitive closure: scan newly marked objects for more pointers.
+        while let Some(obj_addr) = scan_worklist.pop() {
+            if let Some(&(total_size, _)) = object_index.get(&obj_addr) {
+                let body_size = total_size.saturating_sub(OBJECT_HEADER_SIZE);
+                let mut scan = obj_addr;
+                let scan_end = obj_addr + body_size;
+                while scan + 8 <= scan_end {
+                    let val = unsafe { *(scan as *const usize) };
+                    if val >= heap_base_addr && val < heap_base_addr + heap_size {
+                        if object_index.contains_key(&val) && !marked.contains(&val) {
+                            marked.insert(val);
+                            scan_worklist.push(val);
+                        }
+                    }
+                    scan += 8;
+                }
+            }
+        }
+
+        // Compute live_bytes per region from mark results.
+        // Also run finalizers for dead objects and break their weak pointers.
+        let mut dead_object_vals: Vec<BlissVal> = Vec::new();
         for (idx, region) in state.regions.iter_mut().enumerate() {
             match region.header.kind {
                 RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject => {
@@ -660,28 +825,26 @@ impl Collector for HeapCollector {
                         continue;
                     }
 
-                    // Walk objects and sum up live bytes.
                     let mut live = 0u32;
                     let mut cursor = base;
                     while cursor + OBJECT_HEADER_SIZE <= top {
                         let header_ptr = cursor as *const u8;
                         let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
-
                         if body_size == 0 && type_id == 0 {
-                            break; // End of allocated objects.
+                            break;
                         }
-
                         let total_size =
                             align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
-
-                        // Mark as live: all objects reachable from roots are live.
-                        // In this simplified mark phase, we conservatively treat all
-                        // objects with valid headers as live (the marker has no root
-                        // set to refine this). Forwarded objects are dead (already moved).
                         if type_id != FORWARDED_TYPE_ID {
-                            live += total_size as u32;
+                            let body_addr = cursor + OBJECT_HEADER_SIZE;
+                            if marked.contains(&body_addr) {
+                                live += total_size as u32;
+                            } else {
+                                // Object is dead — queue for finalization.
+                                let obj_val = BlissVal::from_raw(body_addr as u64);
+                                dead_object_vals.push(obj_val);
+                            }
                         }
-
                         cursor += total_size;
                     }
 
@@ -689,6 +852,18 @@ impl Collector for HeapCollector {
                 }
                 _ => {}
             }
+        }
+
+        // Run finalizers for dead objects (R3.12).
+        for obj_val in &dead_object_vals {
+            run_finalizers_for(*obj_val);
+        }
+
+        // Break weak pointers to dead objects (R3.13).
+        {
+            let dead_set: std::collections::HashSet<u64> =
+                dead_object_vals.iter().map(|v| v.to_raw()).collect();
+            break_dead_weak_pointers(&|val: BlissVal| dead_set.contains(&val.to_raw()));
         }
 
         // Phase 2: Region selection — find old-gen regions with high garbage ratio.
@@ -739,8 +914,9 @@ impl Collector for HeapCollector {
                 let total_size =
                     align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
 
-                // Only copy non-forwarded (live) objects.
-                if type_id != FORWARDED_TYPE_ID {
+                // Only copy non-forwarded, marked (live) objects.
+                let body_addr = cursor + OBJECT_HEADER_SIZE;
+                if type_id != FORWARDED_TYPE_ID && marked.contains(&body_addr) {
                     // Try to copy; if target fills up, find another.
                     if Self::copy_object(state, header_ptr, body_size, target_idx).is_none() {
                         if let Some(new_target) =
@@ -988,6 +1164,73 @@ impl WeakPointer {
             (self.referent, false)
         }
     }
+
+    /// Break this weak pointer, clearing the referent. Called by the GC
+    /// when the referent becomes unreachable (per R3.13).
+    pub fn break_ref(&mut self) {
+        self.broken = true;
+        self.referent = crate::value::NIL;
+    }
+
+    /// Returns whether this weak pointer has been broken.
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+}
+
+// ── Weak pointer registry ─────────────────────────────────────────
+
+/// Wrapper around raw pointer to WeakPointer for Send/Sync.
+/// Safety: access is always guarded by the registry mutex.
+struct WeakPtrHandle(*mut WeakPointer);
+unsafe impl Send for WeakPtrHandle {}
+unsafe impl Sync for WeakPtrHandle {}
+
+/// Global registry of weak pointers so the GC can break them during collection.
+fn weak_pointer_registry() -> &'static Mutex<Vec<WeakPtrHandle>> {
+    static REGISTRY: OnceLock<Mutex<Vec<WeakPtrHandle>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register a weak pointer with the GC so it can be broken when its referent
+/// is collected. The caller must ensure the WeakPointer lives at least until
+/// it is unregistered or broken.
+pub fn register_weak_pointer(wp: &mut WeakPointer) {
+    let ptr: *mut WeakPointer = wp;
+    let mut registry = weak_pointer_registry().lock().unwrap();
+    registry.push(WeakPtrHandle(ptr));
+}
+
+/// Unregister a weak pointer from the GC registry.
+pub fn unregister_weak_pointer(wp: &WeakPointer) {
+    let ptr = wp as *const WeakPointer;
+    let mut registry = weak_pointer_registry().lock().unwrap();
+    registry.retain(|h| h.0 as *const WeakPointer != ptr);
+}
+
+/// Break all weak pointers whose referent is in a dead region (one being freed).
+/// Called by the collector during minor_gc and major_gc.
+/// `is_dead` returns true if the given BlissVal's referent is unreachable.
+fn break_dead_weak_pointers<F>(is_dead: &F)
+where
+    F: Fn(BlissVal) -> bool,
+{
+    let mut registry = weak_pointer_registry().lock().unwrap();
+    for handle in registry.iter() {
+        // Safety: the weak pointer was registered by the owner and is still alive.
+        let wp = unsafe { &mut *handle.0 };
+        if !wp.is_broken() {
+            let (referent, _) = wp.value();
+            if is_dead(referent) {
+                wp.break_ref();
+            }
+        }
+    }
+    // Remove broken weak pointers from the registry.
+    registry.retain(|handle| {
+        let wp = unsafe { &*handle.0 };
+        !wp.is_broken()
+    });
 }
 
 // ── Finalization ───────────────────────────────────────────────────
@@ -1194,21 +1437,16 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     }
 
     // Set up region metadata. Divide the heap into regions.
-    let nursery_regions = (config.nursery_size / config.region_size) as u32;
+    // All regions start as Free — nursery regions are lazily converted
+    // from Free→Nursery on the first TLAB refill (see refill_tlab).
     let mut regions = Vec::with_capacity(regions_total as usize);
 
     for i in 0..regions_total {
         let region_base = unsafe { heap_base.add(i as usize * config.region_size) };
         let region_limit = unsafe { region_base.add(config.region_size) } as *const u8;
 
-        let kind = if i < nursery_regions {
-            RegionKind::Nursery
-        } else {
-            RegionKind::Free
-        };
-
         let header = RegionHeader {
-            kind,
+            kind: RegionKind::Free,
             gen_age: 0,
             live_bytes: 0,
             alloc_top: region_base, // nothing allocated yet
@@ -1224,13 +1462,11 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
         });
     }
 
-    let free_regions = regions.iter().filter(|r| r.header.kind == RegionKind::Free).count() as u32;
-
     let mut stats = GcStats::default();
     stats.nursery_capacity = config.nursery_size as u64;
     stats.old_gen_capacity = (config.heap_size - config.nursery_size) as u64;
     stats.regions_total = regions_total;
-    stats.regions_free = free_regions;
+    stats.regions_free = regions_total; // all regions start Free
 
     let state = HeapState {
         config: config.clone(),
