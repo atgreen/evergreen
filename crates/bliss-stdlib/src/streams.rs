@@ -162,3 +162,77 @@ pub fn output_stream_p(stream: BlissVal) -> bool {
 pub fn stream_element_type(stream: BlissVal) -> BlissVal {
     unimplemented!("stream_element_type")
 }
+
+// ── GrayStream free-function wrappers ─────────────────────────────
+// These extract the GrayStream impl from a BlissVal stream and
+// delegate to the trait methods.
+
+/// Read one character from a stream.
+pub fn stream_read_char(stream: BlissVal) -> Result<BlissVal, BlissError> {
+    unimplemented!("stream_read_char")
+}
+
+/// Unread a character back onto a stream.
+pub fn stream_unread_char(stream: BlissVal, ch: BlissVal) -> Result<(), BlissError> {
+    unimplemented!("stream_unread_char")
+}
+
+/// Read one byte from a stream.
+pub fn stream_read_byte(stream: BlissVal) -> Result<BlissVal, BlissError> {
+    unimplemented!("stream_read_byte")
+}
+
+/// Write one character to a stream.
+pub fn stream_write_char(stream: BlissVal, ch: BlissVal) -> Result<(), BlissError> {
+    unimplemented!("stream_write_char")
+}
+
+/// Write one byte to a stream.
+pub fn stream_write_byte(stream: BlissVal, byte: BlissVal) -> Result<(), BlissError> {
+    unimplemented!("stream_write_byte")
+}
+
+/// Write a string to a stream.
+pub fn stream_write_string(
+    stream: BlissVal,
+    string: BlissVal,
+    start: usize,
+    end: Option<usize>,
+) -> Result<(), BlissError> {
+    unimplemented!("stream_write_string")
+}
+
+/// Force output on a stream.
+pub fn stream_force_output(stream: BlissVal) -> Result<(), BlissError> {
+    unimplemented!("stream_force_output")
+}
+
+/// Finish output (flush all buffers) on a stream.
+pub fn stream_finish_output(stream: BlissVal) -> Result<(), BlissError> {
+    unimplemented!("stream_finish_output")
+}
+
+/// Clear the input buffer of a stream.
+pub fn stream_clear_input(stream: BlissVal) -> Result<(), BlissError> {
+    unimplemented!("stream_clear_input")
+}
+
+/// Check if input is available on a stream.
+pub fn stream_listen(stream: BlissVal) -> Result<bool, BlissError> {
+    unimplemented!("stream_listen")
+}
+
+/// Get the current line number of a stream.
+pub fn stream_line_number(stream: BlissVal) -> Option<u64> {
+    unimplemented!("stream_line_number")
+}
+
+/// Get the current column number of a stream.
+pub fn stream_line_column(stream: BlissVal) -> Option<u64> {
+    unimplemented!("stream_line_column")
+}
+
+/// Create a BlissVal representing a Lisp string (helper for tests).
+pub fn make_lisp_string(s: &str) -> BlissVal {
+    unimplemented!("make_lisp_string")
+}
