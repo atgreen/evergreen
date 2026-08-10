@@ -5,6 +5,7 @@
 //! See §1.3 of the spec.
 
 use crate::value::BlissVal;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── ObjectHeader ───────────────────────────────────────────────────
 
@@ -19,46 +20,57 @@ use crate::value::BlissVal;
 #[repr(transparent)]
 pub struct ObjectHeader(pub u64);
 
+// Bit-field masks and shifts
+const TYPE_ID_SHIFT: u32 = 56;
+const TYPE_ID_MASK: u64 = 0xFF << TYPE_ID_SHIFT;
+const GC_BITS_SHIFT: u32 = 48;
+const GC_BITS_MASK: u64 = 0xFF << GC_BITS_SHIFT;
+const HASH_SHIFT: u32 = 16;
+const HASH_MASK: u64 = 0xFFFF_FFFF << HASH_SHIFT;
+const SIZE_MASK: u64 = 0xFFFF;
+
 impl ObjectHeader {
     /// Create a new object header.
     pub fn new(type_id: u8, size_units: u16) -> Self {
-        unimplemented!("ObjectHeader::new")
+        let bits = ((type_id as u64) << TYPE_ID_SHIFT)
+            | (size_units as u64);
+        ObjectHeader(bits)
     }
 
     /// Extract the type ID (bits 63:56).
     pub fn type_id(self) -> u8 {
-        unimplemented!("ObjectHeader::type_id")
+        ((self.0 & TYPE_ID_MASK) >> TYPE_ID_SHIFT) as u8
     }
 
     /// Extract the GC bits (bits 55:48).
     pub fn gc_bits(self) -> u8 {
-        unimplemented!("ObjectHeader::gc_bits")
+        ((self.0 & GC_BITS_MASK) >> GC_BITS_SHIFT) as u8
     }
 
     /// Set GC bits (bits 55:48).
     pub fn set_gc_bits(&mut self, bits: u8) {
-        unimplemented!("ObjectHeader::set_gc_bits")
+        self.0 = (self.0 & !GC_BITS_MASK) | ((bits as u64) << GC_BITS_SHIFT);
     }
 
     /// Extract the cached identity hash (bits 47:16). Zero means not yet computed.
     pub fn hash(self) -> u32 {
-        unimplemented!("ObjectHeader::hash")
+        ((self.0 & HASH_MASK) >> HASH_SHIFT) as u32
     }
 
     /// Set the cached identity hash (bits 47:16).
     pub fn set_hash(&mut self, hash: u32) {
-        unimplemented!("ObjectHeader::set_hash")
+        self.0 = (self.0 & !HASH_MASK) | ((hash as u64) << HASH_SHIFT);
     }
 
     /// Extract the size in 8-byte units (bits 15:0).
     /// `0xFFFF` signals the large-object extension (true size at offset 8).
     pub fn size_units(self) -> u16 {
-        unimplemented!("ObjectHeader::size_units")
+        (self.0 & SIZE_MASK) as u16
     }
 
     /// Whether this is a large object (size field == 0xFFFF sentinel).
     pub fn is_large_object(self) -> bool {
-        unimplemented!("ObjectHeader::is_large_object")
+        self.size_units() == 0xFFFF
     }
 }
 
@@ -76,22 +88,41 @@ pub mod gc_bit {
 impl ObjectHeader {
     /// Atomically read mark bit.
     pub fn is_marked(&self) -> bool {
-        unimplemented!("ObjectHeader::is_marked")
+        let atomic = unsafe { &*((&self.0) as *const u64 as *const AtomicU64) };
+        let bits = atomic.load(Ordering::Acquire);
+        let gc = ((bits & GC_BITS_MASK) >> GC_BITS_SHIFT) as u8;
+        gc & (1 << gc_bit::MARK) != 0
     }
 
     /// Atomically set mark bit via CAS.
+    /// Returns true if the bit was successfully set (was previously unset).
+    /// Returns false if the mark bit was already set.
     pub fn set_marked(&self) -> bool {
-        unimplemented!("ObjectHeader::set_marked")
+        let atomic = unsafe { &*((&self.0) as *const u64 as *const AtomicU64) };
+        let mark_bit_in_word: u64 = 1u64 << (GC_BITS_SHIFT + gc_bit::MARK as u32);
+        loop {
+            let old = atomic.load(Ordering::Acquire);
+            if old & mark_bit_in_word != 0 {
+                return false; // already marked
+            }
+            let new = old | mark_bit_in_word;
+            match atomic.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
+        }
     }
 
     /// Check if object has been forwarded (evacuated by GC).
     pub fn is_forwarded(&self) -> bool {
-        unimplemented!("ObjectHeader::is_forwarded")
+        let gc = self.gc_bits();
+        gc & (1 << gc_bit::FORWARDED) != 0
     }
 
     /// Check if object is pinned (must not be moved by GC).
     pub fn is_pinned(&self) -> bool {
-        unimplemented!("ObjectHeader::is_pinned")
+        let gc = self.gc_bits();
+        gc & (1 << gc_bit::PINNED) != 0
     }
 }
 

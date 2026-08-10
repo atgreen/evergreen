@@ -64,7 +64,29 @@ pub enum BlissError {
 
 impl core::fmt::Display for BlissError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        unimplemented!("BlissError::Display")
+        match self {
+            BlissError::Oom => write!(f, "out of memory"),
+            BlissError::StackOverflow(tid) => write!(f, "stack overflow in thread {}", tid.0),
+            BlissError::InvalidImage(msg) => write!(f, "invalid image: {}", msg),
+            BlissError::FfiError(msg) => write!(f, "FFI error: {}", msg),
+            BlissError::SignalError(sig) => write!(f, "signal error: signal {}", sig),
+            BlissError::Shutdown => write!(f, "shutdown requested"),
+            BlissError::Internal(msg) => write!(f, "internal error: {}", msg),
+            BlissError::TypeError { datum, expected } => {
+                write!(f, "type error: {:?} is not of type {}", datum, expected)
+            }
+            BlissError::UnboundVariable(sym) => {
+                write!(f, "unbound variable: {:?}", sym)
+            }
+            BlissError::UndefinedFunction(sym) => {
+                write!(f, "undefined function: {:?}", sym)
+            }
+            BlissError::ArithmeticError(msg) => write!(f, "arithmetic error: {}", msg),
+            BlissError::PackageError(msg) => write!(f, "package error: {}", msg),
+            BlissError::StreamError(msg) => write!(f, "stream error: {}", msg),
+            BlissError::FileError(msg) => write!(f, "file error: {}", msg),
+            BlissError::SandboxViolation(msg) => write!(f, "sandbox violation: {}", msg),
+        }
     }
 }
 

@@ -33,3 +33,8 @@ pub mod error;
 
 // ── Top-level entry ───────────────────────────────────────────────
 pub mod runtime;
+
+// ── Re-exports for convenience ────────────────────────────────────
+pub use value::BlissVal;
+pub use object::ObjectHeader;
+pub use error::BlissError;
