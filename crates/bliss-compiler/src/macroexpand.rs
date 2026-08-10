@@ -10,6 +10,8 @@ use std::sync::{Arc, LazyLock, RwLock};
 use bliss_rt::error::BlissError;
 use bliss_rt::value::{BlissVal, TAG_CONS, TAG_MASK};
 
+use crate::reader::symbol_name;
+
 // ── Constants ─────────────────────────────────────────────────────
 
 /// Default maximum number of macroexpand-1 iterations per macroexpand call.
@@ -604,17 +606,14 @@ pub fn macroexpand(form: BlissVal, env: &Environment) -> Result<(BlissVal, bool)
 /// 1. Macroexpand the top-level form.
 /// 2. If the result is a self-evaluating atom or symbol, return it.
 /// 3. If the result is a cons (compound form):
-///    a. Check for compiler macros (spec §4.2.4, R4.12) — if a compiler
+///    a. Check for QUOTE — quoted data is opaque, no sub-form expansion
+///       occurs (spec §4.2.7).
+///    b. Check for compiler macros (spec §4.2.4, R4.12) — if a compiler
 ///       macro exists for the operator and notinline is NOT declared,
 ///       invoke it. If it declines (returns form unchanged), fall through.
-///    b. Recursively expand each element in the list, building new cons
-///       cells (non-destructive).
-///
-/// This does NOT handle special-form-specific walking (e.g., QUOTE
-/// suppression, LET binding environment augmentation) — that requires
-/// the full code-walker which depends on operator dispatch tables.
-/// This function provides the baseline recursive expansion that the
-/// full code-walker builds upon.
+///    c. Per spec §4.2.3 Phase 3 step 4.d.ii, the operator is NOT
+///       recursively code-walked (only arguments are expanded). The
+///       operator was already checked for macros by macroexpand above.
 pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
     // Step 1: Macroexpand the top-level form
     let (expanded, _) = macroexpand(form, env)?;
@@ -628,7 +627,13 @@ pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
     // Step 3: The form is a compound (cons cell).
     let operator = unsafe { cons_car(expanded) };
 
-    // Step 3.d.i: Compiler macro check (spec §4.2.4, R4.12).
+    // Step 3.a: QUOTE suppression (spec §4.2.7).
+    // Quoted data is opaque — no sub-form expansion should occur.
+    if is_quote_symbol(operator) {
+        return Ok(expanded);
+    }
+
+    // Step 3.b: Compiler macro check (spec §4.2.4, R4.12).
     // Only applies to function-call forms (not special operators or macros
     // after full macroexpansion).
     if !matches!(env.function_information(operator), Some(FunctionInfo::SpecialOperator)) {
@@ -645,9 +650,43 @@ pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
         }
     }
 
-    // Step 3: Recursively walk the list structure, expanding each element.
-    // Build new cons cells (non-destructive) to avoid corrupting shared structure.
-    walk_cons(expanded, env)
+    // Step 3.c: Recursively walk the arguments (CDR) only, not the operator.
+    // Per spec §4.2.3 Phase 3 step 4.d.ii, only the arguments (not the
+    // operator) should be recursively expanded for function calls.
+    let cdr = unsafe { cons_cdr(expanded) };
+    let expanded_cdr = if cdr.is_cons() {
+        walk_cons(cdr, env)?
+    } else if !cdr.is_nil() {
+        // Dotted pair tail — expand as atom
+        let (expanded_cdr_val, _) = macroexpand(cdr, env)?;
+        expanded_cdr_val
+    } else {
+        cdr
+    };
+
+    // If nothing changed, return the original form to preserve identity.
+    if expanded_cdr == cdr {
+        return Ok(expanded);
+    }
+
+    // Build a new cons cell with the operator unchanged and expanded arguments.
+    Ok(alloc_cons(operator, expanded_cdr))
+}
+
+/// Check if a BlissVal is the QUOTE symbol.
+fn is_quote_symbol(val: BlissVal) -> bool {
+    if !val.is_symbol() {
+        return false;
+    }
+    // NIL and T are special symbols that are not QUOTE
+    if val.is_nil() || val.0 == bliss_rt::value::T.0 {
+        return false;
+    }
+    let idx = val.as_symbol_index();
+    match symbol_name(idx) {
+        Some(name) => name == "QUOTE",
+        None => false,
+    }
 }
 
 /// Recursively walk a cons-cell structure, expanding all subforms.
