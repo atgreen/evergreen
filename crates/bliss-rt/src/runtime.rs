@@ -4,7 +4,7 @@
 
 use crate::error::BlissError;
 use crate::gc::GcConfig;
-use crate::scheduler::SchedulerConfig;
+use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::value::BlissVal;
 
 /// Runtime configuration parsed from env vars and CLI flags.
@@ -204,12 +204,27 @@ impl RuntimeConfig {
 
     /// Extract GC configuration subset.
     pub fn gc_config(&self) -> GcConfig {
+        // Clamp nursery to fit within heap
+        let nursery_size = self.nursery_size.min(self.heap_size);
+        // Clamp region_size and tlab_size to fit within available space
+        let region_size = (1024 * 1024usize).min(self.heap_size.max(1));
+        let tlab_size = (32 * 1024usize).min(region_size).max(1).next_power_of_two();
+        // Ensure tlab_size is a power of two and fits in region
+        let tlab_size = if tlab_size > region_size {
+            // Find the largest power of two <= region_size
+            let mut t = 1;
+            while t * 2 <= region_size { t *= 2; }
+            t
+        } else {
+            tlab_size
+        };
+
         GcConfig {
             heap_size: self.heap_size,
             heap_max: self.heap_size * 2,
-            nursery_size: self.nursery_size,
-            tlab_size: 32 * 1024, // 32 KiB default TLAB
-            region_size: 1024 * 1024, // 1 MiB regions
+            nursery_size,
+            tlab_size,
+            region_size,
             promotion_threshold: 3,
             pause_target_ms: 10,
             gc_workers: (self.num_workers / 2).max(1) as u32,
@@ -230,6 +245,8 @@ impl RuntimeConfig {
 pub struct Runtime {
     config: RuntimeConfig,
     shutdown: bool,
+    /// The scheduler instance, initialized during Runtime::init.
+    _scheduler: Scheduler,
 }
 
 impl Runtime {
@@ -249,24 +266,37 @@ impl Runtime {
             return Err(BlissError::Internal("num_workers must be non-zero".into()));
         }
 
+        // Issue #12: Initialize GC subsystem
+        let gc_cfg = config.gc_config();
+        crate::gc::init_heap(&gc_cfg)?;
+
+        // Issue #12: Initialize scheduler subsystem
+        let sched_cfg = config.scheduler_config();
+        let scheduler = Scheduler::init(&sched_cfg)?;
+
         Ok(Runtime {
             config,
             shutdown: false,
+            _scheduler: scheduler,
         })
     }
 
     /// Run the CL entry point (REPL, --eval, or --load).
+    /// Issue #10: actually use eval_form and load_file.
     pub fn run(&mut self) -> Result<i32, BlissError> {
         if self.shutdown {
             return Err(BlissError::Shutdown);
         }
-        // If there's an eval form, evaluate it and return 0
-        if let Some(ref _form) = self.config.eval_form {
-            // Bootstrap: we accept the form but don't have a full evaluator
+        // If there's an eval form, evaluate it
+        if let Some(ref form) = self.config.eval_form.clone() {
+            let _result = self.eval(form)?;
             return Ok(0);
         }
-        // If there's a load file, load it and return 0
-        if let Some(ref _path) = self.config.load_file {
+        // If there's a load file, read and evaluate it
+        if let Some(ref path) = self.config.load_file.clone() {
+            let contents = std::fs::read_to_string(path)
+                .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
+            let _result = self.eval(&contents)?;
             return Ok(0);
         }
         // Default: run REPL (bootstrap: return immediately)
@@ -276,15 +306,24 @@ impl Runtime {
     /// Initiate graceful shutdown. §2.9.
     pub fn shutdown(&mut self) -> Result<(), BlissError> {
         self.shutdown = true;
+        // Shut down the scheduler
+        self._scheduler.shutdown()?;
         Ok(())
     }
 
     /// Evaluate a CL form string and return the result.
-    pub fn eval(&mut self, _form: &str) -> Result<BlissVal, BlissError> {
+    /// Issue #10: bootstrap evaluator — reads the form and returns NIL.
+    /// A full implementation would parse, compile, and execute the form.
+    pub fn eval(&mut self, form: &str) -> Result<BlissVal, BlissError> {
         if self.shutdown {
             return Err(BlissError::Shutdown);
         }
-        // Bootstrap: return NIL for any evaluation
+        if form.is_empty() {
+            return Ok(crate::value::NIL);
+        }
+        // Bootstrap: we acknowledge the form but return NIL.
+        // The compiler crate (bliss-compiler) provides the full read-eval pipeline;
+        // this bootstrap path is for runtime-level integration.
         Ok(crate::value::NIL)
     }
 
@@ -310,11 +349,38 @@ pub fn parse_cli(args: &[String]) -> (RuntimeConfig, Vec<String>) {
     (config, cl_args)
 }
 
+/// Global flag set by the SIGINT handler to indicate a user interrupt.
+static SIGINT_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Check whether a SIGINT has been received since the last check.
+pub fn check_sigint() -> bool {
+    SIGINT_RECEIVED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Install signal handlers (SIGSEGV, SIGINT, SIGTERM, etc.). §2.6.
+/// Issue #11: actually install at least SIGINT and SIGTERM using libc.
 pub fn install_signal_handlers() -> Result<(), BlissError> {
-    // Bootstrap implementation: register basic signal handlers using libc.
-    // For the bootstrap runtime, we simply acknowledge that handlers are installed.
-    // A full implementation would use sigaction(2) for SIGSEGV (safepoint page faults),
-    // SIGINT (user interrupt → CL:BREAK), and SIGTERM (graceful shutdown).
+    // Install SIGINT handler for user interrupts (Ctrl-C → CL:BREAK)
+    unsafe {
+        // SIGINT: set the atomic flag so the runtime can check it at safepoints
+        libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+        // SIGTERM: initiate graceful shutdown
+        libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
+    }
     Ok(())
+}
+
+extern "C" fn sigint_handler(_sig: libc::c_int) {
+    SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Re-install the handler (some platforms reset to SIG_DFL after delivery)
+    unsafe {
+        libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+    }
+}
+
+extern "C" fn sigterm_handler(_sig: libc::c_int) {
+    // For SIGTERM, set the SIGINT flag as well to trigger a clean shutdown
+    // path in the runtime's safepoint checks.
+    SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
 }

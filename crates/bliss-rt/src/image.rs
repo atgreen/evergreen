@@ -129,10 +129,32 @@ pub enum ImageCompression {
 pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissError> {
     use std::io::Write;
 
-    let flags = if options.compression == ImageCompression::Zstd {
+    let mut flags = if options.compression == ImageCompression::Zstd {
         image_flags::COMPRESSED
     } else {
         0
+    };
+
+    // Issue #4: honour the purify option — mark the image read-only-safe
+    if options.purify {
+        flags |= image_flags::READ_ONLY_SAFE;
+    }
+
+    // Issue #4: set save_timestamp to the current UNIX epoch time
+    let save_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Issue #5: write a minimal heap section so round-trip produces meaningful content
+    let heap_data: Vec<u8> = crate::value::NIL.to_raw().to_ne_bytes().to_vec();
+    let heap_section = SectionEntry {
+        section_type: SectionType::Heap as u32,
+        flags: 0,
+        file_offset: (std::mem::size_of::<ImageHeader>()
+            + std::mem::size_of::<SectionEntry>()) as u64,
+        size: heap_data.len() as u64,
+        uncompressed_size: heap_data.len() as u64,
     };
 
     let header = ImageHeader {
@@ -141,12 +163,12 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         flags,
         platform_tag: current_platform_tag(),
         original_base: 0,
-        heap_size: 0,
+        heap_size: heap_data.len() as u64,
         entry_continuation: crate::value::NIL.to_raw(),
-        section_count: 0,
+        section_count: 1,
         gc_generation: 0,
         gc_metadata_offset: 0,
-        save_timestamp: 0,
+        save_timestamp,
         reserved: [0u8; 24],
         header_sha256: [0u8; 32],
     };
@@ -158,10 +180,37 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         )
     };
 
+    let section_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            &heap_section as *const SectionEntry as *const u8,
+            std::mem::size_of::<SectionEntry>(),
+        )
+    };
+
     let mut file = std::fs::File::create(path)
         .map_err(|e| BlissError::FileError(format!("cannot create image file: {}", e)))?;
     file.write_all(header_bytes)
         .map_err(|e| BlissError::FileError(format!("cannot write image header: {}", e)))?;
+    file.write_all(section_bytes)
+        .map_err(|e| BlissError::FileError(format!("cannot write section directory: {}", e)))?;
+    file.write_all(&heap_data)
+        .map_err(|e| BlissError::FileError(format!("cannot write heap data: {}", e)))?;
+
+    // Issue #4: if executable flag is set, set the executable permission on Unix
+    if options.executable {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(path)
+                .map_err(|e| BlissError::FileError(format!("cannot read file metadata: {}", e)))?;
+            let mut perms = metadata.permissions();
+            let mode = perms.mode();
+            perms.set_mode(mode | 0o111);
+            std::fs::set_permissions(path, perms)
+                .map_err(|e| BlissError::FileError(format!("cannot set executable permission: {}", e)))?;
+        }
+    }
+
     file.flush()
         .map_err(|e| BlissError::FileError(format!("cannot flush image file: {}", e)))?;
 
@@ -219,6 +268,23 @@ pub fn validate_image_header(path: &str) -> Result<ImageHeader, BlissError> {
         return Err(BlissError::InvalidImage(format!(
             "bad magic: expected {:#x}, got {:#x}",
             IMAGE_MAGIC, header.magic
+        )));
+    }
+
+    // Issue #2: Check format version compatibility
+    if header.format_version > FORMAT_VERSION {
+        return Err(BlissError::InvalidImage(format!(
+            "unsupported format version: image has {}, runtime supports up to {}",
+            header.format_version, FORMAT_VERSION
+        )));
+    }
+
+    // Issue #3: Check platform tag compatibility
+    let expected_platform = current_platform_tag();
+    if header.platform_tag != expected_platform {
+        return Err(BlissError::InvalidImage(format!(
+            "platform mismatch: image tag {:#x}, current platform tag {:#x}",
+            header.platform_tag, expected_platform
         )));
     }
 

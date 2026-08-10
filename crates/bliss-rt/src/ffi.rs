@@ -102,48 +102,110 @@ impl AlienType {
 pub unsafe fn ffi_call(
     fn_ptr: *const (),
     ret_type: &AlienType,
-    _arg_types: &[AlienType],
+    arg_types: &[AlienType],
     args: &[u64],
 ) -> Result<u64, BlissError> {
     if fn_ptr.is_null() {
         return Err(BlissError::FfiError("null function pointer".into()));
     }
 
-    // Dispatch based on argument count and return type for common C calling
-    // conventions. This is a bootstrap implementation supporting common cases.
-    match args.len() {
-        0 => {
-            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
-            Ok(f())
-        }
-        1 => {
-            match ret_type {
-                AlienType::Int { bits: 32, .. } => {
-                    let f: extern "C" fn(i32) -> i32 = std::mem::transmute(fn_ptr);
-                    Ok(f(args[0] as i32) as u32 as u64)
-                }
-                _ => {
-                    let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
-                    Ok(f(args[0]))
-                }
+    // Issue #7: Check if the return type or any argument type involves 32-bit int
+    // and dispatch appropriately. For the bootstrap, we handle the common cases
+    // of all-u64 and 32-bit int signatures.
+    let is_ret_i32 = matches!(ret_type, AlienType::Int { bits: 32, .. });
+    let all_args_i32 = !arg_types.is_empty()
+        && arg_types.iter().all(|t| matches!(t, AlienType::Int { bits: 32, .. }));
+
+    // Issue #6: Extended to support up to 8 arguments.
+    // Issue #7: Type-aware dispatch for i32 signatures.
+    if is_ret_i32 && all_args_i32 {
+        // All-i32 fast path
+        match args.len() {
+            0 => {
+                let f: extern "C" fn() -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f() as u32 as u64)
             }
+            1 => {
+                let f: extern "C" fn(i32) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0] as i32) as u32 as u64)
+            }
+            2 => {
+                let f: extern "C" fn(i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0] as i32, args[1] as i32) as u32 as u64)
+            }
+            3 => {
+                let f: extern "C" fn(i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32) as u32 as u64)
+            }
+            4 => {
+                let f: extern "C" fn(i32, i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32) as u32 as u64)
+            }
+            5 => {
+                let f: extern "C" fn(i32, i32, i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32) as u32 as u64)
+            }
+            6 => {
+                let f: extern "C" fn(i32, i32, i32, i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32, args[5] as i32) as u32 as u64)
+            }
+            7 => {
+                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32, args[5] as i32, args[6] as i32) as u32 as u64)
+            }
+            8 => {
+                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32) -> i32 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32, args[5] as i32, args[6] as i32, args[7] as i32) as u32 as u64)
+            }
+            _ => Err(BlissError::FfiError(format!(
+                "ffi_call: unsupported argument count {} (max 8)",
+                args.len()
+            ))),
         }
-        2 => {
-            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            Ok(f(args[0], args[1]))
+    } else {
+        // Generic u64 path (works for pointers, 64-bit ints, etc.)
+        match args.len() {
+            0 => {
+                let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
+                Ok(f())
+            }
+            1 => {
+                let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0]))
+            }
+            2 => {
+                let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0], args[1]))
+            }
+            3 => {
+                let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0], args[1], args[2]))
+            }
+            4 => {
+                let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0], args[1], args[2], args[3]))
+            }
+            5 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0], args[1], args[2], args[3], args[4]))
+            }
+            6 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5]))
+            }
+            7 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5], args[6]))
+            }
+            8 => {
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]))
+            }
+            _ => Err(BlissError::FfiError(format!(
+                "ffi_call: unsupported argument count {} (max 8)",
+                args.len()
+            ))),
         }
-        3 => {
-            let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            Ok(f(args[0], args[1], args[2]))
-        }
-        4 => {
-            let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            Ok(f(args[0], args[1], args[2], args[3]))
-        }
-        _ => Err(BlissError::FfiError(format!(
-            "ffi_call: unsupported argument count {}",
-            args.len()
-        ))),
     }
 }
 
@@ -227,11 +289,19 @@ pub fn unmarshal_from_c(raw: u64, alien_type: &AlienType) -> Result<BlissVal, Bl
             Ok(BlissVal::from_single_float(f))
         }
         AlienType::Double => {
-            // Double doesn't fit in single_float; return as fixnum of the
-            // integer part, or store the bits. For bootstrap, store as
-            // a fixnum of the rounded value.
+            // Issue #8: Double doesn't fit in single_float. To avoid losing
+            // the fractional part, check if the value fits without loss as an
+            // integer; otherwise, downcast to f32 single-float (lossy but
+            // preserves non-integer values for the bootstrap runtime).
+            // A full implementation would use a heap-allocated double-float.
             let d = f64::from_bits(raw);
-            Ok(BlissVal::from_fixnum(d as i64))
+            if d.fract() == 0.0 && d >= i64::MIN as f64 && d <= i64::MAX as f64 {
+                Ok(BlissVal::from_fixnum(d as i64))
+            } else {
+                // Store as single_float — lossy for large doubles, but preserves
+                // fractional part for typical values.
+                Ok(BlissVal::from_single_float(d as f32))
+            }
         }
         AlienType::Pointer(_) => {
             if raw == 0 {
@@ -249,44 +319,80 @@ pub fn unmarshal_from_c(raw: u64, alien_type: &AlienType) -> Result<BlissVal, Bl
 
 // ── Callbacks ──────────────────────────────────────────────────────
 
+/// A C-callable trampoline function type.
+/// In the bootstrap implementation, callbacks invoke this static trampoline
+/// which looks up the registered Lisp closure via a thread-local slot.
+extern "C" fn bootstrap_trampoline() -> u64 {
+    // Bootstrap: look up the current callback's closure and invoke it.
+    // For the bootstrap runtime, we return NIL (0x07) since we don't
+    // have a full evaluator yet, but this IS a valid C-callable function pointer.
+    CURRENT_CALLBACK_CLOSURE.with(|cell| {
+        let _closure = cell.get();
+        // A full implementation would invoke the Lisp closure here.
+        // For bootstrap, return NIL's raw bits.
+        crate::value::NIL.to_raw()
+    })
+}
+
+std::thread_local! {
+    /// Thread-local storage for the current callback's Lisp closure value.
+    static CURRENT_CALLBACK_CLOSURE: std::cell::Cell<BlissVal> =
+        const { std::cell::Cell::new(crate::value::NIL) };
+}
+
 /// Opaque handle to a callback trampoline.
 pub struct Callback {
-    _closure: BlissVal,
+    closure: BlissVal,
     _ret_type: AlienType,
     _arg_types: Vec<AlienType>,
-    /// A small executable trampoline. In the bootstrap implementation we
-    /// use a boxed closure to keep a stable function pointer.
-    trampoline: Box<dyn Fn()>,
+    /// The C-callable function pointer for this callback.
+    fn_ptr: *const (),
 }
 
 impl Callback {
     /// Create a callback trampoline for calling back into CL from C.
+    ///
+    /// In the bootstrap implementation, all callbacks share a single static
+    /// trampoline function. Before calling through the fn_ptr from C, the
+    /// runtime sets the thread-local CURRENT_CALLBACK_CLOSURE to this
+    /// callback's closure value. A full implementation would generate
+    /// per-callback executable trampolines.
     pub fn new(
         closure: BlissVal,
         ret_type: AlienType,
         arg_types: Vec<AlienType>,
     ) -> Result<Self, BlissError> {
-        let trampoline = Box::new(|| {
-            // Bootstrap trampoline — does nothing when called from C.
-        });
+        // Store the closure so it can be set before invocation
+        let fn_ptr = bootstrap_trampoline as *const ();
         Ok(Callback {
-            _closure: closure,
+            closure,
             _ret_type: ret_type,
             _arg_types: arg_types,
-            trampoline,
+            fn_ptr,
         })
     }
 
     /// Get the C-callable function pointer for this callback.
+    ///
+    /// Before calling this pointer from C code, set up the callback
+    /// context by calling `prepare_call()`.
     pub fn as_fn_ptr(&self) -> *const () {
-        &*self.trampoline as *const dyn Fn() as *const ()
+        self.fn_ptr
+    }
+
+    /// Prepare the thread-local state so that calling `as_fn_ptr()` from C
+    /// will invoke this callback's closure.
+    pub fn prepare_call(&self) {
+        CURRENT_CALLBACK_CLOSURE.with(|cell| {
+            cell.set(self.closure);
+        });
     }
 }
 
 impl Drop for Callback {
     fn drop(&mut self) {
-        // The trampoline Box is dropped automatically.
-        // No additional cleanup needed in the bootstrap implementation.
+        // No additional cleanup needed — the static trampoline is shared
+        // and the thread-local is per-call, not per-callback.
     }
 }
 

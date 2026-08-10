@@ -97,6 +97,47 @@ impl Sandbox {
         }
     }
 
+    /// Check whether a heap allocation of `bytes` is allowed under the
+    /// max_heap_bytes policy limit.
+    ///
+    /// `current_usage` is the current total heap usage in bytes.
+    /// Returns `Ok(())` if unlimited (0) or within budget, `Err` otherwise.
+    pub fn check_heap_alloc(&self, current_usage: usize, bytes: usize) -> Result<(), BlissError> {
+        if self.policy.max_heap_bytes == 0 {
+            // 0 means unlimited
+            return Ok(());
+        }
+        let new_total = current_usage.saturating_add(bytes);
+        if new_total > self.policy.max_heap_bytes {
+            Err(BlissError::SandboxViolation(format!(
+                "heap allocation denied: {} + {} = {} exceeds limit of {} bytes",
+                current_usage, bytes, new_total, self.policy.max_heap_bytes
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Check whether creating another thread is allowed under the
+    /// max_threads policy limit.
+    ///
+    /// `current_count` is the current number of active threads.
+    /// Returns `Ok(())` if unlimited (0) or within budget, `Err` otherwise.
+    pub fn check_thread_create(&self, current_count: usize) -> Result<(), BlissError> {
+        if self.policy.max_threads == 0 {
+            // 0 means unlimited
+            return Ok(());
+        }
+        if current_count >= self.policy.max_threads {
+            Err(BlissError::SandboxViolation(format!(
+                "thread creation denied: {} threads already active, limit is {}",
+                current_count, self.policy.max_threads
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Get the current policy.
     pub fn policy(&self) -> &SandboxPolicy {
         &self.policy
