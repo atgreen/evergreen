@@ -96,3 +96,17 @@ fn shutdown_succeeds_and_clears_threads() {
     assert!(s.shutdown().is_ok());
     assert_eq!(s.active_thread_count(), 0);
 }
+
+// ── submit after shutdown (§2.3.4) ──────────────────────────────
+
+#[test]
+fn submit_after_shutdown_returns_error() {
+    let s = Scheduler::init(&SchedulerConfig { num_workers: 2 }).unwrap();
+    s.shutdown().expect("shutdown should succeed");
+    let result = s.submit(GreenThreadId(42));
+    assert!(
+        result.is_err(),
+        "submit() after shutdown() should return an error, got: {:?}",
+        result
+    );
+}

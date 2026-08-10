@@ -151,11 +151,18 @@ fn osr_entry_map_enter_with_valid_locals() {
 
 #[test]
 fn deopt_log_becomes_blacklisted_after_threshold() {
-    let mut log = DeoptLog::new();
     let config = DeoptConfig { blacklist_threshold: 3, backoff_seconds: 10 };
-    // Record enough deopts to exceed the threshold
-    for _ in 0..config.blacklist_threshold {
+    let mut log = DeoptLog::with_config(&config);
+    // Not yet blacklisted
+    assert!(!log.is_blacklisted(), "should not be blacklisted with 0 deopts");
+    // Record enough deopts to reach the threshold
+    for i in 0..config.blacklist_threshold {
         log.record(DeoptReason::InlineCacheOverflow);
+        if i + 1 < config.blacklist_threshold {
+            assert!(!log.is_blacklisted(),
+                "should not be blacklisted after {} deopts (threshold={})",
+                i + 1, config.blacklist_threshold);
+        }
     }
     assert!(
         log.is_blacklisted(),
@@ -163,4 +170,23 @@ fn deopt_log_becomes_blacklisted_after_threshold() {
         log.count(),
         config.blacklist_threshold,
     );
+}
+
+#[test]
+fn deopt_log_with_config_uses_custom_threshold() {
+    // Verify that with_config actually applies the threshold, not a hardcoded default
+    let config_high = DeoptConfig { blacklist_threshold: 10, backoff_seconds: 5 };
+    let mut log = DeoptLog::with_config(&config_high);
+    for _ in 0..3 {
+        log.record(DeoptReason::InlineCacheOverflow);
+    }
+    assert!(!log.is_blacklisted(),
+        "threshold=10 but only 3 deopts — should NOT be blacklisted");
+
+    let config_low = DeoptConfig { blacklist_threshold: 2, backoff_seconds: 5 };
+    let mut log2 = DeoptLog::with_config(&config_low);
+    log2.record(DeoptReason::InlineCacheOverflow);
+    log2.record(DeoptReason::Other("test".into()));
+    assert!(log2.is_blacklisted(),
+        "threshold=2 with 2 deopts — should be blacklisted");
 }

@@ -116,29 +116,37 @@ fn check_promotion_cold_returns_none() {
 }
 
 #[test]
-fn check_promotion_hot_function_returns_baseline() {
-    // Per A4.08: when tier=0 and invoke_count >= t1_threshold, return Some(Baseline).
-    // We use a config with t1_threshold=0 so any function qualifies.
+fn check_promotion_non_function_with_zero_threshold() {
+    // NIL is not a function — check_promotion treats non-functions as T0 with
+    // invoke_count=0. With t1_threshold=0, invoke_count(0) >= threshold(0) is
+    // true, so this returns Some(Baseline). This tests the threshold=0 boundary
+    // for non-function values specifically.
     let config = TierConfig { t1_threshold: 0, t2_threshold: 5000, osr_threshold: 10000, compile_threads: 2 };
-    // With t1_threshold=0, even a cold function at T0 should be promoted to Baseline.
     let result = check_promotion(NIL, &config);
-    assert_eq!(result, Some(Tier::Baseline), "function with invoke_count >= t1_threshold should promote to Baseline");
+    assert_eq!(result, Some(Tier::Baseline),
+        "non-function at T0 with invoke_count=0 and t1_threshold=0 should promote to Baseline");
 }
 
 #[test]
-fn check_promotion_t2_function_returns_none() {
-    // Per A4.08 step 19-20: a function already at T2 (max tier) returns None.
-    // Since we can't easily set a function's tier to T2 via just BlissVal,
-    // we rely on NIL not being a real function — check_promotion on a non-function
-    // at max tier should return None. This tests the "already at max" path.
-    // With default config, NIL is cold and returns None regardless.
+fn check_promotion_non_function_below_threshold_returns_none() {
+    // NIL is not a function — check_promotion treats it as T0 with invoke_count=0.
+    // With t1_threshold=10, invoke_count(0) < threshold(10), so no promotion.
     let config = default_config();
-    assert!(check_promotion(NIL, &config).is_none());
+    assert!(check_promotion(NIL, &config).is_none(),
+        "non-function at T0 with invoke_count=0 below t1_threshold should return None");
 }
 
 #[test]
-fn request_compilation_returns_result() {
-    // Issue #6: assert the Result rather than discarding it.
+fn check_promotion_real_function_needs_function_tag() {
+    // T is also not a function — verify that non-function values consistently
+    // get the non-function code path (T0, invoke_count=0).
+    let config = default_config();
+    assert!(check_promotion(T, &config).is_none(),
+        "T (non-function) should return None with default thresholds");
+}
+
+#[test]
+fn request_compilation_rejects_non_function() {
     // request_compilation on NIL (not a function) should return an error.
     let result_baseline = request_compilation(NIL, Tier::Baseline);
     assert!(result_baseline.is_err(), "requesting compilation of NIL (non-function) should error");
@@ -146,3 +154,4 @@ fn request_compilation_returns_result() {
     let result_optimising = request_compilation(NIL, Tier::Optimising);
     assert!(result_optimising.is_err(), "requesting compilation of NIL (non-function) should error");
 }
+
