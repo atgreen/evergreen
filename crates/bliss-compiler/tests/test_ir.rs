@@ -1,7 +1,7 @@
 //! Tests for bliss-compiler IR graph, builder, and verifier.
 
 use bliss_compiler::ir::*;
-use bliss_rt::value::{BlissVal, NIL};
+use bliss_rt::value::NIL;
 
 #[test]
 fn new_graph_has_zero_nodes() {
@@ -226,7 +226,7 @@ fn verify_detects_ssa_dominance_violation() {
     let region = g.add_node(NodeKind::Region);
     let ret = g.add_node(NodeKind::Return);
     // A constant that lives in one branch arm only
-    let c1 = g.add_node(NodeKind::Constant(NIL));
+    let _c1 = g.add_node(NodeKind::Constant(NIL));
 
     // Start -> Branch
     g.add_edge(Edge { from: start, to: branch, kind: EdgeKind::Control, input_index: 0 });

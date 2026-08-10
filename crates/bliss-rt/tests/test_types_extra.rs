@@ -12,23 +12,16 @@ use bliss_rt::object::*;
 // ── Helpers (same pattern as test_types.rs) ───────────────────────
 
 fn mk_fix(n: i64) -> BlissVal { BlissVal::from_fixnum(n) }
-fn mk_chr(c: char) -> BlissVal { BlissVal::from_char(c) }
 fn mk_flt(f: f32) -> BlissVal { BlissVal::from_single_float(f) }
 fn mk_sym(i: u32) -> BlissVal { BlissVal::from_symbol_index(i) }
 
 unsafe fn mk_heap(storage: &mut [u64; 2], tid: u8) -> BlissVal {
-    let header = ObjectHeader::new(tid, 1);
-    storage[0] = header.0;
-    storage[1] = 0;
-    BlissVal::from_heap_ptr(storage.as_mut_ptr() as *mut u8)
-}
-
-unsafe fn mk_cons(cell: &mut ConsCell) -> BlissVal {
-    BlissVal::from_cons_ptr(cell as *mut ConsCell as *mut u8)
-}
-
-unsafe fn mk_func(storage: &mut [u64; 8]) -> BlissVal {
-    BlissVal::from_function_ptr(storage.as_mut_ptr() as *mut u8)
+    unsafe {
+        let header = ObjectHeader::new(tid, 1);
+        storage[0] = header.0;
+        storage[1] = 0;
+        BlissVal::from_heap_ptr(storage.as_mut_ptr() as *mut u8)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════

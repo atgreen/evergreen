@@ -8,7 +8,7 @@
 //! once it exists.
 
 use bliss_stdlib::devtools::*;
-use bliss_rt::value::{BlissVal, NIL, T};
+use bliss_rt::value::{NIL, T};
 
 // ══════════════════════════════════════════════════════════════════
 // ReplState

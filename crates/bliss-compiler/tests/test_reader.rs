@@ -2,7 +2,7 @@
 //! readtable operations, SourcePos, and edge cases.
 
 use bliss_compiler::reader::*;
-use bliss_rt::value::{BlissVal, NIL, T, EOF};
+use bliss_rt::value::{NIL, T, EOF};
 
 // ── ReaderState construction and configuration ────────────────────
 

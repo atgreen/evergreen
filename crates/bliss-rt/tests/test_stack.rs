@@ -1,6 +1,5 @@
 use bliss_rt::stack::*;
 use bliss_rt::value::{BlissVal, NIL};
-use std::mem::MaybeUninit;
 
 #[test]
 fn stack_capacity_matches_requested() {
@@ -120,7 +119,7 @@ fn frame_walker_chain() {
         function: NIL, code_info: ptr::null(),
         flags: 0, num_locals: 0, _pad: 0,
     };
-    let mut b = Frame {
+    let b = Frame {
         prev_fp: &mut a as *mut Frame, return_pc: ptr::null(),
         function: NIL, code_info: ptr::null(),
         flags: 0, num_locals: 0, _pad: 0,

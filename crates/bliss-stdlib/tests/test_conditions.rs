@@ -198,7 +198,7 @@ fn compute_restarts_within_restart_bind() {
 
     // After restart_bind returns, the restart should NOT be in scope.
     // This is the correct behavior per ANSI CL — restarts have dynamic extent.
-    let restarts_after = compute_restarts(None);
+    let _restarts_after = compute_restarts(None);
     let found_after = find_restart(restart_name, None);
     assert!(found_after.is_none(),
         "find_restart should return None outside the dynamic extent of restart_bind");

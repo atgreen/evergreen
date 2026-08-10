@@ -182,8 +182,11 @@ use bliss_compiler::profiling::FunctionProfile;
 fn function_profile_invocation_counter() {
     // FunctionProfile has private fields — construction will panic with unimplemented,
     // but this test validates the invocation_counter() method signature.
+    // We zero-initialize to ensure `initialized` is false, triggering the panic
+    // in check_init() before any invalid field (HashMap) is accessed.
+    #[allow(invalid_value)]
     let fp = unsafe {
-        std::mem::MaybeUninit::<FunctionProfile>::uninit().assume_init()
+        std::mem::MaybeUninit::<FunctionProfile>::zeroed().assume_init()
     };
     let _counter: &InvocationCounter = fp.invocation_counter();
 }
@@ -191,8 +194,9 @@ fn function_profile_invocation_counter() {
 #[test]
 #[should_panic(expected = "FunctionProfile")]
 fn function_profile_type_profile() {
+    #[allow(invalid_value)]
     let fp = unsafe {
-        std::mem::MaybeUninit::<FunctionProfile>::uninit().assume_init()
+        std::mem::MaybeUninit::<FunctionProfile>::zeroed().assume_init()
     };
     let _tp: Option<&TypeProfile> = fp.type_profile(0);
 }
