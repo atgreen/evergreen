@@ -85,7 +85,17 @@ impl ValueStack {
 | `sp` | `usize` | Current stack pointer (index into `slots`) |
 
 **Invariant:** `sp <= slots.len()`.  If `push` would exceed capacity, the
-vector doubles via `Vec::reserve`.
+vector doubles via `Vec::reserve`, up to a configurable maximum depth
+(default 65 536 slots, set via `BLISS_MAX_STACK_DEPTH`).
+
+**Overflow handling:** If `push` would exceed the maximum depth, the
+interpreter signals a `STORAGE-CONDITION` (ANSI CL §9.1) with a restart
+`ABORT` that unwinds to the nearest `CATCH` or top-level REPL.  This
+prevents unbounded memory growth, which is especially important when many
+green threads each have their own `ValueStack` — without a cap, deep or
+infinite recursion across N green threads could exhaust process memory.
+The maximum depth SHOULD be set conservatively; users can raise it via the
+environment variable when workloads legitimately require deep stacks.
 
 #### Environment Chain
 
@@ -207,6 +217,13 @@ fn request_t1_compilation(meta: &FnMeta, thread: &mut BlissThread) {
         Err(e) => {
             log::warn!("T1 compilation of {:?} failed: {}", meta.name, e);
             meta.tier.store(0, Ordering::Release); // fall back to T0
+            if e.is_structural() {
+                // Unsupported construct (e.g., inline assembly) — never retry.
+                meta.flags.fetch_or(NEVER_COMPILE, Ordering::Release);
+            }
+            // Transient failures (e.g., OOM) leave NEVER_COMPILE unset,
+            // allowing retry on next threshold hit as the counter keeps
+            // incrementing.
         }
     }
 }
@@ -258,7 +275,7 @@ the overhead of the platform C ABI on every Lisp-to-Lisp call:
 Arguments beyond index 5 are passed on the stack.  `&REST` arguments are
 collected into a freshly allocated list at the callee's prologue.
 
-### 4.4.4.5  Stack Frame Layout (D4.07)
+### 4.4.4.5  Stack Frame Layout (D4.08)
 
 ```text
        ┌──────────────────────────────┐  ← caller's rsp before CALL
@@ -282,18 +299,32 @@ collected into a freshly allocated list at the callee's prologue.
 ```
 
 **D4.07 — Compilation Request** is defined in §4.4.6 below (compilation queue).
+**D4.08 — Stack Frame Layout** is the diagram above.
 
 The `FnMeta` pointer stored in the frame allows the profiling subsystem (§4.5)
 and the debugger (§6) to identify the function for any frame on the stack.
 
 ### 4.4.4.6  Profiling Stub Insertion
 
-T1 emits lightweight profiling stubs at two sites:
+T1 emits lightweight profiling stubs at three sites:
 
 1. **Function prologue** — `lock inc [fn_meta + INVOKE_OFFSET]`; compare
    against `T1_T2_THRESHOLD`; branch to cold path on `jge`.
 2. **Loop back-edges** — `lock inc [fn_meta + BACKEDGE_OFFSET]`; compare
    against `LOOP_HEAT_THRESHOLD`; branch to cold path on `jge`.
+3. **Call-site type feedback** — At each call site, the stub records the
+   observed argument types into a `TypeProfile` attached to the call site's
+   `FnMeta`.  Each `TypeProfile` is a fixed-size array (default 4 entries) of
+   `AtomicU64` slots, each packing a `TypeTag` (upper 8 bits) and a saturating
+   hit count (lower 56 bits).  The stub executes after argument evaluation and
+   before the actual call:
+   - For each argument (up to the first 4), load the runtime type tag.
+   - Atomically update the corresponding `TypeProfile` slot: if the tag
+     matches, increment the count; otherwise, if a free slot exists, CAS the
+     tag in.  If all slots are occupied and none match, set a
+     `MEGAMORPHIC` flag on the slot (T2 will not speculate on that argument).
+   Type feedback stubs are emitted inline for ≤ 4 arguments; for functions
+   with more arguments, only the first 4 are profiled.
 
 The cold path (`.request_t2`) calls into the runtime to enqueue the function
 for background T2 compilation (§4.4.6).
@@ -506,6 +537,7 @@ hold the queue mutex only during enqueue/dequeue (microseconds).
 | `BLISS_COMPILE_QUEUE_SIZE` | 64 | Maximum entries in the T2 compilation queue |
 | `BLISS_INLINE_LIMIT` | 30 | Maximum IR node count for inlining in T2 |
 | `BLISS_T2_NODE_BUDGET` | 500 | Maximum IR nodes per function post-inlining |
+| `BLISS_MAX_STACK_DEPTH` | 65 536 | Maximum ValueStack slots per green thread (overflow signals `STORAGE-CONDITION`) |
 
 ---
 
