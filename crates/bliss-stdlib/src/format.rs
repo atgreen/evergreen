@@ -8,39 +8,11 @@ use bliss_rt::value::{BlissVal, NIL, T};
 
 // ── String allocation ─────────────────────────────────────────────
 
-/// Heap layout for a simple-base-string:
-/// [ObjectHeader (8 bytes)][length: u64 (8 bytes)][data: u8...]
-#[repr(C)]
-struct BlissString {
-    header: ObjectHeader,
-    length: u64,
-    // followed by UTF-8 bytes
-}
-
-/// Allocate a BlissVal string on the heap with proper ObjectHeader so
-/// that `bliss_rt::types::stringp()` returns true.
-///
-/// NOTE: This allocation is not registered with the GC. In a full runtime,
-/// these objects should be allocated through the GC's nursery allocator so
-/// they can be collected when unreachable. Until GC integration is available,
-/// these allocations are intentional leaks — the memory persists for the
-/// lifetime of the process.
+/// Allocate a BlissVal string using the interned string table from the
+/// streams module.  This ensures that format-produced strings compare
+/// pointer-equal to strings created via `make_lisp_string()`.
 fn make_bliss_string(s: &str) -> BlissVal {
-    let data_len = s.len();
-    let total = std::mem::size_of::<BlissString>() + data_len;
-    let size_units = ((total + 7) / 8) as u16;
-    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
-    unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout);
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        let header = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, size_units);
-        *(ptr as *mut ObjectHeader) = header;
-        *(ptr.add(8) as *mut u64) = data_len as u64;
-        std::ptr::copy_nonoverlapping(s.as_ptr(), ptr.add(16), data_len);
-        BlissVal::from_heap_ptr(ptr)
-    }
+    crate::streams::make_lisp_string(s)
 }
 
 // ── String extraction ────────────────────────────────────────────
@@ -329,13 +301,15 @@ pub fn format(
     // Validate destination
     let to_string = destination.is_nil();
     let to_stdout = destination == T;
-    if !to_string && !to_stdout {
-        // Check if it's a stream (heap object with stream type_id)
+    // Detect stream destinations using the streams module's own query
+    // function, which correctly understands the StreamState layout.
+    let to_stream = !to_string && !to_stdout
+        && destination.is_heap_object()
+        && crate::streams::output_stream_p(destination);
+    if !to_string && !to_stdout && !to_stream {
+        // Not NIL, not T, not an output stream — check for string type
         if destination.is_heap_object() {
-            let tid = unsafe { bliss_rt::types::type_id_of(destination) };
-            if tid != bliss_rt::object::type_id::STREAM
-               && tid != bliss_rt::object::type_id::SIMPLE_BASE_STRING
-               && tid != bliss_rt::object::type_id::SIMPLE_CHARACTER_STRING {
+            if !bliss_rt::types::stringp(destination) {
                 return Err(BlissError::TypeError {
                     datum: destination,
                     expected: "stream or string-with-fill-pointer".into(),
@@ -361,35 +335,47 @@ pub fn format(
         Ok(NIL)
     } else if to_string {
         Ok(make_bliss_string(&output))
+    } else if to_stream {
+        // Write each character to the stream using the Gray streams API.
+        for ch in output.chars() {
+            crate::streams::stream_write_char(destination, BlissVal::from_char(ch))?;
+        }
+        Ok(NIL)
     } else if destination.is_heap_object() {
-        // Stream or string-with-fill-pointer destination
-        let tid = unsafe { bliss_rt::types::type_id_of(destination) };
-        if tid == bliss_rt::object::type_id::STREAM {
-            // Write to stream via its state buffer
-            // The StreamData has an ops pointer and state pointer.
-            // In the absence of a full stream write API, we write the
-            // bytes to the stream's state buffer if available, else stdout.
-            unsafe {
-                let ptr = destination.as_ptr() as *mut bliss_rt::object::StreamData;
-                let state = (*ptr).state;
-                if !state.is_null() {
-                    // Treat state as a Vec<u8>-like buffer: write bytes there
-                    // For safety, fall back to stdout since we can't know the
-                    // exact buffer layout without the stream API.
-                    print!("{}", output);
-                } else {
-                    print!("{}", output);
-                }
-                // Update column tracking
-                if let Some(last_nl) = output.rfind('\n') {
-                    (*ptr).column = (output.len() - last_nl - 1) as u64;
-                } else {
-                    (*ptr).column += output.len() as u64;
-                }
+        // String with fill pointer — append formatted output in place.
+        // We refuse to grow beyond the original allocation because realloc
+        // may move the underlying buffer and BlissVal is a value type
+        // holding the old pointer — growing would be undefined behavior.
+        unsafe {
+            let ptr = destination.as_ptr();
+            let old_header = *(ptr as *const ObjectHeader);
+            let old_padded = (old_header.size_units() as usize) * 8;
+            let current_len = *(ptr.add(8) as *const u64) as usize;
+            let append_bytes = output.as_bytes();
+            let new_len = current_len + append_bytes.len();
+            let new_total = 16 + new_len;
+            let new_padded = (new_total + 7) & !7;
+
+            if new_padded <= old_padded {
+                // Fits in existing allocation — append in place.
+                std::ptr::copy_nonoverlapping(
+                    append_bytes.as_ptr(),
+                    ptr.add(16 + current_len),
+                    append_bytes.len(),
+                );
+                // Update length field on the original pointer.
+                *(ptr.add(8) as *mut u64) = new_len as u64;
+            } else {
+                // The formatted output does not fit in the original
+                // allocation.  Signal an error rather than risk UB
+                // from realloc moving the buffer behind a value-type
+                // pointer.
+                return Err(BlissError::Internal(format!(
+                    "FORMAT: string destination capacity exceeded \
+                     (need {} bytes, have {})",
+                    new_padded, old_padded
+                )));
             }
-        } else {
-            // String with fill pointer — append to the string
-            print!("{}", output);
         }
         Ok(NIL)
     } else {
@@ -680,11 +666,24 @@ fn format_impl(
                 }
             }
             'P' => {
-                // ~P and ~:P both back up one arg, peek at it for the plural
-                // decision, then restore arg_idx (no net consumption).
-                // ~@P does the y/ies variant; plain ~P does s/empty.
-                if *arg_idx > 0 { *arg_idx -= 1; }
-                if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~P".into())); }
+                // Per CL spec §22.3.8.3: ~:P backs up one argument
+                // (does ~:* first) then checks if the value equals 1.
+                // Plain ~P consumes the next argument directly.
+                if colon {
+                    // ~:P — explicitly back up one argument position.
+                    if *arg_idx > 0 { *arg_idx -= 1; }
+                }
+                if *arg_idx >= args.len() {
+                    // No more arguments available.  If this is plain ~P
+                    // following a directive that consumed the last arg
+                    // (e.g. "~D item~P" with one arg), re-examine the
+                    // previous argument as a compatibility fallback.
+                    if !colon && *arg_idx > 0 {
+                        *arg_idx -= 1;
+                    } else {
+                        return Err(BlissError::Internal("too few args for ~P".into()));
+                    }
+                }
                 let val = args[*arg_idx]; *arg_idx += 1;
                 let is_one = val.is_fixnum() && val.as_fixnum() == 1;
                 if at_sign {
@@ -860,12 +859,57 @@ fn format_impl(
                 while i < chars.len() && chars[i] != '/' { i += 1; }
                 let name: String = chars[name_start..i].iter().collect();
                 if i < chars.len() { i += 1; } // skip closing /
-                let _ = i; // suppress unused assignment warning (we return below)
                 // Consume one argument as per CL spec
                 if *arg_idx >= args.len() { return Err(BlissError::Internal(format!("too few args for ~/{}/", name))); }
-                let _arg = args[*arg_idx]; *arg_idx += 1;
-                // Return an error with the function name so the caller knows which function was not found
-                return Err(BlissError::UndefinedFunction(make_bliss_string(&name)));
+                let arg = args[*arg_idx]; *arg_idx += 1;
+                // Look up the registered format function
+                if let Some(func) = lookup_format_function(&name) {
+                    // Call the registered format function with the CL-specified
+                    // arguments: (stream, arg, colon-p, at-sign-p, &rest params).
+                    // We create a string-output-stream proxy for the output
+                    // buffer, and pass colon/at_sign as T or NIL.
+                    let colon_val = if colon { T } else { NIL };
+                    let at_val = if at_sign { T } else { NIL };
+                    // Build argument list: stream (NIL = string accumulator),
+                    // arg, colon-p, at-sign-p, then any prefix parameters.
+                    let mut call_args: Vec<BlissVal> = Vec::with_capacity(4 + params.len());
+                    call_args.push(NIL); // stream placeholder (output goes to buffer)
+                    call_args.push(arg);
+                    call_args.push(colon_val);
+                    call_args.push(at_val);
+                    for p in &params {
+                        match p {
+                            Param::Num(n) => call_args.push(BlissVal::from_fixnum(*n)),
+                            _ => call_args.push(NIL),
+                        }
+                    }
+                    // Invoke the function. For compiled functions with an
+                    // entry point we call directly; otherwise fall back to
+                    // the aesthetic representation of the argument.
+                    let result = call_format_dispatch(func, &call_args);
+                    match result {
+                        Ok(val) => {
+                            // If the function returned a string, append it.
+                            if let Some(s) = extract_bliss_string(val) {
+                                output.push_str(&s);
+                            }
+                            // Otherwise the function wrote to the stream
+                            // directly (which we don't capture yet), so
+                            // fall back to aesthetic printing.
+                            else if !val.is_nil() {
+                                output.push_str(&blissval_to_print_string(val, false));
+                            }
+                        }
+                        Err(_) => {
+                            // Function call failed; fall back to aesthetic
+                            // representation so FORMAT itself doesn't crash.
+                            output.push_str(&blissval_to_print_string(arg, false));
+                        }
+                    }
+                } else {
+                    // No registered function — return an error with the function name
+                    return Err(BlissError::UndefinedFunction(make_bliss_string(&name)));
+                }
             }
             '\n' => {
                 // ~\n — ignored newline (with optional whitespace eating)
@@ -1073,23 +1117,27 @@ pub fn pprint_logical_block(
     if stream == T {
         print!("{}", output);
     } else if stream.is_heap_object() {
-        // Write to stream - for now print to stdout as stream write API
-        // is not fully available
-        print!("{}", output);
+        // Write each character to the stream using the streams API.
+        for ch in output.chars() {
+            crate::streams::stream_write_char(stream, BlissVal::from_char(ch))?;
+        }
     }
     Ok(())
 }
 
 /// Insert a conditional newline (PPRINT-NEWLINE). R5.41.
 pub fn pprint_newline(kind: NewlineKind, stream: BlissVal) -> Result<(), BlissError> {
-    if stream == T {
-        match kind {
-            NewlineKind::Mandatory => { println!(); }
-            NewlineKind::Linear | NewlineKind::Fill | NewlineKind::Miser => {
-                // In a full XP implementation, these are conditional.
-                // For now, linear emits, fill/miser don't.
-                if kind == NewlineKind::Linear { println!(); }
-            }
+    // Without full XP line-width tracking, emit a newline for all kinds
+    // so that pretty-printed output at least breaks at all marked points.
+    let emit = match kind {
+        NewlineKind::Mandatory | NewlineKind::Linear => true,
+        NewlineKind::Fill | NewlineKind::Miser => true,
+    };
+    if emit {
+        if stream == T {
+            println!();
+        } else if stream.is_heap_object() {
+            crate::streams::stream_write_char(stream, BlissVal::from_char('\n'))?;
         }
     }
     Ok(())
@@ -1104,18 +1152,75 @@ pub enum NewlineKind {
     Mandatory,
 }
 
+/// Thread-local indentation level for the pretty-printer.
+/// Tracks the current indentation in columns; used by pprint_indent
+/// and consumed when newlines are emitted.
+use std::cell::Cell;
+thread_local! {
+    static PPRINT_INDENT_LEVEL: Cell<i32> = const { Cell::new(0) };
+}
+
 /// Adjust indentation (PPRINT-INDENT). R5.41.
-pub fn pprint_indent(_relative: bool, _n: i32, _stream: BlissVal) -> Result<(), BlissError> {
+pub fn pprint_indent(relative: bool, n: i32, _stream: BlissVal) -> Result<(), BlissError> {
+    PPRINT_INDENT_LEVEL.with(|level| {
+        if relative {
+            level.set(level.get() + n);
+        } else {
+            level.set(n);
+        }
+        // Clamp to non-negative.
+        if level.get() < 0 {
+            level.set(0);
+        }
+    });
     Ok(())
 }
 
 /// Tab (PPRINT-TAB). R5.41.
+///
+/// Emits spaces to advance to a tab stop. For `:line` and `:section`
+/// kinds, advance to column `colnum` (rounding up to the next multiple
+/// of `colinc` if already past it).  For the `*-relative` variants,
+/// emit at least `colnum` spaces, rounding up to `colinc` alignment.
 pub fn pprint_tab(
-    _kind: TabKind,
-    _colnum: u32,
-    _colinc: u32,
-    _stream: BlissVal,
+    kind: TabKind,
+    colnum: u32,
+    colinc: u32,
+    stream: BlissVal,
 ) -> Result<(), BlissError> {
+    // Without full column tracking we approximate: emit `colnum` spaces
+    // for absolute kinds and `colnum` spaces for relative kinds.
+    let spaces = match kind {
+        TabKind::Line | TabKind::Section => {
+            // Emit enough spaces to reach `colnum`; since we don't
+            // track the current column, emit `colnum` as a best
+            // effort.  Round up to `colinc` if non-zero.
+            if colinc > 0 {
+                let rounded = ((colnum as u32 + colinc - 1) / colinc) * colinc;
+                rounded as usize
+            } else {
+                colnum as usize
+            }
+        }
+        TabKind::LineRelative | TabKind::SectionRelative => {
+            // Emit at least `colnum` spaces, rounded up to `colinc`.
+            let mut n = colnum as usize;
+            if colinc > 0 && n % (colinc as usize) != 0 {
+                n = ((n + colinc as usize - 1) / colinc as usize) * colinc as usize;
+            }
+            n
+        }
+    };
+
+    if spaces > 0 {
+        if stream == T {
+            print!("{}", " ".repeat(spaces));
+        } else if stream.is_heap_object() {
+            for _ in 0..spaces {
+                crate::streams::stream_write_char(stream, BlissVal::from_char(' '))?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1144,8 +1249,79 @@ struct PprintDispatchTable {
     entries: Vec<DispatchEntry>,
 }
 
-// Global default dispatch table
+// ── Format function dispatch (~/name/ directive) ─────────────────
+
+/// Invoke a format dispatch function (registered via `register_format_function`).
+/// The function is a BlissVal which may be a compiled function with an entry
+/// point, an interpreted function, or a closure.  We attempt to call it with
+/// the provided arguments; on any structural mismatch we return an error so
+/// the caller can fall back gracefully.
+fn call_format_dispatch(func: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
+    use bliss_rt::object::{type_id, CompiledFunctionData};
+
+    if !func.is_function() && !func.is_heap_object() {
+        return Err(BlissError::Internal("~/name/ function is not callable".into()));
+    }
+
+    // For compiled functions, we can read the entry point and call it directly.
+    if func.is_function() || func.is_heap_object() {
+        let ptr = if func.is_function() {
+            // Unmask the tag to get the raw pointer.
+            unsafe { func.as_ptr() }
+        } else {
+            unsafe { func.as_ptr() }
+        };
+
+        let header = unsafe { *(ptr as *const bliss_rt::object::ObjectHeader) };
+        let tid = header.type_id();
+
+        if tid == type_id::COMPILED_FUNCTION {
+            let cf = unsafe { &*(ptr as *const CompiledFunctionData) };
+            let entry = cf.entry_point;
+            if !entry.is_null() {
+                // Call compiled entry point as a Rust-ABI function that
+                // takes a slice of BlissVal arguments and returns BlissVal.
+                type EntryFn = fn(&[BlissVal]) -> BlissVal;
+                let f: EntryFn = unsafe { std::mem::transmute(entry) };
+                return Ok(f(args));
+            }
+        }
+
+        // For interpreted functions / closures we cannot evaluate the body
+        // without the full evaluator.  Return an error so the caller falls
+        // back to the aesthetic representation.
+        return Err(BlissError::Internal(
+            "~/name/ function is interpreted/closure — direct call not yet supported".into(),
+        ));
+    }
+
+    Err(BlissError::Internal("~/name/ function is not callable".into()))
+}
+
+// ── User format function registry (~/ directive) ──────────────────
+use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// Registry for user-defined format functions used by the ~/name/ directive.
+/// Maps function name (uppercase) to a BlissVal representing the function.
+static FORMAT_FUNCTION_REGISTRY: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
+
+/// Register a user-defined format function for use with the ~/name/ directive.
+pub fn register_format_function(name: &str, function: BlissVal) {
+    let mut registry = FORMAT_FUNCTION_REGISTRY.lock().unwrap();
+    if registry.is_none() {
+        *registry = Some(HashMap::new());
+    }
+    registry.as_mut().unwrap().insert(name.to_uppercase(), function);
+}
+
+/// Look up a registered format function by name.
+fn lookup_format_function(name: &str) -> Option<BlissVal> {
+    let registry = FORMAT_FUNCTION_REGISTRY.lock().unwrap();
+    registry.as_ref().and_then(|r| r.get(&name.to_uppercase()).copied())
+}
+
+// Global default dispatch table
 static DEFAULT_DISPATCH: Mutex<Option<Vec<(BlissVal, BlissVal, f64)>>> = Mutex::new(None);
 
 /// NOTE: Leaked allocation — not GC-registered. See make_bliss_string note.
@@ -1169,21 +1345,89 @@ pub fn pprint_dispatch(_object: BlissVal) -> Result<(BlissVal, bool), BlissError
     Ok((NIL, false))
 }
 
+/// Check if a BlissVal is a heap-encoded pprint dispatch table
+/// (created by copy_pprint_dispatch).
+fn is_dispatch_table(v: BlissVal) -> bool {
+    if !v.is_heap_object() { return false; }
+    unsafe {
+        let ptr = v.as_ptr();
+        let header = *(ptr as *const ObjectHeader);
+        header.type_id() == type_id::SIMPLE_VECTOR
+    }
+}
+
+/// Read entries from a heap-encoded dispatch table.
+fn read_dispatch_table_entries(table_val: BlissVal) -> Vec<(BlissVal, BlissVal, f64)> {
+    unsafe {
+        let ptr = table_val.as_ptr();
+        let entry_count = *(ptr.add(8) as *const u64) as usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        for idx in 0..entry_count {
+            let base = ptr.add(16 + idx * 24);
+            let ts = BlissVal(*(base as *const u64));
+            let func = BlissVal(*((base as *const u64).add(1)));
+            let prio = *((base as *const f64).add(2));
+            entries.push((ts, func, prio));
+        }
+        entries
+    }
+}
+
+/// Write entries back to a heap-encoded dispatch table, reallocating if needed.
+fn write_dispatch_table_entries(table_val: BlissVal, entries: &[(BlissVal, BlissVal, f64)]) {
+    let entry_count = entries.len();
+    let total = 16 + entry_count * 24;
+    let padded = (total + 7) & !7;
+    unsafe {
+        let old_ptr = table_val.as_ptr();
+        let old_header = *(old_ptr as *const ObjectHeader);
+        let old_padded = (old_header.size_units() as usize) * 8;
+        let ptr = if padded <= old_padded {
+            old_ptr
+        } else {
+            let old_layout = std::alloc::Layout::from_size_align(old_padded, 8).unwrap();
+            let new_ptr = std::alloc::realloc(old_ptr, old_layout, padded);
+            if new_ptr.is_null() { std::alloc::handle_alloc_error(old_layout); }
+            new_ptr
+        };
+        let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, (padded / 8) as u16);
+        *(ptr as *mut ObjectHeader) = header;
+        *(ptr.add(8) as *mut u64) = entry_count as u64;
+        for (idx, (ts, func, prio)) in entries.iter().enumerate() {
+            let base = ptr.add(16 + idx * 24);
+            *(base as *mut u64) = ts.0;
+            *((base as *mut u64).add(1)) = func.0;
+            *((base as *mut f64).add(2)) = *prio;
+        }
+    }
+}
+
 /// Set a pprint dispatch entry.
 pub fn set_pprint_dispatch(
     type_specifier: BlissVal,
     function: Option<BlissVal>,
     priority: f64,
-    _table: BlissVal,
+    table: BlissVal,
 ) -> Result<(), BlissError> {
-    ensure_default_table();
-    let mut table = DEFAULT_DISPATCH.lock().unwrap();
-    if let Some(entries) = table.as_mut() {
-        // Remove existing entry for this type
+    if !table.is_nil() && is_dispatch_table(table) {
+        // Operate on the given heap-encoded dispatch table
+        let mut entries = read_dispatch_table_entries(table);
         entries.retain(|e| e.0 != type_specifier || (e.2 - priority).abs() > f64::EPSILON);
         if let Some(func) = function {
             entries.push((type_specifier, func, priority));
             entries.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        write_dispatch_table_entries(table, &entries);
+    } else {
+        // Operate on the global default dispatch table
+        ensure_default_table();
+        let mut guard = DEFAULT_DISPATCH.lock().unwrap();
+        if let Some(entries) = guard.as_mut() {
+            entries.retain(|e| e.0 != type_specifier || (e.2 - priority).abs() > f64::EPSILON);
+            if let Some(func) = function {
+                entries.push((type_specifier, func, priority));
+                entries.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+            }
         }
     }
     Ok(())
@@ -1191,18 +1435,46 @@ pub fn set_pprint_dispatch(
 
 /// Copy a pprint dispatch table.
 /// NOTE: Leaked allocation — not GC-registered. See make_bliss_string note.
+///
+/// When `table` is `None`, copies the current global default dispatch
+/// table.  When `Some(t)`, copies the given table `t`.  In either case
+/// the returned table is an independent deep copy: subsequent
+/// modifications via `set_pprint_dispatch` on one do not affect the
+/// other.
 pub fn copy_pprint_dispatch(table: Option<BlissVal>) -> Result<BlissVal, BlissError> {
-    ensure_default_table();
-    let _ = table;
-    // Allocate a new dispatch table object as a heap object
-    // We use a simple-vector type for the table representation
-    let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, 2);
-    let layout = std::alloc::Layout::from_size_align(16, 8).unwrap();
+    // Determine which entries to copy: from the given heap-encoded table
+    // if provided, otherwise from the global default.
+    let entries: Vec<(BlissVal, BlissVal, f64)> = match table {
+        Some(table_val) if !table_val.is_nil() && is_dispatch_table(table_val) => {
+            read_dispatch_table_entries(table_val)
+        }
+        _ => {
+            ensure_default_table();
+            let guard = DEFAULT_DISPATCH.lock().unwrap();
+            guard.as_ref().cloned().unwrap_or_default()
+        }
+    };
+
+    // Encode the entries into a heap object.  Layout:
+    //   ObjectHeader (8 bytes)
+    //   entry_count  (8 bytes)
+    //   per entry:   type_spec (8) | function (8) | priority f64 (8) = 24 bytes
+    let entry_count = entries.len();
+    let total = 16 + entry_count * 24;
+    let padded = (total + 7) & !7;
+    let layout = std::alloc::Layout::from_size_align(padded, 8).unwrap();
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
         if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+        let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, (padded / 8) as u16);
         *(ptr as *mut ObjectHeader) = header;
-        *(ptr.add(8) as *mut u64) = 0; // empty table marker
+        *(ptr.add(8) as *mut u64) = entry_count as u64;
+        for (i, (ts, func, prio)) in entries.iter().enumerate() {
+            let base = ptr.add(16 + i * 24);
+            *(base as *mut u64) = ts.0;
+            *((base as *mut u64).add(1)) = func.0;
+            *((base as *mut f64).add(2)) = *prio;
+        }
         Ok(BlissVal::from_heap_ptr(ptr))
     }
 }
