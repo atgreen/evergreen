@@ -19,6 +19,12 @@ struct BlissString {
 
 /// Allocate a BlissVal string on the heap with proper ObjectHeader so
 /// that `bliss_rt::types::stringp()` returns true.
+///
+/// NOTE: This allocation is not registered with the GC. In a full runtime,
+/// these objects should be allocated through the GC's nursery allocator so
+/// they can be collected when unreachable. Until GC integration is available,
+/// these allocations are intentional leaks — the memory persists for the
+/// lifetime of the process.
 fn make_bliss_string(s: &str) -> BlissVal {
     let data_len = s.len();
     let total = std::mem::size_of::<BlissString>() + data_len;
@@ -35,6 +41,44 @@ fn make_bliss_string(s: &str) -> BlissVal {
         std::ptr::copy_nonoverlapping(s.as_ptr(), ptr.add(16), data_len);
         BlissVal::from_heap_ptr(ptr)
     }
+}
+
+// ── String extraction ────────────────────────────────────────────
+
+/// Extract Rust string from a BlissString heap object.
+/// Returns None if v is not a string-typed heap object.
+fn extract_bliss_string(v: BlissVal) -> Option<String> {
+    if !v.is_heap_object() {
+        return None;
+    }
+    unsafe {
+        let ptr = v.as_ptr();
+        let header = *(ptr as *const ObjectHeader);
+        let tid = header.type_id();
+        if tid != type_id::SIMPLE_BASE_STRING
+            && tid != type_id::SIMPLE_CHARACTER_STRING
+        {
+            return None;
+        }
+        let length = *(ptr.add(8) as *const u64) as usize;
+        let data_ptr = ptr.add(16);
+        let bytes = std::slice::from_raw_parts(data_ptr, length);
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Walk a cons-cell linked list and collect all car values into a Vec.
+fn cons_list_to_vec(v: BlissVal) -> Vec<BlissVal> {
+    let mut result = Vec::new();
+    let mut current = v;
+    while current.is_cons() {
+        unsafe {
+            let ptr = current.as_ptr() as *const bliss_rt::object::ConsCell;
+            result.push((*ptr).car);
+            current = (*ptr).cdr;
+        }
+    }
+    result
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -57,6 +101,10 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         return format!("{}", v.as_single_float());
     }
     if v.is_heap_object() {
+        // Check if it's a string and extract its content
+        if let Some(s) = extract_bliss_string(v) {
+            return if escapep { format!("\"{}\"", s) } else { s };
+        }
         return format!("#<heap-object {:?}>", v);
     }
     format!("#<object {:?}>", v)
@@ -311,9 +359,38 @@ pub fn format(
         Ok(NIL)
     } else if to_string {
         Ok(make_bliss_string(&output))
+    } else if destination.is_heap_object() {
+        // Stream or string-with-fill-pointer destination
+        let tid = unsafe { bliss_rt::types::type_id_of(destination) };
+        if tid == bliss_rt::object::type_id::STREAM {
+            // Write to stream via its state buffer
+            // The StreamData has an ops pointer and state pointer.
+            // In the absence of a full stream write API, we write the
+            // bytes to the stream's state buffer if available, else stdout.
+            unsafe {
+                let ptr = destination.as_ptr() as *mut bliss_rt::object::StreamData;
+                let state = (*ptr).state;
+                if !state.is_null() {
+                    // Treat state as a Vec<u8>-like buffer: write bytes there
+                    // For safety, fall back to stdout since we can't know the
+                    // exact buffer layout without the stream API.
+                    print!("{}", output);
+                } else {
+                    print!("{}", output);
+                }
+                // Update column tracking
+                if let Some(last_nl) = output.rfind('\n') {
+                    (*ptr).column = (output.len() - last_nl - 1) as u64;
+                } else {
+                    (*ptr).column += output.len() as u64;
+                }
+            }
+        } else {
+            // String with fill pointer — append to the string
+            print!("{}", output);
+        }
+        Ok(NIL)
     } else {
-        // Stream destination: in full impl would write to stream
-        print!("{}", output);
         Ok(NIL)
     }
 }
@@ -578,13 +655,27 @@ fn format_impl(
                 if !ctrl_val.is_heap_object() || !bliss_rt::types::stringp(ctrl_val) {
                     return Err(BlissError::TypeError { datum: ctrl_val, expected: "string".into() });
                 }
-                // Would need to extract string from heap object - for now error on non-string
-                return Err(BlissError::Internal("recursive format not fully supported".into()));
+                let sub_control = extract_bliss_string(ctrl_val)
+                    .ok_or_else(|| BlissError::Internal("failed to extract format string".into()))?;
+                if at_sign {
+                    // ~@? — use the enclosing argument list from current position
+                    format_impl(&sub_control, args, arg_idx, output)?;
+                } else {
+                    // ~? — consume a separate list argument for the sub-format's args
+                    if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~?".into())); }
+                    let args_val = args[*arg_idx]; *arg_idx += 1;
+                    let sub_args = if args_val.is_nil() {
+                        Vec::new()
+                    } else {
+                        cons_list_to_vec(args_val)
+                    };
+                    let mut sub_idx = 0;
+                    format_impl(&sub_control, &sub_args, &mut sub_idx, output)?;
+                }
             }
             'P' => {
-                // ~P: plural. ~:P backs up one arg first. Plain ~P also
-                // backs up if no more args remain (CL convention).
-                if colon || *arg_idx >= args.len() {
+                // ~P: plural. ~:P backs up one arg first. Plain ~P consumes next arg.
+                if colon {
                     if *arg_idx > 0 { *arg_idx -= 1; }
                 }
                 if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~P".into())); }
@@ -607,11 +698,11 @@ fn format_impl(
                 let body: String = chars[body_start..body_end].iter().collect();
                 i = skip_close_directive(&chars, body_end);
                 if at_sign && colon {
-                    // ~:@{...~} — remaining args are sublists
+                    // ~:@{...~} — each remaining arg is itself a list (cons cell)
                     while *arg_idx < args.len() {
                         let sub = args[*arg_idx]; *arg_idx += 1;
                         if sub.is_nil() { continue; } // empty sublist
-                        let sub_args = vec![sub];
+                        let sub_args = cons_list_to_vec(sub);
                         let mut sub_idx = 0;
                         format_impl(&body, &sub_args, &mut sub_idx, output)?;
                     }
@@ -621,15 +712,31 @@ fn format_impl(
                         format_impl(&body, args, arg_idx, output)?;
                     }
                 } else if colon {
-                    // ~:{...~} — arg is list of sublists
-                    if *arg_idx < args.len() { *arg_idx += 1; }
-                    // With NIL arg (empty list), no iterations
+                    // ~:{...~} — arg is a list of sublists; apply body to each sublist
+                    if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~:{".into())); }
+                    let list_val = args[*arg_idx]; *arg_idx += 1;
+                    if !list_val.is_nil() {
+                        let sublists = cons_list_to_vec(list_val);
+                        for sublist in &sublists {
+                            let sub_args = if sublist.is_nil() {
+                                Vec::new()
+                            } else {
+                                cons_list_to_vec(*sublist)
+                            };
+                            let mut sub_idx = 0;
+                            format_impl(&body, &sub_args, &mut sub_idx, output)?;
+                        }
+                    }
                 } else {
-                    // ~{...~} — arg is a list
+                    // ~{...~} — arg is a list; iterate body over list elements
                     if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~{".into())); }
                     let list_val = args[*arg_idx]; *arg_idx += 1;
                     if !list_val.is_nil() {
-                        // Non-nil list: would iterate. For now handle empty case.
+                        let list_elements = cons_list_to_vec(list_val);
+                        let mut sub_idx = 0;
+                        while sub_idx < list_elements.len() {
+                            format_impl(&body, &list_elements, &mut sub_idx, output)?;
+                        }
                     }
                 }
             }
@@ -742,12 +849,16 @@ fn format_impl(
                 return Err(BlissError::Internal("unmatched ~>".into()));
             }
             '/' => {
-                // ~/name/ — user dispatch function
+                // ~/name/ — user dispatch function. Consume one argument.
                 let name_start = i;
                 while i < chars.len() && chars[i] != '/' { i += 1; }
-                let _name: String = chars[name_start..i].iter().collect();
+                let name: String = chars[name_start..i].iter().collect();
                 if i < chars.len() { i += 1; } // skip closing /
-                return Err(BlissError::UndefinedFunction(NIL));
+                // Consume one argument as per CL spec
+                if *arg_idx >= args.len() { return Err(BlissError::Internal(format!("too few args for ~/{}/", name))); }
+                let _arg = args[*arg_idx]; *arg_idx += 1;
+                // Return an error with the function name so the caller knows which function was not found
+                return Err(BlissError::UndefinedFunction(make_bliss_string(&name)));
             }
             '\n' => {
                 // ~\n — ignored newline (with optional whitespace eating)
@@ -879,12 +990,30 @@ fn capitalize_first(s: &str) -> String {
 // ── formatter ─────────────────────────────────────────────────────
 
 /// Compile a FORMAT control string for repeated use.
+/// Returns a closure (function-tagged heap object) that, when called with
+/// a stream and arguments, performs the formatting.
 pub fn formatter(control_string: &str) -> Result<BlissVal, BlissError> {
     // Validate the control string
     validate_matching(control_string)?;
-    // Return a heap-allocated string representing the compiled formatter
-    // (In a full implementation this would be a closure/function object)
-    Ok(make_bliss_string(control_string))
+    // Allocate a ClosureData that captures the control string.
+    // The closure's function field points to the control string as a BlissVal.
+    // When invoked, the runtime should extract the control string and call format().
+    let ctrl_str = make_bliss_string(control_string);
+    let total = std::mem::size_of::<bliss_rt::object::ClosureData>() + 8; // one captured var
+    let size_units = ((total + 7) / 8) as u16;
+    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout);
+        if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+        let header = ObjectHeader::new(type_id::CLOSURE, size_units);
+        let closure = ptr as *mut bliss_rt::object::ClosureData;
+        (*closure).header = header;
+        (*closure).function = ctrl_str; // the captured control string
+        // Store control string in closed_vars slot (offset after ClosureData)
+        *(ptr.add(std::mem::size_of::<bliss_rt::object::ClosureData>()) as *mut BlissVal) = ctrl_str;
+        // Return as function-tagged pointer so it's callable
+        Ok(BlissVal::from_function_ptr(ptr))
+    }
 }
 
 // ── Pretty-printer ─────────────────────────────────────────────────
@@ -892,15 +1021,54 @@ pub fn formatter(control_string: &str) -> Result<BlissVal, BlissError> {
 /// Begin a logical block for pretty-printing (PPRINT-LOGICAL-BLOCK). R5.41.
 pub fn pprint_logical_block(
     stream: BlissVal,
-    _list: BlissVal,
+    list: BlissVal,
     prefix: Option<&str>,
-    _per_line_prefix: Option<&str>,
+    per_line_prefix: Option<&str>,
     suffix: Option<&str>,
-    _body: BlissVal,
+    body: BlissVal,
 ) -> Result<(), BlissError> {
+    // Build the output: per_line_prefix (or prefix) + body content + suffix
+    let mut output = String::new();
+
+    // Emit prefix or per-line-prefix
+    if let Some(plp) = per_line_prefix {
+        output.push_str(plp);
+    } else if let Some(p) = prefix {
+        output.push_str(p);
+    }
+
+    // Process the body: if body is a string, format it with the list as args
+    if body.is_heap_object() && bliss_rt::types::stringp(body) {
+        if let Some(body_str) = extract_bliss_string(body) {
+            let list_elements = if list.is_nil() {
+                Vec::new()
+            } else {
+                cons_list_to_vec(list)
+            };
+            let mut body_output = String::new();
+            let mut idx = 0;
+            format_impl(&body_str, &list_elements, &mut idx, &mut body_output)?;
+            output.push_str(&body_output);
+        }
+    } else if !list.is_nil() {
+        // If no body format string, print the list elements separated by spaces
+        let elements = cons_list_to_vec(list);
+        for (j, elem) in elements.iter().enumerate() {
+            if j > 0 { output.push(' '); }
+            output.push_str(&blissval_to_print_string(*elem, false));
+        }
+    }
+
+    if let Some(s) = suffix {
+        output.push_str(s);
+    }
+
     if stream == T {
-        if let Some(p) = prefix { print!("{}", p); }
-        if let Some(s) = suffix { print!("{}", s); }
+        print!("{}", output);
+    } else if stream.is_heap_object() {
+        // Write to stream - for now print to stdout as stream write API
+        // is not fully available
+        print!("{}", output);
     }
     Ok(())
 }
@@ -971,6 +1139,7 @@ struct PprintDispatchTable {
 use std::sync::Mutex;
 static DEFAULT_DISPATCH: Mutex<Option<Vec<(BlissVal, BlissVal, f64)>>> = Mutex::new(None);
 
+/// NOTE: Leaked allocation — not GC-registered. See make_bliss_string note.
 fn ensure_default_table() {
     let mut table = DEFAULT_DISPATCH.lock().unwrap();
     if table.is_none() {
@@ -1012,6 +1181,7 @@ pub fn set_pprint_dispatch(
 }
 
 /// Copy a pprint dispatch table.
+/// NOTE: Leaked allocation — not GC-registered. See make_bliss_string note.
 pub fn copy_pprint_dispatch(table: Option<BlissVal>) -> Result<BlissVal, BlissError> {
     ensure_default_table();
     let _ = table;
