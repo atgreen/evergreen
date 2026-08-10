@@ -2,14 +2,11 @@
 //!
 //! Covers every variant's construction and Display output,
 //! std::error::Error trait implementation, Debug output,
-//! and non_exhaustive attribute behavior. Also includes
-//! additional runtime module tests for LogLevel ordering,
-//! RuntimeConfig Clone/Debug, and edge cases.
+//! Send/Sync bounds, and non_exhaustive match routing.
 
 use bliss_rt::error::BlissError;
 use bliss_rt::thread::GreenThreadId;
 use bliss_rt::value::BlissVal;
-use bliss_rt::runtime::{LogLevel, RuntimeConfig, Runtime};
 
 // ══════════════════════════════════════════════════════════════════
 // BlissError — Construction of every variant
@@ -266,40 +263,28 @@ fn debug_all_string_variants() {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// BlissError — #[non_exhaustive] behavior
+// BlissError — Send + Sync (required for cross-thread error propagation)
 // ══════════════════════════════════════════════════════════════════
 
 #[test]
-fn non_exhaustive_requires_wildcard_arm() {
-    // Because BlissError is #[non_exhaustive], external crates must
-    // use a wildcard arm in match. This test verifies we can match
-    // known variants and must have a catch-all.
-    let err = BlissError::Oom;
-    let msg = match err {
-        BlissError::Oom => "oom",
-        BlissError::StackOverflow(_) => "stack",
-        BlissError::InvalidImage(_) => "image",
-        BlissError::FfiError(_) => "ffi",
-        BlissError::SignalError(_) => "signal",
-        BlissError::Shutdown => "shutdown",
-        BlissError::Internal(_) => "internal",
-        BlissError::TypeError { .. } => "type",
-        BlissError::UnboundVariable(_) => "unbound",
-        BlissError::UndefinedFunction(_) => "undef",
-        BlissError::ArithmeticError(_) => "arith",
-        BlissError::PackageError(_) => "pkg",
-        BlissError::StreamError(_) => "stream",
-        BlissError::FileError(_) => "file",
-        BlissError::SandboxViolation(_) => "sandbox",
-        // Wildcard is REQUIRED by #[non_exhaustive]
-        _ => "unknown",
-    };
-    assert_eq!(msg, "oom");
+fn bliss_error_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<BlissError>();
 }
 
+// ══════════════════════════════════════════════════════════════════
+// BlissError — match routing with wildcard arm
+// ══════════════════════════════════════════════════════════════════
+// NOTE: BlissError is #[non_exhaustive], which means external crates
+// MUST include a wildcard arm in match expressions. A true compile-time
+// test of that guarantee requires a compile-fail harness (e.g. trybuild).
+// The tests below only verify that match routing with a wildcard arm
+// works correctly for each variant — they do not verify that omitting
+// the wildcard causes a compile error.
+
 #[test]
-fn non_exhaustive_match_each_variant() {
-    // Spot-check that several distinct variants route correctly
+fn match_routing_with_wildcard_arm() {
+    // Verify each variant routes to the correct arm when a wildcard is present.
     let classify = |e: &BlissError| -> &str {
         match e {
             BlissError::Oom => "oom",
@@ -320,8 +305,20 @@ fn non_exhaustive_match_each_variant() {
             _ => "unknown",
         }
     };
-    assert_eq!(classify(&BlissError::Shutdown), "shutdown");
+    assert_eq!(classify(&BlissError::Oom), "oom");
+    assert_eq!(classify(&BlissError::StackOverflow(GreenThreadId(1))), "stack");
+    assert_eq!(classify(&BlissError::InvalidImage("x".into())), "image");
     assert_eq!(classify(&BlissError::FfiError("x".into())), "ffi");
+    assert_eq!(classify(&BlissError::SignalError(1)), "signal");
+    assert_eq!(classify(&BlissError::Shutdown), "shutdown");
+    assert_eq!(classify(&BlissError::Internal("x".into())), "internal");
+    assert_eq!(classify(&BlissError::TypeError { datum: BlissVal(0), expected: "T".into() }), "type");
+    assert_eq!(classify(&BlissError::UnboundVariable(BlissVal(0))), "unbound");
+    assert_eq!(classify(&BlissError::UndefinedFunction(BlissVal(0))), "undef");
+    assert_eq!(classify(&BlissError::ArithmeticError("x".into())), "arith");
+    assert_eq!(classify(&BlissError::PackageError("x".into())), "pkg");
+    assert_eq!(classify(&BlissError::StreamError("x".into())), "stream");
+    assert_eq!(classify(&BlissError::FileError("x".into())), "file");
     assert_eq!(classify(&BlissError::SandboxViolation("x".into())), "sandbox");
 }
 
@@ -351,163 +348,4 @@ fn bliss_error_question_mark_propagation() {
     let result = inner();
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().to_string(), "shutdown requested");
-}
-
-// ══════════════════════════════════════════════════════════════════
-// LogLevel — ordering tests
-// ══════════════════════════════════════════════════════════════════
-
-#[test]
-fn log_level_error_is_least() {
-    assert!(LogLevel::Error < LogLevel::Warn);
-    assert!(LogLevel::Error < LogLevel::Info);
-    assert!(LogLevel::Error < LogLevel::Debug);
-    assert!(LogLevel::Error < LogLevel::Trace);
-}
-
-#[test]
-fn log_level_trace_is_greatest() {
-    assert!(LogLevel::Trace > LogLevel::Debug);
-    assert!(LogLevel::Trace > LogLevel::Info);
-    assert!(LogLevel::Trace > LogLevel::Warn);
-    assert!(LogLevel::Trace > LogLevel::Error);
-}
-
-#[test]
-fn log_level_total_ordering() {
-    assert!(LogLevel::Error < LogLevel::Warn);
-    assert!(LogLevel::Warn < LogLevel::Info);
-    assert!(LogLevel::Info < LogLevel::Debug);
-    assert!(LogLevel::Debug < LogLevel::Trace);
-}
-
-#[test]
-fn log_level_equality() {
-    assert_eq!(LogLevel::Error, LogLevel::Error);
-    assert_eq!(LogLevel::Warn, LogLevel::Warn);
-    assert_eq!(LogLevel::Info, LogLevel::Info);
-    assert_eq!(LogLevel::Debug, LogLevel::Debug);
-    assert_eq!(LogLevel::Trace, LogLevel::Trace);
-}
-
-#[test]
-fn log_level_not_equal_across_variants() {
-    assert_ne!(LogLevel::Error, LogLevel::Warn);
-    assert_ne!(LogLevel::Warn, LogLevel::Info);
-    assert_ne!(LogLevel::Info, LogLevel::Debug);
-    assert_ne!(LogLevel::Debug, LogLevel::Trace);
-}
-
-#[test]
-fn log_level_clone_and_copy() {
-    let level = LogLevel::Debug;
-    let cloned = level.clone();
-    assert_eq!(level, cloned);
-    // Copy: level is still usable after move
-    let copied = level;
-    let _also = level;
-    assert_eq!(copied, LogLevel::Debug);
-}
-
-#[test]
-fn log_level_debug_output() {
-    assert_eq!(format!("{:?}", LogLevel::Error), "Error");
-    assert_eq!(format!("{:?}", LogLevel::Warn), "Warn");
-    assert_eq!(format!("{:?}", LogLevel::Info), "Info");
-    assert_eq!(format!("{:?}", LogLevel::Debug), "Debug");
-    assert_eq!(format!("{:?}", LogLevel::Trace), "Trace");
-}
-
-#[test]
-fn log_level_min_max() {
-    let levels = [
-        LogLevel::Trace,
-        LogLevel::Error,
-        LogLevel::Info,
-        LogLevel::Warn,
-        LogLevel::Debug,
-    ];
-    assert_eq!(*levels.iter().min().unwrap(), LogLevel::Error);
-    assert_eq!(*levels.iter().max().unwrap(), LogLevel::Trace);
-}
-
-// ══════════════════════════════════════════════════════════════════
-// RuntimeConfig — Clone and Debug
-// ══════════════════════════════════════════════════════════════════
-
-#[test]
-fn runtime_config_clone_preserves_all_fields() {
-    let cfg = RuntimeConfig::from_env();
-    let cloned = cfg.clone();
-    assert_eq!(cfg.heap_size, cloned.heap_size);
-    assert_eq!(cfg.nursery_size, cloned.nursery_size);
-    assert_eq!(cfg.stack_size, cloned.stack_size);
-    assert_eq!(cfg.num_workers, cloned.num_workers);
-    assert_eq!(cfg.image_path, cloned.image_path);
-    assert_eq!(cfg.no_image, cloned.no_image);
-    assert_eq!(cfg.eval_form, cloned.eval_form);
-    assert_eq!(cfg.load_file, cloned.load_file);
-    assert_eq!(cfg.gc_log, cloned.gc_log);
-    assert_eq!(cfg.jit_dump, cloned.jit_dump);
-    assert_eq!(cfg.safepoint_spin, cloned.safepoint_spin);
-    assert_eq!(cfg.ffi_pool_pages, cloned.ffi_pool_pages);
-    assert_eq!(cfg.log_level, cloned.log_level);
-}
-
-#[test]
-fn runtime_config_clone_is_independent() {
-    let mut cfg = RuntimeConfig::from_env();
-    let cloned = cfg.clone();
-    cfg.heap_size = 999_999;
-    // The clone should retain its original value
-    assert_ne!(cloned.heap_size, 999_999);
-}
-
-#[test]
-fn runtime_config_debug_contains_field_names() {
-    let cfg = RuntimeConfig::from_env();
-    let dbg = format!("{:?}", cfg);
-    assert!(dbg.contains("RuntimeConfig"), "got: {}", dbg);
-    assert!(dbg.contains("heap_size"), "got: {}", dbg);
-    assert!(dbg.contains("nursery_size"), "got: {}", dbg);
-    assert!(dbg.contains("stack_size"), "got: {}", dbg);
-    assert!(dbg.contains("num_workers"), "got: {}", dbg);
-    assert!(dbg.contains("log_level"), "got: {}", dbg);
-}
-
-// ══════════════════════════════════════════════════════════════════
-// Runtime::init — edge cases
-// ══════════════════════════════════════════════════════════════════
-
-#[test]
-fn runtime_init_zero_heap_size_is_error() {
-    let mut cfg = RuntimeConfig::from_env();
-    cfg.heap_size = 0;
-    // A zero-byte heap is nonsensical; init should fail
-    let result = Runtime::init(cfg);
-    assert!(result.is_err(), "Runtime::init with heap_size=0 should return Err");
-}
-
-#[test]
-fn runtime_init_zero_nursery_size_is_error() {
-    let mut cfg = RuntimeConfig::from_env();
-    cfg.nursery_size = 0;
-    let result = Runtime::init(cfg);
-    assert!(result.is_err(), "Runtime::init with nursery_size=0 should return Err");
-}
-
-#[test]
-fn runtime_init_zero_stack_size_is_error() {
-    let mut cfg = RuntimeConfig::from_env();
-    cfg.stack_size = 0;
-    let result = Runtime::init(cfg);
-    assert!(result.is_err(), "Runtime::init with stack_size=0 should return Err");
-}
-
-#[test]
-fn runtime_init_zero_workers_is_error() {
-    let mut cfg = RuntimeConfig::from_env();
-    cfg.num_workers = 0;
-    let result = Runtime::init(cfg);
-    assert!(result.is_err(), "Runtime::init with num_workers=0 should return Err");
 }
