@@ -128,7 +128,7 @@ fn remove_dead_nodes(graph: &mut IrGraph, reachable: &HashSet<NodeId>) -> usize 
 /// following the BlissVal tag scheme, or as a special value (NIL/T).
 /// If expected_type is T (top type), every value satisfies it.
 fn constant_satisfies_type(val: bliss_rt::value::BlissVal, expected_type: bliss_rt::value::BlissVal) -> bool {
-    use bliss_rt::value::{T_BITS, TAG_FIXNUM, TAG_CONS, TAG_CHARACTER, TAG_SINGLE_FLOAT, TAG_SYMBOL, TAG_FUNCTION, TAG_HEAP_OBJECT};
+    use bliss_rt::value::T_BITS;
     // T (top type) accepts everything
     if expected_type.0 == T_BITS {
         return true;
@@ -473,8 +473,8 @@ impl Pass for Inlining {
             return Ok(false);
         }
         let reachable = reachable_from_start(graph);
-        let mut changed = false;
-        let mut remaining_budget = self.config.budget;
+        let changed = false;
+        let remaining_budget = self.config.budget;
 
         // Collect Call nodes that are inlining candidates
         let mut call_sites: Vec<NodeId> = Vec::new();
@@ -710,7 +710,7 @@ impl Pass for Licm {
                     .find(|e| !is_forward_reachable(graph, *header, e.from, &reachable))
                     .map(|e| e.from);
 
-                if let Some(pre_src) = preheader_src {
+                if let Some(_pre_src) = preheader_src {
                     // For each invariant node that has a control input from within the loop,
                     // rewire its control dependency to the preheader source
                     for &inv_id in &invariant {
