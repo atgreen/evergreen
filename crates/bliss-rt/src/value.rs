@@ -159,6 +159,27 @@ impl BlissVal {
     pub fn is_list(self) -> bool {
         self.is_cons() || self.is_nil()
     }
+
+    /// True if this value is a string (a heap object whose type_id is
+    /// `SIMPLE_BASE_STRING` or `SIMPLE_CHARACTER_STRING`).
+    ///
+    /// # Safety note
+    /// This method dereferences the heap pointer to read the `ObjectHeader`.
+    /// It is safe to call only when the underlying pointer is valid and
+    /// points to a live object. Returns `false` for non-heap-object tags.
+    pub fn is_string(self) -> bool {
+        if self.tag() != TAG_HEAP_OBJECT {
+            return false;
+        }
+        // SAFETY: caller guarantees the heap pointer is valid.
+        unsafe {
+            let ptr = self.as_ptr();
+            let header = *(ptr as *const crate::object::ObjectHeader);
+            let tid = header.type_id();
+            tid == crate::object::type_id::SIMPLE_BASE_STRING
+                || tid == crate::object::type_id::SIMPLE_CHARACTER_STRING
+        }
+    }
 }
 
 // ── Extraction ─────────────────────────────────────────────────────

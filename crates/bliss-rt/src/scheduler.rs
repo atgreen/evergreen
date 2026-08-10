@@ -41,6 +41,11 @@ impl Scheduler {
 
     /// Submit a runnable green thread to the current worker's deque.
     pub fn submit(&self, thread_id: GreenThreadId) -> Result<(), BlissError> {
+        let shut = self.shut_down.lock().unwrap();
+        if *shut {
+            return Err(BlissError::Internal("scheduler is shut down".into()));
+        }
+        drop(shut);
         let mut active = self.active.lock().unwrap();
         active.insert(thread_id);
         Ok(())
