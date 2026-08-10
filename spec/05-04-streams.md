@@ -50,7 +50,7 @@ from `COMMON-LISP`.
 
 | Class | Superclasses | Role |
 |-------|-------------|------|
-| `fundamental-stream` | `stream`, `standard-object` | Root of Gray hierarchy; adds CLOS-based dispatch. |
+| `fundamental-stream` | `stream`, `standard-object` | Root of Gray hierarchy; adds CLOS-based dispatch.  Contains a `stream-id` slot (monotonically increasing `u64` assigned at creation) used for lock ordering (§5.4.7.3). |
 | `fundamental-input-stream` | `fundamental-stream`, `input-stream` | Readable stream mixin. |
 | `fundamental-output-stream` | `fundamental-stream`, `output-stream` | Writable stream mixin. |
 | `fundamental-character-stream` | `fundamental-stream` | Element type is `character`. |
@@ -91,6 +91,18 @@ from `COMMON-LISP`.
 | `stream-write-byte` | `(stream integer) → integer` | Write one byte to a binary stream. Subclass MUST implement. |
 | `stream-write-sequence` | `(stream sequence start end) → sequence` | Bulk write. Default: loop on element writes. |
 
+### 5.4.2.4  Required Generic Functions — Query and Lifecycle
+
+These standard CL functions MUST dispatch through Gray generic functions
+on `fundamental-stream` subclasses (R5.113):
+
+| Generic Function | Signature | Contract |
+|-----------------|-----------|----------|
+| `stream-element-type` | `(stream) → typespec` | Return the element type of the stream (e.g. `character`, `(unsigned-byte 8)`). Subclass MUST implement or inherit a correct default. |
+| `open-stream-p` | `(stream) → boolean` | Return `T` if the stream is open. Default on `fundamental-stream`: check the `open` slot. |
+| `close` | `(stream &key abort) → t` | Close the stream. If `:abort` is true, discard pending output without flushing. Default on `fundamental-stream`: set `open` to `nil`, deregister finalizer. MUST be idempotent (R5.122). |
+| `interactive-stream-p` | `(stream) → boolean` | Return `T` if the stream is interactive (e.g. a terminal). Default on `fundamental-stream`: `nil`. `bliss-file-stream` overrides to check `isatty(3)`. |
+
 ---
 
 ## 5.4.3  Built-in Stream Implementations
@@ -125,9 +137,43 @@ struct BlissFileStream {
 - Created via CL `open` / `with-open-file`.
 - On character streams, bytes are decoded/encoded through the
   external-format codec (§5.4.4).
-- `file-position` calls `lseek(2)` after flushing the buffer.
 - `file-length` calls `fstat(2)`.
 - Pipes/sockets/FIFOs: `file-position`/`file-length` return `nil` (R5.124).
+
+**Buffer–position synchronisation:**
+
+The `position` field tracks the *logical byte offset in the file* that
+corresponds to the next byte the user would read or write, accounting for
+buffered data.  It is maintained as follows:
+
+1. **Read path:** After a `read(2)` syscall fills the buffer, `position`
+   is set to `fd_offset_after_read - bytes_in_buffer + buf.pos`.  Each
+   `stream-read-char` / `stream-read-byte` advances `buf.pos` and
+   increments `position` by the number of raw bytes consumed (which may
+   differ from 1 for multi-byte codecs).
+
+2. **Write path:** Each `stream-write-char` / `stream-write-byte` appends
+   encoded bytes to the buffer and increments `position` by the number of
+   bytes written to the buffer.  On flush, `write(2)` sends `buf[0..fill]`
+   to the fd; the fd offset then equals `position`.
+
+3. **Bidirectional (`:io`) streams:** A direction-switch protocol prevents
+   desynchronisation:
+   - **Read → Write transition:** The buffer is invalidated (discarded).
+     `lseek(fd, position, SEEK_SET)` is called to align the fd offset to
+     the logical position before the first write.
+   - **Write → Read transition:** The buffer is flushed via `write(2)`.
+     The fd offset now equals `position`; the next `read(2)` refills the
+     buffer from that point.
+   The current direction is tracked in a `last_op: Option<Direction>` field
+   (elided from D5.15 for brevity but stored alongside `buffer`).
+
+4. **`file-position` (query):** Returns `position` directly — no syscall
+   needed because `position` is always kept in sync.
+
+5. **`file-position` (set):** Flushes dirty buffer data via `write(2)`,
+   invalidates the read buffer, calls `lseek(fd, new_pos, SEEK_SET)`, and
+   sets `position = new_pos`.
 
 ### 5.4.3.2  `bliss-string-stream`
 
@@ -163,8 +209,28 @@ struct BlissStringStream {
 | `synonym-stream` | D5.21 | Holds a symbol; every operation `symbol-value`s the symbol and delegates. |
 
 All composite streams store their component(s) and delegate via the Gray
-protocol.  Per-stream mutex is on the composite, not the components — the
-caller holds one lock for the composite operation (R5.120).
+protocol.
+
+**Composite stream locking policy (R5.120):**
+
+Composite stream operations acquire **both** the composite's own mutex
+**and** the mutex of each component stream they delegate to, following the
+lock ordering defined in §5.4.7.3 (composite first, then components in
+`stream-id` order).  Specifically:
+
+- `broadcast-stream` `stream-write-char`: acquires the broadcast-stream
+  lock, then acquires each component stream's lock in `stream-id` order
+  before writing.  Component locks are released in reverse order after
+  the write completes.
+- `two-way-stream` / `echo-stream`: acquires the composite lock, then the
+  relevant component's lock (input-side or output-side) for the operation.
+- `synonym-stream`: acquires its own lock, resolves the symbol value, then
+  acquires the target stream's lock.
+
+This two-level locking ensures that (a) the composite operation is atomic
+from the caller's perspective, and (b) individual component streams
+remain safe when accessed both directly and through composites
+concurrently.
 
 ---
 
@@ -274,9 +340,33 @@ All file-stream I/O goes through Rust wrappers around POSIX
 crates/bliss-rt/src/io/
 ├── fd.rs          // RawFd wrapper, non-blocking mode toggle
 ├── buffer.rs      // StreamBuffer implementation
-├── codec.rs       // Rust-side fast-path UTF-8 decode for bootstrap
+├── codec.rs       // Rust-side bootstrap UTF-8 codec (see below)
 └── stdio.rs       // Setup of *standard-input*, etc. from fds 0/1/2
 ```
+
+**Rust bootstrap codec vs. CL codec protocol (R5.129):**
+
+During Phase 1 bootstrap, the CLOS-based codec generic functions
+(§5.4.4.1) are not yet available because the class hierarchy has not been
+built.  The Rust-side `codec.rs` provides a hard-coded UTF-8
+encoder/decoder that is called directly by the bootstrap stream
+primitives (e.g., reading `*.lisp` source files to build the image).
+
+Once the CL stream class hierarchy is initialised (end of Phase 1):
+
+1. The bootstrap Rust codec is **replaced**: `bliss-file-stream` methods
+   switch to dispatching through the CL `codec-encode` / `codec-decode`
+   generic functions.  The Rust entry points are no longer called for
+   normal stream operations.
+2. **Correctness guarantee:** The bootstrap test suite (§5.4.10) includes
+   a round-trip comparison test that encodes and decodes a corpus of
+   Unicode strings through both the Rust `codec.rs` path and the CL
+   `utf-8-codec` path, asserting byte-identical output.  This test runs
+   as part of image build validation.
+3. After switchover, `codec.rs` remains compiled into the runtime but is
+   only reachable via an internal `%bootstrap-decode-utf8` FFI function,
+   retained for emergency / fallback use (e.g., decoding error messages
+   if the CL codec signals during condition handling).
 
 ### 5.4.6.2  Non-blocking I/O (R5.126)
 
@@ -323,6 +413,32 @@ acquire this mutex:
 `read-sequence`, `write-sequence`, `read-line`, and `write-string` hold
 the stream lock for their entire duration.  This guarantees that
 interleaved writes from multiple threads do not produce garbled output.
+
+**Bulk bypass and codec interaction (R5.127):**
+
+R5.127 requires that `read-sequence` / `write-sequence` on `file-stream`
+bypass the per-character Gray generic-function dispatch (i.e., they do NOT
+call `stream-read-char` / `stream-write-char` in a loop).  The bypass
+behaviour depends on the stream's element type:
+
+- **Binary streams** (`element-type` is an integer subtype): Bulk
+  `read(2)` / `write(2)` directly between the user-supplied sequence and
+  the stream buffer.  No codec is involved.  This is the fastest path.
+
+- **Character streams**: The bulk path still performs codec
+  encoding/decoding, but does so on buffer-sized chunks rather than
+  character-by-character.  Specifically, `write-sequence` encodes the
+  entire sub-sequence into the stream buffer via repeated `codec-encode`
+  calls on spans of characters (not one GF call per character), flushing
+  full buffers to the fd as needed.  `read-sequence` symmetrically fills
+  the buffer via `read(2)` and decodes spans via `codec-decode`.  The
+  codec generic functions are still called, but the per-character
+  `stream-write-char` / `stream-read-char` generic functions and their
+  `:around` methods (including redundant per-char lock acquisition) are
+  bypassed.
+
+This means "bypass" in R5.127 refers to bypassing the per-element Gray
+stream GF dispatch loop, NOT bypassing codec processing.
 
 ### 5.4.7.3  Lock Ordering
 
