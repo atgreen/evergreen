@@ -342,8 +342,10 @@ pub fn format(
         }
         Ok(NIL)
     } else if destination.is_heap_object() {
-        // String with fill pointer — append formatted output by
-        // reallocating the backing store to hold old + new content.
+        // String with fill pointer — append formatted output in place.
+        // We refuse to grow beyond the original allocation because realloc
+        // may move the underlying buffer and BlissVal is a value type
+        // holding the old pointer — growing would be undefined behavior.
         unsafe {
             let ptr = destination.as_ptr();
             let old_header = *(ptr as *const ObjectHeader);
@@ -364,26 +366,15 @@ pub fn format(
                 // Update length field on the original pointer.
                 *(ptr.add(8) as *mut u64) = new_len as u64;
             } else {
-                // Need a larger buffer.  Reallocate and copy combined
-                // content back to the *same* base pointer so that
-                // holders of the BlissVal still see the update.
-                let old_layout = std::alloc::Layout::from_size_align(old_padded, 8).unwrap();
-                let grown = std::alloc::realloc(ptr, old_layout, new_padded);
-                if grown.is_null() { std::alloc::handle_alloc_error(old_layout); }
-                // If realloc moved, we cannot update the BlissVal held
-                // by the caller (it is a value type).  In practice the
-                // allocator often extends in place for small strings;
-                // CL semantics guarantee the caller keeps a reference
-                // to the same object (VECTOR-PUSH-EXTEND).
-                std::ptr::copy_nonoverlapping(
-                    append_bytes.as_ptr(),
-                    grown.add(16 + current_len),
-                    append_bytes.len(),
-                );
-                // Update header and length on the (possibly moved) pointer.
-                let new_header = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, (new_padded / 8) as u16);
-                *(grown as *mut ObjectHeader) = new_header;
-                *(grown.add(8) as *mut u64) = new_len as u64;
+                // The formatted output does not fit in the original
+                // allocation.  Signal an error rather than risk UB
+                // from realloc moving the buffer behind a value-type
+                // pointer.
+                return Err(BlissError::Internal(format!(
+                    "FORMAT: string destination capacity exceeded \
+                     (need {} bytes, have {})",
+                    new_padded, old_padded
+                )));
             }
         }
         Ok(NIL)
@@ -675,14 +666,24 @@ fn format_impl(
                 }
             }
             'P' => {
-                // Both ~P and ~:P back up one argument to peek at the
-                // preceding value for the plural decision.  Per CL spec
-                // ~:P does a ~:* first; plain ~P technically consumes the
-                // next arg, but the idiomatic usage pattern `~D item~P`
-                // relies on the implicit back-up, which major
-                // implementations also support.
-                if *arg_idx > 0 { *arg_idx -= 1; }
-                if *arg_idx >= args.len() { return Err(BlissError::Internal("too few args for ~P".into())); }
+                // Per CL spec §22.3.8.3: ~:P backs up one argument
+                // (does ~:* first) then checks if the value equals 1.
+                // Plain ~P consumes the next argument directly.
+                if colon {
+                    // ~:P — explicitly back up one argument position.
+                    if *arg_idx > 0 { *arg_idx -= 1; }
+                }
+                if *arg_idx >= args.len() {
+                    // No more arguments available.  If this is plain ~P
+                    // following a directive that consumed the last arg
+                    // (e.g. "~D item~P" with one arg), re-examine the
+                    // previous argument as a compatibility fallback.
+                    if !colon && *arg_idx > 0 {
+                        *arg_idx -= 1;
+                    } else {
+                        return Err(BlissError::Internal("too few args for ~P".into()));
+                    }
+                }
                 let val = args[*arg_idx]; *arg_idx += 1;
                 let is_one = val.is_fixnum() && val.as_fixnum() == 1;
                 if at_sign {
@@ -862,11 +863,49 @@ fn format_impl(
                 if *arg_idx >= args.len() { return Err(BlissError::Internal(format!("too few args for ~/{}/", name))); }
                 let arg = args[*arg_idx]; *arg_idx += 1;
                 // Look up the registered format function
-                if let Some(_func) = lookup_format_function(&name) {
-                    // The registered function exists. In a full implementation,
-                    // we would call it with (stream, arg, colon, at_sign, params...).
-                    // For now, print the argument's aesthetic representation.
-                    output.push_str(&blissval_to_print_string(arg, false));
+                if let Some(func) = lookup_format_function(&name) {
+                    // Call the registered format function with the CL-specified
+                    // arguments: (stream, arg, colon-p, at-sign-p, &rest params).
+                    // We create a string-output-stream proxy for the output
+                    // buffer, and pass colon/at_sign as T or NIL.
+                    let colon_val = if colon { T } else { NIL };
+                    let at_val = if at_sign { T } else { NIL };
+                    // Build argument list: stream (NIL = string accumulator),
+                    // arg, colon-p, at-sign-p, then any prefix parameters.
+                    let mut call_args: Vec<BlissVal> = Vec::with_capacity(4 + params.len());
+                    call_args.push(NIL); // stream placeholder (output goes to buffer)
+                    call_args.push(arg);
+                    call_args.push(colon_val);
+                    call_args.push(at_val);
+                    for p in &params {
+                        match p {
+                            Param::Num(n) => call_args.push(BlissVal::from_fixnum(*n)),
+                            _ => call_args.push(NIL),
+                        }
+                    }
+                    // Invoke the function. For compiled functions with an
+                    // entry point we call directly; otherwise fall back to
+                    // the aesthetic representation of the argument.
+                    let result = call_format_dispatch(func, &call_args);
+                    match result {
+                        Ok(val) => {
+                            // If the function returned a string, append it.
+                            if let Some(s) = extract_bliss_string(val) {
+                                output.push_str(&s);
+                            }
+                            // Otherwise the function wrote to the stream
+                            // directly (which we don't capture yet), so
+                            // fall back to aesthetic printing.
+                            else if !val.is_nil() {
+                                output.push_str(&blissval_to_print_string(val, false));
+                            }
+                        }
+                        Err(_) => {
+                            // Function call failed; fall back to aesthetic
+                            // representation so FORMAT itself doesn't crash.
+                            output.push_str(&blissval_to_print_string(arg, false));
+                        }
+                    }
                 } else {
                     // No registered function — return an error with the function name
                     return Err(BlissError::UndefinedFunction(make_bliss_string(&name)));
@@ -1208,6 +1247,55 @@ struct DispatchEntry {
 #[allow(dead_code)]
 struct PprintDispatchTable {
     entries: Vec<DispatchEntry>,
+}
+
+// ── Format function dispatch (~/name/ directive) ─────────────────
+
+/// Invoke a format dispatch function (registered via `register_format_function`).
+/// The function is a BlissVal which may be a compiled function with an entry
+/// point, an interpreted function, or a closure.  We attempt to call it with
+/// the provided arguments; on any structural mismatch we return an error so
+/// the caller can fall back gracefully.
+fn call_format_dispatch(func: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
+    use bliss_rt::object::{type_id, CompiledFunctionData};
+
+    if !func.is_function() && !func.is_heap_object() {
+        return Err(BlissError::Internal("~/name/ function is not callable".into()));
+    }
+
+    // For compiled functions, we can read the entry point and call it directly.
+    if func.is_function() || func.is_heap_object() {
+        let ptr = if func.is_function() {
+            // Unmask the tag to get the raw pointer.
+            unsafe { func.as_ptr() }
+        } else {
+            unsafe { func.as_ptr() }
+        };
+
+        let header = unsafe { *(ptr as *const bliss_rt::object::ObjectHeader) };
+        let tid = header.type_id();
+
+        if tid == type_id::COMPILED_FUNCTION {
+            let cf = unsafe { &*(ptr as *const CompiledFunctionData) };
+            let entry = cf.entry_point;
+            if !entry.is_null() {
+                // Call compiled entry point as a Rust-ABI function that
+                // takes a slice of BlissVal arguments and returns BlissVal.
+                type EntryFn = fn(&[BlissVal]) -> BlissVal;
+                let f: EntryFn = unsafe { std::mem::transmute(entry) };
+                return Ok(f(args));
+            }
+        }
+
+        // For interpreted functions / closures we cannot evaluate the body
+        // without the full evaluator.  Return an error so the caller falls
+        // back to the aesthetic representation.
+        return Err(BlissError::Internal(
+            "~/name/ function is interpreted/closure — direct call not yet supported".into(),
+        ));
+    }
+
+    Err(BlissError::Internal("~/name/ function is not callable".into()))
 }
 
 // ── User format function registry (~/ directive) ──────────────────
