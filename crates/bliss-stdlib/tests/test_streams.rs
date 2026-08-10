@@ -684,3 +684,79 @@ fn get_output_stream_string_on_non_string_output_stream_errors() {
     let result = get_output_stream_string(input);
     assert!(result.is_err());
 }
+
+// ── Additional stream edge cases ─────────────────────────────────
+
+#[test]
+fn write_byte_to_input_stream_errors() {
+    let s = make_string_input_stream(make_lisp_string("abc"), 0, None).unwrap();
+    assert!(stream_write_byte(s, BlissVal::from_fixnum(65)).is_err());
+}
+
+#[test]
+fn write_string_to_input_stream_errors() {
+    let s = make_string_input_stream(make_lisp_string("abc"), 0, None).unwrap();
+    assert!(stream_write_string(s, make_lisp_string("x"), 0, None).is_err());
+}
+
+#[test]
+fn read_byte_from_output_stream_errors() {
+    let s = make_string_output_stream(NIL).unwrap();
+    assert!(stream_read_byte(s).is_err());
+}
+
+#[test]
+fn unread_char_on_output_stream_errors() {
+    let s = make_string_output_stream(NIL).unwrap();
+    assert!(stream_unread_char(s, BlissVal::from_char('x')).is_err());
+}
+
+#[test]
+fn element_type_for_broadcast_stream() {
+    let s = make_string_output_stream(NIL).unwrap();
+    let b = make_broadcast_stream(&[s]).unwrap();
+    assert_ne!(stream_element_type(b), NIL);
+}
+
+#[test]
+fn element_type_for_two_way_stream() {
+    let inp = make_string_input_stream(make_lisp_string("t"), 0, None).unwrap();
+    let out = make_string_output_stream(NIL).unwrap();
+    let tw = make_two_way_stream(inp, out).unwrap();
+    assert_ne!(stream_element_type(tw), NIL);
+}
+
+#[test]
+fn write_string_with_start_end_substring() {
+    let s = make_string_output_stream(NIL).unwrap();
+    stream_write_string(s, make_lisp_string("hello world"), 6, Some(11)).unwrap();
+    assert_eq!(get_output_stream_string(s).unwrap(), make_lisp_string("world"));
+}
+
+#[test]
+fn write_string_with_start_only() {
+    let s = make_string_output_stream(NIL).unwrap();
+    stream_write_string(s, make_lisp_string("abcdef"), 3, None).unwrap();
+    assert_eq!(get_output_stream_string(s).unwrap(), make_lisp_string("def"));
+}
+
+#[test]
+fn force_output_on_closed_stream_errors() {
+    let s = make_string_output_stream(NIL).unwrap();
+    close(s, false).unwrap();
+    assert!(stream_force_output(s).is_err());
+}
+
+#[test]
+fn finish_output_on_closed_stream_errors() {
+    let s = make_string_output_stream(NIL).unwrap();
+    close(s, false).unwrap();
+    assert!(stream_finish_output(s).is_err());
+}
+
+#[test]
+fn listen_on_closed_stream_errors() {
+    let s = make_string_input_stream(make_lisp_string("d"), 0, None).unwrap();
+    close(s, false).unwrap();
+    assert!(stream_listen(s).is_err());
+}
