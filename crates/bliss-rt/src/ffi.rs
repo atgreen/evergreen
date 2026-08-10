@@ -375,10 +375,14 @@ fn invoke_closure(closure: BlissVal) -> u64 {
                     return invoke_closure(inner);
                 }
                 type_id::FUNCTION_INTERPRETED => {
-                    // Interpreted functions need the evaluator which is in the
-                    // compiler crate. Return NIL for now — the full tiered
-                    // compilation pipeline will handle this.
-                    return crate::value::NIL.to_raw();
+                    // Interpreted functions require the evaluator which lives in
+                    // the compiler crate and is not accessible from the runtime.
+                    // Callbacks wrapping interpreted functions must be compiled
+                    // first via the tiered compilation pipeline.
+                    panic!(
+                        "FFI callback invoked on an interpreted (non-compiled) function. \
+                         The function must be compiled before it can be used as a foreign callback."
+                    );
                 }
                 _ => {
                     // Unknown function sub-type; return NIL.
