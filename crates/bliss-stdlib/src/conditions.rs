@@ -317,16 +317,14 @@ pub struct RestartSpec {
 /// Registers the restart specs in thread-local state and evaluates the body.
 /// Restarts persist in thread-local state after restart_bind returns.
 ///
-/// Note: Per ANSI CL, restarts should have dynamic extent (only visible
-/// during the body). However, since the body is a pre-evaluated BlissVal
-/// and not a closure, there is no way to call find_restart/compute_restarts
-/// "during" the body. The tests that call find_restart after restart_bind
-/// require restarts to persist. Restarts are naturally cleaned up when the
-/// test thread exits (thread-local storage).
+/// Note: Per ANSI CL, restarts have dynamic extent — they are only visible
+/// during the body and are removed when restart_bind returns.
 pub fn restart_bind(
     restarts: &[RestartSpec],
     body: BlissVal,
 ) -> Result<BlissVal, BlissError> {
+    let count = restarts.len();
+
     // Register all restart specs in thread-local state
     STATE.with(|s| {
         let mut state = s.borrow_mut();
@@ -341,8 +339,17 @@ pub fn restart_bind(
         }
     });
 
-    // Return the body value (no restart was invoked)
-    Ok(body)
+    // Compute result (body is pre-evaluated)
+    let result = Ok(body);
+
+    // Remove the restarts we added (dynamic extent)
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let len = state.restart_registry.len();
+        state.restart_registry.truncate(len - count);
+    });
+
+    result
 }
 
 /// Compute available restarts for a condition.

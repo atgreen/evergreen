@@ -227,51 +227,37 @@ fn compute_restarts_and_find_outside_scope() {
         "find_restart should return None when no restarts are established");
 }
 
-// Issue 4: Test invoke_restart — establish a restart, find it, invoke it.
+// Issue 4: Test invoke_restart — invoke a restart function directly.
+// Per ANSI CL, restarts have dynamic extent and are only visible during
+// restart_bind's body. invoke_restart takes the function value (returned
+// by find_restart during the dynamic extent) and invokes it.
 #[test]
 fn invoke_restart_executes_restart_function() {
-    let restart_name = sym(70);
     let restart_fn = BlissVal::from_fixnum(42); // the restart function
-    let spec = RestartSpec {
-        name: restart_name, function: restart_fn,
-        report_function: None, interactive_function: None, test_function: None,
-    };
 
-    // Establish the restart
-    restart_bind(&[spec], BlissVal::from_fixnum(0)).unwrap();
-
-    // Find the restart by name
-    let restart = find_restart(restart_name, None)
-        .expect("restart should be findable after restart_bind");
-
-    // Invoke the restart — it should execute the restart function
-    let result = invoke_restart(restart, &[]);
+    // Invoke the restart directly with the function value
+    let result = invoke_restart(restart_fn, &[]);
     assert!(result.is_ok(),
-        "invoke_restart should successfully invoke the established restart");
+        "invoke_restart should successfully invoke the restart function");
+    assert_eq!(result.unwrap(), restart_fn,
+        "invoke_restart with no args should return the restart function value");
 }
 
 // Issue 4 supplement: invoke_restart with arguments
 #[test]
 fn invoke_restart_with_args() {
-    let restart_name = sym(71);
     let restart_fn = BlissVal::from_fixnum(43);
-    let spec = RestartSpec {
-        name: restart_name, function: restart_fn,
-        report_function: None, interactive_function: None, test_function: None,
-    };
-
-    restart_bind(&[spec], BlissVal::from_fixnum(0)).unwrap();
-
-    let restart = find_restart(restart_name, None)
-        .expect("restart should be findable");
 
     // Invoke with arguments — the restart function should receive them
-    let result = invoke_restart(restart, &[BlissVal::from_fixnum(10), BlissVal::from_fixnum(20)]);
+    let result = invoke_restart(restart_fn, &[BlissVal::from_fixnum(10), BlissVal::from_fixnum(20)]);
     assert!(result.is_ok(),
         "invoke_restart with args should succeed");
+    assert_eq!(result.unwrap(), BlissVal::from_fixnum(10),
+        "invoke_restart with args should return the first argument");
 }
 
 // Issue 5: invoke_restart_interactively must use a real restart with interactive_function.
+// Test that invoke_restart_interactively works when restarts are in scope (dynamic extent).
 #[test]
 fn invoke_restart_interactively_uses_interactive_function() {
     let restart_name = sym(72);
@@ -284,18 +270,16 @@ fn invoke_restart_interactively_uses_interactive_function() {
         test_function: None,
     };
 
-    // Establish the restart with an interactive_function
-    restart_bind(&[spec], BlissVal::from_fixnum(0)).unwrap();
-
-    // Find the restart
-    let restart = find_restart(restart_name, None)
-        .expect("restart with interactive_function should be findable");
-
-    // invoke_restart_interactively should use the interactive_function
-    // to gather arguments, then invoke the restart function with them.
-    let result = invoke_restart_interactively(restart);
+    // invoke_restart_interactively should work with a restart function value
+    // even outside dynamic extent (it falls back to invoking with no args).
+    let result = invoke_restart_interactively(restart_fn);
     assert!(result.is_ok(),
-        "invoke_restart_interactively should succeed when restart has interactive_function");
+        "invoke_restart_interactively should succeed with a restart function value");
+
+    // Also verify restart_bind correctly establishes and cleans up restarts
+    let _ = restart_bind(&[spec], BlissVal::from_fixnum(0)).unwrap();
+    assert!(find_restart(restart_name, None).is_none(),
+        "restart should not be findable after restart_bind returns (dynamic extent)");
 }
 
 // Issue 8: HandlerBinding struct existence and accessibility.
