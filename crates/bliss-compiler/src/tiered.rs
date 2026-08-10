@@ -6,7 +6,7 @@ use crate::codegen::{native_arch, TargetArch};
 use crate::ir::{EdgeKind, IrBuilder, IrGraph, NodeKind};
 use crate::opt::PassManager;
 use bliss_rt::error::BlissError;
-use bliss_rt::value::{BlissVal, NIL_BITS, TAG_FUNCTION, TAG_SPECIAL, TAG_SYMBOL, T_BITS};
+use bliss_rt::value::{BlissVal, NIL_BITS, TAG_CONS, TAG_FUNCTION, TAG_SPECIAL, TAG_SYMBOL, T_BITS};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -38,6 +38,8 @@ pub struct TierConfig {
 pub const FLAG_QUEUED_FOR_T2: u16 = 0x0001;
 pub const FLAG_T2_FAILED: u16 = 0x0002;
 pub const FLAG_NEVER_COMPILE: u16 = 0x0004;
+/// Indicates this FnMeta is part of a ClosureObj with a captured environment.
+pub const FLAG_IS_CLOSURE: u16 = 0x0008;
 
 /// Per-function metadata shared across tiers (§4.4.3.5).
 ///
@@ -348,6 +350,111 @@ fn list_to_vec(list: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
     Ok(result)
 }
 
+/// Build a proper cons list from a Vec of BlissVals.
+/// Allocates cons cells on the heap (leaked for simplicity in the interpreter).
+fn vec_to_list(vals: &[BlissVal]) -> BlissVal {
+    let mut result = BlissVal(NIL_BITS);
+    for val in vals.iter().rev() {
+        let cell = Box::leak(Box::new([val.0, result.0]));
+        result = BlissVal((cell.as_ptr() as u64) | TAG_CONS);
+    }
+    result
+}
+
+// ── Non-local exit signals (§4.4.3.4) ────────────────────────────
+// These are used for BLOCK/RETURN-FROM, TAGBODY/GO, and CATCH/THROW
+// to implement non-local transfers of control via Rust's Result type.
+
+/// Signal for RETURN-FROM non-local exit.
+#[derive(Debug)]
+struct ReturnFromSignal {
+    /// The block name (symbol bits used as identity).
+    block_name: u64,
+    /// The value being returned.
+    value: BlissVal,
+}
+
+/// Signal for GO non-local exit.
+#[derive(Debug)]
+struct GoSignal {
+    /// The tag (symbol bits used as identity).
+    tag: u64,
+}
+
+/// Signal for THROW non-local exit.
+#[derive(Debug)]
+struct ThrowSignal {
+    /// The catch tag value (evaluated).
+    tag: BlissVal,
+    /// The result value.
+    value: BlissVal,
+}
+
+/// Unified non-local exit type wrapping all transfer kinds.
+#[derive(Debug)]
+enum NonLocalExit {
+    ReturnFrom(ReturnFromSignal),
+    Go(GoSignal),
+    Throw(ThrowSignal),
+}
+
+/// Helper to convert NonLocalExit into BlissError for propagation.
+fn non_local_to_error(nle: NonLocalExit) -> BlissError {
+    match nle {
+        NonLocalExit::ReturnFrom(r) => BlissError::Internal(
+            format!("__NLE_RETURN_FROM__:{}:{}", r.block_name, r.value.0),
+        ),
+        NonLocalExit::Go(g) => BlissError::Internal(
+            format!("__NLE_GO__:{}", g.tag),
+        ),
+        NonLocalExit::Throw(t) => BlissError::Internal(
+            format!("__NLE_THROW__:{}:{}", t.tag.0, t.value.0),
+        ),
+    }
+}
+
+/// Try to parse a BlissError as a non-local exit signal.
+fn error_as_non_local(err: &BlissError) -> Option<NonLocalExit> {
+    if let BlissError::Internal(msg) = err {
+        if let Some(rest) = msg.strip_prefix("__NLE_RETURN_FROM__:") {
+            let parts: Vec<&str> = rest.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                if let (Ok(name), Ok(val)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                    return Some(NonLocalExit::ReturnFrom(ReturnFromSignal {
+                        block_name: name,
+                        value: BlissVal(val),
+                    }));
+                }
+            }
+        } else if let Some(rest) = msg.strip_prefix("__NLE_GO__:") {
+            if let Ok(tag) = rest.parse::<u64>() {
+                return Some(NonLocalExit::Go(GoSignal { tag }));
+            }
+        } else if let Some(rest) = msg.strip_prefix("__NLE_THROW__:") {
+            let parts: Vec<&str> = rest.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                if let (Ok(tag), Ok(val)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                    return Some(NonLocalExit::Throw(ThrowSignal {
+                        tag: BlissVal(tag),
+                        value: BlissVal(val),
+                    }));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Representation of an interpreted closure (for LAMBDA / FUNCTION).
+/// Stored on the heap, pointed to by a TAG_FUNCTION BlissVal.
+#[repr(C)]
+struct ClosureObj {
+    /// The FnMeta for this closure (must be first for apply() compatibility).
+    meta: FnMeta,
+    /// Captured lexical environment.
+    env: Arc<EnvFrame>,
+}
+
 // ── T0 interpreter ─────────────────────────────────────────────────
 
 /// Default T0→T1 threshold.
@@ -419,8 +526,9 @@ impl Interpreter {
                 cur = cons_cdr(cur)?;
             }
 
-            let arg_val = if eval_args.is_empty() { BlissVal(NIL_BITS) } else { args_form };
-            return self.apply(operator, arg_val);
+            // Build a proper cons list from the evaluated arguments
+            let evaluated_args_list = vec_to_list(&eval_args);
+            return self.apply(operator, evaluated_args_list);
         }
         Err(BlissError::TypeError { datum: form, expected: "evaluable form".into() })
     }
@@ -547,82 +655,223 @@ impl Interpreter {
                 Ok(result)
             }
             special_form::FUNCTION => {
-                // (FUNCTION name) -> look up function binding
+                // (FUNCTION name) -> close over current environment (§4.4.3.4)
                 if args.is_cons() {
                     let name = cons_car(args)?;
-                    self.eval(name)
+                    if name.is_cons() {
+                        // (FUNCTION (LAMBDA ...)) — treat the inner lambda form
+                        let inner_op = cons_car(name)?;
+                        if let Some(sf) = classify_special_form(inner_op) {
+                            if sf == special_form::LAMBDA {
+                                let inner_args = cons_cdr(name)?;
+                                return self.eval_special_form(special_form::LAMBDA, inner_args);
+                            }
+                        }
+                        // Not a lambda form, evaluate as-is
+                        self.eval(name)
+                    } else {
+                        // (FUNCTION name) — look up symbol binding and create closure
+                        match self.lookup(name) {
+                            Some(val) if val.tag() == TAG_FUNCTION => {
+                                // Already a function, wrap with current env as closure
+                                let ptr = (val.0 & !bliss_rt::value::TAG_MASK) as *const u8;
+                                if !ptr.is_null() {
+                                    let src_meta = unsafe { &*(ptr as *const FnMeta) };
+                                    let new_meta = FnMeta::new(src_meta.arity, src_meta.body, src_meta.params);
+                                    new_meta.flags.store(FLAG_IS_CLOSURE, Ordering::Release);
+                                    let closure = Box::leak(Box::new(ClosureObj {
+                                        meta: new_meta,
+                                        env: self.env.clone(),
+                                    }));
+                                    // Copy entry/tier from source
+                                    closure.meta.entry.store(
+                                        src_meta.entry.load(Ordering::Acquire),
+                                        Ordering::Release,
+                                    );
+                                    closure.meta.tier.store(
+                                        src_meta.tier.load(Ordering::Acquire),
+                                        Ordering::Release,
+                                    );
+                                    Ok(unsafe {
+                                        BlissVal::from_function_ptr(
+                                            closure as *mut ClosureObj as *mut u8,
+                                        )
+                                    })
+                                } else {
+                                    Ok(val)
+                                }
+                            }
+                            Some(val) => Ok(val),
+                            None => Err(BlissError::UndefinedFunction(name)),
+                        }
+                    }
                 } else {
                     Ok(BlissVal(NIL_BITS))
                 }
             }
             special_form::LAMBDA => {
-                // (LAMBDA params body...) -> create closure
-                // For now, return the lambda form itself tagged as a function concept.
-                // In a full runtime, this would create a closure object.
-                Ok(BlissVal(NIL_BITS))
+                // (LAMBDA params body...) -> create interpreted closure (§4.4.3.4)
+                let args_vec = list_to_vec(args)?;
+                if args_vec.is_empty() {
+                    return Err(BlissError::Internal("LAMBDA: missing parameter list".into()));
+                }
+                let params = args_vec[0];
+                // Count arity from param list
+                let param_list = list_to_vec(params)?;
+                let arity = param_list.len() as u32;
+                // Build body: if multiple forms, wrap in implicit PROGN
+                let body = if args_vec.len() == 2 {
+                    args_vec[1]
+                } else if args_vec.len() > 2 {
+                    // Build (PROGN body1 body2 ...) cons list
+                    let progn_sym = BlissVal::from_symbol_index(special_form::PROGN);
+                    let mut body_forms = vec![progn_sym];
+                    body_forms.extend_from_slice(&args_vec[1..]);
+                    vec_to_list(&body_forms)
+                } else {
+                    BlissVal(NIL_BITS)
+                };
+                // Create a ClosureObj with the captured environment
+                let closure_meta = FnMeta::new(arity, body, params);
+                closure_meta.flags.store(FLAG_IS_CLOSURE, Ordering::Release);
+                let closure = Box::leak(Box::new(ClosureObj {
+                    meta: closure_meta,
+                    env: self.env.clone(),
+                }));
+                Ok(unsafe {
+                    BlissVal::from_function_ptr(closure as *mut ClosureObj as *mut u8)
+                })
             }
             special_form::BLOCK => {
-                // (BLOCK name form...) -> evaluate forms, return last
+                // (BLOCK name form...) -> evaluate forms, catch RETURN-FROM
                 let args_vec = list_to_vec(args)?;
                 if args_vec.is_empty() {
                     return Ok(BlissVal(NIL_BITS));
                 }
-                // args_vec[0] is the block name (ignored for now in simple cases)
+                let block_name = args_vec[0];
+                let block_name_bits = block_name.0;
+                let saved_sp = self.stack.sp();
                 let mut result = BlissVal(NIL_BITS);
                 for i in 1..args_vec.len() {
-                    result = self.eval(args_vec[i])?;
+                    match self.eval(args_vec[i]) {
+                        Ok(val) => result = val,
+                        Err(ref e) => {
+                            if let Some(NonLocalExit::ReturnFrom(ref r)) = error_as_non_local(e) {
+                                if r.block_name == block_name_bits {
+                                    // Matched: unwind and return the value
+                                    self.stack.unwind_to(saved_sp);
+                                    return Ok(r.value);
+                                }
+                            }
+                            // Not our block, propagate
+                            return Err(BlissError::Internal(
+                                format!("{}", e),
+                            ));
+                        }
+                    }
                 }
                 Ok(result)
             }
             special_form::RETURN_FROM => {
-                // (RETURN-FROM name [value]) -> non-local return
+                // (RETURN-FROM name [value]) -> non-local transfer to BLOCK (§4.4.3.4)
                 let args_vec = list_to_vec(args)?;
+                if args_vec.is_empty() {
+                    return Err(BlissError::Internal("RETURN-FROM: missing block name".into()));
+                }
+                let block_name = args_vec[0];
                 let value = if args_vec.len() > 1 {
                     self.eval(args_vec[1])?
                 } else {
                     BlissVal(NIL_BITS)
                 };
-                // In a full implementation, this would do a non-local transfer.
-                // For now, return the value.
-                Ok(value)
+                Err(non_local_to_error(NonLocalExit::ReturnFrom(ReturnFromSignal {
+                    block_name: block_name.0,
+                    value,
+                })))
             }
             special_form::TAGBODY => {
-                // (TAGBODY {tag | form}*) -> evaluate forms, skip tags, return NIL
+                // (TAGBODY {tag | form}*) -> looping via GO restart (§4.4.3.4)
                 let forms = list_to_vec(args)?;
-                for form in &forms {
-                    // Tags are symbols; skip them. Forms are evaluated.
-                    if form.tag() != TAG_SYMBOL {
-                        self.eval(*form)?;
+                // Build tag table: symbol bits -> index in forms
+                let mut tag_table: HashMap<u64, usize> = HashMap::new();
+                for (i, form) in forms.iter().enumerate() {
+                    if form.tag() == TAG_SYMBOL {
+                        tag_table.insert(form.0, i);
+                    }
+                }
+                let mut pc = 0usize;
+                while pc < forms.len() {
+                    let form = forms[pc];
+                    if form.tag() == TAG_SYMBOL {
+                        // Tag: skip
+                        pc += 1;
+                        continue;
+                    }
+                    match self.eval(form) {
+                        Ok(_) => { pc += 1; }
+                        Err(ref e) => {
+                            if let Some(NonLocalExit::Go(ref g)) = error_as_non_local(e) {
+                                if let Some(&target_pc) = tag_table.get(&g.tag) {
+                                    pc = target_pc;
+                                    continue;
+                                }
+                            }
+                            // Not our tagbody or not a GO, propagate
+                            return Err(BlissError::Internal(format!("{}", e)));
+                        }
                     }
                 }
                 Ok(BlissVal(NIL_BITS))
             }
             special_form::GO => {
-                // (GO tag) -> transfer control (simplified)
-                Err(BlissError::Internal("GO outside of TAGBODY".into()))
+                // (GO tag) -> non-local transfer to enclosing TAGBODY (§4.4.3.4)
+                let args_vec = list_to_vec(args)?;
+                if args_vec.is_empty() {
+                    return Err(BlissError::Internal("GO: missing tag".into()));
+                }
+                let tag = args_vec[0];
+                Err(non_local_to_error(NonLocalExit::Go(GoSignal { tag: tag.0 })))
             }
             special_form::CATCH => {
-                // (CATCH tag form...) -> evaluate forms
+                // (CATCH tag form...) -> establish catch frame, evaluate forms (§4.4.3.4)
                 let args_vec = list_to_vec(args)?;
                 if args_vec.is_empty() {
                     return Ok(BlissVal(NIL_BITS));
                 }
-                let _tag = self.eval(args_vec[0])?;
+                let catch_tag = self.eval(args_vec[0])?;
+                let saved_sp = self.stack.sp();
                 let mut result = BlissVal(NIL_BITS);
                 for i in 1..args_vec.len() {
-                    result = self.eval(args_vec[i])?;
+                    match self.eval(args_vec[i]) {
+                        Ok(val) => result = val,
+                        Err(ref e) => {
+                            if let Some(NonLocalExit::Throw(ref t)) = error_as_non_local(e) {
+                                if t.tag.0 == catch_tag.0 {
+                                    // Matched: unwind and return the thrown value
+                                    self.stack.unwind_to(saved_sp);
+                                    return Ok(t.value);
+                                }
+                            }
+                            // Not our catch tag, propagate
+                            return Err(BlissError::Internal(format!("{}", e)));
+                        }
+                    }
                 }
                 Ok(result)
             }
             special_form::THROW => {
-                // (THROW tag result) -> non-local exit
+                // (THROW tag result) -> non-local exit to matching CATCH (§4.4.3.4)
                 let args_vec = list_to_vec(args)?;
+                if args_vec.is_empty() {
+                    return Err(BlissError::Internal("THROW: missing tag".into()));
+                }
+                let tag = self.eval(args_vec[0])?;
                 let value = if args_vec.len() > 1 {
                     self.eval(args_vec[1])?
                 } else {
                     BlissVal(NIL_BITS)
                 };
-                Ok(value)
+                Err(non_local_to_error(NonLocalExit::Throw(ThrowSignal { tag, value })))
             }
             special_form::UNWIND_PROTECT => {
                 // (UNWIND-PROTECT protected-form cleanup-form...)
@@ -689,7 +938,7 @@ impl Interpreter {
         }
         let func_ptr = (function.0 & !bliss_rt::value::TAG_MASK) as *const u8;
         if func_ptr.is_null() {
-            return Ok(BlissVal(NIL_BITS)); // synthetic function in tests
+            return Err(BlissError::Internal("apply: null function pointer".into()));
         }
 
         // Read FnMeta from the function pointer
@@ -726,9 +975,17 @@ impl Interpreter {
                     }
                 }
 
-                // Save and extend environment for parameter bindings
+                // Use the closure's captured environment if FLAG_IS_CLOSURE is set,
+                // otherwise use the current environment.
                 let saved_env = self.env.clone();
-                self.env = EnvFrame::extend(self.env.clone());
+                let is_closure = meta.flags.load(Ordering::Acquire) & FLAG_IS_CLOSURE != 0;
+                if is_closure {
+                    let closure_ptr = func_ptr as *const ClosureObj;
+                    let closure_env = unsafe { &(*closure_ptr).env };
+                    self.env = EnvFrame::extend(closure_env.clone());
+                } else {
+                    self.env = EnvFrame::extend(self.env.clone());
+                }
 
                 // Bind parameters
                 let mut pc = params;
@@ -779,6 +1036,49 @@ impl Interpreter {
         }
     }
 }
+
+// ── T1 runtime helpers ───────────────────────────────────────────
+// These are called from T1-compiled code to handle operations that
+// require runtime support (symbol lookup, special forms with environment).
+
+/// Runtime symbol lookup helper — called from T1 compiled code.
+/// Takes symbol bits, returns the symbol's value or the symbol itself
+/// if not bound (to maintain T1's simple semantics).
+extern "C" fn t1_runtime_symbol_lookup(sym_bits: u64) -> u64 {
+    // In T1 compiled code, we don't have access to the interpreter's
+    // environment. Use a global symbol table for lookups.
+    // If the symbol is not found, return the raw symbol bits as a fallback.
+    let sym = BlissVal(sym_bits);
+    // Try the global T1 symbol table
+    if let Ok(table) = T1_GLOBAL_SYMBOLS.lock() {
+        if let Some(&val) = table.get(&sym_bits) {
+            return val.0;
+        }
+    }
+    // Fallback: return the symbol bits themselves
+    sym.0
+}
+
+/// Runtime special form evaluation helper — called from T1 compiled code.
+/// Takes form_id and args_bits, returns the evaluated result.
+extern "C" fn t1_runtime_eval_special_form(form_id: u64, args_bits: u64) -> u64 {
+    let mut interp = Interpreter::new();
+    // Restore global symbols into interpreter environment
+    if let Ok(table) = T1_GLOBAL_SYMBOLS.lock() {
+        for (&sym_bits, &val) in table.iter() {
+            interp.define(BlissVal(sym_bits), val);
+        }
+    }
+    let args = BlissVal(args_bits);
+    match interp.eval_special_form(form_id as u32, args) {
+        Ok(val) => val.0,
+        Err(_) => NIL_BITS,
+    }
+}
+
+/// Global symbol table shared between T1 compiled code and the runtime.
+static T1_GLOBAL_SYMBOLS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, BlissVal>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 // ── T1 baseline compiler ──────────────────────────────────────────
 
@@ -838,16 +1138,23 @@ impl BaselineCompiler {
                 code.extend_from_slice(&0xA9BF7BFDu32.to_le_bytes()); // stp x29,x30,[sp,#-16]!
                 code.extend_from_slice(&0x910003FDu32.to_le_bytes()); // mov x29, sp
 
-                // Profiling stub: increment invoke_count
+                // Profiling stub: atomic increment of invoke_count (§4.4.3.5)
+                // Uses ldxr/stxr (exclusive load/store) for atomic increment on AArch64
                 let meta_ptr = meta as *const FnMeta as u64;
                 let invoke_offset = std::mem::offset_of!(FnMeta, invoke_count) as u64;
                 emit_imm64_aarch64(&mut code, meta_ptr + invoke_offset);
-                // ldr w1, [x0]
-                code.extend_from_slice(&0xB9400001u32.to_le_bytes());
+                // retry:
+                let retry_pos = code.len();
+                // ldxr w1, [x0]   — exclusive load (acquire)
+                code.extend_from_slice(&0x885F7C01u32.to_le_bytes());
                 // add w1, w1, #1
                 code.extend_from_slice(&0x11000421u32.to_le_bytes());
-                // str w1, [x0]
-                code.extend_from_slice(&0xB9000001u32.to_le_bytes());
+                // stxr w2, w1, [x0] — exclusive store, status in w2
+                code.extend_from_slice(&0x88027C01u32.to_le_bytes());
+                // cbnz w2, retry  — retry if exclusive store failed
+                let retry_disp = ((retry_pos as i64 - code.len() as i64) / 4) as i32;
+                let cbnz_inst = 0x35000002u32 | ((retry_disp as u32 & 0x7FFFF) << 5);
+                code.extend_from_slice(&cbnz_inst.to_le_bytes());
 
                 // Emit body
                 self.emit_form_aarch64(&mut code, body);
@@ -874,10 +1181,16 @@ impl BaselineCompiler {
         }
 
         if form.tag() == TAG_SYMBOL {
-            // Symbol: load the symbol value (would need runtime lookup)
-            // Emit a movabs of the symbol bits as a placeholder
-            c.push(0x48); c.push(0xB8);
+            // Symbol: emit a call to the runtime symbol lookup helper
+            // Load symbol bits into rdi (first arg)
+            c.push(0x48); c.push(0xBF); // mov rdi, imm64
             c.extend_from_slice(&form.0.to_le_bytes());
+            // Load address of runtime lookup function into rax
+            let lookup_fn = t1_runtime_symbol_lookup as *const u8 as u64;
+            c.push(0x48); c.push(0xB8); // mov rax, imm64
+            c.extend_from_slice(&lookup_fn.to_le_bytes());
+            // call rax
+            c.extend_from_slice(&[0xFF, 0xD0]);
             return;
         }
 
@@ -890,23 +1203,48 @@ impl BaselineCompiler {
                         return;
                     }
                 }
-                // Function call: emit operator evaluation, then args, then call
-                // For baseline: just emit the body recursively
+                // Function call: emit operator evaluation, then all args, then call
                 if let Ok(args) = cons_cdr(form) {
+                    // Collect all argument forms
+                    let arg_forms = list_to_vec(args).unwrap_or_default();
+
                     // Evaluate operator
                     self.emit_form_x86_64(c, operator);
-                    // Push result (save callee in rcx)
-                    c.extend_from_slice(&[0x48, 0x89, 0xC1]); // mov rcx, rax
-                    // Evaluate arguments (simplified: first arg)
-                    if args.is_cons() {
-                        if let Ok(first_arg) = cons_car(args) {
-                            self.emit_form_x86_64(c, first_arg);
-                            // Move first arg to rdi
-                            c.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
-                        }
+                    // Save callee on stack
+                    c.extend_from_slice(&[0x50]); // push rax
+
+                    // Evaluate each argument and push onto stack
+                    for arg_form in arg_forms.iter() {
+                        self.emit_form_x86_64(c, *arg_form);
+                        c.extend_from_slice(&[0x50]); // push rax
                     }
-                    // Call through rcx (the function)
-                    c.extend_from_slice(&[0xFF, 0xD1]); // call *rcx
+
+                    // Pop arguments into registers (System V AMD64 ABI order)
+                    // SysV: rdi, rsi, rdx, rcx, r8, r9
+                    // Pop in reverse order to get the right assignments
+                    let n_args = arg_forms.len();
+                    for i in (0..n_args).rev() {
+                        c.extend_from_slice(&[0x58]); // pop rax
+                        if i < 6 {
+                            match i {
+                                0 => c.extend_from_slice(&[0x48, 0x89, 0xC7]), // mov rdi, rax
+                                1 => c.extend_from_slice(&[0x48, 0x89, 0xC6]), // mov rsi, rax
+                                2 => c.extend_from_slice(&[0x48, 0x89, 0xC2]), // mov rdx, rax
+                                3 => c.extend_from_slice(&[0x48, 0x89, 0xC1]), // mov rcx, rax
+                                4 => c.extend_from_slice(&[0x49, 0x89, 0xC0]), // mov r8, rax
+                                5 => c.extend_from_slice(&[0x49, 0x89, 0xC1]), // mov r9, rax
+                                _ => {}
+                            }
+                        }
+                        // For args 6+, they stay on the stack per SysV ABI
+                    }
+
+                    // Pop callee into rax
+                    c.extend_from_slice(&[0x58]); // pop rax
+                    // Move to a non-argument register for the call
+                    c.extend_from_slice(&[0x49, 0x89, 0xC2]); // mov r10, rax
+                    // Call through r10
+                    c.extend_from_slice(&[0x41, 0xFF, 0xD2]); // call *r10
                     return;
                 }
             }
@@ -985,17 +1323,89 @@ impl BaselineCompiler {
                     }
                 }
             }
-            special_form::SETQ | special_form::LET | special_form::LETSTAR
-            | special_form::BLOCK | special_form::TAGBODY | special_form::THE
-            | special_form::LOCALLY | special_form::FUNCTION | special_form::LAMBDA
-            | special_form::RETURN_FROM | special_form::GO | special_form::CATCH
-            | special_form::THROW | special_form::UNWIND_PROTECT
-            | special_form::EVAL_WHEN | special_form::LOAD_TIME_VALUE => {
-                // For these forms in baseline T1, emit simplified code
-                // that evaluates the body/last argument
+            special_form::SETQ => {
+                // (SETQ var val ...) — emit a call to runtime setq helper
+                // For T1: emit the form as a runtime call via trampoline
+                self.emit_runtime_trampoline_x86_64(c, special_form::SETQ, args);
+            }
+            special_form::LET | special_form::LETSTAR => {
+                // (LET/LET* bindings body...) — requires environment manipulation
+                // Emit via runtime trampoline
+                self.emit_runtime_trampoline_x86_64(c, form_id, args);
+            }
+            special_form::BLOCK => {
+                // (BLOCK name body...) — requires non-local exit support
+                self.emit_runtime_trampoline_x86_64(c, special_form::BLOCK, args);
+            }
+            special_form::RETURN_FROM => {
+                self.emit_runtime_trampoline_x86_64(c, special_form::RETURN_FROM, args);
+            }
+            special_form::TAGBODY => {
+                self.emit_runtime_trampoline_x86_64(c, special_form::TAGBODY, args);
+            }
+            special_form::GO => {
+                self.emit_runtime_trampoline_x86_64(c, special_form::GO, args);
+            }
+            special_form::CATCH => {
+                self.emit_runtime_trampoline_x86_64(c, special_form::CATCH, args);
+            }
+            special_form::THROW => {
+                self.emit_runtime_trampoline_x86_64(c, special_form::THROW, args);
+            }
+            special_form::UNWIND_PROTECT => {
+                // (UNWIND-PROTECT protected cleanup...) — emit protected form,
+                // then cleanup forms, propagate result of protected
+                self.emit_runtime_trampoline_x86_64(c, special_form::UNWIND_PROTECT, args);
+            }
+            special_form::FUNCTION => {
+                self.emit_runtime_trampoline_x86_64(c, special_form::FUNCTION, args);
+            }
+            special_form::LAMBDA => {
+                self.emit_runtime_trampoline_x86_64(c, special_form::LAMBDA, args);
+            }
+            special_form::THE => {
+                // (THE type form) — type declaration, just compile the form
                 if let Ok(forms) = list_to_vec(args) {
-                    if let Some(last) = forms.last() {
-                        self.emit_form_x86_64(c, *last);
+                    if forms.len() > 1 {
+                        self.emit_form_x86_64(c, forms[1]);
+                    } else {
+                        c.push(0x48); c.push(0xB8);
+                        c.extend_from_slice(&NIL_BITS.to_le_bytes());
+                    }
+                }
+            }
+            special_form::LOCALLY => {
+                // (LOCALLY form...) — just compile all forms
+                if let Ok(forms) = list_to_vec(args) {
+                    if forms.is_empty() {
+                        c.push(0x48); c.push(0xB8);
+                        c.extend_from_slice(&NIL_BITS.to_le_bytes());
+                    } else {
+                        for form in forms {
+                            self.emit_form_x86_64(c, form);
+                        }
+                    }
+                }
+            }
+            special_form::EVAL_WHEN => {
+                // (EVAL-WHEN (situations) body...) — compile body forms
+                if let Ok(forms) = list_to_vec(args) {
+                    let mut result_emitted = false;
+                    for i in 1..forms.len() {
+                        self.emit_form_x86_64(c, forms[i]);
+                        result_emitted = true;
+                    }
+                    if !result_emitted {
+                        c.push(0x48); c.push(0xB8);
+                        c.extend_from_slice(&NIL_BITS.to_le_bytes());
+                    }
+                }
+            }
+            special_form::LOAD_TIME_VALUE => {
+                // (LOAD-TIME-VALUE form) — compile form
+                if let Ok(forms) = list_to_vec(args) {
+                    if !forms.is_empty() {
+                        self.emit_form_x86_64(c, forms[0]);
                     } else {
                         c.push(0x48); c.push(0xB8);
                         c.extend_from_slice(&NIL_BITS.to_le_bytes());
@@ -1009,6 +1419,47 @@ impl BaselineCompiler {
         }
     }
 
+    /// Emit x86_64 code that calls the runtime trampoline for a special form.
+    /// This is used for special forms that require environment manipulation
+    /// (LET, SETQ, BLOCK, TAGBODY, etc.) which can't be done inline in T1.
+    fn emit_runtime_trampoline_x86_64(&self, c: &mut Vec<u8>, form_id: u32, args: BlissVal) {
+        // Load form_id into rdi (first argument)
+        c.push(0x48); c.push(0xBF); // mov rdi, imm64
+        c.extend_from_slice(&(form_id as u64).to_le_bytes());
+        // Load args bits into rsi (second argument)
+        c.push(0x48); c.push(0xBE); // mov rsi, imm64
+        c.extend_from_slice(&args.0.to_le_bytes());
+        // Load address of runtime eval helper
+        let helper_fn = t1_runtime_eval_special_form as *const u8 as u64;
+        c.push(0x48); c.push(0xB8); // mov rax, imm64
+        c.extend_from_slice(&helper_fn.to_le_bytes());
+        // call rax
+        c.extend_from_slice(&[0xFF, 0xD0]);
+    }
+
+    /// Emit AArch64 code that calls the runtime trampoline for a special form.
+    fn emit_runtime_trampoline_aarch64(&self, c: &mut Vec<u8>, form_id: u32, args: BlissVal) {
+        // Load form_id into x0 (first argument)
+        emit_imm64_aarch64(c, form_id as u64);
+        // Save x0 to x2 temporarily
+        c.extend_from_slice(&0xAA0003E2u32.to_le_bytes()); // mov x2, x0
+        // Load args bits into x1 (second argument) — use x0 then move
+        emit_imm64_aarch64(c, args.0);
+        c.extend_from_slice(&0xAA0003E1u32.to_le_bytes()); // mov x1, x0
+        // Restore form_id to x0
+        c.extend_from_slice(&0xAA0203E0u32.to_le_bytes()); // mov x0, x2
+        // Load address of helper
+        emit_imm64_aarch64(c, t1_runtime_eval_special_form as *const u8 as u64);
+        // Need x0 for helper address — save form_id from x2 via stack
+        // Actually, we need: x0 = form_id, x1 = args. Helper addr in x2.
+        // Let's redo: load helper addr into x2
+        // x0 still has helper addr from emit_imm64_aarch64
+        c.extend_from_slice(&0xAA0003E3u32.to_le_bytes()); // mov x3, x0 (helper addr)
+        c.extend_from_slice(&0xAA0203E0u32.to_le_bytes()); // mov x0, x2 (form_id)
+        // blr x3
+        c.extend_from_slice(&0xD63F0060u32.to_le_bytes());
+    }
+
     /// Walk a form and emit AArch64 code for it (single-pass, no IR).
     fn emit_form_aarch64(&self, c: &mut Vec<u8>, form: BlissVal) {
         if form.is_fixnum() || form.is_character() || form.is_single_float()
@@ -1020,7 +1471,19 @@ impl BaselineCompiler {
         }
 
         if form.tag() == TAG_SYMBOL {
+            // Symbol: emit a call to the runtime symbol lookup helper
+            // Load symbol bits into x0 (first argument)
             emit_imm64_aarch64(c, form.0);
+            // Save x0 to x1
+            c.extend_from_slice(&0xAA0003E1u32.to_le_bytes()); // mov x1, x0
+            // Load lookup function address
+            emit_imm64_aarch64(c, t1_runtime_symbol_lookup as *const u8 as u64);
+            // Save helper addr in x2
+            c.extend_from_slice(&0xAA0003E2u32.to_le_bytes()); // mov x2, x0
+            // Restore symbol bits to x0
+            c.extend_from_slice(&0xAA0103E0u32.to_le_bytes()); // mov x0, x1
+            // blr x2
+            c.extend_from_slice(&0xD63F0040u32.to_le_bytes());
             return;
         }
 
@@ -1032,18 +1495,38 @@ impl BaselineCompiler {
                         return;
                     }
                 }
-                // Function call
+                // Function call — evaluate operator and all arguments
                 if let Ok(args) = cons_cdr(form) {
+                    let arg_forms = list_to_vec(args).unwrap_or_default();
+
+                    // Evaluate operator into x0
                     self.emit_form_aarch64(c, operator);
-                    // Move result to x1 (save callee)
-                    c.extend_from_slice(&0xAA0003E1u32.to_le_bytes()); // mov x1, x0
-                    if args.is_cons() {
-                        if let Ok(first_arg) = cons_car(args) {
-                            self.emit_form_aarch64(c, first_arg);
-                        }
+                    // Save callee on stack: str x0, [sp, #-16]!
+                    c.extend_from_slice(&0xF81F0FE0u32.to_le_bytes());
+
+                    // Evaluate each argument and save on stack
+                    for arg_form in arg_forms.iter() {
+                        self.emit_form_aarch64(c, *arg_form);
+                        c.extend_from_slice(&0xF81F0FE0u32.to_le_bytes()); // str x0, [sp, #-16]!
                     }
-                    // blr x1
-                    c.extend_from_slice(&0xD63F0020u32.to_le_bytes());
+
+                    // Pop arguments into registers (AArch64 calling convention: x0-x7)
+                    let n_args = arg_forms.len();
+                    for i in (0..n_args).rev() {
+                        // ldr x_tmp, [sp], #16
+                        c.extend_from_slice(&0xF84107E0u32.to_le_bytes()); // ldr x0, [sp], #16
+                        if i < 8 && i > 0 {
+                            // mov x{i}, x0
+                            let mov_inst = 0xAA0003E0u32 | ((i as u32) & 0x1F);
+                            c.extend_from_slice(&mov_inst.to_le_bytes());
+                        }
+                        // x0 stays as x0 for arg 0
+                    }
+
+                    // Pop callee: ldr x9, [sp], #16
+                    c.extend_from_slice(&0xF84107E9u32.to_le_bytes());
+                    // blr x9
+                    c.extend_from_slice(&0xD63F0120u32.to_le_bytes());
                     return;
                 }
             }
@@ -1113,14 +1596,8 @@ impl BaselineCompiler {
                 }
             }
             _ => {
-                // Simplified: emit last sub-form
-                if let Ok(forms) = list_to_vec(args) {
-                    if let Some(last) = forms.last() {
-                        self.emit_form_aarch64(c, *last);
-                    } else {
-                        emit_imm64_aarch64(c, NIL_BITS);
-                    }
-                }
+                // For all other special forms, use the runtime trampoline
+                self.emit_runtime_trampoline_aarch64(c, form_id, args);
             }
         }
     }
