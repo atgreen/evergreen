@@ -631,6 +631,77 @@ fn read_sharpsign_less_than_is_error() {
     );
 }
 
+// ── #S struct literals (standard CL reader macro) ───────────────
+
+#[test]
+fn read_sharpsign_struct_literal() {
+    // #S(point :x 1 :y 2) should produce a struct instance
+    // This is the standard CL reader macro for struct literals
+    let result = read_from_string("#S(point :x 1 :y 2)");
+    assert!(result.is_ok(), "#S(point :x 1 :y 2) should parse successfully");
+    let (v, _) = result.unwrap();
+    // The result should be a heap object (struct instance), not NIL
+    assert_ne!(v, NIL, "#S(point ...) should not be NIL");
+    assert!(v.is_heap_object(), "#S(point ...) should be a heap object");
+}
+
+#[test]
+fn read_sharpsign_struct_empty_slots() {
+    // #S(empty-struct) — struct with no slot initializers
+    let result = read_from_string("#S(empty-struct)");
+    assert!(result.is_ok(), "#S(empty-struct) should parse successfully");
+    let (v, _) = result.unwrap();
+    assert_ne!(v, NIL, "#S(empty-struct) should not be NIL");
+}
+
+#[test]
+fn read_sharpsign_struct_missing_name_is_error() {
+    // #S() with no struct name should be a reader error
+    assert!(
+        read_from_string("#S()").is_err(),
+        "#S() with no struct name should be a reader error"
+    );
+}
+
+// ── #P pathname literals (standard CL reader macro) ──────────────
+
+#[test]
+fn read_sharpsign_pathname_literal() {
+    // #P"path/to/file" should produce a pathname object
+    let result = read_from_string("#P\"path/to/file\"");
+    assert!(result.is_ok(), "#P\"path/to/file\" should parse successfully");
+    let (v, _) = result.unwrap();
+    assert_ne!(v, NIL, "#P\"...\" should not be NIL");
+    assert!(v.is_heap_object(), "#P\"...\" should be a heap object (pathname)");
+}
+
+#[test]
+fn read_sharpsign_pathname_absolute() {
+    // #P"/usr/local/lib" — absolute pathname
+    let result = read_from_string("#P\"/usr/local/lib\"");
+    assert!(result.is_ok(), "#P\"/usr/local/lib\" should parse successfully");
+    let (v, _) = result.unwrap();
+    assert_ne!(v, NIL);
+}
+
+#[test]
+fn read_sharpsign_pathname_empty_string() {
+    // #P"" — empty pathname is valid per the spec
+    let result = read_from_string("#P\"\"");
+    assert!(result.is_ok(), "#P\"\" (empty pathname) should parse successfully");
+    let (v, _) = result.unwrap();
+    assert!(v.is_heap_object(), "#P\"\" should be a heap object");
+}
+
+#[test]
+fn read_sharpsign_pathname_missing_string_is_error() {
+    // #P without a following string should be a reader error
+    assert!(
+        read_from_string("#P").is_err() || read_from_string("#P 42").is_err(),
+        "#P without a string argument should be a reader error"
+    );
+}
+
 // ── Readtable operations ─────────────────────────────────────────
 
 #[test]

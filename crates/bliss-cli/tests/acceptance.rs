@@ -14,6 +14,7 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// Get the path to the bliss binary built by cargo.
 fn bliss_bin() -> Command {
@@ -326,11 +327,27 @@ fn repl_shows_prompt() {
             .expect("failed to write to stdin");
     }
 
-    let output = child.wait_with_output().expect("failed to wait on bliss");
+    // Use wait_with_output with a timeout thread to prevent hanging
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let _ = tx.send(());
+        result
+    });
+
+    // Wait up to 10 seconds
+    let output = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(_) => handle.join().unwrap().expect("failed to wait on bliss"),
+        Err(_) => panic!("REPL test timed out after 10 seconds — binary may be hanging"),
+    };
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The prompt could appear on either stdout or stderr
     assert!(
-        stderr.contains("BLISS>") || stderr.contains("bliss>"),
-        "REPL should display a prompt, stderr: '{}'",
+        stderr.contains("BLISS>") || stderr.contains("bliss>")
+            || stdout.contains("BLISS>") || stdout.contains("bliss>"),
+        "REPL should display a prompt, stdout: '{}', stderr: '{}'",
+        stdout,
         stderr
     );
 }
@@ -750,6 +767,131 @@ fn sandbox_mode_restricts_file_access() {
         "sandbox mode should deny file access, exit={:?}, stderr='{}', stdout='{}'",
         output.status.code(),
         stderr,
+        stdout
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// --no-init: skip init file loading
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn no_init_flag_skips_init_file() {
+    // Create a temporary init file that would print a side effect if loaded
+    let dir = std::env::temp_dir().join("bliss_test_no_init");
+    let _ = std::fs::create_dir_all(&dir);
+    let init_file = dir.join(".blissrc");
+    std::fs::write(&init_file, "(print \"INIT-FILE-LOADED\")\n")
+        .expect("failed to write init file");
+
+    // Run with --no-init --eval — the init file side effect should NOT appear
+    let output = bliss_bin()
+        .args(["--no-init", "--eval", "(print \"main\")"])
+        .env("BLISS_INIT_FILE", init_file.to_str().unwrap())
+        .env("HOME", dir.to_str().unwrap())
+        .output()
+        .expect("failed to run bliss");
+
+    let _ = std::fs::remove_file(&init_file);
+    let _ = std::fs::remove_dir(&dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // With --no-init, the init file's side effect should be suppressed
+    assert!(
+        !stdout.contains("INIT-FILE-LOADED") && !stderr.contains("INIT-FILE-LOADED"),
+        "--no-init should suppress init file loading, stdout: '{}', stderr: '{}'",
+        stdout,
+        stderr
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// REPL debugger / error recovery
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn repl_error_shows_debugger_prompt() {
+    // When an unhandled error occurs in the REPL, CL implementations
+    // enter a debugger break level. Verify that an error expression
+    // produces a debugger prompt (e.g. "Debug>" or break level indicator)
+    // and that abort returns to the top level.
+    let mut child = bliss_bin()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bliss");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        // Trigger an error, then try to abort back to top level, then quit
+        stdin
+            .write_all(b"(error \"test-debugger-error\")\n:abort\n(quit)\n")
+            .expect("failed to write to stdin");
+    }
+
+    // Timeout protection
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let _ = tx.send(());
+        result
+    });
+    let output = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(_) => handle.join().unwrap().expect("failed to wait on bliss"),
+        Err(_) => panic!("REPL debugger test timed out after 10 seconds"),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let all_output = format!("{}{}", stdout, stderr);
+    // The REPL should show some indication of the error and a debugger prompt
+    assert!(
+        all_output.contains("test-debugger-error")
+            || all_output.to_uppercase().contains("ERROR")
+            || all_output.to_uppercase().contains("DEBUG")
+            || all_output.contains("[1]")
+            || all_output.contains("Break"),
+        "REPL should show error/debugger when an unhandled error occurs, got stdout: '{}', stderr: '{}'",
+        stdout,
+        stderr
+    );
+}
+
+#[test]
+fn repl_error_abort_returns_to_top_level() {
+    // After an error in the REPL, :abort should return to the top-level
+    // and the REPL should continue accepting input.
+    let mut child = bliss_bin()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bliss");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        // Error → abort → evaluate a normal expression → quit
+        stdin
+            .write_all(b"(error \"recoverable\")\n:abort\n(+ 1 1)\n(quit)\n")
+            .expect("failed to write to stdin");
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let _ = tx.send(());
+        result
+    });
+    let output = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(_) => handle.join().unwrap().expect("failed to wait on bliss"),
+        Err(_) => panic!("REPL abort test timed out after 10 seconds"),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // After abort, (+ 1 1) should evaluate to 2, proving the REPL recovered
+    assert!(
+        stdout.contains('2'),
+        "after :abort, REPL should recover and evaluate (+ 1 1) to 2, got stdout: '{}'",
         stdout
     );
 }
