@@ -95,9 +95,15 @@ R13.06).
 |-------|------|----------|-----------|-------|
 | 0 | (thread-local — no lock) | TLAB, dynamic bindings, handler bindings, SATB buffer | §2, §3 | Never contended. |
 | 1 | Per-stream mutex | Stream state and buffer | §5.4 | Ordered by `stream-id` when multiple streams needed. |
-| 2 | Per-bucket hash-table stripe | Hash-table entries | §5.5 | Ordered by bucket index within a table. |
+| 2 | Per-bucket hash-table stripe; per-symbol plist RwLock | Hash-table entries; symbol property lists | §5.5, §13.4.1 | Ordered by bucket index within a table. Plist locks are rarely contended. |
 | 3 | Per-package RwLock (internal, external) | Symbol tables within a package | §5.1 | `external` before `internal` (Rule L4, §5.1.5). |
 | 4 | Global package registry RwLock | Package creation/deletion/rename | §5.1 | Must precede per-package locks (Rule L1). |
+
+> **Note:** §5.1.5 defines a local hierarchy (Level 0 = PackageRegistry,
+> Level 1 = Package, Level 2 = SymbolTable) for the package subsystem.
+> The global hierarchy here (levels 3–4) supersedes those local levels.
+> The relative ordering is preserved: registry (global level 4) before
+> per-package (global level 3), matching Rule L1 in §5.1.5.
 | 5 | Compiler code-cache lock | JIT code installation, IC patching coordination | §4 | — |
 | 6 | Profiling-data lock | Tier-promotion decisions, counters rollup | §4.9 | — |
 | 7 | GC world-stop mutex | Stop-the-world coordination | §3.9 | Only the GC controller acquires this. |
@@ -249,6 +255,8 @@ ALGORITHM worker_loop(worker_id):
 | `MAKE-THREAD` | Allocate `GreenThread` (D2.01), push to current worker's deque. Wake a parked worker if any. |
 | Yield (cooperative) | Push current task back to deque tail, pop next task. |
 | Block (mutex/condvar) | Remove task from deque, set state `Blocked`, record waker. |
+| I/O submit | Set state `Waiting`, publish stack top, register with I/O poller. Treated like `Blocked` for GC purposes (§13.6.1). |
+| I/O ready | I/O poller marks task ready, set state `Runnable`, push to worker deque. |
 | Unblock (notify) | Set state `Runnable`, push to notifier's deque (or global queue if cross-worker). |
 | FFI call | Set state `Native`, publish stack top. Task remains logically on the worker but does not block scheduling. |
 | FFI return | Set state `Runnable`; if worker's deque is empty, resume immediately. |
@@ -394,8 +402,11 @@ outside the signal handler context.
 
 `SIGUSR1` is sent to threads blocked in syscalls after a 100 ms timeout.
 The handler sets `pending_safepoint = true`; when the syscall returns
-(`EINTR`), the thread enters the safepoint. This is a last-resort —
-the polling-page handles >99.9% of cases.
+(`EINTR`), the thread enters the safepoint. Per R3.14, this handler
+MUST NOT suspend the thread; it only sets a flag. The `SIGUSR1`
+mechanism is strictly for flag-setting — thread suspension is
+prohibited (§3, R3.14). This is a last-resort — the polling-page
+handles >99.9% of cases.
 
 ---
 
