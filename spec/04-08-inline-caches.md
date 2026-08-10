@@ -54,6 +54,32 @@ struct InlineCacheEntry {
 **Alignment:** Each entry MUST be 16-byte aligned so that a 128-bit
 atomic compare-and-swap can update both fields together on x86-64.
 
+**Versioned guard variant:** For T2-optimised code that uses class
+version checks (§4.8.8), a wider entry layout is used:
+
+```rust
+/// IC entry with class-version guard, used in T2 code.
+#[repr(C, align(32))]
+struct InlineCacheVersionedEntry {
+    /// Class pointer.
+    guard_class: AtomicU64,
+    /// Expected class version counter.
+    guard_version: AtomicU64,
+    /// Cached dispatch target.
+    target: AtomicU64,
+    /// Padding to 32-byte alignment.
+    _pad: u64,
+}
+```
+
+Versioned entries are 32 bytes each and are used only in monomorphic
+ICs embedded in T2-compiled code (§4.8.5).  They are NOT stored in the
+standard `InlineCacheSite.entries` array; instead, the T2 compiler
+emits the versioned guard+target inline as immediate data in the code
+stream, checked by the assembly sequence shown in §4.8.8.  The
+standard 16-byte `InlineCacheEntry` remains the layout for all
+interpreter and T1 IC sites.
+
 ### D4.13 — `InlineCacheSite`
 
 The full IC metadata associated with a single call site.
@@ -71,12 +97,24 @@ struct InlineCacheSite {
     /// Number of valid entries (0..=MAX_POLY_ENTRIES).
     entry_count: AtomicU8,
 
-    /// Padding to align entries array.
-    _pad: [u8; 6],
+    /// Per-site spinlock used to serialise concurrent miss handlers.
+    /// 0 = unlocked, 1 = locked.  See §4.8.7 Patching Protocol and
+    /// §4.8.12 Concurrency.
+    lock: AtomicU8,
+
+    /// Padding to align entries array to a 16-byte boundary.
+    /// Preceding fields: kind (1) + state (1) + entry_count (1)
+    /// + lock (1) = 4 bytes; 12 bytes of padding → offset 16.
+    _pad: [u8; 12],
 
     /// Inline entry slots.  Monomorphic uses entries[0] only.
     /// Polymorphic uses entries[0..entry_count].
     entries: [InlineCacheEntry; MAX_POLY_ENTRIES],
+
+    /// Pointer to the megamorphic dispatch hash table (§4.8.10).
+    /// NULL when state ≠ Megamorphic.  Set by `build_dispatch_hash_table`
+    /// during the Polymorphic → Megamorphic transition.
+    dispatch_table: *const DispatchHashTable,
 
     /// Pointer to the slow-path / generic dispatch stub.
     slow_path: *const u8,
@@ -93,6 +131,7 @@ struct InlineCacheSite {
     miss_count: AtomicU32,
 
     /// Statistics: total number of times the fast path was taken.
+    /// Updated by sampling (see §4.8.9), NOT on every fast-path hit.
     hit_count: AtomicU32,
 }
 ```
@@ -182,19 +221,24 @@ function ic_miss(site: &InlineCacheSite, receiver_class: ClassPtr, args...):
 
         Polymorphic:
             n = site.entry_count
-            if n < MAX_POLY_ENTRIES:
-                site.entries[n] = { guard: receiver_class, target: target }
+            // For multi-argument dispatch (§4.8.4), each logical entry
+            // occupies `slots_per_entry` physical slots (e.g. 2 for
+            // 2-argument GFs).  Effective capacity is reduced accordingly.
+            slots_per_entry = dispatch_arity_slots(site)
+            effective_max = MAX_POLY_ENTRIES / slots_per_entry
+            if n < effective_max:
+                write_entry(site, n, slots_per_entry, receiver_class, target)
                 site.entry_count = n + 1
                 // stub already handles linear scan; no re-patch needed
                 // unless entry count crossed a stub-variant threshold
             else:
                 site.state = Megamorphic
-                build_dispatch_hash_table(site)
+                site.dispatch_table = build_dispatch_hash_table(site)
                 patch_call_site(site, megamorphic_stub)
 
         Megamorphic:
             // Insert into hash table only; no IC entry change.
-            insert_hash_entry(site, receiver_class, target)
+            insert_hash_entry(site.dispatch_table, receiver_class, target)
 
     site.miss_count.fetch_add(1, Relaxed)
     return target
@@ -498,8 +542,8 @@ optimisation and developer tooling.
 
 | Counter | Type | Updated By |
 |---------|------|-----------|
-| `hit_count` | `AtomicU32` | Fast-path stub (incremented on each successful guard match) |
-| `miss_count` | `AtomicU32` | `ic_miss` handler |
+| `hit_count` | `AtomicU32` | Profiling subsystem (§4.5): sampled periodically via timer-based profiling interrupts, NOT incremented on every fast-path hit.  When `BLISS_IC_STATS_ENABLED` is `false`, hit counting is disabled entirely. |
+| `miss_count` | `AtomicU32` | `ic_miss` handler (always incremented; miss path is already slow). |
 
 ### Aggregate Metrics
 
