@@ -85,6 +85,10 @@ pub struct Package {
     /// Package-local nicknames (§5.1.6).
     local_nicknames: RwLock<HashMap<Box<str>, Arc<Package>>>,
 
+    /// Conduit source packages (§5.1.7).  `None` for normal packages;
+    /// `Some(vec)` for conduit packages created via `DEFCONDUIT`.
+    conduit_sources: Option<RwLock<Vec<Arc<Package>>>>,
+
     /// Deleted flag.
     deleted: AtomicBool,
 }
@@ -142,7 +146,7 @@ compare probe distances; if occupant has shorter distance, key is absent.
 Tombstones are skipped during lookup, reused during insert.  Load factor
 ≥ 75% triggers rehash (double capacity, discard tombstones).  Delete
 replaces slot with `Tombstone`; tombstone ratio > 25% triggers compacting
-rehash.  **Complexity:** amortised O(1), worst-case O(log n) probes.
+rehash.  **Complexity:** amortised O(1); expected maximum displacement O(log n) under uniform hashing, worst-case O(n).
 
 ---
 
@@ -309,7 +313,7 @@ paths, and bootstrap self-test assertions.  Requirements R5.59–R5.65.
 
 ### §5.2.2.1  Bootstrap Packages
 
-Created in step 5b, in this order:
+Created in step 4 (cold start), in this order:
 
 | Order | Package | Nicknames | Use-list | Notes |
 |-------|---------|-----------|----------|-------|
@@ -363,7 +367,21 @@ All reside in `CL` unless noted.  MUST be registered before `boot.lisp` loads.
 `RETURN-FROM`, `TAGBODY`, `GO`, `CATCH`, `THROW`, `UNWIND-PROTECT`,
 `MULTIPLE-VALUE-CALL`, `MULTIPLE-VALUE-PROG1`, `THE`, `LOCALLY`,
 `FLET`, `LABELS`, `MACROLET`, `SYMBOL-MACROLET`, `LOAD-TIME-VALUE`,
-`EVAL-WHEN`, `FUNCTION`, `DEFMACRO`.
+`EVAL-WHEN`, `FUNCTION`.
+
+> **Note on `DEFMACRO`:** In ANSI CL `DEFMACRO` is a macro, not a
+> special form.  However, the T0 interpreter handles it as a *built-in
+> special form* because no macro-expansion infrastructure exists yet at
+> Phase 1 — `DEFMACRO` itself is the mechanism that bootstraps macro
+> definition.  Once `boot.lisp` establishes the full macro expander,
+> user-level `DEFMACRO` expands normally.  This is a deliberate bootstrap
+> deviation, not a standards violation — `DEFMACRO`'s observable behaviour
+> still conforms to ANSI §3.8.1.
+
+**Additional T0 built-in:** `LOAD` — required so that `boot.lisp` can
+load sub-files (e.g., per-section or platform-specific files).  Semantics
+match `A5.05` (Rust-side read/eval loop), restricted to `:direction :input`.
+`LOAD` is registered in `CL` alongside the Phase 1 primitives.
 
 **BLISS-INTERNAL primitives** (package `BI`):
 
