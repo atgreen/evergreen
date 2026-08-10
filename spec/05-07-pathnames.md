@@ -1,4 +1,4 @@
-# §5.8 Pathnames and Logical Pathnames
+# §5.7 Pathnames and Logical Pathnames
 
 **Scope:** This section specifies the pathname abstraction in Bliss,
 covering the `PATHNAME` and `LOGICAL-PATHNAME` class hierarchy,
@@ -10,7 +10,7 @@ expansion extension.
 
 ---
 
-## 5.8.1 Requirements
+## 5.7.1 Requirements
 
 | ID | Requirement |
 |----|-------------|
@@ -34,10 +34,12 @@ expansion extension.
 | R5.198 | `DIRECTORY` MUST accept a wild pathname and return a list of truename pathnames matching the pattern. It MUST handle `:WILD-INFERIORS` via recursive directory traversal. |
 | R5.199 | `ENSURE-DIRECTORIES-EXIST` MUST create all missing directories in the pathname's directory component (equivalent to `mkdir -p`). It MUST return the pathname and a boolean indicating whether any directory was created. |
 | R5.200 | All pathname objects MUST be immutable once constructed. Concurrent reads from multiple threads MUST NOT require synchronisation. |
+| R5.201 | `USER-HOMEDIR-PATHNAME` MUST return a pathname for the current user's home directory (from `$HOME` or `getpwuid`), with an optional host argument (ignored on POSIX). The returned pathname MUST have name and type components of NIL. |
+| R5.202 | `WILD-PATHNAME-P` MUST return true if the pathname contains any wild components (`:WILD`, `:WILD-INFERIORS`, or `*` within name/type strings). When called with an optional field-key argument (`:HOST`, `:DEVICE`, `:DIRECTORY`, `:NAME`, `:TYPE`, `:VERSION`), it MUST return true only if that specific component is wild. |
 
 ---
 
-## 5.8.2 Data Structures
+## 5.7.2 Data Structures
 
 ### D5.30 — Pathname
 
@@ -118,7 +120,7 @@ The directory slot is a proper list with one of two structures:
 
 ---
 
-## 5.8.3 Algorithms
+## 5.7.3 Algorithms
 
 ### A5.11 — Physical Pathname Parsing (POSIX)
 
@@ -152,9 +154,15 @@ PARSE-PHYSICAL-POSIX(S):
         push it back; name ← NIL, type ← NIL.
      c. Else → split last-token on the rightmost ".":
         - No "." → name ← last-token, type ← NIL.
-        - "." is first char → name ← last-token (including dot),
-          type ← NIL.  (Hidden files: ".bashrc" → name=".bashrc")
-        - Otherwise → name ← part before ".", type ← part after ".".
+        - "." is first char AND is the only "." in the token →
+          name ← last-token (including dot), type ← NIL.
+          (Hidden files: ".bashrc" → name=".bashrc")
+        - "." is first char but there are additional dots →
+          apply the rightmost-dot rule: name ← part before
+          rightmost ".", type ← part after rightmost ".".
+          (E.g., ".bashrc.bak" → name=".bashrc", type="bak")
+        - Otherwise → name ← part before rightmost ".",
+          type ← part after rightmost ".".
      d. If last-token is empty string → name ← NIL, type ← NIL.
 
   5. CANONICALISE directory tokens:
@@ -201,7 +209,9 @@ RECONSTRUCT-NAMESTRING(P):
         - E = :WILD        → append "*/".
         - E = :WILD-INFERIORS → append "**/".
         - E = :UP           → append "../".
-        - E = :BACK         → append "../".
+        - E = :BACK         → error: :BACK MUST be resolved at
+          construction time (see below) and MUST NOT appear in a
+          pathname passed to NAMESTRING.
 
   3. NAME:
      a. If name is NIL → skip.
@@ -218,6 +228,17 @@ RECONSTRUCT-NAMESTRING(P):
 
 **Invariant (R5.187):** For any well-formed pathname P constructed from
 a POSIX namestring, `(equal P (parse-namestring (namestring P)))`.
+
+**`:BACK` resolution:** Because POSIX namestrings have no distinct
+representation for `:BACK` (as opposed to `:UP`), `:BACK` MUST be
+resolved at `MAKE-PATHNAME` construction time. When `:BACK` appears
+in a directory list passed to `MAKE-PATHNAME`, it is resolved
+syntactically by removing the immediately preceding directory
+component. If no preceding component exists (i.e., `:BACK` appears
+immediately after `:ABSOLUTE` or `:RELATIVE`), `MAKE-PATHNAME` signals
+a `FILE-ERROR`. After construction, no pathname's directory slot will
+ever contain `:BACK`. This guarantees the round-trip invariant R5.187
+holds for all constructed pathnames.
 
 ### A5.13 — Translate Logical Pathname
 
@@ -288,7 +309,7 @@ MERGE-PATHNAMES(P, D, V):
 
 ---
 
-## 5.8.4 Logical Pathname Syntax and Parsing
+## 5.7.4 Logical Pathname Syntax and Parsing
 
 Logical pathnames use a host-based syntax distinct from physical paths:
 
@@ -317,7 +338,7 @@ word               ::= { letter | digit | "-" }+
 
 ---
 
-## 5.8.5 Function Contracts
+## 5.7.5 Function Contracts
 
 ### MAKE-PATHNAME
 
@@ -340,6 +361,9 @@ word               ::= { letter | digit | "-" }+
 ```
 
 - If `thing` is already a pathname → return it, position = start.
+- If `thing` is a stream associated with a file → return
+  `(pathname thing)`, position = start. The stream must be a file
+  stream; for non-file streams, signals `TYPE-ERROR`.
 - If `host` is a known logical host → parse as logical pathname.
 - Otherwise → parse via A5.11 (POSIX physical).
 - `junk-allowed` true: return values up to point of failure.
@@ -362,10 +386,19 @@ word               ::= { letter | digit | "-" }+
 ```
 
 - Compares each component of `pathname` against `wildcard`.
-- `:WILD` matches any single component value (including NIL for name/type).
+- `:WILD` matches any single component value, including NIL, for
+  name/type/version components (per ANSI 19.2.2.3 — `:WILD` matches
+  any value). This NIL-matching is intentional ANSI alignment.
+- `:WILD` in the directory component matches any single directory
+  element (string, `:UP`, etc.) but does NOT match an empty directory
+  list — an empty directory list is matched only by NIL or another
+  empty directory list.
 - `:WILD-INFERIORS` in directory matches zero or more directory elements.
 - `*` within a string component matches any substring (glob semantics).
 - NIL in wildcard component matches only NIL in pathname.
+- Host comparison: if the wildcard's host is non-NIL and differs from
+  the pathname's host, the match fails. If the wildcard's host is NIL,
+  the host component is not constrained (matches any host).
 
 ### TRANSLATE-PATHNAME
 
@@ -378,9 +411,40 @@ word               ::= { letter | digit | "-" }+
 - Transfers wildcard-matched segments from source into `to-wildcard`.
 - See A5.13 for wildcard transfer details.
 
+### USER-HOMEDIR-PATHNAME
+
+```lisp
+(user-homedir-pathname &optional host) → pathname
+```
+
+- Returns a pathname representing the current user's home directory (R5.201).
+- On POSIX: reads `$HOME`; if unset, falls back to `pw_dir` from
+  `getpwuid(getuid())`.
+- The returned pathname has `:ABSOLUTE` directory, name = NIL, type = NIL,
+  version = `:NEWEST`. E.g., `#P"/home/user/"`.
+- `host` argument is accepted for ANSI compatibility but ignored on POSIX
+  (returns the local home directory regardless).
+- If the home directory cannot be determined, signals `FILE-ERROR`.
+
+### WILD-PATHNAME-P
+
+```lisp
+(wild-pathname-p pathname &optional field-key) → boolean
+```
+
+- If `field-key` is NIL (default): returns true if any component of
+  `pathname` is wild (R5.202).
+- If `field-key` is one of `:HOST`, `:DEVICE`, `:DIRECTORY`, `:NAME`,
+  `:TYPE`, `:VERSION`: returns true only if that component is wild.
+- A component is wild if it is the keyword `:WILD`, or (for directory)
+  contains `:WILD` or `:WILD-INFERIORS`, or (for name/type strings)
+  contains the character `*`.
+- `:HOST` and `:DEVICE` are never wild for POSIX pathnames.
+  For logical pathnames, `:HOST` is never wild.
+
 ---
 
-## 5.8.6 File-System Interaction
+## 5.7.6 File-System Interaction
 
 ### PROBE-FILE
 
@@ -434,7 +498,7 @@ word               ::= { letter | digit | "-" }+
 
 ---
 
-## 5.8.7 Tilde Expansion (Bliss Extension)
+## 5.7.7 Tilde Expansion (Bliss Extension)
 
 Per R5.194, Bliss expands `~` at parse time (A5.11 step 1):
 
@@ -448,7 +512,7 @@ Per R5.194, Bliss expands `~` at parse time (A5.11 step 1):
 
 ---
 
-## 5.8.8 Error Handling
+## 5.7.8 Error Handling
 
 | Condition | When |
 |-----------|------|
@@ -466,7 +530,7 @@ the offending pathname in the condition's `:PATHNAME` slot
 
 ---
 
-## 5.8.9 Concurrency
+## 5.7.9 Concurrency
 
 - Pathname objects are immutable once constructed (R5.200). No
   synchronisation is required for concurrent reads.
@@ -485,7 +549,7 @@ the offending pathname in the condition's `:PATHNAME` slot
 
 ---
 
-## 5.8.10 Configuration
+## 5.7.10 Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -495,7 +559,7 @@ the offending pathname in the condition's `:PATHNAME` slot
 
 ---
 
-## 5.8.11 Test Strategy
+## 5.7.11 Test Strategy
 
 1. **Unit tests (A5.11):** absolute, relative, root, trailing slash, dot files, multiple extensions, consecutive slashes, `//`, empty string, tilde expansion with mocked `$HOME`/`getpwnam`.
 2. **Round-trip (R5.187):** random pathnames verify `(equal pn (parse-namestring (namestring pn)))`.
@@ -508,7 +572,7 @@ the offending pathname in the condition's `:PATHNAME` slot
 
 ---
 
-## 5.8.12 Module Map
+## 5.7.12 Module Map
 
 | Source file | Contents |
 |-------------|----------|
