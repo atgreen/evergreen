@@ -321,17 +321,121 @@ pub fn unmarshal_from_c(raw: u64, alien_type: &AlienType) -> Result<BlissVal, Bl
 
 /// A C-callable trampoline function type.
 /// In the bootstrap implementation, callbacks invoke this static trampoline
-/// which looks up the registered Lisp closure via a thread-local slot.
+/// which looks up the registered Lisp closure via a thread-local slot and
+/// invokes it.
 extern "C" fn bootstrap_trampoline() -> u64 {
-    // Bootstrap: look up the current callback's closure and invoke it.
-    // For the bootstrap runtime, we return NIL (0x07) since we don't
-    // have a full evaluator yet, but this IS a valid C-callable function pointer.
     CURRENT_CALLBACK_CLOSURE.with(|cell| {
-        let _closure = cell.get();
-        // A full implementation would invoke the Lisp closure here.
-        // For bootstrap, return NIL's raw bits.
-        crate::value::NIL.to_raw()
+        let closure = cell.get();
+        invoke_closure(closure)
     })
+}
+
+/// Invoke a Lisp closure value and return its raw result.
+///
+/// Dispatches based on the closure's type:
+/// - NIL → returns NIL (no closure registered)
+/// - Function-tagged pointer → dereferences the function header:
+///   - CompiledFunctionData → calls through `entry_point`
+///   - ClosureData → extracts the inner function and recurses
+///   - InterpretedFunctionData → returns NIL (needs full evaluator)
+/// - Fixnum → treated as a raw C function pointer (useful for testing)
+/// - Any other type → returns NIL
+fn invoke_closure(closure: BlissVal) -> u64 {
+    use crate::object::{type_id, ObjectHeader, CompiledFunctionData, ClosureData};
+    #[allow(unused_imports)]
+    use crate::value::{TAG_FUNCTION, TAG_MASK};
+
+    // NIL means no closure is registered; return NIL.
+    if closure.is_nil() {
+        return crate::value::NIL.to_raw();
+    }
+
+    // Function-tagged pointer: dereference the function header and dispatch
+    // on the object's type_id to find the entry_point or inner function.
+    if closure.is_function() {
+        unsafe {
+            let ptr = closure.as_ptr();
+            let header = *(ptr as *const ObjectHeader);
+            let tid = header.type_id();
+
+            match tid {
+                type_id::COMPILED_FUNCTION => {
+                    let compiled = &*(ptr as *const CompiledFunctionData);
+                    let entry = compiled.entry_point;
+                    if !entry.is_null() {
+                        let f: extern "C" fn() -> u64 = std::mem::transmute(entry);
+                        return f();
+                    }
+                    // Null entry_point — fall through to NIL
+                }
+                type_id::CLOSURE => {
+                    // A ClosureData wraps an inner function; extract and recurse.
+                    let clo = &*(ptr as *const ClosureData);
+                    let inner = clo.function;
+                    return invoke_closure(inner);
+                }
+                type_id::FUNCTION_INTERPRETED => {
+                    // Interpreted functions require the evaluator which lives in
+                    // the compiler crate and is not accessible from the runtime.
+                    // Callbacks wrapping interpreted functions must be compiled
+                    // first via the tiered compilation pipeline.
+                    panic!(
+                        "FFI callback invoked on an interpreted (non-compiled) function. \
+                         The function must be compiled before it can be used as a foreign callback."
+                    );
+                }
+                _ => {
+                    // Unknown function sub-type; return NIL.
+                }
+            }
+        }
+        return crate::value::NIL.to_raw();
+    }
+
+    // Heap-object path: the closure might be a heap-allocated closure
+    // or compiled function reached via TAG_HEAP_OBJECT instead of TAG_FUNCTION.
+    if closure.is_heap_object() {
+        unsafe {
+            let ptr = closure.as_ptr();
+            let header = *(ptr as *const ObjectHeader);
+            let tid = header.type_id();
+
+            match tid {
+                type_id::COMPILED_FUNCTION => {
+                    let compiled = &*(ptr as *const CompiledFunctionData);
+                    let entry = compiled.entry_point;
+                    if !entry.is_null() {
+                        let f: extern "C" fn() -> u64 = std::mem::transmute(entry);
+                        return f();
+                    }
+                }
+                type_id::CLOSURE => {
+                    let clo = &*(ptr as *const ClosureData);
+                    let inner = clo.function;
+                    return invoke_closure(inner);
+                }
+                _ => {}
+            }
+        }
+        return crate::value::NIL.to_raw();
+    }
+
+    // Fixnum path: treat the integer value as a raw C function pointer.
+    // This is convenient for testing callbacks without constructing full
+    // heap-allocated function objects.
+    if closure.is_fixnum() {
+        let raw = closure.as_fixnum() as u64;
+        if raw != 0 {
+            unsafe {
+                let f: extern "C" fn() -> u64 = std::mem::transmute(raw as *const ());
+                return f();
+            }
+        }
+        return crate::value::NIL.to_raw();
+    }
+
+    // Anything else — return NIL.
+    crate::value::NIL.to_raw()
 }
 
 std::thread_local! {
