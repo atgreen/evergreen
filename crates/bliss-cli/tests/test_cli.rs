@@ -20,6 +20,8 @@ fn parse_empty_args_gives_defaults() {
     assert!(parsed.eval.is_none());
     assert!(parsed.load.is_none());
     assert!(!parsed.no_image);
+    assert!(!parsed.sandbox);
+    assert!(!parsed.no_init);
     assert!(!parsed.bootstrap);
     assert!(parsed.workers.is_none());
     assert!(parsed.heap_size.is_none());
@@ -76,6 +78,18 @@ fn parse_no_image_flag() {
 fn parse_bootstrap_flag() {
     let parsed = CliArgs::parse(&args(&["--bootstrap"])).expect("--bootstrap should parse");
     assert!(parsed.bootstrap);
+}
+
+#[test]
+fn parse_sandbox_flag() {
+    let parsed = CliArgs::parse(&args(&["--sandbox"])).expect("--sandbox should parse");
+    assert!(parsed.sandbox);
+}
+
+#[test]
+fn parse_no_init_flag() {
+    let parsed = CliArgs::parse(&args(&["--no-init"])).expect("--no-init should parse");
+    assert!(parsed.no_init);
 }
 
 #[test]
@@ -203,6 +217,41 @@ fn parse_double_dash_stops_flag_parsing() {
     assert!(!parsed.help);
     assert!(!parsed.version);
     assert_eq!(parsed.cl_args, vec!["--help", "--version"]);
+}
+
+// ══════════════════════════════════════════════════════════════════
+// CliArgs::parse — conflicting flags
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn parse_image_and_no_image_conflict_is_error() {
+    // --image and --no-image are contradictory
+    let result = CliArgs::parse(&args(&["--image", "core.img", "--no-image"]));
+    assert!(result.is_err(), "--image + --no-image should conflict");
+}
+
+#[test]
+fn parse_sandbox_and_no_image_conflict_is_error() {
+    // --sandbox with --no-image may be contradictory (sandbox needs a controlled image)
+    let result = CliArgs::parse(&args(&["--sandbox", "--no-image"]));
+    assert!(result.is_err(), "--sandbox + --no-image should conflict");
+}
+
+#[test]
+fn parse_no_init_and_bootstrap_conflict_is_error() {
+    // --no-init skips init, --bootstrap loads from lib/boot.lisp — conflicting intent
+    let result = CliArgs::parse(&args(&["--no-init", "--bootstrap"]));
+    assert!(result.is_err(), "--no-init + --bootstrap should conflict");
+}
+
+#[test]
+fn parse_eval_and_load_conflict_is_error() {
+    // --eval and --load both request non-interactive execution — which takes precedence?
+    let result = CliArgs::parse(&args(&["--eval", "(+ 1 2)", "--load", "boot.lisp"]));
+    assert!(
+        result.is_err(),
+        "--eval + --load should conflict or have documented precedence"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════

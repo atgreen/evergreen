@@ -27,6 +27,10 @@ pub struct CliArgs {
     pub help: bool,
     /// Print version and exit (--version).
     pub version: bool,
+    /// Enable sandbox mode (--sandbox).
+    pub sandbox: bool,
+    /// Skip loading init file (--no-init).
+    pub no_init: bool,
     /// Arguments passed through to CL (after --).
     pub cl_args: Vec<String>,
     /// Positional argument: script file to execute.

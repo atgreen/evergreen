@@ -63,6 +63,32 @@ fn debug_frame_function_panics_until_implemented() {
     }
 }
 
+#[test]
+#[should_panic(expected = "not yet implemented")]
+fn debug_frame_source_location_panics_until_implemented() {
+    let frames = walk_stack();
+    if let Some(frame) = frames.first() {
+        let _loc = frame.source_location();
+    }
+}
+
+#[test]
+#[should_panic(expected = "not yet implemented")]
+fn debug_frame_locals_panics_until_implemented() {
+    let frames = walk_stack();
+    if let Some(frame) = frames.first() {
+        let _locals = frame.locals();
+    }
+}
+
+#[test]
+#[should_panic(expected = "not yet implemented")]
+fn debug_frame_is_live_panics_until_implemented() {
+    let frames = walk_stack();
+    if let Some(frame) = frames.first() {
+        let _live = frame.is_live();
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════
 // Breakpoints
@@ -240,18 +266,34 @@ fn stop_swank_server_panics_until_implemented() {
 
 // ══════════════════════════════════════════════════════════════════
 // repl_loop & invoke_debugger_ui
+//
+// NOTE: These tests currently panic inside ReplState::new() before
+// reaching the target function. Once ReplState::new() is implemented,
+// these tests will proceed to call repl_loop / invoke_debugger_ui
+// and should then panic with their own "not yet implemented" message.
+// At that point, update the expected panic message accordingly.
 // ══════════════════════════════════════════════════════════════════
 
 #[test]
 #[should_panic(expected = "not yet implemented")]
 fn repl_loop_panics_until_implemented() {
+    // Phase 1: ReplState::new() panics here.
+    // Phase 2 (after new() is implemented): repl_loop() should panic.
     let mut state = ReplState::new();
+    // This line is only reached once ReplState::new() is implemented.
     let _ = repl_loop(&mut state);
+    // If both are implemented, repl_loop should return Ok or Err, not silently pass.
+    unreachable!("repl_loop should either panic or be tested for its return value");
 }
 
 #[test]
 #[should_panic(expected = "not yet implemented")]
 fn invoke_debugger_ui_panics_until_implemented() {
+    // Phase 1: ReplState::new() panics here.
+    // Phase 2 (after new() is implemented): invoke_debugger_ui() should panic.
     let mut state = ReplState::new();
+    // This line is only reached once ReplState::new() is implemented.
     let _ = invoke_debugger_ui(NIL, &mut state);
+    // If both are implemented, invoke_debugger_ui should return Ok or Err, not silently pass.
+    unreachable!("invoke_debugger_ui should either panic or be tested for its return value");
 }
