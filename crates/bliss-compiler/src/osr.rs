@@ -13,7 +13,7 @@ use std::time::Instant;
 
 /// Default number of deopts before blacklisting a function from T2.
 /// Spec §4.6.5.2 recommends 20; tunable via DeoptConfig.
-const DEFAULT_BLACKLIST_THRESHOLD: u32 = 3;
+const DEFAULT_BLACKLIST_THRESHOLD: u32 = 20;
 
 /// Default backoff period in seconds before retrying T2 after blacklist.
 const DEFAULT_BACKOFF_SECONDS: u32 = 10;
@@ -268,16 +268,21 @@ fn apply_conversion(val: BlissVal, conversion: &ConversionKind) -> BlissVal {
             BlissVal(((val.0 as i64) >> 3) as u64)
         }
         ConversionKind::UnboxFloat => {
-            // Extract the float payload from bits 63:32
-            BlissVal((val.0 >> 32) as u64)
+            // Extract the IEEE 754 f32 bits from bits 63:32 into the lower 32 bits.
+            // Result fits in 32 bits (upper 32 bits are zero), so BoxFloat can
+            // shift them back with `<< 32` to round-trip correctly.
+            let float_bits = (val.0 >> 32) & 0xFFFF_FFFF;
+            BlissVal(float_bits)
         }
         ConversionKind::BoxFixnum => {
             // Wrap raw i64 as a tagged fixnum (shift left by 3, tag 000)
             BlissVal(((val.0 as i64) << 3) as u64)
         }
         ConversionKind::BoxFloat => {
-            // Wrap raw float bits into a tagged single-float (bits 63:32, tag 100)
-            BlissVal((val.0 << 32) | bliss_rt::value::TAG_SINGLE_FLOAT)
+            // Wrap raw f32 bits (in lower 32 bits) into a tagged single-float.
+            // Mask to 32 bits to ensure only valid float payload is shifted up.
+            let float_bits = val.0 & 0xFFFF_FFFF;
+            BlissVal((float_bits << 32) | bliss_rt::value::TAG_SINGLE_FLOAT)
         }
         ConversionKind::WidenI32ToI64 => {
             // Sign-extend a 32-bit value to 64-bit
@@ -461,7 +466,7 @@ impl DeoptLog {
 
     /// Count of entries currently in the ring buffer (≤ DEOPT_LOG_CAP).
     pub fn count(&self) -> u32 {
-        self.total_deopts
+        self.entry_count as u32
     }
 
     /// Get per-reason counter for a given category within the sliding window
