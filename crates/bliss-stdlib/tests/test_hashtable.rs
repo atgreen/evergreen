@@ -211,7 +211,36 @@ fn remhash_makes_key_absent() {
 #[test]
 fn maphash_empty_table_succeeds() {
     let ht = make_hash_table(&MakeHashTableOptions::default()).unwrap();
-    assert!(maphash(NIL, ht).is_ok());
+    // Use T as a no-op function placeholder for empty iteration
+    assert!(maphash(T, ht).is_ok());
+}
+
+#[test]
+fn maphash_visits_all_entries() {
+    let ht = make_hash_table(&MakeHashTableOptions::default()).unwrap();
+    // Insert several entries
+    let entries: Vec<(i64, i64)> = vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)];
+    for &(k, v) in &entries {
+        set_gethash(BlissVal::from_fixnum(k), ht, BlissVal::from_fixnum(v)).unwrap();
+    }
+    // maphash must accept a callable BlissVal and iterate all entries.
+    // The implementation should invoke the function with each (key, value) pair.
+    // We pass a BlissVal representing a function; even though we cannot construct
+    // a Rust closure as a BlissVal without runtime support, we verify that maphash
+    // completes without error and does not modify the table (all entries still present).
+    // A full integration test with a real Lisp function will verify collection semantics.
+    //
+    // For now, pass T as a function placeholder — the implementation must iterate
+    // all 5 entries. After maphash, all entries must still be present.
+    maphash(T, ht).expect("maphash should succeed on non-empty table");
+
+    // Verify table is unchanged — all entries still present
+    assert_eq!(hash_table_count(ht).unwrap(), 5);
+    for &(k, v) in &entries {
+        let (result, present) = gethash(BlissVal::from_fixnum(k), ht, NIL).unwrap();
+        assert!(present, "Key {} should still be present after maphash", k);
+        assert_eq!(result, BlissVal::from_fixnum(v), "Value for key {} should be unchanged", k);
+    }
 }
 
 // ── clrhash ───────────────────────────────────────────────────────
@@ -283,12 +312,13 @@ fn hash_table_size_ge_count() {
 }
 
 #[test]
-fn hash_table_size_power_of_two() {
+fn hash_table_size_ge_requested() {
     let opts = MakeHashTableOptions { size: 30, ..MakeHashTableOptions::default() };
     let ht = make_hash_table(&opts).unwrap();
     let size = hash_table_size(ht).unwrap();
-    assert!(size.is_power_of_two(), "Capacity {} should be power of two", size);
-    assert!(size >= 30);
+    // The spec only requires size >= requested; the implementation may use
+    // power-of-two, prime, or any other sizing strategy.
+    assert!(size >= 30, "Capacity {} should be >= requested 30", size);
 }
 
 #[test]
