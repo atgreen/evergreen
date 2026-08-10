@@ -28,3 +28,6 @@ pub mod ic;
 
 // ── Profiling infrastructure ──────────────────────────────────────
 pub mod profiling;
+
+// ── Error types ──────────────────────────────────────────────────
+pub mod error;

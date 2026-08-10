@@ -28,3 +28,6 @@ pub mod pathnames;
 
 // ── Developer tools ───────────────────────────────────────────────
 pub mod devtools;
+
+// ── Error types ──────────────────────────────────────────────────
+pub mod error;
