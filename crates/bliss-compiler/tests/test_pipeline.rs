@@ -15,7 +15,11 @@ use bliss_compiler::codegen::{
 };
 use bliss_compiler::tiered::{
     Tier, TierConfig, Interpreter, BaselineCompiler, OptimisingCompiler,
-    check_promotion,
+    check_promotion, request_compilation,
+};
+use bliss_compiler::osr::{
+    OsrEntryMap, LocalMapping, DeoptLog, DeoptReason, DeoptConfig,
+    osr_entry, deoptimize,
 };
 use bliss_rt::value::{BlissVal, NIL, T, EOF};
 
@@ -502,6 +506,221 @@ fn tiered_compilers_produce_code_with_non_function() {
 fn tiered_tiers_ordered() {
     assert!(Tier::Interpreter < Tier::Baseline);
     assert!(Tier::Baseline < Tier::Optimising);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 6b. request_compilation() and CompiledCode::install()
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn tiered_request_compilation_accepts_function_val() {
+    // Allocate a function header: [entry_point: 8][tier: 1][pad: 3][invoke_count: 4] = 16 bytes
+    let header = vec![0u8; 16];
+    let header_ptr = header.as_ptr() as u64;
+    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION as u64);
+
+    // request_compilation should accept a function-tagged value and enqueue it
+    let result = request_compilation(func_val, Tier::Baseline);
+    assert!(result.is_ok(), "request_compilation should accept a function-tagged value");
+
+    // Also verify it works for T2 target
+    let result2 = request_compilation(func_val, Tier::Optimising);
+    assert!(result2.is_ok(), "request_compilation should accept Optimising target tier");
+}
+
+#[test]
+fn tiered_request_compilation_rejects_non_function() {
+    // A fixnum is not a function — request_compilation should reject it
+    let non_func = BlissVal::from_fixnum(42);
+    let result = request_compilation(non_func, Tier::Baseline);
+    assert!(result.is_err(), "request_compilation should reject non-function values");
+}
+
+#[test]
+fn tiered_compiled_code_install_updates_function_header() {
+    // Allocate a function header with space for:
+    //   [entry_point: 8 bytes (AtomicPtr)][tier: 1 byte][padding: 3][invoke_count: 4]
+    // We need proper alignment for AtomicPtr, so use a Box<[u8; 16]> via aligned allocation.
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    // Use a Vec with enough space, aligned to pointer size
+    let mut header = vec![0u8; 32]; // extra room for alignment
+    let header_ptr = header.as_mut_ptr();
+
+    // Ensure the pointer is 8-byte aligned (it should be from Vec)
+    assert_eq!(header_ptr as usize % 8, 0, "header must be 8-byte aligned");
+
+    // Initialize: entry_point = null, tier = Interpreter (0)
+    unsafe {
+        let entry_slot = header_ptr as *const AtomicPtr<u8>;
+        (*entry_slot).store(std::ptr::null_mut(), Ordering::Release);
+        *header_ptr.add(8) = 0; // Tier::Interpreter
+    }
+
+    // Create a function-tagged value pointing to the header
+    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION as u64);
+
+    // Compile at baseline tier
+    let compiled = BaselineCompiler::new().compile(func_val).unwrap();
+    assert_eq!(compiled.tier(), Tier::Baseline);
+    let code_size = compiled.code_size();
+    assert!(code_size > 0);
+
+    // Install the compiled code into the function header
+    let install_result = compiled.install(func_val);
+    assert!(install_result.is_ok(), "install should succeed for a function-tagged value");
+
+    // After install, the entry point should be non-null and tier byte should be Baseline (1)
+    unsafe {
+        let entry_slot = header_ptr as *const AtomicPtr<u8>;
+        let entry = (*entry_slot).load(Ordering::Acquire);
+        assert!(!entry.is_null(), "entry point should be updated after install");
+
+        let tier_byte = *header_ptr.add(8);
+        assert_eq!(tier_byte, 1, "tier byte should be Baseline (1) after install");
+    }
+}
+
+#[test]
+fn tiered_compiled_code_install_rejects_non_function() {
+    let non_func = BlissVal::from_fixnum(0);
+    let compiled = BaselineCompiler::new().compile(non_func);
+    // If compile succeeds (it may or may not gate on TAG_FUNCTION), try install
+    if let Ok(cc) = compiled {
+        let result = cc.install(non_func);
+        assert!(result.is_err(), "install should reject non-function values");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 6c. OSR integration with the pipeline
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn osr_entry_map_construction() {
+    // Verify OsrEntryMap can be constructed with local-to-SSA mappings
+    let mappings = vec![
+        LocalMapping { local_index: 0, ssa_var: 10 },
+        LocalMapping { local_index: 1, ssa_var: 11 },
+        LocalMapping { local_index: 2, ssa_var: 12 },
+    ];
+    let entry_map = OsrEntryMap::new(mappings.clone(), 64);
+    assert_eq!(entry_map.mappings.len(), 3);
+    assert_eq!(entry_map.target_pc_offset, 64);
+    assert_eq!(entry_map.mappings[0].local_index, 0);
+    assert_eq!(entry_map.mappings[0].ssa_var, 10);
+}
+
+#[test]
+fn osr_entry_map_enter_validates_local_bounds() {
+    // enter() should error when a mapping references an out-of-bounds local
+    let mappings = vec![
+        LocalMapping { local_index: 5, ssa_var: 10 }, // index 5, but only 2 locals
+    ];
+    let entry_map = OsrEntryMap::new(mappings, 0);
+    let locals = [BlissVal::from_fixnum(1), BlissVal::from_fixnum(2)];
+    let result = entry_map.enter(&locals, std::ptr::null());
+    assert!(result.is_err(), "enter should fail when local_index is out of bounds");
+}
+
+#[test]
+fn osr_entry_with_compiled_function() {
+    // Build a compiled function and attempt OSR entry — this exercises the
+    // osr_entry() free function which validates the function and entry map
+    // before attempting the (unimplemented) stack transfer.
+    let mut header = vec![0u8; 16];
+    let header_ptr = header.as_mut_ptr();
+    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION as u64);
+
+    let entry_map = OsrEntryMap::new(
+        vec![LocalMapping { local_index: 0, ssa_var: 0 }],
+        0,
+    );
+    let locals = [BlissVal::from_fixnum(42)];
+
+    // osr_entry should validate inputs and then hit unimplemented!() for
+    // the actual stack transfer — we expect a panic (not an Err).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        osr_entry(func_val, &entry_map, &locals)
+    }));
+    // The function either panics (unimplemented) or returns an error —
+    // either is acceptable in red phase; what matters is it doesn't silently succeed
+    assert!(
+        result.is_err() || result.unwrap().is_err(),
+        "osr_entry should either panic (unimplemented) or return Err"
+    );
+}
+
+#[test]
+fn osr_deoptimize_records_reason_and_blacklists() {
+    // Test the DeoptLog independently — it tracks deopt events and blacklists
+    let mut log = DeoptLog::new();
+    assert_eq!(log.count(), 0);
+    assert!(!log.is_blacklisted());
+
+    log.record(DeoptReason::TypeMismatch {
+        expected: "fixnum".into(),
+        actual: "cons".into(),
+    });
+    assert_eq!(log.count(), 1);
+    assert!(!log.is_blacklisted());
+
+    log.record(DeoptReason::InlineCacheOverflow);
+    log.record(DeoptReason::Other("test".into()));
+    assert_eq!(log.count(), 3);
+    assert!(log.is_blacklisted(), "3 deopts should trigger blacklisting (threshold=3)");
+}
+
+#[test]
+fn osr_deopt_config_custom_threshold() {
+    let config = DeoptConfig {
+        blacklist_threshold: 5,
+        backoff_seconds: 60,
+    };
+    let mut log = DeoptLog::with_config(&config);
+    for _ in 0..4 {
+        log.record(DeoptReason::InlineCacheOverflow);
+    }
+    assert!(!log.is_blacklisted(), "4 deopts below threshold 5 should not blacklist");
+    log.record(DeoptReason::InlineCacheOverflow);
+    assert!(log.is_blacklisted(), "5 deopts at threshold 5 should blacklist");
+}
+
+#[test]
+fn osr_threshold_in_tier_config() {
+    // Verify TierConfig carries the osr_threshold field used to trigger OSR entry
+    let config = TierConfig {
+        t1_threshold: 10,
+        t2_threshold: 5000,
+        osr_threshold: 10000,
+        compile_threads: 1,
+    };
+    assert_eq!(config.osr_threshold, 10000,
+        "TierConfig should carry osr_threshold for back-edge triggered OSR");
+}
+
+#[test]
+fn osr_deoptimize_with_compiled_function() {
+    // Exercise the deoptimize() free function with a compiled function.
+    // It should validate and then hit unimplemented!() for stack reconstruction.
+    let mut header = vec![0u8; 16];
+    let header_ptr = header.as_mut_ptr();
+    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION as u64);
+
+    let live_values = [BlissVal::from_fixnum(1), BlissVal::from_fixnum(2)];
+    let reason = DeoptReason::TypeMismatch {
+        expected: "fixnum".into(),
+        actual: "symbol".into(),
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        deoptimize(func_val, reason, &live_values)
+    }));
+    // deoptimize should either panic (unimplemented) or return Err
+    assert!(
+        result.is_err() || result.unwrap().is_err(),
+        "deoptimize should either panic (unimplemented) or return Err"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
