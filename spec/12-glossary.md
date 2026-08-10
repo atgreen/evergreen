@@ -96,8 +96,10 @@
 | D4.05 | Readtable Layout | §4.1 | ASCII fast-path table + HashMap for extended Unicode chars |
 | D4.06 | Environment | §4.2 | Lexical environment for macro expansion (bindings, declarations) |
 | D4.07 | CompilationRequest | §4.4 | Queued request for background compilation (function, tier, profile) |
-| D4.08 | Type Lattice / Stack Frame | §4.5 / §4.4 | CL type lattice for propagation; also T1 stack frame layout |
-| D4.09 | OSR Entry Map / Connection Graph | §4.6 / §4.5 | Maps T1 locals to T2 SSA vars; also escape analysis graph |
+| D4.08 | Type Lattice | §4.5 | CL type lattice for type propagation pass — **ID collision**: §4.4 also assigns D4.08 to Stack Frame Layout; see §12.5 finding #8 |
+| D4.08 | Stack Frame Layout | §4.4 | T1 stack frame layout diagram — **ID collision**: §4.5 also assigns D4.08 to Type Lattice; see §12.5 finding #8 |
+| D4.09 | OSR Entry Map | §4.6 | Maps T1 locals to T2 SSA vars for on-stack replacement — **ID collision**: §4.5 also assigns D4.09 to Connection Graph; see §12.5 finding #9 |
+| D4.09 | Connection Graph | §4.5 | Escape analysis connection graph — **ID collision**: §4.6 also assigns D4.09 to OSR Entry Map; see §12.5 finding #9 |
 | D4.10 | Deopt Log | §4.6 | Per-function log of deoptimisation events with reasons |
 | D4.11 | MachNode | §4.7 | Platform-specific machine instruction node |
 | D4.12 | CodeBuffer | §4.7 | Growable byte buffer for machine code emission |
@@ -112,7 +114,8 @@
 | D5.07 | MethodTable | §5.2 | Sorted method list + effective method cache per GF |
 | D5.08 | Dispatch Cache | §5.2 | Hash table mapping class tuples to effective methods |
 | D5.09 | Instance Layout | §5.2 | CLOS instance memory layout (class ptr + slot vector) |
-| D5.10 | HandlerCluster / PrimitiveFn | §5.3 / §5.1 | Handler cluster for condition system; also bootstrap primitive fn descriptor |
+| D5.10 | HandlerCluster | §5.3 | Handler cluster for condition system — **ID collision**: §5.1 also assigns D5.10 to PrimitiveFn; see §12.5 finding #10 |
+| D5.10 | PrimitiveFn | §5.1 | Bootstrap primitive function descriptor — **ID collision**: §5.3 also assigns D5.10 to HandlerCluster; see §12.5 finding #10 |
 | D5.11 | RestartCluster | §5.3 | Cluster of restarts established by RESTART-BIND/RESTART-CASE |
 | D5.12 | ThreadConditionState | §5.3 | Per-thread handler/restart stack and debugger state |
 | D5.13 | Pre-allocated Storage Conditions | §5.3 | Pool of 4 pre-allocated STORAGE-CONDITION instances for OOM scenarios |
@@ -121,9 +124,12 @@
 | D5.17 | Broadcast Stream | §5.4 | Output stream fanning to multiple component streams |
 | D5.18 | Concatenated Stream | §5.4 | Input stream reading sequentially from multiple sources |
 | D5.19 | Two-Way Stream | §5.4 | Bidirectional stream delegating to input/output components |
-| D5.20 | Hash Table Layout (detailed) / Echo Stream | §5.5 / §5.4 | Robin Hood HT with RwLock; also echo stream layout |
-| D5.21 | SEQ-DISPATCH-TABLE / Synonym Stream | §5.5 / §5.4 | 2D dispatch table for sequence specialisation; also synonym stream |
-| D5.22 | TimsortMergeBuffer / StreamBuffer | §5.5 / §5.4 | Thread-local scratch buffer for Timsort; also stream I/O buffer |
+| D5.20 | Echo Stream | §5.4 | Echo stream layout — **ID collision**: §5.5 also assigns D5.20 to Hash Table Layout; see §12.5 finding #11 |
+| D5.20 | Hash Table Layout (detailed) | §5.5 | Robin Hood hash table with RwLock — **ID collision**: §5.4 also assigns D5.20 to Echo Stream; see §12.5 finding #11 |
+| D5.21 | Synonym Stream | §5.4 | Synonym stream delegating to symbol-value — **ID collision**: §5.5 also assigns D5.21 to SEQ-DISPATCH-TABLE; see §12.5 finding #11 |
+| D5.21 | SEQ-DISPATCH-TABLE | §5.5 | 2D dispatch table for sequence specialisation — **ID collision**: §5.4 also assigns D5.21 to Synonym Stream; see §12.5 finding #11 |
+| D5.22 | StreamBuffer | §5.4 | Stream I/O buffer — **ID collision**: §5.5 also assigns D5.22 to TimsortMergeBuffer; see §12.5 finding #11 |
+| D5.22 | TimsortMergeBuffer | §5.5 | Thread-local scratch buffer for Timsort — **ID collision**: §5.4 also assigns D5.22 to StreamBuffer; see §12.5 finding #11 |
 | D5.23 | check_seq_bounds | §5.5 | Shared bounds-validation utility for :START/:END keywords |
 | D5.25 | FormatOp | §5.6 | Compiled FORMAT directive node |
 | D5.26 | JustifyOp | §5.6 | Justification (~<...~>) operation descriptor |
@@ -233,6 +239,8 @@ requirements that satisfy it.
 | R5.40–R5.43 | FORMAT: all ANSI directives; pretty-printer |
 | R5.44–R5.45 | Error signalling with correct ANSI condition types |
 | R10.01–R10.03 | ANSI test suite must pass; CI-gated |
+| R10.13–R10.16 | Fuzz testing of reader, compiler pipeline, and FFI boundaries; triage within 48 hours |
+| R10.23–R10.26 | Dedicated fuzz targets with persistent seed corpora and weekly minimisation |
 
 ### G2 — Competitive Peak Throughput (within 2× of SBCL)
 
@@ -279,6 +287,7 @@ requirements that satisfy it.
 | R3.14 | Safepoint-based (no async signal suspension) |
 | R3.17 | Mark state in side-table bitmap, not object headers |
 | R3.19 | Large objects never moved |
+| R10.15 | FFI boundary fuzzing catches GC/runtime robustness issues |
 
 ### G6 — Native Threads (OS-thread-per-core + green scheduling)
 
@@ -307,6 +316,7 @@ requirements that satisfy it.
 | R7.14 | Shared library follows semantic versioning |
 | R8.03–R8.05 | Unsafe code confined; no raw pointers to CL code |
 | R8.19 | Type-safe alien value marshalling |
+| R10.15 | FFI boundary functions fuzzed with random alien descriptors and data |
 
 ---
 
