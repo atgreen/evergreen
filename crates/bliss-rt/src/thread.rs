@@ -287,21 +287,27 @@ fn worker_loop() {
         // Execute the green thread's entry.
         task.thread.set_state(ThreadState::Runnable);
 
-        // Determine the result: if the entry is a callable (TAG_FUNCTION),
-        // a full evaluator would invoke it here. Without a full evaluator,
-        // we store the entry value itself as the result. If the entry is NIL,
-        // the result is NIL. This allows callers to retrieve the entry value
-        // they supplied and satisfies the contract that make_thread does
-        // something meaningful with `entry`.
-        let result_val = task.thread.entry;
+        // Execute the entry: if it is a TAG_FUNCTION, extract the native
+        // function pointer and invoke it. Otherwise pass the entry value
+        // through as the result (e.g. NIL, T, fixnums).
+        let result_val = if task.thread.entry.is_function() {
+            // The function pointer is stored in the upper bits (mask off the
+            // 3-bit tag). Interpret it as a `fn() -> BlissVal`.
+            let fn_addr = task.thread.entry.0 & !crate::value::TAG_MASK;
+            let func: fn() -> BlissVal = unsafe { std::mem::transmute(fn_addr) };
+            func()
+        } else {
+            task.thread.entry
+        };
 
-        // Check for pending interrupts before completing.
-        if task.thread.has_interrupt() {
-            // In a full implementation, the interrupt condition would be
-            // signaled through the condition system. For now, the interrupt
-            // is consumed but does not alter the result.
-            let _ = task.thread.take_interrupt();
-        }
+        // Check for pending interrupts before completing. If an interrupt
+        // was delivered, the interrupt condition replaces the normal result
+        // so that the joining thread can observe the interruption.
+        let result_val = if task.thread.has_interrupt() {
+            task.thread.take_interrupt().unwrap_or(result_val)
+        } else {
+            result_val
+        };
 
         // Mark thread as dead and publish the result.
         task.thread.set_state(ThreadState::Dead);
