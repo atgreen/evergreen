@@ -5,7 +5,6 @@
 //! See §1.3 of the spec.
 
 use crate::value::BlissVal;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── ObjectHeader ───────────────────────────────────────────────────
 
@@ -32,45 +31,43 @@ const SIZE_MASK: u64 = 0xFFFF;
 impl ObjectHeader {
     /// Create a new object header.
     pub fn new(type_id: u8, size_units: u16) -> Self {
-        let bits = ((type_id as u64) << TYPE_ID_SHIFT)
-            | (size_units as u64);
-        ObjectHeader(bits)
+        unimplemented!()
     }
 
     /// Extract the type ID (bits 63:56).
     pub fn type_id(self) -> u8 {
-        ((self.0 & TYPE_ID_MASK) >> TYPE_ID_SHIFT) as u8
+        unimplemented!()
     }
 
     /// Extract the GC bits (bits 55:48).
     pub fn gc_bits(self) -> u8 {
-        ((self.0 & GC_BITS_MASK) >> GC_BITS_SHIFT) as u8
+        unimplemented!()
     }
 
     /// Set GC bits (bits 55:48).
     pub fn set_gc_bits(&mut self, bits: u8) {
-        self.0 = (self.0 & !GC_BITS_MASK) | ((bits as u64) << GC_BITS_SHIFT);
+        unimplemented!()
     }
 
     /// Extract the cached identity hash (bits 47:16). Zero means not yet computed.
     pub fn hash(self) -> u32 {
-        ((self.0 & HASH_MASK) >> HASH_SHIFT) as u32
+        unimplemented!()
     }
 
     /// Set the cached identity hash (bits 47:16).
     pub fn set_hash(&mut self, hash: u32) {
-        self.0 = (self.0 & !HASH_MASK) | ((hash as u64) << HASH_SHIFT);
+        unimplemented!()
     }
 
     /// Extract the size in 8-byte units (bits 15:0).
     /// `0xFFFF` signals the large-object extension (true size at offset 8).
     pub fn size_units(self) -> u16 {
-        (self.0 & SIZE_MASK) as u16
+        unimplemented!()
     }
 
     /// Whether this is a large object (size field == 0xFFFF sentinel).
     pub fn is_large_object(self) -> bool {
-        self.size_units() == 0xFFFF
+        unimplemented!()
     }
 }
 
@@ -86,62 +83,26 @@ pub mod gc_bit {
 }
 
 impl ObjectHeader {
-    /// Get an atomic reference to the inner u64, avoiding forming `&u64` first.
-    ///
-    /// # Safety
-    /// Uses `addr_of!` to obtain a raw pointer without an intermediate `&u64`,
-    /// then reinterprets as `&AtomicU64`. `AtomicU64` has the same size/alignment
-    /// as `u64` (guaranteed by `repr(transparent)`). The caller must ensure no
-    /// non-atomic writes race with atomic operations on the same header.
-    #[inline(always)]
-    fn as_atomic(&self) -> &AtomicU64 {
-        unsafe { &*(std::ptr::addr_of!(self.0) as *const AtomicU64) }
-    }
-
-    /// Atomically read the full header word.
-    #[inline(always)]
-    fn atomic_load(&self) -> u64 {
-        self.as_atomic().load(Ordering::Acquire)
-    }
-
     /// Atomically read mark bit.
     pub fn is_marked(&self) -> bool {
-        let bits = self.atomic_load();
-        let gc = ((bits & GC_BITS_MASK) >> GC_BITS_SHIFT) as u8;
-        gc & (1 << gc_bit::MARK) != 0
+        unimplemented!()
     }
 
     /// Atomically set mark bit via CAS.
     /// Returns true if the bit was successfully set (was previously unset).
     /// Returns false if the mark bit was already set.
     pub fn set_marked(&self) -> bool {
-        let atomic = self.as_atomic();
-        let mark_bit_in_word: u64 = 1u64 << (GC_BITS_SHIFT + gc_bit::MARK as u32);
-        loop {
-            let old = atomic.load(Ordering::Acquire);
-            if old & mark_bit_in_word != 0 {
-                return false; // already marked
-            }
-            let new = old | mark_bit_in_word;
-            match atomic.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return true,
-                Err(_) => continue,
-            }
-        }
+        unimplemented!()
     }
 
     /// Atomically check if object has been forwarded (evacuated by GC).
     pub fn is_forwarded(&self) -> bool {
-        let bits = self.atomic_load();
-        let gc = ((bits & GC_BITS_MASK) >> GC_BITS_SHIFT) as u8;
-        gc & (1 << gc_bit::FORWARDED) != 0
+        unimplemented!()
     }
 
     /// Atomically check if object is pinned (must not be moved by GC).
     pub fn is_pinned(&self) -> bool {
-        let bits = self.atomic_load();
-        let gc = ((bits & GC_BITS_MASK) >> GC_BITS_SHIFT) as u8;
-        gc & (1 << gc_bit::PINNED) != 0
+        unimplemented!()
     }
 }
 
