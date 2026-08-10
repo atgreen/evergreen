@@ -3,7 +3,7 @@
 //! Covers: StreamDirection, ExternalFormat, GrayStream trait operations,
 //! stream constructors, composite streams, stream queries, and error conditions.
 
-use bliss_rt::value::{BlissVal, NIL, T, EOF};
+use bliss_rt::value::{BlissVal, NIL, EOF};
 use bliss_stdlib::streams::*;
 
 // ── StreamDirection enum ──────────────────────────────────────────

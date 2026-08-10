@@ -1,6 +1,5 @@
 //! Tests for bliss-stdlib packages module (spec §5.1).
 use bliss_stdlib::packages::*;
-use bliss_rt::value::BlissVal;
 
 fn fresh_registry() -> PackageRegistry {
     let mut reg = PackageRegistry::new();
