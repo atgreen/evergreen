@@ -3,8 +3,8 @@
 //! Class hierarchy, generic function dispatch, method combination,
 //! and MOP. See spec §5.3.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
 
 use bliss_rt::error::BlissError;
 use bliss_rt::value::{BlissVal, NIL, T};
@@ -132,15 +132,22 @@ impl ClosState {
     }
 }
 
-static CLOS_STATE: LazyLock<RwLock<ClosState>> =
-    LazyLock::new(|| RwLock::new(ClosState::new()));
-
-fn lock_read() -> std::sync::RwLockReadGuard<'static, ClosState> {
-    CLOS_STATE.read().expect("CLOS lock poisoned")
+thread_local! {
+    static CLOS_STATE: RefCell<ClosState> = RefCell::new(ClosState::new());
 }
 
-fn lock_write() -> std::sync::RwLockWriteGuard<'static, ClosState> {
-    CLOS_STATE.write().expect("CLOS lock poisoned")
+fn with_state<F, R>(f: F) -> R
+where
+    F: FnOnce(&ClosState) -> R,
+{
+    CLOS_STATE.with(|cell| f(&cell.borrow()))
+}
+
+fn with_state_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut ClosState) -> R,
+{
+    CLOS_STATE.with(|cell| f(&mut cell.borrow_mut()))
 }
 
 // ── CLOS bootstrap ─────────────────────────────────────────────────
@@ -148,7 +155,7 @@ fn lock_write() -> std::sync::RwLockWriteGuard<'static, ClosState> {
 /// Initialize the CLOS bootstrap: create proto-classes, wire up metaclass
 /// circularity. R5.10.
 pub fn bootstrap_clos() -> Result<(), BlissError> {
-    let mut st = lock_write();
+    with_state_mut(|st| {
     // Full reset so tests are independent
     *st = ClosState::new();
 
@@ -222,125 +229,130 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
     st.heap_object_class = hpo_cls;
     st.bootstrapped = true;
     Ok(())
+    })
 }
 
 // ── Class protocol ─────────────────────────────────────────────────
 
 /// Find a class by name.
 pub fn find_class(name: BlissVal) -> Option<BlissVal> {
-    lock_read().class_registry.get(&name).copied()
+    with_state(|st| st.class_registry.get(&name).copied())
 }
 
 /// Register a class by name.
 pub fn set_find_class(name: BlissVal, class: BlissVal) -> Result<(), BlissError> {
-    let mut st = lock_write();
-
-    // Track fixnum registration order (for diamond-hierarchy inference)
-    if class.is_fixnum() {
-        let fv = class.as_fixnum();
-        if !st.fixnum_registrations.iter().any(|(v, _)| *v == fv) {
-            st.fixnum_registrations.push((fv, class));
+    with_state_mut(|st| {
+        // Track fixnum registration order (for diamond-hierarchy inference)
+        if class.is_fixnum() {
+            let fv = class.as_fixnum();
+            if !st.fixnum_registrations.iter().any(|(v, _)| *v == fv) {
+                st.fixnum_registrations.push((fv, class));
+            }
         }
-    }
 
-    st.class_registry.insert(name, class);
+        st.class_registry.insert(name, class);
 
-    if !st.class_meta.contains_key(&class) {
-        let default_supers = if st.bootstrapped && st.standard_object_class != NIL {
-            vec![st.standard_object_class]
+        if !st.class_meta.contains_key(&class) {
+            let default_supers = if st.bootstrapped && st.standard_object_class != NIL {
+                vec![st.standard_object_class]
+            } else {
+                vec![]
+            };
+            st.class_meta.insert(class, ClassMeta {
+                name,
+                direct_supers: default_supers,
+                direct_subs: vec![],
+                slots: vec![],
+            });
         } else {
-            vec![]
-        };
-        st.class_meta.insert(class, ClassMeta {
-            name,
-            direct_supers: default_supers,
-            direct_subs: vec![],
-            slots: vec![],
-        });
-    } else {
-        // Update name mapping
-        st.class_meta.get_mut(&class).unwrap().name = name;
-    }
-    Ok(())
+            // Update name mapping
+            st.class_meta.get_mut(&class).unwrap().name = name;
+        }
+        Ok(())
+    })
 }
 
 /// Get the class of an object.
 pub fn class_of(object: BlissVal) -> BlissVal {
-    let st = lock_read();
-    // Check instances first
-    if let Some(inst) = st.instances.get(&object) {
-        return inst.class;
-    }
-    if object == NIL {
-        return st.null_class;
-    }
-    if object == T {
-        return st.symbol_class;
-    }
-    if object.is_fixnum() {
-        return st.fixnum_class;
-    }
-    if object.is_character() {
-        return st.character_class;
-    }
-    if object.is_symbol() {
-        return st.symbol_class;
-    }
-    if object.is_cons() {
-        return st.cons_class;
-    }
-    if object.is_single_float() {
-        return st.float_class;
-    }
-    if object.is_function() {
-        return st.function_class;
-    }
-    if object.is_heap_object() {
-        return st.heap_object_class;
-    }
-    st.t_class_val
+    with_state(|st| {
+        // Check instances first
+        if let Some(inst) = st.instances.get(&object) {
+            return inst.class;
+        }
+        if object == NIL {
+            return st.null_class;
+        }
+        if object == T {
+            return st.symbol_class;
+        }
+        if object.is_fixnum() {
+            return st.fixnum_class;
+        }
+        if object.is_character() {
+            return st.character_class;
+        }
+        if object.is_symbol() {
+            return st.symbol_class;
+        }
+        if object.is_cons() {
+            return st.cons_class;
+        }
+        if object.is_single_float() {
+            return st.float_class;
+        }
+        if object.is_function() {
+            return st.function_class;
+        }
+        if object.is_heap_object() {
+            return st.heap_object_class;
+        }
+        st.t_class_val
+    })
 }
 
 /// Get the class name.
 pub fn class_name(class: BlissVal) -> BlissVal {
-    lock_read()
-        .class_meta
-        .get(&class)
-        .map(|m| m.name)
-        .unwrap_or(NIL)
+    with_state(|st| {
+        st.class_meta
+            .get(&class)
+            .map(|m| m.name)
+            .unwrap_or(NIL)
+    })
 }
 
 /// Compute the class precedence list using C3 linearization (R5.11).
 pub fn compute_class_precedence_list(class: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
-    let st = lock_read();
-    c3_linearize(&st, class)
+    with_state(|st| c3_linearize(st, class))
 }
 
 /// Get the direct superclasses of a class.
 pub fn class_direct_superclasses(class: BlissVal) -> Vec<BlissVal> {
-    lock_read()
-        .class_meta
-        .get(&class)
-        .map(|m| m.direct_supers.clone())
-        .unwrap_or_default()
+    with_state(|st| {
+        st.class_meta
+            .get(&class)
+            .map(|m| m.direct_supers.clone())
+            .unwrap_or_default()
+    })
 }
 
 /// Get the direct subclasses of a class.
 pub fn class_direct_subclasses(class: BlissVal) -> Vec<BlissVal> {
-    lock_read()
-        .class_meta
-        .get(&class)
-        .map(|m| m.direct_subs.clone())
-        .unwrap_or_default()
+    with_state(|st| {
+        st.class_meta
+            .get(&class)
+            .map(|m| m.direct_subs.clone())
+            .unwrap_or_default()
+    })
 }
 
 /// Get the slots of a class.
 pub fn class_slots(class: BlissVal) -> Vec<BlissVal> {
-    lock_read()
-        .class_meta
-        .get(&class)
-        .map(|m| m.slots.clone())
-        .unwrap_or_default()
+    with_state(|st| {
+        st.class_meta
+            .get(&class)
+            .map(|m| m.slots.clone())
+            .unwrap_or_default()
+    })
 }
 
 // ── C3 linearization ──────────────────────────────────────────────
@@ -399,10 +411,18 @@ fn infer_group_supers(st: &ClosState, class: BlissVal) -> Option<Vec<BlissVal>> 
 fn c3_linearize(st: &ClosState, class: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
     let direct_supers = match st.class_meta.get(&class) {
         Some(meta) => {
-            // If this class only has the default [STANDARD-OBJECT] supers and
-            // belongs to a consecutive-fixnum group, use inferred supers instead.
-            if let Some(inferred) = infer_group_supers(st, class) {
-                inferred
+            // Only use inferred supers when the class's current direct_supers
+            // are exactly the default [STANDARD-OBJECT] (set by set_find_class).
+            // This prevents the heuristic from overriding intentionally-set supers.
+            let is_default_supers = meta.direct_supers.len() == 1
+                && meta.direct_supers[0] == st.standard_object_class
+                && st.standard_object_class != NIL;
+            if is_default_supers {
+                if let Some(inferred) = infer_group_supers(st, class) {
+                    inferred
+                } else {
+                    meta.direct_supers.clone()
+                }
             } else {
                 meta.direct_supers.clone()
             }
@@ -452,13 +472,14 @@ fn c3_linearize(st: &ClosState, class: BlissVal) -> Result<Vec<BlissVal>, BlissE
 
 /// Allocate an instance of a class (ALLOCATE-INSTANCE).
 pub fn allocate_instance(class: BlissVal) -> Result<BlissVal, BlissError> {
-    let mut st = lock_write();
-    let id = st.alloc_instance_id();
-    st.instances.insert(id, InstanceData {
-        class,
-        slots: HashMap::new(),
-    });
-    Ok(id)
+    with_state_mut(|st| {
+        let id = st.alloc_instance_id();
+        st.instances.insert(id, InstanceData {
+            class,
+            slots: HashMap::new(),
+        });
+        Ok(id)
+    })
 }
 
 /// Make an instance (MAKE-INSTANCE). R5.12.
@@ -474,17 +495,18 @@ pub fn initialize_instance(
     instance: BlissVal,
     initargs: &[BlissVal],
 ) -> Result<(), BlissError> {
-    let mut st = lock_write();
-    let inst = st
-        .instances
-        .get_mut(&instance)
-        .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-    let mut i = 0;
-    while i + 1 < initargs.len() {
-        inst.slots.insert(initargs[i], Some(initargs[i + 1]));
-        i += 2;
-    }
-    Ok(())
+    with_state_mut(|st| {
+        let inst = st
+            .instances
+            .get_mut(&instance)
+            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+        let mut i = 0;
+        while i + 1 < initargs.len() {
+            inst.slots.insert(initargs[i], Some(initargs[i + 1]));
+            i += 2;
+        }
+        Ok(())
+    })
 }
 
 /// Shared initialize (SHARED-INITIALIZE).
@@ -494,17 +516,18 @@ pub fn shared_initialize(
     _slot_names: BlissVal,
     initargs: &[BlissVal],
 ) -> Result<(), BlissError> {
-    let mut st = lock_write();
-    let inst = st
-        .instances
-        .get_mut(&instance)
-        .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-    let mut i = 0;
-    while i + 1 < initargs.len() {
-        inst.slots.insert(initargs[i], Some(initargs[i + 1]));
-        i += 2;
-    }
-    Ok(())
+    with_state_mut(|st| {
+        let inst = st
+            .instances
+            .get_mut(&instance)
+            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+        let mut i = 0;
+        while i + 1 < initargs.len() {
+            inst.slots.insert(initargs[i], Some(initargs[i + 1]));
+            i += 2;
+        }
+        Ok(())
+    })
 }
 
 // ── Slot access ────────────────────────────────────────────────────
@@ -514,15 +537,16 @@ pub fn slot_value(
     instance: BlissVal,
     slot_name: BlissVal,
 ) -> Result<BlissVal, BlissError> {
-    let st = lock_read();
-    let inst = st
-        .instances
-        .get(&instance)
-        .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-    match inst.slots.get(&slot_name) {
-        Some(Some(val)) => Ok(*val),
-        _ => Err(BlissError::UnboundVariable(slot_name)),
-    }
+    with_state(|st| {
+        let inst = st
+            .instances
+            .get(&instance)
+            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+        match inst.slots.get(&slot_name) {
+            Some(Some(val)) => Ok(*val),
+            _ => Err(BlissError::UnboundVariable(slot_name)),
+        }
+    })
 }
 
 /// Set a slot value ((SETF SLOT-VALUE)).
@@ -531,13 +555,14 @@ pub fn set_slot_value(
     slot_name: BlissVal,
     new_value: BlissVal,
 ) -> Result<(), BlissError> {
-    let mut st = lock_write();
-    let inst = st
-        .instances
-        .get_mut(&instance)
-        .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-    inst.slots.insert(slot_name, Some(new_value));
-    Ok(())
+    with_state_mut(|st| {
+        let inst = st
+            .instances
+            .get_mut(&instance)
+            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+        inst.slots.insert(slot_name, Some(new_value));
+        Ok(())
+    })
 }
 
 /// Check if a slot is bound (SLOT-BOUNDP).
@@ -545,12 +570,13 @@ pub fn slot_boundp(
     instance: BlissVal,
     slot_name: BlissVal,
 ) -> Result<bool, BlissError> {
-    let st = lock_read();
-    let inst = st
-        .instances
-        .get(&instance)
-        .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-    Ok(matches!(inst.slots.get(&slot_name), Some(Some(_))))
+    with_state(|st| {
+        let inst = st
+            .instances
+            .get(&instance)
+            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+        Ok(matches!(inst.slots.get(&slot_name), Some(Some(_))))
+    })
 }
 
 /// Make a slot unbound (SLOT-MAKUNBOUND).
@@ -558,13 +584,14 @@ pub fn slot_makunbound(
     instance: BlissVal,
     slot_name: BlissVal,
 ) -> Result<(), BlissError> {
-    let mut st = lock_write();
-    let inst = st
-        .instances
-        .get_mut(&instance)
-        .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-    inst.slots.insert(slot_name, None);
-    Ok(())
+    with_state_mut(|st| {
+        let inst = st
+            .instances
+            .get_mut(&instance)
+            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+        inst.slots.insert(slot_name, None);
+        Ok(())
+    })
 }
 
 // ── Generic function dispatch ──────────────────────────────────────
@@ -574,14 +601,15 @@ pub fn make_generic_function(
     name: BlissVal,
     lambda_list: BlissVal,
 ) -> Result<BlissVal, BlissError> {
-    let mut st = lock_write();
-    let id = st.alloc_gf_id();
-    st.generic_functions.insert(id, GFData {
-        name,
-        lambda_list,
-        methods: Vec::new(),
-    });
-    Ok(id)
+    with_state_mut(|st| {
+        let id = st.alloc_gf_id();
+        st.generic_functions.insert(id, GFData {
+            name,
+            lambda_list,
+            methods: Vec::new(),
+        });
+        Ok(id)
+    })
 }
 
 /// Add a method to a generic function.
@@ -589,13 +617,14 @@ pub fn add_method(
     generic_function: BlissVal,
     method: BlissVal,
 ) -> Result<(), BlissError> {
-    let mut st = lock_write();
-    let gf = st
-        .generic_functions
-        .get_mut(&generic_function)
-        .ok_or_else(|| BlissError::Internal("not a generic function".into()))?;
-    gf.methods.push(method);
-    Ok(())
+    with_state_mut(|st| {
+        let gf = st
+            .generic_functions
+            .get_mut(&generic_function)
+            .ok_or_else(|| BlissError::Internal("not a generic function".into()))?;
+        gf.methods.push(method);
+        Ok(())
+    })
 }
 
 /// Remove a method from a generic function.
@@ -603,13 +632,14 @@ pub fn remove_method(
     generic_function: BlissVal,
     method: BlissVal,
 ) -> Result<(), BlissError> {
-    let mut st = lock_write();
-    let gf = st
-        .generic_functions
-        .get_mut(&generic_function)
-        .ok_or_else(|| BlissError::Internal("not a generic function".into()))?;
-    gf.methods.retain(|m| *m != method);
-    Ok(())
+    with_state_mut(|st| {
+        let gf = st
+            .generic_functions
+            .get_mut(&generic_function)
+            .ok_or_else(|| BlissError::Internal("not a generic function".into()))?;
+        gf.methods.retain(|m| *m != method);
+        Ok(())
+    })
 }
 
 /// Compute the applicable methods for given arguments.
@@ -649,11 +679,12 @@ pub fn change_class(
     instance: BlissVal,
     new_class: BlissVal,
 ) -> Result<(), BlissError> {
-    let mut st = lock_write();
-    let inst = st
-        .instances
-        .get_mut(&instance)
-        .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-    inst.class = new_class;
-    Ok(())
+    with_state_mut(|st| {
+        let inst = st
+            .instances
+            .get_mut(&instance)
+            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+        inst.class = new_class;
+        Ok(())
+    })
 }
