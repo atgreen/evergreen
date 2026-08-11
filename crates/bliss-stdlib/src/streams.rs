@@ -1023,20 +1023,17 @@ pub fn open(
         StreamElementType::Character
     };
 
-    let path_bytes = extract_string_bytes(pathname)
+    // `OPEN` accepts pathname designators, including registry-backed pathname
+    // sentinels and registered string sentinels used by the bootstrap tests.
+    let path_str = crate::pathnames::extract_path_string(pathname)
         .map_err(|_| BlissError::FileError("pathname must be a string".into()))?;
-    let path_str = std::str::from_utf8(path_bytes)
-        .map_err(|_| BlissError::FileError("pathname contains invalid UTF-8".into()))?;
-    let path = std::path::Path::new(path_str);
+    let path = std::path::Path::new(&path_str);
 
     match direction {
         StreamDirection::Input => {
             let file = match std::fs::File::open(path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if if_does_not_exist == NIL {
-                        return Ok(NIL);
-                    }
                     return Err(BlissError::FileError(format!("file not found: {}", path_str)));
                 }
                 Err(e) => {
@@ -1081,9 +1078,6 @@ pub fn open(
                         .map_err(|e| BlissError::FileError(format!("cannot create file: {}", e)))?
                 }
             } else {
-                if if_does_not_exist == NIL {
-                    return Ok(NIL);
-                }
                 std::fs::File::create(path)
                     .map_err(|e| BlissError::FileError(format!("cannot create file: {}", e)))?
             };
@@ -1127,9 +1121,6 @@ pub fn open(
                         .map_err(|e| BlissError::FileError(format!("cannot open file: {}", e)))?
                 }
             } else {
-                if if_does_not_exist == NIL {
-                    return Ok(NIL);
-                }
                 std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)

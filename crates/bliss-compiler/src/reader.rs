@@ -8,11 +8,12 @@ use bliss_rt::object::{
     type_id,
 };
 use bliss_rt::value::{BlissVal, EOF, NIL, T, TAG_HEAP_OBJECT};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 // ── Global symbol table ───────────────────────────────────────────
 static SYMBOL_TABLE: Mutex<Option<SymbolTable>> = Mutex::new(None);
+static PACKAGE_TABLE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 struct SymbolTable {
     name_to_index: HashMap<String, u32>,
@@ -46,6 +47,34 @@ pub fn symbol_name(idx: u32) -> Option<String> {
     } else {
         None
     }
+}
+
+pub fn register_package(name: &str) {
+    let mut packages = PACKAGE_TABLE.lock().unwrap();
+    let set = packages.get_or_insert_with(|| {
+        let mut builtins = HashSet::new();
+        builtins.insert("CL".to_string());
+        builtins.insert("COMMON-LISP".to_string());
+        builtins.insert("KEYWORD".to_string());
+        builtins.insert("BLISS".to_string());
+        builtins.insert("CL-USER".to_string());
+        builtins
+    });
+    set.insert(name.to_uppercase());
+}
+
+fn package_exists(name: &str) -> bool {
+    let mut packages = PACKAGE_TABLE.lock().unwrap();
+    let set = packages.get_or_insert_with(|| {
+        let mut builtins = HashSet::new();
+        builtins.insert("CL".to_string());
+        builtins.insert("COMMON-LISP".to_string());
+        builtins.insert("KEYWORD".to_string());
+        builtins.insert("BLISS".to_string());
+        builtins.insert("CL-USER".to_string());
+        builtins
+    });
+    set.contains(&name.to_uppercase())
 }
 
 // Counter for uninterned symbols — each gets a unique index
@@ -589,12 +618,12 @@ fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
                 let idx = intern_symbol(&full);
                 Ok(Some(BlissVal::from_symbol_index(idx)))
             }
-            _ => {
-                // Unknown package: intern as PKG:SYM for the evaluator to resolve
+            _ if package_exists(pkg) => {
                 let full = format!("{}:{}", pkg, sym_name);
                 let idx = intern_symbol(&full);
                 Ok(Some(BlissVal::from_symbol_index(idx)))
             }
+            _ => Err(BlissError::StreamError(format!("package not found: {}", pkg))),
         }
     } else {
         Ok(None)

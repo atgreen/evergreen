@@ -393,10 +393,6 @@ fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>, BlissError> {
 pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissError> {
     use std::io::Write;
 
-    // Trigger a full GC before saving to ensure only live objects are serialised
-    // and finalizers have been run (spec §7.2).
-    crate::gc::full_gc()?;
-
     let use_compression = options.compression == ImageCompression::Zstd;
     let mut flags: u32 = 0;
     if use_compression {

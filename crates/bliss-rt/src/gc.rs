@@ -1788,6 +1788,12 @@ pub fn serialize_relocation_table() -> Vec<u8> {
         return Vec::new();
     }
 
+    let mut object_addresses = std::collections::HashSet::new();
+    let _ = walk_heap(|ptr, _type_id, _size| {
+        object_addresses.insert(ptr as usize);
+        true
+    });
+
     let mut relocs = Vec::new();
     let mut object_offset = 0usize;
     let _ = walk_heap(|ptr, _type_id, size| {
@@ -1795,7 +1801,10 @@ pub fn serialize_relocation_table() -> Vec<u8> {
         while field_offset + 8 <= size {
             let field_ptr = unsafe { ptr.add(field_offset) };
             let raw = unsafe { std::ptr::read_unaligned(field_ptr as *const u64) } as usize;
-            if raw >= heap_base {
+            if raw >= heap_base
+                && raw % OBJECT_ALIGNMENT == OBJECT_HEADER_SIZE
+                && object_addresses.contains(&raw)
+            {
                 relocs.push((object_offset + field_offset) as u64);
             }
             field_offset += 8;

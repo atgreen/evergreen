@@ -1091,6 +1091,12 @@ impl BaselineCompiler {
     /// Compile a form to baseline native code. Single-pass: prologue -> body -> epilogue.
     /// This is the simplified path for compiling a raw BlissVal constant (used by tests).
     pub fn compile(&mut self, function: BlissVal) -> Result<CompiledCode, BlissError> {
+        if function != bliss_rt::value::NIL && function.tag() != TAG_FUNCTION {
+            return Err(BlissError::TypeError {
+                datum: function,
+                expected: "function".into(),
+            });
+        }
         let mut code = Vec::with_capacity(128);
         #[cfg(target_arch = "x86_64")]
         { self.emit_body_x86_64(&mut code, function); }
@@ -1638,6 +1644,12 @@ impl OptimisingCompiler {
 
     /// Compile with full optimisation: build IR -> run passes -> emit code.
     pub fn compile(&mut self, function: BlissVal) -> Result<CompiledCode, BlissError> {
+        if function != bliss_rt::value::NIL && function.tag() != TAG_FUNCTION {
+            return Err(BlissError::TypeError {
+                datum: function,
+                expected: "function".into(),
+            });
+        }
         // 1. Build SSA IR from the function's AST
         let mut builder = IrBuilder::new();
         let mut graph = builder.build(function)

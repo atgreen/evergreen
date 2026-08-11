@@ -148,8 +148,12 @@ static IC_REGISTRY_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// Initialise the global IC registry. Must be called during runtime
 /// bootstrap before any calls to `reset_all_caches`.
 pub fn init_ic_registry() {
-    IC_REGISTRY_INITIALIZED.store(true, Ordering::Release);
-    IC_GENERATION.store(0, Ordering::Release);
+    if IC_REGISTRY_INITIALIZED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        IC_GENERATION.store(0, Ordering::Release);
+    }
 }
 
 /// Get the current global IC generation counter.

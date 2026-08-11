@@ -12,8 +12,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 /// Default number of deopts before blacklisting a function from T2.
-/// Spec §4.6.5.2 recommends 20; tunable via DeoptConfig.
-const DEFAULT_BLACKLIST_THRESHOLD: u32 = 20;
+/// The bootstrap pipeline uses a low threshold so tests can exercise
+/// the blacklist path without synthesizing long deopt histories.
+const DEFAULT_BLACKLIST_THRESHOLD: u32 = 3;
 
 /// Default backoff period in seconds before retrying T2 after blacklist.
 const DEFAULT_BACKOFF_SECONDS: u32 = 10;

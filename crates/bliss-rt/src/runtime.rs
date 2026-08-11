@@ -4,6 +4,7 @@
 
 use crate::error::BlissError;
 use crate::gc::GcConfig;
+use crate::object::{type_id, ObjectHeader};
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::value::BlissVal;
 
@@ -501,12 +502,23 @@ fn boot_symbol_name(val: BlissVal) -> Option<String> {
 fn boot_make_string(s: &str) -> BlissVal {
     BOOT_STORE.with(|store| {
         let mut st = store.borrow_mut();
-        let id = st.string_counter;
-        st.string_counter += 1;
+        let bytes = s.as_bytes();
+        let size = 8 + 8 + bytes.len();
+        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+        let ptr = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout);
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            *(ptr as *mut ObjectHeader) =
+                ObjectHeader::new(type_id::SIMPLE_BASE_STRING, ((size + 7) / 8) as u16);
+            *(ptr.add(8) as *mut u64) = bytes.len() as u64;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
+            ptr
+        };
+        let id = (ptr as u64) >> 3;
         st.strings.insert(id, s.to_string());
-        // Use heap-object tag with ID as "pointer" — safe for bootstrap,
-        // these values won't be dereferenced by is_string().
-        BlissVal((id << 3) | crate::value::TAG_HEAP_OBJECT)
+        unsafe { BlissVal::from_heap_ptr(ptr) }
     })
 }
 

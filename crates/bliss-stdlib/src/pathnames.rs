@@ -708,7 +708,7 @@ fn resolve_relative_path(path_str: &str) -> String {
 
 /// Extract a filesystem path string from a BlissVal.
 /// Tries the string registry first, then the pathname record's reconstructed path.
-fn extract_path_string(val: BlissVal) -> Result<String, BlissError> {
+pub(crate) fn extract_path_string(val: BlissVal) -> Result<String, BlissError> {
     // Direct string lookup
     if let Some(s) = lookup_string(val) {
         return Ok(s);

@@ -259,7 +259,7 @@ struct Closure {
 // so that child() only clones the local vars HashMap, not the entire env.
 #[derive(Clone)]
 struct Env {
-    vars: HashMap<String, BlissVal>,
+    frame: Rc<RefCell<EnvFrame>>,
     funs: Rc<HashMap<String, FunDef>>,
     macros: Rc<HashMap<String, MacroDef>>,
     classes: Rc<HashMap<String, ClassDef>>,
@@ -275,6 +275,12 @@ struct Env {
     closures: Rc<HashMap<u64, Closure>>,
 }
 
+#[derive(Clone, Default)]
+struct EnvFrame {
+    vars: HashMap<String, BlissVal>,
+    parent: Option<Rc<RefCell<EnvFrame>>>,
+}
+
 #[derive(Clone)]
 struct FunDef {
     params: Vec<String>,
@@ -284,7 +290,7 @@ struct FunDef {
 #[derive(Clone)]
 struct MacroDef {
     params: Vec<String>,
-    has_body: bool,
+    rest_param: Option<String>,
     body: BlissVal,
 }
 
@@ -339,7 +345,7 @@ struct HandlerEntry {
 impl Env {
     fn new(sandbox: bool) -> Self {
         Env {
-            vars: HashMap::new(),
+            frame: Rc::new(RefCell::new(EnvFrame::default())),
             funs: Rc::new(HashMap::new()),
             macros: Rc::new(HashMap::new()),
             classes: Rc::new(HashMap::new()),
@@ -358,7 +364,10 @@ impl Env {
     /// classes, methods, packages) via Rc and only clones local vars.
     fn child(&self) -> Self {
         Env {
-            vars: self.vars.clone(),
+            frame: Rc::new(RefCell::new(EnvFrame {
+                vars: HashMap::new(),
+                parent: Some(Rc::clone(&self.frame)),
+            })),
             funs: Rc::clone(&self.funs),
             macros: Rc::clone(&self.macros),
             classes: Rc::clone(&self.classes),
@@ -371,6 +380,74 @@ impl Env {
             mv: self.mv.clone(),
             closures: Rc::clone(&self.closures),
         }
+    }
+
+    fn lookup_var(&self, name: &str) -> Option<BlissVal> {
+        let frame = self.frame.borrow();
+        if let Some(val) = frame.vars.get(name) {
+            return Some(*val);
+        }
+        let parent = frame.parent.clone();
+        drop(frame);
+        parent.and_then(|parent| Self::lookup_frame(&parent, name))
+    }
+
+    fn set_var(&mut self, name: &str, val: BlissVal) {
+        if Self::set_frame_var(&self.frame, name, val) {
+            return;
+        }
+        self.define_local(name, val);
+    }
+
+    fn define_local(&mut self, name: &str, val: BlissVal) {
+        self.frame.borrow_mut().vars.insert(name.to_string(), val);
+    }
+
+    fn visible_vars(&self) -> HashMap<String, BlissVal> {
+        let mut vars = HashMap::new();
+        Self::collect_visible_vars(&self.frame, &mut vars);
+        vars
+    }
+
+    fn lookup_frame(frame: &Rc<RefCell<EnvFrame>>, name: &str) -> Option<BlissVal> {
+        let borrowed = frame.borrow();
+        if let Some(val) = borrowed.vars.get(name) {
+            return Some(*val);
+        }
+        let parent = borrowed.parent.clone();
+        drop(borrowed);
+        parent.and_then(|parent| Self::lookup_frame(&parent, name))
+    }
+
+    fn set_frame_var(frame: &Rc<RefCell<EnvFrame>>, name: &str, val: BlissVal) -> bool {
+        {
+            let mut borrowed = frame.borrow_mut();
+            if borrowed.vars.contains_key(name) {
+                borrowed.vars.insert(name.to_string(), val);
+                return true;
+            }
+            let parent = borrowed.parent.clone();
+            drop(borrowed);
+            if let Some(parent) = parent {
+                return Self::set_frame_var(&parent, name, val);
+            }
+        }
+        false
+    }
+
+    fn collect_visible_vars(frame: &Rc<RefCell<EnvFrame>>, out: &mut HashMap<String, BlissVal>) {
+        let borrowed = frame.borrow();
+        let parent = borrowed.parent.clone();
+        let vars = borrowed
+            .vars
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>();
+        drop(borrowed);
+        if let Some(parent) = parent {
+            Self::collect_visible_vars(&parent, out);
+        }
+        out.extend(vars);
     }
 }
 
@@ -491,6 +568,18 @@ fn vec_to_list(elems: &[BlissVal]) -> BlissVal {
     result
 }
 
+fn format_body_forms(forms: BlissVal) -> String {
+    let parts = list_to_vec(forms)
+        .into_iter()
+        .map(format_val)
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "NIL".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
 // ── Quasiquote expansion ─────────────────────────────────────────
 /// Expand a quasiquote template, substituting BLISS::UNQUOTE forms with
 /// their evaluated values and splicing BLISS::UNQUOTE-SPLICING forms.
@@ -557,8 +646,66 @@ fn next_closure_id() -> u64 {
     NEXT_CLOSURE_ID.with(|c| { let v = *c.borrow(); *c.borrow_mut() = v + 1; v })
 }
 
+fn register_declared_packages(source: &str) {
+    let chars: Vec<char> = source.chars().collect();
+    let mut pos = 0;
+    while pos < chars.len() {
+        match chars[pos] {
+            ';' => {
+                while pos < chars.len() && chars[pos] != '\n' {
+                    pos += 1;
+                }
+            }
+            '"' => {
+                pos += 1;
+                while pos < chars.len() {
+                    if chars[pos] == '\\' {
+                        pos += 2;
+                    } else if chars[pos] == '"' {
+                        pos += 1;
+                        break;
+                    } else {
+                        pos += 1;
+                    }
+                }
+            }
+            '(' => {
+                pos += 1;
+                let op = read_scan_token(&chars, &mut pos);
+                if op.eq_ignore_ascii_case("DEFPACKAGE") {
+                    let pkg = read_scan_token(&chars, &mut pos);
+                    let pkg = pkg.trim_start_matches(':').trim_start_matches("KEYWORD:").trim();
+                    if !pkg.is_empty() {
+                        reader::register_package(&pkg.to_uppercase());
+                    }
+                }
+            }
+            _ => pos += 1,
+        }
+    }
+}
+
+fn read_scan_token(chars: &[char], pos: &mut usize) -> String {
+    while *pos < chars.len() && chars[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+    if *pos >= chars.len() {
+        return String::new();
+    }
+    let start = *pos;
+    while *pos < chars.len() {
+        let ch = chars[*pos];
+        if ch.is_ascii_whitespace() || matches!(ch, '(' | ')' | '"' | ';') {
+            break;
+        }
+        *pos += 1;
+    }
+    chars[start..*pos].iter().collect()
+}
+
 // ── Minimal bootstrap evaluator ───────────────────────────────────
 fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
+    register_declared_packages(source);
     let chars: Vec<char> = source.chars().collect();
     let mut pos = 0; let mut last = NIL;
     loop {
@@ -590,7 +737,7 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         // Keyword symbols are self-evaluating
         if name.starts_with("KEYWORD:") { return Ok(form); }
         // Check variable environment
-        if let Some(val) = env.vars.get(&name) { return Ok(*val); }
+        if let Some(val) = env.lookup_var(&name) { return Ok(val); }
         return Err(BlissError::UnboundVariable(form));
     }
     if form.is_cons() { return eval_list(form, env); }
@@ -802,7 +949,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (val_form, r2) = cp(r);
                     let name = sym_name(sym_form);
                     let val = eval_form(val_form, env)?;
-                    env.vars.insert(name, val);
+                    env.set_var(&name, val);
                     result = val;
                     c = r2;
                 }
@@ -831,7 +978,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         let closure = Closure {
                             params: params.clone(),
                             body,
-                            captured_vars: env.vars.clone(),
+                            captured_vars: env.visible_vars(),
                         };
                         let id = next_closure_id();
                         Rc::make_mut(&mut env.closures).insert(id, closure);
@@ -849,7 +996,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let closure = Closure {
                     params: params.clone(),
                     body,
-                    captured_vars: env.vars.clone(),
+                    captured_vars: env.visible_vars(),
                 };
                 let id = next_closure_id();
                 Rc::make_mut(&mut env.closures).insert(id, closure);
@@ -1194,7 +1341,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut image_data = String::new();
                 for (name, fdef) in env.funs.iter() {
                     let params_str = fdef.params.join(" ");
-                    let body_str = format_val(fdef.body);
+                    let body_str = format_body_forms(fdef.body);
                     image_data.push_str(&format!("(defun {} ({}) {})\n", name, params_str, body_str));
                 }
                 std::fs::write(&path, &image_data)
@@ -1236,12 +1383,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let count = eval_form(count_form, env)?;
                 let n = num_val(count)? as i64;
                 for i in 0..n {
-                    env.vars.insert(var_name.clone(), BlissVal::from_fixnum(i));
+                    env.define_local(&var_name, BlissVal::from_fixnum(i));
                     eval_progn(body, env)?;
                 }
                 if result_rest.is_cons() {
                     let (result_form, _) = cp(result_rest);
-                    env.vars.insert(var_name, BlissVal::from_fixnum(n));
+                    env.define_local(&var_name, BlissVal::from_fixnum(n));
                     return eval_form(result_form, env);
                 }
                 return Ok(NIL);
@@ -1255,12 +1402,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let list = eval_form(list_form, env)?;
                 let elems = list_to_vec(list);
                 for e in &elems {
-                    env.vars.insert(var_name.clone(), *e);
+                    env.define_local(&var_name, *e);
                     eval_progn(body, env)?;
                 }
                 if result_rest.is_cons() {
                     let (result_form, _) = cp(result_rest);
-                    env.vars.insert(var_name, NIL);
+                    env.define_local(&var_name, NIL);
                     return eval_form(result_form, env);
                 }
                 return Ok(NIL);
@@ -1306,7 +1453,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             while c.is_cons() { let (af, r) = cp(c); args.push(eval_form(af, env)?); c = r; }
             let mut child_env = env.child();
             for (i, param) in fdef.params.iter().enumerate() {
-                child_env.vars.insert(param.clone(), if i < args.len() { args[i] } else { NIL });
+                child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
             }
             return eval_progn(fdef.body, &mut child_env);
         }
@@ -1363,7 +1510,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let m = m.clone();
                 let mut child_env = env.child();
                 for (i, param) in m.params.iter().enumerate() {
-                    child_env.vars.insert(param.clone(), if i < args.len() { args[i] } else { NIL });
+                    child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
                 }
                 return eval_progn(m.body, &mut child_env);
             }
@@ -1382,7 +1529,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     while c.is_cons() { let (af, r) = cp(c); args.push(eval_form(af, env)?); c = r; }
                     let mut child_env = env.child();
                     for (i, param) in fdef.params.iter().enumerate() {
-                        child_env.vars.insert(param.clone(), if i < args.len() { args[i] } else { NIL });
+                        child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
                     }
                     return eval_progn(fdef.body, &mut child_env);
                 }
@@ -1401,7 +1548,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             while c.is_cons() { let (af, r) = cp(c); args.push(eval_form(af, env)?); c = r; }
             let mut child_env = env.child();
             for (i, param) in params.iter().enumerate() {
-                child_env.vars.insert(param.clone(), if i < args.len() { args[i] } else { NIL });
+                child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
             }
             return eval_progn(body_rest, &mut child_env);
         }
@@ -1534,11 +1681,11 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
             } else {
                 eval_form(val_form, env)?
             };
-            child_env.vars.insert(var_name, val);
+            child_env.define_local(&var_name, val);
         } else if binding.is_symbol() {
             // (let (x) ...) — x bound to NIL
             let var_name = sym_name(binding);
-            child_env.vars.insert(var_name, NIL);
+            child_env.define_local(&var_name, NIL);
         }
         c = rest;
     }
@@ -1581,14 +1728,19 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let name = sym_name(name_form);
 
     let mut params = Vec::new();
-    let mut has_body = false;
+    let mut rest_param = None;
     let mut c = params_form;
     while c.is_cons() {
         let (p, rest_p) = cp(c);
         if p.is_symbol() {
             let pname = sym_name(p);
             if pname == "&BODY" || pname == "&REST" {
-                has_body = true;
+                if rest_p.is_cons() {
+                    let (rest_name, rest_after_name) = cp(rest_p);
+                    rest_param = Some(sym_name(rest_name));
+                    c = rest_after_name;
+                    continue;
+                }
             } else if !pname.starts_with('&') {
                 params.push(pname);
             }
@@ -1596,7 +1748,7 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         c = rest_p;
     }
 
-    Rc::make_mut(&mut env.macros).insert(name.clone(), MacroDef { params, has_body, body });
+    Rc::make_mut(&mut env.macros).insert(name.clone(), MacroDef { params, rest_param, body });
     Ok(name_form)
 }
 
@@ -1607,21 +1759,20 @@ fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissV
     let mut arg_idx = 0;
     for param in &mdef.params {
         if arg_idx < arg_list.len() {
-            child_env.vars.insert(param.clone(), arg_list[arg_idx]);
+            child_env.define_local(param, arg_list[arg_idx]);
             arg_idx += 1;
         } else {
-            child_env.vars.insert(param.clone(), NIL);
+            child_env.define_local(param, NIL);
         }
     }
 
-    if mdef.has_body {
-        // Collect remaining args as a list for &body
+    if let Some(rest_param) = &mdef.rest_param {
         let body_args = if arg_idx < arg_list.len() {
             vec_to_list(&arg_list[arg_idx..])
         } else {
             NIL
         };
-        child_env.vars.insert("BODY".to_string(), body_args);
+        child_env.define_local(rest_param, body_args);
     }
 
     // Evaluate the macro body to get the expansion (it should be a quasiquote form)
@@ -1798,7 +1949,7 @@ fn apply_function(fn_val: BlissVal, args: &[BlissVal], env: &mut Env) -> Result<
         if let Some(fdef) = env.funs.get(&name).cloned() {
             let mut child_env = env.child();
             for (i, param) in fdef.params.iter().enumerate() {
-                child_env.vars.insert(param.clone(), if i < args.len() { args[i] } else { NIL });
+                child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
             }
             return eval_progn(fdef.body, &mut child_env);
         }
@@ -1815,11 +1966,11 @@ fn apply_function(fn_val: BlissVal, args: &[BlissVal], env: &mut Env) -> Result<
                     let mut child_env = env.child();
                     // Restore captured lexical environment
                     for (k, v) in &closure.captured_vars {
-                        child_env.vars.insert(k.clone(), *v);
+                        child_env.define_local(k, *v);
                     }
                     // Bind parameters
                     for (i, param) in closure.params.iter().enumerate() {
-                        child_env.vars.insert(param.clone(), if i < args.len() { args[i] } else { NIL });
+                        child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
                     }
                     return eval_progn(closure.body, &mut child_env);
                 }
@@ -1830,7 +1981,7 @@ fn apply_function(fn_val: BlissVal, args: &[BlissVal], env: &mut Env) -> Result<
             let params = extract_params(params_form);
             let mut child_env = env.child();
             for (i, param) in params.iter().enumerate() {
-                child_env.vars.insert(param.clone(), if i < args.len() { args[i] } else { NIL });
+                child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
             }
             return eval_progn(body, &mut child_env);
         }
@@ -1921,7 +2072,7 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
         } else {
             NIL
         };
-        child_env.vars.insert(var_name.clone(), val);
+        child_env.define_local(&var_name, val);
     }
 
     eval_progn(body, &mut child_env)
@@ -1951,7 +2102,7 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
                         let (var_form, _) = cp(bind_list);
                         let var_name = sym_name(var_form);
                         let err_msg = format!("{}", e);
-                        child_env.vars.insert(var_name, arena_str(&err_msg));
+                        child_env.define_local(&var_name, arena_str(&err_msg));
                     }
 
                     return eval_progn(handler_body, &mut child_env);
@@ -2069,7 +2220,7 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
     let stream_val = open_stream(&path, direction)?;
 
     let mut child_env = env.child();
-    child_env.vars.insert(var_name, stream_val);
+    child_env.define_local(&var_name, stream_val);
 
     // Evaluate body, then close the stream (unwind-protect style)
     let result = eval_progn(body, &mut child_env);
@@ -2113,11 +2264,12 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     }
 
     Rc::make_mut(&mut env.packages).insert(pkg_name.clone(), PackageDef {
-        name: pkg_name,
+        name: pkg_name.clone(),
         exports,
         uses,
         symbols: HashMap::new(),
     });
+    reader::register_package(&pkg_name);
 
     Ok(T)
 }
@@ -2189,9 +2341,9 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     if !ca.cl_args.is_empty() {
         let args_list: Vec<BlissVal> = ca.cl_args.iter().map(|s| arena_str(s)).collect();
         let args_val = vec_to_list(&args_list);
-        env.vars.insert("*COMMAND-LINE-ARGS*".to_string(), args_val);
+        env.define_local("*COMMAND-LINE-ARGS*", args_val);
     } else {
-        env.vars.insert("*COMMAND-LINE-ARGS*".to_string(), NIL);
+        env.define_local("*COMMAND-LINE-ARGS*", NIL);
     }
 
     // Load init file unless --no-init (issue #8)
