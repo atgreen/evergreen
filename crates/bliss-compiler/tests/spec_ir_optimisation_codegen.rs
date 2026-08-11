@@ -1,5 +1,6 @@
 use bliss_compiler::codegen::{
-    patch_code, Aarch64Backend, CodegenBackend, LinearScanAllocator, TargetArch, X86_64Backend,
+    patch_code, Aarch64Backend, CodeBuffer, CodegenBackend, LinearScanAllocator, RelocKind,
+    Relocation, StackMap, TargetArch, X86_64Backend,
 };
 use bliss_compiler::ir::{verify, Edge, EdgeKind, IrBuilder, IrGraph, NodeId, NodeKind};
 use bliss_compiler::opt::{
@@ -7,8 +8,36 @@ use bliss_compiler::opt::{
     InliningConfig, Licm, NullCheckElimination, Pass, PassManager, StrengthReduction,
     TypePropagation,
 };
+use bliss_compiler::osr::{
+    clear_global_deopt_logs, deoptimize, ConversionKind, DeoptReason, LocalMapping, Location,
+    OsrEntryMap, OsrSlotDesc, TypeGuard,
+};
+use bliss_compiler::tiered::{CompiledCode, Tier};
 use bliss_compiler::read_from_string;
-use bliss_rt::value::{BlissVal, T, TAG_FIXNUM};
+use bliss_rt::value::{BlissVal, T, TAG_FIXNUM, TAG_FUNCTION};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::thread;
+
+struct CodeBufferView {
+    bytes: Vec<u8>,
+    arch: TargetArch,
+    relocations: Vec<Relocation>,
+    stack_maps: Vec<StackMap>,
+}
+
+struct CompiledCodeView {
+    code: Vec<u8>,
+    tier: Tier,
+}
+
+#[repr(C)]
+struct InstallHeader {
+    entry: AtomicPtr<u8>,
+    tier: u8,
+    _pad: [u8; 3],
+    invoke_count: u32,
+}
 
 fn edge(from: NodeId, to: NodeId, kind: EdgeKind, input_index: u32) -> Edge {
     Edge {
@@ -61,6 +90,21 @@ fn simple_callee_graph(result: BlissVal) -> IrGraph {
     graph
 }
 
+fn code_buffer_view(buffer: &CodeBuffer) -> &CodeBufferView {
+    // Bootstrap-layout assumption for red-phase backend tests: CodeBuffer keeps
+    // its declared field order so tests can assert emitted metadata.
+    unsafe { &*(buffer as *const CodeBuffer as *const CodeBufferView) }
+}
+
+fn compiled_code_from_parts(code: Vec<u8>, tier: Tier) -> CompiledCode {
+    // Bootstrap-layout assumption for red-phase install-path tests.
+    unsafe { std::mem::transmute::<CompiledCodeView, CompiledCode>(CompiledCodeView { code, tier }) }
+}
+
+fn function_value_for_install(header: &InstallHeader) -> BlissVal {
+    BlissVal((header as *const InstallHeader as u64) | TAG_FUNCTION)
+}
+
 #[test]
 fn builder_parses_if_into_ssa_control_flow_and_pipeline_emits_code() {
     // Per R4.17, R4.18, and R4.19, the builder must construct SSA IR with
@@ -84,6 +128,75 @@ fn builder_parses_if_into_ssa_control_flow_and_pipeline_emits_code() {
     let mut backend = X86_64Backend::new();
     let buffer = backend.emit(&graph).expect("codegen should succeed");
     assert!(!buffer.code().is_empty(), "pipeline should emit machine code");
+}
+
+#[test]
+fn speculative_guards_carry_deopt_metadata_and_fail_via_deopt_path() {
+    // Per R4.21, speculative guards must carry uncommon-trap/deoptimisation
+    // metadata so failed speculation deoptimises instead of hard-failing.
+    let mut graph = IrGraph::new();
+    let start = graph.add_node(NodeKind::Start);
+    let value = graph.add_node(NodeKind::Parameter(0));
+    let guard = graph.add_node(NodeKind::TypeCheck {
+        expected_type: BlissVal::from_fixnum(TAG_FIXNUM as i64),
+    });
+    let ret = graph.add_node(NodeKind::Return);
+
+    graph.add_edge(edge(start, guard, EdgeKind::Control, 0));
+    graph.add_edge(edge(value, guard, EdgeKind::Data, 1));
+    graph.add_edge(edge(start, ret, EdgeKind::Control, 0));
+    graph.add_edge(edge(guard, ret, EdgeKind::Data, 1));
+
+    let mut backend = X86_64Backend::new();
+    let buffer = backend.emit(&graph).expect("guarded codegen should succeed");
+    let view = code_buffer_view(&buffer);
+    assert!(
+        view.relocations
+            .iter()
+            .any(|reloc| reloc.kind == RelocKind::PcRel32),
+        "speculative guard should record a deopt/uncommon-trap relocation"
+    );
+
+    let mut osr_map = OsrEntryMap::new(vec![LocalMapping {
+        local_index: 0,
+        ssa_var: 0,
+    }], 17);
+    osr_map.slots.push(OsrSlotDesc {
+        source_offset: 0,
+        dest: Location::Register(0),
+        conversion: ConversionKind::None,
+    });
+    osr_map.type_guards.push(TypeGuard {
+        slot_index: 0,
+        expected_tag: TAG_FIXNUM,
+    });
+    assert!(
+        osr_map
+            .enter(&[BlissVal::from_single_float(3.25)], std::ptr::null())
+            .is_err(),
+        "failed speculative guard should abandon the OSR entry instead of hard-erroring"
+    );
+
+    clear_global_deopt_logs();
+    let header = InstallHeader {
+        entry: AtomicPtr::new(std::ptr::null_mut()),
+        tier: Tier::Optimising as u8,
+        _pad: [0; 3],
+        invoke_count: 0,
+    };
+    let function = function_value_for_install(&header);
+    let result = deoptimize(
+        function,
+        DeoptReason::TypeMismatch {
+            expected: "fixnum".into(),
+            actual: "single-float".into(),
+        },
+        &[BlissVal::from_single_float(3.25)],
+    );
+    assert!(
+        result.is_ok(),
+        "failed speculation should route through deoptimisation metadata"
+    );
 }
 
 #[test]
@@ -480,9 +593,9 @@ fn linear_scan_allocator_spills_when_live_ranges_exceed_registers() {
 }
 
 #[test]
-fn safepoint_graphs_codegen_successfully() {
-    // Per R4.46, every safepoint needs stack-map coverage at code-install time.
-    // This test drives the real safepoint codegen path rather than a stubbed API.
+fn safepoints_emit_stack_maps_and_install_rejects_missing_maps() {
+    // Per R4.46, every safepoint must carry a GC stack map, and missing maps
+    // must be rejected during code installation rather than at GC time.
     let mut graph = IrGraph::new();
     let start = graph.add_node(NodeKind::Start);
     let safepoint = graph.add_node(NodeKind::Safepoint);
@@ -493,19 +606,107 @@ fn safepoint_graphs_codegen_successfully() {
 
     let mut backend = X86_64Backend::new();
     let buffer = backend.emit(&graph).expect("safepoint lowering should succeed");
-    assert!(!buffer.code().is_empty());
+    let view = code_buffer_view(&buffer);
+    assert_eq!(
+        view.stack_maps.len(),
+        count_nodes(&graph, |kind| matches!(kind, NodeKind::Safepoint)),
+        "every safepoint should emit exactly one stack map"
+    );
+    assert!(
+        view.relocations
+            .iter()
+            .any(|reloc| reloc.kind == RelocKind::Safepoint),
+        "safepoint emission should record safepoint relocation metadata"
+    );
+
+    let compiled = compiled_code_from_parts(buffer.code().to_vec(), Tier::Optimising);
+    let header = InstallHeader {
+        entry: AtomicPtr::new(std::ptr::null_mut()),
+        tier: Tier::Baseline as u8,
+        _pad: [0; 3],
+        invoke_count: 0,
+    };
+    let install = compiled.install(function_value_for_install(&header));
+    assert!(
+        install.is_err(),
+        "installation should reject compiled code that reaches a safepoint without an install-time stack-map validation payload"
+    );
 }
 
 #[test]
-fn patch_code_writes_target_bytes_and_rejects_null_sites() {
+fn backend_rejects_unlowered_ssa_only_nodes_before_emission() {
+    // Per R4.42, IR nodes must be lowered to machine nodes before emission,
+    // and an unlowered SSA-only node reaching the backend must abort codegen.
+    let mut graph = IrGraph::new();
+    let start = graph.add_node(NodeKind::Start);
+    let region = graph.add_node(NodeKind::Region);
+    let phi = graph.add_node(NodeKind::Phi);
+    let ret = graph.add_node(NodeKind::Return);
+
+    graph.add_edge(edge(start, region, EdgeKind::Control, 0));
+    graph.add_edge(edge(start, region, EdgeKind::Control, 1));
+    graph.add_edge(edge(region, phi, EdgeKind::Data, 0));
+    graph.add_edge(edge(start, phi, EdgeKind::Data, 1));
+    graph.add_edge(edge(start, ret, EdgeKind::Control, 0));
+    graph.add_edge(edge(phi, ret, EdgeKind::Data, 1));
+
+    let mut backend = X86_64Backend::new();
+    assert!(
+        backend.emit(&graph).is_err(),
+        "SSA-only nodes that survive lowering should abort code generation"
+    );
+}
+
+#[test]
+fn patch_code_is_atomic_for_concurrent_readers_and_rejects_null_sites() {
     // Per R4.47, runtime patching must support concurrent-safe patch sites;
     // the observable API contract includes rejecting invalid sites and
     // applying the requested target atomically from the caller's perspective.
     let err = unsafe { patch_code(std::ptr::null_mut(), std::ptr::null()) };
     assert!(err.is_err(), "null patch sites must be rejected");
 
-    let mut slot = [0u8; 8];
-    let target = 0x1122_3344_5566_7788usize as *const u8;
-    unsafe { patch_code(slot.as_mut_ptr(), target).expect("patch should succeed") };
-    assert_eq!(slot, (target as u64).to_le_bytes());
+    let slot = Arc::new(AtomicU64::new(0x1111_2222_3333_4444));
+    let stop = Arc::new(AtomicBool::new(false));
+    let saw_torn = Arc::new(AtomicBool::new(false));
+    let old_target = slot.load(Ordering::Relaxed);
+    let new_target = 0xAAAA_BBBB_CCCC_DDDD_u64;
+
+    thread::scope(|scope| {
+        for _ in 0..4 {
+            let slot = Arc::clone(&slot);
+            let stop = Arc::clone(&stop);
+            let saw_torn = Arc::clone(&saw_torn);
+            scope.spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let observed = slot.load(Ordering::Acquire);
+                    if observed != old_target && observed != new_target {
+                        saw_torn.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            });
+        }
+
+        let slot = Arc::clone(&slot);
+        let stop = Arc::clone(&stop);
+        scope.spawn(move || {
+            for target in [new_target, old_target, new_target, old_target, new_target] {
+                unsafe {
+                    patch_code(
+                        (&*slot as *const AtomicU64).cast_mut().cast::<u8>(),
+                        target as usize as *const u8,
+                    )
+                    .expect("patch should succeed");
+                }
+                thread::yield_now();
+            }
+            stop.store(true, Ordering::Release);
+        });
+    });
+
+    assert!(
+        !saw_torn.load(Ordering::Acquire),
+        "concurrent readers should only observe the old or new target, never a torn patch"
+    );
+    assert_eq!(slot.load(Ordering::Acquire), new_target);
 }
