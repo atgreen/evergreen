@@ -63,13 +63,9 @@ impl CliArgs {
                     }
                     i += 1;
                 }
-                "--eval" | "--load" | "--image" | "--no-image" | "--workers"
-                | "--heap-size" => {
+                s if is_forwarded_runtime_flag(s) => {
                     shared_args.push(arg.clone());
-                    if matches!(
-                        arg.as_str(),
-                        "--eval" | "--load" | "--image" | "--workers" | "--heap-size"
-                    ) {
+                    if runtime_flag_requires_value(arg) {
                         let value = args.get(i + 1).ok_or_else(|| {
                             BlissError::Internal(format!("{} requires a value", arg))
                         })?;
@@ -158,6 +154,40 @@ impl CliArgs {
         }
         Ok(r)
     }
+}
+
+fn is_forwarded_runtime_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--eval"
+            | "--load"
+            | "--image"
+            | "--no-image"
+            | "--workers"
+            | "--heap-size"
+            | "--tlab-size"
+            | "--nursery-size"
+            | "--stack-size"
+            | "--gc-log"
+            | "--jit-dump"
+            | "--log-level"
+    )
+}
+
+fn runtime_flag_requires_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--eval"
+            | "--load"
+            | "--image"
+            | "--workers"
+            | "--heap-size"
+            | "--tlab-size"
+            | "--nursery-size"
+            | "--stack-size"
+            | "--gc-log"
+            | "--log-level"
+    )
 }
 
 fn extract_size_arg(args: &[String], flag: &str) -> Option<String> {
@@ -3252,25 +3282,37 @@ fn run_script(path: &str) -> Result<i32, BlissError> {
     run_script_env(path, &mut env)
 }
 
+pub fn help_text() -> &'static str {
+    concat!(
+        "Usage: bliss [OPTIONS] [SCRIPT] [-- CL-ARGS...]\n",
+        "\n",
+        "Bliss Common Lisp\n",
+        "\n",
+        "Options:\n",
+        "  --help               Print this help message and exit\n",
+        "  --version            Print version information and exit\n",
+        "  --eval, -e EXPR      Evaluate EXPR and exit\n",
+        "  --load FILE          Load FILE and exit\n",
+        "  --image FILE         Path to the boot image\n",
+        "  --no-image           Start without loading an image\n",
+        "  --bootstrap          Bootstrap from lib/boot.lisp\n",
+        "  --workers N          Number of worker threads\n",
+        "  --heap-size SIZE     Heap size (e.g. 512M, 1G)\n",
+        "  --tlab-size SIZE     Per-thread TLAB size\n",
+        "  --nursery-size SIZE  Nursery size\n",
+        "  --stack-size SIZE    CL stack size per green thread\n",
+        "  --gc-log FILE        Write GC logs to FILE\n",
+        "  --jit-dump           Emit jitdump metadata\n",
+        "  --log-level LEVEL    Set log level (error|warn|info|debug|trace)\n",
+        "  --sandbox            Enable sandbox mode\n",
+        "  --no-init            Skip loading the init file\n",
+        "\n",
+        "Arguments after -- are passed through to CL as *command-line-args*.\n",
+    )
+}
+
 pub fn print_help() {
-    println!("Usage: bliss [OPTIONS] [SCRIPT] [-- CL-ARGS...]");
-    println!();
-    println!("Bliss Common Lisp");
-    println!();
-    println!("Options:");
-    println!("  --help               Print this help message and exit");
-    println!("  --version            Print version information and exit");
-    println!("  --eval, -e EXPR      Evaluate EXPR and exit");
-    println!("  --load FILE          Load FILE and exit");
-    println!("  --image FILE         Path to the boot image");
-    println!("  --no-image           Start without loading an image");
-    println!("  --bootstrap          Bootstrap from lib/boot.lisp");
-    println!("  --workers N          Number of worker threads");
-    println!("  --heap-size SIZE     Heap size (e.g. 512M, 1G)");
-    println!("  --sandbox            Enable sandbox mode");
-    println!("  --no-init            Skip loading the init file");
-    println!();
-    println!("Arguments after -- are passed through to CL as *command-line-args*.");
+    print!("{}", help_text());
 }
 
 pub fn print_version() {

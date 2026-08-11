@@ -103,6 +103,27 @@ fn parse_heap_size_flag() {
     assert_eq!(parsed.heap_size.as_deref(), Some("512M"));
 }
 
+#[test]
+fn parse_runtime_tuning_flags_are_forwarded() {
+    let parsed = CliArgs::parse(&args(&[
+        "--tlab-size",
+        "2M",
+        "--nursery-size",
+        "32M",
+        "--stack-size",
+        "1M",
+        "--gc-log",
+        "gc.log",
+        "--jit-dump",
+        "--log-level",
+        "debug",
+    ]))
+    .expect("runtime tuning flags should parse");
+    assert!(parsed.eval.is_none());
+    assert!(parsed.load.is_none());
+    assert!(parsed.cl_args.is_empty());
+}
+
 // ══════════════════════════════════════════════════════════════════
 // CliArgs::parse — positional & passthrough
 // ══════════════════════════════════════════════════════════════════
@@ -193,6 +214,20 @@ fn parse_workers_missing_value_is_error() {
 fn parse_heap_size_missing_value_is_error() {
     let result = CliArgs::parse(&args(&["--heap-size"]));
     assert!(result.is_err(), "--heap-size without value should fail");
+}
+
+#[test]
+fn parse_runtime_tuning_missing_value_is_error() {
+    for flag in [
+        "--tlab-size",
+        "--nursery-size",
+        "--stack-size",
+        "--gc-log",
+        "--log-level",
+    ] {
+        let result = CliArgs::parse(&args(&[flag]));
+        assert!(result.is_err(), "{} without value should fail", flag);
+    }
 }
 
 #[test]
@@ -299,6 +334,21 @@ fn run_with_help_returns_ok() {
 #[test]
 fn print_help_does_not_panic() {
     bliss_cli::cli::print_help();
+}
+
+#[test]
+fn help_text_mentions_runtime_flags() {
+    let help = bliss_cli::cli::help_text();
+    for flag in [
+        "--tlab-size",
+        "--nursery-size",
+        "--stack-size",
+        "--gc-log",
+        "--jit-dump",
+        "--log-level",
+    ] {
+        assert!(help.contains(flag), "help text should mention {}", flag);
+    }
 }
 
 #[test]

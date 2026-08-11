@@ -10,21 +10,22 @@ use bliss_rt::value::{BlissVal, NIL};
 
 /// Create a minimal RuntimeConfig suitable for testing.
 fn test_config() -> RuntimeConfig {
-    RuntimeConfig {
-        heap_size: 4 * 1024 * 1024, // 4 MB
-        nursery_size: 512 * 1024,   // 512 KB
-        stack_size: 64 * 1024,      // 64 KB
-        num_workers: 1,
-        image_path: None,
-        no_image: true,
-        eval_form: None,
-        load_file: None,
-        gc_log: None,
-        jit_dump: false,
-        safepoint_spin: 100,
-        ffi_pool_pages: 1,
-        log_level: LogLevel::Error,
-    }
+    let mut config = RuntimeConfig::from_env().expect("from_env");
+    config.heap_size = 4 * 1024 * 1024; // 4 MB
+    config.nursery_size = 512 * 1024; // 512 KB
+    config.tlab_size = 128 * 1024; // 128 KB
+    config.stack_size = 64 * 1024; // 64 KB
+    config.num_workers = 1;
+    config.image_path = None;
+    config.no_image = true;
+    config.eval_form = None;
+    config.load_file = None;
+    config.gc_log = None;
+    config.jit_dump = false;
+    config.safepoint_spin = 100;
+    config.ffi_pool_pages = 1;
+    config.log_level = LogLevel::Error;
+    config
 }
 
 // ══════════════════════════════════════════════════════════════════
