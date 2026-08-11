@@ -210,13 +210,12 @@ pub fn ic_generation() -> u64 {
 /// is stale. This is O(1) — no scanning of IC sites required (§4.8.8
 /// epoch-based bulk invalidation).
 ///
-/// # Panics
-///
-/// Panics if the global IC registry has not been initialised via
-/// `init_ic_registry()`.
-pub fn reset_all_caches() {
+pub fn reset_all_caches() -> Result<(), bliss_rt::error::BlissError> {
     if !IC_REGISTRY_INITIALIZED.load(Ordering::Acquire) {
-        panic!("reset_all_caches: global IC registry not yet initialized");
+        return Err(bliss_rt::error::BlissError::Internal(
+            "reset_all_caches: global IC registry not yet initialized".into(),
+        ));
     }
     IC_GENERATION.fetch_add(1, Ordering::Release);
+    Ok(())
 }

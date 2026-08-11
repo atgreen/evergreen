@@ -4,6 +4,7 @@
 use bliss_compiler::reader;
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{ConsCell, ObjectHeader, type_id};
+use bliss_rt::runtime::parse_cli as parse_runtime_cli;
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
 use std::cell::RefCell;
@@ -28,64 +29,113 @@ pub struct CliArgs {
     pub script: Option<String>,
 }
 
-fn take_value<'a>(
-    flag: &str,
-    iter: &mut impl Iterator<Item = &'a String>,
-) -> Result<String, BlissError> {
-    iter.next()
-        .cloned()
-        .ok_or_else(|| BlissError::Internal(format!("{} requires a value", flag)))
-}
-
 impl CliArgs {
     pub fn parse(args: &[String]) -> Result<Self, BlissError> {
-        let mut r = CliArgs {
-            image: None,
-            eval: None,
-            load: None,
-            no_image: false,
-            bootstrap: false,
-            workers: None,
-            heap_size: None,
-            help: false,
-            version: false,
-            sandbox: false,
-            no_init: false,
-            cl_args: Vec::new(),
-            script: None,
-        };
-        let mut iter = args.iter();
-        while let Some(arg) = iter.next() {
+        let mut shared_args = Vec::new();
+        let mut cl_args = Vec::new();
+        let mut bootstrap = false;
+        let mut sandbox = false;
+        let mut no_init = false;
+        let mut help = false;
+        let mut version = false;
+        let mut script = None;
+        let mut saw_double_dash = false;
+
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            if saw_double_dash {
+                cl_args.push(arg.clone());
+                i += 1;
+                continue;
+            }
+
             match arg.as_str() {
                 "--" => {
-                    r.cl_args = iter.cloned().collect();
-                    break;
+                    saw_double_dash = true;
+                    i += 1;
                 }
-                "--help" => r.help = true,
-                "--version" => r.version = true,
-                "--eval" | "-e" => r.eval = Some(take_value(arg, &mut iter)?),
-                "--load" => r.load = Some(take_value(arg, &mut iter)?),
-                "--image" => r.image = Some(take_value(arg, &mut iter)?),
-                "--no-image" => r.no_image = true,
-                "--bootstrap" => r.bootstrap = true,
-                "--sandbox" => r.sandbox = true,
-                "--no-init" => r.no_init = true,
-                "--workers" => {
-                    let v = take_value(arg, &mut iter)?;
-                    r.workers = Some(v.parse::<usize>().map_err(|_| {
-                        BlissError::Internal(format!(
-                            "--workers requires a numeric value, got: {}",
-                            v
-                        ))
-                    })?);
+                "--help" | "--version" => {
+                    if arg == "--help" {
+                        help = true;
+                    } else {
+                        version = true;
+                    }
+                    i += 1;
                 }
-                "--heap-size" => r.heap_size = Some(take_value(arg, &mut iter)?),
+                "--eval" | "--load" | "--image" | "--no-image" | "--workers"
+                | "--heap-size" => {
+                    shared_args.push(arg.clone());
+                    if matches!(
+                        arg.as_str(),
+                        "--eval" | "--load" | "--image" | "--workers" | "--heap-size"
+                    ) {
+                        let value = args.get(i + 1).ok_or_else(|| {
+                            BlissError::Internal(format!("{} requires a value", arg))
+                        })?;
+                        shared_args.push(value.clone());
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                "-e" => {
+                    shared_args.push("--eval".into());
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| BlissError::Internal("-e requires a value".into()))?;
+                    shared_args.push(value.clone());
+                    i += 2;
+                }
+                "--bootstrap" => {
+                    bootstrap = true;
+                    i += 1;
+                }
+                "--sandbox" => {
+                    sandbox = true;
+                    i += 1;
+                }
+                "--no-init" => {
+                    no_init = true;
+                    i += 1;
+                }
                 s if s.starts_with('-') => {
                     return Err(BlissError::Internal(format!("unknown flag: {}", s)));
                 }
-                _ => r.script = Some(arg.clone()),
+                _ => {
+                    if script.is_none() {
+                        script = Some(arg.clone());
+                    }
+                    i += 1;
+                }
             }
         }
+
+        let (config, runtime_cl_args) = parse_runtime_cli(&shared_args)?;
+        if !runtime_cl_args.is_empty() {
+            cl_args.extend(runtime_cl_args);
+        }
+
+        let r = CliArgs {
+            image: extract_flag_value(&shared_args, "--image"),
+            eval: config.eval_form.clone(),
+            load: config.load_file.clone(),
+            no_image: shared_args.iter().any(|arg| arg == "--no-image"),
+            bootstrap,
+            workers: extract_flag_value(&shared_args, "--workers")
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| {
+                    BlissError::Internal("--workers requires a numeric value".into())
+                })?,
+            heap_size: extract_size_arg(&shared_args, "--heap-size"),
+            help,
+            version,
+            sandbox,
+            no_init,
+            cl_args,
+            script,
+        };
         if r.image.is_some() && r.no_image {
             return Err(BlissError::Internal(
                 "--image and --no-image are contradictory".into(),
@@ -108,6 +158,20 @@ impl CliArgs {
         }
         Ok(r)
     }
+}
+
+fn extract_size_arg(args: &[String], flag: &str) -> Option<String> {
+    extract_flag_value(args, flag)
+}
+
+fn extract_flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find_map(|pair| {
+        if pair[0] == flag {
+            Some(pair[1].clone())
+        } else {
+            None
+        }
+    })
 }
 
 // ── Arena allocator (replaces Box::leak) ─────────────────────────

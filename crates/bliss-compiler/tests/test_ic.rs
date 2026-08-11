@@ -131,7 +131,7 @@ fn reset_all_caches_invalidates_existing_cache_via_generation() {
     let gen_before = ic_generation();
 
     // Bump the global generation — all existing ICs become stale.
-    reset_all_caches();
+    reset_all_caches().expect("reset_all_caches");
 
     let gen_after = ic_generation();
     assert!(

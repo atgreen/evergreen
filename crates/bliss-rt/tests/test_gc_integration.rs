@@ -17,7 +17,7 @@ use bliss_rt::value::{BlissVal, TAG_HEAP_OBJECT};
 
 /// Helper: create a Runtime with a small heap for integration tests.
 fn make_test_runtime() -> Runtime {
-    let mut cfg = RuntimeConfig::from_env();
+    let mut cfg = RuntimeConfig::from_env().expect("from_env");
     cfg.heap_size = 4 * 1024 * 1024;
     cfg.nursery_size = 1024 * 1024;
     cfg.stack_size = 64 * 1024;
@@ -125,7 +125,7 @@ fn heap_stats_nursery_plus_old_gen_equals_total_capacity() {
 
 #[test]
 fn runtime_gc_config_satisfies_init_heap_preconditions() {
-    let mut cfg = RuntimeConfig::from_env();
+    let mut cfg = RuntimeConfig::from_env().expect("from_env");
     cfg.heap_size = 8 * 1024 * 1024;
     cfg.nursery_size = 2 * 1024 * 1024;
     cfg.num_workers = 2;

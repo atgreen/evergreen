@@ -18,8 +18,10 @@ use std::rc::Rc;
 pub struct RuntimeConfig {
     /// Initial old-gen heap reservation (default: 512 MB).
     pub heap_size: usize,
-    /// Per-thread nursery (TLAB) size (default: 2 MB).
+    /// Total nursery region pool size (default: 64 MB).
     pub nursery_size: usize,
+    /// Per-thread TLAB size (default: 2 MB).
+    pub tlab_size: usize,
     /// CL stack size per green thread (default: 512 KiB).
     pub stack_size: usize,
     /// OS worker thread count (default: nproc).
@@ -61,105 +63,218 @@ fn available_parallelism() -> usize {
         .unwrap_or(1)
 }
 
+fn parse_size(value: &str, context: &str) -> Result<usize, BlissError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(BlissError::Internal(format!("{} requires a size value", context)));
+    }
+
+    let split_at = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, suffix) = trimmed.split_at(split_at);
+    if digits.is_empty() {
+        return Err(BlissError::Internal(format!(
+            "{} requires a numeric size, got: {}",
+            context, value
+        )));
+    }
+
+    let base = digits.parse::<usize>().map_err(|_| {
+        BlissError::Internal(format!(
+            "{} requires a numeric size, got: {}",
+            context, value
+        ))
+    })?;
+
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" => 1,
+        "k" => 1024,
+        "m" => 1024 * 1024,
+        "g" => 1024 * 1024 * 1024,
+        other => {
+            return Err(BlissError::Internal(format!(
+                "{} has unsupported size suffix '{}'",
+                context, other
+            )));
+        }
+    };
+
+    base.checked_mul(multiplier).ok_or_else(|| {
+        BlissError::Internal(format!(
+            "{} is too large to fit in usize: {}",
+            context, value
+        ))
+    })
+}
+
+fn parse_bool_flag(value: &str, context: &str) -> Result<bool, BlissError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        other => Err(BlissError::Internal(format!(
+            "{} requires a boolean-like value, got: {}",
+            context, other
+        ))),
+    }
+}
+
+fn parse_usize(value: &str, context: &str) -> Result<usize, BlissError> {
+    value.parse::<usize>().map_err(|_| {
+        BlissError::Internal(format!(
+            "{} requires a numeric value, got: {}",
+            context, value
+        ))
+    })
+}
+
+fn parse_log_level(value: &str, context: &str) -> Result<LogLevel, BlissError> {
+    match value.to_ascii_lowercase().as_str() {
+        "error" => Ok(LogLevel::Error),
+        "warn" => Ok(LogLevel::Warn),
+        "info" => Ok(LogLevel::Info),
+        "debug" => Ok(LogLevel::Debug),
+        "trace" => Ok(LogLevel::Trace),
+        other => Err(BlissError::Internal(format!(
+            "{} has unknown log level: {}",
+            context, other
+        ))),
+    }
+}
+
 impl RuntimeConfig {
     /// Parse configuration from environment variables.
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, BlissError> {
         let heap_size = std::env::var("BLISS_HEAP_SIZE")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .map(|s| parse_size(&s, "BLISS_HEAP_SIZE"))
+            .transpose()?
             .unwrap_or(512 * 1024 * 1024);
+        let tlab_size = std::env::var("BLISS_TLAB_SIZE")
+            .ok()
+            .map(|s| parse_size(&s, "BLISS_TLAB_SIZE"))
+            .transpose()?
+            .unwrap_or(2 * 1024 * 1024);
         let nursery_size = std::env::var("BLISS_NURSERY_SIZE")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2 * 1024 * 1024);
+            .map(|s| parse_size(&s, "BLISS_NURSERY_SIZE"))
+            .transpose()?
+            .unwrap_or(64 * 1024 * 1024);
         let stack_size = std::env::var("BLISS_STACK_SIZE")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .map(|s| parse_size(&s, "BLISS_STACK_SIZE"))
+            .transpose()?
             .unwrap_or(512 * 1024);
         let num_workers = std::env::var("BLISS_WORKERS")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .map(|s| parse_usize(&s, "BLISS_WORKERS"))
+            .transpose()?
             .unwrap_or_else(available_parallelism);
-        let log_level = match std::env::var("BLISS_LOG_LEVEL")
-            .unwrap_or_default()
-            .to_lowercase()
-            .as_str()
-        {
-            "error" => LogLevel::Error,
-            "warn" => LogLevel::Warn,
-            "debug" => LogLevel::Debug,
-            "trace" => LogLevel::Trace,
-            _ => LogLevel::Info,
-        };
+        let image_path = std::env::var("BLISS_IMAGE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some("bliss.bimg".into()));
+        let gc_log = std::env::var("BLISS_GC_LOG")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let jit_dump = std::env::var("BLISS_JIT_DUMP")
+            .ok()
+            .map(|s| parse_bool_flag(&s, "BLISS_JIT_DUMP"))
+            .transpose()?
+            .unwrap_or(false);
+        let safepoint_spin = std::env::var("BLISS_SAFEPOINT_SPIN")
+            .ok()
+            .map(|s| parse_usize(&s, "BLISS_SAFEPOINT_SPIN"))
+            .transpose()?
+            .unwrap_or(1000);
+        let ffi_pool_pages = std::env::var("BLISS_FFI_POOL_PAGES")
+            .ok()
+            .map(|s| parse_usize(&s, "BLISS_FFI_POOL_PAGES"))
+            .transpose()?
+            .unwrap_or(4);
+        let log_level = std::env::var("BLISS_LOG_LEVEL")
+            .ok()
+            .map(|s| parse_log_level(&s, "BLISS_LOG_LEVEL"))
+            .transpose()?
+            .unwrap_or(LogLevel::Info);
 
-        RuntimeConfig {
+        Ok(RuntimeConfig {
             heap_size,
             nursery_size,
+            tlab_size,
             stack_size,
             num_workers,
-            image_path: Some("bliss.bimg".into()),
+            image_path,
             no_image: false,
             eval_form: None,
             load_file: None,
-            gc_log: None,
-            jit_dump: false,
-            safepoint_spin: 1000,
-            ffi_pool_pages: 4,
+            gc_log,
+            jit_dump,
+            safepoint_spin,
+            ffi_pool_pages,
             log_level,
-        }
+        })
     }
 
     /// Apply CLI argument overrides.
-    pub fn apply_cli_args(&mut self, args: &[String]) {
+    pub fn apply_cli_args(&mut self, args: &[String]) -> Result<(), BlissError> {
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
                 "--eval" => {
                     if i + 1 >= args.len() {
-                        panic!("--eval requires an argument");
+                        return Err(BlissError::Internal("--eval requires an argument".into()));
                     }
                     self.eval_form = Some(args[i + 1].clone());
                     i += 2;
                 }
                 "--load" => {
                     if i + 1 >= args.len() {
-                        panic!("--load requires an argument");
+                        return Err(BlissError::Internal("--load requires an argument".into()));
                     }
                     self.load_file = Some(args[i + 1].clone());
                     i += 2;
                 }
                 "--heap-size" => {
                     if i + 1 >= args.len() {
-                        panic!("--heap-size requires an argument");
+                        return Err(BlissError::Internal("--heap-size requires an argument".into()));
                     }
-                    self.heap_size = args[i + 1].parse().expect("--heap-size: invalid number");
+                    self.heap_size = parse_size(&args[i + 1], "--heap-size")?;
+                    i += 2;
+                }
+                "--tlab-size" => {
+                    if i + 1 >= args.len() {
+                        return Err(BlissError::Internal("--tlab-size requires an argument".into()));
+                    }
+                    self.tlab_size = parse_size(&args[i + 1], "--tlab-size")?;
                     i += 2;
                 }
                 "--nursery-size" => {
                     if i + 1 >= args.len() {
-                        panic!("--nursery-size requires an argument");
+                        return Err(BlissError::Internal(
+                            "--nursery-size requires an argument".into(),
+                        ));
                     }
-                    self.nursery_size =
-                        args[i + 1].parse().expect("--nursery-size: invalid number");
+                    self.nursery_size = parse_size(&args[i + 1], "--nursery-size")?;
                     i += 2;
                 }
                 "--stack-size" => {
                     if i + 1 >= args.len() {
-                        panic!("--stack-size requires an argument");
+                        return Err(BlissError::Internal("--stack-size requires an argument".into()));
                     }
-                    self.stack_size = args[i + 1].parse().expect("--stack-size: invalid number");
+                    self.stack_size = parse_size(&args[i + 1], "--stack-size")?;
                     i += 2;
                 }
                 "--workers" => {
                     if i + 1 >= args.len() {
-                        panic!("--workers requires an argument");
+                        return Err(BlissError::Internal("--workers requires an argument".into()));
                     }
-                    self.num_workers = args[i + 1].parse().expect("--workers: invalid number");
+                    self.num_workers = parse_usize(&args[i + 1], "--workers")?;
                     i += 2;
                 }
                 "--image" => {
                     if i + 1 >= args.len() {
-                        panic!("--image requires an argument");
+                        return Err(BlissError::Internal("--image requires an argument".into()));
                     }
                     self.image_path = Some(args[i + 1].clone());
                     i += 2;
@@ -170,7 +285,7 @@ impl RuntimeConfig {
                 }
                 "--gc-log" => {
                     if i + 1 >= args.len() {
-                        panic!("--gc-log requires an argument");
+                        return Err(BlissError::Internal("--gc-log requires an argument".into()));
                     }
                     self.gc_log = Some(args[i + 1].clone());
                     i += 2;
@@ -181,23 +296,19 @@ impl RuntimeConfig {
                 }
                 "--log-level" => {
                     if i + 1 >= args.len() {
-                        panic!("--log-level requires an argument");
+                        return Err(BlissError::Internal(
+                            "--log-level requires an argument".into(),
+                        ));
                     }
-                    self.log_level = match args[i + 1].to_lowercase().as_str() {
-                        "error" => LogLevel::Error,
-                        "warn" => LogLevel::Warn,
-                        "info" => LogLevel::Info,
-                        "debug" => LogLevel::Debug,
-                        "trace" => LogLevel::Trace,
-                        other => panic!("unknown log level: {}", other),
-                    };
+                    self.log_level = parse_log_level(&args[i + 1], "--log-level")?;
                     i += 2;
                 }
                 flag => {
-                    panic!("unknown flag: {}", flag);
+                    return Err(BlissError::Internal(format!("unknown flag: {}", flag)));
                 }
             }
         }
+        Ok(())
     }
 
     /// Extract GC configuration subset.
@@ -206,7 +317,7 @@ impl RuntimeConfig {
         let nursery_size = self.nursery_size.min(self.heap_size);
         // Clamp region_size and tlab_size to fit within available space
         let region_size = (1024 * 1024usize).min(self.heap_size.max(1));
-        let tlab_size = (32 * 1024usize).min(region_size).max(1).next_power_of_two();
+        let tlab_size = self.tlab_size.min(region_size).max(1).next_power_of_two();
         // Ensure tlab_size is a power of two and fits in region
         let tlab_size = if tlab_size > region_size {
             // Find the largest power of two <= region_size
@@ -343,8 +454,8 @@ impl Runtime {
 
 /// Parse CLI arguments into arguments for the runtime and arguments
 /// to pass through to CL (after `--`).
-pub fn parse_cli(args: &[String]) -> (RuntimeConfig, Vec<String>) {
-    let mut config = RuntimeConfig::from_env();
+pub fn parse_cli(args: &[String]) -> Result<(RuntimeConfig, Vec<String>), BlissError> {
+    let mut config = RuntimeConfig::from_env()?;
     // Split at "--"
     let double_dash = args.iter().position(|a| a == "--");
     let (rt_args, cl_args) = match double_dash {
@@ -352,9 +463,9 @@ pub fn parse_cli(args: &[String]) -> (RuntimeConfig, Vec<String>) {
         None => (args, Vec::new()),
     };
     if !rt_args.is_empty() {
-        config.apply_cli_args(rt_args);
+        config.apply_cli_args(rt_args)?;
     }
-    (config, cl_args)
+    Ok((config, cl_args))
 }
 
 /// Global flag set by the SIGINT handler to indicate a user interrupt.

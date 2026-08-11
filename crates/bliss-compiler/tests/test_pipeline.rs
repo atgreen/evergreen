@@ -969,7 +969,7 @@ fn ic_generation_invalidation_with_compiled_code() {
     );
 
     // Simulate a class redefinition: bump global generation
-    reset_all_caches();
+    reset_all_caches().expect("reset_all_caches");
     let gen_after = ic_generation();
     assert!(
         gen_after > gen_before,
