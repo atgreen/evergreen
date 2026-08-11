@@ -1,5 +1,6 @@
 //! Comprehensive tests for `BlissVal` — the 64-bit tagged value type.
 
+use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::value::*;
 
 // 61-bit signed fixnum range
@@ -178,6 +179,23 @@ fn char_is_not_other_types() {
     assert!(!v.is_function());
     assert!(!v.is_nil());
     assert!(!v.is_list());
+}
+
+#[test]
+fn string_accessor_decodes_runtime_string_layout() {
+    let bytes = "hello, bliss".as_bytes();
+    let total = 16 + bytes.len();
+    let padded = (total + 7) & !7;
+    let mut storage = vec![0_u8; padded];
+    unsafe {
+        *(storage.as_mut_ptr() as *mut ObjectHeader) =
+            ObjectHeader::new(type_id::SIMPLE_BASE_STRING, (padded / 8) as u16);
+        *((storage.as_mut_ptr() as *mut u64).add(1)) = bytes.len() as u64;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), storage.as_mut_ptr().add(16), bytes.len());
+        let value = BlissVal::from_heap_ptr(storage.as_mut_ptr());
+        assert!(value.is_string());
+        assert_eq!(value.as_string(), "hello, bliss");
+    }
 }
 
 // ── Single-float constructors and extractors ───────────────────────

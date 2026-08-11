@@ -26,6 +26,12 @@ thread_local! {
     static CURRENT_STORE: RefCell<Option<Rc<RefCell<PackageStore>>>> = const { RefCell::new(None) };
 }
 
+fn swap_current_store(
+    new_store: Option<Rc<RefCell<PackageStore>>>,
+) -> Option<Rc<RefCell<PackageStore>>> {
+    CURRENT_STORE.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), new_store))
+}
+
 struct PackageStore {
     packages: HashMap<i64, Package>,
     /// Map from name/nickname → package id for fast lookup.
@@ -127,16 +133,30 @@ where
 /// first registry's data is still accessible via its methods).
 pub struct PackageRegistry {
     store: Rc<RefCell<PackageStore>>,
+    previous_store: Option<Rc<RefCell<PackageStore>>>,
+}
+
+/// Scoped activation guard for the thread-local package registry.
+pub struct ActivePackageRegistryGuard {
+    previous_store: Option<Rc<RefCell<PackageStore>>>,
 }
 
 impl PackageRegistry {
     /// Create a new empty registry and install it as the current store for this thread.
     pub fn new() -> Self {
         let store = Rc::new(RefCell::new(PackageStore::new()));
-        CURRENT_STORE.with(|cell| {
-            *cell.borrow_mut() = Some(Rc::clone(&store));
-        });
-        PackageRegistry { store }
+        let previous_store = swap_current_store(Some(Rc::clone(&store)));
+        PackageRegistry {
+            store,
+            previous_store,
+        }
+    }
+
+    /// Install this registry as the current thread-local registry until the returned
+    /// guard is dropped.
+    pub fn activate(&self) -> ActivePackageRegistryGuard {
+        let previous_store = swap_current_store(Some(Rc::clone(&self.store)));
+        ActivePackageRegistryGuard { previous_store }
     }
 
     /// Initialize with the standard packages (CL, CL-USER, KEYWORD, BLISS, etc.).
@@ -368,6 +388,27 @@ impl PackageRegistry {
 impl Default for PackageRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for PackageRegistry {
+    fn drop(&mut self) {
+        CURRENT_STORE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|current| Rc::ptr_eq(current, &self.store))
+            {
+                *slot = self.previous_store.take();
+            }
+        });
+    }
+}
+
+impl Drop for ActivePackageRegistryGuard {
+    fn drop(&mut self) {
+        let previous_store = self.previous_store.take();
+        let _ = swap_current_store(previous_store);
     }
 }
 

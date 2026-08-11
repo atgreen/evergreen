@@ -228,3 +228,50 @@ fn make_package_with_use_list_inherits() {
         "symbol from use_list should have Inherited status"
     );
 }
+
+#[test]
+fn dropping_temporary_registry_restores_previous_active_store() {
+    let mut outer = fresh_registry();
+    let outer_pkg = outer.make_package("OUTER-PKG", &[], &[]).unwrap();
+    let (outer_sym, _) = intern("OUTER-SYM", outer_pkg).unwrap();
+
+    {
+        let mut inner = fresh_registry();
+        let inner_pkg = inner.make_package("INNER-PKG", &[], &[]).unwrap();
+        let (inner_sym, _) = intern("INNER-SYM", inner_pkg).unwrap();
+        assert_eq!(
+            find_symbol("INNER-SYM", inner_pkg).unwrap(),
+            Some((inner_sym, InternStatus::Internal))
+        );
+    }
+
+    assert_eq!(
+        find_symbol("OUTER-SYM", outer_pkg).unwrap(),
+        Some((outer_sym, InternStatus::Internal))
+    );
+}
+
+#[test]
+fn activation_guard_restores_previous_active_store() {
+    let mut outer = fresh_registry();
+    let outer_pkg = outer.make_package("GUARD-OUTER", &[], &[]).unwrap();
+    let (outer_sym, _) = intern("VISIBLE-OUTER", outer_pkg).unwrap();
+
+    let mut inner = PackageRegistry::new();
+    inner.init_standard_packages().unwrap();
+    let inner_pkg = inner.make_package("GUARD-INNER", &[], &[]).unwrap();
+    let (inner_sym, _) = intern("VISIBLE-INNER", inner_pkg).unwrap();
+
+    {
+        let _guard = outer.activate();
+        assert_eq!(
+            find_symbol("VISIBLE-OUTER", outer_pkg).unwrap(),
+            Some((outer_sym, InternStatus::Internal))
+        );
+    }
+
+    assert_eq!(
+        find_symbol("VISIBLE-INNER", inner_pkg).unwrap(),
+        Some((inner_sym, InternStatus::Internal))
+    );
+}

@@ -219,6 +219,20 @@ impl BlissVal {
         (self.0 >> 3) as u32
     }
 
+    /// Extract a heap string as a Rust `String`.
+    ///
+    /// Bliss currently stores simple strings as an object header, a u64 byte
+    /// length, and then UTF-8 bytes starting at offset 16.
+    pub fn as_string(self) -> String {
+        assert!(self.is_string(), "as_string called on non-string value");
+        unsafe {
+            let ptr = self.as_ptr();
+            let len = *((ptr as *const u64).add(1)) as usize;
+            let bytes = std::slice::from_raw_parts(ptr.add(16), len);
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+    }
+
     /// Extract the raw pointer (mask off tag bits).
     ///
     /// # Safety
