@@ -18,8 +18,8 @@ fn ic_state_variants_distinct_and_copy() {
 }
 
 #[test]
-fn ic_poly_max_is_four() {
-    assert_eq!(IC_POLY_MAX, 4);
+fn ic_poly_max_is_eight() {
+    assert_eq!(IC_POLY_MAX, 8);
 }
 
 // ── IcEntry struct ────────────────────────────────────────────────

@@ -7,9 +7,13 @@ use bliss_compiler::osr::{
 use bliss_compiler::profiling::{
     BackEdgeCounter, FunctionProfile, InvocationCounter, TYPE_PROFILE_MAX_ENTRIES,
 };
-use bliss_compiler::tiered::{FnMeta, Tier, TierConfig, check_promotion, pop_compilation_request, request_compilation};
-use bliss_rt::value::{BlissVal, NIL, TAG_FIXNUM};
+use bliss_compiler::tiered::{
+    FLAG_T2_FAILED, FnMeta, Interpreter, Tier, TierConfig, check_promotion,
+    pop_compilation_request, process_compilation_request, request_compilation,
+};
+use bliss_rt::value::{BlissVal, NIL, T, TAG_FIXNUM};
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 fn make_function() -> (BlissVal, &'static FnMeta) {
     let meta = Box::leak(Box::new(FnMeta::new(0, BlissVal::from_fixnum(0), NIL)));
@@ -20,6 +24,22 @@ fn make_function() -> (BlissVal, &'static FnMeta) {
 
 fn drain_queue() {
     while pop_compilation_request().is_some() {}
+}
+
+fn env_threshold_helper() {
+    let mut interpreter = Interpreter::new();
+    let (function, meta) = make_function();
+    for _ in 0..3 {
+        let value = interpreter
+            .apply(function, NIL)
+            .expect("helper process should be able to call the fixture through T0");
+        assert_eq!(value, BlissVal::from_fixnum(0));
+    }
+    assert_eq!(
+        meta.tier.load(Ordering::Acquire),
+        Tier::Baseline as u8,
+        "BLISS_T0_T1_THRESHOLD=3 should promote on the third call in a fresh process"
+    );
 }
 
 #[test]
@@ -50,6 +70,66 @@ fn tiered_promotion_uses_invocation_and_loop_heat_thresholds_from_spec() {
         check_promotion(function, &config),
         Some(Tier::Optimising),
         "loop heat alone should make a T1 function eligible for T2"
+    );
+}
+
+#[test]
+fn t2_compile_failure_keeps_t1_entry_and_marks_failure() {
+    // Per R4.28, if T2 compilation fails then the function must remain at T1,
+    // keep its existing entry point, and record the failure for logging/reporting.
+    drain_queue();
+    let (function, meta) = make_function();
+    let mut interpreter = Interpreter::new();
+    for _ in 0..10 {
+        interpreter
+            .apply(function, NIL)
+            .expect("real calls should synchronously promote the fixture to T1");
+    }
+    let t1_entry = meta.entry.load(Ordering::Acquire);
+    assert_eq!(meta.tier.load(Ordering::Acquire), Tier::Baseline as u8);
+
+    request_compilation(function, Tier::Optimising)
+        .expect("queueing the T2 compilation attempt should succeed");
+    assert!(process_compilation_request());
+    assert_eq!(
+        meta.tier.load(Ordering::Acquire),
+        Tier::Baseline as u8,
+        "a failed T2 compile must leave the function executing at T1"
+    );
+    assert_eq!(
+        meta.entry.load(Ordering::Acquire),
+        t1_entry,
+        "a failed T2 compile must not clobber the published T1 entry point"
+    );
+    assert_ne!(
+        meta.flags.load(Ordering::Acquire) & FLAG_T2_FAILED,
+        0,
+        "failed T2 compilation should set persistent failure metadata for logging/reporting"
+    );
+}
+
+#[test]
+fn startup_environment_configures_tier_thresholds() {
+    // Per R4.29, tier thresholds must be configurable at startup from
+    // BLISS_T0_T1_THRESHOLD, BLISS_T1_T2_THRESHOLD, and BLISS_LOOP_HEAT_THRESHOLD.
+    if std::env::var_os("BLISS_ENV_THRESHOLD_HELPER").is_some() {
+        env_threshold_helper();
+        return;
+    }
+
+    let status = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        .arg("--exact")
+        .arg("startup_environment_configures_tier_thresholds")
+        .arg("--nocapture")
+        .env("BLISS_ENV_THRESHOLD_HELPER", "1")
+        .env("BLISS_T0_T1_THRESHOLD", "3")
+        .env("BLISS_T1_T2_THRESHOLD", "4")
+        .env("BLISS_LOOP_HEAT_THRESHOLD", "5")
+        .status()
+        .expect("helper process should launch");
+    assert!(
+        status.success(),
+        "startup tier-threshold environment variables should affect promotion in a fresh process"
     );
 }
 
@@ -89,6 +169,74 @@ fn compilation_queue_is_bounded_and_prioritises_hotter_requests() {
         popped, 64,
         "spec queue bound is 64 entries; overflow requests should be dropped"
     );
+}
+
+#[test]
+fn deopt_at_safepoint_restores_equivalent_interpreter_frame() {
+    // Per R4.39, deoptimisation at a GC safepoint must reconstruct a
+    // semantically equivalent interpreter frame within one poll interval.
+    clear_global_deopt_logs();
+    let (function, _) = make_function();
+    let live_values = [BlissVal::from_fixnum(7), NIL, T];
+    let deopt = deoptimize(
+        function,
+        DeoptReason::TypeMismatch {
+            expected: "fixnum".into(),
+            actual: "symbol".into(),
+        },
+        &live_values,
+    )
+    .expect("deoptimisation should reconstruct interpreter state at the safepoint");
+
+    assert_eq!(deopt.frame_locals, live_values);
+    assert_eq!(deopt.total_deopts, 1);
+    assert!(
+        !deopt.blacklisted,
+        "the first safepoint deoptimisation should restore the frame without blacklisting"
+    );
+}
+
+#[test]
+fn osr_and_deopt_keep_gc_visible_state_walkable_during_transition() {
+    // Per R4.41, OSR entry and deoptimisation must reach a safepoint before
+    // stack-shape changes and the replacement frame must remain GC-walkable.
+    let (function, _) = make_function();
+    let map = OsrEntryMap {
+        mappings: vec![
+            LocalMapping {
+                local_index: 0,
+                ssa_var: 1,
+            },
+            LocalMapping {
+                local_index: 1,
+                ssa_var: 2,
+            },
+        ],
+        target_pc_offset: 13,
+        slots: vec![
+            OsrSlotDesc {
+                source_offset: 0,
+                dest: Location::StackOffset(0),
+                conversion: ConversionKind::None,
+            },
+            OsrSlotDesc {
+                source_offset: 8,
+                dest: Location::StackOffset(8),
+                conversion: ConversionKind::None,
+            },
+        ],
+        live_ref_bitmap: vec![0b0000_0011],
+        type_guards: vec![],
+    };
+    let locals = [NIL, T];
+    let entered = osr_entry(function, &map, &locals)
+        .expect("OSR should expose a fully mapped replacement frame at the safepoint");
+    assert_eq!(entered.mapped_values, vec![(1, NIL), (2, T)]);
+    assert_eq!(map.live_ref_bitmap, vec![0b0000_0011]);
+
+    let deopt = deoptimize(function, DeoptReason::InlineCacheOverflow, &locals)
+        .expect("deopt should hand GC-visible locals back to the interpreter");
+    assert_eq!(deopt.frame_locals, locals);
 }
 
 #[test]
@@ -192,6 +340,28 @@ fn deopt_log_keeps_recent_ring_and_records_reason_counts() {
 }
 
 #[test]
+fn scheduler_reads_hot_counters_through_lock_free_metadata_loads() {
+    // Per R4.55, the compilation scheduler must read hotness counters with
+    // lock-free atomic loads rather than a mutex or CAS loop.
+    let (function, meta) = make_function();
+    let config = TierConfig {
+        t1_threshold: 10,
+        t2_threshold: 5_000,
+        osr_threshold: 10_000,
+        compile_threads: 1,
+    };
+    meta.tier.store(Tier::Baseline as u8, Ordering::Release);
+    meta.invoke_count.store(5_000, Ordering::Relaxed);
+    meta.back_edge_count.store(10_000, Ordering::Relaxed);
+
+    for _ in 0..32 {
+        assert_eq!(check_promotion(function, &config), Some(Tier::Optimising));
+        assert_eq!(meta.invoke_count.load(Ordering::Relaxed), 5_000);
+        assert_eq!(meta.back_edge_count.load(Ordering::Relaxed), 10_000);
+    }
+}
+
+#[test]
 fn inline_cache_follows_spec_state_machine_and_bulk_invalidation() {
     // Per R4.48, dynamic dispatch sites must be backed by an inline cache.
     // Per R4.49, the IC supports monomorphic -> polymorphic (<= 8) -> megamorphic.
@@ -266,5 +436,46 @@ fn profiling_records_hotness_and_fixed_size_type_profile_ring() {
         profile.invocation_counter().count(),
         0,
         "function profiles should expose the real invocation counter object"
+    );
+}
+
+#[test]
+fn profiling_overhead_stays_within_budget_on_counter_workload() {
+    // Per R4.58, counter increments plus type recording must stay within
+    // a 5% wall-clock slowdown versus profiling-disabled execution.
+    fn baseline_loop(iterations: usize) -> u128 {
+        let started = Instant::now();
+        let mut acc = 0usize;
+        for idx in 0..iterations {
+            acc = std::hint::black_box(acc.wrapping_add(idx));
+        }
+        std::hint::black_box(acc);
+        started.elapsed().as_nanos()
+    }
+
+    fn profiled_loop(iterations: usize) -> u128 {
+        let invocation = InvocationCounter::new();
+        let back_edge = BackEdgeCounter::new();
+        let mut profile = FunctionProfile::new();
+        profile.add_type_profile(1);
+        let site = profile
+            .type_profile(1)
+            .expect("call-site profile should exist for the overhead fixture");
+
+        let started = Instant::now();
+        for idx in 0..iterations {
+            let _ = invocation.increment(u32::MAX);
+            let _ = back_edge.increment(u32::MAX);
+            site.record(BlissVal::from_fixnum((idx % 4) as i64));
+        }
+        started.elapsed().as_nanos()
+    }
+
+    let iterations = 50_000;
+    let baseline = baseline_loop(iterations);
+    let profiled = profiled_loop(iterations);
+    assert!(
+        profiled * 100 <= baseline * 105,
+        "profiling budget exceeded: baseline={baseline}ns profiled={profiled}ns"
     );
 }

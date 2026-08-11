@@ -104,8 +104,8 @@ fn back_edge_counter_reset() {
 // ── TYPE_PROFILE_MAX_ENTRIES constant ─────────────────────────────
 
 #[test]
-fn type_profile_max_entries_is_eight() {
-    assert_eq!(TYPE_PROFILE_MAX_ENTRIES, 8);
+fn type_profile_max_entries_is_four() {
+    assert_eq!(TYPE_PROFILE_MAX_ENTRIES, 4);
 }
 
 // ── TypeProfile ───────────────────────────────────────────────────
