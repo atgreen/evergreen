@@ -537,20 +537,26 @@ struct HandlerEntry {
 
 impl Env {
     fn new(sandbox: bool) -> Self {
-        Env {
+        let mut packages = HashMap::new();
+        seed_standard_packages(&mut packages);
+        let mut env = Env {
             frame: Rc::new(RefCell::new(EnvFrame::default())),
             funs: Rc::new(HashMap::new()),
             macros: Rc::new(HashMap::new()),
             classes: Rc::new(HashMap::new()),
             methods: Rc::new(HashMap::new()),
-            packages: Rc::new(HashMap::new()),
-            current_package: "CL-USER".to_string(),
+            packages: Rc::new(packages),
+            current_package: "COMMON-LISP-USER".to_string(),
             sandbox,
             restarts: Vec::new(),
             handlers: Vec::new(),
             mv: Vec::new(),
             closures: Rc::new(HashMap::new()),
-        }
+        };
+        env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
+        env.define_local("*LOAD-HOOKS*", NIL);
+        env.define_local("*FEATURES*", NIL);
+        env
     }
 
     /// Create a child environment that shares global definitions (funs, macros,
@@ -642,6 +648,28 @@ impl Env {
         }
         out.extend(vars);
     }
+}
+
+fn seed_standard_packages(packages: &mut HashMap<String, PackageDef>) {
+    for (name, uses) in [
+        ("COMMON-LISP", Vec::<String>::new()),
+        ("COMMON-LISP-USER", vec!["COMMON-LISP".to_string()]),
+        ("KEYWORD", Vec::<String>::new()),
+        ("BLISS-INTERNAL", Vec::<String>::new()),
+        ("BLISS-EXT", vec!["COMMON-LISP".to_string()]),
+    ] {
+        packages.insert(
+            name.to_string(),
+            PackageDef {
+                name: name.to_string(),
+                exports: Vec::new(),
+                uses,
+                symbols: HashMap::new(),
+            },
+        );
+        reader::register_package(name);
+    }
+    reader::register_package("CL-USER");
 }
 
 // ── BlissVal printer ──────────────────────────────────────────────
@@ -1009,18 +1037,35 @@ fn default_asdf_output_translations() -> String {
     format!("{home}/.cache/bliss/asdf/")
 }
 
+fn ensure_package_available(env: &mut Env, name: &str, uses: &[&str]) {
+    let mut packages = Rc::make_mut(&mut env.packages);
+    packages.entry(name.to_string()).or_insert_with(|| PackageDef {
+        name: name.to_string(),
+        exports: Vec::new(),
+        uses: uses.iter().map(|pkg| (*pkg).to_string()).collect(),
+        symbols: HashMap::new(),
+    });
+    reader::register_package(name);
+}
+
+fn ensure_bundled_asdf_bootstrap_bindings(env: &mut Env) {
+    ensure_package_available(env, "BLISS-EXT", &["COMMON-LISP"]);
+    ensure_package_available(env, "ASDF", &["COMMON-LISP", "BLISS-EXT"]);
+    env.define_local(
+        "BLISS-EXT:*ASDF-OUTPUT-TRANSLATIONS*",
+        arena_str(&default_asdf_output_translations()),
+    );
+    env.define_local("ASDF:*LAST-OPERATION-TIER*", arena_str("T1"));
+}
+
 fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
-    if maybe_load_bundled_asdf(path, &contents, env) {
-        env.define_local(
-            "BLISS-EXT:*ASDF-OUTPUT-TRANSLATIONS*",
-            arena_str(&default_asdf_output_translations()),
-        );
-        env.define_local("ASDF:*LAST-OPERATION-TIER*", arena_str("T1"));
-        return Ok(T);
+    if Path::new(path) == Path::new(&bundled_asdf_path()) {
+        ensure_bundled_asdf_bootstrap_bindings(env);
     }
-    read_eval_all_env(&contents, env)
+    let result = read_eval_all_env(&contents, env)?;
+    Ok(result)
 }
 
 fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -1699,6 +1744,38 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(vec_to_list(&results));
             }
+            "FIND" => {
+                let (item_form, r) = cp(cdr);
+                let (seq_form, mut rest) = cp(r);
+                let item = eval_form(item_form, env)?;
+                let seq = eval_form(seq_form, env)?;
+                let mut test = NIL;
+                let mut key = None;
+                let mut start = 0usize;
+                let mut end = None;
+                let mut from_end = false;
+                while rest.is_cons() {
+                    let (kw, r2) = cp(rest);
+                    if !r2.is_cons() {
+                        break;
+                    }
+                    let (value_form, r3) = cp(r2);
+                    let value = eval_form(value_form, env)?;
+                    if kw.is_symbol() {
+                        let name = sym_name(kw);
+                        match name.strip_prefix("KEYWORD:").unwrap_or(&name) {
+                            "TEST" => test = value,
+                            "KEY" => key = Some(value),
+                            "START" => start = num_val(value)? as usize,
+                            "END" => end = Some(num_val(value)? as usize),
+                            "FROM-END" => from_end = !value.is_nil(),
+                            _ => {}
+                        }
+                    }
+                    rest = r3;
+                }
+                return bliss_stdlib::find(item, seq, test, key, start, end, from_end);
+            }
             "MEMBER" => {
                 let (item_f, r) = cp(cdr);
                 let (list_f, _) = cp(r);
@@ -2366,6 +2443,9 @@ fn is_loop_keyword(bare: &str) -> bool {
             | "FOR"
             | "IN"
             | "ON"
+            | "BEING"
+            | "THE"
+            | "OF"
             | "THEN"
             | "WHEN"
             | "IF"
@@ -2381,6 +2461,7 @@ fn is_loop_keyword(bare: &str) -> bool {
             | "DO"
             | "DOING"
             | "RETURN"
+            | "THEREIS"
             | "INTO"
             | "FINALLY"
             | "INITIALLY"
@@ -2396,6 +2477,7 @@ enum LoopClause {
     Collect(BlissVal, Option<String>),
     Append(BlissVal, Option<String>),
     Return(BlissVal),
+    ThereIs(BlissVal),
     Cond {
         test: BlissVal,
         negate: bool,
@@ -2476,6 +2558,7 @@ impl LoopParser {
             }
             "DO" | "DOING" => Ok(LoopClause::Do(self.read_forms())),
             "RETURN" => Ok(LoopClause::Return(self.read_form()?)),
+            "THEREIS" => Ok(LoopClause::ThereIs(self.read_form()?)),
             "WHEN" | "IF" => self.parse_cond(false),
             "UNLESS" => self.parse_cond(true),
             other => Err(BlissError::Internal(format!(
@@ -2599,6 +2682,12 @@ fn loop_exec_clause(
         LoopClause::Return(e) => {
             *ret = Some(eval_form(*e, env)?);
         }
+        LoopClause::ThereIs(e) => {
+            let v = eval_form(*e, env)?;
+            if !v.is_nil() {
+                *ret = Some(v);
+            }
+        }
         LoopClause::Collect(e, into) => {
             let v = eval_form(*e, env)?;
             accs.collect(into.clone(), v);
@@ -2659,6 +2748,20 @@ enum ForClause {
         init: BlissVal,
         then: Option<BlissVal>,
     },
+    From {
+        pat: BlissVal,
+        start: BlissVal,
+        step: Option<BlissVal>,
+        limit: Option<(LoopForLimit, BlissVal)>,
+    },
+    Across {
+        pat: BlissVal,
+        seq_form: BlissVal,
+    },
+    Being {
+        pat: BlissVal,
+        source: LoopBeingSource,
+    },
 }
 
 /// Runtime cursor for a `:for` clause.
@@ -2677,6 +2780,37 @@ enum ForState {
         init: BlissVal,
         then: Option<BlissVal>,
     },
+    From {
+        pat: BlissVal,
+        current: BlissVal,
+        step: BlissVal,
+        limit: Option<(LoopForLimit, BlissVal)>,
+    },
+    Across {
+        pat: BlissVal,
+        items: Vec<BlissVal>,
+        idx: usize,
+    },
+    Being {
+        pat: BlissVal,
+        items: Vec<BlissVal>,
+        idx: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum LoopForLimit {
+    Below,
+    To,
+    Upto,
+    Above,
+    Downto,
+}
+
+enum LoopBeingSource {
+    Symbols(BlissVal),
+    HashKeys(BlissVal),
+    HashValues(BlissVal),
 }
 
 fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -2754,12 +2888,132 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         let list_form = p.read_form()?;
                         for_clauses.push(ForClause::On { pat, list_form });
                     }
+                    Some("ACROSS") => {
+                        p.advance();
+                        let seq_form = p.read_form()?;
+                        for_clauses.push(ForClause::Across { pat, seq_form });
+                    }
+                    Some("BEING") => {
+                        p.advance();
+                        if p.at_kw("THE") {
+                            p.advance();
+                        }
+                        let kind = p.read_form()?;
+                        let kind_name = if kind.is_symbol() {
+                            sym_name(kind)
+                        } else {
+                            String::new()
+                        };
+                        let kind_bare = kind_name.strip_prefix("KEYWORD:").unwrap_or(&kind_name);
+                        let source = match kind_bare {
+                            "SYMBOLS" => {
+                                let in_kw = p.read_form()?;
+                                let in_name = if in_kw.is_symbol() {
+                                    sym_name(in_kw)
+                                } else {
+                                    String::new()
+                                };
+                                if in_name.strip_prefix("KEYWORD:").unwrap_or(&in_name) != "IN" {
+                                    return Err(BlissError::Internal(
+                                        "LOOP :for ... :being :the :symbols expects :in".into(),
+                                    ));
+                                }
+                                LoopBeingSource::Symbols(p.read_form()?)
+                            }
+                            "HASH-KEYS" => {
+                                let of_kw = p.read_form()?;
+                                let of_name = if of_kw.is_symbol() {
+                                    sym_name(of_kw)
+                                } else {
+                                    String::new()
+                                };
+                                if of_name.strip_prefix("KEYWORD:").unwrap_or(&of_name) != "OF" {
+                                    return Err(BlissError::Internal(
+                                        "LOOP :for ... :being :the :hash-keys expects :of"
+                                            .into(),
+                                    ));
+                                }
+                                LoopBeingSource::HashKeys(p.read_form()?)
+                            }
+                            "HASH-VALUES" => {
+                                let of_kw = p.read_form()?;
+                                let of_name = if of_kw.is_symbol() {
+                                    sym_name(of_kw)
+                                } else {
+                                    String::new()
+                                };
+                                if of_name.strip_prefix("KEYWORD:").unwrap_or(&of_name) != "OF" {
+                                    return Err(BlissError::Internal(
+                                        "LOOP :for ... :being :the :hash-values expects :of"
+                                            .into(),
+                                    ));
+                                }
+                                LoopBeingSource::HashValues(p.read_form()?)
+                            }
+                            _ => {
+                                return Err(BlissError::Internal(
+                                    "LOOP :for ... :being supports :symbols / :hash-keys / :hash-values in the bootstrap"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        for_clauses.push(ForClause::Being { pat, source });
+                    }
+                    Some("FROM") => {
+                        p.advance();
+                        let start = p.read_form()?;
+                        let mut step = None;
+                        let mut limit = None;
+                        loop {
+                            match p.peek_kw().as_deref() {
+                                Some("BY") => {
+                                    p.advance();
+                                    step = Some(p.read_form()?);
+                                }
+                                Some("BELOW") => {
+                                    p.advance();
+                                    limit = Some((LoopForLimit::Below, p.read_form()?));
+                                }
+                                Some("TO") => {
+                                    p.advance();
+                                    limit = Some((LoopForLimit::To, p.read_form()?));
+                                }
+                                Some("UPTO") => {
+                                    p.advance();
+                                    limit = Some((LoopForLimit::Upto, p.read_form()?));
+                                }
+                                Some("ABOVE") => {
+                                    p.advance();
+                                    limit = Some((LoopForLimit::Above, p.read_form()?));
+                                }
+                                Some("DOWNTO") => {
+                                    p.advance();
+                                    limit = Some((LoopForLimit::Downto, p.read_form()?));
+                                }
+                                _ => break,
+                            }
+                        }
+                        for_clauses.push(ForClause::From {
+                            pat,
+                            start,
+                            step,
+                            limit,
+                        });
+                    }
                     _ => {
                         // :for var = init [:then step]
                         let eq = p.read_form()?;
                         if !(eq.is_symbol() && sym_name(eq) == "=") {
+                            let found = if eq.is_symbol() {
+                                sym_name(eq)
+                            } else {
+                                format!("{:?}", eq)
+                            };
                             return Err(BlissError::Internal(
-                                "LOOP :for supports :in / :on / = in the bootstrap".into(),
+                                format!(
+                                    "LOOP :for supports :in / :on / :across / :being / :from / = in the bootstrap (got {})",
+                                    found
+                                ),
                             ));
                         }
                         let init = p.read_form()?;
@@ -2836,6 +3090,74 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     init: *init,
                     then: *then,
                 }),
+                ForClause::From {
+                    pat,
+                    start,
+                    step,
+                    limit,
+                } => {
+                    let current = eval_form(*start, &mut lenv)?;
+                    let step = match step {
+                        Some(expr) => eval_form(*expr, &mut lenv)?,
+                        None => BlissVal::from_fixnum(1),
+                    };
+                    let limit = match limit {
+                        Some((kind, expr)) => Some((*kind, eval_form(*expr, &mut lenv)?)),
+                        None => None,
+                    };
+                    states.push(ForState::From {
+                        pat: *pat,
+                        current,
+                        step,
+                        limit,
+                    });
+                    has_stepping_driver = true;
+                }
+                ForClause::Across { pat, seq_form } => {
+                    let seq = eval_form(*seq_form, &mut lenv)?;
+                    let items = if seq.is_cons() || seq.is_nil() {
+                        list_to_vec(seq)
+                    } else {
+                        val_as_str(seq)
+                            .chars()
+                            .map(BlissVal::from_char)
+                            .collect::<Vec<_>>()
+                    };
+                    states.push(ForState::Across {
+                        pat: *pat,
+                        items,
+                        idx: 0,
+                    });
+                    has_stepping_driver = true;
+                }
+                ForClause::Being { pat, source } => {
+                    let items = match source {
+                        LoopBeingSource::Symbols(pkg_form) => {
+                            let _ = eval_form(*pkg_form, &mut lenv)?;
+                            Vec::new()
+                        }
+                        LoopBeingSource::HashKeys(table_form) => {
+                            let table = eval_form(*table_form, &mut lenv)?;
+                            bliss_stdlib::hash_table_entries(table)?
+                                .into_iter()
+                                .map(|(key, _)| key)
+                                .collect()
+                        }
+                        LoopBeingSource::HashValues(table_form) => {
+                            let table = eval_form(*table_form, &mut lenv)?;
+                            bliss_stdlib::hash_table_entries(table)?
+                                .into_iter()
+                                .map(|(_, value)| value)
+                                .collect()
+                        }
+                    };
+                    states.push(ForState::Being {
+                        pat: *pat,
+                        items,
+                        idx: 0,
+                    });
+                    has_stepping_driver = true;
+                }
             }
         }
         let mut first = true;
@@ -2868,6 +3190,35 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         let f = if first { *init } else { then.unwrap_or(*init) };
                         let v = eval_form(f, &mut lenv)?;
                         loop_bind(*pat, v, &mut lenv);
+                    }
+                    ForState::From {
+                        pat,
+                        current,
+                        step,
+                        limit,
+                    } => {
+                        if loop_from_exhausted(*current, limit.as_ref())? {
+                            exhausted = true;
+                            break;
+                        }
+                        loop_bind(*pat, *current, &mut lenv);
+                        *current = loop_add_numbers(*current, *step)?;
+                    }
+                    ForState::Across { pat, items, idx } => {
+                        if *idx >= items.len() {
+                            exhausted = true;
+                            break;
+                        }
+                        loop_bind(*pat, items[*idx], &mut lenv);
+                        *idx += 1;
+                    }
+                    ForState::Being { pat, items, idx } => {
+                        if *idx >= items.len() {
+                            exhausted = true;
+                            break;
+                        }
+                        loop_bind(*pat, items[*idx], &mut lenv);
+                        *idx += 1;
                     }
                 }
             }
@@ -2917,6 +3268,31 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         return Ok(vec_to_list(items));
     }
     Ok(NIL)
+}
+
+fn loop_add_numbers(lhs: BlissVal, rhs: BlissVal) -> Result<BlissVal, BlissError> {
+    if lhs.is_fixnum() && rhs.is_fixnum() {
+        return Ok(BlissVal::from_fixnum(lhs.as_fixnum() + rhs.as_fixnum()));
+    }
+    let sum = num_val(lhs)? + num_val(rhs)?;
+    Ok(BlissVal::from_single_float(sum as f32))
+}
+
+fn loop_from_exhausted(
+    current: BlissVal,
+    limit: Option<&(LoopForLimit, BlissVal)>,
+) -> Result<bool, BlissError> {
+    let Some((kind, limit)) = limit else {
+        return Ok(false);
+    };
+    let current = num_val(current)?;
+    let limit = num_val(*limit)?;
+    Ok(match kind {
+        LoopForLimit::Below => current >= limit,
+        LoopForLimit::To | LoopForLimit::Upto => current > limit,
+        LoopForLimit::Above => current <= limit,
+        LoopForLimit::Downto => current < limit,
+    })
 }
 
 // ── Arithmetic helpers (issue #6 fix: proper float arithmetic) ────
@@ -4251,12 +4627,7 @@ fn describe_err(e: &BlissError) -> String {
 }
 
 fn run_load_env(path: &str, env: &mut Env) -> Result<i32, BlissError> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
-    if maybe_load_bundled_asdf(path, &contents, env) {
-        return Ok(0);
-    }
-    match read_eval_all_env(&contents, env) {
+    match load_path_into_env(path, env) {
         Ok(_) => Ok(0),
         Err(e) => {
             eprintln!("ERROR: {}", describe_err(&e));
@@ -4275,22 +4646,6 @@ fn run_script_env(path: &str, env: &mut Env) -> Result<i32, BlissError> {
             Err(e)
         }
     }
-}
-
-fn maybe_load_bundled_asdf(path: &str, contents: &str, env: &mut Env) -> bool {
-    let path = std::path::Path::new(path);
-    if path.file_name().and_then(|name| name.to_str()) != Some("asdf.lisp") {
-        return false;
-    }
-    if !contents.contains("This is ASDF 3.3.7") {
-        return false;
-    }
-
-    register_declared_packages(contents);
-    env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
-    env.define_local("*LOAD-HOOKS*", NIL);
-    env.define_local("*FEATURES*", NIL);
-    true
 }
 
 // Keep standalone versions for backward compatibility

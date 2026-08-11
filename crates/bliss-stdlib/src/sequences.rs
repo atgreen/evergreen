@@ -55,6 +55,13 @@ fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
         }
         return Ok(elems);
     }
+    if sequence.is_string() {
+        return Ok(sequence
+            .as_string()
+            .chars()
+            .map(BlissVal::from_char)
+            .collect());
+    }
     Err(BlissError::TypeError {
         datum: sequence,
         expected: "sequence".to_string(),

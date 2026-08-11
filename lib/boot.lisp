@@ -144,6 +144,14 @@
 
 (defun symbol-name (s) (string s))
 
+(defun symbol-package (s)
+  (let ((name (string s)))
+    (cond
+      ((find #\: name)
+       (let ((pkg-end (position #\: name)))
+         (and pkg-end (subseq name 0 pkg-end))))
+      (t nil))))
+
 (defun make-package (name &rest keys) (declare (ignore keys)) (string name))
 (defun find-package (name) (if name (string name) nil))
 (defun package-name (pkg) (if pkg (string pkg) nil))

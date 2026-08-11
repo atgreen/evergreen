@@ -540,23 +540,24 @@ fn try_invoke_function(function: BlissVal, key: BlissVal, value: BlissVal) {
 /// The table must not be structurally modified during iteration (per
 /// the CL spec).
 pub fn maphash(function: BlissVal, table: BlissVal) -> Result<(), BlissError> {
-    let ptr = get_table_inner(table)?;
-    // Safety: single &mut from raw pointer, valid for the function's duration.
-    let inner = unsafe { &mut *ptr };
-
-    // Snapshot the entries so that we iterate a consistent view even if
-    // the function happens to call back into hash-table operations on
-    // *other* tables.
-    let snapshot: Vec<(BlissVal, BlissVal)> = inner
-        .entries
-        .iter()
-        .filter_map(|slot| slot.map(|e| (e.key, e.value)))
-        .collect();
-
+    let snapshot = hash_table_entries(table)?;
     for (key, value) in snapshot {
         try_invoke_function(function, key, value);
     }
     Ok(())
+}
+
+/// Snapshot all live entries in a hash table.
+pub fn hash_table_entries(table: BlissVal) -> Result<Vec<(BlissVal, BlissVal)>, BlissError> {
+    let ptr = get_table_inner(table)?;
+    // Safety: single &mut from raw pointer, valid for the function's duration.
+    let inner = unsafe { &mut *ptr };
+
+    Ok(inner
+        .entries
+        .iter()
+        .filter_map(|slot| slot.map(|e| (e.key, e.value)))
+        .collect())
 }
 
 /// Clear all entries (CL `CLRHASH`).

@@ -86,32 +86,32 @@ fn pkg_id(handle: BlissVal) -> i64 {
     handle.as_fixnum()
 }
 
+fn no_active_registry_error() -> BlissError {
+    BlissError::PackageError("No active PackageRegistry on this thread".to_string())
+}
+
 /// Helper: run a closure with mutable access to the current thread-local store.
-/// Panics if no `PackageRegistry` has been created on this thread.
-fn with_store_mut<F, R>(f: F) -> R
+/// Returns a package error if no `PackageRegistry` has been created on this thread.
+fn with_store_mut<F, R>(f: F) -> Result<R, BlissError>
 where
-    F: FnOnce(&mut PackageStore) -> R,
+    F: FnOnce(&mut PackageStore) -> Result<R, BlissError>,
 {
     CURRENT_STORE.with(|cell| {
         let borrow = cell.borrow();
-        let store_rc = borrow
-            .as_ref()
-            .expect("No active PackageRegistry on this thread");
+        let store_rc = borrow.as_ref().ok_or_else(no_active_registry_error)?;
         f(&mut store_rc.borrow_mut())
     })
 }
 
 /// Helper: run a closure with read access to the current thread-local store.
-/// Panics if no `PackageRegistry` has been created on this thread.
-fn with_store<F, R>(f: F) -> R
+/// Returns a package error if no `PackageRegistry` has been created on this thread.
+fn with_store<F, R>(f: F) -> Result<R, BlissError>
 where
-    F: FnOnce(&PackageStore) -> R,
+    F: FnOnce(&PackageStore) -> Result<R, BlissError>,
 {
     CURRENT_STORE.with(|cell| {
         let borrow = cell.borrow();
-        let store_rc = borrow
-            .as_ref()
-            .expect("No active PackageRegistry on this thread");
+        let store_rc = borrow.as_ref().ok_or_else(no_active_registry_error)?;
         f(&store_rc.borrow())
     })
 }
@@ -141,9 +141,26 @@ impl PackageRegistry {
 
     /// Initialize with the standard packages (CL, CL-USER, KEYWORD, BLISS, etc.).
     pub fn init_standard_packages(&mut self) -> Result<(), BlissError> {
-        self.make_package("COMMON-LISP", &["CL"], &[])?;
-        self.make_package("CL-USER", &[], &[])?;
-        self.make_package("KEYWORD", &[], &[])?;
+        if self.bootstrap_initialized()? {
+            return Ok(());
+        }
+
+        let keyword = self.ensure_package("KEYWORD", &[], &[])?;
+        let common_lisp = self.ensure_package("COMMON-LISP", &["CL"], &[])?;
+        let bliss_internal = self.ensure_package("BLISS-INTERNAL", &["BI"], &["CL"])?;
+        let bliss_ext = self.ensure_package("BLISS-EXT", &[], &["CL"])?;
+        let common_lisp_user =
+            self.ensure_package("COMMON-LISP-USER", &["CL-USER"], &["CL", "BLISS-EXT"])?;
+
+        // Preserve the canonical bootstrap package graph on repeated initialization.
+        self.ensure_package_alias("BI", bliss_internal)?;
+        self.ensure_package_alias("CL", common_lisp)?;
+        self.ensure_package_alias("CL-USER", common_lisp_user)?;
+        self.ensure_package_alias("COMMON-LISP", common_lisp)?;
+        self.ensure_package_alias("COMMON-LISP-USER", common_lisp_user)?;
+        self.ensure_package_alias("KEYWORD", keyword)?;
+        self.ensure_package_alias("BLISS-INTERNAL", bliss_internal)?;
+        self.ensure_package_alias("BLISS-EXT", bliss_ext)?;
         Ok(())
     }
 
@@ -208,6 +225,116 @@ impl PackageRegistry {
         store.packages.insert(id, pkg);
 
         Ok(handle)
+    }
+
+    fn ensure_package(
+        &mut self,
+        name: &str,
+        nicknames: &[&str],
+        use_list: &[&str],
+    ) -> Result<BlissVal, BlissError> {
+        if let Some(existing) = self.find_package(name) {
+            self.ensure_package_aliases(existing, name, nicknames)?;
+            self.ensure_package_uses(existing, use_list)?;
+            return Ok(existing);
+        }
+
+        for &nickname in nicknames {
+            if let Some(existing) = self.find_package(nickname) {
+                self.ensure_package_aliases(existing, name, nicknames)?;
+                self.ensure_package_uses(existing, use_list)?;
+                return Ok(existing);
+            }
+        }
+
+        self.make_package(name, nicknames, use_list)
+    }
+
+    fn bootstrap_initialized(&self) -> Result<bool, BlissError> {
+        let Some(common_lisp) = self.find_package("COMMON-LISP") else {
+            return Ok(false);
+        };
+        let Some(common_lisp_user) = self.find_package("COMMON-LISP-USER") else {
+            return Ok(false);
+        };
+        let Some(bliss_internal) = self.find_package("BLISS-INTERNAL") else {
+            return Ok(false);
+        };
+        let Some(bliss_ext) = self.find_package("BLISS-EXT") else {
+            return Ok(false);
+        };
+        if self.find_package("KEYWORD").is_none() {
+            return Ok(false);
+        }
+
+        Ok(self.find_package("CL") == Some(common_lisp)
+            && self.find_package("CL-USER") == Some(common_lisp_user)
+            && self.find_package("BI") == Some(bliss_internal)
+            && self.package_uses_package(bliss_internal, common_lisp)?
+            && self.package_uses_package(bliss_ext, common_lisp)?
+            && self.package_uses_package(common_lisp_user, common_lisp)?
+            && self.package_uses_package(common_lisp_user, bliss_ext)?)
+    }
+
+    fn ensure_package_aliases(
+        &mut self,
+        package: BlissVal,
+        canonical_name: &str,
+        nicknames: &[&str],
+    ) -> Result<(), BlissError> {
+        self.ensure_package_alias(canonical_name, package)?;
+        for &nickname in nicknames {
+            self.ensure_package_alias(nickname, package)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_package_uses(&mut self, package: BlissVal, use_list: &[&str]) -> Result<(), BlissError> {
+        let resolved = use_list
+            .iter()
+            .map(|name| {
+                self.find_package(name).ok_or_else(|| {
+                    BlissError::PackageError(format!("Package {:?} not found for use-list", name))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        use_package(&resolved, package)
+    }
+
+    fn package_uses_package(
+        &self,
+        package: BlissVal,
+        used_package: BlissVal,
+    ) -> Result<bool, BlissError> {
+        let id = pkg_id(package);
+        let used_id = pkg_id(used_package);
+        let store = self.store.borrow();
+        let pkg = store
+            .packages
+            .get(&id)
+            .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
+        Ok(pkg.use_list.iter().any(|handle| pkg_id(*handle) == used_id))
+    }
+
+    fn ensure_package_alias(&mut self, alias: &str, package: BlissVal) -> Result<(), BlissError> {
+        let id = pkg_id(package);
+        let mut store = self.store.borrow_mut();
+        match store.name_index.get(alias).copied() {
+            Some(existing) if existing == id => Ok(()),
+            Some(_) => Err(BlissError::PackageError(format!(
+                "Package alias {:?} conflicts with an existing package",
+                alias
+            ))),
+            None => {
+                store.name_index.insert(alias.to_string(), id);
+                if let Some(pkg) = store.packages.get_mut(&id) {
+                    if alias != pkg.name && !pkg.nicknames.iter().any(|nick| nick == alias) {
+                        pkg.nicknames.push(alias.to_string());
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Delete a package.
