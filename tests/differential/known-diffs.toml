@@ -1,0 +1,3 @@
+sbcl_reference = "SBCL"
+image_round_trip = "save/load acceptance output may differ only in banner text"
+hash_table_print_order = "non-deterministic output ignored by acceptance diff"

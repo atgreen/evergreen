@@ -1,0 +1,21 @@
+name: sanitizers
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: asan
+        run: cargo +nightly test -Z sanitizer=address
+      - name: tsan
+        run: cargo +nightly test -Z sanitizer=thread
+      - name: msan
+        run: cargo +nightly test -Z sanitizer=memory
+      - name: miri
+        run: cargo +nightly miri test
