@@ -1,0 +1,2 @@
+# Per R10.42, persisted regression seeds for the reader round-trip property
+# live under tests/proptest/regressions/ and are replayed during cargo test.

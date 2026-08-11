@@ -137,8 +137,12 @@ fn repl_acceptance_drives_the_real_binary_through_read_eval_print_and_exit() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stdout.contains("Bliss Common Lisp"), "stdout: {stdout}");
     assert!(
-        stdout.contains('3') || stderr.contains("BLISS>"),
+        stdout.lines().any(|line| line.trim() == "3"),
         "stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("BLISS>"),
+        "the real REPL should print its prompt before evaluating input: stdout: {stdout} stderr: {stderr}"
     );
 }
 

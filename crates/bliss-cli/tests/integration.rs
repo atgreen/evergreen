@@ -4,7 +4,7 @@
 //! through the bliss-cli crate to verify cross-crate integration.
 
 use bliss_rt::runtime::{LogLevel, Runtime, RuntimeConfig};
-use bliss_rt::value::{BlissVal, NIL};
+use bliss_rt::value::BlissVal;
 
 // ── Helper ────────────────────────────────────────────────────────
 
@@ -37,11 +37,10 @@ fn runtime_init_eval_shutdown_lifecycle() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("runtime init should succeed");
     let result = rt.eval("(+ 1 2)").expect("eval should succeed");
-    // When fully wired, result should be fixnum 3
-    // For now, bootstrap returns NIL — this test will go green when eval is real
-    assert!(
-        result == BlissVal::from_fixnum(3) || result == NIL,
-        "eval '(+ 1 2)' should return 3 (or NIL in bootstrap), got: {:?}",
+    assert_eq!(
+        result,
+        BlissVal::from_fixnum(3),
+        "eval '(+ 1 2)' should return 3, got: {:?}",
         result
     );
     rt.shutdown().expect("shutdown should succeed");

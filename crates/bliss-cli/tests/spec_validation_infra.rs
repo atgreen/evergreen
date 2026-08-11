@@ -1,5 +1,13 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
+
+use bliss_compiler::reader::read_from_string;
+use bliss_rt::image::{load_image, validate_image_header};
+use bliss_rt::value::NIL;
+use bliss_stdlib::format::format as bliss_format;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -17,6 +25,32 @@ fn assert_has(haystack: &str, needle: &str, context: &str) {
         haystack.contains(needle),
         "{context} should contain {needle:?}, got:\n{haystack}"
     );
+}
+
+fn cargo_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn run(mut command: Command, context: &str) -> Output {
+    let output = command
+        .output()
+        .unwrap_or_else(|e| panic!("{context}: {e}"));
+    assert!(
+        output.status.success(),
+        "{context} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn expected_markers(script: &str) -> Vec<String> {
+    read(script)
+        .lines()
+        .filter_map(|line| line.strip_prefix("; EXPECT: "))
+        .map(str::to_string)
+        .collect()
 }
 
 #[test]
@@ -43,98 +77,190 @@ fn ansi_expected_failures_and_ci_contracts() {
 }
 
 #[test]
-fn integration_acceptance_scripts_are_present_and_annotated() {
-    // Per R10.04 and R10.06, tests/integration/ contains end-to-end evaluation scripts
-    // with expected observable output through real user-facing entrypoints.
-    // Per R10.20, R10.21, and R10.22, regression-oriented acceptance coverage must
-    // include deopt/image-sensitive scenarios as observable scripts, not just unit seams.
-    for script in [
-        "tests/integration/acceptance_eval.lisp",
-        "tests/integration/acceptance_load.lisp",
-        "tests/integration/acceptance_repl.lisp",
-    ] {
-        let text = read(script);
-        assert_has(&text, "EXPECT:", script);
-        assert_has(&text, "(format t", script);
+fn integration_acceptance_scripts_execute_through_real_cli_entrypoints() {
+    // Per R10.04 and R10.06, integration tests must drive end-to-end CL
+    // evaluation through the real CLI/REPL and assert observable output.
+    // Per R10.70, the checked-in integration scripts define their expectations
+    // via EXPECT annotations that the runner must honor.
+    let eval_script = "tests/integration/acceptance_eval.lisp";
+    let eval_expected = expected_markers(eval_script);
+    let eval = run(
+        {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_bliss-cli"));
+            cmd.current_dir(repo_root()).args(["--load", eval_script]);
+            cmd
+        },
+        "run acceptance_eval.lisp",
+    );
+    let eval_stdout = String::from_utf8_lossy(&eval.stdout);
+    for expected in &eval_expected {
+        assert!(
+            eval_stdout.contains(expected),
+            "acceptance_eval.lisp missing expected output {expected:?}: {eval_stdout}"
+        );
+    }
+
+    let load_script = "tests/integration/acceptance_load.lisp";
+    let load_expected = expected_markers(load_script);
+    let load = run(
+        {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_bliss-cli"));
+            cmd.current_dir(repo_root()).args(["--load", load_script]);
+            cmd
+        },
+        "run acceptance_load.lisp",
+    );
+    let load_stdout = String::from_utf8_lossy(&load.stdout);
+    for expected in &load_expected {
+        assert!(
+            load_stdout.contains(expected),
+            "acceptance_load.lisp missing expected output {expected:?}: {load_stdout}"
+        );
+    }
+
+    let repl_script = "tests/integration/acceptance_repl.lisp";
+    let repl_expected = expected_markers(repl_script);
+    let script_body = read(repl_script);
+    let mut repl = Command::new(env!("CARGO_BIN_EXE_bliss-cli"));
+    repl.current_dir(repo_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = repl.spawn().expect("spawn REPL");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(format!("{script_body}\n(quit)\n").as_bytes())
+        .expect("write REPL script");
+    let repl_output = child.wait_with_output().expect("wait for REPL");
+    assert!(
+        repl_output.status.success(),
+        "run acceptance_repl.lisp failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&repl_output.stdout),
+        String::from_utf8_lossy(&repl_output.stderr)
+    );
+    let repl_stdout = String::from_utf8_lossy(&repl_output.stdout);
+    for expected in &repl_expected {
+        assert!(
+            repl_stdout.contains(expected),
+            "acceptance_repl.lisp missing expected output {expected:?}: {repl_stdout}"
+        );
     }
 }
 
 #[test]
-fn fuzz_targets_corpora_and_regressions_match_spec_contracts() {
-    // Per R10.13, R10.14, and R10.15, reader/compiler/eval/ffi/image fuzzing is required.
-    // Per R10.16, R10.23, R10.24, R10.25, R10.26, R10.28, R10.29, R10.31, R10.32,
-    // R10.33, R10.34, and R10.35, dedicated targets, checked-in corpora, regression
-    // inputs, coverage, minimisation, and crash-triage workflow artifacts must exist.
-    let targets = [
-        ("fuzz/fuzz_targets/fuzz_reader.rs", "read_from_string"),
-        ("fuzz/fuzz_targets/fuzz_macroexpand.rs", "macroexpand"),
-        ("fuzz/fuzz_targets/fuzz_compile.rs", "codegen"),
-        ("fuzz/fuzz_targets/fuzz_eval.rs", "compare_eval_outputs"),
-        ("fuzz/fuzz_targets/fuzz_format.rs", "format_to_string"),
-        ("fuzz/fuzz_targets/fuzz_ffi.rs", "call_foreign"),
-        ("fuzz/fuzz_targets/fuzz_image_load.rs", "load_image"),
-    ];
-    for (path, needle) in targets {
-        let text = read(path);
-        assert_has(&text, "fuzz_target!", path);
-        assert_has(&text, needle, path);
-    }
+fn regression_inputs_are_executable_through_standard_test_entrypoints() {
+    // Per R10.16 and R10.34, minimized crash inputs must be checked in and
+    // re-run by the normal cargo-test workflow rather than existing only as
+    // inert repository artifacts.
+    let reader_regression = fs::read(repo_root().join("fuzz/regression/fuzz_reader/crash-min-001.lisp"))
+        .expect("reader regression input");
+    let reader_source = String::from_utf8_lossy(&reader_regression);
+    let _ = read_from_string(reader_source.as_ref());
 
-    for dir in [
-        "fuzz/corpus/fuzz_reader",
-        "fuzz/corpus/fuzz_compile",
-        "fuzz/corpus/fuzz_eval",
-        "fuzz/corpus/fuzz_format",
-        "fuzz/corpus/fuzz_ffi",
-        "fuzz/corpus/fuzz_image_load",
-        "fuzz/regression/fuzz_reader",
-        "fuzz/regression/fuzz_compile",
-        "fuzz/regression/fuzz_eval",
-        "fuzz/regression/fuzz_format",
-        "fuzz/regression/fuzz_ffi",
-        "fuzz/regression/fuzz_image_load",
-    ] {
-        let mut entries = fs::read_dir(repo_root().join(dir))
-            .unwrap_or_else(|e| panic!("{dir}: {e}"))
-            .filter_map(Result::ok);
-        assert!(entries.next().is_some(), "{dir} should not be empty");
-    }
+    let compile_regression =
+        fs::read(repo_root().join("fuzz/regression/fuzz_compile/crash-min-001.lisp"))
+            .expect("compile regression input");
+    let compile_source = String::from_utf8_lossy(&compile_regression);
+    let _ = read_from_string(compile_source.as_ref());
 
-    let nightly = read(".github/workflows/nightly-fuzz.yml");
-    for needle in [
-        "cargo fuzz run fuzz_reader -- -max_total_time=60",
-        "cargo fuzz cmin fuzz_reader fuzz/corpus/fuzz_reader",
-        "cargo llvm-cov",
-        "RUSTFLAGS: -C instrument-coverage",
-    ] {
-        assert_has(&nightly, needle, "nightly-fuzz.yml");
-    }
+    let eval_regression = fs::read(repo_root().join("fuzz/regression/fuzz_eval/crash-min-001.lisp"))
+        .expect("eval regression input");
+    let eval_source = String::from_utf8_lossy(&eval_regression);
+    let _ = read_from_string(eval_source.as_ref());
+
+    let format_regression =
+        fs::read_to_string(repo_root().join("fuzz/regression/fuzz_format/crash-min-001.lisp"))
+            .expect("format regression input");
+    let _ = bliss_format(NIL, &format_regression, &[]);
+
+    let image_regression = repo_root().join("fuzz/regression/fuzz_image_load/crash-min-001.bimg");
+    let _ = validate_image_header(image_regression.to_str().expect("utf8 path"));
+    let _ = load_image(image_regression.to_str().expect("utf8 path"));
 }
 
 #[test]
-fn sanitizer_and_differential_artifacts_are_checked_in() {
-    // Per R10.07 and R10.08, the integration runner needs stress and concurrency hooks.
-    // Per R10.09, R10.10, R10.11, and R10.12, differential/perf artifacts are archived.
-    // Per R10.19, nightly sanitizer workflows and suppression files must exist.
-    let sanitizers = read(".github/workflows/sanitizers.yml");
-    for needle in [
-        "sanitizer=address",
-        "sanitizer=thread",
-        "sanitizer=memory",
-        "miri test",
-    ] {
-        assert_has(&sanitizers, needle, "sanitizers.yml");
-    }
+fn stress_and_regression_scenarios_run_via_real_test_binaries() {
+    // Per R10.07 and R10.08, GC stress paths and thread-safety scenarios must
+    // execute real collector and concurrent mutation code paths.
+    // Per R10.20, R10.21, and R10.22, regression coverage must execute the
+    // deoptimisation and image round-trip tests through the standard runner.
+    let _guard = cargo_lock().lock().unwrap_or_else(|e| e.into_inner());
 
-    for supp in [
-        "tests/sanitizers/asan.supp",
-        "tests/sanitizers/msan.supp",
-        "tests/sanitizers/tsan.supp",
-    ] {
-        assert_has(&read(supp), "interceptor", supp);
-    }
+    run(
+        {
+            let mut cmd = Command::new("cargo");
+            cmd.current_dir(repo_root()).args([
+                "test",
+                "-p",
+                "bliss-rt",
+                "--test",
+                "spec_memory_gc",
+                "spec_gc_large_objects_minor_gc_and_full_gc_use_real_collector_paths",
+                "--",
+                "--exact",
+                "--nocapture",
+            ]);
+            cmd
+        },
+        "run GC stress regression",
+    );
 
-    let known_diffs = read("tests/differential/known-diffs.toml");
-    assert_has(&known_diffs, "sbcl_reference", "known-diffs.toml");
-    assert_has(&known_diffs, "image_round_trip", "known-diffs.toml");
+    run(
+        {
+            let mut cmd = Command::new("cargo");
+            cmd.current_dir(repo_root()).args([
+                "test",
+                "-p",
+                "bliss-stdlib",
+                "--test",
+                "spec_packages_bootstrap",
+                "concurrent_bootstrap_and_mutation_on_separate_threads_remain_isolated",
+                "--",
+                "--exact",
+                "--nocapture",
+            ]);
+            cmd
+        },
+        "run package concurrency regression",
+    );
+
+    run(
+        {
+            let mut cmd = Command::new("cargo");
+            cmd.current_dir(repo_root()).args([
+                "test",
+                "-p",
+                "bliss-rt",
+                "--test",
+                "spec_image_ops",
+                "spec_image_round_trip_restores_heap_and_entry_state",
+                "--",
+                "--exact",
+                "--nocapture",
+            ]);
+            cmd
+        },
+        "run image round-trip regression",
+    );
+
+    run(
+        {
+            let mut cmd = Command::new("cargo");
+            cmd.current_dir(repo_root()).args([
+                "test",
+                "-p",
+                "bliss-compiler",
+                "--test",
+                "spec_tiered_osr_ic_profiling",
+                "deopt_at_safepoint_restores_equivalent_interpreter_frame",
+                "--",
+                "--exact",
+                "--nocapture",
+            ]);
+            cmd
+        },
+        "run deoptimisation regression",
+    );
 }
