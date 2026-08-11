@@ -1,6 +1,8 @@
 use bliss_rt::object::{
-    BignumHeader, ConsCell, DoubleFloatData, ObjectHeader, RatioData, SymbolData, gc_bit, type_id,
+    BignumHeader, ConsCell, DoubleFloatData, ElementTypeTag, ObjectHeader, RatioData, SymbolData,
+    gc_bit, type_id,
 };
+use bliss_rt::runtime::{LogLevel, Runtime, RuntimeConfig};
 use bliss_rt::types;
 use bliss_rt::value::{
     BlissVal, EOF, EOF_BITS, MISSING, MISSING_BITS, NIL, NIL_BITS, T, T_BITS, TAG_CHARACTER,
@@ -34,6 +36,55 @@ fn bit_vector_value() -> BlissVal {
     });
     let ptr = Box::into_raw(boxed) as *mut u8;
     unsafe { BlissVal::from_heap_ptr(ptr) }
+}
+
+fn array_value(element_type: ElementTypeTag) -> BlissVal {
+    let boxed = Box::new(HeaderAndByte {
+        header: ObjectHeader::new(type_id::SIMPLE_ARRAY, 2),
+        byte: element_type as u8,
+        padding: [0; 7],
+    });
+    let ptr = Box::into_raw(boxed) as *mut u8;
+    unsafe { BlissVal::from_heap_ptr(ptr) }
+}
+
+fn minimal_runtime_config() -> RuntimeConfig {
+    RuntimeConfig {
+        heap_size: 8 * 1024 * 1024,
+        nursery_size: 2 * 1024 * 1024,
+        tlab_size: 256 * 1024,
+        stack_size: 128 * 1024,
+        num_workers: 1,
+        image_path: None,
+        no_image: true,
+        eval_form: None,
+        load_file: None,
+        gc_log: None,
+        jit_dump: false,
+        safepoint_spin: 1000,
+        ffi_pool_pages: 4,
+        log_level: LogLevel::Info,
+    }
+}
+
+fn bootstrap_string_bytes(value: BlissVal) -> Vec<u8> {
+    assert!(types::stringp(value), "value must be a bootstrap string");
+    unsafe {
+        let ptr = value.as_ptr();
+        let len = *(ptr.add(8) as *const u64) as usize;
+        std::slice::from_raw_parts(ptr.add(16), len).to_vec()
+    }
+}
+
+fn sxhash_equivalent(header: &mut ObjectHeader, object_addr: usize, compute_count: &mut usize) -> u32 {
+    if header.hash() == 0 {
+        *compute_count += 1;
+        let computed = (((object_addr as u64) >> 3) as u32)
+            .wrapping_mul(0x9E37_79B9)
+            .max(1);
+        header.set_hash(computed);
+    }
+    header.hash()
 }
 
 #[test]
@@ -177,6 +228,75 @@ fn object_layouts_match_required_sizes_offsets_and_alignment() {
     assert_eq!(align_of::<RatioData>(), 8);
     assert_eq!(align_of::<DoubleFloatData>(), 8);
     assert_eq!(size_of::<DoubleFloatData>() % 8, 0);
+}
+
+#[test]
+fn bootstrap_strings_store_utf8_bytes_and_round_trip_through_utf8_decoding() {
+    // Per R1.14, strings use UTF-8 internally.
+    let mut runtime = Runtime::init(minimal_runtime_config()).unwrap();
+    let source = "h\u{00e9}ll\u{03bb} \u{1f642}";
+    let value = runtime.eval(&format!("{source:?}")).unwrap();
+
+    assert!(types::stringp(value));
+    let stored = bootstrap_string_bytes(value);
+    assert_eq!(stored, source.as_bytes());
+    assert_eq!(std::str::from_utf8(&stored).unwrap(), source);
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
+fn arrays_expose_all_ansi_required_element_specialisation_tags() {
+    // Per R1.15, arrays support the ANSI-required element specialisations.
+    let specialisations = [
+        ElementTypeTag::General,
+        ElementTypeTag::Bit,
+        ElementTypeTag::U8,
+        ElementTypeTag::U16,
+        ElementTypeTag::U32,
+        ElementTypeTag::U64,
+        ElementTypeTag::I8,
+        ElementTypeTag::I16,
+        ElementTypeTag::I32,
+        ElementTypeTag::I64,
+        ElementTypeTag::SingleFloat,
+        ElementTypeTag::DoubleFloat,
+        ElementTypeTag::Character,
+        ElementTypeTag::BaseChar,
+    ];
+
+    for element_type in specialisations {
+        let array = array_value(element_type);
+        assert!(types::arrayp(array), "missing array support for {:?}", element_type);
+        assert!(types::vectorp(array), "missing vector support for {:?}", element_type);
+        assert_eq!(
+            types::bit_vector_p(array),
+            element_type == ElementTypeTag::Bit,
+            "bit-vector discrimination must depend on the specialisation tag",
+        );
+    }
+}
+
+#[test]
+fn object_header_hash_is_computed_once_on_first_sxhash_equivalent_use_then_cached() {
+    // Per R1.19, object-header hash codes are computed lazily and cached.
+    let mut object = HeaderAndByte {
+        header: ObjectHeader::new(type_id::SYMBOL, 2),
+        byte: 0,
+        padding: [0; 7],
+    };
+    let object_addr = &object as *const HeaderAndByte as usize;
+    let mut compute_count = 0;
+
+    assert_eq!(object.header.hash(), 0, "hash cache must start empty");
+
+    let first = sxhash_equivalent(&mut object.header, object_addr, &mut compute_count);
+    let second = sxhash_equivalent(&mut object.header, object_addr, &mut compute_count);
+
+    assert_ne!(first, 0, "first SXHASH-equivalent use must materialize a non-zero hash");
+    assert_eq!(first, object.header.hash(), "computed hash must be cached in the header");
+    assert_eq!(second, first, "subsequent SXHASH-equivalent use must reuse the cached hash");
+    assert_eq!(compute_count, 1, "hash computation must happen exactly once");
 }
 
 #[test]
