@@ -30,6 +30,9 @@ policy, and logging/diagnostics infrastructure for the Bliss runtime.
 | R7.18 | GC and JIT subsystems MUST provide dedicated log channels that can be enabled independently. |
 | R7.19 | The runtime SHOULD support loading an image from a read-only filesystem (e.g., container images) without requiring write access. |
 | R7.20 | The image save operation MUST be atomic: either the complete image is written or the previous file is left untouched. |
+| R7.21 | Startup mode selection MUST be deterministic: explicit CLI mode (`--eval`, `--load`, script path, `--bootstrap`, `--no-image`) overrides appended-image and default-image discovery. |
+| R7.22 | The runtime MUST support a bootstrap-without-image operating profile that loads `lib/boot.lisp` from the source tree or installation prefix and exposes enough functionality to build and save a first image. |
+| R7.23 | The runtime MUST support an immutable-image operating profile in which the mapped image remains read-only and all post-startup mutation occurs in freshly allocated writable regions. |
 
 ---
 
@@ -685,3 +688,67 @@ log-writer thread drains the ring and writes to stderr.
 | `crates/bliss-rt/src/perf_map.rs` | Linux perf-map writer | R7.17 |
 | `crates/bliss-rt/src/dtrace.rs` | USDT probe definitions | §7.9.5 |
 | `crates/bliss-cli/src/main.rs` | CLI flag parsing, REPL/script dispatch | R7.07 |
+
+---
+
+## 7.14  Runtime Operating Profiles
+
+This section defines the startup profiles exposed by the CLI and by
+embedding callers. It narrows the intended behaviour of the current
+bootstrap implementation and gives later phases a stable compatibility
+contract.
+
+### 7.14.1  Startup Resolution Order
+
+The runtime chooses exactly one startup profile in the following order
+(R7.21):
+
+1. `--eval EXPR` — start enough runtime state to evaluate `EXPR`,
+   print the resulting values, and exit.
+2. `--load FILE` — load `FILE`, evaluate top-level forms, and exit.
+3. `SCRIPT` positional path — execute the script, bind remaining
+   arguments after `--` to `*COMMAND-LINE-ARGS*`, and exit.
+4. `--bootstrap` — skip image discovery and load the bootstrap file set
+   rooted at `lib/boot.lisp`.
+5. `--no-image` — start with an empty heap and no boot image.
+6. Appended image on the executable — if present and valid, load it.
+7. Default image discovery via `--image` or `BLISS_IMAGE_PATH`.
+8. Fallback interactive REPL with no image if all image discovery
+   mechanisms fail and stdin is a terminal.
+
+If multiple explicit execution modes are requested, argument parsing
+MUST fail before runtime initialisation with a diagnostic naming the
+conflicting flags.
+
+### 7.14.2  Bootstrap-Without-Image Profile
+
+The bootstrap profile (R7.22) exists to support early development,
+packaging, and recovery when no valid `.bimg` is available.
+
+Bootstrap mode MUST:
+
+- Initialise the object model, allocator, reader, evaluator, package
+  registry, and enough stream support to read `lib/boot.lisp`.
+- Search for `lib/boot.lisp` relative to the current working directory,
+  then relative to the installed prefix, and fail with `FILE-ERROR` if
+  neither location is valid.
+- Permit `(bliss:save-image ...)` once the bootstrap sequence has
+  completed successfully.
+
+Bootstrap mode MUST NOT assume that any previously saved heap image,
+compiled code cache, or package registry exists.
+
+### 7.14.3  Immutable-Image Profile
+
+In the immutable-image profile (R7.23), the saved image is treated as a
+read-only baseline:
+
+- The mapped image pages remain read-only after relocation.
+- Mutable roots such as symbol value cells, package hash tables, thread
+  state, and newly compiled code are copied or re-homed into writable
+  runtime regions before mutation.
+- If the process terminates without an explicit image save, mutations in
+  writable regions are discarded without touching the original image.
+
+This profile is the required deployment mode for container images,
+Nix-style stores, and shared read-only installations.

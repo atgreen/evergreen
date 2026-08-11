@@ -587,3 +587,40 @@ replacement suggestion:
 **R11.21** The `BLISS` package MUST maintain a machine-readable
 deprecation registry accessible via
 `(bliss:deprecated-symbols)` → list of `(symbol replacement removal-version)`.
+
+## 11.14  Phase Exit Gates
+
+Phase names and milestone narratives are useful, but later phases also
+need an explicit “ready to advance” contract. The gates in this section
+apply in addition to the phase descriptions above.
+
+**R11.22** A phase MUST NOT be declared complete until its required
+functional deliverables, its mandatory tests, and its stated operating
+profiles all pass together on every tier-1 platform for that phase.
+
+**R11.23** Advancement from Phase 0 to Phase 1, Phase 1 to Phase 2, and
+Phase 2 to Phase 3 MUST be recorded by a release checklist artifact in
+`spec/releases/` that links the satisfied requirements, unresolved
+waivers, benchmark results, and known limitations.
+
+**R11.24** When a phase gate is missed, the roadmap MUST prefer holding
+the current phase and reducing scope for the next phase over silently
+weakening already-published acceptance criteria.
+
+### 11.14.1  Gate Checklist by Phase
+
+| Transition | Mandatory gate items |
+|------------|----------------------|
+| Phase 0 → Phase 1 | Reader, evaluator, minimal GC, and REPL work; `cargo test` passes for all crates that exist; bootstrap examples load from source without an image |
+| Phase 1 → Phase 2 | `LOAD`/`COMPILE-FILE`, packages, conditions, streams, threads, and T1 compile path are stable; bootstrap stdlib load works from `lib/boot.lisp`; runtime image can be created and reloaded |
+| Phase 2 → Phase 3 | Triple-build verification passes; T2, OSR/deopt, CLOS, image save/load, and profiling are active; differential testing against SBCL and performance tracking are green |
+| Phase 3 → Stable releases | `ansi-test` has zero unexpected failures; supported release artifacts are reproducible; C-ABI and extension packages are documented; security and portability gates pass |
+
+### 11.14.2  Expected Release Artifacts per Phase
+
+| Phase | Required artifacts |
+|-------|--------------------|
+| Phase 0 | Source checkout, `cargo test` logs, bootstrap transcript |
+| Phase 1 | Bootstrap image, stdlib load transcript, crate-level test report |
+| Phase 2 | Triple-build report, benchmark snapshot, self-compile transcript |
+| Phase 3 | Full release bundle from §7, benchmark report, compatibility notes, security review summary |

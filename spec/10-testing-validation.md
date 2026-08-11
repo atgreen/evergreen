@@ -695,3 +695,62 @@ fuzz/                               # Fuzz targets and corpora (§10.4)
 | Nightly | All + fuzz (60s) + differential | linux-x86_64 | ASan, TSan | 120 min |
 | Weekly | All + fuzz (3600s) + coverage | linux-x86_64 | ASan, TSan, MSan | 480 min |
 | Release | All + benchmarks + full ansi-test | linux-x86_64, macos-aarch64 | All | 600 min |
+
+## 10.12  Requirement Traceability
+
+The repository already treats requirement identifiers as first-class
+artifacts via `scripts/spec-coverage.py`. This section makes that
+contract normative so later implementation and review work can rely on
+it consistently.
+
+**R10.76** Every automated test that exists primarily to verify a
+normative requirement MUST cite at least one requirement ID (`R*.*`) in
+source comments or test names so that traceability tooling can detect
+the link.
+
+**R10.77** The repository MUST maintain a machine-generated coverage
+report from `scripts/spec-coverage.py` that distinguishes `MUST`,
+`SHOULD`, and uncategorised requirements by chapter and by ID.
+
+**R10.78** Release builds MUST gate on traceability quality: every
+`MUST` requirement in chapters §2–§10 that is marked implemented in code
+or documentation MUST either have at least one automated test reference
+or be listed in an explicit waiver file with rationale and owner.
+
+### 10.12.1  Traceability Sources
+
+The traceability report aggregates evidence from the following sources:
+
+| Source | Evidence type | Notes |
+|--------|---------------|-------|
+| Rust unit/integration tests | `R*.*` identifiers in comments, module docs, or test names | Primary implementation-level evidence |
+| CL integration tests | `;; R*.*` annotations in `.lisp` files | Used for reader/compiler/stdlib behaviour |
+| Fuzz regressions | Requirement IDs in regression test wrappers | Counts only when replayed under `cargo test` |
+| Benchmark harness metadata | Requirement IDs for performance constraints | Used for R4/R7/R10/R11 performance gates |
+| Waiver registry | Explicit uncovered requirement with justification | Release-management exception path only |
+
+### 10.12.2  Waiver Registry
+
+`spec/traceability-waivers.toml` SHOULD be used for temporary gaps that
+are understood but not yet automated. Each waiver entry MUST contain:
+
+- `requirement_id`
+- `scope` (`unit`, `integration`, `fuzz`, `benchmark`, or `manual`)
+- `justification`
+- `owner`
+- `expires_on`
+
+Expired waivers MUST fail the release traceability check.
+
+### 10.12.3  Review Workflow
+
+When a change adds or materially revises a normative requirement, the
+same change series SHOULD include one of:
+
+- a new automated test referencing the requirement ID,
+- an update to an existing test to reference the requirement ID more
+  precisely, or
+- a time-bounded waiver entry.
+
+This keeps specification growth incremental rather than allowing large
+untracked testing debt to accumulate.

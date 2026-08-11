@@ -1,7 +1,7 @@
 # Bliss Specification — Master Index
 
 **Version:** 0.1-draft
-**Last updated:** 2026-08-10
+**Last updated:** 2026-08-11
 
 This index provides at-a-glance navigation across all specification
 chapters, sections, and subsections. Code references spec sections
