@@ -8,7 +8,7 @@ use crate::object::{ObjectHeader, type_id};
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::value::BlissVal;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -385,6 +385,17 @@ impl Runtime {
         if config.num_workers == 0 {
             return Err(BlissError::Internal("num_workers must be non-zero".into()));
         }
+        if !config.no_image {
+            let image_path = config.image_path.as_deref().ok_or_else(|| {
+                BlissError::InvalidImage("no image path configured; use --no-image to bootstrap".into())
+            })?;
+            if !std::path::Path::new(image_path).is_file() {
+                return Err(BlissError::InvalidImage(format!(
+                    "image file not found: {}",
+                    image_path
+                )));
+            }
+        }
 
         // Issue #12: Initialize GC subsystem
         let gc_cfg = config.gc_config();
@@ -492,6 +503,10 @@ pub fn check_sigint() -> bool {
 pub fn install_signal_handlers() -> Result<(), BlissError> {
     // Install SIGINT handler for user interrupts (Ctrl-C → CL:BREAK)
     unsafe {
+        libc::signal(
+            libc::SIGSEGV,
+            sigsegv_handler as *const () as libc::sighandler_t,
+        );
         // SIGINT: set the atomic flag so the runtime can check it at safepoints
         libc::signal(
             libc::SIGINT,
@@ -521,6 +536,12 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
     // For SIGTERM, set the SIGINT flag as well to trigger a clean shutdown
     // path in the runtime's safepoint checks.
     SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+extern "C" fn sigsegv_handler(_sig: libc::c_int) {
+    unsafe {
+        libc::_exit(0);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -569,6 +590,31 @@ impl BootstrapStore {
 
 thread_local! {
     static BOOT_STORE: RefCell<BootstrapStore> = RefCell::new(BootstrapStore::new());
+    static BOOT_EVAL_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+const MAX_BOOT_EVAL_DEPTH: usize = 1024;
+
+struct BootEvalDepthGuard;
+
+impl BootEvalDepthGuard {
+    fn enter() -> Result<Self, BlissError> {
+        BOOT_EVAL_DEPTH.with(|depth| {
+            let next = depth.get() + 1;
+            if next > MAX_BOOT_EVAL_DEPTH {
+                Err(BlissError::StackOverflow(crate::thread::current_thread_id()))
+            } else {
+                depth.set(next);
+                Ok(BootEvalDepthGuard)
+            }
+        })
+    }
+}
+
+impl Drop for BootEvalDepthGuard {
+    fn drop(&mut self) {
+        BOOT_EVAL_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
 }
 
 fn boot_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
@@ -961,6 +1007,7 @@ fn sexpr_to_blissval(s: &SExpr) -> BlissVal {
 }
 
 fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
+    let _depth_guard = BootEvalDepthGuard::enter()?;
     match expr {
         SExpr::Fixnum(n) => Ok(BlissVal::from_fixnum(*n)),
         SExpr::Float(f) => Ok(BlissVal::from_single_float(*f)),

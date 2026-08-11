@@ -230,13 +230,11 @@ pub fn wait_for_all_threads() -> Result<(), BlissError> {
     let coord = coordinator();
     let page = global_safepoint_page();
 
-    // Determine how many other mutator threads need to arrive.
-    // In the bootstrap single-threaded runtime this is typically 0.
-    // We use the thread registry to count live threads, excluding the
-    // current (requesting) thread.
-    let all_ids = crate::thread::all_thread_ids();
     let current = crate::thread::current_thread_id();
-    let other_count = all_ids.iter().filter(|id| **id != current).count();
+    // Determine how many other mutator threads need to arrive.
+    // Native threads are excluded because they cannot observe poll sites
+    // while executing foreign code and therefore must not block the handshake.
+    let other_count = crate::thread::safepoint_participant_count_excluding(current);
 
     if other_count == 0 {
         // Single-threaded: trivially at a safepoint already.

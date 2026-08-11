@@ -505,8 +505,44 @@ pub fn all_thread_ids() -> Vec<GreenThreadId> {
     // This avoids the double-lock race where another thread could
     // modify the registry between two separate lock acquisitions.
     let _ = current_thread_id();
-    let registry = thread_registry().lock().unwrap();
+    let mut registry = thread_registry().lock().unwrap();
+    prune_orphaned_threads(&mut registry, None);
     registry.keys().copied().collect()
+}
+
+/// Count threads that must participate in a safepoint handshake.
+///
+/// Native threads are intentionally excluded: while they are inside foreign
+/// code they cannot poll, and the safepoint protocol must not wait for them.
+pub fn safepoint_participant_count_excluding(current: GreenThreadId) -> usize {
+    let _ = current_thread_id();
+    let mut registry = thread_registry().lock().unwrap();
+    prune_orphaned_threads(&mut registry, Some(current));
+    registry
+        .iter()
+        .filter(|(id, thread)| {
+            **id != current
+                && thread.state() != ThreadState::Dead
+                && thread.state() != ThreadState::Native
+        })
+        .count()
+}
+
+fn prune_orphaned_threads(
+    registry: &mut HashMap<GreenThreadId, Arc<GreenThread>>,
+    current: Option<GreenThreadId>,
+) {
+    registry.retain(|id, thread| {
+        if Some(*id) == current {
+            return true;
+        }
+
+        // Thread-local CURRENT_THREAD entries can outlive a runtime instance:
+        // once the owning OS thread exits, the registry may be the last owner.
+        // Those orphaned entries are not runnable work and must not block
+        // shutdown or appear as live threads in subsequent runtimes/tests.
+        Arc::strong_count(thread) > 1 || thread.state() == ThreadState::Dead
+    });
 }
 
 /// Wait until every other registered green thread has finished executing.
@@ -517,7 +553,8 @@ pub fn wait_for_other_threads() {
     let current = current_thread_id();
     loop {
         let pending = {
-            let registry = thread_registry().lock().unwrap();
+            let mut registry = thread_registry().lock().unwrap();
+            prune_orphaned_threads(&mut registry, Some(current));
             registry
                 .iter()
                 .filter(|(id, _)| **id != current)

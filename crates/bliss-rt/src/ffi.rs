@@ -330,8 +330,9 @@ pub fn marshal_to_c(value: BlissVal, alien_type: &AlienType) -> Result<u64, Blis
             } else if value.is_fixnum() {
                 Ok(value.as_fixnum() as u64)
             } else {
-                // Return the raw tagged pointer
-                Ok(value.to_raw())
+                Err(BlissError::FfiError(
+                    "cannot marshal opaque Lisp value as foreign pointer".into(),
+                ))
             }
         }
         _ => Err(BlissError::FfiError(format!(
