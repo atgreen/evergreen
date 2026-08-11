@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::thread;
 
+#[allow(dead_code)]
 struct CodeBufferView {
     bytes: Vec<u8>,
     arch: TargetArch,
@@ -26,6 +27,7 @@ struct CodeBufferView {
     stack_maps: Vec<StackMap>,
 }
 
+#[allow(dead_code)]
 struct CompiledCodeView {
     code: Vec<u8>,
     tier: Tier,

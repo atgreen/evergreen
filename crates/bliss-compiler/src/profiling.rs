@@ -142,7 +142,7 @@ impl TypeProfile {
         }
         let mut entries = self.entries.get();
         let len = self.len.get() as usize;
-        if entries[..len].iter().any(|&entry| entry == class.0) {
+        if entries[..len].contains(&class.0) {
             return;
         }
         if len < TYPE_PROFILE_MAX_ENTRIES {
@@ -177,8 +177,8 @@ impl TypeProfile {
         for idx in 0..len {
             let candidate = entries[idx];
             let mut count = 0usize;
-            for probe in 0..len {
-                if entries[probe] == candidate {
+            for entry in entries.iter().take(len) {
+                if *entry == candidate {
                     count += 1;
                 }
             }

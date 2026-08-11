@@ -261,10 +261,7 @@ fn file_streams_expose_position_length_and_external_format() {
         set_file_position(input, BlissVal::from_fixnum(1)).unwrap(),
         T
     );
-    assert_eq!(
-        stream_unread_char(input, BlissVal::from_char('e')).is_ok(),
-        true
-    );
+    assert!(stream_unread_char(input, BlissVal::from_char('e')).is_ok());
 }
 
 #[test]

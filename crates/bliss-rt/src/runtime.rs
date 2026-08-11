@@ -426,6 +426,8 @@ impl Runtime {
     /// Initiate graceful shutdown. §2.9.
     pub fn shutdown(&mut self) -> Result<(), BlissError> {
         self.shutdown = true;
+        crate::thread::wait_for_other_threads();
+        crate::gc::run_pending_finalizers();
         // Shut down the scheduler
         self._scheduler.shutdown()?;
         Ok(())

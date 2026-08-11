@@ -1188,20 +1188,24 @@ fn read_sharpsign_with_base(
             pos,
             labels,
             true,
-            read_base,
-            read_eval,
-            read_circular,
-            depth + 1,
+            ReaderOptions {
+                read_base,
+                read_eval,
+                read_circular,
+                depth: depth + 1,
+            },
         ),
         '-' => read_feature_expr_with_base(
             chars,
             pos,
             labels,
             false,
-            read_base,
-            read_eval,
-            read_circular,
-            depth + 1,
+            ReaderOptions {
+                read_base,
+                read_eval,
+                read_circular,
+                depth: depth + 1,
+            },
         ),
         '.' => {
             // Read-eval: #.(form) — check *read-eval* first
@@ -1431,7 +1435,26 @@ fn read_feature_expr(
     labels: &mut CircularLabels,
     include_if_present: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
-    read_feature_expr_with_base(chars, pos, labels, include_if_present, 10, false, true, 0)
+    read_feature_expr_with_base(
+        chars,
+        pos,
+        labels,
+        include_if_present,
+        ReaderOptions {
+            read_base: 10,
+            read_eval: false,
+            read_circular: true,
+            depth: 0,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ReaderOptions {
+    read_base: u32,
+    read_eval: bool,
+    read_circular: bool,
+    depth: usize,
 }
 
 fn read_feature_expr_with_base(
@@ -1439,10 +1462,7 @@ fn read_feature_expr_with_base(
     mut pos: usize,
     labels: &mut CircularLabels,
     include_if_present: bool,
-    read_base: u32,
-    read_eval: bool,
-    read_circular: bool,
-    depth: usize,
+    options: ReaderOptions,
 ) -> Result<(BlissVal, usize), BlissError> {
     // Read the feature expression, which may be a symbol or a compound form
     // such as (or sbcl ccl).
@@ -1450,10 +1470,10 @@ fn read_feature_expr_with_base(
         chars,
         pos,
         labels,
-        read_base,
-        read_eval,
-        read_circular,
-        depth + 1,
+        options.read_base,
+        options.read_eval,
+        options.read_circular,
+        options.depth + 1,
     )?;
     pos = p;
     let feature_present = eval_feature_expression(feature);
@@ -1464,10 +1484,10 @@ fn read_feature_expr_with_base(
             chars,
             pos,
             labels,
-            read_base,
-            read_eval,
-            read_circular,
-            depth + 1,
+            options.read_base,
+            options.read_eval,
+            options.read_circular,
+            options.depth + 1,
         )
     } else {
         // Skip the next form syntactically without resolving packages or

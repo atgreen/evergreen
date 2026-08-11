@@ -1332,6 +1332,27 @@ pub fn run_finalizers_for(object: BlissVal) -> Vec<BlissVal> {
     invoked
 }
 
+/// Drain and invoke every finalizer still registered with the runtime.
+///
+/// Shutdown uses this to honor the lifecycle contract even when no GC cycle
+/// happens to collect the associated objects first.
+pub fn run_pending_finalizers() -> Vec<(BlissVal, BlissVal)> {
+    let mut registry = finalizer_registry().lock().unwrap();
+    let entries: Vec<_> = registry.drain(..).collect();
+    drop(registry);
+
+    let mut invoked = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(dispatch) = entry.callback.or_else(|| FINALIZER_DISPATCH.get().copied()) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dispatch(entry.finalizer, entry.object);
+            }));
+        }
+        invoked.push((entry.finalizer, entry.object));
+    }
+    invoked
+}
+
 // ── GC statistics ──────────────────────────────────────────────────
 
 /// GC statistics for introspection (`ROOM`, profiling).

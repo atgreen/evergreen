@@ -2881,30 +2881,15 @@ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// Per-connection state (D6.07 / R6.35).
 #[allow(dead_code)]
 struct SwankConnection {
-    #[expect(
-        dead_code,
-        reason = "connection metadata is retained for future swank command handling"
-    )]
+    #[allow(dead_code)]
     id: SwankConnectionId,
-    #[expect(
-        dead_code,
-        reason = "connection metadata is retained for future swank command handling"
-    )]
+    #[allow(dead_code)]
     stream: TcpStream,
-    #[expect(
-        dead_code,
-        reason = "connection metadata is retained for future swank command handling"
-    )]
+    #[allow(dead_code)]
     buffer_package: String,
-    #[expect(
-        dead_code,
-        reason = "connection metadata is retained for future swank command handling"
-    )]
+    #[allow(dead_code)]
     pending_returns: HashMap<u64, ()>,
-    #[expect(
-        dead_code,
-        reason = "connection metadata is retained for future swank command handling"
-    )]
+    #[allow(dead_code)]
     thread_id: u64,
 }
 

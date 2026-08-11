@@ -508,3 +508,24 @@ pub fn all_thread_ids() -> Vec<GreenThreadId> {
     let registry = thread_registry().lock().unwrap();
     registry.keys().copied().collect()
 }
+
+/// Wait until every other registered green thread has finished executing.
+///
+/// Unlike `join_thread`, this preserves each thread's result so callers may
+/// still join later and observe the completed value.
+pub fn wait_for_other_threads() {
+    let current = current_thread_id();
+    loop {
+        let pending = {
+            let registry = thread_registry().lock().unwrap();
+            registry
+                .iter()
+                .filter(|(id, _)| **id != current)
+                .any(|(_, thread)| thread.state() != ThreadState::Dead)
+        };
+        if !pending {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}

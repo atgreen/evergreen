@@ -490,7 +490,15 @@ struct ClosureObj {
 
 /// Default T0→T1 threshold.
 const DEFAULT_T0_T1_THRESHOLD: u32 = 10;
+#[expect(
+    dead_code,
+    reason = "T1->T2 promotion defaults are specified but not yet threaded through a shared config constructor"
+)]
 const DEFAULT_T1_T2_THRESHOLD: u32 = 5_000;
+#[expect(
+    dead_code,
+    reason = "OSR loop-heat defaults are specified but not yet threaded through a shared config constructor"
+)]
 const DEFAULT_LOOP_HEAT_THRESHOLD: u32 = 10_000;
 
 fn env_threshold(name: &str, default: u32) -> u32 {

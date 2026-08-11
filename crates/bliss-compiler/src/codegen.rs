@@ -872,7 +872,7 @@ impl LinearScanAllocator {
         // Non-value nodes (Start, Return, Region, Branch, MemStore, Safepoint)
         // don't need register assignments.
         let mut value_nodes = Vec::new();
-        let start = graph.start();
+        let _start = graph.start();
 
         let mut ordered: Vec<_> = graph.node_ids().collect();
         ordered.sort_by_key(|id| id.0);

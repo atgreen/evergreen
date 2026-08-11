@@ -435,7 +435,6 @@ fn stream_write_string(stream_val: BlissVal, s: &str) -> Result<(), BlissError> 
 // ── Closure representation ───────────────────────────────────────
 #[derive(Clone)]
 struct Closure {
-    params: Vec<String>,
     /// Raw lambda list, for full &optional/&rest/&key binding.
     params_form: BlissVal,
     body: BlissVal,
@@ -1755,10 +1754,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (lh, lr) = cp(name_form);
                     if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
                         let (params_form, body) = cp(lr);
-                        let params = extract_params(params_form);
                         // Capture the current lexical environment
                         let closure = Closure {
-                            params: params.clone(),
                             params_form,
                             body,
                             captured_vars: env.visible_vars(),
@@ -1775,9 +1772,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "LAMBDA" => {
                 // Bare (lambda (params) body...) — create a closure
                 let (params_form, body) = cp(cdr);
-                let params = extract_params(params_form);
                 let closure = Closure {
-                    params: params.clone(),
                     params_form,
                     body,
                     captured_vars: env.visible_vars(),
@@ -4516,6 +4511,7 @@ fn apply_function(
     Err(BlissError::Internal(format!("Cannot apply: {:?}", fn_val)))
 }
 
+#[expect(dead_code, reason = "legacy builtin dispatch is retained during evaluator consolidation")]
 fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissVal, BlissError> {
     match name {
         "+" => {

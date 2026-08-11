@@ -119,8 +119,8 @@ fn spec_gc_large_objects_minor_gc_and_full_gc_use_real_collector_paths() {
 
     full_gc().expect("full_gc");
     let after_full = heap_stats();
-    assert!(after_full.minor_gc_count >= after_minor.minor_gc_count + 1);
-    assert!(after_full.major_gc_count >= after_minor.major_gc_count + 1);
+    assert!(after_full.minor_gc_count > after_minor.minor_gc_count);
+    assert!(after_full.major_gc_count > after_minor.major_gc_count);
 
     let objects = heap_objects();
     assert!(
