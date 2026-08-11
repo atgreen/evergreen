@@ -24,7 +24,7 @@ fn special_constants_have_correct_bits() {
 
 #[test]
 fn special_payloads_are_sequential() {
-    assert_eq!(NIL_BITS, (0 << 3) | TAG_SPECIAL);
+    assert_eq!(NIL_BITS, TAG_SPECIAL);
     assert_eq!(T_BITS, (1 << 3) | TAG_SPECIAL);
     assert_eq!(UNBOUND_BITS, (2 << 3) | TAG_SPECIAL);
     assert_eq!(MISSING_BITS, (3 << 3) | TAG_SPECIAL);
@@ -194,9 +194,9 @@ fn single_float_zero_and_one() {
 
 #[test]
 fn single_float_negative() {
-    let v = BlissVal::from_single_float(-3.14_f32);
+    let v = BlissVal::from_single_float(-std::f32::consts::PI);
     assert!(v.is_single_float());
-    assert_eq!(v.as_single_float(), -3.14_f32);
+    assert_eq!(v.as_single_float(), -std::f32::consts::PI);
 }
 
 #[test]
@@ -389,9 +389,9 @@ fn raw_round_trip_char() {
 
 #[test]
 fn raw_round_trip_single_float() {
-    let v = BlissVal::from_single_float(2.718_f32);
+    let v = BlissVal::from_single_float(std::f32::consts::E);
     let v2 = BlissVal::from_raw(v.to_raw());
-    assert_eq!(v2.as_single_float(), 2.718_f32);
+    assert_eq!(v2.as_single_float(), std::f32::consts::E);
 }
 
 #[test]

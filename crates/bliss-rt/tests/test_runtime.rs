@@ -220,7 +220,7 @@ fn log_level_not_equal_across_variants() {
 #[test]
 fn log_level_clone_and_copy() {
     let level = LogLevel::Debug;
-    let cloned = level.clone();
+    let cloned = level;
     assert_eq!(level, cloned);
     // Copy: level is still usable after move
     let copied = level;

@@ -4,7 +4,7 @@
 use bliss_compiler::reader;
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{ConsCell, ObjectHeader, type_id};
-use bliss_rt::value::{BlissVal, EOF, NIL, T, TAG_HEAP_OBJECT};
+use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ pub struct CliArgs {
 }
 
 fn take_value<'a>(flag: &str, iter: &mut impl Iterator<Item = &'a String>) -> Result<String, BlissError> {
-    iter.next().map(|s| s.clone()).ok_or_else(|| BlissError::Internal(format!("{} requires a value", flag)))
+    iter.next().cloned().ok_or_else(|| BlissError::Internal(format!("{} requires a value", flag)))
 }
 
 impl CliArgs {
@@ -115,7 +115,7 @@ impl Arena {
         unsafe {
             let p = std::alloc::alloc_zeroed(layout);
             if p.is_null() { std::alloc::handle_alloc_error(layout); }
-            *(p as *mut ObjectHeader) = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, ((sz + 7) / 8) as u16);
+            *(p as *mut ObjectHeader) = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, sz.div_ceil(8) as u16);
             *(p.add(8) as *mut u64) = b.len() as u64;
             std::ptr::copy_nonoverlapping(b.as_ptr(), p.add(16), b.len());
             self.blocks.push((p, layout));
@@ -163,7 +163,7 @@ struct StreamState {
 
 thread_local! {
     static STREAMS: RefCell<HashMap<u64, StreamState>> = RefCell::new(HashMap::new());
-    static NEXT_STREAM_ID: RefCell<u64> = RefCell::new(1);
+    static NEXT_STREAM_ID: RefCell<u64> = const { RefCell::new(1) };
 }
 
 fn open_stream(path: &str, direction: StreamDirection) -> Result<BlissVal, BlissError> {
@@ -294,6 +294,7 @@ struct MacroDef {
     body: BlissVal,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct ClassDef {
     name: String,
@@ -315,6 +316,7 @@ struct MethodDef {
     body: BlissVal,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct PackageDef {
     name: String,
@@ -331,6 +333,7 @@ struct RestartEntry {
 
 /// Sentinel error used for non-local control flow when invoke-restart is called.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct RestartInvoked {
     name: String,
     result: BlissVal,
@@ -639,7 +642,7 @@ fn eval_quasiquote(template: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
 
 // ── Closure ID generation ────────────────────────────────────────
 thread_local! {
-    static NEXT_CLOSURE_ID: RefCell<u64> = RefCell::new(1);
+    static NEXT_CLOSURE_ID: RefCell<u64> = const { RefCell::new(1) };
 }
 
 fn next_closure_id() -> u64 {
@@ -720,6 +723,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
     Ok(last)
 }
 
+#[allow(dead_code)]
 fn read_eval_all(source: &str) -> Result<BlissVal, BlissError> {
     let mut env = Env::new(false);
     read_eval_all_env(source, &mut env)
@@ -1043,17 +1047,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "APPEND" => {
                 let mut all = Vec::new();
-                let mut c = cdr;
                 let items = list_to_vec(cdr);
                 if items.is_empty() { return Ok(NIL); }
                 for (i, item_form) in items.iter().enumerate() {
                     let v = eval_form(*item_form, env)?;
                     if i == items.len() - 1 && v.is_nil() { continue; }
-                    if i == items.len() - 1 {
-                        all.extend(list_to_vec(v));
-                    } else {
-                        all.extend(list_to_vec(v));
-                    }
+                    all.extend(list_to_vec(v));
                 }
                 return Ok(vec_to_list(&all));
             }
@@ -1142,7 +1141,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if args.is_empty() { return Err(BlissError::Internal("MIN requires at least one argument".into())); }
                 let mut min = num_val(args[0])?;
                 let mut is_f = args[0].is_single_float();
-                for a in &args[1..] { let v = num_val(*a)?; if v < min { min = v; } if a.is_single_float() { is_f = true; } }
+                for a in &args[1..] {
+                    let v = num_val(*a)?;
+                    let is_single_float = a.is_single_float();
+                    if v < min {
+                        min = v;
+                    }
+                    if is_single_float {
+                        is_f = true;
+                    }
+                }
                 return Ok(if is_f { BlissVal::from_single_float(min as f32) } else { BlissVal::from_fixnum(min as i64) });
             }
             "MAX" => {
@@ -1150,7 +1158,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if args.is_empty() { return Err(BlissError::Internal("MAX requires at least one argument".into())); }
                 let mut max = num_val(args[0])?;
                 let mut is_f = args[0].is_single_float();
-                for a in &args[1..] { let v = num_val(*a)?; if v > max { max = v; } if a.is_single_float() { is_f = true; } }
+                for a in &args[1..] {
+                    let v = num_val(*a)?;
+                    let is_single_float = a.is_single_float();
+                    if v > max {
+                        max = v;
+                    }
+                    if is_single_float {
+                        is_f = true;
+                    }
+                }
                 return Ok(if is_f { BlissVal::from_single_float(max as f32) } else { BlissVal::from_fixnum(max as i64) });
             }
             "FLOOR" => return eval_floor(cdr, env),
@@ -1239,7 +1256,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else if cond.is_symbol() {
                     sym_name(cond)
                 } else {
-                    val_as_str(cond.clone())
+                    val_as_str(cond)
                 };
                 // Signal runs handlers; if no handler catches, returns NIL
                 for handler in env.handlers.clone().iter().rev() {
@@ -1247,7 +1264,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         || handler.type_name == "CONDITION"
                         || handler.type_name == "ERROR"
                         || handler.type_name == "T" {
-                        let hfn = handler.handler.clone();
+                        let hfn = handler.handler;
                         let _ = apply_function(hfn, &[cond], env);
                     }
                 }
@@ -1275,7 +1292,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "CERROR" => return eval_cerror(cdr, env),
             "INVOKE-RESTART" => {
-                let (name_form, rest_args) = cp(cdr);
+                let (name_form, _rest_args) = cp(cdr);
                 let name_val = eval_form(name_form, env)?;
                 let restart_name = val_as_str(name_val).to_uppercase();
                 // Look up the restart by name in the restart stack
@@ -1366,7 +1383,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
             }
             "GENSYM" => {
-                thread_local! { static COUNTER: RefCell<u64> = RefCell::new(0); }
+                thread_local! { static COUNTER: RefCell<u64> = const { RefCell::new(0) }; }
                 let n = COUNTER.with(|c| { let v = *c.borrow(); *c.borrow_mut() = v + 1; v });
                 let name = format!("G{}", n);
                 match resolve_sym(&name) {
@@ -1498,9 +1515,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let arg_class = get_instance_class_name(args[0]);
                 if method.specializer == arg_class || is_subclass(&arg_class, &method.specializer, env) {
                     // Prefer more specific (exact match over superclass)
-                    if best_method.is_none() {
-                        best_method = Some(method);
-                    } else if method.specializer == arg_class {
+                    if best_method.is_none() || method.specializer == arg_class {
                         best_method = Some(method);
                     }
                 }
@@ -1862,7 +1877,7 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         }
     }
 
-    Rc::make_mut(&mut env.methods).entry(name.clone()).or_insert_with(Vec::new)
+    Rc::make_mut(&mut env.methods).entry(name.clone()).or_default()
         .push(MethodDef { specializer, params, body });
     Ok(name_form)
 }
@@ -1959,21 +1974,19 @@ fn apply_function(fn_val: BlissVal, args: &[BlissVal], env: &mut Env) -> Result<
     if fn_val.is_cons() {
         let (lh, lr) = cp(fn_val);
         // Check for closure: (BLISS::CLOSURE . id)
-        if lh.is_symbol() && sym_name(lh) == "BLISS::CLOSURE" {
-            if lr.is_fixnum() {
-                let id = lr.as_fixnum() as u64;
-                if let Some(closure) = env.closures.get(&id).cloned() {
-                    let mut child_env = env.child();
-                    // Restore captured lexical environment
-                    for (k, v) in &closure.captured_vars {
-                        child_env.define_local(k, *v);
-                    }
-                    // Bind parameters
-                    for (i, param) in closure.params.iter().enumerate() {
-                        child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
-                    }
-                    return eval_progn(closure.body, &mut child_env);
+        if lh.is_symbol() && sym_name(lh) == "BLISS::CLOSURE" && lr.is_fixnum() {
+            let id = lr.as_fixnum() as u64;
+            if let Some(closure) = env.closures.get(&id).cloned() {
+                let mut child_env = env.child();
+                // Restore captured lexical environment
+                for (k, v) in &closure.captured_vars {
+                    child_env.define_local(k, *v);
                 }
+                // Bind parameters
+                for (i, param) in closure.params.iter().enumerate() {
+                    child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
+                }
+                return eval_progn(closure.body, &mut child_env);
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
@@ -1989,7 +2002,7 @@ fn apply_function(fn_val: BlissVal, args: &[BlissVal], env: &mut Env) -> Result<
     Err(BlissError::Internal(format!("Cannot apply: {:?}", fn_val)))
 }
 
-fn apply_builtin(name: &str, args: &[BlissVal], env: &mut Env) -> Result<BlissVal, BlissError> {
+fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissVal, BlissError> {
     match name {
         "+" => {
             let mut sum: f64 = 0.0; let mut is_f = false;
@@ -2072,7 +2085,7 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
         } else {
             NIL
         };
-        child_env.define_local(&var_name, val);
+        child_env.define_local(var_name, val);
     }
 
     eval_progn(body, &mut child_env)
@@ -2155,7 +2168,7 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // Check if there's a handler that will invoke the restart
     for handler in env.handlers.clone().iter().rev() {
         if handler.type_name == "ERROR" || handler.type_name == "CONDITION" || handler.type_name == "T" {
-            let hfn = handler.handler.clone();
+            let hfn = handler.handler;
             let cond = arena_str(&val_as_str(msg));
             match apply_function(hfn, &[cond], env) {
                 Ok(_) => {
@@ -2403,16 +2416,19 @@ fn run_script_env(path: &str, env: &mut Env) -> Result<i32, BlissError> {
 }
 
 // Keep standalone versions for backward compatibility
+#[allow(dead_code)]
 fn run_eval(expr: &str) -> Result<i32, BlissError> {
     let mut env = Env::new(false);
     run_eval_env(expr, &mut env)
 }
 
+#[allow(dead_code)]
 fn run_load(path: &str) -> Result<i32, BlissError> {
     let mut env = Env::new(false);
     run_load_env(path, &mut env)
 }
 
+#[allow(dead_code)]
 fn run_script(path: &str) -> Result<i32, BlissError> {
     let mut env = Env::new(false);
     run_script_env(path, &mut env)

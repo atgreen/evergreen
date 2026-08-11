@@ -100,6 +100,12 @@ impl ReplState {
     }
 }
 
+impl Default for ReplState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Load persistent history from ~/.bliss/repl-history (R6.03).
 fn load_history_from_file() -> Vec<String> {
     let path = history_file_path();
@@ -203,7 +209,7 @@ fn swank_symbol_name(name: &str) -> String {
     name.trim_matches('\'')
         .trim_matches('"')
         .split(':')
-        .last()
+        .next_back()
         .unwrap_or(name)
         .to_string()
 }
@@ -447,12 +453,16 @@ pub enum StepMode {
 }
 
 /// Thread-local stepping state.
+#[allow(dead_code)]
 struct SteppingState {
     /// The thread that is currently stepping.
+    #[expect(dead_code, reason = "stepping metadata is retained for future debugger coordination")]
     thread_id: u64,
     /// The step mode.
+    #[expect(dead_code, reason = "stepping metadata is retained for future debugger coordination")]
     mode: StepMode,
     /// Frame pointer of the frame being stepped (for Next/Out).
+    #[expect(dead_code, reason = "stepping metadata is retained for future debugger coordination")]
     frame_fp: usize,
     /// Trap addresses installed for stepping, with original bytes.
     traps: Vec<(usize, Vec<u8>)>,
@@ -998,10 +1008,7 @@ fn should_breakpoint_fire(info: &mut BreakpointInfo) -> bool {
         return false;
     }
     info.hit_count += 1;
-    match info.condition {
-        Some(cond) if cond == NIL => false,
-        _ => true,
-    }
+    !matches!(info.condition, Some(cond) if cond == NIL)
 }
 
 /// Set a breakpoint on function entry. R6.14/R6.16.
@@ -1212,9 +1219,12 @@ static INSTRUMENT_PROFILER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// A single profiler sample: captures the return address (PC) at sample time.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct ProfileSample {
     pc: usize,
+    #[expect(dead_code, reason = "sampling metadata is retained for future profile exports")]
     timestamp_us: u64,
+    #[expect(dead_code, reason = "sampling metadata is retained for future profile exports")]
     thread_id: u64,
 }
 
@@ -1284,9 +1294,11 @@ pub enum ProfilerKind {
 
 /// Allocation tracking record.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct AllocRecord {
     type_tag: u8,
     size: usize,
+    #[expect(dead_code, reason = "allocation metadata is retained for future profile exports")]
     pc: usize,
 }
 
@@ -1312,6 +1324,7 @@ struct AllocState {
 
 /// Per-function instrumentation data for the deterministic profiler.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct InstrumentEntry {
     call_count: u64,
     cumulative_time_ns: u64,
@@ -1319,6 +1332,7 @@ struct InstrumentEntry {
     /// Timestamp when the function was entered (for computing elapsed).
     entry_time: Option<Instant>,
     /// Count of nested calls (for self-time accounting).
+    #[expect(dead_code, reason = "instrumentation metadata is retained for future nested timing")]
     nested_depth: u64,
 }
 
@@ -1876,7 +1890,7 @@ pub fn disassemble(
                 // In a full implementation, we'd query the code-location map.
                 // Here we annotate at function entry and at 16-byte boundaries.
                 if i == 0 {
-                    let new_src = format!("; Source: function entry");
+                    let new_src = "; Source: function entry".to_string();
                     if current_source.as_ref() != Some(&new_src) {
                         writeln!(out, "{}", new_src).unwrap();
                         current_source = Some(new_src);
@@ -2309,8 +2323,8 @@ fn compute_inspect_parts(object: BlissVal) -> Vec<(&'static str, BlissVal)> {
 pub fn room(verbosity: Option<BlissVal>, _stream: BlissVal) -> Result<(), BlissError> {
     let stats = bliss_rt::gc::heap_stats();
     let mut report = String::new();
-    let is_full = verbosity.map_or(false, |v| v == T);
-    let is_minimal = verbosity.map_or(false, |v| v == NIL);
+    let is_full = verbosity == Some(T);
+    let is_minimal = verbosity == Some(NIL);
 
     if is_minimal {
         let total = stats.nursery_used + stats.old_gen_used + stats.large_object_bytes;
@@ -2382,11 +2396,17 @@ struct SwankConnectionId(u64);
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Per-connection state (D6.07 / R6.35).
+#[allow(dead_code)]
 struct SwankConnection {
+    #[expect(dead_code, reason = "connection metadata is retained for future swank command handling")]
     id: SwankConnectionId,
+    #[expect(dead_code, reason = "connection metadata is retained for future swank command handling")]
     stream: TcpStream,
+    #[expect(dead_code, reason = "connection metadata is retained for future swank command handling")]
     buffer_package: String,
+    #[expect(dead_code, reason = "connection metadata is retained for future swank command handling")]
     pending_returns: HashMap<u64, ()>,
+    #[expect(dead_code, reason = "connection metadata is retained for future swank command handling")]
     thread_id: u64,
 }
 
@@ -2613,7 +2633,7 @@ fn dispatch_swank_message(message: &str, interpreter: &mut bliss_compiler::tiere
 
     // Thread listing (R6.38)
     if trimmed.contains("swank:list-threads") || trimmed.contains(":list-threads") {
-        return format!("(:return (:ok ((\"ID\" \"Name\" \"Status\") (\"1\" \"main\" \"running\"))) 0)\n");
+        return "(:return (:ok ((\"ID\" \"Name\" \"Status\") (\"1\" \"main\" \"running\"))) 0)\n".to_string();
     }
 
     // Default response

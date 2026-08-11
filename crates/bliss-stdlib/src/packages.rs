@@ -23,7 +23,7 @@ static NEXT_SYMBOL_ID: AtomicI64 = AtomicI64::new(1);
 // Set by `PackageRegistry::new()` so that free functions (`intern`, `find_symbol`, etc.)
 // can access the store without an explicit registry reference.
 thread_local! {
-    static CURRENT_STORE: RefCell<Option<Rc<RefCell<PackageStore>>>> = RefCell::new(None);
+    static CURRENT_STORE: RefCell<Option<Rc<RefCell<PackageStore>>>> = const { RefCell::new(None) };
 }
 
 struct PackageStore {
@@ -223,6 +223,12 @@ impl PackageRegistry {
             .keys()
             .map(|&id| BlissVal::from_fixnum(id))
             .collect()
+    }
+}
+
+impl Default for PackageRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

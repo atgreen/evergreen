@@ -202,7 +202,6 @@ fn x86_64_emit_produces_nonempty_code_buffer() {
     let buf = backend.emit(&graph).expect("emit should succeed for minimal graph");
     // A compiled function (even trivial) should produce at least some machine code bytes.
     assert!(!buf.is_empty(), "emitted code buffer should not be empty");
-    assert!(buf.len() > 0, "emitted code length should be > 0");
     assert_eq!(buf.code().len(), buf.len(),
         "code() length should match len()");
 }
@@ -218,7 +217,6 @@ fn aarch64_emit_produces_nonempty_code_buffer() {
 
     let buf = backend.emit(&graph).expect("emit should succeed for minimal graph");
     assert!(!buf.is_empty(), "emitted code buffer should not be empty");
-    assert!(buf.len() > 0, "emitted code length should be > 0");
 }
 
 #[test]

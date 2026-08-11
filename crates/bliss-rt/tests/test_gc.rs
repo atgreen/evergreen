@@ -104,9 +104,11 @@ fn gc_stats_default_all_zeroed() {
 
 #[test]
 fn gc_stats_clone_and_debug() {
-    let mut s = GcStats::default();
-    s.minor_gc_count = 10;
-    s.bytes_allocated = 999;
+    let s = GcStats {
+        minor_gc_count: 10,
+        bytes_allocated: 999,
+        ..GcStats::default()
+    };
     let s2 = s.clone();
     assert_eq!(s2.minor_gc_count, 10);
     assert!(format!("{:?}", s2).contains("bytes_allocated"));
@@ -332,10 +334,11 @@ impl Collector for TestCollector {
         Ok(())
     }
     fn stats(&self) -> GcStats {
-        let mut s = GcStats::default();
-        s.minor_gc_count = self.minor_count;
-        s.major_gc_count = self.major_count;
-        s
+        GcStats {
+            minor_gc_count: self.minor_count,
+            major_gc_count: self.major_count,
+            ..GcStats::default()
+        }
     }
 }
 

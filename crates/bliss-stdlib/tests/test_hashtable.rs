@@ -11,7 +11,7 @@ fn hashtest_eq_clone_copy_debug() {
     assert_ne!(HashTest::Eq, HashTest::Eql);
     assert_ne!(HashTest::Eq, HashTest::Equal);
     assert_ne!(HashTest::Eq, HashTest::Equalp);
-    let cloned = HashTest::Eq.clone();
+    let cloned = HashTest::Eq;
     assert_eq!(HashTest::Eq, cloned);
     let copied = HashTest::Eq;
     assert_eq!(HashTest::Eq, copied);
@@ -41,7 +41,7 @@ fn weakness_eq_clone_copy_debug() {
     assert_ne!(Weakness::Key, Weakness::Value);
     assert_ne!(Weakness::Key, Weakness::KeyAndValue);
     assert_ne!(Weakness::Value, Weakness::KeyAndValue);
-    let cloned = Weakness::Key.clone();
+    let cloned = Weakness::Key;
     assert_eq!(Weakness::Key, cloned);
     let copied = Weakness::Value;
     assert_eq!(Weakness::Value, copied);

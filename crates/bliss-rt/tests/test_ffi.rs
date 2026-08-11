@@ -158,17 +158,17 @@ fn unmarshal_int32_to_fixnum() {
 
 #[test]
 fn marshal_single_float_to_float() {
-    let val = BlissVal::from_single_float(3.14);
+    let val = BlissVal::from_single_float(std::f32::consts::PI);
     let result = marshal_to_c(val, &AlienType::Float);
     assert!(result.is_ok());
     let bits = result.unwrap() as u32;
     let f = f32::from_bits(bits);
-    assert!((f - 3.14).abs() < 0.01);
+    assert!((f - std::f32::consts::PI).abs() < 0.01);
 }
 
 #[test]
 fn unmarshal_double_to_blissval() {
-    let bits = f64::to_bits(2.718);
+    let bits = f64::to_bits(std::f64::consts::E);
     let result = unmarshal_from_c(bits, &AlienType::Double);
     assert!(result.is_ok());
 }

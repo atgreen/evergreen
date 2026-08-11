@@ -75,24 +75,24 @@ pub fn heap_object_p(v: BlissVal) -> bool {
 
 /// `STRINGP` — simple-base-string, simple-character-string, or complex string.
 pub fn stringp(v: BlissVal) -> bool {
-    match heap_type_id(v) {
-        Some(type_id::SIMPLE_BASE_STRING) | Some(type_id::SIMPLE_CHARACTER_STRING) => true,
-        _ => false,
-    }
+    matches!(
+        heap_type_id(v),
+        Some(type_id::SIMPLE_BASE_STRING) | Some(type_id::SIMPLE_CHARACTER_STRING)
+    )
 }
 
 /// `VECTORP` — rank-1 array of any kind.
 /// Includes simple-vector, simple-array, simple-base-string,
 /// simple-character-string, complex-array.
 pub fn vectorp(v: BlissVal) -> bool {
-    match heap_type_id(v) {
+    matches!(
+        heap_type_id(v),
         Some(type_id::SIMPLE_VECTOR)
         | Some(type_id::SIMPLE_ARRAY)
         | Some(type_id::SIMPLE_BASE_STRING)
         | Some(type_id::SIMPLE_CHARACTER_STRING)
-        | Some(type_id::COMPLEX_ARRAY) => true,
-        _ => false,
-    }
+        | Some(type_id::COMPLEX_ARRAY)
+    )
 }
 
 /// `ARRAYP` — any array type.
@@ -121,13 +121,13 @@ pub fn numberp(v: BlissVal) -> bool {
     if v.is_fixnum() || v.is_single_float() {
         return true;
     }
-    match heap_type_id(v) {
+    matches!(
+        heap_type_id(v),
         Some(type_id::BIGNUM)
         | Some(type_id::RATIO)
         | Some(type_id::COMPLEX)
-        | Some(type_id::DOUBLE_FLOAT) => true,
-        _ => false,
-    }
+        | Some(type_id::DOUBLE_FLOAT)
+    )
 }
 
 /// `INTEGERP` — fixnum or bignum.

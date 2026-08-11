@@ -1116,6 +1116,12 @@ fn pathname_from_fs_path(path: &Path) -> Result<BlissVal, BlissError> {
     Ok(make_record_value(build_record_from_namestring(parsed, None)))
 }
 
+fn pathname_from_listed_path(path: &Path) -> Result<BlissVal, BlissError> {
+    let path_str = path.to_string_lossy().to_string();
+    let parsed = parse_namestring_model(&path_str, None)?;
+    Ok(make_record_value(build_record_from_namestring(parsed, None)))
+}
+
 pub fn probe_file(pathname: BlissVal) -> Result<Option<BlissVal>, BlissError> {
     let path_str = resolve_relative_path(&extract_path_string(pathname)?);
     let path = Path::new(&path_str);
@@ -1184,7 +1190,7 @@ pub fn directory(pathname: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
             .map_err(|e| BlissError::FileError(format!("{}: {}", root.display(), e)))?
         {
             let entry = entry.map_err(|e| BlissError::FileError(e.to_string()))?;
-            result.push(pathname_from_fs_path(&entry.path())?);
+            result.push(pathname_from_listed_path(&entry.path())?);
         }
         result.sort_by_key(|bv| lookup_string(namestring(*bv).unwrap()).unwrap_or_default());
         return Ok(result);
@@ -1202,7 +1208,7 @@ pub fn directory(pathname: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
         let candidate_str = candidate.to_string_lossy().to_string();
         let candidate_rec = build_record_from_namestring(parse_namestring_model(&candidate_str, None)?, None);
         if pathname_match_with_captures(&candidate_rec, &rec).is_some() {
-            result.push(pathname_from_fs_path(&candidate)?);
+            result.push(pathname_from_listed_path(&candidate)?);
         }
     }
     result.sort_by_key(|bv| lookup_string(namestring(*bv).unwrap()).unwrap_or_default());

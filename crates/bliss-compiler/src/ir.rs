@@ -224,6 +224,12 @@ impl IrGraph {
     }
 }
 
+impl Default for IrGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── IR builder ─────────────────────────────────────────────────────
 
 /// Builds an IR graph from a CL AST (used by T2 compiler).
@@ -502,8 +508,8 @@ impl IrBuilder {
         // Build the body forms (like PROGN)
         if args.len() > 1 {
             let mut result_node = graph.add_node(NodeKind::Constant(BlissVal(NIL_BITS)));
-            for i in 1..args.len() {
-                result_node = self.build_form(graph, args[i], ctrl)?;
+            for arg in args.iter().skip(1) {
+                result_node = self.build_form(graph, *arg, ctrl)?;
             }
             Ok(result_node)
         } else {
@@ -666,5 +672,11 @@ pub fn verify(graph: &IrGraph) -> Result<(), Vec<String>> {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+impl Default for IrBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }

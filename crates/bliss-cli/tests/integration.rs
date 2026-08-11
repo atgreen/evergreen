@@ -4,8 +4,7 @@
 //! through the bliss-cli crate to verify cross-crate integration.
 
 use bliss_rt::runtime::{Runtime, RuntimeConfig, LogLevel};
-use bliss_rt::value::{BlissVal, NIL, T};
-use bliss_rt::error::BlissError;
+use bliss_rt::value::{BlissVal, NIL};
 
 // ── Helper ────────────────────────────────────────────────────────
 

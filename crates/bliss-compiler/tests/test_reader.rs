@@ -92,7 +92,7 @@ fn read_integer_returns_position_past_token() {
 fn read_floats() {
     let (v, _) = read_from_string("3.14").unwrap();
     assert!(v.is_single_float());
-    assert!((v.as_single_float() - 3.14_f32).abs() < 0.01);
+    assert!((v.as_single_float() - (314.0_f32 / 100.0_f32)).abs() < 0.01);
     let (v, _) = read_from_string("-1.5").unwrap();
     assert!((v.as_single_float() - (-1.5_f32)).abs() < 0.01);
     let (v, _) = read_from_string("1.0e2").unwrap();
@@ -474,9 +474,8 @@ fn read_skips_leading_whitespace() {
 
 #[test]
 fn read_empty_input() {
-    match read_from_string("") {
-        Ok((val, _)) => assert_eq!(val, EOF),
-        Err(_) => {}
+    if let Ok((val, _)) = read_from_string("") {
+        assert_eq!(val, EOF);
     }
 }
 

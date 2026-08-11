@@ -168,7 +168,7 @@ fn breakpoint_id_equality() {
 fn breakpoint_id_is_clone_copy_debug() {
     let a = BreakpointId(7);
     let b = a; // Copy
-    let c = a.clone();
+    let c = a;
     assert_eq!(a, b);
     assert_eq!(a, c);
     let dbg = format!("{:?}", a);

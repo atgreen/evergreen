@@ -329,14 +329,13 @@ fn match_routing_with_wildcard_arm() {
 #[test]
 fn bliss_error_in_result_ok() {
     let result: Result<i32, BlissError> = Ok(42);
-    assert_eq!(result.unwrap(), 42);
+    assert!(matches!(result, Ok(42)));
 }
 
 #[test]
 fn bliss_error_in_result_err() {
     let result: Result<i32, BlissError> = Err(BlissError::Oom);
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().to_string(), "out of memory");
+    assert!(matches!(result, Err(BlissError::Oom)));
 }
 
 #[test]

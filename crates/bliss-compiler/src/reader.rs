@@ -11,6 +11,11 @@ use bliss_rt::value::{BlissVal, EOF, NIL, T, TAG_HEAP_OBJECT};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+type MacroCharTable = HashMap<(u64, char), (BlissVal, bool)>;
+type DispatchCharTable = HashMap<(u64, char), bool>;
+type DispatchSubCharTable = HashMap<(u64, char, char), BlissVal>;
+type TokenChars = Vec<(char, bool)>;
+
 // ── Global symbol table ───────────────────────────────────────────
 static SYMBOL_TABLE: Mutex<Option<SymbolTable>> = Mutex::new(None);
 static PACKAGE_TABLE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
@@ -86,9 +91,9 @@ fn make_uninterned_symbol(_name: &str) -> BlissVal {
 }
 
 // ── Global macro character tables ─────────────────────────────────
-static MACRO_CHARS: Mutex<Option<HashMap<(u64, char), (BlissVal, bool)>>> = Mutex::new(None);
-static DISPATCH_CHARS: Mutex<Option<HashMap<(u64, char), bool>>> = Mutex::new(None);
-static DISPATCH_SUB_CHARS: Mutex<Option<HashMap<(u64, char, char), BlissVal>>> = Mutex::new(None);
+static MACRO_CHARS: Mutex<Option<MacroCharTable>> = Mutex::new(None);
+static DISPATCH_CHARS: Mutex<Option<DispatchCharTable>> = Mutex::new(None);
+static DISPATCH_SUB_CHARS: Mutex<Option<DispatchSubCharTable>> = Mutex::new(None);
 
 // ── Circular structure label table ────────────────────────────────
 // Thread-local for read_from_string calls
@@ -115,7 +120,7 @@ fn alloc_string(s: &str) -> BlissVal {
     let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
-        let header = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, ((total_size + 7) / 8) as u16);
+        let header = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, total_size.div_ceil(8) as u16);
         *(ptr as *mut ObjectHeader) = header;
         *(ptr.add(8) as *mut u64) = bytes.len() as u64;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
@@ -128,7 +133,7 @@ fn alloc_vector(elements: &[BlissVal]) -> BlissVal {
     let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
-        let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, ((total_size + 7) / 8) as u16);
+        let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, total_size.div_ceil(8) as u16);
         *(ptr as *mut ObjectHeader) = header;
         *(ptr.add(8) as *mut u64) = elements.len() as u64;
         for (i, &elem) in elements.iter().enumerate() {
@@ -158,15 +163,15 @@ fn alloc_complex(real: BlissVal, imag: BlissVal) -> BlissVal {
 
 fn alloc_bit_vector(bits: &[u8]) -> BlissVal {
     // Layout: ObjectHeader (8) + element_type_tag byte + padding (7) + length (8) + data
-    let data_bytes = (bits.len() + 7) / 8;
+    let data_bytes = bits.len().div_ceil(8);
     let total_size = 8 + 8 + 8 + data_bytes;
     let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
-        let header = ObjectHeader::new(type_id::SIMPLE_ARRAY, ((total_size + 7) / 8) as u16);
+        let header = ObjectHeader::new(type_id::SIMPLE_ARRAY, total_size.div_ceil(8) as u16);
         *(ptr as *mut ObjectHeader) = header;
         // Element type tag at first byte after header
-        *(ptr.add(8) as *mut u8) = ElementTypeTag::Bit as u8;
+        *ptr.add(8) = ElementTypeTag::Bit as u8;
         // Length stored after the element-type word
         *(ptr.add(16) as *mut u64) = bits.len() as u64;
         // Pack bits
@@ -213,7 +218,7 @@ fn alloc_structure(name: BlissVal, slots: &[BlissVal]) -> BlissVal {
     let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
-        let header = ObjectHeader::new(type_id::STRUCTURE, ((total_size + 7) / 8) as u16);
+        let header = ObjectHeader::new(type_id::STRUCTURE, total_size.div_ceil(8) as u16);
         *(ptr as *mut ObjectHeader) = header;
         *(ptr.add(8) as *mut BlissVal) = name;
         *(ptr.add(16) as *mut u64) = slots.len() as u64;
@@ -259,6 +264,12 @@ impl ReaderState {
     pub fn set_read_base(&mut self, base: u32) { self.read_base = base; }
     pub fn set_read_suppress(&mut self, suppress: bool) { self.read_suppress = suppress; }
     pub fn set_read_eval(&mut self, eval: bool) { self.read_eval = eval; }
+}
+
+impl Default for ReaderState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Source location ────────────────────────────────────────────────
@@ -359,6 +370,7 @@ pub fn read_from_string_with_base(s: &str, read_base: u32, read_eval: bool) -> R
     Ok((val, pos))
 }
 
+#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
 fn read_token(
     chars: &[char], pos: usize, labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
@@ -418,6 +430,7 @@ fn skip_whitespace_and_comments(chars: &[char], mut pos: usize) -> usize {
     }
 }
 
+#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
 fn read_list(
     chars: &[char], pos: usize, labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
@@ -489,6 +502,7 @@ fn read_string(chars: &[char], mut pos: usize) -> Result<(BlissVal, usize), Blis
     }
 }
 
+#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
 fn read_atom(chars: &[char], pos: usize) -> Result<(BlissVal, usize), BlissError> {
     read_atom_with_base(chars, pos, 10)
 }
@@ -501,9 +515,9 @@ fn read_atom_with_base(chars: &[char], pos: usize, read_base: u32) -> Result<(Bl
 
 /// Collect a token respecting single-escape (\) and multiple-escape (|...|).
 /// Returns (token_chars_with_case_info, end_position, had_any_escape).
-fn collect_token(chars: &[char], mut pos: usize) -> Result<(Vec<(char, bool)>, usize, bool), BlissError> {
+fn collect_token(chars: &[char], mut pos: usize) -> Result<(TokenChars, usize, bool), BlissError> {
     // Each element is (char, escaped) where escaped means preserve case
-    let mut token: Vec<(char, bool)> = Vec::new();
+    let mut token: TokenChars = Vec::new();
     let mut in_multiple_escape = false;
     let mut had_escape = false;
 
@@ -544,6 +558,7 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(Vec<(char, bool)>, u
     Ok((token, pos, had_escape))
 }
 
+#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
 fn parse_token(token: &[(char, bool)], has_escape: bool) -> Result<BlissVal, BlissError> {
     parse_token_with_base(token, has_escape, 10)
 }
@@ -565,8 +580,7 @@ fn parse_token_with_base(token: &[(char, bool)], has_escape: bool, read_base: u3
             return Ok(result);
         }
         // Check for keyword symbols
-        if name.starts_with(':') {
-            let kw_name = &name[1..];
+        if let Some(kw_name) = name.strip_prefix(':') {
             if kw_name.is_empty() {
                 return Err(BlissError::StreamError("empty keyword".into()));
             }
@@ -595,8 +609,8 @@ fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
     if let Some(colon_pos) = name.find(':') {
         let pkg = &name[..colon_pos];
         let rest = &name[colon_pos + 1..];
-        let (sym_name, _internal) = if rest.starts_with(':') {
-            (&rest[1..], true)
+        let (sym_name, _internal) = if let Some(stripped) = rest.strip_prefix(':') {
+            (stripped, true)
         } else {
             (rest, false)
         };
@@ -630,6 +644,7 @@ fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
     }
 }
 
+#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
 fn try_parse_number(s: &str) -> Result<Option<BlissVal>, BlissError> {
     try_parse_number_with_base(s, 10)
 }
@@ -658,13 +673,15 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
         return Ok(None);
     }
     // Float: contains '.' or 'E'/'e' with digits (only for base 10)
-    if read_base == 10 {
-        if s.contains('.') || (s.contains('e') || s.contains('E')) && !s.chars().all(|c| c.is_ascii_hexdigit() || c == '+' || c == '-') {
-            if let Ok(f) = s.parse::<f32>() {
-                return Ok(Some(BlissVal::from_single_float(f)));
-            }
-            return Ok(None);
+    if read_base == 10
+        && (s.contains('.')
+            || (s.contains('e') || s.contains('E'))
+                && !s.chars().all(|c| c.is_ascii_hexdigit() || c == '+' || c == '-'))
+    {
+        if let Ok(f) = s.parse::<f32>() {
+            return Ok(Some(BlissVal::from_single_float(f)));
         }
+        return Ok(None);
     }
     // Integer with read_base
     let trimmed = s.trim_start_matches('+');
@@ -674,6 +691,7 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
     Ok(None)
 }
 
+#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
 fn read_sharpsign(
     chars: &[char], pos: usize, labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
@@ -812,6 +830,7 @@ fn read_char_literal(chars: &[char], pos: usize) -> Result<(BlissVal, usize), Bl
     Ok((BlissVal::from_char(chars[pos]), end))
 }
 
+#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
 fn read_vector_literal(
     chars: &[char], pos: usize, labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
@@ -836,6 +855,7 @@ fn read_vector_literal_with_base(
     }
 }
 
+#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
 fn read_complex_literal(
     chars: &[char], pos: usize, labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
@@ -906,6 +926,7 @@ fn skip_block_comment(chars: &[char], mut pos: usize) -> Result<usize, BlissErro
     Err(BlissError::StreamError("unterminated block comment".into()))
 }
 
+#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
 fn read_feature_expr(
     chars: &[char], pos: usize, labels: &mut CircularLabels, include_if_present: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
@@ -1000,10 +1021,10 @@ fn try_eval(form: BlissVal) -> Option<BlissVal> {
                 }
             }
             // Unary + is identity
-            if op == BlissVal::from_symbol_index(plus_idx) {
-                if arg1.is_fixnum() || arg1.is_single_float() {
-                    return Some(arg1);
-                }
+            if op == BlissVal::from_symbol_index(plus_idx)
+                && (arg1.is_fixnum() || arg1.is_single_float())
+            {
+                return Some(arg1);
             }
             return None;
         }
@@ -1055,6 +1076,7 @@ fn read_pathname_literal(chars: &[char], pos: usize) -> Result<(BlissVal, usize)
     Ok((alloc_pathname(string_val), end))
 }
 
+#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
 fn read_struct_literal(
     chars: &[char], pos: usize, labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
@@ -1111,7 +1133,7 @@ pub fn make_readtable(from: Option<BlissVal>) -> Result<BlissVal, BlissError> {
             let table = guard.get_or_insert_with(HashMap::new);
             let copies: Vec<_> = table.iter()
                 .filter(|&(&(k, _), _)| k == src_key)
-                .map(|(&(_, ch), v)| (ch, v.clone()))
+                .map(|(&(_, ch), v)| (ch, *v))
                 .collect();
             for (ch, val) in copies {
                 table.insert((rt_key, ch), val);
@@ -1132,7 +1154,7 @@ pub fn copy_readtable(from: BlissVal, to: Option<BlissVal>) -> Result<BlissVal, 
     let table = guard.get_or_insert_with(HashMap::new);
     let copies: Vec<_> = table.iter()
         .filter(|&(&(k, _), _)| k == src_key)
-        .map(|(&(_, ch), v)| (ch, v.clone()))
+        .map(|(&(_, ch), v)| (ch, *v))
         .collect();
     for (ch, val) in copies {
         table.insert((dst_key, ch), val);

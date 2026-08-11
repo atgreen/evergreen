@@ -542,6 +542,12 @@ impl DeoptLog {
     }
 }
 
+impl Default for DeoptLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Result of a deoptimisation — reconstructed interpreter frame data
 /// that the runtime needs to resume interpretation.
 pub struct DeoptResult {
@@ -631,7 +637,7 @@ pub fn deoptimize(
         let mut logs = DEOPT_LOGS.lock().unwrap();
         let log = logs
             .entry(function.0)
-            .or_insert_with(DeoptLog::new);
+            .or_default();
         log.record(reason);
         (log.is_blacklisted(), log.total_deopts())
     };

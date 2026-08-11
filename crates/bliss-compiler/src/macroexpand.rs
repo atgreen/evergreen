@@ -173,7 +173,7 @@ impl Environment {
     /// Supports standard queries:
     /// - For 'optimize': returns optimize qualities as a BlissVal encoding.
     /// - For 'declaration': returns list of valid declaration names.
-    /// Walks the parent chain to find declarations (spec §4.2.9 R4.14).
+    ///   Walks the parent chain to find declarations (spec §4.2.9 R4.14).
     pub fn declaration_information(&self, decl_name: BlissVal) -> Option<BlissVal> {
         // Search this frame's declarations for an optimize entry
         for decl in &self.declarations {
@@ -404,21 +404,21 @@ fn lookup_compiler_macro(name: BlissVal) -> Option<CompilerMacroFn> {
 /// Registry mapping BlissVal expander identities to callable Rust functions.
 /// This enables the default_hook (funcall) to actually invoke macro expanders
 /// that are represented as BlissVal handles (spec §4.2.8 R4.15).
-static MACRO_FUNCTION_REGISTRY: LazyLock<RwLock<HashMap<u64, Arc<dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + Send + Sync>>>> =
+static MACRO_FUNCTION_REGISTRY: LazyLock<RwLock<HashMap<u64, Arc<MacroFn>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Register a macro expander function that can be invoked by the default hook.
 /// The `key` is the BlissVal that appears as FunctionInfo::Macro(key).
 pub fn register_macro_function(
     key: BlissVal,
-    func: Arc<dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + Send + Sync>,
+    func: Arc<MacroFn>,
 ) {
     let mut registry = MACRO_FUNCTION_REGISTRY.write().unwrap();
     registry.insert(key.0, func);
 }
 
 /// Look up a registered macro function by its BlissVal identity.
-fn lookup_macro_function(key: BlissVal) -> Option<Arc<dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + Send + Sync>> {
+fn lookup_macro_function(key: BlissVal) -> Option<Arc<MacroFn>> {
     let registry = MACRO_FUNCTION_REGISTRY.read().unwrap();
     registry.get(&key.0).cloned()
 }
@@ -677,15 +677,15 @@ fn is_lambda_expression(val: BlissVal) -> bool {
 /// 2. If the result is a self-evaluating atom or symbol, return it.
 /// 3. If the result is a cons (compound form):
 ///    a. Check for QUOTE — quoted data is opaque, no sub-form expansion
-///       occurs (spec §4.2.7).
+///    occurs (spec §4.2.7).
 ///    b. Dispatch to special-form handlers for special operators (spec §4.2.7).
 ///    c. Handle lambda expressions in operator position (spec §4.2.3 step 4.c).
 ///    d. Check for compiler macros (spec §4.2.4, R4.12) — if a compiler
-///       macro exists for the operator and notinline is NOT declared,
-///       invoke it. If it declines (returns form unchanged), fall through.
+///    macro exists for the operator and notinline is NOT declared,
+///    invoke it. If it declines (returns form unchanged), fall through.
 ///    e. Per spec §4.2.3 Phase 3 step 4.d.ii, the operator is NOT
-///       recursively code-walked (only arguments are expanded). The
-///       operator was already checked for macros by macroexpand above.
+///    recursively code-walked (only arguments are expanded). The
+///    operator was already checked for macros by macroexpand above.
 pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
     // Step 1: Macroexpand the top-level form
     let (expanded, _) = macroexpand(form, env)?;
@@ -1524,3 +1524,4 @@ fn walk_cons(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> 
     // Build a new cons cell with the expanded values (non-destructive).
     Ok(alloc_cons(expanded_car, expanded_cdr))
 }
+type MacroFn = dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + Send + Sync;

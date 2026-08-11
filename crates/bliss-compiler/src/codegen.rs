@@ -314,11 +314,11 @@ fn emit_x86_64(buf: &mut CodeBuffer, graph: &IrGraph) {
                 // Mask off tag bits: and rax, ~7
                 buf.emit_bytes(&[0x48, 0x83, 0xE0, 0xF8]);
                 // mov rax, [rax + offset]
-                if offset >= -128 && offset <= 127 {
+                if (-128..=127).contains(&offset) {
                     buf.emit_bytes(&[0x48, 0x8B, 0x40, offset as u8]);
                 } else {
                     buf.emit_bytes(&[0x48, 0x8B, 0x80]);
-                    buf.emit_bytes(&(offset as i32).to_le_bytes());
+                    buf.emit_bytes(&offset.to_le_bytes());
                 }
                 // Add GC root relocation
                 buf.add_relocation(Relocation {
@@ -340,11 +340,11 @@ fn emit_x86_64(buf: &mut CodeBuffer, graph: &IrGraph) {
                     // Load value into rax
                     emit_node_value_x86_64(buf, graph, data_inputs[1].from);
                     // mov [rcx + offset], rax
-                    if offset >= -128 && offset <= 127 {
+                    if (-128..=127).contains(&offset) {
                         buf.emit_bytes(&[0x48, 0x89, 0x41, offset as u8]);
                     } else {
                         buf.emit_bytes(&[0x48, 0x89, 0x81]);
-                        buf.emit_bytes(&(offset as i32).to_le_bytes());
+                        buf.emit_bytes(&offset.to_le_bytes());
                     }
                 }
             }
@@ -463,7 +463,7 @@ fn emit_aarch64(buf: &mut CodeBuffer, graph: &IrGraph) {
                 // AArch64 passes params in x0-x7; move to x0 for use
                 if idx > 0 && idx <= 7 {
                     // mov x0, x<idx>
-                    let mov = 0xAA0003E0u32 | ((idx as u32) << 16);
+                    let mov = 0xAA0003E0u32 | (idx << 16);
                     buf.emit_bytes(&mov.to_le_bytes());
                 }
             }
@@ -560,7 +560,7 @@ fn emit_aarch64(buf: &mut CodeBuffer, graph: &IrGraph) {
                 // Mask off tag: and x0, x0, #~7
                 buf.emit_bytes(&0x927CF800u32.to_le_bytes()); // and x0, x0, #0xFFFFFFFFFFFFFFF8
                 // ldr x0, [x0, #offset]
-                if offset >= 0 && offset < 32768 && (offset % 8 == 0) {
+                if (0..32768).contains(&offset) && (offset % 8 == 0) {
                     let ldr = 0xF9400000u32 | (((offset as u32 / 8) & 0xFFF) << 10);
                     buf.emit_bytes(&ldr.to_le_bytes());
                 } else {
@@ -586,7 +586,7 @@ fn emit_aarch64(buf: &mut CodeBuffer, graph: &IrGraph) {
                     // Load value into x0
                     emit_node_value_aarch64(buf, graph, data_inputs[1].from);
                     // str x0, [x1, #offset]
-                    if offset >= 0 && offset < 32768 && (offset % 8 == 0) {
+                    if (0..32768).contains(&offset) && (offset % 8 == 0) {
                         let str_inst = 0xF9000020u32 | (((offset as u32 / 8) & 0xFFF) << 10);
                         buf.emit_bytes(&str_inst.to_le_bytes());
                     } else {
@@ -643,7 +643,7 @@ fn emit_node_value_aarch64(buf: &mut CodeBuffer, graph: &IrGraph, node: crate::i
         }
         NodeKind::Parameter(idx) => {
             if *idx > 0 && *idx <= 7 {
-                let mov = 0xAA0003E0u32 | ((*idx as u32) << 16);
+                let mov = 0xAA0003E0u32 | (*idx << 16);
                 buf.emit_bytes(&mov.to_le_bytes());
             }
         }
@@ -675,6 +675,12 @@ impl X86_64Backend {
     }
 }
 
+impl Default for X86_64Backend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CodegenBackend for X86_64Backend {
     fn emit(&mut self, graph: &IrGraph) -> Result<CodeBuffer, crate::error::CompilerError> {
         if graph.node_count() == 0 {
@@ -700,6 +706,12 @@ pub struct Aarch64Backend {
 impl Aarch64Backend {
     pub fn new() -> Self {
         Aarch64Backend { _private: () }
+    }
+}
+
+impl Default for Aarch64Backend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

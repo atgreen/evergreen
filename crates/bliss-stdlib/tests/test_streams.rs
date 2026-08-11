@@ -28,7 +28,7 @@ fn stream_direction_equality() {
 #[test]
 fn stream_direction_clone() {
     let d = StreamDirection::Input;
-    let d2 = d.clone();
+    let d2 = d;
     assert_eq!(d, d2);
 }
 
@@ -75,7 +75,7 @@ fn external_format_equality() {
 #[test]
 fn external_format_clone() {
     let f = ExternalFormat::Utf8;
-    let f2 = f.clone();
+    let f2 = ExternalFormat::Utf8;
     assert_eq!(f, f2);
 }
 

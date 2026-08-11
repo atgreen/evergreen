@@ -67,6 +67,12 @@ impl PassManager {
     }
 }
 
+impl Default for PassManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Helper: collect all nodes reachable from the Start node ────────
 
 /// BFS from Start following all edges (uses and inputs) to find every
@@ -138,7 +144,7 @@ fn constant_satisfies_type(val: bliss_rt::value::BlissVal, expected_type: bliss_
     // If expected_type is a fixnum encoding a tag value (0–7), check val's tag
     if expected_type.is_fixnum() {
         let tag = expected_type.as_fixnum();
-        if tag >= 0 && tag <= 7 {
+        if (0..=7).contains(&tag) {
             return val.tag() == tag as u64;
         }
     }
@@ -503,6 +509,12 @@ impl FunctionRegistry {
     /// Look up a callee's entry by its BlissVal constant.
     fn lookup(&self, callee_val: bliss_rt::value::BlissVal) -> Option<&FunctionEntry> {
         self.entries.get(&callee_val.0)
+    }
+}
+
+impl Default for FunctionRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

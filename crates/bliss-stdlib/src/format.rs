@@ -57,7 +57,7 @@ fn cons_list_to_vec(v: BlissVal) -> Vec<BlissVal> {
 
 fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
     if v.is_nil() {
-        return if escapep { "NIL".into() } else { "NIL".into() };
+        return "NIL".into();
     }
     if v == T {
         return "T".into();
@@ -107,7 +107,7 @@ fn format_integer(n: i64, radix: u32, colon: bool, at_sign: bool, mincol: usize,
                else { String::new() };
     let result = format!("{}{}", sign, with_commas);
     if result.len() < mincol {
-        let pad: String = std::iter::repeat(padchar).take(mincol - result.len()).collect();
+        let pad: String = std::iter::repeat_n(padchar, mincol - result.len()).collect();
         format!("{}{}", pad, result)
     } else {
         result
@@ -1051,7 +1051,7 @@ pub fn formatter(control_string: &str) -> Result<BlissVal, BlissError> {
     // When invoked, the runtime should extract the control string and call format().
     let ctrl_str = make_bliss_string(control_string);
     let total = std::mem::size_of::<bliss_rt::object::ClosureData>() + 8; // one captured var
-    let size_units = ((total + 7) / 8) as u16;
+    let size_units = total.div_ceil(8) as u16;
     let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
@@ -1196,7 +1196,7 @@ pub fn pprint_tab(
             // track the current column, emit `colnum` as a best
             // effort.  Round up to `colinc` if non-zero.
             if colinc > 0 {
-                let rounded = ((colnum as u32 + colinc - 1) / colinc) * colinc;
+                let rounded = colnum.div_ceil(colinc) * colinc;
                 rounded as usize
             } else {
                 colnum as usize
@@ -1206,7 +1206,7 @@ pub fn pprint_tab(
             // Emit at least `colnum` spaces, rounded up to `colinc`.
             let mut n = colnum as usize;
             if colinc > 0 && n % (colinc as usize) != 0 {
-                n = ((n + colinc as usize - 1) / colinc as usize) * colinc as usize;
+                n = n.div_ceil(colinc as usize) * colinc as usize;
             }
             n
         }

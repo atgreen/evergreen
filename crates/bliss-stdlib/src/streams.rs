@@ -735,13 +735,10 @@ impl GrayStream for StreamMutableState {
         self.check_input()?;
         // For string streams, if exhausted return NIL.
         // For file streams, reads never block on regular files, so just call stream_read_char.
-        match &self.inner {
-            StreamInner::StringInput { position, end, .. } => {
-                if *position >= *end {
-                    return Ok(NIL);
-                }
+        if let StreamInner::StringInput { position, end, .. } = &self.inner {
+            if *position >= *end {
+                return Ok(NIL);
             }
-            _ => {}
         }
         // For file streams (FileInput, FileIo) and all others, read_char never blocks
         // on regular files — attempt the read directly.
@@ -1008,7 +1005,7 @@ pub fn open(
     direction: StreamDirection,
     element_type_val: BlissVal,
     if_exists: BlissVal,
-    if_does_not_exist: BlissVal,
+    _if_does_not_exist: BlissVal,
     external_format: ExternalFormat,
 ) -> Result<BlissVal, BlissError> {
     if pathname == NIL {
@@ -1060,7 +1057,6 @@ pub fn open(
                 } else if if_exists == IF_EXISTS_APPEND_VAL {
                     // :append — open for writing at end
                     std::fs::OpenOptions::new()
-                        .write(true)
                         .append(true)
                         .open(path)
                         .map_err(|e| BlissError::FileError(format!("cannot open file for append: {}", e)))?
@@ -1125,6 +1121,7 @@ pub fn open(
                     .read(true)
                     .write(true)
                     .create(true)
+                    .truncate(false)
                     .open(path)
                     .map_err(|e| BlissError::FileError(format!("cannot open file: {}", e)))?
             };

@@ -118,9 +118,11 @@ fn funcall(function: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError
 // ── Thread-local condition system state ───────────────────────────
 
 /// Internal restart entry stored in thread-local state.
+#[allow(dead_code)]
 struct RestartEntry {
     name: BlissVal,
     function: BlissVal,
+    #[expect(dead_code, reason = "restart metadata is stored for later reporting hooks")]
     report_function: Option<BlissVal>,
     interactive_function: Option<BlissVal>,
     test_function: Option<BlissVal>,
@@ -155,7 +157,7 @@ impl ConditionState {
 thread_local! {
     static STATE: RefCell<ConditionState> = RefCell::new(ConditionState::new());
     /// Flag set by the MUFFLE-WARNING restart to suppress warning output.
-    static WARNING_MUFFLED: RefCell<bool> = RefCell::new(false);
+    static WARNING_MUFFLED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 // ── Condition construction ────────────────────────────────────────

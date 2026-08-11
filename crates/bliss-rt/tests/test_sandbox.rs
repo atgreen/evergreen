@@ -37,8 +37,10 @@ fn default_policy_is_deny_all() {
 
 #[test]
 fn sandbox_policy_clone() {
-    let mut p = SandboxPolicy::default();
-    p.allow_network = false;
+    let mut p = SandboxPolicy {
+        allow_network: false,
+        ..SandboxPolicy::default()
+    };
     p.allowed_paths.push("/tmp".into());
     let p2 = p.clone();
     assert!(!p2.allow_network);

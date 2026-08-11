@@ -36,6 +36,12 @@ impl InvocationCounter {
     }
 }
 
+impl Default for InvocationCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-loop back-edge counter (32-bit, in compiled code).
 pub struct BackEdgeCounter {
     count: Cell<u32>,
@@ -62,6 +68,12 @@ impl BackEdgeCounter {
     /// Reset the counter to zero.
     pub fn reset(&self) {
         self.count.set(0);
+    }
+}
+
+impl Default for BackEdgeCounter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -130,6 +142,12 @@ impl TypeProfile {
     }
 }
 
+impl Default for TypeProfile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Aggregate profiling data for a function.
 pub struct FunctionProfile {
     initialized: bool,
@@ -167,5 +185,11 @@ impl FunctionProfile {
     /// Register a type profile for a call-site ID.
     pub fn add_type_profile(&mut self, site_id: u32) {
         self.type_profiles.insert(site_id, TypeProfile::new());
+    }
+}
+
+impl Default for FunctionProfile {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -164,6 +164,12 @@ impl ValueStack {
     }
 }
 
+impl Default for ValueStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── EnvFrame (§4.4.3.2) ──────────────────────────────────────────
 
 /// Lexical environment frame forming a singly-linked chain.
@@ -229,8 +235,8 @@ impl EnvFrame {
             let ptr = Arc::as_ptr(env) as *mut EnvFrame;
             &mut *ptr
         };
-        if frame.bindings.contains_key(&key) {
-            frame.bindings.insert(key, value);
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = frame.bindings.entry(key) {
+            entry.insert(value);
             return true;
         }
         // Walk parent chain
@@ -238,8 +244,8 @@ impl EnvFrame {
         while let Some(ref parent_arc) = current {
             let parent_ptr = Arc::as_ptr(parent_arc) as *mut EnvFrame;
             let parent = unsafe { &mut *parent_ptr };
-            if parent.bindings.contains_key(&key) {
-                parent.bindings.insert(key, value);
+            if let std::collections::hash_map::Entry::Occupied(mut entry) = parent.bindings.entry(key) {
+                entry.insert(value);
                 return true;
             }
             current = parent.parent.clone();
@@ -622,8 +628,8 @@ impl Interpreter {
 
                 // Evaluate body forms; return last
                 let mut result = BlissVal(NIL_BITS);
-                for i in 1..args_vec.len() {
-                    result = self.eval(args_vec[i])?;
+                for form in args_vec.iter().skip(1) {
+                    result = self.eval(*form)?;
                 }
                 self.env = saved_env;
                 Ok(result)
@@ -752,8 +758,8 @@ impl Interpreter {
                 let block_name_bits = block_name.0;
                 let saved_sp = self.stack.sp();
                 let mut result = BlissVal(NIL_BITS);
-                for i in 1..args_vec.len() {
-                    match self.eval(args_vec[i]) {
+                for form in args_vec.iter().skip(1) {
+                    match self.eval(*form) {
                         Ok(val) => result = val,
                         Err(ref e) => {
                             if let Some(NonLocalExit::ReturnFrom(ref r)) = error_as_non_local(e) {
@@ -841,8 +847,8 @@ impl Interpreter {
                 let catch_tag = self.eval(args_vec[0])?;
                 let saved_sp = self.stack.sp();
                 let mut result = BlissVal(NIL_BITS);
-                for i in 1..args_vec.len() {
-                    match self.eval(args_vec[i]) {
+                for form in args_vec.iter().skip(1) {
+                    match self.eval(*form) {
                         Ok(val) => result = val,
                         Err(ref e) => {
                             if let Some(NonLocalExit::Throw(ref t)) = error_as_non_local(e) {
@@ -881,8 +887,8 @@ impl Interpreter {
                 }
                 let result = self.eval(args_vec[0]);
                 // Always run cleanup forms
-                for i in 1..args_vec.len() {
-                    let _ = self.eval(args_vec[i]);
+                for form in args_vec.iter().skip(1) {
+                    let _ = self.eval(*form);
                 }
                 result
             }
@@ -912,8 +918,8 @@ impl Interpreter {
                 }
                 // Evaluate body forms (simplified: always evaluate at :execute)
                 let mut result = BlissVal(NIL_BITS);
-                for i in 1..args_vec.len() {
-                    result = self.eval(args_vec[i])?;
+                for form in args_vec.iter().skip(1) {
+                    result = self.eval(*form)?;
                 }
                 Ok(result)
             }
@@ -1034,6 +1040,12 @@ impl Interpreter {
             }
             _ => Err(BlissError::Internal(format!("apply: unknown tier {}", tier_byte))),
         }
+    }
+}
+
+impl Default for Interpreter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1397,8 +1409,8 @@ impl BaselineCompiler {
                 // (EVAL-WHEN (situations) body...) — compile body forms
                 if let Ok(forms) = list_to_vec(args) {
                     let mut result_emitted = false;
-                    for i in 1..forms.len() {
-                        self.emit_form_x86_64(c, forms[i]);
+                    for form in forms.iter().skip(1) {
+                        self.emit_form_x86_64(c, *form);
                         result_emitted = true;
                     }
                     if !result_emitted {
@@ -1634,6 +1646,12 @@ impl BaselineCompiler {
     }
 }
 
+impl Default for BaselineCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── T2 optimising compiler ─────────────────────────────────────────
 
 /// T2 optimising compiler — SSA IR + passes + codegen (§4.4.5).
@@ -1723,20 +1741,20 @@ impl OptimisingCompiler {
                 NodeKind::Unbox => { c.extend_from_slice(&[0x48,0xC1,0xE8,0x03]); }
                 NodeKind::MemLoad { offset } => {
                     c.extend_from_slice(&[0x48,0x83,0xE0,0xF8]);
-                    if offset >= -128 && offset <= 127 {
+                    if (-128..=127).contains(&offset) {
                         c.extend_from_slice(&[0x48,0x8B,0x40,offset as u8]);
                     } else {
                         c.extend_from_slice(&[0x48,0x8B,0x80]);
-                        c.extend_from_slice(&(offset as i32).to_le_bytes());
+                        c.extend_from_slice(&offset.to_le_bytes());
                     }
                 }
                 NodeKind::MemStore { offset } => {
                     c.extend_from_slice(&[0x48,0x83,0xE1,0xF8]);
-                    if offset >= -128 && offset <= 127 {
+                    if (-128..=127).contains(&offset) {
                         c.extend_from_slice(&[0x48,0x89,0x41,offset as u8]);
                     } else {
                         c.extend_from_slice(&[0x48,0x89,0x81]);
-                        c.extend_from_slice(&(offset as i32).to_le_bytes());
+                        c.extend_from_slice(&offset.to_le_bytes());
                     }
                 }
                 NodeKind::Safepoint => { c.extend_from_slice(&[0x41,0x85,0x07]); }
@@ -1778,7 +1796,7 @@ impl OptimisingCompiler {
                 }
                 NodeKind::Parameter(i) => {
                     if i > 0 && i <= 7 {
-                        c.extend_from_slice(&(0xAA0003E0u32|((i as u32)<<16)).to_le_bytes());
+                        c.extend_from_slice(&(0xAA0003E0u32 | (i << 16)).to_le_bytes());
                     }
                 }
                 NodeKind::Phi | NodeKind::Region => {
@@ -1817,10 +1835,16 @@ impl OptimisingCompiler {
         match g.node_kind(n) {
             NodeKind::Constant(v) => { emit_imm64_aarch64(c, v.to_raw()); }
             NodeKind::Parameter(i) if *i > 0 && *i <= 7 => {
-                c.extend_from_slice(&(0xAA0003E0u32|((*i as u32)<<16)).to_le_bytes());
+                c.extend_from_slice(&(0xAA0003E0u32 | (*i << 16)).to_le_bytes());
             }
             _ => {}
         }
+    }
+}
+
+impl Default for OptimisingCompiler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

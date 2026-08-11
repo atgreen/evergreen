@@ -88,7 +88,7 @@ fn newline_kind_equality() {
 #[test]
 fn newline_kind_clone_and_copy() {
     let original = NewlineKind::Fill;
-    let cloned = original.clone();
+    let cloned = original;
     let copied = original; // Copy
     assert_eq!(original, cloned);
     assert_eq!(original, copied);
@@ -130,7 +130,7 @@ fn tab_kind_equality() {
 #[test]
 fn tab_kind_clone_and_copy() {
     let original = TabKind::SectionRelative;
-    let cloned = original.clone();
+    let cloned = original;
     let copied = original; // Copy
     assert_eq!(original, cloned);
     assert_eq!(original, copied);
@@ -237,14 +237,14 @@ fn format_directive_tilde_r_radix() {
 // ~F — fixed-format float
 #[test]
 fn format_directive_tilde_f_fixed_float() {
-    let s = format_nil_string("~F", &[BlissVal::from_single_float(3.14)]);
+    let s = format_nil_string("~F", &[BlissVal::from_single_float(std::f32::consts::PI)]);
     assert!(s.contains("3.14"), "~F of 3.14 should contain '3.14', got: {:?}", s);
 }
 
 // ~E — exponential float
 #[test]
 fn format_directive_tilde_e_exponential() {
-    let s = format_nil_string("~E", &[BlissVal::from_single_float(3.14)]);
+    let s = format_nil_string("~E", &[BlissVal::from_single_float(std::f32::consts::PI)]);
     // Exponential notation contains an exponent marker (e.g., "E" or "e")
     assert!(
         s.to_uppercase().contains('E'),
@@ -255,7 +255,7 @@ fn format_directive_tilde_e_exponential() {
 // ~G — general float
 #[test]
 fn format_directive_tilde_g_general_float() {
-    let s = format_nil_string("~G", &[BlissVal::from_single_float(3.14)]);
+    let s = format_nil_string("~G", &[BlissVal::from_single_float(std::f32::consts::PI)]);
     assert!(s.contains("3.14") || s.to_uppercase().contains('E'),
         "~G of 3.14 should produce a float representation, got: {:?}", s);
 }
@@ -263,7 +263,7 @@ fn format_directive_tilde_g_general_float() {
 // ~$ — monetary/dollars float (R5.157)
 #[test]
 fn format_directive_tilde_dollar_monetary_float() {
-    let s = format_nil_string("~$", &[BlissVal::from_single_float(3.14)]);
+    let s = format_nil_string("~$", &[BlissVal::from_single_float(std::f32::consts::PI)]);
     // ~$ typically produces at least 2 decimal places, e.g. "3.14"
     assert!(s.contains("3.14"), "~$ of 3.14 should contain '3.14', got: {:?}", s);
 }
@@ -1038,6 +1038,6 @@ fn format_directive_tilde_at_c_reader_syntax() {
 // ~$  with modifiers
 #[test]
 fn format_directive_tilde_at_dollar_forced_sign() {
-    let s = format_nil_string("~@$", &[BlissVal::from_single_float(3.14)]);
+    let s = format_nil_string("~@$", &[BlissVal::from_single_float(std::f32::consts::PI)]);
     assert!(s.starts_with('+'), "~@$ should force sign on positive, got: {:?}", s);
 }

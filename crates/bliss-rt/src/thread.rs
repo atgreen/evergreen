@@ -41,7 +41,7 @@ const DEFAULT_STACK_SIZE: usize = 512 * 1024;
 static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Holds the result of a thread's execution and a signal for completion.
-struct ThreadResult {
+pub(crate) struct ThreadResult {
     /// The result value, set when the thread finishes.
     value: Mutex<Option<Result<BlissVal, BlissError>>>,
     /// Condvar signaled when the thread transitions to Dead.
@@ -252,8 +252,7 @@ impl WorkerPool {
             let num_workers = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
-                .max(2)
-                .min(64);
+                .clamp(2, 64);
             for i in 0..num_workers {
                 std::thread::Builder::new()
                     .name(format!("bliss-worker-{}", i))
@@ -364,6 +363,12 @@ impl WorkerThread {
             thread,
             result_cell,
         });
+    }
+}
+
+impl Default for WorkerThread {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -29,7 +29,7 @@ impl AlienType {
     pub fn size(&self) -> usize {
         match self {
             AlienType::Void => 0,
-            AlienType::Int { bits, .. } => (*bits as usize + 7) / 8,
+            AlienType::Int { bits, .. } => (*bits as usize).div_ceil(8),
             AlienType::Float => 4,
             AlienType::Double => 8,
             AlienType::Pointer(_) | AlienType::FnPtr { .. } => std::mem::size_of::<*const ()>(),
@@ -69,7 +69,7 @@ impl AlienType {
         match self {
             AlienType::Void => 1,
             AlienType::Int { bits, .. } => {
-                let size = (*bits as usize + 7) / 8;
+                let size = (*bits as usize).div_ceil(8);
                 // Alignment is the natural size, capped at 8
                 size.min(8)
             }

@@ -138,7 +138,7 @@ fn class_hierarchy_accessors() {
     // Direct superclasses: a class registered via set_find_class should have
     // at least one superclass (standard-object or T in the CLOS hierarchy).
     let supers = class_direct_superclasses(cls);
-    assert!(supers.len() >= 1,
+    assert!(!supers.is_empty(),
         "a registered class should have at least one superclass (e.g., standard-object)");
 
     // Direct subclasses of a fresh class with no children should be empty

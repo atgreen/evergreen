@@ -358,7 +358,7 @@ impl Allocator for HeapAllocator {
         })?;
 
         // Find a Free region large enough, convert to LargeObject.
-        let regions_needed = (total_size + self.region_size - 1) / self.region_size;
+        let regions_needed = total_size.div_ceil(self.region_size);
 
         if regions_needed == 1 {
             for region in state.regions.iter_mut() {
@@ -516,6 +516,12 @@ impl HeapCollector {
         }
 
         Some(new_body)
+    }
+}
+
+impl Default for HeapCollector {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -723,8 +729,6 @@ impl Collector for HeapCollector {
         let region_count = state.regions.len();
         let heap_base_addr = state.heap_base as usize;
         let heap_size = state.config.heap_size;
-        let region_size = state.config.region_size;
-
         // Record TAMS (Top-At-Mark-Start) per region.
         let mut tams: Vec<usize> = Vec::with_capacity(region_count);
         for region in state.regions.iter() {
@@ -786,11 +790,13 @@ impl Collector for HeapCollector {
             let mut scan = base;
             while scan + 8 <= top {
                 let val = unsafe { *(scan as *const usize) };
-                if val >= heap_base_addr && val < heap_base_addr + heap_size {
-                    if object_index.contains_key(&val) && !marked.contains(&val) {
-                        marked.insert(val);
-                        scan_worklist.push(val);
-                    }
+                if val >= heap_base_addr
+                    && val < heap_base_addr + heap_size
+                    && object_index.contains_key(&val)
+                    && !marked.contains(&val)
+                {
+                    marked.insert(val);
+                    scan_worklist.push(val);
                 }
                 scan += 8; // scan every 8-byte aligned slot
             }
@@ -804,11 +810,13 @@ impl Collector for HeapCollector {
                 let scan_end = obj_addr + body_size;
                 while scan + 8 <= scan_end {
                     let val = unsafe { *(scan as *const usize) };
-                    if val >= heap_base_addr && val < heap_base_addr + heap_size {
-                        if object_index.contains_key(&val) && !marked.contains(&val) {
-                            marked.insert(val);
-                            scan_worklist.push(val);
-                        }
+                    if val >= heap_base_addr
+                        && val < heap_base_addr + heap_size
+                        && object_index.contains_key(&val)
+                        && !marked.contains(&val)
+                    {
+                        marked.insert(val);
+                        scan_worklist.push(val);
                     }
                     scan += 8;
                 }
@@ -1208,7 +1216,7 @@ pub fn register_weak_pointer(wp: &mut WeakPointer) {
 pub fn unregister_weak_pointer(wp: &WeakPointer) {
     let ptr = wp as *const WeakPointer;
     let mut registry = weak_pointer_registry().lock().unwrap();
-    registry.retain(|h| h.0 as *const WeakPointer != ptr);
+    registry.retain(|h| !std::ptr::eq(h.0 as *const WeakPointer, ptr));
 }
 
 /// Break all weak pointers whose referent is in a dead region (one being freed).
@@ -1471,11 +1479,13 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
         });
     }
 
-    let mut stats = GcStats::default();
-    stats.nursery_capacity = config.nursery_size as u64;
-    stats.old_gen_capacity = (config.heap_size - config.nursery_size) as u64;
-    stats.regions_total = regions_total;
-    stats.regions_free = regions_total; // all regions start Free
+    let stats = GcStats {
+        nursery_capacity: config.nursery_size as u64,
+        old_gen_capacity: (config.heap_size - config.nursery_size) as u64,
+        regions_total,
+        regions_free: regions_total, // all regions start Free
+        ..GcStats::default()
+    };
 
     // Use the address of the heap_state mutex itself as a stable base address
     // for relocation tracking.  This gives a deterministic, non-zero value that

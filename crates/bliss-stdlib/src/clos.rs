@@ -26,7 +26,9 @@ pub enum MethodCombinationType {
     Progn,
 }
 
+#[allow(dead_code)]
 impl MethodCombinationType {
+    #[expect(dead_code, reason = "retained for future serialized combination encodings")]
     fn discriminant(self) -> i64 {
         match self {
             Self::Standard => 0,
@@ -1045,9 +1047,7 @@ pub fn compute_effective_method(
 /// Retrieve a standard-combination effective method descriptor by key.
 ///
 /// Returns the around, before, primary, and after method lists.
-pub fn get_effective_method(
-    key: BlissVal,
-) -> Option<(Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>)> {
+pub fn get_effective_method(key: BlissVal) -> Option<EffectiveMethodParts> {
     with_state(|st| {
         st.effective_methods.get(&key).map(|em| {
             (
@@ -1068,7 +1068,7 @@ pub fn get_short_form_method(
 ) -> Option<(MethodCombinationType, Vec<BlissVal>)> {
     with_state(|st| {
         st.short_form_methods.get(&key).map(|sfm| {
-            (sfm.combination.clone(), sfm.methods.clone())
+            (sfm.combination, sfm.methods.clone())
         })
     })
 }
@@ -1204,3 +1204,4 @@ fn update_instance_for_different_class_internal(
         }
     }
 }
+type EffectiveMethodParts = (Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>);

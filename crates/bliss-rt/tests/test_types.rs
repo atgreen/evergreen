@@ -92,7 +92,7 @@ fn characterp_false_cases() {
 
 #[test]
 fn single_float_p_true_cases() {
-    assert!(single_float_p(mk_flt(3.14)));
+    assert!(single_float_p(mk_flt(std::f32::consts::PI)));
     assert!(single_float_p(mk_flt(0.0)));
     assert!(single_float_p(mk_flt(-1.5)));
 }
@@ -480,7 +480,7 @@ fn fixnum_numeric_hierarchy() {
 
 #[test]
 fn single_float_numeric_hierarchy() {
-    let v = mk_flt(3.14);
+    let v = mk_flt(std::f32::consts::PI);
     assert!(numberp(v),    "single-float must be numberp");
     assert!(realp(v),      "single-float must be realp");
     assert!(floatp(v),     "single-float must be floatp");

@@ -234,9 +234,7 @@ fn cl_equalp(a: BlissVal, b: BlissVal) -> bool {
                 if sa.len() != sb.len() {
                     return false;
                 }
-                return sa.iter().zip(sb.iter()).all(|(&x, &y)| {
-                    x.to_ascii_lowercase() == y.to_ascii_lowercase()
-                });
+                return sa.iter().zip(sb.iter()).all(|(&x, &y)| x.eq_ignore_ascii_case(&y));
             }
         }
     }
@@ -343,32 +341,30 @@ fn resize_table(inner: &mut HashTableInner) {
     let new_capacity = next_power_of_two(new_capacity.max(inner.capacity + 1));
     let mut new_entries: Vec<Option<RHEntry>> = vec![None; new_capacity];
 
-    for entry in inner.entries.iter() {
-        if let Some(e) = entry {
-            let mut idx = probe_index(e.key.0, new_capacity);
-            let mut incoming = RHEntry {
-                key: e.key,
-                value: e.value,
-                probe_dist: 0,
-            };
-            loop {
-                match &new_entries[idx] {
-                    None => {
+    for e in inner.entries.iter().flatten() {
+        let mut idx = probe_index(e.key.0, new_capacity);
+        let mut incoming = RHEntry {
+            key: e.key,
+            value: e.value,
+            probe_dist: 0,
+        };
+        loop {
+            match &new_entries[idx] {
+                None => {
+                    new_entries[idx] = Some(incoming);
+                    break;
+                }
+                Some(occupant) => {
+                    // Robin Hood: swap if incoming has traveled farther
+                    if incoming.probe_dist > occupant.probe_dist {
+                        let displaced = *occupant;
                         new_entries[idx] = Some(incoming);
-                        break;
-                    }
-                    Some(occupant) => {
-                        // Robin Hood: swap if incoming has traveled farther
-                        if incoming.probe_dist > occupant.probe_dist {
-                            let displaced = *occupant;
-                            new_entries[idx] = Some(incoming);
-                            incoming = displaced;
-                        }
+                        incoming = displaced;
                     }
                 }
-                incoming.probe_dist += 1;
-                idx = (idx + 1) & (new_capacity - 1);
             }
+            incoming.probe_dist += 1;
+            idx = (idx + 1) & (new_capacity - 1);
         }
     }
 

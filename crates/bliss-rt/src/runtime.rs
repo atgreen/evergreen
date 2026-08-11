@@ -414,7 +414,6 @@ struct BootstrapStore {
     idx_to_symbol: HashMap<u32, String>,
     symbol_counter: u32,
     strings: HashMap<u64, String>,
-    string_counter: u64,
     lambdas: HashMap<u64, BootLambda>,
     lambda_counter: u64,
 }
@@ -437,7 +436,6 @@ impl BootstrapStore {
             idx_to_symbol: HashMap::new(),
             symbol_counter: 1, // reserve 0
             strings: HashMap::new(),
-            string_counter: 1,
             lambdas: HashMap::new(),
             lambda_counter: 1,
         }
@@ -511,7 +509,7 @@ fn boot_make_string(s: &str) -> BlissVal {
                 std::alloc::handle_alloc_error(layout);
             }
             *(ptr as *mut ObjectHeader) =
-                ObjectHeader::new(type_id::SIMPLE_BASE_STRING, ((size + 7) / 8) as u16);
+                ObjectHeader::new(type_id::SIMPLE_BASE_STRING, size.div_ceil(8) as u16);
             *(ptr.add(8) as *mut u64) = bytes.len() as u64;
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
             ptr
@@ -1351,7 +1349,7 @@ fn boot_print_val(val: BlissVal, escape: bool) -> String {
         }
     }
     if val.tag() == crate::value::TAG_FUNCTION {
-        return format!("#<FUNCTION>");
+        return "#<FUNCTION>".to_string();
     }
     format!("#<UNKNOWN {:#x}>", val.0)
 }

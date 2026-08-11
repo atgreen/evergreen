@@ -27,6 +27,8 @@ use bliss_rt::value::{BlissVal, NIL, T, EOF};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+type Predicate = fn(BlissVal) -> bool;
+
 fn read(s: &str) -> BlissVal {
     let (val, _) = read_from_string(s).expect("read_from_string failed");
     val
@@ -95,7 +97,7 @@ fn full_pipeline_x86_64(source: &str) -> CodeBuffer {
 #[test]
 fn reader_to_macroexpand_self_evaluating() {
     // Integer, T, NIL should not be macro-expanded
-    let cases: &[(&str, fn(BlissVal) -> bool)] = &[
+    let cases: &[(&str, Predicate)] = &[
         ("42", |v| v.is_fixnum() && v.as_fixnum() == 42),
         ("t",  |v| v == T),
         ("nil", |v| v == NIL),
@@ -489,7 +491,7 @@ fn tiered_promotion_full_lifecycle() {
     //   offset 12: invoke_count (u32, little-endian)
     // Total: 16 bytes.
     // See also: tiered.rs lines 350-366, 319-327.
-    let mut header = vec![0u8; 16];
+    let mut header = Box::new([0u8; 16]);
 
     // Set tier = Interpreter (0)
     header[8] = 0; // Tier::Interpreter
@@ -499,7 +501,7 @@ fn tiered_promotion_full_lifecycle() {
 
     // Create a function-tagged BlissVal pointing to our header
     let header_ptr = header.as_ptr() as u64;
-    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION as u64);
+    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION);
 
     // At 0 invocations, no promotion
     assert_eq!(check_promotion(func_val, &config), None,
@@ -524,6 +526,7 @@ fn tiered_promotion_full_lifecycle() {
 
     // Update tier to Optimising
     header[8] = 2; // Tier::Optimising
+    assert_eq!(header[8], 2);
 
     // Already at max tier — no further promotion
     assert_eq!(check_promotion(func_val, &config), None,
@@ -536,9 +539,9 @@ fn tiered_compilers_produce_code_with_function_val() {
     // We must allocate a real function header to avoid null-pointer dereference.
     // Function header layout per tiered.rs:
     //   [entry_point: 8][tier: 1][pad: 3][invoke_count: 4] = 16 bytes
-    let header = vec![0u8; 16];
+    let header = Box::new([0u8; 16]);
     let header_ptr = header.as_ptr() as u64;
-    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION as u64);
+    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION);
 
     let bc = BaselineCompiler::new().compile(func_val).unwrap();
     assert_eq!(bc.tier(), Tier::Baseline);
@@ -548,8 +551,6 @@ fn tiered_compilers_produce_code_with_function_val() {
     assert_eq!(oc.tier(), Tier::Optimising);
     assert!(oc.code_size() > 0);
 
-    // Keep header alive until after compile calls
-    drop(header);
 }
 
 #[test]
@@ -602,11 +603,11 @@ fn profiling_invocation_counter_triggers_t1_promotion() {
 
     // Now simulate: create a function header with invoke_count=10, tier=Interpreter
     // and verify check_promotion returns Baseline
-    let mut header = vec![0u8; 16];
+    let mut header = Box::new([0u8; 16]);
     header[8] = 0; // Tier::Interpreter
     header[12..16].copy_from_slice(&10u32.to_le_bytes());
     let header_ptr = header.as_ptr() as u64;
-    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION as u64);
+    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION);
     assert_eq!(check_promotion(func_val, &config), Some(Tier::Baseline),
         "function with invoke_count at t1_threshold should promote to Baseline");
 }
@@ -678,9 +679,9 @@ fn profiling_invocation_counter_reset_and_recount() {
 fn tiered_request_compilation_accepts_function_val() {
     // Function header layout per tiered.rs check_promotion() and CompiledCode::install():
     //   [entry_point: 8][tier: 1][pad: 3][invoke_count: 4] = 16 bytes
-    let header = vec![0u8; 16];
+    let header = Box::new([0u8; 16]);
     let header_ptr = header.as_ptr() as u64;
-    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION as u64);
+    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION);
 
     // request_compilation should accept a function-tagged value and enqueue it
     let result = request_compilation(func_val, Tier::Baseline);
@@ -708,7 +709,7 @@ fn tiered_compiled_code_install_updates_function_header() {
     use std::sync::atomic::{AtomicPtr, Ordering};
 
     // Use a Vec with enough space, aligned to pointer size
-    let mut header = vec![0u8; 32]; // extra room for alignment
+    let mut header = [0u8; 32]; // extra room for alignment
     let header_ptr = header.as_mut_ptr();
 
     // Ensure the pointer is 8-byte aligned (it should be from Vec)
@@ -722,7 +723,7 @@ fn tiered_compiled_code_install_updates_function_header() {
     }
 
     // Create a function-tagged value pointing to the header
-    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION as u64);
+    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION);
 
     // Compile at baseline tier
     let compiled = BaselineCompiler::new().compile(func_val).unwrap();
@@ -858,9 +859,9 @@ fn osr_entry_with_compiled_function() {
     // Build a compiled function and attempt OSR entry — this exercises the
     // osr_entry() free function which validates the function and entry map
     // before attempting the (unimplemented) stack transfer.
-    let mut header = vec![0u8; 16];
+    let mut header = Box::new([0u8; 16]);
     let header_ptr = header.as_mut_ptr();
-    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION as u64);
+    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION);
 
     let entry_map = OsrEntryMap::new(
         vec![LocalMapping { local_index: 0, ssa_var: 0 }],
@@ -930,9 +931,9 @@ fn osr_threshold_in_tier_config() {
 fn osr_deoptimize_with_compiled_function() {
     // Exercise the deoptimize() free function with a compiled function.
     // It should validate and then hit unimplemented!() for stack reconstruction.
-    let mut header = vec![0u8; 16];
+    let mut header = Box::new([0u8; 16]);
     let header_ptr = header.as_mut_ptr();
-    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION as u64);
+    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION);
 
     let live_values = [BlissVal::from_fixnum(1), BlissVal::from_fixnum(2)];
     let reason = DeoptReason::TypeMismatch {

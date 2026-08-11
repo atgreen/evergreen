@@ -567,8 +567,8 @@ pub fn position(
             }
         }
     } else {
-        for i in start..actual_end {
-            let keyed = apply_key(key, elems[i]);
+        for (i, elem) in elems.iter().enumerate().take(actual_end).skip(start) {
+            let keyed = apply_key(key, *elem);
             if test_equal(test, item, keyed) {
                 return Ok(BlissVal::from_fixnum(i as i64));
             }
@@ -589,8 +589,8 @@ pub fn count(
     let elems = collect_elements(sequence)?;
     let actual_end = end.unwrap_or(elems.len());
     let mut n = 0i64;
-    for i in start..actual_end {
-        let keyed = apply_key(key, elems[i]);
+    for elem in elems.iter().take(actual_end).skip(start) {
+        let keyed = apply_key(key, *elem);
         if test_equal(test, item, keyed) {
             n += 1;
         }
@@ -682,8 +682,8 @@ pub fn reduce(
             }
         };
         let range_start = if initial_value.is_none() { 1 } else { 0 };
-        for i in range_start..keyed.len() {
-            acc = apply_fn(function, &[acc, keyed[i]]);
+        for elem in keyed.iter().skip(range_start) {
+            acc = apply_fn(function, &[acc, *elem]);
         }
         Ok(acc)
     }
@@ -692,6 +692,7 @@ pub fn reduce(
 // ── Filtering ──────────────────────────────────────────────────────
 
 /// Remove elements (CL `REMOVE`).
+#[allow(clippy::too_many_arguments)]
 pub fn remove(
     item: BlissVal,
     sequence: BlissVal,
@@ -706,17 +707,16 @@ pub fn remove(
     let len = elems.len();
     let actual_end = end.unwrap_or(len);
 
-    if from_end && count_limit.is_some() {
+    if let Some(limit) = count_limit.filter(|_| from_end) {
         // When from_end with count, we need to remove the LAST count matches
         // Collect indices of matches in range, then remove the last `count` of them
         let mut match_indices = Vec::new();
-        for i in start..actual_end {
-            let keyed = apply_key(key, elems[i]);
+        for (i, elem) in elems.iter().enumerate().take(actual_end).skip(start) {
+            let keyed = apply_key(key, *elem);
             if test_equal(test, item, keyed) {
                 match_indices.push(i);
             }
         }
-        let limit = count_limit.unwrap();
         let skip = if match_indices.len() > limit {
             match_indices.len() - limit
         } else {
@@ -766,6 +766,7 @@ pub fn remove(
 }
 
 /// Substitute elements (CL `SUBSTITUTE`).
+#[allow(clippy::too_many_arguments)]
 pub fn substitute(
     new_item: BlissVal,
     old_item: BlissVal,
@@ -781,16 +782,15 @@ pub fn substitute(
     let len = elems.len();
     let actual_end = end.unwrap_or(len);
 
-    if from_end && count_limit.is_some() {
+    if let Some(limit) = count_limit.filter(|_| from_end) {
         // Substitute the last `count` matches within the range
         let mut match_indices = Vec::new();
-        for i in start..actual_end {
-            let keyed = apply_key(key, elems[i]);
+        for (i, elem) in elems.iter().enumerate().take(actual_end).skip(start) {
+            let keyed = apply_key(key, *elem);
             if test_equal(test, old_item, keyed) {
                 match_indices.push(i);
             }
         }
-        let limit = count_limit.unwrap();
         let skip = if match_indices.len() > limit {
             match_indices.len() - limit
         } else {

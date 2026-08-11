@@ -145,6 +145,12 @@ impl InlineCache {
     }
 }
 
+impl Default for InlineCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Global IC Registry ────────────────────────────────────────────
 //
 // The global IC registry uses an epoch-based invalidation scheme (§4.8.8):
