@@ -1,9 +1,18 @@
 //! Tests for bliss-stdlib conditions module (spec §5.4).
-use bliss_rt::value::BlissVal;
+use bliss_rt::value::{BlissVal, NIL};
 use bliss_stdlib::conditions::*;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 fn sym(i: u32) -> BlissVal {
     BlissVal::from_symbol_index(i)
+}
+
+fn fx(i: i64) -> BlissVal {
+    BlissVal::from_fixnum(i)
 }
 
 #[test]
@@ -15,6 +24,22 @@ fn make_simple_error_variants() {
 #[test]
 fn make_type_error_returns_val() {
     let _ = make_type_error(BlissVal::from_fixnum(5), sym(1));
+}
+
+#[test]
+fn condition_values_participate_in_the_root_and_error_hierarchies() {
+    let simple = make_simple_error("boom", &[]);
+    let typed = make_type_error(fx(5), sym(2));
+
+    // Per R5.91 and R5.107, ANSI condition objects must behave as CONDITION-rooted
+    // CLOS instances, and DEFINE-CONDITION-backed types must participate in the
+    // observable class hierarchy seen by handler dispatch.
+    assert_eq!(handler_case(simple, &[(sym(SYMBOL_ERROR), fx(1))]).unwrap(), fx(1));
+    assert_eq!(
+        handler_case(simple, &[(sym(SYMBOL_CONDITION), fx(2))]).unwrap(),
+        fx(2)
+    );
+    assert_eq!(handler_case(typed, &[(sym(SYMBOL_ERROR), fx(3))]).unwrap(), fx(3));
 }
 
 #[test]
@@ -85,70 +110,65 @@ fn handler_case_no_signal() {
     );
 }
 
-// Issue 6: handler_case_nested must actually signal a condition and test nesting.
-// Establishes an outer handler-case, an inner handler-case, signals a condition,
-// and verifies the inner handler catches it.
 #[test]
 fn handler_case_nested_with_signal() {
-    let error_type = sym(31);
-    let inner_handler_result = BlissVal::from_fixnum(200);
-    let outer_handler_result = BlissVal::from_fixnum(100);
+    let error_type = sym(SYMBOL_ERROR);
+    let outer_handler = fx(100);
+    let inner_handler = fx(200);
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log_for_hook = Arc::clone(&log);
 
-    // The inner handler-case should catch the condition signalled in its body.
-    // We simulate by establishing nested handler-case scopes with signal in the inner body.
+    set_funcall_hook(move |function, args| {
+        assert_eq!(args.len(), 1);
+        log_for_hook.lock().unwrap().push(function);
+        Ok(BlissVal::from_fixnum(function.as_fixnum()))
+    });
+
     let condition = make_simple_error("inner error", &[]);
 
-    // Inner handler-case: if a condition of type error_type is signalled,
-    // the inner handler should catch it and return inner_handler_result.
-    let inner_result = handler_case(
-        condition, // The body expression — signalling a condition
-        &[(error_type, inner_handler_result)],
-    );
+    // Per R5.92, R5.93, R5.94, and R5.95, nested handler scopes must search
+    // newest-first over a real signalled condition rather than plain values.
+    let result = handler_bind_fn(&[(error_type, outer_handler)], || {
+        handler_bind_fn(&[(error_type, inner_handler)], || {
+            signal_condition(condition)?;
+            Ok(fx(99))
+        })
+    })
+    .unwrap();
 
-    // The inner handler-case should have caught the condition
-    assert!(inner_result.is_ok(), "inner handler_case should succeed");
-    let inner_val = inner_result.unwrap();
-
-    // Now wrap in outer handler-case: the inner result should pass through
-    // since the inner handler already caught the condition.
-    let outer_result = handler_case(inner_val, &[(error_type, outer_handler_result)]);
-
-    assert!(outer_result.is_ok(), "outer handler_case should succeed");
-    // The inner handler should have caught it, so we should get the inner result,
-    // not the outer handler result.
-    assert_eq!(
-        outer_result.unwrap(),
-        inner_handler_result,
-        "inner handler should catch the condition before outer"
-    );
+    assert_eq!(result, fx(99));
+    assert_eq!(*log.lock().unwrap(), vec![inner_handler, outer_handler]);
+    clear_funcall_hook();
 }
 
-// Issue 6 supplement: test that unhandled condition propagates to outer handler
 #[test]
 fn handler_case_nested_propagation() {
-    let inner_type = sym(32);
-    let outer_type = sym(33);
-    let outer_handler_result = BlissVal::from_fixnum(300);
+    let inner_type = sym(SYMBOL_SIMPLE_WARNING);
+    let outer_type = sym(SYMBOL_ERROR);
+    let outer_handler = fx(300);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_for_hook = Arc::clone(&seen);
+
+    set_funcall_hook(move |function, args| {
+        assert_eq!(args.len(), 1);
+        seen_for_hook.lock().unwrap().push(function);
+        Ok(function)
+    });
 
     let condition = make_simple_error("propagating error", &[]);
 
-    // Inner handler-case does NOT handle the signalled condition type
-    let inner_result = handler_case(
-        condition,
-        &[(inner_type, BlissVal::from_fixnum(999))], // wrong type, won't match
-    );
+    // Per R5.93, R5.94, and R5.95, a non-matching inner handler scope must let
+    // a real signalled condition propagate outward to the matching older scope.
+    handler_bind_fn(&[(outer_type, outer_handler)], || {
+        handler_bind_fn(&[(inner_type, fx(999))], || {
+            signal_condition(condition)?;
+            Ok(fx(0))
+        })
+    })
+    .unwrap();
 
-    // If the inner handler didn't catch it, wrap in outer handler-case
-    // that handles the actual condition type
-    let outer_result = handler_case(
-        inner_result.unwrap_or(condition),
-        &[(outer_type, outer_handler_result)],
-    );
-
-    assert!(
-        outer_result.is_ok(),
-        "outer handler_case should handle propagated condition"
-    );
+    assert_eq!(*seen.lock().unwrap(), vec![outer_handler]);
+    clear_funcall_hook();
 }
 
 #[test]
@@ -210,61 +230,52 @@ fn restart_bind_multiple_specs() {
     assert!(restart_bind(&[s1, s2], BlissVal::from_fixnum(0)).is_ok());
 }
 
-// Issue 7: compute_restarts and find_restart must be tested within a restart_bind scope
-// to verify that established restarts appear and are findable.
-// The restarts are only dynamically in scope during the body of restart_bind,
-// so compute_restarts must be called inside that dynamic extent.
 #[test]
 fn compute_restarts_within_restart_bind() {
     let restart_name = sym(60);
-    let restart_fn = BlissVal::from_fixnum(1);
+    let hidden_name = sym(61);
+    let restart_fn = fx(1);
+    let allow_fn = fx(2);
+    let deny_fn = fx(3);
     let spec = RestartSpec {
         name: restart_name,
         function: restart_fn,
         report_function: None,
         interactive_function: None,
-        test_function: None,
+        test_function: Some(allow_fn),
     };
-
-    // restart_bind should establish the restart during the dynamic extent of its body.
-    // We pass a body value and check compute_restarts inside a callback-style test.
-    //
-    // Since restart_bind takes a BlissVal body (not a closure), we cannot directly
-    // call compute_restarts inside it. Instead, we test the contract:
-    // after restart_bind returns, the restarts are NO LONGER in scope.
-    // We verify that compute_restarts outside the scope does NOT include our restart.
-    restart_bind(&[spec], BlissVal::from_fixnum(0)).unwrap();
-
-    // After restart_bind returns, the restart should NOT be in scope.
-    // This is the correct behavior per ANSI CL — restarts have dynamic extent.
-    let _restarts_after = compute_restarts(None);
-    let found_after = find_restart(restart_name, None);
-    assert!(
-        found_after.is_none(),
-        "find_restart should return None outside the dynamic extent of restart_bind"
-    );
-
-    // To test that restarts ARE visible during restart_bind's body,
-    // we need a mechanism that evaluates compute_restarts during the body.
-    // We use signal + handler_bind: signal a condition inside a restart_bind,
-    // and the handler can call compute_restarts to verify visibility.
-    // For now, we test the interface contract that restart_bind accepts
-    // specs and returns the body value.
-    let spec2 = RestartSpec {
-        name: restart_name,
-        function: restart_fn,
+    let hidden = RestartSpec {
+        name: hidden_name,
+        function: fx(4),
         report_function: None,
         interactive_function: None,
-        test_function: None,
+        test_function: Some(deny_fn),
     };
-    let body_val = BlissVal::from_fixnum(42);
-    let result = restart_bind(&[spec2], body_val);
-    assert!(result.is_ok(), "restart_bind should succeed");
-    assert_eq!(
-        result.unwrap(),
-        body_val,
-        "restart_bind should return the body value when no restart is invoked"
-    );
+    let condition = make_simple_error("restart-filter", &[]);
+
+    set_funcall_hook(move |function, _args| {
+        if function == allow_fn {
+            return Ok(BlissVal::from_symbol_index(1));
+        }
+        if function == deny_fn {
+            return Ok(NIL);
+        }
+        Ok(NIL)
+    });
+
+    // Per R5.96, R5.97, and R5.98, restart clusters exist only during their
+    // dynamic extent, compute-restarts is newest-first, and find-restart
+    // locates the newest applicable restart.
+    let result = restart_bind_fn(&[spec, hidden], || {
+        assert_eq!(compute_restarts(Some(condition)), vec![restart_name]);
+        assert_eq!(compute_restarts(None), vec![hidden_name, restart_name]);
+        assert_eq!(find_restart(restart_name, Some(condition)), Some(restart_fn));
+        Ok(fx(42))
+    })
+    .unwrap();
+    assert_eq!(result, fx(42));
+    assert!(find_restart(restart_name, Some(condition)).is_none());
+    clear_funcall_hook();
 }
 
 #[test]
@@ -276,52 +287,73 @@ fn compute_restarts_and_find_outside_scope() {
     );
 }
 
-// Issue 4: Test invoke_restart — invoke a restart function directly.
-// Per ANSI CL, restarts have dynamic extent and are only visible during
-// restart_bind's body. invoke_restart takes the function value (returned
-// by find_restart during the dynamic extent) and invokes it.
 #[test]
 fn invoke_restart_executes_restart_function() {
-    let restart_fn = BlissVal::from_fixnum(42); // the restart function
+    let restart_name = sym(70);
+    let restart_fn = fx(42);
 
-    // Invoke the restart directly with the function value
-    let result = invoke_restart(restart_fn, &[]);
-    assert!(
-        result.is_ok(),
-        "invoke_restart should successfully invoke the restart function"
-    );
-    assert_eq!(
-        result.unwrap(),
-        restart_fn,
-        "invoke_restart with no args should return the restart function value"
-    );
+    set_funcall_hook(move |function, args| {
+        assert_eq!(function, restart_fn);
+        assert!(args.is_empty());
+        Ok(fx(4200))
+    });
+
+    // Per R5.99, INVOKE-RESTART must run the active restart's function in the
+    // dynamic environment established by RESTART-BIND.
+    let observed = restart_bind_fn(
+        &[RestartSpec {
+            name: restart_name,
+            function: restart_fn,
+            report_function: None,
+            interactive_function: None,
+            test_function: None,
+        }],
+        || {
+            let active = find_restart(restart_name, None).unwrap();
+            invoke_restart(active, &[])
+        },
+    )
+    .unwrap();
+    assert_eq!(observed, fx(4200));
+    clear_funcall_hook();
 }
 
-// Issue 4 supplement: invoke_restart with arguments
 #[test]
 fn invoke_restart_with_args() {
-    let restart_fn = BlissVal::from_fixnum(43);
+    let restart_name = sym(71);
+    let restart_fn = fx(43);
 
-    // Invoke with arguments — the restart function should receive them
-    let result = invoke_restart(
-        restart_fn,
-        &[BlissVal::from_fixnum(10), BlissVal::from_fixnum(20)],
-    );
-    assert!(result.is_ok(), "invoke_restart with args should succeed");
-    assert_eq!(
-        result.unwrap(),
-        BlissVal::from_fixnum(10),
-        "invoke_restart with args should return the first argument"
-    );
+    set_funcall_hook(move |function, args| {
+        assert_eq!(function, restart_fn);
+        assert_eq!(args, &[fx(10), fx(20)]);
+        Ok(args[0])
+    });
+
+    // Per R5.99, INVOKE-RESTART must pass caller-supplied arguments to the
+    // active restart function, not a raw token disconnected from the stack.
+    let observed = restart_bind_fn(
+        &[RestartSpec {
+            name: restart_name,
+            function: restart_fn,
+            report_function: None,
+            interactive_function: None,
+            test_function: None,
+        }],
+        || {
+            let active = find_restart(restart_name, None).unwrap();
+            invoke_restart(active, &[fx(10), fx(20)])
+        },
+    )
+    .unwrap();
+    assert_eq!(observed, fx(10));
+    clear_funcall_hook();
 }
 
-// Issue 5: invoke_restart_interactively must use a real restart with interactive_function.
-// Test that invoke_restart_interactively works when restarts are in scope (dynamic extent).
 #[test]
 fn invoke_restart_interactively_uses_interactive_function() {
     let restart_name = sym(72);
-    let restart_fn = BlissVal::from_fixnum(44);
-    let interactive_fn = BlissVal::from_fixnum(45); // the interactive function
+    let restart_fn = fx(44);
+    let interactive_fn = fx(45);
     let spec = RestartSpec {
         name: restart_name,
         function: restart_fn,
@@ -330,20 +362,82 @@ fn invoke_restart_interactively_uses_interactive_function() {
         test_function: None,
     };
 
-    // invoke_restart_interactively should work with a restart function value
-    // even outside dynamic extent (it falls back to invoking with no args).
-    let result = invoke_restart_interactively(restart_fn);
-    assert!(
-        result.is_ok(),
-        "invoke_restart_interactively should succeed with a restart function value"
-    );
+    set_funcall_hook(move |function, args| {
+        if function == interactive_fn {
+            assert!(args.is_empty());
+            return Ok(fx(99));
+        }
+        if function == restart_fn {
+            assert_eq!(args, &[fx(99)]);
+            return Ok(fx(199));
+        }
+        Ok(NIL)
+    });
 
-    // Also verify restart_bind correctly establishes and cleans up restarts
-    let _ = restart_bind(&[spec], BlissVal::from_fixnum(0)).unwrap();
-    assert!(
-        find_restart(restart_name, None).is_none(),
-        "restart should not be findable after restart_bind returns (dynamic extent)"
-    );
+    // Per R5.100, INVOKE-RESTART-INTERACTIVELY must call the active restart's
+    // interactive function to obtain arguments before invoking the restart.
+    let result = restart_bind_fn(&[spec], || invoke_restart_interactively(restart_name)).unwrap();
+    assert_eq!(result, fx(199));
+    assert!(find_restart(restart_name, None).is_none());
+    clear_funcall_hook();
+}
+
+#[test]
+fn cleanup_runs_when_handler_transfer_unwinds_the_dynamic_extent() {
+    let handler = fx(80);
+    let cleanup_ran = Arc::new(AtomicBool::new(false));
+    let cleanup_for_drop = Arc::clone(&cleanup_ran);
+
+    struct CleanupGuard(Arc<AtomicBool>);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    set_funcall_hook(move |function, _args| {
+        if function == handler {
+            panic!("simulated non-local exit");
+        }
+        Ok(NIL)
+    });
+
+    // Per R5.106 and R5.109, cleanup forms around handler-established dynamic
+    // scopes must still run when control transfers out through the handler path.
+    let unwound = panic::catch_unwind(AssertUnwindSafe(|| {
+        let _guard = CleanupGuard(cleanup_for_drop);
+        let _ = handler_bind_fn(&[(sym(SYMBOL_ERROR), handler)], || {
+            signal_condition(make_simple_error("cleanup", &[]))?;
+            Ok(fx(0))
+        });
+    }));
+    assert!(unwound.is_err());
+    assert!(cleanup_ran.load(Ordering::SeqCst));
+    clear_funcall_hook();
+}
+
+#[test]
+fn unhandled_error_path_exposes_break_and_storage_related_debugger_surface() {
+    let hook = fx(81);
+    let seen = Arc::new(AtomicBool::new(false));
+    let seen_for_hook = Arc::clone(&seen);
+
+    set_funcall_hook(move |function, args| {
+        if function == hook {
+            assert_eq!(args.len(), 2);
+            seen_for_hook.store(true, Ordering::SeqCst);
+        }
+        Ok(NIL)
+    });
+    set_debugger_hook(Some(hook));
+
+    // Per R5.101, R5.103, and R5.203, the unhandled signalling path must route
+    // through debugger-entry hooks before reporting the condition. Per R5.110,
+    // storage-failure reporting uses the same externally observable entrypoint.
+    assert!(error_condition(make_simple_error("debug", &[])).is_err());
+    assert!(seen.load(Ordering::SeqCst));
+    set_debugger_hook(None);
+    clear_funcall_hook();
 }
 
 // Issue 8: HandlerBinding struct existence and accessibility.
