@@ -260,6 +260,7 @@ pub fn wait_for_all_threads() -> Result<(), BlissError> {
     // so we hold the same lock when checking and waiting, preventing
     // lost notifications.
     let mut guard = coord.arrival_mutex.lock().unwrap();
+    let mut timeouts = 0u32;
     while coord.arrived.load(Ordering::SeqCst) < other_count {
         // Use a timed wait to avoid deadlock if a thread died before
         // reaching its next poll point.
@@ -275,8 +276,13 @@ pub fn wait_for_all_threads() -> Result<(), BlissError> {
             if coord.arrived.load(Ordering::SeqCst) >= other_count {
                 break;
             }
-            // Continue waiting — the thread may be in a long-running
-            // native call and will poll eventually.
+            timeouts += 1;
+            // In the bootstrap runtime the thread registry can contain
+            // worker threads that never participate in safepoint polling.
+            // Bound the wait so GC/debug paths can still make progress.
+            if timeouts >= 10 {
+                break;
+            }
         }
     }
 

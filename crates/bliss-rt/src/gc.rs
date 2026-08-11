@@ -8,8 +8,6 @@ use crate::value::BlissVal;
 use std::alloc::{self, Layout};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::collections::HashMap;
-
 // ── Region model ───────────────────────────────────────────────────
 
 /// The kind of a heap region.
@@ -169,19 +167,23 @@ const FORWARDED_TYPE_ID: u8 = 0xFF;
 ///
 /// Safety: `ptr` must be valid for writes of at least OBJECT_HEADER_SIZE bytes.
 unsafe fn write_object_header(ptr: *mut u8, type_id: u8, body_size: u32) {
-    *ptr = type_id;
+    unsafe {
+        *ptr = type_id;
+    }
     // bytes 1-3 are padding, already zeroed from alloc_zeroed
-    let size_ptr = ptr.add(4) as *mut u32;
-    *size_ptr = body_size;
+    let size_ptr = unsafe { ptr.add(4) } as *mut u32;
+    unsafe {
+        *size_ptr = body_size;
+    }
 }
 
 /// Read an object header at `ptr`. Returns (type_id, body_size).
 ///
 /// Safety: `ptr` must be valid for reads of at least OBJECT_HEADER_SIZE bytes.
 unsafe fn read_object_header(ptr: *const u8) -> (u8, u32) {
-    let type_id = *ptr;
-    let size_ptr = ptr.add(4) as *const u32;
-    let body_size = *size_ptr;
+    let type_id = unsafe { *ptr };
+    let size_ptr = unsafe { ptr.add(4) } as *const u32;
+    let body_size = unsafe { *size_ptr };
     (type_id, body_size)
 }
 
@@ -1427,7 +1429,13 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     // Allocate real heap memory as a single contiguous block.
     // We use page-level alignment (4096) which the system allocator supports,
     // rather than region_size alignment which may be too large.
-    let align = 4096.min(config.region_size);
+    let mut align = 4096usize.min(config.region_size.max(1));
+    if !align.is_power_of_two() {
+        align = align.next_power_of_two() >> 1;
+        if align == 0 {
+            align = 1;
+        }
+    }
     let heap_layout = Layout::from_size_align(config.heap_size, align)
         .map_err(|e| BlissError::Internal(format!("invalid heap layout: {}", e)))?;
 
@@ -1472,8 +1480,6 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     // Use the address of the heap_state mutex itself as a stable base address
     // for relocation tracking.  This gives a deterministic, non-zero value that
     // changes across processes, which is exactly what the image format needs.
-    let base_address = heap_state() as *const _ as u64;
-
     let state = HeapState {
         config: config.clone(),
         stats,
@@ -1558,5 +1564,355 @@ where
         }
     }
 
+    Ok(())
+}
+
+// ── Image / persistence helpers ───────────────────────────────────
+
+fn entry_continuation_cell() -> &'static Mutex<BlissVal> {
+    static ENTRY: OnceLock<Mutex<BlissVal>> = OnceLock::new();
+    ENTRY.get_or_init(|| Mutex::new(crate::value::NIL))
+}
+
+fn byte_store(name: &'static str) -> &'static Mutex<Vec<u8>> {
+    static SYMBOLS: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+    static PACKAGES: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+    static CODE: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+    match name {
+        "symbols" => SYMBOLS.get_or_init(|| Mutex::new(Vec::new())),
+        "packages" => PACKAGES.get_or_init(|| Mutex::new(Vec::new())),
+        "code" => CODE.get_or_init(|| Mutex::new(Vec::new())),
+        _ => unreachable!(),
+    }
+}
+
+fn clear_heap_objects(state: &mut HeapState) {
+    for region in &mut state.regions {
+        let used = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
+        if used > 0 {
+            unsafe {
+                std::ptr::write_bytes(region.base, 0, used);
+            }
+        }
+        region.header.kind = RegionKind::Free;
+        region.header.gen_age = 0;
+        region.header.live_bytes = 0;
+        region.header.alloc_top = region.base;
+    }
+    state.stats.bytes_allocated = 0;
+    state.stats.bytes_promoted = 0;
+    state.stats.nursery_used = 0;
+    state.stats.old_gen_used = 0;
+    state.stats.large_object_bytes = 0;
+    state.stats.regions_free = state.regions.len() as u32;
+}
+
+fn append_serialized_object(
+    state: &mut HeapState,
+    type_id: u8,
+    body: &[u8],
+) -> Result<(), BlissError> {
+    let total_size = align_up(OBJECT_HEADER_SIZE + body.len(), OBJECT_ALIGNMENT);
+    let region_limit = state.config.region_size / 2;
+    let desired_kind = if total_size > region_limit {
+        RegionKind::LargeObject
+    } else {
+        RegionKind::Nursery
+    };
+
+    let mut target_idx = None;
+    for (idx, region) in state.regions.iter_mut().enumerate() {
+        if region.header.kind != desired_kind {
+            continue;
+        }
+        let used = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
+        if used + total_size <= region.size {
+            target_idx = Some(idx);
+            break;
+        }
+    }
+
+    if target_idx.is_none() {
+        for (idx, region) in state.regions.iter_mut().enumerate() {
+            if region.header.kind == RegionKind::Free && region.size >= total_size {
+                region.header.kind = desired_kind;
+                region.header.gen_age = 0;
+                state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
+                target_idx = Some(idx);
+                break;
+            }
+        }
+    }
+
+    let idx = target_idx.ok_or(BlissError::Oom)?;
+    let region = &mut state.regions[idx];
+    let header_ptr = region.header.alloc_top;
+    unsafe {
+        write_object_header(header_ptr, type_id, body.len() as u32);
+        std::ptr::copy_nonoverlapping(body.as_ptr(), header_ptr.add(OBJECT_HEADER_SIZE), body.len());
+        if total_size > OBJECT_HEADER_SIZE + body.len() {
+            std::ptr::write_bytes(
+                header_ptr.add(OBJECT_HEADER_SIZE + body.len()),
+                0,
+                total_size - OBJECT_HEADER_SIZE - body.len(),
+            );
+        }
+    }
+    region.header.alloc_top = unsafe { region.header.alloc_top.add(total_size) };
+    region.header.live_bytes = region.header.live_bytes.saturating_add(total_size as u32);
+
+    match desired_kind {
+        RegionKind::Nursery => state.stats.nursery_used += total_size as u64,
+        RegionKind::LargeObject => state.stats.large_object_bytes += total_size as u64,
+        _ => {}
+    }
+    state.stats.bytes_allocated += total_size as u64;
+    Ok(())
+}
+
+pub fn record_object(type_id: u8, data: Vec<u8>) {
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        let _ = append_serialized_object(state, type_id, &data);
+    }
+}
+
+pub fn set_entry_continuation(val: BlissVal) {
+    *entry_continuation_cell().lock().unwrap() = val;
+}
+
+pub fn get_entry_continuation() -> BlissVal {
+    *entry_continuation_cell().lock().unwrap()
+}
+
+pub fn full_gc() -> Result<(), BlissError> {
+    let guard = heap_state().lock().unwrap();
+    if guard.is_none() {
+        return Ok(());
+    }
+    drop(guard);
+    let mut collector = HeapCollector::new();
+    collector.full_gc()
+}
+
+pub fn serialize_heap_objects() -> Vec<u8> {
+    let mut out = Vec::new();
+    let _ = walk_heap(|ptr, type_id, size| {
+        out.push(type_id);
+        out.extend_from_slice(&(size as u32).to_le_bytes());
+        let data = unsafe { std::slice::from_raw_parts(ptr, size) };
+        out.extend_from_slice(data);
+        true
+    });
+    out
+}
+
+pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
+    let mut guard = heap_state().lock().unwrap();
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| BlissError::Internal("heap not initialized".into()))?;
+    clear_heap_objects(state);
+
+    let mut offset = 0usize;
+    while offset < data.len() {
+        if data.len() - offset < 5 {
+            return Err(BlissError::InvalidImage(
+                "truncated heap object record".into(),
+            ));
+        }
+        let type_id = data[offset];
+        offset += 1;
+        let size = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if data.len() - offset < size {
+            return Err(BlissError::InvalidImage(
+                "truncated heap object payload".into(),
+            ));
+        }
+        append_serialized_object(state, type_id, &data[offset..offset + size])?;
+        offset += size;
+    }
+    Ok(())
+}
+
+pub fn serialize_symbols() -> Vec<u8> {
+    byte_store("symbols").lock().unwrap().clone()
+}
+
+pub fn restore_symbols(data: &[u8]) -> Result<(), BlissError> {
+    *byte_store("symbols").lock().unwrap() = data.to_vec();
+    Ok(())
+}
+
+pub fn serialize_packages() -> Vec<u8> {
+    byte_store("packages").lock().unwrap().clone()
+}
+
+pub fn restore_packages(data: &[u8]) -> Result<(), BlissError> {
+    *byte_store("packages").lock().unwrap() = data.to_vec();
+    Ok(())
+}
+
+pub fn serialize_code_cache() -> Vec<u8> {
+    byte_store("code").lock().unwrap().clone()
+}
+
+pub fn restore_code_cache(data: &[u8]) -> Result<(), BlissError> {
+    *byte_store("code").lock().unwrap() = data.to_vec();
+    Ok(())
+}
+
+pub fn heap_base_address() -> u64 {
+    let guard = heap_state().lock().unwrap();
+    guard
+        .as_ref()
+        .map_or(0, |state| state.heap_base as usize as u64)
+}
+
+pub fn gc_generation() -> u32 {
+    let guard = heap_state().lock().unwrap();
+    guard
+        .as_ref()
+        .map_or(0, |state| state.stats.major_gc_count as u32)
+}
+
+pub fn serialize_relocation_table() -> Vec<u8> {
+    let heap_base = heap_base_address() as usize;
+    if heap_base == 0 {
+        return Vec::new();
+    }
+
+    let mut relocs = Vec::new();
+    let mut object_offset = 0usize;
+    let _ = walk_heap(|ptr, _type_id, size| {
+        let mut field_offset = 0usize;
+        while field_offset + 8 <= size {
+            let field_ptr = unsafe { ptr.add(field_offset) };
+            let raw = unsafe { std::ptr::read_unaligned(field_ptr as *const u64) } as usize;
+            if raw >= heap_base {
+                relocs.push((object_offset + field_offset) as u64);
+            }
+            field_offset += 8;
+        }
+        object_offset += size;
+        true
+    });
+
+    let mut out = Vec::with_capacity(8 + relocs.len() * 8);
+    out.extend_from_slice(&(relocs.len() as u64).to_le_bytes());
+    for reloc in relocs {
+        out.extend_from_slice(&reloc.to_le_bytes());
+    }
+    out
+}
+
+pub fn apply_relocations(
+    object_data: &mut [u8],
+    reloc_data: &[u8],
+    delta: i64,
+) -> Result<(), BlissError> {
+    if reloc_data.is_empty() {
+        return Ok(());
+    }
+    if reloc_data.len() < 8 {
+        return Err(BlissError::InvalidImage(
+            "relocation table too small".into(),
+        ));
+    }
+
+    let count = u64::from_le_bytes(reloc_data[..8].try_into().unwrap()) as usize;
+    let expected_len = 8 + count * 8;
+    if reloc_data.len() != expected_len {
+        return Err(BlissError::InvalidImage(
+            "relocation table length mismatch".into(),
+        ));
+    }
+
+    for i in 0..count {
+        let start = 8 + i * 8;
+        let offset = u64::from_le_bytes(reloc_data[start..start + 8].try_into().unwrap()) as usize;
+        if offset + 8 > object_data.len() {
+            return Err(BlissError::InvalidImage(
+                "relocation entry out of range".into(),
+            ));
+        }
+        let raw = u64::from_le_bytes(object_data[offset..offset + 8].try_into().unwrap());
+        let relocated = if delta >= 0 {
+            raw.checked_add(delta as u64)
+        } else {
+            raw.checked_sub((-delta) as u64)
+        }
+        .ok_or_else(|| BlissError::InvalidImage("relocation overflow".into()))?;
+        object_data[offset..offset + 8].copy_from_slice(&relocated.to_le_bytes());
+    }
+
+    Ok(())
+}
+
+pub fn serialize_gc_metadata() -> Vec<u8> {
+    let stats = heap_stats();
+    let generation = gc_generation();
+    let values = [
+        stats.minor_gc_count,
+        stats.major_gc_count,
+        stats.total_minor_pause_us,
+        stats.total_major_pause_us,
+        stats.bytes_allocated,
+        stats.bytes_promoted,
+        stats.nursery_used,
+        stats.nursery_capacity,
+        stats.old_gen_used,
+        stats.old_gen_capacity,
+        stats.large_object_bytes,
+        generation as u64,
+        stats.regions_total as u64,
+        stats.regions_free as u64,
+    ];
+    let mut out = Vec::with_capacity(values.len() * 8);
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+pub fn restore_gc_metadata(data: &[u8]) -> Result<(), BlissError> {
+    const FIELD_COUNT: usize = 14;
+    if data.is_empty() {
+        return Ok(());
+    }
+    if data.len() != FIELD_COUNT * 8 {
+        return Err(BlissError::InvalidImage(
+            "GC metadata length mismatch".into(),
+        ));
+    }
+
+    let read = |idx: usize| -> u64 {
+        let start = idx * 8;
+        u64::from_le_bytes(data[start..start + 8].try_into().unwrap())
+    };
+
+    let mut guard = heap_state().lock().unwrap();
+    let state = guard
+        .as_mut()
+        .ok_or_else(|| BlissError::Internal("heap not initialized".into()))?;
+    state.stats.minor_gc_count = read(0);
+    state.stats.major_gc_count = read(1);
+    state.stats.total_minor_pause_us = read(2);
+    state.stats.total_major_pause_us = read(3);
+    state.stats.bytes_allocated = read(4);
+    state.stats.bytes_promoted = read(5);
+    state.stats.nursery_used = read(6);
+    state.stats.nursery_capacity = read(7);
+    state.stats.old_gen_used = read(8);
+    state.stats.old_gen_capacity = read(9);
+    state.stats.large_object_bytes = read(10);
+    state.stats.regions_total = read(12) as u32;
+    state.stats.regions_free = read(13) as u32;
     Ok(())
 }
