@@ -7,21 +7,21 @@ use bliss_rt::error::BlissError;
 use bliss_rt::object::{ConsCell, ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
 use bliss_stdlib::hashtable::{
-    HashTest, MakeHashTableOptions, Weakness, clrhash, gethash, hash_table_count,
-    hash_table_size, make_hash_table, remhash, set_gethash, sxhash,
+    HashTest, MakeHashTableOptions, Weakness, clrhash, gethash, hash_table_count, hash_table_size,
+    make_hash_table, remhash, set_gethash, sxhash,
 };
 use bliss_stdlib::pathnames::register_string;
 use bliss_stdlib::sequences;
 use bliss_stdlib::streams::{
-    ExternalFormat, IF_EXISTS_SUPERSEDE_VAL, StreamDirection, close, file_length_fn,
-    file_position, get_output_stream_string, make_broadcast_stream, make_concatenated_stream,
-    make_echo_stream, make_lisp_string, make_lisp_string_fresh, make_string_input_stream,
-    make_string_output_stream, make_synonym_stream, make_two_way_stream, open, open_stream_p,
-    set_file_position, set_symbol_stream, stream_advance_to_column, stream_element_type,
-    stream_external_format, stream_finish_output, stream_force_output, stream_fresh_line,
-    stream_listen, stream_peek_char, stream_read_char, stream_read_char_no_hang,
-    stream_read_line, stream_read_sequence, stream_start_line_p, stream_unread_char,
-    stream_write_char, stream_write_sequence, stream_write_string,
+    ExternalFormat, IF_EXISTS_SUPERSEDE_VAL, StreamDirection, close, file_length_fn, file_position,
+    get_output_stream_string, make_broadcast_stream, make_concatenated_stream, make_echo_stream,
+    make_lisp_string, make_lisp_string_fresh, make_string_input_stream, make_string_output_stream,
+    make_synonym_stream, make_two_way_stream, open, open_stream_p, set_file_position,
+    set_symbol_stream, stream_advance_to_column, stream_element_type, stream_external_format,
+    stream_finish_output, stream_force_output, stream_fresh_line, stream_listen, stream_peek_char,
+    stream_read_char, stream_read_char_no_hang, stream_read_line, stream_read_sequence,
+    stream_start_line_p, stream_unread_char, stream_write_char, stream_write_sequence,
+    stream_write_string,
 };
 
 fn make_list(vals: &[i64]) -> BlissVal {
@@ -104,7 +104,10 @@ fn stream_string_entrypoints_round_trip_and_dispatch() {
     let input = make_string_input_stream(make_lisp_string("alpha\nbeta"), 0, None).unwrap();
 
     assert_eq!(stream_peek_char(input).unwrap(), BlissVal::from_char('a'));
-    assert_eq!(stream_read_char_no_hang(input).unwrap(), BlissVal::from_char('a'));
+    assert_eq!(
+        stream_read_char_no_hang(input).unwrap(),
+        BlissVal::from_char('a')
+    );
     assert_eq!(stream_read_char(input).unwrap(), BlissVal::from_char('l'));
 
     let (line1, eof1) = stream_read_line(input).unwrap();
@@ -141,8 +144,14 @@ fn composite_streams_delegate_to_their_constituents() {
     let out_b = make_string_output_stream(NIL).unwrap();
     let broadcast = make_broadcast_stream(&[out_a, out_b]).unwrap();
     stream_write_string(broadcast, make_lisp_string("fanout"), 0, None).unwrap();
-    assert_eq!(lisp_string_to_string(get_output_stream_string(out_a).unwrap()), "fanout");
-    assert_eq!(lisp_string_to_string(get_output_stream_string(out_b).unwrap()), "fanout");
+    assert_eq!(
+        lisp_string_to_string(get_output_stream_string(out_a).unwrap()),
+        "fanout"
+    );
+    assert_eq!(
+        lisp_string_to_string(get_output_stream_string(out_b).unwrap()),
+        "fanout"
+    );
 
     let cat = make_concatenated_stream(&[
         make_string_input_stream(make_lisp_string("ab"), 0, None).unwrap(),
@@ -164,7 +173,10 @@ fn composite_streams_delegate_to_their_constituents() {
     .unwrap();
     stream_write_char(two_way, BlissVal::from_char('!')).unwrap();
     assert_eq!(stream_read_char(two_way).unwrap(), BlissVal::from_char('i'));
-    assert_eq!(lisp_string_to_string(get_output_stream_string(two_way_out).unwrap()), "!");
+    assert_eq!(
+        lisp_string_to_string(get_output_stream_string(two_way_out).unwrap()),
+        "!"
+    );
 
     let echo_out = make_string_output_stream(NIL).unwrap();
     let echo = make_echo_stream(
@@ -174,7 +186,10 @@ fn composite_streams_delegate_to_their_constituents() {
     .unwrap();
     assert_eq!(stream_read_char(echo).unwrap(), BlissVal::from_char('x'));
     assert_eq!(stream_read_char(echo).unwrap(), BlissVal::from_char('y'));
-    assert_eq!(lisp_string_to_string(get_output_stream_string(echo_out).unwrap()), "xy");
+    assert_eq!(
+        lisp_string_to_string(get_output_stream_string(echo_out).unwrap()),
+        "xy"
+    );
 
     let symbol = BlissVal::from_symbol_index(4001);
     let synonym_target = make_string_input_stream(make_lisp_string("syn"), 0, None).unwrap();
@@ -222,7 +237,15 @@ fn file_streams_expose_position_length_and_external_format() {
     assert_eq!(file_position(out).unwrap().as_fixnum(), 5);
     close(out, false).unwrap();
 
-    let input = open(path, StreamDirection::Input, NIL, T, T, ExternalFormat::Utf8).unwrap();
+    let input = open(
+        path,
+        StreamDirection::Input,
+        NIL,
+        T,
+        T,
+        ExternalFormat::Utf8,
+    )
+    .unwrap();
     assert_eq!(file_length_fn(input).unwrap().as_fixnum(), 5);
     assert_eq!(file_position(input).unwrap().as_fixnum(), 0);
     assert_eq!(
@@ -234,8 +257,14 @@ fn file_streams_expose_position_length_and_external_format() {
         "he"
     );
     assert_eq!(file_position(input).unwrap().as_fixnum(), 2);
-    assert_eq!(set_file_position(input, BlissVal::from_fixnum(1)).unwrap(), T);
-    assert_eq!(stream_unread_char(input, BlissVal::from_char('e')).is_ok(), true);
+    assert_eq!(
+        set_file_position(input, BlissVal::from_fixnum(1)).unwrap(),
+        T
+    );
+    assert_eq!(
+        stream_unread_char(input, BlissVal::from_char('e')).is_ok(),
+        true
+    );
 }
 
 #[test]
@@ -280,7 +309,10 @@ fn sequence_dispatch_and_bounds_follow_spec() {
 
     assert_eq!(sequences::length(list).unwrap(), 4);
     assert_eq!(sequences::length(vector).unwrap(), 4);
-    assert_eq!(seq_to_fixnums(sequences::subseq(list, 1, None).unwrap()), vec![20, 30, 40]);
+    assert_eq!(
+        seq_to_fixnums(sequences::subseq(list, 1, None).unwrap()),
+        vec![20, 30, 40]
+    );
     assert_eq!(
         seq_to_fixnums(sequences::concatenate(vector_symbol(), &[list, vector]).unwrap()),
         vec![10, 20, 30, 40, 1, 2, 3, 4]
@@ -301,8 +333,16 @@ fn sequence_search_and_reduction_honor_keywords() {
     let list = make_list(&[1, 2, 3, 2, 1]);
 
     assert_eq!(
-        sequences::find(BlissVal::from_fixnum(-2), list, NIL, Some(negate_key()), 0, None, false)
-            .unwrap(),
+        sequences::find(
+            BlissVal::from_fixnum(-2),
+            list,
+            NIL,
+            Some(negate_key()),
+            0,
+            None,
+            false
+        )
+        .unwrap(),
         BlissVal::from_fixnum(2)
     );
     assert_eq!(
@@ -314,8 +354,16 @@ fn sequence_search_and_reduction_honor_keywords() {
         BlissVal::from_fixnum(2)
     );
     assert_eq!(
-        sequences::reduce(addition_fn(), list, Some(BlissVal::from_fixnum(10)), None, 1, Some(4), false)
-            .unwrap(),
+        sequences::reduce(
+            addition_fn(),
+            list,
+            Some(BlissVal::from_fixnum(10)),
+            None,
+            1,
+            Some(4),
+            false
+        )
+        .unwrap(),
         BlissVal::from_fixnum(17)
     );
 }
@@ -381,7 +429,12 @@ fn robin_hood_growth_and_shrink_are_observable() {
     let initial_size = hash_table_size(table).unwrap();
 
     for i in 0..20 {
-        set_gethash(BlissVal::from_fixnum(i), table, BlissVal::from_fixnum(i * 10)).unwrap();
+        set_gethash(
+            BlissVal::from_fixnum(i),
+            table,
+            BlissVal::from_fixnum(i * 10),
+        )
+        .unwrap();
     }
     assert_eq!(hash_table_size(table).unwrap(), initial_size * 2);
     for i in 0..20 {
@@ -404,10 +457,18 @@ fn remhash_backward_shift_keeps_probe_chains_findable() {
     // strand later keys in the same probe cluster.
     let table = make_hash_table(&MakeHashTableOptions::default()).unwrap();
     for i in 0..64 {
-        set_gethash(BlissVal::from_fixnum(i), table, BlissVal::from_fixnum(i + 100)).unwrap();
+        set_gethash(
+            BlissVal::from_fixnum(i),
+            table,
+            BlissVal::from_fixnum(i + 100),
+        )
+        .unwrap();
     }
     assert!(remhash(BlissVal::from_fixnum(7), table).unwrap());
-    assert_eq!(gethash(BlissVal::from_fixnum(7), table, NIL).unwrap(), (NIL, false));
+    assert_eq!(
+        gethash(BlissVal::from_fixnum(7), table, NIL).unwrap(),
+        (NIL, false)
+    );
     assert_eq!(
         gethash(BlissVal::from_fixnum(63), table, NIL).unwrap(),
         (BlissVal::from_fixnum(163), true)
@@ -418,7 +479,11 @@ fn remhash_backward_shift_keeps_probe_chains_findable() {
 fn synchronized_and_weak_hash_table_modes_preserve_normal_operations() {
     // Per R9.10 and R9.11, synchronized and weak tables are created through
     // MAKE-HASH-TABLE and must still support the standard hash-table API.
-    for weakness in [Some(Weakness::Key), Some(Weakness::Value), Some(Weakness::KeyAndValue)] {
+    for weakness in [
+        Some(Weakness::Key),
+        Some(Weakness::Value),
+        Some(Weakness::KeyAndValue),
+    ] {
         let table = make_hash_table(&MakeHashTableOptions {
             synchronized: true,
             weakness,

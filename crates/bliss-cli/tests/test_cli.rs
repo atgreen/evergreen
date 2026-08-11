@@ -1,12 +1,23 @@
 //! Tests for bliss-cli: CliArgs parsing, ReplConfig defaults, and CLI driver functions.
 
-use bliss_cli::cli::{CliArgs, ReplConfig};
+use bliss_cli::{CliArgs, ReplConfig, help_text};
 
 // ── Helper ────────────────────────────────────────────────────────
 
 /// Convenience: build a `Vec<String>` from string slices.
 fn args(strs: &[&str]) -> Vec<String> {
     strs.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn crate_root_reexports_cli_surface() {
+    let parsed =
+        CliArgs::parse(&args(&["--eval", "(+ 1 2)"])).expect("crate-root CliArgs should parse");
+    assert_eq!(parsed.eval.as_deref(), Some("(+ 1 2)"));
+
+    let repl = ReplConfig::default();
+    assert!(repl.syntax_highlighting);
+    assert!(help_text().contains("Usage: bliss"));
 }
 
 // ══════════════════════════════════════════════════════════════════

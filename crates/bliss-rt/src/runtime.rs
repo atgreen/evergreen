@@ -66,7 +66,10 @@ fn available_parallelism() -> usize {
 fn parse_size(value: &str, context: &str) -> Result<usize, BlissError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(BlissError::Internal(format!("{} requires a size value", context)));
+        return Err(BlissError::Internal(format!(
+            "{} requires a size value",
+            context
+        )));
     }
 
     let split_at = trimmed
@@ -174,9 +177,7 @@ impl RuntimeConfig {
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| Some("bliss.bimg".into()));
-        let gc_log = std::env::var("BLISS_GC_LOG")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let gc_log = std::env::var("BLISS_GC_LOG").ok().filter(|s| !s.is_empty());
         let jit_dump = std::env::var("BLISS_JIT_DUMP")
             .ok()
             .map(|s| parse_bool_flag(&s, "BLISS_JIT_DUMP"))
@@ -237,14 +238,18 @@ impl RuntimeConfig {
                 }
                 "--heap-size" => {
                     if i + 1 >= args.len() {
-                        return Err(BlissError::Internal("--heap-size requires an argument".into()));
+                        return Err(BlissError::Internal(
+                            "--heap-size requires an argument".into(),
+                        ));
                     }
                     self.heap_size = parse_size(&args[i + 1], "--heap-size")?;
                     i += 2;
                 }
                 "--tlab-size" => {
                     if i + 1 >= args.len() {
-                        return Err(BlissError::Internal("--tlab-size requires an argument".into()));
+                        return Err(BlissError::Internal(
+                            "--tlab-size requires an argument".into(),
+                        ));
                     }
                     self.tlab_size = parse_size(&args[i + 1], "--tlab-size")?;
                     i += 2;
@@ -260,14 +265,18 @@ impl RuntimeConfig {
                 }
                 "--stack-size" => {
                     if i + 1 >= args.len() {
-                        return Err(BlissError::Internal("--stack-size requires an argument".into()));
+                        return Err(BlissError::Internal(
+                            "--stack-size requires an argument".into(),
+                        ));
                     }
                     self.stack_size = parse_size(&args[i + 1], "--stack-size")?;
                     i += 2;
                 }
                 "--workers" => {
                     if i + 1 >= args.len() {
-                        return Err(BlissError::Internal("--workers requires an argument".into()));
+                        return Err(BlissError::Internal(
+                            "--workers requires an argument".into(),
+                        ));
                     }
                     self.num_workers = parse_usize(&args[i + 1], "--workers")?;
                     i += 2;

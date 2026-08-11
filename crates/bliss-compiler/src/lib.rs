@@ -34,14 +34,12 @@ pub mod error;
 
 // ── Re-exports for convenience ────────────────────────────────────
 pub use codegen::{
-    Aarch64Backend, CodeBuffer, CodegenBackend, LinearScanAllocator, RegisterAllocation,
-    RelocKind, Relocation, StackMap, TargetArch, X86_64Backend, native_arch,
+    Aarch64Backend, CodeBuffer, CodegenBackend, LinearScanAllocator, RegisterAllocation, RelocKind,
+    Relocation, StackMap, TargetArch, X86_64Backend, native_arch,
 };
 pub use error::CompilerError;
 pub use ic::{IcEntry, IcState, InlineCache, ic_generation, init_ic_registry, reset_all_caches};
-pub use ir::{
-    Edge, EdgeKind, IrBuilder, IrGraph, IrSourceInfo, NodeId, NodeKind, verify,
-};
+pub use ir::{Edge, EdgeKind, IrBuilder, IrGraph, IrSourceInfo, NodeId, NodeKind, verify};
 pub use macroexpand::{
     CompilerMacroFn, DeclInfo, Environment, FunctionInfo, InlinePolicy, MacroexpandHook,
     OptimizeQualities, VariableInfo, define_compiler_macro, define_global_macro, macroexpand,
@@ -58,9 +56,7 @@ pub use osr::{
     Location, OsrEntryMap, OsrEntryResult, OsrSlotDesc, TypeGuard, clear_global_deopt_logs,
     deoptimize, is_function_blacklisted, is_function_in_backoff, osr_entry,
 };
-pub use profiling::{
-    BackEdgeCounter, FunctionProfile, InvocationCounter, TypeProfile,
-};
+pub use profiling::{BackEdgeCounter, FunctionProfile, InvocationCounter, TypeProfile};
 pub use reader::{
     ReaderState, SourcePos, SyntaxType, copy_readtable, get_dispatch_macro_character,
     get_macro_character, intern_symbol, make_dispatch_macro_character, make_readtable, read,

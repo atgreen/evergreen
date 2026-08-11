@@ -64,7 +64,10 @@ fn list_items(mut value: BlissVal) -> Vec<BlissVal> {
 }
 
 fn heap_type(value: BlissVal) -> u8 {
-    assert!(value.is_heap_object(), "expected heap object, got {value:?}");
+    assert!(
+        value.is_heap_object(),
+        "expected heap object, got {value:?}"
+    );
     unsafe { (*(value.as_ptr() as *const ObjectHeader)).type_id() }
 }
 
@@ -89,7 +92,9 @@ fn expect_error_contains<T>(result: Result<T, BlissError>, needle: &str) {
 }
 
 fn macro_state_guard() -> MutexGuard<'static, ()> {
-    MACRO_STATE_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    MACRO_STATE_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
 }
 
 fn passthrough_hook(
@@ -120,10 +125,7 @@ fn reader_acceptance_parses_standard_reader_macros_comments_and_escapes() {
 
     let quasiquoted = parse("`(,foo ,@bar)");
     let outer = list_items(quasiquoted);
-    assert_eq!(
-        symbol_text(outer[0]).as_deref(),
-        Some("BLISS::QUASIQUOTE")
-    );
+    assert_eq!(symbol_text(outer[0]).as_deref(), Some("BLISS::QUASIQUOTE"));
     let inner = list_items(outer[1]);
     assert_eq!(
         symbol_text(list_items(inner[0])[0]).as_deref(),
@@ -194,7 +196,10 @@ fn reader_readtable_entrypoints_store_and_copy_macro_dispatch_configuration() {
     let rt = make_readtable(None).unwrap();
     let bang_handler = BlissVal::from_fixnum(11);
     set_macro_character(rt, '!', bang_handler, true).unwrap();
-    assert_eq!(get_macro_character(rt, '!').unwrap(), (Some(bang_handler), true));
+    assert_eq!(
+        get_macro_character(rt, '!').unwrap(),
+        (Some(bang_handler), true)
+    );
 
     make_dispatch_macro_character(rt, '%', false).unwrap();
     let sub_handler = BlissVal::from_fixnum(22);
@@ -226,7 +231,7 @@ fn reader_entrypoints_report_positions_and_malformed_input_errors() {
 
     expect_stream_error_contains(read_from_string("(foo"), "unterminated list");
     expect_stream_error_contains(read_from_string("\"abc"), "unterminated string");
-    expect_stream_error_contains(read_from_string("\\") , "trailing single escape");
+    expect_stream_error_contains(read_from_string("\\"), "trailing single escape");
     expect_stream_error_contains(read_from_string("MISSING-PKG:SYM"), "package not found");
     expect_error_contains(read_from_string("1/0"), "division by zero");
 }
@@ -363,7 +368,10 @@ fn macroexpand_all_consults_compiler_macros_and_honors_decline() {
 
     let unchanged = macroexpand_all(parse("(DECLINED-FN 1)"), &Environment::null()).unwrap();
     let unchanged_items = list_items(unchanged);
-    assert_eq!(symbol_text(unchanged_items[0]).as_deref(), Some("DECLINED-FN"));
+    assert_eq!(
+        symbol_text(unchanged_items[0]).as_deref(),
+        Some("DECLINED-FN")
+    );
     assert_eq!(unchanged_items[1].as_fixnum(), 1);
 
     undefine_global_macro(ordinary);
@@ -423,7 +431,8 @@ fn macroexpand_uses_the_macroexpand_hook() {
     let name = sym("HOOKED-MACRO");
     define_global_macro(name, BlissVal::from_fixnum(123));
 
-    let (expanded, did_expand) = macroexpand_1(parse("(HOOKED-MACRO)"), &Environment::null()).unwrap();
+    let (expanded, did_expand) =
+        macroexpand_1(parse("(HOOKED-MACRO)"), &Environment::null()).unwrap();
     assert!(did_expand);
     assert_eq!(expanded.as_fixnum(), 123);
     assert!(HOOK_CALLED.load(Ordering::SeqCst));
@@ -443,7 +452,10 @@ fn macroexpand_detects_circular_expansion() {
     let cyc = sym("CYCLE");
     define_global_macro(cyc, parse("(CYCLE)"));
 
-    expect_error_contains(macroexpand(parse("(CYCLE)"), &Environment::null()), "circular");
+    expect_error_contains(
+        macroexpand(parse("(CYCLE)"), &Environment::null()),
+        "circular",
+    );
 
     undefine_global_macro(cyc);
     set_macroexpand_limit(65536);

@@ -9,10 +9,32 @@
 
 use bliss_rt::value::{NIL, T};
 use bliss_stdlib::devtools::*;
+use bliss_stdlib::{
+    BreakpointId, ReplState, describe, eval_in_frame, inspect, list_breakpoints, room, walk_stack,
+};
 
 // ══════════════════════════════════════════════════════════════════
 // ReplState
 // ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn crate_root_reexports_devtools_surface() {
+    let _ = BreakpointId(1);
+    let _ = ReplState::new();
+    let _ = walk_stack();
+    let _describe: fn(
+        bliss_rt::value::BlissVal,
+        bliss_rt::value::BlissVal,
+    ) -> Result<(), bliss_rt::error::BlissError> = describe;
+    let _inspect: fn(bliss_rt::value::BlissVal) -> Result<(), bliss_rt::error::BlissError> =
+        inspect;
+    let _room: fn(
+        Option<bliss_rt::value::BlissVal>,
+        bliss_rt::value::BlissVal,
+    ) -> Result<(), bliss_rt::error::BlissError> = room;
+    let _eval = eval_in_frame;
+    let _ = list_breakpoints();
+}
 
 #[test]
 fn repl_state_initial_level_is_zero() {

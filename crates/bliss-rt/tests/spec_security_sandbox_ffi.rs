@@ -22,7 +22,8 @@ extern "C" fn callback_target() -> u64 {
 
 fn read_source(path: impl AsRef<Path>) -> String {
     let path = path.as_ref();
-    fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err))
+    fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err))
 }
 
 fn collect_rust_sources(root: &Path, files: &mut Vec<PathBuf>) {
@@ -81,7 +82,10 @@ fn sandbox_source_defines_eval_time_and_stack_guards_and_child_propagation() {
     // Per R8.20, sandbox escape prevention must cover EVAL/COMPILE/LOAD and child-thread propagation.
     let sandbox_source = read_source("crates/bliss-rt/src/sandbox.rs");
 
-    assert!(sandbox_source.contains("max_cpu_ms"), "sandbox policy must track CPU limits");
+    assert!(
+        sandbox_source.contains("max_cpu_ms"),
+        "sandbox policy must track CPU limits"
+    );
     assert!(
         sandbox_source.contains("max_stack_depth"),
         "sandbox policy must track stack depth limits"
@@ -117,7 +121,9 @@ fn ffi_rejects_null_function_pointer_instead_of_crashing() {
     // Per R2.18, runtime failures propagate as Result errors rather than panicking.
     let err = unsafe { ffi_call(std::ptr::null(), &AlienType::Void, &[], &[]) }
         .expect_err("null function pointer must be rejected");
-    assert!(matches!(err, BlissError::FfiError(message) if message.contains("null function pointer")));
+    assert!(
+        matches!(err, BlissError::FfiError(message) if message.contains("null function pointer"))
+    );
 }
 
 #[test]
@@ -179,8 +185,15 @@ fn ffi_calls_real_c_symbols_with_platform_abi_and_pointer_arguments() {
 fn ffi_callback_trampoline_invokes_prepared_closure() {
     // Per R2.12, the FFI bridge supports callbacks from C into CL via trampolines.
     let closure = BlissVal::from_fixnum(callback_target as *const () as usize as i64);
-    let callback = Callback::new(closure, AlienType::Int { signed: false, bits: 64 }, vec![])
-        .expect("callback construction must succeed");
+    let callback = Callback::new(
+        closure,
+        AlienType::Int {
+            signed: false,
+            bits: 64,
+        },
+        vec![],
+    )
+    .expect("callback construction must succeed");
     callback.prepare_call();
 
     let raw = unsafe {
@@ -195,10 +208,34 @@ fn marshalling_round_trips_integer_float_and_pointer_shapes() {
     // Per R2.13 and R8.19, alien-value marshalling must cover integer, float, double, pointer,
     // and void shapes without silent information loss for supported values.
     let signed_cases = [
-        (AlienType::Int { signed: true, bits: 8 }, -7_i64),
-        (AlienType::Int { signed: true, bits: 16 }, -300_i64),
-        (AlienType::Int { signed: true, bits: 32 }, -42_i64),
-        (AlienType::Int { signed: true, bits: 64 }, -9_223_372_036_854_775_i64),
+        (
+            AlienType::Int {
+                signed: true,
+                bits: 8,
+            },
+            -7_i64,
+        ),
+        (
+            AlienType::Int {
+                signed: true,
+                bits: 16,
+            },
+            -300_i64,
+        ),
+        (
+            AlienType::Int {
+                signed: true,
+                bits: 32,
+            },
+            -42_i64,
+        ),
+        (
+            AlienType::Int {
+                signed: true,
+                bits: 64,
+            },
+            -9_223_372_036_854_775_i64,
+        ),
     ];
     for (alien_type, number) in signed_cases {
         let raw = marshal_to_c(BlissVal::from_fixnum(number), &alien_type).expect("marshal int");
@@ -208,17 +245,18 @@ fn marshalling_round_trips_integer_float_and_pointer_shapes() {
 
     let float_value = BlissVal::from_single_float(3.5);
     let float_bits = marshal_to_c(float_value, &AlienType::Float).expect("marshal float");
-    let float_round_trip = unmarshal_from_c(float_bits, &AlienType::Float).expect("unmarshal float");
+    let float_round_trip =
+        unmarshal_from_c(float_bits, &AlienType::Float).expect("unmarshal float");
     assert!((float_round_trip.as_single_float() - 3.5).abs() < f32::EPSILON);
 
-    let double_bits = marshal_to_c(BlissVal::from_fixnum(12), &AlienType::Double)
-        .expect("marshal double");
+    let double_bits =
+        marshal_to_c(BlissVal::from_fixnum(12), &AlienType::Double).expect("marshal double");
     let double_round_trip =
         unmarshal_from_c(double_bits, &AlienType::Double).expect("unmarshal double");
     assert_eq!(double_round_trip, BlissVal::from_fixnum(12));
 
-    let null_pointer = marshal_to_c(NIL, &AlienType::Pointer(Box::new(AlienType::Void)))
-        .expect("marshal pointer");
+    let null_pointer =
+        marshal_to_c(NIL, &AlienType::Pointer(Box::new(AlienType::Void))).expect("marshal pointer");
     assert_eq!(null_pointer, 0);
     assert_eq!(
         unmarshal_from_c(null_pointer, &AlienType::Pointer(Box::new(AlienType::Void)))
@@ -280,7 +318,11 @@ fn unsafe_runtime_code_is_confined_to_the_specified_modules_and_documented() {
             || normalized.contains("/gc/")
             || normalized.ends_with("/signal.rs");
 
-        assert!(allowed, "unexpected unsafe code outside approved modules: {}", normalized);
+        assert!(
+            allowed,
+            "unexpected unsafe code outside approved modules: {}",
+            normalized
+        );
         assert!(
             source.contains("SAFETY:"),
             "unsafe code in {} must be justified with a SAFETY comment",

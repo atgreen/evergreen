@@ -43,11 +43,17 @@ fn debugger_public_hooks_support_stack_walk_eval_and_breakpoints() {
     // Per R6.12 and R6.18, public debugger APIs expose frames and eval-in-frame.
     // Per R6.14-R6.16, breakpoints are user-visible debugger hooks.
     let frames = walk_stack();
-    assert!(!frames.is_empty(), "walk_stack should expose the current execution stack");
+    assert!(
+        !frames.is_empty(),
+        "walk_stack should expose the current execution stack"
+    );
 
     let frame = frames.first().expect("first frame");
     assert!(frame.is_live(), "current stack frame should be live");
-    assert_eq!(eval_in_frame(BlissVal::from_fixnum(7), frame).expect("eval in frame"), BlissVal::from_fixnum(7));
+    assert_eq!(
+        eval_in_frame(BlissVal::from_fixnum(7), frame).expect("eval in frame"),
+        BlissVal::from_fixnum(7)
+    );
 
     let entry_bp = break_on_entry(BlissVal::from_raw(0x6), Some(T)).expect("break-on-entry");
     let line_bp = break_at("spec/devtools.lisp", 12, Some(T)).expect("break-at");
@@ -76,14 +82,27 @@ fn profiler_and_timing_apis_return_structured_observable_results() {
     instrument_function_exit(0xAA);
     let instrumented = stop_instrumentation_profiler().expect("stop instrumentation profiler");
     assert_eq!(instrumented.kind, ProfilerKind::Instrumented);
-    assert!(instrumented.entries.iter().any(|entry| entry.call_count == Some(1)));
+    assert!(
+        instrumented
+            .entries
+            .iter()
+            .any(|entry| entry.call_count == Some(1))
+    );
 
     start_allocation_profiler().expect("start allocation profiler");
     record_allocation(0x0E, 64, 0x2222);
-    assert_eq!(stop_allocation_profiler().expect("stop allocation profiler"), T);
+    assert_eq!(
+        stop_allocation_profiler().expect("stop allocation profiler"),
+        T
+    );
     let allocation = get_last_profiler_report().expect("allocation report");
     assert_eq!(allocation.kind, ProfilerKind::Allocation);
-    assert!(allocation.entries.iter().any(|entry| entry.alloc_bytes.unwrap_or(0) >= 64));
+    assert!(
+        allocation
+            .entries
+            .iter()
+            .any(|entry| entry.alloc_bytes.unwrap_or(0) >= 64)
+    );
 
     let (result, timing) = time_execution(|| Ok(BlissVal::from_fixnum(42)));
     assert_eq!(result.expect("timed result"), BlissVal::from_fixnum(42));
@@ -119,7 +138,10 @@ fn swank_server_enforces_authentication_and_serves_eval_completion_and_thread_qu
 
     let mut bad = connect_and_auth(port, "wrong-secret\n");
     let bad_reply = read_ascii_response(&mut bad);
-    assert!(bad_reply.contains("authentication failed"), "reply was: {bad_reply}");
+    assert!(
+        bad_reply.contains("authentication failed"),
+        "reply was: {bad_reply}"
+    );
 
     let mut conn1 = connect_and_auth(port, swank_secret_for_first_server());
     let ok_reply = read_ascii_response(&mut conn1);
@@ -139,23 +161,41 @@ fn swank_server_enforces_authentication_and_serves_eval_completion_and_thread_qu
         .write_all(completions.as_bytes())
         .expect("send completions");
     let completions_reply = read_ascii_response(&mut conn1);
-    assert!(completions_reply.to_lowercase().contains("format"), "reply was: {completions_reply}");
+    assert!(
+        completions_reply.to_lowercase().contains("format"),
+        "reply was: {completions_reply}"
+    );
 
     let threads = swank_rex("(swank:list-threads)", 9);
-    conn2.write_all(threads.as_bytes()).expect("send thread query");
+    conn2
+        .write_all(threads.as_bytes())
+        .expect("send thread query");
     let thread_reply = read_ascii_response(&mut conn2);
-    assert!(thread_reply.contains("swank-conn-"), "reply was: {thread_reply}");
-    assert!(thread_reply.contains("connected"), "reply was: {thread_reply}");
+    assert!(
+        thread_reply.contains("swank-conn-"),
+        "reply was: {thread_reply}"
+    );
+    assert!(
+        thread_reply.contains("connected"),
+        "reply was: {thread_reply}"
+    );
 
     let debug = swank_rex("(swank:debug-thread 9)", 10);
-    conn2.write_all(debug.as_bytes()).expect("send debug-thread");
+    conn2
+        .write_all(debug.as_bytes())
+        .expect("send debug-thread");
     let debug_reply = read_ascii_response(&mut conn2);
     assert!(debug_reply.contains(":thread"), "reply was: {debug_reply}");
 
     let info = swank_rex("(swank:connection-info)", 11);
-    conn1.write_all(info.as_bytes()).expect("send connection-info");
+    conn1
+        .write_all(info.as_bytes())
+        .expect("send connection-info");
     let info_reply = read_ascii_response(&mut conn1);
-    assert!(info_reply.contains(":connections"), "reply was: {info_reply}");
+    assert!(
+        info_reply.contains(":connections"),
+        "reply was: {info_reply}"
+    );
     assert!(info_reply.contains("127.0.0.1"), "reply was: {info_reply}");
 
     stop_swank_server().expect("stop swank server");

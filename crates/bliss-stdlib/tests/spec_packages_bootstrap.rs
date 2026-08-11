@@ -124,7 +124,9 @@ fn use_package_exposes_only_directly_used_external_symbols() {
         .expect("leaf package");
 
     assert_eq!(
-        find_symbol("VISIBLE", middle).unwrap().map(|(_, status)| status),
+        find_symbol("VISIBLE", middle)
+            .unwrap()
+            .map(|(_, status)| status),
         Some(InternStatus::Inherited),
         "a package must inherit exported symbols from packages on its direct use-list",
     );
@@ -232,13 +234,18 @@ fn concurrent_bootstrap_and_mutation_on_separate_threads_remain_isolated() {
             let cl_lookup = registry.find_package("CL");
             let cl_user_lookup = registry.find_package("CL-USER");
             let local_lookup = registry.find_package(&format!("THREAD-PKG-{thread_index}"));
-            let foreign_lookup = registry.find_package(&format!(
-                "THREAD-PKG-{}",
-                (thread_index + 1) % THREADS
-            ));
+            let foreign_lookup =
+                registry.find_package(&format!("THREAD-PKG-{}", (thread_index + 1) % THREADS));
 
-            tx.send((thread_index, ids, cl_lookup, cl_user_lookup, local_lookup, foreign_lookup))
-                .expect("send thread result");
+            tx.send((
+                thread_index,
+                ids,
+                cl_lookup,
+                cl_user_lookup,
+                local_lookup,
+                foreign_lookup,
+            ))
+            .expect("send thread result");
         }));
     }
     drop(tx);

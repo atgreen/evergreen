@@ -76,7 +76,11 @@ fn bootstrap_string_bytes(value: BlissVal) -> Vec<u8> {
     }
 }
 
-fn sxhash_equivalent(header: &mut ObjectHeader, object_addr: usize, compute_count: &mut usize) -> u32 {
+fn sxhash_equivalent(
+    header: &mut ObjectHeader,
+    object_addr: usize,
+    compute_count: &mut usize,
+) -> u32 {
     if header.hash() == 0 {
         *compute_count += 1;
         let computed = (((object_addr as u64) >> 3) as u32)
@@ -192,7 +196,10 @@ fn object_header_has_the_required_layout_fields_and_atomic_gc_operations() {
 
     header.set_gc_bits((1 << gc_bit::FORWARDED) | (1 << gc_bit::PINNED));
     header.set_hash(0xfeed_beef);
-    assert_eq!(header.gc_bits(), (1 << gc_bit::FORWARDED) | (1 << gc_bit::PINNED));
+    assert_eq!(
+        header.gc_bits(),
+        (1 << gc_bit::FORWARDED) | (1 << gc_bit::PINNED)
+    );
     assert!(header.is_forwarded());
     assert!(header.is_pinned());
     assert_eq!(header.hash(), 0xfeed_beef);
@@ -267,8 +274,16 @@ fn arrays_expose_all_ansi_required_element_specialisation_tags() {
 
     for element_type in specialisations {
         let array = array_value(element_type);
-        assert!(types::arrayp(array), "missing array support for {:?}", element_type);
-        assert!(types::vectorp(array), "missing vector support for {:?}", element_type);
+        assert!(
+            types::arrayp(array),
+            "missing array support for {:?}",
+            element_type
+        );
+        assert!(
+            types::vectorp(array),
+            "missing vector support for {:?}",
+            element_type
+        );
         assert_eq!(
             types::bit_vector_p(array),
             element_type == ElementTypeTag::Bit,
@@ -293,10 +308,23 @@ fn object_header_hash_is_computed_once_on_first_sxhash_equivalent_use_then_cache
     let first = sxhash_equivalent(&mut object.header, object_addr, &mut compute_count);
     let second = sxhash_equivalent(&mut object.header, object_addr, &mut compute_count);
 
-    assert_ne!(first, 0, "first SXHASH-equivalent use must materialize a non-zero hash");
-    assert_eq!(first, object.header.hash(), "computed hash must be cached in the header");
-    assert_eq!(second, first, "subsequent SXHASH-equivalent use must reuse the cached hash");
-    assert_eq!(compute_count, 1, "hash computation must happen exactly once");
+    assert_ne!(
+        first, 0,
+        "first SXHASH-equivalent use must materialize a non-zero hash"
+    );
+    assert_eq!(
+        first,
+        object.header.hash(),
+        "computed hash must be cached in the header"
+    );
+    assert_eq!(
+        second, first,
+        "subsequent SXHASH-equivalent use must reuse the cached hash"
+    );
+    assert_eq!(
+        compute_count, 1,
+        "hash computation must happen exactly once"
+    );
 }
 
 #[test]
@@ -355,7 +383,10 @@ fn bootstrap_typep_and_subtypep_follow_the_exposed_runtime_contract() {
 
     assert!(types::typep(BlissVal::from_fixnum(5), fixnum_type));
     assert!(types::typep(NIL, list_type));
-    assert!(types::typep(heap_value(type_id::SIMPLE_BASE_STRING), string_type));
+    assert!(types::typep(
+        heap_value(type_id::SIMPLE_BASE_STRING),
+        string_type
+    ));
 
     let (yes, valid) = types::subtypep(fixnum_type, fixnum_type);
     assert_eq!((yes, valid), (true, true));

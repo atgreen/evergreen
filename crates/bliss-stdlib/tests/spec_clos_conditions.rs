@@ -294,7 +294,10 @@ fn conditions_handler_case_matches_registered_conditions_and_passes_through_valu
         handler_case(condition, &[(sym(SYMBOL_ERROR), fx(77))]).unwrap(),
         fx(77)
     );
-    assert_eq!(handler_case(fx(78), &[(sym(SYMBOL_ERROR), fx(99))]).unwrap(), fx(78));
+    assert_eq!(
+        handler_case(fx(78), &[(sym(SYMBOL_ERROR), fx(99))]).unwrap(),
+        fx(78)
+    );
 }
 
 #[test]
@@ -357,7 +360,10 @@ fn conditions_restarts_are_newest_first_filtered_invokable_and_thread_local() {
     let observed = conditions::restart_bind_fn(&[visible_old, visible_new, hidden], || {
         let names = compute_restarts(Some(condition));
         assert_eq!(names, vec![same_name, same_name]);
-        assert_eq!(compute_restarts(None), vec![hidden_name, same_name, same_name]);
+        assert_eq!(
+            compute_restarts(None),
+            vec![hidden_name, same_name, same_name]
+        );
 
         let found = find_restart(same_name, Some(condition)).unwrap();
         assert_eq!(found, new_restart);
@@ -365,7 +371,10 @@ fn conditions_restarts_are_newest_first_filtered_invokable_and_thread_local() {
         assert_eq!(invoke_restart_interactively(same_name).unwrap(), fx(1234));
 
         let thread_names = thread::spawn(compute_restarts_none).join().unwrap();
-        assert!(thread_names.is_empty(), "R5.108: restart stacks are thread-local");
+        assert!(
+            thread_names.is_empty(),
+            "R5.108: restart stacks are thread-local"
+        );
 
         Ok(fx(1))
     })

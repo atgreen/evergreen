@@ -3,8 +3,8 @@ use bliss_compiler::ir::{IrBuilder, NodeKind, verify};
 use bliss_compiler::macroexpand::{Environment, macroexpand};
 use bliss_compiler::reader::read_from_string;
 use bliss_compiler::tiered::{
-    BaselineCompiler, FnMeta, Interpreter, OptimisingCompiler, Tier, TierConfig,
-    check_promotion, process_compilation_request, request_compilation,
+    BaselineCompiler, FnMeta, Interpreter, OptimisingCompiler, Tier, TierConfig, check_promotion,
+    process_compilation_request, request_compilation,
 };
 use bliss_rt::value::{BlissVal, NIL};
 use std::sync::atomic::Ordering;
@@ -42,11 +42,15 @@ fn acceptance_read_macroexpand_ir_and_t2_codegen_for_branching_form() {
         .map(|id| graph.node_kind(bliss_compiler::NodeId(id)).clone())
         .collect();
     assert!(
-        node_kinds.iter().any(|kind| matches!(kind, NodeKind::Branch)),
+        node_kinds
+            .iter()
+            .any(|kind| matches!(kind, NodeKind::Branch)),
         "branching source must produce a Branch node in the public IR"
     );
     assert!(
-        node_kinds.iter().any(|kind| matches!(kind, NodeKind::Return)),
+        node_kinds
+            .iter()
+            .any(|kind| matches!(kind, NodeKind::Return)),
         "pipeline must end in a Return node"
     );
 

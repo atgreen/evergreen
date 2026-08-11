@@ -1,10 +1,10 @@
+use bliss_rt::WriteBarrier;
 use bliss_rt::gc::{
     Allocator, Collector, GcConfig, HeapAllocator, HeapCollector, SatbCardBarrier, WeakPointer,
     full_gc, gc_marking_in_progress, heap_stats, init_heap, record_object, register_finalizer,
     register_weak_pointer, set_finalizer_dispatch, set_gc_marking_in_progress, walk_heap,
 };
 use bliss_rt::value::BlissVal;
-use bliss_rt::WriteBarrier;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -82,7 +82,9 @@ fn spec_gc_allocator_paths_and_stats_follow_configured_heap() {
     assert_eq!(second as usize - first as usize, 32);
 
     while allocator.alloc_fast(24).is_some() {}
-    let slow = allocator.alloc_slow(24).expect("slow alloc after exhaustion");
+    let slow = allocator
+        .alloc_slow(24)
+        .expect("slow alloc after exhaustion");
     assert!(!slow.is_null());
 
     let stats = heap_stats();
@@ -122,7 +124,9 @@ fn spec_gc_large_objects_minor_gc_and_full_gc_use_real_collector_paths() {
 
     let objects = heap_objects();
     assert!(
-        objects.iter().any(|(ptr, _, size)| *ptr == large as usize && *size == 700),
+        objects
+            .iter()
+            .any(|(ptr, _, size)| *ptr == large as usize && *size == 700),
         "large object should remain walkable after collection"
     );
 }
@@ -182,7 +186,10 @@ fn spec_gc_major_gc_runs_finalizers_and_survives_finalizer_panics() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    assert_eq!(log, vec![(BlissVal::from_fixnum(7).to_raw(), object.to_raw())]);
+    assert_eq!(
+        log,
+        vec![(BlissVal::from_fixnum(7).to_raw(), object.to_raw())]
+    );
 
     record_object(0x42, vec![9, 9, 9, 9, 9, 9, 9, 9]);
     let panicking_ptr = heap_objects()
@@ -194,7 +201,9 @@ fn spec_gc_major_gc_runs_finalizers_and_survives_finalizer_panics() {
     register_finalizer(panicking_object, BlissVal::from_fixnum(8)).expect("register_finalizer");
 
     PANIC_IN_FINALIZER.store(true, Ordering::SeqCst);
-    collector.major_gc().expect("major_gc should survive finalizer panic");
+    collector
+        .major_gc()
+        .expect("major_gc should survive finalizer panic");
     PANIC_IN_FINALIZER.store(false, Ordering::SeqCst);
     assert!(heap_stats().major_gc_count >= 2);
 }
@@ -242,7 +251,9 @@ fn spec_gc_large_object_is_not_moved_by_major_gc() {
 
     let objects = heap_objects();
     assert!(
-        objects.iter().any(|(obj_ptr, _, size)| *obj_ptr == ptr as usize && *size == 700),
+        objects
+            .iter()
+            .any(|(obj_ptr, _, size)| *obj_ptr == ptr as usize && *size == 700),
         "surviving large object address changed across major GC"
     );
 }

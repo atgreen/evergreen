@@ -131,9 +131,7 @@ impl CliArgs {
             workers: extract_flag_value(&shared_args, "--workers")
                 .map(|value| value.parse::<usize>())
                 .transpose()
-                .map_err(|_| {
-                    BlissError::Internal("--workers requires a numeric value".into())
-                })?,
+                .map_err(|_| BlissError::Internal("--workers requires a numeric value".into()))?,
             heap_size: extract_size_arg(&shared_args, "--heap-size"),
             help,
             version,
@@ -2538,7 +2536,11 @@ fn loop_bind(pattern: BlissVal, value: BlissVal, env: &mut Env) {
         }
     } else if pattern.is_cons() {
         let (pcar, pcdr) = cp(pattern);
-        let (vcar, vcdr) = if value.is_cons() { cp(value) } else { (NIL, NIL) };
+        let (vcar, vcdr) = if value.is_cons() {
+            cp(value)
+        } else {
+            (NIL, NIL)
+        };
         loop_bind(pcar, vcar, env);
         loop_bind(pcdr, vcdr, env);
     }
@@ -2644,9 +2646,19 @@ fn loop_return_target(form: BlissVal) -> Option<BlissVal> {
 
 /// A parsed `:for` iteration clause.
 enum ForClause {
-    In { pat: BlissVal, list_form: BlissVal },
-    On { pat: BlissVal, list_form: BlissVal },
-    Eq { pat: BlissVal, init: BlissVal, then: Option<BlissVal> },
+    In {
+        pat: BlissVal,
+        list_form: BlissVal,
+    },
+    On {
+        pat: BlissVal,
+        list_form: BlissVal,
+    },
+    Eq {
+        pat: BlissVal,
+        init: BlissVal,
+        then: Option<BlissVal>,
+    },
 }
 
 /// Runtime cursor for a `:for` clause.

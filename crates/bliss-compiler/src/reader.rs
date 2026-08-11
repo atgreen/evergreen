@@ -104,10 +104,16 @@ fn readtable_key(readtable: BlissVal) -> u64 {
 fn lookup_custom_macro(readtable: BlissVal, ch: char) -> Option<(BlissVal, bool)> {
     let key = readtable_key(readtable);
     let guard = MACRO_CHARS.lock().unwrap();
-    guard.as_ref().and_then(|table| table.get(&(key, ch)).copied())
+    guard
+        .as_ref()
+        .and_then(|table| table.get(&(key, ch)).copied())
 }
 
-fn lookup_custom_dispatch(readtable: BlissVal, disp_char: char, sub_char: char) -> Option<BlissVal> {
+fn lookup_custom_dispatch(
+    readtable: BlissVal,
+    disp_char: char,
+    sub_char: char,
+) -> Option<BlissVal> {
     let key = readtable_key(readtable);
     let guard = DISPATCH_SUB_CHARS.lock().unwrap();
     guard
@@ -390,7 +396,8 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
 
                     // Honor custom readtable entries before falling back to built-ins.
                     let first_pos = skip_whitespace_and_comments(&chars, 0);
-                    if let Some(custom) = apply_custom_macro_handler(&chars, first_pos, state.readtable)
+                    if let Some(custom) =
+                        apply_custom_macro_handler(&chars, first_pos, state.readtable)
                     {
                         return custom.map(|(val, _)| val);
                     }
@@ -458,7 +465,10 @@ pub fn read_from_string_with_base(
 fn default_string_reader_circular_mode() -> bool {
     std::env::current_exe()
         .ok()
-        .and_then(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
+        .and_then(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
         .map(|stem| !stem.contains("spec_reader_macroexpand"))
         .unwrap_or(true)
 }
@@ -1143,7 +1153,15 @@ fn read_sharpsign_with_base(
         '|' => {
             // Block comment #| ... |# — possibly nested
             let p = skip_block_comment(chars, pos)?;
-            read_token_with_base(chars, p, labels, read_base, read_eval, read_circular, depth + 1)
+            read_token_with_base(
+                chars,
+                p,
+                labels,
+                read_base,
+                read_eval,
+                read_circular,
+                depth + 1,
+            )
         }
         ':' => {
             // Uninterned symbol
@@ -1442,7 +1460,15 @@ fn read_feature_expr_with_base(
 
     if (include_if_present && feature_present) || (!include_if_present && !feature_present) {
         // Include the next form
-        read_token_with_base(chars, pos, labels, read_base, read_eval, read_circular, depth + 1)
+        read_token_with_base(
+            chars,
+            pos,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        )
     } else {
         // Skip the next form syntactically without resolving packages or
         // evaluating reader macros inside the suppressed branch.
@@ -1512,9 +1538,8 @@ fn feature_symbol_name(val: BlissVal) -> String {
     match val {
         NIL => "NIL".to_string(),
         T => "T".to_string(),
-        _ if val.tag() == bliss_rt::value::TAG_SYMBOL => {
-            symbol_name(val.as_symbol_index()).unwrap_or_else(|| format!("SYM#{}", val.as_symbol_index()))
-        }
+        _ if val.tag() == bliss_rt::value::TAG_SYMBOL => symbol_name(val.as_symbol_index())
+            .unwrap_or_else(|| format!("SYM#{}", val.as_symbol_index())),
         _ => String::new(),
     }
 }
@@ -1598,7 +1623,10 @@ fn skip_sharpsign_form(chars: &[char], mut pos: usize, depth: usize) -> Result<u
         return match chars[pos] {
             '=' => skip_form(chars, pos + 1, depth + 1),
             '#' => Ok(pos + 1),
-            other => Err(BlissError::StreamError(format!("unknown # dispatch #{}", other))),
+            other => Err(BlissError::StreamError(format!(
+                "unknown # dispatch #{}",
+                other
+            ))),
         };
     }
 

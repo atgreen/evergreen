@@ -132,9 +132,7 @@ fn emit_graph(buf: &mut CodeBuffer, graph: &IrGraph) {
     }
 }
 
-fn lower_backend_supported_phis(
-    graph: &IrGraph,
-) -> Result<IrGraph, crate::error::CompilerError> {
+fn lower_backend_supported_phis(graph: &IrGraph) -> Result<IrGraph, crate::error::CompilerError> {
     use crate::ir::EdgeKind;
 
     let mut lowered = graph.clone();

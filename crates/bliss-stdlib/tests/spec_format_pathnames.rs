@@ -6,16 +6,16 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bliss_rt::error::BlissError;
-use bliss_rt::object::{type_id, ObjectHeader};
 use bliss_rt::object::ConsCell;
+use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, NIL, T};
 use bliss_stdlib::{
-    directory, ensure_directories_exist, format, get_output_stream_string,
+    NewlineKind, TabKind, directory, ensure_directories_exist, format, get_output_stream_string,
     logical_pathname_translations, make_lisp_string, make_pathname, make_string_output_stream,
     merge_pathnames, namestring, parse_namestring, pathname_directory, pathname_host,
     pathname_match_p, pathname_name, pathname_type, pathname_version, pprint_logical_block,
     pprint_newline, pprint_tab, probe_file, register_string, set_logical_pathname_translations,
-    translate_logical_pathname, truename, wild_pathname_p, NewlineKind, TabKind,
+    translate_logical_pathname, truename, wild_pathname_p,
 };
 
 fn pseudo_string(s: &str) -> BlissVal {
@@ -92,7 +92,8 @@ fn format_accepts_nil_and_stream_destinations_and_rejects_other_values() {
     assert_eq!(rendered, make_lisp_string("Hello, world"));
 
     let stream = make_string_output_stream(NIL).expect("string output stream");
-    let stream_result = format(stream, "~D bottles", &[BlissVal::from_fixnum(3)]).expect("stream format");
+    let stream_result =
+        format(stream, "~D bottles", &[BlissVal::from_fixnum(3)]).expect("stream format");
     assert_eq!(stream_result, NIL);
     assert_eq!(
         get_output_stream_string(stream).expect("stream contents"),
@@ -126,8 +127,7 @@ fn format_supports_modifiers_v_and_hash_parameters_and_is_thread_safe() {
     let threads: Vec<_> = (0..8)
         .map(|i| {
             thread::spawn(move || {
-                format(NIL, "[~D]", &[BlissVal::from_fixnum(i)])
-                    .expect("concurrent format")
+                format(NIL, "[~D]", &[BlissVal::from_fixnum(i)]).expect("concurrent format")
             })
         })
         .collect();
@@ -169,7 +169,11 @@ fn format_exercises_recursive_conditional_iteration_and_plural_directives() {
                 BlissVal::from_fixnum(2),
                 T,
                 BlissVal::from_fixnum(9),
-                list(&[make_lisp_string("a"), make_lisp_string("b"), make_lisp_string("c")]),
+                list(&[
+                    make_lisp_string("a"),
+                    make_lisp_string("b"),
+                    make_lisp_string("c")
+                ]),
                 BlissVal::from_fixnum(3)
             ]
         )
@@ -181,7 +185,8 @@ fn format_exercises_recursive_conditional_iteration_and_plural_directives() {
 #[test]
 fn format_reports_errors_for_bad_directives_and_argument_types() {
     // Per R5.157, malformed control strings and mismatched argument types must fail.
-    let unmatched = format(NIL, "~{~A", &[list(&[BlissVal::from_fixnum(1)])]).expect_err("unmatched");
+    let unmatched =
+        format(NIL, "~{~A", &[list(&[BlissVal::from_fixnum(1)])]).expect_err("unmatched");
     assert!(matches!(unmatched, BlissError::Internal(_)));
 
     let wrong_type = format(NIL, "~D", &[T]).expect_err("wrong type");
@@ -224,18 +229,24 @@ fn parse_namestring_handles_physical_edges_and_tilde_expansion() {
     assert_eq!(pathname_directory(root_pn), pseudo_string("/"));
     assert_eq!(pathname_name(root_pn), NIL);
 
-    let (hidden, _) = parse_namestring(pseudo_string(".gitignore"), None, None).expect("hidden file");
+    let (hidden, _) =
+        parse_namestring(pseudo_string(".gitignore"), None, None).expect("hidden file");
     assert_eq!(pathname_name(hidden), pseudo_string(".gitignore"));
     assert_eq!(pathname_type(hidden), NIL);
 
-    let (multi, _) = parse_namestring(pseudo_string("/tmp/foo.tar.gz"), None, None).expect("multi ext");
+    let (multi, _) =
+        parse_namestring(pseudo_string("/tmp/foo.tar.gz"), None, None).expect("multi ext");
     assert_eq!(pathname_name(multi), pseudo_string("foo.tar"));
     assert_eq!(pathname_type(multi), pseudo_string("gz"));
 
     let tilde_path = "~/src/bliss.lisp";
-    let (expanded, tilde_pos) = parse_namestring(pseudo_string(tilde_path), None, None).expect("tilde parse");
+    let (expanded, tilde_pos) =
+        parse_namestring(pseudo_string(tilde_path), None, None).expect("tilde parse");
     assert_eq!(tilde_pos, tilde_path.len());
-    assert_eq!(pathname_directory(expanded), pseudo_string(&format!("{}/src/", home.display())));
+    assert_eq!(
+        pathname_directory(expanded),
+        pseudo_string(&format!("{}/src/", home.display()))
+    );
     assert_eq!(pathname_name(expanded), pseudo_string("bliss"));
     assert_eq!(pathname_type(expanded), pseudo_string("lisp"));
 }
@@ -243,8 +254,8 @@ fn parse_namestring_handles_physical_edges_and_tilde_expansion() {
 #[test]
 fn namestring_round_trips_for_physical_and_logical_pathnames() {
     // Per R5.182/R5.187, logical components canonicalize to uppercase and namestring round-trips.
-    let (physical, _) =
-        parse_namestring(pseudo_string("/var/tmp/.cache/archive.tar"), None, None).expect("physical");
+    let (physical, _) = parse_namestring(pseudo_string("/var/tmp/.cache/archive.tar"), None, None)
+        .expect("physical");
     assert_reparse_same(physical);
 
     let logical = make_pathname(
@@ -297,8 +308,8 @@ fn merge_pathnames_applies_defaulting_and_relative_directory_rules() {
 fn wildcard_matching_and_wild_pathname_detection_cover_directory_name_type_and_version() {
     // Per R5.192/R5.202, wildcard detection and matching include directory wildcards,
     // name/type globs, and version wildcards.
-    let (pathname, _) =
-        parse_namestring(pseudo_string("/workspace/src/lib/core.lisp"), None, None).expect("pathname");
+    let (pathname, _) = parse_namestring(pseudo_string("/workspace/src/lib/core.lisp"), None, None)
+        .expect("pathname");
     let wildcard = make_pathname(
         NIL,
         NIL,
@@ -334,7 +345,8 @@ fn logical_pathname_translations_are_setfable_and_translate_matching_sources() {
         translations
     );
 
-    let (logical, _) = parse_namestring(pseudo_string("SYS:SRC;PKG.LISP"), None, None).expect("logical parse");
+    let (logical, _) =
+        parse_namestring(pseudo_string("SYS:SRC;PKG.LISP"), None, None).expect("logical parse");
     let translated = translate_logical_pathname(logical).expect("logical translation");
     assert_eq!(pathname_name(translated), pseudo_string("PKG"));
     assert_eq!(pathname_type(translated), pseudo_string("LISP"));
@@ -357,7 +369,8 @@ fn filesystem_pathname_entrypoints_create_probe_and_resolve_truenames() {
     assert!(probed.is_some());
     let true_name = truename(file_spec).expect("truename");
     let rendered_true = namestring(true_name).expect("truename namestring");
-    let (roundtrip_true, _) = parse_namestring(rendered_true, None, None).expect("reparse truename");
+    let (roundtrip_true, _) =
+        parse_namestring(rendered_true, None, None).expect("reparse truename");
     assert_eq!(pathname_name(roundtrip_true), pseudo_string("example"));
     assert_eq!(pathname_type(roundtrip_true), pseudo_string("lisp"));
 

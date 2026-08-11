@@ -36,10 +36,18 @@ fn eval_mode_uses_real_cli_entrypoint_and_overrides_init_discovery() {
         .output()
         .expect("run bliss --eval");
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains('3'), "stdout was: {stdout}");
-    assert!(!stdout.contains("99"), "explicit --eval should suppress init-file execution: {stdout}");
+    assert!(
+        !stdout.contains("99"),
+        "explicit --eval should suppress init-file execution: {stdout}"
+    );
     fs::remove_dir_all(dir).ok();
 }
 
@@ -56,7 +64,12 @@ fn load_mode_executes_a_real_file_path() {
         .output()
         .expect("run bliss --load");
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("42"),
         "stdout: {} stderr: {}",
@@ -78,9 +91,16 @@ fn script_mode_executes_the_positional_script_entrypoint() {
         .output()
         .expect("run bliss script");
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
-        String::from_utf8_lossy(&output.stdout).to_uppercase().contains("SCRIPT-RAN"),
+        String::from_utf8_lossy(&output.stdout)
+            .to_uppercase()
+            .contains("SCRIPT-RAN"),
         "stdout: {} stderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -101,15 +121,25 @@ fn repl_acceptance_drives_the_real_binary_through_read_eval_print_and_exit() {
 
     {
         let stdin = child.stdin.as_mut().expect("child stdin");
-        stdin.write_all(b"(+ 1 2)\n(quit)\n").expect("write repl input");
+        stdin
+            .write_all(b"(+ 1 2)\n(quit)\n")
+            .expect("write repl input");
     }
 
     let output = child.wait_with_output().expect("wait for repl");
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stdout.contains("Bliss Common Lisp"), "stdout: {stdout}");
-    assert!(stdout.contains('3') || stderr.contains("BLISS>"), "stdout: {stdout} stderr: {stderr}");
+    assert!(
+        stdout.contains('3') || stderr.contains("BLISS>"),
+        "stdout: {stdout} stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -120,7 +150,12 @@ fn no_image_eval_mode_supports_bootstrap_without_a_saved_image() {
         .output()
         .expect("run bliss --no-image --eval");
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains('9'));
 }
 
@@ -165,7 +200,12 @@ fn eval_when_body_runs_as_implicit_progn() {
         .output()
         .expect("run bliss --load eval-when");
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("42"),
         "stdout: {} stderr: {}",
@@ -199,8 +239,14 @@ fn prelude_loads_unconditionally_and_no_bootstrap_opts_out() {
         String::from_utf8_lossy(&plain.stderr)
     );
     let stdout = String::from_utf8_lossy(&plain.stdout);
-    assert!(stdout.contains('2'), "expected popped value 2, stdout: {stdout}");
-    assert!(stdout.contains("(1)"), "expected remaining (1), stdout: {stdout}");
+    assert!(
+        stdout.contains('2'),
+        "expected popped value 2, stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("(1)"),
+        "expected remaining (1), stdout: {stdout}"
+    );
 
     // --no-bootstrap: prelude absent, defvar is undefined -> failure.
     let opted_out = bliss()
@@ -236,7 +282,12 @@ fn extended_loop_supports_asdf_load_path_clauses() {
         .output()
         .expect("run bliss loop");
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     // as = (1 2), bs = (3)  ->  ((1 2) (3))
     assert!(stdout.contains("((1 2) (3))"), "stdout: {stdout}");
@@ -264,7 +315,12 @@ fn lambda_lists_bind_optional_rest_and_key() {
         .output()
         .expect("run bliss lambda-list");
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("(1 10 NIL)"), "f/1: {stdout}");
     assert!(stdout.contains("(1 2 (3 4))"), "f/rest: {stdout}");
@@ -293,7 +349,12 @@ fn hash_tables_and_funcall_of_builtins_work() {
         .output()
         .expect("run bliss ht");
 
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("(1 T)"), "gethash present-p: {stdout}");
     assert!(stdout.contains('T'), "funcall eql: {stdout}");

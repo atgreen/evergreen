@@ -34,12 +34,18 @@ fn condition_values_participate_in_the_root_and_error_hierarchies() {
     // Per R5.91 and R5.107, ANSI condition objects must behave as CONDITION-rooted
     // CLOS instances, and DEFINE-CONDITION-backed types must participate in the
     // observable class hierarchy seen by handler dispatch.
-    assert_eq!(handler_case(simple, &[(sym(SYMBOL_ERROR), fx(1))]).unwrap(), fx(1));
+    assert_eq!(
+        handler_case(simple, &[(sym(SYMBOL_ERROR), fx(1))]).unwrap(),
+        fx(1)
+    );
     assert_eq!(
         handler_case(simple, &[(sym(SYMBOL_CONDITION), fx(2))]).unwrap(),
         fx(2)
     );
-    assert_eq!(handler_case(typed, &[(sym(SYMBOL_ERROR), fx(3))]).unwrap(), fx(3));
+    assert_eq!(
+        handler_case(typed, &[(sym(SYMBOL_ERROR), fx(3))]).unwrap(),
+        fx(3)
+    );
 }
 
 #[test]
@@ -269,7 +275,10 @@ fn compute_restarts_within_restart_bind() {
     let result = restart_bind_fn(&[spec, hidden], || {
         assert_eq!(compute_restarts(Some(condition)), vec![restart_name]);
         assert_eq!(compute_restarts(None), vec![hidden_name, restart_name]);
-        assert_eq!(find_restart(restart_name, Some(condition)), Some(restart_fn));
+        assert_eq!(
+            find_restart(restart_name, Some(condition)),
+            Some(restart_fn)
+        );
         Ok(fx(42))
     })
     .unwrap();

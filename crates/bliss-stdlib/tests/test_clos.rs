@@ -68,7 +68,11 @@ fn class_of_returns_builtin_and_instance_classes_in_constant_observable_time() {
     let symbol_class = class_of(T);
     let nil_class = class_of(NIL);
     assert_eq!(class_of(instance), cls);
-    assert_eq!(class_of(instance), cls, "class_of must stay stable across repeated reads");
+    assert_eq!(
+        class_of(instance),
+        cls,
+        "class_of must stay stable across repeated reads"
+    );
     assert_ne!(fixnum_class, NIL);
     assert_ne!(char_class, NIL);
     assert_ne!(symbol_class, NIL);
@@ -371,7 +375,11 @@ fn multi_argument_dispatch_uses_later_specializer_positions() {
     let specific_second = fx(805);
     add_method(gf, generic_second).unwrap();
     add_method(gf, specific_second).unwrap();
-    set_method_specializers(generic_second, vec![t_class, second_base], MethodQualifier::Primary);
+    set_method_specializers(
+        generic_second,
+        vec![t_class, second_base],
+        MethodQualifier::Primary,
+    );
     set_method_specializers(
         specific_second,
         vec![t_class, second_specific],

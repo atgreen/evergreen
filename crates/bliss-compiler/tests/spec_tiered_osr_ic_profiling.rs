@@ -276,12 +276,8 @@ fn osr_entry_preserves_mapped_locals_and_deopt_blacklists_after_threshold() {
         }],
     };
 
-    let result = osr_entry(
-        function,
-        &map,
-        &[NIL, BlissVal::from_fixnum(5)],
-    )
-    .expect("OSR entry should accept matching locals");
+    let result = osr_entry(function, &map, &[NIL, BlissVal::from_fixnum(5)])
+        .expect("OSR entry should accept matching locals");
     assert_eq!(result.target_pc_offset, 77);
     assert_eq!(result.mapped_values[0], (11, NIL));
     assert_eq!(

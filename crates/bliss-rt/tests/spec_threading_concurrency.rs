@@ -1,15 +1,17 @@
 use bliss_rt::error::BlissError;
 use bliss_rt::runtime::{check_sigint, install_signal_handlers};
-use bliss_rt::safepoint::{enter_safepoint, poll_safepoint, resume_all_threads, wait_for_all_threads};
+use bliss_rt::safepoint::{
+    enter_safepoint, poll_safepoint, resume_all_threads, wait_for_all_threads,
+};
 use bliss_rt::scheduler::{Scheduler, SchedulerConfig};
 use bliss_rt::thread::{
-    GreenThreadId, all_thread_ids, current_thread, current_thread_id, interrupt_thread, join_thread,
-    make_thread,
+    GreenThreadId, all_thread_ids, current_thread, current_thread_id, interrupt_thread,
+    join_thread, make_thread,
 };
 use bliss_rt::value::{BlissVal, T};
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -238,7 +240,10 @@ fn sigint_delivery_is_observable_through_the_runtime_interrupt_flag() {
         std::thread::yield_now();
     }
 
-    assert!(observed, "SIGINT must become observable through the runtime flag");
+    assert!(
+        observed,
+        "SIGINT must become observable through the runtime flag"
+    );
     assert!(
         !check_sigint(),
         "check_sigint must clear the pending interrupt after observing it"
@@ -252,8 +257,8 @@ fn safepoint_wait_does_not_block_on_a_thread_executing_native_ffi() {
         .or_else(|_| bliss_rt::ffi::load_foreign_library("libSystem.B.dylib"))
         .or_else(|_| bliss_rt::ffi::load_foreign_library("libc.so"))
         .expect("expected a libc-compatible shared library");
-    let usleep = unsafe { bliss_rt::ffi::foreign_symbol(libc, "usleep") }
-        .expect("libc must export usleep");
+    let usleep =
+        unsafe { bliss_rt::ffi::foreign_symbol(libc, "usleep") }.expect("libc must export usleep");
     let _ = USLEEP_FN.set(usleep as usize);
 
     NATIVE_FFI_STARTED.store(false, Ordering::Release);
@@ -292,7 +297,10 @@ fn runtime_sources_define_the_boot_sequence_and_walkable_stack_metadata() {
     assert!(runtime_source.contains("pub fn apply_cli_args(&mut self, args: &[String])"));
     assert!(runtime_source.contains("pub fn parse_cli"));
     assert!(runtime_source.contains("pub fn shutdown(&mut self) -> Result<(), BlissError>"));
-    assert!(runtime_source.contains("SIGSEGV"), "runtime must install a SIGSEGV path");
+    assert!(
+        runtime_source.contains("SIGSEGV"),
+        "runtime must install a SIGSEGV path"
+    );
     assert!(stack_source.contains("pub prev_fp: *mut Frame"));
     assert!(stack_source.contains("pub fn publish_top(&self)"));
     assert!(stack_source.contains("pub fn stack_map(&self, pc_offset: usize)"));
@@ -324,12 +332,26 @@ fn concurrency_sources_expose_atomic_ordering_locking_and_thread_primitives() {
     assert!(thread_source.contains("yield_requested"));
     assert!(safepoint_source.contains("Mutex"));
     assert!(safepoint_source.contains("Condvar"));
-    assert!(safepoint_source.contains("publish stack top") || safepoint_source.contains("publish_top"));
-    assert!(safepoint_source.contains("SIGUSR1"), "blocked-syscall fallback must be represented");
+    assert!(
+        safepoint_source.contains("publish stack top") || safepoint_source.contains("publish_top")
+    );
+    assert!(
+        safepoint_source.contains("SIGUSR1"),
+        "blocked-syscall fallback must be represented"
+    );
     assert!(scheduler_source.contains("work-stealing"));
-    assert!(lib_source.contains("RwLock"), "public lock primitives must include RW locks");
-    assert!(lib_source.contains("Semaphore"), "public thread primitives must include semaphores");
-    assert!(lib_source.contains("with_atomic"), "WITH-ATOMIC must have a runtime surface");
+    assert!(
+        lib_source.contains("RwLock"),
+        "public lock primitives must include RW locks"
+    );
+    assert!(
+        lib_source.contains("Semaphore"),
+        "public thread primitives must include semaphores"
+    );
+    assert!(
+        lib_source.contains("with_atomic"),
+        "WITH-ATOMIC must have a runtime surface"
+    );
 }
 
 #[test]
@@ -338,6 +360,12 @@ fn thread_sources_describe_thread_local_dynamic_bindings() {
     let thread_source = read_runtime_source("crates/bliss-rt/src/thread.rs");
     let stack_source = read_runtime_source("crates/bliss-rt/src/stack.rs");
 
-    assert!(thread_source.contains("binding"), "thread runtime must store dynamic bindings");
-    assert!(stack_source.contains("FrameType::Special"), "special-binding frames must be walkable");
+    assert!(
+        thread_source.contains("binding"),
+        "thread runtime must store dynamic bindings"
+    );
+    assert!(
+        stack_source.contains("FrameType::Special"),
+        "special-binding frames must be walkable"
+    );
 }

@@ -13,7 +13,9 @@ use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter, MatchingBracketHighlighter};
 use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::history::DefaultHistory;
-use rustyline::validate::{MatchingBracketValidator, ValidationContext, ValidationResult, Validator};
+use rustyline::validate::{
+    MatchingBracketValidator, ValidationContext, ValidationResult, Validator,
+};
 use rustyline::{CompletionType, Config, Context, Editor, Helper};
 
 use std::collections::HashMap;
@@ -231,9 +233,10 @@ impl Completer for ReplHelper {
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let prefix = &line[..pos];
         if let Some((start, path_prefix)) = path_completion_span(prefix) {
-            return self.file_completer.complete(path_prefix, pos - start, ctx).map(
-                |(path_start, pairs)| (start + path_start, pairs),
-            );
+            return self
+                .file_completer
+                .complete(path_prefix, pos - start, ctx)
+                .map(|(path_start, pairs)| (start + path_start, pairs));
         }
 
         let start = prefix
@@ -1414,7 +1417,8 @@ fn watch_registry() -> &'static Mutex<HashMap<u64, BreakpointId>> {
 
 fn evaluate_watch_predicate(predicate: BlissVal, old_value: BlissVal, new_value: BlissVal) -> bool {
     let mut interpreter = bliss_compiler::tiered::Interpreter::new();
-    let pred_sym = BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol("%WATCH-PREDICATE"));
+    let pred_sym =
+        BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol("%WATCH-PREDICATE"));
     let old_sym = BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol("%WATCH-OLD"));
     let new_sym = BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol("%WATCH-NEW"));
     interpreter.define(pred_sym, predicate);
@@ -3274,12 +3278,10 @@ fn handle_swank_op(
         "swank:interactive-eval" | "swank:eval-and-grab-output" | "swank:listener-eval" => {
             if let Some(form_str) = extract_swank_string_arg(full_message) {
                 match bliss_compiler::reader::read_from_string(&form_str) {
-                    Ok((form, _)) => {
-                        match interpreter.eval(form) {
-                            Ok(val) => format!("{:?}", val),
-                            Err(e) => format!("\"Error: {}\"", e),
-                        }
-                    }
+                    Ok((form, _)) => match interpreter.eval(form) {
+                        Ok(val) => format!("{:?}", val),
+                        Err(e) => format!("\"Error: {}\"", e),
+                    },
                     Err(e) => format!("\"Reader error: {}\"", e),
                 }
             } else {
@@ -3291,12 +3293,10 @@ fn handle_swank_op(
         "swank:compile-string-for-emacs" => {
             if let Some(source) = extract_swank_string_arg(full_message) {
                 match bliss_compiler::reader::read_from_string(&source) {
-                    Ok((form, _)) => {
-                        match interpreter.eval(form) {
-                            Ok(_) => "t".to_string(),
-                            Err(e) => format!("\"Compilation error: {}\"", e),
-                        }
-                    }
+                    Ok((form, _)) => match interpreter.eval(form) {
+                        Ok(_) => "t".to_string(),
+                        Err(e) => format!("\"Compilation error: {}\"", e),
+                    },
                     Err(e) => format!("\"Read error: {}\"", e),
                 }
             } else {
@@ -3320,9 +3320,7 @@ fn handle_swank_op(
         "swank:completions" | "swank:simple-completions" | "swank:fuzzy-completions" => {
             if let Some(prefix) = extract_swank_string_arg(full_message) {
                 let completions = complete_symbol(&prefix);
-                let items: Vec<String> = completions.iter()
-                    .map(|c| format!("\"{}\"", c))
-                    .collect();
+                let items: Vec<String> = completions.iter().map(|c| format!("\"{}\"", c)).collect();
                 format!("(({}) \"{}\")", items.join(" "), prefix)
             } else {
                 "(() \"\")".to_string()
@@ -3396,18 +3394,17 @@ fn handle_swank_op(
         "swank:init-inspector" | "swank:inspect-in-emacs" => {
             if let Some(form_str) = extract_swank_string_arg(full_message) {
                 match bliss_compiler::reader::read_from_string(&form_str) {
-                    Ok((form, _)) => {
-                        match interpreter.eval(form) {
-                            Ok(val) => {
-                                let parts = compute_inspect_parts(val);
-                                let parts_str: Vec<String> = parts.iter()
-                                    .map(|(label, v)| format!("(\"{}\", {:?})", label, v))
-                                    .collect();
-                                format!("(:title \"{:?}\" :content ({}))", val, parts_str.join(" "))
-                            }
-                            Err(e) => format!("\"Error: {}\"", e),
+                    Ok((form, _)) => match interpreter.eval(form) {
+                        Ok(val) => {
+                            let parts = compute_inspect_parts(val);
+                            let parts_str: Vec<String> = parts
+                                .iter()
+                                .map(|(label, v)| format!("(\"{}\", {:?})", label, v))
+                                .collect();
+                            format!("(:title \"{:?}\" :content ({}))", val, parts_str.join(" "))
                         }
-                    }
+                        Err(e) => format!("\"Error: {}\"", e),
+                    },
                     Err(e) => format!("\"Read error: {}\"", e),
                 }
             } else {
@@ -3416,17 +3413,16 @@ fn handle_swank_op(
         }
 
         // R6.34: xref (callers/callees)
-        "swank:xref" => {
-            extract_swank_string_arg(full_message)
-                .map(|query| swank_xref(&query))
-                .unwrap_or_else(|| "NIL".to_string())
-        }
+        "swank:xref" => extract_swank_string_arg(full_message)
+            .map(|query| swank_xref(&query))
+            .unwrap_or_else(|| "NIL".to_string()),
 
         // R6.34: apropos
         "swank:apropos-list-for-emacs" => {
             if let Some(query) = extract_swank_string_arg(full_message) {
                 let matches = complete_symbol(&query);
-                let items: Vec<String> = matches.iter()
+                let items: Vec<String> = matches
+                    .iter()
                     .map(|m| format!("(:designator \"{}\" :function \"\")", m))
                     .collect();
                 format!("({})", items.join(" "))
@@ -3445,19 +3441,13 @@ fn handle_swank_op(
         }
 
         // R6.38: thread-listing
-        "swank:list-threads" => {
-            swank_threads_payload()
-        }
+        "swank:list-threads" => swank_threads_payload(),
 
         // R6.38: thread debugging
-        "swank:debug-thread" => {
-            debug_thread_payload(full_message)
-        }
+        "swank:debug-thread" => debug_thread_payload(full_message),
 
         // Connection info
-        "swank:connection-info" => {
-            swank_connection_info()
-        }
+        "swank:connection-info" => swank_connection_info(),
 
         // Default: return T
         _ => {

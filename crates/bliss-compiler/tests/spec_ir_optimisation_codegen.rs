@@ -1,19 +1,19 @@
 use bliss_compiler::codegen::{
-    patch_code, Aarch64Backend, CodeBuffer, CodegenBackend, LinearScanAllocator, RelocKind,
-    Relocation, StackMap, TargetArch, X86_64Backend,
+    Aarch64Backend, CodeBuffer, CodegenBackend, LinearScanAllocator, RelocKind, Relocation,
+    StackMap, TargetArch, X86_64Backend, patch_code,
 };
-use bliss_compiler::ir::{verify, Edge, EdgeKind, IrBuilder, IrGraph, NodeId, NodeKind};
+use bliss_compiler::ir::{Edge, EdgeKind, IrBuilder, IrGraph, NodeId, NodeKind, verify};
 use bliss_compiler::opt::{
     ConstantFolding, DeadCodeElimination, EscapeAnalysis, FunctionRegistry, Inlining,
     InliningConfig, Licm, NullCheckElimination, Pass, PassManager, StrengthReduction,
     TypePropagation,
 };
 use bliss_compiler::osr::{
-    clear_global_deopt_logs, deoptimize, ConversionKind, DeoptReason, LocalMapping, Location,
-    OsrEntryMap, OsrSlotDesc, TypeGuard,
+    ConversionKind, DeoptReason, LocalMapping, Location, OsrEntryMap, OsrSlotDesc, TypeGuard,
+    clear_global_deopt_logs, deoptimize,
 };
-use bliss_compiler::tiered::{CompiledCode, Tier};
 use bliss_compiler::read_from_string;
+use bliss_compiler::tiered::{CompiledCode, Tier};
 use bliss_rt::value::{BlissVal, T, TAG_FIXNUM, TAG_FUNCTION};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
@@ -57,7 +57,8 @@ fn minimal_graph() -> IrGraph {
 }
 
 fn count_nodes(graph: &IrGraph, pred: impl Fn(&NodeKind) -> bool) -> usize {
-    graph.node_ids()
+    graph
+        .node_ids()
         .filter(|&id| pred(graph.node_kind(id)))
         .count()
 }
@@ -67,7 +68,8 @@ fn single_return_data_input(graph: &IrGraph) -> NodeId {
         .node_ids()
         .find(|&id| matches!(graph.node_kind(id), NodeKind::Return))
         .expect("graph should contain a Return node");
-    graph.inputs(ret)
+    graph
+        .inputs(ret)
         .iter()
         .find(|e| e.kind == EdgeKind::Data)
         .map(|e| e.from)
@@ -98,7 +100,9 @@ fn code_buffer_view(buffer: &CodeBuffer) -> &CodeBufferView {
 
 fn compiled_code_from_parts(code: Vec<u8>, tier: Tier) -> CompiledCode {
     // Bootstrap-layout assumption for red-phase install-path tests.
-    unsafe { std::mem::transmute::<CompiledCodeView, CompiledCode>(CompiledCodeView { code, tier }) }
+    unsafe {
+        std::mem::transmute::<CompiledCodeView, CompiledCode>(CompiledCodeView { code, tier })
+    }
 }
 
 fn function_value_for_install(header: &InstallHeader) -> BlissVal {
@@ -127,7 +131,10 @@ fn builder_parses_if_into_ssa_control_flow_and_pipeline_emits_code() {
 
     let mut backend = X86_64Backend::new();
     let buffer = backend.emit(&graph).expect("codegen should succeed");
-    assert!(!buffer.code().is_empty(), "pipeline should emit machine code");
+    assert!(
+        !buffer.code().is_empty(),
+        "pipeline should emit machine code"
+    );
 }
 
 #[test]
@@ -148,7 +155,9 @@ fn speculative_guards_carry_deopt_metadata_and_fail_via_deopt_path() {
     graph.add_edge(edge(guard, ret, EdgeKind::Data, 1));
 
     let mut backend = X86_64Backend::new();
-    let buffer = backend.emit(&graph).expect("guarded codegen should succeed");
+    let buffer = backend
+        .emit(&graph)
+        .expect("guarded codegen should succeed");
     let view = code_buffer_view(&buffer);
     assert!(
         view.relocations
@@ -157,10 +166,13 @@ fn speculative_guards_carry_deopt_metadata_and_fail_via_deopt_path() {
         "speculative guard should record a deopt/uncommon-trap relocation"
     );
 
-    let mut osr_map = OsrEntryMap::new(vec![LocalMapping {
-        local_index: 0,
-        ssa_var: 0,
-    }], 17);
+    let mut osr_map = OsrEntryMap::new(
+        vec![LocalMapping {
+            local_index: 0,
+            ssa_var: 0,
+        }],
+        17,
+    );
     osr_map.slots.push(OsrSlotDesc {
         source_offset: 0,
         dest: Location::Register(0),
@@ -280,7 +292,9 @@ fn type_propagation_eliminates_redundant_constant_type_check() {
     graph.add_edge(edge(start, ret, EdgeKind::Control, 0));
     graph.add_edge(edge(check, ret, EdgeKind::Data, 1));
 
-    let changed = TypePropagation.run(&mut graph).expect("pass should succeed");
+    let changed = TypePropagation
+        .run(&mut graph)
+        .expect("pass should succeed");
     assert!(changed, "redundant TypeCheck should be removed");
     assert!(!graph.contains(check));
     assert_eq!(single_return_data_input(&graph), constant);
@@ -303,7 +317,9 @@ fn constant_folding_applies_numeric_contagion_to_mixed_constants() {
     graph.add_edge(edge(start, ret, EdgeKind::Control, 0));
     graph.add_edge(edge(call, ret, EdgeKind::Data, 1));
 
-    let changed = ConstantFolding.run(&mut graph).expect("pass should succeed");
+    let changed = ConstantFolding
+        .run(&mut graph)
+        .expect("pass should succeed");
     assert!(changed, "mixed numeric constants should fold");
 
     let folded = single_return_data_input(&graph);
@@ -330,7 +346,13 @@ fn inlining_respects_notinline_registry_entries() {
     graph.add_edge(edge(call, ret, EdgeKind::Data, 1));
 
     let mut registry = FunctionRegistry::new();
-    registry.register(callee, simple_callee_graph(BlissVal::from_fixnum(5)), true, true, true);
+    registry.register(
+        callee,
+        simple_callee_graph(BlissVal::from_fixnum(5)),
+        true,
+        true,
+        true,
+    );
     let mut pass = Inlining {
         config: InliningConfig {
             budget: 100,
@@ -380,7 +402,10 @@ fn inlining_expands_small_registered_callee_into_caller() {
 
     let changed = pass.run(&mut graph).expect("pass should succeed");
     assert!(changed, "small callee should be inlined");
-    assert!(!graph.contains(call), "Call should be removed after inlining");
+    assert!(
+        !graph.contains(call),
+        "Call should be removed after inlining"
+    );
     match graph.node_kind(single_return_data_input(&graph)) {
         NodeKind::Constant(value) => assert_eq!(value.as_fixnum(), 77),
         other => panic!("expected inlined constant result, got {other:?}"),
@@ -404,7 +429,10 @@ fn escape_analysis_scalar_replaces_non_escaping_box_unbox_pair() {
     graph.add_edge(edge(unboxed, ret, EdgeKind::Data, 1));
 
     let changed = EscapeAnalysis.run(&mut graph).expect("pass should succeed");
-    assert!(changed, "non-escaping Box/Unbox pair should be scalar-replaced");
+    assert!(
+        changed,
+        "non-escaping Box/Unbox pair should be scalar-replaced"
+    );
     assert!(!graph.contains(unboxed));
     assert_eq!(single_return_data_input(&graph), raw);
 }
@@ -442,7 +470,10 @@ fn licm_hoists_invariant_non_side_effecting_loop_node() {
     let changed = Licm.run(&mut graph).expect("pass should succeed");
     assert!(changed, "invariant TypeCheck should be hoisted");
     assert!(!graph.contains(original_guard));
-    assert_eq!(count_nodes(&graph, |k| matches!(k, NodeKind::TypeCheck { .. })), 1);
+    assert_eq!(
+        count_nodes(&graph, |k| matches!(k, NodeKind::TypeCheck { .. })),
+        1
+    );
 }
 
 #[test]
@@ -451,7 +482,10 @@ fn licm_does_not_hoist_side_effecting_memory_node() {
     let (mut graph, original_load) = loop_graph_with_guarded_value(NodeKind::MemLoad { offset: 8 });
 
     let changed = Licm.run(&mut graph).expect("pass should succeed");
-    assert!(!changed, "side-effecting memory node should remain in the loop");
+    assert!(
+        !changed,
+        "side-effecting memory node should remain in the loop"
+    );
     assert!(graph.contains(original_load));
 }
 
@@ -472,7 +506,9 @@ fn strength_reduction_removes_identity_operation_shape() {
     graph.add_edge(edge(start, ret, EdgeKind::Control, 0));
     graph.add_edge(edge(call, ret, EdgeKind::Data, 1));
 
-    let changed = StrengthReduction.run(&mut graph).expect("pass should succeed");
+    let changed = StrengthReduction
+        .run(&mut graph)
+        .expect("pass should succeed");
     assert!(changed, "identity operation should be reduced");
     assert_eq!(single_return_data_input(&graph), value);
 }
@@ -484,7 +520,9 @@ fn dead_code_elimination_removes_unreachable_nodes() {
     let mut graph = minimal_graph();
     let dead = graph.add_node(NodeKind::Constant(BlissVal::from_fixnum(404)));
 
-    let changed = DeadCodeElimination.run(&mut graph).expect("pass should succeed");
+    let changed = DeadCodeElimination
+        .run(&mut graph)
+        .expect("pass should succeed");
     assert!(changed);
     assert!(!graph.contains(dead));
 }
@@ -588,7 +626,9 @@ fn linear_scan_allocator_spills_when_live_ranges_exceed_registers() {
     graph.add_edge(edge(call, ret, EdgeKind::Data, 1));
 
     let mut allocator = LinearScanAllocator::new(TargetArch::X86_64);
-    let allocation = allocator.allocate(&graph).expect("allocation should succeed");
+    let allocation = allocator
+        .allocate(&graph)
+        .expect("allocation should succeed");
     assert!(allocation.spill_slots() > 0, "pressure should force spills");
 }
 
@@ -605,7 +645,9 @@ fn safepoints_emit_stack_maps_and_install_rejects_missing_maps() {
     graph.add_edge(edge(start, ret, EdgeKind::Control, 0));
 
     let mut backend = X86_64Backend::new();
-    let buffer = backend.emit(&graph).expect("safepoint lowering should succeed");
+    let buffer = backend
+        .emit(&graph)
+        .expect("safepoint lowering should succeed");
     let view = code_buffer_view(&buffer);
     assert_eq!(
         view.stack_maps.len(),

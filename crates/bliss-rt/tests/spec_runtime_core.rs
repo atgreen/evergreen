@@ -24,7 +24,9 @@ fn serial_lock() -> &'static Mutex<()> {
 }
 
 fn lock_serial() -> MutexGuard<'static, ()> {
-    serial_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    serial_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
@@ -154,38 +156,44 @@ fn parse_cli_overrides_runtime_flags_and_preserves_passthrough_arguments() {
     let _guard = lock_serial();
     // Per R2.02, startup begins by parsing CLI input.
     // Per R2.03 and R2.16, CLI flags override worker and memory configuration.
-    with_env(&[("BLISS_WORKERS", Some("2")), ("BLISS_IMAGE", Some("env.bimg"))], || {
-        let args = vec![
-            "--eval".to_string(),
-            "(+ 1 2)".to_string(),
-            "--workers".to_string(),
-            "5".to_string(),
-            "--heap-size".to_string(),
-            "32m".to_string(),
-            "--image".to_string(),
-            "cli.bimg".to_string(),
-            "--no-image".to_string(),
-            "--gc-log".to_string(),
-            "gc.txt".to_string(),
-            "--jit-dump".to_string(),
-            "--log-level".to_string(),
-            "trace".to_string(),
-            "--".to_string(),
-            "script.lisp".to_string(),
-            "--user-arg".to_string(),
-        ];
+    with_env(
+        &[
+            ("BLISS_WORKERS", Some("2")),
+            ("BLISS_IMAGE", Some("env.bimg")),
+        ],
+        || {
+            let args = vec![
+                "--eval".to_string(),
+                "(+ 1 2)".to_string(),
+                "--workers".to_string(),
+                "5".to_string(),
+                "--heap-size".to_string(),
+                "32m".to_string(),
+                "--image".to_string(),
+                "cli.bimg".to_string(),
+                "--no-image".to_string(),
+                "--gc-log".to_string(),
+                "gc.txt".to_string(),
+                "--jit-dump".to_string(),
+                "--log-level".to_string(),
+                "trace".to_string(),
+                "--".to_string(),
+                "script.lisp".to_string(),
+                "--user-arg".to_string(),
+            ];
 
-        let (cfg, passthrough) = parse_cli(&args).unwrap();
-        assert_eq!(cfg.eval_form.as_deref(), Some("(+ 1 2)"));
-        assert_eq!(cfg.num_workers, 5);
-        assert_eq!(cfg.heap_size, 32 * 1024 * 1024);
-        assert_eq!(cfg.image_path.as_deref(), Some("cli.bimg"));
-        assert!(cfg.no_image);
-        assert_eq!(cfg.gc_log.as_deref(), Some("gc.txt"));
-        assert!(cfg.jit_dump);
-        assert_eq!(cfg.log_level, LogLevel::Trace);
-        assert_eq!(passthrough, vec!["script.lisp", "--user-arg"]);
-    });
+            let (cfg, passthrough) = parse_cli(&args).unwrap();
+            assert_eq!(cfg.eval_form.as_deref(), Some("(+ 1 2)"));
+            assert_eq!(cfg.num_workers, 5);
+            assert_eq!(cfg.heap_size, 32 * 1024 * 1024);
+            assert_eq!(cfg.image_path.as_deref(), Some("cli.bimg"));
+            assert!(cfg.no_image);
+            assert_eq!(cfg.gc_log.as_deref(), Some("gc.txt"));
+            assert!(cfg.jit_dump);
+            assert_eq!(cfg.log_level, LogLevel::Trace);
+            assert_eq!(passthrough, vec!["script.lisp", "--user-arg"]);
+        },
+    );
 }
 
 #[test]
@@ -347,7 +355,14 @@ fn green_thread_reports_stack_base() -> BlissVal {
 }
 
 fn green_thread_calls_ffi_and_returns_nil() -> BlissVal {
-    let _ = unsafe { ffi_call(ffi_observe_native_state as *const (), &AlienType::Void, &[], &[]) };
+    let _ = unsafe {
+        ffi_call(
+            ffi_observe_native_state as *const (),
+            &AlienType::Void,
+            &[],
+            &[],
+        )
+    };
     NIL
 }
 
@@ -405,9 +420,8 @@ fn startup_requires_image_load_unless_the_cli_selects_bootstrap_mode() {
 fn green_threads_run_user_functions_through_the_worker_pool() {
     let _guard = lock_serial();
     // Per R2.04, green threads are multiplexed M:N onto the worker pool.
-    let entry = unsafe {
-        BlissVal::from_function_ptr(green_thread_returns_seven as *const () as *mut u8)
-    };
+    let entry =
+        unsafe { BlissVal::from_function_ptr(green_thread_returns_seven as *const () as *mut u8) };
     let ids: Vec<_> = (0..8).map(|_| make_thread(entry).unwrap()).collect();
     let results: Vec<_> = ids
         .into_iter()
@@ -432,8 +446,14 @@ fn green_threads_have_distinct_cl_stacks_from_each_other_and_from_the_caller() {
     let current = current_thread().stack().base() as usize;
 
     assert_ne!(stack1, stack2, "green threads must not share a CL stack");
-    assert_ne!(stack1, current, "green-thread stack must differ from the caller's stack");
-    assert_ne!(stack2, current, "green-thread stack must differ from the caller's stack");
+    assert_ne!(
+        stack1, current,
+        "green-thread stack must differ from the caller's stack"
+    );
+    assert_ne!(
+        stack2, current,
+        "green-thread stack must differ from the caller's stack"
+    );
 }
 
 #[test]
@@ -595,16 +615,17 @@ fn ffi_marshalling_covers_scalars_pointers_struct_layouts_and_void() {
         -7
     );
     assert!(
-        (
-            unmarshal_from_c((3.5f32).to_bits() as u64, &AlienType::Float)
-                .unwrap()
-                .as_single_float()
-                - 3.5
-        )
-        .abs()
+        (unmarshal_from_c((3.5f32).to_bits() as u64, &AlienType::Float)
+            .unwrap()
+            .as_single_float()
+            - 3.5)
+            .abs()
             < f32::EPSILON
     );
-    assert_eq!(marshal_to_c(NIL, &AlienType::Pointer(Box::new(AlienType::Void))).unwrap(), 0);
+    assert_eq!(
+        marshal_to_c(NIL, &AlienType::Pointer(Box::new(AlienType::Void))).unwrap(),
+        0
+    );
 
     let pair = AlienType::Struct {
         fields: vec![
@@ -629,9 +650,7 @@ fn ffi_calls_transition_green_threads_to_native_state() {
     // Per R2.15, FFI calls transition the calling green thread into Native state.
     OBSERVED_THREAD_STATE.store(0xFF, Ordering::SeqCst);
     let entry = unsafe {
-        BlissVal::from_function_ptr(
-            green_thread_calls_ffi_and_returns_nil as *const () as *mut u8,
-        )
+        BlissVal::from_function_ptr(green_thread_calls_ffi_and_returns_nil as *const () as *mut u8)
     };
     let id = make_thread(entry).unwrap();
     assert_eq!(join_thread(id).unwrap(), NIL);
@@ -663,10 +682,23 @@ fn shutdown_runs_registered_finalizers_and_waits_for_in_flight_workers() {
     runtime.shutdown().unwrap();
     let elapsed = started.elapsed();
 
-    assert!(elapsed >= Duration::from_millis(150), "shutdown must wait for worker completion");
-    assert_eq!(FINALIZER_CALLS.load(Ordering::SeqCst), 1, "shutdown must run finalizers");
-    assert_eq!(LAST_FINALIZER.load(Ordering::SeqCst) as u64, finalizer.to_raw());
-    assert_eq!(LAST_FINALIZED_OBJECT.load(Ordering::SeqCst) as u64, object.to_raw());
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "shutdown must wait for worker completion"
+    );
+    assert_eq!(
+        FINALIZER_CALLS.load(Ordering::SeqCst),
+        1,
+        "shutdown must run finalizers"
+    );
+    assert_eq!(
+        LAST_FINALIZER.load(Ordering::SeqCst) as u64,
+        finalizer.to_raw()
+    );
+    assert_eq!(
+        LAST_FINALIZED_OBJECT.load(Ordering::SeqCst) as u64,
+        object.to_raw()
+    );
     assert_eq!(join_thread(slow_thread).unwrap().as_fixnum(), 1);
 }
 
@@ -674,9 +706,8 @@ fn shutdown_runs_registered_finalizers_and_waits_for_in_flight_workers() {
 fn runtime_accepts_large_green_thread_populations_without_exhausting_the_api() {
     let _guard = lock_serial();
     // Per R2.19, the runtime supports large populations of simultaneous green threads.
-    let entry = unsafe {
-        BlissVal::from_function_ptr(green_thread_returns_seven as *const () as *mut u8)
-    };
+    let entry =
+        unsafe { BlissVal::from_function_ptr(green_thread_returns_seven as *const () as *mut u8) };
     let ids: Vec<_> = (0..1024).map(|_| make_thread(entry).unwrap()).collect();
     for id in ids {
         assert_eq!(join_thread(id).unwrap().as_fixnum(), 7);

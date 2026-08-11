@@ -1,4 +1,6 @@
-use bliss_rt::gc::{GcConfig, heap_base_address, init_heap, record_object, set_entry_continuation, walk_heap};
+use bliss_rt::gc::{
+    GcConfig, heap_base_address, init_heap, record_object, set_entry_continuation, walk_heap,
+};
 use bliss_rt::image::{
     ImageCompression, SaveImageOptions, load_image, save_image, validate_image_header,
 };
@@ -73,15 +75,26 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
     save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
     let header = validate_image_header(path.to_str().unwrap()).expect("validate header");
     assert_eq!(header.entry_continuation, entry.to_raw());
-    assert_eq!(header.heap_size, 8 + (1 + 4 + 4) as u64 + (1 + 4 + 5) as u64);
+    assert_eq!(
+        header.heap_size,
+        8 + (1 + 4 + 4) as u64 + (1 + 4 + 5) as u64
+    );
 
     init_test_heap();
     let restored = load_image(path.to_str().unwrap()).expect("load_image");
     assert_eq!(restored, entry);
 
     let restored_objects = walk_objects_with_data();
-    assert!(restored_objects.iter().any(|(_, t, data)| *t == 0x61 && data == &vec![1, 2, 3, 4]));
-    assert!(restored_objects.iter().any(|(_, t, data)| *t == 0x62 && data == &vec![5, 6, 7, 8, 9]));
+    assert!(
+        restored_objects
+            .iter()
+            .any(|(_, t, data)| *t == 0x61 && data == &vec![1, 2, 3, 4])
+    );
+    assert!(
+        restored_objects
+            .iter()
+            .any(|(_, t, data)| *t == 0x62 && data == &vec![5, 6, 7, 8, 9])
+    );
 }
 
 #[test]
@@ -189,5 +202,8 @@ fn spec_image_save_is_atomic_and_preserves_previous_file_on_failure() {
 
     let err = save_image(path.to_str().unwrap(), &image_opts()).expect_err("save should fail");
     assert!(format!("{err}").contains("temp image file"));
-    assert_eq!(fs::read(&path).expect("read preserved target"), b"previous-image");
+    assert_eq!(
+        fs::read(&path).expect("read preserved target"),
+        b"previous-image"
+    );
 }
