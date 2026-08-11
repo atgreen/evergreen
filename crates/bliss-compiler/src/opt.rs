@@ -29,6 +29,7 @@ pub struct PassManager {
 /// 7. Strength reduction
 /// 8. DCE
 /// 9. Null-check elimination
+/// 10. Phi lowering
 impl PassManager {
     /// Create a new pass manager with the default pass ordering.
     pub fn new() -> Self {
@@ -49,6 +50,7 @@ impl PassManager {
             Box::new(StrengthReduction),
             Box::new(DeadCodeElimination),
             Box::new(NullCheckElimination),
+            Box::new(PhiLowering),
         ];
         PassManager { passes }
     }
@@ -1285,5 +1287,45 @@ impl Pass for NullCheckElimination {
         }
 
         Ok(changed)
+    }
+}
+
+/// Lower remaining SSA Phi nodes after optimisation.
+///
+/// The bootstrap pipeline only emits straight-line machine code, so any Phi
+/// that survives the optimisation pipeline must be rewritten to a concrete
+/// value before backend emission.
+pub struct PhiLowering;
+impl Pass for PhiLowering {
+    fn name(&self) -> &str {
+        "phi-lowering"
+    }
+
+    fn run(&mut self, graph: &mut IrGraph) -> Result<bool, crate::error::CompilerError> {
+        let reachable = reachable_from_start(graph);
+        let mut replacements = Vec::new();
+
+        for &id in &reachable {
+            if !matches!(graph.node_kind(id), NodeKind::Phi) {
+                continue;
+            }
+            let replacement = graph
+                .inputs(id)
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::Data)
+                .skip(1)
+                .map(|edge| edge.from)
+                .next();
+            if let Some(replacement) = replacement {
+                replacements.push((id, replacement));
+            }
+        }
+
+        for (phi, replacement) in &replacements {
+            graph.replace_uses(*phi, *replacement);
+            graph.remove_node(*phi);
+        }
+
+        Ok(!replacements.is_empty())
     }
 }

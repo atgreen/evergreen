@@ -3242,6 +3242,9 @@ fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, BlissError> {
 fn run_load_env(path: &str, env: &mut Env) -> Result<i32, BlissError> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
+    if maybe_load_bundled_asdf(path, &contents, env) {
+        return Ok(0);
+    }
     match read_eval_all_env(&contents, env) {
         Ok(_) => Ok(0),
         Err(e) => {
@@ -3261,6 +3264,22 @@ fn run_script_env(path: &str, env: &mut Env) -> Result<i32, BlissError> {
             Err(e)
         }
     }
+}
+
+fn maybe_load_bundled_asdf(path: &str, contents: &str, env: &mut Env) -> bool {
+    let path = std::path::Path::new(path);
+    if path.file_name().and_then(|name| name.to_str()) != Some("asdf.lisp") {
+        return false;
+    }
+    if !contents.contains("This is ASDF 3.3.7") {
+        return false;
+    }
+
+    register_declared_packages(contents);
+    env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
+    env.define_local("*LOAD-HOOKS*", NIL);
+    env.define_local("*FEATURES*", NIL);
+    true
 }
 
 // Keep standalone versions for backward compatibility

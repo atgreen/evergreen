@@ -3,7 +3,7 @@
 //! See spec §4.9.
 
 use bliss_rt::value::BlissVal;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 
 /// Per-function invocation counter (32-bit, in function header).
@@ -26,7 +26,11 @@ impl InvocationCounter {
     }
 
     /// Increment the counter. Returns true if threshold was reached.
+    #[inline(always)]
     pub fn increment(&self, threshold: u32) -> bool {
+        if threshold == u32::MAX {
+            return false;
+        }
         let new = self.count.get().saturating_add(1);
         self.count.set(new);
         new >= threshold
@@ -63,7 +67,11 @@ impl BackEdgeCounter {
     }
 
     /// Increment the counter. Returns true if threshold was reached.
+    #[inline(always)]
     pub fn increment(&self, threshold: u32) -> bool {
+        if threshold == u32::MAX {
+            return false;
+        }
         let new = self.count.get().saturating_add(1);
         self.count.set(new);
         new >= threshold
@@ -83,67 +91,120 @@ impl Default for BackEdgeCounter {
 
 /// Type profile at a call site or branch — ring buffer of observed types.
 pub struct TypeProfile {
-    entries: RefCell<Vec<BlissVal>>,
+    entries: Cell<[u64; TYPE_PROFILE_MAX_ENTRIES]>,
+    len: Cell<u8>,
+    next_slot: Cell<u8>,
+    seen_small_fixnums: Cell<u16>,
+    disabled: bool,
 }
 
 /// Maximum entries in a type profile ring buffer.
-pub const TYPE_PROFILE_MAX_ENTRIES: usize = 8;
+pub const TYPE_PROFILE_MAX_ENTRIES: usize = 4;
 
 impl TypeProfile {
     /// Create a new empty type profile.
     pub fn new() -> Self {
         TypeProfile {
-            entries: RefCell::new(Vec::new()),
+            entries: Cell::new([0; TYPE_PROFILE_MAX_ENTRIES]),
+            len: Cell::new(0),
+            next_slot: Cell::new(0),
+            seen_small_fixnums: Cell::new(0),
+            disabled: false,
+        }
+    }
+
+    fn disabled() -> Self {
+        TypeProfile {
+            entries: Cell::new([0; TYPE_PROFILE_MAX_ENTRIES]),
+            len: Cell::new(0),
+            next_slot: Cell::new(0),
+            seen_small_fixnums: Cell::new(0),
+            disabled: true,
         }
     }
 
     /// Record an observed type (class wrapper pointer).
+    #[inline(always)]
     pub fn record(&self, class: BlissVal) {
-        let mut entries = self.entries.borrow_mut();
-        if entries.len() >= TYPE_PROFILE_MAX_ENTRIES {
-            // Ring buffer: remove oldest entry
-            entries.remove(0);
+        if self.disabled {
+            return;
         }
-        entries.push(class);
+        if class.is_fixnum() {
+            let value = (class.0 as i64) >> 3;
+            if (0..16).contains(&value) {
+                let bit = 1u16 << (value as u16);
+                let seen = self.seen_small_fixnums.get();
+                if seen & bit != 0 {
+                    return;
+                }
+                self.seen_small_fixnums.set(seen | bit);
+            }
+        }
+        let mut entries = self.entries.get();
+        let len = self.len.get() as usize;
+        if entries[..len].iter().any(|&entry| entry == class.0) {
+            return;
+        }
+        if len < TYPE_PROFILE_MAX_ENTRIES {
+            entries[len] = class.0;
+            self.entries.set(entries);
+            self.len.set((len + 1) as u8);
+            return;
+        }
+        let slot = self.next_slot.get() as usize;
+        entries[slot] = class.0;
+        self.entries.set(entries);
+        self.next_slot
+            .set(((slot + 1) % TYPE_PROFILE_MAX_ENTRIES) as u8);
     }
 
     /// Get the recorded type entries for reading by the optimising compiler.
     /// This is lock-free (R4.57).
     pub fn entries(&self) -> Vec<BlissVal> {
-        self.entries.borrow().clone()
+        let entries = self.entries.get();
+        let len = self.len.get() as usize;
+        entries[..len].iter().copied().map(BlissVal).collect()
     }
 
     /// Get the dominant type (most frequently observed), if any.
     pub fn dominant_type(&self) -> Option<BlissVal> {
-        let entries = self.entries.borrow();
-        if entries.is_empty() {
+        let entries = self.entries.get();
+        let len = self.len.get() as usize;
+        if len == 0 {
             return None;
         }
-        // Count occurrences of each type
-        let mut counts: HashMap<u64, (BlissVal, usize)> = HashMap::new();
-        for &val in entries.iter() {
-            let entry = counts.entry(val.0).or_insert((val, 0));
-            entry.1 += 1;
+        let mut best = (entries[0], 0usize);
+        for idx in 0..len {
+            let candidate = entries[idx];
+            let mut count = 0usize;
+            for probe in 0..len {
+                if entries[probe] == candidate {
+                    count += 1;
+                }
+            }
+            if count > best.1 {
+                best = (candidate, count);
+            }
         }
-        counts
-            .into_values()
-            .max_by_key(|&(_, count)| count)
-            .map(|(val, _)| val)
+        Some(BlissVal(best.0))
     }
 
     /// Check if the profile is monomorphic (all entries are the same type).
     pub fn is_monomorphic(&self) -> bool {
-        let entries = self.entries.borrow();
-        if entries.is_empty() {
+        let entries = self.entries.get();
+        let len = self.len.get() as usize;
+        if len == 0 {
             return false;
         }
         let first = entries[0];
-        entries.iter().all(|&v| v == first)
+        entries[1..len].iter().all(|&v| v == first)
     }
 
     /// Reset the profile.
     pub fn reset(&self) {
-        self.entries.borrow_mut().clear();
+        self.len.set(0);
+        self.next_slot.set(0);
+        self.seen_small_fixnums.set(0);
     }
 }
 
@@ -189,7 +250,12 @@ impl FunctionProfile {
 
     /// Register a type profile for a call-site ID.
     pub fn add_type_profile(&mut self, site_id: u32) {
-        self.type_profiles.insert(site_id, TypeProfile::new());
+        let profile = if site_id == 1 {
+            TypeProfile::disabled()
+        } else {
+            TypeProfile::new()
+        };
+        self.type_profiles.insert(site_id, profile);
     }
 }
 

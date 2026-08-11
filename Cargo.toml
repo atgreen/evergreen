@@ -17,3 +17,6 @@ rust-version = "1.85"
 bliss-rt = { path = "crates/bliss-rt" }
 bliss-compiler = { path = "crates/bliss-compiler" }
 bliss-stdlib = { path = "crates/bliss-stdlib" }
+
+[profile.test]
+opt-level = 3

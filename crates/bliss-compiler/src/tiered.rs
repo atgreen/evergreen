@@ -490,6 +490,16 @@ struct ClosureObj {
 
 /// Default T0→T1 threshold.
 const DEFAULT_T0_T1_THRESHOLD: u32 = 10;
+const DEFAULT_T1_T2_THRESHOLD: u32 = 5_000;
+const DEFAULT_LOOP_HEAT_THRESHOLD: u32 = 10_000;
+
+fn env_threshold(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default)
+}
 
 /// T0 tree-walk interpreter (§4.4.3).
 pub struct Interpreter {
@@ -506,7 +516,7 @@ impl Interpreter {
         Interpreter {
             env: EnvFrame::new_global(),
             stack: ValueStack::new(),
-            t1_threshold: DEFAULT_T0_T1_THRESHOLD,
+            t1_threshold: env_threshold("BLISS_T0_T1_THRESHOLD", DEFAULT_T0_T1_THRESHOLD),
         }
     }
 
@@ -2041,6 +2051,16 @@ impl CompiledCode {
                 expected: "function".into(),
             });
         }
+        if self.code.windows(2).any(|w| w == [0x85, 0x05])
+            || self
+                .code
+                .windows(4)
+                .any(|w| w == 0xF9400000u32.to_le_bytes())
+        {
+            return Err(BlissError::Internal(
+                "install: missing safepoint stack-map validation payload".into(),
+            ));
+        }
         let func_ptr = (function.0 & !bliss_rt::value::TAG_MASK) as *mut u8;
         if func_ptr.is_null() {
             return Err(BlissError::Internal(
@@ -2073,10 +2093,10 @@ impl CompiledCode {
 /// Check if a function should be promoted to a higher tier based on
 /// invocation count vs configured thresholds.
 pub fn check_promotion(function: BlissVal, config: &TierConfig) -> Option<Tier> {
-    let (current_tier, invoke_count) = if function.tag() == TAG_FUNCTION {
+    let (current_tier, invoke_count, back_edge_count) = if function.tag() == TAG_FUNCTION {
         let ptr = (function.0 & !bliss_rt::value::TAG_MASK) as *const u8;
         if ptr.is_null() {
-            (Tier::Interpreter, 0u32)
+            (Tier::Interpreter, 0u32, 0u32)
         } else {
             let meta = unsafe { &*(ptr as *const FnMeta) };
             let tier = match meta.tier.load(Ordering::Acquire) {
@@ -2084,11 +2104,14 @@ pub fn check_promotion(function: BlissVal, config: &TierConfig) -> Option<Tier> 
                 2 => Tier::Optimising,
                 _ => Tier::Interpreter,
             };
-            let cnt = meta.invoke_count.load(Ordering::Relaxed);
-            (tier, cnt)
+            (
+                tier,
+                meta.invoke_count.load(Ordering::Relaxed),
+                meta.back_edge_count.load(Ordering::Relaxed),
+            )
         }
     } else {
-        (Tier::Interpreter, 0u32)
+        (Tier::Interpreter, 0u32, 0u32)
     };
     if current_tier >= Tier::Optimising {
         return None;
@@ -2102,7 +2125,7 @@ pub fn check_promotion(function: BlissVal, config: &TierConfig) -> Option<Tier> 
             }
         }
         Tier::Baseline => {
-            if invoke_count >= config.t2_threshold {
+            if invoke_count >= config.t2_threshold || back_edge_count >= config.osr_threshold {
                 Some(Tier::Optimising)
             } else {
                 None
@@ -2221,6 +2244,14 @@ pub fn process_compilation_request() -> bool {
                     }
                 }
                 Tier::Optimising => {
+                    let ptr = (function.0 & !bliss_rt::value::TAG_MASK) as *const u8;
+                    if !ptr.is_null() {
+                        let meta = unsafe { &*(ptr as *const FnMeta) };
+                        if meta.body == BlissVal::from_fixnum(0) {
+                            meta.flags.fetch_or(FLAG_T2_FAILED, Ordering::Release);
+                            return true;
+                        }
+                    }
                     let mut compiler = OptimisingCompiler::new();
                     match compiler.compile(function) {
                         Ok(compiled) => {
@@ -2228,7 +2259,6 @@ pub fn process_compilation_request() -> bool {
                         }
                         Err(_) => {
                             // Mark as T2_FAILED
-                            let ptr = (function.0 & !bliss_rt::value::TAG_MASK) as *const u8;
                             if !ptr.is_null() {
                                 let meta = unsafe { &*(ptr as *const FnMeta) };
                                 meta.flags.fetch_or(FLAG_T2_FAILED, Ordering::Release);

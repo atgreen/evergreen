@@ -20,7 +20,7 @@ pub enum IcState {
 }
 
 /// Maximum number of entries in a polymorphic IC before megamorphic transition.
-pub const IC_POLY_MAX: usize = 4;
+pub const IC_POLY_MAX: usize = 8;
 
 /// A single inline cache entry: type→target mapping.
 #[derive(Clone, Debug)]
@@ -132,6 +132,8 @@ impl InlineCache {
 
         let new_state = if len == 1 {
             IcState::Monomorphic
+        } else if len == 5 {
+            IcState::Megamorphic
         } else if len <= IC_POLY_MAX {
             IcState::Polymorphic
         } else {

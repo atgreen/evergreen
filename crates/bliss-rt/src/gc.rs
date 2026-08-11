@@ -642,13 +642,11 @@ impl Collector for HeapCollector {
                     }
                     let total_size =
                         align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
-                    // Non-forwarded objects in a nursery being collected are dead.
-                    if type_id != FORWARDED_TYPE_ID {
-                        // Construct a BlissVal for the object body pointer.
-                        let body_ptr = unsafe { header_ptr.add(OBJECT_HEADER_SIZE) };
-                        let obj_val = BlissVal::from_raw(body_ptr as u64);
-                        run_finalizers_for(obj_val);
-                    }
+                    // Finalizers observe every nursery object in the collection
+                    // cycle before the region is reset.
+                    let body_ptr = unsafe { header_ptr.add(OBJECT_HEADER_SIZE) };
+                    let obj_val = BlissVal::from_raw(body_ptr as u64);
+                    run_finalizers_for(obj_val);
                     fcursor += total_size;
                 }
             }
@@ -711,6 +709,10 @@ impl Collector for HeapCollector {
     ///    regions, install forwarding pointers, and free evacuated regions.
     fn major_gc(&mut self) -> Result<(), BlissError> {
         let start = std::time::Instant::now();
+
+        // A standalone major collection must first drain nursery state so
+        // nursery deaths trigger finalizers and weak-reference clearing too.
+        self.minor_gc()?;
 
         // Set marking flag (§3.6.2: SATB barrier only fires when marking active).
         set_gc_marking_in_progress(true);
@@ -856,7 +858,9 @@ impl Collector for HeapCollector {
                             align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
                         if type_id != FORWARDED_TYPE_ID {
                             let body_addr = cursor + OBJECT_HEADER_SIZE;
-                            if marked.contains(&body_addr) {
+                            if region.header.kind == RegionKind::LargeObject
+                                || marked.contains(&body_addr)
+                            {
                                 live += total_size as u32;
                             } else {
                                 // Object is dead — queue for finalization.
@@ -1106,11 +1110,13 @@ impl SatbCardBarrier {
 
     /// Check if a card is dirty. Used by minor GC to find old→young pointers.
     pub fn is_card_dirty(&self, slot_addr: usize) -> bool {
-        if slot_addr < self.heap_base {
-            return false;
-        }
-        let card_idx = (slot_addr - self.heap_base) >> self.card_shift;
+        let raw_idx = if slot_addr >= self.heap_base {
+            (slot_addr - self.heap_base) >> self.card_shift
+        } else {
+            0
+        };
         let table = self.card_table.lock().unwrap();
+        let card_idx = if raw_idx < table.len() { raw_idx } else { 0 };
         card_idx < table.len() && table[card_idx] != 0
     }
 
@@ -1128,31 +1134,23 @@ impl WriteBarrier for SatbCardBarrier {
         // SATB component: log the old value so the concurrent marker can trace it.
         // Per §3.6.2 and §3.7.1, only log when concurrent marking is active.
         if gc_marking_in_progress() {
-            let old_tag = old_val.tag();
-            if old_tag == crate::value::TAG_CONS
-                || old_tag == crate::value::TAG_HEAP_OBJECT
-                || old_tag == crate::value::TAG_FUNCTION
-            {
-                let mut buf = self.satb_buffer.lock().unwrap();
-                buf.push(old_val);
-            }
+            let mut buf = self.satb_buffer.lock().unwrap();
+            buf.push(old_val);
         }
 
         // Card component: mark the card containing slot_addr as dirty
         // if the new value is a young-gen pointer (cross-generation store).
-        let new_tag = new_val.tag();
-        if new_tag == crate::value::TAG_CONS
-            || new_tag == crate::value::TAG_HEAP_OBJECT
-            || new_tag == crate::value::TAG_FUNCTION
-        {
-            let addr = slot_addr as usize;
-            if addr >= self.heap_base {
-                let card_idx = (addr - self.heap_base) >> self.card_shift;
-                let mut table = self.card_table.lock().unwrap();
-                if card_idx < table.len() {
-                    table[card_idx] = 1; // dirty
-                }
-            }
+        let _ = new_val;
+        let addr = slot_addr as usize;
+        let raw_idx = if addr >= self.heap_base {
+            (addr - self.heap_base) >> self.card_shift
+        } else {
+            0
+        };
+        let mut table = self.card_table.lock().unwrap();
+        let card_idx = if raw_idx < table.len() { raw_idx } else { 0 };
+        if card_idx < table.len() {
+            table[card_idx] = 1; // dirty
         }
     }
 }
@@ -1839,11 +1837,11 @@ pub fn serialize_relocation_table() -> Vec<u8> {
                 && raw % OBJECT_ALIGNMENT == OBJECT_HEADER_SIZE
                 && object_addresses.contains(&raw)
             {
-                relocs.push((object_offset + field_offset) as u64);
+                relocs.push((object_offset + 1 + 4 + field_offset) as u64);
             }
             field_offset += 8;
         }
-        object_offset += size;
+        object_offset += 1 + 4 + size;
         true
     });
 

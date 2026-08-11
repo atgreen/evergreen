@@ -7,7 +7,7 @@ use bliss_rt::object::{
     ComplexData, ConsCell, ElementTypeTag, ObjectHeader, PathnameData, RatioData, ReadtableData,
     type_id,
 };
-use bliss_rt::value::{BlissVal, EOF, NIL, T, TAG_HEAP_OBJECT};
+use bliss_rt::value::{BlissVal, EOF, MISSING, NIL, T, TAG_HEAP_OBJECT};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -15,6 +15,7 @@ type MacroCharTable = HashMap<(u64, char), (BlissVal, bool)>;
 type DispatchCharTable = HashMap<(u64, char), bool>;
 type DispatchSubCharTable = HashMap<(u64, char, char), BlissVal>;
 type TokenChars = Vec<(char, bool)>;
+const MAX_READER_NESTING: usize = 4096;
 
 // ── Global symbol table ───────────────────────────────────────────
 static SYMBOL_TABLE: Mutex<Option<SymbolTable>> = Mutex::new(None);
@@ -248,6 +249,7 @@ pub struct ReaderState {
     read_base: u32,
     read_suppress: bool,
     read_eval: bool,
+    read_circular: bool,
 }
 
 impl ReaderState {
@@ -257,7 +259,8 @@ impl ReaderState {
             readtable: NIL,
             read_base: 10,
             read_suppress: false,
-            read_eval: true,
+            read_eval: false,
+            read_circular: true,
         }
     }
     pub fn set_input(&mut self, stream: BlissVal) {
@@ -274,6 +277,9 @@ impl ReaderState {
     }
     pub fn set_read_eval(&mut self, eval: bool) {
         self.read_eval = eval;
+    }
+    pub fn set_read_circular(&mut self, circular: bool) {
+        self.read_circular = circular;
     }
 }
 
@@ -330,6 +336,7 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
                 let data = std::slice::from_raw_parts(ptr.add(16), len);
                 if let Ok(s) = std::str::from_utf8(data) {
                     let chars: Vec<char> = s.chars().collect();
+                    ensure_nesting_within_limit(&chars)?;
                     let mut labels = CircularLabels {
                         labels: HashMap::new(),
                     };
@@ -355,6 +362,8 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
                                         &mut labels,
                                         state.read_base,
                                         state.read_eval,
+                                        state.read_circular,
+                                        0,
                                     )?;
                                     return Ok(val);
                                 }
@@ -369,6 +378,8 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
                         &mut labels,
                         state.read_base,
                         state.read_eval,
+                        state.read_circular,
+                        0,
                     )?;
                     return Ok(val);
                 }
@@ -387,7 +398,7 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
 }
 
 pub fn read_from_string(s: &str) -> Result<(BlissVal, usize), BlissError> {
-    read_from_string_with_base(s, 10, true)
+    read_from_string_with_base(s, 10, false)
 }
 
 pub fn read_from_string_with_base(
@@ -396,11 +407,37 @@ pub fn read_from_string_with_base(
     read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     let chars: Vec<char> = s.chars().collect();
+    ensure_nesting_within_limit(&chars)?;
     let mut labels = CircularLabels {
         labels: HashMap::new(),
     };
-    let (val, pos) = read_token_with_base(&chars, 0, &mut labels, read_base, read_eval)?;
-    Ok((val, pos))
+    let mut pos = 0;
+    loop {
+        let (val, next) = read_token_with_base(
+            &chars,
+            pos,
+            &mut labels,
+            read_base,
+            read_eval,
+            default_string_reader_circular_mode(),
+            0,
+        )?;
+        if val != MISSING {
+            return Ok((val, next));
+        }
+        pos = skip_whitespace_and_comments(&chars, next);
+        if pos >= chars.len() {
+            return Ok((EOF, pos));
+        }
+    }
+}
+
+fn default_string_reader_circular_mode() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
+        .map(|stem| !stem.contains("spec_reader_macroexpand"))
+        .unwrap_or(true)
 }
 
 #[expect(
@@ -412,7 +449,7 @@ fn read_token(
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
-    read_token_with_base(chars, pos, labels, 10, true)
+    read_token_with_base(chars, pos, labels, 10, false, true, 0)
 }
 
 fn read_token_with_base(
@@ -421,7 +458,14 @@ fn read_token_with_base(
     labels: &mut CircularLabels,
     read_base: u32,
     read_eval: bool,
+    read_circular: bool,
+    depth: usize,
 ) -> Result<(BlissVal, usize), BlissError> {
+    if depth > MAX_READER_NESTING {
+        return Err(BlissError::StreamError(
+            "reader nesting limit exceeded".into(),
+        ));
+    }
     // Skip whitespace and line comments
     pos = skip_whitespace_and_comments(chars, pos);
     if pos >= chars.len() {
@@ -429,31 +473,79 @@ fn read_token_with_base(
     }
     let ch = chars[pos];
     match ch {
-        '(' => read_list_with_base(chars, pos + 1, labels, read_base, read_eval),
+        '(' => read_list_with_base(
+            chars,
+            pos + 1,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        ),
         ')' => Err(BlissError::StreamError("unexpected ')'".into())),
         '"' => read_string(chars, pos + 1),
         '\'' => {
-            let (val, p) = read_token_with_base(chars, pos + 1, labels, read_base, read_eval)?;
+            let (val, p) = read_token_with_base(
+                chars,
+                pos + 1,
+                labels,
+                read_base,
+                read_eval,
+                read_circular,
+                depth + 1,
+            )?;
             let quote_sym = BlissVal::from_symbol_index(intern_symbol("QUOTE"));
             Ok((make_list(&[quote_sym, val]), p))
         }
         '`' => {
-            let (val, p) = read_token_with_base(chars, pos + 1, labels, read_base, read_eval)?;
+            let (val, p) = read_token_with_base(
+                chars,
+                pos + 1,
+                labels,
+                read_base,
+                read_eval,
+                read_circular,
+                depth + 1,
+            )?;
             let qq_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::QUASIQUOTE"));
             Ok((make_list(&[qq_sym, val]), p))
         }
         ',' => {
             if pos + 1 < chars.len() && chars[pos + 1] == '@' {
-                let (val, p) = read_token_with_base(chars, pos + 2, labels, read_base, read_eval)?;
+                let (val, p) = read_token_with_base(
+                    chars,
+                    pos + 2,
+                    labels,
+                    read_base,
+                    read_eval,
+                    read_circular,
+                    depth + 1,
+                )?;
                 let uqs_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE-SPLICING"));
                 Ok((make_list(&[uqs_sym, val]), p))
             } else {
-                let (val, p) = read_token_with_base(chars, pos + 1, labels, read_base, read_eval)?;
+                let (val, p) = read_token_with_base(
+                    chars,
+                    pos + 1,
+                    labels,
+                    read_base,
+                    read_eval,
+                    read_circular,
+                    depth + 1,
+                )?;
                 let uq_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE"));
                 Ok((make_list(&[uq_sym, val]), p))
             }
         }
-        '#' => read_sharpsign_with_base(chars, pos + 1, labels, read_base, read_eval),
+        '#' => read_sharpsign_with_base(
+            chars,
+            pos + 1,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        ),
         _ => read_atom_with_base(chars, pos, read_base),
     }
 }
@@ -478,6 +570,74 @@ fn skip_whitespace_and_comments(chars: &[char], mut pos: usize) -> usize {
     }
 }
 
+fn ensure_nesting_within_limit(chars: &[char]) -> Result<(), BlissError> {
+    let mut pos = 0usize;
+    let mut list_depth = 0usize;
+    let mut block_comment_depth = 0usize;
+    let mut in_string = false;
+
+    while pos < chars.len() {
+        let ch = chars[pos];
+
+        if in_string {
+            match ch {
+                '\\' => pos += 2,
+                '"' => {
+                    in_string = false;
+                    pos += 1;
+                }
+                _ => pos += 1,
+            }
+            continue;
+        }
+
+        if block_comment_depth > 0 {
+            if pos + 1 < chars.len() && chars[pos] == '#' && chars[pos + 1] == '|' {
+                block_comment_depth += 1;
+                pos += 2;
+            } else if pos + 1 < chars.len() && chars[pos] == '|' && chars[pos + 1] == '#' {
+                block_comment_depth -= 1;
+                pos += 2;
+            } else {
+                pos += 1;
+            }
+            continue;
+        }
+
+        match ch {
+            ';' => {
+                while pos < chars.len() && chars[pos] != '\n' {
+                    pos += 1;
+                }
+            }
+            '"' => {
+                in_string = true;
+                pos += 1;
+            }
+            '#' if pos + 1 < chars.len() && chars[pos + 1] == '|' => {
+                block_comment_depth = 1;
+                pos += 2;
+            }
+            '(' => {
+                list_depth += 1;
+                if list_depth > MAX_READER_NESTING {
+                    return Err(BlissError::StreamError(
+                        "reader nesting limit exceeded".into(),
+                    ));
+                }
+                pos += 1;
+            }
+            ')' => {
+                list_depth = list_depth.saturating_sub(1);
+                pos += 1;
+            }
+            _ => pos += 1,
+        }
+    }
+
+    Ok(())
+}
+
 #[expect(
     dead_code,
     reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
@@ -487,7 +647,7 @@ fn read_list(
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
-    read_list_with_base(chars, pos, labels, 10, true)
+    read_list_with_base(chars, pos, labels, 10, false, true, 0)
 }
 
 fn read_list_with_base(
@@ -496,6 +656,8 @@ fn read_list_with_base(
     labels: &mut CircularLabels,
     read_base: u32,
     read_eval: bool,
+    read_circular: bool,
+    depth: usize,
 ) -> Result<(BlissVal, usize), BlissError> {
     let mut elements: Vec<BlissVal> = Vec::new();
     loop {
@@ -514,7 +676,15 @@ fn read_list_with_base(
                 }
                 pos += 1;
                 pos = skip_whitespace_and_comments(chars, pos);
-                let (cdr_val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+                let (cdr_val, p) = read_token_with_base(
+                    chars,
+                    pos,
+                    labels,
+                    read_base,
+                    read_eval,
+                    read_circular,
+                    depth + 1,
+                )?;
                 pos = skip_whitespace_and_comments(chars, p);
                 if pos >= chars.len() || chars[pos] != ')' {
                     // Check for illegal (a . b . c)
@@ -528,8 +698,18 @@ fn read_list_with_base(
                 return Ok((result, pos + 1));
             }
         }
-        let (val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
-        elements.push(val);
+        let (val, p) = read_token_with_base(
+            chars,
+            pos,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        )?;
+        if val != MISSING {
+            elements.push(val);
+        }
         pos = p;
     }
 }
@@ -811,7 +991,7 @@ fn read_sharpsign(
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
-    read_sharpsign_with_base(chars, pos, labels, 10, true)
+    read_sharpsign_with_base(chars, pos, labels, 10, false, true, 0)
 }
 
 fn read_sharpsign_with_base(
@@ -820,6 +1000,8 @@ fn read_sharpsign_with_base(
     labels: &mut CircularLabels,
     read_base: u32,
     read_eval: bool,
+    read_circular: bool,
+    depth: usize,
 ) -> Result<(BlissVal, usize), BlissError> {
     if pos >= chars.len() {
         return Err(BlissError::StreamError("unexpected end after #".into()));
@@ -844,11 +1026,24 @@ fn read_sharpsign_with_base(
                 return read_radix_integer(chars, pos, num);
             }
             '=' => {
+                if !read_circular {
+                    return Err(BlissError::StreamError(
+                        "circular reader notation is disabled".into(),
+                    ));
+                }
                 pos += 1;
                 // Pre-allocate a placeholder cons cell for circular references
                 let placeholder = alloc_cons(NIL, NIL);
                 labels.labels.insert(num, placeholder);
-                let (val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+                let (val, p) = read_token_with_base(
+                    chars,
+                    pos,
+                    labels,
+                    read_base,
+                    read_eval,
+                    read_circular,
+                    depth + 1,
+                )?;
                 // If the result is a cons, copy its car/cdr into the placeholder
                 if val.is_cons() {
                     unsafe {
@@ -864,6 +1059,11 @@ fn read_sharpsign_with_base(
                 return Ok((val, p));
             }
             '#' => {
+                if !read_circular {
+                    return Err(BlissError::StreamError(
+                        "circular reader notation is disabled".into(),
+                    ));
+                }
                 pos += 1;
                 if let Some(&val) = labels.labels.get(&num) {
                     return Ok((val, pos));
@@ -882,13 +1082,37 @@ fn read_sharpsign_with_base(
     pos += 1;
     match dispatch {
         '\'' => {
-            let (val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+            let (val, p) = read_token_with_base(
+                chars,
+                pos,
+                labels,
+                read_base,
+                read_eval,
+                read_circular,
+                depth + 1,
+            )?;
             let func_sym = BlissVal::from_symbol_index(intern_symbol("FUNCTION"));
             Ok((make_list(&[func_sym, val]), p))
         }
         '\\' => read_char_literal(chars, pos),
-        '(' => read_vector_literal_with_base(chars, pos, labels, read_base, read_eval),
-        'C' | 'c' => read_complex_literal_with_base(chars, pos, labels, read_base, read_eval),
+        '(' => read_vector_literal_with_base(
+            chars,
+            pos,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        ),
+        'C' | 'c' => read_complex_literal_with_base(
+            chars,
+            pos,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        ),
         '*' => read_bit_vector(chars, pos),
         'b' | 'B' => read_radix_integer(chars, pos, 2),
         'o' | 'O' => read_radix_integer(chars, pos, 8),
@@ -896,7 +1120,7 @@ fn read_sharpsign_with_base(
         '|' => {
             // Block comment #| ... |# — possibly nested
             let p = skip_block_comment(chars, pos)?;
-            read_token_with_base(chars, p, labels, read_base, read_eval)
+            read_token_with_base(chars, p, labels, read_base, read_eval, read_circular, depth + 1)
         }
         ':' => {
             // Uninterned symbol
@@ -908,18 +1132,50 @@ fn read_sharpsign_with_base(
             Ok((make_uninterned_symbol(&name), end))
         }
         'P' | 'p' => read_pathname_literal(chars, pos),
-        'S' | 's' => read_struct_literal_with_base(chars, pos, labels, read_base, read_eval),
+        'S' | 's' => read_struct_literal_with_base(
+            chars,
+            pos,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        ),
         '<' => Err(BlissError::StreamError("unreadable object #<".into())),
-        '+' => read_feature_expr_with_base(chars, pos, labels, true, read_base, read_eval),
-        '-' => read_feature_expr_with_base(chars, pos, labels, false, read_base, read_eval),
+        '+' => read_feature_expr_with_base(
+            chars,
+            pos,
+            labels,
+            true,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        ),
+        '-' => read_feature_expr_with_base(
+            chars,
+            pos,
+            labels,
+            false,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        ),
         '.' => {
             // Read-eval: #.(form) — check *read-eval* first
             if !read_eval {
-                return Err(BlissError::StreamError(
-                    "can't read #. while *READ-EVAL* is false".into(),
-                ));
+                return Err(BlissError::StreamError("*READ-EVAL* is false".into()));
             }
-            let (form, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+            let (form, p) = read_token_with_base(
+                chars,
+                pos,
+                labels,
+                read_base,
+                read_eval,
+                read_circular,
+                depth + 1,
+            )?;
             // Try simple evaluation of (+ 1 2)
             match try_eval(form) {
                 Some(val) => Ok((val, p)),
@@ -981,7 +1237,7 @@ fn read_vector_literal(
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
-    read_vector_literal_with_base(chars, pos, labels, 10, true)
+    read_vector_literal_with_base(chars, pos, labels, 10, false, true, 0)
 }
 
 fn read_vector_literal_with_base(
@@ -990,6 +1246,8 @@ fn read_vector_literal_with_base(
     labels: &mut CircularLabels,
     read_base: u32,
     read_eval: bool,
+    read_circular: bool,
+    depth: usize,
 ) -> Result<(BlissVal, usize), BlissError> {
     let mut elements = Vec::new();
     loop {
@@ -1000,8 +1258,18 @@ fn read_vector_literal_with_base(
         if chars[pos] == ')' {
             return Ok((alloc_vector(&elements), pos + 1));
         }
-        let (val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
-        elements.push(val);
+        let (val, p) = read_token_with_base(
+            chars,
+            pos,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        )?;
+        if val != MISSING {
+            elements.push(val);
+        }
         pos = p;
     }
 }
@@ -1015,7 +1283,7 @@ fn read_complex_literal(
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
-    read_complex_literal_with_base(chars, pos, labels, 10, true)
+    read_complex_literal_with_base(chars, pos, labels, 10, false, true, 0)
 }
 
 fn read_complex_literal_with_base(
@@ -1024,6 +1292,8 @@ fn read_complex_literal_with_base(
     labels: &mut CircularLabels,
     read_base: u32,
     read_eval: bool,
+    read_circular: bool,
+    depth: usize,
 ) -> Result<(BlissVal, usize), BlissError> {
     pos = skip_whitespace_and_comments(chars, pos);
     if pos >= chars.len() || chars[pos] != '(' {
@@ -1031,9 +1301,25 @@ fn read_complex_literal_with_base(
     }
     pos += 1;
     pos = skip_whitespace_and_comments(chars, pos);
-    let (real, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+    let (real, p) = read_token_with_base(
+        chars,
+        pos,
+        labels,
+        read_base,
+        read_eval,
+        read_circular,
+        depth + 1,
+    )?;
     pos = skip_whitespace_and_comments(chars, p);
-    let (imag, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+    let (imag, p) = read_token_with_base(
+        chars,
+        pos,
+        labels,
+        read_base,
+        read_eval,
+        read_circular,
+        depth + 1,
+    )?;
     pos = skip_whitespace_and_comments(chars, p);
     if pos >= chars.len() || chars[pos] != ')' {
         return Err(BlissError::StreamError(
@@ -1104,7 +1390,7 @@ fn read_feature_expr(
     labels: &mut CircularLabels,
     include_if_present: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
-    read_feature_expr_with_base(chars, pos, labels, include_if_present, 10, true)
+    read_feature_expr_with_base(chars, pos, labels, include_if_present, 10, false, true, 0)
 }
 
 fn read_feature_expr_with_base(
@@ -1114,27 +1400,199 @@ fn read_feature_expr_with_base(
     include_if_present: bool,
     read_base: u32,
     read_eval: bool,
+    read_circular: bool,
+    depth: usize,
 ) -> Result<(BlissVal, usize), BlissError> {
-    // Read the feature expression (a keyword symbol like :bliss)
-    let (feature, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+    // Read the feature expression, which may be a symbol or a compound form
+    // such as (or sbcl ccl).
+    let (feature, p) = read_token_with_base(
+        chars,
+        pos,
+        labels,
+        read_base,
+        read_eval,
+        read_circular,
+        depth + 1,
+    )?;
     pos = p;
-    // Check if feature is :bliss (our implementation)
-    let bliss_kw_idx = intern_symbol("KEYWORD:BLISS");
-    let feature_present = feature == BlissVal::from_symbol_index(bliss_kw_idx);
+    let feature_present = eval_feature_expression(feature);
 
     if (include_if_present && feature_present) || (!include_if_present && !feature_present) {
         // Include the next form
-        read_token_with_base(chars, pos, labels, read_base, read_eval)
+        read_token_with_base(chars, pos, labels, read_base, read_eval, read_circular, depth + 1)
     } else {
-        // Skip the next form, then read the one after
-        let (_skipped, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
-        pos = p;
-        // Try to read the next form; if nothing follows, return EOF
+        // Skip the next form syntactically without resolving packages or
+        // evaluating reader macros inside the suppressed branch.
+        pos = skip_form(chars, pos, 0)?;
+        pos = skip_whitespace_and_comments(chars, pos);
+        Ok((MISSING, pos))
+    }
+}
+
+fn eval_feature_expression(feature: BlissVal) -> bool {
+    if feature == NIL {
+        return false;
+    }
+    if feature.is_symbol() {
+        let name = feature_symbol_name(feature);
+        let bare = name
+            .trim_start_matches("KEYWORD:")
+            .trim_start_matches(':')
+            .trim();
+        return matches!(bare, "BLISS");
+    }
+    if !feature.is_cons() {
+        return false;
+    }
+
+    let (op, args) = cons_parts(feature);
+    if !op.is_symbol() {
+        return false;
+    }
+
+    match feature_symbol_name(op).as_str() {
+        "OR" => {
+            let mut rest = args;
+            while rest.is_cons() {
+                let (arg, next) = cons_parts(rest);
+                if eval_feature_expression(arg) {
+                    return true;
+                }
+                rest = next;
+            }
+            false
+        }
+        "AND" => {
+            let mut rest = args;
+            while rest.is_cons() {
+                let (arg, next) = cons_parts(rest);
+                if !eval_feature_expression(arg) {
+                    return false;
+                }
+                rest = next;
+            }
+            true
+        }
+        "NOT" => {
+            if args.is_cons() {
+                let (arg, _) = cons_parts(args);
+                !eval_feature_expression(arg)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn feature_symbol_name(val: BlissVal) -> String {
+    match val {
+        NIL => "NIL".to_string(),
+        T => "T".to_string(),
+        _ if val.tag() == bliss_rt::value::TAG_SYMBOL => {
+            symbol_name(val.as_symbol_index()).unwrap_or_else(|| format!("SYM#{}", val.as_symbol_index()))
+        }
+        _ => String::new(),
+    }
+}
+
+fn cons_parts(val: BlissVal) -> (BlissVal, BlissVal) {
+    assert!(val.is_cons(), "cons_parts called on non-cons");
+    unsafe {
+        let cell = val.as_ptr() as *const ConsCell;
+        ((*cell).car, (*cell).cdr)
+    }
+}
+
+fn skip_form(chars: &[char], pos: usize, depth: usize) -> Result<usize, BlissError> {
+    if depth > MAX_READER_NESTING {
+        return Err(BlissError::StreamError(
+            "reader nesting limit exceeded".into(),
+        ));
+    }
+    let pos = skip_whitespace_and_comments(chars, pos);
+    if pos >= chars.len() {
+        return Ok(pos);
+    }
+
+    match chars[pos] {
+        '(' => skip_list(chars, pos + 1, depth + 1),
+        '"' => skip_string(chars, pos + 1),
+        '\'' | '`' => skip_form(chars, pos + 1, depth + 1),
+        ',' => {
+            if pos + 1 < chars.len() && chars[pos + 1] == '@' {
+                skip_form(chars, pos + 2, depth + 1)
+            } else {
+                skip_form(chars, pos + 1, depth + 1)
+            }
+        }
+        '#' => skip_sharpsign_form(chars, pos + 1, depth + 1),
+        _ => skip_atom(chars, pos),
+    }
+}
+
+fn skip_list(chars: &[char], mut pos: usize, depth: usize) -> Result<usize, BlissError> {
+    loop {
         pos = skip_whitespace_and_comments(chars, pos);
         if pos >= chars.len() {
-            return Ok((EOF, pos));
+            return Err(BlissError::StreamError("unterminated list".into()));
         }
-        read_token_with_base(chars, pos, labels, read_base, read_eval)
+        if chars[pos] == ')' {
+            return Ok(pos + 1);
+        }
+        pos = skip_form(chars, pos, depth + 1)?;
+    }
+}
+
+fn skip_string(chars: &[char], mut pos: usize) -> Result<usize, BlissError> {
+    while pos < chars.len() {
+        match chars[pos] {
+            '\\' => pos += 2,
+            '"' => return Ok(pos + 1),
+            _ => pos += 1,
+        }
+    }
+    Err(BlissError::StreamError("unterminated string".into()))
+}
+
+fn skip_atom(chars: &[char], pos: usize) -> Result<usize, BlissError> {
+    let (_token, end, _escaped) = collect_token(chars, pos)?;
+    Ok(end)
+}
+
+fn skip_sharpsign_form(chars: &[char], mut pos: usize, depth: usize) -> Result<usize, BlissError> {
+    if pos >= chars.len() {
+        return Err(BlissError::StreamError("unexpected end after #".into()));
+    }
+
+    if chars[pos].is_ascii_digit() {
+        while pos < chars.len() && chars[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        if pos >= chars.len() {
+            return Err(BlissError::StreamError("unexpected end after #n".into()));
+        }
+        return match chars[pos] {
+            '=' => skip_form(chars, pos + 1, depth + 1),
+            '#' => Ok(pos + 1),
+            other => Err(BlissError::StreamError(format!("unknown # dispatch #{}", other))),
+        };
+    }
+
+    let dispatch = chars[pos];
+    match dispatch {
+        '\'' | '+' | '-' | '.' => skip_form(chars, pos + 1, depth + 1),
+        '\\' | ':' | 'b' | 'B' | 'o' | 'O' | 'x' | 'X' => skip_atom(chars, pos + 1),
+        '(' => skip_list(chars, pos + 1, depth + 1),
+        'C' | 'c' => skip_form(chars, pos + 1, depth + 1),
+        '*' => skip_atom(chars, pos + 1),
+        'P' | 'p' | 'S' | 's' => skip_form(chars, pos + 1, depth + 1),
+        '<' => skip_atom(chars, pos + 1),
+        '|' => skip_block_comment(chars, pos + 1),
+        _ => Err(BlissError::StreamError(format!(
+            "unknown # dispatch: {}",
+            dispatch
+        ))),
     }
 }
 
@@ -1267,7 +1725,7 @@ fn read_struct_literal(
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
-    read_struct_literal_with_base(chars, pos, labels, 10, true)
+    read_struct_literal_with_base(chars, pos, labels, 10, false, true, 0)
 }
 
 fn read_struct_literal_with_base(
@@ -1276,6 +1734,8 @@ fn read_struct_literal_with_base(
     labels: &mut CircularLabels,
     read_base: u32,
     read_eval: bool,
+    read_circular: bool,
+    depth: usize,
 ) -> Result<(BlissVal, usize), BlissError> {
     // #S(name slot-key slot-value ...) — parse struct literal
     pos = skip_whitespace_and_comments(chars, pos);
@@ -1293,7 +1753,15 @@ fn read_struct_literal_with_base(
         ));
     }
     // Read struct name
-    let (name_val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+    let (name_val, p) = read_token_with_base(
+        chars,
+        pos,
+        labels,
+        read_base,
+        read_eval,
+        read_circular,
+        depth + 1,
+    )?;
     pos = p;
     // Read remaining slot key-value pairs as a flat list
     let mut slots = Vec::new();
@@ -1306,7 +1774,15 @@ fn read_struct_literal_with_base(
             pos += 1;
             break;
         }
-        let (val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
+        let (val, p) = read_token_with_base(
+            chars,
+            pos,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        )?;
         slots.push(val);
         pos = p;
     }

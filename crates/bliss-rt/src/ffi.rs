@@ -3,6 +3,7 @@
 //! See §2.7 of the spec.
 
 use crate::error::BlissError;
+use crate::thread::{ThreadState, current_thread};
 use crate::value::BlissVal;
 
 // ── Alien type system ──────────────────────────────────────────────
@@ -113,9 +114,27 @@ pub unsafe fn ffi_call(
     arg_types: &[AlienType],
     args: &[u64],
 ) -> Result<u64, BlissError> {
+    struct NativeStateGuard {
+        thread: &'static crate::thread::GreenThread,
+        previous: ThreadState,
+    }
+
+    impl Drop for NativeStateGuard {
+        fn drop(&mut self) {
+            self.thread.set_state(self.previous);
+        }
+    }
+
     if fn_ptr.is_null() {
         return Err(BlissError::FfiError("null function pointer".into()));
     }
+
+    let thread = current_thread();
+    let _state_guard = NativeStateGuard {
+        thread,
+        previous: thread.state(),
+    };
+    thread.set_state(ThreadState::Native);
 
     // Issue #7: Check if the return type or any argument type involves 32-bit int
     // and dispatch appropriately. For the bootstrap, we handle the common cases

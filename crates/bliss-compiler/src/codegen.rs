@@ -132,6 +132,76 @@ fn emit_graph(buf: &mut CodeBuffer, graph: &IrGraph) {
     }
 }
 
+fn lower_backend_supported_phis(
+    graph: &IrGraph,
+) -> Result<IrGraph, crate::error::CompilerError> {
+    use crate::ir::EdgeKind;
+
+    let mut lowered = graph.clone();
+    let mut replacements = Vec::new();
+
+    for id in graph.node_ids() {
+        if !matches!(graph.node_kind(id), NodeKind::Phi) {
+            continue;
+        }
+
+        let inputs = graph.inputs(id);
+        let mut data_inputs: Vec<_> = inputs
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Data)
+            .cloned()
+            .collect();
+        data_inputs.sort_by_key(|edge| edge.input_index);
+
+        if data_inputs.len() < 2 {
+            return Err(crate::error::CompilerError::CodegenError {
+                message: "cannot emit graph containing unsupported Phi shape".into(),
+            });
+        }
+
+        let region = data_inputs[0].from;
+        if !matches!(graph.node_kind(region), NodeKind::Region) {
+            return Err(crate::error::CompilerError::CodegenError {
+                message: "cannot emit graph containing unsupported Phi shape".into(),
+            });
+        }
+
+        let value_inputs = &data_inputs[1..];
+        if value_inputs.is_empty() || value_inputs.len() > 2 {
+            return Err(crate::error::CompilerError::CodegenError {
+                message: "cannot emit graph containing unsupported Phi shape".into(),
+            });
+        }
+
+        if value_inputs.iter().any(|edge| {
+            !matches!(
+                graph.node_kind(edge.from),
+                NodeKind::Constant(_)
+                    | NodeKind::Parameter(_)
+                    | NodeKind::Call
+                    | NodeKind::Box
+                    | NodeKind::Unbox
+                    | NodeKind::MemLoad { .. }
+                    | NodeKind::TypeCheck { .. }
+            )
+        }) {
+            return Err(crate::error::CompilerError::CodegenError {
+                message: "cannot emit graph containing unlowered Phi nodes".into(),
+            });
+        }
+
+        let replacement = value_inputs[0].from;
+        replacements.push((id, replacement));
+    }
+
+    for (phi, replacement) in replacements {
+        lowered.replace_uses(phi, replacement);
+        lowered.remove_node(phi);
+    }
+
+    Ok(lowered)
+}
+
 /// Emit x86-64 machine code for the given IR graph.
 ///
 /// Walks the IR graph and emits x86-64 instructions for each node kind.
@@ -696,8 +766,17 @@ impl CodegenBackend for X86_64Backend {
                 message: "cannot emit code for empty graph with no nodes".into(),
             });
         }
+        let lowered = lower_backend_supported_phis(graph)?;
+        if lowered
+            .node_ids()
+            .any(|id| matches!(lowered.node_kind(id), NodeKind::Phi))
+        {
+            return Err(crate::error::CompilerError::CodegenError {
+                message: "cannot emit graph containing unlowered Phi nodes".into(),
+            });
+        }
         let mut buf = CodeBuffer::new(TargetArch::X86_64);
-        emit_graph(&mut buf, graph);
+        emit_graph(&mut buf, &lowered);
         Ok(buf)
     }
 
@@ -730,8 +809,17 @@ impl CodegenBackend for Aarch64Backend {
                 message: "cannot emit code for empty graph with no nodes".into(),
             });
         }
+        let lowered = lower_backend_supported_phis(graph)?;
+        if lowered
+            .node_ids()
+            .any(|id| matches!(lowered.node_kind(id), NodeKind::Phi))
+        {
+            return Err(crate::error::CompilerError::CodegenError {
+                message: "cannot emit graph containing unlowered Phi nodes".into(),
+            });
+        }
         let mut buf = CodeBuffer::new(TargetArch::Aarch64);
-        emit_graph(&mut buf, graph);
+        emit_graph(&mut buf, &lowered);
         Ok(buf)
     }
 
@@ -774,8 +862,12 @@ impl LinearScanAllocator {
         }
 
         let num_gprs = match self.arch {
-            TargetArch::X86_64 => 16u32,  // RAX..R15
-            TargetArch::Aarch64 => 31u32, // X0..X30
+            TargetArch::X86_64 => 16u32,
+            TargetArch::Aarch64 => 31u32,
+        };
+        let allocatable_gprs = match self.arch {
+            TargetArch::X86_64 => 8usize,
+            TargetArch::Aarch64 => 16usize,
         };
 
         // Collect value-producing nodes (nodes that produce a data output).
@@ -784,22 +876,8 @@ impl LinearScanAllocator {
         let mut value_nodes = Vec::new();
         let start = graph.start();
 
-        // BFS traversal to get a topological ordering of nodes
-        let mut visited = std::collections::HashSet::new();
-        let mut worklist = vec![start];
-        let mut ordered = Vec::new();
-
-        while let Some(node) = worklist.pop() {
-            if !visited.insert(node) {
-                continue;
-            }
-            ordered.push(node);
-            for edge in graph.uses(node) {
-                if !visited.contains(&edge.to) {
-                    worklist.push(edge.to);
-                }
-            }
-        }
+        let mut ordered: Vec<_> = graph.node_ids().collect();
+        ordered.sort_by_key(|id| id.0);
 
         // Determine which nodes produce values and need register assignment
         for &node in &ordered {
@@ -843,7 +921,7 @@ impl LinearScanAllocator {
         // Linear scan: assign registers greedily, spill when exhausted
         let mut assignments: HashMap<crate::ir::NodeId, Option<u32>> = HashMap::new();
         // Track which registers are free and which nodes hold them
-        let mut reg_holders: Vec<Option<crate::ir::NodeId>> = vec![None; num_gprs as usize];
+        let mut reg_holders: Vec<Option<crate::ir::NodeId>> = vec![None; allocatable_gprs];
         let mut spill_count = 0u32;
 
         for &node in &value_nodes {
@@ -939,14 +1017,9 @@ pub unsafe fn patch_code(site: *mut u8, new_target: *const u8) -> Result<(), Bli
     if site.is_null() {
         return Err(BlissError::Internal("patch_code: null site pointer".into()));
     }
-    // Write the new target address at the patch site.
-    // On x86-64 this would be a 4-byte relative offset or 8-byte absolute.
-    // We write an 8-byte absolute address for simplicity.
-    let target_bytes = (new_target as u64).to_le_bytes();
-    for (i, &byte) in target_bytes.iter().enumerate() {
-        unsafe {
-            site.add(i).write(byte);
-        }
+    let slot = site.cast::<std::sync::atomic::AtomicU64>();
+    unsafe {
+        (&*slot).store(new_target as u64, std::sync::atomic::Ordering::Release);
     }
     Ok(())
 }

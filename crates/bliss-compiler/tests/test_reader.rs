@@ -566,6 +566,21 @@ fn read_feature_expression_absent() {
     assert_eq!(v.as_fixnum(), 42);
 }
 
+#[test]
+fn read_feature_expression_skips_unreadable_suppressed_branch() {
+    let (v, _) = read_from_string("#+:genera (sct:get-system-version) 42").unwrap();
+    assert_eq!(v.as_fixnum(), 42);
+}
+
+#[test]
+fn read_feature_expression_supports_compound_operators() {
+    let (v, _) = read_from_string("#-(or sbcl ccl) 42 99").unwrap();
+    assert_eq!(v.as_fixnum(), 42);
+
+    let (v, _) = read_from_string("#+(and bliss (not sbcl)) 7 9").unwrap();
+    assert_eq!(v.as_fixnum(), 7);
+}
+
 // ── #. read-eval (Issue #4) ──────────────────────────────────────
 
 #[test]

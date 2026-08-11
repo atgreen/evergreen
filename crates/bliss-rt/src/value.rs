@@ -50,6 +50,7 @@ pub const EOF: BlissVal = BlissVal(EOF_BITS);
 impl BlissVal {
     /// Create a fixnum value from a 61-bit signed integer.
     /// The value is left-shifted by 3 bits; tag bits are 000.
+    #[inline(always)]
     pub fn from_fixnum(n: i64) -> Self {
         // Left-shift by 3; tag is 000 so no OR needed.
         // The cast to u64 preserves the bit pattern for negative numbers.

@@ -76,6 +76,7 @@ pub struct IrSourceInfo {
 // ── IR graph ───────────────────────────────────────────────────────
 
 /// A sea-of-nodes IR graph representing a single function.
+#[derive(Clone, Debug)]
 pub struct IrGraph {
     nodes: HashMap<NodeId, NodeKind>,
     /// Edges indexed by destination node (inputs to a node).
@@ -271,6 +272,19 @@ impl IrBuilder {
             kind: EdgeKind::Data,
             input_index: 1,
         });
+
+        let default_source = IrSourceInfo {
+            file: None,
+            line: 1,
+            column: 1,
+            form: Some(form),
+        };
+        let ids: Vec<_> = graph.node_ids().collect();
+        for id in ids {
+            if graph.source_info(id).is_none() {
+                graph.set_source_info(id, default_source.clone());
+            }
+        }
 
         Ok(graph)
     }

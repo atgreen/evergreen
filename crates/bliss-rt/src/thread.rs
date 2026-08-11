@@ -145,7 +145,7 @@ impl GreenThread {
     }
 
     /// Set the thread state.
-    fn set_state(&self, new_state: ThreadState) {
+    pub(crate) fn set_state(&self, new_state: ThreadState) {
         *self.state.lock().unwrap() = new_state;
     }
 
