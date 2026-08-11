@@ -22,38 +22,28 @@ file:
 | `04-08-inline-caches.md` | §4.8 | Inline Caches |
 | `04-09-profiling.md` | §4.9 | Profiling Infrastructure |
 
-Source map:
+Current source map:
 
 ```
 crates/bliss-compiler/src/
 ├── reader.rs          §4.1  CL reader (Rust bootstrap)
-├── readtable.rs       §4.1  Readtable & character traits
 ├── macroexpand.rs     §4.2  Macro expansion engine
-├── env.rs             §4.2  Lexical environment protocol
 ├── ir.rs              §4.3  Sea-of-nodes IR core types
-├── ir_build.rs        §4.3  IR graph builder
-├── interp.rs          §4.4  T0 tree-walk interpreter
-├── baseline.rs        §4.4  T1 baseline compiler
-├── opt/               §4.5  Optimisation passes
-│   ├── mod.rs                Pass manager & ordering
-│   ├── type_prop.rs          Type propagation / inference
-│   ├── inline.rs             Inlining heuristics
-│   ├── escape.rs             Escape analysis
-│   ├── licm.rs               Loop-invariant code motion
-│   ├── dce.rs                Dead code elimination
-│   ├── strength.rs           Strength reduction
-│   ├── fold.rs               Constant folding
-│   └── null_elim.rs          Null-check elimination
-├── osr.rs             §4.6  On-stack replacement
-├── codegen/           §4.7  Machine code emission
-│   ├── mod.rs                Codegen trait + driver
-│   ├── x86_64.rs             x86-64 backend
-│   ├── aarch64.rs            AArch64 backend
-│   ├── regalloc.rs           Linear-scan register allocator
-│   └── patcher.rs            Code patching for ICs
+├── tiered.rs          §4.4  Tiered execution orchestration for T0/T1/T2
+├── opt.rs             §4.5  Optimisation pipeline and pass coordination
+├── osr.rs             §4.6  On-stack replacement and deoptimisation support
+├── codegen.rs         §4.7  Machine code emission and backend glue
 ├── ic.rs              §4.8  Inline cache runtime
-└── profile.rs         §4.9  Profiling counters & type recording
+├── profiling.rs       §4.9  Profiling counters and type recording
+├── error.rs           Shared compiler diagnostics and error types
+└── lib.rs             Crate entrypoint and subsystem wiring
 ```
+
+Planned finer-grained decomposition such as dedicated `readtable`,
+environment, interpreter, baseline, or per-pass/backend modules remains
+permitted by later implementation work, but those paths are not present
+in the current repository and therefore are not part of the current
+source map.
 
 ---
 

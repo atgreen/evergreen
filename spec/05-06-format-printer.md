@@ -10,31 +10,31 @@ variables. Implements ANSI CL §22 (Printer) and §22.3 (FORMAT).
 
 | ID | Req | Level |
 |----|-----|-------|
-| R5.156 | `FORMAT` MUST accept destination of `nil`, `t`, a stream, or a string with fill-pointer. | MUST |
-| R5.157 | All ANSI FORMAT directives (§22.3) MUST be supported with correct colon/at-sign modifier interactions. | MUST |
-| R5.158 | `V` and `#` MUST be supported as directive parameters. | MUST |
-| R5.159 | `~?` (recursive processing) MUST process a format string from the arg list; `~@?` uses the enclosing arg list. | MUST |
-| R5.160 | `~{...~}` (iteration) MUST support all four colon/at variants with correct sublist/remaining-args semantics. | MUST |
-| R5.161 | `~[...~]` (conditional) MUST support numeric, boolean (`~:[`), and true-test (`~@[`) variants. | MUST |
-| R5.162 | `~<...~>` MUST implement both justification and logical-block modes. | MUST |
-| R5.163 | `~/name/` MUST call the named function as `(funcall fn stream arg colon-p at-p &rest params)`. | MUST |
-| R5.164 | Constant FORMAT strings SHOULD be compiled to closures at macro-expansion time. | SHOULD |
-| R5.165 | FORMAT compiler output MUST be identical to interpreted output for all directives. | MUST |
-| R5.166 | Pretty-printer MUST implement XP algorithm: logical blocks, conditional newlines (linear/fill/miser/mandatory), per-block indentation. | MUST |
-| R5.167 | `*print-pprint-dispatch*` MUST be a type-specifier-keyed table with numeric priority; higher wins. | MUST |
-| R5.168 | Default pprint-dispatch entries MUST exist for lists, `defun`, `let`, `cond`, `do`, `loop`, and standard special forms. | MUST |
-| R5.169 | `*print-circle*` MUST detect shared/circular structure via `eq` hash table; label with `#n=`/`#n#`. | MUST |
-| R5.170 | `*print-level*`/`*print-length*` MUST truncate with `#` and `...` respectively. | MUST |
-| R5.171 | `*print-readably*` MUST signal `print-not-readable` if no re-readable form exists. | MUST |
-| R5.172 | `*print-lines*` MUST limit output lines, emitting ` ..` for truncation. | MUST |
-| R5.173 | `*print-miser-width*` MUST enable miser mode when available width ≤ threshold. | MUST |
-| R5.174 | `*print-right-margin*` MUST control the right margin; `nil` → auto-detect terminal width. | MUST |
-| R5.175 | Array printing MUST respect `*print-array*`, `*print-level*`, `*print-length*`, `*print-readably*`. | MUST |
-| R5.176 | Hash-table printing: `#<HASH-TABLE :TEST eql :COUNT n>` by default. When `*print-readably*` is true, signal `print-not-readable` (per R5.171), since ANSI CL defines no standard readable syntax for hash tables. See §5.9.15 for a Bliss-extension reader macro that may be provided separately. | MUST |
-| R5.177 | Structure printing MUST use print-function/print-object, falling back to `#S(...)`. | MUST |
-| R5.178 | CLOS objects MUST dispatch through `print-object`. | MUST |
-| R5.179 | Pretty-printer directives `~W`, `~I`, `~:T`, `~_` MUST work within FORMAT. | MUST |
-| R5.180 | `FORMAT` MUST be thread-safe; concurrent `FORMAT nil` MUST NOT corrupt shared state. | MUST |
+| R5.156 [S0] | `FORMAT` MUST accept destination of `nil`, `t`, a stream, or a string with fill-pointer. | MUST |
+| R5.157 [S3] | All ANSI FORMAT directives (§22.3) MUST be supported with correct colon/at-sign modifier interactions. | MUST |
+| R5.158 [S3] | `V` and `#` MUST be supported as directive parameters. | MUST |
+| R5.159 [S3] | `~?` (recursive processing) MUST process a format string from the arg list; `~@?` uses the enclosing arg list. | MUST |
+| R5.160 [S3] | `~{...~}` (iteration) MUST support all four colon/at variants with correct sublist/remaining-args semantics. | MUST |
+| R5.161 [S3] | `~[...~]` (conditional) MUST support numeric, boolean (`~:[`), and true-test (`~@[`) variants. | MUST |
+| R5.162 [S3] | `~<...~>` MUST implement both justification and logical-block modes. | MUST |
+| R5.163 [S3] | `~/name/` MUST call the named function as `(funcall fn stream arg colon-p at-p &rest params)`. | MUST |
+| R5.164 [S3] | Constant FORMAT strings SHOULD be compiled to closures at macro-expansion time. | SHOULD |
+| R5.165 [S3] | FORMAT compiler output MUST be identical to interpreted output for all directives. | MUST |
+| R5.166 [S3] | Pretty-printer MUST implement XP algorithm: logical blocks, conditional newlines (linear/fill/miser/mandatory), per-block indentation. | MUST |
+| R5.167 [S3] | `*print-pprint-dispatch*` MUST be a type-specifier-keyed table with numeric priority; higher wins. | MUST |
+| R5.168 [S3] | Default pprint-dispatch entries MUST exist for lists, `defun`, `let`, `cond`, `do`, `loop`, and standard special forms. | MUST |
+| R5.169 [S3] | `*print-circle*` MUST detect shared/circular structure via `eq` hash table; label with `#n=`/`#n#`. | MUST |
+| R5.170 [S3] | `*print-level*`/`*print-length*` MUST truncate with `#` and `...` respectively. | MUST |
+| R5.171 [S3] | `*print-readably*` MUST signal `print-not-readable` if no re-readable form exists. | MUST |
+| R5.172 [S3] | `*print-lines*` MUST limit output lines, emitting ` ..` for truncation. | MUST |
+| R5.173 [S3] | `*print-miser-width*` MUST enable miser mode when available width ≤ threshold. | MUST |
+| R5.174 [S3] | `*print-right-margin*` MUST control the right margin; `nil` → auto-detect terminal width. | MUST |
+| R5.175 [S3] | Array printing MUST respect `*print-array*`, `*print-level*`, `*print-length*`, `*print-readably*`. | MUST |
+| R5.176 [S3] | Hash-table printing: `#<HASH-TABLE :TEST eql :COUNT n>` by default. When `*print-readably*` is true, signal `print-not-readable` (per R5.171), since ANSI CL defines no standard readable syntax for hash tables. See §5.9.15 for a Bliss-extension reader macro that may be provided separately. | MUST |
+| R5.177 [S3] | Structure printing MUST use print-function/print-object, falling back to `#S(...)`. | MUST |
+| R5.178 [S3] | CLOS objects MUST dispatch through `print-object`. | MUST |
+| R5.179 [S3] | Pretty-printer directives `~W`, `~I`, `~:T`, `~_` MUST work within FORMAT. | MUST |
+| R5.180 [S3] | `FORMAT` MUST be thread-safe; concurrent `FORMAT nil` MUST NOT corrupt shared state. | MUST |
 
 ---
 

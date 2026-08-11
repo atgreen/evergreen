@@ -141,7 +141,7 @@ CLOS bootstrap presents a chicken-and-egg problem: `standard-class` is an
 instance of itself; `standard-object` is a superclass of `standard-class`
 but also an instance of it.
 
-**R5.10** The CLOS bootstrap MUST use a three-phase protocol:
+**R5.10 [S4]** The CLOS bootstrap MUST use a three-phase protocol:
 1. **Proto-classes** — Rust allocates raw structures for `T`,
    `standard-object`, `standard-class`, `built-in-class` with placeholder
    metaclass pointers.
@@ -181,29 +181,29 @@ t
       └── standard-method-combination
 ```
 
-**R5.11** `STANDARD-CLASS` MUST support single and multiple inheritance with
+**R5.11 [S4]** `STANDARD-CLASS` MUST support single and multiple inheritance with
 C3 linearization for the class precedence list (CPL).
 
-**R5.12** `MAKE-INSTANCE` MUST follow the ANSI initialization protocol:
+**R5.12 [S4]** `MAKE-INSTANCE` MUST follow the ANSI initialization protocol:
 `allocate-instance` → `initialize-instance` → `shared-initialize`.
 
-**R5.13** Slot access via `SLOT-VALUE` MUST be optimised by the T1/T2
+**R5.13 [S4]** Slot access via `SLOT-VALUE` MUST be optimised by the T1/T2
 compilers to a direct memory offset load when the class is sealed or the
 slot position is monomorphic (§4).
 
-**R5.14** Generic function dispatch MUST use a **discriminating function**
+**R5.14 [S4]** Generic function dispatch MUST use a **discriminating function**
 compiled to native code. The dispatch strategy MUST support:
 - Single-dispatch fast path (vtable-like index lookup).
 - Multi-method dispatch via method caching (hash on class tuple).
 
-**R5.15** Method combination MUST support `STANDARD`, `+`, `AND`, `OR`,
+**R5.15 [S4]** Method combination MUST support `STANDARD`, `+`, `AND`, `OR`,
 `LIST`, `APPEND`, `NCONC`, `MIN`, `MAX`, and `PROGN`, plus
 `DEFINE-METHOD-COMBINATION` (short and long forms).
 
-**R5.16** `CHANGE-CLASS` MUST call `UPDATE-INSTANCE-FOR-DIFFERENT-CLASS`
+**R5.16 [S4]** `CHANGE-CLASS` MUST call `UPDATE-INSTANCE-FOR-DIFFERENT-CLASS`
 and preserve slot values for slots with the same name.
 
-**R5.17** Class redefinition MUST lazily update existing instances via
+**R5.17 [S4]** Class redefinition MUST lazily update existing instances via
 `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` on next slot access (stamp-check
 protocol).
 
@@ -213,7 +213,7 @@ protocol).
 
 Detailed specification in `spec/05-03-conditions.md`. Summary:
 
-**R5.18** The condition type hierarchy MUST include at least:
+**R5.18 [S4]** The condition type hierarchy MUST include at least:
 
 ```text
 condition
@@ -237,18 +237,18 @@ condition
  simple-error, simple-type-error, simple-warning (via multiple inheritance)
 ```
 
-**R5.19** `HANDLER-BIND` MUST establish handlers without unwinding the
+**R5.19 [S4]** `HANDLER-BIND` MUST establish handlers without unwinding the
 stack. `HANDLER-CASE` MUST unwind before running the handler clause.
 
-**R5.20** `RESTART-BIND` / `RESTART-CASE` MUST support `:interactive`,
+**R5.20 [S4]** `RESTART-BIND` / `RESTART-CASE` MUST support `:interactive`,
 `:report`, and `:test` options.
 
-**R5.21** Default restarts MUST be established:
+**R5.21 [S4]** Default restarts MUST be established:
 - `ABORT` — available in all `ERROR` calls (exit to nearest REPL).
 - `CONTINUE` — available in `CERROR` calls.
 - `MUFFLE-WARNING` — available in `WARN` calls.
 
-**R5.22** `*DEBUGGER-HOOK*` MUST be called before the default debugger
+**R5.22 [S4]** `*DEBUGGER-HOOK*` MUST be called before the default debugger
 when an unhandled condition is signalled. Signature:
 `(lambda (condition hook) ...)`.
 

@@ -33,6 +33,9 @@ policy, and logging/diagnostics infrastructure for the Bliss runtime.
 | R7.21 | Startup mode selection MUST be deterministic: explicit CLI mode (`--eval`, `--load`, script path, `--bootstrap`, `--no-image`) overrides appended-image and default-image discovery. |
 | R7.22 | The runtime MUST support a bootstrap-without-image operating profile that loads `lib/boot.lisp` from the source tree or installation prefix and exposes enough functionality to build and save a first image. |
 | R7.23 | The runtime MUST support an immutable-image operating profile in which the mapped image remains read-only and all post-startup mutation occurs in freshly allocated writable regions. |
+| R7.24 | Init-file discovery MUST be explicit and suppressible: in interactive startup with no explicit `--eval`, `--load`, or script path, the runtime MUST load the file named by `BLISS_INIT_FILE` if set, else `~/.blissrc` if present; `--no-init` MUST suppress both probes. |
+| R7.25 | The standard bootstrap prelude MUST load before init-file processing and before executing `--eval`, `--load`, or a positional script unless `--no-bootstrap` is in effect; `--bootstrap` MAY remain as a compatibility alias for explicitly requesting this prelude-backed bootstrap profile. |
+| R7.26 | `--no-bootstrap` MUST disable standard bootstrap-prelude loading and expose the raw evaluator/runtime state for the selected startup mode. |
 
 ---
 
@@ -407,6 +410,7 @@ in-image defaults  →  environment variables  →  CLI flags
 | `BLISS_TIER2_THRESHOLD` | Integer | `5000` | Call/back-edge count triggering T1→T2 promotion |
 | `BLISS_PERF_MAP` | `0` or `1` | `1` (Linux) | Emit `/tmp/perf-<pid>.map` for JIT symbols |
 | `BLISS_CODE_CACHE_SIZE` | Size | `64m` | Maximum compiled-code cache size |
+| `BLISS_INIT_FILE` | Path | `~/.blissrc` fallback | Interactive init file override; only consulted when no explicit `--eval`, `--load`, or script path is selected |
 
 ### 7.6.3  CLI Flags
 
@@ -421,9 +425,41 @@ in-image defaults  →  environment variables  →  CLI flags
 | `--eval`, `-e` | — | `-e '(print 42)'` |
 | `--no-image` | — | Start with an empty heap (no CL environment loaded) |
 | `--bootstrap` | — | Load `lib/boot.lisp` bootstrap sequence without a pre-existing image (see §0 section 3); provides enough CL to run `SAVE-IMAGE` |
+| `--no-bootstrap` | — | Skip the standard bootstrap prelude and run with the raw evaluator/runtime state |
+| `--no-init` | — | Suppress `BLISS_INIT_FILE` and `~/.blissrc` init-file loading |
 | `--version` | — | Print version and exit |
 
-### 7.6.4  In-Image Defaults
+### 7.6.4  Init-File Discovery and Suppression
+
+Init-file discovery is part of configuration resolution for interactive
+use and is governed by R7.24:
+
+1. If `--no-init` is present, no init file is probed or loaded.
+2. Otherwise, if `BLISS_INIT_FILE` is set, its path is used.
+3. Otherwise, the runtime probes `~/.blissrc`.
+4. Init-file discovery only occurs when startup remains in interactive
+   mode; any explicit `--eval`, `--load`, or positional script path
+   suppresses it.
+
+If a selected init file cannot be read or evaluated, startup MUST fail
+with a diagnostic naming the path and the phase (`read` or `eval`) that
+failed.
+
+### 7.6.5  Bootstrap Prelude Defaults
+
+The standard bootstrap prelude is a startup-layer default rather than a
+user init file:
+
+- By default it loads for every CLI execution mode before init-file
+  processing and before any user `--eval`, `--load`, or positional
+  script payload (R7.25).
+- `--no-bootstrap` suppresses this load completely and does not fall
+  back to an ambient default (R7.26).
+- `--bootstrap` remains valid as an explicit compatibility spelling for
+  requesting startup in the prelude-backed bootstrap profile when no
+  saved image is used.
+
+### 7.6.6  In-Image Defaults
 
 At save time, the current configuration values are serialised into a
 dedicated Settings section (`section_type = Settings = 7` in the
@@ -716,6 +752,16 @@ The runtime chooses exactly one startup profile in the following order
 8. Fallback interactive REPL with no image if all image discovery
    mechanisms fail and stdin is a terminal.
 
+After the runtime selects a startup profile, it applies prelude and init
+loading in this order:
+
+1. Load the standard bootstrap prelude unless `--no-bootstrap` is set
+   (R7.25, R7.26).
+2. If the selected profile is interactive REPL and `--no-init` is not
+   set, perform init-file discovery per §7.6.3 (R7.24).
+3. Execute the explicit `--eval`, `--load`, or script payload if one was
+   selected.
+
 If multiple explicit execution modes are requested, argument parsing
 MUST fail before runtime initialisation with a diagnostic naming the
 conflicting flags.
@@ -734,6 +780,9 @@ Bootstrap mode MUST:
   neither location is valid.
 - Permit `(bliss:save-image ...)` once the bootstrap sequence has
   completed successfully.
+- Continue to load the standard bootstrap prelude unless
+  `--no-bootstrap` is set; `--no-bootstrap` selects the raw
+  no-prelude variant even when combined with `--load` or `--eval`.
 
 Bootstrap mode MUST NOT assume that any previously saved heap image,
 compiled code cache, or package registry exists.

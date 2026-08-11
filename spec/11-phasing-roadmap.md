@@ -23,15 +23,20 @@ Bootstrap     Core Runtime     Self-Hosting        Production
 **Goal:** A minimal Lisp that can read, evaluate, and print CL forms.
 
 **R11.01** Deliverables:
-- CL reader (`crates/bliss-compiler/src/reader.rs`) — full §4.1
-- Tree-walk interpreter (T0) — all 25 special operators
-- Object model — BlissVal, cons, symbols, strings, fixnums, floats
-- Nursery GC — bump-pointer TLAB allocation, stop-the-world minor GC
-- REPL — read-eval-print loop with basic error recovery
-- Minimal built-in functions: `CAR`, `CDR`, `CONS`, `EQ`, `+`, `-`,
-  `*`, `/`, `<`, `PRINT`, `READ`, `EVAL`, `APPLY`
+- The implementation MUST complete Stage 0 as defined in
+  `spec/stages.json` and §0.4 before this phase is considered done.
+- Scope is limited to the narrow vertical slice needed for the Stage 0
+  gate: core datatypes, read/print round-trip for those datatypes,
+  self-evaluating forms, `quote`, `if`, `progn`, and the primitive
+  functions named by the Stage 0 gate.
+- Supporting runtime work such as the object model, allocator, and REPL
+  loop MAY be broader internally, but Phase 0 is accepted only by the
+  Stage 0 gate, not by subsystem completeness claims.
 
-**Milestone criterion:** `(defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))` computes `(fib 30)` correctly.
+**Milestone criterion:** the Stage 0 gate passes through the real
+`bliss` binary: `bliss --eval "(+ 1 2)"` prints `3`, core datatypes
+round-trip read→print unchanged, and a short nested arithmetic/list
+script prints correct results.
 
 **Dependencies:** None (pure Rust).
 
@@ -41,19 +46,19 @@ Bootstrap     Core Runtime     Self-Hosting        Production
 writing the standard library in CL.
 
 **R11.02** Deliverables:
-- Full GC (nursery + old-gen concurrent marking) — §3
-- Thread pool + green thread scheduler — §2
-- Safepoint infrastructure — §2
-- FFI bridge (libffi integration) — §2
-- T1 baseline compiler — §4.4 (unoptimised native code)
-- Package system — §5.1
-- Condition system (bootstrap, Rust-backed) — §5.3
-- Basic streams (file-stream, string-stream) — §5.4
-- `LOAD` / `COMPILE-FILE` working for `.lisp` sources
-- `DEFMACRO`, `MACROLET`, backquote — §4.2
+- This phase aggregates Stage 1 and Stage 2 only after Stage 0 remains
+  passing.
+- Phase 1a is Stage 1: closures, recursion, non-local exits, and full
+  lambda-list behaviour sufficient for the Stage 1 gate.
+- Phase 1b is Stage 2: `defmacro`, backquote/unquote/splice,
+  `macroexpand[-1]`, and the standard control/binding macros sufficient
+  for the Stage 2 gate's real source-loading scenario.
+- Runtime, package, stream, GC, and compiler work MAY advance in
+  parallel, but no Phase 1 milestone may redefine acceptance more
+  broadly than the Stage 1 and Stage 2 gates.
 
-**Milestone criterion:** Bliss can `(load "lib/boot.lisp")` which
-defines ~200 stdlib functions in CL, and those functions work correctly.
+**Milestone criterion:** the Stage 1 gate and then the Stage 2 gate
+pass through the real `bliss` binary with no regression of Stage 0.
 
 **Dependencies:** Phase 0 complete.
 
@@ -63,21 +68,20 @@ defines ~200 stdlib functions in CL, and those functions work correctly.
 by T1, and produces T2-quality code.
 
 **R11.03** Deliverables:
-- Sea-of-nodes IR builder (CL) — §4.3
-- Optimisation passes (CL) — §4.5
-- Register allocator and code emitter (CL + Rust codegen backend) — §4.7
-- Inline caches — §4.8
-- Profiling counters and tier-promotion logic — §4.9
-- OSR and deoptimisation — §4.6
-- CLOS (full ANSI, partial MOP) — §5.2
-- FORMAT and pretty-printer — §5.6
-- Sequences and hash tables (CL fast paths) — §5.5
-- Image save/restore — §7
+- This phase aggregates Stage 3, Stage 4, and Stage 5 in order, while
+  preserving all earlier gates.
+- Phase 2a is Stage 3: data structures, sequence/library breadth,
+  `FORMAT`, pathnames, and package behaviour needed by the Stage 3 gate.
+- Phase 2b is Stage 4: conditions and CLOS needed by the Stage 4 gate.
+- Phase 2c is Stage 5: tiered execution, profiling, inline caches, OSR,
+  and deoptimisation needed by the Stage 5 gate.
+- Compiler self-hosting work, image save/restore, and bootstrap
+  refactoring MAY proceed within this phase only insofar as they do not
+  bypass or replace the stage gates as acceptance criteria.
 
-**Milestone criterion:** Bliss compiles its own compiler source with T2
-and the resulting code passes all existing tests. Self-compiled compiler
-produces identical output to cross-compiled version (bootstrap
-verification).
+**Milestone criterion:** the Stage 3, Stage 4, and Stage 5 gates pass
+in order through the real `bliss` binary with no regression of earlier
+stages.
 
 **Dependencies:** Phase 1 complete.
 
@@ -228,19 +232,17 @@ time with a clear diagnostic naming the missing dependency.
 **Goal:** ANSI-compliant, performant, embeddable, documented.
 
 **R11.04** Deliverables:
-- Pass `ansi-test` with zero unexpected failures — §10
-- `cl-bench` within 2× of SBCL on reference hardware — §10
-- Startup < 50 ms — G3
-- SLIME/SLY support — §6
-- `libbliss.so` with stable C-ABI — G8
-- Sandbox mode — §8
-- Full pathname system — §5.7
-- Gray streams — §5.4
-- SBCL-compatible extensions — §9
-- Documentation: user guide, embedding guide, internals guide
+- Stage 6 MUST pass first: real ASDF loading through the real loader,
+  followed by at least one real library call with a real result.
+- Once Stage 6 is stable, this phase hardens the implementation for
+  release: compliance, performance, embedding, tooling, sandboxing, and
+  documentation.
+- Production criteria MUST be interpreted as additions on top of the
+  completed stage ledger, not as substitutes for it.
 
-**Milestone criterion:** A non-trivial application (e.g., a web server
-using Hunchentoot or a subset) runs correctly on Bliss.
+**Milestone criterion:** the Stage 6 gate passes through the real
+`bliss` binary, earlier gates still pass, and the production-readiness
+targets in §10 and §7 are met.
 
 **Dependencies:** Phase 2 complete.
 
