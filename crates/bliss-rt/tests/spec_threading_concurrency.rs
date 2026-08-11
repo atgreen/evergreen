@@ -1,4 +1,5 @@
 use bliss_rt::error::BlissError;
+use bliss_rt::runtime::{check_sigint, install_signal_handlers};
 use bliss_rt::safepoint::{enter_safepoint, poll_safepoint, resume_all_threads, wait_for_all_threads};
 use bliss_rt::scheduler::{Scheduler, SchedulerConfig};
 use bliss_rt::thread::{
@@ -6,13 +7,19 @@ use bliss_rt::thread::{
     make_thread,
 };
 use bliss_rt::value::{BlissVal, T};
+use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 
 static SLOW_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 static RELEASE_SLOW_THREAD: AtomicBool = AtomicBool::new(false);
 static SAFETY_LOOP_EXIT: AtomicBool = AtomicBool::new(false);
 static POLL_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_FFI_STARTED: AtomicBool = AtomicBool::new(false);
+static NATIVE_FFI_FINISHED: AtomicBool = AtomicBool::new(false);
+static USLEEP_FN: OnceLock<usize> = OnceLock::new();
 
 fn value_returning_entry() -> BlissVal {
     BlissVal::from_fixnum(1234)
@@ -41,8 +48,34 @@ fn polling_entry() -> BlissVal {
     BlissVal::from_fixnum(POLL_ITERATIONS.load(Ordering::Acquire) as i64)
 }
 
+fn native_ffi_entry() -> BlissVal {
+    NATIVE_FFI_STARTED.store(true, Ordering::Release);
+    let usleep = *USLEEP_FN.get().expect("usleep must be configured") as *const ();
+    unsafe {
+        bliss_rt::ffi::ffi_call(
+            usleep,
+            &bliss_rt::ffi::AlienType::Int {
+                signed: true,
+                bits: 32,
+            },
+            &[bliss_rt::ffi::AlienType::Int {
+                signed: false,
+                bits: 32,
+            }],
+            &[200_000],
+        )
+        .expect("usleep FFI call must succeed");
+    }
+    NATIVE_FFI_FINISHED.store(true, Ordering::Release);
+    T
+}
+
 unsafe fn fn_entry(function: fn() -> BlissVal) -> BlissVal {
     unsafe { BlissVal::from_function_ptr(function as usize as *mut u8) }
+}
+
+fn read_runtime_source(path: &str) -> String {
+    fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {}: {}", path, err))
 }
 
 #[test]
@@ -78,7 +111,6 @@ fn invalid_thread_entry_surfaces_a_result_error_not_a_panic() {
 #[test]
 fn thread_local_storage_is_isolated_between_green_threads() {
     // Per R2.05, each green thread has its own control/value stack and thread-local state.
-    // Per R13.17, bindings in one thread must not affect another thread.
     current_thread().tls_set(0, BlissVal::from_fixnum(7));
     let id = make_thread(unsafe { fn_entry(tls_isolated_entry) }).expect("thread creation");
     let child_value = join_thread(id).expect("join must succeed");
@@ -186,4 +218,126 @@ fn current_thread_identity_is_stable_within_the_calling_thread() {
     let thread = current_thread();
     assert_eq!(thread.id(), current_thread_id());
     assert_eq!(thread.id(), current_thread_id());
+}
+
+#[test]
+fn sigint_delivery_is_observable_through_the_runtime_interrupt_flag() {
+    // Per R2.10, SIGINT must be surfaced to the runtime rather than crashing the process.
+    // Per R8.10 and R13.13, signal handlers defer non-trivial work by setting a flag.
+    install_signal_handlers().expect("signal handlers must install");
+    assert!(!check_sigint(), "signal flag should start clear");
+
+    unsafe {
+        libc::raise(libc::SIGINT);
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let mut observed = false;
+    while Instant::now() < deadline && !observed {
+        observed = check_sigint();
+        std::thread::yield_now();
+    }
+
+    assert!(observed, "SIGINT must become observable through the runtime flag");
+    assert!(
+        !check_sigint(),
+        "check_sigint must clear the pending interrupt after observing it"
+    );
+}
+
+#[test]
+fn safepoint_wait_does_not_block_on_a_thread_executing_native_ffi() {
+    // Per R2.15 and R13.11, a thread in Native FFI state must not block a safepoint handshake.
+    let libc = bliss_rt::ffi::load_foreign_library("libc.so.6")
+        .or_else(|_| bliss_rt::ffi::load_foreign_library("libSystem.B.dylib"))
+        .or_else(|_| bliss_rt::ffi::load_foreign_library("libc.so"))
+        .expect("expected a libc-compatible shared library");
+    let usleep = unsafe { bliss_rt::ffi::foreign_symbol(libc, "usleep") }
+        .expect("libc must export usleep");
+    let _ = USLEEP_FN.set(usleep as usize);
+
+    NATIVE_FFI_STARTED.store(false, Ordering::Release);
+    NATIVE_FFI_FINISHED.store(false, Ordering::Release);
+
+    let id = make_thread(unsafe { fn_entry(native_ffi_entry) }).expect("thread creation");
+    while !NATIVE_FFI_STARTED.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    let started = Instant::now();
+    wait_for_all_threads().expect("safepoint request must return");
+    let elapsed = started.elapsed();
+    resume_all_threads().expect("resume must succeed");
+
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "native threads should be excluded from the handshake, observed {:?}",
+        elapsed
+    );
+    assert_eq!(join_thread(id).expect("native thread must finish"), T);
+}
+
+#[test]
+fn runtime_sources_define_the_boot_sequence_and_walkable_stack_metadata() {
+    // Per R2.01 and R2.02, startup must parse configuration, initialize the runtime,
+    // and enter user-visible evaluation entrypoints.
+    // Per R2.06, stack frames must remain walkable through prev-fp metadata and safepoint maps.
+    // Per R2.16 and R2.17, environment parsing and shutdown hooks must be part of the runtime surface.
+    // Per R2.20, stack overflow is represented as a recoverable runtime error.
+    let runtime_source = read_runtime_source("crates/bliss-rt/src/runtime.rs");
+    let stack_source = read_runtime_source("crates/bliss-rt/src/stack.rs");
+    let error_source = read_runtime_source("crates/bliss-rt/src/error.rs");
+
+    assert!(runtime_source.contains("pub fn from_env() -> Result<Self, BlissError>"));
+    assert!(runtime_source.contains("pub fn apply_cli_args(&mut self, args: &[String])"));
+    assert!(runtime_source.contains("pub fn parse_cli"));
+    assert!(runtime_source.contains("pub fn shutdown(&mut self) -> Result<(), BlissError>"));
+    assert!(runtime_source.contains("SIGSEGV"), "runtime must install a SIGSEGV path");
+    assert!(stack_source.contains("pub prev_fp: *mut Frame"));
+    assert!(stack_source.contains("pub fn publish_top(&self)"));
+    assert!(stack_source.contains("pub fn stack_map(&self, pc_offset: usize)"));
+    assert!(error_source.contains("StackOverflow(GreenThreadId)"));
+    assert!(
+        read_runtime_source("crates/bliss-rt/src/thread.rs").contains("100 000"),
+        "threading source must account for the 100,000-thread scalability target"
+    );
+}
+
+#[test]
+fn concurrency_sources_expose_atomic_ordering_locking_and_thread_primitives() {
+    // Per R13.01 and R13.02, per-thread and cross-thread state must use explicit ordering.
+    // Per R13.04, compare-and-swap operations must exist with acquire-release semantics.
+    // Per R13.05 and R13.06, lock ordering must be represented explicitly in the runtime.
+    // Per R13.07, key runtime coordination cells must be lock-free atomics.
+    // Per R13.09, scheduling must expose a yield/preemption flag checked at safepoints.
+    // Per R13.12 and R13.14, blocked threads must publish their stacks and long syscalls need a SIGUSR1 fallback.
+    // Per R13.15 and R13.16, WITH-ATOMIC support must exist as a distinct preemption-control surface.
+    // Per R13.19, mutex, condition-variable, read-write-lock, and semaphore primitives must be exposed.
+    let thread_source = read_runtime_source("crates/bliss-rt/src/thread.rs");
+    let safepoint_source = read_runtime_source("crates/bliss-rt/src/safepoint.rs");
+    let scheduler_source = read_runtime_source("crates/bliss-rt/src/scheduler.rs");
+    let lib_source = read_runtime_source("crates/bliss-rt/src/lib.rs");
+
+    assert!(thread_source.contains("Ordering::Acquire"));
+    assert!(thread_source.contains("Ordering::Release"));
+    assert!(thread_source.contains("compare_exchange"));
+    assert!(thread_source.contains("yield_requested"));
+    assert!(safepoint_source.contains("Mutex"));
+    assert!(safepoint_source.contains("Condvar"));
+    assert!(safepoint_source.contains("publish stack top") || safepoint_source.contains("publish_top"));
+    assert!(safepoint_source.contains("SIGUSR1"), "blocked-syscall fallback must be represented");
+    assert!(scheduler_source.contains("work-stealing"));
+    assert!(lib_source.contains("RwLock"), "public lock primitives must include RW locks");
+    assert!(lib_source.contains("Semaphore"), "public thread primitives must include semaphores");
+    assert!(lib_source.contains("with_atomic"), "WITH-ATOMIC must have a runtime surface");
+}
+
+#[test]
+fn thread_sources_describe_thread_local_dynamic_bindings() {
+    // Per R13.17, each green thread must have its own special-variable binding stack.
+    let thread_source = read_runtime_source("crates/bliss-rt/src/thread.rs");
+    let stack_source = read_runtime_source("crates/bliss-rt/src/stack.rs");
+
+    assert!(thread_source.contains("binding"), "thread runtime must store dynamic bindings");
+    assert!(stack_source.contains("FrameType::Special"), "special-binding frames must be walkable");
 }

@@ -135,6 +135,7 @@ fn check_subprocess_allowed_denied() {
 
 #[test]
 fn sandbox_enforces_max_heap_bytes() {
+    // Per R8.06, allocation beyond the configured heap cap must be rejected.
     let p = SandboxPolicy {
         allow_filesystem: false,
         allow_network: false,
@@ -145,15 +146,15 @@ fn sandbox_enforces_max_heap_bytes() {
         allowed_paths: vec![],
     };
     let sb = Sandbox::new(p).unwrap();
-    let pol = sb.policy();
-    assert_eq!(pol.max_heap_bytes, 1024);
-    // The sandbox should enforce this limit; attempting to exceed it should fail.
-    // Since we can't directly allocate through sandbox, we verify the policy
-    // is stored and accessible so the runtime can enforce it.
+    assert!(sb.check_heap_alloc(512, 256).is_ok());
+    assert!(sb.check_heap_alloc(900, 124).is_ok());
+    assert!(sb.check_heap_alloc(900, 200).is_err());
 }
 
 #[test]
 fn sandbox_enforces_max_threads() {
+    // Per R8.20's thread-propagation rules, thread creation must be denied when the
+    // configured sandbox thread budget is exhausted.
     let p = SandboxPolicy {
         allow_filesystem: false,
         allow_network: false,
@@ -164,8 +165,9 @@ fn sandbox_enforces_max_threads() {
         allowed_paths: vec![],
     };
     let sb = Sandbox::new(p).unwrap();
-    let pol = sb.policy();
-    assert_eq!(pol.max_threads, 2);
+    assert!(sb.check_thread_create(0).is_ok());
+    assert!(sb.check_thread_create(1).is_ok());
+    assert!(sb.check_thread_create(2).is_err());
 }
 
 #[test]

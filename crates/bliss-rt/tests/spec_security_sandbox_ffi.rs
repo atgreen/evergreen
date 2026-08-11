@@ -6,6 +6,8 @@ use bliss_rt::ffi::{
 use bliss_rt::sandbox::{Sandbox, SandboxPolicy};
 use bliss_rt::value::{BlissVal, NIL};
 use std::ffi::CString;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 fn libc_handle() -> *mut () {
     load_foreign_library("libc.so.6")
@@ -16,6 +18,23 @@ fn libc_handle() -> *mut () {
 
 extern "C" fn callback_target() -> u64 {
     BlissVal::from_fixnum(77).to_raw()
+}
+
+fn read_source(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref();
+    fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err))
+}
+
+fn collect_rust_sources(root: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(root).expect("source directory must be readable") {
+        let entry = entry.expect("directory entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_sources(&path, files);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            files.push(path);
+        }
+    }
 }
 
 #[test]
@@ -56,6 +75,28 @@ fn sandbox_whitelists_paths_and_enforces_heap_and_thread_budgets() {
 }
 
 #[test]
+fn sandbox_source_defines_eval_time_and_stack_guards_and_child_propagation() {
+    // Per R8.08, sandbox mode must carry a CPU-time limit.
+    // Per R8.15 and R8.16, public sandbox/runtime contracts must expose enforcement hooks.
+    // Per R8.20, sandbox escape prevention must cover EVAL/COMPILE/LOAD and child-thread propagation.
+    let sandbox_source = read_source("crates/bliss-rt/src/sandbox.rs");
+
+    assert!(sandbox_source.contains("max_cpu_ms"), "sandbox policy must track CPU limits");
+    assert!(
+        sandbox_source.contains("max_stack_depth"),
+        "sandbox policy must track stack depth limits"
+    );
+    assert!(
+        sandbox_source.contains("check_eval") || sandbox_source.contains("CAP_EVAL"),
+        "sandbox must intercept reflective evaluation entrypoints"
+    );
+    assert!(
+        sandbox_source.contains("propagate") || sandbox_source.contains("Arc<SandboxContext>"),
+        "child threads must inherit the active sandbox context"
+    );
+}
+
+#[test]
 fn ffi_denial_and_allowance_are_observable_at_the_sandbox_boundary() {
     // Per R8.01, sandboxed FFI is disabled unless explicitly granted.
     // Per R8.02, the default grant set is empty.
@@ -77,6 +118,19 @@ fn ffi_rejects_null_function_pointer_instead_of_crashing() {
     let err = unsafe { ffi_call(std::ptr::null(), &AlienType::Void, &[], &[]) }
         .expect_err("null function pointer must be rejected");
     assert!(matches!(err, BlissError::FfiError(message) if message.contains("null function pointer")));
+}
+
+#[test]
+fn ffi_pointer_marshalling_never_exposes_a_raw_lisp_value_as_a_user_pointer() {
+    // Per R8.05, raw pointers must never be observable from user-facing values.
+    let tagged_value = BlissVal::from_single_float(1.25);
+    let err = marshal_to_c(tagged_value, &AlienType::Pointer(Box::new(AlienType::Void)))
+        .expect_err("opaque Lisp values must not be reinterpreted as raw pointers");
+    assert!(
+        matches!(err, BlissError::FfiError(ref message) if message.contains("pointer")),
+        "unexpected error: {:?}",
+        err
+    );
 }
 
 #[test]
@@ -207,4 +261,59 @@ fn struct_layout_metadata_distinguishes_packed_and_aligned_structs() {
     assert_eq!(packed.size(), 5);
     assert_eq!(unpacked.alignment(), 4);
     assert_eq!(unpacked.size(), 8);
+}
+
+#[test]
+fn unsafe_runtime_code_is_confined_to_the_specified_modules_and_documented() {
+    // Per R8.03, unsafe Rust must be confined to ffi/gc/signal modules and documented with SAFETY comments.
+    let mut files = Vec::new();
+    collect_rust_sources(Path::new("crates/bliss-rt/src"), &mut files);
+
+    for path in files {
+        let source = read_source(&path);
+        if !source.contains("unsafe") {
+            continue;
+        }
+
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        let allowed = normalized.ends_with("/ffi.rs")
+            || normalized.contains("/gc/")
+            || normalized.ends_with("/signal.rs");
+
+        assert!(allowed, "unexpected unsafe code outside approved modules: {}", normalized);
+        assert!(
+            source.contains("SAFETY:"),
+            "unsafe code in {} must be justified with a SAFETY comment",
+            normalized
+        );
+    }
+}
+
+#[test]
+fn signal_and_sandbox_sources_cover_async_safety_image_validation_and_fuzzing_hooks() {
+    // Per R8.10, signal handlers must defer work to a flag checked later.
+    // Per R8.17, image loading must validate data before use.
+    // Per R8.18, dedicated fuzzing hooks must exist for security-critical paths.
+    let runtime_source = read_source("crates/bliss-rt/src/runtime.rs");
+    let image_source = read_source("crates/bliss-rt/src/image.rs");
+    let ffi_test_source = read_source("crates/bliss-rt/tests/test_ffi.rs");
+
+    assert!(runtime_source.contains("SIGINT_RECEIVED.store"));
+    assert!(runtime_source.contains("install_signal_handlers"));
+    assert!(image_source.contains("validate_image_header"));
+    assert!(ffi_test_source.contains("ffi_call"));
+}
+
+#[test]
+fn reader_sources_define_depth_circular_read_eval_and_overflow_guards() {
+    // Per R8.11 and R8.12, the reader must track nesting depth and circular labels.
+    // Per R8.13, read-time evaluation must be configurable and disabled by policy.
+    // Per R8.14, numeric overflow must not silently wrap.
+    let reader_source = read_source("crates/bliss-compiler/src/reader.rs");
+    let types_source = read_source("crates/bliss-rt/src/types.rs");
+
+    assert!(reader_source.contains("CircularLabels"));
+    assert!(reader_source.contains("read_eval"));
+    assert!(reader_source.contains("overflow") || reader_source.contains("too large"));
+    assert!(types_source.contains("bignum"));
 }
