@@ -10,7 +10,7 @@
 //! are actually called at runtime.
 
 use bliss_rt::error::BlissError;
-use bliss_rt::value::{BlissVal, TAG_SYMBOL};
+use bliss_rt::value::{BlissVal, NIL, TAG_SYMBOL};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -24,6 +24,8 @@ use std::collections::HashMap;
 pub const SYMBOL_CONTINUE: u32 = 110;
 /// Symbol index for the MUFFLE-WARNING restart name.
 pub const SYMBOL_MUFFLE_WARNING: u32 = 111;
+const INTERNAL_CONTINUE_RESTART_FN: u32 = 112;
+const INTERNAL_MUFFLE_WARNING_RESTART_FN: u32 = 113;
 
 /// Symbol index for the CONDITION type (root of the condition hierarchy).
 pub const SYMBOL_CONDITION: u32 = 100;
@@ -98,6 +100,11 @@ pub fn clear_funcall_hook() {
 
 /// Call a function value with args, going through the hook if set.
 fn funcall(function: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
+    if function == BlissVal::from_symbol_index(INTERNAL_CONTINUE_RESTART_FN)
+        || function == BlissVal::from_symbol_index(INTERNAL_MUFFLE_WARNING_RESTART_FN)
+    {
+        return Ok(args.first().copied().unwrap_or(NIL));
+    }
     FUNCALL_HOOK.with(|h| {
         let borrow = h.borrow();
         if let Some(hook) = borrow.as_ref() {
@@ -355,7 +362,7 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
     let continue_name = BlissVal::from_symbol_index(SYMBOL_CONTINUE);
     let continue_restart = RestartEntry {
         name: continue_name,
-        function: BlissVal::from_fixnum(0), // identity / no-op function
+        function: BlissVal::from_symbol_index(INTERNAL_CONTINUE_RESTART_FN),
         report_function: None,
         interactive_function: None,
         test_function: None,
@@ -402,7 +409,7 @@ pub fn warn_condition(condition: BlissVal) -> Result<(), BlissError> {
     let muffle_name = BlissVal::from_symbol_index(SYMBOL_MUFFLE_WARNING);
     let muffle_restart = RestartEntry {
         name: muffle_name,
-        function: BlissVal::from_fixnum(0),
+        function: BlissVal::from_symbol_index(INTERNAL_MUFFLE_WARNING_RESTART_FN),
         report_function: None,
         interactive_function: None,
         test_function: None,

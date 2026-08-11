@@ -309,7 +309,11 @@ impl PackageRegistry {
         Ok(())
     }
 
-    fn ensure_package_uses(&mut self, package: BlissVal, use_list: &[&str]) -> Result<(), BlissError> {
+    fn ensure_package_uses(
+        &mut self,
+        package: BlissVal,
+        use_list: &[&str],
+    ) -> Result<(), BlissError> {
         let resolved = use_list
             .iter()
             .map(|name| {

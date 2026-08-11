@@ -387,7 +387,9 @@ impl Runtime {
         }
         if !config.no_image {
             let image_path = config.image_path.as_deref().ok_or_else(|| {
-                BlissError::InvalidImage("no image path configured; use --no-image to bootstrap".into())
+                BlissError::InvalidImage(
+                    "no image path configured; use --no-image to bootstrap".into(),
+                )
             })?;
             if !std::path::Path::new(image_path).is_file() {
                 return Err(BlissError::InvalidImage(format!(

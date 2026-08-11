@@ -220,6 +220,86 @@ fn eval_when_body_runs_as_implicit_progn() {
 }
 
 #[test]
+fn bootstrap_defvar_preserves_existing_binding_and_assert_signals() {
+    let keep = bliss()
+        .args(["--eval", "(progn (setq x 1) (defvar x 2) x)"])
+        .output()
+        .expect("run bliss --eval defvar");
+    assert_eq!(
+        keep.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&keep.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&keep.stdout).contains('1'),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&keep.stdout),
+        String::from_utf8_lossy(&keep.stderr)
+    );
+
+    let assert_fail = bliss()
+        .args(["--eval", "(let ((x 1)) (assert nil) x)"])
+        .output()
+        .expect("run bliss --eval assert");
+    assert_ne!(assert_fail.status.code(), Some(0), "assert should signal");
+}
+
+#[test]
+fn bootstrap_define_condition_and_do_symbols_have_real_effects() {
+    let define_condition = bliss()
+        .args([
+            "--eval",
+            "(progn
+               (define-condition foo (error) ())
+               (let ((seen nil))
+                 (handler-bind ((foo (lambda (c) (setq seen t))))
+                   (signal (make-condition 'foo)))
+                 seen))",
+        ])
+        .output()
+        .expect("run bliss --eval define-condition");
+    assert_eq!(
+        define_condition.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&define_condition.stdout),
+        String::from_utf8_lossy(&define_condition.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&define_condition.stdout)
+            .to_uppercase()
+            .contains('T'),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&define_condition.stdout),
+        String::from_utf8_lossy(&define_condition.stderr)
+    );
+
+    let do_symbols = bliss()
+        .args([
+            "--eval",
+            "(let ((seen nil)) (do-symbols (s) (setq seen t)) seen)",
+        ])
+        .output()
+        .expect("run bliss --eval do-symbols");
+    assert_eq!(
+        do_symbols.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&do_symbols.stdout),
+        String::from_utf8_lossy(&do_symbols.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&do_symbols.stdout)
+            .to_uppercase()
+            .contains('T'),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&do_symbols.stdout),
+        String::from_utf8_lossy(&do_symbols.stderr)
+    );
+}
+
+#[test]
 fn prelude_loads_unconditionally_and_no_bootstrap_opts_out() {
     // The prelude defines standard-CL forms (defvar/push/pop/...), so it must
     // load for every invocation WITHOUT any flag. --no-bootstrap opts out.

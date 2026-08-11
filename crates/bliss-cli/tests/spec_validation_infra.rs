@@ -154,8 +154,9 @@ fn regression_inputs_are_executable_through_standard_test_entrypoints() {
     // Per R10.16 and R10.34, minimized crash inputs must be checked in and
     // re-run by the normal cargo-test workflow rather than existing only as
     // inert repository artifacts.
-    let reader_regression = fs::read(repo_root().join("fuzz/regression/fuzz_reader/crash-min-001.lisp"))
-        .expect("reader regression input");
+    let reader_regression =
+        fs::read(repo_root().join("fuzz/regression/fuzz_reader/crash-min-001.lisp"))
+            .expect("reader regression input");
     let reader_source = String::from_utf8_lossy(&reader_regression);
     let _ = read_from_string(reader_source.as_ref());
 
@@ -165,8 +166,9 @@ fn regression_inputs_are_executable_through_standard_test_entrypoints() {
     let compile_source = String::from_utf8_lossy(&compile_regression);
     let _ = read_from_string(compile_source.as_ref());
 
-    let eval_regression = fs::read(repo_root().join("fuzz/regression/fuzz_eval/crash-min-001.lisp"))
-        .expect("eval regression input");
+    let eval_regression =
+        fs::read(repo_root().join("fuzz/regression/fuzz_eval/crash-min-001.lisp"))
+            .expect("eval regression input");
     let eval_source = String::from_utf8_lossy(&eval_regression);
     let _ = read_from_string(eval_source.as_ref());
 

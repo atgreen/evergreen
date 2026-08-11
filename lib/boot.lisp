@@ -17,11 +17,12 @@
 ;;; Global variable definitions
 ;;; ---------------------------------------------------------------------------
 
-;; No boundp check yet, so defvar behaves like defparameter for now: it always
-;; assigns. That is close enough for bootstrapping; a conforming defvar can
-;; replace this once boundp is available.
 (defmacro defvar (name &rest value)
-  `(setq ,name ,(if value (car value) nil)))
+  `(progn
+     (if (boundp ',name)
+         ,name
+         (setq ,name ,(if value (car value) nil)))
+     ',name))
 
 (defmacro defparameter (name &rest value)
   `(setq ,name ,(if value (car value) nil)))
@@ -70,17 +71,39 @@
 ;; declaim: declarations have no bearing on the tree-walking interpreter.
 (defmacro declaim (&rest ignore) nil)
 
-;; deftype: type definitions are not consulted by the interpreter yet.
-(defmacro deftype (&rest ignore) nil)
+;; Track bootstrap type aliases so TYPEP/CHECK-TYPE can consult them.
+(defvar *type-definitions* nil)
 
-;; define-condition: no condition class is created yet. Code that signals such
-;; a condition will fail at signal time, not load time — acceptable for now.
-(defmacro define-condition (&rest ignore) nil)
+(defmacro deftype (name lambda-list &rest body)
+  (declare (ignore lambda-list))
+  `(progn
+     (setq *type-definitions*
+           (cons (cons ',name ',(if body (car body) t))
+                 *type-definitions*))
+     ',name))
 
-;; check-type / assert / declaim-like checks: no type/assertion enforcement in
-;; the bootstrap evaluator yet, so these are no-ops.
-(defmacro check-type (&rest ignore) nil)
-(defmacro assert (&rest ignore) nil)
+;; Track condition supertypes so SIGNAL/HANDLER-BIND can do real type matching.
+(defvar *condition-types* nil)
+
+(defmacro define-condition (name parents slots &rest options)
+  (declare (ignore slots options))
+  `(progn
+     (setq *condition-types*
+           (cons (cons ',name ',(if parents parents '(condition)))
+                 *condition-types*))
+     ',name))
+
+(defmacro check-type (place typespec &rest ignore)
+  (declare (ignore ignore))
+  `(if (typep ,place ',typespec)
+       ,place
+       (error "CHECK-TYPE failed")))
+
+(defmacro assert (test-form &rest ignore)
+  (declare (ignore ignore))
+  `(if ,test-form
+       t
+       (error "ASSERT failed")))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Sequence / list helpers (Common Lisp, now that lambda lists bind properly)
@@ -151,8 +174,25 @@
          (and pkg-end (subseq name 0 pkg-end))))
       (t nil))))
 
-;; Symbol iteration macros: no external/present symbols are tracked, so the
-;; body never runs; the optional result form is not evaluated (defaults to nil).
-(defmacro do-external-symbols (&rest args) (declare (ignore args)) nil)
-(defmacro do-symbols (&rest args) (declare (ignore args)) nil)
-(defmacro do-all-symbols (&rest args) (declare (ignore args)) nil)
+(defmacro do-external-symbols (binding &rest body)
+  (let ((var (car binding))
+        (package (if (cdr binding) (car (cdr binding)) '*package*))
+        (result (if (cdr (cdr binding)) (car (cdr (cdr binding))) nil)))
+    `(dolist (,var (bliss-internal::package-symbols ,package nil) ,result)
+       ,@body)))
+
+(defmacro do-symbols (binding &rest body)
+  (let ((var (car binding))
+        (package (if (cdr binding) (car (cdr binding)) '*package*))
+        (result (if (cdr (cdr binding)) (car (cdr (cdr binding))) nil)))
+    `(dolist (,var (bliss-internal::package-symbols ,package t) ,result)
+       ,@body)))
+
+(defmacro do-all-symbols (binding &rest body)
+  (let ((var (car binding))
+        (result (if (cdr binding) (car (cdr binding)) nil))
+        (pkg (gensym)))
+    `(progn
+       (dolist (,pkg (list-all-packages) ,result)
+         (dolist (,var (bliss-internal::package-symbols ,pkg t))
+           ,@body)))))

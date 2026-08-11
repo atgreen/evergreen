@@ -583,6 +583,9 @@ impl Env {
         env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
         env.define_local("*LOAD-HOOKS*", NIL);
         env.define_local("*FEATURES*", NIL);
+        env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
+        env.define_local("*TYPE-DEFINITIONS*", NIL);
+        env.define_local("*CONDITION-TYPES*", NIL);
         env
     }
 
@@ -1100,7 +1103,9 @@ fn symbol_for_package(pkg_name: &str, bare_name: &str) -> Option<BlissVal> {
             bare_name.clone(),
         ]
     };
-    candidates.into_iter().find_map(|candidate| resolve_sym(&candidate))
+    candidates
+        .into_iter()
+        .find_map(|candidate| resolve_sym(&candidate))
 }
 
 fn intern_into_package(env: &mut Env, pkg_name: &str, bare_name: &str) -> BlissVal {
@@ -1154,12 +1159,14 @@ fn find_symbol_in_package(
 
 fn ensure_package_available(env: &mut Env, name: &str, uses: &[&str]) {
     let packages = Rc::make_mut(&mut env.packages);
-    packages.entry(name.to_string()).or_insert_with(|| PackageDef {
-        name: name.to_string(),
-        exports: Vec::new(),
-        uses: uses.iter().map(|pkg| (*pkg).to_string()).collect(),
-        symbols: HashMap::new(),
-    });
+    packages
+        .entry(name.to_string())
+        .or_insert_with(|| PackageDef {
+            name: name.to_string(),
+            exports: Vec::new(),
+            uses: uses.iter().map(|pkg| (*pkg).to_string()).collect(),
+            symbols: HashMap::new(),
+        });
     reader::register_package(name);
 }
 
@@ -1173,6 +1180,95 @@ fn ensure_bundled_asdf_bootstrap_bindings(env: &mut Env) {
     env.define_local("ASDF:*LAST-OPERATION-TIER*", arena_str("T1"));
 }
 
+fn plist_get(list: BlissVal, key: &str) -> Option<BlissVal> {
+    let mut cur = list;
+    while cur.is_cons() {
+        let (entry, rest) = cp(cur);
+        if entry.is_cons() {
+            let (entry_key, entry_vals) = cp(entry);
+            if symbol_bare_name(&val_as_str(entry_key)) == key {
+                return Some(cp(entry_vals).0);
+            }
+        }
+        cur = rest;
+    }
+    None
+}
+
+fn resolve_type_spec(env: &Env, type_spec: BlissVal) -> BlissVal {
+    if type_spec.is_symbol() {
+        let name = symbol_bare_name(&sym_name(type_spec));
+        if let Some(expanded) =
+            plist_get(env.lookup_var("*TYPE-DEFINITIONS*").unwrap_or(NIL), &name)
+        {
+            return expanded;
+        }
+    }
+    type_spec
+}
+
+fn condition_supertypes(env: &Env, type_name: &str) -> Vec<String> {
+    let mut supers = Vec::new();
+    let mut cur = plist_get(
+        env.lookup_var("*CONDITION-TYPES*").unwrap_or(NIL),
+        &symbol_bare_name(type_name),
+    );
+    while let Some(list) = cur {
+        for sup in list_to_vec(list) {
+            supers.push(symbol_bare_name(&val_as_str(sup)));
+        }
+        cur = None;
+    }
+    supers
+}
+
+fn condition_type_matches(env: &Env, signaled_type: &str, handler_type: &str) -> bool {
+    let signaled = symbol_bare_name(signaled_type);
+    let handler = symbol_bare_name(handler_type);
+    handler == "T"
+        || signaled == handler
+        || condition_supertypes(env, &signaled)
+            .iter()
+            .any(|sup| sup == &handler)
+}
+
+fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Vec<BlissVal> {
+    let package_name = normalize_package_name(package_name);
+    let mut seen = HashMap::<String, BlissVal>::new();
+    if matches!(package_name.as_str(), "COMMON-LISP" | "COMMON-LISP-USER") {
+        for idx in 0..4096u32 {
+            if let Some(name) = reader::symbol_name(idx) {
+                if !name.contains(':') {
+                    seen.entry(name.clone())
+                        .or_insert(BlissVal::from_symbol_index(idx));
+                }
+            }
+        }
+    } else if package_name == "KEYWORD" {
+        for idx in 0..4096u32 {
+            if let Some(name) = reader::symbol_name(idx) {
+                if name.starts_with(':') {
+                    seen.entry(name.clone())
+                        .or_insert(BlissVal::from_symbol_index(idx));
+                }
+            }
+        }
+    }
+    if let Some(pkg) = env.packages.get(&package_name) {
+        for (name, sym) in &pkg.symbols {
+            seen.entry(name.clone()).or_insert(*sym);
+        }
+        if include_inherited {
+            for used in &pkg.uses {
+                for sym in package_symbols(env, used, false) {
+                    seen.entry(val_as_str(sym)).or_insert(sym);
+                }
+            }
+        }
+    }
+    seen.into_values().collect()
+}
+
 fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
@@ -1183,8 +1279,7 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
     match read_eval_all_env(&contents, env) {
         Ok(result) => Ok(result),
         Err(BlissError::Internal(msg))
-            if is_bundled_asdf
-                && msg.contains("ASDF is not supported on your implementation") =>
+            if is_bundled_asdf && msg.contains("ASDF is not supported on your implementation") =>
         {
             Ok(T)
         }
@@ -1261,12 +1356,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         let name = sym_name(car);
 
         // Check for macro expansion first
-        if let Some(mdef) = env
-            .macros
-            .get(&name)
-            .cloned()
-            .or_else(|| name.rsplit(':').next().and_then(|bare| env.macros.get(bare).cloned()))
-        {
+        if let Some(mdef) = env.macros.get(&name).cloned().or_else(|| {
+            name.rsplit(':')
+                .next()
+                .and_then(|bare| env.macros.get(bare).cloned())
+        }) {
             let expanded = expand_macro(&mdef, cdr, env)?;
             return eval_form(expanded, env);
         }
@@ -1515,10 +1609,54 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 return Ok(if v.is_string() { T } else { NIL });
             }
+            "BOUNDP" => {
+                let (sf, _) = cp(cdr);
+                let sym = eval_form(sf, env)?;
+                let name = if sym.is_symbol() {
+                    sym_name(sym)
+                } else {
+                    val_as_str(sym)
+                };
+                return Ok(if env.lookup_var(&name).is_some() {
+                    T
+                } else {
+                    NIL
+                });
+            }
             "SYMBOLP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(if v.is_symbol() { T } else { NIL });
+            }
+            "TYPEP" => {
+                let (obj_form, r) = cp(cdr);
+                let (type_form, _) = cp(r);
+                let obj = eval_form(obj_form, env)?;
+                let raw_type_spec = eval_form(type_form, env)?;
+                let type_spec = resolve_type_spec(env, raw_type_spec);
+                let type_name = if type_spec.is_symbol() {
+                    symbol_bare_name(&sym_name(type_spec))
+                } else if type_spec.is_cons() {
+                    symbol_bare_name(&val_as_str(cp(type_spec).0))
+                } else {
+                    val_as_str(type_spec).to_uppercase()
+                };
+                let matches = match type_name.as_str() {
+                    "T" => true,
+                    "NIL" => obj.is_nil(),
+                    "ATOM" => !obj.is_cons(),
+                    "LIST" => obj.is_list(),
+                    "CONS" => obj.is_cons(),
+                    "SYMBOL" => obj.is_symbol(),
+                    "STRING" | "SIMPLE-STRING" | "BASE-STRING" => obj.is_string(),
+                    "NUMBER" => obj.is_fixnum() || obj.is_single_float(),
+                    "INTEGER" | "FIXNUM" => obj.is_fixnum(),
+                    "FLOAT" | "SINGLE-FLOAT" => obj.is_single_float(),
+                    "CHARACTER" => obj.is_character(),
+                    "CONDITION" | "ERROR" => obj.is_cons(),
+                    other => other == symbol_bare_name(&val_as_str(obj)),
+                };
+                return Ok(if matches { T } else { NIL });
             }
             "EQ" | "EQL" => {
                 let (af, r) = cp(cdr);
@@ -2257,11 +2395,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 // Signal runs handlers; if no handler catches, returns NIL
                 for handler in env.handlers.clone().iter().rev() {
-                    if handler.type_name == cond_type
-                        || handler.type_name == "CONDITION"
-                        || handler.type_name == "ERROR"
-                        || handler.type_name == "T"
-                    {
+                    if condition_type_matches(env, &cond_type, &handler.type_name) {
                         let hfn = handler.handler;
                         let _ = apply_function(hfn, &[cond], env);
                     }
@@ -2404,6 +2538,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .trim_start_matches(':')
                     .to_uppercase();
                 env.current_package = pkg_name;
+                env.define_local("*PACKAGE*", arena_str(&env.current_package));
                 return Ok(T);
             }
             "MAKE-PACKAGE" => {
@@ -2423,13 +2558,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Ok(NIL);
                 }
                 let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
-                return Ok(if env.packages.contains_key(&pkg_name)
-                    || matches!(pkg_name.as_str(), "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD")
-                {
-                    arena_str(&pkg_name)
-                } else {
-                    NIL
-                });
+                return Ok(
+                    if env.packages.contains_key(&pkg_name)
+                        || matches!(
+                            pkg_name.as_str(),
+                            "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
+                        )
+                    {
+                        arena_str(&pkg_name)
+                    } else {
+                        NIL
+                    },
+                );
             }
             "PACKAGE-NAME" => {
                 let args = list_to_vec(cdr);
@@ -2471,6 +2611,32 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     })
                     .unwrap_or_default();
                 return Ok(vec_to_list(&uses));
+            }
+            "LIST-ALL-PACKAGES" => {
+                let packages = env
+                    .packages
+                    .keys()
+                    .map(|name| arena_str(name))
+                    .collect::<Vec<_>>();
+                return Ok(vec_to_list(&packages));
+            }
+            "BLISS-INTERNAL::PACKAGE-SYMBOLS" | "BLISS-INTERNAL:PACKAGE-SYMBOLS" => {
+                let args = list_to_vec(cdr);
+                let package = if args.is_empty() {
+                    env.current_package.clone()
+                } else {
+                    normalize_package_name(&val_as_str(eval_form(args[0], env)?))
+                };
+                let include_inherited = if let Some(arg) = args.get(1) {
+                    !eval_form(*arg, env)?.is_nil()
+                } else {
+                    false
+                };
+                return Ok(vec_to_list(&package_symbols(
+                    env,
+                    &package,
+                    include_inherited,
+                )));
             }
             "USE-PACKAGE" => {
                 let args = list_to_vec(cdr);
@@ -2538,7 +2704,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     env.current_package.clone()
                 };
                 let sym = intern_into_package(env, &pkg_name, &name_str);
-                env.mv = vec![sym, if sym.is_symbol() { package_status_symbol("INTERNAL") } else { NIL }];
+                env.mv = vec![
+                    sym,
+                    if sym.is_symbol() {
+                        package_status_symbol("INTERNAL")
+                    } else {
+                        NIL
+                    },
+                ];
                 return Ok(sym);
             }
             "FIND-SYMBOL" => {
@@ -3374,8 +3547,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 };
                                 if of_name.strip_prefix("KEYWORD:").unwrap_or(&of_name) != "OF" {
                                     return Err(BlissError::Internal(
-                                        "LOOP :for ... :being :the :hash-keys expects :of"
-                                            .into(),
+                                        "LOOP :for ... :being :the :hash-keys expects :of".into(),
                                     ));
                                 }
                                 LoopBeingSource::HashKeys(p.read_form()?)
@@ -3389,8 +3561,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 };
                                 if of_name.strip_prefix("KEYWORD:").unwrap_or(&of_name) != "OF" {
                                     return Err(BlissError::Internal(
-                                        "LOOP :for ... :being :the :hash-values expects :of"
-                                            .into(),
+                                        "LOOP :for ... :being :the :hash-values expects :of".into(),
                                     ));
                                 }
                                 LoopBeingSource::HashValues(p.read_form()?)
@@ -3454,12 +3625,10 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             } else {
                                 format!("{:?}", eq)
                             };
-                            return Err(BlissError::Internal(
-                                format!(
-                                    "LOOP :for supports :in / :on / :across / :being / :from / = in the bootstrap (got {})",
-                                    found
-                                ),
-                            ));
+                            return Err(BlissError::Internal(format!(
+                                "LOOP :for supports :in / :on / :across / :being / :from / = in the bootstrap (got {})",
+                                found
+                            )));
                         }
                         let init = p.read_form()?;
                         let then = if p.at_kw("THEN") {
@@ -4511,7 +4680,10 @@ fn apply_function(
     Err(BlissError::Internal(format!("Cannot apply: {:?}", fn_val)))
 }
 
-#[expect(dead_code, reason = "legacy builtin dispatch is retained during evaluator consolidation")]
+#[expect(
+    dead_code,
+    reason = "legacy builtin dispatch is retained during evaluator consolidation"
+)]
 fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissVal, BlissError> {
     match name {
         "+" => {
