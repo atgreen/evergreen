@@ -144,16 +144,50 @@ fn swank_server_enforces_authentication_and_serves_eval_completion_and_thread_qu
     let threads = swank_rex("(swank:list-threads)", 9);
     conn2.write_all(threads.as_bytes()).expect("send thread query");
     let thread_reply = read_ascii_response(&mut conn2);
-    assert!(thread_reply.to_lowercase().contains("running"), "reply was: {thread_reply}");
+    assert!(thread_reply.contains("swank-conn-"), "reply was: {thread_reply}");
+    assert!(thread_reply.contains("connected"), "reply was: {thread_reply}");
+
+    let debug = swank_rex("(swank:debug-thread 9)", 10);
+    conn2.write_all(debug.as_bytes()).expect("send debug-thread");
+    let debug_reply = read_ascii_response(&mut conn2);
+    assert!(debug_reply.contains(":thread"), "reply was: {debug_reply}");
+
+    let info = swank_rex("(swank:connection-info)", 11);
+    conn1.write_all(info.as_bytes()).expect("send connection-info");
+    let info_reply = read_ascii_response(&mut conn1);
+    assert!(info_reply.contains(":connections"), "reply was: {info_reply}");
+    assert!(info_reply.contains("127.0.0.1"), "reply was: {info_reply}");
 
     stop_swank_server().expect("stop swank server");
 }
 
 #[test]
-fn bundled_asdf_artifact_is_present_for_require_and_output_translation_integration() {
-    // Per R6.45-R6.48, Bliss ships ASDF and an implementation-owned output cache integration.
-    let asdf = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lib/asdf.lisp");
-    let source = std::fs::read_to_string(&asdf).expect("read bundled asdf");
-    assert!(source.contains("(provide \"asdf\")"), "bundled ASDF should provide the asdf module");
-    assert!(source.to_lowercase().contains("asdf-output-translations"), "bundled ASDF should expose output translation support");
+fn bundled_asdf_require_path_is_observable_through_the_real_cli() {
+    // Per R6.45-R6.48, the acceptance gate must drive REQUIRE/ASDF behavior
+    // through the real CLI rather than grepping the bundled source file.
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = std::process::Command::new("cargo")
+        .args([
+            "run",
+            "-q",
+            "-p",
+            "bliss-cli",
+            "--",
+            "--eval",
+            "(require :asdf)\n(print bliss-ext:*asdf-output-translations*)\n(print asdf:*last-operation-tier*)",
+        ])
+        .current_dir(&repo_root)
+        .output()
+        .expect("run real bliss-cli require path");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    assert!(stdout.contains(".CACHE/BLISS/ASDF"), "stdout: {stdout}");
+    assert!(stdout.contains("T1"), "stdout: {stdout}");
 }

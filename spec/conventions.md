@@ -32,6 +32,28 @@ with ≥3 parallel fields.
 - Common Lisp: fenced with ```lisp
 - Assembly / pseudo-code: fenced with ```asm or ```text
 
+## Build stages
+
+Bliss is built in ordered **stages**, each a runnable vertical slice with an
+end-to-end **Gate** (see `spec/stages.json` and `~/git/bureau/bliss/problem.md`).
+A stage is done only when its Gate genuinely passes through the real `bliss`
+binary — never by stubbing the capability under test.
+
+Every requirement belongs to a stage:
+
+- **Inline tag (authoritative):** append `[Sn]` to a requirement's text to pin
+  it to stage `n`, e.g.
+  `| R4.20 | The reader MUST parse ratios [S0] | MUST |`. Use this when a spec
+  file spans stages (e.g. `04-compiler.md` mixes reader S0 and tiered S5).
+- **File default:** an untagged requirement inherits the stage of its spec file
+  from `stages.json`'s `files` map.
+- **Unstaged:** anything with neither is reported by `spec-coverage.py` but not
+  gated. Assign it a stage as soon as its slice is in scope.
+
+`scripts/spec-coverage.py --gate` only requires MUST requirements at or below
+`current_stage` to be covered, so work stays focused on one slice at a time.
+Advance `current_stage` by one only after that stage's Gate genuinely passes.
+
 ## Chapter structure template
 
 Each chapter file should follow:

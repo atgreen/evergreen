@@ -2,16 +2,25 @@
 //! See spec §6.
 
 use bliss_rt::error::BlissError;
+use bliss_rt::object::ConsCell;
 use bliss_rt::value::{
     BlissVal, EOF_BITS, MISSING_BITS, NIL, NIL_BITS, T, T_BITS, TAG_CHARACTER, TAG_CONS,
     TAG_FIXNUM, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK, TAG_SINGLE_FLOAT, TAG_SPECIAL, TAG_SYMBOL,
     UNBOUND_BITS,
 };
+use rustyline::completion::{Completer, FilenameCompleter, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::{CmdKind, Highlighter, MatchingBracketHighlighter};
+use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline::history::DefaultHistory;
+use rustyline::validate::{MatchingBracketValidator, ValidationContext, ValidationResult, Validator};
+use rustyline::{CompletionType, Config, Context, Editor, Helper};
 
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, BufRead, Read as IoRead, Write as IoWrite};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -149,6 +158,142 @@ fn history_max_size() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000)
+}
+
+struct ReplHelper {
+    highlighter: MatchingBracketHighlighter,
+    validator: MatchingBracketValidator,
+    hinter: HistoryHinter,
+    file_completer: FilenameCompleter,
+}
+
+impl ReplHelper {
+    fn new() -> Self {
+        Self {
+            highlighter: MatchingBracketHighlighter::new(),
+            validator: MatchingBracketValidator::new(),
+            hinter: HistoryHinter::new(),
+            file_completer: FilenameCompleter::new(),
+        }
+    }
+}
+
+impl Helper for ReplHelper {}
+
+impl Hinter for ReplHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<String> {
+        self.hinter.hint(line, pos, ctx)
+    }
+}
+
+impl Highlighter for ReplHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> std::borrow::Cow<'b, str> {
+        self.highlighter.highlight_prompt(prompt, default)
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        self.highlighter.highlight_hint(hint)
+    }
+
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
+        self.highlighter.highlight(line, pos)
+    }
+
+    fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
+        self.highlighter.highlight_char(line, pos, kind)
+    }
+}
+
+impl Validator for ReplHelper {
+    fn validate(&self, ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
+        self.validator.validate(ctx)
+    }
+
+    fn validate_while_typing(&self) -> bool {
+        self.validator.validate_while_typing()
+    }
+}
+
+impl Completer for ReplHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let prefix = &line[..pos];
+        if let Some((start, path_prefix)) = path_completion_span(prefix) {
+            return self.file_completer.complete(path_prefix, pos - start, ctx).map(
+                |(path_start, pairs)| (start + path_start, pairs),
+            );
+        }
+
+        let start = prefix
+            .rfind(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\''))
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let token = &prefix[start..];
+        let pairs = complete_symbol(token)
+            .into_iter()
+            .map(|candidate| Pair {
+                display: candidate.clone(),
+                replacement: candidate,
+            })
+            .collect();
+        Ok((start, pairs))
+    }
+}
+
+fn path_completion_span(prefix: &str) -> Option<(usize, &str)> {
+    let lower = prefix.to_ascii_lowercase();
+    for marker in ["(load ", "(require "] {
+        if let Some(idx) = lower.rfind(marker) {
+            let start = idx + marker.len();
+            let token = prefix[start..].trim_start_matches('"');
+            return Some((start + (prefix[start..].len() - token.len()), token));
+        }
+    }
+    None
+}
+
+fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
+    let cell = Box::leak(Box::new(ConsCell { car, cdr }));
+    unsafe { BlissVal::from_cons_ptr(cell as *mut ConsCell as *mut u8) }
+}
+
+fn values_to_list(values: &[BlissVal]) -> BlissVal {
+    let mut result = NIL;
+    for &value in values.iter().rev() {
+        result = alloc_cons(value, result);
+    }
+    result
+}
+
+fn expose_repl_history(interpreter: &mut bliss_compiler::tiered::Interpreter, state: &ReplState) {
+    let bindings = [
+        ("*", state.history_star[0]),
+        ("**", state.history_star[1]),
+        ("***", state.history_star[2]),
+        ("+", state.history_plus[0]),
+        ("++", state.history_plus[1]),
+        ("+++", state.history_plus[2]),
+        ("/", values_to_list(&state.history_slash[0])),
+        ("//", values_to_list(&state.history_slash[1])),
+        ("///", values_to_list(&state.history_slash[2])),
+    ];
+
+    for (name, value) in bindings {
+        let sym = BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol(name));
+        interpreter.define(sym, value);
+    }
 }
 
 /// Check if stdin is attached to a terminal (interactive).
@@ -404,42 +549,48 @@ pub fn repl_loop(state: &mut ReplState) -> Result<(), BlissError> {
         return Ok(());
     }
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let config = Config::builder()
+        .history_ignore_space(false)
+        .completion_type(CompletionType::List)
+        .build();
+    let mut editor = Editor::<ReplHelper, DefaultHistory>::with_config(config)
+        .map_err(|e| BlissError::Internal(format!("failed to initialize REPL editor: {e}")))?;
+    editor.set_helper(Some(ReplHelper::new()));
+    let history_path = history_file_path();
+    if Path::new(&history_path).exists() {
+        let _ = editor.load_history(&history_path);
+    }
     let mut interpreter = bliss_compiler::tiered::Interpreter::new();
 
     loop {
-        // Display prompt (R6.08)
         let prompt = state.prompt_string();
-        write!(stdout, "{}", prompt).unwrap_or(());
-        stdout.flush().unwrap_or(());
-
-        // Read input with multi-line support (R6.02)
         state.input_buffer.clear();
         loop {
-            let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) => {
-                    // EOF — save history and exit
-                    save_history_to_file(&state.command_history);
-                    return Ok(());
+            let prompt = if state.input_buffer.is_empty() {
+                prompt.as_str()
+            } else {
+                "  ... "
+            };
+            match editor.readline(prompt) {
+                Ok(line) => {
+                    if !state.input_buffer.is_empty() {
+                        state.input_buffer.push('\n');
+                    }
+                    state.input_buffer.push_str(&line);
+                    if brackets_balanced(&state.input_buffer) {
+                        break;
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("Read error: {}", e);
+                Err(ReadlineError::Interrupted) => {
+                    state.input_buffer.clear();
                     break;
                 }
-            }
-
-            state.input_buffer.push_str(&line);
-
-            // Check for balanced brackets (multi-line editing R6.02)
-            if brackets_balanced(&state.input_buffer) {
-                break;
-            } else {
-                // Continuation prompt
-                write!(stdout, "  ... ").unwrap_or(());
-                stdout.flush().unwrap_or(());
+                Err(ReadlineError::Eof) => {
+                    save_history_to_file(&state.command_history);
+                    let _ = editor.save_history(&history_path);
+                    return Ok(());
+                }
+                Err(e) => return Err(BlissError::Internal(format!("REPL input failed: {e}"))),
             }
         }
 
@@ -448,54 +599,35 @@ pub fn repl_loop(state: &mut ReplState) -> Result<(), BlissError> {
             continue;
         }
 
-        // Save to persistent history (R6.03)
         state.push_history(&trimmed);
+        let _ = editor.add_history_entry(trimmed.as_str());
+        expose_repl_history(&mut interpreter, state);
 
-        // Parse the input using the reader
         let form = match bliss_compiler::reader::read_from_string(&trimmed) {
             Ok((f, _pos)) => f,
             Err(e) => {
-                // R6.07: present error as a condition, not just eprintln
-                writeln!(stdout, "Reader error: {}", e).unwrap_or(());
-                stdout.flush().unwrap_or(());
+                println!("Reader error: {}", e);
                 continue;
             }
         };
 
-        // Evaluate the form with error handling (R6.07)
         match interpreter.eval(form) {
             Ok(value) => {
-                // Print result
-                writeln!(stdout, "{:?}", value).unwrap_or(());
-                stdout.flush().unwrap_or(());
-                // Update history
+                println!("{:?}", value);
                 state.rotate_history(form, &[value]);
             }
             Err(e) => {
-                // R6.07: Present condition and restarts
-                writeln!(stdout, "\nCondition: {}", e).unwrap_or(());
-                writeln!(stdout, "Available restarts:").unwrap_or(());
-                writeln!(stdout, "  0: [ABORT] Return to top level.").unwrap_or(());
-                writeln!(stdout, "  1: [CONTINUE] Continue with NIL.").unwrap_or(());
-                writeln!(stdout, "Select restart (0-1): ").unwrap_or(());
-                stdout.flush().unwrap_or(());
-
-                let mut restart_line = String::new();
-                let _ = stdin.lock().read_line(&mut restart_line);
-                let restart_choice = restart_line.trim();
-
-                match restart_choice {
-                    "1" => {
-                        // Continue with NIL
-                        writeln!(stdout, "NIL").unwrap_or(());
+                println!("\nCondition: {}", e);
+                println!("Available restarts:");
+                println!("  0: [ABORT] Return to top level.");
+                println!("  1: [CONTINUE] Continue with NIL.");
+                match editor.readline("Select restart (0-1): ") {
+                    Ok(choice) if choice.trim() == "1" => {
+                        println!("NIL");
                         state.rotate_history(form, &[NIL]);
                     }
-                    _ => {
-                        // Abort (default)
-                        state.rotate_history(form, &[]);
-                    }
+                    _ => state.rotate_history(form, &[]),
                 }
-                stdout.flush().unwrap_or(());
             }
         }
     }
@@ -1280,6 +1412,18 @@ fn watch_registry() -> &'static Mutex<HashMap<u64, BreakpointId>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn evaluate_watch_predicate(predicate: BlissVal, old_value: BlissVal, new_value: BlissVal) -> bool {
+    let mut interpreter = bliss_compiler::tiered::Interpreter::new();
+    let pred_sym = BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol("%WATCH-PREDICATE"));
+    let old_sym = BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol("%WATCH-OLD"));
+    let new_sym = BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol("%WATCH-NEW"));
+    interpreter.define(pred_sym, predicate);
+    interpreter.define(old_sym, old_value);
+    interpreter.define(new_sym, new_value);
+    let form = values_to_list(&[pred_sym, old_sym, new_sym]);
+    interpreter.eval(form).map(|v| v != NIL).unwrap_or(false)
+}
+
 /// Check a watchpoint (A6.04a). Called by the runtime when a watched variable
 /// is written. Returns true if the debugger should be entered.
 pub fn check_watchpoint(variable_name: BlissVal, old_value: BlissVal, new_value: BlissVal) -> bool {
@@ -1299,11 +1443,9 @@ pub fn check_watchpoint(variable_name: BlissVal, old_value: BlissVal, new_value:
                 }
                 // Check predicate
                 if let Some(pred) = target.predicate {
-                    if pred == NIL {
+                    if pred == NIL || !evaluate_watch_predicate(pred, old_value, new_value) {
                         return false;
                     }
-                    // In a full implementation, we'd funcall the predicate
-                    // with (old_value, new_value). For now, non-NIL predicate means always fire.
                 }
                 // Value actually changed?
                 if old_value != new_value {
@@ -2081,28 +2223,37 @@ pub fn disassemble(
     tier: Option<BlissVal>,
     _stream: BlissVal,
 ) -> Result<(), BlissError> {
-    let tier_label = match tier {
-        Some(t) if t == T => "T1",
-        Some(t) if t == NIL => "T0",
-        Some(_) => "default",
-        None => "highest",
-    };
-
     let mut out = String::new();
-    writeln!(
-        out,
-        "; disassembly for {:?} (type: {}, tier: {})",
-        function,
-        tag_type_name(function),
-        tier_label
-    )
-    .unwrap();
-
-    // Check if the function has compiled native code
     if function.is_function() {
-        let code_addr = (function.0 & !TAG_MASK) as usize;
-        if code_addr != 0 {
-            // Validate the address before reading (issue #8 / #11)
+        let meta = unsafe { &*((function.0 & !TAG_MASK) as *const bliss_compiler::tiered::FnMeta) };
+        let actual_tier = match meta.tier.load(Ordering::Acquire) {
+            1 => "T1",
+            2 => "T2",
+            _ => "T0",
+        };
+        let requested_tier = match tier {
+            Some(t) if t == NIL => "T0",
+            Some(t) if t == T => "T1",
+            Some(_) => "T2",
+            None => actual_tier,
+        };
+        if requested_tier != actual_tier && requested_tier != "T0" {
+            return Err(BlissError::Internal(format!(
+                "requested tier {requested_tier} is not available; current tier is {actual_tier}"
+            )));
+        }
+
+        writeln!(
+            out,
+            "; disassembly for {:?} (type: {}, tier: {})",
+            function,
+            tag_type_name(function),
+            actual_tier
+        )
+        .unwrap();
+
+        let code_addr = meta.entry.load(Ordering::Acquire) as usize;
+        if code_addr != 0 && actual_tier != "T0" {
             if !is_valid_code_address(code_addr) {
                 writeln!(
                     out,
@@ -2119,26 +2270,16 @@ pub fn disassemble(
                 return Ok(());
             }
 
-            writeln!(out, "; Code at {:#x} (tier: {}):", code_addr, tier_label).unwrap();
-            writeln!(out, "; Available tiers: [{}]", tier_label).unwrap();
+            writeln!(out, "; Code at {:#x} (tier: {}):", code_addr, actual_tier).unwrap();
+            writeln!(out, "; Available tiers: [{}]", actual_tier).unwrap();
+            writeln!(out, "; Source form: {:?}", meta.body).unwrap();
 
-            // Disassemble with source-location annotations (R6.30)
             let max_bytes = 128;
             writeln!(out, "; Raw code bytes (up to {} bytes):", max_bytes).unwrap();
 
-            // Source-location annotation: emit source markers at known offsets
-            let mut current_source: Option<String> = None;
-
             for i in 0..max_bytes {
-                // Check for source location annotation at this offset (R6.30)
-                // In a full implementation, we'd query the code-location map.
-                // Here we annotate at function entry and at 16-byte boundaries.
                 if i == 0 {
-                    let new_src = "; Source: function entry".to_string();
-                    if current_source.as_ref() != Some(&new_src) {
-                        writeln!(out, "{}", new_src).unwrap();
-                        current_source = Some(new_src);
-                    }
+                    writeln!(out, "; Source: function entry").unwrap();
                 }
 
                 if i % 16 == 0 {
@@ -2148,23 +2289,17 @@ pub fn disassemble(
                     write!(out, ";   {:#06x}: ", i).unwrap();
                 }
 
-                // Safe read with validation (issue #8)
                 let byte = safe_read_byte(code_addr + i);
                 write!(out, "{:02x} ", byte).unwrap();
             }
             writeln!(out).unwrap();
         } else {
-            // R6.32: notice for interpreted functions
-            writeln!(
-                out,
-                "; No native code available — function pointer is null."
-            )
-            .unwrap();
+            writeln!(out, "; This function has not been compiled to native code.").unwrap();
+            writeln!(out, "; Displayed tier: T0").unwrap();
             writeln!(out, "; This function has not been compiled to native code.").unwrap();
             writeln!(out, "; Use (COMPILE 'fn) to compile it first.").unwrap();
         }
     } else {
-        // R6.32: notice for non-function values
         writeln!(out, "; No native code available — not a compiled function.").unwrap();
         writeln!(
             out,
@@ -3046,6 +3181,88 @@ fn extract_swank_id(message: &str) -> Option<u64> {
     None
 }
 
+fn eval_all_forms(
+    source: &str,
+    interpreter: &mut bliss_compiler::tiered::Interpreter,
+) -> Result<BlissVal, BlissError> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut offset = 0usize;
+    let mut last = NIL;
+    while offset < chars.len() {
+        let remaining: String = chars[offset..].iter().collect();
+        let (form, consumed) = bliss_compiler::reader::read_from_string(&remaining)?;
+        if form == bliss_rt::value::EOF {
+            break;
+        }
+        last = interpreter.eval(form)?;
+        if consumed == 0 {
+            break;
+        }
+        offset += consumed;
+    }
+    Ok(last)
+}
+
+fn compile_swank_file(
+    path: &str,
+    interpreter: &mut bliss_compiler::tiered::Interpreter,
+) -> Result<String, BlissError> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| BlissError::FileError(format!("cannot read {path}: {e}")))?;
+    let result = eval_all_forms(&source, interpreter)?;
+    Ok(format!(
+        "(:compilation-result t :file \"{}\" :value {:?} :minimum-tier :t1)",
+        path, result
+    ))
+}
+
+fn swank_xref(query: &str) -> String {
+    let definitions = extract_swank_definitions(query);
+    if definitions.is_empty() {
+        "NIL".to_string()
+    } else {
+        format!("({})", definitions.join(" "))
+    }
+}
+
+fn swank_threads_payload() -> String {
+    let connections = swank_connections().lock().unwrap();
+    let mut rows = vec![format!(
+        "(\"{}\" \"main\" \"running\")",
+        thread_id_current()
+    )];
+    for (conn_id, conn) in connections.iter() {
+        let conn = conn.lock().unwrap();
+        rows.push(format!(
+            "(\"{}\" \"swank-conn-{}\" \"connected\")",
+            conn.thread_id, conn_id.0
+        ));
+    }
+    format!("((\"ID\" \"Name\" \"Status\") {})", rows.join(" "))
+}
+
+fn swank_connection_info() -> String {
+    let state = swank_state().lock().unwrap();
+    format!(
+        "(:pid {} :style :spawn :encoding \"utf-8\" :lisp-implementation (:type \"Bliss\" :name \"bliss\" :version \"{}\") :package (:name \"CL-USER\" :prompt \"CL-USER\") :connections {} :host \"{}\" :port {} :features (:bliss))",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION"),
+        state.conns,
+        state.host,
+        state.port
+    )
+}
+
+fn debug_thread_payload(full_message: &str) -> String {
+    let target = extract_swank_id(full_message).unwrap_or(0).to_string();
+    let threads = swank_threads_payload();
+    if threads.contains(&format!("\"{}\"", target)) {
+        format!("(:thread {} :status :ok)", target)
+    } else {
+        format!("(:thread {} :status :unknown)", target)
+    }
+}
+
 /// Handle a specific SWANK operation (R6.34).
 fn handle_swank_op(
     op: &str,
@@ -3089,7 +3306,14 @@ fn handle_swank_op(
 
         // R6.34: compile-file
         "swank:compile-file-for-emacs" => {
-            "t".to_string() // Compilation accepted
+            if let Some(path) = extract_swank_string_arg(full_message) {
+                match compile_swank_file(&path, interpreter) {
+                    Ok(result) => result,
+                    Err(e) => format!("\"Compilation error: {}\"", e),
+                }
+            } else {
+                "\"compile-file requires a path\"".to_string()
+            }
         }
 
         // R6.34: completions
@@ -3193,7 +3417,9 @@ fn handle_swank_op(
 
         // R6.34: xref (callers/callees)
         "swank:xref" => {
-            "NIL".to_string() // Cross-reference database not yet populated
+            extract_swank_string_arg(full_message)
+                .map(|query| swank_xref(&query))
+                .unwrap_or_else(|| "NIL".to_string())
         }
 
         // R6.34: apropos
@@ -3220,17 +3446,17 @@ fn handle_swank_op(
 
         // R6.38: thread-listing
         "swank:list-threads" => {
-            "((\"ID\" \"Name\" \"Status\") (\"1\" \"main\" \"running\"))".to_string()
+            swank_threads_payload()
         }
 
         // R6.38: thread debugging
         "swank:debug-thread" => {
-            "t".to_string()
+            debug_thread_payload(full_message)
         }
 
         // Connection info
         "swank:connection-info" => {
-            "(:pid 0 :style :spawn :lisp-implementation (:type \"Bliss\" :name \"bliss\" :version \"0.1.0\") :package (:name \"CL-USER\" :prompt \"CL-USER\") :features (:bliss))".to_string()
+            swank_connection_info()
         }
 
         // Default: return T

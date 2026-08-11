@@ -211,8 +211,8 @@ fn reader_readtable_entrypoints_store_and_copy_macro_dispatch_configuration() {
     );
     assert_eq!(
         get_dispatch_macro_character(copied, '%', 'X').unwrap(),
-        None,
-        "dispatch subtables should also be spec-covered when implemented"
+        Some(sub_handler),
+        "dispatch sub-character configuration must survive copy-readtable"
     );
 }
 

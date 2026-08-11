@@ -271,10 +271,21 @@ fn parse_sandbox_and_no_image_conflict_is_error() {
 }
 
 #[test]
-fn parse_no_init_and_bootstrap_conflict_is_error() {
-    // --no-init skips init, --bootstrap loads from lib/boot.lisp — conflicting intent
-    let result = CliArgs::parse(&args(&["--no-init", "--bootstrap"]));
-    assert!(result.is_err(), "--no-init + --bootstrap should conflict");
+fn parse_no_init_and_bootstrap_are_compatible() {
+    // The prelude now loads by default, so --bootstrap is a no-op and no longer
+    // conflicts with --no-init (which only governs the user init file).
+    let parsed = CliArgs::parse(&args(&["--no-init", "--bootstrap"]))
+        .expect("--no-init + --bootstrap should be accepted");
+    assert!(parsed.no_init);
+    assert!(parsed.bootstrap);
+}
+
+#[test]
+fn parse_no_bootstrap_flag() {
+    let parsed = CliArgs::parse(&args(&["--no-bootstrap"])).expect("--no-bootstrap should parse");
+    assert!(parsed.no_bootstrap);
+    let default = CliArgs::parse(&args(&["--eval", "(+ 1 2)"])).expect("parse");
+    assert!(!default.no_bootstrap, "prelude on by default");
 }
 
 #[test]

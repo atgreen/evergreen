@@ -125,15 +125,178 @@ fn no_image_eval_mode_supports_bootstrap_without_a_saved_image() {
 }
 
 #[test]
-fn bundled_asdf_can_be_loaded_via_the_real_cli_load_mode() {
-    // Per R6.45 and R6.47, Bliss MUST ship and integrate bundled ASDF support.
-    let asdf = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lib/asdf.lisp");
-    assert!(asdf.exists(), "bundled ASDF file missing at {}", asdf.display());
+fn bundled_asdf_is_reachable_via_require_with_output_translations_and_t1_metadata() {
+    // Per R6.45-R6.48, the real CLI must delegate REQUIRE to bundled ASDF,
+    // expose the implementation-owned output translation cache, and record
+    // the minimum T1 compilation tier for the bootstrap ASDF load path.
+    let output = bliss()
+        .args([
+            "--eval",
+            "(require :asdf)\n(print bliss-ext:*asdf-output-translations*)\n(print asdf:*last-operation-tier*)",
+        ])
+        .output()
+        .expect("run bliss --eval require asdf");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    assert!(stdout.contains(".CACHE/BLISS/ASDF"), "stdout: {stdout}");
+    assert!(stdout.contains("T1"), "stdout: {stdout}");
+}
+
+#[test]
+fn eval_when_body_runs_as_implicit_progn() {
+    // eval-when must execute its body in the bootstrap evaluator (situations
+    // are ignored); ASDF's top-level eval-when forms depend on this.
+    let dir = temp_dir("evalwhen");
+    let script = dir.join("ew.lisp");
+    write_file(
+        &script,
+        "(eval-when (:load-toplevel :compile-toplevel :execute) (print (+ 20 22)))\n",
+    );
 
     let output = bliss()
-        .args(["--load", asdf.to_str().expect("utf8 path")])
+        .args(["--load", script.to_str().expect("utf8 path")])
         .output()
-        .expect("run bliss --load lib/asdf.lisp");
+        .expect("run bliss --load eval-when");
 
-    assert_eq!(output.status.code(), Some(0), "stdout: {} stderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("42"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn prelude_loads_unconditionally_and_no_bootstrap_opts_out() {
+    // The prelude defines standard-CL forms (defvar/push/pop/...), so it must
+    // load for every invocation WITHOUT any flag. --no-bootstrap opts out.
+    let dir = temp_dir("bootstrap");
+    let script = dir.join("prelude.lisp");
+    write_file(
+        &script,
+        "(defvar *stack* nil)(push 1 *stack*)(push 2 *stack*)(print (pop *stack*))(print *stack*)\n",
+    );
+    let path = script.to_str().expect("utf8 path");
+
+    // No flag: prelude is present.
+    let plain = bliss()
+        .args(["--load", path])
+        .output()
+        .expect("run bliss --load");
+    assert_eq!(
+        plain.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(stdout.contains('2'), "expected popped value 2, stdout: {stdout}");
+    assert!(stdout.contains("(1)"), "expected remaining (1), stdout: {stdout}");
+
+    // --no-bootstrap: prelude absent, defvar is undefined -> failure.
+    let opted_out = bliss()
+        .args(["--no-bootstrap", "--load", path])
+        .output()
+        .expect("run bliss --no-bootstrap --load");
+    assert_ne!(
+        opted_out.status.code(),
+        Some(0),
+        "prelude must be absent under --no-bootstrap; stdout: {}",
+        String::from_utf8_lossy(&opted_out.stdout)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn extended_loop_supports_asdf_load_path_clauses() {
+    // The bootstrap LOOP must handle the clause mix ASDF's define-package
+    // machinery uses at load time: destructuring :for, :when/:else chains,
+    // :append :into named accumulators, and :finally (return ...).
+    let dir = temp_dir("loop");
+    let script = dir.join("loop.lisp");
+    write_file(
+        &script,
+        "(print (loop :for (kw . args) :in (list (list :a 1 2) (list :b 3))\n\
+           :when (eq kw :a) :append args :into as :else :append args :into bs\n\
+           :finally (return (list as bs))))\n",
+    );
+
+    let output = bliss()
+        .args(["--bootstrap", "--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run bliss loop");
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // as = (1 2), bs = (3)  ->  ((1 2) (3))
+    assert!(stdout.contains("((1 2) (3))"), "stdout: {stdout}");
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn lambda_lists_bind_optional_rest_and_key() {
+    // Functions must bind &optional (with defaults), &rest (as a proper list),
+    // and &key — required to run ASDF's own utility functions.
+    let dir = temp_dir("lambdalist");
+    let script = dir.join("ll.lisp");
+    write_file(
+        &script,
+        "(defun f (a &optional (b 10) &rest r) (list a b r))\n\
+         (print (f 1))\n\
+         (print (f 1 2 3 4))\n\
+         (defun g (&key (n 5 np)) (list n np))\n\
+         (print (g))\n\
+         (print (g :n 9))\n",
+    );
+
+    let output = bliss()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run bliss lambda-list");
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("(1 10 NIL)"), "f/1: {stdout}");
+    assert!(stdout.contains("(1 2 (3 4))"), "f/rest: {stdout}");
+    assert!(stdout.contains("(5 NIL)"), "g default: {stdout}");
+    assert!(stdout.contains("(9 T)"), "g key+supplied: {stdout}");
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn hash_tables_and_funcall_of_builtins_work() {
+    // Hash tables (make/setf-gethash/gethash + present-p) and funcall/mapcar of
+    // builtin functions are prerequisites for ASDF's package machinery.
+    let dir = temp_dir("htfc");
+    let script = dir.join("ht.lisp");
+    write_file(
+        &script,
+        "(defvar *h* (make-hash-table :test 'eql))\n\
+         (setf (gethash :a *h*) 1)\n\
+         (multiple-value-bind (v p) (gethash :a *h*) (print (list v p)))\n\
+         (print (funcall #'eql 3 3))\n\
+         (print (mapcar #'string '(a b)))\n",
+    );
+
+    let output = bliss()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run bliss ht");
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("(1 T)"), "gethash present-p: {stdout}");
+    assert!(stdout.contains('T'), "funcall eql: {stdout}");
+    assert!(stdout.contains("(\"A\" \"B\")"), "mapcar string: {stdout}");
+    fs::remove_dir_all(dir).ok();
 }

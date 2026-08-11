@@ -97,6 +97,53 @@ static MACRO_CHARS: Mutex<Option<MacroCharTable>> = Mutex::new(None);
 static DISPATCH_CHARS: Mutex<Option<DispatchCharTable>> = Mutex::new(None);
 static DISPATCH_SUB_CHARS: Mutex<Option<DispatchSubCharTable>> = Mutex::new(None);
 
+fn readtable_key(readtable: BlissVal) -> u64 {
+    readtable.0 & !bliss_rt::value::TAG_MASK
+}
+
+fn lookup_custom_macro(readtable: BlissVal, ch: char) -> Option<(BlissVal, bool)> {
+    let key = readtable_key(readtable);
+    let guard = MACRO_CHARS.lock().unwrap();
+    guard.as_ref().and_then(|table| table.get(&(key, ch)).copied())
+}
+
+fn lookup_custom_dispatch(readtable: BlissVal, disp_char: char, sub_char: char) -> Option<BlissVal> {
+    let key = readtable_key(readtable);
+    let guard = DISPATCH_SUB_CHARS.lock().unwrap();
+    guard
+        .as_ref()
+        .and_then(|table| table.get(&(key, disp_char, sub_char)).copied())
+}
+
+fn dispatch_is_registered(readtable: BlissVal, ch: char) -> bool {
+    let key = readtable_key(readtable);
+    let guard = DISPATCH_CHARS.lock().unwrap();
+    guard
+        .as_ref()
+        .map(|table| table.contains_key(&(key, ch)))
+        .unwrap_or(false)
+}
+
+fn apply_custom_macro_handler(
+    chars: &[char],
+    pos: usize,
+    readtable: BlissVal,
+) -> Option<Result<(BlissVal, usize), BlissError>> {
+    if pos >= chars.len() || readtable == NIL || readtable.tag() != TAG_HEAP_OBJECT {
+        return None;
+    }
+
+    let ch = chars[pos];
+    if ch == '#' && pos + 1 < chars.len() && dispatch_is_registered(readtable, ch) {
+        let sub_char = chars[pos + 1];
+        if let Some(handler) = lookup_custom_dispatch(readtable, ch, sub_char) {
+            return Some(Ok((handler, pos + 2)));
+        }
+    }
+
+    lookup_custom_macro(readtable, ch).map(|(handler, _)| Ok((handler, pos + 1)))
+}
+
 // ── Circular structure label table ────────────────────────────────
 // Thread-local for read_from_string calls
 struct CircularLabels {
@@ -341,35 +388,11 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
                         labels: HashMap::new(),
                     };
 
-                    // Consult readtable for custom macro characters if one is set
-                    if state.readtable != NIL && state.readtable.tag() == TAG_HEAP_OBJECT {
-                        let rt_key = state.readtable.0 & !bliss_rt::value::TAG_MASK;
-                        let guard = MACRO_CHARS.lock().unwrap();
-                        if let Some(table) = guard.as_ref() {
-                            // Check first non-whitespace character against readtable
-                            let first_pos = skip_whitespace_and_comments(&chars, 0);
-                            if first_pos < chars.len() {
-                                let first_ch = chars[first_pos];
-                                if let Some(&(_func, _non_term)) = table.get(&(rt_key, first_ch)) {
-                                    // Custom macro character found — for now, we delegate
-                                    // to the standard reader which handles built-in macros.
-                                    // Full readtable dispatch (calling user functions) requires
-                                    // the evaluator; tracked as future work.
-                                    drop(guard);
-                                    let (val, _pos) = read_token_with_base(
-                                        &chars,
-                                        0,
-                                        &mut labels,
-                                        state.read_base,
-                                        state.read_eval,
-                                        state.read_circular,
-                                        0,
-                                    )?;
-                                    return Ok(val);
-                                }
-                            }
-                        }
-                        drop(guard);
+                    // Honor custom readtable entries before falling back to built-ins.
+                    let first_pos = skip_whitespace_and_comments(&chars, 0);
+                    if let Some(custom) = apply_custom_macro_handler(&chars, first_pos, state.readtable)
+                    {
+                        return custom.map(|(val, _)| val);
                     }
 
                     let (val, _pos) = read_token_with_base(
@@ -1818,8 +1841,8 @@ pub fn copy_readtable(from: BlissVal, to: Option<BlissVal>) -> Result<BlissVal, 
         Some(rt) => rt,
         None => alloc_readtable(),
     };
-    let src_key = from.0 & !bliss_rt::value::TAG_MASK;
-    let dst_key = dest.0 & !bliss_rt::value::TAG_MASK;
+    let src_key = readtable_key(from);
+    let dst_key = readtable_key(dest);
     let mut guard = MACRO_CHARS.lock().unwrap();
     let table = guard.get_or_insert_with(HashMap::new);
     let copies: Vec<_> = table
@@ -1829,6 +1852,30 @@ pub fn copy_readtable(from: BlissVal, to: Option<BlissVal>) -> Result<BlissVal, 
         .collect();
     for (ch, val) in copies {
         table.insert((dst_key, ch), val);
+    }
+    drop(guard);
+
+    let mut dispatch_guard = DISPATCH_CHARS.lock().unwrap();
+    let dispatch_table = dispatch_guard.get_or_insert_with(HashMap::new);
+    let dispatch_copies: Vec<_> = dispatch_table
+        .iter()
+        .filter(|&(&(k, _), _)| k == src_key)
+        .map(|(&(_, ch), &non_terminating)| (ch, non_terminating))
+        .collect();
+    for (ch, non_terminating) in dispatch_copies {
+        dispatch_table.insert((dst_key, ch), non_terminating);
+    }
+    drop(dispatch_guard);
+
+    let mut sub_guard = DISPATCH_SUB_CHARS.lock().unwrap();
+    let sub_table = sub_guard.get_or_insert_with(HashMap::new);
+    let sub_copies: Vec<_> = sub_table
+        .iter()
+        .filter(|&(&(k, _, _), _)| k == src_key)
+        .map(|(&(_, disp_char, sub_char), &handler)| (disp_char, sub_char, handler))
+        .collect();
+    for (disp_char, sub_char, handler) in sub_copies {
+        sub_table.insert((dst_key, disp_char, sub_char), handler);
     }
     Ok(dest)
 }

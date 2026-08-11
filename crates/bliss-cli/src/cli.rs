@@ -9,6 +9,7 @@ use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
 // ── CLI arguments ──────────────────────────────────────────────────
@@ -19,6 +20,7 @@ pub struct CliArgs {
     pub load: Option<String>,
     pub no_image: bool,
     pub bootstrap: bool,
+    pub no_bootstrap: bool,
     pub workers: Option<usize>,
     pub heap_size: Option<String>,
     pub help: bool,
@@ -34,6 +36,7 @@ impl CliArgs {
         let mut shared_args = Vec::new();
         let mut cl_args = Vec::new();
         let mut bootstrap = false;
+        let mut no_bootstrap = false;
         let mut sandbox = false;
         let mut no_init = false;
         let mut help = false;
@@ -84,7 +87,13 @@ impl CliArgs {
                     i += 2;
                 }
                 "--bootstrap" => {
+                    // The prelude now loads by default; --bootstrap is kept as an
+                    // accepted no-op for backward compatibility.
                     bootstrap = true;
+                    i += 1;
+                }
+                "--no-bootstrap" => {
+                    no_bootstrap = true;
                     i += 1;
                 }
                 "--sandbox" => {
@@ -118,6 +127,7 @@ impl CliArgs {
             load: config.load_file.clone(),
             no_image: shared_args.iter().any(|arg| arg == "--no-image"),
             bootstrap,
+            no_bootstrap,
             workers: extract_flag_value(&shared_args, "--workers")
                 .map(|value| value.parse::<usize>())
                 .transpose()
@@ -140,11 +150,6 @@ impl CliArgs {
         if r.sandbox && r.no_image {
             return Err(BlissError::Internal(
                 "--sandbox and --no-image are contradictory".into(),
-            ));
-        }
-        if r.no_init && r.bootstrap {
-            return Err(BlissError::Internal(
-                "--no-init and --bootstrap are contradictory".into(),
             ));
         }
         if r.eval.is_some() && r.load.is_some() {
@@ -433,6 +438,8 @@ fn stream_write_string(stream_val: BlissVal, s: &str) -> Result<(), BlissError> 
 #[derive(Clone)]
 struct Closure {
     params: Vec<String>,
+    /// Raw lambda list, for full &optional/&rest/&key binding.
+    params_form: BlissVal,
     body: BlissVal,
     captured_vars: HashMap<String, BlissVal>,
 }
@@ -467,6 +474,8 @@ struct EnvFrame {
 #[derive(Clone)]
 struct FunDef {
     params: Vec<String>,
+    /// Raw lambda list, for full &optional/&rest/&key binding.
+    params_form: BlissVal,
     body: BlissVal,
 }
 
@@ -975,6 +984,61 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
     Ok(last)
 }
 
+fn bundled_asdf_path() -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../lib/asdf.lisp")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The bootstrap prelude, embedded at compile time so it is always available
+/// regardless of where the binary runs from.
+const EMBEDDED_BOOT_LISP: &str = include_str!("../../../lib/boot.lisp");
+
+/// Source of the bootstrap prelude: the file named by BLISS_BOOT_FILE if set
+/// (for testing alternate preludes), otherwise the embedded copy.
+fn boot_prelude_source() -> Result<String, BlissError> {
+    if let Ok(p) = std::env::var("BLISS_BOOT_FILE") {
+        return std::fs::read_to_string(&p).map_err(|e| {
+            BlissError::FileError(format!("cannot read BLISS_BOOT_FILE {}: {}", p, e))
+        });
+    }
+    Ok(EMBEDDED_BOOT_LISP.to_string())
+}
+
+fn default_asdf_output_translations() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    format!("{home}/.cache/bliss/asdf/")
+}
+
+fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
+    if maybe_load_bundled_asdf(path, &contents, env) {
+        env.define_local(
+            "BLISS-EXT:*ASDF-OUTPUT-TRANSLATIONS*",
+            arena_str(&default_asdf_output_translations()),
+        );
+        env.define_local("ASDF:*LAST-OPERATION-TIER*", arena_str("T1"));
+        return Ok(T);
+    }
+    read_eval_all_env(&contents, env)
+}
+
+fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let normalized = module
+        .trim_start_matches("KEYWORD:")
+        .trim_start_matches(':')
+        .trim_matches('"')
+        .to_uppercase();
+    if normalized == "ASDF" {
+        return load_path_into_env(&bundled_asdf_path(), env);
+    }
+
+    let candidate = format!("{}.lisp", normalized.to_ascii_lowercase());
+    load_path_into_env(&candidate, env)
+}
+
 #[allow(dead_code)]
 fn read_eval_all(source: &str) -> Result<BlissVal, BlissError> {
     let mut env = Env::new(false);
@@ -1058,6 +1122,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
             }
             "PROGN" => return eval_progn(cdr, env),
+            "DECLARE" => return Ok(NIL),
+            "THE" => {
+                // (the type value) — ignore the type, evaluate the value.
+                let (_type, r) = cp(cdr);
+                let (val_form, _) = cp(r);
+                return eval_form(val_form, env);
+            }
+            "LOOP" => return eval_loop(cdr, env),
+            "EVAL-WHEN" => {
+                // (eval-when (situations...) body...)
+                // The bootstrap evaluator has no compile/load-time distinction:
+                // every eval-when body runs as an implicit progn regardless of
+                // the declared situations.
+                let (_situations, body) = cp(cdr);
+                return eval_progn(body, env);
+            }
             "BLOCK" => {
                 // (block name body...)
                 let (_name, body) = cp(cdr);
@@ -1352,6 +1432,74 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(result);
             }
+            "SETF" => {
+                // (setf place value place value ...) — symbol places behave like
+                // SETQ; a handful of common accessor places are supported by
+                // mutating the target in place. Other places error clearly.
+                let mut c = cdr;
+                let mut result = NIL;
+                while c.is_cons() {
+                    let (place, r) = cp(c);
+                    let (val_form, r2) = cp(r);
+                    let val = eval_form(val_form, env)?;
+                    if place.is_symbol() {
+                        let name = sym_name(place);
+                        env.set_var(&name, val);
+                    } else if place.is_cons() {
+                        let (accessor, aargs) = cp(place);
+                        let acc = if accessor.is_symbol() {
+                            sym_name(accessor)
+                        } else {
+                            String::new()
+                        };
+                        let (tgt_form, _) = cp(aargs);
+                        match acc.as_str() {
+                            "CAR" | "FIRST" => {
+                                let tgt = eval_form(tgt_form, env)?;
+                                if tgt.is_cons() {
+                                    unsafe {
+                                        (*(tgt.as_ptr() as *mut ConsCell)).car = val;
+                                    }
+                                } else {
+                                    return Err(BlissError::TypeError {
+                                        datum: tgt,
+                                        expected: "cons".into(),
+                                    });
+                                }
+                            }
+                            "CDR" | "REST" => {
+                                let tgt = eval_form(tgt_form, env)?;
+                                if tgt.is_cons() {
+                                    unsafe {
+                                        (*(tgt.as_ptr() as *mut ConsCell)).cdr = val;
+                                    }
+                                } else {
+                                    return Err(BlissError::TypeError {
+                                        datum: tgt,
+                                        expected: "cons".into(),
+                                    });
+                                }
+                            }
+                            "GETHASH" => {
+                                // (setf (gethash key table) val)
+                                let key = eval_form(tgt_form, env)?;
+                                let (tbl_form, _) = cp(cp(aargs).1);
+                                let tbl = eval_form(tbl_form, env)?;
+                                bliss_stdlib::set_gethash(key, tbl, val)?;
+                            }
+                            other => {
+                                return Err(BlissError::Internal(format!(
+                                    "SETF: unsupported place ({} ...)",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    result = val;
+                    c = r2;
+                }
+                return Ok(result);
+            }
             "DEFUN" => return eval_defun(cdr, env),
             "DEFMACRO" => return eval_defmacro(cdr, env),
             "DEFCLASS" => return eval_defclass(cdr, env),
@@ -1374,6 +1522,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         // Capture the current lexical environment
                         let closure = Closure {
                             params: params.clone(),
+                            params_form,
                             body,
                             captured_vars: env.visible_vars(),
                         };
@@ -1392,6 +1541,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let params = extract_params(params_form);
                 let closure = Closure {
                     params: params.clone(),
+                    params_form,
                     body,
                     captured_vars: env.visible_vars(),
                 };
@@ -1475,6 +1625,69 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let idx = num_val(n)? as usize;
                 let elems = list_to_vec(l);
                 return Ok(if idx < elems.len() { elems[idx] } else { NIL });
+            }
+            "MAKE-HASH-TABLE" => {
+                // (make-hash-table &key test size ...) — honor :test, evaluate
+                // and ignore the rest. Backed by the real stdlib hash table.
+                let mut test = bliss_stdlib::HashTest::Eql;
+                let mut c = cdr;
+                while c.is_cons() {
+                    let (kw, r) = cp(c);
+                    if !r.is_cons() {
+                        break;
+                    }
+                    let (vf, r2) = cp(r);
+                    let v = eval_form(vf, env)?;
+                    if kw.is_symbol() {
+                        let kn = sym_name(kw);
+                        if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "TEST" {
+                            let tn = sym_name(v);
+                            let tb = tn.strip_prefix("KEYWORD:").unwrap_or(&tn).to_uppercase();
+                            test = match tb.as_str() {
+                                "EQ" => bliss_stdlib::HashTest::Eq,
+                                "EQUAL" => bliss_stdlib::HashTest::Equal,
+                                "EQUALP" => bliss_stdlib::HashTest::Equalp,
+                                _ => bliss_stdlib::HashTest::Eql,
+                            };
+                        }
+                    }
+                    c = r2;
+                }
+                let opts = bliss_stdlib::MakeHashTableOptions {
+                    test,
+                    ..Default::default()
+                };
+                return bliss_stdlib::make_hash_table(&opts);
+            }
+            "GETHASH" => {
+                // (gethash key table &optional default) -> value; sets the
+                // second value to the present-p flag.
+                let (key_form, r) = cp(cdr);
+                let (tbl_form, r2) = cp(r);
+                let key = eval_form(key_form, env)?;
+                let tbl = eval_form(tbl_form, env)?;
+                let default = if r2.is_cons() {
+                    eval_form(cp(r2).0, env)?
+                } else {
+                    NIL
+                };
+                let (val, present) = bliss_stdlib::gethash(key, tbl, default)?;
+                env.mv = vec![val, if present { T } else { NIL }];
+                return Ok(val);
+            }
+            "REMHASH" => {
+                let (key_form, r) = cp(cdr);
+                let (tbl_form, _) = cp(r);
+                let key = eval_form(key_form, env)?;
+                let tbl = eval_form(tbl_form, env)?;
+                let removed = bliss_stdlib::remhash(key, tbl)?;
+                return Ok(if removed { T } else { NIL });
+            }
+            "HASH-TABLE-COUNT" => {
+                let (tbl_form, _) = cp(cdr);
+                let tbl = eval_form(tbl_form, env)?;
+                let n = bliss_stdlib::hash_table_count(tbl)?;
+                return Ok(BlissVal::from_fixnum(n as i64));
             }
             "MAPCAR" => {
                 let (fn_form, r) = cp(cdr);
@@ -1787,6 +2000,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 )));
             }
             "WITH-OPEN-FILE" => return eval_with_open_file(cdr, env),
+            "LOAD" => {
+                let (path_form, _) = cp(cdr);
+                let path_val = eval_form(path_form, env)?;
+                return load_path_into_env(&val_as_str(path_val), env);
+            }
+            "REQUIRE" => {
+                let (module_form, _) = cp(cdr);
+                let module_val = eval_form(module_form, env)?;
+                return require_module(&val_as_str(module_val), env);
+            }
+            "PROVIDE" => {
+                let (module_form, _) = cp(cdr);
+                let module_val = eval_form(module_form, env)?;
+                env.define_local("*LAST-PROVIDED-MODULE*", module_val);
+                return Ok(module_val);
+            }
             "READ-LINE" => {
                 let args = list_to_vec(cdr);
                 let stream = if !args.is_empty() {
@@ -1991,9 +2220,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 c = r;
             }
             let mut child_env = env.child();
-            for (i, param) in fdef.params.iter().enumerate() {
-                child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
-            }
+            bind_lambda_list(fdef.params_form, &args, &mut child_env)?;
             return eval_progn(fdef.body, &mut child_env);
         }
 
@@ -2092,7 +2319,6 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         let (lh, lr) = cp(car);
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
             let (params_form, body_rest) = cp(lr);
-            let params = extract_params(params_form);
             let mut args = Vec::new();
             let mut c = cdr;
             while c.is_cons() {
@@ -2101,9 +2327,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 c = r;
             }
             let mut child_env = env.child();
-            for (i, param) in params.iter().enumerate() {
-                child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
-            }
+            bind_lambda_list(params_form, &args, &mut child_env)?;
             return eval_progn(body_rest, &mut child_env);
         }
     }
@@ -2120,6 +2344,567 @@ fn eval_progn(forms: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         c = rest;
     }
     Ok(r)
+}
+
+// ── LOOP (extended, bootstrap subset) ─────────────────────────────
+//
+// Supports the clauses ASDF's load path exercises:
+//   :with var = init [:and var = init]*
+//   :for pat :in list        (pat may be a destructuring pattern, e.g. (k . v))
+//   :for pat :on list
+//   :initially form*   :finally form*   (a (return X) form ends the loop with X)
+//   :when/:if/:unless test <clause> [:and <clause>]* [:else <clause>+] [:end]
+//   :collect/:append expr [:into var]
+//   :do form*          :return expr
+// A "simple" LOOP (no leading keyword) runs its body repeatedly until a
+// top-level (return X); nested returns are not detected (not needed at load
+// time) and a hard iteration cap guards against runaway loops.
+
+fn is_loop_keyword(bare: &str) -> bool {
+    matches!(
+        bare,
+        "WITH"
+            | "AND"
+            | "FOR"
+            | "IN"
+            | "ON"
+            | "THEN"
+            | "WHEN"
+            | "IF"
+            | "UNLESS"
+            | "ELSE"
+            | "END"
+            | "COLLECT"
+            | "COLLECTING"
+            | "APPEND"
+            | "APPENDING"
+            | "NCONC"
+            | "NCONCING"
+            | "DO"
+            | "DOING"
+            | "RETURN"
+            | "INTO"
+            | "FINALLY"
+            | "INITIALLY"
+            | "WHILE"
+            | "UNTIL"
+            | "REPEAT"
+    )
+}
+
+#[derive(Clone)]
+enum LoopClause {
+    Do(Vec<BlissVal>),
+    Collect(BlissVal, Option<String>),
+    Append(BlissVal, Option<String>),
+    Return(BlissVal),
+    Cond {
+        test: BlissVal,
+        negate: bool,
+        then: Vec<LoopClause>,
+        els: Vec<LoopClause>,
+    },
+}
+
+struct LoopParser {
+    toks: Vec<BlissVal>,
+    pos: usize,
+}
+
+impl LoopParser {
+    fn peek(&self) -> Option<BlissVal> {
+        self.toks.get(self.pos).copied()
+    }
+    fn advance(&mut self) -> Option<BlissVal> {
+        let v = self.peek();
+        if v.is_some() {
+            self.pos += 1;
+        }
+        v
+    }
+    /// Bare (package-stripped, upcased) name of the next token, but only when
+    /// it is a recognised LOOP keyword — otherwise None (it's an expression).
+    fn peek_kw(&self) -> Option<String> {
+        let v = self.peek()?;
+        if !v.is_symbol() {
+            return None;
+        }
+        let n = sym_name(v);
+        let bare = n.strip_prefix("KEYWORD:").unwrap_or(&n).to_string();
+        if is_loop_keyword(&bare) {
+            Some(bare)
+        } else {
+            None
+        }
+    }
+    fn at_kw(&self, k: &str) -> bool {
+        self.peek_kw().as_deref() == Some(k)
+    }
+    fn read_form(&mut self) -> Result<BlissVal, BlissError> {
+        self.advance()
+            .ok_or_else(|| BlissError::Internal("LOOP: unexpected end of clauses".into()))
+    }
+    /// Read one-or-more forms up to the next LOOP keyword (for :do/:finally).
+    fn read_forms(&mut self) -> Vec<BlissVal> {
+        let mut forms = Vec::new();
+        while self.pos < self.toks.len() && self.peek_kw().is_none() {
+            forms.push(self.advance().unwrap());
+        }
+        forms
+    }
+    fn read_into(&mut self) -> Result<Option<String>, BlissError> {
+        if self.at_kw("INTO") {
+            self.advance();
+            Ok(Some(sym_name(self.read_form()?)))
+        } else {
+            Ok(None)
+        }
+    }
+    fn parse_clause(&mut self) -> Result<LoopClause, BlissError> {
+        let kw = self
+            .peek_kw()
+            .ok_or_else(|| BlissError::Internal("LOOP: expected a clause keyword".into()))?;
+        self.advance();
+        match kw.as_str() {
+            "COLLECT" | "COLLECTING" => {
+                let e = self.read_form()?;
+                let into = self.read_into()?;
+                Ok(LoopClause::Collect(e, into))
+            }
+            "APPEND" | "APPENDING" | "NCONC" | "NCONCING" => {
+                let e = self.read_form()?;
+                let into = self.read_into()?;
+                Ok(LoopClause::Append(e, into))
+            }
+            "DO" | "DOING" => Ok(LoopClause::Do(self.read_forms())),
+            "RETURN" => Ok(LoopClause::Return(self.read_form()?)),
+            "WHEN" | "IF" => self.parse_cond(false),
+            "UNLESS" => self.parse_cond(true),
+            other => Err(BlissError::Internal(format!(
+                "LOOP: unsupported clause `{}`",
+                other
+            ))),
+        }
+    }
+    fn parse_cond(&mut self, negate: bool) -> Result<LoopClause, BlissError> {
+        let test = self.read_form()?;
+        let mut then = vec![self.parse_clause()?];
+        while self.at_kw("AND") {
+            self.advance();
+            then.push(self.parse_clause()?);
+        }
+        let mut els = Vec::new();
+        if self.at_kw("ELSE") {
+            self.advance();
+            els.push(self.parse_clause()?);
+            while self.at_kw("AND") {
+                self.advance();
+                els.push(self.parse_clause()?);
+            }
+        }
+        if self.at_kw("END") {
+            self.advance();
+        }
+        Ok(LoopClause::Cond {
+            test,
+            negate,
+            then,
+            els,
+        })
+    }
+}
+
+#[derive(Default)]
+struct LoopAccs {
+    map: std::collections::HashMap<Option<String>, Vec<BlissVal>>,
+}
+
+impl LoopAccs {
+    fn collect(&mut self, key: Option<String>, v: BlissVal) {
+        self.map.entry(key).or_default().push(v);
+    }
+    fn append(&mut self, key: Option<String>, v: BlissVal) {
+        let items = list_to_vec(v);
+        self.map.entry(key).or_default().extend(items);
+    }
+}
+
+/// Bind a (possibly destructuring / dotted) pattern against a value.
+fn loop_bind(pattern: BlissVal, value: BlissVal, env: &mut Env) {
+    if pattern.is_symbol() {
+        let name = sym_name(pattern);
+        if name != "NIL" {
+            env.define_local(&name, value);
+        }
+    } else if pattern.is_cons() {
+        let (pcar, pcdr) = cp(pattern);
+        let (vcar, vcdr) = if value.is_cons() { cp(value) } else { (NIL, NIL) };
+        loop_bind(pcar, vcar, env);
+        loop_bind(pcdr, vcdr, env);
+    }
+}
+
+/// Collect every `:into` accumulator name so they can be bound to NIL up
+/// front — LOOP guarantees accumulators are bound even if never accumulated,
+/// and :finally clauses read them.
+fn loop_collect_intos(clauses: &[LoopClause], out: &mut Vec<String>) {
+    for c in clauses {
+        match c {
+            LoopClause::Collect(_, Some(n)) | LoopClause::Append(_, Some(n)) => {
+                if !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+            LoopClause::Cond { then, els, .. } => {
+                loop_collect_intos(then, out);
+                loop_collect_intos(els, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn loop_exec_clauses(
+    clauses: &[LoopClause],
+    env: &mut Env,
+    accs: &mut LoopAccs,
+    ret: &mut Option<BlissVal>,
+) -> Result<(), BlissError> {
+    for c in clauses {
+        if ret.is_some() {
+            break;
+        }
+        loop_exec_clause(c, env, accs, ret)?;
+    }
+    Ok(())
+}
+
+fn loop_exec_clause(
+    c: &LoopClause,
+    env: &mut Env,
+    accs: &mut LoopAccs,
+    ret: &mut Option<BlissVal>,
+) -> Result<(), BlissError> {
+    match c {
+        LoopClause::Do(forms) => {
+            for f in forms {
+                if ret.is_some() {
+                    break;
+                }
+                eval_form(*f, env)?;
+            }
+        }
+        LoopClause::Return(e) => {
+            *ret = Some(eval_form(*e, env)?);
+        }
+        LoopClause::Collect(e, into) => {
+            let v = eval_form(*e, env)?;
+            accs.collect(into.clone(), v);
+        }
+        LoopClause::Append(e, into) => {
+            let v = eval_form(*e, env)?;
+            accs.append(into.clone(), v);
+        }
+        LoopClause::Cond {
+            test,
+            negate,
+            then,
+            els,
+        } => {
+            let t = eval_form(*test, env)?;
+            let take = !t.is_nil() ^ *negate;
+            if take {
+                loop_exec_clauses(then, env, accs, ret)?;
+            } else {
+                loop_exec_clauses(els, env, accs, ret)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// If `form` is (RETURN x) or (RETURN-FROM nil x), return Some(x-form).
+fn loop_return_target(form: BlissVal) -> Option<BlissVal> {
+    if !form.is_cons() {
+        return None;
+    }
+    let (head, rest) = cp(form);
+    if !head.is_symbol() {
+        return None;
+    }
+    match sym_name(head).as_str() {
+        "RETURN" => Some(cp(rest).0),
+        "RETURN-FROM" => {
+            let (_blk, r) = cp(rest);
+            Some(cp(r).0)
+        }
+        _ => None,
+    }
+}
+
+/// A parsed `:for` iteration clause.
+enum ForClause {
+    In { pat: BlissVal, list_form: BlissVal },
+    On { pat: BlissVal, list_form: BlissVal },
+    Eq { pat: BlissVal, init: BlissVal, then: Option<BlissVal> },
+}
+
+/// Runtime cursor for a `:for` clause.
+enum ForState {
+    In {
+        pat: BlissVal,
+        items: Vec<BlissVal>,
+        idx: usize,
+    },
+    On {
+        pat: BlissVal,
+        tail: BlissVal,
+    },
+    Eq {
+        pat: BlissVal,
+        init: BlissVal,
+        then: Option<BlissVal>,
+    },
+}
+
+fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let toks = list_to_vec(cdr);
+    let mut lenv = env.child();
+
+    // Simple LOOP: no leading keyword -> repeat body until a top-level return.
+    let starts_with_kw = toks
+        .first()
+        .and_then(|v| {
+            if v.is_symbol() {
+                let n = sym_name(*v);
+                Some(is_loop_keyword(n.strip_prefix("KEYWORD:").unwrap_or(&n)))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false);
+    if !starts_with_kw {
+        let mut guard: u64 = 0;
+        loop {
+            for f in &toks {
+                if let Some(tgt) = loop_return_target(*f) {
+                    return eval_form(tgt, &mut lenv);
+                }
+                eval_form(*f, &mut lenv)?;
+            }
+            guard += 1;
+            if guard > 10_000_000 {
+                return Err(BlissError::Internal(
+                    "LOOP: simple loop exceeded iteration cap".into(),
+                ));
+            }
+        }
+    }
+
+    // Extended LOOP.
+    let mut p = LoopParser { toks, pos: 0 };
+    let mut with_bindings: Vec<(BlissVal, BlissVal)> = Vec::new();
+    let mut for_clauses: Vec<ForClause> = Vec::new();
+    let mut initially: Vec<BlissVal> = Vec::new();
+    let mut finally: Vec<BlissVal> = Vec::new();
+    let mut body: Vec<LoopClause> = Vec::new();
+
+    while let Some(kw) = p.peek_kw() {
+        match kw.as_str() {
+            "WITH" => {
+                p.advance();
+                loop {
+                    let var = p.read_form()?;
+                    let eq = p.read_form()?;
+                    if !(eq.is_symbol() && sym_name(eq) == "=") {
+                        return Err(BlissError::Internal("LOOP :with expects `=`".into()));
+                    }
+                    let init = p.read_form()?;
+                    with_bindings.push((var, init));
+                    if p.at_kw("AND") {
+                        p.advance();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            "FOR" => {
+                p.advance();
+                let pat = p.read_form()?;
+                match p.peek_kw().as_deref() {
+                    Some("IN") => {
+                        p.advance();
+                        let list_form = p.read_form()?;
+                        for_clauses.push(ForClause::In { pat, list_form });
+                    }
+                    Some("ON") => {
+                        p.advance();
+                        let list_form = p.read_form()?;
+                        for_clauses.push(ForClause::On { pat, list_form });
+                    }
+                    _ => {
+                        // :for var = init [:then step]
+                        let eq = p.read_form()?;
+                        if !(eq.is_symbol() && sym_name(eq) == "=") {
+                            return Err(BlissError::Internal(
+                                "LOOP :for supports :in / :on / = in the bootstrap".into(),
+                            ));
+                        }
+                        let init = p.read_form()?;
+                        let then = if p.at_kw("THEN") {
+                            p.advance();
+                            Some(p.read_form()?)
+                        } else {
+                            None
+                        };
+                        for_clauses.push(ForClause::Eq { pat, init, then });
+                    }
+                }
+            }
+            "INITIALLY" => {
+                p.advance();
+                initially = p.read_forms();
+            }
+            "FINALLY" => {
+                p.advance();
+                finally = p.read_forms();
+            }
+            _ => body.push(p.parse_clause()?),
+        }
+    }
+
+    // Establish :with bindings (sequential, LET*-style).
+    for (var, init) in &with_bindings {
+        let v = eval_form(*init, &mut lenv)?;
+        loop_bind(*var, v, &mut lenv);
+    }
+
+    // Bind all :into accumulators to NIL up front.
+    let mut into_names = Vec::new();
+    loop_collect_intos(&body, &mut into_names);
+    for n in &into_names {
+        lenv.define_local(n, NIL);
+    }
+
+    let mut accs = LoopAccs::default();
+    let mut ret: Option<BlissVal> = None;
+
+    for f in &initially {
+        eval_form(*f, &mut lenv)?;
+    }
+
+    if for_clauses.is_empty() {
+        // No :for driver: run body once (covers when/collect-only loops).
+        loop_exec_clauses(&body, &mut lenv, &mut accs, &mut ret)?;
+    } else {
+        // Build cursors, evaluating each list form once.
+        let mut states: Vec<ForState> = Vec::with_capacity(for_clauses.len());
+        let mut has_stepping_driver = false;
+        for fc in &for_clauses {
+            match fc {
+                ForClause::In { pat, list_form } => {
+                    let list = eval_form(*list_form, &mut lenv)?;
+                    states.push(ForState::In {
+                        pat: *pat,
+                        items: list_to_vec(list),
+                        idx: 0,
+                    });
+                    has_stepping_driver = true;
+                }
+                ForClause::On { pat, list_form } => {
+                    let list = eval_form(*list_form, &mut lenv)?;
+                    states.push(ForState::On {
+                        pat: *pat,
+                        tail: list,
+                    });
+                    has_stepping_driver = true;
+                }
+                ForClause::Eq { pat, init, then } => states.push(ForState::Eq {
+                    pat: *pat,
+                    init: *init,
+                    then: *then,
+                }),
+            }
+        }
+        let mut first = true;
+        let mut guard: u64 = 0;
+        loop {
+            if ret.is_some() {
+                break;
+            }
+            // Step every driver in order; later clauses see earlier bindings.
+            let mut exhausted = false;
+            for st in &mut states {
+                match st {
+                    ForState::In { pat, items, idx } => {
+                        if *idx >= items.len() {
+                            exhausted = true;
+                            break;
+                        }
+                        loop_bind(*pat, items[*idx], &mut lenv);
+                        *idx += 1;
+                    }
+                    ForState::On { pat, tail } => {
+                        if !tail.is_cons() {
+                            exhausted = true;
+                            break;
+                        }
+                        loop_bind(*pat, *tail, &mut lenv);
+                        *tail = cp(*tail).1;
+                    }
+                    ForState::Eq { pat, init, then } => {
+                        let f = if first { *init } else { then.unwrap_or(*init) };
+                        let v = eval_form(f, &mut lenv)?;
+                        loop_bind(*pat, v, &mut lenv);
+                    }
+                }
+            }
+            if exhausted {
+                break;
+            }
+            loop_exec_clauses(&body, &mut lenv, &mut accs, &mut ret)?;
+            first = false;
+            if !has_stepping_driver {
+                guard += 1;
+                if guard > 10_000_000 {
+                    return Err(BlissError::Internal(
+                        "LOOP: exceeded iteration cap (no terminating driver)".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Publish named accumulators so :finally can read them.
+    let named: Vec<(String, Vec<BlissVal>)> = accs
+        .map
+        .iter()
+        .filter_map(|(k, v)| k.as_ref().map(|name| (name.clone(), v.clone())))
+        .collect();
+    for (name, items) in named {
+        lenv.define_local(&name, vec_to_list(&items));
+    }
+
+    // :finally — an embedded (return X) ends the loop with X.
+    for f in &finally {
+        if ret.is_some() {
+            break;
+        }
+        if let Some(tgt) = loop_return_target(*f) {
+            ret = Some(eval_form(tgt, &mut lenv)?);
+        } else {
+            eval_form(*f, &mut lenv)?;
+        }
+    }
+
+    if let Some(r) = ret {
+        return Ok(r);
+    }
+    // Default: the anonymous accumulator's list, else NIL.
+    if let Some(items) = accs.map.get(&None) {
+        return Ok(vec_to_list(items));
+    }
+    Ok(NIL)
 }
 
 // ── Arithmetic helpers (issue #6 fix: proper float arithmetic) ────
@@ -2331,7 +3116,14 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (params_form, body) = cp(rest);
     let name = sym_name(name_form);
     let params = extract_params(params_form);
-    Rc::make_mut(&mut env.funs).insert(name.clone(), FunDef { params, body });
+    Rc::make_mut(&mut env.funs).insert(
+        name.clone(),
+        FunDef {
+            params,
+            params_form,
+            body,
+        },
+    );
     Ok(name_form)
 }
 
@@ -2351,6 +3143,190 @@ fn extract_params(params_form: BlissVal) -> Vec<String> {
         c = rest;
     }
     params
+}
+
+// ── Ordinary lambda-list binding ─────────────────────────────────
+// Binds required, &optional (with defaults + supplied-p), &rest/&body,
+// &key (with defaults, supplied-p, and ((:kw var) ...) form),
+// &allow-other-keys (accepted, not enforced), and &aux. Defaults are
+// evaluated left-to-right in `env` so they can see earlier parameters.
+
+/// Bare (KEYWORD:-stripped) name of a symbol.
+fn key_bare(sym: BlissVal) -> String {
+    let n = sym_name(sym);
+    n.strip_prefix("KEYWORD:").unwrap_or(&n).to_string()
+}
+
+/// Parse an &optional/&aux element: `var` | `(var [default [supplied-p]])`.
+fn parse_var_spec(elem: BlissVal) -> (String, BlissVal, Option<String>) {
+    if elem.is_symbol() {
+        return (sym_name(elem), NIL, None);
+    }
+    if elem.is_cons() {
+        let (var, r) = cp(elem);
+        let (default, r2) = if r.is_cons() { cp(r) } else { (NIL, NIL) };
+        let supp = if r2.is_cons() {
+            Some(sym_name(cp(r2).0))
+        } else {
+            None
+        };
+        return (sym_name(var), default, supp);
+    }
+    (String::new(), NIL, None)
+}
+
+/// Parse a &key element: `var` | `(var [default [supp]])` | `((:kw var) [default [supp]])`.
+/// Returns (keyword-bare-name, var-name, default-form, supplied-p-var).
+fn parse_key_spec(elem: BlissVal) -> (String, String, BlissVal, Option<String>) {
+    if elem.is_symbol() {
+        let var = sym_name(elem);
+        return (var.clone(), var, NIL, None);
+    }
+    if elem.is_cons() {
+        let (head, r) = cp(elem);
+        let (default, r2) = if r.is_cons() { cp(r) } else { (NIL, NIL) };
+        let supp = if r2.is_cons() {
+            Some(sym_name(cp(r2).0))
+        } else {
+            None
+        };
+        if head.is_symbol() {
+            let var = sym_name(head);
+            return (var.clone(), var, default, supp);
+        }
+        if head.is_cons() {
+            let (kw_sym, r3) = cp(head);
+            let var = if r3.is_cons() {
+                sym_name(cp(r3).0)
+            } else {
+                String::new()
+            };
+            return (key_bare(kw_sym), var, default, supp);
+        }
+    }
+    (String::new(), String::new(), NIL, None)
+}
+
+/// Look up a keyword's value in a `key value key value ...` argument tail.
+fn find_key_arg(plist: &[BlissVal], kw_bare: &str) -> Option<BlissVal> {
+    let mut i = 0;
+    while i + 1 < plist.len() {
+        if plist[i].is_symbol() && key_bare(plist[i]) == kw_bare {
+            return Some(plist[i + 1]);
+        }
+        i += 2;
+    }
+    None
+}
+
+fn bind_lambda_list(
+    params_form: BlissVal,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Result<(), BlissError> {
+    #[derive(PartialEq)]
+    enum Mode {
+        Req,
+        Opt,
+        Rest,
+        Key,
+        Aux,
+    }
+    let mut mode = Mode::Req;
+    let mut arg_i = 0usize;
+    let mut key_start: Option<usize> = None;
+
+    let mut c = params_form;
+    while c.is_cons() {
+        let (elem, rest) = cp(c);
+        c = rest;
+        if elem.is_symbol() {
+            match sym_name(elem).as_str() {
+                "&OPTIONAL" => {
+                    mode = Mode::Opt;
+                    continue;
+                }
+                "&REST" | "&BODY" => {
+                    mode = Mode::Rest;
+                    continue;
+                }
+                "&KEY" => {
+                    mode = Mode::Key;
+                    key_start.get_or_insert(arg_i);
+                    continue;
+                }
+                "&AUX" => {
+                    mode = Mode::Aux;
+                    continue;
+                }
+                "&ALLOW-OTHER-KEYS" => continue,
+                _ => {}
+            }
+        }
+        match mode {
+            Mode::Req => {
+                let v = args.get(arg_i).copied().unwrap_or(NIL);
+                arg_i += 1;
+                env.define_local(&sym_name(elem), v);
+            }
+            Mode::Opt => {
+                let (var, default_form, supp) = parse_var_spec(elem);
+                if arg_i < args.len() {
+                    env.define_local(&var, args[arg_i]);
+                    arg_i += 1;
+                    if let Some(sp) = supp {
+                        env.define_local(&sp, T);
+                    }
+                } else {
+                    let dv = if default_form == NIL {
+                        NIL
+                    } else {
+                        eval_form(default_form, env)?
+                    };
+                    env.define_local(&var, dv);
+                    if let Some(sp) = supp {
+                        env.define_local(&sp, NIL);
+                    }
+                }
+            }
+            Mode::Rest => {
+                let remaining = args.get(arg_i..).unwrap_or(&[]);
+                env.define_local(&sym_name(elem), vec_to_list(remaining));
+                key_start.get_or_insert(arg_i);
+            }
+            Mode::Key => {
+                let (kw_bare, var, default_form, supp) = parse_key_spec(elem);
+                let start = key_start.unwrap_or(arg_i);
+                let tail = args.get(start..).unwrap_or(&[]);
+                if let Some(v) = find_key_arg(tail, &kw_bare) {
+                    env.define_local(&var, v);
+                    if let Some(sp) = supp {
+                        env.define_local(&sp, T);
+                    }
+                } else {
+                    let dv = if default_form == NIL {
+                        NIL
+                    } else {
+                        eval_form(default_form, env)?
+                    };
+                    env.define_local(&var, dv);
+                    if let Some(sp) = supp {
+                        env.define_local(&sp, NIL);
+                    }
+                }
+            }
+            Mode::Aux => {
+                let (var, default_form, _) = parse_var_spec(elem);
+                let dv = if default_form == NIL {
+                    NIL
+                } else {
+                    eval_form(default_form, env)?
+                };
+                env.define_local(&var, dv);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── DEFMACRO ─────────────────────────────────────────────────────
@@ -2637,13 +3613,20 @@ fn apply_function(
         let name = sym_name(fn_val);
         if let Some(fdef) = env.funs.get(&name).cloned() {
             let mut child_env = env.child();
-            for (i, param) in fdef.params.iter().enumerate() {
-                child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
-            }
+            bind_lambda_list(fdef.params_form, args, &mut child_env)?;
             return eval_progn(fdef.body, &mut child_env);
         }
-        // Try built-in
-        return apply_builtin(&name, args, env);
+        // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
+        // full operator-position builtin set (not just apply_builtin's subset)
+        // is reachable through funcall/apply/mapcar.
+        let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
+        let mut items = Vec::with_capacity(args.len() + 1);
+        items.push(fn_val);
+        for a in args {
+            items.push(arena_cons(quote_sym, arena_cons(*a, NIL)));
+        }
+        let form = vec_to_list(&items);
+        return eval_form(form, env);
     }
     if fn_val.is_cons() {
         let (lh, lr) = cp(fn_val);
@@ -2657,19 +3640,14 @@ fn apply_function(
                     child_env.define_local(k, *v);
                 }
                 // Bind parameters
-                for (i, param) in closure.params.iter().enumerate() {
-                    child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
-                }
+                bind_lambda_list(closure.params_form, args, &mut child_env)?;
                 return eval_progn(closure.body, &mut child_env);
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
             let (params_form, body) = cp(lr);
-            let params = extract_params(params_form);
             let mut child_env = env.child();
-            for (i, param) in params.iter().enumerate() {
-                child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
-            }
+            bind_lambda_list(params_form, args, &mut child_env)?;
             return eval_progn(body, &mut child_env);
         }
     }
@@ -3189,6 +4167,17 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         env.define_local("*COMMAND-LINE-ARGS*", NIL);
     }
 
+    // Load the Lisp bootstrap prelude. It defines standard-CL forms (defvar,
+    // push, incf, ...) that are part of the language, not an optional feature,
+    // so it loads unconditionally — before any init file, --eval, --load, or
+    // script — for every mode. `--no-bootstrap` opts out (raw evaluator);
+    // `--bootstrap` is now the default and kept only for compatibility. A
+    // failure here is fatal: the prelude is core.
+    if !ca.no_bootstrap {
+        let contents = boot_prelude_source()?;
+        read_eval_all_env(&contents, &mut env)?;
+    }
+
     // Load init file unless --no-init (issue #8)
     if !ca.no_init && ca.eval.is_none() && ca.load.is_none() && ca.script.is_none() {
         // Try to load init file
@@ -3233,9 +4222,19 @@ fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, BlissError> {
             Ok(0)
         }
         Err(e) => {
-            eprintln!("ERROR: {}", e);
+            eprintln!("ERROR: {}", describe_err(&e));
             Err(e)
         }
+    }
+}
+
+/// Render an error for display, resolving symbol indices to their names so
+/// messages read `undefined function: FOO` instead of `... Symbol(147)`.
+fn describe_err(e: &BlissError) -> String {
+    match e {
+        BlissError::UndefinedFunction(s) => format!("undefined function: {}", sym_name(*s)),
+        BlissError::UnboundVariable(s) => format!("unbound variable: {}", sym_name(*s)),
+        _ => format!("{}", e),
     }
 }
 
@@ -3248,7 +4247,7 @@ fn run_load_env(path: &str, env: &mut Env) -> Result<i32, BlissError> {
     match read_eval_all_env(&contents, env) {
         Ok(_) => Ok(0),
         Err(e) => {
-            eprintln!("ERROR: {}", e);
+            eprintln!("ERROR: {}", describe_err(&e));
             Err(e)
         }
     }
@@ -3260,7 +4259,7 @@ fn run_script_env(path: &str, env: &mut Env) -> Result<i32, BlissError> {
     match read_eval_all_env(&contents, env) {
         Ok(_) => Ok(0),
         Err(e) => {
-            eprintln!("ERROR: {}", e);
+            eprintln!("ERROR: {}", describe_err(&e));
             Err(e)
         }
     }
@@ -3314,7 +4313,8 @@ pub fn help_text() -> &'static str {
         "  --load FILE          Load FILE and exit\n",
         "  --image FILE         Path to the boot image\n",
         "  --no-image           Start without loading an image\n",
-        "  --bootstrap          Bootstrap from lib/boot.lisp\n",
+        "  --bootstrap          Deprecated; the prelude now loads by default\n",
+        "  --no-bootstrap       Skip the bootstrap prelude (raw evaluator)\n",
         "  --workers N          Number of worker threads\n",
         "  --heap-size SIZE     Heap size (e.g. 512M, 1G)\n",
         "  --tlab-size SIZE     Per-thread TLAB size\n",
@@ -3385,7 +4385,7 @@ fn run_repl_env(env: &mut Env) -> Result<i32, BlissError> {
                         ARENA.with(|a| a.borrow_mut().promote_all());
                     }
                     Err(e) => {
-                        eprintln!("ERROR: {}", e);
+                        eprintln!("ERROR: {}", describe_err(&e));
                         in_debugger = true;
                         // On error, temporary allocations can be freed
                         ARENA.with(|a| {
