@@ -135,11 +135,10 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Lenient package layer
 ;;;
-;;; Bliss's evaluator resolves package-qualified symbols by their bare name, so
-;;; real package objects, use-lists, and external-symbol tables are not needed
-;;; for code to run. These stubs exist only so ASDF's own package machinery
-;;; (define-package -> ensure-package) executes harmlessly. A package is
-;;; represented by its name string.
+;;; Bliss's evaluator provides package primitives from the Rust CLI/runtime.
+;;; Keep only thin symbol helpers here; package functions themselves should
+;;; resolve to the real builtins so bundled ASDF can exercise actual package
+;;; state instead of bootstrap stubs.
 ;;; ---------------------------------------------------------------------------
 
 (defun symbol-name (s) (string s))
@@ -151,26 +150,6 @@
        (let ((pkg-end (position #\: name)))
          (and pkg-end (subseq name 0 pkg-end))))
       (t nil))))
-
-(defun make-package (name &rest keys) (declare (ignore keys)) (string name))
-(defun find-package (name) (if name (string name) nil))
-(defun package-name (pkg) (if pkg (string pkg) nil))
-(defun package-names (pkg) (list (package-name pkg)))
-(defun package-nicknames (pkg) (declare (ignore pkg)) nil)
-(defun package-use-list (pkg) (declare (ignore pkg)) nil)
-(defun package-used-by-list (pkg) (declare (ignore pkg)) nil)
-(defun package-shadowing-symbols (pkg) (declare (ignore pkg)) nil)
-(defun use-package (pkgs &rest r) (declare (ignore pkgs r)) t)
-(defun unuse-package (pkgs &rest r) (declare (ignore pkgs r)) t)
-(defun rename-package (pkg name &rest nicknames) (declare (ignore name nicknames)) pkg)
-(defun delete-package (pkg) (declare (ignore pkg)) t)
-(defun find-symbol (name &rest pkg) (declare (ignore name pkg)) (values nil nil))
-(defun import (symbols &rest pkg) (declare (ignore symbols pkg)) t)
-(defun export (symbols &rest pkg) (declare (ignore symbols pkg)) t)
-(defun unexport (symbols &rest pkg) (declare (ignore symbols pkg)) t)
-(defun shadow (symbols &rest pkg) (declare (ignore symbols pkg)) t)
-(defun shadowing-import (symbols &rest pkg) (declare (ignore symbols pkg)) t)
-(defun unintern (symbol &rest pkg) (declare (ignore symbol pkg)) t)
 
 ;; Symbol iteration macros: no external/present symbols are tracked, so the
 ;; body never runs; the optional result form is not evaluated (defaults to nil).

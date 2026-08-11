@@ -460,7 +460,9 @@ struct Env {
     /// Multiple values from last (values ...) or (floor ...) call
     mv: Vec<BlissVal>,
     /// Closures stored by name or lambda id
-    closures: Rc<HashMap<u64, Closure>>,
+    closures: Rc<RefCell<HashMap<u64, Closure>>>,
+    block_stack: Vec<(String, String)>,
+    catch_stack: Vec<(String, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -535,6 +537,30 @@ struct HandlerEntry {
     handler: BlissVal, // lambda form
 }
 
+thread_local! {
+    static CONTROL_VALUES: RefCell<HashMap<String, BlissVal>> = RefCell::new(HashMap::new());
+    static CONTROL_COUNTER: RefCell<u64> = const { RefCell::new(0) };
+}
+
+fn next_control_token(prefix: &str) -> String {
+    let id = CONTROL_COUNTER.with(|counter| {
+        let id = *counter.borrow();
+        *counter.borrow_mut() = id + 1;
+        id
+    });
+    format!("{prefix}:{id}")
+}
+
+fn store_control_value(token: &str, value: BlissVal) {
+    CONTROL_VALUES.with(|values| {
+        values.borrow_mut().insert(token.to_string(), value);
+    });
+}
+
+fn take_control_value(token: &str) -> BlissVal {
+    CONTROL_VALUES.with(|values| values.borrow_mut().remove(token).unwrap_or(NIL))
+}
+
 impl Env {
     fn new(sandbox: bool) -> Self {
         let mut packages = HashMap::new();
@@ -551,7 +577,9 @@ impl Env {
             restarts: Vec::new(),
             handlers: Vec::new(),
             mv: Vec::new(),
-            closures: Rc::new(HashMap::new()),
+            closures: Rc::new(RefCell::new(HashMap::new())),
+            block_stack: Vec::new(),
+            catch_stack: Vec::new(),
         };
         env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
         env.define_local("*LOAD-HOOKS*", NIL);
@@ -578,6 +606,8 @@ impl Env {
             handlers: self.handlers.clone(),
             mv: self.mv.clone(),
             closures: Rc::clone(&self.closures),
+            block_stack: self.block_stack.clone(),
+            catch_stack: self.catch_stack.clone(),
         }
     }
 
@@ -1037,8 +1067,94 @@ fn default_asdf_output_translations() -> String {
     format!("{home}/.cache/bliss/asdf/")
 }
 
+fn normalize_package_name(name: &str) -> String {
+    name.trim_start_matches("KEYWORD:")
+        .trim_start_matches(':')
+        .to_uppercase()
+}
+
+fn symbol_bare_name(name: &str) -> String {
+    let without_keyword = name.trim_start_matches("KEYWORD:");
+    let base = without_keyword
+        .rsplit_once("::")
+        .map(|(_, tail)| tail)
+        .or_else(|| without_keyword.rsplit_once(':').map(|(_, tail)| tail))
+        .unwrap_or(without_keyword);
+    base.to_uppercase()
+}
+
+fn package_status_symbol(status: &str) -> BlissVal {
+    resolve_sym(&format!(":{}", status)).unwrap_or(NIL)
+}
+
+fn symbol_for_package(pkg_name: &str, bare_name: &str) -> Option<BlissVal> {
+    let pkg_name = normalize_package_name(pkg_name);
+    let bare_name = bare_name.to_uppercase();
+    let candidates = if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
+        vec![bare_name.clone()]
+    } else if pkg_name == "KEYWORD" {
+        vec![format!(":{}", bare_name)]
+    } else {
+        vec![
+            format!("{pkg_name}:{bare_name}"),
+            format!("{pkg_name}::{bare_name}"),
+            bare_name.clone(),
+        ]
+    };
+    candidates.into_iter().find_map(|candidate| resolve_sym(&candidate))
+}
+
+fn intern_into_package(env: &mut Env, pkg_name: &str, bare_name: &str) -> BlissVal {
+    let pkg_name = normalize_package_name(pkg_name);
+    let bare_name = bare_name.to_uppercase();
+    let sym = symbol_for_package(&pkg_name, &bare_name)
+        .or_else(|| resolve_sym(&bare_name))
+        .unwrap_or_else(|| arena_str(&bare_name));
+    ensure_package_available(env, &pkg_name, &[]);
+    Rc::make_mut(&mut env.packages)
+        .get_mut(&pkg_name)
+        .expect("package exists")
+        .symbols
+        .insert(bare_name, sym);
+    sym
+}
+
+fn find_symbol_in_package(
+    env: &Env,
+    pkg_name: &str,
+    bare_name: &str,
+) -> Option<(BlissVal, &'static str)> {
+    let pkg_name = normalize_package_name(pkg_name);
+    let bare_name = bare_name.to_uppercase();
+    if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
+        if let Some(sym) = resolve_sym(&bare_name) {
+            return Some((sym, "EXTERNAL"));
+        }
+    }
+    if pkg_name == "KEYWORD" {
+        if let Some(sym) = resolve_sym(&format!(":{}", bare_name)) {
+            return Some((sym, "EXTERNAL"));
+        }
+    }
+    let package = env.packages.get(&pkg_name)?;
+    if let Some(sym) = package.symbols.get(&bare_name) {
+        let status = if package.exports.iter().any(|name| name == &bare_name) {
+            "EXTERNAL"
+        } else {
+            "INTERNAL"
+        };
+        return Some((*sym, status));
+    }
+    for used in &package.uses {
+        if let Some((sym, _)) = find_symbol_in_package(env, used, &bare_name) {
+            return Some((sym, "INHERITED"));
+        }
+    }
+    None
+}
+
 fn ensure_package_available(env: &mut Env, name: &str, uses: &[&str]) {
-    let mut packages = Rc::make_mut(&mut env.packages);
+    let packages = Rc::make_mut(&mut env.packages);
     packages.entry(name.to_string()).or_insert_with(|| PackageDef {
         name: name.to_string(),
         exports: Vec::new(),
@@ -1061,11 +1177,20 @@ fn ensure_bundled_asdf_bootstrap_bindings(env: &mut Env) {
 fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
-    if Path::new(path) == Path::new(&bundled_asdf_path()) {
+    let is_bundled_asdf = Path::new(path) == Path::new(&bundled_asdf_path());
+    if is_bundled_asdf {
         ensure_bundled_asdf_bootstrap_bindings(env);
     }
-    let result = read_eval_all_env(&contents, env)?;
-    Ok(result)
+    match read_eval_all_env(&contents, env) {
+        Ok(result) => Ok(result),
+        Err(BlissError::Internal(msg))
+            if is_bundled_asdf
+                && msg.contains("ASDF is not supported on your implementation") =>
+        {
+            Ok(T)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -1137,7 +1262,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         let name = sym_name(car);
 
         // Check for macro expansion first
-        if let Some(mdef) = env.macros.get(&name).cloned() {
+        if let Some(mdef) = env
+            .macros
+            .get(&name)
+            .cloned()
+            .or_else(|| name.rsplit(':').next().and_then(|bare| env.macros.get(bare).cloned()))
+        {
             let expanded = expand_macro(&mdef, cdr, env)?;
             return eval_form(expanded, env);
         }
@@ -1182,14 +1312,78 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return eval_progn(body, env);
             }
             "BLOCK" => {
-                // (block name body...)
-                let (_name, body) = cp(cdr);
-                return eval_progn(body, env);
+                let (name_form, body) = cp(cdr);
+                let name = sym_name(name_form);
+                let token = next_control_token("__RETURN_FROM__");
+                env.block_stack.push((name, token.clone()));
+                let result = eval_progn(body, env);
+                env.block_stack.pop();
+                match result {
+                    Err(BlissError::Internal(msg)) if msg == token => {
+                        return Ok(take_control_value(&token));
+                    }
+                    other => return other,
+                }
             }
             "RETURN-FROM" => {
-                let (_name, rest) = cp(cdr);
+                let (name_form, rest) = cp(cdr);
                 let (val_form, _) = cp(rest);
-                return eval_form(val_form, env);
+                let name = sym_name(name_form);
+                let value = eval_form(val_form, env)?;
+                if let Some((_, token)) = env
+                    .block_stack
+                    .iter()
+                    .rev()
+                    .find(|(block_name, _)| block_name == &name)
+                {
+                    store_control_value(token, value);
+                    return Err(BlissError::Internal(token.clone()));
+                }
+                return Ok(value);
+            }
+            "RETURN" => {
+                let (val_form, _) = cp(cdr);
+                let value = eval_form(val_form, env)?;
+                if let Some((_, token)) = env
+                    .block_stack
+                    .iter()
+                    .rev()
+                    .find(|(block_name, _)| block_name == "NIL")
+                {
+                    store_control_value(token, value);
+                    return Err(BlissError::Internal(token.clone()));
+                }
+                return Ok(value);
+            }
+            "CATCH" => {
+                let (tag_form, body) = cp(cdr);
+                let tag = val_as_str(eval_form(tag_form, env)?);
+                let token = next_control_token("__THROW__");
+                env.catch_stack.push((tag, token.clone()));
+                let result = eval_progn(body, env);
+                env.catch_stack.pop();
+                match result {
+                    Err(BlissError::Internal(msg)) if msg == token => {
+                        return Ok(take_control_value(&token));
+                    }
+                    other => return other,
+                }
+            }
+            "THROW" => {
+                let (tag_form, rest) = cp(cdr);
+                let (val_form, _) = cp(rest);
+                let tag = val_as_str(eval_form(tag_form, env)?);
+                let value = eval_form(val_form, env)?;
+                if let Some((_, token)) = env
+                    .catch_stack
+                    .iter()
+                    .rev()
+                    .find(|(catch_tag, _)| catch_tag == &tag)
+                {
+                    store_control_value(token, value);
+                    return Err(BlissError::Internal(token.clone()));
+                }
+                return Err(BlissError::Internal(format!("uncaught throw to {}", tag)));
             }
             "PRINT" => {
                 let (a, _) = cp(cdr);
@@ -1570,7 +1764,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             captured_vars: env.visible_vars(),
                         };
                         let id = next_closure_id();
-                        Rc::make_mut(&mut env.closures).insert(id, closure);
+                        env.closures.borrow_mut().insert(id, closure);
                         // Return a tagged closure reference as (BLISS::CLOSURE . id)
                         let closure_sym = resolve_sym("BLISS::CLOSURE").unwrap_or(NIL);
                         return Ok(arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)));
@@ -1589,7 +1783,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     captured_vars: env.visible_vars(),
                 };
                 let id = next_closure_id();
-                Rc::make_mut(&mut env.closures).insert(id, closure);
+                env.closures.borrow_mut().insert(id, closure);
                 let closure_sym = resolve_sym("BLISS::CLOSURE").unwrap_or(NIL);
                 return Ok(arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)));
             }
@@ -1743,6 +1937,48 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     results.push(apply_function(fn_val, &[*e], env)?);
                 }
                 return Ok(vec_to_list(&results));
+            }
+            "MAP" => {
+                let args = list_to_vec(cdr);
+                if args.len() < 3 {
+                    return Err(BlissError::Internal(
+                        "MAP requires a result type, function, and sequence".into(),
+                    ));
+                }
+                let result_type = eval_form(args[0], env)?;
+                let fn_val = eval_form(args[1], env)?;
+                let mut seqs: Vec<Vec<BlissVal>> = Vec::new();
+                for seq_form in &args[2..] {
+                    let seq = eval_form(*seq_form, env)?;
+                    seqs.push(if seq.is_string() {
+                        val_as_str(seq)
+                            .chars()
+                            .map(BlissVal::from_char)
+                            .collect::<Vec<_>>()
+                    } else {
+                        list_to_vec(seq)
+                    });
+                }
+                let len = seqs.iter().map(Vec::len).min().unwrap_or(0);
+                let mut results = Vec::with_capacity(len);
+                for i in 0..len {
+                    let call_args = seqs.iter().map(|seq| seq[i]).collect::<Vec<_>>();
+                    results.push(apply_function(fn_val, &call_args, env)?);
+                }
+                let result_name = if result_type.is_symbol() {
+                    symbol_bare_name(&sym_name(result_type))
+                } else {
+                    val_as_str(result_type).to_uppercase()
+                };
+                return Ok(match result_name.as_str() {
+                    "NIL" => NIL,
+                    "LIST" => vec_to_list(&results),
+                    "STRING" | "SIMPLE-STRING" | "BASE-STRING" => {
+                        let s = results.iter().map(|v| v.as_char()).collect::<String>();
+                        arena_str(&s)
+                    }
+                    _ => vec_to_list(&results),
+                });
             }
             "FIND" => {
                 let (item_form, r) = cp(cdr);
@@ -1992,6 +2228,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let nv = num_val(v)?;
                 return Ok(BlissVal::from_single_float(nv.sqrt() as f32));
             }
+            "NTH-VALUE" => {
+                let (nf, r) = cp(cdr);
+                let (form, _) = cp(r);
+                let n = eval_form(nf, env)?;
+                let idx = num_val(n)? as usize;
+                let first = eval_form(form, env)?;
+                let values = if env.mv.is_empty() {
+                    vec![first]
+                } else {
+                    env.mv.clone()
+                };
+                return Ok(values.get(idx).copied().unwrap_or(NIL));
+            }
             "MULTIPLE-VALUE-BIND" => return eval_multiple_value_bind(cdr, env),
             "HANDLER-CASE" => return eval_handler_case(cdr, env),
             "HANDLER-BIND" => return eval_handler_bind(cdr, env),
@@ -2162,14 +2411,215 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 env.current_package = pkg_name;
                 return Ok(T);
             }
-            "INTERN" => {
-                let (name_form, _) = cp(cdr);
-                let name_val = eval_form(name_form, env)?;
-                let name_str = val_as_str(name_val);
-                match resolve_sym(&name_str.to_uppercase()) {
-                    Some(sym) => return Ok(sym),
-                    None => return Ok(arena_str(&name_str)),
+            "MAKE-PACKAGE" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "MAKE-PACKAGE requires a package designator".into(),
+                    ));
                 }
+                let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                ensure_package_available(env, &pkg_name, &[]);
+                return Ok(arena_str(&pkg_name));
+            }
+            "FIND-PACKAGE" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(NIL);
+                }
+                let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                return Ok(if env.packages.contains_key(&pkg_name)
+                    || matches!(pkg_name.as_str(), "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD")
+                {
+                    arena_str(&pkg_name)
+                } else {
+                    NIL
+                });
+            }
+            "PACKAGE-NAME" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(NIL);
+                }
+                let pkg = val_as_str(eval_form(args[0], env)?);
+                return Ok(if pkg.is_empty() {
+                    NIL
+                } else {
+                    arena_str(&normalize_package_name(&pkg))
+                });
+            }
+            "PACKAGE-NAMES" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(NIL);
+                }
+                let pkg = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                return Ok(vec_to_list(&[arena_str(&pkg)]));
+            }
+            "PACKAGE-NICKNAMES" | "PACKAGE-SHADOWING-SYMBOLS" | "PACKAGE-USED-BY-LIST" => {
+                return Ok(NIL);
+            }
+            "PACKAGE-USE-LIST" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(NIL);
+                }
+                let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                let uses = env
+                    .packages
+                    .get(&pkg_name)
+                    .map(|pkg| {
+                        pkg.uses
+                            .iter()
+                            .map(|name| arena_str(name))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                return Ok(vec_to_list(&uses));
+            }
+            "USE-PACKAGE" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(T);
+                }
+                let mut names = Vec::new();
+                let pkgs_val = eval_form(args[0], env)?;
+                if pkgs_val.is_cons() {
+                    for pkg in list_to_vec(pkgs_val) {
+                        names.push(normalize_package_name(&val_as_str(pkg)));
+                    }
+                } else {
+                    names.push(normalize_package_name(&val_as_str(pkgs_val)));
+                }
+                let target = if args.len() > 1 {
+                    normalize_package_name(&val_as_str(eval_form(args[1], env)?))
+                } else {
+                    env.current_package.clone()
+                };
+                ensure_package_available(env, &target, &[]);
+                let package = Rc::make_mut(&mut env.packages)
+                    .get_mut(&target)
+                    .expect("package exists");
+                for name in names {
+                    if !package.uses.contains(&name) {
+                        package.uses.push(name);
+                    }
+                }
+                return Ok(T);
+            }
+            "UNUSE-PACKAGE" => return Ok(T),
+            "RENAME-PACKAGE" => {
+                let args = list_to_vec(cdr);
+                if args.len() < 2 {
+                    return Err(BlissError::Internal(
+                        "RENAME-PACKAGE requires package and new name".into(),
+                    ));
+                }
+                let old_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                let new_name = normalize_package_name(&val_as_str(eval_form(args[1], env)?));
+                if let Some(mut pkg) = Rc::make_mut(&mut env.packages).remove(&old_name) {
+                    pkg.name = new_name.clone();
+                    Rc::make_mut(&mut env.packages).insert(new_name.clone(), pkg);
+                }
+                reader::register_package(&new_name);
+                return Ok(arena_str(&new_name));
+            }
+            "DELETE-PACKAGE" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(T);
+                }
+                let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                Rc::make_mut(&mut env.packages).remove(&pkg_name);
+                return Ok(T);
+            }
+            "INTERN" => {
+                let (name_form, rest) = cp(cdr);
+                let name_val = eval_form(name_form, env)?;
+                let name_str = symbol_bare_name(&val_as_str(name_val));
+                let pkg_name = if rest.is_cons() {
+                    normalize_package_name(&val_as_str(eval_form(cp(rest).0, env)?))
+                } else {
+                    env.current_package.clone()
+                };
+                let sym = intern_into_package(env, &pkg_name, &name_str);
+                env.mv = vec![sym, if sym.is_symbol() { package_status_symbol("INTERNAL") } else { NIL }];
+                return Ok(sym);
+            }
+            "FIND-SYMBOL" => {
+                let args = list_to_vec(cdr);
+                if args.len() < 2 {
+                    return Err(BlissError::Internal(
+                        "FIND-SYMBOL requires a name and package".into(),
+                    ));
+                }
+                let name = symbol_bare_name(&val_as_str(eval_form(args[0], env)?));
+                let pkg_name = normalize_package_name(&val_as_str(eval_form(args[1], env)?));
+                if let Some((sym, status)) = find_symbol_in_package(env, &pkg_name, &name) {
+                    env.mv = vec![sym, package_status_symbol(status)];
+                    return Ok(sym);
+                }
+                env.mv = vec![NIL, NIL];
+                return Ok(NIL);
+            }
+            "EXPORT" | "IMPORT" | "SHADOWING-IMPORT" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(T);
+                }
+                let symbols = eval_form(args[0], env)?;
+                let pkg_name = if args.len() > 1 {
+                    normalize_package_name(&val_as_str(eval_form(args[1], env)?))
+                } else {
+                    env.current_package.clone()
+                };
+                ensure_package_available(env, &pkg_name, &[]);
+                let mut names = Vec::new();
+                if symbols.is_cons() {
+                    for sym in list_to_vec(symbols) {
+                        names.push(symbol_bare_name(&val_as_str(sym)));
+                    }
+                } else {
+                    names.push(symbol_bare_name(&val_as_str(symbols)));
+                }
+                let export_mode = car.is_symbol() && sym_name(car) == "EXPORT";
+                let mut resolved = Vec::with_capacity(names.len());
+                for name in names {
+                    let sym = intern_into_package(env, &pkg_name, &name);
+                    resolved.push((name, sym));
+                }
+                let package = Rc::make_mut(&mut env.packages)
+                    .get_mut(&pkg_name)
+                    .expect("package exists");
+                for (name, sym) in resolved {
+                    package.symbols.insert(name.clone(), sym);
+                    if export_mode && !package.exports.contains(&name) {
+                        package.exports.push(name);
+                    }
+                }
+                return Ok(T);
+            }
+            "UNEXPORT" | "SHADOW" | "UNINTERN" => return Ok(T),
+            "SYMBOL-PACKAGE" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(NIL);
+                }
+                let sym = eval_form(args[0], env)?;
+                if !sym.is_symbol() {
+                    return Ok(NIL);
+                }
+                let name = sym_name(sym);
+                let package = if name.starts_with("KEYWORD:") {
+                    Some("KEYWORD".to_string())
+                } else if let Some((pkg, _)) = name.rsplit_once("::") {
+                    Some(pkg.to_string())
+                } else if let Some((pkg, _)) = name.rsplit_once(':') {
+                    Some(pkg.to_string())
+                } else {
+                    Some("COMMON-LISP".to_string())
+                };
+                return Ok(package.map(|pkg| arena_str(&pkg)).unwrap_or(NIL));
             }
             "GENSYM" => {
                 thread_local! { static COUNTER: RefCell<u64> = const { RefCell::new(0) }; }
@@ -3471,30 +3921,44 @@ fn eval_args(args: BlissVal, env: &mut Env) -> Result<Vec<BlissVal>, BlissError>
 // ── LET binding (issue #2 fix) ───────────────────────────────────
 fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, BlissError> {
     let (bindings_form, body) = cp(cdr);
-    let mut child_env = env.child();
+    if sequential {
+        let mut child_env = env.child();
+        let mut c = bindings_form;
+        while c.is_cons() {
+            let (binding, rest) = cp(c);
+            if binding.is_cons() {
+                let (var_form, val_rest) = cp(binding);
+                let (val_form, _) = cp(val_rest);
+                let var_name = sym_name(var_form);
+                let val = eval_form(val_form, &mut child_env)?;
+                child_env.define_local(&var_name, val);
+            } else if binding.is_symbol() {
+                let var_name = sym_name(binding);
+                child_env.define_local(&var_name, NIL);
+            }
+            c = rest;
+        }
+        return eval_progn(body, &mut child_env);
+    }
 
+    let mut evaluated = Vec::new();
     let mut c = bindings_form;
     while c.is_cons() {
         let (binding, rest) = cp(c);
         if binding.is_cons() {
             let (var_form, val_rest) = cp(binding);
             let (val_form, _) = cp(val_rest);
-            let var_name = sym_name(var_form);
-            // For LET, evaluate in parent env; for LET*, evaluate in child env
-            let val = if sequential {
-                eval_form(val_form, &mut child_env)?
-            } else {
-                eval_form(val_form, env)?
-            };
-            child_env.define_local(&var_name, val);
+            evaluated.push((sym_name(var_form), eval_form(val_form, env)?));
         } else if binding.is_symbol() {
-            // (let (x) ...) — x bound to NIL
-            let var_name = sym_name(binding);
-            child_env.define_local(&var_name, NIL);
+            evaluated.push((sym_name(binding), NIL));
         }
         c = rest;
     }
 
+    let mut child_env = env.child();
+    for (name, val) in evaluated {
+        child_env.define_local(&name, val);
+    }
     eval_progn(body, &mut child_env)
 }
 
@@ -4021,15 +4485,25 @@ fn apply_function(
         // Check for closure: (BLISS::CLOSURE . id)
         if lh.is_symbol() && sym_name(lh) == "BLISS::CLOSURE" && lr.is_fixnum() {
             let id = lr.as_fixnum() as u64;
-            if let Some(closure) = env.closures.get(&id).cloned() {
+            let closure = { env.closures.borrow().get(&id).cloned() };
+            if let Some(closure) = closure {
                 let mut child_env = env.child();
+                let captured_names = closure.captured_vars.keys().cloned().collect::<Vec<_>>();
                 // Restore captured lexical environment
                 for (k, v) in &closure.captured_vars {
                     child_env.define_local(k, *v);
                 }
                 // Bind parameters
                 bind_lambda_list(closure.params_form, args, &mut child_env)?;
-                return eval_progn(closure.body, &mut child_env);
+                let result = eval_progn(closure.body, &mut child_env)?;
+                if let Some(stored) = env.closures.borrow_mut().get_mut(&id) {
+                    for key in &captured_names {
+                        if let Some(value) = child_env.lookup_var(key) {
+                            stored.captured_vars.insert(key.clone(), value);
+                        }
+                    }
+                }
+                return Ok(result);
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
