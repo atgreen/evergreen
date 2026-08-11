@@ -1,0 +1,3 @@
+# ANSI expected failures tracked per R10.01.
+# Format: test-id | rationale
+ansi/pathname-host-roundtrip | bootstrap pathnames not implemented yet

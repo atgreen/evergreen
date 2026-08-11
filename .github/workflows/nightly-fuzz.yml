@@ -1,0 +1,23 @@
+name: nightly-fuzz
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -C instrument-coverage
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: short fuzz run
+        run: cargo fuzz run fuzz_reader -- -max_total_time=60
+      - name: corpus minimisation
+        run: cargo fuzz cmin fuzz_reader fuzz/corpus/fuzz_reader
+      - name: weekly llvm-cov report
+        run: cargo llvm-cov --workspace --lcov --output-path coverage.lcov
