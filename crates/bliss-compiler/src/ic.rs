@@ -45,6 +45,10 @@ pub struct InlineCache {
     /// Caches created before the global registry is initialised remain
     /// standalone, which matches the explicit bootstrap contract.
     tracked: bool,
+    /// Registry session captured when this IC was created or explicitly reset.
+    /// A new `init_ic_registry` call starts a fresh session, which isolates
+    /// later bulk invalidation from older caches that belong to prior sessions.
+    session: Cell<u64>,
     /// Local generation — compared against the global IC_GENERATION counter.
     generation: Cell<u64>,
 }
@@ -53,10 +57,16 @@ impl InlineCache {
     /// Create a new uninitialized inline cache.
     pub fn new() -> Self {
         let tracked = IC_REGISTRY_INITIALIZED.load(Ordering::Acquire);
+        let session = if tracked {
+            IC_SESSION.load(Ordering::Acquire)
+        } else {
+            0
+        };
         InlineCache {
             state: Cell::new(IcState::Uninitialized),
             entries: RefCell::new(Vec::new()),
             tracked,
+            session: Cell::new(session),
             generation: Cell::new(if tracked {
                 IC_GENERATION.load(Ordering::Acquire)
             } else {
@@ -69,6 +79,10 @@ impl InlineCache {
     /// generation, and if so, lazily reset this IC.
     fn check_generation(&self) {
         if !self.tracked {
+            return;
+        }
+        let global_session = IC_SESSION.load(Ordering::Acquire);
+        if self.session.get() != global_session {
             return;
         }
         let global_gen = IC_GENERATION.load(Ordering::Acquire);
@@ -131,11 +145,13 @@ impl InlineCache {
     pub fn reset(&self) {
         self.entries.borrow_mut().clear();
         self.state.set(IcState::Uninitialized);
-        self.generation.set(if self.tracked {
-            IC_GENERATION.load(Ordering::Acquire)
+        if self.tracked {
+            self.session.set(IC_SESSION.load(Ordering::Acquire));
+            self.generation.set(IC_GENERATION.load(Ordering::Acquire));
         } else {
-            0
-        });
+            self.session.set(0);
+            self.generation.set(0);
+        }
     }
 
     /// Get the current entries (for diagnostics).
@@ -165,18 +181,21 @@ impl Default for InlineCache {
 /// Global IC generation counter — incremented by `reset_all_caches`.
 static IC_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Global registry session counter.
+///
+/// Each successful `init_ic_registry` call starts a new session so tests and
+/// independent bootstrap cycles do not invalidate each other's caches.
+static IC_SESSION: AtomicU64 = AtomicU64::new(0);
+
 /// Whether the global IC registry has been initialised.
 static IC_REGISTRY_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Initialise the global IC registry. Must be called during runtime
 /// bootstrap before any calls to `reset_all_caches`.
 pub fn init_ic_registry() {
-    if IC_REGISTRY_INITIALIZED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        IC_GENERATION.store(0, Ordering::Release);
-    }
+    IC_REGISTRY_INITIALIZED.store(true, Ordering::Release);
+    IC_SESSION.fetch_add(1, Ordering::AcqRel);
+    IC_GENERATION.store(0, Ordering::Release);
 }
 
 /// Get the current global IC generation counter.
