@@ -34,6 +34,62 @@ conflict with ANSI semantics. Each adopted extension MUST be listed in
 - Windows support — Linux and macOS first; FreeBSD best-effort.
 - GPU / SIMD auto-vectorisation — manual intrinsics only.
 
+## 0.3  Delivery Model: Staged Vertical Slices
+
+Bliss is specified and implemented as a sequence of **stages**, each of
+which is a runnable vertical slice through the real `bliss` entrypoint.
+The stage manifest lives in `spec/stages.json`; the roadmap in §11
+interprets that manifest for humans, and §10 defines how the gates are
+verified.
+
+The governing principle is **depth before breadth**. A stage is only
+complete when a user can run its gate end-to-end and observe the claimed
+behaviour through the real CLI or REPL. Internal completeness of a
+subsystem does not count as stage completion by itself.
+
+### 0.3.1  Stage Semantics
+
+- A **stage** is the smallest user-meaningful language/runtime slice
+  that can be exercised through the real binary.
+- A **gate** is the concrete end-to-end scenario that proves the stage
+  is working for a real user.
+- Earlier gates remain part of the required regression suite as later
+  stages are added.
+- Broad subsystem work that spans multiple stages MUST be partitioned by
+  stage tags or by file-level stage ownership as described in
+  `spec/conventions.md`.
+
+### 0.3.2  Anti-Illusion Rule
+
+The specification distinguishes genuine stage completion from artifacts
+that only make a gate appear to pass:
+
+- Special-casing filenames, forms, or command-line modes solely so a
+  gate example succeeds is a defect, not a milestone.
+- Returning placeholder, echoed, or fixed outputs from a seam that is
+  supposed to perform real reader/evaluator/compiler/runtime work is a
+  defect, even if the gate transcript matches the expected text.
+- Acceptance evidence is valid only when the capability under test is
+  implemented at the seam the user actually exercises.
+
+## 0.4  Stage Map
+
+The current stage sequence is:
+
+| Stage | Name | Primary user-visible capability |
+|-------|------|---------------------------------|
+| 0 | Read, print, evaluate | Core datatypes, `quote`/`if`/`progn`, primitive arithmetic/list ops |
+| 1 | Core evaluator | Closures, recursion, non-local exits, full lambda lists |
+| 2 | Macros | `defmacro`, backquote, standard control/binding macros, real source loading |
+| 3 | Data and library breadth | Sequences, strings, hash tables, `format`, pathnames, packages |
+| 4 | Conditions and CLOS | User-defined conditions, classes, generics, methods, restarts |
+| 5 | HotSpot-inspired engine | Tiering, profiling, ICs, OSR, speculative optimisation, deopt |
+| 6 | Real-world payload | Real ASDF/library loading and self-hosting trajectory |
+
+This stage map is intentionally narrower than the full chapter map in
+§2. A single subsystem chapter may contribute requirements to multiple
+stages.
+
 ## 1  Architecture Overview
 
 ```

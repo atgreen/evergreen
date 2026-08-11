@@ -754,3 +754,52 @@ same change series SHOULD include one of:
 
 This keeps specification growth incremental rather than allowing large
 untracked testing debt to accumulate.
+
+## 10.13  Stage-Gated Acceptance
+
+The staged build policy in `spec/stages.json`, §0.3, and §11 requires
+acceptance coverage that matches the current vertical slice rather than
+pretending the entire language is already complete.
+
+**R10.79** The primary acceptance gate for active development MUST be
+stage-aware: it MUST execute the current stage's gate scenario plus a
+no-regression pass of all earlier stages through the real `bliss`
+binary.
+
+**R10.80** Advancing `spec/stages.json` `current_stage` MUST require
+simultaneous evidence of:
+- the new stage gate passing through the real CLI/REPL entrypoint,
+- all earlier stage gates still passing, and
+- traceability coverage for all in-scope `MUST` requirements as defined
+  by `scripts/spec-coverage.py --gate`.
+
+**R10.81** Acceptance tests for stage gates MUST assert a user-visible
+result: printed value, printed diagnostic, exit status, produced file,
+or persisted runtime artifact. Parser-only, type-only, or mocked-seam
+tests MUST NOT be used as sole evidence that a gate passes.
+
+### 10.13.1  Real Entrypoint Contract
+
+**R10.82** Stage-gate acceptance scenarios MUST drive the same surface a
+user would drive in that stage: `bliss --eval`, `bliss --load`,
+positional script execution, or the interactive REPL. Calling internal
+library functions directly MAY supplement acceptance coverage, but MUST
+NOT replace the real-entrypoint gate.
+
+**R10.83** A stage gate that claims file loading or library loading MUST
+exercise an actual filesystem path and actual evaluator/loader work.
+Recognising a specific path, basename, or hard-coded form to skip the
+real load/eval path is prohibited.
+
+### 10.13.2  Evidence Quality Rules
+
+**R10.84** Acceptance artifacts and test code MUST make seam-faking
+detectable during review. Where a gate concerns source loading,
+evaluation, compilation, or image loading, the test SHOULD include a
+payload whose observable result depends on the real subsystem under
+test rather than on a canned success path.
+
+**R10.85** When a stage is too large for one delivery step, interim work
+SHOULD add observable progress tests that measure how far a real payload
+gets through the real binary, while keeping the formal gate unchanged
+until the full stage contract is met.

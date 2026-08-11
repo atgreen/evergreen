@@ -624,3 +624,78 @@ weakening already-published acceptance criteria.
 | Phase 1 | Bootstrap image, stdlib load transcript, crate-level test report |
 | Phase 2 | Triple-build report, benchmark snapshot, self-compile transcript |
 | Phase 3 | Full release bundle from §7, benchmark report, compatibility notes, security review summary |
+
+## 11.15  Stage Roadmap Within the Phases
+
+The broad implementation phases in §11.2–§11.5 are delivery epochs.
+Within them, progress is controlled by the finer-grained **stages** in
+`spec/stages.json`. These stages are the normative sequence for
+day-to-day implementation and acceptance, because they correspond to the
+smallest end-to-end slices a user can actually run.
+
+### 11.15.1  Stage-to-Phase Mapping
+
+| Stage | Name | Governing phase | Primary chapters in scope |
+|-------|------|-----------------|---------------------------|
+| 0 | Read, print, evaluate | Phase 0 | §1, §4.1, bootstrap printing portions of §5.9 |
+| 1 | Core evaluator | Phase 0 / early Phase 1 | §2, evaluator-facing parts of §4.3 |
+| 2 | Macros | Phase 1 | §4.2 and loader/bootstrap support across §2 and §5 |
+| 3 | Data and library breadth | Phase 1 / Phase 2 | §5.1, §5.5, §5.6, §5.7 |
+| 4 | Conditions and CLOS | Phase 2 | §5.2, §5.3 |
+| 5 | HotSpot-inspired engine | Phase 2 | §3, §4.4–§4.9, §13 |
+| 6 | Real-world payload and self-hosting | Phase 3 entry gate | §6, §7, §8, §9, later §11 |
+
+This mapping is intentionally overlapping: a phase may contain multiple
+stages, and a subsystem chapter may contribute requirements to more
+than one stage. The stage manifest, not the phase narrative alone,
+determines what is presently in scope for acceptance gating.
+
+### 11.15.2  Stage Advancement Rules
+
+**R11.25** Stages MUST advance strictly in numeric order from 0 through
+6. A later stage's work MAY land behind flags or inactive paths, but its
+gate MUST NOT be considered complete before every earlier stage gate is
+passing.
+
+**R11.26** The authoritative record of current implementation scope MUST
+be `spec/stages.json`. Human-readable roadmap text, release notes, CI
+configuration, and traceability reports MUST remain consistent with that
+manifest.
+
+**R11.27** When a requirement in a multi-stage file is intended to enter
+scope before the rest of that file, it MUST be tagged inline with its
+stage (`[S0]` ... `[S6]`) per `spec/conventions.md`; otherwise it
+inherits the file-level stage assignment from `spec/stages.json`.
+
+**R11.28** Stage advancement MUST be conservative: if the nominal stage
+payload partially works but its published gate is still incomplete, the
+project MUST remain on the earlier stage and report partial progress as
+intermediate implementation status rather than as a completed stage.
+
+### 11.15.3  Stage Gate Ledger
+
+The stage ledger below restates the current gate contract in the human
+roadmap so that planning, acceptance, and release notes all refer to the
+same gates.
+
+| Stage | Gate summary |
+|-------|--------------|
+| 0 | `bliss --eval "(+ 1 2)"` prints `3`; core datatypes round-trip read→print; a nested arithmetic/list script prints correct results |
+| 1 | Recursive factorial/Fibonacci, higher-order list processing, closures with captured state, and non-local exits run correctly through the CLI |
+| 2 | A real multi-form `.lisp` file that defines and uses its own macros plus standard macros loads and runs to a correct result |
+| 3 | A library-heavy program using strings/sequences/hash tables/formatted output produces correct observable results |
+| 4 | Programs using user-defined classes/generic functions and condition handling/restarts run correctly end-to-end |
+| 5 | A hot loop is observably promoted through tiers with identical results at each tier; invalidated speculation deoptimizes and still returns the correct result |
+| 6 | Real ASDF loads without special-casing, and a real library call such as `(uiop:getenv "PATH")` returns the process PATH |
+
+### 11.15.4  Relationship to Phase Exit Gates
+
+**R11.29** Phase exit gates in §11.14 MUST be interpreted as aggregate
+checkpoints over the stage ledger, not as permission to skip unfinished
+earlier stages. If a phase-level checklist item depends on an earlier
+stage gate, failure of that stage gate blocks the phase exit.
+
+**R11.30** Release artifacts, milestone reports, and acceptance
+transcripts SHOULD identify both the broad phase and the exact stage
+that was current when the evidence was produced, so that claims about
+project maturity remain unambiguous.
