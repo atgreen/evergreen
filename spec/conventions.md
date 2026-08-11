@@ -35,20 +35,23 @@ with ≥3 parallel fields.
 ## Build stages
 
 Bliss is built in ordered **stages**, each a runnable vertical slice with an
-end-to-end **Gate** (see `spec/stages.json` and `~/git/bureau/bliss/problem.md`).
+end-to-end **Gate** (see `spec/stages.json`, `spec/00-overview.md`, and
+`spec/11-phasing-roadmap.md`).
 A stage is done only when its Gate genuinely passes through the real `bliss`
 binary — never by stubbing the capability under test.
 
-Every requirement belongs to a stage:
+Every stage-gated requirement is expected to have an authoritative stage
+assignment:
 
-- **Inline tag (authoritative):** append `[Sn]` to a requirement's text to pin
-  it to stage `n`, e.g.
+- **Inline tag (authoritative):** append `[Sn]` as a suffix to a requirement's
+  text to pin it to stage `n`, e.g.
   `| R4.20 | The reader MUST parse ratios [S0] | MUST |`. Use this when a spec
   file spans stages (e.g. `04-compiler.md` mixes reader S0 and tiered S5).
 - **File default:** an untagged requirement inherits the stage of its spec file
   from `stages.json`'s `files` map.
-- **Unstaged:** anything with neither is reported by `spec-coverage.py` but not
-  gated. Assign it a stage as soon as its slice is in scope.
+- **Unstaged:** anything with neither is reported by `spec-coverage.py` as a
+  staging defect and is not yet gated. Assign it a stage before relying on it
+  for stage-complete acceptance.
 
 `scripts/spec-coverage.py --gate` only requires MUST requirements at or below
 `current_stage` to be covered, so work stays focused on one slice at a time.

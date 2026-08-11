@@ -618,8 +618,8 @@ controlled vocabulary:
 | `reader` | Tests the CL reader (§4.1) |
 | `compiler` | Tests compilation pipeline (§4) |
 | `gc` | Tests garbage collector (§3) |
-| `clos` | Tests CLOS (§5.2) |
-| `conditions` | Tests condition system (§5.3) |
+| `clos` | Tests CLOS (§5.3) |
+| `conditions` | Tests condition system (§5.4) |
 | `threads` | Tests thread safety (§2) |
 | `ffi` | Tests foreign function interface (§2) |
 | `format` | Tests FORMAT (§5.6) |

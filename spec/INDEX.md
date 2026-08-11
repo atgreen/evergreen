@@ -46,7 +46,7 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | File | § | Title | Requirements |
 |------|---|-------|--------------|
 | `05-01-packages-bootstrap.md` | §5.1 | Package System | R5.51–R5.58 |
-| `05-02-clos.md` | §5.2 | CLOS | R5.66–R5.79 |
+| `05-02-clos.md` | §5.3 | CLOS | R5.66–R5.79 |
 | `05-03-conditions.md` | §5.4 | Condition System | R5.91–R5.110, R5.203 |
 | `05-04-streams.md` | §5.5 | Streams | R5.111–R5.130 |
 | `05-05-sequences-hashtables.md` | §5.6–§5.7 | Sequences & Hash Tables | R5.131–R5.155 |

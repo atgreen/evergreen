@@ -110,15 +110,15 @@
 | D5.03 | Package (detailed) | §5.1 | Full package with local nicknames, conduit list, shadowing set |
 | D5.04 | SymbolTable | §5.1 | Open-addressing hash table for package symbol lookup |
 | D5.05 | Symbol Identity | §5.1 | Invariant: interned symbol has exactly one identity per package |
-| D5.06 | Generic Function Metaobject | §5.2 | GF descriptor: name, methods, lambda-list, discriminator, cache |
-| D5.07 | MethodTable | §5.2 | Sorted method list + effective method cache per GF |
-| D5.08 | Dispatch Cache | §5.2 | Hash table mapping class tuples to effective methods |
-| D5.09 | Instance Layout | §5.2 | CLOS instance memory layout (class ptr + slot vector) |
-| D5.10 | HandlerCluster | §5.3 | Handler cluster for condition system — **ID collision**: §5.1 also assigns D5.10 to PrimitiveFn; see §12.5 finding #10 |
-| D5.10 | PrimitiveFn | §5.1 | Bootstrap primitive function descriptor — **ID collision**: §5.3 also assigns D5.10 to HandlerCluster; see §12.5 finding #10 |
-| D5.11 | RestartCluster | §5.3 | Cluster of restarts established by RESTART-BIND/RESTART-CASE |
-| D5.12 | ThreadConditionState | §5.3 | Per-thread handler/restart stack and debugger state |
-| D5.13 | Pre-allocated Storage Conditions | §5.3 | Pool of 4 pre-allocated STORAGE-CONDITION instances for OOM scenarios |
+| D5.06 | Generic Function Metaobject | §5.3 | GF descriptor: name, methods, lambda-list, discriminator, cache |
+| D5.07 | MethodTable | §5.3 | Sorted method list + effective method cache per GF |
+| D5.08 | Dispatch Cache | §5.3 | Hash table mapping class tuples to effective methods |
+| D5.09 | Instance Layout | §5.3 | CLOS instance memory layout (class ptr + slot vector) |
+| D5.10 | HandlerCluster | §5.4 | Handler cluster for condition system — **ID collision**: §5.1 also assigns D5.10 to PrimitiveFn; see §12.5 finding #10 |
+| D5.10 | PrimitiveFn | §5.1 | Bootstrap primitive function descriptor — **ID collision**: §5.4 also assigns D5.10 to HandlerCluster; see §12.5 finding #10 |
+| D5.11 | RestartCluster | §5.4 | Cluster of restarts established by RESTART-BIND/RESTART-CASE |
+| D5.12 | ThreadConditionState | §5.4 | Per-thread handler/restart stack and debugger state |
+| D5.13 | Pre-allocated Storage Conditions | §5.4 | Pool of 4 pre-allocated STORAGE-CONDITION instances for OOM scenarios |
 | D5.15 | BlissFileStream | §5.4 | File-backed stream with fd, buffer, external format |
 | D5.16 | BlissStringStream | §5.4 | String-backed stream (input or output) |
 | D5.17 | Broadcast Stream | §5.4 | Output stream fanning to multiple component streams |
@@ -184,16 +184,16 @@
 | A4.11 | IC State Machine | §4.8 | Uninitialized → Mono → Poly (≤4) → Megamorphic transitions |
 | A4.12 | Tier Promotion Trigger | §4.9 | Counter overflow detection and compilation request submission |
 | A5.01 | Symbol Table Lookup/Insert | §5.1 | Open-addressing hash lookup with Robin Hood probing |
-| A5.02 | Single-Dispatch Vtable | §5.2 | Vtable-based fast path for single-argument generic dispatch |
+| A5.02 | Single-Dispatch Vtable | §5.3 | Vtable-based fast path for single-argument generic dispatch |
 | A5.03 | Multi-Package Lock Acquisition | §5.1 | Deterministic lock ordering for cross-package operations |
-| A5.04 | Snapshot Iteration / Handler Search | §5.1 / §5.3 | Copy-on-read iteration; also condition handler search algorithm |
-| A5.05 | Boot Load Algorithm / Handler-Bind | §5.1 / §5.3 | Bootstrap file loading; also HANDLER-BIND establishment |
-| A5.06 | HANDLER-CASE Expansion | §5.3 | Macro expansion of HANDLER-CASE into unwind + handler code |
-| A5.07 | RESTART-BIND/RESTART-CASE | §5.3 | Establishment of restart clusters on the dynamic stack |
-| A5.08 | COMPUTE-RESTARTS / FIND-RESTART | §5.3 | Search active restart clusters for applicable restarts |
-| A5.09 | INVOKE-RESTART | §5.3 | Transfer control to a restart's function |
-| A5.10 | Signalling Protocols | §5.3 | SIGNAL / ERROR / WARN / CERROR dispatch logic |
-| A5.11 | Debugger Entry Protocol | §5.3 | *DEBUGGER-HOOK* → default debugger entry sequence |
+| A5.04 | Snapshot Iteration / Handler Search | §5.1 / §5.4 | Copy-on-read iteration; also condition handler search algorithm |
+| A5.05 | Boot Load Algorithm / Handler-Bind | §5.1 / §5.4 | Bootstrap file loading; also HANDLER-BIND establishment |
+| A5.06 | HANDLER-CASE Expansion | §5.4 | Macro expansion of HANDLER-CASE into unwind + handler code |
+| A5.07 | RESTART-BIND/RESTART-CASE | §5.4 | Establishment of restart clusters on the dynamic stack |
+| A5.08 | COMPUTE-RESTARTS / FIND-RESTART | §5.4 | Search active restart clusters for applicable restarts |
+| A5.09 | INVOKE-RESTART | §5.4 | Transfer control to a restart's function |
+| A5.10 | Signalling Protocols | §5.4 | SIGNAL / ERROR / WARN / CERROR dispatch logic |
+| A5.11 | Debugger Entry Protocol | §5.4 | *DEBUGGER-HOOK* → default debugger entry sequence |
 | A5.12 | Namestring Reconstruction | §5.7 | Convert pathname components to a platform namestring |
 | A5.13 | Translate Logical Pathname | §5.7 | Apply logical-host translation rules to produce physical pathname |
 | A5.14 | Merge Pathnames | §5.7 | Merge defaults into a pathname per ANSI semantics |
@@ -393,7 +393,7 @@ their resolutions are confirmed below. Any remaining findings follow.
 
 10. **D5.10 dual assignment.**
     - §5.1 (packages-bootstrap) defines D5.10 as `PrimitiveFn`.
-    - §5.3 (conditions) defines D5.10 as `HandlerCluster`.
+    - §5.4 (conditions) defines D5.10 as `HandlerCluster`.
     - **Recommendation:** Renumber the bootstrap PrimitiveFn to D5.14
       (currently unassigned).
 
@@ -413,9 +413,9 @@ their resolutions are confirmed below. Any remaining findings follow.
 13. **A5.04 and A5.05 dual assignments.**
     - §5.1 defines A5.04 as "Snapshot Iteration" and A5.05 as the
       "Boot Load Algorithm".
-    - §5.3 defines A5.04 as "Handler Search" and A5.05 as
+    - §5.4 defines A5.04 as "Handler Search" and A5.05 as
       "HANDLER-BIND Establishment".
-    - **Recommendation:** Renumber the §5.3 algorithms to A5.15–A5.16
+    - **Recommendation:** Renumber the §5.4 algorithms to A5.15–A5.16
       (or higher) to avoid collision with §5.1.
 
 14. **`*READ-EVAL*` default: §4.1 reader vs §8.6.1.**

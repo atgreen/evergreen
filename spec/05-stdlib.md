@@ -7,7 +7,9 @@ functions. It covers package layout (§5.1), bootstrap ordering (§5.2), CLOS
 tables (§5.7), pathnames (§5.8), and the format/pretty-printer subsystem (§5.9).
 
 Detailed specifications for each subsystem are in companion files
-`spec/05-01-packages-bootstrap.md` through `spec/05-07-pathnames.md`.
+`spec/05-01-packages-bootstrap.md` through `spec/05-07-pathnames.md`. The
+package/bootstrap companion covers both §5.1 and §5.2; the standalone CLOS
+companion is authoritative for §5.3.
 
 ---
 
@@ -156,7 +158,8 @@ but also an instance of it.
 
 ## 5.3  CLOS — Common Lisp Object System
 
-Detailed specification in `spec/05-02-clos.md`. Summary of key design points:
+Detailed specification in `spec/05-02-clos.md` (§5.3). Summary of key design
+points:
 
 ### 5.3.1  Class Hierarchy (Core)
 

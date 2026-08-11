@@ -12,12 +12,13 @@ task is never tested *and* never implemented, so it sails straight past a
 green build — "missing" is not the same as "failing". This tool makes those
 holes visible (and, with ``--gate``, fatal).
 
-STAGING: the build is incremental (see spec/stages.json and
-~/git/bureau/bliss/problem.md). Each requirement belongs to a stage — its
-inline ``[Sn]`` tag if present, else the stage of the spec file it is defined
-in (per ``spec/stages.json``'s ``files`` map), else "unstaged". ``--gate``
-only requires MUST requirements *at or below the current stage* to be covered,
-so the project can ship a working vertical slice before covering the whole
+STAGING: the build is incremental (see ``spec/stages.json``,
+``spec/00-overview.md``, and ``spec/11-phasing-roadmap.md``). Each
+requirement belongs to a stage — its explicit trailing ``[Sn]`` tag if
+present, else the stage of the spec file it is defined in (per
+``spec/stages.json``'s ``files`` map), else "unstaged". ``--gate`` only
+requires MUST requirements *at or below the current stage* to be covered, so
+the project can ship a working vertical slice before covering the whole
 language. Requirements above the current stage (or unstaged) are reported but
 do not fail the gate. Advance the current stage only when the stage's Gate
 genuinely passes end-to-end through the real binary.
@@ -50,7 +51,7 @@ _RID_EXACT = re.compile(r"R\d+\.\d+")
 _RID_PROSE = re.compile(r"^\*\*(R\d+\.\d+)\*\*")
 _LEVEL = re.compile(r"\b(MUST(?:\s*/\s*SHOULD)?|SHOULD|MAY|REQUIRED|SHALL)\b",
                     re.IGNORECASE)
-_STAGE_TAG = re.compile(r"\[S(\d+)\]")
+_STAGE_TAG_SUFFIX = re.compile(r"\[S(\d+)\]\s*$")
 _SKIP_SPEC_FILES = {"12-glossary.md"}
 
 # Requirement stage when neither an inline tag nor the file map assigns one.
@@ -79,7 +80,7 @@ def _level_for_text(text: str) -> str | None:
 
 
 def _stage_for_text(text: str) -> int | None:
-    match = _STAGE_TAG.search(text)
+    match = _STAGE_TAG_SUFFIX.search(text.strip())
     return int(match.group(1)) if match else None
 
 
@@ -130,7 +131,7 @@ def parse_requirements(spec_dir: Path, file_stage: dict[str, int]) -> dict[str, 
                 continue
             body = " | ".join(cells[1:])
             level = _level_for_text(body) or cells[-1].upper()
-            record(cells[0], level, md.name, body)
+            record(cells[0], level, md.name, cells[1])
         for block in _split_blocks(text):
             first = block.splitlines()[0].strip()
             match = _RID_PROSE.match(first)

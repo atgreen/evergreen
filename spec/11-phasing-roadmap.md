@@ -532,7 +532,7 @@ commonly used SBCL extensions:
 4. Test `defstruct` `:include` chains — Bliss Phase 2 supports them but
    layout may differ from SBCL (check `bliss:struct-slot-offset`).
 5. Replace `sb-mop` usage with `closer-mop` or `bliss-mop`; verify
-   that only the supported MOP subset is used (see §5.2).
+   that only the supported MOP subset is used (see §5.3).
 6. Test `LOOP` — Bliss implements ANSI `LOOP` exactly; some SBCL `LOOP`
    extensions (e.g., `LOOP FOR x ACROSS-OF-TYPE`) are not supported.
 7. Run the application's test suite under Bliss with
@@ -643,7 +643,7 @@ smallest end-to-end slices a user can actually run.
 | 1 | Core evaluator | Phase 0 / early Phase 1 | §2, evaluator-facing parts of §4.3 |
 | 2 | Macros | Phase 1 | §4.2 and loader/bootstrap support across §2 and §5 |
 | 3 | Data and library breadth | Phase 1 / Phase 2 | §5.1, §5.5, §5.6, §5.7 |
-| 4 | Conditions and CLOS | Phase 2 | §5.2, §5.3 |
+| 4 | Conditions and CLOS | Phase 2 | §5.3, §5.4 |
 | 5 | HotSpot-inspired engine | Phase 2 | §3, §4.4–§4.9, §13 |
 | 6 | Real-world payload and self-hosting | Phase 3 entry gate | §6, §7, §8, §9, later §11 |
 
@@ -666,7 +666,8 @@ manifest.
 
 **R11.27** When a requirement in a multi-stage file is intended to enter
 scope before the rest of that file, it MUST be tagged inline with its
-stage (`[S0]` ... `[S6]`) per `spec/conventions.md`; otherwise it
+stage by appending a trailing suffix (`[S0]` ... `[S6]`) per
+`spec/conventions.md`; otherwise it
 inherits the file-level stage assignment from `spec/stages.json`.
 
 **R11.28** Stage advancement MUST be conservative: if the nominal stage
