@@ -33,7 +33,41 @@ pub mod profiling;
 pub mod error;
 
 // ── Re-exports for convenience ────────────────────────────────────
+pub use codegen::{
+    Aarch64Backend, CodeBuffer, CodegenBackend, LinearScanAllocator, RegisterAllocation,
+    RelocKind, Relocation, StackMap, TargetArch, X86_64Backend, native_arch,
+};
 pub use error::CompilerError;
-pub use ir::IrGraph;
-pub use reader::ReaderState;
-pub use tiered::{CompiledCode, Tier};
+pub use ic::{IcEntry, IcState, InlineCache, ic_generation, init_ic_registry, reset_all_caches};
+pub use ir::{
+    Edge, EdgeKind, IrBuilder, IrGraph, IrSourceInfo, NodeId, NodeKind, verify,
+};
+pub use macroexpand::{
+    CompilerMacroFn, DeclInfo, Environment, FunctionInfo, InlinePolicy, MacroexpandHook,
+    OptimizeQualities, VariableInfo, define_compiler_macro, define_global_macro, macroexpand,
+    macroexpand_1, macroexpand_all, set_macroexpand_hook, set_macroexpand_limit,
+    undefine_compiler_macro, undefine_global_macro,
+};
+pub use opt::{
+    ConstantFolding, DeadCodeElimination, EscapeAnalysis, FunctionRegistry, Inlining,
+    InliningConfig, Licm, NullCheckElimination, Pass, PassManager, StrengthReduction,
+    TypePropagation,
+};
+pub use osr::{
+    ConversionKind, DeoptConfig, DeoptEntry, DeoptLog, DeoptReason, DeoptResult, LocalMapping,
+    Location, OsrEntryMap, OsrEntryResult, OsrSlotDesc, TypeGuard, clear_global_deopt_logs,
+    deoptimize, is_function_blacklisted, is_function_in_backoff, osr_entry,
+};
+pub use profiling::{
+    BackEdgeCounter, FunctionProfile, InvocationCounter, TypeProfile,
+};
+pub use reader::{
+    ReaderState, SourcePos, SyntaxType, copy_readtable, get_dispatch_macro_character,
+    get_macro_character, intern_symbol, make_dispatch_macro_character, make_readtable, read,
+    read_from_string, read_from_string_with_base, register_package, set_dispatch_macro_character,
+    set_macro_character, symbol_name,
+};
+pub use tiered::{
+    BaselineCompiler, CompiledCode, Interpreter, OptimisingCompiler, Tier, TierConfig,
+    check_promotion, pop_compilation_request, process_compilation_request, request_compilation,
+};
