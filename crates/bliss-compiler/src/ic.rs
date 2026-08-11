@@ -41,6 +41,10 @@ pub struct IcEntry {
 pub struct InlineCache {
     state: Cell<IcState>,
     entries: RefCell<Vec<IcEntry>>,
+    /// Whether this cache participates in epoch-based invalidation.
+    /// Caches created before the global registry is initialised remain
+    /// standalone, which matches the explicit bootstrap contract.
+    tracked: bool,
     /// Local generation — compared against the global IC_GENERATION counter.
     generation: Cell<u64>,
 }
@@ -48,16 +52,25 @@ pub struct InlineCache {
 impl InlineCache {
     /// Create a new uninitialized inline cache.
     pub fn new() -> Self {
+        let tracked = IC_REGISTRY_INITIALIZED.load(Ordering::Acquire);
         InlineCache {
             state: Cell::new(IcState::Uninitialized),
             entries: RefCell::new(Vec::new()),
-            generation: Cell::new(IC_GENERATION.load(Ordering::Acquire)),
+            tracked,
+            generation: Cell::new(if tracked {
+                IC_GENERATION.load(Ordering::Acquire)
+            } else {
+                0
+            }),
         }
     }
 
     /// Check if the global IC generation has advanced past our local
     /// generation, and if so, lazily reset this IC.
     fn check_generation(&self) {
+        if !self.tracked {
+            return;
+        }
         let global_gen = IC_GENERATION.load(Ordering::Acquire);
         if self.generation.get() != global_gen {
             self.entries.borrow_mut().clear();
@@ -118,7 +131,11 @@ impl InlineCache {
     pub fn reset(&self) {
         self.entries.borrow_mut().clear();
         self.state.set(IcState::Uninitialized);
-        self.generation.set(IC_GENERATION.load(Ordering::Acquire));
+        self.generation.set(if self.tracked {
+            IC_GENERATION.load(Ordering::Acquire)
+        } else {
+            0
+        });
     }
 
     /// Get the current entries (for diagnostics).

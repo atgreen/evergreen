@@ -1541,7 +1541,11 @@ where
             let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
 
             if body_size == 0 && type_id == 0 {
-                break; // No more objects (zero-filled memory).
+                // Zero-filled holes can appear inside a region after prior GC
+                // activity. Keep scanning on object-aligned boundaries instead
+                // of truncating the walk at the first gap.
+                cursor += OBJECT_ALIGNMENT;
+                continue;
             }
 
             // Skip forwarded objects (they are stale copies).
