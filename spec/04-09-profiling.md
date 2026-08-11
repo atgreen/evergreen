@@ -182,7 +182,7 @@ pub const TYPE_PROFILE_RING_SIZE: usize = 4;
 
 ### 4.9.3.1 Invocation Counters
 
-The T1 baseline compiler (§4.5) emits an invocation counter increment
+The T1 baseline compiler (§4.4) emits an invocation counter increment
 in every function prologue:
 
 ```asm

@@ -11,6 +11,7 @@ binding and dispatch, restart machinery, signalling protocol (`SIGNAL`,
 
 | ID | Requirement |
 |--------|-------------|
+| R5.203 | When `*BREAK-ON-SIGNALS*` is non-NIL, the signalling functions (`SIGNAL`, `ERROR`, `WARN`, `CERROR`) MUST test `(TYPEP condition *BREAK-ON-SIGNALS*)` and, if true, call `BREAK` before performing handler search. |
 | R5.91 | All ANSI condition types listed in §5.4.2 MUST be defined as CLOS classes inheriting from `CONDITION`. |
 | R5.92 | `HANDLER-BIND` MUST establish handler clusters without consing; cluster setup MUST be O(1). |
 | R5.93 | Handler search MUST be O(n) in the number of established handler clusters, scanning newest-first. |
@@ -31,7 +32,6 @@ binding and dispatch, restart machinery, signalling protocol (`SIGNAL`,
 | R5.108 | Handler stacks and restart stacks MUST be thread-local. Each thread begins with empty stacks. |
 | R5.109 | Handler establishment (`HANDLER-BIND`, `HANDLER-CASE`) MUST NOT heap-allocate in the common case; stack-allocated clusters are REQUIRED. |
 | R5.110 | The runtime MUST pre-allocate `STORAGE-CONDITION` instances at startup for use when heap memory is exhausted. |
-| R5.111 | When `*BREAK-ON-SIGNALS*` is non-NIL, the signalling functions (`SIGNAL`, `ERROR`, `WARN`, `CERROR`) MUST test `(TYPEP condition *BREAK-ON-SIGNALS*)` and, if true, call `BREAK` before performing handler search. |
 
 ---
 
@@ -203,7 +203,7 @@ Invoked by `SIGNAL`, `ERROR`, `WARN`, and `CERROR`.
 
 ```text
 function signal-handler-search(condition):
-    // R5.111: *break-on-signals* check before handler search
+    // R5.203: *break-on-signals* check before handler search
     if *break-on-signals* ≠ NIL:
         bos ← *break-on-signals*
         *break-on-signals* ← NIL   // prevent recursive break

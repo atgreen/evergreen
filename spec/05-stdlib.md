@@ -7,7 +7,7 @@ functions. It covers package layout (§5.1), bootstrap ordering (§5.2), CLOS
 tables (§5.7), pathnames (§5.8), and the format/pretty-printer subsystem (§5.9).
 
 Detailed specifications for each subsystem are in companion files
-`spec/05-01-packages-bootstrap.md` through `spec/05-06-format-printer.md`.
+`spec/05-01-packages-bootstrap.md` through `spec/05-07-pathnames.md`.
 
 ---
 
@@ -315,7 +315,7 @@ length and allocate once.
 
 ## 5.7  Hash Tables
 
-Detailed specification in `spec/05-05-sequences-hashtables.md` §5.7 subsection. Summary:
+Detailed specification in `spec/05-05-sequences-hashtables.md` §5.6–§5.7. Summary:
 
 **R5.31** Hash table implementation MUST use **Robin Hood hashing** with
 open addressing and backward-shift deletion.

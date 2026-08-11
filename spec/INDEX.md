@@ -17,7 +17,7 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | `02-runtime-core.md` | §2 | Runtime Core | Thread model, stack layout, safepoints, FFI, signals, startup |
 | `03-memory-gc.md` | §3 | Memory & GC | Nursery/old-gen, TLABs, concurrent marking, compaction, finalization |
 | `04-compiler.md` | §4 | Compiler Pipeline | Overview + 9 sub-chapters (§4.1–§4.9) |
-| `05-stdlib.md` | §5 | Standard Library | Overview + 7 sub-chapters (§5.1–§5.7) |
+| `05-stdlib.md` | §5 | Standard Library | Overview + 7 companion files spanning §5.1–§5.9 |
 | `06-devtools.md` | §6 | Developer Tools | REPL, debugger, profiler, SLIME/SLY protocol |
 | `07-ops-portability.md` | §7 | Ops & Portability | Image format, deployment, platform matrix, build, logging |
 | `08-security-robustness.md` | §8 | Security & Robustness | Sandbox, safe FFI, resource limits, reader hardening, fuzzing |
@@ -47,11 +47,11 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 |------|---|-------|--------------|
 | `05-01-packages-bootstrap.md` | §5.1 | Package System | R5.51–R5.58 |
 | `05-02-clos.md` | §5.2 | CLOS | R5.66–R5.79 |
-| `05-03-conditions.md` | §5.3 | Condition System | R5.91–R5.107 |
-| `05-04-streams.md` | §5.4 | Streams | R5.111–R5.120 |
-| `05-05-sequences-hashtables.md` | §5.5 | Sequences & Hash Tables | R5.131–R5.133 |
-| `05-06-format-printer.md` | §5.6 | FORMAT & Pretty-Printer | R5.156–R5.173 |
-| `05-07-pathnames.md` | §5.7 | Pathnames | R5.181–R5.194 |
+| `05-03-conditions.md` | §5.4 | Condition System | R5.91–R5.110, R5.203 |
+| `05-04-streams.md` | §5.5 | Streams | R5.111–R5.130 |
+| `05-05-sequences-hashtables.md` | §5.6–§5.7 | Sequences & Hash Tables | R5.131–R5.155 |
+| `05-06-format-printer.md` | §5.9 | FORMAT & Pretty-Printer | R5.156–R5.180 |
+| `05-07-pathnames.md` | §5.8 | Pathnames | R5.181–R5.202 |
 
 ## Requirement ID Ranges
 
@@ -61,7 +61,7 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | §2 Runtime Core | R2.01–R2.xx | ~25 |
 | §3 Memory & GC | R3.01–R3.xx | ~20 |
 | §4 Compiler | R4.01–R4.58 | ~58 |
-| §5 Standard Library | R5.01–R5.194 | ~60 |
+| §5 Standard Library | R5.01–R5.203 | ~60 |
 | §6 Developer Tools | R6.01–R6.09 | ~15 |
 | §7 Ops & Portability | R7.01–R7.18 | ~18 |
 | §8 Security | R8.01–R8.15 | ~15 |
@@ -73,8 +73,8 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 
 | Concern | Primary § | Also appears in |
 |---------|-----------|-----------------|
-| Thread safety | §2 | §3 (GC safepoints), §5.1 (packages), §5.4 (streams), §8 |
-| Error handling | §5.3 (conditions) | §2 (signals→conditions), §4.1 (READER-ERROR), §8 |
+| Thread safety | §2 | §3 (GC safepoints), §5.1 (packages), §5.5 (streams), §8 |
+| Error handling | §5.4 (conditions) | §2 (signals→conditions), §4.1 (READER-ERROR), §8 |
 | Performance | §4.4 (tiered), §4.9 (profiling) | §3 (GC pauses), §10 (benchmarks) |
 | ANSI compliance | §0 (G1) | §5 (978 symbols), §10 (ansi-test) |
 | Security | §8 | §2 (FFI), §4.1 (reader hardening) |

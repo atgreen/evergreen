@@ -542,12 +542,12 @@ optimisation and developer tooling.
 
 | Counter | Type | Updated By |
 |---------|------|-----------|
-| `hit_count` | `AtomicU32` | Profiling subsystem (§4.5): sampled periodically via timer-based profiling interrupts, NOT incremented on every fast-path hit.  When `BLISS_IC_STATS_ENABLED` is `false`, hit counting is disabled entirely. |
+| `hit_count` | `AtomicU32` | Profiling subsystem (§4.9): sampled periodically via timer-based profiling interrupts, NOT incremented on every fast-path hit.  When `BLISS_IC_STATS_ENABLED` is `false`, hit counting is disabled entirely. |
 | `miss_count` | `AtomicU32` | `ic_miss` handler (always incremented; miss path is already slow). |
 
 ### Aggregate Metrics
 
-The profiling subsystem (§4.5) periodically samples IC sites and
+The profiling subsystem (§4.9) periodically samples IC sites and
 maintains:
 
 | Metric | Description |
@@ -577,7 +577,7 @@ maintains:
 
 ### Tier Promotion Feedback
 
-The IC statistics feed back into tier promotion decisions (§4.5):
+The IC statistics feed back into tier promotion decisions (§4.9):
 
 - A function with high `ic_miss_rate` is deprioritised for T2
   promotion (optimising code with unstable ICs wastes compile time).

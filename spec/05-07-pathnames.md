@@ -1,4 +1,4 @@
-# §5.7 Pathnames and Logical Pathnames
+# §5.8 Pathnames and Logical Pathnames
 
 **Scope:** This section specifies the pathname abstraction in Bliss,
 covering the `PATHNAME` and `LOGICAL-PATHNAME` class hierarchy,
@@ -10,7 +10,7 @@ expansion extension.
 
 ---
 
-## 5.7.1 Requirements
+## 5.8.1 Requirements
 
 | ID | Requirement |
 |----|-------------|
@@ -39,7 +39,7 @@ expansion extension.
 
 ---
 
-## 5.7.2 Data Structures
+## 5.8.2 Data Structures
 
 ### D5.30 — Pathname
 
@@ -120,7 +120,7 @@ The directory slot is a proper list with one of two structures:
 
 ---
 
-## 5.7.3 Algorithms
+## 5.8.3 Algorithms
 
 ### A5.11 — Physical Pathname Parsing (POSIX)
 
@@ -309,7 +309,7 @@ MERGE-PATHNAMES(P, D, V):
 
 ---
 
-## 5.7.4 Logical Pathname Syntax and Parsing
+## 5.8.4 Logical Pathname Syntax and Parsing
 
 Logical pathnames use a host-based syntax distinct from physical paths:
 
@@ -338,7 +338,7 @@ word               ::= { letter | digit | "-" }+
 
 ---
 
-## 5.7.5 Function Contracts
+## 5.8.5 Function Contracts
 
 ### MAKE-PATHNAME
 
@@ -444,7 +444,7 @@ word               ::= { letter | digit | "-" }+
 
 ---
 
-## 5.7.6 File-System Interaction
+## 5.8.6 File-System Interaction
 
 ### PROBE-FILE
 
@@ -498,7 +498,7 @@ word               ::= { letter | digit | "-" }+
 
 ---
 
-## 5.7.7 Tilde Expansion (Bliss Extension)
+## 5.8.7 Tilde Expansion (Bliss Extension)
 
 Per R5.194, Bliss expands `~` at parse time (A5.11 step 1):
 
@@ -512,7 +512,7 @@ Per R5.194, Bliss expands `~` at parse time (A5.11 step 1):
 
 ---
 
-## 5.7.8 Error Handling
+## 5.8.8 Error Handling
 
 | Condition | When |
 |-----------|------|
@@ -530,7 +530,7 @@ the offending pathname in the condition's `:PATHNAME` slot
 
 ---
 
-## 5.7.9 Concurrency
+## 5.8.9 Concurrency
 
 - Pathname objects are immutable once constructed (R5.200). No
   synchronisation is required for concurrent reads.
@@ -549,7 +549,7 @@ the offending pathname in the condition's `:PATHNAME` slot
 
 ---
 
-## 5.7.10 Configuration
+## 5.8.10 Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -559,7 +559,7 @@ the offending pathname in the condition's `:PATHNAME` slot
 
 ---
 
-## 5.7.11 Test Strategy
+## 5.8.11 Test Strategy
 
 1. **Unit tests (A5.11):** absolute, relative, root, trailing slash, dot files, multiple extensions, consecutive slashes, `//`, empty string, tilde expansion with mocked `$HOME`/`getpwnam`.
 2. **Round-trip (R5.187):** random pathnames verify `(equal pn (parse-namestring (namestring pn)))`.
@@ -572,7 +572,7 @@ the offending pathname in the condition's `:PATHNAME` slot
 
 ---
 
-## 5.7.12 Module Map
+## 5.8.12 Module Map
 
 | Source file | Contents |
 |-------------|----------|

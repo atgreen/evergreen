@@ -3,7 +3,7 @@
 **Scope.**  Bliss executes Common Lisp code through three tiers modelled on
 the HotSpot JVM's interpreter → C1 → C2 pipeline.  This section specifies
 each tier's internal mechanics, the decision logic for tier transitions, the
-compilation queue, and the interaction with the profiling subsystem (§4.5).
+compilation queue, and the interaction with the profiling subsystem (§4.9).
 
 ---
 
@@ -301,7 +301,7 @@ collected into a freshly allocated list at the callee's prologue.
 **D4.07 — Compilation Request** is defined in §4.4.6 below (compilation queue).
 **D4.08 — Stack Frame Layout** is the diagram above.
 
-The `FnMeta` pointer stored in the frame allows the profiling subsystem (§4.5)
+The `FnMeta` pointer stored in the frame allows the profiling subsystem (§4.9)
 and the debugger (§6) to identify the function for any frame on the stack.
 
 ### 4.4.4.6  Profiling Stub Insertion
@@ -486,7 +486,7 @@ Output: action ∈ { NONE, COMPILE_T1, ENQUEUE_T2 }
 
 ## 4.4.8  Profiling Subsystem Interaction
 
-The tiered compilation system depends on §4.5 (Profiling) for:
+The tiered compilation system depends on §4.9 (Profiling) for:
 
 | Interaction Point | Direction | Description |
 |-------------------|-----------|-------------|

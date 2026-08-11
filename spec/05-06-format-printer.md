@@ -445,7 +445,7 @@ approximate character position.
 ## 5.9.12 Concurrency (R5.180)
 
 - `FORMAT nil` → thread-local string stream; no shared state.
-- `FORMAT` to a shared stream synchronizes via stream lock (§5.7).
+- `FORMAT` to a shared stream synchronizes via stream lock (§5.5).
 - `*print-pprint-dispatch*` is immutable once installed; mutation copies via `copy-pprint-dispatch`. Concurrent reads are lock-free.
 - FORMAT string cache is thread-local (no locking).
 - Circularity detector allocated per-call on the stack (no sharing).

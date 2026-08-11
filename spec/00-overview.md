@@ -64,7 +64,7 @@ conflict with ANSI semantics. Each adopted extension MUST be listed in
 | T1 | **Baseline compiler** | Call count ≥ 10 | Unoptimised native code |
 | T2 | **Optimising compiler** | Hot loop / call count ≥ 5000 | Optimised native via IR |
 
-Tier transitions are managed by the **Profiling Subsystem** (§4.5) which
+Tier transitions are managed by the **Profiling Subsystem** (§4.9) which
 inserts counters and traps, exactly as HotSpot's C1/C2 pipeline does.
 
 ### 1.2  Language Used per Layer
@@ -94,50 +94,65 @@ cross-referencing. Code modules reference spec sections as `§N.M`.
 | `10-testing-validation.md` | §10 Testing & Validation | ANSI test suite, benchmarks, CI, fuzzing strategy |
 | `11-phasing-roadmap.md` | §11 Phasing & Roadmap | Bootstrap phases, milestones, self-hosting path |
 
-## 3  Directory Structure (Source Tree)
+## 3  Directory Structure (Current Source Tree)
 
 ```
 bliss/
 ├── Cargo.toml              # workspace root
 ├── spec/                   # this specification
+├── scripts/
+│   └── spec-coverage.py    # requirement traceability gate
 ├── crates/
 │   ├── bliss-rt/           # §2 runtime core (Rust)
 │   │   ├── src/
-│   │   │   ├── object.rs       # tagged pointer, object header
-│   │   │   ├── heap.rs         # heap regions, allocation
-│   │   │   ├── gc/             # §3 garbage collector
-│   │   │   ├── thread.rs       # native thread + green thread
+│   │   │   ├── runtime.rs      # runtime entry points and coordination
+│   │   │   ├── object.rs       # tagged object model support
+│   │   │   ├── value.rs        # Bliss value representation helpers
+│   │   │   ├── gc.rs           # §3 garbage collector
+│   │   │   ├── image.rs        # image save/load support
+│   │   │   ├── safepoint.rs    # safepoint protocol
+│   │   │   ├── scheduler.rs    # green-thread scheduling
+│   │   │   ├── sandbox.rs      # sandbox enforcement
+│   │   │   ├── stack.rs        # CL stack representation
+│   │   │   ├── thread.rs       # native and green thread state
 │   │   │   ├── ffi.rs          # C-ABI bridge
-│   │   │   ├── signal.rs       # POSIX signal handling
-│   │   │   └── startup.rs      # image load, init sequence
+│   │   │   ├── error.rs        # runtime error types
+│   │   │   ├── types.rs        # runtime type descriptors
+│   │   │   └── lib.rs
 │   │   └── Cargo.toml
 │   ├── bliss-compiler/     # §4 compiler pipeline (Rust bootstrap)
 │   │   ├── src/
 │   │   │   ├── reader.rs       # CL reader
 │   │   │   ├── macroexpand.rs  # macro expansion
 │   │   │   ├── ir.rs           # intermediate representation
-│   │   │   ├── baseline.rs     # T1 baseline codegen
+│   │   │   ├── tiered.rs       # tiered compilation orchestration
 │   │   │   ├── opt.rs          # T2 optimising backend
-│   │   │   └── osr.rs          # on-stack replacement
+│   │   │   ├── osr.rs          # on-stack replacement
+│   │   │   ├── codegen.rs      # native code emission
+│   │   │   ├── ic.rs           # inline caches
+│   │   │   ├── profiling.rs    # profiling counters and metadata
+│   │   │   └── lib.rs
 │   │   └── Cargo.toml
-│   ├── bliss-stdlib/       # §5 standard library (CL sources)
+│   ├── bliss-stdlib/       # §5 standard library (Rust bootstrap implementation)
 │   │   ├── src/
-│   │   │   ├── clos/
-│   │   │   ├── conditions.lisp
-│   │   │   ├── sequences.lisp
-│   │   │   ├── streams.lisp
-│   │   │   └── ...
-│   │   └── bliss-stdlib.asd
+│   │   │   ├── clos.rs         # CLOS support
+│   │   │   ├── conditions.rs   # condition system
+│   │   │   ├── streams.rs      # streams
+│   │   │   ├── sequences.rs    # sequences
+│   │   │   ├── hashtable.rs    # hash tables
+│   │   │   ├── pathnames.rs    # pathnames
+│   │   │   ├── format.rs       # FORMAT and printer support
+│   │   │   ├── packages.rs     # package system
+│   │   │   ├── devtools.rs     # developer tools hooks
+│   │   │   └── lib.rs
+│   │   └── Cargo.toml
 │   └── bliss-cli/          # REPL + command-line driver
+│       ├── src/cli.rs
 │       ├── src/main.rs
 │       └── Cargo.toml
-├── lib/                    # CL library code loaded at boot
-│   ├── boot.lisp           # minimal bootstrap sequence
-│   └── compiler.lisp       # self-hosted compiler (later)
-└── tests/
-    ├── ansi-test/          # git submodule → ansi-test suite
-    ├── unit/               # per-module Rust tests
-    └── integration/        # end-to-end CL test scripts
+├── lib/
+│   └── asdf.lisp           # bundled bootstrap library support
+└── crates/*/tests/         # per-crate unit and integration tests
 ```
 
 ## 4  Key Design Decisions

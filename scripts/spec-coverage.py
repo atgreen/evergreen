@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """spec-coverage.py — requirement traceability gate for Bliss.
 
-Enumerates the normative requirements declared in ``spec/`` (markdown table
-rows of the form ``| R6.45 | ... | MUST |``) and checks which are cited by at
-least one test under ``crates/*/tests/`` — tests reference a requirement by
-its R-id, e.g. ``// Per R6.45, (require ...) delegates to ASDF``.
+Enumerates the normative requirements declared in ``spec/`` (both markdown
+table rows of the form ``| R6.45 | ... | MUST |`` and prose entries of the
+form ``**R10.01** ... MUST ...``) and checks which are cited by at least one
+test under ``crates/*/tests/`` — tests reference a requirement by its R-id,
+e.g. ``// Per R6.45, (require ...) delegates to ASDF``.
 
 Why this exists: a spec-mandated capability that no phase ever turned into a
 task is never tested *and* never implemented, so it sails straight past a
@@ -28,21 +29,63 @@ from collections import defaultdict
 from pathlib import Path
 
 _RID_EXACT = re.compile(r"R\d+\.\d+")
+_RID_PROSE = re.compile(r"^\*\*(R\d+\.\d+)\*\*")
+_LEVEL = re.compile(r"\b(MUST(?:\s*/\s*SHOULD)?|SHOULD|MAY|REQUIRED|SHALL)\b",
+                    re.IGNORECASE)
+_SKIP_SPEC_FILES = {"12-glossary.md"}
+
+
+def _split_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] = []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def _level_for_text(text: str) -> str | None:
+    match = _LEVEL.search(text)
+    return match.group(1).upper() if match else None
 
 
 def parse_requirements(spec_dir: Path) -> dict[str, tuple[str, str]]:
-    """Return {req_id: (level, spec_filename)} for every requirement row."""
+    """Return {req_id: (level, spec_filename)} for every requirement."""
     reqs: dict[str, tuple[str, str]] = {}
     for md in sorted(spec_dir.rglob("*.md")):
-        for raw in md.read_text(errors="replace").splitlines():
+        if md.name in _SKIP_SPEC_FILES:
+            continue
+        text = md.read_text(errors="replace")
+        for raw in text.splitlines():
             line = raw.strip()
             if not line.startswith("|"):
                 continue
             cells = [c.strip() for c in line.strip("|").split("|")]
             if len(cells) < 2 or not _RID_EXACT.fullmatch(cells[0]):
                 continue
-            level = cells[-1].upper()
+            level = _level_for_text(" | ".join(cells[1:])) or cells[-1].upper()
+            if cells[0] in reqs:
+                continue
             reqs[cells[0]] = (level, md.name)
+        for block in _split_blocks(text):
+            first = block.splitlines()[0].strip()
+            match = _RID_PROSE.match(first)
+            if not match:
+                continue
+            level = _level_for_text(block)
+            if not level:
+                continue
+            rid = match.group(1)
+            if rid in reqs:
+                continue
+            reqs[rid] = (level, md.name)
     return reqs
 
 
