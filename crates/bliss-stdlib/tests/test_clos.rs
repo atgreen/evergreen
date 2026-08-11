@@ -6,6 +6,10 @@ fn sym(i: u32) -> BlissVal {
     BlissVal::from_symbol_index(i)
 }
 
+fn fx(i: i64) -> BlissVal {
+    BlissVal::from_fixnum(i)
+}
+
 #[test]
 fn method_combination_variants_distinct() {
     let v = [
@@ -48,32 +52,34 @@ fn set_find_class_roundtrip() {
     assert_eq!(find_class(name), Some(cls));
 }
 
-// Issue 1: class_of must assert correct metaclass, not discard results.
 #[test]
-fn class_of_returns_correct_metaclass() {
+fn class_of_returns_builtin_and_instance_classes_in_constant_observable_time() {
     bootstrap_clos().unwrap();
-    // class_of a fixnum should return the FIXNUM class (not NIL, not garbage)
-    let fixnum_class = class_of(BlissVal::from_fixnum(7));
-    // The class itself must be a valid value (not NIL for a real object)
-    assert_ne!(fixnum_class, NIL, "class_of fixnum must not return NIL");
+    let cls = fx(2026);
+    let slot = sym(2026);
+    define_class(sym(2027), cls, &[], &[slot]).unwrap();
+    let instance = make_instance(cls, &[slot, fx(41)]).unwrap();
 
-    // class_of NIL should return the NULL class
-    let nil_class = class_of(NIL);
-    assert_ne!(
-        nil_class, NIL,
-        "class_of NIL must return the NULL class, not NIL itself"
-    );
-
-    // Different types should have different classes
+    // Per R5.68 and R5.69, instances expose a stable class identity through
+    // their header/wrapper path; per R5.88 and R5.89, built-in classes and
+    // user instances must all return class metaobjects through CLASS-OF.
+    let fixnum_class = class_of(fx(7));
     let char_class = class_of(BlissVal::from_char('a'));
-    assert_ne!(
-        fixnum_class, char_class,
-        "class_of fixnum and class_of char must return different classes"
-    );
-
-    // class_of T should return the SYMBOL class (T is a symbol)
-    let t_class = class_of(T);
-    assert_ne!(t_class, NIL, "class_of T must not return NIL");
+    let symbol_class = class_of(T);
+    let nil_class = class_of(NIL);
+    assert_eq!(class_of(instance), cls);
+    assert_eq!(class_of(instance), cls, "class_of must stay stable across repeated reads");
+    assert_ne!(fixnum_class, NIL);
+    assert_ne!(char_class, NIL);
+    assert_ne!(symbol_class, NIL);
+    assert_ne!(nil_class, NIL);
+    assert_ne!(fixnum_class, char_class);
+    assert_ne!(fixnum_class, symbol_class);
+    assert_ne!(nil_class, symbol_class);
+    assert_ne!(class_name(fixnum_class), NIL);
+    assert_ne!(class_name(char_class), NIL);
+    assert_ne!(class_name(symbol_class), NIL);
+    assert_ne!(class_name(nil_class), NIL);
 }
 
 #[test]
@@ -94,41 +100,23 @@ fn cpl_starts_with_self() {
     assert_eq!(cpl[0], cls);
 }
 
-// Issue 2: Test C3 linearization with diamond inheritance.
-// Diamond: D inherits from B and C, both B and C inherit from A.
-// C3 linearization for D should be [D, B, C, A, ...] (standard CLOS MRO).
 #[test]
 fn cpl_c3_linearization_diamond() {
     bootstrap_clos().unwrap();
+    let class_a = fx(310);
+    let class_b = fx(311);
+    let class_c = fx(312);
+    let class_d = fx(313);
 
-    // Create four classes forming a diamond: A at top, B and C in middle, D at bottom
-    let class_a = BlissVal::from_fixnum(310);
-    let class_b = BlissVal::from_fixnum(311);
-    let class_c = BlissVal::from_fixnum(312);
-    let class_d = BlissVal::from_fixnum(313);
+    // Per R5.67, COMPUTE-CLASS-PRECEDENCE-LIST must implement real C3
+    // linearization over an explicit diamond superclass graph.
+    define_class(sym(310), class_a, &[], &[]).unwrap();
+    define_class(sym(311), class_b, &[class_a], &[]).unwrap();
+    define_class(sym(312), class_c, &[class_a], &[]).unwrap();
+    define_class(sym(313), class_d, &[class_b, class_c], &[]).unwrap();
 
-    let name_a = sym(310);
-    let name_b = sym(311);
-    let name_c = sym(312);
-    let name_d = sym(313);
-
-    // Register classes: A has no explicit supers (implicitly T/STANDARD-OBJECT),
-    // B -> A, C -> A, D -> B, C
-    set_find_class(name_a, class_a).unwrap();
-    set_find_class(name_b, class_b).unwrap();
-    set_find_class(name_c, class_c).unwrap();
-    set_find_class(name_d, class_d).unwrap();
-
-    // For the diamond, we need the implementation to know the hierarchy.
-    // We rely on make_instance or equivalent class definition mechanism;
-    // here we test compute_class_precedence_list on a class at the bottom
-    // of the diamond.
     let cpl_d = compute_class_precedence_list(class_d).unwrap();
-
-    // D must be first in its own CPL
     assert_eq!(cpl_d[0], class_d, "D must be first in its CPL");
-
-    // B must appear before C (left-to-right direct superclass order)
     let pos_b = cpl_d
         .iter()
         .position(|&v| v == class_b)
@@ -142,7 +130,6 @@ fn cpl_c3_linearization_diamond() {
         "B must precede C in D's CPL (left-to-right rule)"
     );
 
-    // A must appear after both B and C (C3 monotonicity)
     let pos_a = cpl_d
         .iter()
         .position(|&v| v == class_a)
@@ -291,19 +278,39 @@ fn compute_effective_method_standard_and_empty() {
     assert!(compute_effective_method(gf2, MethodCombinationType::Standard, &[]).is_err());
 }
 
-// Issue 3: Test compute_effective_method with non-Standard MethodCombinationType variants.
 #[test]
 fn compute_effective_method_non_standard_variants() {
     let gf = make_generic_function(sym(605), NIL).unwrap();
-    let m1 = BlissVal::from_fixnum(1);
-    let m2 = BlissVal::from_fixnum(2);
-    add_method(gf, m1).unwrap();
-    add_method(gf, m2).unwrap();
+    let around = fx(1);
+    let before = fx(2);
+    let primary_1 = fx(3);
+    let primary_2 = fx(4);
+    let after = fx(5);
+    for method in [around, before, primary_1, primary_2, after] {
+        add_method(gf, method).unwrap();
+    }
+    set_method_specializers(around, vec![], MethodQualifier::Around);
+    set_method_specializers(before, vec![], MethodQualifier::Before);
+    set_method_specializers(primary_1, vec![], MethodQualifier::Primary);
+    set_method_specializers(primary_2, vec![], MethodQualifier::Primary);
+    set_method_specializers(after, vec![], MethodQualifier::After);
 
-    let methods = &[m1, m2];
+    // Per R5.77, R5.78, and R5.79, the effective-method protocol must expose
+    // observable standard-combination structure and preserve short-form
+    // combination metadata over the primary-method chain.
+    let standard_key = compute_effective_method(
+        gf,
+        MethodCombinationType::Standard,
+        &[around, before, primary_1, primary_2, after],
+    )
+    .unwrap();
+    let standard = get_effective_method(standard_key).unwrap();
+    assert_eq!(standard.0, vec![around]);
+    assert_eq!(standard.1, vec![before]);
+    assert_eq!(standard.2, vec![primary_1, primary_2]);
+    assert_eq!(standard.3, vec![after]);
 
-    // Each non-Standard combination type should produce a valid effective method
-    let combinations = [
+    for combo in [
         MethodCombinationType::Plus,
         MethodCombinationType::And,
         MethodCombinationType::Or,
@@ -313,44 +320,116 @@ fn compute_effective_method_non_standard_variants() {
         MethodCombinationType::Min,
         MethodCombinationType::Max,
         MethodCombinationType::Progn,
-    ];
-
-    let standard_result =
-        compute_effective_method(gf, MethodCombinationType::Standard, methods).unwrap();
-
-    for combo in &combinations {
-        let result = compute_effective_method(gf, *combo, methods);
-        assert!(
-            result.is_ok(),
-            "compute_effective_method should succeed with {:?} combination",
-            combo
-        );
-        // Non-Standard combinations should produce a result different from Standard,
-        // since they combine method results differently (e.g., Plus sums them).
-        let em = result.unwrap();
-        assert_ne!(
-            em, standard_result,
-            "{:?} combination should produce a different effective method than Standard",
-            combo
-        );
+    ] {
+        let key =
+            compute_effective_method(gf, combo, &[around, primary_1, primary_2, after]).unwrap();
+        let (kind, methods) = get_short_form_method(key).unwrap();
+        assert_eq!(kind, combo);
+        assert_eq!(methods, vec![primary_1, primary_2]);
     }
-
-    // Verify distinct combination types produce distinct effective methods where expected
-    let plus_em = compute_effective_method(gf, MethodCombinationType::Plus, methods).unwrap();
-    let and_em = compute_effective_method(gf, MethodCombinationType::And, methods).unwrap();
-    assert_ne!(
-        plus_em, and_em,
-        "Plus and And combinations should produce different effective methods"
-    );
 }
 
 #[test]
 fn change_class_succeeds() {
     bootstrap_clos().unwrap();
-    let old = BlissVal::from_fixnum(700);
-    set_find_class(sym(700), old).unwrap();
-    let inst = make_instance(old, &[]).unwrap();
-    let new = BlissVal::from_fixnum(701);
-    set_find_class(sym(701), new).unwrap();
+    let old = fx(700);
+    let new = fx(701);
+    let shared = sym(702);
+    let old_only = sym(703);
+    let new_only = sym(704);
+
+    // Per R5.82, CHANGE-CLASS must invoke the update protocol observably by
+    // preserving same-named slots while rebinding the instance to the new class.
+    define_class(sym(700), old, &[], &[shared, old_only]).unwrap();
+    define_class(sym(701), new, &[], &[shared, new_only]).unwrap();
+    let inst = make_instance(old, &[shared, fx(11), old_only, fx(12)]).unwrap();
     change_class(inst, new).unwrap();
+    assert_eq!(class_of(inst), new);
+    assert_eq!(slot_value(inst, shared).unwrap(), fx(11));
+    assert!(slot_value(inst, old_only).is_err());
+    assert!(!slot_boundp(inst, new_only).unwrap());
+}
+
+#[test]
+fn multi_argument_dispatch_uses_later_specializer_positions() {
+    bootstrap_clos().unwrap();
+    let first = fx(800);
+    let second_base = fx(801);
+    let second_specific = fx(802);
+    define_class(sym(800), first, &[], &[]).unwrap();
+    define_class(sym(801), second_base, &[], &[]).unwrap();
+    define_class(sym(802), second_specific, &[second_base], &[]).unwrap();
+
+    let first_instance = make_instance(first, &[]).unwrap();
+    let second_instance = make_instance(second_specific, &[]).unwrap();
+    let fixnum_class = class_of(fx(0));
+    let standard_object_class = class_direct_superclasses(fixnum_class)[0];
+    let t_class = class_direct_superclasses(standard_object_class)[0];
+
+    let gf = make_generic_function(sym(803), NIL).unwrap();
+    let generic_second = fx(804);
+    let specific_second = fx(805);
+    add_method(gf, generic_second).unwrap();
+    add_method(gf, specific_second).unwrap();
+    set_method_specializers(generic_second, vec![t_class, second_base], MethodQualifier::Primary);
+    set_method_specializers(
+        specific_second,
+        vec![t_class, second_specific],
+        MethodQualifier::Primary,
+    );
+
+    // Per R5.76, specializer discrimination must consider non-leading argument
+    // positions; this exercises the observable second-argument dispatch path.
+    assert_eq!(
+        compute_applicable_methods(gf, &[first_instance, second_instance]),
+        vec![specific_second, generic_second]
+    );
+}
+
+#[test]
+fn redefined_instances_keep_existing_state_visible_on_first_and_second_access() {
+    bootstrap_clos().unwrap();
+    let class = fx(900);
+    let old_slot = sym(901);
+    let new_slot = sym(902);
+    define_class(sym(903), class, &[], &[old_slot]).unwrap();
+    let instance = make_instance(class, &[old_slot, fx(77)]).unwrap();
+
+    // Per R5.83 and R5.84, obsolete instances must update lazily on first
+    // access and then remain stable on subsequent accesses.
+    define_class(sym(903), class, &[], &[old_slot, new_slot]).unwrap();
+    assert_eq!(slot_value(instance, old_slot).unwrap(), fx(77));
+    assert!(slot_value(instance, new_slot).is_err());
+    set_slot_value(instance, new_slot, fx(88)).unwrap();
+    assert_eq!(slot_value(instance, old_slot).unwrap(), fx(77));
+    assert_eq!(slot_value(instance, new_slot).unwrap(), fx(88));
+}
+
+#[test]
+fn dispatch_surface_reflects_method_mutation_without_stale_results() {
+    bootstrap_clos().unwrap();
+    let animal = fx(950);
+    let dog = fx(951);
+    define_class(sym(950), animal, &[], &[]).unwrap();
+    define_class(sym(951), dog, &[animal], &[]).unwrap();
+    let dog_instance = make_instance(dog, &[]).unwrap();
+    let gf = make_generic_function(sym(952), NIL).unwrap();
+    let animal_method = fx(953);
+    let dog_method = fx(954);
+    add_method(gf, animal_method).unwrap();
+    add_method(gf, dog_method).unwrap();
+    set_method_specializers(animal_method, vec![animal], MethodQualifier::Primary);
+    set_method_specializers(dog_method, vec![dog], MethodQualifier::Primary);
+
+    // Per R5.85, dispatch invalidation after method/class mutation must be
+    // observable as fresh applicable-method results rather than stale caches.
+    assert_eq!(
+        compute_applicable_methods(gf, &[dog_instance]),
+        vec![dog_method, animal_method]
+    );
+    remove_method(gf, dog_method).unwrap();
+    assert_eq!(
+        compute_applicable_methods(gf, &[dog_instance]),
+        vec![animal_method]
+    );
 }
