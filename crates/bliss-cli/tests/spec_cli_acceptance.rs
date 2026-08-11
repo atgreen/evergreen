@@ -361,3 +361,63 @@ fn hash_tables_and_funcall_of_builtins_work() {
     assert!(stdout.contains("(\"A\" \"B\")"), "mapcar string: {stdout}");
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn stage_one_gate_programs_run_through_the_real_cli() {
+    // Per §0.4 stage 1 and §11.3 / spec/stages.json, the core-evaluator gate
+    // is real CLI execution of recursion, higher-order list processing,
+    // closures with captured state, and non-local exits.
+    // Per R2.02 and R10.06, this must run through the actual startup/load path.
+    let dir = temp_dir("stage1-gate");
+    let script = dir.join("core-evaluator.lisp");
+    write_file(
+        &script,
+        "(defun fib (n)\n\
+           (if (eq n 0)\n\
+               0\n\
+               (if (eq n 1)\n\
+                   1\n\
+                   (+ (fib (- n 1)) (fib (- n 2))))))\n\
+         (defun make-counter (start)\n\
+           (let ((n start))\n\
+             (lambda (&optional (delta 1))\n\
+               (setq n (+ n delta))\n\
+               n)))\n\
+         (print (fib 10))\n\
+         (print (mapcar (lambda (x) (* x x)) '(1 2 3 4)))\n\
+         (let ((counter (make-counter 7)))\n\
+           (print (list (funcall counter) (funcall counter 5))))\n\
+         (print (catch 'done\n\
+                  (progn\n\
+                    (throw 'done '(escaped ok))\n\
+                    nil)))\n",
+    );
+
+    let output = bliss()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run bliss stage-1 gate");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    assert!(stdout.contains("55"), "fib output missing from: {stdout}");
+    assert!(
+        stdout.contains("(1 4 9 16)"),
+        "mapcar/lambda output missing from: {stdout}"
+    );
+    assert!(
+        stdout.contains("(8 13)"),
+        "closure state output missing from: {stdout}"
+    );
+    assert!(
+        stdout.contains("(ESCAPED OK)"),
+        "catch/throw output missing from: {stdout}"
+    );
+    fs::remove_dir_all(dir).ok();
+}
