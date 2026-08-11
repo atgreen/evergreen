@@ -23,30 +23,19 @@ pub enum CompilerError {
     },
 
     /// Circular macro expansion detected.
-    CircularExpansion {
-        macro_name: String,
-    },
+    CircularExpansion { macro_name: String },
 
     /// IR construction or validation error. Internal — fall back to T0.
-    IrError {
-        message: String,
-    },
+    IrError { message: String },
 
     /// Optimisation pass error. Internal — abort T2, retain T1.
-    OptimisationError {
-        pass_name: String,
-        message: String,
-    },
+    OptimisationError { pass_name: String, message: String },
 
     /// Code emission error. Internal — abort T2, retain T1.
-    CodegenError {
-        message: String,
-    },
+    CodegenError { message: String },
 
     /// Register allocation failure (e.g. too many live values).
-    RegisterAllocationError {
-        message: String,
-    },
+    RegisterAllocationError { message: String },
 }
 
 impl core::fmt::Display for CompilerError {
@@ -55,9 +44,17 @@ impl core::fmt::Display for CompilerError {
             CompilerError::ReaderError { message, position } => {
                 if let Some(pos) = position {
                     if let Some(ref file) = pos.file {
-                        write!(f, "reader error at {}:{}:{}: {}", file, pos.line, pos.column, message)
+                        write!(
+                            f,
+                            "reader error at {}:{}:{}: {}",
+                            file, pos.line, pos.column, message
+                        )
                     } else {
-                        write!(f, "reader error at {}:{}: {}", pos.line, pos.column, message)
+                        write!(
+                            f,
+                            "reader error at {}:{}: {}",
+                            pos.line, pos.column, message
+                        )
                     }
                 } else {
                     write!(f, "reader error: {}", message)

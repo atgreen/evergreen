@@ -2,14 +2,16 @@
 //!
 //! See spec §4.4.
 
-use crate::codegen::{native_arch, TargetArch};
+use crate::codegen::{TargetArch, native_arch};
 use crate::ir::{EdgeKind, IrBuilder, IrGraph, NodeKind};
 use crate::opt::PassManager;
 use bliss_rt::error::BlissError;
-use bliss_rt::value::{BlissVal, NIL_BITS, TAG_CONS, TAG_FUNCTION, TAG_SPECIAL, TAG_SYMBOL, T_BITS};
+use bliss_rt::value::{
+    BlissVal, NIL_BITS, T_BITS, TAG_CONS, TAG_FUNCTION, TAG_SPECIAL, TAG_SYMBOL,
+};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU16, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 /// Compilation tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -128,7 +130,9 @@ impl ValueStack {
 
     pub fn push(&mut self, v: BlissVal) -> Result<(), BlissError> {
         if self.sp >= self.max_depth {
-            return Err(BlissError::Internal("STORAGE-CONDITION: stack overflow".into()));
+            return Err(BlissError::Internal(
+                "STORAGE-CONDITION: stack overflow".into(),
+            ));
         }
         if self.sp >= self.slots.len() {
             self.slots.push(v);
@@ -244,7 +248,9 @@ impl EnvFrame {
         while let Some(ref parent_arc) = current {
             let parent_ptr = Arc::as_ptr(parent_arc) as *mut EnvFrame;
             let parent = unsafe { &mut *parent_ptr };
-            if let std::collections::hash_map::Entry::Occupied(mut entry) = parent.bindings.entry(key) {
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                parent.bindings.entry(key)
+            {
                 entry.insert(value);
                 return true;
             }
@@ -306,12 +312,24 @@ fn classify_special_form(sym: BlissVal) -> Option<u32> {
     }
     let idx = (sym.0 >> 3) as u32;
     match idx {
-        special_form::QUOTE | special_form::IF | special_form::LET
-        | special_form::LETSTAR | special_form::PROGN | special_form::SETQ
-        | special_form::FUNCTION | special_form::LAMBDA | special_form::BLOCK
-        | special_form::RETURN_FROM | special_form::TAGBODY | special_form::GO
-        | special_form::CATCH | special_form::THROW | special_form::UNWIND_PROTECT
-        | special_form::THE | special_form::LOCALLY | special_form::EVAL_WHEN
+        special_form::QUOTE
+        | special_form::IF
+        | special_form::LET
+        | special_form::LETSTAR
+        | special_form::PROGN
+        | special_form::SETQ
+        | special_form::FUNCTION
+        | special_form::LAMBDA
+        | special_form::BLOCK
+        | special_form::RETURN_FROM
+        | special_form::TAGBODY
+        | special_form::GO
+        | special_form::CATCH
+        | special_form::THROW
+        | special_form::UNWIND_PROTECT
+        | special_form::THE
+        | special_form::LOCALLY
+        | special_form::EVAL_WHEN
         | special_form::LOAD_TIME_VALUE => Some(idx),
         _ => None,
     }
@@ -322,7 +340,10 @@ fn classify_special_form(sym: BlissVal) -> Option<u32> {
 /// Extract car from a cons cell.
 fn cons_car(cons: BlissVal) -> Result<BlissVal, BlissError> {
     if !cons.is_cons() {
-        return Err(BlissError::TypeError { datum: cons, expected: "cons".into() });
+        return Err(BlissError::TypeError {
+            datum: cons,
+            expected: "cons".into(),
+        });
     }
     let ptr = (cons.0 & !bliss_rt::value::TAG_MASK) as *const u64;
     if ptr.is_null() {
@@ -334,7 +355,10 @@ fn cons_car(cons: BlissVal) -> Result<BlissVal, BlissError> {
 /// Extract cdr from a cons cell.
 fn cons_cdr(cons: BlissVal) -> Result<BlissVal, BlissError> {
     if !cons.is_cons() {
-        return Err(BlissError::TypeError { datum: cons, expected: "cons".into() });
+        return Err(BlissError::TypeError {
+            datum: cons,
+            expected: "cons".into(),
+        });
     }
     let ptr = (cons.0 & !bliss_rt::value::TAG_MASK) as *const u64;
     if ptr.is_null() {
@@ -349,7 +373,9 @@ fn list_to_vec(list: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
     let mut cur = list;
     while cur.is_cons() {
         let ptr = (cur.0 & !bliss_rt::value::TAG_MASK) as *const u64;
-        if ptr.is_null() { break; }
+        if ptr.is_null() {
+            break;
+        }
         result.push(BlissVal(unsafe { *ptr }));
         cur = BlissVal(unsafe { *ptr.add(1) });
     }
@@ -407,15 +433,14 @@ enum NonLocalExit {
 /// Helper to convert NonLocalExit into BlissError for propagation.
 fn non_local_to_error(nle: NonLocalExit) -> BlissError {
     match nle {
-        NonLocalExit::ReturnFrom(r) => BlissError::Internal(
-            format!("__NLE_RETURN_FROM__:{}:{}", r.block_name, r.value.0),
-        ),
-        NonLocalExit::Go(g) => BlissError::Internal(
-            format!("__NLE_GO__:{}", g.tag),
-        ),
-        NonLocalExit::Throw(t) => BlissError::Internal(
-            format!("__NLE_THROW__:{}:{}", t.tag.0, t.value.0),
-        ),
+        NonLocalExit::ReturnFrom(r) => BlissError::Internal(format!(
+            "__NLE_RETURN_FROM__:{}:{}",
+            r.block_name, r.value.0
+        )),
+        NonLocalExit::Go(g) => BlissError::Internal(format!("__NLE_GO__:{}", g.tag)),
+        NonLocalExit::Throw(t) => {
+            BlissError::Internal(format!("__NLE_THROW__:{}:{}", t.tag.0, t.value.0))
+        }
     }
 }
 
@@ -497,8 +522,12 @@ impl Interpreter {
     /// symbols are looked up, cons cells dispatch as special forms or function calls.
     pub fn eval(&mut self, form: BlissVal) -> Result<BlissVal, BlissError> {
         // Self-evaluating forms: fixnum, character, single-float, heap object, NIL, T
-        if form.is_fixnum() || form.is_character() || form.is_single_float()
-            || form.is_heap_object() || form.0 == NIL_BITS || form.0 == T_BITS
+        if form.is_fixnum()
+            || form.is_character()
+            || form.is_single_float()
+            || form.is_heap_object()
+            || form.0 == NIL_BITS
+            || form.0 == T_BITS
         {
             return Ok(form);
         }
@@ -536,7 +565,10 @@ impl Interpreter {
             let evaluated_args_list = vec_to_list(&eval_args);
             return self.apply(operator, evaluated_args_list);
         }
-        Err(BlissError::TypeError { datum: form, expected: "evaluable form".into() })
+        Err(BlissError::TypeError {
+            datum: form,
+            expected: "evaluable form".into(),
+        })
     }
 
     /// Handle special forms (§4.4.3.4).
@@ -683,7 +715,8 @@ impl Interpreter {
                                 let ptr = (val.0 & !bliss_rt::value::TAG_MASK) as *const u8;
                                 if !ptr.is_null() {
                                     let src_meta = unsafe { &*(ptr as *const FnMeta) };
-                                    let new_meta = FnMeta::new(src_meta.arity, src_meta.body, src_meta.params);
+                                    let new_meta =
+                                        FnMeta::new(src_meta.arity, src_meta.body, src_meta.params);
                                     new_meta.flags.store(FLAG_IS_CLOSURE, Ordering::Release);
                                     let closure = Box::leak(Box::new(ClosureObj {
                                         meta: new_meta,
@@ -719,7 +752,9 @@ impl Interpreter {
                 // (LAMBDA params body...) -> create interpreted closure (§4.4.3.4)
                 let args_vec = list_to_vec(args)?;
                 if args_vec.is_empty() {
-                    return Err(BlissError::Internal("LAMBDA: missing parameter list".into()));
+                    return Err(BlissError::Internal(
+                        "LAMBDA: missing parameter list".into(),
+                    ));
                 }
                 let params = args_vec[0];
                 // Count arity from param list
@@ -744,9 +779,7 @@ impl Interpreter {
                     meta: closure_meta,
                     env: self.env.clone(),
                 }));
-                Ok(unsafe {
-                    BlissVal::from_function_ptr(closure as *mut ClosureObj as *mut u8)
-                })
+                Ok(unsafe { BlissVal::from_function_ptr(closure as *mut ClosureObj as *mut u8) })
             }
             special_form::BLOCK => {
                 // (BLOCK name form...) -> evaluate forms, catch RETURN-FROM
@@ -770,9 +803,7 @@ impl Interpreter {
                                 }
                             }
                             // Not our block, propagate
-                            return Err(BlissError::Internal(
-                                format!("{}", e),
-                            ));
+                            return Err(BlissError::Internal(format!("{}", e)));
                         }
                     }
                 }
@@ -782,7 +813,9 @@ impl Interpreter {
                 // (RETURN-FROM name [value]) -> non-local transfer to BLOCK (§4.4.3.4)
                 let args_vec = list_to_vec(args)?;
                 if args_vec.is_empty() {
-                    return Err(BlissError::Internal("RETURN-FROM: missing block name".into()));
+                    return Err(BlissError::Internal(
+                        "RETURN-FROM: missing block name".into(),
+                    ));
                 }
                 let block_name = args_vec[0];
                 let value = if args_vec.len() > 1 {
@@ -790,10 +823,12 @@ impl Interpreter {
                 } else {
                     BlissVal(NIL_BITS)
                 };
-                Err(non_local_to_error(NonLocalExit::ReturnFrom(ReturnFromSignal {
-                    block_name: block_name.0,
-                    value,
-                })))
+                Err(non_local_to_error(NonLocalExit::ReturnFrom(
+                    ReturnFromSignal {
+                        block_name: block_name.0,
+                        value,
+                    },
+                )))
             }
             special_form::TAGBODY => {
                 // (TAGBODY {tag | form}*) -> looping via GO restart (§4.4.3.4)
@@ -814,7 +849,9 @@ impl Interpreter {
                         continue;
                     }
                     match self.eval(form) {
-                        Ok(_) => { pc += 1; }
+                        Ok(_) => {
+                            pc += 1;
+                        }
                         Err(ref e) => {
                             if let Some(NonLocalExit::Go(ref g)) = error_as_non_local(e) {
                                 if let Some(&target_pc) = tag_table.get(&g.tag) {
@@ -836,7 +873,9 @@ impl Interpreter {
                     return Err(BlissError::Internal("GO: missing tag".into()));
                 }
                 let tag = args_vec[0];
-                Err(non_local_to_error(NonLocalExit::Go(GoSignal { tag: tag.0 })))
+                Err(non_local_to_error(NonLocalExit::Go(GoSignal {
+                    tag: tag.0,
+                })))
             }
             special_form::CATCH => {
                 // (CATCH tag form...) -> establish catch frame, evaluate forms (§4.4.3.4)
@@ -877,7 +916,10 @@ impl Interpreter {
                 } else {
                     BlissVal(NIL_BITS)
                 };
-                Err(non_local_to_error(NonLocalExit::Throw(ThrowSignal { tag, value })))
+                Err(non_local_to_error(NonLocalExit::Throw(ThrowSignal {
+                    tag,
+                    value,
+                })))
             }
             special_form::UNWIND_PROTECT => {
                 // (UNWIND-PROTECT protected-form cleanup-form...)
@@ -931,7 +973,10 @@ impl Interpreter {
                 }
                 self.eval(args_vec[0])
             }
-            _ => Err(BlissError::Internal(format!("unknown special form id {}", form_id))),
+            _ => Err(BlissError::Internal(format!(
+                "unknown special form id {}",
+                form_id
+            ))),
         }
     }
 
@@ -940,7 +985,10 @@ impl Interpreter {
     /// T0 evaluates the body form, T1/T2 calls the compiled entry.
     pub fn apply(&mut self, function: BlissVal, args: BlissVal) -> Result<BlissVal, BlissError> {
         if function.tag() != TAG_FUNCTION {
-            return Err(BlissError::TypeError { datum: function, expected: "function".into() });
+            return Err(BlissError::TypeError {
+                datum: function,
+                expected: "function".into(),
+            });
         }
         let func_ptr = (function.0 & !bliss_rt::value::TAG_MASK) as *const u8;
         if func_ptr.is_null() {
@@ -964,7 +1012,9 @@ impl Interpreter {
                 // Check for T0→T1 promotion
                 if new_count >= self.t1_threshold {
                     // Request T1 compilation (synchronous per R4.26)
-                    let prev = meta.tier.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+                    let prev =
+                        meta.tier
+                            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
                     if prev.is_ok() {
                         let mut compiler = BaselineCompiler::new();
                         match compiler.compile_fn(meta) {
@@ -1007,9 +1057,10 @@ impl Interpreter {
                 }
                 if bound < arity && !args.is_nil() {
                     self.env = saved_env;
-                    return Err(BlissError::Internal(
-                        format!("wrong number of arguments: expected {}, got {}", arity, bound),
-                    ));
+                    return Err(BlissError::Internal(format!(
+                        "wrong number of arguments: expected {}, got {}",
+                        arity, bound
+                    )));
                 }
 
                 // Use the operand stack to track eval depth
@@ -1038,7 +1089,10 @@ impl Interpreter {
                     Ok(BlissVal(result_bits))
                 }
             }
-            _ => Err(BlissError::Internal(format!("apply: unknown tier {}", tier_byte))),
+            _ => Err(BlissError::Internal(format!(
+                "apply: unknown tier {}",
+                tier_byte
+            ))),
         }
     }
 }
@@ -1095,10 +1149,14 @@ static T1_GLOBAL_SYMBOLS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Blis
 // ── T1 baseline compiler ──────────────────────────────────────────
 
 /// T1 baseline compiler — single-pass form→native code (§4.4.4).
-pub struct BaselineCompiler { _private: () }
+pub struct BaselineCompiler {
+    _private: (),
+}
 
 impl BaselineCompiler {
-    pub fn new() -> Self { BaselineCompiler { _private: () } }
+    pub fn new() -> Self {
+        BaselineCompiler { _private: () }
+    }
 
     /// Compile a form to baseline native code. Single-pass: prologue -> body -> epilogue.
     /// This is the simplified path for compiling a raw BlissVal constant (used by tests).
@@ -1111,12 +1169,21 @@ impl BaselineCompiler {
         }
         let mut code = Vec::with_capacity(128);
         #[cfg(target_arch = "x86_64")]
-        { self.emit_body_x86_64(&mut code, function); }
+        {
+            self.emit_body_x86_64(&mut code, function);
+        }
         #[cfg(target_arch = "aarch64")]
-        { self.emit_body_aarch64(&mut code, function); }
+        {
+            self.emit_body_aarch64(&mut code, function);
+        }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        { self.emit_body_x86_64(&mut code, function); }
-        Ok(CompiledCode { code, tier: Tier::Baseline })
+        {
+            self.emit_body_x86_64(&mut code, function);
+        }
+        Ok(CompiledCode {
+            code,
+            tier: Tier::Baseline,
+        })
     }
 
     /// Compile a function with FnMeta — walks the body AST and emits native code.
@@ -1128,8 +1195,8 @@ impl BaselineCompiler {
         match arch {
             TargetArch::X86_64 => {
                 // Prologue
-                code.push(0x55);                                    // push rbp
-                code.extend_from_slice(&[0x48, 0x89, 0xE5]);       // mov rbp, rsp
+                code.push(0x55); // push rbp
+                code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
                 code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 64
 
                 // Profiling stub: increment invoke_count (§4.4.4.6)
@@ -1138,7 +1205,8 @@ impl BaselineCompiler {
                 let meta_ptr = meta as *const FnMeta as u64;
                 let invoke_offset = std::mem::offset_of!(FnMeta, invoke_count) as u64;
                 // mov rax, meta_ptr + invoke_offset
-                code.push(0x48); code.push(0xB8);
+                code.push(0x48);
+                code.push(0xB8);
                 code.extend_from_slice(&(meta_ptr + invoke_offset).to_le_bytes());
                 // lock inc dword [rax]
                 code.extend_from_slice(&[0xF0, 0xFF, 0x00]);
@@ -1148,8 +1216,8 @@ impl BaselineCompiler {
 
                 // Epilogue
                 code.extend_from_slice(&[0x48, 0x89, 0xEC]); // mov rsp, rbp
-                code.push(0x5D);                              // pop rbp
-                code.push(0xC3);                              // ret
+                code.push(0x5D); // pop rbp
+                code.push(0xC3); // ret
             }
             TargetArch::Aarch64 => {
                 // Prologue
@@ -1183,17 +1251,25 @@ impl BaselineCompiler {
             }
         }
 
-        Ok(CompiledCode { code, tier: Tier::Baseline })
+        Ok(CompiledCode {
+            code,
+            tier: Tier::Baseline,
+        })
     }
 
     /// Walk a form and emit x86_64 code for it (single-pass, no IR).
     fn emit_form_x86_64(&self, c: &mut Vec<u8>, form: BlissVal) {
-        if form.is_fixnum() || form.is_character() || form.is_single_float()
-            || form.is_heap_object() || form.0 == NIL_BITS || form.0 == T_BITS
+        if form.is_fixnum()
+            || form.is_character()
+            || form.is_single_float()
+            || form.is_heap_object()
+            || form.0 == NIL_BITS
+            || form.0 == T_BITS
             || form.tag() == TAG_SPECIAL
         {
             // Self-evaluating: load constant into rax
-            c.push(0x48); c.push(0xB8);
+            c.push(0x48);
+            c.push(0xB8);
             c.extend_from_slice(&form.0.to_le_bytes());
             return;
         }
@@ -1201,11 +1277,13 @@ impl BaselineCompiler {
         if form.tag() == TAG_SYMBOL {
             // Symbol: emit a call to the runtime symbol lookup helper
             // Load symbol bits into rdi (first arg)
-            c.push(0x48); c.push(0xBF); // mov rdi, imm64
+            c.push(0x48);
+            c.push(0xBF); // mov rdi, imm64
             c.extend_from_slice(&form.0.to_le_bytes());
             // Load address of runtime lookup function into rax
             let lookup_fn = t1_runtime_symbol_lookup as *const u8 as u64;
-            c.push(0x48); c.push(0xB8); // mov rax, imm64
+            c.push(0x48);
+            c.push(0xB8); // mov rax, imm64
             c.extend_from_slice(&lookup_fn.to_le_bytes());
             // call rax
             c.extend_from_slice(&[0xFF, 0xD0]);
@@ -1269,7 +1347,8 @@ impl BaselineCompiler {
         }
 
         // Fallback: load raw bits
-        c.push(0x48); c.push(0xB8);
+        c.push(0x48);
+        c.push(0xB8);
         c.extend_from_slice(&form.0.to_le_bytes());
     }
 
@@ -1279,21 +1358,26 @@ impl BaselineCompiler {
             special_form::QUOTE => {
                 // (QUOTE datum): load datum as constant
                 if let Ok(datum) = cons_car(args) {
-                    c.push(0x48); c.push(0xB8);
+                    c.push(0x48);
+                    c.push(0xB8);
                     c.extend_from_slice(&datum.0.to_le_bytes());
                 } else {
-                    c.push(0x48); c.push(0xB8);
+                    c.push(0x48);
+                    c.push(0xB8);
                     c.extend_from_slice(&NIL_BITS.to_le_bytes());
                 }
             }
             special_form::IF => {
                 // (IF test then [else])
                 if let Ok(args_vec) = list_to_vec(args) {
-                    if args_vec.is_empty() { return; }
+                    if args_vec.is_empty() {
+                        return;
+                    }
                     // Emit test
                     self.emit_form_x86_64(c, args_vec[0]);
                     // Compare with NIL
-                    c.push(0x48); c.push(0xB9); // mov rcx, NIL_BITS
+                    c.push(0x48);
+                    c.push(0xB9); // mov rcx, NIL_BITS
                     c.extend_from_slice(&NIL_BITS.to_le_bytes());
                     c.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
                     // je else_branch (placeholder)
@@ -1318,7 +1402,8 @@ impl BaselineCompiler {
                     if args_vec.len() > 2 {
                         self.emit_form_x86_64(c, args_vec[2]);
                     } else {
-                        c.push(0x48); c.push(0xB8);
+                        c.push(0x48);
+                        c.push(0xB8);
                         c.extend_from_slice(&NIL_BITS.to_le_bytes());
                     }
 
@@ -1332,7 +1417,8 @@ impl BaselineCompiler {
                 // (PROGN form...) - emit all forms, result of last is in rax
                 if let Ok(forms) = list_to_vec(args) {
                     if forms.is_empty() {
-                        c.push(0x48); c.push(0xB8);
+                        c.push(0x48);
+                        c.push(0xB8);
                         c.extend_from_slice(&NIL_BITS.to_le_bytes());
                     } else {
                         for form in forms {
@@ -1387,7 +1473,8 @@ impl BaselineCompiler {
                     if forms.len() > 1 {
                         self.emit_form_x86_64(c, forms[1]);
                     } else {
-                        c.push(0x48); c.push(0xB8);
+                        c.push(0x48);
+                        c.push(0xB8);
                         c.extend_from_slice(&NIL_BITS.to_le_bytes());
                     }
                 }
@@ -1396,7 +1483,8 @@ impl BaselineCompiler {
                 // (LOCALLY form...) — just compile all forms
                 if let Ok(forms) = list_to_vec(args) {
                     if forms.is_empty() {
-                        c.push(0x48); c.push(0xB8);
+                        c.push(0x48);
+                        c.push(0xB8);
                         c.extend_from_slice(&NIL_BITS.to_le_bytes());
                     } else {
                         for form in forms {
@@ -1414,7 +1502,8 @@ impl BaselineCompiler {
                         result_emitted = true;
                     }
                     if !result_emitted {
-                        c.push(0x48); c.push(0xB8);
+                        c.push(0x48);
+                        c.push(0xB8);
                         c.extend_from_slice(&NIL_BITS.to_le_bytes());
                     }
                 }
@@ -1425,13 +1514,15 @@ impl BaselineCompiler {
                     if !forms.is_empty() {
                         self.emit_form_x86_64(c, forms[0]);
                     } else {
-                        c.push(0x48); c.push(0xB8);
+                        c.push(0x48);
+                        c.push(0xB8);
                         c.extend_from_slice(&NIL_BITS.to_le_bytes());
                     }
                 }
             }
             _ => {
-                c.push(0x48); c.push(0xB8);
+                c.push(0x48);
+                c.push(0xB8);
                 c.extend_from_slice(&NIL_BITS.to_le_bytes());
             }
         }
@@ -1442,14 +1533,17 @@ impl BaselineCompiler {
     /// (LET, SETQ, BLOCK, TAGBODY, etc.) which can't be done inline in T1.
     fn emit_runtime_trampoline_x86_64(&self, c: &mut Vec<u8>, form_id: u32, args: BlissVal) {
         // Load form_id into rdi (first argument)
-        c.push(0x48); c.push(0xBF); // mov rdi, imm64
+        c.push(0x48);
+        c.push(0xBF); // mov rdi, imm64
         c.extend_from_slice(&(form_id as u64).to_le_bytes());
         // Load args bits into rsi (second argument)
-        c.push(0x48); c.push(0xBE); // mov rsi, imm64
+        c.push(0x48);
+        c.push(0xBE); // mov rsi, imm64
         c.extend_from_slice(&args.0.to_le_bytes());
         // Load address of runtime eval helper
         let helper_fn = t1_runtime_eval_special_form as *const u8 as u64;
-        c.push(0x48); c.push(0xB8); // mov rax, imm64
+        c.push(0x48);
+        c.push(0xB8); // mov rax, imm64
         c.extend_from_slice(&helper_fn.to_le_bytes());
         // call rax
         c.extend_from_slice(&[0xFF, 0xD0]);
@@ -1480,8 +1574,12 @@ impl BaselineCompiler {
 
     /// Walk a form and emit AArch64 code for it (single-pass, no IR).
     fn emit_form_aarch64(&self, c: &mut Vec<u8>, form: BlissVal) {
-        if form.is_fixnum() || form.is_character() || form.is_single_float()
-            || form.is_heap_object() || form.0 == NIL_BITS || form.0 == T_BITS
+        if form.is_fixnum()
+            || form.is_character()
+            || form.is_single_float()
+            || form.is_heap_object()
+            || form.0 == NIL_BITS
+            || form.0 == T_BITS
             || form.tag() == TAG_SPECIAL
         {
             emit_imm64_aarch64(c, form.0);
@@ -1565,7 +1663,9 @@ impl BaselineCompiler {
             }
             special_form::IF => {
                 if let Ok(args_vec) = list_to_vec(args) {
-                    if args_vec.is_empty() { return; }
+                    if args_vec.is_empty() {
+                        return;
+                    }
                     // Emit test
                     self.emit_form_aarch64(c, args_vec[0]);
                     // Compare with NIL: mov x1, NIL; cmp x0, x1; b.eq else
@@ -1623,8 +1723,8 @@ impl BaselineCompiler {
     /// Original simple emit methods (for compile() with raw BlissVal).
     fn emit_body_x86_64(&self, c: &mut Vec<u8>, form: BlissVal) {
         // Prologue
-        c.push(0x55);                                    // push rbp
-        c.extend_from_slice(&[0x48, 0x89, 0xE5]);       // mov rbp, rsp
+        c.push(0x55); // push rbp
+        c.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
         c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32
 
         // Walk the form and emit code
@@ -1632,8 +1732,8 @@ impl BaselineCompiler {
 
         // Epilogue
         c.extend_from_slice(&[0x48, 0x89, 0xEC]); // mov rsp, rbp
-        c.push(0x5D);                              // pop rbp
-        c.push(0xC3);                              // ret
+        c.push(0x5D); // pop rbp
+        c.push(0xC3); // ret
     }
 
     #[allow(dead_code)]
@@ -1655,10 +1755,14 @@ impl Default for BaselineCompiler {
 // ── T2 optimising compiler ─────────────────────────────────────────
 
 /// T2 optimising compiler — SSA IR + passes + codegen (§4.4.5).
-pub struct OptimisingCompiler { _private: () }
+pub struct OptimisingCompiler {
+    _private: (),
+}
 
 impl OptimisingCompiler {
-    pub fn new() -> Self { OptimisingCompiler { _private: () } }
+    pub fn new() -> Self {
+        OptimisingCompiler { _private: () }
+    }
 
     /// Compile with full optimisation: build IR -> run passes -> emit code.
     pub fn compile(&mut self, function: BlissVal) -> Result<CompiledCode, BlissError> {
@@ -1670,7 +1774,8 @@ impl OptimisingCompiler {
         }
         // 1. Build SSA IR from the function's AST
         let mut builder = IrBuilder::new();
-        let mut graph = builder.build(function)
+        let mut graph = builder
+            .build(function)
             .map_err(|e| BlissError::Internal(format!("T2 IR build failed: {}", e)))?;
         // 2. Optimisation passes (non-fatal on failure)
         let mut pm = PassManager::new();
@@ -1679,7 +1784,10 @@ impl OptimisingCompiler {
         let _ = crate::ir::verify(&graph);
         // 4. Emit machine code
         let code = self.emit_from_ir(&graph, native_arch())?;
-        Ok(CompiledCode { code, tier: Tier::Optimising })
+        Ok(CompiledCode {
+            code,
+            tier: Tier::Optimising,
+        })
     }
 
     fn emit_from_ir(&self, graph: &IrGraph, arch: TargetArch) -> Result<Vec<u8>, BlissError> {
@@ -1688,10 +1796,14 @@ impl OptimisingCompiler {
         let mut worklist = vec![graph.start()];
         let mut ordered = Vec::new();
         while let Some(n) = worklist.pop() {
-            if !visited.insert(n) { continue; }
+            if !visited.insert(n) {
+                continue;
+            }
             ordered.push(n);
             for e in graph.uses(n) {
-                if !visited.contains(&e.to) { worklist.push(e.to); }
+                if !visited.contains(&e.to) {
+                    worklist.push(e.to);
+                }
             }
         }
         match arch {
@@ -1700,96 +1812,133 @@ impl OptimisingCompiler {
         }
     }
 
-    fn emit_x86_64(&self, g: &IrGraph, ordered: &[crate::ir::NodeId]) -> Result<Vec<u8>, BlissError> {
+    fn emit_x86_64(
+        &self,
+        g: &IrGraph,
+        ordered: &[crate::ir::NodeId],
+    ) -> Result<Vec<u8>, BlissError> {
         let mut c = Vec::with_capacity(64);
-        c.push(0x55);                              // push rbp
+        c.push(0x55); // push rbp
         c.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
         for &n in ordered {
             match g.node_kind(n).clone() {
                 NodeKind::Start => {}
                 NodeKind::Constant(v) => {
-                    c.push(0x48); c.push(0xB8);
+                    c.push(0x48);
+                    c.push(0xB8);
                     c.extend_from_slice(&v.to_raw().to_le_bytes());
                 }
                 NodeKind::Parameter(i) => {
                     let r: &[u8] = match i {
-                        0 => &[0x48,0x89,0xF8], 1 => &[0x48,0x89,0xF0],
-                        2 => &[0x48,0x89,0xC8], 3 => &[0x4C,0x89,0xC0],
-                        4 => &[0x4C,0x89,0xC8], 5 => &[0x4C,0x89,0xD0],
-                        _ => &[0x31,0xC0],
+                        0 => &[0x48, 0x89, 0xF8],
+                        1 => &[0x48, 0x89, 0xF0],
+                        2 => &[0x48, 0x89, 0xC8],
+                        3 => &[0x4C, 0x89, 0xC0],
+                        4 => &[0x4C, 0x89, 0xC8],
+                        5 => &[0x4C, 0x89, 0xD0],
+                        _ => &[0x31, 0xC0],
                     };
                     c.extend_from_slice(r);
                 }
                 NodeKind::Return => {
                     for inp in g.inputs(n) {
-                        if inp.kind == EdgeKind::Data { self.val_x86(&mut c, g, inp.from); }
+                        if inp.kind == EdgeKind::Data {
+                            self.val_x86(&mut c, g, inp.from);
+                        }
                     }
-                    c.push(0x5D); c.push(0xC3);
+                    c.push(0x5D);
+                    c.push(0xC3);
                 }
-                NodeKind::Phi | NodeKind::Region => { c.push(0x90); }
+                NodeKind::Phi | NodeKind::Region => {
+                    c.push(0x90);
+                }
                 NodeKind::Branch => {
-                    c.extend_from_slice(&[0x48,0x85,0xC0]);
-                    c.extend_from_slice(&[0x0F,0x84,0x00,0x00,0x00,0x00]);
+                    c.extend_from_slice(&[0x48, 0x85, 0xC0]);
+                    c.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                 }
-                NodeKind::Call => { c.extend_from_slice(&[0xFF,0xD0]); }
+                NodeKind::Call => {
+                    c.extend_from_slice(&[0xFF, 0xD0]);
+                }
                 NodeKind::TypeCheck { expected_type } => {
-                    c.extend_from_slice(&[0x48,0x89,0xC1,0x48,0x83,0xE1,0x07]);
-                    c.extend_from_slice(&[0x48,0x83,0xF9,(expected_type.to_raw()&7) as u8]);
-                    c.extend_from_slice(&[0x0F,0x85,0x00,0x00,0x00,0x00]);
+                    c.extend_from_slice(&[0x48, 0x89, 0xC1, 0x48, 0x83, 0xE1, 0x07]);
+                    c.extend_from_slice(&[0x48, 0x83, 0xF9, (expected_type.to_raw() & 7) as u8]);
+                    c.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
                 }
-                NodeKind::Box => { c.extend_from_slice(&[0x48,0xC1,0xE0,0x03]); }
-                NodeKind::Unbox => { c.extend_from_slice(&[0x48,0xC1,0xE8,0x03]); }
+                NodeKind::Box => {
+                    c.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x03]);
+                }
+                NodeKind::Unbox => {
+                    c.extend_from_slice(&[0x48, 0xC1, 0xE8, 0x03]);
+                }
                 NodeKind::MemLoad { offset } => {
-                    c.extend_from_slice(&[0x48,0x83,0xE0,0xF8]);
+                    c.extend_from_slice(&[0x48, 0x83, 0xE0, 0xF8]);
                     if (-128..=127).contains(&offset) {
-                        c.extend_from_slice(&[0x48,0x8B,0x40,offset as u8]);
+                        c.extend_from_slice(&[0x48, 0x8B, 0x40, offset as u8]);
                     } else {
-                        c.extend_from_slice(&[0x48,0x8B,0x80]);
+                        c.extend_from_slice(&[0x48, 0x8B, 0x80]);
                         c.extend_from_slice(&offset.to_le_bytes());
                     }
                 }
                 NodeKind::MemStore { offset } => {
-                    c.extend_from_slice(&[0x48,0x83,0xE1,0xF8]);
+                    c.extend_from_slice(&[0x48, 0x83, 0xE1, 0xF8]);
                     if (-128..=127).contains(&offset) {
-                        c.extend_from_slice(&[0x48,0x89,0x41,offset as u8]);
+                        c.extend_from_slice(&[0x48, 0x89, 0x41, offset as u8]);
                     } else {
-                        c.extend_from_slice(&[0x48,0x89,0x81]);
+                        c.extend_from_slice(&[0x48, 0x89, 0x81]);
                         c.extend_from_slice(&offset.to_le_bytes());
                     }
                 }
-                NodeKind::Safepoint => { c.extend_from_slice(&[0x41,0x85,0x07]); }
+                NodeKind::Safepoint => {
+                    c.extend_from_slice(&[0x41, 0x85, 0x07]);
+                }
             }
         }
-        if c.last() != Some(&0xC3) { c.push(0x5D); c.push(0xC3); }
+        if c.last() != Some(&0xC3) {
+            c.push(0x5D);
+            c.push(0xC3);
+        }
         Ok(c)
     }
 
     fn val_x86(&self, c: &mut Vec<u8>, g: &IrGraph, n: crate::ir::NodeId) {
         match g.node_kind(n) {
             NodeKind::Constant(v) => {
-                c.push(0x48); c.push(0xB8);
+                c.push(0x48);
+                c.push(0xB8);
                 c.extend_from_slice(&v.to_raw().to_le_bytes());
             }
             NodeKind::Parameter(i) => {
-                let r: &[u8] = match *i { 0=>&[0x48,0x89,0xF8], 1=>&[0x48,0x89,0xF0],
-                    2=>&[0x48,0x89,0xC8], _=>&[0x90] };
+                let r: &[u8] = match *i {
+                    0 => &[0x48, 0x89, 0xF8],
+                    1 => &[0x48, 0x89, 0xF0],
+                    2 => &[0x48, 0x89, 0xC8],
+                    _ => &[0x90],
+                };
                 c.extend_from_slice(r);
             }
             _ => {}
         }
     }
 
-    fn emit_aarch64(&self, g: &IrGraph, ordered: &[crate::ir::NodeId]) -> Result<Vec<u8>, BlissError> {
+    fn emit_aarch64(
+        &self,
+        g: &IrGraph,
+        ordered: &[crate::ir::NodeId],
+    ) -> Result<Vec<u8>, BlissError> {
         let mut c = Vec::with_capacity(64);
         c.extend_from_slice(&0xA9BF7BFDu32.to_le_bytes());
         c.extend_from_slice(&0x910003FDu32.to_le_bytes());
         for &n in ordered {
             match g.node_kind(n).clone() {
                 NodeKind::Start => {}
-                NodeKind::Constant(v) => { emit_imm64_aarch64(&mut c, v.to_raw()); }
+                NodeKind::Constant(v) => {
+                    emit_imm64_aarch64(&mut c, v.to_raw());
+                }
                 NodeKind::Return => {
                     for inp in g.inputs(n) {
-                        if inp.kind == EdgeKind::Data { self.val_aarch64(&mut c, g, inp.from); }
+                        if inp.kind == EdgeKind::Data {
+                            self.val_aarch64(&mut c, g, inp.from);
+                        }
                     }
                     c.extend_from_slice(&0xA8C17BFDu32.to_le_bytes());
                     c.extend_from_slice(&0xD65F03C0u32.to_le_bytes());
@@ -1802,29 +1951,39 @@ impl OptimisingCompiler {
                 NodeKind::Phi | NodeKind::Region => {
                     c.extend_from_slice(&0xD503201Fu32.to_le_bytes());
                 }
-                NodeKind::Branch => { c.extend_from_slice(&0xB4000000u32.to_le_bytes()); }
-                NodeKind::Call => { c.extend_from_slice(&0xD63F0000u32.to_le_bytes()); }
+                NodeKind::Branch => {
+                    c.extend_from_slice(&0xB4000000u32.to_le_bytes());
+                }
+                NodeKind::Call => {
+                    c.extend_from_slice(&0xD63F0000u32.to_le_bytes());
+                }
                 NodeKind::TypeCheck { expected_type } => {
                     c.extend_from_slice(&0x92400401u32.to_le_bytes());
-                    let t = (expected_type.to_raw()&7) as u32;
-                    c.extend_from_slice(&(0xF1000020u32|(t<<10)).to_le_bytes());
+                    let t = (expected_type.to_raw() & 7) as u32;
+                    c.extend_from_slice(&(0xF1000020u32 | (t << 10)).to_le_bytes());
                     c.extend_from_slice(&0x54000001u32.to_le_bytes());
                 }
-                NodeKind::Box => { c.extend_from_slice(&0xD37CEC00u32.to_le_bytes()); }
-                NodeKind::Unbox => { c.extend_from_slice(&0xD340FC00u32.to_le_bytes()); }
-                NodeKind::MemLoad{..} => {
+                NodeKind::Box => {
+                    c.extend_from_slice(&0xD37CEC00u32.to_le_bytes());
+                }
+                NodeKind::Unbox => {
+                    c.extend_from_slice(&0xD340FC00u32.to_le_bytes());
+                }
+                NodeKind::MemLoad { .. } => {
                     c.extend_from_slice(&0x927CF800u32.to_le_bytes());
                     c.extend_from_slice(&0xF9400000u32.to_le_bytes());
                 }
-                NodeKind::MemStore{..} => {
+                NodeKind::MemStore { .. } => {
                     c.extend_from_slice(&0x927CF821u32.to_le_bytes());
                     c.extend_from_slice(&0xF9000020u32.to_le_bytes());
                 }
-                NodeKind::Safepoint => { c.extend_from_slice(&0xF9400000u32.to_le_bytes()); }
+                NodeKind::Safepoint => {
+                    c.extend_from_slice(&0xF9400000u32.to_le_bytes());
+                }
             }
         }
         let ret = 0xD65F03C0u32.to_le_bytes();
-        if c.len() < 4 || c[c.len()-4..] != ret {
+        if c.len() < 4 || c[c.len() - 4..] != ret {
             c.extend_from_slice(&0xA8C17BFDu32.to_le_bytes());
             c.extend_from_slice(&ret);
         }
@@ -1833,7 +1992,9 @@ impl OptimisingCompiler {
 
     fn val_aarch64(&self, c: &mut Vec<u8>, g: &IrGraph, n: crate::ir::NodeId) {
         match g.node_kind(n) {
-            NodeKind::Constant(v) => { emit_imm64_aarch64(c, v.to_raw()); }
+            NodeKind::Constant(v) => {
+                emit_imm64_aarch64(c, v.to_raw());
+            }
             NodeKind::Parameter(i) if *i > 0 && *i <= 7 => {
                 c.extend_from_slice(&(0xAA0003E0u32 | (*i << 16)).to_le_bytes());
             }
@@ -1860,20 +2021,31 @@ unsafe impl Send for CompiledCode {}
 unsafe impl Sync for CompiledCode {}
 
 impl CompiledCode {
-    pub fn entry_point(&self) -> *const u8 { self.code.as_ptr() }
-    pub fn code_size(&self) -> usize { self.code.len() }
-    pub fn tier(&self) -> Tier { self.tier }
+    pub fn entry_point(&self) -> *const u8 {
+        self.code.as_ptr()
+    }
+    pub fn code_size(&self) -> usize {
+        self.code.len()
+    }
+    pub fn tier(&self) -> Tier {
+        self.tier
+    }
 
     /// Install compiled code into a function object via atomic entry-point swap.
     ///
     /// Uses FnMeta's atomic fields to ensure safe concurrent access.
     pub fn install(self, function: BlissVal) -> Result<(), BlissError> {
         if function.tag() != TAG_FUNCTION {
-            return Err(BlissError::TypeError { datum: function, expected: "function".into() });
+            return Err(BlissError::TypeError {
+                datum: function,
+                expected: "function".into(),
+            });
         }
         let func_ptr = (function.0 & !bliss_rt::value::TAG_MASK) as *mut u8;
         if func_ptr.is_null() {
-            return Err(BlissError::Internal("install: null function pointer".into()));
+            return Err(BlissError::Internal(
+                "install: null function pointer".into(),
+            ));
         }
 
         let new_tier = self.tier as u8;
@@ -1908,7 +2080,9 @@ pub fn check_promotion(function: BlissVal, config: &TierConfig) -> Option<Tier> 
         } else {
             let meta = unsafe { &*(ptr as *const FnMeta) };
             let tier = match meta.tier.load(Ordering::Acquire) {
-                1 => Tier::Baseline, 2 => Tier::Optimising, _ => Tier::Interpreter,
+                1 => Tier::Baseline,
+                2 => Tier::Optimising,
+                _ => Tier::Interpreter,
             };
             let cnt = meta.invoke_count.load(Ordering::Relaxed);
             (tier, cnt)
@@ -1916,10 +2090,24 @@ pub fn check_promotion(function: BlissVal, config: &TierConfig) -> Option<Tier> 
     } else {
         (Tier::Interpreter, 0u32)
     };
-    if current_tier >= Tier::Optimising { return None; }
+    if current_tier >= Tier::Optimising {
+        return None;
+    }
     match current_tier {
-        Tier::Interpreter => if invoke_count >= config.t1_threshold { Some(Tier::Baseline) } else { None },
-        Tier::Baseline => if invoke_count >= config.t2_threshold { Some(Tier::Optimising) } else { None },
+        Tier::Interpreter => {
+            if invoke_count >= config.t1_threshold {
+                Some(Tier::Baseline)
+            } else {
+                None
+            }
+        }
+        Tier::Baseline => {
+            if invoke_count >= config.t2_threshold {
+                Some(Tier::Optimising)
+            } else {
+                None
+            }
+        }
         Tier::Optimising => None,
     }
 }
@@ -1953,15 +2141,20 @@ impl CompilationQueue {
     }
 }
 
-static COMPILATION_QUEUE: std::sync::Mutex<CompilationQueue> = std::sync::Mutex::new(CompilationQueue::new());
+static COMPILATION_QUEUE: std::sync::Mutex<CompilationQueue> =
+    std::sync::Mutex::new(CompilationQueue::new());
 const COMPILATION_QUEUE_CAPACITY: usize = 64;
 
 /// Enqueue a function for background compilation at the target tier (R4.30).
 pub fn request_compilation(function: BlissVal, target_tier: Tier) -> Result<(), BlissError> {
     if function.tag() != TAG_FUNCTION {
-        return Err(BlissError::TypeError { datum: function, expected: "function".into() });
+        return Err(BlissError::TypeError {
+            datum: function,
+            expected: "function".into(),
+        });
     }
-    let mut queue = COMPILATION_QUEUE.lock()
+    let mut queue = COMPILATION_QUEUE
+        .lock()
         .map_err(|_| BlissError::Internal("compilation queue lock poisoned".into()))?;
     if queue.requests.len() >= queue.capacity {
         queue.dropped += 1;
@@ -1981,7 +2174,11 @@ pub fn request_compilation(function: BlissVal, target_tier: Tier) -> Result<(), 
     } else {
         0
     };
-    queue.requests.push(CompilationRequest { function, target_tier, priority });
+    queue.requests.push(CompilationRequest {
+        function,
+        target_tier,
+        priority,
+    });
     Ok(())
 }
 

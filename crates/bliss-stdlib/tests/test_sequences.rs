@@ -52,7 +52,9 @@ fn make_vector(vals: &[i64]) -> BlissVal {
 /// Default equality test placeholder (CL `#'EQL`).
 /// Uses NIL to signify "use default equality" — the implementation should
 /// treat NIL/None key/test as the standard EQL comparison.
-fn default_test() -> BlissVal { NIL }
+fn default_test() -> BlissVal {
+    NIL
+}
 
 /// Build a simple "identity" function value for use as a key parameter.
 /// This is a placeholder — the runtime will need to recognise it as a callable.
@@ -117,17 +119,26 @@ fn length_non_sequence_errors() {
 
 #[test]
 fn elt_valid_index_list() {
-    assert_eq!(sequences::elt(make_list(&[10, 20, 30]), 1).unwrap(), BlissVal::from_fixnum(20));
+    assert_eq!(
+        sequences::elt(make_list(&[10, 20, 30]), 1).unwrap(),
+        BlissVal::from_fixnum(20)
+    );
 }
 
 #[test]
 fn elt_first_element() {
-    assert_eq!(sequences::elt(make_list(&[7, 8, 9]), 0).unwrap(), BlissVal::from_fixnum(7));
+    assert_eq!(
+        sequences::elt(make_list(&[7, 8, 9]), 0).unwrap(),
+        BlissVal::from_fixnum(7)
+    );
 }
 
 #[test]
 fn elt_valid_index_vector() {
-    assert_eq!(sequences::elt(make_vector(&[100, 200, 300]), 2).unwrap(), BlissVal::from_fixnum(300));
+    assert_eq!(
+        sequences::elt(make_vector(&[100, 200, 300]), 2).unwrap(),
+        BlissVal::from_fixnum(300)
+    );
 }
 
 #[test]
@@ -162,7 +173,10 @@ fn set_elt_on_immutable_errors() {
     // with a TypeError since lists are not mutable sequences for SETF ELT.
     let list = make_list(&[1, 2, 3]);
     let result = sequences::set_elt(list, 0, BlissVal::from_fixnum(42));
-    assert!(result.is_err(), "set_elt on an immutable/non-setf-elt-able sequence should error");
+    assert!(
+        result.is_err(),
+        "set_elt on an immutable/non-setf-elt-able sequence should error"
+    );
     match result.unwrap_err() {
         BlissError::TypeError { .. } => {}
         other => panic!("expected TypeError for immutable sequence, got {:?}", other),
@@ -177,9 +191,15 @@ fn set_elt_on_immutable_errors() {
 fn copy_seq_independent() {
     let orig = make_list(&[1, 2, 3]);
     let copy = sequences::copy_seq(orig).unwrap();
-    assert_eq!(sequences::length(copy).unwrap(), sequences::length(orig).unwrap());
+    assert_eq!(
+        sequences::length(copy).unwrap(),
+        sequences::length(orig).unwrap()
+    );
     for i in 0..3 {
-        assert_eq!(sequences::elt(orig, i).unwrap(), sequences::elt(copy, i).unwrap());
+        assert_eq!(
+            sequences::elt(orig, i).unwrap(),
+            sequences::elt(copy, i).unwrap()
+        );
     }
     // Modify copy, original unchanged.
     let _ = sequences::set_elt(copy, 0, BlissVal::from_fixnum(999));
@@ -188,7 +208,10 @@ fn copy_seq_independent() {
 
 #[test]
 fn copy_seq_empty() {
-    assert_eq!(sequences::length(sequences::copy_seq(NIL).unwrap()).unwrap(), 0);
+    assert_eq!(
+        sequences::length(sequences::copy_seq(NIL).unwrap()).unwrap(),
+        0
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -237,7 +260,10 @@ fn reverse_non_destructive() {
 
 #[test]
 fn reverse_empty() {
-    assert_eq!(sequences::length(sequences::reverse(NIL).unwrap()).unwrap(), 0);
+    assert_eq!(
+        sequences::length(sequences::reverse(NIL).unwrap()).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -269,7 +295,8 @@ fn concatenate_with_empty() {
 
 #[test]
 fn concatenate_multiple() {
-    let cat = sequences::concatenate(T, &[make_list(&[1]), make_list(&[2]), make_list(&[3])]).unwrap();
+    let cat =
+        sequences::concatenate(T, &[make_list(&[1]), make_list(&[2]), make_list(&[3])]).unwrap();
     assert_eq!(sequences::length(cat).unwrap(), 3);
     assert_eq!(sequences::elt(cat, 1).unwrap(), BlissVal::from_fixnum(2));
 }
@@ -280,29 +307,61 @@ fn concatenate_multiple() {
 
 #[test]
 fn find_present() {
-    let r = sequences::find(BlissVal::from_fixnum(20), make_list(&[10, 20, 30]),
-        default_test(), None, 0, None, false).unwrap();
+    let r = sequences::find(
+        BlissVal::from_fixnum(20),
+        make_list(&[10, 20, 30]),
+        default_test(),
+        None,
+        0,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(20));
 }
 
 #[test]
 fn find_absent_returns_nil() {
-    let r = sequences::find(BlissVal::from_fixnum(99), make_list(&[10, 20, 30]),
-        default_test(), None, 0, None, false).unwrap();
+    let r = sequences::find(
+        BlissVal::from_fixnum(99),
+        make_list(&[10, 20, 30]),
+        default_test(),
+        None,
+        0,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(r, NIL);
 }
 
 #[test]
 fn find_with_start_end() {
-    let r = sequences::find(BlissVal::from_fixnum(2), make_list(&[1, 2, 3, 2, 5]),
-        default_test(), None, 2, Some(4), false).unwrap();
+    let r = sequences::find(
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 5]),
+        default_test(),
+        None,
+        2,
+        Some(4),
+        false,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(2));
 }
 
 #[test]
 fn find_from_end() {
-    let r = sequences::find(BlissVal::from_fixnum(2), make_list(&[1, 2, 3, 2, 5]),
-        default_test(), None, 0, None, true).unwrap();
+    let r = sequences::find(
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 5]),
+        default_test(),
+        None,
+        0,
+        None,
+        true,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(2));
 }
 
@@ -311,8 +370,16 @@ fn find_with_key() {
     // Search list [10, 20, 30] with a key function (identity_key).
     // Looking for 20 with key applied — the key extracts the element itself,
     // so find should still return the matching element 20.
-    let r = sequences::find(BlissVal::from_fixnum(20), make_list(&[10, 20, 30]),
-        default_test(), Some(identity_key()), 0, None, false).unwrap();
+    let r = sequences::find(
+        BlissVal::from_fixnum(20),
+        make_list(&[10, 20, 30]),
+        default_test(),
+        Some(identity_key()),
+        0,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(20));
 }
 
@@ -321,8 +388,16 @@ fn find_with_custom_test() {
     // Use a custom test function instead of default EQL.
     // custom_test() represents a broader equality (e.g. EQUAL).
     // Looking for 10 in [10, 20, 30] with custom test — should still find it.
-    let r = sequences::find(BlissVal::from_fixnum(10), make_list(&[10, 20, 30]),
-        custom_test(), None, 0, None, false).unwrap();
+    let r = sequences::find(
+        BlissVal::from_fixnum(10),
+        make_list(&[10, 20, 30]),
+        custom_test(),
+        None,
+        0,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(10));
 }
 
@@ -332,45 +407,93 @@ fn find_with_custom_test() {
 
 #[test]
 fn position_present() {
-    let r = sequences::position(BlissVal::from_fixnum(30), make_list(&[10, 20, 30]),
-        default_test(), None, 0, None, false).unwrap();
+    let r = sequences::position(
+        BlissVal::from_fixnum(30),
+        make_list(&[10, 20, 30]),
+        default_test(),
+        None,
+        0,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(2));
 }
 
 #[test]
 fn position_absent_returns_nil() {
-    let r = sequences::position(BlissVal::from_fixnum(99), make_list(&[10, 20, 30]),
-        default_test(), None, 0, None, false).unwrap();
+    let r = sequences::position(
+        BlissVal::from_fixnum(99),
+        make_list(&[10, 20, 30]),
+        default_test(),
+        None,
+        0,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(r, NIL);
 }
 
 #[test]
 fn position_with_start() {
-    let r = sequences::position(BlissVal::from_fixnum(2), make_list(&[1, 2, 3, 2, 5]),
-        default_test(), None, 2, None, false).unwrap();
+    let r = sequences::position(
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 5]),
+        default_test(),
+        None,
+        2,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(3));
 }
 
 #[test]
 fn position_from_end() {
-    let r = sequences::position(BlissVal::from_fixnum(2), make_list(&[1, 2, 3, 2, 5]),
-        default_test(), None, 0, None, true).unwrap();
+    let r = sequences::position(
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 5]),
+        default_test(),
+        None,
+        0,
+        None,
+        true,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(3));
 }
 
 #[test]
 fn position_with_key() {
     // position with key function — key is applied to each element before comparison.
-    let r = sequences::position(BlissVal::from_fixnum(20), make_list(&[10, 20, 30]),
-        default_test(), Some(identity_key()), 0, None, false).unwrap();
+    let r = sequences::position(
+        BlissVal::from_fixnum(20),
+        make_list(&[10, 20, 30]),
+        default_test(),
+        Some(identity_key()),
+        0,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(1));
 }
 
 #[test]
 fn position_with_custom_test() {
     // position with a non-default test function.
-    let r = sequences::position(BlissVal::from_fixnum(30), make_list(&[10, 20, 30]),
-        custom_test(), None, 0, None, false).unwrap();
+    let r = sequences::position(
+        BlissVal::from_fixnum(30),
+        make_list(&[10, 20, 30]),
+        custom_test(),
+        None,
+        0,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(2));
 }
 
@@ -380,38 +503,73 @@ fn position_with_custom_test() {
 
 #[test]
 fn count_multiple() {
-    let r = sequences::count(BlissVal::from_fixnum(2), make_list(&[1, 2, 3, 2, 2]),
-        default_test(), None, 0, None).unwrap();
+    let r = sequences::count(
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 2]),
+        default_test(),
+        None,
+        0,
+        None,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(3));
 }
 
 #[test]
 fn count_zero() {
-    let r = sequences::count(BlissVal::from_fixnum(99), make_list(&[1, 2, 3]),
-        default_test(), None, 0, None).unwrap();
+    let r = sequences::count(
+        BlissVal::from_fixnum(99),
+        make_list(&[1, 2, 3]),
+        default_test(),
+        None,
+        0,
+        None,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(0));
 }
 
 #[test]
 fn count_with_start_end() {
-    let r = sequences::count(BlissVal::from_fixnum(2), make_list(&[2, 2, 3, 2, 5]),
-        default_test(), None, 1, Some(4)).unwrap();
+    let r = sequences::count(
+        BlissVal::from_fixnum(2),
+        make_list(&[2, 2, 3, 2, 5]),
+        default_test(),
+        None,
+        1,
+        Some(4),
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(2));
 }
 
 #[test]
 fn count_with_key() {
     // Count with key function applied to each element before comparison.
-    let r = sequences::count(BlissVal::from_fixnum(2), make_list(&[1, 2, 3, 2, 2]),
-        default_test(), Some(identity_key()), 0, None).unwrap();
+    let r = sequences::count(
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 2]),
+        default_test(),
+        Some(identity_key()),
+        0,
+        None,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(3));
 }
 
 #[test]
 fn count_with_custom_test() {
     // Count with a custom test function instead of default EQL.
-    let r = sequences::count(BlissVal::from_fixnum(2), make_list(&[1, 2, 3, 2, 2]),
-        custom_test(), None, 0, None).unwrap();
+    let r = sequences::count(
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 2]),
+        custom_test(),
+        None,
+        0,
+        None,
+    )
+    .unwrap();
     assert_eq!(r, BlissVal::from_fixnum(3));
 }
 
@@ -442,7 +600,12 @@ fn map_single_sequence() {
 
 #[test]
 fn map_mismatched_lengths_stops_at_shortest() {
-    let mapped = sequences::map(T, addition_fn(), &[make_list(&[1, 2, 3]), make_list(&[10, 20])]).unwrap();
+    let mapped = sequences::map(
+        T,
+        addition_fn(),
+        &[make_list(&[1, 2, 3]), make_list(&[10, 20])],
+    )
+    .unwrap();
     assert_eq!(sequences::length(mapped).unwrap(), 2);
 }
 
@@ -453,35 +616,70 @@ fn map_mismatched_lengths_stops_at_shortest() {
 #[test]
 fn reduce_with_initial_value() {
     // reduce #'+ '(1 2 3) :initial-value 0  =>  6
-    let result = sequences::reduce(addition_fn(), make_list(&[1, 2, 3]),
-        Some(BlissVal::from_fixnum(0)), None, 0, None, false).unwrap();
-    assert_eq!(result, BlissVal::from_fixnum(6),
-        "reduce with + over [1,2,3] starting from 0 should yield 6");
+    let result = sequences::reduce(
+        addition_fn(),
+        make_list(&[1, 2, 3]),
+        Some(BlissVal::from_fixnum(0)),
+        None,
+        0,
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        BlissVal::from_fixnum(6),
+        "reduce with + over [1,2,3] starting from 0 should yield 6"
+    );
 }
 
 #[test]
 fn reduce_without_initial_value() {
     // reduce #'+ '(10 20 30) => 60
-    let result = sequences::reduce(addition_fn(), make_list(&[10, 20, 30]),
-        None, None, 0, None, false).unwrap();
-    assert_eq!(result, BlissVal::from_fixnum(60),
-        "reduce with + over [10,20,30] should yield 60");
+    let result = sequences::reduce(
+        addition_fn(),
+        make_list(&[10, 20, 30]),
+        None,
+        None,
+        0,
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        BlissVal::from_fixnum(60),
+        "reduce with + over [10,20,30] should yield 60"
+    );
 }
 
 #[test]
 fn reduce_empty_no_initial_errors() {
-    assert!(sequences::reduce(addition_fn(), NIL, None, None, 0, None, false).is_err(),
-        "reduce on empty sequence without initial-value should error");
+    assert!(
+        sequences::reduce(addition_fn(), NIL, None, None, 0, None, false).is_err(),
+        "reduce on empty sequence without initial-value should error"
+    );
 }
 
 #[test]
 fn reduce_with_start_end() {
     // reduce #'+ '(10 20 30 40) :initial-value 0 :start 1 :end 3
     // Only reduces elements at indices 1,2 => 20 + 30 = 50
-    let result = sequences::reduce(addition_fn(), make_list(&[10, 20, 30, 40]),
-        Some(BlissVal::from_fixnum(0)), None, 1, Some(3), false).unwrap();
-    assert_eq!(result, BlissVal::from_fixnum(50),
-        "reduce over sub-range [1,3) of [10,20,30,40] with initial 0 should yield 50");
+    let result = sequences::reduce(
+        addition_fn(),
+        make_list(&[10, 20, 30, 40]),
+        Some(BlissVal::from_fixnum(0)),
+        None,
+        1,
+        Some(3),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        BlissVal::from_fixnum(50),
+        "reduce over sub-range [1,3) of [10,20,30,40] with initial 0 should yield 50"
+    );
 }
 
 #[test]
@@ -490,10 +688,21 @@ fn reduce_from_end() {
     // Right-fold: 1 + (2 + (3 + 0)) = 6 — same as left for +,
     // but the implementation must process from the end.
     // For a commutative op the result is the same; we still verify the value.
-    let result = sequences::reduce(addition_fn(), make_list(&[1, 2, 3]),
-        Some(BlissVal::from_fixnum(0)), None, 0, None, true).unwrap();
-    assert_eq!(result, BlissVal::from_fixnum(6),
-        "reduce from-end with + over [1,2,3] starting from 0 should yield 6");
+    let result = sequences::reduce(
+        addition_fn(),
+        make_list(&[1, 2, 3]),
+        Some(BlissVal::from_fixnum(0)),
+        None,
+        0,
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        result,
+        BlissVal::from_fixnum(6),
+        "reduce from-end with + over [1,2,3] starting from 0 should yield 6"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -502,8 +711,17 @@ fn reduce_from_end() {
 
 #[test]
 fn remove_all_occurrences() {
-    let rem = sequences::remove(BlissVal::from_fixnum(2), make_list(&[1, 2, 3, 2, 5]),
-        default_test(), None, 0, None, None, false).unwrap();
+    let rem = sequences::remove(
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 5]),
+        default_test(),
+        None,
+        0,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(sequences::length(rem).unwrap(), 3);
     assert_eq!(sequences::elt(rem, 0).unwrap(), BlissVal::from_fixnum(1));
     assert_eq!(sequences::elt(rem, 1).unwrap(), BlissVal::from_fixnum(3));
@@ -512,22 +730,49 @@ fn remove_all_occurrences() {
 
 #[test]
 fn remove_with_count() {
-    let rem = sequences::remove(BlissVal::from_fixnum(2), make_list(&[2, 1, 2, 3, 2]),
-        default_test(), None, 0, None, Some(2), false).unwrap();
+    let rem = sequences::remove(
+        BlissVal::from_fixnum(2),
+        make_list(&[2, 1, 2, 3, 2]),
+        default_test(),
+        None,
+        0,
+        None,
+        Some(2),
+        false,
+    )
+    .unwrap();
     assert_eq!(sequences::length(rem).unwrap(), 3);
 }
 
 #[test]
 fn remove_from_end_with_count() {
-    let rem = sequences::remove(BlissVal::from_fixnum(2), make_list(&[2, 1, 2, 3, 2]),
-        default_test(), None, 0, None, Some(1), true).unwrap();
+    let rem = sequences::remove(
+        BlissVal::from_fixnum(2),
+        make_list(&[2, 1, 2, 3, 2]),
+        default_test(),
+        None,
+        0,
+        None,
+        Some(1),
+        true,
+    )
+    .unwrap();
     assert_eq!(sequences::length(rem).unwrap(), 4);
 }
 
 #[test]
 fn remove_with_start_end() {
-    let rem = sequences::remove(BlissVal::from_fixnum(2), make_list(&[2, 1, 2, 3, 2]),
-        default_test(), None, 1, Some(4), None, false).unwrap();
+    let rem = sequences::remove(
+        BlissVal::from_fixnum(2),
+        make_list(&[2, 1, 2, 3, 2]),
+        default_test(),
+        None,
+        1,
+        Some(4),
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(sequences::length(rem).unwrap(), 4);
 }
 
@@ -535,8 +780,17 @@ fn remove_with_start_end() {
 fn remove_with_key() {
     // Remove with key function applied to elements before test comparison.
     // With identity_key, behaviour matches default — remove all 2s.
-    let rem = sequences::remove(BlissVal::from_fixnum(2), make_list(&[1, 2, 3, 2]),
-        default_test(), Some(identity_key()), 0, None, None, false).unwrap();
+    let rem = sequences::remove(
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2]),
+        default_test(),
+        Some(identity_key()),
+        0,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(sequences::length(rem).unwrap(), 2);
     assert_eq!(sequences::elt(rem, 0).unwrap(), BlissVal::from_fixnum(1));
     assert_eq!(sequences::elt(rem, 1).unwrap(), BlissVal::from_fixnum(3));
@@ -545,8 +799,17 @@ fn remove_with_key() {
 #[test]
 fn remove_with_custom_test() {
     // Remove with a custom test function instead of default EQL.
-    let rem = sequences::remove(BlissVal::from_fixnum(2), make_list(&[1, 2, 3, 2, 5]),
-        custom_test(), None, 0, None, None, false).unwrap();
+    let rem = sequences::remove(
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 5]),
+        custom_test(),
+        None,
+        0,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(sequences::length(rem).unwrap(), 3);
     assert_eq!(sequences::elt(rem, 0).unwrap(), BlissVal::from_fixnum(1));
     assert_eq!(sequences::elt(rem, 1).unwrap(), BlissVal::from_fixnum(3));
@@ -559,8 +822,18 @@ fn remove_with_custom_test() {
 
 #[test]
 fn substitute_all() {
-    let s = sequences::substitute(BlissVal::from_fixnum(99), BlissVal::from_fixnum(2),
-        make_list(&[1, 2, 3, 2, 5]), default_test(), None, 0, None, None, false).unwrap();
+    let s = sequences::substitute(
+        BlissVal::from_fixnum(99),
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 5]),
+        default_test(),
+        None,
+        0,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(sequences::length(s).unwrap(), 5);
     assert_eq!(sequences::elt(s, 1).unwrap(), BlissVal::from_fixnum(99));
     assert_eq!(sequences::elt(s, 3).unwrap(), BlissVal::from_fixnum(99));
@@ -569,8 +842,18 @@ fn substitute_all() {
 
 #[test]
 fn substitute_with_count() {
-    let s = sequences::substitute(BlissVal::from_fixnum(0), BlissVal::from_fixnum(2),
-        make_list(&[2, 2, 2]), default_test(), None, 0, None, Some(2), false).unwrap();
+    let s = sequences::substitute(
+        BlissVal::from_fixnum(0),
+        BlissVal::from_fixnum(2),
+        make_list(&[2, 2, 2]),
+        default_test(),
+        None,
+        0,
+        None,
+        Some(2),
+        false,
+    )
+    .unwrap();
     assert_eq!(sequences::elt(s, 0).unwrap(), BlissVal::from_fixnum(0));
     assert_eq!(sequences::elt(s, 1).unwrap(), BlissVal::from_fixnum(0));
     assert_eq!(sequences::elt(s, 2).unwrap(), BlissVal::from_fixnum(2));
@@ -578,16 +861,36 @@ fn substitute_with_count() {
 
 #[test]
 fn substitute_from_end_with_count() {
-    let s = sequences::substitute(BlissVal::from_fixnum(0), BlissVal::from_fixnum(2),
-        make_list(&[2, 2, 2]), default_test(), None, 0, None, Some(1), true).unwrap();
+    let s = sequences::substitute(
+        BlissVal::from_fixnum(0),
+        BlissVal::from_fixnum(2),
+        make_list(&[2, 2, 2]),
+        default_test(),
+        None,
+        0,
+        None,
+        Some(1),
+        true,
+    )
+    .unwrap();
     assert_eq!(sequences::elt(s, 0).unwrap(), BlissVal::from_fixnum(2));
     assert_eq!(sequences::elt(s, 2).unwrap(), BlissVal::from_fixnum(0));
 }
 
 #[test]
 fn substitute_with_start_end() {
-    let s = sequences::substitute(BlissVal::from_fixnum(0), BlissVal::from_fixnum(2),
-        make_list(&[2, 1, 2, 3, 2]), default_test(), None, 1, Some(4), None, false).unwrap();
+    let s = sequences::substitute(
+        BlissVal::from_fixnum(0),
+        BlissVal::from_fixnum(2),
+        make_list(&[2, 1, 2, 3, 2]),
+        default_test(),
+        None,
+        1,
+        Some(4),
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(sequences::elt(s, 0).unwrap(), BlissVal::from_fixnum(2)); // outside range
     assert_eq!(sequences::elt(s, 2).unwrap(), BlissVal::from_fixnum(0)); // inside range
     assert_eq!(sequences::elt(s, 4).unwrap(), BlissVal::from_fixnum(2)); // outside range
@@ -596,8 +899,18 @@ fn substitute_with_start_end() {
 #[test]
 fn substitute_with_key() {
     // Substitute with key function applied to elements before comparison.
-    let s = sequences::substitute(BlissVal::from_fixnum(99), BlissVal::from_fixnum(2),
-        make_list(&[1, 2, 3]), default_test(), Some(identity_key()), 0, None, None, false).unwrap();
+    let s = sequences::substitute(
+        BlissVal::from_fixnum(99),
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3]),
+        default_test(),
+        Some(identity_key()),
+        0,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(sequences::length(s).unwrap(), 3);
     assert_eq!(sequences::elt(s, 0).unwrap(), BlissVal::from_fixnum(1));
     assert_eq!(sequences::elt(s, 1).unwrap(), BlissVal::from_fixnum(99));
@@ -607,8 +920,18 @@ fn substitute_with_key() {
 #[test]
 fn substitute_with_custom_test() {
     // Substitute with a non-default test function.
-    let s = sequences::substitute(BlissVal::from_fixnum(99), BlissVal::from_fixnum(2),
-        make_list(&[1, 2, 3, 2, 5]), custom_test(), None, 0, None, None, false).unwrap();
+    let s = sequences::substitute(
+        BlissVal::from_fixnum(99),
+        BlissVal::from_fixnum(2),
+        make_list(&[1, 2, 3, 2, 5]),
+        custom_test(),
+        None,
+        0,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(sequences::length(s).unwrap(), 5);
     assert_eq!(sequences::elt(s, 1).unwrap(), BlissVal::from_fixnum(99));
     assert_eq!(sequences::elt(s, 3).unwrap(), BlissVal::from_fixnum(99));
@@ -628,7 +951,10 @@ fn sort_basic() {
 
 #[test]
 fn sort_empty() {
-    assert_eq!(sequences::length(sequences::sort(NIL, T, None).unwrap()).unwrap(), 0);
+    assert_eq!(
+        sequences::length(sequences::sort(NIL, T, None).unwrap()).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -679,5 +1005,8 @@ fn stable_sort_with_key() {
 
 #[test]
 fn stable_sort_empty() {
-    assert_eq!(sequences::length(sequences::stable_sort(NIL, T, None).unwrap()).unwrap(), 0);
+    assert_eq!(
+        sequences::length(sequences::stable_sort(NIL, T, None).unwrap()).unwrap(),
+        0
+    );
 }

@@ -16,11 +16,17 @@ pub enum TargetArch {
 /// Return the target architecture of the current platform.
 pub fn native_arch() -> TargetArch {
     #[cfg(target_arch = "x86_64")]
-    { TargetArch::X86_64 }
+    {
+        TargetArch::X86_64
+    }
     #[cfg(target_arch = "aarch64")]
-    { TargetArch::Aarch64 }
+    {
+        TargetArch::Aarch64
+    }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { TargetArch::X86_64 } // default fallback
+    {
+        TargetArch::X86_64
+    } // default fallback
 }
 
 // ── Code buffer ────────────────────────────────────────────────────
@@ -156,7 +162,7 @@ fn emit_x86_64(buf: &mut CodeBuffer, graph: &IrGraph) {
     let mut node_offsets: HashMap<crate::ir::NodeId, usize> = HashMap::new();
 
     // Function prologue: push rbp; mov rbp, rsp
-    buf.emit_bytes(&[0x55]);             // push rbp
+    buf.emit_bytes(&[0x55]); // push rbp
     buf.emit_bytes(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
 
     for &node in &ordered {
@@ -330,7 +336,8 @@ fn emit_x86_64(buf: &mut CodeBuffer, graph: &IrGraph) {
             NodeKind::MemStore { offset } => {
                 // Heap store: first data input = base, second = value
                 let inputs = graph.inputs(node);
-                let data_inputs: Vec<_> = inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
+                let data_inputs: Vec<_> =
+                    inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
                 if data_inputs.len() >= 2 {
                     // Load base address into rcx
                     emit_node_value_x86_64(buf, graph, data_inputs[0].from);
@@ -372,7 +379,7 @@ fn emit_x86_64(buf: &mut CodeBuffer, graph: &IrGraph) {
     // If nothing was emitted (shouldn't happen with a valid graph), emit a bare ret
     if buf.is_empty() {
         buf.emit_bytes(&[0x31, 0xC0]); // xor eax, eax
-        buf.emit_bytes(&[0xC3]);       // ret
+        buf.emit_bytes(&[0xC3]); // ret
     }
 }
 
@@ -575,7 +582,8 @@ fn emit_aarch64(buf: &mut CodeBuffer, graph: &IrGraph) {
             }
             NodeKind::MemStore { offset } => {
                 let inputs = graph.inputs(node);
-                let data_inputs: Vec<_> = inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
+                let data_inputs: Vec<_> =
+                    inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
                 if data_inputs.len() >= 2 {
                     // Load base into x1
                     emit_node_value_aarch64(buf, graph, data_inputs[0].from);
@@ -814,11 +822,8 @@ impl LinearScanAllocator {
 
         // Compute live ranges: a node is live from its definition until
         // its last use. We approximate this with ordinal positions.
-        let node_order: HashMap<crate::ir::NodeId, usize> = ordered
-            .iter()
-            .enumerate()
-            .map(|(i, &n)| (n, i))
-            .collect();
+        let node_order: HashMap<crate::ir::NodeId, usize> =
+            ordered.iter().enumerate().map(|(i, &n)| (n, i)).collect();
 
         // For each value node, find the last use position
         let mut last_use: HashMap<crate::ir::NodeId, usize> = HashMap::new();
@@ -932,16 +937,16 @@ impl RegisterAllocation {
 /// `site` must be a valid patchable site address.
 pub unsafe fn patch_code(site: *mut u8, new_target: *const u8) -> Result<(), BlissError> {
     if site.is_null() {
-        return Err(BlissError::Internal(
-            "patch_code: null site pointer".into(),
-        ));
+        return Err(BlissError::Internal("patch_code: null site pointer".into()));
     }
     // Write the new target address at the patch site.
     // On x86-64 this would be a 4-byte relative offset or 8-byte absolute.
     // We write an 8-byte absolute address for simplicity.
     let target_bytes = (new_target as u64).to_le_bytes();
     for (i, &byte) in target_bytes.iter().enumerate() {
-        unsafe { site.add(i).write(byte); }
+        unsafe {
+            site.add(i).write(byte);
+        }
     }
     Ok(())
 }

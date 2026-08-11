@@ -70,8 +70,10 @@ fn source_location_clone_and_debug() {
 fn code_info_source_location_returns_none_at_zero() {
     // CodeInfo has a private field; construct via zero-init transmute.
     let ci: CodeInfo = unsafe { std::mem::zeroed() };
-    assert!(ci.source_location(0).is_none(),
-        "CodeInfo::source_location should return None (stub)");
+    assert!(
+        ci.source_location(0).is_none(),
+        "CodeInfo::source_location should return None (stub)"
+    );
 }
 
 #[test]
@@ -86,8 +88,10 @@ fn code_info_source_location_returns_none_at_nonzero() {
 fn code_info_stack_map_returns_none_at_zero() {
     // CodeInfo has a private field; construct via zero-init transmute.
     let ci: CodeInfo = unsafe { std::mem::zeroed() };
-    assert!(ci.stack_map(0).is_none(),
-        "CodeInfo::stack_map should return None (stub)");
+    assert!(
+        ci.stack_map(0).is_none(),
+        "CodeInfo::stack_map should return None (stub)"
+    );
 }
 
 #[test]
@@ -167,7 +171,10 @@ fn frame_zero_locals_returns_empty_slice() {
     };
     unsafe {
         let locals = frame.locals();
-        assert!(locals.is_empty(), "zero num_locals should yield empty slice");
+        assert!(
+            locals.is_empty(),
+            "zero num_locals should yield empty slice"
+        );
     }
 }
 
@@ -181,17 +188,22 @@ fn frame_type_ignores_high_bits_comprehensive() {
     for &hi in &[0x8000_0000u32, 0xFFFF_FF00, 0xDEAD_BE00] {
         for low in 0u32..=3 {
             let expected = match low {
-                0 => FrameType::Call, 1 => FrameType::Catch,
-                2 => FrameType::Unwind, 3 => FrameType::Special,
+                0 => FrameType::Call,
+                1 => FrameType::Catch,
+                2 => FrameType::Unwind,
+                3 => FrameType::Special,
                 _ => unreachable!(),
             };
             let frame = Frame {
-                prev_fp: ptr::null_mut(), return_pc: ptr::null(),
-                function: NIL, code_info: ptr::null(),
-                flags: hi | low, num_locals: 0, _pad: 0,
+                prev_fp: ptr::null_mut(),
+                return_pc: ptr::null(),
+                function: NIL,
+                code_info: ptr::null(),
+                flags: hi | low,
+                num_locals: 0,
+                _pad: 0,
             };
-            assert_eq!(frame.frame_type(), expected,
-                "flags={:#010x}", hi | low);
+            assert_eq!(frame.frame_type(), expected, "flags={:#010x}", hi | low);
         }
     }
 }
@@ -204,19 +216,31 @@ fn frame_type_ignores_high_bits_comprehensive() {
 fn frame_walker_three_frame_chain() {
     use std::ptr;
     let mut a = Frame {
-        prev_fp: ptr::null_mut(), return_pc: ptr::null(),
-        function: NIL, code_info: ptr::null(),
-        flags: FrameType::Call as u32, num_locals: 0, _pad: 0,
+        prev_fp: ptr::null_mut(),
+        return_pc: ptr::null(),
+        function: NIL,
+        code_info: ptr::null(),
+        flags: FrameType::Call as u32,
+        num_locals: 0,
+        _pad: 0,
     };
     let mut b = Frame {
-        prev_fp: &mut a as *mut Frame, return_pc: ptr::null(),
-        function: NIL, code_info: ptr::null(),
-        flags: FrameType::Catch as u32, num_locals: 0, _pad: 0,
+        prev_fp: &mut a as *mut Frame,
+        return_pc: ptr::null(),
+        function: NIL,
+        code_info: ptr::null(),
+        flags: FrameType::Catch as u32,
+        num_locals: 0,
+        _pad: 0,
     };
     let c = Frame {
-        prev_fp: &mut b as *mut Frame, return_pc: ptr::null(),
-        function: NIL, code_info: ptr::null(),
-        flags: FrameType::Unwind as u32, num_locals: 0, _pad: 0,
+        prev_fp: &mut b as *mut Frame,
+        return_pc: ptr::null(),
+        function: NIL,
+        code_info: ptr::null(),
+        flags: FrameType::Unwind as u32,
+        num_locals: 0,
+        _pad: 0,
     };
     unsafe {
         let frames: Vec<_> = FrameWalker::new(&c as *const Frame).collect();
@@ -236,9 +260,13 @@ fn frame_walker_three_frame_chain() {
 fn frame_walker_single_frame() {
     use std::ptr;
     let frame = Frame {
-        prev_fp: ptr::null_mut(), return_pc: ptr::null(),
-        function: NIL, code_info: ptr::null(),
-        flags: 0, num_locals: 0, _pad: 0,
+        prev_fp: ptr::null_mut(),
+        return_pc: ptr::null(),
+        function: NIL,
+        code_info: ptr::null(),
+        flags: 0,
+        num_locals: 0,
+        _pad: 0,
     };
     unsafe {
         let frames: Vec<_> = FrameWalker::new(&frame as *const Frame).collect();

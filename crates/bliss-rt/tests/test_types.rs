@@ -4,16 +4,24 @@
 //! (requiring heap object header inspection) defined in crates/bliss-rt/src/types.rs.
 //! Red phase: all tests expected to fail before implementation.
 
-use bliss_rt::value::*;
-use bliss_rt::types::*;
 use bliss_rt::object::*;
+use bliss_rt::types::*;
+use bliss_rt::value::*;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-fn mk_fix(n: i64) -> BlissVal { BlissVal::from_fixnum(n) }
-fn mk_chr(c: char) -> BlissVal { BlissVal::from_char(c) }
-fn mk_flt(f: f32) -> BlissVal { BlissVal::from_single_float(f) }
-fn mk_sym(i: u32) -> BlissVal { BlissVal::from_symbol_index(i) }
+fn mk_fix(n: i64) -> BlissVal {
+    BlissVal::from_fixnum(n)
+}
+fn mk_chr(c: char) -> BlissVal {
+    BlissVal::from_char(c)
+}
+fn mk_flt(f: f32) -> BlissVal {
+    BlissVal::from_single_float(f)
+}
+fn mk_sym(i: u32) -> BlissVal {
+    BlissVal::from_symbol_index(i)
+}
 
 unsafe fn mk_heap(storage: &mut [u64; 2], tid: u8) -> BlissVal {
     unsafe {
@@ -160,18 +168,24 @@ fn functionp_false_for_heap_function_types() {
         let interp = mk_heap(&mut s1, type_id::FUNCTION_INTERPRETED);
         // A heap object with FUNCTION_INTERPRETED type_id has heap tag (010),
         // not function tag (110), so tag-based functionp returns false.
-        assert!(!functionp(interp),
-            "heap FUNCTION_INTERPRETED should not satisfy tag-based functionp");
+        assert!(
+            !functionp(interp),
+            "heap FUNCTION_INTERPRETED should not satisfy tag-based functionp"
+        );
 
         let mut s2 = [0u64; 2];
         let compiled = mk_heap(&mut s2, type_id::COMPILED_FUNCTION);
-        assert!(!functionp(compiled),
-            "heap COMPILED_FUNCTION should not satisfy tag-based functionp");
+        assert!(
+            !functionp(compiled),
+            "heap COMPILED_FUNCTION should not satisfy tag-based functionp"
+        );
 
         let mut s3 = [0u64; 2];
         let closure = mk_heap(&mut s3, type_id::CLOSURE);
-        assert!(!functionp(closure),
-            "heap CLOSURE should not satisfy tag-based functionp");
+        assert!(
+            !functionp(closure),
+            "heap CLOSURE should not satisfy tag-based functionp"
+        );
     }
 }
 
@@ -211,7 +225,10 @@ fn listp_true_for_nil() {
 #[test]
 fn listp_true_for_cons() {
     unsafe {
-        let mut cell = ConsCell { car: mk_fix(1), cdr: NIL };
+        let mut cell = ConsCell {
+            car: mk_fix(1),
+            cdr: NIL,
+        };
         assert!(listp(mk_cons(&mut cell)));
     }
 }
@@ -343,7 +360,10 @@ fn bit_vector_p_true_for_simple_bit_array() {
         // which is where the array element-type tag is expected.
         storage[1] = ElementTypeTag::Bit as u64;
         let v = BlissVal::from_heap_ptr(storage.as_mut_ptr() as *mut u8);
-        assert!(bit_vector_p(v), "SIMPLE_ARRAY with Bit element type should be bit_vector_p");
+        assert!(
+            bit_vector_p(v),
+            "SIMPLE_ARRAY with Bit element type should be bit_vector_p"
+        );
     }
 }
 
@@ -360,7 +380,10 @@ fn bit_vector_p_false_cases() {
         s2[0] = header.0;
         s2[1] = ElementTypeTag::General as u64;
         let v = BlissVal::from_heap_ptr(s2.as_mut_ptr() as *mut u8);
-        assert!(!bit_vector_p(v), "SIMPLE_ARRAY with General element type should NOT be bit_vector_p");
+        assert!(
+            !bit_vector_p(v),
+            "SIMPLE_ARRAY with General element type should NOT be bit_vector_p"
+        );
     }
 }
 
@@ -466,11 +489,11 @@ fn complexp_false() {
 #[test]
 fn fixnum_numeric_hierarchy() {
     let v = mk_fix(42);
-    assert!(numberp(v),   "fixnum must be numberp");
-    assert!(integerp(v),  "fixnum must be integerp");
+    assert!(numberp(v), "fixnum must be numberp");
+    assert!(integerp(v), "fixnum must be integerp");
     assert!(rationalp(v), "fixnum must be rationalp");
-    assert!(realp(v),     "fixnum must be realp");
-    assert!(!floatp(v),   "fixnum must NOT be floatp");
+    assert!(realp(v), "fixnum must be realp");
+    assert!(!floatp(v), "fixnum must NOT be floatp");
     assert!(!complexp(v), "fixnum must NOT be complexp");
 }
 
@@ -481,12 +504,12 @@ fn fixnum_numeric_hierarchy() {
 #[test]
 fn single_float_numeric_hierarchy() {
     let v = mk_flt(std::f32::consts::PI);
-    assert!(numberp(v),    "single-float must be numberp");
-    assert!(realp(v),      "single-float must be realp");
-    assert!(floatp(v),     "single-float must be floatp");
-    assert!(!integerp(v),  "single-float must NOT be integerp");
+    assert!(numberp(v), "single-float must be numberp");
+    assert!(realp(v), "single-float must be realp");
+    assert!(floatp(v), "single-float must be floatp");
+    assert!(!integerp(v), "single-float must NOT be integerp");
     assert!(!rationalp(v), "single-float must NOT be rationalp");
-    assert!(!complexp(v),  "single-float must NOT be complexp");
+    assert!(!complexp(v), "single-float must NOT be complexp");
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -498,9 +521,9 @@ fn bignum_numeric_hierarchy() {
     unsafe {
         let mut s = [0u64; 2];
         let v = mk_heap(&mut s, type_id::BIGNUM);
-        assert!(numberp(v),  "bignum must be numberp");
+        assert!(numberp(v), "bignum must be numberp");
         assert!(integerp(v), "bignum must be integerp");
-        assert!(rationalp(v),"bignum must be rationalp");
+        assert!(rationalp(v), "bignum must be rationalp");
     }
 }
 
@@ -519,9 +542,9 @@ fn double_float_numeric_hierarchy() {
     unsafe {
         let mut s = [0u64; 2];
         let v = mk_heap(&mut s, type_id::DOUBLE_FLOAT);
-        assert!(numberp(v),   "double-float must be numberp");
-        assert!(realp(v),     "double-float must be realp");
-        assert!(floatp(v),    "double-float must be floatp");
+        assert!(numberp(v), "double-float must be numberp");
+        assert!(realp(v), "double-float must be realp");
+        assert!(floatp(v), "double-float must be floatp");
         assert!(!integerp(v), "double-float must NOT be integerp");
     }
 }
@@ -532,7 +555,7 @@ fn complex_numeric_hierarchy() {
         let mut s = [0u64; 2];
         let v = mk_heap(&mut s, type_id::COMPLEX);
         assert!(numberp(v), "complex must be numberp");
-        assert!(!realp(v),  "complex must NOT be realp");
+        assert!(!realp(v), "complex must NOT be realp");
     }
 }
 
@@ -570,14 +593,19 @@ fn typep_with_fixnum_returns_meaningful_result() {
     // once the symbol table is bootstrapped, this should map to the real FIXNUM symbol.
     let result: bool = typep(mk_fix(42), mk_sym(0));
     // A fixnum checked against its own type specifier should return true.
-    assert!(result, "typep of a fixnum against the fixnum type specifier should return true");
+    assert!(
+        result,
+        "typep of a fixnum against the fixnum type specifier should return true"
+    );
 
     // Verify that typep returns false for an obviously wrong type:
     // A fixnum should not satisfy a cons type predicate.
     // (Assuming mk_sym(1) maps to a different type specifier than fixnum.)
     let wrong_type_result = typep(mk_fix(42), mk_sym(1));
-    assert!(!wrong_type_result,
-        "typep of a fixnum against a non-fixnum type specifier should return false");
+    assert!(
+        !wrong_type_result,
+        "typep of a fixnum against a non-fixnum type specifier should return false"
+    );
 }
 
 #[test]

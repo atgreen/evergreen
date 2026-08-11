@@ -63,8 +63,7 @@ fn parse_load_flag() {
 
 #[test]
 fn parse_image_flag() {
-    let parsed =
-        CliArgs::parse(&args(&["--image", "core.img"])).expect("--image should parse");
+    let parsed = CliArgs::parse(&args(&["--image", "core.img"])).expect("--image should parse");
     assert_eq!(parsed.image.as_deref(), Some("core.img"));
 }
 
@@ -100,8 +99,7 @@ fn parse_workers_flag() {
 
 #[test]
 fn parse_heap_size_flag() {
-    let parsed =
-        CliArgs::parse(&args(&["--heap-size", "512M"])).expect("--heap-size should parse");
+    let parsed = CliArgs::parse(&args(&["--heap-size", "512M"])).expect("--heap-size should parse");
     assert_eq!(parsed.heap_size.as_deref(), Some("512M"));
 }
 
@@ -117,8 +115,8 @@ fn parse_script_positional_arg() {
 
 #[test]
 fn parse_cl_args_after_double_dash() {
-    let parsed = CliArgs::parse(&args(&["--", "foo", "bar", "baz"]))
-        .expect("-- passthrough should parse");
+    let parsed =
+        CliArgs::parse(&args(&["--", "foo", "bar", "baz"])).expect("-- passthrough should parse");
     assert_eq!(parsed.cl_args, vec!["foo", "bar", "baz"]);
 }
 
@@ -212,8 +210,8 @@ fn parse_workers_non_numeric_is_error() {
 #[test]
 fn parse_double_dash_stops_flag_parsing() {
     // After --, even flag-like strings are CL args, not parsed as flags
-    let parsed = CliArgs::parse(&args(&["--", "--help", "--version"]))
-        .expect("-- should stop flag parsing");
+    let parsed =
+        CliArgs::parse(&args(&["--", "--help", "--version"])).expect("-- should stop flag parsing");
     assert!(!parsed.help);
     assert!(!parsed.version);
     assert_eq!(parsed.cl_args, vec!["--help", "--version"]);

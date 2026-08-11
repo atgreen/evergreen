@@ -105,7 +105,9 @@ fn vector_elt(v: BlissVal, idx: usize) -> BlissVal {
 #[inline]
 fn vector_set_elt(v: BlissVal, idx: usize, val: BlissVal) {
     let ptr = unsafe { v.as_ptr() };
-    unsafe { *(ptr.add(16 + idx * 8) as *mut BlissVal) = val; }
+    unsafe {
+        *(ptr.add(16 + idx * 8) as *mut BlissVal) = val;
+    }
 }
 
 /// Apply a key function to a value. For identity_key or NIL/None, return as-is.
@@ -130,7 +132,10 @@ fn apply_key(key: Option<BlissVal>, val: BlissVal) -> BlissVal {
                 }
                 // Unrecognised symbol key — cannot invoke without VM.
                 // Panic rather than silently returning identity.
-                panic!("apply_key: unsupported key function (symbol index {}); VM callback required", idx);
+                panic!(
+                    "apply_key: unsupported key function (symbol index {}); VM callback required",
+                    idx
+                );
             }
             if k.tag() == bliss_rt::value::TAG_FUNCTION {
                 // Compiled closure / function pointer — cannot invoke without VM.
@@ -261,7 +266,11 @@ fn apply_fn(func: BlissVal, args: &[BlissVal]) -> BlissVal {
                         }
                     }
                     _ => {
-                        let mut result = if args[0].is_fixnum() { args[0].as_fixnum() } else { 0 };
+                        let mut result = if args[0].is_fixnum() {
+                            args[0].as_fixnum()
+                        } else {
+                            0
+                        };
                         for &a in &args[1..] {
                             if a.is_fixnum() {
                                 result -= a.as_fixnum();
@@ -496,10 +505,7 @@ fn result_type_is_vector(result_type: BlissVal) -> bool {
 }
 
 /// Concatenate sequences (CL `CONCATENATE`). R5.30.
-pub fn concatenate(
-    result_type: BlissVal,
-    sequences: &[BlissVal],
-) -> Result<BlissVal, BlissError> {
+pub fn concatenate(result_type: BlissVal, sequences: &[BlissVal]) -> Result<BlissVal, BlissError> {
     let mut all_elems = Vec::new();
     for &seq in sequences {
         let elems = collect_elements(seq)?;
@@ -868,9 +874,9 @@ fn compare_with_predicate(
     } else if predicate.tag() == bliss_rt::value::TAG_SYMBOL {
         let idx = predicate.as_symbol_index();
         match idx {
-            SYMBOL_NEGATE => false,    // descending
-            SYMBOL_ADDITION => true,   // ascending
-            _ => true,                 // default ascending
+            SYMBOL_NEGATE => false,  // descending
+            SYMBOL_ADDITION => true, // ascending
+            _ => true,               // default ascending
         }
     } else {
         // Default: ascending

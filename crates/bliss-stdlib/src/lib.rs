@@ -17,8 +17,8 @@ pub mod conditions;
 pub mod streams;
 
 // ── Sequences & hash tables ───────────────────────────────────────
-pub mod sequences;
 pub mod hashtable;
+pub mod sequences;
 
 // ── FORMAT & pretty-printer ───────────────────────────────────────
 pub mod format;

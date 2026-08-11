@@ -3,7 +3,8 @@ use bliss_stdlib::packages::*;
 
 fn fresh_registry() -> PackageRegistry {
     let mut reg = PackageRegistry::new();
-    reg.init_standard_packages().expect("init_standard_packages");
+    reg.init_standard_packages()
+        .expect("init_standard_packages");
     reg
 }
 
@@ -113,7 +114,10 @@ fn export_makes_external() {
     let pkg = reg.make_package("EXP", &[], &[]).unwrap();
     let (sym, _) = intern("X", pkg).unwrap();
     export(&[sym], pkg).unwrap();
-    assert_eq!(find_symbol("X", pkg).unwrap().unwrap().1, InternStatus::External);
+    assert_eq!(
+        find_symbol("X", pkg).unwrap().unwrap().1,
+        InternStatus::External
+    );
 }
 
 #[test]
@@ -123,7 +127,10 @@ fn unexport_reverts() {
     let (sym, _) = intern("Y", pkg).unwrap();
     export(&[sym], pkg).unwrap();
     unexport(&[sym], pkg).unwrap();
-    assert_eq!(find_symbol("Y", pkg).unwrap().unwrap().1, InternStatus::Internal);
+    assert_eq!(
+        find_symbol("Y", pkg).unwrap().unwrap().1,
+        InternStatus::Internal
+    );
 }
 
 #[test]
@@ -144,7 +151,10 @@ fn use_package_inherits() {
     export(&[sym], prov).unwrap();
     let cons = reg.make_package("CONS", &[], &[]).unwrap();
     use_package(&[prov], cons).unwrap();
-    assert_eq!(find_symbol("SHARED", cons).unwrap().unwrap().1, InternStatus::Inherited);
+    assert_eq!(
+        find_symbol("SHARED", cons).unwrap().unwrap().1,
+        InternStatus::Inherited
+    );
 }
 
 #[test]
@@ -203,11 +213,18 @@ fn make_package_with_use_list_inherits() {
 
     // The consumer should inherit the exported symbol from the provider
     let found = find_symbol("INHERITED-SYM", cons).unwrap();
-    assert!(found.is_some(),
-        "package created with use_list should inherit exported symbols");
+    assert!(
+        found.is_some(),
+        "package created with use_list should inherit exported symbols"
+    );
     let (found_sym, status) = found.unwrap();
-    assert_eq!(found_sym, exported_sym,
-        "inherited symbol should be the same as the exported one");
-    assert_eq!(status, InternStatus::Inherited,
-        "symbol from use_list should have Inherited status");
+    assert_eq!(
+        found_sym, exported_sym,
+        "inherited symbol should be the same as the exported one"
+    );
+    assert_eq!(
+        status,
+        InternStatus::Inherited,
+        "symbol from use_list should have Inherited status"
+    );
 }

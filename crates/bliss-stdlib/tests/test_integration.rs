@@ -4,43 +4,32 @@
 //! their public APIs, proving that the modules integrate correctly.
 
 use bliss_rt::value::{BlissVal, NIL, T};
-use bliss_stdlib::packages::{
-    PackageRegistry, InternStatus,
-    intern, find_symbol, export, import,
-};
 use bliss_stdlib::clos::{
-    bootstrap_clos, find_class, set_find_class, class_of, class_name,
-    make_instance,
-    slot_value, set_slot_value, slot_boundp,
+    bootstrap_clos, class_name, class_of, find_class, make_instance, set_find_class,
+    set_slot_value, slot_boundp, slot_value,
 };
 use bliss_stdlib::conditions::{
-    make_simple_error, make_type_error,
-    handler_case, restart_bind,
-    compute_restarts, find_restart,
-    RestartSpec,
-};
-use bliss_stdlib::sequences::{
-    length, elt, copy_seq, subseq, find as seq_find, position,
-    count, reduce, reverse,
-};
-use bliss_stdlib::hashtable::{
-    make_hash_table, gethash, set_gethash, maphash,
-    hash_table_count, sxhash,
-    MakeHashTableOptions, HashTest,
-};
-use bliss_stdlib::streams::{
-    make_string_input_stream, make_string_output_stream,
-    get_output_stream_string, make_broadcast_stream,
-    make_two_way_stream, open, close,
-    stream_write_string, stream_write_char, stream_read_char,
-    open_stream_p, input_stream_p, output_stream_p,
-    make_lisp_string, StreamDirection, ExternalFormat,
+    RestartSpec, compute_restarts, find_restart, handler_case, make_simple_error, make_type_error,
+    restart_bind,
 };
 use bliss_stdlib::format::{format, formatter};
+use bliss_stdlib::hashtable::{
+    HashTest, MakeHashTableOptions, gethash, hash_table_count, make_hash_table, maphash,
+    set_gethash, sxhash,
+};
+use bliss_stdlib::packages::{InternStatus, PackageRegistry, export, find_symbol, import, intern};
 use bliss_stdlib::pathnames::{
-    parse_namestring, make_pathname, merge_pathnames, namestring,
-    pathname_name, pathname_type, pathname_directory,
-    pathname_host, pathname_device, register_string,
+    make_pathname, merge_pathnames, namestring, parse_namestring, pathname_device,
+    pathname_directory, pathname_host, pathname_name, pathname_type, register_string,
+};
+use bliss_stdlib::sequences::{
+    copy_seq, count, elt, find as seq_find, length, position, reduce, reverse, subseq,
+};
+use bliss_stdlib::streams::{
+    ExternalFormat, StreamDirection, close, get_output_stream_string, input_stream_p,
+    make_broadcast_stream, make_lisp_string, make_string_input_stream, make_string_output_stream,
+    make_two_way_stream, open, open_stream_p, output_stream_p, stream_read_char, stream_write_char,
+    stream_write_string,
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -49,7 +38,8 @@ use bliss_stdlib::pathnames::{
 
 fn fresh_registry() -> PackageRegistry {
     let mut reg = PackageRegistry::new();
-    reg.init_standard_packages().expect("init_standard_packages");
+    reg.init_standard_packages()
+        .expect("init_standard_packages");
     reg
 }
 
@@ -170,7 +160,10 @@ fn intern_multiple_symbols_in_same_package() {
     // All must be distinct values
     for i in 0..syms.len() {
         for j in (i + 1)..syms.len() {
-            assert_ne!(syms[i], syms[j], "different names must produce different symbols");
+            assert_ne!(
+                syms[i], syms[j],
+                "different names must produce different symbols"
+            );
         }
     }
 
@@ -195,8 +188,7 @@ fn define_condition_class_and_handle() {
     bootstrap_clos().expect("bootstrap_clos");
 
     // Find the T class (root of the class hierarchy)
-    let t_class = find_class(T)
-        .expect("T class must exist after bootstrap");
+    let t_class = find_class(T).expect("T class must exist after bootstrap");
 
     // Register a custom condition class name in the CLOS class registry,
     // making it a CLOS-visible class that the condition system can reference.
@@ -208,13 +200,19 @@ fn define_condition_class_and_handle() {
     // Verify the condition class is findable via CLOS
     let found_class = find_class(condition_class_name)
         .expect("condition class should be findable after registration");
-    assert_eq!(found_class, condition_class_val, "found class must match registered class");
+    assert_eq!(
+        found_class, condition_class_val,
+        "found class must match registered class"
+    );
 
     // Create a condition instance via make_instance of the T class (our base class),
     // demonstrating CLOS instance creation for the condition.
-    let condition_instance = make_instance(t_class, &[])
-        .expect("make_instance should create a condition instance");
-    assert!(!condition_instance.is_nil(), "condition instance must not be NIL");
+    let condition_instance =
+        make_instance(t_class, &[]).expect("make_instance should create a condition instance");
+    assert!(
+        !condition_instance.is_nil(),
+        "condition instance must not be NIL"
+    );
 
     // Also create a condition via the condition system
     let condition = make_simple_error("something went wrong", &[]);
@@ -227,8 +225,11 @@ fn define_condition_class_and_handle() {
     assert!(result.is_ok(), "handler_case should succeed");
     // handler_case returns the handler value when a condition matches
     let handled = result.unwrap();
-    assert_eq!(handled.as_fixnum(), 42,
-        "handler_case should return the handler's result value (42) when condition matches");
+    assert_eq!(
+        handled.as_fixnum(),
+        42,
+        "handler_case should return the handler's result value (42) when condition matches"
+    );
 }
 
 /// Create a type-error condition via CLOS, verify its datum/expected-type.
@@ -266,18 +267,25 @@ fn restart_from_handler_bind() {
     let result = restart_bind(&[restart], body);
     assert!(result.is_ok(), "restart_bind should succeed");
     // restart_bind returns the body value
-    assert_eq!(result.unwrap().as_fixnum(), 100,
-        "restart_bind should return the body value");
+    assert_eq!(
+        result.unwrap().as_fixnum(),
+        100,
+        "restart_bind should return the body value"
+    );
 
     // After restart_bind returns, the restart has dynamic extent and should
     // be removed from the registry. Verify dynamic extent semantics:
     let restarts_after = compute_restarts(None);
-    assert!(restarts_after.is_empty(),
-        "restarts should be removed after restart_bind returns (dynamic extent)");
+    assert!(
+        restarts_after.is_empty(),
+        "restarts should be removed after restart_bind returns (dynamic extent)"
+    );
 
     let found_after = find_restart(restart_name, None);
-    assert!(found_after.is_none(),
-        "find_restart should return None after restart_bind's dynamic extent ends");
+    assert!(
+        found_after.is_none(),
+        "find_restart should return None after restart_bind's dynamic extent ends"
+    );
 }
 
 /// CLOS class_of returns the correct class for fixnums after bootstrap.
@@ -474,7 +482,11 @@ fn hashtable_keys_to_list_copy_and_reverse() {
     let reversed = reverse(val_list).expect("reverse on list");
     assert!(!reversed.is_nil());
     let first_reversed = elt(reversed, 0).expect("elt 0 of reversed");
-    assert_eq!(first_reversed.as_fixnum(), 400, "first element of reversed should be 400");
+    assert_eq!(
+        first_reversed.as_fixnum(),
+        400,
+        "first element of reversed should be 400"
+    );
 }
 
 /// Use sequence functions (length, elt, position, count) on a cons-list
@@ -491,7 +503,8 @@ fn sequence_functions_on_hashtable_derived_data() {
     }
 
     // Collect values from hash table into a cons list
-    let values: Vec<BlissVal> = source.iter()
+    let values: Vec<BlissVal> = source
+        .iter()
         .map(|k| {
             let (v, _) = gethash(*k, ht, NIL).unwrap();
             v
@@ -539,8 +552,12 @@ fn sequence_copy_reverse_with_hashtable_lookup() {
     set_gethash(key3, ht, BlissVal::from_fixnum(3)).unwrap();
 
     // Build a cons list from the hashtable values
-    let vals: Vec<BlissVal> = [key1, key2, key3].iter()
-        .map(|k| { let (v, _) = gethash(*k, ht, NIL).unwrap(); v })
+    let vals: Vec<BlissVal> = [key1, key2, key3]
+        .iter()
+        .map(|k| {
+            let (v, _) = gethash(*k, ht, NIL).unwrap();
+            v
+        })
         .collect();
     let seq = make_list(&vals);
 
@@ -552,7 +569,11 @@ fn sequence_copy_reverse_with_hashtable_lookup() {
     // Use reverse on the list
     let reversed = reverse(seq).expect("reverse should work on list");
     assert!(!reversed.is_nil(), "reversed list should not be NIL");
-    assert_eq!(elt(reversed, 0).unwrap().as_fixnum(), 3, "reversed first element should be 3");
+    assert_eq!(
+        elt(reversed, 0).unwrap().as_fixnum(),
+        3,
+        "reversed first element should be 3"
+    );
 
     // Use subseq to extract a subsequence
     let sub = subseq(seq, 0, Some(2)).expect("subseq should work on list");
@@ -584,7 +605,15 @@ fn reduce_sequence_from_hashtable_values() {
     // T as the function is a placeholder; verify reduce returns a value (not NIL)
     // and that the call processes the sequence without error.
     let add_fn = T; // placeholder function value
-    let result = reduce(add_fn, seq, Some(BlissVal::from_fixnum(0)), None, 0, None, false);
+    let result = reduce(
+        add_fn,
+        seq,
+        Some(BlissVal::from_fixnum(0)),
+        None,
+        0,
+        None,
+        false,
+    );
     assert!(result.is_ok(), "reduce should succeed on a cons list");
     let reduced = result.unwrap();
     // With a real addition function, reduce of [10,20,30,40] with initial 0
@@ -615,7 +644,13 @@ fn maphash_iterate_and_collect() {
     for i in 1..=5i64 {
         let (val, present) = gethash(BlissVal::from_fixnum(i), ht, NIL).unwrap();
         assert!(present, "key {} should still be present after maphash", i);
-        assert_eq!(val.as_fixnum(), i * 100, "value for key {} should be {}", i, i * 100);
+        assert_eq!(
+            val.as_fixnum(),
+            i * 100,
+            "value for key {} should be {}",
+            i,
+            i * 100
+        );
     }
 }
 
@@ -632,7 +667,10 @@ fn sequence_find_in_hashtable_values() {
 
     // Collect values into a cons list
     let values: Vec<BlissVal> = (1..=5)
-        .map(|i| { let (v, _) = gethash(BlissVal::from_fixnum(i), ht, NIL).unwrap(); v })
+        .map(|i| {
+            let (v, _) = gethash(BlissVal::from_fixnum(i), ht, NIL).unwrap();
+            v
+        })
         .collect();
     let seq = make_list(&values);
 
@@ -643,9 +681,15 @@ fn sequence_find_in_hashtable_values() {
     assert!(found.is_ok(), "find should succeed on a cons list");
     let found_val = found.unwrap();
     // find should return the element itself (30) when found
-    assert!(!found_val.is_nil(), "find should locate element 30 in the list");
-    assert_eq!(found_val.as_fixnum(), 30,
-        "find should return the found element (30)");
+    assert!(
+        !found_val.is_nil(),
+        "find should locate element 30 in the list"
+    );
+    assert_eq!(
+        found_val.as_fixnum(),
+        30,
+        "find should return the found element (30)"
+    );
 
     // Use length to verify sequence length
     let len = length(seq).expect("length should work on list");
@@ -669,10 +713,12 @@ fn format_to_string_output_stream() {
     assert!(result.is_ok(), "format to stream should succeed");
 
     // Extract what was written to the stream and verify the content
-    let output = get_output_stream_string(stream)
-        .expect("should retrieve output stream string");
-    assert_eq!(output, make_lisp_string("Hello, world!"),
-        "format output via stream should be 'Hello, world!'");
+    let output = get_output_stream_string(stream).expect("should retrieve output stream string");
+    assert_eq!(
+        output,
+        make_lisp_string("Hello, world!"),
+        "format output via stream should be 'Hello, world!'"
+    );
 }
 
 /// Format with ~D for integer arguments.
@@ -683,8 +729,11 @@ fn format_integer_directive() {
     let result = format(NIL, "The answer is ~D.", &[arg]).expect("format ~D");
     assert!(!result.is_nil());
     // Verify the output contains the expected formatted content
-    assert_eq!(result, make_lisp_string("The answer is 42."),
-        "format ~D should produce 'The answer is 42.'");
+    assert_eq!(
+        result,
+        make_lisp_string("The answer is 42."),
+        "format ~D should produce 'The answer is 42.'"
+    );
 }
 
 /// Format with ~% produces newlines.
@@ -693,8 +742,11 @@ fn format_newline_directive() {
     let result = format(NIL, "line1~%line2", &[]).expect("format ~%");
     assert!(!result.is_nil());
     // The result should contain a newline between line1 and line2
-    assert_eq!(result, make_lisp_string("line1\nline2"),
-        "format ~% should produce a newline");
+    assert_eq!(
+        result,
+        make_lisp_string("line1\nline2"),
+        "format ~% should produce a newline"
+    );
 }
 
 /// Format into an actual stream (T = *standard-output*, or a stream val).
@@ -707,10 +759,12 @@ fn format_to_stream_destination() {
     assert!(result.is_ok());
 
     // Extract what was written and verify the content
-    let output = get_output_stream_string(stream)
-        .expect("should retrieve output stream string");
-    assert_eq!(output, make_lisp_string("value=7"),
-        "format to stream should produce 'value=7'");
+    let output = get_output_stream_string(stream).expect("should retrieve output stream string");
+    assert_eq!(
+        output,
+        make_lisp_string("value=7"),
+        "format to stream should produce 'value=7'"
+    );
 }
 
 /// Write characters to a string output stream and read the result.
@@ -735,8 +789,11 @@ fn stream_write_string_and_get_output() {
     stream_write_string(stream, s, 0, None).unwrap();
 
     let output = get_output_stream_string(stream).unwrap();
-    assert_eq!(output, make_lisp_string("Hello, streams!"),
-        "output should contain 'Hello, streams!'");
+    assert_eq!(
+        output,
+        make_lisp_string("Hello, streams!"),
+        "output should contain 'Hello, streams!'"
+    );
 }
 
 /// String input stream: read characters one by one.
@@ -744,8 +801,7 @@ fn stream_write_string_and_get_output() {
 fn string_input_stream_read_chars() {
     let input_str = make_lisp_string("abc");
     // make_string_input_stream takes (string, start: usize, end: Option<usize>)
-    let stream = make_string_input_stream(input_str, 0, None)
-        .expect("make_string_input_stream");
+    let stream = make_string_input_stream(input_str, 0, None).expect("make_string_input_stream");
 
     // input_stream_p returns bool directly
     assert!(input_stream_p(stream));
@@ -764,12 +820,10 @@ fn string_input_stream_read_chars() {
 #[test]
 fn two_way_stream_integration() {
     let input_str = make_lisp_string("input data");
-    let in_stream = make_string_input_stream(input_str, 0, None)
-        .expect("input stream");
+    let in_stream = make_string_input_stream(input_str, 0, None).expect("input stream");
     let out_stream = make_string_output_stream(NIL).expect("output stream");
 
-    let two_way = make_two_way_stream(in_stream, out_stream)
-        .expect("make_two_way_stream");
+    let two_way = make_two_way_stream(in_stream, out_stream).expect("make_two_way_stream");
 
     // Should be both input and output (return bool directly)
     assert!(input_stream_p(two_way));
@@ -798,14 +852,18 @@ fn broadcast_stream_writes_to_all() {
     stream_write_string(broadcast, make_lisp_string("broadcast"), 0, None).unwrap();
 
     // Both component streams should have received the data
-    let out1 = get_output_stream_string(s1)
-        .expect("should get output from stream 1");
-    let out2 = get_output_stream_string(s2)
-        .expect("should get output from stream 2");
-    assert_eq!(out1, make_lisp_string("broadcast"),
-        "stream 1 should have received 'broadcast'");
-    assert_eq!(out2, make_lisp_string("broadcast"),
-        "stream 2 should have received 'broadcast'");
+    let out1 = get_output_stream_string(s1).expect("should get output from stream 1");
+    let out2 = get_output_stream_string(s2).expect("should get output from stream 2");
+    assert_eq!(
+        out1,
+        make_lisp_string("broadcast"),
+        "stream 1 should have received 'broadcast'"
+    );
+    assert_eq!(
+        out2,
+        make_lisp_string("broadcast"),
+        "stream 2 should have received 'broadcast'"
+    );
 }
 
 /// Format with multiple directives (~A ~D ~%) combined.
@@ -819,8 +877,11 @@ fn format_multiple_directives() {
     assert!(result.is_ok());
     let output = result.unwrap();
     assert!(!output.is_nil());
-    assert_eq!(output, make_lisp_string("Name: Alice, Age: 30\n"),
-        "format with multiple directives should produce correct output");
+    assert_eq!(
+        output,
+        make_lisp_string("Name: Alice, Age: 30\n"),
+        "format with multiple directives should produce correct output"
+    );
 }
 
 /// Formatter compiles a control string into a closure, then use it.
@@ -828,7 +889,10 @@ fn format_multiple_directives() {
 fn formatter_compile_and_use() {
     // formatter takes &str (not BlissVal)
     let compiled = formatter("~A = ~D");
-    assert!(compiled.is_ok(), "formatter should compile a valid control string");
+    assert!(
+        compiled.is_ok(),
+        "formatter should compile a valid control string"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -848,8 +912,7 @@ fn make_pathname_string(s: &str) -> BlissVal {
 fn parse_pathname_and_extract_components() {
     let path_str = make_pathname_string("/home/user/file.lisp");
     // parse_namestring returns Result<(BlissVal, usize)>
-    let (pathname, _position) = parse_namestring(path_str, None, None)
-        .expect("parse_namestring");
+    let (pathname, _position) = parse_namestring(path_str, None, None).expect("parse_namestring");
 
     // pathname_name etc return BlissVal directly (not Result)
     let name = pathname_name(pathname);
@@ -875,8 +938,7 @@ fn make_pathname_roundtrip() {
     let directory = NIL;
     let version = NIL;
 
-    let pn = make_pathname(host, device, directory, name, typ, version)
-        .expect("make_pathname");
+    let pn = make_pathname(host, device, directory, name, typ, version).expect("make_pathname");
 
     let ns = namestring(pn).expect("namestring");
     assert!(!ns.is_nil(), "namestring should produce a non-NIL string");
@@ -893,23 +955,19 @@ fn make_pathname_roundtrip() {
 #[test]
 fn merge_pathnames_fills_defaults() {
     let data_str = make_pathname_string("data");
-    let partial = make_pathname(
-        NIL, NIL, NIL,
-        data_str,
-        NIL,
-        NIL,
-    ).expect("partial pathname");
+    let partial = make_pathname(NIL, NIL, NIL, data_str, NIL, NIL).expect("partial pathname");
 
     let defaults = make_pathname(
-        NIL, NIL,
+        NIL,
+        NIL,
         make_pathname_string("/tmp/"),
         make_pathname_string("default"),
         make_pathname_string("dat"),
         NIL,
-    ).expect("default pathname");
+    )
+    .expect("default pathname");
 
-    let merged = merge_pathnames(partial, defaults, NIL)
-        .expect("merge_pathnames");
+    let merged = merge_pathnames(partial, defaults, NIL).expect("merge_pathnames");
 
     // Name should come from partial, type from defaults
     // pathname_name and pathname_type return BlissVal directly
@@ -927,8 +985,7 @@ fn merge_pathnames_fills_defaults() {
 fn pathname_to_stream_open() {
     let path_str = make_pathname_string("/tmp/bliss-test-nonexistent.lisp");
     // parse_namestring returns (BlissVal, usize)
-    let (pathname, _pos) = parse_namestring(path_str, None, None)
-        .expect("parse_namestring");
+    let (pathname, _pos) = parse_namestring(path_str, None, None).expect("parse_namestring");
 
     // Attempting to open a non-existent file for input should error
     let result = open(
@@ -948,18 +1005,19 @@ fn pathname_to_stream_open() {
 #[test]
 fn pathname_namestring_parse_roundtrip() {
     let original = make_pathname(
-        NIL, NIL,
+        NIL,
+        NIL,
         make_pathname_string("/usr/local/"),
         make_pathname_string("config"),
         make_pathname_string("conf"),
         NIL,
-    ).expect("make_pathname");
+    )
+    .expect("make_pathname");
 
     let ns = namestring(original).expect("namestring");
 
     // Parse the namestring back; returns (BlissVal, usize)
-    let (reparsed, _pos) = parse_namestring(ns, None, None)
-        .expect("re-parse namestring");
+    let (reparsed, _pos) = parse_namestring(ns, None, None).expect("re-parse namestring");
 
     // Components should survive the round-trip
     // pathname_name and pathname_type return BlissVal directly
@@ -1038,8 +1096,11 @@ fn format_condition_message() {
     let formatted = format(NIL, "Error: ~A at position ~D", &[arg1, arg2]);
     assert!(formatted.is_ok());
     let output = formatted.unwrap();
-    assert_eq!(output, make_lisp_string("Error: unexpected token at position 42"),
-        "formatted condition message should contain the error details");
+    assert_eq!(
+        output,
+        make_lisp_string("Error: unexpected token at position 42"),
+        "formatted condition message should contain the error details"
+    );
 }
 
 /// Stream close: verify stream is open, close it, verify it's closed.

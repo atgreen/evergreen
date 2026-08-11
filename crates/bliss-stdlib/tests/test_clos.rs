@@ -1,20 +1,29 @@
 //! Tests for bliss-stdlib CLOS module (spec §5.3).
-use bliss_stdlib::clos::*;
 use bliss_rt::value::{BlissVal, NIL, T};
+use bliss_stdlib::clos::*;
 
-fn sym(i: u32) -> BlissVal { BlissVal::from_symbol_index(i) }
+fn sym(i: u32) -> BlissVal {
+    BlissVal::from_symbol_index(i)
+}
 
 #[test]
 fn method_combination_variants_distinct() {
     let v = [
-        MethodCombinationType::Standard, MethodCombinationType::Plus,
-        MethodCombinationType::And,      MethodCombinationType::Or,
-        MethodCombinationType::List,     MethodCombinationType::Append,
-        MethodCombinationType::Nconc,    MethodCombinationType::Min,
-        MethodCombinationType::Max,      MethodCombinationType::Progn,
+        MethodCombinationType::Standard,
+        MethodCombinationType::Plus,
+        MethodCombinationType::And,
+        MethodCombinationType::Or,
+        MethodCombinationType::List,
+        MethodCombinationType::Append,
+        MethodCombinationType::Nconc,
+        MethodCombinationType::Min,
+        MethodCombinationType::Max,
+        MethodCombinationType::Progn,
     ];
     for i in 0..v.len() {
-        for j in (i + 1)..v.len() { assert_ne!(v[i], v[j]); }
+        for j in (i + 1)..v.len() {
+            assert_ne!(v[i], v[j]);
+        }
     }
     assert_eq!(v[0], v[0].clone()); // Clone + Eq
     assert!(format!("{:?}", v[9]).contains("Progn")); // Debug
@@ -50,12 +59,17 @@ fn class_of_returns_correct_metaclass() {
 
     // class_of NIL should return the NULL class
     let nil_class = class_of(NIL);
-    assert_ne!(nil_class, NIL, "class_of NIL must return the NULL class, not NIL itself");
+    assert_ne!(
+        nil_class, NIL,
+        "class_of NIL must return the NULL class, not NIL itself"
+    );
 
     // Different types should have different classes
     let char_class = class_of(BlissVal::from_char('a'));
-    assert_ne!(fixnum_class, char_class,
-        "class_of fixnum and class_of char must return different classes");
+    assert_ne!(
+        fixnum_class, char_class,
+        "class_of fixnum and class_of char must return different classes"
+    );
 
     // class_of T should return the SYMBOL class (T is a symbol)
     let t_class = class_of(T);
@@ -115,14 +129,23 @@ fn cpl_c3_linearization_diamond() {
     assert_eq!(cpl_d[0], class_d, "D must be first in its CPL");
 
     // B must appear before C (left-to-right direct superclass order)
-    let pos_b = cpl_d.iter().position(|&v| v == class_b)
+    let pos_b = cpl_d
+        .iter()
+        .position(|&v| v == class_b)
         .expect("B must appear in D's CPL");
-    let pos_c = cpl_d.iter().position(|&v| v == class_c)
+    let pos_c = cpl_d
+        .iter()
+        .position(|&v| v == class_c)
         .expect("C must appear in D's CPL");
-    assert!(pos_b < pos_c, "B must precede C in D's CPL (left-to-right rule)");
+    assert!(
+        pos_b < pos_c,
+        "B must precede C in D's CPL (left-to-right rule)"
+    );
 
     // A must appear after both B and C (C3 monotonicity)
-    let pos_a = cpl_d.iter().position(|&v| v == class_a)
+    let pos_a = cpl_d
+        .iter()
+        .position(|&v| v == class_a)
         .expect("A must appear in D's CPL");
     assert!(pos_a > pos_b, "A must come after B in D's CPL");
     assert!(pos_a > pos_c, "A must come after C in D's CPL");
@@ -138,12 +161,17 @@ fn class_hierarchy_accessors() {
     // Direct superclasses: a class registered via set_find_class should have
     // at least one superclass (standard-object or T in the CLOS hierarchy).
     let supers = class_direct_superclasses(cls);
-    assert!(!supers.is_empty(),
-        "a registered class should have at least one superclass (e.g., standard-object)");
+    assert!(
+        !supers.is_empty(),
+        "a registered class should have at least one superclass (e.g., standard-object)"
+    );
 
     // Direct subclasses of a fresh class with no children should be empty
     let subs = class_direct_subclasses(cls);
-    assert!(subs.is_empty(), "fresh class should have no direct subclasses yet");
+    assert!(
+        subs.is_empty(),
+        "fresh class should have no direct subclasses yet"
+    );
 
     // Slots: a class defined without explicit slots might have zero,
     // but class_slots must return a valid (possibly empty) vector.
@@ -183,19 +211,27 @@ fn initialize_and_shared_initialize_protocol() {
 
     // Allocate a raw instance — slots should be unbound
     let inst = allocate_instance(cls).unwrap();
-    assert!(!slot_boundp(inst, slot_name).unwrap(),
-        "freshly allocated instance should have unbound slots");
+    assert!(
+        !slot_boundp(inst, slot_name).unwrap(),
+        "freshly allocated instance should have unbound slots"
+    );
 
     // initialize_instance with initargs should populate the slot
     initialize_instance(inst, &[slot_name, init_val]).unwrap();
-    assert_eq!(slot_value(inst, slot_name).unwrap(), init_val,
-        "initialize_instance should set slot from initargs");
+    assert_eq!(
+        slot_value(inst, slot_name).unwrap(),
+        init_val,
+        "initialize_instance should set slot from initargs"
+    );
 
     // shared_initialize with T (all slots) and new initargs should update
     let new_val = BlissVal::from_fixnum(200);
     shared_initialize(inst, T, &[slot_name, new_val]).unwrap();
-    assert_eq!(slot_value(inst, slot_name).unwrap(), new_val,
-        "shared_initialize with T should update slot from initargs");
+    assert_eq!(
+        slot_value(inst, slot_name).unwrap(),
+        new_val,
+        "shared_initialize with T should update slot from initargs"
+    );
 }
 
 #[test]
@@ -279,25 +315,33 @@ fn compute_effective_method_non_standard_variants() {
         MethodCombinationType::Progn,
     ];
 
-    let standard_result = compute_effective_method(gf, MethodCombinationType::Standard, methods)
-        .unwrap();
+    let standard_result =
+        compute_effective_method(gf, MethodCombinationType::Standard, methods).unwrap();
 
     for combo in &combinations {
         let result = compute_effective_method(gf, *combo, methods);
-        assert!(result.is_ok(),
-            "compute_effective_method should succeed with {:?} combination", combo);
+        assert!(
+            result.is_ok(),
+            "compute_effective_method should succeed with {:?} combination",
+            combo
+        );
         // Non-Standard combinations should produce a result different from Standard,
         // since they combine method results differently (e.g., Plus sums them).
         let em = result.unwrap();
-        assert_ne!(em, standard_result,
-            "{:?} combination should produce a different effective method than Standard", combo);
+        assert_ne!(
+            em, standard_result,
+            "{:?} combination should produce a different effective method than Standard",
+            combo
+        );
     }
 
     // Verify distinct combination types produce distinct effective methods where expected
     let plus_em = compute_effective_method(gf, MethodCombinationType::Plus, methods).unwrap();
     let and_em = compute_effective_method(gf, MethodCombinationType::And, methods).unwrap();
-    assert_ne!(plus_em, and_em,
-        "Plus and And combinations should produce different effective methods");
+    assert_ne!(
+        plus_em, and_em,
+        "Plus and And combinations should produce different effective methods"
+    );
 }
 
 #[test]

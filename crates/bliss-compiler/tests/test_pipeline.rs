@@ -3,27 +3,25 @@
 //! Tests the reader → macroexpand → IR → optimization → codegen pipeline
 //! end-to-end, exercising cross-module integration within bliss-compiler.
 
-use bliss_compiler::reader::read_from_string;
-use bliss_compiler::macroexpand::{
-    macroexpand_1, macroexpand, macroexpand_all, Environment, VariableInfo,
-};
-use bliss_compiler::ir::{IrBuilder, IrGraph, NodeId, NodeKind, EdgeKind, verify};
-use bliss_compiler::opt::PassManager;
 use bliss_compiler::codegen::{
-    CodegenBackend, X86_64Backend, Aarch64Backend, CodeBuffer, TargetArch,
-    LinearScanAllocator,
+    Aarch64Backend, CodeBuffer, CodegenBackend, LinearScanAllocator, TargetArch, X86_64Backend,
 };
-use bliss_compiler::tiered::{
-    Tier, TierConfig, Interpreter, BaselineCompiler, OptimisingCompiler,
-    check_promotion, request_compilation,
+use bliss_compiler::ic::{IcState, InlineCache, ic_generation, init_ic_registry, reset_all_caches};
+use bliss_compiler::ir::{EdgeKind, IrBuilder, IrGraph, NodeId, NodeKind, verify};
+use bliss_compiler::macroexpand::{
+    Environment, VariableInfo, macroexpand, macroexpand_1, macroexpand_all,
 };
+use bliss_compiler::opt::PassManager;
 use bliss_compiler::osr::{
-    OsrEntryMap, LocalMapping, DeoptLog, DeoptReason, DeoptConfig,
-    osr_entry, deoptimize,
+    DeoptConfig, DeoptLog, DeoptReason, LocalMapping, OsrEntryMap, deoptimize, osr_entry,
 };
-use bliss_compiler::profiling::{InvocationCounter, BackEdgeCounter, FunctionProfile};
-use bliss_compiler::ic::{InlineCache, IcState, init_ic_registry, reset_all_caches, ic_generation};
-use bliss_rt::value::{BlissVal, NIL, T, EOF};
+use bliss_compiler::profiling::{BackEdgeCounter, FunctionProfile, InvocationCounter};
+use bliss_compiler::reader::read_from_string;
+use bliss_compiler::tiered::{
+    BaselineCompiler, Interpreter, OptimisingCompiler, Tier, TierConfig, check_promotion,
+    request_compilation,
+};
+use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -55,9 +53,14 @@ fn collect_node_kinds(graph: &IrGraph) -> Vec<(NodeId, NodeKind)> {
         }
     }
     // Sanity check: we found all nodes
-    assert_eq!(results.len(), graph.node_count(),
+    assert_eq!(
+        results.len(),
+        graph.node_count(),
         "collect_node_kinds: found {} nodes but graph reports {}; upper bound {} may be too low",
-        results.len(), graph.node_count(), upper);
+        results.len(),
+        graph.node_count(),
+        upper
+    );
     results
 }
 
@@ -99,7 +102,7 @@ fn reader_to_macroexpand_self_evaluating() {
     // Integer, T, NIL should not be macro-expanded
     let cases: &[(&str, Predicate)] = &[
         ("42", |v| v.is_fixnum() && v.as_fixnum() == 42),
-        ("t",  |v| v == T),
+        ("t", |v| v == T),
         ("nil", |v| v == NIL),
     ];
     for &(src, check_fn) in cases {
@@ -116,8 +119,7 @@ fn reader_to_macroexpand_self_evaluating() {
 fn reader_to_macroexpand_symbol_macro() {
     let form = read("MY-VAR");
     let replacement = BlissVal::from_fixnum(99);
-    let env = Environment::null()
-        .augment_variable(form, VariableInfo::SymbolMacro(replacement));
+    let env = Environment::null().augment_variable(form, VariableInfo::SymbolMacro(replacement));
     let (expanded, did) = macroexpand_1(form, &env).unwrap();
     assert!(did, "symbol macro should trigger expansion");
     assert_eq!(expanded.as_fixnum(), 99);
@@ -161,19 +163,23 @@ fn macroexpand_all_on_compound_form() {
     // would expand it, while a broken non-recursive walk would leave it unexpanded.
     let sym = read("MY-SM");
     let replacement = BlissVal::from_fixnum(99);
-    let env = Environment::null()
-        .augment_variable(sym, VariableInfo::SymbolMacro(replacement));
+    let env = Environment::null().augment_variable(sym, VariableInfo::SymbolMacro(replacement));
 
     // Build a form that contains the symbol macro as a subform: (if MY-SM 1 2)
     let form = read("(if MY-SM 1 2)");
     assert!(form.is_cons(), "(if MY-SM 1 2) should parse as cons");
     let result = macroexpand_all(form, &env).unwrap();
     // The result should still be a cons (compound form preserved)
-    assert!(result.is_cons(), "macroexpand_all on compound form should return cons");
+    assert!(
+        result.is_cons(),
+        "macroexpand_all on compound form should return cons"
+    );
     // A correct recursive walk should have expanded MY-SM to 99 within the subforms.
     // The result should NOT be identical to the input (the symbol macro should be expanded).
-    assert_ne!(result, form,
-        "macroexpand_all should expand symbol macros within subforms (recursive walk)");
+    assert_ne!(
+        result, form,
+        "macroexpand_all should expand symbol macros within subforms (recursive walk)"
+    );
 }
 
 #[test]
@@ -183,16 +189,20 @@ fn macroexpand_all_on_nested_compound_form() {
     // descends into nested structures, not just top-level subforms.
     let sym = read("NESTED-SM");
     let replacement = BlissVal::from_fixnum(42);
-    let env = Environment::null()
-        .augment_variable(sym, VariableInfo::SymbolMacro(replacement));
+    let env = Environment::null().augment_variable(sym, VariableInfo::SymbolMacro(replacement));
 
     let form = read("(progn (+ NESTED-SM 2) 3)");
     assert!(form.is_cons());
     let result = macroexpand_all(form, &env).unwrap();
-    assert!(result.is_cons(), "macroexpand_all on nested compound should return cons");
+    assert!(
+        result.is_cons(),
+        "macroexpand_all on nested compound should return cons"
+    );
     // A correct recursive walk should have expanded NESTED-SM inside the inner (+ ...) form.
-    assert_ne!(result, form,
-        "macroexpand_all should expand symbol macros in nested subforms (deep recursive walk)");
+    assert_ne!(
+        result, form,
+        "macroexpand_all should expand symbol macros in nested subforms (deep recursive walk)"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -204,7 +214,12 @@ fn pipeline_self_evaluating_forms_to_ir() {
     // Self-evaluating atoms should produce a 3-node graph: Start, Constant, Return
     for src in &["42", "nil", "t", "-7", "3.14", "'foo", "#\\a", "\"hello\""] {
         let graph = read_and_build_ir(src);
-        assert_eq!(graph.node_count(), 3, "'{}' should produce 3-node graph", src);
+        assert_eq!(
+            graph.node_count(),
+            3,
+            "'{}' should produce 3-node graph",
+            src
+        );
         verify(&graph).unwrap_or_else(|e| panic!("verify failed for '{}': {:?}", src, e));
     }
 }
@@ -213,9 +228,11 @@ fn pipeline_self_evaluating_forms_to_ir() {
 fn pipeline_addition_to_ir() {
     // (+ 1 2) needs at least: Start, Const(1), Const(2), Call(+), Return
     let graph = read_and_build_ir("(+ 1 2)");
-    assert!(graph.node_count() >= 5,
+    assert!(
+        graph.node_count() >= 5,
         "(+ 1 2) should produce at least 5 nodes (Start, Const(1), Const(2), Call(+), Return), got {}",
-        graph.node_count());
+        graph.node_count()
+    );
     verify(&graph).unwrap_or_else(|e| panic!("verify failed for '(+ 1 2)': {:?}", e));
 }
 
@@ -223,13 +240,17 @@ fn pipeline_addition_to_ir() {
 fn pipeline_if_to_ir() {
     // (if t 1 2) needs at least: Start, Const(t), Branch, Region, Const(1), Const(2), Phi, Return
     let graph = read_and_build_ir("(if t 1 2)");
-    assert!(graph.node_count() >= 8,
+    assert!(
+        graph.node_count() >= 8,
         "(if t 1 2) should produce at least 8 nodes (Start, Const(t), Branch, Region, Const(1), Const(2), Phi, Return), got {}",
-        graph.node_count());
+        graph.node_count()
+    );
     // Additionally verify that a Branch node exists in the graph
     let nodes = collect_node_kinds(&graph);
-    assert!(nodes.iter().any(|(_, k)| matches!(k, NodeKind::Branch)),
-        "(if t 1 2) IR must contain a Branch node");
+    assert!(
+        nodes.iter().any(|(_, k)| matches!(k, NodeKind::Branch)),
+        "(if t 1 2) IR must contain a Branch node"
+    );
     verify(&graph).unwrap_or_else(|e| panic!("verify failed for '(if t 1 2)': {:?}", e));
 }
 
@@ -237,13 +258,19 @@ fn pipeline_if_to_ir() {
 fn pipeline_lambda_to_ir() {
     // (lambda (x) x) needs at least: Start, Parameter(0), Return
     let graph = read_and_build_ir("(lambda (x) x)");
-    assert!(graph.node_count() >= 3,
+    assert!(
+        graph.node_count() >= 3,
         "(lambda (x) x) should produce at least 3 nodes including Parameter, got {}",
-        graph.node_count());
+        graph.node_count()
+    );
     // A correct implementation must emit a Parameter node for the lambda argument
     let nodes = collect_node_kinds(&graph);
-    assert!(nodes.iter().any(|(_, k)| matches!(k, NodeKind::Parameter(_))),
-        "(lambda (x) x) IR must contain a Parameter node for the lambda variable");
+    assert!(
+        nodes
+            .iter()
+            .any(|(_, k)| matches!(k, NodeKind::Parameter(_))),
+        "(lambda (x) x) IR must contain a Parameter node for the lambda variable"
+    );
     verify(&graph).unwrap_or_else(|e| panic!("verify failed for '(lambda (x) x)': {:?}", e));
 }
 
@@ -254,13 +281,19 @@ fn pipeline_ir_graph_wiring() {
     assert!(matches!(graph.node_kind(start), NodeKind::Start));
 
     // Start→Return via control edge
-    let ret_edge = graph.uses(start).iter().find(|e| e.kind == EdgeKind::Control);
+    let ret_edge = graph
+        .uses(start)
+        .iter()
+        .find(|e| e.kind == EdgeKind::Control);
     assert!(ret_edge.is_some(), "Start should have control edge");
     let ret_id = ret_edge.unwrap().to;
     assert!(matches!(graph.node_kind(ret_id), NodeKind::Return));
 
     // Return has data input from Constant(42)
-    let data_in = graph.inputs(ret_id).iter().find(|e| e.kind == EdgeKind::Data);
+    let data_in = graph
+        .inputs(ret_id)
+        .iter()
+        .find(|e| e.kind == EdgeKind::Data);
     assert!(data_in.is_some(), "Return should have data input");
     match graph.node_kind(data_in.unwrap().from) {
         NodeKind::Constant(val) => assert_eq!(val.as_fixnum(), 42),
@@ -276,18 +309,24 @@ fn pipeline_ir_graph_wiring_addition() {
 
     // Walk all nodes in the graph using the safe helper (handles non-contiguous IDs after DCE)
     let nodes = collect_node_kinds(&graph);
-    let call_nodes: Vec<_> = nodes.iter()
+    let call_nodes: Vec<_> = nodes
+        .iter()
         .filter(|(_, k)| matches!(k, NodeKind::Call))
         .collect();
-    assert!(!call_nodes.is_empty(), "(+ 1 2) IR should contain a Call node");
+    assert!(
+        !call_nodes.is_empty(),
+        "(+ 1 2) IR should contain a Call node"
+    );
 
     for &(nid, _) in &call_nodes {
         // Call node should have data inputs (the arguments)
         let inputs = graph.inputs(nid);
         let data_inputs: Vec<_> = inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
-        assert!(data_inputs.len() >= 2,
+        assert!(
+            data_inputs.len() >= 2,
             "Call node for (+ 1 2) should have at least 2 data inputs, got {}",
-            data_inputs.len());
+            data_inputs.len()
+        );
     }
 }
 
@@ -299,18 +338,27 @@ fn pipeline_ir_graph_wiring_if() {
 
     // Walk all nodes in the graph using the safe helper (handles non-contiguous IDs after DCE)
     let nodes = collect_node_kinds(&graph);
-    let branch_nodes: Vec<_> = nodes.iter()
+    let branch_nodes: Vec<_> = nodes
+        .iter()
         .filter(|(_, k)| matches!(k, NodeKind::Branch))
         .collect();
-    assert!(!branch_nodes.is_empty(), "(if t 1 2) IR should contain a Branch node");
+    assert!(
+        !branch_nodes.is_empty(),
+        "(if t 1 2) IR should contain a Branch node"
+    );
 
     for &(nid, _) in &branch_nodes {
         // Branch should have control outputs leading to Region targets
         let uses = graph.uses(nid);
-        let ctrl_outputs: Vec<_> = uses.iter().filter(|e| e.kind == EdgeKind::Control).collect();
-        assert!(ctrl_outputs.len() >= 2,
+        let ctrl_outputs: Vec<_> = uses
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Control)
+            .collect();
+        assert!(
+            ctrl_outputs.len() >= 2,
             "Branch node for (if t 1 2) should have at least 2 control outputs (then/else), got {}",
-            ctrl_outputs.len());
+            ctrl_outputs.len()
+        );
     }
 }
 
@@ -320,7 +368,16 @@ fn pipeline_ir_graph_wiring_if() {
 
 #[test]
 fn pipeline_optimize_preserves_validity() {
-    for src in &["42", "t", "nil", "-1", "3.14", "'foo", "(+ 1 2)", "(if t 1 2)"] {
+    for src in &[
+        "42",
+        "t",
+        "nil",
+        "-1",
+        "3.14",
+        "'foo",
+        "(+ 1 2)",
+        "(if t 1 2)",
+    ] {
         let graph = read_build_and_optimize(src);
         verify(&graph).unwrap_or_else(|e| panic!("post-opt verify failed for '{}': {:?}", src, e));
     }
@@ -332,7 +389,11 @@ fn pipeline_passmanager_trivial_graph_unchanged() {
     let initial = graph.node_count();
     let mut pm = PassManager::new();
     pm.run_all(&mut graph).expect("PassManager failed");
-    assert_eq!(graph.node_count(), initial, "trivial graph should not lose nodes");
+    assert_eq!(
+        graph.node_count(),
+        initial,
+        "trivial graph should not lose nodes"
+    );
 }
 
 #[test]
@@ -343,8 +404,18 @@ fn pipeline_dce_removes_dead_nodes() {
     let live = graph.add_node(NodeKind::Constant(BlissVal::from_fixnum(1)));
     let _dead = graph.add_node(NodeKind::Constant(BlissVal::from_fixnum(999)));
     let ret = graph.add_node(NodeKind::Return);
-    graph.add_edge(Edge { from: start, to: ret, kind: EdgeKind::Control, input_index: 0 });
-    graph.add_edge(Edge { from: live, to: ret, kind: EdgeKind::Data, input_index: 1 });
+    graph.add_edge(Edge {
+        from: start,
+        to: ret,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
+    graph.add_edge(Edge {
+        from: live,
+        to: ret,
+        kind: EdgeKind::Data,
+        input_index: 1,
+    });
 
     assert_eq!(graph.node_count(), 4);
     let mut pm = PassManager::new();
@@ -359,12 +430,22 @@ fn pipeline_dce_removes_dead_nodes() {
 
 #[test]
 fn pipeline_codegen_x86_64_forms() {
-    for src in &["42", "nil", "t", "-1", "3.14", "'foo", "(+ 1 2)",
-                 "(if t 1 2)", "(lambda (x) x)"] {
+    for src in &[
+        "42",
+        "nil",
+        "t",
+        "-1",
+        "3.14",
+        "'foo",
+        "(+ 1 2)",
+        "(if t 1 2)",
+        "(lambda (x) x)",
+    ] {
         let graph = read_build_and_optimize(src);
         let mut backend = X86_64Backend::new();
-        let code = backend.emit(&graph).unwrap_or_else(|e|
-            panic!("x86_64 codegen failed for '{}': {}", src, e));
+        let code = backend
+            .emit(&graph)
+            .unwrap_or_else(|e| panic!("x86_64 codegen failed for '{}': {}", src, e));
         assert!(!code.is_empty(), "code for '{}' is empty", src);
     }
 }
@@ -374,8 +455,9 @@ fn pipeline_codegen_aarch64_forms() {
     for src in &["42", "nil", "t", "'bar", "(+ 1 2)"] {
         let graph = read_build_and_optimize(src);
         let mut backend = Aarch64Backend::new();
-        let code = backend.emit(&graph).unwrap_or_else(|e|
-            panic!("aarch64 codegen failed for '{}': {}", src, e));
+        let code = backend
+            .emit(&graph)
+            .unwrap_or_else(|e| panic!("aarch64 codegen failed for '{}': {}", src, e));
         assert!(!code.is_empty(), "code for '{}' is empty", src);
     }
 }
@@ -423,7 +505,11 @@ fn pipeline_regalloc_aarch64() {
 #[test]
 fn pipeline_regalloc_empty_graph_errors() {
     let graph = IrGraph::new();
-    assert!(LinearScanAllocator::new(TargetArch::X86_64).allocate(&graph).is_err());
+    assert!(
+        LinearScanAllocator::new(TargetArch::X86_64)
+            .allocate(&graph)
+            .is_err()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -459,15 +545,23 @@ fn tiered_interpreter_unbound_symbol_errors() {
 #[test]
 fn tiered_promotion_logic() {
     let config = TierConfig {
-        t1_threshold: 10, t2_threshold: 5000,
-        osr_threshold: 10000, compile_threads: 1,
+        t1_threshold: 10,
+        t2_threshold: 5000,
+        osr_threshold: 10000,
+        compile_threads: 1,
     };
     // Non-function at T0 with 0 invocations: no promotion
     assert_eq!(check_promotion(BlissVal::from_fixnum(0), &config), None);
 
     // With threshold 0, any T0 value qualifies for promotion
-    let config0 = TierConfig { t1_threshold: 0, ..config.clone() };
-    assert_eq!(check_promotion(BlissVal::from_fixnum(0), &config0), Some(Tier::Baseline));
+    let config0 = TierConfig {
+        t1_threshold: 0,
+        ..config.clone()
+    };
+    assert_eq!(
+        check_promotion(BlissVal::from_fixnum(0), &config0),
+        Some(Tier::Baseline)
+    );
 }
 
 #[test]
@@ -479,8 +573,10 @@ fn tiered_promotion_full_lifecycle() {
     // 4. Simulate calling t2_threshold times, verify promotion to Optimising
 
     let config = TierConfig {
-        t1_threshold: 10, t2_threshold: 100,
-        osr_threshold: 10000, compile_threads: 1,
+        t1_threshold: 10,
+        t2_threshold: 100,
+        osr_threshold: 10000,
+        compile_threads: 1,
     };
 
     // Function header layout assumed here matches tiered.rs check_promotion()
@@ -504,33 +600,48 @@ fn tiered_promotion_full_lifecycle() {
     let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION);
 
     // At 0 invocations, no promotion
-    assert_eq!(check_promotion(func_val, &config), None,
-        "function at T0 with 0 invocations should not promote");
+    assert_eq!(
+        check_promotion(func_val, &config),
+        None,
+        "function at T0 with 0 invocations should not promote"
+    );
 
     // Simulate reaching t1_threshold invocations
     header[12..16].copy_from_slice(&10u32.to_le_bytes());
-    assert_eq!(check_promotion(func_val, &config), Some(Tier::Baseline),
-        "function at T0 with t1_threshold invocations should promote to Baseline");
+    assert_eq!(
+        check_promotion(func_val, &config),
+        Some(Tier::Baseline),
+        "function at T0 with t1_threshold invocations should promote to Baseline"
+    );
 
     // "Compile" to baseline — update tier to Baseline
     header[8] = 1; // Tier::Baseline
 
     // At t1_threshold invocations but now Baseline tier, no promotion yet
-    assert_eq!(check_promotion(func_val, &config), None,
-        "Baseline function below t2_threshold should not promote");
+    assert_eq!(
+        check_promotion(func_val, &config),
+        None,
+        "Baseline function below t2_threshold should not promote"
+    );
 
     // Simulate reaching t2_threshold invocations
     header[12..16].copy_from_slice(&100u32.to_le_bytes());
-    assert_eq!(check_promotion(func_val, &config), Some(Tier::Optimising),
-        "Baseline function at t2_threshold should promote to Optimising");
+    assert_eq!(
+        check_promotion(func_val, &config),
+        Some(Tier::Optimising),
+        "Baseline function at t2_threshold should promote to Optimising"
+    );
 
     // Update tier to Optimising
     header[8] = 2; // Tier::Optimising
     assert_eq!(header[8], 2);
 
     // Already at max tier — no further promotion
-    assert_eq!(check_promotion(func_val, &config), None,
-        "Optimising function should not promote further");
+    assert_eq!(
+        check_promotion(func_val, &config),
+        None,
+        "Optimising function should not promote further"
+    );
 }
 
 #[test]
@@ -550,7 +661,6 @@ fn tiered_compilers_produce_code_with_function_val() {
     let oc = OptimisingCompiler::new().compile(func_val).unwrap();
     assert_eq!(oc.tier(), Tier::Optimising);
     assert!(oc.code_size() > 0);
-
 }
 
 #[test]
@@ -559,12 +669,16 @@ fn tiered_compilers_produce_code_with_non_function() {
     // Red-phase test: this will fail until compile() adds TAG_FUNCTION type-checking.
     let non_func = BlissVal::from_fixnum(0);
     let result = BaselineCompiler::new().compile(non_func);
-    assert!(result.is_err(),
-        "BaselineCompiler::compile() should reject non-function values");
+    assert!(
+        result.is_err(),
+        "BaselineCompiler::compile() should reject non-function values"
+    );
 
     let result2 = OptimisingCompiler::new().compile(non_func);
-    assert!(result2.is_err(),
-        "OptimisingCompiler::compile() should reject non-function values");
+    assert!(
+        result2.is_err(),
+        "OptimisingCompiler::compile() should reject non-function values"
+    );
 }
 
 #[test]
@@ -582,8 +696,10 @@ fn profiling_invocation_counter_triggers_t1_promotion() {
     // Verify that InvocationCounter reaching t1_threshold causes
     // check_promotion to return Some(Tier::Baseline) for a function.
     let config = TierConfig {
-        t1_threshold: 10, t2_threshold: 5000,
-        osr_threshold: 10000, compile_threads: 1,
+        t1_threshold: 10,
+        t2_threshold: 5000,
+        osr_threshold: 10000,
+        compile_threads: 1,
     };
 
     let counter = InvocationCounter::new();
@@ -592,7 +708,11 @@ fn profiling_invocation_counter_triggers_t1_promotion() {
     // Increment 9 times — below threshold
     for _ in 0..9 {
         let reached = counter.increment(config.t1_threshold);
-        assert!(!reached, "should not reach threshold before {} increments", config.t1_threshold);
+        assert!(
+            !reached,
+            "should not reach threshold before {} increments",
+            config.t1_threshold
+        );
     }
     assert_eq!(counter.count(), 9);
 
@@ -608,16 +728,21 @@ fn profiling_invocation_counter_triggers_t1_promotion() {
     header[12..16].copy_from_slice(&10u32.to_le_bytes());
     let header_ptr = header.as_ptr() as u64;
     let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION);
-    assert_eq!(check_promotion(func_val, &config), Some(Tier::Baseline),
-        "function with invoke_count at t1_threshold should promote to Baseline");
+    assert_eq!(
+        check_promotion(func_val, &config),
+        Some(Tier::Baseline),
+        "function with invoke_count at t1_threshold should promote to Baseline"
+    );
 }
 
 #[test]
 fn profiling_back_edge_counter_triggers_osr() {
     // Verify that BackEdgeCounter reaching osr_threshold signals OSR readiness.
     let config = TierConfig {
-        t1_threshold: 10, t2_threshold: 5000,
-        osr_threshold: 100, compile_threads: 1,
+        t1_threshold: 10,
+        t2_threshold: 5000,
+        osr_threshold: 100,
+        compile_threads: 1,
     };
 
     let counter = BackEdgeCounter::new();
@@ -629,8 +754,10 @@ fn profiling_back_edge_counter_triggers_osr() {
     assert_eq!(counter.count(), 99);
 
     // 100th increment reaches osr_threshold
-    assert!(counter.increment(config.osr_threshold),
-        "back-edge counter should reach osr_threshold at 100");
+    assert!(
+        counter.increment(config.osr_threshold),
+        "back-edge counter should reach osr_threshold at 100"
+    );
 }
 
 #[test]
@@ -639,8 +766,10 @@ fn profiling_function_profile_drives_tier_transition() {
     // create FunctionProfile, increment its invocation counter to threshold,
     // then verify check_promotion would trigger.
     let config = TierConfig {
-        t1_threshold: 5, t2_threshold: 100,
-        osr_threshold: 10000, compile_threads: 1,
+        t1_threshold: 5,
+        t2_threshold: 100,
+        osr_threshold: 10000,
+        compile_threads: 1,
     };
 
     let profile = FunctionProfile::new();
@@ -650,8 +779,10 @@ fn profiling_function_profile_drives_tier_transition() {
     for _ in 0..4 {
         assert!(!counter.increment(config.t1_threshold));
     }
-    assert!(counter.increment(config.t1_threshold),
-        "5th increment should reach t1_threshold");
+    assert!(
+        counter.increment(config.t1_threshold),
+        "5th increment should reach t1_threshold"
+    );
 
     // Verify the counter value matches what check_promotion would read
     assert_eq!(counter.count(), config.t1_threshold);
@@ -667,7 +798,10 @@ fn profiling_invocation_counter_reset_and_recount() {
     assert_eq!(counter.count(), 5);
     counter.reset();
     assert_eq!(counter.count(), 0);
-    assert!(!counter.increment(10), "after reset, single increment should not reach threshold 10");
+    assert!(
+        !counter.increment(10),
+        "after reset, single increment should not reach threshold 10"
+    );
     assert_eq!(counter.count(), 1);
 }
 
@@ -685,11 +819,17 @@ fn tiered_request_compilation_accepts_function_val() {
 
     // request_compilation should accept a function-tagged value and enqueue it
     let result = request_compilation(func_val, Tier::Baseline);
-    assert!(result.is_ok(), "request_compilation should accept a function-tagged value");
+    assert!(
+        result.is_ok(),
+        "request_compilation should accept a function-tagged value"
+    );
 
     // Also verify it works for T2 target
     let result2 = request_compilation(func_val, Tier::Optimising);
-    assert!(result2.is_ok(), "request_compilation should accept Optimising target tier");
+    assert!(
+        result2.is_ok(),
+        "request_compilation should accept Optimising target tier"
+    );
 }
 
 #[test]
@@ -697,7 +837,10 @@ fn tiered_request_compilation_rejects_non_function() {
     // A fixnum is not a function — request_compilation should reject it
     let non_func = BlissVal::from_fixnum(42);
     let result = request_compilation(non_func, Tier::Baseline);
-    assert!(result.is_err(), "request_compilation should reject non-function values");
+    assert!(
+        result.is_err(),
+        "request_compilation should reject non-function values"
+    );
 }
 
 #[test]
@@ -733,16 +876,25 @@ fn tiered_compiled_code_install_updates_function_header() {
 
     // Install the compiled code into the function header
     let install_result = compiled.install(func_val);
-    assert!(install_result.is_ok(), "install should succeed for a function-tagged value");
+    assert!(
+        install_result.is_ok(),
+        "install should succeed for a function-tagged value"
+    );
 
     // After install, the entry point should be non-null and tier byte should be Baseline (1)
     unsafe {
         let entry_slot = header_ptr as *const AtomicPtr<u8>;
         let entry = (*entry_slot).load(Ordering::Acquire);
-        assert!(!entry.is_null(), "entry point should be updated after install");
+        assert!(
+            !entry.is_null(),
+            "entry point should be updated after install"
+        );
 
         let tier_byte = *header_ptr.add(8);
-        assert_eq!(tier_byte, 1, "tier byte should be Baseline (1) after install");
+        assert_eq!(
+            tier_byte, 1,
+            "tier byte should be Baseline (1) after install"
+        );
     }
 }
 
@@ -794,8 +946,10 @@ fn ic_state_transitions_affect_deopt_decisions() {
     log.record(DeoptReason::InlineCacheOverflow);
     log.record(DeoptReason::InlineCacheOverflow);
     log.record(DeoptReason::InlineCacheOverflow);
-    assert!(log.is_blacklisted(),
-        "3 InlineCacheOverflow deopts should blacklist the function");
+    assert!(
+        log.is_blacklisted(),
+        "3 InlineCacheOverflow deopts should blacklist the function"
+    );
 }
 
 #[test]
@@ -809,18 +963,30 @@ fn ic_generation_invalidation_with_compiled_code() {
     let ic = InlineCache::new();
     ic.update(BlissVal::from_fixnum(1), BlissVal::from_fixnum(100));
     assert_eq!(ic.state(), IcState::Monomorphic);
-    assert_eq!(ic.lookup(BlissVal::from_fixnum(1)), Some(BlissVal::from_fixnum(100)));
+    assert_eq!(
+        ic.lookup(BlissVal::from_fixnum(1)),
+        Some(BlissVal::from_fixnum(100))
+    );
 
     // Simulate a class redefinition: bump global generation
     reset_all_caches();
     let gen_after = ic_generation();
-    assert!(gen_after > gen_before, "reset_all_caches should bump IC generation");
+    assert!(
+        gen_after > gen_before,
+        "reset_all_caches should bump IC generation"
+    );
 
     // The IC should lazily reset on next access — lookup should miss
-    assert_eq!(ic.lookup(BlissVal::from_fixnum(1)), None,
-        "IC should lazily reset after generation bump, causing cache miss");
-    assert_eq!(ic.state(), IcState::Uninitialized,
-        "IC should be Uninitialized after generation-triggered reset");
+    assert_eq!(
+        ic.lookup(BlissVal::from_fixnum(1)),
+        None,
+        "IC should lazily reset after generation bump, causing cache miss"
+    );
+    assert_eq!(
+        ic.state(),
+        IcState::Uninitialized,
+        "IC should be Uninitialized after generation-triggered reset"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -831,9 +997,18 @@ fn ic_generation_invalidation_with_compiled_code() {
 fn osr_entry_map_construction() {
     // Verify OsrEntryMap can be constructed with local-to-SSA mappings
     let mappings = vec![
-        LocalMapping { local_index: 0, ssa_var: 10 },
-        LocalMapping { local_index: 1, ssa_var: 11 },
-        LocalMapping { local_index: 2, ssa_var: 12 },
+        LocalMapping {
+            local_index: 0,
+            ssa_var: 10,
+        },
+        LocalMapping {
+            local_index: 1,
+            ssa_var: 11,
+        },
+        LocalMapping {
+            local_index: 2,
+            ssa_var: 12,
+        },
     ];
     let entry_map = OsrEntryMap::new(mappings.clone(), 64);
     assert_eq!(entry_map.mappings.len(), 3);
@@ -846,12 +1021,18 @@ fn osr_entry_map_construction() {
 fn osr_entry_map_enter_validates_local_bounds() {
     // enter() should error when a mapping references an out-of-bounds local
     let mappings = vec![
-        LocalMapping { local_index: 5, ssa_var: 10 }, // index 5, but only 2 locals
+        LocalMapping {
+            local_index: 5,
+            ssa_var: 10,
+        }, // index 5, but only 2 locals
     ];
     let entry_map = OsrEntryMap::new(mappings, 0);
     let locals = [BlissVal::from_fixnum(1), BlissVal::from_fixnum(2)];
     let result = entry_map.enter(&locals, std::ptr::null());
-    assert!(result.is_err(), "enter should fail when local_index is out of bounds");
+    assert!(
+        result.is_err(),
+        "enter should fail when local_index is out of bounds"
+    );
 }
 
 #[test]
@@ -864,7 +1045,10 @@ fn osr_entry_with_compiled_function() {
     let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION);
 
     let entry_map = OsrEntryMap::new(
-        vec![LocalMapping { local_index: 0, ssa_var: 0 }],
+        vec![LocalMapping {
+            local_index: 0,
+            ssa_var: 0,
+        }],
         0,
     );
     let locals = [BlissVal::from_fixnum(42)];
@@ -896,7 +1080,10 @@ fn osr_deoptimize_records_reason_and_blacklists() {
     log.record(DeoptReason::InlineCacheOverflow);
     log.record(DeoptReason::Other("test".into()));
     assert_eq!(log.count(), 3);
-    assert!(log.is_blacklisted(), "3 deopts should trigger blacklisting (threshold=3)");
+    assert!(
+        log.is_blacklisted(),
+        "3 deopts should trigger blacklisting (threshold=3)"
+    );
 }
 
 #[test]
@@ -909,9 +1096,15 @@ fn osr_deopt_config_custom_threshold() {
     for _ in 0..4 {
         log.record(DeoptReason::InlineCacheOverflow);
     }
-    assert!(!log.is_blacklisted(), "4 deopts below threshold 5 should not blacklist");
+    assert!(
+        !log.is_blacklisted(),
+        "4 deopts below threshold 5 should not blacklist"
+    );
     log.record(DeoptReason::InlineCacheOverflow);
-    assert!(log.is_blacklisted(), "5 deopts at threshold 5 should blacklist");
+    assert!(
+        log.is_blacklisted(),
+        "5 deopts at threshold 5 should blacklist"
+    );
 }
 
 #[test]
@@ -923,8 +1116,10 @@ fn osr_threshold_in_tier_config() {
         osr_threshold: 10000,
         compile_threads: 1,
     };
-    assert_eq!(config.osr_threshold, 10000,
-        "TierConfig should carry osr_threshold for back-edge triggered OSR");
+    assert_eq!(
+        config.osr_threshold, 10000,
+        "TierConfig should carry osr_threshold for back-edge triggered OSR"
+    );
 }
 
 #[test]
@@ -957,17 +1152,38 @@ fn osr_deoptimize_with_compiled_function() {
 
 #[test]
 fn acceptance_full_pipeline_forms() {
-    for src in &["42", "nil", "t", "-42", "3.14", "'hello",
-                 "(+ 1 2)", "(if t 1 2)", "(lambda (x) x)",
-                 "\"hello world\"", "#\\Space",
-                 "(defun foo (x) (+ x 1))"] {
+    for src in &[
+        "42",
+        "nil",
+        "t",
+        "-42",
+        "3.14",
+        "'hello",
+        "(+ 1 2)",
+        "(if t 1 2)",
+        "(lambda (x) x)",
+        "\"hello world\"",
+        "#\\Space",
+        "(defun foo (x) (+ x 1))",
+    ] {
         let code = full_pipeline_x86_64(src);
-        assert!(!code.is_empty(), "full pipeline for '{}' produced empty code", src);
+        assert!(
+            !code.is_empty(),
+            "full pipeline for '{}' produced empty code",
+            src
+        );
         // Every emitted function must have x86-64 prologue (push rbp) and ret
-        assert_eq!(code.code()[0], 0x55,
-            "full pipeline for '{}' should emit push rbp prologue", src);
-        assert!(code.code().contains(&0xC3),
-            "full pipeline for '{}' should contain ret instruction", src);
+        assert_eq!(
+            code.code()[0],
+            0x55,
+            "full pipeline for '{}' should emit push rbp prologue",
+            src
+        );
+        assert!(
+            code.code().contains(&0xC3),
+            "full pipeline for '{}' should contain ret instruction",
+            src
+        );
     }
 }
 
@@ -979,14 +1195,20 @@ fn acceptance_full_pipeline_constant_encoding() {
     let bytes = code.code();
     // Look for the movabs rax prefix (REX.W + B8)
     let has_movabs = bytes.windows(2).any(|w| w[0] == 0x48 && w[1] == 0xB8);
-    assert!(has_movabs,
-        "code for '42' should contain movabs (0x48 0xB8) encoding the literal value");
+    assert!(
+        has_movabs,
+        "code for '42' should contain movabs (0x48 0xB8) encoding the literal value"
+    );
     // The fixnum raw bytes for 42 should follow the movabs prefix
     let fixnum_42 = BlissVal::from_fixnum(42);
     let raw_bytes = fixnum_42.0.to_le_bytes();
-    let has_value = bytes.windows(10).any(|w| w[0] == 0x48 && w[1] == 0xB8 && w[2..10] == raw_bytes);
-    assert!(has_value,
-        "code for '42' should contain the fixnum-tagged encoding of 42");
+    let has_value = bytes
+        .windows(10)
+        .any(|w| w[0] == 0x48 && w[1] == 0xB8 && w[2..10] == raw_bytes);
+    assert!(
+        has_value,
+        "code for '42' should contain the fixnum-tagged encoding of 42"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1040,7 +1262,10 @@ fn pipeline_circular_macro_detected() {
     let env = Environment::null()
         .augment_variable(sym_a, VariableInfo::SymbolMacro(sym_b))
         .augment_variable(sym_b, VariableInfo::SymbolMacro(sym_a));
-    assert!(macroexpand(sym_a, &env).is_err(), "circular expansion should error");
+    assert!(
+        macroexpand(sym_a, &env).is_err(),
+        "circular expansion should error"
+    );
 }
 
 #[test]
@@ -1049,5 +1274,8 @@ fn pipeline_ir_verify_missing_control() {
     let _start = graph.add_node(NodeKind::Start);
     let _ret = graph.add_node(NodeKind::Return);
     // No edge wired: Return lacks control input
-    assert!(verify(&graph).is_err(), "should catch Return without control input");
+    assert!(
+        verify(&graph).is_err(),
+        "should catch Return without control input"
+    );
 }

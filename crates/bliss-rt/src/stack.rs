@@ -4,7 +4,7 @@
 //! region for CL control/value frames. See §2.4 of the spec.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::value::BlissVal;
@@ -67,7 +67,8 @@ impl BlissStack {
     /// stack while it is parked at a safepoint (§2.5.3).
     pub fn publish_top(&self) {
         self.published_sp.store(self.sp_offset, Ordering::Release);
-        self.published_fp.store(self.fp as *mut Frame, Ordering::Release);
+        self.published_fp
+            .store(self.fp as *mut Frame, Ordering::Release);
     }
 
     /// Read the published stack pointer offset (for GC scanning).
@@ -183,10 +184,10 @@ impl CodeInfo {
             source_locations: Box::leak(source_locations.to_vec().into_boxed_slice()),
             stack_maps: Box::leak(stack_maps.to_vec().into_boxed_slice()),
         }));
-        code_info_registry().lock().unwrap().insert(
-            handle as usize,
-            metadata,
-        );
+        code_info_registry()
+            .lock()
+            .unwrap()
+            .insert(handle as usize, metadata);
         unsafe { &*handle }
     }
 
@@ -196,7 +197,9 @@ impl CodeInfo {
             .unwrap()
             .get(&(self as *const CodeInfo as usize))
             .copied();
-        metadata.map(|metadata| metadata.source_locations).unwrap_or(&[])
+        metadata
+            .map(|metadata| metadata.source_locations)
+            .unwrap_or(&[])
     }
 
     fn stack_map_entries(&self) -> &[StackMapEntry] {

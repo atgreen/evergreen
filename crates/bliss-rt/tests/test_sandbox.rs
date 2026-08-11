@@ -5,17 +5,25 @@ use bliss_rt::sandbox::*;
 
 fn restrictive_policy() -> SandboxPolicy {
     SandboxPolicy {
-        allow_filesystem: false, allow_network: false,
-        allow_ffi: false, allow_subprocess: false,
-        max_heap_bytes: 0, max_threads: 0, allowed_paths: vec![],
+        allow_filesystem: false,
+        allow_network: false,
+        allow_ffi: false,
+        allow_subprocess: false,
+        max_heap_bytes: 0,
+        max_threads: 0,
+        allowed_paths: vec![],
     }
 }
 
 fn permissive_policy() -> SandboxPolicy {
     SandboxPolicy {
-        allow_filesystem: true, allow_network: true,
-        allow_ffi: true, allow_subprocess: true,
-        max_heap_bytes: 0, max_threads: 0, allowed_paths: vec![],
+        allow_filesystem: true,
+        allow_network: true,
+        allow_ffi: true,
+        allow_subprocess: true,
+        max_heap_bytes: 0,
+        max_threads: 0,
+        allowed_paths: vec![],
     }
 }
 
@@ -26,13 +34,28 @@ fn permissive_policy() -> SandboxPolicy {
 #[test]
 fn default_policy_is_deny_all() {
     let p = SandboxPolicy::default();
-    assert!(!p.allow_filesystem, "default policy must deny filesystem (R8.02)");
+    assert!(
+        !p.allow_filesystem,
+        "default policy must deny filesystem (R8.02)"
+    );
     assert!(!p.allow_network, "default policy must deny network (R8.02)");
     assert!(!p.allow_ffi, "default policy must deny FFI (R8.02)");
-    assert!(!p.allow_subprocess, "default policy must deny subprocess (R8.02)");
-    assert_eq!(p.max_heap_bytes, 0, "default max_heap_bytes should be 0 (unlimited/unset)");
-    assert_eq!(p.max_threads, 0, "default max_threads should be 0 (unlimited/unset)");
-    assert!(p.allowed_paths.is_empty(), "default allowed_paths must be empty");
+    assert!(
+        !p.allow_subprocess,
+        "default policy must deny subprocess (R8.02)"
+    );
+    assert_eq!(
+        p.max_heap_bytes, 0,
+        "default max_heap_bytes should be 0 (unlimited/unset)"
+    );
+    assert_eq!(
+        p.max_threads, 0,
+        "default max_threads should be 0 (unlimited/unset)"
+    );
+    assert!(
+        p.allowed_paths.is_empty(),
+        "default allowed_paths must be empty"
+    );
 }
 
 #[test]
@@ -113,9 +136,12 @@ fn check_subprocess_allowed_denied() {
 #[test]
 fn sandbox_enforces_max_heap_bytes() {
     let p = SandboxPolicy {
-        allow_filesystem: false, allow_network: false,
-        allow_ffi: false, allow_subprocess: false,
-        max_heap_bytes: 1024, max_threads: 0,
+        allow_filesystem: false,
+        allow_network: false,
+        allow_ffi: false,
+        allow_subprocess: false,
+        max_heap_bytes: 1024,
+        max_threads: 0,
         allowed_paths: vec![],
     };
     let sb = Sandbox::new(p).unwrap();
@@ -129,9 +155,12 @@ fn sandbox_enforces_max_heap_bytes() {
 #[test]
 fn sandbox_enforces_max_threads() {
     let p = SandboxPolicy {
-        allow_filesystem: false, allow_network: false,
-        allow_ffi: false, allow_subprocess: false,
-        max_heap_bytes: 0, max_threads: 2,
+        allow_filesystem: false,
+        allow_network: false,
+        allow_ffi: false,
+        allow_subprocess: false,
+        max_heap_bytes: 0,
+        max_threads: 2,
         allowed_paths: vec![],
     };
     let sb = Sandbox::new(p).unwrap();
@@ -143,10 +172,16 @@ fn sandbox_enforces_max_threads() {
 fn sandbox_default_deny_all_blocks_everything() {
     // With default deny-all policy, all checks should fail
     let sb = Sandbox::new(SandboxPolicy::default()).unwrap();
-    assert!(sb.check_path("/any/path").is_err(), "deny-all should block path access");
+    assert!(
+        sb.check_path("/any/path").is_err(),
+        "deny-all should block path access"
+    );
     assert!(sb.check_network().is_err(), "deny-all should block network");
     assert!(sb.check_ffi().is_err(), "deny-all should block FFI");
-    assert!(sb.check_subprocess().is_err(), "deny-all should block subprocess");
+    assert!(
+        sb.check_subprocess().is_err(),
+        "deny-all should block subprocess"
+    );
 }
 
 // ── policy accessor ───────────────────────────────────────────────
@@ -154,9 +189,12 @@ fn sandbox_default_deny_all_blocks_everything() {
 #[test]
 fn policy_accessor_returns_configured_values() {
     let p = SandboxPolicy {
-        allow_filesystem: false, allow_network: false,
-        allow_ffi: true, allow_subprocess: false,
-        max_heap_bytes: 4096, max_threads: 10,
+        allow_filesystem: false,
+        allow_network: false,
+        allow_ffi: true,
+        allow_subprocess: false,
+        max_heap_bytes: 4096,
+        max_threads: 10,
         allowed_paths: vec!["/opt".into()],
     };
     let sb = Sandbox::new(p).unwrap();

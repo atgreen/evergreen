@@ -115,14 +115,22 @@ fn frame_walker_null_yields_empty() {
 fn frame_walker_chain() {
     use std::ptr;
     let mut a = Frame {
-        prev_fp: ptr::null_mut(), return_pc: ptr::null(),
-        function: NIL, code_info: ptr::null(),
-        flags: 0, num_locals: 0, _pad: 0,
+        prev_fp: ptr::null_mut(),
+        return_pc: ptr::null(),
+        function: NIL,
+        code_info: ptr::null(),
+        flags: 0,
+        num_locals: 0,
+        _pad: 0,
     };
     let b = Frame {
-        prev_fp: &mut a as *mut Frame, return_pc: ptr::null(),
-        function: NIL, code_info: ptr::null(),
-        flags: 0, num_locals: 0, _pad: 0,
+        prev_fp: &mut a as *mut Frame,
+        return_pc: ptr::null(),
+        function: NIL,
+        code_info: ptr::null(),
+        flags: 0,
+        num_locals: 0,
+        _pad: 0,
     };
     unsafe {
         let items: Vec<_> = FrameWalker::new(&b as *const Frame).collect();

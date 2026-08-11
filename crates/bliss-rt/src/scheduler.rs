@@ -2,10 +2,10 @@
 //!
 //! See §2.3.4 of the spec.
 
-use std::collections::HashSet;
-use std::sync::Mutex;
 use crate::error::BlissError;
 use crate::thread::GreenThreadId;
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 /// Scheduler configuration.
 #[derive(Clone, Debug)]

@@ -128,9 +128,7 @@ fn coordinator() -> &'static SafepointCoordinator {
 /// Access the global safepoint page (lazily initialized).
 fn global_safepoint_page() -> &'static SafepointPage {
     static PAGE: OnceLock<SafepointPage> = OnceLock::new();
-    PAGE.get_or_init(|| {
-        SafepointPage::init().expect("failed to allocate global safepoint page")
-    })
+    PAGE.get_or_init(|| SafepointPage::init().expect("failed to allocate global safepoint page"))
 }
 
 // ── Public coordination functions ────────────────────────────────────

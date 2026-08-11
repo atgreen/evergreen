@@ -260,8 +260,7 @@ fn script_receives_cl_args() {
     let _ = std::fs::create_dir_all(&dir);
     let file_path = dir.join("test_args.lisp");
     // Script that prints *command-line-args*
-    std::fs::write(&file_path, "(print *command-line-args*)\n")
-        .expect("failed to write test file");
+    std::fs::write(&file_path, "(print *command-line-args*)\n").expect("failed to write test file");
 
     let output = bliss_bin()
         .arg(file_path.to_str().unwrap())
@@ -344,8 +343,10 @@ fn repl_shows_prompt() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // The prompt could appear on either stdout or stderr
     assert!(
-        stderr.contains("BLISS>") || stderr.contains("bliss>")
-            || stdout.contains("BLISS>") || stdout.contains("bliss>"),
+        stderr.contains("BLISS>")
+            || stderr.contains("bliss>")
+            || stdout.contains("BLISS>")
+            || stdout.contains("bliss>"),
         "REPL should display a prompt, stdout: '{}', stderr: '{}'",
         stdout,
         stderr
@@ -553,7 +554,10 @@ fn heap_size_flag_accepted() {
 #[test]
 fn eval_handler_case_catches_error() {
     let output = bliss_bin()
-        .args(["--eval", "(handler-case (error \"boom\") (error (c) (format nil \"caught: ~A\" c)))"])
+        .args([
+            "--eval",
+            "(handler-case (error \"boom\") (error (c) (format nil \"caught: ~A\" c)))",
+        ])
         .output()
         .expect("failed to run bliss");
     assert_eq!(output.status.code(), Some(0), "exit code should be 0");
@@ -924,12 +928,7 @@ fn image_save_and_load_cycle() {
 
     // Step 2: Load the image and call the function
     let output = bliss_bin()
-        .args([
-            "--image",
-            image_path.to_str().unwrap(),
-            "--eval",
-            "(my-fn)",
-        ])
+        .args(["--image", image_path.to_str().unwrap(), "--eval", "(my-fn)"])
         .output()
         .expect("failed to run bliss for load");
 

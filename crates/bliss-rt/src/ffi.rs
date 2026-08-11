@@ -11,12 +11,20 @@ use crate::value::BlissVal;
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlienType {
     Void,
-    Int { signed: bool, bits: u8 },
+    Int {
+        signed: bool,
+        bits: u8,
+    },
     Float,
     Double,
     Pointer(Box<AlienType>),
-    Struct { fields: Vec<AlienType>, packed: bool },
-    Union { variants: Vec<AlienType> },
+    Struct {
+        fields: Vec<AlienType>,
+        packed: bool,
+    },
+    Union {
+        variants: Vec<AlienType>,
+    },
     FnPtr {
         ret: Box<AlienType>,
         args: Vec<AlienType>,
@@ -114,7 +122,9 @@ pub unsafe fn ffi_call(
     // of all-u64 and 32-bit int signatures.
     let is_ret_i32 = matches!(ret_type, AlienType::Int { bits: 32, .. });
     let all_args_i32 = !arg_types.is_empty()
-        && arg_types.iter().all(|t| matches!(t, AlienType::Int { bits: 32, .. }));
+        && arg_types
+            .iter()
+            .all(|t| matches!(t, AlienType::Int { bits: 32, .. }));
 
     // Issue #6: Extended to support up to 8 arguments.
     // Issue #7: Type-aware dispatch for i32 signatures.
@@ -138,24 +148,64 @@ pub unsafe fn ffi_call(
                 Ok(f(args[0] as i32, args[1] as i32, args[2] as i32) as u32 as u64)
             }
             4 => {
-                let f: extern "C" fn(i32, i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32) as u32 as u64)
+                let f: extern "C" fn(i32, i32, i32, i32) -> i32 =
+                    unsafe { std::mem::transmute(fn_ptr) };
+                Ok(f(
+                    args[0] as i32,
+                    args[1] as i32,
+                    args[2] as i32,
+                    args[3] as i32,
+                ) as u32 as u64)
             }
             5 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32) as u32 as u64)
+                let f: extern "C" fn(i32, i32, i32, i32, i32) -> i32 =
+                    unsafe { std::mem::transmute(fn_ptr) };
+                Ok(f(
+                    args[0] as i32,
+                    args[1] as i32,
+                    args[2] as i32,
+                    args[3] as i32,
+                    args[4] as i32,
+                ) as u32 as u64)
             }
             6 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32, args[5] as i32) as u32 as u64)
+                let f: extern "C" fn(i32, i32, i32, i32, i32, i32) -> i32 =
+                    unsafe { std::mem::transmute(fn_ptr) };
+                Ok(f(
+                    args[0] as i32,
+                    args[1] as i32,
+                    args[2] as i32,
+                    args[3] as i32,
+                    args[4] as i32,
+                    args[5] as i32,
+                ) as u32 as u64)
             }
             7 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32, args[5] as i32, args[6] as i32) as u32 as u64)
+                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32) -> i32 =
+                    unsafe { std::mem::transmute(fn_ptr) };
+                Ok(f(
+                    args[0] as i32,
+                    args[1] as i32,
+                    args[2] as i32,
+                    args[3] as i32,
+                    args[4] as i32,
+                    args[5] as i32,
+                    args[6] as i32,
+                ) as u32 as u64)
             }
             8 => {
-                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32) -> i32 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0] as i32, args[1] as i32, args[2] as i32, args[3] as i32, args[4] as i32, args[5] as i32, args[6] as i32, args[7] as i32) as u32 as u64)
+                let f: extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32) -> i32 =
+                    unsafe { std::mem::transmute(fn_ptr) };
+                Ok(f(
+                    args[0] as i32,
+                    args[1] as i32,
+                    args[2] as i32,
+                    args[3] as i32,
+                    args[4] as i32,
+                    args[5] as i32,
+                    args[6] as i32,
+                    args[7] as i32,
+                ) as u32 as u64)
             }
             _ => Err(BlissError::FfiError(format!(
                 "ffi_call: unsupported argument count {} (max 8)",
@@ -182,24 +232,33 @@ pub unsafe fn ffi_call(
                 Ok(f(args[0], args[1], args[2]))
             }
             4 => {
-                let f: extern "C" fn(u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
+                let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                    unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0], args[1], args[2], args[3]))
             }
             5 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
+                let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 =
+                    unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0], args[1], args[2], args[3], args[4]))
             }
             6 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                    unsafe { std::mem::transmute(fn_ptr) };
                 Ok(f(args[0], args[1], args[2], args[3], args[4], args[5]))
             }
             7 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5], args[6]))
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    unsafe { std::mem::transmute(fn_ptr) };
+                Ok(f(
+                    args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                ))
             }
             8 => {
-                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(fn_ptr) };
-                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]))
+                let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                    unsafe { std::mem::transmute(fn_ptr) };
+                Ok(f(
+                    args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+                ))
             }
             _ => Err(BlissError::FfiError(format!(
                 "ffi_call: unsupported argument count {} (max 8)",
@@ -232,9 +291,7 @@ pub fn marshal_to_c(value: BlissVal, alien_type: &AlienType) -> Result<u64, Blis
             } else if value.is_fixnum() {
                 Ok((value.as_fixnum() as f32).to_bits() as u64)
             } else {
-                Err(BlissError::FfiError(
-                    "cannot marshal value to float".into(),
-                ))
+                Err(BlissError::FfiError("cannot marshal value to float".into()))
             }
         }
         AlienType::Double => {
@@ -341,7 +398,7 @@ extern "C" fn bootstrap_trampoline() -> u64 {
 /// - Fixnum → treated as a raw C function pointer (useful for testing)
 /// - Any other type → returns NIL
 fn invoke_closure(closure: BlissVal) -> u64 {
-    use crate::object::{type_id, ObjectHeader, CompiledFunctionData, ClosureData};
+    use crate::object::{ClosureData, CompiledFunctionData, ObjectHeader, type_id};
     #[allow(unused_imports)]
     use crate::value::{TAG_FUNCTION, TAG_MASK};
 
@@ -544,7 +601,9 @@ pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), 
     let sym = unsafe { libc::dlsym(library as *mut libc::c_void, c_name.as_ptr()) };
     let err = unsafe { libc::dlerror() };
     if !err.is_null() {
-        let msg = unsafe { std::ffi::CStr::from_ptr(err) }.to_string_lossy().into_owned();
+        let msg = unsafe { std::ffi::CStr::from_ptr(err) }
+            .to_string_lossy()
+            .into_owned();
         Err(BlissError::FfiError(format!(
             "symbol '{}' not found: {}",
             name, msg

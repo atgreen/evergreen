@@ -28,7 +28,10 @@ pub enum MethodCombinationType {
 
 #[allow(dead_code)]
 impl MethodCombinationType {
-    #[expect(dead_code, reason = "retained for future serialized combination encodings")]
+    #[expect(
+        dead_code,
+        reason = "retained for future serialized combination encodings"
+    )]
     fn discriminant(self) -> i64 {
         match self {
             Self::Standard => 0,
@@ -86,7 +89,6 @@ struct GFData {
     lambda_list: BlissVal,
     methods: Vec<BlissVal>,
 }
-
 
 /// Standard method combination effective method descriptor.
 #[derive(Clone)]
@@ -201,79 +203,93 @@ where
 /// circularity. R5.10.
 pub fn bootstrap_clos() -> Result<(), BlissError> {
     with_state_mut(|st| {
-    // Full reset so tests are independent
-    *st = ClosState::new();
+        // Full reset so tests are independent
+        *st = ClosState::new();
 
-    // Built-in class values (negative fixnums avoid collision with user classes)
-    let t_cls = BlissVal::from_fixnum(-1);
-    let std_obj = BlissVal::from_fixnum(-2);
-    let fix_cls = BlissVal::from_fixnum(-3);
-    let chr_cls = BlissVal::from_fixnum(-4);
-    let sym_cls = BlissVal::from_fixnum(-5);
-    let nul_cls = BlissVal::from_fixnum(-6);
-    let con_cls = BlissVal::from_fixnum(-7);
-    let flt_cls = BlissVal::from_fixnum(-8);
-    let fun_cls = BlissVal::from_fixnum(-9);
-    let hpo_cls = BlissVal::from_fixnum(-10);
+        // Built-in class values (negative fixnums avoid collision with user classes)
+        let t_cls = BlissVal::from_fixnum(-1);
+        let std_obj = BlissVal::from_fixnum(-2);
+        let fix_cls = BlissVal::from_fixnum(-3);
+        let chr_cls = BlissVal::from_fixnum(-4);
+        let sym_cls = BlissVal::from_fixnum(-5);
+        let nul_cls = BlissVal::from_fixnum(-6);
+        let con_cls = BlissVal::from_fixnum(-7);
+        let flt_cls = BlissVal::from_fixnum(-8);
+        let fun_cls = BlissVal::from_fixnum(-9);
+        let hpo_cls = BlissVal::from_fixnum(-10);
 
-    // Names (high symbol indices to avoid collision)
-    let t_nm = T;
-    let std_nm = BlissVal::from_symbol_index(0xFFFE_0001);
-    let fix_nm = BlissVal::from_symbol_index(0xFFFE_0002);
-    let chr_nm = BlissVal::from_symbol_index(0xFFFE_0003);
-    let sym_nm = BlissVal::from_symbol_index(0xFFFE_0004);
-    let nul_nm = BlissVal::from_symbol_index(0xFFFE_0005);
-    let con_nm = BlissVal::from_symbol_index(0xFFFE_0006);
-    let flt_nm = BlissVal::from_symbol_index(0xFFFE_0007);
-    let fun_nm = BlissVal::from_symbol_index(0xFFFE_0008);
-    let hpo_nm = BlissVal::from_symbol_index(0xFFFE_0009);
+        // Names (high symbol indices to avoid collision)
+        let t_nm = T;
+        let std_nm = BlissVal::from_symbol_index(0xFFFE_0001);
+        let fix_nm = BlissVal::from_symbol_index(0xFFFE_0002);
+        let chr_nm = BlissVal::from_symbol_index(0xFFFE_0003);
+        let sym_nm = BlissVal::from_symbol_index(0xFFFE_0004);
+        let nul_nm = BlissVal::from_symbol_index(0xFFFE_0005);
+        let con_nm = BlissVal::from_symbol_index(0xFFFE_0006);
+        let flt_nm = BlissVal::from_symbol_index(0xFFFE_0007);
+        let fun_nm = BlissVal::from_symbol_index(0xFFFE_0008);
+        let hpo_nm = BlissVal::from_symbol_index(0xFFFE_0009);
 
-    // T — root, no supers
-    st.class_registry.insert(t_nm, t_cls);
-    st.class_meta.insert(t_cls, ClassMeta {
-        name: t_nm,
-        direct_supers: vec![],
-        direct_subs: vec![],
-        slots: vec![],
-    });
+        // T — root, no supers
+        st.class_registry.insert(t_nm, t_cls);
+        st.class_meta.insert(
+            t_cls,
+            ClassMeta {
+                name: t_nm,
+                direct_supers: vec![],
+                direct_subs: vec![],
+                slots: vec![],
+            },
+        );
 
-    // STANDARD-OBJECT (super: T)
-    st.class_registry.insert(std_nm, std_obj);
-    st.class_meta.insert(std_obj, ClassMeta {
-        name: std_nm,
-        direct_supers: vec![t_cls],
-        direct_subs: vec![],
-        slots: vec![],
-    });
+        // STANDARD-OBJECT (super: T)
+        st.class_registry.insert(std_nm, std_obj);
+        st.class_meta.insert(
+            std_obj,
+            ClassMeta {
+                name: std_nm,
+                direct_supers: vec![t_cls],
+                direct_subs: vec![],
+                slots: vec![],
+            },
+        );
 
-    // All other built-in classes (super: STANDARD-OBJECT)
-    let builtins = [
-        (fix_nm, fix_cls), (chr_nm, chr_cls), (sym_nm, sym_cls),
-        (nul_nm, nul_cls), (con_nm, con_cls), (flt_nm, flt_cls),
-        (fun_nm, fun_cls), (hpo_nm, hpo_cls),
-    ];
-    for (nm, cls) in &builtins {
-        st.class_registry.insert(*nm, *cls);
-        st.class_meta.insert(*cls, ClassMeta {
-            name: *nm,
-            direct_supers: vec![std_obj],
-            direct_subs: vec![],
-            slots: vec![],
-        });
-    }
+        // All other built-in classes (super: STANDARD-OBJECT)
+        let builtins = [
+            (fix_nm, fix_cls),
+            (chr_nm, chr_cls),
+            (sym_nm, sym_cls),
+            (nul_nm, nul_cls),
+            (con_nm, con_cls),
+            (flt_nm, flt_cls),
+            (fun_nm, fun_cls),
+            (hpo_nm, hpo_cls),
+        ];
+        for (nm, cls) in &builtins {
+            st.class_registry.insert(*nm, *cls);
+            st.class_meta.insert(
+                *cls,
+                ClassMeta {
+                    name: *nm,
+                    direct_supers: vec![std_obj],
+                    direct_subs: vec![],
+                    slots: vec![],
+                },
+            );
+        }
 
-    st.t_class_val = t_cls;
-    st.standard_object_class = std_obj;
-    st.fixnum_class = fix_cls;
-    st.character_class = chr_cls;
-    st.symbol_class = sym_cls;
-    st.null_class = nul_cls;
-    st.cons_class = con_cls;
-    st.float_class = flt_cls;
-    st.function_class = fun_cls;
-    st.heap_object_class = hpo_cls;
-    st.bootstrapped = true;
-    Ok(())
+        st.t_class_val = t_cls;
+        st.standard_object_class = std_obj;
+        st.fixnum_class = fix_cls;
+        st.character_class = chr_cls;
+        st.symbol_class = sym_cls;
+        st.null_class = nul_cls;
+        st.cons_class = con_cls;
+        st.float_class = flt_cls;
+        st.function_class = fun_cls;
+        st.heap_object_class = hpo_cls;
+        st.bootstrapped = true;
+        Ok(())
     })
 }
 
@@ -303,12 +319,15 @@ pub fn set_find_class(name: BlissVal, class: BlissVal) -> Result<(), BlissError>
             } else {
                 vec![]
             };
-            st.class_meta.insert(class, ClassMeta {
-                name,
-                direct_supers: default_supers,
-                direct_subs: vec![],
-                slots: vec![],
-            });
+            st.class_meta.insert(
+                class,
+                ClassMeta {
+                    name,
+                    direct_supers: default_supers,
+                    direct_subs: vec![],
+                    slots: vec![],
+                },
+            );
         } else {
             // Update name mapping
             st.class_meta.get_mut(&class).unwrap().name = name;
@@ -340,11 +359,12 @@ pub fn define_class(
 
         st.class_registry.insert(name, class);
 
-        let supers = if direct_supers.is_empty() && st.bootstrapped && st.standard_object_class != NIL {
-            vec![st.standard_object_class]
-        } else {
-            direct_supers.to_vec()
-        };
+        let supers =
+            if direct_supers.is_empty() && st.bootstrapped && st.standard_object_class != NIL {
+                vec![st.standard_object_class]
+            } else {
+                direct_supers.to_vec()
+            };
 
         // Register as subclass of each superclass
         for &s in &supers {
@@ -355,12 +375,15 @@ pub fn define_class(
             }
         }
 
-        st.class_meta.insert(class, ClassMeta {
-            name,
-            direct_supers: supers,
-            direct_subs: vec![],
-            slots: slots.to_vec(),
-        });
+        st.class_meta.insert(
+            class,
+            ClassMeta {
+                name,
+                direct_supers: supers,
+                direct_subs: vec![],
+                slots: slots.to_vec(),
+            },
+        );
 
         Ok(())
     })
@@ -406,12 +429,7 @@ pub fn class_of(object: BlissVal) -> BlissVal {
 
 /// Get the class name.
 pub fn class_name(class: BlissVal) -> BlissVal {
-    with_state(|st| {
-        st.class_meta
-            .get(&class)
-            .map(|m| m.name)
-            .unwrap_or(NIL)
-    })
+    with_state(|st| st.class_meta.get(&class).map(|m| m.name).unwrap_or(NIL))
 }
 
 /// Compute the class precedence list using C3 linearization (R5.11).
@@ -469,8 +487,7 @@ fn infer_group_supers(st: &ClosState, class: BlissVal) -> Option<Vec<BlissVal>> 
 
     // Find maximal consecutive run containing this position
     let mut start = pos;
-    while start > 0
-        && st.fixnum_registrations[start].0 - st.fixnum_registrations[start - 1].0 == 1
+    while start > 0 && st.fixnum_registrations[start].0 - st.fixnum_registrations[start - 1].0 == 1
     {
         start -= 1;
     }
@@ -547,9 +564,7 @@ fn c3_linearize(st: &ClosState, class: BlissVal) -> Result<Vec<BlissVal>, BlissE
             .map(|l| l[0])
             .find(|&h| !lists.iter().any(|l| l[1..].contains(&h)))
             .ok_or_else(|| {
-                BlissError::Internal(
-                    "C3 linearization failed: inconsistent hierarchy".into(),
-                )
+                BlissError::Internal("C3 linearization failed: inconsistent hierarchy".into())
             })?;
 
         result.push(head);
@@ -568,10 +583,13 @@ fn c3_linearize(st: &ClosState, class: BlissVal) -> Result<Vec<BlissVal>, BlissE
 pub fn allocate_instance(class: BlissVal) -> Result<BlissVal, BlissError> {
     with_state_mut(|st| {
         let id = st.alloc_instance_id();
-        st.instances.insert(id, InstanceData {
-            class,
-            slots: HashMap::new(),
-        });
+        st.instances.insert(
+            id,
+            InstanceData {
+                class,
+                slots: HashMap::new(),
+            },
+        );
         Ok(id)
     })
 }
@@ -586,10 +604,7 @@ pub fn make_instance(class: BlissVal, initargs: &[BlissVal]) -> Result<BlissVal,
 /// Initialize an instance (INITIALIZE-INSTANCE).
 /// Per ANSI CL, initialize-instance calls (shared-initialize instance T initargs).
 /// Initargs are pairwise (slot-name, value).
-pub fn initialize_instance(
-    instance: BlissVal,
-    initargs: &[BlissVal],
-) -> Result<(), BlissError> {
+pub fn initialize_instance(instance: BlissVal, initargs: &[BlissVal]) -> Result<(), BlissError> {
     // Per spec R5.80: initialize-instance calls shared-initialize with T (all slots)
     shared_initialize(instance, T, initargs)
 }
@@ -663,10 +678,7 @@ pub fn shared_initialize_with_list(
 /// Reinitialize an instance (REINITIALIZE-INSTANCE). R5.81.
 /// Per ANSI CL, reinitialize-instance calls (shared-initialize instance NIL initargs)
 /// — only explicit initargs are applied, no initforms are evaluated.
-pub fn reinitialize_instance(
-    instance: BlissVal,
-    initargs: &[BlissVal],
-) -> Result<(), BlissError> {
+pub fn reinitialize_instance(instance: BlissVal, initargs: &[BlissVal]) -> Result<(), BlissError> {
     // Per spec R5.81: reinitialize-instance calls shared-initialize with
     // slot-names = NIL.  Now that shared_initialize handles NIL correctly
     // (applies initargs but skips initforms), we call it directly.
@@ -676,10 +688,7 @@ pub fn reinitialize_instance(
 // ── Slot access ────────────────────────────────────────────────────
 
 /// Get a slot value (SLOT-VALUE).
-pub fn slot_value(
-    instance: BlissVal,
-    slot_name: BlissVal,
-) -> Result<BlissVal, BlissError> {
+pub fn slot_value(instance: BlissVal, slot_name: BlissVal) -> Result<BlissVal, BlissError> {
     with_state(|st| {
         let inst = st
             .instances
@@ -709,10 +718,7 @@ pub fn set_slot_value(
 }
 
 /// Check if a slot is bound (SLOT-BOUNDP).
-pub fn slot_boundp(
-    instance: BlissVal,
-    slot_name: BlissVal,
-) -> Result<bool, BlissError> {
+pub fn slot_boundp(instance: BlissVal, slot_name: BlissVal) -> Result<bool, BlissError> {
     with_state(|st| {
         let inst = st
             .instances
@@ -723,10 +729,7 @@ pub fn slot_boundp(
 }
 
 /// Make a slot unbound (SLOT-MAKUNBOUND).
-pub fn slot_makunbound(
-    instance: BlissVal,
-    slot_name: BlissVal,
-) -> Result<(), BlissError> {
+pub fn slot_makunbound(instance: BlissVal, slot_name: BlissVal) -> Result<(), BlissError> {
     with_state_mut(|st| {
         let inst = st
             .instances
@@ -746,20 +749,20 @@ pub fn make_generic_function(
 ) -> Result<BlissVal, BlissError> {
     with_state_mut(|st| {
         let id = st.alloc_gf_id();
-        st.generic_functions.insert(id, GFData {
-            name,
-            lambda_list,
-            methods: Vec::new(),
-        });
+        st.generic_functions.insert(
+            id,
+            GFData {
+                name,
+                lambda_list,
+                methods: Vec::new(),
+            },
+        );
         Ok(id)
     })
 }
 
 /// Add a method to a generic function.
-pub fn add_method(
-    generic_function: BlissVal,
-    method: BlissVal,
-) -> Result<(), BlissError> {
+pub fn add_method(generic_function: BlissVal, method: BlissVal) -> Result<(), BlissError> {
     with_state_mut(|st| {
         let gf = st
             .generic_functions
@@ -771,10 +774,7 @@ pub fn add_method(
 }
 
 /// Remove a method from a generic function.
-pub fn remove_method(
-    generic_function: BlissVal,
-    method: BlissVal,
-) -> Result<(), BlissError> {
+pub fn remove_method(generic_function: BlissVal, method: BlissVal) -> Result<(), BlissError> {
     with_state_mut(|st| {
         let gf = st
             .generic_functions
@@ -794,7 +794,13 @@ pub fn set_method_specializers(
     qualifier: MethodQualifier,
 ) {
     with_state_mut(|st| {
-        st.method_meta.insert(method, MethodMeta { specializers, qualifier });
+        st.method_meta.insert(
+            method,
+            MethodMeta {
+                specializers,
+                qualifier,
+            },
+        );
     });
 }
 
@@ -847,10 +853,7 @@ fn method_specificity(st: &ClosState, method: BlissVal, arg_classes: &[BlissVal]
 /// Filters the generic function's methods to those whose specializers
 /// are supertypes of the corresponding argument classes, then sorts
 /// most-specific-first using CPL position.
-pub fn compute_applicable_methods(
-    generic_function: BlissVal,
-    args: &[BlissVal],
-) -> Vec<BlissVal> {
+pub fn compute_applicable_methods(generic_function: BlissVal, args: &[BlissVal]) -> Vec<BlissVal> {
     with_state(|st| {
         let gf = match st.generic_functions.get(&generic_function) {
             Some(gf) => gf,
@@ -862,55 +865,63 @@ pub fn compute_applicable_methods(
         }
 
         // Compute argument classes
-        let arg_classes: Vec<BlissVal> = args.iter().map(|a| {
-            // Inline class_of logic (we already hold the borrow)
-            if let Some(inst) = st.instances.get(a) {
-                inst.class
-            } else if *a == NIL {
-                st.null_class
-            } else if *a == T {
-                st.symbol_class
-            } else if a.is_fixnum() {
-                st.fixnum_class
-            } else if a.is_character() {
-                st.character_class
-            } else if a.is_symbol() {
-                st.symbol_class
-            } else if a.is_cons() {
-                st.cons_class
-            } else if a.is_single_float() {
-                st.float_class
-            } else if a.is_function() {
-                st.function_class
-            } else if a.is_heap_object() {
-                st.heap_object_class
-            } else {
-                st.t_class_val
-            }
-        }).collect();
+        let arg_classes: Vec<BlissVal> = args
+            .iter()
+            .map(|a| {
+                // Inline class_of logic (we already hold the borrow)
+                if let Some(inst) = st.instances.get(a) {
+                    inst.class
+                } else if *a == NIL {
+                    st.null_class
+                } else if *a == T {
+                    st.symbol_class
+                } else if a.is_fixnum() {
+                    st.fixnum_class
+                } else if a.is_character() {
+                    st.character_class
+                } else if a.is_symbol() {
+                    st.symbol_class
+                } else if a.is_cons() {
+                    st.cons_class
+                } else if a.is_single_float() {
+                    st.float_class
+                } else if a.is_function() {
+                    st.function_class
+                } else if a.is_heap_object() {
+                    st.heap_object_class
+                } else {
+                    st.t_class_val
+                }
+            })
+            .collect();
 
         // Filter: keep methods whose specializers match the argument classes
-        let mut applicable: Vec<BlissVal> = gf.methods.iter().copied().filter(|&m| {
-            match st.method_meta.get(&m) {
-                Some(meta) => {
-                    // Each specializer must be applicable to the corresponding arg
-                    for (i, spec) in meta.specializers.iter().enumerate() {
-                        if i >= arg_classes.len() {
-                            break;
+        let mut applicable: Vec<BlissVal> = gf
+            .methods
+            .iter()
+            .copied()
+            .filter(|&m| {
+                match st.method_meta.get(&m) {
+                    Some(meta) => {
+                        // Each specializer must be applicable to the corresponding arg
+                        for (i, spec) in meta.specializers.iter().enumerate() {
+                            if i >= arg_classes.len() {
+                                break;
+                            }
+                            if !specializer_applicable(st, *spec, arg_classes[i]) {
+                                return false;
+                            }
                         }
-                        if !specializer_applicable(st, *spec, arg_classes[i]) {
-                            return false;
-                        }
+                        true
                     }
-                    true
+                    None => {
+                        // No specializer metadata: method is unspecialized,
+                        // applicable to all arguments
+                        true
+                    }
                 }
-                None => {
-                    // No specializer metadata: method is unspecialized,
-                    // applicable to all arguments
-                    true
-                }
-            }
-        }).collect();
+            })
+            .collect();
 
         // Sort by specificity: most specific first (lowest score)
         applicable.sort_by_key(|&m| method_specificity(st, m, &arg_classes));
@@ -996,12 +1007,15 @@ pub fn compute_effective_method(
             // Store the effective method chain for later invocation
             let em_key = with_state_mut(|st| {
                 let key = st.alloc_instance_id();
-                st.effective_methods.insert(key, EffectiveMethod {
-                    around,
-                    before,
-                    primary,
-                    after,
-                });
+                st.effective_methods.insert(
+                    key,
+                    EffectiveMethod {
+                        around,
+                        before,
+                        primary,
+                        after,
+                    },
+                );
                 key
             });
 
@@ -1013,12 +1027,16 @@ pub fn compute_effective_method(
             // We store the method list and combination type for later invocation.
 
             let primary_methods: Vec<BlissVal> = with_state(|st| {
-                methods.iter().copied().filter(|m| {
-                    match st.method_meta.get(m) {
-                        Some(meta) => meta.qualifier == MethodQualifier::Primary,
-                        None => true, // no metadata = primary
-                    }
-                }).collect()
+                methods
+                    .iter()
+                    .copied()
+                    .filter(|m| {
+                        match st.method_meta.get(m) {
+                            Some(meta) => meta.qualifier == MethodQualifier::Primary,
+                            None => true, // no metadata = primary
+                        }
+                    })
+                    .collect()
             });
 
             if primary_methods.is_empty() {
@@ -1030,10 +1048,13 @@ pub fn compute_effective_method(
             // Store the short-form effective method for later invocation
             let em_key = with_state_mut(|st| {
                 let key = st.alloc_instance_id();
-                st.short_form_methods.insert(key, ShortFormMethod {
-                    combination: other,
-                    methods: primary_methods,
-                });
+                st.short_form_methods.insert(
+                    key,
+                    ShortFormMethod {
+                        combination: other,
+                        methods: primary_methods,
+                    },
+                );
                 key
             });
 
@@ -1063,13 +1084,11 @@ pub fn get_effective_method(key: BlissVal) -> Option<EffectiveMethodParts> {
 /// Retrieve a short-form combination effective method descriptor by key.
 ///
 /// Returns the combination type and the ordered list of methods.
-pub fn get_short_form_method(
-    key: BlissVal,
-) -> Option<(MethodCombinationType, Vec<BlissVal>)> {
+pub fn get_short_form_method(key: BlissVal) -> Option<(MethodCombinationType, Vec<BlissVal>)> {
     with_state(|st| {
-        st.short_form_methods.get(&key).map(|sfm| {
-            (sfm.combination, sfm.methods.clone())
-        })
+        st.short_form_methods
+            .get(&key)
+            .map(|sfm| (sfm.combination, sfm.methods.clone()))
     })
 }
 
@@ -1084,10 +1103,7 @@ pub fn get_short_form_method(
 /// 4. Swap the class pointer (wrapper) to the new class.
 /// 5. Call update-instance-for-different-class with the old snapshot
 ///    and the updated instance.
-pub fn change_class(
-    instance: BlissVal,
-    new_class: BlissVal,
-) -> Result<(), BlissError> {
+pub fn change_class(instance: BlissVal, new_class: BlissVal) -> Result<(), BlissError> {
     with_state_mut(|st| {
         let inst = st
             .instances
@@ -1099,11 +1115,13 @@ pub fn change_class(
         let old_slots = inst.slots.clone();
 
         // Step 2: Determine shared slot names (slots defined in both old and new class)
-        let old_class_slots: Vec<BlissVal> = st.class_meta
+        let old_class_slots: Vec<BlissVal> = st
+            .class_meta
             .get(&old_class)
             .map(|m| m.slots.clone())
             .unwrap_or_default();
-        let new_class_slots: Vec<BlissVal> = st.class_meta
+        let new_class_slots: Vec<BlissVal> = st
+            .class_meta
             .get(&new_class)
             .map(|m| m.slots.clone())
             .unwrap_or_default();
@@ -1169,11 +1187,13 @@ fn update_instance_for_different_class_internal(
     // Per ANSI CL / spec R5.82: the default method calls shared-initialize
     // on the instance with the list of added slots (slots present in the new
     // class but absent from the old class) so they can receive initform defaults.
-    let old_class_slots: Vec<BlissVal> = st.class_meta
+    let old_class_slots: Vec<BlissVal> = st
+        .class_meta
         .get(&old_class)
         .map(|m| m.slots.clone())
         .unwrap_or_default();
-    let new_class_slots: Vec<BlissVal> = st.class_meta
+    let new_class_slots: Vec<BlissVal> = st
+        .class_meta
         .get(&new_class)
         .map(|m| m.slots.clone())
         .unwrap_or_default();

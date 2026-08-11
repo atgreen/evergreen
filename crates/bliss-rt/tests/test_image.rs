@@ -1,5 +1,5 @@
-use bliss_rt::image::*;
 use bliss_rt::gc;
+use bliss_rt::image::*;
 
 #[test]
 fn arch_and_os_repr_values() {
@@ -30,7 +30,10 @@ fn platform_tag_unique_per_combination() {
 
 #[test]
 fn platform_tag_deterministic() {
-    assert_eq!(platform_tag(Arch::X86_64, Os::Linux), platform_tag(Arch::X86_64, Os::Linux));
+    assert_eq!(
+        platform_tag(Arch::X86_64, Os::Linux),
+        platform_tag(Arch::X86_64, Os::Linux)
+    );
 }
 
 #[test]
@@ -72,13 +75,18 @@ fn image_header_is_128_bytes() {
 #[test]
 fn image_header_fields_roundtrip() {
     let h = ImageHeader {
-        magic: IMAGE_MAGIC, format_version: 1,
+        magic: IMAGE_MAGIC,
+        format_version: 1,
         flags: image_flags::COMPRESSED | image_flags::READ_ONLY_SAFE,
         platform_tag: platform_tag(Arch::X86_64, Os::Linux),
-        original_base: 0x7F00_0000_0000, heap_size: 1 << 20,
-        entry_continuation: 0, section_count: 3,
-        gc_generation: 5, gc_metadata_offset: 4096,
-        save_timestamp: 1700000000, reserved: [0u8; 24],
+        original_base: 0x7F00_0000_0000,
+        heap_size: 1 << 20,
+        entry_continuation: 0,
+        section_count: 3,
+        gc_generation: 5,
+        gc_metadata_offset: 4096,
+        save_timestamp: 1700000000,
+        reserved: [0u8; 24],
         header_sha256: [0u8; 32],
     };
     assert_eq!(h.magic, IMAGE_MAGIC);
@@ -90,8 +98,10 @@ fn image_header_fields_roundtrip() {
 fn section_entry_fields() {
     let e = SectionEntry {
         section_type: SectionType::Code as u32,
-        flags: 0, file_offset: 128,
-        size: 65536, uncompressed_size: 131072,
+        flags: 0,
+        file_offset: 128,
+        size: 65536,
+        uncompressed_size: 131072,
     };
     assert_eq!(e.section_type, 4);
     assert_eq!(e.uncompressed_size, 131072);
@@ -159,7 +169,10 @@ fn save_image_with_compression() {
     if result.is_ok() {
         std::fs::remove_file(path).ok();
     }
-    assert!(result.is_ok(), "save_image with Zstd compression should succeed");
+    assert!(
+        result.is_ok(),
+        "save_image with Zstd compression should succeed"
+    );
 }
 
 #[test]
@@ -168,8 +181,10 @@ fn find_appended_image_returns_result() {
     // For a non-appended test binary, find_appended_image should return None/Err
     // indicating no appended image was found. The key assertion: it completes
     // and returns a meaningful result.
-    assert!(result.is_none(),
-        "find_appended_image on a test binary should return None (no appended image)");
+    assert!(
+        result.is_none(),
+        "find_appended_image on a test binary should return None (no appended image)"
+    );
 }
 
 #[test]
@@ -214,14 +229,21 @@ fn save_load_roundtrip_preserves_heap_objects() {
 
     // Verify heap is empty.
     let mut count_before = 0usize;
-    gc::walk_heap(|_, _, _| { count_before += 1; true }).unwrap();
+    gc::walk_heap(|_, _, _| {
+        count_before += 1;
+        true
+    })
+    .unwrap();
     assert_eq!(count_before, 0, "heap should be empty after clear");
 
     // Load the image back.
     let restored_entry = load_image(path).expect("load_image should succeed");
 
     // Verify the entry continuation was restored.
-    assert_eq!(restored_entry, entry_val, "entry continuation should survive round-trip");
+    assert_eq!(
+        restored_entry, entry_val,
+        "entry continuation should survive round-trip"
+    );
 
     // Walk the restored heap and verify objects are present.
     let mut restored_objects: Vec<(u8, Vec<u8>)> = Vec::new();
@@ -229,14 +251,23 @@ fn save_load_roundtrip_preserves_heap_objects() {
         let data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
         restored_objects.push((type_id, data));
         true
-    }).unwrap();
+    })
+    .unwrap();
 
-    assert!(restored_objects.len() >= 2, "should have at least 2 restored objects, got {}", restored_objects.len());
+    assert!(
+        restored_objects.len() >= 2,
+        "should have at least 2 restored objects, got {}",
+        restored_objects.len()
+    );
 
     // Find our objects among the restored set (there may be others from prior tests
     // since heap state is global).
-    let found_obj1 = restored_objects.iter().any(|(tid, data)| *tid == 1 && data == &obj1_data);
-    let found_obj2 = restored_objects.iter().any(|(tid, data)| *tid == 2 && data == &obj2_data);
+    let found_obj1 = restored_objects
+        .iter()
+        .any(|(tid, data)| *tid == 1 && data == &obj1_data);
+    let found_obj2 = restored_objects
+        .iter()
+        .any(|(tid, data)| *tid == 2 && data == &obj2_data);
     assert!(found_obj1, "object 1 should survive save/load round-trip");
     assert!(found_obj2, "object 2 should survive save/load round-trip");
 
@@ -289,7 +320,8 @@ fn save_load_roundtrip_with_compression() {
             }
         }
         true
-    }).unwrap();
+    })
+    .unwrap();
     assert!(found, "compressed object should survive round-trip");
 
     std::fs::remove_file(path).ok();

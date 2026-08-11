@@ -4,7 +4,7 @@
 
 use crate::error::BlissError;
 use crate::gc::GcConfig;
-use crate::object::{type_id, ObjectHeader};
+use crate::object::{ObjectHeader, type_id};
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::value::BlissVal;
 
@@ -132,36 +132,29 @@ impl RuntimeConfig {
                     if i + 1 >= args.len() {
                         panic!("--heap-size requires an argument");
                     }
-                    self.heap_size = args[i + 1]
-                        .parse()
-                        .expect("--heap-size: invalid number");
+                    self.heap_size = args[i + 1].parse().expect("--heap-size: invalid number");
                     i += 2;
                 }
                 "--nursery-size" => {
                     if i + 1 >= args.len() {
                         panic!("--nursery-size requires an argument");
                     }
-                    self.nursery_size = args[i + 1]
-                        .parse()
-                        .expect("--nursery-size: invalid number");
+                    self.nursery_size =
+                        args[i + 1].parse().expect("--nursery-size: invalid number");
                     i += 2;
                 }
                 "--stack-size" => {
                     if i + 1 >= args.len() {
                         panic!("--stack-size requires an argument");
                     }
-                    self.stack_size = args[i + 1]
-                        .parse()
-                        .expect("--stack-size: invalid number");
+                    self.stack_size = args[i + 1].parse().expect("--stack-size: invalid number");
                     i += 2;
                 }
                 "--workers" => {
                     if i + 1 >= args.len() {
                         panic!("--workers requires an argument");
                     }
-                    self.num_workers = args[i + 1]
-                        .parse()
-                        .expect("--workers: invalid number");
+                    self.num_workers = args[i + 1].parse().expect("--workers: invalid number");
                     i += 2;
                 }
                 "--image" => {
@@ -218,7 +211,9 @@ impl RuntimeConfig {
         let tlab_size = if tlab_size > region_size {
             // Find the largest power of two <= region_size
             let mut t = 1;
-            while t * 2 <= region_size { t *= 2; }
+            while t * 2 <= region_size {
+                t *= 2;
+            }
             t
         } else {
             tlab_size
@@ -363,8 +358,7 @@ pub fn parse_cli(args: &[String]) -> (RuntimeConfig, Vec<String>) {
 }
 
 /// Global flag set by the SIGINT handler to indicate a user interrupt.
-static SIGINT_RECEIVED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SIGINT_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Check whether a SIGINT has been received since the last check.
 pub fn check_sigint() -> bool {
@@ -377,9 +371,15 @@ pub fn install_signal_handlers() -> Result<(), BlissError> {
     // Install SIGINT handler for user interrupts (Ctrl-C → CL:BREAK)
     unsafe {
         // SIGINT: set the atomic flag so the runtime can check it at safepoints
-        libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        );
         // SIGTERM: initiate graceful shutdown
-        libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            sigterm_handler as *const () as libc::sighandler_t,
+        );
     }
     Ok(())
 }
@@ -388,7 +388,10 @@ extern "C" fn sigint_handler(_sig: libc::c_int) {
     SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
     // Re-install the handler (some platforms reset to SIG_DFL after delivery)
     unsafe {
-        libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -457,20 +460,38 @@ fn boot_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
 }
 
 fn boot_car(val: BlissVal) -> BlissVal {
-    if val.is_nil() { return crate::value::NIL; }
-    if val.tag() != crate::value::TAG_CONS { return crate::value::NIL; }
+    if val.is_nil() {
+        return crate::value::NIL;
+    }
+    if val.tag() != crate::value::TAG_CONS {
+        return crate::value::NIL;
+    }
     let id = val.0 >> 3;
     BOOT_STORE.with(|store| {
-        store.borrow().cons_cells.get(&id).map(|(car, _)| *car).unwrap_or(crate::value::NIL)
+        store
+            .borrow()
+            .cons_cells
+            .get(&id)
+            .map(|(car, _)| *car)
+            .unwrap_or(crate::value::NIL)
     })
 }
 
 fn boot_cdr(val: BlissVal) -> BlissVal {
-    if val.is_nil() { return crate::value::NIL; }
-    if val.tag() != crate::value::TAG_CONS { return crate::value::NIL; }
+    if val.is_nil() {
+        return crate::value::NIL;
+    }
+    if val.tag() != crate::value::TAG_CONS {
+        return crate::value::NIL;
+    }
     let id = val.0 >> 3;
     BOOT_STORE.with(|store| {
-        store.borrow().cons_cells.get(&id).map(|(_, cdr)| *cdr).unwrap_or(crate::value::NIL)
+        store
+            .borrow()
+            .cons_cells
+            .get(&id)
+            .map(|(_, cdr)| *cdr)
+            .unwrap_or(crate::value::NIL)
     })
 }
 
@@ -490,11 +511,11 @@ fn boot_intern(name: &str) -> BlissVal {
 }
 
 fn boot_symbol_name(val: BlissVal) -> Option<String> {
-    if val.tag() != crate::value::TAG_SYMBOL { return None; }
+    if val.tag() != crate::value::TAG_SYMBOL {
+        return None;
+    }
     let idx = val.as_symbol_index();
-    BOOT_STORE.with(|store| {
-        store.borrow().idx_to_symbol.get(&idx).cloned()
-    })
+    BOOT_STORE.with(|store| store.borrow().idx_to_symbol.get(&idx).cloned())
 }
 
 fn boot_make_string(s: &str) -> BlissVal {
@@ -530,17 +551,25 @@ fn boot_make_lambda(
         let mut s = store.borrow_mut();
         let id = s.lambda_counter;
         s.lambda_counter += 1;
-        s.lambdas.insert(id, BootLambda { params, body, captured_vars, captured_fns });
+        s.lambdas.insert(
+            id,
+            BootLambda {
+                params,
+                body,
+                captured_vars,
+                captured_fns,
+            },
+        );
         BlissVal((id << 3) | crate::value::TAG_FUNCTION)
     })
 }
 
 fn boot_get_lambda(val: BlissVal) -> Option<BootLambda> {
-    if val.tag() != crate::value::TAG_FUNCTION { return None; }
+    if val.tag() != crate::value::TAG_FUNCTION {
+        return None;
+    }
     let id = val.0 >> 3;
-    BOOT_STORE.with(|store| {
-        store.borrow().lambdas.get(&id).cloned()
-    })
+    BOOT_STORE.with(|store| store.borrow().lambdas.get(&id).cloned())
 }
 
 /// Internal s-expression representation used by the bootstrap evaluator.
@@ -566,7 +595,11 @@ struct BootEnv {
 
 impl BootEnv {
     fn new() -> Self {
-        BootEnv { vars: HashMap::new(), fns: HashMap::new(), parent: None }
+        BootEnv {
+            vars: HashMap::new(),
+            fns: HashMap::new(),
+            parent: None,
+        }
     }
 
     /// Create a child environment from a mutable reference by snapshotting
@@ -655,13 +688,27 @@ fn tokenize(input: &str) -> Vec<String> {
     let mut i = 0;
     while i < chars.len() {
         match chars[i] {
-            ' ' | '\t' | '\n' | '\r' => { i += 1; }
-            ';' => { // line comment
-                while i < chars.len() && chars[i] != '\n' { i += 1; }
+            ' ' | '\t' | '\n' | '\r' => {
+                i += 1;
             }
-            '(' => { tokens.push("(".into()); i += 1; }
-            ')' => { tokens.push(")".into()); i += 1; }
-            '\'' => { tokens.push("'".into()); i += 1; }
+            ';' => {
+                // line comment
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '(' => {
+                tokens.push("(".into());
+                i += 1;
+            }
+            ')' => {
+                tokens.push(")".into());
+                i += 1;
+            }
+            '\'' => {
+                tokens.push("'".into());
+                i += 1;
+            }
             '#' if i + 1 < chars.len() && chars[i + 1] == '\'' => {
                 // #'name → (FUNCTION name)
                 tokens.push("#'".into());
@@ -678,19 +725,26 @@ fn tokenize(input: &str) -> Vec<String> {
                             't' => s.push('\t'),
                             '\\' => s.push('\\'),
                             '"' => s.push('"'),
-                            c => { s.push('\\'); s.push(c); }
+                            c => {
+                                s.push('\\');
+                                s.push(c);
+                            }
                         }
                     } else {
                         s.push(chars[i]);
                     }
                     i += 1;
                 }
-                if i < chars.len() { i += 1; } // closing quote
+                if i < chars.len() {
+                    i += 1;
+                } // closing quote
                 tokens.push(format!("\"{}\"", s));
             }
             _ => {
                 let start = i;
-                while i < chars.len() && !matches!(chars[i], ' '|'\t'|'\n'|'\r'|'('|')'|';'|'"') {
+                while i < chars.len()
+                    && !matches!(chars[i], ' ' | '\t' | '\n' | '\r' | '(' | ')' | ';' | '"')
+                {
                     i += 1;
                 }
                 tokens.push(chars[start..i].iter().collect());
@@ -715,7 +769,9 @@ fn parse_sexpr(tokens: &[String], pos: usize) -> Result<(SExpr, usize), String> 
                 elems.push(expr);
                 i = next;
             }
-            if i >= tokens.len() { return Err("unmatched '('".into()); }
+            if i >= tokens.len() {
+                return Err("unmatched '('".into());
+            }
             Ok((SExpr::List(elems), i + 1))
         }
         ")" => Err("unexpected ')'".into()),
@@ -725,12 +781,15 @@ fn parse_sexpr(tokens: &[String], pos: usize) -> Result<(SExpr, usize), String> 
         }
         "#'" => {
             let (expr, next) = parse_sexpr(tokens, pos + 1)?;
-            Ok((SExpr::List(vec![SExpr::Symbol("FUNCTION".into()), expr]), next))
+            Ok((
+                SExpr::List(vec![SExpr::Symbol("FUNCTION".into()), expr]),
+                next,
+            ))
         }
         tok => {
             // String literal
             if tok.starts_with('"') && tok.ends_with('"') && tok.len() >= 2 {
-                let inner = &tok[1..tok.len()-1];
+                let inner = &tok[1..tok.len() - 1];
                 return Ok((SExpr::Str(inner.to_string()), pos + 1));
             }
             // Try integer
@@ -761,13 +820,11 @@ fn sexpr_to_blissval(s: &SExpr) -> BlissVal {
         SExpr::Nil => crate::value::NIL,
         SExpr::Bool(true) => crate::value::T,
         SExpr::Bool(false) => crate::value::NIL,
-        SExpr::Symbol(name) => {
-            match name.as_str() {
-                "T" => crate::value::T,
-                "NIL" => crate::value::NIL,
-                _ => boot_intern(name),
-            }
-        }
+        SExpr::Symbol(name) => match name.as_str() {
+            "T" => crate::value::T,
+            "NIL" => crate::value::NIL,
+            _ => boot_intern(name),
+        },
         SExpr::Str(s) => boot_make_string(s),
         SExpr::List(elems) => {
             // Build a cons list from the elements
@@ -789,15 +846,13 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
         SExpr::Bool(true) => Ok(crate::value::T),
         SExpr::Bool(false) => Ok(crate::value::NIL),
         SExpr::Str(s) => Ok(boot_make_string(s)),
-        SExpr::Symbol(name) => {
-            match name.as_str() {
-                "T" => Ok(crate::value::T),
-                "NIL" => Ok(crate::value::NIL),
-                _ => env.lookup(name).ok_or_else(|| {
-                    BlissError::Internal(format!("unbound variable: {}", name))
-                }),
-            }
-        }
+        SExpr::Symbol(name) => match name.as_str() {
+            "T" => Ok(crate::value::T),
+            "NIL" => Ok(crate::value::NIL),
+            _ => env
+                .lookup(name)
+                .ok_or_else(|| BlissError::Internal(format!("unbound variable: {}", name))),
+        },
         SExpr::List(elems) => {
             if elems.is_empty() {
                 return Ok(crate::value::NIL);
@@ -814,12 +869,20 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
                     "LAMBDA" => {
                         // (lambda (params...) body...)
                         if elems.len() < 3 {
-                            return Err(BlissError::Internal("lambda requires params and body".into()));
+                            return Err(BlissError::Internal(
+                                "lambda requires params and body".into(),
+                            ));
                         }
                         let params = if let SExpr::List(ps) = &elems[1] {
-                            ps.iter().filter_map(|p| {
-                                if let SExpr::Symbol(s) = p { Some(s.clone()) } else { None }
-                            }).collect()
+                            ps.iter()
+                                .filter_map(|p| {
+                                    if let SExpr::Symbol(s) = p {
+                                        Some(s.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
                         } else {
                             Vec::new()
                         };
@@ -888,14 +951,21 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
                     "FUNCTION" => {
                         // (function name) — look up a named function and return it as a lambda value
                         if elems.len() < 2 {
-                            return Err(BlissError::Internal("FUNCTION requires an argument".into()));
+                            return Err(BlissError::Internal(
+                                "FUNCTION requires an argument".into(),
+                            ));
                         }
                         match &elems[1] {
                             SExpr::Symbol(fname) => {
                                 if let Some((params, body)) = env.lookup_fn(fname) {
                                     let captured_vars = env.flatten_vars();
                                     let captured_fns = env.flatten_fns();
-                                    return Ok(boot_make_lambda(params, body, captured_vars, captured_fns));
+                                    return Ok(boot_make_lambda(
+                                        params,
+                                        body,
+                                        captured_vars,
+                                        captured_fns,
+                                    ));
                                 }
                                 // Check for built-in functions
                                 return Ok(boot_intern_builtin(fname));
@@ -904,13 +974,19 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
                                 // (function (lambda (params) body))
                                 return eval_sexpr(&elems[1], env);
                             }
-                            _ => return Err(BlissError::Internal("FUNCTION: invalid argument".into())),
+                            _ => {
+                                return Err(BlissError::Internal(
+                                    "FUNCTION: invalid argument".into(),
+                                ));
+                            }
                         }
                     }
                     "FUNCALL" => {
                         // (funcall fn arg1 arg2 ...)
                         if elems.len() < 2 {
-                            return Err(BlissError::Internal("FUNCALL requires at least a function argument".into()));
+                            return Err(BlissError::Internal(
+                                "FUNCALL requires at least a function argument".into(),
+                            ));
                         }
                         let func_val = eval_sexpr(&elems[1], env)?;
                         return eval_lambda_call(func_val, &elems[2..], env);
@@ -918,16 +994,18 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
                     "APPLY" => {
                         // (apply fn arg1 ... argN list)
                         if elems.len() < 3 {
-                            return Err(BlissError::Internal("APPLY requires a function and at least one argument".into()));
+                            return Err(BlissError::Internal(
+                                "APPLY requires a function and at least one argument".into(),
+                            ));
                         }
                         let func_val = eval_sexpr(&elems[1], env)?;
                         // Evaluate all args except the last normally; the last must be a list
                         let mut evaled_args = Vec::new();
-                        for a in &elems[2..elems.len()-1] {
+                        for a in &elems[2..elems.len() - 1] {
                             evaled_args.push(eval_sexpr(a, env)?);
                         }
                         // Last arg: evaluate it, then spread the list
-                        let last = eval_sexpr(&elems[elems.len()-1], env)?;
+                        let last = eval_sexpr(&elems[elems.len() - 1], env)?;
                         // Walk the cons list and append each element
                         let mut cur = last;
                         while !cur.is_nil() {
@@ -961,12 +1039,16 @@ fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
 }
 
 fn eval_quote(elems: &[SExpr]) -> Result<BlissVal, BlissError> {
-    if elems.len() < 2 { return Ok(crate::value::NIL); }
+    if elems.len() < 2 {
+        return Ok(crate::value::NIL);
+    }
     Ok(sexpr_to_blissval(&elems[1]))
 }
 
 fn eval_if(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 3 { return Ok(crate::value::NIL); }
+    if elems.len() < 3 {
+        return Ok(crate::value::NIL);
+    }
     let cond = eval_sexpr(&elems[1], env)?;
     if !cond.is_nil() {
         eval_sexpr(&elems[2], env)
@@ -987,7 +1069,9 @@ fn eval_progn(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError
 
 fn eval_let(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     // (let ((var1 val1) (var2 val2) ...) body...)
-    if elems.len() < 2 { return Ok(crate::value::NIL); }
+    if elems.len() < 2 {
+        return Ok(crate::value::NIL);
+    }
     let mut child = BootEnv::child_from_mut(env);
     if let SExpr::List(bindings) = &elems[1] {
         for b in bindings {
@@ -1018,12 +1102,20 @@ fn eval_let(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> 
 
 fn eval_defun(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     // (defun name (params...) body)
-    if elems.len() < 4 { return Ok(crate::value::NIL); }
+    if elems.len() < 4 {
+        return Ok(crate::value::NIL);
+    }
     if let SExpr::Symbol(name) = &elems[1] {
         let params = if let SExpr::List(ps) = &elems[2] {
-            ps.iter().filter_map(|p| {
-                if let SExpr::Symbol(s) = p { Some(s.clone()) } else { None }
-            }).collect()
+            ps.iter()
+                .filter_map(|p| {
+                    if let SExpr::Symbol(s) = p {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -1042,7 +1134,9 @@ fn eval_defun(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError
 }
 
 fn eval_setq(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 3 { return Ok(crate::value::NIL); }
+    if elems.len() < 3 {
+        return Ok(crate::value::NIL);
+    }
     let mut result = crate::value::NIL;
     let mut i = 1;
     while i + 1 < elems.len() {
@@ -1056,19 +1150,29 @@ fn eval_setq(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError>
 }
 
 #[derive(Clone, Copy)]
-enum ArithOp { Add, Sub, Mul, Div }
+enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
 
 fn eval_arith(elems: &[SExpr], env: &mut BootEnv, op: ArithOp) -> Result<BlissVal, BlissError> {
-    let args: Vec<BlissVal> = elems[1..].iter()
+    let args: Vec<BlissVal> = elems[1..]
+        .iter()
         .map(|e| eval_sexpr(e, env))
         .collect::<Result<_, _>>()?;
     if args.is_empty() {
         return match op {
             ArithOp::Add => Ok(BlissVal::from_fixnum(0)),
             ArithOp::Mul => Ok(BlissVal::from_fixnum(1)),
-            ArithOp::Sub | ArithOp::Div => Err(BlissError::Internal(
-                format!("wrong number of arguments for {}", match op { ArithOp::Sub => "-", _ => "/" })
-            )),
+            ArithOp::Sub | ArithOp::Div => Err(BlissError::Internal(format!(
+                "wrong number of arguments for {}",
+                match op {
+                    ArithOp::Sub => "-",
+                    _ => "/",
+                }
+            ))),
         };
     }
     if !args[0].is_fixnum() {
@@ -1108,63 +1212,102 @@ fn eval_arith(elems: &[SExpr], env: &mut BootEnv, op: ArithOp) -> Result<BlissVa
 }
 
 fn eval_numeq(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 3 { return Ok(crate::value::T); }
+    if elems.len() < 3 {
+        return Ok(crate::value::T);
+    }
     let a = eval_sexpr(&elems[1], env)?;
     let b = eval_sexpr(&elems[2], env)?;
-    Ok(if a == b { crate::value::T } else { crate::value::NIL })
+    Ok(if a == b {
+        crate::value::T
+    } else {
+        crate::value::NIL
+    })
 }
 
 #[derive(Clone, Copy)]
-enum NumCmp { Lt, Gt, Le, Ge }
+enum NumCmp {
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
 
 fn eval_numcmp(elems: &[SExpr], env: &mut BootEnv, cmp: NumCmp) -> Result<BlissVal, BlissError> {
-    if elems.len() < 3 { return Ok(crate::value::T); }
+    if elems.len() < 3 {
+        return Ok(crate::value::T);
+    }
     let a = eval_sexpr(&elems[1], env)?;
     let b = eval_sexpr(&elems[2], env)?;
     if !a.is_fixnum() {
-        return Err(BlissError::TypeError { datum: a, expected: "number".into() });
+        return Err(BlissError::TypeError {
+            datum: a,
+            expected: "number".into(),
+        });
     }
     if !b.is_fixnum() {
-        return Err(BlissError::TypeError { datum: b, expected: "number".into() });
+        return Err(BlissError::TypeError {
+            datum: b,
+            expected: "number".into(),
+        });
     }
     let (na, nb) = (a.as_fixnum(), b.as_fixnum());
     let res = match cmp {
-        NumCmp::Lt => na < nb, NumCmp::Gt => na > nb,
-        NumCmp::Le => na <= nb, NumCmp::Ge => na >= nb,
+        NumCmp::Lt => na < nb,
+        NumCmp::Gt => na > nb,
+        NumCmp::Le => na <= nb,
+        NumCmp::Ge => na >= nb,
     };
-    Ok(if res { crate::value::T } else { crate::value::NIL })
+    Ok(if res {
+        crate::value::T
+    } else {
+        crate::value::NIL
+    })
 }
 
 fn eval_eq(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 3 { return Ok(crate::value::T); }
+    if elems.len() < 3 {
+        return Ok(crate::value::T);
+    }
     let a = eval_sexpr(&elems[1], env)?;
     let b = eval_sexpr(&elems[2], env)?;
-    Ok(if a.0 == b.0 { crate::value::T } else { crate::value::NIL })
+    Ok(if a.0 == b.0 {
+        crate::value::T
+    } else {
+        crate::value::NIL
+    })
 }
 
 /// Bootstrap cons: stores car/cdr pairs in a thread-local side-table,
 /// keyed by a monotonic counter encoded as a cons-tagged BlissVal.
 fn eval_cons(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 3 { return Ok(crate::value::NIL); }
+    if elems.len() < 3 {
+        return Ok(crate::value::NIL);
+    }
     let car = eval_sexpr(&elems[1], env)?;
     let cdr = eval_sexpr(&elems[2], env)?;
     Ok(boot_cons(car, cdr))
 }
 
 fn eval_car(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 2 { return Ok(crate::value::NIL); }
+    if elems.len() < 2 {
+        return Ok(crate::value::NIL);
+    }
     let val = eval_sexpr(&elems[1], env)?;
     Ok(boot_car(val))
 }
 
 fn eval_cdr(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 2 { return Ok(crate::value::NIL); }
+    if elems.len() < 2 {
+        return Ok(crate::value::NIL);
+    }
     let val = eval_sexpr(&elems[1], env)?;
     Ok(boot_cdr(val))
 }
 
 fn eval_list(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 2 { return Ok(crate::value::NIL); }
+    if elems.len() < 2 {
+        return Ok(crate::value::NIL);
+    }
     // Evaluate all args, then build a proper cons list
     let mut vals = Vec::new();
     for e in &elems[1..] {
@@ -1178,20 +1321,34 @@ fn eval_list(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError>
 }
 
 fn eval_null(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 2 { return Ok(crate::value::T); }
+    if elems.len() < 2 {
+        return Ok(crate::value::T);
+    }
     let val = eval_sexpr(&elems[1], env)?;
-    Ok(if val.is_nil() { crate::value::T } else { crate::value::NIL })
+    Ok(if val.is_nil() {
+        crate::value::T
+    } else {
+        crate::value::NIL
+    })
 }
 
 fn eval_atom(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 2 { return Ok(crate::value::T); }
+    if elems.len() < 2 {
+        return Ok(crate::value::T);
+    }
     let val = eval_sexpr(&elems[1], env)?;
     // In bootstrap: everything is an atom (no cons cells)
-    Ok(if val.is_cons() { crate::value::NIL } else { crate::value::T })
+    Ok(if val.is_cons() {
+        crate::value::NIL
+    } else {
+        crate::value::T
+    })
 }
 
 fn eval_numberp(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
-    if elems.len() < 2 { return Ok(crate::value::NIL); }
+    if elems.len() < 2 {
+        return Ok(crate::value::NIL);
+    }
     let val = eval_sexpr(&elems[1], env)?;
     Ok(if val.is_fixnum() || val.is_single_float() {
         crate::value::T
@@ -1204,7 +1361,9 @@ fn eval_and(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> 
     let mut result = crate::value::T;
     for e in &elems[1..] {
         result = eval_sexpr(e, env)?;
-        if result.is_nil() { return Ok(crate::value::NIL); }
+        if result.is_nil() {
+            return Ok(crate::value::NIL);
+        }
     }
     Ok(result)
 }
@@ -1212,7 +1371,9 @@ fn eval_and(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> 
 fn eval_or(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     for e in &elems[1..] {
         let result = eval_sexpr(e, env)?;
-        if !result.is_nil() { return Ok(result); }
+        if !result.is_nil() {
+            return Ok(result);
+        }
     }
     Ok(crate::value::NIL)
 }
@@ -1220,10 +1381,14 @@ fn eval_or(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
 fn eval_cond(elems: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     for clause in &elems[1..] {
         if let SExpr::List(parts) = clause {
-            if parts.is_empty() { continue; }
+            if parts.is_empty() {
+                continue;
+            }
             let test = eval_sexpr(&parts[0], env)?;
             if !test.is_nil() {
-                if parts.len() == 1 { return Ok(test); }
+                if parts.len() == 1 {
+                    return Ok(test);
+                }
                 let mut result = test;
                 for e in &parts[1..] {
                     result = eval_sexpr(e, env)?;
@@ -1263,7 +1428,11 @@ fn eval_funcall(
 
 /// Call a lambda/closure value with unevaluated argument s-expressions.
 /// Evaluates args in the caller's env, then invokes the closure in its captured env.
-fn eval_lambda_call(func_val: BlissVal, arg_exprs: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
+fn eval_lambda_call(
+    func_val: BlissVal,
+    arg_exprs: &[SExpr],
+    env: &mut BootEnv,
+) -> Result<BlissVal, BlissError> {
     // Check for built-in function symbols first
     if let Some(builtin_name) = boot_builtin_name(func_val) {
         return eval_builtin_call(&builtin_name, arg_exprs, env);
@@ -1275,12 +1444,18 @@ fn eval_lambda_call(func_val: BlissVal, arg_exprs: &[SExpr], env: &mut BootEnv) 
         }
         eval_lambda_call_with_vals(func_val, &evaled_args, env)
     } else {
-        Err(BlissError::Internal("invalid function call: not a function".into()))
+        Err(BlissError::Internal(
+            "invalid function call: not a function".into(),
+        ))
     }
 }
 
 /// Call a lambda/closure value with already-evaluated argument values.
-fn eval_lambda_call_with_vals(func_val: BlissVal, args: &[BlissVal], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
+fn eval_lambda_call_with_vals(
+    func_val: BlissVal,
+    args: &[BlissVal],
+    env: &mut BootEnv,
+) -> Result<BlissVal, BlissError> {
     // Check for built-in function symbols first
     if let Some(builtin_name) = boot_builtin_name(func_val) {
         return eval_builtin_call_with_vals(&builtin_name, args, env);
@@ -1299,7 +1474,9 @@ fn eval_lambda_call_with_vals(func_val: BlissVal, args: &[BlissVal], env: &mut B
         }
         Ok(result)
     } else {
-        Err(BlissError::Internal("invalid function call: not a function".into()))
+        Err(BlissError::Internal(
+            "invalid function call: not a function".into(),
+        ))
     }
 }
 
@@ -1327,9 +1504,7 @@ fn boot_print_val(val: BlissVal, escape: bool) -> String {
     if val.tag() == crate::value::TAG_HEAP_OBJECT {
         // Might be a bootstrap string
         let id = val.0 >> 3;
-        let s = BOOT_STORE.with(|store| {
-            store.borrow().strings.get(&id).cloned()
-        });
+        let s = BOOT_STORE.with(|store| store.borrow().strings.get(&id).cloned());
         if let Some(s) = s {
             return if escape { format!("\"{}\"", s) } else { s };
         }
@@ -1372,7 +1547,11 @@ fn boot_builtin_name(val: BlissVal) -> Option<String> {
 }
 
 /// Call a built-in function by name with unevaluated args.
-fn eval_builtin_call(name: &str, arg_exprs: &[SExpr], env: &mut BootEnv) -> Result<BlissVal, BlissError> {
+fn eval_builtin_call(
+    name: &str,
+    arg_exprs: &[SExpr],
+    env: &mut BootEnv,
+) -> Result<BlissVal, BlissError> {
     let mut evaled = Vec::new();
     for a in arg_exprs {
         evaled.push(eval_sexpr(a, env)?);
@@ -1381,22 +1560,32 @@ fn eval_builtin_call(name: &str, arg_exprs: &[SExpr], env: &mut BootEnv) -> Resu
 }
 
 /// Call a built-in function by name with already-evaluated args.
-fn eval_builtin_call_with_vals(name: &str, args: &[BlissVal], _env: &mut BootEnv) -> Result<BlissVal, BlissError> {
+fn eval_builtin_call_with_vals(
+    name: &str,
+    args: &[BlissVal],
+    _env: &mut BootEnv,
+) -> Result<BlissVal, BlissError> {
     match name {
         "+" => arith_builtin(args, ArithOp::Add),
         "-" => arith_builtin(args, ArithOp::Sub),
         "*" => arith_builtin(args, ArithOp::Mul),
         "/" => arith_builtin(args, ArithOp::Div),
         "CONS" => {
-            if args.len() < 2 { return Ok(crate::value::NIL); }
+            if args.len() < 2 {
+                return Ok(crate::value::NIL);
+            }
             Ok(boot_cons(args[0], args[1]))
         }
         "CAR" | "FIRST" => {
-            if args.is_empty() { return Ok(crate::value::NIL); }
+            if args.is_empty() {
+                return Ok(crate::value::NIL);
+            }
             Ok(boot_car(args[0]))
         }
         "CDR" | "REST" => {
-            if args.is_empty() { return Ok(crate::value::NIL); }
+            if args.is_empty() {
+                return Ok(crate::value::NIL);
+            }
             Ok(boot_cdr(args[0]))
         }
         "LIST" => {
@@ -1407,18 +1596,39 @@ fn eval_builtin_call_with_vals(name: &str, args: &[BlissVal], _env: &mut BootEnv
             Ok(result)
         }
         "EQ" => {
-            if args.len() < 2 { return Ok(crate::value::T); }
-            Ok(if args[0].0 == args[1].0 { crate::value::T } else { crate::value::NIL })
+            if args.len() < 2 {
+                return Ok(crate::value::T);
+            }
+            Ok(if args[0].0 == args[1].0 {
+                crate::value::T
+            } else {
+                crate::value::NIL
+            })
         }
         "EQL" | "=" => {
-            if args.len() < 2 { return Ok(crate::value::T); }
-            Ok(if args[0] == args[1] { crate::value::T } else { crate::value::NIL })
+            if args.len() < 2 {
+                return Ok(crate::value::T);
+            }
+            Ok(if args[0] == args[1] {
+                crate::value::T
+            } else {
+                crate::value::NIL
+            })
         }
         "NULL" | "NOT" => {
-            if args.is_empty() { return Ok(crate::value::T); }
-            Ok(if args[0].is_nil() { crate::value::T } else { crate::value::NIL })
+            if args.is_empty() {
+                return Ok(crate::value::T);
+            }
+            Ok(if args[0].is_nil() {
+                crate::value::T
+            } else {
+                crate::value::NIL
+            })
         }
-        _ => Err(BlissError::Internal(format!("undefined function: {}", name))),
+        _ => Err(BlissError::Internal(format!(
+            "undefined function: {}",
+            name
+        ))),
     }
 }
 
@@ -1428,9 +1638,13 @@ fn arith_builtin(args: &[BlissVal], op: ArithOp) -> Result<BlissVal, BlissError>
         return match op {
             ArithOp::Add => Ok(BlissVal::from_fixnum(0)),
             ArithOp::Mul => Ok(BlissVal::from_fixnum(1)),
-            ArithOp::Sub | ArithOp::Div => Err(BlissError::Internal(
-                format!("wrong number of arguments for {}", match op { ArithOp::Sub => "-", _ => "/" })
-            )),
+            ArithOp::Sub | ArithOp::Div => Err(BlissError::Internal(format!(
+                "wrong number of arguments for {}",
+                match op {
+                    ArithOp::Sub => "-",
+                    _ => "/",
+                }
+            ))),
         };
     }
     if !args[0].is_fixnum() {

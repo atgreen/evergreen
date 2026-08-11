@@ -3,7 +3,7 @@
 //! Maps the CL type hierarchy onto BlissVal tag + ObjectHeader type_id.
 //! See §1.16–§1.17 of the spec.
 
-use crate::object::{ObjectHeader, type_id, ElementTypeTag};
+use crate::object::{ElementTypeTag, ObjectHeader, type_id};
 use crate::value::BlissVal;
 
 /// Extract the `type_id` from a heap object's header.
@@ -88,10 +88,10 @@ pub fn vectorp(v: BlissVal) -> bool {
     matches!(
         heap_type_id(v),
         Some(type_id::SIMPLE_VECTOR)
-        | Some(type_id::SIMPLE_ARRAY)
-        | Some(type_id::SIMPLE_BASE_STRING)
-        | Some(type_id::SIMPLE_CHARACTER_STRING)
-        | Some(type_id::COMPLEX_ARRAY)
+            | Some(type_id::SIMPLE_ARRAY)
+            | Some(type_id::SIMPLE_BASE_STRING)
+            | Some(type_id::SIMPLE_CHARACTER_STRING)
+            | Some(type_id::COMPLEX_ARRAY)
     )
 }
 
@@ -124,9 +124,9 @@ pub fn numberp(v: BlissVal) -> bool {
     matches!(
         heap_type_id(v),
         Some(type_id::BIGNUM)
-        | Some(type_id::RATIO)
-        | Some(type_id::COMPLEX)
-        | Some(type_id::DOUBLE_FLOAT)
+            | Some(type_id::RATIO)
+            | Some(type_id::COMPLEX)
+            | Some(type_id::DOUBLE_FLOAT)
     )
 }
 

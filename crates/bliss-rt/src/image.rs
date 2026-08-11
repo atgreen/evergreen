@@ -133,28 +133,22 @@ pub enum ImageCompression {
 fn sha256(data: &[u8]) -> [u8; 32] {
     // Initial hash values (first 32 bits of fractional parts of square roots of first 8 primes)
     let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
 
     // Round constants
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
 
     // Pre-processing: pad the message
@@ -296,10 +290,7 @@ fn compress_data(data: &[u8]) -> Vec<u8> {
                 // Check if next position starts a worthwhile run
                 let nb = data[i + lit_len];
                 let mut nr = 1usize;
-                while i + lit_len + nr < data.len()
-                    && data[i + lit_len + nr] == nb
-                    && nr < 65535
-                {
+                while i + lit_len + nr < data.len() && data[i + lit_len + nr] == nb && nr < 65535 {
                     nr += 1;
                 }
                 if nr >= 4 {
@@ -322,16 +313,10 @@ fn compress_data(data: &[u8]) -> Vec<u8> {
 /// Decompress data produced by `compress_data`.
 fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>, BlissError> {
     if compressed.len() < 4 {
-        return Err(BlissError::InvalidImage(
-            "compressed data too short".into(),
-        ));
+        return Err(BlissError::InvalidImage("compressed data too short".into()));
     }
-    let uncompressed_len = u32::from_le_bytes([
-        compressed[0],
-        compressed[1],
-        compressed[2],
-        compressed[3],
-    ]) as usize;
+    let uncompressed_len =
+        u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]) as usize;
     let mut out = Vec::with_capacity(uncompressed_len);
     let mut i = 4;
     while i < compressed.len() {
@@ -348,9 +333,7 @@ fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>, BlissError> {
             0x00 => {
                 // Run-length
                 if i >= compressed.len() {
-                    return Err(BlissError::InvalidImage(
-                        "truncated RLE byte".into(),
-                    ));
+                    return Err(BlissError::InvalidImage("truncated RLE byte".into()));
                 }
                 let b = compressed[i];
                 i += 1;
@@ -361,9 +344,7 @@ fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>, BlissError> {
             0x01 => {
                 // Literals
                 if i + count > compressed.len() {
-                    return Err(BlissError::InvalidImage(
-                        "truncated literal block".into(),
-                    ));
+                    return Err(BlissError::InvalidImage("truncated literal block".into()));
                 }
                 out.extend_from_slice(&compressed[i..i + count]);
                 i += count;
@@ -443,12 +424,36 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
     let gc_meta_uncompressed_size = gc_meta_raw.len();
 
     // Apply compression if requested.
-    let heap_data = if use_compression { compress_data(&heap_data_raw) } else { heap_data_raw };
-    let symbol_data = if use_compression { compress_data(&symbol_data_raw) } else { symbol_data_raw };
-    let package_data = if use_compression { compress_data(&package_data_raw) } else { package_data_raw };
-    let code_data = if use_compression { compress_data(&code_data_raw) } else { code_data_raw };
-    let reloc_data = if use_compression { compress_data(&reloc_data_raw) } else { reloc_data_raw };
-    let gc_meta_data = if use_compression { compress_data(&gc_meta_raw) } else { gc_meta_raw };
+    let heap_data = if use_compression {
+        compress_data(&heap_data_raw)
+    } else {
+        heap_data_raw
+    };
+    let symbol_data = if use_compression {
+        compress_data(&symbol_data_raw)
+    } else {
+        symbol_data_raw
+    };
+    let package_data = if use_compression {
+        compress_data(&package_data_raw)
+    } else {
+        package_data_raw
+    };
+    let code_data = if use_compression {
+        compress_data(&code_data_raw)
+    } else {
+        code_data_raw
+    };
+    let reloc_data = if use_compression {
+        compress_data(&reloc_data_raw)
+    } else {
+        reloc_data_raw
+    };
+    let gc_meta_data = if use_compression {
+        compress_data(&gc_meta_raw)
+    } else {
+        gc_meta_raw
+    };
 
     // Section count: Heap, Symbols, Packages, Code, Reloc, GcMeta
     let section_count: u32 = 6;
@@ -565,21 +570,30 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
 
         // Write section directory entries
         let sections = [
-            heap_section, symbol_section, package_section,
-            code_section, reloc_section, gc_meta_section,
+            heap_section,
+            symbol_section,
+            package_section,
+            code_section,
+            reloc_section,
+            gc_meta_section,
         ];
         for section in &sections {
             let section_bytes = struct_to_bytes(section);
-            file.write_all(&section_bytes)
-                .map_err(|e| BlissError::FileError(format!("cannot write section directory: {}", e)))?;
+            file.write_all(&section_bytes).map_err(|e| {
+                BlissError::FileError(format!("cannot write section directory: {}", e))
+            })?;
         }
 
         // Write section data with page-alignment padding between sections.
         // Each section's file_offset was computed with page alignment, so
         // we pad to match those offsets.
         let section_data_slices: [&[u8]; 6] = [
-            &heap_data, &symbol_data, &package_data,
-            &code_data, &reloc_data, &gc_meta_data,
+            &heap_data,
+            &symbol_data,
+            &package_data,
+            &code_data,
+            &reloc_data,
+            &gc_meta_data,
         ];
         let mut write_pos = section_dir_offset + sections.len() * SECTION_ENTRY_SIZE;
         for (idx, data) in section_data_slices.iter().enumerate() {
@@ -587,8 +601,9 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
             // Write padding zeros to reach the page-aligned offset.
             if target_offset > write_pos {
                 let padding = vec![0u8; target_offset - write_pos];
-                file.write_all(&padding)
-                    .map_err(|e| BlissError::FileError(format!("cannot write section padding: {}", e)))?;
+                file.write_all(&padding).map_err(|e| {
+                    BlissError::FileError(format!("cannot write section padding: {}", e))
+                })?;
                 write_pos = target_offset;
             }
             file.write_all(data)
@@ -621,10 +636,9 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
             let mut perms = metadata.permissions();
             let mode = perms.mode();
             perms.set_mode(mode | 0o111);
-            std::fs::set_permissions(path, perms)
-                .map_err(|e| {
-                    BlissError::FileError(format!("cannot set executable permission: {}", e))
-                })?;
+            std::fs::set_permissions(path, perms).map_err(|e| {
+                BlissError::FileError(format!("cannot set executable permission: {}", e))
+            })?;
         }
     }
 
@@ -690,8 +704,7 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
 
     // Parse the section directory.
     let section_dir_start = HEADER_SIZE;
-    let section_dir_end =
-        section_dir_start + (header.section_count as usize) * SECTION_ENTRY_SIZE;
+    let section_dir_end = section_dir_start + (header.section_count as usize) * SECTION_ENTRY_SIZE;
     if file_data.len() < section_dir_end {
         return Err(BlissError::InvalidImage(
             "image file too small for section directory".into(),
@@ -728,10 +741,8 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
 
     for i in 0..header.section_count as usize {
         let entry_offset = section_dir_start + i * SECTION_ENTRY_SIZE;
-        let entry: SectionEntry =
-            bytes_to_struct(&file_data[entry_offset..]).ok_or_else(|| {
-                BlissError::InvalidImage(format!("cannot parse section entry {}", i))
-            })?;
+        let entry: SectionEntry = bytes_to_struct(&file_data[entry_offset..])
+            .ok_or_else(|| BlissError::InvalidImage(format!("cannot parse section entry {}", i)))?;
 
         match entry.section_type {
             t if t == SectionType::Heap as u32 => heap_entry = Some(entry),
@@ -754,9 +765,8 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
     };
 
     // Restore the heap section.
-    let heap_entry = heap_entry.ok_or_else(|| {
-        BlissError::InvalidImage("image contains no heap section".into())
-    })?;
+    let heap_entry = heap_entry
+        .ok_or_else(|| BlissError::InvalidImage("image contains no heap section".into()))?;
     let mut heap_bytes = read_section_data(&heap_entry)?;
 
     if heap_bytes.len() >= 8 {

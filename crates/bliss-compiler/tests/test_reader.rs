@@ -2,7 +2,7 @@
 //! readtable operations, SourcePos, and edge cases.
 
 use bliss_compiler::reader::*;
-use bliss_rt::value::{NIL, T, EOF};
+use bliss_rt::value::{EOF, NIL, T};
 
 // ── ReaderState construction and configuration ────────────────────
 
@@ -50,12 +50,20 @@ fn reader_state_set_read_eval() {
 
 #[test]
 fn source_pos_fields_and_clone() {
-    let pos = SourcePos { file: Some("test.lisp".into()), line: 42, column: 7 };
+    let pos = SourcePos {
+        file: Some("test.lisp".into()),
+        line: 42,
+        column: 7,
+    };
     assert_eq!(pos.file.as_deref(), Some("test.lisp"));
     let p2 = pos.clone();
     assert_eq!(p2.line, 42);
     assert_eq!(p2.column, 7);
-    let none_pos = SourcePos { file: None, line: 1, column: 0 };
+    let none_pos = SourcePos {
+        file: None,
+        line: 1,
+        column: 0,
+    };
     assert!(none_pos.file.is_none());
     assert!(!format!("{:?}", none_pos).is_empty());
 }
@@ -112,7 +120,10 @@ fn read_ratio_literal() {
 #[test]
 fn read_ratio_division_by_zero_is_error() {
     // 1/0 is an invalid ratio — should signal an error
-    assert!(read_from_string("1/0").is_err(), "1/0 should be a reader error");
+    assert!(
+        read_from_string("1/0").is_err(),
+        "1/0 should be a reader error"
+    );
 }
 
 // ── read_from_string: symbols ────────────────────────────────────
@@ -173,7 +184,10 @@ fn read_uninterned_symbol() {
     assert!(v.is_symbol(), "#:foo should be a symbol");
     // Two reads of #:foo should yield distinct uninterned symbols
     let (v2, _) = read_from_string("#:foo").unwrap();
-    assert_ne!(v, v2, "each #:foo should produce a distinct uninterned symbol");
+    assert_ne!(
+        v, v2,
+        "each #:foo should produce a distinct uninterned symbol"
+    );
 }
 
 #[test]
@@ -232,19 +246,28 @@ fn read_strings() {
     let (v, _) = read_from_string("\"hello\"").unwrap();
     assert!(v.is_heap_object(), "string should be a heap object");
     // Verify it's specifically a string, not just any heap object
-    assert!(bliss_rt::types::stringp(v), "\"hello\" should satisfy stringp");
+    assert!(
+        bliss_rt::types::stringp(v),
+        "\"hello\" should satisfy stringp"
+    );
 }
 
 #[test]
 fn read_empty_string() {
     let (v, _) = read_from_string("\"\"").unwrap();
-    assert!(bliss_rt::types::stringp(v), "empty string should satisfy stringp");
+    assert!(
+        bliss_rt::types::stringp(v),
+        "empty string should satisfy stringp"
+    );
 }
 
 #[test]
 fn read_string_with_escape() {
     let (v, _) = read_from_string("\"hello\\\"world\"").unwrap();
-    assert!(bliss_rt::types::stringp(v), "string with escape should satisfy stringp");
+    assert!(
+        bliss_rt::types::stringp(v),
+        "string with escape should satisfy stringp"
+    );
 }
 
 // ── read_from_string: lists ──────────────────────────────────────
@@ -333,7 +356,10 @@ fn read_sharpsign_vector_produces_vector() {
     // #(1 2 3) should produce a vector, not just any heap object
     let (v, _) = read_from_string("#(1 2 3)").unwrap();
     assert!(v.is_heap_object(), "#(1 2 3) should be a heap object");
-    assert!(bliss_rt::types::vectorp(v), "#(1 2 3) should satisfy vectorp");
+    assert!(
+        bliss_rt::types::vectorp(v),
+        "#(1 2 3) should satisfy vectorp"
+    );
 }
 
 // ── read_from_string: comments ───────────────────────────────────
@@ -431,7 +457,10 @@ fn read_with_reader_state_custom_readtable() {
     let result = read(&mut state);
     // With a custom readtable and empty/NIL input, expect EOF or an error
     match result {
-        Ok(val) => assert_eq!(val, EOF, "reading from empty input with custom readtable should return EOF"),
+        Ok(val) => assert_eq!(
+            val, EOF,
+            "reading from empty input with custom readtable should return EOF"
+        ),
         Err(_) => { /* EOF error on empty input is acceptable */ }
     }
 }
@@ -587,7 +616,10 @@ fn read_sharpsign_complex() {
     let result = read_from_string("#C(1 2)");
     assert!(result.is_ok(), "#C(1 2) should parse successfully");
     let (v, _) = result.unwrap();
-    assert!(bliss_rt::types::complexp(v), "#C(1 2) should be a complex number");
+    assert!(
+        bliss_rt::types::complexp(v),
+        "#C(1 2) should be a complex number"
+    );
 }
 
 #[test]
@@ -595,7 +627,10 @@ fn read_sharpsign_complex_float() {
     let result = read_from_string("#C(1.0 2.0)");
     assert!(result.is_ok(), "#C(1.0 2.0) should parse successfully");
     let (v, _) = result.unwrap();
-    assert!(bliss_rt::types::complexp(v), "#C(1.0 2.0) should be complex");
+    assert!(
+        bliss_rt::types::complexp(v),
+        "#C(1.0 2.0) should be complex"
+    );
 }
 
 // ── #* bit-vectors (Issue #4) ────────────────────────────────────
@@ -614,9 +649,15 @@ fn read_sharpsign_bitvector() {
 #[test]
 fn read_sharpsign_empty_bitvector() {
     let result = read_from_string("#*");
-    assert!(result.is_ok(), "#* (empty bit vector) should parse successfully");
+    assert!(
+        result.is_ok(),
+        "#* (empty bit vector) should parse successfully"
+    );
     let (v, _) = result.unwrap();
-    assert!(bliss_rt::types::bit_vector_p(v), "#* should be a bit vector");
+    assert!(
+        bliss_rt::types::bit_vector_p(v),
+        "#* should be a bit vector"
+    );
 }
 
 // ── #< unreadable object error (Issue #4) ────────────────────────
@@ -637,7 +678,10 @@ fn read_sharpsign_struct_literal() {
     // #S(point :x 1 :y 2) should produce a struct instance
     // This is the standard CL reader macro for struct literals
     let result = read_from_string("#S(point :x 1 :y 2)");
-    assert!(result.is_ok(), "#S(point :x 1 :y 2) should parse successfully");
+    assert!(
+        result.is_ok(),
+        "#S(point :x 1 :y 2) should parse successfully"
+    );
     let (v, _) = result.unwrap();
     // The result should be a heap object (struct instance), not NIL
     assert_ne!(v, NIL, "#S(point ...) should not be NIL");
@@ -668,17 +712,26 @@ fn read_sharpsign_struct_missing_name_is_error() {
 fn read_sharpsign_pathname_literal() {
     // #P"path/to/file" should produce a pathname object
     let result = read_from_string("#P\"path/to/file\"");
-    assert!(result.is_ok(), "#P\"path/to/file\" should parse successfully");
+    assert!(
+        result.is_ok(),
+        "#P\"path/to/file\" should parse successfully"
+    );
     let (v, _) = result.unwrap();
     assert_ne!(v, NIL, "#P\"...\" should not be NIL");
-    assert!(v.is_heap_object(), "#P\"...\" should be a heap object (pathname)");
+    assert!(
+        v.is_heap_object(),
+        "#P\"...\" should be a heap object (pathname)"
+    );
 }
 
 #[test]
 fn read_sharpsign_pathname_absolute() {
     // #P"/usr/local/lib" — absolute pathname
     let result = read_from_string("#P\"/usr/local/lib\"");
-    assert!(result.is_ok(), "#P\"/usr/local/lib\" should parse successfully");
+    assert!(
+        result.is_ok(),
+        "#P\"/usr/local/lib\" should parse successfully"
+    );
     let (v, _) = result.unwrap();
     assert_ne!(v, NIL);
 }
@@ -687,7 +740,10 @@ fn read_sharpsign_pathname_absolute() {
 fn read_sharpsign_pathname_empty_string() {
     // #P"" — empty pathname is valid per the spec
     let result = read_from_string("#P\"\"");
-    assert!(result.is_ok(), "#P\"\" (empty pathname) should parse successfully");
+    assert!(
+        result.is_ok(),
+        "#P\"\" (empty pathname) should parse successfully"
+    );
     let (v, _) = result.unwrap();
     assert!(v.is_heap_object(), "#P\"\" should be a heap object");
 }

@@ -8,7 +8,7 @@ use std::io::{Read, Seek, Write};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use bliss_rt::error::BlissError;
-use bliss_rt::object::{type_id, ObjectHeader};
+use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
 // ── Gray streams protocol ──────────────────────────────────────────
@@ -20,7 +20,12 @@ pub trait GrayStream {
     fn stream_read_byte(&mut self) -> Result<BlissVal, BlissError>;
     fn stream_write_char(&mut self, ch: BlissVal) -> Result<(), BlissError>;
     fn stream_write_byte(&mut self, byte: BlissVal) -> Result<(), BlissError>;
-    fn stream_write_string(&mut self, string: BlissVal, start: usize, end: Option<usize>) -> Result<(), BlissError>;
+    fn stream_write_string(
+        &mut self,
+        string: BlissVal,
+        start: usize,
+        end: Option<usize>,
+    ) -> Result<(), BlissError>;
     fn stream_force_output(&mut self) -> Result<(), BlissError>;
     fn stream_finish_output(&mut self) -> Result<(), BlissError>;
     fn stream_clear_input(&mut self) -> Result<(), BlissError>;
@@ -70,10 +75,10 @@ pub enum StreamElementType {
 // ── if_exists keyword constants ───────────────────────────────────
 // Callers pass these as BlissVal to open(). NIL and T are also valid.
 // NIL = return nil if exists; T = default (:supersede).
-pub const IF_EXISTS_ERROR_VAL: BlissVal = BlissVal(1 << 3);       // fixnum 1
-pub const IF_EXISTS_SUPERSEDE_VAL: BlissVal = BlissVal(2 << 3);   // fixnum 2
-pub const IF_EXISTS_APPEND_VAL: BlissVal = BlissVal(3 << 3);      // fixnum 3
-pub const IF_EXISTS_OVERWRITE_VAL: BlissVal = BlissVal(4 << 3);   // fixnum 4
+pub const IF_EXISTS_ERROR_VAL: BlissVal = BlissVal(1 << 3); // fixnum 1
+pub const IF_EXISTS_SUPERSEDE_VAL: BlissVal = BlissVal(2 << 3); // fixnum 2
+pub const IF_EXISTS_APPEND_VAL: BlissVal = BlissVal(3 << 3); // fixnum 3
+pub const IF_EXISTS_OVERWRITE_VAL: BlissVal = BlissVal(4 << 3); // fixnum 4
 
 // ── Internal stream state ──────────────────────────────────────────
 
@@ -172,11 +177,17 @@ impl StreamMutableState {
     }
 
     fn is_input(&self) -> bool {
-        matches!(self.direction(), StreamDirection::Input | StreamDirection::Io)
+        matches!(
+            self.direction(),
+            StreamDirection::Input | StreamDirection::Io
+        )
     }
 
     fn is_output(&self) -> bool {
-        matches!(self.direction(), StreamDirection::Output | StreamDirection::Io)
+        matches!(
+            self.direction(),
+            StreamDirection::Output | StreamDirection::Io
+        )
     }
 
     fn check_open(&self) -> Result<(), BlissError> {
@@ -225,11 +236,14 @@ fn file_read_char_buffered(
     loop {
         if *buf_pos >= *buf_fill {
             read_buf.resize(FILE_BUF_SIZE, 0);
-            let n = file.read(&mut read_buf[..])
+            let n = file
+                .read(&mut read_buf[..])
                 .map_err(|e| BlissError::StreamError(format!("file read error: {}", e)))?;
             if n == 0 {
                 if char_len > 0 {
-                    return Err(BlissError::StreamError("incomplete UTF-8 sequence at EOF".into()));
+                    return Err(BlissError::StreamError(
+                        "incomplete UTF-8 sequence at EOF".into(),
+                    ));
                 }
                 return Ok(EOF);
             }
@@ -252,7 +266,9 @@ fn file_read_char_buffered(
             }
             Err(e) => {
                 if char_len >= 4 || e.error_len().is_some() {
-                    return Err(BlissError::StreamError("invalid UTF-8 in file stream".into()));
+                    return Err(BlissError::StreamError(
+                        "invalid UTF-8 in file stream".into(),
+                    ));
                 }
             }
         }
@@ -268,7 +284,8 @@ fn file_read_byte_raw(
 ) -> Result<BlissVal, BlissError> {
     if *buf_pos >= *buf_fill {
         read_buf.resize(FILE_BUF_SIZE, 0);
-        let n = file.read(&mut read_buf[..])
+        let n = file
+            .read(&mut read_buf[..])
             .map_err(|e| BlissError::StreamError(format!("file read error: {}", e)))?;
         if n == 0 {
             return Ok(EOF);
@@ -308,7 +325,14 @@ impl GrayStream for StreamMutableState {
     fn stream_read_char(&mut self) -> Result<BlissVal, BlissError> {
         self.check_input()?;
         match &mut self.inner {
-            StreamInner::StringInput { chars, position, end, line, col, unread } => {
+            StreamInner::StringInput {
+                chars,
+                position,
+                end,
+                line,
+                col,
+                unread,
+            } => {
                 if let Some(c) = unread.take() {
                     return Ok(BlissVal::from_char(c));
                 }
@@ -325,10 +349,27 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(BlissVal::from_char(c))
             }
-            StreamInner::FileInput { file, read_buf, buf_pos, buf_fill, line, col, unread, .. } => {
-                file_read_char_buffered(file, read_buf, buf_pos, buf_fill, line, col, unread)
-            }
-            StreamInner::FileIo { file, read_buf, buf_pos, buf_fill, write_buf, line, col, unread, .. } => {
+            StreamInner::FileInput {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                line,
+                col,
+                unread,
+                ..
+            } => file_read_char_buffered(file, read_buf, buf_pos, buf_fill, line, col, unread),
+            StreamInner::FileIo {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                write_buf,
+                line,
+                col,
+                unread,
+                ..
+            } => {
                 file_flush_write_buf(file, write_buf)?;
                 file_read_char_buffered(file, read_buf, buf_pos, buf_fill, line, col, unread)
             }
@@ -370,38 +411,50 @@ impl GrayStream for StreamMutableState {
         self.check_input()?;
         let c = ch.as_char();
         match &mut self.inner {
-            StreamInner::StringInput { unread, line, col, .. } => {
+            StreamInner::StringInput {
+                unread, line, col, ..
+            } => {
                 *unread = Some(c);
                 if c == '\n' {
                     // Can't perfectly restore col after newline unread, but decrement line
-                    if *line > 0 { *line -= 1; }
+                    if *line > 0 {
+                        *line -= 1;
+                    }
                     // col is unknown after unreading a newline; leave as-is (best effort)
                 } else {
-                    if *col > 0 { *col -= 1; }
+                    if *col > 0 {
+                        *col -= 1;
+                    }
                 }
                 Ok(())
             }
-            StreamInner::FileInput { unread, line, col, .. }
-            | StreamInner::FileIo { unread, line, col, .. } => {
+            StreamInner::FileInput {
+                unread, line, col, ..
+            }
+            | StreamInner::FileIo {
+                unread, line, col, ..
+            } => {
                 *unread = Some(c);
                 if c == '\n' {
-                    if *line > 0 { *line -= 1; }
+                    if *line > 0 {
+                        *line -= 1;
+                    }
                 } else {
-                    if *col > 0 { *col -= 1; }
+                    if *col > 0 {
+                        *col -= 1;
+                    }
                 }
                 Ok(())
             }
-            StreamInner::TwoWay { input, .. } => {
-                crate::streams::stream_unread_char(*input, ch)
-            }
-            StreamInner::Echo { input, .. } => {
-                crate::streams::stream_unread_char(*input, ch)
-            }
+            StreamInner::TwoWay { input, .. } => crate::streams::stream_unread_char(*input, ch),
+            StreamInner::Echo { input, .. } => crate::streams::stream_unread_char(*input, ch),
             StreamInner::Concatenated { streams } => {
                 if let Some(&s) = streams.first() {
                     crate::streams::stream_unread_char(s, ch)
                 } else {
-                    Err(BlissError::StreamError("no streams in concatenated stream".into()))
+                    Err(BlissError::StreamError(
+                        "no streams in concatenated stream".into(),
+                    ))
                 }
             }
             StreamInner::Synonym { symbol } => {
@@ -417,9 +470,14 @@ impl GrayStream for StreamMutableState {
     fn stream_read_byte(&mut self) -> Result<BlissVal, BlissError> {
         self.check_input()?;
         match &mut self.inner {
-            StreamInner::FileInput { element_type, file, read_buf, buf_pos, buf_fill, .. }
-                if *element_type == StreamElementType::UnsignedByte8 =>
-            {
+            StreamInner::FileInput {
+                element_type,
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                ..
+            } if *element_type == StreamElementType::UnsignedByte8 => {
                 file_read_byte_raw(file, read_buf, buf_pos, buf_fill)
             }
             _ => {
@@ -450,7 +508,13 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::FileOutput { file, write_buf, line, col, .. } => {
+            StreamInner::FileOutput {
+                file,
+                write_buf,
+                line,
+                col,
+                ..
+            } => {
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
                 write_buf.extend_from_slice(encoded.as_bytes());
@@ -465,7 +529,13 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::FileIo { file, write_buf, line, col, .. } => {
+            StreamInner::FileIo {
+                file,
+                write_buf,
+                line,
+                col,
+                ..
+            } => {
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
                 write_buf.extend_from_slice(encoded.as_bytes());
@@ -511,7 +581,13 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::FileOutput { file, write_buf, line, col, .. } => {
+            StreamInner::FileOutput {
+                file,
+                write_buf,
+                line,
+                col,
+                ..
+            } => {
                 write_buf.push(b);
                 if b == b'\n' {
                     *line += 1;
@@ -524,7 +600,13 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::FileIo { file, write_buf, line, col, .. } => {
+            StreamInner::FileIo {
+                file,
+                write_buf,
+                line,
+                col,
+                ..
+            } => {
                 write_buf.push(b);
                 if b == b'\n' {
                     *line += 1;
@@ -555,14 +637,20 @@ impl GrayStream for StreamMutableState {
     }
 
     // Issue #11: start/end are character indices, not byte indices.
-    fn stream_write_string(&mut self, string: BlissVal, start: usize, end: Option<usize>) -> Result<(), BlissError> {
+    fn stream_write_string(
+        &mut self,
+        string: BlissVal,
+        start: usize,
+        end: Option<usize>,
+    ) -> Result<(), BlissError> {
         self.check_output()?;
         // Extract string as &str so we can index by character position.
         let s = extract_string_str(string)?;
         let char_count = s.chars().count();
         let actual_end = end.unwrap_or(char_count);
         // Compute byte range from character indices.
-        let byte_start = s.char_indices()
+        let byte_start = s
+            .char_indices()
             .nth(start)
             .map(|(i, _)| i)
             .unwrap_or(s.len());
@@ -589,7 +677,13 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::FileOutput { file, write_buf, line, col, .. } => {
+            StreamInner::FileOutput {
+                file,
+                write_buf,
+                line,
+                col,
+                ..
+            } => {
                 write_buf.extend_from_slice(slice);
                 for c in str_slice.chars() {
                     if c == '\n' {
@@ -604,7 +698,13 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::FileIo { file, write_buf, line, col, .. } => {
+            StreamInner::FileIo {
+                file,
+                write_buf,
+                line,
+                col,
+                ..
+            } => {
                 write_buf.extend_from_slice(slice);
                 for c in str_slice.chars() {
                     if c == '\n' {
@@ -639,10 +739,12 @@ impl GrayStream for StreamMutableState {
     fn stream_force_output(&mut self) -> Result<(), BlissError> {
         self.check_open()?;
         match &mut self.inner {
-            StreamInner::FileOutput { file, write_buf, .. }
-            | StreamInner::FileIo { file, write_buf, .. } => {
-                file_flush_write_buf(file, write_buf)
+            StreamInner::FileOutput {
+                file, write_buf, ..
             }
+            | StreamInner::FileIo {
+                file, write_buf, ..
+            } => file_flush_write_buf(file, write_buf),
             StreamInner::Synonym { symbol } => {
                 let target = resolve_synonym(*symbol)?;
                 crate::streams::stream_force_output(target)
@@ -654,8 +756,12 @@ impl GrayStream for StreamMutableState {
     fn stream_finish_output(&mut self) -> Result<(), BlissError> {
         self.check_open()?;
         match &mut self.inner {
-            StreamInner::FileOutput { file, write_buf, .. }
-            | StreamInner::FileIo { file, write_buf, .. } => {
+            StreamInner::FileOutput {
+                file, write_buf, ..
+            }
+            | StreamInner::FileIo {
+                file, write_buf, ..
+            } => {
                 file_flush_write_buf(file, write_buf)?;
                 file.flush()
                     .map_err(|e| BlissError::StreamError(format!("flush error: {}", e)))
@@ -670,8 +776,18 @@ impl GrayStream for StreamMutableState {
 
     fn stream_clear_input(&mut self) -> Result<(), BlissError> {
         match &mut self.inner {
-            StreamInner::FileInput { buf_pos, buf_fill, unread, .. }
-            | StreamInner::FileIo { buf_pos, buf_fill, unread, .. } => {
+            StreamInner::FileInput {
+                buf_pos,
+                buf_fill,
+                unread,
+                ..
+            }
+            | StreamInner::FileIo {
+                buf_pos,
+                buf_fill,
+                unread,
+                ..
+            } => {
                 *buf_pos = 0;
                 *buf_fill = 0;
                 *unread = None;
@@ -688,16 +804,25 @@ impl GrayStream for StreamMutableState {
     fn stream_listen(&self) -> Result<bool, BlissError> {
         self.check_open()?;
         match &self.inner {
-            StreamInner::StringInput { position, end, unread, .. } => {
-                Ok(unread.is_some() || *position < *end)
+            StreamInner::StringInput {
+                position,
+                end,
+                unread,
+                ..
+            } => Ok(unread.is_some() || *position < *end),
+            StreamInner::FileInput {
+                buf_pos,
+                buf_fill,
+                unread,
+                ..
             }
-            StreamInner::FileInput { buf_pos, buf_fill, unread, .. }
-            | StreamInner::FileIo { buf_pos, buf_fill, unread, .. } => {
-                Ok(unread.is_some() || *buf_pos < *buf_fill)
-            }
-            StreamInner::Concatenated { streams } => {
-                Ok(!streams.is_empty())
-            }
+            | StreamInner::FileIo {
+                buf_pos,
+                buf_fill,
+                unread,
+                ..
+            } => Ok(unread.is_some() || *buf_pos < *buf_fill),
+            StreamInner::Concatenated { streams } => Ok(!streams.is_empty()),
             StreamInner::TwoWay { input, .. } | StreamInner::Echo { input, .. } => {
                 crate::streams::stream_listen(*input)
             }
@@ -792,8 +917,7 @@ impl GrayStream for StreamMutableState {
     fn stream_clear_output(&mut self) -> Result<(), BlissError> {
         self.check_open()?;
         match &mut self.inner {
-            StreamInner::FileOutput { write_buf, .. }
-            | StreamInner::FileIo { write_buf, .. } => {
+            StreamInner::FileOutput { write_buf, .. } | StreamInner::FileIo { write_buf, .. } => {
                 write_buf.clear();
                 Ok(())
             }
@@ -846,7 +970,9 @@ impl GrayStream for StreamMutableState {
             } else if elem.is_fixnum() {
                 self.stream_write_byte(elem)?;
             } else {
-                return Err(BlissError::StreamError("invalid element in write-sequence".into()));
+                return Err(BlissError::StreamError(
+                    "invalid element in write-sequence".into(),
+                ));
             }
         }
         Ok(())
@@ -860,9 +986,15 @@ impl GrayStream for StreamMutableState {
 
     fn stream_external_format(&self) -> ExternalFormat {
         match &self.inner {
-            StreamInner::FileInput { external_format, .. } => external_format.clone(),
-            StreamInner::FileOutput { external_format, .. } => external_format.clone(),
-            StreamInner::FileIo { external_format, .. } => external_format.clone(),
+            StreamInner::FileInput {
+                external_format, ..
+            } => external_format.clone(),
+            StreamInner::FileOutput {
+                external_format, ..
+            } => external_format.clone(),
+            StreamInner::FileIo {
+                external_format, ..
+            } => external_format.clone(),
             _ => ExternalFormat::Utf8,
         }
     }
@@ -914,13 +1046,19 @@ fn alloc_string_object(bytes: &[u8]) -> *mut u8 {
 
 fn extract_string_bytes(val: BlissVal) -> Result<&'static [u8], BlissError> {
     if !val.is_heap_object() {
-        return Err(BlissError::TypeError { datum: val, expected: "string".into() });
+        return Err(BlissError::TypeError {
+            datum: val,
+            expected: "string".into(),
+        });
     }
     unsafe {
         let ptr = val.as_ptr();
         let header = *(ptr as *const ObjectHeader);
         if header.type_id() != type_id::SIMPLE_BASE_STRING {
-            return Err(BlissError::TypeError { datum: val, expected: "string".into() });
+            return Err(BlissError::TypeError {
+                datum: val,
+                expected: "string".into(),
+            });
         }
         let len = *((ptr as *const u64).add(1)) as usize;
         Ok(std::slice::from_raw_parts(ptr.add(16), len))
@@ -949,11 +1087,9 @@ pub fn remove_symbol_stream(symbol: BlissVal) {
 /// Resolve a synonym symbol to its target stream.
 fn resolve_synonym(symbol: BlissVal) -> Result<BlissVal, BlissError> {
     let table = synonym_table().lock().unwrap();
-    table.get(&symbol.0)
-        .copied()
-        .ok_or_else(|| BlissError::StreamError(
-            "synonym stream: symbol has no stream binding".into()
-        ))
+    table.get(&symbol.0).copied().ok_or_else(|| {
+        BlissError::StreamError("synonym stream: symbol has no stream binding".into())
+    })
 }
 
 // ── Stream allocation helpers ──────────────────────────────────────
@@ -1031,23 +1167,29 @@ pub fn open(
             let file = match std::fs::File::open(path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(BlissError::FileError(format!("file not found: {}", path_str)));
+                    return Err(BlissError::FileError(format!(
+                        "file not found: {}",
+                        path_str
+                    )));
                 }
                 Err(e) => {
                     return Err(BlissError::FileError(format!("cannot open file: {}", e)));
                 }
             };
-            Ok(alloc_stream(elt, StreamInner::FileInput {
-                file,
-                read_buf: Vec::with_capacity(FILE_BUF_SIZE),
-                buf_pos: 0,
-                buf_fill: 0,
-                line: 0,
-                col: 0,
-                unread: None,
-                external_format,
-                element_type: elt,
-            }))
+            Ok(alloc_stream(
+                elt,
+                StreamInner::FileInput {
+                    file,
+                    read_buf: Vec::with_capacity(FILE_BUF_SIZE),
+                    buf_pos: 0,
+                    buf_fill: 0,
+                    line: 0,
+                    col: 0,
+                    unread: None,
+                    external_format,
+                    element_type: elt,
+                },
+            ))
         }
         StreamDirection::Output => {
             // Issue #8: Handle if_exists variants including :append.
@@ -1059,15 +1201,22 @@ pub fn open(
                     std::fs::OpenOptions::new()
                         .append(true)
                         .open(path)
-                        .map_err(|e| BlissError::FileError(format!("cannot open file for append: {}", e)))?
+                        .map_err(|e| {
+                            BlissError::FileError(format!("cannot open file for append: {}", e))
+                        })?
                 } else if if_exists == IF_EXISTS_OVERWRITE_VAL {
                     // :overwrite — open for writing without truncating
                     std::fs::OpenOptions::new()
                         .write(true)
                         .open(path)
-                        .map_err(|e| BlissError::FileError(format!("cannot open file for overwrite: {}", e)))?
+                        .map_err(|e| {
+                            BlissError::FileError(format!("cannot open file for overwrite: {}", e))
+                        })?
                 } else if if_exists == IF_EXISTS_ERROR_VAL {
-                    return Err(BlissError::FileError(format!("file already exists: {}", path_str)));
+                    return Err(BlissError::FileError(format!(
+                        "file already exists: {}",
+                        path_str
+                    )));
                 } else {
                     // Default (:supersede / T / any other value) — truncate and create
                     std::fs::File::create(path)
@@ -1077,20 +1226,26 @@ pub fn open(
                 std::fs::File::create(path)
                     .map_err(|e| BlissError::FileError(format!("cannot create file: {}", e)))?
             };
-            Ok(alloc_stream(elt, StreamInner::FileOutput {
-                file,
-                write_buf: Vec::with_capacity(FILE_BUF_SIZE),
-                external_format,
-                line: 0,
-                col: 0,
-            }))
+            Ok(alloc_stream(
+                elt,
+                StreamInner::FileOutput {
+                    file,
+                    write_buf: Vec::with_capacity(FILE_BUF_SIZE),
+                    external_format,
+                    line: 0,
+                    col: 0,
+                },
+            ))
         }
         StreamDirection::Io => {
             let file = if path.exists() {
                 if if_exists == NIL {
                     return Ok(NIL);
                 } else if if_exists == IF_EXISTS_ERROR_VAL {
-                    return Err(BlissError::FileError(format!("file already exists: {}", path_str)));
+                    return Err(BlissError::FileError(format!(
+                        "file already exists: {}",
+                        path_str
+                    )));
                 } else if if_exists == IF_EXISTS_APPEND_VAL {
                     let mut f = std::fs::OpenOptions::new()
                         .read(true)
@@ -1125,17 +1280,20 @@ pub fn open(
                     .open(path)
                     .map_err(|e| BlissError::FileError(format!("cannot open file: {}", e)))?
             };
-            Ok(alloc_stream(elt, StreamInner::FileIo {
-                file,
-                read_buf: Vec::with_capacity(FILE_BUF_SIZE),
-                buf_pos: 0,
-                buf_fill: 0,
-                write_buf: Vec::with_capacity(FILE_BUF_SIZE),
-                line: 0,
-                col: 0,
-                unread: None,
-                external_format,
-            }))
+            Ok(alloc_stream(
+                elt,
+                StreamInner::FileIo {
+                    file,
+                    read_buf: Vec::with_capacity(FILE_BUF_SIZE),
+                    buf_pos: 0,
+                    buf_fill: 0,
+                    write_buf: Vec::with_capacity(FILE_BUF_SIZE),
+                    line: 0,
+                    col: 0,
+                    unread: None,
+                    external_format,
+                },
+            ))
         }
     }
 }
@@ -1145,8 +1303,12 @@ pub fn close(stream: BlissVal, abort: bool) -> Result<(), BlissError> {
     // Flush write buffers before closing (unless abort)
     if guard.open && !abort {
         match &mut guard.inner {
-            StreamInner::FileOutput { file, write_buf, .. }
-            | StreamInner::FileIo { file, write_buf, .. } => {
+            StreamInner::FileOutput {
+                file, write_buf, ..
+            }
+            | StreamInner::FileIo {
+                file, write_buf, ..
+            } => {
                 let _ = file_flush_write_buf(file, write_buf);
             }
             _ => {}
@@ -1176,18 +1338,28 @@ pub fn make_string_input_stream(
     if start > actual_end {
         return Err(BlissError::StreamError("start greater than end".into()));
     }
-    Ok(alloc_stream(StreamElementType::Character, StreamInner::StringInput {
-        chars,
-        position: start,
-        end: actual_end,
-        line: 0,
-        col: 0,
-        unread: None,
-    }))
+    Ok(alloc_stream(
+        StreamElementType::Character,
+        StreamInner::StringInput {
+            chars,
+            position: start,
+            end: actual_end,
+            line: 0,
+            col: 0,
+            unread: None,
+        },
+    ))
 }
 
 pub fn make_string_output_stream(_element_type: BlissVal) -> Result<BlissVal, BlissError> {
-    Ok(alloc_stream(StreamElementType::Character, StreamInner::StringOutput { buffer: Vec::new(), line: 0, col: 0 }))
+    Ok(alloc_stream(
+        StreamElementType::Character,
+        StreamInner::StringOutput {
+            buffer: Vec::new(),
+            line: 0,
+            col: 0,
+        },
+    ))
 }
 
 pub fn get_output_stream_string(stream: BlissVal) -> Result<BlissVal, BlissError> {
@@ -1207,23 +1379,42 @@ pub fn get_output_stream_string(stream: BlissVal) -> Result<BlissVal, BlissError
 }
 
 pub fn make_broadcast_stream(streams: &[BlissVal]) -> Result<BlissVal, BlissError> {
-    Ok(alloc_stream(StreamElementType::Character, StreamInner::Broadcast { streams: streams.to_vec() }))
+    Ok(alloc_stream(
+        StreamElementType::Character,
+        StreamInner::Broadcast {
+            streams: streams.to_vec(),
+        },
+    ))
 }
 
 pub fn make_concatenated_stream(streams: &[BlissVal]) -> Result<BlissVal, BlissError> {
-    Ok(alloc_stream(StreamElementType::Character, StreamInner::Concatenated { streams: streams.to_vec() }))
+    Ok(alloc_stream(
+        StreamElementType::Character,
+        StreamInner::Concatenated {
+            streams: streams.to_vec(),
+        },
+    ))
 }
 
 pub fn make_two_way_stream(input: BlissVal, output: BlissVal) -> Result<BlissVal, BlissError> {
-    Ok(alloc_stream(StreamElementType::Character, StreamInner::TwoWay { input, output }))
+    Ok(alloc_stream(
+        StreamElementType::Character,
+        StreamInner::TwoWay { input, output },
+    ))
 }
 
 pub fn make_echo_stream(input: BlissVal, output: BlissVal) -> Result<BlissVal, BlissError> {
-    Ok(alloc_stream(StreamElementType::Character, StreamInner::Echo { input, output }))
+    Ok(alloc_stream(
+        StreamElementType::Character,
+        StreamInner::Echo { input, output },
+    ))
 }
 
 pub fn make_synonym_stream(symbol: BlissVal) -> Result<BlissVal, BlissError> {
-    Ok(alloc_stream(StreamElementType::Character, StreamInner::Synonym { symbol }))
+    Ok(alloc_stream(
+        StreamElementType::Character,
+        StreamInner::Synonym { symbol },
+    ))
 }
 
 // ── Stream queries ─────────────────────────────────────────────────
@@ -1251,12 +1442,10 @@ pub fn output_stream_p(stream: BlissVal) -> bool {
 
 pub fn stream_element_type(stream: BlissVal) -> BlissVal {
     match lock_stream(stream) {
-        Ok(guard) => {
-            match guard.element_type {
-                StreamElementType::Character => T,
-                StreamElementType::UnsignedByte8 => BlissVal::from_fixnum(8),
-            }
-        }
+        Ok(guard) => match guard.element_type {
+            StreamElementType::Character => T,
+            StreamElementType::UnsignedByte8 => BlissVal::from_fixnum(8),
+        },
         Err(_) => NIL,
     }
 }
@@ -1408,32 +1597,46 @@ pub fn file_position(stream: BlissVal) -> Result<BlissVal, BlissError> {
     let mut guard = lock_stream(stream)?;
     guard.check_open()?;
     match &mut guard.inner {
-        StreamInner::FileInput { file, buf_pos, buf_fill, .. } => {
+        StreamInner::FileInput {
+            file,
+            buf_pos,
+            buf_fill,
+            ..
+        } => {
             // The OS position is ahead of our logical position by the buffered-but-unread bytes.
-            let os_pos = file.stream_position()
+            let os_pos = file
+                .stream_position()
                 .map_err(|e| BlissError::StreamError(format!("file-position error: {}", e)))?;
             let buffered_unread = (*buf_fill - *buf_pos) as u64;
             Ok(BlissVal::from_fixnum((os_pos - buffered_unread) as i64))
         }
-        StreamInner::FileOutput { file, write_buf, .. } => {
-            let os_pos = file.stream_position()
+        StreamInner::FileOutput {
+            file, write_buf, ..
+        } => {
+            let os_pos = file
+                .stream_position()
                 .map_err(|e| BlissError::StreamError(format!("file-position error: {}", e)))?;
             let pending = write_buf.len() as u64;
             Ok(BlissVal::from_fixnum((os_pos + pending) as i64))
         }
-        StreamInner::FileIo { file, buf_pos, buf_fill, write_buf, .. } => {
-            let os_pos = file.stream_position()
+        StreamInner::FileIo {
+            file,
+            buf_pos,
+            buf_fill,
+            write_buf,
+            ..
+        } => {
+            let os_pos = file
+                .stream_position()
                 .map_err(|e| BlissError::StreamError(format!("file-position error: {}", e)))?;
             let buffered_unread = (*buf_fill - *buf_pos) as u64;
             let pending_write = write_buf.len() as u64;
-            Ok(BlissVal::from_fixnum((os_pos - buffered_unread + pending_write) as i64))
+            Ok(BlissVal::from_fixnum(
+                (os_pos - buffered_unread + pending_write) as i64,
+            ))
         }
-        StreamInner::StringInput { position, .. } => {
-            Ok(BlissVal::from_fixnum(*position as i64))
-        }
-        StreamInner::StringOutput { buffer, .. } => {
-            Ok(BlissVal::from_fixnum(buffer.len() as i64))
-        }
+        StreamInner::StringInput { position, .. } => Ok(BlissVal::from_fixnum(*position as i64)),
+        StreamInner::StringOutput { buffer, .. } => Ok(BlissVal::from_fixnum(buffer.len() as i64)),
         StreamInner::Synonym { symbol } => {
             let target = resolve_synonym(*symbol)?;
             file_position(target)
@@ -1447,7 +1650,13 @@ pub fn set_file_position(stream: BlissVal, position: BlissVal) -> Result<BlissVa
     let mut guard = lock_stream(stream)?;
     guard.check_open()?;
     match &mut guard.inner {
-        StreamInner::FileInput { file, buf_pos, buf_fill, unread, .. } => {
+        StreamInner::FileInput {
+            file,
+            buf_pos,
+            buf_fill,
+            unread,
+            ..
+        } => {
             // Invalidate read buffer on seek.
             *buf_pos = 0;
             *buf_fill = 0;
@@ -1457,14 +1666,24 @@ pub fn set_file_position(stream: BlissVal, position: BlissVal) -> Result<BlissVa
                 .map_err(|e| BlissError::StreamError(format!("set-file-position error: {}", e)))?;
             Ok(T)
         }
-        StreamInner::FileOutput { file, write_buf, .. } => {
+        StreamInner::FileOutput {
+            file, write_buf, ..
+        } => {
             file_flush_write_buf(file, write_buf)?;
             let pos = position.as_fixnum() as u64;
             file.seek(std::io::SeekFrom::Start(pos))
                 .map_err(|e| BlissError::StreamError(format!("set-file-position error: {}", e)))?;
             Ok(T)
         }
-        StreamInner::FileIo { file, read_buf: _, buf_pos, buf_fill, write_buf, unread, .. } => {
+        StreamInner::FileIo {
+            file,
+            read_buf: _,
+            buf_pos,
+            buf_fill,
+            write_buf,
+            unread,
+            ..
+        } => {
             file_flush_write_buf(file, write_buf)?;
             *buf_pos = 0;
             *buf_fill = 0;
@@ -1491,7 +1710,8 @@ pub fn file_length_fn(stream: BlissVal) -> Result<BlissVal, BlissError> {
         StreamInner::FileInput { file, .. }
         | StreamInner::FileOutput { file, .. }
         | StreamInner::FileIo { file, .. } => {
-            let metadata = file.metadata()
+            let metadata = file
+                .metadata()
                 .map_err(|e| BlissError::StreamError(format!("file-length error: {}", e)))?;
             Ok(BlissVal::from_fixnum(metadata.len() as i64))
         }

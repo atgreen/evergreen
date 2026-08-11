@@ -1,8 +1,8 @@
 //! Tests for bliss-rt runtime module: RuntimeConfig, Runtime lifecycle,
 //! parse_cli, and install_signal_handlers.
 
-use bliss_rt::runtime::*;
 use bliss_rt::runtime::LogLevel;
+use bliss_rt::runtime::*;
 
 // ── RuntimeConfig::from_env ───────────────────────────────────────
 
@@ -17,12 +17,25 @@ fn from_env_returns_sane_defaults() {
     assert!(cfg.eval_form.is_none());
     assert!(cfg.load_file.is_none());
     // Additional fields that should have sane defaults
-    assert!(cfg.image_path.is_some(), "image_path should default to Some(\"bliss.bimg\") or similar");
+    assert!(
+        cfg.image_path.is_some(),
+        "image_path should default to Some(\"bliss.bimg\") or similar"
+    );
     assert!(cfg.gc_log.is_none(), "gc_log should default to None");
     assert!(!cfg.jit_dump, "jit_dump should default to false");
-    assert!(cfg.safepoint_spin > 0, "safepoint_spin should have a non-zero default");
-    assert!(cfg.ffi_pool_pages > 0, "ffi_pool_pages should have a non-zero default");
-    assert_eq!(cfg.log_level, LogLevel::Info, "default log level should be Info");
+    assert!(
+        cfg.safepoint_spin > 0,
+        "safepoint_spin should have a non-zero default"
+    );
+    assert!(
+        cfg.ffi_pool_pages > 0,
+        "ffi_pool_pages should have a non-zero default"
+    );
+    assert_eq!(
+        cfg.log_level,
+        LogLevel::Info,
+        "default log level should be Info"
+    );
 }
 
 // ── RuntimeConfig::apply_cli_args ─────────────────────────────────
@@ -113,7 +126,9 @@ fn scheduler_config_reflects_num_workers() {
 #[test]
 fn parse_cli_separates_at_double_dash() {
     let args: Vec<String> = ["--heap-size", "1024", "--", "u1", "u2"]
-        .iter().map(|s| s.to_string()).collect();
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let (cfg, cl) = parse_cli(&args);
     assert_eq!(cfg.heap_size, 1024);
     assert_eq!(cl, vec!["u1", "u2"]);
@@ -128,7 +143,10 @@ fn parse_cli_empty_args_gives_defaults() {
 
 #[test]
 fn parse_cli_eval_flag() {
-    let args: Vec<String> = ["--eval", "(print 42)"].iter().map(|s| s.to_string()).collect();
+    let args: Vec<String> = ["--eval", "(print 42)"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let (cfg, _) = parse_cli(&args);
     assert_eq!(cfg.eval_form.as_deref(), Some("(print 42)"));
 }
@@ -299,7 +317,10 @@ fn runtime_init_zero_heap_size_is_error() {
     let mut cfg = RuntimeConfig::from_env();
     cfg.heap_size = 0;
     let result = Runtime::init(cfg);
-    assert!(result.is_err(), "Runtime::init with heap_size=0 should return Err");
+    assert!(
+        result.is_err(),
+        "Runtime::init with heap_size=0 should return Err"
+    );
 }
 
 #[test]
@@ -307,7 +328,10 @@ fn runtime_init_zero_nursery_size_is_error() {
     let mut cfg = RuntimeConfig::from_env();
     cfg.nursery_size = 0;
     let result = Runtime::init(cfg);
-    assert!(result.is_err(), "Runtime::init with nursery_size=0 should return Err");
+    assert!(
+        result.is_err(),
+        "Runtime::init with nursery_size=0 should return Err"
+    );
 }
 
 #[test]
@@ -315,7 +339,10 @@ fn runtime_init_zero_stack_size_is_error() {
     let mut cfg = RuntimeConfig::from_env();
     cfg.stack_size = 0;
     let result = Runtime::init(cfg);
-    assert!(result.is_err(), "Runtime::init with stack_size=0 should return Err");
+    assert!(
+        result.is_err(),
+        "Runtime::init with stack_size=0 should return Err"
+    );
 }
 
 #[test]
@@ -323,5 +350,8 @@ fn runtime_init_zero_workers_is_error() {
     let mut cfg = RuntimeConfig::from_env();
     cfg.num_workers = 0;
     let result = Runtime::init(cfg);
-    assert!(result.is_err(), "Runtime::init with num_workers=0 should return Err");
+    assert!(
+        result.is_err(),
+        "Runtime::init with num_workers=0 should return Err"
+    );
 }

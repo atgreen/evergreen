@@ -7,8 +7,8 @@
 //! #[should_panic] because that would mask whether the implementation is correct
 //! once it exists.
 
-use bliss_stdlib::devtools::*;
 use bliss_rt::value::{NIL, T};
+use bliss_stdlib::devtools::*;
 
 // ══════════════════════════════════════════════════════════════════
 // ReplState
@@ -25,11 +25,13 @@ fn repl_state_initial_package_is_valid() {
     let state = ReplState::new();
     let pkg = state.package();
     // The REPL starts in CL-USER or similar — package must not be UNBOUND.
-    assert_ne!(pkg, bliss_rt::value::UNBOUND,
-        "initial REPL package must not be the UNBOUND sentinel");
+    assert_ne!(
+        pkg,
+        bliss_rt::value::UNBOUND,
+        "initial REPL package must not be the UNBOUND sentinel"
+    );
     // Package should not be NIL either.
-    assert_ne!(pkg, NIL,
-        "initial REPL package must not be NIL");
+    assert_ne!(pkg, NIL, "initial REPL package must not be NIL");
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -41,24 +43,29 @@ fn walk_stack_returns_frames() {
     let frames = walk_stack();
     // walk_stack should return a non-empty vector of debug frames
     // representing the current call stack.
-    assert!(!frames.is_empty(),
-        "walk_stack should return at least one frame (the test's own frame)");
+    assert!(
+        !frames.is_empty(),
+        "walk_stack should return at least one frame (the test's own frame)"
+    );
 }
 
 #[test]
 fn debug_frame_function_returns_value() {
     let frames = walk_stack();
-    let frame = frames.first().expect("walk_stack should return at least one frame");
+    let frame = frames
+        .first()
+        .expect("walk_stack should return at least one frame");
     let func = frame.function();
     // The function for a frame should be a valid BlissVal (not NIL for a real frame).
-    assert_ne!(func, NIL,
-        "debug frame function should not be NIL");
+    assert_ne!(func, NIL, "debug frame function should not be NIL");
 }
 
 #[test]
 fn debug_frame_source_location_returns_option() {
     let frames = walk_stack();
-    let frame = frames.first().expect("walk_stack should return at least one frame");
+    let frame = frames
+        .first()
+        .expect("walk_stack should return at least one frame");
     let loc = frame.source_location();
     // source_location returns Option<(file, line, col)>.
     // For compiled Rust test code, it may be None — but the call must succeed.
@@ -72,7 +79,9 @@ fn debug_frame_source_location_returns_option() {
 #[test]
 fn debug_frame_locals_accessible() {
     let frames = walk_stack();
-    let frame = frames.first().expect("walk_stack should return at least one frame");
+    let frame = frames
+        .first()
+        .expect("walk_stack should return at least one frame");
     let locals = frame.locals();
     // locals() returns Option<Vec<(name, value)>>.
     // Whether we get Some or None depends on debug quality.
@@ -87,21 +96,30 @@ fn debug_frame_locals_accessible() {
 #[test]
 fn debug_frame_is_live_for_current_stack() {
     let frames = walk_stack();
-    let frame = frames.first().expect("walk_stack should return at least one frame");
+    let frame = frames
+        .first()
+        .expect("walk_stack should return at least one frame");
     // A frame from the current stack should be live.
-    assert!(frame.is_live(),
-        "frame from current walk_stack should be live");
+    assert!(
+        frame.is_live(),
+        "frame from current walk_stack should be live"
+    );
 }
 
 #[test]
 fn eval_in_frame_returns_result() {
     let frames = walk_stack();
-    let frame = frames.first().expect("walk_stack should return at least one frame");
+    let frame = frames
+        .first()
+        .expect("walk_stack should return at least one frame");
     // Evaluating NIL in any frame should return NIL (self-evaluating).
     let result = eval_in_frame(NIL, frame);
     assert!(result.is_ok(), "eval_in_frame of NIL should succeed");
-    assert_eq!(result.unwrap(), NIL,
-        "eval_in_frame of NIL should return NIL");
+    assert_eq!(
+        result.unwrap(),
+        NIL,
+        "eval_in_frame of NIL should return NIL"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -134,7 +152,10 @@ fn break_at_with_condition() {
 fn remove_breakpoint_succeeds_for_existing() {
     let bp = break_on_entry(NIL, None).expect("break_on_entry should succeed");
     let result = remove_breakpoint(bp);
-    assert!(result.is_ok(), "remove_breakpoint should succeed for an existing breakpoint");
+    assert!(
+        result.is_ok(),
+        "remove_breakpoint should succeed for an existing breakpoint"
+    );
 }
 
 #[test]
@@ -142,8 +163,10 @@ fn list_breakpoints_returns_established() {
     // Set a breakpoint, then list should contain it.
     let bp = break_on_entry(NIL, None).expect("break_on_entry should succeed");
     let bps = list_breakpoints();
-    assert!(bps.contains(&bp),
-        "list_breakpoints should include the breakpoint we just set");
+    assert!(
+        bps.contains(&bp),
+        "list_breakpoints should include the breakpoint we just set"
+    );
 }
 
 #[test]
@@ -151,8 +174,10 @@ fn list_breakpoints_after_remove_excludes_removed() {
     let bp = break_on_entry(NIL, None).expect("break_on_entry should succeed");
     remove_breakpoint(bp).expect("remove_breakpoint should succeed");
     let bps = list_breakpoints();
-    assert!(!bps.contains(&bp),
-        "list_breakpoints should not include a removed breakpoint");
+    assert!(
+        !bps.contains(&bp),
+        "list_breakpoints should not include a removed breakpoint"
+    );
 }
 
 #[test]
@@ -251,8 +276,10 @@ fn trace_untrace_lifecycle() {
 #[test]
 fn trace_with_break_and_condition() {
     let result = trace_function(NIL, true, Some(T));
-    assert!(result.is_ok(),
-        "trace_function with break=true and condition should succeed");
+    assert!(
+        result.is_ok(),
+        "trace_function with break=true and condition should succeed"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -308,8 +335,10 @@ fn repl_loop_is_callable() {
     // In a test context (no real terminal), repl_loop may return Err
     // to indicate no input available. That's acceptable.
     // The key test: it must not panic and must return a valid Result.
-    assert!(result.is_ok() || result.is_err(),
-        "repl_loop should return a Result");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "repl_loop should return a Result"
+    );
 }
 
 #[test]
@@ -317,6 +346,8 @@ fn invoke_debugger_ui_is_callable() {
     let mut state = ReplState::new();
     let result = invoke_debugger_ui(NIL, &mut state);
     // invoke_debugger_ui should return Ok or Err (not panic).
-    assert!(result.is_ok() || result.is_err(),
-        "invoke_debugger_ui should return a Result");
+    assert!(
+        result.is_ok() || result.is_err(),
+        "invoke_debugger_ui should return a Result"
+    );
 }

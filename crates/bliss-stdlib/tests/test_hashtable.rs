@@ -57,8 +57,14 @@ fn make_hash_table_options_defaults() {
     let opts = MakeHashTableOptions::default();
     assert_eq!(opts.test, HashTest::Eql, "Default test should be Eql");
     assert_eq!(opts.size, 16, "Default size should be 16");
-    assert!((opts.rehash_size - 2.0).abs() < f64::EPSILON, "Default rehash_size should be 2.0");
-    assert!((opts.rehash_threshold - 0.75).abs() < f64::EPSILON, "Default rehash_threshold should be 0.75");
+    assert!(
+        (opts.rehash_size - 2.0).abs() < f64::EPSILON,
+        "Default rehash_size should be 2.0"
+    );
+    assert!(
+        (opts.rehash_threshold - 0.75).abs() < f64::EPSILON,
+        "Default rehash_threshold should be 0.75"
+    );
     assert!(!opts.synchronized, "Default should not be synchronized");
     assert!(opts.weakness.is_none(), "Default weakness should be None");
 }
@@ -77,8 +83,16 @@ fn make_hash_table_default_succeeds_empty() {
 
 #[test]
 fn make_hash_table_each_test_function() {
-    for test_fn in &[HashTest::Eq, HashTest::Eql, HashTest::Equal, HashTest::Equalp] {
-        let opts = MakeHashTableOptions { test: *test_fn, ..MakeHashTableOptions::default() };
+    for test_fn in &[
+        HashTest::Eq,
+        HashTest::Eql,
+        HashTest::Equal,
+        HashTest::Equalp,
+    ] {
+        let opts = MakeHashTableOptions {
+            test: *test_fn,
+            ..MakeHashTableOptions::default()
+        };
         let ht = make_hash_table(&opts).expect("should create hash table");
         assert_eq!(hash_table_test(ht).unwrap(), *test_fn);
     }
@@ -86,7 +100,10 @@ fn make_hash_table_each_test_function() {
 
 #[test]
 fn make_hash_table_custom_size() {
-    let opts = MakeHashTableOptions { size: 64, ..MakeHashTableOptions::default() };
+    let opts = MakeHashTableOptions {
+        size: 64,
+        ..MakeHashTableOptions::default()
+    };
     let ht = make_hash_table(&opts).expect("should create hash table");
     let size = hash_table_size(ht).unwrap();
     assert!(size >= 64, "Size should be >= requested 64, got: {}", size);
@@ -95,7 +112,9 @@ fn make_hash_table_custom_size() {
 #[test]
 fn make_hash_table_custom_rehash_params() {
     let opts = MakeHashTableOptions {
-        rehash_size: 3.0, rehash_threshold: 0.5, ..MakeHashTableOptions::default()
+        rehash_size: 3.0,
+        rehash_threshold: 0.5,
+        ..MakeHashTableOptions::default()
     };
     let ht = make_hash_table(&opts).expect("should create hash table");
     assert!((hash_table_rehash_size(ht).unwrap() - 3.0).abs() < f64::EPSILON);
@@ -104,15 +123,25 @@ fn make_hash_table_custom_rehash_params() {
 
 #[test]
 fn make_hash_table_synchronized() {
-    let opts = MakeHashTableOptions { synchronized: true, ..MakeHashTableOptions::default() };
+    let opts = MakeHashTableOptions {
+        synchronized: true,
+        ..MakeHashTableOptions::default()
+    };
     assert!(make_hash_table(&opts).is_ok());
 }
 
 #[test]
 fn make_hash_table_weakness_variants() {
     for w in &[Weakness::Key, Weakness::Value, Weakness::KeyAndValue] {
-        let opts = MakeHashTableOptions { weakness: Some(*w), ..MakeHashTableOptions::default() };
-        assert!(make_hash_table(&opts).is_ok(), "Should create {:?} weak table", w);
+        let opts = MakeHashTableOptions {
+            weakness: Some(*w),
+            ..MakeHashTableOptions::default()
+        };
+        assert!(
+            make_hash_table(&opts).is_ok(),
+            "Should create {:?} weak table",
+            w
+        );
     }
 }
 
@@ -239,7 +268,12 @@ fn maphash_visits_all_entries() {
     for &(k, v) in &entries {
         let (result, present) = gethash(BlissVal::from_fixnum(k), ht, NIL).unwrap();
         assert!(present, "Key {} should still be present after maphash", k);
-        assert_eq!(result, BlissVal::from_fixnum(v), "Value for key {} should be unchanged", k);
+        assert_eq!(
+            result,
+            BlissVal::from_fixnum(v),
+            "Value for key {} should be unchanged",
+            k
+        );
     }
 }
 
@@ -313,7 +347,10 @@ fn hash_table_size_ge_count() {
 
 #[test]
 fn hash_table_size_ge_requested() {
-    let opts = MakeHashTableOptions { size: 30, ..MakeHashTableOptions::default() };
+    let opts = MakeHashTableOptions {
+        size: 30,
+        ..MakeHashTableOptions::default()
+    };
     let ht = make_hash_table(&opts).unwrap();
     let size = hash_table_size(ht).unwrap();
     // The spec only requires size >= requested; the implementation may use
@@ -323,7 +360,10 @@ fn hash_table_size_ge_requested() {
 
 #[test]
 fn hash_table_size_minimum_16() {
-    let opts = MakeHashTableOptions { size: 1, ..MakeHashTableOptions::default() };
+    let opts = MakeHashTableOptions {
+        size: 1,
+        ..MakeHashTableOptions::default()
+    };
     let ht = make_hash_table(&opts).unwrap();
     assert!(hash_table_size(ht).unwrap() >= 16);
 }
@@ -334,7 +374,10 @@ fn hash_table_size_minimum_16() {
 fn hash_table_rehash_size_custom_and_default() {
     let ht_default = make_hash_table(&MakeHashTableOptions::default()).unwrap();
     assert!((hash_table_rehash_size(ht_default).unwrap() - 2.0).abs() < f64::EPSILON);
-    let opts = MakeHashTableOptions { rehash_size: 4.0, ..MakeHashTableOptions::default() };
+    let opts = MakeHashTableOptions {
+        rehash_size: 4.0,
+        ..MakeHashTableOptions::default()
+    };
     let ht_custom = make_hash_table(&opts).unwrap();
     assert!((hash_table_rehash_size(ht_custom).unwrap() - 4.0).abs() < f64::EPSILON);
 }
@@ -343,7 +386,10 @@ fn hash_table_rehash_size_custom_and_default() {
 fn hash_table_rehash_threshold_custom_and_default() {
     let ht_default = make_hash_table(&MakeHashTableOptions::default()).unwrap();
     assert!((hash_table_rehash_threshold(ht_default).unwrap() - 0.75).abs() < f64::EPSILON);
-    let opts = MakeHashTableOptions { rehash_threshold: 0.9, ..MakeHashTableOptions::default() };
+    let opts = MakeHashTableOptions {
+        rehash_threshold: 0.9,
+        ..MakeHashTableOptions::default()
+    };
     let ht_custom = make_hash_table(&opts).unwrap();
     assert!((hash_table_rehash_threshold(ht_custom).unwrap() - 0.9).abs() < f64::EPSILON);
 }
@@ -355,20 +401,26 @@ fn sxhash_consistent() {
     let val = BlissVal::from_fixnum(42);
     assert_eq!(sxhash(val), sxhash(val));
     // Equal fixnums must produce equal hashes (R5.155)
-    assert_eq!(sxhash(BlissVal::from_fixnum(100)), sxhash(BlissVal::from_fixnum(100)));
+    assert_eq!(
+        sxhash(BlissVal::from_fixnum(100)),
+        sxhash(BlissVal::from_fixnum(100))
+    );
 }
 
 #[test]
 fn sxhash_returns_non_negative_fixnum() {
     let hash_val = sxhash(BlissVal::from_fixnum(42));
     assert!(hash_val.is_fixnum(), "sxhash should return a fixnum");
-    assert!(hash_val.as_fixnum() >= 0, "sxhash should return non-negative");
+    assert!(
+        hash_val.as_fixnum() >= 0,
+        "sxhash should return non-negative"
+    );
 }
 
 #[test]
 fn sxhash_nil_and_t() {
     let _ = sxhash(NIL); // should not panic
-    let _ = sxhash(T);   // should not panic
+    let _ = sxhash(T); // should not panic
 }
 
 // ── Error conditions ──────────────────────────────────────────────
@@ -382,7 +434,14 @@ fn gethash_on_non_hash_table_errors() {
 #[test]
 fn set_gethash_on_non_hash_table_errors() {
     let not_a_table = BlissVal::from_fixnum(42);
-    assert!(set_gethash(BlissVal::from_fixnum(1), not_a_table, BlissVal::from_fixnum(2)).is_err());
+    assert!(
+        set_gethash(
+            BlissVal::from_fixnum(1),
+            not_a_table,
+            BlissVal::from_fixnum(2)
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -409,8 +468,15 @@ fn maphash_on_non_hash_table_errors() {
 fn make_hash_table_invalid_rehash_size_le_one() {
     // rehash_size <= 1.0 should error per R5.160
     for bad in &[0.5, 1.0, 0.0, -1.0] {
-        let opts = MakeHashTableOptions { rehash_size: *bad, ..MakeHashTableOptions::default() };
-        assert!(make_hash_table(&opts).is_err(), "rehash_size={} should error", bad);
+        let opts = MakeHashTableOptions {
+            rehash_size: *bad,
+            ..MakeHashTableOptions::default()
+        };
+        assert!(
+            make_hash_table(&opts).is_err(),
+            "rehash_size={} should error",
+            bad
+        );
     }
 }
 
@@ -418,7 +484,14 @@ fn make_hash_table_invalid_rehash_size_le_one() {
 fn make_hash_table_invalid_rehash_threshold() {
     // threshold must be in (0, 1] per R5.160
     for bad in &[0.0, -0.5, 1.5] {
-        let opts = MakeHashTableOptions { rehash_threshold: *bad, ..MakeHashTableOptions::default() };
-        assert!(make_hash_table(&opts).is_err(), "rehash_threshold={} should error", bad);
+        let opts = MakeHashTableOptions {
+            rehash_threshold: *bad,
+            ..MakeHashTableOptions::default()
+        };
+        assert!(
+            make_hash_table(&opts).is_err(),
+            "rehash_threshold={} should error",
+            bad
+        );
     }
 }

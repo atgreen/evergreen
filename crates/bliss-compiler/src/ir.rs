@@ -30,21 +30,15 @@ pub enum NodeKind {
     /// Function call.
     Call,
     /// Runtime type guard (with uncommon trap metadata).
-    TypeCheck {
-        expected_type: BlissVal,
-    },
+    TypeCheck { expected_type: BlissVal },
     /// Tag an unboxed scalar into a BlissVal.
     Box,
     /// Untag a BlissVal to a raw scalar.
     Unbox,
     /// Heap load.
-    MemLoad {
-        offset: i32,
-    },
+    MemLoad { offset: i32 },
     /// Heap store.
-    MemStore {
-        offset: i32,
-    },
+    MemStore { offset: i32 },
     /// GC safepoint poll.
     Safepoint,
 }
@@ -137,12 +131,18 @@ impl IrGraph {
 
     /// Get all input edges to a node.
     pub fn inputs(&self, id: impl Borrow<NodeId>) -> &[Edge] {
-        self.inputs.get(id.borrow()).map(|v| v.as_slice()).unwrap_or(&[])
+        self.inputs
+            .get(id.borrow())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Get all output edges from a node.
     pub fn uses(&self, id: impl Borrow<NodeId>) -> &[Edge] {
-        self.uses.get(id.borrow()).map(|v| v.as_slice()).unwrap_or(&[])
+        self.uses
+            .get(id.borrow())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Get the Start node ID.
@@ -276,13 +276,23 @@ impl IrBuilder {
     }
 
     /// Recursively build IR nodes for a form.
-    fn build_form(&mut self, graph: &mut IrGraph, form: BlissVal, ctrl: NodeId) -> Result<NodeId, crate::error::CompilerError> {
-        use bliss_rt::value::{NIL_BITS, T_BITS, TAG_SPECIAL, TAG_SYMBOL, TAG_CONS};
+    fn build_form(
+        &mut self,
+        graph: &mut IrGraph,
+        form: BlissVal,
+        ctrl: NodeId,
+    ) -> Result<NodeId, crate::error::CompilerError> {
+        use bliss_rt::value::{NIL_BITS, T_BITS, TAG_CONS, TAG_SPECIAL, TAG_SYMBOL};
 
         // Self-evaluating forms: produce a Constant node
-        if form.is_fixnum() || form.is_character() || form.is_single_float()
-            || form.is_heap_object() || form.0 == NIL_BITS || form.0 == T_BITS
-            || form.tag() == TAG_SPECIAL || form.is_function()
+        if form.is_fixnum()
+            || form.is_character()
+            || form.is_single_float()
+            || form.is_heap_object()
+            || form.0 == NIL_BITS
+            || form.0 == T_BITS
+            || form.tag() == TAG_SPECIAL
+            || form.is_function()
         {
             return Ok(graph.add_node(NodeKind::Constant(form)));
         }
@@ -354,7 +364,9 @@ impl IrBuilder {
             let mut cur = args_form;
             while cur.tag() == TAG_CONS {
                 let ap = (cur.0 & !bliss_rt::value::TAG_MASK) as *const u64;
-                if ap.is_null() { break; }
+                if ap.is_null() {
+                    break;
+                }
                 let arg_form = BlissVal(unsafe { *ap });
                 let arg_node = self.build_form(graph, arg_form, ctrl)?;
                 arg_nodes.push(arg_node);
@@ -397,7 +409,9 @@ impl IrBuilder {
         let mut cur = list;
         while cur.tag() == TAG_CONS {
             let ap = (cur.0 & !bliss_rt::value::TAG_MASK) as *const u64;
-            if ap.is_null() { break; }
+            if ap.is_null() {
+                break;
+            }
             result.push(BlissVal(unsafe { *ap }));
             cur = BlissVal(unsafe { *ap.add(1) });
         }
@@ -405,7 +419,12 @@ impl IrBuilder {
     }
 
     /// Build IR for an IF form: (IF test then [else])
-    fn build_if(&mut self, graph: &mut IrGraph, args_form: BlissVal, ctrl: NodeId) -> Result<NodeId, crate::error::CompilerError> {
+    fn build_if(
+        &mut self,
+        graph: &mut IrGraph,
+        args_form: BlissVal,
+        ctrl: NodeId,
+    ) -> Result<NodeId, crate::error::CompilerError> {
         use bliss_rt::value::NIL_BITS;
 
         let args = Self::collect_list(args_form);
@@ -487,7 +506,12 @@ impl IrBuilder {
 
     /// Build IR for a LAMBDA form: (LAMBDA (params...) body...)
     /// Creates Parameter nodes for each parameter and builds the body.
-    fn build_lambda(&mut self, graph: &mut IrGraph, args_form: BlissVal, ctrl: NodeId) -> Result<NodeId, crate::error::CompilerError> {
+    fn build_lambda(
+        &mut self,
+        graph: &mut IrGraph,
+        args_form: BlissVal,
+        ctrl: NodeId,
+    ) -> Result<NodeId, crate::error::CompilerError> {
         use bliss_rt::value::NIL_BITS;
 
         let args = Self::collect_list(args_form);
@@ -518,7 +542,12 @@ impl IrBuilder {
     }
 
     /// Build IR for a PROGN form: (PROGN form1 form2 ... formN)
-    fn build_progn(&mut self, graph: &mut IrGraph, args_form: BlissVal, ctrl: NodeId) -> Result<NodeId, crate::error::CompilerError> {
+    fn build_progn(
+        &mut self,
+        graph: &mut IrGraph,
+        args_form: BlissVal,
+        ctrl: NodeId,
+    ) -> Result<NodeId, crate::error::CompilerError> {
         use bliss_rt::value::NIL_BITS;
 
         let forms = Self::collect_list(args_form);
@@ -540,10 +569,7 @@ impl IrBuilder {
 fn is_pinned(kind: &NodeKind) -> bool {
     matches!(
         kind,
-        NodeKind::MemLoad { .. }
-            | NodeKind::MemStore { .. }
-            | NodeKind::Safepoint
-            | NodeKind::Call
+        NodeKind::MemLoad { .. } | NodeKind::MemStore { .. } | NodeKind::Safepoint | NodeKind::Call
     )
 }
 
@@ -592,8 +618,14 @@ pub fn verify(graph: &IrGraph) -> Result<(), Vec<String>> {
             if !graph.nodes.contains_key(&edge.from) {
                 continue; // already caught by V1
             }
-            let from_uses = graph.uses.get(&edge.from).map(|v| v.as_slice()).unwrap_or(&[]);
-            let has_match = from_uses.iter().any(|u| u.to == edge.to && u.input_index == edge.input_index);
+            let from_uses = graph
+                .uses
+                .get(&edge.from)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let has_match = from_uses
+                .iter()
+                .any(|u| u.to == edge.to && u.input_index == edge.input_index);
             if !has_match {
                 errors.push(format!(
                     "V2: use-list inconsistency: edge {:?}->{:?} in inputs but not in uses",
@@ -609,7 +641,11 @@ pub fn verify(graph: &IrGraph) -> Result<(), Vec<String>> {
         if !matches!(kind, NodeKind::Phi) {
             continue;
         }
-        let inputs = graph.inputs.get(node_id).map(|v| v.as_slice()).unwrap_or(&[]);
+        let inputs = graph
+            .inputs
+            .get(node_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let data_inputs: Vec<&Edge> = inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
         if data_inputs.is_empty() {
             errors.push(format!("V4: Phi {:?} has no data inputs", node_id));
@@ -627,8 +663,15 @@ pub fn verify(graph: &IrGraph) -> Result<(), Vec<String>> {
         // Value inputs = data_inputs.len() - 1 (subtract the region reference)
         let value_input_count = data_inputs.len() - 1;
         // Region's control input count
-        let region_inputs = graph.inputs.get(&region_id).map(|v| v.as_slice()).unwrap_or(&[]);
-        let region_ctrl_count = region_inputs.iter().filter(|e| e.kind == EdgeKind::Control).count();
+        let region_inputs = graph
+            .inputs
+            .get(&region_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let region_ctrl_count = region_inputs
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Control)
+            .count();
         if value_input_count != region_ctrl_count {
             errors.push(format!(
                 "V4: Phi {:?} has {} value inputs but Region {:?} has {} control inputs",
@@ -642,8 +685,15 @@ pub fn verify(graph: &IrGraph) -> Result<(), Vec<String>> {
         if !matches!(kind, NodeKind::Return) {
             continue;
         }
-        let inputs = graph.inputs.get(node_id).map(|v| v.as_slice()).unwrap_or(&[]);
-        let ctrl_count = inputs.iter().filter(|e| e.kind == EdgeKind::Control).count();
+        let inputs = graph
+            .inputs
+            .get(node_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let ctrl_count = inputs
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Control)
+            .count();
         if ctrl_count < 1 {
             errors.push(format!(
                 "V5: Return node {:?} has no control input",
@@ -658,8 +708,15 @@ pub fn verify(graph: &IrGraph) -> Result<(), Vec<String>> {
         if !is_pinned(kind) {
             continue;
         }
-        let inputs = graph.inputs.get(node_id).map(|v| v.as_slice()).unwrap_or(&[]);
-        let ctrl_count = inputs.iter().filter(|e| e.kind == EdgeKind::Control).count();
+        let inputs = graph
+            .inputs
+            .get(node_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let ctrl_count = inputs
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Control)
+            .count();
         if ctrl_count != 1 {
             errors.push(format!(
                 "V6: pinned node {:?} ({:?}) has {} control inputs (expected 1)",

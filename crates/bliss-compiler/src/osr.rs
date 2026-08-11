@@ -195,37 +195,31 @@ impl OsrEntryMap {
         for guard in &self.type_guards {
             let idx = guard.slot_index as usize;
             if idx >= locals.len() {
-                return Err(BlissError::Internal(
-                    format!(
-                        "OsrEntryMap::enter: type guard slot_index {} out of bounds (have {} locals)",
-                        guard.slot_index,
-                        locals.len()
-                    ),
-                ));
+                return Err(BlissError::Internal(format!(
+                    "OsrEntryMap::enter: type guard slot_index {} out of bounds (have {} locals)",
+                    guard.slot_index,
+                    locals.len()
+                )));
             }
             let val = locals[idx];
             if val.tag() != guard.expected_tag {
-                return Err(BlissError::Internal(
-                    format!(
-                        "OsrEntryMap::enter: type guard failed at slot {}: expected tag {:#x}, got {:#x}",
-                        guard.slot_index,
-                        guard.expected_tag,
-                        val.tag()
-                    ),
-                ));
+                return Err(BlissError::Internal(format!(
+                    "OsrEntryMap::enter: type guard failed at slot {}: expected tag {:#x}, got {:#x}",
+                    guard.slot_index,
+                    guard.expected_tag,
+                    val.tag()
+                )));
             }
         }
 
         // Validate that each mapping's local_index is within bounds.
         for mapping in &self.mappings {
             if (mapping.local_index as usize) >= locals.len() {
-                return Err(BlissError::Internal(
-                    format!(
-                        "OsrEntryMap::enter: local_index {} out of bounds (have {} locals)",
-                        mapping.local_index,
-                        locals.len()
-                    ),
-                ));
+                return Err(BlissError::Internal(format!(
+                    "OsrEntryMap::enter: local_index {} out of bounds (have {} locals)",
+                    mapping.local_index,
+                    locals.len()
+                )));
             }
         }
 
@@ -296,10 +290,7 @@ fn apply_conversion(val: BlissVal, conversion: &ConversionKind) -> BlissVal {
 #[derive(Clone, Debug)]
 pub enum DeoptReason {
     /// Type guard failure — observed type didn't match speculation.
-    TypeMismatch {
-        expected: String,
-        actual: String,
-    },
+    TypeMismatch { expected: String, actual: String },
     /// Access to an uninitialized variable.
     UninitializedVariable(BlissVal),
     /// Class hierarchy changed (method redefinition, class redefinition).
@@ -403,9 +394,9 @@ impl DeoptLog {
         // Build the DeoptEntry.
         let entry = DeoptEntry {
             timestamp,
-            trap_pc: 0,     // filled in by caller if available
+            trap_pc: 0, // filled in by caller if available
             reason,
-            resume_pc: 0,   // filled in by caller if available
+            resume_pc: 0, // filled in by caller if available
         };
 
         // Insert into the ring buffer.
@@ -518,7 +509,8 @@ impl DeoptLog {
         }
         // Exponential backoff: base * 2^(count - 1), capped to avoid overflow.
         let shift = (self.blacklist_count - 1).min(30);
-        self.backoff_seconds.saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
+        self.backoff_seconds
+            .saturating_mul(1u32.checked_shl(shift).unwrap_or(u32::MAX))
     }
 
     /// Reset the deopt log so the function can be re-promoted to T2.
@@ -575,12 +567,10 @@ pub fn osr_entry(
     let is_function = function.tag() == bliss_rt::value::TAG_FUNCTION;
 
     if !is_function {
-        return Err(BlissError::Internal(
-            format!(
-                "osr_entry: expected a function-tagged value, got tag {:#x}",
-                function.tag()
-            ),
-        ));
+        return Err(BlissError::Internal(format!(
+            "osr_entry: expected a function-tagged value, got tag {:#x}",
+            function.tag()
+        )));
     }
 
     // Check whether this function is currently in the backoff period
@@ -623,21 +613,17 @@ pub fn deoptimize(
     let is_function = function.tag() == bliss_rt::value::TAG_FUNCTION;
 
     if !is_function {
-        return Err(BlissError::Internal(
-            format!(
-                "deoptimize: expected a function-tagged value, got tag {:#x}",
-                function.tag()
-            ),
-        ));
+        return Err(BlissError::Internal(format!(
+            "deoptimize: expected a function-tagged value, got tag {:#x}",
+            function.tag()
+        )));
     }
 
     // Look up or create the persistent DeoptLog for this function.
     // The log is keyed by the function's raw tagged-pointer bits.
     let (blacklisted, total_deopts) = {
         let mut logs = DEOPT_LOGS.lock().unwrap();
-        let log = logs
-            .entry(function.0)
-            .or_default();
+        let log = logs.entry(function.0).or_default();
         log.record(reason);
         (log.is_blacklisted(), log.total_deopts())
     };

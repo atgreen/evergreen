@@ -201,14 +201,20 @@ impl BlissVal {
 
     /// Extract the single-float value. Panics if not a single-float.
     pub fn as_single_float(self) -> f32 {
-        assert!(self.is_single_float(), "as_single_float called on non-single-float value");
+        assert!(
+            self.is_single_float(),
+            "as_single_float called on non-single-float value"
+        );
         let bits = (self.0 >> 32) as u32;
         f32::from_bits(bits)
     }
 
     /// Extract the symbol table index. Panics if not a symbol.
     pub fn as_symbol_index(self) -> u32 {
-        assert!(self.tag() == TAG_SYMBOL, "as_symbol_index called on non-symbol value");
+        assert!(
+            self.tag() == TAG_SYMBOL,
+            "as_symbol_index called on non-symbol value"
+        );
         (self.0 >> 3) as u32
     }
 

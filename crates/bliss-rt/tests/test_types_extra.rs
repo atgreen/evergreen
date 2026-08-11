@@ -5,15 +5,21 @@
 //! MISSING, EOF), type_id_of for remaining heap type IDs, structure/
 //! standard-object type IDs, and additional cross-cutting predicate checks.
 
-use bliss_rt::value::*;
-use bliss_rt::types::*;
 use bliss_rt::object::*;
+use bliss_rt::types::*;
+use bliss_rt::value::*;
 
 // ── Helpers (same pattern as test_types.rs) ───────────────────────
 
-fn mk_fix(n: i64) -> BlissVal { BlissVal::from_fixnum(n) }
-fn mk_flt(f: f32) -> BlissVal { BlissVal::from_single_float(f) }
-fn mk_sym(i: u32) -> BlissVal { BlissVal::from_symbol_index(i) }
+fn mk_fix(n: i64) -> BlissVal {
+    BlissVal::from_fixnum(n)
+}
+fn mk_flt(f: f32) -> BlissVal {
+    BlissVal::from_single_float(f)
+}
+fn mk_sym(i: u32) -> BlissVal {
+    BlissVal::from_symbol_index(i)
+}
 
 unsafe fn mk_heap(storage: &mut [u64; 2], tid: u8) -> BlissVal {
     unsafe {
@@ -63,8 +69,11 @@ fn special_values_are_distinct() {
     let specials = [NIL, T, UNBOUND, MISSING, EOF];
     for i in 0..specials.len() {
         for j in (i + 1)..specials.len() {
-            assert_ne!(specials[i], specials[j],
-                "special values at index {} and {} must differ", i, j);
+            assert_ne!(
+                specials[i], specials[j],
+                "special values at index {} and {} must differ",
+                i, j
+            );
         }
     }
 }
@@ -178,7 +187,11 @@ fn heap_numeric_cross_cutting() {
 #[test]
 fn non_numeric_heap_types_not_numeric() {
     unsafe {
-        for &tid in &[type_id::STRUCTURE, type_id::STANDARD_OBJECT, type_id::PACKAGE] {
+        for &tid in &[
+            type_id::STRUCTURE,
+            type_id::STANDARD_OBJECT,
+            type_id::PACKAGE,
+        ] {
             let mut s = [0u64; 2];
             let v = mk_heap(&mut s, tid);
             assert!(!numberp(v), "type_id {} should not be numberp", tid);

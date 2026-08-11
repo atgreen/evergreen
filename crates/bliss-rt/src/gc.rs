@@ -212,9 +212,9 @@ impl HeapAllocator {
     /// Create a new HeapAllocator. The heap must already be initialized via `init_heap`.
     pub fn new() -> Result<Self, BlissError> {
         let guard = heap_state().lock().unwrap();
-        let state = guard.as_ref().ok_or_else(|| {
-            BlissError::Internal("heap not initialized".into())
-        })?;
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| BlissError::Internal("heap not initialized".into()))?;
         let region_size = state.config.region_size;
         let tlab_size = state.config.tlab_size;
         drop(guard);
@@ -238,9 +238,9 @@ impl HeapAllocator {
     /// if no nursery region with space and no free region can be found.
     fn refill_tlab(&mut self) -> Result<(), BlissError> {
         let mut guard = heap_state().lock().unwrap();
-        let state = guard.as_mut().ok_or_else(|| {
-            BlissError::Internal("heap not initialized".into())
-        })?;
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| BlissError::Internal("heap not initialized".into()))?;
 
         // Find a nursery region with enough space for a TLAB.
         for (idx, region) in state.regions.iter_mut().enumerate() {
@@ -253,7 +253,8 @@ impl HeapAllocator {
             if available >= self.tlab_size {
                 // Carve out a TLAB from this region.
                 self.tlab.cursor = region.header.alloc_top;
-                self.tlab.limit = unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
+                self.tlab.limit =
+                    unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
                 self.tlab.region_idx = idx as u16;
                 // Advance the region's alloc_top past the TLAB.
                 region.header.alloc_top = unsafe { region.header.alloc_top.add(self.tlab_size) };
@@ -278,7 +279,8 @@ impl HeapAllocator {
             let available = limit.saturating_sub(top);
             if available >= self.tlab_size {
                 self.tlab.cursor = region.header.alloc_top;
-                self.tlab.limit = unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
+                self.tlab.limit =
+                    unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
                 self.tlab.region_idx = idx as u16;
                 region.header.alloc_top = unsafe { region.header.alloc_top.add(self.tlab_size) };
                 return Ok(());
@@ -353,9 +355,9 @@ impl Allocator for HeapAllocator {
         let total_size = align_up(OBJECT_HEADER_SIZE + size, OBJECT_ALIGNMENT);
 
         let mut guard = heap_state().lock().unwrap();
-        let state = guard.as_mut().ok_or_else(|| {
-            BlissError::Internal("heap not initialized".into())
-        })?;
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| BlissError::Internal("heap not initialized".into()))?;
 
         // Find a Free region large enough, convert to LargeObject.
         let regions_needed = total_size.div_ceil(self.region_size);
@@ -394,12 +396,14 @@ impl Allocator for HeapAllocator {
                     state.regions[start + offset].header.kind = RegionKind::LargeObject;
                     state.regions[start + offset].header.gen_age = 0;
                 }
-                state.regions[start].header.alloc_top =
-                    unsafe { ptr.add(total_size) };
+                state.regions[start].header.alloc_top = unsafe { ptr.add(total_size) };
                 state.regions[start].header.live_bytes = total_size as u32;
                 state.stats.large_object_bytes += total_size as u64;
                 state.stats.bytes_allocated += total_size as u64;
-                state.stats.regions_free = state.stats.regions_free.saturating_sub(regions_needed as u32);
+                state.stats.regions_free = state
+                    .stats
+                    .regions_free
+                    .saturating_sub(regions_needed as u32);
                 // Write object header.
                 unsafe {
                     write_object_header(ptr, 0, size as u32);
@@ -533,18 +537,14 @@ impl Collector for HeapCollector {
         let start = std::time::Instant::now();
 
         let mut guard = heap_state().lock().unwrap();
-        let state = guard.as_mut().ok_or_else(|| {
-            BlissError::Internal("heap not initialized".into())
-        })?;
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| BlissError::Internal("heap not initialized".into()))?;
 
         let promotion_threshold = self.promotion_threshold;
 
         // Phase 1: Ensure we have a survivor region to copy into.
-        let survivor_idx = Self::find_or_create_target_region(
-            state,
-            RegionKind::Survivor,
-            1,
-        );
+        let survivor_idx = Self::find_or_create_target_region(state, RegionKind::Survivor, 1);
 
         // Phase 2: Walk each nursery region, copy live objects to survivor/old-gen.
         let mut bytes_promoted: u64 = 0;
@@ -586,7 +586,8 @@ impl Collector for HeapCollector {
                     continue;
                 }
 
-                let total_size = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                let total_size =
+                    align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
 
                 // Decide target: promote to old-gen if region age >= threshold,
                 // otherwise copy to survivor.
@@ -639,7 +640,8 @@ impl Collector for HeapCollector {
                     if body_size == 0 && type_id == 0 {
                         break;
                     }
-                    let total_size = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                    let total_size =
+                        align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
                     // Non-forwarded objects in a nursery being collected are dead.
                     if type_id != FORWARDED_TYPE_ID {
                         // Construct a BlissVal for the object body pointer.
@@ -654,7 +656,8 @@ impl Collector for HeapCollector {
             // Phase 4: Reset the nursery region for reuse.
             let region = &mut state.regions[nursery_idx];
             // Zero the region memory so walk_heap doesn't see stale forwarding pointers.
-            let region_used = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
+            let region_used =
+                (region.header.alloc_top as usize).saturating_sub(region.base as usize);
             if region_used > 0 {
                 unsafe {
                     std::ptr::write_bytes(region.base, 0, region_used);
@@ -668,14 +671,19 @@ impl Collector for HeapCollector {
         // Break weak pointers to objects that were in nursery regions (now freed).
         // After resetting, any pointer into these regions is dead.
         {
-            let nursery_ranges: Vec<(usize, usize)> = nursery_indices.iter().map(|&idx| {
-                let base = state.regions[idx].base as usize;
-                let limit = state.regions[idx].header.alloc_limit as usize;
-                (base, limit)
-            }).collect();
+            let nursery_ranges: Vec<(usize, usize)> = nursery_indices
+                .iter()
+                .map(|&idx| {
+                    let base = state.regions[idx].base as usize;
+                    let limit = state.regions[idx].header.alloc_limit as usize;
+                    (base, limit)
+                })
+                .collect();
             break_dead_weak_pointers(&|val: BlissVal| {
                 let addr = val.to_raw() as usize;
-                nursery_ranges.iter().any(|&(base, limit)| addr >= base && addr < limit)
+                nursery_ranges
+                    .iter()
+                    .any(|&(base, limit)| addr >= base && addr < limit)
             });
         }
 
@@ -934,8 +942,7 @@ impl Collector for HeapCollector {
                             Self::find_or_create_target_region(state, RegionKind::OldGen, 0)
                         {
                             if new_target != evac_idx {
-                                let _ =
-                                    Self::copy_object(state, header_ptr, body_size, new_target);
+                                let _ = Self::copy_object(state, header_ptr, body_size, new_target);
                             }
                         }
                     }
@@ -946,7 +953,8 @@ impl Collector for HeapCollector {
 
             // Free the evacuated region.
             let region = &mut state.regions[evac_idx];
-            let region_used = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
+            let region_used =
+                (region.header.alloc_top as usize).saturating_sub(region.base as usize);
             if region_used > 0 {
                 unsafe {
                     std::ptr::write_bytes(region.base, 0, region_used);
@@ -985,8 +993,8 @@ impl Collector for HeapCollector {
                 }
                 RegionKind::LargeObject => {
                     if region.header.live_bytes == 0 {
-                        let size = (region.header.alloc_top as usize)
-                            .saturating_sub(region.base as usize);
+                        let size =
+                            (region.header.alloc_top as usize).saturating_sub(region.base as usize);
                         state.stats.large_object_bytes =
                             state.stats.large_object_bytes.saturating_sub(size as u64);
                         if size > 0 {
@@ -1075,9 +1083,9 @@ impl SatbCardBarrier {
     /// Create a new SATB+card barrier for the initialized heap.
     pub fn new() -> Result<Self, BlissError> {
         let guard = heap_state().lock().unwrap();
-        let state = guard.as_ref().ok_or_else(|| {
-            BlissError::Internal("heap not initialized".into())
-        })?;
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| BlissError::Internal("heap not initialized".into()))?;
         let card_shift = 9; // 512-byte cards → shift by 9
         let card_count = (state.config.heap_size >> card_shift) + 1;
         let heap_base = state.heap_base as usize;
@@ -1421,7 +1429,9 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
         return Err(BlissError::Internal("heap_size exceeds heap_max".into()));
     }
     if config.nursery_size > config.heap_size {
-        return Err(BlissError::Internal("nursery_size exceeds heap_size".into()));
+        return Err(BlissError::Internal(
+            "nursery_size exceeds heap_size".into(),
+        ));
     }
     if config.region_size == 0 {
         return Err(BlissError::Internal("region_size must be non-zero".into()));
@@ -1430,7 +1440,9 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     // also implicitly rejects region_size+1 (never a power of two when region_size
     // is a power of two), preventing TLAB sizes that can't fit in a single region.
     if config.tlab_size == 0 || (config.tlab_size & (config.tlab_size - 1)) != 0 {
-        return Err(BlissError::Internal("tlab_size must be a power of two".into()));
+        return Err(BlissError::Internal(
+            "tlab_size must be a power of two".into(),
+        ));
     }
     let regions_total = (config.heap_size / config.region_size) as u32;
 
@@ -1468,7 +1480,11 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
             live_bytes: 0,
             alloc_top: region_base, // nothing allocated yet
             alloc_limit: region_limit,
-            next_free: if i + 1 < regions_total { i + 1 } else { u32::MAX },
+            next_free: if i + 1 < regions_total {
+                i + 1
+            } else {
+                u32::MAX
+            },
             mark_bitmap_offset: 0,
         };
 
@@ -1663,7 +1679,11 @@ fn append_serialized_object(
     let header_ptr = region.header.alloc_top;
     unsafe {
         write_object_header(header_ptr, type_id, body.len() as u32);
-        std::ptr::copy_nonoverlapping(body.as_ptr(), header_ptr.add(OBJECT_HEADER_SIZE), body.len());
+        std::ptr::copy_nonoverlapping(
+            body.as_ptr(),
+            header_ptr.add(OBJECT_HEADER_SIZE),
+            body.len(),
+        );
         if total_size > OBJECT_HEADER_SIZE + body.len() {
             std::ptr::write_bytes(
                 header_ptr.add(OBJECT_HEADER_SIZE + body.len()),

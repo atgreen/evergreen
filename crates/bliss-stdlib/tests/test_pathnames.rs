@@ -53,11 +53,7 @@ fn make_keyword_val(s: &str) -> BlissVal {
 
 /// Generate a unique temporary path using the test name and a counter-like suffix.
 fn temp_path(label: &str) -> String {
-    format!(
-        "/tmp/bliss_test_{}_{}",
-        label,
-        std::process::id()
-    )
+    format!("/tmp/bliss_test_{}_{}", label, std::process::id())
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -80,7 +76,10 @@ fn parse_namestring_with_host() {
     // Verify host was stored — the real implementation must return the host
     // that was provided, not an arbitrary value.
     let got_host = pathname_host(pathname);
-    assert_ne!(got_host, NIL, "host should be set when provided to parse_namestring");
+    assert_ne!(
+        got_host, NIL,
+        "host should be set when provided to parse_namestring"
+    );
     assert_eq!(got_host, host);
 }
 
@@ -145,10 +144,14 @@ fn make_pathname_with_nil_components() {
 fn merge_pathnames_fills_missing_components() {
     let name_only = make_pathname(NIL, NIL, NIL, make_string_val("foo"), NIL, NIL).unwrap();
     let default_pn = make_pathname(
-        make_string_val("defaulthost"), make_string_val("dev0"),
-        make_string_val("/home/user/"), make_string_val("default"),
-        make_string_val("txt"), make_keyword_val("NEWEST"),
-    ).unwrap();
+        make_string_val("defaulthost"),
+        make_string_val("dev0"),
+        make_string_val("/home/user/"),
+        make_string_val("default"),
+        make_string_val("txt"),
+        make_keyword_val("NEWEST"),
+    )
+    .unwrap();
     let merged = merge_pathnames(name_only, default_pn, make_keyword_val("NEWEST")).unwrap();
     // name came from primary
     assert_eq!(pathname_name(merged), make_string_val("foo"));
@@ -161,15 +164,23 @@ fn merge_pathnames_fills_missing_components() {
 #[test]
 fn merge_pathnames_preserves_existing_components() {
     let full = make_pathname(
-        make_string_val("h"), make_string_val("d"),
-        make_string_val("/a/"), make_string_val("n"),
-        make_string_val("t"), make_keyword_val("NEWEST"),
-    ).unwrap();
+        make_string_val("h"),
+        make_string_val("d"),
+        make_string_val("/a/"),
+        make_string_val("n"),
+        make_string_val("t"),
+        make_keyword_val("NEWEST"),
+    )
+    .unwrap();
     let default_pn = make_pathname(
-        make_string_val("X"), make_string_val("Y"),
-        make_string_val("/Z/"), make_string_val("W"),
-        make_string_val("Q"), make_keyword_val("NEWEST"),
-    ).unwrap();
+        make_string_val("X"),
+        make_string_val("Y"),
+        make_string_val("/Z/"),
+        make_string_val("W"),
+        make_string_val("Q"),
+        make_keyword_val("NEWEST"),
+    )
+    .unwrap();
     let merged = merge_pathnames(full, default_pn, make_keyword_val("NEWEST")).unwrap();
     assert_eq!(pathname_host(merged), make_string_val("h"));
     assert_eq!(pathname_name(merged), make_string_val("n"));
@@ -248,35 +259,69 @@ fn pathname_version_returns_correct_component() {
 #[test]
 fn pathname_match_p_exact_match() {
     let pn = make_pathname(
-        NIL, NIL, make_string_val("/usr/local/"),
-        make_string_val("test"), make_string_val("lisp"), NIL,
-    ).unwrap();
+        NIL,
+        NIL,
+        make_string_val("/usr/local/"),
+        make_string_val("test"),
+        make_string_val("lisp"),
+        NIL,
+    )
+    .unwrap();
     let wildcard = make_pathname(
-        NIL, NIL, make_string_val("/usr/local/"),
-        make_string_val("test"), make_string_val("lisp"), NIL,
-    ).unwrap();
+        NIL,
+        NIL,
+        make_string_val("/usr/local/"),
+        make_string_val("test"),
+        make_string_val("lisp"),
+        NIL,
+    )
+    .unwrap();
     assert!(pathname_match_p(pn, wildcard).unwrap());
 }
 
 #[test]
 fn pathname_match_p_wild_name() {
     let pn = make_pathname(
-        NIL, NIL, NIL, make_string_val("anything"), make_string_val("lisp"), NIL,
-    ).unwrap();
+        NIL,
+        NIL,
+        NIL,
+        make_string_val("anything"),
+        make_string_val("lisp"),
+        NIL,
+    )
+    .unwrap();
     let wildcard = make_pathname(
-        NIL, NIL, NIL, make_keyword_val("WILD"), make_string_val("lisp"), NIL,
-    ).unwrap();
+        NIL,
+        NIL,
+        NIL,
+        make_keyword_val("WILD"),
+        make_string_val("lisp"),
+        NIL,
+    )
+    .unwrap();
     assert!(pathname_match_p(pn, wildcard).unwrap());
 }
 
 #[test]
 fn pathname_match_p_wild_type() {
     let pn = make_pathname(
-        NIL, NIL, NIL, make_string_val("foo"), make_string_val("txt"), NIL,
-    ).unwrap();
+        NIL,
+        NIL,
+        NIL,
+        make_string_val("foo"),
+        make_string_val("txt"),
+        NIL,
+    )
+    .unwrap();
     let wildcard = make_pathname(
-        NIL, NIL, NIL, make_string_val("foo"), make_keyword_val("WILD"), NIL,
-    ).unwrap();
+        NIL,
+        NIL,
+        NIL,
+        make_string_val("foo"),
+        make_keyword_val("WILD"),
+        NIL,
+    )
+    .unwrap();
     assert!(pathname_match_p(pn, wildcard).unwrap());
 }
 
@@ -294,33 +339,70 @@ fn pathname_match_p_no_match() {
 #[test]
 fn wild_pathname_p_no_wildcards() {
     let pn = make_pathname(
-        NIL, NIL, make_string_val("/home/"), make_string_val("file"),
-        make_string_val("txt"), NIL,
-    ).unwrap();
+        NIL,
+        NIL,
+        make_string_val("/home/"),
+        make_string_val("file"),
+        make_string_val("txt"),
+        NIL,
+    )
+    .unwrap();
     assert!(!wild_pathname_p(pn, None));
 }
 
 #[test]
 fn wild_pathname_p_wild_name_field_none() {
-    let pn = make_pathname(NIL, NIL, NIL, make_keyword_val("WILD"), make_string_val("lisp"), NIL).unwrap();
+    let pn = make_pathname(
+        NIL,
+        NIL,
+        NIL,
+        make_keyword_val("WILD"),
+        make_string_val("lisp"),
+        NIL,
+    )
+    .unwrap();
     assert!(wild_pathname_p(pn, None));
 }
 
 #[test]
 fn wild_pathname_p_specific_field_name() {
-    let pn = make_pathname(NIL, NIL, NIL, make_keyword_val("WILD"), make_string_val("lisp"), NIL).unwrap();
+    let pn = make_pathname(
+        NIL,
+        NIL,
+        NIL,
+        make_keyword_val("WILD"),
+        make_string_val("lisp"),
+        NIL,
+    )
+    .unwrap();
     assert!(wild_pathname_p(pn, Some(make_keyword_val("NAME"))));
 }
 
 #[test]
 fn wild_pathname_p_specific_field_type_not_wild() {
-    let pn = make_pathname(NIL, NIL, NIL, make_keyword_val("WILD"), make_string_val("lisp"), NIL).unwrap();
+    let pn = make_pathname(
+        NIL,
+        NIL,
+        NIL,
+        make_keyword_val("WILD"),
+        make_string_val("lisp"),
+        NIL,
+    )
+    .unwrap();
     assert!(!wild_pathname_p(pn, Some(make_keyword_val("TYPE"))));
 }
 
 #[test]
 fn wild_pathname_p_wild_in_type() {
-    let pn = make_pathname(NIL, NIL, NIL, make_string_val("foo"), make_keyword_val("WILD"), NIL).unwrap();
+    let pn = make_pathname(
+        NIL,
+        NIL,
+        NIL,
+        make_string_val("foo"),
+        make_keyword_val("WILD"),
+        NIL,
+    )
+    .unwrap();
     assert!(wild_pathname_p(pn, Some(make_keyword_val("TYPE"))));
 }
 
@@ -400,7 +482,10 @@ fn ensure_directories_exist_creates_dirs() {
 
     // Verify the directory structure actually exists on disk
     let parent = std::path::Path::new(&full_path).parent().unwrap();
-    assert!(parent.is_dir(), "parent directory should exist after ensure_directories_exist");
+    assert!(
+        parent.is_dir(),
+        "parent directory should exist after ensure_directories_exist"
+    );
 
     // Clean up after test
     let _ = std::fs::remove_dir_all(&dir_path);
@@ -499,9 +584,9 @@ fn open_with_nonexistent_directory_errors() {
     let result = streams::open(
         path,
         streams::StreamDirection::Output,
-        NIL,  // default element-type
-        NIL,  // if-exists
-        NIL,  // if-does-not-exist
+        NIL, // default element-type
+        NIL, // if-exists
+        NIL, // if-does-not-exist
         streams::ExternalFormat::Utf8,
     );
     assert!(
@@ -568,26 +653,20 @@ fn parse_namestring_multiple_extensions() {
 #[test]
 fn pathname_match_p_wild_name_matches_nil() {
     let pn = make_pathname(NIL, NIL, NIL, NIL, NIL, NIL).unwrap();
-    let wildcard = make_pathname(
-        NIL, NIL, NIL, make_keyword_val("WILD"), NIL, NIL,
-    ).unwrap();
+    let wildcard = make_pathname(NIL, NIL, NIL, make_keyword_val("WILD"), NIL, NIL).unwrap();
     assert!(pathname_match_p(pn, wildcard).unwrap());
 }
 
 #[test]
 fn wild_pathname_p_host_never_wild_posix() {
-    let pn = make_pathname(
-        NIL, NIL, NIL, make_keyword_val("WILD"), NIL, NIL,
-    ).unwrap();
+    let pn = make_pathname(NIL, NIL, NIL, make_keyword_val("WILD"), NIL, NIL).unwrap();
     let host_field = make_keyword_val("HOST");
     assert!(!wild_pathname_p(pn, Some(host_field)));
 }
 
 #[test]
 fn merge_pathnames_version_from_default_version_arg() {
-    let primary = make_pathname(
-        NIL, NIL, NIL, make_string_val("foo"), NIL, NIL,
-    ).unwrap();
+    let primary = make_pathname(NIL, NIL, NIL, make_string_val("foo"), NIL, NIL).unwrap();
     let default_pn = make_pathname(NIL, NIL, NIL, NIL, NIL, NIL).unwrap();
     let newest = make_keyword_val("NEWEST");
     let merged = merge_pathnames(primary, default_pn, newest).unwrap();

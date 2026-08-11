@@ -94,7 +94,9 @@ where
 {
     CURRENT_STORE.with(|cell| {
         let borrow = cell.borrow();
-        let store_rc = borrow.as_ref().expect("No active PackageRegistry on this thread");
+        let store_rc = borrow
+            .as_ref()
+            .expect("No active PackageRegistry on this thread");
         f(&mut store_rc.borrow_mut())
     })
 }
@@ -107,7 +109,9 @@ where
 {
     CURRENT_STORE.with(|cell| {
         let borrow = cell.borrow();
-        let store_rc = borrow.as_ref().expect("No active PackageRegistry on this thread");
+        let store_rc = borrow
+            .as_ref()
+            .expect("No active PackageRegistry on this thread");
         f(&store_rc.borrow())
     })
 }
@@ -146,7 +150,10 @@ impl PackageRegistry {
     /// Find a package by name or nickname. O(1) amortised (R5.05).
     pub fn find_package(&self, name: &str) -> Option<BlissVal> {
         let store = self.store.borrow();
-        store.name_index.get(name).map(|&id| BlissVal::from_fixnum(id))
+        store
+            .name_index
+            .get(name)
+            .map(|&id| BlissVal::from_fixnum(id))
     }
 
     /// Create a new package.
@@ -160,15 +167,17 @@ impl PackageRegistry {
 
         // Check for duplicate name or nickname conflicts.
         if store.name_index.contains_key(name) {
-            return Err(BlissError::PackageError(
-                format!("Package named {:?} already exists", name),
-            ));
+            return Err(BlissError::PackageError(format!(
+                "Package named {:?} already exists",
+                name
+            )));
         }
         for nick in nicknames {
             if store.name_index.contains_key(*nick) {
-                return Err(BlissError::PackageError(
-                    format!("Nickname {:?} conflicts with an existing package", nick),
-                ));
+                return Err(BlissError::PackageError(format!(
+                    "Nickname {:?} conflicts with an existing package",
+                    nick
+                )));
             }
         }
 
@@ -178,9 +187,10 @@ impl PackageRegistry {
             match store.name_index.get(*use_name) {
                 Some(&id) => resolved_uses.push(BlissVal::from_fixnum(id)),
                 None => {
-                    return Err(BlissError::PackageError(
-                        format!("Package {:?} not found for use-list", use_name),
-                    ));
+                    return Err(BlissError::PackageError(format!(
+                        "Package {:?} not found for use-list",
+                        use_name
+                    )));
                 }
             }
         }
@@ -203,9 +213,11 @@ impl PackageRegistry {
     /// Delete a package.
     pub fn delete_package(&mut self, name: &str) -> Result<(), BlissError> {
         let mut store = self.store.borrow_mut();
-        let id = store.name_index.get(name).copied().ok_or_else(|| {
-            BlissError::PackageError(format!("Package {:?} not found", name))
-        })?;
+        let id = store
+            .name_index
+            .get(name)
+            .copied()
+            .ok_or_else(|| BlissError::PackageError(format!("Package {:?} not found", name)))?;
 
         let pkg = store.packages.remove(&id).unwrap();
         store.name_index.remove(&pkg.name);
@@ -238,9 +250,10 @@ impl Default for PackageRegistry {
 pub fn intern(name: &str, package: BlissVal) -> Result<(BlissVal, InternStatus), BlissError> {
     with_store_mut(|store| {
         let id = pkg_id(package);
-        let pkg = store.packages.get(&id).ok_or_else(|| {
-            BlissError::PackageError("Package not found".to_string())
-        })?;
+        let pkg = store
+            .packages
+            .get(&id)
+            .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
 
         // Check internal symbols first.
         if let Some(&sym) = pkg.internal_symbols.get(name) {
@@ -285,12 +298,16 @@ pub enum InternStatus {
 }
 
 /// Find a symbol without interning it.
-pub fn find_symbol(name: &str, package: BlissVal) -> Result<Option<(BlissVal, InternStatus)>, BlissError> {
+pub fn find_symbol(
+    name: &str,
+    package: BlissVal,
+) -> Result<Option<(BlissVal, InternStatus)>, BlissError> {
     with_store(|store| {
         let id = pkg_id(package);
-        let pkg = store.packages.get(&id).ok_or_else(|| {
-            BlissError::PackageError("Package not found".to_string())
-        })?;
+        let pkg = store
+            .packages
+            .get(&id)
+            .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
 
         // Check internal symbols.
         if let Some(&sym) = pkg.internal_symbols.get(name) {
@@ -320,9 +337,10 @@ pub fn find_symbol(name: &str, package: BlissVal) -> Result<Option<(BlissVal, In
 pub fn export(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissError> {
     with_store_mut(|store| {
         let id = pkg_id(package);
-        let pkg = store.packages.get_mut(&id).ok_or_else(|| {
-            BlissError::PackageError("Package not found".to_string())
-        })?;
+        let pkg = store
+            .packages
+            .get_mut(&id)
+            .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
 
         for &sym in symbols {
             // Find the symbol name in internal_symbols.
@@ -353,9 +371,10 @@ pub fn export(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissError>
 pub fn unexport(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissError> {
     with_store_mut(|store| {
         let id = pkg_id(package);
-        let pkg = store.packages.get_mut(&id).ok_or_else(|| {
-            BlissError::PackageError("Package not found".to_string())
-        })?;
+        let pkg = store
+            .packages
+            .get_mut(&id)
+            .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
 
         for &sym in symbols {
             let sym_name = pkg
@@ -378,9 +397,10 @@ pub fn unexport(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissErro
 pub fn unintern(symbol: BlissVal, package: BlissVal) -> Result<bool, BlissError> {
     with_store_mut(|store| {
         let id = pkg_id(package);
-        let pkg = store.packages.get_mut(&id).ok_or_else(|| {
-            BlissError::PackageError("Package not found".to_string())
-        })?;
+        let pkg = store
+            .packages
+            .get_mut(&id)
+            .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
 
         // Try to remove from internal_symbols.
         let removed_internal = pkg
@@ -425,9 +445,10 @@ pub fn use_package(packages: &[BlissVal], target: BlissVal) -> Result<(), BlissE
             }
         }
 
-        let target_pkg = store.packages.get_mut(&target_id).ok_or_else(|| {
-            BlissError::PackageError("Target package not found".to_string())
-        })?;
+        let target_pkg = store
+            .packages
+            .get_mut(&target_id)
+            .ok_or_else(|| BlissError::PackageError("Target package not found".to_string()))?;
 
         for &pkg_handle in packages {
             if !target_pkg.use_list.contains(&pkg_handle) {
@@ -442,9 +463,10 @@ pub fn use_package(packages: &[BlissVal], target: BlissVal) -> Result<(), BlissE
 pub fn unuse_package(packages: &[BlissVal], target: BlissVal) -> Result<(), BlissError> {
     with_store_mut(|store| {
         let target_id = pkg_id(target);
-        let target_pkg = store.packages.get_mut(&target_id).ok_or_else(|| {
-            BlissError::PackageError("Target package not found".to_string())
-        })?;
+        let target_pkg = store
+            .packages
+            .get_mut(&target_id)
+            .ok_or_else(|| BlissError::PackageError("Target package not found".to_string()))?;
 
         for &pkg_handle in packages {
             target_pkg.use_list.retain(|&x| x != pkg_handle);
@@ -464,25 +486,28 @@ pub fn import(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissError>
                 BlissError::PackageError("Symbol not found in any package".to_string())
             })?;
 
-            let pkg = store.packages.get(&id).ok_or_else(|| {
-                BlissError::PackageError("Package not found".to_string())
-            })?;
+            let pkg = store
+                .packages
+                .get(&id)
+                .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
 
             // Check for conflict: a different symbol with the same name exists.
             if let Some(&existing) = pkg.internal_symbols.get(&name) {
                 if existing != sym {
-                    return Err(BlissError::PackageError(
-                        format!("Name conflict for symbol {:?}", name),
-                    ));
+                    return Err(BlissError::PackageError(format!(
+                        "Name conflict for symbol {:?}",
+                        name
+                    )));
                 }
                 // Same symbol already present — no-op.
                 continue;
             }
             if let Some(&existing) = pkg.external_symbols.get(&name) {
                 if existing != sym {
-                    return Err(BlissError::PackageError(
-                        format!("Name conflict for symbol {:?}", name),
-                    ));
+                    return Err(BlissError::PackageError(format!(
+                        "Name conflict for symbol {:?}",
+                        name
+                    )));
                 }
                 continue;
             }
@@ -504,9 +529,10 @@ pub fn shadowing_import(symbols: &[BlissVal], package: BlissVal) -> Result<(), B
                 BlissError::PackageError("Symbol not found in any package".to_string())
             })?;
 
-            let pkg = store.packages.get_mut(&id).ok_or_else(|| {
-                BlissError::PackageError("Package not found".to_string())
-            })?;
+            let pkg = store
+                .packages
+                .get_mut(&id)
+                .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
 
             // Remove any existing symbol with the same name (no conflict check).
             pkg.internal_symbols.remove(&name);
@@ -524,14 +550,14 @@ pub fn shadowing_import(symbols: &[BlissVal], package: BlissVal) -> Result<(), B
 pub fn shadow(names: &[&str], package: BlissVal) -> Result<(), BlissError> {
     with_store_mut(|store| {
         let id = pkg_id(package);
-        let pkg = store.packages.get_mut(&id).ok_or_else(|| {
-            BlissError::PackageError("Package not found".to_string())
-        })?;
+        let pkg = store
+            .packages
+            .get_mut(&id)
+            .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
 
         for &name in names {
             // If symbol doesn't exist in internal or external, create it.
-            if !pkg.internal_symbols.contains_key(name)
-                && !pkg.external_symbols.contains_key(name)
+            if !pkg.internal_symbols.contains_key(name) && !pkg.external_symbols.contains_key(name)
             {
                 let sym = alloc_symbol();
                 pkg.internal_symbols.insert(name.to_string(), sym);

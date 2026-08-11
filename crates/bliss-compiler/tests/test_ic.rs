@@ -1,6 +1,8 @@
 //! Tests for inline caches — ic.rs
 
-use bliss_compiler::ic::{IcEntry, IcState, InlineCache, IC_POLY_MAX, reset_all_caches, init_ic_registry, ic_generation};
+use bliss_compiler::ic::{
+    IC_POLY_MAX, IcEntry, IcState, InlineCache, ic_generation, init_ic_registry, reset_all_caches,
+};
 use bliss_rt::value::{BlissVal, NIL, T};
 
 // ── IcState enum ──────────────────────────────────────────────────
@@ -24,7 +26,10 @@ fn ic_poly_max_is_four() {
 
 #[test]
 fn ic_entry_fields_and_clone() {
-    let entry = IcEntry { class: NIL, method: T };
+    let entry = IcEntry {
+        class: NIL,
+        method: T,
+    };
     assert_eq!(entry.class, NIL);
     let cloned = entry.clone();
     assert_eq!(cloned.method, T);
@@ -116,7 +121,11 @@ fn reset_all_caches_invalidates_existing_cache_via_generation() {
     // Create an IC and populate it before the reset.
     let ic = InlineCache::new();
     ic.update(BlissVal(10), BlissVal(20));
-    assert_eq!(ic.state(), IcState::Monomorphic, "IC should be populated before reset");
+    assert_eq!(
+        ic.state(),
+        IcState::Monomorphic,
+        "IC should be populated before reset"
+    );
     assert_eq!(ic.lookup(BlissVal(10)), Some(BlissVal(20)));
 
     let gen_before = ic_generation();
@@ -125,17 +134,27 @@ fn reset_all_caches_invalidates_existing_cache_via_generation() {
     reset_all_caches();
 
     let gen_after = ic_generation();
-    assert!(gen_after > gen_before,
+    assert!(
+        gen_after > gen_before,
         "global IC generation should advance after reset_all_caches (was {}, now {})",
-        gen_before, gen_after);
+        gen_before,
+        gen_after
+    );
 
     // The SAME ic should now be lazily invalidated on the next access:
     // its local generation is behind the global one, so state()/lookup()
     // trigger check_generation() which clears it.
-    assert_eq!(ic.state(), IcState::Uninitialized,
-        "IC should be lazily reset to Uninitialized after reset_all_caches");
-    assert!(ic.entries().is_empty(),
-        "IC entries should be empty after reset_all_caches");
-    assert!(ic.lookup(BlissVal(10)).is_none(),
-        "lookup should miss after reset_all_caches cleared the IC");
+    assert_eq!(
+        ic.state(),
+        IcState::Uninitialized,
+        "IC should be lazily reset to Uninitialized after reset_all_caches"
+    );
+    assert!(
+        ic.entries().is_empty(),
+        "IC entries should be empty after reset_all_caches"
+    );
+    assert!(
+        ic.lookup(BlissVal(10)).is_none(),
+        "lookup should miss after reset_all_caches cleared the IC"
+    );
 }

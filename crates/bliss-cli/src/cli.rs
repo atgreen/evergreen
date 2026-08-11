@@ -13,26 +13,54 @@ use std::rc::Rc;
 // ── CLI arguments ──────────────────────────────────────────────────
 #[derive(Clone, Debug)]
 pub struct CliArgs {
-    pub image: Option<String>, pub eval: Option<String>, pub load: Option<String>,
-    pub no_image: bool, pub bootstrap: bool, pub workers: Option<usize>,
-    pub heap_size: Option<String>, pub help: bool, pub version: bool,
-    pub sandbox: bool, pub no_init: bool, pub cl_args: Vec<String>,
+    pub image: Option<String>,
+    pub eval: Option<String>,
+    pub load: Option<String>,
+    pub no_image: bool,
+    pub bootstrap: bool,
+    pub workers: Option<usize>,
+    pub heap_size: Option<String>,
+    pub help: bool,
+    pub version: bool,
+    pub sandbox: bool,
+    pub no_init: bool,
+    pub cl_args: Vec<String>,
     pub script: Option<String>,
 }
 
-fn take_value<'a>(flag: &str, iter: &mut impl Iterator<Item = &'a String>) -> Result<String, BlissError> {
-    iter.next().cloned().ok_or_else(|| BlissError::Internal(format!("{} requires a value", flag)))
+fn take_value<'a>(
+    flag: &str,
+    iter: &mut impl Iterator<Item = &'a String>,
+) -> Result<String, BlissError> {
+    iter.next()
+        .cloned()
+        .ok_or_else(|| BlissError::Internal(format!("{} requires a value", flag)))
 }
 
 impl CliArgs {
     pub fn parse(args: &[String]) -> Result<Self, BlissError> {
-        let mut r = CliArgs { image: None, eval: None, load: None, no_image: false,
-            bootstrap: false, workers: None, heap_size: None, help: false, version: false,
-            sandbox: false, no_init: false, cl_args: Vec::new(), script: None };
+        let mut r = CliArgs {
+            image: None,
+            eval: None,
+            load: None,
+            no_image: false,
+            bootstrap: false,
+            workers: None,
+            heap_size: None,
+            help: false,
+            version: false,
+            sandbox: false,
+            no_init: false,
+            cl_args: Vec::new(),
+            script: None,
+        };
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
-                "--" => { r.cl_args = iter.cloned().collect(); break; }
+                "--" => {
+                    r.cl_args = iter.cloned().collect();
+                    break;
+                }
                 "--help" => r.help = true,
                 "--version" => r.version = true,
                 "--eval" | "-e" => r.eval = Some(take_value(arg, &mut iter)?),
@@ -42,18 +70,42 @@ impl CliArgs {
                 "--bootstrap" => r.bootstrap = true,
                 "--sandbox" => r.sandbox = true,
                 "--no-init" => r.no_init = true,
-                "--workers" => { let v = take_value(arg, &mut iter)?;
-                    r.workers = Some(v.parse::<usize>().map_err(|_|
-                        BlissError::Internal(format!("--workers requires a numeric value, got: {}", v)))?); }
+                "--workers" => {
+                    let v = take_value(arg, &mut iter)?;
+                    r.workers = Some(v.parse::<usize>().map_err(|_| {
+                        BlissError::Internal(format!(
+                            "--workers requires a numeric value, got: {}",
+                            v
+                        ))
+                    })?);
+                }
                 "--heap-size" => r.heap_size = Some(take_value(arg, &mut iter)?),
-                s if s.starts_with('-') => return Err(BlissError::Internal(format!("unknown flag: {}", s))),
+                s if s.starts_with('-') => {
+                    return Err(BlissError::Internal(format!("unknown flag: {}", s)));
+                }
                 _ => r.script = Some(arg.clone()),
             }
         }
-        if r.image.is_some() && r.no_image { return Err(BlissError::Internal("--image and --no-image are contradictory".into())); }
-        if r.sandbox && r.no_image { return Err(BlissError::Internal("--sandbox and --no-image are contradictory".into())); }
-        if r.no_init && r.bootstrap { return Err(BlissError::Internal("--no-init and --bootstrap are contradictory".into())); }
-        if r.eval.is_some() && r.load.is_some() { return Err(BlissError::Internal("--eval and --load are contradictory".into())); }
+        if r.image.is_some() && r.no_image {
+            return Err(BlissError::Internal(
+                "--image and --no-image are contradictory".into(),
+            ));
+        }
+        if r.sandbox && r.no_image {
+            return Err(BlissError::Internal(
+                "--sandbox and --no-image are contradictory".into(),
+            ));
+        }
+        if r.no_init && r.bootstrap {
+            return Err(BlissError::Internal(
+                "--no-init and --bootstrap are contradictory".into(),
+            ));
+        }
+        if r.eval.is_some() && r.load.is_some() {
+            return Err(BlissError::Internal(
+                "--eval and --load are contradictory".into(),
+            ));
+        }
         Ok(r)
     }
 }
@@ -71,7 +123,13 @@ struct Arena {
 }
 
 impl Arena {
-    fn new() -> Self { Arena { blocks: Vec::new(), permanent: Vec::new(), compaction_threshold: 10000 } }
+    fn new() -> Self {
+        Arena {
+            blocks: Vec::new(),
+            permanent: Vec::new(),
+            compaction_threshold: 10000,
+        }
+    }
 
     /// Promote all current blocks to permanent status.
     /// Call this after loading an image or defining persistent functions
@@ -85,7 +143,9 @@ impl Arena {
     /// SAFETY: Caller must ensure no references to non-permanent blocks exist.
     fn compact(&mut self) {
         for &(ptr, layout) in &self.blocks {
-            unsafe { std::alloc::dealloc(ptr, layout); }
+            unsafe {
+                std::alloc::dealloc(ptr, layout);
+            }
         }
         self.blocks.clear();
     }
@@ -99,7 +159,9 @@ impl Arena {
         let layout = std::alloc::Layout::new::<ConsCell>();
         unsafe {
             let ptr = std::alloc::alloc_zeroed(layout);
-            if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
             let cell = ptr as *mut ConsCell;
             (*cell).car = car;
             (*cell).cdr = cdr;
@@ -114,8 +176,11 @@ impl Arena {
         let layout = std::alloc::Layout::from_size_align(sz, 8).unwrap();
         unsafe {
             let p = std::alloc::alloc_zeroed(layout);
-            if p.is_null() { std::alloc::handle_alloc_error(layout); }
-            *(p as *mut ObjectHeader) = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, sz.div_ceil(8) as u16);
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            *(p as *mut ObjectHeader) =
+                ObjectHeader::new(type_id::SIMPLE_BASE_STRING, sz.div_ceil(8) as u16);
             *(p.add(8) as *mut u64) = b.len() as u64;
             std::ptr::copy_nonoverlapping(b.as_ptr(), p.add(16), b.len());
             self.blocks.push((p, layout));
@@ -127,10 +192,14 @@ impl Arena {
 impl Drop for Arena {
     fn drop(&mut self) {
         for &(ptr, layout) in &self.blocks {
-            unsafe { std::alloc::dealloc(ptr, layout); }
+            unsafe {
+                std::alloc::dealloc(ptr, layout);
+            }
         }
         for &(ptr, layout) in &self.permanent {
-            unsafe { std::alloc::dealloc(ptr, layout); }
+            unsafe {
+                std::alloc::dealloc(ptr, layout);
+            }
         }
     }
 }
@@ -150,7 +219,10 @@ fn arena_str(s: &str) -> BlissVal {
 
 // ── Stream tracking for file I/O ─────────────────────────────────
 #[derive(Clone, Debug)]
-enum StreamDirection { Input, Output }
+enum StreamDirection {
+    Input,
+    Output,
+}
 
 #[derive(Clone, Debug)]
 struct StreamState {
@@ -171,26 +243,43 @@ fn open_stream(path: &str, direction: StreamDirection) -> Result<BlissVal, Bliss
         StreamDirection::Input => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| BlissError::FileError(format!("cannot open {}: {}", path, e)))?;
-            StreamState { content, position: 0, direction, path: path.to_string(), buffer: String::new() }
+            StreamState {
+                content,
+                position: 0,
+                direction,
+                path: path.to_string(),
+                buffer: String::new(),
+            }
         }
-        StreamDirection::Output => {
-            StreamState { content: String::new(), position: 0, direction, path: path.to_string(), buffer: String::new() }
-        }
+        StreamDirection::Output => StreamState {
+            content: String::new(),
+            position: 0,
+            direction,
+            path: path.to_string(),
+            buffer: String::new(),
+        },
     };
-    let id = NEXT_STREAM_ID.with(|c| { let v = *c.borrow(); *c.borrow_mut() = v + 1; v });
+    let id = NEXT_STREAM_ID.with(|c| {
+        let v = *c.borrow();
+        *c.borrow_mut() = v + 1;
+        v
+    });
     STREAMS.with(|s| s.borrow_mut().insert(id, state));
     // Represent stream as a tagged fixnum with high bit set to distinguish from regular fixnums
     Ok(BlissVal::from_fixnum(-(id as i64)))
 }
 
 fn close_stream(stream_val: BlissVal) -> Result<(), BlissError> {
-    if !stream_val.is_fixnum() { return Ok(()); }
+    if !stream_val.is_fixnum() {
+        return Ok(());
+    }
     let id = (-stream_val.as_fixnum()) as u64;
     STREAMS.with(|s| {
         if let Some(state) = s.borrow_mut().remove(&id) {
             if matches!(state.direction, StreamDirection::Output) {
-                std::fs::write(&state.path, &state.buffer)
-                    .map_err(|e| BlissError::FileError(format!("cannot write {}: {}", state.path, e)))?;
+                std::fs::write(&state.path, &state.buffer).map_err(|e| {
+                    BlissError::FileError(format!("cannot write {}: {}", state.path, e))
+                })?;
             }
             Ok(())
         } else {
@@ -456,22 +545,35 @@ impl Env {
 
 // ── BlissVal printer ──────────────────────────────────────────────
 fn print_val(val: BlissVal, out: &mut String) {
-    if val.is_nil() { out.push_str("NIL"); }
-    else if val == T { out.push('T'); }
-    else if val == EOF { out.push_str("#<EOF>"); }
-    else if val.is_fixnum() { out.push_str(&val.as_fixnum().to_string()); }
-    else if val.is_single_float() {
+    if val.is_nil() {
+        out.push_str("NIL");
+    } else if val == T {
+        out.push('T');
+    } else if val == EOF {
+        out.push_str("#<EOF>");
+    } else if val.is_fixnum() {
+        out.push_str(&val.as_fixnum().to_string());
+    } else if val.is_single_float() {
         let s = format!("{}", val.as_single_float());
         out.push_str(&s);
-        if !s.contains('.') && !s.contains('e') { out.push_str(".0"); }
+        if !s.contains('.') && !s.contains('e') {
+            out.push_str(".0");
+        }
     } else if val.is_character() {
         out.push_str("#\\");
-        match val.as_char() { ' '=>out.push_str("Space"), '\n'=>out.push_str("Newline"),
-            '\t'=>out.push_str("Tab"), '\r'=>out.push_str("Return"), c=>out.push(c) }
+        match val.as_char() {
+            ' ' => out.push_str("Space"),
+            '\n' => out.push_str("Newline"),
+            '\t' => out.push_str("Tab"),
+            '\r' => out.push_str("Return"),
+            c => out.push(c),
+        }
     } else if val.is_symbol() {
         out.push_str(&sym_name(val));
     } else if val.is_cons() {
-        out.push('('); print_list_body(val, out); out.push(')');
+        out.push('(');
+        print_list_body(val, out);
+        out.push(')');
     } else if val.is_heap_object() {
         unsafe {
             let ptr = val.as_ptr();
@@ -482,45 +584,81 @@ fn print_val(val: BlissVal, out: &mut String) {
                     let data = std::slice::from_raw_parts(ptr.add(16), len);
                     if let Ok(s) = std::str::from_utf8(data) {
                         out.push('"');
-                        for c in s.chars() { if c=='"'||c=='\\' { out.push('\\'); } out.push(c); }
+                        for c in s.chars() {
+                            if c == '"' || c == '\\' {
+                                out.push('\\');
+                            }
+                            out.push(c);
+                        }
                         out.push('"');
-                    } else { out.push_str("#<string>"); }
+                    } else {
+                        out.push_str("#<string>");
+                    }
                 }
                 type_id::SIMPLE_VECTOR => {
                     let len = *(ptr.add(8) as *const u64) as usize;
                     out.push_str("#(");
-                    for i in 0..len { if i>0 { out.push(' '); }
-                        print_val(*(ptr.add(16+i*8) as *const BlissVal), out); }
+                    for i in 0..len {
+                        if i > 0 {
+                            out.push(' ');
+                        }
+                        print_val(*(ptr.add(16 + i * 8) as *const BlissVal), out);
+                    }
                     out.push(')');
                 }
                 _ => out.push_str(&format!("#<heap-object type={}>", hdr.type_id())),
             }
         }
-    } else { out.push_str(&format!("#<unknown {:#x}>", val.0)); }
+    } else {
+        out.push_str(&format!("#<unknown {:#x}>", val.0));
+    }
 }
 
 fn print_list_body(val: BlissVal, out: &mut String) {
-    let mut cur = val; let mut first = true;
+    let mut cur = val;
+    let mut first = true;
     while cur.is_cons() {
-        if !first { out.push(' '); } first = false;
-        unsafe { let c = cur.as_ptr() as *const ConsCell;
-            print_val((*c).car, out); cur = (*c).cdr; }
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        unsafe {
+            let c = cur.as_ptr() as *const ConsCell;
+            print_val((*c).car, out);
+            cur = (*c).cdr;
+        }
     }
-    if !cur.is_nil() { out.push_str(" . "); print_val(cur, out); }
+    if !cur.is_nil() {
+        out.push_str(" . ");
+        print_val(cur, out);
+    }
 }
 
-fn format_val(val: BlissVal) -> String { let mut s = String::new(); print_val(val, &mut s); s }
+fn format_val(val: BlissVal) -> String {
+    let mut s = String::new();
+    print_val(val, &mut s);
+    s
+}
 
 fn princ_val(val: BlissVal, out: &mut String) {
-    if val.is_heap_object() { unsafe {
-        let ptr = val.as_ptr(); let hdr = *(ptr as *const ObjectHeader);
-        if hdr.type_id() == type_id::SIMPLE_BASE_STRING {
-            let len = *(ptr.add(8) as *const u64) as usize;
-            let data = std::slice::from_raw_parts(ptr.add(16), len);
-            if let Ok(s) = std::str::from_utf8(data) { out.push_str(s); return; }
+    if val.is_heap_object() {
+        unsafe {
+            let ptr = val.as_ptr();
+            let hdr = *(ptr as *const ObjectHeader);
+            if hdr.type_id() == type_id::SIMPLE_BASE_STRING {
+                let len = *(ptr.add(8) as *const u64) as usize;
+                let data = std::slice::from_raw_parts(ptr.add(16), len);
+                if let Ok(s) = std::str::from_utf8(data) {
+                    out.push_str(s);
+                    return;
+                }
+            }
         }
-    }}
-    if val.is_character() { out.push(val.as_char()); return; }
+    }
+    if val.is_character() {
+        out.push(val.as_char());
+        return;
+    }
     if val.is_symbol() {
         let name = sym_name(val);
         // For ~A, print symbol name without package prefix
@@ -533,9 +671,15 @@ fn princ_val(val: BlissVal, out: &mut String) {
 
 // ── Symbol name lookup ────────────────────────────────────────────
 fn sym_name(val: BlissVal) -> String {
-    if val.is_nil() { return "NIL".into(); }
-    if val == T { return "T".into(); }
-    if !val.is_symbol() { return String::new(); }
+    if val.is_nil() {
+        return "NIL".into();
+    }
+    if val == T {
+        return "T".into();
+    }
+    if !val.is_symbol() {
+        return String::new();
+    }
     let idx = val.as_symbol_index();
     // Use the reader's reverse symbol table for O(1) lookup
     if let Some(name) = reader::symbol_name(idx) {
@@ -646,7 +790,11 @@ thread_local! {
 }
 
 fn next_closure_id() -> u64 {
-    NEXT_CLOSURE_ID.with(|c| { let v = *c.borrow(); *c.borrow_mut() = v + 1; v })
+    NEXT_CLOSURE_ID.with(|c| {
+        let v = *c.borrow();
+        *c.borrow_mut() = v + 1;
+        v
+    })
 }
 
 fn register_declared_packages(source: &str) {
@@ -677,7 +825,10 @@ fn register_declared_packages(source: &str) {
                 let op = read_scan_token(&chars, &mut pos);
                 if op.eq_ignore_ascii_case("DEFPACKAGE") {
                     let pkg = read_scan_token(&chars, &mut pos);
-                    let pkg = pkg.trim_start_matches(':').trim_start_matches("KEYWORD:").trim();
+                    let pkg = pkg
+                        .trim_start_matches(':')
+                        .trim_start_matches("KEYWORD:")
+                        .trim();
                     if !pkg.is_empty() {
                         reader::register_package(&pkg.to_uppercase());
                     }
@@ -710,13 +861,20 @@ fn read_scan_token(chars: &[char], pos: &mut usize) -> String {
 fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     register_declared_packages(source);
     let chars: Vec<char> = source.chars().collect();
-    let mut pos = 0; let mut last = NIL;
+    let mut pos = 0;
+    let mut last = NIL;
     loop {
-        while pos < chars.len() && chars[pos].is_ascii_whitespace() { pos += 1; }
-        if pos >= chars.len() { break; }
+        while pos < chars.len() && chars[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= chars.len() {
+            break;
+        }
         let remaining: String = chars[pos..].iter().collect();
         let (val, consumed) = reader::read_from_string(&remaining)?;
-        if val == EOF { break; }
+        if val == EOF {
+            break;
+        }
         last = eval_form(val, env)?;
         pos += consumed;
     }
@@ -730,27 +888,46 @@ fn read_eval_all(source: &str) -> Result<BlissVal, BlissError> {
 }
 
 fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    if form.is_nil() || form == T { return Ok(form); }
-    if form.is_fixnum() || form.is_single_float() || form.is_character() { return Ok(form); }
-    if form.is_heap_object() { unsafe {
-        let hdr = *(form.as_ptr() as *const ObjectHeader);
-        if hdr.type_id() == type_id::SIMPLE_BASE_STRING { return Ok(form); }
-    }}
+    if form.is_nil() || form == T {
+        return Ok(form);
+    }
+    if form.is_fixnum() || form.is_single_float() || form.is_character() {
+        return Ok(form);
+    }
+    if form.is_heap_object() {
+        unsafe {
+            let hdr = *(form.as_ptr() as *const ObjectHeader);
+            if hdr.type_id() == type_id::SIMPLE_BASE_STRING {
+                return Ok(form);
+            }
+        }
+    }
     if form.is_symbol() {
         let name = sym_name(form);
         // Keyword symbols are self-evaluating
-        if name.starts_with("KEYWORD:") { return Ok(form); }
+        if name.starts_with("KEYWORD:") {
+            return Ok(form);
+        }
         // Check variable environment
-        if let Some(val) = env.lookup_var(&name) { return Ok(val); }
+        if let Some(val) = env.lookup_var(&name) {
+            return Ok(val);
+        }
         return Err(BlissError::UnboundVariable(form));
     }
-    if form.is_cons() { return eval_list(form, env); }
+    if form.is_cons() {
+        return eval_list(form, env);
+    }
     Ok(form)
 }
 
 fn cp(val: BlissVal) -> (BlissVal, BlissVal) {
-    if !val.is_cons() { return (NIL, NIL); }
-    unsafe { let c = val.as_ptr() as *const ConsCell; ((*c).car, (*c).cdr) }
+    if !val.is_cons() {
+        return (NIL, NIL);
+    }
+    unsafe {
+        let c = val.as_ptr() as *const ConsCell;
+        ((*c).car, (*c).cdr)
+    }
 }
 
 fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -765,17 +942,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
 
         match name.as_str() {
-            "QUOTE" => { let (q, _) = cp(cdr); return Ok(q); }
+            "QUOTE" => {
+                let (q, _) = cp(cdr);
+                return Ok(q);
+            }
             "BLISS::QUASIQUOTE" => {
                 let (template, _) = cp(cdr);
                 return eval_quasiquote(template, env);
             }
             "IF" => {
-                let (test, r) = cp(cdr); let tv = eval_form(test, env)?;
+                let (test, r) = cp(cdr);
+                let tv = eval_form(test, env)?;
                 let (then, er) = cp(r);
-                return if !tv.is_nil() { eval_form(then, env) }
-                       else if er.is_cons() { let (ef, _) = cp(er); eval_form(ef, env) }
-                       else { Ok(NIL) };
+                return if !tv.is_nil() {
+                    eval_form(then, env)
+                } else if er.is_cons() {
+                    let (ef, _) = cp(er);
+                    eval_form(ef, env)
+                } else {
+                    Ok(NIL)
+                };
             }
             "PROGN" => return eval_progn(cdr, env),
             "BLOCK" => {
@@ -789,132 +975,232 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return eval_form(val_form, env);
             }
             "PRINT" => {
-                let (a, _) = cp(cdr); let v = eval_form(a, env)?;
-                println!("\n{}", format_val(v)); return Ok(v);
+                let (a, _) = cp(cdr);
+                let v = eval_form(a, env)?;
+                println!("\n{}", format_val(v));
+                return Ok(v);
             }
             "PRINC" => {
-                let (a, _) = cp(cdr); let v = eval_form(a, env)?;
+                let (a, _) = cp(cdr);
+                let v = eval_form(a, env)?;
                 let mut s = String::new();
                 princ_val(v, &mut s);
                 print!("{}", s);
                 return Ok(v);
             }
-            "TERPRI" => { println!(); return Ok(NIL); }
-            "FRESH-LINE" => { println!(); return Ok(T); }
-            "+" => return eval_arith(cdr, env, 0, |a,b| a+b, 0.0, |a,b| a+b),
+            "TERPRI" => {
+                println!();
+                return Ok(NIL);
+            }
+            "FRESH-LINE" => {
+                println!();
+                return Ok(T);
+            }
+            "+" => return eval_arith(cdr, env, 0, |a, b| a + b, 0.0, |a, b| a + b),
             "-" => return eval_arith_sub(cdr, env),
-            "*" => return eval_arith(cdr, env, 1, |a,b| a*b, 1.0, |a,b| a*b),
+            "*" => return eval_arith(cdr, env, 1, |a, b| a * b, 1.0, |a, b| a * b),
             "/" => return eval_arith_div(cdr, env),
             "CONS" => {
-                let (af, r) = cp(cdr); let (bf, _) = cp(r);
-                let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
                 return Ok(arena_cons(a, b));
             }
             "LIST" => {
-                let mut elems = Vec::new(); let mut c = cdr;
-                while c.is_cons() { let (ef, r) = cp(c); elems.push(eval_form(ef, env)?); c = r; }
+                let mut elems = Vec::new();
+                let mut c = cdr;
+                while c.is_cons() {
+                    let (ef, r) = cp(c);
+                    elems.push(eval_form(ef, env)?);
+                    c = r;
+                }
                 return Ok(vec_to_list(&elems));
             }
             "CAR" | "FIRST" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
-                if v.is_nil() { return Ok(NIL); }
-                if v.is_cons() { let (a, _) = cp(v); return Ok(a); }
-                return Err(BlissError::TypeError { datum: v, expected: "list".into() });
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if v.is_nil() {
+                    return Ok(NIL);
+                }
+                if v.is_cons() {
+                    let (a, _) = cp(v);
+                    return Ok(a);
+                }
+                return Err(BlissError::TypeError {
+                    datum: v,
+                    expected: "list".into(),
+                });
             }
             "CDR" | "REST" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
-                if v.is_nil() { return Ok(NIL); }
-                if v.is_cons() { let (_, d) = cp(v); return Ok(d); }
-                return Err(BlissError::TypeError { datum: v, expected: "list".into() });
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if v.is_nil() {
+                    return Ok(NIL);
+                }
+                if v.is_cons() {
+                    let (_, d) = cp(v);
+                    return Ok(d);
+                }
+                return Err(BlissError::TypeError {
+                    datum: v,
+                    expected: "list".into(),
+                });
             }
             "SECOND" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
-                if v.is_nil() { return Ok(NIL); }
-                if v.is_cons() { let (_, d) = cp(v); if d.is_cons() { let (a, _) = cp(d); return Ok(a); } }
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if v.is_nil() {
+                    return Ok(NIL);
+                }
+                if v.is_cons() {
+                    let (_, d) = cp(v);
+                    if d.is_cons() {
+                        let (a, _) = cp(d);
+                        return Ok(a);
+                    }
+                }
                 return Ok(NIL);
             }
             "THIRD" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
-                if v.is_nil() { return Ok(NIL); }
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if v.is_nil() {
+                    return Ok(NIL);
+                }
                 let elems = list_to_vec(v);
                 return Ok(if elems.len() >= 3 { elems[2] } else { NIL });
             }
             "ATOM" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
                 return Ok(if v.is_cons() { NIL } else { T });
             }
             "NULL" | "NOT" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
                 return Ok(if v.is_nil() { T } else { NIL });
             }
             "CONSP" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
                 return Ok(if v.is_cons() { T } else { NIL });
             }
             "LISTP" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
                 return Ok(if v.is_list() { T } else { NIL });
             }
             "NUMBERP" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
-                return Ok(if v.is_fixnum() || v.is_single_float() { T } else { NIL });
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                return Ok(if v.is_fixnum() || v.is_single_float() {
+                    T
+                } else {
+                    NIL
+                });
             }
             "STRINGP" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
                 return Ok(if v.is_string() { T } else { NIL });
             }
             "SYMBOLP" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
                 return Ok(if v.is_symbol() { T } else { NIL });
             }
             "EQ" | "EQL" => {
-                let (af, r) = cp(cdr); let (bf, _) = cp(r);
-                let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
                 return Ok(if a == b { T } else { NIL });
             }
             "EQUAL" | "EQUALP" => {
-                let (af, r) = cp(cdr); let (bf, _) = cp(r);
-                let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
                 return Ok(if vals_equal(a, b) { T } else { NIL });
             }
             "=" => {
-                let (af, r) = cp(cdr); let (bf, _) = cp(r);
-                let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
-                let av = num_val(a)?; let bv = num_val(b)?;
-                return Ok(if (av - bv).abs() < f64::EPSILON { T } else { NIL });
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
+                let av = num_val(a)?;
+                let bv = num_val(b)?;
+                return Ok(if (av - bv).abs() < f64::EPSILON {
+                    T
+                } else {
+                    NIL
+                });
             }
-            "<" => { return eval_cmp(cdr, env, |a, b| a < b); }
-            ">" => { return eval_cmp(cdr, env, |a, b| a > b); }
-            "<=" => { return eval_cmp(cdr, env, |a, b| a <= b); }
-            ">=" => { return eval_cmp(cdr, env, |a, b| a >= b); }
+            "<" => {
+                return eval_cmp(cdr, env, |a, b| a < b);
+            }
+            ">" => {
+                return eval_cmp(cdr, env, |a, b| a > b);
+            }
+            "<=" => {
+                return eval_cmp(cdr, env, |a, b| a <= b);
+            }
+            ">=" => {
+                return eval_cmp(cdr, env, |a, b| a >= b);
+            }
             "/=" => {
-                let (af, r) = cp(cdr); let (bf, _) = cp(r);
-                let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
-                let av = num_val(a)?; let bv = num_val(b)?;
-                return Ok(if (av - bv).abs() >= f64::EPSILON { T } else { NIL });
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
+                let av = num_val(a)?;
+                let bv = num_val(b)?;
+                return Ok(if (av - bv).abs() >= f64::EPSILON {
+                    T
+                } else {
+                    NIL
+                });
             }
             "AND" => {
-                let mut result = T; let mut c = cdr;
-                while c.is_cons() { let (f, r) = cp(c); result = eval_form(f, env)?;
-                    if result.is_nil() { return Ok(NIL); } c = r; }
+                let mut result = T;
+                let mut c = cdr;
+                while c.is_cons() {
+                    let (f, r) = cp(c);
+                    result = eval_form(f, env)?;
+                    if result.is_nil() {
+                        return Ok(NIL);
+                    }
+                    c = r;
+                }
                 return Ok(result);
             }
             "OR" => {
                 let mut c = cdr;
-                while c.is_cons() { let (f, r) = cp(c); let v = eval_form(f, env)?;
-                    if !v.is_nil() { return Ok(v); } c = r; }
+                while c.is_cons() {
+                    let (f, r) = cp(c);
+                    let v = eval_form(f, env)?;
+                    if !v.is_nil() {
+                        return Ok(v);
+                    }
+                    c = r;
+                }
                 return Ok(NIL);
             }
             "WHEN" => {
                 let (test, body) = cp(cdr);
                 let tv = eval_form(test, env)?;
-                if !tv.is_nil() { return eval_progn(body, env); }
+                if !tv.is_nil() {
+                    return eval_progn(body, env);
+                }
                 return Ok(NIL);
             }
             "UNLESS" => {
                 let (test, body) = cp(cdr);
                 let tv = eval_form(test, env)?;
-                if tv.is_nil() { return eval_progn(body, env); }
+                if tv.is_nil() {
+                    return eval_progn(body, env);
+                }
                 return Ok(NIL);
             }
             "COND" => {
@@ -924,7 +1210,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (test, body) = cp(clause);
                     let tv = eval_form(test, env)?;
                     if !tv.is_nil() {
-                        if body.is_nil() { return Ok(tv); }
+                        if body.is_nil() {
+                            return Ok(tv);
+                        }
                         return eval_progn(body, env);
                     }
                     c = rest;
@@ -932,22 +1220,33 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(NIL);
             }
             "VALUES" => {
-                let mut vals = Vec::new(); let mut c = cdr;
-                while c.is_cons() { let (af, r) = cp(c); vals.push(eval_form(af, env)?); c = r; }
-                if vals.is_empty() { return Ok(NIL); }
+                let mut vals = Vec::new();
+                let mut c = cdr;
+                while c.is_cons() {
+                    let (af, r) = cp(c);
+                    vals.push(eval_form(af, env)?);
+                    c = r;
+                }
+                if vals.is_empty() {
+                    return Ok(NIL);
+                }
                 env.mv = vals.clone();
-                for v in &vals[1..] { println!("{}", format_val(*v)); }
+                for v in &vals[1..] {
+                    println!("{}", format_val(*v));
+                }
                 return Ok(vals[0]);
             }
             "FORMAT" => return eval_format(cdr, env),
             "ERROR" => {
-                let (mf, _) = cp(cdr); let m = eval_form(mf, env)?;
+                let (mf, _) = cp(cdr);
+                let m = eval_form(mf, env)?;
                 return Err(BlissError::Internal(format!("ERROR: {}", val_as_str(m))));
             }
             "LET" => return eval_let(cdr, env, false),
             "LET*" => return eval_let(cdr, env, true),
             "SETQ" => {
-                let mut c = cdr; let mut result = NIL;
+                let mut c = cdr;
+                let mut result = NIL;
                 while c.is_cons() {
                     let (sym_form, r) = cp(c);
                     let (val_form, r2) = cp(r);
@@ -1012,7 +1311,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let fn_val = eval_form(fn_form, env)?;
                 let mut args = Vec::new();
                 let mut c = args_form;
-                while c.is_cons() { let (af, r) = cp(c); args.push(eval_form(af, env)?); c = r; }
+                while c.is_cons() {
+                    let (af, r) = cp(c);
+                    args.push(eval_form(af, env)?);
+                    c = r;
+                }
                 return apply_function(fn_val, &args, env);
             }
             "APPLY" => {
@@ -1033,8 +1336,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return apply_function(fn_val, &args, env);
             }
             "LENGTH" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
-                if v.is_nil() { return Ok(BlissVal::from_fixnum(0)); }
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if v.is_nil() {
+                    return Ok(BlissVal::from_fixnum(0));
+                }
                 if v.is_cons() {
                     let elems = list_to_vec(v);
                     return Ok(BlissVal::from_fixnum(elems.len() as i64));
@@ -1048,23 +1354,30 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "APPEND" => {
                 let mut all = Vec::new();
                 let items = list_to_vec(cdr);
-                if items.is_empty() { return Ok(NIL); }
+                if items.is_empty() {
+                    return Ok(NIL);
+                }
                 for (i, item_form) in items.iter().enumerate() {
                     let v = eval_form(*item_form, env)?;
-                    if i == items.len() - 1 && v.is_nil() { continue; }
+                    if i == items.len() - 1 && v.is_nil() {
+                        continue;
+                    }
                     all.extend(list_to_vec(v));
                 }
                 return Ok(vec_to_list(&all));
             }
             "REVERSE" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
                 let mut elems = list_to_vec(v);
                 elems.reverse();
                 return Ok(vec_to_list(&elems));
             }
             "NTH" => {
-                let (nf, r) = cp(cdr); let (lf, _) = cp(r);
-                let n = eval_form(nf, env)?; let l = eval_form(lf, env)?;
+                let (nf, r) = cp(cdr);
+                let (lf, _) = cp(r);
+                let n = eval_form(nf, env)?;
+                let l = eval_form(lf, env)?;
                 let idx = num_val(n)? as usize;
                 let elems = list_to_vec(l);
                 return Ok(if idx < elems.len() { elems[idx] } else { NIL });
@@ -1082,19 +1395,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(vec_to_list(&results));
             }
             "MEMBER" => {
-                let (item_f, r) = cp(cdr); let (list_f, _) = cp(r);
+                let (item_f, r) = cp(cdr);
+                let (list_f, _) = cp(r);
                 let item = eval_form(item_f, env)?;
                 let list = eval_form(list_f, env)?;
                 let mut c = list;
                 while c.is_cons() {
                     let (car, cdr_val) = cp(c);
-                    if vals_equal(car, item) { return Ok(c); }
+                    if vals_equal(car, item) {
+                        return Ok(c);
+                    }
                     c = cdr_val;
                 }
                 return Ok(NIL);
             }
             "ASSOC" => {
-                let (key_f, r) = cp(cdr); let (alist_f, _) = cp(r);
+                let (key_f, r) = cp(cdr);
+                let (alist_f, _) = cp(r);
                 let key = eval_form(key_f, env)?;
                 let alist = eval_form(alist_f, env)?;
                 let mut c = alist;
@@ -1102,7 +1419,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (pair, rest) = cp(c);
                     if pair.is_cons() {
                         let (k, _) = cp(pair);
-                        if vals_equal(k, key) { return Ok(pair); }
+                        if vals_equal(k, key) {
+                            return Ok(pair);
+                        }
                     }
                     c = rest;
                 }
@@ -1123,22 +1442,36 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(arena_str(&result));
             }
             "STRING" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
                 return Ok(arena_str(&val_as_str(v)));
             }
             "WRITE-TO-STRING" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
                 return Ok(arena_str(&format_val(v)));
             }
             "ABS" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
-                if v.is_fixnum() { return Ok(BlissVal::from_fixnum(v.as_fixnum().abs())); }
-                if v.is_single_float() { return Ok(BlissVal::from_single_float(v.as_single_float().abs())); }
-                return Err(BlissError::TypeError { datum: v, expected: "number".into() });
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if v.is_fixnum() {
+                    return Ok(BlissVal::from_fixnum(v.as_fixnum().abs()));
+                }
+                if v.is_single_float() {
+                    return Ok(BlissVal::from_single_float(v.as_single_float().abs()));
+                }
+                return Err(BlissError::TypeError {
+                    datum: v,
+                    expected: "number".into(),
+                });
             }
             "MIN" => {
                 let args = eval_args(cdr, env)?;
-                if args.is_empty() { return Err(BlissError::Internal("MIN requires at least one argument".into())); }
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "MIN requires at least one argument".into(),
+                    ));
+                }
                 let mut min = num_val(args[0])?;
                 let mut is_f = args[0].is_single_float();
                 for a in &args[1..] {
@@ -1151,11 +1484,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         is_f = true;
                     }
                 }
-                return Ok(if is_f { BlissVal::from_single_float(min as f32) } else { BlissVal::from_fixnum(min as i64) });
+                return Ok(if is_f {
+                    BlissVal::from_single_float(min as f32)
+                } else {
+                    BlissVal::from_fixnum(min as i64)
+                });
             }
             "MAX" => {
                 let args = eval_args(cdr, env)?;
-                if args.is_empty() { return Err(BlissError::Internal("MAX requires at least one argument".into())); }
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "MAX requires at least one argument".into(),
+                    ));
+                }
                 let mut max = num_val(args[0])?;
                 let mut is_f = args[0].is_single_float();
                 for a in &args[1..] {
@@ -1168,14 +1509,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         is_f = true;
                     }
                 }
-                return Ok(if is_f { BlissVal::from_single_float(max as f32) } else { BlissVal::from_fixnum(max as i64) });
+                return Ok(if is_f {
+                    BlissVal::from_single_float(max as f32)
+                } else {
+                    BlissVal::from_fixnum(max as i64)
+                });
             }
             "FLOOR" => return eval_floor(cdr, env),
             "MOD" | "REM" => {
-                let (af, r) = cp(cdr); let (bf, _) = cp(r);
-                let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
-                let av = num_val(a)? as i64; let bv = num_val(b)? as i64;
-                if bv == 0 { return Err(BlissError::ArithmeticError("division by zero".into())); }
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
+                let av = num_val(a)? as i64;
+                let bv = num_val(b)? as i64;
+                if bv == 0 {
+                    return Err(BlissError::ArithmeticError("division by zero".into()));
+                }
                 return Ok(BlissVal::from_fixnum(av % bv));
             }
             "TRUNCATE" => {
@@ -1186,10 +1536,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (bf, _) = cp(r);
                     let b = eval_form(bf, env)?;
                     let bv = num_val(b)?;
-                    if bv == 0.0 { return Err(BlissError::ArithmeticError("division by zero".into())); }
+                    if bv == 0.0 {
+                        return Err(BlissError::ArithmeticError("division by zero".into()));
+                    }
                     let q = (av / bv).trunc() as i64;
                     let rem = av - (q as f64) * bv;
-                    env.mv = vec![BlissVal::from_fixnum(q), BlissVal::from_single_float(rem as f32)];
+                    env.mv = vec![
+                        BlissVal::from_fixnum(q),
+                        BlissVal::from_single_float(rem as f32),
+                    ];
                     return Ok(BlissVal::from_fixnum(q));
                 }
                 return Ok(BlissVal::from_fixnum(av as i64));
@@ -1202,10 +1557,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (bf, _) = cp(r);
                     let b = eval_form(bf, env)?;
                     let bv = num_val(b)?;
-                    if bv == 0.0 { return Err(BlissError::ArithmeticError("division by zero".into())); }
+                    if bv == 0.0 {
+                        return Err(BlissError::ArithmeticError("division by zero".into()));
+                    }
                     let q = (av / bv).ceil() as i64;
                     let rem = av - (q as f64) * bv;
-                    env.mv = vec![BlissVal::from_fixnum(q), BlissVal::from_single_float(rem as f32)];
+                    env.mv = vec![
+                        BlissVal::from_fixnum(q),
+                        BlissVal::from_single_float(rem as f32),
+                    ];
                     return Ok(BlissVal::from_fixnum(q));
                 }
                 return Ok(BlissVal::from_fixnum(av.ceil() as i64));
@@ -1218,18 +1578,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (bf, _) = cp(r);
                     let b = eval_form(bf, env)?;
                     let bv = num_val(b)?;
-                    if bv == 0.0 { return Err(BlissError::ArithmeticError("division by zero".into())); }
+                    if bv == 0.0 {
+                        return Err(BlissError::ArithmeticError("division by zero".into()));
+                    }
                     let q = (av / bv).round() as i64;
                     let rem = av - (q as f64) * bv;
-                    env.mv = vec![BlissVal::from_fixnum(q), BlissVal::from_single_float(rem as f32)];
+                    env.mv = vec![
+                        BlissVal::from_fixnum(q),
+                        BlissVal::from_single_float(rem as f32),
+                    ];
                     return Ok(BlissVal::from_fixnum(q));
                 }
                 return Ok(BlissVal::from_fixnum(av.round() as i64));
             }
             "EXPT" => {
-                let (af, r) = cp(cdr); let (bf, _) = cp(r);
-                let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
-                let av = num_val(a)?; let bv = num_val(b)?;
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
+                let av = num_val(a)?;
+                let bv = num_val(b)?;
                 let result = av.powf(bv);
                 if a.is_fixnum() && b.is_fixnum() && bv >= 0.0 {
                     return Ok(BlissVal::from_fixnum(result as i64));
@@ -1237,7 +1605,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(BlissVal::from_single_float(result as f32));
             }
             "SQRT" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
                 let nv = num_val(v)?;
                 return Ok(BlissVal::from_single_float(nv.sqrt() as f32));
             }
@@ -1246,7 +1615,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "HANDLER-BIND" => return eval_handler_bind(cdr, env),
             "SIGNAL" => {
                 let args = list_to_vec(cdr);
-                if args.is_empty() { return Err(BlissError::Internal("SIGNAL requires an argument".into())); }
+                if args.is_empty() {
+                    return Err(BlissError::Internal("SIGNAL requires an argument".into()));
+                }
                 let cond = eval_form(args[0], env)?;
                 // Determine condition type name
                 let cond_type = if cond.is_cons() {
@@ -1263,7 +1634,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if handler.type_name == cond_type
                         || handler.type_name == "CONDITION"
                         || handler.type_name == "ERROR"
-                        || handler.type_name == "T" {
+                        || handler.type_name == "T"
+                    {
                         let hfn = handler.handler;
                         let _ = apply_function(hfn, &[cond], env);
                     }
@@ -1273,7 +1645,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "MAKE-CONDITION" => {
                 // (make-condition 'type :slot1 val1 :slot2 val2 ...)
                 let args = list_to_vec(cdr);
-                if args.is_empty() { return Err(BlissError::Internal("MAKE-CONDITION requires a type".into())); }
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "MAKE-CONDITION requires a type".into(),
+                    ));
+                }
                 let type_val = eval_form(args[0], env)?;
                 let type_name = val_as_str(type_val);
                 // Build condition object as (TYPE-NAME (slot . val) ...)
@@ -1305,10 +1681,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         }
                         // Otherwise (e.g., CONTINUE restart from cerror), just return NIL
                         // Signal the restart was invoked via a special error
-                        return Err(BlissError::Internal(format!("__RESTART_INVOKED__:{}", restart_name)));
+                        return Err(BlissError::Internal(format!(
+                            "__RESTART_INVOKED__:{}",
+                            restart_name
+                        )));
                     }
                 }
-                return Err(BlissError::Internal(format!("Restart {} not found", restart_name)));
+                return Err(BlissError::Internal(format!(
+                    "Restart {} not found",
+                    restart_name
+                )));
             }
             "WITH-OPEN-FILE" => return eval_with_open_file(cdr, env),
             "READ-LINE" => {
@@ -1329,7 +1711,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     // Read from stdin
                     let mut line = String::new();
-                    std::io::stdin().read_line(&mut line)
+                    std::io::stdin()
+                        .read_line(&mut line)
                         .map_err(|e| BlissError::StreamError(format!("read-line: {}", e)))?;
                     let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
                     return Ok(arena_str(trimmed));
@@ -1337,7 +1720,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "WRITE-STRING" => {
                 let args = list_to_vec(cdr);
-                if args.is_empty() { return Err(BlissError::Internal("WRITE-STRING requires an argument".into())); }
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "WRITE-STRING requires an argument".into(),
+                    ));
+                }
                 let string = eval_form(args[0], env)?;
                 let s = val_as_str(string);
                 if args.len() > 1 {
@@ -1359,7 +1746,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 for (name, fdef) in env.funs.iter() {
                     let params_str = fdef.params.join(" ");
                     let body_str = format_body_forms(fdef.body);
-                    image_data.push_str(&format!("(defun {} ({}) {})\n", name, params_str, body_str));
+                    image_data
+                        .push_str(&format!("(defun {} ({}) {})\n", name, params_str, body_str));
                 }
                 std::fs::write(&path, &image_data)
                     .map_err(|e| BlissError::FileError(format!("save-image: {}", e)))?;
@@ -1369,7 +1757,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "IN-PACKAGE" => {
                 let (pkg_form, _) = cp(cdr);
                 let pkg_val = eval_form(pkg_form, env)?;
-                let pkg_name = val_as_str(pkg_val).trim_start_matches("KEYWORD:").trim_start_matches(':').to_uppercase();
+                let pkg_name = val_as_str(pkg_val)
+                    .trim_start_matches("KEYWORD:")
+                    .trim_start_matches(':')
+                    .to_uppercase();
                 env.current_package = pkg_name;
                 return Ok(T);
             }
@@ -1384,7 +1775,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "GENSYM" => {
                 thread_local! { static COUNTER: RefCell<u64> = const { RefCell::new(0) }; }
-                let n = COUNTER.with(|c| { let v = *c.borrow(); *c.borrow_mut() = v + 1; v });
+                let n = COUNTER.with(|c| {
+                    let v = *c.borrow();
+                    *c.borrow_mut() = v + 1;
+                    v
+                });
                 let name = format!("G{}", n);
                 match resolve_sym(&name) {
                     Some(sym) => return Ok(sym),
@@ -1430,31 +1825,60 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(NIL);
             }
             "STRING=" => {
-                let (af, r) = cp(cdr); let (bf, _) = cp(r);
-                let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
-                return Ok(if val_as_str(a) == val_as_str(b) { T } else { NIL });
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
+                return Ok(if val_as_str(a) == val_as_str(b) {
+                    T
+                } else {
+                    NIL
+                });
             }
             "STRING<" => {
-                let (af, r) = cp(cdr); let (bf, _) = cp(r);
-                let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
-                return Ok(if val_as_str(a) < val_as_str(b) { T } else { NIL });
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
+                return Ok(if val_as_str(a) < val_as_str(b) {
+                    T
+                } else {
+                    NIL
+                });
             }
             "STRING>" => {
-                let (af, r) = cp(cdr); let (bf, _) = cp(r);
-                let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
-                return Ok(if val_as_str(a) > val_as_str(b) { T } else { NIL });
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
+                return Ok(if val_as_str(a) > val_as_str(b) {
+                    T
+                } else {
+                    NIL
+                });
             }
             "TYPE-OF" => {
-                let (af, _) = cp(cdr); let v = eval_form(af, env)?;
-                let type_name = if v.is_nil() { "NULL" }
-                    else if v == T { "BOOLEAN" }
-                    else if v.is_fixnum() { "FIXNUM" }
-                    else if v.is_single_float() { "SINGLE-FLOAT" }
-                    else if v.is_character() { "CHARACTER" }
-                    else if v.is_symbol() { "SYMBOL" }
-                    else if v.is_cons() { "CONS" }
-                    else if v.is_string() { "SIMPLE-BASE-STRING" }
-                    else { "T" };
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                let type_name = if v.is_nil() {
+                    "NULL"
+                } else if v == T {
+                    "BOOLEAN"
+                } else if v.is_fixnum() {
+                    "FIXNUM"
+                } else if v.is_single_float() {
+                    "SINGLE-FLOAT"
+                } else if v.is_character() {
+                    "CHARACTER"
+                } else if v.is_symbol() {
+                    "SYMBOL"
+                } else if v.is_cons() {
+                    "CONS"
+                } else if v.is_string() {
+                    "SIMPLE-BASE-STRING"
+                } else {
+                    "T"
+                };
                 match resolve_sym(type_name) {
                     Some(sym) => return Ok(sym),
                     None => return Ok(arena_str(type_name)),
@@ -1467,7 +1891,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         if let Some(fdef) = env.funs.get(&name).cloned() {
             let mut args = Vec::new();
             let mut c = cdr;
-            while c.is_cons() { let (af, r) = cp(c); args.push(eval_form(af, env)?); c = r; }
+            while c.is_cons() {
+                let (af, r) = cp(c);
+                args.push(eval_form(af, env)?);
+                c = r;
+            }
             let mut child_env = env.child();
             for (i, param) in fdef.params.iter().enumerate() {
                 child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
@@ -1503,7 +1931,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         if let Some(methods) = env.methods.get(&name).cloned() {
             let mut args = Vec::new();
             let mut c = cdr;
-            while c.is_cons() { let (af, r) = cp(c); args.push(eval_form(af, env)?); c = r; }
+            while c.is_cons() {
+                let (af, r) = cp(c);
+                args.push(eval_form(af, env)?);
+                c = r;
+            }
 
             // Find most specific method by checking specializer
             let mut best_method: Option<&MethodDef> = None;
@@ -1513,7 +1945,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     break;
                 }
                 let arg_class = get_instance_class_name(args[0]);
-                if method.specializer == arg_class || is_subclass(&arg_class, &method.specializer, env) {
+                if method.specializer == arg_class
+                    || is_subclass(&arg_class, &method.specializer, env)
+                {
                     // Prefer more specific (exact match over superclass)
                     if best_method.is_none() || method.specializer == arg_class {
                         best_method = Some(method);
@@ -1529,7 +1963,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return eval_progn(m.body, &mut child_env);
             }
-            return Err(BlissError::Internal(format!("No applicable method for {}", name)));
+            return Err(BlissError::Internal(format!(
+                "No applicable method for {}",
+                name
+            )));
         }
 
         // Check for package-qualified symbols (e.g., TEST-PKG:HELLO)
@@ -1541,7 +1978,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if let Some(fdef) = env.funs.get(fn_name).cloned() {
                     let mut args = Vec::new();
                     let mut c = cdr;
-                    while c.is_cons() { let (af, r) = cp(c); args.push(eval_form(af, env)?); c = r; }
+                    while c.is_cons() {
+                        let (af, r) = cp(c);
+                        args.push(eval_form(af, env)?);
+                        c = r;
+                    }
                     let mut child_env = env.child();
                     for (i, param) in fdef.params.iter().enumerate() {
                         child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
@@ -1560,7 +2001,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             let params = extract_params(params_form);
             let mut args = Vec::new();
             let mut c = cdr;
-            while c.is_cons() { let (af, r) = cp(c); args.push(eval_form(af, env)?); c = r; }
+            while c.is_cons() {
+                let (af, r) = cp(c);
+                args.push(eval_form(af, env)?);
+                c = r;
+            }
             let mut child_env = env.child();
             for (i, param) in params.iter().enumerate() {
                 child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
@@ -1573,20 +2018,38 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 }
 
 fn eval_progn(forms: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let mut r = NIL; let mut c = forms;
-    while c.is_cons() { let (f, rest) = cp(c); r = eval_form(f, env)?; c = rest; }
+    let mut r = NIL;
+    let mut c = forms;
+    while c.is_cons() {
+        let (f, rest) = cp(c);
+        r = eval_form(f, env)?;
+        c = rest;
+    }
     Ok(r)
 }
 
 // ── Arithmetic helpers (issue #6 fix: proper float arithmetic) ────
 fn num_val(v: BlissVal) -> Result<f64, BlissError> {
-    if v.is_fixnum() { Ok(v.as_fixnum() as f64) }
-    else if v.is_single_float() { Ok(v.as_single_float() as f64) }
-    else { Err(BlissError::TypeError { datum: v, expected: "number".into() }) }
+    if v.is_fixnum() {
+        Ok(v.as_fixnum() as f64)
+    } else if v.is_single_float() {
+        Ok(v.as_single_float() as f64)
+    } else {
+        Err(BlissError::TypeError {
+            datum: v,
+            expected: "number".into(),
+        })
+    }
 }
 
-fn eval_arith(args: BlissVal, env: &mut Env, init_i: i64, op_i: fn(i64,i64)->i64,
-              init_f: f64, op_f: fn(f64,f64)->f64) -> Result<BlissVal, BlissError> {
+fn eval_arith(
+    args: BlissVal,
+    env: &mut Env,
+    init_i: i64,
+    op_i: fn(i64, i64) -> i64,
+    init_f: f64,
+    op_f: fn(f64, f64) -> f64,
+) -> Result<BlissVal, BlissError> {
     let mut acc_i = init_i;
     let mut acc_f = init_f;
     let mut is_float = false;
@@ -1607,54 +2070,103 @@ fn eval_arith(args: BlissVal, env: &mut Env, init_i: i64, op_i: fn(i64,i64)->i64
             }
             acc_f = op_f(acc_f, v.as_single_float() as f64);
         } else {
-            return Err(BlissError::TypeError { datum: v, expected: "number".into() });
+            return Err(BlissError::TypeError {
+                datum: v,
+                expected: "number".into(),
+            });
         }
         c = r;
     }
-    Ok(if is_float { BlissVal::from_single_float(acc_f as f32) } else { BlissVal::from_fixnum(acc_i) })
+    Ok(if is_float {
+        BlissVal::from_single_float(acc_f as f32)
+    } else {
+        BlissVal::from_fixnum(acc_i)
+    })
 }
 
 fn eval_arith_sub(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let mut vals = Vec::new(); let mut c = args;
-    while c.is_cons() { let (af, r) = cp(c); vals.push(eval_form(af, env)?); c = r; }
-    if vals.is_empty() { return Ok(BlissVal::from_fixnum(0)); }
+    let mut vals = Vec::new();
+    let mut c = args;
+    while c.is_cons() {
+        let (af, r) = cp(c);
+        vals.push(eval_form(af, env)?);
+        c = r;
+    }
+    if vals.is_empty() {
+        return Ok(BlissVal::from_fixnum(0));
+    }
     if vals.len() == 1 {
-        return Ok(if vals[0].is_fixnum() { BlissVal::from_fixnum(-vals[0].as_fixnum()) }
-                  else { BlissVal::from_single_float(-vals[0].as_single_float()) });
+        return Ok(if vals[0].is_fixnum() {
+            BlissVal::from_fixnum(-vals[0].as_fixnum())
+        } else {
+            BlissVal::from_single_float(-vals[0].as_single_float())
+        });
     }
     let mut is_float = vals[0].is_single_float();
     let mut acc_f = num_val(vals[0])?;
-    let mut acc_i = if vals[0].is_fixnum() { vals[0].as_fixnum() } else { 0 };
+    let mut acc_i = if vals[0].is_fixnum() {
+        vals[0].as_fixnum()
+    } else {
+        0
+    };
     for v in &vals[1..] {
         if v.is_single_float() {
-            if !is_float { is_float = true; acc_f = acc_i as f64; }
+            if !is_float {
+                is_float = true;
+                acc_f = acc_i as f64;
+            }
             acc_f -= v.as_single_float() as f64;
         } else if v.is_fixnum() {
-            if is_float { acc_f -= v.as_fixnum() as f64; }
-            else { acc_i -= v.as_fixnum(); }
+            if is_float {
+                acc_f -= v.as_fixnum() as f64;
+            } else {
+                acc_i -= v.as_fixnum();
+            }
         } else {
-            return Err(BlissError::TypeError { datum: *v, expected: "number".into() });
+            return Err(BlissError::TypeError {
+                datum: *v,
+                expected: "number".into(),
+            });
         }
     }
-    Ok(if is_float { BlissVal::from_single_float(acc_f as f32) } else { BlissVal::from_fixnum(acc_i) })
+    Ok(if is_float {
+        BlissVal::from_single_float(acc_f as f32)
+    } else {
+        BlissVal::from_fixnum(acc_i)
+    })
 }
 
 fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let mut vals = Vec::new(); let mut c = args;
-    while c.is_cons() { let (af, r) = cp(c); vals.push(eval_form(af, env)?); c = r; }
-    if vals.is_empty() { return Err(BlissError::ArithmeticError("/ requires at least one argument".into())); }
+    let mut vals = Vec::new();
+    let mut c = args;
+    while c.is_cons() {
+        let (af, r) = cp(c);
+        vals.push(eval_form(af, env)?);
+        c = r;
+    }
+    if vals.is_empty() {
+        return Err(BlissError::ArithmeticError(
+            "/ requires at least one argument".into(),
+        ));
+    }
     if vals.len() == 1 {
         let v = num_val(vals[0])?;
-        if v == 0.0 { return Err(BlissError::ArithmeticError("division by zero".into())); }
+        if v == 0.0 {
+            return Err(BlissError::ArithmeticError("division by zero".into()));
+        }
         return Ok(BlissVal::from_single_float((1.0 / v) as f32));
     }
     let mut acc = num_val(vals[0])?;
     let mut is_float = vals[0].is_single_float();
     for v in &vals[1..] {
         let dv = num_val(*v)?;
-        if dv == 0.0 { return Err(BlissError::ArithmeticError("division by zero".into())); }
+        if dv == 0.0 {
+            return Err(BlissError::ArithmeticError("division by zero".into()));
+        }
         acc /= dv;
-        if v.is_single_float() { is_float = true; }
+        if v.is_single_float() {
+            is_float = true;
+        }
     }
     // If result is exact integer and both args were fixnums, return fixnum
     if !is_float && acc == (acc as i64) as f64 {
@@ -1664,17 +2176,28 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     }
 }
 
-fn eval_cmp(args: BlissVal, env: &mut Env, cmp: fn(f64, f64) -> bool) -> Result<BlissVal, BlissError> {
-    let (af, r) = cp(args); let (bf, _) = cp(r);
-    let a = eval_form(af, env)?; let b = eval_form(bf, env)?;
-    let av = num_val(a)?; let bv = num_val(b)?;
+fn eval_cmp(
+    args: BlissVal,
+    env: &mut Env,
+    cmp: fn(f64, f64) -> bool,
+) -> Result<BlissVal, BlissError> {
+    let (af, r) = cp(args);
+    let (bf, _) = cp(r);
+    let a = eval_form(af, env)?;
+    let b = eval_form(bf, env)?;
+    let av = num_val(a)?;
+    let bv = num_val(b)?;
     Ok(if cmp(av, bv) { T } else { NIL })
 }
 
 fn eval_args(args: BlissVal, env: &mut Env) -> Result<Vec<BlissVal>, BlissError> {
     let mut result = Vec::new();
     let mut c = args;
-    while c.is_cons() { let (af, r) = cp(c); result.push(eval_form(af, env)?); c = r; }
+    while c.is_cons() {
+        let (af, r) = cp(c);
+        result.push(eval_form(af, env)?);
+        c = r;
+    }
     Ok(result)
 }
 
@@ -1763,7 +2286,14 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         c = rest_p;
     }
 
-    Rc::make_mut(&mut env.macros).insert(name.clone(), MacroDef { params, rest_param, body });
+    Rc::make_mut(&mut env.macros).insert(
+        name.clone(),
+        MacroDef {
+            params,
+            rest_param,
+            body,
+        },
+    );
     Ok(name_form)
 }
 
@@ -1824,20 +2354,35 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             let mut i = 0;
             while i < opts.len() {
                 let opt_name = sym_name(opts[i]);
-                let opt_bare = opt_name.trim_start_matches("KEYWORD:").trim_start_matches(':');
+                let opt_bare = opt_name
+                    .trim_start_matches("KEYWORD:")
+                    .trim_start_matches(':');
                 if opt_bare == "INITARG" {
                     if i + 1 < opts.len() {
                         let ia = sym_name(opts[i + 1]);
-                        initarg = Some(ia.trim_start_matches("KEYWORD:").trim_start_matches(':').to_string());
+                        initarg = Some(
+                            ia.trim_start_matches("KEYWORD:")
+                                .trim_start_matches(':')
+                                .to_string(),
+                        );
                         i += 2;
-                    } else { i += 1; }
+                    } else {
+                        i += 1;
+                    }
                 } else if opt_bare == "ACCESSOR" {
                     if i + 1 < opts.len() {
                         accessor = Some(sym_name(opts[i + 1]));
                         i += 2;
-                    } else { i += 1; }
-                } else if opt_bare == "INITFORM" || opt_bare == "READER" || opt_bare == "WRITER"
-                         || opt_bare == "ALLOCATION" || opt_bare == "TYPE" || opt_bare == "DOCUMENTATION" {
+                    } else {
+                        i += 1;
+                    }
+                } else if opt_bare == "INITFORM"
+                    || opt_bare == "READER"
+                    || opt_bare == "WRITER"
+                    || opt_bare == "ALLOCATION"
+                    || opt_bare == "TYPE"
+                    || opt_bare == "DOCUMENTATION"
+                {
                     // Skip known slot option with value
                     i += 2;
                 } else {
@@ -1845,13 +2390,28 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
             }
 
-            slots.push(SlotDef { name: slot_name, initarg, accessor });
+            slots.push(SlotDef {
+                name: slot_name,
+                initarg,
+                accessor,
+            });
         } else if slot_form.is_symbol() {
-            slots.push(SlotDef { name: sym_name(*slot_form), initarg: None, accessor: None });
+            slots.push(SlotDef {
+                name: sym_name(*slot_form),
+                initarg: None,
+                accessor: None,
+            });
         }
     }
 
-    Rc::make_mut(&mut env.classes).insert(name.clone(), ClassDef { name: name.clone(), supers, slots });
+    Rc::make_mut(&mut env.classes).insert(
+        name.clone(),
+        ClassDef {
+            name: name.clone(),
+            supers,
+            slots,
+        },
+    );
     Ok(name_form)
 }
 
@@ -1877,8 +2437,14 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         }
     }
 
-    Rc::make_mut(&mut env.methods).entry(name.clone()).or_default()
-        .push(MethodDef { specializer, params, body });
+    Rc::make_mut(&mut env.methods)
+        .entry(name.clone())
+        .or_default()
+        .push(MethodDef {
+            specializer,
+            params,
+            body,
+        });
     Ok(name_form)
 }
 
@@ -1888,7 +2454,10 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     let class_val = eval_form(class_form, env)?;
     let class_name = sym_name(class_val);
 
-    let class_def = env.classes.get(&class_name).cloned()
+    let class_def = env
+        .classes
+        .get(&class_name)
+        .cloned()
         .ok_or_else(|| BlissError::Internal(format!("Unknown class: {}", class_name)))?;
 
     // Parse keyword init args
@@ -1897,7 +2466,10 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     let mut i = 0;
     while i + 1 < args_vec.len() {
         let key_val = eval_form(args_vec[i], env)?;
-        let key_name = sym_name(key_val).trim_start_matches("KEYWORD:").trim_start_matches(':').to_string();
+        let key_name = sym_name(key_val)
+            .trim_start_matches("KEYWORD:")
+            .trim_start_matches(':')
+            .to_string();
         let val = eval_form(args_vec[i + 1], env)?;
         init_map.insert(key_name, val);
         i += 2;
@@ -1947,17 +2519,25 @@ fn get_instance_slots(val: BlissVal) -> Vec<(String, BlissVal)> {
 }
 
 fn is_subclass(child: &str, parent: &str, env: &Env) -> bool {
-    if child == parent { return true; }
+    if child == parent {
+        return true;
+    }
     if let Some(class_def) = env.classes.get(child) {
         for super_name in &class_def.supers {
-            if is_subclass(super_name, parent, env) { return true; }
+            if is_subclass(super_name, parent, env) {
+                return true;
+            }
         }
     }
     false
 }
 
 // ── Apply function (lambda or named) ─────────────────────────────
-fn apply_function(fn_val: BlissVal, args: &[BlissVal], env: &mut Env) -> Result<BlissVal, BlissError> {
+fn apply_function(
+    fn_val: BlissVal,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
     // Function could be a lambda form, a symbol naming a function, or a closure
     if fn_val.is_symbol() {
         let name = sym_name(fn_val);
@@ -2005,41 +2585,103 @@ fn apply_function(fn_val: BlissVal, args: &[BlissVal], env: &mut Env) -> Result<
 fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissVal, BlissError> {
     match name {
         "+" => {
-            let mut sum: f64 = 0.0; let mut is_f = false;
-            for a in args { let v = num_val(*a)?; sum += v; if a.is_single_float() { is_f = true; } }
-            Ok(if is_f { BlissVal::from_single_float(sum as f32) } else { BlissVal::from_fixnum(sum as i64) })
+            let mut sum: f64 = 0.0;
+            let mut is_f = false;
+            for a in args {
+                let v = num_val(*a)?;
+                sum += v;
+                if a.is_single_float() {
+                    is_f = true;
+                }
+            }
+            Ok(if is_f {
+                BlissVal::from_single_float(sum as f32)
+            } else {
+                BlissVal::from_fixnum(sum as i64)
+            })
         }
         "-" => {
-            if args.is_empty() { return Ok(BlissVal::from_fixnum(0)); }
-            if args.len() == 1 { let v = num_val(args[0])?; return Ok(BlissVal::from_fixnum((-v) as i64)); }
-            let mut acc = num_val(args[0])?; let mut is_f = args[0].is_single_float();
-            for a in &args[1..] { acc -= num_val(*a)?; if a.is_single_float() { is_f = true; } }
-            Ok(if is_f { BlissVal::from_single_float(acc as f32) } else { BlissVal::from_fixnum(acc as i64) })
+            if args.is_empty() {
+                return Ok(BlissVal::from_fixnum(0));
+            }
+            if args.len() == 1 {
+                let v = num_val(args[0])?;
+                return Ok(BlissVal::from_fixnum((-v) as i64));
+            }
+            let mut acc = num_val(args[0])?;
+            let mut is_f = args[0].is_single_float();
+            for a in &args[1..] {
+                acc -= num_val(*a)?;
+                if a.is_single_float() {
+                    is_f = true;
+                }
+            }
+            Ok(if is_f {
+                BlissVal::from_single_float(acc as f32)
+            } else {
+                BlissVal::from_fixnum(acc as i64)
+            })
         }
         "*" => {
-            let mut prod: f64 = 1.0; let mut is_f = false;
-            for a in args { let v = num_val(*a)?; prod *= v; if a.is_single_float() { is_f = true; } }
-            Ok(if is_f { BlissVal::from_single_float(prod as f32) } else { BlissVal::from_fixnum(prod as i64) })
+            let mut prod: f64 = 1.0;
+            let mut is_f = false;
+            for a in args {
+                let v = num_val(*a)?;
+                prod *= v;
+                if a.is_single_float() {
+                    is_f = true;
+                }
+            }
+            Ok(if is_f {
+                BlissVal::from_single_float(prod as f32)
+            } else {
+                BlissVal::from_fixnum(prod as i64)
+            })
         }
         "CONS" => {
-            if args.len() >= 2 { Ok(arena_cons(args[0], args[1])) }
-            else { Err(BlissError::Internal("CONS requires 2 arguments".into())) }
+            if args.len() >= 2 {
+                Ok(arena_cons(args[0], args[1]))
+            } else {
+                Err(BlissError::Internal("CONS requires 2 arguments".into()))
+            }
         }
         "CAR" | "FIRST" => {
-            if args.is_empty() { return Ok(NIL); }
+            if args.is_empty() {
+                return Ok(NIL);
+            }
             let v = args[0];
-            if v.is_nil() { return Ok(NIL); }
-            if v.is_cons() { let (a, _) = cp(v); return Ok(a); }
-            Err(BlissError::TypeError { datum: v, expected: "list".into() })
+            if v.is_nil() {
+                return Ok(NIL);
+            }
+            if v.is_cons() {
+                let (a, _) = cp(v);
+                return Ok(a);
+            }
+            Err(BlissError::TypeError {
+                datum: v,
+                expected: "list".into(),
+            })
         }
         "CDR" | "REST" => {
-            if args.is_empty() { return Ok(NIL); }
+            if args.is_empty() {
+                return Ok(NIL);
+            }
             let v = args[0];
-            if v.is_nil() { return Ok(NIL); }
-            if v.is_cons() { let (_, d) = cp(v); return Ok(d); }
-            Err(BlissError::TypeError { datum: v, expected: "list".into() })
+            if v.is_nil() {
+                return Ok(NIL);
+            }
+            if v.is_cons() {
+                let (_, d) = cp(v);
+                return Ok(d);
+            }
+            Err(BlissError::TypeError {
+                datum: v,
+                expected: "list".into(),
+            })
         }
-        _ => Err(BlissError::UndefinedFunction(resolve_sym(name).unwrap_or(NIL))),
+        _ => Err(BlissError::UndefinedFunction(
+            resolve_sym(name).unwrap_or(NIL),
+        )),
     }
 }
 
@@ -2052,7 +2694,9 @@ fn eval_floor(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         let (bf, _) = cp(r);
         let b = eval_form(bf, env)?;
         let bv = num_val(b)?;
-        if bv == 0.0 { return Err(BlissError::ArithmeticError("division by zero".into())); }
+        if bv == 0.0 {
+            return Err(BlissError::ArithmeticError("division by zero".into()));
+        }
         let q = (av / bv).floor() as i64;
         let rem = av - (q as f64) * bv;
         env.mv = vec![BlissVal::from_fixnum(q), BlissVal::from_fixnum(rem as i64)];
@@ -2060,7 +2704,10 @@ fn eval_floor(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     }
     let q = av.floor() as i64;
     let rem = av - q as f64;
-    env.mv = vec![BlissVal::from_fixnum(q), BlissVal::from_single_float(rem as f32)];
+    env.mv = vec![
+        BlissVal::from_fixnum(q),
+        BlissVal::from_single_float(rem as f32),
+    ];
     Ok(BlissVal::from_fixnum(q))
 }
 
@@ -2074,7 +2721,10 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
     let mv = env.mv.clone();
 
     // Bind variables
-    let var_names: Vec<String> = list_to_vec(vars_form).iter().map(|v| sym_name(*v)).collect();
+    let var_names: Vec<String> = list_to_vec(vars_form)
+        .iter()
+        .map(|v| sym_name(*v))
+        .collect();
     let mut child_env = env.child();
 
     for (i, var_name) in var_names.iter().enumerate() {
@@ -2163,11 +2813,17 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let msg = eval_form(msg_form, env)?;
 
     // Install a CONTINUE restart
-    env.restarts.push(RestartEntry { name: "CONTINUE".to_string(), body: None });
+    env.restarts.push(RestartEntry {
+        name: "CONTINUE".to_string(),
+        body: None,
+    });
 
     // Check if there's a handler that will invoke the restart
     for handler in env.handlers.clone().iter().rev() {
-        if handler.type_name == "ERROR" || handler.type_name == "CONDITION" || handler.type_name == "T" {
+        if handler.type_name == "ERROR"
+            || handler.type_name == "CONDITION"
+            || handler.type_name == "T"
+        {
             let hfn = handler.handler;
             let cond = arena_str(&val_as_str(msg));
             match apply_function(hfn, &[cond], env) {
@@ -2207,7 +2863,10 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
 
     // Check sandbox mode
     if env.sandbox {
-        return Err(BlissError::SandboxViolation(format!("File access denied in sandbox mode: {}", path)));
+        return Err(BlissError::SandboxViolation(format!(
+            "File access denied in sandbox mode: {}",
+            path
+        )));
     }
 
     // Parse options
@@ -2216,14 +2875,20 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
     let mut i = 0;
     while i < opts.len() {
         let opt_name = sym_name(opts[i]);
-        let opt_bare = opt_name.trim_start_matches("KEYWORD:").trim_start_matches(':');
+        let opt_bare = opt_name
+            .trim_start_matches("KEYWORD:")
+            .trim_start_matches(':');
         if opt_bare == "DIRECTION" {
             if i + 1 < opts.len() {
                 let dir = sym_name(opts[i + 1]);
                 let dir_bare = dir.trim_start_matches("KEYWORD:").trim_start_matches(':');
-                if dir_bare == "OUTPUT" { direction = StreamDirection::Output; }
+                if dir_bare == "OUTPUT" {
+                    direction = StreamDirection::Output;
+                }
                 i += 2;
-            } else { i += 1; }
+            } else {
+                i += 1;
+            }
         } else {
             i += 1;
         }
@@ -2245,7 +2910,10 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
 fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, opts) = cp(cdr);
     let name_val = eval_form(name_form, env)?;
-    let pkg_name = val_as_str(name_val).trim_start_matches("KEYWORD:").trim_start_matches(':').to_uppercase();
+    let pkg_name = val_as_str(name_val)
+        .trim_start_matches("KEYWORD:")
+        .trim_start_matches(':')
+        .to_uppercase();
 
     let mut exports = Vec::new();
     let mut uses = Vec::new();
@@ -2256,19 +2924,31 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         if opt.is_cons() {
             let (key, val_list) = cp(opt);
             let key_name = sym_name(key);
-            let key_bare = key_name.trim_start_matches("KEYWORD:").trim_start_matches(':');
+            let key_bare = key_name
+                .trim_start_matches("KEYWORD:")
+                .trim_start_matches(':');
             if key_bare == "USE" {
                 let mut vc = val_list;
                 while vc.is_cons() {
                     let (v, vr) = cp(vc);
-                    uses.push(sym_name(v).trim_start_matches("KEYWORD:").trim_start_matches(':').to_uppercase());
+                    uses.push(
+                        sym_name(v)
+                            .trim_start_matches("KEYWORD:")
+                            .trim_start_matches(':')
+                            .to_uppercase(),
+                    );
                     vc = vr;
                 }
             } else if key_bare == "EXPORT" {
                 let mut vc = val_list;
                 while vc.is_cons() {
                     let (v, vr) = cp(vc);
-                    exports.push(sym_name(v).trim_start_matches("KEYWORD:").trim_start_matches(':').to_uppercase());
+                    exports.push(
+                        sym_name(v)
+                            .trim_start_matches("KEYWORD:")
+                            .trim_start_matches(':')
+                            .to_uppercase(),
+                    );
                     vc = vr;
                 }
             }
@@ -2276,12 +2956,15 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         c = rest;
     }
 
-    Rc::make_mut(&mut env.packages).insert(pkg_name.clone(), PackageDef {
-        name: pkg_name.clone(),
-        exports,
-        uses,
-        symbols: HashMap::new(),
-    });
+    Rc::make_mut(&mut env.packages).insert(
+        pkg_name.clone(),
+        PackageDef {
+            name: pkg_name.clone(),
+            exports,
+            uses,
+            symbols: HashMap::new(),
+        },
+    );
     reader::register_package(&pkg_name);
 
     Ok(T)
@@ -2289,38 +2972,77 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
 
 // ── FORMAT ───────────────────────────────────────────────────────
 fn eval_format(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (df, r) = cp(args); let dest = eval_form(df, env)?;
-    let (ff, fa) = cp(r); let fv = eval_form(ff, env)?;
+    let (df, r) = cp(args);
+    let dest = eval_form(df, env)?;
+    let (ff, fa) = cp(r);
+    let fv = eval_form(ff, env)?;
     let fs = val_as_str(fv);
-    let mut av = Vec::new(); let mut c = fa;
-    while c.is_cons() { let (af, r2) = cp(c); av.push(eval_form(af, env)?); c = r2; }
+    let mut av = Vec::new();
+    let mut c = fa;
+    while c.is_cons() {
+        let (af, r2) = cp(c);
+        av.push(eval_form(af, env)?);
+        c = r2;
+    }
     let mut result = String::new();
     let fc: Vec<char> = fs.chars().collect();
     let (mut i, mut ai) = (0, 0);
     while i < fc.len() {
-        if fc[i] == '~' && i+1 < fc.len() {
-            match fc[i+1] {
-                'A'|'a' => { if ai<av.len() { princ_val(av[ai], &mut result); ai+=1; } i+=2; }
-                'D'|'d'|'S'|'s' => { if ai<av.len() { result.push_str(&format_val(av[ai])); ai+=1; } i+=2; }
-                '~' => { result.push('~'); i+=2; }
-                '%' => { result.push('\n'); i+=2; }
-                _ => { result.push(fc[i]); i+=1; }
+        if fc[i] == '~' && i + 1 < fc.len() {
+            match fc[i + 1] {
+                'A' | 'a' => {
+                    if ai < av.len() {
+                        princ_val(av[ai], &mut result);
+                        ai += 1;
+                    }
+                    i += 2;
+                }
+                'D' | 'd' | 'S' | 's' => {
+                    if ai < av.len() {
+                        result.push_str(&format_val(av[ai]));
+                        ai += 1;
+                    }
+                    i += 2;
+                }
+                '~' => {
+                    result.push('~');
+                    i += 2;
+                }
+                '%' => {
+                    result.push('\n');
+                    i += 2;
+                }
+                _ => {
+                    result.push(fc[i]);
+                    i += 1;
+                }
             }
-        } else { result.push(fc[i]); i+=1; }
+        } else {
+            result.push(fc[i]);
+            i += 1;
+        }
     }
-    if dest == T { print!("{}", result); return Ok(NIL); }
+    if dest == T {
+        print!("{}", result);
+        return Ok(NIL);
+    }
     Ok(arena_str(&result))
 }
 
 fn val_as_str(val: BlissVal) -> String {
-    if val.is_heap_object() { unsafe {
-        let p = val.as_ptr(); let h = *(p as *const ObjectHeader);
-        if h.type_id() == type_id::SIMPLE_BASE_STRING {
-            let len = *(p.add(8) as *const u64) as usize;
-            let data = std::slice::from_raw_parts(p.add(16), len);
-            if let Ok(s) = std::str::from_utf8(data) { return s.to_string(); }
+    if val.is_heap_object() {
+        unsafe {
+            let p = val.as_ptr();
+            let h = *(p as *const ObjectHeader);
+            if h.type_id() == type_id::SIMPLE_BASE_STRING {
+                let len = *(p.add(8) as *const u64) as usize;
+                let data = std::slice::from_raw_parts(p.add(16), len);
+                if let Ok(s) = std::str::from_utf8(data) {
+                    return s.to_string();
+                }
+            }
         }
-    }}
+    }
     if val.is_symbol() {
         let name = sym_name(val);
         // For symbols used as keyword args, strip package prefix
@@ -2330,10 +3052,18 @@ fn val_as_str(val: BlissVal) -> String {
 }
 
 fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
-    if a == b { return true; }
-    if a.is_fixnum() && b.is_fixnum() { return a.as_fixnum() == b.as_fixnum(); }
-    if a.is_single_float() && b.is_single_float() { return a.as_single_float() == b.as_single_float(); }
-    if a.is_string() && b.is_string() { return val_as_str(a) == val_as_str(b); }
+    if a == b {
+        return true;
+    }
+    if a.is_fixnum() && b.is_fixnum() {
+        return a.as_fixnum() == b.as_fixnum();
+    }
+    if a.is_single_float() && b.is_single_float() {
+        return a.as_single_float() == b.as_single_float();
+    }
+    if a.is_string() && b.is_string() {
+        return val_as_str(a) == val_as_str(b);
+    }
     if a.is_cons() && b.is_cons() {
         let (a_car, a_cdr) = cp(a);
         let (b_car, b_cdr) = cp(b);
@@ -2345,8 +3075,14 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
 // ── CLI driver ─────────────────────────────────────────────────────
 pub fn run(args: &[String]) -> Result<i32, BlissError> {
     let ca = CliArgs::parse(args)?;
-    if ca.help { print_help(); return Ok(0); }
-    if ca.version { print_version(); return Ok(0); }
+    if ca.help {
+        print_help();
+        return Ok(0);
+    }
+    if ca.version {
+        print_version();
+        return Ok(0);
+    }
 
     let mut env = Env::new(ca.sandbox);
 
@@ -2384,16 +3120,28 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         }
     }
 
-    if let Some(ref expr) = ca.eval { return run_eval_env(expr, &mut env); }
-    if let Some(ref path) = ca.load { return run_load_env(path, &mut env); }
-    if let Some(ref script) = ca.script { return run_script_env(script, &mut env); }
+    if let Some(ref expr) = ca.eval {
+        return run_eval_env(expr, &mut env);
+    }
+    if let Some(ref path) = ca.load {
+        return run_load_env(path, &mut env);
+    }
+    if let Some(ref script) = ca.script {
+        return run_script_env(script, &mut env);
+    }
     run_repl_env(&mut env)
 }
 
 fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, BlissError> {
     match read_eval_all_env(expr, env) {
-        Ok(result) => { println!("{}", format_val(result)); Ok(0) }
-        Err(e) => { eprintln!("ERROR: {}", e); Err(e) }
+        Ok(result) => {
+            println!("{}", format_val(result));
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("ERROR: {}", e);
+            Err(e)
+        }
     }
 }
 
@@ -2402,7 +3150,10 @@ fn run_load_env(path: &str, env: &mut Env) -> Result<i32, BlissError> {
         .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
     match read_eval_all_env(&contents, env) {
         Ok(_) => Ok(0),
-        Err(e) => { eprintln!("ERROR: {}", e); Err(e) }
+        Err(e) => {
+            eprintln!("ERROR: {}", e);
+            Err(e)
+        }
     }
 }
 
@@ -2411,7 +3162,10 @@ fn run_script_env(path: &str, env: &mut Env) -> Result<i32, BlissError> {
         .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
     match read_eval_all_env(&contents, env) {
         Ok(_) => Ok(0),
-        Err(e) => { eprintln!("ERROR: {}", e); Err(e) }
+        Err(e) => {
+            eprintln!("ERROR: {}", e);
+            Err(e)
+        }
     }
 }
 
@@ -2455,7 +3209,9 @@ pub fn print_help() {
     println!("Arguments after -- are passed through to CL as *command-line-args*.");
 }
 
-pub fn print_version() { println!("bliss {}", env!("CARGO_PKG_VERSION")); }
+pub fn print_version() {
+    println!("bliss {}", env!("CARGO_PKG_VERSION"));
+}
 
 // ── REPL driver ────────────────────────────────────────────────────
 pub fn run_repl() -> Result<i32, BlissError> {
@@ -2477,13 +3233,23 @@ fn run_repl_env(env: &mut Env) -> Result<i32, BlissError> {
         eprint!("{}", if in_debugger { "Debug> " } else { "BLISS> " });
         input.clear();
         match stdin.read_line(&mut input) {
-            Ok(0) => { println!(); return Ok(0); }
+            Ok(0) => {
+                println!();
+                return Ok(0);
+            }
             Ok(_) => {
                 let trimmed = input.trim();
-                if trimmed.is_empty() { continue; }
-                if trimmed == "(quit)" || trimmed == "(exit)" { return Ok(0); }
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed == "(quit)" || trimmed == "(exit)" {
+                    return Ok(0);
+                }
                 if in_debugger {
-                    if trimmed == ":abort" || trimmed == ":a" { in_debugger = false; continue; }
+                    if trimmed == ":abort" || trimmed == ":a" {
+                        in_debugger = false;
+                        continue;
+                    }
                     eprintln!("Unknown debugger command: {}", trimmed);
                     continue;
                 }
@@ -2513,10 +3279,16 @@ fn run_repl_env(env: &mut Env) -> Result<i32, BlissError> {
 
 #[derive(Clone, Debug)]
 pub struct ReplConfig {
-    pub history_file: String, pub history_size: usize, pub syntax_highlighting: bool,
+    pub history_file: String,
+    pub history_size: usize,
+    pub syntax_highlighting: bool,
 }
 impl Default for ReplConfig {
     fn default() -> Self {
-        Self { history_file: "~/.bliss/repl-history".into(), history_size: 1000, syntax_highlighting: true }
+        Self {
+            history_file: "~/.bliss/repl-history".into(),
+            history_size: 1000,
+            syntax_highlighting: true,
+        }
     }
 }

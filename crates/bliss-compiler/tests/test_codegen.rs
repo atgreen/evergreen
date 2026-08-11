@@ -43,7 +43,11 @@ fn code_buffer_new_is_empty() {
 
 #[test]
 fn relocation_fields_and_clone() {
-    let reloc = Relocation { offset: 42, kind: RelocKind::Abs64, target: 0xDEAD_BEEF };
+    let reloc = Relocation {
+        offset: 42,
+        kind: RelocKind::Abs64,
+        target: 0xDEAD_BEEF,
+    };
     assert_eq!(reloc.offset, 42);
     assert_eq!(reloc.kind, RelocKind::Abs64);
     let cloned = reloc.clone();
@@ -55,8 +59,11 @@ fn relocation_fields_and_clone() {
 #[test]
 fn reloc_kind_all_variants_distinct() {
     let variants = [
-        RelocKind::Abs64, RelocKind::PcRel32, RelocKind::GcRoot,
-        RelocKind::InlineCache, RelocKind::Safepoint,
+        RelocKind::Abs64,
+        RelocKind::PcRel32,
+        RelocKind::GcRoot,
+        RelocKind::InlineCache,
+        RelocKind::Safepoint,
     ];
     for i in 0..variants.len() {
         for j in (i + 1)..variants.len() {
@@ -69,7 +76,11 @@ fn reloc_kind_all_variants_distinct() {
 
 #[test]
 fn stack_map_fields_and_clone() {
-    let sm = StackMap { pc_offset: 16, ref_bitmap: vec![0xFF, 0x01], ref_registers: 0b1010 };
+    let sm = StackMap {
+        pc_offset: 16,
+        ref_bitmap: vec![0xFF, 0x01],
+        ref_registers: 0b1010,
+    };
     assert_eq!(sm.pc_offset, 16);
     assert_eq!(sm.ref_bitmap, vec![0xFF, 0x01]);
     let cloned = sm.clone();
@@ -92,8 +103,16 @@ fn x86_64_backend_emit_accepts_minimal_graph() {
     let mut graph = IrGraph::new();
     let s = graph.add_node(NodeKind::Start);
     let r = graph.add_node(NodeKind::Return);
-    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
-    assert!(backend.emit(&graph).is_ok(), "emit should succeed for a minimal valid Start->Return graph");
+    graph.add_edge(Edge {
+        from: s,
+        to: r,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
+    assert!(
+        backend.emit(&graph).is_ok(),
+        "emit should succeed for a minimal valid Start->Return graph"
+    );
 }
 
 #[test]
@@ -102,7 +121,10 @@ fn x86_64_backend_emit_rejects_empty_graph() {
     let mut backend = X86_64Backend::new();
     let graph = IrGraph::new();
     // An empty graph (zero nodes, no Start) is malformed; emit should reject it
-    assert!(backend.emit(&graph).is_err(), "emit should reject an empty graph with no nodes");
+    assert!(
+        backend.emit(&graph).is_err(),
+        "emit should reject an empty graph with no nodes"
+    );
 }
 
 // ── Aarch64Backend ────────────────────────────────────────────────
@@ -121,8 +143,16 @@ fn aarch64_backend_emit_accepts_minimal_graph() {
     let mut graph = IrGraph::new();
     let s = graph.add_node(NodeKind::Start);
     let r = graph.add_node(NodeKind::Return);
-    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
-    assert!(backend.emit(&graph).is_ok(), "emit should succeed for a minimal valid Start->Return graph");
+    graph.add_edge(Edge {
+        from: s,
+        to: r,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
+    assert!(
+        backend.emit(&graph).is_ok(),
+        "emit should succeed for a minimal valid Start->Return graph"
+    );
 }
 
 #[test]
@@ -131,7 +161,10 @@ fn aarch64_backend_emit_rejects_empty_graph() {
     let mut backend = Aarch64Backend::new();
     let graph = IrGraph::new();
     // An empty graph (zero nodes, no Start) is malformed; emit should reject it
-    assert!(backend.emit(&graph).is_err(), "emit should reject an empty graph with no nodes");
+    assert!(
+        backend.emit(&graph).is_err(),
+        "emit should reject an empty graph with no nodes"
+    );
 }
 
 // ── LinearScanAllocator ───────────────────────────────────────────
@@ -150,8 +183,16 @@ fn linear_scan_allocator_allocate_with_minimal_graph() {
     let mut graph = IrGraph::new();
     let s = graph.add_node(NodeKind::Start);
     let r = graph.add_node(NodeKind::Return);
-    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
-    assert!(alloc.allocate(&graph).is_ok(), "allocate should succeed for a minimal valid graph");
+    graph.add_edge(Edge {
+        from: s,
+        to: r,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
+    assert!(
+        alloc.allocate(&graph).is_ok(),
+        "allocate should succeed for a minimal valid graph"
+    );
 }
 
 #[test]
@@ -160,7 +201,10 @@ fn linear_scan_allocator_allocate_rejects_empty_graph() {
     let mut alloc = LinearScanAllocator::new(TargetArch::X86_64);
     let graph = IrGraph::new();
     // Register allocation on an empty graph (no nodes) should fail
-    assert!(alloc.allocate(&graph).is_err(), "allocate should reject an empty graph with no nodes");
+    assert!(
+        alloc.allocate(&graph).is_err(),
+        "allocate should reject an empty graph with no nodes"
+    );
 }
 
 // ── RegisterAllocation struct ────────────────────────────────────
@@ -174,7 +218,12 @@ fn register_allocation_can_be_stored_and_used() {
     let mut graph = IrGraph::new();
     let s = graph.add_node(NodeKind::Start);
     let r = graph.add_node(NodeKind::Return);
-    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+    graph.add_edge(Edge {
+        from: s,
+        to: r,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
     let reg_alloc: RegisterAllocation = alloc.allocate(&graph).unwrap();
     // Verify the RegisterAllocation value is usable: can be moved/stored
     let _stored = reg_alloc;
@@ -183,7 +232,12 @@ fn register_allocation_can_be_stored_and_used() {
     let mut graph2 = IrGraph::new();
     let s2 = graph2.add_node(NodeKind::Start);
     let r2 = graph2.add_node(NodeKind::Return);
-    graph2.add_edge(Edge { from: s2, to: r2, kind: EdgeKind::Control, input_index: 0 });
+    graph2.add_edge(Edge {
+        from: s2,
+        to: r2,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
     let _reg_alloc2: RegisterAllocation = alloc2.allocate(&graph2).unwrap();
 }
 
@@ -197,13 +251,23 @@ fn x86_64_emit_produces_nonempty_code_buffer() {
     let mut graph = IrGraph::new();
     let s = graph.add_node(NodeKind::Start);
     let r = graph.add_node(NodeKind::Return);
-    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+    graph.add_edge(Edge {
+        from: s,
+        to: r,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
 
-    let buf = backend.emit(&graph).expect("emit should succeed for minimal graph");
+    let buf = backend
+        .emit(&graph)
+        .expect("emit should succeed for minimal graph");
     // A compiled function (even trivial) should produce at least some machine code bytes.
     assert!(!buf.is_empty(), "emitted code buffer should not be empty");
-    assert_eq!(buf.code().len(), buf.len(),
-        "code() length should match len()");
+    assert_eq!(
+        buf.code().len(),
+        buf.len(),
+        "code() length should match len()"
+    );
 }
 
 #[test]
@@ -213,9 +277,16 @@ fn aarch64_emit_produces_nonempty_code_buffer() {
     let mut graph = IrGraph::new();
     let s = graph.add_node(NodeKind::Start);
     let r = graph.add_node(NodeKind::Return);
-    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+    graph.add_edge(Edge {
+        from: s,
+        to: r,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
 
-    let buf = backend.emit(&graph).expect("emit should succeed for minimal graph");
+    let buf = backend
+        .emit(&graph)
+        .expect("emit should succeed for minimal graph");
     assert!(!buf.is_empty(), "emitted code buffer should not be empty");
 }
 
@@ -228,13 +299,27 @@ fn emit_with_constant_produces_code() {
     let s = graph.add_node(NodeKind::Start);
     let c = graph.add_node(NodeKind::Constant(NIL));
     let r = graph.add_node(NodeKind::Return);
-    graph.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
-    graph.add_edge(Edge { from: c, to: r, kind: EdgeKind::Data, input_index: 1 });
+    graph.add_edge(Edge {
+        from: s,
+        to: r,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
+    graph.add_edge(Edge {
+        from: c,
+        to: r,
+        kind: EdgeKind::Data,
+        input_index: 1,
+    });
 
-    let buf = backend.emit(&graph).expect("emit with constant should succeed");
+    let buf = backend
+        .emit(&graph)
+        .expect("emit with constant should succeed");
     // Code that returns a constant should be non-empty.
-    assert!(!buf.is_empty(),
-        "code that loads and returns a constant should produce machine code");
+    assert!(
+        !buf.is_empty(),
+        "code that loads and returns a constant should produce machine code"
+    );
 }
 
 // ── patch_code ────────────────────────────────────────────────────
@@ -255,5 +340,8 @@ fn patch_code_with_valid_buffer() {
     let site = code.as_mut_ptr();
     // patch_code with a valid site and target should succeed.
     let result = unsafe { patch_code(site, target) };
-    assert!(result.is_ok(), "patch_code with valid pointers should succeed");
+    assert!(
+        result.is_ok(),
+        "patch_code with valid pointers should succeed"
+    );
 }

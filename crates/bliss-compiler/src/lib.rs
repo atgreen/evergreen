@@ -5,8 +5,8 @@
 //! → code emission → inline caches → profiling → OSR/deopt.
 
 // ── Front-end ─────────────────────────────────────────────────────
-pub mod reader;
 pub mod macroexpand;
+pub mod reader;
 
 // ── Intermediate representation ───────────────────────────────────
 pub mod ir;
@@ -34,6 +34,6 @@ pub mod error;
 
 // ── Re-exports for convenience ────────────────────────────────────
 pub use error::CompilerError;
-pub use reader::ReaderState;
 pub use ir::IrGraph;
-pub use tiered::{Tier, CompiledCode};
+pub use reader::ReaderState;
+pub use tiered::{CompiledCode, Tier};

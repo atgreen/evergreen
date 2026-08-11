@@ -11,12 +11,9 @@
 //! order-independent invariants (e.g. capacity > 0, regions > 0) rather
 //! than exact equality with a specific config.
 
-use bliss_rt::gc::{
-    init_heap, heap_stats, walk_heap, register_finalizer,
-    WeakPointer,
-};
-use bliss_rt::value::{BlissVal, TAG_HEAP_OBJECT};
+use bliss_rt::gc::{WeakPointer, heap_stats, init_heap, register_finalizer, walk_heap};
 use bliss_rt::runtime::{Runtime, RuntimeConfig};
+use bliss_rt::value::{BlissVal, TAG_HEAP_OBJECT};
 
 /// Helper: create a Runtime with a small heap for integration tests.
 fn make_test_runtime() -> Runtime {
@@ -48,9 +45,18 @@ fn runtime_init_initialises_gc_heap() {
     let _rt = make_test_runtime();
     let s = heap_stats();
     // Order-independent: after any Runtime::init, capacities must be positive.
-    assert!(s.nursery_capacity > 0, "runtime must initialise nursery capacity");
-    assert!(s.old_gen_capacity > 0, "runtime must initialise old-gen capacity");
-    assert!(s.regions_total > 0, "runtime must create at least one region");
+    assert!(
+        s.nursery_capacity > 0,
+        "runtime must initialise nursery capacity"
+    );
+    assert!(
+        s.old_gen_capacity > 0,
+        "runtime must initialise old-gen capacity"
+    );
+    assert!(
+        s.regions_total > 0,
+        "runtime must create at least one region"
+    );
 }
 
 #[test]
@@ -58,8 +64,10 @@ fn runtime_init_sets_positive_region_count() {
     let _rt = make_test_runtime();
     let s = heap_stats();
     // Invariant: regions_total should be at least 1 regardless of config.
-    assert!(s.regions_total >= 1,
-        "runtime must initialise at least 1 heap region");
+    assert!(
+        s.regions_total >= 1,
+        "runtime must initialise at least 1 heap region"
+    );
 }
 
 #[test]
@@ -67,8 +75,14 @@ fn heap_stats_fresh_runtime_zero_gc_counts() {
     // After init, no GC should have run yet.
     let _rt = make_test_runtime();
     let s = heap_stats();
-    assert_eq!(s.minor_gc_count, 0, "fresh runtime should have zero minor GC count");
-    assert_eq!(s.major_gc_count, 0, "fresh runtime should have zero major GC count");
+    assert_eq!(
+        s.minor_gc_count, 0,
+        "fresh runtime should have zero minor GC count"
+    );
+    assert_eq!(
+        s.major_gc_count, 0,
+        "fresh runtime should have zero major GC count"
+    );
     assert_eq!(s.total_minor_pause_us, 0);
     assert_eq!(s.total_major_pause_us, 0);
 }
@@ -77,8 +91,14 @@ fn heap_stats_fresh_runtime_zero_gc_counts() {
 fn heap_stats_fresh_runtime_zero_bytes() {
     let _rt = make_test_runtime();
     let s = heap_stats();
-    assert_eq!(s.bytes_allocated, 0, "fresh runtime should have zero bytes allocated");
-    assert_eq!(s.bytes_promoted, 0, "fresh runtime should have zero bytes promoted");
+    assert_eq!(
+        s.bytes_allocated, 0,
+        "fresh runtime should have zero bytes allocated"
+    );
+    assert_eq!(
+        s.bytes_promoted, 0,
+        "fresh runtime should have zero bytes promoted"
+    );
 }
 
 #[test]
@@ -86,8 +106,10 @@ fn heap_stats_fresh_runtime_all_regions_free() {
     let _rt = make_test_runtime();
     let s = heap_stats();
     // Invariant: on a fresh heap, all regions should be free.
-    assert_eq!(s.regions_free, s.regions_total,
-        "fresh runtime should have all regions free");
+    assert_eq!(
+        s.regions_free, s.regions_total,
+        "fresh runtime should have all regions free"
+    );
 }
 
 #[test]
@@ -114,7 +136,10 @@ fn runtime_gc_config_satisfies_init_heap_preconditions() {
     assert!(gc.nursery_size <= gc.heap_size);
     assert!(gc.region_size > 0);
     assert!(gc.tlab_size > 0);
-    assert!(gc.tlab_size & (gc.tlab_size - 1) == 0, "tlab_size must be power of two");
+    assert!(
+        gc.tlab_size & (gc.tlab_size - 1) == 0,
+        "tlab_size must be power of two"
+    );
     assert!(init_heap(&gc).is_ok());
 }
 
@@ -147,8 +172,10 @@ fn bytes_allocated_after_eval_is_non_negative() {
     // bytes_allocated should increase. For now, verify invariant.
     // bytes_allocated is u64, so it's always >= 0. Verify it hasn't
     // wrapped or been corrupted (should be less than total capacity).
-    assert!(s.bytes_allocated <= s.nursery_capacity + s.old_gen_capacity,
-        "bytes_allocated should not exceed total heap capacity after eval");
+    assert!(
+        s.bytes_allocated <= s.nursery_capacity + s.old_gen_capacity,
+        "bytes_allocated should not exceed total heap capacity after eval"
+    );
 }
 
 // ── Weak pointers: heap-object GC integration ───────────────────
@@ -250,7 +277,10 @@ fn walk_heap_after_runtime_init_succeeds() {
         count += 1;
         true
     });
-    assert!(result.is_ok(), "walk_heap should not error after Runtime::init");
+    assert!(
+        result.is_ok(),
+        "walk_heap should not error after Runtime::init"
+    );
     // On a fresh heap, count may be 0 (no objects allocated yet).
     // When the runtime allocates bootstrap objects during init, count > 0.
 }
@@ -293,8 +323,10 @@ fn register_finalizer_on_heap_object_succeeds() {
     let _rt = make_test_runtime();
     let heap_obj = fake_heap_object_val();
     let finalizer = BlissVal::from_fixnum(0); // Placeholder for function
-    assert!(register_finalizer(heap_obj, finalizer).is_ok(),
-        "register_finalizer should accept heap-object-tagged values");
+    assert!(
+        register_finalizer(heap_obj, finalizer).is_ok(),
+        "register_finalizer should accept heap-object-tagged values"
+    );
 }
 
 #[test]
@@ -318,12 +350,14 @@ fn register_finalizer_lifecycle_smoke_test() {
     let mut rt = make_test_runtime();
     let heap_obj = fake_heap_object_val();
     let finalizer_fn = BlissVal::from_fixnum(0);
-    register_finalizer(heap_obj, finalizer_fn)
-        .expect("register_finalizer should succeed");
+    register_finalizer(heap_obj, finalizer_fn).expect("register_finalizer should succeed");
 
     // The runtime should continue to work after finalizer registration.
     let result = rt.eval("(+ 1 1)");
-    assert!(result.is_ok(), "runtime should work after finalizer registration");
+    assert!(
+        result.is_ok(),
+        "runtime should work after finalizer registration"
+    );
 }
 
 // ── End-to-end: Runtime lifecycle ──────────────────────────────
@@ -349,8 +383,10 @@ fn runtime_init_eval_shutdown_lifecycle() {
 
     // 3. Verify heap stats are still consistent
     let s1 = heap_stats();
-    assert!(s1.regions_free <= s1.regions_total,
-        "regions_free must not exceed regions_total");
+    assert!(
+        s1.regions_free <= s1.regions_total,
+        "regions_free must not exceed regions_total"
+    );
 
     // 4. Shutdown
     assert!(rt.shutdown().is_ok(), "shutdown should succeed");
@@ -368,10 +404,16 @@ fn runtime_eval_does_not_corrupt_heap_stats() {
 
     let s = heap_stats();
     // Invariants that must hold regardless of what eval does:
-    assert!(s.regions_free <= s.regions_total,
-        "regions_free must not exceed regions_total");
-    assert!(s.nursery_used <= s.nursery_capacity,
-        "nursery_used must not exceed nursery_capacity");
-    assert!(s.old_gen_used <= s.old_gen_capacity,
-        "old_gen_used must not exceed old_gen_capacity");
+    assert!(
+        s.regions_free <= s.regions_total,
+        "regions_free must not exceed regions_total"
+    );
+    assert!(
+        s.nursery_used <= s.nursery_capacity,
+        "nursery_used must not exceed nursery_capacity"
+    );
+    assert!(
+        s.old_gen_used <= s.old_gen_capacity,
+        "old_gen_used must not exceed old_gen_capacity"
+    );
 }

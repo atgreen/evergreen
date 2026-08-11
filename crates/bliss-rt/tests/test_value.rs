@@ -204,7 +204,10 @@ fn single_float_negative_zero() {
     let v = BlissVal::from_single_float(-0.0_f32);
     assert!(v.is_single_float());
     let extracted = v.as_single_float();
-    assert!(extracted.is_sign_negative(), "negative zero must preserve sign");
+    assert!(
+        extracted.is_sign_negative(),
+        "negative zero must preserve sign"
+    );
     assert_eq!(extracted.to_bits(), (-0.0_f32).to_bits());
 }
 
@@ -253,7 +256,12 @@ fn symbol_index_round_trip() {
         let v = BlissVal::from_symbol_index(idx);
         assert_eq!(v.tag(), TAG_SYMBOL);
         assert!(v.is_symbol());
-        assert_eq!(v.as_symbol_index(), idx, "round-trip failed for idx={}", idx);
+        assert_eq!(
+            v.as_symbol_index(),
+            idx,
+            "round-trip failed for idx={}",
+            idx
+        );
     }
 }
 
@@ -366,8 +374,12 @@ fn tag_exhaustiveness() {
         (NIL, 7),
     ];
     for (val, expected_tag) in &samples {
-        assert_eq!(val.tag(), *expected_tag,
-            "tag mismatch for expected_tag={}", expected_tag);
+        assert_eq!(
+            val.tag(),
+            *expected_tag,
+            "tag mismatch for expected_tag={}",
+            expected_tag
+        );
     }
 }
 
@@ -414,11 +426,20 @@ fn raw_round_trip_specials() {
 fn raw_round_trip_pointers() {
     for &addr in &[0x3000_u64, 0x5000, 0x7000] {
         let vc = unsafe { BlissVal::from_cons_ptr(addr as *mut u8) };
-        assert_eq!(unsafe { BlissVal::from_raw(vc.to_raw()).as_ptr() } as u64, addr);
+        assert_eq!(
+            unsafe { BlissVal::from_raw(vc.to_raw()).as_ptr() } as u64,
+            addr
+        );
         let vh = unsafe { BlissVal::from_heap_ptr(addr as *mut u8) };
-        assert_eq!(unsafe { BlissVal::from_raw(vh.to_raw()).as_ptr() } as u64, addr);
+        assert_eq!(
+            unsafe { BlissVal::from_raw(vh.to_raw()).as_ptr() } as u64,
+            addr
+        );
         let vf = unsafe { BlissVal::from_function_ptr(addr as *mut u8) };
-        assert_eq!(unsafe { BlissVal::from_raw(vf.to_raw()).as_ptr() } as u64, addr);
+        assert_eq!(
+            unsafe { BlissVal::from_raw(vf.to_raw()).as_ptr() } as u64,
+            addr
+        );
     }
 }
 

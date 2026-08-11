@@ -56,12 +56,11 @@ impl PassManager {
     /// Run all passes on the given IR graph.
     pub fn run_all(&mut self, graph: &mut IrGraph) -> Result<(), crate::error::CompilerError> {
         for pass in &mut self.passes {
-            pass.run(graph).map_err(|e| {
-                crate::error::CompilerError::OptimisationError {
+            pass.run(graph)
+                .map_err(|e| crate::error::CompilerError::OptimisationError {
                     pass_name: pass.name().to_string(),
                     message: format!("{}", e),
-                }
-            })?;
+                })?;
         }
         Ok(())
     }
@@ -135,7 +134,10 @@ fn remove_dead_nodes(graph: &mut IrGraph, reachable: &HashSet<NodeId>) -> usize 
 /// `expected_type` is encoded as a fixnum holding the tag value (0–7)
 /// following the BlissVal tag scheme, or as a special value (NIL/T).
 /// If expected_type is T (top type), every value satisfies it.
-fn constant_satisfies_type(val: bliss_rt::value::BlissVal, expected_type: bliss_rt::value::BlissVal) -> bool {
+fn constant_satisfies_type(
+    val: bliss_rt::value::BlissVal,
+    expected_type: bliss_rt::value::BlissVal,
+) -> bool {
     use bliss_rt::value::T_BITS;
     // T (top type) accepts everything
     if expected_type.0 == T_BITS {
@@ -154,7 +156,12 @@ fn constant_satisfies_type(val: bliss_rt::value::BlissVal, expected_type: bliss_
 
 /// Check whether a node is reachable from `from` following forward (uses) edges,
 /// without exceeding `limit` steps. Used for back-edge detection.
-fn is_forward_reachable(graph: &IrGraph, from: NodeId, target: NodeId, reachable: &HashSet<NodeId>) -> bool {
+fn is_forward_reachable(
+    graph: &IrGraph,
+    from: NodeId,
+    target: NodeId,
+    reachable: &HashSet<NodeId>,
+) -> bool {
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
     // Follow uses (forward edges) from `from`
@@ -182,7 +189,11 @@ fn is_forward_reachable(graph: &IrGraph, from: NodeId, target: NodeId, reachable
 /// Collect the set of nodes in a loop body given the loop header (a Region node).
 /// The loop body consists of all nodes that can reach the header's back-edge source
 /// without leaving through the header.
-fn collect_loop_body(graph: &IrGraph, header: NodeId, reachable: &HashSet<NodeId>) -> HashSet<NodeId> {
+fn collect_loop_body(
+    graph: &IrGraph,
+    header: NodeId,
+    reachable: &HashSet<NodeId>,
+) -> HashSet<NodeId> {
     let mut body = HashSet::new();
     body.insert(header);
 
@@ -246,7 +257,9 @@ impl Pass for TypePropagation {
                     NodeKind::Constant(val) => constant_satisfies_type(*val, expected_type),
                     // If the input already passed an identical TypeCheck (same expected_type),
                     // this check is dominated and redundant
-                    NodeKind::TypeCheck { expected_type: prev } => *prev == expected_type,
+                    NodeKind::TypeCheck {
+                        expected_type: prev,
+                    } => *prev == expected_type,
                     _ => false,
                 };
                 if can_eliminate {
@@ -277,7 +290,9 @@ pub struct ConstantFolding;
 impl ConstantFolding {
     /// Try to fold a Call node with all-constant fixnum inputs.
     /// Returns Some(result) if foldable.
-    fn try_fold_fixnum(constants: &[bliss_rt::value::BlissVal]) -> Option<bliss_rt::value::BlissVal> {
+    fn try_fold_fixnum(
+        constants: &[bliss_rt::value::BlissVal],
+    ) -> Option<bliss_rt::value::BlissVal> {
         if constants.len() < 2 || !constants.iter().all(|c| c.is_fixnum()) {
             return None;
         }
@@ -291,7 +306,9 @@ impl ConstantFolding {
     }
 
     /// Try to fold a Call node with all-constant single-float inputs.
-    fn try_fold_single_float(constants: &[bliss_rt::value::BlissVal]) -> Option<bliss_rt::value::BlissVal> {
+    fn try_fold_single_float(
+        constants: &[bliss_rt::value::BlissVal],
+    ) -> Option<bliss_rt::value::BlissVal> {
         if constants.len() < 2 || !constants.iter().all(|c| c.is_single_float()) {
             return None;
         }
@@ -304,7 +321,9 @@ impl ConstantFolding {
 
     /// Try to fold a Call node with mixed numeric types (numeric contagion).
     /// Per CL spec §12.1, fixnum + single-float → single-float.
-    fn try_fold_mixed_numeric(constants: &[bliss_rt::value::BlissVal]) -> Option<bliss_rt::value::BlissVal> {
+    fn try_fold_mixed_numeric(
+        constants: &[bliss_rt::value::BlissVal],
+    ) -> Option<bliss_rt::value::BlissVal> {
         if constants.len() != 2 {
             return None;
         }
@@ -324,11 +343,17 @@ impl ConstantFolding {
                 return None;
             }
         }
-        Some(bliss_rt::value::BlissVal::from_single_float(vals[0] + vals[1]))
+        Some(bliss_rt::value::BlissVal::from_single_float(
+            vals[0] + vals[1],
+        ))
     }
 
     /// Remove a call node and its dead constant inputs, replacing with folded result.
-    fn replace_call_with_constant(graph: &mut IrGraph, call_id: NodeId, result: bliss_rt::value::BlissVal) {
+    fn replace_call_with_constant(
+        graph: &mut IrGraph,
+        call_id: NodeId,
+        result: bliss_rt::value::BlissVal,
+    ) {
         let dead_inputs: Vec<NodeId> = graph
             .inputs(call_id)
             .iter()
@@ -364,10 +389,7 @@ impl Pass for ConstantFolding {
                 continue;
             }
             let inputs = graph.inputs(node_id);
-            let data_inputs: Vec<_> = inputs
-                .iter()
-                .filter(|e| e.kind == EdgeKind::Data)
-                .collect();
+            let data_inputs: Vec<_> = inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
             if data_inputs.is_empty() {
                 continue;
             }
@@ -498,12 +520,15 @@ impl FunctionRegistry {
         inline_priority_high: bool,
         pgo_hot: bool,
     ) {
-        self.entries.insert(callee_val.0, FunctionEntry {
-            ir,
-            notinline,
-            inline_priority_high,
-            pgo_hot,
-        });
+        self.entries.insert(
+            callee_val.0,
+            FunctionEntry {
+                ir,
+                notinline,
+                inline_priority_high,
+                pgo_hot,
+            },
+        );
     }
 
     /// Look up a callee's entry by its BlissVal constant.
@@ -541,11 +566,7 @@ pub struct Inlining {
 /// 6. Remove the Call node.
 ///
 /// Returns the cost (number of callee nodes cloned) on success.
-fn inline_call_site(
-    graph: &mut IrGraph,
-    call_id: NodeId,
-    callee: &IrGraph,
-) -> Option<u32> {
+fn inline_call_site(graph: &mut IrGraph, call_id: NodeId, callee: &IrGraph) -> Option<u32> {
     use std::collections::HashMap as Map;
 
     let cost = callee.node_count() as u32;
@@ -615,7 +636,10 @@ fn inline_call_site(
 
     // Clone callee edges (remap IDs)
     for (cid, _kind) in &callee_nodes {
-        if matches!(_kind, NodeKind::Start | NodeKind::Return | NodeKind::Parameter(_)) {
+        if matches!(
+            _kind,
+            NodeKind::Start | NodeKind::Return | NodeKind::Parameter(_)
+        ) {
             continue;
         }
         let mapped_to = match id_map.get(cid) {
@@ -653,7 +677,8 @@ fn inline_call_site(
             if let Some(&mapped_ctrl) = id_map.get(&rce.from) {
                 // The call's control successors are now controlled by the
                 // last node before callee's return
-                let call_ctrl_succs: Vec<_> = graph.uses(call_id)
+                let call_ctrl_succs: Vec<_> = graph
+                    .uses(call_id)
                     .iter()
                     .filter(|e| e.kind == EdgeKind::Control)
                     .map(|e| (e.to, e.input_index))
@@ -711,9 +736,7 @@ impl Pass for Inlining {
 
             let callee_inputs = graph.inputs(call_id);
             // Convention: the first data input to a Call is the callee function reference
-            let callee_ref = callee_inputs
-                .iter()
-                .find(|e| e.kind == EdgeKind::Data);
+            let callee_ref = callee_inputs.iter().find(|e| e.kind == EdgeKind::Data);
 
             if let Some(callee_edge) = callee_ref {
                 let callee_src = callee_edge.from;
@@ -928,19 +951,22 @@ impl Pass for Licm {
                     }
                     // Do NOT hoist pinned/side-effecting nodes (§4.5.6.3)
                     match graph.node_kind(node_id) {
-                        NodeKind::Call | NodeKind::MemLoad { .. } | NodeKind::MemStore { .. }
+                        NodeKind::Call
+                        | NodeKind::MemLoad { .. }
+                        | NodeKind::MemStore { .. }
                         | NodeKind::Safepoint => continue,
                         // Control-flow nodes are part of loop structure, not hoistable
-                        NodeKind::Region | NodeKind::Branch | NodeKind::Phi
-                        | NodeKind::Start | NodeKind::Return => continue,
+                        NodeKind::Region
+                        | NodeKind::Branch
+                        | NodeKind::Phi
+                        | NodeKind::Start
+                        | NodeKind::Return => continue,
                         _ => {}
                     }
 
                     let inputs = graph.inputs(node_id);
-                    let all_inputs_invariant = inputs
-                        .iter()
-                        .filter(|e| e.kind == EdgeKind::Data)
-                        .all(|e| {
+                    let all_inputs_invariant =
+                        inputs.iter().filter(|e| e.kind == EdgeKind::Data).all(|e| {
                             // Input is invariant if defined outside loop, or marked invariant,
                             // or is a constant/parameter (always available)
                             !loop_body.contains(&e.from)
@@ -1054,10 +1080,7 @@ impl Pass for StrengthReduction {
                 continue;
             }
             let inputs = graph.inputs(id);
-            let data_inputs: Vec<_> = inputs
-                .iter()
-                .filter(|e| e.kind == EdgeKind::Data)
-                .collect();
+            let data_inputs: Vec<_> = inputs.iter().filter(|e| e.kind == EdgeKind::Data).collect();
 
             if data_inputs.len() != 2 {
                 continue;
@@ -1207,7 +1230,10 @@ impl Pass for NullCheckElimination {
                     break;
                 }
 
-                if let NodeKind::TypeCheck { expected_type: dom_expected } = graph.node_kind(node) {
+                if let NodeKind::TypeCheck {
+                    expected_type: dom_expected,
+                } = graph.node_kind(node)
+                {
                     // Check if this is a dominating check on the same value
                     if *dom_expected == expected_type {
                         let dom_data_src = graph

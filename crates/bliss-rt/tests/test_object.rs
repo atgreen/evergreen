@@ -297,15 +297,29 @@ fn type_id_constants_values() {
 fn type_id_range_is_contiguous() {
     // Verify IDs run from 0x01..=0x17 with no gaps
     let ids = [
-        type_id::CONS, type_id::SYMBOL, type_id::SIMPLE_VECTOR,
-        type_id::SIMPLE_ARRAY, type_id::SIMPLE_BASE_STRING,
-        type_id::SIMPLE_CHARACTER_STRING, type_id::COMPLEX_ARRAY,
-        type_id::BIGNUM, type_id::RATIO, type_id::COMPLEX,
-        type_id::DOUBLE_FLOAT, type_id::HASH_TABLE, type_id::STRUCTURE,
-        type_id::STANDARD_OBJECT, type_id::FUNCTION_INTERPRETED,
-        type_id::COMPILED_FUNCTION, type_id::CLOSURE, type_id::PACKAGE,
-        type_id::STREAM, type_id::PATHNAME, type_id::READTABLE,
-        type_id::CONDITION, type_id::RESTART,
+        type_id::CONS,
+        type_id::SYMBOL,
+        type_id::SIMPLE_VECTOR,
+        type_id::SIMPLE_ARRAY,
+        type_id::SIMPLE_BASE_STRING,
+        type_id::SIMPLE_CHARACTER_STRING,
+        type_id::COMPLEX_ARRAY,
+        type_id::BIGNUM,
+        type_id::RATIO,
+        type_id::COMPLEX,
+        type_id::DOUBLE_FLOAT,
+        type_id::HASH_TABLE,
+        type_id::STRUCTURE,
+        type_id::STANDARD_OBJECT,
+        type_id::FUNCTION_INTERPRETED,
+        type_id::COMPILED_FUNCTION,
+        type_id::CLOSURE,
+        type_id::PACKAGE,
+        type_id::STREAM,
+        type_id::PATHNAME,
+        type_id::READTABLE,
+        type_id::CONDITION,
+        type_id::RESTART,
     ];
     for (i, &id) in ids.iter().enumerate() {
         assert_eq!(id, (i + 1) as u8);

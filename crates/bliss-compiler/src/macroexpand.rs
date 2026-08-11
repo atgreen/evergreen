@@ -3,8 +3,8 @@
 //! Expansion runs after reading and before IR construction.
 //! Implements the algorithm from spec §4.2 / A4.01.
 
-use std::collections::{HashMap, HashSet};
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use bliss_rt::error::BlissError;
@@ -361,7 +361,8 @@ static COMPILER_MACRO_TABLE: LazyLock<RwLock<HashMap<u64, CompilerMacroFn>>> =
 /// Compiler macro function type.
 /// Takes (whole_form, env) and returns either a transformed form or the
 /// original `whole_form` (pointer-equal) to decline the transformation.
-pub type CompilerMacroFn = Arc<dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + Send + Sync>;
+pub type CompilerMacroFn =
+    Arc<dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + Send + Sync>;
 
 /// Register a global macro (DEFMACRO).
 pub fn define_global_macro(name: BlissVal, expander: BlissVal) {
@@ -409,10 +410,7 @@ static MACRO_FUNCTION_REGISTRY: LazyLock<RwLock<HashMap<u64, Arc<MacroFn>>>> =
 
 /// Register a macro expander function that can be invoked by the default hook.
 /// The `key` is the BlissVal that appears as FunctionInfo::Macro(key).
-pub fn register_macro_function(
-    key: BlissVal,
-    func: Arc<MacroFn>,
-) {
+pub fn register_macro_function(key: BlissVal, func: Arc<MacroFn>) {
     let mut registry = MACRO_FUNCTION_REGISTRY.write().unwrap();
     registry.insert(key.0, func);
 }
@@ -439,7 +437,11 @@ pub type MacroexpandHook = fn(BlissVal, BlissVal, &Environment) -> Result<BlissV
 ///
 /// For full funcall semantics with arbitrary Lisp functions, the runtime must
 /// register each macro's expander via `register_macro_function`.
-fn default_hook(expander: BlissVal, form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+fn default_hook(
+    expander: BlissVal,
+    form: BlissVal,
+    env: &Environment,
+) -> Result<BlissVal, BlissError> {
     // Try to look up and invoke the expander as a registered macro function.
     // This implements true funcall semantics: (funcall expander form env).
     if let Some(func) = lookup_macro_function(expander) {
@@ -542,7 +544,9 @@ pub fn macroexpand_1(form: BlissVal, env: &Environment) -> Result<(BlissVal, boo
                 let result = hook(expander, form, env)?;
                 return Ok((result, true));
             }
-            Some(FunctionInfo::SpecialOperator) | Some(FunctionInfo::Lexical) | Some(FunctionInfo::Global) => {
+            Some(FunctionInfo::SpecialOperator)
+            | Some(FunctionInfo::Lexical)
+            | Some(FunctionInfo::Global) => {
                 // 2.d: Found as special operator or function — no expansion
                 return Ok((form, false));
             }
@@ -586,9 +590,10 @@ pub fn macroexpand(form: BlissVal, env: &Environment) -> Result<(BlissVal, bool)
 
         // Check iteration limit (spec §4.2.3 Phase 2 step 2.f, §4.2.13)
         if iteration_count > limit {
-            return Err(BlissError::Internal(
-                format!("Macro expansion limit ({}) exceeded", limit),
-            ));
+            return Err(BlissError::Internal(format!(
+                "Macro expansion limit ({}) exceeded",
+                limit
+            )));
         }
 
         // Check for circular expansion (R4.16)
@@ -708,7 +713,10 @@ pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
     // Step 3.b: Special operator dispatch (spec §4.2.7).
     // Special operators have structural subforms (binding names, block names,
     // tag labels) that must NOT be expanded as expressions.
-    let is_special = matches!(env.function_information(operator), Some(FunctionInfo::SpecialOperator));
+    let is_special = matches!(
+        env.function_information(operator),
+        Some(FunctionInfo::SpecialOperator)
+    );
     if is_special || (operator.is_symbol() && is_known_special_operator(operator)) {
         return expand_special_form(operator, expanded, env);
     }
@@ -740,7 +748,11 @@ pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
 }
 
 /// Expand the arguments of a function call form, leaving the operator untouched.
-fn expand_function_call_args(operator: BlissVal, form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+fn expand_function_call_args(
+    operator: BlissVal,
+    form: BlissVal,
+    env: &Environment,
+) -> Result<BlissVal, BlissError> {
     let cdr = unsafe { cons_cdr(form) };
     let expanded_cdr = if cdr.is_cons() {
         walk_cons(cdr, env)?
@@ -761,20 +773,44 @@ fn expand_function_call_args(operator: BlissVal, form: BlissVal, env: &Environme
 /// Check if a symbol names a known CL special operator.
 fn is_known_special_operator(val: BlissVal) -> bool {
     match get_symbol_name(val) {
-        Some(name) => matches!(name.as_str(),
-            "BLOCK" | "CATCH" | "EVAL-WHEN" | "FLET" | "FUNCTION" | "GO" | "IF"
-            | "LABELS" | "LET" | "LET*" | "LOAD-TIME-VALUE" | "LOCALLY"
-            | "MACROLET" | "MULTIPLE-VALUE-CALL" | "MULTIPLE-VALUE-PROG1"
-            | "PROGN" | "PROGV" | "QUOTE" | "RETURN-FROM" | "SETQ"
-            | "SYMBOL-MACROLET" | "TAGBODY" | "THE" | "THROW"
-            | "UNWIND-PROTECT"
+        Some(name) => matches!(
+            name.as_str(),
+            "BLOCK"
+                | "CATCH"
+                | "EVAL-WHEN"
+                | "FLET"
+                | "FUNCTION"
+                | "GO"
+                | "IF"
+                | "LABELS"
+                | "LET"
+                | "LET*"
+                | "LOAD-TIME-VALUE"
+                | "LOCALLY"
+                | "MACROLET"
+                | "MULTIPLE-VALUE-CALL"
+                | "MULTIPLE-VALUE-PROG1"
+                | "PROGN"
+                | "PROGV"
+                | "QUOTE"
+                | "RETURN-FROM"
+                | "SETQ"
+                | "SYMBOL-MACROLET"
+                | "TAGBODY"
+                | "THE"
+                | "THROW"
+                | "UNWIND-PROTECT"
         ),
         None => false,
     }
 }
 
 /// Dispatch to the correct special-form expansion handler (spec §4.2.7).
-fn expand_special_form(operator: BlissVal, form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+fn expand_special_form(
+    operator: BlissVal,
+    form: BlissVal,
+    env: &Environment,
+) -> Result<BlissVal, BlissError> {
     let name = get_symbol_name(operator);
     let name_str = name.as_deref().unwrap_or("");
 
@@ -847,7 +883,13 @@ fn expand_return_from(form: BlissVal, env: &Environment) -> Result<BlissVal, Bli
     if expanded_result == result_form {
         Ok(form)
     } else {
-        Ok(alloc_cons(operator, alloc_cons(block_name, alloc_cons(expanded_result, bliss_rt::value::NIL))))
+        Ok(alloc_cons(
+            operator,
+            alloc_cons(
+                block_name,
+                alloc_cons(expanded_result, bliss_rt::value::NIL),
+            ),
+        ))
     }
 }
 
@@ -900,7 +942,9 @@ fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
     let items = cons_to_vec(args);
 
     if items.len() % 2 != 0 {
-        return Err(BlissError::Internal("SETQ requires an even number of arguments".into()));
+        return Err(BlissError::Internal(
+            "SETQ requires an even number of arguments".into(),
+        ));
     }
 
     let mut result_pairs = Vec::new();
@@ -917,7 +961,10 @@ fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
             any_symbol_macro = true;
             let expanded_val = macroexpand_all(val_form, env)?;
             let setf_sym = make_symbol("SETF");
-            let setf_form = alloc_cons(setf_sym, alloc_cons(expansion, alloc_cons(expanded_val, bliss_rt::value::NIL)));
+            let setf_form = alloc_cons(
+                setf_sym,
+                alloc_cons(expansion, alloc_cons(expanded_val, bliss_rt::value::NIL)),
+            );
             // Re-enter expand-form on the setf form
             let expanded_setf = macroexpand_all(setf_form, env)?;
             result_pairs.push((var, val_form, Some(expanded_setf)));
@@ -1010,7 +1057,10 @@ fn expand_the(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError>
     if expanded_value == value_form {
         Ok(form)
     } else {
-        Ok(alloc_cons(operator, alloc_cons(type_spec, alloc_cons(expanded_value, bliss_rt::value::NIL))))
+        Ok(alloc_cons(
+            operator,
+            alloc_cons(type_spec, alloc_cons(expanded_value, bliss_rt::value::NIL)),
+        ))
     }
 }
 
@@ -1051,7 +1101,10 @@ fn expand_function_special(form: BlissVal, env: &Environment) -> Result<BlissVal
         if expanded_lambda == arg {
             Ok(form)
         } else {
-            Ok(alloc_cons(operator, alloc_cons(expanded_lambda, bliss_rt::value::NIL)))
+            Ok(alloc_cons(
+                operator,
+                alloc_cons(expanded_lambda, bliss_rt::value::NIL),
+            ))
         }
     } else {
         // (function name) — no expansion
@@ -1097,7 +1150,11 @@ fn expand_lambda_expression(lambda: BlissVal, env: &Environment) -> Result<Bliss
 
 /// Expand a lambda call: ((lambda (params...) body...) arg1 arg2 ...)
 /// Expand the lambda body AND the arguments.
-fn expand_lambda_call(operator: BlissVal, form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+fn expand_lambda_call(
+    operator: BlissVal,
+    form: BlissVal,
+    env: &Environment,
+) -> Result<BlissVal, BlissError> {
     let args = unsafe { cons_cdr(form) };
 
     // Expand the lambda expression
@@ -1158,7 +1215,10 @@ fn expand_let(form: BlissVal, env: &Environment, sequential: bool) -> Result<Bli
                 bindings_changed = true;
             }
             // Reconstruct binding: (var expanded-init)
-            expanded_bindings.push(alloc_cons(var, alloc_cons(expanded_init, bliss_rt::value::NIL)));
+            expanded_bindings.push(alloc_cons(
+                var,
+                alloc_cons(expanded_init, bliss_rt::value::NIL),
+            ));
 
             // For LET*, augment env after each binding
             if sequential {
@@ -1191,7 +1251,10 @@ fn expand_let(form: BlissVal, env: &Environment, sequential: bool) -> Result<Bli
         Ok(form)
     } else {
         let new_bindings = vec_to_cons(&expanded_bindings);
-        Ok(alloc_cons(operator, alloc_cons(new_bindings, expanded_body)))
+        Ok(alloc_cons(
+            operator,
+            alloc_cons(new_bindings, expanded_body),
+        ))
     }
 }
 

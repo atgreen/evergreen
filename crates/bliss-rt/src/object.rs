@@ -76,10 +76,10 @@ impl ObjectHeader {
 
 /// GC bit positions within the gc_bits byte.
 pub mod gc_bit {
-    pub const MARK: u8 = 7;       // bit 55 — mark-white/black
-    pub const GREY: u8 = 6;       // bit 54 — in concurrent mark worklist
-    pub const FORWARDED: u8 = 5;  // bit 53 — object has been evacuated
-    pub const PINNED: u8 = 4;     // bit 52 — must not be moved
+    pub const MARK: u8 = 7; // bit 55 — mark-white/black
+    pub const GREY: u8 = 6; // bit 54 — in concurrent mark worklist
+    pub const FORWARDED: u8 = 5; // bit 53 — object has been evacuated
+    pub const PINNED: u8 = 4; // bit 52 — must not be moved
     pub const REMEMBERED: u8 = 3; // bit 51 — in remembered set
 }
 

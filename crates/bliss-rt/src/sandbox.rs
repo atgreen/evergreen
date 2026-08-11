@@ -71,9 +71,7 @@ impl Sandbox {
         if self.policy.allow_network {
             Ok(())
         } else {
-            Err(BlissError::SandboxViolation(
-                "network access denied".into(),
-            ))
+            Err(BlissError::SandboxViolation("network access denied".into()))
         }
     }
 

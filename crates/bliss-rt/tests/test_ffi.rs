@@ -4,15 +4,29 @@ use bliss_rt::value::{BlissVal, NIL};
 #[test]
 fn alien_type_variants_constructible() {
     let _ = AlienType::Void;
-    let _ = AlienType::Int { signed: true, bits: 32 };
+    let _ = AlienType::Int {
+        signed: true,
+        bits: 32,
+    };
     let _ = AlienType::Float;
     let _ = AlienType::Double;
     let _ = AlienType::Pointer(Box::new(AlienType::Void));
-    let _ = AlienType::Struct { fields: vec![AlienType::Float], packed: false };
-    let _ = AlienType::Union { variants: vec![AlienType::Int { signed: true, bits: 32 }] };
+    let _ = AlienType::Struct {
+        fields: vec![AlienType::Float],
+        packed: false,
+    };
+    let _ = AlienType::Union {
+        variants: vec![AlienType::Int {
+            signed: true,
+            bits: 32,
+        }],
+    };
     let _ = AlienType::FnPtr {
         ret: Box::new(AlienType::Void),
-        args: vec![AlienType::Int { signed: true, bits: 32 }],
+        args: vec![AlienType::Int {
+            signed: true,
+            bits: 32,
+        }],
         variadic: true,
     };
 }
@@ -22,31 +36,88 @@ fn alien_type_equality() {
     assert_eq!(AlienType::Void, AlienType::Void);
     assert_ne!(AlienType::Float, AlienType::Double);
     assert_eq!(
-        AlienType::Int { signed: true, bits: 32 },
-        AlienType::Int { signed: true, bits: 32 }
+        AlienType::Int {
+            signed: true,
+            bits: 32
+        },
+        AlienType::Int {
+            signed: true,
+            bits: 32
+        }
     );
     assert_ne!(
-        AlienType::Int { signed: true, bits: 32 },
-        AlienType::Int { signed: false, bits: 32 }
+        AlienType::Int {
+            signed: true,
+            bits: 32
+        },
+        AlienType::Int {
+            signed: false,
+            bits: 32
+        }
     );
 }
 
 #[test]
 fn alien_type_sizes() {
     assert_eq!(AlienType::Void.size(), 0);
-    assert_eq!(AlienType::Int { signed: true, bits: 8 }.size(), 1);
-    assert_eq!(AlienType::Int { signed: false, bits: 16 }.size(), 2);
-    assert_eq!(AlienType::Int { signed: true, bits: 32 }.size(), 4);
-    assert_eq!(AlienType::Int { signed: false, bits: 64 }.size(), 8);
+    assert_eq!(
+        AlienType::Int {
+            signed: true,
+            bits: 8
+        }
+        .size(),
+        1
+    );
+    assert_eq!(
+        AlienType::Int {
+            signed: false,
+            bits: 16
+        }
+        .size(),
+        2
+    );
+    assert_eq!(
+        AlienType::Int {
+            signed: true,
+            bits: 32
+        }
+        .size(),
+        4
+    );
+    assert_eq!(
+        AlienType::Int {
+            signed: false,
+            bits: 64
+        }
+        .size(),
+        8
+    );
     assert_eq!(AlienType::Float.size(), 4);
     assert_eq!(AlienType::Double.size(), 8);
-    assert_eq!(AlienType::Pointer(Box::new(AlienType::Void)).size(), std::mem::size_of::<*const ()>());
+    assert_eq!(
+        AlienType::Pointer(Box::new(AlienType::Void)).size(),
+        std::mem::size_of::<*const ()>()
+    );
 }
 
 #[test]
 fn alien_type_alignments() {
-    assert_eq!(AlienType::Int { signed: true, bits: 8 }.alignment(), 1);
-    assert_eq!(AlienType::Int { signed: true, bits: 32 }.alignment(), 4);
+    assert_eq!(
+        AlienType::Int {
+            signed: true,
+            bits: 8
+        }
+        .alignment(),
+        1
+    );
+    assert_eq!(
+        AlienType::Int {
+            signed: true,
+            bits: 32
+        }
+        .alignment(),
+        4
+    );
     assert_eq!(AlienType::Float.alignment(), 4);
     assert_eq!(AlienType::Double.alignment(), 8);
 }
@@ -88,12 +159,7 @@ fn foreign_symbol_null_library_fails() {
 #[test]
 fn ffi_call_null_fn_ptr_fails() {
     unsafe {
-        let result = ffi_call(
-            std::ptr::null(),
-            &AlienType::Void,
-            &[],
-            &[],
-        );
+        let result = ffi_call(std::ptr::null(), &AlienType::Void, &[], &[]);
         assert!(result.is_err());
     }
 }
@@ -106,12 +172,17 @@ fn ffi_call_with_known_c_function() {
         .or_else(|_| load_foreign_library("libc.so"))
         .expect("should be able to load libc on any supported platform");
     unsafe {
-        let abs_fn = foreign_symbol(lib, "abs")
-            .expect("libc should export 'abs'");
+        let abs_fn = foreign_symbol(lib, "abs").expect("libc should export 'abs'");
         let result = ffi_call(
             abs_fn,
-            &AlienType::Int { signed: true, bits: 32 },
-            &[AlienType::Int { signed: true, bits: 32 }],
+            &AlienType::Int {
+                signed: true,
+                bits: 32,
+            },
+            &[AlienType::Int {
+                signed: true,
+                bits: 32,
+            }],
             &[(-42i32 as u32) as u64],
         );
         assert!(result.is_ok(), "ffi_call to abs should succeed");
@@ -123,8 +194,7 @@ fn ffi_call_with_known_c_function() {
 
 #[test]
 fn callback_drop_does_not_panic() {
-    let cb = Callback::new(NIL, AlienType::Void, vec![])
-        .expect("Callback::new should succeed");
+    let cb = Callback::new(NIL, AlienType::Void, vec![]).expect("Callback::new should succeed");
     drop(cb); // explicitly drop to exercise Drop impl
     // If we reach here without panic, the Drop impl is correct.
 }
@@ -134,7 +204,13 @@ fn callback_drop_does_not_panic() {
 #[test]
 fn marshal_fixnum_to_int32() {
     let val = BlissVal::from_fixnum(42);
-    let result = marshal_to_c(val, &AlienType::Int { signed: true, bits: 32 });
+    let result = marshal_to_c(
+        val,
+        &AlienType::Int {
+            signed: true,
+            bits: 32,
+        },
+    );
     assert!(result.is_ok());
     assert_eq!(result.unwrap() as i32, 42);
 }
@@ -142,14 +218,26 @@ fn marshal_fixnum_to_int32() {
 #[test]
 fn marshal_fixnum_negative_to_int32() {
     let val = BlissVal::from_fixnum(-7);
-    let result = marshal_to_c(val, &AlienType::Int { signed: true, bits: 32 });
+    let result = marshal_to_c(
+        val,
+        &AlienType::Int {
+            signed: true,
+            bits: 32,
+        },
+    );
     assert!(result.is_ok());
     assert_eq!(result.unwrap() as i32, -7);
 }
 
 #[test]
 fn unmarshal_int32_to_fixnum() {
-    let result = unmarshal_from_c(42, &AlienType::Int { signed: true, bits: 32 });
+    let result = unmarshal_from_c(
+        42,
+        &AlienType::Int {
+            signed: true,
+            bits: 32,
+        },
+    );
     assert!(result.is_ok());
     // The result should be a fixnum representing 42
     let val = result.unwrap();
@@ -182,7 +270,10 @@ fn alien_type_struct_size_with_padding() {
     // Total: 16 bytes
     let s = AlienType::Struct {
         fields: vec![
-            AlienType::Int { signed: true, bits: 32 },
+            AlienType::Int {
+                signed: true,
+                bits: 32,
+            },
             AlienType::Double,
         ],
         packed: false,
@@ -197,7 +288,10 @@ fn alien_type_struct_size_with_padding() {
 fn alien_type_struct_alignment_is_max_field() {
     let s = AlienType::Struct {
         fields: vec![
-            AlienType::Int { signed: true, bits: 32 },
+            AlienType::Int {
+                signed: true,
+                bits: 32,
+            },
             AlienType::Double,
         ],
         packed: false,
@@ -210,7 +304,10 @@ fn alien_type_struct_alignment_is_max_field() {
 fn alien_type_packed_struct_no_padding() {
     let s = AlienType::Struct {
         fields: vec![
-            AlienType::Int { signed: true, bits: 32 },
+            AlienType::Int {
+                signed: true,
+                bits: 32,
+            },
             AlienType::Double,
         ],
         packed: true,
@@ -223,9 +320,15 @@ fn alien_type_packed_struct_no_padding() {
 fn alien_type_union_size_is_largest_variant() {
     let u = AlienType::Union {
         variants: vec![
-            AlienType::Int { signed: true, bits: 32 },  // 4 bytes
-            AlienType::Double,                            // 8 bytes
-            AlienType::Int { signed: false, bits: 8 },   // 1 byte
+            AlienType::Int {
+                signed: true,
+                bits: 32,
+            }, // 4 bytes
+            AlienType::Double, // 8 bytes
+            AlienType::Int {
+                signed: false,
+                bits: 8,
+            }, // 1 byte
         ],
     };
     // Union size should be the largest variant = 8 (Double)
@@ -236,7 +339,10 @@ fn alien_type_union_size_is_largest_variant() {
 fn alien_type_union_alignment_is_max_variant() {
     let u = AlienType::Union {
         variants: vec![
-            AlienType::Int { signed: true, bits: 32 },
+            AlienType::Int {
+                signed: true,
+                bits: 32,
+            },
             AlienType::Double,
         ],
     };

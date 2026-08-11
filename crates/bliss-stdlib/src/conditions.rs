@@ -122,7 +122,10 @@ fn funcall(function: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError
 struct RestartEntry {
     name: BlissVal,
     function: BlissVal,
-    #[expect(dead_code, reason = "restart metadata is stored for later reporting hooks")]
+    #[expect(
+        dead_code,
+        reason = "restart metadata is stored for later reporting hooks"
+    )]
     report_function: Option<BlissVal>,
     interactive_function: Option<BlissVal>,
     test_function: Option<BlissVal>,
@@ -284,8 +287,7 @@ fn condition_type_matches(condition: BlissVal, clause_type: BlissVal) -> bool {
 /// the handler, preventing infinite recursion when a handler re-signals.
 pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
     // Snapshot the handler stack so we can iterate without holding the borrow.
-    let handlers: Vec<Vec<(BlissVal, BlissVal)>> =
-        STATE.with(|s| s.borrow().handler_stack.clone());
+    let handlers: Vec<Vec<(BlissVal, BlissVal)>> = STATE.with(|s| s.borrow().handler_stack.clone());
 
     // Walk from most-recently-established frame to oldest.
     for (frame_idx, frame) in handlers.iter().enumerate().rev() {
@@ -294,8 +296,7 @@ pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
                 // Per A5.04: temporarily rebind the handler stack to exclude
                 // the current cluster and everything after it.  This prevents
                 // infinite recursion if the handler re-signals the same condition.
-                let prev_frames: Vec<Vec<(BlissVal, BlissVal)>> =
-                    handlers[..frame_idx].to_vec();
+                let prev_frames: Vec<Vec<(BlissVal, BlissVal)>> = handlers[..frame_idx].to_vec();
                 STATE.with(|s| {
                     s.borrow_mut().handler_stack = prev_frames;
                 });
@@ -572,10 +573,7 @@ pub struct RestartSpec {
 ///
 /// When `body` is a pre-evaluated BlissVal, it is returned directly.
 /// For real body evaluation with restarts active, use `restart_bind_fn`.
-pub fn restart_bind(
-    restarts: &[RestartSpec],
-    body: BlissVal,
-) -> Result<BlissVal, BlissError> {
+pub fn restart_bind(restarts: &[RestartSpec], body: BlissVal) -> Result<BlissVal, BlissError> {
     let count = restarts.len();
 
     // Register all restart specs in thread-local state.

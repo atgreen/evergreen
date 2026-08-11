@@ -23,7 +23,10 @@ fn construct_all_variants() {
         BlissError::SignalError(11),
         BlissError::Shutdown,
         BlissError::Internal("invariant broken".into()),
-        BlissError::TypeError { datum: BlissVal(0), expected: "INTEGER".into() },
+        BlissError::TypeError {
+            datum: BlissVal(0),
+            expected: "INTEGER".into(),
+        },
         BlissError::UnboundVariable(BlissVal(0)),
         BlissError::UndefinedFunction(BlissVal(0)),
         BlissError::ArithmeticError("division by zero".into()),
@@ -63,8 +66,14 @@ fn display_stack_overflow_edge_ids() {
 
 #[test]
 fn display_invalid_image() {
-    assert_eq!(BlissError::InvalidImage("bad magic".into()).to_string(), "invalid image: bad magic");
-    assert_eq!(BlissError::InvalidImage(String::new()).to_string(), "invalid image: ");
+    assert_eq!(
+        BlissError::InvalidImage("bad magic".into()).to_string(),
+        "invalid image: bad magic"
+    );
+    assert_eq!(
+        BlissError::InvalidImage(String::new()).to_string(),
+        "invalid image: "
+    );
 }
 
 #[test]
@@ -106,7 +115,11 @@ fn display_type_error() {
     };
     let msg = err.to_string();
     assert!(msg.starts_with("type error: "), "got: {}", msg);
-    assert!(msg.contains("STRING"), "expected type name in message, got: {}", msg);
+    assert!(
+        msg.contains("STRING"),
+        "expected type name in message, got: {}",
+        msg
+    );
 }
 
 #[test]
@@ -152,7 +165,10 @@ fn display_file_error() {
 #[test]
 fn display_sandbox_violation() {
     let err = BlissError::SandboxViolation("filesystem write blocked".to_string());
-    assert_eq!(err.to_string(), "sandbox violation: filesystem write blocked");
+    assert_eq!(
+        err.to_string(),
+        "sandbox violation: filesystem write blocked"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -235,10 +251,13 @@ fn debug_signal_error_contains_signal_number() {
 
 #[test]
 fn debug_type_error_contains_fields() {
-    let dbg = format!("{:?}", BlissError::TypeError {
-        datum: BlissVal(5),
-        expected: "NUMBER".to_string(),
-    });
+    let dbg = format!(
+        "{:?}",
+        BlissError::TypeError {
+            datum: BlissVal(5),
+            expected: "NUMBER".to_string(),
+        }
+    );
     assert!(dbg.contains("TypeError"), "got: {}", dbg);
     assert!(dbg.contains("NUMBER"), "got: {}", dbg);
 }
@@ -246,18 +265,55 @@ fn debug_type_error_contains_fields() {
 #[test]
 fn debug_all_string_variants() {
     let cases: Vec<(BlissError, &str, &str)> = vec![
-        (BlissError::ArithmeticError("overflow".into()), "ArithmeticError", "overflow"),
-        (BlissError::PackageError("conflict".into()), "PackageError", "conflict"),
-        (BlissError::StreamError("closed".into()), "StreamError", "closed"),
-        (BlissError::FileError("not found".into()), "FileError", "not found"),
-        (BlissError::SandboxViolation("blocked".into()), "SandboxViolation", "blocked"),
-        (BlissError::InvalidImage("truncated".into()), "InvalidImage", "truncated"),
-        (BlissError::FfiError("abi mismatch".into()), "FfiError", "abi mismatch"),
-        (BlissError::Internal("null ref".into()), "Internal", "null ref"),
+        (
+            BlissError::ArithmeticError("overflow".into()),
+            "ArithmeticError",
+            "overflow",
+        ),
+        (
+            BlissError::PackageError("conflict".into()),
+            "PackageError",
+            "conflict",
+        ),
+        (
+            BlissError::StreamError("closed".into()),
+            "StreamError",
+            "closed",
+        ),
+        (
+            BlissError::FileError("not found".into()),
+            "FileError",
+            "not found",
+        ),
+        (
+            BlissError::SandboxViolation("blocked".into()),
+            "SandboxViolation",
+            "blocked",
+        ),
+        (
+            BlissError::InvalidImage("truncated".into()),
+            "InvalidImage",
+            "truncated",
+        ),
+        (
+            BlissError::FfiError("abi mismatch".into()),
+            "FfiError",
+            "abi mismatch",
+        ),
+        (
+            BlissError::Internal("null ref".into()),
+            "Internal",
+            "null ref",
+        ),
     ];
     for (err, variant, msg) in cases {
         let dbg = format!("{:?}", err);
-        assert!(dbg.contains(variant), "expected '{}' in debug: {}", variant, dbg);
+        assert!(
+            dbg.contains(variant),
+            "expected '{}' in debug: {}",
+            variant,
+            dbg
+        );
         assert!(dbg.contains(msg), "expected '{}' in debug: {}", msg, dbg);
     }
 }
@@ -306,20 +362,38 @@ fn match_routing_with_wildcard_arm() {
         }
     };
     assert_eq!(classify(&BlissError::Oom), "oom");
-    assert_eq!(classify(&BlissError::StackOverflow(GreenThreadId(1))), "stack");
+    assert_eq!(
+        classify(&BlissError::StackOverflow(GreenThreadId(1))),
+        "stack"
+    );
     assert_eq!(classify(&BlissError::InvalidImage("x".into())), "image");
     assert_eq!(classify(&BlissError::FfiError("x".into())), "ffi");
     assert_eq!(classify(&BlissError::SignalError(1)), "signal");
     assert_eq!(classify(&BlissError::Shutdown), "shutdown");
     assert_eq!(classify(&BlissError::Internal("x".into())), "internal");
-    assert_eq!(classify(&BlissError::TypeError { datum: BlissVal(0), expected: "T".into() }), "type");
-    assert_eq!(classify(&BlissError::UnboundVariable(BlissVal(0))), "unbound");
-    assert_eq!(classify(&BlissError::UndefinedFunction(BlissVal(0))), "undef");
+    assert_eq!(
+        classify(&BlissError::TypeError {
+            datum: BlissVal(0),
+            expected: "T".into()
+        }),
+        "type"
+    );
+    assert_eq!(
+        classify(&BlissError::UnboundVariable(BlissVal(0))),
+        "unbound"
+    );
+    assert_eq!(
+        classify(&BlissError::UndefinedFunction(BlissVal(0))),
+        "undef"
+    );
     assert_eq!(classify(&BlissError::ArithmeticError("x".into())), "arith");
     assert_eq!(classify(&BlissError::PackageError("x".into())), "pkg");
     assert_eq!(classify(&BlissError::StreamError("x".into())), "stream");
     assert_eq!(classify(&BlissError::FileError("x".into())), "file");
-    assert_eq!(classify(&BlissError::SandboxViolation("x".into())), "sandbox");
+    assert_eq!(
+        classify(&BlissError::SandboxViolation("x".into())),
+        "sandbox"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════

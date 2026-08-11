@@ -20,27 +20,16 @@ pub enum StdlibError {
     PackageNotFound(String),
 
     /// Stream I/O error.
-    StreamIoError {
-        stream: String,
-        message: String,
-    },
+    StreamIoError { stream: String, message: String },
 
     /// End of file reached unexpectedly.
-    EndOfFile {
-        stream: String,
-    },
+    EndOfFile { stream: String },
 
     /// Pathname resolution error.
-    PathnameError {
-        pathname: String,
-        message: String,
-    },
+    PathnameError { pathname: String, message: String },
 
     /// Logical pathname translation error.
-    LogicalPathnameError {
-        host: String,
-        message: String,
-    },
+    LogicalPathnameError { host: String, message: String },
 
     /// FORMAT directive error (invalid control string).
     FormatError {
@@ -50,15 +39,10 @@ pub enum StdlibError {
     },
 
     /// CLOS protocol error (e.g., slot not found, invalid class).
-    ClosError {
-        message: String,
-    },
+    ClosError { message: String },
 
     /// Unbound slot access.
-    UnboundSlot {
-        instance: String,
-        slot_name: String,
-    },
+    UnboundSlot { instance: String, slot_name: String },
 
     /// Method combination error.
     MethodCombinationError {
@@ -73,26 +57,28 @@ pub enum StdlibError {
     },
 
     /// Hash table error.
-    HashTableError {
-        message: String,
-    },
+    HashTableError { message: String },
 
     /// Sort comparison error (predicate returned invalid result).
-    SortError {
-        message: String,
-    },
+    SortError { message: String },
 
     /// Print-not-readable error.
-    PrintNotReadable {
-        object: String,
-    },
+    PrintNotReadable { object: String },
 }
 
 impl core::fmt::Display for StdlibError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            StdlibError::PackageConflict { package, symbol, message } => {
-                write!(f, "Package conflict in {}: symbol {} — {}", package, symbol, message)
+            StdlibError::PackageConflict {
+                package,
+                symbol,
+                message,
+            } => {
+                write!(
+                    f,
+                    "Package conflict in {}: symbol {} — {}",
+                    package, symbol, message
+                )
             }
             StdlibError::PackageNotFound(name) => {
                 write!(f, "Package not found: {}", name)
@@ -109,20 +95,45 @@ impl core::fmt::Display for StdlibError {
             StdlibError::LogicalPathnameError { host, message } => {
                 write!(f, "Logical pathname error for host {}: {}", host, message)
             }
-            StdlibError::FormatError { control_string, position, message } => {
-                write!(f, "FORMAT error in {:?} at position {}: {}", control_string, position, message)
+            StdlibError::FormatError {
+                control_string,
+                position,
+                message,
+            } => {
+                write!(
+                    f,
+                    "FORMAT error in {:?} at position {}: {}",
+                    control_string, position, message
+                )
             }
             StdlibError::ClosError { message } => {
                 write!(f, "CLOS error: {}", message)
             }
-            StdlibError::UnboundSlot { instance, slot_name } => {
+            StdlibError::UnboundSlot {
+                instance,
+                slot_name,
+            } => {
                 write!(f, "Unbound slot {} in instance {}", slot_name, instance)
             }
-            StdlibError::MethodCombinationError { generic_function, message } => {
-                write!(f, "Method combination error in {}: {}", generic_function, message)
+            StdlibError::MethodCombinationError {
+                generic_function,
+                message,
+            } => {
+                write!(
+                    f,
+                    "Method combination error in {}: {}",
+                    generic_function, message
+                )
             }
-            StdlibError::SequenceBoundsError { sequence_length, index } => {
-                write!(f, "Sequence index {} out of bounds for length {}", index, sequence_length)
+            StdlibError::SequenceBoundsError {
+                sequence_length,
+                index,
+            } => {
+                write!(
+                    f,
+                    "Sequence index {} out of bounds for length {}",
+                    index, sequence_length
+                )
             }
             StdlibError::HashTableError { message } => {
                 write!(f, "Hash table error: {}", message)

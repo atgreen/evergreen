@@ -7,8 +7,8 @@ use bliss_rt::value::{BlissVal, NIL, TAG_HEAP_OBJECT};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Internal data ─────────────────────────────────────────────────
 
@@ -166,11 +166,7 @@ fn get_record(pathname: BlissVal) -> Option<PathnameRecord> {
 }
 
 fn nil_if_empty(s: String) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn resolve_home_path(input: &str) -> Result<String, BlissError> {
@@ -233,7 +229,10 @@ fn parse_physical_namestring(s: &str) -> Result<ParsedPathname, BlissError> {
     let expanded = resolve_home_path(s)?;
     let absolute = expanded.starts_with('/');
     let trailing_slash = expanded.ends_with('/');
-    let tokens: Vec<&str> = expanded.split('/').filter(|part| !part.is_empty()).collect();
+    let tokens: Vec<&str> = expanded
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
 
     let (dir_tokens, final_token) = if trailing_slash || tokens.is_empty() {
         (tokens.as_slice(), None)
@@ -253,8 +252,20 @@ fn parse_physical_namestring(s: &str) -> Result<ParsedPathname, BlissError> {
     let (name, type_field) = if let Some(token) = final_token {
         let (name, type_field) = split_name_type(token);
         (
-            name.map(|value| if value == "*" { ComponentSpec::Wild } else { ComponentSpec::Literal(value) }),
-            type_field.map(|value| if value == "*" { ComponentSpec::Wild } else { ComponentSpec::Literal(value) }),
+            name.map(|value| {
+                if value == "*" {
+                    ComponentSpec::Wild
+                } else {
+                    ComponentSpec::Literal(value)
+                }
+            }),
+            type_field.map(|value| {
+                if value == "*" {
+                    ComponentSpec::Wild
+                } else {
+                    ComponentSpec::Literal(value)
+                }
+            }),
         )
     } else {
         (None, None)
@@ -269,14 +280,20 @@ fn parse_physical_namestring(s: &str) -> Result<ParsedPathname, BlissError> {
     })
 }
 
-fn parse_logical_namestring(s: &str, forced_host: Option<String>) -> Result<ParsedPathname, BlissError> {
+fn parse_logical_namestring(
+    s: &str,
+    forced_host: Option<String>,
+) -> Result<ParsedPathname, BlissError> {
     let (host_name, rest) = if let Some(host) = forced_host {
         let remainder = s.split_once(':').map(|(_, tail)| tail).unwrap_or(s);
         (host.to_uppercase(), remainder)
     } else if let Some((host, tail)) = s.split_once(':') {
         (host.to_uppercase(), tail)
     } else {
-        return Err(BlissError::FileError(format!("invalid logical namestring: {}", s)));
+        return Err(BlissError::FileError(format!(
+            "invalid logical namestring: {}",
+            s
+        )));
     };
 
     let relative = rest.starts_with(';');
@@ -316,10 +333,20 @@ fn parse_logical_namestring(s: &str, forced_host: Option<String>) -> Result<Pars
         let name_piece = pieces.first().copied().unwrap_or("");
         let type_piece = pieces.get(1).copied().unwrap_or("");
         (
-            nil_if_empty(name_piece.to_string())
-                .map(|value| if value == "*" { ComponentSpec::Wild } else { ComponentSpec::Literal(value) }),
-            nil_if_empty(type_piece.to_string())
-                .map(|value| if value == "*" { ComponentSpec::Wild } else { ComponentSpec::Literal(value) }),
+            nil_if_empty(name_piece.to_string()).map(|value| {
+                if value == "*" {
+                    ComponentSpec::Wild
+                } else {
+                    ComponentSpec::Literal(value)
+                }
+            }),
+            nil_if_empty(type_piece.to_string()).map(|value| {
+                if value == "*" {
+                    ComponentSpec::Wild
+                } else {
+                    ComponentSpec::Literal(value)
+                }
+            }),
         )
     } else {
         (None, None)
@@ -371,8 +398,11 @@ fn directory_from_val(val: BlissVal, uppercase: bool) -> Result<Option<Directory
     }
     if let Some(s) = lookup_string(val) {
         if s.contains(';') || (!s.starts_with('/') && s.contains(':')) {
-            return Ok(parse_logical_namestring(&format!("H:{}", s.trim_start_matches("H:")), Some("H".to_string()))?
-                .directory);
+            return Ok(parse_logical_namestring(
+                &format!("H:{}", s.trim_start_matches("H:")),
+                Some("H".to_string()),
+            )?
+            .directory);
         }
         return Ok(parse_physical_namestring(&s)?.directory);
     }
@@ -505,7 +535,9 @@ fn normalize_record(
 
     let parsed = ParsedPathname {
         is_logical,
-        host_name: host_name.clone().map(|s| if is_logical { s.to_uppercase() } else { s }),
+        host_name: host_name
+            .clone()
+            .map(|s| if is_logical { s.to_uppercase() } else { s }),
         directory: directory_from_val(directory, is_logical)?,
         name: component_from_val(name, is_logical),
         type_field: component_from_val(type_field, is_logical),
@@ -525,7 +557,10 @@ fn normalize_record(
     })
 }
 
-fn build_record_from_namestring(parsed: ParsedPathname, supplied_host: Option<BlissVal>) -> PathnameRecord {
+fn build_record_from_namestring(
+    parsed: ParsedPathname,
+    supplied_host: Option<BlissVal>,
+) -> PathnameRecord {
     let host = if let Some(host) = supplied_host {
         host
     } else if let Some(host_name) = &parsed.host_name {
@@ -596,12 +631,7 @@ pub fn make_pathname(
     version: BlissVal,
 ) -> Result<BlissVal, BlissError> {
     Ok(make_record_value(normalize_record(
-        host,
-        device,
-        directory,
-        name,
-        type_field,
-        version,
+        host, device, directory, name, type_field, version,
     )?))
 }
 
@@ -633,9 +663,17 @@ pub fn merge_pathnames(
         (None, None) => None,
     };
 
-    let name = if primary.name == NIL { def.name } else { primary.name };
+    let name = if primary.name == NIL {
+        def.name
+    } else {
+        primary.name
+    };
     let version = if primary.name != NIL {
-        if primary.version == NIL { default_version } else { primary.version }
+        if primary.version == NIL {
+            default_version
+        } else {
+            primary.version
+        }
     } else if primary.version != NIL {
         primary.version
     } else if def.version != NIL {
@@ -645,18 +683,45 @@ pub fn merge_pathnames(
     };
 
     let merged = PathnameRecord {
-        host: if primary.host == NIL { def.host } else { primary.host },
-        device: if primary.device == NIL { def.device } else { primary.device },
-        directory: stringify_directory(&merged_dir, primary.parsed.is_logical || def.parsed.is_logical),
+        host: if primary.host == NIL {
+            def.host
+        } else {
+            primary.host
+        },
+        device: if primary.device == NIL {
+            def.device
+        } else {
+            primary.device
+        },
+        directory: stringify_directory(
+            &merged_dir,
+            primary.parsed.is_logical || def.parsed.is_logical,
+        ),
         name,
-        type_field: if primary.type_field == NIL { def.type_field } else { primary.type_field },
+        type_field: if primary.type_field == NIL {
+            def.type_field
+        } else {
+            primary.type_field
+        },
         version,
         parsed: ParsedPathname {
             is_logical: primary.parsed.is_logical || def.parsed.is_logical,
-            host_name: primary.parsed.host_name.clone().or_else(|| def.parsed.host_name.clone()),
+            host_name: primary
+                .parsed
+                .host_name
+                .clone()
+                .or_else(|| def.parsed.host_name.clone()),
             directory: merged_dir,
-            name: primary.parsed.name.clone().or_else(|| def.parsed.name.clone()),
-            type_field: primary.parsed.type_field.clone().or_else(|| def.parsed.type_field.clone()),
+            name: primary
+                .parsed
+                .name
+                .clone()
+                .or_else(|| def.parsed.name.clone()),
+            type_field: primary
+                .parsed
+                .type_field
+                .clone()
+                .or_else(|| def.parsed.type_field.clone()),
         },
         namestring: None,
     };
@@ -701,7 +766,11 @@ pub fn pathname_version(pathname: BlissVal) -> BlissVal {
 
 fn match_glob(value: &str, pattern: &str) -> Option<Vec<String>> {
     if !pattern.contains('*') {
-        return if value == pattern { Some(Vec::new()) } else { None };
+        return if value == pattern {
+            Some(Vec::new())
+        } else {
+            None
+        };
     }
 
     let pieces: Vec<&str> = pattern.split('*').collect();
@@ -752,7 +821,10 @@ struct MatchCaptures {
     directory_inferiors: Vec<String>,
 }
 
-fn match_component(value: &Option<ComponentSpec>, pattern: &Option<ComponentSpec>) -> Option<(Option<String>, Vec<String>)> {
+fn match_component(
+    value: &Option<ComponentSpec>,
+    pattern: &Option<ComponentSpec>,
+) -> Option<(Option<String>, Vec<String>)> {
     match pattern {
         None => {
             if value.is_none() {
@@ -774,7 +846,9 @@ fn match_component(value: &Option<ComponentSpec>, pattern: &Option<ComponentSpec
                 let fragments = match_glob(text, pattern_text)?;
                 Some((Some(text.clone()), fragments))
             }
-            Some(ComponentSpec::Wild) => match_glob("*", pattern_text).map(|fragments| (Some("*".to_string()), fragments)),
+            Some(ComponentSpec::Wild) => {
+                match_glob("*", pattern_text).map(|fragments| (Some("*".to_string()), fragments))
+            }
             None => None,
         },
     }
@@ -834,8 +908,10 @@ fn match_directory_parts(
                 false
             }
         }
-        DirPart::Up => matches!(value.first(), Some(DirPart::Up))
-            && match_directory_parts(&value[1..], &pattern[1..], captures),
+        DirPart::Up => {
+            matches!(value.first(), Some(DirPart::Up))
+                && match_directory_parts(&value[1..], &pattern[1..], captures)
+        }
     }
 }
 
@@ -849,7 +925,8 @@ fn pathname_match_with_captures(
     if wildcard.device != NIL && pathname.device != wildcard.device {
         return None;
     }
-    if wildcard.version != NIL && pathname.version != wildcard.version && !is_wild(wildcard.version) {
+    if wildcard.version != NIL && pathname.version != wildcard.version && !is_wild(wildcard.version)
+    {
         return None;
     }
 
@@ -865,11 +942,13 @@ fn pathname_match_with_captures(
         _ => return None,
     }
 
-    let (name_capture, name_fragments) = match_component(&pathname.parsed.name, &wildcard.parsed.name)?;
+    let (name_capture, name_fragments) =
+        match_component(&pathname.parsed.name, &wildcard.parsed.name)?;
     captures.name = name_capture;
     captures.name_fragments = name_fragments;
 
-    let (type_capture, type_fragments) = match_component(&pathname.parsed.type_field, &wildcard.parsed.type_field)?;
+    let (type_capture, type_fragments) =
+        match_component(&pathname.parsed.type_field, &wildcard.parsed.type_field)?;
     captures.type_field = type_capture;
     captures.type_fragments = type_fragments;
 
@@ -897,9 +976,14 @@ fn component_is_wild(component: &Option<ComponentSpec>) -> bool {
 }
 
 fn directory_is_wild(directory: &Option<DirectorySpec>) -> bool {
-    directory.as_ref().map(|dir| {
-        dir.parts.iter().any(|part| matches!(part, DirPart::Wild | DirPart::WildInferiors))
-    }).unwrap_or(false)
+    directory
+        .as_ref()
+        .map(|dir| {
+            dir.parts
+                .iter()
+                .any(|part| matches!(part, DirPart::Wild | DirPart::WildInferiors))
+        })
+        .unwrap_or(false)
 }
 
 pub fn wild_pathname_p(pathname: BlissVal, field: Option<BlissVal>) -> bool {
@@ -914,7 +998,9 @@ pub fn wild_pathname_p(pathname: BlissVal, field: Option<BlissVal>) -> bool {
                 || component_is_wild(&rec.parsed.type_field)
                 || is_wild(rec.version)
         }
-        Some(field_kw) if is_keyword(field_kw, "DIRECTORY") => directory_is_wild(&rec.parsed.directory),
+        Some(field_kw) if is_keyword(field_kw, "DIRECTORY") => {
+            directory_is_wild(&rec.parsed.directory)
+        }
         Some(field_kw) if is_keyword(field_kw, "NAME") => component_is_wild(&rec.parsed.name),
         Some(field_kw) if is_keyword(field_kw, "TYPE") => component_is_wild(&rec.parsed.type_field),
         Some(field_kw) if is_keyword(field_kw, "VERSION") => is_wild(rec.version),
@@ -978,7 +1064,10 @@ fn apply_component_capture(
     }
 }
 
-fn apply_directory_capture(target: &Option<DirectorySpec>, captures: &MatchCaptures) -> Option<DirectorySpec> {
+fn apply_directory_capture(
+    target: &Option<DirectorySpec>,
+    captures: &MatchCaptures,
+) -> Option<DirectorySpec> {
     target.as_ref().map(|dir| {
         let mut wild_idx = 0usize;
         let mut parts = Vec::new();
@@ -1011,16 +1100,32 @@ fn translate_pathname_with_patterns(
     from_pattern: &PathnameRecord,
     to_pattern: &PathnameRecord,
 ) -> Result<PathnameRecord, BlissError> {
-    let captures = pathname_match_with_captures(source, from_pattern)
-        .ok_or_else(|| BlissError::FileError("source pathname does not match translation".to_string()))?;
+    let captures = pathname_match_with_captures(source, from_pattern).ok_or_else(|| {
+        BlissError::FileError("source pathname does not match translation".to_string())
+    })?;
     let parsed = ParsedPathname {
         is_logical: to_pattern.parsed.is_logical,
         host_name: to_pattern.parsed.host_name.clone(),
         directory: apply_directory_capture(&to_pattern.parsed.directory, &captures),
-        name: apply_component_capture(&to_pattern.parsed.name, captures.name.as_ref(), &captures.name_fragments),
-        type_field: apply_component_capture(&to_pattern.parsed.type_field, captures.type_field.as_ref(), &captures.type_fragments),
+        name: apply_component_capture(
+            &to_pattern.parsed.name,
+            captures.name.as_ref(),
+            &captures.name_fragments,
+        ),
+        type_field: apply_component_capture(
+            &to_pattern.parsed.type_field,
+            captures.type_field.as_ref(),
+            &captures.type_fragments,
+        ),
     };
-    Ok(build_record_from_namestring(parsed, if to_pattern.host == NIL { None } else { Some(to_pattern.host) }))
+    Ok(build_record_from_namestring(
+        parsed,
+        if to_pattern.host == NIL {
+            None
+        } else {
+            Some(to_pattern.host)
+        },
+    ))
 }
 
 pub fn translate_logical_pathname(pathname: BlissVal) -> Result<BlissVal, BlissError> {
@@ -1028,22 +1133,31 @@ pub fn translate_logical_pathname(pathname: BlissVal) -> Result<BlissVal, BlissE
         datum: pathname,
         expected: "pathname".to_string(),
     })?;
-    let host = rec.parsed.host_name.clone().ok_or_else(|| {
-        BlissError::TypeError {
+    let host = rec
+        .parsed
+        .host_name
+        .clone()
+        .ok_or_else(|| BlissError::TypeError {
             datum: pathname,
             expected: "logical pathname".to_string(),
-        }
-    })?;
-    let translations_val = with_logical_translations(|map| map.get(&host).copied()).ok_or_else(|| {
-        BlissError::FileError(format!("no translations for logical host {:?}", host))
-    })?;
+        })?;
+    let translations_val =
+        with_logical_translations(|map| map.get(&host).copied()).ok_or_else(|| {
+            BlissError::FileError(format!("no translations for logical host {:?}", host))
+        })?;
     let translations_src = lookup_string(translations_val).ok_or_else(|| {
-        BlissError::FileError(format!("logical host {:?} has unreadable translations", host))
+        BlissError::FileError(format!(
+            "logical host {:?} has unreadable translations",
+            host
+        ))
     })?;
 
     for (from, to) in parse_translation_pairs(&translations_src) {
         let from_host = make_string_bv(&host);
-        let from_rec = build_record_from_namestring(parse_namestring_model(&from, Some(from_host))?, Some(from_host));
+        let from_rec = build_record_from_namestring(
+            parse_namestring_model(&from, Some(from_host))?,
+            Some(from_host),
+        );
         if pathname_match_with_captures(&rec, &from_rec).is_none() {
             continue;
         }
@@ -1074,7 +1188,10 @@ pub fn set_logical_pathname_translations(
 
 pub fn logical_pathname_translations(host: &str) -> Result<BlissVal, BlissError> {
     with_logical_translations(|map| map.get(&host.to_uppercase()).copied()).ok_or_else(|| {
-        BlissError::FileError(format!("no logical pathname translations for host {:?}", host))
+        BlissError::FileError(format!(
+            "no logical pathname translations for host {:?}",
+            host
+        ))
     })
 }
 
@@ -1100,7 +1217,8 @@ pub(crate) fn extract_path_string(val: BlissVal) -> Result<String, BlissError> {
     }
     if get_record(val).is_some() {
         let ns = namestring(val)?;
-        return lookup_string(ns).ok_or_else(|| BlissError::FileError("cannot render pathname".to_string()));
+        return lookup_string(ns)
+            .ok_or_else(|| BlissError::FileError("cannot render pathname".to_string()));
     }
     Err(BlissError::FileError(
         "cannot extract path string from value".to_string(),
@@ -1113,13 +1231,17 @@ fn pathname_from_fs_path(path: &Path) -> Result<BlissVal, BlissError> {
         .map_err(|e| BlissError::FileError(format!("{}: {}", path.display(), e)))?;
     let canon_str = canon.to_string_lossy().to_string();
     let parsed = parse_namestring_model(&canon_str, None)?;
-    Ok(make_record_value(build_record_from_namestring(parsed, None)))
+    Ok(make_record_value(build_record_from_namestring(
+        parsed, None,
+    )))
 }
 
 fn pathname_from_listed_path(path: &Path) -> Result<BlissVal, BlissError> {
     let path_str = path.to_string_lossy().to_string();
     let parsed = parse_namestring_model(&path_str, None)?;
-    Ok(make_record_value(build_record_from_namestring(parsed, None)))
+    Ok(make_record_value(build_record_from_namestring(
+        parsed, None,
+    )))
 }
 
 pub fn probe_file(pathname: BlissVal) -> Result<Option<BlissVal>, BlissError> {
@@ -1138,7 +1260,12 @@ pub fn truename(pathname: BlissVal) -> Result<BlissVal, BlissError> {
 }
 
 fn wildcard_root(parsed: &ParsedPathname) -> PathBuf {
-    let mut root = if parsed.directory.as_ref().map(|d| d.absolute).unwrap_or(false) {
+    let mut root = if parsed
+        .directory
+        .as_ref()
+        .map(|d| d.absolute)
+        .unwrap_or(false)
+    {
         PathBuf::from("/")
     } else {
         PathBuf::from(".")
@@ -1155,7 +1282,11 @@ fn wildcard_root(parsed: &ParsedPathname) -> PathBuf {
     root
 }
 
-fn collect_candidates(root: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<(), BlissError> {
+fn collect_candidates(
+    root: &Path,
+    recursive: bool,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), BlissError> {
     let entries = std::fs::read_dir(root)
         .map_err(|e| BlissError::FileError(format!("{}: {}", root.display(), e)))?;
     for entry in entries {
@@ -1196,9 +1327,16 @@ pub fn directory(pathname: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
         return Ok(result);
     }
 
-    let recursive = rec.parsed.directory.as_ref().map(|dir| {
-        dir.parts.iter().any(|part| matches!(part, DirPart::WildInferiors))
-    }).unwrap_or(false);
+    let recursive = rec
+        .parsed
+        .directory
+        .as_ref()
+        .map(|dir| {
+            dir.parts
+                .iter()
+                .any(|part| matches!(part, DirPart::WildInferiors))
+        })
+        .unwrap_or(false);
     let root = wildcard_root(&rec.parsed);
     let mut candidates = Vec::new();
     collect_candidates(&root, recursive, &mut candidates)?;
@@ -1206,7 +1344,8 @@ pub fn directory(pathname: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
     let mut result = Vec::new();
     for candidate in candidates {
         let candidate_str = candidate.to_string_lossy().to_string();
-        let candidate_rec = build_record_from_namestring(parse_namestring_model(&candidate_str, None)?, None);
+        let candidate_rec =
+            build_record_from_namestring(parse_namestring_model(&candidate_str, None)?, None);
         if pathname_match_with_captures(&candidate_rec, &rec).is_some() {
             result.push(pathname_from_listed_path(&candidate)?);
         }
@@ -1241,7 +1380,10 @@ pub fn rename_file(
     let new_path_str = extract_path_string(new_name)?;
     let old_true = pathname_from_fs_path(Path::new(&old_path_str))?;
     std::fs::rename(&old_path_str, &new_path_str).map_err(|e| {
-        BlissError::FileError(format!("rename {} -> {}: {}", old_path_str, new_path_str, e))
+        BlissError::FileError(format!(
+            "rename {} -> {}: {}",
+            old_path_str, new_path_str, e
+        ))
     })?;
     let new_true = pathname_from_fs_path(Path::new(&new_path_str))?;
     Ok((new_name, old_true, new_true))

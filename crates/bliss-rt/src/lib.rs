@@ -6,18 +6,18 @@
 //! bridge, image persistence, and security sandbox.
 
 // ── Object model ──────────────────────────────────────────────────
-pub mod value;
 pub mod object;
 pub mod types;
+pub mod value;
 
 // ── Memory / GC ───────────────────────────────────────────────────
 pub mod gc;
 
 // ── Thread runtime ────────────────────────────────────────────────
-pub mod thread;
-pub mod stack;
 pub mod safepoint;
 pub mod scheduler;
+pub mod stack;
+pub mod thread;
 
 // ── FFI ───────────────────────────────────────────────────────────
 pub mod ffi;
@@ -35,6 +35,6 @@ pub mod error;
 pub mod runtime;
 
 // ── Re-exports for convenience ────────────────────────────────────
-pub use value::BlissVal;
-pub use object::ObjectHeader;
 pub use error::BlissError;
+pub use object::ObjectHeader;
+pub use value::BlissVal;

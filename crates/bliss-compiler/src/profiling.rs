@@ -15,7 +15,9 @@ pub struct InvocationCounter {
 impl InvocationCounter {
     /// Create a new counter starting at zero.
     pub fn new() -> Self {
-        InvocationCounter { count: Cell::new(0) }
+        InvocationCounter {
+            count: Cell::new(0),
+        }
     }
 
     /// Get the current count.
@@ -50,7 +52,9 @@ pub struct BackEdgeCounter {
 impl BackEdgeCounter {
     /// Create a new counter starting at zero.
     pub fn new() -> Self {
-        BackEdgeCounter { count: Cell::new(0) }
+        BackEdgeCounter {
+            count: Cell::new(0),
+        }
     }
 
     /// Get the current count.
@@ -121,7 +125,8 @@ impl TypeProfile {
             let entry = counts.entry(val.0).or_insert((val, 0));
             entry.1 += 1;
         }
-        counts.into_values()
+        counts
+            .into_values()
             .max_by_key(|&(_, count)| count)
             .map(|(val, _)| val)
     }

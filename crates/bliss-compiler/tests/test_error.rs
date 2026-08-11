@@ -176,11 +176,23 @@ fn register_allocation_error_construction() {
 fn debug_output_reader_error_with_position() {
     let err = CompilerError::ReaderError {
         message: "bad token".into(),
-        position: Some(SourcePos { file: Some("a.lisp".into()), line: 1, column: 0 }),
+        position: Some(SourcePos {
+            file: Some("a.lisp".into()),
+            line: 1,
+            column: 0,
+        }),
     };
     let dbg = format!("{:?}", err);
-    assert!(dbg.contains("ReaderError"), "Debug should contain variant name: {}", dbg);
-    assert!(dbg.contains("bad token"), "Debug should contain message: {}", dbg);
+    assert!(
+        dbg.contains("ReaderError"),
+        "Debug should contain variant name: {}",
+        dbg
+    );
+    assert!(
+        dbg.contains("bad token"),
+        "Debug should contain message: {}",
+        dbg
+    );
 }
 
 #[test]
@@ -190,7 +202,10 @@ fn debug_output_reader_error_no_position() {
         position: None,
     };
     let dbg = format!("{:?}", err);
-    assert!(dbg.contains("ReaderError"), "Debug should contain variant name");
+    assert!(
+        dbg.contains("ReaderError"),
+        "Debug should contain variant name"
+    );
     assert!(dbg.contains("None"), "Debug should show None for position");
 }
 
@@ -265,21 +280,40 @@ fn display_all_variants_produce_nonempty_output() {
     let errors: Vec<CompilerError> = vec![
         CompilerError::ReaderError {
             message: "unexpected )".into(),
-            position: Some(SourcePos { file: Some("x.lisp".into()), line: 5, column: 3 }),
+            position: Some(SourcePos {
+                file: Some("x.lisp".into()),
+                line: 5,
+                column: 3,
+            }),
         },
         CompilerError::MacroExpansionError {
             message: "expansion failed".into(),
             backtrace: vec![],
         },
-        CompilerError::CircularExpansion { macro_name: "WHEN".into() },
-        CompilerError::IrError { message: "dangling edge".into() },
-        CompilerError::OptimisationError { pass_name: "DCE".into(), message: "fault".into() },
-        CompilerError::CodegenError { message: "encoding error".into() },
-        CompilerError::RegisterAllocationError { message: "ran out of registers".into() },
+        CompilerError::CircularExpansion {
+            macro_name: "WHEN".into(),
+        },
+        CompilerError::IrError {
+            message: "dangling edge".into(),
+        },
+        CompilerError::OptimisationError {
+            pass_name: "DCE".into(),
+            message: "fault".into(),
+        },
+        CompilerError::CodegenError {
+            message: "encoding error".into(),
+        },
+        CompilerError::RegisterAllocationError {
+            message: "ran out of registers".into(),
+        },
     ];
     for (i, err) in errors.iter().enumerate() {
         let display = format!("{}", err);
-        assert!(!display.is_empty(), "variant {} display should be non-empty", i);
+        assert!(
+            !display.is_empty(),
+            "variant {} display should be non-empty",
+            i
+        );
     }
 }
 
@@ -304,7 +338,10 @@ fn compiler_error_source_is_none() {
         message: "test".into(),
     };
     let error_ref: &dyn std::error::Error = &err;
-    assert!(error_ref.source().is_none(), "CompilerError::source() should be None");
+    assert!(
+        error_ref.source().is_none(),
+        "CompilerError::source() should be None"
+    );
 }
 
 #[test]
@@ -339,8 +376,16 @@ fn all_variants_implement_error_trait() {
     assert_eq!(errors.len(), 7, "should have all 7 variants");
     for (i, err) in errors.iter().enumerate() {
         let display = format!("{}", err);
-        assert!(!display.is_empty(), "variant {} display should be non-empty", i);
-        assert!(err.source().is_none(), "variant {} source should be None", i);
+        assert!(
+            !display.is_empty(),
+            "variant {} display should be non-empty",
+            i
+        );
+        assert!(
+            err.source().is_none(),
+            "variant {} source should be None",
+            i
+        );
     }
 }
 
@@ -351,13 +396,30 @@ fn match_all_variants_exhaustive() {
     // Ensures we can match on every variant — will fail to compile
     // if a variant is added without updating this test
     let errors = vec![
-        CompilerError::ReaderError { message: "a".into(), position: None },
-        CompilerError::MacroExpansionError { message: "b".into(), backtrace: vec![] },
-        CompilerError::CircularExpansion { macro_name: "c".into() },
-        CompilerError::IrError { message: "d".into() },
-        CompilerError::OptimisationError { pass_name: "e".into(), message: "f".into() },
-        CompilerError::CodegenError { message: "g".into() },
-        CompilerError::RegisterAllocationError { message: "h".into() },
+        CompilerError::ReaderError {
+            message: "a".into(),
+            position: None,
+        },
+        CompilerError::MacroExpansionError {
+            message: "b".into(),
+            backtrace: vec![],
+        },
+        CompilerError::CircularExpansion {
+            macro_name: "c".into(),
+        },
+        CompilerError::IrError {
+            message: "d".into(),
+        },
+        CompilerError::OptimisationError {
+            pass_name: "e".into(),
+            message: "f".into(),
+        },
+        CompilerError::CodegenError {
+            message: "g".into(),
+        },
+        CompilerError::RegisterAllocationError {
+            message: "h".into(),
+        },
     ];
     for err in &errors {
         match err {
@@ -376,7 +438,11 @@ fn match_all_variants_exhaustive() {
 
 #[test]
 fn source_pos_clone_inside_reader_error() {
-    let pos = SourcePos { file: Some("main.lisp".into()), line: 100, column: 42 };
+    let pos = SourcePos {
+        file: Some("main.lisp".into()),
+        line: 100,
+        column: 42,
+    };
     let pos2 = pos.clone();
     let err = CompilerError::ReaderError {
         message: "test".into(),
@@ -397,15 +463,27 @@ fn source_pos_clone_inside_reader_error() {
 
 #[test]
 fn source_pos_debug_output() {
-    let pos = SourcePos { file: None, line: 0, column: 0 };
+    let pos = SourcePos {
+        file: None,
+        line: 0,
+        column: 0,
+    };
     let dbg = format!("{:?}", pos);
-    assert!(dbg.contains("SourcePos"), "Debug should mention SourcePos: {}", dbg);
+    assert!(
+        dbg.contains("SourcePos"),
+        "Debug should mention SourcePos: {}",
+        dbg
+    );
     assert!(dbg.contains("None"), "Debug should show None file: {}", dbg);
 }
 
 #[test]
 fn source_pos_with_file_debug() {
-    let pos = SourcePos { file: Some("foo.lisp".into()), line: 99, column: 12 };
+    let pos = SourcePos {
+        file: Some("foo.lisp".into()),
+        line: 99,
+        column: 12,
+    };
     let dbg = format!("{:?}", pos);
     assert!(dbg.contains("foo.lisp"));
     assert!(dbg.contains("99"));

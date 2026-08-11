@@ -8,7 +8,7 @@
 //! See spec §5.7.
 
 use bliss_rt::error::BlissError;
-use bliss_rt::object::{type_id, CompiledFunctionData, ConsCell, ObjectHeader};
+use bliss_rt::object::{CompiledFunctionData, ConsCell, ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
 
 /// Hash table test function.
@@ -234,7 +234,10 @@ fn cl_equalp(a: BlissVal, b: BlissVal) -> bool {
                 if sa.len() != sb.len() {
                     return false;
                 }
-                return sa.iter().zip(sb.iter()).all(|(&x, &y)| x.eq_ignore_ascii_case(&y));
+                return sa
+                    .iter()
+                    .zip(sb.iter())
+                    .all(|(&x, &y)| x.eq_ignore_ascii_case(&y));
             }
         }
     }
@@ -373,11 +376,7 @@ fn resize_table(inner: &mut HashTableInner) {
 }
 
 /// Set a value in a hash table (CL `(SETF GETHASH)`).
-pub fn set_gethash(
-    key: BlissVal,
-    table: BlissVal,
-    value: BlissVal,
-) -> Result<(), BlissError> {
+pub fn set_gethash(key: BlissVal, table: BlissVal, value: BlissVal) -> Result<(), BlissError> {
     let ptr = get_table_inner(table)?;
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
     // We create exactly one &mut reference from the raw pointer per call.
@@ -528,8 +527,7 @@ fn try_invoke_function(function: BlissVal, key: BlissVal, value: BlissVal) {
             return;
         }
         // Cast the entry point to the two-argument calling convention.
-        let func: extern "C" fn(BlissVal, BlissVal) -> BlissVal =
-            std::mem::transmute(entry);
+        let func: extern "C" fn(BlissVal, BlissVal) -> BlissVal = std::mem::transmute(entry);
         // Call the function; discard the return value per CL spec.
         let _ = func(key, value);
     }

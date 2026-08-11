@@ -60,7 +60,12 @@ fn add_edge_appears_in_uses_and_inputs() {
     let mut g = IrGraph::new();
     let a = g.add_node(NodeKind::Start);
     let b = g.add_node(NodeKind::Return);
-    g.add_edge(Edge { from: a, to: b, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge {
+        from: a,
+        to: b,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
     assert_eq!(g.uses(a).len(), 1);
     assert_eq!(g.uses(a)[0].to, b);
     assert_eq!(g.uses(a)[0].kind, EdgeKind::Control);
@@ -74,8 +79,18 @@ fn multiple_edges_different_kinds() {
     let mut g = IrGraph::new();
     let a = g.add_node(NodeKind::Start);
     let b = g.add_node(NodeKind::MemStore { offset: 0 });
-    g.add_edge(Edge { from: a, to: b, kind: EdgeKind::Control, input_index: 0 });
-    g.add_edge(Edge { from: a, to: b, kind: EdgeKind::Memory, input_index: 1 });
+    g.add_edge(Edge {
+        from: a,
+        to: b,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
+    g.add_edge(Edge {
+        from: a,
+        to: b,
+        kind: EdgeKind::Memory,
+        input_index: 1,
+    });
     assert_eq!(g.inputs(b).len(), 2);
     assert_eq!(g.uses(a).len(), 2);
 }
@@ -85,7 +100,12 @@ fn data_edge_connects_producer_to_consumer() {
     let mut g = IrGraph::new();
     let c = g.add_node(NodeKind::Constant(NIL));
     let r = g.add_node(NodeKind::Return);
-    g.add_edge(Edge { from: c, to: r, kind: EdgeKind::Data, input_index: 0 });
+    g.add_edge(Edge {
+        from: c,
+        to: r,
+        kind: EdgeKind::Data,
+        input_index: 0,
+    });
     assert_eq!(g.inputs(r)[0].kind, EdgeKind::Data);
 }
 
@@ -107,7 +127,15 @@ fn source_info_none_by_default() {
 fn set_and_get_source_info() {
     let mut g = IrGraph::new();
     let id = g.add_node(NodeKind::Call);
-    g.set_source_info(id, IrSourceInfo { file: Some("test.lisp".into()), line: 42, column: 7, form: None });
+    g.set_source_info(
+        id,
+        IrSourceInfo {
+            file: Some("test.lisp".into()),
+            line: 42,
+            column: 7,
+            form: None,
+        },
+    );
     let info = g.source_info(id).expect("should have source info");
     assert_eq!(info.file.as_deref(), Some("test.lisp"));
     assert_eq!(info.line, 42);
@@ -119,7 +147,12 @@ fn remove_node_decrements_count_and_clears_edges() {
     let mut g = IrGraph::new();
     let a = g.add_node(NodeKind::Constant(NIL));
     let b = g.add_node(NodeKind::Return);
-    g.add_edge(Edge { from: a, to: b, kind: EdgeKind::Data, input_index: 0 });
+    g.add_edge(Edge {
+        from: a,
+        to: b,
+        kind: EdgeKind::Data,
+        input_index: 0,
+    });
     assert_eq!(g.node_count(), 2);
     g.remove_node(a);
     assert_eq!(g.node_count(), 1);
@@ -132,7 +165,12 @@ fn replace_uses_redirects_edges() {
     let old = g.add_node(NodeKind::Constant(NIL));
     let new_n = g.add_node(NodeKind::Parameter(0));
     let ret = g.add_node(NodeKind::Return);
-    g.add_edge(Edge { from: old, to: ret, kind: EdgeKind::Data, input_index: 0 });
+    g.add_edge(Edge {
+        from: old,
+        to: ret,
+        kind: EdgeKind::Data,
+        input_index: 0,
+    });
     g.replace_uses(old, new_n);
     assert_eq!(g.inputs(ret)[0].from, new_n);
     assert_eq!(g.uses(old).len(), 0);
@@ -145,9 +183,14 @@ fn ir_builder_build_constant_produces_ok_graph() {
     // NIL is a self-evaluating constant; building it should succeed and
     // produce a graph containing at least one Constant node.
     let mut builder = IrBuilder::new();
-    let graph = builder.build(NIL).expect("building a self-evaluating form (NIL) should succeed");
+    let graph = builder
+        .build(NIL)
+        .expect("building a self-evaluating form (NIL) should succeed");
     // The resulting graph must have at least a Start node and a Constant node.
-    assert!(graph.node_count() >= 2, "graph for a constant form should have at least Start + Constant nodes");
+    assert!(
+        graph.node_count() >= 2,
+        "graph for a constant form should have at least Start + Constant nodes"
+    );
 }
 
 #[test]
@@ -157,7 +200,10 @@ fn ir_builder_build_nil_produces_graph_with_start_node() {
     let mut builder = IrBuilder::new();
     let graph = builder.build(NIL).expect("NIL should build successfully");
     // Verify the graph is non-trivial
-    assert!(graph.node_count() >= 2, "built graph for NIL must contain at least Start + Constant nodes");
+    assert!(
+        graph.node_count() >= 2,
+        "built graph for NIL must contain at least Start + Constant nodes"
+    );
     // Verify the graph has a Start node
     let start_id = graph.start();
     assert!(matches!(graph.node_kind(start_id), NodeKind::Start));
@@ -168,7 +214,10 @@ fn ir_builder_verify_built_graph_is_well_formed() {
     // A graph built from a valid form should pass verification.
     let mut builder = IrBuilder::new();
     let graph = builder.build(NIL).expect("NIL should build successfully");
-    assert!(verify(&graph).is_ok(), "graph built from valid form should pass verification");
+    assert!(
+        verify(&graph).is_ok(),
+        "graph built from valid form should pass verification"
+    );
 }
 
 // ── Verifier: Issue #4 — additional verification checks ──────────
@@ -178,7 +227,12 @@ fn verify_well_formed_trivial_graph() {
     let mut g = IrGraph::new();
     let s = g.add_node(NodeKind::Start);
     let r = g.add_node(NodeKind::Return);
-    g.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge {
+        from: s,
+        to: r,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
     assert!(verify(&g).is_ok(), "trivial graph should verify");
 }
 
@@ -188,7 +242,12 @@ fn verify_detects_dangling_edge() {
     let mut g = IrGraph::new();
     let a = g.add_node(NodeKind::Start);
     let b = g.add_node(NodeKind::Return);
-    g.add_edge(Edge { from: a, to: b, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge {
+        from: a,
+        to: b,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
     g.remove_node(a);
     assert!(verify(&g).is_err());
 }
@@ -204,15 +263,33 @@ fn verify_detects_use_list_inconsistency() {
     let s = g.add_node(NodeKind::Start);
     let c = g.add_node(NodeKind::Constant(NIL));
     let r = g.add_node(NodeKind::Return);
-    g.add_edge(Edge { from: s, to: r, kind: EdgeKind::Control, input_index: 0 });
-    g.add_edge(Edge { from: c, to: r, kind: EdgeKind::Data, input_index: 1 });
+    g.add_edge(Edge {
+        from: s,
+        to: r,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
+    g.add_edge(Edge {
+        from: c,
+        to: r,
+        kind: EdgeKind::Data,
+        input_index: 1,
+    });
     // Remove the constant node — this should clear edges.
     // Then add an edge referencing the dead node — creates a dangling/inconsistent state.
     g.remove_node(c);
     // Now r's input at slot 1 should be gone, but we add a new edge to a dead node.
-    g.add_edge(Edge { from: c, to: r, kind: EdgeKind::Data, input_index: 1 });
+    g.add_edge(Edge {
+        from: c,
+        to: r,
+        kind: EdgeKind::Data,
+        input_index: 1,
+    });
     // Verify should detect this (V1 dangling reference or V2 use-list inconsistency).
-    assert!(verify(&g).is_err(), "verify should detect edge to dead/removed node (V1/V2)");
+    assert!(
+        verify(&g).is_err(),
+        "verify should detect edge to dead/removed node (V1/V2)"
+    );
 }
 
 #[test]
@@ -229,11 +306,26 @@ fn verify_detects_ssa_dominance_violation() {
     let _c1 = g.add_node(NodeKind::Constant(NIL));
 
     // Start -> Branch
-    g.add_edge(Edge { from: start, to: branch, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge {
+        from: start,
+        to: branch,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
     // Branch -> Region (only one arm connected, simulating incomplete CFG)
-    g.add_edge(Edge { from: branch, to: region, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge {
+        from: branch,
+        to: region,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
     // Region -> Return
-    g.add_edge(Edge { from: region, to: ret, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge {
+        from: region,
+        to: ret,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
 
     // Make c1 used by ret, but c1 is placed after the branch in a way that
     // violates dominance — c1 has no control edge anchoring it before ret.
@@ -242,9 +334,17 @@ fn verify_detects_ssa_dominance_violation() {
     // Use a MemLoad (pinned/side-effecting) without proper control input to violate V3/V6.
     let bad_load = g.add_node(NodeKind::MemLoad { offset: 0 });
     // bad_load has no control input (violates V6 for pinned nodes)
-    g.add_edge(Edge { from: bad_load, to: ret, kind: EdgeKind::Data, input_index: 1 });
+    g.add_edge(Edge {
+        from: bad_load,
+        to: ret,
+        kind: EdgeKind::Data,
+        input_index: 1,
+    });
 
-    assert!(verify(&g).is_err(), "verify should detect control edge integrity violation (V6) for pinned node without control input");
+    assert!(
+        verify(&g).is_err(),
+        "verify should detect control edge integrity violation (V6) for pinned node without control input"
+    );
 }
 
 #[test]
@@ -258,21 +358,54 @@ fn verify_detects_phi_wrong_input_count() {
     let ret = g.add_node(NodeKind::Return);
 
     // Region has 2 control inputs
-    g.add_edge(Edge { from: start, to: region, kind: EdgeKind::Control, input_index: 0 });
-    g.add_edge(Edge { from: start, to: region, kind: EdgeKind::Control, input_index: 1 });
+    g.add_edge(Edge {
+        from: start,
+        to: region,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
+    g.add_edge(Edge {
+        from: start,
+        to: region,
+        kind: EdgeKind::Control,
+        input_index: 1,
+    });
     // Region -> Return
-    g.add_edge(Edge { from: region, to: ret, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge {
+        from: region,
+        to: ret,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
 
     // Phi references region
-    g.add_edge(Edge { from: region, to: phi, kind: EdgeKind::Data, input_index: 0 });
+    g.add_edge(Edge {
+        from: region,
+        to: phi,
+        kind: EdgeKind::Data,
+        input_index: 0,
+    });
     // But Phi only has 1 value input when it should have 2 (one per Region predecessor)
     let c1 = g.add_node(NodeKind::Constant(NIL));
-    g.add_edge(Edge { from: c1, to: phi, kind: EdgeKind::Data, input_index: 1 });
+    g.add_edge(Edge {
+        from: c1,
+        to: phi,
+        kind: EdgeKind::Data,
+        input_index: 1,
+    });
     // Missing second value input — Phi has 1 value input but Region has 2 control inputs.
 
-    g.add_edge(Edge { from: phi, to: ret, kind: EdgeKind::Data, input_index: 1 });
+    g.add_edge(Edge {
+        from: phi,
+        to: ret,
+        kind: EdgeKind::Data,
+        input_index: 1,
+    });
 
-    assert!(verify(&g).is_err(), "verify should detect Phi with wrong number of value inputs (V4)");
+    assert!(
+        verify(&g).is_err(),
+        "verify should detect Phi with wrong number of value inputs (V4)"
+    );
 }
 
 #[test]
@@ -284,12 +417,30 @@ fn verify_detects_bad_control_edge_count() {
     let store = g.add_node(NodeKind::MemStore { offset: 0 });
     let ret = g.add_node(NodeKind::Return);
 
-    g.add_edge(Edge { from: start, to: ret, kind: EdgeKind::Control, input_index: 0 });
+    g.add_edge(Edge {
+        from: start,
+        to: ret,
+        kind: EdgeKind::Control,
+        input_index: 0,
+    });
     // store has no control input — violates V6 for pinned/side-effecting nodes
     // Just a data edge to make it referenced
     let c = g.add_node(NodeKind::Constant(NIL));
-    g.add_edge(Edge { from: c, to: store, kind: EdgeKind::Data, input_index: 0 });
-    g.add_edge(Edge { from: store, to: ret, kind: EdgeKind::Memory, input_index: 1 });
+    g.add_edge(Edge {
+        from: c,
+        to: store,
+        kind: EdgeKind::Data,
+        input_index: 0,
+    });
+    g.add_edge(Edge {
+        from: store,
+        to: ret,
+        kind: EdgeKind::Memory,
+        input_index: 1,
+    });
 
-    assert!(verify(&g).is_err(), "verify should detect pinned node (MemStore) with no control input (V6)");
+    assert!(
+        verify(&g).is_err(),
+        "verify should detect pinned node (MemStore) with no control input (V6)"
+    );
 }

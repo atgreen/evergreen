@@ -35,10 +35,7 @@ pub enum BlissError {
     Internal(String),
 
     /// Type error (wrong argument type). Maps to CL `TYPE-ERROR`.
-    TypeError {
-        datum: BlissVal,
-        expected: String,
-    },
+    TypeError { datum: BlissVal, expected: String },
 
     /// Unbound variable. Maps to CL `UNBOUND-VARIABLE`.
     UnboundVariable(BlissVal),

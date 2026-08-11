@@ -2,9 +2,11 @@
 //! See spec §6.
 
 use bliss_rt::error::BlissError;
-use bliss_rt::value::{BlissVal, T, NIL, TAG_MASK, TAG_FIXNUM, TAG_CONS, TAG_HEAP_OBJECT,
-                       TAG_CHARACTER, TAG_SINGLE_FLOAT, TAG_SYMBOL, TAG_FUNCTION, TAG_SPECIAL,
-                       NIL_BITS, T_BITS, UNBOUND_BITS, MISSING_BITS, EOF_BITS};
+use bliss_rt::value::{
+    BlissVal, EOF_BITS, MISSING_BITS, NIL, NIL_BITS, T, T_BITS, TAG_CHARACTER, TAG_CONS,
+    TAG_FIXNUM, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK, TAG_SINGLE_FLOAT, TAG_SPECIAL, TAG_SYMBOL,
+    UNBOUND_BITS,
+};
 
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
@@ -48,8 +50,12 @@ impl ReplState {
             input_buffer: String::new(),
         }
     }
-    pub fn package(&self) -> BlissVal { self.current_package }
-    pub fn level(&self) -> usize { self.level }
+    pub fn package(&self) -> BlissVal {
+        self.current_package
+    }
+    pub fn level(&self) -> usize {
+        self.level
+    }
 
     /// Set a custom prompt function (R6.08).
     pub fn set_prompt_fn<F: Fn(usize, BlissVal) -> String + 'static>(&mut self, f: F) {
@@ -122,7 +128,11 @@ fn save_history_to_file(history: &[String]) {
         let _ = std::fs::create_dir_all(parent);
     }
     let max = history_max_size();
-    let start = if history.len() > max { history.len() - max } else { 0 };
+    let start = if history.len() > max {
+        history.len() - max
+    } else {
+        0
+    };
     let content: String = history[start..].join("\n");
     let _ = std::fs::write(&path, content);
 }
@@ -183,23 +193,88 @@ pub fn complete_symbol(prefix: &str) -> Vec<String> {
     // Query the known symbol table for matches.
     // In bootstrap, we provide basic keyword completions.
     let builtins = [
-        "defun", "defvar", "defparameter", "defmacro", "defclass", "defgeneric",
-        "defmethod", "defstruct", "let", "let*", "lambda", "if", "cond", "case",
-        "when", "unless", "progn", "block", "return-from", "tagbody", "go",
-        "catch", "throw", "unwind-protect", "handler-bind", "handler-case",
-        "restart-case", "restart-bind", "invoke-restart", "signal", "error",
-        "warn", "cerror", "format", "print", "princ", "prin1", "write",
-        "read", "eval", "compile", "load", "require", "provide",
-        "car", "cdr", "cons", "list", "append", "mapcar", "mapc",
-        "funcall", "apply", "values", "multiple-value-bind",
-        "setq", "setf", "push", "pop", "incf", "decf",
-        "loop", "do", "dolist", "dotimes", "map",
-        "make-instance", "slot-value", "with-slots",
-        "trace", "untrace", "describe", "inspect", "room", "time",
-        "disassemble", "break", "step",
+        "defun",
+        "defvar",
+        "defparameter",
+        "defmacro",
+        "defclass",
+        "defgeneric",
+        "defmethod",
+        "defstruct",
+        "let",
+        "let*",
+        "lambda",
+        "if",
+        "cond",
+        "case",
+        "when",
+        "unless",
+        "progn",
+        "block",
+        "return-from",
+        "tagbody",
+        "go",
+        "catch",
+        "throw",
+        "unwind-protect",
+        "handler-bind",
+        "handler-case",
+        "restart-case",
+        "restart-bind",
+        "invoke-restart",
+        "signal",
+        "error",
+        "warn",
+        "cerror",
+        "format",
+        "print",
+        "princ",
+        "prin1",
+        "write",
+        "read",
+        "eval",
+        "compile",
+        "load",
+        "require",
+        "provide",
+        "car",
+        "cdr",
+        "cons",
+        "list",
+        "append",
+        "mapcar",
+        "mapc",
+        "funcall",
+        "apply",
+        "values",
+        "multiple-value-bind",
+        "setq",
+        "setf",
+        "push",
+        "pop",
+        "incf",
+        "decf",
+        "loop",
+        "do",
+        "dolist",
+        "dotimes",
+        "map",
+        "make-instance",
+        "slot-value",
+        "with-slots",
+        "trace",
+        "untrace",
+        "describe",
+        "inspect",
+        "room",
+        "time",
+        "disassemble",
+        "break",
+        "step",
     ];
     let lower_prefix = prefix.to_lowercase();
-    builtins.iter()
+    builtins
+        .iter()
         .filter(|s| s.starts_with(&lower_prefix))
         .map(|s| s.to_string())
         .collect()
@@ -300,8 +375,12 @@ fn extract_swank_definitions(name: &str) -> Vec<String> {
             let trimmed = line.trim();
             if trimmed.starts_with(&format!("pub fn {}", rust_name))
                 || trimmed.starts_with(&format!("fn {}", rust_name))
-                || trimmed.to_lowercase().starts_with(&format!("(defun {}", lisp_name))
-                || trimmed.to_lowercase().starts_with(&format!("(defmacro {}", lisp_name))
+                || trimmed
+                    .to_lowercase()
+                    .starts_with(&format!("(defun {}", lisp_name))
+                || trimmed
+                    .to_lowercase()
+                    .starts_with(&format!("(defmacro {}", lisp_name))
             {
                 matches.push(format!(
                     "((\"{}\" \"{}\") (:location (\"{}\" :line {})))",
@@ -433,10 +512,18 @@ pub struct DebugFrame {
 }
 
 impl DebugFrame {
-    pub fn function(&self) -> BlissVal { self.func }
-    pub fn source_location(&self) -> Option<(String, u32, u32)> { self.source_loc.clone() }
-    pub fn locals(&self) -> Option<Vec<(BlissVal, BlissVal)>> { self.local_bindings.clone() }
-    pub fn is_live(&self) -> bool { self.live }
+    pub fn function(&self) -> BlissVal {
+        self.func
+    }
+    pub fn source_location(&self) -> Option<(String, u32, u32)> {
+        self.source_loc.clone()
+    }
+    pub fn locals(&self) -> Option<Vec<(BlissVal, BlissVal)>> {
+        self.local_bindings.clone()
+    }
+    pub fn is_live(&self) -> bool {
+        self.live
+    }
 }
 
 /// Stepping mode for the debugger (A6.04 / R6.13).
@@ -456,13 +543,22 @@ pub enum StepMode {
 #[allow(dead_code)]
 struct SteppingState {
     /// The thread that is currently stepping.
-    #[expect(dead_code, reason = "stepping metadata is retained for future debugger coordination")]
+    #[expect(
+        dead_code,
+        reason = "stepping metadata is retained for future debugger coordination"
+    )]
     thread_id: u64,
     /// The step mode.
-    #[expect(dead_code, reason = "stepping metadata is retained for future debugger coordination")]
+    #[expect(
+        dead_code,
+        reason = "stepping metadata is retained for future debugger coordination"
+    )]
     mode: StepMode,
     /// Frame pointer of the frame being stepped (for Next/Out).
-    #[expect(dead_code, reason = "stepping metadata is retained for future debugger coordination")]
+    #[expect(
+        dead_code,
+        reason = "stepping metadata is retained for future debugger coordination"
+    )]
     frame_fp: usize,
     /// Trap addresses installed for stepping, with original bytes.
     traps: Vec<(usize, Vec<u8>)>,
@@ -497,7 +593,9 @@ fn clear_stepping_traps() {
     let mut state = stepping_state().lock().unwrap();
     if let Some(ref st) = *state {
         for (addr, original) in &st.traps {
-            unsafe { remove_trap(*addr, original); }
+            unsafe {
+                remove_trap(*addr, original);
+            }
         }
     }
     *state = None;
@@ -622,7 +720,8 @@ pub fn invoke_debugger_ui(
                             }
                         }
                     } else {
-                        writeln!(stdout, "Frame {} out of range (0..{})", n, frames.len() - 1).unwrap_or(());
+                        writeln!(stdout, "Frame {} out of range (0..{})", n, frames.len() - 1)
+                            .unwrap_or(());
                     }
                 }
             }
@@ -633,11 +732,17 @@ pub fn invoke_debugger_ui(
                         Ok((form, _)) => {
                             let frame = &frames[selected_frame.min(frames.len() - 1)];
                             match eval_in_frame(form, frame) {
-                                Ok(val) => { writeln!(stdout, "{:?}", val).unwrap_or(()); }
-                                Err(e) => { writeln!(stdout, "Error: {}", e).unwrap_or(()); }
+                                Ok(val) => {
+                                    writeln!(stdout, "{:?}", val).unwrap_or(());
+                                }
+                                Err(e) => {
+                                    writeln!(stdout, "Error: {}", e).unwrap_or(());
+                                }
                             }
                         }
-                        Err(e) => { writeln!(stdout, "Read error: {}", e).unwrap_or(()); }
+                        Err(e) => {
+                            writeln!(stdout, "Read error: {}", e).unwrap_or(());
+                        }
                     }
                 }
             }
@@ -645,9 +750,17 @@ pub fn invoke_debugger_ui(
             "restart" | "r" => {
                 if let Some(n) = arg.and_then(|a| a.parse::<usize>().ok()) {
                     match n {
-                        0 => { writeln!(stdout, "Aborting.").unwrap_or(()); break; }
-                        1 => { writeln!(stdout, "Continuing.").unwrap_or(()); break; }
-                        _ => { writeln!(stdout, "Invalid restart: {}", n).unwrap_or(()); }
+                        0 => {
+                            writeln!(stdout, "Aborting.").unwrap_or(());
+                            break;
+                        }
+                        1 => {
+                            writeln!(stdout, "Continuing.").unwrap_or(());
+                            break;
+                        }
+                        _ => {
+                            writeln!(stdout, "Invalid restart: {}", n).unwrap_or(());
+                        }
                     }
                 }
             }
@@ -669,11 +782,17 @@ pub fn invoke_debugger_ui(
                     Ok((form, _)) => {
                         let frame = &frames[selected_frame.min(frames.len() - 1)];
                         match eval_in_frame(form, frame) {
-                            Ok(val) => { writeln!(stdout, "{:?}", val).unwrap_or(()); }
-                            Err(e) => { writeln!(stdout, "Error: {}", e).unwrap_or(()); }
+                            Ok(val) => {
+                                writeln!(stdout, "{:?}", val).unwrap_or(());
+                            }
+                            Err(e) => {
+                                writeln!(stdout, "Error: {}", e).unwrap_or(());
+                            }
                         }
                     }
-                    Err(e) => { writeln!(stdout, "Unknown command. Error: {}", e).unwrap_or(()); }
+                    Err(e) => {
+                        writeln!(stdout, "Unknown command. Error: {}", e).unwrap_or(());
+                    }
                 }
             }
         }
@@ -728,7 +847,10 @@ pub fn walk_stack() -> Vec<DebugFrame> {
                 continue;
             }
 
-            if before.chars().all(|c| c.is_ascii_digit()) && !after.starts_with('/') && !after.starts_with("at ") {
+            if before.chars().all(|c| c.is_ascii_digit())
+                && !after.starts_with('/')
+                && !after.starts_with("at ")
+            {
                 // Flush previous pending frame
                 if let Some(func_name) = pending_func.take() {
                     let func_val = func_val_from_name(&func_name);
@@ -738,7 +860,9 @@ pub fn walk_stack() -> Vec<DebugFrame> {
                         local_bindings: None,
                         live: true,
                     });
-                    if frames.len() >= 64 { break; }
+                    if frames.len() >= 64 {
+                        break;
+                    }
                 }
                 pending_func = Some(after.to_string());
                 pending_loc = None;
@@ -877,7 +1001,10 @@ struct BreakpointInfo {
 
 enum BreakpointTarget {
     Entry(BlissVal),
-    SourceLocation { file: String, line: u32 },
+    SourceLocation {
+        file: String,
+        line: u32,
+    },
     /// Watchpoint target (R6.17).
     Watch(WatchTarget),
 }
@@ -935,11 +1062,7 @@ fn resolve_function_entry(function_name: BlissVal) -> Option<(usize, Vec<u8>)> {
     let mut original = vec![0u8; trap_size];
     // SAFETY: We validated the address is in mapped memory above.
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            addr as *const u8,
-            original.as_mut_ptr(),
-            trap_size,
-        );
+        std::ptr::copy_nonoverlapping(addr as *const u8, original.as_mut_ptr(), trap_size);
     }
     Some((addr, original))
 }
@@ -968,38 +1091,46 @@ fn is_valid_code_address(addr: usize) -> bool {
 #[inline]
 fn breakpoint_trap_size() -> usize {
     #[cfg(target_arch = "x86_64")]
-    { 1 }
+    {
+        1
+    }
     #[cfg(target_arch = "aarch64")]
-    { 4 }
+    {
+        4
+    }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { 1 }
+    {
+        1
+    }
 }
 
 unsafe fn install_trap(addr: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         let ptr = addr as *mut u8;
-        unsafe { std::ptr::write_volatile(ptr, 0xCC); }
+        unsafe {
+            std::ptr::write_volatile(ptr, 0xCC);
+        }
     }
     #[cfg(target_arch = "aarch64")]
     {
         let ptr = addr as *mut u32;
-        unsafe { std::ptr::write_volatile(ptr, 0xD4200000); }
+        unsafe {
+            std::ptr::write_volatile(ptr, 0xD4200000);
+        }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let ptr = addr as *mut u8;
-        unsafe { std::ptr::write_volatile(ptr, 0xCC); }
+        unsafe {
+            std::ptr::write_volatile(ptr, 0xCC);
+        }
     }
 }
 
 unsafe fn remove_trap(addr: usize, original: &[u8]) {
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            original.as_ptr(),
-            addr as *mut u8,
-            original.len(),
-        );
+        std::ptr::copy_nonoverlapping(original.as_ptr(), addr as *mut u8, original.len());
     }
 }
 
@@ -1020,36 +1151,49 @@ pub fn break_on_entry(
 
     let (trap_address, original_bytes) = match resolve_function_entry(function_name) {
         Some((addr, orig)) => {
-            unsafe { install_trap(addr); }
+            unsafe {
+                install_trap(addr);
+            }
             (Some(addr), Some(orig))
         }
         None => (None, None),
     };
 
-    breakpoint_map().lock().unwrap().insert(id, BreakpointInfo {
-        target: BreakpointTarget::Entry(function_name),
-        condition,
-        enabled: true,
-        hit_count: 0,
-        original_bytes,
-        trap_address,
-    });
+    breakpoint_map().lock().unwrap().insert(
+        id,
+        BreakpointInfo {
+            target: BreakpointTarget::Entry(function_name),
+            condition,
+            enabled: true,
+            hit_count: 0,
+            original_bytes,
+            trap_address,
+        },
+    );
     Ok(id)
 }
 
 /// Set a breakpoint at a source location. R6.15.
 pub fn break_at(
-    file: &str, line: u32, condition: Option<BlissVal>,
+    file: &str,
+    line: u32,
+    condition: Option<BlissVal>,
 ) -> Result<BreakpointId, BlissError> {
     let id = BreakpointId(NEXT_BREAKPOINT_ID.fetch_add(1, Ordering::Relaxed));
-    breakpoint_map().lock().unwrap().insert(id, BreakpointInfo {
-        target: BreakpointTarget::SourceLocation { file: file.to_string(), line },
-        condition,
-        enabled: true,
-        hit_count: 0,
-        original_bytes: None,
-        trap_address: None,
-    });
+    breakpoint_map().lock().unwrap().insert(
+        id,
+        BreakpointInfo {
+            target: BreakpointTarget::SourceLocation {
+                file: file.to_string(),
+                line,
+            },
+            condition,
+            enabled: true,
+            hit_count: 0,
+            original_bytes: None,
+            trap_address: None,
+        },
+    );
     Ok(id)
 }
 
@@ -1078,14 +1222,17 @@ pub fn watch(
         predicate,
     };
 
-    breakpoint_map().lock().unwrap().insert(id, BreakpointInfo {
-        target: BreakpointTarget::Watch(target),
-        condition: None,
-        enabled: true,
-        hit_count: 0,
-        original_bytes: None,
-        trap_address: None,
-    });
+    breakpoint_map().lock().unwrap().insert(
+        id,
+        BreakpointInfo {
+            target: BreakpointTarget::Watch(target),
+            condition: None,
+            enabled: true,
+            hit_count: 0,
+            original_bytes: None,
+            trap_address: None,
+        },
+    );
 
     // For special variables, install guarded cell (A6.04a)
     if scope == WatchScope::Special {
@@ -1113,15 +1260,18 @@ pub fn unwatch(id: BreakpointId) -> Result<(), BlissError> {
 fn install_watch_guard(_variable_name: BlissVal, _bp_id: BreakpointId) {
     // Record that this variable is being watched.
     // The runtime's setq/set/setf paths must check the watch registry.
-    watch_registry().lock().unwrap().insert(
-        _variable_name.to_raw(),
-        _bp_id,
-    );
+    watch_registry()
+        .lock()
+        .unwrap()
+        .insert(_variable_name.to_raw(), _bp_id);
 }
 
 /// Remove the guarded cell for a watched special variable.
 fn remove_watch_guard(_variable_name: BlissVal) {
-    watch_registry().lock().unwrap().remove(&_variable_name.to_raw());
+    watch_registry()
+        .lock()
+        .unwrap()
+        .remove(&_variable_name.to_raw());
 }
 
 fn watch_registry() -> &'static Mutex<HashMap<u64, BreakpointId>> {
@@ -1171,7 +1321,9 @@ pub fn remove_breakpoint(id: BreakpointId) -> Result<(), BlissError> {
     let mut map = breakpoint_map().lock().unwrap();
     if let Some(info) = map.remove(&id) {
         if let (Some(addr), Some(original)) = (info.trap_address, &info.original_bytes) {
-            unsafe { remove_trap(addr, original); }
+            unsafe {
+                remove_trap(addr, original);
+            }
         }
         if let BreakpointTarget::Watch(ref target) = info.target {
             if target.scope == WatchScope::Special {
@@ -1202,7 +1354,11 @@ pub fn check_breakpoint_for_function(function_name: BlissVal) -> bool {
 pub fn check_breakpoint_at_location(file: &str, line: u32) -> bool {
     let mut map = breakpoint_map().lock().unwrap();
     for info in map.values_mut() {
-        if let BreakpointTarget::SourceLocation { file: ref f, line: l } = info.target {
+        if let BreakpointTarget::SourceLocation {
+            file: ref f,
+            line: l,
+        } = info.target
+        {
             if f == file && l == line {
                 return should_breakpoint_fire(info);
             }
@@ -1222,23 +1378,31 @@ static INSTRUMENT_PROFILER_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[allow(dead_code)]
 struct ProfileSample {
     pc: usize,
-    #[expect(dead_code, reason = "sampling metadata is retained for future profile exports")]
+    #[expect(
+        dead_code,
+        reason = "sampling metadata is retained for future profile exports"
+    )]
     timestamp_us: u64,
-    #[expect(dead_code, reason = "sampling metadata is retained for future profile exports")]
+    #[expect(
+        dead_code,
+        reason = "sampling metadata is retained for future profile exports"
+    )]
     thread_id: u64,
 }
 
 fn profiler_state() -> &'static Mutex<ProfilerState> {
     use std::sync::OnceLock;
     static S: OnceLock<Mutex<ProfilerState>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(ProfilerState {
-        rate_hz: 1000,
-        start: None,
-        sample_count: 0,
-        samples: Vec::new(),
-        sampling_thread: None,
-        target_thread_id: 0,
-    }))
+    S.get_or_init(|| {
+        Mutex::new(ProfilerState {
+            rate_hz: 1000,
+            start: None,
+            sample_count: 0,
+            samples: Vec::new(),
+            sampling_thread: None,
+            target_thread_id: 0,
+        })
+    })
 }
 
 struct ProfilerState {
@@ -1298,19 +1462,24 @@ pub enum ProfilerKind {
 struct AllocRecord {
     type_tag: u8,
     size: usize,
-    #[expect(dead_code, reason = "allocation metadata is retained for future profile exports")]
+    #[expect(
+        dead_code,
+        reason = "allocation metadata is retained for future profile exports"
+    )]
     pc: usize,
 }
 
 fn alloc_state() -> &'static Mutex<AllocState> {
     use std::sync::OnceLock;
     static S: OnceLock<Mutex<AllocState>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(AllocState {
-        start: None,
-        total_allocs: 0,
-        total_bytes: 0,
-        records: Vec::new(),
-    }))
+    S.get_or_init(|| {
+        Mutex::new(AllocState {
+            start: None,
+            total_allocs: 0,
+            total_bytes: 0,
+            records: Vec::new(),
+        })
+    })
 }
 
 struct AllocState {
@@ -1332,18 +1501,23 @@ struct InstrumentEntry {
     /// Timestamp when the function was entered (for computing elapsed).
     entry_time: Option<Instant>,
     /// Count of nested calls (for self-time accounting).
-    #[expect(dead_code, reason = "instrumentation metadata is retained for future nested timing")]
+    #[expect(
+        dead_code,
+        reason = "instrumentation metadata is retained for future nested timing"
+    )]
     nested_depth: u64,
 }
 
 fn instrument_state() -> &'static Mutex<InstrumentState> {
     use std::sync::OnceLock;
     static S: OnceLock<Mutex<InstrumentState>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(InstrumentState {
-        start: None,
-        functions: HashMap::new(),
-        call_stack: Vec::new(),
-    }))
+    S.get_or_init(|| {
+        Mutex::new(InstrumentState {
+            start: None,
+            functions: HashMap::new(),
+            call_stack: Vec::new(),
+        })
+    })
 }
 
 struct InstrumentState {
@@ -1373,13 +1547,16 @@ pub fn instrument_function_entry(function_id: u64) {
     }
     let now = Instant::now();
     if let Ok(mut s) = instrument_state().lock() {
-        let entry = s.functions.entry(function_id).or_insert_with(|| InstrumentEntry {
-            call_count: 0,
-            cumulative_time_ns: 0,
-            self_time_ns: 0,
-            entry_time: None,
-            nested_depth: 0,
-        });
+        let entry = s
+            .functions
+            .entry(function_id)
+            .or_insert_with(|| InstrumentEntry {
+                call_count: 0,
+                cumulative_time_ns: 0,
+                self_time_ns: 0,
+                entry_time: None,
+                nested_depth: 0,
+            });
         entry.call_count += 1;
         entry.entry_time = Some(now);
         s.call_stack.push((function_id, now));
@@ -1420,8 +1597,10 @@ pub fn stop_instrumentation_profiler() -> Result<ProfilerReport, BlissError> {
     let mut s = instrument_state().lock().unwrap();
     let elapsed_ns = s.start.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
 
-    let mut entries: Vec<ProfilerEntry> = s.functions.iter().map(|(id, data)| {
-        ProfilerEntry {
+    let mut entries: Vec<ProfilerEntry> = s
+        .functions
+        .iter()
+        .map(|(id, data)| ProfilerEntry {
             function_name: format!("fn_{:#x}", id),
             self_samples: 0,
             total_samples: 0,
@@ -1430,8 +1609,8 @@ pub fn stop_instrumentation_profiler() -> Result<ProfilerReport, BlissError> {
             total_time_ns: Some(data.cumulative_time_ns),
             alloc_bytes: None,
             alloc_count: None,
-        }
-    }).collect();
+        })
+        .collect();
 
     // Sort by self-time descending
     entries.sort_by(|a, b| b.self_time_ns.cmp(&a.self_time_ns));
@@ -1572,8 +1751,9 @@ pub fn stop_profiler() -> Result<BlissVal, BlissError> {
     let elapsed_ns = elapsed.map(|e| e.as_nanos() as u64).unwrap_or(0);
 
     // Build structured entries sorted by sample count
-    let mut entries: Vec<ProfilerEntry> = pc_counts.iter().map(|(pc, count)| {
-        ProfilerEntry {
+    let mut entries: Vec<ProfilerEntry> = pc_counts
+        .iter()
+        .map(|(pc, count)| ProfilerEntry {
             function_name: format!("{:#x}", pc),
             self_samples: *count,
             total_samples: *count,
@@ -1582,8 +1762,8 @@ pub fn stop_profiler() -> Result<BlissVal, BlissError> {
             total_time_ns: None,
             alloc_bytes: None,
             alloc_count: None,
-        }
-    }).collect();
+        })
+        .collect();
     entries.sort_by(|a, b| b.self_samples.cmp(&a.self_samples));
 
     // Build the structured report (D6.05)
@@ -1598,16 +1778,28 @@ pub fn stop_profiler() -> Result<BlissVal, BlissError> {
     if let Some(elapsed) = elapsed {
         let mut report_str = String::new();
         writeln!(report_str, "Sampling profiler report:").unwrap();
-        writeln!(report_str, "  Rate: {} Hz, Duration: {:.2}s, Samples: {}",
-                 rate, elapsed.as_secs_f64(), sample_count).unwrap();
+        writeln!(
+            report_str,
+            "  Rate: {} Hz, Duration: {:.2}s, Samples: {}",
+            rate,
+            elapsed.as_secs_f64(),
+            sample_count
+        )
+        .unwrap();
         writeln!(report_str, "  Top addresses by sample count:").unwrap();
 
         for entry in report.entries.iter().take(20) {
             let pct = if sample_count > 0 {
                 entry.self_samples as f64 / sample_count as f64 * 100.0
-            } else { 0.0 };
-            writeln!(report_str, "    {}: {} ({:.1}%)",
-                     entry.function_name, entry.self_samples, pct).unwrap();
+            } else {
+                0.0
+            };
+            writeln!(
+                report_str,
+                "    {}: {} ({:.1}%)",
+                entry.function_name, entry.self_samples, pct
+            )
+            .unwrap();
         }
         eprint!("{}", report_str);
     }
@@ -1664,8 +1856,9 @@ pub fn stop_allocation_profiler() -> Result<BlissVal, BlissError> {
     }
 
     // Build structured entries
-    let mut entries: Vec<ProfilerEntry> = type_counts.iter().map(|(tag, (count, bytes))| {
-        ProfilerEntry {
+    let mut entries: Vec<ProfilerEntry> = type_counts
+        .iter()
+        .map(|(tag, (count, bytes))| ProfilerEntry {
             function_name: format!("type_{:#04x}", tag),
             self_samples: 0,
             total_samples: 0,
@@ -1674,8 +1867,8 @@ pub fn stop_allocation_profiler() -> Result<BlissVal, BlissError> {
             total_time_ns: None,
             alloc_bytes: Some(*bytes),
             alloc_count: Some(*count),
-        }
-    }).collect();
+        })
+        .collect();
     entries.sort_by(|a, b| b.alloc_bytes.cmp(&a.alloc_bytes));
 
     let report = ProfilerReport {
@@ -1688,16 +1881,26 @@ pub fn stop_allocation_profiler() -> Result<BlissVal, BlissError> {
     if let Some(elapsed) = elapsed {
         let mut report_str = String::new();
         writeln!(report_str, "Allocation profiler report:").unwrap();
-        writeln!(report_str, "  Duration: {:.2}s, Allocations: {}, Bytes: {}",
-                 elapsed.as_secs_f64(), total_allocs, total_bytes).unwrap();
+        writeln!(
+            report_str,
+            "  Duration: {:.2}s, Allocations: {}, Bytes: {}",
+            elapsed.as_secs_f64(),
+            total_allocs,
+            total_bytes
+        )
+        .unwrap();
 
         if !type_counts.is_empty() {
             writeln!(report_str, "  By type:").unwrap();
             for entry in &report.entries {
-                writeln!(report_str, "    {}: {} allocs, {} bytes",
-                         entry.function_name,
-                         entry.alloc_count.unwrap_or(0),
-                         entry.alloc_bytes.unwrap_or(0)).unwrap();
+                writeln!(
+                    report_str,
+                    "    {}: {} allocs, {} bytes",
+                    entry.function_name,
+                    entry.alloc_count.unwrap_or(0),
+                    entry.alloc_bytes.unwrap_or(0)
+                )
+                .unwrap();
             }
         }
         eprint!("{}", report_str);
@@ -1754,7 +1957,9 @@ fn get_cpu_times() -> (u64, u64) {
         (0, 0)
     }
     #[cfg(not(target_os = "linux"))]
-    { (0, 0) }
+    {
+        (0, 0)
+    }
 }
 
 /// Get page fault count.
@@ -1774,7 +1979,9 @@ fn get_page_faults() -> u64 {
         0
     }
     #[cfg(not(target_os = "linux"))]
-    { 0 }
+    {
+        0
+    }
 }
 
 /// Execute a function and measure its execution time, allocations, GC activity,
@@ -1785,7 +1992,8 @@ pub fn time_execution<F: FnOnce() -> Result<BlissVal, BlissError>>(
 ) -> (Result<BlissVal, BlissError>, TimeResult) {
     let gc_stats_before = bliss_rt::gc::heap_stats();
     let gc_count_before = gc_stats_before.minor_gc_count + gc_stats_before.major_gc_count;
-    let gc_time_before = gc_stats_before.total_minor_pause_us + gc_stats_before.total_major_pause_us;
+    let gc_time_before =
+        gc_stats_before.total_minor_pause_us + gc_stats_before.total_major_pause_us;
     let bytes_before = gc_stats_before.bytes_allocated;
     let faults_before = get_page_faults();
     let (user_before, sys_before) = get_cpu_times();
@@ -1819,12 +2027,24 @@ pub fn time_execution<F: FnOnce() -> Result<BlissVal, BlissError>>(
     // Print timing report to stderr (like SBCL's TIME)
     let prefix = if completed { "" } else { "(aborted) " };
     eprintln!("{}Evaluation took:", prefix);
-    eprintln!("  {:.6} seconds of real time", timing.wall_clock_ns as f64 / 1e9);
-    eprintln!("  {:.6} seconds of user run time", timing.user_cpu_ns as f64 / 1e9);
-    eprintln!("  {:.6} seconds of system run time", timing.system_cpu_ns as f64 / 1e9);
+    eprintln!(
+        "  {:.6} seconds of real time",
+        timing.wall_clock_ns as f64 / 1e9
+    );
+    eprintln!(
+        "  {:.6} seconds of user run time",
+        timing.user_cpu_ns as f64 / 1e9
+    );
+    eprintln!(
+        "  {:.6} seconds of system run time",
+        timing.system_cpu_ns as f64 / 1e9
+    );
     eprintln!("  {} bytes consed", timing.bytes_consed);
-    eprintln!("  {} GC pauses totalling {:.6} seconds",
-             timing.gc_pauses, timing.gc_time_ns as f64 / 1e9);
+    eprintln!(
+        "  {} GC pauses totalling {:.6} seconds",
+        timing.gc_pauses,
+        timing.gc_time_ns as f64 / 1e9
+    );
     eprintln!("  {} page faults", timing.page_faults);
 
     (result, timing)
@@ -1834,13 +2054,21 @@ pub fn time_execution<F: FnOnce() -> Result<BlissVal, BlissError>>(
 
 fn tag_type_name(val: BlissVal) -> &'static str {
     match val.0 {
-        NIL_BITS => "NIL", T_BITS => "T",
-        UNBOUND_BITS => "UNBOUND", MISSING_BITS => "MISSING", EOF_BITS => "EOF",
+        NIL_BITS => "NIL",
+        T_BITS => "T",
+        UNBOUND_BITS => "UNBOUND",
+        MISSING_BITS => "MISSING",
+        EOF_BITS => "EOF",
         _ => match val.0 & TAG_MASK {
-            TAG_FIXNUM => "FIXNUM", TAG_CONS => "CONS",
-            TAG_HEAP_OBJECT => "HEAP-OBJECT", TAG_CHARACTER => "CHARACTER",
-            TAG_SINGLE_FLOAT => "SINGLE-FLOAT", TAG_SYMBOL => "SYMBOL",
-            TAG_FUNCTION => "FUNCTION", TAG_SPECIAL => "SPECIAL", _ => "UNKNOWN",
+            TAG_FIXNUM => "FIXNUM",
+            TAG_CONS => "CONS",
+            TAG_HEAP_OBJECT => "HEAP-OBJECT",
+            TAG_CHARACTER => "CHARACTER",
+            TAG_SINGLE_FLOAT => "SINGLE-FLOAT",
+            TAG_SYMBOL => "SYMBOL",
+            TAG_FUNCTION => "FUNCTION",
+            TAG_SPECIAL => "SPECIAL",
+            _ => "UNKNOWN",
         },
     }
 }
@@ -1849,7 +2077,9 @@ fn tag_type_name(val: BlissVal) -> &'static str {
 /// Decodes native code for compiled functions with source-location annotations (R6.30).
 /// For interpreted (T0) functions or non-function values, prints a notice (R6.32).
 pub fn disassemble(
-    function: BlissVal, tier: Option<BlissVal>, _stream: BlissVal,
+    function: BlissVal,
+    tier: Option<BlissVal>,
+    _stream: BlissVal,
 ) -> Result<(), BlissError> {
     let tier_label = match tier {
         Some(t) if t == T => "T1",
@@ -1859,8 +2089,14 @@ pub fn disassemble(
     };
 
     let mut out = String::new();
-    writeln!(out, "; disassembly for {:?} (type: {}, tier: {})",
-             function, tag_type_name(function), tier_label).unwrap();
+    writeln!(
+        out,
+        "; disassembly for {:?} (type: {}, tier: {})",
+        function,
+        tag_type_name(function),
+        tier_label
+    )
+    .unwrap();
 
     // Check if the function has compiled native code
     if function.is_function() {
@@ -1868,9 +2104,17 @@ pub fn disassemble(
         if code_addr != 0 {
             // Validate the address before reading (issue #8 / #11)
             if !is_valid_code_address(code_addr) {
-                writeln!(out, "; WARNING: Code address {:#x} appears invalid — skipping raw dump.",
-                         code_addr).unwrap();
-                writeln!(out, "; The function pointer does not point to mapped memory.").unwrap();
+                writeln!(
+                    out,
+                    "; WARNING: Code address {:#x} appears invalid — skipping raw dump.",
+                    code_addr
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "; The function pointer does not point to mapped memory."
+                )
+                .unwrap();
                 print!("{}", out);
                 return Ok(());
             }
@@ -1911,15 +2155,23 @@ pub fn disassemble(
             writeln!(out).unwrap();
         } else {
             // R6.32: notice for interpreted functions
-            writeln!(out, "; No native code available — function pointer is null.").unwrap();
+            writeln!(
+                out,
+                "; No native code available — function pointer is null."
+            )
+            .unwrap();
             writeln!(out, "; This function has not been compiled to native code.").unwrap();
             writeln!(out, "; Use (COMPILE 'fn) to compile it first.").unwrap();
         }
     } else {
         // R6.32: notice for non-function values
         writeln!(out, "; No native code available — not a compiled function.").unwrap();
-        writeln!(out, "; (Value is {} — use COMPILE to compile first.)",
-                 tag_type_name(function)).unwrap();
+        writeln!(
+            out,
+            "; (Value is {} — use COMPILE to compile first.)",
+            tag_type_name(function)
+        )
+        .unwrap();
     }
 
     print!("{}", out);
@@ -1968,19 +2220,24 @@ static TRACE_DEPTH: AtomicU64 = AtomicU64::new(0);
 /// The trace wrapper prints indented entry/exit messages showing arguments
 /// and return values. Supports :break (break_on_entry) and :condition options.
 pub fn trace_function(
-    function_name: BlissVal, break_on_entry: bool, condition: Option<BlissVal>,
+    function_name: BlissVal,
+    break_on_entry: bool,
+    condition: Option<BlissVal>,
 ) -> Result<(), BlissError> {
     let mut registry = traced_registry().lock().unwrap();
     let key = function_name.to_raw();
 
     // Store the trace entry with encapsulation info
-    registry.insert(key, TraceEntry {
-        break_on_entry,
-        condition,
-        depth: 0,
-        original_function: None, // Will be set when the function is first called
-        active: true,
-    });
+    registry.insert(
+        key,
+        TraceEntry {
+            break_on_entry,
+            condition,
+            depth: 0,
+            original_function: None, // Will be set when the function is first called
+            active: true,
+        },
+    );
 
     // Register this function in the trace-check table so the interpreter
     // and compiled code wrappers know to call trace_entry/trace_exit.
@@ -2005,12 +2262,18 @@ pub fn untrace_function(function_name: BlissVal) -> Result<(), BlissError> {
 /// Register a function for trace checking by the interpreter/compiled code.
 /// The interpreter's function-call path checks this registry before each call.
 fn register_trace_hook(function_name: BlissVal) {
-    trace_hooks().lock().unwrap().insert(function_name.to_raw(), true);
+    trace_hooks()
+        .lock()
+        .unwrap()
+        .insert(function_name.to_raw(), true);
 }
 
 /// Unregister a trace hook.
 fn unregister_trace_hook(function_name: BlissVal) {
-    trace_hooks().lock().unwrap().remove(&function_name.to_raw());
+    trace_hooks()
+        .lock()
+        .unwrap()
+        .remove(&function_name.to_raw());
 }
 
 fn trace_hooks() -> &'static Mutex<HashMap<u64, bool>> {
@@ -2022,7 +2285,10 @@ fn trace_hooks() -> &'static Mutex<HashMap<u64, bool>> {
 /// Check if a function has a trace hook installed.
 /// Called by the interpreter at function-call boundaries.
 pub fn has_trace_hook(function_name: BlissVal) -> bool {
-    trace_hooks().lock().map(|h| h.contains_key(&function_name.to_raw())).unwrap_or(false)
+    trace_hooks()
+        .lock()
+        .map(|h| h.contains_key(&function_name.to_raw()))
+        .unwrap_or(false)
 }
 
 /// Check if a function is traced and log entry if so.
@@ -2049,8 +2315,13 @@ pub fn trace_entry(function_name: BlissVal, args: &[BlissVal]) -> bool {
         let depth = TRACE_DEPTH.fetch_add(1, Ordering::Relaxed);
         let indent = "  ".repeat(depth as usize);
         let args_str: Vec<String> = args.iter().map(|a| format!("{:?}", a)).collect();
-        eprintln!("{}TRACE {}: ({:?} {})",
-                  indent, depth, function_name, args_str.join(" "));
+        eprintln!(
+            "{}TRACE {}: ({:?} {})",
+            indent,
+            depth,
+            function_name,
+            args_str.join(" ")
+        );
 
         entry.depth = depth;
         return entry.break_on_entry;
@@ -2069,7 +2340,9 @@ pub fn trace_exit(function_name: BlissVal, result: BlissVal) {
         if !entry.active {
             return;
         }
-        let depth = TRACE_DEPTH.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        let depth = TRACE_DEPTH
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
         let indent = "  ".repeat(depth as usize);
         eprintln!("{}TRACE {} returned: {:?}", indent, depth, result);
     }
@@ -2077,7 +2350,10 @@ pub fn trace_exit(function_name: BlissVal, result: BlissVal) {
 
 /// Check if a function is currently traced.
 pub fn is_traced(function_name: BlissVal) -> bool {
-    traced_registry().lock().map(|r| r.contains_key(&function_name.to_raw())).unwrap_or(false)
+    traced_registry()
+        .lock()
+        .map(|r| r.contains_key(&function_name.to_raw()))
+        .unwrap_or(false)
 }
 
 // ── Describe/Inspect ───────────────────────────────────────────────
@@ -2088,20 +2364,40 @@ pub fn is_traced(function_name: BlissVal) -> bool {
 pub fn describe(object: BlissVal, _stream: BlissVal) -> Result<(), BlissError> {
     let mut desc = String::new();
     match object.0 {
-        NIL_BITS => { writeln!(desc, "NIL\n  Type: NULL (SYMBOL, LIST)").unwrap(); }
-        T_BITS => { writeln!(desc, "T\n  Type: SYMBOL").unwrap(); }
-        UNBOUND_BITS => { writeln!(desc, "#<UNBOUND>").unwrap(); }
-        MISSING_BITS => { writeln!(desc, "#<MISSING>").unwrap(); }
-        EOF_BITS => { writeln!(desc, "#<EOF>").unwrap(); }
+        NIL_BITS => {
+            writeln!(desc, "NIL\n  Type: NULL (SYMBOL, LIST)").unwrap();
+        }
+        T_BITS => {
+            writeln!(desc, "T\n  Type: SYMBOL").unwrap();
+        }
+        UNBOUND_BITS => {
+            writeln!(desc, "#<UNBOUND>").unwrap();
+        }
+        MISSING_BITS => {
+            writeln!(desc, "#<MISSING>").unwrap();
+        }
+        EOF_BITS => {
+            writeln!(desc, "#<EOF>").unwrap();
+        }
         _ => match object.0 & TAG_MASK {
             TAG_FIXNUM => {
                 let n = (object.0 as i64) >> 3;
-                writeln!(desc, "{}\n  Type: FIXNUM\n  Value: {} ({:#x})", n, n, object.0).unwrap();
+                writeln!(
+                    desc,
+                    "{}\n  Type: FIXNUM\n  Value: {} ({:#x})",
+                    n, n, object.0
+                )
+                .unwrap();
             }
             TAG_CHARACTER => {
                 let cp = (object.0 >> 3) as u32;
                 let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
-                writeln!(desc, "#\\{}\n  Type: CHARACTER\n  Codepoint: U+{:04X}", ch, cp).unwrap();
+                writeln!(
+                    desc,
+                    "#\\{}\n  Type: CHARACTER\n  Codepoint: U+{:04X}",
+                    ch, cp
+                )
+                .unwrap();
             }
             TAG_SINGLE_FLOAT => {
                 let f = f32::from_bits((object.0 >> 32) as u32);
@@ -2109,7 +2405,12 @@ pub fn describe(object: BlissVal, _stream: BlissVal) -> Result<(), BlissError> {
             }
             TAG_SYMBOL => {
                 let idx = (object.0 >> 3) as u32;
-                writeln!(desc, "#<SYMBOL idx={}>\n  Type: SYMBOL\n  Symbol-index: {}", idx, idx).unwrap();
+                writeln!(
+                    desc,
+                    "#<SYMBOL idx={}>\n  Type: SYMBOL\n  Symbol-index: {}",
+                    idx, idx
+                )
+                .unwrap();
             }
             TAG_CONS => {
                 let addr = object.0 & !TAG_MASK;
@@ -2158,7 +2459,9 @@ pub fn describe(object: BlissVal, _stream: BlissVal) -> Result<(), BlissError> {
                     writeln!(desc, "  Status: interpreted or not yet compiled").unwrap();
                 }
             }
-            _ => { writeln!(desc, "#<UNKNOWN {:#x}>", object.0).unwrap(); }
+            _ => {
+                writeln!(desc, "#<UNKNOWN {:#x}>", object.0).unwrap();
+            }
         },
     }
 
@@ -2225,7 +2528,11 @@ pub fn inspect(object: BlissVal) -> Result<(), BlissError> {
     }
 
     if is_interactive() {
-        writeln!(out, "\nCommands: (number) to inspect part, :pop to go back, q to quit.").unwrap();
+        writeln!(
+            out,
+            "\nCommands: (number) to inspect part, :pop to go back, q to quit."
+        )
+        .unwrap();
         print!("{}", out);
         io::stdout().flush().unwrap_or(());
 
@@ -2328,33 +2635,68 @@ pub fn room(verbosity: Option<BlissVal>, _stream: BlissVal) -> Result<(), BlissE
 
     if is_minimal {
         let total = stats.nursery_used + stats.old_gen_used + stats.large_object_bytes;
-        writeln!(report, "Heap: {} bytes / {} bytes cap",
-                 total, stats.nursery_capacity + stats.old_gen_capacity).unwrap();
+        writeln!(
+            report,
+            "Heap: {} bytes / {} bytes cap",
+            total,
+            stats.nursery_capacity + stats.old_gen_capacity
+        )
+        .unwrap();
     } else {
         let npct = if stats.nursery_capacity > 0 {
             stats.nursery_used as f64 / stats.nursery_capacity as f64 * 100.0
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let opct = if stats.old_gen_capacity > 0 {
             stats.old_gen_used as f64 / stats.old_gen_capacity as f64 * 100.0
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         writeln!(report, "BLISS Heap Usage:").unwrap();
-        writeln!(report, "  Nursery:  {} / {} ({:.0}%)",
-                 stats.nursery_used, stats.nursery_capacity, npct).unwrap();
-        writeln!(report, "  Old Gen:  {} / {} ({:.0}%)  [{} regions]",
-                 stats.old_gen_used, stats.old_gen_capacity, opct,
-                 stats.regions_total.saturating_sub(stats.regions_free)).unwrap();
+        writeln!(
+            report,
+            "  Nursery:  {} / {} ({:.0}%)",
+            stats.nursery_used, stats.nursery_capacity, npct
+        )
+        .unwrap();
+        writeln!(
+            report,
+            "  Old Gen:  {} / {} ({:.0}%)  [{} regions]",
+            stats.old_gen_used,
+            stats.old_gen_capacity,
+            opct,
+            stats.regions_total.saturating_sub(stats.regions_free)
+        )
+        .unwrap();
         writeln!(report, "  Large:    {} bytes", stats.large_object_bytes).unwrap();
         let avg_minor = if stats.minor_gc_count > 0 {
             stats.total_minor_pause_us as f64 / stats.minor_gc_count as f64 / 1000.0
-        } else { 0.0 };
-        writeln!(report, "  GC: {} minor (avg {:.1}ms), {} major ({:.1}ms)",
-                 stats.minor_gc_count, avg_minor,
-                 stats.major_gc_count, stats.total_major_pause_us as f64 / 1000.0).unwrap();
+        } else {
+            0.0
+        };
+        writeln!(
+            report,
+            "  GC: {} minor (avg {:.1}ms), {} major ({:.1}ms)",
+            stats.minor_gc_count,
+            avg_minor,
+            stats.major_gc_count,
+            stats.total_major_pause_us as f64 / 1000.0
+        )
+        .unwrap();
         if is_full {
-            writeln!(report, "  Allocated: {} bytes, Promoted: {} bytes",
-                     stats.bytes_allocated, stats.bytes_promoted).unwrap();
-            writeln!(report, "  Regions: {} total, {} free",
-                     stats.regions_total, stats.regions_free).unwrap();
+            writeln!(
+                report,
+                "  Allocated: {} bytes, Promoted: {} bytes",
+                stats.bytes_allocated, stats.bytes_promoted
+            )
+            .unwrap();
+            writeln!(
+                report,
+                "  Regions: {} total, {} free",
+                stats.regions_total, stats.regions_free
+            )
+            .unwrap();
         }
     }
 
@@ -2369,14 +2711,16 @@ static SWANK_ACTIVE: AtomicBool = AtomicBool::new(false);
 fn swank_state() -> &'static Mutex<SwankState> {
     use std::sync::OnceLock;
     static S: OnceLock<Mutex<SwankState>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(SwankState {
-        port: 4005,
-        host: "127.0.0.1".into(),
-        conns: 0,
-        listener_thread: None,
-        session_secret: None,
-        connections: Vec::new(),
-    }))
+    S.get_or_init(|| {
+        Mutex::new(SwankState {
+            port: 4005,
+            host: "127.0.0.1".into(),
+            conns: 0,
+            listener_thread: None,
+            session_secret: None,
+            connections: Vec::new(),
+        })
+    })
 }
 
 struct SwankState {
@@ -2398,22 +2742,38 @@ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 /// Per-connection state (D6.07 / R6.35).
 #[allow(dead_code)]
 struct SwankConnection {
-    #[expect(dead_code, reason = "connection metadata is retained for future swank command handling")]
+    #[expect(
+        dead_code,
+        reason = "connection metadata is retained for future swank command handling"
+    )]
     id: SwankConnectionId,
-    #[expect(dead_code, reason = "connection metadata is retained for future swank command handling")]
+    #[expect(
+        dead_code,
+        reason = "connection metadata is retained for future swank command handling"
+    )]
     stream: TcpStream,
-    #[expect(dead_code, reason = "connection metadata is retained for future swank command handling")]
+    #[expect(
+        dead_code,
+        reason = "connection metadata is retained for future swank command handling"
+    )]
     buffer_package: String,
-    #[expect(dead_code, reason = "connection metadata is retained for future swank command handling")]
+    #[expect(
+        dead_code,
+        reason = "connection metadata is retained for future swank command handling"
+    )]
     pending_returns: HashMap<u64, ()>,
-    #[expect(dead_code, reason = "connection metadata is retained for future swank command handling")]
+    #[expect(
+        dead_code,
+        reason = "connection metadata is retained for future swank command handling"
+    )]
     thread_id: u64,
 }
 
 /// Active SWANK connections registry (R6.35 — multiple simultaneous).
 fn swank_connections() -> &'static Mutex<HashMap<SwankConnectionId, Arc<Mutex<SwankConnection>>>> {
     use std::sync::OnceLock;
-    static C: OnceLock<Mutex<HashMap<SwankConnectionId, Arc<Mutex<SwankConnection>>>>> = OnceLock::new();
+    static C: OnceLock<Mutex<HashMap<SwankConnectionId, Arc<Mutex<SwankConnection>>>>> =
+        OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2436,10 +2796,15 @@ pub fn start_swank_server(port: u16, host: &str) -> Result<(), BlissError> {
 
     let bind_addr = format!("{}:{}", host, port);
 
-    let listener = TcpListener::bind(&bind_addr)
-        .map_err(|e| BlissError::Internal(format!("Failed to bind SWANK listener on {}: {}", bind_addr, e)))?;
+    let listener = TcpListener::bind(&bind_addr).map_err(|e| {
+        BlissError::Internal(format!(
+            "Failed to bind SWANK listener on {}: {}",
+            bind_addr, e
+        ))
+    })?;
 
-    listener.set_nonblocking(true)
+    listener
+        .set_nonblocking(true)
         .map_err(|e| BlissError::Internal(format!("Failed to set non-blocking: {}", e)))?;
 
     let secret = generate_session_secret();
@@ -2520,20 +2885,28 @@ fn handle_swank_connection(mut stream: TcpStream, addr: std::net::SocketAddr, se
     let conn_id = SwankConnectionId(NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed));
     let conn = SwankConnection {
         id: conn_id,
-        stream: stream.try_clone().unwrap_or_else(|_| stream.try_clone().expect("clone")),
+        stream: stream
+            .try_clone()
+            .unwrap_or_else(|_| stream.try_clone().expect("clone")),
         buffer_package: "CL-USER".to_string(),
         pending_returns: HashMap::new(),
         thread_id: thread_id_current(),
     };
     let conn_arc = Arc::new(Mutex::new(conn));
-    swank_connections().lock().unwrap().insert(conn_id, conn_arc.clone());
+    swank_connections()
+        .lock()
+        .unwrap()
+        .insert(conn_id, conn_arc.clone());
 
     if let Ok(mut s) = swank_state().lock() {
         s.conns += 1;
         s.connections.push(conn_id);
     }
 
-    eprintln!("; SWANK client authenticated from {} (conn #{})", addr, conn_id.0);
+    eprintln!(
+        "; SWANK client authenticated from {} (conn #{})",
+        addr, conn_id.0
+    );
 
     // Send connection info
     let _ = stream.write_all(b"(:ok t)\n");
@@ -2612,7 +2985,10 @@ fn handle_swank_connection(mut stream: TcpStream, addr: std::net::SocketAddr, se
 /// Supports: eval, compile-string, compile-file, completions, arglist,
 /// find-definitions, macroexpand-1, macroexpand-all, inspect, xref,
 /// apropos, describe, thread-list (R6.38).
-fn dispatch_swank_message(message: &str, interpreter: &mut bliss_compiler::tiered::Interpreter) -> String {
+fn dispatch_swank_message(
+    message: &str,
+    interpreter: &mut bliss_compiler::tiered::Interpreter,
+) -> String {
     let trimmed = message.trim();
 
     // Parse the S-expression message
@@ -2633,7 +3009,8 @@ fn dispatch_swank_message(message: &str, interpreter: &mut bliss_compiler::tiere
 
     // Thread listing (R6.38)
     if trimmed.contains("swank:list-threads") || trimmed.contains(":list-threads") {
-        return "(:return (:ok ((\"ID\" \"Name\" \"Status\") (\"1\" \"main\" \"running\"))) 0)\n".to_string();
+        return "(:return (:ok ((\"ID\" \"Name\" \"Status\") (\"1\" \"main\" \"running\"))) 0)\n"
+            .to_string();
     }
 
     // Default response
@@ -2647,7 +3024,9 @@ fn extract_swank_op(message: &str) -> Option<String> {
     let rest = message.get(after_rex..)?.trim();
     let rest = rest.strip_prefix('(')?;
     // Find the operation name (up to first space or closing paren)
-    let end = rest.find(|c: char| c.is_whitespace() || c == ')').unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ')')
+        .unwrap_or(rest.len());
     let op = rest.get(..end)?;
     Some(op.to_string())
 }
@@ -2655,7 +3034,10 @@ fn extract_swank_op(message: &str) -> Option<String> {
 /// Extract the message ID from a SWANK message.
 fn extract_swank_id(message: &str) -> Option<u64> {
     // The ID is the last number in the message
-    let parts: Vec<&str> = message.trim_end_matches(')').rsplit_terminator(char::is_whitespace).collect();
+    let parts: Vec<&str> = message
+        .trim_end_matches(')')
+        .rsplit_terminator(char::is_whitespace)
+        .collect();
     for part in parts {
         if let Ok(id) = part.trim().parse::<u64>() {
             return Some(id);

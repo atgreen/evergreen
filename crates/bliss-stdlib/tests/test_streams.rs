@@ -3,7 +3,7 @@
 //! Covers: StreamDirection, ExternalFormat, GrayStream trait operations,
 //! stream constructors, composite streams, stream queries, and error conditions.
 
-use bliss_rt::value::{BlissVal, NIL, EOF};
+use bliss_rt::value::{BlissVal, EOF, NIL};
 use bliss_stdlib::streams::*;
 
 // ── StreamDirection enum ──────────────────────────────────────────
@@ -136,7 +136,10 @@ fn string_input_stream_listen_returns_true_when_data_available() {
     let lisp_str = make_lisp_string("data");
     let stream = make_string_input_stream(lisp_str, 0, None).unwrap();
     let available = stream_listen(stream).unwrap();
-    assert!(available, "stream_listen should return true when data is available");
+    assert!(
+        available,
+        "stream_listen should return true when data is available"
+    );
 }
 
 #[test]
@@ -144,7 +147,10 @@ fn string_input_stream_listen_returns_false_at_eof() {
     let lisp_str = make_lisp_string("");
     let stream = make_string_input_stream(lisp_str, 0, None).unwrap();
     let available = stream_listen(stream).unwrap();
-    assert!(!available, "stream_listen should return false on empty stream");
+    assert!(
+        !available,
+        "stream_listen should return false on empty stream"
+    );
 }
 
 #[test]
@@ -154,7 +160,10 @@ fn string_input_stream_line_number_initial() {
     // Before any reads, line number should be 0 or 1 (implementation-defined),
     // but it must return Some.
     let ln = stream_line_number(stream);
-    assert!(ln.is_some(), "stream_line_number should return Some for a string input stream");
+    assert!(
+        ln.is_some(),
+        "stream_line_number should return Some for a string input stream"
+    );
 }
 
 #[test]
@@ -163,7 +172,10 @@ fn string_input_stream_line_column_initial() {
     let stream = make_string_input_stream(lisp_str, 0, None).unwrap();
     // Before any reads, column should be 0.
     let col = stream_line_column(stream);
-    assert!(col.is_some(), "stream_line_column should return Some for a string input stream");
+    assert!(
+        col.is_some(),
+        "stream_line_column should return Some for a string input stream"
+    );
     assert_eq!(col.unwrap(), 0);
 }
 
@@ -225,7 +237,10 @@ fn string_output_stream_write_char() {
     let stream = make_string_output_stream(NIL).unwrap();
     let ch = BlissVal::from_char('A');
     let result = stream_write_char(stream, ch);
-    assert!(result.is_ok(), "stream_write_char should succeed on an output stream");
+    assert!(
+        result.is_ok(),
+        "stream_write_char should succeed on an output stream"
+    );
     // Verify by extracting accumulated string.
     let output = get_output_stream_string(stream).unwrap();
     assert_ne!(output, NIL);
@@ -236,7 +251,10 @@ fn string_output_stream_write_byte() {
     let stream = make_string_output_stream(NIL).unwrap();
     let byte = BlissVal::from_fixnum(66); // 'B'
     let result = stream_write_byte(stream, byte);
-    assert!(result.is_ok(), "stream_write_byte should succeed on an output stream");
+    assert!(
+        result.is_ok(),
+        "stream_write_byte should succeed on an output stream"
+    );
 }
 
 #[test]
@@ -244,21 +262,30 @@ fn string_output_stream_write_string() {
     let stream = make_string_output_stream(NIL).unwrap();
     let lisp_str = make_lisp_string("hello");
     let result = stream_write_string(stream, lisp_str, 0, None);
-    assert!(result.is_ok(), "stream_write_string should succeed on an output stream");
+    assert!(
+        result.is_ok(),
+        "stream_write_string should succeed on an output stream"
+    );
 }
 
 #[test]
 fn string_output_stream_force_output() {
     let stream = make_string_output_stream(NIL).unwrap();
     let result = stream_force_output(stream);
-    assert!(result.is_ok(), "stream_force_output should succeed on an output stream");
+    assert!(
+        result.is_ok(),
+        "stream_force_output should succeed on an output stream"
+    );
 }
 
 #[test]
 fn string_output_stream_finish_output() {
     let stream = make_string_output_stream(NIL).unwrap();
     let result = stream_finish_output(stream);
-    assert!(result.is_ok(), "stream_finish_output should succeed on an output stream");
+    assert!(
+        result.is_ok(),
+        "stream_finish_output should succeed on an output stream"
+    );
 }
 
 #[test]
@@ -266,7 +293,10 @@ fn string_output_stream_clear_input_is_noop_or_ok() {
     let stream = make_string_output_stream(NIL).unwrap();
     // clear_input on an output stream should be a no-op or return Ok.
     let result = stream_clear_input(stream);
-    assert!(result.is_ok(), "stream_clear_input should be a no-op on an output stream");
+    assert!(
+        result.is_ok(),
+        "stream_clear_input should be a no-op on an output stream"
+    );
 }
 
 #[test]
@@ -502,7 +532,10 @@ fn read_from_output_only_stream_errors() {
     let stream = make_string_output_stream(NIL).unwrap();
     // Attempting to read a character from an output-only stream must error.
     let result = stream_read_char(stream);
-    assert!(result.is_err(), "stream_read_char on output-only stream should return Err");
+    assert!(
+        result.is_err(),
+        "stream_read_char on output-only stream should return Err"
+    );
 }
 
 #[test]
@@ -512,7 +545,10 @@ fn write_to_input_only_stream_errors() {
     // Attempting to write a character to an input-only stream must error.
     let ch = BlissVal::from_char('x');
     let result = stream_write_char(stream, ch);
-    assert!(result.is_err(), "stream_write_char on input-only stream should return Err");
+    assert!(
+        result.is_err(),
+        "stream_write_char on input-only stream should return Err"
+    );
 }
 
 // Issue 3: Test reading past end-of-stream.
@@ -577,7 +613,10 @@ fn read_on_closed_stream_errors() {
     assert!(!open_stream_p(stream));
     // Attempting to read from a closed stream should error.
     let result = stream_read_char(stream);
-    assert!(result.is_err(), "stream_read_char on closed stream should return Err");
+    assert!(
+        result.is_err(),
+        "stream_read_char on closed stream should return Err"
+    );
 }
 
 #[test]
@@ -588,7 +627,10 @@ fn write_on_closed_stream_errors() {
     // Attempting to write to a closed stream should error.
     let ch = BlissVal::from_char('x');
     let result = stream_write_char(stream, ch);
-    assert!(result.is_err(), "stream_write_char on closed stream should return Err");
+    assert!(
+        result.is_err(),
+        "stream_write_char on closed stream should return Err"
+    );
 }
 
 #[test]
@@ -598,7 +640,10 @@ fn close_already_closed_stream() {
     close(stream, false).unwrap();
     // Per CL spec, closing an already-closed stream returns successfully.
     let result = close(stream, false);
-    assert!(result.is_ok(), "closing an already-closed stream should succeed per CL spec");
+    assert!(
+        result.is_ok(),
+        "closing an already-closed stream should succeed per CL spec"
+    );
 }
 
 #[test]
@@ -730,14 +775,20 @@ fn element_type_for_two_way_stream() {
 fn write_string_with_start_end_substring() {
     let s = make_string_output_stream(NIL).unwrap();
     stream_write_string(s, make_lisp_string("hello world"), 6, Some(11)).unwrap();
-    assert_eq!(get_output_stream_string(s).unwrap(), make_lisp_string("world"));
+    assert_eq!(
+        get_output_stream_string(s).unwrap(),
+        make_lisp_string("world")
+    );
 }
 
 #[test]
 fn write_string_with_start_only() {
     let s = make_string_output_stream(NIL).unwrap();
     stream_write_string(s, make_lisp_string("abcdef"), 3, None).unwrap();
-    assert_eq!(get_output_stream_string(s).unwrap(), make_lisp_string("def"));
+    assert_eq!(
+        get_output_stream_string(s).unwrap(),
+        make_lisp_string("def")
+    );
 }
 
 #[test]

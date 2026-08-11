@@ -4,7 +4,7 @@
 
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{
-    ConsCell, ComplexData, ElementTypeTag, ObjectHeader, PathnameData, RatioData, ReadtableData,
+    ComplexData, ConsCell, ElementTypeTag, ObjectHeader, PathnameData, RatioData, ReadtableData,
     type_id,
 };
 use bliss_rt::value::{BlissVal, EOF, NIL, T, TAG_HEAP_OBJECT};
@@ -83,7 +83,8 @@ fn package_exists(name: &str) -> bool {
 }
 
 // Counter for uninterned symbols — each gets a unique index
-static UNINTERNED_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x8000_0000);
+static UNINTERNED_COUNTER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x8000_0000);
 
 fn make_uninterned_symbol(_name: &str) -> BlissVal {
     let idx = UNINTERNED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -259,11 +260,21 @@ impl ReaderState {
             read_eval: true,
         }
     }
-    pub fn set_input(&mut self, stream: BlissVal) { self.input = stream; }
-    pub fn set_readtable(&mut self, readtable: BlissVal) { self.readtable = readtable; }
-    pub fn set_read_base(&mut self, base: u32) { self.read_base = base; }
-    pub fn set_read_suppress(&mut self, suppress: bool) { self.read_suppress = suppress; }
-    pub fn set_read_eval(&mut self, eval: bool) { self.read_eval = eval; }
+    pub fn set_input(&mut self, stream: BlissVal) {
+        self.input = stream;
+    }
+    pub fn set_readtable(&mut self, readtable: BlissVal) {
+        self.readtable = readtable;
+    }
+    pub fn set_read_base(&mut self, base: u32) {
+        self.read_base = base;
+    }
+    pub fn set_read_suppress(&mut self, suppress: bool) {
+        self.read_suppress = suppress;
+    }
+    pub fn set_read_eval(&mut self, eval: bool) {
+        self.read_eval = eval;
+    }
 }
 
 impl Default for ReaderState {
@@ -319,7 +330,9 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
                 let data = std::slice::from_raw_parts(ptr.add(16), len);
                 if let Ok(s) = std::str::from_utf8(data) {
                     let chars: Vec<char> = s.chars().collect();
-                    let mut labels = CircularLabels { labels: HashMap::new() };
+                    let mut labels = CircularLabels {
+                        labels: HashMap::new(),
+                    };
 
                     // Consult readtable for custom macro characters if one is set
                     if state.readtable != NIL && state.readtable.tag() == TAG_HEAP_OBJECT {
@@ -336,7 +349,13 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
                                     // Full readtable dispatch (calling user functions) requires
                                     // the evaluator; tracked as future work.
                                     drop(guard);
-                                    let (val, _pos) = read_token_with_base(&chars, 0, &mut labels, state.read_base, state.read_eval)?;
+                                    let (val, _pos) = read_token_with_base(
+                                        &chars,
+                                        0,
+                                        &mut labels,
+                                        state.read_base,
+                                        state.read_eval,
+                                    )?;
                                     return Ok(val);
                                 }
                             }
@@ -344,7 +363,13 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
                         drop(guard);
                     }
 
-                    let (val, _pos) = read_token_with_base(&chars, 0, &mut labels, state.read_base, state.read_eval)?;
+                    let (val, _pos) = read_token_with_base(
+                        &chars,
+                        0,
+                        &mut labels,
+                        state.read_base,
+                        state.read_eval,
+                    )?;
                     return Ok(val);
                 }
             }
@@ -356,29 +381,46 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
         }
     }
     // Non-heap, non-NIL input — cannot read from it
-    Err(BlissError::StreamError("unsupported input type for read".into()))
+    Err(BlissError::StreamError(
+        "unsupported input type for read".into(),
+    ))
 }
 
 pub fn read_from_string(s: &str) -> Result<(BlissVal, usize), BlissError> {
     read_from_string_with_base(s, 10, true)
 }
 
-pub fn read_from_string_with_base(s: &str, read_base: u32, read_eval: bool) -> Result<(BlissVal, usize), BlissError> {
+pub fn read_from_string_with_base(
+    s: &str,
+    read_base: u32,
+    read_eval: bool,
+) -> Result<(BlissVal, usize), BlissError> {
     let chars: Vec<char> = s.chars().collect();
-    let mut labels = CircularLabels { labels: HashMap::new() };
+    let mut labels = CircularLabels {
+        labels: HashMap::new(),
+    };
     let (val, pos) = read_token_with_base(&chars, 0, &mut labels, read_base, read_eval)?;
     Ok((val, pos))
 }
 
-#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
+#[expect(
+    dead_code,
+    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
+)]
 fn read_token(
-    chars: &[char], pos: usize, labels: &mut CircularLabels,
+    chars: &[char],
+    pos: usize,
+    labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
     read_token_with_base(chars, pos, labels, 10, true)
 }
 
 fn read_token_with_base(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
+    chars: &[char],
+    mut pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     // Skip whitespace and line comments
     pos = skip_whitespace_and_comments(chars, pos);
@@ -418,27 +460,42 @@ fn read_token_with_base(
 
 fn skip_whitespace_and_comments(chars: &[char], mut pos: usize) -> usize {
     loop {
-        if pos >= chars.len() { return pos; }
+        if pos >= chars.len() {
+            return pos;
+        }
         if chars[pos].is_ascii_whitespace() {
             pos += 1;
         } else if chars[pos] == ';' {
-            while pos < chars.len() && chars[pos] != '\n' { pos += 1; }
-            if pos < chars.len() { pos += 1; }
+            while pos < chars.len() && chars[pos] != '\n' {
+                pos += 1;
+            }
+            if pos < chars.len() {
+                pos += 1;
+            }
         } else {
             return pos;
         }
     }
 }
 
-#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
+#[expect(
+    dead_code,
+    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
+)]
 fn read_list(
-    chars: &[char], pos: usize, labels: &mut CircularLabels,
+    chars: &[char],
+    pos: usize,
+    labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
     read_list_with_base(chars, pos, labels, 10, true)
 }
 
 fn read_list_with_base(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
+    chars: &[char],
+    mut pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     let mut elements: Vec<BlissVal> = Vec::new();
     loop {
@@ -497,20 +554,29 @@ fn read_string(chars: &[char], mut pos: usize) -> Result<(BlissVal, usize), Blis
                 s.push(chars[pos]);
                 pos += 1;
             }
-            c => { s.push(c); pos += 1; }
+            c => {
+                s.push(c);
+                pos += 1;
+            }
         }
     }
 }
 
-#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
+#[expect(
+    dead_code,
+    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
+)]
 fn read_atom(chars: &[char], pos: usize) -> Result<(BlissVal, usize), BlissError> {
     read_atom_with_base(chars, pos, 10)
 }
 
-fn read_atom_with_base(chars: &[char], pos: usize, read_base: u32) -> Result<(BlissVal, usize), BlissError> {
+fn read_atom_with_base(
+    chars: &[char],
+    pos: usize,
+    read_base: u32,
+) -> Result<(BlissVal, usize), BlissError> {
     let (token, end, has_escape) = collect_token(chars, pos)?;
-    parse_token_with_base(&token, has_escape, read_base)
-        .map(|v| (v, end))
+    parse_token_with_base(&token, has_escape, read_base).map(|v| (v, end))
 }
 
 /// Collect a token respecting single-escape (\) and multiple-escape (|...|).
@@ -549,25 +615,42 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(TokenChars, usize, b
                 pos += 1;
             }
             c if is_delimiter(c) => break,
-            c => { token.push((c, false)); pos += 1; }
+            c => {
+                token.push((c, false));
+                pos += 1;
+            }
         }
     }
     if in_multiple_escape {
-        return Err(BlissError::StreamError("unterminated multiple escape".into()));
+        return Err(BlissError::StreamError(
+            "unterminated multiple escape".into(),
+        ));
     }
     Ok((token, pos, had_escape))
 }
 
-#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
+#[expect(
+    dead_code,
+    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
+)]
 fn parse_token(token: &[(char, bool)], has_escape: bool) -> Result<BlissVal, BlissError> {
     parse_token_with_base(token, has_escape, 10)
 }
 
-fn parse_token_with_base(token: &[(char, bool)], has_escape: bool, read_base: u32) -> Result<BlissVal, BlissError> {
+fn parse_token_with_base(
+    token: &[(char, bool)],
+    has_escape: bool,
+    read_base: u32,
+) -> Result<BlissVal, BlissError> {
     // Build the upcased name (upcased for non-escaped chars)
-    let name: String = token.iter().map(|&(c, escaped)| {
-        if escaped { c } else { c.to_ascii_uppercase() }
-    }).collect();
+    let name: String = token
+        .iter()
+        .map(
+            |&(c, escaped)| {
+                if escaped { c } else { c.to_ascii_uppercase() }
+            },
+        )
+        .collect();
 
     if name.is_empty() {
         return Err(BlissError::StreamError("empty token".into()));
@@ -591,21 +674,27 @@ fn parse_token_with_base(token: &[(char, bool)], has_escape: bool, read_base: u3
         // Try numeric parse
         match try_parse_number_with_base(&name, read_base) {
             Ok(Some(val)) => return Ok(val),
-            Ok(None) => {} // Not a number, fall through to symbol
+            Ok(None) => {}           // Not a number, fall through to symbol
             Err(e) => return Err(e), // e.g. division by zero in ratio
         }
     }
 
     // It's a symbol
-    if name == "NIL" && !has_escape { return Ok(NIL); }
-    if name == "T" && !has_escape { return Ok(T); }
+    if name == "NIL" && !has_escape {
+        return Ok(NIL);
+    }
+    if name == "T" && !has_escape {
+        return Ok(T);
+    }
     let idx = intern_symbol(&name);
     Ok(BlissVal::from_symbol_index(idx))
 }
 
 fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
     // Check for PKG::SYM or PKG:SYM (but not :keyword which starts with :)
-    if name.starts_with(':') { return Ok(None); }
+    if name.starts_with(':') {
+        return Ok(None);
+    }
     if let Some(colon_pos) = name.find(':') {
         let pkg = &name[..colon_pos];
         let rest = &name[colon_pos + 1..];
@@ -617,8 +706,12 @@ fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
         // Known packages: CL, KEYWORD, BLISS, COMMON-LISP
         match pkg {
             "CL" | "COMMON-LISP" => {
-                if sym_name == "NIL" { return Ok(Some(NIL)); }
-                if sym_name == "T" { return Ok(Some(T)); }
+                if sym_name == "NIL" {
+                    return Ok(Some(NIL));
+                }
+                if sym_name == "T" {
+                    return Ok(Some(T));
+                }
                 let idx = intern_symbol(sym_name);
                 Ok(Some(BlissVal::from_symbol_index(idx)))
             }
@@ -637,14 +730,20 @@ fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
                 let idx = intern_symbol(&full);
                 Ok(Some(BlissVal::from_symbol_index(idx)))
             }
-            _ => Err(BlissError::StreamError(format!("package not found: {}", pkg))),
+            _ => Err(BlissError::StreamError(format!(
+                "package not found: {}",
+                pkg
+            ))),
         }
     } else {
         Ok(None)
     }
 }
 
-#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
+#[expect(
+    dead_code,
+    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
+)]
 fn try_parse_number(s: &str) -> Result<Option<BlissVal>, BlissError> {
     try_parse_number_with_base(s, 10)
 }
@@ -659,10 +758,20 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
                 i64::from_str_radix(num_str.trim_start_matches('+'), read_base),
                 i64::from_str_radix(den_str.trim_start_matches('+'), read_base),
             ) {
-                let n = if num_str.starts_with('-') { -n.abs() } else { n };
-                let d = if den_str.starts_with('-') { -d.abs() } else { d };
+                let n = if num_str.starts_with('-') {
+                    -n.abs()
+                } else {
+                    n
+                };
+                let d = if den_str.starts_with('-') {
+                    -d.abs()
+                } else {
+                    d
+                };
                 if d == 0 {
-                    return Err(BlissError::ArithmeticError("division by zero in ratio".into()));
+                    return Err(BlissError::ArithmeticError(
+                        "division by zero in ratio".into(),
+                    ));
                 }
                 return Ok(Some(alloc_ratio(
                     BlissVal::from_fixnum(n),
@@ -676,7 +785,9 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
     if read_base == 10
         && (s.contains('.')
             || (s.contains('e') || s.contains('E'))
-                && !s.chars().all(|c| c.is_ascii_hexdigit() || c == '+' || c == '-'))
+                && !s
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == '+' || c == '-'))
     {
         if let Ok(f) = s.parse::<f32>() {
             return Ok(Some(BlissVal::from_single_float(f)));
@@ -691,15 +802,24 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
     Ok(None)
 }
 
-#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
+#[expect(
+    dead_code,
+    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
+)]
 fn read_sharpsign(
-    chars: &[char], pos: usize, labels: &mut CircularLabels,
+    chars: &[char],
+    pos: usize,
+    labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
     read_sharpsign_with_base(chars, pos, labels, 10, true)
 }
 
 fn read_sharpsign_with_base(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
+    chars: &[char],
+    mut pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     if pos >= chars.len() {
         return Err(BlissError::StreamError("unexpected end after #".into()));
@@ -707,11 +827,17 @@ fn read_sharpsign_with_base(
     // Check for #nR, #n=, #n#
     if chars[pos].is_ascii_digit() {
         let start = pos;
-        while pos < chars.len() && chars[pos].is_ascii_digit() { pos += 1; }
+        while pos < chars.len() && chars[pos].is_ascii_digit() {
+            pos += 1;
+        }
         if pos >= chars.len() {
             return Err(BlissError::StreamError("unexpected end after #n".into()));
         }
-        let num: u32 = chars[start..pos].iter().collect::<String>().parse().unwrap();
+        let num: u32 = chars[start..pos]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .unwrap();
         match chars[pos].to_ascii_uppercase() {
             'R' => {
                 pos += 1;
@@ -744,7 +870,12 @@ fn read_sharpsign_with_base(
                 }
                 return Err(BlissError::StreamError(format!("undefined label #{}", num)));
             }
-            _ => return Err(BlissError::StreamError(format!("unknown # dispatch #{}", chars[pos]))),
+            _ => {
+                return Err(BlissError::StreamError(format!(
+                    "unknown # dispatch #{}",
+                    chars[pos]
+                )));
+            }
         }
     }
     let dispatch = chars[pos];
@@ -770,7 +901,10 @@ fn read_sharpsign_with_base(
         ':' => {
             // Uninterned symbol
             let (token, end, _) = collect_token(chars, pos)?;
-            let name: String = token.iter().map(|&(c, esc)| if esc { c } else { c.to_ascii_uppercase() }).collect();
+            let name: String = token
+                .iter()
+                .map(|&(c, esc)| if esc { c } else { c.to_ascii_uppercase() })
+                .collect();
             Ok((make_uninterned_symbol(&name), end))
         }
         'P' | 'p' => read_pathname_literal(chars, pos),
@@ -792,7 +926,10 @@ fn read_sharpsign_with_base(
                 None => Err(BlissError::StreamError("read-eval not supported".into())),
             }
         }
-        _ => Err(BlissError::StreamError(format!("unknown # dispatch: {}", dispatch))),
+        _ => Err(BlissError::StreamError(format!(
+            "unknown # dispatch: {}",
+            dispatch
+        ))),
     }
 }
 
@@ -805,7 +942,9 @@ fn read_char_literal(chars: &[char], pos: usize) -> Result<(BlissVal, usize), Bl
     let mut end = pos + 1;
     // If first char is alphabetic, read the full name
     if chars[pos].is_ascii_alphabetic() {
-        while end < chars.len() && chars[end].is_ascii_alphabetic() { end += 1; }
+        while end < chars.len() && chars[end].is_ascii_alphabetic() {
+            end += 1;
+        }
     }
     if end - start > 1 {
         let name: String = chars[start..end].iter().collect();
@@ -823,22 +962,34 @@ fn read_char_literal(chars: &[char], pos: usize) -> Result<(BlissVal, usize), Bl
                 if name.len() == 1 {
                     return Ok((BlissVal::from_char(name.chars().next().unwrap()), end));
                 }
-                return Err(BlissError::StreamError(format!("unknown character name: {}", name)));
+                return Err(BlissError::StreamError(format!(
+                    "unknown character name: {}",
+                    name
+                )));
             }
         }
     }
     Ok((BlissVal::from_char(chars[pos]), end))
 }
 
-#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
+#[expect(
+    dead_code,
+    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
+)]
 fn read_vector_literal(
-    chars: &[char], pos: usize, labels: &mut CircularLabels,
+    chars: &[char],
+    pos: usize,
+    labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
     read_vector_literal_with_base(chars, pos, labels, 10, true)
 }
 
 fn read_vector_literal_with_base(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
+    chars: &[char],
+    mut pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     let mut elements = Vec::new();
     loop {
@@ -855,15 +1006,24 @@ fn read_vector_literal_with_base(
     }
 }
 
-#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
+#[expect(
+    dead_code,
+    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
+)]
 fn read_complex_literal(
-    chars: &[char], pos: usize, labels: &mut CircularLabels,
+    chars: &[char],
+    pos: usize,
+    labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
     read_complex_literal_with_base(chars, pos, labels, 10, true)
 }
 
 fn read_complex_literal_with_base(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
+    chars: &[char],
+    mut pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     pos = skip_whitespace_and_comments(chars, pos);
     if pos >= chars.len() || chars[pos] != '(' {
@@ -876,7 +1036,9 @@ fn read_complex_literal_with_base(
     let (imag, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
     pos = skip_whitespace_and_comments(chars, p);
     if pos >= chars.len() || chars[pos] != ')' {
-        return Err(BlissError::StreamError("expected ) after #C(real imag".into()));
+        return Err(BlissError::StreamError(
+            "expected ) after #C(real imag".into(),
+        ));
     }
     Ok((alloc_complex(real, imag), pos + 1))
 }
@@ -890,7 +1052,11 @@ fn read_bit_vector(chars: &[char], mut pos: usize) -> Result<(BlissVal, usize), 
     Ok((alloc_bit_vector(&bits), pos))
 }
 
-fn read_radix_integer(chars: &[char], mut pos: usize, radix: u32) -> Result<(BlissVal, usize), BlissError> {
+fn read_radix_integer(
+    chars: &[char],
+    mut pos: usize,
+    radix: u32,
+) -> Result<(BlissVal, usize), BlissError> {
     let start = pos;
     let negative = if pos < chars.len() && (chars[pos] == '+' || chars[pos] == '-') {
         let neg = chars[pos] == '-';
@@ -918,7 +1084,9 @@ fn skip_block_comment(chars: &[char], mut pos: usize) -> Result<usize, BlissErro
         } else if chars[pos] == '|' && chars[pos + 1] == '#' {
             depth -= 1;
             pos += 2;
-            if depth == 0 { return Ok(pos); }
+            if depth == 0 {
+                return Ok(pos);
+            }
         } else {
             pos += 1;
         }
@@ -926,16 +1094,26 @@ fn skip_block_comment(chars: &[char], mut pos: usize) -> Result<usize, BlissErro
     Err(BlissError::StreamError("unterminated block comment".into()))
 }
 
-#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
+#[expect(
+    dead_code,
+    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
+)]
 fn read_feature_expr(
-    chars: &[char], pos: usize, labels: &mut CircularLabels, include_if_present: bool,
+    chars: &[char],
+    pos: usize,
+    labels: &mut CircularLabels,
+    include_if_present: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     read_feature_expr_with_base(chars, pos, labels, include_if_present, 10, true)
 }
 
 fn read_feature_expr_with_base(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels, include_if_present: bool,
-    read_base: u32, read_eval: bool,
+    chars: &[char],
+    mut pos: usize,
+    labels: &mut CircularLabels,
+    include_if_present: bool,
+    read_base: u32,
+    read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     // Read the feature expression (a keyword symbol like :bliss)
     let (feature, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
@@ -1029,11 +1207,15 @@ fn try_eval(form: BlissVal) -> Option<BlissVal> {
             return None;
         }
 
-        if !rest2.is_cons() { return None; }
+        if !rest2.is_cons() {
+            return None;
+        }
         let rest2_cell = rest2.as_ptr() as *const ConsCell;
         let arg2_form = (*rest2_cell).car;
         let rest3 = (*rest2_cell).cdr;
-        if !rest3.is_nil() { return None; } // only binary ops
+        if !rest3.is_nil() {
+            return None;
+        } // only binary ops
 
         let arg2 = try_eval(arg2_form)?;
 
@@ -1076,15 +1258,24 @@ fn read_pathname_literal(chars: &[char], pos: usize) -> Result<(BlissVal, usize)
     Ok((alloc_pathname(string_val), end))
 }
 
-#[expect(dead_code, reason = "kept for bootstrap reader entrypoints not yet wired through public APIs")]
+#[expect(
+    dead_code,
+    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
+)]
 fn read_struct_literal(
-    chars: &[char], pos: usize, labels: &mut CircularLabels,
+    chars: &[char],
+    pos: usize,
+    labels: &mut CircularLabels,
 ) -> Result<(BlissVal, usize), BlissError> {
     read_struct_literal_with_base(chars, pos, labels, 10, true)
 }
 
 fn read_struct_literal_with_base(
-    chars: &[char], mut pos: usize, labels: &mut CircularLabels, read_base: u32, read_eval: bool,
+    chars: &[char],
+    mut pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
     // #S(name slot-key slot-value ...) — parse struct literal
     pos = skip_whitespace_and_comments(chars, pos);
@@ -1097,7 +1288,9 @@ fn read_struct_literal_with_base(
         return Err(BlissError::StreamError("unterminated #S literal".into()));
     }
     if chars[pos] == ')' {
-        return Err(BlissError::StreamError("#S() requires a struct name".into()));
+        return Err(BlissError::StreamError(
+            "#S() requires a struct name".into(),
+        ));
     }
     // Read struct name
     let (name_val, p) = read_token_with_base(chars, pos, labels, read_base, read_eval)?;
@@ -1131,7 +1324,8 @@ pub fn make_readtable(from: Option<BlissVal>) -> Result<BlissVal, BlissError> {
             let rt_key = rt.0 & !bliss_rt::value::TAG_MASK;
             let mut guard = MACRO_CHARS.lock().unwrap();
             let table = guard.get_or_insert_with(HashMap::new);
-            let copies: Vec<_> = table.iter()
+            let copies: Vec<_> = table
+                .iter()
                 .filter(|&(&(k, _), _)| k == src_key)
                 .map(|(&(_, ch), v)| (ch, *v))
                 .collect();
@@ -1152,7 +1346,8 @@ pub fn copy_readtable(from: BlissVal, to: Option<BlissVal>) -> Result<BlissVal, 
     let dst_key = dest.0 & !bliss_rt::value::TAG_MASK;
     let mut guard = MACRO_CHARS.lock().unwrap();
     let table = guard.get_or_insert_with(HashMap::new);
-    let copies: Vec<_> = table.iter()
+    let copies: Vec<_> = table
+        .iter()
         .filter(|&(&(k, _), _)| k == src_key)
         .map(|(&(_, ch), v)| (ch, *v))
         .collect();
@@ -1163,7 +1358,10 @@ pub fn copy_readtable(from: BlissVal, to: Option<BlissVal>) -> Result<BlissVal, 
 }
 
 pub fn set_macro_character(
-    readtable: BlissVal, ch: char, function: BlissVal, non_terminating: bool,
+    readtable: BlissVal,
+    ch: char,
+    function: BlissVal,
+    non_terminating: bool,
 ) -> Result<(), BlissError> {
     let key = readtable.0 & !bliss_rt::value::TAG_MASK;
     let mut guard = MACRO_CHARS.lock().unwrap();
@@ -1173,7 +1371,8 @@ pub fn set_macro_character(
 }
 
 pub fn get_macro_character(
-    readtable: BlissVal, ch: char,
+    readtable: BlissVal,
+    ch: char,
 ) -> Result<(Option<BlissVal>, bool), BlissError> {
     let key = readtable.0 & !bliss_rt::value::TAG_MASK;
     let guard = MACRO_CHARS.lock().unwrap();
@@ -1186,7 +1385,10 @@ pub fn get_macro_character(
 }
 
 pub fn set_dispatch_macro_character(
-    readtable: BlissVal, disp_char: char, sub_char: char, function: BlissVal,
+    readtable: BlissVal,
+    disp_char: char,
+    sub_char: char,
+    function: BlissVal,
 ) -> Result<(), BlissError> {
     let key = readtable.0 & !bliss_rt::value::TAG_MASK;
     let mut guard = DISPATCH_SUB_CHARS.lock().unwrap();
@@ -1196,7 +1398,9 @@ pub fn set_dispatch_macro_character(
 }
 
 pub fn get_dispatch_macro_character(
-    readtable: BlissVal, disp_char: char, sub_char: char,
+    readtable: BlissVal,
+    disp_char: char,
+    sub_char: char,
 ) -> Result<Option<BlissVal>, BlissError> {
     let key = readtable.0 & !bliss_rt::value::TAG_MASK;
     let guard = DISPATCH_SUB_CHARS.lock().unwrap();
@@ -1209,7 +1413,9 @@ pub fn get_dispatch_macro_character(
 }
 
 pub fn make_dispatch_macro_character(
-    readtable: BlissVal, ch: char, non_terminating: bool,
+    readtable: BlissVal,
+    ch: char,
+    non_terminating: bool,
 ) -> Result<(), BlissError> {
     let key = readtable.0 & !bliss_rt::value::TAG_MASK;
     let mut guard = DISPATCH_CHARS.lock().unwrap();

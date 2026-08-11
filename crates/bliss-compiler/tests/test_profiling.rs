@@ -1,7 +1,7 @@
 //! Tests for profiling infrastructure — profiling.rs
 
 use bliss_compiler::profiling::{
-    BackEdgeCounter, InvocationCounter, TypeProfile, TYPE_PROFILE_MAX_ENTRIES,
+    BackEdgeCounter, InvocationCounter, TYPE_PROFILE_MAX_ENTRIES, TypeProfile,
 };
 use bliss_rt::value::BlissVal;
 
@@ -40,7 +40,10 @@ fn invocation_counter_returns_true_at_threshold() {
     let counter = InvocationCounter::new();
     let mut reached = false;
     for _ in 0..5 {
-        if counter.increment(5) { reached = true; break; }
+        if counter.increment(5) {
+            reached = true;
+            break;
+        }
     }
     assert!(reached);
 }
@@ -80,7 +83,10 @@ fn back_edge_counter_reaches_threshold() {
     let counter = BackEdgeCounter::new();
     let mut reached = false;
     for _ in 0..10 {
-        if counter.increment(10) { reached = true; break; }
+        if counter.increment(10) {
+            reached = true;
+            break;
+        }
     }
     assert!(reached);
 }
@@ -88,7 +94,9 @@ fn back_edge_counter_reaches_threshold() {
 #[test]
 fn back_edge_counter_reset() {
     let counter = BackEdgeCounter::new();
-    for _ in 0..5 { counter.increment(100); }
+    for _ in 0..5 {
+        counter.increment(100);
+    }
     counter.reset();
     assert_eq!(counter.count(), 0);
 }
@@ -124,7 +132,9 @@ fn type_profile_single_type_is_monomorphic() {
 fn type_profile_multiple_same_type_still_monomorphic() {
     let profile = TypeProfile::new();
     let class = BlissVal(42);
-    for _ in 0..5 { profile.record(class); }
+    for _ in 0..5 {
+        profile.record(class);
+    }
     assert!(profile.is_monomorphic());
 }
 
@@ -140,7 +150,9 @@ fn type_profile_two_types_not_monomorphic() {
 fn type_profile_dominant_type_is_most_frequent() {
     let profile = TypeProfile::new();
     let frequent = BlissVal(10);
-    for _ in 0..3 { profile.record(frequent); }
+    for _ in 0..3 {
+        profile.record(frequent);
+    }
     profile.record(BlissVal(20));
     assert_eq!(profile.dominant_type(), Some(frequent));
 }
@@ -185,9 +197,7 @@ fn function_profile_invocation_counter() {
     // We zero-initialize to ensure `initialized` is false, triggering the panic
     // in check_init() before any invalid field (HashMap) is accessed.
     #[allow(invalid_value)]
-    let fp = unsafe {
-        std::mem::MaybeUninit::<FunctionProfile>::zeroed().assume_init()
-    };
+    let fp = unsafe { std::mem::MaybeUninit::<FunctionProfile>::zeroed().assume_init() };
     let _counter: &InvocationCounter = fp.invocation_counter();
 }
 
@@ -195,8 +205,6 @@ fn function_profile_invocation_counter() {
 #[should_panic(expected = "FunctionProfile")]
 fn function_profile_type_profile() {
     #[allow(invalid_value)]
-    let fp = unsafe {
-        std::mem::MaybeUninit::<FunctionProfile>::zeroed().assume_init()
-    };
+    let fp = unsafe { std::mem::MaybeUninit::<FunctionProfile>::zeroed().assume_init() };
     let _tp: Option<&TypeProfile> = fp.type_profile(0);
 }

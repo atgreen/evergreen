@@ -28,8 +28,10 @@ fn scheduler_init_single_worker() {
 
 #[test]
 fn scheduler_init_zero_workers_errors() {
-    assert!(Scheduler::init(&SchedulerConfig { num_workers: 0 }).is_err(),
-        "zero workers should fail initialization");
+    assert!(
+        Scheduler::init(&SchedulerConfig { num_workers: 0 }).is_err(),
+        "zero workers should fail initialization"
+    );
 }
 
 // ── submit / park / unpark / yield / active_thread_count ──────────
@@ -83,8 +85,10 @@ fn park_and_unpark_roundtrip() {
     s.submit(GreenThreadId(1)).unwrap();
     s.park_current();
     // Unparking a previously parked thread should succeed
-    assert!(s.unpark(GreenThreadId(1)).is_ok(),
-        "unparking a parked thread should succeed");
+    assert!(
+        s.unpark(GreenThreadId(1)).is_ok(),
+        "unparking a parked thread should succeed"
+    );
 }
 
 // ── shutdown ──────────────────────────────────────────────────────

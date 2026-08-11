@@ -1,8 +1,10 @@
 //! Tests for bliss-stdlib conditions module (spec §5.4).
-use bliss_stdlib::conditions::*;
 use bliss_rt::value::BlissVal;
+use bliss_stdlib::conditions::*;
 
-fn sym(i: u32) -> BlissVal { BlissVal::from_symbol_index(i) }
+fn sym(i: u32) -> BlissVal {
+    BlissVal::from_symbol_index(i)
+}
 
 #[test]
 fn make_simple_error_variants() {
@@ -40,8 +42,10 @@ fn error_condition_with_debugger_hook() {
     // Either way, the hook must have been called. We verify the hook was
     // consulted by checking the result is not silently Ok(()) with no
     // debugger involvement — an unhandled error MUST enter the debugger.
-    assert!(result.is_err(),
-        "error_condition with unhandled error must enter debugger (return Err)");
+    assert!(
+        result.is_err(),
+        "error_condition with unhandled error must enter debugger (return Err)"
+    );
     set_debugger_hook(None);
 }
 
@@ -58,15 +62,27 @@ fn warn_returns_ok() {
 #[test]
 fn handler_bind_no_signal() {
     let body = BlissVal::from_fixnum(99);
-    assert_eq!(handler_bind(&[(sym(10), BlissVal::from_fixnum(0))], body).unwrap(), body);
-    assert_eq!(handler_bind(&[], BlissVal::from_fixnum(77)).unwrap(), BlissVal::from_fixnum(77));
+    assert_eq!(
+        handler_bind(&[(sym(10), BlissVal::from_fixnum(0))], body).unwrap(),
+        body
+    );
+    assert_eq!(
+        handler_bind(&[], BlissVal::from_fixnum(77)).unwrap(),
+        BlissVal::from_fixnum(77)
+    );
 }
 
 #[test]
 fn handler_case_no_signal() {
     let form = BlissVal::from_fixnum(55);
-    assert_eq!(handler_case(form, &[(sym(20), BlissVal::from_fixnum(0))]).unwrap(), form);
-    assert_eq!(handler_case(BlissVal::from_fixnum(33), &[]).unwrap(), BlissVal::from_fixnum(33));
+    assert_eq!(
+        handler_case(form, &[(sym(20), BlissVal::from_fixnum(0))]).unwrap(),
+        form
+    );
+    assert_eq!(
+        handler_case(BlissVal::from_fixnum(33), &[]).unwrap(),
+        BlissVal::from_fixnum(33)
+    );
 }
 
 // Issue 6: handler_case_nested must actually signal a condition and test nesting.
@@ -95,16 +111,16 @@ fn handler_case_nested_with_signal() {
 
     // Now wrap in outer handler-case: the inner result should pass through
     // since the inner handler already caught the condition.
-    let outer_result = handler_case(
-        inner_val,
-        &[(error_type, outer_handler_result)],
-    );
+    let outer_result = handler_case(inner_val, &[(error_type, outer_handler_result)]);
 
     assert!(outer_result.is_ok(), "outer handler_case should succeed");
     // The inner handler should have caught it, so we should get the inner result,
     // not the outer handler result.
-    assert_eq!(outer_result.unwrap(), inner_handler_result,
-        "inner handler should catch the condition before outer");
+    assert_eq!(
+        outer_result.unwrap(),
+        inner_handler_result,
+        "inner handler should catch the condition before outer"
+    );
 }
 
 // Issue 6 supplement: test that unhandled condition propagates to outer handler
@@ -129,13 +145,17 @@ fn handler_case_nested_propagation() {
         &[(outer_type, outer_handler_result)],
     );
 
-    assert!(outer_result.is_ok(), "outer handler_case should handle propagated condition");
+    assert!(
+        outer_result.is_ok(),
+        "outer handler_case should handle propagated condition"
+    );
 }
 
 #[test]
 fn restart_spec_fields() {
     let full = RestartSpec {
-        name: sym(40), function: BlissVal::from_fixnum(1),
+        name: sym(40),
+        function: BlissVal::from_fixnum(1),
         report_function: Some(BlissVal::from_fixnum(2)),
         interactive_function: Some(BlissVal::from_fixnum(3)),
         test_function: Some(BlissVal::from_fixnum(4)),
@@ -143,8 +163,11 @@ fn restart_spec_fields() {
     assert_eq!(full.name, sym(40));
     assert!(full.report_function.is_some());
     let minimal = RestartSpec {
-        name: sym(41), function: BlissVal::from_fixnum(1),
-        report_function: None, interactive_function: None, test_function: None,
+        name: sym(41),
+        function: BlissVal::from_fixnum(1),
+        report_function: None,
+        interactive_function: None,
+        test_function: None,
     };
     assert!(minimal.interactive_function.is_none());
 }
@@ -152,21 +175,34 @@ fn restart_spec_fields() {
 #[test]
 fn restart_bind_returns_body() {
     let spec = RestartSpec {
-        name: sym(50), function: BlissVal::from_fixnum(1),
-        report_function: None, interactive_function: None, test_function: None,
+        name: sym(50),
+        function: BlissVal::from_fixnum(1),
+        report_function: None,
+        interactive_function: None,
+        test_function: None,
     };
-    assert_eq!(restart_bind(&[spec], BlissVal::from_fixnum(42)).unwrap(), BlissVal::from_fixnum(42));
-    assert_eq!(restart_bind(&[], BlissVal::from_fixnum(88)).unwrap(), BlissVal::from_fixnum(88));
+    assert_eq!(
+        restart_bind(&[spec], BlissVal::from_fixnum(42)).unwrap(),
+        BlissVal::from_fixnum(42)
+    );
+    assert_eq!(
+        restart_bind(&[], BlissVal::from_fixnum(88)).unwrap(),
+        BlissVal::from_fixnum(88)
+    );
 }
 
 #[test]
 fn restart_bind_multiple_specs() {
     let s1 = RestartSpec {
-        name: sym(80), function: BlissVal::from_fixnum(1),
-        report_function: None, interactive_function: None, test_function: None,
+        name: sym(80),
+        function: BlissVal::from_fixnum(1),
+        report_function: None,
+        interactive_function: None,
+        test_function: None,
     };
     let s2 = RestartSpec {
-        name: sym(81), function: BlissVal::from_fixnum(2),
+        name: sym(81),
+        function: BlissVal::from_fixnum(2),
         report_function: Some(BlissVal::from_fixnum(3)),
         interactive_function: Some(BlissVal::from_fixnum(4)),
         test_function: Some(BlissVal::from_fixnum(5)),
@@ -183,8 +219,11 @@ fn compute_restarts_within_restart_bind() {
     let restart_name = sym(60);
     let restart_fn = BlissVal::from_fixnum(1);
     let spec = RestartSpec {
-        name: restart_name, function: restart_fn,
-        report_function: None, interactive_function: None, test_function: None,
+        name: restart_name,
+        function: restart_fn,
+        report_function: None,
+        interactive_function: None,
+        test_function: None,
     };
 
     // restart_bind should establish the restart during the dynamic extent of its body.
@@ -200,8 +239,10 @@ fn compute_restarts_within_restart_bind() {
     // This is the correct behavior per ANSI CL — restarts have dynamic extent.
     let _restarts_after = compute_restarts(None);
     let found_after = find_restart(restart_name, None);
-    assert!(found_after.is_none(),
-        "find_restart should return None outside the dynamic extent of restart_bind");
+    assert!(
+        found_after.is_none(),
+        "find_restart should return None outside the dynamic extent of restart_bind"
+    );
 
     // To test that restarts ARE visible during restart_bind's body,
     // we need a mechanism that evaluates compute_restarts during the body.
@@ -210,21 +251,29 @@ fn compute_restarts_within_restart_bind() {
     // For now, we test the interface contract that restart_bind accepts
     // specs and returns the body value.
     let spec2 = RestartSpec {
-        name: restart_name, function: restart_fn,
-        report_function: None, interactive_function: None, test_function: None,
+        name: restart_name,
+        function: restart_fn,
+        report_function: None,
+        interactive_function: None,
+        test_function: None,
     };
     let body_val = BlissVal::from_fixnum(42);
     let result = restart_bind(&[spec2], body_val);
     assert!(result.is_ok(), "restart_bind should succeed");
-    assert_eq!(result.unwrap(), body_val,
-        "restart_bind should return the body value when no restart is invoked");
+    assert_eq!(
+        result.unwrap(),
+        body_val,
+        "restart_bind should return the body value when no restart is invoked"
+    );
 }
 
 #[test]
 fn compute_restarts_and_find_outside_scope() {
     // Outside any restart_bind, find_restart for a random name returns None
-    assert!(find_restart(sym(9999), None).is_none(),
-        "find_restart should return None when no restarts are established");
+    assert!(
+        find_restart(sym(9999), None).is_none(),
+        "find_restart should return None when no restarts are established"
+    );
 }
 
 // Issue 4: Test invoke_restart — invoke a restart function directly.
@@ -237,10 +286,15 @@ fn invoke_restart_executes_restart_function() {
 
     // Invoke the restart directly with the function value
     let result = invoke_restart(restart_fn, &[]);
-    assert!(result.is_ok(),
-        "invoke_restart should successfully invoke the restart function");
-    assert_eq!(result.unwrap(), restart_fn,
-        "invoke_restart with no args should return the restart function value");
+    assert!(
+        result.is_ok(),
+        "invoke_restart should successfully invoke the restart function"
+    );
+    assert_eq!(
+        result.unwrap(),
+        restart_fn,
+        "invoke_restart with no args should return the restart function value"
+    );
 }
 
 // Issue 4 supplement: invoke_restart with arguments
@@ -249,11 +303,16 @@ fn invoke_restart_with_args() {
     let restart_fn = BlissVal::from_fixnum(43);
 
     // Invoke with arguments — the restart function should receive them
-    let result = invoke_restart(restart_fn, &[BlissVal::from_fixnum(10), BlissVal::from_fixnum(20)]);
-    assert!(result.is_ok(),
-        "invoke_restart with args should succeed");
-    assert_eq!(result.unwrap(), BlissVal::from_fixnum(10),
-        "invoke_restart with args should return the first argument");
+    let result = invoke_restart(
+        restart_fn,
+        &[BlissVal::from_fixnum(10), BlissVal::from_fixnum(20)],
+    );
+    assert!(result.is_ok(), "invoke_restart with args should succeed");
+    assert_eq!(
+        result.unwrap(),
+        BlissVal::from_fixnum(10),
+        "invoke_restart with args should return the first argument"
+    );
 }
 
 // Issue 5: invoke_restart_interactively must use a real restart with interactive_function.
@@ -264,7 +323,8 @@ fn invoke_restart_interactively_uses_interactive_function() {
     let restart_fn = BlissVal::from_fixnum(44);
     let interactive_fn = BlissVal::from_fixnum(45); // the interactive function
     let spec = RestartSpec {
-        name: restart_name, function: restart_fn,
+        name: restart_name,
+        function: restart_fn,
         report_function: None,
         interactive_function: Some(interactive_fn),
         test_function: None,
@@ -273,13 +333,17 @@ fn invoke_restart_interactively_uses_interactive_function() {
     // invoke_restart_interactively should work with a restart function value
     // even outside dynamic extent (it falls back to invoking with no args).
     let result = invoke_restart_interactively(restart_fn);
-    assert!(result.is_ok(),
-        "invoke_restart_interactively should succeed with a restart function value");
+    assert!(
+        result.is_ok(),
+        "invoke_restart_interactively should succeed with a restart function value"
+    );
 
     // Also verify restart_bind correctly establishes and cleans up restarts
     let _ = restart_bind(&[spec], BlissVal::from_fixnum(0)).unwrap();
-    assert!(find_restart(restart_name, None).is_none(),
-        "restart should not be findable after restart_bind returns (dynamic extent)");
+    assert!(
+        find_restart(restart_name, None).is_none(),
+        "restart should not be findable after restart_bind returns (dynamic extent)"
+    );
 }
 
 // Issue 8: HandlerBinding struct existence and accessibility.
@@ -290,8 +354,10 @@ fn handler_binding_struct_exists() {
     // as a type in the conditions module.
     let _: Option<HandlerBinding> = None;
     // Verify it's a sized type (can be used in Option, references, etc.)
-    assert!(std::mem::size_of::<HandlerBinding>() > 0 || std::mem::size_of::<HandlerBinding>() == 0,
-        "HandlerBinding should be a valid sized type");
+    assert!(
+        std::mem::size_of::<HandlerBinding>() > 0 || std::mem::size_of::<HandlerBinding>() == 0,
+        "HandlerBinding should be a valid sized type"
+    );
 }
 
 #[test]

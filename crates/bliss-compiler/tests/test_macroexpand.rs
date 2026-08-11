@@ -80,7 +80,10 @@ fn augment_variable_does_not_mutate_original() {
 #[test]
 fn null_env_has_no_function_info() {
     let env = Environment::null();
-    assert!(env.function_information(BlissVal::from_fixnum(10)).is_none());
+    assert!(
+        env.function_information(BlissVal::from_fixnum(10))
+            .is_none()
+    );
 }
 
 #[test]
@@ -141,7 +144,10 @@ fn augment_function_does_not_mutate_original() {
 #[test]
 fn null_env_has_no_declaration_info() {
     let env = Environment::null();
-    assert!(env.declaration_information(BlissVal::from_fixnum(20)).is_none());
+    assert!(
+        env.declaration_information(BlissVal::from_fixnum(20))
+            .is_none()
+    );
 }
 
 #[test]
@@ -280,7 +286,10 @@ fn macroexpand_fully_expands_symbol_macro() {
 
     let (result, expanded_p) = macroexpand(sym, &env2).unwrap();
     assert!(expanded_p, "macroexpand should report expansion occurred");
-    assert_eq!(result, expansion, "macroexpand should return final expansion");
+    assert_eq!(
+        result, expansion,
+        "macroexpand should return final expansion"
+    );
 }
 
 // ── macroexpand: circular expansion detection (Issue #7) ─────────
@@ -326,7 +335,10 @@ fn macroexpand_all_expands_symbol_macro() {
     let env2 = env.augment_variable(sym, VariableInfo::SymbolMacro(expansion));
 
     let result = macroexpand_all(sym, &env2).unwrap();
-    assert_eq!(result, expansion, "macroexpand_all should expand symbol macros");
+    assert_eq!(
+        result, expansion,
+        "macroexpand_all should expand symbol macros"
+    );
 }
 
 // ── set_macroexpand_hook (Issue #8) ──────────────────────────────

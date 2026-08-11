@@ -6,8 +6,8 @@ use crate::error::BlissError;
 use crate::stack::BlissStack;
 use crate::value::{BlissVal, NIL};
 
-use std::collections::{HashMap, VecDeque};
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -322,7 +322,10 @@ fn run_green_thread_entry(thread: &GreenThread) -> Result<BlissVal, BlissError> 
         let fn_addr = thread.entry.0 & !crate::value::TAG_MASK;
         let func: fn() -> BlissVal = unsafe { std::mem::transmute(fn_addr) };
         Ok(func())
-    } else if matches!(thread.entry.0, crate::value::NIL_BITS | crate::value::T_BITS) {
+    } else if matches!(
+        thread.entry.0,
+        crate::value::NIL_BITS | crate::value::T_BITS
+    ) {
         Ok(thread.entry)
     } else {
         Err(BlissError::TypeError {
@@ -424,10 +427,7 @@ pub fn join_thread(id: GreenThreadId) -> Result<BlissVal, BlissError> {
         match registry.get(&id) {
             Some(thread) => Arc::clone(&thread.result),
             None => {
-                return Err(BlissError::Internal(format!(
-                    "no thread with id {}",
-                    id.0
-                )));
+                return Err(BlissError::Internal(format!("no thread with id {}", id.0)));
             }
         }
     };
@@ -458,9 +458,7 @@ pub fn current_thread() -> &'static GreenThread {
     if let Some(active) = ACTIVE_GREEN_THREAD.with(|slot| slot.borrow().clone()) {
         unsafe { &*(Arc::as_ptr(&active)) }
     } else {
-        CURRENT_THREAD.with(|t| {
-            unsafe { &*(Arc::as_ptr(t)) }
-        })
+        CURRENT_THREAD.with(|t| unsafe { &*(Arc::as_ptr(t)) })
     }
 }
 
@@ -496,10 +494,7 @@ pub fn interrupt_thread(id: GreenThreadId, condition: BlissVal) -> Result<(), Bl
             thread.post_interrupt(condition);
             Ok(())
         }
-        None => Err(BlissError::Internal(format!(
-            "no thread with id {}",
-            id.0
-        ))),
+        None => Err(BlissError::Internal(format!("no thread with id {}", id.0))),
     }
 }
 

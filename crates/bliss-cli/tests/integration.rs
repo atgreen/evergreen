@@ -3,7 +3,7 @@
 //! These tests wire together bliss-rt, bliss-compiler, and bliss-stdlib
 //! through the bliss-cli crate to verify cross-crate integration.
 
-use bliss_rt::runtime::{Runtime, RuntimeConfig, LogLevel};
+use bliss_rt::runtime::{LogLevel, Runtime, RuntimeConfig};
 use bliss_rt::value::{BlissVal, NIL};
 
 // ── Helper ────────────────────────────────────────────────────────
@@ -11,9 +11,9 @@ use bliss_rt::value::{BlissVal, NIL};
 /// Create a minimal RuntimeConfig suitable for testing.
 fn test_config() -> RuntimeConfig {
     RuntimeConfig {
-        heap_size: 4 * 1024 * 1024,   // 4 MB
-        nursery_size: 512 * 1024,      // 512 KB
-        stack_size: 64 * 1024,         // 64 KB
+        heap_size: 4 * 1024 * 1024, // 4 MB
+        nursery_size: 512 * 1024,   // 512 KB
+        stack_size: 64 * 1024,      // 64 KB
         num_workers: 1,
         image_path: None,
         no_image: true,
@@ -85,7 +85,9 @@ fn runtime_run_with_eval_form() {
 fn eval_integer_literal() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("42").expect("eval of integer literal should not error");
+    let result = rt
+        .eval("42")
+        .expect("eval of integer literal should not error");
     assert_eq!(
         result,
         BlissVal::from_fixnum(42),
@@ -99,7 +101,9 @@ fn eval_integer_literal() {
 fn eval_quoted_symbol() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("'foo").expect("eval of quoted symbol should not error");
+    let result = rt
+        .eval("'foo")
+        .expect("eval of quoted symbol should not error");
     // Result should be a symbol named FOO (CL upcases by default)
     assert!(
         result.is_symbol(),
@@ -113,7 +117,9 @@ fn eval_quoted_symbol() {
 fn eval_string_literal() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("\"hello\"").expect("eval of string literal should not error");
+    let result = rt
+        .eval("\"hello\"")
+        .expect("eval of string literal should not error");
     assert!(
         result.is_string(),
         "eval of '\"hello\"' should return a string, got: {:?}",
@@ -126,7 +132,9 @@ fn eval_string_literal() {
 fn eval_cons_construction() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("(cons 1 2)").expect("eval of cons should not error");
+    let result = rt
+        .eval("(cons 1 2)")
+        .expect("eval of cons should not error");
     // Result should be a cons cell (1 . 2)
     assert!(
         result.is_cons(),
@@ -140,7 +148,9 @@ fn eval_cons_construction() {
 fn eval_list_construction() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("(list 1 2 3)").expect("eval of list should not error");
+    let result = rt
+        .eval("(list 1 2 3)")
+        .expect("eval of list should not error");
     // Result should be a cons cell (a proper list)
     assert!(
         result.is_cons(),
@@ -154,7 +164,9 @@ fn eval_list_construction() {
 fn eval_lambda_application() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("((lambda (x) (* x x)) 5)").expect("eval of lambda application should not error");
+    let result = rt
+        .eval("((lambda (x) (* x x)) 5)")
+        .expect("eval of lambda application should not error");
     assert_eq!(
         result,
         BlissVal::from_fixnum(25),
@@ -168,7 +180,9 @@ fn eval_lambda_application() {
 fn eval_let_binding() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("(let ((x 10) (y 20)) (+ x y))").expect("eval of let should not error");
+    let result = rt
+        .eval("(let ((x 10) (y 20)) (+ x y))")
+        .expect("eval of let should not error");
     assert_eq!(
         result,
         BlissVal::from_fixnum(30),
@@ -182,7 +196,9 @@ fn eval_let_binding() {
 fn eval_if_true_branch() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("(if t 'yes 'no)").expect("eval of if should not error");
+    let result = rt
+        .eval("(if t 'yes 'no)")
+        .expect("eval of if should not error");
     // Result should be the symbol YES
     assert!(
         result.is_symbol(),
@@ -196,7 +212,9 @@ fn eval_if_true_branch() {
 fn eval_if_false_branch() {
     let config = test_config();
     let mut rt = Runtime::init(config).expect("init");
-    let result = rt.eval("(if nil 'yes 'no)").expect("eval of if (false) should not error");
+    let result = rt
+        .eval("(if nil 'yes 'no)")
+        .expect("eval of if (false) should not error");
     // Result should be the symbol NO
     assert!(
         result.is_symbol(),
