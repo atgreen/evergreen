@@ -4,9 +4,10 @@
 
 use crate::error::BlissError;
 use crate::stack::BlissStack;
-use crate::value::BlissVal;
+use crate::value::{BlissVal, NIL};
 
 use std::collections::{HashMap, VecDeque};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -42,7 +43,7 @@ static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 /// Holds the result of a thread's execution and a signal for completion.
 struct ThreadResult {
     /// The result value, set when the thread finishes.
-    value: Mutex<Option<BlissVal>>,
+    value: Mutex<Option<Result<BlissVal, BlissError>>>,
     /// Condvar signaled when the thread transitions to Dead.
     done: Condvar,
 }
@@ -56,19 +57,19 @@ impl ThreadResult {
     }
 
     /// Store the result and notify all waiters.
-    fn complete(&self, val: BlissVal) {
+    fn complete(&self, val: Result<BlissVal, BlissError>) {
         let mut guard = self.value.lock().unwrap();
         *guard = Some(val);
         self.done.notify_all();
     }
 
     /// Block until the result is available, then return it.
-    fn wait(&self) -> BlissVal {
+    fn wait(&self) -> Result<BlissVal, BlissError> {
         let mut guard = self.value.lock().unwrap();
         while guard.is_none() {
             guard = self.done.wait(guard).unwrap();
         }
-        guard.unwrap()
+        guard.take().unwrap()
     }
 
     /// Check if the thread has finished without blocking.
@@ -90,18 +91,19 @@ thread_local! {
         let id = GreenThreadId(NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed));
         let thread = Arc::new(GreenThread {
             id,
-            entry: crate::value::NIL,
+            entry: NIL,
             state: Mutex::new(ThreadState::Runnable),
             stack: BlissStack::new(DEFAULT_STACK_SIZE),
-            tls: Mutex::new(vec![crate::value::NIL; MAX_TLS]),
+            tls: Mutex::new(vec![NIL; MAX_TLS]),
             yield_requested: AtomicBool::new(false),
             result: Arc::new(ThreadResult::new()),
             interrupt_pending: AtomicBool::new(false),
-            interrupt_value: Mutex::new(crate::value::NIL),
+            interrupt_value: Mutex::new(NIL),
         });
         thread_registry().lock().unwrap().insert(id, Arc::clone(&thread));
         thread
     };
+    static ACTIVE_GREEN_THREAD: RefCell<Option<Arc<GreenThread>>> = const { RefCell::new(None) };
 }
 
 /// Green thread descriptor. D2.01.
@@ -300,33 +302,41 @@ fn worker_loop() {
     while let Some(task) = pool.take_task() {
         // Execute the green thread's entry.
         task.thread.set_state(ThreadState::Runnable);
+        let thread = Arc::clone(&task.thread);
+        ACTIVE_GREEN_THREAD.with(|slot| {
+            *slot.borrow_mut() = Some(Arc::clone(&thread));
+        });
 
-        // Execute the entry: if it is a TAG_FUNCTION, extract the native
-        // function pointer and invoke it. Otherwise pass the entry value
-        // through as the result (e.g. NIL, T, fixnums).
-        let result_val = if task.thread.entry.is_function() {
-            // The function pointer is stored in the upper bits (mask off the
-            // 3-bit tag). Interpret it as a `fn() -> BlissVal`.
-            let fn_addr = task.thread.entry.0 & !crate::value::TAG_MASK;
-            let func: fn() -> BlissVal = unsafe { std::mem::transmute(fn_addr) };
-            func()
-        } else {
-            task.thread.entry
-        };
+        let result = run_green_thread_entry(&thread);
 
-        // Check for pending interrupts before completing. If an interrupt
-        // was delivered, the interrupt condition replaces the normal result
-        // so that the joining thread can observe the interruption.
-        let result_val = if task.thread.has_interrupt() {
-            task.thread.take_interrupt().unwrap_or(result_val)
-        } else {
-            result_val
-        };
+        ACTIVE_GREEN_THREAD.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
 
-        // Mark thread as dead and publish the result.
         task.thread.set_state(ThreadState::Dead);
-        task.result_cell.complete(result_val);
+        task.result_cell.complete(result);
     }
+}
+
+fn run_green_thread_entry(thread: &GreenThread) -> Result<BlissVal, BlissError> {
+    let mut result = if thread.entry.is_function() {
+        let fn_addr = thread.entry.0 & !crate::value::TAG_MASK;
+        let func: fn() -> BlissVal = unsafe { std::mem::transmute(fn_addr) };
+        Ok(func())
+    } else if matches!(thread.entry.0, crate::value::NIL_BITS | crate::value::T_BITS) {
+        Ok(thread.entry)
+    } else {
+        Err(BlissError::TypeError {
+            datum: thread.entry,
+            expected: "function".to_string(),
+        })
+    };
+
+    if thread.has_interrupt() {
+        result = Ok(thread.take_interrupt().unwrap_or(NIL));
+    }
+
+    result
 }
 
 /// An OS-level worker thread in the worker pool (§2.3.1).
@@ -362,10 +372,8 @@ impl WorkerThread {
 /// Create a new green thread that will execute `entry`.
 /// The thread starts in `Runnable` state and is submitted to the global
 /// worker pool for M:N scheduling onto OS worker threads. The entry value
-/// is stored on the GreenThread descriptor and used as the thread's body.
-/// In the current bootstrap runtime (without a full evaluator), the entry
-/// value is returned as the thread's result. A full evaluator would invoke
-/// `entry` as a zero-argument CL function.
+/// is stored on the GreenThread descriptor and invoked as a zero-argument
+/// CL function when scheduled.
 pub fn make_thread(entry: BlissVal) -> Result<GreenThreadId, BlissError> {
     let id = GreenThreadId(NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed));
     let result_cell = Arc::new(ThreadResult::new());
@@ -374,11 +382,11 @@ pub fn make_thread(entry: BlissVal) -> Result<GreenThreadId, BlissError> {
         entry,
         state: Mutex::new(ThreadState::Runnable),
         stack: BlissStack::new(DEFAULT_STACK_SIZE),
-        tls: Mutex::new(vec![crate::value::NIL; MAX_TLS]),
+        tls: Mutex::new(vec![NIL; MAX_TLS]),
         yield_requested: AtomicBool::new(false),
         result: Arc::clone(&result_cell),
         interrupt_pending: AtomicBool::new(false),
-        interrupt_value: Mutex::new(crate::value::NIL),
+        interrupt_value: Mutex::new(NIL),
     });
 
     // Register the thread before submitting so it is visible to other threads.
@@ -420,7 +428,7 @@ pub fn join_thread(id: GreenThreadId) -> Result<BlissVal, BlissError> {
     };
 
     // Block until the thread completes, then return the result.
-    let val = result_cell.wait();
+    let val = result_cell.wait()?;
 
     // Clean up: remove the dead thread from the registry to avoid leaking memory.
     thread_registry().lock().unwrap().remove(&id);
@@ -442,12 +450,13 @@ pub fn current_thread_id() -> GreenThreadId {
 /// returned `&'static` reference is valid as long as the calling OS thread
 /// is alive.
 pub fn current_thread() -> &'static GreenThread {
-    CURRENT_THREAD.with(|t| {
-        // Safety: The Arc in thread-local storage keeps the GreenThread alive
-        // for the lifetime of this OS thread. We return a 'static reference
-        // that is valid as long as the OS thread lives.
-        unsafe { &*(Arc::as_ptr(t)) }
-    })
+    if let Some(active) = ACTIVE_GREEN_THREAD.with(|slot| slot.borrow().clone()) {
+        unsafe { &*(Arc::as_ptr(&active)) }
+    } else {
+        CURRENT_THREAD.with(|t| {
+            unsafe { &*(Arc::as_ptr(t)) }
+        })
+    }
 }
 
 /// Yield the current green thread at the next safepoint.

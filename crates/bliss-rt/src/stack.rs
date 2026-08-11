@@ -3,7 +3,9 @@
 //! Each green thread owns a `BlissStack` — a contiguous virtual memory
 //! region for CL control/value frames. See §2.4 of the spec.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::value::BlissVal;
 
@@ -143,19 +145,93 @@ impl Frame {
 
 /// Metadata about a compiled function's code, used for GC stack maps
 /// and debugger source-location mapping.
+#[derive(Clone, Debug)]
+pub struct SourceLocationEntry {
+    pub pc_offset: usize,
+    pub location: SourceLocation,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StackMapEntry {
+    pub pc_offset: usize,
+    pub bytes: usize,
+    pub len: usize,
+}
+
+struct CodeInfoMetadata {
+    source_locations: &'static [SourceLocationEntry],
+    stack_maps: &'static [StackMapEntry],
+}
+
+fn code_info_registry() -> &'static Mutex<HashMap<usize, &'static CodeInfoMetadata>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, &'static CodeInfoMetadata>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub struct CodeInfo {
     _private: (),
 }
 
 impl CodeInfo {
+    /// Create code metadata from static tables emitted by the compiler.
+    pub fn new(
+        source_locations: &'static [SourceLocationEntry],
+        stack_maps: &'static [StackMapEntry],
+    ) -> &'static Self {
+        let handle = Box::leak(Box::new(0u8)) as *mut u8 as *const CodeInfo;
+        let metadata = Box::leak(Box::new(CodeInfoMetadata {
+            source_locations: Box::leak(source_locations.to_vec().into_boxed_slice()),
+            stack_maps: Box::leak(stack_maps.to_vec().into_boxed_slice()),
+        }));
+        code_info_registry().lock().unwrap().insert(
+            handle as usize,
+            metadata,
+        );
+        unsafe { &*handle }
+    }
+
+    fn source_location_entries(&self) -> &[SourceLocationEntry] {
+        let metadata = code_info_registry()
+            .lock()
+            .unwrap()
+            .get(&(self as *const CodeInfo as usize))
+            .copied();
+        metadata.map(|metadata| metadata.source_locations).unwrap_or(&[])
+    }
+
+    fn stack_map_entries(&self) -> &[StackMapEntry] {
+        let metadata = code_info_registry()
+            .lock()
+            .unwrap()
+            .get(&(self as *const CodeInfo as usize))
+            .copied();
+        metadata.map(|metadata| metadata.stack_maps).unwrap_or(&[])
+    }
+
     /// Look up the source location for a given PC offset.
-    pub fn source_location(&self, _pc_offset: usize) -> Option<SourceLocation> {
-        None
+    pub fn source_location(&self, pc_offset: usize) -> Option<SourceLocation> {
+        let entries = self.source_location_entries();
+        let idx = entries.partition_point(|entry| entry.pc_offset <= pc_offset);
+        if idx == 0 {
+            None
+        } else {
+            Some(entries[idx - 1].location.clone())
+        }
     }
 
     /// Get the GC stack map for a given safepoint PC offset.
-    pub fn stack_map(&self, _pc_offset: usize) -> Option<&[u8]> {
-        None
+    pub fn stack_map(&self, pc_offset: usize) -> Option<&[u8]> {
+        let entries = self.stack_map_entries();
+        let idx = entries.partition_point(|entry| entry.pc_offset <= pc_offset);
+        if idx == 0 {
+            return None;
+        }
+        let entry = &entries[idx - 1];
+        if entry.bytes == 0 || entry.len == 0 {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(entry.bytes as *const u8, entry.len) })
+        }
     }
 }
 

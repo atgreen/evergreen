@@ -199,6 +199,118 @@ pub fn complete_symbol(prefix: &str) -> Vec<String> {
         .collect()
 }
 
+fn swank_symbol_name(name: &str) -> String {
+    name.trim_matches('\'')
+        .trim_matches('"')
+        .split(':')
+        .last()
+        .unwrap_or(name)
+        .to_string()
+}
+
+fn read_workspace_sources() -> Vec<(String, String)> {
+    fn walk(path: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|s| s.to_str()) == Some("target") {
+                    continue;
+                }
+                walk(&path, out);
+            } else if matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("rs" | "lisp" | "lsp" | "cl" | "md")
+            ) {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    out.push((path.to_string_lossy().to_string(), content));
+                }
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    walk(std::path::Path::new("."), &mut files);
+    files
+}
+
+fn extract_swank_arglist(name: &str) -> Option<String> {
+    let bare = swank_symbol_name(name);
+    let rust_name = bare.replace('-', "_");
+    let lisp_name = bare.to_lowercase();
+
+    for (_path, content) in read_workspace_sources() {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("pub fn ") {
+                if let Some(args_start) = rest.find('(') {
+                    let fn_name = rest[..args_start].trim();
+                    if fn_name == rust_name {
+                        if let Some(args_end) = rest[args_start + 1..].find(')') {
+                            let args = &rest[args_start + 1..args_start + 1 + args_end];
+                            return Some(format!("({})", args.trim()));
+                        }
+                    }
+                }
+            }
+            let lower = trimmed.to_lowercase();
+            let defun = format!("(defun {}", lisp_name);
+            let defmacro = format!("(defmacro {}", lisp_name);
+            if lower.starts_with(&defun) || lower.starts_with(&defmacro) {
+                if let Some(args_start) = trimmed[1..].find('(') {
+                    let start = args_start + 1;
+                    if let Some(end) = trimmed[start..].find(')') {
+                        return Some(trimmed[start..start + end + 1].to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let builtin = match lisp_name.as_str() {
+        "car" | "cdr" => Some("(list)"),
+        "cons" => Some("(car cdr)"),
+        "list" => Some("(&rest objects)"),
+        "format" => Some("(destination control-string &rest args)"),
+        "apply" => Some("(function &rest args)"),
+        "funcall" => Some("(function &rest args)"),
+        "make-thread" => Some("(function)"),
+        _ => None,
+    }?;
+    Some(builtin.to_string())
+}
+
+fn extract_swank_definitions(name: &str) -> Vec<String> {
+    let bare = swank_symbol_name(name);
+    let rust_name = bare.replace('-', "_");
+    let lisp_name = bare.to_lowercase();
+    let mut matches = Vec::new();
+
+    for (path, content) in read_workspace_sources() {
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with(&format!("pub fn {}", rust_name))
+                || trimmed.starts_with(&format!("fn {}", rust_name))
+                || trimmed.to_lowercase().starts_with(&format!("(defun {}", lisp_name))
+                || trimmed.to_lowercase().starts_with(&format!("(defmacro {}", lisp_name))
+            {
+                matches.push(format!(
+                    "((\"{}\" \"{}\") (:location (\"{}\" :line {})))",
+                    bare,
+                    path,
+                    path,
+                    idx + 1
+                ));
+            }
+        }
+    }
+
+    matches
+}
+
 /// Run the interactive REPL loop. A6.01.
 /// Supports multi-line editing with bracket matching (R6.02),
 /// persistent history (R6.03), and condition/restart presentation (R6.07).
@@ -2593,8 +2705,12 @@ fn handle_swank_op(
 
         // R6.34: arglist
         "swank:operator-arglist" => {
-            if let Some(_name) = extract_swank_string_arg(full_message) {
-                "\"(args...)\"".to_string()
+            if let Some(name) = extract_swank_string_arg(full_message) {
+                if let Some(arglist) = extract_swank_arglist(&name) {
+                    format!("\"{}\"", arglist)
+                } else {
+                    "NIL".to_string()
+                }
             } else {
                 "NIL".to_string()
             }
@@ -2602,7 +2718,16 @@ fn handle_swank_op(
 
         // R6.34: find-definitions
         "swank:find-definitions-for-emacs" => {
-            "NIL".to_string() // No definitions found in bootstrap
+            if let Some(name) = extract_swank_string_arg(full_message) {
+                let definitions = extract_swank_definitions(&name);
+                if definitions.is_empty() {
+                    "NIL".to_string()
+                } else {
+                    format!("({})", definitions.join(" "))
+                }
+            } else {
+                "NIL".to_string()
+            }
         }
 
         // R6.34: macroexpand-1
