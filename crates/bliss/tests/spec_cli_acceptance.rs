@@ -873,3 +873,721 @@ fn stage_four_cli_rejects_builtin_class_instantiation() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Evaluate a single expression through the real CLI and return trimmed stdout.
+fn eval_ok(expr: &str) -> String {
+    let output = bliss()
+        .args(["--eval", expr])
+        .output()
+        .expect("run bliss --eval");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "expr `{expr}` exited non-zero; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn clos_inherited_slot_initforms_are_evaluated_during_make_instance() {
+    // R5.80: make-instance must evaluate :initform for every effective slot,
+    // including slots inherited from superclasses — not just self-evaluating
+    // literals. The initform here is a non-trivial form that must be *evaluated*.
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass base () ((x :initform (+ 40 2) :accessor base-x))) \
+                    (defclass mid (base) ()) \
+                    (defclass leaf (mid) ()) \
+                    (base-x (make-instance 'leaf)))"
+        ),
+        "42",
+        "inherited :initform must be evaluated through the full class precedence list"
+    );
+}
+
+#[test]
+fn clos_inherited_initform_reachable_via_slot_value() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass base () ((x :initform (* 6 7)))) \
+                    (defclass sub (base) ()) \
+                    (slot-value (make-instance 'sub) 'x))"
+        ),
+        "42"
+    );
+}
+
+#[test]
+fn clos_subclass_without_initform_keeps_inherited_default() {
+    // A subclass that redeclares a slot but supplies no :initform must not
+    // shadow the inherited default (ANSI effective-slot :initform inheritance).
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass base () ((x :initform 7 :accessor bx))) \
+                    (defclass sub (base) ((x :accessor sx))) \
+                    (bx (make-instance 'sub)))"
+        ),
+        "7"
+    );
+}
+
+#[test]
+fn clos_explicit_initarg_overrides_inherited_initform() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass base () ((x :initarg :x :initform 1 :accessor bx))) \
+                    (defclass sub (base) ()) \
+                    (bx (make-instance 'sub :x 99)))"
+        ),
+        "99"
+    );
+}
+
+#[test]
+fn clos_typep_honours_user_class_hierarchy() {
+    // typep must consult the CLOS class precedence list for user instances,
+    // matching a class against every one of its superclasses.
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass animal () ()) (defclass dog (animal) ()) \
+                    (let ((d (make-instance 'dog))) \
+                      (list (typep d 'dog) (typep d 'animal) \
+                            (typep d 'standard-object) (typep d 't))))"
+        ),
+        "(T T T T)"
+    );
+}
+
+#[test]
+fn clos_typep_rejects_unrelated_user_class() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass animal () ()) (defclass plant () ()) \
+                    (typep (make-instance 'animal) 'plant))"
+        ),
+        "NIL"
+    );
+}
+
+#[test]
+fn condition_make_condition_evaluates_slot_initforms() {
+    // Conditions are CLOS objects: MAKE-CONDITION must run the same initform
+    // protocol as MAKE-INSTANCE, evaluating a non-literal :initform.
+    assert_eq!(
+        eval_ok(
+            "(progn (define-condition my-err (error) \
+                      ((code :initform (+ 1 41) :reader err-code))) \
+                    (err-code (make-condition 'my-err)))"
+        ),
+        "42"
+    );
+}
+
+#[test]
+fn condition_inherits_slot_initform_from_parent_condition() {
+    assert_eq!(
+        eval_ok(
+            "(progn (define-condition base-err (error) \
+                      ((code :initform 5 :reader err-code))) \
+                    (define-condition sub-err (base-err) ()) \
+                    (err-code (make-condition 'sub-err)))"
+        ),
+        "5"
+    );
+}
+
+#[test]
+fn condition_error_accepts_type_designator_symbol() {
+    // (error 'type ...) must build a condition instance and dispatch handlers
+    // through the CLOS class hierarchy — the slot :initform is applied too.
+    assert_eq!(
+        eval_ok(
+            "(progn (define-condition my-err (error) \
+                      ((code :initform 7 :reader err-code))) \
+                    (handler-case (error 'my-err) (my-err (c) (err-code c))))"
+        ),
+        "7"
+    );
+}
+
+#[test]
+fn condition_error_symbol_passes_initargs() {
+    assert_eq!(
+        eval_ok(
+            "(progn (define-condition my-err (error) \
+                      ((code :initarg :code :reader err-code))) \
+                    (handler-case (error 'my-err :code 99) (my-err (c) (err-code c))))"
+        ),
+        "99"
+    );
+}
+
+#[test]
+fn condition_signal_accepts_type_designator_symbol() {
+    assert_eq!(
+        eval_ok(
+            "(progn (define-condition w (warning) ()) \
+                    (handler-case (signal 'w) (w (c) 'caught)))"
+        ),
+        "CAUGHT"
+    );
+}
+
+#[test]
+fn condition_handler_matches_via_class_hierarchy() {
+    // A handler for a superclass condition catches a subclass condition, and an
+    // unrelated handler does not — proving handler matching walks the CLOS CPL.
+    assert_eq!(
+        eval_ok(
+            "(progn (define-condition my-err (error) ()) \
+                    (handler-case (error 'my-err) \
+                      (warning (c) 'wrong) \
+                      (error (c) 'right)))"
+        ),
+        "RIGHT"
+    );
+}
+
+#[test]
+fn condition_warn_signals_catchable_warning() {
+    assert_eq!(
+        eval_ok(
+            "(progn (define-condition w (warning) ()) \
+                    (handler-case (warn 'w) (warning (c) 'caught)))"
+        ),
+        "CAUGHT"
+    );
+}
+
+#[test]
+fn condition_warn_string_is_simple_warning() {
+    assert_eq!(
+        eval_ok("(handler-case (warn \"heads up ~a\" 42) (warning (c) 'caught))"),
+        "CAUGHT"
+    );
+}
+
+#[test]
+fn condition_warn_muffle_restart_returns_nil() {
+    // MUFFLE-WARNING suppresses the default warning and lets execution continue.
+    assert_eq!(
+        eval_ok(
+            "(progn (handler-bind ((warning (lambda (c) (invoke-restart 'muffle-warning)))) \
+                      (warn \"muffled\")) \
+                    'after)"
+        ),
+        "AFTER"
+    );
+}
+
+#[test]
+fn clos_unbound_slot_signals_catchable_condition() {
+    // R5.71: reading an unbound slot signals a real UNBOUND-SLOT condition that
+    // handler-case can catch (also matchable as the more general ERROR).
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass a () ((x))) \
+                    (handler-case (slot-value (make-instance 'a) 'x) \
+                      (unbound-slot (c) 'unbound) (error (c) 'other)))"
+        ),
+        "UNBOUND"
+    );
+}
+
+#[test]
+fn clos_no_applicable_method_is_catchable_error() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defgeneric g (x)) (defmethod g ((x integer)) 'int) \
+                    (handler-case (g \"str\") (error (c) 'no-method)))"
+        ),
+        "NO-METHOD"
+    );
+}
+
+#[test]
+fn clos_no_next_method_is_catchable_error() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass a () ()) (defmethod g ((x a)) (call-next-method)) \
+                    (handler-case (g (make-instance 'a)) (error (c) 'no-next)))"
+        ),
+        "NO-NEXT"
+    );
+}
+
+#[test]
+fn clos_dispatch_on_builtin_type_specializers() {
+    // Methods specialized on built-in CL types must dispatch on immediate values.
+    assert_eq!(
+        eval_ok(
+            "(progn (defmethod k ((x integer)) 'int) (defmethod k ((x string)) 'str) \
+                    (defmethod k ((x symbol)) 'sym) (defmethod k ((x character)) 'char) \
+                    (defmethod k ((x cons)) 'cons) \
+                    (list (k 5) (k \"s\") (k 'a) (k #\\x) (k '(1))))"
+        ),
+        "(INT STR SYM CHAR CONS)"
+    );
+}
+
+#[test]
+fn clos_builtin_specializer_specificity_orders_subtype_first() {
+    // A fixnum matches both INTEGER and NUMBER; the more specific INTEGER wins.
+    assert_eq!(
+        eval_ok(
+            "(progn (defmethod h ((x number)) 'num) (defmethod h ((x integer)) 'int) \
+                    (list (h 5) (h 1.5)))"
+        ),
+        "(INT NUM)"
+    );
+}
+
+#[test]
+fn clos_setf_slot_value_writes_slot() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass p () ((x))) (let ((o (make-instance 'p))) \
+                    (setf (slot-value o 'x) 7) (slot-value o 'x)))"
+        ),
+        "7"
+    );
+}
+
+#[test]
+fn clos_with_slots_reads_and_writes() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass p () ((x :initform 1))) (let ((o (make-instance 'p))) \
+                    (with-slots (x) o (setf x 10)) (slot-value o 'x)))"
+        ),
+        "10"
+    );
+}
+
+#[test]
+fn clos_with_slots_supports_renamed_bindings() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass p () ((x :initform 5))) \
+                    (with-slots ((a x)) (make-instance 'p) a))"
+        ),
+        "5"
+    );
+}
+
+#[test]
+fn clos_with_accessors_reads_and_writes() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass p () ((x :initform 3 :accessor px))) (let ((o (make-instance 'p))) \
+                    (with-accessors ((a px)) o (setf a 9)) (px o)))"
+        ),
+        "9"
+    );
+}
+
+#[test]
+fn condition_standard_type_error_accessors() {
+    assert_eq!(
+        eval_ok(
+            "(handler-case (error 'type-error :datum 5 :expected-type 'string) \
+               (type-error (c) (list (type-error-datum c) (type-error-expected-type c))))"
+        ),
+        "(5 STRING)"
+    );
+}
+
+#[test]
+fn condition_simple_condition_format_control_accessor() {
+    assert_eq!(
+        eval_ok("(handler-case (error \"boom\") (simple-error (c) (simple-condition-format-control c)))"),
+        "\"boom\""
+    );
+}
+
+#[test]
+fn condition_cell_error_name_on_unbound_slot() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass a () ((x))) \
+               (handler-case (slot-value (make-instance 'a) 'x) \
+                 (unbound-slot (c) (cell-error-name c))))"
+        ),
+        "X"
+    );
+}
+
+#[test]
+fn format_aesthetic_prints_lists() {
+    // ~A must print a cons as a list, not an object address.
+    assert_eq!(eval_ok("(format nil \"~a\" (list 1 2 3))"), "\"(1 2 3)\"");
+}
+
+#[test]
+fn format_nested_and_dotted_lists() {
+    assert_eq!(eval_ok("(format nil \"~a\" '(a (b c) d))"), "\"(A (B C) D)\"");
+    assert_eq!(eval_ok("(format nil \"~a\" (cons 1 2))"), "\"(1 . 2)\"");
+}
+
+#[test]
+fn format_standard_escapes_strings_inside_lists() {
+    // ~S escapes strings/symbols recursively; ~A does not escape strings.
+    assert_eq!(eval_ok("(format nil \"~s\" (list \"a\" 'b 3))"), "\"(\\\"a\\\" B 3)\"");
+    assert_eq!(eval_ok("(format nil \"~a\" (list \"x\" \"y\"))"), "\"(x y)\"");
+}
+
+#[test]
+fn printers_princ_and_prin1_to_string_handle_lists() {
+    assert_eq!(eval_ok("(princ-to-string (list 1 2 3))"), "\"(1 2 3)\"");
+    assert_eq!(eval_ok("(prin1-to-string (list \"a\" 'b))"), "\"(\\\"a\\\" B)\"");
+}
+
+#[test]
+fn clos_instance_is_not_an_integer_despite_fixnum_representation() {
+    // Instances are internally tagged fixnum ids; typep must not leak that.
+    assert_eq!(
+        eval_ok("(progn (defclass a () ()) (typep (make-instance 'a) 'integer))"),
+        "NIL"
+    );
+    assert_eq!(
+        eval_ok("(progn (defclass a () ()) (typep (make-instance 'a) 'number))"),
+        "NIL"
+    );
+}
+
+#[test]
+fn clos_integer_specializer_does_not_capture_instances() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass a () ()) (defmethod k ((x integer)) 'int) (defmethod k ((x a)) 'is-a) \
+                    (list (k 5) (k (make-instance 'a))))"
+        ),
+        "(INT IS-A)"
+    );
+}
+
+#[test]
+fn macro_typecase_dispatches_on_type() {
+    assert_eq!(eval_ok("(typecase 5 (string 's) (integer 'i) (t 'other))"), "I");
+    assert_eq!(
+        eval_ok("(progn (defclass a () ()) (typecase (make-instance 'a) (integer 'i) (a 'is-a) (t 'other)))"),
+        "IS-A"
+    );
+}
+
+#[test]
+fn macro_ecase_and_etypecase_error_on_fall_through() {
+    assert_eq!(eval_ok("(ecase 2 (1 'one) (2 'two))"), "TWO");
+    assert_eq!(
+        eval_ok("(handler-case (ecase 9 (1 'one)) (error (c) 'no-key))"),
+        "NO-KEY"
+    );
+    assert_eq!(
+        eval_ok("(handler-case (etypecase 5 (string 's)) (error (c) 'fell-through))"),
+        "FELL-THROUGH"
+    );
+}
+
+#[test]
+fn macro_ignore_errors_returns_nil_on_error() {
+    assert_eq!(eval_ok("(ignore-errors (error \"boom\"))"), "NIL");
+    assert_eq!(eval_ok("(ignore-errors (+ 1 2))"), "3");
+}
+
+#[test]
+fn clos_find_class_and_class_name_roundtrip() {
+    assert_eq!(
+        eval_ok("(progn (defclass foo () ()) (class-name (find-class 'foo)))"),
+        "FOO"
+    );
+    assert_eq!(
+        eval_ok("(handler-case (find-class 'no-such-class-xyz) (error (c) 'no-class))"),
+        "NO-CLASS"
+    );
+}
+
+#[test]
+fn clos_slot_exists_p_and_slot_makunbound() {
+    assert_eq!(
+        eval_ok("(progn (defclass a () ((x))) (list (slot-exists-p (make-instance 'a) 'x) (slot-exists-p (make-instance 'a) 'y)))"),
+        "(T NIL)"
+    );
+    assert_eq!(
+        eval_ok("(progn (defclass a () ((x :initform 1))) (let ((o (make-instance 'a))) (slot-makunbound o 'x) (slot-boundp o 'x)))"),
+        "NIL"
+    );
+}
+
+#[test]
+fn clos_method_lambda_list_supports_optional_rest_key() {
+    assert_eq!(
+        eval_ok("(progn (defmethod g ((x integer) &optional y) (list x y)) (list (g 5) (g 5 9)))"),
+        "((5 NIL) (5 9))"
+    );
+    assert_eq!(
+        eval_ok("(progn (defmethod g ((x integer) &rest r) (list x r)) (g 5 6 7))"),
+        "(5 (6 7))"
+    );
+    assert_eq!(
+        eval_ok("(progn (defmethod g ((x integer) &key (scale 1)) (* x scale)) (list (g 5) (g 5 :scale 3)))"),
+        "(5 15)"
+    );
+}
+
+#[test]
+fn clos_defgeneric_method_options_register_methods() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defgeneric g (x) (:method ((x integer)) 'int) (:method ((x string)) 'str)) \
+                    (list (g 5) (g \"a\")))"
+        ),
+        "(INT STR)"
+    );
+}
+
+#[test]
+fn string_of_symbol_returns_bare_symbol_name() {
+    // (string sym) is SYMBOL-NAME: no package prefix, for keywords too.
+    assert_eq!(eval_ok("(string :uiop/package*)"), "\"UIOP/PACKAGE*\"");
+    assert_eq!(eval_ok("(string 'foo)"), "\"FOO\"");
+    assert_eq!(eval_ok("(string \"hi\")"), "\"hi\"");
+    assert_eq!(eval_ok("(string #\\a)"), "\"a\"");
+    assert_eq!(eval_ok("(symbol-name :foo)"), "\"FOO\"");
+    // A keyword name coerced by STRING now satisfies (check-type x string).
+    assert_eq!(
+        eval_ok("(let ((n (string :uiop/package*))) (check-type n string) n)"),
+        "\"UIOP/PACKAGE*\""
+    );
+}
+
+#[test]
+fn symbol_package_reports_real_package() {
+    assert_eq!(eval_ok("(symbol-package :foo)"), "\"KEYWORD\"");
+    assert_eq!(eval_ok("(symbol-package 'car)"), "\"COMMON-LISP\"");
+}
+
+#[test]
+fn macro_lambda_list_supports_nested_destructuring() {
+    // ASDF's (defmacro with-upgradability ((&optional) &body body) ...) shape:
+    // a nested destructuring pattern with lambda-list keywords must expand.
+    assert_eq!(
+        eval_ok("(progn (defmacro wu ((&optional) &body body) `(progn ,@body)) (wu () (+ 1 2)))"),
+        "3"
+    );
+    assert_eq!(
+        eval_ok("(progn (defmacro foo ((&optional x) &rest body) `(list ,x ,@body)) (foo (5) 6 7))"),
+        "(5 6 7)"
+    );
+    assert_eq!(
+        eval_ok("(progn (defmacro bar ((&key (v 10)) &body body) `(list ,v ,@body)) (list (bar () 1) (bar (:v 99) 2)))"),
+        "((10 1) (99 2))"
+    );
+}
+
+#[test]
+fn macro_lambda_list_deeply_nested_destructuring() {
+    assert_eq!(
+        eval_ok("(progn (defmacro d ((a (b &optional c)) &body body) `(list ,a ,b ,c ,@body)) (d (1 (2 3)) 9))"),
+        "(1 2 3 9)"
+    );
+    // Missing optional in the nested pattern defaults to NIL.
+    assert_eq!(
+        eval_ok("(progn (defmacro d ((a (b &optional c)) &body body) `(list ,a ,b ,c ,@body)) (d (1 (2)) 9))"),
+        "(1 2 NIL 9)"
+    );
+}
+
+#[test]
+fn condition_prints_as_its_report_message() {
+    // ~A / princ of a condition renders its report, not the raw instance id.
+    assert_eq!(
+        eval_ok("(format nil \"~a\" (make-condition 'simple-error :format-control \"boom\"))"),
+        "\"boom\""
+    );
+    assert_eq!(
+        eval_ok("(handler-case (error \"val is ~a\" 42) (error (c) (format nil \"got: ~a\" c)))"),
+        "\"got: val is 42\""
+    );
+}
+
+#[test]
+fn instance_without_report_prints_as_class_tag() {
+    assert_eq!(
+        eval_ok("(progn (defclass point () ((x :initarg :x))) (format nil \"~a\" (make-instance 'point :x 1)))"),
+        "\"#<POINT>\""
+    );
+    assert_eq!(
+        eval_ok("(progn (defstruct pt x) (format nil \"~a\" (make-pt :x 1)))"),
+        "\"#<PT>\""
+    );
+}
+
+#[test]
+fn defstruct_constructor_and_accessors() {
+    assert_eq!(
+        eval_ok("(progn (defstruct point x y) (let ((p (make-point :x 1 :y 2))) (list (point-x p) (point-y p))))"),
+        "(1 2)"
+    );
+}
+
+#[test]
+fn defstruct_slot_defaults_are_evaluated() {
+    assert_eq!(
+        eval_ok("(progn (defstruct pt (x 0) (y 10)) (let ((p (make-pt :x 5))) (list (pt-x p) (pt-y p))))"),
+        "(5 10)"
+    );
+    assert_eq!(eval_ok("(progn (defstruct pt (x (+ 2 3))) (pt-x (make-pt)))"), "5");
+}
+
+#[test]
+fn defstruct_predicate_and_typep() {
+    assert_eq!(
+        eval_ok("(progn (defstruct pt x) (list (pt-p (make-pt :x 1)) (pt-p 5)))"),
+        "(T NIL)"
+    );
+    assert_eq!(eval_ok("(progn (defstruct pt x) (typep (make-pt :x 1) 'pt))"), "T");
+}
+
+#[test]
+fn defstruct_copier_is_independent() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defstruct pt x y) \
+                    (let* ((a (make-pt :x 1 :y 2)) (b (copy-pt a))) \
+                      (setf (pt-x b) 99) (list (pt-x a) (pt-x b))))"
+        ),
+        "(1 99)"
+    );
+}
+
+#[test]
+fn defstruct_accessor_is_setfable() {
+    assert_eq!(
+        eval_ok("(progn (defstruct pt x) (let ((p (make-pt :x 1))) (setf (pt-x p) 42) (pt-x p)))"),
+        "42"
+    );
+}
+
+#[test]
+fn clos_subtypep_classes_and_builtins() {
+    // subtypep returns two values; wrap in IF to observe just the primary.
+    assert_eq!(
+        eval_ok("(progn (defclass a () ()) (defclass b (a) ()) (if (subtypep 'b 'a) 'yes 'no))"),
+        "YES"
+    );
+    assert_eq!(
+        eval_ok("(progn (defclass a () ()) (defclass b () ()) (if (subtypep 'b 'a) 'yes 'no))"),
+        "NO"
+    );
+    assert_eq!(eval_ok("(if (subtypep 'integer 'number) 'yes 'no)"), "YES");
+    assert_eq!(eval_ok("(if (subtypep 'integer 'string) 'yes 'no)"), "NO");
+    assert_eq!(eval_ok("(if (subtypep 'string 'sequence) 'yes 'no)"), "YES");
+}
+
+#[test]
+fn clos_subtypep_returns_certainty_second_value() {
+    assert_eq!(
+        eval_ok("(multiple-value-bind (s c) (subtypep 'fixnum 'real) (list s c))"),
+        "(T T)"
+    );
+}
+
+#[test]
+fn clos_class_precedence_list_orders_supers() {
+    // The CPL of B (subclass of A) starts B, A and ends with T.
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass a () ()) (defclass b (a) ()) \
+                    (let ((cpl (class-precedence-list (find-class 'b)))) \
+                      (list (class-name (car cpl)) (class-name (car (cdr cpl))))))"
+        ),
+        "(B A)"
+    );
+}
+
+#[test]
+fn clos_initialize_instance_after_runs_during_make_instance() {
+    // The canonical construction hook: make-instance must run user
+    // (defmethod initialize-instance :after ...) methods.
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass a () ((x :initarg :x :accessor ax))) \
+                    (defmethod initialize-instance :after ((o a) &rest args) \
+                      (setf (ax o) (* 2 (ax o)))) \
+                    (ax (make-instance 'a :x 5)))"
+        ),
+        "10"
+    );
+}
+
+#[test]
+fn clos_initialize_instance_after_can_derive_from_initargs() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass rect () ((w :initarg :w) (h :initarg :h) (area :accessor area))) \
+                    (defmethod initialize-instance :after ((r rect) &rest a) \
+                      (setf (area r) (* (slot-value r 'w) (slot-value r 'h)))) \
+                    (area (make-instance 'rect :w 3 :h 4)))"
+        ),
+        "12"
+    );
+}
+
+#[test]
+fn clos_shared_initialize_after_runs_during_make_instance() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defvar *r* nil) (defclass a () ()) \
+                    (defmethod shared-initialize :after ((o a) slots &rest args) (setq *r* t)) \
+                    (make-instance 'a) *r*)"
+        ),
+        "T"
+    );
+}
+
+#[test]
+fn clos_initialize_instance_after_least_specific_first() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defvar *o* nil) (defclass a () ()) (defclass b (a) ()) \
+                    (defmethod initialize-instance :after ((x a) &rest r) (push :a *o*)) \
+                    (defmethod initialize-instance :after ((x b) &rest r) (push :b *o*)) \
+                    (make-instance 'b) (reverse *o*))"
+        ),
+        "(:A :B)"
+    );
+}
+
+#[test]
+fn clos_defgeneric_method_options_support_qualifiers() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defvar *l* nil) \
+                    (defgeneric g (x) (:method ((x integer)) (push :primary *l*)) \
+                                      (:method :before ((x integer)) (push :before *l*))) \
+                    (g 5) (reverse *l*))"
+        ),
+        "(:BEFORE :PRIMARY)"
+    );
+}
+
+#[test]
+fn clos_next_method_p_reflects_chain() {
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass a () ()) (defclass b (a) ()) (defmethod g ((x a)) 'base) \
+                    (defmethod g ((x b)) (if (next-method-p) (call-next-method) 'none)) \
+                    (g (make-instance 'b)))"
+        ),
+        "BASE"
+    );
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass a () ()) (defmethod g ((x a)) (if (next-method-p) 'has 'none)) \
+                    (g (make-instance 'a)))"
+        ),
+        "NONE"
+    );
+}

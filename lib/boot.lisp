@@ -130,6 +130,50 @@
        (error (format nil "ASSERT failed: ~S" ',test-form))))
 
 ;;; ---------------------------------------------------------------------------
+;;; CLOS convenience macros and standard condition accessors.
+;;;
+;;; WITH-SLOTS / WITH-ACCESSORS expand into SYMBOL-MACROLET so the bound names
+;;; are places: reading goes through SLOT-VALUE / the accessor, and SETF on them
+;;; works too. The standard condition readers are ordinary functions over the
+;;; condition instance's slots — conditions are CLOS objects, so SLOT-VALUE is
+;;; all that is needed.
+;;; ---------------------------------------------------------------------------
+
+(defmacro with-slots (slots instance &rest body)
+  (let ((obj (gensym)))
+    `(let ((,obj ,instance))
+       (symbol-macrolet
+           ,(mapcar (lambda (s)
+                      (let ((var (if (consp s) (car s) s))
+                            (slot (if (consp s) (car (cdr s)) s)))
+                        (list var (list 'slot-value obj (list 'quote slot)))))
+                    slots)
+         ,@body))))
+
+(defmacro with-accessors (bindings instance &rest body)
+  (let ((obj (gensym)))
+    `(let ((,obj ,instance))
+       (symbol-macrolet
+           ,(mapcar (lambda (b)
+                      (list (car b) (list (car (cdr b)) obj)))
+                    bindings)
+         ,@body))))
+
+(defun type-error-datum (c) (slot-value c 'datum))
+(defun type-error-expected-type (c) (slot-value c 'expected-type))
+(defun simple-condition-format-control (c) (slot-value c 'format-control))
+(defun simple-condition-format-arguments (c) (slot-value c 'format-arguments))
+(defun cell-error-name (c) (slot-value c 'name))
+(defun unbound-slot-instance (c) (slot-value c 'instance))
+
+;; String-producing printers, built on FORMAT now that ~A/~S print lists.
+(defun princ-to-string (x) (format nil "~a" x))
+(defun prin1-to-string (x) (format nil "~s" x))
+(defun write-to-string (x &rest ignore)
+  (declare (ignore ignore))
+  (format nil "~s" x))
+
+;;; ---------------------------------------------------------------------------
 ;;; Control-flow macros still needed during the Stage 2 bootstrap.
 ;;; ---------------------------------------------------------------------------
 
@@ -151,6 +195,50 @@
           expanded)))
     `(let ((,value ,keyform))
        (cond ,@expanded))))
+
+(defmacro typecase (keyform &rest clauses)
+  (let ((value (gensym))
+        (expanded nil))
+    (dolist (clause (reverse clauses))
+      (let ((type (car clause))
+            (body (cdr clause)))
+        (push
+          (if (or (eq type 'otherwise) (eq type t))
+              `(t ,@body)
+              `((typep ,value ',type) ,@body))
+          expanded)))
+    `(let ((,value ,keyform))
+       (cond ,@expanded))))
+
+(defmacro etypecase (keyform &rest clauses)
+  (let ((value (gensym))
+        (expanded nil))
+    (dolist (clause (reverse clauses))
+      (let ((type (car clause))
+            (body (cdr clause)))
+        (push `((typep ,value ',type) ,@body) expanded)))
+    `(let ((,value ,keyform))
+       (cond ,@expanded
+             (t (error (format nil "ETYPECASE: no clause matched ~s" ,value)))))))
+
+(defmacro ecase (keyform &rest clauses)
+  (let ((value (gensym))
+        (expanded nil))
+    (dolist (clause (reverse clauses))
+      (let ((keys (car clause))
+            (body (cdr clause)))
+        (push
+          (if (consp keys)
+              `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys)) ,@body)
+              `((eql ,value ',keys) ,@body))
+          expanded)))
+    `(let ((,value ,keyform))
+       (cond ,@expanded
+             (t (error (format nil "ECASE: ~s is not one of the expected keys" ,value)))))))
+
+(defmacro ignore-errors (&rest body)
+  `(handler-case (progn ,@body)
+     (error (c) (values nil c))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Sequence / list helpers (Common Lisp, now that lambda lists bind properly)
@@ -213,13 +301,9 @@
 
 (defun symbol-name (s) (string s))
 
-(defun symbol-package (s)
-  (let ((name (string s)))
-    (cond
-      ((find #\: name)
-       (let ((pkg-end (position #\: name)))
-         (and pkg-end (subseq name 0 pkg-end))))
-      (t nil))))
+;; SYMBOL-PACKAGE is provided as a builtin that inspects the symbol's real
+;; package prefix; the previous bootstrap definition parsed (string s), which
+;; no longer carries a package prefix now that STRING returns the bare name.
 
 (defmacro do-external-symbols (binding &rest body)
   (let ((var (car binding))

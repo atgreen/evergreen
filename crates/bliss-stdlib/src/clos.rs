@@ -402,6 +402,12 @@ pub fn define_class(
     })
 }
 
+/// Return true if `object` is a CLOS instance allocated in the instance store
+/// (as opposed to an immediate value such as a fixnum, symbol, or cons).
+pub fn is_instance(object: BlissVal) -> bool {
+    with_state(|st| st.instances.contains_key(&object))
+}
+
 /// Get the class of an object.
 pub fn class_of(object: BlissVal) -> BlissVal {
     with_state(|st| {

@@ -63,6 +63,12 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
     if v == T {
         return "T".into();
     }
+    // CLOS instances are represented as tagged fixnum ids, so they must be
+    // detected before the plain-fixnum branch. A condition prints as its report
+    // message (~A/princ semantics); any other instance prints as #<CLASS-NAME>.
+    if crate::clos::is_instance(v) {
+        return format_instance(v);
+    }
     if v.is_fixnum() {
         return format!("{}", v.as_fixnum());
     }
@@ -86,6 +92,9 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         }
         return name.trim_start_matches("KEYWORD:").to_string();
     }
+    if v.is_cons() {
+        return format_cons(v, escapep);
+    }
     if v.is_heap_object() {
         // Check if it's a string and extract its content
         if let Some(s) = extract_bliss_string(v) {
@@ -94,6 +103,85 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         return format!("#<heap-object {:?}>", v);
     }
     format!("#<object {:?}>", v)
+}
+
+/// Print a CLOS instance. Conditions carrying a `format-control` slot render as
+/// their report message (the standard `princ`/`~A` behaviour for conditions);
+/// every other instance renders as `#<CLASS-NAME>`. Guarded against unbounded
+/// re-entry in case a report control string references its own condition.
+fn format_instance(v: BlissVal) -> String {
+    use std::cell::Cell;
+    thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+    if DEPTH.with(|d| d.get()) > 8 {
+        return instance_class_tag(v);
+    }
+    DEPTH.with(|d| d.set(d.get() + 1));
+    let control_sym =
+        BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol("FORMAT-CONTROL"));
+    let result = match crate::clos::slot_value(v, control_sym) {
+        Ok(control) => match extract_bliss_string(control) {
+            Some(control_str) => {
+                let args_sym = BlissVal::from_symbol_index(
+                    bliss_compiler::reader::intern_symbol("FORMAT-ARGUMENTS"),
+                );
+                let args = crate::clos::slot_value(v, args_sym)
+                    .ok()
+                    .map(cons_list_to_vec)
+                    .unwrap_or_default();
+                if args.is_empty() {
+                    control_str
+                } else {
+                    match format(NIL, &control_str, &args) {
+                        Ok(formatted) => extract_bliss_string(formatted).unwrap_or(control_str),
+                        Err(_) => control_str,
+                    }
+                }
+            }
+            None => instance_class_tag(v),
+        },
+        Err(_) => instance_class_tag(v),
+    };
+    DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    result
+}
+
+/// `#<CLASS-NAME>` tag for an instance with no printable report.
+fn instance_class_tag(v: BlissVal) -> String {
+    let class = crate::clos::class_of(v);
+    let name = crate::clos::class_name(class);
+    format!("#<{}>", blissval_to_print_string(name, false))
+}
+
+/// Print a cons/list the way `~A`/`~S` should: `(a b c)`, nested lists
+/// recursively, and dotted tails as `(a . b)`. `escapep` propagates so `~S`
+/// escapes strings and characters inside the list.
+fn format_cons(v: BlissVal, escapep: bool) -> String {
+    let mut out = String::from("(");
+    let mut current = v;
+    let mut first = true;
+    loop {
+        if current.is_cons() {
+            unsafe {
+                let ptr = current.as_ptr() as *const bliss_rt::object::ConsCell;
+                if !first {
+                    out.push(' ');
+                }
+                first = false;
+                out.push_str(&blissval_to_print_string((*ptr).car, escapep));
+                current = (*ptr).cdr;
+            }
+        } else if current.is_nil() {
+            break;
+        } else {
+            out.push_str(" . ");
+            out.push_str(&blissval_to_print_string(current, escapep));
+            break;
+        }
+    }
+    out.push(')');
+    out
 }
 
 fn format_integer(

@@ -35,6 +35,10 @@ pub struct CliArgs {
     pub no_init: bool,
     pub cl_args: Vec<String>,
     pub script: Option<String>,
+    /// `--load-report FILE`: fault-tolerantly evaluate every top-level form in
+    /// FILE, continuing past errors, and print a categorized punch-list of the
+    /// forms that failed. A diagnostic aid for bring-up (e.g. loading ASDF).
+    pub load_report: Option<String>,
 }
 
 impl CliArgs {
@@ -48,6 +52,7 @@ impl CliArgs {
         let mut help = false;
         let mut version = false;
         let mut script = None;
+        let mut load_report = None;
         let mut saw_double_dash = false;
 
         let mut i = 0;
@@ -110,6 +115,13 @@ impl CliArgs {
                     no_init = true;
                     i += 1;
                 }
+                "--load-report" => {
+                    let value = args.get(i + 1).ok_or_else(|| {
+                        BlissError::Internal("--load-report requires a file argument".into())
+                    })?;
+                    load_report = Some(value.clone());
+                    i += 2;
+                }
                 s if s.starts_with('-') => {
                     return Err(BlissError::Internal(format!("unknown flag: {}", s)));
                 }
@@ -145,6 +157,7 @@ impl CliArgs {
             no_init,
             cl_args,
             script,
+            load_report,
         };
         if r.image.is_some() && r.no_image {
             return Err(BlissError::Internal(
@@ -544,8 +557,13 @@ enum SlotAllocation {
 #[derive(Clone)]
 struct MethodDef {
     method_id: BlissVal,
+    /// Specializers for the required parameters only (parameters before any
+    /// lambda-list keyword). Their count is the number of required parameters.
     specializers: Vec<MethodSpecializer>,
-    params: Vec<String>,
+    /// The method's ordinary lambda list with specializers stripped, so it can
+    /// be bound with the same binder as functions (handles &optional/&rest/&key).
+    lambda_list: BlissVal,
+    qualifier: bliss_stdlib::MethodQualifier,
     body: BlissVal,
 }
 
@@ -749,6 +767,91 @@ fn make_simple_error_condition(message: BlissVal, env: &mut Env) -> Result<Bliss
     )
 }
 
+fn make_simple_warning_condition(message: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let class = ensure_condition_class_registered(env, "SIMPLE-WARNING")?;
+    bliss_stdlib::make_instance(
+        class,
+        &[
+            resolve_sym("FORMAT-CONTROL").unwrap_or(NIL),
+            message,
+            resolve_sym("FORMAT-ARGUMENTS").unwrap_or(NIL),
+            NIL,
+        ],
+    )
+}
+
+/// Construct a condition instance of `type_name` from already-evaluated initarg
+/// pairs (`key value key value …`). Explicit initargs and `:default-initargs`
+/// are applied first, then slot `:initform`s fill any remaining unbound slots —
+/// so conditions honour the same MAKE-INSTANCE protocol as ordinary CLOS
+/// objects (R5.80). Shared by MAKE-CONDITION and the ERROR/SIGNAL/WARN/CERROR
+/// condition-designator coercion.
+fn build_condition_instance(
+    env: &mut Env,
+    type_name: &str,
+    initarg_pairs: &[BlissVal],
+) -> Result<BlissVal, BlissError> {
+    let class = ensure_condition_class_registered(env, type_name)?;
+    let slot_specs = condition_slot_specs(env, type_name);
+    let mut initargs = Vec::new();
+    let mut seen_initargs = Vec::new();
+    let mut i = 0;
+    while i + 1 < initarg_pairs.len() {
+        let key = initarg_pairs[i];
+        let val = initarg_pairs[i + 1];
+        let key_name = symbol_bare_name(&sym_name(key));
+        let slot_name = slot_specs
+            .iter()
+            .find(|(_, initarg)| initarg == &key_name)
+            .map(|(slot_name, _)| slot_name.clone())
+            .unwrap_or_else(|| key_name.clone());
+        seen_initargs.push(key_name);
+        initargs.push(resolve_sym(&slot_name).unwrap_or(NIL));
+        initargs.push(val);
+        i += 2;
+    }
+    for (initarg_name, default_value) in condition_default_initargs(env, type_name) {
+        if seen_initargs.iter().any(|seen| seen == &initarg_name) {
+            continue;
+        }
+        if let Some((slot_name, _)) = slot_specs
+            .iter()
+            .find(|(_, initarg)| initarg == &initarg_name)
+        {
+            initargs.push(resolve_sym(slot_name).unwrap_or(NIL));
+            initargs.push(default_value);
+        }
+    }
+    let instance = bliss_stdlib::make_instance(class, &initargs)?;
+    let explicit_slots: Vec<String> = initargs
+        .chunks_exact(2)
+        .map(|pair| symbol_bare_name(&sym_name(pair[0])))
+        .collect();
+    let cond_class_name = class_name_for_instance_class(class);
+    apply_class_initforms(instance, &cond_class_name, env, None, &explicit_slots)?;
+    Ok(instance)
+}
+
+/// Coerce a condition designator to a condition instance per ANSI CL. A symbol
+/// datum names a condition type and is built via `build_condition_instance` with
+/// `args` as initargs; an existing instance is returned unchanged; anything else
+/// (typically a format-control string) yields `None` so the caller can apply its
+/// own default (e.g. SIMPLE-ERROR).
+fn coerce_condition_designator(
+    env: &mut Env,
+    datum: BlissVal,
+    args: &[BlissVal],
+) -> Result<Option<BlissVal>, BlissError> {
+    if bliss_stdlib::is_instance(datum) {
+        return Ok(Some(datum));
+    }
+    if datum.is_symbol() {
+        let type_name = sym_name(datum);
+        return Ok(Some(build_condition_instance(env, &type_name, args)?));
+    }
+    Ok(None)
+}
+
 fn eval_handler_impl(
     handler: &HandlerImpl,
     condition: BlissVal,
@@ -780,6 +883,19 @@ fn signal_condition_object(condition: BlissVal, env: &mut Env) -> Result<BlissVa
         }
     }
     Ok(NIL)
+}
+
+/// Signal `condition` through the active handler stack. If a handler transfers
+/// control (unwinds), the resulting error propagates so HANDLER-CASE can run its
+/// clause; otherwise a terminal error carrying `msg` is returned — mirroring
+/// ANSI `ERROR`, which never returns normally. This is how internal CLOS
+/// failures (unbound slot, no applicable method, no next method) surface as real
+/// catchable condition objects rather than opaque runtime errors.
+fn signal_and_raise(env: &mut Env, condition: BlissVal, msg: String) -> BlissError {
+    match signal_condition_object(condition, env) {
+        Ok(_) => BlissError::Internal(format!("ERROR: {}", msg)),
+        Err(error) => error,
+    }
 }
 
 fn condition_matches_type_spec(env: &Env, condition: BlissVal, type_spec: BlissVal) -> bool {
@@ -958,6 +1074,37 @@ fn read_slot_value(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<Blis
     bliss_stdlib::slot_value(instance, slot)
 }
 
+/// Read a slot, signalling a catchable `unbound-slot` condition (R5.71) when the
+/// slot is unbound on a genuine instance. The condition carries `:name` (the slot
+/// name) and `:instance`, so handlers can inspect it like any CLOS object.
+fn slot_value_or_signal(
+    instance: BlissVal,
+    slot: BlissVal,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    match read_slot_value(instance, slot, env) {
+        Ok(value) => Ok(value),
+        Err(BlissError::UnboundVariable(_)) if bliss_stdlib::is_instance(instance) => {
+            let condition = build_condition_instance(
+                env,
+                "UNBOUND-SLOT",
+                &[
+                    resolve_sym("NAME").unwrap_or(NIL),
+                    slot,
+                    resolve_sym("INSTANCE").unwrap_or(NIL),
+                    instance,
+                ],
+            )?;
+            Err(signal_and_raise(
+                env,
+                condition,
+                format!("slot {} is unbound", symbol_bare_name(&sym_name(slot))),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn slot_is_bound(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<bool, BlissError> {
     let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
     let slot_name = symbol_bare_name(&sym_name(slot));
@@ -993,6 +1140,57 @@ fn write_slot_value(
     bliss_stdlib::set_slot_value(instance, slot, value)
 }
 
+/// Class precedence names for a class, most-specific-first, via preorder DFS
+/// over the `env.classes` superclass links (deduped). Used to compute effective
+/// slots so inherited slot definitions participate in instance initialization.
+fn class_precedence_names(env: &Env, class_name: &str) -> Vec<String> {
+    fn visit(
+        env: &Env,
+        name: &str,
+        order: &mut Vec<String>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        order.push(name.to_string());
+        if let Some(class_def) = env.classes.get(name) {
+            for super_name in &class_def.supers {
+                visit(env, super_name, order, seen);
+            }
+        }
+    }
+    let mut order = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    visit(env, class_name, &mut order, &mut seen);
+    order
+}
+
+/// Effective slots for a class, most-specific-first, deduped by name. A slot's
+/// `:initform` is inherited from the most specific class that supplies one, so a
+/// subclass that redeclares a slot without an initform does not shadow an
+/// inherited default — matching ANSI effective-slot computation.
+fn effective_slots_for_class(env: &Env, class_name: &str) -> Vec<SlotDef> {
+    let mut result: Vec<SlotDef> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for cname in class_precedence_names(env, class_name) {
+        let Some(class_def) = env.classes.get(&cname) else {
+            continue;
+        };
+        for slot in &class_def.slots {
+            if let Some(&i) = index.get(&slot.name) {
+                if result[i].initform.is_none() && slot.initform.is_some() {
+                    result[i].initform = slot.initform;
+                }
+            } else {
+                index.insert(slot.name.clone(), result.len());
+                result.push(slot.clone());
+            }
+        }
+    }
+    result
+}
+
 fn apply_class_initforms(
     instance: BlissVal,
     class_name: &str,
@@ -1000,10 +1198,16 @@ fn apply_class_initforms(
     eligible_slots: Option<&[String]>,
     explicit_slots: &[String],
 ) -> Result<(), BlissError> {
-    let Some(class_def) = env.classes.get(class_name).cloned() else {
-        return Ok(());
-    };
-    for slot in &class_def.slots {
+    // Walk the full class precedence list so inherited slot initforms are
+    // applied, not just those declared on the instance's own class. Class-
+    // allocated slot values are stored in the instance class's shared map,
+    // consistent with `read_slot_value`/`write_class_slot_value`.
+    let effective = effective_slots_for_class(env, class_name);
+    let class_slot_values = env
+        .classes
+        .get(class_name)
+        .map(|class_def| Arc::clone(&class_def.class_slot_values));
+    for slot in &effective {
         if explicit_slots.iter().any(|name| name == &slot.name) {
             continue;
         }
@@ -1017,10 +1221,10 @@ fn apply_class_initforms(
         };
         let slot_sym = resolve_sym(&slot.name).unwrap_or(NIL);
         let already_bound = match slot.allocation {
-            SlotAllocation::Class => matches!(
-                class_def.class_slot_values.lock().unwrap().get(&slot.name),
-                Some(Some(_))
-            ),
+            SlotAllocation::Class => class_slot_values
+                .as_ref()
+                .map(|values| matches!(values.lock().unwrap().get(&slot.name), Some(Some(_))))
+                .unwrap_or(false),
             SlotAllocation::Instance => bliss_stdlib::slot_boundp(instance, slot_sym)?,
         };
         if already_bound {
@@ -1029,11 +1233,9 @@ fn apply_class_initforms(
         let value = eval_form(initform, env)?;
         match slot.allocation {
             SlotAllocation::Class => {
-                class_def
-                    .class_slot_values
-                    .lock()
-                    .unwrap()
-                    .insert(slot.name.clone(), Some(value));
+                if let Some(values) = class_slot_values.as_ref() {
+                    values.lock().unwrap().insert(slot.name.clone(), Some(value));
+                }
             }
             SlotAllocation::Instance => {
                 bliss_stdlib::set_slot_value(instance, slot_sym, value)?;
@@ -1061,6 +1263,31 @@ fn evaluated_initargs(
     Ok(initargs)
 }
 
+/// Specificity distance for a method specialized on a built-in CL type name when
+/// the argument is an immediate value (fixnum, character, string, …) that has no
+/// user-registered CLOS class carrying that name. Returns `None` if the argument
+/// is not of that type. Depths encode the numeric/type supertype chain so a
+/// `fixnum` specializer outranks `integer` outranks `number`, etc.
+fn builtin_type_specializer_distance(name: &str, arg: BlissVal) -> Option<usize> {
+    match symbol_bare_name(name).as_str() {
+        "FIXNUM" => arg.is_fixnum().then_some(1),
+        "INTEGER" => arg.is_fixnum().then_some(2),
+        "RATIONAL" => arg.is_fixnum().then_some(3),
+        "REAL" => (arg.is_fixnum() || arg.is_single_float()).then_some(4),
+        "NUMBER" => (arg.is_fixnum() || arg.is_single_float()).then_some(5),
+        "SINGLE-FLOAT" => arg.is_single_float().then_some(1),
+        "FLOAT" => arg.is_single_float().then_some(2),
+        "STRING" | "SIMPLE-STRING" | "BASE-STRING" => arg.is_string().then_some(1),
+        "CHARACTER" => arg.is_character().then_some(1),
+        "NULL" => arg.is_nil().then_some(1),
+        "SYMBOL" => arg.is_symbol().then_some(2),
+        "CONS" => arg.is_cons().then_some(1),
+        "LIST" => arg.is_list().then_some(2),
+        "ATOM" => (!arg.is_cons()).then_some(6),
+        _ => None,
+    }
+}
+
 fn method_specificity_vector(
     env: &Env,
     method: &MethodDef,
@@ -1081,11 +1308,30 @@ fn method_specificity_vector(
             }
             MethodSpecializer::Class(name) => {
                 let specializer_sym = resolve_sym(name).unwrap_or(NIL);
-                let specializer_class = resolve_class_metaobject(env, specializer_sym).ok()?;
                 let arg_class = bliss_stdlib::class_of(*arg);
-                let cpl = bliss_stdlib::compute_class_precedence_list(arg_class).ok()?;
-                let pos = cpl.iter().position(|&class| class == specializer_class)?;
-                distances.push(pos + 1);
+                // Prefer a genuine CLOS-class match via the argument's class
+                // precedence list; fall back to built-in immediate types (integer,
+                // string, …) whose classes are not user-registered by name.
+                let clos_distance = resolve_class_metaobject(env, specializer_sym)
+                    .ok()
+                    .and_then(|specializer_class| {
+                        bliss_stdlib::compute_class_precedence_list(arg_class)
+                            .ok()
+                            .and_then(|cpl| {
+                                cpl.iter().position(|&class| class == specializer_class)
+                            })
+                            .map(|pos| pos + 1)
+                    });
+                let distance = match clos_distance {
+                    Some(distance) => distance,
+                    // A CLOS instance is a tagged fixnum id; never let it match a
+                    // built-in immediate-type specializer (integer, symbol, …).
+                    None if !bliss_stdlib::is_instance(*arg) => {
+                        builtin_type_specializer_distance(name, *arg)?
+                    }
+                    None => return None,
+                };
+                distances.push(distance);
             }
         }
     }
@@ -1097,10 +1343,9 @@ fn bind_method_params(
     method: &MethodDef,
     args: &[BlissVal],
 ) -> Result<(), BlissError> {
-    for (i, param) in method.params.iter().enumerate() {
-        env.define_local(param, args.get(i).copied().unwrap_or(NIL));
-    }
-    Ok(())
+    // Bind through the ordinary lambda-list binder so &optional/&rest/&key
+    // parameters in method lambda lists behave exactly as in functions.
+    bind_lambda_list(method.lambda_list, args, env)
 }
 
 fn invoke_method(
@@ -1158,9 +1403,11 @@ fn invoke_primary_chain(
     args: &[BlissVal],
 ) -> Result<BlissVal, BlissError> {
     let Some((method, rest)) = primary.split_first() else {
-        return Err(BlissError::Internal(
-            "no next method available for CALL-NEXT-METHOD".into(),
-        ));
+        // call-next-method with an exhausted chain: signal a catchable error
+        // condition (no-next-method) rather than an opaque runtime failure.
+        let msg = "no next method available for call-next-method".to_string();
+        let condition = make_simple_error_condition(arena_str(&msg), env)?;
+        return Err(signal_and_raise(env, condition, msg));
     };
     invoke_method(
         env,
@@ -1202,6 +1449,20 @@ fn invoke_standard_methods(
         let _ = invoke_method(env, method, args, None)?;
     }
     Ok(result)
+}
+
+/// Whether `call-next-method` from the current context would find another
+/// method to run (drives `next-method-p`).
+fn method_context_has_next(context: &MethodContext) -> bool {
+    match &context.next {
+        NextMethod::Standard {
+            around,
+            before,
+            primary,
+            after,
+        } => !around.is_empty() || !before.is_empty() || !primary.is_empty() || !after.is_empty(),
+        NextMethod::Primary { primary } => !primary.is_empty(),
+    }
 }
 
 fn invoke_next_method(
@@ -1296,6 +1557,50 @@ fn combine_short_form_results(
     }
 }
 
+/// Build and signal a catchable error condition for a failed generic-function
+/// dispatch (`no-applicable-method`, R5.??). Returns the terminal error when no
+/// handler transfers control.
+fn no_applicable_method_error(env: &mut Env, name: &str) -> BlissError {
+    let msg = format!("no applicable method for generic function {}", name);
+    match make_simple_error_condition(arena_str(&msg), env) {
+        Ok(condition) => signal_and_raise(env, condition, msg),
+        Err(error) => error,
+    }
+}
+
+/// Run user-defined auxiliary methods of a given qualifier on an initialization
+/// generic function (`initialize-instance` / `shared-initialize`) during
+/// MAKE-INSTANCE. The built-in slot initialization stands in for the default
+/// primary method, so this covers the canonical `:after` construction hook.
+/// `:after` methods run least-specific-first per standard method combination.
+fn run_initialization_aux_methods(
+    env: &mut Env,
+    gf_name: &str,
+    args: &[BlissVal],
+    qualifier: bliss_stdlib::MethodQualifier,
+) -> Result<(), BlissError> {
+    let methods = match env.methods.get(gf_name) {
+        Some(methods) if !methods.is_empty() => methods.clone(),
+        _ => return Ok(()),
+    };
+    let mut applicable: Vec<(MethodDef, Vec<usize>)> = methods
+        .into_iter()
+        .filter(|method| method.qualifier == qualifier)
+        .filter_map(|method| {
+            method_specificity_vector(env, &method, args).map(|key| (method, key))
+        })
+        .collect();
+    applicable.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut ordered: Vec<MethodDef> = applicable.into_iter().map(|(method, _)| method).collect();
+    if qualifier == bliss_stdlib::MethodQualifier::After {
+        ordered.reverse();
+    }
+    for method in ordered {
+        invoke_method(env, &method, args, None)?;
+    }
+    Ok(())
+}
+
 fn invoke_generic_function(
     name: &str,
     args: &[BlissVal],
@@ -1303,10 +1608,7 @@ fn invoke_generic_function(
 ) -> Result<BlissVal, BlissError> {
     let methods = env.methods.get(name).cloned().unwrap_or_default();
     if methods.is_empty() {
-        return Err(BlissError::Internal(format!(
-            "No applicable method for {}",
-            name
-        )));
+        return Err(no_applicable_method_error(env, name));
     }
 
     let mut applicable: Vec<(MethodDef, Vec<usize>)> = methods
@@ -1315,10 +1617,7 @@ fn invoke_generic_function(
         .collect();
     applicable.sort_by(|a, b| a.1.cmp(&b.1));
     if applicable.is_empty() {
-        return Err(BlissError::Internal(format!(
-            "No applicable method for {}",
-            name
-        )));
+        return Err(no_applicable_method_error(env, name));
     }
 
     let ordered: Vec<MethodDef> = applicable.into_iter().map(|(method, _)| method).collect();
@@ -2193,6 +2492,18 @@ fn symbol_bare_name(name: &str) -> String {
     base.to_uppercase()
 }
 
+/// The bare `symbol-name` (CL `SYMBOL-NAME` / `STRING` of a symbol): strips any
+/// package prefix but preserves case, unlike `symbol_bare_name` which upper-cases.
+fn symbol_name_string(name: &str) -> String {
+    let without_keyword = name.strip_prefix("KEYWORD:").unwrap_or(name);
+    without_keyword
+        .rsplit_once("::")
+        .map(|(_, tail)| tail)
+        .or_else(|| without_keyword.rsplit_once(':').map(|(_, tail)| tail))
+        .unwrap_or(without_keyword)
+        .to_string()
+}
+
 fn package_status_symbol(status: &str) -> BlissVal {
     resolve_sym(&format!(":{}", status)).unwrap_or(NIL)
 }
@@ -2500,6 +2811,30 @@ fn ensure_condition_class_registered(env: &Env, type_name: &str) -> Result<Bliss
     Ok(class)
 }
 
+/// Class-precedence-list names for a genuine CLOS instance, most-specific-first.
+/// Returns `None` for immediate values (fixnums, symbols, conses, …) so callers
+/// can fall back to immediate-type handling. Used by `typep` to honour the CLOS
+/// class hierarchy for user-defined classes and conditions alike.
+fn instance_class_hierarchy_names(object: BlissVal) -> Option<Vec<String>> {
+    if !bliss_stdlib::is_instance(object) {
+        return None;
+    }
+    let class = bliss_stdlib::class_of(object);
+    let cpl = bliss_stdlib::compute_class_precedence_list(class).ok()?;
+    let mut names = Vec::new();
+    for class in cpl {
+        let name = bliss_stdlib::class_name(class);
+        if name.is_symbol() {
+            names.push(symbol_bare_name(&sym_name(name)));
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
 fn condition_type_hierarchy_names(cond: BlissVal) -> Option<Vec<String>> {
     let class = bliss_stdlib::class_of(cond);
     let cpl = bliss_stdlib::compute_class_precedence_list(class).ok()?;
@@ -2570,10 +2905,98 @@ fn is_package_value(env: &Env, value: BlissVal) -> bool {
         )
 }
 
+/// The chain of built-in supertypes for a type name (including the type itself),
+/// most-specific-first, used by SUBTYPEP. Returns `None` for names that are not
+/// built-in atomic types.
+fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
+    let chain: &'static [&'static str] = match name {
+        "FIXNUM" | "BIGNUM" => &["INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
+        "INTEGER" => &["RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
+        "RATIO" => &["RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
+        "RATIONAL" => &["REAL", "NUMBER", "ATOM", "T"],
+        "SINGLE-FLOAT" | "DOUBLE-FLOAT" | "SHORT-FLOAT" | "LONG-FLOAT" => {
+            &["FLOAT", "REAL", "NUMBER", "ATOM", "T"]
+        }
+        "FLOAT" => &["REAL", "NUMBER", "ATOM", "T"],
+        "REAL" => &["NUMBER", "ATOM", "T"],
+        "NUMBER" => &["ATOM", "T"],
+        "CHARACTER" => &["ATOM", "T"],
+        "SYMBOL" => &["ATOM", "T"],
+        "KEYWORD" => &["SYMBOL", "ATOM", "T"],
+        "NULL" => &["SYMBOL", "LIST", "SEQUENCE", "ATOM", "T"],
+        "CONS" => &["LIST", "SEQUENCE", "T"],
+        "LIST" => &["SEQUENCE", "T"],
+        "SIMPLE-STRING" | "BASE-STRING" => &["STRING", "VECTOR", "ARRAY", "SEQUENCE", "ATOM", "T"],
+        "STRING" => &["VECTOR", "ARRAY", "SEQUENCE", "ATOM", "T"],
+        "VECTOR" => &["ARRAY", "SEQUENCE", "ATOM", "T"],
+        "ARRAY" => &["ATOM", "T"],
+        "SEQUENCE" => &["T"],
+        "HASH-TABLE" | "FUNCTION" | "PACKAGE" | "PATHNAME" | "STREAM" => &["ATOM", "T"],
+        "STANDARD-OBJECT" => &["T"],
+        "ATOM" => &["T"],
+        "T" => &[],
+        _ => return None,
+    };
+    Some(chain)
+}
+
+/// SUBTYPEP core: returns `(subtype-p, certain-p)`. Handles built-in atomic type
+/// lattices and CLOS class subtyping via the class precedence list; returns
+/// `(false, false)` — "unknown" — for relationships it cannot decide.
+fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
+    let n1 = symbol_bare_name(&sym_name(t1));
+    let n2 = symbol_bare_name(&sym_name(t2));
+    if n2 == "T" || n1 == "NIL" || n1 == n2 {
+        return (true, true);
+    }
+    // Built-in atomic type lattice.
+    if let Some(supers) = builtin_supertypes(&n1) {
+        if supers.contains(&n2.as_str()) {
+            return (true, true);
+        }
+        // Both are known built-ins with no relation → definitely not a subtype.
+        if builtin_supertypes(&n2).is_some() {
+            return (false, true);
+        }
+    }
+    // CLOS class subtyping via the class precedence list.
+    if let (Some(c1), Some(c2)) = (bliss_stdlib::find_class(t1), bliss_stdlib::find_class(t2)) {
+        if let Ok(cpl) = bliss_stdlib::compute_class_precedence_list(c1) {
+            if cpl.contains(&c2) {
+                return (true, true);
+            }
+            return (false, true);
+        }
+    }
+    // Every class is a subtype of STANDARD-OBJECT and T.
+    if bliss_stdlib::find_class(t1).is_some() && (n2 == "STANDARD-OBJECT") {
+        return (true, true);
+    }
+    (false, false)
+}
+
 fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result<bool, BlissError> {
     let type_spec = resolve_type_spec(env, type_spec);
     if type_spec.is_symbol() {
         let type_name = symbol_bare_name(&sym_name(type_spec));
+        // CLOS instances are represented internally as tagged fixnum ids, so the
+        // immediate-type predicates below (INTEGER/FIXNUM/NUMBER, …) would alias
+        // them. Route instances exclusively through their class hierarchy.
+        if bliss_stdlib::is_instance(object) {
+            if type_name == "T" {
+                return Ok(true);
+            }
+            let hierarchy = instance_class_hierarchy_names(object);
+            let in_hierarchy = hierarchy
+                .as_ref()
+                .map(|names| names.iter().any(|name| name == &type_name))
+                .unwrap_or(false);
+            let is_condition = hierarchy
+                .as_ref()
+                .map(|names| names.iter().any(|name| name == "CONDITION"))
+                .unwrap_or(false);
+            return Ok(in_hierarchy || (type_name == "STANDARD-OBJECT" && !is_condition));
+        }
         let matches = match type_name.as_str() {
             "T" => true,
             "NIL" | "NULL" => object.is_nil(),
@@ -2593,8 +3016,10 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "PATHNAME" => bliss_stdlib::namestring(object).is_ok(),
             "STREAM" | "FILE-STREAM" | "SYNONYM-STREAM" => is_stream(object),
             other => {
-                if let Some(hierarchy) = condition_type_hierarchy_names(object) {
+                if let Some(hierarchy) = instance_class_hierarchy_names(object) {
                     hierarchy.iter().any(|name| name == other)
+                        || (other == "STANDARD-OBJECT"
+                            && !hierarchy.iter().any(|name| name == "CONDITION"))
                 } else {
                     other == symbol_bare_name(&val_as_str(object))
                 }
@@ -3450,10 +3875,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     val_as_str(control)
                 };
-                let condition = if args.len() == 1 && !control.is_string() {
-                    control
-                } else {
-                    make_simple_error_condition(arena_str(&message), env)?
+                // (error datum &rest args): a condition instance is signalled as
+                // is; a condition-type symbol is built via MAKE-CONDITION with the
+                // remaining args as initargs; a format-control string becomes a
+                // SIMPLE-ERROR.
+                let condition = match coerce_condition_designator(env, control, &format_args)? {
+                    Some(condition) => condition,
+                    None => make_simple_error_condition(arena_str(&message), env)?,
                 };
                 match signal_condition_object(condition, env) {
                     Ok(_) => return Err(BlissError::Internal(format!("ERROR: {}", message))),
@@ -3553,6 +3981,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 let tbl = eval_form(tbl_form, env)?;
                                 bliss_stdlib::set_gethash(key, tbl, val)?;
                             }
+                            "SLOT-VALUE" => {
+                                // (setf (slot-value instance slot-name) val)
+                                let instance = eval_form(tgt_form, env)?;
+                                let (slot_form, _) = cp(cp(aargs).1);
+                                let slot = eval_form(slot_form, env)?;
+                                write_slot_value(instance, slot, val, env)?;
+                            }
                             other => {
                                 let reader_slot = env.classes.values().find_map(|class| {
                                     class.slots.iter().find_map(|slot| {
@@ -3602,6 +4037,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "MACROEXPAND-1" => return eval_macroexpand(cdr, env, true),
             "MACROEXPAND" => return eval_macroexpand(cdr, env, false),
             "DEFCLASS" => return eval_defclass(cdr, env),
+            "DEFSTRUCT" => return eval_defstruct(cdr, env),
             "DEFGENERIC" => return eval_defgeneric(cdr, env),
             "DEFMETHOD" => return eval_defmethod(cdr, env),
             "MAKE-INSTANCE" => return eval_make_instance(cdr, env),
@@ -4069,9 +4505,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(bliss_stdlib::pathname_version(pathname));
             }
             "STRING" => {
+                // (string x): a string is returned as-is; a symbol yields its
+                // bare SYMBOL-NAME (no package prefix); a character yields a
+                // one-character string.
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(arena_str(&val_as_str(v)));
+                let s = if v.is_string() {
+                    val_as_str(v)
+                } else if v.is_character() {
+                    v.as_char().to_string()
+                } else if v.is_symbol() || v.is_nil() || v == T {
+                    symbol_name_string(&sym_name(v))
+                } else {
+                    val_as_str(v)
+                };
+                return Ok(arena_str(&s));
             }
             "WRITE-TO-STRING" => {
                 let (af, _) = cp(cdr);
@@ -4323,8 +4771,65 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if args.is_empty() {
                     return Err(BlissError::Internal("SIGNAL requires an argument".into()));
                 }
-                let cond = eval_form(args[0], env)?;
+                let datum = eval_form(args[0], env)?;
+                let mut initargs = Vec::new();
+                for arg in &args[1..] {
+                    initargs.push(eval_form(*arg, env)?);
+                }
+                // (signal datum &rest args): a condition-type symbol is built into
+                // an instance so handler type-matching runs against the real CLOS
+                // class hierarchy.
+                let cond =
+                    coerce_condition_designator(env, datum, &initargs)?.unwrap_or(datum);
                 return signal_condition_object(cond, env);
+            }
+            "WARN" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal("WARN requires an argument".into()));
+                }
+                let datum = eval_form(args[0], env)?;
+                let mut rest_args = Vec::new();
+                for arg in &args[1..] {
+                    rest_args.push(eval_form(*arg, env)?);
+                }
+                // (warn datum &rest args): a warning-type symbol or condition is
+                // used directly; a format-control string becomes a SIMPLE-WARNING.
+                let message = if datum.is_string() && !rest_args.is_empty() {
+                    simple_format_message(&val_as_str(datum), &rest_args)
+                } else {
+                    val_as_str(datum)
+                };
+                let condition = match coerce_condition_designator(env, datum, &rest_args)? {
+                    Some(condition) => condition,
+                    None => make_simple_warning_condition(arena_str(&message), env)?,
+                };
+                // Establish a MUFFLE-WARNING restart for the dynamic extent of the
+                // signal so a handler can suppress the default warning message.
+                let base_len = env.restarts.len();
+                env.restarts.push(RestartEntry {
+                    name: "MUFFLE-WARNING".to_string(),
+                    function: RestartFunction::ContinueNil,
+                    interactive_function: None,
+                    test_function: None,
+                    unwind_on_invoke: true,
+                });
+                let result = signal_condition_object(condition, env);
+                env.restarts.truncate(base_len);
+                match result {
+                    Ok(_) => {
+                        // Unhandled (or handler declined): print the warning per
+                        // R5.104 and return NIL. Warnings never enter the debugger.
+                        eprintln!("WARNING: {}", message);
+                        return Ok(NIL);
+                    }
+                    Err(error) => {
+                        if restart_invoked_name(&error).as_deref() == Some("MUFFLE-WARNING") {
+                            return Ok(NIL);
+                        }
+                        return Err(error);
+                    }
+                }
             }
             "MAKE-CONDITION" => {
                 let args = list_to_vec(cdr);
@@ -4339,45 +4844,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     val_as_str(type_val)
                 };
-                let class = ensure_condition_class_registered(env, &type_name)?;
-                let slot_specs = condition_slot_specs(env, &type_name);
-                let mut initargs = Vec::new();
-                let mut seen_initargs = Vec::new();
+                let mut initarg_pairs = Vec::new();
                 let mut i = 1;
                 while i + 1 < args.len() {
-                    let key = eval_form(args[i], env)?;
-                    let val = eval_form(args[i + 1], env)?;
-                    let key_name = symbol_bare_name(&sym_name(key));
-                    let slot_name = slot_specs
-                        .iter()
-                        .find(|(_, initarg)| initarg == &key_name)
-                        .map(|(slot_name, _)| slot_name.clone())
-                        .unwrap_or_else(|| key_name.clone());
-                    seen_initargs.push(key_name);
-                    initargs.push(resolve_sym(&slot_name).unwrap_or(NIL));
-                    initargs.push(val);
+                    initarg_pairs.push(eval_form(args[i], env)?);
+                    initarg_pairs.push(eval_form(args[i + 1], env)?);
                     i += 2;
                 }
-                for (initarg_name, default_value) in condition_default_initargs(env, &type_name) {
-                    if seen_initargs.iter().any(|seen| seen == &initarg_name) {
-                        continue;
-                    }
-                    if let Some((slot_name, _)) = slot_specs
-                        .iter()
-                        .find(|(_, initarg)| initarg == &initarg_name)
-                    {
-                        initargs.push(resolve_sym(slot_name).unwrap_or(NIL));
-                        initargs.push(default_value);
-                    }
-                }
-                return bliss_stdlib::make_instance(class, &initargs);
+                return build_condition_instance(env, &type_name, &initarg_pairs);
             }
             "SLOT-VALUE" => {
                 let (instance_form, rest) = cp(cdr);
                 let (slot_form, _) = cp(rest);
                 let instance = eval_form(instance_form, env)?;
                 let slot = eval_form(slot_form, env)?;
-                return read_slot_value(instance, slot, env);
+                return slot_value_or_signal(instance, slot, env);
             }
             "SLOT-BOUNDP" => {
                 let (instance_form, rest) = cp(cdr);
@@ -4394,6 +4875,79 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (object_form, _) = cp(cdr);
                 let object = eval_form(object_form, env)?;
                 return Ok(bliss_stdlib::class_of(object));
+            }
+            "FIND-CLASS" => {
+                // (find-class name &optional errorp) — return the class metaobject.
+                let (name_form, _) = cp(cdr);
+                let name = eval_form(name_form, env)?;
+                if let Some(class) = bliss_stdlib::find_class(name) {
+                    return Ok(class);
+                }
+                if let Ok(class) = resolve_class_metaobject(env, name)
+                    && class != name
+                {
+                    return Ok(class);
+                }
+                let name_str = if name.is_symbol() {
+                    sym_name(name)
+                } else {
+                    val_as_str(name)
+                };
+                let msg = format!("there is no class named {}", name_str);
+                let condition = make_simple_error_condition(arena_str(&msg), env)?;
+                return Err(signal_and_raise(env, condition, msg));
+            }
+            "CLASS-NAME" => {
+                let (class_form, _) = cp(cdr);
+                let class = eval_form(class_form, env)?;
+                return Ok(bliss_stdlib::class_name(class));
+            }
+            "SUBTYPEP" => {
+                // (subtypep type1 type2) → two values: subtype-p and certain-p.
+                let (t1_form, rest) = cp(cdr);
+                let (t2_form, _) = cp(rest);
+                let t1 = eval_form(t1_form, env)?;
+                let t2 = eval_form(t2_form, env)?;
+                let t1 = resolve_type_spec(env, t1);
+                let t2 = resolve_type_spec(env, t2);
+                let (subtype_p, certain_p) = subtypep_relation(t1, t2);
+                let subp = if subtype_p { T } else { NIL };
+                let certainp = if certain_p { T } else { NIL };
+                env.set_mv(vec![subp, certainp]);
+                return Ok(subp);
+            }
+            "CLASS-PRECEDENCE-LIST" | "COMPUTE-CLASS-PRECEDENCE-LIST" => {
+                let (class_form, _) = cp(cdr);
+                let class_input = eval_form(class_form, env)?;
+                let class = resolve_class_metaobject(env, class_input)?;
+                let cpl = bliss_stdlib::compute_class_precedence_list(class)?;
+                return Ok(vec_to_list(&cpl));
+            }
+            "SLOT-MAKUNBOUND" => {
+                let (instance_form, rest) = cp(cdr);
+                let (slot_form, _) = cp(rest);
+                let instance = eval_form(instance_form, env)?;
+                let slot = eval_form(slot_form, env)?;
+                bliss_stdlib::slot_makunbound(instance, slot)?;
+                return Ok(instance);
+            }
+            "SLOT-EXISTS-P" => {
+                let (instance_form, rest) = cp(cdr);
+                let (slot_form, _) = cp(rest);
+                let instance = eval_form(instance_form, env)?;
+                let slot = eval_form(slot_form, env)?;
+                let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
+                let slot_name = symbol_bare_name(&sym_name(slot));
+                let exists = lookup_slot_def(env, &class_name, &slot_name).is_some();
+                return Ok(if exists { T } else { NIL });
+            }
+            "NEXT-METHOD-P" => {
+                let has_next = env
+                    .method_context
+                    .last()
+                    .map(|context| method_context_has_next(context))
+                    .unwrap_or(false);
+                return Ok(if has_next { T } else { NIL });
             }
             "INITIALIZE-INSTANCE" => {
                 let (instance_form, init_args) = cp(cdr);
@@ -7187,6 +7741,85 @@ fn bind_pattern_value(pattern: BlissVal, value: BlissVal, env: &mut Env) -> Resu
     bind_pattern_value(pcdr, vcdr, env)
 }
 
+/// True if a nested macro pattern is a destructuring lambda list — it contains a
+/// lambda-list keyword (`&optional`/`&rest`/`&key`/…) — as opposed to a plain
+/// structural pattern like `(a b)` or a dotted `(k . v)`.
+fn contains_lambda_list_keyword(pattern: BlissVal) -> bool {
+    let mut c = pattern;
+    while c.is_cons() {
+        let (elem, rest) = cp(c);
+        if elem.is_symbol()
+            && matches!(
+                sym_name(elem).as_str(),
+                "&OPTIONAL"
+                    | "&REST"
+                    | "&BODY"
+                    | "&KEY"
+                    | "&AUX"
+                    | "&WHOLE"
+                    | "&ENVIRONMENT"
+                    | "&ALLOW-OTHER-KEYS"
+            )
+        {
+            return true;
+        }
+        c = rest;
+    }
+    false
+}
+
+/// Bind one macro parameter pattern against a value. A symbol binds directly; a
+/// nested pattern that is itself a destructuring lambda list recurses through the
+/// full macro lambda-list binder so `&optional`/`&rest`/`&key` work at any depth
+/// (this is what lets e.g. ASDF's `(defmacro with-upgradability ((&optional) &body body) …)`
+/// expand). Every other cons pattern uses plain structural destructuring.
+fn bind_macro_param(
+    pattern: BlissVal,
+    value: BlissVal,
+    env: &mut Env,
+    macroexpand_env: Option<&MacroexpandEnv>,
+) -> Result<(), BlissError> {
+    if pattern.is_nil() {
+        if value.is_nil() {
+            return Ok(());
+        }
+        return Err(BlissError::Internal(format!(
+            "destructuring mismatch: expected NIL, got {}",
+            format_val(value)
+        )));
+    }
+    if pattern.is_symbol() {
+        env.define_local_symbol(pattern, value);
+        return Ok(());
+    }
+    if !pattern.is_cons() {
+        return Err(BlissError::Internal(format!(
+            "invalid destructuring pattern: {}",
+            format_val(pattern)
+        )));
+    }
+    // A sub-pattern that is a destructuring lambda list at *this* level goes to
+    // the lambda-list binder (handles &optional/&rest/&key).
+    if contains_lambda_list_keyword(pattern) {
+        let sub_args = list_to_vec(value);
+        return bind_macro_lambda_list(pattern, &sub_args, env, macroexpand_env);
+    }
+    // Otherwise destructure structurally, recursing through this function so a
+    // keyword-bearing lambda list nested *deeper* is still detected. A symbol in
+    // the cdr position binds the rest (dotted patterns).
+    if !value.is_cons() {
+        return Err(BlissError::Internal(format!(
+            "destructuring mismatch: expected list for pattern {}, got {}",
+            format_val(pattern),
+            format_val(value)
+        )));
+    }
+    let (pcar, pcdr) = cp(pattern);
+    let (vcar, vcdr) = cp(value);
+    bind_macro_param(pcar, vcar, env, macroexpand_env)?;
+    bind_macro_param(pcdr, vcdr, env, macroexpand_env)
+}
+
 fn bind_macro_lambda_list(
     params_form: BlissVal,
     args: &[BlissVal],
@@ -7270,7 +7903,7 @@ fn bind_macro_lambda_list(
                     ))
                 })?;
                 arg_i += 1;
-                bind_pattern_value(elem, v, env)?;
+                bind_macro_param(elem, v, env, macroexpand_env)?;
             }
             Mode::Opt => {
                 let (pattern, default_form, supp) = if elem.is_symbol() {
@@ -7289,7 +7922,7 @@ fn bind_macro_lambda_list(
                 };
 
                 if arg_i < args.len() {
-                    bind_pattern_value(pattern, args[arg_i], env)?;
+                    bind_macro_param(pattern, args[arg_i], env, macroexpand_env)?;
                     arg_i += 1;
                     if let Some(sp) = supp {
                         env.define_local(&sp, T);
@@ -7300,7 +7933,7 @@ fn bind_macro_lambda_list(
                     } else {
                         eval_form(default_form, env)?
                     };
-                    bind_pattern_value(pattern, dv, env)?;
+                    bind_macro_param(pattern, dv, env, macroexpand_env)?;
                     if let Some(sp) = supp {
                         env.define_local(&sp, NIL);
                     }
@@ -7313,7 +7946,7 @@ fn bind_macro_lambda_list(
                     ));
                 }
                 let remaining = vec_to_list(args.get(arg_i..).unwrap_or(&[]));
-                bind_pattern_value(elem, remaining, env)?;
+                bind_macro_param(elem, remaining, env, macroexpand_env)?;
                 key_start.get_or_insert(arg_i);
                 rest_bound = true;
             }
@@ -7393,7 +8026,7 @@ fn bind_macro_lambda_list(
 
         for (kw_bare, pattern, default_form, supp) in &key_specs {
             if let Some(v) = find_key_arg(tail, kw_bare) {
-                bind_pattern_value(*pattern, v, env)?;
+                bind_macro_param(*pattern, v, env, macroexpand_env)?;
                 if let Some(sp) = supp {
                     env.define_local(sp, T);
                 }
@@ -7403,7 +8036,7 @@ fn bind_macro_lambda_list(
                 } else {
                     eval_form(*default_form, env)?
                 };
-                bind_pattern_value(*pattern, dv, env)?;
+                bind_macro_param(*pattern, dv, env, macroexpand_env)?;
                 if let Some(sp) = supp {
                     env.define_local(sp, NIL);
                 }
@@ -7802,20 +8435,142 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     Ok(name_form)
 }
 
+// ── DEFSTRUCT ────────────────────────────────────────────────────
+/// A minimal `defstruct` implemented on top of CLOS: it expands to a `defclass`
+/// plus a `make-NAME` keyword constructor, a `NAME-P` predicate, a `copy-NAME`
+/// copier, and `NAME-slot` accessors, then evaluates those forms. Structure
+/// options (e.g. `:conc-name`, `:constructor`) are accepted but ignored; the
+/// standard default names are used.
+fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let (name_spec, slots_form) = cp(cdr);
+    let name_sym = if name_spec.is_cons() {
+        cp(name_spec).0
+    } else {
+        name_spec
+    };
+    let name_str = symbol_bare_name(&sym_name(name_sym));
+
+    // Parse each slot into (slot-symbol, default-form, accessor-symbol, initarg-keyword).
+    struct StructSlot {
+        slot_sym: BlissVal,
+        default: BlissVal,
+        accessor: BlissVal,
+        initarg: BlissVal,
+    }
+    let mut slots: Vec<StructSlot> = Vec::new();
+    for slot_form in list_to_vec(slots_form) {
+        let (slot_sym, default) = if slot_form.is_cons() {
+            let (sn, rest) = cp(slot_form);
+            (sn, if rest.is_cons() { cp(rest).0 } else { NIL })
+        } else {
+            (slot_form, NIL)
+        };
+        if !slot_sym.is_symbol() {
+            continue;
+        }
+        let slot_str = symbol_bare_name(&sym_name(slot_sym));
+        slots.push(StructSlot {
+            slot_sym,
+            default,
+            accessor: resolve_sym(&format!("{}-{}", name_str, slot_str)).unwrap_or(NIL),
+            initarg: resolve_sym(&format!(":{}", slot_str)).unwrap_or(NIL),
+        });
+    }
+
+    let sym = |name: &str| resolve_sym(name).unwrap_or(NIL);
+    let quote = |value: BlissVal| vec_to_list(&[sym("QUOTE"), value]);
+    let obj = sym("%STRUCT-OBJECT%");
+
+    // (defclass NAME () ((slot :initarg :slot :accessor NAME-slot) ...))
+    let slot_clauses: Vec<BlissVal> = slots
+        .iter()
+        .map(|s| {
+            vec_to_list(&[
+                s.slot_sym,
+                sym(":INITARG"),
+                s.initarg,
+                sym(":ACCESSOR"),
+                s.accessor,
+            ])
+        })
+        .collect();
+    let defclass_form = vec_to_list(&[
+        sym("DEFCLASS"),
+        name_sym,
+        NIL,
+        vec_to_list(&slot_clauses),
+    ]);
+    eval_form(defclass_form, env)?;
+
+    // (defun make-NAME (&key (slot default) ...) (make-instance 'NAME :slot slot ...))
+    let mut ctor_params = vec![sym("&KEY")];
+    for s in &slots {
+        ctor_params.push(vec_to_list(&[s.slot_sym, s.default]));
+    }
+    let mut make_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)];
+    for s in &slots {
+        make_call.push(s.initarg);
+        make_call.push(s.slot_sym);
+    }
+    let ctor_defun = vec_to_list(&[
+        sym("DEFUN"),
+        sym(&format!("MAKE-{}", name_str)),
+        vec_to_list(&ctor_params),
+        vec_to_list(&make_call),
+    ]);
+    eval_form(ctor_defun, env)?;
+
+    // (defun NAME-P (o) (typep o 'NAME))
+    let pred_defun = vec_to_list(&[
+        sym("DEFUN"),
+        sym(&format!("{}-P", name_str)),
+        vec_to_list(&[obj]),
+        vec_to_list(&[sym("TYPEP"), obj, quote(name_sym)]),
+    ]);
+    eval_form(pred_defun, env)?;
+
+    // (defun copy-NAME (o) (make-NAME :slot (NAME-slot o) ...))
+    let mut copy_call = vec![sym(&format!("MAKE-{}", name_str))];
+    for s in &slots {
+        copy_call.push(s.initarg);
+        copy_call.push(vec_to_list(&[s.accessor, obj]));
+    }
+    let copy_defun = vec_to_list(&[
+        sym("DEFUN"),
+        sym(&format!("COPY-{}", name_str)),
+        vec_to_list(&[obj]),
+        vec_to_list(&copy_call),
+    ]);
+    eval_form(copy_defun, env)?;
+
+    Ok(name_sym)
+}
+
 // ── DEFGENERIC ───────────────────────────────────────────────────
 fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, options) = cp(cdr);
     let name = sym_name(name_form);
     let mut combination = bliss_stdlib::MethodCombinationType::Standard;
+    // `(:method qualifier* specialized-lambda-list body...)` options each define a
+    // method; collect their tails so they can be registered after the generic
+    // function exists (with its method combination already known).
+    let mut method_options: Vec<BlissVal> = Vec::new();
     let mut opts = options;
     while opts.is_cons() {
         let (option, rest) = cp(opts);
         if option.is_cons() {
             let (option_name, option_rest) = cp(option);
-            if symbol_bare_name(&sym_name(option_name)) == "METHOD-COMBINATION" {
-                let method_combination = cp(option_rest).0;
-                combination = method_combination_from_name(&sym_name(method_combination))
-                    .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
+            if option_name.is_symbol() {
+                match symbol_bare_name(&sym_name(option_name)).as_str() {
+                    "METHOD-COMBINATION" => {
+                        let method_combination = cp(option_rest).0;
+                        combination =
+                            method_combination_from_name(&sym_name(method_combination))
+                                .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
+                    }
+                    "METHOD" => method_options.push(option_rest),
+                    _ => {}
+                }
             }
         }
         opts = rest;
@@ -7829,6 +8584,14 @@ fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         },
     );
     Rc::make_mut(&mut env.methods).entry(name).or_default();
+
+    // Register each :method option by delegating to DEFMETHOD: the option tail
+    // `(qualifier* specialized-lambda-list body...)` is exactly a DEFMETHOD cdr
+    // once the generic-function name is consed on the front.
+    for method_option in method_options {
+        let defmethod_cdr = arena_cons(name_form, method_option);
+        eval_defmethod(defmethod_cdr, env)?;
+    }
     Ok(name_form)
 }
 
@@ -7866,16 +8629,37 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     let (spec_params_form, body) = cp(cursor);
     let method_id = next_stdlib_class_id();
 
-    // Parse specialized params: ((var class) ...)
+    // Parse the specialized lambda list. Required parameters (before any
+    // lambda-list keyword) may carry specializers `(var class)` / `(var (eql v))`;
+    // once a keyword such as &optional/&rest/&key/&aux is seen, the remaining
+    // parameters are ordinary (unspecialized) and are passed through verbatim so
+    // the standard lambda-list binder handles them.
     let params_list = list_to_vec(spec_params_form);
-    let mut params = Vec::new();
     let mut specializers = Vec::new();
+    let mut plain_params: Vec<BlissVal> = Vec::new();
+    let mut past_required = false;
 
     for p in &params_list {
-        if p.is_cons() {
+        if p.is_symbol() {
+            let bare = symbol_bare_name(&sym_name(*p));
+            if bare.starts_with('&') {
+                past_required = true;
+                plain_params.push(*p);
+                continue;
+            }
+            plain_params.push(*p);
+            if !past_required {
+                specializers.push(MethodSpecializer::Any);
+            }
+        } else if p.is_cons() {
+            if past_required {
+                // &optional/&key parameter with a default form, e.g. (y 10).
+                plain_params.push(*p);
+                continue;
+            }
             let (var_form, rest_p) = cp(*p);
+            plain_params.push(var_form);
             let (class_form, _) = cp(rest_p);
-            params.push(sym_name(var_form));
             if class_form.is_cons() {
                 let (head, value_rest) = cp(class_form);
                 if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "EQL" {
@@ -7891,11 +8675,9 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                     specializers.push(MethodSpecializer::Class(specializer_name));
                 }
             }
-        } else if p.is_symbol() {
-            params.push(sym_name(*p));
-            specializers.push(MethodSpecializer::Any);
         }
     }
+    let lambda_list = vec_to_list(&plain_params);
 
     let generic_function = if let Some(generic) = env.generics.get(&name) {
         generic.generic_function
@@ -7919,7 +8701,8 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         .push(MethodDef {
             method_id,
             specializers,
-            params,
+            lambda_list,
+            qualifier,
             body,
         });
     Ok(name_form)
@@ -7942,6 +8725,32 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
         write_class_slot_value(env, &class_name, &slot_name, Some(value));
     }
     apply_class_initforms(instance, &class_name, env, None, &explicit_slots)?;
+
+    // Run user-defined :after methods on the initialization protocol so the
+    // canonical `(defmethod initialize-instance :after ...)` hook fires. Per
+    // ANSI, shared-initialize's :after methods run inside the initialize-instance
+    // primary, hence before initialize-instance's own :after methods.
+    // initialize-instance is called as (instance &rest initargs); shared-initialize
+    // as (instance slot-names &rest initargs) with slot-names = T (all slots).
+    let mut ii_args = Vec::with_capacity(initargs.len() + 1);
+    ii_args.push(instance);
+    ii_args.extend_from_slice(&initargs);
+    let mut si_args = Vec::with_capacity(initargs.len() + 2);
+    si_args.push(instance);
+    si_args.push(T);
+    si_args.extend_from_slice(&initargs);
+    run_initialization_aux_methods(
+        env,
+        "SHARED-INITIALIZE",
+        &si_args,
+        bliss_stdlib::MethodQualifier::After,
+    )?;
+    run_initialization_aux_methods(
+        env,
+        "INITIALIZE-INSTANCE",
+        &ii_args,
+        bliss_stdlib::MethodQualifier::After,
+    )?;
     Ok(instance)
 }
 
@@ -8194,9 +9003,16 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
                 captured_frame: freeze_env_frame(&env.frame),
             },
         };
-        env.handlers.push(entry.clone());
         installed.push(entry);
         c = rest;
+    }
+
+    // Install clauses so that SIGNAL's newest-first traversal tries them in the
+    // order written: HANDLER-CASE selects the first matching clause (ANSI CL),
+    // so a more specific clause listed before a general one must win. Pushing in
+    // reverse makes the first clause the last-pushed, hence first-visited.
+    for entry in installed.iter().rev() {
+        env.handlers.push(entry.clone());
     }
 
     let result = eval_form(protected_form, env);
@@ -8365,9 +9181,27 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
 // ── CERROR ───────────────────────────────────────────────────────
 fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (_continue_form, rest) = cp(cdr);
-    let (msg_form, _) = cp(rest);
-    let msg = eval_form(msg_form, env)?;
-    let condition = make_simple_error_condition(msg, env)?;
+    let (datum_form, arg_forms) = cp(rest);
+    let datum = eval_form(datum_form, env)?;
+    let mut args = Vec::new();
+    let mut cursor = arg_forms;
+    while cursor.is_cons() {
+        let (arg, next) = cp(cursor);
+        args.push(eval_form(arg, env)?);
+        cursor = next;
+    }
+    // (cerror continue-control datum &rest args): datum may be a condition
+    // instance, a condition-type symbol (built via MAKE-CONDITION), or a
+    // format-control string (→ SIMPLE-ERROR).
+    let message = if datum.is_string() && !args.is_empty() {
+        simple_format_message(&val_as_str(datum), &args)
+    } else {
+        val_as_str(datum)
+    };
+    let condition = match coerce_condition_designator(env, datum, &args)? {
+        Some(condition) => condition,
+        None => make_simple_error_condition(arena_str(&message), env)?,
+    };
 
     let base_len = env.restarts.len();
     env.restarts.push(RestartEntry {
@@ -8381,7 +9215,7 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let result = signal_condition_object(condition, env);
     env.restarts.truncate(base_len);
     match result {
-        Ok(_) => Err(BlissError::Internal(format!("ERROR: {}", val_as_str(msg)))),
+        Ok(_) => Err(BlissError::Internal(format!("ERROR: {}", message))),
         Err(error) => {
             if restart_invoked_name(&error).as_deref() == Some("CONTINUE") {
                 return Ok(NIL);
@@ -8632,6 +9466,9 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         }
     }
 
+    if let Some(ref path) = ca.load_report {
+        return run_load_report(path, &mut env);
+    }
     if let Some(ref expr) = ca.eval {
         return run_eval_env(expr, &mut env);
     }
@@ -8642,6 +9479,145 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         return run_script_env(script, &mut env);
     }
     run_repl_env(&mut env)
+}
+
+/// Collapse a form's source to a single-line, length-capped preview keyed by its
+/// operator, for the punch-list.
+fn preview_form(src: &str) -> String {
+    // Drop leading comment lines / blank lines the reader skipped, so the
+    // preview starts at the actual form.
+    let body: String = src
+        .lines()
+        .skip_while(|line| {
+            let t = line.trim_start();
+            t.is_empty() || t.starts_with(';')
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 96 {
+        let head: String = collapsed.chars().take(93).collect();
+        format!("{}...", head)
+    } else {
+        collapsed
+    }
+}
+
+/// Bucket an error message into a category. Undefined functions/variables keep
+/// their name so the report shows exactly which symbols are missing.
+fn categorize_error(desc: &str) -> String {
+    if let Some(rest) = desc.strip_prefix("undefined function: ") {
+        return format!("undefined-fn: {}", rest);
+    }
+    if let Some(rest) = desc.strip_prefix("unbound variable: ") {
+        return format!("unbound-var: {}", rest);
+    }
+    if desc.contains("CHECK-TYPE") {
+        return "check-type-failure".to_string();
+    }
+    if desc.contains("LOOP ") {
+        return "loop-unsupported-clause".to_string();
+    }
+    if desc.contains("SETF: unsupported place") {
+        return "setf-unsupported-place".to_string();
+    }
+    if desc.contains("not an instance") {
+        return "not-an-instance".to_string();
+    }
+    let cleaned = desc.strip_prefix("internal error: ").unwrap_or(desc);
+    let cleaned = cleaned.strip_prefix("ERROR: ").unwrap_or(cleaned);
+    cleaned.chars().take(60).collect()
+}
+
+/// From `pos`, find the index of the next top-level form (a `(` at the start of
+/// a line). Used to resync after a reader error.
+fn resync_to_next_toplevel(chars: &[char], pos: usize) -> usize {
+    let mut i = pos;
+    while i + 1 < chars.len() {
+        if chars[i] == '\n' && chars[i + 1] == '(' {
+            return i + 1;
+        }
+        i += 1;
+    }
+    chars.len()
+}
+
+/// `--load-report`: evaluate every top-level form in a file, continue past
+/// errors, and print a categorized punch-list of the failures.
+fn run_load_report(path: &str, env: &mut Env) -> Result<i32, BlissError> {
+    use std::collections::BTreeMap;
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
+    register_declared_packages(&contents);
+    let chars: Vec<char> = contents.chars().collect();
+    let mut pos = 0usize;
+    let mut form_index = 0usize;
+    let mut ok = 0usize;
+    let mut failures: Vec<(usize, String, String)> = Vec::new();
+    let mut category_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    with_eval_context(env, EvalContext::Load, |env| {
+        loop {
+            while pos < chars.len() && chars[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos >= chars.len() {
+                break;
+            }
+            let remaining: String = chars[pos..].iter().collect();
+            let (val, consumed) = match reader::read_from_string(&remaining) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    *category_counts.entry("reader-error".to_string()).or_insert(0) += 1;
+                    failures.push((form_index + 1, "<reader>".into(), describe_err(&e)));
+                    let next = resync_to_next_toplevel(&chars, pos);
+                    if next <= pos {
+                        break;
+                    }
+                    pos = next;
+                    continue;
+                }
+            };
+            if val == EOF {
+                break;
+            }
+            let form_src: String = chars[pos..pos + consumed].iter().collect();
+            pos += consumed;
+            form_index += 1;
+            match eval_form(val, env) {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    let desc = describe_err(&e);
+                    *category_counts
+                        .entry(categorize_error(&desc))
+                        .or_insert(0) += 1;
+                    failures.push((form_index, preview_form(&form_src), desc));
+                }
+            }
+        }
+        Ok(NIL)
+    })?;
+
+    println!(
+        "== {} ==\n{} top-level forms: {} ok, {} failed\n",
+        path,
+        form_index,
+        ok,
+        failures.len()
+    );
+
+    let mut cats: Vec<(&String, &usize)> = category_counts.iter().collect();
+    cats.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    println!("== Failure categories (by count) ==");
+    for (cat, count) in &cats {
+        println!("  {:>4}  {}", count, cat);
+    }
+
+    println!("\n== First failing forms (up to 80) ==");
+    for (idx, form, err) in failures.iter().take(80) {
+        println!("  [{:>4}] {}\n         → {}", idx, form, err);
+    }
+    Ok(0)
 }
 
 fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, BlissError> {
