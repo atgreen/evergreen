@@ -603,6 +603,7 @@ enum NextMethod {
 #[derive(Clone)]
 struct PackageDef {
     name: String,
+    nicknames: Vec<String>,
     exports: Vec<String>,
     uses: Vec<String>,
     symbols: HashMap<String, BlissVal>,
@@ -1953,17 +1954,22 @@ fn with_eval_context<T>(
 }
 
 fn seed_standard_packages(packages: &mut HashMap<String, PackageDef>) {
-    for (name, uses) in [
-        ("COMMON-LISP", Vec::<String>::new()),
-        ("COMMON-LISP-USER", vec!["COMMON-LISP".to_string()]),
-        ("KEYWORD", Vec::<String>::new()),
-        ("BLISS-INTERNAL", Vec::<String>::new()),
-        ("BLISS-EXT", vec!["COMMON-LISP".to_string()]),
+    for (name, nicknames, uses) in [
+        ("COMMON-LISP", vec!["CL".to_string()], Vec::<String>::new()),
+        (
+            "COMMON-LISP-USER",
+            vec!["CL-USER".to_string()],
+            vec!["COMMON-LISP".to_string()],
+        ),
+        ("KEYWORD", Vec::new(), Vec::new()),
+        ("BLISS-INTERNAL", Vec::new(), Vec::new()),
+        ("BLISS-EXT", Vec::new(), vec!["COMMON-LISP".to_string()]),
     ] {
         packages.insert(
             name.to_string(),
             PackageDef {
                 name: name.to_string(),
+                nicknames,
                 exports: Vec::new(),
                 uses,
                 symbols: HashMap::new(),
@@ -2472,6 +2478,32 @@ fn normalize_package_name(name: &str) -> String {
         .to_uppercase()
 }
 
+/// Resolve a package designator to a canonical package name, following
+/// nicknames. Returns the canonical name of the registered package whose name or
+/// nicknames match; if none match, returns the normalized designator unchanged
+/// (so it can name a package about to be created).
+fn resolve_package_name(env: &Env, raw: &str) -> String {
+    let normalized = normalize_package_name(raw);
+    // Built-in nicknames that must resolve even before the registry is consulted.
+    let builtin = match normalized.as_str() {
+        "CL" => Some("COMMON-LISP"),
+        "CL-USER" => Some("COMMON-LISP-USER"),
+        _ => None,
+    };
+    if let Some(canonical) = builtin {
+        return canonical.to_string();
+    }
+    if env.packages.contains_key(&normalized) {
+        return normalized;
+    }
+    for (canonical, def) in env.packages.iter() {
+        if def.nicknames.iter().any(|nick| nick == &normalized) {
+            return canonical.clone();
+        }
+    }
+    normalized
+}
+
 /// Short package name for the REPL prompt. Standard packages use their usual
 /// CL nicknames (`CL-USER>`, `CL>`); user-defined packages show their full name.
 fn prompt_package_name(name: &str) -> &str {
@@ -2547,7 +2579,7 @@ fn find_symbol_in_package(
     pkg_name: &str,
     bare_name: &str,
 ) -> Option<(BlissVal, &'static str)> {
-    let pkg_name = normalize_package_name(pkg_name);
+    let pkg_name = resolve_package_name(env, pkg_name);
     let bare_name = bare_name.to_uppercase();
     if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
         if let Some(sym) = resolve_sym(&bare_name) {
@@ -2582,6 +2614,7 @@ fn ensure_package_available(env: &mut Env, name: &str, uses: &[&str]) {
         .entry(name.to_string())
         .or_insert_with(|| PackageDef {
             name: name.to_string(),
+            nicknames: Vec::new(),
             exports: Vec::new(),
             uses: uses.iter().map(|pkg| (*pkg).to_string()).collect(),
             symbols: HashMap::new(),
@@ -5230,7 +5263,39 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     ));
                 }
                 let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
-                ensure_package_available(env, &pkg_name, &[]);
+                // Parse :nicknames and :use keyword options.
+                let mut nicknames = Vec::new();
+                let mut uses: Vec<String> = Vec::new();
+                let mut i = 1;
+                while i + 1 < args.len() {
+                    let key = symbol_bare_name(&sym_name(eval_form(args[i], env)?));
+                    let value = eval_form(args[i + 1], env)?;
+                    match key.as_str() {
+                        "NICKNAMES" => {
+                            for nick in list_to_vec(value) {
+                                nicknames.push(normalize_package_name(&val_as_str(nick)));
+                            }
+                        }
+                        "USE" => {
+                            for used in list_to_vec(value) {
+                                uses.push(resolve_package_name(env, &val_as_str(used)));
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 2;
+                }
+                let use_refs: Vec<&str> = uses.iter().map(String::as_str).collect();
+                ensure_package_available(env, &pkg_name, &use_refs);
+                if !nicknames.is_empty() {
+                    if let Some(def) = Rc::make_mut(&mut env.packages).get_mut(&pkg_name) {
+                        for nick in nicknames {
+                            if !def.nicknames.contains(&nick) {
+                                def.nicknames.push(nick);
+                            }
+                        }
+                    }
+                }
                 return Ok(arena_str(&pkg_name));
             }
             "FIND-PACKAGE" => {
@@ -5238,7 +5303,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if args.is_empty() {
                     return Ok(NIL);
                 }
-                let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                let raw = val_as_str(eval_form(args[0], env)?);
+                let pkg_name = resolve_package_name(env, &raw);
                 return Ok(
                     if env.packages.contains_key(&pkg_name)
                         || matches!(
@@ -5252,6 +5318,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     },
                 );
             }
+            "PACKAGEP" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(NIL);
+                }
+                let value = eval_form(args[0], env)?;
+                return Ok(if is_package_value(env, value) { T } else { NIL });
+            }
             "PACKAGE-NAME" => {
                 let args = list_to_vec(cdr);
                 if args.is_empty() {
@@ -5261,7 +5335,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if pkg.is_empty() {
                     NIL
                 } else {
-                    arena_str(&normalize_package_name(&pkg))
+                    arena_str(&resolve_package_name(env, &pkg))
                 });
             }
             "PACKAGE-NAMES" => {
@@ -5272,7 +5346,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pkg = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
                 return Ok(vec_to_list(&[arena_str(&pkg)]));
             }
-            "PACKAGE-NICKNAMES" | "PACKAGE-SHADOWING-SYMBOLS" | "PACKAGE-USED-BY-LIST" => {
+            "PACKAGE-NICKNAMES" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(NIL);
+                }
+                let raw = val_as_str(eval_form(args[0], env)?);
+                let pkg_name = resolve_package_name(env, &raw);
+                let nicks: Vec<BlissVal> = env
+                    .packages
+                    .get(&pkg_name)
+                    .map(|def| def.nicknames.iter().map(|n| arena_str(n)).collect())
+                    .unwrap_or_default();
+                return Ok(vec_to_list(&nicks));
+            }
+            "PACKAGE-SHADOWING-SYMBOLS" | "PACKAGE-USED-BY-LIST" => {
                 return Ok(NIL);
             }
             "PACKAGE-USE-LIST" => {
@@ -5380,7 +5468,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let name_val = eval_form(name_form, env)?;
                 let name_str = symbol_bare_name(&val_as_str(name_val));
                 let pkg_name = if rest.is_cons() {
-                    normalize_package_name(&val_as_str(eval_form(cp(rest).0, env)?))
+                    let raw = val_as_str(eval_form(cp(rest).0, env)?);
+                    resolve_package_name(env, &raw)
                 } else {
                     env.current_package.clone()
                 };
@@ -5403,7 +5492,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     ));
                 }
                 let name = symbol_bare_name(&val_as_str(eval_form(args[0], env)?));
-                let pkg_name = normalize_package_name(&val_as_str(eval_form(args[1], env)?));
+                let pkg_raw = val_as_str(eval_form(args[1], env)?);
+                let pkg_name = resolve_package_name(env, &pkg_raw);
                 if let Some((sym, status)) = find_symbol_in_package(env, &pkg_name, &name) {
                     env.set_mv(vec![sym, package_status_symbol(status)]);
                     return Ok(sym);
@@ -9291,6 +9381,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
 
     let mut exports = Vec::new();
     let mut uses = Vec::new();
+    let mut nicknames = Vec::new();
 
     let mut c = opts;
     while c.is_cons() {
@@ -9305,24 +9396,21 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 let mut vc = val_list;
                 while vc.is_cons() {
                     let (v, vr) = cp(vc);
-                    uses.push(
-                        sym_name(v)
-                            .trim_start_matches("KEYWORD:")
-                            .trim_start_matches(':')
-                            .to_uppercase(),
-                    );
+                    uses.push(resolve_package_name(env, &val_as_str(v)));
                     vc = vr;
                 }
             } else if key_bare == "EXPORT" {
                 let mut vc = val_list;
                 while vc.is_cons() {
                     let (v, vr) = cp(vc);
-                    exports.push(
-                        sym_name(v)
-                            .trim_start_matches("KEYWORD:")
-                            .trim_start_matches(':')
-                            .to_uppercase(),
-                    );
+                    exports.push(symbol_bare_name(&sym_name(v)));
+                    vc = vr;
+                }
+            } else if key_bare == "NICKNAMES" {
+                let mut vc = val_list;
+                while vc.is_cons() {
+                    let (v, vr) = cp(vc);
+                    nicknames.push(normalize_package_name(&val_as_str(v)));
                     vc = vr;
                 }
             }
@@ -9334,6 +9422,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         pkg_name.clone(),
         PackageDef {
             name: pkg_name.clone(),
+            nicknames,
             exports,
             uses,
             symbols: HashMap::new(),

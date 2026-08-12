@@ -1369,6 +1369,56 @@ fn symbol_package_reports_real_package() {
 }
 
 #[test]
+fn find_symbol_resolves_package_nicknames_and_two_values() {
+    // CL is a nickname for COMMON-LISP; find-symbol must resolve it and return
+    // the external status as a second value.
+    assert_eq!(
+        eval_ok("(multiple-value-list (find-symbol \"CAR\" :cl))"),
+        "(CAR :EXTERNAL)"
+    );
+    // Nickname as a string designator also resolves (two values collected).
+    assert_eq!(
+        eval_ok("(multiple-value-list (find-symbol \"CAR\" \"CL\"))"),
+        "(CAR :EXTERNAL)"
+    );
+}
+
+#[test]
+fn find_package_resolves_nicknames() {
+    assert_eq!(eval_ok("(package-name (find-package :cl))"), "\"COMMON-LISP\"");
+    assert_eq!(
+        eval_ok("(package-name (find-package :cl-user))"),
+        "\"COMMON-LISP-USER\""
+    );
+}
+
+#[test]
+fn packagep_predicate() {
+    assert_eq!(eval_ok("(packagep (find-package :cl))"), "T");
+    assert_eq!(eval_ok("(packagep 5)"), "NIL");
+}
+
+#[test]
+fn defpackage_nicknames_are_registered_and_resolvable() {
+    assert_eq!(
+        eval_ok("(progn (defpackage :foopkg (:nicknames :fp :foolib) (:use :cl)) (package-name (find-package :foolib)))"),
+        "\"FOOPKG\""
+    );
+    assert_eq!(
+        eval_ok("(progn (defpackage :barpkg (:nicknames :bp)) (package-nicknames (find-package :barpkg)))"),
+        "(\"BP\")"
+    );
+}
+
+#[test]
+fn make_package_with_nicknames() {
+    assert_eq!(
+        eval_ok("(progn (make-package \"MYPKG\" :nicknames '(\"MP\")) (package-name (find-package :mp)))"),
+        "\"MYPKG\""
+    );
+}
+
+#[test]
 fn macro_lambda_list_supports_nested_destructuring() {
     // ASDF's (defmacro with-upgradability ((&optional) &body body) ...) shape:
     // a nested destructuring pattern with lambda-list keywords must expand.
