@@ -172,6 +172,8 @@ struct ConditionState {
     restart_registry: Vec<RestartEntry>,
     /// Current debugger hook (*DEBUGGER-HOOK*).
     debugger_hook: Option<BlissVal>,
+    /// Current *BREAK-ON-SIGNALS* value.
+    break_on_signals: Option<BlissVal>,
     /// Flag set when debugger was invoked (for testing).
     debugger_invoked: bool,
     handler_case_clauses: HashMap<u64, BlissVal>,
@@ -185,6 +187,7 @@ impl ConditionState {
             handler_stack: Vec::new(),
             restart_registry: Vec::new(),
             debugger_hook: None,
+            break_on_signals: None,
             debugger_invoked: false,
             handler_case_clauses: HashMap::new(),
             pending_handler_case: None,
@@ -346,6 +349,7 @@ fn condition_type_matches(condition: BlissVal, clause_type: BlissVal) -> bool {
 /// current cluster (and everything established after it) before invoking
 /// the handler, preventing infinite recursion when a handler re-signals.
 pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
+    break_on_signals_gate(condition)?;
     // Snapshot the handler stack so we can iterate without holding the borrow.
     let handlers: Vec<Vec<(BlissVal, BlissVal)>> = STATE.with(|s| s.borrow().handler_stack.clone());
 
@@ -379,6 +383,25 @@ pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
     }
 
     // All handlers declined (or none matched) — SIGNAL returns NIL / Ok.
+    Ok(())
+}
+
+fn break_on_signals_gate(condition: BlissVal) -> Result<(), BlissError> {
+    let break_spec = STATE.with(|s| s.borrow().break_on_signals);
+    let Some(break_spec) = break_spec else {
+        return Ok(());
+    };
+    if !condition_type_matches(condition, break_spec) {
+        return Ok(());
+    }
+
+    STATE.with(|s| {
+        s.borrow_mut().break_on_signals = None;
+    });
+    let _ = invoke_debugger(condition);
+    STATE.with(|s| {
+        s.borrow_mut().break_on_signals = Some(break_spec);
+    });
     Ok(())
 }
 
@@ -915,6 +938,13 @@ pub fn set_debugger_hook(hook: Option<BlissVal>) {
         if hook.is_none() {
             state.debugger_invoked = false;
         }
+    });
+}
+
+/// Set `*BREAK-ON-SIGNALS*`.
+pub fn set_break_on_signals(type_spec: Option<BlissVal>) {
+    STATE.with(|s| {
+        s.borrow_mut().break_on_signals = type_spec;
     });
 }
 

@@ -45,7 +45,8 @@ pub use conditions::{
     HandlerBinding, RestartSpec, clear_funcall_hook, compute_restarts, error_condition,
     find_restart, handler_bind, handler_bind_fn, handler_case, invoke_debugger, invoke_restart,
     invoke_restart_interactively, make_simple_error, make_type_error, restart_bind,
-    restart_bind_fn, set_debugger_hook, set_funcall_hook, signal_condition, warn_condition,
+    restart_bind_fn, set_break_on_signals, set_debugger_hook, set_funcall_hook,
+    signal_condition, warn_condition,
 };
 pub use devtools::{
     BreakpointId, DebugFrame, ProfilerEntry, ProfilerKind, ProfilerReport, ReplState, StepMode,

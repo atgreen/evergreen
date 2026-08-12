@@ -772,6 +772,7 @@ fn eval_handler_impl(
 }
 
 fn signal_condition_object(condition: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    maybe_break_on_signals(condition, env)?;
     let handlers = env.handlers.clone();
     for handler in handlers.iter().rev() {
         if condition_matches_handler(env, condition, &handler.type_name) {
@@ -779,6 +780,40 @@ fn signal_condition_object(condition: BlissVal, env: &mut Env) -> Result<BlissVa
         }
     }
     Ok(NIL)
+}
+
+fn condition_matches_type_spec(env: &Env, condition: BlissVal, type_spec: BlissVal) -> bool {
+    if type_spec.is_nil() {
+        return false;
+    }
+    if type_spec == T {
+        return true;
+    }
+    if type_spec.is_symbol() {
+        return condition_matches_handler(env, condition, &sym_name(type_spec));
+    }
+    let Ok(class) = resolve_class_metaobject(env, type_spec) else {
+        return false;
+    };
+    bliss_stdlib::compute_class_precedence_list(bliss_stdlib::class_of(condition))
+        .map(|cpl| cpl.into_iter().any(|entry| entry == class))
+        .unwrap_or(false)
+}
+
+fn maybe_break_on_signals(condition: BlissVal, env: &mut Env) -> Result<(), BlissError> {
+    let Some(type_spec) = env.lookup_var("*BREAK-ON-SIGNALS*") else {
+        return Ok(());
+    };
+    if !condition_matches_type_spec(env, condition, type_spec) {
+        return Ok(());
+    }
+
+    env.set_var("*BREAK-ON-SIGNALS*", NIL);
+    let debugger_result = bliss_stdlib::invoke_debugger(condition);
+    env.set_var("*BREAK-ON-SIGNALS*", type_spec);
+    match debugger_result {
+        Ok(()) | Err(_) => Ok(()),
+    }
 }
 
 fn method_combination_from_name(name: &str) -> Option<bliss_stdlib::MethodCombinationType> {
@@ -811,21 +846,19 @@ fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, Blis
     Ok(class)
 }
 
-fn resolve_slot_symbol(class_name: &str, key: BlissVal, env: &Env) -> BlissVal {
+fn resolve_slot_symbol(
+    class_name: &str,
+    key: BlissVal,
+    env: &Env,
+) -> Result<BlissVal, BlissError> {
     let key_name = symbol_bare_name(&sym_name(key));
-    if let Some(class_def) = env.classes.get(class_name) {
-        for slot in &class_def.slots {
-            let matches_initarg = slot
-                .initarg
-                .as_ref()
-                .map(|initarg| initarg == &key_name)
-                .unwrap_or(false);
-            if matches_initarg || slot.name == key_name {
-                return resolve_sym(&slot.name).unwrap_or(NIL);
-            }
-        }
+    if let Some(slot) = lookup_slot_by_initarg(env, class_name, &key_name) {
+        return Ok(resolve_sym(&slot.name).unwrap_or(NIL));
     }
-    resolve_sym(&key_name).unwrap_or(NIL)
+    Err(BlissError::Internal(format!(
+        "Unknown initarg :{} for class {}",
+        key_name, class_name
+    )))
 }
 
 fn class_name_for_instance_class(class: BlissVal) -> String {
@@ -841,9 +874,35 @@ fn class_name_for_instance_class(class: BlissVal) -> String {
 }
 
 fn lookup_slot_def<'a>(env: &'a Env, class_name: &str, slot_name: &str) -> Option<&'a SlotDef> {
-    env.classes
-        .get(class_name)
-        .and_then(|class_def| class_def.slots.iter().find(|slot| slot.name == slot_name))
+    let class_def = env.classes.get(class_name)?;
+    if let Some(slot) = class_def.slots.iter().find(|slot| slot.name == slot_name) {
+        return Some(slot);
+    }
+    for super_name in &class_def.supers {
+        if let Some(slot) = lookup_slot_def(env, super_name, slot_name) {
+            return Some(slot);
+        }
+    }
+    None
+}
+
+fn lookup_slot_by_initarg<'a>(env: &'a Env, class_name: &str, initarg: &str) -> Option<&'a SlotDef> {
+    let class_def = env.classes.get(class_name)?;
+    if let Some(slot) = class_def.slots.iter().find(|slot| {
+        slot.initarg
+            .as_ref()
+            .map(|slot_initarg| slot_initarg == initarg)
+            .unwrap_or(false)
+            || slot.name == initarg
+    }) {
+        return Some(slot);
+    }
+    for super_name in &class_def.supers {
+        if let Some(slot) = lookup_slot_by_initarg(env, super_name, initarg) {
+            return Some(slot);
+        }
+    }
+    None
 }
 
 fn split_initargs_for_class(
@@ -995,7 +1054,7 @@ fn evaluated_initargs(
     while i + 1 < args_vec.len() {
         let key = eval_form(args_vec[i], env)?;
         let value = eval_form(args_vec[i + 1], env)?;
-        initargs.push(resolve_slot_symbol(class_name, key, env));
+        initargs.push(resolve_slot_symbol(class_name, key, env)?);
         initargs.push(value);
         i += 2;
     }
@@ -1363,6 +1422,7 @@ impl Env {
         env.define_local("*TYPE-DEFINITIONS*", NIL);
         env.define_local("*CONDITION-TYPES*", NIL);
         env.define_local("*CONDITION-DEFINITIONS*", NIL);
+        env.define_local("*BREAK-ON-SIGNALS*", NIL);
         env
     }
 

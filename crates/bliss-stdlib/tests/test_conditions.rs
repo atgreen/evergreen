@@ -5,6 +5,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    Mutex,
 };
 
 fn sym(i: u32) -> BlissVal {
@@ -426,25 +427,35 @@ fn cleanup_runs_when_handler_transfer_unwinds_the_dynamic_extent() {
 }
 
 #[test]
-fn unhandled_error_path_exposes_break_and_storage_related_debugger_surface() {
+fn break_on_signals_invokes_break_before_handler_search() {
     let hook = fx(81);
-    let seen = Arc::new(AtomicBool::new(false));
+    let handler = fx(82);
+    let seen = Arc::new(Mutex::new(Vec::new()));
     let seen_for_hook = Arc::clone(&seen);
 
     set_funcall_hook(move |function, args| {
         if function == hook {
             assert_eq!(args.len(), 2);
-            seen_for_hook.store(true, Ordering::SeqCst);
+            seen_for_hook.lock().unwrap().push("break");
+        } else if function == handler {
+            assert_eq!(args.len(), 1);
+            seen_for_hook.lock().unwrap().push("handler");
         }
         Ok(NIL)
     });
     set_debugger_hook(Some(hook));
+    set_break_on_signals(Some(sym(SYMBOL_ERROR)));
 
-    // Per R5.101, R5.103, and R5.203, the unhandled signalling path must route
-    // through debugger-entry hooks before reporting the condition. Per R5.110,
-    // storage-failure reporting uses the same externally observable entrypoint.
-    assert!(error_condition(make_simple_error("debug", &[])).is_err());
-    assert!(seen.load(Ordering::SeqCst));
+    // Per R5.203, BREAK must run before the normal handler search when the
+    // signalled condition matches *BREAK-ON-SIGNALS*.
+    assert!(handler_bind_fn(&[(sym(SYMBOL_ERROR), handler)], || {
+        signal_condition(make_simple_error("debug", &[]))?;
+        Ok(NIL)
+    })
+    .is_ok());
+    assert_eq!(&*seen.lock().unwrap(), &["break", "handler"]);
+
+    set_break_on_signals(None);
     set_debugger_hook(None);
     clear_funcall_hook();
 }
