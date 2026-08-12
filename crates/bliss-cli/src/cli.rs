@@ -457,6 +457,7 @@ struct Env {
     frame: Rc<RefCell<EnvFrame>>,
     funs: Rc<HashMap<String, FunDef>>,
     macros: Rc<HashMap<String, MacroDef>>,
+    symbol_macros: Rc<HashMap<u32, BlissVal>>,
     classes: Rc<HashMap<String, ClassDef>>,
     methods: Rc<HashMap<String, Vec<MethodDef>>>,
     packages: Rc<HashMap<String, PackageDef>>,
@@ -495,6 +496,7 @@ struct FunDef {
 struct MacroDef {
     params_form: BlissVal,
     body: BlissVal,
+    captured_frame: Rc<RefCell<EnvFrame>>,
 }
 
 #[allow(dead_code)]
@@ -581,6 +583,7 @@ impl Env {
             frame: Rc::new(RefCell::new(EnvFrame::default())),
             funs: Rc::new(HashMap::new()),
             macros: Rc::new(HashMap::new()),
+            symbol_macros: Rc::new(HashMap::new()),
             classes: Rc::new(HashMap::new()),
             methods: Rc::new(HashMap::new()),
             packages: Rc::new(packages),
@@ -620,6 +623,7 @@ impl Env {
             })),
             funs: Rc::clone(&self.funs),
             macros: Rc::clone(&self.macros),
+            symbol_macros: Rc::clone(&self.symbol_macros),
             classes: Rc::clone(&self.classes),
             methods: Rc::clone(&self.methods),
             packages: Rc::clone(&self.packages),
@@ -646,6 +650,7 @@ impl Env {
             })),
             funs: Rc::clone(&self.funs),
             macros: Rc::clone(&self.macros),
+            symbol_macros: Rc::clone(&self.symbol_macros),
             classes: Rc::clone(&self.classes),
             methods: Rc::clone(&self.methods),
             packages: Rc::clone(&self.packages),
@@ -701,6 +706,14 @@ impl Env {
         self.define_local_symbol(symbol, val);
     }
 
+    fn lookup_symbol_macro(&self, symbol: BlissVal) -> Option<BlissVal> {
+        self.symbol_macros.get(&symbol.as_symbol_index()).copied()
+    }
+
+    fn define_symbol_macro(&mut self, symbol: BlissVal, expansion: BlissVal) {
+        Rc::make_mut(&mut self.symbol_macros).insert(symbol.as_symbol_index(), expansion);
+    }
+
     fn define_local(&mut self, name: &str, val: BlissVal) {
         self.frame.borrow_mut().vars.insert(name.to_string(), val);
     }
@@ -747,7 +760,11 @@ impl Env {
         false
     }
 
-    fn set_symbol_frame_var(frame: &Rc<RefCell<EnvFrame>>, symbol_index: u32, val: BlissVal) -> bool {
+    fn set_symbol_frame_var(
+        frame: &Rc<RefCell<EnvFrame>>,
+        symbol_index: u32,
+        val: BlissVal,
+    ) -> bool {
         {
             let mut borrowed = frame.borrow_mut();
             if borrowed.symbol_vars.contains_key(&symbol_index) {
@@ -1878,6 +1895,15 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
     }
     if form.is_symbol() {
+        if let Some(expansion) = env.lookup_symbol_macro(form) {
+            if expansion == form {
+                return Err(BlissError::Internal(format!(
+                    "circular symbol macro expansion for {}",
+                    sym_name(form)
+                )));
+            }
+            return eval_form(expansion, env);
+        }
         if let Some(val) = env.lookup_var_symbol(form) {
             return Ok(val);
         }
@@ -2552,6 +2578,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 while c.is_cons() {
                     let (sym_form, r) = cp(c);
                     let (val_form, r2) = cp(r);
+                    if sym_form.is_symbol() {
+                        if let Some(expansion) = env.lookup_symbol_macro(sym_form) {
+                            let setf_form = arena_cons(
+                                resolve_sym("SETF").unwrap_or(NIL),
+                                arena_cons(expansion, arena_cons(val_form, NIL)),
+                            );
+                            result = eval_form(setf_form, env)?;
+                            c = r2;
+                            continue;
+                        }
+                    }
                     let val = eval_form(val_form, env)?;
                     if sym_form.is_symbol() {
                         env.set_var_symbol(sym_form, val);
@@ -2634,6 +2671,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "DEFUN" => return eval_defun(cdr, env),
             "FLET" | "LABELS" => return eval_flet(cdr, env),
             "DEFMACRO" => return eval_defmacro(cdr, env),
+            "MACROLET" => return eval_macrolet(cdr, env),
+            "SYMBOL-MACROLET" => return eval_symbol_macrolet(cdr, env),
             "DEFCLASS" => return eval_defclass(cdr, env),
             "DEFMETHOD" => return eval_defmethod(cdr, env),
             "MAKE-INSTANCE" => return eval_make_instance(cdr, env),
@@ -5895,11 +5934,7 @@ fn bind_lambda_list(
     Ok(())
 }
 
-fn bind_pattern_value(
-    pattern: BlissVal,
-    value: BlissVal,
-    env: &mut Env,
-) -> Result<(), BlissError> {
+fn bind_pattern_value(pattern: BlissVal, value: BlissVal, env: &mut Env) -> Result<(), BlissError> {
     if pattern.is_nil() {
         if value.is_nil() {
             return Ok(());
@@ -6184,16 +6219,56 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         MacroDef {
             params_form,
             body,
+            captured_frame: Rc::clone(&env.frame),
         },
     );
     Ok(name_form)
 }
 
 fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let mut child_env = env.child();
+    let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
     let arg_list = list_to_vec(args);
     bind_macro_lambda_list(mdef.params_form, &arg_list, &mut child_env)?;
     eval_progn(mdef.body, &mut child_env)
+}
+
+fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let (defs_form, body) = cp(cdr);
+    let mut child_env = env.child();
+    for def in list_to_vec(defs_form) {
+        if !def.is_cons() {
+            continue;
+        }
+        let (name_form, rest) = cp(def);
+        let (params_form, macro_body) = cp(rest);
+        let name = sym_name(name_form);
+        Rc::make_mut(&mut child_env.macros).insert(
+            name,
+            MacroDef {
+                params_form,
+                body: macro_body,
+                captured_frame: Rc::clone(&env.frame),
+            },
+        );
+    }
+    eval_progn(body, &mut child_env)
+}
+
+fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let (bindings_form, body) = cp(cdr);
+    let mut child_env = env.child();
+    for binding in list_to_vec(bindings_form) {
+        if !binding.is_cons() {
+            continue;
+        }
+        let (symbol, expansion_rest) = cp(binding);
+        if !symbol.is_symbol() {
+            continue;
+        }
+        let (expansion, _) = cp(expansion_rest);
+        child_env.define_symbol_macro(symbol, expansion);
+    }
+    eval_progn(body, &mut child_env)
 }
 
 // ── DEFCLASS ─────────────────────────────────────────────────────

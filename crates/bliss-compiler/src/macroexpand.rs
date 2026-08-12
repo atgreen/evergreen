@@ -4,7 +4,9 @@
 //! Implements the algorithm from spec §4.2 / A4.01.
 
 use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use bliss_rt::error::BlissError;
@@ -514,7 +516,7 @@ fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
 /// Returns `(expanded_form, expanded_p)`.
 ///
 /// If form has a SymbolMacro binding in env, invokes the macroexpand hook
-/// with (expansion_value, expansion_value, env) and returns (result, true).
+/// with (expansion_value, form, env) and returns (result, true).
 ///
 /// If form is a cons whose car is a symbol with a Macro function binding,
 /// invokes the macroexpand hook with (expander, form, env) and returns
@@ -528,7 +530,7 @@ pub fn macroexpand_1(form: BlissVal, env: &Environment) -> Result<(BlissVal, boo
     // 1. Check if form is a symbol with a symbol-macro binding
     if let Some(VariableInfo::SymbolMacro(expansion)) = env.variable_information(form) {
         let hook = get_macroexpand_hook();
-        let result = hook(expansion, expansion, env)?;
+        let result = hook(expansion, form, env)?;
         return Ok((result, true));
     }
 
@@ -578,7 +580,7 @@ pub fn macroexpand(form: BlissVal, env: &Environment) -> Result<(BlissVal, bool)
     let limit = get_macroexpand_limit();
 
     // Insert the original form to detect self-referential expansions
-    seen.insert(current.0);
+    seen.insert(structural_fingerprint(current, 8));
 
     loop {
         let (expanded, did_expand) = macroexpand_1(current, env)?;
@@ -597,7 +599,7 @@ pub fn macroexpand(form: BlissVal, env: &Environment) -> Result<(BlissVal, bool)
         }
 
         // Check for circular expansion (R4.16)
-        if !seen.insert(expanded.0) {
+        if !seen.insert(structural_fingerprint(expanded, 8)) {
             return Err(BlissError::Internal("circular macro expansion".into()));
         }
 
@@ -645,6 +647,25 @@ fn vec_to_cons(items: &[BlissVal]) -> BlissVal {
         result = alloc_cons(*item, result);
     }
     result
+}
+
+fn structural_fingerprint(form: BlissVal, depth: usize) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    fingerprint_into(form, depth, &mut hasher);
+    hasher.finish()
+}
+
+fn fingerprint_into(form: BlissVal, depth: usize, hasher: &mut DefaultHasher) {
+    if depth == 0 || !form.is_cons() {
+        form.0.hash(hasher);
+        return;
+    }
+
+    0xC0DEC0DEu64.hash(hasher);
+    let car = unsafe { cons_car(form) };
+    let cdr = unsafe { cons_cdr(form) };
+    fingerprint_into(car, depth - 1, hasher);
+    fingerprint_into(cdr, depth - 1, hasher);
 }
 
 /// Expand a list of forms, returning a new list.
@@ -1456,16 +1477,13 @@ fn expand_macrolet(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissE
     // Install macro definitions in a new environment frame
     let mut augmented_env = env.clone();
     let defs = cons_to_vec(macro_defs);
-    for def in &defs {
+    for (index, def) in defs.iter().enumerate() {
         if !def.is_cons() {
             continue;
         }
         let macro_name = unsafe { cons_car(*def) };
-        let _macro_rest = unsafe { cons_cdr(*def) };
-        // The expander is the macro definition itself — store the def as the expander.
-        // In a full implementation, parse-macro + enclose would compile this.
-        // For now, register as a Macro binding so macroexpand_1 can find it.
-        augmented_env = augmented_env.augment_function(macro_name, FunctionInfo::Macro(*def));
+        let key = make_local_macrolet_expander(*def, env.clone(), index as u64)?;
+        augmented_env = augmented_env.augment_function(macro_name, FunctionInfo::Macro(key));
     }
 
     // Expand body in augmented env
@@ -1588,3 +1606,250 @@ fn walk_cons(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> 
     Ok(alloc_cons(expanded_car, expanded_cdr))
 }
 type MacroFn = dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + Send + Sync;
+
+fn make_local_macrolet_expander(
+    def: BlissVal,
+    defining_env: Environment,
+    ordinal: u64,
+) -> Result<BlissVal, BlissError> {
+    let name = unsafe { cons_car(def) };
+    let rest = unsafe { cons_cdr(def) };
+    if !rest.is_cons() {
+        return Err(BlissError::Internal(
+            "MACROLET: malformed local macro definition".into(),
+        ));
+    }
+    let params = unsafe { cons_car(rest) };
+    let body = unsafe { cons_cdr(rest) };
+    let key = BlissVal::from_fixnum(-((ordinal as i64) + 1));
+    let func = Arc::new(move |whole_form: BlissVal, call_env: &Environment| {
+        expand_local_macro_call(whole_form, call_env, &defining_env, params, body)
+    });
+    register_macro_function(key, func);
+    let _ = name;
+    Ok(key)
+}
+
+fn expand_local_macro_call(
+    whole_form: BlissVal,
+    call_env: &Environment,
+    defining_env: &Environment,
+    params: BlissVal,
+    body: BlissVal,
+) -> Result<BlissVal, BlissError> {
+    let arg_forms = if whole_form.is_cons() {
+        unsafe { cons_cdr(whole_form) }
+    } else {
+        bliss_rt::value::NIL
+    };
+    let bindings = bind_macrolet_lambda_list(params, arg_forms)?;
+    let expansion_env = defining_env.augment_environment(bindings, Vec::new(), Vec::new());
+    eval_local_macro_body(body, &expansion_env, call_env)
+}
+
+fn bind_macrolet_lambda_list(
+    params: BlissVal,
+    args: BlissVal,
+) -> Result<Vec<(BlissVal, VariableInfo)>, BlissError> {
+    let params_vec = cons_to_vec(params);
+    let args_vec = cons_to_vec(args);
+    let mut bindings = Vec::new();
+    let mut arg_i = 0usize;
+    let mut rest_target: Option<BlissVal> = None;
+    let mut optional_mode = false;
+
+    let mut i = 0usize;
+    while i < params_vec.len() {
+        let param = params_vec[i];
+        if let Some(name) = get_symbol_name(param) {
+            match name.as_str() {
+                "&OPTIONAL" => {
+                    optional_mode = true;
+                    i += 1;
+                    continue;
+                }
+                "&REST" | "&BODY" => {
+                    if i + 1 >= params_vec.len() {
+                        return Err(BlissError::Internal(
+                            "MACROLET: &REST requires a parameter".into(),
+                        ));
+                    }
+                    rest_target = Some(params_vec[i + 1]);
+                    break;
+                }
+                _ if name.starts_with('&') => {
+                    return Err(BlissError::Internal(format!(
+                        "MACROLET: unsupported lambda-list keyword {}",
+                        name
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        let value = if arg_i < args_vec.len() {
+            let arg = args_vec[arg_i];
+            arg_i += 1;
+            arg
+        } else if optional_mode {
+            bliss_rt::value::NIL
+        } else {
+            return Err(BlissError::Internal(
+                "MACROLET: too few arguments for local macro".into(),
+            ));
+        };
+        bindings.push((param, VariableInfo::Constant(value)));
+        i += 1;
+    }
+
+    if let Some(rest) = rest_target {
+        bindings.push((
+            rest,
+            VariableInfo::Constant(vec_to_cons(&args_vec[arg_i..])),
+        ));
+    } else if arg_i != args_vec.len() {
+        return Err(BlissError::Internal(
+            "MACROLET: too many arguments for local macro".into(),
+        ));
+    }
+
+    Ok(bindings)
+}
+
+fn eval_local_macro_body(
+    body: BlissVal,
+    env: &Environment,
+    call_env: &Environment,
+) -> Result<BlissVal, BlissError> {
+    let forms = cons_to_vec(body);
+    let mut result = bliss_rt::value::NIL;
+    for form in forms {
+        result = eval_local_macro_form(form, env, call_env)?;
+    }
+    Ok(result)
+}
+
+fn eval_local_macro_form(
+    form: BlissVal,
+    env: &Environment,
+    call_env: &Environment,
+) -> Result<BlissVal, BlissError> {
+    if form.is_symbol() {
+        if let Some(info) = env.variable_information(form) {
+            return match info {
+                VariableInfo::Constant(v) | VariableInfo::SymbolMacro(v) => Ok(v),
+                VariableInfo::Lexical | VariableInfo::Special => Ok(form),
+            };
+        }
+        return Ok(form);
+    }
+    if !form.is_cons() {
+        return Ok(form);
+    }
+
+    let operator = unsafe { cons_car(form) };
+    let args = unsafe { cons_cdr(form) };
+    let op_name = get_symbol_name(operator).unwrap_or_default();
+    match op_name.as_str() {
+        "QUOTE" => Ok(if args.is_cons() {
+            unsafe { cons_car(args) }
+        } else {
+            bliss_rt::value::NIL
+        }),
+        "LIST" => {
+            let mut out = Vec::new();
+            for item in cons_to_vec(args) {
+                out.push(eval_local_macro_form(item, env, call_env)?);
+            }
+            Ok(vec_to_cons(&out))
+        }
+        "CONS" => {
+            let items = cons_to_vec(args);
+            if items.len() != 2 {
+                return Err(BlissError::Internal("MACROLET: CONS expects 2 args".into()));
+            }
+            Ok(alloc_cons(
+                eval_local_macro_form(items[0], env, call_env)?,
+                eval_local_macro_form(items[1], env, call_env)?,
+            ))
+        }
+        "APPEND" => eval_local_macro_append(args, env, call_env),
+        "PROGN" => eval_local_macro_body(args, env, call_env),
+        "BLISS::QUASIQUOTE" => expand_local_quasiquote(
+            if args.is_cons() {
+                unsafe { cons_car(args) }
+            } else {
+                bliss_rt::value::NIL
+            },
+            env,
+            call_env,
+        ),
+        _ => {
+            let (expanded, did_expand) = macroexpand_1(form, call_env)?;
+            if did_expand {
+                eval_local_macro_form(expanded, env, call_env)
+            } else {
+                Ok(form)
+            }
+        }
+    }
+}
+
+fn eval_local_macro_append(
+    args: BlissVal,
+    env: &Environment,
+    call_env: &Environment,
+) -> Result<BlissVal, BlissError> {
+    let mut result = bliss_rt::value::NIL;
+    let parts = cons_to_vec(args);
+    for part in parts.into_iter().rev() {
+        let mut items = cons_to_vec(eval_local_macro_form(part, env, call_env)?);
+        while let Some(item) = items.pop() {
+            result = alloc_cons(item, result);
+        }
+    }
+    Ok(result)
+}
+
+fn expand_local_quasiquote(
+    form: BlissVal,
+    env: &Environment,
+    call_env: &Environment,
+) -> Result<BlissVal, BlissError> {
+    if !form.is_cons() {
+        return Ok(form);
+    }
+
+    let operator = unsafe { cons_car(form) };
+    if is_symbol_named(operator, "BLISS::UNQUOTE") {
+        let args = unsafe { cons_cdr(form) };
+        return Ok(if args.is_cons() {
+            eval_local_macro_form(unsafe { cons_car(args) }, env, call_env)?
+        } else {
+            bliss_rt::value::NIL
+        });
+    }
+
+    let mut out = Vec::new();
+    let mut cursor = form;
+    while cursor.is_cons() {
+        let item = unsafe { cons_car(cursor) };
+        if item.is_cons() && is_symbol_named(unsafe { cons_car(item) }, "BLISS::UNQUOTE-SPLICING") {
+            let splice_args = unsafe { cons_cdr(item) };
+            let splice_form = if splice_args.is_cons() {
+                unsafe { cons_car(splice_args) }
+            } else {
+                bliss_rt::value::NIL
+            };
+            out.extend(cons_to_vec(eval_local_macro_form(
+                splice_form,
+                env,
+                call_env,
+            )?));
+        } else {
+            out.push(expand_local_quasiquote(item, env, call_env)?);
+        }
+        cursor = unsafe { cons_cdr(cursor) };
+    }
+    Ok(vec_to_cons(&out))
+}

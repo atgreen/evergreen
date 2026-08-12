@@ -41,21 +41,21 @@
   `(progn ,first (prog1 ,second ,@body)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Stack / place mutation (symbol places only, for now)
+;;; Stack / place mutation
 ;;; ---------------------------------------------------------------------------
 
 (defmacro push (item place)
-  `(setq ,place (cons ,item ,place)))
+  `(setf ,place (cons ,item ,place)))
 
 (defmacro pop (place)
   `(prog1 (car ,place)
-     (setq ,place (cdr ,place))))
+     (setf ,place (cdr ,place))))
 
 (defmacro incf (place &rest delta)
-  `(setq ,place (+ ,place ,(if delta (car delta) 1))))
+  `(setf ,place (+ ,place ,(if delta (car delta) 1))))
 
 (defmacro decf (place &rest delta)
-  `(setq ,place (- ,place ,(if delta (car delta) 1))))
+  `(setf ,place (- ,place ,(if delta (car delta) 1))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Declarations, type aliases, and condition definitions used by the shipped
