@@ -562,6 +562,7 @@ fn take_control_value(token: &str) -> BlissVal {
 
 impl Env {
     fn new(sandbox: bool) -> Self {
+        let _ = bliss_stdlib::bootstrap_clos();
         let mut packages = HashMap::new();
         seed_standard_packages(&mut packages);
         let mut env = Env {
@@ -582,10 +583,11 @@ impl Env {
         };
         env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
         env.define_local("*LOAD-HOOKS*", NIL);
-        env.define_local("*FEATURES*", NIL);
+        env.define_local("*FEATURES*", vec_to_list(&[resolve_sym(":BLISS").unwrap_or(NIL)]));
         env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
         env.define_local("*TYPE-DEFINITIONS*", NIL);
         env.define_local("*CONDITION-TYPES*", NIL);
+        env.define_local("*CONDITION-DEFINITIONS*", NIL);
         env
     }
 
@@ -801,6 +803,47 @@ fn format_val(val: BlissVal) -> String {
     s
 }
 
+fn simple_format_message(control: &str, args: &[BlissVal]) -> String {
+    let mut rendered = String::new();
+    let mut chars = control.chars().peekable();
+    let mut arg_index = 0usize;
+    while let Some(ch) = chars.next() {
+        if ch == '~' {
+            if let Some(directive) = chars.next() {
+                match directive {
+                    'A' | 'a' => {
+                        if let Some(arg) = args.get(arg_index) {
+                            let mut out = String::new();
+                            princ_val(*arg, &mut out);
+                            rendered.push_str(&out);
+                            arg_index += 1;
+                            continue;
+                        }
+                    }
+                    'S' | 's' => {
+                        if let Some(arg) = args.get(arg_index) {
+                            rendered.push_str(&format_val(*arg));
+                            arg_index += 1;
+                            continue;
+                        }
+                    }
+                    '~' => {
+                        rendered.push('~');
+                        continue;
+                    }
+                    _ => {
+                        rendered.push('~');
+                        rendered.push(directive);
+                        continue;
+                    }
+                }
+            }
+        }
+        rendered.push(ch);
+    }
+    rendered
+}
+
 fn princ_val(val: BlissVal, out: &mut String) {
     if val.is_heap_object() {
         unsafe {
@@ -948,6 +991,7 @@ fn eval_quasiquote(template: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
 // ── Closure ID generation ────────────────────────────────────────
 thread_local! {
     static NEXT_CLOSURE_ID: RefCell<u64> = const { RefCell::new(1) };
+    static NEXT_STDLIB_CLASS_ID: RefCell<i64> = const { RefCell::new(300_000) };
 }
 
 fn next_closure_id() -> u64 {
@@ -955,6 +999,14 @@ fn next_closure_id() -> u64 {
         let v = *c.borrow();
         *c.borrow_mut() = v + 1;
         v
+    })
+}
+
+fn next_stdlib_class_id() -> BlissVal {
+    NEXT_STDLIB_CLASS_ID.with(|c| {
+        let v = *c.borrow();
+        *c.borrow_mut() = v + 1;
+        BlissVal::from_fixnum(v)
     })
 }
 
@@ -1170,16 +1222,6 @@ fn ensure_package_available(env: &mut Env, name: &str, uses: &[&str]) {
     reader::register_package(name);
 }
 
-fn ensure_bundled_asdf_bootstrap_bindings(env: &mut Env) {
-    ensure_package_available(env, "BLISS-EXT", &["COMMON-LISP"]);
-    ensure_package_available(env, "ASDF", &["COMMON-LISP", "BLISS-EXT"]);
-    env.define_local(
-        "BLISS-EXT:*ASDF-OUTPUT-TRANSLATIONS*",
-        arena_str(&default_asdf_output_translations()),
-    );
-    env.define_local("ASDF:*LAST-OPERATION-TIER*", arena_str("T1"));
-}
-
 fn plist_get(list: BlissVal, key: &str) -> Option<BlissVal> {
     let mut cur = list;
     while cur.is_cons() {
@@ -1188,6 +1230,21 @@ fn plist_get(list: BlissVal, key: &str) -> Option<BlissVal> {
             let (entry_key, entry_vals) = cp(entry);
             if symbol_bare_name(&val_as_str(entry_key)) == key {
                 return Some(cp(entry_vals).0);
+            }
+        }
+        cur = rest;
+    }
+    None
+}
+
+fn plist_entry(list: BlissVal, key: &str) -> Option<BlissVal> {
+    let mut cur = list;
+    while cur.is_cons() {
+        let (entry, rest) = cp(cur);
+        if entry.is_cons() {
+            let (entry_key, _) = cp(entry);
+            if symbol_bare_name(&val_as_str(entry_key)) == key {
+                return Some(entry);
             }
         }
         cur = rest;
@@ -1205,6 +1262,171 @@ fn resolve_type_spec(env: &Env, type_spec: BlissVal) -> BlissVal {
         }
     }
     type_spec
+}
+
+fn condition_definition_entry(env: &Env, type_name: &str) -> Option<BlissVal> {
+    plist_entry(
+        env.lookup_var("*CONDITION-DEFINITIONS*").unwrap_or(NIL),
+        &symbol_bare_name(type_name),
+    )
+}
+
+fn builtin_condition_definition(type_name: &str) -> Option<(Vec<String>, Vec<(String, String)>)> {
+    match symbol_bare_name(type_name).as_str() {
+        "CONDITION" => Some((vec![], vec![])),
+        "SERIOUS-CONDITION" => Some((vec!["CONDITION".into()], vec![])),
+        "ERROR" => Some((vec!["SERIOUS-CONDITION".into()], vec![])),
+        "WARNING" => Some((vec!["CONDITION".into()], vec![])),
+        "SIMPLE-CONDITION" => Some((
+            vec!["CONDITION".into()],
+            vec![
+                ("FORMAT-CONTROL".into(), "FORMAT-CONTROL".into()),
+                ("FORMAT-ARGUMENTS".into(), "FORMAT-ARGUMENTS".into()),
+            ],
+        )),
+        "SIMPLE-ERROR" => Some((
+            vec!["ERROR".into(), "SIMPLE-CONDITION".into()],
+            vec![],
+        )),
+        "SIMPLE-WARNING" => Some((
+            vec!["WARNING".into(), "SIMPLE-CONDITION".into()],
+            vec![],
+        )),
+        "TYPE-ERROR" => Some((
+            vec!["ERROR".into()],
+            vec![
+                ("DATUM".into(), "DATUM".into()),
+                ("EXPECTED-TYPE".into(), "EXPECTED-TYPE".into()),
+            ],
+        )),
+        "CONTROL-ERROR" => Some((vec!["ERROR".into()], vec![])),
+        _ => None,
+    }
+}
+
+fn condition_slot_specs(env: &Env, type_name: &str) -> Vec<(String, String)> {
+    let mut specs = Vec::new();
+    let type_name = symbol_bare_name(type_name);
+    if let Some((parents, own_slots)) = builtin_condition_definition(&type_name) {
+        for parent in parents {
+            specs.extend(condition_slot_specs(env, &parent));
+        }
+        specs.extend(own_slots);
+        return specs;
+    }
+
+    if let Some(entry) = condition_definition_entry(env, &type_name) {
+        let (_, rest) = cp(entry);
+        let (parents_form, rest2) = cp(rest);
+        let (slots_form, _) = cp(rest2);
+        for parent in list_to_vec(parents_form) {
+            specs.extend(condition_slot_specs(env, &sym_name(parent)));
+        }
+        for slot in list_to_vec(slots_form) {
+            if slot.is_symbol() {
+                let name = symbol_bare_name(&sym_name(slot));
+                specs.push((name.clone(), name));
+                continue;
+            }
+            if slot.is_cons() {
+                let (slot_name_form, opts_form) = cp(slot);
+                let slot_name = symbol_bare_name(&sym_name(slot_name_form));
+                let mut initarg = slot_name.clone();
+                let opts = list_to_vec(opts_form);
+                let mut i = 0;
+                while i + 1 < opts.len() {
+                    let opt_name = symbol_bare_name(&sym_name(opts[i]));
+                    if opt_name == "INITARG" {
+                        initarg = symbol_bare_name(&sym_name(opts[i + 1]));
+                    }
+                    i += 2;
+                }
+                specs.push((slot_name, initarg));
+            }
+        }
+    }
+
+    specs
+}
+
+fn condition_default_initargs(env: &Env, type_name: &str) -> Vec<(String, BlissVal)> {
+    let mut defaults = Vec::new();
+    let type_name = symbol_bare_name(type_name);
+    if let Some(entry) = condition_definition_entry(env, &type_name) {
+        let (_, rest) = cp(entry);
+        let (parents_form, rest2) = cp(rest);
+        let (_, rest3) = cp(rest2);
+        let (options_form, _) = cp(rest3);
+        for parent in list_to_vec(parents_form) {
+            defaults.extend(condition_default_initargs(env, &sym_name(parent)));
+        }
+        for option in list_to_vec(options_form) {
+            if !option.is_cons() {
+                continue;
+            }
+            let (name_form, values_form) = cp(option);
+            if symbol_bare_name(&sym_name(name_form)) != "DEFAULT-INITARGS" {
+                continue;
+            }
+            let values = list_to_vec(values_form);
+            let mut i = 0;
+            while i + 1 < values.len() {
+                defaults.push((symbol_bare_name(&sym_name(values[i])), values[i + 1]));
+                i += 2;
+            }
+        }
+    }
+    defaults
+}
+
+fn ensure_condition_class_registered(env: &Env, type_name: &str) -> Result<BlissVal, BlissError> {
+    let type_sym = resolve_sym(&symbol_bare_name(type_name)).unwrap_or(NIL);
+    if let Some(class) = bliss_stdlib::find_class(type_sym) {
+        return Ok(class);
+    }
+
+    let mut parent_names = Vec::new();
+    if let Some((builtin_parents, _)) = builtin_condition_definition(type_name) {
+        parent_names.extend(builtin_parents);
+    } else if let Some(entry) = condition_definition_entry(env, type_name) {
+        let (_, rest) = cp(entry);
+        let (parents_form, _) = cp(rest);
+        for parent in list_to_vec(parents_form) {
+            parent_names.push(symbol_bare_name(&sym_name(parent)));
+        }
+    } else {
+        parent_names.push("CONDITION".into());
+    }
+
+    let mut supers = Vec::new();
+    for parent in parent_names {
+        supers.push(ensure_condition_class_registered(env, &parent)?);
+    }
+
+    let slot_names: Vec<BlissVal> = condition_slot_specs(env, type_name)
+        .into_iter()
+        .map(|(slot_name, _)| resolve_sym(&slot_name).unwrap_or(NIL))
+        .collect();
+    let class = next_stdlib_class_id();
+    bliss_stdlib::define_class(type_sym, class, &supers, &slot_names)?;
+    Ok(class)
+}
+
+fn condition_type_hierarchy_names(cond: BlissVal) -> Option<Vec<String>> {
+    let class = bliss_stdlib::class_of(cond);
+    let cpl = bliss_stdlib::compute_class_precedence_list(class).ok()?;
+    let mut names = Vec::new();
+    for class in cpl {
+        let name = bliss_stdlib::class_name(class);
+        if name.is_symbol() {
+            names.push(symbol_bare_name(&sym_name(name)));
+        }
+    }
+    if names.iter().any(|name| name == "CONDITION") {
+        Some(names)
+    } else {
+        None
+    }
 }
 
 fn condition_supertypes(env: &Env, type_name: &str) -> Vec<String> {
@@ -1230,6 +1452,152 @@ fn condition_type_matches(env: &Env, signaled_type: &str, handler_type: &str) ->
         || condition_supertypes(env, &signaled)
             .iter()
             .any(|sup| sup == &handler)
+}
+
+fn condition_matches_handler(env: &Env, condition: BlissVal, handler_type: &str) -> bool {
+    let handler = symbol_bare_name(handler_type);
+    if handler == "T" {
+        return true;
+    }
+    if let Some(hierarchy) = condition_type_hierarchy_names(condition) {
+        return hierarchy.iter().any(|name| name == &handler);
+    }
+    let signaled_type = if condition.is_symbol() {
+        sym_name(condition)
+    } else {
+        val_as_str(condition)
+    };
+    condition_type_matches(env, &signaled_type, handler_type)
+}
+
+fn is_package_value(env: &Env, value: BlissVal) -> bool {
+    if !value.is_string() {
+        return false;
+    }
+    let pkg_name = normalize_package_name(&val_as_str(value));
+    env.packages.contains_key(&pkg_name)
+        || matches!(
+            pkg_name.as_str(),
+            "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD" | "BLISS-EXT"
+        )
+}
+
+fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result<bool, BlissError> {
+    let type_spec = resolve_type_spec(env, type_spec);
+    if type_spec.is_symbol() {
+        let type_name = symbol_bare_name(&sym_name(type_spec));
+        let matches = match type_name.as_str() {
+            "T" => true,
+            "NIL" | "NULL" => object.is_nil(),
+            "ATOM" => !object.is_cons(),
+            "LIST" => object.is_list(),
+            "CONS" => object.is_cons(),
+            "SYMBOL" => object.is_symbol(),
+            "STRING" | "SIMPLE-STRING" | "BASE-STRING" => object.is_string(),
+            "NUMBER" | "REAL" => object.is_fixnum() || object.is_single_float(),
+            "INTEGER" | "FIXNUM" => object.is_fixnum(),
+            "FLOAT" | "SINGLE-FLOAT" => object.is_single_float(),
+            "CHARACTER" => object.is_character(),
+            "BOOLEAN" => object.is_nil() || object == T,
+            "FUNCTION" => object.is_symbol() || object.is_cons(),
+            "PACKAGE" => is_package_value(env, object),
+            "HASH-TABLE" => bliss_stdlib::hash_table_count(object).is_ok(),
+            "PATHNAME" => bliss_stdlib::namestring(object).is_ok(),
+            "STREAM" | "FILE-STREAM" | "SYNONYM-STREAM" => is_stream(object),
+            other => {
+                if let Some(hierarchy) = condition_type_hierarchy_names(object) {
+                    hierarchy.iter().any(|name| name == other)
+                } else {
+                    other == symbol_bare_name(&val_as_str(object))
+                }
+            }
+        };
+        return Ok(matches);
+    }
+
+    if !type_spec.is_cons() {
+        return Ok(object == type_spec);
+    }
+
+    let (head, args) = cp(type_spec);
+    let op = symbol_bare_name(&sym_name(head));
+    match op.as_str() {
+        "OR" => {
+            for spec in list_to_vec(args) {
+                if typep_matches(env, object, spec)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        "AND" => {
+            for spec in list_to_vec(args) {
+                if !typep_matches(env, object, spec)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        "MEMBER" => Ok(list_to_vec(args)
+            .into_iter()
+            .any(|candidate| vals_equal(object, candidate))),
+        "EQL" => {
+            let (value, _) = cp(args);
+            Ok(object == value)
+        }
+        "INTEGER" => {
+            if !object.is_fixnum() {
+                return Ok(false);
+            }
+            let bounds = list_to_vec(args);
+            let value = object.as_fixnum();
+            let lower_ok = bounds
+                .first()
+                .copied()
+                .map(|bound| {
+                    if bound.is_symbol() && symbol_bare_name(&sym_name(bound)) == "*" {
+                        true
+                    } else {
+                        value >= bound.as_fixnum()
+                    }
+                })
+                .unwrap_or(true);
+            let upper_ok = bounds
+                .get(1)
+                .copied()
+                .map(|bound| {
+                    if bound.is_symbol() && symbol_bare_name(&sym_name(bound)) == "*" {
+                        true
+                    } else {
+                        value <= bound.as_fixnum()
+                    }
+                })
+                .unwrap_or(true);
+            Ok(lower_ok && upper_ok)
+        }
+        "SATISFIES" => {
+            let (predicate, _) = cp(args);
+            let predicate_name = sym_name(predicate);
+            if predicate_name == "FIND-PACKAGE" {
+                let designator = if object.is_character() || object.is_string() || object.is_symbol()
+                {
+                    val_as_str(object)
+                } else {
+                    return Ok(false);
+                };
+                let pkg_name = normalize_package_name(&designator);
+                return Ok(
+                    env.packages.contains_key(&pkg_name)
+                        || matches!(
+                            pkg_name.as_str(),
+                            "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD" | "BLISS-EXT"
+                        ),
+                );
+            }
+            Ok(!apply_function(predicate, &[object], env)?.is_nil())
+        }
+        _ => Ok(false),
+    }
 }
 
 fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Vec<BlissVal> {
@@ -1272,19 +1640,7 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
 fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
-    let is_bundled_asdf = Path::new(path) == Path::new(&bundled_asdf_path());
-    if is_bundled_asdf {
-        ensure_bundled_asdf_bootstrap_bindings(env);
-    }
-    match read_eval_all_env(&contents, env) {
-        Ok(result) => Ok(result),
-        Err(BlissError::Internal(msg))
-            if is_bundled_asdf && msg.contains("ASDF is not supported on your implementation") =>
-        {
-            Ok(T)
-        }
-        Err(err) => Err(err),
-    }
+    read_eval_all_env(&contents, env)
 }
 
 fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -1294,7 +1650,16 @@ fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
         .trim_matches('"')
         .to_uppercase();
     if normalized == "ASDF" {
-        return load_path_into_env(&bundled_asdf_path(), env);
+        load_path_into_env(&bundled_asdf_path(), env)?;
+        return Ok(T);
+    }
+
+    let providers = list_to_vec(env.lookup_var("*MODULE-PROVIDER-FUNCTIONS*").unwrap_or(NIL));
+    for provider in providers {
+        let provided = apply_function(provider, &[arena_str(&normalized)], env)?;
+        if !provided.is_nil() {
+            return Ok(provided);
+        }
     }
 
     let candidate = format!("{}.lisp", normalized.to_ascii_lowercase());
@@ -1633,29 +1998,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (type_form, _) = cp(r);
                 let obj = eval_form(obj_form, env)?;
                 let raw_type_spec = eval_form(type_form, env)?;
-                let type_spec = resolve_type_spec(env, raw_type_spec);
-                let type_name = if type_spec.is_symbol() {
-                    symbol_bare_name(&sym_name(type_spec))
-                } else if type_spec.is_cons() {
-                    symbol_bare_name(&val_as_str(cp(type_spec).0))
-                } else {
-                    val_as_str(type_spec).to_uppercase()
-                };
-                let matches = match type_name.as_str() {
-                    "T" => true,
-                    "NIL" => obj.is_nil(),
-                    "ATOM" => !obj.is_cons(),
-                    "LIST" => obj.is_list(),
-                    "CONS" => obj.is_cons(),
-                    "SYMBOL" => obj.is_symbol(),
-                    "STRING" | "SIMPLE-STRING" | "BASE-STRING" => obj.is_string(),
-                    "NUMBER" => obj.is_fixnum() || obj.is_single_float(),
-                    "INTEGER" | "FIXNUM" => obj.is_fixnum(),
-                    "FLOAT" | "SINGLE-FLOAT" => obj.is_single_float(),
-                    "CHARACTER" => obj.is_character(),
-                    "CONDITION" | "ERROR" => obj.is_cons(),
-                    other => other == symbol_bare_name(&val_as_str(obj)),
-                };
+                let matches = typep_matches(env, obj, raw_type_spec)?;
                 return Ok(if matches { T } else { NIL });
             }
             "EQ" | "EQL" => {
@@ -1786,9 +2129,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "FORMAT" => return eval_format(cdr, env),
             "ERROR" => {
-                let (mf, _) = cp(cdr);
-                let m = eval_form(mf, env)?;
-                return Err(BlissError::Internal(format!("ERROR: {}", val_as_str(m))));
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal("ERROR".into()));
+                }
+                let control = eval_form(args[0], env)?;
+                let mut format_args = Vec::new();
+                for arg in &args[1..] {
+                    format_args.push(eval_form(*arg, env)?);
+                }
+                let message = if control.is_string() && !format_args.is_empty() {
+                    simple_format_message(&val_as_str(control), &format_args)
+                } else {
+                    val_as_str(control)
+                };
+                return Err(BlissError::Internal(format!("ERROR: {}", message)));
             }
             "LET" => return eval_let(cdr, env, false),
             "LET*" => return eval_let(cdr, env, true),
@@ -2383,19 +2738,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Err(BlissError::Internal("SIGNAL requires an argument".into()));
                 }
                 let cond = eval_form(args[0], env)?;
-                // Determine condition type name
-                let cond_type = if cond.is_cons() {
-                    // Condition object: (TYPE-NAME (slot . val) ...)
-                    let (type_val, _) = cp(cond);
-                    val_as_str(type_val)
-                } else if cond.is_symbol() {
-                    sym_name(cond)
-                } else {
-                    val_as_str(cond)
-                };
-                // Signal runs handlers; if no handler catches, returns NIL
                 for handler in env.handlers.clone().iter().rev() {
-                    if condition_type_matches(env, &cond_type, &handler.type_name) {
+                    if condition_matches_handler(env, cond, &handler.type_name) {
                         let hfn = handler.handler;
                         let _ = apply_function(hfn, &[cond], env);
                     }
@@ -2403,7 +2747,6 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(NIL);
             }
             "MAKE-CONDITION" => {
-                // (make-condition 'type :slot1 val1 :slot2 val2 ...)
                 let args = list_to_vec(cdr);
                 if args.is_empty() {
                     return Err(BlissError::Internal(
@@ -2411,20 +2754,43 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     ));
                 }
                 let type_val = eval_form(args[0], env)?;
-                let type_name = val_as_str(type_val);
-                // Build condition object as (TYPE-NAME (slot . val) ...)
-                let mut slot_pairs = Vec::new();
+                let type_name = if type_val.is_symbol() {
+                    sym_name(type_val)
+                } else {
+                    val_as_str(type_val)
+                };
+                let class = ensure_condition_class_registered(env, &type_name)?;
+                let slot_specs = condition_slot_specs(env, &type_name);
+                let mut initargs = Vec::new();
+                let mut seen_initargs = Vec::new();
                 let mut i = 1;
                 while i + 1 < args.len() {
                     let key = eval_form(args[i], env)?;
                     let val = eval_form(args[i + 1], env)?;
-                    slot_pairs.push(arena_cons(key, val));
+                    let key_name = symbol_bare_name(&sym_name(key));
+                    let slot_name = slot_specs
+                        .iter()
+                        .find(|(_, initarg)| initarg == &key_name)
+                        .map(|(slot_name, _)| slot_name.clone())
+                        .unwrap_or_else(|| key_name.clone());
+                    seen_initargs.push(key_name);
+                    initargs.push(resolve_sym(&slot_name).unwrap_or(NIL));
+                    initargs.push(val);
                     i += 2;
                 }
-                let type_name_val = arena_str(&type_name);
-                let mut result = vec_to_list(&slot_pairs);
-                result = arena_cons(type_name_val, result);
-                return Ok(result);
+                for (initarg_name, default_value) in condition_default_initargs(env, &type_name) {
+                    if seen_initargs.iter().any(|seen| seen == &initarg_name) {
+                        continue;
+                    }
+                    if let Some((slot_name, _)) = slot_specs
+                        .iter()
+                        .find(|(_, initarg)| initarg == &initarg_name)
+                    {
+                        initargs.push(resolve_sym(slot_name).unwrap_or(NIL));
+                        initargs.push(default_value);
+                    }
+                }
+                return bliss_stdlib::make_instance(class, &initargs);
             }
             "CERROR" => return eval_cerror(cdr, env),
             "INVOKE-RESTART" => {
@@ -2468,6 +2834,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let module_val = eval_form(module_form, env)?;
                 env.define_local("*LAST-PROVIDED-MODULE*", module_val);
                 return Ok(module_val);
+            }
+            "BLISS-EXT:GETENV" => {
+                let (name_form, _) = cp(cdr);
+                let name = val_as_str(eval_form(name_form, env)?);
+                return Ok(std::env::var(&name)
+                    .ok()
+                    .map(|value| arena_str(&value))
+                    .unwrap_or(NIL));
             }
             "READ-LINE" => {
                 let args = list_to_vec(cdr);
@@ -2767,7 +3141,57 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(T);
             }
-            "UNEXPORT" | "SHADOW" | "UNINTERN" => return Ok(T),
+            "UNEXPORT" => return Ok(T),
+            "SHADOW" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(T);
+                }
+                let names_val = eval_form(args[0], env)?;
+                let pkg_name = if args.len() > 1 {
+                    normalize_package_name(&val_as_str(eval_form(args[1], env)?))
+                } else {
+                    env.current_package.clone()
+                };
+                ensure_package_available(env, &pkg_name, &[]);
+                let mut names = Vec::new();
+                if names_val.is_cons() {
+                    for name in list_to_vec(names_val) {
+                        names.push(symbol_bare_name(&val_as_str(name)));
+                    }
+                } else {
+                    names.push(symbol_bare_name(&val_as_str(names_val)));
+                }
+                for name in names {
+                    intern_into_package(env, &pkg_name, &name);
+                }
+                return Ok(T);
+            }
+            "UNINTERN" => {
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(NIL);
+                }
+                let symbol = eval_form(args[0], env)?;
+                let pkg_name = if args.len() > 1 {
+                    normalize_package_name(&val_as_str(eval_form(args[1], env)?))
+                } else {
+                    env.current_package.clone()
+                };
+                let name = symbol_bare_name(&val_as_str(symbol));
+                let Some(package) = Rc::make_mut(&mut env.packages).get_mut(&pkg_name) else {
+                    return Ok(NIL);
+                };
+                let removed_symbol = package.symbols.remove(&name).is_some();
+                let removed_export = if let Some(pos) = package.exports.iter().position(|n| n == &name)
+                {
+                    package.exports.remove(pos);
+                    true
+                } else {
+                    false
+                };
+                return Ok(if removed_symbol || removed_export { T } else { NIL });
+            }
             "SYMBOL-PACKAGE" => {
                 let args = list_to_vec(cdr);
                 if args.is_empty() {

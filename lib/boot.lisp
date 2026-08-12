@@ -58,14 +58,8 @@
   `(setq ,place (- ,place ,(if delta (car delta) 1))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Bootstrap stubs for declaring / type / condition forms
-;;;
-;;; These are LENIENT no-ops: they let a file load past forms the bootstrap
-;;; evaluator does not yet model, without giving them real semantics. That is
-;;; sufficient because the forms below either carry no runtime obligation
-;;; (declaim, deftype used only for declaration) or their effect is only
-;;; needed when a defining form's body actually runs. Replace with conforming
-;;; implementations as the type and condition systems come online.
+;;; Declarations, type aliases, and condition definitions used by the shipped
+;;; bootstrap evaluator.
 ;;; ---------------------------------------------------------------------------
 
 ;; declaim: declarations have no bearing on the tree-walking interpreter.
@@ -78,32 +72,36 @@
   (declare (ignore lambda-list))
   `(progn
      (setq *type-definitions*
-           (cons (cons ',name ',(if body (car body) t))
+           (cons (list ',name ',(if body (car body) t))
                  *type-definitions*))
      ',name))
 
-;; Track condition supertypes so SIGNAL/HANDLER-BIND can do real type matching.
+;; Track condition definitions so MAKE-CONDITION/SIGNAL can create and match
+;; real condition instances through the evaluator.
 (defvar *condition-types* nil)
+(defvar *condition-definitions* nil)
 
 (defmacro define-condition (name parents slots &rest options)
-  (declare (ignore slots options))
   `(progn
      (setq *condition-types*
-           (cons (cons ',name ',(if parents parents '(condition)))
+           (cons (list ',name ',(if parents parents '(condition)))
                  *condition-types*))
+     (setq *condition-definitions*
+           (cons (list ',name ',(if parents parents '(condition)) ',slots ',options)
+                 *condition-definitions*))
      ',name))
 
 (defmacro check-type (place typespec &rest ignore)
   (declare (ignore ignore))
   `(if (typep ,place ',typespec)
        ,place
-       (error "CHECK-TYPE failed")))
+       (error (format nil "CHECK-TYPE failed: ~S is not of type ~S" ,place ',typespec))))
 
 (defmacro assert (test-form &rest ignore)
   (declare (ignore ignore))
   `(if ,test-form
        t
-       (error "ASSERT failed")))
+       (error (format nil "ASSERT failed: ~S" ',test-form))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Sequence / list helpers (Common Lisp, now that lambda lists bind properly)
