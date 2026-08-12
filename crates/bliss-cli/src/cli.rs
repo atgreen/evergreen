@@ -5480,6 +5480,10 @@ fn bind_lambda_list(
     let mut mode = Mode::Req;
     let mut arg_i = 0usize;
     let mut key_start: Option<usize> = None;
+    let mut rest_bound = false;
+    let mut saw_key = false;
+    let mut allow_other_keys = false;
+    let mut key_specs: Vec<(String, String, BlissVal, Option<String>)> = Vec::new();
 
     let mut c = params_form;
     while c.is_cons() {
@@ -5497,6 +5501,7 @@ fn bind_lambda_list(
                 }
                 "&KEY" => {
                     mode = Mode::Key;
+                    saw_key = true;
                     key_start.get_or_insert(arg_i);
                     continue;
                 }
@@ -5504,13 +5509,21 @@ fn bind_lambda_list(
                     mode = Mode::Aux;
                     continue;
                 }
-                "&ALLOW-OTHER-KEYS" => continue,
+                "&ALLOW-OTHER-KEYS" => {
+                    allow_other_keys = true;
+                    continue;
+                }
                 _ => {}
             }
         }
         match mode {
             Mode::Req => {
-                let v = args.get(arg_i).copied().unwrap_or(NIL);
+                let v = args.get(arg_i).copied().ok_or_else(|| {
+                    BlissError::Internal(format!(
+                        "too few arguments for lambda list: missing value for {}",
+                        sym_name(elem)
+                    ))
+                })?;
                 arg_i += 1;
                 env.define_local(&sym_name(elem), v);
             }
@@ -5535,30 +5548,19 @@ fn bind_lambda_list(
                 }
             }
             Mode::Rest => {
+                if rest_bound {
+                    return Err(BlissError::Internal(
+                        "malformed lambda list: multiple &rest/&body variables".into(),
+                    ));
+                }
                 let remaining = args.get(arg_i..).unwrap_or(&[]);
                 env.define_local(&sym_name(elem), vec_to_list(remaining));
                 key_start.get_or_insert(arg_i);
+                rest_bound = true;
             }
             Mode::Key => {
                 let (kw_bare, var, default_form, supp) = parse_key_spec(elem);
-                let start = key_start.unwrap_or(arg_i);
-                let tail = args.get(start..).unwrap_or(&[]);
-                if let Some(v) = find_key_arg(tail, &kw_bare) {
-                    env.define_local(&var, v);
-                    if let Some(sp) = supp {
-                        env.define_local(&sp, T);
-                    }
-                } else {
-                    let dv = if default_form == NIL {
-                        NIL
-                    } else {
-                        eval_form(default_form, env)?
-                    };
-                    env.define_local(&var, dv);
-                    if let Some(sp) = supp {
-                        env.define_local(&sp, NIL);
-                    }
-                }
+                key_specs.push((kw_bare, var, default_form, supp));
             }
             Mode::Aux => {
                 let (var, default_form, _) = parse_var_spec(elem);
@@ -5571,6 +5573,72 @@ fn bind_lambda_list(
             }
         }
     }
+
+    if saw_key {
+        let start = key_start.unwrap_or(arg_i);
+        let tail = args.get(start..).unwrap_or(&[]);
+        if tail.len() % 2 != 0 {
+            return Err(BlissError::Internal(
+                "keyword arguments must appear in key/value pairs".into(),
+            ));
+        }
+
+        let mut call_allows_other_keys = false;
+        for pair in tail.chunks(2) {
+            let key = pair[0];
+            if !key.is_symbol() {
+                return Err(BlissError::TypeError {
+                    datum: key,
+                    expected: "keyword".into(),
+                });
+            }
+            let bare = key_bare(key);
+            if bare == "ALLOW-OTHER-KEYS" && !pair[1].is_nil() {
+                call_allows_other_keys = true;
+            }
+        }
+
+        for (kw_bare, var, default_form, supp) in &key_specs {
+            if let Some(v) = find_key_arg(tail, kw_bare) {
+                env.define_local(var, v);
+                if let Some(sp) = supp {
+                    env.define_local(sp, T);
+                }
+            } else {
+                let dv = if *default_form == NIL {
+                    NIL
+                } else {
+                    eval_form(*default_form, env)?
+                };
+                env.define_local(var, dv);
+                if let Some(sp) = supp {
+                    env.define_local(sp, NIL);
+                }
+            }
+        }
+
+        if !(allow_other_keys || call_allows_other_keys) {
+            for pair in tail.chunks(2) {
+                let bare = key_bare(pair[0]);
+                if bare == "ALLOW-OTHER-KEYS" {
+                    continue;
+                }
+                if !key_specs.iter().any(|(kw, _, _, _)| kw == &bare) {
+                    return Err(BlissError::Internal(format!(
+                        "unexpected keyword argument: {}",
+                        bare
+                    )));
+                }
+            }
+        }
+    } else if !rest_bound && arg_i < args.len() {
+        return Err(BlissError::Internal(format!(
+            "too many arguments for lambda list: expected {}, got {}",
+            arg_i,
+            args.len()
+        )));
+    }
+
     Ok(())
 }
 
