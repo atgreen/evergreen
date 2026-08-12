@@ -77,6 +77,15 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
     if v.is_single_float() {
         return format!("{}", v.as_single_float());
     }
+    if v.is_symbol() {
+        let idx = v.as_symbol_index();
+        let name =
+            bliss_compiler::reader::symbol_name(idx).unwrap_or_else(|| format!("SYM#{}", idx));
+        if escapep {
+            return name;
+        }
+        return name.trim_start_matches("KEYWORD:").to_string();
+    }
     if v.is_heap_object() {
         // Check if it's a string and extract its content
         if let Some(s) = extract_bliss_string(v) {
