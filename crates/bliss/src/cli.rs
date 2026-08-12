@@ -2860,18 +2860,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "LENGTH" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                if v.is_nil() {
-                    return Ok(BlissVal::from_fixnum(0));
-                }
-                if v.is_cons() {
-                    let elems = list_to_vec(v);
-                    return Ok(BlissVal::from_fixnum(elems.len() as i64));
-                }
-                if v.is_string() {
-                    let s = val_as_str(v);
-                    return Ok(BlissVal::from_fixnum(s.len() as i64));
-                }
-                return Ok(BlissVal::from_fixnum(0));
+                return Ok(BlissVal::from_fixnum(bliss_stdlib::length(v)? as i64));
             }
             "APPEND" => {
                 let mut all = Vec::new();
@@ -3053,6 +3042,68 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return bliss_stdlib::find(item, seq, test, key, start, end, from_end);
             }
+            "POSITION" => {
+                let (item_form, r) = cp(cdr);
+                let (seq_form, mut rest) = cp(r);
+                let item = eval_form(item_form, env)?;
+                let seq = eval_form(seq_form, env)?;
+                let mut test = NIL;
+                let mut key = None;
+                let mut start = 0usize;
+                let mut end = None;
+                let mut from_end = false;
+                while rest.is_cons() {
+                    let (kw, r2) = cp(rest);
+                    if !r2.is_cons() {
+                        break;
+                    }
+                    let (value_form, r3) = cp(r2);
+                    let value = eval_form(value_form, env)?;
+                    if kw.is_symbol() {
+                        let name = sym_name(kw);
+                        match name.strip_prefix("KEYWORD:").unwrap_or(&name) {
+                            "TEST" => test = value,
+                            "KEY" => key = Some(value),
+                            "START" => start = num_val(value)? as usize,
+                            "END" => end = Some(num_val(value)? as usize),
+                            "FROM-END" => from_end = !value.is_nil(),
+                            _ => {}
+                        }
+                    }
+                    rest = r3;
+                }
+                return bliss_stdlib::position(item, seq, test, key, start, end, from_end);
+            }
+            "COUNT" => {
+                let (item_form, r) = cp(cdr);
+                let (seq_form, mut rest) = cp(r);
+                let item = eval_form(item_form, env)?;
+                let seq = eval_form(seq_form, env)?;
+                let mut test = NIL;
+                let mut key = None;
+                let mut start = 0usize;
+                let mut end = None;
+                while rest.is_cons() {
+                    let (kw, r2) = cp(rest);
+                    if !r2.is_cons() {
+                        break;
+                    }
+                    let (value_form, r3) = cp(r2);
+                    let value = eval_form(value_form, env)?;
+                    if kw.is_symbol() {
+                        let name = sym_name(kw);
+                        match name.strip_prefix("KEYWORD:").unwrap_or(&name) {
+                            "TEST" => test = value,
+                            "KEY" => key = Some(value),
+                            "START" => start = num_val(value)? as usize,
+                            "END" => end = Some(num_val(value)? as usize),
+                            _ => {}
+                        }
+                    }
+                    rest = r3;
+                }
+                return bliss_stdlib::count(item, seq, test, key, start, end);
+            }
             "MEMBER" => {
                 let (item_f, r) = cp(cdr);
                 let (list_f, _) = cp(r);
@@ -3087,18 +3138,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(NIL);
             }
             "CONCATENATE" => {
-                // (concatenate 'string str1 str2 ...)
+                // Delegate to stdlib so CLI sequence behavior matches the
+                // same implementation used by lower-level stage-3 tests.
                 let (type_form, rest) = cp(cdr);
-                let _type_val = eval_form(type_form, env)?;
-                let mut result = String::new();
+                let result_type = eval_form(type_form, env)?;
+                let mut sequences = Vec::new();
                 let mut c = rest;
                 while c.is_cons() {
                     let (sf, r) = cp(c);
-                    let v = eval_form(sf, env)?;
-                    result.push_str(&val_as_str(v));
+                    sequences.push(eval_form(sf, env)?);
                     c = r;
                 }
-                return Ok(arena_str(&result));
+                return bliss_stdlib::concatenate(result_type, &sequences);
             }
             "SUBSEQ" => {
                 let (seq_form, rest) = cp(cdr);
@@ -3111,6 +3162,46 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     None
                 };
                 return bliss_stdlib::subseq(seq, start, end);
+            }
+            "SORT" => {
+                let (seq_form, rest) = cp(cdr);
+                let (pred_form, rest2) = cp(rest);
+                let seq = eval_form(seq_form, env)?;
+                let predicate = eval_form(pred_form, env)?;
+                let key = if rest2.is_cons() {
+                    let (kw_form, rest3) = cp(rest2);
+                    if kw_form.is_symbol()
+                        && symbol_bare_name(&sym_name(kw_form)).eq_ignore_ascii_case("KEY")
+                        && rest3.is_cons()
+                    {
+                        Some(eval_form(cp(rest3).0, env)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                return bliss_stdlib::sort(seq, predicate, key);
+            }
+            "STABLE-SORT" => {
+                let (seq_form, rest) = cp(cdr);
+                let (pred_form, rest2) = cp(rest);
+                let seq = eval_form(seq_form, env)?;
+                let predicate = eval_form(pred_form, env)?;
+                let key = if rest2.is_cons() {
+                    let (kw_form, rest3) = cp(rest2);
+                    if kw_form.is_symbol()
+                        && symbol_bare_name(&sym_name(kw_form)).eq_ignore_ascii_case("KEY")
+                        && rest3.is_cons()
+                    {
+                        Some(eval_form(cp(rest3).0, env)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                return bliss_stdlib::stable_sort(seq, predicate, key);
             }
             "PARSE-NAMESTRING" => {
                 let (thing_form, rest) = cp(cdr);
