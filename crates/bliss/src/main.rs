@@ -1,6 +1,6 @@
 //! Bliss Common Lisp — entry point.
 
-use bliss_cli::cli;
+use bliss::cli;
 
 fn main() {
     // Collect OS args, skipping argv[0] (the program name).

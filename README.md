@@ -20,7 +20,7 @@ This is a Cargo workspace using Rust 2024 and requiring Rust 1.85 or newer.
 | `crates/bliss-rt` | Runtime core: object model, values, GC, threads, FFI, sandboxing, images |
 | `crates/bliss-compiler` | Bootstrap compiler pieces: reader, macro expansion, IR, optimisation, codegen, tiering, OSR, profiling |
 | `crates/bliss-stdlib` | Standard-library support: packages, CLOS, conditions, streams, sequences, hash tables, FORMAT, pathnames, devtools |
-| `crates/bliss-cli` | User-facing CLI, REPL, script loading, image loading, and evaluation driver |
+| `crates/bliss` | User-facing CLI, REPL, script loading, image loading, and evaluation driver |
 | `lib/` | Lisp-side prelude (`boot.lisp`) and bundled sources loaded at startup |
 | `tests/` | Cross-cutting suites: ANSI conformance, differential, integration, property, and sanitizer configs |
 | `fuzz/` | `cargo-fuzz` targets and corpora for the reader, compiler, evaluator, FORMAT, FFI, and image loader |
@@ -36,7 +36,7 @@ cargo build
 Build the CLI binary:
 
 ```sh
-cargo build -p bliss-cli
+cargo build -p bliss
 ```
 
 Run the test suite:
@@ -51,7 +51,7 @@ Run tests for one crate:
 cargo test -p bliss-rt
 cargo test -p bliss-compiler
 cargo test -p bliss-stdlib
-cargo test -p bliss-cli
+cargo test -p bliss
 ```
 
 Fuzz targets live under `fuzz/` and run via `cargo-fuzz`:
@@ -70,25 +70,25 @@ clippy on Linux and macOS, a nightly fuzzing job, and sanitizer builds.
 Run the REPL:
 
 ```sh
-cargo run -p bliss-cli
+cargo run -p bliss
 ```
 
 Evaluate an expression:
 
 ```sh
-cargo run -p bliss-cli -- --eval "(+ 1 2)"
+cargo run -p bliss -- --eval "(+ 1 2)"
 ```
 
 Load a file:
 
 ```sh
-cargo run -p bliss-cli -- --load path/to/file.lisp
+cargo run -p bliss -- --load path/to/file.lisp
 ```
 
 Run a script and pass arguments through to Lisp as `*COMMAND-LINE-ARGS*`:
 
 ```sh
-cargo run -p bliss-cli -- path/to/script.lisp -- arg1 arg2
+cargo run -p bliss -- path/to/script.lisp -- arg1 arg2
 ```
 
 The CLI currently accepts:

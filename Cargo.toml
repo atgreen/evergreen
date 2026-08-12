@@ -4,7 +4,7 @@ members = [
     "crates/bliss-rt",
     "crates/bliss-compiler",
     "crates/bliss-stdlib",
-    "crates/bliss-cli",
+    "crates/bliss",
 ]
 
 [workspace.package]
@@ -21,5 +21,5 @@ bliss-stdlib = { path = "crates/bliss-stdlib" }
 [profile.test]
 opt-level = 3
 
-[profile.dev.package.bliss-cli]
+[profile.dev.package.bliss]
 opt-level = 2

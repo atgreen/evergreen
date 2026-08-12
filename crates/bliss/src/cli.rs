@@ -1410,6 +1410,16 @@ fn normalize_package_name(name: &str) -> String {
         .to_uppercase()
 }
 
+/// Short package name for the REPL prompt. Standard packages use their usual
+/// CL nicknames (`CL-USER>`, `CL>`); user-defined packages show their full name.
+fn prompt_package_name(name: &str) -> &str {
+    match name {
+        "COMMON-LISP-USER" => "CL-USER",
+        "COMMON-LISP" => "CL",
+        other => other,
+    }
+}
+
 fn symbol_bare_name(name: &str) -> String {
     let without_keyword = name.trim_start_matches("KEYWORD:");
     let base = without_keyword
@@ -7477,9 +7487,11 @@ fn run_repl_env(env: &mut Env) -> Result<i32, BlissError> {
     ARENA.with(|a| a.borrow_mut().promote_all());
     let stdin = std::io::stdin();
     let mut input = String::new();
-    let mut in_debugger = false;
+    // Debugger state (nesting level, history) carried across debugger entries (A6.02).
+    let mut repl_state = bliss_stdlib::ReplState::new();
     loop {
-        eprint!("{}", if in_debugger { "Debug> " } else { "BLISS> " });
+        // Prompt reflects the current package, e.g. `CL-USER> ` (R6.08).
+        eprint!("{}> ", prompt_package_name(&env.current_package));
         input.clear();
         match stdin.read_line(&mut input) {
             Ok(0) => {
@@ -7494,14 +7506,6 @@ fn run_repl_env(env: &mut Env) -> Result<i32, BlissError> {
                 if trimmed == "(quit)" || trimmed == "(exit)" {
                     return Ok(0);
                 }
-                if in_debugger {
-                    if trimmed == ":abort" || trimmed == ":a" {
-                        in_debugger = false;
-                        continue;
-                    }
-                    eprintln!("Unknown debugger command: {}", trimmed);
-                    continue;
-                }
                 match read_eval_all_env(trimmed, env) {
                     Ok(result) => {
                         println!("{}", format_val(result));
@@ -7510,7 +7514,14 @@ fn run_repl_env(env: &mut Env) -> Result<i32, BlissError> {
                     }
                     Err(e) => {
                         eprintln!("ERROR: {}", describe_err(&e));
-                        in_debugger = true;
+                        // Enter the full devtools debugger (R6.13, A6.02): supports
+                        // step/next/out/continue, backtrace, frame, eval, restart, and
+                        // help. It runs its own read loop and returns once the user
+                        // continues, aborts, or requests stepping. In non-interactive
+                        // sessions (piped stdin/scripts) it returns immediately so the
+                        // REPL keeps consuming input rather than blocking.
+                        let condition = arena_str(&format!("{}", e));
+                        let _ = bliss_stdlib::invoke_debugger_ui(condition, &mut repl_state);
                         // On error, temporary allocations can be freed
                         ARENA.with(|a| {
                             let mut arena = a.borrow_mut();

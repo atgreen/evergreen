@@ -762,8 +762,15 @@ pub fn invoke_debugger_ui(
     let mut stdout = io::stdout();
     let stdin = io::stdin();
 
-    // Display the condition
-    writeln!(stdout, "\nDebugger entered: condition {:?}", condition).unwrap_or(());
+    // Display the condition. Conditions surfaced from the REPL are string
+    // values (the formatted error text); render that text rather than the raw
+    // `HeapObj(..)` debug form.
+    let condition_desc = if condition.is_string() {
+        condition.as_string()
+    } else {
+        format!("{:?}", condition)
+    };
+    writeln!(stdout, "\nDebugger entered: {}", condition_desc).unwrap_or(());
 
     // Walk the stack and display backtrace
     let frames = walk_stack();
@@ -828,7 +835,7 @@ pub fn invoke_debugger_ui(
                 writeln!(stdout, "Continuing...").unwrap_or(());
                 break;
             }
-            "abort" | "q" => {
+            "abort" | "q" | ":abort" | ":a" => {
                 clear_stepping_traps();
                 break;
             }
@@ -905,7 +912,7 @@ pub fn invoke_debugger_ui(
                 writeln!(stdout, "  next (n)      - Step over (skip calls)").unwrap_or(());
                 writeln!(stdout, "  out (finish)  - Step out of current frame").unwrap_or(());
                 writeln!(stdout, "  continue (c)  - Continue execution").unwrap_or(());
-                writeln!(stdout, "  abort (q)     - Abort to top level").unwrap_or(());
+                writeln!(stdout, "  abort (q, :abort, :a) - Abort to top level").unwrap_or(());
                 writeln!(stdout, "  backtrace (bt) [n] - Show backtrace").unwrap_or(());
                 writeln!(stdout, "  frame (f) N   - Select frame N").unwrap_or(());
                 writeln!(stdout, "  eval (e) FORM - Eval in selected frame").unwrap_or(());
@@ -986,17 +993,19 @@ pub fn walk_stack() -> Vec<DebugFrame> {
                 && !after.starts_with('/')
                 && !after.starts_with("at ")
             {
-                // Flush previous pending frame
+                // Flush previous pending frame, skipping debugger/runtime plumbing.
                 if let Some(func_name) = pending_func.take() {
-                    let func_val = func_val_from_name(&func_name);
-                    frames.push(DebugFrame {
-                        func: func_val,
-                        source_loc: pending_loc.take(),
-                        local_bindings: None,
-                        live: true,
-                    });
-                    if frames.len() >= 64 {
-                        break;
+                    if !is_internal_frame(&func_name) {
+                        let func_val = func_val_from_name(&func_name);
+                        frames.push(DebugFrame {
+                            func: func_val,
+                            source_loc: pending_loc.take(),
+                            local_bindings: None,
+                            live: true,
+                        });
+                        if frames.len() >= 64 {
+                            break;
+                        }
                     }
                 }
                 pending_func = Some(after.to_string());
@@ -1013,15 +1022,17 @@ pub fn walk_stack() -> Vec<DebugFrame> {
         }
     }
 
-    // Flush last pending frame
+    // Flush last pending frame, skipping debugger/runtime plumbing.
     if let Some(func_name) = pending_func.take() {
-        let func_val = func_val_from_name(&func_name);
-        frames.push(DebugFrame {
-            func: func_val,
-            source_loc: pending_loc.take(),
-            local_bindings: None,
-            live: true,
-        });
+        if !is_internal_frame(&func_name) {
+            let func_val = func_val_from_name(&func_name);
+            frames.push(DebugFrame {
+                func: func_val,
+                source_loc: pending_loc.take(),
+                local_bindings: None,
+                live: true,
+            });
+        }
     }
 
     // Ensure at least one frame
@@ -1035,6 +1046,29 @@ pub fn walk_stack() -> Vec<DebugFrame> {
     }
 
     frames
+}
+
+/// True for native frames that are backtrace-capture or debugger plumbing
+/// rather than user-meaningful frames. These sit at the very top of the raw
+/// native backtrace (the machinery that captured it) and at the very bottom
+/// (the process/runtime entry point); neither helps someone debugging Lisp.
+fn is_internal_frame(name: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "backtrace",                    // std::backtrace / backtrace_rs capture
+        "libunwind",
+        "invoke_debugger_ui",           // the debugger itself
+        "walk_stack",
+        "print_frame",
+        "core::ops::function",          // FnOnce/FnMut::call shims
+        "std::sys",
+        "std::rt",
+        "std::panic",
+        "rust_begin_unwind",
+        "__rust_begin_short_backtrace",
+        "__libc_start_main",
+        "_start",
+    ];
+    NEEDLES.iter().any(|needle| name.contains(needle))
 }
 
 /// Convert a backtrace function name into a BlissVal.

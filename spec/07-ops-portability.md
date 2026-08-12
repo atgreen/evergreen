@@ -487,7 +487,7 @@ The project is a Cargo workspace (see §0, section 3):
 members = [
     "crates/bliss-rt",
     "crates/bliss-compiler",
-    "crates/bliss-cli",
+    "crates/bliss",
 ]
 ```
 
@@ -723,7 +723,7 @@ log-writer thread drains the ring and writes to stderr.
 | `crates/bliss-rt/src/log.rs` | Structured logger, GC/JIT channels | R7.16–R7.18 |
 | `crates/bliss-rt/src/perf_map.rs` | Linux perf-map writer | R7.17 |
 | `crates/bliss-rt/src/dtrace.rs` | USDT probe definitions | §7.9.5 |
-| `crates/bliss-cli/src/main.rs` | CLI flag parsing, REPL/script dispatch | R7.07 |
+| `crates/bliss/src/main.rs` | CLI flag parsing, REPL/script dispatch | R7.07 |
 
 ---
 

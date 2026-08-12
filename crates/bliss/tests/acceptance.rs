@@ -18,7 +18,7 @@ use std::time::Duration;
 
 /// Get the path to the bliss binary built by cargo.
 fn bliss_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_bliss-cli"))
+    Command::new(env!("CARGO_BIN_EXE_bliss"))
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -343,11 +343,8 @@ fn repl_shows_prompt() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // The prompt could appear on either stdout or stderr
     assert!(
-        stderr.contains("BLISS>")
-            || stderr.contains("bliss>")
-            || stdout.contains("BLISS>")
-            || stdout.contains("bliss>"),
-        "REPL should display a prompt, stdout: '{}', stderr: '{}'",
+        stderr.contains("CL-USER>") || stdout.contains("CL-USER>"),
+        "REPL should display the current-package prompt, stdout: '{}', stderr: '{}'",
         stdout,
         stderr
     );

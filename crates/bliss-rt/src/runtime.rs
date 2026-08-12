@@ -457,12 +457,12 @@ impl Runtime {
     /// quote, if, progn, let, defun, function calls, arithmetic (+,-,*,/),
     /// cons/car/cdr, eq/eql, and list. It exists so `bliss-rt` can be exercised
     /// in isolation by its own unit/integration tests *without* depending on the
-    /// higher `bliss-cli` crate.
+    /// higher `bliss` crate.
     ///
     /// It is NOT the language evaluator. The real, full evaluator that every
     /// user-facing behaviour (the `bliss` CLI/REPL, `--eval`, `--load`) runs
-    /// through lives in `bliss-cli` (`cli::eval_form`). Because the crate
-    /// dependency points `bliss-cli -> bliss-rt` (never the reverse), `bliss-rt`
+    /// through lives in `bliss` (`cli::eval_form`). Because the crate
+    /// dependency points `bliss -> bliss-rt` (never the reverse), `bliss-rt`
     /// cannot call into that evaluator; the two are kept separate on purpose
     /// rather than one wrapping the other. Do not grow this bootstrap evaluator
     /// into a second language implementation — extend `cli::eval_form` instead,
@@ -1064,7 +1064,7 @@ fn sexpr_to_blissval(s: &SExpr) -> BlissVal {
 
 /// The bootstrap evaluator core. See the note on `Runtime::eval`: this is a
 /// scoped, test-only subset — the full language evaluator is `cli::eval_form`
-/// in the `bliss-cli` crate. Keep these in sync only as far as the small subset
+/// in the `bliss` crate. Keep these in sync only as far as the small subset
 /// listed on `Runtime::eval`; do not expand this into a rival implementation.
 fn eval_sexpr(expr: &SExpr, env: &mut BootEnv) -> Result<BlissVal, BlissError> {
     let _depth_guard = BootEvalDepthGuard::enter()?;

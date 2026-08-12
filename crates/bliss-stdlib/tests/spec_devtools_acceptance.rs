@@ -213,14 +213,14 @@ fn bundled_asdf_require_path_is_observable_through_the_real_cli() {
             "run",
             "-q",
             "-p",
-            "bliss-cli",
+            "bliss",
             "--",
             "--eval",
             "(require :asdf)\n(print bliss-ext:*asdf-output-translations*)\n(print asdf:*last-operation-tier*)",
         ])
         .current_dir(&repo_root)
         .output()
-        .expect("run real bliss-cli require path");
+        .expect("run real bliss require path");
 
     assert_eq!(
         output.status.code(),

@@ -23,7 +23,7 @@ test suite for library compatibility validation.
 ## 10.2  Unit & Integration Tests
 
 **R10.04** Every Rust crate (`bliss-rt`, `bliss-compiler`, `bliss-stdlib`,
-`bliss-cli`) MUST maintain unit tests in `tests/` subdirectories,
+`bliss`) MUST maintain unit tests in `tests/` subdirectories,
 exercising public API surfaces.
 
 **R10.05** Unit test coverage SHOULD exceed 80% line coverage for Rust

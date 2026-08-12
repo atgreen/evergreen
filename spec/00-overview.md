@@ -202,7 +202,7 @@ bliss/
 │   │   │   ├── devtools.rs     # developer tools hooks
 │   │   │   └── lib.rs
 │   │   └── Cargo.toml
-│   └── bliss-cli/          # REPL + command-line driver
+│   └── bliss/          # REPL + command-line driver
 │       ├── src/cli.rs
 │       ├── src/main.rs
 │       └── Cargo.toml

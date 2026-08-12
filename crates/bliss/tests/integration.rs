@@ -1,7 +1,7 @@
 //! Integration tests that exercise the full pipeline through the public API.
 //!
 //! These tests wire together bliss-rt, bliss-compiler, and bliss-stdlib
-//! through the bliss-cli crate to verify cross-crate integration.
+//! through the bliss crate to verify cross-crate integration.
 
 use bliss_rt::runtime::{LogLevel, Runtime, RuntimeConfig};
 use bliss_rt::value::BlissVal;

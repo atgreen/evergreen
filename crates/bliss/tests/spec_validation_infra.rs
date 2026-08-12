@@ -86,7 +86,7 @@ fn integration_acceptance_scripts_execute_through_real_cli_entrypoints() {
     let eval_expected = expected_markers(eval_script);
     let eval = run(
         {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_bliss-cli"));
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_bliss"));
             cmd.current_dir(repo_root()).args(["--load", eval_script]);
             cmd
         },
@@ -104,7 +104,7 @@ fn integration_acceptance_scripts_execute_through_real_cli_entrypoints() {
     let load_expected = expected_markers(load_script);
     let load = run(
         {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_bliss-cli"));
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_bliss"));
             cmd.current_dir(repo_root()).args(["--load", load_script]);
             cmd
         },
@@ -121,7 +121,7 @@ fn integration_acceptance_scripts_execute_through_real_cli_entrypoints() {
     let repl_script = "tests/integration/acceptance_repl.lisp";
     let repl_expected = expected_markers(repl_script);
     let script_body = read(repl_script);
-    let mut repl = Command::new(env!("CARGO_BIN_EXE_bliss-cli"));
+    let mut repl = Command::new(env!("CARGO_BIN_EXE_bliss"));
     repl.current_dir(repo_root())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

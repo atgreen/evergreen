@@ -5,7 +5,7 @@
 ;;;; goal is to push everything that can be expressed as a macro or ordinary
 ;;;; function out of the `eval_form` interpreter and into this file.
 ;;;;
-;;;; Constraints of the current bootstrap evaluator (see crates/bliss-cli):
+;;;; Constraints of the current bootstrap evaluator (see crates/bliss):
 ;;;;   * macro lambda lists are flat — &optional and &rest work, but nested
 ;;;;     destructuring does NOT yet. Keep parameter lists simple.
 ;;;;   * user macros are expanded before builtins, so nothing here should

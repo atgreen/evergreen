@@ -634,7 +634,7 @@ Developer tools span several crates and CL source files:
 
 ```
 crates/
-  bliss-cli/
+  bliss/
     src/
       main.rs           # CLI entry point, argument parsing
       repl.rs            # §6.1 — REPL loop, line editing, history

@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn bliss() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_bliss-cli"))
+    Command::new(env!("CARGO_BIN_EXE_bliss"))
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -141,8 +141,8 @@ fn repl_acceptance_drives_the_real_binary_through_read_eval_print_and_exit() {
         "stdout: {stdout} stderr: {stderr}"
     );
     assert!(
-        stderr.contains("BLISS>"),
-        "the real REPL should print its prompt before evaluating input: stdout: {stdout} stderr: {stderr}"
+        stderr.contains("CL-USER>"),
+        "the real REPL should print its current-package prompt before evaluating input: stdout: {stdout} stderr: {stderr}"
     );
 }
 

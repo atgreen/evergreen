@@ -1,6 +1,6 @@
-//! Tests for bliss-cli: CliArgs parsing, ReplConfig defaults, and CLI driver functions.
+//! Tests for bliss: CliArgs parsing, ReplConfig defaults, and CLI driver functions.
 
-use bliss_cli::{CliArgs, ReplConfig, help_text};
+use bliss::{CliArgs, ReplConfig, help_text};
 
 // ── Helper ────────────────────────────────────────────────────────
 
@@ -348,19 +348,19 @@ fn repl_config_default_syntax_highlighting_enabled() {
 
 #[test]
 fn run_with_help_returns_ok() {
-    let result = bliss_cli::cli::run(&args(&["--help"]));
+    let result = bliss::cli::run(&args(&["--help"]));
     assert!(result.is_ok(), "run(--help) should return Ok");
     assert_eq!(result.unwrap(), 0);
 }
 
 #[test]
 fn print_help_does_not_panic() {
-    bliss_cli::cli::print_help();
+    bliss::cli::print_help();
 }
 
 #[test]
 fn help_text_mentions_runtime_flags() {
-    let help = bliss_cli::cli::help_text();
+    let help = bliss::cli::help_text();
     for flag in [
         "--tlab-size",
         "--nursery-size",
@@ -375,13 +375,13 @@ fn help_text_mentions_runtime_flags() {
 
 #[test]
 fn print_version_does_not_panic() {
-    bliss_cli::cli::print_version();
+    bliss::cli::print_version();
 }
 
 #[test]
 fn run_repl_returns_ok_on_eof() {
     // In test context, stdin is at EOF so run_repl exits immediately with Ok(0).
-    let result = bliss_cli::cli::run_repl();
+    let result = bliss::cli::run_repl();
     assert!(result.is_ok(), "run_repl should return Ok on EOF stdin");
     assert_eq!(result.unwrap(), 0);
 }

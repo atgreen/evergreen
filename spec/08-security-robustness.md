@@ -133,7 +133,7 @@ All `unsafe` blocks MUST be confined to the following modules:
 
 No other module may contain `unsafe` code. The `#![deny(unsafe_code)]`
 attribute is set at crate level in `bliss-rt`, `bliss-compiler`, and
-`bliss-cli`, with per-module `#[allow(unsafe_code)]` only in the three
+`bliss`, with per-module `#[allow(unsafe_code)]` only in the three
 locations listed above.
 
 ### 8.3.2  Pointer Validation (R8.04)
