@@ -10,6 +10,7 @@ use crate::value::BlissVal;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::rc::Rc;
 
 /// Default boot-image path. Unlike an explicitly-requested image, its absence
@@ -436,8 +437,7 @@ impl Runtime {
             let _result = self.eval(&contents)?;
             return Ok(0);
         }
-        // Default: run REPL (bootstrap: return immediately)
-        Ok(0)
+        self.run_repl()
     }
 
     /// Initiate graceful shutdown. §2.9.
@@ -490,6 +490,43 @@ impl Runtime {
     /// Get a reference to the runtime configuration.
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+
+    fn run_repl(&mut self) -> Result<i32, BlissError> {
+        let stdin = io::stdin();
+        let mut input = String::new();
+
+        loop {
+            eprint!("BLISS> ");
+            io::stderr().flush().map_err(|e| {
+                BlissError::StreamError(format!("failed to flush REPL prompt: {}", e))
+            })?;
+
+            input.clear();
+            match stdin.read_line(&mut input) {
+                Ok(0) => {
+                    eprintln!();
+                    return Ok(0);
+                }
+                Ok(_) => {
+                    let trimmed = input.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if trimmed == "(quit)" || trimmed == "(exit)" {
+                        return Ok(0);
+                    }
+                    let value = self.eval(trimmed)?;
+                    println!("{}", boot_print_val(value, true));
+                }
+                Err(e) => {
+                    return Err(BlissError::StreamError(format!(
+                        "failed to read REPL input: {}",
+                        e
+                    )));
+                }
+            }
+        }
     }
 }
 

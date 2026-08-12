@@ -1058,10 +1058,7 @@ fn parse_decimal_float(s: &str) -> Option<f32> {
             i += 1;
         } else if !has_exp
             && prev_digit
-            && matches!(
-                c,
-                'e' | 'E' | 's' | 'S' | 'f' | 'F' | 'd' | 'D' | 'l' | 'L'
-            )
+            && matches!(c, 'e' | 'E' | 's' | 'S' | 'f' | 'F' | 'd' | 'D' | 'l' | 'L')
         {
             has_exp = true;
             out.push('e');

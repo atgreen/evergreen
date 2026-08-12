@@ -442,6 +442,13 @@ struct Closure {
     captured_frame: Rc<RefCell<EnvFrame>>,
 }
 
+#[derive(Clone, Copy)]
+enum EvalContext {
+    Repl,
+    Eval,
+    Load,
+}
+
 // ── Environment for variable/function bindings ───────────────────
 // Uses Rc for global definitions (funs, macros, classes, methods, packages)
 // so that child() only clones the local vars HashMap, not the entire env.
@@ -466,6 +473,7 @@ struct Env {
     catch_stack: Vec<(String, String)>,
     /// Tags visible for GO: (tag-name, tagbody-token)
     tag_stack: Vec<(String, String)>,
+    eval_context: EvalContext,
 }
 
 #[derive(Clone, Default)]
@@ -586,10 +594,14 @@ impl Env {
             block_stack: Vec::new(),
             catch_stack: Vec::new(),
             tag_stack: Vec::new(),
+            eval_context: EvalContext::Repl,
         };
         env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
         env.define_local("*LOAD-HOOKS*", NIL);
-        env.define_local("*FEATURES*", vec_to_list(&[resolve_sym(":BLISS").unwrap_or(NIL)]));
+        env.define_local(
+            "*FEATURES*",
+            vec_to_list(&[resolve_sym(":BLISS").unwrap_or(NIL)]),
+        );
         env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
         env.define_local("*TYPE-DEFINITIONS*", NIL);
         env.define_local("*CONDITION-TYPES*", NIL);
@@ -620,6 +632,7 @@ impl Env {
             block_stack: self.block_stack.clone(),
             catch_stack: self.catch_stack.clone(),
             tag_stack: self.tag_stack.clone(),
+            eval_context: self.eval_context,
         }
     }
 
@@ -644,6 +657,7 @@ impl Env {
             block_stack: self.block_stack.clone(),
             catch_stack: self.catch_stack.clone(),
             tag_stack: self.tag_stack.clone(),
+            eval_context: self.eval_context,
         }
     }
 
@@ -703,6 +717,18 @@ impl Env {
         self.mv = values;
         self.mv_active = true;
     }
+}
+
+fn with_eval_context<T>(
+    env: &mut Env,
+    context: EvalContext,
+    f: impl FnOnce(&mut Env) -> Result<T, BlissError>,
+) -> Result<T, BlissError> {
+    let previous = env.eval_context;
+    env.eval_context = context;
+    let result = f(env);
+    env.eval_context = previous;
+    result
 }
 
 fn seed_standard_packages(packages: &mut HashMap<String, PackageDef>) {
@@ -1370,14 +1396,8 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
                 ("FORMAT-ARGUMENTS".into(), "FORMAT-ARGUMENTS".into()),
             ],
         )),
-        "SIMPLE-ERROR" => Some((
-            vec!["ERROR".into(), "SIMPLE-CONDITION".into()],
-            vec![],
-        )),
-        "SIMPLE-WARNING" => Some((
-            vec!["WARNING".into(), "SIMPLE-CONDITION".into()],
-            vec![],
-        )),
+        "SIMPLE-ERROR" => Some((vec!["ERROR".into(), "SIMPLE-CONDITION".into()], vec![])),
+        "SIMPLE-WARNING" => Some((vec!["WARNING".into(), "SIMPLE-CONDITION".into()], vec![])),
         "TYPE-ERROR" => Some((
             vec!["ERROR".into()],
             vec![
@@ -1665,20 +1685,18 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             let (predicate, _) = cp(args);
             let predicate_name = sym_name(predicate);
             if predicate_name == "FIND-PACKAGE" {
-                let designator = if object.is_character() || object.is_string() || object.is_symbol()
-                {
-                    val_as_str(object)
-                } else {
-                    return Ok(false);
-                };
+                let designator =
+                    if object.is_character() || object.is_string() || object.is_symbol() {
+                        val_as_str(object)
+                    } else {
+                        return Ok(false);
+                    };
                 let pkg_name = normalize_package_name(&designator);
-                return Ok(
-                    env.packages.contains_key(&pkg_name)
-                        || matches!(
-                            pkg_name.as_str(),
-                            "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD" | "BLISS-EXT"
-                        ),
-                );
+                return Ok(env.packages.contains_key(&pkg_name)
+                    || matches!(
+                        pkg_name.as_str(),
+                        "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD" | "BLISS-EXT"
+                    ));
             }
             Ok(!apply_function(predicate, &[object], env)?.is_nil())
         }
@@ -1726,7 +1744,9 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
 fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
-    read_eval_all_env(&contents, env)
+    with_eval_context(env, EvalContext::Load, |env| {
+        read_eval_all_env(&contents, env)
+    })
 }
 
 fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -1789,6 +1809,94 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         return eval_list(form, env);
     }
     Ok(form)
+}
+
+fn canonical_type_name(type_form: BlissVal) -> Result<String, BlissError> {
+    if type_form.is_symbol() {
+        return Ok(sym_name(type_form)
+            .trim_start_matches("COMMON-LISP:")
+            .to_string());
+    }
+    if type_form.is_cons() {
+        let (head, rest) = cp(type_form);
+        if head.is_symbol() && sym_name(head) == "QUOTE" {
+            let (quoted, _) = cp(rest);
+            if quoted.is_symbol() {
+                return Ok(sym_name(quoted)
+                    .trim_start_matches("COMMON-LISP:")
+                    .to_string());
+            }
+        }
+    }
+    Err(BlissError::TypeError {
+        datum: type_form,
+        expected: "type specifier".into(),
+    })
+}
+
+fn value_satisfies_declared_type(type_form: BlissVal, value: BlissVal) -> Result<bool, BlissError> {
+    let type_name = canonical_type_name(type_form)?;
+    Ok(match type_name.as_str() {
+        "T" => true,
+        "NIL" | "NULL" => value.is_nil(),
+        "BOOLEAN" => value.is_nil() || value == T,
+        "SYMBOL" => value.is_symbol(),
+        "KEYWORD" => value.is_symbol() && sym_name(value).starts_with("KEYWORD:"),
+        "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" => value.is_character(),
+        "STRING" | "SIMPLE-STRING" | "SIMPLE-BASE-STRING" => value.is_string(),
+        "INTEGER" | "FIXNUM" => value.is_fixnum(),
+        "FLOAT" | "SINGLE-FLOAT" | "REAL" => value.is_single_float() || value.is_fixnum(),
+        "RATIO" => ratio_parts_val(value).is_some(),
+        "NUMBER" => {
+            value.is_fixnum() || value.is_single_float() || ratio_parts_val(value).is_some()
+        }
+        "LIST" => value.is_list(),
+        "CONS" => value.is_cons(),
+        "ATOM" => !value.is_cons(),
+        other => {
+            if value.is_heap_object() {
+                let header = unsafe { *(value.as_ptr() as *const ObjectHeader) };
+                match other {
+                    "VECTOR" | "SIMPLE-VECTOR" => header.type_id() == type_id::SIMPLE_VECTOR,
+                    "HASH-TABLE" => header.type_id() == type_id::HASH_TABLE,
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+    })
+}
+
+fn eval_when_should_run(situations: BlissVal, env: &Env) -> bool {
+    let has_situation = |target: &str| {
+        list_to_vec(situations).into_iter().any(|situation| {
+            situation.is_symbol()
+                && sym_name(situation)
+                    .trim_start_matches("KEYWORD:")
+                    .trim_start_matches("COMMON-LISP:")
+                    == target
+        })
+    };
+
+    match env.eval_context {
+        EvalContext::Load => has_situation("LOAD-TOPLEVEL") || has_situation("EXECUTE"),
+        EvalContext::Eval | EvalContext::Repl => has_situation("EXECUTE"),
+    }
+}
+
+fn eval_form_collecting_values(
+    form: BlissVal,
+    env: &mut Env,
+) -> Result<(BlissVal, Vec<BlissVal>), BlissError> {
+    env.clear_mv();
+    let primary = eval_form(form, env)?;
+    let values = if env.mv_active {
+        env.mv.clone()
+    } else {
+        vec![primary]
+    };
+    Ok((primary, values))
 }
 
 fn cp(val: BlissVal) -> (BlissVal, BlissVal) {
@@ -1856,19 +1964,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "PROGN" => return eval_progn(cdr, env),
             "DECLARE" => return Ok(NIL),
             "THE" => {
-                // (the type value) — ignore the type, evaluate the value.
-                let (_type, r) = cp(cdr);
+                let (type_form, r) = cp(cdr);
                 let (val_form, _) = cp(r);
-                return eval_form(val_form, env);
+                let value = eval_form(val_form, env)?;
+                if value_satisfies_declared_type(type_form, value)? {
+                    return Ok(value);
+                }
+                return Err(BlissError::TypeError {
+                    datum: value,
+                    expected: canonical_type_name(type_form)?,
+                });
             }
             "LOOP" => return eval_loop(cdr, env),
             "EVAL-WHEN" => {
-                // (eval-when (situations...) body...)
-                // The bootstrap evaluator has no compile/load-time distinction:
-                // every eval-when body runs as an implicit progn regardless of
-                // the declared situations.
-                let (_situations, body) = cp(cdr);
-                return eval_progn(body, env);
+                let (situations, body) = cp(cdr);
+                return if eval_when_should_run(situations, env) {
+                    eval_progn(body, env)
+                } else {
+                    Ok(NIL)
+                };
             }
             "BLOCK" => {
                 let (name_form, body) = cp(cdr);
@@ -2004,7 +2118,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     None => {
                         return Err(BlissError::Internal(
                             "GO: tag must be a symbol or integer".into(),
-                        ))
+                        ));
                     }
                 };
                 if let Some((_, token)) = env
@@ -2033,12 +2147,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         env.mv_active = saved_mv_active;
                         return Ok(v);
                     }
-                    Err(e) => {
-                        match eval_progn(cleanup, env) {
-                            Ok(_) => return Err(e),
-                            Err(cleanup_exit) => return Err(cleanup_exit),
-                        }
-                    }
+                    Err(e) => match eval_progn(cleanup, env) {
+                        Ok(_) => return Err(e),
+                        Err(cleanup_exit) => return Err(cleanup_exit),
+                    },
                 }
             }
             "PRINT" => {
@@ -2926,13 +3038,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (form, _) = cp(r);
                 let n = eval_form(nf, env)?;
                 let idx = num_val(n)? as usize;
-                env.clear_mv();
-                let first = eval_form(form, env)?;
-                let values = if env.mv_active {
-                    env.mv.clone()
-                } else {
-                    vec![first]
-                };
+                let (_, values) = eval_form_collecting_values(form, env)?;
                 return Ok(values.get(idx).copied().unwrap_or(NIL));
             }
             "MULTIPLE-VALUE-BIND" => return eval_multiple_value_bind(cdr, env),
@@ -2945,27 +3051,39 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut c = forms;
                 while c.is_cons() {
                     let (af, r) = cp(c);
-                    env.clear_mv();
-                    let primary = eval_form(af, env)?;
-                    if env.mv_active {
-                        args.extend(env.mv.clone());
-                    } else {
-                        args.push(primary);
-                    }
+                    let (_, values) = eval_form_collecting_values(af, env)?;
+                    args.extend(values);
                     c = r;
                 }
                 return apply_function(fn_val, &args, env);
             }
+            "MULTIPLE-VALUE-PROG1" => {
+                let (first_form, rest_forms) = cp(cdr);
+                let (primary, saved_values) = eval_form_collecting_values(first_form, env)?;
+                let _ = eval_progn(rest_forms, env)?;
+                env.set_mv(saved_values);
+                return Ok(primary);
+            }
+            "MULTIPLE-VALUE-SETQ" => {
+                let (vars_form, rest) = cp(cdr);
+                let (values_form, _) = cp(rest);
+                let vars = list_to_vec(vars_form);
+                let (_, values) = eval_form_collecting_values(values_form, env)?;
+                for (index, var_form) in vars.iter().enumerate() {
+                    let name = sym_name(*var_form);
+                    env.set_var(&name, values.get(index).copied().unwrap_or(NIL));
+                }
+                if values.is_empty() {
+                    env.set_mv(Vec::new());
+                    return Ok(NIL);
+                }
+                env.set_mv(values.clone());
+                return Ok(values[0]);
+            }
             "MULTIPLE-VALUE-LIST" => {
                 // (multiple-value-list form) — a list of all the values of form.
                 let (form, _) = cp(cdr);
-                env.clear_mv();
-                let primary = eval_form(form, env)?;
-                let values = if env.mv_active {
-                    env.mv.clone()
-                } else {
-                    vec![primary]
-                };
+                let (_, values) = eval_form_collecting_values(form, env)?;
                 return Ok(vec_to_list(&values));
             }
             "VALUES-LIST" => {
@@ -3433,14 +3551,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Ok(NIL);
                 };
                 let removed_symbol = package.symbols.remove(&name).is_some();
-                let removed_export = if let Some(pos) = package.exports.iter().position(|n| n == &name)
-                {
-                    package.exports.remove(pos);
-                    true
+                let removed_export =
+                    if let Some(pos) = package.exports.iter().position(|n| n == &name) {
+                        package.exports.remove(pos);
+                        true
+                    } else {
+                        false
+                    };
+                return Ok(if removed_symbol || removed_export {
+                    T
                 } else {
-                    false
-                };
-                return Ok(if removed_symbol || removed_export { T } else { NIL });
+                    NIL
+                });
             }
             "SYMBOL-PACKAGE" => {
                 let args = list_to_vec(cdr);
@@ -4836,11 +4958,7 @@ impl BigInt {
         for &limb in self.mag.iter().rev() {
             f = f * 18446744073709551616.0 + limb as f64; // * 2^64
         }
-        if self.sign < 0 {
-            -f
-        } else {
-            f
-        }
+        if self.sign < 0 { -f } else { f }
     }
 
     /// Canonicalize: a fixnum when it fits the 61-bit range, else a BIGNUM.
@@ -6111,7 +6229,10 @@ fn eval_floor(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
         let q = (av / bv).floor() as i64;
         let rem = av - (q as f64) * bv;
-        env.set_mv(vec![BlissVal::from_fixnum(q), BlissVal::from_fixnum(rem as i64)]);
+        env.set_mv(vec![
+            BlissVal::from_fixnum(q),
+            BlissVal::from_fixnum(rem as i64),
+        ]);
         return Ok(BlissVal::from_fixnum(q));
     }
     let q = av.floor() as i64;
@@ -6557,7 +6678,7 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
 }
 
 fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, BlissError> {
-    match read_eval_all_env(expr, env) {
+    match with_eval_context(env, EvalContext::Eval, |env| read_eval_all_env(expr, env)) {
         Ok(result) => {
             println!("{}", format_val(result));
             // When the top-level form yielded multiple values, echo the
