@@ -466,6 +466,7 @@ struct Env {
     macros: Rc<HashMap<String, MacroDef>>,
     symbol_macros: Rc<HashMap<u32, BlissVal>>,
     classes: Rc<HashMap<String, ClassDef>>,
+    generics: Rc<HashMap<String, GenericDef>>,
     methods: Rc<HashMap<String, Vec<MethodDef>>>,
     packages: Rc<HashMap<String, PackageDef>>,
     current_package: String,
@@ -481,6 +482,7 @@ struct Env {
     catch_stack: Vec<(String, String)>,
     /// Tags visible for GO: (tag-name, tagbody-token)
     tag_stack: Vec<(String, String)>,
+    method_context: Vec<MethodContext>,
     eval_context: EvalContext,
 }
 
@@ -530,9 +532,42 @@ struct SlotDef {
 
 #[derive(Clone)]
 struct MethodDef {
-    specializers: Vec<String>,
+    method_id: BlissVal,
+    specializers: Vec<MethodSpecializer>,
     params: Vec<String>,
     body: BlissVal,
+}
+
+#[derive(Clone)]
+struct GenericDef {
+    generic_function: BlissVal,
+    combination: bliss_stdlib::MethodCombinationType,
+}
+
+#[derive(Clone)]
+enum MethodSpecializer {
+    Any,
+    Class(String),
+    Eql(BlissVal),
+}
+
+#[derive(Clone)]
+struct MethodContext {
+    args: Vec<BlissVal>,
+    next: NextMethod,
+}
+
+#[derive(Clone)]
+enum NextMethod {
+    Standard {
+        around: Vec<MethodDef>,
+        before: Vec<MethodDef>,
+        primary: Vec<MethodDef>,
+        after: Vec<MethodDef>,
+    },
+    Primary {
+        primary: Vec<MethodDef>,
+    },
 }
 
 #[allow(dead_code)]
@@ -548,6 +583,9 @@ struct PackageDef {
 struct RestartEntry {
     name: String,
     function: RestartFunction,
+    interactive_function: Option<RestartFunction>,
+    test_function: Option<RestartFunction>,
+    unwind_on_invoke: bool,
 }
 
 #[derive(Clone)]
@@ -732,35 +770,405 @@ fn signal_condition_object(condition: BlissVal, env: &mut Env) -> Result<BlissVa
     Ok(NIL)
 }
 
-fn method_specializer_matches(arg: BlissVal, specializer: &str, env: &Env) -> bool {
-    let arg_class = get_instance_class_name(arg);
-    specializer == "T" || arg_class == specializer || is_subclass(&arg_class, specializer, env)
+fn method_combination_from_name(name: &str) -> Option<bliss_stdlib::MethodCombinationType> {
+    match symbol_bare_name(name).as_str() {
+        "STANDARD" => Some(bliss_stdlib::MethodCombinationType::Standard),
+        "+" | "PLUS" => Some(bliss_stdlib::MethodCombinationType::Plus),
+        "AND" => Some(bliss_stdlib::MethodCombinationType::And),
+        "OR" => Some(bliss_stdlib::MethodCombinationType::Or),
+        "LIST" => Some(bliss_stdlib::MethodCombinationType::List),
+        "APPEND" => Some(bliss_stdlib::MethodCombinationType::Append),
+        "NCONC" => Some(bliss_stdlib::MethodCombinationType::Nconc),
+        "MIN" => Some(bliss_stdlib::MethodCombinationType::Min),
+        "MAX" => Some(bliss_stdlib::MethodCombinationType::Max),
+        "PROGN" => Some(bliss_stdlib::MethodCombinationType::Progn),
+        _ => None,
+    }
 }
 
-fn method_specificity_distance(arg: BlissVal, specializer: &str, env: &Env) -> Option<usize> {
-    if specializer == "T" {
-        return Some(usize::MAX / 2);
+fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, BlissError> {
+    if !class.is_symbol() {
+        return Ok(class);
     }
-    let arg_class = get_instance_class_name(arg);
-    if arg_class == specializer {
-        return Some(0);
+    if let Some(found) = bliss_stdlib::find_class(class) {
+        return Ok(found);
     }
-    superclass_distance(&arg_class, specializer, env)
+    let name = sym_name(class);
+    if builtin_condition_definition(&name).is_some() {
+        return ensure_condition_class_registered(env, &name);
+    }
+    Ok(class)
 }
 
-fn superclass_distance(child: &str, parent: &str, env: &Env) -> Option<usize> {
-    if child == parent {
-        return Some(0);
-    }
-    let class_def = env.classes.get(child)?;
-    let mut best = None;
-    for super_name in &class_def.supers {
-        if let Some(distance) = superclass_distance(super_name, parent, env) {
-            let candidate = distance + 1;
-            best = Some(best.map_or(candidate, |current: usize| current.min(candidate)));
+fn resolve_slot_symbol(class_name: &str, key: BlissVal, env: &Env) -> BlissVal {
+    let key_name = symbol_bare_name(&sym_name(key));
+    if let Some(class_def) = env.classes.get(class_name) {
+        for slot in &class_def.slots {
+            let matches_initarg = slot
+                .initarg
+                .as_ref()
+                .map(|initarg| initarg == &key_name)
+                .unwrap_or(false);
+            if matches_initarg || slot.name == key_name {
+                return resolve_sym(&slot.name).unwrap_or(NIL);
+            }
         }
     }
-    best
+    resolve_sym(&key_name).unwrap_or(NIL)
+}
+
+fn class_name_for_instance_class(class: BlissVal) -> String {
+    if class.is_symbol() {
+        return sym_name(class);
+    }
+    let name = bliss_stdlib::class_name(class);
+    if name.is_symbol() {
+        sym_name(name)
+    } else {
+        val_as_str(class)
+    }
+}
+
+fn evaluated_initargs(
+    class_name: &str,
+    init_args: BlissVal,
+    env: &mut Env,
+) -> Result<Vec<BlissVal>, BlissError> {
+    let args_vec = list_to_vec(init_args);
+    let mut initargs = Vec::new();
+    let mut i = 0;
+    while i + 1 < args_vec.len() {
+        let key = eval_form(args_vec[i], env)?;
+        let value = eval_form(args_vec[i + 1], env)?;
+        initargs.push(resolve_slot_symbol(class_name, key, env));
+        initargs.push(value);
+        i += 2;
+    }
+    Ok(initargs)
+}
+
+fn method_specificity_vector(
+    env: &Env,
+    method: &MethodDef,
+    args: &[BlissVal],
+) -> Option<Vec<usize>> {
+    if method.specializers.len() > args.len() {
+        return None;
+    }
+    let mut distances = Vec::with_capacity(method.specializers.len());
+    for (arg, specializer) in args.iter().zip(method.specializers.iter()) {
+        match specializer {
+            MethodSpecializer::Any => distances.push(usize::MAX / 4),
+            MethodSpecializer::Eql(expected) => {
+                if arg != expected {
+                    return None;
+                }
+                distances.push(0);
+            }
+            MethodSpecializer::Class(name) => {
+                let specializer_sym = resolve_sym(name).unwrap_or(NIL);
+                let specializer_class = resolve_class_metaobject(env, specializer_sym).ok()?;
+                let arg_class = bliss_stdlib::class_of(*arg);
+                let cpl = bliss_stdlib::compute_class_precedence_list(arg_class).ok()?;
+                let pos = cpl.iter().position(|&class| class == specializer_class)?;
+                distances.push(pos + 1);
+            }
+        }
+    }
+    Some(distances)
+}
+
+fn bind_method_params(
+    env: &mut Env,
+    method: &MethodDef,
+    args: &[BlissVal],
+) -> Result<(), BlissError> {
+    for (i, param) in method.params.iter().enumerate() {
+        env.define_local(param, args.get(i).copied().unwrap_or(NIL));
+    }
+    Ok(())
+}
+
+fn invoke_method(
+    env: &mut Env,
+    method: &MethodDef,
+    args: &[BlissVal],
+    next: Option<NextMethod>,
+) -> Result<BlissVal, BlissError> {
+    let mut child_env = env.child();
+    bind_method_params(&mut child_env, method, args)?;
+    if let Some(next) = next {
+        child_env.method_context.push(MethodContext {
+            args: args.to_vec(),
+            next,
+        });
+    }
+    eval_progn(method.body, &mut child_env)
+}
+
+fn invoke_restart_function(
+    function: &RestartFunction,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    match function {
+        RestartFunction::FunctionForm {
+            function_form,
+            captured_frame,
+        } => {
+            let mut restart_env = env.child_with_parent(thaw_env_frame(captured_frame));
+            let function = eval_form(*function_form, &mut restart_env)?;
+            apply_function(function, args, &mut restart_env)
+        }
+        RestartFunction::ContinueNil => Ok(args.first().copied().unwrap_or(NIL)),
+    }
+}
+
+fn restart_applies(
+    restart: &RestartEntry,
+    condition: Option<BlissVal>,
+    env: &mut Env,
+) -> Result<bool, BlissError> {
+    let Some(condition) = condition else {
+        return Ok(true);
+    };
+    let Some(test_function) = &restart.test_function else {
+        return Ok(true);
+    };
+    Ok(!invoke_restart_function(test_function, &[condition], env)?.is_nil())
+}
+
+fn invoke_primary_chain(
+    env: &mut Env,
+    primary: &[MethodDef],
+    args: &[BlissVal],
+) -> Result<BlissVal, BlissError> {
+    let Some((method, rest)) = primary.split_first() else {
+        return Err(BlissError::Internal(
+            "no next method available for CALL-NEXT-METHOD".into(),
+        ));
+    };
+    invoke_method(
+        env,
+        method,
+        args,
+        Some(NextMethod::Primary {
+            primary: rest.to_vec(),
+        }),
+    )
+}
+
+fn invoke_standard_methods(
+    env: &mut Env,
+    around: &[MethodDef],
+    before: &[MethodDef],
+    primary: &[MethodDef],
+    after: &[MethodDef],
+    args: &[BlissVal],
+) -> Result<BlissVal, BlissError> {
+    if let Some((method, rest)) = around.split_first() {
+        return invoke_method(
+            env,
+            method,
+            args,
+            Some(NextMethod::Standard {
+                around: rest.to_vec(),
+                before: before.to_vec(),
+                primary: primary.to_vec(),
+                after: after.to_vec(),
+            }),
+        );
+    }
+
+    for method in before {
+        let _ = invoke_method(env, method, args, None)?;
+    }
+    let result = invoke_primary_chain(env, primary, args)?;
+    for method in after {
+        let _ = invoke_method(env, method, args, None)?;
+    }
+    Ok(result)
+}
+
+fn invoke_next_method(
+    env: &mut Env,
+    context: &MethodContext,
+    args: &[BlissVal],
+) -> Result<BlissVal, BlissError> {
+    match &context.next {
+        NextMethod::Standard {
+            around,
+            before,
+            primary,
+            after,
+        } => invoke_standard_methods(env, around, before, primary, after, args),
+        NextMethod::Primary { primary } => invoke_primary_chain(env, primary, args),
+    }
+}
+
+fn combine_short_form_results(
+    combination: bliss_stdlib::MethodCombinationType,
+    results: &[BlissVal],
+) -> Result<BlissVal, BlissError> {
+    match combination {
+        bliss_stdlib::MethodCombinationType::List => Ok(vec_to_list(results)),
+        bliss_stdlib::MethodCombinationType::Append
+        | bliss_stdlib::MethodCombinationType::Nconc => {
+            let mut combined = Vec::new();
+            for result in results {
+                combined.extend(list_to_vec(*result));
+            }
+            Ok(vec_to_list(&combined))
+        }
+        bliss_stdlib::MethodCombinationType::Progn
+        | bliss_stdlib::MethodCombinationType::Standard => {
+            Ok(results.last().copied().unwrap_or(NIL))
+        }
+        bliss_stdlib::MethodCombinationType::Plus => {
+            let mut sum = 0.0;
+            let mut is_float = false;
+            for result in results {
+                sum += num_val(*result)?;
+                is_float |= result.is_single_float();
+            }
+            Ok(if is_float {
+                BlissVal::from_single_float(sum as f32)
+            } else {
+                BlissVal::from_fixnum(sum as i64)
+            })
+        }
+        bliss_stdlib::MethodCombinationType::And => {
+            let mut last = T;
+            for result in results {
+                if result.is_nil() {
+                    return Ok(NIL);
+                }
+                last = *result;
+            }
+            Ok(last)
+        }
+        bliss_stdlib::MethodCombinationType::Or => {
+            for result in results {
+                if !result.is_nil() {
+                    return Ok(*result);
+                }
+            }
+            Ok(NIL)
+        }
+        bliss_stdlib::MethodCombinationType::Min => {
+            let mut best = *results.first().unwrap_or(&NIL);
+            let mut best_num = num_val(best)?;
+            for result in &results[1..] {
+                let num = num_val(*result)?;
+                if num < best_num {
+                    best = *result;
+                    best_num = num;
+                }
+            }
+            Ok(best)
+        }
+        bliss_stdlib::MethodCombinationType::Max => {
+            let mut best = *results.first().unwrap_or(&NIL);
+            let mut best_num = num_val(best)?;
+            for result in &results[1..] {
+                let num = num_val(*result)?;
+                if num > best_num {
+                    best = *result;
+                    best_num = num;
+                }
+            }
+            Ok(best)
+        }
+    }
+}
+
+fn invoke_generic_function(
+    name: &str,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    let methods = env.methods.get(name).cloned().unwrap_or_default();
+    if methods.is_empty() {
+        return Err(BlissError::Internal(format!(
+            "No applicable method for {}",
+            name
+        )));
+    }
+
+    let mut applicable: Vec<(MethodDef, Vec<usize>)> = methods
+        .into_iter()
+        .filter_map(|method| method_specificity_vector(env, &method, args).map(|key| (method, key)))
+        .collect();
+    applicable.sort_by(|a, b| a.1.cmp(&b.1));
+    if applicable.is_empty() {
+        return Err(BlissError::Internal(format!(
+            "No applicable method for {}",
+            name
+        )));
+    }
+
+    let ordered: Vec<MethodDef> = applicable.into_iter().map(|(method, _)| method).collect();
+    let mut method_map = HashMap::new();
+    let method_ids: Vec<BlissVal> = ordered
+        .iter()
+        .map(|method| {
+            method_map.insert(method.method_id, method.clone());
+            method.method_id
+        })
+        .collect();
+
+    let combination = env
+        .generics
+        .get(name)
+        .map(|generic| generic.combination)
+        .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
+    let effective = bliss_stdlib::compute_effective_method(NIL, combination, &method_ids)?;
+    match combination {
+        bliss_stdlib::MethodCombinationType::Standard => {
+            let Some((around_ids, before_ids, primary_ids, after_ids)) =
+                bliss_stdlib::clos::get_effective_method(effective)
+            else {
+                return Err(BlissError::Internal(
+                    "missing standard effective method".into(),
+                ));
+            };
+            let around: Vec<MethodDef> = around_ids
+                .into_iter()
+                .filter_map(|id| method_map.get(&id).cloned())
+                .collect();
+            let before: Vec<MethodDef> = before_ids
+                .into_iter()
+                .filter_map(|id| method_map.get(&id).cloned())
+                .collect();
+            let primary: Vec<MethodDef> = primary_ids
+                .into_iter()
+                .filter_map(|id| method_map.get(&id).cloned())
+                .collect();
+            let after: Vec<MethodDef> = after_ids
+                .into_iter()
+                .filter_map(|id| method_map.get(&id).cloned())
+                .collect();
+            invoke_standard_methods(env, &around, &before, &primary, &after, args)
+        }
+        other => {
+            let Some((short_combination, method_ids)) =
+                bliss_stdlib::clos::get_short_form_method(effective)
+            else {
+                return Err(BlissError::Internal(
+                    "missing short-form effective method".into(),
+                ));
+            };
+            debug_assert_eq!(other, short_combination);
+            let mut results = Vec::new();
+            for method_id in method_ids {
+                let method = method_map.get(&method_id).ok_or_else(|| {
+                    BlissError::Internal("short-form method lookup failed".into())
+                })?;
+                results.push(invoke_method(env, method, args, None)?);
+            }
+            combine_short_form_results(short_combination, &results)
+        }
+    }
 }
 
 impl Env {
@@ -774,6 +1182,7 @@ impl Env {
             macros: Rc::new(HashMap::new()),
             symbol_macros: Rc::new(HashMap::new()),
             classes: Rc::new(HashMap::new()),
+            generics: Rc::new(HashMap::new()),
             methods: Rc::new(HashMap::new()),
             packages: Rc::new(packages),
             current_package: "COMMON-LISP-USER".to_string(),
@@ -786,6 +1195,7 @@ impl Env {
             block_stack: Vec::new(),
             catch_stack: Vec::new(),
             tag_stack: Vec::new(),
+            method_context: Vec::new(),
             eval_context: EvalContext::Repl,
         };
         env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
@@ -814,6 +1224,7 @@ impl Env {
             macros: Rc::clone(&self.macros),
             symbol_macros: Rc::clone(&self.symbol_macros),
             classes: Rc::clone(&self.classes),
+            generics: Rc::clone(&self.generics),
             methods: Rc::clone(&self.methods),
             packages: Rc::clone(&self.packages),
             current_package: self.current_package.clone(),
@@ -826,6 +1237,7 @@ impl Env {
             block_stack: self.block_stack.clone(),
             catch_stack: self.catch_stack.clone(),
             tag_stack: self.tag_stack.clone(),
+            method_context: self.method_context.clone(),
             eval_context: self.eval_context,
         }
     }
@@ -841,6 +1253,7 @@ impl Env {
             macros: Rc::clone(&self.macros),
             symbol_macros: Rc::clone(&self.symbol_macros),
             classes: Rc::clone(&self.classes),
+            generics: Rc::clone(&self.generics),
             methods: Rc::clone(&self.methods),
             packages: Rc::clone(&self.packages),
             current_package: self.current_package.clone(),
@@ -853,6 +1266,7 @@ impl Env {
             block_stack: self.block_stack.clone(),
             catch_stack: self.catch_stack.clone(),
             tag_stack: self.tag_stack.clone(),
+            method_context: self.method_context.clone(),
             eval_context: self.eval_context,
         }
     }
@@ -3681,7 +4095,105 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return bliss_stdlib::make_instance(class, &initargs);
             }
+            "SLOT-VALUE" => {
+                let (instance_form, rest) = cp(cdr);
+                let (slot_form, _) = cp(rest);
+                let instance = eval_form(instance_form, env)?;
+                let slot = eval_form(slot_form, env)?;
+                return bliss_stdlib::slot_value(instance, slot);
+            }
+            "SLOT-BOUNDP" => {
+                let (instance_form, rest) = cp(cdr);
+                let (slot_form, _) = cp(rest);
+                let instance = eval_form(instance_form, env)?;
+                let slot = eval_form(slot_form, env)?;
+                return Ok(if bliss_stdlib::slot_boundp(instance, slot)? {
+                    T
+                } else {
+                    NIL
+                });
+            }
+            "CLASS-OF" => {
+                let (object_form, _) = cp(cdr);
+                let object = eval_form(object_form, env)?;
+                return Ok(bliss_stdlib::class_of(object));
+            }
+            "INITIALIZE-INSTANCE" => {
+                let (instance_form, init_args) = cp(cdr);
+                let instance = eval_form(instance_form, env)?;
+                let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
+                let initargs = evaluated_initargs(&class_name, init_args, env)?;
+                bliss_stdlib::initialize_instance(instance, &initargs)?;
+                return Ok(instance);
+            }
+            "REINITIALIZE-INSTANCE" => {
+                let (instance_form, init_args) = cp(cdr);
+                let instance = eval_form(instance_form, env)?;
+                let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
+                let initargs = evaluated_initargs(&class_name, init_args, env)?;
+                bliss_stdlib::reinitialize_instance(instance, &initargs)?;
+                return Ok(instance);
+            }
+            "CHANGE-CLASS" => {
+                let (instance_form, rest) = cp(cdr);
+                let (class_form, _) = cp(rest);
+                let instance = eval_form(instance_form, env)?;
+                let class_input = eval_form(class_form, env)?;
+                let class = resolve_class_metaobject(env, class_input)?;
+                bliss_stdlib::change_class(instance, class)?;
+                return Ok(instance);
+            }
+            "CALL-NEXT-METHOD" => {
+                let context = env.method_context.last().cloned().ok_or_else(|| {
+                    BlissError::UndefinedFunction(resolve_sym("CALL-NEXT-METHOD").unwrap_or(NIL))
+                })?;
+                let args = if cdr.is_nil() {
+                    context.args.clone()
+                } else {
+                    let mut args = Vec::new();
+                    let mut cursor = cdr;
+                    while cursor.is_cons() {
+                        let (arg_form, rest) = cp(cursor);
+                        args.push(eval_form(arg_form, env)?);
+                        cursor = rest;
+                    }
+                    args
+                };
+                return invoke_next_method(env, &context, &args);
+            }
             "CERROR" => return eval_cerror(cdr, env),
+            "COMPUTE-RESTARTS" => {
+                let args = list_to_vec(cdr);
+                let condition = if args.is_empty() {
+                    None
+                } else {
+                    Some(eval_form(args[0], env)?)
+                };
+                let mut restarts = Vec::new();
+                for restart in env.restarts.iter().rev().cloned().collect::<Vec<_>>() {
+                    if restart_applies(&restart, condition, env)? {
+                        restarts.push(resolve_sym(&restart.name).unwrap_or(NIL));
+                    }
+                }
+                return Ok(vec_to_list(&restarts));
+            }
+            "FIND-RESTART" => {
+                let (name_form, rest) = cp(cdr);
+                let restart_name = symbol_bare_name(&val_as_str(eval_form(name_form, env)?));
+                let condition = if rest.is_cons() {
+                    Some(eval_form(cp(rest).0, env)?)
+                } else {
+                    None
+                };
+                for restart in env.restarts.iter().rev().cloned().collect::<Vec<_>>() {
+                    if symbol_bare_name(&restart.name) == restart_name
+                        && restart_applies(&restart, condition, env)?
+                    {
+                        return Ok(resolve_sym(&restart.name).unwrap_or(NIL));
+                    }
+                }
+                return Ok(NIL);
+            }
             "INVOKE-RESTART" => {
                 let (name_form, rest_args) = cp(cdr);
                 let name_val = eval_form(name_form, env)?;
@@ -3693,31 +4205,61 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     args.push(eval_form(arg_form, env)?);
                     c = rest;
                 }
-                for restart in env.restarts.iter().rev() {
+                for restart in env.restarts.iter().rev().cloned().collect::<Vec<_>>() {
                     if restart.name == restart_name {
-                        let result = match &restart.function {
-                            RestartFunction::FunctionForm {
-                                function_form,
-                                captured_frame,
-                            } => {
-                                let mut restart_env =
-                                    env.child_with_parent(thaw_env_frame(captured_frame));
-                                let function = eval_form(*function_form, &mut restart_env)?;
-                                apply_function(function, &args, &mut restart_env)?
-                            }
-                            RestartFunction::ContinueNil => NIL,
-                        };
-                        store_control_value(&format!("RESTART-RESULT:{restart_name}"), result);
-                        return Err(BlissError::Internal(format!(
-                            "__RESTART_INVOKED__:{}",
-                            restart_name
-                        )));
+                        let result = invoke_restart_function(&restart.function, &args, env)?;
+                        if restart.unwind_on_invoke {
+                            store_control_value(&format!("RESTART-RESULT:{restart_name}"), result);
+                            return Err(BlissError::Internal(format!(
+                                "__RESTART_INVOKED__:{}",
+                                restart_name
+                            )));
+                        }
+                        return Ok(result);
                     }
                 }
                 return Err(BlissError::Internal(format!(
                     "Restart {} not found",
                     restart_name
                 )));
+            }
+            "INVOKE-RESTART-INTERACTIVELY" => {
+                let (restart_form, _) = cp(cdr);
+                let restart = eval_form(restart_form, env)?;
+                let restart_name = symbol_bare_name(&val_as_str(restart)).to_uppercase();
+                let Some(entry) = env
+                    .restarts
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.name == restart_name)
+                    .cloned()
+                else {
+                    return Err(BlissError::Internal(format!(
+                        "Restart {} not found",
+                        restart_name
+                    )));
+                };
+                let interactive_args = if let Some(interactive) = &entry.interactive_function {
+                    let value = invoke_restart_function(interactive, &[], env)?;
+                    if value.is_nil() {
+                        Vec::new()
+                    } else if value.is_cons() {
+                        list_to_vec(value)
+                    } else {
+                        vec![value]
+                    }
+                } else {
+                    Vec::new()
+                };
+                let result = invoke_restart_function(&entry.function, &interactive_args, env)?;
+                if entry.unwind_on_invoke {
+                    store_control_value(&format!("RESTART-RESULT:{restart_name}"), result);
+                    return Err(BlissError::Internal(format!(
+                        "__RESTART_INVOKED__:{}",
+                        restart_name
+                    )));
+                }
+                return Ok(result);
             }
             "WITH-OPEN-FILE" => return eval_with_open_file(cdr, env),
             "LOAD" => {
@@ -4265,17 +4807,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         if let Some(slot_name) = accessor_slot_name {
             let (inst_form, _) = cp(cdr);
             let inst = eval_form(inst_form, env)?;
-            let slots_alist = get_instance_slots(inst);
-            for pair in &slots_alist {
-                if pair.0 == slot_name {
-                    return Ok(pair.1);
-                }
-            }
-            return Ok(NIL);
+            return bliss_stdlib::slot_value(inst, resolve_sym(&slot_name).unwrap_or(NIL));
         }
 
         // Check methods
-        if let Some(methods) = env.methods.get(&name).cloned() {
+        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
             let mut args = Vec::new();
             let mut c = cdr;
             while c.is_cons() {
@@ -4283,48 +4819,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 args.push(eval_form(af, env)?);
                 c = r;
             }
-
-            let mut best_method: Option<(MethodDef, Vec<usize>)> = None;
-            for method in methods.iter().rev() {
-                if method.specializers.len() > args.len() {
-                    continue;
-                }
-                let mut distances = Vec::with_capacity(method.specializers.len());
-                let mut applicable = true;
-                for (arg, specializer) in args.iter().zip(method.specializers.iter()) {
-                    if !method_specializer_matches(*arg, specializer, env) {
-                        applicable = false;
-                        break;
-                    }
-                    distances.push(
-                        method_specificity_distance(*arg, specializer, env)
-                            .unwrap_or(usize::MAX / 2),
-                    );
-                }
-                if !applicable {
-                    continue;
-                }
-                let replace = match &best_method {
-                    Some((_, current_distances)) => distances < *current_distances,
-                    None => true,
-                };
-                if replace {
-                    best_method = Some((method.clone(), distances));
-                }
-            }
-
-            if let Some((m, _)) = best_method {
-                let m = m.clone();
-                let mut child_env = env.child();
-                for (i, param) in m.params.iter().enumerate() {
-                    child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
-                }
-                return eval_progn(m.body, &mut child_env);
-            }
-            return Err(BlissError::Internal(format!(
-                "No applicable method for {}",
-                name
-            )));
+            return invoke_generic_function(&name, &args, env);
         }
 
         // Check for package-qualified symbols (e.g., TEST-PKG:HELLO)
@@ -6932,13 +7427,45 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             slots,
         },
     );
+    let direct_supers: Result<Vec<BlissVal>, BlissError> = super_list
+        .iter()
+        .map(|super_name| resolve_class_metaobject(env, *super_name))
+        .collect();
+    let slot_names: Vec<BlissVal> = env.classes[&name]
+        .slots
+        .iter()
+        .map(|slot| resolve_sym(&slot.name).unwrap_or(NIL))
+        .collect();
+    bliss_stdlib::define_class(name_form, name_form, &direct_supers?, &slot_names)?;
     Ok(name_form)
 }
 
 // ── DEFGENERIC ───────────────────────────────────────────────────
 fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (name_form, _rest) = cp(cdr);
+    let (name_form, options) = cp(cdr);
     let name = sym_name(name_form);
+    let mut combination = bliss_stdlib::MethodCombinationType::Standard;
+    let mut opts = options;
+    while opts.is_cons() {
+        let (option, rest) = cp(opts);
+        if option.is_cons() {
+            let (option_name, option_rest) = cp(option);
+            if symbol_bare_name(&sym_name(option_name)) == "METHOD-COMBINATION" {
+                let method_combination = cp(option_rest).0;
+                combination = method_combination_from_name(&sym_name(method_combination))
+                    .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
+            }
+        }
+        opts = rest;
+    }
+    let generic_function = bliss_stdlib::make_generic_function(name_form, NIL)?;
+    Rc::make_mut(&mut env.generics).insert(
+        name.clone(),
+        GenericDef {
+            generic_function,
+            combination,
+        },
+    );
     Rc::make_mut(&mut env.methods).entry(name).or_default();
     Ok(name_form)
 }
@@ -6946,8 +7473,36 @@ fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
 // ── DEFMETHOD ────────────────────────────────────────────────────
 fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, rest) = cp(cdr);
-    let (spec_params_form, body) = cp(rest);
     let name = sym_name(name_form);
+    let combination = env
+        .generics
+        .get(&name)
+        .map(|generic| generic.combination)
+        .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
+    let mut cursor = rest;
+    let mut qualifier = bliss_stdlib::MethodQualifier::Primary;
+    while cursor.is_cons() {
+        let (head, tail) = cp(cursor);
+        if head.is_cons() {
+            cursor = arena_cons(head, tail);
+            break;
+        }
+        if !head.is_symbol() {
+            break;
+        }
+        match symbol_bare_name(&sym_name(head)).as_str() {
+            "AROUND" => qualifier = bliss_stdlib::MethodQualifier::Around,
+            "BEFORE" => qualifier = bliss_stdlib::MethodQualifier::Before,
+            "AFTER" => qualifier = bliss_stdlib::MethodQualifier::After,
+            qualifier_name
+                if combination != bliss_stdlib::MethodCombinationType::Standard
+                    && method_combination_from_name(qualifier_name) == Some(combination) => {}
+            _ => break,
+        }
+        cursor = tail;
+    }
+    let (spec_params_form, body) = cp(cursor);
+    let method_id = next_stdlib_class_id();
 
     // Parse specialized params: ((var class) ...)
     let params_list = list_to_vec(spec_params_form);
@@ -6959,17 +7514,48 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
             let (var_form, rest_p) = cp(*p);
             let (class_form, _) = cp(rest_p);
             params.push(sym_name(var_form));
-            specializers.push(sym_name(class_form));
+            if class_form.is_cons() {
+                let (head, value_rest) = cp(class_form);
+                if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "EQL" {
+                    specializers.push(MethodSpecializer::Eql(eval_form(cp(value_rest).0, env)?));
+                } else {
+                    specializers.push(MethodSpecializer::Class(sym_name(class_form)));
+                }
+            } else {
+                let specializer_name = sym_name(class_form);
+                if symbol_bare_name(&specializer_name) == "T" {
+                    specializers.push(MethodSpecializer::Any);
+                } else {
+                    specializers.push(MethodSpecializer::Class(specializer_name));
+                }
+            }
         } else if p.is_symbol() {
             params.push(sym_name(*p));
-            specializers.push("T".to_string());
+            specializers.push(MethodSpecializer::Any);
         }
     }
+
+    let generic_function = if let Some(generic) = env.generics.get(&name) {
+        generic.generic_function
+    } else {
+        let gf = bliss_stdlib::make_generic_function(name_form, NIL)?;
+        Rc::make_mut(&mut env.generics).insert(
+            name.clone(),
+            GenericDef {
+                generic_function: gf,
+                combination: bliss_stdlib::MethodCombinationType::Standard,
+            },
+        );
+        gf
+    };
+    bliss_stdlib::clos::add_method(generic_function, method_id)?;
+    bliss_stdlib::set_method_specializers(method_id, vec![], qualifier);
 
     Rc::make_mut(&mut env.methods)
         .entry(name.clone())
         .or_default()
         .push(MethodDef {
+            method_id,
             specializers,
             params,
             body,
@@ -6980,85 +7566,11 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
 // ── MAKE-INSTANCE ────────────────────────────────────────────────
 fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (class_form, init_args) = cp(cdr);
-    let class_val = eval_form(class_form, env)?;
-    let class_name = sym_name(class_val);
-
-    let class_def = env
-        .classes
-        .get(&class_name)
-        .cloned()
-        .ok_or_else(|| BlissError::Internal(format!("Unknown class: {}", class_name)))?;
-
-    // Parse keyword init args
-    let args_vec = list_to_vec(init_args);
-    let mut init_map: HashMap<String, BlissVal> = HashMap::new();
-    let mut i = 0;
-    while i + 1 < args_vec.len() {
-        let key_val = eval_form(args_vec[i], env)?;
-        let key_name = sym_name(key_val)
-            .trim_start_matches("KEYWORD:")
-            .trim_start_matches(':')
-            .to_string();
-        let val = eval_form(args_vec[i + 1], env)?;
-        init_map.insert(key_name, val);
-        i += 2;
-    }
-
-    // Build instance as a list: (CLASS-NAME (slot1 . val1) (slot2 . val2) ...)
-    let mut slot_pairs = Vec::new();
-    for slot in &class_def.slots {
-        let val = if let Some(ref ia) = slot.initarg {
-            init_map.get(ia).copied().unwrap_or(NIL)
-        } else {
-            init_map.get(&slot.name).copied().unwrap_or(NIL)
-        };
-        let name_val = arena_str(&slot.name);
-        slot_pairs.push(arena_cons(name_val, val));
-    }
-
-    let class_name_val = arena_str(&class_name);
-    let mut result = vec_to_list(&slot_pairs);
-    result = arena_cons(class_name_val, result);
-    Ok(result)
-}
-
-fn get_instance_class_name(val: BlissVal) -> String {
-    if val.is_cons() {
-        let (car, _) = cp(val);
-        return val_as_str(car);
-    }
-    "T".to_string()
-}
-
-fn get_instance_slots(val: BlissVal) -> Vec<(String, BlissVal)> {
-    let mut result = Vec::new();
-    if val.is_cons() {
-        let (_, slots) = cp(val); // skip class name
-        let mut c = slots;
-        while c.is_cons() {
-            let (pair, rest) = cp(c);
-            if pair.is_cons() {
-                let (name_val, slot_val) = cp(pair);
-                result.push((val_as_str(name_val), slot_val));
-            }
-            c = rest;
-        }
-    }
-    result
-}
-
-fn is_subclass(child: &str, parent: &str, env: &Env) -> bool {
-    if child == parent {
-        return true;
-    }
-    if let Some(class_def) = env.classes.get(child) {
-        for super_name in &class_def.supers {
-            if is_subclass(super_name, parent, env) {
-                return true;
-            }
-        }
-    }
-    false
+    let class_input = eval_form(class_form, env)?;
+    let class = resolve_class_metaobject(env, class_input)?;
+    let class_name = class_name_for_instance_class(class);
+    let initargs = evaluated_initargs(&class_name, init_args, env)?;
+    bliss_stdlib::make_instance(class, &initargs)
 }
 
 // ── Apply function (lambda or named) ─────────────────────────────
@@ -7078,6 +7590,9 @@ fn apply_function(
                 args,
                 Rc::clone(&env.frame),
             );
+        }
+        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
+            return invoke_generic_function(&name, args, env);
         }
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
         // full operator-position builtin set (not just apply_builtin's subset)
@@ -7373,6 +7888,39 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     result
 }
 
+fn parse_restart_options(
+    option_forms: BlissVal,
+    captured_frame: &Arc<FrozenEnvFrame>,
+) -> (Option<RestartFunction>, Option<RestartFunction>) {
+    let options = list_to_vec(option_forms);
+    let mut interactive_function = None;
+    let mut test_function = None;
+    let mut index = 0;
+    while index + 1 < options.len() {
+        let key = options[index];
+        let value = options[index + 1];
+        if key.is_symbol() {
+            match symbol_bare_name(&sym_name(key)).as_str() {
+                "INTERACTIVE-FUNCTION" => {
+                    interactive_function = Some(RestartFunction::FunctionForm {
+                        function_form: value,
+                        captured_frame: captured_frame.clone(),
+                    });
+                }
+                "TEST-FUNCTION" => {
+                    test_function = Some(RestartFunction::FunctionForm {
+                        function_form: value,
+                        captured_frame: captured_frame.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        index += 2;
+    }
+    (interactive_function, test_function)
+}
+
 // ── RESTART-BIND ────────────────────────────────────────────────
 fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (bindings_form, body) = cp(cdr);
@@ -7382,13 +7930,18 @@ fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     while c.is_cons() {
         let (binding, rest) = cp(c);
         let (name_form, binding_rest) = cp(binding);
-        let (function_form, _) = cp(binding_rest);
+        let (function_form, option_forms) = cp(binding_rest);
+        let (interactive_function, test_function) =
+            parse_restart_options(option_forms, &captured_frame);
         env.restarts.push(RestartEntry {
             name: sym_name(name_form).to_uppercase(),
             function: RestartFunction::FunctionForm {
                 function_form,
                 captured_frame: captured_frame.clone(),
             },
+            interactive_function,
+            test_function,
+            unwind_on_invoke: false,
         });
         c = rest;
     }
@@ -7417,6 +7970,9 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
                 ),
                 captured_frame: captured_frame.clone(),
             },
+            interactive_function: None,
+            test_function: None,
+            unwind_on_invoke: true,
         });
         c = rest;
     }
@@ -7445,6 +8001,9 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     env.restarts.push(RestartEntry {
         name: "CONTINUE".to_string(),
         function: RestartFunction::ContinueNil,
+        interactive_function: None,
+        test_function: None,
+        unwind_on_invoke: true,
     });
 
     let result = signal_condition_object(condition, env);

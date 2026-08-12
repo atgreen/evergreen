@@ -81,15 +81,41 @@
 (defvar *condition-types* nil)
 (defvar *condition-definitions* nil)
 
+(defun %define-condition-option-reader-defs (slot-name opts)
+  (if opts
+      (let ((key (car opts))
+            (value (car (cdr opts))))
+        (if (or (eq key :reader) (eq key :accessor))
+            (cons `(defun ,value (instance)
+                     (slot-value instance ',slot-name))
+                  (%define-condition-option-reader-defs slot-name (cdr (cdr opts))))
+            (%define-condition-option-reader-defs slot-name (cdr (cdr opts)))))
+      nil))
+
+(defun %define-condition-slot-reader-defs (slot)
+  (if (consp slot)
+      (%define-condition-option-reader-defs (car slot) (cdr slot))
+      nil))
+
+(defun %define-condition-reader-defs (slots)
+  (if slots
+      (append (%define-condition-slot-reader-defs (car slots))
+              (%define-condition-reader-defs (cdr slots)))
+      nil))
+
 (defmacro define-condition (name parents slots &rest options)
-  `(progn
-     (setq *condition-types*
-           (cons (list ',name ',(if parents parents '(condition)))
-                 *condition-types*))
-     (setq *condition-definitions*
-           (cons (list ',name ',(if parents parents '(condition)) ',slots ',options)
-                 *condition-definitions*))
-     ',name))
+  (let ((effective-parents (if parents parents '(condition)))
+        (reader-defs (%define-condition-reader-defs slots)))
+    `(progn
+       (setq *condition-types*
+             (cons (list ',name ',effective-parents)
+                   *condition-types*))
+       (setq *condition-definitions*
+             (cons (list ',name ',effective-parents ',slots ',options)
+                   *condition-definitions*))
+       (defclass ,name ,effective-parents ,slots)
+       ,@reader-defs
+       ',name)))
 
 (defmacro check-type (place typespec &rest ignore)
   (declare (ignore ignore))

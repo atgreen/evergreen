@@ -738,3 +738,138 @@ fn stage_four_gate_runs_conditions_clos_and_restarts_through_the_real_cli() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn stage_four_cli_exposes_condition_readers_and_core_clos_slot_protocol() {
+    let output = bliss()
+        .args([
+            "--eval",
+            "(progn
+               (define-condition pet-error (error) ((name :initarg :name :reader pet-error-name)))
+               (defclass animal () ((name :initarg :name)))
+               (defclass dog (animal) ((breed :initarg :breed)))
+               (let ((pet (make-instance 'animal :name 'spot))
+                     (dog (make-instance 'dog :name 'fido :breed 'collie))
+                     (err (make-condition 'pet-error :name 'bad-dog)))
+                 (list (pet-error-name err)
+                       (slot-value pet 'name)
+                       (slot-boundp dog 'breed)
+                       (class-of dog)
+                       (progn
+                         (reinitialize-instance dog :breed 'shepherd)
+                         (slot-value dog 'breed))
+                       (progn
+                         (change-class pet 'dog)
+                         (slot-boundp pet 'breed)))))",
+        ])
+        .output()
+        .expect("run bliss stage-4 clos slot protocol");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    assert!(stdout.contains("BAD-DOG"), "stdout: {stdout}");
+    assert!(stdout.contains("SPOT"), "stdout: {stdout}");
+    assert!(stdout.contains("SHEPHERD"), "stdout: {stdout}");
+    assert!(stdout.contains("T"), "stdout: {stdout}");
+    assert!(stdout.contains("NIL"), "stdout: {stdout}");
+}
+
+#[test]
+fn stage_four_cli_supports_call_next_method_eql_specializers_and_short_form_combination() {
+    let output = bliss()
+        .args([
+            "--eval",
+            "(progn
+               (defclass animal () ())
+               (defclass dog (animal) ())
+               (defgeneric speak (x))
+               (defmethod speak :before ((x animal)) (print 'before-animal))
+               (defmethod speak :after ((x animal)) (print 'after-animal))
+               (defmethod speak :around ((x animal)) (call-next-method))
+               (defmethod speak ((x animal)) 'animal)
+               (defmethod speak ((x dog)) (call-next-method))
+               (defgeneric pick (x))
+               (defmethod pick ((x (eql 7))) 'seven)
+               (defmethod pick ((x t)) 'other)
+               (defgeneric collect (x) (:method-combination list))
+               (defmethod collect ((x t)) 'a)
+               (defmethod collect ((x t)) 'b)
+               (defgeneric sum-values (x) (:method-combination +))
+               (defmethod sum-values + ((x t)) 1)
+               (defmethod sum-values + ((x t)) 2)
+               (list (speak (make-instance 'dog))
+                     (pick 7)
+                     (collect 0)
+                     (sum-values 0)))",
+        ])
+        .output()
+        .expect("run bliss stage-4 generic dispatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    assert!(stdout.contains("BEFORE-ANIMAL"), "stdout: {stdout}");
+    assert!(stdout.contains("AFTER-ANIMAL"), "stdout: {stdout}");
+    assert!(stdout.contains("ANIMAL"), "stdout: {stdout}");
+    assert!(stdout.contains("SEVEN"), "stdout: {stdout}");
+    assert!(stdout.contains("(A B)"), "stdout: {stdout}");
+    assert!(stdout.contains("3"), "stdout: {stdout}");
+}
+
+#[test]
+fn stage_four_cli_exposes_restart_queries_and_interactive_invocation() {
+    let output = bliss()
+        .args([
+            "--eval",
+            "(restart-bind
+               ((visible (lambda (x) x)
+                  :interactive-function (lambda () 99)
+                  :test-function (lambda (c) t))
+                (hidden (lambda () 'hidden)
+                  :test-function (lambda (c) nil)))
+               (list (compute-restarts 'dummy)
+                     (find-restart 'visible 'dummy)
+                     (invoke-restart-interactively 'visible)))",
+        ])
+        .output()
+        .expect("run bliss stage-4 restart apis");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    assert!(stdout.contains("VISIBLE"), "stdout: {stdout}");
+    assert!(!stdout.contains("HIDDEN"), "stdout: {stdout}");
+    assert!(stdout.contains("99"), "stdout: {stdout}");
+}
+
+#[test]
+fn stage_four_cli_rejects_builtin_class_instantiation() {
+    let output = bliss()
+        .args(["--eval", "(make-instance (class-of 7))"])
+        .output()
+        .expect("run bliss built-in instantiation rejection");
+
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
