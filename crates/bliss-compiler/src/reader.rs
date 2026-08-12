@@ -994,25 +994,164 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
         }
         return Ok(None);
     }
-    // Float: contains '.' or 'E'/'e' with digits (only for base 10)
-    if read_base == 10
-        && (s.contains('.')
-            || (s.contains('e') || s.contains('E'))
-                && !s
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit() || c == '+' || c == '-'))
-    {
-        if let Ok(f) = s.parse::<f32>() {
+    // Float literal (base 10 only): a token with a decimal point and/or an
+    // exponent marker. CL allows exponent markers e/E, s/S, f/F, d/D, l/L;
+    // `1.5d0` (double-float syntax) and `1d0` must read as a float, not a
+    // symbol. parse_decimal_float validates the grammar so hex-like symbols
+    // (e.g. `FACE` in a base-16 context) are not misread as floats.
+    if read_base == 10 {
+        if let Some(f) = parse_decimal_float(s) {
             return Ok(Some(BlissVal::from_single_float(f)));
         }
-        return Ok(None);
     }
-    // Integer with read_base
+    // Integer with read_base. Integers that fit the 61-bit fixnum range are
+    // immediates; anything larger (including values that overflow i64) becomes
+    // a bignum (§1.8.1) rather than silently degrading to a symbol.
     let trimmed = s.trim_start_matches('+');
     if let Ok(n) = i64::from_str_radix(trimmed, read_base) {
-        return Ok(Some(BlissVal::from_fixnum(n)));
+        if fits_fixnum(n) {
+            return Ok(Some(BlissVal::from_fixnum(n)));
+        }
+        return Ok(Some(alloc_bignum_from_i64(n)));
+    }
+    // i64 overflow: parse as an arbitrary-precision bignum if the token is a
+    // valid integer literal in this base.
+    if let Some(b) = parse_bignum(trimmed, read_base) {
+        return Ok(Some(b));
     }
     Ok(None)
+}
+
+/// True when `n` fits the 61-bit signed fixnum range.
+fn fits_fixnum(n: i64) -> bool {
+    const MAX: i64 = (1 << 60) - 1;
+    const MIN: i64 = -(1 << 60);
+    (MIN..=MAX).contains(&n)
+}
+
+/// Parse a base-10 float literal following CL float syntax, normalizing any
+/// exponent marker (e/s/f/d/l) to `e`. Returns `None` for non-floats.
+fn parse_decimal_float(s: &str) -> Option<f32> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0;
+    let mut has_digit = false;
+    let mut has_dot = false;
+    let mut has_exp = false;
+    let mut prev_digit = false;
+
+    if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
+        out.push(chars[i]);
+        i += 1;
+    }
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_ascii_digit() {
+            has_digit = true;
+            prev_digit = true;
+            out.push(c);
+            i += 1;
+        } else if c == '.' && !has_dot && !has_exp {
+            has_dot = true;
+            prev_digit = false;
+            out.push('.');
+            i += 1;
+        } else if !has_exp
+            && prev_digit
+            && matches!(
+                c,
+                'e' | 'E' | 's' | 'S' | 'f' | 'F' | 'd' | 'D' | 'l' | 'L'
+            )
+        {
+            has_exp = true;
+            out.push('e');
+            i += 1;
+            if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
+                out.push(chars[i]);
+                i += 1;
+            }
+            let mut exp_digits = false;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                out.push(chars[i]);
+                exp_digits = true;
+                i += 1;
+            }
+            if !exp_digits {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    // A real float needs at least one digit and either a dot or an exponent.
+    if !has_digit || (!has_dot && !has_exp) {
+        return None;
+    }
+    out.parse::<f32>().ok()
+}
+
+/// Allocate a bignum from an i64 that does not fit the fixnum range.
+fn alloc_bignum_from_i64(n: i64) -> BlissVal {
+    let sign = if n < 0 { -1 } else { 1 };
+    let mag = n.unsigned_abs();
+    alloc_bignum(sign, &[mag])
+}
+
+/// Parse a (possibly signed) integer literal in `base` into a bignum.
+/// Returns `None` if the token is not a valid integer in that base.
+fn parse_bignum(s: &str, base: u32) -> Option<BlissVal> {
+    let (neg, digits) = if let Some(r) = s.strip_prefix('-') {
+        (true, r)
+    } else if let Some(r) = s.strip_prefix('+') {
+        (false, r)
+    } else {
+        (false, s)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut limbs: Vec<u64> = vec![0];
+    for ch in digits.chars() {
+        let d = ch.to_digit(base)? as u64;
+        let mut carry = d;
+        for limb in limbs.iter_mut() {
+            let v = (*limb as u128) * (base as u128) + carry as u128;
+            *limb = v as u64;
+            carry = (v >> 64) as u64;
+        }
+        if carry != 0 {
+            limbs.push(carry);
+        }
+    }
+    while limbs.len() > 1 && *limbs.last().unwrap() == 0 {
+        limbs.pop();
+    }
+    let sign = if limbs.len() == 1 && limbs[0] == 0 {
+        0
+    } else if neg {
+        -1
+    } else {
+        1
+    };
+    Some(alloc_bignum(sign, &limbs))
+}
+
+/// Allocate a BIGNUM heap object (§1.8.1): header + sign + n_limbs + limbs.
+fn alloc_bignum(sign: i32, limbs: &[u64]) -> BlissVal {
+    let n = limbs.len();
+    let total_size = 16 + n * 8;
+    let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout);
+        *(ptr as *mut ObjectHeader) =
+            ObjectHeader::new(type_id::BIGNUM, total_size.div_ceil(8) as u16);
+        *(ptr.add(8) as *mut i32) = sign;
+        *(ptr.add(12) as *mut u32) = n as u32;
+        for (idx, &limb) in limbs.iter().enumerate() {
+            *(ptr.add(16 + idx * 8) as *mut u64) = limb;
+        }
+        BlissVal::from_heap_ptr(ptr)
+    }
 }
 
 #[expect(
