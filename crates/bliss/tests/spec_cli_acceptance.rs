@@ -686,3 +686,55 @@ fn stage_three_gate_runs_a_library_heavy_program_through_the_real_cli() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn stage_four_gate_runs_conditions_clos_and_restarts_through_the_real_cli() {
+    // Per spec/stages.json stage 4, the real CLI gate must prove user-defined
+    // classes/generic functions plus condition handling/restarts end-to-end.
+    let dir = temp_dir("stage4-gate");
+    let script = dir.join("stage4-conditions-clos.lisp");
+    write_file(
+        &script,
+        "(define-condition pet-error (error) ())\n\
+         (defclass animal () ())\n\
+         (defclass dog (animal) ())\n\
+         (defclass cat (animal) ())\n\
+         (defgeneric pair-speak (x y))\n\
+         (defmethod pair-speak ((x animal) (y dog)) 'animal-dog)\n\
+         (defmethod pair-speak ((x dog) (y animal)) 'dog-animal)\n\
+         (print (pair-speak (make-instance 'animal) (make-instance 'dog)))\n\
+         (print (handler-case\n\
+                  (progn\n\
+                    (signal (make-condition 'pet-error))\n\
+                    'after)\n\
+                  (pet-error (c)\n\
+                    (declare (ignore c))\n\
+                    'caught)))\n\
+         (print (handler-bind\n\
+                  ((error (lambda (c)\n\
+                            (declare (ignore c))\n\
+                            (invoke-restart 'continue))))\n\
+                  (restart-case\n\
+                    (error \"boom\")\n\
+                    (continue () 'recovered))))\n",
+    );
+
+    let output = bliss()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run bliss stage-4 gate");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    assert!(stdout.contains("ANIMAL-DOG"), "stdout: {stdout}");
+    assert!(stdout.contains("CAUGHT"), "stdout: {stdout}");
+    assert!(stdout.contains("RECOVERED"), "stdout: {stdout}");
+
+    fs::remove_dir_all(dir).ok();
+}

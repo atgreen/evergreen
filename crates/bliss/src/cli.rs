@@ -530,7 +530,7 @@ struct SlotDef {
 
 #[derive(Clone)]
 struct MethodDef {
-    specializer: String,
+    specializers: Vec<String>,
     params: Vec<String>,
     body: BlissVal,
 }
@@ -547,7 +547,16 @@ struct PackageDef {
 #[derive(Clone)]
 struct RestartEntry {
     name: String,
-    body: Option<BlissVal>, // form to evaluate when restart is invoked
+    function: RestartFunction,
+}
+
+#[derive(Clone)]
+enum RestartFunction {
+    FunctionForm {
+        function_form: BlissVal,
+        captured_frame: Arc<FrozenEnvFrame>,
+    },
+    ContinueNil,
 }
 
 /// Sentinel error used for non-local control flow when invoke-restart is called.
@@ -561,7 +570,18 @@ struct RestartInvoked {
 #[derive(Clone)]
 struct HandlerEntry {
     type_name: String,
-    handler: BlissVal, // lambda form
+    handler: HandlerImpl,
+}
+
+#[derive(Clone)]
+enum HandlerImpl {
+    Function(BlissVal),
+    HandlerCase {
+        token: String,
+        var_name: Option<String>,
+        body: BlissVal,
+        captured_frame: Arc<FrozenEnvFrame>,
+    },
 }
 
 thread_local! {
@@ -647,6 +667,100 @@ fn thaw_env_frame(frame: &Arc<FrozenEnvFrame>) -> Rc<RefCell<EnvFrame>> {
 
 fn take_control_value(token: &str) -> BlissVal {
     CONTROL_VALUES.with(|values| values.borrow_mut().remove(token).unwrap_or(NIL))
+}
+
+fn handler_case_token(error: &BlissError) -> Option<String> {
+    let BlissError::Internal(message) = error else {
+        return None;
+    };
+    message
+        .strip_prefix("__HANDLER_CASE__:")
+        .map(ToString::to_string)
+}
+
+fn restart_invoked_name(error: &BlissError) -> Option<String> {
+    let BlissError::Internal(message) = error else {
+        return None;
+    };
+    message
+        .strip_prefix("__RESTART_INVOKED__:")
+        .map(ToString::to_string)
+}
+
+fn make_simple_error_condition(message: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let class = ensure_condition_class_registered(env, "SIMPLE-ERROR")?;
+    bliss_stdlib::make_instance(
+        class,
+        &[
+            resolve_sym("FORMAT-CONTROL").unwrap_or(NIL),
+            message,
+            resolve_sym("FORMAT-ARGUMENTS").unwrap_or(NIL),
+            NIL,
+        ],
+    )
+}
+
+fn eval_handler_impl(
+    handler: &HandlerImpl,
+    condition: BlissVal,
+    env: &mut Env,
+) -> Result<(), BlissError> {
+    match handler {
+        HandlerImpl::Function(function) => {
+            let _ = apply_function(*function, &[condition], env)?;
+            Ok(())
+        }
+        HandlerImpl::HandlerCase {
+            token,
+            var_name: _,
+            body: _,
+            captured_frame: _,
+        } => {
+            store_control_value(token, condition);
+            Err(BlissError::Internal(format!("__HANDLER_CASE__:{token}")))
+        }
+    }
+}
+
+fn signal_condition_object(condition: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let handlers = env.handlers.clone();
+    for handler in handlers.iter().rev() {
+        if condition_matches_handler(env, condition, &handler.type_name) {
+            eval_handler_impl(&handler.handler, condition, env)?;
+        }
+    }
+    Ok(NIL)
+}
+
+fn method_specializer_matches(arg: BlissVal, specializer: &str, env: &Env) -> bool {
+    let arg_class = get_instance_class_name(arg);
+    specializer == "T" || arg_class == specializer || is_subclass(&arg_class, specializer, env)
+}
+
+fn method_specificity_distance(arg: BlissVal, specializer: &str, env: &Env) -> Option<usize> {
+    if specializer == "T" {
+        return Some(usize::MAX / 2);
+    }
+    let arg_class = get_instance_class_name(arg);
+    if arg_class == specializer {
+        return Some(0);
+    }
+    superclass_distance(&arg_class, specializer, env)
+}
+
+fn superclass_distance(child: &str, parent: &str, env: &Env) -> Option<usize> {
+    if child == parent {
+        return Some(0);
+    }
+    let class_def = env.classes.get(child)?;
+    let mut best = None;
+    for super_name in &class_def.supers {
+        if let Some(distance) = superclass_distance(super_name, parent, env) {
+            let candidate = distance + 1;
+            best = Some(best.map_or(candidate, |current: usize| current.min(candidate)));
+        }
+    }
+    best
 }
 
 impl Env {
@@ -2671,7 +2785,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     val_as_str(control)
                 };
-                return Err(BlissError::Internal(format!("ERROR: {}", message)));
+                let condition = if args.len() == 1 && !control.is_string() {
+                    control
+                } else {
+                    make_simple_error_condition(arena_str(&message), env)?
+                };
+                match signal_condition_object(condition, env) {
+                    Ok(_) => return Err(BlissError::Internal(format!("ERROR: {}", message))),
+                    Err(error) => return Err(error),
+                }
             }
             "LET" => return eval_let(cdr, env, false),
             "LET*" => return eval_let(cdr, env, true),
@@ -2789,6 +2911,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "MACROEXPAND-1" => return eval_macroexpand(cdr, env, true),
             "MACROEXPAND" => return eval_macroexpand(cdr, env, false),
             "DEFCLASS" => return eval_defclass(cdr, env),
+            "DEFGENERIC" => return eval_defgeneric(cdr, env),
             "DEFMETHOD" => return eval_defmethod(cdr, env),
             "MAKE-INSTANCE" => return eval_make_instance(cdr, env),
             "FUNCTION" => {
@@ -3502,19 +3625,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "HANDLER-CASE" => return eval_handler_case(cdr, env),
             "HANDLER-BIND" => return eval_handler_bind(cdr, env),
+            "RESTART-BIND" => return eval_restart_bind(cdr, env),
+            "RESTART-CASE" => return eval_restart_case(cdr, env),
             "SIGNAL" => {
                 let args = list_to_vec(cdr);
                 if args.is_empty() {
                     return Err(BlissError::Internal("SIGNAL requires an argument".into()));
                 }
                 let cond = eval_form(args[0], env)?;
-                for handler in env.handlers.clone().iter().rev() {
-                    if condition_matches_handler(env, cond, &handler.type_name) {
-                        let hfn = handler.handler;
-                        let _ = apply_function(hfn, &[cond], env);
-                    }
-                }
-                return Ok(NIL);
+                return signal_condition_object(cond, env);
             }
             "MAKE-CONDITION" => {
                 let args = list_to_vec(cdr);
@@ -3564,19 +3683,31 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "CERROR" => return eval_cerror(cdr, env),
             "INVOKE-RESTART" => {
-                let (name_form, _rest_args) = cp(cdr);
+                let (name_form, rest_args) = cp(cdr);
                 let name_val = eval_form(name_form, env)?;
                 let restart_name = val_as_str(name_val).to_uppercase();
-                // Look up the restart by name in the restart stack
+                let mut args = Vec::new();
+                let mut c = rest_args;
+                while c.is_cons() {
+                    let (arg_form, rest) = cp(c);
+                    args.push(eval_form(arg_form, env)?);
+                    c = rest;
+                }
                 for restart in env.restarts.iter().rev() {
                     if restart.name == restart_name {
-                        // If restart has a body, evaluate it
-                        if let Some(body) = restart.body {
-                            let result = eval_progn(body, env)?;
-                            return Ok(result);
-                        }
-                        // Otherwise (e.g., CONTINUE restart from cerror), just return NIL
-                        // Signal the restart was invoked via a special error
+                        let result = match &restart.function {
+                            RestartFunction::FunctionForm {
+                                function_form,
+                                captured_frame,
+                            } => {
+                                let mut restart_env =
+                                    env.child_with_parent(thaw_env_frame(captured_frame));
+                                let function = eval_form(*function_form, &mut restart_env)?;
+                                apply_function(function, &args, &mut restart_env)?
+                            }
+                            RestartFunction::ContinueNil => NIL,
+                        };
+                        store_control_value(&format!("RESTART-RESULT:{restart_name}"), result);
                         return Err(BlissError::Internal(format!(
                             "__RESTART_INVOKED__:{}",
                             restart_name
@@ -4153,25 +4284,36 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 c = r;
             }
 
-            // Find most specific method by checking specializer
-            let mut best_method: Option<&MethodDef> = None;
+            let mut best_method: Option<(MethodDef, Vec<usize>)> = None;
             for method in methods.iter().rev() {
-                if args.is_empty() {
-                    best_method = Some(method);
-                    break;
+                if method.specializers.len() > args.len() {
+                    continue;
                 }
-                let arg_class = get_instance_class_name(args[0]);
-                if method.specializer == arg_class
-                    || is_subclass(&arg_class, &method.specializer, env)
-                {
-                    // Prefer more specific (exact match over superclass)
-                    if best_method.is_none() || method.specializer == arg_class {
-                        best_method = Some(method);
+                let mut distances = Vec::with_capacity(method.specializers.len());
+                let mut applicable = true;
+                for (arg, specializer) in args.iter().zip(method.specializers.iter()) {
+                    if !method_specializer_matches(*arg, specializer, env) {
+                        applicable = false;
+                        break;
                     }
+                    distances.push(
+                        method_specificity_distance(*arg, specializer, env)
+                            .unwrap_or(usize::MAX / 2),
+                    );
+                }
+                if !applicable {
+                    continue;
+                }
+                let replace = match &best_method {
+                    Some((_, current_distances)) => distances < *current_distances,
+                    None => true,
+                };
+                if replace {
+                    best_method = Some((method.clone(), distances));
                 }
             }
 
-            if let Some(m) = best_method {
+            if let Some((m, _)) = best_method {
                 let m = m.clone();
                 let mut child_env = env.child();
                 for (i, param) in m.params.iter().enumerate() {
@@ -6793,6 +6935,14 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     Ok(name_form)
 }
 
+// ── DEFGENERIC ───────────────────────────────────────────────────
+fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let (name_form, _rest) = cp(cdr);
+    let name = sym_name(name_form);
+    Rc::make_mut(&mut env.methods).entry(name).or_default();
+    Ok(name_form)
+}
+
 // ── DEFMETHOD ────────────────────────────────────────────────────
 fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, rest) = cp(cdr);
@@ -6802,16 +6952,17 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     // Parse specialized params: ((var class) ...)
     let params_list = list_to_vec(spec_params_form);
     let mut params = Vec::new();
-    let mut specializer = "T".to_string();
+    let mut specializers = Vec::new();
 
     for p in &params_list {
         if p.is_cons() {
             let (var_form, rest_p) = cp(*p);
             let (class_form, _) = cp(rest_p);
             params.push(sym_name(var_form));
-            specializer = sym_name(class_form);
+            specializers.push(sym_name(class_form));
         } else if p.is_symbol() {
             params.push(sym_name(*p));
+            specializers.push("T".to_string());
         }
     }
 
@@ -6819,7 +6970,7 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         .entry(name.clone())
         .or_default()
         .push(MethodDef {
-            specializer,
+            specializers,
             params,
             body,
         });
@@ -7134,35 +7285,61 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
 // ── HANDLER-CASE ────────────────────────────────────────────────
 fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (protected_form, clauses) = cp(cdr);
+    let base_len = env.handlers.len();
+    let mut installed = Vec::new();
+    let mut c = clauses;
+    while c.is_cons() {
+        let (clause, rest) = cp(c);
+        let (type_form, clause_rest) = cp(clause);
+        let (bind_list, handler_body) = cp(clause_rest);
+        let token = next_control_token("handler-case");
+        let var_name = if bind_list.is_cons() {
+            Some(sym_name(cp(bind_list).0))
+        } else {
+            None
+        };
+        let entry = HandlerEntry {
+            type_name: sym_name(type_form),
+            handler: HandlerImpl::HandlerCase {
+                token: token.clone(),
+                var_name: var_name.clone(),
+                body: handler_body,
+                captured_frame: freeze_env_frame(&env.frame),
+            },
+        };
+        env.handlers.push(entry.clone());
+        installed.push(entry);
+        c = rest;
+    }
 
-    match eval_form(protected_form, env) {
+    let result = eval_form(protected_form, env);
+    env.handlers.truncate(base_len);
+
+    match result {
         Ok(val) => Ok(val),
-        Err(e) => {
-            // Try to find a matching handler clause
-            let mut c = clauses;
-            while c.is_cons() {
-                let (clause, rest) = cp(c);
-                let (type_form, clause_rest) = cp(clause);
-                let type_name = sym_name(type_form);
-
-                // Check if this handler matches
-                if type_name == "ERROR" || type_name == "CONDITION" || type_name == "T" {
-                    let (bind_list, handler_body) = cp(clause_rest);
-                    let mut child_env = env.child();
-
-                    // Bind the condition variable
-                    if bind_list.is_cons() {
-                        let (var_form, _) = cp(bind_list);
-                        let var_name = sym_name(var_form);
-                        let err_msg = format!("{}", e);
-                        child_env.define_local(&var_name, arena_str(&err_msg));
+        Err(error) => {
+            let Some(token) = handler_case_token(&error) else {
+                return Err(error);
+            };
+            let condition = take_control_value(&token);
+            for handler in installed {
+                if let HandlerImpl::HandlerCase {
+                    token: entry_token,
+                    var_name,
+                    body,
+                    captured_frame,
+                } = handler.handler
+                {
+                    if entry_token == token {
+                        let mut handler_env = env.child_with_parent(thaw_env_frame(&captured_frame));
+                        if let Some(name) = var_name {
+                            handler_env.define_local(&name, condition);
+                        }
+                        return eval_progn(body, &mut handler_env);
                     }
-
-                    return eval_progn(handler_body, &mut child_env);
                 }
-                c = rest;
             }
-            Err(e) // No matching handler
+            Err(error)
         }
     }
 }
@@ -7180,7 +7357,7 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
         let type_name = sym_name(type_form);
         env.handlers.push(HandlerEntry {
             type_name,
-            handler: handler_form,
+            handler: HandlerImpl::Function(handler_form),
         });
         c = rest;
     }
@@ -7196,49 +7373,91 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     result
 }
 
+// ── RESTART-BIND ────────────────────────────────────────────────
+fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let (bindings_form, body) = cp(cdr);
+    let base_len = env.restarts.len();
+    let captured_frame = freeze_env_frame(&env.frame);
+    let mut c = bindings_form;
+    while c.is_cons() {
+        let (binding, rest) = cp(c);
+        let (name_form, binding_rest) = cp(binding);
+        let (function_form, _) = cp(binding_rest);
+        env.restarts.push(RestartEntry {
+            name: sym_name(name_form).to_uppercase(),
+            function: RestartFunction::FunctionForm {
+                function_form,
+                captured_frame: captured_frame.clone(),
+            },
+        });
+        c = rest;
+    }
+
+    let result = eval_progn(body, env);
+    env.restarts.truncate(base_len);
+    result
+}
+
+// ── RESTART-CASE ────────────────────────────────────────────────
+fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let (restartable_form, clauses) = cp(cdr);
+    let base_len = env.restarts.len();
+    let captured_frame = freeze_env_frame(&env.frame);
+    let mut c = clauses;
+    while c.is_cons() {
+        let (clause, rest) = cp(c);
+        let (name_form, clause_rest) = cp(clause);
+        let (params_form, body) = cp(clause_rest);
+        env.restarts.push(RestartEntry {
+            name: sym_name(name_form).to_uppercase(),
+            function: RestartFunction::FunctionForm {
+                function_form: arena_cons(
+                    resolve_sym("LAMBDA").unwrap_or(NIL),
+                    arena_cons(params_form, body),
+                ),
+                captured_frame: captured_frame.clone(),
+            },
+        });
+        c = rest;
+    }
+
+    let result = eval_form(restartable_form, env);
+    env.restarts.truncate(base_len);
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if let Some(name) = restart_invoked_name(&error) {
+                return Ok(take_control_value(&format!("RESTART-RESULT:{name}")));
+            }
+            Err(error)
+        }
+    }
+}
+
 // ── CERROR ───────────────────────────────────────────────────────
 fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (_continue_form, rest) = cp(cdr);
     let (msg_form, _) = cp(rest);
     let msg = eval_form(msg_form, env)?;
+    let condition = make_simple_error_condition(msg, env)?;
 
-    // Install a CONTINUE restart
+    let base_len = env.restarts.len();
     env.restarts.push(RestartEntry {
         name: "CONTINUE".to_string(),
-        body: None,
+        function: RestartFunction::ContinueNil,
     });
 
-    // Check if there's a handler that will invoke the restart
-    for handler in env.handlers.clone().iter().rev() {
-        if handler.type_name == "ERROR"
-            || handler.type_name == "CONDITION"
-            || handler.type_name == "T"
-        {
-            let hfn = handler.handler;
-            let cond = arena_str(&val_as_str(msg));
-            match apply_function(hfn, &[cond], env) {
-                Ok(_) => {
-                    // Handler returned normally
-                    env.restarts.pop();
-                    return Ok(NIL);
-                }
-                Err(e) => {
-                    // Check if it's a restart invocation
-                    let err_str = format!("{}", e);
-                    if err_str.contains("__RESTART_INVOKED__:CONTINUE") {
-                        env.restarts.pop();
-                        return Ok(NIL);
-                    }
-                    env.restarts.pop();
-                    return Err(e);
-                }
+    let result = signal_condition_object(condition, env);
+    env.restarts.truncate(base_len);
+    match result {
+        Ok(_) => Err(BlissError::Internal(format!("ERROR: {}", val_as_str(msg)))),
+        Err(error) => {
+            if restart_invoked_name(&error).as_deref() == Some("CONTINUE") {
+                return Ok(NIL);
             }
+            Err(error)
         }
     }
-
-    env.restarts.pop();
-    // If no handler, signal the error
-    Err(BlissError::Internal(format!("ERROR: {}", val_as_str(msg))))
 }
 
 // ── WITH-OPEN-FILE ──────────────────────────────────────────────
