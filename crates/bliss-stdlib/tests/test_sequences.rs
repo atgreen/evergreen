@@ -301,6 +301,21 @@ fn concatenate_multiple() {
     assert_eq!(sequences::elt(cat, 1).unwrap(), BlissVal::from_fixnum(2));
 }
 
+#[test]
+fn concatenate_string_result_returns_a_real_string() {
+    let string_sym = BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol("STRING"));
+    let cat = sequences::concatenate(
+        string_sym,
+        &[
+            bliss_stdlib::streams::make_lisp_string("alpha"),
+            bliss_stdlib::streams::make_lisp_string("-SOUP"),
+        ],
+    )
+    .unwrap();
+    assert!(cat.is_string());
+    assert_eq!(cat.as_string(), "alpha-SOUP");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // FIND
 // ═══════════════════════════════════════════════════════════════════════

@@ -599,6 +599,20 @@ fn result_type_is_vector(result_type: BlissVal) -> bool {
     false
 }
 
+/// Check whether CONCATENATE requested a string result type.
+fn result_type_is_string(result_type: BlissVal) -> bool {
+    if !result_type.is_symbol() {
+        return false;
+    }
+    match bliss_compiler::reader::symbol_name(result_type.as_symbol_index()) {
+        Some(name) => matches!(
+            name.as_str(),
+            "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING"
+        ),
+        None => false,
+    }
+}
+
 /// Concatenate sequences (CL `CONCATENATE`). R5.30.
 pub fn concatenate(result_type: BlissVal, sequences: &[BlissVal]) -> Result<BlissVal, BlissError> {
     let mut all_elems = Vec::new();
@@ -606,7 +620,19 @@ pub fn concatenate(result_type: BlissVal, sequences: &[BlissVal]) -> Result<Blis
         let elems = collect_elements(seq)?;
         all_elems.extend(elems);
     }
-    if result_type_is_vector(result_type) {
+    if result_type_is_string(result_type) {
+        let mut out = String::with_capacity(all_elems.len());
+        for elem in all_elems {
+            if !elem.is_character() {
+                return Err(BlissError::TypeError {
+                    datum: elem,
+                    expected: "character".to_string(),
+                });
+            }
+            out.push(elem.as_char());
+        }
+        Ok(crate::streams::make_lisp_string(&out))
+    } else if result_type_is_vector(result_type) {
         Ok(build_vector(&all_elems))
     } else {
         Ok(build_list(&all_elems))
