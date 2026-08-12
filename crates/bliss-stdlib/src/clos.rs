@@ -197,6 +197,19 @@ where
     CLOS_STATE.with(|cell| f(&mut cell.borrow_mut()))
 }
 
+fn is_builtin_class(st: &ClosState, class: BlissVal) -> bool {
+    class == st.t_class_val
+        || class == st.standard_object_class
+        || class == st.fixnum_class
+        || class == st.character_class
+        || class == st.symbol_class
+        || class == st.null_class
+        || class == st.cons_class
+        || class == st.float_class
+        || class == st.function_class
+        || class == st.heap_object_class
+}
+
 // ── CLOS bootstrap ─────────────────────────────────────────────────
 
 /// Initialize the CLOS bootstrap: create proto-classes, wire up metaclass
@@ -596,6 +609,14 @@ pub fn allocate_instance(class: BlissVal) -> Result<BlissVal, BlissError> {
 
 /// Make an instance (MAKE-INSTANCE). R5.12.
 pub fn make_instance(class: BlissVal, initargs: &[BlissVal]) -> Result<BlissVal, BlissError> {
+    with_state(|st| {
+        if is_builtin_class(st, class) {
+            return Err(BlissError::Internal(
+                "MAKE-INSTANCE does not support built-in classes".into(),
+            ));
+        }
+        Ok(())
+    })?;
     let inst = allocate_instance(class)?;
     initialize_instance(inst, initargs)?;
     Ok(inst)
