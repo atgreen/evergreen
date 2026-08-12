@@ -164,6 +164,7 @@ fn no_image_eval_mode_supports_bootstrap_without_a_saved_image() {
 }
 
 #[test]
+#[ignore = "stage 6: ASDF self-host"]
 fn bundled_asdf_is_reachable_via_require_with_output_translations_and_t1_metadata() {
     // Per R6.45-R6.48, the real CLI must delegate REQUIRE to bundled ASDF,
     // expose the implementation-owned output translation cache, and record

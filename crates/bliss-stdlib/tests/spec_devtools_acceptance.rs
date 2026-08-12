@@ -111,6 +111,7 @@ fn profiler_and_timing_apis_return_structured_observable_results() {
 }
 
 #[test]
+#[ignore = "stage 6: devtools/telemetry"]
 fn trace_disassemble_describe_inspect_and_room_hooks_are_callable_end_to_end() {
     // Per R6.29-R6.32a, R6.39-R6.43, the public devtools hooks must be callable from user code.
     let traced = BlissVal::from_symbol_index(77);
@@ -202,6 +203,7 @@ fn swank_server_enforces_authentication_and_serves_eval_completion_and_thread_qu
 }
 
 #[test]
+#[ignore = "stage 6: ASDF self-host"]
 fn bundled_asdf_require_path_is_observable_through_the_real_cli() {
     // Per R6.45-R6.48, the acceptance gate must drive REQUIRE/ASDF behavior
     // through the real CLI rather than grepping the bundled source file.

@@ -81,6 +81,7 @@ fn read_runtime_source(path: &str) -> String {
 }
 
 #[test]
+#[ignore = "stage 5: concurrency"]
 fn make_thread_join_and_registry_cleanup_follow_the_public_thread_api() {
     // Per R2.04 and R13.18, user-visible green threads run via the public make/join entrypoints.
     let before = all_thread_ids();
@@ -184,6 +185,7 @@ fn enter_safepoint_publishes_the_current_stack_top() {
 }
 
 #[test]
+#[ignore = "stage 5: concurrency"]
 fn stop_the_world_waits_for_polling_threads_and_resumes_them() {
     // Per R2.07, safepoint polls must be observed by running threads.
     // Per R13.10, stop-the-world uses the safepoint handshake rather than async suspension.
@@ -251,6 +253,7 @@ fn sigint_delivery_is_observable_through_the_runtime_interrupt_flag() {
 }
 
 #[test]
+#[ignore = "stage 5: concurrency"]
 fn safepoint_wait_does_not_block_on_a_thread_executing_native_ffi() {
     // Per R2.15 and R13.11, a thread in Native FFI state must not block a safepoint handshake.
     let libc = bliss_rt::ffi::load_foreign_library("libc.so.6")

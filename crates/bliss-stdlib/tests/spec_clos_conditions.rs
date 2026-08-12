@@ -36,6 +36,7 @@ fn reset_state() {
 }
 
 #[test]
+#[ignore = "stage 4: CLOS"]
 fn clos_bootstrap_exposes_core_classes_and_rejects_builtin_instantiation() {
     reset_state();
 

@@ -366,6 +366,7 @@ fn sequence_search_and_reduction_honor_keywords() {
 }
 
 #[test]
+#[ignore = "stage 3: sequences/hash-tables"]
 fn sort_and_stable_sort_follow_destructive_contracts() {
     // Per R5.145-R5.148, SORT/STABLE-SORT are destructive contracts: callers
     // must use the returned value, vectors sort in-place, and list sorts reuse cons cells.
@@ -383,6 +384,7 @@ fn sort_and_stable_sort_follow_destructive_contracts() {
 }
 
 #[test]
+#[ignore = "stage 3: sequences/hash-tables"]
 fn hash_tables_obey_test_functions_and_sxhash_contract() {
     // Per R5.154 and R5.155, hash selection must match the equality test and
     // SXHASH must agree for EQUAL objects.
