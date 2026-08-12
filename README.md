@@ -21,6 +21,9 @@ This is a Cargo workspace using Rust 2024 and requiring Rust 1.85 or newer.
 | `crates/bliss-compiler` | Bootstrap compiler pieces: reader, macro expansion, IR, optimisation, codegen, tiering, OSR, profiling |
 | `crates/bliss-stdlib` | Standard-library support: packages, CLOS, conditions, streams, sequences, hash tables, FORMAT, pathnames, devtools |
 | `crates/bliss-cli` | User-facing CLI, REPL, script loading, image loading, and evaluation driver |
+| `lib/` | Lisp-side prelude (`boot.lisp`) and bundled sources loaded at startup |
+| `tests/` | Cross-cutting suites: ANSI conformance, differential, integration, property, and sanitizer configs |
+| `fuzz/` | `cargo-fuzz` targets and corpora for the reader, compiler, evaluator, FORMAT, FFI, and image loader |
 | `spec/` | Technical specification and roadmap |
 | `scripts/spec-coverage.py` | Requirement-to-test traceability report |
 
@@ -50,6 +53,17 @@ cargo test -p bliss-compiler
 cargo test -p bliss-stdlib
 cargo test -p bliss-cli
 ```
+
+Fuzz targets live under `fuzz/` and run via `cargo-fuzz`:
+
+```sh
+cargo install cargo-fuzz
+cargo fuzz list
+cargo fuzz run fuzz_reader
+```
+
+Continuous integration (`.github/workflows/`) runs the workspace tests and
+clippy on Linux and macOS, a nightly fuzzing job, and sanitizer builds.
 
 ## CLI Usage
 
@@ -82,6 +96,8 @@ The CLI currently accepts:
 ```text
 Usage: bliss [OPTIONS] [SCRIPT] [-- CL-ARGS...]
 
+Bliss Common Lisp
+
 Options:
   --help               Print this help message and exit
   --version            Print version information and exit
@@ -89,12 +105,25 @@ Options:
   --load FILE          Load FILE and exit
   --image FILE         Path to the boot image
   --no-image           Start without loading an image
-  --bootstrap          Bootstrap from lib/boot.lisp
+  --bootstrap          Deprecated; the prelude now loads by default
+  --no-bootstrap       Skip the bootstrap prelude (raw evaluator)
   --workers N          Number of worker threads
   --heap-size SIZE     Heap size (e.g. 512M, 1G)
+  --tlab-size SIZE     Per-thread TLAB size
+  --nursery-size SIZE  Nursery size
+  --stack-size SIZE    CL stack size per green thread
+  --gc-log FILE        Write GC logs to FILE
+  --jit-dump           Emit jitdump metadata
+  --log-level LEVEL    Set log level (error|warn|info|debug|trace)
   --sandbox            Enable sandbox mode
   --no-init            Skip loading the init file
+
+Arguments after -- are passed through to CL as *command-line-args*.
 ```
+
+The bootstrap prelude (`lib/boot.lisp`) now loads by default; `--bootstrap`
+is retained only for compatibility, and `--no-bootstrap` starts the raw
+evaluator without it.
 
 When starting the REPL without `--no-init`, Bliss attempts to load the file
 specified by `BLISS_INIT_FILE`; if that is unset, it falls back to `~/.blissrc`.
