@@ -439,7 +439,7 @@ struct Closure {
     /// Raw lambda list, for full &optional/&rest/&key binding.
     params_form: BlissVal,
     body: BlissVal,
-    captured_vars: HashMap<String, BlissVal>,
+    captured_frame: Rc<RefCell<EnvFrame>>,
 }
 
 // ── Environment for variable/function bindings ───────────────────
@@ -459,6 +459,7 @@ struct Env {
     handlers: Vec<HandlerEntry>,
     /// Multiple values from last (values ...) or (floor ...) call
     mv: Vec<BlissVal>,
+    mv_active: bool,
     /// Closures stored by name or lambda id
     closures: Rc<RefCell<HashMap<u64, Closure>>>,
     block_stack: Vec<(String, String)>,
@@ -580,6 +581,7 @@ impl Env {
             restarts: Vec::new(),
             handlers: Vec::new(),
             mv: Vec::new(),
+            mv_active: false,
             closures: Rc::new(RefCell::new(HashMap::new())),
             block_stack: Vec::new(),
             catch_stack: Vec::new(),
@@ -613,6 +615,31 @@ impl Env {
             restarts: self.restarts.clone(),
             handlers: self.handlers.clone(),
             mv: self.mv.clone(),
+            mv_active: self.mv_active,
+            closures: Rc::clone(&self.closures),
+            block_stack: self.block_stack.clone(),
+            catch_stack: self.catch_stack.clone(),
+            tag_stack: self.tag_stack.clone(),
+        }
+    }
+
+    fn child_with_parent(&self, parent: Rc<RefCell<EnvFrame>>) -> Self {
+        Env {
+            frame: Rc::new(RefCell::new(EnvFrame {
+                vars: HashMap::new(),
+                parent: Some(parent),
+            })),
+            funs: Rc::clone(&self.funs),
+            macros: Rc::clone(&self.macros),
+            classes: Rc::clone(&self.classes),
+            methods: Rc::clone(&self.methods),
+            packages: Rc::clone(&self.packages),
+            current_package: self.current_package.clone(),
+            sandbox: self.sandbox,
+            restarts: self.restarts.clone(),
+            handlers: self.handlers.clone(),
+            mv: self.mv.clone(),
+            mv_active: self.mv_active,
             closures: Rc::clone(&self.closures),
             block_stack: self.block_stack.clone(),
             catch_stack: self.catch_stack.clone(),
@@ -641,12 +668,6 @@ impl Env {
         self.frame.borrow_mut().vars.insert(name.to_string(), val);
     }
 
-    fn visible_vars(&self) -> HashMap<String, BlissVal> {
-        let mut vars = HashMap::new();
-        Self::collect_visible_vars(&self.frame, &mut vars);
-        vars
-    }
-
     fn lookup_frame(frame: &Rc<RefCell<EnvFrame>>, name: &str) -> Option<BlissVal> {
         let borrowed = frame.borrow();
         if let Some(val) = borrowed.vars.get(name) {
@@ -673,19 +694,14 @@ impl Env {
         false
     }
 
-    fn collect_visible_vars(frame: &Rc<RefCell<EnvFrame>>, out: &mut HashMap<String, BlissVal>) {
-        let borrowed = frame.borrow();
-        let parent = borrowed.parent.clone();
-        let vars = borrowed
-            .vars
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect::<Vec<_>>();
-        drop(borrowed);
-        if let Some(parent) = parent {
-            Self::collect_visible_vars(&parent, out);
-        }
-        out.extend(vars);
+    fn clear_mv(&mut self) {
+        self.mv.clear();
+        self.mv_active = false;
+    }
+
+    fn set_mv(&mut self, values: Vec<BlissVal>) {
+        self.mv = values;
+        self.mv_active = true;
     }
 }
 
@@ -1882,7 +1898,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     store_control_value(token, value);
                     return Err(BlissError::Internal(token.clone()));
                 }
-                return Ok(value);
+                return Err(BlissError::Internal(format!(
+                    "RETURN-FROM: no block named {} is currently visible",
+                    name
+                )));
             }
             "RETURN" => {
                 let (val_form, _) = cp(cdr);
@@ -1896,7 +1915,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     store_control_value(token, value);
                     return Err(BlissError::Internal(token.clone()));
                 }
-                return Ok(value);
+                return Err(BlissError::Internal(
+                    "RETURN: no block named NIL is currently visible".into(),
+                ));
             }
             "CATCH" => {
                 let (tag_form, body) = cp(cdr);
@@ -2006,13 +2027,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 match result {
                     Ok(v) => {
                         let saved_mv = env.mv.clone();
+                        let saved_mv_active = env.mv_active;
                         eval_progn(cleanup, env)?;
                         env.mv = saved_mv;
+                        env.mv_active = saved_mv_active;
                         return Ok(v);
                     }
                     Err(e) => {
-                        let _ = eval_progn(cleanup, env);
-                        return Err(e);
+                        match eval_progn(cleanup, env) {
+                            Ok(_) => return Err(e),
+                            Err(cleanup_exit) => return Err(cleanup_exit),
+                        }
                     }
                 }
             }
@@ -2288,10 +2313,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     c = r;
                 }
                 if vals.is_empty() {
-                    env.mv = Vec::new();
+                    env.set_mv(Vec::new());
                     return Ok(NIL);
                 }
-                env.mv = vals.clone();
+                env.set_mv(vals.clone());
                 return Ok(vals[0]);
             }
             "FORMAT" => return eval_format(cdr, env),
@@ -2419,7 +2444,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         let closure = Closure {
                             params_form,
                             body,
-                            captured_vars: env.visible_vars(),
+                            captured_frame: Rc::clone(&env.frame),
                         };
                         let id = next_closure_id();
                         env.closures.borrow_mut().insert(id, closure);
@@ -2436,7 +2461,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let closure = Closure {
                     params_form,
                     body,
-                    captured_vars: env.visible_vars(),
+                    captured_frame: Rc::clone(&env.frame),
                 };
                 let id = next_closure_id();
                 env.closures.borrow_mut().insert(id, closure);
@@ -2565,7 +2590,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 };
                 let (val, present) = bliss_stdlib::gethash(key, tbl, default)?;
-                env.mv = vec![val, if present { T } else { NIL }];
+                env.set_mv(vec![val, if present { T } else { NIL }]);
                 return Ok(val);
             }
             "REMHASH" => {
@@ -2815,10 +2840,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                     let q = (av / bv).trunc() as i64;
                     let rem = av - (q as f64) * bv;
-                    env.mv = vec![
+                    env.set_mv(vec![
                         BlissVal::from_fixnum(q),
                         BlissVal::from_single_float(rem as f32),
-                    ];
+                    ]);
                     return Ok(BlissVal::from_fixnum(q));
                 }
                 return Ok(BlissVal::from_fixnum(av as i64));
@@ -2836,10 +2861,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                     let q = (av / bv).ceil() as i64;
                     let rem = av - (q as f64) * bv;
-                    env.mv = vec![
+                    env.set_mv(vec![
                         BlissVal::from_fixnum(q),
                         BlissVal::from_single_float(rem as f32),
-                    ];
+                    ]);
                     return Ok(BlissVal::from_fixnum(q));
                 }
                 return Ok(BlissVal::from_fixnum(av.ceil() as i64));
@@ -2857,10 +2882,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                     let q = (av / bv).round() as i64;
                     let rem = av - (q as f64) * bv;
-                    env.mv = vec![
+                    env.set_mv(vec![
                         BlissVal::from_fixnum(q),
                         BlissVal::from_single_float(rem as f32),
-                    ];
+                    ]);
                     return Ok(BlissVal::from_fixnum(q));
                 }
                 return Ok(BlissVal::from_fixnum(av.round() as i64));
@@ -2901,11 +2926,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (form, _) = cp(r);
                 let n = eval_form(nf, env)?;
                 let idx = num_val(n)? as usize;
+                env.clear_mv();
                 let first = eval_form(form, env)?;
-                let values = if env.mv.is_empty() {
-                    vec![first]
-                } else {
+                let values = if env.mv_active {
                     env.mv.clone()
+                } else {
+                    vec![first]
                 };
                 return Ok(values.get(idx).copied().unwrap_or(NIL));
             }
@@ -2919,12 +2945,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut c = forms;
                 while c.is_cons() {
                     let (af, r) = cp(c);
-                    env.mv = Vec::new();
+                    env.clear_mv();
                     let primary = eval_form(af, env)?;
-                    if env.mv.is_empty() {
-                        args.push(primary);
-                    } else {
+                    if env.mv_active {
                         args.extend(env.mv.clone());
+                    } else {
+                        args.push(primary);
                     }
                     c = r;
                 }
@@ -2933,12 +2959,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "MULTIPLE-VALUE-LIST" => {
                 // (multiple-value-list form) — a list of all the values of form.
                 let (form, _) = cp(cdr);
-                env.mv = Vec::new();
+                env.clear_mv();
                 let primary = eval_form(form, env)?;
-                let values = if env.mv.is_empty() {
-                    vec![primary]
-                } else {
+                let values = if env.mv_active {
                     env.mv.clone()
+                } else {
+                    vec![primary]
                 };
                 return Ok(vec_to_list(&values));
             }
@@ -2948,10 +2974,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let lst = eval_form(form, env)?;
                 let vals = list_to_vec(lst);
                 if vals.is_empty() {
-                    env.mv = Vec::new();
+                    env.set_mv(Vec::new());
                     return Ok(NIL);
                 }
-                env.mv = vals.clone();
+                env.set_mv(vals.clone());
                 return Ok(vals[0]);
             }
             "HANDLER-CASE" => return eval_handler_case(cdr, env),
@@ -3080,7 +3106,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if eof && line.is_empty() {
                         return Ok(NIL);
                     }
-                    env.mv = vec![arena_str(&line), if eof { T } else { NIL }];
+                    env.set_mv(vec![arena_str(&line), if eof { T } else { NIL }]);
                     return Ok(arena_str(&line));
                 } else {
                     // Read from stdin
@@ -3302,14 +3328,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     env.current_package.clone()
                 };
                 let sym = intern_into_package(env, &pkg_name, &name_str);
-                env.mv = vec![
+                env.set_mv(vec![
                     sym,
                     if sym.is_symbol() {
                         package_status_symbol("INTERNAL")
                     } else {
                         NIL
                     },
-                ];
+                ]);
                 return Ok(sym);
             }
             "FIND-SYMBOL" => {
@@ -3322,10 +3348,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let name = symbol_bare_name(&val_as_str(eval_form(args[0], env)?));
                 let pkg_name = normalize_package_name(&val_as_str(eval_form(args[1], env)?));
                 if let Some((sym, status)) = find_symbol_in_package(env, &pkg_name, &name) {
-                    env.mv = vec![sym, package_status_symbol(status)];
+                    env.set_mv(vec![sym, package_status_symbol(status)]);
                     return Ok(sym);
                 }
-                env.mv = vec![NIL, NIL];
+                env.set_mv(vec![NIL, NIL]);
                 return Ok(NIL);
             }
             "EXPORT" | "IMPORT" | "SHADOWING-IMPORT" => {
@@ -5948,23 +5974,10 @@ fn apply_function(
             let id = lr.as_fixnum() as u64;
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
-                let mut child_env = env.child();
-                let captured_names = closure.captured_vars.keys().cloned().collect::<Vec<_>>();
-                // Restore captured lexical environment
-                for (k, v) in &closure.captured_vars {
-                    child_env.define_local(k, *v);
-                }
+                let mut child_env = env.child_with_parent(Rc::clone(&closure.captured_frame));
                 // Bind parameters
                 bind_lambda_list(closure.params_form, args, &mut child_env)?;
-                let result = eval_progn(closure.body, &mut child_env)?;
-                if let Some(stored) = env.closures.borrow_mut().get_mut(&id) {
-                    for key in &captured_names {
-                        if let Some(value) = child_env.lookup_var(key) {
-                            stored.captured_vars.insert(key.clone(), value);
-                        }
-                    }
-                }
-                return Ok(result);
+                return eval_progn(closure.body, &mut child_env);
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
@@ -6098,15 +6111,15 @@ fn eval_floor(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
         let q = (av / bv).floor() as i64;
         let rem = av - (q as f64) * bv;
-        env.mv = vec![BlissVal::from_fixnum(q), BlissVal::from_fixnum(rem as i64)];
+        env.set_mv(vec![BlissVal::from_fixnum(q), BlissVal::from_fixnum(rem as i64)]);
         return Ok(BlissVal::from_fixnum(q));
     }
     let q = av.floor() as i64;
     let rem = av - q as f64;
-    env.mv = vec![
+    env.set_mv(vec![
         BlissVal::from_fixnum(q),
         BlissVal::from_single_float(rem as f32),
-    ];
+    ]);
     Ok(BlissVal::from_fixnum(q))
 }
 
@@ -6116,6 +6129,7 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
     let (values_form, body) = cp(rest);
 
     // Evaluate the values form
+    env.clear_mv();
     let primary = eval_form(values_form, env)?;
     let mv = env.mv.clone();
 
