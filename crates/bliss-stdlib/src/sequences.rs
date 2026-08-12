@@ -117,6 +117,75 @@ fn vector_set_elt(v: BlissVal, idx: usize, val: BlissVal) {
     }
 }
 
+/// Collect cons-cell pointers from a proper list.
+fn collect_cons_cells(sequence: BlissVal) -> Vec<*mut ConsCell> {
+    let mut cells = Vec::new();
+    let mut cur = sequence;
+    while cur.is_cons() {
+        let ptr = unsafe { cur.as_ptr() } as *mut ConsCell;
+        cells.push(ptr);
+        // Safety: `cur` is a cons cell for the duration of the walk.
+        cur = unsafe { (*ptr).cdr };
+    }
+    cells
+}
+
+/// Destructively sort a vector in place.
+fn sort_vector_in_place(
+    sequence: BlissVal,
+    predicate: BlissVal,
+    key: Option<BlissVal>,
+    stable: bool,
+) -> BlissVal {
+    let ptr = unsafe { sequence.as_ptr() };
+    let len = unsafe { *(ptr.add(8) as *const u64) as usize };
+    let elems = unsafe { std::slice::from_raw_parts_mut(ptr.add(16) as *mut BlissVal, len) };
+    if stable {
+        elems.sort_by(|a, b| compare_with_predicate(predicate, key, *a, *b));
+    } else {
+        elems.sort_unstable_by(|a, b| compare_with_predicate(predicate, key, *a, *b));
+    }
+    sequence
+}
+
+/// Destructively sort a list by relinking existing cons cells.
+fn sort_list_in_place(
+    sequence: BlissVal,
+    predicate: BlissVal,
+    key: Option<BlissVal>,
+    stable: bool,
+) -> BlissVal {
+    let mut cells = collect_cons_cells(sequence);
+    if stable {
+        cells.sort_by(|a, b| {
+            let car_a = unsafe { (**a).car };
+            let car_b = unsafe { (**b).car };
+            compare_with_predicate(predicate, key, car_a, car_b)
+        });
+    } else {
+        cells.sort_unstable_by(|a, b| {
+            let car_a = unsafe { (**a).car };
+            let car_b = unsafe { (**b).car };
+            compare_with_predicate(predicate, key, car_a, car_b)
+        });
+    }
+
+    for window in cells.windows(2) {
+        // Safety: all pointers were collected from the original proper list.
+        unsafe {
+            (*window[0]).cdr = BlissVal::from_cons_ptr(window[1] as *mut u8);
+        }
+    }
+    if let Some(&last) = cells.last() {
+        unsafe {
+            (*last).cdr = NIL;
+            BlissVal::from_cons_ptr(cells[0] as *mut u8)
+        }
+    } else {
+        NIL
+    }
+}
+
 /// Apply a key function to a value. For identity_key or NIL/None, return as-is.
 /// For negate_key (symbol 3), negate a fixnum.
 fn apply_key(key: Option<BlissVal>, val: BlissVal) -> BlissVal {
@@ -930,12 +999,10 @@ pub fn sort(
     if sequence.is_nil() {
         return Ok(NIL);
     }
-    let mut elems = collect_elements(sequence)?;
-    elems.sort_by(|a, b| compare_with_predicate(predicate, key, *a, *b));
     if is_list(sequence) {
-        Ok(build_list(&elems))
+        Ok(sort_list_in_place(sequence, predicate, key, false))
     } else {
-        Ok(build_vector(&elems))
+        Ok(sort_vector_in_place(sequence, predicate, key, false))
     }
 }
 
@@ -948,11 +1015,9 @@ pub fn stable_sort(
     if sequence.is_nil() {
         return Ok(NIL);
     }
-    let mut elems = collect_elements(sequence)?;
-    elems.sort_by(|a, b| compare_with_predicate(predicate, key, *a, *b));
     if is_list(sequence) {
-        Ok(build_list(&elems))
+        Ok(sort_list_in_place(sequence, predicate, key, true))
     } else {
-        Ok(build_vector(&elems))
+        Ok(sort_vector_in_place(sequence, predicate, key, true))
     }
 }

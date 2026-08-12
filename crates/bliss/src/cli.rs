@@ -583,7 +583,9 @@ fn next_control_token(prefix: &str) -> String {
 }
 
 fn next_macro_function_handle() -> BlissVal {
-    BlissVal::from_fixnum(MACRO_FUNCTION_HANDLE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64)
+    BlissVal::from_fixnum(
+        MACRO_FUNCTION_HANDLE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64,
+    )
 }
 
 fn macroexpand_environment_handle_symbol() -> BlissVal {
@@ -6541,7 +6543,11 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
     macro_env
 }
 
-fn eval_macroexpand(cdr: BlissVal, env: &mut Env, single_step: bool) -> Result<BlissVal, BlissError> {
+fn eval_macroexpand(
+    cdr: BlissVal,
+    env: &mut Env,
+    single_step: bool,
+) -> Result<BlissVal, BlissError> {
     let (form_expr, rest) = cp(cdr);
     let form = eval_form(form_expr, env)?;
     let macro_env = if rest.is_cons() {

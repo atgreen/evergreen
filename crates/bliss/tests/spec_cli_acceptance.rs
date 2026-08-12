@@ -214,7 +214,10 @@ fn stage_zero_gate_round_trips_core_datatypes_and_runs_a_nested_script() {
         "NIL",
         "(7 8 (5 6))",
     ];
-    assert_eq!(actual_lines, expected_lines, "unexpected stage-0 gate stdout");
+    assert_eq!(
+        actual_lines, expected_lines,
+        "unexpected stage-0 gate stdout"
+    );
 
     fs::remove_dir_all(dir).ok();
 }
@@ -567,7 +570,8 @@ fn stage_one_gate_programs_run_through_the_real_cli() {
 }
 
 #[test]
-fn stage_two_gate_loads_a_real_file_with_user_macros_standard_macros_and_environment_aware_expansion() {
+fn stage_two_gate_loads_a_real_file_with_user_macros_standard_macros_and_environment_aware_expansion()
+ {
     // Per §0.4 stage 2 and spec/stages.json, the real CLI gate is loading a
     // multi-form file that defines and uses its own macros plus standard macros.
     let dir = temp_dir("stage2-gate");

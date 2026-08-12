@@ -128,7 +128,7 @@ fn get_table_inner(table: BlissVal) -> Result<*mut HashTableInner, BlissError> {
 
 /// Compute the probe index for a key in a table of the given capacity.
 fn probe_index(key_bits: u64, capacity: usize) -> usize {
-    (hash_u64(key_bits) as usize) & (capacity - 1)
+    (key_bits as usize) & (capacity - 1)
 }
 
 /// Extract the raw bytes of a heap-allocated string (SIMPLE-BASE-STRING or
@@ -151,6 +151,25 @@ unsafe fn extract_string_bytes(v: BlissVal) -> Option<&'static [u8]> {
         let len = *((ptr as *const u64).add(1)) as usize;
         Some(std::slice::from_raw_parts(ptr.add(16), len))
     }
+}
+
+fn is_simple_vector(v: BlissVal) -> bool {
+    if !v.is_heap_object() {
+        return false;
+    }
+    // Safety: heap objects start with an ObjectHeader.
+    let header = unsafe { *(v.as_ptr() as *const ObjectHeader) };
+    header.type_id() == type_id::SIMPLE_VECTOR
+}
+
+fn vector_length(v: BlissVal) -> usize {
+    let ptr = unsafe { v.as_ptr() };
+    unsafe { *(ptr.add(8) as *const u64) as usize }
+}
+
+fn vector_elt(v: BlissVal, idx: usize) -> BlissVal {
+    let ptr = unsafe { v.as_ptr() };
+    unsafe { *(ptr.add(16 + idx * 8) as *const BlissVal) }
 }
 
 /// CL `EQUAL` — structural equality.
@@ -178,6 +197,18 @@ fn cl_equal(a: BlissVal, b: BlissVal) -> bool {
             if let (Some(sa), Some(sb)) = (extract_string_bytes(a), extract_string_bytes(b)) {
                 return sa == sb;
             }
+        }
+        if is_simple_vector(a) && is_simple_vector(b) {
+            let len = vector_length(a);
+            if len != vector_length(b) {
+                return false;
+            }
+            for i in 0..len {
+                if !cl_equal(vector_elt(a, i), vector_elt(b, i)) {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 
@@ -240,6 +271,18 @@ fn cl_equalp(a: BlissVal, b: BlissVal) -> bool {
                     .all(|(&x, &y)| x.eq_ignore_ascii_case(&y));
             }
         }
+        if is_simple_vector(a) && is_simple_vector(b) {
+            let len = vector_length(a);
+            if len != vector_length(b) {
+                return false;
+            }
+            for i in 0..len {
+                if !cl_equalp(vector_elt(a, i), vector_elt(b, i)) {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
     // All other types: bit equality.
@@ -258,6 +301,106 @@ fn keys_equal(a: BlissVal, b: BlissVal, test: HashTest) -> bool {
         HashTest::Eq | HashTest::Eql => a.0 == b.0,
         HashTest::Equal => cl_equal(a, b),
         HashTest::Equalp => cl_equalp(a, b),
+    }
+}
+
+const STRUCTURAL_HASH_DEPTH_LIMIT: usize = 4;
+const MOST_POSITIVE_FIXNUM_MASK: u64 = 0x0FFF_FFFF_FFFF_FFFF;
+
+fn hash_bytes(bytes: &[u8], case_fold: bool) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFSET;
+    for &byte in bytes {
+        let mixed = if case_fold {
+            byte.to_ascii_lowercase()
+        } else {
+            byte
+        };
+        h ^= mixed as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+fn combine_hashes(a: u64, b: u64) -> u64 {
+    a.rotate_left(13) ^ b.rotate_right(7) ^ 0x9e37_79b9_7f4a_7c15
+}
+
+fn equal_hash(object: BlissVal, depth: usize) -> u64 {
+    if depth == 0 {
+        return 0;
+    }
+    if object.tag() == TAG_CONS {
+        unsafe {
+            let cell = &*(object.as_ptr() as *const ConsCell);
+            return combine_hashes(
+                equal_hash(cell.car, depth - 1),
+                equal_hash(cell.cdr, depth - 1),
+            );
+        }
+    }
+    if object.is_heap_object() {
+        unsafe {
+            if let Some(bytes) = extract_string_bytes(object) {
+                return hash_bytes(bytes, false);
+            }
+        }
+        if is_simple_vector(object) {
+            let mut h = hash_u64(vector_length(object) as u64);
+            for i in 0..vector_length(object) {
+                h = combine_hashes(h, equal_hash(vector_elt(object, i), depth - 1));
+            }
+            return h;
+        }
+    }
+    hash_u64(object.0)
+}
+
+fn equalp_hash(object: BlissVal, depth: usize) -> u64 {
+    if depth == 0 {
+        return 0;
+    }
+    if object.is_character() {
+        return hash_u64(object.as_char().to_ascii_lowercase() as u64);
+    }
+    if object.is_fixnum() {
+        return hash_u64((object.as_fixnum() as f64).to_bits());
+    }
+    if object.is_single_float() {
+        return hash_u64((object.as_single_float() as f64).to_bits());
+    }
+    if object.tag() == TAG_CONS {
+        unsafe {
+            let cell = &*(object.as_ptr() as *const ConsCell);
+            return combine_hashes(
+                equalp_hash(cell.car, depth - 1),
+                equalp_hash(cell.cdr, depth - 1),
+            );
+        }
+    }
+    if object.is_heap_object() {
+        unsafe {
+            if let Some(bytes) = extract_string_bytes(object) {
+                return hash_bytes(bytes, true);
+            }
+        }
+        if is_simple_vector(object) {
+            let mut h = hash_u64(vector_length(object) as u64);
+            for i in 0..vector_length(object) {
+                h = combine_hashes(h, equalp_hash(vector_elt(object, i), depth - 1));
+            }
+            return h;
+        }
+    }
+    hash_u64(object.0)
+}
+
+fn hash_for_test(object: BlissVal, test: HashTest) -> u64 {
+    match test {
+        HashTest::Eq | HashTest::Eql => hash_u64(object.0),
+        HashTest::Equal => equal_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT),
+        HashTest::Equalp => equalp_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT),
     }
 }
 
@@ -313,8 +456,8 @@ pub fn gethash(
     let inner = unsafe { &mut *ptr };
     let cap = inner.capacity;
     let test = inner.test;
-    let key_bits = key.0;
-    let mut idx = probe_index(key_bits, cap);
+    let key_hash = hash_for_test(key, test);
+    let mut idx = probe_index(key_hash, cap);
 
     for dist in 0..cap {
         match &inner.entries[idx] {
@@ -345,7 +488,7 @@ fn resize_table(inner: &mut HashTableInner) {
     let mut new_entries: Vec<Option<RHEntry>> = vec![None; new_capacity];
 
     for e in inner.entries.iter().flatten() {
-        let mut idx = probe_index(e.key.0, new_capacity);
+        let mut idx = probe_index(hash_for_test(e.key, inner.test), new_capacity);
         let mut incoming = RHEntry {
             key: e.key,
             value: e.value,
@@ -382,12 +525,12 @@ pub fn set_gethash(key: BlissVal, table: BlissVal, value: BlissVal) -> Result<()
     // We create exactly one &mut reference from the raw pointer per call.
     let inner = unsafe { &mut *ptr };
     let test = inner.test;
-    let key_bits = key.0;
+    let key_hash = hash_for_test(key, test);
 
     // Check if key already exists and update in place
     {
         let cap = inner.capacity;
-        let mut idx = probe_index(key_bits, cap);
+        let mut idx = probe_index(key_hash, cap);
         for dist in 0..cap {
             match &inner.entries[idx] {
                 Some(entry) => {
@@ -417,7 +560,7 @@ pub fn set_gethash(key: BlissVal, table: BlissVal, value: BlissVal) -> Result<()
 
     // Insert into (possibly resized) table using Robin Hood insertion
     let cap = inner.capacity;
-    let mut idx = probe_index(key_bits, cap);
+    let mut idx = probe_index(key_hash, cap);
     let mut incoming = RHEntry {
         key,
         value,
@@ -452,8 +595,8 @@ pub fn remhash(key: BlissVal, table: BlissVal) -> Result<bool, BlissError> {
     let inner = unsafe { &mut *ptr };
     let cap = inner.capacity;
     let test = inner.test;
-    let key_bits = key.0;
-    let mut idx = probe_index(key_bits, cap);
+    let key_hash = hash_for_test(key, test);
+    let mut idx = probe_index(key_hash, cap);
 
     for dist in 0..cap {
         match &inner.entries[idx] {
@@ -608,9 +751,7 @@ pub fn hash_table_rehash_threshold(table: BlissVal) -> Result<f64, BlissError> {
 /// Compute the hash code for an object (CL `SXHASH`). R5.32.
 /// Returns a non-negative fixnum.
 pub fn sxhash(object: BlissVal) -> BlissVal {
-    let h = hash_u64(object.0);
-    // Mask to ensure non-negative fixnum (positive 60-bit value)
-    let non_neg = (h >> 1) as i64; // shift right to ensure positive
-    let non_neg = non_neg & 0x0FFF_FFFF_FFFF_FFFF; // ensure fits in fixnum range
-    BlissVal::from_fixnum(non_neg)
+    BlissVal::from_fixnum(
+        (equal_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT) & MOST_POSITIVE_FIXNUM_MASK) as i64,
+    )
 }

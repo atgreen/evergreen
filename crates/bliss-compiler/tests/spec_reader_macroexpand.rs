@@ -459,10 +459,12 @@ fn macroexpand_uses_the_macroexpand_hook() {
 fn parse_macro_and_enclose_capture_the_defining_environment() {
     // Per R4.14, parse-macro/enclose must produce a local macro expander that
     // closes over the lexical macroexpansion environment visible at definition time.
-    let defining_env = Environment::null()
-        .augment_variable(sym("X"), VariableInfo::SymbolMacro(BlissVal::from_fixnum(41)));
-    let parsed = parse_macro(sym("M"), NIL, parse("(X)"), Some(&defining_env))
-        .expect("parse local macro");
+    let defining_env = Environment::null().augment_variable(
+        sym("X"),
+        VariableInfo::SymbolMacro(BlissVal::from_fixnum(41)),
+    );
+    let parsed =
+        parse_macro(sym("M"), NIL, parse("(X)"), Some(&defining_env)).expect("parse local macro");
     let expander = enclose(parsed, &defining_env).expect("close local macro");
     let call_env = Environment::null().augment_function(sym("M"), FunctionInfo::Macro(expander));
 

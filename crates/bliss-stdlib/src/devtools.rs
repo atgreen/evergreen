@@ -1054,12 +1054,12 @@ pub fn walk_stack() -> Vec<DebugFrame> {
 /// (the process/runtime entry point); neither helps someone debugging Lisp.
 fn is_internal_frame(name: &str) -> bool {
     const NEEDLES: &[&str] = &[
-        "backtrace",                    // std::backtrace / backtrace_rs capture
+        "backtrace", // std::backtrace / backtrace_rs capture
         "libunwind",
-        "invoke_debugger_ui",           // the debugger itself
+        "invoke_debugger_ui", // the debugger itself
         "walk_stack",
         "print_frame",
-        "core::ops::function",          // FnOnce/FnMut::call shims
+        "core::ops::function", // FnOnce/FnMut::call shims
         "std::sys",
         "std::rt",
         "std::panic",
