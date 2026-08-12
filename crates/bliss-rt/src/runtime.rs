@@ -12,6 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 /// Default boot-image path. Unlike an explicitly-requested image, its absence
 /// is not fatal: the runtime bootstraps from the prelude instead.
@@ -59,6 +60,17 @@ pub enum LogLevel {
     Info,
     Debug,
     Trace,
+}
+
+type RuntimeInitHook = fn() -> Result<(), BlissError>;
+
+static RUNTIME_INIT_HOOK: OnceLock<RuntimeInitHook> = OnceLock::new();
+
+/// Register an optional startup hook that runs during `Runtime::init`.
+///
+/// Later registrations after the first are ignored.
+pub fn set_runtime_init_hook(hook: RuntimeInitHook) {
+    let _ = RUNTIME_INIT_HOOK.set(hook);
 }
 
 /// Available hardware thread count, falling back to 1.
@@ -378,6 +390,9 @@ impl Runtime {
     /// Initialize the runtime: parse config, init GC, init scheduler,
     /// load image, spawn workers. §2.2.
     pub fn init(config: RuntimeConfig) -> Result<Self, BlissError> {
+        if let Some(hook) = RUNTIME_INIT_HOOK.get() {
+            hook()?;
+        }
         if config.heap_size == 0 {
             return Err(BlissError::Internal("heap_size must be non-zero".into()));
         }

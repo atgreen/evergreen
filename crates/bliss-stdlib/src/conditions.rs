@@ -19,6 +19,7 @@ use crate::streams::make_lisp_string_fresh;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Once;
 
 // ── Well-known symbol indices ────────────────────────────────────
 //
@@ -49,11 +50,13 @@ pub const SYMBOL_SIMPLE_WARNING: u32 = 106;
 /// Symbol index for CONTROL-ERROR.
 pub const SYMBOL_CONTROL_ERROR: u32 = 107;
 pub const SYMBOL_SIMPLE_CONDITION: u32 = 108;
+pub const SYMBOL_STORAGE_CONDITION: u32 = 109;
 const SYMBOL_FORMAT_CONTROL: u32 = 120;
 const SYMBOL_FORMAT_ARGUMENTS: u32 = 121;
 const SYMBOL_DATUM: u32 = 122;
 const SYMBOL_EXPECTED_TYPE: u32 = 123;
 const INTERNAL_HANDLER_CASE_FN_BASE: i64 = -9_000_000;
+const STORAGE_CONDITION_POOL_SIZE: usize = 4;
 
 /// All known condition-type symbol indices (used for hierarchy discrimination).
 const KNOWN_CONDITION_TYPES: &[u32] = &[
@@ -66,6 +69,7 @@ const KNOWN_CONDITION_TYPES: &[u32] = &[
     SYMBOL_SIMPLE_WARNING,
     SYMBOL_CONTROL_ERROR,
     SYMBOL_SIMPLE_CONDITION,
+    SYMBOL_STORAGE_CONDITION,
 ];
 
 /// Check whether a BlissVal represents a known condition type symbol.
@@ -179,6 +183,9 @@ struct ConditionState {
     handler_case_clauses: HashMap<u64, BlissVal>,
     pending_handler_case: Option<(BlissVal, BlissVal)>,
     next_handler_case_id: i64,
+    storage_condition_pool: [BlissVal; STORAGE_CONDITION_POOL_SIZE],
+    next_storage_condition: usize,
+    storage_condition_pool_initialized: bool,
 }
 
 impl ConditionState {
@@ -192,6 +199,9 @@ impl ConditionState {
             handler_case_clauses: HashMap::new(),
             pending_handler_case: None,
             next_handler_case_id: 0,
+            storage_condition_pool: [NIL; STORAGE_CONDITION_POOL_SIZE],
+            next_storage_condition: 0,
+            storage_condition_pool_initialized: false,
         }
     }
 }
@@ -218,6 +228,7 @@ fn condition_class_spec(name: u32) -> (&'static [u32], &'static [u32]) {
         SYMBOL_TYPE_ERROR => (&[SYMBOL_ERROR], &[SYMBOL_DATUM, SYMBOL_EXPECTED_TYPE]),
         SYMBOL_SIMPLE_WARNING => (&[SYMBOL_WARNING, SYMBOL_SIMPLE_CONDITION], &[]),
         SYMBOL_CONTROL_ERROR => (&[SYMBOL_ERROR], &[]),
+        SYMBOL_STORAGE_CONDITION => (&[SYMBOL_SERIOUS_CONDITION], &[]),
         _ => (&[SYMBOL_CONDITION], &[]),
     }
 }
@@ -253,7 +264,72 @@ fn ensure_builtin_condition_classes() -> Result<(), BlissError> {
     ensure_condition_class(SYMBOL_TYPE_ERROR)?;
     ensure_condition_class(SYMBOL_SIMPLE_WARNING)?;
     ensure_condition_class(SYMBOL_CONTROL_ERROR)?;
+    ensure_condition_class(SYMBOL_STORAGE_CONDITION)?;
     Ok(())
+}
+
+fn initialize_storage_condition_pool() -> Result<(), BlissError> {
+    ensure_builtin_condition_classes()?;
+    let class = ensure_condition_class(SYMBOL_STORAGE_CONDITION)?;
+    let mut pool = [NIL; STORAGE_CONDITION_POOL_SIZE];
+    for entry in &mut pool {
+        *entry = make_instance(class, &[])?;
+    }
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        state.storage_condition_pool = pool;
+        state.next_storage_condition = 0;
+        state.storage_condition_pool_initialized = true;
+    });
+    Ok(())
+}
+
+fn storage_condition_pool_is_live() -> bool {
+    STATE.with(|s| {
+        let state = s.borrow();
+        if !state.storage_condition_pool_initialized {
+            return false;
+        }
+        let first = state.storage_condition_pool[0];
+        first != NIL
+            && class_inherits_from(
+                class_of(first),
+                BlissVal::from_symbol_index(SYMBOL_STORAGE_CONDITION),
+            )
+    })
+}
+
+fn acquire_storage_condition() -> Result<BlissVal, BlissError> {
+    if !storage_condition_pool_is_live() {
+        initialize_storage_condition_pool()?;
+    }
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let condition = state.storage_condition_pool[state.next_storage_condition];
+        state.next_storage_condition =
+            (state.next_storage_condition + 1) % STORAGE_CONDITION_POOL_SIZE;
+        Ok(condition)
+    })
+}
+
+fn runtime_init_storage_condition_support() -> Result<(), BlissError> {
+    initialize_condition_runtime_support()
+}
+
+pub fn install_runtime_init_hook() {
+    static INSTALL_HOOK: Once = Once::new();
+    INSTALL_HOOK.call_once(|| {
+        bliss_rt::set_runtime_init_hook(runtime_init_storage_condition_support);
+    });
+}
+
+pub fn initialize_condition_runtime_support() -> Result<(), BlissError> {
+    install_runtime_init_hook();
+    if storage_condition_pool_is_live() {
+        Ok(())
+    } else {
+        initialize_storage_condition_pool()
+    }
 }
 
 fn class_inherits_from(class: BlissVal, target: BlissVal) -> bool {
@@ -271,7 +347,7 @@ fn class_inherits_from(class: BlissVal, target: BlissVal) -> bool {
 /// The condition is registered in thread-local state so handler_case can
 /// recognize it as a condition value.
 pub fn make_simple_error(format_control: &str, _format_args: &[BlissVal]) -> BlissVal {
-    ensure_builtin_condition_classes().expect("bootstrap condition classes");
+    initialize_condition_runtime_support().expect("bootstrap condition runtime support");
     let class = ensure_condition_class(SYMBOL_SIMPLE_ERROR).expect("resolve SIMPLE-ERROR class");
     make_instance(
         class,
@@ -290,7 +366,7 @@ pub fn make_simple_error(format_control: &str, _format_args: &[BlissVal]) -> Bli
 /// Returns a BlissVal fixnum combining datum and expected type information.
 /// Registered as a condition in thread-local state.
 pub fn make_type_error(datum: BlissVal, expected_type: BlissVal) -> BlissVal {
-    ensure_builtin_condition_classes().expect("bootstrap condition classes");
+    initialize_condition_runtime_support().expect("bootstrap condition runtime support");
     let class = ensure_condition_class(SYMBOL_TYPE_ERROR).expect("resolve TYPE-ERROR class");
     make_instance(
         class,
@@ -349,6 +425,7 @@ fn condition_type_matches(condition: BlissVal, clause_type: BlissVal) -> bool {
 /// current cluster (and everything established after it) before invoking
 /// the handler, preventing infinite recursion when a handler re-signals.
 pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
+    initialize_condition_runtime_support()?;
     break_on_signals_gate(condition)?;
     // Snapshot the handler stack so we can iterate without holding the borrow.
     let handlers: Vec<Vec<(BlissVal, BlissVal)>> = STATE.with(|s| s.borrow().handler_stack.clone());
@@ -481,6 +558,7 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
 /// handles the warning, per R5.104 a message is printed to *error-output*.
 /// Always returns `Ok(())`.
 pub fn warn_condition(condition: BlissVal) -> Result<(), BlissError> {
+    initialize_condition_runtime_support()?;
     // Establish a MUFFLE-WARNING restart using the named constant (issue 8 fix).
     let muffle_name = BlissVal::from_symbol_index(SYMBOL_MUFFLE_WARNING);
     let muffle_restart = RestartEntry {
@@ -958,6 +1036,7 @@ pub fn set_break_on_signals(type_spec: Option<BlissVal>) {
 ///
 /// Returns `Err` to indicate the debugger was entered.
 pub fn invoke_debugger(condition: BlissVal) -> Result<(), BlissError> {
+    initialize_condition_runtime_support()?;
     let hook = STATE.with(|s| {
         let state = s.borrow();
         state.debugger_hook
@@ -992,4 +1071,21 @@ pub fn invoke_debugger(condition: BlissVal) -> Result<(), BlissError> {
         "debugger entered (no hook) for condition: {:?}",
         condition
     )))
+}
+
+/// Signal a runtime low-memory/storage failure using a preallocated
+/// `STORAGE-CONDITION` instance per R5.110.
+pub fn signal_storage_condition_for_runtime_error(
+    error: &BlissError,
+) -> Result<BlissVal, BlissError> {
+    match error {
+        BlissError::Oom | BlissError::StackOverflow(_) => {
+            let condition = acquire_storage_condition()?;
+            signal_condition(condition)?;
+            Ok(condition)
+        }
+        _ => Err(BlissError::Internal(
+            "runtime error does not map to STORAGE-CONDITION".into(),
+        )),
+    }
 }

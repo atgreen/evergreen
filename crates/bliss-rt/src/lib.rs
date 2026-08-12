@@ -50,6 +50,7 @@ pub use image::{
 pub use object::ObjectHeader;
 pub use runtime::{
     LogLevel, Runtime, RuntimeConfig, check_sigint, install_signal_handlers, parse_cli,
+    set_runtime_init_hook,
 };
 pub use safepoint::{
     SafepointPage, enter_safepoint, poll_safepoint, resume_all_threads, wait_for_all_threads,

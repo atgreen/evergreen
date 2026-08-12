@@ -1388,6 +1388,7 @@ fn invoke_generic_function(
 impl Env {
     fn new(sandbox: bool) -> Self {
         let _ = bliss_stdlib::bootstrap_clos();
+        let _ = bliss_stdlib::initialize_condition_runtime_support();
         let mut packages = HashMap::new();
         seed_standard_packages(&mut packages);
         let mut env = Env {

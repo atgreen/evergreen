@@ -58,26 +58,29 @@ fn signal_no_handler_ok() {
 // Per R5.101, *DEBUGGER-HOOK* MUST be called before entering the debugger.
 #[test]
 fn error_condition_with_debugger_hook() {
-    // We use a function value as the hook. The implementation should invoke it
-    // when error_condition triggers the debugger.
     let hook_fn = BlissVal::from_fixnum(1);
+    let hook_called = Arc::new(AtomicBool::new(false));
+    let hook_called_for_funcall = Arc::clone(&hook_called);
+    set_funcall_hook(move |function, args| {
+        if function == hook_fn {
+            assert_eq!(args.len(), 2);
+            hook_called_for_funcall.store(true, Ordering::SeqCst);
+        }
+        Ok(NIL)
+    });
     set_debugger_hook(Some(hook_fn));
-    // error_condition on an unhandled error should invoke the debugger hook.
-    // After calling error_condition, we verify that the hook was invoked by
-    // checking that the debugger was entered (error_condition should either
-    // return an error result or invoke the hook). The key assertion is that
-    // the call completes without ignoring the hook.
+
     let result = error_condition(make_simple_error("unhandled", &[]));
-    // error_condition for an unhandled error should either:
-    // - return Err (because debugger was entered), or
-    // - return Ok if the hook handled it
-    // Either way, the hook must have been called. We verify the hook was
-    // consulted by checking the result is not silently Ok(()) with no
-    // debugger involvement — an unhandled error MUST enter the debugger.
+
     assert!(
         result.is_err(),
         "error_condition with unhandled error must enter debugger (return Err)"
     );
+    assert!(
+        hook_called.load(Ordering::SeqCst),
+        "R5.101: *DEBUGGER-HOOK* must be invoked before debugger entry"
+    );
+    clear_funcall_hook();
     set_debugger_hook(None);
 }
 
