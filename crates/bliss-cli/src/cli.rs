@@ -479,6 +479,7 @@ struct Env {
 #[derive(Clone, Default)]
 struct EnvFrame {
     vars: HashMap<String, BlissVal>,
+    symbol_vars: HashMap<u32, BlissVal>,
     parent: Option<Rc<RefCell<EnvFrame>>>,
 }
 
@@ -615,6 +616,7 @@ impl Env {
         Env {
             frame: Rc::new(RefCell::new(EnvFrame {
                 vars: HashMap::new(),
+                symbol_vars: HashMap::new(),
                 parent: Some(Rc::clone(&self.frame)),
             })),
             funs: Rc::clone(&self.funs),
@@ -640,6 +642,7 @@ impl Env {
         Env {
             frame: Rc::new(RefCell::new(EnvFrame {
                 vars: HashMap::new(),
+                symbol_vars: HashMap::new(),
                 parent: Some(parent),
             })),
             funs: Rc::clone(&self.funs),
@@ -671,6 +674,16 @@ impl Env {
         parent.and_then(|parent| Self::lookup_frame(&parent, name))
     }
 
+    fn lookup_var_symbol(&self, symbol: BlissVal) -> Option<BlissVal> {
+        let frame = self.frame.borrow();
+        if let Some(val) = frame.symbol_vars.get(&symbol.as_symbol_index()) {
+            return Some(*val);
+        }
+        let parent = frame.parent.clone();
+        drop(frame);
+        parent.and_then(|parent| Self::lookup_symbol_frame(&parent, symbol.as_symbol_index()))
+    }
+
     fn set_var(&mut self, name: &str, val: BlissVal) {
         if Self::set_frame_var(&self.frame, name, val) {
             return;
@@ -678,8 +691,25 @@ impl Env {
         self.define_local(name, val);
     }
 
+    fn set_var_symbol(&mut self, symbol: BlissVal, val: BlissVal) {
+        if Self::set_symbol_frame_var(&self.frame, symbol.as_symbol_index(), val) {
+            return;
+        }
+        let name = sym_name(symbol);
+        if Self::set_frame_var(&self.frame, &name, val) {
+            return;
+        }
+        self.define_local_symbol(symbol, val);
+    }
+
     fn define_local(&mut self, name: &str, val: BlissVal) {
         self.frame.borrow_mut().vars.insert(name.to_string(), val);
+    }
+
+    fn define_local_symbol(&mut self, symbol: BlissVal, val: BlissVal) {
+        let mut frame = self.frame.borrow_mut();
+        frame.symbol_vars.insert(symbol.as_symbol_index(), val);
+        frame.vars.insert(sym_name(symbol), val);
     }
 
     fn lookup_frame(frame: &Rc<RefCell<EnvFrame>>, name: &str) -> Option<BlissVal> {
@@ -690,6 +720,16 @@ impl Env {
         let parent = borrowed.parent.clone();
         drop(borrowed);
         parent.and_then(|parent| Self::lookup_frame(&parent, name))
+    }
+
+    fn lookup_symbol_frame(frame: &Rc<RefCell<EnvFrame>>, symbol_index: u32) -> Option<BlissVal> {
+        let borrowed = frame.borrow();
+        if let Some(val) = borrowed.symbol_vars.get(&symbol_index) {
+            return Some(*val);
+        }
+        let parent = borrowed.parent.clone();
+        drop(borrowed);
+        parent.and_then(|parent| Self::lookup_symbol_frame(&parent, symbol_index))
     }
 
     fn set_frame_var(frame: &Rc<RefCell<EnvFrame>>, name: &str, val: BlissVal) -> bool {
@@ -708,6 +748,22 @@ impl Env {
         false
     }
 
+    fn set_symbol_frame_var(frame: &Rc<RefCell<EnvFrame>>, symbol_index: u32, val: BlissVal) -> bool {
+        {
+            let mut borrowed = frame.borrow_mut();
+            if borrowed.symbol_vars.contains_key(&symbol_index) {
+                borrowed.symbol_vars.insert(symbol_index, val);
+                return true;
+            }
+            let parent = borrowed.parent.clone();
+            drop(borrowed);
+            if let Some(parent) = parent {
+                return Self::set_symbol_frame_var(&parent, symbol_index, val);
+            }
+        }
+        false
+    }
+
     fn clear_mv(&mut self) {
         self.mv.clear();
         self.mv_active = false;
@@ -717,6 +773,35 @@ impl Env {
         self.mv = values;
         self.mv_active = true;
     }
+}
+
+fn with_child_frame<T>(
+    env: &mut Env,
+    parent: Rc<RefCell<EnvFrame>>,
+    f: impl FnOnce(&mut Env) -> Result<T, BlissError>,
+) -> Result<T, BlissError> {
+    let saved_frame = Rc::clone(&env.frame);
+    env.frame = Rc::new(RefCell::new(EnvFrame {
+        vars: HashMap::new(),
+        symbol_vars: HashMap::new(),
+        parent: Some(parent),
+    }));
+    let result = f(env);
+    env.frame = saved_frame;
+    result
+}
+
+fn eval_lambda_call(
+    env: &mut Env,
+    params_form: BlissVal,
+    body: BlissVal,
+    args: &[BlissVal],
+    parent: Rc<RefCell<EnvFrame>>,
+) -> Result<BlissVal, BlissError> {
+    with_child_frame(env, parent, |env| {
+        bind_lambda_list(params_form, args, env)?;
+        eval_progn(body, env)
+    })
 }
 
 fn with_eval_context<T>(
@@ -1794,6 +1879,9 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
     }
     if form.is_symbol() {
+        if let Some(val) = env.lookup_var_symbol(form) {
+            return Ok(val);
+        }
         let name = sym_name(form);
         // Keyword symbols are self-evaluating
         if name.starts_with("KEYWORD:") {
@@ -2457,9 +2545,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 while c.is_cons() {
                     let (sym_form, r) = cp(c);
                     let (val_form, r2) = cp(r);
-                    let name = sym_name(sym_form);
                     let val = eval_form(val_form, env)?;
-                    env.set_var(&name, val);
+                    if sym_form.is_symbol() {
+                        env.set_var_symbol(sym_form, val);
+                    } else {
+                        env.set_var(&sym_name(sym_form), val);
+                    }
                     result = val;
                     c = r2;
                 }
@@ -3708,9 +3799,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 args.push(eval_form(af, env)?);
                 c = r;
             }
-            let mut child_env = env.child();
-            bind_lambda_list(fdef.params_form, &args, &mut child_env)?;
-            return eval_progn(fdef.body, &mut child_env);
+            return eval_lambda_call(
+                env,
+                fdef.params_form,
+                fdef.body,
+                &args,
+                Rc::clone(&env.frame),
+            );
         }
 
         // Check accessor functions (from DEFCLASS)
@@ -3793,11 +3888,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         args.push(eval_form(af, env)?);
                         c = r;
                     }
-                    let mut child_env = env.child();
-                    for (i, param) in fdef.params.iter().enumerate() {
-                        child_env.define_local(param, if i < args.len() { args[i] } else { NIL });
-                    }
-                    return eval_progn(fdef.body, &mut child_env);
+                    return eval_lambda_call(
+                        env,
+                        fdef.params_form,
+                        fdef.body,
+                        &args,
+                        Rc::clone(&env.frame),
+                    );
                 }
             }
         }
@@ -3815,9 +3912,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 args.push(eval_form(af, env)?);
                 c = r;
             }
-            let mut child_env = env.child();
-            bind_lambda_list(params_form, &args, &mut child_env)?;
-            return eval_progn(body_rest, &mut child_env);
+            return eval_lambda_call(env, params_form, body_rest, &args, Rc::clone(&env.frame));
         }
     }
 
@@ -5435,10 +5530,13 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                 let (val_form, _) = cp(val_rest);
                 let var_name = sym_name(var_form);
                 let val = eval_form(val_form, &mut child_env)?;
-                child_env.define_local(&var_name, val);
+                if var_form.is_symbol() {
+                    child_env.define_local_symbol(var_form, val);
+                } else {
+                    child_env.define_local(&var_name, val);
+                }
             } else if binding.is_symbol() {
-                let var_name = sym_name(binding);
-                child_env.define_local(&var_name, NIL);
+                child_env.define_local_symbol(binding, NIL);
             }
             c = rest;
         }
@@ -5452,16 +5550,20 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
         if binding.is_cons() {
             let (var_form, val_rest) = cp(binding);
             let (val_form, _) = cp(val_rest);
-            evaluated.push((sym_name(var_form), eval_form(val_form, env)?));
+            evaluated.push((var_form, eval_form(val_form, env)?));
         } else if binding.is_symbol() {
-            evaluated.push((sym_name(binding), NIL));
+            evaluated.push((binding, NIL));
         }
         c = rest;
     }
 
     let mut child_env = env.child();
-    for (name, val) in evaluated {
-        child_env.define_local(&name, val);
+    for (symbol, val) in evaluated {
+        if symbol.is_symbol() {
+            child_env.define_local_symbol(symbol, val);
+        } else {
+            child_env.define_local(&sym_name(symbol), val);
+        }
     }
     eval_progn(body, &mut child_env)
 }
@@ -5669,7 +5771,7 @@ fn bind_lambda_list(
                     ))
                 })?;
                 arg_i += 1;
-                env.define_local(&sym_name(elem), v);
+                env.define_local_symbol(elem, v);
             }
             Mode::Opt => {
                 let (var, default_form, supp) = parse_var_spec(elem);
@@ -6069,9 +6171,13 @@ fn apply_function(
     if fn_val.is_symbol() {
         let name = sym_name(fn_val);
         if let Some(fdef) = env.funs.get(&name).cloned() {
-            let mut child_env = env.child();
-            bind_lambda_list(fdef.params_form, args, &mut child_env)?;
-            return eval_progn(fdef.body, &mut child_env);
+            return eval_lambda_call(
+                env,
+                fdef.params_form,
+                fdef.body,
+                args,
+                Rc::clone(&env.frame),
+            );
         }
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
         // full operator-position builtin set (not just apply_builtin's subset)
@@ -6092,17 +6198,18 @@ fn apply_function(
             let id = lr.as_fixnum() as u64;
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
-                let mut child_env = env.child_with_parent(Rc::clone(&closure.captured_frame));
-                // Bind parameters
-                bind_lambda_list(closure.params_form, args, &mut child_env)?;
-                return eval_progn(closure.body, &mut child_env);
+                return eval_lambda_call(
+                    env,
+                    closure.params_form,
+                    closure.body,
+                    args,
+                    Rc::clone(&closure.captured_frame),
+                );
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
             let (params_form, body) = cp(lr);
-            let mut child_env = env.child();
-            bind_lambda_list(params_form, args, &mut child_env)?;
-            return eval_progn(body, &mut child_env);
+            return eval_lambda_call(env, params_form, body, args, Rc::clone(&env.frame));
         }
     }
     Err(BlissError::Internal(format!("Cannot apply: {:?}", fn_val)))

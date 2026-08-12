@@ -20,3 +20,6 @@ bliss-stdlib = { path = "crates/bliss-stdlib" }
 
 [profile.test]
 opt-level = 3
+
+[profile.dev.package.bliss-cli]
+opt-level = 2

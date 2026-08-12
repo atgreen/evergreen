@@ -164,6 +164,53 @@ fn no_image_eval_mode_supports_bootstrap_without_a_saved_image() {
 }
 
 #[test]
+fn stage_zero_gate_round_trips_core_datatypes_and_runs_a_nested_script() {
+    // Per §0.4 stage 0 and spec/stages.json, the real CLI must prove
+    // datatype read->print round-trips plus nested arithmetic/list evaluation.
+    let dir = temp_dir("stage0-gate");
+    let script = dir.join("stage0-gate.lisp");
+    write_file(
+        &script,
+        "(print 123)\n\
+         (print 3/4)\n\
+         (print 1.5)\n\
+         (print #\\A)\n\
+         (print \"hello\")\n\
+         (print 'foo)\n\
+         (print :bar)\n\
+         (print '(1 (2 3) nil))\n\
+         (print t)\n\
+         (print nil)\n\
+         (print (list (+ 1 (* 2 3))\n\
+                      (car (cdr (cons 9 (list 8 7))))\n\
+                      (cdr (list 4 5 6))))\n",
+    );
+
+    let output = bliss()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run bliss stage-0 gate");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    for expected in [
+        "123", "3/4", "1.5", "#\\A", "\"HELLO\"", "FOO", ":BAR", "(1 (2 3) NIL)", "T", "NIL",
+        "(7 8 (5 6))",
+    ] {
+        assert!(stdout.contains(expected), "missing `{expected}` in: {stdout}");
+    }
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 #[ignore = "stage 6: ASDF self-host"]
 fn bundled_asdf_is_reachable_via_require_with_output_translations_and_t1_metadata() {
     // Per R6.45-R6.48, the real CLI must delegate REQUIRE to bundled ASDF,
@@ -468,7 +515,7 @@ fn stage_one_gate_programs_run_through_the_real_cli() {
              (lambda (&optional (delta 1))\n\
                (setq n (+ n delta))\n\
                n)))\n\
-         (print (fib 10))\n\
+         (print (fib 30))\n\
          (print (mapcar (lambda (x) (* x x)) '(1 2 3 4)))\n\
          (let ((counter (make-counter 7)))\n\
            (print (list (funcall counter) (funcall counter 5))))\n\
@@ -491,7 +538,7 @@ fn stage_one_gate_programs_run_through_the_real_cli() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
-    assert!(stdout.contains("55"), "fib output missing from: {stdout}");
+    assert!(stdout.contains("832040"), "fib output missing from: {stdout}");
     assert!(
         stdout.contains("(1 4 9 16)"),
         "mapcar/lambda output missing from: {stdout}"
