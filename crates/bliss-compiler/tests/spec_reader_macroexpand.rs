@@ -5,8 +5,8 @@ use std::sync::{
 
 use bliss_compiler::macroexpand::{
     DeclInfo, Environment, FunctionInfo, VariableInfo, define_compiler_macro, define_global_macro,
-    macroexpand, macroexpand_1, macroexpand_all, set_macroexpand_hook, set_macroexpand_limit,
-    undefine_compiler_macro, undefine_global_macro,
+    enclose, macroexpand, macroexpand_1, macroexpand_all, parse_macro, set_macroexpand_hook,
+    set_macroexpand_limit, undefine_compiler_macro, undefine_global_macro,
 };
 use bliss_compiler::reader::{
     ReaderState, copy_readtable, get_dispatch_macro_character, get_macro_character, intern_symbol,
@@ -439,6 +439,22 @@ fn macroexpand_uses_the_macroexpand_hook() {
 
     undefine_global_macro(name);
     set_macroexpand_hook(passthrough_hook);
+}
+
+#[test]
+fn parse_macro_and_enclose_capture_the_defining_environment() {
+    // Per R4.14, parse-macro/enclose must produce a local macro expander that
+    // closes over the lexical macroexpansion environment visible at definition time.
+    let defining_env = Environment::null()
+        .augment_variable(sym("X"), VariableInfo::SymbolMacro(BlissVal::from_fixnum(41)));
+    let parsed = parse_macro(sym("M"), NIL, parse("(X)"), Some(&defining_env))
+        .expect("parse local macro");
+    let expander = enclose(parsed, &defining_env).expect("close local macro");
+    let call_env = Environment::null().augment_function(sym("M"), FunctionInfo::Macro(expander));
+
+    let (expanded, did_expand) = macroexpand_1(parse("(M)"), &call_env).unwrap();
+    assert!(did_expand);
+    assert_eq!(expanded.as_fixnum(), 41);
 }
 
 #[test]

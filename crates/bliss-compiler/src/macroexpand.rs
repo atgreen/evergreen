@@ -7,6 +7,7 @@ use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use bliss_rt::error::BlissError;
@@ -366,6 +367,14 @@ static COMPILER_MACRO_TABLE: LazyLock<RwLock<HashMap<u64, CompilerMacroFn>>> =
 pub type CompilerMacroFn =
     Arc<dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + Send + Sync>;
 
+/// Parsed macro lambda-expression used by `parse_macro`/`enclose`.
+#[derive(Clone, Debug)]
+pub struct ParsedMacro {
+    name: BlissVal,
+    lambda_list: BlissVal,
+    body: BlissVal,
+}
+
 /// Register a global macro (DEFMACRO).
 pub fn define_global_macro(name: BlissVal, expander: BlissVal) {
     let mut table = GLOBAL_MACRO_TABLE.write().unwrap();
@@ -410,11 +419,50 @@ fn lookup_compiler_macro(name: BlissVal) -> Option<CompilerMacroFn> {
 static MACRO_FUNCTION_REGISTRY: LazyLock<RwLock<HashMap<u64, Arc<MacroFn>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+static MACRO_FUNCTION_KEY_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 /// Register a macro expander function that can be invoked by the default hook.
 /// The `key` is the BlissVal that appears as FunctionInfo::Macro(key).
 pub fn register_macro_function(key: BlissVal, func: Arc<MacroFn>) {
     let mut registry = MACRO_FUNCTION_REGISTRY.write().unwrap();
     registry.insert(key.0, func);
+}
+
+fn next_registered_macro_key() -> BlissVal {
+    BlissVal::from_fixnum(MACRO_FUNCTION_KEY_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64)
+}
+
+/// Parse a macro definition into a lambda-expression suitable for `enclose`.
+pub fn parse_macro(
+    name: BlissVal,
+    lambda_list: BlissVal,
+    body: BlissVal,
+    _env: Option<&Environment>,
+) -> Result<ParsedMacro, BlissError> {
+    if !name.is_symbol() {
+        return Err(BlissError::Internal(
+            "PARSE-MACRO: name must be a symbol".into(),
+        ));
+    }
+    Ok(ParsedMacro {
+        name,
+        lambda_list,
+        body,
+    })
+}
+
+/// Close a parsed macro lambda-expression over the given lexical environment.
+pub fn enclose(parsed: ParsedMacro, env: &Environment) -> Result<BlissVal, BlissError> {
+    let key = next_registered_macro_key();
+    let defining_env = env.clone();
+    let _ = parsed.name;
+    let lambda_list = parsed.lambda_list;
+    let body = parsed.body;
+    let func = Arc::new(move |whole_form: BlissVal, call_env: &Environment| {
+        expand_local_macro_call(whole_form, call_env, &defining_env, lambda_list, body)
+    });
+    register_macro_function(key, func);
+    Ok(key)
 }
 
 /// Look up a registered macro function by its BlissVal identity.
@@ -1477,12 +1525,12 @@ fn expand_macrolet(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissE
     // Install macro definitions in a new environment frame
     let mut augmented_env = env.clone();
     let defs = cons_to_vec(macro_defs);
-    for (index, def) in defs.iter().enumerate() {
+    for def in &defs {
         if !def.is_cons() {
             continue;
         }
         let macro_name = unsafe { cons_car(*def) };
-        let key = make_local_macrolet_expander(*def, env.clone(), index as u64)?;
+        let key = make_local_macrolet_expander(*def, env.clone())?;
         augmented_env = augmented_env.augment_function(macro_name, FunctionInfo::Macro(key));
     }
 
@@ -1610,7 +1658,6 @@ type MacroFn = dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + 
 fn make_local_macrolet_expander(
     def: BlissVal,
     defining_env: Environment,
-    ordinal: u64,
 ) -> Result<BlissVal, BlissError> {
     let name = unsafe { cons_car(def) };
     let rest = unsafe { cons_cdr(def) };
@@ -1621,13 +1668,8 @@ fn make_local_macrolet_expander(
     }
     let params = unsafe { cons_car(rest) };
     let body = unsafe { cons_cdr(rest) };
-    let key = BlissVal::from_fixnum(-((ordinal as i64) + 1));
-    let func = Arc::new(move |whole_form: BlissVal, call_env: &Environment| {
-        expand_local_macro_call(whole_form, call_env, &defining_env, params, body)
-    });
-    register_macro_function(key, func);
-    let _ = name;
-    Ok(key)
+    let parsed = parse_macro(name, params, body, Some(&defining_env))?;
+    enclose(parsed, &defining_env)
 }
 
 fn expand_local_macro_call(

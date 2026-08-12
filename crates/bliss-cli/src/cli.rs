@@ -565,6 +565,8 @@ struct HandlerEntry {
 thread_local! {
     static CONTROL_VALUES: RefCell<HashMap<String, BlissVal>> = RefCell::new(HashMap::new());
     static CONTROL_COUNTER: RefCell<u64> = const { RefCell::new(0) };
+    static MACROEXPAND_ENVIRONMENTS: RefCell<HashMap<u64, MacroexpandEnv>> = RefCell::new(HashMap::new());
+    static NEXT_MACROEXPAND_ENVIRONMENT_ID: RefCell<u64> = const { RefCell::new(1) };
 }
 
 static MACRO_FUNCTION_HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -580,6 +582,40 @@ fn next_control_token(prefix: &str) -> String {
 
 fn next_macro_function_handle() -> BlissVal {
     BlissVal::from_fixnum(MACRO_FUNCTION_HANDLE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64)
+}
+
+fn macroexpand_environment_handle_symbol() -> BlissVal {
+    resolve_sym("BLISS::MACROEXPAND-ENV").unwrap_or(NIL)
+}
+
+fn store_macroexpand_environment(env: MacroexpandEnv) -> BlissVal {
+    let id = NEXT_MACROEXPAND_ENVIRONMENT_ID.with(|counter| {
+        let id = *counter.borrow();
+        *counter.borrow_mut() = id + 1;
+        id
+    });
+    MACROEXPAND_ENVIRONMENTS.with(|envs| {
+        envs.borrow_mut().insert(id, env);
+    });
+    arena_cons(
+        macroexpand_environment_handle_symbol(),
+        BlissVal::from_fixnum(id as i64),
+    )
+}
+
+fn load_macroexpand_environment(handle: BlissVal) -> Option<MacroexpandEnv> {
+    if !handle.is_cons() {
+        return None;
+    }
+    let (tag, payload) = cp(handle);
+    if tag != macroexpand_environment_handle_symbol() || !payload.is_fixnum() {
+        return None;
+    }
+    let id = payload.as_fixnum();
+    if id <= 0 {
+        return None;
+    }
+    MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().get(&(id as u64)).cloned())
 }
 
 fn store_control_value(token: &str, value: BlissVal) {
@@ -6022,6 +6058,7 @@ fn bind_macro_lambda_list(
     params_form: BlissVal,
     args: &[BlissVal],
     env: &mut Env,
+    macroexpand_env: Option<&MacroexpandEnv>,
 ) -> Result<(), BlissError> {
     #[derive(PartialEq)]
     enum Mode {
@@ -6052,6 +6089,16 @@ fn bind_macro_lambda_list(
                 "&WHOLE" => {
                     let (var, rest_after_var) = cp(c);
                     whole_var = Some(var);
+                    c = rest_after_var;
+                    continue;
+                }
+                "&ENVIRONMENT" => {
+                    let (var, rest_after_var) = cp(c);
+                    let env_value = macroexpand_env
+                        .cloned()
+                        .map(store_macroexpand_environment)
+                        .unwrap_or(NIL);
+                    bind_pattern_value(var, env_value, env)?;
                     c = rest_after_var;
                     continue;
                 }
@@ -6317,7 +6364,12 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
             macro_env.packages = Rc::new(packages.clone());
             macro_env.current_package = current_package.clone();
             macro_env.eval_context = eval_context;
-            bind_macro_lambda_list(params_form, &list_to_vec(args), &mut macro_env)?;
+            bind_macro_lambda_list(
+                params_form,
+                &list_to_vec(args),
+                &mut macro_env,
+                Some(_macro_env),
+            )?;
             eval_progn(body, &mut macro_env)
         }),
     );
@@ -6328,7 +6380,13 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
 fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
     let arg_list = list_to_vec(args);
-    bind_macro_lambda_list(mdef.params_form, &arg_list, &mut child_env)?;
+    let macroexpand_env = macroexpand_environment_from_cli(env);
+    bind_macro_lambda_list(
+        mdef.params_form,
+        &arg_list,
+        &mut child_env,
+        Some(&macroexpand_env),
+    )?;
     eval_progn(mdef.body, &mut child_env)
 }
 
@@ -6377,11 +6435,16 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         let captured_frame = freeze_env_frame(&macro_def.captured_frame);
         compiler_macroexpand::register_macro_function(
             handle,
-            Arc::new(move |form, _macro_env| {
+            Arc::new(move |form, call_macro_env| {
                 let (_, args) = cp(form);
                 let mut macro_env = Env::new(false);
                 macro_env.frame = thaw_env_frame(&captured_frame);
-                bind_macro_lambda_list(params_form, &list_to_vec(args), &mut macro_env)?;
+                bind_macro_lambda_list(
+                    params_form,
+                    &list_to_vec(args),
+                    &mut macro_env,
+                    Some(call_macro_env),
+                )?;
                 eval_progn(body, &mut macro_env)
             }),
         );
@@ -6394,9 +6457,17 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
 }
 
 fn eval_macroexpand(cdr: BlissVal, env: &mut Env, single_step: bool) -> Result<BlissVal, BlissError> {
-    let (form_expr, _) = cp(cdr);
+    let (form_expr, rest) = cp(cdr);
     let form = eval_form(form_expr, env)?;
-    let macro_env = macroexpand_environment_from_cli(env);
+    let macro_env = if rest.is_cons() {
+        let (env_expr, _) = cp(rest);
+        let env_value = eval_form(env_expr, env)?;
+        load_macroexpand_environment(env_value).ok_or_else(|| {
+            BlissError::Internal("MACROEXPAND: invalid lexical environment".into())
+        })?
+    } else {
+        macroexpand_environment_from_cli(env)
+    };
     let (expanded, expanded_p) = if single_step {
         compiler_macroexpand::macroexpand_1(form, &macro_env)?
     } else {

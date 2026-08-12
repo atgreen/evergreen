@@ -568,3 +568,49 @@ fn stage_one_gate_programs_run_through_the_real_cli() {
     );
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn stage_two_gate_loads_a_real_file_with_user_macros_standard_macros_and_environment_aware_expansion() {
+    // Per §0.4 stage 2 and spec/stages.json, the real CLI gate is loading a
+    // multi-form file that defines and uses its own macros plus standard macros.
+    let dir = temp_dir("stage2-gate");
+    let script = dir.join("stage2-macros.lisp");
+    write_file(
+        &script,
+        "(defmacro expand-local (form &environment env)\n\
+           (macroexpand form env))\n\
+         (defmacro sum-pairs (pairs)\n\
+           `(let ((total 0))\n\
+              (dolist (pair ,pairs)\n\
+                (destructuring-bind (a . b) pair\n\
+                  (when t\n\
+                    (incf total (+ a b)))))\n\
+              total))\n\
+         (print\n\
+           (list\n\
+             (macrolet ((local-answer () 41))\n\
+               (+ 1 (expand-local (local-answer))))\n\
+             (sum-pairs '((1 . 2) (3 . 4)))))\n",
+    );
+
+    let output = bliss()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run bliss stage-2 gate");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("(42 10)"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
