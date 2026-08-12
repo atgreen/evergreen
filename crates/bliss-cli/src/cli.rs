@@ -1,6 +1,9 @@
 //! CLI entry point — argument parsing, REPL driver, and image-load entry.
 //! See spec §6.1 (REPL), §7.4 (deployment modes), §2.8 (CLI args).
 
+use bliss_compiler::macroexpand::{
+    self as compiler_macroexpand, Environment as MacroexpandEnv, FunctionInfo, VariableInfo,
+};
 use bliss_compiler::reader;
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{ConsCell, ObjectHeader, RatioData, type_id};
@@ -12,6 +15,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 // ── CLI arguments ──────────────────────────────────────────────────
 #[derive(Clone, Debug)]
@@ -485,6 +490,13 @@ struct EnvFrame {
 }
 
 #[derive(Clone)]
+struct FrozenEnvFrame {
+    vars: HashMap<String, BlissVal>,
+    symbol_vars: HashMap<u32, BlissVal>,
+    parent: Option<Arc<FrozenEnvFrame>>,
+}
+
+#[derive(Clone)]
 struct FunDef {
     params: Vec<String>,
     /// Raw lambda list, for full &optional/&rest/&key binding.
@@ -555,6 +567,8 @@ thread_local! {
     static CONTROL_COUNTER: RefCell<u64> = const { RefCell::new(0) };
 }
 
+static MACRO_FUNCTION_HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 fn next_control_token(prefix: &str) -> String {
     let id = CONTROL_COUNTER.with(|counter| {
         let id = *counter.borrow();
@@ -564,10 +578,31 @@ fn next_control_token(prefix: &str) -> String {
     format!("{prefix}:{id}")
 }
 
+fn next_macro_function_handle() -> BlissVal {
+    BlissVal::from_fixnum(MACRO_FUNCTION_HANDLE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64)
+}
+
 fn store_control_value(token: &str, value: BlissVal) {
     CONTROL_VALUES.with(|values| {
         values.borrow_mut().insert(token.to_string(), value);
     });
+}
+
+fn freeze_env_frame(frame: &Rc<RefCell<EnvFrame>>) -> Arc<FrozenEnvFrame> {
+    let borrowed = frame.borrow();
+    Arc::new(FrozenEnvFrame {
+        vars: borrowed.vars.clone(),
+        symbol_vars: borrowed.symbol_vars.clone(),
+        parent: borrowed.parent.as_ref().map(freeze_env_frame),
+    })
+}
+
+fn thaw_env_frame(frame: &Arc<FrozenEnvFrame>) -> Rc<RefCell<EnvFrame>> {
+    Rc::new(RefCell::new(EnvFrame {
+        vars: frame.vars.clone(),
+        symbol_vars: frame.symbol_vars.clone(),
+        parent: frame.parent.as_ref().map(thaw_env_frame),
+    }))
 }
 
 fn take_control_value(token: &str) -> BlissVal {
@@ -2611,8 +2646,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (val_form, r2) = cp(r);
                     let val = eval_form(val_form, env)?;
                     if place.is_symbol() {
-                        let name = sym_name(place);
-                        env.set_var(&name, val);
+                        if let Some(expansion) = env.lookup_symbol_macro(place) {
+                            let setf_form = arena_cons(
+                                resolve_sym("SETF").unwrap_or(NIL),
+                                arena_cons(expansion, arena_cons(val_form, NIL)),
+                            );
+                            result = eval_form(setf_form, env)?;
+                            c = r2;
+                            continue;
+                        }
+                        env.set_var_symbol(place, val);
                     } else if place.is_cons() {
                         let (accessor, aargs) = cp(place);
                         let acc = if accessor.is_symbol() {
@@ -2671,8 +2714,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "DEFUN" => return eval_defun(cdr, env),
             "FLET" | "LABELS" => return eval_flet(cdr, env),
             "DEFMACRO" => return eval_defmacro(cdr, env),
+            "DEFINE-SYMBOL-MACRO" => return eval_define_symbol_macro(cdr, env),
+            "DEFINE-COMPILER-MACRO" => return eval_define_compiler_macro(cdr, env),
             "MACROLET" => return eval_macrolet(cdr, env),
             "SYMBOL-MACROLET" => return eval_symbol_macrolet(cdr, env),
+            "MACROEXPAND-1" => return eval_macroexpand(cdr, env, true),
+            "MACROEXPAND" => return eval_macroexpand(cdr, env, false),
             "DEFCLASS" => return eval_defclass(cdr, env),
             "DEFMETHOD" => return eval_defmethod(cdr, env),
             "MAKE-INSTANCE" => return eval_make_instance(cdr, env),
@@ -6225,11 +6272,138 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     Ok(name_form)
 }
 
+fn eval_define_symbol_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let (symbol, rest) = cp(cdr);
+    let (expansion, _) = cp(rest);
+    if !symbol.is_symbol() {
+        return Err(BlissError::Internal(
+            "DEFINE-SYMBOL-MACRO: name must be a symbol".into(),
+        ));
+    }
+    env.define_symbol_macro(symbol, expansion);
+    Ok(symbol)
+}
+
+fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let (name_form, rest) = cp(cdr);
+    let (params_form, body) = cp(rest);
+    if !name_form.is_symbol() {
+        return Err(BlissError::Internal(
+            "DEFINE-COMPILER-MACRO: name must be a symbol".into(),
+        ));
+    }
+
+    let captured_frame = freeze_env_frame(&env.frame);
+    let funs = (*env.funs).clone();
+    let classes = (*env.classes).clone();
+    let methods = (*env.methods).clone();
+    let packages = (*env.packages).clone();
+    let current_package = env.current_package.clone();
+    let sandbox = env.sandbox;
+    let symbol_macros = (*env.symbol_macros).clone();
+    let eval_context = env.eval_context;
+
+    compiler_macroexpand::define_compiler_macro(
+        name_form,
+        Arc::new(move |form, _macro_env| {
+            let (_, args) = cp(form);
+            let mut macro_env = Env::new(sandbox);
+            macro_env.frame = thaw_env_frame(&captured_frame);
+            macro_env.funs = Rc::new(funs.clone());
+            macro_env.macros = Rc::new(HashMap::new());
+            macro_env.symbol_macros = Rc::new(symbol_macros.clone());
+            macro_env.classes = Rc::new(classes.clone());
+            macro_env.methods = Rc::new(methods.clone());
+            macro_env.packages = Rc::new(packages.clone());
+            macro_env.current_package = current_package.clone();
+            macro_env.eval_context = eval_context;
+            bind_macro_lambda_list(params_form, &list_to_vec(args), &mut macro_env)?;
+            eval_progn(body, &mut macro_env)
+        }),
+    );
+
+    Ok(name_form)
+}
+
 fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
     let arg_list = list_to_vec(args);
     bind_macro_lambda_list(mdef.params_form, &arg_list, &mut child_env)?;
     eval_progn(mdef.body, &mut child_env)
+}
+
+fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
+    fn collect_frames(frame: &Rc<RefCell<EnvFrame>>, frames: &mut Vec<Rc<RefCell<EnvFrame>>>) {
+        let parent = frame.borrow().parent.clone();
+        if let Some(parent) = parent {
+            collect_frames(&parent, frames);
+        }
+        frames.push(Rc::clone(frame));
+    }
+
+    let mut macro_env = MacroexpandEnv::null();
+
+    let mut global_symbol_macros = Vec::new();
+    for (&symbol_index, &expansion) in env.symbol_macros.iter() {
+        global_symbol_macros.push((
+            BlissVal::from_symbol_index(symbol_index),
+            VariableInfo::SymbolMacro(expansion),
+        ));
+    }
+    if !global_symbol_macros.is_empty() {
+        macro_env = macro_env.augment_environment(global_symbol_macros, Vec::new(), Vec::new());
+    }
+
+    let mut frames = Vec::new();
+    collect_frames(&env.frame, &mut frames);
+    for frame in frames {
+        let borrowed = frame.borrow();
+        let mut variables = Vec::new();
+        for &symbol_index in borrowed.symbol_vars.keys() {
+            variables.push((
+                BlissVal::from_symbol_index(symbol_index),
+                VariableInfo::Lexical,
+            ));
+        }
+        if !variables.is_empty() {
+            macro_env = macro_env.augment_environment(variables, Vec::new(), Vec::new());
+        }
+    }
+
+    for (name, macro_def) in env.macros.iter() {
+        let handle = next_macro_function_handle();
+        let params_form = macro_def.params_form;
+        let body = macro_def.body;
+        let captured_frame = freeze_env_frame(&macro_def.captured_frame);
+        compiler_macroexpand::register_macro_function(
+            handle,
+            Arc::new(move |form, _macro_env| {
+                let (_, args) = cp(form);
+                let mut macro_env = Env::new(false);
+                macro_env.frame = thaw_env_frame(&captured_frame);
+                bind_macro_lambda_list(params_form, &list_to_vec(args), &mut macro_env)?;
+                eval_progn(body, &mut macro_env)
+            }),
+        );
+        if let Some(symbol) = resolve_sym(name) {
+            macro_env = macro_env.augment_function(symbol, FunctionInfo::Macro(handle));
+        }
+    }
+
+    macro_env
+}
+
+fn eval_macroexpand(cdr: BlissVal, env: &mut Env, single_step: bool) -> Result<BlissVal, BlissError> {
+    let (form_expr, _) = cp(cdr);
+    let form = eval_form(form_expr, env)?;
+    let macro_env = macroexpand_environment_from_cli(env);
+    let (expanded, expanded_p) = if single_step {
+        compiler_macroexpand::macroexpand_1(form, &macro_env)?
+    } else {
+        compiler_macroexpand::macroexpand(form, &macro_env)?
+    };
+    env.set_mv(vec![expanded, if expanded_p { T } else { NIL }]);
+    Ok(expanded)
 }
 
 fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
