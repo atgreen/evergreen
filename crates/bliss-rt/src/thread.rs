@@ -557,7 +557,15 @@ pub fn wait_for_other_threads() {
             prune_orphaned_threads(&mut registry, Some(current));
             registry
                 .iter()
-                .filter(|(id, _)| **id != current)
+                .filter(|(id, thread)| {
+                    // Only wait for green threads this runtime actually spawned
+                    // (those created by `make_thread`, which carry a real entry
+                    // function). Bootstrap CURRENT_THREAD entries created lazily
+                    // by *other* OS threads have a NIL entry and are never driven
+                    // to Dead by this runtime, so waiting on them would livelock
+                    // shutdown whenever another runtime/test thread coexists.
+                    **id != current && !thread.entry().is_nil()
+                })
                 .any(|(_, thread)| thread.state() != ThreadState::Dead)
         };
         if !pending {

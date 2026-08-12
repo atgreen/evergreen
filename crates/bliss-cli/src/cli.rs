@@ -8,6 +8,7 @@ use bliss_rt::runtime::parse_cli as parse_runtime_cli;
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -2031,9 +2032,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 println!();
                 return Ok(T);
             }
-            "+" => return eval_arith(cdr, env, 0, 0.0, |a, b| a + b, rat_add),
+            "+" => return eval_arith(cdr, env, 0, 0.0, |a, b| a + b, bigrat_add),
             "-" => return eval_arith_sub(cdr, env),
-            "*" => return eval_arith(cdr, env, 1, 1.0, |a, b| a * b, rat_mul),
+            "*" => return eval_arith(cdr, env, 1, 1.0, |a, b| a * b, bigrat_mul),
             "/" => return eval_arith_div(cdr, env),
             "CONS" => {
                 let (af, r) = cp(cdr);
@@ -2186,34 +2187,30 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (bf, _) = cp(r);
                 let a = eval_form(af, env)?;
                 let b = eval_form(bf, env)?;
-                let av = num_val(a)?;
-                let bv = num_val(b)?;
-                return Ok(if (av - bv).abs() < f64::EPSILON {
+                return Ok(if numeric_cmp(a, b)? == Ordering::Equal {
                     T
                 } else {
                     NIL
                 });
             }
             "<" => {
-                return eval_cmp(cdr, env, |a, b| a < b);
+                return eval_cmp(cdr, env, |o| o == Ordering::Less);
             }
             ">" => {
-                return eval_cmp(cdr, env, |a, b| a > b);
+                return eval_cmp(cdr, env, |o| o == Ordering::Greater);
             }
             "<=" => {
-                return eval_cmp(cdr, env, |a, b| a <= b);
+                return eval_cmp(cdr, env, |o| o != Ordering::Greater);
             }
             ">=" => {
-                return eval_cmp(cdr, env, |a, b| a >= b);
+                return eval_cmp(cdr, env, |o| o != Ordering::Less);
             }
             "/=" => {
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
                 let a = eval_form(af, env)?;
                 let b = eval_form(bf, env)?;
-                let av = num_val(a)?;
-                let bv = num_val(b)?;
-                return Ok(if (av - bv).abs() >= f64::EPSILON {
+                return Ok(if numeric_cmp(a, b)? != Ordering::Equal {
                     T
                 } else {
                     NIL
@@ -2867,13 +2864,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (bf, _) = cp(r);
                 let a = eval_form(af, env)?;
                 let b = eval_form(bf, env)?;
+                // Exact result when the base is rational and the exponent is an
+                // integer: an exact rational/bignum, promoting past i64 range.
+                if !a.is_single_float() && b.is_fixnum() {
+                    if let Some(base) = as_bigrat(a) {
+                        let e = b.as_fixnum();
+                        if e >= 0 {
+                            return Ok(bigrat_pow(&base, e as u64).to_val());
+                        }
+                        if base.num.is_zero() {
+                            return Err(BlissError::ArithmeticError("division by zero".into()));
+                        }
+                        // negative exponent: reciprocal of base^|e|
+                        let p = bigrat_pow(&base, e.unsigned_abs());
+                        return Ok(bigrat_div(&BigRat::from_i64(1), &p).to_val());
+                    }
+                }
                 let av = num_val(a)?;
                 let bv = num_val(b)?;
-                let result = av.powf(bv);
-                if a.is_fixnum() && b.is_fixnum() && bv >= 0.0 {
-                    return Ok(BlissVal::from_fixnum(result as i64));
-                }
-                return Ok(BlissVal::from_single_float(result as f32));
+                return Ok(BlissVal::from_single_float(av.powf(bv) as f32));
             }
             "SQRT" => {
                 let (af, _) = cp(cdr);
@@ -4542,47 +4551,19 @@ fn loop_from_exhausted(
     })
 }
 
-// ── Arithmetic helpers (issue #6 fix: proper float arithmetic) ────
-// ── Exact rational arithmetic (Stage-0 numeric tower) ─────────────
-#[derive(Clone, Copy)]
-struct Rat {
-    num: i64,
-    den: i64, // invariant after rat_reduce: den > 0
-}
+// ── Exact numeric tower: fixnum <-> bignum <-> ratio ──────────────
+//
+// Integer arithmetic promotes to arbitrary precision (BIGNUM, §1.8.1) on
+// i64 overflow rather than silently wrapping. Exact rationals are carried as
+// a pair of BigInts (denominator kept positive). Floats remain inexact and
+// contaminate any operation they take part in, per CL contagion rules.
 
-fn gcd_i64(a: i64, b: i64) -> i64 {
-    let mut a = a.abs();
-    let mut b = b.abs();
-    while b != 0 {
-        let t = a % b;
-        a = b;
-        b = t;
-    }
-    a
-}
+/// The 61-bit fixnum range (values outside it become BIGNUMs), matching the
+/// reader's `fits_fixnum`.
+const FIXNUM_MAX: i64 = (1 << 60) - 1;
+const FIXNUM_MIN: i64 = -(1 << 60);
 
-fn rat_reduce(mut num: i64, mut den: i64) -> Rat {
-    if den < 0 {
-        num = -num;
-        den = -den;
-    }
-    let g = gcd_i64(num, den);
-    let g = if g == 0 { 1 } else { g };
-    Rat {
-        num: num / g,
-        den: den / g,
-    }
-}
-
-fn rat_add(a: Rat, b: Rat) -> Rat {
-    rat_reduce(a.num * b.den + b.num * a.den, a.den * b.den)
-}
-
-fn rat_mul(a: Rat, b: Rat) -> Rat {
-    rat_reduce(a.num * b.num, a.den * b.den)
-}
-
-/// Allocate a RATIO heap object (numerator/denominator both fixnums).
+/// Allocate a RATIO heap object (numerator/denominator are integers).
 fn alloc_ratio_cli(num: BlissVal, den: BlissVal) -> BlissVal {
     let data = Box::leak(Box::new(RatioData {
         header: ObjectHeader::new(type_id::RATIO, 3),
@@ -4592,18 +4573,27 @@ fn alloc_ratio_cli(num: BlissVal, den: BlissVal) -> BlissVal {
     unsafe { BlissVal::from_heap_ptr(data as *mut RatioData as *mut u8) }
 }
 
-/// Materialize a (num/den) pair as a fixnum (when integral) or a ratio.
-fn make_rat(num: i64, den: i64) -> BlissVal {
-    let r = rat_reduce(num, den);
-    if r.den == 1 {
-        BlissVal::from_fixnum(r.num)
-    } else {
-        alloc_ratio_cli(BlissVal::from_fixnum(r.num), BlissVal::from_fixnum(r.den))
+/// Allocate a BIGNUM heap object (§1.8.1): header + sign + n_limbs + limbs.
+/// Layout mirrors the reader so `print_val` renders it correctly.
+fn alloc_bignum_cli(sign: i32, limbs: &[u64]) -> BlissVal {
+    let n = limbs.len();
+    let total_size = 16 + n * 8;
+    let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout);
+        *(ptr as *mut ObjectHeader) =
+            ObjectHeader::new(type_id::BIGNUM, total_size.div_ceil(8) as u16);
+        *(ptr.add(8) as *mut i32) = sign;
+        *(ptr.add(12) as *mut u32) = n as u32;
+        for (idx, &limb) in limbs.iter().enumerate() {
+            *(ptr.add(16 + idx * 8) as *mut u64) = limb;
+        }
+        BlissVal::from_heap_ptr(ptr)
     }
 }
 
-/// Extract (numerator, denominator) from a RATIO heap object.
-fn ratio_parts(v: BlissVal) -> Option<(i64, i64)> {
+/// Extract (numerator, denominator) BlissVals from a RATIO heap object.
+fn ratio_parts_val(v: BlissVal) -> Option<(BlissVal, BlissVal)> {
     if !v.is_heap_object() {
         return None;
     }
@@ -4615,38 +4605,482 @@ fn ratio_parts(v: BlissVal) -> Option<(i64, i64)> {
         }
         let num = *(ptr.add(8) as *const BlissVal);
         let den = *(ptr.add(16) as *const BlissVal);
-        if num.is_fixnum() && den.is_fixnum() {
-            Some((num.as_fixnum(), den.as_fixnum()))
+        Some((num, den))
+    }
+}
+
+// ── Arbitrary-precision integers (little-endian base-2^64 magnitude) ──
+
+fn mag_trim(mut m: Vec<u64>) -> Vec<u64> {
+    while !m.is_empty() && *m.last().unwrap() == 0 {
+        m.pop();
+    }
+    m
+}
+
+fn mag_cmp(a: &[u64], b: &[u64]) -> Ordering {
+    if a.len() != b.len() {
+        return a.len().cmp(&b.len());
+    }
+    for i in (0..a.len()).rev() {
+        if a[i] != b[i] {
+            return a[i].cmp(&b[i]);
+        }
+    }
+    Ordering::Equal
+}
+
+fn mag_add(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
+    let mut carry: u128 = 0;
+    for i in 0..a.len().max(b.len()) {
+        let av = *a.get(i).unwrap_or(&0) as u128;
+        let bv = *b.get(i).unwrap_or(&0) as u128;
+        let s = av + bv + carry;
+        out.push(s as u64);
+        carry = s >> 64;
+    }
+    if carry != 0 {
+        out.push(carry as u64);
+    }
+    mag_trim(out)
+}
+
+/// `a - b`, requiring `a >= b`.
+fn mag_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(a.len());
+    let mut borrow: i128 = 0;
+    for i in 0..a.len() {
+        let av = a[i] as i128;
+        let bv = *b.get(i).unwrap_or(&0) as i128;
+        let mut d = av - bv - borrow;
+        if d < 0 {
+            d += 1i128 << 64;
+            borrow = 1;
         } else {
-            None
+            borrow = 0;
+        }
+        out.push(d as u64);
+    }
+    mag_trim(out)
+}
+
+fn mag_mul(a: &[u64], b: &[u64]) -> Vec<u64> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![0u64; a.len() + b.len()];
+    for (i, &av) in a.iter().enumerate() {
+        let av = av as u128;
+        let mut carry: u128 = 0;
+        for (j, &bv) in b.iter().enumerate() {
+            let cur = out[i + j] as u128 + av * bv as u128 + carry;
+            out[i + j] = cur as u64;
+            carry = cur >> 64;
+        }
+        let mut k = i + b.len();
+        while carry != 0 {
+            let cur = out[k] as u128 + carry;
+            out[k] = cur as u64;
+            carry = cur >> 64;
+            k += 1;
+        }
+    }
+    mag_trim(out)
+}
+
+fn mag_bit(m: &[u64], idx: usize) -> u64 {
+    (m[idx / 64] >> (idx % 64)) & 1
+}
+
+fn mag_bitlen(m: &[u64]) -> usize {
+    if m.is_empty() {
+        return 0;
+    }
+    let top = m.len() - 1;
+    64 * top + (64 - m[top].leading_zeros() as usize)
+}
+
+fn mag_shl1(m: &[u64]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(m.len() + 1);
+    let mut carry = 0u64;
+    for &x in m {
+        out.push((x << 1) | carry);
+        carry = x >> 63;
+    }
+    if carry != 0 {
+        out.push(carry);
+    }
+    mag_trim(out)
+}
+
+fn mag_set_bit(m: &mut Vec<u64>, idx: usize) {
+    let w = idx / 64;
+    while m.len() <= w {
+        m.push(0);
+    }
+    m[w] |= 1u64 << (idx % 64);
+}
+
+/// Truncating division of magnitudes: returns (quotient, remainder). `b` must
+/// be nonzero. Bit-by-bit long division — O(bits · limbs), fine at test sizes.
+fn mag_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    if mag_cmp(a, b) == Ordering::Less {
+        return (Vec::new(), a.to_vec());
+    }
+    let n = mag_bitlen(a);
+    let mut rem: Vec<u64> = Vec::new();
+    let mut quot: Vec<u64> = Vec::new();
+    for i in (0..n).rev() {
+        rem = mag_shl1(&rem);
+        if mag_bit(a, i) == 1 {
+            if rem.is_empty() {
+                rem.push(1);
+            } else {
+                rem[0] |= 1;
+            }
+        }
+        if mag_cmp(&rem, b) != Ordering::Less {
+            rem = mag_sub(&rem, b);
+            mag_set_bit(&mut quot, i);
+        }
+    }
+    (mag_trim(quot), mag_trim(rem))
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct BigInt {
+    sign: i8,      // -1, 0, or 1
+    mag: Vec<u64>, // little-endian; no trailing zero limbs; empty iff sign == 0
+}
+
+impl BigInt {
+    fn zero() -> BigInt {
+        BigInt {
+            sign: 0,
+            mag: Vec::new(),
+        }
+    }
+
+    fn one() -> BigInt {
+        BigInt {
+            sign: 1,
+            mag: vec![1],
+        }
+    }
+
+    fn from_i64(n: i64) -> BigInt {
+        if n == 0 {
+            return BigInt::zero();
+        }
+        BigInt {
+            sign: if n < 0 { -1 } else { 1 },
+            mag: vec![n.unsigned_abs()],
+        }
+    }
+
+    fn from_mag(sign: i8, mag: Vec<u64>) -> BigInt {
+        let mag = mag_trim(mag);
+        if mag.is_empty() {
+            BigInt::zero()
+        } else {
+            BigInt {
+                sign: if sign < 0 { -1 } else { 1 },
+                mag,
+            }
+        }
+    }
+
+    fn from_parts(sign: i32, limbs: &[u64]) -> BigInt {
+        BigInt::from_mag(if sign < 0 { -1 } else { 1 }, limbs.to_vec())
+    }
+
+    fn is_zero(&self) -> bool {
+        self.sign == 0
+    }
+
+    fn to_f64(&self) -> f64 {
+        let mut f = 0.0f64;
+        for &limb in self.mag.iter().rev() {
+            f = f * 18446744073709551616.0 + limb as f64; // * 2^64
+        }
+        if self.sign < 0 {
+            -f
+        } else {
+            f
+        }
+    }
+
+    /// Canonicalize: a fixnum when it fits the 61-bit range, else a BIGNUM.
+    fn to_val(&self) -> BlissVal {
+        if self.is_zero() {
+            return BlissVal::from_fixnum(0);
+        }
+        if self.mag.len() == 1 {
+            let m = self.mag[0];
+            if self.sign > 0 {
+                if m <= FIXNUM_MAX as u64 {
+                    return BlissVal::from_fixnum(m as i64);
+                }
+            } else if m <= FIXNUM_MIN.unsigned_abs() {
+                return BlissVal::from_fixnum(-(m as i64));
+            }
+        }
+        alloc_bignum_cli(self.sign as i32, &self.mag)
+    }
+}
+
+fn big_neg(a: &BigInt) -> BigInt {
+    BigInt {
+        sign: -a.sign,
+        mag: a.mag.clone(),
+    }
+}
+
+fn big_add(a: &BigInt, b: &BigInt) -> BigInt {
+    if a.is_zero() {
+        return b.clone();
+    }
+    if b.is_zero() {
+        return a.clone();
+    }
+    if a.sign == b.sign {
+        BigInt::from_mag(a.sign, mag_add(&a.mag, &b.mag))
+    } else {
+        match mag_cmp(&a.mag, &b.mag) {
+            Ordering::Equal => BigInt::zero(),
+            Ordering::Greater => BigInt::from_mag(a.sign, mag_sub(&a.mag, &b.mag)),
+            Ordering::Less => BigInt::from_mag(b.sign, mag_sub(&b.mag, &a.mag)),
         }
     }
 }
 
-/// A fixnum or ratio as an exact rational; `None` for non-exact values.
-fn as_rat(v: BlissVal) -> Option<Rat> {
-    if v.is_fixnum() {
-        Some(Rat {
-            num: v.as_fixnum(),
-            den: 1,
-        })
-    } else {
-        ratio_parts(v).map(|(n, d)| rat_reduce(n, d))
+fn big_sub(a: &BigInt, b: &BigInt) -> BigInt {
+    big_add(a, &big_neg(b))
+}
+
+fn big_mul(a: &BigInt, b: &BigInt) -> BigInt {
+    if a.is_zero() || b.is_zero() {
+        return BigInt::zero();
+    }
+    BigInt::from_mag(a.sign * b.sign, mag_mul(&a.mag, &b.mag))
+}
+
+fn big_cmp(a: &BigInt, b: &BigInt) -> Ordering {
+    if a.sign != b.sign {
+        return a.sign.cmp(&b.sign);
+    }
+    match a.sign {
+        0 => Ordering::Equal,
+        1 => mag_cmp(&a.mag, &b.mag),
+        _ => mag_cmp(&b.mag, &a.mag),
     }
 }
 
-fn num_val(v: BlissVal) -> Result<f64, BlissError> {
+/// Truncating (toward zero) division: (quotient, remainder). `b` nonzero.
+fn big_divmod(a: &BigInt, b: &BigInt) -> (BigInt, BigInt) {
+    let (q, r) = mag_divmod(&a.mag, &b.mag);
+    (
+        BigInt::from_mag(a.sign * b.sign, q),
+        BigInt::from_mag(a.sign, r), // remainder takes the dividend's sign
+    )
+}
+
+/// Exact division, assuming `g` divides `a` with no remainder.
+fn big_divexact(a: &BigInt, g: &BigInt) -> BigInt {
+    big_divmod(a, g).0
+}
+
+/// Non-negative gcd of two integers (gcd(0,0) == 0).
+fn big_gcd(x: &BigInt, y: &BigInt) -> BigInt {
+    let mut a = BigInt::from_mag(1, x.mag.clone());
+    let mut b = BigInt::from_mag(1, y.mag.clone());
+    while !b.is_zero() {
+        let (_, r) = big_divmod(&a, &b);
+        a = b;
+        b = BigInt::from_mag(1, r.mag);
+    }
+    a
+}
+
+/// Read a fixnum or BIGNUM into a BigInt. `None` for any other value.
+fn bigint_from_val(v: BlissVal) -> Option<BigInt> {
     if v.is_fixnum() {
-        Ok(v.as_fixnum() as f64)
-    } else if v.is_single_float() {
+        return Some(BigInt::from_i64(v.as_fixnum()));
+    }
+    if v.is_heap_object() {
+        unsafe {
+            let ptr = v.as_ptr();
+            let hdr = *(ptr as *const ObjectHeader);
+            if hdr.type_id() == type_id::BIGNUM {
+                let sign = *(ptr.add(8) as *const i32);
+                let n = *(ptr.add(12) as *const u32) as usize;
+                let mut limbs = Vec::with_capacity(n);
+                for i in 0..n {
+                    limbs.push(*(ptr.add(16 + i * 8) as *const u64));
+                }
+                return Some(BigInt::from_parts(sign, &limbs));
+            }
+        }
+    }
+    None
+}
+
+/// An exact rational: denominator kept positive and reduced to lowest terms.
+#[derive(Clone)]
+struct BigRat {
+    num: BigInt,
+    den: BigInt,
+}
+
+impl BigRat {
+    fn from_i64(n: i64) -> BigRat {
+        BigRat {
+            num: BigInt::from_i64(n),
+            den: BigInt::one(),
+        }
+    }
+
+    fn from_bigint(n: BigInt) -> BigRat {
+        BigRat {
+            num: n,
+            den: BigInt::one(),
+        }
+    }
+
+    /// Build a reduced rational; `den` must be nonzero.
+    fn new(mut num: BigInt, mut den: BigInt) -> BigRat {
+        if den.sign < 0 {
+            num = big_neg(&num);
+            den = big_neg(&den);
+        }
+        if num.is_zero() {
+            return BigRat {
+                num: BigInt::zero(),
+                den: BigInt::one(),
+            };
+        }
+        let g = big_gcd(&num, &den);
+        if big_cmp(&g, &BigInt::one()) != Ordering::Equal {
+            num = big_divexact(&num, &g);
+            den = big_divexact(&den, &g);
+        }
+        BigRat { num, den }
+    }
+
+    fn is_integer(&self) -> bool {
+        big_cmp(&self.den, &BigInt::one()) == Ordering::Equal
+    }
+
+    fn to_f64(&self) -> f64 {
+        self.num.to_f64() / self.den.to_f64()
+    }
+
+    fn to_val(&self) -> BlissVal {
+        if self.is_integer() {
+            self.num.to_val()
+        } else {
+            alloc_ratio_cli(self.num.to_val(), self.den.to_val())
+        }
+    }
+}
+
+fn bigrat_neg(a: &BigRat) -> BigRat {
+    BigRat {
+        num: big_neg(&a.num),
+        den: a.den.clone(),
+    }
+}
+
+fn bigrat_add(a: &BigRat, b: &BigRat) -> BigRat {
+    let num = big_add(&big_mul(&a.num, &b.den), &big_mul(&b.num, &a.den));
+    let den = big_mul(&a.den, &b.den);
+    BigRat::new(num, den)
+}
+
+fn bigrat_sub(a: &BigRat, b: &BigRat) -> BigRat {
+    let num = big_sub(&big_mul(&a.num, &b.den), &big_mul(&b.num, &a.den));
+    let den = big_mul(&a.den, &b.den);
+    BigRat::new(num, den)
+}
+
+fn bigrat_mul(a: &BigRat, b: &BigRat) -> BigRat {
+    BigRat::new(big_mul(&a.num, &b.num), big_mul(&a.den, &b.den))
+}
+
+/// `a / b`; `b` must be nonzero (the caller checks for zero divisors).
+fn bigrat_div(a: &BigRat, b: &BigRat) -> BigRat {
+    BigRat::new(big_mul(&a.num, &b.den), big_mul(&a.den, &b.num))
+}
+
+fn bigrat_cmp(a: &BigRat, b: &BigRat) -> Ordering {
+    // Denominators are positive, so comparing cross-products is order-preserving.
+    big_cmp(&big_mul(&a.num, &b.den), &big_mul(&b.num, &a.den))
+}
+
+/// Raise an exact rational to a non-negative integer power.
+fn bigrat_pow(base: &BigRat, mut e: u64) -> BigRat {
+    let mut result = BigRat::from_i64(1);
+    let mut b = base.clone();
+    while e > 0 {
+        if e & 1 == 1 {
+            result = bigrat_mul(&result, &b);
+        }
+        e >>= 1;
+        if e > 0 {
+            b = bigrat_mul(&b, &b);
+        }
+    }
+    result
+}
+
+/// A fixnum, BIGNUM, or RATIO as an exact rational; `None` otherwise.
+fn as_bigrat(v: BlissVal) -> Option<BigRat> {
+    if let Some(n) = bigint_from_val(v) {
+        return Some(BigRat::from_bigint(n));
+    }
+    if let Some((nv, dv)) = ratio_parts_val(v) {
+        let n = bigint_from_val(nv)?;
+        let d = bigint_from_val(dv)?;
+        if d.is_zero() {
+            return None;
+        }
+        return Some(BigRat::new(n, d));
+    }
+    None
+}
+
+fn num_val(v: BlissVal) -> Result<f64, BlissError> {
+    if v.is_single_float() {
         Ok(v.as_single_float() as f64)
-    } else if let Some((n, d)) = ratio_parts(v) {
-        Ok(n as f64 / d as f64)
+    } else if let Some(r) = as_bigrat(v) {
+        Ok(r.to_f64())
     } else {
         Err(BlissError::TypeError {
             datum: v,
             expected: "number".into(),
         })
+    }
+}
+
+/// Exact-where-possible numeric comparison. Floats force inexact comparison
+/// (CL contagion); otherwise operands compare as exact rationals.
+fn numeric_cmp(a: BlissVal, b: BlissVal) -> Result<Ordering, BlissError> {
+    if a.is_single_float() || b.is_single_float() {
+        let av = num_val(a)?;
+        let bv = num_val(b)?;
+        return Ok(av.partial_cmp(&bv).unwrap_or(Ordering::Equal));
+    }
+    match (as_bigrat(a), as_bigrat(b)) {
+        (Some(ra), Some(rb)) => Ok(bigrat_cmp(&ra, &rb)),
+        (None, _) => Err(BlissError::TypeError {
+            datum: a,
+            expected: "number".into(),
+        }),
+        (_, None) => Err(BlissError::TypeError {
+            datum: b,
+            expected: "number".into(),
+        }),
     }
 }
 
@@ -4656,12 +5090,9 @@ fn eval_arith(
     init_i: i64,
     init_f: f64,
     op_f: fn(f64, f64) -> f64,
-    op_r: fn(Rat, Rat) -> Rat,
+    op_r: fn(&BigRat, &BigRat) -> BigRat,
 ) -> Result<BlissVal, BlissError> {
-    let mut acc = Rat {
-        num: init_i,
-        den: 1,
-    };
+    let mut acc = BigRat::from_i64(init_i);
     let mut acc_f = init_f;
     let mut is_float = false;
     let mut c = args;
@@ -4671,14 +5102,14 @@ fn eval_arith(
         if v.is_single_float() {
             if !is_float {
                 is_float = true;
-                acc_f = acc.num as f64 / acc.den as f64;
+                acc_f = acc.to_f64();
             }
             acc_f = op_f(acc_f, v.as_single_float() as f64);
-        } else if let Some(rv) = as_rat(v) {
+        } else if let Some(rv) = as_bigrat(v) {
             if is_float {
-                acc_f = op_f(acc_f, rv.num as f64 / rv.den as f64);
+                acc_f = op_f(acc_f, rv.to_f64());
             } else {
-                acc = op_r(acc, rv);
+                acc = op_r(&acc, &rv);
             }
         } else {
             return Err(BlissError::TypeError {
@@ -4691,7 +5122,7 @@ fn eval_arith(
     Ok(if is_float {
         BlissVal::from_single_float(acc_f as f32)
     } else {
-        make_rat(acc.num, acc.den)
+        acc.to_val()
     })
 }
 
@@ -4710,8 +5141,8 @@ fn eval_arith_sub(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         if vals[0].is_single_float() {
             return Ok(BlissVal::from_single_float(-vals[0].as_single_float()));
         }
-        if let Some(r) = as_rat(vals[0]) {
-            return Ok(make_rat(-r.num, r.den));
+        if let Some(r) = as_bigrat(vals[0]) {
+            return Ok(bigrat_neg(&r).to_val());
         }
         return Err(BlissError::TypeError {
             datum: vals[0],
@@ -4720,19 +5151,19 @@ fn eval_arith_sub(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     }
     let mut is_float = vals[0].is_single_float();
     let mut acc_f = num_val(vals[0])?;
-    let mut acc = as_rat(vals[0]).unwrap_or(Rat { num: 0, den: 1 });
+    let mut acc = as_bigrat(vals[0]).unwrap_or_else(|| BigRat::from_i64(0));
     for v in &vals[1..] {
         if v.is_single_float() {
             if !is_float {
                 is_float = true;
-                acc_f = acc.num as f64 / acc.den as f64;
+                acc_f = acc.to_f64();
             }
             acc_f -= v.as_single_float() as f64;
-        } else if let Some(rv) = as_rat(*v) {
+        } else if let Some(rv) = as_bigrat(*v) {
             if is_float {
-                acc_f -= rv.num as f64 / rv.den as f64;
+                acc_f -= rv.to_f64();
             } else {
-                acc = rat_reduce(acc.num * rv.den - rv.num * acc.den, acc.den * rv.den);
+                acc = bigrat_sub(&acc, &rv);
             }
         } else {
             return Err(BlissError::TypeError {
@@ -4744,7 +5175,7 @@ fn eval_arith_sub(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     Ok(if is_float {
         BlissVal::from_single_float(acc_f as f32)
     } else {
-        make_rat(acc.num, acc.den)
+        acc.to_val()
     })
 }
 
@@ -4769,12 +5200,12 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             }
             return Ok(BlissVal::from_single_float(1.0 / v));
         }
-        if let Some(r) = as_rat(vals[0]) {
-            if r.num == 0 {
+        if let Some(r) = as_bigrat(vals[0]) {
+            if r.num.is_zero() {
                 return Err(BlissError::ArithmeticError("division by zero".into()));
             }
             // reciprocal: den/num
-            return Ok(make_rat(r.den, r.num));
+            return Ok(bigrat_div(&BigRat::from_i64(1), &r).to_val());
         }
         return Err(BlissError::TypeError {
             datum: vals[0],
@@ -4783,7 +5214,7 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     }
     let mut is_float = vals[0].is_single_float();
     let mut acc_f = num_val(vals[0])?;
-    let mut acc = as_rat(vals[0]).unwrap_or(Rat { num: 0, den: 1 });
+    let mut acc = as_bigrat(vals[0]).unwrap_or_else(|| BigRat::from_i64(0));
     for v in &vals[1..] {
         if v.is_single_float() {
             let dv = v.as_single_float() as f64;
@@ -4792,17 +5223,17 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             }
             if !is_float {
                 is_float = true;
-                acc_f = acc.num as f64 / acc.den as f64;
+                acc_f = acc.to_f64();
             }
             acc_f /= dv;
-        } else if let Some(rv) = as_rat(*v) {
-            if rv.num == 0 {
+        } else if let Some(rv) = as_bigrat(*v) {
+            if rv.num.is_zero() {
                 return Err(BlissError::ArithmeticError("division by zero".into()));
             }
             if is_float {
-                acc_f /= rv.num as f64 / rv.den as f64;
+                acc_f /= rv.to_f64();
             } else {
-                acc = rat_reduce(acc.num * rv.den, acc.den * rv.num);
+                acc = bigrat_div(&acc, &rv);
             }
         } else {
             return Err(BlissError::TypeError {
@@ -4814,22 +5245,20 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     if is_float {
         Ok(BlissVal::from_single_float(acc_f as f32))
     } else {
-        Ok(make_rat(acc.num, acc.den))
+        Ok(acc.to_val())
     }
 }
 
 fn eval_cmp(
     args: BlissVal,
     env: &mut Env,
-    cmp: fn(f64, f64) -> bool,
+    pred: fn(Ordering) -> bool,
 ) -> Result<BlissVal, BlissError> {
     let (af, r) = cp(args);
     let (bf, _) = cp(r);
     let a = eval_form(af, env)?;
     let b = eval_form(bf, env)?;
-    let av = num_val(a)?;
-    let bv = num_val(b)?;
-    Ok(if cmp(av, bv) { T } else { NIL })
+    Ok(if pred(numeric_cmp(a, b)?) { T } else { NIL })
 }
 
 fn eval_args(args: BlissVal, env: &mut Env) -> Result<Vec<BlissVal>, BlissError> {
