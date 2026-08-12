@@ -564,7 +564,7 @@ fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
 /// Returns `(expanded_form, expanded_p)`.
 ///
 /// If form has a SymbolMacro binding in env, invokes the macroexpand hook
-/// with (expansion_value, form, env) and returns (result, true).
+/// with (expansion_value, expansion_value, env) and returns (result, true).
 ///
 /// If form is a cons whose car is a symbol with a Macro function binding,
 /// invokes the macroexpand hook with (expander, form, env) and returns
@@ -578,7 +578,7 @@ pub fn macroexpand_1(form: BlissVal, env: &Environment) -> Result<(BlissVal, boo
     // 1. Check if form is a symbol with a symbol-macro binding
     if let Some(VariableInfo::SymbolMacro(expansion)) = env.variable_information(form) {
         let hook = get_macroexpand_hook();
-        let result = hook(expansion, form, env)?;
+        let result = hook(expansion, expansion, env)?;
         return Ok((result, true));
     }
 

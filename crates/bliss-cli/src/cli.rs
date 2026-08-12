@@ -838,8 +838,10 @@ impl Env {
     ) -> bool {
         {
             let mut borrowed = frame.borrow_mut();
-            if borrowed.symbol_vars.contains_key(&symbol_index) {
-                borrowed.symbol_vars.insert(symbol_index, val);
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                borrowed.symbol_vars.entry(symbol_index)
+            {
+                entry.insert(val);
                 return true;
             }
             let parent = borrowed.parent.clone();
