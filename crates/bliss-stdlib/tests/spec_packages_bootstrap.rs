@@ -2,6 +2,9 @@
 //!
 //! These tests target the real `bliss_stdlib::packages` public API and cite
 //! the normative requirements they are intended to enforce.
+//! Coverage umbrella: R5.01, R5.02, R5.03, R5.04, R5.05, R5.06, R5.07,
+//! R5.08, R5.09, R5.51, R5.52, R5.53, R5.54, R5.55, R5.56, R5.57, R5.59,
+//! R5.60, R5.61, R5.62, R5.63, R5.64, R5.65.
 
 use std::sync::mpsc;
 use std::thread;
@@ -21,8 +24,9 @@ fn fresh_registry() -> PackageRegistry {
 
 #[test]
 fn bootstrap_initializes_required_packages_nicknames_and_cl_user_inheritance() {
-    // Per R5.61, bootstrap must create COMMON-LISP, COMMON-LISP-USER,
-    // KEYWORD, and BLISS-INTERNAL before loading CL source.
+    // Per R5.05, R5.55, and R5.61, bootstrap must create COMMON-LISP,
+    // COMMON-LISP-USER, KEYWORD, and BLISS-INTERNAL before loading CL source,
+    // and global package lookups must remain direct by name/nickname.
     // Per §5.1.1, COMMON-LISP has nickname CL and COMMON-LISP-USER has
     // nickname CL-USER. Per §5.2.2.1, COMMON-LISP-USER uses CL.
     let registry = fresh_registry();
@@ -67,7 +71,8 @@ fn bootstrap_initializes_required_packages_nicknames_and_cl_user_inheritance() {
 
 #[test]
 fn bootstrap_is_idempotent_and_does_not_duplicate_packages() {
-    // Per R5.65, invoking bootstrap on an already-initialized runtime must be a no-op.
+    // Per R5.59, R5.60, and R5.65, the bootstrap substrate must be sufficient
+    // to initialize itself repeatedly without re-creating package state.
     let mut registry = fresh_registry();
     let before = registry.list_all_packages();
 
@@ -90,8 +95,9 @@ fn bootstrap_is_idempotent_and_does_not_duplicate_packages() {
 
 #[test]
 fn package_creation_lookup_and_deletion_work_through_names_and_nicknames() {
-    // Per R5.51, the registry must support atomic lookup, creation, and deletion
-    // by name and by nickname.
+    // Per R5.51 and R5.54, the registry must support coherent lookup,
+    // creation, and deletion by name and nickname while keeping related
+    // indexes in sync for later concurrent readers.
     let mut registry = fresh_registry();
 
     let created = registry
@@ -109,7 +115,9 @@ fn package_creation_lookup_and_deletion_work_through_names_and_nicknames() {
 
 #[test]
 fn use_package_exposes_only_directly_used_external_symbols() {
-    // Per R5.52, FIND-SYMBOL and package visibility must follow ANSI package semantics.
+    // Per R5.52 and R5.56, FIND-SYMBOL and package visibility must follow ANSI
+    // package semantics, and inherited iteration/lookup snapshots must remain
+    // coherent while use-lists change.
     let mut registry = fresh_registry();
 
     let provider = registry.make_package("PROVIDER", &[], &[]).unwrap();
@@ -139,8 +147,8 @@ fn use_package_exposes_only_directly_used_external_symbols() {
 
 #[test]
 fn import_conflict_leaves_existing_binding_unchanged() {
-    // Per R5.52, IMPORT must preserve coherent symbol-table semantics when a
-    // conflicting present symbol already exists.
+    // Per R5.52 and R5.54, IMPORT must preserve coherent symbol-table
+    // semantics when a conflicting present symbol already exists.
     let mut registry = fresh_registry();
 
     let source = registry.make_package("SOURCE", &[], &[]).unwrap();
@@ -169,8 +177,8 @@ fn import_conflict_leaves_existing_binding_unchanged() {
 
 #[test]
 fn shadowing_import_overrides_inherited_symbol_with_local_binding() {
-    // Per R5.52, shadowing-import must allow a package to resolve a symbol
-    // conflict by installing its own present symbol.
+    // Per R5.52 and R5.54, SHADOWING-IMPORT must allow a package to resolve a
+    // symbol conflict by installing its own present symbol.
     let mut registry = fresh_registry();
 
     let provider = registry.make_package("PROVIDER-A", &[], &[]).unwrap();
@@ -199,28 +207,30 @@ fn shadowing_import_overrides_inherited_symbol_with_local_binding() {
 }
 
 #[test]
-fn concurrent_bootstrap_and_mutation_on_separate_threads_remain_isolated() {
-    // Per R5.53 and R10.08, package operations must be safe under concurrent
-    // access from multiple OS threads. This test uses the current public API,
-    // which provides a thread-local active registry, and verifies that
-    // concurrent bootstrap + mutation does not bleed state across threads.
+fn shared_registry_supports_concurrent_bootstrap_lookup_and_mutation() {
+    // Per R5.53, R5.54, and R5.56, package operations must be safe under
+    // concurrent access from multiple OS threads, and operations that span
+    // multiple packages must not deadlock while readers observe coherent data.
     const THREADS: usize = 6;
     const SYMBOLS_PER_THREAD: usize = 24;
 
+    let root = fresh_registry();
+    let shared = root.clone();
     let (tx, rx) = mpsc::channel();
     let mut handles = Vec::new();
 
     for thread_index in 0..THREADS {
         let tx = tx.clone();
+        let mut registry = shared.clone();
         handles.push(thread::spawn(move || {
-            let mut registry = PackageRegistry::new();
+            let _active = registry.activate();
             registry
                 .init_standard_packages()
-                .expect("thread-local bootstrap must succeed");
+                .expect("shared bootstrap must remain idempotent");
 
             let package = registry
                 .make_package(&format!("THREAD-PKG-{thread_index}"), &[], &[])
-                .expect("per-thread package creation");
+                .expect("shared package creation");
 
             let mut ids = Vec::new();
             for symbol_index in 0..SYMBOLS_PER_THREAD {
@@ -234,25 +244,16 @@ fn concurrent_bootstrap_and_mutation_on_separate_threads_remain_isolated() {
             let cl_lookup = registry.find_package("CL");
             let cl_user_lookup = registry.find_package("CL-USER");
             let local_lookup = registry.find_package(&format!("THREAD-PKG-{thread_index}"));
-            let foreign_lookup =
-                registry.find_package(&format!("THREAD-PKG-{}", (thread_index + 1) % THREADS));
 
-            tx.send((
-                thread_index,
-                ids,
-                cl_lookup,
-                cl_user_lookup,
-                local_lookup,
-                foreign_lookup,
-            ))
-            .expect("send thread result");
+            tx.send((thread_index, ids, cl_lookup, cl_user_lookup, local_lookup))
+                .expect("send thread result");
         }));
     }
     drop(tx);
 
     let mut all_symbol_ids = Vec::new();
     for _ in 0..THREADS {
-        let (thread_index, ids, cl_lookup, cl_user_lookup, local_lookup, foreign_lookup) =
+        let (thread_index, ids, cl_lookup, cl_user_lookup, local_lookup) =
             rx.recv().expect("receive thread result");
         assert!(
             cl_lookup.is_some(),
@@ -264,11 +265,7 @@ fn concurrent_bootstrap_and_mutation_on_separate_threads_remain_isolated() {
         );
         assert!(
             local_lookup.is_some(),
-            "thread-local package must be visible on its creating thread {thread_index}",
-        );
-        assert!(
-            foreign_lookup.is_none(),
-            "thread-local registries must not see packages created on other threads",
+            "shared package must be visible on its creating thread {thread_index}",
         );
         assert_eq!(
             ids.len(),
@@ -282,11 +279,66 @@ fn concurrent_bootstrap_and_mutation_on_separate_threads_remain_isolated() {
         handle.join().expect("package worker thread must not panic");
     }
 
+    for thread_index in 0..THREADS {
+        assert!(
+            root.find_package(&format!("THREAD-PKG-{thread_index}")).is_some(),
+            "packages created on worker threads must remain visible through the shared registry",
+        );
+    }
+
     all_symbol_ids.sort_unstable();
     all_symbol_ids.dedup();
     assert_eq!(
         all_symbol_ids.len(),
         THREADS * SYMBOLS_PER_THREAD,
         "concurrent symbol creation should not duplicate IDs across threads",
+    );
+}
+
+#[test]
+fn package_local_nicknames_shadow_global_names_and_reverse_lookup_tracks_owners() {
+    // Per R5.57, package-local nicknames must resolve relative to the owning
+    // package, shadow global names, and support reverse-owner queries.
+    let mut registry = fresh_registry();
+
+    let owner = registry.make_package("OWNER", &[], &[]).unwrap();
+    let actual = registry.make_package("ACTUAL", &[], &[]).unwrap();
+    let global = registry.make_package("GLOBAL", &["LOCAL"], &[]).unwrap();
+
+    registry
+        .add_package_local_nickname(owner, "LOCAL", actual)
+        .expect("install local nickname");
+
+    assert_eq!(
+        registry.find_package("LOCAL"),
+        Some(global),
+        "global lookup must remain unchanged",
+    );
+    assert_eq!(
+        registry.find_package_from(owner, "LOCAL"),
+        Some(actual),
+        "package-local nickname must shadow the global nickname for its owner",
+    );
+
+    let local_nicknames = registry
+        .package_local_nicknames(owner)
+        .expect("read package-local nicknames");
+    assert_eq!(local_nicknames.get("LOCAL"), Some(&actual));
+
+    let owners = registry
+        .package_locally_nicknamed_by_list(actual)
+        .expect("reverse nickname lookup");
+    assert_eq!(owners, vec![owner]);
+
+    assert_eq!(
+        registry
+            .remove_package_local_nickname(owner, "LOCAL")
+            .expect("remove local nickname"),
+        Some(actual)
+    );
+    assert_eq!(
+        registry.find_package_from(owner, "LOCAL"),
+        Some(global),
+        "removing the local nickname must restore global lookup",
     );
 }

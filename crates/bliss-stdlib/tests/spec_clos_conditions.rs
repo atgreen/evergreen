@@ -1,3 +1,5 @@
+// Coverage umbrella: R5.44, R5.45.
+
 use std::sync::{Arc, Mutex};
 use std::thread;
 

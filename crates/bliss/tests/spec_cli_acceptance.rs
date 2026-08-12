@@ -615,3 +615,46 @@ fn stage_two_gate_loads_a_real_file_with_user_macros_standard_macros_and_environ
 
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn stage_three_gate_runs_a_library_heavy_program_through_the_real_cli() {
+    // Per spec/stages.json stage 3, the real CLI gate is a library-heavy
+    // program with observable string/sequence/hash-table/format results.
+    // Per R5.59, R5.60, R5.62, R5.63, and R5.64, the bootstrap path that
+    // makes these library entrypoints available must complete before user code.
+    let dir = temp_dir("stage3-gate");
+    let script = dir.join("stage3-library.lisp");
+    write_file(
+        &script,
+        "(let* ((text (format nil \"~A-~D\" 'bliss 3))\n\
+                (numbers '(1 3 5))\n\
+                (table (make-hash-table :test 'equal))\n\
+                (seq (concatenate 'list '(1 2) '(3 4 5))))\n\
+           (setf (gethash \"TEXT\" table) text)\n\
+           (setf (gethash \"SLICE\" table) (subseq seq 1 4))\n\
+           (print (list (gethash \"TEXT\" table)\n\
+                        (gethash \"SLICE\" table)\n\
+                        seq\n\
+                        (format nil \"~{~A~^, ~}\" numbers))))\n",
+    );
+
+    let output = bliss()
+        .args(["--load", script.to_str().expect("utf8 path")])
+        .output()
+        .expect("run bliss stage-3 gate");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
+    assert!(
+        stdout.contains("(\"BLISS-3\" (2 3 4) (1 2 3 4 5) \"1, 3, 5\")"),
+        "stdout: {stdout}"
+    );
+
+    fs::remove_dir_all(dir).ok();
+}

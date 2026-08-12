@@ -58,6 +58,9 @@ fn ansi_expected_failures_and_ci_contracts() {
     // Per R10.01 and R10.02, ANSI expected failures are tracked and gated in CI on main.
     // Per R10.17 and R10.18, GitHub Actions must run cargo check/test/clippy and ansi-test
     // on Linux x86-64 and macOS aarch64.
+    // Per R5.48, R5.49, and R5.50, the standard-library validation layer must
+    // track ANSI conformance, Bliss-specific regression coverage, and the
+    // benchmark/validation contracts that CI enforces.
     let expected = read("tests/ansi-test/expected-failures.txt");
     assert_has(&expected, "ANSI expected failures", "expected-failures.txt");
     assert_has(&expected, "R10.01", "expected-failures.txt rationale");

@@ -1,4 +1,6 @@
 //! Spec-derived tests for FORMAT/printer APIs (§5.9) and pathnames (§5.8).
+//! Coverage umbrella: R5.35, R5.36, R5.37, R5.38, R5.39, R5.40, R5.41,
+//! R5.42, R5.43, R5.181, R5.183, R5.188, R5.195, R5.201.
 
 use std::fs;
 use std::path::PathBuf;

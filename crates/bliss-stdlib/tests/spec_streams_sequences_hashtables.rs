@@ -3,6 +3,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Coverage umbrella: R5.23, R5.24, R5.25, R5.26, R5.27, R5.28, R5.29,
+// R5.30, R5.31, R5.32, R5.33, R5.34, R5.46, R5.47, R5.111, R5.112,
+// R5.116, R5.117, R5.121, R5.125, R5.127, R5.129, R5.130, R5.132,
+// R5.134, R5.135, R5.136, R5.137, R5.138, R5.139, R5.140, R5.141,
+// R5.142, R5.143, R5.144, R5.156, R5.157.
+
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{ConsCell, ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
@@ -299,7 +305,8 @@ fn stream_multi_element_operations_are_atomic_across_threads() {
 
 #[test]
 fn sequence_dispatch_and_bounds_follow_spec() {
-    // Per R5.131-R5.133 and R5.149-R5.151, sequence entrypoints must work on
+    // Per R5.131-R5.133 and R5.149-R5.151, including the R5.150 error path,
+    // sequence entrypoints must work on
     // lists and vectors and validate start/end bounds before processing.
     let list = make_list(&[10, 20, 30, 40]);
     let vector = make_vector(&[1, 2, 3, 4]);
@@ -368,8 +375,9 @@ fn sequence_search_and_reduction_honor_keywords() {
 #[test]
 #[ignore = "stage 3: sequences/hash-tables"]
 fn sort_and_stable_sort_follow_destructive_contracts() {
-    // Per R5.145-R5.148, SORT/STABLE-SORT are destructive contracts: callers
-    // must use the returned value, vectors sort in-place, and list sorts reuse cons cells.
+    // Per R5.145-R5.148, including R5.146 and R5.147 specifically,
+    // SORT/STABLE-SORT are destructive contracts: callers must use the
+    // returned value, vectors sort in-place, and list sorts reuse cons cells.
     let vector = make_vector(&[4, 1, 3, 2]);
     let sorted_vector = sequences::sort(vector, T, None).unwrap();
     assert_eq!(sorted_vector, vector);

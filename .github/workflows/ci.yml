@@ -14,6 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: spec coverage gate
+        run: python3 scripts/spec-coverage.py --gate
       - name: cargo check
         run: cargo check --workspace
       - name: cargo test
