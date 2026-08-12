@@ -20,6 +20,9 @@ fn make_bliss_string(s: &str) -> BlissVal {
 /// Extract Rust string from a BlissString heap object.
 /// Returns None if v is not a string-typed heap object.
 fn extract_bliss_string(v: BlissVal) -> Option<String> {
+    if let Some(s) = crate::pathnames::registered_string(v) {
+        return Some(s);
+    }
     if !v.is_heap_object() {
         return None;
     }

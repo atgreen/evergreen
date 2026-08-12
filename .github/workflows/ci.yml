@@ -21,4 +21,4 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: ansi-test
-        run: cargo test -p bliss-cli --test spec_validation_infra ansi_expected_failures_and_ci_contracts
+        run: cargo test -p bliss --test spec_validation_infra ansi_expected_failures_and_ci_contracts

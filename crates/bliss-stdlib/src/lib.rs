@@ -78,8 +78,8 @@ pub use pathnames::{
     delete_file, directory, ensure_directories_exist, logical_pathname_translations, make_pathname,
     merge_pathnames, namestring, parse_namestring, pathname_device, pathname_directory,
     pathname_host, pathname_match_p, pathname_name, pathname_type, pathname_version, probe_file,
-    register_string, rename_file, set_logical_pathname_translations, translate_logical_pathname,
-    truename, wild_pathname_p,
+    register_string, registered_string, rename_file, set_logical_pathname_translations,
+    translate_logical_pathname, truename, wild_pathname_p,
 };
 pub use sequences::{
     concatenate, copy_seq, count, elt, find, length, map, nreverse, position, reduce, remove,

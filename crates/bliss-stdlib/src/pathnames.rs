@@ -143,6 +143,10 @@ pub fn register_string(val: BlissVal, s: &str) {
     });
 }
 
+pub fn registered_string(val: BlissVal) -> Option<String> {
+    lookup_string(val)
+}
+
 fn is_keyword(val: BlissVal, name: &str) -> bool {
     val.0 == keyword_hash(name)
 }

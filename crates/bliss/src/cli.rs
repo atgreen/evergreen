@@ -317,7 +317,9 @@ fn arena_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
 }
 
 fn arena_str(s: &str) -> BlissVal {
-    ARENA.with(|a| a.borrow_mut().alloc_str(s))
+    let val = ARENA.with(|a| a.borrow_mut().alloc_str(s));
+    bliss_stdlib::register_string(val, s);
+    val
 }
 
 // ── Stream tracking for file I/O ─────────────────────────────────
@@ -965,6 +967,17 @@ fn print_val(val: BlissVal, out: &mut String) {
         print_list_body(val, out);
         out.push(')');
     } else if val.is_heap_object() {
+        if let Some(s) = bliss_stdlib::registered_string(val) {
+            out.push('"');
+            for c in s.chars() {
+                if c == '"' || c == '\\' {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out.push('"');
+            return;
+        }
         unsafe {
             let ptr = val.as_ptr();
             let hdr = *(ptr as *const ObjectHeader);
@@ -1973,6 +1986,7 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         unsafe {
             let hdr = *(form.as_ptr() as *const ObjectHeader);
             if hdr.type_id() == type_id::SIMPLE_BASE_STRING {
+                bliss_stdlib::register_string(form, &val_as_str(form));
                 return Ok(form);
             }
         }
@@ -3083,6 +3097,65 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     c = r;
                 }
                 return Ok(arena_str(&result));
+            }
+            "SUBSEQ" => {
+                let (seq_form, rest) = cp(cdr);
+                let (start_form, rest2) = cp(rest);
+                let seq = eval_form(seq_form, env)?;
+                let start = num_val(eval_form(start_form, env)?)? as usize;
+                let end = if rest2.is_cons() {
+                    Some(num_val(eval_form(cp(rest2).0, env)?)? as usize)
+                } else {
+                    None
+                };
+                return bliss_stdlib::subseq(seq, start, end);
+            }
+            "PARSE-NAMESTRING" => {
+                let (thing_form, rest) = cp(cdr);
+                let thing = eval_form(thing_form, env)?;
+                let host = if rest.is_cons() {
+                    Some(eval_form(cp(rest).0, env)?)
+                } else {
+                    None
+                };
+                let (pathname, position) = bliss_stdlib::parse_namestring(thing, host, None)?;
+                env.set_mv(vec![pathname, BlissVal::from_fixnum(position as i64)]);
+                return Ok(pathname);
+            }
+            "NAMESTRING" => {
+                let (pathname_form, _) = cp(cdr);
+                let pathname = eval_form(pathname_form, env)?;
+                return bliss_stdlib::namestring(pathname);
+            }
+            "PATHNAME-NAME" => {
+                let (pathname_form, _) = cp(cdr);
+                let pathname = eval_form(pathname_form, env)?;
+                return Ok(bliss_stdlib::pathname_name(pathname));
+            }
+            "PATHNAME-TYPE" => {
+                let (pathname_form, _) = cp(cdr);
+                let pathname = eval_form(pathname_form, env)?;
+                return Ok(bliss_stdlib::pathname_type(pathname));
+            }
+            "PATHNAME-DIRECTORY" => {
+                let (pathname_form, _) = cp(cdr);
+                let pathname = eval_form(pathname_form, env)?;
+                return Ok(bliss_stdlib::pathname_directory(pathname));
+            }
+            "PATHNAME-HOST" => {
+                let (pathname_form, _) = cp(cdr);
+                let pathname = eval_form(pathname_form, env)?;
+                return Ok(bliss_stdlib::pathname_host(pathname));
+            }
+            "PATHNAME-DEVICE" => {
+                let (pathname_form, _) = cp(cdr);
+                let pathname = eval_form(pathname_form, env)?;
+                return Ok(bliss_stdlib::pathname_device(pathname));
+            }
+            "PATHNAME-VERSION" => {
+                let (pathname_form, _) = cp(cdr);
+                let pathname = eval_form(pathname_form, env)?;
+                return Ok(bliss_stdlib::pathname_version(pathname));
             }
             "STRING" => {
                 let (af, _) = cp(cdr);
@@ -7200,52 +7273,13 @@ fn eval_format(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         av.push(eval_form(af, env)?);
         c = r2;
     }
-    let mut result = String::new();
-    let fc: Vec<char> = fs.chars().collect();
-    let (mut i, mut ai) = (0, 0);
-    while i < fc.len() {
-        if fc[i] == '~' && i + 1 < fc.len() {
-            match fc[i + 1] {
-                'A' | 'a' => {
-                    if ai < av.len() {
-                        princ_val(av[ai], &mut result);
-                        ai += 1;
-                    }
-                    i += 2;
-                }
-                'D' | 'd' | 'S' | 's' => {
-                    if ai < av.len() {
-                        result.push_str(&format_val(av[ai]));
-                        ai += 1;
-                    }
-                    i += 2;
-                }
-                '~' => {
-                    result.push('~');
-                    i += 2;
-                }
-                '%' => {
-                    result.push('\n');
-                    i += 2;
-                }
-                _ => {
-                    result.push(fc[i]);
-                    i += 1;
-                }
-            }
-        } else {
-            result.push(fc[i]);
-            i += 1;
-        }
-    }
-    if dest == T {
-        print!("{}", result);
-        return Ok(NIL);
-    }
-    Ok(arena_str(&result))
+    bliss_stdlib::format(dest, &fs, &av)
 }
 
 fn val_as_str(val: BlissVal) -> String {
+    if let Some(s) = bliss_stdlib::registered_string(val) {
+        return s;
+    }
     if val.is_heap_object() {
         unsafe {
             let p = val.as_ptr();

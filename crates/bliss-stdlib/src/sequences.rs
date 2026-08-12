@@ -431,6 +431,25 @@ pub fn subseq(
     start: usize,
     end: Option<usize>,
 ) -> Result<BlissVal, BlissError> {
+    if sequence.is_string() {
+        let chars: Vec<char> = sequence.as_string().chars().collect();
+        let len = chars.len();
+        let actual_end = end.unwrap_or(len);
+        if start > actual_end {
+            return Err(BlissError::TypeError {
+                datum: sequence,
+                expected: format!("start ({}) <= end ({})", start, actual_end),
+            });
+        }
+        if actual_end > len {
+            return Err(BlissError::TypeError {
+                datum: sequence,
+                expected: format!("end ({}) <= length ({})", actual_end, len),
+            });
+        }
+        let sub = chars[start..actual_end].iter().collect::<String>();
+        return Ok(crate::streams::make_lisp_string(&sub));
+    }
     let elems = collect_elements(sequence)?;
     let len = elems.len();
     let actual_end = end.unwrap_or(len);
