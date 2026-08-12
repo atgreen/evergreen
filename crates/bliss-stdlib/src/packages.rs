@@ -818,13 +818,19 @@ pub fn import(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissError>
         .read()
         .map_err(|_| lock_poisoned_error("import"))?;
     let target = lookup_package_arc(&registry, package)?;
+    let resolved = symbols
+        .iter()
+        .map(|&sym| {
+            find_symbol_name_in_store(&registry, sym)?.ok_or_else(|| {
+                BlissError::PackageError("Symbol not found in any package".to_string())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut target = target
         .write()
         .map_err(|_| lock_poisoned_error("import"))?;
 
-    for &sym in symbols {
-        let name = find_symbol_name_in_store(&registry, sym)?
-            .ok_or_else(|| BlissError::PackageError("Symbol not found in any package".to_string()))?;
+    for (&sym, name) in symbols.iter().zip(resolved) {
         if let Some(&existing) = target.internal_symbols.get(&name) {
             if existing != sym {
                 return Err(BlissError::PackageError(format!(
@@ -856,13 +862,19 @@ pub fn shadowing_import(symbols: &[BlissVal], package: BlissVal) -> Result<(), B
         .read()
         .map_err(|_| lock_poisoned_error("shadowing-import"))?;
     let target = lookup_package_arc(&registry, package)?;
+    let resolved = symbols
+        .iter()
+        .map(|&sym| {
+            find_symbol_name_in_store(&registry, sym)?.ok_or_else(|| {
+                BlissError::PackageError("Symbol not found in any package".to_string())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut target = target
         .write()
         .map_err(|_| lock_poisoned_error("shadowing-import"))?;
 
-    for &sym in symbols {
-        let name = find_symbol_name_in_store(&registry, sym)?
-            .ok_or_else(|| BlissError::PackageError("Symbol not found in any package".to_string()))?;
+    for (&sym, name) in symbols.iter().zip(resolved) {
         target.internal_symbols.remove(&name);
         target.external_symbols.remove(&name);
         target.internal_symbols.insert(name.clone(), sym);

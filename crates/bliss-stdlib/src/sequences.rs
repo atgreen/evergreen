@@ -601,7 +601,7 @@ fn result_type_is_vector(result_type: BlissVal) -> bool {
 
 /// Check whether CONCATENATE requested a string result type.
 fn result_type_is_string(result_type: BlissVal) -> bool {
-    if !result_type.is_symbol() {
+    if result_type.tag() != bliss_rt::value::TAG_SYMBOL {
         return false;
     }
     match bliss_compiler::reader::symbol_name(result_type.as_symbol_index()) {
