@@ -1180,6 +1180,9 @@ fn boot_prelude_source() -> Result<String, BlissError> {
     Ok(EMBEDDED_BOOT_LISP.to_string())
 }
 
+// Reserved for the stage-6 ASDF output-translations wiring; retained so the
+// default cache location stays defined in one place until `require`/ASDF is live.
+#[allow(dead_code)]
 fn default_asdf_output_translations() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     format!("{home}/.cache/bliss/asdf/")
@@ -1335,7 +1338,10 @@ fn condition_definition_entry(env: &Env, type_name: &str) -> Option<BlissVal> {
     )
 }
 
-fn builtin_condition_definition(type_name: &str) -> Option<(Vec<String>, Vec<(String, String)>)> {
+/// A condition definition: its parent type names and its `(slot, initarg)` slots.
+type ConditionDefinition = (Vec<String>, Vec<(String, String)>);
+
+fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> {
     match symbol_bare_name(type_name).as_str() {
         "CONDITION" => Some((vec![], vec![])),
         "SERIOUS-CONDITION" => Some((vec!["CONDITION".into()], vec![])),
@@ -4650,8 +4656,8 @@ fn mag_add(a: &[u64], b: &[u64]) -> Vec<u64> {
 fn mag_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
     let mut out = Vec::with_capacity(a.len());
     let mut borrow: i128 = 0;
-    for i in 0..a.len() {
-        let av = a[i] as i128;
+    for (i, &ai) in a.iter().enumerate() {
+        let av = ai as i128;
         let bv = *b.get(i).unwrap_or(&0) as i128;
         let mut d = av - bv - borrow;
         if d < 0 {

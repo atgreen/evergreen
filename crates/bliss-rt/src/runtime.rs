@@ -12,6 +12,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// Default boot-image path. Unlike an explicitly-requested image, its absence
+/// is not fatal: the runtime bootstraps from the prelude instead.
+pub const DEFAULT_IMAGE_PATH: &str = "bliss.bimg";
+
 /// Runtime configuration parsed from env vars and CLI flags.
 /// See §2.8 of the spec.
 #[derive(Clone, Debug)]
@@ -176,7 +180,7 @@ impl RuntimeConfig {
         let image_path = std::env::var("BLISS_IMAGE")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| Some("bliss.bimg".into()));
+            .or_else(|| Some(DEFAULT_IMAGE_PATH.into()));
         let gc_log = std::env::var("BLISS_GC_LOG").ok().filter(|s| !s.is_empty());
         let jit_dump = std::env::var("BLISS_JIT_DUMP")
             .ok()
@@ -386,16 +390,16 @@ impl Runtime {
             return Err(BlissError::Internal("num_workers must be non-zero".into()));
         }
         if !config.no_image {
-            let image_path = config.image_path.as_deref().ok_or_else(|| {
-                BlissError::InvalidImage(
-                    "no image path configured; use --no-image to bootstrap".into(),
-                )
-            })?;
-            if !std::path::Path::new(image_path).is_file() {
-                return Err(BlissError::InvalidImage(format!(
-                    "image file not found: {}",
-                    image_path
-                )));
+            // The default image path is optional: if the bundled image is
+            // absent we bootstrap from the prelude instead of failing. An
+            // explicitly-named image, however, must exist.
+            if let Some(image_path) = config.image_path.as_deref() {
+                if !std::path::Path::new(image_path).is_file() && image_path != DEFAULT_IMAGE_PATH {
+                    return Err(BlissError::InvalidImage(format!(
+                        "image file not found: {}",
+                        image_path
+                    )));
+                }
             }
         }
 
