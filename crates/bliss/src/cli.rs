@@ -15,7 +15,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 // ── CLI arguments ──────────────────────────────────────────────────
@@ -521,6 +521,7 @@ struct ClassDef {
     name: String,
     supers: Vec<String>,
     slots: Vec<SlotDef>,
+    class_slot_values: Arc<Mutex<HashMap<String, Option<BlissVal>>>>,
 }
 
 #[derive(Clone)]
@@ -528,6 +529,16 @@ struct SlotDef {
     name: String,
     initarg: Option<String>,
     accessor: Option<String>,
+    readers: Vec<String>,
+    writers: Vec<String>,
+    initform: Option<BlissVal>,
+    allocation: SlotAllocation,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotAllocation {
+    Instance,
+    Class,
 }
 
 #[derive(Clone)]
@@ -827,6 +838,150 @@ fn class_name_for_instance_class(class: BlissVal) -> String {
     } else {
         val_as_str(class)
     }
+}
+
+fn lookup_slot_def<'a>(env: &'a Env, class_name: &str, slot_name: &str) -> Option<&'a SlotDef> {
+    env.classes
+        .get(class_name)
+        .and_then(|class_def| class_def.slots.iter().find(|slot| slot.name == slot_name))
+}
+
+fn split_initargs_for_class(
+    env: &Env,
+    class_name: &str,
+    initargs: &[BlissVal],
+) -> (Vec<BlissVal>, Vec<(String, BlissVal)>) {
+    let mut instance_initargs = Vec::new();
+    let mut class_initargs = Vec::new();
+    let mut i = 0;
+    while i + 1 < initargs.len() {
+        let slot_sym = initargs[i];
+        let value = initargs[i + 1];
+        let slot_name = symbol_bare_name(&sym_name(slot_sym));
+        if matches!(
+            lookup_slot_def(env, class_name, &slot_name).map(|slot| slot.allocation),
+            Some(SlotAllocation::Class)
+        ) {
+            class_initargs.push((slot_name, value));
+        } else {
+            instance_initargs.push(slot_sym);
+            instance_initargs.push(value);
+        }
+        i += 2;
+    }
+    (instance_initargs, class_initargs)
+}
+
+fn write_class_slot_value(env: &Env, class_name: &str, slot_name: &str, value: Option<BlissVal>) {
+    if let Some(class_def) = env.classes.get(class_name) {
+        class_def
+            .class_slot_values
+            .lock()
+            .unwrap()
+            .insert(slot_name.to_string(), value);
+    }
+}
+
+fn read_slot_value(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<BlissVal, BlissError> {
+    let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
+    let slot_name = symbol_bare_name(&sym_name(slot));
+    if matches!(
+        lookup_slot_def(env, &class_name, &slot_name).map(|slot| slot.allocation),
+        Some(SlotAllocation::Class)
+    ) {
+        if let Some(class_def) = env.classes.get(&class_name) {
+            if let Some(Some(value)) = class_def.class_slot_values.lock().unwrap().get(&slot_name) {
+                return Ok(*value);
+            }
+        }
+        return Err(BlissError::UnboundVariable(slot));
+    }
+    bliss_stdlib::slot_value(instance, slot)
+}
+
+fn slot_is_bound(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<bool, BlissError> {
+    let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
+    let slot_name = symbol_bare_name(&sym_name(slot));
+    if matches!(
+        lookup_slot_def(env, &class_name, &slot_name).map(|slot| slot.allocation),
+        Some(SlotAllocation::Class)
+    ) {
+        if let Some(class_def) = env.classes.get(&class_name) {
+            return Ok(matches!(
+                class_def.class_slot_values.lock().unwrap().get(&slot_name),
+                Some(Some(_))
+            ));
+        }
+    }
+    bliss_stdlib::slot_boundp(instance, slot)
+}
+
+fn write_slot_value(
+    instance: BlissVal,
+    slot: BlissVal,
+    value: BlissVal,
+    env: &Env,
+) -> Result<(), BlissError> {
+    let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
+    let slot_name = symbol_bare_name(&sym_name(slot));
+    if matches!(
+        lookup_slot_def(env, &class_name, &slot_name).map(|slot| slot.allocation),
+        Some(SlotAllocation::Class)
+    ) {
+        write_class_slot_value(env, &class_name, &slot_name, Some(value));
+        return Ok(());
+    }
+    bliss_stdlib::set_slot_value(instance, slot, value)
+}
+
+fn apply_class_initforms(
+    instance: BlissVal,
+    class_name: &str,
+    env: &mut Env,
+    eligible_slots: Option<&[String]>,
+    explicit_slots: &[String],
+) -> Result<(), BlissError> {
+    let Some(class_def) = env.classes.get(class_name).cloned() else {
+        return Ok(());
+    };
+    for slot in &class_def.slots {
+        if explicit_slots.iter().any(|name| name == &slot.name) {
+            continue;
+        }
+        if let Some(eligible) = eligible_slots
+            && !eligible.iter().any(|name| name == &slot.name)
+        {
+            continue;
+        }
+        let Some(initform) = slot.initform else {
+            continue;
+        };
+        let slot_sym = resolve_sym(&slot.name).unwrap_or(NIL);
+        let already_bound = match slot.allocation {
+            SlotAllocation::Class => matches!(
+                class_def.class_slot_values.lock().unwrap().get(&slot.name),
+                Some(Some(_))
+            ),
+            SlotAllocation::Instance => bliss_stdlib::slot_boundp(instance, slot_sym)?,
+        };
+        if already_bound {
+            continue;
+        }
+        let value = eval_form(initform, env)?;
+        match slot.allocation {
+            SlotAllocation::Class => {
+                class_def
+                    .class_slot_values
+                    .lock()
+                    .unwrap()
+                    .insert(slot.name.clone(), Some(value));
+            }
+            SlotAllocation::Instance => {
+                bliss_stdlib::set_slot_value(instance, slot_sym, value)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn evaluated_initargs(
@@ -2120,6 +2275,8 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
         "SERIOUS-CONDITION" => Some((vec!["CONDITION".into()], vec![])),
         "ERROR" => Some((vec!["SERIOUS-CONDITION".into()], vec![])),
         "WARNING" => Some((vec!["CONDITION".into()], vec![])),
+        "STYLE-WARNING" => Some((vec!["WARNING".into()], vec![])),
+        "STORAGE-CONDITION" => Some((vec!["SERIOUS-CONDITION".into()], vec![])),
         "SIMPLE-CONDITION" => Some((
             vec!["CONDITION".into()],
             vec![
@@ -2129,6 +2286,27 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
         )),
         "SIMPLE-ERROR" => Some((vec!["ERROR".into(), "SIMPLE-CONDITION".into()], vec![])),
         "SIMPLE-WARNING" => Some((vec!["WARNING".into(), "SIMPLE-CONDITION".into()], vec![])),
+        "ARITHMETIC-ERROR" => Some((
+            vec!["ERROR".into()],
+            vec![
+                ("OPERATION".into(), "OPERATION".into()),
+                ("OPERANDS".into(), "OPERANDS".into()),
+            ],
+        )),
+        "DIVISION-BY-ZERO" => Some((vec!["ARITHMETIC-ERROR".into()], vec![])),
+        "FLOATING-POINT-OVERFLOW" => Some((vec!["ARITHMETIC-ERROR".into()], vec![])),
+        "FLOATING-POINT-UNDERFLOW" => Some((vec!["ARITHMETIC-ERROR".into()], vec![])),
+        "FLOATING-POINT-INEXACT" => Some((vec!["ARITHMETIC-ERROR".into()], vec![])),
+        "FLOATING-POINT-INVALID-OPERATION" => {
+            Some((vec!["ARITHMETIC-ERROR".into()], vec![]))
+        }
+        "CELL-ERROR" => Some((vec!["ERROR".into()], vec![("NAME".into(), "NAME".into())])),
+        "UNBOUND-VARIABLE" => Some((vec!["CELL-ERROR".into()], vec![])),
+        "UNDEFINED-FUNCTION" => Some((vec!["CELL-ERROR".into()], vec![])),
+        "UNBOUND-SLOT" => Some((
+            vec!["CELL-ERROR".into()],
+            vec![("INSTANCE".into(), "INSTANCE".into())],
+        )),
         "TYPE-ERROR" => Some((
             vec!["ERROR".into()],
             vec![
@@ -2136,7 +2314,19 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
                 ("EXPECTED-TYPE".into(), "EXPECTED-TYPE".into()),
             ],
         )),
+        "SIMPLE-TYPE-ERROR" => Some((
+            vec!["TYPE-ERROR".into(), "SIMPLE-CONDITION".into()],
+            vec![],
+        )),
         "CONTROL-ERROR" => Some((vec!["ERROR".into()], vec![])),
+        "FILE-ERROR" => Some((vec!["ERROR".into()], vec![("PATHNAME".into(), "PATHNAME".into())])),
+        "PACKAGE-ERROR" => Some((vec!["ERROR".into()], vec![("PACKAGE".into(), "PACKAGE".into())])),
+        "PARSE-ERROR" => Some((vec!["ERROR".into()], vec![])),
+        "PRINT-NOT-READABLE" => Some((vec!["ERROR".into()], vec![("OBJECT".into(), "OBJECT".into())])),
+        "PROGRAM-ERROR" => Some((vec!["ERROR".into()], vec![])),
+        "STREAM-ERROR" => Some((vec!["ERROR".into()], vec![("STREAM".into(), "STREAM".into())])),
+        "END-OF-FILE" => Some((vec!["STREAM-ERROR".into()], vec![])),
+        "READER-ERROR" => Some((vec!["STREAM-ERROR".into(), "PARSE-ERROR".into()], vec![])),
         _ => None,
     }
 }
@@ -3303,10 +3493,36 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 bliss_stdlib::set_gethash(key, tbl, val)?;
                             }
                             other => {
-                                return Err(BlissError::Internal(format!(
-                                    "SETF: unsupported place ({} ...)",
-                                    other
-                                )));
+                                let reader_slot = env.classes.values().find_map(|class| {
+                                    class.slots.iter().find_map(|slot| {
+                                        let matches_reader = slot
+                                            .accessor
+                                            .as_ref()
+                                            .map(|acc| acc == other)
+                                            .unwrap_or(false)
+                                            || slot.readers.iter().any(|reader| reader == other)
+                                            || slot.writers.iter().any(|writer| writer == other);
+                                        if matches_reader {
+                                            Some(slot.name.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                });
+                                if let Some(slot_name) = reader_slot {
+                                    let tgt = eval_form(tgt_form, env)?;
+                                    write_slot_value(
+                                        tgt,
+                                        resolve_sym(&slot_name).unwrap_or(NIL),
+                                        val,
+                                        env,
+                                    )?;
+                                } else {
+                                    return Err(BlissError::Internal(format!(
+                                        "SETF: unsupported place ({} ...)",
+                                        other
+                                    )));
+                                }
                             }
                         }
                     }
@@ -4100,14 +4316,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (slot_form, _) = cp(rest);
                 let instance = eval_form(instance_form, env)?;
                 let slot = eval_form(slot_form, env)?;
-                return bliss_stdlib::slot_value(instance, slot);
+                return read_slot_value(instance, slot, env);
             }
             "SLOT-BOUNDP" => {
                 let (instance_form, rest) = cp(cdr);
                 let (slot_form, _) = cp(rest);
                 let instance = eval_form(instance_form, env)?;
                 let slot = eval_form(slot_form, env)?;
-                return Ok(if bliss_stdlib::slot_boundp(instance, slot)? {
+                return Ok(if slot_is_bound(instance, slot, env)? {
                     T
                 } else {
                     NIL
@@ -4123,7 +4339,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let instance = eval_form(instance_form, env)?;
                 let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
                 let initargs = evaluated_initargs(&class_name, init_args, env)?;
-                bliss_stdlib::initialize_instance(instance, &initargs)?;
+                let explicit_slots: Vec<String> = initargs
+                    .chunks_exact(2)
+                    .map(|pair| symbol_bare_name(&sym_name(pair[0])))
+                    .collect();
+                let (instance_initargs, class_initargs) =
+                    split_initargs_for_class(env, &class_name, &initargs);
+                bliss_stdlib::initialize_instance(instance, &instance_initargs)?;
+                for (slot_name, value) in class_initargs {
+                    write_class_slot_value(env, &class_name, &slot_name, Some(value));
+                }
+                apply_class_initforms(instance, &class_name, env, None, &explicit_slots)?;
                 return Ok(instance);
             }
             "REINITIALIZE-INSTANCE" => {
@@ -4131,16 +4357,39 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let instance = eval_form(instance_form, env)?;
                 let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
                 let initargs = evaluated_initargs(&class_name, init_args, env)?;
-                bliss_stdlib::reinitialize_instance(instance, &initargs)?;
+                let (instance_initargs, class_initargs) =
+                    split_initargs_for_class(env, &class_name, &initargs);
+                bliss_stdlib::reinitialize_instance(instance, &instance_initargs)?;
+                for (slot_name, value) in class_initargs {
+                    write_class_slot_value(env, &class_name, &slot_name, Some(value));
+                }
                 return Ok(instance);
             }
             "CHANGE-CLASS" => {
                 let (instance_form, rest) = cp(cdr);
                 let (class_form, _) = cp(rest);
                 let instance = eval_form(instance_form, env)?;
+                let old_class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
                 let class_input = eval_form(class_form, env)?;
                 let class = resolve_class_metaobject(env, class_input)?;
                 bliss_stdlib::change_class(instance, class)?;
+                let new_class_name = class_name_for_instance_class(class);
+                let added_slots = if let Some(class_def) = env.classes.get(&new_class_name) {
+                    class_def
+                        .slots
+                        .iter()
+                        .filter(|slot| {
+                            !env.classes
+                                .get(&old_class_name)
+                                .map(|old| old.slots.iter().any(|s| s.name == slot.name))
+                                .unwrap_or(false)
+                        })
+                        .map(|slot| slot.name.clone())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                apply_class_initforms(instance, &new_class_name, env, Some(&added_slots), &[])?;
                 return Ok(instance);
             }
             "CALL-NEXT-METHOD" => {
@@ -4797,17 +5046,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         let mut accessor_slot_name: Option<String> = None;
         for class in env.classes.values() {
             for slot in &class.slots {
-                if let Some(ref acc) = slot.accessor {
-                    if *acc == name {
-                        accessor_slot_name = Some(slot.name.clone());
-                    }
+                let reader_match = slot
+                    .accessor
+                    .as_ref()
+                    .map(|acc| acc == &name)
+                    .unwrap_or(false)
+                    || slot.readers.iter().any(|reader| reader == &name);
+                if reader_match {
+                    accessor_slot_name = Some(slot.name.clone());
                 }
             }
         }
         if let Some(slot_name) = accessor_slot_name {
             let (inst_form, _) = cp(cdr);
             let inst = eval_form(inst_form, env)?;
-            return bliss_stdlib::slot_value(inst, resolve_sym(&slot_name).unwrap_or(NIL));
+            return read_slot_value(inst, resolve_sym(&slot_name).unwrap_or(NIL), env);
         }
 
         // Check methods
@@ -7363,6 +7616,10 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             let slot_name = sym_name(slot_name_form);
             let mut initarg = None;
             let mut accessor = None;
+            let mut readers = Vec::new();
+            let mut writers = Vec::new();
+            let mut initform = None;
+            let mut allocation = SlotAllocation::Instance;
 
             // Parse slot options
             let opts = list_to_vec(slot_opts);
@@ -7386,19 +7643,47 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                 } else if opt_bare == "ACCESSOR" {
                     if i + 1 < opts.len() {
-                        accessor = Some(sym_name(opts[i + 1]));
+                        let accessor_name = sym_name(opts[i + 1]);
+                        accessor = Some(accessor_name.clone());
+                        readers.push(accessor_name);
                         i += 2;
                     } else {
                         i += 1;
                     }
-                } else if opt_bare == "INITFORM"
-                    || opt_bare == "READER"
-                    || opt_bare == "WRITER"
-                    || opt_bare == "ALLOCATION"
-                    || opt_bare == "TYPE"
-                    || opt_bare == "DOCUMENTATION"
-                {
-                    // Skip known slot option with value
+                } else if opt_bare == "READER" {
+                    if i + 1 < opts.len() {
+                        readers.push(sym_name(opts[i + 1]));
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                } else if opt_bare == "WRITER" {
+                    if i + 1 < opts.len() {
+                        if opts[i + 1].is_symbol() {
+                            writers.push(sym_name(opts[i + 1]));
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                } else if opt_bare == "INITFORM" {
+                    if i + 1 < opts.len() {
+                        initform = Some(opts[i + 1]);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                } else if opt_bare == "ALLOCATION" {
+                    if i + 1 < opts.len() {
+                        let allocation_name = symbol_bare_name(&sym_name(opts[i + 1]));
+                        if allocation_name == "CLASS" {
+                            allocation = SlotAllocation::Class;
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                } else if opt_bare == "TYPE" || opt_bare == "DOCUMENTATION" {
                     i += 2;
                 } else {
                     i += 1;
@@ -7409,13 +7694,28 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 name: slot_name,
                 initarg,
                 accessor,
+                readers,
+                writers,
+                initform,
+                allocation,
             });
         } else if slot_form.is_symbol() {
             slots.push(SlotDef {
                 name: sym_name(*slot_form),
                 initarg: None,
                 accessor: None,
+                readers: Vec::new(),
+                writers: Vec::new(),
+                initform: None,
+                allocation: SlotAllocation::Instance,
             });
+        }
+    }
+
+    let mut class_slot_values = HashMap::new();
+    for slot in &slots {
+        if slot.allocation == SlotAllocation::Class {
+            class_slot_values.insert(slot.name.clone(), None);
         }
     }
 
@@ -7425,6 +7725,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             name: name.clone(),
             supers,
             slots,
+            class_slot_values: Arc::new(Mutex::new(class_slot_values)),
         },
     );
     let direct_supers: Result<Vec<BlissVal>, BlissError> = super_list
@@ -7570,7 +7871,17 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     let class = resolve_class_metaobject(env, class_input)?;
     let class_name = class_name_for_instance_class(class);
     let initargs = evaluated_initargs(&class_name, init_args, env)?;
-    bliss_stdlib::make_instance(class, &initargs)
+    let explicit_slots: Vec<String> = initargs
+        .chunks_exact(2)
+        .map(|pair| symbol_bare_name(&sym_name(pair[0])))
+        .collect();
+    let (instance_initargs, class_initargs) = split_initargs_for_class(env, &class_name, &initargs);
+    let instance = bliss_stdlib::make_instance(class, &instance_initargs)?;
+    for (slot_name, value) in class_initargs {
+        write_class_slot_value(env, &class_name, &slot_name, Some(value));
+    }
+    apply_class_initforms(instance, &class_name, env, None, &explicit_slots)?;
+    Ok(instance)
 }
 
 // ── Apply function (lambda or named) ─────────────────────────────

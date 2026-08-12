@@ -11,6 +11,11 @@
 
 use bliss_rt::error::BlissError;
 use bliss_rt::value::{BlissVal, NIL, TAG_SYMBOL};
+use crate::clos::{
+    bootstrap_clos, class_direct_superclasses, class_name, class_of, define_class, find_class,
+    make_instance,
+};
+use crate::streams::make_lisp_string_fresh;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -43,6 +48,12 @@ pub const SYMBOL_TYPE_ERROR: u32 = 105;
 pub const SYMBOL_SIMPLE_WARNING: u32 = 106;
 /// Symbol index for CONTROL-ERROR.
 pub const SYMBOL_CONTROL_ERROR: u32 = 107;
+pub const SYMBOL_SIMPLE_CONDITION: u32 = 108;
+const SYMBOL_FORMAT_CONTROL: u32 = 120;
+const SYMBOL_FORMAT_ARGUMENTS: u32 = 121;
+const SYMBOL_DATUM: u32 = 122;
+const SYMBOL_EXPECTED_TYPE: u32 = 123;
+const INTERNAL_HANDLER_CASE_FN_BASE: i64 = -9_000_000;
 
 /// All known condition-type symbol indices (used for hierarchy discrimination).
 const KNOWN_CONDITION_TYPES: &[u32] = &[
@@ -54,6 +65,7 @@ const KNOWN_CONDITION_TYPES: &[u32] = &[
     SYMBOL_TYPE_ERROR,
     SYMBOL_SIMPLE_WARNING,
     SYMBOL_CONTROL_ERROR,
+    SYMBOL_SIMPLE_CONDITION,
 ];
 
 /// Check whether a BlissVal represents a known condition type symbol.
@@ -105,6 +117,20 @@ fn funcall(function: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError
     {
         return Ok(args.first().copied().unwrap_or(NIL));
     }
+    if function.is_fixnum() && function.as_fixnum() <= INTERNAL_HANDLER_CASE_FN_BASE {
+        let matched = STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            let handler_val = state.handler_case_clauses.get(&function.to_raw()).copied();
+            if let Some(handler_val) = handler_val {
+                state.pending_handler_case =
+                    Some((args.first().copied().unwrap_or(NIL), handler_val));
+            }
+            handler_val
+        });
+        if matched.is_some() {
+            return Err(BlissError::Internal("__HANDLER_CASE__".into()));
+        }
+    }
     FUNCALL_HOOK.with(|h| {
         let borrow = h.borrow();
         if let Some(hook) = borrow.as_ref() {
@@ -140,8 +166,6 @@ struct RestartEntry {
 
 /// Per-thread condition system state.
 struct ConditionState {
-    /// Map of BlissVal raw bits → type hierarchy (list of supertype raw bits).
-    condition_registry: HashMap<u64, Vec<u64>>,
     /// Handler stack for handler_bind (each frame is a set of bindings).
     handler_stack: Vec<Vec<(BlissVal, BlissVal)>>,
     /// Persistent restart registry (restarts survive restart_bind return).
@@ -150,16 +174,21 @@ struct ConditionState {
     debugger_hook: Option<BlissVal>,
     /// Flag set when debugger was invoked (for testing).
     debugger_invoked: bool,
+    handler_case_clauses: HashMap<u64, BlissVal>,
+    pending_handler_case: Option<(BlissVal, BlissVal)>,
+    next_handler_case_id: i64,
 }
 
 impl ConditionState {
     fn new() -> Self {
         ConditionState {
-            condition_registry: HashMap::new(),
             handler_stack: Vec::new(),
             restart_registry: Vec::new(),
             debugger_hook: None,
             debugger_invoked: false,
+            handler_case_clauses: HashMap::new(),
+            pending_handler_case: None,
+            next_handler_case_id: 0,
         }
     }
 }
@@ -172,36 +201,65 @@ thread_local! {
 
 // ── Condition construction ────────────────────────────────────────
 
-/// Simple hash of a string to produce a fixnum value for condition identity.
-fn string_hash(s: &str) -> i64 {
-    let mut hash: u64 = 5381;
-    for b in s.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(b as u64);
+fn condition_class_spec(name: u32) -> (&'static [u32], &'static [u32]) {
+    match name {
+        SYMBOL_CONDITION => (&[], &[]),
+        SYMBOL_SERIOUS_CONDITION => (&[SYMBOL_CONDITION], &[]),
+        SYMBOL_ERROR => (&[SYMBOL_SERIOUS_CONDITION], &[]),
+        SYMBOL_WARNING => (&[SYMBOL_CONDITION], &[]),
+        SYMBOL_SIMPLE_CONDITION => (
+            &[SYMBOL_CONDITION],
+            &[SYMBOL_FORMAT_CONTROL, SYMBOL_FORMAT_ARGUMENTS],
+        ),
+        SYMBOL_SIMPLE_ERROR => (&[SYMBOL_ERROR, SYMBOL_SIMPLE_CONDITION], &[]),
+        SYMBOL_TYPE_ERROR => (&[SYMBOL_ERROR], &[SYMBOL_DATUM, SYMBOL_EXPECTED_TYPE]),
+        SYMBOL_SIMPLE_WARNING => (&[SYMBOL_WARNING, SYMBOL_SIMPLE_CONDITION], &[]),
+        SYMBOL_CONTROL_ERROR => (&[SYMBOL_ERROR], &[]),
+        _ => (&[SYMBOL_CONDITION], &[]),
     }
-    // Ensure it fits in fixnum range (61-bit signed) and is positive
-    (hash & 0x0FFF_FFFF_FFFF_FFFF) as i64
 }
 
-/// Build the type hierarchy for SIMPLE-ERROR:
-/// SIMPLE-ERROR <: ERROR <: SERIOUS-CONDITION <: CONDITION
-fn simple_error_types() -> Vec<u64> {
-    vec![
-        BlissVal::from_symbol_index(SYMBOL_SIMPLE_ERROR).to_raw(),
-        BlissVal::from_symbol_index(SYMBOL_ERROR).to_raw(),
-        BlissVal::from_symbol_index(SYMBOL_SERIOUS_CONDITION).to_raw(),
-        BlissVal::from_symbol_index(SYMBOL_CONDITION).to_raw(),
-    ]
+fn ensure_condition_class(name: u32) -> Result<BlissVal, BlissError> {
+    let sym = BlissVal::from_symbol_index(name);
+    if let Some(class) = find_class(sym) {
+        return Ok(class);
+    }
+    if find_class(bliss_rt::value::T).is_none() {
+        let _ = bootstrap_clos();
+        if let Some(class) = find_class(sym) {
+            return Ok(class);
+        }
+    }
+    let (supers, slots) = condition_class_spec(name);
+    let super_vals: Vec<BlissVal> = supers
+        .iter()
+        .map(|idx| ensure_condition_class(*idx))
+        .collect::<Result<_, _>>()?;
+    let slot_vals: Vec<BlissVal> = slots.iter().map(|idx| BlissVal::from_symbol_index(*idx)).collect();
+    define_class(sym, sym, &super_vals, &slot_vals)?;
+    Ok(sym)
 }
 
-/// Build the type hierarchy for TYPE-ERROR:
-/// TYPE-ERROR <: ERROR <: SERIOUS-CONDITION <: CONDITION
-fn type_error_types() -> Vec<u64> {
-    vec![
-        BlissVal::from_symbol_index(SYMBOL_TYPE_ERROR).to_raw(),
-        BlissVal::from_symbol_index(SYMBOL_ERROR).to_raw(),
-        BlissVal::from_symbol_index(SYMBOL_SERIOUS_CONDITION).to_raw(),
-        BlissVal::from_symbol_index(SYMBOL_CONDITION).to_raw(),
-    ]
+fn ensure_builtin_condition_classes() -> Result<(), BlissError> {
+    ensure_condition_class(SYMBOL_CONDITION)?;
+    ensure_condition_class(SYMBOL_SERIOUS_CONDITION)?;
+    ensure_condition_class(SYMBOL_ERROR)?;
+    ensure_condition_class(SYMBOL_WARNING)?;
+    ensure_condition_class(SYMBOL_SIMPLE_CONDITION)?;
+    ensure_condition_class(SYMBOL_SIMPLE_ERROR)?;
+    ensure_condition_class(SYMBOL_TYPE_ERROR)?;
+    ensure_condition_class(SYMBOL_SIMPLE_WARNING)?;
+    ensure_condition_class(SYMBOL_CONTROL_ERROR)?;
+    Ok(())
+}
+
+fn class_inherits_from(class: BlissVal, target: BlissVal) -> bool {
+    if class == target || class_name(class) == target {
+        return true;
+    }
+    class_direct_superclasses(class)
+        .into_iter()
+        .any(|super_class| class_inherits_from(super_class, target))
 }
 
 /// Create a simple-error condition.
@@ -210,14 +268,18 @@ fn type_error_types() -> Vec<u64> {
 /// The condition is registered in thread-local state so handler_case can
 /// recognize it as a condition value.
 pub fn make_simple_error(format_control: &str, _format_args: &[BlissVal]) -> BlissVal {
-    let hash = string_hash(format_control);
-    let val = BlissVal::from_fixnum(hash);
-    STATE.with(|s| {
-        s.borrow_mut()
-            .condition_registry
-            .insert(val.to_raw(), simple_error_types());
-    });
-    val
+    ensure_builtin_condition_classes().expect("bootstrap condition classes");
+    let class = ensure_condition_class(SYMBOL_SIMPLE_ERROR).expect("resolve SIMPLE-ERROR class");
+    make_instance(
+        class,
+        &[
+            BlissVal::from_symbol_index(SYMBOL_FORMAT_CONTROL),
+            make_lisp_string_fresh(format_control),
+            BlissVal::from_symbol_index(SYMBOL_FORMAT_ARGUMENTS),
+            NIL,
+        ],
+    )
+    .expect("make SIMPLE-ERROR instance")
 }
 
 /// Create a type-error condition.
@@ -225,23 +287,23 @@ pub fn make_simple_error(format_control: &str, _format_args: &[BlissVal]) -> Bli
 /// Returns a BlissVal fixnum combining datum and expected type information.
 /// Registered as a condition in thread-local state.
 pub fn make_type_error(datum: BlissVal, expected_type: BlissVal) -> BlissVal {
-    let combined = datum
-        .to_raw()
-        .wrapping_mul(31)
-        .wrapping_add(expected_type.to_raw());
-    let hash = (combined & 0x0FFF_FFFF_FFFF_FFFF) as i64;
-    let val = BlissVal::from_fixnum(hash);
-    STATE.with(|s| {
-        s.borrow_mut()
-            .condition_registry
-            .insert(val.to_raw(), type_error_types());
-    });
-    val
+    ensure_builtin_condition_classes().expect("bootstrap condition classes");
+    let class = ensure_condition_class(SYMBOL_TYPE_ERROR).expect("resolve TYPE-ERROR class");
+    make_instance(
+        class,
+        &[
+            BlissVal::from_symbol_index(SYMBOL_DATUM),
+            datum,
+            BlissVal::from_symbol_index(SYMBOL_EXPECTED_TYPE),
+            expected_type,
+        ],
+    )
+    .expect("make TYPE-ERROR instance")
 }
 
-/// Check if a BlissVal is a registered condition.
+/// Check if a BlissVal is a condition instance rooted at CONDITION.
 fn is_condition(val: BlissVal) -> bool {
-    STATE.with(|s| s.borrow().condition_registry.contains_key(&val.to_raw()))
+    class_inherits_from(class_of(val), BlissVal::from_symbol_index(SYMBOL_CONDITION))
 }
 
 /// Check if a handler's condition-type specification matches a given condition.
@@ -263,20 +325,11 @@ fn condition_type_matches(condition: BlissVal, clause_type: BlissVal) -> bool {
     if clause_type.is_nil() {
         return false;
     }
-    STATE.with(|s| {
-        let state = s.borrow();
-        if let Some(types) = state.condition_registry.get(&condition.to_raw()) {
-            if is_known_condition_type(clause_type) {
-                // Rule 3: known type → check hierarchy.
-                types.contains(&clause_type.to_raw())
-            } else {
-                // Rule 4: unknown type → catch-all (backward compat).
-                true
-            }
-        } else {
-            false
-        }
-    })
+    if is_known_condition_type(clause_type) {
+        class_inherits_from(class_of(condition), clause_type)
+    } else {
+        is_condition(condition)
+    }
 }
 
 // ── Signalling ────────────────────────────────────────────────────
@@ -555,10 +608,66 @@ pub fn handler_case(
                 return Ok(*handler_val);
             }
         }
+        return Ok(form);
+    }
+    if !form.is_function() {
+        return Ok(form);
     }
 
-    // No condition signalled, no clauses, or no clause matched.
-    Ok(form)
+    handler_case_fn(clauses, || funcall(form, &[]))
+}
+
+/// Establish handler case around a protected computation (HANDLER-CASE). R5.19.
+///
+/// This is the closure-based entrypoint used when the protected form must be
+/// evaluated with handler clauses dynamically installed.
+pub fn handler_case_fn(
+    clauses: &[(BlissVal, BlissVal)],
+    body: impl FnOnce() -> Result<BlissVal, BlissError>,
+) -> Result<BlissVal, BlissError> {
+    if clauses.is_empty() {
+        return body();
+    }
+
+    let mut bindings = Vec::with_capacity(clauses.len());
+    let mut installed = Vec::with_capacity(clauses.len());
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        state.pending_handler_case = None;
+        for (clause_type, handler_val) in clauses {
+            let id = INTERNAL_HANDLER_CASE_FN_BASE - state.next_handler_case_id;
+            state.next_handler_case_id += 1;
+            let token = BlissVal::from_fixnum(id);
+            state.handler_case_clauses.insert(token.to_raw(), *handler_val);
+            bindings.push((*clause_type, token));
+            installed.push(token.to_raw());
+        }
+    });
+
+    let result = handler_bind_fn(&bindings, body);
+
+    for raw in installed {
+        STATE.with(|s| {
+            s.borrow_mut().handler_case_clauses.remove(&raw);
+        });
+    }
+
+    match result {
+        Ok(value) => Ok(value),
+        Err(BlissError::Internal(message)) if message == "__HANDLER_CASE__" => {
+            let matched = STATE.with(|s| s.borrow_mut().pending_handler_case.take());
+            if let Some((condition, handler_val)) = matched {
+                if handler_val.is_function() {
+                    funcall(handler_val, &[condition])
+                } else {
+                    Ok(handler_val)
+                }
+            } else {
+                Err(BlissError::Internal("handler-case lost pending match".into()))
+            }
+        }
+        Err(err) => Err(err),
+    }
 }
 
 // ── Restart protocol ──────────────────────────────────────────────
