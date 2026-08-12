@@ -1,10 +1,18 @@
 [package]
-name = "bliss"
+name = "bliss-cli"
 description = "Bliss Common Lisp: REPL, image loading, entry point"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "bliss"
+
+[[bin]]
+name = "bliss-cli"
+path = "src/main.rs"
+test = false
 
 [dependencies]
 bliss-rt.workspace = true

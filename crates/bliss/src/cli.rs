@@ -932,6 +932,7 @@ fn seed_standard_packages(packages: &mut HashMap<String, PackageDef>) {
 }
 
 // ── BlissVal printer ──────────────────────────────────────────────
+#[inline]
 fn print_val(val: BlissVal, out: &mut String) {
     if val.is_nil() {
         out.push_str("NIL");
@@ -1072,6 +1073,7 @@ fn bignum_to_decimal(sign: i32, limbs: &[u64]) -> String {
     s
 }
 
+#[inline]
 fn print_list_body(val: BlissVal, out: &mut String) {
     let mut cur = val;
     let mut first = true;
@@ -1092,6 +1094,7 @@ fn print_list_body(val: BlissVal, out: &mut String) {
     }
 }
 
+#[inline]
 fn format_val(val: BlissVal) -> String {
     let mut s = String::new();
     print_val(val, &mut s);
@@ -1139,6 +1142,7 @@ fn simple_format_message(control: &str, args: &[BlissVal]) -> String {
     rendered
 }
 
+#[inline]
 fn princ_val(val: BlissVal, out: &mut String) {
     if val.is_heap_object() {
         unsafe {

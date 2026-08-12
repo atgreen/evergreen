@@ -1,6 +1,6 @@
 //! End-to-end acceptance tests for the Bliss CLI binary.
 //!
-//! These tests build and invoke the real `bliss` binary via std::process::Command,
+//! These tests build and invoke the real `bliss-cli` binary via std::process::Command,
 //! asserting on exit codes, stdout, and stderr output. They exercise every
 //! top-level user-facing capability from the spec:
 //!   - --help, --version informational output
@@ -13,12 +13,41 @@
 //!   - Passthrough CL args via --
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// Get the path to the bliss binary built by cargo.
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root")
+}
+
+fn cargo_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn bliss_bin_path() -> &'static Path {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let _guard = cargo_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let status = Command::new("cargo")
+            .current_dir(repo_root())
+            .args(["build", "-p", "bliss-cli"])
+            .status()
+            .expect("build bliss-cli");
+        assert!(status.success(), "cargo build -p bliss-cli failed");
+        repo_root().join("target/debug/bliss-cli")
+    })
+    .as_path()
+}
+
+/// Get the path to the bliss-cli binary built by cargo.
 fn bliss_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_bliss"))
+    Command::new(bliss_bin_path())
 }
 
 // ══════════════════════════════════════════════════════════════════

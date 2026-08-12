@@ -32,6 +32,21 @@ fn cargo_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn bliss_bin_path() -> &'static Path {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let _guard = cargo_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let status = Command::new("cargo")
+            .current_dir(repo_root())
+            .args(["build", "-p", "bliss-cli"])
+            .status()
+            .expect("build bliss-cli");
+        assert!(status.success(), "cargo build -p bliss-cli failed");
+        repo_root().join("target/debug/bliss-cli")
+    })
+    .as_path()
+}
+
 fn run(mut command: Command, context: &str) -> Output {
     let output = command
         .output()
@@ -89,7 +104,7 @@ fn integration_acceptance_scripts_execute_through_real_cli_entrypoints() {
     let eval_expected = expected_markers(eval_script);
     let eval = run(
         {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_bliss"));
+            let mut cmd = Command::new(bliss_bin_path());
             cmd.current_dir(repo_root()).args(["--load", eval_script]);
             cmd
         },
@@ -107,7 +122,7 @@ fn integration_acceptance_scripts_execute_through_real_cli_entrypoints() {
     let load_expected = expected_markers(load_script);
     let load = run(
         {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_bliss"));
+            let mut cmd = Command::new(bliss_bin_path());
             cmd.current_dir(repo_root()).args(["--load", load_script]);
             cmd
         },
@@ -124,7 +139,7 @@ fn integration_acceptance_scripts_execute_through_real_cli_entrypoints() {
     let repl_script = "tests/integration/acceptance_repl.lisp";
     let repl_expected = expected_markers(repl_script);
     let script_body = read(repl_script);
-    let mut repl = Command::new(env!("CARGO_BIN_EXE_bliss"));
+    let mut repl = Command::new(bliss_bin_path());
     repl.current_dir(repo_root())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

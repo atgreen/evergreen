@@ -2,10 +2,38 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root")
+}
+
+fn cargo_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn bliss_bin_path() -> &'static Path {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let _guard = cargo_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let status = Command::new("cargo")
+            .current_dir(repo_root())
+            .args(["build", "-p", "bliss-cli"])
+            .status()
+            .expect("build bliss-cli");
+        assert!(status.success(), "cargo build -p bliss-cli failed");
+        repo_root().join("target/debug/bliss-cli")
+    })
+    .as_path()
+}
+
 fn bliss() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_bliss"))
+    Command::new(bliss_bin_path())
 }
 
 fn temp_dir(name: &str) -> PathBuf {
