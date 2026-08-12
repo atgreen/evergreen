@@ -1,6 +1,6 @@
 {
   "_comment": "Staged build plan for Bliss. `current_stage` is the knob that makes the build incremental: spec-coverage.py --gate only requires MUST requirements at or below current_stage to be tested, so the project ships working vertical slices instead of an all-or-nothing whole. Advance current_stage by ONE only after the stage's Gate genuinely passes end-to-end through the real `bliss` binary (see spec/00-overview.md and §11). Each requirement's stage is its explicit trailing [Sn] tag if present, else the stage of the spec file it is defined in (the `files` map below), else unstaged (reported, not gated). Files not listed here are meta-only and are not stage-gated by default.",
-  "current_stage": 1,
+  "current_stage": 2,
   "stages": [
     { "id": 0, "name": "read-print-eval",        "gate": "bliss --eval \"(+ 1 2)\" prints 3; every core datatype round-trips read->print; a nested arithmetic/list script prints correct results" },
     { "id": 1, "name": "core-evaluator",          "gate": "recursive (fib 30), higher-order list processing, closures with captured state, and non-local exits run correctly through the CLI" },

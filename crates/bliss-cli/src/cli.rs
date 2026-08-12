@@ -493,8 +493,7 @@ struct FunDef {
 
 #[derive(Clone)]
 struct MacroDef {
-    params: Vec<String>,
-    rest_param: Option<String>,
+    params_form: BlissVal,
     body: BlissVal,
 }
 
@@ -2487,6 +2486,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return eval_progn(body, env);
                 }
                 return Ok(NIL);
+            }
+            "DESTRUCTURING-BIND" => {
+                let (pattern, rest) = cp(cdr);
+                let (value_form, body) = cp(rest);
+                let value = eval_form(value_form, env)?;
+                let mut child_env = env.child();
+                bind_pattern_value(pattern, value, &mut child_env)?;
+                return eval_progn(body, &mut child_env);
             }
             "COND" => {
                 let mut c = cdr;
@@ -5888,38 +5895,294 @@ fn bind_lambda_list(
     Ok(())
 }
 
+fn bind_pattern_value(
+    pattern: BlissVal,
+    value: BlissVal,
+    env: &mut Env,
+) -> Result<(), BlissError> {
+    if pattern.is_nil() {
+        if value.is_nil() {
+            return Ok(());
+        }
+        return Err(BlissError::Internal(format!(
+            "destructuring mismatch: expected NIL, got {}",
+            format_val(value)
+        )));
+    }
+
+    if pattern.is_symbol() {
+        env.define_local_symbol(pattern, value);
+        return Ok(());
+    }
+
+    if !pattern.is_cons() {
+        return Err(BlissError::Internal(format!(
+            "invalid destructuring pattern: {}",
+            format_val(pattern)
+        )));
+    }
+
+    if !value.is_cons() {
+        return Err(BlissError::Internal(format!(
+            "destructuring mismatch: expected list for pattern {}, got {}",
+            format_val(pattern),
+            format_val(value)
+        )));
+    }
+
+    let (pcar, pcdr) = cp(pattern);
+    let (vcar, vcdr) = cp(value);
+    bind_pattern_value(pcar, vcar, env)?;
+    bind_pattern_value(pcdr, vcdr, env)
+}
+
+fn bind_macro_lambda_list(
+    params_form: BlissVal,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Result<(), BlissError> {
+    #[derive(PartialEq)]
+    enum Mode {
+        Req,
+        Opt,
+        Rest,
+        Key,
+        Aux,
+    }
+
+    let mut mode = Mode::Req;
+    let mut arg_i = 0usize;
+    let mut key_start: Option<usize> = None;
+    let mut rest_bound = false;
+    let mut saw_key = false;
+    let mut allow_other_keys = false;
+    let mut key_specs: Vec<(String, BlissVal, BlissVal, Option<String>)> = Vec::new();
+    let mut whole_var: Option<BlissVal> = None;
+    let whole_form = vec_to_list(args);
+
+    let mut c = params_form;
+    while c.is_cons() {
+        let (elem, rest) = cp(c);
+        c = rest;
+
+        if elem.is_symbol() {
+            match sym_name(elem).as_str() {
+                "&WHOLE" => {
+                    let (var, rest_after_var) = cp(c);
+                    whole_var = Some(var);
+                    c = rest_after_var;
+                    continue;
+                }
+                "&OPTIONAL" => {
+                    mode = Mode::Opt;
+                    continue;
+                }
+                "&REST" | "&BODY" => {
+                    mode = Mode::Rest;
+                    continue;
+                }
+                "&KEY" => {
+                    mode = Mode::Key;
+                    saw_key = true;
+                    key_start.get_or_insert(arg_i);
+                    continue;
+                }
+                "&AUX" => {
+                    mode = Mode::Aux;
+                    continue;
+                }
+                "&ALLOW-OTHER-KEYS" => {
+                    allow_other_keys = true;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        match mode {
+            Mode::Req => {
+                let v = args.get(arg_i).copied().ok_or_else(|| {
+                    BlissError::Internal(format!(
+                        "too few arguments for macro lambda list: missing value for {}",
+                        format_val(elem)
+                    ))
+                })?;
+                arg_i += 1;
+                bind_pattern_value(elem, v, env)?;
+            }
+            Mode::Opt => {
+                let (pattern, default_form, supp) = if elem.is_symbol() {
+                    (elem, NIL, None)
+                } else if elem.is_cons() {
+                    let (pat, r) = cp(elem);
+                    let (default, r2) = if r.is_cons() { cp(r) } else { (NIL, NIL) };
+                    let supp = if r2.is_cons() {
+                        Some(sym_name(cp(r2).0))
+                    } else {
+                        None
+                    };
+                    (pat, default, supp)
+                } else {
+                    (elem, NIL, None)
+                };
+
+                if arg_i < args.len() {
+                    bind_pattern_value(pattern, args[arg_i], env)?;
+                    arg_i += 1;
+                    if let Some(sp) = supp {
+                        env.define_local(&sp, T);
+                    }
+                } else {
+                    let dv = if default_form == NIL {
+                        NIL
+                    } else {
+                        eval_form(default_form, env)?
+                    };
+                    bind_pattern_value(pattern, dv, env)?;
+                    if let Some(sp) = supp {
+                        env.define_local(&sp, NIL);
+                    }
+                }
+            }
+            Mode::Rest => {
+                if rest_bound {
+                    return Err(BlissError::Internal(
+                        "malformed macro lambda list: multiple &rest/&body variables".into(),
+                    ));
+                }
+                let remaining = vec_to_list(args.get(arg_i..).unwrap_or(&[]));
+                bind_pattern_value(elem, remaining, env)?;
+                key_start.get_or_insert(arg_i);
+                rest_bound = true;
+            }
+            Mode::Key => {
+                let (kw_bare, pattern, default_form, supp) = if elem.is_symbol() {
+                    let bare = sym_name(elem);
+                    (bare, elem, NIL, None)
+                } else if elem.is_cons() {
+                    let (head, r) = cp(elem);
+                    let (default, r2) = if r.is_cons() { cp(r) } else { (NIL, NIL) };
+                    let supp = if r2.is_cons() {
+                        Some(sym_name(cp(r2).0))
+                    } else {
+                        None
+                    };
+                    if head.is_symbol() {
+                        (sym_name(head), head, default, supp)
+                    } else if head.is_cons() {
+                        let (kw_sym, r3) = cp(head);
+                        let pattern = if r3.is_cons() { cp(r3).0 } else { NIL };
+                        (key_bare(kw_sym), pattern, default, supp)
+                    } else {
+                        (String::new(), head, default, supp)
+                    }
+                } else {
+                    (String::new(), elem, NIL, None)
+                };
+                key_specs.push((kw_bare, pattern, default_form, supp));
+            }
+            Mode::Aux => {
+                let (pattern, default_form) = if elem.is_symbol() {
+                    (elem, NIL)
+                } else if elem.is_cons() {
+                    let (pat, r) = cp(elem);
+                    let (default, _) = if r.is_cons() { cp(r) } else { (NIL, NIL) };
+                    (pat, default)
+                } else {
+                    (elem, NIL)
+                };
+                let dv = if default_form == NIL {
+                    NIL
+                } else {
+                    eval_form(default_form, env)?
+                };
+                bind_pattern_value(pattern, dv, env)?;
+            }
+        }
+    }
+
+    if let Some(var) = whole_var {
+        bind_pattern_value(var, whole_form, env)?;
+    }
+
+    if saw_key {
+        let start = key_start.unwrap_or(arg_i);
+        let tail = args.get(start..).unwrap_or(&[]);
+        if tail.len() % 2 != 0 {
+            return Err(BlissError::Internal(
+                "macro keyword arguments must appear in key/value pairs".into(),
+            ));
+        }
+
+        let mut call_allows_other_keys = false;
+        for pair in tail.chunks(2) {
+            let key = pair[0];
+            if !key.is_symbol() {
+                return Err(BlissError::TypeError {
+                    datum: key,
+                    expected: "keyword".into(),
+                });
+            }
+            let bare = key_bare(key);
+            if bare == "ALLOW-OTHER-KEYS" && !pair[1].is_nil() {
+                call_allows_other_keys = true;
+            }
+        }
+
+        for (kw_bare, pattern, default_form, supp) in &key_specs {
+            if let Some(v) = find_key_arg(tail, kw_bare) {
+                bind_pattern_value(*pattern, v, env)?;
+                if let Some(sp) = supp {
+                    env.define_local(sp, T);
+                }
+            } else {
+                let dv = if *default_form == NIL {
+                    NIL
+                } else {
+                    eval_form(*default_form, env)?
+                };
+                bind_pattern_value(*pattern, dv, env)?;
+                if let Some(sp) = supp {
+                    env.define_local(sp, NIL);
+                }
+            }
+        }
+
+        if !(allow_other_keys || call_allows_other_keys) {
+            for pair in tail.chunks(2) {
+                let bare = key_bare(pair[0]);
+                if bare == "ALLOW-OTHER-KEYS" {
+                    continue;
+                }
+                if !key_specs.iter().any(|(kw, _, _, _)| kw == &bare) {
+                    return Err(BlissError::Internal(format!(
+                        "unexpected macro keyword argument: {}",
+                        bare
+                    )));
+                }
+            }
+        }
+    } else if !rest_bound && arg_i < args.len() {
+        return Err(BlissError::Internal(format!(
+            "too many arguments for macro lambda list: expected {}, got {}",
+            arg_i,
+            args.len()
+        )));
+    }
+
+    Ok(())
+}
+
 // ── DEFMACRO ─────────────────────────────────────────────────────
 fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, rest) = cp(cdr);
     let (params_form, body) = cp(rest);
     let name = sym_name(name_form);
 
-    let mut params = Vec::new();
-    let mut rest_param = None;
-    let mut c = params_form;
-    while c.is_cons() {
-        let (p, rest_p) = cp(c);
-        if p.is_symbol() {
-            let pname = sym_name(p);
-            if pname == "&BODY" || pname == "&REST" {
-                if rest_p.is_cons() {
-                    let (rest_name, rest_after_name) = cp(rest_p);
-                    rest_param = Some(sym_name(rest_name));
-                    c = rest_after_name;
-                    continue;
-                }
-            } else if !pname.starts_with('&') {
-                params.push(pname);
-            }
-        }
-        c = rest_p;
-    }
-
     Rc::make_mut(&mut env.macros).insert(
         name.clone(),
         MacroDef {
-            params,
-            rest_param,
+            params_form,
             body,
         },
     );
@@ -5929,27 +6192,7 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let mut child_env = env.child();
     let arg_list = list_to_vec(args);
-
-    let mut arg_idx = 0;
-    for param in &mdef.params {
-        if arg_idx < arg_list.len() {
-            child_env.define_local(param, arg_list[arg_idx]);
-            arg_idx += 1;
-        } else {
-            child_env.define_local(param, NIL);
-        }
-    }
-
-    if let Some(rest_param) = &mdef.rest_param {
-        let body_args = if arg_idx < arg_list.len() {
-            vec_to_list(&arg_list[arg_idx..])
-        } else {
-            NIL
-        };
-        child_env.define_local(rest_param, body_args);
-    }
-
-    // Evaluate the macro body to get the expansion (it should be a quasiquote form)
+    bind_macro_lambda_list(mdef.params_form, &arg_list, &mut child_env)?;
     eval_progn(mdef.body, &mut child_env)
 }
 

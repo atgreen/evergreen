@@ -104,6 +104,29 @@
        (error (format nil "ASSERT failed: ~S" ',test-form))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Control-flow macros still needed during the Stage 2 bootstrap.
+;;; ---------------------------------------------------------------------------
+
+(defmacro case (keyform &rest clauses)
+  (let ((value (gensym))
+        (expanded nil))
+    (dolist (clause (reverse clauses))
+      (let ((keys (car clause))
+            (body (cdr clause)))
+        (push
+          (cond
+            ((or (eq keys 'otherwise) (eq keys t))
+             `(t ,@body))
+            ((consp keys)
+             `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys))
+               ,@body))
+            (t
+             `((eql ,value ',keys) ,@body)))
+          expanded)))
+    `(let ((,value ,keyform))
+       (cond ,@expanded))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Sequence / list helpers (Common Lisp, now that lambda lists bind properly)
 ;;; ---------------------------------------------------------------------------
 
