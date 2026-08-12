@@ -9,7 +9,7 @@
     (lambda (&optional (delta 1))
       (setq n (+ n delta))
       n)))
-(print (fib 10))
+(print (fib 30))
 (print (mapcar (lambda (x) (* x x)) '(1 2 3 4)))
 (let ((counter (make-counter 7)))
   (print (list (funcall counter) (funcall counter 5))))

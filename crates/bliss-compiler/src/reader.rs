@@ -96,6 +96,17 @@ fn make_uninterned_symbol(_name: &str) -> BlissVal {
 static MACRO_CHARS: Mutex<Option<MacroCharTable>> = Mutex::new(None);
 static DISPATCH_CHARS: Mutex<Option<DispatchCharTable>> = Mutex::new(None);
 static DISPATCH_SUB_CHARS: Mutex<Option<DispatchSubCharTable>> = Mutex::new(None);
+type ReadEvalHook = fn(BlissVal) -> Result<BlissVal, BlissError>;
+static READ_EVAL_HOOK: Mutex<Option<ReadEvalHook>> = Mutex::new(None);
+
+pub fn set_read_eval_hook(hook: Option<ReadEvalHook>) {
+    let mut guard = READ_EVAL_HOOK.lock().unwrap();
+    *guard = hook;
+}
+
+fn read_eval_hook() -> Option<ReadEvalHook> {
+    *READ_EVAL_HOOK.lock().unwrap()
+}
 
 fn readtable_key(readtable: BlissVal) -> u64 {
     readtable.0 & !bliss_rt::value::TAG_MASK
@@ -1357,11 +1368,7 @@ fn read_sharpsign_with_base(
                 read_circular,
                 depth + 1,
             )?;
-            // Try simple evaluation of (+ 1 2)
-            match try_eval(form) {
-                Some(val) => Ok((val, p)),
-                None => Err(BlissError::StreamError("read-eval not supported".into())),
-            }
+            eval_read_time_form_with_hook(form).map(|value| (value, p))
         }
         _ => Err(BlissError::StreamError(format!(
             "unknown # dispatch: {}",
@@ -1814,104 +1821,227 @@ fn numeric_to_f64(v: BlissVal) -> Option<f64> {
     }
 }
 
-fn try_eval(form: BlissVal) -> Option<BlissVal> {
-    // Minimal eval for #. — handles self-evaluating atoms and simple arithmetic
-    // on fixnums and floats: (+, -, *) with recursive argument evaluation.
+fn eval_read_time_form_with_hook(form: BlissVal) -> Result<BlissVal, BlissError> {
+    if let Some(hook) = read_eval_hook() {
+        return hook(form);
+    }
+    eval_read_time_form(form)
+}
+
+pub fn eval_read_time_form(form: BlissVal) -> Result<BlissVal, BlissError> {
     if !form.is_cons() {
-        // Self-evaluating atoms: numbers, floats, characters, strings
-        if form.is_fixnum() || form.is_single_float() || form.is_character() {
-            return Some(form);
+        if form == NIL || form == T {
+            return Ok(form);
         }
-        // Strings are self-evaluating
+        if form.is_fixnum() || form.is_single_float() || form.is_character() {
+            return Ok(form);
+        }
+        if form.is_symbol() {
+            let name = feature_symbol_name(form);
+            if name.starts_with("KEYWORD:") {
+                return Ok(form);
+            }
+            return Err(BlissError::UnboundVariable(form));
+        }
         if form.is_heap_object() {
             unsafe {
                 let ptr = form.as_ptr();
                 let header = *(ptr as *const ObjectHeader);
                 if header.type_id() == type_id::SIMPLE_BASE_STRING {
-                    return Some(form);
+                    return Ok(form);
                 }
             }
         }
-        return None;
+        return Err(BlissError::TypeError {
+            datum: form,
+            expected: "read-time evaluable form".into(),
+        });
     }
-    // Destructure (op arg1 arg2) from cons cells
-    unsafe {
-        let cell = form.as_ptr() as *const ConsCell;
-        let op = (*cell).car;
-        let rest = (*cell).cdr;
-        if !op.is_symbol() || !rest.is_cons() {
-            return None;
+
+    let (operator, args) = cons_parts(form);
+    if !operator.is_symbol() {
+        return Err(BlissError::TypeError {
+            datum: operator,
+            expected: "read-time operator symbol".into(),
+        });
+    }
+
+    let operator_name = feature_symbol_name(operator);
+    match operator_name.as_str() {
+        "QUOTE" => {
+            let argv = list_to_vec(args)?;
+            argv.first()
+                .copied()
+                .ok_or_else(|| BlissError::Internal("QUOTE: missing argument".into()))
         }
-        let rest_cell = rest.as_ptr() as *const ConsCell;
-        let arg1_form = (*rest_cell).car;
-        let rest2 = (*rest_cell).cdr;
+        "IF" => {
+            let argv = list_to_vec(args)?;
+            if argv.is_empty() {
+                return Err(BlissError::Internal("IF: missing test".into()));
+            }
+            if eval_read_time_form(argv[0])? != NIL {
+                if argv.len() > 1 {
+                    eval_read_time_form(argv[1])
+                } else {
+                    Ok(NIL)
+                }
+            } else if argv.len() > 2 {
+                eval_read_time_form(argv[2])
+            } else {
+                Ok(NIL)
+            }
+        }
+        "PROGN" => {
+            let argv = list_to_vec(args)?;
+            let mut result = NIL;
+            for form in argv {
+                result = eval_read_time_form(form)?;
+            }
+            Ok(result)
+        }
+        "+" | "-" | "*" => eval_read_time_arithmetic(operator_name.as_str(), args),
+        "CAR" => {
+            let argv = eval_read_time_args(args)?;
+            if argv.len() != 1 {
+                return Err(BlissError::Internal("CAR: expected 1 argument".into()));
+            }
+            if argv[0] == NIL {
+                Ok(NIL)
+            } else {
+                Ok(cons_parts(argv[0]).0)
+            }
+        }
+        "CDR" => {
+            let argv = eval_read_time_args(args)?;
+            if argv.len() != 1 {
+                return Err(BlissError::Internal("CDR: expected 1 argument".into()));
+            }
+            if argv[0] == NIL {
+                Ok(NIL)
+            } else {
+                Ok(cons_parts(argv[0]).1)
+            }
+        }
+        "CONS" => {
+            let argv = eval_read_time_args(args)?;
+            if argv.len() != 2 {
+                return Err(BlissError::Internal("CONS: expected 2 arguments".into()));
+            }
+            Ok(alloc_cons(argv[0], argv[1]))
+        }
+        "LIST" => Ok(make_list(&eval_read_time_args(args)?)),
+        "EQ" => {
+            let argv = eval_read_time_args(args)?;
+            if argv.len() != 2 {
+                return Err(BlissError::Internal("EQ: expected 2 arguments".into()));
+            }
+            Ok(if argv[0] == argv[1] { T } else { NIL })
+        }
+        _ => Err(BlissError::StreamError(format!(
+            "read-eval not supported for {}",
+            operator_name
+        ))),
+    }
+}
 
-        // Recursively evaluate arguments
-        let arg1 = try_eval(arg1_form)?;
+fn list_to_vec(list: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
+    let mut result = Vec::new();
+    let mut current = list;
+    while current.is_cons() {
+        let (car, cdr) = cons_parts(current);
+        result.push(car);
+        current = cdr;
+    }
+    if current != NIL {
+        return Err(BlissError::TypeError {
+            datum: list,
+            expected: "proper list".into(),
+        });
+    }
+    Ok(result)
+}
 
-        let plus_idx = intern_symbol("+");
-        let minus_idx = intern_symbol("-");
-        let star_idx = intern_symbol("*");
+fn eval_read_time_args(args: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
+    list_to_vec(args)?
+        .into_iter()
+        .map(eval_read_time_form)
+        .collect()
+}
 
-        // Unary or binary?
-        if rest2.is_nil() {
-            // Unary: e.g. (- x)
-            if op == BlissVal::from_symbol_index(minus_idx) {
-                if arg1.is_fixnum() {
-                    return Some(BlissVal::from_fixnum(-arg1.as_fixnum()));
-                } else if arg1.is_single_float() {
-                    return Some(BlissVal::from_single_float(-arg1.as_single_float()));
+fn eval_read_time_arithmetic(op: &str, args: BlissVal) -> Result<BlissVal, BlissError> {
+    let argv = eval_read_time_args(args)?;
+    if argv.is_empty() {
+        return Ok(match op {
+            "+" | "-" => BlissVal::from_fixnum(0),
+            "*" => BlissVal::from_fixnum(1),
+            _ => unreachable!(),
+        });
+    }
+
+    if argv.iter().all(|value| value.is_fixnum()) {
+        let mut iter = argv.iter().map(|value| value.as_fixnum());
+        let first = iter
+            .next()
+            .ok_or_else(|| BlissError::Internal("missing arithmetic operand".into()))?;
+        let total = match op {
+            "+" => first + iter.sum::<i64>(),
+            "*" => iter.fold(first, |acc, value| acc * value),
+            "-" => {
+                if argv.len() == 1 {
+                    -first
+                } else {
+                    iter.fold(first, |acc, value| acc - value)
                 }
             }
-            // Unary + is identity
-            if op == BlissVal::from_symbol_index(plus_idx)
-                && (arg1.is_fixnum() || arg1.is_single_float())
-            {
-                return Some(arg1);
-            }
-            return None;
-        }
-
-        if !rest2.is_cons() {
-            return None;
-        }
-        let rest2_cell = rest2.as_ptr() as *const ConsCell;
-        let arg2_form = (*rest2_cell).car;
-        let rest3 = (*rest2_cell).cdr;
-        if !rest3.is_nil() {
-            return None;
-        } // only binary ops
-
-        let arg2 = try_eval(arg2_form)?;
-
-        // Both fixnum — stay in fixnum domain
-        if arg1.is_fixnum() && arg2.is_fixnum() {
-            let a = arg1.as_fixnum();
-            let b = arg2.as_fixnum();
-            if op == BlissVal::from_symbol_index(plus_idx) {
-                return Some(BlissVal::from_fixnum(a + b));
-            } else if op == BlissVal::from_symbol_index(minus_idx) {
-                return Some(BlissVal::from_fixnum(a - b));
-            } else if op == BlissVal::from_symbol_index(star_idx) {
-                return Some(BlissVal::from_fixnum(a * b));
-            }
-            return None;
-        }
-
-        // Mixed or both float — promote to float
-        let a = numeric_to_f64(arg1)?;
-        let b = numeric_to_f64(arg2)?;
-
-        if op == BlissVal::from_symbol_index(plus_idx) {
-            Some(BlissVal::from_single_float((a + b) as f32))
-        } else if op == BlissVal::from_symbol_index(minus_idx) {
-            Some(BlissVal::from_single_float((a - b) as f32))
-        } else if op == BlissVal::from_symbol_index(star_idx) {
-            Some(BlissVal::from_single_float((a * b) as f32))
-        } else {
-            None
-        }
+            _ => unreachable!(),
+        };
+        return Ok(BlissVal::from_fixnum(total));
     }
+
+    let mut iter = argv.into_iter();
+    let first_value = iter
+        .next()
+        .ok_or_else(|| BlissError::Internal("missing arithmetic operand".into()))?;
+    let first = numeric_to_f64(first_value).ok_or_else(|| BlissError::TypeError {
+        datum: first_value,
+        expected: "number".into(),
+    })?;
+
+    let total = match op {
+        "+" => iter.try_fold(first, |acc, value| {
+            numeric_to_f64(value)
+                .map(|number| acc + number)
+                .ok_or_else(|| BlissError::TypeError {
+                    datum: value,
+                    expected: "number".into(),
+                })
+        })?,
+        "*" => iter.try_fold(first, |acc, value| {
+            numeric_to_f64(value)
+                .map(|number| acc * number)
+                .ok_or_else(|| BlissError::TypeError {
+                    datum: value,
+                    expected: "number".into(),
+                })
+        })?,
+        "-" => {
+            if iter.len() == 0 {
+                -first
+            } else {
+                iter.try_fold(first, |acc, value| {
+                    numeric_to_f64(value)
+                        .map(|number| acc - number)
+                        .ok_or_else(|| BlissError::TypeError {
+                            datum: value,
+                            expected: "number".into(),
+                        })
+                })?
+            }
+        }
+        _ => unreachable!(),
+    };
+
+    Ok(BlissVal::from_single_float(total as f32))
 }
 
 fn read_pathname_literal(chars: &[char], pos: usize) -> Result<(BlissVal, usize), BlissError> {

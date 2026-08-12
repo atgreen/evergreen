@@ -61,7 +61,7 @@ pub use reader::{
     ReaderState, SourcePos, SyntaxType, copy_readtable, get_dispatch_macro_character,
     get_macro_character, intern_symbol, make_dispatch_macro_character, make_readtable, read,
     read_from_string, read_from_string_with_base, register_package, set_dispatch_macro_character,
-    set_macro_character, symbol_name,
+    set_macro_character, set_read_eval_hook, symbol_name,
 };
 pub use tiered::{
     BaselineCompiler, CompiledCode, Interpreter, OptimisingCompiler, Tier, TierConfig,

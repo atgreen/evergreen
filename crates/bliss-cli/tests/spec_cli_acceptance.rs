@@ -199,25 +199,22 @@ fn stage_zero_gate_round_trips_core_datatypes_and_runs_a_nested_script() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
-    for expected in [
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let actual_lines: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
+    let expected_lines = vec![
         "123",
         "3/4",
         "1.5",
         "#\\A",
-        "\"HELLO\"",
+        "\"hello\"",
         "FOO",
         ":BAR",
         "(1 (2 3) NIL)",
         "T",
         "NIL",
         "(7 8 (5 6))",
-    ] {
-        assert!(
-            stdout.contains(expected),
-            "missing `{expected}` in: {stdout}"
-        );
-    }
+    ];
+    assert_eq!(actual_lines, expected_lines, "unexpected stage-0 gate stdout");
 
     fs::remove_dir_all(dir).ok();
 }

@@ -1,7 +1,7 @@
 (print 123)
 (print 3/4)
 (print 1.5)
-(print #\\A)
+(print #\A)
 (print "hello")
 (print 'foo)
 (print :bar)

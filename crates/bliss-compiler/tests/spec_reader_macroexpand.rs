@@ -265,6 +265,20 @@ fn reader_hardening_disables_read_eval_by_default_and_allows_explicit_opt_in() {
     state.set_read_eval(true);
     let value = read(&mut state).unwrap();
     assert_eq!(value.as_fixnum(), 3);
+
+    let quoted_source = parse("\"#.(quote hello)\"");
+    let mut quoted = ReaderState::new();
+    quoted.set_input(quoted_source);
+    quoted.set_read_eval(true);
+    let quoted_value = read(&mut quoted).unwrap();
+    assert_eq!(symbol_text(quoted_value).as_deref(), Some("HELLO"));
+
+    let car_source = parse("\"#.(car '(1 2))\"");
+    let mut car_state = ReaderState::new();
+    car_state.set_input(car_source);
+    car_state.set_read_eval(true);
+    let car_value = read(&mut car_state).unwrap();
+    assert_eq!(car_value.as_fixnum(), 1);
 }
 
 #[test]
