@@ -462,6 +462,8 @@ struct Env {
     closures: Rc<RefCell<HashMap<u64, Closure>>>,
     block_stack: Vec<(String, String)>,
     catch_stack: Vec<(String, String)>,
+    /// Tags visible for GO: (tag-name, tagbody-token)
+    tag_stack: Vec<(String, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -580,6 +582,7 @@ impl Env {
             closures: Rc::new(RefCell::new(HashMap::new())),
             block_stack: Vec::new(),
             catch_stack: Vec::new(),
+            tag_stack: Vec::new(),
         };
         env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
         env.define_local("*LOAD-HOOKS*", NIL);
@@ -612,6 +615,7 @@ impl Env {
             closures: Rc::clone(&self.closures),
             block_stack: self.block_stack.clone(),
             catch_stack: self.catch_stack.clone(),
+            tag_stack: self.tag_stack.clone(),
         }
     }
 
@@ -1774,6 +1778,21 @@ fn cp(val: BlissVal) -> (BlissVal, BlissVal) {
     }
 }
 
+/// A TAGBODY tag is a symbol or an integer. Return its canonical string key,
+/// or None if the form is a statement (a cons or other non-tag object).
+fn tag_key(form: BlissVal) -> Option<String> {
+    if form.is_cons() {
+        return None;
+    }
+    if form.is_symbol() {
+        return Some(sym_name(form));
+    }
+    if form.is_fixnum() {
+        return Some(format!("#{}", form.as_fixnum()));
+    }
+    None
+}
+
 fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (car, cdr) = cp(form);
     if car.is_symbol() {
@@ -1901,6 +1920,94 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Err(BlissError::Internal(token.clone()));
                 }
                 return Err(BlissError::Internal(format!("uncaught throw to {}", tag)));
+            }
+            "TAGBODY" => {
+                // (tagbody {tag | statement}*)
+                // Tags are symbols or integers; statements are forms evaluated in
+                // order. GO transfers control to a tag; TAGBODY returns NIL.
+                let items = list_to_vec(cdr);
+                let token = next_control_token("__GO__");
+                // Record tag name -> statement index (index just after the tag).
+                let mut tag_index: HashMap<String, usize> = HashMap::new();
+                let base = env.tag_stack.len();
+                for (i, item) in items.iter().enumerate() {
+                    if let Some(name) = tag_key(*item) {
+                        tag_index.entry(name.clone()).or_insert(i);
+                        env.tag_stack.push((name, token.clone()));
+                    }
+                }
+                let mut pc = 0usize;
+                let result: Result<(), BlissError> = loop {
+                    if pc >= items.len() {
+                        break Ok(());
+                    }
+                    let item = items[pc];
+                    if tag_key(item).is_some() {
+                        pc += 1;
+                        continue;
+                    }
+                    match eval_form(item, env) {
+                        Ok(_) => {
+                            pc += 1;
+                        }
+                        Err(BlissError::Internal(msg)) if msg == token => {
+                            let target = val_as_str(take_control_value(&token));
+                            match tag_index.get(&target) {
+                                Some(idx) => {
+                                    pc = *idx;
+                                }
+                                None => break Err(BlissError::Internal(msg)),
+                            }
+                        }
+                        Err(e) => break Err(e),
+                    }
+                };
+                env.tag_stack.truncate(base);
+                match result {
+                    Ok(()) => return Ok(NIL),
+                    Err(e) => return Err(e),
+                }
+            }
+            "GO" => {
+                // (go tag) — tag is not evaluated.
+                let (tag_form, _) = cp(cdr);
+                let name = match tag_key(tag_form) {
+                    Some(n) => n,
+                    None => {
+                        return Err(BlissError::Internal(
+                            "GO: tag must be a symbol or integer".into(),
+                        ))
+                    }
+                };
+                if let Some((_, token)) = env
+                    .tag_stack
+                    .iter()
+                    .rev()
+                    .find(|(tag_name, _)| tag_name == &name)
+                {
+                    let token = token.clone();
+                    store_control_value(&token, arena_str(&name));
+                    return Err(BlissError::Internal(token));
+                }
+                return Err(BlissError::Internal(format!("GO: no such tag {}", name)));
+            }
+            "UNWIND-PROTECT" => {
+                // (unwind-protect protected cleanup...) — cleanup runs whether the
+                // protected form returns normally or exits non-locally.
+                let (protected, cleanup) = cp(cdr);
+                let result = eval_form(protected, env);
+                match result {
+                    Ok(v) => {
+                        let saved_mv = env.mv.clone();
+                        eval_progn(cleanup, env)?;
+                        env.mv = saved_mv;
+                        return Ok(v);
+                    }
+                    Err(e) => {
+                        let _ = eval_progn(cleanup, env);
+                        return Err(e);
+                    }
+                }
             }
             "PRINT" => {
                 let (a, _) = cp(cdr);
@@ -2178,12 +2285,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     c = r;
                 }
                 if vals.is_empty() {
+                    env.mv = Vec::new();
                     return Ok(NIL);
                 }
                 env.mv = vals.clone();
-                for v in &vals[1..] {
-                    println!("{}", format_val(*v));
-                }
                 return Ok(vals[0]);
             }
             "FORMAT" => return eval_format(cdr, env),
@@ -2289,6 +2394,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(result);
             }
             "DEFUN" => return eval_defun(cdr, env),
+            "FLET" | "LABELS" => return eval_flet(cdr, env),
             "DEFMACRO" => return eval_defmacro(cdr, env),
             "DEFCLASS" => return eval_defclass(cdr, env),
             "DEFMETHOD" => return eval_defmethod(cdr, env),
@@ -2789,6 +2895,50 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(values.get(idx).copied().unwrap_or(NIL));
             }
             "MULTIPLE-VALUE-BIND" => return eval_multiple_value_bind(cdr, env),
+            "MULTIPLE-VALUE-CALL" => {
+                // (multiple-value-call function form*) — gather all the values
+                // produced by each form into a single argument list.
+                let (fn_form, forms) = cp(cdr);
+                let fn_val = eval_form(fn_form, env)?;
+                let mut args = Vec::new();
+                let mut c = forms;
+                while c.is_cons() {
+                    let (af, r) = cp(c);
+                    env.mv = Vec::new();
+                    let primary = eval_form(af, env)?;
+                    if env.mv.is_empty() {
+                        args.push(primary);
+                    } else {
+                        args.extend(env.mv.clone());
+                    }
+                    c = r;
+                }
+                return apply_function(fn_val, &args, env);
+            }
+            "MULTIPLE-VALUE-LIST" => {
+                // (multiple-value-list form) — a list of all the values of form.
+                let (form, _) = cp(cdr);
+                env.mv = Vec::new();
+                let primary = eval_form(form, env)?;
+                let values = if env.mv.is_empty() {
+                    vec![primary]
+                } else {
+                    env.mv.clone()
+                };
+                return Ok(vec_to_list(&values));
+            }
+            "VALUES-LIST" => {
+                // (values-list list) — return the elements of list as values.
+                let (form, _) = cp(cdr);
+                let lst = eval_form(form, env)?;
+                let vals = list_to_vec(lst);
+                if vals.is_empty() {
+                    env.mv = Vec::new();
+                    return Ok(NIL);
+                }
+                env.mv = vals.clone();
+                return Ok(vals[0]);
+            }
             "HANDLER-CASE" => return eval_handler_case(cdr, env),
             "HANDLER-BIND" => return eval_handler_bind(cdr, env),
             "SIGNAL" => {
@@ -4754,6 +4904,39 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     Ok(name_form)
 }
 
+// ── FLET / LABELS local function binding ────────────────────────
+// (flet ((name (lambda-list) body...) ...) body...)
+// (labels ...) has the same shape but the local functions are mutually
+// recursive. Both bind the named functions in a fresh child environment and
+// evaluate the body there; because named functions in this evaluator resolve
+// their names through the current environment's function table at call time,
+// LABELS-style mutual recursion works naturally, and FLET-bound functions are
+// visible only within the FLET/LABELS body.
+fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let (defs_form, body) = cp(cdr);
+    let mut child_env = env.child();
+    let mut c = defs_form;
+    while c.is_cons() {
+        let (def, rest) = cp(c);
+        if def.is_cons() {
+            let (name_form, def_rest) = cp(def);
+            let (params_form, fbody) = cp(def_rest);
+            let name = sym_name(name_form);
+            let params = extract_params(params_form);
+            Rc::make_mut(&mut child_env.funs).insert(
+                name,
+                FunDef {
+                    params,
+                    params_form,
+                    body: fbody,
+                },
+            );
+        }
+        c = rest;
+    }
+    eval_progn(body, &mut child_env)
+}
+
 // ── Extract parameter names from a lambda list ──────────────────
 fn extract_params(params_form: BlissVal) -> Vec<String> {
     let mut params = Vec::new();
@@ -5860,6 +6043,17 @@ fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, BlissError> {
     match read_eval_all_env(expr, env) {
         Ok(result) => {
             println!("{}", format_val(result));
+            // When the top-level form yielded multiple values, echo the
+            // secondary values too (one per line). env.mv holds the full value
+            // list only when the last form actually produced multiple values;
+            // guard on mv[0] == result so a stale channel from a nested form
+            // does not leak extra output.
+            let mv = env.mv.clone();
+            if mv.len() > 1 && mv[0] == result {
+                for v in &mv[1..] {
+                    println!("{}", format_val(*v));
+                }
+            }
             Ok(0)
         }
         Err(e) => {
