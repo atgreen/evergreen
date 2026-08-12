@@ -22,6 +22,14 @@ use bliss_compiler::tiered::{
     request_compilation,
 };
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
+use std::sync::Mutex;
+
+/// Serializes tests that mutate the process-global inline-cache registry
+/// (`IC_SESSION`/`IC_GENERATION`). These statics are shared by every test in
+/// this binary, so running the dependent tests concurrently makes their
+/// session/generation observations nondeterministic. The lock keeps them
+/// isolated without changing behaviour for the single-threaded case.
+static IC_REGISTRY_SERIAL: Mutex<()> = Mutex::new(());
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -918,6 +926,9 @@ fn ic_state_transitions_affect_deopt_decisions() {
     // Verify that IC state transitions (Uninitialized → Monomorphic → Polymorphic
     // → Megamorphic) interact with the deoptimization system: a Megamorphic IC
     // should trigger InlineCacheOverflow deopts which eventually blacklist the function.
+    let _serial = IC_REGISTRY_SERIAL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     init_ic_registry();
 
     let ic = InlineCache::new();
@@ -954,6 +965,11 @@ fn ic_state_transitions_affect_deopt_decisions() {
 
 #[test]
 fn ic_generation_invalidation_with_compiled_code() {
+    // Serialize against sibling tests that mutate the process-global IC
+    // registry (session/generation counters); see IC_REGISTRY_SERIAL.
+    let _serial = IC_REGISTRY_SERIAL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     // Verify that ic_generation() bump (from reset_all_caches) causes
     // existing ICs to lazily reset, which would invalidate compiled code
     // assumptions (requiring deoptimization).

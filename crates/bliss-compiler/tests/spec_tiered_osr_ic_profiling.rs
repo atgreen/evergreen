@@ -12,8 +12,17 @@ use bliss_compiler::tiered::{
     pop_compilation_request, process_compilation_request, request_compilation,
 };
 use bliss_rt::value::{BlissVal, NIL, T, TAG_FIXNUM};
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+
+/// Serializes tests that touch process-global registries shared across this
+/// binary: the bounded compilation queue (`COMPILATION_QUEUE`) and the global
+/// deopt-log/blacklist registry (`DEOPT_LOGS`). Running these tests
+/// concurrently lets one test's enqueue/drain or `clear_global_deopt_logs()`
+/// perturb another's expectations. The lock restores determinism without
+/// altering single-threaded behaviour.
+static GLOBAL_REGISTRY_SERIAL: Mutex<()> = Mutex::new(());
 
 fn make_function() -> (BlissVal, &'static FnMeta) {
     let meta = Box::leak(Box::new(FnMeta::new(0, BlissVal::from_fixnum(0), NIL)));
@@ -77,6 +86,9 @@ fn tiered_promotion_uses_invocation_and_loop_heat_thresholds_from_spec() {
 fn t2_compile_failure_keeps_t1_entry_and_marks_failure() {
     // Per R4.28, if T2 compilation fails then the function must remain at T1,
     // keep its existing entry point, and record the failure for logging/reporting.
+    let _serial = GLOBAL_REGISTRY_SERIAL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     drain_queue();
     let (function, meta) = make_function();
     let mut interpreter = Interpreter::new();
@@ -137,6 +149,9 @@ fn startup_environment_configures_tier_thresholds() {
 fn compilation_queue_is_bounded_and_prioritises_hotter_requests() {
     // Per R4.30, the queue is bounded and overflow drops work instead of blocking.
     // Per R4.25/R4.26, background T2 requests are orchestrated through the queue.
+    let _serial = GLOBAL_REGISTRY_SERIAL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     drain_queue();
 
     let (high_fn, high_meta) = make_function();
@@ -175,6 +190,9 @@ fn compilation_queue_is_bounded_and_prioritises_hotter_requests() {
 fn deopt_at_safepoint_restores_equivalent_interpreter_frame() {
     // Per R4.39, deoptimisation at a GC safepoint must reconstruct a
     // semantically equivalent interpreter frame within one poll interval.
+    let _serial = GLOBAL_REGISTRY_SERIAL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     clear_global_deopt_logs();
     let (function, _) = make_function();
     let live_values = [BlissVal::from_fixnum(7), NIL, T];
@@ -200,6 +218,9 @@ fn deopt_at_safepoint_restores_equivalent_interpreter_frame() {
 fn osr_and_deopt_keep_gc_visible_state_walkable_during_transition() {
     // Per R4.41, OSR entry and deoptimisation must reach a safepoint before
     // stack-shape changes and the replacement frame must remain GC-walkable.
+    let _serial = GLOBAL_REGISTRY_SERIAL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let (function, _) = make_function();
     let map = OsrEntryMap {
         mappings: vec![
@@ -243,6 +264,9 @@ fn osr_and_deopt_keep_gc_visible_state_walkable_during_transition() {
 fn osr_entry_preserves_mapped_locals_and_deopt_blacklists_after_threshold() {
     // Per R4.38, OSR must preserve live locals and the current PC mapping.
     // Per R4.40, repeated deopts must be logged and eventually blacklist T2.
+    let _serial = GLOBAL_REGISTRY_SERIAL
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     clear_global_deopt_logs();
     let (function, _) = make_function();
     let map = OsrEntryMap {
