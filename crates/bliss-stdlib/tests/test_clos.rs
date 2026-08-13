@@ -196,8 +196,9 @@ fn make_instance_variants() {
 fn initialize_and_shared_initialize_protocol() {
     bootstrap_clos().unwrap();
     let cls = BlissVal::from_fixnum(403);
-    set_find_class(sym(403), cls).unwrap();
     let slot_name = sym(404);
+    // Instances have a fixed inline slot layout: the slot must be declared.
+    define_class(sym(403), cls, &[], &[slot_name]).unwrap();
     let init_val = BlissVal::from_fixnum(99);
 
     // Allocate a raw instance — slots should be unbound
@@ -229,9 +230,9 @@ fn initialize_and_shared_initialize_protocol() {
 fn slot_set_get_roundtrip() {
     bootstrap_clos().unwrap();
     let cls = BlissVal::from_fixnum(500);
-    set_find_class(sym(500), cls).unwrap();
-    let inst = make_instance(cls, &[]).unwrap();
     let (sn, val) = (sym(501), BlissVal::from_fixnum(42));
+    define_class(sym(500), cls, &[], &[sn]).unwrap();
+    let inst = make_instance(cls, &[]).unwrap();
     set_slot_value(inst, sn, val).unwrap();
     assert_eq!(slot_value(inst, sn).unwrap(), val);
 }
@@ -240,9 +241,9 @@ fn slot_set_get_roundtrip() {
 fn slot_boundp_and_makunbound() {
     bootstrap_clos().unwrap();
     let cls = BlissVal::from_fixnum(502);
-    set_find_class(sym(502), cls).unwrap();
-    let inst = allocate_instance(cls).unwrap();
     let sn = sym(503);
+    define_class(sym(502), cls, &[], &[sn]).unwrap();
+    let inst = allocate_instance(cls).unwrap();
     assert!(!slot_boundp(inst, sn).unwrap());
     set_slot_value(inst, sn, BlissVal::from_fixnum(1)).unwrap();
     assert!(slot_boundp(inst, sn).unwrap());
@@ -440,4 +441,45 @@ fn dispatch_surface_reflects_method_mutation_without_stale_results() {
         compute_applicable_methods(gf, &[dog_instance]),
         vec![animal_method]
     );
+}
+
+// ── Heap-object instance representation (bliss-xyo) ─────────────────
+
+#[test]
+fn instances_are_heap_objects_not_fixnums() {
+    bootstrap_clos().unwrap();
+    let cls = fx(700);
+    let s = sym(701);
+    define_class(sym(702), cls, &[], &[s]).unwrap();
+    let inst = make_instance(cls, &[s, fx(9)]).unwrap();
+
+    // A real STANDARD_OBJECT heap object, recognized as an instance.
+    assert!(inst.is_standard_object());
+    assert!(is_instance(inst));
+    assert_eq!(class_of(inst), cls);
+    assert_eq!(slot_value(inst, s).unwrap(), fx(9));
+
+    // bliss-2ke, now structural: a plain fixnum can never be an instance,
+    // even one equal to the old-style instance-id base or a class handle.
+    assert!(!is_instance(fx(9)));
+    assert!(!is_instance(fx(100_004)));
+    assert!(!is_instance(fx(700)));
+}
+
+#[test]
+fn change_class_growth_preserves_slots_via_forwarding() {
+    bootstrap_clos().unwrap();
+    let a = fx(710);
+    let b = fx(711);
+    let sa = sym(712);
+    let sb = sym(713);
+    define_class(sym(714), a, &[], &[sa]).unwrap(); // 1 instance slot
+    define_class(sym(715), b, &[a], &[sb]).unwrap(); // inherits sa + own sb -> 2 slots
+    let inst = make_instance(a, &[sa, fx(1)]).unwrap();
+
+    // Growth (1 -> 2 slots) reallocates and forwards; identity/value survive.
+    change_class(inst, b).unwrap();
+    assert_eq!(class_of(inst), b);
+    assert_eq!(slot_value(inst, sa).unwrap(), fx(1)); // shared slot copied
+    assert!(!slot_boundp(inst, sb).unwrap()); // added slot unbound
 }

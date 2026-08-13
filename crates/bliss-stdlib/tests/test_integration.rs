@@ -314,10 +314,11 @@ fn clos_make_instance_and_slots() {
     let t_class = find_class(T).expect("T must exist");
     let user_class_name = BlissVal::from_fixnum(-200);
     let user_class = BlissVal::from_fixnum(-201);
-    define_class(user_class_name, user_class, &[t_class], &[]).expect("define_class");
-    let instance = make_instance(user_class, &[]).expect("make_instance");
-
+    // Instances have a fixed inline slot layout: declare the slot (reusing the
+    // same BlissVal so layout keying by identity resolves it on access).
     let slot_name = make_lisp_string("X");
+    define_class(user_class_name, user_class, &[t_class], &[slot_name]).expect("define_class");
+    let instance = make_instance(user_class, &[]).expect("make_instance");
 
     // Slot should be unbound initially
     let bound = slot_boundp(instance, slot_name);

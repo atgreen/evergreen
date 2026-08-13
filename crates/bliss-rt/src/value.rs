@@ -31,11 +31,6 @@ pub const TAG_SPECIAL: u64 = 0b111;
 
 pub const TAG_MASK: u64 = 0b111;
 
-/// Payload bit that distinguishes a CLOS instance handle from the builtin
-/// `SPECIAL` values (NIL/T/UNBOUND/MISSING/EOF, which never set it). Chosen high
-/// so it cannot overlap the small instance-id counter. See [`BlissVal::from_clos_handle`].
-pub const CLOS_HANDLE_BIT: u64 = 1 << 62;
-
 // ── Special-value constants ────────────────────────────────────────
 
 pub const NIL_BITS: u64 = 0x0000_0000_0000_0007; // tag 111, payload 0
@@ -78,24 +73,6 @@ impl BlissVal {
         BlissVal(((idx as u64) << 3) | TAG_SYMBOL)
     }
 
-    /// Encode a CLOS instance handle id as a `SPECIAL`-tagged immediate.
-    ///
-    /// CLOS instances are registry-backed (their slots live in a side table
-    /// keyed by this value) but the value itself is an immediate. Encoding it
-    /// under `TAG_SPECIAL` with [`CLOS_HANDLE_BIT`] set keeps it OUT of the
-    /// fixnum tag, so `is_fixnum()` never matches an instance — otherwise a
-    /// plain integer equal to an instance id would collide with it in the
-    /// registry (e.g. `(typep 100004 'point)` wrongly returning true) and
-    /// immediate-type checks (`type-of`, printing) would treat the instance as
-    /// a number. See issue bliss-2ke.
-    ///
-    /// `id` is a small monotonic counter, always non-negative and well within
-    /// 58 bits, so it never reaches [`CLOS_HANDLE_BIT`].
-    #[inline(always)]
-    pub fn from_clos_handle(id: i64) -> Self {
-        debug_assert!(id >= 0 && (id as u64) < (1 << 58));
-        BlissVal(((id as u64) << 3) | TAG_SPECIAL | CLOS_HANDLE_BIT)
-    }
 
     /// Create a cons-tagged pointer.
     ///
@@ -173,23 +150,6 @@ impl BlissVal {
         self.tag() == TAG_FUNCTION
     }
 
-    /// True if this value is a CLOS instance handle (SPECIAL tag with
-    /// [`CLOS_HANDLE_BIT`] set). Builtin specials (NIL/T/UNBOUND/MISSING/EOF)
-    /// never set the bit, so they are excluded.
-    #[inline(always)]
-    pub fn is_clos_handle(self) -> bool {
-        self.tag() == TAG_SPECIAL && (self.0 & CLOS_HANDLE_BIT) != 0
-    }
-
-    /// Extract the id from a CLOS instance handle. Panics if not a handle.
-    pub fn as_clos_handle_id(self) -> i64 {
-        assert!(
-            self.is_clos_handle(),
-            "as_clos_handle_id called on non-handle value"
-        );
-        ((self.0 & !CLOS_HANDLE_BIT) >> 3) as i64
-    }
-
     /// True if this value is NIL.
     #[inline(always)]
     pub fn is_nil(self) -> bool {
@@ -220,6 +180,25 @@ impl BlissVal {
             let tid = header.type_id();
             tid == crate::object::type_id::SIMPLE_BASE_STRING
                 || tid == crate::object::type_id::SIMPLE_CHARACTER_STRING
+        }
+    }
+
+    /// True if this value is a CLOS standard-object instance (a heap object
+    /// whose type_id is `STANDARD_OBJECT`). CLOS instances are heap objects
+    /// laid out as `[ObjectHeader | wrapper ptr | inline slots]`.
+    ///
+    /// # Safety note
+    /// Dereferences the heap pointer to read the `ObjectHeader`; safe only when
+    /// the pointer is valid and live. Returns `false` for non-heap-object tags.
+    pub fn is_standard_object(self) -> bool {
+        if self.tag() != TAG_HEAP_OBJECT {
+            return false;
+        }
+        // SAFETY: caller guarantees the heap pointer is valid.
+        unsafe {
+            let ptr = self.as_ptr();
+            let header = *(ptr as *const crate::object::ObjectHeader);
+            header.type_id() == crate::object::type_id::STANDARD_OBJECT
         }
     }
 }

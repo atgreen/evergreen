@@ -63,8 +63,8 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
     if v == T {
         return "T".into();
     }
-    // CLOS instances are represented as tagged fixnum ids, so they must be
-    // detected before the plain-fixnum branch. A condition prints as its report
+    // CLOS instances are heap objects; detect them via the liveness registry
+    // before the generic heap-object branch. A condition prints as its report
     // message (~A/princ semantics); any other instance prints as #<CLASS-NAME>.
     if crate::clos::is_instance(v) {
         return format_instance(v);

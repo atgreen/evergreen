@@ -4,10 +4,12 @@
 //! and MOP. See spec §5.3.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use bliss_rt::error::BlissError;
-use bliss_rt::value::{BlissVal, NIL, T};
+use bliss_rt::object::{ObjectHeader, type_id};
+use bliss_rt::value::{BlissVal, NIL, T, UNBOUND};
 
 // ── Method combination ─────────────────────────────────────────────
 
@@ -55,13 +57,192 @@ struct ClassMeta {
     name: BlissVal,
     direct_supers: Vec<BlissVal>,
     direct_subs: Vec<BlissVal>,
+    /// Direct :instance-allocated slot names (as passed to `define_class`).
     slots: Vec<BlissVal>,
+    /// Current wrapper for this class, or null until finalized. Built-in
+    /// (never-instantiated) classes keep a null wrapper.
+    wrapper: *mut ClassWrapper,
 }
 
-#[derive(Clone)]
-struct InstanceData {
+// ── Standard-object instances (heap objects) ───────────────────────
+//
+// A CLOS instance is a real heap object (tag 010, type_id STANDARD_OBJECT):
+//
+//   offset 0   ObjectHeader (8 bytes)
+//   offset 8   wrapper pointer (*mut ClassWrapper)
+//   offset 16  slot[0..N-1]  inline BlissVal cells (:instance allocation only)
+//
+// Size = 16 + 8N bytes. Allocated via `std::alloc::alloc_zeroed` and leaked,
+// like the other tree-walker heap objects (strings/ratios/vectors). See
+// spec §5.3.4 (D5.09) and issue bliss-xyo.
+
+/// Global monotonic class-stamp counter (§5.3.4). Copied into each wrapper.
+static CLASS_STAMP: AtomicU64 = AtomicU64::new(1);
+
+fn next_stamp() -> u64 {
+    CLASS_STAMP.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Wrapper state values.
+const WRAPPER_CURRENT: u8 = 0;
+const WRAPPER_OBSOLETE: u8 = 1;
+
+/// Frozen effective-slot layout for a class, owned by a `ClassWrapper`. Leaked
+/// at finalize time so instances created against it keep reading their own
+/// layout even after the class is redefined (which mints a fresh wrapper).
+struct SlotLayout {
+    /// index → slot name.
+    order: Vec<BlissVal>,
+    /// slot name → index into the inline slot vector.
+    index: HashMap<BlissVal, usize>,
+}
+
+/// Lightweight, immutable per-class descriptor (D5.04) pointed to from each
+/// instance's offset-8 word. A new wrapper is allocated on class redefinition
+/// and the old one's `state` set to obsolete, enabling the stamp-check fast
+/// path without touching the class metaobject.
+#[repr(C)]
+struct ClassWrapper {
+    stamp: u64,
+    state: AtomicU8,
     class: BlissVal,
-    slots: HashMap<BlissVal, Option<BlissVal>>,
+    slot_count: u32,
+    layout: *const SlotLayout,
+}
+
+/// Follow the forwarding chain to the live object. When `change-class` needs a
+/// larger allocation than the original (slot-count growth), the old object is
+/// turned into a forwarding stub: its header `FORWARDED` gc-bit is set and a
+/// `BlissVal` pointer to the replacement is stored at offset 8. Every accessor
+/// chases this so pointer identity is preserved (spec R5.69). Fresh instances
+/// are never forwarded, so the common path returns immediately.
+///
+/// # Safety
+/// `inst` must be a live STANDARD_OBJECT heap value.
+#[inline]
+unsafe fn resolve_forwarding(inst: BlissVal) -> BlissVal {
+    unsafe {
+        let mut cur = inst;
+        loop {
+            let hdr = *(cur.as_ptr() as *const ObjectHeader);
+            if hdr.gc_bits() & (1 << bliss_rt::object::gc_bit::FORWARDED) == 0 {
+                return cur;
+            }
+            cur = *(cur.as_ptr().add(8) as *const BlissVal);
+        }
+    }
+}
+
+/// Mark `old` as forwarded to `new` (used by `change-class` growth).
+///
+/// # Safety
+/// Both must be live STANDARD_OBJECT heap values; `old` must not already be
+/// forwarded.
+#[inline]
+unsafe fn forward_instance(old: BlissVal, new: BlissVal) {
+    unsafe {
+        let hdr_ptr = old.as_ptr() as *mut ObjectHeader;
+        let mut hdr = *hdr_ptr;
+        hdr.set_gc_bits(hdr.gc_bits() | (1 << bliss_rt::object::gc_bit::FORWARDED));
+        *hdr_ptr = hdr;
+        *(old.as_ptr().add(8) as *mut BlissVal) = new;
+    }
+}
+
+/// Lazily migrate an instance whose wrapper is obsolete (its class was
+/// redefined) to the class's current layout, exactly once (R5.83/R5.84).
+/// Surviving slots are copied by name; slots removed by the redefinition are
+/// dropped; slots added are left UNBOUND. The old object is forwarded to the
+/// new one, so subsequent accesses see the current layout and this runs once.
+///
+/// # Safety
+/// `inst` must be a live STANDARD_OBJECT heap value.
+unsafe fn update_if_obsolete(inst: BlissVal) {
+    unsafe {
+        let live = resolve_forwarding(inst);
+        let w = *(live.as_ptr().add(8) as *const *mut ClassWrapper);
+        if w.is_null() || (*w).state.load(Ordering::Acquire) != WRAPPER_OBSOLETE {
+            return;
+        }
+        let class = (*w).class;
+        // Snapshot surviving (bound) slots from the old frozen layout.
+        let mut snap: Vec<(BlissVal, BlissVal)> = Vec::new();
+        if !(*w).layout.is_null() {
+            let ol = &*(*w).layout;
+            for (i, &name) in ol.order.iter().enumerate() {
+                let v = *((live.as_ptr().add(16) as *const BlissVal).add(i));
+                if v != UNBOUND {
+                    snap.push((name, v));
+                }
+            }
+        }
+        // Allocate a fresh instance in the class's current layout and copy
+        // surviving slots by name, then forward the old object to it.
+        let new_inst = match allocate_instance(class) {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+        let nw = *(new_inst.as_ptr().add(8) as *const *mut ClassWrapper);
+        if !nw.is_null() && !(*nw).layout.is_null() {
+            let nl = &*(*nw).layout;
+            for (name, val) in &snap {
+                if let Some(&idx) = nl.index.get(name) {
+                    *((new_inst.as_ptr().add(16) as *mut BlissVal).add(idx)) = *val;
+                }
+            }
+        }
+        forward_instance(live, new_inst);
+    }
+}
+
+/// Read the wrapper pointer from an instance (offset 8), chasing forwarding.
+///
+/// # Safety
+/// `inst` must be a live STANDARD_OBJECT heap value.
+#[inline]
+unsafe fn instance_wrapper(inst: BlissVal) -> *mut ClassWrapper {
+    unsafe {
+        let live = resolve_forwarding(inst);
+        *(live.as_ptr().add(8) as *const *mut ClassWrapper)
+    }
+}
+
+/// Write the wrapper pointer into an instance (offset 8), chasing forwarding.
+///
+/// # Safety
+/// `inst` must be a live STANDARD_OBJECT heap value.
+#[inline]
+unsafe fn set_instance_wrapper(inst: BlissVal, w: *mut ClassWrapper) {
+    unsafe {
+        let live = resolve_forwarding(inst);
+        *(live.as_ptr().add(8) as *mut *mut ClassWrapper) = w;
+    }
+}
+
+/// Pointer to slot cell `idx` (offset 16 + 8*idx), chasing forwarding.
+///
+/// # Safety
+/// `inst` must be a live STANDARD_OBJECT with at least `idx+1` slots.
+#[inline]
+unsafe fn slot_cell(inst: BlissVal, idx: usize) -> *mut BlissVal {
+    unsafe {
+        let live = resolve_forwarding(inst);
+        (live.as_ptr().add(16) as *mut BlissVal).add(idx)
+    }
+}
+
+/// Resolve a slot name to its inline index via the instance's frozen layout.
+///
+/// # Safety
+/// `inst` must be a live STANDARD_OBJECT heap value.
+unsafe fn instance_slot_index(inst: BlissVal, slot_name: BlissVal) -> Option<usize> {
+    unsafe {
+        let w = instance_wrapper(inst);
+        if w.is_null() || (*w).layout.is_null() {
+            return None;
+        }
+        (*(*w).layout).index.get(&slot_name).copied()
+    }
 }
 
 /// Qualifier for a method (for method combination).
@@ -111,8 +292,6 @@ struct ClosState {
     class_registry: HashMap<BlissVal, BlissVal>,
     /// class value → metadata
     class_meta: HashMap<BlissVal, ClassMeta>,
-    /// instance id → instance data
-    instances: HashMap<BlissVal, InstanceData>,
     /// gf id → generic function data
     generic_functions: HashMap<BlissVal, GFData>,
     /// method id → method metadata (specializers, qualifier)
@@ -121,8 +300,17 @@ struct ClosState {
     effective_methods: HashMap<BlissVal, EffectiveMethod>,
     /// effective method key → short-form combination descriptor
     short_form_methods: HashMap<BlissVal, ShortFormMethod>,
-    next_instance_id: i64,
+    /// Counter for internal effective-method HashMap keys (not Lisp-visible).
+    next_em_key: i64,
     next_gf_id: i64,
+    /// Pointers of live standard-object instances. Used to discriminate
+    /// instances WITHOUT dereferencing an arbitrary value: the tree-walker's
+    /// arena can present dangling or garbage heap-tagged `BlissVal`s (e.g. a
+    /// freed string, or a raw sentinel) to `typep`/`class-of`, and reading a
+    /// type_id from such a pointer would segfault. Instances are leaked (never
+    /// freed), so this set never holds a stale entry. Slot *data* is inline in
+    /// the heap object; this is only a liveness registry. See bliss-xyo.
+    live_instances: HashSet<BlissVal>,
     // Built-in class values
     fixnum_class: BlissVal,
     character_class: BlissVal,
@@ -144,13 +332,13 @@ impl ClosState {
         Self {
             class_registry: HashMap::new(),
             class_meta: HashMap::new(),
-            instances: HashMap::new(),
             generic_functions: HashMap::new(),
             method_meta: HashMap::new(),
             effective_methods: HashMap::new(),
             short_form_methods: HashMap::new(),
-            next_instance_id: 100_000,
+            next_em_key: 500_000,
             next_gf_id: 200_000,
+            live_instances: HashSet::new(),
             fixnum_class: NIL,
             character_class: NIL,
             symbol_class: NIL,
@@ -166,13 +354,13 @@ impl ClosState {
         }
     }
 
-    fn alloc_instance_id(&mut self) -> BlissVal {
-        let id = self.next_instance_id;
-        self.next_instance_id += 1;
-        // SPECIAL-tagged handle, not a fixnum: keeps instances off the fixnum
-        // tag so a plain integer can never collide with an instance id in the
-        // registry, and immediate-type checks don't misfire. See bliss-2ke.
-        BlissVal::from_clos_handle(id)
+    /// Mint a fresh internal key for the effective-method HashMaps. These keys
+    /// are never exposed to Lisp (only used to index `effective_methods` /
+    /// `short_form_methods`), so a plain fixnum in a private high range is fine.
+    fn alloc_em_key(&mut self) -> BlissVal {
+        let id = self.next_em_key;
+        self.next_em_key += 1;
+        BlissVal::from_fixnum(id)
     }
 
     fn alloc_gf_id(&mut self) -> BlissVal {
@@ -255,6 +443,7 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
                 direct_supers: vec![],
                 direct_subs: vec![],
                 slots: vec![],
+                wrapper: std::ptr::null_mut(),
             },
         );
 
@@ -267,6 +456,7 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
                 direct_supers: vec![t_cls],
                 direct_subs: vec![],
                 slots: vec![],
+                wrapper: std::ptr::null_mut(),
             },
         );
 
@@ -290,6 +480,7 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
                     direct_supers: vec![std_obj],
                     direct_subs: vec![],
                     slots: vec![],
+                    wrapper: std::ptr::null_mut(),
                 },
             );
         }
@@ -342,6 +533,7 @@ pub fn set_find_class(name: BlissVal, class: BlissVal) -> Result<(), BlissError>
                     direct_supers: default_supers,
                     direct_subs: vec![],
                     slots: vec![],
+                    wrapper: std::ptr::null_mut(),
                 },
             );
         } else {
@@ -391,6 +583,14 @@ pub fn define_class(
             }
         }
 
+        // Preserve any existing wrapper pointer so we can obsolete it on
+        // redefinition (below); the layout is recomputed fresh regardless.
+        let prev_wrapper = st
+            .class_meta
+            .get(&class)
+            .map(|m| m.wrapper)
+            .unwrap_or(std::ptr::null_mut());
+
         st.class_meta.insert(
             class,
             ClassMeta {
@@ -398,25 +598,77 @@ pub fn define_class(
                 direct_supers: supers,
                 direct_subs: vec![],
                 slots: slots.to_vec(),
+                wrapper: std::ptr::null_mut(),
             },
         );
+
+        // Compute the effective slot layout and mint a fresh wrapper. On
+        // redefinition, mark the previous wrapper obsolete so instances created
+        // against it take the slow path on next access (they keep working
+        // against their frozen layout). See bliss-xyo / spec §5.3.4.
+        finalize_class_layout(st, class);
+        if !prev_wrapper.is_null() {
+            unsafe {
+                (*prev_wrapper)
+                    .state
+                    .store(WRAPPER_OBSOLETE, Ordering::Release);
+            }
+        }
 
         Ok(())
     })
 }
 
-/// Return true if `object` is a CLOS instance allocated in the instance store
-/// (as opposed to an immediate value such as a fixnum, symbol, or cons).
+/// Compute a class's effective :instance-allocated slot layout (walking the
+/// CPL, most-specific-first, first occurrence wins) and install a fresh
+/// `ClassWrapper` referencing a leaked, frozen `SlotLayout`. Built-in classes
+/// (never instantiated) are skipped and keep a null wrapper.
+fn finalize_class_layout(st: &mut ClosState, class: BlissVal) {
+    if is_builtin_class(st, class) {
+        return;
+    }
+    let cpl = c3_linearize(st, class).unwrap_or_else(|_| vec![class]);
+    let mut order: Vec<BlissVal> = Vec::new();
+    let mut index: HashMap<BlissVal, usize> = HashMap::new();
+    for c in &cpl {
+        if let Some(meta) = st.class_meta.get(c) {
+            for &slot_name in &meta.slots {
+                if let std::collections::hash_map::Entry::Vacant(e) = index.entry(slot_name) {
+                    e.insert(order.len());
+                    order.push(slot_name);
+                }
+            }
+        }
+    }
+    let slot_count = order.len() as u32;
+    let layout: *const SlotLayout = Box::into_raw(Box::new(SlotLayout { order, index }));
+    let wrapper: *mut ClassWrapper = Box::into_raw(Box::new(ClassWrapper {
+        stamp: next_stamp(),
+        state: AtomicU8::new(WRAPPER_CURRENT),
+        class,
+        slot_count,
+        layout,
+    }));
+    if let Some(meta) = st.class_meta.get_mut(&class) {
+        meta.wrapper = wrapper;
+    }
+}
+
+/// Return true if `object` is a live CLOS standard-object instance. Uses the
+/// liveness registry so it is safe to call on ANY value, including dangling or
+/// garbage heap-tagged values that must not be dereferenced (see
+/// `ClosState.live_instances`).
 pub fn is_instance(object: BlissVal) -> bool {
-    with_state(|st| st.instances.contains_key(&object))
+    with_state(|st| st.live_instances.contains(&object))
 }
 
 /// Get the class of an object.
 pub fn class_of(object: BlissVal) -> BlissVal {
     with_state(|st| {
-        // Check instances first
-        if let Some(inst) = st.instances.get(&object) {
-            return inst.class;
+        // Live instances carry their class via the offset-8 wrapper. Gate the
+        // deref on the liveness set so a garbage heap value can't crash us.
+        if st.live_instances.contains(&object) {
+            return unsafe { (*instance_wrapper(object)).class };
         }
         if object == NIL {
             return st.null_class;
@@ -602,18 +854,58 @@ fn c3_linearize(st: &ClosState, class: BlissVal) -> Result<Vec<BlissVal>, BlissE
 // ── Instance protocol ──────────────────────────────────────────────
 
 /// Allocate an instance of a class (ALLOCATE-INSTANCE).
+///
+/// Allocates a heap object `[ObjectHeader | wrapper ptr | inline slots]` and
+/// initialises every slot cell to `UNBOUND` (a zeroed cell would read as the
+/// bound value `0`). The object is leaked, matching the other tree-walker heap
+/// objects. See spec §5.3.4 / issue bliss-xyo.
 pub fn allocate_instance(class: BlissVal) -> Result<BlissVal, BlissError> {
-    with_state_mut(|st| {
-        let id = st.alloc_instance_id();
-        st.instances.insert(
-            id,
-            InstanceData {
-                class,
-                slots: HashMap::new(),
-            },
-        );
-        Ok(id)
-    })
+    // Fetch the wrapper + slot count as Copy values, finalising the layout if
+    // the class has none yet, then allocate outside the state borrow.
+    let (wrapper, slot_count) = with_state_mut(|st| {
+        let mut w = st
+            .class_meta
+            .get(&class)
+            .map(|m| m.wrapper)
+            .unwrap_or(std::ptr::null_mut());
+        if w.is_null() {
+            finalize_class_layout(st, class);
+            w = st
+                .class_meta
+                .get(&class)
+                .map(|m| m.wrapper)
+                .unwrap_or(std::ptr::null_mut());
+        }
+        let n = if w.is_null() {
+            0
+        } else {
+            unsafe { (*w).slot_count as usize }
+        };
+        (w, n)
+    });
+    if wrapper.is_null() {
+        return Err(BlissError::Internal(
+            "cannot allocate an instance of a class with no slot layout".into(),
+        ));
+    }
+    let size = 16 + 8 * slot_count;
+    debug_assert!(size / 8 <= 0xFFFE, "instance too large for header size field");
+    unsafe {
+        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+        let ptr = std::alloc::alloc_zeroed(layout);
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        *(ptr as *mut ObjectHeader) =
+            ObjectHeader::new(type_id::STANDARD_OBJECT, (size / 8) as u16);
+        let inst = BlissVal::from_heap_ptr(ptr);
+        set_instance_wrapper(inst, wrapper);
+        for i in 0..slot_count {
+            *slot_cell(inst, i) = UNBOUND;
+        }
+        with_state_mut(|st| st.live_instances.insert(inst));
+        Ok(inst)
+    }
 }
 
 /// Make an instance (MAKE-INSTANCE). R5.12.
@@ -679,30 +971,32 @@ pub fn shared_initialize_with_list(
     eligible: Option<&[BlissVal]>,
     initargs: &[BlissVal],
 ) -> Result<(), BlissError> {
-    with_state_mut(|st| {
-        let inst = st
-            .instances
-            .get_mut(&instance)
-            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+    if !is_instance(instance) {
+        return Err(BlissError::Internal("not an instance".into()));
+    }
+    let mut i = 0;
+    while i + 1 < initargs.len() {
+        let slot_name = initargs[i];
+        let value = initargs[i + 1];
 
-        let mut i = 0;
-        while i + 1 < initargs.len() {
-            let slot_name = initargs[i];
-            let value = initargs[i + 1];
+        let is_eligible = match eligible {
+            None => true, // T: all slots eligible
+            Some(names) => names.contains(&slot_name),
+        };
 
-            let is_eligible = match eligible {
-                None => true, // T: all slots eligible
-                Some(names) => names.contains(&slot_name),
-            };
-
-            if is_eligible {
-                inst.slots.insert(slot_name, Some(value));
+        // Initargs naming a slot outside the layout are ignored (best-effort
+        // initialization; only declared :instance slots have storage).
+        if is_eligible {
+            unsafe {
+                if let Some(idx) = instance_slot_index(instance, slot_name) {
+                    *slot_cell(instance, idx) = value;
+                }
             }
-
-            i += 2;
         }
-        Ok(())
-    })
+
+        i += 2;
+    }
+    Ok(())
 }
 
 /// Reinitialize an instance (REINITIALIZE-INSTANCE). R5.81.
@@ -717,18 +1011,27 @@ pub fn reinitialize_instance(instance: BlissVal, initargs: &[BlissVal]) -> Resul
 
 // ── Slot access ────────────────────────────────────────────────────
 
-/// Get a slot value (SLOT-VALUE).
+/// Get a slot value (SLOT-VALUE). An unbound slot signals `UnboundVariable`
+/// (the CLI turns this into `unbound-slot`); a name outside the class layout is
+/// a `slot-missing`-style error.
 pub fn slot_value(instance: BlissVal, slot_name: BlissVal) -> Result<BlissVal, BlissError> {
-    with_state(|st| {
-        let inst = st
-            .instances
-            .get(&instance)
-            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-        match inst.slots.get(&slot_name) {
-            Some(Some(val)) => Ok(*val),
-            _ => Err(BlissError::UnboundVariable(slot_name)),
+    if !is_instance(instance) {
+        return Err(BlissError::Internal("not an instance".into()));
+    }
+    unsafe {
+        update_if_obsolete(instance);
+        match instance_slot_index(instance, slot_name) {
+            Some(idx) => {
+                let v = *slot_cell(instance, idx);
+                if v == UNBOUND {
+                    Err(BlissError::UnboundVariable(slot_name))
+                } else {
+                    Ok(v)
+                }
+            }
+            None => Err(BlissError::Internal("slot not present in class layout".into())),
         }
-    })
+    }
 }
 
 /// Set a slot value ((SETF SLOT-VALUE)).
@@ -737,37 +1040,48 @@ pub fn set_slot_value(
     slot_name: BlissVal,
     new_value: BlissVal,
 ) -> Result<(), BlissError> {
-    with_state_mut(|st| {
-        let inst = st
-            .instances
-            .get_mut(&instance)
-            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-        inst.slots.insert(slot_name, Some(new_value));
-        Ok(())
-    })
+    if !is_instance(instance) {
+        return Err(BlissError::Internal("not an instance".into()));
+    }
+    unsafe {
+        update_if_obsolete(instance);
+        match instance_slot_index(instance, slot_name) {
+            Some(idx) => {
+                *slot_cell(instance, idx) = new_value;
+                Ok(())
+            }
+            None => Err(BlissError::Internal("slot not present in class layout".into())),
+        }
+    }
 }
 
-/// Check if a slot is bound (SLOT-BOUNDP).
+/// Check if a slot is bound (SLOT-BOUNDP). A name outside the layout is treated
+/// as unbound (returns `false`) rather than an error.
 pub fn slot_boundp(instance: BlissVal, slot_name: BlissVal) -> Result<bool, BlissError> {
-    with_state(|st| {
-        let inst = st
-            .instances
-            .get(&instance)
-            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-        Ok(matches!(inst.slots.get(&slot_name), Some(Some(_))))
-    })
+    if !is_instance(instance) {
+        return Err(BlissError::Internal("not an instance".into()));
+    }
+    unsafe {
+        update_if_obsolete(instance);
+        match instance_slot_index(instance, slot_name) {
+            Some(idx) => Ok(*slot_cell(instance, idx) != UNBOUND),
+            None => Ok(false),
+        }
+    }
 }
 
 /// Make a slot unbound (SLOT-MAKUNBOUND).
 pub fn slot_makunbound(instance: BlissVal, slot_name: BlissVal) -> Result<(), BlissError> {
-    with_state_mut(|st| {
-        let inst = st
-            .instances
-            .get_mut(&instance)
-            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
-        inst.slots.insert(slot_name, None);
-        Ok(())
-    })
+    if !is_instance(instance) {
+        return Err(BlissError::Internal("not an instance".into()));
+    }
+    unsafe {
+        update_if_obsolete(instance);
+        if let Some(idx) = instance_slot_index(instance, slot_name) {
+            *slot_cell(instance, idx) = UNBOUND;
+        }
+    }
+    Ok(())
 }
 
 // ── Generic function dispatch ──────────────────────────────────────
@@ -899,8 +1213,8 @@ pub fn compute_applicable_methods(generic_function: BlissVal, args: &[BlissVal])
             .iter()
             .map(|a| {
                 // Inline class_of logic (we already hold the borrow)
-                if let Some(inst) = st.instances.get(a) {
-                    inst.class
+                if st.live_instances.contains(a) {
+                    unsafe { (*instance_wrapper(*a)).class }
                 } else if *a == NIL {
                     st.null_class
                 } else if *a == T {
@@ -1036,7 +1350,7 @@ pub fn compute_effective_method(
 
             // Store the effective method chain for later invocation
             let em_key = with_state_mut(|st| {
-                let key = st.alloc_instance_id();
+                let key = st.alloc_em_key();
                 st.effective_methods.insert(
                     key,
                     EffectiveMethod {
@@ -1077,7 +1391,7 @@ pub fn compute_effective_method(
 
             // Store the short-form effective method for later invocation
             let em_key = with_state_mut(|st| {
-                let key = st.alloc_instance_id();
+                let key = st.alloc_em_key();
                 st.short_form_methods.insert(
                     key,
                     ShortFormMethod {
@@ -1134,124 +1448,88 @@ pub fn get_short_form_method(key: BlissVal) -> Option<(MethodCombinationType, Ve
 /// 5. Call update-instance-for-different-class with the old snapshot
 ///    and the updated instance.
 pub fn change_class(instance: BlissVal, new_class: BlissVal) -> Result<(), BlissError> {
-    with_state_mut(|st| {
-        let inst = st
-            .instances
-            .get(&instance)
-            .ok_or_else(|| BlissError::Internal("not an instance".into()))?;
+    if !is_instance(instance) {
+        return Err(BlissError::Internal("not an instance".into()));
+    }
 
-        // Step 1: Snapshot old instance state
-        let old_class = inst.class;
-        let old_slots = inst.slots.clone();
+    // Step 1: snapshot the old instance's bound slots by name, and its inline
+    // capacity (the number of cells the allocation was sized for).
+    let (old_capacity, snapshot): (usize, Vec<(BlissVal, BlissVal)>) = unsafe {
+        let ow = instance_wrapper(instance);
+        let cap = if ow.is_null() { 0 } else { (*ow).slot_count as usize };
+        let mut snap = Vec::new();
+        if !ow.is_null() && !(*ow).layout.is_null() {
+            let ol = &*(*ow).layout;
+            for (i, &name) in ol.order.iter().enumerate() {
+                let v = *slot_cell(instance, i);
+                if v != UNBOUND {
+                    snap.push((name, v));
+                }
+            }
+        }
+        (cap, snap)
+    };
 
-        // Step 2: Determine shared slot names (slots defined in both old and new class)
-        let old_class_slots: Vec<BlissVal> = st
-            .class_meta
-            .get(&old_class)
-            .map(|m| m.slots.clone())
-            .unwrap_or_default();
-        let new_class_slots: Vec<BlissVal> = st
+    // Step 2: fetch the new class's wrapper + slot count (finalize if needed).
+    let (new_wrapper, new_count) = with_state_mut(|st| {
+        let mut w = st
             .class_meta
             .get(&new_class)
-            .map(|m| m.slots.clone())
-            .unwrap_or_default();
-
-        // Step 3: Build new slot map — copy shared slot values, leave new slots unbound
-        let mut new_slots = HashMap::new();
-
-        // If both classes have explicit slots defined, use those to determine sharing.
-        // Otherwise, carry over all old slots that have values (pragmatic approach
-        // matching real CL implementations when slot metadata isn't fully available).
-        if !old_class_slots.is_empty() || !new_class_slots.is_empty() {
-            for slot_name in &new_class_slots {
-                if old_class_slots.contains(slot_name) {
-                    // Shared slot: copy value from old instance
-                    if let Some(val) = old_slots.get(slot_name) {
-                        new_slots.insert(*slot_name, *val);
-                    }
-                }
-                // New slots that weren't in old class: left unbound (not inserted)
-            }
-            // Also carry over any slot values that were set but not in the class's
-            // declared slot list (dynamic slots), if they appear in new class slots
-            for (slot_name, val) in &old_slots {
-                if new_class_slots.contains(slot_name) || new_class_slots.is_empty() {
-                    new_slots.entry(*slot_name).or_insert_with(|| *val);
-                }
-            }
-        } else {
-            // Neither class has explicit slot definitions: carry over all old slots
-            new_slots = old_slots.clone();
+            .map(|m| m.wrapper)
+            .unwrap_or(std::ptr::null_mut());
+        if w.is_null() {
+            finalize_class_layout(st, new_class);
+            w = st
+                .class_meta
+                .get(&new_class)
+                .map(|m| m.wrapper)
+                .unwrap_or(std::ptr::null_mut());
         }
-
-        // Step 4: Swap wrapper — update the instance's class and slots
-        let inst = st.instances.get_mut(&instance).unwrap();
-        inst.class = new_class;
-        inst.slots = new_slots;
-
-        // Step 5: Call update-instance-for-different-class
-        // In a full implementation this would be a generic function call.
-        // We call our internal version which handles slot initialization
-        // for added slots.
-        update_instance_for_different_class_internal(
-            st, instance, old_class, &old_slots, new_class,
-        );
-
-        Ok(())
-    })
-}
-
-/// Internal implementation of update-instance-for-different-class.
-///
-/// Per ANSI CL, this is called after the instance's class has been changed.
-/// It receives the old instance state (as a snapshot) and the updated instance.
-/// The default method calls shared-initialize on the instance with the list
-/// of newly added slots (so they can get initform defaults).
-fn update_instance_for_different_class_internal(
-    st: &mut ClosState,
-    instance: BlissVal,
-    old_class: BlissVal,
-    _old_slots: &HashMap<BlissVal, Option<BlissVal>>,
-    new_class: BlissVal,
-) {
-    // Per ANSI CL / spec R5.82: the default method calls shared-initialize
-    // on the instance with the list of added slots (slots present in the new
-    // class but absent from the old class) so they can receive initform defaults.
-    let old_class_slots: Vec<BlissVal> = st
-        .class_meta
-        .get(&old_class)
-        .map(|m| m.slots.clone())
-        .unwrap_or_default();
-    let new_class_slots: Vec<BlissVal> = st
-        .class_meta
-        .get(&new_class)
-        .map(|m| m.slots.clone())
-        .unwrap_or_default();
-
-    // Compute added slots: slots in new class but not in old class
-    let added_slots: Vec<BlissVal> = new_class_slots
-        .iter()
-        .filter(|s| !old_class_slots.contains(s))
-        .copied()
-        .collect();
-
-    // Call shared-initialize with the added slot names as the eligible set.
-    // No initargs are passed (empty slice) — only initforms would apply,
-    // but this ensures the protocol is followed correctly.
-    if !added_slots.is_empty() {
-        // We need to drop the mutable borrow on ClosState before calling
-        // shared_initialize_with_list (which will re-acquire the lock).
-        // Since we're already inside with_state_mut, we perform the
-        // equivalent operation inline.
-        let inst = match st.instances.get_mut(&instance) {
-            Some(inst) => inst,
-            None => return,
+        let n = if w.is_null() {
+            0
+        } else {
+            unsafe { (*w).slot_count as usize }
         };
-        for slot_name in &added_slots {
-            // Ensure the slot exists in the instance (unbound if not already set).
-            // This makes added slots visible even if they have no initform.
-            inst.slots.entry(*slot_name).or_insert(None);
+        (w, n)
+    });
+    if new_wrapper.is_null() {
+        return Err(BlissError::Internal(
+            "cannot change to a class with no slot layout".into(),
+        ));
+    }
+
+    if new_count <= old_capacity {
+        // Step 3a (fits): swap the wrapper in place, clear the new layout's
+        // cells to UNBOUND, then copy shared slots by name (R5.82). Added slots
+        // stay UNBOUND.
+        unsafe {
+            set_instance_wrapper(instance, new_wrapper);
+            for i in 0..new_count {
+                *slot_cell(instance, i) = UNBOUND;
+            }
+            let nl = &*(*new_wrapper).layout;
+            for (name, val) in &snapshot {
+                if let Some(&idx) = nl.index.get(name) {
+                    *slot_cell(instance, idx) = *val;
+                }
+            }
+        }
+    } else {
+        // Step 3b (growth): the new layout needs more inline cells than the old
+        // allocation holds. Allocate a fresh larger instance, copy shared slots
+        // by name, then forward the old object to it so pointer identity is
+        // preserved (spec R5.69 forwarding word).
+        let new_inst = allocate_instance(new_class)?;
+        unsafe {
+            let nl = &*(*new_wrapper).layout;
+            for (name, val) in &snapshot {
+                if let Some(&idx) = nl.index.get(name) {
+                    *slot_cell(new_inst, idx) = *val;
+                }
+            }
+            forward_instance(resolve_forwarding(instance), new_inst);
         }
     }
+    Ok(())
 }
 type EffectiveMethodParts = (Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>, Vec<BlissVal>);

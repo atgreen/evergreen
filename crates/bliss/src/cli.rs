@@ -9109,9 +9109,12 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         .iter()
         .map(|super_name| resolve_class_metaobject(env, *super_name))
         .collect();
+    // Only :instance-allocated slots get an inline cell in the heap-object
+    // instance layout; :class-allocated slots live in ClassDef.class_slot_values.
     let slot_names: Vec<BlissVal> = env.classes[&name]
         .slots
         .iter()
+        .filter(|slot| slot.allocation == SlotAllocation::Instance)
         .map(|slot| resolve_sym(&slot.name).unwrap_or(NIL))
         .collect();
     bliss_stdlib::define_class(name_form, name_form, &direct_supers?, &slot_names)?;
