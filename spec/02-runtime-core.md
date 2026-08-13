@@ -341,6 +341,36 @@ warranted only if interpreter throughput becomes a hard requirement, at which
 point it is a localized swap because the frame format (D2.03), adapters (D2.04),
 and maps are already defined here.
 
+**Note — two axes decide whether the interpreter shares the compiled stack.**
+Whether interpreted activations land on the one control stack depends on two
+independent properties: (1) *recursive* (a tree-walker: one host frame per
+subform) vs. *explicit-stack* (a bytecode loop that pushes/pops its own frames),
+and (2) *host-language* (Rust) vs. *compiled to native code*. A true single stack
+requires **explicit-stack _or_ compiled** — the only combination that fails is
+*recursive and host-language*, which is exactly today's tree-walker (its Rust
+recursion puts CL activations on the Rust stack, a separate stack from
+`BlissStack` — the two-stack condition bliss-nmq removes).
+
+- The **host-loop baseline above qualifies because it is a _bytecode_ loop**:
+  `CALL`/`RETURN` push and pop D2.03 frames on the `BlissStack`, so CL
+  activations live there and only the single dispatch-loop frame (plus transient
+  helpers) sits on the Rust stack. It is host-language but not recursive.
+- **SBCL reaches the same single control stack from the other axis.** Its
+  `sb-fasteval` interpreter is a *recursive* code-walker, but it is **compiled
+  native Lisp** — interpreted functions are `funcallable-structure` objects
+  (`sbcl/src/interpreter/function.lisp`), so their activations are ordinary
+  compiled frames on the one per-thread control stack
+  (`sbcl/src/runtime/thread.h`, `C_STACK_IS_CONTROL_STACK`). Notably SBCL still
+  keeps interpreter **lexical environments on the heap** (a parent-linked
+  `basic-env` chain — `sbcl/src/interpreter/basic-env.lisp`: "never
+  stack-allocates any ENV"). So **call-frame unification and locals-in-frame are
+  separable**: SBCL unifies the control stack while heap-allocating bindings,
+  whereas D2.03's in-frame locals are a bytecode-VM / compiled-code property that
+  a lowering pass makes available. Bliss's current `EnvFrame` chain
+  (`Rc<RefCell<EnvFrame>>`) matches SBCL's heap-env model; moving *call frames*
+  onto the `BlissStack` is the separable step, and the bytecode loop is what
+  achieves it without the interpreter itself being native code.
+
 ---
 
 ## 2.5 Safepoint Mechanism
