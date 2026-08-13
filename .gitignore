@@ -58,3 +58,10 @@ Thumbs.db
 # Claude / Bureau internals
 .claude/
 _bureau_*
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
