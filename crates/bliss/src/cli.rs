@@ -1899,6 +1899,23 @@ fn with_child_frame<T>(
     result
 }
 
+/// Run `f` inside an implicit `(block nil …)` so a `(return x)` in the body
+/// exits the construct with `x`. Used by DOTIMES/DOLIST (and other iteration
+/// macros) which ANSI specifies establish a NIL block.
+fn with_block_nil(
+    env: &mut Env,
+    f: impl FnOnce(&mut Env) -> Result<BlissVal, BlissError>,
+) -> Result<BlissVal, BlissError> {
+    let token = next_control_token("__RETURN_FROM__");
+    env.block_stack.push(("NIL".to_string(), token.clone()));
+    let result = f(env);
+    env.block_stack.pop();
+    match result {
+        Err(BlissError::Internal(msg)) if msg == token => Ok(take_control_value(&token)),
+        other => other,
+    }
+}
+
 fn eval_lambda_call(
     env: &mut Env,
     params_form: BlissVal,
@@ -6032,17 +6049,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // only the frame on the same env; `env.child()` would clone the
                 // copy-on-write tables and lose those mutations.
                 let parent = Rc::clone(&env.frame);
-                return with_child_frame(env, parent, |env| {
-                    for i in 0..n {
-                        env.define_local_symbol(var_form, BlissVal::from_fixnum(i));
-                        eval_progn(body, env)?;
-                    }
-                    if result_rest.is_cons() {
-                        let (result_form, _) = cp(result_rest);
-                        env.define_local_symbol(var_form, BlissVal::from_fixnum(n));
-                        return eval_form(result_form, env);
-                    }
-                    Ok(NIL)
+                return with_block_nil(env, move |env| {
+                    with_child_frame(env, parent, |env| {
+                        for i in 0..n {
+                            env.define_local_symbol(var_form, BlissVal::from_fixnum(i));
+                            eval_progn(body, env)?;
+                        }
+                        if result_rest.is_cons() {
+                            let (result_form, _) = cp(result_rest);
+                            env.define_local_symbol(var_form, BlissVal::from_fixnum(n));
+                            return eval_form(result_form, env);
+                        }
+                        Ok(NIL)
+                    })
                 });
             }
             "DOLIST" => {
@@ -6053,17 +6072,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let list = eval_form(list_form, env)?;
                 let elems = list_to_vec(list);
                 let parent = Rc::clone(&env.frame);
-                return with_child_frame(env, parent, |env| {
-                    for e in &elems {
-                        env.define_local_symbol(var_form, *e);
-                        eval_progn(body, env)?;
-                    }
-                    if result_rest.is_cons() {
-                        let (result_form, _) = cp(result_rest);
-                        env.define_local_symbol(var_form, NIL);
-                        return eval_form(result_form, env);
-                    }
-                    Ok(NIL)
+                return with_block_nil(env, move |env| {
+                    with_child_frame(env, parent, |env| {
+                        for e in &elems {
+                            env.define_local_symbol(var_form, *e);
+                            eval_progn(body, env)?;
+                        }
+                        if result_rest.is_cons() {
+                            let (result_form, _) = cp(result_rest);
+                            env.define_local_symbol(var_form, NIL);
+                            return eval_form(result_form, env);
+                        }
+                        Ok(NIL)
+                    })
                 });
             }
             "STRING=" => {

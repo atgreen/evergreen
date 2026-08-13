@@ -1118,3 +1118,25 @@ fn loop_while_until_repeat_drivers() {
         );
     }
 }
+
+/// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
+/// in the body exits the loop with x. Previously this errored "no block named
+/// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.
+#[test]
+fn return_exits_dotimes_and_dolist() {
+    let cases = [
+        ("(dotimes (i 5 :done) (when (= i 2) (return :hit)))", "HIT"),
+        ("(dolist (x '(a b c) :done) (when (eq x 'b) (return x)))", "B"),
+        ("(dotimes (i 5 :done) nil)", "DONE"),
+        ("(block nil (dotimes (i 10) (when (> i 3) (return-from nil i))))", "4"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().to_uppercase().contains(expected),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}
