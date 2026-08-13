@@ -76,7 +76,10 @@ impl Package {
 /// Allocate a fresh BlissVal to represent a package handle.
 fn alloc_package_id() -> (i64, BlissVal) {
     let id = NEXT_PACKAGE_ID.fetch_add(1, Ordering::Relaxed);
-    (id, BlissVal::from_fixnum(id))
+    // Opaque metaobject handle, not a fixnum: keeps package handles off the
+    // fixnum tag so a plain integer (or a same-id symbol handle) can't collide
+    // with a package in the registry. See bliss-dx6.1.
+    (id, BlissVal::from_meta_handle(id))
 }
 
 /// Allocate a fresh BlissVal to represent a symbol.
@@ -87,7 +90,7 @@ fn alloc_symbol() -> BlissVal {
 
 /// Extract the package ID from a BlissVal handle.
 fn pkg_id(handle: BlissVal) -> i64 {
-    handle.as_fixnum()
+    handle.as_meta_handle_id()
 }
 
 fn no_active_registry_error() -> BlissError {
@@ -210,7 +213,7 @@ impl PackageRegistry {
             .name_index
             .get(name)
             .copied()
-            .map(BlissVal::from_fixnum)
+            .map(BlissVal::from_meta_handle)
     }
 
     /// Resolve a package designator relative to another package, honoring package-local nicknames first.
@@ -219,13 +222,13 @@ impl PackageRegistry {
         let package = store.packages.get(&pkg_id(package))?.clone();
         let package = package.read().ok()?;
         if let Some(&id) = package.local_nicknames.get(name) {
-            return Some(BlissVal::from_fixnum(id));
+            return Some(BlissVal::from_meta_handle(id));
         }
         store
             .name_index
             .get(name)
             .copied()
-            .map(BlissVal::from_fixnum)
+            .map(BlissVal::from_meta_handle)
     }
 
     /// Create a new package.
@@ -259,7 +262,7 @@ impl PackageRegistry {
         let mut resolved_uses = Vec::new();
         for use_name in use_list {
             match store.name_index.get(*use_name) {
-                Some(&id) => resolved_uses.push(BlissVal::from_fixnum(id)),
+                Some(&id) => resolved_uses.push(BlissVal::from_meta_handle(id)),
                 None => {
                     return Err(BlissError::PackageError(format!(
                         "Package {:?} not found for use-list",
@@ -334,7 +337,7 @@ impl PackageRegistry {
         Ok(owner
             .local_nicknames
             .remove(local_nickname)
-            .map(BlissVal::from_fixnum))
+            .map(BlissVal::from_meta_handle))
     }
 
     pub fn package_local_nicknames(
@@ -353,7 +356,7 @@ impl PackageRegistry {
         Ok(package
             .local_nicknames
             .iter()
-            .map(|(name, &id)| (name.clone(), BlissVal::from_fixnum(id)))
+            .map(|(name, &id)| (name.clone(), BlissVal::from_meta_handle(id)))
             .collect())
     }
 
@@ -373,7 +376,7 @@ impl PackageRegistry {
                 .read()
                 .map_err(|_| lock_poisoned_error("local nickname reverse lookup"))?;
             if pkg.local_nicknames.values().any(|&other| other == target) {
-                out.push(BlissVal::from_fixnum(id));
+                out.push(BlissVal::from_meta_handle(id));
             }
         }
         Ok(out)
@@ -549,7 +552,7 @@ impl PackageRegistry {
                     .packages
                     .keys()
                     .copied()
-                    .map(BlissVal::from_fixnum)
+                    .map(BlissVal::from_meta_handle)
                     .collect()
             })
             .unwrap_or_default()
