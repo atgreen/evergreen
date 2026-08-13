@@ -412,7 +412,7 @@ struct Env {
     current_package: String,
     sandbox: bool,
     restarts: Vec<RestartEntry>,
-    handlers: Vec<HandlerEntry>,
+    handlers: Vec<HandlerCluster>,
     /// Multiple values from last (values ...) or (floor ...) call
     mv: Vec<BlissVal>,
     mv_active: bool,
@@ -587,6 +587,22 @@ struct RestartInvoked {
 struct HandlerEntry {
     type_name: String,
     handler: HandlerImpl,
+}
+
+/// The set of handlers established by a single HANDLER-BIND or HANDLER-CASE
+/// form — one *cluster*, per §5.4 (D5.10). Grouping matters for the signalling
+/// rule R5.94/R5.102: while any handler in a cluster runs, that whole cluster
+/// (not merely the one handler) plus all newer clusters are disestablished, so
+/// a re-signalled condition is seen only by strictly-older clusters. A flat
+/// per-handler stack cannot express "the rest of my own HANDLER-BIND is also
+/// hidden". `entries` are held in source order and tried front-to-back, so a
+/// HANDLER-CASE's first matching clause wins.
+///
+/// Stage-4 backing is this `Vec`; the spec's stack-allocated cluster is stage-5
+/// work (bliss-2yo). See bliss-uh4.1.
+#[derive(Clone)]
+struct HandlerCluster {
+    entries: Vec<HandlerEntry>,
 }
 
 #[derive(Clone)]
@@ -879,48 +895,57 @@ fn eval_handler_impl(
 
 fn signal_condition_object(condition: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     maybe_break_on_signals(condition, env)?;
-    let handlers = env.handlers.clone();
-    for i in (0..handlers.len()).rev() {
-        if condition_matches_handler(env, condition, &handlers[i].type_name) {
-            // R5.94/R5.102: while a handler runs, its own cluster and all newer
-            // handlers are disestablished, so a condition it re-signals is seen
-            // only by OLDER handlers — never itself. Without this a handler that
-            // re-signals the same condition recurses into itself forever
-            // (stack overflow).
-            env.handlers = handlers[..i].to_vec();
-            let result = eval_handler_impl(&handlers[i].handler, condition, env);
-            env.handlers = handlers.clone();
-            result?;
-        }
+    // Visit clusters newest-first; within a cluster try its handlers in source
+    // order (first HANDLER-CASE clause wins). SIGNAL returns NIL if no handler
+    // transfers control (R5.102).
+    for ci in (0..env.handlers.len()).rev() {
+        run_handler_cluster(env, condition, ci)?;
     }
     Ok(NIL)
 }
 
-/// Run the HANDLER-BIND handlers in `env.handlers[lo..hi]` against `condition`,
-/// newest-first, for a raw evaluator error that bypassed `signal_condition_object`.
-/// Only this range (the handlers a single HANDLER-BIND frame established) is run,
-/// so as the error unwinds each enclosing frame runs its own handlers exactly
-/// once. While a handler runs, it and all newer handlers are disestablished
-/// (R5.94/R5.102) so a re-signal is seen only by older handlers. `Ok(())` means
-/// every matching handler declined (returned normally); `Err` means a handler
-/// transferred control (INVOKE-RESTART, non-local exit) and that must propagate.
-fn run_handler_bind_handlers(
+/// Run the handlers of the single cluster at `ci` against `condition`, in source
+/// order. While a handler runs, its whole cluster and every newer cluster are
+/// disestablished (R5.94/R5.102), so a condition it re-signals is seen only by
+/// strictly-older clusters — never itself or a sibling handler of the same
+/// HANDLER-BIND. `Ok(())` means every matching handler declined (returned
+/// normally); `Err` means a handler transferred control (a HANDLER-CASE token,
+/// INVOKE-RESTART, or a non-local exit) and must propagate.
+///
+/// Disestablishment is done by moving the tail `env.handlers[ci..]` out with
+/// `split_off` (no deep clone of the whole stack) and appending it back
+/// afterwards; only the current cluster is cloned so it can be iterated while
+/// `env.handlers` is mutated.
+fn run_handler_cluster(
     env: &mut Env,
     condition: BlissVal,
-    lo: usize,
-    hi: usize,
+    ci: usize,
 ) -> Result<(), BlissError> {
-    let handlers = env.handlers.clone();
-    let hi = hi.min(handlers.len());
-    for i in (lo..hi).rev() {
-        if condition_matches_handler(env, condition, &handlers[i].type_name) {
-            env.handlers = handlers[..i].to_vec();
-            let result = eval_handler_impl(&handlers[i].handler, condition, env);
-            env.handlers = handlers.clone();
+    if ci >= env.handlers.len() {
+        return Ok(());
+    }
+    let cluster = env.handlers[ci].clone();
+    for entry in &cluster.entries {
+        if condition_matches_handler(env, condition, &entry.type_name) {
+            let tail = env.handlers.split_off(ci);
+            let result = eval_handler_impl(&entry.handler, condition, env);
+            env.handlers.extend(tail);
             result?;
         }
     }
     Ok(())
+}
+
+/// Run the handlers of the HANDLER-BIND cluster at index `ci` for a raw evaluator
+/// error that bypassed `signal_condition_object`. As the error unwinds, each
+/// enclosing HANDLER-BIND runs its own cluster exactly once (see
+/// `eval_handler_bind`). Same semantics as `run_handler_cluster`.
+fn run_handler_bind_handlers(
+    env: &mut Env,
+    condition: BlissVal,
+    ci: usize,
+) -> Result<(), BlissError> {
+    run_handler_cluster(env, condition, ci)
 }
 
 /// Signal `condition` through the active handler stack. If a handler transfers
@@ -10128,13 +10153,12 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
         c = rest;
     }
 
-    // Install clauses so that SIGNAL's newest-first traversal tries them in the
-    // order written: HANDLER-CASE selects the first matching clause (ANSI CL),
-    // so a more specific clause listed before a general one must win. Pushing in
-    // reverse makes the first clause the last-pushed, hence first-visited.
-    for entry in installed.iter().rev() {
-        env.handlers.push(entry.clone());
-    }
+    // One HANDLER-CASE form is one cluster, its clauses held in source order.
+    // SIGNAL tries a cluster's entries front-to-back, so the first matching
+    // clause wins (ANSI CL) — no reverse needed.
+    env.handlers.push(HandlerCluster {
+        entries: installed.clone(),
+    });
 
     let result = eval_form(protected_form, env);
     env.handlers.truncate(base_len);
@@ -10200,20 +10224,22 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     let (bindings_form, body) = cp(cdr);
     let base_len = env.handlers.len();
 
-    // Parse handler bindings and install them
+    // Parse all bindings into one cluster (this HANDLER-BIND form), in source
+    // order. Establishing the cluster is a single push.
+    let mut entries = Vec::new();
     let mut c = bindings_form;
     while c.is_cons() {
         let (binding, rest) = cp(c);
         let (type_form, handler_rest) = cp(binding);
         let (handler_form, _) = cp(handler_rest);
-        let type_name = sym_name(type_form);
-        env.handlers.push(HandlerEntry {
-            type_name,
+        entries.push(HandlerEntry {
+            type_name: sym_name(type_form),
             handler: HandlerImpl::Function(handler_form),
         });
         c = rest;
     }
-    let installed_hi = env.handlers.len();
+    env.handlers.push(HandlerCluster { entries });
+    let cluster_index = base_len;
 
     let result = eval_progn(body, env);
 
@@ -10236,7 +10262,7 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
         Ok(value) => Ok(value),
         Err(error) => match bliss_error_to_condition(env, &error) {
             Ok(Some(condition)) => {
-                match run_handler_bind_handlers(env, condition, base_len, installed_hi) {
+                match run_handler_bind_handlers(env, condition, cluster_index) {
                     Ok(()) => Err(error),
                     Err(transfer) => Err(transfer),
                 }

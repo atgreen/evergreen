@@ -427,34 +427,28 @@ fn condition_type_matches(condition: BlissVal, clause_type: BlissVal) -> bool {
 pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
     initialize_condition_runtime_support()?;
     break_on_signals_gate(condition)?;
-    // Snapshot the handler stack so we can iterate without holding the borrow.
-    let handlers: Vec<Vec<(BlissVal, BlissVal)>> = STATE.with(|s| s.borrow().handler_stack.clone());
 
-    // Walk from most-recently-established frame to oldest.
-    for (frame_idx, frame) in handlers.iter().enumerate().rev() {
-        for (condition_type, handler_fn) in frame {
+    // Each frame of `handler_stack` is one cluster (the handlers established by a
+    // single HANDLER-BIND). Walk clusters most-recent-first, trying a cluster's
+    // handlers in source order. Per A5.04 (R5.94/R5.102), while a handler runs,
+    // its whole cluster and every newer cluster are disestablished so a re-signal
+    // is seen only by strictly-older clusters. Disestablishment moves the tail
+    // `handler_stack[ci..]` out with `split_off` and appends it back afterwards —
+    // no clone of the whole stack, only the current cluster is copied so it can
+    // be iterated while the TLS stack is mutated.
+    let cluster_count = STATE.with(|s| s.borrow().handler_stack.len());
+    for ci in (0..cluster_count).rev() {
+        let Some(cluster) = STATE.with(|s| s.borrow().handler_stack.get(ci).cloned()) else {
+            continue;
+        };
+        for (condition_type, handler_fn) in &cluster {
             if condition_type_matches(condition, *condition_type) {
-                // Per A5.04: temporarily rebind the handler stack to exclude
-                // the current cluster and everything after it.  This prevents
-                // infinite recursion if the handler re-signals the same condition.
-                let prev_frames: Vec<Vec<(BlissVal, BlissVal)>> = handlers[..frame_idx].to_vec();
-                STATE.with(|s| {
-                    s.borrow_mut().handler_stack = prev_frames;
-                });
-
-                // Invoke the handler function: (funcall handler_fn condition).
+                let tail = STATE.with(|s| s.borrow_mut().handler_stack.split_off(ci));
                 let handler_result = funcall(*handler_fn, &[condition]);
-
-                // Restore the full handler stack after handler returns normally.
-                STATE.with(|s| {
-                    s.borrow_mut().handler_stack = handlers.clone();
-                });
-
-                // If the handler itself errored, propagate the error
-                // (after having already restored the handler stack above).
+                STATE.with(|s| s.borrow_mut().handler_stack.extend(tail));
+                // A handler that returns normally *declines* — keep searching;
+                // one that transferred control surfaces here as Err and propagates.
                 handler_result?;
-                // Per CL SIGNAL semantics, a handler that returns normally
-                // *declines* the condition — continue searching the next handler.
             }
         }
     }

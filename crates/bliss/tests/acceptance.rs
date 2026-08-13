@@ -1334,6 +1334,67 @@ fn handler_bind_raw_errors_and_program_error() {
     }
 }
 
+/// Regression: handlers are grouped into per-form clusters (bliss-uh4.1). While
+/// any handler in a HANDLER-BIND/HANDLER-CASE runs, its whole cluster — not just
+/// that one handler — and every newer cluster are disestablished (R5.94/R5.102),
+/// so a re-signalled condition is seen only by strictly-older clusters. Handlers
+/// within a cluster are tried in source order, so the first matching HANDLER-CASE
+/// clause wins.
+#[test]
+fn handler_clusters_disestablish_whole_cluster_on_resignal() {
+    let cases = [
+        // A sibling handler in the SAME handler-bind must not catch a condition
+        // re-signalled by its cluster-mate. *sib* stays NIL; the outer
+        // HANDLER-CASE catches the re-signal.
+        (
+            "(defvar *sib* nil) \
+             (handler-case \
+               (handler-bind ((error (lambda (c) (declare (ignore c)) (error \"resig\"))) \
+                              (error (lambda (c) (declare (ignore c)) (setq *sib* t)))) \
+                 (error \"init\")) \
+               (error (e) (declare (ignore e)) (list :outer *sib*)))",
+            "(:OUTER NIL)",
+        ),
+        // Within one HANDLER-BIND, the first matching handler runs first.
+        (
+            "(defvar *log1* nil) \
+             (handler-case \
+               (handler-bind ((error (lambda (c) (declare (ignore c)) (push :a *log1*) (error \"x\"))) \
+                              (error (lambda (c) (declare (ignore c)) (push :b *log1*)))) \
+                 (error \"init\")) \
+               (error (e) (declare (ignore e)) (reverse *log1*)))",
+            "(:A)",
+        ),
+        // HANDLER-CASE: a specific clause listed before a general one wins.
+        (
+            "(handler-case (error 'type-error :datum 1 :expected-type 'string) \
+               (type-error (e) (declare (ignore e)) :specific) \
+               (error (e) (declare (ignore e)) :general))",
+            "SPECIFIC",
+        ),
+        // Nested HANDLER-BINDs: a re-signal reaches the OUTER cluster, not the
+        // inner one again.
+        (
+            "(defvar *seen* nil) \
+             (handler-case \
+               (handler-bind ((error (lambda (c) (declare (ignore c)) (push :outer *seen*)))) \
+                 (handler-bind ((error (lambda (c) (declare (ignore c)) (push :inner *seen*) (error \"re\")))) \
+                   (error \"go\"))) \
+               (error (e) (declare (ignore e)) (reverse *seen*)))",
+            "(:INNER :OUTER)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}
+
 /// Regression: PSETQ, DO, and DO* iteration macros (bliss-2pt.11).
 #[test]
 fn do_dostar_psetq() {
