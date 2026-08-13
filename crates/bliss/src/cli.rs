@@ -433,6 +433,24 @@ struct EnvFrame {
     parent: Option<Rc<RefCell<EnvFrame>>>,
 }
 
+/// An owned, thread-safe (`Arc`-based) deep-copy snapshot of a lexical
+/// [`EnvFrame`] chain.
+///
+/// The live evaluator represents lexical scopes as `Rc<RefCell<EnvFrame>>`,
+/// which closures, restarts, and the ordinary macro-expansion path
+/// ([`expand_macro`]) all *share* by `Rc::clone` (see bliss-gd4). This frozen
+/// form exists solely for the compiler-macro / macroexpand-environment registry
+/// bridge: `bliss-compiler` stores macro and compiler-macro expanders as
+/// `Arc<dyn Fn(..) + Send + Sync + 'static>` in a *global* table
+/// ([`macroexpand::CompilerMacroFn`] / `MacroFn`) that outlives the defining
+/// `Env`. Such a closure cannot capture an `Rc<RefCell<EnvFrame>>` — it is
+/// neither `Send`/`Sync` nor `'static` against a transient `Env`, and would
+/// dangle once that `Env` is gone. So at definition time we `freeze` the frame
+/// into this immutable `Arc` structure, and at expansion time `thaw` it into a
+/// throwaway `Env` to recover the lexical variables the expander was defined in.
+/// This copy is therefore load-bearing (a lifetime/`Send` requirement, not the
+/// gd4 aliasing bug) and cannot be replaced by frame sharing while the registry
+/// stays in a separate crate behind `Send + Sync` bounds. See bliss-9sf.
 #[derive(Clone)]
 struct FrozenEnvFrame {
     vars: HashMap<String, BlissVal>,
@@ -647,6 +665,9 @@ fn store_control_value(token: &str, value: BlissVal) {
     });
 }
 
+/// Deep-copy a live lexical frame chain into an owned, `Send + Sync` snapshot.
+/// Only the global macro/compiler-macro registry bridge needs this; see
+/// [`FrozenEnvFrame`].
 fn freeze_env_frame(frame: &Rc<RefCell<EnvFrame>>) -> Arc<FrozenEnvFrame> {
     let borrowed = frame.borrow();
     Arc::new(FrozenEnvFrame {
@@ -9206,6 +9227,9 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
         ));
     }
 
+    // The expander is stored in bliss-compiler's global registry as an
+    // Arc<dyn Fn + Send + Sync>, so it must own a Send snapshot of the defining
+    // lexical frame rather than share the live Rc chain. See FrozenEnvFrame.
     let captured_frame = freeze_env_frame(&env.frame);
     let funs = (*env.funs).clone();
     let classes = (*env.classes).clone();
@@ -9298,6 +9322,9 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         let handle = next_macro_function_handle();
         let params_form = macro_def.params_form;
         let body = macro_def.body;
+        // Registered into bliss-compiler's global Send + Sync macro table, so the
+        // closure owns a frozen snapshot instead of the live Rc frame. See
+        // FrozenEnvFrame. (The ordinary expand_macro path shares the live frame.)
         let captured_frame = freeze_env_frame(&macro_def.captured_frame);
         compiler_macroexpand::register_macro_function(
             handle,
