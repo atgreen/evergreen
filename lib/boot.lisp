@@ -694,3 +694,21 @@
 
 (defun string-trim (bag s)
   (string-left-trim bag (string-right-trim bag s)))
+
+;;; ---------------------------------------------------------------------------
+;;; More list/tree/string functions.
+;;; ---------------------------------------------------------------------------
+
+(defun char (s i) (elt s i))
+(defun acons (key datum alist) (cons (cons key datum) alist))
+(defun list-length (list) (length list))
+(defun nconc (&rest lists) (apply (function append) lists))
+(defun revappend (x y) (append (reverse x) y))
+(defun make-list (n &key initial-element) (loop repeat n collect initial-element))
+(defun string-equal (a b) (string= (string-downcase a) (string-downcase b)))
+
+(defun subst (new old tree)
+  (cond ((eql tree old) new)
+        ((consp tree) (cons (subst new old (car tree))
+                            (subst new old (cdr tree))))
+        (t tree)))

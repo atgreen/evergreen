@@ -1261,3 +1261,28 @@ fn format_fixed_float_directive() {
         );
     }
 }
+
+/// Regression: CHAR, ACONS, LIST-LENGTH, NCONC, REVAPPEND, MAKE-LIST,
+/// STRING-EQUAL, and SUBST were undefined. (bliss-2pt stdlib completeness.)
+#[test]
+fn more_list_tree_string_functions() {
+    let cases = [
+        ("(char \"hello\" 1)", "e"),
+        ("(acons 'k 'v nil)", "((K . V))"),
+        ("(list-length '(1 2 3))", "3"),
+        ("(nconc (list 1 2) (list 3 4))", "(1 2 3 4)"),
+        ("(revappend '(1 2 3) '(a b))", "(3 2 1 A B)"),
+        ("(make-list 3 :initial-element 'x)", "(X X X)"),
+        ("(string-equal \"ABC\" \"abc\")", "T"),
+        ("(subst 'x 'a '(a b (a c)))", "(X B (X C))"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}
