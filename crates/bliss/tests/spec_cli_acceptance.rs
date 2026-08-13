@@ -1348,6 +1348,49 @@ fn clos_defgeneric_method_options_register_methods() {
 }
 
 #[test]
+fn definitions_inside_loops_persist_globally() {
+    // Regression: iteration constructs run in a fresh variable frame but must
+    // keep the shared global tables mutable in place, so definitions made in
+    // their body (intern, use-package, defun) persist after the loop.
+    assert_eq!(
+        eval_ok("(progn (make-package \"LP\") (dolist (n '(\"A\")) (intern n \"LP\")) (nth-value 1 (find-symbol \"A\" \"LP\")))"),
+        ":INTERNAL"
+    );
+    assert_eq!(
+        eval_ok("(progn (make-package \"LP2\") (loop for n in '(\"A\") do (intern n \"LP2\")) (nth-value 1 (find-symbol \"A\" \"LP2\")))"),
+        ":INTERNAL"
+    );
+    assert_eq!(
+        eval_ok("(progn (defpackage :usrc (:export #:uq)) (make-package \"UDST\") (dolist (p '(\"UDST\")) (use-package :usrc p)) (package-use-list (find-package \"UDST\")))"),
+        "(\"USRC\")"
+    );
+}
+
+#[test]
+fn uninterned_symbol_names_resolve() {
+    // #: uninterned symbols and make-symbol must carry a resolvable name.
+    assert_eq!(eval_ok("(string '#:foo)"), "\"FOO\"");
+    assert_eq!(eval_ok("(symbol-name (make-symbol \"HELLO\"))"), "\"HELLO\"");
+    assert_eq!(eval_ok("(eq '#:a '#:a)"), "NIL");
+}
+
+#[test]
+fn defpackage_export_and_import_from_are_interned() {
+    assert_eq!(
+        eval_ok("(progn (defpackage :ep (:export #:foo)) (nth-value 1 (find-symbol \"FOO\" :ep)))"),
+        ":EXTERNAL"
+    );
+    assert_eq!(
+        eval_ok("(progn (defpackage :isrc (:export #:sfoo)) (defpackage :idst (:import-from :isrc #:sfoo)) (nth-value 1 (find-symbol \"SFOO\" :idst)))"),
+        ":INTERNAL"
+    );
+    assert_eq!(
+        eval_ok("(progn (defpackage :dx (:export #:a #:b)) (let (r) (do-external-symbols (s :dx) (push (string s) r)) (sort r #'string<)))"),
+        "(\"A\" \"B\")"
+    );
+}
+
+#[test]
 fn iteration_variables_shadow_outer_bindings() {
     // A loop/dolist/dotimes variable must shadow an outer lexical binding of the
     // same name — symbol lookup consults the symbol-indexed store first, so the

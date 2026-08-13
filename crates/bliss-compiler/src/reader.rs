@@ -44,6 +44,17 @@ pub fn intern_symbol(name: &str) -> u32 {
     idx
 }
 
+/// Look up an already-interned symbol index by name WITHOUT interning it.
+/// Unlike `intern_symbol`, this never creates a new entry, so it can be used
+/// to answer "does a symbol with this name exist?" without side effects — which
+/// is what a correct FIND-SYMBOL needs (FIND-SYMBOL must not intern).
+pub fn find_symbol_index(name: &str) -> Option<u32> {
+    let guard = SYMBOL_TABLE.lock().unwrap();
+    guard
+        .as_ref()
+        .and_then(|table| table.name_to_index.get(name).copied())
+}
+
 /// Look up the name of a symbol by its index.
 /// Returns None if the index is not in the global symbol table.
 pub fn symbol_name(idx: u32) -> Option<String> {
@@ -87,8 +98,20 @@ fn package_exists(name: &str) -> bool {
 static UNINTERNED_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0x8000_0000);
 
-fn make_uninterned_symbol(_name: &str) -> BlissVal {
+/// Create a fresh uninterned symbol with the given name. Each call yields a
+/// distinct symbol (a unique high-range index), but the name IS registered so
+/// `symbol_name`/`string`/`symbol-name` can resolve it. The name is deliberately
+/// not added to the name→index map, so the symbol remains uninterned and is not
+/// found by `intern`/`find-symbol`.
+pub fn make_uninterned_symbol(name: &str) -> BlissVal {
     let idx = UNINTERNED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut guard = SYMBOL_TABLE.lock().unwrap();
+    let table = guard.get_or_insert_with(|| SymbolTable {
+        name_to_index: HashMap::new(),
+        index_to_name: HashMap::new(),
+        next_index: 0,
+    });
+    table.index_to_name.insert(idx, name.to_string());
     BlissVal::from_symbol_index(idx)
 }
 

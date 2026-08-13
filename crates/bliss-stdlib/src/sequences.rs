@@ -79,6 +79,11 @@ fn build_list(vals: &[BlissVal]) -> BlissVal {
     list
 }
 
+/// Build a simple-vector from a slice of BlissVals (public entry point).
+pub fn build_simple_vector(vals: &[BlissVal]) -> BlissVal {
+    build_vector(vals)
+}
+
 /// Build a simple-vector from a slice of BlissVals.
 fn build_vector(vals: &[BlissVal]) -> BlissVal {
     let total_u64s = 2 + vals.len();

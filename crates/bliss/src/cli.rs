@@ -1355,15 +1355,22 @@ fn invoke_method(
     args: &[BlissVal],
     next: Option<NextMethod>,
 ) -> Result<BlissVal, BlissError> {
-    let mut child_env = env.child();
-    bind_method_params(&mut child_env, method, args)?;
-    if let Some(next) = next {
-        child_env.method_context.push(MethodContext {
-            args: args.to_vec(),
-            next,
-        });
-    }
-    eval_progn(method.body, &mut child_env)
+    let parent = Rc::clone(&env.frame);
+    let pushed = next.is_some();
+    with_child_frame(env, parent, move |env| {
+        bind_method_params(env, method, args)?;
+        if let Some(next) = next {
+            env.method_context.push(MethodContext {
+                args: args.to_vec(),
+                next,
+            });
+        }
+        let result = eval_progn(method.body, env);
+        if pushed {
+            env.method_context.pop();
+        }
+        result
+    })
 }
 
 fn invoke_restart_function(
@@ -2419,7 +2426,41 @@ fn read_scan_token(chars: &[char], pos: &mut usize) -> String {
 }
 
 // ── Minimal bootstrap evaluator ───────────────────────────────────
+// ── Read-time evaluation (`#.`) ──────────────────────────────────
+// `#.` must evaluate its form in the live load environment. The reader's
+// read-eval hook is a bare `fn` pointer, so it reaches the current env through
+// this thread-local. It is set to point at the loop's `&mut Env` only for the
+// duration of each top-level read (during which the outer `env` binding is not
+// otherwise touched) and cleared afterwards. Evaluation is single-threaded.
+thread_local! {
+    static READ_EVAL_ENV: std::cell::Cell<*mut Env> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+fn read_time_eval(form: BlissVal) -> Result<BlissVal, BlissError> {
+    let ptr = READ_EVAL_ENV.with(|c| c.get());
+    if ptr.is_null() {
+        return Err(BlissError::StreamError(
+            "#. read-eval used outside a load environment".into(),
+        ));
+    }
+    // Safety: `ptr` refers to the load loop's live `&mut Env` for exactly the
+    // span of the enclosing read, and reads never run concurrently.
+    let env = unsafe { &mut *ptr };
+    eval_form(form, env)
+}
+
+/// Read the next form from `remaining`, evaluating any `#.` read-eval forms in
+/// `env`. Restores the read-eval env pointer afterwards so nested loads compose.
+fn read_next_form(remaining: &str, env: &mut Env) -> Result<(BlissVal, usize), BlissError> {
+    let prev = READ_EVAL_ENV.with(|c| c.replace(env as *mut Env));
+    let result = reader::read_from_string_with_base(remaining, 10, true);
+    READ_EVAL_ENV.with(|c| c.set(prev));
+    result
+}
+
 fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
+    reader::set_read_eval_hook(Some(read_time_eval));
     register_declared_packages(source);
     let chars: Vec<char> = source.chars().collect();
     let mut pos = 0;
@@ -2432,7 +2473,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
             break;
         }
         let remaining: String = chars[pos..].iter().collect();
-        let (val, consumed) = reader::read_from_string(&remaining)?;
+        let (val, consumed) = read_next_form(&remaining, env)?;
         if val == EOF {
             break;
         }
@@ -2476,6 +2517,49 @@ fn normalize_package_name(name: &str) -> String {
     name.trim_start_matches("KEYWORD:")
         .trim_start_matches(':')
         .to_uppercase()
+}
+
+/// The home package encoded in a symbol's arena key. Mirrors the logic of the
+/// SYMBOL-PACKAGE builtin: `KEYWORD:x` → KEYWORD, `PKG::x`/`PKG:x` → PKG, and a
+/// bare name → COMMON-LISP.
+fn home_package_of_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("KEYWORD:") {
+        let _ = rest;
+        "KEYWORD".to_string()
+    } else if let Some((pkg, _)) = name.rsplit_once("::") {
+        pkg.to_string()
+    } else if let Some((pkg, _)) = name.rsplit_once(':') {
+        pkg.to_string()
+    } else {
+        "COMMON-LISP".to_string()
+    }
+}
+
+/// True if some package OTHER than COMMON-LISP genuinely owns (homes) a symbol
+/// with this bare name.
+///
+/// The reader interns every bare symbol under a package-less arena key, so the
+/// COMMON-LISP package would otherwise appear to "contain" every bare symbol
+/// ever read — including internal symbols of user packages such as UIOP, whose
+/// names collide with nothing in ANSI CL but still get a bare arena entry.
+/// A symbol is only truly owned by package P when P's own symbol table maps the
+/// name to a symbol whose home package (per its arena key) is P itself; imported
+/// or inherited symbols don't count. If any non-CL package owns the name, then
+/// COMMON-LISP must NOT claim it — that is what keeps FIND-SYMBOL / DO-SYMBOLS
+/// over COMMON-LISP from fabricating membership and breaking package algorithms
+/// like UIOP's DEFINE-PACKAGE (which compares symbol home packages).
+fn name_owned_by_noncl_package(env: &Env, bare_name: &str) -> bool {
+    for (pkg_name, pkg) in env.packages.iter() {
+        if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
+            continue;
+        }
+        if let Some(sym) = pkg.symbols.get(bare_name) {
+            if &home_package_of_name(&sym_name(*sym)) == pkg_name {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Resolve a package designator to a canonical package name, following
@@ -2581,7 +2665,17 @@ fn find_symbol_in_package(
 ) -> Option<(BlissVal, &'static str)> {
     let pkg_name = resolve_package_name(env, pkg_name);
     let bare_name = bare_name.to_uppercase();
-    if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
+    if pkg_name == "COMMON-LISP" {
+        // COMMON-LISP owns a bare name only if it is an already-interned symbol
+        // that no user package homes. Never intern here: FIND-SYMBOL must have
+        // no side effects, and fabricating a symbol would make COMMON-LISP
+        // appear to export every name ever read.
+        if let Some(idx) = reader::find_symbol_index(&bare_name) {
+            if !name_owned_by_noncl_package(env, &bare_name) {
+                return Some((BlissVal::from_symbol_index(idx), "EXTERNAL"));
+            }
+        }
+    } else if pkg_name == "COMMON-LISP-USER" {
         if let Some(sym) = resolve_sym(&bare_name) {
             return Some((sym, "EXTERNAL"));
         }
@@ -3147,7 +3241,17 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
 fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Vec<BlissVal> {
     let package_name = normalize_package_name(package_name);
     let mut seen = HashMap::<String, BlissVal>::new();
-    if matches!(package_name.as_str(), "COMMON-LISP" | "COMMON-LISP-USER") {
+    if package_name == "COMMON-LISP" {
+        // Only bare symbols that no user package homes belong to COMMON-LISP.
+        for idx in 0..4096u32 {
+            if let Some(name) = reader::symbol_name(idx) {
+                if !name.contains(':') && !name_owned_by_noncl_package(env, &name) {
+                    seen.entry(name.clone())
+                        .or_insert(BlissVal::from_symbol_index(idx));
+                }
+            }
+        }
+    } else if package_name == "COMMON-LISP-USER" {
         for idx in 0..4096u32 {
             if let Some(name) = reader::symbol_name(idx) {
                 if !name.contains(':') {
@@ -3857,9 +3961,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (pattern, rest) = cp(cdr);
                 let (value_form, body) = cp(rest);
                 let value = eval_form(value_form, env)?;
-                let mut child_env = env.child();
-                bind_pattern_value(pattern, value, &mut child_env)?;
-                return eval_progn(body, &mut child_env);
+                let parent = Rc::clone(&env.frame);
+                return with_child_frame(env, parent, move |env| {
+                    bind_pattern_value(pattern, value, env)?;
+                    eval_progn(body, env)
+                });
             }
             "COND" => {
                 let mut c = cdr;
@@ -4450,6 +4556,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 return bliss_stdlib::subseq(seq, start, end);
             }
+            "COERCE" => {
+                let (val_form, rest) = cp(cdr);
+                let (type_form, _) = cp(rest);
+                let value = eval_form(val_form, env)?;
+                let type_val = eval_form(type_form, env)?;
+                return coerce_value(value, type_val);
+            }
             "SORT" => {
                 let (seq_form, rest) = cp(cdr);
                 let (pred_form, rest2) = cp(rest);
@@ -4468,7 +4581,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     None
                 };
-                return bliss_stdlib::sort(seq, predicate, key);
+                return sort_sequence(seq, predicate, key, env);
             }
             "STABLE-SORT" => {
                 let (seq_form, rest) = cp(cdr);
@@ -4488,7 +4601,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     None
                 };
-                return bliss_stdlib::stable_sort(seq, predicate, key);
+                return sort_sequence(seq, predicate, key, env);
             }
             "PARSE-NAMESTRING" => {
                 let (thing_form, rest) = cp(cdr);
@@ -4558,6 +4671,44 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(arena_str(&format_val(v)));
+            }
+            "1+" | "1-" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                let delta = if name == "1+" { 1 } else { -1 };
+                if v.is_fixnum() {
+                    return Ok(BlissVal::from_fixnum(v.as_fixnum() + delta));
+                }
+                if v.is_single_float() {
+                    return Ok(BlissVal::from_single_float(
+                        v.as_single_float() + delta as f32,
+                    ));
+                }
+                return Err(BlissError::TypeError {
+                    datum: v,
+                    expected: "number".into(),
+                });
+            }
+            "ZEROP" | "PLUSP" | "MINUSP" => {
+                let (af, _) = cp(cdr);
+                let n = num_val(eval_form(af, env)?)?;
+                let result = match name.as_str() {
+                    "ZEROP" => n == 0.0,
+                    "PLUSP" => n > 0.0,
+                    _ => n < 0.0,
+                };
+                return Ok(if result { T } else { NIL });
+            }
+            "EVENP" | "ODDP" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                let n = if v.is_fixnum() {
+                    v.as_fixnum()
+                } else {
+                    num_val(v)? as i64
+                };
+                let even = n % 2 == 0;
+                return Ok(if even == (name == "EVENP") { T } else { NIL });
             }
             "ABS" => {
                 let (af, _) = cp(cdr);
@@ -5627,6 +5778,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     None => return Ok(arena_str(&name)),
                 }
             }
+            "MAKE-SYMBOL" => {
+                // (make-symbol name) — a fresh uninterned symbol with that name.
+                let (name_form, _) = cp(cdr);
+                let name = val_as_str(eval_form(name_form, env)?);
+                return Ok(reader::make_uninterned_symbol(&name));
+            }
+            "COPY-SYMBOL" => {
+                // (copy-symbol sym) — a fresh uninterned symbol with the same name.
+                let (sym_form, _) = cp(cdr);
+                let sym = eval_form(sym_form, env)?;
+                let name = symbol_name_string(&sym_name(sym));
+                return Ok(reader::make_uninterned_symbol(&name));
+            }
             "DOTIMES" => {
                 // (dotimes (var count [result]) body...)
                 let (binding, body) = cp(cdr);
@@ -5634,19 +5798,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (count_form, result_rest) = cp(br);
                 let count = eval_form(count_form, env)?;
                 let n = num_val(count)? as i64;
-                // Bind the loop variable in a fresh scope via the symbol-indexed
-                // store so it shadows any outer binding of the same name.
-                let mut loop_env = env.child();
-                for i in 0..n {
-                    loop_env.define_local_symbol(var_form, BlissVal::from_fixnum(i));
-                    eval_progn(body, &mut loop_env)?;
-                }
-                if result_rest.is_cons() {
-                    let (result_form, _) = cp(result_rest);
-                    loop_env.define_local_symbol(var_form, BlissVal::from_fixnum(n));
-                    return eval_form(result_form, &mut loop_env);
-                }
-                return Ok(NIL);
+                // Establish a fresh variable frame (so the loop variable shadows
+                // outer bindings and does not leak) while keeping the shared
+                // global tables — packages, functions, … — mutable in place, so
+                // definitions made in the body persist. `with_child_frame` swaps
+                // only the frame on the same env; `env.child()` would clone the
+                // copy-on-write tables and lose those mutations.
+                let parent = Rc::clone(&env.frame);
+                return with_child_frame(env, parent, |env| {
+                    for i in 0..n {
+                        env.define_local_symbol(var_form, BlissVal::from_fixnum(i));
+                        eval_progn(body, env)?;
+                    }
+                    if result_rest.is_cons() {
+                        let (result_form, _) = cp(result_rest);
+                        env.define_local_symbol(var_form, BlissVal::from_fixnum(n));
+                        return eval_form(result_form, env);
+                    }
+                    Ok(NIL)
+                });
             }
             "DOLIST" => {
                 // (dolist (var list [result]) body...)
@@ -5655,17 +5825,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (list_form, result_rest) = cp(br);
                 let list = eval_form(list_form, env)?;
                 let elems = list_to_vec(list);
-                let mut loop_env = env.child();
-                for e in &elems {
-                    loop_env.define_local_symbol(var_form, *e);
-                    eval_progn(body, &mut loop_env)?;
-                }
-                if result_rest.is_cons() {
-                    let (result_form, _) = cp(result_rest);
-                    loop_env.define_local_symbol(var_form, NIL);
-                    return eval_form(result_form, &mut loop_env);
-                }
-                return Ok(NIL);
+                let parent = Rc::clone(&env.frame);
+                return with_child_frame(env, parent, |env| {
+                    for e in &elems {
+                        env.define_local_symbol(var_form, *e);
+                        eval_progn(body, env)?;
+                    }
+                    if result_rest.is_cons() {
+                        let (result_form, _) = cp(result_rest);
+                        env.define_local_symbol(var_form, NIL);
+                        return eval_form(result_form, env);
+                    }
+                    Ok(NIL)
+                });
             }
             "STRING=" => {
                 let (af, r) = cp(cdr);
@@ -6233,8 +6405,15 @@ enum LoopBeingSource {
 }
 
 fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    // Run the loop in a fresh variable frame (for iteration variables and
+    // accumulators) while keeping the shared global tables mutable in place, so
+    // definitions made in the loop body (intern, use-package, defun, …) persist.
+    let parent = Rc::clone(&env.frame);
+    with_child_frame(env, parent, |env| eval_loop_inner(cdr, env))
+}
+
+fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let toks = list_to_vec(cdr);
-    let mut lenv = env.child();
 
     // Simple LOOP: no leading keyword -> repeat body until a top-level return.
     let starts_with_kw = toks
@@ -6253,9 +6432,9 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         loop {
             for f in &toks {
                 if let Some(tgt) = loop_return_target(*f) {
-                    return eval_form(tgt, &mut lenv);
+                    return eval_form(tgt, env);
                 }
-                eval_form(*f, &mut lenv)?;
+                eval_form(*f, env)?;
             }
             guard += 1;
             if guard > 10_000_000 {
@@ -6456,27 +6635,27 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
     // Establish :with bindings (sequential, LET*-style).
     for (var, init) in &with_bindings {
-        let v = eval_form(*init, &mut lenv)?;
-        loop_bind(*var, v, &mut lenv);
+        let v = eval_form(*init, env)?;
+        loop_bind(*var, v, env);
     }
 
     // Bind all :into accumulators to NIL up front.
     let mut into_names = Vec::new();
     loop_collect_intos(&body, &mut into_names);
     for n in &into_names {
-        lenv.define_local(n, NIL);
+        env.define_local(n, NIL);
     }
 
     let mut accs = LoopAccs::default();
     let mut ret: Option<BlissVal> = None;
 
     for f in &initially {
-        eval_form(*f, &mut lenv)?;
+        eval_form(*f, env)?;
     }
 
     if for_clauses.is_empty() {
         // No :for driver: run body once (covers when/collect-only loops).
-        loop_exec_clauses(&body, &mut lenv, &mut accs, &mut ret)?;
+        loop_exec_clauses(&body, env, &mut accs, &mut ret)?;
     } else {
         // Build cursors, evaluating each list form once.
         let mut states: Vec<ForState> = Vec::with_capacity(for_clauses.len());
@@ -6484,7 +6663,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         for fc in &for_clauses {
             match fc {
                 ForClause::In { pat, list_form } => {
-                    let list = eval_form(*list_form, &mut lenv)?;
+                    let list = eval_form(*list_form, env)?;
                     states.push(ForState::In {
                         pat: *pat,
                         items: list_to_vec(list),
@@ -6493,7 +6672,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     has_stepping_driver = true;
                 }
                 ForClause::On { pat, list_form } => {
-                    let list = eval_form(*list_form, &mut lenv)?;
+                    let list = eval_form(*list_form, env)?;
                     states.push(ForState::On {
                         pat: *pat,
                         tail: list,
@@ -6511,13 +6690,13 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     step,
                     limit,
                 } => {
-                    let current = eval_form(*start, &mut lenv)?;
+                    let current = eval_form(*start, env)?;
                     let step = match step {
-                        Some(expr) => eval_form(*expr, &mut lenv)?,
+                        Some(expr) => eval_form(*expr, env)?,
                         None => BlissVal::from_fixnum(1),
                     };
                     let limit = match limit {
-                        Some((kind, expr)) => Some((*kind, eval_form(*expr, &mut lenv)?)),
+                        Some((kind, expr)) => Some((*kind, eval_form(*expr, env)?)),
                         None => None,
                     };
                     states.push(ForState::From {
@@ -6529,7 +6708,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     has_stepping_driver = true;
                 }
                 ForClause::Across { pat, seq_form } => {
-                    let seq = eval_form(*seq_form, &mut lenv)?;
+                    let seq = eval_form(*seq_form, env)?;
                     let items = if seq.is_cons() || seq.is_nil() {
                         list_to_vec(seq)
                     } else {
@@ -6548,18 +6727,18 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 ForClause::Being { pat, source } => {
                     let items = match source {
                         LoopBeingSource::Symbols(pkg_form) => {
-                            let _ = eval_form(*pkg_form, &mut lenv)?;
+                            let _ = eval_form(*pkg_form, env)?;
                             Vec::new()
                         }
                         LoopBeingSource::HashKeys(table_form) => {
-                            let table = eval_form(*table_form, &mut lenv)?;
+                            let table = eval_form(*table_form, env)?;
                             bliss_stdlib::hash_table_entries(table)?
                                 .into_iter()
                                 .map(|(key, _)| key)
                                 .collect()
                         }
                         LoopBeingSource::HashValues(table_form) => {
-                            let table = eval_form(*table_form, &mut lenv)?;
+                            let table = eval_form(*table_form, env)?;
                             bliss_stdlib::hash_table_entries(table)?
                                 .into_iter()
                                 .map(|(_, value)| value)
@@ -6590,7 +6769,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             exhausted = true;
                             break;
                         }
-                        loop_bind(*pat, items[*idx], &mut lenv);
+                        loop_bind(*pat, items[*idx], env);
                         *idx += 1;
                     }
                     ForState::On { pat, tail } => {
@@ -6598,13 +6777,13 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             exhausted = true;
                             break;
                         }
-                        loop_bind(*pat, *tail, &mut lenv);
+                        loop_bind(*pat, *tail, env);
                         *tail = cp(*tail).1;
                     }
                     ForState::Eq { pat, init, then } => {
                         let f = if first { *init } else { then.unwrap_or(*init) };
-                        let v = eval_form(f, &mut lenv)?;
-                        loop_bind(*pat, v, &mut lenv);
+                        let v = eval_form(f, env)?;
+                        loop_bind(*pat, v, env);
                     }
                     ForState::From {
                         pat,
@@ -6616,7 +6795,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             exhausted = true;
                             break;
                         }
-                        loop_bind(*pat, *current, &mut lenv);
+                        loop_bind(*pat, *current, env);
                         *current = loop_add_numbers(*current, *step)?;
                     }
                     ForState::Across { pat, items, idx } => {
@@ -6624,7 +6803,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             exhausted = true;
                             break;
                         }
-                        loop_bind(*pat, items[*idx], &mut lenv);
+                        loop_bind(*pat, items[*idx], env);
                         *idx += 1;
                     }
                     ForState::Being { pat, items, idx } => {
@@ -6632,7 +6811,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             exhausted = true;
                             break;
                         }
-                        loop_bind(*pat, items[*idx], &mut lenv);
+                        loop_bind(*pat, items[*idx], env);
                         *idx += 1;
                     }
                 }
@@ -6640,7 +6819,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             if exhausted {
                 break;
             }
-            loop_exec_clauses(&body, &mut lenv, &mut accs, &mut ret)?;
+            loop_exec_clauses(&body, env, &mut accs, &mut ret)?;
             first = false;
             if !has_stepping_driver {
                 guard += 1;
@@ -6660,7 +6839,7 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         .filter_map(|(k, v)| k.as_ref().map(|name| (name.clone(), v.clone())))
         .collect();
     for (name, items) in named {
-        lenv.define_local(&name, vec_to_list(&items));
+        env.define_local(&name, vec_to_list(&items));
     }
 
     // :finally — an embedded (return X) ends the loop with X.
@@ -6669,9 +6848,9 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             break;
         }
         if let Some(tgt) = loop_return_target(*f) {
-            ret = Some(eval_form(tgt, &mut lenv)?);
+            ret = Some(eval_form(tgt, env)?);
         } else {
-            eval_form(*f, &mut lenv)?;
+            eval_form(*f, env)?;
         }
     }
 
@@ -7427,32 +7606,216 @@ fn eval_args(args: BlissVal, env: &mut Env) -> Result<Vec<BlissVal>, BlissError>
     Ok(result)
 }
 
-// ── LET binding (issue #2 fix) ───────────────────────────────────
+// ── COERCE ───────────────────────────────────────────────────────
+/// Extract a sequence (list, vector, or string) into a Vec of its elements.
+fn seq_elements(seq: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
+    if seq.is_nil() {
+        return Ok(Vec::new());
+    }
+    if seq.is_cons() {
+        return Ok(list_to_vec(seq));
+    }
+    let n = bliss_stdlib::length(seq)?;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(bliss_stdlib::elt(seq, i)?);
+    }
+    Ok(out)
+}
+
+/// CL COERCE for the type specifiers that actually occur in practice. The
+/// result-type is reduced to the head symbol of the spec (e.g. `(vector t)` →
+/// VECTOR). Unknown specifiers pass the value through unchanged.
+fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissError> {
+    // Reduce the type spec to a bare head-symbol name.
+    let head = if type_val.is_cons() {
+        cp(type_val).0
+    } else {
+        type_val
+    };
+    if head.is_nil() {
+        return Ok(value);
+    }
+    let tname = symbol_bare_name(&sym_name(head));
+    match tname.as_str() {
+        "T" => Ok(value),
+        "LIST" => {
+            if value.is_cons() || value.is_nil() {
+                Ok(value)
+            } else {
+                Ok(vec_to_list(&seq_elements(value)?))
+            }
+        }
+        "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" | "SIMPLE-ARRAY" => {
+            Ok(bliss_stdlib::build_simple_vector(&seq_elements(value)?))
+        }
+        "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING" => {
+            if bliss_stdlib::registered_string(value).is_some() {
+                return Ok(value);
+            }
+            let mut s = String::new();
+            for e in seq_elements(value)? {
+                if e.is_character() {
+                    s.push(e.as_char());
+                }
+            }
+            Ok(arena_str(&s))
+        }
+        "CHARACTER" => {
+            if value.is_character() {
+                return Ok(value);
+            }
+            let s = val_as_str(value);
+            match s.chars().next() {
+                Some(c) => Ok(BlissVal::from_char(c)),
+                None => Err(BlissError::TypeError {
+                    datum: value,
+                    expected: "character".into(),
+                }),
+            }
+        }
+        "FLOAT" | "SINGLE-FLOAT" | "DOUBLE-FLOAT" | "SHORT-FLOAT" | "LONG-FLOAT" => {
+            Ok(BlissVal::from_single_float(num_val(value)? as f32))
+        }
+        // FUNCTION: bliss symbols and closures are already callable via funcall.
+        "FUNCTION" => Ok(value),
+        // Unknown / identity specifiers: pass through unchanged.
+        _ => Ok(value),
+    }
+}
+
+// ── SORT / STABLE-SORT ───────────────────────────────────────────
+// Sort by actually applying the predicate (and optional key) — the stdlib
+// helper only guessed a direction from the predicate symbol and compared raw
+// bits, so `#'string<` and other real predicates produced wrong orders. This
+// runs in the evaluator, where functions can be called. Both SORT and
+// STABLE-SORT use this stable merge sort.
+fn sort_less(
+    predicate: BlissVal,
+    key: Option<BlissVal>,
+    a: BlissVal,
+    b: BlissVal,
+    env: &mut Env,
+) -> Result<bool, BlissError> {
+    let ka = match key {
+        Some(k) if !k.is_nil() => apply_function(k, &[a], env)?,
+        _ => a,
+    };
+    let kb = match key {
+        Some(k) if !k.is_nil() => apply_function(k, &[b], env)?,
+        _ => b,
+    };
+    Ok(!apply_function(predicate, &[ka, kb], env)?.is_nil())
+}
+
+fn merge_sort_pred(
+    elems: &mut [BlissVal],
+    predicate: BlissVal,
+    key: Option<BlissVal>,
+    env: &mut Env,
+) -> Result<(), BlissError> {
+    let n = elems.len();
+    if n <= 1 {
+        return Ok(());
+    }
+    let mid = n / 2;
+    let mut left = elems[..mid].to_vec();
+    let mut right = elems[mid..].to_vec();
+    merge_sort_pred(&mut left, predicate, key, env)?;
+    merge_sort_pred(&mut right, predicate, key, env)?;
+    let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
+    while i < left.len() && j < right.len() {
+        // Stable: keep left before right unless right is strictly less.
+        if sort_less(predicate, key, right[j], left[i], env)? {
+            elems[k] = right[j];
+            j += 1;
+        } else {
+            elems[k] = left[i];
+            i += 1;
+        }
+        k += 1;
+    }
+    while i < left.len() {
+        elems[k] = left[i];
+        i += 1;
+        k += 1;
+    }
+    while j < right.len() {
+        elems[k] = right[j];
+        j += 1;
+        k += 1;
+    }
+    Ok(())
+}
+
+fn sort_sequence(
+    seq: BlissVal,
+    predicate: BlissVal,
+    key: Option<BlissVal>,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    if seq.is_nil() {
+        return Ok(NIL);
+    }
+    let is_list = seq.is_cons();
+    let mut elems: Vec<BlissVal> = if is_list {
+        list_to_vec(seq)
+    } else {
+        let n = bliss_stdlib::length(seq)?;
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            v.push(bliss_stdlib::elt(seq, i)?);
+        }
+        v
+    };
+    merge_sort_pred(&mut elems, predicate, key, env)?;
+    if is_list {
+        Ok(vec_to_list(&elems))
+    } else {
+        for (i, e) in elems.iter().enumerate() {
+            bliss_stdlib::set_elt(seq, i, *e)?;
+        }
+        Ok(seq)
+    }
+}
+
+// ── LET / LET* binding ───────────────────────────────────────────
+// Bind lexically by pushing a fresh frame onto the SAME env (via
+// `with_child_frame`), never by forking a whole `Env` with `env.child()`.
+// Forking would copy the Rc-shared global tables (packages, funs, macros,
+// classes, methods, …) and any mutation inside the body — e.g. a DEFPACKAGE,
+// DEFUN, or DEFMETHOD nested in a LET — would copy-on-write into the discarded
+// child and never reach the caller. Keeping one env also lets multiple values
+// and dynamic state flow out of the body naturally.
 fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, BlissError> {
     let (bindings_form, body) = cp(cdr);
+    let parent = Rc::clone(&env.frame);
+
     if sequential {
-        let mut child_env = env.child();
-        let mut c = bindings_form;
-        while c.is_cons() {
-            let (binding, rest) = cp(c);
-            if binding.is_cons() {
-                let (var_form, val_rest) = cp(binding);
-                let (val_form, _) = cp(val_rest);
-                let var_name = sym_name(var_form);
-                let val = eval_form(val_form, &mut child_env)?;
-                if var_form.is_symbol() {
-                    child_env.define_local_symbol(var_form, val);
-                } else {
-                    child_env.define_local(&var_name, val);
+        // let*: one child frame; each init sees the bindings established before it.
+        return with_child_frame(env, parent, move |env| {
+            let mut c = bindings_form;
+            while c.is_cons() {
+                let (binding, rest) = cp(c);
+                if binding.is_cons() {
+                    let (var_form, val_rest) = cp(binding);
+                    let (val_form, _) = cp(val_rest);
+                    let val = eval_form(val_form, env)?;
+                    if var_form.is_symbol() {
+                        env.define_local_symbol(var_form, val);
+                    } else {
+                        env.define_local(&sym_name(var_form), val);
+                    }
+                } else if binding.is_symbol() {
+                    env.define_local_symbol(binding, NIL);
                 }
-            } else if binding.is_symbol() {
-                child_env.define_local_symbol(binding, NIL);
+                c = rest;
             }
-            c = rest;
-        }
-        return eval_progn(body, &mut child_env);
+            eval_progn(body, env)
+        });
     }
 
+    // let: every init is evaluated in the outer frame before any binding is visible.
     let mut evaluated = Vec::new();
     let mut c = bindings_form;
     while c.is_cons() {
@@ -7467,15 +7830,16 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
         c = rest;
     }
 
-    let mut child_env = env.child();
-    for (symbol, val) in evaluated {
-        if symbol.is_symbol() {
-            child_env.define_local_symbol(symbol, val);
-        } else {
-            child_env.define_local(&sym_name(symbol), val);
+    with_child_frame(env, parent, move |env| {
+        for (symbol, val) in evaluated {
+            if symbol.is_symbol() {
+                env.define_local_symbol(symbol, val);
+            } else {
+                env.define_local(&sym_name(symbol), val);
+            }
         }
-    }
-    eval_progn(body, &mut child_env)
+        eval_progn(body, env)
+    })
 }
 
 // ── DEFUN ────────────────────────────────────────────────────────
@@ -9051,25 +9415,27 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
     let primary = eval_form(values_form, env)?;
     let mv = env.mv.clone();
 
-    // Bind variables
+    // Bind variables in a fresh frame on the SAME env (see eval_let) so that
+    // global definitions in the body — e.g. INTERN inside UIOP's ENSURE-SYMBOL,
+    // which runs under two nested MULTIPLE-VALUE-BINDs — persist to the caller.
     let var_names: Vec<String> = list_to_vec(vars_form)
         .iter()
         .map(|v| sym_name(*v))
         .collect();
-    let mut child_env = env.child();
-
-    for (i, var_name) in var_names.iter().enumerate() {
-        let val = if i == 0 {
-            primary
-        } else if i < mv.len() {
-            mv[i]
-        } else {
-            NIL
-        };
-        child_env.define_local(var_name, val);
-    }
-
-    eval_progn(body, &mut child_env)
+    let parent = Rc::clone(&env.frame);
+    with_child_frame(env, parent, move |env| {
+        for (i, var_name) in var_names.iter().enumerate() {
+            let val = if i == 0 {
+                primary
+            } else if i < mv.len() {
+                mv[i]
+            } else {
+                NIL
+            };
+            env.define_local(var_name, val);
+        }
+        eval_progn(body, env)
+    })
 }
 
 // ── HANDLER-CASE ────────────────────────────────────────────────
@@ -9365,11 +9731,13 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
     // Open the file and create a stream
     let stream_val = open_stream(&path, direction)?;
 
-    let mut child_env = env.child();
-    child_env.define_local(&var_name, stream_val);
-
-    // Evaluate body, then close the stream (unwind-protect style)
-    let result = eval_progn(body, &mut child_env);
+    let parent = Rc::clone(&env.frame);
+    // Evaluate body in a fresh frame on the same env, then close the stream
+    // (unwind-protect style) whether the body returned or unwound.
+    let result = with_child_frame(env, parent, move |env| {
+        env.define_local(&var_name, stream_val);
+        eval_progn(body, env)
+    });
     close_stream(stream_val)?;
     result
 }
@@ -9386,6 +9754,9 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     let mut exports = Vec::new();
     let mut uses = Vec::new();
     let mut nicknames = Vec::new();
+    let mut interns: Vec<String> = Vec::new();
+    // (from-package, symbol-name) pairs to import into this package.
+    let mut import_from: Vec<(String, String)> = Vec::new();
 
     let mut c = opts;
     while c.is_cons() {
@@ -9396,27 +9767,37 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             let key_bare = key_name
                 .trim_start_matches("KEYWORD:")
                 .trim_start_matches(':');
-            if key_bare == "USE" {
-                let mut vc = val_list;
-                while vc.is_cons() {
-                    let (v, vr) = cp(vc);
-                    uses.push(resolve_package_name(env, &val_as_str(v)));
-                    vc = vr;
+            match key_bare {
+                "USE" => {
+                    for v in list_to_vec(val_list) {
+                        uses.push(resolve_package_name(env, &val_as_str(v)));
+                    }
                 }
-            } else if key_bare == "EXPORT" {
-                let mut vc = val_list;
-                while vc.is_cons() {
-                    let (v, vr) = cp(vc);
-                    exports.push(symbol_bare_name(&sym_name(v)));
-                    vc = vr;
+                "EXPORT" => {
+                    for v in list_to_vec(val_list) {
+                        exports.push(symbol_bare_name(&sym_name(v)));
+                    }
                 }
-            } else if key_bare == "NICKNAMES" {
-                let mut vc = val_list;
-                while vc.is_cons() {
-                    let (v, vr) = cp(vc);
-                    nicknames.push(normalize_package_name(&val_as_str(v)));
-                    vc = vr;
+                "NICKNAMES" => {
+                    for v in list_to_vec(val_list) {
+                        nicknames.push(normalize_package_name(&val_as_str(v)));
+                    }
                 }
+                "INTERN" | "SHADOW" => {
+                    for v in list_to_vec(val_list) {
+                        interns.push(symbol_bare_name(&sym_name(v)));
+                    }
+                }
+                "IMPORT-FROM" | "SHADOWING-IMPORT-FROM" => {
+                    let vals = list_to_vec(val_list);
+                    if let Some((pkg, syms)) = vals.split_first() {
+                        let from = resolve_package_name(env, &val_as_str(*pkg));
+                        for s in syms {
+                            import_from.push((from.clone(), symbol_bare_name(&sym_name(*s))));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         c = rest;
@@ -9427,12 +9808,44 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         PackageDef {
             name: pkg_name.clone(),
             nicknames,
-            exports,
+            exports: exports.clone(),
             uses,
             symbols: HashMap::new(),
         },
     );
     reader::register_package(&pkg_name);
+
+    // Import named symbols so they are accessible (and identical) in this
+    // package; fall back to a fresh internal symbol if the source lacks it.
+    for (from, sym_name_str) in &import_from {
+        let found = find_symbol_in_package(env, from, sym_name_str).map(|(sym, _)| sym);
+        match found {
+            Some(sym) => {
+                if let Some(def) = Rc::make_mut(&mut env.packages).get_mut(&pkg_name) {
+                    def.symbols.insert(sym_name_str.clone(), sym);
+                }
+            }
+            None => {
+                intern_into_package(env, &pkg_name, sym_name_str);
+            }
+        }
+    }
+    // Intern :intern/:shadow symbols as internal symbols.
+    for name in &interns {
+        intern_into_package(env, &pkg_name, name);
+    }
+    // Intern each exported symbol so FIND-SYMBOL sees it as external (unless it
+    // was already imported, in which case that symbol keeps its identity).
+    for name in &exports {
+        let already = env
+            .packages
+            .get(&pkg_name)
+            .map(|def| def.symbols.contains_key(name))
+            .unwrap_or(false);
+        if !already {
+            intern_into_package(env, &pkg_name, name);
+        }
+    }
 
     Ok(T)
 }
