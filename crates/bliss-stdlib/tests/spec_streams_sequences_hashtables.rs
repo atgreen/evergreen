@@ -508,3 +508,27 @@ fn synchronized_and_weak_hash_table_modes_preserve_normal_operations() {
         assert_eq!(hash_table_count(table).unwrap(), 0);
     }
 }
+
+#[test]
+fn strings_are_sequences() {
+    // ANSI: a string is a sequence of characters. Regression for bliss-2pt.9
+    // (LENGTH on a string reproduced the ASDF "not of type sequence" error).
+    let s = make_lisp_string("hello");
+    assert_eq!(sequences::length(s).unwrap(), 5);
+    assert_eq!(sequences::elt(s, 0).unwrap(), BlissVal::from_char('h'));
+    assert_eq!(sequences::elt(s, 4).unwrap(), BlissVal::from_char('o'));
+    assert!(sequences::elt(s, 5).is_err()); // out of bounds
+
+    // REVERSE and SUBSEQ of a string are strings (same element type).
+    assert_eq!(lisp_string_to_string(sequences::reverse(s).unwrap()), "olleh");
+    assert_eq!(
+        lisp_string_to_string(sequences::subseq(s, 1, Some(3)).unwrap()),
+        "el"
+    );
+
+    // COPY-SEQ preserves contents (read side goes through collect_elements).
+    assert_eq!(
+        sequences::length(sequences::copy_seq(s).unwrap()).unwrap(),
+        5
+    );
+}

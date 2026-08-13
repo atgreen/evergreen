@@ -413,6 +413,10 @@ pub fn length(sequence: BlissVal) -> Result<usize, BlissError> {
     if is_vector(sequence) {
         return Ok(vector_length(sequence));
     }
+    if sequence.is_string() {
+        // Strings are sequences of characters (ANSI). Count characters, not bytes.
+        return Ok(sequence.as_string().chars().count());
+    }
     Err(BlissError::TypeError {
         datum: sequence,
         expected: "sequence".to_string(),
@@ -454,6 +458,18 @@ pub fn elt(sequence: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
         }
         return Ok(vector_elt(sequence, index));
     }
+    if sequence.is_string() {
+        let s = sequence.as_string();
+        match s.chars().nth(index) {
+            Some(c) => return Ok(BlissVal::from_char(c)),
+            None => {
+                return Err(BlissError::TypeError {
+                    datum: sequence,
+                    expected: format!("index {} in bounds (length {})", index, s.chars().count()),
+                });
+            }
+        }
+    }
     Err(BlissError::TypeError {
         datum: sequence,
         expected: "sequence".to_string(),
@@ -492,6 +508,13 @@ pub fn copy_seq(sequence: BlissVal) -> Result<BlissVal, BlissError> {
     if is_vector(sequence) {
         let elems = collect_elements(sequence)?;
         return Ok(build_vector(&elems));
+    }
+    if sequence.is_string() {
+        let s: String = collect_elements(sequence)?
+            .iter()
+            .map(|&c| c.as_char())
+            .collect();
+        return Ok(crate::streams::make_lisp_string_fresh(&s));
     }
     Err(BlissError::TypeError {
         datum: sequence,
@@ -556,6 +579,10 @@ pub fn reverse(sequence: BlissVal) -> Result<BlissVal, BlissError> {
     elems.reverse();
     if is_list(sequence) {
         Ok(build_list(&elems))
+    } else if sequence.is_string() {
+        // REVERSE of a string is a string (ANSI): same element type as input.
+        let s: String = elems.iter().map(|&c| c.as_char()).collect();
+        Ok(crate::streams::make_lisp_string_fresh(&s))
     } else {
         Ok(build_vector(&elems))
     }

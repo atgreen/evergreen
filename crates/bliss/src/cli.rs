@@ -4345,6 +4345,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 return Ok(BlissVal::from_fixnum(bliss_stdlib::length(v)? as i64));
             }
+            "ELT" => {
+                // (elt sequence index) — works on lists, vectors, and strings.
+                let (sf, r) = cp(cdr);
+                let (idxf, _) = cp(r);
+                let seq = eval_form(sf, env)?;
+                let idx = eval_form(idxf, env)?;
+                if !idx.is_fixnum() || idx.as_fixnum() < 0 {
+                    return Err(BlissError::TypeError {
+                        datum: idx,
+                        expected: "non-negative sequence index".into(),
+                    });
+                }
+                return bliss_stdlib::elt(seq, idx.as_fixnum() as usize);
+            }
             "APPEND" => {
                 let mut all = Vec::new();
                 let items = list_to_vec(cdr);
@@ -4361,11 +4375,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(vec_to_list(&all));
             }
             "REVERSE" => {
+                // Delegate to the stdlib so lists, vectors, and strings all
+                // reverse with the correct result type (AGENTS.md: don't
+                // reimplement sequence ops in the interpreter).
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                let mut elems = list_to_vec(v);
-                elems.reverse();
-                return Ok(vec_to_list(&elems));
+                return bliss_stdlib::reverse(v);
             }
             "NTH" => {
                 let (nf, r) = cp(cdr);
