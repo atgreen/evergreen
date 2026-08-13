@@ -155,9 +155,12 @@
 
 (defmacro check-type (place typespec &rest ignore)
   (declare (ignore ignore))
-  `(if (typep ,place ',typespec)
-       ,place
-       (error (format nil "CHECK-TYPE failed: ~S is not of type ~S" ,place ',typespec))))
+  ;; ANSI: signal a correctable TYPE-ERROR with a STORE-VALUE restart that
+  ;; supplies a new value for PLACE. Returns NIL when PLACE already conforms.
+  `(unless (typep ,place ',typespec)
+     (restart-case
+         (error 'type-error :datum ,place :expected-type ',typespec)
+       (store-value (value) (setf ,place value)))))
 
 (defmacro assert (test-form &rest ignore)
   (declare (ignore ignore))
