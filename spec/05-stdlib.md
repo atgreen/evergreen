@@ -88,7 +88,7 @@ These MUST exist before any CL source file can be loaded:
 | Strings | `char`, `schar`, `string=`, `string<`, `make-string` |
 | I/O (minimal) | `read`, `read-char`, `write-char`, `terpri`, `print`, `princ`, `prin1`, `write`, `open`, `close`, `*standard-input*`, `*standard-output*`, `*error-output*` |
 | Reader core | `read`, `read-from-string`, `*readtable*`, `set-macro-character`, `get-macro-character`, dispatch macros |
-| Eval/Apply | `eval`, `apply` (tree-walk interpreter) |
+| Eval/Apply | `eval`, `apply` (source-to-bytecode lowering plus T0 bytecode interpreter) |
 | Packages | `make-package`, `find-package`, `in-package`, `intern`, `export`, `use-package`, `find-symbol` |
 | Definitions | `defun` (macro), `defvar`, `defparameter`, `defconstant`, `defmacro`, `defstruct` (basic) |
 | Macros (core) | `and`, `or`, `when`, `unless`, `cond`, `case`, `do`, `do*`, `dolist`, `dotimes`, `loop` (simple) |

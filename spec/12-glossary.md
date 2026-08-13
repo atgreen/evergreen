@@ -31,7 +31,8 @@
 | **OSR (On-Stack Replacement)** | Transferring execution from one compilation tier to another (typically T0/T1 → T2) at a loop back-edge without restarting the function. | §4.6 (A4.03) |
 | **Deoptimisation** | The reverse of OSR: when a speculative guard fails in T2 code, the compiled frame is deconstructed and execution resumes in the interpreter (T0). | §4.6 (A4.04) |
 | **Uncommon trap** | A guard inserted by the optimising compiler at speculative points; when the guard fails, it triggers deoptimisation and records the reason. | §4.6 (D4.10) |
-| **Tier (T0/T1/T2)** | Execution tiers: T0 = tree-walk interpreter; T1 = baseline compiler (unoptimised native); T2 = optimising compiler (sea-of-nodes, full pass pipeline). | §0 §1.1, §4.4 |
+| **Bliss bytecode** | Architecture-neutral instruction stream produced from macroexpanded forms; executed by T0, serialized in `.bfasl`, and used as the stable PC coordinate system for debug info, profiling, OSR, and deoptimisation. | §4.4 |
+| **Tier (T0/T1/T2)** | Execution tiers: T0 = bytecode interpreter; T1 = baseline compiler (unoptimised native from bytecode); T2 = optimising compiler (sea-of-nodes, full pass pipeline). | §0 §1.1, §4.4 |
 | **Type propagation** | A forward data-flow analysis pass in the T2 compiler that infers CL types for IR nodes, enabling specialisation and type-check elimination. | §4.5 (A4.02 step 2) |
 | **Escape analysis** | An optimisation pass that identifies allocations that do not escape their defining scope, enabling stack-allocation or scalar replacement. | §4.5 (D4.09) |
 | **Linear scan** | The register allocation algorithm used by Bliss: a single pass over SSA live ranges assigning physical registers and spilling to stack slots. | §4.7 (A4.10) |

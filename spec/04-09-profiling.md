@@ -223,13 +223,17 @@ slot:
 Back-edge overflow triggers an OSR (On-Stack Replacement) request
 (§4.8) in addition to setting `hot_flag`.
 
-### 4.9.3.3 T0 Interpreter Counters
+### 4.9.3.3 T0 Bytecode Interpreter Counters
 
-The T0 tree-walk interpreter maintains invocation counts in the
-function object's interpreted metadata (a simple `u32` field, non-atomic
-since T0 functions execute only on the calling thread). When the count
-reaches the T0→T1 threshold, the interpreter enqueues a T1 compilation
-request and continues interpreting until T1 code is installed.
+The T0 bytecode interpreter maintains invocation counts in the function
+metadata and increments bytecode back-edge counters at `BACK_EDGE`
+instructions.  Counter storage follows the same `FnMeta` layout used by T1
+so the tiering scheduler, OSR machinery, and profiler read one shared
+profile shape across tiers.  When the invocation count reaches the T0→T1
+threshold, the interpreter requests T1 compilation and continues interpreting
+until T1 code is installed.  When a bytecode back-edge reaches the OSR
+threshold, the interpreter may request direct OSR into T2 once suitable OSR
+entry metadata exists.
 
 ---
 

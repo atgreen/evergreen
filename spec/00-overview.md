@@ -116,18 +116,22 @@ stages.
 
 | Tier | Name | When | Output |
 |------|------|------|--------|
-| T0 | **Tree-walk interpreter** | First call | Direct AST eval |
-| T1 | **Baseline compiler** | Call count ≥ 10 | Unoptimised native code |
+| T0 | **Bytecode interpreter** | First call | Portable Bliss bytecode |
+| T1 | **Baseline compiler** | Call count ≥ 10 | Unoptimised native code compiled from bytecode |
 | T2 | **Optimising compiler** | Hot loop / call count ≥ 5000 | Optimised native via IR |
 
 Tier transitions are managed by the **Profiling Subsystem** (§4.9) which
 inserts counters and traps, exactly as HotSpot's C1/C2 pipeline does.
+Source forms are never the long-lived execution representation: the reader
+and macroexpander produce forms, the compiler front-end lowers them to
+portable Bliss bytecode, and every tier uses bytecode PCs as the stable
+debugging, profiling, OSR, and deoptimisation coordinate system.
 
 ### 1.2  Language Used per Layer
 
 | Layer | Language | Rationale |
 |-------|----------|-----------|
-| Platform abstraction, GC inner loops, bootstrap reader/eval | Rust | Safety, performance, no runtime dependency |
+| Platform abstraction, GC inner loops, bootstrap reader/bytecode interpreter | Rust | Safety, performance, no runtime dependency |
 | Standard library, compiler middle-end/back-end, CLOS | Common Lisp (self-hosted) | Dogfooding, expressiveness |
 | Build orchestration | Cargo + Make | Standard Rust tooling |
 

@@ -575,9 +575,13 @@ consists of:
 2. **Output translations:** Default output directory is
    `~/.cache/bliss/asdf/<implementation-version>/` so FASL files do not
    collide with other CL implementations.
-3. **FASL format:** Bliss FASL files (`.bfasl`) contain serialised T1
-   compiled code. When loaded, hot functions may be promoted to T2 by
-   the tiered compilation system (§4).
+3. **FASL format:** Bliss FASL files (`.bfasl`) are architecture-neutral
+   compiled-unit files.  They contain portable Bliss bytecode plus constant
+   pools, symbol/package references, source maps, stack maps, unwind tables,
+   verification metadata, and optional cached T1 code for the producing
+   platform.  When loaded on another architecture, the bytecode is interpreted
+   at T0 or recompiled to local T1 code.  Hot functions may be promoted to T2
+   by the tiered compilation system (§4).
 4. **`require` hook:** `(require :name)` first checks built-in modules,
    then delegates to `asdf:load-system`.
 5. **Compilation policy:** Files compiled via ASDF `compile-op` are

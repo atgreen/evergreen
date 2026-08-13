@@ -93,9 +93,9 @@ subsection; the master list is collected here for cross-referencing.
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R4.23 | T0 MUST interpret any valid CL form without prior compilation | MUST |
+| R4.23 | The compiler front-end MUST lower any valid executable CL form to portable Bliss bytecode before T0 execution | MUST |
 | R4.24 | T0 MUST maintain per-function invocation counters (§4.9) | MUST |
-| R4.25 | T1 MUST compile a CL function from AST to native code with < 1 ms latency for typical functions (≤ 200 AST nodes) | MUST |
+| R4.25 | T1 MUST compile a CL function from Bliss bytecode to native code with < 1 ms latency for typical functions (≤ 200 bytecode instructions) | MUST |
 | R4.26 | T1 code MUST include profiling stubs for T2 promotion | MUST |
 | R4.27 | T2 MUST apply the full optimisation pass pipeline (§4.5) | MUST |
 | R4.28 | Tier promotion thresholds MUST be configurable at runtime | MUST |
@@ -242,15 +242,18 @@ motion by default.
 
 See `spec/04-04-tiered.md` for the full specification.
 
-**T0 — Tree-Walk Interpreter:**  Directly evaluates the AST / s-expression
-tree.  Maintains invocation counters (§4.9).  Used for cold code and
-`eval`.  The interpreter uses a `ValueStack` for locals and an explicit
-environment chain for closures.
+**T0 — Bytecode Interpreter:**  Executes portable Bliss bytecode produced by
+the compiler front-end from macroexpanded forms.  Maintains invocation and
+back-edge counters (§4.9).  Used for cold code, `eval`, bootstrap execution,
+and architecture-independent FASL loading.  The interpreter uses an operand
+stack, lexical frame slots, and bytecode PCs for source maps, OSR, and
+deoptimisation.
 
-**T1 — Baseline Compiler:**  Performs a single-pass walk over the AST,
-emitting native code without constructing an IR graph.  Inserts profiling
-stubs at call sites and back-edges.  Target latency: < 1 ms for a 200-node
-function.  No optimisation beyond constant folding of immediates.
+**T1 — Baseline Compiler:**  Performs a single-pass lowering from bytecode to
+native code without constructing the full sea-of-nodes IR graph.  Inserts
+profiling stubs at call sites and back-edges.  Target latency: < 1 ms for a
+200-instruction function.  No optimisation beyond peephole lowering and
+constant folding of immediates.
 
 **T2 — Optimising Compiler:**  Builds the sea-of-nodes IR (§4.3), runs the
 optimisation pass pipeline (§4.5), lowers to machine-specific nodes, performs
@@ -291,18 +294,19 @@ site and a maximum inlining depth of 5.
 
 See `spec/04-06-osr.md` for the full specification.
 
-**OSR Entry (A4.03):** When a back-edge counter exceeds the T2 threshold,
-the running T0/T1 frame is suspended at the safepoint.  The T2 compiler is
-invoked (if not already running).  Once T2 code is ready, the interpreter/T1
-frame's live locals are mapped to the T2 code's SSA variables via an **OSR
-entry map**, and execution transfers to the T2 loop header.
+**OSR Entry (A4.03):** When a bytecode back-edge counter exceeds the T2
+threshold, the running T0/T1 frame is suspended at the safepoint.  The T2
+compiler is invoked (if not already running).  Once T2 code is ready, the
+interpreter/T1 frame's live locals at the bytecode PC are mapped to the T2
+code's SSA variables via an **OSR entry map**, and execution transfers to the
+T2 loop header.
 
 **OSR Exit / Deoptimisation (A4.04):** When an uncommon trap fires (type
 guard failure, uninitialized variable, changed class), the T2 frame is
 deconstructed:
 1. Read live SSA values from registers/stack via the GC stack map.
 2. Reconstruct an interpreter-compatible `ValueStack` frame.
-3. Set the program counter to the corresponding AST node.
+3. Set the program counter to the corresponding bytecode PC.
 4. Resume in the interpreter (T0).
 
 Uncommon traps record their reason in a per-function **deopt log** for

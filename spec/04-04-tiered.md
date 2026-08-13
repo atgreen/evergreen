@@ -11,7 +11,7 @@ compilation queue, and the interaction with the profiling subsystem (§4.9).
 
 | ID | Requirement |
 |----|-------------|
-| R4.23 | Every user-defined function MUST begin execution at T0 (tree-walk interpreter). |
+| R4.23 | Every user-defined function MUST begin execution at T0 (portable bytecode interpreter). |
 | R4.24 | The runtime MUST promote a function from T0 to T1 when its invocation counter reaches the T0→T1 threshold (default 10). |
 | R4.25 | The runtime MUST promote a function from T1 to T2 when its invocation counter reaches the T1→T2 threshold (default 5 000) **or** a back-edge counter in the function reaches the loop-heat threshold (default 10 000). |
 | R4.26 | T1 compilation MUST complete synchronously on the calling thread before the function's next invocation executes compiled code.  T2 compilation MUST execute on a background compiler thread. |
@@ -26,8 +26,8 @@ compilation queue, and the interaction with the profiling subsystem (§4.9).
 
 ```text
                 ┌─────────────┐
-                │  T0  tree   │  first call
-                │  walk eval  │──────────┐
+                │ T0 bytecode │  first call
+                │ interpreter │──────────┐
                 └─────────────┘          │ invoke_count ≥ T0_T1_THRESHOLD
                                          ▼
                                 ┌─────────────┐
@@ -46,20 +46,57 @@ Each tier is described in detail below.
 
 ---
 
-## 4.4.3  T0 — Tree-Walk Interpreter
+## 4.4.3  T0 — Bytecode Interpreter
 
 ### 4.4.3.1  Purpose
 
-T0 provides immediate execution with zero compilation latency.  Every
-function starts here.  T0 collects invocation counts so the runtime can
-decide when compilation is worthwhile.
+T0 provides architecture-independent cold-code execution with low front-end
+latency.  Every executable form is first lowered to portable Bliss bytecode;
+every user-defined function starts by executing that bytecode.  T0 collects
+invocation and bytecode back-edge counts so the runtime can decide when
+native compilation is worthwhile.
+
+This bytecode layer is the stable execution contract below source forms and
+above native code.  It is the coordinate system for source maps, debugger
+locations, profiling counters, OSR entry, deoptimisation resume, and portable
+`.bfasl` files.
 
 ### 4.4.3.2  Data Structures
 
+#### BytecodeFunction
+
+The compiler front-end lowers a macroexpanded lambda/body form to a
+`BytecodeFunction`.
+
+```rust
+pub struct BytecodeFunction {
+    /// Encoded bytecode instructions.
+    code: Vec<u8>,
+    /// Literal constants referenced by bytecode operands.
+    constants: Vec<BlissVal>,
+    /// Symbol, package, class, and function references.
+    references: Vec<BytecodeRef>,
+    /// Bytecode PC -> source location mapping.
+    source_map: Vec<SourceMapEntry>,
+    /// Exception, cleanup, catch/tagbody, and restart metadata.
+    unwind_table: Vec<UnwindEntry>,
+    /// Bytecode PCs eligible for safepoints, back-edge counting, OSR, and deopt.
+    pc_table: Vec<PcInfo>,
+    /// Maximum operand stack depth required by verifier.
+    max_stack: u16,
+    /// Number of lexical local slots.
+    n_locals: u16,
+}
+```
+
+The bytecode verifier MUST check stack depth, local-slot bounds, branch
+targets, literal/reference indices, unwind-table ranges, and safepoint/PC
+metadata before a `BytecodeFunction` can execute or be serialized to FASL.
+
 #### ValueStack
 
-The interpreter uses an explicit operand stack rather than relying on the
-Rust call stack for recursive evaluation.
+The bytecode interpreter uses an explicit operand stack rather than relying
+on the Rust call stack for recursive evaluation.
 
 ```rust
 /// Interpreter operand stack (per green-thread).
@@ -97,71 +134,81 @@ infinite recursion across N green threads could exhaust process memory.
 The maximum depth SHOULD be set conservatively; users can raise it via the
 environment variable when workloads legitimately require deep stacks.
 
-#### Environment Chain
+#### Lexical Frame
 
-Lexical environments form a singly-linked chain of `EnvFrame` nodes.
-Each frame is heap-allocated when closures may capture it; stack-allocated
-via arena otherwise (escape analysis in the interpreter is trivial: if the
-body contains `LAMBDA`/`FLET`/`LABELS`, heap-allocate).
+Lexical environments are represented as frame slots addressed by bytecode
+operands.  Closed-over slots are boxed into heap-allocated closure cells; all
+other locals live in the current bytecode frame and are visible to the GC
+through the frame's stack map.
 
 ```rust
-pub struct EnvFrame {
-    /// Parent scope (None for the global environment).
-    parent: Option<Arc<EnvFrame>>,
-    /// Bindings: name → slot index.
-    bindings: FxHashMap<SymbolId, BlissVal>,
+pub struct BytecodeFrame {
+    function: *const BytecodeFunction,
+    pc: u32,
+    locals: Vec<BlissVal>,
+    stack_base: usize,
 }
 ```
 
 ### 4.4.3.3  Eval Loop
 
-The core interpreter is a tail-recursive loop driven by an explicit
-work stack that avoids deep Rust recursion.  Signature:
+The core interpreter is a dispatch loop over bytecode instructions.
+Signature:
 
 ```rust
-pub fn eval_loop(
-    form: BlissVal, env: Arc<EnvFrame>,
+pub fn bytecode_loop(
+    function: &BytecodeFunction,
+    frame: &mut BytecodeFrame,
     stack: &mut ValueStack, thread: &mut BlissThread,
 ) -> Result<BlissVal, BlissError>;
 ```
 
-The loop classifies `current` and dispatches:
+Representative bytecodes:
 
-| `classify(current)` | Action |
-|----------------------|--------|
-| `SelfEval` | Return value immediately |
-| `Symbol` | Look up in environment chain |
-| `SpecialForm(kind)` | Handle (see §4.4.3.4); tail-position forms loop back via TCO |
-| `FunctionCall` | Evaluate args, bump `invoke_count`, dispatch to interpreted body (tail-call → loop), compiled entry, or Rust builtin |
-| `MacroCall` | `macroexpand_1`, then loop |
+| Bytecode | Behaviour |
+|----------|-----------|
+| `CONST k` | Push `constants[k]` |
+| `LOAD_LOCAL i` / `STORE_LOCAL i` | Read/write lexical local slot |
+| `LOAD_SPECIAL s` / `STORE_SPECIAL s` | Read/write dynamic value cell |
+| `CALL argc` | Call function value with `argc` arguments |
+| `TAIL_CALL argc` | Tail-call without growing the bytecode frame chain |
+| `RETURN n` | Return `n` values |
+| `BR pc` / `BR_IF_FALSE pc` | Branch to bytecode PC |
+| `PUSH_UNWIND idx` / `POP_UNWIND` | Establish/remove cleanup or non-local-exit metadata |
+| `THROW` / `RETURN_FROM` / `GO` | Transfer using the unwind table |
+| `SAFEPOINT` | Poll GC/yield/interruption and publish frame roots |
+| `BACK_EDGE pc` | Increment back-edge counter, poll safepoint, optionally request OSR |
 
-On every function call, the eval loop atomically increments the callee's
-`invoke_count` and checks against `T0_T1_THRESHOLD`; if reached, it calls
-`request_t1_compilation` synchronously (§4.4.4.2).
+On every function entry, the bytecode loop atomically increments the
+callee's `invoke_count` and checks against `T0_T1_THRESHOLD`; if reached, it
+calls `request_t1_compilation` synchronously (§4.4.4.2).  On every
+`BACK_EDGE`, it increments the function's back-edge counter and checks OSR
+eligibility.
 
-### 4.4.3.4  Special Form Handling
+### 4.4.3.4  Source-to-Bytecode Lowering
 
-The interpreter recognises the following special forms directly (all others
-are macro-expanded before reaching the eval loop):
+Special forms are handled by the bytecode compiler, not by the runtime
+dispatch loop.  All macro expansion completes before lowering.  The compiler
+must lower at least:
 
-| Special Form | Behaviour |
-|-------------|-----------|
-| `IF` | Evaluate test; tail-call into consequent or alternative |
-| `LET` / `LET*` | Extend environment, tail-call body |
-| `PROGN` | Evaluate forms in sequence; last form is tail-call |
-| `SETQ` | Mutate binding in nearest enclosing `EnvFrame` |
-| `QUOTE` | Return datum directly |
-| `FUNCTION` | Close over current environment |
-| `LAMBDA` | Create interpreted closure |
-| `BLOCK` / `RETURN-FROM` | Establish / transfer to non-local exit via `ValueStack::unwind_to` |
-| `TAGBODY` / `GO` | Looping via restart of tagged section |
-| `CATCH` / `THROW` | Dynamic non-local exit |
+| Special Form | Lowering |
+|-------------|----------|
+| `IF` | Conditional branch bytecodes |
+| `LET` / `LET*` | Local slot allocation and stores |
+| `PROGN` | Sequential bytecode emission |
+| `SETQ` | Local/special/global store bytecode |
+| `QUOTE` | Constant-pool reference |
+| `FUNCTION` | Closure object with bytecode or compiled entry |
+| `LAMBDA` | Nested `BytecodeFunction` constant plus closure creation |
+| `BLOCK` / `RETURN-FROM` | Unwind-table entries and transfer bytecodes |
+| `TAGBODY` / `GO` | Label PCs and unwind-table entries |
+| `CATCH` / `THROW` | Dynamic non-local-exit entries |
 | `UNWIND-PROTECT` | Cleanup form always runs |
 | `MULTIPLE-VALUE-CALL/BIND/PROG1` | Multiple-value protocol |
-| `THE` | Type declaration (ignored at T0, recorded for T2) |
-| `LOCALLY` | Declarations wrapper |
-| `LOAD-TIME-VALUE` | Evaluate once and cache |
-| `EVAL-WHEN` | Conditional evaluation per situation |
+| `THE` | Type metadata attached to bytecode PC / value slot |
+| `LOCALLY` | Declaration scope metadata |
+| `LOAD-TIME-VALUE` | Load-time constant cell |
+| `EVAL-WHEN` | Conditional compile/load/eval behavior before lowering |
 
 ### 4.4.3.5  Invocation Counter Maintenance
 
@@ -183,8 +230,10 @@ pub struct FnMeta {
 }
 ```
 
-At T0, only `invoke_count` is bumped (one `fetch_add` per call).  Back-edge
-counting begins at T1 where profiling stubs are emitted.
+At T0, `invoke_count` is bumped at bytecode function entry and
+`back_edge_count` is bumped by `BACK_EDGE` bytecodes.  This lets hot loops OSR
+directly from bytecode to T2 even before a function has reached the call-count
+threshold for T1.
 
 ---
 
@@ -192,9 +241,9 @@ counting begins at T1 where profiling stubs are emitted.
 
 ### 4.4.4.1  Purpose
 
-T1 eliminates interpretation overhead via a fast, single-pass compilation to
-native code.  It trades code quality for compilation speed (target: < 100 µs
-per function for typical sizes).
+T1 eliminates bytecode dispatch overhead via a fast, single-pass compilation
+from bytecode to native code.  It trades code quality for compilation speed
+(target: < 100 µs per function for typical sizes).
 
 ### 4.4.4.2  Compilation Trigger
 
