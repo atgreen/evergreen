@@ -12,6 +12,35 @@ current build stage as a reminder — the read itself is still your job:
 2. Pull individual `spec/NN-*.md` chapters on demand for the subsystem you are
    touching. Do **not** read all ~29 spec files up front.
 
+### Enabling the orientation hook (per-agent, one-time)
+
+`scripts/spec-orient.sh` is committed, but the hook that runs it lives in
+`.claude/settings.json`, which is **gitignored** — so each agent/checkout must
+wire it up locally. Add a `SessionStart` command hook that runs the script.
+For Claude Code, `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "bd prime --hook-json" },
+          { "type": "command", "command": "bash scripts/spec-orient.sh" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+(The `bd prime` entry is the existing Beads hook; keep it and add the
+`spec-orient.sh` line beside it.) Other agent runners can invoke
+`bash scripts/spec-orient.sh` from their equivalent session-start mechanism, or
+just run it manually at the start of a session. The script's stdout is the
+orientation banner and is safe to run anytime.
+
 ## Architecture Principles
 
 - **The interpreter MUST NOT duplicate functionality that belongs in the
