@@ -419,3 +419,34 @@
          (*read-eval* t)
          (*read-suppress* nil))
      ,@body))
+
+;;; ---------------------------------------------------------------------------
+;;; Standard restart-invoking functions (CLHS 9.1.4.2.2). Each finds the named
+;;; restart (optionally associated with CONDITION) and invokes it; STORE-VALUE
+;;; and USE-VALUE pass their argument to the restart function. See spec §5.4.
+;;; ---------------------------------------------------------------------------
+
+(defun continue (&optional condition)
+  "Invoke the most recent CONTINUE restart, or return NIL if none is active."
+  (let ((r (find-restart 'continue condition)))
+    (when r (invoke-restart r))))
+
+(defun abort (&optional condition)
+  "Invoke the most recent ABORT restart; signal an error if none is active."
+  (let ((r (find-restart 'abort condition)))
+    (if r (invoke-restart r) (error "no ABORT restart is active"))))
+
+(defun muffle-warning (&optional condition)
+  "Invoke the most recent MUFFLE-WARNING restart; error if none is active."
+  (let ((r (find-restart 'muffle-warning condition)))
+    (if r (invoke-restart r) (error "no MUFFLE-WARNING restart is active"))))
+
+(defun store-value (value &optional condition)
+  "Invoke the most recent STORE-VALUE restart with VALUE, or NIL if none."
+  (let ((r (find-restart 'store-value condition)))
+    (when r (invoke-restart r value))))
+
+(defun use-value (value &optional condition)
+  "Invoke the most recent USE-VALUE restart with VALUE, or NIL if none."
+  (let ((r (find-restart 'use-value condition)))
+    (when r (invoke-restart r value))))
