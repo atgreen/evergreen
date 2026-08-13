@@ -4300,6 +4300,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let closure_sym = resolve_sym("BLISS::CLOSURE").unwrap_or(NIL);
                 return Ok(arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)));
             }
+            "EVAL" => {
+                // (eval form): evaluate the argument to obtain the form, then
+                // evaluate that form. CL specifies the null lexical environment;
+                // the tree-walker evaluates in the current env, which suffices
+                // for the global/dynamic forms ASDF passes to EVAL.
+                let (form_form, _) = cp(cdr);
+                let form = eval_form(form_form, env)?;
+                return eval_form(form, env);
+            }
             "FUNCALL" => {
                 let (fn_form, args_form) = cp(cdr);
                 let fn_val = eval_form(fn_form, env)?;
@@ -5507,6 +5516,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .ok()
                     .map(|value| arena_str(&value))
                     .unwrap_or(NIL));
+            }
+            "BLISS-EXT:GETCWD" => {
+                // Current working directory as a namestring with a trailing
+                // slash (a directory namestring), for ASDF's getcwd (#+bliss).
+                return Ok(std::env::current_dir()
+                    .ok()
+                    .map(|p| {
+                        let mut s = p.to_string_lossy().into_owned();
+                        if !s.ends_with('/') {
+                            s.push('/');
+                        }
+                        arena_str(&s)
+                    })
+                    .unwrap_or(NIL));
+            }
+            "BLISS-EXT:RAW-COMMAND-LINE-ARGUMENTS" => {
+                // The process argv as a list of strings (program name first),
+                // matching SBCL's sb-ext:*posix-argv*, for ASDF (#+bliss).
+                let argv: Vec<BlissVal> = std::env::args().map(|a| arena_str(&a)).collect();
+                return Ok(vec_to_list(&argv));
             }
             "READ-LINE" => {
                 // (read-line &optional stream eof-error-p eof-value)

@@ -2350,7 +2350,8 @@ suitable for use as a directory name to segregate Lisp FASLs, C dynamic librarie
 
   (defun getcwd ()
     "Get the current working directory as per POSIX getcwd(3), as a pathname object"
-    (or #+(or abcl genera mezzano xcl) (truename *default-pathname-defaults*) ;; d-p-d is canonical!
+    (or #+bliss (parse-namestring (bliss-ext:getcwd))
+        #+(or abcl genera mezzano xcl) (truename *default-pathname-defaults*) ;; d-p-d is canonical!
         #+allegro (excl::current-directory)
         #+clisp (ext:default-directory)
         #+clozure (ccl:current-directory)
@@ -4888,6 +4889,7 @@ depending on whether *LISP-INTERACTION* is set, enter debugger or die"
 (with-upgradability ()
   (defun raw-command-line-arguments ()
     "Find what the actual command line for this process was."
+    #+bliss (bliss-ext:raw-command-line-arguments)
     #+abcl ext:*command-line-argument-list* ; Use 1.0.0 or later!
     #+allegro (sys:command-line-arguments) ; default: :application t
     #+(or clasp ecl) (loop :for i :from 0 :below (si:argc) :collect (si:argv i))
@@ -4900,7 +4902,7 @@ depending on whether *LISP-INTERACTION* is set, enter debugger or die"
     #+mkcl (loop :for i :from 0 :below (mkcl:argc) :collect (mkcl:argv i))
     #+sbcl sb-ext:*posix-argv*
     #+xcl system:*argv*
-    #-(or abcl allegro clasp clisp clozure cmucl ecl gcl genera lispworks mcl mezzano mkcl sbcl scl xcl)
+    #-(or abcl allegro bliss clasp clisp clozure cmucl ecl gcl genera lispworks mcl mezzano mkcl sbcl scl xcl)
     (not-implemented-error 'raw-command-line-arguments))
 
   (defun command-line-arguments (&optional (arguments (raw-command-line-arguments)))
