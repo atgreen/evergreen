@@ -1239,3 +1239,25 @@ fn gcd_lcm_and_string_trim() {
         );
     }
 }
+
+/// Regression: FORMAT ~w,dF honors d (decimal places) and w (width). Previously
+/// the d parameter was ignored, so ~,2F printed full precision. (bliss-2pt.13)
+#[test]
+fn format_fixed_float_directive() {
+    let cases = [
+        ("(format nil \"~,2f\" 3.14159)", "\"3.14\""),
+        ("(format nil \"~,3f\" 3.14159)", "\"3.142\""),
+        ("(format nil \"~8,2f\" 3.14159)", "\"    3.14\""),
+        ("(format nil \"~,0f\" 3.7)", "\"4\""),
+        ("(format nil \"~f\" 2.5)", "\"2.5\""),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(expected),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}

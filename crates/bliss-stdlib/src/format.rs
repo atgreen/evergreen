@@ -963,7 +963,27 @@ fn format_impl(
                         expected: "number".into(),
                     });
                 };
-                output.push_str(&format!("{}", f));
+                // ~w,dF: d = digits after the decimal point, w = minimum width.
+                let d = if params.len() > 1 {
+                    let dd = resolve_param(&params[1], -1, arg_idx)?;
+                    if dd >= 0 { Some(dd as usize) } else { None }
+                } else {
+                    None
+                };
+                let mut s = match d {
+                    Some(dd) => format!("{:.*}", dd, f),
+                    None => format!("{}", f),
+                };
+                let w = if !params.is_empty() {
+                    resolve_param(&params[0], 0, arg_idx)? as usize
+                } else {
+                    0
+                };
+                if s.len() < w {
+                    let pad: String = std::iter::repeat_n(' ', w - s.len()).collect();
+                    s = format!("{pad}{s}");
+                }
+                output.push_str(&s);
             }
             'E' => {
                 if *arg_idx >= args.len() {
