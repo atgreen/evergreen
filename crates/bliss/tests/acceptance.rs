@@ -1395,6 +1395,65 @@ fn handler_clusters_disestablish_whole_cluster_on_resignal() {
     }
 }
 
+/// R2.20 / bliss-nmq: runaway interpreter recursion raises a catchable
+/// STORAGE-CONDITION via a host-stack depth guard, instead of overflowing the
+/// native stack into a process-killing SIGSEGV.
+#[test]
+fn deep_recursion_raises_catchable_storage_condition_not_sigsegv() {
+    // Caught as STORAGE-CONDITION (its own type)…
+    let caught = bliss_bin()
+        .args([
+            "--eval",
+            "(handler-case (labels ((f (n) (+ 1 (f (+ n 1))))) (f 0)) \
+               (storage-condition (e) (declare (ignore e)) :caught))",
+        ])
+        .output()
+        .expect("run bliss");
+    assert_eq!(caught.status.code(), Some(0), "overflow should be catchable, exit 0");
+    assert!(
+        String::from_utf8_lossy(&caught.stdout).to_uppercase().contains("CAUGHT"),
+        "storage-condition clause should fire: {}",
+        String::from_utf8_lossy(&caught.stdout)
+    );
+
+    // …and as the CONDITION superclass.
+    let via_super = bliss_bin()
+        .args([
+            "--eval",
+            "(handler-case (labels ((f () (f))) (f)) \
+               (condition (e) (declare (ignore e)) :caught))",
+        ])
+        .output()
+        .expect("run bliss");
+    assert!(
+        String::from_utf8_lossy(&via_super.stdout).to_uppercase().contains("CAUGHT"),
+        "condition clause should fire on overflow"
+    );
+
+    // Uncaught overflow must still exit gracefully — a normal exit code, never a
+    // signal (status.code() == None would mean the process was killed, e.g. by
+    // SIGSEGV/SIGABRT).
+    let uncaught = bliss_bin()
+        .args(["--eval", "(labels ((f () (f))) (f))"])
+        .output()
+        .expect("run bliss");
+    assert!(
+        uncaught.status.code().is_some(),
+        "uncaught stack overflow must not kill the process with a signal"
+    );
+
+    // A recursion depth well within budget still runs normally.
+    let ok = bliss_bin()
+        .args([
+            "--eval",
+            "(labels ((down (n) (if (= n 0) :done (down (- n 1))))) (down 1500))",
+        ])
+        .output()
+        .expect("run bliss");
+    assert_eq!(ok.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&ok.stdout).to_uppercase().contains("DONE"));
+}
+
 /// Regression: PSETQ, DO, and DO* iteration macros (bliss-2pt.11).
 #[test]
 fn do_dostar_psetq() {

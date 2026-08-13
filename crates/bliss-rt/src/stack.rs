@@ -82,6 +82,51 @@ impl BlissStack {
     }
 }
 
+/// Byte budget for the interpreter's *host* (Rust) call-stack use before it must
+/// raise `STORAGE-CONDITION` rather than let the native stack overflow into a
+/// process-killing signal (R2.20). Derived from the OS soft stack limit
+/// (`RLIMIT_STACK`) minus a red zone, so the guard fires with headroom to spare;
+/// overridable with `BLISS_MAX_EVAL_STACK_BYTES`.
+///
+/// This is an interim guard for the tree-walker, whose activations live on the
+/// Rust stack. Once CL activations move onto the per-green-thread `BlissStack`
+/// (bliss-nmq), overflow is bounded by that stack's own capacity instead.
+pub fn eval_stack_budget() -> usize {
+    // Red zone left below the OS limit. The guard is polled at every CL call
+    // boundary, so the most stack that can be consumed between two checks is a
+    // single call's worth of host frames (kilobytes) — 1 MiB is ample headroom
+    // to unwind and run a handler after the guard fires.
+    const RED_ZONE: usize = 1024 * 1024;
+    const FLOOR: usize = 1024 * 1024;
+    const DEFAULT: usize = 7 * 1024 * 1024;
+
+    if let Ok(v) = std::env::var("BLISS_MAX_EVAL_STACK_BYTES") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        // SAFETY: getrlimit with a valid, zero-initialised rlimit and a supported
+        // resource id. Reads only; no aliasing concerns.
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut rl) } == 0 {
+            let soft = rl.rlim_cur;
+            if soft != 0 && soft != libc::RLIM_INFINITY {
+                return (soft as usize).saturating_sub(RED_ZONE).max(FLOOR);
+            }
+        }
+    }
+
+    DEFAULT
+}
+
 // ── Frame layout ───────────────────────────────────────────────────
 
 /// Fixed-layout frame header (40 bytes). D2.02.

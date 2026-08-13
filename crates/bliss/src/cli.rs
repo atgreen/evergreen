@@ -626,6 +626,54 @@ thread_local! {
 
 static MACRO_FUNCTION_HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+thread_local! {
+    /// Host (Rust) stack address of the outermost interpreter call, captured
+    /// lazily. Interpreted CL activations live on the Rust stack in the current
+    /// tree-walker (see §2.4.4 / bliss-nmq), so we bound how far below this base
+    /// recursion may grow.
+    static EVAL_STACK_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Byte budget below `EVAL_STACK_BASE`; 0 until first initialised from
+    /// `bliss_rt::eval_stack_budget()`.
+    static EVAL_STACK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Guard interpreter recursion so runaway CL recursion raises a catchable
+/// `STORAGE-CONDITION` (via `BlissError::StackOverflow` → the preallocated pool)
+/// instead of overflowing the native stack into a process-killing `SIGSEGV`
+/// (R2.20). Called at each CL call boundary (`eval_lambda_call`). The stack
+/// grows downward, so depth below the captured base is `base - current_sp`.
+///
+/// Interim measure for the Rust-stack tree-walker; superseded once activations
+/// move onto the per-green-thread `BlissStack` (bliss-nmq).
+#[inline]
+fn check_eval_stack_depth() -> Result<(), BlissError> {
+    let probe = 0u8;
+    let sp = std::ptr::addr_of!(probe) as usize;
+    let base = EVAL_STACK_BASE.with(|b| {
+        let cur = b.get();
+        if cur == 0 {
+            b.set(sp);
+            sp
+        } else {
+            cur
+        }
+    });
+    let limit = EVAL_STACK_LIMIT.with(|l| {
+        let cur = l.get();
+        if cur == 0 {
+            let v = bliss_rt::eval_stack_budget();
+            l.set(v);
+            v
+        } else {
+            cur
+        }
+    });
+    if base.saturating_sub(sp) > limit {
+        return Err(BlissError::StackOverflow(bliss_rt::GreenThreadId(0)));
+    }
+    Ok(())
+}
+
 fn next_control_token(prefix: &str) -> String {
     let id = CONTROL_COUNTER.with(|counter| {
         let id = *counter.borrow();
@@ -789,12 +837,18 @@ fn bliss_error_to_condition(
         BlissError::PackageError(_) => build_condition_instance(env, "PACKAGE-ERROR", &[])?,
         BlissError::StreamError(_) => build_condition_instance(env, "STREAM-ERROR", &[])?,
         BlissError::FileError(_) => build_condition_instance(env, "FILE-ERROR", &[])?,
-        BlissError::Oom | BlissError::StackOverflow(_) => {
-            // R5.110: on the storage-failure path allocation is already failing,
-            // so hand back a STORAGE-CONDITION preallocated at startup rather than
-            // building a fresh instance (which would intern/define classes and
-            // allocate). See bliss-uh4.2. HANDLER-CASE still catches it normally.
+        BlissError::Oom => {
+            // Heap is exhausted: the storage-failure path must not allocate, so
+            // hand back a STORAGE-CONDITION preallocated at startup rather than
+            // building a fresh instance (R5.110, bliss-uh4.2).
             bliss_stdlib::acquire_preallocated_storage_condition()?
+        }
+        BlissError::StackOverflow(_) => {
+            // Only the control stack overflowed — the heap is fine — so build a
+            // CLI-native STORAGE-CONDITION here (allocation is safe, and unlike a
+            // preallocated stdlib-pool instance it is recognised by the CLI's
+            // condition type matching). R2.20; see bliss-nmq.
+            build_condition_instance(env, "STORAGE-CONDITION", &[])?
         }
         BlissError::SandboxViolation(msg) => make_simple_error_condition(arena_str(msg), env)?,
         BlissError::ProgramError(_) => build_condition_instance(env, "PROGRAM-ERROR", &[])?,
@@ -2056,6 +2110,7 @@ fn eval_lambda_call(
     args: &[BlissVal],
     parent: Rc<RefCell<EnvFrame>>,
 ) -> Result<BlissVal, BlissError> {
+    check_eval_stack_depth()?;
     with_child_frame(env, parent, |env| {
         bind_lambda_list(params_form, args, env)?;
         // Arguments are a single-value context; a producer evaluated as an
