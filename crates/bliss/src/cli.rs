@@ -777,6 +777,7 @@ fn bliss_error_to_condition(
             build_condition_instance(env, "STORAGE-CONDITION", &[])?
         }
         BlissError::SandboxViolation(msg) => make_simple_error_condition(arena_str(msg), env)?,
+        BlissError::ProgramError(_) => build_condition_instance(env, "PROGRAM-ERROR", &[])?,
         _ => return Ok(None),
     };
     Ok(Some(condition))
@@ -893,6 +894,33 @@ fn signal_condition_object(condition: BlissVal, env: &mut Env) -> Result<BlissVa
         }
     }
     Ok(NIL)
+}
+
+/// Run the HANDLER-BIND handlers in `env.handlers[lo..hi]` against `condition`,
+/// newest-first, for a raw evaluator error that bypassed `signal_condition_object`.
+/// Only this range (the handlers a single HANDLER-BIND frame established) is run,
+/// so as the error unwinds each enclosing frame runs its own handlers exactly
+/// once. While a handler runs, it and all newer handlers are disestablished
+/// (R5.94/R5.102) so a re-signal is seen only by older handlers. `Ok(())` means
+/// every matching handler declined (returned normally); `Err` means a handler
+/// transferred control (INVOKE-RESTART, non-local exit) and that must propagate.
+fn run_handler_bind_handlers(
+    env: &mut Env,
+    condition: BlissVal,
+    lo: usize,
+    hi: usize,
+) -> Result<(), BlissError> {
+    let handlers = env.handlers.clone();
+    let hi = hi.min(handlers.len());
+    for i in (lo..hi).rev() {
+        if condition_matches_handler(env, condition, &handlers[i].type_name) {
+            env.handlers = handlers[..i].to_vec();
+            let result = eval_handler_impl(&handlers[i].handler, condition, env);
+            env.handlers = handlers.clone();
+            result?;
+        }
+    }
+    Ok(())
 }
 
 /// Signal `condition` through the active handler stack. If a handler transfers
@@ -4759,100 +4787,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     _ => vec_to_list(&results),
                 });
             }
-            "FIND" => {
-                let (item_form, r) = cp(cdr);
-                let (seq_form, mut rest) = cp(r);
-                let item = eval_form(item_form, env)?;
-                let seq = eval_form(seq_form, env)?;
-                let mut test = NIL;
-                let mut key = None;
-                let mut start = 0usize;
-                let mut end = None;
-                let mut from_end = false;
-                while rest.is_cons() {
-                    let (kw, r2) = cp(rest);
-                    if !r2.is_cons() {
-                        break;
-                    }
-                    let (value_form, r3) = cp(r2);
-                    let value = eval_form(value_form, env)?;
-                    if kw.is_symbol() {
-                        let name = sym_name(kw);
-                        match name.strip_prefix("KEYWORD:").unwrap_or(&name) {
-                            "TEST" => test = value,
-                            "KEY" => key = Some(value),
-                            "START" => start = num_val(value)? as usize,
-                            "END" => end = Some(num_val(value)? as usize),
-                            "FROM-END" => from_end = !value.is_nil(),
-                            _ => {}
-                        }
-                    }
-                    rest = r3;
-                }
-                return bliss_stdlib::find(item, seq, test, key, start, end, from_end);
-            }
-            "POSITION" => {
-                let (item_form, r) = cp(cdr);
-                let (seq_form, mut rest) = cp(r);
-                let item = eval_form(item_form, env)?;
-                let seq = eval_form(seq_form, env)?;
-                let mut test = NIL;
-                let mut key = None;
-                let mut start = 0usize;
-                let mut end = None;
-                let mut from_end = false;
-                while rest.is_cons() {
-                    let (kw, r2) = cp(rest);
-                    if !r2.is_cons() {
-                        break;
-                    }
-                    let (value_form, r3) = cp(r2);
-                    let value = eval_form(value_form, env)?;
-                    if kw.is_symbol() {
-                        let name = sym_name(kw);
-                        match name.strip_prefix("KEYWORD:").unwrap_or(&name) {
-                            "TEST" => test = value,
-                            "KEY" => key = Some(value),
-                            "START" => start = num_val(value)? as usize,
-                            "END" => end = Some(num_val(value)? as usize),
-                            "FROM-END" => from_end = !value.is_nil(),
-                            _ => {}
-                        }
-                    }
-                    rest = r3;
-                }
-                return bliss_stdlib::position(item, seq, test, key, start, end, from_end);
-            }
-            "COUNT" => {
-                let (item_form, r) = cp(cdr);
-                let (seq_form, mut rest) = cp(r);
-                let item = eval_form(item_form, env)?;
-                let seq = eval_form(seq_form, env)?;
-                let mut test = NIL;
-                let mut key = None;
-                let mut start = 0usize;
-                let mut end = None;
-                while rest.is_cons() {
-                    let (kw, r2) = cp(rest);
-                    if !r2.is_cons() {
-                        break;
-                    }
-                    let (value_form, r3) = cp(r2);
-                    let value = eval_form(value_form, env)?;
-                    if kw.is_symbol() {
-                        let name = sym_name(kw);
-                        match name.strip_prefix("KEYWORD:").unwrap_or(&name) {
-                            "TEST" => test = value,
-                            "KEY" => key = Some(value),
-                            "START" => start = num_val(value)? as usize,
-                            "END" => end = Some(num_val(value)? as usize),
-                            _ => {}
-                        }
-                    }
-                    rest = r3;
-                }
-                return bliss_stdlib::count(item, seq, test, key, start, end);
-            }
+            // FIND / POSITION / COUNT are defined in lib/boot.lisp over
+            // ELT/LENGTH/FUNCALL so their :key/:test can be any interpreter
+            // function.  The stdlib helpers only understood a fixed set of
+            // sentinel keys and panicked (aborting the process) on a real
+            // function — see bliss-0l1.  No builtin arm here means these names
+            // fall through to the user/boot function table below.
             "MEMBER" => {
                 let (item_f, r) = cp(cdr);
                 let (list_f, _) = cp(r);
@@ -8751,7 +8691,7 @@ fn bind_lambda_list(
         match mode {
             Mode::Req => {
                 let v = args.get(arg_i).copied().ok_or_else(|| {
-                    BlissError::Internal(format!(
+                    BlissError::ProgramError(format!(
                         "too few arguments for lambda list: missing value for {}",
                         sym_name(elem)
                     ))
@@ -8864,7 +8804,7 @@ fn bind_lambda_list(
             }
         }
     } else if !rest_bound && arg_i < args.len() {
-        return Err(BlissError::Internal(format!(
+        return Err(BlissError::ProgramError(format!(
             "too many arguments for lambda list: expected {}, got {}",
             arg_i,
             args.len()
@@ -8879,7 +8819,7 @@ fn bind_pattern_value(pattern: BlissVal, value: BlissVal, env: &mut Env) -> Resu
         if value.is_nil() {
             return Ok(());
         }
-        return Err(BlissError::Internal(format!(
+        return Err(BlissError::ProgramError(format!(
             "destructuring mismatch: expected NIL, got {}",
             format_val(value)
         )));
@@ -8891,14 +8831,14 @@ fn bind_pattern_value(pattern: BlissVal, value: BlissVal, env: &mut Env) -> Resu
     }
 
     if !pattern.is_cons() {
-        return Err(BlissError::Internal(format!(
+        return Err(BlissError::ProgramError(format!(
             "invalid destructuring pattern: {}",
             format_val(pattern)
         )));
     }
 
     if !value.is_cons() {
-        return Err(BlissError::Internal(format!(
+        return Err(BlissError::ProgramError(format!(
             "destructuring mismatch: expected list for pattern {}, got {}",
             format_val(pattern),
             format_val(value)
@@ -8953,7 +8893,7 @@ fn bind_macro_param(
         if value.is_nil() {
             return Ok(());
         }
-        return Err(BlissError::Internal(format!(
+        return Err(BlissError::ProgramError(format!(
             "destructuring mismatch: expected NIL, got {}",
             format_val(value)
         )));
@@ -8963,7 +8903,7 @@ fn bind_macro_param(
         return Ok(());
     }
     if !pattern.is_cons() {
-        return Err(BlissError::Internal(format!(
+        return Err(BlissError::ProgramError(format!(
             "invalid destructuring pattern: {}",
             format_val(pattern)
         )));
@@ -8978,7 +8918,7 @@ fn bind_macro_param(
     // keyword-bearing lambda list nested *deeper* is still detected. A symbol in
     // the cdr position binds the rest (dotted patterns).
     if !value.is_cons() {
-        return Err(BlissError::Internal(format!(
+        return Err(BlissError::ProgramError(format!(
             "destructuring mismatch: expected list for pattern {}, got {}",
             format_val(pattern),
             format_val(value)
@@ -9067,7 +9007,7 @@ fn bind_macro_lambda_list(
         match mode {
             Mode::Req => {
                 let v = args.get(arg_i).copied().ok_or_else(|| {
-                    BlissError::Internal(format!(
+                    BlissError::ProgramError(format!(
                         "too few arguments for macro lambda list: missing value for {}",
                         format_val(elem)
                     ))
@@ -9228,7 +9168,7 @@ fn bind_macro_lambda_list(
             }
         }
     } else if !rest_bound && arg_i < args.len() {
-        return Err(BlissError::Internal(format!(
+        return Err(BlissError::ProgramError(format!(
             "too many arguments for macro lambda list: expected {}, got {}",
             arg_i,
             args.len()
@@ -10258,6 +10198,7 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
 // ── HANDLER-BIND ────────────────────────────────────────────────
 fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (bindings_form, body) = cp(cdr);
+    let base_len = env.handlers.len();
 
     // Parse handler bindings and install them
     let mut c = bindings_form;
@@ -10272,16 +10213,40 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
         });
         c = rest;
     }
+    let installed_hi = env.handlers.len();
 
     let result = eval_progn(body, env);
 
-    // Clean up handlers (pop what we added)
-    let binding_count = list_to_vec(bindings_form).len();
-    for _ in 0..binding_count {
-        env.handlers.pop();
-    }
+    // Conditions raised through SIGNAL/ERROR already ran the handler stack at
+    // signal time (signal_condition_object). Raw evaluator errors — TYPE-ERROR
+    // from (car 5), UNBOUND-VARIABLE, PROGRAM-ERROR, arithmetic, … — do not pass
+    // through that machinery, so give the handlers this HANDLER-BIND established
+    // their turn now, on the unwind: build the condition the error denotes and
+    // run our handlers newest-first. A handler that declines (returns) lets the
+    // original error keep propagating, so enclosing frames still see it; a
+    // handler that transfers control (INVOKE-RESTART, non-local exit) surfaces as
+    // a different error, which we propagate instead. Non-condition errors
+    // (control tokens, Shutdown) convert to None and are left untouched.
+    //
+    // Because a raw error unwinds the interpreter stack before reaching here, a
+    // handler can only invoke restarts that ENCLOSE this HANDLER-BIND; a restart
+    // established inside its body is already gone. The fully general fix is to
+    // signal raw errors at generation time (bliss-qry) — a runtime-model change.
+    let outcome = match result {
+        Ok(value) => Ok(value),
+        Err(error) => match bliss_error_to_condition(env, &error) {
+            Ok(Some(condition)) => {
+                match run_handler_bind_handlers(env, condition, base_len, installed_hi) {
+                    Ok(()) => Err(error),
+                    Err(transfer) => Err(transfer),
+                }
+            }
+            _ => Err(error),
+        },
+    };
 
-    result
+    env.handlers.truncate(base_len);
+    outcome
 }
 
 fn parse_restart_options(

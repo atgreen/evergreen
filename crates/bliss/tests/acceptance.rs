@@ -1226,6 +1226,114 @@ fn reduce_and_if_predicate_family() {
     }
 }
 
+/// Regression: FIND/POSITION/COUNT/SORT/REMOVE with a real interpreter
+/// :key/:test used to reach a stdlib helper that only understood sentinel keys
+/// and `panic!`ed — aborting the whole process, uncatchable by HANDLER-CASE
+/// (bliss-0l1). They are now defined over ELT/LENGTH/FUNCALL and accept any
+/// function, and no path aborts the process.
+#[test]
+fn sequence_key_test_with_real_functions() {
+    let cases = [
+        // Named function as :key / :test (the original panic repro).
+        ("(find 2 '((1 a) (2 b)) :key (function car))", "(2 B)"),
+        ("(position 3 '(1 2 3) :test (function =))", "2"),
+        ("(count 2 '(1 2 2 3 2) :test (function =))", "3"),
+        // Lambda as :test.
+        ("(find 10 '(1 5 10 20) :test (lambda (a b) (= a b)))", "10"),
+        // :from-end, :start, strings, :test-not.
+        ("(find 2 '((2 a) (2 b)) :key (function car) :from-end t)", "(2 B)"),
+        ("(position #\\a \"banana\" :start 2)", "3"),
+        ("(sort (list (list 2) (list 1)) (function <) :key (function car))", "((1) (2))"),
+        ("(remove \"x\" '(\"a\" \"x\" \"b\") :test (function equal))", "(\"a\" \"b\")"),
+        ("(remove 1 '((1 a) (2 b) (1 c)) :key (function car) :test-not (function =))", "((1 A) (1 C))"),
+        // The unsupported-function path must be catchable, never abort.
+        ("(ignore-errors (find 2 '((1 a) (2 b)) :key (function car)))", "(2 B)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (no panic/abort)");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}
+
+/// Regression: HANDLER-BIND now sees raw evaluator errors, and malformed calls
+/// signal a catchable PROGRAM-ERROR instead of an uncatchable Internal error
+/// (bliss-qry). Control-flow tokens (BLOCK/RETURN-FROM, CATCH/THROW) must never
+/// be misrouted into the condition machinery.
+#[test]
+fn handler_bind_raw_errors_and_program_error() {
+    let cases = [
+        // HANDLER-BIND handler fires on a raw TYPE-ERROR ((car 5)); it declines
+        // (returns), so IGNORE-ERRORS still contains the error. FIRED proves the
+        // handler ran.
+        (
+            "(let ((fired nil)) \
+               (ignore-errors \
+                 (handler-bind ((type-error (lambda (e) (declare (ignore e)) (setq fired t)))) \
+                   (car 5))) \
+               fired)",
+            "T",
+        ),
+        // A HANDLER-BIND handler may invoke a restart that ENCLOSES the binding.
+        (
+            "(restart-case \
+               (handler-bind ((type-error (lambda (e) (declare (ignore e)) (invoke-restart 'my-restart)))) \
+                 (car 5)) \
+               (my-restart () 'restarted))",
+            "RESTARTED",
+        ),
+        // Handler on UNBOUND-VARIABLE fires too.
+        (
+            "(let ((n 0)) \
+               (ignore-errors \
+                 (handler-bind ((unbound-variable (lambda (e) (declare (ignore e)) (incf n)))) \
+                   *definitely-unbound*)) \
+               n)",
+            "1",
+        ),
+        // Declining HANDLER-BIND lets an enclosing HANDLER-CASE catch the error.
+        (
+            "(handler-case \
+               (handler-bind ((type-error (lambda (e) e))) (car 5)) \
+               (type-error (e) (declare (ignore e)) 'outer))",
+            "OUTER",
+        ),
+        // Malformed call (too many arguments) is a catchable PROGRAM-ERROR …
+        (
+            "(handler-case (funcall (lambda (x) x) 1 2 3) (program-error (e) (declare (ignore e)) 'caught-pe))",
+            "CAUGHT-PE",
+        ),
+        // … and hence catchable as its superclass ERROR / by IGNORE-ERRORS.
+        (
+            "(handler-case (funcall (lambda (x) x) 1 2 3) (error (e) (declare (ignore e)) 'caught-err))",
+            "CAUGHT-ERR",
+        ),
+        // Safety: BLOCK/RETURN-FROM and CATCH/THROW tokens are not misrouted even
+        // when a matching HANDLER-BIND is on the stack.
+        (
+            "(block b (handler-bind ((error (lambda (e) (declare (ignore e)) 'nope))) (return-from b 'ok)))",
+            "OK",
+        ),
+        (
+            "(catch 'tag (handler-bind ((error (lambda (e) (declare (ignore e)) 'nope))) (throw 'tag 'thrown)))",
+            "THROWN",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}
+
 /// Regression: PSETQ, DO, and DO* iteration macros (bliss-2pt.11).
 #[test]
 fn do_dostar_psetq() {

@@ -34,6 +34,12 @@ pub enum BlissError {
     /// Invariant violation (runtime bug). Always a non-recoverable error.
     Internal(String),
 
+    /// A program error in the CL sense (malformed call: wrong argument count,
+    /// destructuring mismatch, …). Maps to CL `PROGRAM-ERROR`, so it is a
+    /// catchable condition — unlike `Internal`, which also carries the
+    /// evaluator's control-flow tokens and must keep propagating.
+    ProgramError(String),
+
     /// Type error (wrong argument type). Maps to CL `TYPE-ERROR`.
     TypeError { datum: BlissVal, expected: String },
 
@@ -69,6 +75,7 @@ impl core::fmt::Display for BlissError {
             BlissError::SignalError(sig) => write!(f, "signal error: signal {}", sig),
             BlissError::Shutdown => write!(f, "shutdown requested"),
             BlissError::Internal(msg) => write!(f, "internal error: {}", msg),
+            BlissError::ProgramError(msg) => write!(f, "program error: {}", msg),
             BlissError::TypeError { datum, expected } => {
                 write!(f, "type error: {:?} is not of type {}", datum, expected)
             }

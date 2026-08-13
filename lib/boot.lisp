@@ -297,12 +297,26 @@
         (push x result)))
     (reverse result)))
 
-(defun remove (item seq &rest keys)
-  (declare (ignore keys))
-  (let ((result nil))
-    (dolist (x seq)
-      (unless (eql x item)
-        (push x result)))
+(defun remove (item seq &key key test test-not (start 0) end count)
+  ;; Honour :key/:test/:test-not (the stdlib helper could not invoke an
+  ;; interpreter function and silently ignored them); see bliss-0l1.  Operates
+  ;; over a list view and returns a fresh list, matching the previous behaviour.
+  (let* ((items (coerce seq 'list))
+         (testfn (or test test-not #'eql))
+         (neg (if test-not t nil))
+         (stop (or end (length items)))
+         (result nil)
+         (removed 0)
+         (i 0))
+    (dolist (x items)
+      (if (and (>= i start)
+               (< i stop)
+               (or (null count) (< removed count))
+               (let ((r (funcall testfn item (if key (funcall key x) x))))
+                 (if neg (not r) r)))
+          (incf removed)
+          (push x result))
+      (incf i))
     (reverse result)))
 
 (defun remove-if (pred seq &rest keys)
@@ -525,6 +539,49 @@
     (when (and (consp pair)
                (not (funcall pred (if key (funcall key (car pair)) (car pair)))))
       (return pair))))
+
+;;; Item-based FIND / POSITION / COUNT. Defined in Lisp over ELT/LENGTH/FUNCALL
+;;; (like the -IF family and REDUCE) because the stdlib's internal apply helper
+;;; cannot invoke an interpreter :key/:test — a real function used to reach it
+;;; and panic the whole process. See bliss-0l1 and spec §5.6.
+
+(defun find (item seq &key key test test-not (start 0) end from-end)
+  (let ((testfn (or test test-not #'eql))
+        (neg (if test-not t nil))
+        (stop (or end (length seq))))
+    (flet ((matchp (e)
+             (let ((r (funcall testfn item (if key (funcall key e) e))))
+               (if neg (not r) r))))
+      (if from-end
+          (loop for i from (1- stop) downto start
+                for e = (elt seq i)
+                when (matchp e) return e)
+          (loop for i from start below stop
+                for e = (elt seq i)
+                when (matchp e) return e)))))
+
+(defun position (item seq &key key test test-not (start 0) end from-end)
+  (let ((testfn (or test test-not #'eql))
+        (neg (if test-not t nil))
+        (stop (or end (length seq))))
+    (flet ((matchp (e)
+             (let ((r (funcall testfn item (if key (funcall key e) e))))
+               (if neg (not r) r))))
+      (if from-end
+          (loop for i from (1- stop) downto start
+                when (matchp (elt seq i)) return i)
+          (loop for i from start below stop
+                when (matchp (elt seq i)) return i)))))
+
+(defun count (item seq &key key test test-not (start 0) end)
+  (let ((testfn (or test test-not #'eql))
+        (neg (if test-not t nil))
+        (stop (or end (length seq))))
+    (flet ((matchp (e)
+             (let ((r (funcall testfn item (if key (funcall key e) e))))
+               (if neg (not r) r))))
+      (loop for i from start below stop
+            count (matchp (elt seq i))))))
 
 (defun delete-if (pred seq &rest keys) (apply #'remove-if pred seq keys))
 (defun delete-if-not (pred seq &rest keys) (apply #'remove-if-not pred seq keys))
