@@ -549,7 +549,10 @@ struct RestartEntry {
 enum RestartFunction {
     FunctionForm {
         function_form: BlissVal,
-        captured_frame: Arc<FrozenEnvFrame>,
+        // Share the LIVE lexical frame (like closures/macros) so a setf/setq
+        // inside the restart function persists to the establishing scope.
+        // Frozen snapshots dropped writes (bliss-gd4).
+        captured_frame: Rc<RefCell<EnvFrame>>,
     },
     ContinueNil,
 }
@@ -575,7 +578,8 @@ enum HandlerImpl {
         token: String,
         var_name: Option<String>,
         body: BlissVal,
-        captured_frame: Arc<FrozenEnvFrame>,
+        // Live lexical frame of the HANDLER-CASE form (shared, not snapshotted).
+        captured_frame: Rc<RefCell<EnvFrame>>,
     },
 }
 
@@ -1318,7 +1322,7 @@ fn invoke_restart_function(
             function_form,
             captured_frame,
         } => {
-            let mut restart_env = env.child_with_parent(thaw_env_frame(captured_frame));
+            let mut restart_env = env.child_with_parent(Rc::clone(captured_frame));
             let function = eval_form(*function_form, &mut restart_env)?;
             apply_function(function, args, &mut restart_env)
         }
@@ -9713,7 +9717,7 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
                 token: token.clone(),
                 var_name: var_name.clone(),
                 body: handler_body,
-                captured_frame: freeze_env_frame(&env.frame),
+                captured_frame: Rc::clone(&env.frame),
             },
         };
         installed.push(entry);
@@ -9747,7 +9751,7 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
                 } = handler.handler
                 {
                     if entry_token == token {
-                        let mut handler_env = env.child_with_parent(thaw_env_frame(&captured_frame));
+                        let mut handler_env = env.child_with_parent(captured_frame);
                         if let Some(name) = var_name {
                             handler_env.define_local(&name, condition);
                         }
@@ -9791,7 +9795,7 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
 
 fn parse_restart_options(
     option_forms: BlissVal,
-    captured_frame: &Arc<FrozenEnvFrame>,
+    captured_frame: &Rc<RefCell<EnvFrame>>,
 ) -> (Option<RestartFunction>, Option<RestartFunction>) {
     let options = list_to_vec(option_forms);
     let mut interactive_function = None;
@@ -9826,7 +9830,7 @@ fn parse_restart_options(
 fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (bindings_form, body) = cp(cdr);
     let base_len = env.restarts.len();
-    let captured_frame = freeze_env_frame(&env.frame);
+    let captured_frame = Rc::clone(&env.frame);
     let mut c = bindings_form;
     while c.is_cons() {
         let (binding, rest) = cp(c);
@@ -9856,7 +9860,7 @@ fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
 fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (restartable_form, clauses) = cp(cdr);
     let base_len = env.restarts.len();
-    let captured_frame = freeze_env_frame(&env.frame);
+    let captured_frame = Rc::clone(&env.frame);
     let mut c = clauses;
     while c.is_cons() {
         let (clause, rest) = cp(c);

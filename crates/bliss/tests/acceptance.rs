@@ -1032,3 +1032,37 @@ fn handler_bind_resignal_is_seen_by_outer_handler_not_itself() {
         stdout
     );
 }
+
+/// Regression for bliss-gd4: restart/handler functions share their establishing
+/// LEXICAL frame (not a frozen snapshot), so a setf/setq inside them persists to
+/// the enclosing scope. Before the fix these writes went into a thawed throwaway
+/// copy and were lost.
+#[test]
+fn mutations_inside_restart_functions_persist() {
+    // setq of an outer lexical variable inside a RESTART-CASE restart persists.
+    let out1 = bliss_bin()
+        .args(["--eval", "(let ((x 0)) (restart-case (invoke-restart 'bump) (bump () (setq x 99))) x)"])
+        .output()
+        .expect("run bliss");
+    assert_eq!(out1.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out1.stdout).contains("99"),
+        "setq inside a restart must persist; got: {}",
+        String::from_utf8_lossy(&out1.stdout)
+    );
+
+    // CHECK-TYPE's STORE-VALUE restart corrects the place end-to-end.
+    let out2 = bliss_bin()
+        .args([
+            "--eval",
+            "(let ((x 'foo)) (handler-bind ((type-error (lambda (c) (declare (ignore c)) (store-value 42)))) (check-type x integer)) x)",
+        ])
+        .output()
+        .expect("run bliss");
+    assert_eq!(out2.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out2.stdout).contains("42"),
+        "store-value must correct the place; got: {}",
+        String::from_utf8_lossy(&out2.stdout)
+    );
+}
