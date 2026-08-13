@@ -1217,3 +1217,25 @@ fn char_string_and_list_functions() {
         );
     }
 }
+
+/// Regression: GCD/LCM and the STRING-TRIM family were undefined.
+#[test]
+fn gcd_lcm_and_string_trim() {
+    let cases = [
+        ("(gcd 12 18)", "6"),
+        ("(gcd 12 18 24)", "6"),
+        ("(lcm 4 6)", "12"),
+        ("(string-trim \" \" \"  hi  \")", "\"hi\""),
+        ("(string-left-trim \" x\" \"xx hi\")", "\"hi\""),
+        ("(string-right-trim \" \" \"hi  \")", "\"hi\""),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(expected),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}

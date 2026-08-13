@@ -661,3 +661,36 @@
       ((null p) default)
     (when (eq (car p) key) (return (cadr p)))))
 (defun nreverse (seq) (reverse seq))
+
+;;; ---------------------------------------------------------------------------
+;;; GCD / LCM and the STRING-TRIM family.
+;;; ---------------------------------------------------------------------------
+
+(defun %gcd2 (a b) (if (= b 0) a (%gcd2 b (mod a b))))
+
+(defun gcd (&rest integers)
+  (if (null integers)
+      0
+      (reduce (lambda (a b) (%gcd2 (abs a) (abs b))) integers)))
+
+(defun lcm (&rest integers)
+  (if (null integers)
+      1
+      (reduce (lambda (a b)
+                (if (or (= a 0) (= b 0))
+                    0
+                    (/ (abs (* a b)) (%gcd2 (abs a) (abs b)))))
+              integers)))
+
+(defun string-left-trim (bag s)
+  (let ((str (string s)) (n (length (string s))) (i 0))
+    (loop while (and (< i n) (find (elt str i) bag)) do (incf i))
+    (subseq str i)))
+
+(defun string-right-trim (bag s)
+  (let ((str (string s)) (i (length (string s))))
+    (loop while (and (> i 0) (find (elt str (- i 1)) bag)) do (decf i))
+    (subseq str 0 i)))
+
+(defun string-trim (bag s)
+  (string-left-trim bag (string-right-trim bag s)))
