@@ -335,122 +335,49 @@ fn arena_str(s: &str) -> BlissVal {
     val
 }
 
-// ── Stream tracking for file I/O ─────────────────────────────────
-#[derive(Clone, Debug)]
-enum StreamDirection {
-    Input,
-    Output,
-}
+// ── Stream designator resolution ─────────────────────────────────
+// The interpreter delegates all stream state to `bliss_stdlib::streams`
+// (a stream is a heap object with type_id STREAM). These helpers turn the
+// CL stream *designators* T / NIL / stream into a concrete stream object and
+// route character output through the standard-library Gray-stream API.
 
-#[derive(Clone, Debug)]
-struct StreamState {
-    content: String,
-    position: usize,
-    direction: StreamDirection,
-    path: String,
-    buffer: String,
-}
-
-thread_local! {
-    static STREAMS: RefCell<HashMap<u64, StreamState>> = RefCell::new(HashMap::new());
-    static NEXT_STREAM_ID: RefCell<u64> = const { RefCell::new(1) };
-}
-
-fn open_stream(path: &str, direction: StreamDirection) -> Result<BlissVal, BlissError> {
-    let state = match direction {
-        StreamDirection::Input => {
-            let content = std::fs::read_to_string(path)
-                .map_err(|e| BlissError::FileError(format!("cannot open {}: {}", path, e)))?;
-            StreamState {
-                content,
-                position: 0,
-                direction,
-                path: path.to_string(),
-                buffer: String::new(),
-            }
-        }
-        StreamDirection::Output => StreamState {
-            content: String::new(),
-            position: 0,
-            direction,
-            path: path.to_string(),
-            buffer: String::new(),
-        },
-    };
-    let id = NEXT_STREAM_ID.with(|c| {
-        let v = *c.borrow();
-        *c.borrow_mut() = v + 1;
-        v
-    });
-    STREAMS.with(|s| s.borrow_mut().insert(id, state));
-    // Represent stream as a tagged fixnum with high bit set to distinguish from regular fixnums
-    Ok(BlissVal::from_fixnum(-(id as i64)))
-}
-
-fn close_stream(stream_val: BlissVal) -> Result<(), BlissError> {
-    if !stream_val.is_fixnum() {
-        return Ok(());
-    }
-    let id = (-stream_val.as_fixnum()) as u64;
-    STREAMS.with(|s| {
-        if let Some(state) = s.borrow_mut().remove(&id) {
-            if matches!(state.direction, StreamDirection::Output) {
-                std::fs::write(&state.path, &state.buffer).map_err(|e| {
-                    BlissError::FileError(format!("cannot write {}: {}", state.path, e))
-                })?;
-            }
-            Ok(())
-        } else {
-            Ok(())
-        }
-    })
-}
-
+/// True if `val` is a real stream object (heap object with STREAM type_id).
 fn is_stream(val: BlissVal) -> bool {
-    val.is_fixnum() && val.as_fixnum() < 0
+    bliss_rt::types::streamp(val)
 }
 
-fn stream_read_line(stream_val: BlissVal) -> Result<(String, bool), BlissError> {
-    if !is_stream(stream_val) {
-        return Err(BlissError::StreamError("not a stream".into()));
+/// Resolve an output stream designator: `T` and `NIL` both denote the current
+/// `*standard-output*`; any other value is taken to be a stream object.
+fn resolve_output_stream(designator: BlissVal, env: &Env) -> BlissVal {
+    if designator == T || designator.is_nil() {
+        env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(NIL)
+    } else {
+        designator
     }
-    let id = (-stream_val.as_fixnum()) as u64;
-    STREAMS.with(|s| {
-        let mut streams = s.borrow_mut();
-        if let Some(state) = streams.get_mut(&id) {
-            if state.position >= state.content.len() {
-                return Ok(("".to_string(), true)); // EOF
-            }
-            let remaining = &state.content[state.position..];
-            if let Some(newline_pos) = remaining.find('\n') {
-                let line = remaining[..newline_pos].to_string();
-                state.position += newline_pos + 1;
-                Ok((line, false))
-            } else {
-                let line = remaining.to_string();
-                state.position = state.content.len();
-                Ok((line, true))
-            }
-        } else {
-            Err(BlissError::StreamError("stream not open".into()))
-        }
-    })
 }
 
-fn stream_write_string(stream_val: BlissVal, s: &str) -> Result<(), BlissError> {
-    if !is_stream(stream_val) {
-        return Err(BlissError::StreamError("not a stream".into()));
+/// Resolve an input stream designator: `NIL` denotes `*standard-input*`, `T`
+/// denotes `*terminal-io*`; any other value is taken to be a stream object.
+fn resolve_input_stream(designator: BlissVal, env: &Env) -> BlissVal {
+    if designator.is_nil() {
+        env.lookup_var("*STANDARD-INPUT*").unwrap_or(NIL)
+    } else if designator == T {
+        env.lookup_var("*TERMINAL-IO*").unwrap_or(NIL)
+    } else {
+        designator
     }
-    let id = (-stream_val.as_fixnum()) as u64;
-    STREAMS.with(|streams| {
-        let mut streams = streams.borrow_mut();
-        if let Some(state) = streams.get_mut(&id) {
-            state.buffer.push_str(s);
-            Ok(())
-        } else {
-            Err(BlissError::StreamError("stream not open".into()))
-        }
-    })
+}
+
+/// Write a string to a resolved output stream via the stdlib stream API.
+fn write_str_to(stream: BlissVal, s: &str) -> Result<(), BlissError> {
+    let sv = bliss_stdlib::make_lisp_string(s);
+    bliss_stdlib::stream_write_string(stream, sv, 0, None)
+}
+
+/// True if `val` is a keyword symbol (name in the KEYWORD package). Used to
+/// tell an optional positional stream argument apart from &key start/end.
+fn is_keyword_arg(val: BlissVal) -> bool {
+    val.is_symbol() && sym_name(val).starts_with("KEYWORD:")
 }
 
 // ── Closure representation ───────────────────────────────────────
@@ -1738,6 +1665,20 @@ impl Env {
         }
         env.define_local("*FEATURES*", vec_to_list(&features));
         env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
+        // Standard stream special variables, bound to real terminal streams
+        // backed by the process stdio (see bliss_stdlib::streams). *terminal-io*
+        // / *query-io* / *debug-io* share the stdin object for their input side;
+        // routing all output builtins through these keeps a single stream model.
+        let stdin_stream = bliss_stdlib::make_stdin();
+        let stdout_stream = bliss_stdlib::make_stdout();
+        let stderr_stream = bliss_stdlib::make_stderr();
+        env.define_local("*STANDARD-INPUT*", stdin_stream);
+        env.define_local("*STANDARD-OUTPUT*", stdout_stream);
+        env.define_local("*ERROR-OUTPUT*", stderr_stream);
+        env.define_local("*TRACE-OUTPUT*", stdout_stream);
+        env.define_local("*TERMINAL-IO*", stdout_stream);
+        env.define_local("*QUERY-IO*", stdout_stream);
+        env.define_local("*DEBUG-IO*", stdout_stream);
         env.define_local("*TYPE-DEFINITIONS*", NIL);
         env.define_local("*CONDITION-TYPES*", NIL);
         env.define_local("*CONDITION-DEFINITIONS*", NIL);
@@ -3770,26 +3711,59 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
             }
             "PRINT" => {
-                let (a, _) = cp(cdr);
-                let v = eval_form(a, env)?;
-                println!("\n{}", format_val(v));
+                // (print object &optional stream): leading newline, then the
+                // prin1 representation — routed through the output stream.
+                // Preserves the historical trailing-newline behaviour that the
+                // stage-0 gate depends on.
+                let args = list_to_vec(cdr);
+                let v = eval_form(args[0], env)?;
+                let stream = if args.len() > 1 {
+                    eval_form(args[1], env)?
+                } else {
+                    NIL
+                };
+                let out = resolve_output_stream(stream, env);
+                write_str_to(out, "\n")?;
+                write_str_to(out, &format_val(v))?;
+                write_str_to(out, "\n")?;
                 return Ok(v);
             }
             "PRINC" => {
-                let (a, _) = cp(cdr);
-                let v = eval_form(a, env)?;
+                // (princ object &optional stream)
+                let args = list_to_vec(cdr);
+                let v = eval_form(args[0], env)?;
                 let mut s = String::new();
                 princ_val(v, &mut s);
-                print!("{}", s);
+                let stream = if args.len() > 1 {
+                    eval_form(args[1], env)?
+                } else {
+                    NIL
+                };
+                let out = resolve_output_stream(stream, env);
+                write_str_to(out, &s)?;
                 return Ok(v);
             }
             "TERPRI" => {
-                println!();
+                let args = list_to_vec(cdr);
+                let stream = if args.is_empty() {
+                    NIL
+                } else {
+                    eval_form(args[0], env)?
+                };
+                let out = resolve_output_stream(stream, env);
+                bliss_stdlib::stream_terpri(out)?;
                 return Ok(NIL);
             }
             "FRESH-LINE" => {
-                println!();
-                return Ok(T);
+                let args = list_to_vec(cdr);
+                let stream = if args.is_empty() {
+                    NIL
+                } else {
+                    eval_form(args[0], env)?
+                };
+                let out = resolve_output_stream(stream, env);
+                let emitted = bliss_stdlib::stream_fresh_line(out)?;
+                return Ok(if emitted { T } else { NIL });
             }
             "+" => return eval_arith(cdr, env, 0, 0.0, |a, b| a + b, bigrat_add),
             "-" => return eval_arith_sub(cdr, env),
@@ -5497,31 +5471,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .unwrap_or(NIL));
             }
             "READ-LINE" => {
+                // (read-line &optional stream eof-error-p eof-value)
                 let args = list_to_vec(cdr);
                 let stream = if !args.is_empty() {
                     eval_form(args[0], env)?
                 } else {
-                    NIL // stdin
+                    NIL
                 };
-                if is_stream(stream) {
-                    // Read from file stream
-                    let (line, eof) = stream_read_line(stream)?;
-                    if eof && line.is_empty() {
-                        return Ok(NIL);
-                    }
-                    env.set_mv(vec![arena_str(&line), if eof { T } else { NIL }]);
-                    return Ok(arena_str(&line));
-                } else {
-                    // Read from stdin
-                    let mut line = String::new();
-                    std::io::stdin()
-                        .read_line(&mut line)
-                        .map_err(|e| BlissError::StreamError(format!("read-line: {}", e)))?;
-                    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-                    return Ok(arena_str(trimmed));
+                let inp = resolve_input_stream(stream, env);
+                let (line_val, missing_newline) = bliss_stdlib::stream_read_line(inp)?;
+                if line_val == EOF {
+                    // At end of input: honour the eof designator like the old
+                    // behaviour did — return NIL rather than signalling.
+                    return Ok(NIL);
                 }
+                env.set_mv(vec![line_val, if missing_newline { T } else { NIL }]);
+                return Ok(line_val);
             }
             "WRITE-STRING" => {
+                // (write-string string &optional stream &key start end)
                 let args = list_to_vec(cdr);
                 if args.is_empty() {
                     return Err(BlissError::Internal(
@@ -5530,14 +5498,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let string = eval_form(args[0], env)?;
                 let s = val_as_str(string);
-                if args.len() > 1 {
-                    let stream = eval_form(args[1], env)?;
-                    if is_stream(stream) {
-                        stream_write_string(stream, &s)?;
-                        return Ok(string);
-                    }
-                }
-                print!("{}", s);
+                // A second positional argument is the stream designator, unless
+                // it is a keyword (the start of &key start/end options).
+                let stream = if args.len() > 1 && !is_keyword_arg(args[1]) {
+                    eval_form(args[1], env)?
+                } else {
+                    NIL
+                };
+                let out = resolve_output_stream(stream, env);
+                write_str_to(out, &s)?;
                 return Ok(string);
             }
             "SAVE-IMAGE" => {
@@ -9882,7 +9851,7 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
 
     // Parse options
     let opts = list_to_vec(opts_rest);
-    let mut direction = StreamDirection::Input;
+    let mut direction = bliss_stdlib::StreamDirection::Input;
     let mut i = 0;
     while i < opts.len() {
         let opt_name = sym_name(opts[i]);
@@ -9893,8 +9862,10 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
             if i + 1 < opts.len() {
                 let dir = sym_name(opts[i + 1]);
                 let dir_bare = dir.trim_start_matches("KEYWORD:").trim_start_matches(':');
-                if dir_bare == "OUTPUT" {
-                    direction = StreamDirection::Output;
+                match dir_bare {
+                    "OUTPUT" => direction = bliss_stdlib::StreamDirection::Output,
+                    "IO" => direction = bliss_stdlib::StreamDirection::Io,
+                    _ => {}
                 }
                 i += 2;
             } else {
@@ -9905,8 +9876,16 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
         }
     }
 
-    // Open the file and create a stream
-    let stream_val = open_stream(&path, direction)?;
+    // Open the file via the standard-library stream machinery. `T` selects the
+    // default character element type and :supersede if-exists behaviour.
+    let stream_val = bliss_stdlib::open(
+        path_val,
+        direction,
+        T,
+        T,
+        NIL,
+        bliss_stdlib::ExternalFormat::Utf8,
+    )?;
 
     let parent = Rc::clone(&env.frame);
     // Evaluate body in a fresh frame on the same env, then close the stream
@@ -9915,7 +9894,7 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
         env.define_local(&var_name, stream_val);
         eval_progn(body, env)
     });
-    close_stream(stream_val)?;
+    bliss_stdlib::close(stream_val, false)?;
     result
 }
 

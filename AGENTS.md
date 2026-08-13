@@ -2,8 +2,22 @@
 
 ## Session Startup
 
-At the start of each session, read the files under `specs/` for project
+At the start of each session, read the files under `spec/` for project
 specifications and requirements.
+
+## Architecture Principles
+
+- **The interpreter MUST NOT duplicate functionality that belongs in the
+  standard library.** `crates/bliss/src/cli.rs` (the tree-walking evaluator)
+  should delegate to `crates/bliss-stdlib` for library behaviour — streams,
+  sequences, format, conditions, pathnames, hash tables, etc. — rather than
+  reimplementing it inline. Duplicated implementations drift apart and create
+  incompatible data representations (e.g. the negative-fixnum stream hack in
+  cli.rs vs. the heap-object streams in `bliss-stdlib::streams`). When a
+  builtin needs library behaviour, wire it to the stdlib API; if the stdlib
+  lacks it, add it there and call it from the interpreter.
+- Before adding a builtin to cli.rs, check whether `bliss-stdlib` already
+  implements it. Prefer extending stdlib over growing cli.rs.
 
 ## Bead Issue Tracking
 

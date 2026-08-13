@@ -158,6 +158,22 @@ enum StreamInner {
     Synonym {
         symbol: BlissVal,
     },
+    /// The process standard input, connected to the real terminal / pipe.
+    Stdin {
+        unread: Option<char>,
+        line: u64,
+        col: u64,
+    },
+    /// The process standard output.
+    Stdout {
+        line: u64,
+        col: u64,
+    },
+    /// The process error output.
+    Stderr {
+        line: u64,
+        col: u64,
+    },
 }
 
 impl StreamMutableState {
@@ -173,6 +189,9 @@ impl StreamMutableState {
             StreamInner::TwoWay { .. } => StreamDirection::Io,
             StreamInner::Echo { .. } => StreamDirection::Io,
             StreamInner::Synonym { .. } => StreamDirection::Io,
+            StreamInner::Stdin { .. } => StreamDirection::Input,
+            StreamInner::Stdout { .. } => StreamDirection::Output,
+            StreamInner::Stderr { .. } => StreamDirection::Output,
         }
     }
 
@@ -403,6 +422,23 @@ impl GrayStream for StreamMutableState {
                 let target = resolve_synonym(*symbol)?;
                 crate::streams::stream_read_char(target)
             }
+            StreamInner::Stdin {
+                unread, line, col, ..
+            } => {
+                if let Some(c) = unread.take() {
+                    return Ok(BlissVal::from_char(c));
+                }
+                let ch = read_char_from_stdin()?;
+                if ch != EOF {
+                    if ch.as_char() == '\n' {
+                        *line += 1;
+                        *col = 0;
+                    } else {
+                        *col += 1;
+                    }
+                }
+                Ok(ch)
+            }
             _ => Err(BlissError::StreamError("not an input stream".into())),
         }
     }
@@ -460,6 +496,19 @@ impl GrayStream for StreamMutableState {
             StreamInner::Synonym { symbol } => {
                 let target = resolve_synonym(*symbol)?;
                 crate::streams::stream_unread_char(target, ch)
+            }
+            StreamInner::Stdin {
+                unread, line, col, ..
+            } => {
+                *unread = Some(c);
+                if c == '\n' {
+                    if *line > 0 {
+                        *line -= 1;
+                    }
+                } else if *col > 0 {
+                    *col -= 1;
+                }
+                Ok(())
             }
             _ => Err(BlissError::StreamError("not an input stream".into())),
         }
@@ -563,6 +612,20 @@ impl GrayStream for StreamMutableState {
                 let target = resolve_synonym(*symbol)?;
                 crate::streams::stream_write_char(target, ch)
             }
+            StreamInner::Stdout { line, col } => {
+                let mut buf = [0u8; 4];
+                let encoded = c.encode_utf8(&mut buf);
+                write_to_std(false, encoded.as_bytes())?;
+                track_col(c, line, col);
+                Ok(())
+            }
+            StreamInner::Stderr { line, col } => {
+                let mut buf = [0u8; 4];
+                let encoded = c.encode_utf8(&mut buf);
+                write_to_std(true, encoded.as_bytes())?;
+                track_col(c, line, col);
+                Ok(())
+            }
             _ => Err(BlissError::StreamError("not an output stream".into())),
         }
     }
@@ -631,6 +694,16 @@ impl GrayStream for StreamMutableState {
             StreamInner::Synonym { symbol } => {
                 let target = resolve_synonym(*symbol)?;
                 crate::streams::stream_write_byte(target, byte)
+            }
+            StreamInner::Stdout { line, col } => {
+                write_to_std(false, &[b])?;
+                track_col(b as char, line, col);
+                Ok(())
+            }
+            StreamInner::Stderr { line, col } => {
+                write_to_std(true, &[b])?;
+                track_col(b as char, line, col);
+                Ok(())
             }
             _ => Err(BlissError::StreamError("not an output stream".into())),
         }
@@ -732,6 +805,20 @@ impl GrayStream for StreamMutableState {
                 let target = resolve_synonym(*symbol)?;
                 crate::streams::stream_write_string(target, string, start, Some(actual_end))
             }
+            StreamInner::Stdout { line, col } => {
+                write_to_std(false, slice)?;
+                for c in str_slice.chars() {
+                    track_col(c, line, col);
+                }
+                Ok(())
+            }
+            StreamInner::Stderr { line, col } => {
+                write_to_std(true, slice)?;
+                for c in str_slice.chars() {
+                    track_col(c, line, col);
+                }
+                Ok(())
+            }
             _ => Err(BlissError::StreamError("not an output stream".into())),
         }
     }
@@ -830,6 +917,7 @@ impl GrayStream for StreamMutableState {
                 let target = resolve_synonym(*symbol)?;
                 crate::streams::stream_listen(target)
             }
+            StreamInner::Stdin { unread, .. } => Ok(unread.is_some()),
             _ => Ok(false),
         }
     }
@@ -840,6 +928,9 @@ impl GrayStream for StreamMutableState {
             StreamInner::StringOutput { line, .. } => Some(*line),
             StreamInner::FileInput { line, .. } | StreamInner::FileIo { line, .. } => Some(*line),
             StreamInner::FileOutput { line, .. } => Some(*line),
+            StreamInner::Stdin { line, .. }
+            | StreamInner::Stdout { line, .. }
+            | StreamInner::Stderr { line, .. } => Some(*line),
             _ => None,
         }
     }
@@ -850,6 +941,9 @@ impl GrayStream for StreamMutableState {
             StreamInner::StringOutput { col, .. } => Some(*col),
             StreamInner::FileInput { col, .. } | StreamInner::FileIo { col, .. } => Some(*col),
             StreamInner::FileOutput { col, .. } => Some(*col),
+            StreamInner::Stdin { col, .. }
+            | StreamInner::Stdout { col, .. }
+            | StreamInner::Stderr { col, .. } => Some(*col),
             _ => None,
         }
     }
@@ -980,8 +1074,12 @@ impl GrayStream for StreamMutableState {
 
     fn interactive_stream_p(&self) -> bool {
         // File streams connected to a terminal could be interactive;
-        // string/composite streams are never interactive.
-        false
+        // string/composite streams are never interactive. The process
+        // standard streams are treated as interactive.
+        matches!(
+            self.inner,
+            StreamInner::Stdin { .. } | StreamInner::Stdout { .. } | StreamInner::Stderr { .. }
+        )
     }
 
     fn stream_external_format(&self) -> ExternalFormat {
@@ -1109,6 +1207,103 @@ fn alloc_stream(element_type: StreamElementType, inner: StreamInner) -> BlissVal
     // Issue #9: verified alignment and tag-stripping correctness.
     let ptr = Box::into_raw(state) as *mut u8;
     unsafe { BlissVal::from_heap_ptr(ptr) }
+}
+
+// ── Process standard stream helpers ────────────────────────────────
+
+/// Update the line/column counters after emitting character `c`.
+fn track_col(c: char, line: &mut u64, col: &mut u64) {
+    if c == '\n' {
+        *line += 1;
+        *col = 0;
+    } else {
+        *col += 1;
+    }
+}
+
+/// Write raw bytes to the process stdout (`err = false`) or stderr
+/// (`err = true`), flushing immediately so terminal output is not buffered
+/// behind a missing newline.
+fn write_to_std(err: bool, bytes: &[u8]) -> Result<(), BlissError> {
+    if err {
+        let out = std::io::stderr();
+        let mut h = out.lock();
+        h.write_all(bytes)
+            .and_then(|_| h.flush())
+            .map_err(|e| BlissError::StreamError(format!("stderr write error: {}", e)))
+    } else {
+        let out = std::io::stdout();
+        let mut h = out.lock();
+        h.write_all(bytes)
+            .and_then(|_| h.flush())
+            .map_err(|e| BlissError::StreamError(format!("stdout write error: {}", e)))
+    }
+}
+
+/// Read a single UTF-8 character from the process standard input.
+/// Returns EOF at end of input.
+fn read_char_from_stdin() -> Result<BlissVal, BlissError> {
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let mut one = [0u8; 1];
+    match handle.read(&mut one) {
+        Ok(0) => return Ok(EOF),
+        Ok(_) => {}
+        Err(e) => return Err(BlissError::StreamError(format!("stdin read error: {}", e))),
+    }
+    let b0 = one[0];
+    let len = if b0 < 0x80 {
+        1
+    } else if b0 >> 5 == 0b110 {
+        2
+    } else if b0 >> 4 == 0b1110 {
+        3
+    } else if b0 >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    };
+    let mut buf = [0u8; 4];
+    buf[0] = b0;
+    for slot in buf.iter_mut().take(len).skip(1) {
+        match handle.read(&mut one) {
+            Ok(0) => break,
+            Ok(_) => *slot = one[0],
+            Err(e) => return Err(BlissError::StreamError(format!("stdin read error: {}", e))),
+        }
+    }
+    match std::str::from_utf8(&buf[..len]) {
+        Ok(s) => Ok(BlissVal::from_char(s.chars().next().unwrap_or('\u{FFFD}'))),
+        Err(_) => Ok(BlissVal::from_char('\u{FFFD}')),
+    }
+}
+
+/// Construct the process standard-input stream object.
+pub fn make_stdin() -> BlissVal {
+    alloc_stream(
+        StreamElementType::Character,
+        StreamInner::Stdin {
+            unread: None,
+            line: 0,
+            col: 0,
+        },
+    )
+}
+
+/// Construct the process standard-output stream object.
+pub fn make_stdout() -> BlissVal {
+    alloc_stream(
+        StreamElementType::Character,
+        StreamInner::Stdout { line: 0, col: 0 },
+    )
+}
+
+/// Construct the process error-output stream object.
+pub fn make_stderr() -> BlissVal {
+    alloc_stream(
+        StreamElementType::Character,
+        StreamInner::Stderr { line: 0, col: 0 },
+    )
 }
 
 /// Get a reference to the StreamAlloc from a BlissVal.
