@@ -3,6 +3,7 @@
 //! Each green thread owns a `BlissStack` — a contiguous virtual memory
 //! region for CL control/value frames. See §2.4 of the spec.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -11,13 +12,20 @@ use crate::value::BlissVal;
 
 /// CL stack for a green thread.
 /// Default usable size: 512 KiB (configurable via BLISS_STACK_SIZE).
+///
+/// The stack is owned by exactly one green thread, which is the only mutator
+/// of `sp_offset`/`fp`; the GC reads only the `published_*` snapshot taken at a
+/// safepoint. `sp_offset`/`fp` therefore use `Cell` (single-threaded interior
+/// mutability) so frame push/pop can go through a shared `&BlissStack` (the
+/// only handle `GreenThread::stack()` hands out) without `&mut`.
 pub struct BlissStack {
-    /// Allocated memory buffer for the stack.
+    /// Allocated memory buffer for the stack. Fixed-size after `new`, so its
+    /// backing buffer never moves and raw pointers into it stay valid.
     memory: Vec<u8>,
     /// Stack pointer offset from base (grows upward from base).
-    sp_offset: usize,
+    sp_offset: Cell<usize>,
     /// Frame pointer (null if no frames pushed).
-    fp: *const Frame,
+    fp: Cell<*mut Frame>,
     /// Published stack pointer for GC scanning while thread is parked at a safepoint.
     published_sp: AtomicUsize,
     /// Published frame pointer for GC scanning while thread is parked at a safepoint.
@@ -31,8 +39,8 @@ impl BlissStack {
         let memory = vec![0u8; size];
         BlissStack {
             memory,
-            sp_offset: 0,
-            fp: std::ptr::null(),
+            sp_offset: Cell::new(0),
+            fp: Cell::new(std::ptr::null_mut()),
             published_sp: AtomicUsize::new(0),
             published_fp: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -43,14 +51,23 @@ impl BlissStack {
         self.memory.as_ptr()
     }
 
+    /// Mutable base pointer into the backing buffer.
+    ///
+    /// SAFETY: the buffer is a fixed-size, single-owner allocation; the only
+    /// mutator is this thread's interpreter, which never holds a `&[u8]`/
+    /// `&mut [u8]` slice over the same region while frames are live.
+    fn base_mut(&self) -> *mut u8 {
+        self.memory.as_ptr() as *mut u8
+    }
+
     /// Get the current stack pointer.
     pub fn sp(&self) -> *const u8 {
-        unsafe { self.memory.as_ptr().add(self.sp_offset) }
+        unsafe { self.memory.as_ptr().add(self.sp_offset.get()) }
     }
 
     /// Get the current frame pointer.
     pub fn fp(&self) -> *const Frame {
-        self.fp
+        self.fp.get()
     }
 
     /// Returns total usable size in bytes.
@@ -60,15 +77,109 @@ impl BlissStack {
 
     /// Returns bytes currently in use.
     pub fn used(&self) -> usize {
-        self.sp_offset
+        self.sp_offset.get()
     }
 
     /// Publish the current sp and fp so the GC can scan this thread's
     /// stack while it is parked at a safepoint (§2.5.3).
     pub fn publish_top(&self) {
-        self.published_sp.store(self.sp_offset, Ordering::Release);
-        self.published_fp
-            .store(self.fp as *mut Frame, Ordering::Release);
+        self.published_sp.store(self.sp_offset.get(), Ordering::Release);
+        self.published_fp.store(self.fp.get(), Ordering::Release);
+    }
+
+    // ── Frame push / pop (D2.03) ───────────────────────────────────
+
+    /// Push a CL activation frame (§2.4.2 header + `num_slots` `BlissVal`
+    /// value slots) onto the stack and make it the current frame.
+    ///
+    /// The value-slot area holds the interpreter frame's lexical locals
+    /// followed by its operand stack (D2.03); the caller decides the split.
+    /// Slots are zero-initialised to `NIL`.
+    ///
+    /// Returns the new frame pointer, or `None` if the stack has no room —
+    /// the single-stack replacement for the tree-walker's host-SP guard:
+    /// the caller maps `None` to `BlissError::StackOverflow` →
+    /// `STORAGE-CONDITION` (R2.20).
+    pub fn push_frame(
+        &self,
+        function: BlissVal,
+        code_info: *const CodeInfo,
+        num_slots: u16,
+        flags: u32,
+    ) -> Option<*mut Frame> {
+        let header = std::mem::size_of::<Frame>();
+        // Value slots follow the header; both are 8-byte aligned so the
+        // header's natural alignment keeps the slot area aligned too.
+        let start = align_up(self.sp_offset.get(), std::mem::align_of::<Frame>());
+        let frame_bytes = header + num_slots as usize * std::mem::size_of::<BlissVal>();
+        let end = start.checked_add(frame_bytes)?;
+        if end > self.memory.len() {
+            return None;
+        }
+
+        // SAFETY: `start .. end` is within the backing buffer (checked above),
+        // 8-byte aligned, and not aliased by any live frame.
+        let frame_ptr = unsafe { self.base_mut().add(start) } as *mut Frame;
+        unsafe {
+            frame_ptr.write(Frame {
+                prev_fp: self.fp.get(),
+                return_pc: std::ptr::null(),
+                function,
+                code_info,
+                flags,
+                num_locals: num_slots,
+                _pad: 0,
+            });
+            let slots = frame_ptr.add(1) as *mut BlissVal;
+            for i in 0..num_slots as usize {
+                slots.add(i).write(crate::value::NIL);
+            }
+        }
+        self.fp.set(frame_ptr);
+        self.sp_offset.set(end);
+        Some(frame_ptr)
+    }
+
+    /// Pop the current frame, restoring `fp` to its `prev_fp` and rewinding
+    /// `sp` to just below the popped frame.
+    ///
+    /// # Panics (debug)
+    /// Panics in debug builds if there is no current frame.
+    pub fn pop_frame(&self) {
+        let fp = self.fp.get();
+        debug_assert!(!fp.is_null(), "pop_frame with empty stack");
+        if fp.is_null() {
+            return;
+        }
+        // SAFETY: `fp` is a frame this stack pushed; its `prev_fp` and address
+        // are valid. `offset_from` is within the same allocation.
+        unsafe {
+            let start = (fp as *const u8).offset_from(self.memory.as_ptr()) as usize;
+            self.sp_offset.set(start);
+            self.fp.set((*fp).prev_fp);
+        }
+    }
+
+    /// Number of frames currently on the stack (walks the `prev_fp` chain).
+    pub fn frame_depth(&self) -> usize {
+        // SAFETY: fp is null or a valid frame this stack pushed.
+        unsafe { FrameWalker::new(self.fp.get()).count() }
+    }
+
+    /// Mutable view of a frame's value-slot area.
+    ///
+    /// # Safety
+    /// `frame` must be a live frame previously returned by [`push_frame`] on
+    /// this stack, with the same `num_slots`.
+    pub unsafe fn frame_slots_mut<'a>(frame: *mut Frame) -> &'a mut [BlissVal] {
+        unsafe {
+            let n = (*frame).num_locals as usize;
+            if n == 0 {
+                return &mut [];
+            }
+            let ptr = frame.add(1) as *mut BlissVal;
+            std::slice::from_raw_parts_mut(ptr, n)
+        }
     }
 
     /// Read the published stack pointer offset (for GC scanning).
@@ -125,6 +236,12 @@ pub fn eval_stack_budget() -> usize {
     }
 
     DEFAULT
+}
+
+/// Round `n` up to the next multiple of `align` (a power of two).
+#[inline]
+fn align_up(n: usize, align: usize) -> usize {
+    (n + align - 1) & !(align - 1)
 }
 
 // ── Frame layout ───────────────────────────────────────────────────

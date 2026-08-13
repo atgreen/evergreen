@@ -252,3 +252,92 @@ fn stack_zero_size_fp_is_null() {
     let stack = BlissStack::new(0);
     assert!(stack.fp().is_null());
 }
+
+// ── Frame push / pop (bliss-nmq) ───────────────────────────────────
+
+#[test]
+fn push_frame_advances_and_sets_fp() {
+    use bliss_rt::BlissVal;
+    let stack = BlissStack::new(64 * 1024);
+    assert!(stack.fp().is_null());
+    let used0 = stack.used();
+    let f = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 3, 0)
+        .expect("push should fit");
+    assert!(!stack.fp().is_null());
+    assert_eq!(stack.fp() as *const _, f as *const _);
+    assert!(stack.used() > used0);
+    assert_eq!(stack.frame_depth(), 1);
+    // Slots are zero-initialised to NIL.
+    let slots = unsafe { BlissStack::frame_slots_mut(f) };
+    assert_eq!(slots.len(), 3);
+    for s in slots.iter() {
+        assert!(s.is_nil());
+    }
+}
+
+#[test]
+fn push_pop_frames_restore_state() {
+    use bliss_rt::BlissVal;
+    let stack = BlissStack::new(64 * 1024);
+    let base_used = stack.used();
+    let f1 = stack
+        .push_frame(BlissVal::from_fixnum(1), std::ptr::null(), 2, 0)
+        .unwrap();
+    let used1 = stack.used();
+    let f2 = stack
+        .push_frame(BlissVal::from_fixnum(2), std::ptr::null(), 4, 0)
+        .unwrap();
+    assert_eq!(stack.frame_depth(), 2);
+    // prev_fp chains f2 -> f1.
+    assert_eq!(unsafe { (*f2).prev_fp } as *const _, f1 as *const _);
+    stack.pop_frame();
+    assert_eq!(stack.frame_depth(), 1);
+    assert_eq!(stack.fp() as *const _, f1 as *const _);
+    assert_eq!(stack.used(), used1);
+    stack.pop_frame();
+    assert_eq!(stack.frame_depth(), 0);
+    assert!(stack.fp().is_null());
+    assert_eq!(stack.used(), base_used);
+}
+
+#[test]
+fn push_frame_overflow_returns_none() {
+    use bliss_rt::BlissVal;
+    // Tiny stack: repeated pushes must eventually fail with None, never panic.
+    let stack = BlissStack::new(256);
+    let mut pushed = 0;
+    loop {
+        match stack.push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 4, 0) {
+            Some(_) => pushed += 1,
+            None => break,
+        }
+        if pushed > 1000 {
+            panic!("stack should have overflowed by now");
+        }
+    }
+    assert!(pushed >= 1, "at least one frame should fit");
+}
+
+#[test]
+fn frame_slots_survive_across_deeper_push() {
+    use bliss_rt::BlissVal;
+    let stack = BlissStack::new(64 * 1024);
+    let f1 = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 2, 0)
+        .unwrap();
+    unsafe {
+        let s = BlissStack::frame_slots_mut(f1);
+        s[0] = BlissVal::from_fixnum(42);
+        s[1] = BlissVal::from_fixnum(99);
+    }
+    // Pushing a deeper frame must not clobber f1's slots.
+    let _f2 = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 8, 0)
+        .unwrap();
+    unsafe {
+        let s = BlissStack::frame_slots_mut(f1);
+        assert_eq!(s[0].as_fixnum(), 42);
+        assert_eq!(s[1].as_fixnum(), 99);
+    }
+}

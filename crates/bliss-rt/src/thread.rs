@@ -37,6 +37,32 @@ pub const MAX_TLS: usize = 4096;
 /// Default stack size for green threads (512 KiB).
 const DEFAULT_STACK_SIZE: usize = 512 * 1024;
 
+/// Usable `BlissStack` size for a green thread, honouring `BLISS_STACK_SIZE`
+/// (accepts a raw byte count or a `k`/`m`/`g` suffix), defaulting to 512 KiB.
+///
+/// Deep interpreted recursion is bounded by this size once CL activations live
+/// on the `BlissStack` (bliss-nmq): overflow raises `STORAGE-CONDITION` (R2.20).
+fn default_stack_size() -> usize {
+    fn parse_size(s: &str) -> Option<usize> {
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let (num, mult) = match s.chars().last().unwrap().to_ascii_lowercase() {
+            'k' => (&s[..s.len() - 1], 1024),
+            'm' => (&s[..s.len() - 1], 1024 * 1024),
+            'g' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+            _ => (s, 1),
+        };
+        num.trim().parse::<usize>().ok().map(|n| n * mult)
+    }
+    std::env::var("BLISS_STACK_SIZE")
+        .ok()
+        .and_then(|v| parse_size(&v))
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_STACK_SIZE)
+}
+
 /// Atomic counter for generating unique thread IDs.
 static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -93,7 +119,7 @@ thread_local! {
             id,
             entry: NIL,
             state: Mutex::new(ThreadState::Runnable),
-            stack: BlissStack::new(DEFAULT_STACK_SIZE),
+            stack: BlissStack::new(default_stack_size()),
             tls: Mutex::new(vec![NIL; MAX_TLS]),
             yield_requested: AtomicBool::new(false),
             result: Arc::new(ThreadResult::new()),
@@ -389,7 +415,7 @@ pub fn make_thread(entry: BlissVal) -> Result<GreenThreadId, BlissError> {
         id,
         entry,
         state: Mutex::new(ThreadState::Runnable),
-        stack: BlissStack::new(DEFAULT_STACK_SIZE),
+        stack: BlissStack::new(default_stack_size()),
         tls: Mutex::new(vec![NIL; MAX_TLS]),
         yield_requested: AtomicBool::new(false),
         result: Arc::clone(&result_cell),

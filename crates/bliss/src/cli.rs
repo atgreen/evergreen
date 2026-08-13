@@ -6,6 +6,8 @@ use bliss_compiler::macroexpand::{
 };
 use bliss_compiler::reader;
 use bliss_rt::error::BlissError;
+
+mod bytecode;
 use bliss_rt::object::{ConsCell, ObjectHeader, RatioData, type_id};
 use bliss_rt::runtime::parse_cli as parse_runtime_cli;
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
@@ -2710,7 +2712,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
         if val == EOF {
             break;
         }
-        last = eval_form(val, env)?;
+        last = bytecode::eval_toplevel(val, env)?;
         pos += consumed;
     }
     Ok(last)
