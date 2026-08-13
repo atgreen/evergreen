@@ -2,8 +2,15 @@
 
 ## Session Startup
 
-At the start of each session, read the files under `spec/` for project
-specifications and requirements.
+At the start of each session, orient yourself in the spec before doing work.
+A `SessionStart` hook (`scripts/spec-orient.sh`) injects a banner with the
+current build stage as a reminder — the read itself is still your job:
+
+1. Read `spec/INDEX.md` (chapter/requirement map), `spec/conventions.md`
+   (notation, staging rules), and `spec/stages.json` (note `current_stage` —
+   only MUST requirements at or below it are gated).
+2. Pull individual `spec/NN-*.md` chapters on demand for the subsystem you are
+   touching. Do **not** read all ~29 spec files up front.
 
 ## Architecture Principles
 
