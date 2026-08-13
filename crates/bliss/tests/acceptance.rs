@@ -1166,3 +1166,23 @@ fn reduce_and_if_predicate_family() {
         );
     }
 }
+
+/// Regression: PSETQ, DO, and DO* iteration macros (bliss-2pt.11).
+#[test]
+fn do_dostar_psetq() {
+    let cases = [
+        ("(let ((a 1) (b 2)) (psetq a b b a) (list a b))", "(2 1)"),
+        ("(do ((i 0 (1+ i)) (acc nil)) ((= i 3) (reverse acc)) (push i acc))", "(0 1 2)"),
+        ("(do* ((i 0 (1+ i)) (j (* i 10) (* i 10))) ((= i 3) j))", "30"),
+        ("(do ((i 0 (1+ i)) (s 0 (+ s i))) ((= i 5) s))", "10"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}

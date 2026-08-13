@@ -561,3 +561,55 @@
 (defun cddadr (x) (cdr (cdadr x)))
 (defun cdddar (x) (cdr (cddar x)))
 (defun cddddr (x) (cdr (cdddr x)))
+
+;;; ---------------------------------------------------------------------------
+;;; PSETQ and the DO / DO* iteration macros.
+;;; ---------------------------------------------------------------------------
+
+;; Parallel assignment: evaluate every value form, then assign (via temporaries).
+(defmacro psetq (&rest pairs)
+  (let ((bindings nil) (assigns nil) (p pairs))
+    (loop while (consp (cdr p)) do
+      (let ((var (car p)) (tmp (gensym)))
+        (setq bindings (cons (list tmp (cadr p)) bindings))
+        (setq assigns (cons (list 'setq var tmp) assigns))
+        (setq p (cddr p))))
+    `(let ,(reverse bindings) ,@(reverse assigns) nil)))
+
+;; Interleave two lists: (a b) (x y) => (a x b y). Helper for DO's step forms.
+(defun %zip-pairs (a b)
+  (if (or (null a) (null b))
+      nil
+      (cons (car a) (cons (car b) (%zip-pairs (cdr a) (cdr b))))))
+
+(defun %do-var (b) (if (consp b) (car b) b))
+(defun %do-init (b) (if (consp b) (cadr b) nil))
+(defun %do-step (b)
+  (if (and (consp b) (cddr b)) (caddr b) (%do-var b)))
+
+(defmacro do (bindings end-test &rest body)
+  (let ((vars (mapcar (function %do-var) bindings))
+        (inits (mapcar (function %do-init) bindings))
+        (steps (mapcar (function %do-step) bindings))
+        (top (gensym)))
+    `(block nil
+       (let ,(mapcar (function list) vars inits)
+         (tagbody
+            ,top
+            (when ,(car end-test) (return (progn ,@(cdr end-test))))
+            ,@body
+            (psetq ,@(%zip-pairs vars steps))
+            (go ,top))))))
+
+(defmacro do* (bindings end-test &rest body)
+  (let ((vars (mapcar (function %do-var) bindings))
+        (steps (mapcar (function %do-step) bindings))
+        (top (gensym)))
+    `(block nil
+       (let* ,(mapcar (function list) vars (mapcar (function %do-init) bindings))
+         (tagbody
+            ,top
+            (when ,(car end-test) (return (progn ,@(cdr end-test))))
+            ,@body
+            ,@(mapcar (lambda (v s) (list 'setq v s)) vars steps)
+            (go ,top))))))
