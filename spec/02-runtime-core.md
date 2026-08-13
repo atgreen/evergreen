@@ -262,15 +262,84 @@ O(n) stack walks without requiring metadata side-tables (R2.06).
 | `10` | `UNWIND` | `UNWIND-PROTECT` cleanup frame |
 | `11` | `SPECIAL` | Special-variable binding frame (dynamic binding stack) |
 
-### 2.4.4 Rust Shadow Stack Interaction
+### 2.4.4 Unified Control Stack (Interpreted + Compiled Frames)
 
-Interpreted code (T0) and runtime-internal helpers execute on the Rust
-stack. These frames are invisible to the CL frame walker. When the
-interpreter calls a CL-compiled function, it pushes a **trampoline
-frame** (a `CALL` frame with a sentinel `code_info`) that bridges the
-two worlds. The GC scans both the CL stack (via the frame chain) and
-the Rust stack (via conservative scanning of the worker thread's native
-stack between known bounds).
+**Every CL activation — interpreted (T0) or compiled (T1/T2) — lives as a
+frame on the green thread's `BlissStack`** (R2.05), in the §2.4.2 format, so a
+single call chain freely interleaves tiers and one frame walker (the `prev_fp`
+chain) sees them all. This is the key mechanism deviation from HotSpot noted in
+§0 §1.1: rather than a template (assembly) interpreter whose frames are native
+machine-stack frames, Bliss's baseline interpreter is a host-language (Rust)
+loop, but its frames still live on the CL stack — not on the OS worker's Rust
+"shadow" stack.
+
+The Rust shadow stack therefore holds only **transient, non-CL** activity: the
+interpreter dispatch loop itself, GC inner loops, and runtime-internal helpers.
+It never holds a durable CL activation, so a green thread can be parked or
+migrated by saving its `BlissStack` pointer alone (§2.3) — interpreter state is
+not stranded on a shared worker stack. Deep interpreted recursion consumes
+`BlissStack` frames and raises `STORAGE-CONDITION` on overflow (R2.20), rather
+than overflowing the Rust stack.
+
+#### D2.03 — Interpreter Frame
+
+An interpreted (T0) frame is a `CALL` frame (§2.4.3) whose `code_info` marks it
+interpreted and whose locals area is laid out as the bytecode function's slots
+followed by its operand-stack slots:
+
+```text
+ │ …§2.4.2 header (code_info → InterpCodeInfo)… │
+ ├────────────────────────────────────────────┤
+ │ bcp        : *const u8   │ current bytecode PC (the stable OSR/deopt coord) │
+ │ constants  : *const …    │ constant pool / reference table for this fn      │
+ │ sp_top     : u16         │ operand-stack depth within the locals area       │
+ ├────────────────────────────────────────────┤
+ │ local[0..n_locals]       │ lexical slots                                    │
+ │ opstack[0..max_stack]    │ operand stack (grows within the frame)           │
+ └────────────────────────────────────────────┘
+```
+
+The operand stack lives **inside the frame**, not in a separate `ValueStack`
+object; `bcp` is the same bytecode PC used for source maps, profiling, OSR
+entry, and deopt resume (§4.4.3).
+
+#### D2.04 — Interpreter↔Compiled Adapters (i2c / c2i)
+
+Crossing tiers is an argument-shuffle, not a stack switch. A **c2i adapter**
+(compiled→interpreted) moves register/stack ABI arguments into the callee's
+interpreter frame slots; an **i2c adapter** (interpreted→compiled) moves
+operand-stack arguments into the compiled calling convention. Adapters are the
+single-stack analog of a cross-world trampoline: control and both frames stay
+on the one `BlissStack`, so OSR and deoptimisation (§4.6) rebuild or unwind
+frames in place without bridging two stacks.
+
+#### GC of the control stack
+
+CL frames are scanned **precisely** via the frame chain: compiled frames use
+their safepoint stack maps (§4.7), and interpreter frames use per-`bcp` operand
+maps derived by abstract interpretation of the bytecode (the interpreter knows
+which slots hold references). Conservative scanning is confined to the Rust
+shadow stack's transient VM frames, and never pins CL data. This removes the
+conservative pinning of interpreter values implied by an all-shadow-stack T0.
+
+### 2.4.5 Interpreter Realisation: Host-Loop vs. Template
+
+The unified-stack model above is independent of *how* the interpreter is coded.
+Two realisations satisfy it; Bliss ships the first and keeps the second as an
+explicit, deferred option.
+
+| | **Host-loop (baseline)** | **Template (later option)** |
+|---|---|---|
+| Interpreter body | Rust dispatch loop over bytecode | Generated machine-code stub per bytecode (via the codegen emitter, §4.7) |
+| Frames | On `BlissStack` (D2.03), driven by the Rust loop | On `BlissStack`, native-stack frames |
+| Cost | No codegen prerequisite; portable; debuggable | Assembly interpreter per ISA (x86-64 + aarch64); largest single component |
+| Payoff | One stack, exact maps, cheap fiber park, mixed-tier chains | The above **plus** raw interpreter throughput / full HotSpot fidelity |
+
+The host-loop realisation already delivers the architectural wins (single stack,
+precise maps, cheap M:N parking, uniform OSR/deopt). A template interpreter is
+warranted only if interpreter throughput becomes a hard requirement, at which
+point it is a localized swap because the frame format (D2.03), adapters (D2.04),
+and maps are already defined here.
 
 ---
 

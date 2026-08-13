@@ -121,7 +121,17 @@ stages.
 | T2 | **Optimising compiler** | Hot loop / call count ≥ 5000 | Optimised native via IR |
 
 Tier transitions are managed by the **Profiling Subsystem** (§4.9) which
-inserts counters and traps, exactly as HotSpot's C1/C2 pipeline does.
+inserts counters and traps. The **tiering *policy*** — invocation/back-edge
+counters, promotion thresholds, OSR at loop back-edges, deoptimisation on
+speculative-guard failure, inline caches — follows HotSpot's C1/C2 pipeline
+directly. The **execution *mechanism*** deliberately differs: HotSpot uses a
+template (assembly) interpreter whose frames share one native stack with
+compiled code under an exact GC, whereas Bliss's baseline model runs a
+host-language (Rust) bytecode interpreter. Both interpreted and compiled CL
+activations still live on a single per-green-thread control stack bridged by
+interpreter↔compiled adapters (§2.4.4); a template interpreter is an explicit
+later option (§2.4.5), not the baseline. See §2.4 for the stack model and the
+scope of the HotSpot correspondence.
 Source forms are never the long-lived execution representation: the reader
 and macroexpander produce forms, the compiler front-end lowers them to
 portable Bliss bytecode, and every tier uses bytecode PCs as the stable
