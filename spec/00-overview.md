@@ -285,6 +285,60 @@ A sea-of-nodes SSA IR (like HotSpot C2 / Graal):
    growing portions of the runtime. Rust core shrinks to GC inner
    loops, FFI bridge, and platform glue.
 
+### 4.6  Prior Art & Design Rationale (CL implementation landscape)
+
+Most of Bliss's execution-model choices are well-trodden in the CL family;
+one is genuinely novel. This subsection records where Bliss follows precedent
+and where it does not, so later decisions can be weighed against real systems.
+
+**Execution strategy — precedented.** CL implementations cluster into a few
+strategies:
+
+| Implementation | Strategy | Relevance to Bliss |
+|----------------|----------|--------------------|
+| **CLISP** | Portable **bytecode VM** (C); compiler emits bytecode, FASLs are bytecode; no native codegen | Reference for the T0 loop and bytecode FASL (§4.4.3, §6) |
+| **ECL** | **Two backends sharing one front-end**: portable bytecode compiler/interpreter (default) + "Lisp → C → native via a C compiler" | Closest cousin to Bliss's **bytecode baseline + native tiers** |
+| **CMUCL** | Native (Python compiler) **plus** a historical byte-compiler for space | Precedent that a serious native CL can carry a bytecode tier |
+| **SBCL** | **No bytecode**: `*evaluator-mode*` selects tree-walk interpret *or* compile-to-native; one optimising compiler, no tiers | Reference for tree-walk-or-native and the compilation environment |
+| **CCL** | Fast compile-to-native; `eval` minimally compiles | — |
+| **ABCL** | Compiles to **JVM bytecode**; inherits the JVM's adaptive JIT/tiering | The only mainstream CL with HotSpot-style tiering — by delegation |
+
+Bliss's **bytecode-baseline-plus-native-tiers** structure follows ECL (and
+historical CMUCL); the **portable bytecode + bytecode FASL** follows CLISP.
+
+**Compile-time evaluation — standardised, so Bliss copies the standard.**
+`eval-when`, the compile-time side effects of `defmacro` / `define-compiler-macro`
+/ `defclass` / `deftype` / `defstruct` / `defpackage` / `defconstant`, and the
+compiler-macro decline/`notinline` protocol are fixed by CLHS 3.2. Every
+conforming implementation maintains a **compilation environment** into which
+those effects register (SBCL: the global *info database* + `*lexenv*`) and runs
+macro/compiler-macro **expander bodies through its own evaluator** during
+compilation. Bliss does the same: the **tree-walker is the compile-time
+evaluator**, and the macro / compiler-macro registries live in the shared
+front-end (`bliss-compiler`), so a `define-compiler-macro` fires identically for
+interpreted and compiled callers. Implementing CLHS 3.2.3 top-level / `eval-when`
+processing is the compiler-specific work; it is a standardised algorithm, not an
+invention. (The hard variant — separating **host** vs **target** macros during a
+from-scratch cross-build — is SBCL's *genesis*; it applies to Bliss only if it
+cross-bootstraps, not to in-image compilation.)
+
+**Two coexisting backends — an established discipline.** SBCL (`:interpret` vs
+`:compile`) and ECL (bytecode vs C) both ship two evaluators that must agree,
+kept consistent by a shared front-end plus conformance testing. Bliss adopts the
+same discipline: keep the tree-walker as the reference **oracle**, build the
+bytecode backend behind a flag with **fallback-on-bail**, and **differential-test**
+both against the stage-0..4 corpus, flipping the default only at parity.
+
+**Adaptive tiering — the novel part.** Counter-driven promotion with **OSR and
+deoptimisation** (tiered compilation §4.4, OSR/deopt §4.6, profiling §4.9) has
+**no self-hosted-CL precedent**: the CL
+family is "interpret *or* compile-to-native, chosen once," and the only mainstream
+CL that gets HotSpot-style adaptive tiering (ABCL) does so by running on the JVM.
+Bliss's references for this layer are therefore **HotSpot / the JVM, not the CL
+implementations** — and the bytecode PC is deliberately the stable coordinate
+system that makes OSR/deopt tractable (§4.4.3.1). This is the part of the design
+to scrutinise against JVM literature rather than CL prior art.
+
 ## 5  Cross-Cutting Concerns
 
 ### 5.1  Error Handling
