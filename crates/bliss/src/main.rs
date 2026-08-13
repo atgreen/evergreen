@@ -9,7 +9,9 @@ fn main() {
     match cli::run(&args) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("bliss: {}", e);
+            // Use describe_err so symbols render by name (e.g. "undefined
+            // function: FIND-IF") rather than "Symbol(194)".
+            eprintln!("bliss: {}", cli::describe_err(&e));
             std::process::exit(1);
         }
     }

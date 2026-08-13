@@ -10630,7 +10630,7 @@ fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, BlissError> {
 
 /// Render an error for display, resolving symbol indices to their names so
 /// messages read `undefined function: FOO` instead of `... Symbol(147)`.
-fn describe_err(e: &BlissError) -> String {
+pub fn describe_err(e: &BlissError) -> String {
     match e {
         BlissError::UndefinedFunction(s) => format!("undefined function: {}", sym_name(*s)),
         BlissError::UnboundVariable(s) => format!("unbound variable: {}", sym_name(*s)),
