@@ -1948,6 +1948,16 @@ fn print_val(val: BlissVal, out: &mut String) {
         out.push('T');
     } else if val == EOF {
         out.push_str("#<EOF>");
+    } else if bliss_stdlib::is_instance(val) {
+        // CLOS instances are opaque handles; print as #<CLASS-NAME>.
+        let name = instance_class_hierarchy_names(val)
+            .as_ref()
+            .and_then(|names| names.first())
+            .cloned()
+            .unwrap_or_else(|| "INSTANCE".to_string());
+        out.push_str("#<");
+        out.push_str(&name);
+        out.push('>');
     } else if val.is_fixnum() {
         out.push_str(&val.as_fixnum().to_string());
     } else if val.is_single_float() {
@@ -6006,6 +6016,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "TYPE-OF" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
+                // CLOS instances: TYPE-OF returns the direct class name, not the
+                // representation type (previously "FIXNUM"). See bliss-2ke.
+                if bliss_stdlib::is_instance(v) {
+                    if let Some(name) =
+                        instance_class_hierarchy_names(v).as_ref().and_then(|n| n.first())
+                    {
+                        return match resolve_sym(name) {
+                            Some(sym) => Ok(sym),
+                            None => Ok(arena_str(name)),
+                        };
+                    }
+                }
                 let type_name = if v.is_nil() {
                     "NULL"
                 } else if v == T {

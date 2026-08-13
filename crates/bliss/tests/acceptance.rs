@@ -637,6 +637,38 @@ fn eval_defclass_and_make_instance() {
     );
 }
 
+/// Regression for bliss-2ke: CLOS instances must not be representable as
+/// fixnums. Instance ids were once `from_fixnum(id)` (starting at 100000), so a
+/// plain integer equal to a live instance id collided with it in the registry
+/// (`(typep <int> <class>)` wrongly true) and `type-of`/printing treated the
+/// instance as a number. Instances are now SPECIAL-tagged handles.
+#[test]
+fn eval_instance_not_confused_with_fixnum() {
+    // type-of an instance is its class, not FIXNUM; and no integer is ever an
+    // instance regardless of value (probe a wide range that spans the old id
+    // base of 100000).
+    let expr = r#"(progn
+  (defclass point () ((x :initarg :x)))
+  (let ((p (make-instance 'point :x 5)))
+    (format nil "~A|~A|~A"
+            (type-of p)
+            (typep p 'point)
+            (some (lambda (i) (typep i 'point))
+                  '(99999 100000 100001 100002 100003 100004 100005 100006)))))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("POINT|T|NIL"),
+        "instance must have class type, match its class, and never collide with \
+         an integer; got: '{}'",
+        stdout
+    );
+}
+
 #[test]
 fn eval_defmethod_dispatches_correctly() {
     let expr = r#"(progn

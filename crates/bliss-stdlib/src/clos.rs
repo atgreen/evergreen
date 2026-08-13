@@ -169,7 +169,10 @@ impl ClosState {
     fn alloc_instance_id(&mut self) -> BlissVal {
         let id = self.next_instance_id;
         self.next_instance_id += 1;
-        BlissVal::from_fixnum(id)
+        // SPECIAL-tagged handle, not a fixnum: keeps instances off the fixnum
+        // tag so a plain integer can never collide with an instance id in the
+        // registry, and immediate-type checks don't misfire. See bliss-2ke.
+        BlissVal::from_clos_handle(id)
     }
 
     fn alloc_gf_id(&mut self) -> BlissVal {
