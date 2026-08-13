@@ -299,13 +299,31 @@ fn storage_condition_pool_is_live() -> bool {
     })
 }
 
-fn acquire_storage_condition() -> Result<BlissVal, BlissError> {
-    if !storage_condition_pool_is_live() {
-        initialize_storage_condition_pool()?;
-    }
+/// Acquire a preallocated `STORAGE-CONDITION` instance for the heap-exhaustion /
+/// stack-overflow signalling path (R5.110). This runs when allocation is already
+/// failing, so it MUST NOT allocate, intern, define classes, resolve symbols, or
+/// take non-essential locks: it only reads the thread-local pool array and
+/// advances the rotation cursor. The pool is filled once at startup by
+/// `initialize_condition_runtime_support` (called from the interpreter's
+/// `Env::new` after CLOS/condition-class bootstrap and before any user code). If
+/// it is somehow not initialized, we fail hard with a fixed `Internal` error
+/// rather than lazily allocating on the low-memory path — that lazy fallback was
+/// the bug this replaces (bliss-uh4.2).
+///
+/// Deliberately does NOT call `storage_condition_pool_is_live`, whose
+/// `class_of` / class-graph walk could allocate or lock.
+pub fn acquire_preallocated_storage_condition() -> Result<BlissVal, BlissError> {
     STATE.with(|s| {
         let mut state = s.borrow_mut();
+        if !state.storage_condition_pool_initialized {
+            return Err(BlissError::Internal(
+                "STORAGE-CONDITION pool not initialized before the storage-failure path".into(),
+            ));
+        }
         let condition = state.storage_condition_pool[state.next_storage_condition];
+        if condition == NIL {
+            return Err(BlissError::Internal("STORAGE-CONDITION pool slot empty".into()));
+        }
         state.next_storage_condition =
             (state.next_storage_condition + 1) % STORAGE_CONDITION_POOL_SIZE;
         Ok(condition)
@@ -1074,7 +1092,7 @@ pub fn signal_storage_condition_for_runtime_error(
 ) -> Result<BlissVal, BlissError> {
     match error {
         BlissError::Oom | BlissError::StackOverflow(_) => {
-            let condition = acquire_storage_condition()?;
+            let condition = acquire_preallocated_storage_condition()?;
             signal_condition(condition)?;
             Ok(condition)
         }

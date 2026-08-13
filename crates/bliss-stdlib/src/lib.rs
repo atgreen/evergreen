@@ -42,8 +42,8 @@ pub use clos::{
     shared_initialize, shared_initialize_with_list, slot_boundp, slot_makunbound, slot_value,
 };
 pub use conditions::{
-    HandlerBinding, RestartSpec, clear_funcall_hook, compute_restarts, error_condition,
-    find_restart, handler_bind, handler_bind_fn, handler_case,
+    HandlerBinding, RestartSpec, acquire_preallocated_storage_condition, clear_funcall_hook,
+    compute_restarts, error_condition, find_restart, handler_bind, handler_bind_fn, handler_case,
     initialize_condition_runtime_support, install_runtime_init_hook, invoke_debugger,
     invoke_restart, invoke_restart_interactively, make_simple_error, make_type_error,
     restart_bind, restart_bind_fn, set_break_on_signals, set_debugger_hook, set_funcall_hook,

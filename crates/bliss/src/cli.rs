@@ -790,7 +790,11 @@ fn bliss_error_to_condition(
         BlissError::StreamError(_) => build_condition_instance(env, "STREAM-ERROR", &[])?,
         BlissError::FileError(_) => build_condition_instance(env, "FILE-ERROR", &[])?,
         BlissError::Oom | BlissError::StackOverflow(_) => {
-            build_condition_instance(env, "STORAGE-CONDITION", &[])?
+            // R5.110: on the storage-failure path allocation is already failing,
+            // so hand back a STORAGE-CONDITION preallocated at startup rather than
+            // building a fresh instance (which would intern/define classes and
+            // allocate). See bliss-uh4.2. HANDLER-CASE still catches it normally.
+            bliss_stdlib::acquire_preallocated_storage_condition()?
         }
         BlissError::SandboxViolation(msg) => make_simple_error_condition(arena_str(msg), env)?,
         BlissError::ProgramError(_) => build_condition_instance(env, "PROGRAM-ERROR", &[])?,
@@ -1757,7 +1761,13 @@ fn invoke_generic_function(
 impl Env {
     fn new(sandbox: bool) -> Self {
         let _ = bliss_stdlib::bootstrap_clos();
-        let _ = bliss_stdlib::initialize_condition_runtime_support();
+        // Establish the condition classes and preallocate the STORAGE-CONDITION
+        // pool at startup, before any user code runs, so the heap-exhaustion /
+        // stack-overflow path never has to allocate (R5.110, bliss-uh4.2). A
+        // failure here means the condition system is unusable — fail loudly
+        // rather than limping on and lazily allocating on the low-memory path.
+        bliss_stdlib::initialize_condition_runtime_support()
+            .expect("initialize condition runtime support (STORAGE-CONDITION pool) at startup");
         let mut packages = HashMap::new();
         seed_standard_packages(&mut packages);
         let mut env = Env {

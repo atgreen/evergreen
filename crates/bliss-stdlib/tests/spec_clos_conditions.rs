@@ -500,6 +500,49 @@ fn conditions_oom_path_uses_preallocated_storage_condition_instances() {
     assert_ne!(seen[0], seen[1]);
 }
 
+// R5.110 / bliss-uh4.2: the storage-failure acquire path must be a startup
+// invariant, never a lazy allocator.
+#[test]
+fn storage_condition_acquire_without_init_is_a_hard_error_not_lazy_alloc() {
+    // A freshly spawned thread has fresh thread-local condition state: the
+    // STORAGE-CONDITION pool has never been initialized there. Acquiring on the
+    // storage-failure path must fail hard rather than lazily defining classes or
+    // allocating an instance (the bug bliss-uh4.2 fixes).
+    let result = thread::spawn(conditions::acquire_preallocated_storage_condition)
+        .join()
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "acquire on the storage-failure path must not lazily initialize/allocate"
+    );
+}
+
+#[test]
+fn storage_condition_pool_rotates_and_reuses_preallocated_instances() {
+    reset_state();
+    conditions::initialize_condition_runtime_support().unwrap();
+    // STORAGE_CONDITION_POOL_SIZE is 4 (conditions.rs). Acquiring many more than
+    // that must cycle through exactly those preallocated instances and never
+    // allocate a fresh one.
+    let mut distinct: Vec<BlissVal> = Vec::new();
+    for _ in 0..12 {
+        let c = conditions::acquire_preallocated_storage_condition().unwrap();
+        assert_ne!(c, NIL);
+        assert_eq!(
+            class_name(class_of(c)),
+            sym(conditions::SYMBOL_STORAGE_CONDITION)
+        );
+        if !distinct.contains(&c) {
+            distinct.push(c);
+        }
+    }
+    assert_eq!(
+        distinct.len(),
+        4,
+        "acquire must reuse the preallocated pool, not allocate a fresh instance each call"
+    );
+}
+
 #[test]
 fn clos_and_conditions_top_level_entrypoints_compose_in_an_acceptance_scenario() {
     reset_state();
