@@ -759,6 +759,37 @@ fn eval_multiple_value_bind() {
     );
 }
 
+#[test]
+fn eval_multiple_values_do_not_leak_through_single_value_ops() {
+    // bliss-2pt.12: a producer (GETHASH/FLOOR) nested inside a single-value
+    // operation (arithmetic, LIST, a single-valued function) must not leak its
+    // extra values to an enclosing multiple-value consumer, while transparent
+    // tails and genuine producers must still propagate them.
+    let expr = r#"
+(let ((h (make-hash-table)))
+  (setf (gethash 'k h) 42)
+  (flet ((mv (form) (multiple-value-bind (a b) form (list a b))))
+    (format nil "~A|~A|~A|~A|~A|~A|~A"
+      (multiple-value-bind (a b) (+ 0 (gethash 'k h)) (list a b))   ; leak -> (42 NIL)
+      (multiple-value-bind (a b) (list (gethash 'k h)) (list a b))  ; leak -> ((42) NIL)
+      (multiple-value-bind (a b) (identity (gethash 'k h)) (list a b)) ; leak -> (42 NIL)
+      (multiple-value-bind (a b) (if t (floor 7 2) 0) (list a b))   ; transparent -> (3 1)
+      (multiple-value-bind (a b) (progn (floor 7 2)) (list a b))    ; transparent -> (3 1)
+      (multiple-value-bind (a b) (funcall #'floor 7 2) (list a b))  ; producer -> (3 1)
+      (multiple-value-bind (a b) (values 1 2) (list a b)))))"#; // producer -> (1 2)
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(42 NIL)|((42) NIL)|(42 NIL)|(3 1)|(3 1)|(3 1)|(1 2)"),
+        "multiple values leaked or a producer was truncated, got: '{}'",
+        stdout
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════
 // Error signaling (error / cerror)
 // ══════════════════════════════════════════════════════════════════

@@ -1925,6 +1925,10 @@ fn eval_lambda_call(
 ) -> Result<BlissVal, BlissError> {
     with_child_frame(env, parent, |env| {
         bind_lambda_list(params_form, args, env)?;
+        // Arguments are a single-value context; a producer evaluated as an
+        // argument (or an &optional/&key default) must not leak its extra values
+        // into the body. The body's tail form establishes this call's values.
+        env.clear_mv();
         eval_progn(body, env)
     })
 }
@@ -3404,9 +3408,131 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         return Err(BlissError::UnboundVariable(form));
     }
     if form.is_cons() {
-        return eval_list(form, env);
+        // Multiple values propagate only out of value-transparent forms (control
+        // and binding special forms, and function calls) and genuine multiple-value
+        // producers. Every other compound form is a single-value context: after it
+        // computes its result, any extra values left in `env.mv` by a nested
+        // producer (e.g. the second value of a GETHASH evaluated as an argument)
+        // must be discarded so an enclosing multiple-value consumer does not see
+        // them leak through. See bliss-2pt.12.
+        let preserve = {
+            let (car, _) = cp(form);
+            if car.is_symbol() {
+                mv_form_preserves_values(&sym_name(car), env)
+            } else {
+                // Lambda application `((lambda ...) ...)` — dispatches through
+                // eval_lambda_call, which sets mv from the body's tail form.
+                true
+            }
+        };
+        let result = eval_list(form, env)?;
+        if !preserve {
+            env.clear_mv();
+        }
+        return Ok(result);
     }
     Ok(form)
+}
+
+/// Whether a compound form headed by `name` propagates multiple values (either
+/// because it is value-transparent — its value is that of a tail sub-form — or
+/// because it is a genuine multiple-value producer). Anything not covered here
+/// is treated as a single-value context (see the `eval_form` cons arm).
+///
+/// The classification is deliberately conservative: over-including a form here
+/// merely leaves a latent leak (the historical behaviour), whereas wrongly
+/// truncating a producer would drop legitimate secondary values. Dynamically
+/// defined functions/macros/generics/methods always preserve — a function's
+/// return values come from its own body (eval_lambda_call clears the caller's
+/// argument values before evaluating it), and a macro's from its expansion.
+fn mv_form_preserves_values(name: &str, env: &Env) -> bool {
+    let bare = name.rsplit(':').next().unwrap_or(name);
+    if env.funs.contains_key(name)
+        || env.macros.contains_key(name)
+        || env.generics.contains_key(name)
+        || env.methods.contains_key(name)
+        || env.funs.contains_key(bare)
+        || env.macros.contains_key(bare)
+    {
+        return true;
+    }
+    mv_operator_preserves(name) || mv_operator_preserves(bare)
+}
+
+/// The static set of built-in operators whose result carries multiple values.
+fn mv_operator_preserves(name: &str) -> bool {
+    matches!(
+        name,
+        // ── genuine multiple-value producers ──
+        "VALUES"
+            | "VALUES-LIST"
+            | "GETHASH"
+            | "FLOOR"
+            | "CEILING"
+            | "TRUNCATE"
+            | "ROUND"
+            | "FFLOOR"
+            | "FCEILING"
+            | "FTRUNCATE"
+            | "FROUND"
+            | "PARSE-NAMESTRING"
+            | "PARSE-INTEGER"
+            | "SUBTYPEP"
+            | "READ-LINE"
+            | "READ-FROM-STRING"
+            | "INTERN"
+            | "FIND-SYMBOL"
+            | "MACROEXPAND"
+            | "MACROEXPAND-1"
+            | "GET-MACRO-CHARACTER"
+            | "GET-PROPERTIES"
+            | "GET-DECODED-TIME"
+            | "DECODE-UNIVERSAL-TIME"
+            | "DECODE-FLOAT"
+            | "INTEGER-DECODE-FLOAT"
+            | "MULTIPLE-VALUE-PROG1"
+            // ── value-transparent control / binding special forms ──
+            | "IF"
+            | "WHEN"
+            | "UNLESS"
+            | "COND"
+            | "CASE"
+            | "ECASE"
+            | "CCASE"
+            | "TYPECASE"
+            | "ETYPECASE"
+            | "CTYPECASE"
+            | "AND"
+            | "OR"
+            | "PROGN"
+            | "LOCALLY"
+            | "THE"
+            | "EVAL-WHEN"
+            | "LET"
+            | "LET*"
+            | "FLET"
+            | "LABELS"
+            | "MACROLET"
+            | "SYMBOL-MACROLET"
+            | "BLOCK"
+            | "CATCH"
+            | "UNWIND-PROTECT"
+            | "PROGV"
+            | "TAGBODY"
+            | "HANDLER-BIND"
+            | "HANDLER-CASE"
+            | "RESTART-BIND"
+            | "RESTART-CASE"
+            | "IGNORE-ERRORS"
+            | "DESTRUCTURING-BIND"
+            | "MULTIPLE-VALUE-BIND"
+            | "MULTIPLE-VALUE-CALL"
+            | "EVAL"
+            | "FUNCALL"
+            | "APPLY"
+            | "CALL-NEXT-METHOD"
+            | "LOOP"
+    )
 }
 
 fn canonical_type_name(type_form: BlissVal) -> Result<String, BlissError> {
