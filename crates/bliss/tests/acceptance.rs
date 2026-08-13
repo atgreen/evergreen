@@ -790,6 +790,34 @@ fn eval_multiple_values_do_not_leak_through_single_value_ops() {
     );
 }
 
+#[test]
+fn handler_case_catches_runtime_errors() {
+    // Runtime errors raised by the evaluator (not only conditions raised through
+    // SIGNAL/ERROR) are catchable CL conditions: HANDLER-CASE / IGNORE-ERRORS
+    // must catch TYPE-ERROR, UNBOUND-VARIABLE, UNDEFINED-FUNCTION, and
+    // DIVISION-BY-ZERO, matching by the condition class hierarchy. Control-flow
+    // transfers (BLOCK/RETURN-FROM) are not conditions and must pass through.
+    let expr = r#"(format nil "~A|~A|~A|~A|~A|~A|~A"
+  (handler-case (car 5) (type-error (e) (type-error-datum e)))
+  (handler-case undefined-var (unbound-variable (e) :unbound))
+  (handler-case (nosuchfn 1) (undefined-function (e) :undef))
+  (handler-case (/ 1 0) (division-by-zero (e) :divzero))
+  (handler-case (car 5) (error (e) :as-error))
+  (ignore-errors (car 5))
+  (handler-case (block b (return-from b 7)) (error (e) :wrongly-caught)))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("5|UNBOUND|UNDEF|DIVZERO|AS-ERROR|NIL|7"),
+        "runtime errors should be catchable and control transfers pass through, got: '{}'",
+        stdout
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════
 // Error signaling (error / cerror)
 // ══════════════════════════════════════════════════════════════════

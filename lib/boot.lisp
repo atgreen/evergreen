@@ -528,6 +528,11 @@
 
 (defun delete-if (pred seq &rest keys) (apply #'remove-if pred seq keys))
 (defun delete-if-not (pred seq &rest keys) (apply #'remove-if-not pred seq keys))
+;; DELETE / DELETE-DUPLICATES are permitted to modify their argument but a
+;; conforming program must not depend on it; delegate to the non-destructive
+;; versions, which is a legal implementation.
+(defun delete (item seq &rest keys) (apply #'remove item seq keys))
+(defun delete-duplicates (seq &rest keys) (apply #'remove-duplicates seq keys))
 
 ;;; ---------------------------------------------------------------------------
 ;;; CxR list accessors (all compositions of CAR/CDR two to four deep).

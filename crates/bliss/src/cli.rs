@@ -733,6 +733,55 @@ fn make_simple_warning_condition(message: BlissVal, env: &mut Env) -> Result<Bli
     )
 }
 
+/// Convert a raw evaluator error into the CL condition it denotes, so that
+/// HANDLER-CASE (and hence IGNORE-ERRORS) catches ordinary runtime errors —
+/// TYPE-ERROR, UNBOUND-VARIABLE, UNDEFINED-FUNCTION, arithmetic, etc. — and not
+/// only conditions raised explicitly through SIGNAL/ERROR. Returns `Ok(None)`
+/// for errors that are not conditions: `Internal` (which also carries the
+/// control-flow tokens used by BLOCK/RETURN-FROM, HANDLER-CASE, and restarts)
+/// and `Shutdown`, so those keep propagating unchanged.
+fn bliss_error_to_condition(
+    env: &mut Env,
+    error: &BlissError,
+) -> Result<Option<BlissVal>, BlissError> {
+    let name_sym = resolve_sym("NAME").unwrap_or(NIL);
+    let condition = match error {
+        BlissError::TypeError { datum, expected } => build_condition_instance(
+            env,
+            "TYPE-ERROR",
+            &[
+                resolve_sym("DATUM").unwrap_or(NIL),
+                *datum,
+                resolve_sym("EXPECTED-TYPE").unwrap_or(NIL),
+                arena_str(expected),
+            ],
+        )?,
+        BlissError::UnboundVariable(sym) => {
+            build_condition_instance(env, "UNBOUND-VARIABLE", &[name_sym, *sym])?
+        }
+        BlissError::UndefinedFunction(sym) => {
+            build_condition_instance(env, "UNDEFINED-FUNCTION", &[name_sym, *sym])?
+        }
+        BlissError::ArithmeticError(msg) => {
+            let type_name = if msg.contains("division") {
+                "DIVISION-BY-ZERO"
+            } else {
+                "ARITHMETIC-ERROR"
+            };
+            build_condition_instance(env, type_name, &[])?
+        }
+        BlissError::PackageError(_) => build_condition_instance(env, "PACKAGE-ERROR", &[])?,
+        BlissError::StreamError(_) => build_condition_instance(env, "STREAM-ERROR", &[])?,
+        BlissError::FileError(_) => build_condition_instance(env, "FILE-ERROR", &[])?,
+        BlissError::Oom | BlissError::StackOverflow(_) => {
+            build_condition_instance(env, "STORAGE-CONDITION", &[])?
+        }
+        BlissError::SandboxViolation(msg) => make_simple_error_condition(arena_str(msg), env)?,
+        _ => return Ok(None),
+    };
+    Ok(Some(condition))
+}
+
 /// Construct a condition instance of `type_name` from already-evaluated initarg
 /// pairs (`key value key value …`). Explicit initargs and `:default-initargs`
 /// are applied first, then slot `:initform`s fill any remaining unbound slots —
@@ -10153,24 +10202,51 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     match result {
         Ok(val) => Ok(val),
         Err(error) => {
-            let Some(token) = handler_case_token(&error) else {
-                return Err(error);
-            };
-            let condition = take_control_value(&token);
-            for handler in installed {
-                if let HandlerImpl::HandlerCase {
-                    token: entry_token,
-                    var_name,
-                    body,
-                    captured_frame,
-                } = handler.handler
-                {
-                    if entry_token == token {
-                        let mut handler_env = env.child_with_parent(captured_frame);
-                        if let Some(name) = var_name {
-                            handler_env.define_local(&name, condition);
+            // A condition signalled through HANDLER-CASE's own handlers arrives as
+            // a control token naming the selected clause.
+            if let Some(token) = handler_case_token(&error) {
+                let condition = take_control_value(&token);
+                for handler in installed {
+                    if let HandlerImpl::HandlerCase {
+                        token: entry_token,
+                        var_name,
+                        body,
+                        captured_frame,
+                    } = handler.handler
+                    {
+                        if entry_token == token {
+                            let mut handler_env = env.child_with_parent(captured_frame);
+                            if let Some(name) = var_name {
+                                handler_env.define_local(&name, condition);
+                            }
+                            return eval_progn(body, &mut handler_env);
                         }
-                        return eval_progn(body, &mut handler_env);
+                    }
+                }
+                return Err(error);
+            }
+            // A raw runtime error (TYPE-ERROR, UNBOUND-VARIABLE,
+            // UNDEFINED-FUNCTION, arithmetic, …) is a signalable CL condition
+            // too. Build the condition and let the first clause whose type
+            // matches handle it, so HANDLER-CASE catches system errors — not only
+            // those raised through SIGNAL/ERROR. Errors that are not conditions
+            // (control-flow tokens, Shutdown) yield None and propagate unchanged.
+            if let Ok(Some(condition)) = bliss_error_to_condition(env, &error) {
+                for handler in installed {
+                    if let HandlerImpl::HandlerCase {
+                        var_name,
+                        body,
+                        captured_frame,
+                        ..
+                    } = handler.handler
+                    {
+                        if condition_matches_handler(env, condition, &handler.type_name) {
+                            let mut handler_env = env.child_with_parent(captured_frame);
+                            if let Some(name) = var_name {
+                                handler_env.define_local(&name, condition);
+                            }
+                            return eval_progn(body, &mut handler_env);
+                        }
                     }
                 }
             }
