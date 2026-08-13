@@ -1186,3 +1186,34 @@ fn do_dostar_psetq() {
         );
     }
 }
+
+/// Regression: character functions (char-code/code-char + comparisons, case,
+/// predicates), string-upcase/downcase, and list fns (last/butlast/nthcdr/
+/// mapc/mapcan/getf/nreverse) were undefined. (bliss-2pt stdlib completeness.)
+#[test]
+fn char_string_and_list_functions() {
+    let cases = [
+        ("(char-code #\\A)", "65"),
+        ("(code-char 66)", "B"),
+        ("(char< #\\a #\\b)", "T"),
+        ("(char-upcase #\\a)", "A"),
+        ("(digit-char-p #\\7)", "7"),
+        ("(alpha-char-p #\\5)", "NIL"),
+        ("(string-upcase \"hello\")", "HELLO"),
+        ("(last '(1 2 3))", "(3)"),
+        ("(butlast '(1 2 3))", "(1 2)"),
+        ("(nthcdr 2 '(a b c d))", "(C D)"),
+        ("(mapcan (function list) '(1 2 3))", "(1 2 3)"),
+        ("(getf '(:a 1 :b 2) :b)", "2"),
+        ("(nreverse (list 1 2 3))", "(3 2 1)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}

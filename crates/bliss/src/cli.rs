@@ -3951,6 +3951,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 return Ok(if v.is_symbol() { T } else { NIL });
             }
+            "CHAR-CODE" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if !v.is_character() {
+                    return Err(BlissError::TypeError {
+                        datum: v,
+                        expected: "character".into(),
+                    });
+                }
+                return Ok(BlissVal::from_fixnum(v.as_char() as i64));
+            }
+            "CODE-CHAR" => {
+                let (af, _) = cp(cdr);
+                let code = num_val(eval_form(af, env)?)? as u32;
+                return Ok(match char::from_u32(code) {
+                    Some(c) => BlissVal::from_char(c),
+                    None => NIL,
+                });
+            }
             "TYPEP" => {
                 let (obj_form, r) = cp(cdr);
                 let (type_form, _) = cp(r);

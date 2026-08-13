@@ -613,3 +613,51 @@
             ,@body
             ,@(mapcar (lambda (v s) (list 'setq v s)) vars steps)
             (go ,top))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Character functions (over CHAR-CODE / CODE-CHAR; ASCII case mapping).
+;;; ---------------------------------------------------------------------------
+
+(defun char= (a b) (= (char-code a) (char-code b)))
+(defun char/= (a b) (/= (char-code a) (char-code b)))
+(defun char< (a b) (< (char-code a) (char-code b)))
+(defun char> (a b) (> (char-code a) (char-code b)))
+(defun char<= (a b) (<= (char-code a) (char-code b)))
+(defun char>= (a b) (>= (char-code a) (char-code b)))
+
+(defun upper-case-p (c) (and (>= (char-code c) 65) (<= (char-code c) 90)))
+(defun lower-case-p (c) (and (>= (char-code c) 97) (<= (char-code c) 122)))
+(defun char-upcase (c) (if (lower-case-p c) (code-char (- (char-code c) 32)) c))
+(defun char-downcase (c) (if (upper-case-p c) (code-char (+ (char-code c) 32)) c))
+(defun alpha-char-p (c) (or (upper-case-p c) (lower-case-p c)))
+(defun digit-char-p (c &optional (radix 10))
+  (let ((code (char-code c)))
+    (if (and (>= code 48) (<= code 57))
+        (let ((d (- code 48))) (if (< d radix) d nil))
+        nil)))
+(defun alphanumericp (c)
+  (or (alpha-char-p c) (and (>= (char-code c) 48) (<= (char-code c) 57))))
+
+(defun string-upcase (s) (map 'string (function char-upcase) (string s)))
+(defun string-downcase (s) (map 'string (function char-downcase) (string s)))
+
+;;; ---------------------------------------------------------------------------
+;;; Additional list functions.
+;;; ---------------------------------------------------------------------------
+
+(defun nthcdr (n list)
+  (if (or (<= n 0) (null list)) list (nthcdr (- n 1) (cdr list))))
+(defun last (list &optional (n 1))
+  (nthcdr (max 0 (- (length list) n)) list))
+(defun butlast (list &optional (n 1))
+  (subseq list 0 (max 0 (- (length list) n))))
+(defun mapc (fn &rest lists)
+  (apply (function mapcar) fn lists)
+  (car lists))
+(defun mapcan (fn &rest lists)
+  (apply (function append) (apply (function mapcar) fn lists)))
+(defun getf (plist key &optional default)
+  (do ((p plist (cddr p)))
+      ((null p) default)
+    (when (eq (car p) key) (return (cadr p)))))
+(defun nreverse (seq) (reverse seq))
