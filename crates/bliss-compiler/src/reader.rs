@@ -782,7 +782,18 @@ fn read_list_with_base(
 }
 
 fn is_delimiter(c: char) -> bool {
-    c.is_ascii_whitespace() || c == ')' || c == '(' || c == '"' || c == ';'
+    // Whitespace plus the standard terminating macro characters. ' (quote),
+    // ` (backquote) and , (comma) terminate a token just like ()";  — e.g.
+    // `foo'bar` reads as `foo` then `'bar`, and ASDF's `='#:eof` reads as the
+    // symbol `=` then `'#:eof` rather than one bogus package-qualified token.
+    c.is_ascii_whitespace()
+        || c == ')'
+        || c == '('
+        || c == '"'
+        || c == ';'
+        || c == '\''
+        || c == '`'
+        || c == ','
 }
 
 fn read_string(chars: &[char], mut pos: usize) -> Result<(BlissVal, usize), BlissError> {
