@@ -2371,7 +2371,9 @@ fn next_stdlib_class_id() -> BlissVal {
     NEXT_STDLIB_CLASS_ID.with(|c| {
         let v = *c.borrow();
         *c.borrow_mut() = v + 1;
-        BlissVal::from_fixnum(v)
+        // Opaque metaobject handle, not a fixnum: keeps class/method ids off the
+        // fixnum tag so a plain integer can't collide with one. See bliss-dx6.
+        BlissVal::from_meta_handle(v)
     })
 }
 

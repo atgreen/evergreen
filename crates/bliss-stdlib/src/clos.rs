@@ -360,13 +360,13 @@ impl ClosState {
     fn alloc_em_key(&mut self) -> BlissVal {
         let id = self.next_em_key;
         self.next_em_key += 1;
-        BlissVal::from_fixnum(id)
+        BlissVal::from_meta_handle(id)
     }
 
     fn alloc_gf_id(&mut self) -> BlissVal {
         let id = self.next_gf_id;
         self.next_gf_id += 1;
-        BlissVal::from_fixnum(id)
+        BlissVal::from_meta_handle(id)
     }
 }
 
@@ -510,9 +510,9 @@ pub fn find_class(name: BlissVal) -> Option<BlissVal> {
 /// Register a class by name.
 pub fn set_find_class(name: BlissVal, class: BlissVal) -> Result<(), BlissError> {
     with_state_mut(|st| {
-        // Track fixnum registration order (for diamond-hierarchy inference)
-        if class.is_fixnum() {
-            let fv = class.as_fixnum();
+        // Track handle-id registration order (for diamond-hierarchy inference)
+        if class.is_meta_handle() {
+            let fv = class.as_meta_handle_id();
             if !st.fixnum_registrations.iter().any(|(v, _)| *v == fv) {
                 st.fixnum_registrations.push((fv, class));
             }
@@ -557,9 +557,9 @@ pub fn define_class(
     slots: &[BlissVal],
 ) -> Result<(), BlissError> {
     with_state_mut(|st| {
-        // Track fixnum registration order (for diamond-hierarchy inference)
-        if class.is_fixnum() {
-            let fv = class.as_fixnum();
+        // Track handle-id registration order (for diamond-hierarchy inference)
+        if class.is_meta_handle() {
+            let fv = class.as_meta_handle_id();
             if !st.fixnum_registrations.iter().any(|(v, _)| *v == fv) {
                 st.fixnum_registrations.push((fv, class));
             }
@@ -753,10 +753,10 @@ pub fn class_slots(class: BlissVal) -> Vec<BlissVal> {
 ///   B, C (middle)     → supers = [A]
 ///   D (last, index 3) → supers = [B, C]  (all middle classes)
 fn infer_group_supers(st: &ClosState, class: BlissVal) -> Option<Vec<BlissVal>> {
-    if !class.is_fixnum() {
+    if !class.is_meta_handle() {
         return None;
     }
-    let fv = class.as_fixnum();
+    let fv = class.as_meta_handle_id();
     let pos = st.fixnum_registrations.iter().position(|(v, _)| *v == fv)?;
 
     // Find maximal consecutive run containing this position

@@ -31,6 +31,15 @@ pub const TAG_SPECIAL: u64 = 0b111;
 
 pub const TAG_MASK: u64 = 0b111;
 
+/// Payload bit marking an opaque metaobject handle (CLOS class/generic-function/
+/// method id, effective-method key) under the `SPECIAL` tag. Keeps these
+/// internal registry keys OFF the fixnum tag so a plain integer equal to one
+/// cannot collide with it in a registry. Builtin `SPECIAL` values
+/// (NIL/T/UNBOUND/MISSING/EOF) never set it. Handle ids are small positive
+/// counters, so they never reach this bit. See [`BlissVal::from_meta_handle`]
+/// and issue bliss-dx6.
+pub const META_HANDLE_BIT: u64 = 1 << 62;
+
 // ── Special-value constants ────────────────────────────────────────
 
 pub const NIL_BITS: u64 = 0x0000_0000_0000_0007; // tag 111, payload 0
@@ -71,6 +80,33 @@ impl BlissVal {
     /// Create a symbol-index value.
     pub fn from_symbol_index(idx: u32) -> Self {
         BlissVal(((idx as u64) << 3) | TAG_SYMBOL)
+    }
+
+    /// Encode an opaque metaobject handle id (CLOS class/gf/method id, or an
+    /// effective-method key) as a `SPECIAL`-tagged immediate with
+    /// [`META_HANDLE_BIT`] set. These are internal registry keys; encoding them
+    /// off the fixnum tag prevents a plain integer from colliding with one.
+    /// `id` must be a small non-negative counter (well within 58 bits). See
+    /// issue bliss-dx6.
+    #[inline(always)]
+    pub fn from_meta_handle(id: i64) -> Self {
+        debug_assert!(id >= 0 && (id as u64) < (1 << 58));
+        BlissVal(((id as u64) << 3) | TAG_SPECIAL | META_HANDLE_BIT)
+    }
+
+    /// True if this value is an opaque metaobject handle.
+    #[inline(always)]
+    pub fn is_meta_handle(self) -> bool {
+        self.tag() == TAG_SPECIAL && (self.0 & META_HANDLE_BIT) != 0
+    }
+
+    /// Extract the id from a metaobject handle. Panics if not a handle.
+    pub fn as_meta_handle_id(self) -> i64 {
+        assert!(
+            self.is_meta_handle(),
+            "as_meta_handle_id called on non-handle value"
+        );
+        ((self.0 & !META_HANDLE_BIT) >> 3) as i64
     }
 
 

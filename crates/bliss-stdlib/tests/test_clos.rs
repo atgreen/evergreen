@@ -483,3 +483,14 @@ fn change_class_growth_preserves_slots_via_forwarding() {
     assert_eq!(slot_value(inst, sa).unwrap(), fx(1)); // shared slot copied
     assert!(!slot_boundp(inst, sb).unwrap()); // added slot unbound
 }
+
+#[test]
+fn metaobject_handles_are_off_the_fixnum_tag() {
+    bootstrap_clos().unwrap();
+    // Generic-function ids are opaque metaobject handles, never fixnums, so a
+    // plain integer equal to the id cannot collide with the gf (bliss-dx6).
+    let gf = make_generic_function(sym(800), NIL).unwrap();
+    assert!(!gf.is_fixnum());
+    assert!(gf.is_meta_handle());
+    assert_ne!(gf, BlissVal::from_fixnum(gf.as_meta_handle_id()));
+}
