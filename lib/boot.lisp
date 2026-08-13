@@ -453,3 +453,78 @@
   "Invoke the most recent USE-VALUE restart with VALUE, or NIL if none."
   (let ((r (find-restart 'use-value condition)))
     (when r (invoke-restart r value))))
+
+;;; ---------------------------------------------------------------------------
+;;; REDUCE and the sequence -IF / -IF-NOT predicate family. Defined in Lisp over
+;;; ELT/LENGTH (general sequences) and FUNCALL (any function), since the stdlib's
+;;; internal apply helper can't invoke interpreter builtins. See spec §5.6.
+;;; ---------------------------------------------------------------------------
+
+(defun reduce (fn seq &key key from-end (start 0) end initial-value)
+  (let ((items (coerce seq 'list)))
+    (when (or (> start 0) end)
+      (setq items (subseq items start (or end (length items)))))
+    (when key (setq items (mapcar key items)))
+    (when from-end (setq items (reverse items)))
+    (if (null items)
+        (if initial-value initial-value (funcall fn))
+        (let ((acc (if initial-value initial-value (pop items))))
+          (dolist (x items acc)
+            (setq acc (if from-end (funcall fn x acc) (funcall fn acc x))))))))
+
+(defun find-if (pred seq &key key)
+  (dotimes (i (length seq) nil)
+    (let ((e (elt seq i)))
+      (when (funcall pred (if key (funcall key e) e)) (return e)))))
+
+(defun find-if-not (pred seq &key key)
+  (dotimes (i (length seq) nil)
+    (let ((e (elt seq i)))
+      (unless (funcall pred (if key (funcall key e) e)) (return e)))))
+
+(defun position-if (pred seq &key key)
+  (dotimes (i (length seq) nil)
+    (let ((e (elt seq i)))
+      (when (funcall pred (if key (funcall key e) e)) (return i)))))
+
+(defun position-if-not (pred seq &key key)
+  (dotimes (i (length seq) nil)
+    (let ((e (elt seq i)))
+      (unless (funcall pred (if key (funcall key e) e)) (return i)))))
+
+(defun count-if (pred seq &key key)
+  (let ((n 0))
+    (dotimes (i (length seq) n)
+      (let ((e (elt seq i)))
+        (when (funcall pred (if key (funcall key e) e)) (incf n))))))
+
+(defun count-if-not (pred seq &key key)
+  (let ((n 0))
+    (dotimes (i (length seq) n)
+      (let ((e (elt seq i)))
+        (unless (funcall pred (if key (funcall key e) e)) (incf n))))))
+
+(defun member-if (pred list &key key)
+  (loop for l on list
+        when (funcall pred (if key (funcall key (car l)) (car l)))
+          return l))
+
+(defun member-if-not (pred list &key key)
+  (loop for l on list
+        unless (funcall pred (if key (funcall key (car l)) (car l)))
+          return l))
+
+(defun assoc-if (pred alist &key key)
+  (dolist (pair alist nil)
+    (when (and (consp pair)
+               (funcall pred (if key (funcall key (car pair)) (car pair))))
+      (return pair))))
+
+(defun assoc-if-not (pred alist &key key)
+  (dolist (pair alist nil)
+    (when (and (consp pair)
+               (not (funcall pred (if key (funcall key (car pair)) (car pair)))))
+      (return pair))))
+
+(defun delete-if (pred seq &rest keys) (apply #'remove-if pred seq keys))
+(defun delete-if-not (pred seq &rest keys) (apply #'remove-if-not pred seq keys))

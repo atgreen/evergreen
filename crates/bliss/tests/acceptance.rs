@@ -1140,3 +1140,29 @@ fn return_exits_dotimes_and_dolist() {
         );
     }
 }
+
+/// Regression: REDUCE and the sequence -IF/-IF-NOT predicate family were
+/// undefined. (bliss-2pt stdlib completeness.)
+#[test]
+fn reduce_and_if_predicate_family() {
+    let cases = [
+        ("(reduce (function +) '(1 2 3 4))", "10"),
+        ("(reduce (function +) '(1 2 3) :initial-value 100)", "106"),
+        ("(reduce (function +) '())", "0"),
+        ("(find-if (function evenp) '(1 3 4 5))", "4"),
+        ("(position-if (function evenp) '(1 3 4 5))", "2"),
+        ("(count-if (function evenp) '(1 2 3 4))", "2"),
+        ("(member-if (function evenp) '(1 3 4 5))", "(4 5)"),
+        ("(find-if-not (function evenp) '(2 4 5 6))", "5"),
+        ("(assoc-if (function evenp) '((1 . a) (2 . b)))", "(2 . B)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}
