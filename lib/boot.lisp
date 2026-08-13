@@ -528,3 +528,36 @@
 
 (defun delete-if (pred seq &rest keys) (apply #'remove-if pred seq keys))
 (defun delete-if-not (pred seq &rest keys) (apply #'remove-if-not pred seq keys))
+
+;;; ---------------------------------------------------------------------------
+;;; CxR list accessors (all compositions of CAR/CDR two to four deep).
+;;; ---------------------------------------------------------------------------
+
+(defun caar (x) (car (car x)))
+(defun cadr (x) (car (cdr x)))
+(defun cdar (x) (cdr (car x)))
+(defun cddr (x) (cdr (cdr x)))
+(defun caaar (x) (car (caar x)))
+(defun caadr (x) (car (cadr x)))
+(defun cadar (x) (car (cdar x)))
+(defun caddr (x) (car (cddr x)))
+(defun cdaar (x) (cdr (caar x)))
+(defun cdadr (x) (cdr (cadr x)))
+(defun cddar (x) (cdr (cdar x)))
+(defun cdddr (x) (cdr (cddr x)))
+(defun caaaar (x) (car (caaar x)))
+(defun caaadr (x) (car (caadr x)))
+(defun caadar (x) (car (cadar x)))
+(defun caaddr (x) (car (caddr x)))
+(defun cadaar (x) (car (cdaar x)))
+(defun cadadr (x) (car (cdadr x)))
+(defun caddar (x) (car (cddar x)))
+(defun cadddr (x) (car (cdddr x)))
+(defun cdaaar (x) (cdr (caaar x)))
+(defun cdaadr (x) (cdr (caadr x)))
+(defun cdadar (x) (cdr (cadar x)))
+(defun cdaddr (x) (cdr (caddr x)))
+(defun cddaar (x) (cdr (cdaar x)))
+(defun cddadr (x) (cdr (cdadr x)))
+(defun cdddar (x) (cdr (cddar x)))
+(defun cddddr (x) (cdr (cdddr x)))

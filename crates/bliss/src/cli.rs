@@ -4484,14 +4484,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(BlissVal::from_fixnum(n as i64));
             }
             "MAPCAR" => {
-                let (fn_form, r) = cp(cdr);
+                // (mapcar fn list1 list2 ...) — apply fn to successive tuples,
+                // stopping at the shortest list.
+                let (fn_form, mut r) = cp(cdr);
                 let fn_val = eval_form(fn_form, env)?;
-                let (list_form, _) = cp(r);
-                let list = eval_form(list_form, env)?;
-                let elems = list_to_vec(list);
-                let mut results = Vec::new();
-                for e in &elems {
-                    results.push(apply_function(fn_val, &[*e], env)?);
+                let mut lists: Vec<Vec<BlissVal>> = Vec::new();
+                while r.is_cons() {
+                    let (list_form, rest) = cp(r);
+                    lists.push(list_to_vec(eval_form(list_form, env)?));
+                    r = rest;
+                }
+                let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+                let mut results = Vec::with_capacity(n);
+                for i in 0..n {
+                    let args: Vec<BlissVal> = lists.iter().map(|l| l[i]).collect();
+                    results.push(apply_function(fn_val, &args, env)?);
                 }
                 return Ok(vec_to_list(&results));
             }
