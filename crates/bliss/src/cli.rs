@@ -6817,7 +6817,11 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // accumulators) while keeping the shared global tables mutable in place, so
     // definitions made in the loop body (intern, use-package, defun, …) persist.
     let parent = Rc::clone(&env.frame);
-    with_child_frame(env, parent, |env| eval_loop_inner(cdr, env))
+    // LOOP establishes an implicit `block nil`, so a bare `(return x)` in the
+    // body (e.g. simple loops) exits with x, alongside LOOP's own RETURN clause.
+    with_block_nil(env, move |env| {
+        with_child_frame(env, parent, |env| eval_loop_inner(cdr, env))
+    })
 }
 
 fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
