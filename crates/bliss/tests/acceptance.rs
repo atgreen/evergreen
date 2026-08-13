@@ -1066,3 +1066,33 @@ fn mutations_inside_restart_functions_persist() {
         String::from_utf8_lossy(&out2.stdout)
     );
 }
+
+/// Regression for numeric LOOP: `for var from/to/below/downto/by`, the
+/// accumulation clauses (sum/count/maximize/minimize), always/never, and across
+/// — previously the numeric sub-keywords weren't recognized so these were dead
+/// code, and `downto` infinite-looped. (bliss-2pt LOOP completeness.)
+#[test]
+fn loop_numeric_iteration_and_accumulation() {
+    let cases = [
+        ("(loop for i from 1 to 5 collect i)", "(1 2 3 4 5)"),
+        ("(loop for i from 10 downto 7 collect i)", "(10 9 8 7)"),
+        ("(loop for i from 0 to 10 by 2 collect i)", "(0 2 4 6 8 10)"),
+        ("(loop for i from 1 to 5 sum i)", "15"),
+        ("(loop for i from 1 to 5 count (oddp i))", "3"),
+        ("(loop for i from 1 to 5 maximize i)", "5"),
+        ("(loop for i from 1 to 5 minimize i)", "1"),
+        ("(loop for i from 1 to 5 always (< i 9))", "T"),
+        ("(loop for i from 1 to 5 always (< i 3))", "NIL"),
+        ("(loop for i from 1 to 5 never (> i 9))", "T"),
+        ("(loop for i from 1 to 10 when (evenp i) sum i)", "30"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}

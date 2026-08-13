@@ -6296,6 +6296,26 @@ fn is_loop_keyword(bare: &str) -> bool {
             | "WHILE"
             | "UNTIL"
             | "REPEAT"
+            // Numeric-iteration and across sub-keywords for `for var ...`.
+            | "FROM"
+            | "TO"
+            | "UPTO"
+            | "DOWNTO"
+            | "BELOW"
+            | "ABOVE"
+            | "BY"
+            | "ACROSS"
+            // Accumulation clause keywords.
+            | "SUM"
+            | "SUMMING"
+            | "COUNT"
+            | "COUNTING"
+            | "MAXIMIZE"
+            | "MAXIMIZING"
+            | "MINIMIZE"
+            | "MINIMIZING"
+            | "ALWAYS"
+            | "NEVER"
     )
 }
 
@@ -6304,6 +6324,12 @@ enum LoopClause {
     Do(Vec<BlissVal>),
     Collect(BlissVal, Option<String>),
     Append(BlissVal, Option<String>),
+    Sum(BlissVal, Option<String>),
+    Count(BlissVal, Option<String>),
+    Maximize(BlissVal, Option<String>),
+    Minimize(BlissVal, Option<String>),
+    Always(BlissVal),
+    Never(BlissVal),
     Return(BlissVal),
     ThereIs(BlissVal),
     Cond {
@@ -6392,6 +6418,24 @@ impl LoopParser {
                 let into = self.read_into()?;
                 Ok(LoopClause::Append(e, into))
             }
+            "SUM" | "SUMMING" => {
+                let e = self.read_form()?;
+                Ok(LoopClause::Sum(e, self.read_into()?))
+            }
+            "COUNT" | "COUNTING" => {
+                let e = self.read_form()?;
+                Ok(LoopClause::Count(e, self.read_into()?))
+            }
+            "MAXIMIZE" | "MAXIMIZING" => {
+                let e = self.read_form()?;
+                Ok(LoopClause::Maximize(e, self.read_into()?))
+            }
+            "MINIMIZE" | "MINIMIZING" => {
+                let e = self.read_form()?;
+                Ok(LoopClause::Minimize(e, self.read_into()?))
+            }
+            "ALWAYS" => Ok(LoopClause::Always(self.read_form()?)),
+            "NEVER" => Ok(LoopClause::Never(self.read_form()?)),
             "DO" | "DOING" => Ok(LoopClause::Do(self.read_forms())),
             "RETURN" => Ok(LoopClause::Return(self.read_form()?)),
             "THEREIS" => Ok(LoopClause::ThereIs(self.read_form()?)),
@@ -6431,9 +6475,31 @@ impl LoopParser {
     }
 }
 
+/// A scalar LOOP accumulator (sum / count / maximize / minimize).
+#[derive(Clone)]
+enum NumAcc {
+    Sum(BlissVal),
+    Count(i64),
+    Max(Option<BlissVal>),
+    Min(Option<BlissVal>),
+}
+
+impl NumAcc {
+    fn finalize(&self) -> BlissVal {
+        match self {
+            NumAcc::Sum(v) => *v,
+            NumAcc::Count(c) => BlissVal::from_fixnum(*c),
+            NumAcc::Max(v) | NumAcc::Min(v) => v.unwrap_or(NIL),
+        }
+    }
+}
+
 #[derive(Default)]
 struct LoopAccs {
     map: std::collections::HashMap<Option<String>, Vec<BlissVal>>,
+    nums: std::collections::HashMap<Option<String>, NumAcc>,
+    /// Default result for a boolean loop (ALWAYS/NEVER): T unless short-circuited.
+    bool_default: Option<BlissVal>,
 }
 
 impl LoopAccs {
@@ -6443,6 +6509,47 @@ impl LoopAccs {
     fn append(&mut self, key: Option<String>, v: BlissVal) {
         let items = list_to_vec(v);
         self.map.entry(key).or_default().extend(items);
+    }
+    fn sum(&mut self, key: Option<String>, v: BlissVal) -> Result<(), BlissError> {
+        let entry = self.nums.entry(key).or_insert(NumAcc::Sum(BlissVal::from_fixnum(0)));
+        if let NumAcc::Sum(acc) = entry {
+            *acc = loop_add_numbers(*acc, v)?;
+        }
+        Ok(())
+    }
+    fn count(&mut self, key: Option<String>, truthy: bool) {
+        let entry = self.nums.entry(key).or_insert(NumAcc::Count(0));
+        if let NumAcc::Count(c) = entry {
+            if truthy {
+                *c += 1;
+            }
+        }
+    }
+    fn maximize(&mut self, key: Option<String>, v: BlissVal) -> Result<(), BlissError> {
+        let entry = self.nums.entry(key).or_insert(NumAcc::Max(None));
+        if let NumAcc::Max(cur) = entry {
+            let take = match cur {
+                None => true,
+                Some(c) => num_val(v)? > num_val(*c)?,
+            };
+            if take {
+                *cur = Some(v);
+            }
+        }
+        Ok(())
+    }
+    fn minimize(&mut self, key: Option<String>, v: BlissVal) -> Result<(), BlissError> {
+        let entry = self.nums.entry(key).or_insert(NumAcc::Min(None));
+        if let NumAcc::Min(cur) = entry {
+            let take = match cur {
+                None => true,
+                Some(c) => num_val(v)? < num_val(*c)?,
+            };
+            if take {
+                *cur = Some(v);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -6473,7 +6580,12 @@ fn loop_bind(pattern: BlissVal, value: BlissVal, env: &mut Env) {
 fn loop_collect_intos(clauses: &[LoopClause], out: &mut Vec<String>) {
     for c in clauses {
         match c {
-            LoopClause::Collect(_, Some(n)) | LoopClause::Append(_, Some(n)) => {
+            LoopClause::Collect(_, Some(n))
+            | LoopClause::Append(_, Some(n))
+            | LoopClause::Sum(_, Some(n))
+            | LoopClause::Count(_, Some(n))
+            | LoopClause::Maximize(_, Some(n))
+            | LoopClause::Minimize(_, Some(n)) => {
                 if !out.contains(n) {
                     out.push(n.clone());
                 }
@@ -6525,6 +6637,34 @@ fn loop_exec_clause(
             if !v.is_nil() {
                 *ret = Some(v);
             }
+        }
+        LoopClause::Always(e) => {
+            accs.bool_default.get_or_insert(T);
+            if eval_form(*e, env)?.is_nil() {
+                *ret = Some(NIL);
+            }
+        }
+        LoopClause::Never(e) => {
+            accs.bool_default.get_or_insert(T);
+            if !eval_form(*e, env)?.is_nil() {
+                *ret = Some(NIL);
+            }
+        }
+        LoopClause::Sum(e, into) => {
+            let v = eval_form(*e, env)?;
+            accs.sum(into.clone(), v)?;
+        }
+        LoopClause::Count(e, into) => {
+            let truthy = !eval_form(*e, env)?.is_nil();
+            accs.count(into.clone(), truthy);
+        }
+        LoopClause::Maximize(e, into) => {
+            let v = eval_form(*e, env)?;
+            accs.maximize(into.clone(), v)?;
+        }
+        LoopClause::Minimize(e, into) => {
+            let v = eval_form(*e, env)?;
+            accs.minimize(into.clone(), v)?;
         }
         LoopClause::Collect(e, into) => {
             let v = eval_form(*e, env)?;
@@ -6947,7 +7087,14 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     let current = eval_form(*start, env)?;
                     let step = match step {
                         Some(expr) => eval_form(*expr, env)?,
-                        None => BlissVal::from_fixnum(1),
+                        // DOWNTO/ABOVE count down by default; everything else up.
+                        None => {
+                            let down = matches!(
+                                limit,
+                                Some((LoopForLimit::Downto, _)) | Some((LoopForLimit::Above, _))
+                            );
+                            BlissVal::from_fixnum(if down { -1 } else { 1 })
+                        }
                     };
                     let limit = match limit {
                         Some((kind, expr)) => Some((*kind, eval_form(*expr, env)?)),
@@ -7095,6 +7242,15 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     for (name, items) in named {
         env.define_local(&name, vec_to_list(&items));
     }
+    // Numeric named accumulators (sum/count/maximize/minimize INTO var).
+    let named_nums: Vec<(String, BlissVal)> = accs
+        .nums
+        .iter()
+        .filter_map(|(k, v)| k.as_ref().map(|name| (name.clone(), v.finalize())))
+        .collect();
+    for (name, val) in named_nums {
+        env.define_local(&name, val);
+    }
 
     // :finally — an embedded (return X) ends the loop with X.
     for f in &finally {
@@ -7111,7 +7267,14 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     if let Some(r) = ret {
         return Ok(r);
     }
-    // Default: the anonymous accumulator's list, else NIL.
+    // Result precedence for the anonymous accumulator: scalar (sum/count/max/min),
+    // then boolean (always/never), then the collected list, else NIL.
+    if let Some(n) = accs.nums.get(&None) {
+        return Ok(n.finalize());
+    }
+    if let Some(b) = accs.bool_default {
+        return Ok(b);
+    }
     if let Some(items) = accs.map.get(&None) {
         return Ok(vec_to_list(items));
     }
