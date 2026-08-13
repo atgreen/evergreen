@@ -3529,6 +3529,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
             }
             "PROGN" => return eval_progn(cdr, env),
+            // LOCALLY evaluates its body forms in sequence; declarations are
+            // not yet honoured by the tree-walker, and leading `(declare …)`
+            // forms evaluate to NIL harmlessly, so it reduces to PROGN.
+            "LOCALLY" => return eval_progn(cdr, env),
             "DECLARE" => return Ok(NIL),
             "THE" => {
                 let (type_form, r) = cp(cdr);

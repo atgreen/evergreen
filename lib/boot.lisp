@@ -363,3 +363,59 @@
        (dolist (,pkg (list-all-packages) ,result)
          (dolist (,var (bliss-internal::package-symbols ,pkg t))
            ,@body)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Standard reader/printer control variables and WITH-STANDARD-IO-SYNTAX.
+;;;
+;;; The control variables are bound globally to their ANSI defaults so bare
+;;; references (and ASDF's save/restore idiom `(*readtable* *readtable*)`) work.
+;;; The interpreter's printer does not yet consult most of them, so the defaults
+;;; are currently inert on output; they exist so library code that binds and
+;;; reads them behaves correctly. *readtable* is an opaque placeholder — ASDF
+;;; only saves and restores it. See issue bliss-2pt.1.
+;;; ---------------------------------------------------------------------------
+
+(defvar *readtable* :standard-readtable)
+(defvar *print-array* t)
+(defvar *print-base* 10)
+(defvar *print-case* :upcase)
+(defvar *print-circle* nil)
+(defvar *print-escape* t)
+(defvar *print-gensym* t)
+(defvar *print-length* nil)
+(defvar *print-level* nil)
+(defvar *print-lines* nil)
+(defvar *print-miser-width* nil)
+(defvar *print-pretty* nil)
+(defvar *print-radix* nil)
+(defvar *print-readably* nil)
+(defvar *print-right-margin* nil)
+(defvar *read-base* 10)
+(defvar *read-default-float-format* 'single-float)
+(defvar *read-eval* t)
+(defvar *read-suppress* nil)
+
+;;; WITH-STANDARD-IO-SYNTAX: evaluate BODY with the standard reader/printer
+;;; variables bound to their ANSI-standard values. An empty body yields NIL.
+(defmacro with-standard-io-syntax (&rest body)
+  `(let ((*readtable* :standard-readtable)
+         (*package* "COMMON-LISP-USER")
+         (*print-array* t)
+         (*print-base* 10)
+         (*print-case* :upcase)
+         (*print-circle* nil)
+         (*print-escape* t)
+         (*print-gensym* t)
+         (*print-length* nil)
+         (*print-level* nil)
+         (*print-lines* nil)
+         (*print-miser-width* nil)
+         (*print-pretty* nil)
+         (*print-radix* nil)
+         (*print-readably* t)
+         (*print-right-margin* nil)
+         (*read-base* 10)
+         (*read-default-float-format* 'single-float)
+         (*read-eval* t)
+         (*read-suppress* nil))
+     ,@body))
