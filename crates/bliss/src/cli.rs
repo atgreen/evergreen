@@ -805,9 +805,17 @@ fn eval_handler_impl(
 fn signal_condition_object(condition: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     maybe_break_on_signals(condition, env)?;
     let handlers = env.handlers.clone();
-    for handler in handlers.iter().rev() {
-        if condition_matches_handler(env, condition, &handler.type_name) {
-            eval_handler_impl(&handler.handler, condition, env)?;
+    for i in (0..handlers.len()).rev() {
+        if condition_matches_handler(env, condition, &handlers[i].type_name) {
+            // R5.94/R5.102: while a handler runs, its own cluster and all newer
+            // handlers are disestablished, so a condition it re-signals is seen
+            // only by OLDER handlers — never itself. Without this a handler that
+            // re-signals the same condition recurses into itself forever
+            // (stack overflow).
+            env.handlers = handlers[..i].to_vec();
+            let result = eval_handler_impl(&handlers[i].handler, condition, env);
+            env.handlers = handlers.clone();
+            result?;
         }
     }
     Ok(NIL)

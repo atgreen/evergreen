@@ -1002,3 +1002,33 @@ fn image_save_and_load_cycle() {
         stdout
     );
 }
+
+/// Regression for the handler re-signal bug (R5.94/R5.102): while a HANDLER-BIND
+/// handler runs, its cluster is disestablished, so a condition it re-signals is
+/// seen only by OLDER handlers — never itself. Before the fix this recursed into
+/// the same handler forever and overflowed the stack.
+#[test]
+fn handler_bind_resignal_is_seen_by_outer_handler_not_itself() {
+    let expr = r#"(progn
+      (define-condition my-c (error) ())
+      (handler-case
+          (handler-bind ((my-c (lambda (c) (declare (ignore c)) (error 'my-c))))
+            (error 'my-c))
+        (my-c (e) (declare (ignore e)) (princ "outer-caught"))))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "recursive re-signal must not crash; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("outer-caught"),
+        "re-signalled condition must be caught by the outer handler; got: '{}'",
+        stdout
+    );
+}
