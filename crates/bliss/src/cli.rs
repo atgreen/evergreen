@@ -3902,6 +3902,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 });
             }
+            "SYMBOL-VALUE" => {
+                let (sf, _) = cp(cdr);
+                let sym = eval_form(sf, env)?;
+                let name = if sym.is_symbol() {
+                    sym_name(sym)
+                } else {
+                    val_as_str(sym)
+                };
+                return match env.lookup_var(&name) {
+                    Some(v) => Ok(v),
+                    None => Err(BlissError::UnboundVariable(sym)),
+                };
+            }
             "SYMBOLP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
@@ -4173,6 +4186,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 let (slot_form, _) = cp(cp(aargs).1);
                                 let slot = eval_form(slot_form, env)?;
                                 write_slot_value(instance, slot, val, env)?;
+                            }
+                            "SYMBOL-VALUE" => {
+                                // (setf (symbol-value sym) val) — assign the
+                                // symbol's dynamic value, like SETQ on the symbol.
+                                let sym = eval_form(tgt_form, env)?;
+                                if sym.is_symbol() {
+                                    env.set_var_symbol(sym, val);
+                                } else {
+                                    let name = val_as_str(sym);
+                                    env.set_var(&name, val);
+                                }
                             }
                             other => {
                                 let reader_slot = env.classes.values().find_map(|class| {
