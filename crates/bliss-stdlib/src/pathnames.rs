@@ -169,6 +169,15 @@ fn get_record(pathname: BlissVal) -> Option<PathnameRecord> {
     with_pathname_store(|store| store.get(&pathname.0).cloned())
 }
 
+/// True if `val` is a pathname. Safe for ANY value: pathnames are registry-
+/// backed pseudo-heap values (a counter id wearing `TAG_HEAP_OBJECT`), so
+/// dereferencing one as a real heap object — e.g. via `is_string` — segfaults.
+/// This checks the store by key only, never dereferencing, so callers can guard
+/// header-reading predicates with it.
+pub fn is_pathname(val: BlissVal) -> bool {
+    with_pathname_store(|store| store.contains_key(&val.0))
+}
+
 fn nil_if_empty(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }

@@ -1,5 +1,10 @@
 # Agent Instructions
 
+## Session Startup
+
+At the start of each session, read the files under `specs/` for project
+specifications and requirements.
+
 ## Bead Issue Tracking
 
 This project uses bd (beads) for issue tracking. See [bd prime] for

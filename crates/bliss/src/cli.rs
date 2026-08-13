@@ -1278,7 +1278,7 @@ fn builtin_type_specializer_distance(name: &str, arg: BlissVal) -> Option<usize>
         "NUMBER" => (arg.is_fixnum() || arg.is_single_float()).then_some(5),
         "SINGLE-FLOAT" => arg.is_single_float().then_some(1),
         "FLOAT" => arg.is_single_float().then_some(2),
-        "STRING" | "SIMPLE-STRING" | "BASE-STRING" => arg.is_string().then_some(1),
+        "STRING" | "SIMPLE-STRING" | "BASE-STRING" => is_string_value(arg).then_some(1),
         "CHARACTER" => arg.is_character().then_some(1),
         "NULL" => arg.is_nil().then_some(1),
         "SYMBOL" => arg.is_symbol().then_some(2),
@@ -1722,10 +1722,21 @@ impl Env {
         };
         env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
         env.define_local("*LOAD-HOOKS*", NIL);
-        env.define_local(
-            "*FEATURES*",
-            vec_to_list(&[resolve_sym(":BLISS").unwrap_or(NIL)]),
-        );
+        // *features*: :BLISS plus the host OS so portable code (e.g. UIOP's
+        // DETECT-OS) can identify the platform via FEATUREP.
+        let mut features = vec![resolve_sym(":BLISS").unwrap_or(NIL)];
+        #[cfg(unix)]
+        features.push(resolve_sym(":UNIX").unwrap_or(NIL));
+        #[cfg(target_os = "linux")]
+        features.push(resolve_sym(":LINUX").unwrap_or(NIL));
+        #[cfg(target_os = "macos")]
+        features.push(resolve_sym(":DARWIN").unwrap_or(NIL));
+        #[cfg(windows)]
+        {
+            features.push(resolve_sym(":WINDOWS").unwrap_or(NIL));
+            features.push(resolve_sym(":WIN32").unwrap_or(NIL));
+        }
+        env.define_local("*FEATURES*", vec_to_list(&features));
         env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
         env.define_local("*TYPE-DEFINITIONS*", NIL);
         env.define_local("*CONDITION-TYPES*", NIL);
@@ -2252,6 +2263,54 @@ fn resolve_sym(name: &str) -> Option<BlissVal> {
         Ok((sym, _)) if sym.is_symbol() => Some(sym),
         _ => None,
     }
+}
+
+/// Render a MAKE-PATHNAME `:directory` list — `(:absolute|:relative comp…)` —
+/// to a physical namestring the pathname parser understands. Components are
+/// strings or the `:up`/`:back`/`:wild`/`:wild-inferiors` keywords. Returns None
+/// if the designator is not a list (leave it for the stdlib to handle).
+fn directory_designator_to_namestring(dir: BlissVal) -> Option<String> {
+    if !dir.is_cons() {
+        return None;
+    }
+    let items = list_to_vec(dir);
+    let mut out = String::new();
+    let mut start = 0;
+    if let Some(&first) = items.first() {
+        if first.is_symbol() {
+            match symbol_bare_name(&sym_name(first)).as_str() {
+                "ABSOLUTE" => {
+                    out.push('/');
+                    start = 1;
+                }
+                "RELATIVE" => start = 1,
+                _ => {}
+            }
+        }
+    }
+    for &item in &items[start..] {
+        let part = if item.is_symbol() {
+            match symbol_bare_name(&sym_name(item)).as_str() {
+                "UP" | "BACK" => "..".to_string(),
+                "WILD" => "*".to_string(),
+                "WILD-INFERIORS" => "**".to_string(),
+                other => other.to_string(),
+            }
+        } else {
+            val_as_str(item)
+        };
+        out.push_str(&part);
+        out.push('/');
+    }
+    Some(out)
+}
+
+/// STRINGP that is safe for every value. Pathnames are registry-backed
+/// pseudo-heap values (a counter id wearing `TAG_HEAP_OBJECT`), so the raw
+/// `BlissVal::is_string` dereferences a bogus pointer and segfaults on them.
+/// Guard with the pathname-store check first.
+fn is_string_value(v: BlissVal) -> bool {
+    !bliss_stdlib::is_pathname(v) && v.is_string()
 }
 
 // ── Collect a list into a Vec of elements ─────────────────────────
@@ -3021,7 +3080,7 @@ fn condition_matches_handler(env: &Env, condition: BlissVal, handler_type: &str)
 }
 
 fn is_package_value(env: &Env, value: BlissVal) -> bool {
-    if !value.is_string() {
+    if !is_string_value(value) {
         return false;
     }
     let pkg_name = normalize_package_name(&val_as_str(value));
@@ -3131,7 +3190,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "LIST" => object.is_list(),
             "CONS" => object.is_cons(),
             "SYMBOL" => object.is_symbol(),
-            "STRING" | "SIMPLE-STRING" | "BASE-STRING" => object.is_string(),
+            "STRING" | "SIMPLE-STRING" | "BASE-STRING" => is_string_value(object),
             "NUMBER" | "REAL" => object.is_fixnum() || object.is_single_float(),
             "INTEGER" | "FIXNUM" => object.is_fixnum(),
             "FLOAT" | "SINGLE-FLOAT" => object.is_single_float(),
@@ -3220,7 +3279,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             let predicate_name = sym_name(predicate);
             if predicate_name == "FIND-PACKAGE" {
                 let designator =
-                    if object.is_character() || object.is_string() || object.is_symbol() {
+                    if object.is_character() || is_string_value(object) || object.is_symbol() {
                         val_as_str(object)
                     } else {
                         return Ok(false);
@@ -3400,7 +3459,7 @@ fn value_satisfies_declared_type(type_form: BlissVal, value: BlissVal) -> Result
         "SYMBOL" => value.is_symbol(),
         "KEYWORD" => value.is_symbol() && sym_name(value).starts_with("KEYWORD:"),
         "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" => value.is_character(),
-        "STRING" | "SIMPLE-STRING" | "SIMPLE-BASE-STRING" => value.is_string(),
+        "STRING" | "SIMPLE-STRING" | "SIMPLE-BASE-STRING" => is_string_value(value),
         "INTEGER" | "FIXNUM" => value.is_fixnum(),
         "FLOAT" | "SINGLE-FLOAT" | "REAL" => value.is_single_float() || value.is_fixnum(),
         "RATIO" => ratio_parts_val(value).is_some(),
@@ -3839,7 +3898,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "STRINGP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(if v.is_string() { T } else { NIL });
+                return Ok(if is_string_value(v) { T } else { NIL });
             }
             "BOUNDP" => {
                 let (sf, _) = cp(cdr);
@@ -4009,7 +4068,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 for arg in &args[1..] {
                     format_args.push(eval_form(*arg, env)?);
                 }
-                let message = if control.is_string() && !format_args.is_empty() {
+                let message = if is_string_value(control) && !format_args.is_empty() {
                     simple_format_message(&val_as_str(control), &format_args)
                 } else {
                     val_as_str(control)
@@ -4167,6 +4226,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(result);
             }
             "DEFUN" => return eval_defun(cdr, env),
+            "DEFSETF" => {
+                // Minimal: user SETF-expanders aren't consulted by SETF yet, so
+                // accept the definition (returning the access-fn name) without
+                // registering an expander. `(setf (access-fn …) …)` will still
+                // fall through to SETF's built-in place handling.
+                let (name_form, _) = cp(cdr);
+                return Ok(name_form);
+            }
             "FLET" | "LABELS" => return eval_flet(cdr, env),
             "DEFMACRO" => return eval_defmacro(cdr, env),
             "DEFINE-SYMBOL-MACRO" => return eval_define_symbol_macro(cdr, env),
@@ -4373,7 +4440,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut seqs: Vec<Vec<BlissVal>> = Vec::new();
                 for seq_form in &args[2..] {
                     let seq = eval_form(*seq_form, env)?;
-                    seqs.push(if seq.is_string() {
+                    seqs.push(if is_string_value(seq) {
                         val_as_str(seq)
                             .chars()
                             .map(BlissVal::from_char)
@@ -4556,6 +4623,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 return bliss_stdlib::subseq(seq, start, end);
             }
+            "SOME" | "EVERY" | "NOTANY" | "NOTEVERY" => {
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::Internal(format!("{} requires a predicate", name)));
+                }
+                let pred = args[0];
+                let mut seqs = Vec::with_capacity(args.len() - 1);
+                for s in &args[1..] {
+                    seqs.push(seq_elements(*s)?);
+                }
+                let minlen = seqs.iter().map(Vec::len).min().unwrap_or(0);
+                for i in 0..minlen {
+                    let call_args: Vec<BlissVal> = seqs.iter().map(|s| s[i]).collect();
+                    let r = apply_function(pred, &call_args, env)?;
+                    match name.as_str() {
+                        "SOME" if !r.is_nil() => return Ok(r),
+                        "EVERY" if r.is_nil() => return Ok(NIL),
+                        "NOTANY" if !r.is_nil() => return Ok(NIL),
+                        "NOTEVERY" if r.is_nil() => return Ok(T),
+                        _ => {}
+                    }
+                }
+                return Ok(match name.as_str() {
+                    "SOME" => NIL,
+                    "EVERY" | "NOTANY" => T,
+                    _ => NIL, // NOTEVERY
+                });
+            }
             "COERCE" => {
                 let (val_form, rest) = cp(cdr);
                 let (type_form, _) = cp(rest);
@@ -4603,6 +4698,59 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 return sort_sequence(seq, predicate, key, env);
             }
+            "PATHNAMEP" => {
+                let (thing_form, _) = cp(cdr);
+                let thing = eval_form(thing_form, env)?;
+                return Ok(if bliss_stdlib::is_pathname(thing) {
+                    T
+                } else {
+                    NIL
+                });
+            }
+            "MAKE-PATHNAME" => {
+                // (make-pathname &key host device directory name type version defaults)
+                let args = eval_args(cdr, env)?;
+                let (mut host, mut device, mut directory) = (NIL, NIL, NIL);
+                let (mut name_c, mut type_c, mut version) = (NIL, NIL, NIL);
+                let mut i = 0;
+                while i + 1 < args.len() {
+                    let key = symbol_bare_name(&sym_name(args[i]));
+                    let val = args[i + 1];
+                    match key.as_str() {
+                        "HOST" => host = val,
+                        "DEVICE" => device = val,
+                        // A directory given as (:absolute|:relative comp…) uses
+                        // reader keywords the stdlib can't match by hash; render
+                        // it to a namestring the stdlib parser accepts.
+                        "DIRECTORY" => {
+                            directory = match directory_designator_to_namestring(val) {
+                                Some(s) => arena_str(&s),
+                                None => val,
+                            }
+                        }
+                        "NAME" => name_c = val,
+                        "TYPE" => type_c = val,
+                        "VERSION" => version = val,
+                        // :defaults is accepted; component defaulting is not yet
+                        // modeled, so unsupplied components stay NIL.
+                        _ => {}
+                    }
+                    i += 2;
+                }
+                return bliss_stdlib::make_pathname(
+                    host, device, directory, name_c, type_c, version,
+                );
+            }
+            "USER-HOMEDIR-PATHNAME" => {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+                let dir = if home.ends_with('/') {
+                    home
+                } else {
+                    format!("{home}/")
+                };
+                let (pathname, _) = bliss_stdlib::parse_namestring(arena_str(&dir), None, None)?;
+                return Ok(pathname);
+            }
             "PARSE-NAMESTRING" => {
                 let (thing_form, rest) = cp(cdr);
                 let thing = eval_form(thing_form, env)?;
@@ -4619,6 +4767,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (pathname_form, _) = cp(cdr);
                 let pathname = eval_form(pathname_form, env)?;
                 return bliss_stdlib::namestring(pathname);
+            }
+            "PATHNAME" => {
+                // Coerce a pathname designator to a pathname: an existing
+                // pathname passes through; anything else is parsed as a
+                // namestring. Check is_pathname FIRST — pathnames are registry-
+                // backed pseudo-heap values, so calling is_string on one (as the
+                // string branch would) dereferences a bogus pointer and crashes.
+                let (thing_form, _) = cp(cdr);
+                let thing = eval_form(thing_form, env)?;
+                if bliss_stdlib::is_pathname(thing) {
+                    return Ok(thing);
+                }
+                let (pathname, _) = bliss_stdlib::parse_namestring(thing, None, None)?;
+                return Ok(pathname);
             }
             "PATHNAME-NAME" => {
                 let (pathname_form, _) = cp(cdr);
@@ -4656,7 +4818,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // one-character string.
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                let s = if v.is_string() {
+                let s = if is_string_value(v) {
                     val_as_str(v)
                 } else if v.is_character() {
                     v.as_char().to_string()
@@ -4979,7 +5141,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 // (warn datum &rest args): a warning-type symbol or condition is
                 // used directly; a format-control string becomes a SIMPLE-WARNING.
-                let message = if datum.is_string() && !rest_args.is_empty() {
+                let message = if is_string_value(datum) && !rest_args.is_empty() {
                     simple_format_message(&val_as_str(datum), &rest_args)
                 } else {
                     val_as_str(datum)
@@ -5889,7 +6051,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     "SYMBOL"
                 } else if v.is_cons() {
                     "CONS"
-                } else if v.is_string() {
+                } else if is_string_value(v) {
                     "SIMPLE-BASE-STRING"
                 } else {
                     "T"
@@ -6108,6 +6270,14 @@ impl LoopParser {
     }
     fn at_kw(&self, k: &str) -> bool {
         self.peek_kw().as_deref() == Some(k)
+    }
+    /// True if the next token is the symbol with the given bare name (e.g. "="),
+    /// regardless of package. Does not consume.
+    fn at_sym(&self, name: &str) -> bool {
+        match self.peek() {
+            Some(v) if v.is_symbol() => symbol_bare_name(&sym_name(v)) == name,
+            _ => false,
+        }
     }
     fn read_form(&mut self) -> Result<BlissVal, BlissError> {
         self.advance()
@@ -6459,11 +6629,18 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 p.advance();
                 loop {
                     let var = p.read_form()?;
-                    let eq = p.read_form()?;
-                    if !(eq.is_symbol() && sym_name(eq) == "=") {
-                        return Err(BlissError::Internal("LOOP :with expects `=`".into()));
+                    // Optional `of-type <type>` is accepted and ignored.
+                    if p.at_sym("OF-TYPE") {
+                        p.advance();
+                        p.read_form()?;
                     }
-                    let init = p.read_form()?;
+                    // `= init` is optional; a bare `:with var` binds var to NIL.
+                    let init = if p.at_sym("=") {
+                        p.advance();
+                        p.read_form()?
+                    } else {
+                        NIL
+                    };
                     with_bindings.push((var, init));
                     if p.at_kw("AND") {
                         p.advance();
@@ -9653,7 +9830,7 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // (cerror continue-control datum &rest args): datum may be a condition
     // instance, a condition-type symbol (built via MAKE-CONDITION), or a
     // format-control string (→ SIMPLE-ERROR).
-    let message = if datum.is_string() && !args.is_empty() {
+    let message = if is_string_value(datum) && !args.is_empty() {
         simple_format_message(&val_as_str(datum), &args)
     } else {
         val_as_str(datum)
@@ -9902,7 +10079,7 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
     if a.is_single_float() && b.is_single_float() {
         return a.as_single_float() == b.as_single_float();
     }
-    if a.is_string() && b.is_string() {
+    if is_string_value(a) && is_string_value(b) {
         return val_as_str(a) == val_as_str(b);
     }
     if a.is_cons() && b.is_cons() {

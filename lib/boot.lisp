@@ -27,6 +27,12 @@
 (defmacro defparameter (name &rest value)
   `(setq ,name ,(if value (car value) nil)))
 
+;; defconstant: this interpreter has no separate constant cell; model it as a
+;; global binding, like defparameter.
+(defmacro defconstant (name value &rest doc)
+  (declare (ignore doc))
+  `(setq ,name ,value))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Sequencing
 ;;; ---------------------------------------------------------------------------
@@ -51,11 +57,41 @@
   `(prog1 (car ,place)
      (setf ,place (cdr ,place))))
 
+;; pushnew: add ITEM to the list in PLACE only if not already a MEMBER.
+;; Keyword args (:test/:key) are accepted but only the default EQL test is
+;; honored, which covers the prelude/UIOP uses (e.g. (pushnew :x *features*)).
+(defmacro pushnew (item place &rest keys)
+  (declare (ignore keys))
+  (let ((v (gensym)))
+    `(let ((,v ,item))
+       (if (member ,v ,place)
+           ,place
+           (setf ,place (cons ,v ,place))))))
+
 (defmacro incf (place &rest delta)
   `(setf ,place (+ ,place ,(if delta (car delta) 1))))
 
 (defmacro decf (place &rest delta)
   `(setf ,place (- ,place ,(if delta (car delta) 1))))
+
+;; define-modify-macro: define NAME so that (NAME place args...) expands to
+;; (setf place (FUNCTION place args...)). Supports required and &rest args in
+;; LAMBDA-LIST, which covers the standard uses (appendf, etc.).
+(defmacro define-modify-macro (name lambda-list function &rest doc)
+  (declare (ignore doc))
+  (let ((vars '()) (rest-var nil) (mode :req) (place (gensym)))
+    (dolist (item lambda-list)
+      (cond ((eq item '&rest) (setq mode :rest))
+            ((eq item '&optional) (setq mode :opt))
+            ((eq mode :rest) (setq rest-var item))
+            (t (push (if (consp item) (car item) item) vars))))
+    (setq vars (reverse vars))
+    `(defmacro ,name (,place ,@lambda-list)
+       (list 'setf ,place
+             (cons ',function
+                   (cons ,place
+                         (append (list ,@vars) ,(or rest-var 'nil))))))))
+
 
 ;;; ---------------------------------------------------------------------------
 ;;; Declarations, type aliases, and condition definitions used by the shipped
