@@ -65,3 +65,6 @@ _bureau_*
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# gstack skill scratch output
+.gstack/
