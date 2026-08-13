@@ -380,8 +380,11 @@ fn print_version_does_not_panic() {
 
 #[test]
 fn run_repl_returns_ok_on_eof() {
-    // In test context, stdin is at EOF so run_repl exits immediately with Ok(0).
-    let result = bliss::cli::run_repl();
+    // Inject an empty reader (immediate EOF) so the test is hermetic and never
+    // blocks on the process's real stdin (bliss-z57). `&[u8]` implements
+    // BufRead, and reading an empty slice returns Ok(0) == EOF.
+    let mut empty: &[u8] = b"";
+    let result = bliss::cli::run_repl_with_reader(&mut empty);
     assert!(result.is_ok(), "run_repl should return Ok on EOF stdin");
     assert_eq!(result.unwrap(), 0);
 }

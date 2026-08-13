@@ -10424,13 +10424,32 @@ pub fn run_repl() -> Result<i32, BlissError> {
 }
 
 fn run_repl_env(env: &mut Env) -> Result<i32, BlissError> {
+    let stdin = std::io::stdin();
+    run_repl_reader(env, &mut stdin.lock())
+}
+
+/// Run the REPL against an explicit line reader instead of the process stdin.
+///
+/// Intended for tests and embedding: passing an empty/closed reader yields an
+/// immediate EOF so the caller never blocks on the process's real stdin (which
+/// makes `cargo test` hang in an interactive terminal). See issue bliss-z57.
+pub fn run_repl_with_reader<R: std::io::BufRead>(reader: &mut R) -> Result<i32, BlissError> {
+    let mut env = Env::new(false);
+    run_repl_reader(&mut env, reader)
+}
+
+/// The read/eval/print loop over an arbitrary line source. Real runs pass
+/// `stdin().lock()`; tests inject an empty reader (immediate EOF).
+fn run_repl_reader<R: std::io::BufRead>(
+    env: &mut Env,
+    reader: &mut R,
+) -> Result<i32, BlissError> {
     let _config = ReplConfig::default();
     println!("Bliss Common Lisp {}", env!("CARGO_PKG_VERSION"));
     println!("Type (quit) to exit.");
     println!();
     // Promote initial allocations (env setup, image load) to permanent
     ARENA.with(|a| a.borrow_mut().promote_all());
-    let stdin = std::io::stdin();
     let mut input = String::new();
     // Debugger state (nesting level, history) carried across debugger entries (A6.02).
     let mut repl_state = bliss_stdlib::ReplState::new();
@@ -10438,7 +10457,7 @@ fn run_repl_env(env: &mut Env) -> Result<i32, BlissError> {
         // Prompt reflects the current package, e.g. `CL-USER> ` (R6.08).
         eprint!("{}> ", prompt_package_name(&env.current_package));
         input.clear();
-        match stdin.read_line(&mut input) {
+        match reader.read_line(&mut input) {
             Ok(0) => {
                 println!();
                 return Ok(0);
