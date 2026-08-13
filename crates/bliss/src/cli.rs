@@ -5632,17 +5632,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (binding, body) = cp(cdr);
                 let (var_form, br) = cp(binding);
                 let (count_form, result_rest) = cp(br);
-                let var_name = sym_name(var_form);
                 let count = eval_form(count_form, env)?;
                 let n = num_val(count)? as i64;
+                // Bind the loop variable in a fresh scope via the symbol-indexed
+                // store so it shadows any outer binding of the same name.
+                let mut loop_env = env.child();
                 for i in 0..n {
-                    env.define_local(&var_name, BlissVal::from_fixnum(i));
-                    eval_progn(body, env)?;
+                    loop_env.define_local_symbol(var_form, BlissVal::from_fixnum(i));
+                    eval_progn(body, &mut loop_env)?;
                 }
                 if result_rest.is_cons() {
                     let (result_form, _) = cp(result_rest);
-                    env.define_local(&var_name, BlissVal::from_fixnum(n));
-                    return eval_form(result_form, env);
+                    loop_env.define_local_symbol(var_form, BlissVal::from_fixnum(n));
+                    return eval_form(result_form, &mut loop_env);
                 }
                 return Ok(NIL);
             }
@@ -5651,17 +5653,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (binding, body) = cp(cdr);
                 let (var_form, br) = cp(binding);
                 let (list_form, result_rest) = cp(br);
-                let var_name = sym_name(var_form);
                 let list = eval_form(list_form, env)?;
                 let elems = list_to_vec(list);
+                let mut loop_env = env.child();
                 for e in &elems {
-                    env.define_local(&var_name, *e);
-                    eval_progn(body, env)?;
+                    loop_env.define_local_symbol(var_form, *e);
+                    eval_progn(body, &mut loop_env)?;
                 }
                 if result_rest.is_cons() {
                     let (result_form, _) = cp(result_rest);
-                    env.define_local(&var_name, NIL);
-                    return eval_form(result_form, env);
+                    loop_env.define_local_symbol(var_form, NIL);
+                    return eval_form(result_form, &mut loop_env);
                 }
                 return Ok(NIL);
             }
@@ -6028,9 +6030,11 @@ impl LoopAccs {
 /// Bind a (possibly destructuring / dotted) pattern against a value.
 fn loop_bind(pattern: BlissVal, value: BlissVal, env: &mut Env) {
     if pattern.is_symbol() {
-        let name = sym_name(pattern);
-        if name != "NIL" {
-            env.define_local(&name, value);
+        if sym_name(pattern) != "NIL" {
+            // Bind through the symbol-indexed store as well, so the loop
+            // variable properly shadows any outer lexical binding of the same
+            // name (symbol lookup consults symbol_vars before the name map).
+            env.define_local_symbol(pattern, value);
         }
     } else if pattern.is_cons() {
         let (pcar, pcdr) = cp(pattern);

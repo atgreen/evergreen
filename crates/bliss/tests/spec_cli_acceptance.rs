@@ -1348,6 +1348,44 @@ fn clos_defgeneric_method_options_register_methods() {
 }
 
 #[test]
+fn iteration_variables_shadow_outer_bindings() {
+    // A loop/dolist/dotimes variable must shadow an outer lexical binding of the
+    // same name — symbol lookup consults the symbol-indexed store first, so the
+    // iteration binding has to be installed there too.
+    assert_eq!(
+        eval_ok("(let ((name :outer)) (loop for name in '(1 2 3) collect name))"),
+        "(1 2 3)"
+    );
+    assert_eq!(
+        eval_ok("(progn (defun f (name) (dolist (name '(1 2 3) name) name)) (f :outer))"),
+        "NIL"
+    );
+    assert_eq!(
+        eval_ok("(progn (defun g (name) (let ((r nil)) (dolist (name '(:a :b) (reverse r)) (push name r)))) (g :outer))"),
+        "(:A :B)"
+    );
+}
+
+#[test]
+fn dolist_and_dotimes_establish_fresh_scope() {
+    // The iteration variable does not leak past the loop.
+    assert_eq!(eval_ok("(let ((x :outer)) (dolist (x '(1 2)) nil) x)"), ":OUTER");
+    assert_eq!(eval_ok("(let ((i :outer)) (dotimes (i 3) nil) i)"), ":OUTER");
+}
+
+#[test]
+fn loop_hash_key_iteration_binds_in_do_body() {
+    assert_eq!(
+        eval_ok(
+            "(let ((name :outer) (h (make-hash-table :test 'equal)) (r nil)) \
+               (setf (gethash \"A\" h) t) \
+               (loop for name being the hash-keys of h do (push name r)) r)"
+        ),
+        "(\"A\")"
+    );
+}
+
+#[test]
 fn string_of_symbol_returns_bare_symbol_name() {
     // (string sym) is SYMBOL-NAME: no package prefix, for keywords too.
     assert_eq!(eval_ok("(string :uiop/package*)"), "\"UIOP/PACKAGE*\"");
