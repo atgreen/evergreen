@@ -1096,3 +1096,25 @@ fn loop_numeric_iteration_and_accumulation() {
         );
     }
 }
+
+/// Regression for LOOP while/until/repeat driver clauses (bliss-2pt.10).
+#[test]
+fn loop_while_until_repeat_drivers() {
+    let cases = [
+        ("(loop repeat 3 collect 'x)", "(X X X)"),
+        ("(loop repeat 0 collect 'x)", "NIL"),
+        ("(let ((i 0)) (loop while (< i 4) do (incf i) collect i))", "(1 2 3 4)"),
+        ("(let ((i 0)) (loop until (>= i 3) do (incf i) collect i))", "(1 2 3)"),
+        ("(loop for i from 1 to 100 while (< i 4) collect i)", "(1 2 3)"),
+        ("(loop for i from 1 repeat 3 collect i)", "(1 2 3)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}

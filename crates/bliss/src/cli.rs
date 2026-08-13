@@ -6839,6 +6839,10 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     let mut initially: Vec<BlissVal> = Vec::new();
     let mut finally: Vec<BlissVal> = Vec::new();
     let mut body: Vec<LoopClause> = Vec::new();
+    // Termination guards: (is_until, condition-form), checked before each body.
+    let mut guards: Vec<(bool, BlissVal)> = Vec::new();
+    // `repeat N`: run the body at most N times.
+    let mut repeat_form: Option<BlissVal> = None;
 
     while let Some(kw) = p.peek_kw() {
         match kw.as_str() {
@@ -7023,6 +7027,18 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 p.advance();
                 finally = p.read_forms();
             }
+            "WHILE" => {
+                p.advance();
+                guards.push((false, p.read_form()?));
+            }
+            "UNTIL" => {
+                p.advance();
+                guards.push((true, p.read_form()?));
+            }
+            "REPEAT" => {
+                p.advance();
+                repeat_form = Some(p.read_form()?);
+            }
             _ => body.push(p.parse_clause()?),
         }
     }
@@ -7047,8 +7063,14 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         eval_form(*f, env)?;
     }
 
-    if for_clauses.is_empty() {
-        // No :for driver: run body once (covers when/collect-only loops).
+    // `repeat N`: evaluate the count once (negative/NIL → 0 iterations).
+    let mut repeat_remaining: Option<u64> = match repeat_form {
+        Some(f) => Some(num_val(eval_form(f, env)?)?.max(0.0) as u64),
+        None => None,
+    };
+
+    if for_clauses.is_empty() && guards.is_empty() && repeat_remaining.is_none() {
+        // No driver at all: run the body once (when/collect-only loops).
         loop_exec_clauses(&body, env, &mut accs, &mut ret)?;
     } else {
         // Build cursors, evaluating each list form once.
@@ -7155,6 +7177,11 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 }
             }
         }
+        // repeat/while/until are terminating drivers too, so the runaway cap
+        // (which only guards driverless loops) should not misfire on them.
+        if repeat_remaining.is_some() || !guards.is_empty() {
+            has_stepping_driver = true;
+        }
         let mut first = true;
         let mut guard: u64 = 0;
         loop {
@@ -7218,6 +7245,27 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 }
             }
             if exhausted {
+                break;
+            }
+            // `repeat N`: stop after N body executions.
+            if let Some(rem) = repeat_remaining {
+                if rem == 0 {
+                    break;
+                }
+                repeat_remaining = Some(rem - 1);
+            }
+            // `while`/`until` termination guards (evaluated after driver stepping
+            // so an interleaved `for … while …` sees the current binding).
+            let mut stop = false;
+            for (is_until, cond) in &guards {
+                let v = eval_form(*cond, env)?;
+                let this_stop = if *is_until { !v.is_nil() } else { v.is_nil() };
+                if this_stop {
+                    stop = true;
+                    break;
+                }
+            }
+            if stop {
                 break;
             }
             loop_exec_clauses(&body, env, &mut accs, &mut ret)?;
