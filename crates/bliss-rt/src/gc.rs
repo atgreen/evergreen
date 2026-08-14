@@ -553,6 +553,144 @@ pub struct HeapCollector {
     promotion_threshold: u8,
 }
 
+/// True if `v` is a tagged heap reference (cons, heap object, or function
+/// pointer) whose referent the GC must trace. Immediates — fixnums, chars,
+/// single-floats, symbols-by-id, NIL/T — are not references.
+#[inline]
+fn is_heap_ref(v: BlissVal) -> bool {
+    matches!(
+        v.0 & crate::value::TAG_MASK,
+        crate::value::TAG_CONS | crate::value::TAG_HEAP_OBJECT | crate::value::TAG_FUNCTION
+    )
+}
+
+/// Enumerate the `BlissVal` reference fields of a heap object precisely
+/// (bliss-jtc.20). `body` points past the object header; `body_len` is the
+/// object's exact body length in bytes; `type_id` selects the field layout
+/// (spec §1.5–§1.16). Only genuine reference slots are visited — numeric limbs,
+/// string characters, double-float bits, raw code/entry pointers, and CLOS
+/// wrapper pointers are never handed to `visit`, so pointer-shaped payload data
+/// can never be mistaken for a live reference. The `visit` closure decides which
+/// visited values are actual heap references.
+///
+/// Safety: `body` must point at a live object body of at least `body_len` bytes.
+unsafe fn trace_object(
+    body: *const u8,
+    type_id: u8,
+    body_len: usize,
+    mut visit: impl FnMut(BlissVal),
+) {
+    use crate::object::type_id as tid;
+    let words = body_len / 8;
+    // Read body word `i` as a BlissVal. Safety: `i < words` keeps it in bounds.
+    let word = |i: usize| unsafe { BlissVal(*(body as *const u64).add(i)) };
+    let mut visit_word = |i: usize| {
+        if i < words {
+            visit(word(i));
+        }
+    };
+    match type_id {
+        // ── Reference-free leaves: numbers and byte/character payloads. Their
+        //    bodies are raw bits and must never be scanned for pointers. ──
+        tid::BIGNUM
+        | tid::DOUBLE_FLOAT
+        | tid::SIMPLE_BASE_STRING
+        | tid::SIMPLE_CHARACTER_STRING => {}
+
+        // ── Fixed reference pairs. ──
+        tid::CONS => {
+            // Real conses are headerless (§1.5.1); this covers a headered
+            // cons-shaped object. car @0, cdr @1.
+            visit_word(0);
+            visit_word(1);
+        }
+        tid::RATIO => {
+            visit_word(0); // numerator
+            visit_word(1); // denominator
+        }
+        tid::COMPLEX => {
+            visit_word(0); // realpart
+            visit_word(1); // imagpart
+        }
+
+        // ── Simple vector: [length, elements...]; the length is a fixnum. ──
+        tid::SIMPLE_VECTOR => {
+            let n = if words >= 1 {
+                word(0).as_fixnum().max(0) as usize
+            } else {
+                0
+            };
+            for i in 0..n.min(words.saturating_sub(1)) {
+                visit_word(1 + i);
+            }
+        }
+
+        // ── Symbol: name/value/function/plist/package are references; the
+        //    trailing flags/tls_index words are raw (§1.7). ──
+        tid::SYMBOL => {
+            for i in 0..5 {
+                visit_word(i);
+            }
+        }
+
+        // ── Interpreted function: lambda_list/body/env/name (§1.11.1). ──
+        tid::FUNCTION_INTERPRETED => {
+            for i in 0..4 {
+                visit_word(i);
+            }
+        }
+        // ── Compiled function (§1.11.2): entry_point and code_size are raw;
+        //    name/lambda_list/constants are references. ──
+        tid::COMPILED_FUNCTION => {
+            visit_word(2); // name
+            visit_word(3); // lambda_list
+            visit_word(5); // constants
+        }
+        // ── Closure: function slot + the trailing closed-over variables. ──
+        tid::CLOSURE => {
+            for i in 0..words {
+                visit_word(i);
+            }
+        }
+
+        // ── Pathname: all six components are references (§1.14). ──
+        tid::PATHNAME => {
+            for i in 0..6 {
+                visit_word(i);
+            }
+        }
+        // ── Readtable (§1.15): word 0 is case_mode+padding; the four tables
+        //    are references. ──
+        tid::READTABLE => {
+            for i in 1..5 {
+                visit_word(i);
+            }
+        }
+        // ── Restart: name/function/report/interactive/test (§1.16). ──
+        tid::RESTART => {
+            for i in 0..5 {
+                visit_word(i);
+            }
+        }
+
+        // ── CLOS instance: word 0 is the raw wrapper pointer (not a GC
+        //    reference); every remaining inline word is a slot value (§1.10). ──
+        tid::STANDARD_OBJECT => {
+            for i in 1..words {
+                visit_word(i);
+            }
+        }
+
+        // ── Kinds whose runtime layout interleaves references with raw fields
+        //    or side storage (structures, conditions, hash-tables, specialised
+        //    arrays, packages, streams) are traced by dedicated callbacks once
+        //    real instances are constructed on the GC heap (jtc.1/jtc.2). None
+        //    are allocated here yet, so visiting nothing is safe and precise —
+        //    never a conservative pointer scan. ──
+        _ => {}
+    }
+}
+
 impl HeapCollector {
     /// Precise CL-stack roots (nmq.3): mark exactly the heap references held in
     /// every live CL frame of every green thread. Each frame slot is a tagged
@@ -562,7 +700,7 @@ impl HeapCollector {
     fn scan_cl_stack_roots(
         marked: &mut std::collections::HashSet<usize>,
         worklist: &mut Vec<usize>,
-        object_index: &std::collections::HashMap<usize, (usize, usize)>,
+        object_index: &std::collections::HashMap<usize, (usize, usize, u8, usize)>,
     ) {
         let mut mark_from = |fp: *const crate::stack::Frame| {
             // SAFETY: `fp` is a valid frame chain (live or published).
@@ -916,19 +1054,20 @@ impl Collector for HeapCollector {
             BlissError::Internal("heap not initialized".into())
         })?;
 
-        // Phase 1: Mark phase — conservative pointer tracing.
+        // Phase 1: Mark phase — precise tracing (bliss-jtc.20).
         //
-        // We use a mark bitmap (one bit per OBJECT_ALIGNMENT-byte slot) to track
-        // which objects are reachable. The algorithm:
-        //   1. Build an index of all object start addresses in old-gen/survivor/LO regions.
-        //   2. Scan all non-free regions (including nursery) for pointer-like values
-        //      that point to indexed objects, marking them live.
-        //   3. Transitively mark objects referenced by newly-marked objects.
-        //   4. Compute live_bytes from the mark bitmap.
-        //
-        // This is a conservative approach: any aligned 8-byte value that happens to
-        // match an object address will mark that object as live (false retention is
-        // possible, but false collection is not).
+        // Marking starts from precise roots (the entry continuation and every
+        // green thread's CL-stack references) and follows only genuine reference
+        // fields via `trace_object`, keyed on each object's type_id. Numeric and
+        // byte payloads are never scanned for pointer-shaped words, so a byte
+        // vector or bignum that happens to contain an object-shaped value cannot
+        // falsely retain that object. Mark state lives in a side table (external
+        // to the object header), per §1.3 / R3.17.
+        //   1. Index every object body in old-gen/survivor/LO regions with its
+        //      footprint, type_id, and body length.
+        //   2. Mark precise roots into a worklist.
+        //   3. Trace transitively, visiting only reference fields.
+        //   4. Compute live_bytes from the mark set.
         let region_count = state.regions.len();
         let heap_base_addr = state.heap_base as usize;
         let heap_size = state.config.heap_size;
@@ -938,9 +1077,9 @@ impl Collector for HeapCollector {
             tams.push(region.header.alloc_top as usize);
         }
 
-        // Build a set of valid object body addresses in old-gen/survivor/LO regions,
-        // along with their sizes. We store (body_addr, total_size, region_idx).
-        let mut object_index: std::collections::HashMap<usize, (usize, usize)> =
+        // Index each live object body: body_addr -> (total_size, region_idx,
+        // type_id, body_len). type_id/body_len drive precise field tracing.
+        let mut object_index: std::collections::HashMap<usize, (usize, usize, u8, usize)> =
             std::collections::HashMap::new();
         for (idx, region) in state.regions.iter().enumerate() {
             match region.header.kind {
@@ -961,7 +1100,8 @@ impl Collector for HeapCollector {
                             align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
                         if !unsafe { header_is_forwarded(header_ptr) } {
                             let body_addr = cursor + OBJECT_HEADER_SIZE;
-                            object_index.insert(body_addr, (total_size, idx));
+                            object_index
+                                .insert(body_addr, (total_size, idx, type_id, body_size as usize));
                         }
                         cursor += total_size;
                     }
@@ -970,65 +1110,42 @@ impl Collector for HeapCollector {
             }
         }
 
-        // Mark bitmap: track which object body addresses are marked live.
+        // Mark set (side table, not header bits — R3.17).
         let mut marked: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-        // Conservative scan: scan ALL non-free regions for pointer-like values
-        // that match known object addresses.
         let mut scan_worklist: Vec<usize> = Vec::new();
-        for (idx, region) in state.regions.iter().enumerate() {
-            if region.header.kind == RegionKind::Free {
-                continue;
-            }
-            // For old-gen/survivor/LO regions being marked, skip scanning their
-            // own objects as roots — they will only be live if referenced from
-            // nursery regions or other roots. But we conservatively scan nursery
-            // regions as roots (they contain the live set from the last minor GC).
-            let base = region.base as usize;
-            let top = tams[idx].min(region.header.alloc_top as usize);
-            if top <= base {
-                continue;
-            }
-            // Scan memory in this region for pointer-sized values.
-            let mut scan = base;
-            while scan + 8 <= top {
-                let val = unsafe { *(scan as *const usize) };
-                if val >= heap_base_addr
-                    && val < heap_base_addr + heap_size
-                    && object_index.contains_key(&val)
-                    && !marked.contains(&val)
-                {
-                    marked.insert(val);
-                    scan_worklist.push(val);
-                }
-                scan += 8; // scan every 8-byte aligned slot
-            }
-        }
 
-        // Precise CL-stack roots (nmq.3): walk this thread's BlissStack frames
-        // and mark exactly the heap references their slots hold — identified by
-        // BlissVal tag, so no non-reference CL data is conservatively pinned.
+        // Helper: mark a candidate reference if it targets an indexed object.
+        let mark_ref =
+            |v: BlissVal,
+             marked: &mut std::collections::HashSet<usize>,
+             worklist: &mut Vec<usize>| {
+                if is_heap_ref(v) {
+                    let target = (v.0 & !crate::value::TAG_MASK) as usize;
+                    if object_index.contains_key(&target) && marked.insert(target) {
+                        worklist.push(target);
+                    }
+                }
+            };
+
+        // Precise root: the saved entry continuation (§7.2.3).
+        mark_ref(get_entry_continuation(), &mut marked, &mut scan_worklist);
+
+        // Precise CL-stack roots (nmq.3): walk every green thread's BlissStack
+        // frames and mark exactly the heap references their slots hold —
+        // identified by BlissVal tag, so no non-reference CL data is pinned.
         // Interpreter (T0) and compiled (T1) frames share the §2.4.2 layout, so
         // this one walk covers mixed-tier stacks.
         Self::scan_cl_stack_roots(&mut marked, &mut scan_worklist, &object_index);
 
-        // Transitive closure: scan newly marked objects for more pointers.
+        // Transitive closure: trace only the reference fields of each marked
+        // object, following its type_id-specific layout.
         while let Some(obj_addr) = scan_worklist.pop() {
-            if let Some(&(total_size, _)) = object_index.get(&obj_addr) {
-                let body_size = total_size.saturating_sub(OBJECT_HEADER_SIZE);
-                let mut scan = obj_addr;
-                let scan_end = obj_addr + body_size;
-                while scan + 8 <= scan_end {
-                    let val = unsafe { *(scan as *const usize) };
-                    if val >= heap_base_addr
-                        && val < heap_base_addr + heap_size
-                        && object_index.contains_key(&val)
-                        && !marked.contains(&val)
-                    {
-                        marked.insert(val);
-                        scan_worklist.push(val);
-                    }
-                    scan += 8;
+            if let Some(&(_total, _idx, type_id, body_len)) = object_index.get(&obj_addr) {
+                // SAFETY: obj_addr is an indexed live object body of body_len bytes.
+                unsafe {
+                    trace_object(obj_addr as *const u8, type_id, body_len, |field| {
+                        mark_ref(field, &mut marked, &mut scan_worklist);
+                    });
                 }
             }
         }
@@ -2266,5 +2383,123 @@ mod header_tests {
         assert_eq!(unsafe { header_total_bytes(ptr) }, expected_total);
         let (tid, _) = unsafe { read_object_header(ptr) };
         assert_eq!(tid, crate::object::type_id::SIMPLE_ARRAY);
+    }
+}
+
+// ── Precise object-tracing tests (bliss-jtc.20) ───────────────────
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::object::type_id as tid;
+
+    /// A pointer-shaped, heap-tagged word for address `addr`.
+    fn heapish(addr: u64) -> u64 {
+        (addr & !crate::value::TAG_MASK) | crate::value::TAG_HEAP_OBJECT
+    }
+
+    /// Trace `body` as an object of `type_id`, collecting the raw field values
+    /// handed to `visit` (before any is_heap_ref filtering).
+    fn traced(type_id: u8, body: &[u64]) -> Vec<u64> {
+        let mut out = Vec::new();
+        let bytes = body.len() * 8;
+        // SAFETY: `body` is a live slice of at least `bytes` bytes.
+        unsafe {
+            trace_object(body.as_ptr() as *const u8, type_id, bytes, |v| out.push(v.0));
+        }
+        out
+    }
+
+    #[test]
+    fn byte_and_numeric_payloads_are_never_traced() {
+        // Bodies full of pointer-shaped words must yield NO references — the
+        // core jtc.20 guarantee: raw payloads are not scanned for pointers.
+        let ptrs = [heapish(0x4000), heapish(0x5000), heapish(0x6000)];
+        for &t in &[
+            tid::SIMPLE_BASE_STRING,
+            tid::SIMPLE_CHARACTER_STRING,
+            tid::BIGNUM,
+            tid::DOUBLE_FLOAT,
+        ] {
+            assert!(
+                traced(t, &ptrs).is_empty(),
+                "type {t:#x} must not trace payload bytes as references"
+            );
+        }
+    }
+
+    #[test]
+    fn ratio_and_complex_trace_both_reference_fields() {
+        let body = [heapish(0x4000), heapish(0x5000)];
+        assert_eq!(traced(tid::RATIO, &body), vec![heapish(0x4000), heapish(0x5000)]);
+        assert_eq!(traced(tid::COMPLEX, &body), vec![heapish(0x4000), heapish(0x5000)]);
+    }
+
+    #[test]
+    fn simple_vector_traces_elements_not_the_length_word() {
+        // [length=2, elem0, elem1, padding]. The length is a fixnum, not a ref.
+        let body = [
+            BlissVal::from_fixnum(2).0,
+            heapish(0x4000),
+            heapish(0x5000),
+            0,
+        ];
+        assert_eq!(
+            traced(tid::SIMPLE_VECTOR, &body),
+            vec![heapish(0x4000), heapish(0x5000)]
+        );
+    }
+
+    #[test]
+    fn symbol_traces_five_reference_fields_not_flags() {
+        // name/value/function/plist/package are refs; the flags/tls word is raw.
+        let body = [
+            heapish(0x1000),
+            heapish(0x2000),
+            heapish(0x3000),
+            heapish(0x4000),
+            heapish(0x5000),
+            0xDEAD_BEEF,
+        ];
+        let got = traced(tid::SYMBOL, &body);
+        assert_eq!(got.len(), 5);
+        assert!(!got.contains(&0xDEAD_BEEF), "flags word must not be traced");
+    }
+
+    #[test]
+    fn standard_object_skips_wrapper_pointer_traces_slots() {
+        // [wrapper(raw ptr), slot0, slot1]. The wrapper is not a GC reference.
+        let body = [0xAABB_CCDD, heapish(0x4000), heapish(0x5000)];
+        assert_eq!(
+            traced(tid::STANDARD_OBJECT, &body),
+            vec![heapish(0x4000), heapish(0x5000)]
+        );
+    }
+
+    #[test]
+    fn compiled_function_skips_entry_and_code_size() {
+        // [entry_ptr, code_size, name, lambda_list, min/max/tier, constants].
+        let body = [
+            0x1111_2222, // entry_point (raw)
+            700,         // code_size (raw)
+            heapish(0x4000), // name
+            heapish(0x5000), // lambda_list
+            0,           // min/max/tier/pad (raw)
+            heapish(0x6000), // constants
+        ];
+        assert_eq!(
+            traced(tid::COMPILED_FUNCTION, &body),
+            vec![heapish(0x4000), heapish(0x5000), heapish(0x6000)]
+        );
+    }
+
+    #[test]
+    fn is_heap_ref_recognizes_only_reference_tags() {
+        assert!(is_heap_ref(BlissVal(heapish(0x4000))));
+        assert!(is_heap_ref(BlissVal(0x1000 | crate::value::TAG_CONS)));
+        assert!(is_heap_ref(BlissVal(0x1000 | crate::value::TAG_FUNCTION)));
+        assert!(!is_heap_ref(BlissVal::from_fixnum(0x4000)));
+        assert!(!is_heap_ref(crate::value::NIL));
+        assert!(!is_heap_ref(crate::value::T));
     }
 }
