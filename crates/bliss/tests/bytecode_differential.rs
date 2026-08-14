@@ -229,6 +229,11 @@ const CORPUS: &[&str] = &[
     // handler-case clause secondary values are discarded (child-env semantics).
     "(handler-case (error \"x\") (error (c) (values 42 99)))",
     "(multiple-value-bind (a b) (handler-case (values 1 2) (error () 0)) (list a b))",
+    // ── format / I/O in (recursive) bodies (nmq.6 coverage) ──
+    "(defun f () (format nil \"~a-~a\" 1 2)) (f)",
+    "(defun countdown (n) (format nil \"~a \" n) (if (> n 0) (countdown (- n 1)) (quote done))) (countdown 3)",
+    "(format nil \"~d items and ~a\" 5 (quote x))",
+    "(princ-to-string 42)",
 ];
 
 /// Full programs whose deep recursion must be bounded by the BlissStack

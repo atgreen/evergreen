@@ -316,6 +316,9 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
     // apply_function's synthesize path; sequence functions taking :key/:test
     // (sort, remove-if, find-if, reduce, ...) are left to bail to the tree-walker.
     "FUNCALL", "APPLY", "MAPCAR", "MAPC", "MAPCAN", "MAPCON", "MAPLIST",
+    // I/O functions (fixed positional args) — common in recursive bodies.
+    "FORMAT", "PRINT", "PRINC", "PRIN1", "WRITE-STRING", "WRITE-LINE", "TERPRI", "WRITE-CHAR",
+    "PRINC-TO-STRING", "PRIN1-TO-STRING", "WRITE-TO-STRING", "FRESH-LINE",
 ];
 
 /// Compiler state for lowering one function body.
