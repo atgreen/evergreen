@@ -65,6 +65,12 @@ impl ObjectHeader {
         self.set_gc_bits(bits);
     }
 
+    /// Clear the PINNED gc-bit (bit 52); the object may be moved again.
+    pub fn clear_pinned(&mut self) {
+        let bits = self.gc_bits() & !(1 << gc_bit::PINNED);
+        self.set_gc_bits(bits);
+    }
+
     /// Extract the cached identity hash (bits 47:16). Zero means not yet computed.
     pub fn hash(self) -> u32 {
         ((self.0 & HASH_MASK) >> HASH_SHIFT) as u32

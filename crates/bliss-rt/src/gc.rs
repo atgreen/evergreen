@@ -240,6 +240,13 @@ unsafe fn header_is_forwarded(ptr: *const u8) -> bool {
     (unsafe { header_at(ptr) }.gc_bits() & (1 << gc_bit::FORWARDED)) != 0
 }
 
+/// True if the object at `ptr` is pinned (must not be moved) (bliss-jtc.18).
+/// Safety: valid header at `ptr`.
+#[inline]
+unsafe fn header_is_pinned(ptr: *const u8) -> bool {
+    (unsafe { header_at(ptr) }.gc_bits() & (1 << gc_bit::PINNED)) != 0
+}
+
 /// The forwarding address (new body pointer) of an evacuated object.
 /// Safety: `ptr` must be a forwarded object.
 #[inline]
@@ -967,7 +974,23 @@ impl Collector for HeapCollector {
             .map(|(i, _)| i)
             .collect();
 
+        // Nursery regions that hold a pinned object are retained in place: their
+        // objects are not copied and the region is promoted to old-gen so it is
+        // never treated as a copy space again (bliss-jtc.18).
+        let pinned_indices: Vec<usize> = nursery_indices
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                let base = state.regions[idx].base as usize;
+                let top = state.regions[idx].header.alloc_top as usize;
+                top > base && unsafe { region_has_pinned(base, top) }
+            })
+            .collect();
+
         for &nursery_idx in &nursery_indices {
+            if pinned_indices.contains(&nursery_idx) {
+                continue; // Retained in place (pinned) — do not evacuate.
+            }
             let base = state.regions[nursery_idx].base as usize;
             let top = state.regions[nursery_idx].header.alloc_top as usize;
             let used = top.saturating_sub(base) as u64;
@@ -1061,6 +1084,18 @@ impl Collector for HeapCollector {
 
         }
 
+        // Promote retained (pinned) nursery regions to old-gen in place, before
+        // the relocation passes, so their objects' fields are traced and any
+        // references they hold to just-evacuated objects are rewritten. The
+        // pinned objects themselves did not move (bliss-jtc.18).
+        for &idx in &pinned_indices {
+            let region = &mut state.regions[idx];
+            let live = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
+            region.header.kind = RegionKind::OldGen;
+            region.header.gen_age = 0;
+            region.header.live_bytes = live as u32;
+        }
+
         // Relocate old→young references recorded by the write barrier (jtc.21).
         // Each remembered slot may hold a pointer to a nursery object that was
         // just evacuated; chase its forwarding pointer and rewrite the slot to
@@ -1096,8 +1131,12 @@ impl Collector for HeapCollector {
         relocate_entry_continuation(heap_base_addr, heap_end);
 
         // Phase 4: Reset all nursery regions for reuse (after relocation, above,
-        // read their forwarding pointers).
+        // read their forwarding pointers). Retained pinned regions were promoted
+        // to old-gen in place and must NOT be zeroed (bliss-jtc.18).
         for &nursery_idx in &nursery_indices {
+            if pinned_indices.contains(&nursery_idx) {
+                continue;
+            }
             let region = &mut state.regions[nursery_idx];
             // Zero the region memory so walk_heap doesn't see stale forwarding pointers.
             let region_used =
@@ -1117,6 +1156,7 @@ impl Collector for HeapCollector {
         {
             let nursery_ranges: Vec<(usize, usize)> = nursery_indices
                 .iter()
+                .filter(|idx| !pinned_indices.contains(idx))
                 .map(|&idx| {
                     let base = state.regions[idx].base as usize;
                     let limit = state.regions[idx].header.alloc_limit as usize;
@@ -1340,6 +1380,11 @@ impl Collector for HeapCollector {
                 continue;
             }
 
+            // Never evacuate a region that holds a pinned object — its objects
+            // must keep their addresses (bliss-jtc.18).
+            if unsafe { region_has_pinned(base, top) } {
+                continue;
+            }
             // Select regions where less than half the used space is live.
             if (region.header.live_bytes as u64) < (used as u64 / 2) {
                 evacuation_set.push(idx);
@@ -1428,7 +1473,11 @@ impl Collector for HeapCollector {
                     let top = region.header.alloc_top as usize;
                     let used = top.saturating_sub(base);
 
-                    if region.header.live_bytes == 0 && used > 0 {
+                    // A region holding a pinned object is never reclaimed, even if
+                    // it is otherwise all garbage — the pin keeps its address live
+                    // (bliss-jtc.18).
+                    let pinned = used > 0 && unsafe { region_has_pinned(base, top) };
+                    if region.header.live_bytes == 0 && used > 0 && !pinned {
                         // Zero the region memory.
                         unsafe {
                             std::ptr::write_bytes(region.base, 0, used);
@@ -1654,6 +1703,82 @@ pub fn drain_satb_log() -> Vec<BlissVal> {
         .as_mut()
         .map(|s| std::mem::take(&mut s.satb_log))
         .unwrap_or_default()
+}
+
+// ── Precise pinning (bliss-jtc.18) ────────────────────────────────
+//
+// A pinned object must never be moved by the collector (needed across FFI /
+// native calls, raw-pointer exposure, and identity hashing). Pinning is coarse
+// at region granularity: a region that holds any live pinned object is retained
+// in place — minor GC promotes such a nursery region without copying, and major
+// GC never selects it for evacuation — so pinned objects keep their address.
+// Large-object regions are non-moving unconditionally.
+
+/// True if the region `[base, top)` holds a live (non-forwarded) pinned object.
+/// Safety: `[base, top)` must be a walkable region of objects.
+unsafe fn region_has_pinned(base: usize, top: usize) -> bool {
+    let mut cursor = base;
+    while cursor + OBJECT_HEADER_SIZE <= top {
+        let ptr = cursor as *const u8;
+        let (type_id, body_size) = unsafe { read_object_header(ptr) };
+        if body_size == 0 && type_id == 0 {
+            break;
+        }
+        if unsafe { !header_is_forwarded(ptr) && header_is_pinned(ptr) } {
+            return true;
+        }
+        cursor += align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+    }
+    false
+}
+
+fn set_pin_bit(v: BlissVal, pinned: bool) {
+    if !is_heap_ref(v) {
+        return;
+    }
+    let body = (v.0 & !crate::value::TAG_MASK) as usize;
+    let guard = heap_state().lock().unwrap();
+    let Some(state) = guard.as_ref() else {
+        return;
+    };
+    let base = state.heap_base as usize;
+    if body < base + OBJECT_HEADER_SIZE || body >= base + state.config.heap_size {
+        return;
+    }
+    // Large-object regions never move, so pinning within one is a no-op (and its
+    // header sits at a different offset — never touch it here).
+    for region in &state.regions {
+        let rb = region.base as usize;
+        if body >= rb && body < rb + region.size {
+            if region.header.kind == RegionKind::LargeObject {
+                return;
+            }
+            break;
+        }
+    }
+    // SAFETY: `body` is a normal object body within the heap; its header
+    // precedes it by OBJECT_HEADER_SIZE.
+    let header = (body - OBJECT_HEADER_SIZE) as *mut ObjectHeader;
+    unsafe {
+        if pinned {
+            (*header).set_pinned();
+        } else {
+            (*header).clear_pinned();
+        }
+    }
+}
+
+/// Pin the heap object referenced by `v` so the GC never moves it (bliss-jtc.18).
+/// A no-op for immediates and for objects already in non-moving (large-object)
+/// regions. Pin scope is the caller's responsibility: unpin once the raw pointer
+/// / FFI exposure ends so the object can be compacted again.
+pub fn pin(v: BlissVal) {
+    set_pin_bit(v, true);
+}
+
+/// Release a pin taken with [`pin`], allowing the object to be moved again.
+pub fn unpin(v: BlissVal) {
+    set_pin_bit(v, false);
 }
 
 // ── T0 evaluator allocation on the shared GC heap (bliss-jtc.1) ───

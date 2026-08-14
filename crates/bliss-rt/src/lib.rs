@@ -41,8 +41,8 @@ pub use ffi::{AlienType, Callback, load_foreign_library, marshal_to_c, unmarshal
 pub use gc::{
     Allocator, Collector, GcConfig, GcStats, HeapAllocator, HeapCollector, RegionHeader,
     RegionKind, SatbCardBarrier, Tlab, WeakPointer, WriteBarrier, alloc_typed, drain_satb_log,
-    full_gc, heap_stats, init_heap, register_finalizer, remembered_set_len, store_ref, walk_heap,
-    write_barrier,
+    full_gc, heap_stats, init_heap, pin, register_finalizer, remembered_set_len, store_ref, unpin,
+    walk_heap, write_barrier,
 };
 pub use image::{
     Arch, ImageCompression, ImageHeader, Os, SaveImageOptions, SectionEntry, SectionType,
