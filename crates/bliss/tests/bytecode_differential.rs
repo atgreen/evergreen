@@ -221,6 +221,14 @@ const CORPUS: &[&str] = &[
     "(labels ((g (k) (if (= k 0) 0 (g (- k 1))))) (g 100))",
     "(labels ((ev (n) (if (= n 0) t (od (- n 1)))) (od (n) (if (= n 0) nil (ev (- n 1))))) (ev 11))",
     "(defun f (n) (labels ((g (k acc) (if (= k 0) acc (g (- k 1) (+ acc k))))) (g n 0))) (f 100)",
+    // ── macroexpand-then-lower: dotimes/dolist and ignore-errors (nmq.6) ──
+    "(defun sumto (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s i))))) (sumto 100)",
+    "(defun sumlist (l) (let ((s 0)) (dolist (x l s) (setq s (+ s x))))) (sumlist (list 1 2 3 4 5))",
+    "(ignore-errors (error \"boom\"))",
+    "(ignore-errors (+ 1 2))",
+    // handler-case clause secondary values are discarded (child-env semantics).
+    "(handler-case (error \"x\") (error (c) (values 42 99)))",
+    "(multiple-value-bind (a b) (handler-case (values 1 2) (error () 0)) (list a b))",
 ];
 
 /// Full programs whose deep recursion must be bounded by the BlissStack

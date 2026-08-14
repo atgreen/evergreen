@@ -33,6 +33,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use bliss_compiler::macroexpand::{self as compiler_macroexpand, Environment as MacroexpandEnv};
 use bliss_compiler::reader;
 use bliss_rt::error::BlissError;
 use bliss_rt::value::{BlissVal, NIL, T};
@@ -331,6 +332,9 @@ struct Lowerer<'e> {
     /// index its compiled body is registered under. A call to such a name lowers
     /// to a bytecode `CallNamed` on that gensym.
     local_fns: std::collections::HashMap<String, u32>,
+    /// Lazily-built macro-expansion environment (mirrors `env`'s macros), used
+    /// to compile macro forms by expanding then lowering.
+    macro_env: Option<MacroexpandEnv>,
     /// Whether this function needs a heap `EnvFrame` (has a boxed local).
     has_env: bool,
     /// Next free local slot index.
@@ -376,6 +380,7 @@ impl<'e> Lowerer<'e> {
             scopes: vec![HashMap::new()],
             captured_names: std::collections::HashSet::new(),
             local_fns: std::collections::HashMap::new(),
+            macro_env: None,
             has_env: false,
             next_local: 0,
             n_locals: 0,
@@ -990,8 +995,22 @@ impl<'e> Lowerer<'e> {
             self.push_n(1);
             return Ok(());
         }
-        // Never treat a macro or an unhandled special operator as a call.
-        if self.env.macros.contains_key(name) || is_bail_special(name) {
+        // A macro: expand one level (with the same macro functions the
+        // tree-walker uses) and lower the expansion. lower_expr recurses, so a
+        // macro that expands to another macro is handled too.
+        if self.env.macros.contains_key(name) {
+            let form = arena_cons(op, rest);
+            if self.macro_env.is_none() {
+                self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
+            }
+            let menv = self.macro_env.as_ref().unwrap();
+            match compiler_macroexpand::macroexpand_1(form, menv) {
+                Ok((expanded, true)) => return self.lower_expr(expanded),
+                _ => return Err(Bail),
+            }
+        }
+        // An unhandled special operator is not a call.
+        if is_bail_special(name) {
             return Err(Bail);
         }
         // Only emit a call when the callee is certainly a function: a
@@ -1389,6 +1408,9 @@ impl<'e> Lowerer<'e> {
             // the condition already stored in `var_slot`.
             self.cur_stack = sp_restore;
             self.lower_progn(body)?; // clause value (+1)
+            // The tree-walker runs the clause in a child env, so a clause's
+            // secondary values do not propagate out of the handler-case.
+            self.emit(Instr::ClearMv);
             self.exit_scope(saved_next_local);
             self.emit(Instr::Br(0));
             clause_brs.push(self.code.len() - 1);
