@@ -123,6 +123,20 @@ const CORPUS: &[&str] = &[
     "(defparameter *c* 0) (defun tick () (setq *c* (+ *c* 1))) (tick) (tick) (tick) *c*",
     // Unbound special read errors the same way in both backends.
     "(defun add-pi () (+ 0 pi)) (add-pi)",
+    // ── HANDLER-CASE on bytecode (nmq.7) ──
+    "(defun f () (handler-case (car 5) (type-error (e) (quote caught-te)))) (f)",
+    "(defun f () (handler-case (+ 1 2) (error (e) (quote nope)))) (f)",
+    "(defun f () (handler-case (/ 1 0) (division-by-zero () (quote div0)))) (f)",
+    "(defun f () (handler-case (error \"boom\") (error (e) (quote caught-err)))) (f)",
+    "(defun f () (handler-case (car 5) (division-by-zero () (quote wrong)) (error (e) (quote generic)))) (f)",
+    "(defun sig () (error \"x\")) (defun f () (handler-case (sig) (error (e) (quote from-callee)))) (f)",
+    "(defun f () (handler-case (car 5) (error (e) (type-of e)))) (f)",
+    "(define-condition my-err (error) ()) (defun g () (error (quote my-err))) (defun f () (handler-case (g) (my-err () (quote got-mine)))) (f)",
+    "(defun f () (handler-case (handler-case (car 5) (division-by-zero () (quote inner))) (type-error (e) (quote outer)))) (f)",
+    "(defun f () (catch (quote out) (handler-case (car 5) (error (e) (throw (quote out) (quote clause-threw)))))) (f)",
+    "(defvar *l* nil) (defun f () (setq *l* nil) (handler-case (unwind-protect (car 5) (setq *l* (cons 1 *l*))) (error (e) *l*))) (f)",
+    "(defun f () (handler-case (car 5) (t () (quote catchall)))) (f)",
+    "(defun f () (handler-case (car 5) (division-by-zero () (quote no)))) (handler-case (f) (type-error () (quote outer-caught)))",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a
@@ -136,6 +150,7 @@ const MUST_COMPILE: &[&str] = &[
     "(let ((n 5)) (if (< n 10) (+ n 1) 0))",
     "(let ((x 1)) (setq x (+ x 10)) x)",
     "(defvar *gg* 3) (defun rr () (setq *gg* (* *gg* 2)))",
+    "(defun hc () (handler-case (car 5) (error (e) (quote caught))))",
 ];
 
 #[test]

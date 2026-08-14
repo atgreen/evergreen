@@ -39,8 +39,9 @@ use bliss_rt::value::{BlissVal, NIL, T};
 use bliss_rt::{CodeInfo, Frame};
 
 use super::{
-    Env, apply_function, cp, eval_form, list_to_vec, next_control_token, store_control_value,
-    sym_name, tag_key, take_control_value, val_as_str,
+    Env, HandlerCluster, HandlerEntry, HandlerImpl, apply_function, bliss_error_to_condition,
+    condition_matches_handler, cp, eval_form, handler_case_token, list_to_vec, next_control_token,
+    store_control_value, sym_name, tag_key, take_control_value, val_as_str,
 };
 
 // ── Backend selection ──────────────────────────────────────────────
@@ -114,6 +115,12 @@ enum Instr {
     /// End of a cleanup body: act on the saved continuation (resume normally,
     /// or continue an in-progress unwind).
     CleanupReturn,
+    /// Establish a `HANDLER-CASE` cluster (registered in `env.handlers` so a
+    /// host-signalled condition finds it) — `hc` indexes the static clause
+    /// table. A matching condition unwinds into the selected clause body.
+    PushHandlerCase { hc: u32, sp_restore: u16 },
+    /// Normal completion of `HANDLER-CASE`: disestablish the cluster.
+    PopHandlerCase,
 }
 
 /// A lowered CL function: a linear bytecode plus its constant pool and frame
@@ -123,6 +130,8 @@ enum Instr {
 pub struct BytecodeFunction {
     code: Vec<Instr>,
     constants: Vec<BlissVal>,
+    /// Static per-`handler-case` clause tables (indexed by `PushHandlerCase`).
+    handler_cases: Vec<HandlerCaseInfo>,
     /// Number of lexical local slots (params + `let` bindings).
     n_locals: u16,
     /// Maximum operand-stack depth.
@@ -139,6 +148,24 @@ impl BytecodeFunction {
     fn num_slots(&self) -> u16 {
         self.n_locals + self.max_stack
     }
+}
+
+/// Static description of one `handler-case` form: its clauses plus the PC to
+/// resume at after the whole form.
+#[derive(Debug, Clone)]
+struct HandlerCaseInfo {
+    clauses: Vec<ClauseInfo>,
+}
+
+/// Static description of one `handler-case` clause.
+#[derive(Debug, Clone)]
+struct ClauseInfo {
+    /// Condition type name the clause handles (`T` = catch-all).
+    type_name: String,
+    /// Bytecode PC of the clause body.
+    body_bcp: u32,
+    /// Local slot the condition is bound to, if the clause has a variable.
+    var_slot: Option<u16>,
 }
 
 // ── Per-thread registry of compiled functions ─────────────────────
@@ -206,6 +233,8 @@ struct Lowerer<'e> {
     /// `Go` instructions awaiting target-bcp patching once their tagbody's tag
     /// positions are known: `(instr_index, tagbody_id, tag_name)`.
     pending_gos: Vec<(usize, u32, String)>,
+    /// Static `handler-case` clause tables.
+    handler_cases: Vec<HandlerCaseInfo>,
     env: &'e Env,
 }
 
@@ -230,6 +259,7 @@ impl<'e> Lowerer<'e> {
             block_scope: Vec::new(),
             tag_scope: Vec::new(),
             pending_gos: Vec::new(),
+            handler_cases: Vec::new(),
             env,
         }
     }
@@ -362,6 +392,7 @@ impl<'e> Lowerer<'e> {
                 "TAGBODY" => self.lower_tagbody(rest),
                 "GO" => self.lower_go(rest),
                 "UNWIND-PROTECT" => self.lower_unwind_protect(rest),
+                "HANDLER-CASE" => self.lower_handler_case(rest),
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
@@ -809,6 +840,89 @@ impl<'e> Lowerer<'e> {
         }
         Ok(())
     }
+
+    /// `(handler-case protected (type (var?) body...)...)` — on a matching
+    /// condition signalled during `protected`, unwind into the clause body with
+    /// the condition bound to `var`.
+    fn lower_handler_case(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (protected, clauses_form) = cp(rest);
+        let clauses = list_to_vec(clauses_form);
+        // `:no-error` clauses are a different protocol — bail if present.
+        for clause in &clauses {
+            let (type_form, _) = cp(*clause);
+            if type_form.is_symbol() && sym_name(type_form).ends_with("NO-ERROR") {
+                return Err(Bail);
+            }
+        }
+
+        let sp_restore = self.cur_stack;
+        let hc = self.handler_cases.len() as u32;
+        self.emit(Instr::PushHandlerCase { hc, sp_restore });
+        // Reserve the table slot; filled in once bodies are laid out.
+        self.handler_cases.push(HandlerCaseInfo {
+            clauses: Vec::new(),
+        });
+
+        self.lower_expr(protected)?; // protected value V (+1)
+        self.emit(Instr::PopHandlerCase);
+        self.emit(Instr::Br(0)); // skip clause bodies
+        let normal_br = self.code.len() - 1;
+
+        let mut clause_infos = Vec::new();
+        let mut clause_brs = Vec::new();
+        for clause in &clauses {
+            let (type_form, clause_rest) = cp(*clause);
+            if !type_form.is_symbol() && !type_form.is_nil() {
+                return Err(Bail); // compound type specifiers not yet handled
+            }
+            let type_name = sym_name(type_form);
+            let (bind_list, body) = cp(clause_rest);
+            let saved_next_local = self.next_local;
+            self.enter_scope();
+            let var_slot = if bind_list.is_cons() {
+                let (var, _) = cp(bind_list);
+                if !var.is_symbol() {
+                    return Err(Bail);
+                }
+                Some(self.alloc_local(&sym_name(var)))
+            } else {
+                None
+            };
+
+            let body_bcp = self.code.len() as u32;
+            // The driver lands here with the operand stack at `sp_restore` and
+            // the condition already stored in `var_slot`.
+            self.cur_stack = sp_restore;
+            self.lower_progn(body)?; // clause value (+1)
+            self.exit_scope(saved_next_local);
+            self.emit(Instr::Br(0));
+            clause_brs.push(self.code.len() - 1);
+
+            clause_infos.push(ClauseInfo {
+                type_name,
+                body_bcp,
+                var_slot,
+            });
+        }
+
+        let after = self.code.len() as u32;
+        if let Instr::Br(t) = &mut self.code[normal_br] {
+            *t = after;
+        }
+        for br in clause_brs {
+            if let Instr::Br(t) = &mut self.code[br] {
+                *t = after;
+            }
+        }
+        self.handler_cases[hc as usize].clauses = clause_infos;
+
+        // The whole form yields one value (protected's, or a clause's).
+        self.cur_stack = sp_restore + 1;
+        if self.cur_stack > self.max_stack {
+            self.max_stack = self.cur_stack;
+        }
+        Ok(())
+    }
 }
 
 /// Extract `(name init)` from a `let` binding, which may also be a bare symbol.
@@ -876,7 +990,6 @@ fn is_bail_special(name: &str) -> bool {
             | "PROG"
             | "PROG*"
             | "DESTRUCTURING-BIND"
-            | "HANDLER-CASE"
             | "HANDLER-BIND"
             | "RESTART-CASE"
             | "RESTART-BIND"
@@ -934,6 +1047,7 @@ fn compile_function(
     Some(BytecodeFunction {
         code: lo.code,
         constants: lo.constants,
+        handler_cases: lo.handler_cases,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
         arity: param_names.len() as u16,
@@ -971,6 +1085,7 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
     Some(BytecodeFunction {
         code: lo.code,
         constants: lo.constants,
+        handler_cases: lo.handler_cases,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
         arity: 0,
@@ -993,6 +1108,23 @@ enum Handler {
     Tag { tagbody_id: u32, sp_restore: u16 },
     /// `UNWIND-PROTECT`: a cleanup to run on any unwind through this point.
     Unwind { cleanup_bcp: u32, sp_restore: u16 },
+    /// `HANDLER-CASE`: a cluster of condition-typed clauses. `cluster_base` is
+    /// the `env.handlers` length before this cluster was pushed.
+    HandlerCase {
+        clauses: Vec<RuntimeClause>,
+        sp_restore: u16,
+        cluster_base: usize,
+    },
+}
+
+/// A live `handler-case` clause: its control token (shared with `env.handlers`),
+/// condition type, body PC, and the local slot for its condition variable.
+#[derive(Clone)]
+struct RuntimeClause {
+    token: String,
+    type_name: String,
+    body_bcp: u32,
+    var_slot: Option<u16>,
 }
 
 /// What to do when a cleanup body finishes (`CleanupReturn`).
@@ -1180,16 +1312,23 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 if let Some(callee) = registry_get(sym) {
                     if callee.arity == nargs {
                         let fn_val = BlissVal::from_symbol_index(sym);
-                        let frame = stack
-                            .push_frame(
-                                fn_val,
-                                std::ptr::null::<CodeInfo>(),
-                                callee.num_slots(),
-                                FLAG_CALL,
-                            )
-                            .ok_or_else(|| {
-                                BlissError::StackOverflow(bliss_rt::current_thread_id())
-                            })?;
+                        let frame = match stack.push_frame(
+                            fn_val,
+                            std::ptr::null::<CodeInfo>(),
+                            callee.num_slots(),
+                            FLAG_CALL,
+                        ) {
+                            Some(f) => f,
+                            None => {
+                                // BlissStack full → STORAGE-CONDITION, routed
+                                // through the unwind driver so unwind-protect
+                                // cleanups run and a handler-case can catch it.
+                                let e =
+                                    BlissError::StackOverflow(bliss_rt::current_thread_id());
+                                initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
+                                continue;
+                            }
+                        };
                         for (i, a) in args.iter().enumerate() {
                             unsafe { slot_set(frame, i as u16, *a) };
                         }
@@ -1358,6 +1497,47 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     }
                 }
             }
+            Instr::PushHandlerCase { hc, sp_restore } => {
+                let info = acts[top_idx].func.handler_cases[hc as usize].clone();
+                let cluster_base = env.handlers.len();
+                let mut runtime_clauses = Vec::with_capacity(info.clauses.len());
+                let mut entries = Vec::with_capacity(info.clauses.len());
+                for clause in &info.clauses {
+                    // A control token shared with the tree-walker: a host SIGNAL
+                    // that matches this clause's type stores the condition here
+                    // and returns Err(__HANDLER_CASE__:token), which the bytecode
+                    // loop then routes into the clause body.
+                    let token = next_control_token("__HANDLER_CASE__");
+                    entries.push(HandlerEntry {
+                        type_name: clause.type_name.clone(),
+                        handler: HandlerImpl::HandlerCase {
+                            token: token.clone(),
+                            var_name: None,
+                            body: NIL,
+                            captured_frame: Rc::clone(&env.frame),
+                        },
+                    });
+                    runtime_clauses.push(RuntimeClause {
+                        token,
+                        type_name: clause.type_name.clone(),
+                        body_bcp: clause.body_bcp,
+                        var_slot: clause.var_slot,
+                    });
+                }
+                env.handlers.push(HandlerCluster { entries });
+                acts[top_idx].handlers.push(Handler::HandlerCase {
+                    clauses: runtime_clauses,
+                    sp_restore,
+                    cluster_base,
+                });
+            }
+            Instr::PopHandlerCase => {
+                if let Some(Handler::HandlerCase { cluster_base, .. }) =
+                    acts[top_idx].handlers.pop()
+                {
+                    env.handlers.truncate(cluster_base);
+                }
+            }
         }
     }
 }
@@ -1445,6 +1625,45 @@ fn initiate_unwind(
                     }
                 }
                 acts[top].handlers.pop();
+            }
+            Some(Handler::HandlerCase {
+                clauses,
+                sp_restore,
+                cluster_base,
+            }) => {
+                acts[top].handlers.pop();
+                env.handlers.truncate(cluster_base);
+                // Only an error (raw, or a host SIGNAL that selected one of this
+                // cluster's clauses) can be caught by HANDLER-CASE. Block/go/throw
+                // transfers pass straight through.
+                let matched: Option<(RuntimeClause, BlissVal)> = match &pending {
+                    Pending::Propagate(error) => {
+                        if let Some(tok) = handler_case_token(error) {
+                            clauses
+                                .iter()
+                                .find(|c| c.token == tok)
+                                .map(|c| (c.clone(), take_control_value(&tok)))
+                        } else if let Ok(Some(cond)) = bliss_error_to_condition(env, error) {
+                            clauses
+                                .iter()
+                                .find(|c| condition_matches_handler(env, cond, &c.type_name))
+                                .map(|c| (c.clone(), cond))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some((clause, cond)) = matched {
+                    if let Some(slot) = clause.var_slot {
+                        unsafe { slot_set(acts[top].frame, slot, cond) };
+                    }
+                    let act = &mut acts[top];
+                    act.sp_top = sp_restore;
+                    act.bcp = clause.body_bcp as usize;
+                    return Ok(());
+                }
+                // No clause matched — keep unwinding.
             }
             None => {
                 // No handler here — this activation is fully unwound.
