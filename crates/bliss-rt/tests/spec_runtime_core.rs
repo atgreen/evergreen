@@ -446,6 +446,18 @@ fn green_threads_run_user_functions_through_the_worker_pool() {
 }
 
 #[test]
+fn fiber_record_publishes_stack_roots() {
+    let _guard = lock_serial();
+    // A managed fiber publishes its stack roots (SP/FP) at a safepoint so the
+    // collector can scan them while it is suspended (bliss-jtc.14.2).
+    let t = current_thread();
+    assert_eq!(t.published_stack(), (0, 0), "unpublished by default");
+    t.publish_stack(0xAAAA_0000, 0xBBBB_0000);
+    assert_eq!(t.published_stack(), (0xAAAA_0000, 0xBBBB_0000));
+    t.publish_stack(0, 0);
+}
+
+#[test]
 fn many_green_threads_complete_via_work_stealing() {
     let _guard = lock_serial();
     // Far more tasks than workers forces the per-worker deques to fill unevenly

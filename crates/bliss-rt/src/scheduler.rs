@@ -1,4 +1,13 @@
-//! Green-thread scheduler — work-stealing deque per worker.
+//! Scheduler control handle.
+//!
+//! The single real scheduler — N **native OS workers** each owning a
+//! work-stealing deque, running M **managed Bliss fibers** (`GreenThread`) — is
+//! implemented in [`crate::thread`] (the `WorkerPool`/`Worker` structs are
+//! internal there). This module is a thin *control handle* over that runtime
+//! (lifecycle/config + safepoint-mediated control ops), not a competing
+//! scheduler: `park_current`/`request_yield` delegate to the real fiber runtime
+//! (bliss-jtc.14.2). Public thread APIs (`make_thread`, `join_thread`, …) create
+//! and join managed fibers; native workers are never exposed.
 //!
 //! See §2.3.4 of the spec.
 
@@ -51,12 +60,10 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Park the current green thread (transition to Blocked).
+    /// Park the current fiber, yielding it at the next safepoint so the fiber
+    /// runtime can run another runnable fiber (bliss-jtc.14.2).
     pub fn park_current(&self) {
-        // In a full implementation this would remove the current green
-        // thread from the run queue and switch to the next runnable
-        // thread. In the bootstrap runtime we simply record the
-        // transition — there is only one OS thread running.
+        crate::thread::thread_yield();
     }
 
     /// Unpark a blocked green thread (transition to Runnable).
@@ -72,11 +79,10 @@ impl Scheduler {
         }
     }
 
-    /// Request preemption of the given green thread at the next safepoint.
-    pub fn request_yield(&self, _thread_id: GreenThreadId) {
-        // Sets a per-thread yield flag that will be checked at the next
-        // safepoint poll. In the bootstrap runtime this is a no-op since
-        // safepoint polling is cooperative.
+    /// Request preemption of fiber `thread_id` at its next safepoint poll — sets
+    /// the real per-fiber yield flag in the fiber runtime (bliss-jtc.14.2).
+    pub fn request_yield(&self, thread_id: GreenThreadId) {
+        let _ = crate::thread::request_fiber_yield(thread_id);
     }
 
     /// Shut down the scheduler: interrupt all green threads, join workers.

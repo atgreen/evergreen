@@ -125,6 +125,8 @@ thread_local! {
             result: Arc::new(ThreadResult::new()),
             interrupt_pending: AtomicBool::new(false),
             interrupt_value: Mutex::new(NIL),
+            published_sp: AtomicUsize::new(0),
+            published_fp: AtomicUsize::new(0),
         });
         thread_registry().lock().unwrap().insert(id, Arc::clone(&thread));
         thread
@@ -148,6 +150,56 @@ pub struct GreenThread {
     interrupt_pending: AtomicBool,
     /// The condition value to deliver on interrupt.
     interrupt_value: Mutex<BlissVal>,
+    /// Stack pointer / frame pointer this managed fiber published at its last
+    /// safepoint before parking or entering Native (bliss-jtc.14.2). While a
+    /// fiber is suspended it does not run its own handshake, so it publishes its
+    /// stack roots here for the collector to scan on its behalf (spec §2.5).
+    /// `0` means "running normally, not published".
+    published_sp: AtomicUsize,
+    published_fp: AtomicUsize,
+}
+
+impl GreenThread {
+    /// Publish this fiber's stack roots (SP/FP) at a safepoint, before it parks,
+    /// blocks, or enters Native, so the collector can scan them while it is
+    /// suspended (bliss-jtc.14.2).
+    pub fn publish_stack(&self, sp: usize, fp: usize) {
+        self.published_sp.store(sp, Ordering::Release);
+        self.published_fp.store(fp, Ordering::Release);
+    }
+
+    /// The stack roots this fiber last published, or `(0, 0)` if it is running
+    /// normally and scanning its own stack.
+    pub fn published_stack(&self) -> (usize, usize) {
+        (
+            self.published_sp.load(Ordering::Acquire),
+            self.published_fp.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// Number of live (non-`Dead`) managed fibers in the registry — the M in the
+/// N-native-workers × M-managed-fibers model (bliss-jtc.14.2).
+pub fn live_fiber_count() -> usize {
+    thread_registry()
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|t| t.state() != ThreadState::Dead)
+        .count()
+}
+
+/// Request that fiber `id` yield at its next safepoint. Returns `false` if no
+/// such fiber exists (bliss-jtc.14.2).
+pub fn request_fiber_yield(id: GreenThreadId) -> bool {
+    let reg = thread_registry().lock().unwrap();
+    match reg.get(&id) {
+        Some(t) => {
+            t.yield_requested.store(true, Ordering::Release);
+            true
+        }
+        None => false,
+    }
 }
 
 // Safety: GreenThread access is controlled by the scheduler and thread registry.
@@ -483,6 +535,8 @@ pub fn make_thread(entry: BlissVal) -> Result<GreenThreadId, BlissError> {
         result: Arc::clone(&result_cell),
         interrupt_pending: AtomicBool::new(false),
         interrupt_value: Mutex::new(NIL),
+        published_sp: AtomicUsize::new(0),
+        published_fp: AtomicUsize::new(0),
     });
 
     // Register the thread before submitting so it is visible to other threads.
