@@ -191,26 +191,49 @@ struct CircularLabels {
 }
 
 // ── Heap allocation helpers ───────────────────────────────────────
-// NOTE(tech-debt): All alloc_* functions below use Box::leak / alloc_zeroed
-// without integrating with the GC (bliss_rt::gc). Every object created by
-// the reader is permanently leaked. This is acceptable during bootstrap but
-// must be wired into the GC's allocation path before production use.
-// Tracked as tech-debt for a future phase.
+// Reader objects are allocated on the shared runtime GC heap (bliss-jtc.15), so
+// they use the same ObjectHeader layouts and allocation path as T0/T1/T2
+// execution and are traceable / image-serializable — no longer leaked Rust
+// boxes. The GC allocator writes each object's header (type_id + size); these
+// helpers fill in the body fields exactly as before.
+
+/// Allocate a `total_size`-byte object (header + body) of `type_id` on the shared
+/// GC heap and return a pointer to the object header. The allocator writes the
+/// header; the caller fills body fields at offsets ≥ 8. Memory is
+/// zero-initialized. Aborts on allocation failure, like the old std::alloc path.
+fn gc_alloc(total_size: usize, type_id: u8) -> *mut u8 {
+    let hdr = std::mem::size_of::<ObjectHeader>();
+    let body_size = total_size.saturating_sub(hdr).max(1);
+    match bliss_rt::gc::alloc_typed(body_size, type_id) {
+        // SAFETY: alloc_typed returns a pointer past an 8-byte header.
+        Some(body) => unsafe { body.sub(hdr) },
+        None => std::alloc::handle_alloc_error(
+            std::alloc::Layout::from_size_align(total_size.max(hdr), hdr).unwrap(),
+        ),
+    }
+}
 
 fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
-    let cell = Box::leak(Box::new(ConsCell { car, cdr }));
-    unsafe { BlissVal::from_cons_ptr(cell as *mut ConsCell as *mut u8) }
+    // A headered GC object whose body (car@0, cdr@8) is what `from_cons_ptr`
+    // points at — the same representation the T0 evaluator uses.
+    let body = match bliss_rt::gc::alloc_typed(16, type_id::CONS) {
+        Some(b) => b,
+        None => std::alloc::handle_alloc_error(std::alloc::Layout::new::<ConsCell>()),
+    };
+    unsafe {
+        let cell = body as *mut ConsCell;
+        (*cell).car = car;
+        (*cell).cdr = cdr;
+        BlissVal::from_cons_ptr(body)
+    }
 }
 
 fn alloc_string(s: &str) -> BlissVal {
     // Layout: ObjectHeader (8 bytes) + length (u64, 8 bytes) + bytes
     let bytes = s.as_bytes();
     let total_size = 8 + 8 + bytes.len();
-    let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
+    let ptr = gc_alloc(total_size, type_id::SIMPLE_BASE_STRING);
     unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout);
-        let header = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, total_size.div_ceil(8) as u16);
-        *(ptr as *mut ObjectHeader) = header;
         *(ptr.add(8) as *mut u64) = bytes.len() as u64;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
         BlissVal::from_heap_ptr(ptr)
@@ -219,11 +242,8 @@ fn alloc_string(s: &str) -> BlissVal {
 
 fn alloc_vector(elements: &[BlissVal]) -> BlissVal {
     let total_size = 8 + 8 + elements.len() * 8;
-    let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
+    let ptr = gc_alloc(total_size, type_id::SIMPLE_VECTOR);
     unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout);
-        let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, total_size.div_ceil(8) as u16);
-        *(ptr as *mut ObjectHeader) = header;
         *(ptr.add(8) as *mut u64) = elements.len() as u64;
         for (i, &elem) in elements.iter().enumerate() {
             *(ptr.add(16 + i * 8) as *mut BlissVal) = elem;
@@ -233,32 +253,29 @@ fn alloc_vector(elements: &[BlissVal]) -> BlissVal {
 }
 
 fn alloc_ratio(num: BlissVal, den: BlissVal) -> BlissVal {
-    let data = Box::leak(Box::new(RatioData {
-        header: ObjectHeader::new(type_id::RATIO, 3),
-        numerator: num,
-        denominator: den,
-    }));
-    unsafe { BlissVal::from_heap_ptr(data as *mut RatioData as *mut u8) }
+    let ptr = gc_alloc(std::mem::size_of::<RatioData>(), type_id::RATIO) as *mut RatioData;
+    unsafe {
+        (*ptr).numerator = num;
+        (*ptr).denominator = den;
+        BlissVal::from_heap_ptr(ptr as *mut u8)
+    }
 }
 
 fn alloc_complex(real: BlissVal, imag: BlissVal) -> BlissVal {
-    let data = Box::leak(Box::new(ComplexData {
-        header: ObjectHeader::new(type_id::COMPLEX, 3),
-        realpart: real,
-        imagpart: imag,
-    }));
-    unsafe { BlissVal::from_heap_ptr(data as *mut ComplexData as *mut u8) }
+    let ptr = gc_alloc(std::mem::size_of::<ComplexData>(), type_id::COMPLEX) as *mut ComplexData;
+    unsafe {
+        (*ptr).realpart = real;
+        (*ptr).imagpart = imag;
+        BlissVal::from_heap_ptr(ptr as *mut u8)
+    }
 }
 
 fn alloc_bit_vector(bits: &[u8]) -> BlissVal {
     // Layout: ObjectHeader (8) + element_type_tag byte + padding (7) + length (8) + data
     let data_bytes = bits.len().div_ceil(8);
     let total_size = 8 + 8 + 8 + data_bytes;
-    let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
+    let ptr = gc_alloc(total_size, type_id::SIMPLE_ARRAY);
     unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout);
-        let header = ObjectHeader::new(type_id::SIMPLE_ARRAY, total_size.div_ceil(8) as u16);
-        *(ptr as *mut ObjectHeader) = header;
         // Element type tag at first byte after header
         *ptr.add(8) = ElementTypeTag::Bit as u8;
         // Length stored after the element-type word
@@ -276,39 +293,36 @@ fn alloc_bit_vector(bits: &[u8]) -> BlissVal {
 }
 
 fn alloc_readtable() -> BlissVal {
-    let data = Box::leak(Box::new(ReadtableData {
-        header: ObjectHeader::new(type_id::READTABLE, 6),
-        case_mode: 0, // :upcase
-        _pad: [0; 7],
-        char_table: NIL,
-        extended_table: NIL,
-        macro_table: NIL,
-        dispatch_table: NIL,
-    }));
-    unsafe { BlissVal::from_heap_ptr(data as *mut ReadtableData as *mut u8) }
+    let ptr = gc_alloc(std::mem::size_of::<ReadtableData>(), type_id::READTABLE) as *mut ReadtableData;
+    unsafe {
+        (*ptr).case_mode = 0; // :upcase
+        (*ptr)._pad = [0; 7];
+        (*ptr).char_table = NIL;
+        (*ptr).extended_table = NIL;
+        (*ptr).macro_table = NIL;
+        (*ptr).dispatch_table = NIL;
+        BlissVal::from_heap_ptr(ptr as *mut u8)
+    }
 }
 
 fn alloc_pathname(namestring: BlissVal) -> BlissVal {
-    let data = Box::leak(Box::new(PathnameData {
-        header: ObjectHeader::new(type_id::PATHNAME, 7),
-        host: NIL,
-        device: NIL,
-        directory: NIL,
-        name: namestring,
-        type_field: NIL,
-        version: NIL,
-    }));
-    unsafe { BlissVal::from_heap_ptr(data as *mut PathnameData as *mut u8) }
+    let ptr = gc_alloc(std::mem::size_of::<PathnameData>(), type_id::PATHNAME) as *mut PathnameData;
+    unsafe {
+        (*ptr).host = NIL;
+        (*ptr).device = NIL;
+        (*ptr).directory = NIL;
+        (*ptr).name = namestring;
+        (*ptr).type_field = NIL;
+        (*ptr).version = NIL;
+        BlissVal::from_heap_ptr(ptr as *mut u8)
+    }
 }
 
 fn alloc_structure(name: BlissVal, slots: &[BlissVal]) -> BlissVal {
     // Layout: ObjectHeader (8) + name (8) + n_slots (8) + slot data
     let total_size = 8 + 8 + 8 + slots.len() * 8;
-    let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
+    let ptr = gc_alloc(total_size, type_id::STRUCTURE);
     unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout);
-        let header = ObjectHeader::new(type_id::STRUCTURE, total_size.div_ceil(8) as u16);
-        *(ptr as *mut ObjectHeader) = header;
         *(ptr.add(8) as *mut BlissVal) = name;
         *(ptr.add(16) as *mut u64) = slots.len() as u64;
         for (i, &slot) in slots.iter().enumerate() {
@@ -1182,11 +1196,8 @@ fn parse_bignum(s: &str, base: u32) -> Option<BlissVal> {
 fn alloc_bignum(sign: i32, limbs: &[u64]) -> BlissVal {
     let n = limbs.len();
     let total_size = 16 + n * 8;
-    let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
+    let ptr = gc_alloc(total_size, type_id::BIGNUM);
     unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout);
-        *(ptr as *mut ObjectHeader) =
-            ObjectHeader::new(type_id::BIGNUM, total_size.div_ceil(8) as u16);
         *(ptr.add(8) as *mut i32) = sign;
         *(ptr.add(12) as *mut u32) = n as u32;
         for (idx, &limb) in limbs.iter().enumerate() {

@@ -1080,11 +1080,18 @@ impl Collector for HeapCollector {
             unsafe { relocate_slot(slot_addr as *mut BlissVal, heap_base_addr, heap_end) };
         }
 
+        // Relocate object reference fields to the moved young objects (jtc.17):
+        // young→young links (e.g. the cdr chain of a freshly-read list, which the
+        // reader builds without going through the write barrier) live in the
+        // survivor copies and must be rewritten to their evacuated targets. This
+        // also covers old→young fields of typed objects; the remembered set above
+        // additionally covers barrier-recorded slots in untyped objects.
+        Self::relocate_object_fields(state, heap_base_addr, heap_end);
+
         // Complete the young-object root set (bliss-jtc.17): a nursery object may
         // also be reachable only from a CL-stack frame or the entry continuation.
         // Relocate those roots to the moved locations too, while forwarding is
-        // still intact and before the nursery is reset. (Old→young object fields
-        // are covered by the authoritative remembered set above.)
+        // still intact and before the nursery is reset.
         Self::relocate_cl_stack_refs(heap_base_addr, state.config.heap_size);
         relocate_entry_continuation(heap_base_addr, heap_end);
 
