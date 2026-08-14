@@ -2086,7 +2086,19 @@ impl Env {
     }
 
     fn define_local(&mut self, name: &str, val: BlissVal) {
-        self.frame.borrow_mut().vars.insert(name.to_string(), val);
+        let mut frame = self.frame.borrow_mut();
+        frame.vars.insert(name.to_string(), val);
+        // Also bind by symbol index so the symbol-keyed lookup
+        // (`lookup_var_symbol`) sees this binding. Otherwise a binding made only
+        // in `vars` (e.g. an unsupplied &optional/&key parameter's NIL default)
+        // fails to shadow a same-named binding in an enclosing frame's
+        // `symbol_vars`, because the two lookups walk the frame chain
+        // independently — the body would then see the caller's variable instead
+        // of the parameter (bliss-lb6: an unsupplied `end` inheriting the
+        // caller's `end` drove find/position off the end of a sequence).
+        if let Some(idx) = bliss_rt::symbols::find_index(name) {
+            frame.symbol_vars.insert(idx, val);
+        }
     }
 
     fn define_local_symbol(&mut self, symbol: BlissVal, val: BlissVal) {

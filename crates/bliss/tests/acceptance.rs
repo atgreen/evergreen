@@ -1716,3 +1716,25 @@ fn pathname_directory_returns_a_list_not_a_namestring() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn unsupplied_optional_and_key_params_shadow_enclosing_bindings() {
+    // bliss-lb6: an unsupplied &optional/&key parameter must default to its
+    // default form (NIL here), not inherit a same-named variable from an
+    // enclosing scope. This bug drove UIOP's split-string off the end of a
+    // string (find/position called without :end picked up a caller's `end`).
+    let prog = "(progn \
+       (defun pk (seq &key end) (list end)) \
+       (defun po (&optional end) end) \
+       (format t \"~a ~a ~a\" \
+         (car (let ((end 99)) (pk \"ab\"))) \
+         (let ((end 88)) (po)) \
+         (let ((end 7)) (find #\\x \"ab\"))))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("NIL NIL NIL"),
+        "unsupplied &optional/&key must be NIL, not the caller's binding; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
