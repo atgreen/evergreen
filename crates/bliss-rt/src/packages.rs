@@ -13,6 +13,7 @@
 //! cells are `NIL` until the per-package symbol maps are migrated onto them; the
 //! interpreter still tracks package membership in its own maps meanwhile.
 
+use crate::error::BlissError;
 use crate::object::{type_id, ObjectHeader, PackageData};
 use crate::value::{BlissVal, NIL};
 use std::collections::HashMap;
@@ -153,6 +154,80 @@ pub fn package_name(pkg: BlissVal) -> Option<String> {
         let data = pkg.as_ptr() as *const PackageData;
         Some((*data).name.as_string())
     }
+}
+
+// ── Image serialization (bliss-jtc.6 Stage F) ───────────────────────────────
+
+/// Serialize the package registry: each package's primary name followed by its
+/// nicknames, length-prefixed. Restoring recreates the packages and nicknames so
+/// a saved image resolves the same package names after reload. (Symbol
+/// membership lives with the symbols; see `symbols::serialize`.)
+pub fn serialize() -> Vec<u8> {
+    let mut buf = Vec::new();
+    with_registry_mut(|reg| {
+        buf.extend_from_slice(&(reg.packages.len() as u32).to_le_bytes());
+        for &pkg in &reg.packages {
+            let primary = package_name(pkg).unwrap_or_default();
+            // Nicknames: every registry key that maps to this package except the
+            // primary name.
+            let nicks: Vec<String> = reg
+                .name_to_package
+                .iter()
+                .filter(|entry| *entry.1 == pkg && *entry.0 != primary)
+                .map(|entry| entry.0.clone())
+                .collect();
+            encode_str(&mut buf, &primary);
+            buf.extend_from_slice(&(nicks.len() as u32).to_le_bytes());
+            for n in &nicks {
+                encode_str(&mut buf, n);
+            }
+        }
+    });
+    buf
+}
+
+/// Restore a package registry serialized by [`serialize`], recreating each
+/// package and its nicknames. Additive over the standard packages seeded on
+/// first use.
+pub fn restore(data: &[u8]) -> Result<(), BlissError> {
+    let mut pos = 0usize;
+    let count = read_u32(data, &mut pos)? as usize;
+    for _ in 0..count {
+        let primary = read_str(data, &mut pos)?;
+        let _ = find_or_create(&primary);
+        let nick_count = read_u32(data, &mut pos)? as usize;
+        for _ in 0..nick_count {
+            let nick = read_str(data, &mut pos)?;
+            add_nickname(&primary, &nick);
+        }
+    }
+    Ok(())
+}
+
+fn encode_str(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, BlissError> {
+    let end = pos
+        .checked_add(4)
+        .filter(|&e| e <= data.len())
+        .ok_or_else(|| BlissError::Internal("truncated package image section".into()))?;
+    let v = u32::from_le_bytes(data[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(v)
+}
+
+fn read_str(data: &[u8], pos: &mut usize) -> Result<String, BlissError> {
+    let len = read_u32(data, pos)? as usize;
+    let end = pos
+        .checked_add(len)
+        .filter(|&e| e <= data.len())
+        .ok_or_else(|| BlissError::Internal("truncated package image string".into()))?;
+    let s = String::from_utf8_lossy(&data[*pos..end]).into_owned();
+    *pos = end;
+    Ok(s)
 }
 
 #[cfg(test)]

@@ -2588,21 +2588,20 @@ pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
 }
 
 pub fn serialize_symbols() -> Vec<u8> {
-    byte_store("symbols").lock().unwrap().clone()
+    // Real symbol-table identity serialization (bliss-jtc.6 Stage F).
+    crate::symbols::serialize()
 }
 
 pub fn restore_symbols(data: &[u8]) -> Result<(), BlissError> {
-    *byte_store("symbols").lock().unwrap() = data.to_vec();
-    Ok(())
+    crate::symbols::restore(data)
 }
 
 pub fn serialize_packages() -> Vec<u8> {
-    byte_store("packages").lock().unwrap().clone()
+    crate::packages::serialize()
 }
 
 pub fn restore_packages(data: &[u8]) -> Result<(), BlissError> {
-    *byte_store("packages").lock().unwrap() = data.to_vec();
-    Ok(())
+    crate::packages::restore(data)
 }
 
 pub fn serialize_code_cache() -> Vec<u8> {

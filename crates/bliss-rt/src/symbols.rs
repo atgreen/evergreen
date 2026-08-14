@@ -25,6 +25,7 @@
 //! migrate those bindings into the cells (Stage C), route packages through real
 //! `PACKAGE` objects (Stage D), and persist the table in images (Stage F).
 
+use crate::error::BlissError;
 use crate::object::{type_id, ObjectHeader, SymbolData};
 use crate::value::{BlissVal, NIL, UNBOUND};
 use std::collections::HashMap;
@@ -232,6 +233,78 @@ pub(crate) fn for_each_root_slot(mut f: impl FnMut(*mut BlissVal)) {
     for &obj in reg.uninterned.values() {
         visit(obj);
     }
+}
+
+// ── Image serialization (bliss-jtc.6 Stage F) ───────────────────────────────
+
+/// Serialize the interned symbol table's identity: the interned names in index
+/// order, length-prefixed. Re-interning them in order on restore reconstructs
+/// the same index→symbol mapping, so a `from_symbol_index(i)` saved in an image
+/// still names the same symbol after reload.
+///
+/// This persists symbol *identity*, not the value/function/plist cell contents —
+/// those reference arbitrary heap objects and belong to whole-heap image
+/// serialization. Uninterned (gensym) symbols are process-local and skipped.
+pub fn serialize() -> Vec<u8> {
+    let mut buf = Vec::new();
+    with_registry(|reg| {
+        let names: Vec<String> = match reg {
+            Some(r) => r
+                .interned
+                .iter()
+                .map(|&obj| {
+                    // SAFETY: registry entries are pinned live symbols.
+                    unsafe { (*symbol_data(obj)).name }.as_string()
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        for name in &names {
+            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+        }
+    });
+    buf
+}
+
+/// Restore an interned symbol table serialized by [`serialize`]. Intended for a
+/// fresh runtime (image load): the current interned table is reset, then the
+/// saved names are re-interned in order so indices match the saved image. The
+/// previously-interned objects (if any) are dropped from the registry (they are
+/// pinned/immortal, so this leaks them — acceptable for a one-shot image load).
+pub fn restore(data: &[u8]) -> Result<(), BlissError> {
+    let names = decode_names(data)?;
+    with_registry_mut(|reg| {
+        reg.interned.clear();
+        reg.uninterned.clear();
+        reg.name_to_index.clear();
+    });
+    for name in names {
+        intern(&name);
+    }
+    Ok(())
+}
+
+/// Decode a `[u32 count][u32 len, bytes]*` blob into names.
+fn decode_names(data: &[u8]) -> Result<Vec<String>, BlissError> {
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, n: usize| -> Result<&[u8], BlissError> {
+        let end = pos.checked_add(n).filter(|&e| e <= data.len()).ok_or_else(|| {
+            BlissError::Internal("truncated symbol-table image section".into())
+        })?;
+        let slice = &data[*pos..end];
+        *pos = end;
+        Ok(slice)
+    };
+    let count = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+    let mut names = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+        let bytes = take(&mut pos, len)?;
+        names.push(String::from_utf8_lossy(bytes).into_owned());
+    }
+    Ok(names)
 }
 
 // ── Cell accessors (used by later staging; symbols carry their own cells) ────
