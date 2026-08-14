@@ -14,6 +14,16 @@
 use bliss_rt::gc::{WeakPointer, heap_stats, init_heap, register_finalizer, walk_heap};
 use bliss_rt::runtime::{Runtime, RuntimeConfig};
 use bliss_rt::value::{BlissVal, TAG_HEAP_OBJECT};
+use std::sync::{Mutex, OnceLock};
+
+/// Serialize every test that touches the process-global heap. The heap is a
+/// single OnceLock<Mutex<Option<HeapState>>>; running Runtime::init / GC /
+/// alloc concurrently across the cargo test-harness threads races (no GC
+/// safepoints), which SIGSEGVs. Matches spec_gc_pinning.rs / spec_memory_gc.rs.
+fn lock() -> &'static Mutex<()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+}
 
 /// Helper: create a Runtime with a small heap for integration tests.
 fn make_test_runtime() -> Runtime {
@@ -42,6 +52,7 @@ fn fake_heap_object_val() -> BlissVal {
 
 #[test]
 fn runtime_init_initialises_gc_heap() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     let _rt = make_test_runtime();
     let s = heap_stats();
     // Order-independent: after any Runtime::init, capacities must be positive.
@@ -61,6 +72,7 @@ fn runtime_init_initialises_gc_heap() {
 
 #[test]
 fn runtime_init_sets_positive_region_count() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     let _rt = make_test_runtime();
     let s = heap_stats();
     // Invariant: regions_total should be at least 1 regardless of config.
@@ -72,6 +84,7 @@ fn runtime_init_sets_positive_region_count() {
 
 #[test]
 fn heap_stats_fresh_runtime_zero_gc_counts() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // After init, no GC should have run yet.
     let _rt = make_test_runtime();
     let s = heap_stats();
@@ -89,6 +102,7 @@ fn heap_stats_fresh_runtime_zero_gc_counts() {
 
 #[test]
 fn heap_stats_fresh_runtime_zero_bytes() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     let _rt = make_test_runtime();
     let s = heap_stats();
     assert_eq!(
@@ -103,6 +117,7 @@ fn heap_stats_fresh_runtime_zero_bytes() {
 
 #[test]
 fn heap_stats_fresh_runtime_all_regions_free() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     let _rt = make_test_runtime();
     let s = heap_stats();
     // Invariant: on a fresh heap, all regions should be free.
@@ -114,6 +129,7 @@ fn heap_stats_fresh_runtime_all_regions_free() {
 
 #[test]
 fn heap_stats_nursery_plus_old_gen_equals_total_capacity() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // Invariant: nursery + old_gen capacity should equal the total heap.
     let _rt = make_test_runtime();
     let s = heap_stats();
@@ -125,6 +141,7 @@ fn heap_stats_nursery_plus_old_gen_equals_total_capacity() {
 
 #[test]
 fn runtime_gc_config_satisfies_init_heap_preconditions() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut cfg = RuntimeConfig::from_env().expect("from_env");
     cfg.heap_size = 8 * 1024 * 1024;
     cfg.nursery_size = 2 * 1024 * 1024;
@@ -150,6 +167,7 @@ fn runtime_gc_config_satisfies_init_heap_preconditions() {
 
 #[test]
 fn eval_on_runtime_returns_result_without_panic() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // Exercise the runtime's eval path end-to-end.
     // In the bootstrap, eval returns NIL. When the full compiler is
     // wired up, this will actually allocate cons cells and verify
@@ -161,6 +179,7 @@ fn eval_on_runtime_returns_result_without_panic() {
 
 #[test]
 fn bytes_allocated_after_eval_is_non_negative() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // After evaluating forms, bytes_allocated should be >= 0.
     // When the real compiler allocates cons cells, this will verify
     // that bytes_allocated increases.
@@ -185,6 +204,7 @@ fn bytes_allocated_after_eval_is_non_negative() {
 
 #[test]
 fn weak_pointer_to_heap_object_initially_not_broken() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // Create a WeakPointer to a heap-object-tagged value and verify
     // it starts in the non-broken state.
     let _rt = make_test_runtime();
@@ -197,6 +217,7 @@ fn weak_pointer_to_heap_object_initially_not_broken() {
 
 #[test]
 fn weak_pointer_breaks_after_gc_collects_referent() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // This tests the core weak-pointer contract: after GC collects the
     // referent, value() returns (NIL, true).
     //
@@ -234,6 +255,7 @@ fn weak_pointer_breaks_after_gc_collects_referent() {
 
 #[test]
 fn multiple_weak_pointers_to_same_heap_object() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // When GC collects a heap object, ALL weak pointers to it must break.
     // For now, verify that multiple WeakPointers to the same value all
     // start non-broken and return the correct referent.
@@ -266,6 +288,7 @@ fn multiple_weak_pointers_to_same_heap_object() {
 
 #[test]
 fn walk_heap_after_runtime_init_succeeds() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // After Runtime::init, walk_heap should succeed (return Ok).
     // On a fresh heap with no allocations, the callback may not be
     // invoked — that's correct per the walk_heap contract.
@@ -287,6 +310,7 @@ fn walk_heap_after_runtime_init_succeeds() {
 
 #[test]
 fn walk_heap_after_eval_succeeds() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // After evaluating forms that allocate objects, walk_heap should
     // visit the allocated objects. In bootstrap, eval doesn't allocate
     // into the region-based heap, so the callback may not fire.
@@ -317,6 +341,7 @@ fn walk_heap_after_eval_succeeds() {
 
 #[test]
 fn register_finalizer_on_heap_object_succeeds() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // Smoke test: register_finalizer should accept a heap-object-tagged
     // value and return Ok. This does not verify that the finalizer is
     // invoked on collection — that requires a runtime GC trigger.
@@ -331,6 +356,7 @@ fn register_finalizer_on_heap_object_succeeds() {
 
 #[test]
 fn register_finalizer_multiple_times_replaces_previous() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // Re-registering a finalizer on the same object should succeed;
     // the latest registration wins.
     let _rt = make_test_runtime();
@@ -341,6 +367,7 @@ fn register_finalizer_multiple_times_replaces_previous() {
 
 #[test]
 fn register_finalizer_lifecycle_smoke_test() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // Smoke test: register a finalizer, then verify the runtime can
     // continue operating normally. This does NOT verify that the
     // finalizer is invoked on collection — that requires:
@@ -364,6 +391,7 @@ fn register_finalizer_lifecycle_smoke_test() {
 
 #[test]
 fn runtime_init_eval_shutdown_lifecycle() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // End-to-end test: init → eval → shutdown.
     // Verifies the complete runtime lifecycle works without panics
     // and that GC state remains consistent throughout.
@@ -394,6 +422,7 @@ fn runtime_init_eval_shutdown_lifecycle() {
 
 #[test]
 fn runtime_eval_does_not_corrupt_heap_stats() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // After multiple eval calls, heap_stats should return consistent values.
     let mut rt = make_test_runtime();
 

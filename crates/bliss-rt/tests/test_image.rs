@@ -1,5 +1,15 @@
 use bliss_rt::gc;
 use bliss_rt::image::*;
+use std::sync::{Mutex, OnceLock};
+
+/// Serialize every test that touches the process-global heap (init_heap,
+/// record_object, restore_heap, save_image). The heap is a single
+/// OnceLock<Mutex<Option<HeapState>>>; concurrent mutation across the cargo
+/// test-harness threads races and can SIGSEGV. Matches spec_gc_pinning.rs.
+fn lock() -> &'static Mutex<()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+}
 
 #[test]
 fn arch_and_os_repr_values() {
@@ -141,6 +151,7 @@ fn validate_image_header_bad_magic_fails() {
 
 #[test]
 fn save_image_returns_result() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = "/tmp/bliss_test_save_image.bimg";
     let opts = SaveImageOptions {
         executable: false,
@@ -159,6 +170,7 @@ fn save_image_returns_result() {
 
 #[test]
 fn save_image_with_compression() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     let path = "/tmp/bliss_test_save_image_zstd.bimg";
     let opts = SaveImageOptions {
         executable: true,
@@ -189,6 +201,7 @@ fn find_appended_image_returns_result() {
 
 #[test]
 fn save_load_roundtrip_preserves_heap_objects() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     // Initialize the heap so objects can be recorded.
     let config = gc::GcConfig {
         heap_size: 64 * 1024 * 1024,
@@ -277,6 +290,7 @@ fn save_load_roundtrip_preserves_heap_objects() {
 
 #[test]
 fn save_load_roundtrip_with_compression() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     let config = gc::GcConfig {
         heap_size: 64 * 1024 * 1024,
         heap_max: 256 * 1024 * 1024,
