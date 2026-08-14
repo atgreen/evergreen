@@ -4997,6 +4997,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return bliss_stdlib::elt(seq, idx.as_fixnum() as usize);
             }
+            "AREF" | "SVREF" | "ROW-MAJOR-AREF" => {
+                // One-dimensional array/vector/string access — delegates to elt.
+                let args = list_to_vec(cdr);
+                if args.len() != 2 {
+                    return Err(BlissError::ProgramError(format!(
+                        "{}: only one-dimensional arrays are supported",
+                        name
+                    )));
+                }
+                let arr = eval_form(args[0], env)?;
+                let idx = eval_form(args[1], env)?;
+                if !idx.is_fixnum() || idx.as_fixnum() < 0 {
+                    return Err(BlissError::TypeError {
+                        datum: idx,
+                        expected: "non-negative array index".into(),
+                    });
+                }
+                return bliss_stdlib::elt(arr, idx.as_fixnum() as usize);
+            }
             "APPEND" => {
                 let mut all = Vec::new();
                 let items = list_to_vec(cdr);
