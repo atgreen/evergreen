@@ -628,54 +628,6 @@ thread_local! {
 
 static MACRO_FUNCTION_HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-thread_local! {
-    /// Host (Rust) stack address of the outermost interpreter call, captured
-    /// lazily. Interpreted CL activations live on the Rust stack in the current
-    /// tree-walker (see §2.4.4 / bliss-nmq), so we bound how far below this base
-    /// recursion may grow.
-    static EVAL_STACK_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Byte budget below `EVAL_STACK_BASE`; 0 until first initialised from
-    /// `bliss_rt::eval_stack_budget()`.
-    static EVAL_STACK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Guard interpreter recursion so runaway CL recursion raises a catchable
-/// `STORAGE-CONDITION` (via `BlissError::StackOverflow` → the preallocated pool)
-/// instead of overflowing the native stack into a process-killing `SIGSEGV`
-/// (R2.20). Called at each CL call boundary (`eval_lambda_call`). The stack
-/// grows downward, so depth below the captured base is `base - current_sp`.
-///
-/// Interim measure for the Rust-stack tree-walker; superseded once activations
-/// move onto the per-green-thread `BlissStack` (bliss-nmq).
-#[inline]
-fn check_eval_stack_depth() -> Result<(), BlissError> {
-    let probe = 0u8;
-    let sp = std::ptr::addr_of!(probe) as usize;
-    let base = EVAL_STACK_BASE.with(|b| {
-        let cur = b.get();
-        if cur == 0 {
-            b.set(sp);
-            sp
-        } else {
-            cur
-        }
-    });
-    let limit = EVAL_STACK_LIMIT.with(|l| {
-        let cur = l.get();
-        if cur == 0 {
-            let v = bliss_rt::eval_stack_budget();
-            l.set(v);
-            v
-        } else {
-            cur
-        }
-    });
-    if base.saturating_sub(sp) > limit {
-        return Err(BlissError::StackOverflow(bliss_rt::GreenThreadId(0)));
-    }
-    Ok(())
-}
-
 fn next_control_token(prefix: &str) -> String {
     let id = CONTROL_COUNTER.with(|counter| {
         let id = *counter.borrow();
@@ -2112,7 +2064,11 @@ fn eval_lambda_call(
     args: &[BlissVal],
     parent: Rc<RefCell<EnvFrame>>,
 ) -> Result<BlissVal, BlissError> {
-    check_eval_stack_depth()?;
+    // The interim host-stack depth guard (commit ddba528) is retired (nmq.6):
+    // with the bytecode backend the default, deep recursion runs on the
+    // per-green-thread BlissStack and is bounded by BLISS_STACK_SIZE, raising a
+    // catchable STORAGE-CONDITION (R2.20). This tree-walker path is now the
+    // fallback for forms the compiler does not yet handle.
     with_child_frame(env, parent, |env| {
         bind_lambda_list(params_form, args, env)?;
         // Arguments are a single-value context; a producer evaluated as an

@@ -234,6 +234,19 @@ const CORPUS: &[&str] = &[
     "(defun countdown (n) (format nil \"~a \" n) (if (> n 0) (countdown (- n 1)) (quote done))) (countdown 3)",
     "(format nil \"~d items and ~a\" 5 (quote x))",
     "(princ-to-string 42)",
+    // ── declare / the / locally (nmq.6) ──
+    "(defun f (x) (declare (ignore x)) 5) (f 99)",
+    "(the integer (+ 1 2))",
+    "(locally (declare (optimize speed)) (+ 3 4))",
+    "(handler-case (car 5) (error (e) (declare (ignore e)) (quote caught)))",
+];
+
+/// Full programs whose deep recursion must raise a catchable STORAGE-CONDITION
+/// through the default (bytecode) backend — proving the retired host-SP guard is
+/// not needed for compiled recursion (it is BlissStack-bounded).
+const GUARD_FREE_STORAGE_CONDITION: &[&str] = &[
+    "(handler-case (labels ((f (n) (+ 1 (f (+ n 1))))) (f 0)) (storage-condition (e) (declare (ignore e)) :caught))",
+    "(handler-case (labels ((f () (f))) (f)) (condition (e) (declare (ignore e)) :caught))",
 ];
 
 /// Full programs whose deep recursion must be bounded by the BlissStack
@@ -304,6 +317,24 @@ fn deep_recursion_raises_catchable_storage_condition() {
         assert!(
             out.contains("CAUGHT"),
             "deep recursion should be caught as STORAGE-CONDITION for {program}, got: {out:?}"
+        );
+    }
+    // The interim host-SP guard is retired (nmq.6); these must still be caught
+    // via the BlissStack bound on the default backend, exiting cleanly.
+    for program in GUARD_FREE_STORAGE_CONDITION {
+        let out = Command::new(BIN)
+            .arg("--eval")
+            .arg(program)
+            .output()
+            .expect("spawn");
+        assert!(
+            out.status.success(),
+            "guard-free deep recursion should be caught (exit 0), not abort: {program}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).to_uppercase().contains("CAUGHT"),
+            "storage-condition must fire for {program}: {}",
+            String::from_utf8_lossy(&out.stdout)
         );
     }
 }

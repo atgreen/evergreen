@@ -562,6 +562,24 @@ impl<'e> Lowerer<'e> {
                 "COND" => self.lower_cond(rest),
                 "CASE" => self.lower_case(rest),
                 "PROGN" => self.lower_progn(rest),
+                // Declarations are no-ops at runtime; yield NIL.
+                "DECLARE" => {
+                    let c = self.add_const(NIL);
+                    self.emit(Instr::Const(c));
+                    self.push_n(1);
+                    Ok(())
+                }
+                // (the type expr) — evaluate expr, ignore the type declaration.
+                "THE" => {
+                    let (_type, r) = cp(rest);
+                    if r.is_cons() {
+                        self.lower_expr(cp(r).0)
+                    } else {
+                        Err(Bail)
+                    }
+                }
+                // (locally decl... body...) — declarations lower to NIL no-ops.
+                "LOCALLY" => self.lower_progn(rest),
                 "LET" => self.lower_let(rest, false),
                 "LET*" => self.lower_let(rest, true),
                 "SETQ" => self.lower_setq(rest),
@@ -1865,9 +1883,6 @@ fn is_bail_special(name: &str) -> bool {
             | "DEFCONSTANT"
             | "MACROLET"
             | "SYMBOL-MACROLET"
-            | "THE"
-            | "LOCALLY"
-            | "DECLARE"
             | "EVAL-WHEN"
             | "LOAD-TIME-VALUE"
             | "PROGV"
