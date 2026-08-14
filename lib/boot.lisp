@@ -33,6 +33,11 @@
   (declare (ignore doc))
   `(setq ,name ,value))
 
+;; Fixnums are 61-bit signed (BlissVal tags the low 3 bits): the value is
+;; stored as n<<3, so the representable range is [-2^60, 2^60-1].
+(defconstant most-positive-fixnum 576460752303423487)
+(defconstant most-negative-fixnum -576460752303423488)
+
 ;;; ---------------------------------------------------------------------------
 ;;; Sequencing
 ;;; ---------------------------------------------------------------------------

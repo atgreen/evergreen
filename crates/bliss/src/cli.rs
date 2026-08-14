@@ -4530,6 +4530,39 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 return Ok(if v.is_symbol() { T } else { NIL });
             }
+            "FBOUNDP" => {
+                let (sf, _) = cp(cdr);
+                let sym = eval_form(sf, env)?;
+                let name = if sym.is_symbol() {
+                    sym_name(sym)
+                } else {
+                    val_as_str(sym)
+                };
+                // A name is fbound if it resolves as an ordinary function,
+                // a generic function, or a macro.
+                let bound = fn_bound(env, &name)
+                    || env.methods.contains_key(&name)
+                    || env.generics.contains_key(&name)
+                    || env.macros.contains_key(&name);
+                return Ok(if bound { T } else { NIL });
+            }
+            "FMAKUNBOUND" => {
+                let (sf, _) = cp(cdr);
+                let sym = eval_form(sf, env)?;
+                let name = if sym.is_symbol() {
+                    sym_name(sym)
+                } else {
+                    val_as_str(sym)
+                };
+                // Clear the global heap function cell and the lexical/name-map
+                // and macro entries, so the name is no longer fbound.
+                if let Some(idx) = bliss_rt::symbols::find_index(&name) {
+                    bliss_rt::symbols::set_symbol_function(idx, bliss_rt::value::UNBOUND);
+                }
+                Rc::make_mut(&mut env.funs).remove(&name);
+                Rc::make_mut(&mut env.macros).remove(&name);
+                return Ok(sym);
+            }
             "CHAR-CODE" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
