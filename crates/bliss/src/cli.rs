@@ -2826,6 +2826,8 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
     let chars: Vec<char> = source.chars().collect();
     let mut pos = 0;
     let mut last = NIL;
+    let trace = std::env::var("BLISS_LOAD_TRACE").is_ok();
+    let mut form_no = 0usize;
     loop {
         while pos < chars.len() && chars[pos].is_ascii_whitespace() {
             pos += 1;
@@ -2837,6 +2839,11 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
         let (val, consumed) = read_next_form(&remaining, env)?;
         if val == EOF {
             break;
+        }
+        if trace {
+            form_no += 1;
+            let snippet: String = remaining.chars().take(70).collect();
+            eprintln!("[LOADTRACE {form_no}] {}", snippet.replace('\n', " "));
         }
         last = bytecode::eval_toplevel(val, env)?;
         pos += consumed;
