@@ -12,8 +12,8 @@
 use bliss_rt::error::BlissError;
 use bliss_rt::value::{BlissVal, NIL, TAG_SYMBOL};
 use crate::clos::{
-    bootstrap_clos, class_direct_superclasses, class_name, class_of, define_class, find_class,
-    make_instance,
+    allocate_instance_pinned_gc, bootstrap_clos, class_direct_superclasses, class_name, class_of,
+    define_class, find_class, initialize_instance, make_instance,
 };
 use crate::streams::make_lisp_string_fresh;
 
@@ -273,7 +273,12 @@ fn initialize_storage_condition_pool() -> Result<(), BlissError> {
     let class = ensure_condition_class(SYMBOL_STORAGE_CONDITION)?;
     let mut pool = [NIL; STORAGE_CONDITION_POOL_SIZE];
     for entry in &mut pool {
-        *entry = make_instance(class, &[])?;
+        // D5.13 (bliss-4v8): the pool lives in the GC heap, pinned, so a moving
+        // collection never relocates or frees these preallocated instances — the
+        // acquire path hands out raw addresses on the storage-exhaustion path.
+        let inst = allocate_instance_pinned_gc(class)?;
+        initialize_instance(inst, &[])?;
+        *entry = inst;
     }
     STATE.with(|s| {
         let mut state = s.borrow_mut();

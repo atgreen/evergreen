@@ -577,3 +577,47 @@ fn clos_and_conditions_top_level_entrypoints_compose_in_an_acceptance_scenario()
     assert_eq!(result.unwrap(), instance);
     assert_eq!(observed.lock().unwrap().len(), 1);
 }
+
+/// The STORAGE-CONDITION pool lives in the GC heap, pinned, so a collection never
+/// moves or frees its preallocated instances (bliss-4v8 / D5.13). After a full
+/// GC the same instances come back at the same addresses, still valid.
+#[test]
+fn storage_condition_pool_is_pinned_in_gc_heap_and_survives_collection() {
+    reset_state();
+    conditions::initialize_condition_runtime_support().unwrap();
+
+    // Snapshot the four pinned pool instances (acquire rotates through them in
+    // order, so acquiring exactly four yields the whole pool).
+    let before: Vec<BlissVal> = (0..4)
+        .map(|_| conditions::acquire_preallocated_storage_condition().unwrap())
+        .collect();
+    for c in &before {
+        assert_ne!(*c, NIL);
+        assert_eq!(
+            class_name(class_of(*c)),
+            sym(conditions::SYMBOL_STORAGE_CONDITION)
+        );
+    }
+
+    // Churn the heap and force a full GC (minor + major). The pool is pinned, so
+    // it must survive unmoved even as other objects are evacuated.
+    for _ in 0..500 {
+        let _ = bliss_rt::alloc_typed(16, bliss_rt::object::type_id::CONS);
+    }
+    bliss_rt::full_gc().expect("full_gc");
+
+    let after: Vec<BlissVal> = (0..4)
+        .map(|_| conditions::acquire_preallocated_storage_condition().unwrap())
+        .collect();
+    assert_eq!(
+        before, after,
+        "pinned pool instances kept their exact addresses across a full GC"
+    );
+    for c in &after {
+        assert_eq!(
+            class_name(class_of(*c)),
+            sym(conditions::SYMBOL_STORAGE_CONDITION),
+            "pool instance is still a valid STORAGE-CONDITION after GC"
+        );
+    }
+}

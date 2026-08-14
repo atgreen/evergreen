@@ -908,6 +908,59 @@ pub fn allocate_instance(class: BlissVal) -> Result<BlissVal, BlissError> {
     }
 }
 
+/// Allocate a CLOS instance of `class` on the shared GC heap and pin it, so the
+/// collector never moves or frees it (bliss-4v8 / D5.13). Used for the immortal
+/// STORAGE-CONDITION pool: its preallocated instances must keep their addresses
+/// forever, even across a moving collection. Layout and slot initialization are
+/// identical to [`allocate_instance`]; only the backing store (GC heap, pinned)
+/// differs.
+pub fn allocate_instance_pinned_gc(class: BlissVal) -> Result<BlissVal, BlissError> {
+    let (wrapper, slot_count) = with_state_mut(|st| {
+        let mut w = st
+            .class_meta
+            .get(&class)
+            .map(|m| m.wrapper)
+            .unwrap_or(std::ptr::null_mut());
+        if w.is_null() {
+            finalize_class_layout(st, class);
+            w = st
+                .class_meta
+                .get(&class)
+                .map(|m| m.wrapper)
+                .unwrap_or(std::ptr::null_mut());
+        }
+        let n = if w.is_null() {
+            0
+        } else {
+            unsafe { (*w).slot_count as usize }
+        };
+        (w, n)
+    });
+    if wrapper.is_null() {
+        return Err(BlissError::Internal(
+            "cannot allocate an instance of a class with no slot layout".into(),
+        ));
+    }
+    let size = 16 + 8 * slot_count;
+    debug_assert!(size / 8 <= 0xFFFE, "instance too large for header size field");
+    // The GC allocator writes an 8-byte STANDARD_OBJECT header and returns the
+    // body pointer; the instance value points at the header (body − 8).
+    let body = bliss_rt::gc::alloc_typed(size - 8, type_id::STANDARD_OBJECT)
+        .ok_or_else(|| BlissError::Internal("GC heap unavailable for pooled instance".into()))?;
+    unsafe {
+        let ptr = body.sub(8);
+        let inst = BlissVal::from_heap_ptr(ptr);
+        set_instance_wrapper(inst, wrapper);
+        for i in 0..slot_count {
+            *slot_cell(inst, i) = UNBOUND;
+        }
+        with_state_mut(|st| st.live_instances.insert(inst));
+        // Pin so the collector never moves or frees this pooled instance.
+        bliss_rt::gc::pin(inst);
+        Ok(inst)
+    }
+}
+
 /// Make an instance (MAKE-INSTANCE). R5.12.
 pub fn make_instance(class: BlissVal, initargs: &[BlissVal]) -> Result<BlissVal, BlissError> {
     with_state(|st| {
