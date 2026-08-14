@@ -5432,6 +5432,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pathname = eval_form(pathname_form, env)?;
                 return Ok(bliss_stdlib::pathname_version(pathname));
             }
+            "WILD-PATHNAME-P" => {
+                // (wild-pathname-p pathname &optional field-key)
+                let args = list_to_vec(cdr);
+                let pathname = if args.is_empty() {
+                    NIL
+                } else {
+                    eval_form(args[0], env)?
+                };
+                let field = if args.len() > 1 {
+                    Some(eval_form(args[1], env)?)
+                } else {
+                    None
+                };
+                return Ok(if bliss_stdlib::wild_pathname_p(pathname, field) {
+                    T
+                } else {
+                    NIL
+                });
+            }
             "STRING" => {
                 // (string x): a string is returned as-is; a symbol yields its
                 // bare SYMBOL-NAME (no package prefix); a character yields a
