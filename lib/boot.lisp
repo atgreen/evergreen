@@ -312,27 +312,23 @@
         (push x result)))
     (reverse result)))
 
-(defun remove (item seq &key key test test-not (start 0) end count)
-  ;; Honour :key/:test/:test-not (the stdlib helper could not invoke an
-  ;; interpreter function and silently ignored them); see bliss-0l1.  Operates
-  ;; over a list view and returns a fresh list, matching the previous behaviour.
+(defun remove (item seq &key key test test-not (start 0) end count from-end)
+  ;; Honour :key/:test/:test-not/:start/:end/:count/:from-end.  Operates over a
+  ;; list view and returns a fresh sequence of the same type as SEQ.  When
+  ;; :count limits removals, :from-end selects the trailing matches rather than
+  ;; the leading ones (CLHS 17.3).  See bliss-0l1.
   (let* ((items (coerce seq 'list))
          (testfn (or test test-not #'eql))
          (neg (if test-not t nil))
-         (stop (or end (length items)))
+         (chosen (%match-positions
+                  (lambda (x) (%seq-match item x key testfn neg))
+                  items start end count from-end))
          (result nil)
-         (removed 0)
          (i 0))
     (dolist (x items)
-      (if (and (>= i start)
-               (< i stop)
-               (or (null count) (< removed count))
-               (let ((r (funcall testfn item (if key (funcall key x) x))))
-                 (if neg (not r) r)))
-          (incf removed)
-          (push x result))
+      (unless (member i chosen) (push x result))
       (incf i))
-    (reverse result)))
+    (%coerce-like (reverse result) seq)))
 
 (defun remove-if (pred seq &rest keys)
   (declare (ignore keys))
@@ -715,8 +711,18 @@
 (defun alphanumericp (c)
   (or (alpha-char-p c) (and (>= (char-code c) 48) (<= (char-code c) 57))))
 
-(defun string-upcase (s) (map 'string (function char-upcase) (string s)))
-(defun string-downcase (s) (map 'string (function char-downcase) (string s)))
+;; STRING-UPCASE / STRING-DOWNCASE honour the bounding indices :START/:END,
+;; transforming only characters in that half-open range and copying the rest.
+(defun string-upcase (s &key (start 0) end)
+  (let* ((str (string s)) (stop (or end (length str))) (i 0) (res nil))
+    (dolist (c (coerce str 'list) (coerce (reverse res) 'string))
+      (push (if (and (>= i start) (< i stop)) (char-upcase c) c) res)
+      (incf i))))
+(defun string-downcase (s &key (start 0) end)
+  (let* ((str (string s)) (stop (or end (length str))) (i 0) (res nil))
+    (dolist (c (coerce str 'list) (coerce (reverse res) 'string))
+      (push (if (and (>= i start) (< i stop)) (char-downcase c) c) res)
+      (incf i))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Additional list functions.
@@ -789,3 +795,700 @@
         ((consp tree) (cons (subst new old (car tree))
                             (subst new old (cdr tree))))
         (t tree)))
+
+;;; ===========================================================================
+;;; Conformance layer: sequence/list/string/number/control functions that were
+;;; missing from the bootstrap prelude.  Everything here is pure Lisp on top of
+;;; the existing primitives (ELT, LENGTH, COERCE, FLOOR, REM, EXPT, ...).  The
+;;; builtin MOD is unreliable for negative arguments and MEMBER's :KEY is
+;;; broken, so these definitions avoid both (see CONFORMANCE-TODO.md).
+;;; ===========================================================================
+
+;;; --- shared helpers --------------------------------------------------------
+
+;; Return a fresh sequence of the same type as ORIG holding the elements of the
+;; list LIST.  Used to keep REMOVE/SUBSTITUTE/FILL/... type-preserving.
+(defun %coerce-like (list orig)
+  (cond ((stringp orig) (coerce list 'string))
+        ((listp orig) list)
+        (t (coerce list 'vector))))
+
+;; Does ITEM match ELT under TESTFN, with KEY applied to ELT and NEG inverting?
+(defun %seq-match (item elt key testfn neg)
+  (let ((r (funcall testfn item (if key (funcall key elt) elt))))
+    (if neg (not r) r)))
+
+;; Indices (ascending) in ITEMS where PREDFN holds, restricted to [START,STOP);
+;; when COUNT is supplied keep only COUNT of them, trailing ones if FROM-END.
+(defun %match-positions (predfn items start end count from-end)
+  (let* ((len (length items)) (stop (or end len))
+         (positions nil) (i 0))
+    (dolist (x items)
+      (when (and (>= i start) (< i stop) (funcall predfn x))
+        (push i positions))
+      (incf i))
+    (setq positions (reverse positions))
+    (if count
+        (if from-end
+            (last positions count)
+            (subseq positions 0 (min count (length positions))))
+        positions)))
+
+;; Membership test honouring KEY/TESTFN/NEG (KEY is applied to each element of
+;; LIST; ITEM is assumed already keyed by the caller).
+(defun %seq-find (item list key testfn neg)
+  (dolist (x list nil)
+    (when (%seq-match item x key testfn neg) (return t))))
+
+;;; --- list constructors / accessors -----------------------------------------
+
+(defun copy-list (list)
+  (if (consp list)
+      (cons (car list) (copy-list (cdr list)))
+      list))
+
+(defun copy-tree (tree)
+  (if (consp tree)
+      (cons (copy-tree (car tree)) (copy-tree (cdr tree)))
+      tree))
+
+(defun copy-seq (seq) (subseq seq 0))
+
+(defun list* (&rest args)
+  (if (null (cdr args))
+      (car args)
+      (cons (car args) (apply (function list*) (cdr args)))))
+
+(defun nbutlast (list &optional (n 1)) (butlast list n))
+
+(defun ldiff (list object)
+  (if (or (null list) (eql list object) (not (consp list)))
+      nil
+      (cons (car list) (ldiff (cdr list) object))))
+
+(defun tailp (object list)
+  (block nil
+    (loop
+      (when (eql object list) (return t))
+      (if (consp list) (setq list (cdr list)) (return (eql object list))))))
+
+(defun nreconc (list tail) (append (reverse list) tail))
+
+;;; --- set operations (KEY/TEST honoured via %seq-find) -----------------------
+
+(defun union (a b &key key (test (function eql)) test-not)
+  (let ((testfn (or test-not test)) (neg (if test-not t nil))
+        (result (copy-list b)))
+    (dolist (x a result)
+      (let ((kx (if key (funcall key x) x)))
+        (unless (%seq-find kx b key testfn neg)
+          (push x result))))))
+
+(defun intersection (a b &key key (test (function eql)) test-not)
+  (let ((testfn (or test-not test)) (neg (if test-not t nil)) (result nil))
+    (dolist (x a (reverse result))
+      (let ((kx (if key (funcall key x) x)))
+        (when (%seq-find kx b key testfn neg)
+          (push x result))))))
+
+(defun set-difference (a b &key key (test (function eql)) test-not)
+  (let ((testfn (or test-not test)) (neg (if test-not t nil)) (result nil))
+    (dolist (x a (reverse result))
+      (let ((kx (if key (funcall key x) x)))
+        (unless (%seq-find kx b key testfn neg)
+          (push x result))))))
+
+(defun set-exclusive-or (a b &rest keys)
+  (append (apply (function set-difference) a b keys)
+          (apply (function set-difference) b a keys)))
+
+(defun subsetp (a b &key key (test (function eql)) test-not)
+  (let ((testfn (or test-not test)) (neg (if test-not t nil)))
+    (dolist (x a t)
+      (let ((kx (if key (funcall key x) x)))
+        (unless (%seq-find kx b key testfn neg)
+          (return nil))))))
+
+;; Destructive variants are permitted to reuse structure; delegating to the
+;; non-destructive forms is a conforming implementation.
+(defun nunion (a b &rest keys) (apply (function union) a b keys))
+(defun nintersection (a b &rest keys) (apply (function intersection) a b keys))
+(defun nset-difference (a b &rest keys) (apply (function set-difference) a b keys))
+(defun nset-exclusive-or (a b &rest keys) (apply (function set-exclusive-or) a b keys))
+
+(defun adjoin (item list &key key (test (function eql)) test-not)
+  (let ((testfn (or test-not test)) (neg (if test-not t nil)))
+    (if (%seq-find (if key (funcall key item) item) list key testfn neg)
+        list
+        (cons item list))))
+
+;;; PUSHNEW now delegates to ADJOIN so :TEST/:KEY are honoured.
+(defmacro pushnew (item place &rest keys)
+  `(setf ,place (adjoin ,item ,place ,@keys)))
+
+;;; --- reverse-association and tree equality ---------------------------------
+
+(defun rassoc (item alist &key key (test (function eql)) test-not)
+  (let ((testfn (or test-not test)) (neg (if test-not t nil)))
+    (dolist (pair alist nil)
+      (when (and (consp pair) (%seq-match item (cdr pair) key testfn neg))
+        (return pair)))))
+
+(defun rassoc-if (pred alist &key key)
+  (dolist (pair alist nil)
+    (when (and (consp pair)
+               (funcall pred (if key (funcall key (cdr pair)) (cdr pair))))
+      (return pair))))
+
+(defun rassoc-if-not (pred alist &key key)
+  (dolist (pair alist nil)
+    (when (and (consp pair)
+               (not (funcall pred (if key (funcall key (cdr pair)) (cdr pair)))))
+      (return pair))))
+
+(defun %tree-equal (a b testfn neg)
+  (if (and (consp a) (consp b))
+      (and (%tree-equal (car a) (car b) testfn neg)
+           (%tree-equal (cdr a) (cdr b) testfn neg))
+      (if (or (consp a) (consp b))
+          nil
+          (let ((r (funcall testfn a b))) (if neg (not r) r)))))
+
+(defun tree-equal (a b &key (test (function eql)) test-not)
+  (%tree-equal a b (or test-not test) (if test-not t nil)))
+
+;;; --- plist removal ----------------------------------------------------------
+
+;; Returns (values NEW-PLIST FOUND-P); removes only the first matching pair.
+(defun %remf (plist indicator)
+  (let ((result nil) (found nil) (p plist))
+    (loop while (consp p) do
+      (if (and (not found) (consp (cdr p)) (eq (car p) indicator))
+          (progn (setq found t) (setq p (cddr p)))
+          (progn (push (car p) result) (setq p (cdr p)))))
+    (values (reverse result) found)))
+
+(defmacro remf (place indicator)
+  (let ((np (gensym)) (fp (gensym)))
+    `(multiple-value-bind (,np ,fp) (%remf ,place ,indicator)
+       (setf ,place ,np)
+       ,fp)))
+
+;;; --- list mapping variants --------------------------------------------------
+
+(defun maplist (fn &rest lists)
+  (let ((result nil))
+    (block nil
+      (loop
+        (when (some (function null) lists) (return))
+        (push (apply fn lists) result)
+        (setq lists (mapcar (function cdr) lists))))
+    (reverse result)))
+
+(defun mapl (fn &rest lists)
+  (let ((first (car lists)))
+    (block nil
+      (loop
+        (when (some (function null) lists) (return))
+        (apply fn lists)
+        (setq lists (mapcar (function cdr) lists))))
+    first))
+
+(defun mapcon (fn &rest lists)
+  (apply (function append) (apply (function maplist) fn lists)))
+
+;;; --- SUBST / SUBSTITUTE families -------------------------------------------
+
+(defun subst-if (new pred tree &key key)
+  (cond ((funcall pred (if key (funcall key tree) tree)) new)
+        ((consp tree) (cons (subst-if new pred (car tree) :key key)
+                            (subst-if new pred (cdr tree) :key key)))
+        (t tree)))
+
+(defun subst-if-not (new pred tree &key key)
+  (subst-if new (lambda (x) (not (funcall pred x))) tree :key key))
+
+(defun nsubst (new old tree &rest keys)
+  (declare (ignore keys))
+  (subst new old tree))
+(defun nsubst-if (new pred tree &rest keys) (apply (function subst-if) new pred tree keys))
+(defun nsubst-if-not (new pred tree &rest keys) (apply (function subst-if-not) new pred tree keys))
+
+;; Build a new sequence replacing chosen positions with NEW.
+(defun %substitute-list (new items chosen)
+  (let ((res nil) (i 0))
+    (dolist (x items (reverse res))
+      (push (if (member i chosen) new x) res)
+      (incf i))))
+
+(defun substitute (new old seq &key key (test (function eql)) test-not
+                                    (start 0) end count from-end)
+  (let* ((items (coerce seq 'list))
+         (testfn (or test-not test)) (neg (if test-not t nil))
+         (chosen (%match-positions
+                  (lambda (x) (%seq-match old x key testfn neg))
+                  items start end count from-end)))
+    (%coerce-like (%substitute-list new items chosen) seq)))
+
+(defun substitute-if (new pred seq &key key (start 0) end count from-end)
+  (let* ((items (coerce seq 'list))
+         (chosen (%match-positions
+                  (lambda (x) (funcall pred (if key (funcall key x) x)))
+                  items start end count from-end)))
+    (%coerce-like (%substitute-list new items chosen) seq)))
+
+(defun substitute-if-not (new pred seq &rest keys)
+  (apply (function substitute-if) new (lambda (x) (not (funcall pred x))) seq keys))
+
+(defun nsubstitute (new old seq &rest keys) (apply (function substitute) new old seq keys))
+(defun nsubstitute-if (new pred seq &rest keys) (apply (function substitute-if) new pred seq keys))
+(defun nsubstitute-if-not (new pred seq &rest keys) (apply (function substitute-if-not) new pred seq keys))
+
+;;; --- REMOVE-DUPLICATES (spec-faithful: default keeps last occurrence) ------
+
+(defun remove-duplicates (seq &key key (test (function eql)) test-not
+                                    from-end (start 0) end)
+  (let* ((items (coerce seq 'list)) (len (length items)) (stop (or end len))
+         (testfn (or test-not test)) (neg (if test-not t nil))
+         (res nil) (i 0))
+    (dolist (x items)
+      (let ((keep t))
+        (when (and (>= i start) (< i stop))
+          (let ((j 0) (kx (if key (funcall key x) x)))
+            (dolist (y items)
+              (when (and (/= i j) (>= j start) (< j stop)
+                         (%seq-match kx y key testfn neg))
+                (if from-end
+                    (when (< j i) (setq keep nil))
+                    (when (> j i) (setq keep nil))))
+              (incf j))))
+        (when keep (push x res)))
+      (incf i))
+    (%coerce-like (reverse res) seq)))
+
+(defun delete-duplicates (seq &rest keys)
+  (apply (function remove-duplicates) seq keys))
+
+;;; --- FILL / REPLACE / SEARCH / MISMATCH / MERGE ----------------------------
+
+(defun fill (seq item &key (start 0) end)
+  (let* ((items (coerce seq 'list)) (len (length items)) (stop (or end len))
+         (i 0) (res nil))
+    (dolist (x items)
+      (push (if (and (>= i start) (< i stop)) item x) res)
+      (incf i))
+    (%coerce-like (reverse res) seq)))
+
+(defun replace (seq1 seq2 &key (start1 0) end1 (start2 0) end2)
+  (let* ((l1 (coerce seq1 'list)) (l2 (coerce seq2 'list))
+         (e1 (or end1 (length l1))) (e2 (or end2 (length l2)))
+         (n (min (- e1 start1) (- e2 start2)))
+         (res nil) (i 0))
+    (dolist (x l1)
+      (if (and (>= i start1) (< i (+ start1 n)))
+          (push (nth (+ start2 (- i start1)) l2) res)
+          (push x res))
+      (incf i))
+    (%coerce-like (reverse res) seq1)))
+
+(defun %match-at (pat list start key testfn neg)
+  (let ((ok t) (i start))
+    (block nil
+      (dolist (p pat ok)
+        (let ((x (nth i list)))
+          (unless (%seq-match (if key (funcall key p) p) x key testfn neg)
+            (setq ok nil) (return)))
+        (incf i)))))
+
+(defun search (seq1 seq2 &key key (test (function eql)) test-not
+                              (start1 0) end1 (start2 0) end2 from-end)
+  (let* ((l1 (coerce seq1 'list)) (l2 (coerce seq2 'list))
+         (e1 (or end1 (length l1))) (e2 (or end2 (length l2)))
+         (pat (subseq l1 start1 e1)) (plen (length pat))
+         (testfn (or test-not test)) (neg (if test-not t nil))
+         (matches nil))
+    (if (= plen 0)
+        (if from-end e2 start2)
+        (progn
+          (loop for i from start2 to (- e2 plen) do
+            (when (%match-at pat l2 i key testfn neg) (push i matches)))
+          (cond ((null matches) nil)
+                (from-end (car matches))          ; largest index (pushed last)
+                (t (car (last matches))))))))      ; smallest index
+
+(defun mismatch (seq1 seq2 &key key (test (function eql)) test-not
+                                (start1 0) end1 (start2 0) end2 from-end)
+  (let* ((l1 (coerce seq1 'list)) (l2 (coerce seq2 'list))
+         (e1 (or end1 (length l1))) (e2 (or end2 (length l2)))
+         (s1 (subseq l1 start1 e1)) (s2 (subseq l2 start2 e2))
+         (n1 (length s1)) (n2 (length s2))
+         (testfn (or test-not test)) (neg (if test-not t nil)))
+    (flet ((eqp (a b)
+             (%seq-match (if key (funcall key a) a) b key testfn neg)))
+      (if from-end
+          (let ((j 0))
+            (block nil
+              (loop
+                (when (or (>= j n1) (>= j n2)) (return))
+                (unless (eqp (nth (- n1 1 j) s1) (nth (- n2 1 j) s2)) (return))
+                (incf j)))
+            (if (and (= j n1) (= j n2)) nil (+ start1 (- n1 j))))
+          (let ((i 0))
+            (block nil
+              (loop
+                (when (or (>= i n1) (>= i n2)) (return))
+                (unless (eqp (nth i s1) (nth i s2)) (return))
+                (incf i)))
+            (if (and (= i n1) (= i n2)) nil (+ start1 i)))))))
+
+(defun merge (result-type seq1 seq2 predicate &key key)
+  (let ((l1 (coerce seq1 'list)) (l2 (coerce seq2 'list)) (res nil))
+    (block nil
+      (loop
+        (cond ((null l1) (setq res (append (reverse res) l2)) (return))
+              ((null l2) (setq res (append (reverse res) l1)) (return))
+              ((funcall predicate
+                        (if key (funcall key (car l2)) (car l2))
+                        (if key (funcall key (car l1)) (car l1)))
+               (push (car l2) res) (setq l2 (cdr l2)))
+              (t (push (car l1) res) (setq l1 (cdr l1))))))
+    (coerce res result-type)))
+
+;;; --- character predicates and naming ---------------------------------------
+
+(defun char-int (c) (char-code c))
+(defun both-case-p (c) (or (upper-case-p c) (lower-case-p c)))
+(defun standard-char-p (c)
+  (let ((code (char-code c)))
+    (or (= code 10) (and (>= code 32) (< code 127)))))
+(defun graphic-char-p (c)
+  (let ((code (char-code c)))
+    (or (= code 32) (and (> code 32) (< code 127)) (>= code 160))))
+
+(defun %char-key (c) (char-code (char-upcase c)))
+
+;; Case-insensitive character comparisons.  EQUAL/NOT-EQUAL require all/none of
+;; the arguments equal; the ordered comparisons require a monotonic chain.
+(defun %char-chain (fn cs)
+  (if (or (null cs) (null (cdr cs)))
+      t
+      (and (funcall fn (car cs) (cadr cs)) (%char-chain fn (cdr cs)))))
+
+(defun char-equal (&rest cs)
+  (%char-chain (lambda (a b) (= (%char-key a) (%char-key b))) cs))
+(defun char-lessp (&rest cs)
+  (%char-chain (lambda (a b) (< (%char-key a) (%char-key b))) cs))
+(defun char-greaterp (&rest cs)
+  (%char-chain (lambda (a b) (> (%char-key a) (%char-key b))) cs))
+(defun char-not-greaterp (&rest cs)
+  (%char-chain (lambda (a b) (<= (%char-key a) (%char-key b))) cs))
+(defun char-not-lessp (&rest cs)
+  (%char-chain (lambda (a b) (>= (%char-key a) (%char-key b))) cs))
+(defun char-not-equal (&rest cs)
+  ;; every pair must differ (case-insensitively).  RETURN-FROM (not RETURN)
+  ;; because the inner DOLIST establishes its own BLOCK NIL.
+  (block done
+    (loop for tail on cs do
+      (dolist (o (cdr tail))
+        (when (= (%char-key (car tail)) (%char-key o)) (return-from done nil))))
+    t))
+
+(defun digit-char (weight &optional (radix 10))
+  (if (and (integerp weight) (>= weight 0) (< weight radix) (< weight 36))
+      (if (< weight 10)
+          (code-char (+ 48 weight))
+          (code-char (+ 55 weight)))
+      nil))
+
+(defun char-name (c)
+  (let ((code (char-code c)))
+    (cond ((= code 32) "Space")
+          ((= code 10) "Newline")
+          ((= code 9) "Tab")
+          ((= code 13) "Return")
+          ((= code 12) "Page")
+          ((= code 8) "Backspace")
+          ((= code 127) "Rubout")
+          ((= code 0) "Null")
+          ((= code 7) "Bell")
+          ((= code 27) "Escape")
+          ((= code 65533) "Rubout")
+          (t nil))))
+
+(defun name-char (name)
+  (let ((n (string name)))
+    (cond ((string-equal n "Space") #\Space)
+          ((string-equal n "Newline") #\Newline)
+          ((string-equal n "Linefeed") #\Newline)
+          ((string-equal n "Tab") (code-char 9))
+          ((string-equal n "Return") (code-char 13))
+          ((string-equal n "Page") (code-char 12))
+          ((string-equal n "Backspace") (code-char 8))
+          ((string-equal n "Rubout") (code-char 127))
+          ((string-equal n "Delete") (code-char 127))
+          ((string-equal n "Null") (code-char 0))
+          ((string-equal n "Nul") (code-char 0))
+          ((string-equal n "Bell") (code-char 7))
+          ((string-equal n "Escape") (code-char 27))
+          (t nil))))
+
+;;; --- string builders and STRING-CAPITALIZE / N-string ops ------------------
+
+(defun make-string (n &key (initial-element #\Space) element-type)
+  (declare (ignore element-type))
+  (coerce (make-list n :initial-element initial-element) 'string))
+
+(defun string-capitalize (s &key (start 0) end)
+  (let* ((str (string s)) (stop (or end (length str)))
+         (res nil) (i 0) (in-word nil))
+    (dolist (c (coerce str 'list))
+      (if (and (>= i start) (< i stop))
+          (if (alphanumericp c)
+              (progn
+                (push (if in-word (char-downcase c) (char-upcase c)) res)
+                (setq in-word t))
+              (progn (push c res) (setq in-word nil)))
+          (push c res))
+      (incf i))
+    (coerce (reverse res) 'string)))
+
+;; The N-string operators cannot mutate in place here (no settable string
+;; elements), so they return a freshly transformed string.
+(defun nstring-upcase (s &rest keys) (apply (function string-upcase) s keys))
+(defun nstring-downcase (s &rest keys) (apply (function string-downcase) s keys))
+(defun nstring-capitalize (s &rest keys) (apply (function string-capitalize) s keys))
+
+;;; --- string comparison family (return mismatch index or NIL) ---------------
+
+;; Compare substrings A[sa,ea) and B[sb,eb).  Returns (values REL IDX) where REL
+;; is one of '<, '>, '= and IDX is the absolute index in A at the decision
+;; point.  FOLD requests a case-insensitive comparison.
+(defun %str-cmp (a b sa ea sb eb fold)
+  (let ((i sa) (j sb))
+    (block nil
+      (loop
+        (cond ((and (>= i ea) (>= j eb)) (return (values '= i)))
+              ((>= i ea) (return (values '< i)))
+              ((>= j eb) (return (values '> i)))
+              (t (let ((ca (char a i)) (cb (char b j)))
+                   (when fold (setq ca (char-upcase ca) cb (char-upcase cb)))
+                   (cond ((char< ca cb) (return (values '< i)))
+                         ((char< cb ca) (return (values '> i)))
+                         (t (incf i) (incf j))))))))))
+
+(defmacro %defstringcmp (name accept fold)
+  `(defun ,name (str1 str2 &key (start1 0) end1 (start2 0) end2)
+     (let ((a (string str1)) (b (string str2)))
+       (multiple-value-bind (rel idx)
+           (%str-cmp a b start1 (or end1 (length a))
+                     start2 (or end2 (length b)) ,fold)
+         (if (member rel ,accept) idx nil)))))
+
+;; Case-sensitive (STRING< / STRING> / STRING= already exist as builtins; add
+;; the remaining relational operators).
+(%defstringcmp string<= '(< =) nil)
+(%defstringcmp string>= '(> =) nil)
+(%defstringcmp string/= '(< >) nil)
+;; Case-insensitive family.
+(%defstringcmp string-lessp '(<) t)
+(%defstringcmp string-greaterp '(>) t)
+(%defstringcmp string-not-greaterp '(< =) t)
+(%defstringcmp string-not-lessp '(> =) t)
+(%defstringcmp string-not-equal '(< >) t)
+
+;;; --- integer bit operations (non-negative; see CONFORMANCE-TODO.md) --------
+
+(defun floatp (x) (typep x 'float))
+(defun integerp (x) (typep x 'integer))
+(defun rationalp (x) (or (integerp x) (typep x 'ratio)))
+(defun realp (x) (or (rationalp x) (floatp x)))
+(defun complexp (x) (typep x 'complex))
+(defun characterp (x) (typep x 'character))
+(defun functionp (x) (typep x 'function))
+
+(defun ash (n count)
+  (if (>= count 0)
+      (* n (expt 2 count))
+      (values (floor n (expt 2 (- count))))))
+
+(defun lognot (n) (- (- n) 1))
+
+;; Low bit of N, computed via floor so it is correct for negative (two's
+;; complement) operands: N - 2*floor(N/2) is 0 or 1 for any integer.
+(defun %lowbit (n) (- n (* 2 (floor n 2))))
+
+;; The two-argument bitwise kernels recurse on floor(N/2) — an arithmetic shift
+;; that realises two's-complement semantics for negatives — with base cases at 0
+;; (all zero bits above) and -1 (all one bits above).
+(defun %logand2 (a b)
+  (cond ((= a 0) 0) ((= b 0) 0)
+        ((= a -1) b) ((= b -1) a)
+        (t (+ (* 2 (%logand2 (floor a 2) (floor b 2)))
+              (if (and (= (%lowbit a) 1) (= (%lowbit b) 1)) 1 0)))))
+(defun %logior2 (a b)
+  (cond ((= a 0) b) ((= b 0) a)
+        ((= a -1) -1) ((= b -1) -1)
+        (t (+ (* 2 (%logior2 (floor a 2) (floor b 2)))
+              (if (or (= (%lowbit a) 1) (= (%lowbit b) 1)) 1 0)))))
+(defun %logxor2 (a b)
+  (cond ((= a 0) b) ((= b 0) a)
+        ((= a -1) (lognot b)) ((= b -1) (lognot a))
+        (t (+ (* 2 (%logxor2 (floor a 2) (floor b 2)))
+              (if (= (%lowbit a) (%lowbit b)) 0 1)))))
+
+(defun logand (&rest ints)
+  (if (null ints) -1 (reduce (function %logand2) ints)))
+(defun logior (&rest ints)
+  (if (null ints) 0 (reduce (function %logior2) ints)))
+(defun logxor (&rest ints)
+  (if (null ints) 0 (reduce (function %logxor2) ints)))
+(defun logeqv (&rest ints)
+  (if (null ints) -1 (lognot (apply (function logxor) ints))))
+(defun lognand (a b) (lognot (logand a b)))
+(defun lognor (a b) (lognot (logior a b)))
+(defun logandc1 (a b) (logand (lognot a) b))
+(defun logandc2 (a b) (logand a (lognot b)))
+(defun logorc1 (a b) (logior (lognot a) b))
+(defun logorc2 (a b) (logior a (lognot b)))
+
+(defun logtest (a b) (not (zerop (logand a b))))
+(defun logbitp (index n)
+  (= 1 (%lowbit (floor n (expt 2 index)))))
+
+(defun integer-length (n)
+  (cond ((< n 0) (integer-length (lognot n)))
+        ((= n 0) 0)
+        (t (1+ (integer-length (floor n 2))))))
+
+(defun logcount (n)
+  (cond ((< n 0) (logcount (lognot n)))
+        ((= n 0) 0)
+        (t (+ (rem n 2) (logcount (floor n 2))))))
+
+;;; --- byte specifiers: LDB / DPB / ... --------------------------------------
+
+(defun byte (size position) (cons size position))
+(defun byte-size (bytespec) (car bytespec))
+(defun byte-position (bytespec) (cdr bytespec))
+
+(defun ldb (bytespec integer)
+  (logand (ash integer (- (byte-position bytespec)))
+          (1- (expt 2 (byte-size bytespec)))))
+
+(defun ldb-test (bytespec integer) (not (zerop (ldb bytespec integer))))
+
+(defun mask-field (bytespec integer)
+  (* (ldb bytespec integer) (expt 2 (byte-position bytespec))))
+
+(defun dpb (newbyte bytespec integer)
+  (let* ((size (byte-size bytespec)) (pos (byte-position bytespec))
+         (mask (1- (expt 2 size))) (scale (expt 2 pos)))
+    (+ (- integer (* (ldb bytespec integer) scale))
+       (* (logand newbyte mask) scale))))
+
+(defun deposit-field (newbyte bytespec integer)
+  ;; Replace the BYTESPEC field of INTEGER with the same-position bits of
+  ;; NEWBYTE (both taken in place via MASK-FIELD).
+  (+ (- integer (mask-field bytespec integer))
+     (mask-field bytespec newbyte)))
+
+;;; --- misc numeric functions -------------------------------------------------
+
+(defun signum (n)
+  (cond ((zerop n) n)
+        ((> n 0) (if (floatp n) 1.0 1))
+        (t (if (floatp n) -1.0 -1))))
+
+(defun isqrt (n)
+  (cond ((< n 0) (error "ISQRT of a negative integer"))
+        ((< n 2) n)
+        (t (let ((x (ash 1 (ceiling (integer-length n) 2))))
+             (block nil
+               (loop
+                 (let ((y (floor (+ x (floor n x)) 2)))
+                   (if (< y x) (setq x y) (return x)))))))))
+
+;;; --- functional combinators -------------------------------------------------
+
+(defun complement (fn)
+  (lambda (&rest args) (not (apply fn args))))
+
+(defun constantly (value)
+  (lambda (&rest args) (declare (ignore args)) value))
+
+;;; --- place-mutating and control macros -------------------------------------
+
+;; PSETF: evaluate all value forms, then assign to all places (parallel).
+(defmacro psetf (&rest pairs)
+  (let ((places nil) (temps nil) (vals nil) (p pairs))
+    (loop while (consp (cdr p)) do
+      (push (car p) places)
+      (push (gensym) temps)
+      (push (cadr p) vals)
+      (setq p (cddr p)))
+    (setq places (reverse places) temps (reverse temps) vals (reverse vals))
+    `(let ,(mapcar (function list) temps vals)
+       ,@(mapcar (lambda (pl tp) (list 'setf pl tp)) places temps)
+       nil)))
+
+;; ROTATEF: each place receives the (old) value of the next; last gets first.
+(defmacro rotatef (&rest places)
+  (if (or (null places) (null (cdr places)))
+      nil
+      (let ((temps (mapcar (lambda (p) (declare (ignore p)) (gensym)) places)))
+        `(let ,(mapcar (function list) temps places)
+           ,@(mapcar (lambda (pl tp) (list 'setf pl tp))
+                     places (append (cdr temps) (list (car temps))))
+           nil))))
+
+;; SHIFTF: return the old value of the first place; shift the rest leftward and
+;; store NEWVALUE (the final argument) into the last place.
+(defmacro shiftf (&rest args)
+  (let* ((places (butlast args))
+         (newval (car (last args)))
+         (temps (mapcar (lambda (p) (declare (ignore p)) (gensym)) places)))
+    `(let ,(mapcar (function list) temps places)
+       (setf ,@(%zip-pairs places (append (cdr temps) (list newval))))
+       ,(car temps))))
+
+;;; PROG / PROG*: LET (or LET*) plus an implicit BLOCK NIL and TAGBODY.
+(defmacro prog (bindings &rest body)
+  `(block nil (let ,bindings (tagbody ,@body))))
+(defmacro prog* (bindings &rest body)
+  `(block nil (let* ,bindings (tagbody ,@body))))
+
+;;; CCASE / CTYPECASE: like ECASE / ETYPECASE but the key is a place and a
+;;; correctable STORE-VALUE restart lets the handler supply a fresh value.
+(defmacro ccase (keyplace &rest clauses)
+  (let ((value (gensym)) (top (gensym)))
+    `(block nil
+       (tagbody
+          ,top
+          (return
+            (let ((,value ,keyplace))
+              (cond
+                ,@(mapcar (lambda (clause)
+                            (let ((keys (car clause)) (body (cdr clause)))
+                              (if (consp keys)
+                                  `((or ,@(mapcar (lambda (k) `(eql ,value ',k)) keys))
+                                    ,@body)
+                                  `((eql ,value ',keys) ,@body))))
+                          clauses)
+                (t (restart-case
+                       (error 'type-error :datum ,value :expected-type t)
+                     (store-value (v) (setf ,keyplace v) (go ,top)))))))))))
+
+(defmacro ctypecase (keyplace &rest clauses)
+  (let ((value (gensym)) (top (gensym)))
+    `(block nil
+       (tagbody
+          ,top
+          (return
+            (let ((,value ,keyplace))
+              (cond
+                ,@(mapcar (lambda (clause)
+                            `((typep ,value ',(car clause)) ,@(cdr clause)))
+                          clauses)
+                (t (restart-case
+                       (error 'type-error :datum ,value :expected-type t)
+                     (store-value (v) (setf ,keyplace v) (go ,top)))))))))))
