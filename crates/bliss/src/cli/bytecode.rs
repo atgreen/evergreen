@@ -1099,6 +1099,7 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
 /// types CATCH / UNWIND / a block/tag marker). Handlers form a per-activation
 /// stack; unwinding walks them newest-first.
 #[derive(Clone)]
+#[allow(clippy::enum_variant_names)] // `HandlerCase` mirrors the tree-walker's naming
 enum Handler {
     /// `CATCH`: keyed by the control token shared with `env.catch_stack`.
     Catch { token: String, resume_bcp: u32, sp_restore: u16 },
