@@ -438,10 +438,31 @@ pub unsafe fn visit_stack_refs(fp: *const Frame, mut visit: impl FnMut(&mut Blis
         unsafe {
             let n = (*frame).num_locals as usize;
             let slots = frame.add(1) as *mut BlissVal;
+            // A compiled frame carries a GC stack map (via its CodeInfo) that says
+            // which activation slots hold references at this safepoint; an
+            // interpreter frame has no map, and every slot is a tagged BlissVal
+            // (bliss-jtc.4). Either way a marked slot is a live reference only if
+            // its tag says so, so scanning stays precise.
+            let code_info = (*frame).code_info;
+            let bitmap: Option<&[u8]> = if code_info.is_null() {
+                None
+            } else {
+                (*code_info).stack_map(0)
+            };
             for i in 0..n {
-                let slot = &mut *slots.add(i);
-                if is_heap_reference(*slot) {
-                    visit(slot);
+                let scan = match bitmap {
+                    // Compiled frame: consult the stack-map ref bitmap (bounds-
+                    // guarded against a short/stale map).
+                    Some(bm) => (i / 8) < bm.len() && (bm[i / 8] >> (i % 8)) & 1 == 1,
+                    // No map: interpreter frame (or a compiled frame with no
+                    // reference slots) — scan every slot by tag.
+                    None => true,
+                };
+                if scan {
+                    let slot = &mut *slots.add(i);
+                    if is_heap_reference(*slot) {
+                        visit(slot);
+                    }
                 }
             }
             cur = (*frame).prev_fp as *const Frame;

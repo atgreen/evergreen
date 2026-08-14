@@ -128,3 +128,59 @@ fn full_gc_with_cl_frame_refs_does_not_crash() {
     stack.pop_frame();
     rt.shutdown().ok();
 }
+
+/// A compiled frame carries a GC stack map (via its CodeInfo); the collector
+/// scans exactly the slots the map marks as references (bliss-jtc.4). Slot 0 is
+/// marked and relocates; slot 1 holds an identical pointer-shaped bit pattern but
+/// is NOT marked, so it is left untouched — proving scanning is map-driven, not
+/// tag-only.
+#[test]
+fn compiled_frame_scanned_precisely_via_gc_stack_map() {
+    use bliss_rt::stack::StackMapEntry;
+    use bliss_rt::CodeInfo;
+
+    let bitmap: &'static [u8] = Box::leak(vec![0b01u8].into_boxed_slice());
+    let entries: &'static [StackMapEntry] = Box::leak(
+        vec![StackMapEntry {
+            pc_offset: 0,
+            bytes: bitmap.as_ptr() as usize,
+            len: 1,
+        }]
+        .into_boxed_slice(),
+    );
+    let ci = CodeInfo::new(&[], entries);
+
+    let mut old = make_object(0x0E);
+    let mut newo = make_object(0x0E);
+    newo[HDR..HDR + 8].copy_from_slice(&0x00C0_FFEE_u64.to_le_bytes());
+    let old_body = unsafe { old.as_mut_ptr().add(HDR) } as usize;
+    let new_body = unsafe { newo.as_mut_ptr().add(HDR) } as usize;
+    forward(&mut old, new_body);
+
+    let stack = BlissStack::new(64 * 1024);
+    let f = stack
+        .push_frame(BlissVal::from_fixnum(0), ci as *const CodeInfo, 2, 0)
+        .unwrap();
+    let raw_word = BlissVal((old_body as u64) | TAG_HEAP);
+    unsafe {
+        let s = BlissStack::frame_slots_mut(f);
+        s[0] = BlissVal((old_body as u64) | TAG_HEAP); // reference (map bit set)
+        s[1] = raw_word; // raw pointer-shaped word (map bit clear)
+    }
+
+    unsafe { visit_stack_refs(stack.fp(), chase) };
+
+    unsafe {
+        let s = BlissStack::frame_slots_mut(f);
+        assert_eq!(
+            (s[0].0 & !0b111) as usize,
+            new_body,
+            "map-marked slot was scanned and relocated"
+        );
+        assert_eq!(
+            s[1].0, raw_word.0,
+            "map-unmarked raw slot left untouched (scanned via map, not by tag)"
+        );
+    }
+    stack.pop_frame();
+}

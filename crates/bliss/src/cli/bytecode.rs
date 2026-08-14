@@ -37,6 +37,7 @@ use bliss_compiler::macroexpand::{self as compiler_macroexpand, Environment as M
 use bliss_compiler::reader;
 use bliss_rt::error::BlissError;
 use bliss_rt::value::{BlissVal, NIL, T};
+use bliss_rt::stack::StackMapEntry;
 use bliss_rt::{CodeInfo, Frame};
 
 use super::{
@@ -3090,6 +3091,41 @@ thread_local! {
 struct NativeCode {
     entry: *const u8,
     num_slots: u16,
+    /// Validated GC stack-map metadata for this function's activation, installed
+    /// alongside the code (bliss-jtc.4). Passed into every frame the i2c adapter
+    /// pushes, so the collector scans compiled frames through the map.
+    code_info: &'static CodeInfo,
+}
+
+/// Build and register validated GC stack-map metadata for a T1 native function
+/// whose CL activation holds `num_slots` tagged BlissVal slots (bliss-jtc.4).
+/// Returns `None` if a map for the entry safepoint could not be constructed, in
+/// which case the caller MUST reject installation (R4.46: no safepoint without a
+/// stack map). Every activation slot is a tagged BlissVal, so its ref bitmap
+/// marks all `num_slots` slots (an unboxed slot would clear its bit; the T1
+/// baseline emits none). The bitmap and entry table are leaked for the lifetime
+/// of the installed code.
+fn install_stack_map(num_slots: u16) -> Option<&'static CodeInfo> {
+    let n = num_slots as usize;
+    let mut bitmap = vec![0u8; n.div_ceil(8)];
+    for i in 0..n {
+        bitmap[i / 8] |= 1 << (i % 8);
+    }
+    let bitmap: &'static [u8] = Box::leak(bitmap.into_boxed_slice());
+    let entry = StackMapEntry {
+        pc_offset: 0,
+        bytes: bitmap.as_ptr() as usize,
+        len: bitmap.len(),
+    };
+    let entries: &'static [StackMapEntry] = Box::leak(vec![entry].into_boxed_slice());
+    let ci = CodeInfo::new(&[], entries);
+    // Validate the entry safepoint (pc 0) resolves to the installed map. A frame
+    // with reference slots must have a non-empty map; a leaf frame with no
+    // reference slots legitimately has none.
+    if n > 0 && ci.stack_map(0).is_none() {
+        return None;
+    }
+    Some(ci)
 }
 
 thread_local! {
@@ -3116,7 +3152,7 @@ fn run_native(nc: &NativeCode, args: &[BlissVal], env: &mut Env) -> Result<Bliss
     let thread = bliss_rt::current_thread();
     let stack = thread.stack();
     let frame = stack
-        .push_frame(NIL, std::ptr::null::<CodeInfo>(), nc.num_slots, FLAG_CALL)
+        .push_frame(NIL, nc.code_info as *const CodeInfo, nc.num_slots, FLAG_CALL)
         .ok_or_else(|| BlissError::StackOverflow(bliss_rt::current_thread_id()))?;
     for (i, a) in args.iter().enumerate() {
         unsafe { slot_set(frame, i as u16, *a) };
@@ -3300,11 +3336,16 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
         }
     }
     let code = emit_native_x86(&bf)?;
+    let num_slots = bf.num_slots();
+    // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
+    // the activation's safepoint must exist, or the code is not installed.
+    let code_info = install_stack_map(num_slots)?;
     let buf = bliss_rt::jit::JitBuffer::new(&code)?;
     let entry = buf.leak();
     let nc = Rc::new(NativeCode {
         entry,
-        num_slots: bf.num_slots(),
+        num_slots,
+        code_info,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
     Some(nc)
@@ -3394,5 +3435,39 @@ fn symbol_index_of(name: &str) -> Option<u32> {
     match reader::read_from_string(name) {
         Ok((sym, _)) if sym.is_symbol() => Some(sym.as_symbol_index()),
         _ => None,
+    }
+}
+
+// ── T1 GC stack-map install contract (bliss-jtc.4) ────────────────
+
+#[cfg(test)]
+mod jtc4_stack_map_tests {
+    use super::*;
+
+    /// install_stack_map builds a validated map covering every activation slot,
+    /// and its entry safepoint (pc 0) resolves to a ref bitmap of the right size.
+    #[test]
+    fn install_stack_map_validates_and_covers_all_slots() {
+        let ci = install_stack_map(3).expect("a 3-slot map must install");
+        let map = ci.stack_map(0).expect("entry safepoint must have a stack map");
+        // 3 slots → 1 byte, bits 0..3 set (all tagged BlissVal references).
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0] & 0b0000_0111, 0b0000_0111);
+
+        // A leaf activation with no reference slots legitimately has no bitmap.
+        let leaf = install_stack_map(0).expect("a 0-slot leaf map must install");
+        assert!(leaf.stack_map(0).is_none());
+    }
+
+    /// The install contract (R4.46): code whose entry safepoint has no registered
+    /// stack map must be rejected. A CodeInfo built with an empty stack-map table
+    /// exposes the "missing map" condition install checks for.
+    #[test]
+    fn missing_stack_map_is_detectable_and_would_abort_install() {
+        let no_maps = CodeInfo::new(&[], &[]);
+        assert!(
+            no_maps.stack_map(0).is_none(),
+            "a safepoint with no registered map resolves to None — install must reject it"
+        );
     }
 }
