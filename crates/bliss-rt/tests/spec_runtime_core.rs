@@ -449,12 +449,18 @@ fn green_threads_have_distinct_cl_stacks_from_each_other_and_from_the_caller() {
     let entry = unsafe {
         BlissVal::from_function_ptr(green_thread_reports_stack_base as *const () as *mut u8)
     };
+    // Capture the caller's stack base *first*. current_thread() lazily creates
+    // this thread's bootstrap CL stack, so it must be materialized before the
+    // green threads are spawned and freed — otherwise the allocator can hand the
+    // caller's freshly-created stack the memory of an already-joined green
+    // thread's stack, producing a spurious base-address collision.
+    let current = current_thread().stack().base() as usize;
+
     let id1 = make_thread(entry).unwrap();
     let id2 = make_thread(entry).unwrap();
 
     let stack1 = join_thread(id1).unwrap().as_fixnum() as usize;
     let stack2 = join_thread(id2).unwrap().as_fixnum() as usize;
-    let current = current_thread().stack().base() as usize;
 
     assert_ne!(stack1, stack2, "green threads must not share a CL stack");
     assert_ne!(
