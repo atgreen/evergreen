@@ -19,9 +19,11 @@ fn run(program: &str, bytecode: bool) -> (String, bool) {
     let mut cmd = Command::new(BIN);
     cmd.arg("--eval").arg(program);
     if bytecode {
+        // Bytecode is the default now; be explicit anyway.
         cmd.env("BLISS_BACKEND", "bytecode");
     } else {
-        cmd.env_remove("BLISS_BACKEND");
+        // The tree-walker is the differential oracle.
+        cmd.env("BLISS_BACKEND", "tree-walker");
     }
     let out = cmd.output().expect("spawn bliss-cli");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -206,6 +208,13 @@ const CORPUS: &[&str] = &[
     "(case (quote b) (a 1) (b 2) (otherwise 99))",
     "(case 9 (1 (quote one)))",
     "(defun day (n) (case n (0 (quote sun)) (1 (quote mon)) (otherwise (quote other)))) (list (day 0) (day 1) (day 5))",
+    // Regressions found by running the full suite under bytecode default:
+    // a handler-bind handler that captures + mutates a boxed local,
+    "(let ((result nil)) (handler-bind ((error (lambda (c) (setq result \"handled\")))) (signal (make-condition (quote error)))) result)",
+    // and sequence functions with :key/:test (these bail — must still match).
+    "(sort (list (list 2) (list 1)) (function <) :key (function car))",
+    "(count 2 '(1 2 2 3 2) :test (function =))",
+    "(remove 1 '((1 a) (2 b) (1 c)) :key (function car) :test-not (function =))",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a

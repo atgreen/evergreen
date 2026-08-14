@@ -49,16 +49,22 @@ use super::{
 
 // ── Backend selection ──────────────────────────────────────────────
 
-/// Whether the bytecode backend is enabled (`BLISS_BACKEND=bytecode`).
+/// Whether the bytecode backend is enabled.
 ///
-/// Read once and cached; the tree-walker remains the default.
+/// The bytecode backend is the **default** (nmq.6); it compiles what it can and
+/// falls back to the tree-walker for the rest, so behaviour is identical. Set
+/// `BLISS_BACKEND` to `tree-walker` / `treewalker` / `tw` / `interp` to force
+/// the pure tree-walker (used as the differential-testing oracle). Read once and
+/// cached.
 pub fn backend_is_bytecode() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("BLISS_BACKEND")
-            .map(|v| v.eq_ignore_ascii_case("bytecode"))
-            .unwrap_or(false)
+    *ENABLED.get_or_init(|| match std::env::var("BLISS_BACKEND") {
+        Ok(v) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "tree-walker" | "treewalker" | "tree_walker" | "tw" | "interp" | "walker"
+        ),
+        Err(_) => true,
     })
 }
 
@@ -305,9 +311,10 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
     // reachable via apply_function, so safe to call from bytecode.
     "ERROR", "SIGNAL", "WARN", "CERROR", "INVOKE-RESTART", "MAKE-CONDITION",
     // Higher-order application functions (apply a closure/function value).
-    "FUNCALL", "APPLY", "MAPCAR", "MAPC", "MAPCAN", "MAPCON", "MAPLIST", "REDUCE", "REMOVE-IF",
-    "REMOVE-IF-NOT", "FIND-IF", "POSITION-IF", "COUNT-IF", "SOME", "EVERY", "NOTANY", "NOTEVERY",
-    "SORT", "STABLE-SORT",
+    // Only the simple applicators without &key/&test arguments are safe through
+    // apply_function's synthesize path; sequence functions taking :key/:test
+    // (sort, remove-if, find-if, reduce, ...) are left to bail to the tree-walker.
+    "FUNCALL", "APPLY", "MAPCAR", "MAPC", "MAPCAN", "MAPCON", "MAPLIST",
 ];
 
 /// Compiler state for lowering one function body.
@@ -2521,15 +2528,30 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
             }
             Instr::PushHandlerBind { hb } => {
                 let info = acts[top_idx].func.handler_binds[hb as usize].clone();
+                let env_frame = acts[top_idx].env_frame.clone();
                 let cluster_base = env.handlers.len();
-                let entries = info
-                    .bindings
-                    .iter()
-                    .map(|(type_name, handler_form)| HandlerEntry {
+                let mut entries = Vec::with_capacity(info.bindings.len());
+                for (type_name, handler_form) in &info.bindings {
+                    // When this function has boxed (captured) locals, evaluate
+                    // the handler form now into a closure that captures them, so
+                    // a handler run at signal time (in the tree-walker, where
+                    // env.frame is global) still sees the lexical bindings.
+                    let handler = if let Some(ef) = &env_frame {
+                        let saved = std::mem::replace(&mut env.frame, ef.clone());
+                        let v = eval_form(*handler_form, env);
+                        env.frame = saved;
+                        match v {
+                            Ok(val) => HandlerImpl::Function(val),
+                            Err(_) => HandlerImpl::Function(*handler_form),
+                        }
+                    } else {
+                        HandlerImpl::Function(*handler_form)
+                    };
+                    entries.push(HandlerEntry {
                         type_name: type_name.clone(),
-                        handler: HandlerImpl::Function(*handler_form),
-                    })
-                    .collect();
+                        handler,
+                    });
+                }
                 env.handlers.push(HandlerCluster { entries });
                 acts[top_idx]
                     .handlers
