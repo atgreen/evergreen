@@ -12,6 +12,7 @@ pub mod value;
 
 // ── Memory / GC ───────────────────────────────────────────────────
 pub mod gc;
+pub mod jit;
 
 // ── Thread runtime ────────────────────────────────────────────────
 pub mod safepoint;
