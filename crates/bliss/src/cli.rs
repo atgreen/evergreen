@@ -6641,18 +6641,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     env.current_package.clone()
                 };
                 ensure_package_available(env, &pkg_name, &[]);
-                let mut names = Vec::new();
-                if symbols.is_cons() {
-                    for sym in list_to_vec(symbols) {
-                        names.push(symbol_bare_name(&val_as_str(sym)));
-                    }
+                let sym_vals: Vec<BlissVal> = if symbols.is_cons() {
+                    list_to_vec(symbols)
+                } else if symbols.is_nil() {
+                    Vec::new()
                 } else {
-                    names.push(symbol_bare_name(&val_as_str(symbols)));
-                }
+                    vec![symbols]
+                };
                 let export_mode = car.is_symbol() && sym_name(car) == "EXPORT";
-                let mut resolved = Vec::with_capacity(names.len());
-                for name in names {
-                    let sym = intern_into_package(env, &pkg_name, &name);
+                // Preserve the identity of the PASSED symbol: importing or
+                // (re-)exporting a symbol must make THAT symbol present in the
+                // package, not fork a fresh same-named one — otherwise a
+                // downstream package that inherits it sees a conflict with the
+                // imported one (bliss-lb6). Only a non-symbol designator (a bare
+                // string name) falls back to interning by name.
+                let mut resolved = Vec::with_capacity(sym_vals.len());
+                for sv in sym_vals {
+                    let name = symbol_bare_name(&val_as_str(sv));
+                    let sym = if sv.is_symbol() {
+                        sv
+                    } else {
+                        intern_into_package(env, &pkg_name, &name)
+                    };
                     resolved.push((name, sym));
                 }
                 let package = Rc::make_mut(&mut env.packages)
