@@ -46,7 +46,8 @@ pub use conditions::{
     compute_restarts, error_condition, find_restart, handler_bind, handler_bind_fn, handler_case,
     initialize_condition_runtime_support, install_runtime_init_hook, invoke_debugger,
     invoke_restart, invoke_restart_interactively, make_simple_error, make_type_error,
-    restart_bind, restart_bind_fn, set_break_on_signals, set_debugger_hook, set_funcall_hook,
+    release_preallocated_storage_condition, restart_bind, restart_bind_fn, set_break_on_signals,
+    set_debugger_hook, set_funcall_hook,
     signal_condition, signal_storage_condition_for_runtime_error, warn_condition,
 };
 pub use devtools::{

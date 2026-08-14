@@ -19,6 +19,7 @@ use crate::streams::make_lisp_string_fresh;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Once;
 
 // ── Well-known symbol indices ────────────────────────────────────
@@ -183,9 +184,6 @@ struct ConditionState {
     handler_case_clauses: HashMap<u64, BlissVal>,
     pending_handler_case: Option<(BlissVal, BlissVal)>,
     next_handler_case_id: i64,
-    storage_condition_pool: [BlissVal; STORAGE_CONDITION_POOL_SIZE],
-    next_storage_condition: usize,
-    storage_condition_pool_initialized: bool,
 }
 
 impl ConditionState {
@@ -199,11 +197,64 @@ impl ConditionState {
             handler_case_clauses: HashMap::new(),
             pending_handler_case: None,
             next_handler_case_id: 0,
-            storage_condition_pool: [NIL; STORAGE_CONDITION_POOL_SIZE],
-            next_storage_condition: 0,
-            storage_condition_pool_initialized: false,
         }
     }
+}
+
+// ── Pre-allocated STORAGE-CONDITION pool (D5.13, R5.110, bliss-wzw) ──────────
+//
+// Signalling on the storage-exhaustion / stack-overflow path MUST NOT allocate,
+// intern, define classes, or take a lock that could block or allocate behind
+// the already-failing allocator. So the pool lives outside the `RefCell`
+// `ConditionState` in its own lock-free structure: fixed atomic slots plus a
+// single atomic claim bitmask. The acquire/release path only does atomic loads
+// and a CAS — it never borrows a `RefCell` (whose reentrant borrow would panic
+// if the storage path were ever re-entered).
+//
+// The pool is **thread-local**, not a process-wide `static` as sketched in the
+// spec's D5.13. That is deliberate: CLOS instance identity here is thread-local
+// (`clos::live_instances`), so an instance created on one thread cannot be
+// safely inspected — `class_of` / condition-type matching — from another. Each
+// thread therefore owns a private pool of instances built against its own
+// condition classes. Cross-thread "concurrent claim" (spec 5.4.10) is satisfied
+// with zero contention: threads never share a slot. The atomic claim bitmask
+// still earns its keep *within* a thread, handing out distinct instances under
+// nested / reentrant storage signalling and recycling them on release, with a
+// deterministic fallback to slot 0 when all slots are in flight so the signal
+// path can never itself fail to produce a condition.
+struct StoragePool {
+    slots: [AtomicU64; STORAGE_CONDITION_POOL_SIZE],
+    /// Bit `i` set ⇒ slot `i` is currently claimed (in flight).
+    claimed: AtomicU32,
+    initialized: AtomicBool,
+}
+
+impl StoragePool {
+    const fn new() -> Self {
+        // `AtomicU64` is not `Copy`, so the array cannot be built with `[expr; N]`;
+        // spell out the slots. A compile-time check keeps this in sync with SIZE.
+        const _: () = assert!(
+            STORAGE_CONDITION_POOL_SIZE == 4,
+            "StoragePool slot literal must match STORAGE_CONDITION_POOL_SIZE"
+        );
+        StoragePool {
+            slots: [
+                AtomicU64::new(NIL.0),
+                AtomicU64::new(NIL.0),
+                AtomicU64::new(NIL.0),
+                AtomicU64::new(NIL.0),
+            ],
+            claimed: AtomicU32::new(0),
+            initialized: AtomicBool::new(false),
+        }
+    }
+
+    /// Bitmask of all valid slots, e.g. `0b1111` for a 4-slot pool.
+    const MASK: u32 = (1u32 << STORAGE_CONDITION_POOL_SIZE) - 1;
+}
+
+thread_local! {
+    static STORAGE_POOL: StoragePool = const { StoragePool::new() };
 }
 
 thread_local! {
@@ -287,11 +338,14 @@ pub fn set_storage_condition_pool(instances: &[BlissVal]) -> Result<(), BlissErr
             instances.len()
         )));
     }
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        state.storage_condition_pool[..].copy_from_slice(instances);
-        state.next_storage_condition = 0;
-        state.storage_condition_pool_initialized = true;
+    STORAGE_POOL.with(|p| {
+        for (slot, inst) in p.slots.iter().zip(instances) {
+            slot.store(inst.0, Ordering::Release);
+        }
+        // Fresh instances are all free; publish `initialized` last so the acquire
+        // path never observes populated slots before the claim mask is cleared.
+        p.claimed.store(0, Ordering::Release);
+        p.initialized.store(true, Ordering::Release);
     });
     Ok(())
 }
@@ -308,22 +362,15 @@ fn initialize_storage_condition_pool() -> Result<(), BlissError> {
         initialize_instance(inst, &[])?;
         *entry = inst;
     }
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        state.storage_condition_pool = pool;
-        state.next_storage_condition = 0;
-        state.storage_condition_pool_initialized = true;
-    });
-    Ok(())
+    set_storage_condition_pool(&pool)
 }
 
 fn storage_condition_pool_is_live() -> bool {
-    STATE.with(|s| {
-        let state = s.borrow();
-        if !state.storage_condition_pool_initialized {
+    STORAGE_POOL.with(|p| {
+        if !p.initialized.load(Ordering::Acquire) {
             return false;
         }
-        let first = state.storage_condition_pool[0];
+        let first = BlissVal(p.slots[0].load(Ordering::Acquire));
         first != NIL
             && class_inherits_from(
                 class_of(first),
@@ -335,32 +382,81 @@ fn storage_condition_pool_is_live() -> bool {
 /// Acquire a preallocated `STORAGE-CONDITION` instance for the heap-exhaustion /
 /// stack-overflow signalling path (R5.110). This runs when allocation is already
 /// failing, so it MUST NOT allocate, intern, define classes, resolve symbols, or
-/// take non-essential locks: it only reads the thread-local pool array and
-/// advances the rotation cursor. The pool is filled once at startup by
-/// `initialize_condition_runtime_support` (called from the interpreter's
-/// `Env::new` after CLOS/condition-class bootstrap and before any user code). If
-/// it is somehow not initialized, we fail hard with a fixed `Internal` error
-/// rather than lazily allocating on the low-memory path — that lazy fallback was
-/// the bug this replaces (bliss-uh4.2).
+/// take a lock that could block or allocate: it only does atomic loads and a
+/// compare-and-swap on the thread-local pool (bliss-wzw). The pool is filled once
+/// at startup by `initialize_condition_runtime_support` (called from the
+/// interpreter's `Env::new` after CLOS/condition-class bootstrap and before any
+/// user code). If it is somehow not initialized, we fail hard with a fixed
+/// `Internal` error rather than lazily allocating on the low-memory path — that
+/// lazy fallback was the bug this replaces (bliss-uh4.2).
+///
+/// The returned instance is *claimed*: pair each success with
+/// [`release_preallocated_storage_condition`] once the condition is no longer in
+/// flight so the slot can be reused. When every slot is already claimed
+/// (deeper nesting than the pool size), acquisition does not fail — it
+/// deterministically falls back to slot 0 (unclaimed, shared) so the storage
+/// path can always produce a condition to signal.
 ///
 /// Deliberately does NOT call `storage_condition_pool_is_live`, whose
 /// `class_of` / class-graph walk could allocate or lock.
 pub fn acquire_preallocated_storage_condition() -> Result<BlissVal, BlissError> {
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        if !state.storage_condition_pool_initialized {
+    STORAGE_POOL.with(|p| {
+        if !p.initialized.load(Ordering::Acquire) {
             return Err(BlissError::Internal(
                 "STORAGE-CONDITION pool not initialized before the storage-failure path".into(),
             ));
         }
-        let condition = state.storage_condition_pool[state.next_storage_condition];
-        if condition == NIL {
-            return Err(BlissError::Internal("STORAGE-CONDITION pool slot empty".into()));
+        loop {
+            let cur = p.claimed.load(Ordering::Acquire);
+            let free = !cur & StoragePool::MASK;
+            if free == 0 {
+                // Exhaustion fallback: hand out slot 0 without claiming. Signalling
+                // with a shared instance under total exhaustion is acceptable — the
+                // path must never itself fail to produce a condition.
+                let bits = p.slots[0].load(Ordering::Acquire);
+                if bits == NIL.0 {
+                    return Err(BlissError::Internal(
+                        "STORAGE-CONDITION pool slot empty".into(),
+                    ));
+                }
+                return Ok(BlissVal(bits));
+            }
+            let idx = free.trailing_zeros() as usize;
+            let next = cur | (1u32 << idx);
+            if p.claimed
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let bits = p.slots[idx].load(Ordering::Acquire);
+                if bits == NIL.0 {
+                    // Slot was never populated; unclaim and report rather than
+                    // handing back NIL.
+                    p.claimed.fetch_and(!(1u32 << idx), Ordering::AcqRel);
+                    return Err(BlissError::Internal(
+                        "STORAGE-CONDITION pool slot empty".into(),
+                    ));
+                }
+                return Ok(BlissVal(bits));
+            }
+            // CAS lost the race; retry with the fresh mask.
         }
-        state.next_storage_condition =
-            (state.next_storage_condition + 1) % STORAGE_CONDITION_POOL_SIZE;
-        Ok(condition)
     })
+}
+
+/// Release a previously [`acquire_preallocated_storage_condition`]-claimed
+/// instance, clearing its claim bit so the slot can be reused (bliss-wzw). Safe
+/// and allocation-free: only atomic loads and a fetch-and. Releasing an instance
+/// that was the exhaustion fallback (slot 0, never claimed) is a harmless no-op
+/// on the bit level. Releasing an unknown value is ignored.
+pub fn release_preallocated_storage_condition(condition: BlissVal) {
+    STORAGE_POOL.with(|p| {
+        for (i, slot) in p.slots.iter().enumerate() {
+            if slot.load(Ordering::Acquire) == condition.0 {
+                p.claimed.fetch_and(!(1u32 << i), Ordering::AcqRel);
+                return;
+            }
+        }
+    });
 }
 
 fn runtime_init_storage_condition_support() -> Result<(), BlissError> {
@@ -1132,5 +1228,86 @@ pub fn signal_storage_condition_for_runtime_error(
         _ => Err(BlissError::Internal(
             "runtime error does not map to STORAGE-CONDITION".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod storage_pool_cas_tests {
+    //! bliss-wzw: the lock-free CAS claim/release protocol for the pre-allocated
+    //! STORAGE-CONDITION pool. These exercise the concurrency primitive directly
+    //! with sentinel BlissVals (real-instance / class recognition is covered by
+    //! the CLI-side and pinned-GC tests); acquire never inspects slot classes.
+    use super::*;
+
+    /// A non-NIL sentinel standing in for a pooled instance.
+    fn sentinel(n: u64) -> BlissVal {
+        BlissVal(n << 3)
+    }
+
+    #[test]
+    fn claim_release_and_deterministic_exhaustion_fallback() {
+        let pool = [sentinel(1), sentinel(2), sentinel(3), sentinel(4)];
+        set_storage_condition_pool(&pool).unwrap();
+
+        // The four claims hand out four *distinct* slots.
+        let claims: Vec<BlissVal> = (0..STORAGE_CONDITION_POOL_SIZE)
+            .map(|_| acquire_preallocated_storage_condition().unwrap())
+            .collect();
+        let mut got: Vec<u64> = claims.iter().map(|c| c.0).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![sentinel(1).0, sentinel(2).0, sentinel(3).0, sentinel(4).0]);
+
+        // Pool exhausted → deterministic fallback to slot 0, no error.
+        let fallback = acquire_preallocated_storage_condition().unwrap();
+        assert_eq!(fallback.0, sentinel(1).0);
+
+        // Releasing a claimed slot lets the next claim reuse exactly it.
+        release_preallocated_storage_condition(claims[1]);
+        let reused = acquire_preallocated_storage_condition().unwrap();
+        assert_eq!(reused.0, claims[1].0);
+    }
+
+    #[test]
+    fn uninitialized_pool_errors_rather_than_allocating() {
+        // A thread that never installed a pool must fail hard on the storage
+        // path rather than lazily allocate (bliss-uh4.2).
+        std::thread::spawn(|| {
+            assert!(acquire_preallocated_storage_condition().is_err());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn concurrent_threads_claim_from_independent_pools() {
+        // Pools are thread-local: many OS threads claim/release concurrently with
+        // zero contention and each only ever sees its own instances — the
+        // architecture's answer to spec 5.4.10 "concurrent claim".
+        let handles: Vec<_> = (0..8u64)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let base = (t + 1) * 100;
+                    let pool = [
+                        sentinel(base),
+                        sentinel(base + 1),
+                        sentinel(base + 2),
+                        sentinel(base + 3),
+                    ];
+                    set_storage_condition_pool(&pool).unwrap();
+                    for _ in 0..2000 {
+                        let c = acquire_preallocated_storage_condition().unwrap();
+                        let v = c.0 >> 3;
+                        assert!(
+                            (base..base + 4).contains(&v),
+                            "thread {t} saw a foreign slot {v}"
+                        );
+                        release_preallocated_storage_condition(c);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

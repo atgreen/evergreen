@@ -586,8 +586,9 @@ fn storage_condition_pool_is_pinned_in_gc_heap_and_survives_collection() {
     reset_state();
     conditions::initialize_condition_runtime_support().unwrap();
 
-    // Snapshot the four pinned pool instances (acquire rotates through them in
-    // order, so acquiring exactly four yields the whole pool).
+    // Snapshot the four pinned pool instances: claim all four distinct slots,
+    // then release them so they can be re-claimed after the GC (bliss-wzw claim/
+    // release protocol — claims are not recycled until released).
     let before: Vec<BlissVal> = (0..4)
         .map(|_| conditions::acquire_preallocated_storage_condition().unwrap())
         .collect();
@@ -597,6 +598,9 @@ fn storage_condition_pool_is_pinned_in_gc_heap_and_survives_collection() {
             class_name(class_of(*c)),
             sym(conditions::SYMBOL_STORAGE_CONDITION)
         );
+    }
+    for c in &before {
+        conditions::release_preallocated_storage_condition(*c);
     }
 
     // Churn the heap and force a full GC (minor + major). The pool is pinned, so
@@ -609,6 +613,8 @@ fn storage_condition_pool_is_pinned_in_gc_heap_and_survives_collection() {
     let after: Vec<BlissVal> = (0..4)
         .map(|_| conditions::acquire_preallocated_storage_condition().unwrap())
         .collect();
+    // Claim order is deterministic (lowest free slot first), so the same four
+    // pinned instances come back in the same order at the same addresses.
     assert_eq!(
         before, after,
         "pinned pool instances kept their exact addresses across a full GC"

@@ -185,13 +185,39 @@ struct ThreadConditionState {
 ### D5.13 — Pre-allocated Storage Conditions
 
 ```rust
-/// Allocated at startup (R5.110); never garbage-collected.
-static STORAGE_CONDITION_POOL: [BlissVal; 4] = /* ... */;
+/// Pre-allocated at startup (R5.110); pinned in the GC heap, never moved or freed.
+/// Thread-local: each thread owns a private pool built against its own
+/// condition classes (see rationale below). Slots + a claim bitmask are atomic
+/// so the acquire/release path is lock-free and allocation-free.
+thread_local! {
+    static STORAGE_POOL: StoragePool /* [AtomicU64; 4] slots + AtomicU32 claim mask */;
+}
 ```
 
-Four `STORAGE-CONDITION` instances are pre-allocated in a pinned, non-GC
-region at startup. When the GC or allocator detects OOM, one of these is
-signalled instead of attempting allocation.
+Four `STORAGE-CONDITION` instances are pre-allocated at startup, pinned in the
+GC heap so a moving collection never relocates or frees them (bliss-4v8). When
+the GC or allocator detects OOM, one of these is signalled instead of attempting
+allocation.
+
+**Thread-locality (rather than a single process-wide `static`).** CLOS instance
+identity in Bliss is thread-local (the live-instance registry is per-thread), so
+an instance created on one thread cannot be safely inspected — `class_of`,
+condition-type matching — from another. Each thread therefore pre-allocates its
+own pool against its own condition classes. This is also what lets a pooled
+instance be recognised by the interpreter's condition matcher and `TYPE-OF`
+(bliss-5mf): the interpreter reseeds its thread's pool at startup with
+instances of the class it will later match against.
+
+**Claim / release (bliss-wzw).** Acquisition claims the lowest free slot with a
+single atomic compare-and-swap and returns that instance; `release` clears the
+claim bit so the slot can be reused. Because pools are thread-local, concurrent
+OOM on multiple OS threads claims from disjoint pools with zero contention. The
+atomic claim still matters *within* a thread: nested / reentrant storage
+signalling hands out distinct instances up to the pool size. When every slot is
+in flight, acquisition does **not** fail — it deterministically falls back to
+slot 0 (shared) so the storage path can always produce a condition to signal.
+The acquire and release paths take no lock that could block or allocate behind
+the already-failing allocator.
 
 ---
 
@@ -540,9 +566,11 @@ bind its own debugger hook independently.
   will use that thread's handlers.
 - `*DEBUGGER-HOOK*` is a thread-local special variable; binding it in one
   thread does not affect other threads.
-- The pre-allocated `STORAGE-CONDITION` pool (D5.13) uses atomic
-  compare-and-swap to claim an instance, ensuring thread-safety during
-  OOM signalling.
+- The pre-allocated `STORAGE-CONDITION` pool (D5.13) is thread-local; each
+  thread claims an instance from its own pool with an atomic compare-and-swap
+  (bliss-wzw), so OOM signalling is thread-safe with no cross-thread contention.
+  A `release` returns the slot; total exhaustion falls back deterministically to
+  a shared slot rather than failing.
 
 ---
 
