@@ -83,6 +83,12 @@ fn alloc_package_id() -> (i64, BlissVal) {
 }
 
 /// Allocate a fresh BlissVal to represent a symbol.
+///
+/// NOTE (bliss-jtc.6): these are still per-store fixnum handles. Retiring them
+/// onto the shared heap-resident registry requires per-(package,name) symbol
+/// identity — a bare-name global intern would collapse `FOO` in two different
+/// packages into one symbol — so it is folded into Stage D (real packages),
+/// where the package cell gives each symbol its home-package identity.
 fn alloc_symbol() -> BlissVal {
     let id = NEXT_SYMBOL_ID.fetch_add(1, Ordering::Relaxed);
     BlissVal::from_fixnum(id)

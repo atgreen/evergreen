@@ -645,9 +645,6 @@ extern "C" fn sigsegv_handler(_sig: libc::c_int) {
 struct BootstrapStore {
     cons_cells: HashMap<u64, (BlissVal, BlissVal)>,
     cons_counter: u64,
-    symbol_to_idx: HashMap<String, u32>,
-    idx_to_symbol: HashMap<u32, String>,
-    symbol_counter: u32,
     strings: HashMap<u64, String>,
     lambdas: HashMap<u64, BootLambda>,
     lambda_counter: u64,
@@ -667,9 +664,6 @@ impl BootstrapStore {
         BootstrapStore {
             cons_cells: HashMap::new(),
             cons_counter: 1, // start at 1 to avoid zero-tagged values
-            symbol_to_idx: HashMap::new(),
-            idx_to_symbol: HashMap::new(),
-            symbol_counter: 1, // reserve 0
             strings: HashMap::new(),
             lambdas: HashMap::new(),
             lambda_counter: 1,
@@ -753,26 +747,16 @@ fn boot_cdr(val: BlissVal) -> BlissVal {
 }
 
 fn boot_intern(name: &str) -> BlissVal {
-    BOOT_STORE.with(|store| {
-        let mut s = store.borrow_mut();
-        if let Some(&idx) = s.symbol_to_idx.get(name) {
-            BlissVal::from_symbol_index(idx)
-        } else {
-            let idx = s.symbol_counter;
-            s.symbol_counter += 1;
-            s.symbol_to_idx.insert(name.to_string(), idx);
-            s.idx_to_symbol.insert(idx, name.to_string());
-            BlissVal::from_symbol_index(idx)
-        }
-    })
+    // Symbols share the one global heap-resident registry (bliss-jtc.6 Stage B);
+    // the bootstrap evaluator no longer keeps its own symbol index space.
+    BlissVal::from_symbol_index(crate::symbols::intern(name))
 }
 
 fn boot_symbol_name(val: BlissVal) -> Option<String> {
     if val.tag() != crate::value::TAG_SYMBOL {
         return None;
     }
-    let idx = val.as_symbol_index();
-    BOOT_STORE.with(|store| store.borrow().idx_to_symbol.get(&idx).cloned())
+    crate::symbols::symbol_name(val.as_symbol_index())
 }
 
 fn boot_make_string(s: &str) -> BlissVal {

@@ -203,11 +203,14 @@ pub fn make_uninterned(name: &str) -> BlissVal {
 /// is relocated to follow it (both GCs).
 ///
 /// Symbols are pinned, so the yielded slot addresses are stable for the duration
-/// of a collection. Only a read lock is held; this must never run while the
-/// caller holds the registry write lock — and it never does, because interning
-/// releases the lock before any allocation that could trigger a collection.
+/// of a collection. Takes the registry *write* lock (exclusive): the collector
+/// both reads cells (marking) and rewrites them (relocation), so it must exclude
+/// concurrent `symbol_value`/`set_symbol_value` on other threads that would
+/// otherwise race on the same cell word. This never runs while the caller holds
+/// the registry lock — interning releases it before any allocation that could
+/// trigger a collection.
 pub(crate) fn for_each_root_slot(mut f: impl FnMut(*mut BlissVal)) {
-    let guard = REGISTRY.read().expect("symbol registry poisoned");
+    let guard = REGISTRY.write().expect("symbol registry poisoned");
     let Some(reg) = guard.as_ref() else {
         return;
     };
@@ -243,13 +246,16 @@ fn read_cell(idx: u32, get: impl FnOnce(&SymbolData) -> BlissVal) -> Option<Blis
 }
 
 /// Write one of a symbol's cells by field. No-op if the index is unknown.
+///
+/// Takes the registry *write* lock even though it only mutates a cell (not the
+/// registry structure): a cell write must be mutually exclusive with the GC's
+/// cell scan/relocation (`for_each_root_slot`, also write-locked) and with cell
+/// reads, or a concurrent collection could observe a torn pointer.
 fn write_cell(idx: u32, set: impl FnOnce(&mut SymbolData)) {
-    with_registry(|reg| {
-        if let Some(reg) = reg {
-            if let Some(obj) = object_for_index(reg, idx) {
-                // SAFETY: registry objects are pinned live symbols.
-                set(unsafe { &mut *symbol_data(obj) });
-            }
+    with_registry_mut(|reg| {
+        if let Some(obj) = object_for_index(reg, idx) {
+            // SAFETY: registry objects are pinned live symbols.
+            set(unsafe { &mut *symbol_data(obj) });
         }
     });
 }
@@ -301,11 +307,22 @@ mod tests {
     //! so the process-global registry (shared across the test binary) can't cause
     //! cross-test collisions, and assertions check relationships rather than
     //! absolute indices (other tests may have interned first).
+    //!
+    //! Interning allocates on the shared GC heap, and concurrent allocation from
+    //! multiple threads is not yet safe (no safepoints), so — like every other
+    //! heap-touching test in this crate — these serialize on a process-global
+    //! lock rather than running in parallel.
     use super::*;
-    use crate::object::type_id;
+    use std::sync::{Mutex, OnceLock};
+
+    fn heap_test_lock() -> &'static Mutex<()> {
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        L.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn intern_is_idempotent_and_names_round_trip_through_the_heap_cell() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let a = intern("STAGE-A-ALPHA");
         let a2 = intern("STAGE-A-ALPHA");
         let b = intern("STAGE-A-BETA");
@@ -318,6 +335,7 @@ mod tests {
 
     #[test]
     fn find_index_never_interns() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(find_index("STAGE-A-NEVER-INTERNED"), None);
         let idx = intern("STAGE-A-FINDABLE");
         assert_eq!(find_index("STAGE-A-FINDABLE"), Some(idx));
@@ -325,6 +343,7 @@ mod tests {
 
     #[test]
     fn uninterned_symbols_are_distinct_and_unfindable() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let g1 = make_uninterned("G");
         let g2 = make_uninterned("G");
         assert_ne!(g1, g2, "each make_uninterned yields a fresh symbol");
@@ -336,6 +355,7 @@ mod tests {
 
     #[test]
     fn cells_start_unbound_and_are_mutable() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let idx = intern("STAGE-A-CELLS");
         assert_eq!(symbol_value(idx), Some(UNBOUND));
         assert_eq!(symbol_function(idx), Some(UNBOUND));
@@ -352,63 +372,9 @@ mod tests {
         BlissVal::from_symbol_index(intern(name))
     }
 
-    #[test]
-    fn interned_symbol_object_lives_on_the_gc_heap() {
-        intern("STAGE-A-ON-HEAP");
-        let mut saw_symbol = false;
-        crate::walk_heap(|_p, tid, _s| {
-            if tid == type_id::SYMBOL {
-                saw_symbol = true;
-            }
-            true
-        })
-        .expect("walk_heap");
-        assert!(saw_symbol, "interned symbols must be SYMBOL objects on the GC heap");
-    }
-
-    #[test]
-    fn value_reachable_only_through_a_symbol_cell_survives_gc() {
-        // A cons stored ONLY in a symbol's value cell — no other root anywhere.
-        let idx = intern("STAGE-C-CELL-ROOT");
-        let marker = BlissVal::from_fixnum(0x00C0_FFEE);
-        let cons_body = crate::gc::alloc_typed(16, type_id::CONS).expect("alloc cons");
-        // SAFETY: fresh 16-byte cons body [car | cdr].
-        let cons = unsafe {
-            *(cons_body as *mut BlissVal) = marker;
-            *(cons_body as *mut BlissVal).add(1) = NIL;
-            BlissVal::from_cons_ptr(cons_body)
-        };
-        set_symbol_value(idx, cons);
-
-        // Push it through several generations: heavy churn + repeated collection
-        // promotes the cons to old-gen and drives major evacuation/sweep. Without
-        // the symbol cell acting as a root it would be swept (mark) or its cell
-        // left dangling (relocate); either way the marker would be lost.
-        for cycle in 0..3 {
-            for _ in 0..300 {
-                let _ = crate::gc::alloc_typed(16, type_id::CONS);
-            }
-            crate::gc::full_gc().unwrap_or_else(|_| panic!("full_gc cycle {cycle}"));
-            let cell = symbol_value(idx).expect("value cell present");
-            // SAFETY: a live cons value points at its body; car is the first word.
-            let car = unsafe { *(cell.as_ptr() as *const BlissVal) };
-            assert_eq!(
-                car, marker,
-                "cons reachable only via the symbol cell survived GC cycle {cycle} intact"
-            );
-        }
-    }
-
-    #[test]
-    fn pinned_symbols_survive_a_full_gc_with_cells_intact() {
-        let idx = intern("STAGE-A-SURVIVOR");
-        set_symbol_value(idx, BlissVal::from_fixnum(7));
-        // Churn + collect: pinned symbols and their name strings must persist.
-        for _ in 0..200 {
-            let _ = crate::gc::alloc_typed(16, type_id::CONS);
-        }
-        crate::gc::full_gc().expect("full_gc");
-        assert_eq!(symbol_name(idx).as_deref(), Some("STAGE-A-SURVIVOR"));
-        assert_eq!(symbol_value(idx), Some(BlissVal::from_fixnum(7)));
-    }
+    // GC-interaction tests (they call `full_gc`, which is unsafe to run
+    // concurrently with allocation from another thread — no safepoints yet) live
+    // in the serialized integration binary `tests/symbols_gc_roots.rs`, matching
+    // the pattern of the other GC tests, so they can't race the parallel unit
+    // tests in this process.
 }
