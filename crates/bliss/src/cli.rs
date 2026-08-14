@@ -5016,6 +5016,45 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return bliss_stdlib::elt(arr, idx.as_fixnum() as usize);
             }
+            "VECTOR" => {
+                // (vector &rest elements) → a fresh simple-vector.
+                let elems = eval_args(cdr, env)?;
+                return Ok(bliss_stdlib::build_simple_vector(&elems));
+            }
+            "VECTORP" | "SIMPLE-VECTOR-P" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                return Ok(if bliss_rt::types::vectorp(v) { T } else { NIL });
+            }
+            "ARRAYP" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                // bliss arrays are simple-vectors and strings.
+                return Ok(if bliss_rt::types::vectorp(v) || is_string_value(v) {
+                    T
+                } else {
+                    NIL
+                });
+            }
+            "ARRAY-ELEMENT-TYPE" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                // Strings hold CHARACTER; simple-vectors hold T.
+                let ty = if is_string_value(v) { "CHARACTER" } else { "T" };
+                return Ok(resolve_sym(ty).unwrap_or(T));
+            }
+            "ARRAY-RANK" => {
+                let (af, _) = cp(cdr);
+                let _v = eval_form(af, env)?;
+                // All bliss arrays are one-dimensional.
+                return Ok(BlissVal::from_fixnum(1));
+            }
+            "ARRAY-DIMENSIONS" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                let len = bliss_stdlib::length(v)? as i64;
+                return Ok(vec_to_list(&[BlissVal::from_fixnum(len)]));
+            }
             "APPEND" => {
                 let mut all = Vec::new();
                 let items = list_to_vec(cdr);
