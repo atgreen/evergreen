@@ -272,8 +272,8 @@ fn conditions_signal_runs_newest_matching_handlers_without_unwinding() {
     // Per R5.92, R5.93, R5.94, and R5.102, HANDLER-BIND establishes dynamic
     // handler clusters, SIGNAL searches newest-first, and returning handlers
     // do not unwind the protected body.
-    let result = handler_bind_fn(&[(sym(SYMBOL_ERROR), oldest_handler)], || {
-        handler_bind_fn(&[(sym(SYMBOL_ERROR), newest_handler)], || {
+    let result = handler_bind_fn(&[(sym(*SYMBOL_ERROR), oldest_handler)], || {
+        handler_bind_fn(&[(sym(*SYMBOL_ERROR), newest_handler)], || {
             signal_condition(condition)?;
             Ok(fx(99))
         })
@@ -293,11 +293,11 @@ fn conditions_handler_case_matches_registered_conditions_and_passes_through_valu
     // Per R5.95 and R11.02, the public HANDLER-CASE surface must route a
     // signalled condition to the matching clause and leave non-conditions alone.
     assert_eq!(
-        handler_case(condition, &[(sym(SYMBOL_ERROR), fx(77))]).unwrap(),
+        handler_case(condition, &[(sym(*SYMBOL_ERROR), fx(77))]).unwrap(),
         fx(77)
     );
     assert_eq!(
-        handler_case(fx(78), &[(sym(SYMBOL_ERROR), fx(99))]).unwrap(),
+        handler_case(fx(78), &[(sym(*SYMBOL_ERROR), fx(99))]).unwrap(),
         fx(78)
     );
 }
@@ -399,12 +399,12 @@ fn conditions_warn_and_cerror_expose_default_restarts() {
 
     set_funcall_hook(move |function, _args| {
         if function == warning_handler {
-            let restart = find_restart(sym(SYMBOL_MUFFLE_WARNING), None).unwrap();
+            let restart = find_restart(sym(*SYMBOL_MUFFLE_WARNING), None).unwrap();
             invoke_restart(restart, &[])?;
             return Ok(NIL);
         }
         if function == continue_handler {
-            let restart = find_restart(sym(SYMBOL_CONTINUE), None).unwrap();
+            let restart = find_restart(sym(*SYMBOL_CONTINUE), None).unwrap();
             invoke_restart(restart, &[])?;
             return Ok(NIL);
         }
@@ -413,13 +413,13 @@ fn conditions_warn_and_cerror_expose_default_restarts() {
 
     // Per R5.104 and R5.105, WARN establishes MUFFLE-WARNING and CERROR
     // establishes CONTINUE for recovery within the dynamic signalling context.
-    handler_bind_fn(&[(sym(SYMBOL_CONDITION), warning_handler)], || {
+    handler_bind_fn(&[(sym(*SYMBOL_CONDITION), warning_handler)], || {
         warn_condition(make_simple_error("warn", &[]))?;
         Ok(NIL)
     })
     .unwrap();
 
-    handler_bind_fn(&[(sym(SYMBOL_ERROR), continue_handler)], || {
+    handler_bind_fn(&[(sym(*SYMBOL_ERROR), continue_handler)], || {
         conditions::cerror("continue", make_simple_error("cerror", &[]))?;
         Ok(NIL)
     })
@@ -474,7 +474,7 @@ fn conditions_oom_path_uses_preallocated_storage_condition_instances() {
     // Per R5.110, the runtime must signal a preallocated STORAGE-CONDITION
     // when heap allocation is exhausted instead of allocating a fresh
     // condition object on the failing path.
-    handler_bind_fn(&[(sym(conditions::SYMBOL_STORAGE_CONDITION), handler)], || {
+    handler_bind_fn(&[(sym(*conditions::SYMBOL_STORAGE_CONDITION), handler)], || {
         let first = conditions::signal_storage_condition_for_runtime_error(&BlissError::Oom)?;
         let second = conditions::signal_storage_condition_for_runtime_error(&BlissError::Oom)?;
         assert_ne!(first, NIL);
@@ -491,11 +491,11 @@ fn conditions_oom_path_uses_preallocated_storage_condition_instances() {
     assert_eq!(seen.len(), 2);
     assert_eq!(
         class_name(class_of(seen[0])),
-        sym(conditions::SYMBOL_STORAGE_CONDITION)
+        sym(*conditions::SYMBOL_STORAGE_CONDITION)
     );
     assert_eq!(
         class_name(class_of(seen[1])),
-        sym(conditions::SYMBOL_STORAGE_CONDITION)
+        sym(*conditions::SYMBOL_STORAGE_CONDITION)
     );
     assert_ne!(seen[0], seen[1]);
 }
@@ -530,7 +530,7 @@ fn storage_condition_pool_rotates_and_reuses_preallocated_instances() {
         assert_ne!(c, NIL);
         assert_eq!(
             class_name(class_of(c)),
-            sym(conditions::SYMBOL_STORAGE_CONDITION)
+            sym(*conditions::SYMBOL_STORAGE_CONDITION)
         );
         if !distinct.contains(&c) {
             distinct.push(c);
@@ -565,7 +565,7 @@ fn clos_and_conditions_top_level_entrypoints_compose_in_an_acceptance_scenario()
     // Per R11.02 and R11.03, the Rust-backed stdlib entrypoints for CLOS and
     // conditions must already compose into a usable bootstrap path.
     let result: Result<BlissVal, BlissError> =
-        handler_bind_fn(&[(sym(SYMBOL_ERROR), handler)], || {
+        handler_bind_fn(&[(sym(*SYMBOL_ERROR), handler)], || {
             initialize_instance(instance, &[slot, fx(88)])?;
             assert_eq!(slot_value(instance, slot).unwrap(), fx(88));
             slot_makunbound(instance, slot)?;
@@ -596,7 +596,7 @@ fn storage_condition_pool_is_pinned_in_gc_heap_and_survives_collection() {
         assert_ne!(*c, NIL);
         assert_eq!(
             class_name(class_of(*c)),
-            sym(conditions::SYMBOL_STORAGE_CONDITION)
+            sym(*conditions::SYMBOL_STORAGE_CONDITION)
         );
     }
     for c in &before {
@@ -622,7 +622,7 @@ fn storage_condition_pool_is_pinned_in_gc_heap_and_survives_collection() {
     for c in &after {
         assert_eq!(
             class_name(class_of(*c)),
-            sym(conditions::SYMBOL_STORAGE_CONDITION),
+            sym(*conditions::SYMBOL_STORAGE_CONDITION),
             "pool instance is still a valid STORAGE-CONDITION after GC"
         );
     }

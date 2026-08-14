@@ -422,17 +422,21 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
         let fun_cls = BlissVal::from_fixnum(-9);
         let hpo_cls = BlissVal::from_fixnum(-10);
 
-        // Names (high symbol indices to avoid collision)
+        // Names: interned into the shared registry by their real CL names
+        // (bliss-jtc.6 Stage E) so a built-in class's CLASS-NAME / TYPE-OF is the
+        // same symbol the reader and interpreter produce — no reserved 0xFFFE_*
+        // indices that don't correspond to any actual symbol.
+        let nm = |name: &str| BlissVal::from_symbol_index(bliss_rt::symbols::intern(name));
         let t_nm = T;
-        let std_nm = BlissVal::from_symbol_index(0xFFFE_0001);
-        let fix_nm = BlissVal::from_symbol_index(0xFFFE_0002);
-        let chr_nm = BlissVal::from_symbol_index(0xFFFE_0003);
-        let sym_nm = BlissVal::from_symbol_index(0xFFFE_0004);
-        let nul_nm = BlissVal::from_symbol_index(0xFFFE_0005);
-        let con_nm = BlissVal::from_symbol_index(0xFFFE_0006);
-        let flt_nm = BlissVal::from_symbol_index(0xFFFE_0007);
-        let fun_nm = BlissVal::from_symbol_index(0xFFFE_0008);
-        let hpo_nm = BlissVal::from_symbol_index(0xFFFE_0009);
+        let std_nm = nm("STANDARD-OBJECT");
+        let fix_nm = nm("FIXNUM");
+        let chr_nm = nm("CHARACTER");
+        let sym_nm = nm("SYMBOL");
+        let nul_nm = nm("NULL");
+        let con_nm = nm("CONS");
+        let flt_nm = nm("FLOAT");
+        let fun_nm = nm("FUNCTION");
+        let hpo_nm = nm("HEAP-OBJECT");
 
         // T — root, no supers
         st.class_registry.insert(t_nm, t_cls);

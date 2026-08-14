@@ -1076,12 +1076,10 @@ fn is_internal_frame(name: &str) -> bool {
 fn func_val_from_name(name: &str) -> BlissVal {
     // Check if this is a Bliss function by looking for bliss-related names
     if name.contains("bliss_") || name.contains("bliss::") {
-        // Create a symbol index from the function name hash
-        let mut hash: u32 = 0;
-        for b in name.bytes() {
-            hash = hash.wrapping_mul(31).wrapping_add(b as u32);
-        }
-        BlissVal::from_symbol_index(hash & 0x00FFFFFF)
+        // Intern the actual function name into the shared registry (bliss-jtc.6
+        // Stage E) instead of hashing it into a synthetic index that corresponds
+        // to no real symbol and can collide.
+        BlissVal::from_symbol_index(bliss_rt::symbols::intern(name))
     } else {
         // Foreign frame — use T as marker
         T

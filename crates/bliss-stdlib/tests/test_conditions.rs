@@ -36,15 +36,15 @@ fn condition_values_participate_in_the_root_and_error_hierarchies() {
     // CLOS instances, and DEFINE-CONDITION-backed types must participate in the
     // observable class hierarchy seen by handler dispatch.
     assert_eq!(
-        handler_case(simple, &[(sym(SYMBOL_ERROR), fx(1))]).unwrap(),
+        handler_case(simple, &[(sym(*SYMBOL_ERROR), fx(1))]).unwrap(),
         fx(1)
     );
     assert_eq!(
-        handler_case(simple, &[(sym(SYMBOL_CONDITION), fx(2))]).unwrap(),
+        handler_case(simple, &[(sym(*SYMBOL_CONDITION), fx(2))]).unwrap(),
         fx(2)
     );
     assert_eq!(
-        handler_case(typed, &[(sym(SYMBOL_ERROR), fx(3))]).unwrap(),
+        handler_case(typed, &[(sym(*SYMBOL_ERROR), fx(3))]).unwrap(),
         fx(3)
     );
 }
@@ -122,7 +122,7 @@ fn handler_case_no_signal() {
 
 #[test]
 fn handler_case_nested_with_signal() {
-    let error_type = sym(SYMBOL_ERROR);
+    let error_type = sym(*SYMBOL_ERROR);
     let outer_handler = fx(100);
     let inner_handler = fx(200);
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -153,8 +153,8 @@ fn handler_case_nested_with_signal() {
 
 #[test]
 fn handler_case_nested_propagation() {
-    let inner_type = sym(SYMBOL_SIMPLE_WARNING);
-    let outer_type = sym(SYMBOL_ERROR);
+    let inner_type = sym(*SYMBOL_SIMPLE_WARNING);
+    let outer_type = sym(*SYMBOL_ERROR);
     let outer_handler = fx(300);
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen_for_hook = Arc::clone(&seen);
@@ -419,7 +419,7 @@ fn cleanup_runs_when_handler_transfer_unwinds_the_dynamic_extent() {
     // scopes must still run when control transfers out through the handler path.
     let unwound = panic::catch_unwind(AssertUnwindSafe(|| {
         let _guard = CleanupGuard(cleanup_for_drop);
-        let _ = handler_bind_fn(&[(sym(SYMBOL_ERROR), handler)], || {
+        let _ = handler_bind_fn(&[(sym(*SYMBOL_ERROR), handler)], || {
             signal_condition(make_simple_error("cleanup", &[]))?;
             Ok(fx(0))
         });
@@ -447,11 +447,11 @@ fn break_on_signals_invokes_break_before_handler_search() {
         Ok(NIL)
     });
     set_debugger_hook(Some(hook));
-    set_break_on_signals(Some(sym(SYMBOL_ERROR)));
+    set_break_on_signals(Some(sym(*SYMBOL_ERROR)));
 
     // Per R5.203, BREAK must run before the normal handler search when the
     // signalled condition matches *BREAK-ON-SIGNALS*.
-    assert!(handler_bind_fn(&[(sym(SYMBOL_ERROR), handler)], || {
+    assert!(handler_bind_fn(&[(sym(*SYMBOL_ERROR), handler)], || {
         signal_condition(make_simple_error("debug", &[]))?;
         Ok(NIL)
     })

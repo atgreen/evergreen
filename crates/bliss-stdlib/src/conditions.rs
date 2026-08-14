@@ -20,67 +20,85 @@ use crate::streams::make_lisp_string_fresh;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Once;
+use std::sync::{LazyLock, Once};
 
-// ── Well-known symbol indices ────────────────────────────────────
+// ── Well-known condition-system symbols ──────────────────────────
 //
-// These are reserved symbol-table slots for condition-system names.
-// Using named constants instead of magic numbers (fixes issue 8).
+// The standard CONDITION-hierarchy names, lazily interned into the one shared
+// symbol registry (bliss-jtc.6 Stage E). A condition symbol here is therefore
+// the *same* object the reader and interpreter produce for that name — no more
+// hardcoded symbol-table indices that could collide with the reader's
+// sequential interning (the root cause behind bliss-5mf). Each `SYMBOL_X` is a
+// `LazyLock<u32>`; dereference (`*SYMBOL_X`) to get the interned index.
 
-/// Symbol index for the CONTINUE restart name.
-pub const SYMBOL_CONTINUE: u32 = 110;
-/// Symbol index for the MUFFLE-WARNING restart name.
-pub const SYMBOL_MUFFLE_WARNING: u32 = 111;
-const INTERNAL_CONTINUE_RESTART_FN: u32 = 112;
-const INTERNAL_MUFFLE_WARNING_RESTART_FN: u32 = 113;
+/// The CONTINUE restart name.
+pub static SYMBOL_CONTINUE: LazyLock<u32> = LazyLock::new(|| intern_name("CONTINUE"));
+/// The MUFFLE-WARNING restart name.
+pub static SYMBOL_MUFFLE_WARNING: LazyLock<u32> = LazyLock::new(|| intern_name("MUFFLE-WARNING"));
+// Internal restart-function sentinels: distinct interned markers under reserved,
+// %-prefixed names so they can never alias a user-written or CL symbol.
+static INTERNAL_CONTINUE_RESTART_FN: LazyLock<u32> =
+    LazyLock::new(|| intern_name("%BLISS-CONTINUE-RESTART-FN"));
+static INTERNAL_MUFFLE_WARNING_RESTART_FN: LazyLock<u32> =
+    LazyLock::new(|| intern_name("%BLISS-MUFFLE-WARNING-RESTART-FN"));
 
-/// Symbol index for the CONDITION type (root of the condition hierarchy).
-pub const SYMBOL_CONDITION: u32 = 100;
-/// Symbol index for WARNING.
-pub const SYMBOL_WARNING: u32 = 101;
-/// Symbol index for SERIOUS-CONDITION.
-pub const SYMBOL_SERIOUS_CONDITION: u32 = 102;
-/// Symbol index for ERROR.
-pub const SYMBOL_ERROR: u32 = 103;
-/// Symbol index for SIMPLE-ERROR.
-pub const SYMBOL_SIMPLE_ERROR: u32 = 104;
-/// Symbol index for TYPE-ERROR.
-pub const SYMBOL_TYPE_ERROR: u32 = 105;
-/// Symbol index for SIMPLE-WARNING.
-pub const SYMBOL_SIMPLE_WARNING: u32 = 106;
-/// Symbol index for CONTROL-ERROR.
-pub const SYMBOL_CONTROL_ERROR: u32 = 107;
-pub const SYMBOL_SIMPLE_CONDITION: u32 = 108;
-pub const SYMBOL_STORAGE_CONDITION: u32 = 109;
-const SYMBOL_FORMAT_CONTROL: u32 = 120;
-const SYMBOL_FORMAT_ARGUMENTS: u32 = 121;
-const SYMBOL_DATUM: u32 = 122;
-const SYMBOL_EXPECTED_TYPE: u32 = 123;
+/// The CONDITION type (root of the condition hierarchy).
+pub static SYMBOL_CONDITION: LazyLock<u32> = LazyLock::new(|| intern_name("CONDITION"));
+/// WARNING.
+pub static SYMBOL_WARNING: LazyLock<u32> = LazyLock::new(|| intern_name("WARNING"));
+/// SERIOUS-CONDITION.
+pub static SYMBOL_SERIOUS_CONDITION: LazyLock<u32> =
+    LazyLock::new(|| intern_name("SERIOUS-CONDITION"));
+/// ERROR.
+pub static SYMBOL_ERROR: LazyLock<u32> = LazyLock::new(|| intern_name("ERROR"));
+/// SIMPLE-ERROR.
+pub static SYMBOL_SIMPLE_ERROR: LazyLock<u32> = LazyLock::new(|| intern_name("SIMPLE-ERROR"));
+/// TYPE-ERROR.
+pub static SYMBOL_TYPE_ERROR: LazyLock<u32> = LazyLock::new(|| intern_name("TYPE-ERROR"));
+/// SIMPLE-WARNING.
+pub static SYMBOL_SIMPLE_WARNING: LazyLock<u32> = LazyLock::new(|| intern_name("SIMPLE-WARNING"));
+/// CONTROL-ERROR.
+pub static SYMBOL_CONTROL_ERROR: LazyLock<u32> = LazyLock::new(|| intern_name("CONTROL-ERROR"));
+/// SIMPLE-CONDITION.
+pub static SYMBOL_SIMPLE_CONDITION: LazyLock<u32> =
+    LazyLock::new(|| intern_name("SIMPLE-CONDITION"));
+/// STORAGE-CONDITION.
+pub static SYMBOL_STORAGE_CONDITION: LazyLock<u32> =
+    LazyLock::new(|| intern_name("STORAGE-CONDITION"));
+static SYMBOL_FORMAT_CONTROL: LazyLock<u32> = LazyLock::new(|| intern_name("FORMAT-CONTROL"));
+static SYMBOL_FORMAT_ARGUMENTS: LazyLock<u32> = LazyLock::new(|| intern_name("FORMAT-ARGUMENTS"));
+static SYMBOL_DATUM: LazyLock<u32> = LazyLock::new(|| intern_name("DATUM"));
+static SYMBOL_EXPECTED_TYPE: LazyLock<u32> = LazyLock::new(|| intern_name("EXPECTED-TYPE"));
+
+/// Intern a condition-system symbol name into the shared registry.
+fn intern_name(name: &str) -> u32 {
+    bliss_rt::symbols::intern(name)
+}
 const INTERNAL_HANDLER_CASE_FN_BASE: i64 = -9_000_000;
 const STORAGE_CONDITION_POOL_SIZE: usize = 4;
 
-/// All known condition-type symbol indices (used for hierarchy discrimination).
-const KNOWN_CONDITION_TYPES: &[u32] = &[
-    SYMBOL_CONDITION,
-    SYMBOL_WARNING,
-    SYMBOL_SERIOUS_CONDITION,
-    SYMBOL_ERROR,
-    SYMBOL_SIMPLE_ERROR,
-    SYMBOL_TYPE_ERROR,
-    SYMBOL_SIMPLE_WARNING,
-    SYMBOL_CONTROL_ERROR,
-    SYMBOL_SIMPLE_CONDITION,
-    SYMBOL_STORAGE_CONDITION,
+/// Names of all builtin condition types (used for hierarchy discrimination).
+const KNOWN_CONDITION_TYPE_NAMES: &[&str] = &[
+    "CONDITION",
+    "WARNING",
+    "SERIOUS-CONDITION",
+    "ERROR",
+    "SIMPLE-ERROR",
+    "TYPE-ERROR",
+    "SIMPLE-WARNING",
+    "CONTROL-ERROR",
+    "SIMPLE-CONDITION",
+    "STORAGE-CONDITION",
 ];
 
 /// Check whether a BlissVal represents a known condition type symbol.
 fn is_known_condition_type(val: BlissVal) -> bool {
     if (val.0 & 0b111) == TAG_SYMBOL {
-        let idx = val.as_symbol_index();
-        KNOWN_CONDITION_TYPES.contains(&idx)
-    } else {
-        false
+        if let Some(name) = bliss_rt::symbols::symbol_name(val.as_symbol_index()) {
+            return KNOWN_CONDITION_TYPE_NAMES.contains(&name.as_str());
+        }
     }
+    false
 }
 
 // ── Funcall hook ─────────────────────────────────────────────────
@@ -117,8 +135,8 @@ pub fn clear_funcall_hook() {
 
 /// Call a function value with args, going through the hook if set.
 fn funcall(function: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
-    if function == BlissVal::from_symbol_index(INTERNAL_CONTINUE_RESTART_FN)
-        || function == BlissVal::from_symbol_index(INTERNAL_MUFFLE_WARNING_RESTART_FN)
+    if function == BlissVal::from_symbol_index(*INTERNAL_CONTINUE_RESTART_FN)
+        || function == BlissVal::from_symbol_index(*INTERNAL_MUFFLE_WARNING_RESTART_FN)
     {
         return Ok(args.first().copied().unwrap_or(NIL));
     }
@@ -265,27 +283,27 @@ thread_local! {
 
 // ── Condition construction ────────────────────────────────────────
 
-fn condition_class_spec(name: u32) -> (&'static [u32], &'static [u32]) {
+/// `(superclass names, slot names)` for each builtin condition type, keyed by
+/// name. Interned lazily by `ensure_condition_class`; expressing the hierarchy in
+/// names keeps it independent of interning order.
+fn condition_class_spec(name: &str) -> (&'static [&'static str], &'static [&'static str]) {
     match name {
-        SYMBOL_CONDITION => (&[], &[]),
-        SYMBOL_SERIOUS_CONDITION => (&[SYMBOL_CONDITION], &[]),
-        SYMBOL_ERROR => (&[SYMBOL_SERIOUS_CONDITION], &[]),
-        SYMBOL_WARNING => (&[SYMBOL_CONDITION], &[]),
-        SYMBOL_SIMPLE_CONDITION => (
-            &[SYMBOL_CONDITION],
-            &[SYMBOL_FORMAT_CONTROL, SYMBOL_FORMAT_ARGUMENTS],
-        ),
-        SYMBOL_SIMPLE_ERROR => (&[SYMBOL_ERROR, SYMBOL_SIMPLE_CONDITION], &[]),
-        SYMBOL_TYPE_ERROR => (&[SYMBOL_ERROR], &[SYMBOL_DATUM, SYMBOL_EXPECTED_TYPE]),
-        SYMBOL_SIMPLE_WARNING => (&[SYMBOL_WARNING, SYMBOL_SIMPLE_CONDITION], &[]),
-        SYMBOL_CONTROL_ERROR => (&[SYMBOL_ERROR], &[]),
-        SYMBOL_STORAGE_CONDITION => (&[SYMBOL_SERIOUS_CONDITION], &[]),
-        _ => (&[SYMBOL_CONDITION], &[]),
+        "CONDITION" => (&[], &[]),
+        "SERIOUS-CONDITION" => (&["CONDITION"], &[]),
+        "ERROR" => (&["SERIOUS-CONDITION"], &[]),
+        "WARNING" => (&["CONDITION"], &[]),
+        "SIMPLE-CONDITION" => (&["CONDITION"], &["FORMAT-CONTROL", "FORMAT-ARGUMENTS"]),
+        "SIMPLE-ERROR" => (&["ERROR", "SIMPLE-CONDITION"], &[]),
+        "TYPE-ERROR" => (&["ERROR"], &["DATUM", "EXPECTED-TYPE"]),
+        "SIMPLE-WARNING" => (&["WARNING", "SIMPLE-CONDITION"], &[]),
+        "CONTROL-ERROR" => (&["ERROR"], &[]),
+        "STORAGE-CONDITION" => (&["SERIOUS-CONDITION"], &[]),
+        _ => (&["CONDITION"], &[]),
     }
 }
 
-fn ensure_condition_class(name: u32) -> Result<BlissVal, BlissError> {
-    let sym = BlissVal::from_symbol_index(name);
+fn ensure_condition_class(name: &str) -> Result<BlissVal, BlissError> {
+    let sym = BlissVal::from_symbol_index(intern_name(name));
     if let Some(class) = find_class(sym) {
         return Ok(class);
     }
@@ -298,24 +316,31 @@ fn ensure_condition_class(name: u32) -> Result<BlissVal, BlissError> {
     let (supers, slots) = condition_class_spec(name);
     let super_vals: Vec<BlissVal> = supers
         .iter()
-        .map(|idx| ensure_condition_class(*idx))
+        .map(|n| ensure_condition_class(n))
         .collect::<Result<_, _>>()?;
-    let slot_vals: Vec<BlissVal> = slots.iter().map(|idx| BlissVal::from_symbol_index(*idx)).collect();
+    let slot_vals: Vec<BlissVal> = slots
+        .iter()
+        .map(|n| BlissVal::from_symbol_index(intern_name(n)))
+        .collect();
     define_class(sym, sym, &super_vals, &slot_vals)?;
     Ok(sym)
 }
 
 fn ensure_builtin_condition_classes() -> Result<(), BlissError> {
-    ensure_condition_class(SYMBOL_CONDITION)?;
-    ensure_condition_class(SYMBOL_SERIOUS_CONDITION)?;
-    ensure_condition_class(SYMBOL_ERROR)?;
-    ensure_condition_class(SYMBOL_WARNING)?;
-    ensure_condition_class(SYMBOL_SIMPLE_CONDITION)?;
-    ensure_condition_class(SYMBOL_SIMPLE_ERROR)?;
-    ensure_condition_class(SYMBOL_TYPE_ERROR)?;
-    ensure_condition_class(SYMBOL_SIMPLE_WARNING)?;
-    ensure_condition_class(SYMBOL_CONTROL_ERROR)?;
-    ensure_condition_class(SYMBOL_STORAGE_CONDITION)?;
+    for name in [
+        "CONDITION",
+        "SERIOUS-CONDITION",
+        "ERROR",
+        "WARNING",
+        "SIMPLE-CONDITION",
+        "SIMPLE-ERROR",
+        "TYPE-ERROR",
+        "SIMPLE-WARNING",
+        "CONTROL-ERROR",
+        "STORAGE-CONDITION",
+    ] {
+        ensure_condition_class(name)?;
+    }
     Ok(())
 }
 
@@ -352,7 +377,7 @@ pub fn set_storage_condition_pool(instances: &[BlissVal]) -> Result<(), BlissErr
 
 fn initialize_storage_condition_pool() -> Result<(), BlissError> {
     ensure_builtin_condition_classes()?;
-    let class = ensure_condition_class(SYMBOL_STORAGE_CONDITION)?;
+    let class = ensure_condition_class("STORAGE-CONDITION")?;
     let mut pool = [NIL; STORAGE_CONDITION_POOL_SIZE];
     for entry in &mut pool {
         // D5.13 (bliss-4v8): the pool lives in the GC heap, pinned, so a moving
@@ -374,7 +399,7 @@ fn storage_condition_pool_is_live() -> bool {
         first != NIL
             && class_inherits_from(
                 class_of(first),
-                BlissVal::from_symbol_index(SYMBOL_STORAGE_CONDITION),
+                BlissVal::from_symbol_index(*SYMBOL_STORAGE_CONDITION),
             )
     })
 }
@@ -495,13 +520,13 @@ fn class_inherits_from(class: BlissVal, target: BlissVal) -> bool {
 /// recognize it as a condition value.
 pub fn make_simple_error(format_control: &str, _format_args: &[BlissVal]) -> BlissVal {
     initialize_condition_runtime_support().expect("bootstrap condition runtime support");
-    let class = ensure_condition_class(SYMBOL_SIMPLE_ERROR).expect("resolve SIMPLE-ERROR class");
+    let class = ensure_condition_class("SIMPLE-ERROR").expect("resolve SIMPLE-ERROR class");
     make_instance(
         class,
         &[
-            BlissVal::from_symbol_index(SYMBOL_FORMAT_CONTROL),
+            BlissVal::from_symbol_index(*SYMBOL_FORMAT_CONTROL),
             make_lisp_string_fresh(format_control),
-            BlissVal::from_symbol_index(SYMBOL_FORMAT_ARGUMENTS),
+            BlissVal::from_symbol_index(*SYMBOL_FORMAT_ARGUMENTS),
             NIL,
         ],
     )
@@ -514,13 +539,13 @@ pub fn make_simple_error(format_control: &str, _format_args: &[BlissVal]) -> Bli
 /// Registered as a condition in thread-local state.
 pub fn make_type_error(datum: BlissVal, expected_type: BlissVal) -> BlissVal {
     initialize_condition_runtime_support().expect("bootstrap condition runtime support");
-    let class = ensure_condition_class(SYMBOL_TYPE_ERROR).expect("resolve TYPE-ERROR class");
+    let class = ensure_condition_class("TYPE-ERROR").expect("resolve TYPE-ERROR class");
     make_instance(
         class,
         &[
-            BlissVal::from_symbol_index(SYMBOL_DATUM),
+            BlissVal::from_symbol_index(*SYMBOL_DATUM),
             datum,
-            BlissVal::from_symbol_index(SYMBOL_EXPECTED_TYPE),
+            BlissVal::from_symbol_index(*SYMBOL_EXPECTED_TYPE),
             expected_type,
         ],
     )
@@ -529,7 +554,7 @@ pub fn make_type_error(datum: BlissVal, expected_type: BlissVal) -> BlissVal {
 
 /// Check if a BlissVal is a condition instance rooted at CONDITION.
 fn is_condition(val: BlissVal) -> bool {
-    class_inherits_from(class_of(val), BlissVal::from_symbol_index(SYMBOL_CONDITION))
+    class_inherits_from(class_of(val), BlissVal::from_symbol_index(*SYMBOL_CONDITION))
 }
 
 /// Check if a handler's condition-type specification matches a given condition.
@@ -653,10 +678,10 @@ pub fn error_condition(condition: BlissVal) -> Result<(), BlissError> {
 /// the CONTINUE restart allows returning from the debugger.
 pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissError> {
     // Establish a CONTINUE restart using the named constant (issue 8 fix).
-    let continue_name = BlissVal::from_symbol_index(SYMBOL_CONTINUE);
+    let continue_name = BlissVal::from_symbol_index(*SYMBOL_CONTINUE);
     let continue_restart = RestartEntry {
         name: continue_name,
-        function: BlissVal::from_symbol_index(INTERNAL_CONTINUE_RESTART_FN),
+        function: BlissVal::from_symbol_index(*INTERNAL_CONTINUE_RESTART_FN),
         report_function: None,
         interactive_function: None,
         test_function: None,
@@ -701,10 +726,10 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
 pub fn warn_condition(condition: BlissVal) -> Result<(), BlissError> {
     initialize_condition_runtime_support()?;
     // Establish a MUFFLE-WARNING restart using the named constant (issue 8 fix).
-    let muffle_name = BlissVal::from_symbol_index(SYMBOL_MUFFLE_WARNING);
+    let muffle_name = BlissVal::from_symbol_index(*SYMBOL_MUFFLE_WARNING);
     let muffle_restart = RestartEntry {
         name: muffle_name,
-        function: BlissVal::from_symbol_index(INTERNAL_MUFFLE_WARNING_RESTART_FN),
+        function: BlissVal::from_symbol_index(*INTERNAL_MUFFLE_WARNING_RESTART_FN),
         report_function: None,
         interactive_function: None,
         test_function: None,
@@ -1083,7 +1108,7 @@ pub fn invoke_restart(restart: BlissVal, args: &[BlissVal]) -> Result<BlissVal, 
     // If invoking MUFFLE-WARNING, set the muffled flag so warn_condition
     // knows to suppress the warning message (issue 2 fix).
     if let Some((_, name)) = restart_entry {
-        let muffle_name = BlissVal::from_symbol_index(SYMBOL_MUFFLE_WARNING);
+        let muffle_name = BlissVal::from_symbol_index(*SYMBOL_MUFFLE_WARNING);
         if name == muffle_name {
             WARNING_MUFFLED.with(|m| *m.borrow_mut() = true);
         }
