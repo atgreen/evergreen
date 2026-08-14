@@ -462,6 +462,45 @@ impl HeapCollector {
         }
     }
 
+    /// Relocate CL-stack references to evacuated objects (nmq.3): walk every CL
+    /// frame and, for each heap reference whose object has been forwarded,
+    /// rewrite the frame slot to the object's new location (preserving the tag).
+    /// Must run after copying installs forwarding pointers and before the source
+    /// regions are zeroed. `heap_base`/`heap_size` bound the check so a frame
+    /// slot pointing outside the managed heap is never dereferenced.
+    fn relocate_cl_stack_refs(heap_base: usize, heap_size: usize) {
+        let mut chase = |slot: &mut crate::value::BlissVal| {
+            let tag = slot.0 & 0b111;
+            let body = (slot.0 & !0b111) as usize;
+            if body < heap_base || body >= heap_base + heap_size || body < OBJECT_HEADER_SIZE {
+                return;
+            }
+            let header = body - OBJECT_HEADER_SIZE;
+            // SAFETY: `body` is within the managed heap; its header precedes it.
+            let type_id = unsafe { *(header as *const u8) };
+            if type_id == FORWARDED_TYPE_ID {
+                // SAFETY: a forwarded object stores its new body pointer at the
+                // body address (offset 8 from the header).
+                let new_body = unsafe { *(body as *const usize) };
+                slot.0 = (new_body as u64) | tag;
+            }
+        };
+        let mut relocate_from = |fp: *const crate::stack::Frame| {
+            // SAFETY: `fp` is a valid frame chain.
+            unsafe { crate::stack::visit_stack_refs(fp, &mut chase) };
+        };
+        let cur = crate::thread::current_thread_id();
+        relocate_from(crate::thread::current_thread().stack().fp());
+        for id in crate::thread::all_thread_ids() {
+            if id == cur {
+                continue;
+            }
+            if let Some(fp) = crate::thread::thread_published_fp(id) {
+                relocate_from(fp);
+            }
+        }
+    }
+
     /// Create a new collector. The heap must already be initialized.
     pub fn new() -> Self {
         let stats = heap_stats();
@@ -995,7 +1034,17 @@ impl Collector for HeapCollector {
                 cursor += total_size;
             }
 
-            // Free the evacuated region.
+        }
+
+        // Relocate CL-stack references to evacuated (forwarded) objects before
+        // the source regions are zeroed, so objects held only in interpreter (T0)
+        // or compiled (T1) frames survive and their frame slots point at the new
+        // locations (nmq.3).
+        Self::relocate_cl_stack_refs(heap_base_addr, heap_size);
+
+        // Now free the evacuated regions — their forwarding pointers are no
+        // longer needed.
+        for &evac_idx in &evacuation_set {
             let region = &mut state.regions[evac_idx];
             let region_used =
                 (region.header.alloc_top as usize).saturating_sub(region.base as usize);
