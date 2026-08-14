@@ -215,6 +215,20 @@ const CORPUS: &[&str] = &[
     "(sort (list (list 2) (list 1)) (function <) :key (function car))",
     "(count 2 '(1 2 2 3 2) :test (function =))",
     "(remove 1 '((1 a) (2 b) (1 c)) :key (function car) :test-not (function =))",
+    // ── flet / labels on bytecode (nmq.6 coverage) ──
+    "(flet ((sq (x) (* x x))) (sq 7))",
+    "(flet ((add (a b) (+ a b)) (mul (a b) (* a b))) (+ (add 2 3) (mul 2 3)))",
+    "(labels ((g (k) (if (= k 0) 0 (g (- k 1))))) (g 100))",
+    "(labels ((ev (n) (if (= n 0) t (od (- n 1)))) (od (n) (if (= n 0) nil (ev (- n 1))))) (ev 11))",
+    "(defun f (n) (labels ((g (k acc) (if (= k 0) acc (g (- k 1) (+ acc k))))) (g n 0))) (f 100)",
+];
+
+/// Full programs whose deep recursion must be bounded by the BlissStack
+/// (raising a catchable STORAGE-CONDITION), proving they run on the bytecode
+/// backend rather than the tree-walker's host-stack guard.
+const DEEP_RECURSION_BOUNDED: &[&str] = &[
+    "(defun down (n) (if (= n 0) (quote done) (down (- n 1)))) (handler-case (down 100000000) (storage-condition () (quote caught)))",
+    "(handler-case (labels ((g (k) (if (= k 0) 0 (g (- k 1))))) (g 100000000)) (storage-condition () (quote caught)))",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a
@@ -268,17 +282,17 @@ fn control_flow_programs_run_on_bytecode() {
 
 /// Deep recursion under the bytecode backend is bounded by the `BlissStack`
 /// capacity and raises a catchable `STORAGE-CONDITION` (R2.20) — it must not
-/// abort the process.
+/// abort the process. Covers plain recursion and labels-local recursion.
 #[test]
 fn deep_recursion_raises_catchable_storage_condition() {
-    let program = "(defun down (n) (if (= n 0) (quote done) (down (- n 1)))) \
-                   (handler-case (down 100000000) (storage-condition () (quote caught)))";
-    let (out, ok) = run(program, true);
-    assert!(ok, "should exit cleanly after catching STORAGE-CONDITION");
-    assert!(
-        out.contains("CAUGHT"),
-        "deep recursion should be caught as STORAGE-CONDITION, got: {out:?}"
-    );
+    for program in DEEP_RECURSION_BOUNDED {
+        let (out, ok) = run(program, true);
+        assert!(ok, "should exit cleanly after catching STORAGE-CONDITION: {program}");
+        assert!(
+            out.contains("CAUGHT"),
+            "deep recursion should be caught as STORAGE-CONDITION for {program}, got: {out:?}"
+        );
+    }
 }
 
 /// The `BlissStack` bound scales with `BLISS_STACK_SIZE`: a depth that fits a

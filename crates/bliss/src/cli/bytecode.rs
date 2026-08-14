@@ -327,6 +327,10 @@ struct Lowerer<'e> {
     /// Names captured by a nested closure — these locals live in the shared
     /// heap `EnvFrame` (boxed) instead of a frame slot.
     captured_names: std::collections::HashSet<String>,
+    /// Lexically-visible local functions (flet/labels): name → the gensym symbol
+    /// index its compiled body is registered under. A call to such a name lowers
+    /// to a bytecode `CallNamed` on that gensym.
+    local_fns: std::collections::HashMap<String, u32>,
     /// Whether this function needs a heap `EnvFrame` (has a boxed local).
     has_env: bool,
     /// Next free local slot index.
@@ -371,6 +375,7 @@ impl<'e> Lowerer<'e> {
             constants: Vec::new(),
             scopes: vec![HashMap::new()],
             captured_names: std::collections::HashSet::new(),
+            local_fns: std::collections::HashMap::new(),
             has_env: false,
             next_local: 0,
             n_locals: 0,
@@ -568,6 +573,8 @@ impl<'e> Lowerer<'e> {
                 "MULTIPLE-VALUE-LIST" => self.lower_mvlist(rest),
                 "LAMBDA" => self.lower_lambda(op, rest),
                 "FUNCTION" => self.lower_function(rest),
+                "FLET" => self.lower_flet(rest, false),
+                "LABELS" => self.lower_flet(rest, true),
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
@@ -964,6 +971,25 @@ impl<'e> Lowerer<'e> {
     }
 
     fn lower_call(&mut self, name: &str, op: BlissVal, rest: BlissVal) -> LowerResult<()> {
+        // A lexically-visible local function (flet/labels): call its compiled
+        // body directly by the gensym it is registered under.
+        if let Some(&sym) = self.local_fns.get(name) {
+            let args = list_to_vec(rest);
+            let nargs = args.len();
+            if nargs > u16::MAX as usize {
+                return Err(Bail);
+            }
+            for a in args {
+                self.lower_expr(a)?;
+            }
+            self.emit(Instr::CallNamed {
+                sym,
+                nargs: nargs as u16,
+            });
+            self.pop_n(nargs as u16);
+            self.push_n(1);
+            return Ok(());
+        }
         // Never treat a macro or an unhandled special operator as a call.
         if self.env.macros.contains_key(name) || is_bail_special(name) {
             return Err(Bail);
@@ -1631,6 +1657,138 @@ impl<'e> Lowerer<'e> {
         let form = arena_cons(function_sym, rest);
         self.emit_closure(form, &captured)
     }
+
+    /// `(flet ((name params body...)...) body...)` / `(labels (...) body...)`.
+    ///
+    /// Each local function's body is compiled to a `BytecodeFunction`, registered
+    /// under a fresh gensym, and calls to it lower to a bytecode `CallNamed` on
+    /// that gensym — so local (and mutually) recursive functions run on the
+    /// BlissStack, bounded recursion. Local functions must be non-capturing (no
+    /// enclosing lexical local) since a `CallNamed` callee gets no heap-frame
+    /// inheritance; anything unsupported inside bails the whole form (so no
+    /// tree-walker `env.funs` scoping is needed).
+    fn lower_flet(&mut self, rest: BlissVal, is_labels: bool) -> LowerResult<()> {
+        let (defs_form, body) = cp(rest);
+        let defs = list_to_vec(defs_form);
+
+        // Parse (name params . fbody) and gensym each local function.
+        let mut parsed: Vec<(String, u32, BlissVal, BlissVal)> = Vec::new();
+        for d in &defs {
+            if !d.is_cons() {
+                return Err(Bail);
+            }
+            let (name_form, d_rest) = cp(*d);
+            if !name_form.is_symbol() {
+                return Err(Bail);
+            }
+            let (params_form, fbody) = cp(d_rest);
+            // A colon would be read as a package separator, so keep the gensym
+            // name colon-free and unique.
+            let gname = next_control_token("__FLET__").replace(':', "_");
+            let gensym = resolve_sym(&gname).ok_or(Bail)?.as_symbol_index();
+            parsed.push((sym_name(name_form), gensym, params_form, fbody));
+        }
+
+        // Non-capturing check: no local function body may reference an enclosing
+        // lexical local.
+        let enclosing: std::collections::HashSet<String> =
+            self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
+        for (_, _, params_form, fbody) in &parsed {
+            let params: std::collections::HashSet<String> = list_to_vec(*params_form)
+                .iter()
+                .filter(|p| p.is_symbol())
+                .map(|p| sym_name(*p))
+                .filter(|n| !n.starts_with('&'))
+                .collect();
+            let mut used = std::collections::HashSet::new();
+            for f in list_to_vec(*fbody) {
+                collect_symbol_names(f, &mut used);
+            }
+            if used
+                .iter()
+                .any(|u| enclosing.contains(u) && !params.contains(u))
+            {
+                return Err(Bail);
+            }
+        }
+
+        let saved_local_fns = self.local_fns.clone();
+
+        // LABELS bodies see all siblings + self; FLET bodies do not.
+        let body_local_fns = if is_labels {
+            let mut m = self.local_fns.clone();
+            for (name, sym, _, _) in &parsed {
+                m.insert(name.clone(), *sym);
+            }
+            m
+        } else {
+            self.local_fns.clone()
+        };
+
+        // Compile and register each local function body.
+        for (_, sym, params_form, fbody) in &parsed {
+            let bf = compile_local_function(*params_form, *fbody, self.env, &body_local_fns)
+                .ok_or(Bail)?;
+            registry_put(*sym, Rc::new(bf));
+        }
+
+        // Compile the form body with all local functions visible.
+        for (name, sym, _, _) in &parsed {
+            self.local_fns.insert(name.clone(), *sym);
+        }
+        let r = self.lower_progn(body);
+        self.local_fns = saved_local_fns;
+        r
+    }
+}
+
+/// Compile a local (flet/labels) function body to a [`BytecodeFunction`],
+/// inheriting the visible local-function namespace so sibling/self calls
+/// resolve. Returns `None` on any unsupported form.
+fn compile_local_function(
+    params_form: BlissVal,
+    fbody: BlissVal,
+    env: &Env,
+    local_fns: &std::collections::HashMap<String, u32>,
+) -> Option<BytecodeFunction> {
+    let params = list_to_vec(params_form);
+    let mut param_names = Vec::new();
+    for p in &params {
+        if !p.is_symbol() {
+            return None;
+        }
+        let pn = sym_name(*p);
+        if pn.starts_with('&') {
+            return None;
+        }
+        param_names.push(pn);
+    }
+    let mut lo = Lowerer::new(env);
+    lo.local_fns = local_fns.clone();
+    lo.captured_names = compute_captured_names(fbody);
+    let mut param_layout = Vec::with_capacity(param_names.len());
+    for pn in &param_names {
+        let loc = lo.alloc_local(pn);
+        param_layout.push((pn.clone(), loc));
+    }
+    if lower_body(&mut lo, fbody).is_err() {
+        return None;
+    }
+    lo.emit(Instr::Return);
+    Some(BytecodeFunction {
+        code: lo.code,
+        constants: lo.constants,
+        handler_cases: lo.handler_cases,
+        handler_binds: lo.handler_binds,
+        names: lo.names,
+        restart_cases: lo.restart_cases,
+        param_layout,
+        has_env: lo.has_env,
+        n_locals: lo.n_locals,
+        max_stack: lo.max_stack.max(1),
+        arity: param_names.len() as u16,
+        name: "<flet>".to_string(),
+    })
 }
 
 /// Collect the names of all symbols appearing in `form` (recursively), except
@@ -1680,8 +1838,6 @@ fn is_bail_special(name: &str) -> bool {
             | "DEFVAR"
             | "DEFPARAMETER"
             | "DEFCONSTANT"
-            | "FLET"
-            | "LABELS"
             | "MACROLET"
             | "SYMBOL-MACROLET"
             | "THE"
