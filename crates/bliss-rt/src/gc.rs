@@ -1156,6 +1156,7 @@ impl Collector for HeapCollector {
         crate::symbols::for_each_root_slot(|slot| unsafe {
             relocate_slot(slot, heap_base_addr, heap_end)
         });
+        scan_external_roots(|slot| unsafe { relocate_slot(slot, heap_base_addr, heap_end) });
 
         // Phase 4: Reset all nursery regions for reuse (after relocation, above,
         // read their forwarding pointers). Retained pinned regions were promoted
@@ -1326,6 +1327,12 @@ impl Collector for HeapCollector {
             let v = unsafe { *slot };
             mark_ref(v, &mut marked, &mut scan_worklist);
         });
+        // External roots (bliss-jtc.8): BlissVals owned outside the GC heap, e.g.
+        // hash-table entries in a Rust Vec.
+        scan_external_roots(|slot| {
+            let v = unsafe { *slot };
+            mark_ref(v, &mut marked, &mut scan_worklist);
+        });
 
         // Transitive closure: trace only the reference fields of each marked
         // object, following its type_id-specific layout.
@@ -1484,6 +1491,7 @@ impl Collector for HeapCollector {
         crate::symbols::for_each_root_slot(|slot| unsafe {
             relocate_slot(slot, heap_base_addr, heap_end)
         });
+        scan_external_roots(|slot| unsafe { relocate_slot(slot, heap_base_addr, heap_end) });
 
         // Now free the evacuated regions — their forwarding pointers are no
         // longer needed.
@@ -1820,6 +1828,42 @@ pub fn pin(v: BlissVal) {
 /// Release a pin taken with [`pin`], allowing the object to be moved again.
 pub fn unpin(v: BlissVal) {
     set_pin_bit(v, false);
+}
+
+// ── External root scanners (bliss-jtc.8) ─────────────────────────────────────
+//
+// Some Lisp-visible heap objects own `BlissVal` storage *outside* the GC heap —
+// e.g. a hash table's entries live in a Rust `Vec`. Their keys/values are still
+// live references the collector must mark and relocate. Such a module registers
+// a root scanner here; the collector calls every scanner during both the mark
+// and the relocate passes with a visitor that receives each root reference slot.
+//
+// The scanner runs while the collector holds the heap lock, so it must not
+// allocate on the GC heap or block on it. Registration is expected once, at
+// startup (idempotent by function pointer).
+
+/// A scanner that yields each external root reference slot to `visit`.
+pub type RootScanner = fn(&mut dyn FnMut(*mut BlissVal));
+
+fn root_scanners() -> &'static Mutex<Vec<RootScanner>> {
+    static S: OnceLock<Mutex<Vec<RootScanner>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register an external root scanner (idempotent by function pointer).
+pub fn register_root_scanner(f: RootScanner) {
+    let mut v = root_scanners().lock().unwrap();
+    if !v.iter().any(|&g| g as usize == f as usize) {
+        v.push(f);
+    }
+}
+
+/// Invoke every registered external root scanner with `visit`.
+fn scan_external_roots(mut visit: impl FnMut(*mut BlissVal)) {
+    let scanners = root_scanners().lock().unwrap().clone();
+    for s in scanners {
+        s(&mut visit);
+    }
 }
 
 // ── T0 evaluator allocation on the shared GC heap (bliss-jtc.1) ───

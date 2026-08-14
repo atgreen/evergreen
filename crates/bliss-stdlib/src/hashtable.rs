@@ -10,6 +10,53 @@
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{CompiledFunctionData, ConsCell, ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
+use std::collections::HashSet;
+use std::sync::{Mutex, Once};
+
+// ── GC root tracking for hash-table storage (bliss-jtc.8) ────────────────────
+//
+// A hash table's entries live in a Rust `Vec<Option<RHEntry>>` outside the GC
+// heap, so its keys/values are invisible to the collector. We track every live
+// table and register a root scanner (bliss_rt::gc) that yields each entry's key
+// and value slot, so the collector marks and relocates them like any other root.
+static LIVE_TABLES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static REGISTER_SCANNER: Once = Once::new();
+
+/// Track a newly-created table and ensure the GC root scanner is registered.
+fn register_live_table(ptr: usize) {
+    REGISTER_SCANNER.call_once(|| {
+        bliss_rt::gc::register_root_scanner(scan_hash_table_roots);
+    });
+    LIVE_TABLES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashSet::new)
+        .insert(ptr);
+}
+
+/// GC external root scanner: yield every live hash table's entry key and value
+/// slots so the collector marks + relocates them. Runs while the collector holds
+/// the heap lock, so it only reads the table registry and the (stable, leaked)
+/// entry Vecs — it never allocates on the GC heap.
+fn scan_hash_table_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let guard = LIVE_TABLES.lock().unwrap();
+    let Some(tables) = guard.as_ref() else {
+        return;
+    };
+    for &addr in tables {
+        // SAFETY: entries in LIVE_TABLES are leaked HashTableInner allocations
+        // that live for the process; their entry Vec is stable during a GC.
+        unsafe {
+            let inner = addr as *mut HashTableInner;
+            for slot in (*inner).entries.iter_mut() {
+                if let Some(entry) = slot.as_mut() {
+                    visit(&mut entry.key as *mut BlissVal);
+                    visit(&mut entry.value as *mut BlissVal);
+                }
+            }
+        }
+    }
+}
 
 /// Hash table test function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,6 +486,7 @@ pub fn make_hash_table(options: &MakeHashTableOptions) -> Result<BlissVal, Bliss
     });
 
     let ptr = Box::into_raw(inner) as *mut u8;
+    register_live_table(ptr as usize);
     let val = unsafe { BlissVal::from_heap_ptr(ptr) };
     Ok(val)
 }

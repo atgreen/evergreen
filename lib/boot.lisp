@@ -74,6 +74,21 @@
 (defmacro decf (place &rest delta)
   `(setf ,place (- ,place ,(if delta (car delta) 1))))
 
+;; with-hash-table-iterator: (with-hash-table-iterator (name table) . body)
+;; Within BODY, calling (name) returns (values more-p key value), advancing over
+;; a snapshot of TABLE's entries, and (values nil) once exhausted (bliss-jtc.8).
+(defmacro with-hash-table-iterator (spec &rest body)
+  (let ((name (car spec)) (table (car (cdr spec)))
+        (rest (gensym)) (pair (gensym)))
+    `(let ((,rest (hash-table-entries ,table)))
+       (flet ((,name ()
+                (if ,rest
+                    (let ((,pair (car ,rest)))
+                      (setq ,rest (cdr ,rest))
+                      (values t (car ,pair) (cdr ,pair)))
+                    (values nil))))
+         ,@body))))
+
 ;; define-modify-macro: define NAME so that (NAME place args...) expands to
 ;; (setf place (FUNCTION place args...)). Supports required and &rest args in
 ;; LAMBDA-LIST, which covers the standard uses (appendf, etc.).

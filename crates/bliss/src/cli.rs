@@ -4926,6 +4926,24 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(NIL);
             }
+            "SXHASH" => {
+                // (sxhash object): a hash code such that equal objects hash equal
+                // (ANSI); routed to the stdlib hash (bliss-jtc.8).
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                return Ok(bliss_stdlib::sxhash(v));
+            }
+            "HASH-TABLE-ENTRIES" => {
+                // Bliss helper: a fresh list of (key . value) pairs. Backs
+                // WITH-HASH-TABLE-ITERATOR (bliss-jtc.8).
+                let (tf, _) = cp(cdr);
+                let tbl = eval_form(tf, env)?;
+                let pairs: Vec<BlissVal> = bliss_stdlib::hash_table_entries(tbl)?
+                    .into_iter()
+                    .map(|(k, v)| arena_cons(k, v))
+                    .collect();
+                return Ok(vec_to_list(&pairs));
+            }
             "MAPCAR" => {
                 // (mapcar fn list1 list2 ...) — apply fn to successive tuples,
                 // stopping at the shortest list.
@@ -11563,6 +11581,24 @@ mod jtc8_hashtable_tests {
         .expect("maphash named");
         assert_eq!(out, BlissVal::from_fixnum(1));
     }
+
+    /// SXHASH: EQUAL objects hash equal (ANSI).
+    #[test]
+    fn sxhash_equal_objects_hash_equal() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            read_eval_all("(eql (sxhash \"abc\") (sxhash \"abc\"))").unwrap(),
+            T
+        );
+        assert_eq!(
+            read_eval_all("(eql (sxhash (list 1 2 3)) (sxhash (list 1 2 3)))").unwrap(),
+            T
+        );
+    }
+
+    // WITH-HASH-TABLE-ITERATOR is a boot.lisp macro, so it is covered by a
+    // subprocess test (tests/hashtable_cli.rs) that loads the bootstrap, not by
+    // the bootstrap-free read_eval_all helper.
 }
 
 #[cfg(test)]
