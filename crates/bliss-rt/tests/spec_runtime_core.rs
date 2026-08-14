@@ -324,6 +324,9 @@ fn helper_command(mode: &str) -> std::process::Command {
 
 fn run_helper(mode: &str, timeout: Duration) -> std::process::Output {
     let mut child = helper_command(mode)
+        // Null stdin so a helper subprocess can never block on the parent's
+        // inherited terminal (a TTY never sends EOF); it gets immediate EOF.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
