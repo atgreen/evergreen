@@ -3,12 +3,12 @@
 //! See spec §5.7.
 
 use bliss_rt::error::BlissError;
+use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, NIL, TAG_HEAP_OBJECT};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Internal data ─────────────────────────────────────────────────
 
@@ -57,7 +57,6 @@ static PATHNAME_STORE: Mutex<Option<HashMap<u64, PathnameRecord>>> = Mutex::new(
 static STRING_REGISTRY: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
 static STRING_REVERSE_REGISTRY: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
 static LOGICAL_TRANSLATIONS: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
-static PATHNAME_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn with_pathname_store<F, R>(f: F) -> R
 where
@@ -156,9 +155,24 @@ fn is_wild(val: BlissVal) -> bool {
 }
 
 fn alloc_pathname(rec: PathnameRecord) -> BlissVal {
-    let id = PATHNAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let raw = (id << 3) | TAG_HEAP_OBJECT;
-    let bv = BlissVal::from_raw(raw);
+    // A pathname is a REAL heap object carrying the PATHNAME type_id in its
+    // header (bliss-lb6.9), NOT a fake `(id << 3) | TAG_HEAP_OBJECT` sentinel.
+    // The old sentinel had the heap-object tag but pointed at a bogus low
+    // address, so `is_string()` (and the sequence functions built on it)
+    // dereferenced garbage and mistook a pathname for a string — crashing or
+    // walking off the end. With a real PATHNAME header, `is_string()` reads a
+    // genuine type_id and is false by construction, exactly as SBCL keeps
+    // PATHNAME a distinct type disjoint from STRING.
+    //
+    // The block is allocated off the GC heap (stable address, leaked like the
+    // CLOS-instance / stream side storage) and holds only the header; the
+    // component record lives in the side-table keyed by the object value.
+    let layout = std::alloc::Layout::from_size_align(16, 8).expect("pathname layout");
+    let bv = unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout);
+        *(ptr as *mut ObjectHeader) = ObjectHeader::new(type_id::PATHNAME, 2);
+        BlissVal::from_heap_ptr(ptr)
+    };
     with_pathname_store(|store| {
         store.insert(bv.0, rec);
     });
@@ -169,11 +183,10 @@ fn get_record(pathname: BlissVal) -> Option<PathnameRecord> {
     with_pathname_store(|store| store.get(&pathname.0).cloned())
 }
 
-/// True if `val` is a pathname. Safe for ANY value: pathnames are registry-
-/// backed pseudo-heap values (a counter id wearing `TAG_HEAP_OBJECT`), so
-/// dereferencing one as a real heap object — e.g. via `is_string` — segfaults.
-/// This checks the store by key only, never dereferencing, so callers can guard
-/// header-reading predicates with it.
+/// True if `val` is a pathname. Pathnames are real heap objects with the
+/// PATHNAME type_id (bliss-lb6.9), so `is_string()` etc. read a genuine header
+/// and are already false for them; this membership check identifies pathnames by
+/// their component record without dereferencing, and is safe for any value.
 pub fn is_pathname(val: BlissVal) -> bool {
     with_pathname_store(|store| store.contains_key(&val.0))
 }
