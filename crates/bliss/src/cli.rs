@@ -4320,6 +4320,27 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let emitted = bliss_stdlib::stream_fresh_line(out)?;
                 return Ok(if emitted { T } else { NIL });
             }
+            // Buffered output is flushed eagerly, so these are effectively
+            // no-ops on ordinary streams; Gray streams still get their protocol
+            // method invoked. All three return NIL per ANSI.
+            "FINISH-OUTPUT" | "FORCE-OUTPUT" | "CLEAR-OUTPUT" => {
+                let args = list_to_vec(cdr);
+                let stream = if args.is_empty() {
+                    NIL
+                } else {
+                    eval_form(args[0], env)?
+                };
+                let out = resolve_output_stream(stream, env);
+                if is_gray_stream(out) {
+                    let gf = match name.as_str() {
+                        "FINISH-OUTPUT" => "STREAM-FINISH-OUTPUT",
+                        "FORCE-OUTPUT" => "STREAM-FORCE-OUTPUT",
+                        _ => "STREAM-CLEAR-OUTPUT",
+                    };
+                    invoke_generic_function(gf, &[out], env)?;
+                }
+                return Ok(NIL);
+            }
             "WRITE-CHAR" => {
                 // (write-char character &optional stream)
                 let args = list_to_vec(cdr);
@@ -4536,6 +4557,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(if v.is_symbol() { T } else { NIL });
+            }
+            "DOCUMENTATION" => {
+                // (documentation object &optional doc-type) — the interpreter
+                // does not retain documentation strings; always NIL. Arguments
+                // are still evaluated for their side effects/arity.
+                let mut c = cdr;
+                while c.is_cons() {
+                    let (af, r) = cp(c);
+                    eval_form(af, env)?;
+                    c = r;
+                }
+                return Ok(NIL);
             }
             "FBOUNDP" => {
                 let (sf, _) = cp(cdr);
@@ -4877,6 +4910,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     let name = val_as_str(sym);
                                     env.set_var(&name, val);
                                 }
+                            }
+                            "DOCUMENTATION" => {
+                                // (setf (documentation object doc-type) val) — the
+                                // interpreter does not retain documentation
+                                // strings, so accept and ignore. SETF still
+                                // returns the assigned value.
                             }
                             other => {
                                 let reader_slot = env.classes.values().find_map(|class| {
