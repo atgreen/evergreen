@@ -1701,3 +1701,18 @@ fn reexported_inherited_symbol_keeps_identity_and_home_package() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn pathname_directory_returns_a_list_not_a_namestring() {
+    // bliss-lb6: PATHNAME-DIRECTORY must return (:absolute|:relative comp…) so
+    // UIOP/ANSI directory-list arithmetic works, not a namestring string.
+    let prog = "(let ((d (pathname-directory (make-pathname :directory (list :absolute \"a\" \"b\"))))) \
+       (format t \"~a ~a ~a\" (eq (car d) :absolute) (second d) (third d)))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("T a b"),
+        "expected '(:absolute \"a\" \"b\")', got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

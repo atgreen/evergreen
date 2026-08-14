@@ -765,6 +765,37 @@ pub fn pathname_directory(pathname: BlissVal) -> BlissVal {
     get_record(pathname).map_or(NIL, |r| r.directory)
 }
 
+/// One component of an ANSI `pathname-directory` list.
+pub enum PathDirComp {
+    Name(String),
+    Up,
+    Wild,
+    WildInferiors,
+}
+
+/// The ANSI `pathname-directory` value as `(absolute?, components)`, from which
+/// the caller assembles the list `(:absolute|:relative comp…)` — each `comp` a
+/// string or one of the keywords `:up` / `:wild` / `:wild-inferiors`. `None` when
+/// the pathname has no directory component (`pathname-directory` → NIL). The
+/// keywords are built by the caller so they are the interpreter's real keyword
+/// symbols. Callers that treat the directory as a namestring (the old behaviour)
+/// are wrong: UIOP and ANSI code do list arithmetic on it (bliss-lb6).
+pub fn pathname_directory_components(pathname: BlissVal) -> Option<(bool, Vec<PathDirComp>)> {
+    let rec = get_record(pathname)?;
+    let dir = rec.parsed.directory.as_ref()?;
+    let comps = dir
+        .parts
+        .iter()
+        .map(|p| match p {
+            DirPart::Literal(s) => PathDirComp::Name(s.clone()),
+            DirPart::Up => PathDirComp::Up,
+            DirPart::Wild => PathDirComp::Wild,
+            DirPart::WildInferiors => PathDirComp::WildInferiors,
+        })
+        .collect();
+    Some((dir.absolute, comps))
+}
+
 pub fn pathname_name(pathname: BlissVal) -> BlissVal {
     get_record(pathname).map_or(NIL, |r| r.name)
 }

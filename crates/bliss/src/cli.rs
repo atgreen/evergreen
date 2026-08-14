@@ -5467,8 +5467,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "PATHNAME-DIRECTORY" => {
                 let (pathname_form, _) = cp(cdr);
-                let pathname = eval_form(pathname_form, env)?;
-                return Ok(bliss_stdlib::pathname_directory(pathname));
+                let mut pathname = eval_form(pathname_form, env)?;
+                // Coerce a namestring designator to a pathname first (ANSI).
+                if !bliss_stdlib::is_pathname(pathname) {
+                    pathname = bliss_stdlib::parse_namestring(pathname, None, None)?.0;
+                }
+                // ANSI PATHNAME-DIRECTORY returns a list (:absolute|:relative
+                // comp…), not a namestring — UIOP does directory-list arithmetic
+                // on it (bliss-lb6). Build the keywords with the interpreter's
+                // interner so they are EQ to the reader's :absolute / :wild / ….
+                match bliss_stdlib::pathname_directory_components(pathname) {
+                    Some((absolute, comps)) => {
+                        let kw = |s: &str| resolve_sym(s).unwrap_or(NIL);
+                        let mut elems = Vec::with_capacity(comps.len() + 1);
+                        elems.push(kw(if absolute { ":ABSOLUTE" } else { ":RELATIVE" }));
+                        for c in comps {
+                            elems.push(match c {
+                                bliss_stdlib::PathDirComp::Name(s) => {
+                                    bliss_stdlib::make_lisp_string(&s)
+                                }
+                                bliss_stdlib::PathDirComp::Up => kw(":UP"),
+                                bliss_stdlib::PathDirComp::Wild => kw(":WILD"),
+                                bliss_stdlib::PathDirComp::WildInferiors => kw(":WILD-INFERIORS"),
+                            });
+                        }
+                        return Ok(vec_to_list(&elems));
+                    }
+                    None => return Ok(NIL),
+                }
             }
             "PATHNAME-HOST" => {
                 let (pathname_form, _) = cp(cdr);

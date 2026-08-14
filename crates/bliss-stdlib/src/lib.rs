@@ -80,7 +80,7 @@ pub use packages::{
 pub use pathnames::{
     delete_file, directory, ensure_directories_exist, is_pathname, logical_pathname_translations,
     make_pathname, merge_pathnames, namestring, parse_namestring, pathname_device,
-    pathname_directory,
+    pathname_directory, pathname_directory_components, PathDirComp,
     pathname_host, pathname_match_p, pathname_name, pathname_type, pathname_version, probe_file,
     register_string, registered_string, rename_file, set_logical_pathname_translations,
     translate_logical_pathname, truename, wild_pathname_p,
