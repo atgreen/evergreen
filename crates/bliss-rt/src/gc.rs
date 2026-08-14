@@ -756,9 +756,18 @@ unsafe fn trace_object(
             }
         }
 
+        // ── Stream handle: body word 0 is a raw pointer to an off-heap block;
+        //    its Lisp-visible component references live in that block and are
+        //    traced by the stdlib-registered hook (bliss-jtc.7a). ──
+        tid::STREAM => {
+            if let Some(f) = STREAM_TRACE_FN.get() {
+                f(body, &mut visit);
+            }
+        }
+
         // ── Kinds whose runtime layout interleaves references with raw fields
         //    or side storage (structures, conditions, hash-tables, specialised
-        //    arrays, packages, streams) are traced by dedicated callbacks once
+        //    arrays, packages) are traced by dedicated callbacks once
         //    real instances are constructed on the GC heap (jtc.1/jtc.2). None
         //    are allocated here yet, so visiting nothing is safe and precise —
         //    never a conservative pointer scan. ──
@@ -2179,6 +2188,19 @@ static FINALIZER_DISPATCH: OnceLock<fn(BlissVal, BlissVal)> = OnceLock::new();
 /// initialization to register how finalizer BlissVal functions are invoked.
 pub fn set_finalizer_dispatch(dispatch: fn(BlissVal, BlissVal)) {
     let _ = FINALIZER_DISPATCH.set(dispatch);
+}
+
+/// Callback that traces the heap references reachable from a STREAM handle.
+/// The stdlib owns the stream layout (a GC handle pointing at an off-heap block
+/// holding component references), so it registers this hook; the GC tracer calls
+/// it for every STREAM object during marking and relocation, passing the handle
+/// body pointer and the `visit` closure that marks/forwards each reference slot
+/// (bliss-jtc.7a).
+static STREAM_TRACE_FN: OnceLock<fn(*mut u8, &mut dyn FnMut(*mut BlissVal))> = OnceLock::new();
+
+/// Register the STREAM tracing hook (see [`STREAM_TRACE_FN`]).
+pub fn set_stream_trace_fn(f: fn(*mut u8, &mut dyn FnMut(*mut BlissVal))) {
+    let _ = STREAM_TRACE_FN.set(f);
 }
 
 /// Register a finalizer for a heap object.

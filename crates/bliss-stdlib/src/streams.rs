@@ -82,10 +82,23 @@ pub const IF_EXISTS_OVERWRITE_VAL: BlissVal = BlissVal(4 << 3); // fixnum 4
 
 // ── Internal stream state ──────────────────────────────────────────
 
-/// Heap-allocated stream object. Contains an ObjectHeader (for type checks
-/// without locking) and a per-stream Mutex protecting all mutable state (R5.120).
+/// Off-heap Rust-owned stream state (bliss-jtc.7a). This is NOT the Lisp-visible
+/// stream value; it is a `Box`-allocated block kept off the moving GC heap
+/// (the `Mutex<File>`/buffers can't be relocated by an evacuating collector).
+/// The Lisp value is a small GC-heap *handle* (`alloc_typed`, tag STREAM) whose
+/// first body word holds a raw pointer to this block (see `alloc_stream` /
+/// `get_stream_alloc`). A GC finalizer registered on the handle drops this block
+/// when the stream becomes unreachable, releasing the fd (via `File`'s Drop) and
+/// buffers, and warning for an unclosed file stream (R5.121).
 struct StreamAlloc {
-    header: ObjectHeader,
+    /// Immutable component references of a composite stream (broadcast /
+    /// concatenated components, two-way/echo input+output, synonym symbol), or
+    /// empty for non-composite streams. Stored OUTSIDE the per-stream mutex so
+    /// the GC can trace and forward them lock-free during a stop-the-world pause
+    /// (a mutator may be parked at a safepoint holding the mutex, so the tracer
+    /// must never need it). Set once at construction; only the GC rewrites its
+    /// entries, to forward evacuated components (bliss-jtc.7a / jtc.7f).
+    components: Box<[BlissVal]>,
     /// Per-stream mutex — every operation spanning multiple elements is atomic
     /// under this lock (R5.120).
     state: Mutex<StreamMutableState>,
@@ -96,6 +109,23 @@ struct StreamMutableState {
     open: bool,
     element_type: StreamElementType,
     inner: StreamInner,
+    /// Raw pointer to the sibling `StreamAlloc::components` slice, so composite
+    /// op arms can read their component references without re-entering
+    /// `get_stream_alloc`. Points into the same (stable, off-heap) `Box`, so it
+    /// stays valid for the block's lifetime. Read via `self.components()`.
+    components_ptr: *const [BlissVal],
+}
+
+impl StreamMutableState {
+    /// The stream's immutable component references (see `StreamAlloc::components`).
+    /// Read the raw back-pointer without borrowing `self`, so callers may hold
+    /// this alongside a `&mut self.inner` match.
+    #[inline]
+    fn components(&self) -> &'static [BlissVal] {
+        // SAFETY: `components_ptr` was set at construction to the sibling
+        // `components` slice in the same stable Box, which outlives every access.
+        unsafe { &*self.components_ptr }
+    }
 }
 
 enum StreamInner {
@@ -141,23 +171,22 @@ enum StreamInner {
         unread: Option<char>,
         external_format: ExternalFormat,
     },
-    Broadcast {
-        streams: Vec<BlissVal>,
-    },
+    // ── Composite streams (bliss-jtc.7a) ──────────────────────────────
+    // Component references live in `StreamAlloc::components` (immutable, traced
+    // lock-free by the GC), indexed as documented per variant. These variants
+    // hold only non-reference mutable state.
+    /// Components: all broadcast targets (fan-out on write).
+    Broadcast,
+    /// Components: all source streams; `cursor` is the index of the current one.
     Concatenated {
-        streams: Vec<BlissVal>,
+        cursor: usize,
     },
-    TwoWay {
-        input: BlissVal,
-        output: BlissVal,
-    },
-    Echo {
-        input: BlissVal,
-        output: BlissVal,
-    },
-    Synonym {
-        symbol: BlissVal,
-    },
+    /// Components: `[input, output]`.
+    TwoWay,
+    /// Components: `[input, output]`.
+    Echo,
+    /// Components: `[symbol]`.
+    Synonym,
     /// The process standard input, connected to the real terminal / pipe.
     Stdin {
         unread: Option<char>,
@@ -343,6 +372,7 @@ fn extract_string_str(val: BlissVal) -> Result<&'static str, BlissError> {
 impl GrayStream for StreamMutableState {
     fn stream_read_char(&mut self) -> Result<BlissVal, BlissError> {
         self.check_input()?;
+        let comps = self.components();
         match &mut self.inner {
             StreamInner::StringInput {
                 chars,
@@ -394,32 +424,32 @@ impl GrayStream for StreamMutableState {
             }
             // Issue #1: Handle TwoWay and Echo as separate arms to avoid
             // borrow-checker conflict when reading from input then writing to output.
-            StreamInner::TwoWay { input, .. } => {
-                let inp = *input;
+            StreamInner::TwoWay => {
+                let inp = comps[0];
                 crate::streams::stream_read_char(inp)
             }
-            StreamInner::Echo { input, output, .. } => {
-                let inp = *input;
-                let out = *output;
+            StreamInner::Echo => {
+                let inp = comps[0];
+                let out = comps[1];
                 let result = crate::streams::stream_read_char(inp)?;
                 if result != EOF {
                     crate::streams::stream_write_char(out, result)?;
                 }
                 Ok(result)
             }
-            StreamInner::Concatenated { streams } => {
-                while !streams.is_empty() {
-                    let s = streams[0];
+            StreamInner::Concatenated { cursor } => {
+                while *cursor < comps.len() {
+                    let s = comps[*cursor];
                     let result = crate::streams::stream_read_char(s)?;
                     if result != EOF {
                         return Ok(result);
                     }
-                    streams.remove(0);
+                    *cursor += 1;
                 }
                 Ok(EOF)
             }
-            StreamInner::Synonym { symbol } => {
-                let target = resolve_synonym(*symbol)?;
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_read_char(target)
             }
             StreamInner::Stdin {
@@ -446,6 +476,7 @@ impl GrayStream for StreamMutableState {
     fn stream_unread_char(&mut self, ch: BlissVal) -> Result<(), BlissError> {
         self.check_input()?;
         let c = ch.as_char();
+        let comps = self.components();
         match &mut self.inner {
             StreamInner::StringInput {
                 unread, line, col, ..
@@ -482,10 +513,11 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::TwoWay { input, .. } => crate::streams::stream_unread_char(*input, ch),
-            StreamInner::Echo { input, .. } => crate::streams::stream_unread_char(*input, ch),
-            StreamInner::Concatenated { streams } => {
-                if let Some(&s) = streams.first() {
+            StreamInner::TwoWay | StreamInner::Echo => {
+                crate::streams::stream_unread_char(comps[0], ch)
+            }
+            StreamInner::Concatenated { cursor } => {
+                if let Some(&s) = comps.get(*cursor) {
                     crate::streams::stream_unread_char(s, ch)
                 } else {
                     Err(BlissError::StreamError(
@@ -493,8 +525,8 @@ impl GrayStream for StreamMutableState {
                     ))
                 }
             }
-            StreamInner::Synonym { symbol } => {
-                let target = resolve_synonym(*symbol)?;
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_unread_char(target, ch)
             }
             StreamInner::Stdin {
@@ -544,6 +576,7 @@ impl GrayStream for StreamMutableState {
     fn stream_write_char(&mut self, ch: BlissVal) -> Result<(), BlissError> {
         self.check_output()?;
         let c = ch.as_char();
+        let comps = self.components();
         match &mut self.inner {
             StreamInner::StringOutput { buffer, line, col } => {
                 let mut buf = [0u8; 4];
@@ -599,17 +632,17 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::Broadcast { streams } => {
-                for &s in streams.iter() {
+            StreamInner::Broadcast => {
+                for &s in comps.iter() {
                     crate::streams::stream_write_char(s, ch)?;
                 }
                 Ok(())
             }
-            StreamInner::TwoWay { output, .. } | StreamInner::Echo { output, .. } => {
-                crate::streams::stream_write_char(*output, ch)
+            StreamInner::TwoWay | StreamInner::Echo => {
+                crate::streams::stream_write_char(comps[1], ch)
             }
-            StreamInner::Synonym { symbol } => {
-                let target = resolve_synonym(*symbol)?;
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_write_char(target, ch)
             }
             StreamInner::Stdout { line, col } => {
@@ -633,6 +666,7 @@ impl GrayStream for StreamMutableState {
     fn stream_write_byte(&mut self, byte: BlissVal) -> Result<(), BlissError> {
         self.check_output()?;
         let b = byte.as_fixnum() as u8;
+        let comps = self.components();
         match &mut self.inner {
             StreamInner::StringOutput { buffer, line, col } => {
                 buffer.push(b);
@@ -682,17 +716,17 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::Broadcast { streams } => {
-                for &s in streams.iter() {
+            StreamInner::Broadcast => {
+                for &s in comps.iter() {
                     crate::streams::stream_write_byte(s, byte)?;
                 }
                 Ok(())
             }
-            StreamInner::TwoWay { output, .. } | StreamInner::Echo { output, .. } => {
-                crate::streams::stream_write_byte(*output, byte)
+            StreamInner::TwoWay | StreamInner::Echo => {
+                crate::streams::stream_write_byte(comps[1], byte)
             }
-            StreamInner::Synonym { symbol } => {
-                let target = resolve_synonym(*symbol)?;
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_write_byte(target, byte)
             }
             StreamInner::Stdout { line, col } => {
@@ -737,6 +771,7 @@ impl GrayStream for StreamMutableState {
         };
         let slice = &s.as_bytes()[byte_start..byte_end];
         let str_slice = &s[byte_start..byte_end];
+        let comps = self.components();
         match &mut self.inner {
             StreamInner::StringOutput { buffer, line, col } => {
                 buffer.extend_from_slice(slice);
@@ -792,17 +827,17 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::Broadcast { streams } => {
-                for &s in streams.iter() {
+            StreamInner::Broadcast => {
+                for &s in comps.iter() {
                     crate::streams::stream_write_string(s, string, start, Some(actual_end))?;
                 }
                 Ok(())
             }
-            StreamInner::TwoWay { output, .. } | StreamInner::Echo { output, .. } => {
-                crate::streams::stream_write_string(*output, string, start, Some(actual_end))
+            StreamInner::TwoWay | StreamInner::Echo => {
+                crate::streams::stream_write_string(comps[1], string, start, Some(actual_end))
             }
-            StreamInner::Synonym { symbol } => {
-                let target = resolve_synonym(*symbol)?;
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_write_string(target, string, start, Some(actual_end))
             }
             StreamInner::Stdout { line, col } => {
@@ -825,6 +860,7 @@ impl GrayStream for StreamMutableState {
 
     fn stream_force_output(&mut self) -> Result<(), BlissError> {
         self.check_open()?;
+        let comps = self.components();
         match &mut self.inner {
             StreamInner::FileOutput {
                 file, write_buf, ..
@@ -832,8 +868,8 @@ impl GrayStream for StreamMutableState {
             | StreamInner::FileIo {
                 file, write_buf, ..
             } => file_flush_write_buf(file, write_buf),
-            StreamInner::Synonym { symbol } => {
-                let target = resolve_synonym(*symbol)?;
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_force_output(target)
             }
             _ => Ok(()),
@@ -842,6 +878,7 @@ impl GrayStream for StreamMutableState {
 
     fn stream_finish_output(&mut self) -> Result<(), BlissError> {
         self.check_open()?;
+        let comps = self.components();
         match &mut self.inner {
             StreamInner::FileOutput {
                 file, write_buf, ..
@@ -853,8 +890,8 @@ impl GrayStream for StreamMutableState {
                 file.flush()
                     .map_err(|e| BlissError::StreamError(format!("flush error: {}", e)))
             }
-            StreamInner::Synonym { symbol } => {
-                let target = resolve_synonym(*symbol)?;
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_finish_output(target)
             }
             _ => Ok(()),
@@ -862,6 +899,7 @@ impl GrayStream for StreamMutableState {
     }
 
     fn stream_clear_input(&mut self) -> Result<(), BlissError> {
+        let comps = self.components();
         match &mut self.inner {
             StreamInner::FileInput {
                 buf_pos,
@@ -880,8 +918,8 @@ impl GrayStream for StreamMutableState {
                 *unread = None;
                 Ok(())
             }
-            StreamInner::Synonym { symbol } => {
-                let target = resolve_synonym(*symbol)?;
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_clear_input(target)
             }
             _ => Ok(()),
@@ -890,6 +928,7 @@ impl GrayStream for StreamMutableState {
 
     fn stream_listen(&self) -> Result<bool, BlissError> {
         self.check_open()?;
+        let comps = self.components();
         match &self.inner {
             StreamInner::StringInput {
                 position,
@@ -909,12 +948,12 @@ impl GrayStream for StreamMutableState {
                 unread,
                 ..
             } => Ok(unread.is_some() || *buf_pos < *buf_fill),
-            StreamInner::Concatenated { streams } => Ok(!streams.is_empty()),
-            StreamInner::TwoWay { input, .. } | StreamInner::Echo { input, .. } => {
-                crate::streams::stream_listen(*input)
+            StreamInner::Concatenated { cursor } => Ok(*cursor < comps.len()),
+            StreamInner::TwoWay | StreamInner::Echo => {
+                crate::streams::stream_listen(comps[0])
             }
-            StreamInner::Synonym { symbol } => {
-                let target = resolve_synonym(*symbol)?;
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_listen(target)
             }
             StreamInner::Stdin { unread, .. } => Ok(unread.is_some()),
@@ -1010,6 +1049,7 @@ impl GrayStream for StreamMutableState {
 
     fn stream_clear_output(&mut self) -> Result<(), BlissError> {
         self.check_open()?;
+        let comps = self.components();
         match &mut self.inner {
             StreamInner::FileOutput { write_buf, .. } | StreamInner::FileIo { write_buf, .. } => {
                 write_buf.clear();
@@ -1019,8 +1059,8 @@ impl GrayStream for StreamMutableState {
                 buffer.clear();
                 Ok(())
             }
-            StreamInner::Synonym { symbol } => {
-                let target = resolve_synonym(*symbol)?;
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_clear_output(target)
             }
             _ => Ok(()),
@@ -1192,21 +1232,43 @@ fn resolve_synonym(symbol: BlissVal) -> Result<BlissVal, BlissError> {
 
 // ── Stream allocation helpers ──────────────────────────────────────
 
-fn alloc_stream(element_type: StreamElementType, inner: StreamInner) -> BlissVal {
-    let state = Box::new(StreamAlloc {
-        header: ObjectHeader::new(type_id::STREAM, 1),
+fn alloc_stream(
+    element_type: StreamElementType,
+    inner: StreamInner,
+    components: Vec<BlissVal>,
+) -> BlissVal {
+    // The Rust-owned state lives in an off-heap Box (stable address; never
+    // relocated by the moving GC). `components` is stored beside the mutex so
+    // the GC can trace it lock-free; the mutable state gets a raw back-pointer
+    // to it for the composite op arms.
+    let mut boxed = Box::new(StreamAlloc {
+        components: components.into_boxed_slice(),
         state: Mutex::new(StreamMutableState {
             open: true,
             element_type,
             inner,
+            components_ptr: std::ptr::slice_from_raw_parts(std::ptr::null::<BlissVal>(), 0),
         }),
     });
-    // SAFETY: Box<StreamAlloc> is at least 8-byte aligned (contains u64 fields),
-    // matching the TAG_HEAP_OBJECT alignment requirement. The pointer is stored
-    // tagged; `as_ptr()` correctly strips the 3-bit tag via `self.0 & !TAG_MASK`.
-    // Issue #9: verified alignment and tag-stripping correctness.
-    let ptr = Box::into_raw(state) as *mut u8;
-    unsafe { BlissVal::from_heap_ptr(ptr) }
+    let cptr: *const [BlissVal] = &*boxed.components;
+    boxed.state.get_mut().unwrap().components_ptr = cptr;
+    let box_ptr = Box::into_raw(boxed) as u64;
+
+    // The Lisp-visible stream value is a GC-heap handle whose single body word
+    // holds the box pointer. Being a normal collectible heap object, its GC
+    // finalizer (registered below) drops the box when the stream becomes
+    // unreachable — closing the fd and warning if it was an unclosed file
+    // stream (R5.121, bliss-jtc.7a).
+    let body = bliss_rt::gc::alloc_typed(8, type_id::STREAM)
+        .expect("GC heap unavailable for stream handle");
+    unsafe {
+        *(body as *mut u64) = box_ptr;
+    }
+    // The finalizer key is the untagged body address (what the GC's dead-object
+    // passes fire on, and what jtc.7f forwards on evacuation); the Lisp value is
+    // the tagged header pointer, body − 8.
+    let _ = bliss_rt::gc::register_finalizer(BlissVal::from_raw(body as u64), NIL);
+    unsafe { BlissVal::from_heap_ptr(body.sub(8)) }
 }
 
 // ── Process standard stream helpers ────────────────────────────────
@@ -1287,6 +1349,7 @@ pub fn make_stdin() -> BlissVal {
             line: 0,
             col: 0,
         },
+        vec![],
     )
 }
 
@@ -1295,6 +1358,7 @@ pub fn make_stdout() -> BlissVal {
     alloc_stream(
         StreamElementType::Character,
         StreamInner::Stdout { line: 0, col: 0 },
+        vec![],
     )
 }
 
@@ -1303,10 +1367,14 @@ pub fn make_stderr() -> BlissVal {
     alloc_stream(
         StreamElementType::Character,
         StreamInner::Stderr { line: 0, col: 0 },
+        vec![],
     )
 }
 
 /// Get a reference to the StreamAlloc from a BlissVal.
+///
+/// The value is a GC-heap handle (tag STREAM) whose first body word holds the
+/// pointer to the off-heap `StreamAlloc` block (bliss-jtc.7a).
 ///
 /// SAFETY: The returned reference is valid as long as the stream has not been
 /// finalized. The caller must ensure the BlissVal was created by `alloc_stream`.
@@ -1315,11 +1383,16 @@ fn get_stream_alloc(stream: BlissVal) -> Result<&'static StreamAlloc, BlissError
         return Err(BlissError::StreamError("not a stream".into()));
     }
     unsafe {
-        let ptr = stream.as_ptr() as *const StreamAlloc;
-        if (*ptr).header.type_id() != type_id::STREAM {
+        let header = stream.as_ptr(); // handle header
+        if (*(header as *const ObjectHeader)).type_id() != type_id::STREAM {
             return Err(BlissError::StreamError("not a stream".into()));
         }
-        Ok(&*ptr)
+        // Body word 0 is the pointer to the off-heap StreamAlloc block.
+        let box_ptr = *(header.add(8) as *const u64) as *const StreamAlloc;
+        if box_ptr.is_null() {
+            return Err(BlissError::StreamError("finalized stream".into()));
+        }
+        Ok(&*box_ptr)
     }
 }
 
@@ -1384,6 +1457,7 @@ pub fn open(
                     external_format,
                     element_type: elt,
                 },
+                vec![],
             ))
         }
         StreamDirection::Output => {
@@ -1430,6 +1504,7 @@ pub fn open(
                     line: 0,
                     col: 0,
                 },
+                vec![],
             ))
         }
         StreamDirection::Io => {
@@ -1488,6 +1563,7 @@ pub fn open(
                     unread: None,
                     external_format,
                 },
+                vec![],
             ))
         }
     }
@@ -1543,6 +1619,7 @@ pub fn make_string_input_stream(
             col: 0,
             unread: None,
         },
+        vec![],
     ))
 }
 
@@ -1554,6 +1631,7 @@ pub fn make_string_output_stream(_element_type: BlissVal) -> Result<BlissVal, Bl
             line: 0,
             col: 0,
         },
+        vec![],
     ))
 }
 
@@ -1576,39 +1654,40 @@ pub fn get_output_stream_string(stream: BlissVal) -> Result<BlissVal, BlissError
 pub fn make_broadcast_stream(streams: &[BlissVal]) -> Result<BlissVal, BlissError> {
     Ok(alloc_stream(
         StreamElementType::Character,
-        StreamInner::Broadcast {
-            streams: streams.to_vec(),
-        },
+        StreamInner::Broadcast,
+        streams.to_vec(),
     ))
 }
 
 pub fn make_concatenated_stream(streams: &[BlissVal]) -> Result<BlissVal, BlissError> {
     Ok(alloc_stream(
         StreamElementType::Character,
-        StreamInner::Concatenated {
-            streams: streams.to_vec(),
-        },
+        StreamInner::Concatenated { cursor: 0 },
+        streams.to_vec(),
     ))
 }
 
 pub fn make_two_way_stream(input: BlissVal, output: BlissVal) -> Result<BlissVal, BlissError> {
     Ok(alloc_stream(
         StreamElementType::Character,
-        StreamInner::TwoWay { input, output },
+        StreamInner::TwoWay,
+        vec![input, output],
     ))
 }
 
 pub fn make_echo_stream(input: BlissVal, output: BlissVal) -> Result<BlissVal, BlissError> {
     Ok(alloc_stream(
         StreamElementType::Character,
-        StreamInner::Echo { input, output },
+        StreamInner::Echo,
+        vec![input, output],
     ))
 }
 
 pub fn make_synonym_stream(symbol: BlissVal) -> Result<BlissVal, BlissError> {
     Ok(alloc_stream(
         StreamElementType::Character,
-        StreamInner::Synonym { symbol },
+        StreamInner::Synonym,
+        vec![symbol],
     ))
 }
 
@@ -1791,6 +1870,7 @@ pub fn stream_external_format(stream: BlissVal) -> ExternalFormat {
 pub fn file_position(stream: BlissVal) -> Result<BlissVal, BlissError> {
     let mut guard = lock_stream(stream)?;
     guard.check_open()?;
+    let comps = guard.components();
     match &mut guard.inner {
         StreamInner::FileInput {
             file,
@@ -1832,8 +1912,8 @@ pub fn file_position(stream: BlissVal) -> Result<BlissVal, BlissError> {
         }
         StreamInner::StringInput { position, .. } => Ok(BlissVal::from_fixnum(*position as i64)),
         StreamInner::StringOutput { buffer, .. } => Ok(BlissVal::from_fixnum(buffer.len() as i64)),
-        StreamInner::Synonym { symbol } => {
-            let target = resolve_synonym(*symbol)?;
+        StreamInner::Synonym => {
+            let target = resolve_synonym(comps[0])?;
             file_position(target)
         }
         _ => Ok(NIL), // non-positionable
@@ -1844,6 +1924,7 @@ pub fn file_position(stream: BlissVal) -> Result<BlissVal, BlissError> {
 pub fn set_file_position(stream: BlissVal, position: BlissVal) -> Result<BlissVal, BlissError> {
     let mut guard = lock_stream(stream)?;
     guard.check_open()?;
+    let comps = guard.components();
     match &mut guard.inner {
         StreamInner::FileInput {
             file,
@@ -1888,8 +1969,8 @@ pub fn set_file_position(stream: BlissVal, position: BlissVal) -> Result<BlissVa
                 .map_err(|e| BlissError::StreamError(format!("set-file-position error: {}", e)))?;
             Ok(T)
         }
-        StreamInner::Synonym { symbol } => {
-            let target = resolve_synonym(*symbol)?;
+        StreamInner::Synonym => {
+            let target = resolve_synonym(comps[0])?;
             set_file_position(target, position)
         }
         _ => Ok(NIL),
@@ -1901,6 +1982,7 @@ pub fn set_file_position(stream: BlissVal, position: BlissVal) -> Result<BlissVa
 pub fn file_length_fn(stream: BlissVal) -> Result<BlissVal, BlissError> {
     let mut guard = lock_stream(stream)?;
     guard.check_open()?;
+    let comps = guard.components();
     match &mut guard.inner {
         StreamInner::FileInput { file, .. }
         | StreamInner::FileOutput { file, .. }
@@ -1910,29 +1992,102 @@ pub fn file_length_fn(stream: BlissVal) -> Result<BlissVal, BlissError> {
                 .map_err(|e| BlissError::StreamError(format!("file-length error: {}", e)))?;
             Ok(BlissVal::from_fixnum(metadata.len() as i64))
         }
-        StreamInner::Synonym { symbol } => {
-            let target = resolve_synonym(*symbol)?;
+        StreamInner::Synonym => {
+            let target = resolve_synonym(comps[0])?;
             file_length_fn(target)
         }
         _ => Ok(NIL),
     }
 }
 
-// ── Stream finalization (Issue #7) ────────────────────────────────
+// ── GC integration (bliss-jtc.7a) ─────────────────────────────────
 
-/// Free the stream's heap allocation. Must be called by the GC finalizer
-/// when the stream object is unreachable (R5.121).
-///
-/// # Safety
-/// The stream BlissVal must not be used after this call.
-pub unsafe fn finalize_stream(stream: BlissVal) {
-    if stream.is_heap_object() {
-        unsafe {
-            let ptr = stream.as_ptr() as *mut StreamAlloc;
-            let header = (*ptr).header;
-            if header.type_id() == type_id::STREAM {
-                drop(Box::from_raw(ptr));
-            }
+/// True if a StreamInner holds an OS file descriptor whose accidental
+/// non-close warrants the unclosed-stream warning (R5.121).
+fn inner_is_file(inner: &StreamInner) -> bool {
+    matches!(
+        inner,
+        StreamInner::FileInput { .. } | StreamInner::FileOutput { .. } | StreamInner::FileIo { .. }
+    )
+}
+
+/// R5.121 warning is enabled unless `BLISS_WARN_UNCLOSED_STREAMS=0`.
+fn warn_unclosed_enabled() -> bool {
+    !matches!(
+        std::env::var("BLISS_WARN_UNCLOSED_STREAMS").as_deref(),
+        Ok("0")
+    )
+}
+
+/// GC trace hook for a stream handle (registered via `set_stream_trace_fn`).
+/// Visits the component references held in the off-heap `StreamAlloc` block so
+/// the collector marks and forwards them (bliss-jtc.7a). `handle_body` points at
+/// the stream handle's body; word 0 is the raw pointer to the block.
+fn stream_trace(handle_body: *mut u8, visit: &mut dyn FnMut(*mut BlissVal)) {
+    unsafe {
+        let box_ptr = *(handle_body as *const u64) as *mut StreamAlloc;
+        if box_ptr.is_null() {
+            return;
+        }
+        // `components` is set once at construction; only the GC rewrites its
+        // entries (forwarding evacuated components). Read the `Box<[BlissVal]>`
+        // fat pointer without forming a reference to the shared `StreamAlloc`,
+        // mirroring the collector's raw-pointer discipline at safepoints; visit()
+        // then rewrites each slot in place.
+        let slice: *mut [BlissVal] =
+            *(std::ptr::addr_of!((*box_ptr).components) as *const *mut [BlissVal]);
+        let len = slice.len();
+        let data = slice as *mut BlissVal;
+        for i in 0..len {
+            visit(data.add(i));
         }
     }
+}
+
+/// GC finalizer dispatch for stream handles (registered via
+/// `set_finalizer_dispatch`). Invoked for a dead object keyed by its untagged
+/// body address. Drops the off-heap `StreamAlloc` block — closing the fd via
+/// `File`'s Drop and freeing buffers — and, for an unclosed file stream, emits a
+/// style warning (R5.121). Non-stream objects are ignored.
+///
+/// Runs inside the GC pause under the heap lock, so it must not allocate on the
+/// GC heap; dropping the Box and writing to stderr are both safe here.
+fn stream_gc_finalize(_finalizer: BlissVal, object: BlissVal) {
+    // `object` is from_raw(body): body word 0 holds the StreamAlloc pointer, and
+    // the handle header (body − 8) carries the type id.
+    let body = object.to_raw() as *mut u8;
+    unsafe {
+        let header = &*(body.sub(8) as *const ObjectHeader);
+        if header.type_id() != type_id::STREAM {
+            return; // not a stream — leave for other finalizer kinds
+        }
+        let box_ptr = *(body as *const u64) as *mut StreamAlloc;
+        if box_ptr.is_null() {
+            return;
+        }
+        if warn_unclosed_enabled() {
+            // The object is unreachable, so no live mutator holds its lock;
+            // try_lock is defensive and never blocks the GC.
+            let alloc: &StreamAlloc = &*box_ptr;
+            if let Ok(state) = alloc.state.try_lock() {
+                if state.open && inner_is_file(&state.inner) {
+                    eprintln!("; Warning: file stream was garbage-collected without being closed");
+                }
+            }
+        }
+        drop(Box::from_raw(box_ptr)); // File::drop closes the fd; buffers freed
+        // Null the handle's box pointer. Finalizers run early in a major GC
+        // (before the relocation pass, which traces *every* non-forwarded object,
+        // including this now-dead handle). Without this, `stream_trace` would
+        // dereference the freed block. A nulled pointer makes the later trace —
+        // and any stray access — skip it safely (bliss-jtc.7a).
+        *(body as *mut u64) = 0;
+    }
+}
+
+/// Install the stdlib's GC hooks (stream tracing + finalizer dispatch). Call
+/// once at interpreter startup (bliss-jtc.7a).
+pub fn install_gc_hooks() {
+    bliss_rt::gc::set_stream_trace_fn(stream_trace);
+    bliss_rt::gc::set_finalizer_dispatch(stream_gc_finalize);
 }

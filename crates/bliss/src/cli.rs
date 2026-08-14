@@ -1902,6 +1902,10 @@ impl Env {
         }
         env.define_local("*FEATURES*", vec_to_list(&features));
         env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
+        // Install the stdlib's GC hooks (stream tracing + finalizer dispatch)
+        // before allocating any stream, so stream handles are traced and their
+        // finalizers can close unclosed file descriptors (bliss-jtc.7a).
+        bliss_stdlib::streams::install_gc_hooks();
         // Standard stream special variables, bound to real terminal streams
         // backed by the process stdio (see bliss_stdlib::streams). *terminal-io*
         // / *query-io* / *debug-io* share the stdin object for their input side;
