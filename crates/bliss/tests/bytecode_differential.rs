@@ -89,12 +89,77 @@ const CORPUS: &[&str] = &[
     "(let ((lst (list 1 2 3))) (car lst))",
     "(mapcar (function 1+) (list 1 2 3))",
     "(format nil \"~a-~a\" 1 2)",
+    // ── Non-local control flow (nmq.4) — all compiled to bytecode ──
+    "(block foo 1 2 3)",
+    "(block foo (return-from foo 42) 99)",
+    "(block nil (return 7) 8)",
+    "(defun f (x) (block b (if (< x 0) (return-from b (quote neg))) (* x 2))) (list (f -1) (f 5))",
+    "(catch (quote tag) 1 2 3)",
+    "(catch (quote tag) (throw (quote tag) 42) 99)",
+    "(catch (quote a) (catch (quote b) (throw (quote a) 10)) 20)",
+    "(catch (quote a) (catch (quote b) (throw (quote b) 10)) 20)",
+    "(defun th (n) (throw (quote esc) n)) (catch (quote esc) (th 77) 0)",
+    "(let ((acc 0)) (tagbody (setq acc 1) (go skip) (setq acc 999) skip (setq acc (+ acc 10))) acc)",
+    "(let ((i 0) (s 0)) (tagbody top (setq s (+ s i)) (setq i (+ i 1)) (if (< i 5) (go top))) s)",
+    "(let ((log nil)) (unwind-protect (setq log (cons 1 log)) (setq log (cons 2 log))) log)",
+    "(let ((log nil)) (catch (quote e) (unwind-protect (throw (quote e) 0) (setq log (cons 99 log)))) log)",
+    "(defun g2 (n) (block b (unwind-protect (if (= n 0) (return-from b (quote done)) n) 111))) (g2 0)",
+    // Nested unwind-protects all run their cleanups on a throw.
+    "(let ((log nil)) (catch (quote e) (unwind-protect (unwind-protect (throw (quote e) 0) (setq log (cons 1 log))) (setq log (cons 2 log)))) log)",
+    // return-from crossing an unwind-protect runs the cleanup.
+    "(let ((log nil)) (defun h () (block b (unwind-protect (return-from b 5) (setq log (cons 9 log))))) (list (h) log))",
+    // SETQ on locals.
+    "(let ((x 1)) (setq x (+ x 10)) (setq x (* x 2)) x)",
+    // Error propagation (bytecode Propagate path) runs unwind-protect cleanups:
+    // a host-call TypeError unwinds through a compiled unwind-protect whose
+    // cleanup throws, superseding the error (correct CL semantics).
+    "(defun error-out () (car 5)) (defun work () (unwind-protect (error-out) (throw (quote cu) (quote cleanup-ran)))) (catch (quote cu) (work))",
+    // A throw crossing many compiled frames.
+    "(defun dig (n) (if (= n 0) (throw (quote out) (quote bottom)) (dig (- n 1)))) (catch (quote out) (dig 500))",
+];
+
+/// Programs that must run on the bytecode backend (not fall back). Each is a
+/// single top-level form whose last trace line under `BLISS_BYTECODE_TRACE`
+/// must be `compiled`.
+const MUST_COMPILE: &[&str] = &[
+    "(block foo (return-from foo 42) 99)",
+    "(catch (quote tag) (throw (quote tag) 42) 99)",
+    "(let ((i 0) (s 0)) (tagbody top (setq s (+ s i)) (setq i (+ i 1)) (if (< i 5) (go top))) s)",
+    "(let ((log nil)) (catch (quote e) (unwind-protect (throw (quote e) 0) (setq log (cons 99 log)))) log)",
+    "(let ((n 5)) (if (< n 10) (+ n 1) 0))",
+    "(let ((x 1)) (setq x (+ x 10)) x)",
 ];
 
 #[test]
 fn bytecode_matches_tree_walker_on_corpus() {
     for program in CORPUS {
         assert_agree(program);
+    }
+}
+
+/// Confirm the control-flow programs actually execute on the bytecode backend
+/// rather than silently bailing to the tree-walker (which would make the
+/// differential agreement vacuous).
+#[test]
+fn control_flow_programs_run_on_bytecode() {
+    for program in MUST_COMPILE {
+        let out = Command::new(BIN)
+            .arg("--eval")
+            .arg(program)
+            .env("BLISS_BACKEND", "bytecode")
+            .env("BLISS_BYTECODE_TRACE", "1")
+            .output()
+            .expect("spawn");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let last = stderr
+            .lines()
+            .filter(|l| l.starts_with("[bytecode]"))
+            .next_back()
+            .unwrap_or("");
+        assert_eq!(
+            last, "[bytecode] compiled",
+            "program should compile to bytecode, not bail:\n  {program}\n  last trace: {last:?}"
+        );
     }
 }
 

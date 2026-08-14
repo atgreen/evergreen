@@ -38,7 +38,10 @@ use bliss_rt::error::BlissError;
 use bliss_rt::value::{BlissVal, NIL, T};
 use bliss_rt::{CodeInfo, Frame};
 
-use super::{Env, apply_function, cp, eval_form, list_to_vec, sym_name};
+use super::{
+    Env, apply_function, cp, eval_form, list_to_vec, next_control_token, store_control_value,
+    sym_name, tag_key, take_control_value, val_as_str,
+};
 
 // ── Backend selection ──────────────────────────────────────────────
 
@@ -78,6 +81,35 @@ enum Instr {
     CallNamed { sym: u32, nargs: u16 },
     /// Return the top of the operand stack to the caller.
     Return,
+
+    // ── Non-local control flow (nmq.4) — unwind-table opcodes ──────
+    /// Pop a tag and establish a `CATCH` handler. Generates a control token
+    /// (shared with the tree-walker via `env.catch_stack`), so a `THROW` from
+    /// either backend lands here, resumes at `resume_bcp`, resets the operand
+    /// stack to `sp_restore`, and pushes the thrown value.
+    PushCatch { resume_bcp: u32, sp_restore: u16 },
+    /// Establish a `BLOCK` exit handler keyed by the lexical `block_id`.
+    PushBlock { block_id: u32, resume_bcp: u32, sp_restore: u16 },
+    /// Establish a `TAGBODY` handler keyed by the lexical `tagbody_id`.
+    PushTag { tagbody_id: u32, sp_restore: u16 },
+    /// Establish an `UNWIND-PROTECT` cleanup handler; on any unwind through it
+    /// the cleanup at `cleanup_bcp` runs (operand stack reset to `sp_restore`).
+    PushUnwind { cleanup_bcp: u32, sp_restore: u16 },
+    /// Remove the most-recently established handler (normal completion).
+    PopHandler,
+    /// Pop a tag and a value and throw: unwind to the matching `CATCH`.
+    Throw,
+    /// Pop a value and return from the lexical block `block_id`.
+    ReturnFrom { block_id: u32 },
+    /// Transfer to tag `target_bcp` within tagbody `tagbody_id`, running any
+    /// intervening `UNWIND-PROTECT` cleanups.
+    Go { tagbody_id: u32, target_bcp: u32 },
+    /// Normal-path `UNWIND-PROTECT`: save the protected value, run the cleanup
+    /// at `cleanup_bcp`, then resume at `resume_bcp` with the value restored.
+    EnterCleanupNormal { cleanup_bcp: u32, resume_bcp: u32 },
+    /// End of a cleanup body: act on the saved continuation (resume normally,
+    /// or continue an in-progress unwind).
+    CleanupReturn,
 }
 
 /// A lowered CL function: a linear bytecode plus its constant pool and frame
@@ -161,7 +193,23 @@ struct Lowerer<'e> {
     cur_stack: u16,
     /// Maximum operand-stack depth observed.
     max_stack: u16,
+    /// Counter for unique lexical block/tagbody ids.
+    next_id: u32,
+    /// Lexically enclosing blocks: `(name, block_id)`, innermost last.
+    block_scope: Vec<(String, u32)>,
+    /// Lexically enclosing tagbodies: `(tagbody_id, tag → target bcp)`.
+    tag_scope: Vec<TagScope>,
+    /// `Go` instructions awaiting target-bcp patching once their tagbody's tag
+    /// positions are known: `(instr_index, tagbody_id, tag_name)`.
+    pending_gos: Vec<(usize, u32, String)>,
     env: &'e Env,
+}
+
+/// A lexically active tagbody during lowering.
+struct TagScope {
+    id: u32,
+    /// Tag name → bytecode target. `usize::MAX` until the tag is emitted.
+    tags: HashMap<String, usize>,
 }
 
 impl<'e> Lowerer<'e> {
@@ -174,8 +222,18 @@ impl<'e> Lowerer<'e> {
             n_locals: 0,
             cur_stack: 0,
             max_stack: 0,
+            next_id: 0,
+            block_scope: Vec::new(),
+            tag_scope: Vec::new(),
+            pending_gos: Vec::new(),
             env,
         }
+    }
+
+    fn fresh_id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     fn emit(&mut self, i: Instr) {
@@ -284,6 +342,15 @@ impl<'e> Lowerer<'e> {
                 "PROGN" => self.lower_progn(rest),
                 "LET" => self.lower_let(rest, false),
                 "LET*" => self.lower_let(rest, true),
+                "SETQ" => self.lower_setq(rest),
+                "BLOCK" => self.lower_block(rest),
+                "RETURN-FROM" => self.lower_return_from(rest),
+                "RETURN" => self.lower_return(rest),
+                "CATCH" => self.lower_catch(rest),
+                "THROW" => self.lower_throw(rest),
+                "TAGBODY" => self.lower_tagbody(rest),
+                "GO" => self.lower_go(rest),
+                "UNWIND-PROTECT" => self.lower_unwind_protect(rest),
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
@@ -429,6 +496,294 @@ impl<'e> Lowerer<'e> {
         self.push_n(1);
         Ok(())
     }
+
+    /// `(setq var val ...)` — store into lexical local slots only; any special
+    /// or global assignment bails (a nmq.5 concern).
+    fn lower_setq(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let items = list_to_vec(rest);
+        if items.is_empty() {
+            let c = self.add_const(NIL);
+            self.emit(Instr::Const(c));
+            self.push_n(1);
+            return Ok(());
+        }
+        if items.len() % 2 != 0 {
+            return Err(Bail);
+        }
+        let npairs = items.len() / 2;
+        for i in 0..npairs {
+            let var = items[2 * i];
+            let val = items[2 * i + 1];
+            if !var.is_symbol() {
+                return Err(Bail);
+            }
+            let slot = match self.lookup_local(&sym_name(var)) {
+                Some(s) => s,
+                None => return Err(Bail),
+            };
+            self.lower_expr(val)?; // +1
+            self.emit(Instr::StoreLocal(slot));
+            self.pop_n(1);
+            if i + 1 == npairs {
+                // Last assignment's value is SETQ's result.
+                self.emit(Instr::LoadLocal(slot));
+                self.push_n(1);
+            }
+        }
+        Ok(())
+    }
+
+    // ── Non-local control flow lowering (nmq.4) ────────────────────
+
+    /// `(block name body...)` — establish a lexical exit, run the body.
+    fn lower_block(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (name_form, body) = cp(rest);
+        if !name_form.is_symbol() && !name_form.is_nil() {
+            return Err(Bail);
+        }
+        let name = sym_name(name_form);
+        let block_id = self.fresh_id();
+        let sp_restore = self.cur_stack;
+        self.emit(Instr::PushBlock {
+            block_id,
+            resume_bcp: 0,
+            sp_restore,
+        });
+        let push_at = self.code.len() - 1;
+        self.block_scope.push((name, block_id));
+        self.lower_progn(body)?; // body value on stack (+1)
+        self.block_scope.pop();
+        self.emit(Instr::PopHandler);
+        let after = self.code.len() as u32;
+        if let Instr::PushBlock { resume_bcp, .. } = &mut self.code[push_at] {
+            *resume_bcp = after;
+        }
+        Ok(())
+    }
+
+    /// `(return-from name value?)` — non-local exit to a lexical block.
+    fn lower_return_from(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (name_form, vrest) = cp(rest);
+        if !name_form.is_symbol() && !name_form.is_nil() {
+            return Err(Bail);
+        }
+        let name = sym_name(name_form);
+        let block_id = match self.block_scope.iter().rev().find(|(n, _)| *n == name) {
+            Some((_, id)) => *id,
+            // Block is not lexically in this function (a closed-over block is a
+            // nmq.5 concern) — bail.
+            None => return Err(Bail),
+        };
+        let val_form = if vrest.is_cons() { cp(vrest).0 } else { NIL };
+        self.lower_expr(val_form)?; // +1
+        self.emit(Instr::ReturnFrom { block_id });
+        // ReturnFrom transfers control; model it as consuming the value and
+        // notionally yielding one (the trailing slot is dead code).
+        self.pop_n(1);
+        self.push_n(1);
+        Ok(())
+    }
+
+    /// `(return value?)` == `(return-from nil value?)`.
+    fn lower_return(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let block_id = match self.block_scope.iter().rev().find(|(n, _)| n == "NIL") {
+            Some((_, id)) => *id,
+            None => return Err(Bail),
+        };
+        let val_form = if rest.is_cons() { cp(rest).0 } else { NIL };
+        self.lower_expr(val_form)?;
+        self.emit(Instr::ReturnFrom { block_id });
+        self.pop_n(1);
+        self.push_n(1);
+        Ok(())
+    }
+
+    /// `(catch tag body...)` — dynamic non-local exit; shares the tree-walker's
+    /// `env.catch_stack` control-token protocol for cross-backend interop.
+    fn lower_catch(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (tag_form, body) = cp(rest);
+        self.lower_expr(tag_form)?; // +1 (tag on stack)
+        let sp_restore = self.cur_stack - 1; // depth after PushCatch consumes the tag
+        self.emit(Instr::PushCatch {
+            resume_bcp: 0,
+            sp_restore,
+        });
+        let push_at = self.code.len() - 1;
+        self.pop_n(1); // PushCatch pops the tag
+        self.lower_progn(body)?; // body value on stack (+1)
+        self.emit(Instr::PopHandler);
+        let after = self.code.len() as u32;
+        if let Instr::PushCatch { resume_bcp, .. } = &mut self.code[push_at] {
+            *resume_bcp = after;
+        }
+        Ok(())
+    }
+
+    /// `(throw tag value)` — dynamic transfer to a matching `catch`.
+    fn lower_throw(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (tag_form, r2) = cp(rest);
+        if !r2.is_cons() {
+            return Err(Bail);
+        }
+        let (val_form, _) = cp(r2);
+        self.lower_expr(tag_form)?; // tag
+        self.lower_expr(val_form)?; // value (on top)
+        self.emit(Instr::Throw);
+        self.pop_n(2);
+        self.push_n(1);
+        Ok(())
+    }
+
+    /// `(tagbody {tag | statement}*)` — statements run in order, `go` jumps to
+    /// a tag, the form returns NIL.
+    fn lower_tagbody(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let items = list_to_vec(rest);
+        let tagbody_id = self.fresh_id();
+        let sp_restore = self.cur_stack;
+        self.emit(Instr::PushTag {
+            tagbody_id,
+            sp_restore,
+        });
+        let push_at = self.code.len() - 1;
+
+        // Pre-register tag names so forward `go`s resolve to this scope.
+        let mut tags: HashMap<String, usize> = HashMap::new();
+        for item in &items {
+            if let Some(name) = tag_key(*item) {
+                tags.entry(name).or_insert(usize::MAX);
+            }
+        }
+        self.tag_scope.push(TagScope {
+            id: tagbody_id,
+            tags,
+        });
+
+        for item in &items {
+            if let Some(name) = tag_key(*item) {
+                let bcp = self.code.len();
+                if let Some(scope) = self.tag_scope.last_mut() {
+                    scope.tags.insert(name, bcp);
+                }
+            } else {
+                self.lower_expr(*item)?; // +1
+                self.emit(Instr::Pop);
+                self.pop_n(1);
+            }
+        }
+
+        let scope = self.tag_scope.pop().unwrap();
+        // `push_at` marks where tags become inactive on normal exit.
+        let _ = push_at;
+        self.emit(Instr::PopHandler);
+
+        // Patch `go`s targeting this tagbody now that tag PCs are known.
+        let mut i = 0;
+        while i < self.pending_gos.len() {
+            let (idx, id, tag) = self.pending_gos[i].clone();
+            if id == tagbody_id {
+                let target = *scope.tags.get(&tag).ok_or(Bail)?;
+                if target == usize::MAX {
+                    return Err(Bail);
+                }
+                if let Instr::Go { target_bcp, .. } = &mut self.code[idx] {
+                    *target_bcp = target as u32;
+                }
+                self.pending_gos.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        // TAGBODY returns NIL.
+        let c = self.add_const(NIL);
+        self.emit(Instr::Const(c));
+        self.push_n(1);
+        Ok(())
+    }
+
+    /// `(go tag)` — transfer to a tag in a lexically enclosing tagbody.
+    fn lower_go(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (tag_form, _) = cp(rest);
+        let name = match tag_key(tag_form) {
+            Some(n) => n,
+            None => return Err(Bail),
+        };
+        let tagbody_id = match self
+            .tag_scope
+            .iter()
+            .rev()
+            .find(|s| s.tags.contains_key(&name))
+        {
+            Some(s) => s.id,
+            // Tag not lexically visible (closed-over tagbody is a nmq.5 concern).
+            None => return Err(Bail),
+        };
+        self.emit(Instr::Go {
+            tagbody_id,
+            target_bcp: 0,
+        });
+        let idx = self.code.len() - 1;
+        self.pending_gos.push((idx, tagbody_id, name));
+        self.push_n(1); // notional (go never yields)
+        Ok(())
+    }
+
+    /// `(unwind-protect protected cleanup...)` — the cleanup runs on both the
+    /// normal path and any non-local exit through the protected form.
+    fn lower_unwind_protect(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (protected, cleanup_forms) = cp(rest);
+        let sp_restore = self.cur_stack;
+        self.emit(Instr::PushUnwind {
+            cleanup_bcp: 0,
+            sp_restore,
+        });
+        let push_at = self.code.len() - 1;
+        self.lower_expr(protected)?; // V on stack (+1)
+        self.emit(Instr::PopHandler);
+        self.emit(Instr::EnterCleanupNormal {
+            cleanup_bcp: 0,
+            resume_bcp: 0,
+        });
+        let enter_at = self.code.len() - 1;
+        self.pop_n(1); // EnterCleanupNormal saves V off-stack
+        self.emit(Instr::Br(0)); // resume point (Br after)
+        let br_at = self.code.len() - 1;
+
+        // Cleanup body (values discarded).
+        let cleanup_bcp = self.code.len() as u32;
+        let saved = self.cur_stack;
+        for f in list_to_vec(cleanup_forms) {
+            self.lower_expr(f)?;
+            self.emit(Instr::Pop);
+            self.pop_n(1);
+        }
+        self.cur_stack = saved;
+        self.emit(Instr::CleanupReturn);
+        let after = self.code.len() as u32;
+
+        // Patch targets.
+        if let Instr::PushUnwind { cleanup_bcp: c, .. } = &mut self.code[push_at] {
+            *c = cleanup_bcp;
+        }
+        if let Instr::EnterCleanupNormal {
+            cleanup_bcp: c,
+            resume_bcp: r,
+        } = &mut self.code[enter_at]
+        {
+            *c = cleanup_bcp;
+            *r = br_at as u32;
+        }
+        if let Instr::Br(t) = &mut self.code[br_at] {
+            *t = after;
+        }
+
+        // Net effect of the whole form: the protected value V (restored at `after`).
+        self.cur_stack = sp_restore + 1;
+        if self.cur_stack > self.max_stack {
+            self.max_stack = self.cur_stack;
+        }
+        Ok(())
+    }
 }
 
 /// Extract `(name init)` from a `let` binding, which may also be a bare symbol.
@@ -454,15 +809,7 @@ fn binding_name_init(b: BlissVal) -> LowerResult<(String, BlissVal)> {
 fn is_bail_special(name: &str) -> bool {
     matches!(
         name,
-        "BLOCK"
-            | "RETURN-FROM"
-            | "RETURN"
-            | "CATCH"
-            | "THROW"
-            | "TAGBODY"
-            | "GO"
-            | "UNWIND-PROTECT"
-            | "FUNCTION"
+        "FUNCTION"
             | "LAMBDA"
             | "SETQ"
             | "SETF"
@@ -608,6 +955,44 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
 
 // ── Execution ──────────────────────────────────────────────────────
 
+/// A live non-local-exit handler established on an activation (§2.4.3 frame
+/// types CATCH / UNWIND / a block/tag marker). Handlers form a per-activation
+/// stack; unwinding walks them newest-first.
+#[derive(Clone)]
+enum Handler {
+    /// `CATCH`: keyed by the control token shared with `env.catch_stack`.
+    Catch { token: String, resume_bcp: u32, sp_restore: u16 },
+    /// `BLOCK`: keyed by a lexical compile-time id.
+    Block { block_id: u32, resume_bcp: u32, sp_restore: u16 },
+    /// `TAGBODY`: keyed by a lexical compile-time id; `GO` targets a tag PC.
+    Tag { tagbody_id: u32, sp_restore: u16 },
+    /// `UNWIND-PROTECT`: a cleanup to run on any unwind through this point.
+    Unwind { cleanup_bcp: u32, sp_restore: u16 },
+}
+
+/// What to do when a cleanup body finishes (`CleanupReturn`).
+enum CleanupCont {
+    /// Normal completion of `unwind-protect`: restore the protected value and
+    /// resume at `resume_bcp`.
+    Normal { resume_bcp: u32, value: BlissVal },
+    /// The cleanup ran during an unwind: resume that unwind afterwards.
+    Resume(Pending),
+}
+
+/// An in-progress non-local transfer looking for its matching handler.
+enum Pending {
+    /// A `THROW` (or a tree-walker control transfer propagated as
+    /// `Err(Internal(token))`): value is held by `store_control_value(token)`.
+    Token(String),
+    /// A `RETURN-FROM` to the lexical block `block_id`.
+    Return { block_id: u32, value: BlissVal },
+    /// A `GO` to `target_bcp` within tagbody `tagbody_id`.
+    Go { tagbody_id: u32, target_bcp: u32 },
+    /// A genuine error (or uncaught throw): unwind all handlers running
+    /// cleanups, then re-raise.
+    Propagate(BlissError),
+}
+
 /// One live bytecode activation. `frame` owns the value slots on the
 /// `BlissStack`; `bcp`/`sp_top` are the interpreter cursor (D2.03 keeps these
 /// per-`bcp` for OSR/deopt — slice 1 keeps them Rust-side; nmq.3 moves them
@@ -618,6 +1003,10 @@ struct Activation {
     bcp: usize,
     sp_top: u16,
     n_locals: u16,
+    /// Non-local-exit handlers established within this activation (newest last).
+    handlers: Vec<Handler>,
+    /// Pending cleanup continuations (for `unwind-protect`).
+    cleanup_conts: Vec<CleanupCont>,
 }
 
 #[inline]
@@ -673,6 +1062,8 @@ fn run(
         func: entry,
         bcp: 0,
         sp_top: 0,
+        handlers: Vec::new(),
+        cleanup_conts: Vec::new(),
     }];
 
     // Ensure the whole control stack is popped on any early return (error).
@@ -759,6 +1150,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                             func: callee,
                             bcp: 0,
                             sp_top: 0,
+                            handlers: Vec::new(),
+                            cleanup_conts: Vec::new(),
                         });
                         continue;
                     }
@@ -767,11 +1160,29 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
 
                 // Fallback: tree-walker apply (builtins, generics, functions).
                 let fn_val = BlissVal::from_symbol_index(sym);
-                let result = apply_function(fn_val, &args, env)?;
-                acts[top_idx].push_op(result);
+                match apply_function(fn_val, &args, env) {
+                    Ok(result) => acts[top_idx].push_op(result),
+                    Err(e) => {
+                        // Route the error through the bytecode unwind so
+                        // unwind-protect cleanups run and a matching bytecode
+                        // CATCH catches a tree-walker THROW.
+                        let pending = error_to_pending(e, env);
+                        initiate_unwind(acts, stack, env, pending)?;
+                    }
+                }
             }
             Instr::Return => {
-                let v = acts[top_idx].pop_op();
+                let v = {
+                    let act = &mut acts[top_idx];
+                    // Balanced bytecode leaves no live handlers at RETURN; drop
+                    // any catch_stack entries defensively.
+                    for h in act.handlers.drain(..) {
+                        if let Handler::Catch { token, .. } = h {
+                            env.catch_stack.retain(|(_, t)| *t != token);
+                        }
+                    }
+                    act.pop_op()
+                };
                 stack.pop_frame();
                 acts.pop();
                 match acts.last_mut() {
@@ -779,7 +1190,248 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     None => return Ok(v),
                 }
             }
+
+            // ── Non-local control flow (nmq.4) ─────────────────────
+            Instr::PushCatch {
+                resume_bcp,
+                sp_restore,
+            } => {
+                let tag = acts[top_idx].pop_op();
+                let tag_str = val_as_str(tag);
+                let token = next_control_token("__THROW__");
+                env.catch_stack.push((tag_str, token.clone()));
+                acts[top_idx].handlers.push(Handler::Catch {
+                    token,
+                    resume_bcp,
+                    sp_restore,
+                });
+            }
+            Instr::PushBlock {
+                block_id,
+                resume_bcp,
+                sp_restore,
+            } => {
+                acts[top_idx].handlers.push(Handler::Block {
+                    block_id,
+                    resume_bcp,
+                    sp_restore,
+                });
+            }
+            Instr::PushTag {
+                tagbody_id,
+                sp_restore,
+            } => {
+                acts[top_idx].handlers.push(Handler::Tag {
+                    tagbody_id,
+                    sp_restore,
+                });
+            }
+            Instr::PushUnwind {
+                cleanup_bcp,
+                sp_restore,
+            } => {
+                acts[top_idx].handlers.push(Handler::Unwind {
+                    cleanup_bcp,
+                    sp_restore,
+                });
+            }
+            Instr::PopHandler => {
+                if let Some(Handler::Catch { token, .. }) = acts[top_idx].handlers.pop() {
+                    env.catch_stack.retain(|(_, t)| *t != token);
+                }
+            }
+            Instr::Throw => {
+                let (value, tag) = {
+                    let act = &mut acts[top_idx];
+                    let v = act.pop_op();
+                    let t = act.pop_op();
+                    (v, t)
+                };
+                let tag_str = val_as_str(tag);
+                let token = env
+                    .catch_stack
+                    .iter()
+                    .rev()
+                    .find(|(t, _)| *t == tag_str)
+                    .map(|(_, tok)| tok.clone());
+                match token {
+                    Some(tok) => {
+                        store_control_value(&tok, value);
+                        initiate_unwind(acts, stack, env, Pending::Token(tok))?;
+                    }
+                    None => {
+                        let e = BlissError::Internal(format!("uncaught throw to {tag_str}"));
+                        initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
+                    }
+                }
+            }
+            Instr::ReturnFrom { block_id } => {
+                let value = acts[top_idx].pop_op();
+                initiate_unwind(acts, stack, env, Pending::Return { block_id, value })?;
+            }
+            Instr::Go {
+                tagbody_id,
+                target_bcp,
+            } => {
+                initiate_unwind(
+                    acts,
+                    stack,
+                    env,
+                    Pending::Go {
+                        tagbody_id,
+                        target_bcp,
+                    },
+                )?;
+            }
+            Instr::EnterCleanupNormal {
+                cleanup_bcp,
+                resume_bcp,
+            } => {
+                let act = &mut acts[top_idx];
+                let value = act.pop_op();
+                act.cleanup_conts
+                    .push(CleanupCont::Normal { resume_bcp, value });
+                act.bcp = cleanup_bcp as usize;
+            }
+            Instr::CleanupReturn => {
+                let cont = acts[top_idx]
+                    .cleanup_conts
+                    .pop()
+                    .expect("CleanupReturn without a pending cleanup continuation");
+                match cont {
+                    CleanupCont::Normal { resume_bcp, value } => {
+                        let act = &mut acts[top_idx];
+                        act.push_op(value);
+                        act.bcp = resume_bcp as usize;
+                    }
+                    CleanupCont::Resume(pending) => {
+                        initiate_unwind(acts, stack, env, pending)?;
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Drive a non-local transfer: walk handlers newest-first (across activations),
+/// running `unwind-protect` cleanups, until the matching handler is found (or
+/// the stack is exhausted). On success the target activation's `bcp`/operand
+/// stack are set so the main loop resumes there; running a cleanup returns
+/// early with the cleanup queued (its `CleanupReturn` re-drives the unwind).
+fn initiate_unwind(
+    acts: &mut Vec<Activation>,
+    stack: &bliss_rt::BlissStack,
+    env: &mut Env,
+    pending: Pending,
+) -> Result<(), BlissError> {
+    loop {
+        let top = acts.len() - 1;
+        let handler = acts[top].handlers.last().cloned();
+        match handler {
+            Some(Handler::Unwind {
+                cleanup_bcp,
+                sp_restore,
+            }) => {
+                let act = &mut acts[top];
+                act.handlers.pop();
+                act.sp_top = sp_restore;
+                act.cleanup_conts.push(CleanupCont::Resume(pending));
+                act.bcp = cleanup_bcp as usize;
+                return Ok(());
+            }
+            Some(Handler::Catch {
+                token,
+                resume_bcp,
+                sp_restore,
+            }) => {
+                let matched = matches!(&pending, Pending::Token(t) if *t == token);
+                acts[top].handlers.pop();
+                env.catch_stack.retain(|(_, t)| *t != token);
+                if matched {
+                    let v = take_control_value(&token);
+                    let act = &mut acts[top];
+                    act.sp_top = sp_restore;
+                    act.bcp = resume_bcp as usize;
+                    act.push_op(v);
+                    return Ok(());
+                }
+                // Non-matching catch: unwound past.
+            }
+            Some(Handler::Block {
+                block_id,
+                resume_bcp,
+                sp_restore,
+            }) => {
+                acts[top].handlers.pop();
+                if let Pending::Return {
+                    block_id: bid,
+                    value,
+                } = &pending
+                {
+                    if *bid == block_id {
+                        let v = *value;
+                        let act = &mut acts[top];
+                        act.sp_top = sp_restore;
+                        act.bcp = resume_bcp as usize;
+                        act.push_op(v);
+                        return Ok(());
+                    }
+                }
+            }
+            Some(Handler::Tag {
+                tagbody_id,
+                sp_restore,
+            }) => {
+                if let Pending::Go {
+                    tagbody_id: tid,
+                    target_bcp,
+                } = &pending
+                {
+                    if *tid == tagbody_id {
+                        // Keep the tag handler live — tags can be re-targeted.
+                        let act = &mut acts[top];
+                        act.sp_top = sp_restore;
+                        act.bcp = *target_bcp as usize;
+                        return Ok(());
+                    }
+                }
+                acts[top].handlers.pop();
+            }
+            None => {
+                // No handler here — this activation is fully unwound.
+                stack.pop_frame();
+                acts.pop();
+                if acts.is_empty() {
+                    return Err(unmatched_error(pending));
+                }
+            }
+        }
+    }
+}
+
+/// Convert an error returned by a host (tree-walker) call into a bytecode
+/// unwind: a control token naming a live bytecode CATCH becomes a `Token`
+/// transfer (so tree-walker THROWs reach bytecode catches); anything else
+/// propagates after running cleanups.
+fn error_to_pending(e: BlissError, env: &Env) -> Pending {
+    if let BlissError::Internal(token) = &e {
+        if env.catch_stack.iter().any(|(_, t)| t == token) {
+            return Pending::Token(token.clone());
+        }
+    }
+    Pending::Propagate(e)
+}
+
+/// The error to raise when an unwind reaches the bottom with no matching
+/// handler.
+fn unmatched_error(pending: Pending) -> BlissError {
+    match pending {
+        Pending::Propagate(e) => e,
+        Pending::Token(token) => BlissError::Internal(token),
+        Pending::Return { .. } => {
+            BlissError::Internal("RETURN-FROM: no visible block".into())
+        }
+        Pending::Go { .. } => BlissError::Internal("GO: no such tag".into()),
     }
 }
 
@@ -815,11 +1467,27 @@ pub fn eval_toplevel(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     // Any other form: compile a thunk, else fall back.
     match compile_thunk(form, env) {
         Some(bf) => {
+            trace("compiled");
             let arc = Rc::new(bf);
             let fn_val = NIL;
             run(arc, &[], fn_val, env)
         }
-        None => eval_form(form, env),
+        None => {
+            trace("bailed");
+            eval_form(form, env)
+        }
+    }
+}
+
+/// Emit a one-word trace line when `BLISS_BYTECODE_TRACE` is set — used by the
+/// differential tests to assert a program actually ran on the bytecode backend
+/// rather than silently falling back to the tree-walker.
+fn trace(what: &str) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("BLISS_BYTECODE_TRACE").is_some());
+    if on {
+        eprintln!("[bytecode] {what}");
     }
 }
 
