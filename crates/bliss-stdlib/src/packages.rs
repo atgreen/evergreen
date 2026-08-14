@@ -16,9 +16,6 @@ use std::sync::{Arc, RwLock};
 /// Counter for generating unique package IDs (globally unique across threads).
 static NEXT_PACKAGE_ID: AtomicI64 = AtomicI64::new(1);
 
-/// Counter for generating unique symbol values (globally unique across threads).
-static NEXT_SYMBOL_ID: AtomicI64 = AtomicI64::new(1);
-
 thread_local! {
     static CURRENT_STORE: RefCell<Option<Arc<RegistryStore>>> = const { RefCell::new(None) };
 }
@@ -82,16 +79,15 @@ fn alloc_package_id() -> (i64, BlissVal) {
     (id, BlissVal::from_meta_handle(id))
 }
 
-/// Allocate a fresh BlissVal to represent a symbol.
-///
-/// NOTE (bliss-jtc.6): these are still per-store fixnum handles. Retiring them
-/// onto the shared heap-resident registry requires per-(package,name) symbol
-/// identity — a bare-name global intern would collapse `FOO` in two different
-/// packages into one symbol — so it is folded into Stage D (real packages),
-/// where the package cell gives each symbol its home-package identity.
-fn alloc_symbol() -> BlissVal {
-    let id = NEXT_SYMBOL_ID.fetch_add(1, Ordering::Relaxed);
-    BlissVal::from_fixnum(id)
+/// The shared heap-resident symbol for `bare_name` in package `pkg_name`
+/// (bliss-jtc.6 Stage D). The registry key is package-qualified so the same name
+/// in two packages yields *distinct* symbols (CL per-package identity), and the
+/// symbol's home-package cell is set to the shared PACKAGE object — retiring the
+/// former anonymous fixnum handles.
+fn alloc_symbol(pkg_name: &str, bare_name: &str) -> BlissVal {
+    let idx = bliss_rt::symbols::intern(&format!("{pkg_name}::{bare_name}"));
+    bliss_rt::symbols::set_symbol_package(idx, bliss_rt::packages::find_or_create(pkg_name));
+    BlissVal::from_symbol_index(idx)
 }
 
 /// Extract the package ID from a BlissVal handle.
@@ -636,7 +632,7 @@ pub fn intern(name: &str, package: BlissVal) -> Result<(BlissVal, InternStatus),
     if let Some(&sym) = package.external_symbols.get(name) {
         return Ok((sym, InternStatus::External));
     }
-    let sym = alloc_symbol();
+    let sym = alloc_symbol(&package.name, name);
     package.internal_symbols.insert(name.to_string(), sym);
     Ok((sym, InternStatus::New))
 }
@@ -907,7 +903,7 @@ pub fn shadow(names: &[&str], package: BlissVal) -> Result<(), BlissError> {
     for &name in names {
         if !target.internal_symbols.contains_key(name) && !target.external_symbols.contains_key(name)
         {
-            let sym = alloc_symbol();
+            let sym = alloc_symbol(&target.name, name);
             target.internal_symbols.insert(name.to_string(), sym);
         }
         target.shadowing_symbols.insert(name.to_string());

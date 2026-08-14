@@ -238,7 +238,10 @@ fn shared_registry_supports_concurrent_bootstrap_lookup_and_mutation() {
                 let (symbol, status) = intern(&name, package).expect("per-thread intern");
                 assert_eq!(status, InternStatus::New);
                 export(&[symbol], package).expect("per-thread export");
-                ids.push(symbol.as_fixnum());
+                // Symbols are heap-registry objects now (bliss-jtc.6), not fixnum
+                // handles; use the raw tagged bits as a unique identity for the
+                // cross-thread uniqueness check below.
+                ids.push(symbol.to_raw());
             }
 
             let cl_lookup = registry.find_package("CL");
