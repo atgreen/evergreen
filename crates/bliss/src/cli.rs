@@ -9166,6 +9166,25 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
 fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, rest) = cp(cdr);
     let (params_form, body) = cp(rest);
+    // A defun body is wrapped in an implicit block named after the function
+    // (ANSI 3.1.2.1), so `(return-from NAME ...)` works from anywhere in the
+    // body — including inside nested flet/loop/etypecase forms. For `(setf x)`
+    // the block is named `x`.
+    let block_name = if name_form.is_symbol() {
+        Some(name_form)
+    } else if name_form.is_cons() {
+        let (_head, tail) = cp(name_form);
+        if tail.is_cons() { Some(cp(tail).0) } else { None }
+    } else {
+        None
+    };
+    let body = match (block_name, resolve_sym("BLOCK")) {
+        (Some(bn), Some(block_sym)) => {
+            let block_form = arena_cons(block_sym, arena_cons(bn, body));
+            arena_cons(block_form, NIL)
+        }
+        _ => body,
+    };
     if name_form.is_symbol() {
         // Ordinary global function → the symbol's heap function cell
         // (bliss-jtc.6.8). Redefinition updates the existing function object in

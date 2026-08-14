@@ -1738,3 +1738,21 @@ fn unsupplied_optional_and_key_params_shadow_enclosing_bindings() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn defun_establishes_implicit_block_for_return_from() {
+    // bliss-lb6: a defun body is wrapped in a block named after the function
+    // (ANSI 3.1.2.1), so (return-from NAME ...) works from anywhere in the body,
+    // including nested forms. UIOP's resolve-absolute-location relies on this.
+    let prog = "(progn \
+       (defun f (x) (declare (ignore x)) (return-from f 42) 99) \
+       (defun g (n) (dolist (i (list 1 2 3)) (when (= i n) (return-from g i))) :none) \
+       (format t \"~a ~a ~a\" (f 1) (g 2) (g 9)))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("42 2 NONE"),
+        "return-from <function> should work from top-level and nested forms; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
