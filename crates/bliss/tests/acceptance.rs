@@ -1677,3 +1677,27 @@ fn unknown_keyword_argument_is_a_catchable_program_error() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn reexported_inherited_symbol_keeps_identity_and_home_package() {
+    // bliss-lb6.8: a package that :uses another and re-exports one of its
+    // symbols must share the SAME symbol (same home package), not fork a new
+    // one — otherwise a downstream package reaching it via two :use paths sees
+    // a conflict (as UIOP's define-package does).
+    let prog = "(progn \
+       (defpackage :lb6a (:use) (:export #:sym)) \
+       (defpackage :lb6b (:use :lb6a) (:export #:sym)) \
+       (defpackage :lb6c (:use :lb6a :lb6b)) \
+       (let ((a (find-symbol \"SYM\" :lb6a)) \
+             (b (find-symbol \"SYM\" :lb6b)) \
+             (c (find-symbol \"SYM\" :lb6c))) \
+         (format t \"~a ~a ~a\" \
+           (package-name (symbol-package b)) (eq a b) (eq a c))))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("LB6A T T"),
+        "re-exported inherited symbol should stay EQ with home LB6A, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

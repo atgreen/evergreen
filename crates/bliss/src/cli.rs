@@ -2977,6 +2977,14 @@ fn symbol_for_package(pkg_name: &str, bare_name: &str) -> Option<BlissVal> {
 fn intern_into_package(env: &mut Env, pkg_name: &str, bare_name: &str) -> BlissVal {
     let pkg_name = normalize_package_name(pkg_name);
     let bare_name = bare_name.to_uppercase();
+    // ANSI INTERN: if a symbol of this name is already accessible in the package
+    // — present here, or inherited from a used package — return it unchanged. In
+    // particular, an inherited symbol must NOT be re-homed into this package or
+    // forked into a new same-named symbol, or a downstream package reaching it
+    // via two :use paths sees two conflicting symbols (bliss-lb6.8).
+    if let Some((sym, _)) = find_symbol_in_package(env, &pkg_name, &bare_name) {
+        return sym;
+    }
     let sym = symbol_for_package(&pkg_name, &bare_name)
         .or_else(|| resolve_sym(&bare_name))
         .unwrap_or_else(|| arena_str(&bare_name));
@@ -11169,8 +11177,12 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     for name in &interns {
         intern_into_package(env, &pkg_name, name);
     }
-    // Intern each exported symbol so FIND-SYMBOL sees it as external (unless it
-    // was already imported, in which case that symbol keeps its identity).
+    // Make each exported name present + external. If a symbol of that name is
+    // already accessible in the package — in particular inherited from a used
+    // package — import THAT symbol (preserving its identity and home package)
+    // rather than forking a fresh same-named symbol. Re-exporting an inherited
+    // symbol must keep it EQ to the original, or a downstream package that uses
+    // both paths sees two conflicting symbols (bliss-lb6.8).
     for name in &exports {
         let already = env
             .packages
@@ -11178,7 +11190,17 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             .map(|def| def.symbols.contains_key(name))
             .unwrap_or(false);
         if !already {
-            intern_into_package(env, &pkg_name, name);
+            let existing = find_symbol_in_package(env, &pkg_name, name).map(|(s, _)| s);
+            match existing {
+                Some(sym) => {
+                    if let Some(def) = Rc::make_mut(&mut env.packages).get_mut(&pkg_name) {
+                        def.symbols.insert(name.clone(), sym);
+                    }
+                }
+                None => {
+                    intern_into_package(env, &pkg_name, name);
+                }
+            }
         }
     }
 
