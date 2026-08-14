@@ -267,9 +267,18 @@ fn runtime_run_supports_eval_load_and_repl_exit_paths() {
     load_rt.shutdown().unwrap();
     let _ = std::fs::remove_file(load_path);
 
+    // REPL exit path — driven hermetically with a canned reader so the test
+    // never blocks on interactive process stdin (which would hang the whole
+    // serial-locked suite). Exercises an eval line and an explicit (quit).
     let mut repl_rt = Runtime::init(minimal_config()).unwrap();
-    assert_eq!(repl_rt.run().unwrap(), 0);
+    let input = std::io::Cursor::new(b"(+ 1 2)\n(quit)\n".to_vec());
+    assert_eq!(repl_rt.run_repl_with_reader(input).unwrap(), 0);
     repl_rt.shutdown().unwrap();
+
+    // And the EOF exit path (empty input → immediate clean exit, code 0).
+    let mut eof_rt = Runtime::init(minimal_config()).unwrap();
+    assert_eq!(eof_rt.run_repl_with_reader(std::io::empty()).unwrap(), 0);
+    eof_rt.shutdown().unwrap();
 }
 
 #[test]
@@ -388,7 +397,9 @@ fn runtime_boots_the_repl_entry_path_within_the_startup_budget() {
     // Per R2.01, the runtime boots to a REPL-capable top-level entry within 50 ms.
     let started = Instant::now();
     let mut runtime = Runtime::init(minimal_config()).unwrap();
-    assert_eq!(runtime.run().unwrap(), 0);
+    // Drive the REPL entry hermetically (immediate EOF) rather than blocking on
+    // interactive process stdin, which would hang the serial-locked suite.
+    assert_eq!(runtime.run_repl_with_reader(std::io::empty()).unwrap(), 0);
     assert!(
         started.elapsed() < Duration::from_millis(50),
         "startup path exceeded 50 ms budget: {:?}",

@@ -509,6 +509,24 @@ impl Runtime {
 
     fn run_repl(&mut self) -> Result<i32, BlissError> {
         let stdin = io::stdin();
+        let lock = stdin.lock();
+        self.run_repl_with_reader(lock)
+    }
+
+    /// Run the REPL loop reading from an arbitrary `BufRead` source.
+    ///
+    /// `run_repl` calls this with the process stdin lock. It is exposed so tests
+    /// (and embedders) can drive the REPL hermetically — e.g. `io::empty()` for
+    /// an immediate EOF exit, or a `Cursor` of canned input — instead of
+    /// blocking on interactive process stdin, which would hang a test harness
+    /// that holds a serial lock and stall every test behind it.
+    pub fn run_repl_with_reader<R: std::io::BufRead>(
+        &mut self,
+        mut reader: R,
+    ) -> Result<i32, BlissError> {
+        if self.shutdown {
+            return Err(BlissError::Shutdown);
+        }
         let mut input = String::new();
 
         loop {
@@ -518,7 +536,7 @@ impl Runtime {
             })?;
 
             input.clear();
-            match stdin.read_line(&mut input) {
+            match reader.read_line(&mut input) {
                 Ok(0) => {
                     eprintln!();
                     return Ok(0);
