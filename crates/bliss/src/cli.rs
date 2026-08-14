@@ -2911,6 +2911,13 @@ fn intern_into_package(env: &mut Env, pkg_name: &str, bare_name: &str) -> BlissV
         .or_else(|| resolve_sym(&bare_name))
         .unwrap_or_else(|| arena_str(&bare_name));
     ensure_package_available(env, &pkg_name, &[]);
+    // Record the symbol's home package in its heap cell, pointing at the shared
+    // bliss_rt PACKAGE object (bliss-jtc.6 Stage D). A no-op if the symbol is not
+    // registry-resident.
+    if sym.is_symbol() {
+        let pkg = bliss_rt::packages::find_or_create(&pkg_name);
+        bliss_rt::symbols::set_symbol_package(sym.as_symbol_index(), pkg);
+    }
     Rc::make_mut(&mut env.packages)
         .get_mut(&pkg_name)
         .expect("package exists")
