@@ -457,14 +457,21 @@ pub fn read_from_string_with_base(
 }
 
 fn default_string_reader_circular_mode() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-        })
-        .map(|stem| !stem.contains("spec_reader_macroexpand"))
-        .unwrap_or(true)
+    // The executable name never changes during a run, but this is consulted on
+    // every reader token read. Computing `current_exe()` each time issues a
+    // `readlink(/proc/self/exe)` syscall per symbol read, which made loading a
+    // large macro-heavy file (e.g. lib/asdf.lisp) appear to hang. Cache it.
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+            })
+            .map(|stem| !stem.contains("spec_reader_macroexpand"))
+            .unwrap_or(true)
+    })
 }
 
 #[expect(

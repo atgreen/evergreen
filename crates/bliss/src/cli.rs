@@ -9636,15 +9636,42 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
     Ok(name_form)
 }
 
+/// True if a macro lambda list references `&ENVIRONMENT` — the only reason
+/// `expand_macro` needs the (expensive to build) macroexpand environment.
+fn params_form_uses_environment(params_form: BlissVal) -> bool {
+    let mut c = params_form;
+    while c.is_cons() {
+        let (elem, rest) = cp(c);
+        if elem.is_symbol() && sym_name(elem) == "&ENVIRONMENT" {
+            return true;
+        }
+        if elem.is_cons() && params_form_uses_environment(elem) {
+            return true;
+        }
+        c = rest;
+    }
+    false
+}
+
 fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
     let arg_list = list_to_vec(args);
-    let macroexpand_env = macroexpand_environment_from_cli(env);
+    // Building the macroexpand environment walks every frame and re-registers
+    // *all* global macros into bliss-compiler's macro table (with fresh handles
+    // and frozen frame snapshots). That is only needed to satisfy an
+    // `&ENVIRONMENT` parameter, which almost no macro has — doing it on every
+    // expansion made loading macro-heavy files (lib/asdf.lisp) blow up to
+    // multi-GB and never finish. Build it only when the lambda list uses it.
+    let macroexpand_env = if params_form_uses_environment(mdef.params_form) {
+        Some(macroexpand_environment_from_cli(env))
+    } else {
+        None
+    };
     bind_macro_lambda_list(
         mdef.params_form,
         &arg_list,
         &mut child_env,
-        Some(&macroexpand_env),
+        macroexpand_env.as_ref(),
     )?;
     eval_progn(mdef.body, &mut child_env)
 }
