@@ -982,7 +982,44 @@ impl Collector for HeapCollector {
                 }
             }
 
-            // Phase 4: Reset the nursery region for reuse.
+        }
+
+        // Relocate old→young references recorded by the write barrier (jtc.21).
+        // Each remembered slot may hold a pointer to a nursery object that was
+        // just evacuated; chase its forwarding pointer and rewrite the slot to
+        // the survivor/old-gen location so the reference stays valid after the
+        // nursery is reset. This runs before any nursery region is zeroed, while
+        // the forwarding pointers are still intact. Every slot and referent is
+        // bounds-checked before it is dereferenced. Remembered slots are cleared:
+        // their referents now live in regions a minor GC does not move.
+        let heap_base_addr = state.heap_base as usize;
+        let heap_end = heap_base_addr + state.config.heap_size;
+        let remembered: Vec<usize> = state.remembered.drain().collect();
+        for slot_addr in remembered {
+            if slot_addr < heap_base_addr || slot_addr + 8 > heap_end {
+                continue;
+            }
+            let slot = slot_addr as *mut BlissVal;
+            // SAFETY: slot_addr lies within the managed heap.
+            let val = unsafe { *slot };
+            if !is_heap_ref(val) {
+                continue;
+            }
+            let body = (val.0 & !crate::value::TAG_MASK) as usize;
+            if body < heap_base_addr + OBJECT_HEADER_SIZE || body >= heap_end {
+                continue;
+            }
+            let header = (body - OBJECT_HEADER_SIZE) as *const u8;
+            // SAFETY: `body` is within the heap; its header precedes it.
+            if unsafe { header_is_forwarded(header) } {
+                let new_body = unsafe { header_forwarding_addr(header) } as u64;
+                unsafe { *slot = BlissVal(new_body | (val.0 & crate::value::TAG_MASK)) };
+            }
+        }
+
+        // Phase 4: Reset all nursery regions for reuse (after relocation, above,
+        // read their forwarding pointers).
+        for &nursery_idx in &nursery_indices {
             let region = &mut state.regions[nursery_idx];
             // Zero the region memory so walk_heap doesn't see stale forwarding pointers.
             let region_used =
@@ -1482,6 +1519,61 @@ impl WriteBarrier for SatbCardBarrier {
     }
 }
 
+// ── Authoritative write barrier (bliss-jtc.21) ────────────────────
+//
+// Every reference store into a heap object routes through `write_barrier`
+// (directly, via `store_ref`, or a compiler-emitted equivalent) so the
+// generational invariants stay authoritative: old→young references are recorded
+// in the remembered set before a minor GC can move the young referent, and the
+// pre-write value is logged for concurrent old-gen marking (SATB). Immediate
+// stores (fixnums, chars, NIL) record nothing.
+
+/// Run the write barrier for a store of `new_val` into the slot at `slot_addr`,
+/// whose current value is `old_val`. Records the SATB pre-write value (only
+/// while marking) and adds the slot to the remembered set when a heap reference
+/// is stored; the minor GC filters remembered slots to genuine old→young
+/// pointers when it processes the set.
+pub fn write_barrier(slot_addr: *mut BlissVal, old_val: BlissVal, new_val: BlissVal) {
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        if gc_marking_in_progress() {
+            state.satb_log.push(old_val);
+        }
+        if is_heap_ref(new_val) {
+            state.remembered.insert(slot_addr as usize);
+        }
+    }
+}
+
+/// Store `new` into the reference slot at `slot`, running the write barrier
+/// first. This is the shared helper that mutators — the interpreter, stdlib,
+/// and compiled stores — route reference writes through so the remembered set
+/// and SATB log stay authoritative (bliss-jtc.21).
+///
+/// # Safety
+/// `slot` must point at a valid, aligned `BlissVal` reference slot.
+pub unsafe fn store_ref(slot: *mut BlissVal, new: BlissVal) {
+    let old = unsafe { *slot };
+    write_barrier(slot, old, new);
+    unsafe { *slot = new };
+}
+
+/// Number of slots currently in the remembered set (test/diagnostic hook).
+pub fn remembered_set_len() -> usize {
+    let guard = heap_state().lock().unwrap();
+    guard.as_ref().map(|s| s.remembered.len()).unwrap_or(0)
+}
+
+/// Drain the SATB pre-write log — consumed by the concurrent old-gen marker at
+/// marking termination (§3.7.1).
+pub fn drain_satb_log() -> Vec<BlissVal> {
+    let mut guard = heap_state().lock().unwrap();
+    guard
+        .as_mut()
+        .map(|s| std::mem::take(&mut s.satb_log))
+        .unwrap_or_default()
+}
+
 // ── Weak references ────────────────────────────────────────────────
 
 /// A weak pointer that is cleared when its referent is collected.
@@ -1742,6 +1834,15 @@ struct HeapState {
     heap_base: *mut u8,
     /// Layout used for the heap allocation (needed for dealloc).
     heap_layout: Layout,
+    /// Remembered set (bliss-jtc.21): addresses of reference slots recorded by
+    /// the write barrier. A minor GC scans these to find and relocate old→young
+    /// pointers without walking the whole old generation, so young referents of
+    /// older objects survive and their slots are fixed up after the nursery moves.
+    remembered: std::collections::HashSet<usize>,
+    /// SATB pre-write log: old reference values captured by the write barrier
+    /// while concurrent old-gen marking is active, so the marker traces the
+    /// snapshot-at-the-beginning graph (§3.6.2).
+    satb_log: Vec<BlissVal>,
 }
 
 // Safety: HeapState is only accessed under the global mutex.
@@ -1858,6 +1959,8 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
         regions,
         heap_base,
         heap_layout,
+        remembered: std::collections::HashSet::new(),
+        satb_log: Vec::new(),
     };
     *heap_state().lock().unwrap() = Some(state);
 

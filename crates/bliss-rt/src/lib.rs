@@ -40,8 +40,9 @@ pub use error::BlissError;
 pub use ffi::{AlienType, Callback, load_foreign_library, marshal_to_c, unmarshal_from_c};
 pub use gc::{
     Allocator, Collector, GcConfig, GcStats, HeapAllocator, HeapCollector, RegionHeader,
-    RegionKind, SatbCardBarrier, Tlab, WeakPointer, WriteBarrier, full_gc, heap_stats, init_heap,
-    register_finalizer, walk_heap,
+    RegionKind, SatbCardBarrier, Tlab, WeakPointer, WriteBarrier, drain_satb_log, full_gc,
+    heap_stats, init_heap, register_finalizer, remembered_set_len, store_ref, walk_heap,
+    write_barrier,
 };
 pub use image::{
     Arch, ImageCompression, ImageHeader, Os, SaveImageOptions, SectionEntry, SectionType,
