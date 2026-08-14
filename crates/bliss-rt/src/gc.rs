@@ -572,6 +572,22 @@ fn is_heap_ref(v: BlissVal) -> bool {
     )
 }
 
+/// The body address (object header + OBJECT_HEADER_SIZE) of the object a heap
+/// reference points at. Conses point at their body directly; every other heap
+/// object's value points at the object header, so its body is 8 bytes further on.
+/// Normalizing to the body address gives the GC one object identity for indexing,
+/// marking, forwarding, and relocation, regardless of the pointer convention.
+/// Safety-neutral: pure address arithmetic on a tagged value.
+#[inline]
+fn ref_body_addr(v: BlissVal) -> usize {
+    let ptr = (v.0 & !crate::value::TAG_MASK) as usize;
+    if (v.0 & crate::value::TAG_MASK) == crate::value::TAG_CONS {
+        ptr
+    } else {
+        ptr + OBJECT_HEADER_SIZE
+    }
+}
+
 /// If `slot` holds a reference to an object that has been evacuated — its header
 /// carries a forwarding pointer — rewrite the slot to the object's new location,
 /// preserving the tag. Bounds-checked against `[heap_base, heap_end)` so a slot
@@ -589,17 +605,22 @@ unsafe fn relocate_slot(slot: *mut BlissVal, heap_base: usize, heap_end: usize) 
         return;
     }
     let tag = v.0 & crate::value::TAG_MASK;
-    let body = (v.0 & !crate::value::TAG_MASK) as usize;
+    let v_ptr = (v.0 & !crate::value::TAG_MASK) as usize;
+    // Normalize to the object body address (tag-aware: conses point at their
+    // body, other heap objects at their header), so the header and forwarding
+    // logic below is uniform for every object kind.
+    let body = ref_body_addr(v);
     if body < heap_base + OBJECT_HEADER_SIZE || body >= heap_end {
         return;
     }
-    // Evacuated objects are normal (offset-8 body); large objects never move, so
-    // the header always precedes the body by OBJECT_HEADER_SIZE here.
     let header = (body - OBJECT_HEADER_SIZE) as *const u8;
     // SAFETY: `body` lies within the managed heap; its header precedes it.
     if unsafe { header_is_forwarded(header) } {
-        let new_body = unsafe { header_forwarding_addr(header) } as u64;
-        unsafe { *slot = BlissVal(new_body | tag) };
+        let new_body = unsafe { header_forwarding_addr(header) } as usize;
+        // Preserve the value's offset from the object header (0 for a cons that
+        // points at its body, OBJECT_HEADER_SIZE for a header-pointing object).
+        let offset = body - v_ptr;
+        unsafe { *slot = BlissVal(((new_body - offset) as u64) | tag) };
     }
 }
 
@@ -760,7 +781,7 @@ impl HeapCollector {
             // SAFETY: `fp` is a valid frame chain (live or published).
             unsafe {
                 crate::stack::visit_stack_refs(fp, |slot| {
-                    let addr = (slot.0 & !0b111) as usize;
+                    let addr = ref_body_addr(*slot);
                     if object_index.contains_key(&addr) && marked.insert(addr) {
                         worklist.push(addr);
                     }
@@ -1275,7 +1296,7 @@ impl Collector for HeapCollector {
              marked: &mut std::collections::HashSet<usize>,
              worklist: &mut Vec<usize>| {
                 if is_heap_ref(v) {
-                    let target = (v.0 & !crate::value::TAG_MASK) as usize;
+                    let target = ref_body_addr(v);
                     if object_index.contains_key(&target) && marked.insert(target) {
                         worklist.push(target);
                     }
@@ -1736,7 +1757,7 @@ fn set_pin_bit(v: BlissVal, pinned: bool) {
     if !is_heap_ref(v) {
         return;
     }
-    let body = (v.0 & !crate::value::TAG_MASK) as usize;
+    let body = ref_body_addr(v);
     let guard = heap_state().lock().unwrap();
     let Some(state) = guard.as_ref() else {
         return;
@@ -2967,7 +2988,8 @@ mod relocation_tests {
 
         let mut holder = vec![0u64; 3]; // header@0, numerator@8, denominator@16
         unsafe { write_object_header(holder.as_mut_ptr() as *mut u8, tid::RATIO, 16) };
-        holder[1] = (target_body as u64) | TAG_HEAP; // numerator → target
+        // Heap objects reference the object header (target_body − 8), not the body.
+        holder[1] = ((target_body as u64) - 8) | TAG_HEAP; // numerator → target
         holder[2] = BlissVal::from_fixnum(7).0; // denominator (non-reference)
         let holder_body = unsafe { (holder.as_mut_ptr() as *mut u8).add(8) };
 
@@ -2987,7 +3009,7 @@ mod relocation_tests {
             });
         }
 
-        assert_eq!(holder[1] & !0b111, moved_body as u64, "field relocated to moved body");
+        assert_eq!(holder[1] & !0b111, (moved_body as u64) - 8, "field relocated to moved header");
         assert_eq!(holder[1] & 0b111, TAG_HEAP, "tag preserved");
         assert_eq!(unsafe { *(moved_body as *const u64) }, 0xFEED_1234, "contents intact");
         assert_eq!(holder[2], BlissVal::from_fixnum(7).0, "non-reference field untouched");

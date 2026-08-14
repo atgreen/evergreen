@@ -32,9 +32,11 @@ fn test_lock() -> &'static Mutex<()> {
     L.get_or_init(|| Mutex::new(()))
 }
 
-/// Tag a heap object body as a reference BlissVal (bodies are 8-byte aligned).
+/// A heap-object reference in the runtime convention: the value points at the
+/// object *header* (body − 8), matching `from_heap_ptr`; the first body word
+/// (header + 8, i.e. the allocator's returned pointer) holds the test marker.
 fn heap_ref(body: *mut u8) -> BlissVal {
-    BlissVal((body as u64) | TAG_HEAP_OBJECT)
+    BlissVal(((body as u64) - 8) | TAG_HEAP_OBJECT)
 }
 
 #[test]
@@ -60,10 +62,10 @@ fn old_to_young_reference_survives_and_relocates_across_minor_gc() {
     HeapCollector::new().minor_gc().unwrap();
 
     let relocated = unsafe { *slot };
-    let new_body = (relocated.0 & !0b111) as *const u64;
-    assert_ne!(new_body as u64, young as u64, "young object was evacuated (moved)");
+    let new_header = (relocated.0 & !0b111) as usize;
+    assert_ne!(new_header, young as usize - 8, "young object was evacuated (moved)");
     assert_eq!(
-        unsafe { *new_body },
+        unsafe { *((new_header + 8) as *const u64) },
         MARKER,
         "young referent survived with intact contents at its new location"
     );
@@ -132,10 +134,10 @@ fn nursery_object_held_only_by_cl_frame_relocates_across_minor_gc() {
     HeapCollector::new().minor_gc().unwrap();
 
     let relocated = unsafe { BlissStack::frame_slots_mut(f)[0] };
-    let new_body = (relocated.0 & !0b111) as *const u64;
-    assert_ne!(new_body as u64, young as u64, "young object was moved by minor GC");
+    let new_header = (relocated.0 & !0b111) as usize;
+    assert_ne!(new_header, young as usize - 8, "young object was moved by minor GC");
     assert_eq!(
-        unsafe { *new_body },
+        unsafe { *((new_header + 8) as *const u64) },
         MARKER,
         "frame-held young object survived with intact contents at its new location"
     );
