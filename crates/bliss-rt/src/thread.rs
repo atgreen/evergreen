@@ -536,6 +536,14 @@ pub fn all_thread_ids() -> Vec<GreenThreadId> {
     registry.keys().copied().collect()
 }
 
+/// The frame pointer a green thread published at its last safepoint, for
+/// precise CL-stack scanning by the GC (nmq.3). Returns `None` if the thread is
+/// not registered.
+pub fn thread_published_fp(id: GreenThreadId) -> Option<*const crate::stack::Frame> {
+    let registry = thread_registry().lock().ok()?;
+    registry.get(&id).map(|t| t.stack().published_fp())
+}
+
 /// Count threads that must participate in a safepoint handshake.
 ///
 /// Native threads are intentionally excluded: while they are inside foreign

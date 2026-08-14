@@ -429,6 +429,39 @@ pub struct HeapCollector {
 }
 
 impl HeapCollector {
+    /// Precise CL-stack roots (nmq.3): mark exactly the heap references held in
+    /// every live CL frame of every green thread. Each frame slot is a tagged
+    /// `BlissVal`, so references are found by tag and non-references are never
+    /// pinned. The current thread uses its live frame pointer; parked threads
+    /// use the frame pointer they published at their safepoint.
+    fn scan_cl_stack_roots(
+        marked: &mut std::collections::HashSet<usize>,
+        worklist: &mut Vec<usize>,
+        object_index: &std::collections::HashMap<usize, (usize, usize)>,
+    ) {
+        let mut mark_from = |fp: *const crate::stack::Frame| {
+            // SAFETY: `fp` is a valid frame chain (live or published).
+            unsafe {
+                crate::stack::visit_stack_refs(fp, |slot| {
+                    let addr = (slot.0 & !0b111) as usize;
+                    if object_index.contains_key(&addr) && marked.insert(addr) {
+                        worklist.push(addr);
+                    }
+                });
+            }
+        };
+        let cur = crate::thread::current_thread_id();
+        mark_from(crate::thread::current_thread().stack().fp());
+        for id in crate::thread::all_thread_ids() {
+            if id == cur {
+                continue;
+            }
+            if let Some(fp) = crate::thread::thread_published_fp(id) {
+                mark_from(fp);
+            }
+        }
+    }
+
     /// Create a new collector. The heap must already be initialized.
     pub fn new() -> Self {
         let stats = heap_stats();
@@ -811,6 +844,13 @@ impl Collector for HeapCollector {
                 scan += 8; // scan every 8-byte aligned slot
             }
         }
+
+        // Precise CL-stack roots (nmq.3): walk this thread's BlissStack frames
+        // and mark exactly the heap references their slots hold — identified by
+        // BlissVal tag, so no non-reference CL data is conservatively pinned.
+        // Interpreter (T0) and compiled (T1) frames share the §2.4.2 layout, so
+        // this one walk covers mixed-tier stacks.
+        Self::scan_cl_stack_roots(&mut marked, &mut scan_worklist, &object_index);
 
         // Transitive closure: scan newly marked objects for more pointers.
         while let Some(obj_addr) = scan_worklist.pop() {

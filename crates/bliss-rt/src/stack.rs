@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::value::BlissVal;
+use crate::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
 
 /// CL stack for a green thread.
 /// Default usable size: 512 KiB (configurable via BLISS_STACK_SIZE).
@@ -406,6 +406,47 @@ pub struct SourceLocation {
     pub file: Option<String>,
     pub line: u32,
     pub column: u32,
+}
+
+// ── Precise CL-stack scanning (nmq.3) ──────────────────────────────
+
+/// Is `v` a heap reference (points to a GC-managed object)? Fixnums,
+/// characters, single-floats, symbols, and the special immediates are not.
+#[inline]
+fn is_heap_reference(v: BlissVal) -> bool {
+    matches!(v.tag(), TAG_CONS | TAG_HEAP_OBJECT | TAG_FUNCTION)
+}
+
+/// Visit every heap-reference slot in the CL frames reachable from `fp`,
+/// **precisely** — each slot is a tagged `BlissVal`, so references are
+/// identified exactly by tag, with no conservative pinning of non-reference CL
+/// data (fixnums, chars, …). The visitor receives a mutable pointer to each
+/// reference slot so the GC can both mark the referent and update the slot when
+/// the object relocates (§2.4.4 "GC of the control stack").
+///
+/// Interpreter (T0) frames and compiled (T1) frames share the §2.4.2 layout, so
+/// one walk covers mixed-tier stacks.
+///
+/// # Safety
+/// `fp` must be null or point to a valid frame chain whose `num_locals` are
+/// correct (as produced by [`BlissStack::push_frame`]).
+pub unsafe fn visit_stack_refs(fp: *const Frame, mut visit: impl FnMut(&mut BlissVal)) {
+    let mut cur = fp;
+    while !cur.is_null() {
+        let frame = cur as *mut Frame;
+        // SAFETY: caller guarantees a valid frame chain.
+        unsafe {
+            let n = (*frame).num_locals as usize;
+            let slots = frame.add(1) as *mut BlissVal;
+            for i in 0..n {
+                let slot = &mut *slots.add(i);
+                if is_heap_reference(*slot) {
+                    visit(slot);
+                }
+            }
+            cur = (*frame).prev_fp as *const Frame;
+        }
+    }
 }
 
 // ── Frame walker ───────────────────────────────────────────────────

@@ -60,7 +60,7 @@ pub use sandbox::{Sandbox, SandboxPolicy};
 pub use scheduler::{Scheduler, SchedulerConfig};
 pub use stack::{
     BlissStack, CodeInfo, Frame, FrameType, FrameWalker, SourceLocation, SourceLocationEntry,
-    StackMapEntry, eval_stack_budget,
+    StackMapEntry, eval_stack_budget, visit_stack_refs,
 };
 pub use thread::{
     GreenThread, GreenThreadId, ThreadState, WorkerThread, all_thread_ids, current_thread,

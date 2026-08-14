@@ -341,3 +341,71 @@ fn frame_slots_survive_across_deeper_push() {
         assert_eq!(s[1].as_fixnum(), 99);
     }
 }
+
+// ── Precise CL-stack scanning (bliss-nmq.3) ────────────────────────
+
+#[test]
+fn visit_stack_refs_finds_exactly_the_references() {
+    use bliss_rt::{BlissVal, visit_stack_refs};
+    let stack = BlissStack::new(64 * 1024);
+    // Frame with a mix of references and non-references.
+    let f = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 4, 0)
+        .unwrap();
+    // Fabricate a cons-tagged and a heap-tagged value (addresses need not be
+    // real for the tag-classification test — the scanner only inspects tags).
+    let cons_val = BlissVal(0x1000 | 0b001); // TAG_CONS
+    let heap_val = BlissVal(0x2000 | 0b010); // TAG_HEAP_OBJECT
+    unsafe {
+        let s = BlissStack::frame_slots_mut(f);
+        s[0] = BlissVal::from_fixnum(42); // not a reference
+        s[1] = cons_val; // reference
+        s[2] = BlissVal::from_char('x'); // not a reference
+        s[3] = heap_val; // reference
+    }
+    let mut visited: Vec<u64> = Vec::new();
+    unsafe {
+        visit_stack_refs(stack.fp(), |slot| visited.push(slot.0));
+    }
+    // Exactly the two references, no conservative pinning of the fixnum/char.
+    assert_eq!(visited.len(), 2);
+    assert!(visited.contains(&cons_val.0));
+    assert!(visited.contains(&heap_val.0));
+}
+
+#[test]
+fn visit_stack_refs_can_relocate_a_reference() {
+    use bliss_rt::{BlissVal, visit_stack_refs};
+    let stack = BlissStack::new(64 * 1024);
+    let f = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)
+        .unwrap();
+    unsafe {
+        BlissStack::frame_slots_mut(f)[0] = BlissVal(0x1000 | 0b001);
+    }
+    // Simulate relocation: rewrite the referent address, preserving the tag.
+    unsafe {
+        visit_stack_refs(stack.fp(), |slot| {
+            let tag = slot.0 & 0b111;
+            slot.0 = 0x9000 | tag;
+        });
+    }
+    unsafe {
+        assert_eq!(BlissStack::frame_slots_mut(f)[0].0, 0x9000 | 0b001);
+    }
+}
+
+#[test]
+fn visit_stack_refs_walks_all_frames() {
+    use bliss_rt::{BlissVal, visit_stack_refs};
+    let stack = BlissStack::new(64 * 1024);
+    let f1 = stack.push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0).unwrap();
+    let f2 = stack.push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0).unwrap();
+    unsafe {
+        BlissStack::frame_slots_mut(f1)[0] = BlissVal(0x1000 | 0b001);
+        BlissStack::frame_slots_mut(f2)[0] = BlissVal(0x2000 | 0b010);
+    }
+    let mut count = 0;
+    unsafe { visit_stack_refs(stack.fp(), |_| count += 1) };
+    assert_eq!(count, 2, "should visit references in both frames");
+}
