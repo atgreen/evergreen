@@ -1627,3 +1627,53 @@ fn gray_input_stream_routes_read_functions_through_generics() {
         "expected read-line/read-char routed through stream-read-char, got stdout: '{stdout}', stderr: '{err}'"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════
+// ASDF long-tail fixes (bliss-lb6.7): -if sequence bounds, LOOP `by`,
+// catchable unknown-keyword errors.
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn sequence_if_functions_accept_start_end_from_end() {
+    let prog = "(format t \"~a ~a ~a ~a\" \
+       (position-if (function evenp) (list 1 3 4 5 6)) \
+       (position-if (function evenp) (list 1 3 4 5 6) :from-end t) \
+       (find-if (function evenp) (list 1 3 4 5) :start 1 :end 3) \
+       (count-if (function evenp) (list 1 2 3 4 5 6) :end 4))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // first even @2; last even @4; find-if even in [1,3)=(3 4)->4; evens in first 4=(1 2 3 4)->2
+    assert!(
+        stdout.contains("2 4 4 2"),
+        "expected '2 4 4 2', got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn loop_supports_by_step_for_numeric_and_lists() {
+    let prog = "(format t \"~a|~a|~a\" \
+       (loop for i from 0 to 10 by 3 collect i) \
+       (loop for x in (list 1 2 3 4 5 6) by (function cddr) collect x) \
+       (loop for x on (list 1 2 3 4) by (function cddr) collect (car x)))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(0 3 6 9)|(1 3 5)|(1 3)"),
+        "expected loop-by results, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn unknown_keyword_argument_is_a_catchable_program_error() {
+    let prog = "(handler-case (find-if (function evenp) (list 1 2) :bogus 3) \
+       (program-error (e) (declare (ignore e)) (format t \"CAUGHT\")))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("CAUGHT"),
+        "unknown keyword should signal a catchable PROGRAM-ERROR, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

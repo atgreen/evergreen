@@ -7329,10 +7329,14 @@ enum ForClause {
     In {
         pat: BlissVal,
         list_form: BlissVal,
+        /// Optional `by` step function form (default: `cdr`).
+        step: Option<BlissVal>,
     },
     On {
         pat: BlissVal,
         list_form: BlissVal,
+        /// Optional `by` step function form (default: `cdr`).
+        step: Option<BlissVal>,
     },
     Eq {
         pat: BlissVal,
@@ -7365,6 +7369,8 @@ enum ForState {
     On {
         pat: BlissVal,
         tail: BlissVal,
+        /// Evaluated `by` step function (None → step by cdr).
+        step: Option<BlissVal>,
     },
     Eq {
         pat: BlissVal,
@@ -7494,12 +7500,32 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     Some("IN") => {
                         p.advance();
                         let list_form = p.read_form()?;
-                        for_clauses.push(ForClause::In { pat, list_form });
+                        let step = if p.at_kw("BY") {
+                            p.advance();
+                            Some(p.read_form()?)
+                        } else {
+                            None
+                        };
+                        for_clauses.push(ForClause::In {
+                            pat,
+                            list_form,
+                            step,
+                        });
                     }
                     Some("ON") => {
                         p.advance();
                         let list_form = p.read_form()?;
-                        for_clauses.push(ForClause::On { pat, list_form });
+                        let step = if p.at_kw("BY") {
+                            p.advance();
+                            Some(p.read_form()?)
+                        } else {
+                            None
+                        };
+                        for_clauses.push(ForClause::On {
+                            pat,
+                            list_form,
+                            step,
+                        });
                     }
                     Some("ACROSS") => {
                         p.advance();
@@ -7695,20 +7721,44 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         let mut has_stepping_driver = false;
         for fc in &for_clauses {
             match fc {
-                ForClause::In { pat, list_form } => {
+                ForClause::In {
+                    pat,
+                    list_form,
+                    step,
+                } => {
                     let list = eval_form(*list_form, env)?;
+                    let items = match step {
+                        // `for x in list by fn`: x takes the car of each stepped
+                        // tail (list, (fn list), (fn (fn list)), …).
+                        Some(step_form) => {
+                            let step_fn = eval_form(*step_form, env)?;
+                            let mut items = Vec::new();
+                            let mut tail = list;
+                            while tail.is_cons() {
+                                items.push(cp(tail).0);
+                                tail = apply_function(step_fn, &[tail], env)?;
+                            }
+                            items
+                        }
+                        None => list_to_vec(list),
+                    };
                     states.push(ForState::In {
                         pat: *pat,
-                        items: list_to_vec(list),
+                        items,
                         idx: 0,
                     });
                     has_stepping_driver = true;
                 }
-                ForClause::On { pat, list_form } => {
+                ForClause::On { pat, list_form, step } => {
                     let list = eval_form(*list_form, env)?;
+                    let step = match step {
+                        Some(step_form) => Some(eval_form(*step_form, env)?),
+                        None => None,
+                    };
                     states.push(ForState::On {
                         pat: *pat,
                         tail: list,
+                        step,
                     });
                     has_stepping_driver = true;
                 }
@@ -7817,13 +7867,16 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                         loop_bind(*pat, items[*idx], env);
                         *idx += 1;
                     }
-                    ForState::On { pat, tail } => {
+                    ForState::On { pat, tail, step } => {
                         if !tail.is_cons() {
                             exhausted = true;
                             break;
                         }
                         loop_bind(*pat, *tail, env);
-                        *tail = cp(*tail).1;
+                        *tail = match step {
+                            Some(f) => apply_function(*f, &[*tail], env)?,
+                            None => cp(*tail).1,
+                        };
                     }
                     ForState::Eq { pat, init, then } => {
                         let f = if first { *init } else { then.unwrap_or(*init) };
@@ -9295,7 +9348,9 @@ fn bind_lambda_list(
                     continue;
                 }
                 if !key_specs.iter().any(|(kw, _, _, _)| kw == &bare) {
-                    return Err(BlissError::Internal(format!(
+                    // Unknown keyword to a function is an ANSI PROGRAM-ERROR
+                    // (catchable), not an internal/uncatchable failure.
+                    return Err(BlissError::ProgramError(format!(
                         "unexpected keyword argument: {}",
                         bare
                     )));

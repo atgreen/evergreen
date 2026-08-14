@@ -497,37 +497,55 @@
           (dolist (x items acc)
             (setq acc (if from-end (funcall fn x acc) (funcall fn acc x))))))))
 
-(defun find-if (pred seq &key key)
-  (dotimes (i (length seq) nil)
-    (let ((e (elt seq i)))
-      (when (funcall pred (if key (funcall key e) e)) (return e)))))
+(defun find-if (pred seq &key key (start 0) end from-end)
+  (let ((stop (or end (length seq))))
+    (flet ((matchp (e) (funcall pred (if key (funcall key e) e))))
+      (if from-end
+          (loop for i from (1- stop) downto start
+                for e = (elt seq i)
+                when (matchp e) return e)
+          (loop for i from start below stop
+                for e = (elt seq i)
+                when (matchp e) return e)))))
 
-(defun find-if-not (pred seq &key key)
-  (dotimes (i (length seq) nil)
-    (let ((e (elt seq i)))
-      (unless (funcall pred (if key (funcall key e) e)) (return e)))))
+(defun find-if-not (pred seq &key key (start 0) end from-end)
+  (let ((stop (or end (length seq))))
+    (flet ((matchp (e) (not (funcall pred (if key (funcall key e) e)))))
+      (if from-end
+          (loop for i from (1- stop) downto start
+                for e = (elt seq i)
+                when (matchp e) return e)
+          (loop for i from start below stop
+                for e = (elt seq i)
+                when (matchp e) return e)))))
 
-(defun position-if (pred seq &key key)
-  (dotimes (i (length seq) nil)
-    (let ((e (elt seq i)))
-      (when (funcall pred (if key (funcall key e) e)) (return i)))))
+(defun position-if (pred seq &key key (start 0) end from-end)
+  (let ((stop (or end (length seq))))
+    (flet ((matchp (e) (funcall pred (if key (funcall key e) e))))
+      (if from-end
+          (loop for i from (1- stop) downto start
+                when (matchp (elt seq i)) return i)
+          (loop for i from start below stop
+                when (matchp (elt seq i)) return i)))))
 
-(defun position-if-not (pred seq &key key)
-  (dotimes (i (length seq) nil)
-    (let ((e (elt seq i)))
-      (unless (funcall pred (if key (funcall key e) e)) (return i)))))
+(defun position-if-not (pred seq &key key (start 0) end from-end)
+  (let ((stop (or end (length seq))))
+    (flet ((matchp (e) (not (funcall pred (if key (funcall key e) e)))))
+      (if from-end
+          (loop for i from (1- stop) downto start
+                when (matchp (elt seq i)) return i)
+          (loop for i from start below stop
+                when (matchp (elt seq i)) return i)))))
 
-(defun count-if (pred seq &key key)
-  (let ((n 0))
-    (dotimes (i (length seq) n)
-      (let ((e (elt seq i)))
-        (when (funcall pred (if key (funcall key e) e)) (incf n))))))
+(defun count-if (pred seq &key key (start 0) end)
+  (let ((stop (or end (length seq))))
+    (loop for i from start below stop
+          count (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e))))))
 
-(defun count-if-not (pred seq &key key)
-  (let ((n 0))
-    (dotimes (i (length seq) n)
-      (let ((e (elt seq i)))
-        (unless (funcall pred (if key (funcall key e) e)) (incf n))))))
+(defun count-if-not (pred seq &key key (start 0) end)
+  (let ((stop (or end (length seq))))
+    (loop for i from start below stop
+          count (not (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e)))))))
 
 (defun member-if (pred list &key key)
   (loop for l on list
