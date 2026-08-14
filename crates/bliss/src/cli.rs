@@ -2318,6 +2318,24 @@ fn print_val(val: BlissVal, out: &mut String) {
             out.push('"');
             return;
         }
+        // Pathnames are registry-backed pseudo-heap values: render via their
+        // namestring rather than dereferencing them as a heap object (which
+        // would crash for a pathname whose namestring is not separately
+        // registered, e.g. a MERGE-PATHNAMES result). bliss-lb6.
+        if bliss_stdlib::is_pathname(val) {
+            if let Ok(ns) = bliss_stdlib::namestring(val) {
+                let s = val_as_str(ns);
+                out.push('"');
+                for c in s.chars() {
+                    if c == '"' || c == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+                out.push('"');
+                return;
+            }
+        }
         unsafe {
             let ptr = val.as_ptr();
             let hdr = *(ptr as *const ObjectHeader);
@@ -5401,6 +5419,41 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let (pathname, _) = bliss_stdlib::parse_namestring(thing, None, None)?;
                 return Ok(pathname);
+            }
+            "MERGE-PATHNAMES" => {
+                // (merge-pathnames pathname &optional default-pathname default-version)
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::ProgramError(
+                        "MERGE-PATHNAMES requires a pathname".into(),
+                    ));
+                }
+                // Coerce a pathname designator (string / pathname) to a pathname.
+                let to_pathname = |v: BlissVal| -> Result<BlissVal, BlissError> {
+                    if bliss_stdlib::is_pathname(v) {
+                        Ok(v)
+                    } else {
+                        Ok(bliss_stdlib::parse_namestring(v, None, None)?.0)
+                    }
+                };
+                let a0 = eval_form(args[0], env)?;
+                let pathname = to_pathname(a0)?;
+                let default = if args.len() > 1 {
+                    let d = eval_form(args[1], env)?;
+                    to_pathname(d)?
+                } else {
+                    // ANSI default is *default-pathname-defaults*.
+                    match env.lookup_var("*DEFAULT-PATHNAME-DEFAULTS*") {
+                        Some(v) if !v.is_nil() => to_pathname(v)?,
+                        _ => to_pathname(bliss_stdlib::make_lisp_string("./"))?,
+                    }
+                };
+                let default_version = if args.len() > 2 {
+                    eval_form(args[2], env)?
+                } else {
+                    NIL
+                };
+                return bliss_stdlib::merge_pathnames(pathname, default, default_version);
             }
             "PATHNAME-NAME" => {
                 let (pathname_form, _) = cp(cdr);
