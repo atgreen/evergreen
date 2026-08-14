@@ -39,7 +39,8 @@ use bliss_rt::value::{BlissVal, NIL, T};
 use bliss_rt::{CodeInfo, Frame};
 
 use super::{
-    Env, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry, RestartFunction, apply_function,
+    Env, EnvFrame, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry, RestartFunction,
+    apply_function,
     arena_cons, bliss_error_to_condition, condition_matches_handler, cp, eval_form,
     handler_case_token, list_to_vec, next_control_token, resolve_sym, restart_invoked_name,
     run_handler_bind_handlers, store_control_value, sym_name, tag_key, take_control_value,
@@ -93,6 +94,21 @@ enum Instr {
     /// for non-capturing `(lambda …)` / `(function …)`: the resulting closure
     /// is callable by both backends (`funcall`/`apply`/`mapcar` go host).
     EvalHost(u16),
+
+    // ── Captured locals / closures (nmq.5) ─────────────────────────
+    /// Push a boxed (closure-captured) variable from the heap `EnvFrame`.
+    LoadEnvVar(u16),
+    /// Pop and store into an existing boxed variable (`setq`).
+    StoreEnvVar(u16),
+    /// Pop and bind a boxed variable in the current heap `EnvFrame`.
+    DefineEnvVar(u16),
+    /// Enter a fresh child `EnvFrame` (a `let` that binds captured variables).
+    PushEnvChild,
+    /// Leave the current child `EnvFrame`.
+    PopEnvChild,
+    /// Evaluate a `(lambda …)` constant with `env.frame` bound to this
+    /// activation's heap `EnvFrame`, so the closure captures it (shared, live).
+    MakeClosureEnv(u16),
     /// Discard the top of the operand stack.
     Pop,
     /// Unconditional jump: set the bytecode pointer to `target`.
@@ -177,6 +193,10 @@ pub struct BytecodeFunction {
     names: Vec<String>,
     /// Static per-`restart-case` tables (indexed by `PushRestartCase`).
     restart_cases: Vec<RestartCaseInfo>,
+    /// Per-parameter `(name, location)` for the entry sequence.
+    param_layout: Vec<(String, VarLoc)>,
+    /// Whether this function needs a heap `EnvFrame` (has captured locals).
+    has_env: bool,
     /// Number of lexical local slots (params + `let` bindings).
     n_locals: u16,
     /// Maximum operand-stack depth.
@@ -219,6 +239,14 @@ struct ClauseInfo {
 #[derive(Debug, Clone)]
 struct HandlerBindInfo {
     bindings: Vec<(String, BlissVal)>,
+}
+
+/// Where a lexical variable lives: a fast frame slot, or boxed in the shared
+/// heap `EnvFrame` because a closure captures it.
+#[derive(Debug, Clone, Copy)]
+enum VarLoc {
+    Slot(u16),
+    Boxed,
 }
 
 /// Static description of one `restart-case` form. Each restart's clause is a
@@ -282,9 +310,14 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
 struct Lowerer<'e> {
     code: Vec<Instr>,
     constants: Vec<BlissVal>,
-    /// Lexical scope: name → local slot index. A `Vec` of frames so `let`
+    /// Lexical scope: name → variable location. A `Vec` of frames so `let`
     /// bindings shadow correctly and unbind at scope exit.
-    scopes: Vec<HashMap<String, u16>>,
+    scopes: Vec<HashMap<String, VarLoc>>,
+    /// Names captured by a nested closure — these locals live in the shared
+    /// heap `EnvFrame` (boxed) instead of a frame slot.
+    captured_names: std::collections::HashSet<String>,
+    /// Whether this function needs a heap `EnvFrame` (has a boxed local).
+    has_env: bool,
     /// Next free local slot index.
     next_local: u16,
     /// Highest local slot index used (frames need this many local slots).
@@ -326,6 +359,8 @@ impl<'e> Lowerer<'e> {
             code: Vec::new(),
             constants: Vec::new(),
             scopes: vec![HashMap::new()],
+            captured_names: std::collections::HashSet::new(),
+            has_env: false,
             next_local: 0,
             n_locals: 0,
             cur_stack: 0,
@@ -380,20 +415,43 @@ impl<'e> Lowerer<'e> {
         idx
     }
 
-    fn alloc_local(&mut self, name: &str) -> u16 {
+    /// Allocate a lexical binding for a param or `let` variable: a fast frame
+    /// slot, or a boxed heap `EnvFrame` binding if it is captured by a closure.
+    fn alloc_local(&mut self, name: &str) -> VarLoc {
+        let loc = if self.captured_names.contains(name) {
+            self.has_env = true;
+            VarLoc::Boxed
+        } else {
+            let idx = self.next_local;
+            self.next_local += 1;
+            if self.next_local > self.n_locals {
+                self.n_locals = self.next_local;
+            }
+            VarLoc::Slot(idx)
+        };
+        self.scopes.last_mut().unwrap().insert(name.to_string(), loc);
+        loc
+    }
+
+    /// Allocate a binding that must live in a frame slot regardless of capture
+    /// (e.g. `multiple-value-bind` / `handler-case` clause variables).
+    fn alloc_slot(&mut self, name: &str) -> u16 {
         let idx = self.next_local;
         self.next_local += 1;
         if self.next_local > self.n_locals {
             self.n_locals = self.next_local;
         }
-        self.scopes.last_mut().unwrap().insert(name.to_string(), idx);
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .insert(name.to_string(), VarLoc::Slot(idx));
         idx
     }
 
-    fn lookup_local(&self, name: &str) -> Option<u16> {
+    fn lookup_local(&self, name: &str) -> Option<VarLoc> {
         for scope in self.scopes.iter().rev() {
-            if let Some(&idx) = scope.get(name) {
-                return Some(idx);
+            if let Some(&loc) = scope.get(name) {
+                return Some(loc);
             }
         }
         None
@@ -435,8 +493,14 @@ impl<'e> Lowerer<'e> {
                 self.push_n(1);
                 return Ok(());
             }
-            if let Some(slot) = self.lookup_local(&name) {
-                self.emit(Instr::LoadLocal(slot));
+            if let Some(loc) = self.lookup_local(&name) {
+                match loc {
+                    VarLoc::Slot(slot) => self.emit(Instr::LoadLocal(slot)),
+                    VarLoc::Boxed => {
+                        let ni = self.intern_name(&name);
+                        self.emit(Instr::LoadEnvVar(ni));
+                    }
+                }
                 self.push_n(1);
                 return Ok(());
             }
@@ -553,14 +617,35 @@ impl<'e> Lowerer<'e> {
         let binding_forms = list_to_vec(bindings);
         let saved_next_local = self.next_local;
 
+        // A let that binds any captured variable needs a fresh child EnvFrame so
+        // each entry captures a distinct binding.
+        let has_boxed = binding_forms.iter().any(|b| {
+            binding_name_init(*b)
+                .map(|(n, _)| self.captured_names.contains(&n))
+                .unwrap_or(false)
+        });
+        if has_boxed {
+            self.has_env = true;
+            self.emit(Instr::PushEnvChild);
+        }
+
+        // Emit the store for one binding based on its location.
+        let store = |lo: &mut Self, name: &str, loc: VarLoc| match loc {
+            VarLoc::Slot(slot) => lo.emit(Instr::StoreLocal(slot)),
+            VarLoc::Boxed => {
+                let ni = lo.intern_name(name);
+                lo.emit(Instr::DefineEnvVar(ni));
+            }
+        };
+
         if sequential {
             // LET*: each init sees prior bindings.
             self.enter_scope();
             for b in &binding_forms {
                 let (name, init) = binding_name_init(*b)?;
                 self.lower_expr(init)?;
-                let slot = self.alloc_local(&name);
-                self.emit(Instr::StoreLocal(slot));
+                let loc = self.alloc_local(&name);
+                store(self, &name, loc);
                 self.pop_n(1);
             }
         } else {
@@ -572,13 +657,13 @@ impl<'e> Lowerer<'e> {
                 names.push(name);
             }
             self.enter_scope();
-            // Values are on the stack in binding order; store in reverse.
-            let mut slots = Vec::with_capacity(names.len());
+            let mut locs = Vec::with_capacity(names.len());
             for name in &names {
-                slots.push(self.alloc_local(name));
+                locs.push((name.clone(), self.alloc_local(name)));
             }
-            for slot in slots.into_iter().rev() {
-                self.emit(Instr::StoreLocal(slot));
+            // Values are on the stack in binding order; store in reverse.
+            for (name, loc) in locs.into_iter().rev() {
+                store(self, &name, loc);
                 self.pop_n(1);
             }
         }
@@ -600,6 +685,9 @@ impl<'e> Lowerer<'e> {
             }
         }
         self.exit_scope(saved_next_local);
+        if has_boxed {
+            self.emit(Instr::PopEnvChild);
+        }
         Ok(())
     }
 
@@ -661,13 +749,23 @@ impl<'e> Lowerer<'e> {
             let last = i + 1 == npairs;
             self.lower_expr(val)?; // +1
             match self.lookup_local(&name) {
-                Some(slot) => {
+                Some(VarLoc::Slot(slot)) => {
                     self.emit(Instr::StoreLocal(slot));
                     self.pop_n(1);
                     // SETQ is not multiple-value-preserving.
                     self.emit(Instr::ClearMv);
                     if last {
                         self.emit(Instr::LoadLocal(slot));
+                        self.push_n(1);
+                    }
+                }
+                Some(VarLoc::Boxed) => {
+                    let ni = self.intern_name(&name);
+                    self.emit(Instr::StoreEnvVar(ni));
+                    self.pop_n(1);
+                    self.emit(Instr::ClearMv);
+                    if last {
+                        self.emit(Instr::LoadEnvVar(ni));
                         self.push_n(1);
                     }
                 }
@@ -983,7 +1081,7 @@ impl<'e> Lowerer<'e> {
                 if !var.is_symbol() {
                     return Err(Bail);
                 }
-                Some(self.alloc_local(&sym_name(var)))
+                Some(self.alloc_slot(&sym_name(var)))
             } else {
                 None
             };
@@ -1160,7 +1258,7 @@ impl<'e> Lowerer<'e> {
         self.enter_scope();
         let slot_base = self.next_local;
         for v in &vars {
-            self.alloc_local(&sym_name(*v));
+            self.alloc_slot(&sym_name(*v));
         }
         self.emit(Instr::TakeValuesToLocals {
             nvars: vars.len() as u16,
@@ -1184,10 +1282,14 @@ impl<'e> Lowerer<'e> {
 
     // ── Closures (nmq.5) ───────────────────────────────────────────
 
-    /// Would a `(lambda params body)` capture an enclosing compiled local?
-    /// Conservative over-approximation: any free symbol of the body (minus the
-    /// lambda's own params) that names an enclosing lexical local.
-    fn lambda_captures_local(&self, params_form: BlissVal, body: BlissVal) -> bool {
+    /// Enclosing lexical locals a `(lambda params body)` captures (free symbols
+    /// of the body minus the lambda's own params, restricted to names bound in
+    /// an enclosing scope).
+    fn lambda_captured_locals(
+        &self,
+        params_form: BlissVal,
+        body: BlissVal,
+    ) -> Vec<String> {
         let params: std::collections::HashSet<String> = list_to_vec(params_form)
             .iter()
             .filter(|p| p.is_symbol())
@@ -1200,49 +1302,62 @@ impl<'e> Lowerer<'e> {
         }
         let enclosing: std::collections::HashSet<&String> =
             self.scopes.iter().flat_map(|s| s.keys()).collect();
-        used.iter()
-            .any(|u| !params.contains(u) && enclosing.contains(u))
+        used.into_iter()
+            .filter(|u| !params.contains(u) && enclosing.contains(u))
+            .collect()
     }
 
-    /// `(lambda params body...)` — compile a non-capturing lambda to a closure
-    /// value built by the tree-walker (capturing the global frame); a lambda
-    /// that captures an enclosing compiled local bails (its enclosing function
-    /// runs on the tree-walker, where capture works).
-    fn lower_lambda(&mut self, op: BlissVal, rest: BlissVal) -> LowerResult<()> {
-        let (params_form, body) = cp(rest);
-        if self.lambda_captures_local(params_form, body) {
-            return Err(Bail);
-        }
-        let form = arena_cons(op, rest);
+    /// Emit a closure value for `form` (a `(lambda …)` / `(function …)` form)
+    /// given the enclosing locals it captures. Non-capturing → EvalHost (the
+    /// tree-walker builds it against the global frame). Capturing → MakeClosureEnv
+    /// (captures this activation's heap frame) provided every captured local is
+    /// boxed; if any is a plain frame slot (e.g. a `multiple-value-bind` var),
+    /// bail so the enclosing function runs on the tree-walker.
+    fn emit_closure(&mut self, form: BlissVal, captured: &[String]) -> LowerResult<()> {
         let c = self.add_const(form);
-        self.emit(Instr::EvalHost(c));
+        if captured.is_empty() {
+            self.emit(Instr::EvalHost(c));
+        } else {
+            for name in captured {
+                match self.lookup_local(name) {
+                    Some(VarLoc::Boxed) | None => {}
+                    Some(VarLoc::Slot(_)) => return Err(Bail),
+                }
+            }
+            self.has_env = true;
+            self.emit(Instr::MakeClosureEnv(c));
+        }
         self.push_n(1);
         Ok(())
     }
 
-    /// `(function name)` / `#'(lambda …)` — a function designator or a
-    /// non-capturing lambda closure value.
+    /// `(lambda params body...)` — a closure value (capturing or not).
+    fn lower_lambda(&mut self, op: BlissVal, rest: BlissVal) -> LowerResult<()> {
+        let (params_form, body) = cp(rest);
+        let captured = self.lambda_captured_locals(params_form, body);
+        let form = arena_cons(op, rest);
+        self.emit_closure(form, &captured)
+    }
+
+    /// `(function name)` / `#'(lambda …)` — a function designator or a closure.
     fn lower_function(&mut self, rest: BlissVal) -> LowerResult<()> {
         let (target, _) = cp(rest);
-        if target.is_cons() {
+        let captured = if target.is_cons() {
             let (t_op, t_rest) = cp(target);
             if t_op.is_symbol() && sym_name(t_op) == "LAMBDA" {
                 let (params_form, body) = cp(t_rest);
-                if self.lambda_captures_local(params_form, body) {
-                    return Err(Bail);
-                }
+                self.lambda_captured_locals(params_form, body)
             } else {
                 return Err(Bail);
             }
-        } else if !target.is_symbol() {
+        } else if target.is_symbol() {
+            Vec::new()
+        } else {
             return Err(Bail);
-        }
+        };
         let function_sym = resolve_sym("FUNCTION").ok_or(Bail)?;
         let form = arena_cons(function_sym, rest);
-        let c = self.add_const(form);
-        self.emit(Instr::EvalHost(c));
-        self.push_n(1);
-        Ok(())
+        self.emit_closure(form, &captured)
     }
 }
 
@@ -1364,8 +1479,11 @@ fn compile_function(
     }
 
     let mut lo = Lowerer::new(env);
+    lo.captured_names = compute_captured_names(body);
+    let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
-        lo.alloc_local(pn);
+        let loc = lo.alloc_local(pn);
+        param_layout.push((pn.clone(), loc));
     }
     // Body as an implicit progn producing the return value.
     if lower_body(&mut lo, body).is_err() {
@@ -1380,11 +1498,58 @@ fn compile_function(
         handler_binds: lo.handler_binds,
         names: lo.names,
         restart_cases: lo.restart_cases,
+        param_layout,
+        has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
         arity: param_names.len() as u16,
         name: name.to_string(),
     })
+}
+
+/// Names of variables captured by a nested `(lambda …)` in `body` (an
+/// over-approximation: a nested lambda's free symbols minus its own params).
+/// A function/`let` binding whose name is in this set is boxed into the heap
+/// `EnvFrame` so a closure can share it.
+fn compute_captured_names(body: BlissVal) -> std::collections::HashSet<String> {
+    fn walk(form: BlissVal, out: &mut std::collections::HashSet<String>) {
+        if !form.is_cons() {
+            return;
+        }
+        let (car, cdr) = cp(form);
+        if car.is_symbol() {
+            let n = sym_name(car);
+            if n == "LAMBDA" {
+                let (params_form, lbody) = cp(cdr);
+                let params: std::collections::HashSet<String> = list_to_vec(params_form)
+                    .iter()
+                    .filter(|p| p.is_symbol())
+                    .map(|p| sym_name(*p))
+                    .collect();
+                let mut used = std::collections::HashSet::new();
+                for f in list_to_vec(lbody) {
+                    collect_symbol_names(f, &mut used);
+                    walk(f, out); // nested lambdas
+                }
+                for u in used {
+                    if !params.contains(&u) {
+                        out.insert(u);
+                    }
+                }
+                return;
+            }
+            if n == "QUOTE" {
+                return;
+            }
+        }
+        walk(car, out);
+        walk(cdr, out);
+    }
+    let mut out = std::collections::HashSet::new();
+    for f in list_to_vec(body) {
+        walk(f, &mut out);
+    }
+    out
 }
 
 /// Lower an implicit-progn body, leaving the last value on the stack.
@@ -1410,6 +1575,7 @@ fn lower_body(lo: &mut Lowerer, body: BlissVal) -> LowerResult<()> {
 /// Compile a top-level form as a zero-argument thunk. Returns `None` on bail.
 fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
     let mut lo = Lowerer::new(env);
+    lo.captured_names = compute_captured_names(arena_cons(form, NIL));
     if lo.lower_expr(form).is_err() {
         return None;
     }
@@ -1421,6 +1587,8 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
         handler_binds: lo.handler_binds,
         names: lo.names,
         restart_cases: lo.restart_cases,
+        param_layout: Vec::new(),
+        has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
         arity: 0,
@@ -1516,6 +1684,35 @@ struct Activation {
     handlers: Vec<Handler>,
     /// Pending cleanup continuations (for `unwind-protect`).
     cleanup_conts: Vec<CleanupCont>,
+    /// Heap `EnvFrame` chain holding this activation's captured (boxed) locals,
+    /// shared with any closure it creates. `None` when the function has no
+    /// captured locals (the common, fast, slot-only case).
+    env_frame: Option<Rc<RefCell<EnvFrame>>>,
+}
+
+/// Build the base heap `EnvFrame` for a function with captured locals, binding
+/// its boxed parameters; returns `None` for the slot-only case.
+fn make_env_frame(
+    func: &BytecodeFunction,
+    args: &[BlissVal],
+    parent: Rc<RefCell<EnvFrame>>,
+) -> Option<Rc<RefCell<EnvFrame>>> {
+    if !func.has_env {
+        return None;
+    }
+    let frame = Rc::new(RefCell::new(EnvFrame {
+        vars: std::collections::HashMap::new(),
+        symbol_vars: std::collections::HashMap::new(),
+        parent: Some(parent),
+    }));
+    for (i, (pname, loc)) in func.param_layout.iter().enumerate() {
+        if let VarLoc::Boxed = loc {
+            if let Some(a) = args.get(i) {
+                frame.borrow_mut().vars.insert(pname.clone(), *a);
+            }
+        }
+    }
+    Some(frame)
 }
 
 #[inline]
@@ -1547,6 +1744,18 @@ impl Activation {
 /// Frame-type/flags value for an interpreted CALL frame (§2.4.3 `CALL` = 0b00).
 const FLAG_CALL: u32 = 0b00;
 
+/// Bind a call's arguments into their parameters' frame slots (boxed params go
+/// to the heap `EnvFrame` via [`make_env_frame`], not here).
+fn bind_params(func: &BytecodeFunction, frame: *mut Frame, args: &[BlissVal]) {
+    for (i, (_, loc)) in func.param_layout.iter().enumerate() {
+        if let VarLoc::Slot(s) = loc {
+            if let Some(a) = args.get(i) {
+                unsafe { slot_set(frame, *s, *a) };
+            }
+        }
+    }
+}
+
 /// Run a compiled function to completion on the current green thread's
 /// `BlissStack`. `args` are the actual arguments bound into the entry frame's
 /// leading local slots.
@@ -1562,12 +1771,12 @@ fn run(
     let frame = stack
         .push_frame(entry_fn_val, std::ptr::null::<CodeInfo>(), entry.num_slots(), FLAG_CALL)
         .ok_or_else(|| BlissError::StackOverflow(bliss_rt::current_thread_id()))?;
-    for (i, a) in args.iter().enumerate() {
-        unsafe { slot_set(frame, i as u16, *a) };
-    }
+    bind_params(&entry, frame, args);
+    let env_frame = make_env_frame(&entry, args, Rc::clone(&env.frame));
     let mut acts: Vec<Activation> = vec![Activation {
         frame,
         n_locals: entry.n_locals,
+        env_frame,
         func: entry,
         bcp: 0,
         sp_top: 0,
@@ -1688,6 +1897,79 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     }
                 }
             }
+            Instr::LoadEnvVar(name_idx) => {
+                let name = acts[top_idx].func.names[name_idx as usize].clone();
+                let ef = acts[top_idx]
+                    .env_frame
+                    .clone()
+                    .expect("LoadEnvVar without a heap EnvFrame");
+                match Env::lookup_frame(&ef, &name) {
+                    Some(v) => acts[top_idx].push_op(v),
+                    None => {
+                        let s = resolve_sym(&name).unwrap_or(NIL);
+                        initiate_unwind(
+                            acts,
+                            stack,
+                            env,
+                            Pending::Propagate(BlissError::UnboundVariable(s)),
+                        )?;
+                    }
+                }
+            }
+            Instr::StoreEnvVar(name_idx) => {
+                let name = acts[top_idx].func.names[name_idx as usize].clone();
+                let v = acts[top_idx].pop_op();
+                let ef = acts[top_idx]
+                    .env_frame
+                    .clone()
+                    .expect("StoreEnvVar without a heap EnvFrame");
+                Env::set_frame_var(&ef, &name, v);
+            }
+            Instr::DefineEnvVar(name_idx) => {
+                let name = acts[top_idx].func.names[name_idx as usize].clone();
+                let v = acts[top_idx].pop_op();
+                let ef = acts[top_idx]
+                    .env_frame
+                    .clone()
+                    .expect("DefineEnvVar without a heap EnvFrame");
+                ef.borrow_mut().vars.insert(name, v);
+            }
+            Instr::PushEnvChild => {
+                let act = &mut acts[top_idx];
+                let parent = act.env_frame.clone();
+                act.env_frame = Some(Rc::new(RefCell::new(EnvFrame {
+                    vars: std::collections::HashMap::new(),
+                    symbol_vars: std::collections::HashMap::new(),
+                    parent,
+                })));
+            }
+            Instr::PopEnvChild => {
+                let act = &mut acts[top_idx];
+                let parent = act
+                    .env_frame
+                    .as_ref()
+                    .and_then(|f| f.borrow().parent.clone());
+                act.env_frame = parent;
+            }
+            Instr::MakeClosureEnv(idx) => {
+                let form = acts[top_idx].func.constants[idx as usize];
+                let ef = acts[top_idx]
+                    .env_frame
+                    .clone()
+                    .expect("MakeClosureEnv without a heap EnvFrame");
+                // Build the closure with env.frame bound to this activation's
+                // heap frame so it captures the live, shared bindings.
+                let saved = std::mem::replace(&mut env.frame, ef);
+                let result = eval_form(form, env);
+                env.frame = saved;
+                match result {
+                    Ok(v) => acts[top_idx].push_op(v),
+                    Err(e) => {
+                        let pending = error_to_pending(e, env);
+                        initiate_unwind(acts, stack, env, pending)?;
+                    }
+                }
+            }
             Instr::Pop => {
                 acts[top_idx].pop_op();
             }
@@ -1732,12 +2014,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                                 continue;
                             }
                         };
-                        for (i, a) in args.iter().enumerate() {
-                            unsafe { slot_set(frame, i as u16, *a) };
-                        }
+                        bind_params(&callee, frame, &args);
+                        let env_frame =
+                            make_env_frame(&callee, &args, Rc::clone(&env.frame));
                         acts.push(Activation {
                             frame,
                             n_locals: callee.n_locals,
+                            env_frame,
                             func: callee,
                             bcp: 0,
                             sp_top: 0,

@@ -175,8 +175,13 @@ const CORPUS: &[&str] = &[
     "(reduce (function +) (list 1 2 3 4 5))",
     "(defun compose2 (f g x) (funcall f (funcall g x))) (compose2 (function 1+) (function 1+) 5)",
     "(remove-if (lambda (x) (> x 3)) (list 1 2 3 4 5))",
-    // Capturing lambda bails to the tree-walker (still correct).
+    // ── Capturing closures on bytecode (nmq.5) ──
     "(defun adder (n) (lambda (x) (+ x n))) (funcall (adder 10) 5)",
+    "(defun make-counter () (let ((n 0)) (lambda () (setq n (+ n 1))))) (let ((c (make-counter))) (list (funcall c) (funcall c) (funcall c)))",
+    "(defun f () (let ((k 100)) (funcall (lambda (x) (+ x k)) 7))) (f)",
+    "(defun pair () (let ((n 0)) (list (lambda () (setq n (+ n 1))) (lambda () n)))) (let ((p (pair))) (funcall (first p)) (funcall (first p)) (funcall (second p)))",
+    "(defun add-n (n lst) (mapcar (lambda (x) (+ x n)) lst)) (add-n 100 (list 1 2 3))",
+    "(defun adders () (let ((a 1) (b 2)) (list (lambda () a) (lambda () b)))) (let ((l (adders))) (list (funcall (first l)) (funcall (second l))))",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a
