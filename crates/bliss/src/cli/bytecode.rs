@@ -1036,8 +1036,9 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         // Only emit a call when the callee is certainly a function: a
-        // user-defined function or an allowlisted primitive.
-        let is_user_fn = self.env.funs.contains_key(name);
+        // user-defined function (lexical name map or global function cell —
+        // bliss-jtc.6.8) or an allowlisted primitive.
+        let is_user_fn = self.env.funs.contains_key(name) || super::global_fn(name).is_some();
         let is_prim = PRIMITIVE_ALLOWLIST.contains(&name);
         if !is_user_fn && !is_prim {
             return Err(Bail);
@@ -2466,6 +2467,15 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                         args.push(act.pop_op());
                     }
                     args.reverse();
+                }
+
+                // bliss-jtc.6.8: bump the callee's FnMeta invoke counter (the
+                // unified tiering substrate) so the function object reflects real
+                // invocations from the bytecode path, not just the tree-walker.
+                if let Some(cell) = bliss_rt::symbols::symbol_function(sym) {
+                    if bliss_rt::function::is_interpreted_function(cell) {
+                        bliss_rt::function::record_invocation(cell);
+                    }
                 }
 
                 // Bytecode callee → native frame on the BlissStack.

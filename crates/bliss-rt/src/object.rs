@@ -207,6 +207,36 @@ pub struct PackageData {
     pub lock: *mut core::ffi::c_void,
 }
 
+// ── Interpreted function (D1.17 + FnMeta §4.4.3) ────────────────────
+
+/// Heap layout for an interpreted function object.
+///
+/// The first four fields are the §1.11.1 (D1.17) interpreted-function layout and
+/// are the *only* GC references (see `trace_object`). The trailing fields are the
+/// per-function tiering metadata (`FnMeta`, §4.4.3) — the substrate a HotSpot-
+/// style engine hangs invocation/back-edge counters, the active entry point, the
+/// current tier, and flags on. They are plain atomics, lock-free readable
+/// (R4.53), and never traced/relocated, so the object is pinned for a stable
+/// identity and stable metadata address across redefinition and tier changes.
+#[repr(C)]
+pub struct FunctionData {
+    pub header: ObjectHeader,
+    pub lambda_list: BlissVal,
+    pub body: BlissVal,
+    pub env: BlissVal,
+    pub name: BlissVal,
+    /// Incremented by the T0 eval loop / T1 prologue on each call.
+    pub invoke_count: core::sync::atomic::AtomicU32,
+    /// Incremented by T1 back-edge stubs.
+    pub back_edge_count: core::sync::atomic::AtomicU32,
+    /// Active entry point; updated atomically on a tier change (null at T0).
+    pub entry: core::sync::atomic::AtomicPtr<u8>,
+    /// Current tier: 0 (T0 interpreter), 1 (baseline), 2 (optimised).
+    pub tier: core::sync::atomic::AtomicU8,
+    /// FnMeta flags (QUEUED_FOR_T2, T2_FAILED, NEVER_COMPILE, …).
+    pub flags: core::sync::atomic::AtomicU16,
+}
+
 // ── Cons cell ──────────────────────────────────────────────────────
 
 /// A headerless 16-byte cons cell (car + cdr).

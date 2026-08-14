@@ -410,6 +410,34 @@ fn global_value_cell(idx: u32) -> Option<BlissVal> {
     }
 }
 
+/// The global interpreted-function object bound to `name`'s function cell, or
+/// `None` (bliss-jtc.6.8). This is the authoritative store for ordinary global
+/// (defun) functions; lexical FLET/LABELS and `(setf f)` functions stay in
+/// `Env.funs`.
+fn global_fn(name: &str) -> Option<BlissVal> {
+    let idx = bliss_rt::symbols::find_index(name)?;
+    let cell = bliss_rt::symbols::symbol_function(idx)?;
+    bliss_rt::function::is_interpreted_function(cell).then_some(cell)
+}
+
+/// True if `name` names a function — lexically (FLET/LABELS or `(setf f)` in
+/// `Env.funs`) or globally (a bound function cell).
+fn fn_bound(env: &Env, name: &str) -> bool {
+    env.funs.contains_key(name) || global_fn(name).is_some()
+}
+
+/// Resolve `name` to a callable `(params_form, body)` — lexical `Env.funs` first,
+/// then the global function cell. Records an invocation on the function object
+/// (FnMeta invoke counter) when resolved globally (bliss-jtc.6.8).
+fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
+    if let Some(fdef) = env.funs.get(name) {
+        return Some((fdef.params_form, fdef.body));
+    }
+    let f = global_fn(name)?;
+    bliss_rt::function::record_invocation(f);
+    Some((bliss_rt::function::lambda_list(f), bliss_rt::function::body(f)))
+}
+
 /// True if `val` is a keyword symbol (name in the KEYWORD package). Used to
 /// tell an optional positional stream argument apart from &key start/end.
 fn is_keyword_arg(val: BlissVal) -> bool {
@@ -3697,11 +3725,11 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 /// argument values before evaluating it), and a macro's from its expansion.
 fn mv_form_preserves_values(name: &str, env: &Env) -> bool {
     let bare = name.rsplit(':').next().unwrap_or(name);
-    if env.funs.contains_key(name)
+    if fn_bound(env, name)
         || env.macros.contains_key(name)
         || env.generics.contains_key(name)
         || env.methods.contains_key(name)
-        || env.funs.contains_key(bare)
+        || fn_bound(env, bare)
         || env.macros.contains_key(bare)
     {
         return true;
@@ -4694,7 +4722,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (name_form, _) = cp(cdr);
                 if name_form.is_symbol() {
                     let fn_name = sym_name(name_form);
-                    if env.funs.contains_key(&fn_name) {
+                    if fn_bound(env, &fn_name) {
                         return Ok(name_form); // return the symbol as a function designator
                     }
                 }
@@ -5945,7 +5973,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (path_form, _) = cp(cdr);
                 let path_val = eval_form(path_form, env)?;
                 let path = val_as_str(path_val);
-                // Save a minimal image: serialize the environment's function definitions
+                // Save a minimal image: serialize function definitions — the
+                // lexical/name-map ones plus the global ones now in symbol
+                // function cells (bliss-jtc.6.8).
                 let mut image_data = String::new();
                 for (name, fdef) in env.funs.iter() {
                     let params_str = fdef.params.join(" ");
@@ -5953,6 +5983,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     image_data
                         .push_str(&format!("(defun {} ({}) {})\n", name, params_str, body_str));
                 }
+                bliss_rt::symbols::for_each_bound_function(|_idx, name, func| {
+                    if bliss_rt::function::is_interpreted_function(func) {
+                        let params_str = format_body_forms(bliss_rt::function::lambda_list(func));
+                        let body_str = format_body_forms(bliss_rt::function::body(func));
+                        image_data.push_str(&format!("(defun {name} {params_str} {body_str})\n"));
+                    }
+                });
                 std::fs::write(&path, &image_data)
                     .map_err(|e| BlissError::FileError(format!("save-image: {}", e)))?;
                 return Ok(T);
@@ -6481,8 +6518,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             _ => {}
         }
 
-        // Check user-defined functions
-        if let Some(fdef) = env.funs.get(&name).cloned() {
+        // Check user-defined functions: lexical (FLET/LABELS/`(setf f)`) then the
+        // global function cell (bliss-jtc.6.8).
+        if let Some((params_form, body)) = callable_body(env, &name) {
             let mut args = Vec::new();
             let mut c = cdr;
             while c.is_cons() {
@@ -6490,13 +6528,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 args.push(eval_form(af, env)?);
                 c = r;
             }
-            return eval_lambda_call(
-                env,
-                fdef.params_form,
-                fdef.body,
-                &args,
-                Rc::clone(&env.frame),
-            );
+            return eval_lambda_call(env, params_form, body, &args, Rc::clone(&env.frame));
         }
 
         // Check accessor functions (from DEFCLASS)
@@ -6539,7 +6571,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             if parts.len() == 2 {
                 let _pkg_name = parts[0];
                 let fn_name = parts[1].trim_start_matches(':');
-                if let Some(fdef) = env.funs.get(fn_name).cloned() {
+                if let Some((params_form, body)) = callable_body(env, fn_name) {
                     let mut args = Vec::new();
                     let mut c = cdr;
                     while c.is_cons() {
@@ -6547,13 +6579,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         args.push(eval_form(af, env)?);
                         c = r;
                     }
-                    return eval_lambda_call(
-                        env,
-                        fdef.params_form,
-                        fdef.body,
-                        &args,
-                        Rc::clone(&env.frame),
-                    );
+                    return eval_lambda_call(env, params_form, body, &args, Rc::clone(&env.frame));
                 }
             }
         }
@@ -8706,16 +8732,34 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
 fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, rest) = cp(cdr);
     let (params_form, body) = cp(rest);
-    let name = sym_name(name_form);
-    let params = extract_params(params_form);
-    Rc::make_mut(&mut env.funs).insert(
-        name.clone(),
-        FunDef {
-            params,
-            params_form,
-            body,
-        },
-    );
+    if name_form.is_symbol() {
+        // Ordinary global function → the symbol's heap function cell
+        // (bliss-jtc.6.8). Redefinition updates the existing function object in
+        // place so its identity (and any attached tiering state) is stable.
+        let idx = name_form.as_symbol_index();
+        match bliss_rt::symbols::symbol_function(idx) {
+            Some(existing) if bliss_rt::function::is_interpreted_function(existing) => {
+                // SAFETY: `existing` is an interpreted-function object.
+                unsafe { bliss_rt::function::redefine(existing, params_form, body, NIL) };
+            }
+            _ => {
+                let f = bliss_rt::function::alloc_interpreted(params_form, body, NIL, name_form);
+                bliss_rt::symbols::set_symbol_function(idx, f);
+            }
+        }
+    } else {
+        // Non-symbol names, e.g. `(setf foo)`, keep the lexical/name-map path.
+        let name = sym_name(name_form);
+        let params = extract_params(params_form);
+        Rc::make_mut(&mut env.funs).insert(
+            name,
+            FunDef {
+                params,
+                params_form,
+                body,
+            },
+        );
+    }
     Ok(name_form)
 }
 
@@ -10090,14 +10134,8 @@ fn apply_function(
     // Function could be a lambda form, a symbol naming a function, or a closure
     if fn_val.is_symbol() {
         let name = sym_name(fn_val);
-        if let Some(fdef) = env.funs.get(&name).cloned() {
-            return eval_lambda_call(
-                env,
-                fdef.params_form,
-                fdef.body,
-                args,
-                Rc::clone(&env.frame),
-            );
+        if let Some((params_form, body)) = callable_body(env, &name) {
+            return eval_lambda_call(env, params_form, body, args, Rc::clone(&env.frame));
         }
         if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
             return invoke_generic_function(&name, args, env);
@@ -11413,6 +11451,66 @@ mod jtc6c2_binding_cell_tests {
             bliss_rt::symbols::symbol_value(idx),
             Some(BlissVal::from_fixnum(123)),
             "the LET binding must not overwrite the global cell"
+        );
+    }
+}
+
+#[cfg(test)]
+mod jtc6_8_function_object_tests {
+    use super::*;
+
+    /// bliss-jtc.6.8: DEFUN of an ordinary symbol installs a heap interpreted-
+    /// function object in the symbol's function cell (with zeroed FnMeta), the
+    /// call path resolves through it, and redefinition updates the object in
+    /// place — preserving identity — while changing behaviour.
+    #[test]
+    fn defun_installs_identity_stable_function_object_in_the_cell() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+
+        read_eval_all_env("(defun c2b-op (x y) (+ x y))", &mut env).expect("defun");
+        let idx = bliss_rt::symbols::intern("C2B-OP");
+        let f = bliss_rt::symbols::symbol_function(idx).expect("function cell must be bound");
+        assert!(
+            bliss_rt::function::is_interpreted_function(f),
+            "DEFUN must store a heap interpreted-function object in the function cell"
+        );
+        assert_eq!(bliss_rt::function::tier(f), 0, "a fresh function starts at tier 0");
+
+        // The call path resolves through the cell.
+        assert_eq!(
+            read_eval_all_env("(c2b-op 2 3)", &mut env).expect("call"),
+            BlissVal::from_fixnum(5)
+        );
+
+        // Redefinition preserves object identity (tiering/IC/deopt key off it)
+        // while changing behaviour.
+        read_eval_all_env("(defun c2b-op (x y) (* x y))", &mut env).expect("redefun");
+        let f2 = bliss_rt::symbols::symbol_function(idx).expect("still bound");
+        assert_eq!(
+            f2, f,
+            "redefinition must reuse the same function object (stable identity)"
+        );
+        assert_eq!(
+            read_eval_all_env("(c2b-op 2 3)", &mut env).expect("call2"),
+            BlissVal::from_fixnum(6)
+        );
+    }
+
+    /// The function-object invoke counter (FnMeta substrate) advances when the
+    /// tree-walker resolves a global call through the cell.
+    #[test]
+    fn tree_walker_call_bumps_the_invoke_counter() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        read_eval_all_env("(defun c2b-counted () 42)", &mut env).expect("defun");
+        let idx = bliss_rt::symbols::intern("C2B-COUNTED");
+        let f = bliss_rt::symbols::symbol_function(idx).unwrap();
+        let before = bliss_rt::function::invoke_count(f);
+        read_eval_all_env("(c2b-counted)", &mut env).expect("call");
+        assert!(
+            bliss_rt::function::invoke_count(f) > before,
+            "a resolved global call must bump the FnMeta invoke counter"
         );
     }
 }

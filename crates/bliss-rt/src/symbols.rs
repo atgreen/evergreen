@@ -373,6 +373,27 @@ pub fn set_symbol_package(idx: u32, package: BlissVal) {
     write_cell(idx, |s| s.package = package);
 }
 
+/// Visit every interned symbol whose global function cell is bound, as
+/// `(index, name, function)`. Used to enumerate globally-defined functions
+/// (e.g. for image dump) now that they live in the function cell rather than an
+/// interpreter-side name map (bliss-jtc.6.8).
+pub fn for_each_bound_function(mut f: impl FnMut(u32, String, BlissVal)) {
+    with_registry(|reg| {
+        if let Some(r) = reg {
+            for (idx, &obj) in r.interned.iter().enumerate() {
+                // SAFETY: registry entries are pinned live symbols.
+                let (func, name) = unsafe {
+                    let d = symbol_data(obj);
+                    ((*d).function, (*d).name)
+                };
+                if func != UNBOUND {
+                    f(idx as u32, name.as_string(), func);
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     //! bliss-jtc.6 Stage A: symbols are heap-resident with their own cells and

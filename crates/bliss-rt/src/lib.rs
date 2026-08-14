@@ -6,6 +6,7 @@
 //! bridge, image persistence, and security sandbox.
 
 // ── Object model ──────────────────────────────────────────────────
+pub mod function;
 pub mod object;
 pub mod packages;
 pub mod symbols;
