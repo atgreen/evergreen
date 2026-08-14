@@ -5,7 +5,8 @@
 use crate::error::BlissError;
 use crate::value::BlissVal;
 
-use std::alloc::{self, Layout};
+use std::alloc::Layout;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 // ── Region model ───────────────────────────────────────────────────
@@ -1648,6 +1649,92 @@ pub fn drain_satb_log() -> Vec<BlissVal> {
         .unwrap_or_default()
 }
 
+// ── T0 evaluator allocation on the shared GC heap (bliss-jtc.1) ───
+//
+// The tree-walking interpreter allocates its Lisp objects (conses, strings, …)
+// through `alloc_typed`, so they use the same object layouts and allocation path
+// as compiled code and are visible to heap stats/walking. The heap is
+// initialized lazily on first use with a large, mostly-nursery configuration;
+// the interpreter never reaches a GC safepoint, so its objects are never moved
+// or collected and stay valid. Reclaiming them awaits interpreter root tracing.
+
+/// Default heap for a standalone T0 evaluator: large and (lazily committed)
+/// mostly nursery, so a program's live objects fit without a collection cycle.
+fn t0_default_config() -> GcConfig {
+    let heap_size = 512 * 1024 * 1024;
+    GcConfig {
+        heap_size,
+        heap_max: heap_size,
+        nursery_size: heap_size,
+        tlab_size: 256 * 1024,
+        region_size: 1024 * 1024,
+        promotion_threshold: 3,
+        pause_target_ms: 10,
+        gc_workers: 1,
+        satb_buffer_size: 1024,
+        old_occupancy_trigger: 0.45,
+    }
+}
+
+/// Ensure the shared GC heap is initialized (idempotent) so the interpreter can
+/// allocate without an explicit runtime boot.
+fn ensure_heap_initialized() {
+    let initialized = heap_state().lock().unwrap().is_some();
+    if !initialized {
+        let _ = init_heap(&t0_default_config());
+    }
+}
+
+thread_local! {
+    /// Per-thread bump allocator over the shared GC heap for T0 allocation. The
+    /// fast path (TLAB) is lock-free; only a TLAB refill touches the heap lock.
+    static T0_ALLOCATOR: RefCell<Option<HeapAllocator>> = const { RefCell::new(None) };
+}
+
+/// Overwrite the type_id of a freshly-allocated object (its size/hash are
+/// already set by the allocator's placeholder header).
+///
+/// # Safety
+/// `body` must be a body pointer returned by the allocator for a `body_size`-byte
+/// object.
+unsafe fn set_object_type_id(body: *mut u8, body_size: usize, type_id: u8) {
+    let (_total, large) = object_footprint(body_size);
+    let off = if large {
+        LARGE_OBJECT_PAYLOAD_OFFSET
+    } else {
+        OBJECT_HEADER_SIZE
+    };
+    // SAFETY: the header precedes the body by the payload offset.
+    unsafe {
+        let header = body.sub(off) as *mut ObjectHeader;
+        (*header).0 = ((*header).0 & 0x00FF_FFFF_FFFF_FFFF) | ((type_id as u64) << 56);
+    }
+}
+
+/// Allocate a `body_size`-byte object of `type_id` on the shared GC heap and
+/// return a pointer to its body (past the header), or `None` if the heap cannot
+/// be initialized or is exhausted. The T0 evaluator routes all Lisp-object
+/// allocation through this (bliss-jtc.1).
+pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
+    if body_size == 0 {
+        return None;
+    }
+    T0_ALLOCATOR.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.is_none() {
+            ensure_heap_initialized();
+            *guard = HeapAllocator::new().ok();
+        }
+        let alloc = guard.as_mut()?;
+        let body = alloc
+            .alloc_fast(body_size)
+            .or_else(|| alloc.alloc_slow(body_size).ok())?;
+        // SAFETY: `body` is a freshly allocated object body of `body_size` bytes.
+        unsafe { set_object_type_id(body, body_size, type_id) };
+        Some(body)
+    })
+}
+
 // ── Weak references ────────────────────────────────────────────────
 
 /// A weak pointer that is cleared when its referent is collected.
@@ -1925,9 +2012,18 @@ unsafe impl Send for HeapState {}
 impl Drop for HeapState {
     fn drop(&mut self) {
         if !self.heap_base.is_null() {
-            // Safety: heap_base was allocated with heap_layout in init_heap.
+            #[cfg(unix)]
+            // SAFETY: heap_base/size came from the anonymous mmap in init_heap.
             unsafe {
-                alloc::dealloc(self.heap_base, self.heap_layout);
+                libc::munmap(
+                    self.heap_base as *mut libc::c_void,
+                    self.heap_layout.size(),
+                );
+            }
+            // Safety: heap_base was allocated with heap_layout in init_heap.
+            #[cfg(not(unix))]
+            unsafe {
+                std::alloc::dealloc(self.heap_base, self.heap_layout);
             }
             self.heap_base = std::ptr::null_mut();
         }
@@ -1980,8 +2076,33 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     let heap_layout = Layout::from_size_align(config.heap_size, align)
         .map_err(|e| BlissError::Internal(format!("invalid heap layout: {}", e)))?;
 
+    // Reserve the heap with an anonymous mmap so its pages are committed (and
+    // zeroed) lazily on first touch. A large heap then costs almost nothing until
+    // objects are actually allocated — important for the T0 evaluator, which
+    // sizes a big no-collection heap but usually touches only a few MB. mmap
+    // returns page-aligned memory, satisfying `align`.
+    #[cfg(unix)]
+    let heap_base = {
+        // SAFETY: standard anonymous mapping; MAP_FAILED is checked below.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                config.heap_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            std::ptr::null_mut()
+        } else {
+            p as *mut u8
+        }
+    };
     // Safety: layout is valid (non-zero size, power-of-two alignment).
-    let heap_base = unsafe { alloc::alloc_zeroed(heap_layout) };
+    #[cfg(not(unix))]
+    let heap_base = unsafe { std::alloc::alloc_zeroed(heap_layout) };
     if heap_base.is_null() {
         return Err(BlissError::Oom);
     }

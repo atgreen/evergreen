@@ -274,6 +274,19 @@ impl Arena {
     }
 
     fn alloc_cons(&mut self, car: BlissVal, cdr: BlissVal) -> BlissVal {
+        // Primary path (bliss-jtc.1): allocate the cons on the shared GC heap so
+        // it uses the same layout as compiled code and is visible to heap walking.
+        // A headered GC object; the body (car@0, cdr@8) is what `from_cons_ptr`
+        // points at, exactly like the old headerless cell.
+        if let Some(body) = bliss_rt::gc::alloc_typed(16, type_id::CONS) {
+            unsafe {
+                let cell = body as *mut ConsCell;
+                (*cell).car = car;
+                (*cell).cdr = cdr;
+                return BlissVal::from_cons_ptr(body);
+            }
+        }
+        // Fallback (heap unavailable/exhausted): a local block freed on drop.
         let layout = std::alloc::Layout::new::<ConsCell>();
         unsafe {
             let ptr = std::alloc::alloc_zeroed(layout);
@@ -290,6 +303,17 @@ impl Arena {
 
     fn alloc_str(&mut self, s: &str) -> BlissVal {
         let b = s.as_bytes();
+        // Primary path (bliss-jtc.1): allocate the string on the shared GC heap.
+        // Body layout [len:u64 | bytes]; the value points at the object header
+        // (body−8), matching the old std::alloc layout [header | len | bytes].
+        if let Some(body) = bliss_rt::gc::alloc_typed(8 + b.len(), type_id::SIMPLE_BASE_STRING) {
+            unsafe {
+                *(body as *mut u64) = b.len() as u64;
+                std::ptr::copy_nonoverlapping(b.as_ptr(), body.add(8), b.len());
+                return BlissVal::from_heap_ptr(body.sub(8));
+            }
+        }
+        // Fallback: a local block freed on drop.
         let sz = 8 + 8 + b.len();
         let layout = std::alloc::Layout::from_size_align(sz, 8).unwrap();
         unsafe {
@@ -5568,7 +5592,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let has_next = env
                     .method_context
                     .last()
-                    .map(|context| method_context_has_next(context))
+                    .map(method_context_has_next)
                     .unwrap_or(false);
                 return Ok(if has_next { T } else { NIL });
             }
@@ -11108,5 +11132,50 @@ impl Default for ReplConfig {
             history_size: 1000,
             syntax_highlighting: true,
         }
+    }
+}
+
+// ── T0 objects on the shared GC heap (bliss-jtc.1) ────────────────
+
+#[cfg(test)]
+mod jtc1_heap_tests {
+    use super::*;
+
+    /// Objects allocated by the tree-walk evaluator live on the shared GC heap
+    /// and are visible to heap walking (bliss-jtc.1).
+    #[test]
+    fn evaluator_objects_live_on_the_gc_heap_and_are_walkable() {
+        // WRITE-TO-STRING allocates its result through the evaluator's arena
+        // (now the GC heap); the distinctive digits are unlikely to collide with
+        // any other live string. (A source string *literal* would be allocated by
+        // the reader — jtc.15 — so we use an evaluator-produced string here.)
+        let marker = "918273645";
+        let src = "(cons (write-to-string 918273645) (cons 1 (cons 2 nil)))";
+        read_eval_all(src).expect("eval");
+
+        let mut cons_count = 0usize;
+        let mut found_marker = false;
+        bliss_rt::walk_heap(|ptr, tid, _size| {
+            if tid == type_id::CONS {
+                cons_count += 1;
+            } else if tid == type_id::SIMPLE_BASE_STRING {
+                // String body layout: [len:u64 | bytes].
+                unsafe {
+                    let len = *(ptr as *const u64) as usize;
+                    if len == marker.len() {
+                        let bytes = std::slice::from_raw_parts(ptr.add(8), len);
+                        found_marker |= bytes == marker.as_bytes();
+                    }
+                }
+            }
+            true
+        })
+        .expect("walk_heap");
+
+        assert!(cons_count > 0, "evaluator cons cells must be walkable on the GC heap");
+        assert!(
+            found_marker,
+            "the evaluator-allocated string must be walkable on the GC heap"
+        );
     }
 }
