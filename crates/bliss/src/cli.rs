@@ -3609,11 +3609,49 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
 }
 
 fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let contents = std::fs::read_to_string(path)
+    let bytes = std::fs::read(path)
         .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
-    with_eval_context(env, EvalContext::Load, |env| {
-        read_eval_all_env(&contents, env)
-    })
+    // A Bliss FASL (.bfasl) starts with the BFASL magic — verify and load the
+    // compiled unit (bliss-lb6.6); otherwise treat the file as source.
+    if bytes.len() >= bliss_rt::bfasl::BFASL_MAGIC.len()
+        && bytes[..bliss_rt::bfasl::BFASL_MAGIC.len()] == bliss_rt::bfasl::BFASL_MAGIC
+    {
+        return load_bfasl_into_env(&bytes, env);
+    }
+    let contents = String::from_utf8_lossy(&bytes).into_owned();
+    with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&contents, env))
+}
+
+/// Load a verified `.bfasl` compiled unit (spec §6.11, bliss-lb6.6): verify the
+/// header/version/checksum, then evaluate its top-level forms so the defined
+/// functions install into their symbol function cells and tier normally (R6.67).
+fn load_bfasl_into_env(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
+    let unit = bliss_rt::bfasl::load(bytes)
+        .map_err(|e| BlissError::FileError(format!("invalid .bfasl: {e}")))?;
+    let forms = unit
+        .section(bliss_rt::bfasl::section::TOPLEVEL_FORMS)
+        .ok_or_else(|| BlissError::FileError("bfasl: missing TOPLEVEL_FORMS section".into()))?;
+    let src = String::from_utf8_lossy(forms).into_owned();
+    with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&src, env))
+}
+
+/// Serialize a source unit to a `.bfasl` byte image (bliss-lb6.6). Minimal
+/// implementation: the portable code section carries the top-level forms as
+/// source text (a valid architecture-neutral payload; the format reserves the
+/// FUNCTIONS bytecode section for the full compiler), plus a source-map section
+/// (the origin path) and the content hash for cache invalidation (R6.70).
+fn build_bfasl_from_source(source: &str, src_path: &str) -> Vec<u8> {
+    bliss_rt::bfasl::BfaslBuilder::new()
+        .content_hash(bliss_rt::bfasl::content_hash(source.as_bytes()))
+        .section(
+            bliss_rt::bfasl::section::TOPLEVEL_FORMS,
+            source.as_bytes().to_vec(),
+        )
+        .section(
+            bliss_rt::bfasl::section::SOURCE_MAP,
+            src_path.as_bytes().to_vec(),
+        )
+        .build()
 }
 
 fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -5923,6 +5961,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (path_form, _) = cp(cdr);
                 let path_val = eval_form(path_form, env)?;
                 return load_path_into_env(&val_as_str(path_val), env);
+            }
+            "COMPILE-FILE" => {
+                // (compile-file source &optional output) — compile SOURCE to a
+                // .bfasl (bliss-lb6.6). Returns the output truename. OUTPUT
+                // defaults to SOURCE with a .bfasl extension.
+                let (src_form, rest) = cp(cdr);
+                let src_path = val_as_str(eval_form(src_form, env)?);
+                let out_path = if rest.is_cons() {
+                    let (out_form, _) = cp(rest);
+                    val_as_str(eval_form(out_form, env)?)
+                } else {
+                    let stem = src_path.strip_suffix(".lisp").unwrap_or(&src_path);
+                    format!("{stem}.bfasl")
+                };
+                let source = std::fs::read_to_string(&src_path).map_err(|e| {
+                    BlissError::FileError(format!("compile-file: cannot read {src_path}: {e}"))
+                })?;
+                let image = build_bfasl_from_source(&source, &src_path);
+                std::fs::write(&out_path, &image).map_err(|e| {
+                    BlissError::FileError(format!("compile-file: cannot write {out_path}: {e}"))
+                })?;
+                return Ok(arena_str(&out_path));
             }
             "REQUIRE" => {
                 let (module_form, _) = cp(cdr);

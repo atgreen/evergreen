@@ -19,6 +19,7 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | `04-compiler.md` | §4 | Compiler Pipeline | Overview + 9 sub-chapters (§4.1–§4.9) |
 | `05-stdlib.md` | §5 | Standard Library | Overview + 7 companion files spanning §5.1–§5.9 |
 | `06-devtools.md` | §6 | Developer Tools | REPL, debugger, profiler, SLIME/SLY protocol |
+| `06-11-bfasl.md` | §6.11 | Bliss FASL format | `.bfasl` portable compiled-artifact format (R6.60–R6.70) |
 | `07-ops-portability.md` | §7 | Ops & Portability | Image format, deployment, platform matrix, build, logging |
 | `08-security-robustness.md` | §8 | Security & Robustness | Sandbox, safe FFI, resource limits, reader hardening, fuzzing |
 | `09-extensions.md` | §9 | SBCL-Compatible Extensions | Adopted extensions, rationale, compatibility mapping |
