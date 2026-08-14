@@ -5360,35 +5360,51 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "MAKE-PATHNAME" => {
                 // (make-pathname &key host device directory name type version defaults)
                 let args = eval_args(cdr, env)?;
-                let (mut host, mut device, mut directory) = (NIL, NIL, NIL);
-                let (mut name_c, mut type_c, mut version) = (NIL, NIL, NIL);
+                // Track supplied-p per component so an explicit `:name nil`
+                // (override) is distinguished from an unsupplied component (which
+                // is taken from :defaults, per ANSI).
+                let (mut host, mut device, mut directory) = (None, None, None);
+                let (mut name_c, mut type_c, mut version) = (None, None, None);
+                let mut defaults: Option<BlissVal> = None;
                 let mut i = 0;
                 while i + 1 < args.len() {
                     let key = symbol_bare_name(&sym_name(args[i]));
                     let val = args[i + 1];
                     match key.as_str() {
-                        "HOST" => host = val,
-                        "DEVICE" => device = val,
+                        "HOST" => host = Some(val),
+                        "DEVICE" => device = Some(val),
                         // A directory given as (:absolute|:relative comp…) uses
                         // reader keywords the stdlib can't match by hash; render
                         // it to a namestring the stdlib parser accepts.
                         "DIRECTORY" => {
-                            directory = match directory_designator_to_namestring(val) {
+                            directory = Some(match directory_designator_to_namestring(val) {
                                 Some(s) => arena_str(&s),
                                 None => val,
-                            }
+                            });
                         }
-                        "NAME" => name_c = val,
-                        "TYPE" => type_c = val,
-                        "VERSION" => version = val,
-                        // :defaults is accepted; component defaulting is not yet
-                        // modeled, so unsupplied components stay NIL.
+                        "NAME" => name_c = Some(val),
+                        "TYPE" => type_c = Some(val),
+                        "VERSION" => version = Some(val),
+                        "DEFAULTS" => defaults = Some(val),
                         _ => {}
                     }
                     i += 2;
                 }
+                // Components not explicitly supplied are taken from :defaults
+                // (ANSI). `pathname_directory` returns the directory as a
+                // namestring, which is what make_pathname expects. With no valid
+                // :defaults, unsupplied components stay NIL.
+                let d = defaults.filter(|v| bliss_stdlib::is_pathname(*v));
+                let resolve = |supplied: Option<BlissVal>, from: fn(BlissVal) -> BlissVal| {
+                    supplied.unwrap_or_else(|| d.map(from).unwrap_or(NIL))
+                };
                 return bliss_stdlib::make_pathname(
-                    host, device, directory, name_c, type_c, version,
+                    resolve(host, bliss_stdlib::pathname_host),
+                    resolve(device, bliss_stdlib::pathname_device),
+                    resolve(directory, bliss_stdlib::pathname_directory),
+                    resolve(name_c, bliss_stdlib::pathname_name),
+                    resolve(type_c, bliss_stdlib::pathname_type),
+                    resolve(version, bliss_stdlib::pathname_version),
                 );
             }
             "USER-HOMEDIR-PATHNAME" => {
