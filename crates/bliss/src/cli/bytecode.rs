@@ -2470,6 +2470,35 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 // Bytecode callee → native frame on the BlissStack.
                 if let Some(callee) = registry_get(sym) {
                     if callee.arity == nargs {
+                        // T1: installed native code → call via the i2c adapter.
+                        // Promote to T1 once the function is hot.
+                        let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
+                        let native = native.or_else(|| {
+                            let count = INVOKE_COUNTS.with(|m| {
+                                let mut b = m.borrow_mut();
+                                let e = b.entry(sym).or_insert(0);
+                                *e += 1;
+                                *e
+                            });
+                            if count >= t1_threshold() {
+                                try_promote_to_t1(sym)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(nc) = native {
+                            match run_native(&nc, &args, env) {
+                                Ok(v) => {
+                                    acts[top_idx].push_op(v);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    let pending = error_to_pending(e, env);
+                                    initiate_unwind(acts, stack, env, pending)?;
+                                    continue;
+                                }
+                            }
+                        }
                         let fn_val = BlissVal::from_symbol_index(sym);
                         let frame = match stack.push_frame(
                             fn_val,
@@ -3005,6 +3034,280 @@ fn unmatched_error(pending: Pending) -> BlissError {
         }
         Pending::Go { .. } => BlissError::Internal("GO: no such tag".into()),
     }
+}
+
+// ── T1 native code (codegen → execution, nmq.2) ────────────────────
+//
+// A hot bytecode function is compiled to native x86-64 by `emit_native_x86`,
+// installed into executable memory (`bliss_rt::jit::JitBuffer`), and called via
+// an *i2c adapter* (`run_native`) that marshals the operand-stack arguments into
+// the SysV calling convention. Native code that calls a non-arithmetic function
+// crosses back through a *c2i adapter* (`c2i_call*`) into the interpreter. Both
+// frames stay on the one BlissStack (the interpreter still pushes D2.03 frames);
+// results are identical to pure interpretation (differential-verified).
+
+thread_local! {
+    /// The `Env` in scope while native T1 code runs, so a c2i callback can
+    /// invoke interpreted functions. Set by `run_native` around the call.
+    static NATIVE_ENV: std::cell::Cell<*mut Env> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// c2i adapter: call the interpreted function named by `sym` with `n` arguments
+/// (SysV registers), returning the result's raw bits. Also the arithmetic
+/// slow path — native code jumps here on fixnum overflow so bignum promotion
+/// matches pure interpretation.
+extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    let env_ptr = NATIVE_ENV.with(|e| e.get());
+    if env_ptr.is_null() {
+        return NIL.0;
+    }
+    // SAFETY: `run_native` sets NATIVE_ENV to a live &mut Env for the duration
+    // of the native call, and native code only calls this synchronously within
+    // that window.
+    let env = unsafe { &mut *env_ptr };
+    let args: &[BlissVal] = &[BlissVal(a0), BlissVal(a1), BlissVal(a2)][..n as usize];
+    let fn_val = BlissVal::from_symbol_index(sym as u32);
+    match apply_function(fn_val, args, env) {
+        Ok(v) => v.0,
+        // A raw error can't unwind through native code cleanly here; stash it so
+        // run_native can re-raise. Return NIL bits as a placeholder.
+        Err(e) => {
+            NATIVE_ERROR.with(|c| *c.borrow_mut() = Some(e));
+            NIL.0
+        }
+    }
+}
+
+thread_local! {
+    /// Error raised by a c2i callback, re-raised by `run_native` after the
+    /// native call returns.
+    static NATIVE_ERROR: RefCell<Option<BlissError>> = const { RefCell::new(None) };
+}
+
+/// Installed T1 native code for a function. Its CL activation (locals + operand
+/// stack) lives in a BlissStack frame that the i2c adapter pushes; the native
+/// code addresses it through the frame-slot pointer passed in rdi (§D2.04).
+struct NativeCode {
+    entry: *const u8,
+    num_slots: u16,
+}
+
+thread_local! {
+    /// Native T1 code keyed by the same symbol index as the bytecode registry.
+    static NATIVE_REGISTRY: RefCell<HashMap<u32, Rc<NativeCode>>> = RefCell::new(HashMap::new());
+    /// Per-function invocation counters driving T0→T1 promotion.
+    static INVOKE_COUNTS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+}
+
+/// T0→T1 promotion threshold (invocations). Env-overridable for tests.
+fn t1_threshold() -> u32 {
+    std::env::var("BLISS_T1_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(10)
+}
+
+/// i2c adapter: push a BlissStack frame for the native activation, bind the
+/// arguments into its leading local slots, run the installed native code (which
+/// addresses the frame through rdi), then pop the frame. The native frame and
+/// any interpreter frames a c2i callback pushes all live on the one BlissStack.
+fn run_native(nc: &NativeCode, args: &[BlissVal], env: &mut Env) -> Result<BlissVal, BlissError> {
+    let thread = bliss_rt::current_thread();
+    let stack = thread.stack();
+    let frame = stack
+        .push_frame(NIL, std::ptr::null::<CodeInfo>(), nc.num_slots, FLAG_CALL)
+        .ok_or_else(|| BlissError::StackOverflow(bliss_rt::current_thread_id()))?;
+    for (i, a) in args.iter().enumerate() {
+        unsafe { slot_set(frame, i as u16, *a) };
+    }
+    let slots = unsafe { frame.add(1) as *mut u64 };
+
+    let saved = NATIVE_ENV.with(|e| e.replace(env as *mut Env));
+    NATIVE_ERROR.with(|c| *c.borrow_mut() = None);
+    // SAFETY: `entry` is installed executable code from emit_native_x86 with the
+    // SysV signature `fn(*mut u64) -> u64`, reading its activation from `slots`.
+    let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(nc.entry) };
+    let ret = f(slots);
+    NATIVE_ENV.with(|e| e.set(saved));
+
+    stack.pop_frame();
+    if let Some(err) = NATIVE_ERROR.with(|c| c.borrow_mut().take()) {
+        return Err(err);
+    }
+    Ok(BlissVal(ret))
+}
+
+/// Compile a bytecode function to native x86-64 T1 code, or `None` if it uses
+/// an opcode the baseline emitter does not handle.
+///
+/// The emitted function has the SysV signature
+/// `fn(a0..a5: u64) -> u64` (BlissVals). It manages the operand stack in-frame
+/// (via r15, keeping rsp 16-aligned for calls) and delegates every `CallNamed`
+/// to the interpreter through the c2i adapter — so a T1 function's arithmetic,
+/// calls, and conditionals produce results identical to pure interpretation,
+/// while the dispatch/operand-stack plumbing runs as native code (nmq.2).
+#[cfg(target_arch = "x86_64")]
+fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
+    if bf.arity > 6 {
+        return None;
+    }
+    // The activation lives in the BlissStack frame passed in rdi. r14 = frame
+    // slots pointer; local i at [r14 + 8*i]; r15 = operand-stack pointer
+    // (grows up from r14 + 8*n_locals). c2i preserves callee-saved r14/r15.
+    let n_locals = bf.n_locals as i32;
+    let local_disp = |i: i32| 8 * i;
+    let c2i_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64) -> u64 as usize as u64;
+
+    let mut c: Vec<u8> = Vec::new();
+    let mut offsets: Vec<usize> = Vec::with_capacity(bf.code.len());
+    let mut patches: Vec<(usize, u32)> = Vec::new();
+
+    // ── Prologue ───────────────────────────────────────────────
+    c.extend_from_slice(&[0x41, 0x56]); // push r14
+    c.extend_from_slice(&[0x41, 0x57]); // push r15
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8 (16-align for calls)
+    c.extend_from_slice(&[0x49, 0x89, 0xFE]); // mov r14, rdi (frame slots)
+    // lea r15, [r14 + 8*n_locals]   4D 8D BE d32
+    c.extend_from_slice(&[0x4D, 0x8D, 0xBE]);
+    c.extend_from_slice(&(8 * n_locals).to_le_bytes());
+
+    // push_op rax: mov [r15], rax ; add r15, 8
+    let push_rax = |c: &mut Vec<u8>| {
+        c.extend_from_slice(&[0x49, 0x89, 0x07]); // mov [r15], rax
+        c.extend_from_slice(&[0x49, 0x83, 0xC7, 0x08]); // add r15, 8
+    };
+    // pop_op into reg: sub r15,8 ; mov reg, [r15]
+    let pop_into = |c: &mut Vec<u8>, modrm_reg: u8, rex_r: bool| {
+        c.extend_from_slice(&[0x49, 0x83, 0xEF, 0x08]); // sub r15, 8
+        let rex = 0x49 | if rex_r { 0x04 } else { 0x00 };
+        c.push(rex);
+        c.push(0x8B);
+        c.push(0b00_000_111 | (modrm_reg << 3)); // mod=00, reg, rm=111 (r15)
+    };
+
+    for instr in bf.code.iter() {
+        offsets.push(c.len());
+        match instr {
+            Instr::Const(k) => {
+                let bits = bf.constants[*k as usize].0;
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+                c.extend_from_slice(&bits.to_le_bytes());
+                push_rax(&mut c);
+            }
+            Instr::LoadLocal(i) => {
+                // mov rax, [r14 + d32]   49 8B 86 d32
+                c.extend_from_slice(&[0x49, 0x8B, 0x86]);
+                c.extend_from_slice(&local_disp(*i as i32).to_le_bytes());
+                push_rax(&mut c);
+            }
+            Instr::StoreLocal(i) => {
+                pop_into(&mut c, 0, false); // -> rax
+                // mov [r14 + d32], rax   49 89 86 d32
+                c.extend_from_slice(&[0x49, 0x89, 0x86]);
+                c.extend_from_slice(&local_disp(*i as i32).to_le_bytes());
+            }
+            Instr::Pop => {
+                c.extend_from_slice(&[0x49, 0x83, 0xEF, 0x08]); // sub r15, 8
+            }
+            Instr::Dup => {
+                // mov rax, [r15-8] ; push
+                c.extend_from_slice(&[0x49, 0x8B, 0x47, 0xF8]); // mov rax, [r15-8]
+                push_rax(&mut c);
+            }
+            Instr::CallNamed { sym, nargs } => {
+                if *nargs > 3 {
+                    return None;
+                }
+                // c2i_call(sym, n, a0, a1, a2): rdi=sym, rsi=n, rdx=a0, rcx=a1,
+                // r8=a2. Top of stack is the last arg.
+                match *nargs {
+                    0 => {}
+                    1 => pop_into(&mut c, 2, false), // a0 -> rdx
+                    2 => {
+                        pop_into(&mut c, 1, false); // a1 -> rcx
+                        pop_into(&mut c, 2, false); // a0 -> rdx
+                    }
+                    3 => {
+                        pop_into(&mut c, 0, true); // a2 -> r8
+                        pop_into(&mut c, 1, false); // a1 -> rcx
+                        pop_into(&mut c, 2, false); // a0 -> rdx
+                    }
+                    _ => return None,
+                }
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, imm64 (sym)
+                c.extend_from_slice(&(*sym as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, imm64 (nargs)
+                c.extend_from_slice(&(*nargs as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i)
+                c.extend_from_slice(&c2i_addr.to_le_bytes());
+                c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                push_rax(&mut c);
+            }
+            Instr::Br(target) => {
+                c.extend_from_slice(&[0xE9]); // jmp rel32
+                patches.push((c.len(), *target));
+                c.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            Instr::BrIfFalse(target) => {
+                pop_into(&mut c, 0, false); // rax = value
+                c.extend_from_slice(&[0x48, 0x3D]); // cmp rax, imm32
+                c.extend_from_slice(&(bliss_rt::value::NIL_BITS as u32).to_le_bytes());
+                c.extend_from_slice(&[0x0F, 0x84]); // je rel32
+                patches.push((c.len(), *target));
+                c.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            Instr::Return => {
+                pop_into(&mut c, 0, false); // rax = result
+                c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+                c.extend_from_slice(&[0x41, 0x5F]); // pop r15
+                c.extend_from_slice(&[0x41, 0x5E]); // pop r14
+                c.extend_from_slice(&[0xC3]); // ret
+            }
+            _ => return None,
+        }
+    }
+
+    for (site, target) in patches {
+        let target_off = offsets[target as usize] as i64;
+        let rel = target_off - (site as i64 + 4);
+        let rel32 = i32::try_from(rel).ok()?;
+        c[site..site + 4].copy_from_slice(&rel32.to_le_bytes());
+    }
+    Some(c)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn emit_native_x86(_bf: &BytecodeFunction) -> Option<Vec<u8>> {
+    None
+}
+
+/// Try to promote `sym`'s bytecode function to T1 native code (install into
+/// executable memory). Returns the installed code, or `None` if it can't be
+/// compiled to native.
+fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
+    let bf = registry_get(sym)?;
+    // Only promote leaf-ish functions: a T1 function's calls cross back through
+    // c2i into the interpreter, so a call to another *bytecode* function (which
+    // could recurse) would grow the native/Rust stack per level. Functions that
+    // call only primitives/interpreted builtins are safe; recursive and
+    // inter-bytecode-calling functions stay T0 (flat loop, BlissStack-bounded).
+    for instr in &bf.code {
+        if let Instr::CallNamed { sym: callee, .. } = instr {
+            if registry_get(*callee).is_some() {
+                return None;
+            }
+        }
+    }
+    let code = emit_native_x86(&bf)?;
+    let buf = bliss_rt::jit::JitBuffer::new(&code)?;
+    let entry = buf.leak();
+    let nc = Rc::new(NativeCode {
+        entry,
+        num_slots: bf.num_slots(),
+    });
+    NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
+    Some(nc)
 }
 
 // ── Top-level driver ───────────────────────────────────────────────
