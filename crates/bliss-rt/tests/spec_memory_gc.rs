@@ -186,9 +186,16 @@ fn spec_gc_major_gc_runs_finalizers_and_survives_finalizer_panics() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    // The object is small, so `record_object` placed it in the nursery; the
+    // minor collection inside `major_gc` promotes (evacuates) it before it is
+    // found dead. Its finalizer therefore fires exactly once, keyed on the
+    // forwarded address rather than the stale pre-promotion one (bliss-jtc.7f).
+    // Assert on the firing and the finalizer value, not the (moved) address.
+    assert_eq!(log.len(), 1, "finalizer must fire exactly once");
     assert_eq!(
-        log,
-        vec![(BlissVal::from_fixnum(7).to_raw(), object.to_raw())]
+        log[0].0,
+        BlissVal::from_fixnum(7).to_raw(),
+        "the registered finalizer (7) must be the one invoked"
     );
 
     record_object(0x42, vec![9, 9, 9, 9, 9, 9, 9, 9]);

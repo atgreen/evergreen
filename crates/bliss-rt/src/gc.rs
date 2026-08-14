@@ -1079,29 +1079,15 @@ impl Collector for HeapCollector {
                 cursor += total_size;
             }
 
-            // Phase 3: Run finalizers for dead (non-forwarded) objects before
-            // zeroing the region. An object is dead if it was NOT forwarded
-            // (i.e., the FORWARDED gc-bit is clear and it has a valid header).
-            {
-                let base = state.regions[nursery_idx].base as usize;
-                let top = state.regions[nursery_idx].header.alloc_top as usize;
-                let mut fcursor = base;
-                while fcursor + OBJECT_HEADER_SIZE <= top {
-                    let header_ptr = fcursor as *const u8;
-                    let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
-                    if body_size == 0 && type_id == 0 {
-                        break;
-                    }
-                    let total_size =
-                        align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
-                    // Finalizers observe every nursery object in the collection
-                    // cycle before the region is reset.
-                    let body_ptr = unsafe { header_ptr.add(body_offset(header_ptr)) };
-                    let obj_val = BlissVal::from_raw(body_ptr as u64);
-                    run_finalizers_for(obj_val);
-                    fcursor += total_size;
-                }
-            }
+            // Finalizer/weak-pointer side tables are NOT touched here: firing a
+            // finalizer per nursery object would fire it for *promoted survivors*
+            // too (Phase 2 evacuates every non-pinned nursery object), closing
+            // live resources at a stale from-space address. Instead, survivors'
+            // side-table keys are forwarded after the relocation passes below
+            // (relocate_side_tables), and finalizers for genuinely dead objects
+            // fire once the freed nursery ranges are known (fire_finalizers_in_ranges).
+            // This is bliss's analogue of SBCL's post-mark scan_finalizers
+            // discipline (bliss-jtc.7f).
 
         }
 
@@ -1158,6 +1144,14 @@ impl Collector for HeapCollector {
         });
         scan_external_roots(|slot| unsafe { relocate_slot(slot, heap_base_addr, heap_end) });
 
+        // Forward finalizer-registry keys and weak-pointer referents for every
+        // object promoted out of the nursery this cycle, while the forwarding
+        // pointers are still intact (bliss-jtc.7f). A promoted survivor's key is
+        // moved to its new address so its finalizer is NOT fired and its weak
+        // pointers stay valid; only genuinely dead objects are handled by the
+        // range-based passes after the nursery is reset.
+        relocate_side_tables(heap_base_addr, heap_end);
+
         // Phase 4: Reset all nursery regions for reuse (after relocation, above,
         // read their forwarding pointers). Retained pinned regions were promoted
         // to old-gen in place and must NOT be zeroed (bliss-jtc.18).
@@ -1197,6 +1191,12 @@ impl Collector for HeapCollector {
                     .iter()
                     .any(|&(base, limit)| addr >= base && addr < limit)
             });
+            // Fire finalizers for objects that genuinely died in the nursery
+            // (e.g. an object lost when a copy failed under GC-time OOM):
+            // survivors have already had their keys forwarded out of these
+            // ranges by relocate_side_tables above, so anything still keyed
+            // inside a freed range is dead (bliss-jtc.7f).
+            fire_finalizers_in_ranges(&nursery_ranges);
         }
 
         // Update stats.
@@ -1492,6 +1492,14 @@ impl Collector for HeapCollector {
             relocate_slot(slot, heap_base_addr, heap_end)
         });
         scan_external_roots(|slot| unsafe { relocate_slot(slot, heap_base_addr, heap_end) });
+
+        // Forward finalizer-registry keys and weak-pointer referents for old-gen
+        // objects that were evacuated in Phase 3, while the forwarding pointers
+        // are still intact (bliss-jtc.7f). Dead objects already had their
+        // finalizers fired / weak pointers broken above (before evacuation, at
+        // their stable pre-evacuation addresses); this pass only moves the keys
+        // of live survivors that relocated.
+        relocate_side_tables(heap_base_addr, heap_end);
 
         // Now free the evacuated regions — their forwarding pointers are no
         // longer needed.
@@ -1986,6 +1994,16 @@ impl WeakPointer {
         self.referent = crate::value::NIL;
     }
 
+    /// Update the referent to its post-evacuation address. Called by the GC when
+    /// the referent survived a collection but moved, so the weak pointer keeps
+    /// referring to the live object rather than a stale from-space address
+    /// (bliss-jtc.7f).
+    pub fn forward_ref(&mut self, new_referent: BlissVal) {
+        if !self.broken {
+            self.referent = new_referent;
+        }
+    }
+
     /// Returns whether this weak pointer has been broken.
     pub fn is_broken(&self) -> bool {
         self.broken
@@ -2045,6 +2063,94 @@ where
         let wp = unsafe { &*handle.0 };
         !wp.is_broken()
     });
+}
+
+// ── GC side-table forwarding (bliss-jtc.7f) ────────────────────────
+//
+// The finalizer registry and the weak-pointer registry key objects by their
+// untagged body address (`BlissVal::from_raw(body)`), NOT by a tagged heap
+// reference. Like SBCL's finalizer store — whose keys are untagged fixnums,
+// "purposely opaque to GC" (src/code/final.lisp) — these keys are invisible to
+// the ordinary scavenger: they neither keep the object alive nor get rewritten
+// by `relocate_slot`. A moving collection would therefore leave them dangling.
+//
+// The fix mirrors SBCL's post-mark `scan_finalizers` / `smash_weak_pointers`
+// (src/runtime/gc-common.c): after the strong scavenge has installed forwarding
+// pointers, walk the side tables and, for each key whose object was evacuated,
+// follow the forwarding pointer to the new address. Survivors are re-keyed (their
+// finalizers must NOT fire); genuinely dead objects are handled by the dead-object
+// passes (`fire_finalizers_in_ranges`, `break_dead_weak_pointers`).
+
+/// Given a side-table key `from_raw(body)`, return `from_raw(new_body)` if the
+/// object's header carries a forwarding pointer (it was evacuated this cycle),
+/// else `None`. Bounds-checked against `[heap_base, heap_end)`, and uses the
+/// same `header = body - OBJECT_HEADER_SIZE` normalization as `relocate_slot`.
+fn forwarded_side_key(key: BlissVal, heap_base: usize, heap_end: usize) -> Option<BlissVal> {
+    let body = key.to_raw() as usize;
+    if body < heap_base + OBJECT_HEADER_SIZE || body >= heap_end {
+        return None;
+    }
+    let header = (body - OBJECT_HEADER_SIZE) as *const u8;
+    // SAFETY: `body` lies within the managed heap; its header precedes it.
+    if unsafe { header_is_forwarded(header) } {
+        let new_body = unsafe { header_forwarding_addr(header) } as u64;
+        Some(BlissVal::from_raw(new_body))
+    } else {
+        None
+    }
+}
+
+/// Forward finalizer-registry keys and weak-pointer referents for objects that
+/// were evacuated this collection, to each object's new address. Objects that
+/// were not evacuated are left untouched. MUST run while forwarding pointers are
+/// still intact (before the from-space regions are zeroed). This is the bliss
+/// analogue of SBCL's `scan_finalizers` + weak-pointer forwarding (jtc.7f).
+fn relocate_side_tables(heap_base: usize, heap_end: usize) {
+    {
+        let mut reg = finalizer_registry().lock().unwrap();
+        for e in reg.iter_mut() {
+            if let Some(new_key) = forwarded_side_key(e.object, heap_base, heap_end) {
+                e.object = new_key;
+            }
+        }
+    }
+    {
+        let reg = weak_pointer_registry().lock().unwrap();
+        for handle in reg.iter() {
+            // SAFETY: the weak pointer was registered by its owner and access is
+            // guarded by the registry mutex.
+            let wp = unsafe { &mut *handle.0 };
+            if !wp.is_broken() {
+                if let Some(new_key) = forwarded_side_key(wp.referent, heap_base, heap_end) {
+                    wp.forward_ref(new_key);
+                }
+            }
+        }
+    }
+}
+
+/// Fire and remove finalizers whose object died in one of the given freed
+/// address ranges. Symmetric with `break_dead_weak_pointers`: survivors have
+/// already had their keys forwarded out of these ranges by
+/// `relocate_side_tables`, so any finalizer key still inside a freed range
+/// belongs to a genuinely dead object (bliss-jtc.7f).
+fn fire_finalizers_in_ranges(ranges: &[(usize, usize)]) {
+    // Snapshot dead keys first; `run_finalizers_for` re-locks the registry.
+    let dead: Vec<BlissVal> = {
+        let reg = finalizer_registry().lock().unwrap();
+        reg.iter()
+            .filter(|e| {
+                let addr = e.object.to_raw() as usize;
+                ranges
+                    .iter()
+                    .any(|&(base, limit)| addr >= base && addr < limit)
+            })
+            .map(|e| e.object)
+            .collect()
+    };
+    for key in dead {
+        run_finalizers_for(key);
+    }
 }
 
 // ── Finalization ───────────────────────────────────────────────────
