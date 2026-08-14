@@ -2631,21 +2631,27 @@ pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
     Ok(())
 }
 
+// A whole-heap image (§7) already snapshots the SymbolData/PackageData objects
+// themselves — they live on the GC heap and are restored in place — and the
+// process-local registry (a Rust-side index → pinned-object map) survives an
+// in-process round-trip unchanged. So the image path must NOT re-serialize and
+// re-intern the registry: doing so allocates fresh symbols into the just-
+// restored heap and corrupts it. Portable, cross-process symbol identity (e.g.
+// for .bfasl) uses `crate::symbols::serialize`/`restore` directly instead.
 pub fn serialize_symbols() -> Vec<u8> {
-    // Real symbol-table identity serialization (bliss-jtc.6 Stage F).
-    crate::symbols::serialize()
+    Vec::new()
 }
 
-pub fn restore_symbols(data: &[u8]) -> Result<(), BlissError> {
-    crate::symbols::restore(data)
+pub fn restore_symbols(_data: &[u8]) -> Result<(), BlissError> {
+    Ok(())
 }
 
 pub fn serialize_packages() -> Vec<u8> {
-    crate::packages::serialize()
+    Vec::new()
 }
 
-pub fn restore_packages(data: &[u8]) -> Result<(), BlissError> {
-    crate::packages::restore(data)
+pub fn restore_packages(_data: &[u8]) -> Result<(), BlissError> {
+    Ok(())
 }
 
 pub fn serialize_code_cache() -> Vec<u8> {
