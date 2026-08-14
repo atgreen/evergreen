@@ -400,6 +400,16 @@ fn write_str_to(stream: BlissVal, s: &str) -> Result<(), BlissError> {
     bliss_stdlib::stream_write_string(stream, sv, 0, None)
 }
 
+/// The global value of symbol `idx` from its heap value cell, or `None` if the
+/// cell is unbound (bliss-jtc.6 Stage C2). This is the authoritative store for
+/// global (non-lexical) variable values.
+fn global_value_cell(idx: u32) -> Option<BlissVal> {
+    match bliss_rt::symbols::symbol_value(idx) {
+        Some(v) if v != bliss_rt::value::UNBOUND => Some(v),
+        _ => None,
+    }
+}
+
 /// True if `val` is a keyword symbol (name in the KEYWORD package). Used to
 /// tell an optional positional stream argument apart from &key start/end.
 fn is_keyword_arg(val: BlissVal) -> bool {
@@ -1976,24 +1986,39 @@ impl Env {
         }
         let parent = frame.parent.clone();
         drop(frame);
-        parent.and_then(|parent| Self::lookup_frame(&parent, name))
+        if let Some(val) = parent.and_then(|parent| Self::lookup_frame(&parent, name)) {
+            return Some(val);
+        }
+        // Global fallback (bliss-jtc.6 Stage C2): a global binding not on the
+        // frame stack lives in the symbol's heap value cell.
+        bliss_rt::symbols::find_index(name).and_then(global_value_cell)
     }
 
     fn lookup_var_symbol(&self, symbol: BlissVal) -> Option<BlissVal> {
+        let idx = symbol.as_symbol_index();
         let frame = self.frame.borrow();
-        if let Some(val) = frame.symbol_vars.get(&symbol.as_symbol_index()) {
+        if let Some(val) = frame.symbol_vars.get(&idx) {
             return Some(*val);
         }
         let parent = frame.parent.clone();
         drop(frame);
-        parent.and_then(|parent| Self::lookup_symbol_frame(&parent, symbol.as_symbol_index()))
+        if let Some(val) = parent.and_then(|parent| Self::lookup_symbol_frame(&parent, idx)) {
+            return Some(val);
+        }
+        global_value_cell(idx)
     }
 
     fn set_var(&mut self, name: &str, val: BlissVal) {
         if Self::set_frame_var(&self.frame, name, val) {
             return;
         }
-        self.define_local(name, val);
+        // Not bound on the frame stack → global assignment into the value cell
+        // (bliss-jtc.6 Stage C2). Uninterned names have no cell, so keep the old
+        // local-definition behaviour for them.
+        match bliss_rt::symbols::find_index(name) {
+            Some(idx) => bliss_rt::symbols::set_symbol_value(idx, val),
+            None => self.define_local(name, val),
+        }
     }
 
     fn set_var_symbol(&mut self, symbol: BlissVal, val: BlissVal) {
@@ -2004,7 +2029,9 @@ impl Env {
         if Self::set_frame_var(&self.frame, &name, val) {
             return;
         }
-        self.define_local_symbol(symbol, val);
+        // Not bound on the frame stack → global assignment into the symbol's
+        // value cell (bliss-jtc.6 Stage C2).
+        bliss_rt::symbols::set_symbol_value(symbol.as_symbol_index(), val);
     }
 
     fn lookup_symbol_macro(&self, symbol: BlissVal) -> Option<BlissVal> {
@@ -11347,6 +11374,46 @@ mod jtc5_numeric_tests {
         );
         assert_eq!(read_eval_all("(eq 1/3 1/3)").unwrap(), NIL);
         assert_eq!(read_eval_all("(= (/ 1 2) (/ 2 4))").unwrap(), T);
+    }
+}
+
+#[cfg(test)]
+mod jtc6c2_binding_cell_tests {
+    use super::*;
+
+    /// bliss-jtc.6 Stage C2: a global (non-lexical) variable's value lives in the
+    /// symbol's heap value cell, and normal references read it back through the
+    /// cell fallback — lexical LET bindings are unaffected.
+    #[test]
+    fn global_value_is_authoritative_in_the_symbol_cell() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+
+        // A top-level assignment writes the global value cell.
+        read_eval_all_env("(setq *c2-global* 123)", &mut env).expect("setq");
+        let idx = bliss_rt::symbols::intern("*C2-GLOBAL*");
+        assert_eq!(
+            bliss_rt::symbols::symbol_value(idx),
+            Some(BlissVal::from_fixnum(123)),
+            "global value must be stored in the symbol's value cell"
+        );
+
+        // A normal reference reads it back through the cell.
+        assert_eq!(
+            read_eval_all_env("*c2-global*", &mut env).expect("ref"),
+            BlissVal::from_fixnum(123)
+        );
+
+        // A lexical LET shadows the global without disturbing the cell.
+        assert_eq!(
+            read_eval_all_env("(let ((*c2-global* 9)) *c2-global*)", &mut env).expect("let"),
+            BlissVal::from_fixnum(9)
+        );
+        assert_eq!(
+            bliss_rt::symbols::symbol_value(idx),
+            Some(BlissVal::from_fixnum(123)),
+            "the LET binding must not overwrite the global cell"
+        );
     }
 }
 
