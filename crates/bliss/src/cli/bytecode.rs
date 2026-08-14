@@ -41,7 +41,8 @@ use bliss_rt::{CodeInfo, Frame};
 use super::{
     Env, HandlerCluster, HandlerEntry, HandlerImpl, apply_function, bliss_error_to_condition,
     condition_matches_handler, cp, eval_form, handler_case_token, list_to_vec, next_control_token,
-    store_control_value, sym_name, tag_key, take_control_value, val_as_str,
+    run_handler_bind_handlers, store_control_value, sym_name, tag_key, take_control_value,
+    val_as_str,
 };
 
 // ── Backend selection ──────────────────────────────────────────────
@@ -93,8 +94,14 @@ enum Instr {
     /// either backend lands here, resumes at `resume_bcp`, resets the operand
     /// stack to `sp_restore`, and pushes the thrown value.
     PushCatch { resume_bcp: u32, sp_restore: u16 },
-    /// Establish a `BLOCK` exit handler keyed by the lexical `block_id`.
-    PushBlock { block_id: u32, resume_bcp: u32, sp_restore: u16 },
+    /// Establish a `BLOCK` exit handler keyed by the lexical `block_id`;
+    /// `name_idx` names the block for `env.block_stack` (tree-walker interop).
+    PushBlock {
+        block_id: u32,
+        name_idx: u16,
+        resume_bcp: u32,
+        sp_restore: u16,
+    },
     /// Establish a `TAGBODY` handler keyed by the lexical `tagbody_id`.
     PushTag { tagbody_id: u32, sp_restore: u16 },
     /// Establish an `UNWIND-PROTECT` cleanup handler; on any unwind through it
@@ -121,6 +128,11 @@ enum Instr {
     PushHandlerCase { hc: u32, sp_restore: u16 },
     /// Normal completion of `HANDLER-CASE`: disestablish the cluster.
     PopHandlerCase,
+    /// Establish a `HANDLER-BIND` cluster (`hb` indexes the static binding
+    /// table). Handlers run in the signalling context via the shared machinery.
+    PushHandlerBind { hb: u32 },
+    /// Normal completion of `HANDLER-BIND`: disestablish the cluster.
+    PopHandlerBind,
 }
 
 /// A lowered CL function: a linear bytecode plus its constant pool and frame
@@ -132,6 +144,10 @@ pub struct BytecodeFunction {
     constants: Vec<BlissVal>,
     /// Static per-`handler-case` clause tables (indexed by `PushHandlerCase`).
     handler_cases: Vec<HandlerCaseInfo>,
+    /// Static per-`handler-bind` binding tables (indexed by `PushHandlerBind`).
+    handler_binds: Vec<HandlerBindInfo>,
+    /// Interned block names (referenced by `PushBlock` for `env.block_stack`).
+    names: Vec<String>,
     /// Number of lexical local slots (params + `let` bindings).
     n_locals: u16,
     /// Maximum operand-stack depth.
@@ -166,6 +182,14 @@ struct ClauseInfo {
     body_bcp: u32,
     /// Local slot the condition is bound to, if the clause has a variable.
     var_slot: Option<u16>,
+}
+
+/// Static description of one `handler-bind` form: `(type . handler-form)` pairs.
+/// The handler form is stored raw (unevaluated) exactly as the tree-walker does,
+/// so the shared signal machinery invokes it identically.
+#[derive(Debug, Clone)]
+struct HandlerBindInfo {
+    bindings: Vec<(String, BlissVal)>,
 }
 
 // ── Per-thread registry of compiled functions ─────────────────────
@@ -235,6 +259,10 @@ struct Lowerer<'e> {
     pending_gos: Vec<(usize, u32, String)>,
     /// Static `handler-case` clause tables.
     handler_cases: Vec<HandlerCaseInfo>,
+    /// Static `handler-bind` binding tables.
+    handler_binds: Vec<HandlerBindInfo>,
+    /// Interned block names.
+    names: Vec<String>,
     env: &'e Env,
 }
 
@@ -260,8 +288,19 @@ impl<'e> Lowerer<'e> {
             tag_scope: Vec::new(),
             pending_gos: Vec::new(),
             handler_cases: Vec::new(),
+            handler_binds: Vec::new(),
+            names: Vec::new(),
             env,
         }
+    }
+
+    fn intern_name(&mut self, name: &str) -> u16 {
+        if let Some(i) = self.names.iter().position(|n| n == name) {
+            return i as u16;
+        }
+        let i = self.names.len() as u16;
+        self.names.push(name.to_string());
+        i
     }
 
     fn fresh_id(&mut self) -> u32 {
@@ -393,6 +432,7 @@ impl<'e> Lowerer<'e> {
                 "GO" => self.lower_go(rest),
                 "UNWIND-PROTECT" => self.lower_unwind_protect(rest),
                 "HANDLER-CASE" => self.lower_handler_case(rest),
+                "HANDLER-BIND" => self.lower_handler_bind(rest),
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
@@ -599,9 +639,11 @@ impl<'e> Lowerer<'e> {
         }
         let name = sym_name(name_form);
         let block_id = self.fresh_id();
+        let name_idx = self.intern_name(&name);
         let sp_restore = self.cur_stack;
         self.emit(Instr::PushBlock {
             block_id,
+            name_idx,
             resume_bcp: 0,
             sp_restore,
         });
@@ -923,6 +965,35 @@ impl<'e> Lowerer<'e> {
         }
         Ok(())
     }
+
+    /// `(handler-bind ((type handler-form)...) body...)` — handlers run in the
+    /// signalling context (no unwind unless a handler transfers control).
+    fn lower_handler_bind(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (bindings_form, body) = cp(rest);
+        let mut bindings = Vec::new();
+        for binding in list_to_vec(bindings_form) {
+            if !binding.is_cons() {
+                return Err(Bail);
+            }
+            let (type_form, handler_rest) = cp(binding);
+            if !type_form.is_symbol() && !type_form.is_nil() {
+                return Err(Bail);
+            }
+            let handler_form = if handler_rest.is_cons() {
+                cp(handler_rest).0
+            } else {
+                return Err(Bail);
+            };
+            bindings.push((sym_name(type_form), handler_form));
+        }
+
+        let hb = self.handler_binds.len() as u32;
+        self.handler_binds.push(HandlerBindInfo { bindings });
+        self.emit(Instr::PushHandlerBind { hb });
+        self.lower_progn(body)?; // body value (+1)
+        self.emit(Instr::PopHandlerBind);
+        Ok(())
+    }
 }
 
 /// Extract `(name init)` from a `let` binding, which may also be a bare symbol.
@@ -990,7 +1061,6 @@ fn is_bail_special(name: &str) -> bool {
             | "PROG"
             | "PROG*"
             | "DESTRUCTURING-BIND"
-            | "HANDLER-BIND"
             | "RESTART-CASE"
             | "RESTART-BIND"
             | "IGNORE-ERRORS"
@@ -1048,6 +1118,8 @@ fn compile_function(
         code: lo.code,
         constants: lo.constants,
         handler_cases: lo.handler_cases,
+        handler_binds: lo.handler_binds,
+        names: lo.names,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
         arity: param_names.len() as u16,
@@ -1086,6 +1158,8 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
         code: lo.code,
         constants: lo.constants,
         handler_cases: lo.handler_cases,
+        handler_binds: lo.handler_binds,
+        names: lo.names,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
         arity: 0,
@@ -1103,8 +1177,14 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
 enum Handler {
     /// `CATCH`: keyed by the control token shared with `env.catch_stack`.
     Catch { token: String, resume_bcp: u32, sp_restore: u16 },
-    /// `BLOCK`: keyed by a lexical compile-time id.
-    Block { block_id: u32, resume_bcp: u32, sp_restore: u16 },
+    /// `BLOCK`: keyed by a lexical compile-time id (compiled `return-from`) and
+    /// a control token registered in `env.block_stack` (tree-walker `return-from`).
+    Block {
+        block_id: u32,
+        token: String,
+        resume_bcp: u32,
+        sp_restore: u16,
+    },
     /// `TAGBODY`: keyed by a lexical compile-time id; `GO` targets a tag PC.
     Tag { tagbody_id: u32, sp_restore: u16 },
     /// `UNWIND-PROTECT`: a cleanup to run on any unwind through this point.
@@ -1116,6 +1196,9 @@ enum Handler {
         sp_restore: u16,
         cluster_base: usize,
     },
+    /// `HANDLER-BIND`: handlers already registered in `env.handlers`. On a raw
+    /// structured error unwinding through here, the handlers get their turn.
+    HandlerBind { cluster_base: usize },
 }
 
 /// A live `handler-case` clause: its control token (shared with `env.handlers`),
@@ -1366,8 +1449,14 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     // Balanced bytecode leaves no live handlers at RETURN; drop
                     // any catch_stack entries defensively.
                     for h in act.handlers.drain(..) {
-                        if let Handler::Catch { token, .. } = h {
-                            env.catch_stack.retain(|(_, t)| *t != token);
+                        match h {
+                            Handler::Catch { token, .. } => {
+                                env.catch_stack.retain(|(_, t)| *t != token);
+                            }
+                            Handler::Block { token, .. } => {
+                                env.block_stack.retain(|(_, t)| *t != token);
+                            }
+                            _ => {}
                         }
                     }
                     act.pop_op()
@@ -1397,11 +1486,16 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
             }
             Instr::PushBlock {
                 block_id,
+                name_idx,
                 resume_bcp,
                 sp_restore,
             } => {
+                let name = acts[top_idx].func.names[name_idx as usize].clone();
+                let token = next_control_token("__RETURN_FROM__");
+                env.block_stack.push((name, token.clone()));
                 acts[top_idx].handlers.push(Handler::Block {
                     block_id,
+                    token,
                     resume_bcp,
                     sp_restore,
                 });
@@ -1425,8 +1519,14 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 });
             }
             Instr::PopHandler => {
-                if let Some(Handler::Catch { token, .. }) = acts[top_idx].handlers.pop() {
-                    env.catch_stack.retain(|(_, t)| *t != token);
+                match acts[top_idx].handlers.pop() {
+                    Some(Handler::Catch { token, .. }) => {
+                        env.catch_stack.retain(|(_, t)| *t != token);
+                    }
+                    Some(Handler::Block { token, .. }) => {
+                        env.block_stack.retain(|(_, t)| *t != token);
+                    }
+                    _ => {}
                 }
             }
             Instr::Throw => {
@@ -1539,6 +1639,27 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     env.handlers.truncate(cluster_base);
                 }
             }
+            Instr::PushHandlerBind { hb } => {
+                let info = acts[top_idx].func.handler_binds[hb as usize].clone();
+                let cluster_base = env.handlers.len();
+                let entries = info
+                    .bindings
+                    .iter()
+                    .map(|(type_name, handler_form)| HandlerEntry {
+                        type_name: type_name.clone(),
+                        handler: HandlerImpl::Function(*handler_form),
+                    })
+                    .collect();
+                env.handlers.push(HandlerCluster { entries });
+                acts[top_idx]
+                    .handlers
+                    .push(Handler::HandlerBind { cluster_base });
+            }
+            Instr::PopHandlerBind => {
+                if let Some(Handler::HandlerBind { cluster_base }) = acts[top_idx].handlers.pop() {
+                    env.handlers.truncate(cluster_base);
+                }
+            }
         }
     }
 }
@@ -1552,7 +1673,7 @@ fn initiate_unwind(
     acts: &mut Vec<Activation>,
     stack: &bliss_rt::BlissStack,
     env: &mut Env,
-    pending: Pending,
+    mut pending: Pending,
 ) -> Result<(), BlissError> {
     loop {
         let top = acts.len() - 1;
@@ -1589,23 +1710,26 @@ fn initiate_unwind(
             }
             Some(Handler::Block {
                 block_id,
+                token,
                 resume_bcp,
                 sp_restore,
             }) => {
                 acts[top].handlers.pop();
-                if let Pending::Return {
-                    block_id: bid,
-                    value,
-                } = &pending
-                {
-                    if *bid == block_id {
-                        let v = *value;
-                        let act = &mut acts[top];
-                        act.sp_top = sp_restore;
-                        act.bcp = resume_bcp as usize;
-                        act.push_op(v);
-                        return Ok(());
-                    }
+                env.block_stack.retain(|(_, t)| *t != token);
+                // A compiled `return-from` matches by lexical id; a tree-walker
+                // `return-from` (e.g. from a handler function) arrives as this
+                // block's control token.
+                let matched = match &pending {
+                    Pending::Return { block_id: bid, value } if *bid == block_id => Some(*value),
+                    Pending::Token(t) if *t == token => Some(take_control_value(&token)),
+                    _ => None,
+                };
+                if let Some(v) = matched {
+                    let act = &mut acts[top];
+                    act.sp_top = sp_restore;
+                    act.bcp = resume_bcp as usize;
+                    act.push_op(v);
+                    return Ok(());
                 }
             }
             Some(Handler::Tag {
@@ -1666,6 +1790,27 @@ fn initiate_unwind(
                 }
                 // No clause matched — keep unwinding.
             }
+            Some(Handler::HandlerBind { cluster_base }) => {
+                acts[top].handlers.pop();
+                // Mirror eval_handler_bind: only a *raw* structured error (one
+                // bliss_error_to_condition can denote) gives these handlers their
+                // turn here — conditions raised via SIGNAL/ERROR already ran the
+                // handler stack at signal time. A handler that declines lets the
+                // original error keep unwinding; one that transfers control
+                // replaces the pending transfer.
+                if let Pending::Propagate(error) = &pending {
+                    if let Ok(Some(cond)) = bliss_error_to_condition(env, error) {
+                        match run_handler_bind_handlers(env, cond, cluster_base) {
+                            Ok(()) => {}
+                            Err(transfer) => {
+                                pending = error_to_pending(transfer, env);
+                            }
+                        }
+                    }
+                }
+                env.handlers.truncate(cluster_base);
+                // Keep unwinding with the (possibly transferred) pending.
+            }
             None => {
                 // No handler here — this activation is fully unwound.
                 stack.pop_frame();
@@ -1684,7 +1829,12 @@ fn initiate_unwind(
 /// propagates after running cleanups.
 fn error_to_pending(e: BlissError, env: &Env) -> Pending {
     if let BlissError::Internal(token) = &e {
-        if env.catch_stack.iter().any(|(_, t)| t == token) {
+        // A control token naming one of our live bytecode CATCH or BLOCK handlers
+        // (a THROW / RETURN-FROM performed by tree-walker code) becomes a Token
+        // transfer the unwind driver routes to that handler.
+        if env.catch_stack.iter().any(|(_, t)| t == token)
+            || env.block_stack.iter().any(|(_, t)| t == token)
+        {
             return Pending::Token(token.clone());
         }
     }

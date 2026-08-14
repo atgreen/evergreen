@@ -137,6 +137,12 @@ const CORPUS: &[&str] = &[
     "(defvar *l* nil) (defun f () (setq *l* nil) (handler-case (unwind-protect (car 5) (setq *l* (cons 1 *l*))) (error (e) *l*))) (f)",
     "(defun f () (handler-case (car 5) (t () (quote catchall)))) (f)",
     "(defun f () (handler-case (car 5) (division-by-zero () (quote no)))) (handler-case (f) (type-error () (quote outer-caught)))",
+    // ── HANDLER-BIND on bytecode (nmq.7) ──
+    "(defun f () (handler-case (handler-bind ((error (lambda (c) (declare (ignore c)) nil))) (car 5)) (error () (quote outer)))) (f)",
+    "(defun f () (catch (quote out) (handler-bind ((error (lambda (c) (declare (ignore c)) (throw (quote out) (quote handled))))) (car 5)))) (f)",
+    "(defun f () (block b (handler-bind ((error (lambda (c) (declare (ignore c)) (return-from b (quote via-handler))))) (car 5)))) (f)",
+    "(defun f () (handler-bind ((error (lambda (c) c))) (+ 2 3))) (f)",
+    "(define-condition my-c (condition) ()) (defun f () (block b (handler-bind ((my-c (lambda (c) (declare (ignore c)) (return-from b (quote sig-handled))))) (signal (quote my-c))))) (f)",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a
