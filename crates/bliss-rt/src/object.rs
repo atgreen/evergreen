@@ -50,6 +50,21 @@ impl ObjectHeader {
         self.0 = (self.0 & !GC_BITS_MASK) | ((bits as u64) << GC_BITS_SHIFT);
     }
 
+    /// Set the FORWARDED gc-bit (bit 53). Non-atomic; callers hold the heap
+    /// lock during the stop-the-world evacuation phase that installs forwarding.
+    /// The type_id and size fields are left intact so a forwarded object can
+    /// still be strided over by the heap walker (spec §1.3.2, R1.09).
+    pub fn set_forwarded(&mut self) {
+        let bits = self.gc_bits() | (1 << gc_bit::FORWARDED);
+        self.set_gc_bits(bits);
+    }
+
+    /// Set the PINNED gc-bit (bit 52); the object must not be moved by the GC.
+    pub fn set_pinned(&mut self) {
+        let bits = self.gc_bits() | (1 << gc_bit::PINNED);
+        self.set_gc_bits(bits);
+    }
+
     /// Extract the cached identity hash (bits 47:16). Zero means not yet computed.
     pub fn hash(self) -> u32 {
         ((self.0 & HASH_MASK) >> HASH_SHIFT) as u32

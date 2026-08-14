@@ -307,14 +307,12 @@ fn push_frame_overflow_returns_none() {
     // Tiny stack: repeated pushes must eventually fail with None, never panic.
     let stack = BlissStack::new(256);
     let mut pushed = 0;
-    loop {
-        match stack.push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 4, 0) {
-            Some(_) => pushed += 1,
-            None => break,
-        }
-        if pushed > 1000 {
-            panic!("stack should have overflowed by now");
-        }
+    while stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 4, 0)
+        .is_some()
+    {
+        pushed += 1;
+        assert!(pushed <= 1000, "stack should have overflowed by now");
     }
     assert!(pushed >= 1, "at least one frame should fit");
 }

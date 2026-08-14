@@ -149,42 +149,172 @@ pub fn set_gc_marking_in_progress(active: bool) {
     GC_MARKING_IN_PROGRESS.store(active, Ordering::Release);
 }
 
-// ── Object header layout ──────────────────────────────────────────
+// ── Object header layout (spec §1.3) ──────────────────────────────
+//
+// Every GC-managed object begins with the 8-byte `ObjectHeader` defined in
+// `crate::object`: type_id (63:56) · gc_bits (55:48) · hash (47:16) · size
+// (15:0, the total object footprint in 8-byte units **including** the header).
+// Objects whose footprint exceeds the inline size field use the large-object
+// extension: size = 0xFFFF and the true total byte size is stored as a u64
+// immediately after the header, with the payload beginning at offset 16.
+//
+// Forwarding uses the FORWARDED gc-bit (bit 53) with the new body address
+// written into the object's first payload word; type_id and size are left
+// intact so the heap walker can still stride over an evacuated object (R1.09).
+//
+// This is the single header contract shared by the allocator, heap walker,
+// tracer, and evacuator (bliss-jtc.19). Header access goes through the helpers
+// below rather than reading raw bytes.
 
-/// Size of the per-object header used in the bootstrap heap layout.
-/// Layout: [type_id: u8, padding: 3 bytes, size: u32] = 8 bytes.
+use crate::object::{ObjectHeader, gc_bit};
+
+/// Size of the base object header (spec §1.3).
 const OBJECT_HEADER_SIZE: usize = 8;
 
 /// Alignment for objects in the heap (spec §3.3.1: 16-byte minimum).
 const OBJECT_ALIGNMENT: usize = 16;
 
-/// Forwarding pointer marker. When type_id byte is 0xFF, the object
-/// has been forwarded; bytes 8..16 contain the new location pointer.
-const FORWARDED_TYPE_ID: u8 = 0xFF;
+/// `size` field value reserved to signal the large-object extension (§1.3).
+const LARGE_SIZE_SENTINEL: u16 = 0xFFFF;
 
-/// Write an object header at `ptr`. The header is 8 bytes:
-/// byte 0: type_id, bytes 1-3: padding (zeroed), bytes 4-7: body_size (u32 LE).
-///
-/// Safety: `ptr` must be valid for writes of at least OBJECT_HEADER_SIZE bytes.
-unsafe fn write_object_header(ptr: *mut u8, type_id: u8, body_size: u32) {
-    unsafe {
-        *ptr = type_id;
-    }
-    // bytes 1-3 are padding, already zeroed from alloc_zeroed
-    let size_ptr = unsafe { ptr.add(4) } as *mut u32;
-    unsafe {
-        *size_ptr = body_size;
+/// Payload offset for large objects: base header (8) + u64 true-size (8).
+const LARGE_OBJECT_PAYLOAD_OFFSET: usize = 16;
+
+/// Total object footprint in bytes (header + body, 16-byte aligned) for a
+/// requested `body_size`, plus whether the large-object extension is required.
+fn object_footprint(body_size: usize) -> (usize, bool) {
+    let inline = align_up(OBJECT_HEADER_SIZE + body_size, OBJECT_ALIGNMENT);
+    if inline / 8 >= LARGE_SIZE_SENTINEL as usize {
+        (
+            align_up(LARGE_OBJECT_PAYLOAD_OFFSET + body_size, OBJECT_ALIGNMENT),
+            true,
+        )
+    } else {
+        (inline, false)
     }
 }
 
-/// Read an object header at `ptr`. Returns (type_id, body_size).
+/// Read the `ObjectHeader` at `ptr`.
+///
+/// Safety: `ptr` must point at a valid object header.
+#[inline]
+unsafe fn header_at(ptr: *const u8) -> ObjectHeader {
+    unsafe { *(ptr as *const ObjectHeader) }
+}
+
+/// Byte offset from the header to the object payload (8, or 16 for large
+/// objects). Safety: `ptr` must point at a valid object header.
+#[inline]
+unsafe fn body_offset(ptr: *const u8) -> usize {
+    if unsafe { header_at(ptr) }.size_units() == LARGE_SIZE_SENTINEL {
+        LARGE_OBJECT_PAYLOAD_OFFSET
+    } else {
+        OBJECT_HEADER_SIZE
+    }
+}
+
+/// Total object footprint in bytes, for striding the heap. Reads the
+/// large-object extension when present. Safety: valid header at `ptr`.
+#[inline]
+unsafe fn header_total_bytes(ptr: *const u8) -> usize {
+    let h = unsafe { header_at(ptr) };
+    if h.size_units() == LARGE_SIZE_SENTINEL {
+        unsafe { *(ptr.add(OBJECT_HEADER_SIZE) as *const u64) as usize }
+    } else {
+        h.size_units() as usize * 8
+    }
+}
+
+/// True if the slot holds no object (zeroed header). Zero-filled holes appear
+/// inside a region after a prior GC. Safety: valid readable `ptr`.
+#[inline]
+unsafe fn header_is_free(ptr: *const u8) -> bool {
+    unsafe { header_at(ptr) }.0 == 0
+}
+
+/// True if the object at `ptr` has been evacuated (FORWARDED gc-bit set).
+/// Safety: valid header at `ptr`.
+#[inline]
+unsafe fn header_is_forwarded(ptr: *const u8) -> bool {
+    (unsafe { header_at(ptr) }.gc_bits() & (1 << gc_bit::FORWARDED)) != 0
+}
+
+/// The forwarding address (new body pointer) of an evacuated object.
+/// Safety: `ptr` must be a forwarded object.
+#[inline]
+unsafe fn header_forwarding_addr(ptr: *const u8) -> *mut u8 {
+    unsafe { *(ptr.add(body_offset(ptr)) as *const *mut u8) }
+}
+
+/// Install a forwarding pointer at `ptr`: set the FORWARDED gc-bit (leaving
+/// type_id and size intact) and store `new_body` in the first payload word.
+/// Safety: `ptr` must point at a live object being evacuated, with room for a
+/// pointer in its payload (always true — minimum object is 16 bytes).
+#[inline]
+unsafe fn header_set_forwarded(ptr: *mut u8, new_body: *mut u8) {
+    unsafe {
+        (*(ptr as *mut ObjectHeader)).set_forwarded();
+        *(ptr.add(body_offset(ptr)) as *mut *mut u8) = new_body;
+    }
+}
+
+/// Write a spec `ObjectHeader` for a `body_size`-byte body and return the
+/// payload offset (8, or 16 for large objects).
+///
+/// The header `size` field records the total footprint in 8-byte units, which
+/// is all the GC needs to stride and evacuate. The exact logical body length is
+/// stashed in the otherwise-unused `hash` field so the image serializer and
+/// heap walker can reproduce sub-8-byte bodies byte-exactly (R7.01). This reuse
+/// is a bootstrap-era mechanism: once real Lisp objects carry their own length
+/// fields (§1.6) and `SXHASH` caching is wired for heap objects, exact length
+/// comes from the payload and the `hash` field reverts to identity hashing.
+///
+/// Safety: `ptr` must be valid for writes of the object's full footprint.
+unsafe fn write_object_header(ptr: *mut u8, type_id: u8, body_size: u32) -> usize {
+    let (total, large) = object_footprint(body_size as usize);
+    let mut hdr = if large {
+        ObjectHeader::new(type_id, LARGE_SIZE_SENTINEL)
+    } else {
+        ObjectHeader::new(type_id, (total / 8) as u16)
+    };
+    hdr.set_hash(body_size);
+    unsafe {
+        *(ptr as *mut ObjectHeader) = hdr;
+        if large {
+            *(ptr.add(OBJECT_HEADER_SIZE) as *mut u64) = total as u64;
+            LARGE_OBJECT_PAYLOAD_OFFSET
+        } else {
+            OBJECT_HEADER_SIZE
+        }
+    }
+}
+
+/// The exact logical body length recorded at allocation (see
+/// `write_object_header`), falling back to the footprint body size for headers
+/// written without one. Safety: valid header at `ptr`.
+#[inline]
+unsafe fn header_exact_body_len(ptr: *const u8) -> usize {
+    let h = unsafe { header_at(ptr) };
+    let exact = h.hash() as usize;
+    if exact != 0 {
+        exact
+    } else {
+        unsafe { header_total_bytes(ptr) - body_offset(ptr) }
+    }
+}
+
+/// Read an object header at `ptr`. Returns `(type_id, body_size_bytes)` where
+/// the body size is the payload footprint (total minus header/extension),
+/// rounded up to the object alignment. A zeroed slot reads as `(0, 0)`.
 ///
 /// Safety: `ptr` must be valid for reads of at least OBJECT_HEADER_SIZE bytes.
 unsafe fn read_object_header(ptr: *const u8) -> (u8, u32) {
-    let type_id = unsafe { *ptr };
-    let size_ptr = unsafe { ptr.add(4) } as *const u32;
-    let body_size = unsafe { *size_ptr };
-    (type_id, body_size)
+    if unsafe { header_is_free(ptr) } {
+        return (0, 0);
+    }
+    let type_id = unsafe { header_at(ptr) }.type_id();
+    let body = unsafe { header_total_bytes(ptr) } - unsafe { body_offset(ptr) };
+    (type_id, body as u32)
 }
 
 /// Align `size` up to OBJECT_ALIGNMENT (16 bytes), per spec §3.3.1.
@@ -311,8 +441,9 @@ impl Allocator for HeapAllocator {
         if size == 0 {
             return None;
         }
-        // Total allocation = object header + body, aligned to 16 bytes (spec §3.3.1).
-        let total_size = align_up(OBJECT_HEADER_SIZE + size, OBJECT_ALIGNMENT);
+        // Total allocation = header + body, 16-byte aligned (spec §3.3.1), with
+        // the large-object extension when the footprint exceeds the size field.
+        let (total_size, _) = object_footprint(size);
         let cursor = self.tlab.cursor as usize;
         let limit = self.tlab.limit as usize;
         let new_cursor = cursor.checked_add(total_size)?;
@@ -320,13 +451,11 @@ impl Allocator for HeapAllocator {
             let header_ptr = self.tlab.cursor;
             self.tlab.cursor = new_cursor as *mut u8;
             // Write the object header (type_id=0 placeholder, caller sets real type).
-            unsafe {
-                write_object_header(header_ptr, 0, size as u32);
-            }
+            let body_off = unsafe { write_object_header(header_ptr, 0, size as u32) };
             // Update live_bytes on the nursery region.
             self.update_nursery_live_bytes(total_size);
             // Return pointer past the header (to the object body).
-            Some(unsafe { header_ptr.add(OBJECT_HEADER_SIZE) })
+            Some(unsafe { header_ptr.add(body_off) })
         } else {
             None
         }
@@ -352,7 +481,7 @@ impl Allocator for HeapAllocator {
         if size == 0 {
             return Err(BlissError::Internal("zero-size large alloc".into()));
         }
-        let total_size = align_up(OBJECT_HEADER_SIZE + size, OBJECT_ALIGNMENT);
+        let (total_size, _) = object_footprint(size);
 
         let mut guard = heap_state().lock().unwrap();
         let state = guard
@@ -374,10 +503,8 @@ impl Allocator for HeapAllocator {
                     state.stats.bytes_allocated += total_size as u64;
                     state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
                     // Write object header.
-                    unsafe {
-                        write_object_header(ptr, 0, size as u32);
-                    }
-                    return Ok(unsafe { ptr.add(OBJECT_HEADER_SIZE) });
+                    let body_off = unsafe { write_object_header(ptr, 0, size as u32) };
+                    return Ok(unsafe { ptr.add(body_off) });
                 }
             }
         } else {
@@ -405,10 +532,8 @@ impl Allocator for HeapAllocator {
                     .regions_free
                     .saturating_sub(regions_needed as u32);
                 // Write object header.
-                unsafe {
-                    write_object_header(ptr, 0, size as u32);
-                }
-                return Ok(unsafe { ptr.add(OBJECT_HEADER_SIZE) });
+                let body_off = unsafe { write_object_header(ptr, 0, size as u32) };
+                return Ok(unsafe { ptr.add(body_off) });
             }
         }
 
@@ -475,14 +600,13 @@ impl HeapCollector {
             if body < heap_base || body >= heap_base + heap_size || body < OBJECT_HEADER_SIZE {
                 return;
             }
-            let header = body - OBJECT_HEADER_SIZE;
+            // CL-frame references point at object bodies; the header precedes the
+            // body. Objects reachable from a frame are inline-sized (offset 8).
+            let header = (body - OBJECT_HEADER_SIZE) as *const u8;
             // SAFETY: `body` is within the managed heap; its header precedes it.
-            let type_id = unsafe { *(header as *const u8) };
-            if type_id == FORWARDED_TYPE_ID {
-                // SAFETY: a forwarded object stores its new body pointer at the
-                // body address (offset 8 from the header).
-                let new_body = unsafe { *(body as *const usize) };
-                slot.0 = (new_body as u64) | tag;
+            if unsafe { header_is_forwarded(header) } {
+                let new_body = unsafe { header_forwarding_addr(header) } as u64;
+                slot.0 = new_body | tag;
             }
         };
         let mut relocate_from = |fp: *const crate::stack::Frame| {
@@ -549,8 +673,9 @@ impl HeapCollector {
     /// region) into the target region at index `target_idx`. Returns the new body
     /// pointer (past header) or None if the target region is full.
     ///
-    /// Also installs a forwarding pointer at the old location: sets type_id to
-    /// FORWARDED_TYPE_ID and writes the new body pointer at offset 8.
+    /// Also installs a forwarding pointer at the old location: sets the
+    /// FORWARDED gc-bit (preserving type_id and size) and writes the new body
+    /// pointer into the object's first payload word.
     fn copy_object(
         state: &mut HeapState,
         source_header: *mut u8,
@@ -578,17 +703,13 @@ impl HeapCollector {
         target.header.alloc_top = unsafe { new_header.add(total_size) };
         target.header.live_bytes += total_size as u32;
 
-        // Install forwarding pointer at old location:
-        // type_id = FORWARDED_TYPE_ID, and we store the new body ptr at offset 8.
+        // Install forwarding at the old location: set the FORWARDED gc-bit and
+        // store the new body pointer in the first payload word. type_id and size
+        // stay intact so the heap walker can stride over the stale copy. The
+        // minimum object is 16 bytes (header + one aligned word), so there is
+        // always room for the pointer.
         unsafe {
-            *source_header = FORWARDED_TYPE_ID;
-            // Ensure there's room for the forwarding pointer (need 16 bytes total).
-            // Since minimum allocation is OBJECT_HEADER_SIZE + body with 16-byte alignment,
-            // the minimum slot is 16 bytes, enough for header(8) + pointer(8).
-            if total_size >= OBJECT_HEADER_SIZE + std::mem::size_of::<usize>() {
-                let fwd_ptr_slot = source_header.add(OBJECT_HEADER_SIZE) as *mut *mut u8;
-                *fwd_ptr_slot = new_body;
-            }
+            header_set_forwarded(source_header, new_body);
         }
 
         Some(new_body)
@@ -652,7 +773,7 @@ impl Collector for HeapCollector {
                 }
 
                 // Skip already-forwarded objects.
-                if type_id == FORWARDED_TYPE_ID {
+                if unsafe { header_is_forwarded(header_ptr) } {
                     let total = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
                     cursor += total;
                     continue;
@@ -701,7 +822,7 @@ impl Collector for HeapCollector {
 
             // Phase 3: Run finalizers for dead (non-forwarded) objects before
             // zeroing the region. An object is dead if it was NOT forwarded
-            // (i.e., its type_id is not FORWARDED_TYPE_ID and it has a valid header).
+            // (i.e., the FORWARDED gc-bit is clear and it has a valid header).
             {
                 let base = state.regions[nursery_idx].base as usize;
                 let top = state.regions[nursery_idx].header.alloc_top as usize;
@@ -716,7 +837,7 @@ impl Collector for HeapCollector {
                         align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
                     // Finalizers observe every nursery object in the collection
                     // cycle before the region is reset.
-                    let body_ptr = unsafe { header_ptr.add(OBJECT_HEADER_SIZE) };
+                    let body_ptr = unsafe { header_ptr.add(body_offset(header_ptr)) };
                     let obj_val = BlissVal::from_raw(body_ptr as u64);
                     run_finalizers_for(obj_val);
                     fcursor += total_size;
@@ -838,7 +959,7 @@ impl Collector for HeapCollector {
                         }
                         let total_size =
                             align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
-                        if type_id != FORWARDED_TYPE_ID {
+                        if !unsafe { header_is_forwarded(header_ptr) } {
                             let body_addr = cursor + OBJECT_HEADER_SIZE;
                             object_index.insert(body_addr, (total_size, idx));
                         }
@@ -935,7 +1056,7 @@ impl Collector for HeapCollector {
                         }
                         let total_size =
                             align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
-                        if type_id != FORWARDED_TYPE_ID {
+                        if !unsafe { header_is_forwarded(header_ptr) } {
                             let body_addr = cursor + OBJECT_HEADER_SIZE;
                             if region.header.kind == RegionKind::LargeObject
                                 || marked.contains(&body_addr)
@@ -1018,7 +1139,7 @@ impl Collector for HeapCollector {
 
                 // Only copy non-forwarded, marked (live) objects.
                 let body_addr = cursor + OBJECT_HEADER_SIZE;
-                if type_id != FORWARDED_TYPE_ID && marked.contains(&body_addr) {
+                if !unsafe { header_is_forwarded(header_ptr) } && marked.contains(&body_addr) {
                     // Try to copy; if target fills up, find another.
                     if Self::copy_object(state, header_ptr, body_size, target_idx).is_none() {
                         if let Some(new_target) =
@@ -1683,22 +1804,21 @@ where
             }
 
             // Skip forwarded objects (they are stale copies).
-            if type_id == FORWARDED_TYPE_ID {
-                let total = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
-                cursor += total;
+            if unsafe { header_is_forwarded(header_ptr) } {
+                cursor += unsafe { header_total_bytes(header_ptr) };
                 continue;
             }
 
-            let obj_ptr = unsafe { header_ptr.add(OBJECT_HEADER_SIZE) };
-            let should_continue = callback(obj_ptr, type_id, body_size as usize);
+            // Report the exact logical body length (byte-exact for the image
+            // serializer), but stride by the true footprint.
+            let _ = body_size;
+            let exact = unsafe { header_exact_body_len(header_ptr) };
+            let obj_ptr = unsafe { header_ptr.add(body_offset(header_ptr)) };
+            let should_continue = callback(obj_ptr, type_id, exact);
             if !should_continue {
                 return Ok(());
             }
-
-            // Advance cursor past header + object body, aligned to 16 bytes.
-            let total = OBJECT_HEADER_SIZE + body_size as usize;
-            let aligned = align_up(total, OBJECT_ALIGNMENT);
-            cursor += aligned;
+            cursor += unsafe { header_total_bytes(header_ptr) };
         }
     }
 
@@ -1750,7 +1870,7 @@ fn append_serialized_object(
     type_id: u8,
     body: &[u8],
 ) -> Result<(), BlissError> {
-    let total_size = align_up(OBJECT_HEADER_SIZE + body.len(), OBJECT_ALIGNMENT);
+    let (total_size, _) = object_footprint(body.len());
     let region_limit = state.config.region_size / 2;
     let desired_kind = if total_size > region_limit {
         RegionKind::LargeObject
@@ -1786,17 +1906,13 @@ fn append_serialized_object(
     let region = &mut state.regions[idx];
     let header_ptr = region.header.alloc_top;
     unsafe {
-        write_object_header(header_ptr, type_id, body.len() as u32);
-        std::ptr::copy_nonoverlapping(
-            body.as_ptr(),
-            header_ptr.add(OBJECT_HEADER_SIZE),
-            body.len(),
-        );
-        if total_size > OBJECT_HEADER_SIZE + body.len() {
+        let body_off = write_object_header(header_ptr, type_id, body.len() as u32);
+        std::ptr::copy_nonoverlapping(body.as_ptr(), header_ptr.add(body_off), body.len());
+        if total_size > body_off + body.len() {
             std::ptr::write_bytes(
-                header_ptr.add(OBJECT_HEADER_SIZE + body.len()),
+                header_ptr.add(body_off + body.len()),
                 0,
-                total_size - OBJECT_HEADER_SIZE - body.len(),
+                total_size - body_off - body.len(),
             );
         }
     }
@@ -2066,4 +2182,89 @@ pub fn restore_gc_metadata(data: &[u8]) -> Result<(), BlissError> {
     state.stats.regions_total = read(12) as u32;
     state.stats.regions_free = read(13) as u32;
     Ok(())
+}
+
+// ── Object-header helper tests (bliss-jtc.19) ─────────────────────
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    /// An 8-byte-aligned scratch buffer big enough for a header + a few words.
+    fn scratch() -> Vec<u64> {
+        vec![0u64; 8]
+    }
+
+    #[test]
+    fn write_read_roundtrip_small_object() {
+        let mut buf = scratch();
+        let ptr = buf.as_mut_ptr() as *mut u8;
+        // Request a 13-byte body → footprint align_up(8+13,16) = 32, units = 4.
+        let body_off = unsafe { write_object_header(ptr, crate::object::type_id::RATIO, 13) };
+        assert_eq!(body_off, OBJECT_HEADER_SIZE, "small object body at offset 8");
+        assert!(!unsafe { header_is_free(ptr) });
+        assert!(!unsafe { header_is_forwarded(ptr) });
+        assert_eq!(unsafe { header_total_bytes(ptr) }, 32);
+        let (tid, body) = unsafe { read_object_header(ptr) };
+        assert_eq!(tid, crate::object::type_id::RATIO);
+        // Body is the aligned payload footprint (total 32 − header 8).
+        assert_eq!(body, 24);
+        // The exact logical body length is preserved for byte-exact serialization.
+        assert_eq!(unsafe { header_exact_body_len(ptr) }, 13);
+    }
+
+    #[test]
+    fn zeroed_slot_reads_as_free() {
+        let mut buf = scratch();
+        let ptr = buf.as_mut_ptr() as *mut u8;
+        assert!(unsafe { header_is_free(ptr) });
+        assert_eq!(unsafe { read_object_header(ptr) }, (0, 0));
+    }
+
+    #[test]
+    fn forwarding_preserves_type_size_and_records_address() {
+        let mut buf = scratch();
+        let ptr = buf.as_mut_ptr() as *mut u8;
+        unsafe { write_object_header(ptr, crate::object::type_id::STANDARD_OBJECT, 16) };
+        let total_before = unsafe { header_total_bytes(ptr) };
+        let new_body = 0xCAFE_0000usize as *mut u8;
+        unsafe { header_set_forwarded(ptr, new_body) };
+        assert!(unsafe { header_is_forwarded(ptr) });
+        assert_eq!(unsafe { header_forwarding_addr(ptr) }, new_body);
+        // type_id and size survive so the walker can still stride the stale copy.
+        let (tid, _) = unsafe { read_object_header(ptr) };
+        assert_eq!(tid, crate::object::type_id::STANDARD_OBJECT);
+        assert_eq!(unsafe { header_total_bytes(ptr) }, total_before);
+    }
+
+    #[test]
+    fn object_footprint_boundary() {
+        // Small: fits the inline size field.
+        let (total, large) = object_footprint(64);
+        assert!(!large);
+        assert_eq!(total, align_up(OBJECT_HEADER_SIZE + 64, OBJECT_ALIGNMENT));
+        // Large: footprint needs ≥ 0xFFFF 8-byte units → extension.
+        let big = (LARGE_SIZE_SENTINEL as usize) * 8; // 524_280 bytes body
+        let (total_l, large_l) = object_footprint(big);
+        assert!(large_l);
+        assert_eq!(
+            total_l,
+            align_up(LARGE_OBJECT_PAYLOAD_OFFSET + big, OBJECT_ALIGNMENT)
+        );
+    }
+
+    #[test]
+    fn large_object_header_uses_extension() {
+        let mut buf = scratch();
+        let ptr = buf.as_mut_ptr() as *mut u8;
+        let big = (LARGE_SIZE_SENTINEL as usize) * 8;
+        let body_off = unsafe { write_object_header(ptr, crate::object::type_id::SIMPLE_ARRAY, big as u32) };
+        assert_eq!(body_off, LARGE_OBJECT_PAYLOAD_OFFSET, "large object body at offset 16");
+        assert_eq!(unsafe { header_at(ptr) }.size_units(), LARGE_SIZE_SENTINEL);
+        // The true byte size is stored just after the header and read back.
+        let (expected_total, _) = object_footprint(big);
+        assert_eq!(unsafe { header_total_bytes(ptr) }, expected_total);
+        let (tid, _) = unsafe { read_object_header(ptr) };
+        assert_eq!(tid, crate::object::type_id::SIMPLE_ARRAY);
+    }
 }
