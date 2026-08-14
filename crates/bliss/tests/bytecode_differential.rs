@@ -143,6 +143,13 @@ const CORPUS: &[&str] = &[
     "(defun f () (block b (handler-bind ((error (lambda (c) (declare (ignore c)) (return-from b (quote via-handler))))) (car 5)))) (f)",
     "(defun f () (handler-bind ((error (lambda (c) c))) (+ 2 3))) (f)",
     "(define-condition my-c (condition) ()) (defun f () (block b (handler-bind ((my-c (lambda (c) (declare (ignore c)) (return-from b (quote sig-handled))))) (signal (quote my-c))))) (f)",
+    // ── RESTART-CASE on bytecode (nmq.7) ──
+    "(defun f () (restart-case (+ 1 2) (use-value (v) v))) (f)",
+    "(defun f () (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart (quote use-value) 99)))) (restart-case (error \"x\") (use-value (v) v)))) (f)",
+    "(defvar *g* 7) (defun f () (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart (quote r) 3)))) (restart-case (error \"x\") (r (v) (+ v *g*))))) (f)",
+    "(defun f (x) (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart (quote r) 3)))) (restart-case (error \"x\") (r (v) (+ v x))))) (f 10)",
+    "(defun f () (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart (quote continue))))) (restart-case (progn (error \"x\") 5) (continue () 42)))) (f)",
+    "(defun g (n) (if (< n 0) (error \"neg\") (* n 2))) (defun f () (handler-case (g -1) (error () (quote was-neg)))) (f)",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a

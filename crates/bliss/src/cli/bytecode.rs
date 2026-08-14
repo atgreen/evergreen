@@ -39,8 +39,9 @@ use bliss_rt::value::{BlissVal, NIL, T};
 use bliss_rt::{CodeInfo, Frame};
 
 use super::{
-    Env, HandlerCluster, HandlerEntry, HandlerImpl, apply_function, bliss_error_to_condition,
-    condition_matches_handler, cp, eval_form, handler_case_token, list_to_vec, next_control_token,
+    Env, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry, RestartFunction, apply_function,
+    arena_cons, bliss_error_to_condition, condition_matches_handler, cp, eval_form,
+    handler_case_token, list_to_vec, next_control_token, resolve_sym, restart_invoked_name,
     run_handler_bind_handlers, store_control_value, sym_name, tag_key, take_control_value,
     val_as_str,
 };
@@ -133,6 +134,16 @@ enum Instr {
     PushHandlerBind { hb: u32 },
     /// Normal completion of `HANDLER-BIND`: disestablish the cluster.
     PopHandlerBind,
+    /// Establish a `RESTART-CASE` (`rc` indexes the static restart table),
+    /// registered in `env.restarts` for INVOKE-RESTART. `resume_bcp` is where a
+    /// delivered restart result resumes.
+    PushRestartCase {
+        rc: u32,
+        resume_bcp: u32,
+        sp_restore: u16,
+    },
+    /// Normal completion of `RESTART-CASE`: disestablish the restarts.
+    PopRestartCase,
 }
 
 /// A lowered CL function: a linear bytecode plus its constant pool and frame
@@ -148,6 +159,8 @@ pub struct BytecodeFunction {
     handler_binds: Vec<HandlerBindInfo>,
     /// Interned block names (referenced by `PushBlock` for `env.block_stack`).
     names: Vec<String>,
+    /// Static per-`restart-case` tables (indexed by `PushRestartCase`).
+    restart_cases: Vec<RestartCaseInfo>,
     /// Number of lexical local slots (params + `let` bindings).
     n_locals: u16,
     /// Maximum operand-stack depth.
@@ -192,6 +205,15 @@ struct HandlerBindInfo {
     bindings: Vec<(String, BlissVal)>,
 }
 
+/// Static description of one `restart-case` form. Each restart's clause is a
+/// `(lambda params . body)` form run by the shared INVOKE-RESTART machinery
+/// (in `env.frame`); the bytecode only catches the restart-invoked transfer and
+/// delivers the stored result.
+#[derive(Debug, Clone)]
+struct RestartCaseInfo {
+    restarts: Vec<(String, BlissVal)>,
+}
+
 // ── Per-thread registry of compiled functions ─────────────────────
 
 thread_local! {
@@ -231,6 +253,9 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
     "NULL", "NOT", "EQ", "EQL", "EQUAL", "ZEROP", "PLUSP", "MINUSP", "ABS", "MIN", "MAX", "MOD",
     "REM", "CONSP", "ATOM", "LISTP", "EVENP", "ODDP", "GCD", "EXPT", "FLOOR", "CEILING", "TRUNCATE",
     "VALUES-LIST", "IDENTITY", "FIRST", "REST", "SECOND", "THIRD", "LENGTH", "APPEND", "REVERSE",
+    // Condition-signalling functions (ordinary functions, normal arg order) —
+    // reachable via apply_function, so safe to call from bytecode.
+    "ERROR", "SIGNAL", "WARN", "CERROR", "INVOKE-RESTART", "MAKE-CONDITION",
 ];
 
 /// Compiler state for lowering one function body.
@@ -263,6 +288,8 @@ struct Lowerer<'e> {
     handler_binds: Vec<HandlerBindInfo>,
     /// Interned block names.
     names: Vec<String>,
+    /// Static `restart-case` tables.
+    restart_cases: Vec<RestartCaseInfo>,
     env: &'e Env,
 }
 
@@ -290,6 +317,7 @@ impl<'e> Lowerer<'e> {
             handler_cases: Vec::new(),
             handler_binds: Vec::new(),
             names: Vec::new(),
+            restart_cases: Vec::new(),
             env,
         }
     }
@@ -433,6 +461,7 @@ impl<'e> Lowerer<'e> {
                 "UNWIND-PROTECT" => self.lower_unwind_protect(rest),
                 "HANDLER-CASE" => self.lower_handler_case(rest),
                 "HANDLER-BIND" => self.lower_handler_bind(rest),
+                "RESTART-CASE" => self.lower_restart_case(rest),
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
@@ -994,6 +1023,91 @@ impl<'e> Lowerer<'e> {
         self.emit(Instr::PopHandlerBind);
         Ok(())
     }
+
+    /// `(restart-case expr (name (params) body...)...)` — establish restarts,
+    /// run `expr`; an INVOKE-RESTART transfers the restart's result out.
+    ///
+    /// Restart clause bodies run via the shared INVOKE-RESTART machinery in
+    /// `env.frame` (the tree-walker's model), which cannot see this compiled
+    /// function's BlissStack locals. So we conservatively bail the whole form
+    /// if any clause body might reference an enclosing lexical local — those
+    /// restart-cases run correctly on the tree-walker instead.
+    fn lower_restart_case(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (restartable_form, clauses_form) = cp(rest);
+        let clauses = list_to_vec(clauses_form);
+
+        let enclosing_locals: std::collections::HashSet<String> = self
+            .scopes
+            .iter()
+            .flat_map(|s| s.keys().cloned())
+            .collect();
+
+        let lambda_sym = resolve_sym("LAMBDA").ok_or(Bail)?;
+        let mut restarts = Vec::new();
+        for clause in &clauses {
+            let (name_form, clause_rest) = cp(*clause);
+            if !name_form.is_symbol() {
+                return Err(Bail);
+            }
+            let name = sym_name(name_form).to_uppercase();
+            let (params_form, body) = cp(clause_rest);
+
+            // Conservative check: clause body must reference only its own params
+            // and globals, never an enclosing compiled local.
+            let params: std::collections::HashSet<String> = list_to_vec(params_form)
+                .iter()
+                .filter(|p| p.is_symbol())
+                .map(|p| sym_name(*p))
+                .filter(|n| !n.starts_with('&'))
+                .collect();
+            let mut used = std::collections::HashSet::new();
+            collect_symbol_names(body, &mut used);
+            if used
+                .iter()
+                .any(|u| enclosing_locals.contains(u) && !params.contains(u))
+            {
+                return Err(Bail);
+            }
+
+            let lambda_form = arena_cons(lambda_sym, arena_cons(params_form, body));
+            restarts.push((name, lambda_form));
+        }
+
+        let rc = self.restart_cases.len() as u32;
+        self.restart_cases.push(RestartCaseInfo { restarts });
+        let sp_restore = self.cur_stack;
+        self.emit(Instr::PushRestartCase {
+            rc,
+            resume_bcp: 0,
+            sp_restore,
+        });
+        let push_at = self.code.len() - 1;
+        self.lower_expr(restartable_form)?; // restartable value (+1)
+        self.emit(Instr::PopRestartCase);
+        let after = self.code.len() as u32;
+        if let Instr::PushRestartCase { resume_bcp, .. } = &mut self.code[push_at] {
+            *resume_bcp = after;
+        }
+        // Net +1 (the restartable form's value, or a delivered restart result).
+        Ok(())
+    }
+}
+
+/// Collect the names of all symbols appearing in `form` (recursively), except
+/// inside `quote`. Used for a conservative free-variable over-approximation.
+fn collect_symbol_names(form: BlissVal, out: &mut std::collections::HashSet<String>) {
+    if form.is_symbol() {
+        out.insert(sym_name(form));
+        return;
+    }
+    if form.is_cons() {
+        let (car, cdr) = cp(form);
+        if car.is_symbol() && sym_name(car) == "QUOTE" {
+            return;
+        }
+        collect_symbol_names(car, out);
+        collect_symbol_names(cdr, out);
+    }
 }
 
 /// Extract `(name init)` from a `let` binding, which may also be a bare symbol.
@@ -1061,7 +1175,6 @@ fn is_bail_special(name: &str) -> bool {
             | "PROG"
             | "PROG*"
             | "DESTRUCTURING-BIND"
-            | "RESTART-CASE"
             | "RESTART-BIND"
             | "IGNORE-ERRORS"
             | "WITH-OPEN-FILE"
@@ -1120,6 +1233,7 @@ fn compile_function(
         handler_cases: lo.handler_cases,
         handler_binds: lo.handler_binds,
         names: lo.names,
+        restart_cases: lo.restart_cases,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
         arity: param_names.len() as u16,
@@ -1160,6 +1274,7 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
         handler_cases: lo.handler_cases,
         handler_binds: lo.handler_binds,
         names: lo.names,
+        restart_cases: lo.restart_cases,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
         arity: 0,
@@ -1199,6 +1314,13 @@ enum Handler {
     /// `HANDLER-BIND`: handlers already registered in `env.handlers`. On a raw
     /// structured error unwinding through here, the handlers get their turn.
     HandlerBind { cluster_base: usize },
+    /// `RESTART-CASE`: restarts registered in `env.restarts`. A restart-invoked
+    /// transfer unwinding through here delivers the stored result.
+    RestartCase {
+        restart_base: usize,
+        resume_bcp: u32,
+        sp_restore: u16,
+    },
 }
 
 /// A live `handler-case` clause: its control token (shared with `env.handlers`),
@@ -1456,6 +1578,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                             Handler::Block { token, .. } => {
                                 env.block_stack.retain(|(_, t)| *t != token);
                             }
+                            Handler::HandlerCase { cluster_base, .. }
+                            | Handler::HandlerBind { cluster_base } => {
+                                env.handlers.truncate(cluster_base);
+                            }
+                            Handler::RestartCase { restart_base, .. } => {
+                                env.restarts.truncate(restart_base);
+                            }
                             _ => {}
                         }
                     }
@@ -1660,6 +1789,38 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     env.handlers.truncate(cluster_base);
                 }
             }
+            Instr::PushRestartCase {
+                rc,
+                resume_bcp,
+                sp_restore,
+            } => {
+                let info = acts[top_idx].func.restart_cases[rc as usize].clone();
+                let restart_base = env.restarts.len();
+                for (name, lambda_form) in &info.restarts {
+                    env.restarts.push(RestartEntry {
+                        name: name.clone(),
+                        function: RestartFunction::FunctionForm {
+                            function_form: *lambda_form,
+                            captured_frame: Rc::clone(&env.frame),
+                        },
+                        interactive_function: None,
+                        test_function: None,
+                        unwind_on_invoke: true,
+                    });
+                }
+                acts[top_idx].handlers.push(Handler::RestartCase {
+                    restart_base,
+                    resume_bcp,
+                    sp_restore,
+                });
+            }
+            Instr::PopRestartCase => {
+                if let Some(Handler::RestartCase { restart_base, .. }) =
+                    acts[top_idx].handlers.pop()
+                {
+                    env.restarts.truncate(restart_base);
+                }
+            }
         }
     }
 }
@@ -1810,6 +1971,29 @@ fn initiate_unwind(
                 }
                 env.handlers.truncate(cluster_base);
                 // Keep unwinding with the (possibly transferred) pending.
+            }
+            Some(Handler::RestartCase {
+                restart_base,
+                resume_bcp,
+                sp_restore,
+            }) => {
+                acts[top].handlers.pop();
+                env.restarts.truncate(restart_base);
+                // A restart invoked (by a handler) unwinds here carrying its
+                // stored result — mirror eval_restart_case.
+                let delivered = match &pending {
+                    Pending::Propagate(error) => restart_invoked_name(error)
+                        .map(|name| take_control_value(&format!("RESTART-RESULT:{name}"))),
+                    _ => None,
+                };
+                if let Some(v) = delivered {
+                    let act = &mut acts[top];
+                    act.sp_top = sp_restore;
+                    act.bcp = resume_bcp as usize;
+                    act.push_op(v);
+                    return Ok(());
+                }
+                // Not a restart transfer — keep unwinding.
             }
             None => {
                 // No handler here — this activation is fully unwound.
