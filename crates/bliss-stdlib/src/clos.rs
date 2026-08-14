@@ -1162,26 +1162,34 @@ pub fn make_generic_function(
     })
 }
 
-/// Add a method to a generic function.
+/// Add a method to a generic function. Upserts the tracking entry if the
+/// function is not already registered here: the interpreter's live dispatch uses
+/// its own method table (cli.rs env.methods), so this map only tracks methods,
+/// and a generic function reaching add-method without a prior make_generic_function
+/// entry (e.g. one restored from an image) must not be an error (bliss-lb6).
 pub fn add_method(generic_function: BlissVal, method: BlissVal) -> Result<(), BlissError> {
     with_state_mut(|st| {
-        let gf = st
-            .generic_functions
-            .get_mut(&generic_function)
-            .ok_or_else(|| BlissError::Internal("not a generic function".into()))?;
-        gf.methods.push(method);
+        st.generic_functions
+            .entry(generic_function)
+            .or_insert_with(|| GFData {
+                name: NIL,
+                lambda_list: NIL,
+                methods: Vec::new(),
+            })
+            .methods
+            .push(method);
         Ok(())
     })
 }
 
-/// Remove a method from a generic function.
+/// Remove a method from a generic function. A no-op if the function is not
+/// tracked here (removing a method that is not present is harmless) — used by
+/// ASDF's upgrade machinery (bliss-lb6).
 pub fn remove_method(generic_function: BlissVal, method: BlissVal) -> Result<(), BlissError> {
     with_state_mut(|st| {
-        let gf = st
-            .generic_functions
-            .get_mut(&generic_function)
-            .ok_or_else(|| BlissError::Internal("not a generic function".into()))?;
-        gf.methods.retain(|m| *m != method);
+        if let Some(gf) = st.generic_functions.get_mut(&generic_function) {
+            gf.methods.retain(|m| *m != method);
+        }
         Ok(())
     })
 }
