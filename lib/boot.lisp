@@ -1668,3 +1668,33 @@
 (defun machine-instance () "localhost")
 (defun software-type () "Linux")
 (defun software-version () "1.0")
+
+;;; ---------------------------------------------------------------------------
+;;; PARSE-INTEGER (bliss-lb6). Parses an integer from a (sub)string with an
+;;; optional sign, honouring :start/:end/:radix/:junk-allowed, returning
+;;; (values integer position). UIOP parses version strings with it.
+;;; ---------------------------------------------------------------------------
+
+(defun parse-integer (string &key (start 0) end (radix 10) junk-allowed)
+  (let ((end (or end (length string)))
+        (i start)
+        (sign 1)
+        (any nil)
+        (value 0))
+    (flet ((ws-p (c) (member c '(#\Space #\Tab #\Newline #\Return #\Page))))
+      (loop while (and (< i end) (ws-p (char string i))) do (incf i))
+      (when (< i end)
+        (let ((c (char string i)))
+          (cond ((eql c #\+) (incf i))
+                ((eql c #\-) (setf sign -1) (incf i)))))
+      (block digits
+        (loop while (< i end) do
+          (let ((d (digit-char-p (char string i) radix)))
+            (if d
+                (progn (setf value (+ (* value radix) d)) (setf any t) (incf i))
+                (return-from digits)))))
+      (loop while (and (< i end) (ws-p (char string i))) do (incf i))
+      (cond
+        (junk-allowed (values (if any (* sign value) nil) i))
+        ((and any (>= i end)) (values (* sign value) i))
+        (t (error "PARSE-INTEGER: not an integer: ~s" (subseq string start end)))))))
