@@ -268,6 +268,34 @@ fn ensure_builtin_condition_classes() -> Result<(), BlissError> {
     Ok(())
 }
 
+/// Number of preallocated STORAGE-CONDITION pool instances.
+pub fn storage_condition_pool_size() -> usize {
+    STORAGE_CONDITION_POOL_SIZE
+}
+
+/// Install a caller-built STORAGE-CONDITION pool, replacing any instances the
+/// stdlib preallocated (bliss-5mf). The interpreter uses this to seed the pool
+/// with CLI-native condition instances — whose class is the one the CLI's
+/// condition matcher / TYPE-OF recognize — after its condition classes are live,
+/// while still keeping the acquire path allocation-free. Instances should be
+/// pinned in the GC heap by the caller (D5.13). Requires exactly
+/// `storage_condition_pool_size()` instances.
+pub fn set_storage_condition_pool(instances: &[BlissVal]) -> Result<(), BlissError> {
+    if instances.len() != STORAGE_CONDITION_POOL_SIZE {
+        return Err(BlissError::Internal(format!(
+            "STORAGE-CONDITION pool needs {STORAGE_CONDITION_POOL_SIZE} instances, got {}",
+            instances.len()
+        )));
+    }
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        state.storage_condition_pool[..].copy_from_slice(instances);
+        state.next_storage_condition = 0;
+        state.storage_condition_pool_initialized = true;
+    });
+    Ok(())
+}
+
 fn initialize_storage_condition_pool() -> Result<(), BlissError> {
     ensure_builtin_condition_classes()?;
     let class = ensure_condition_class(SYMBOL_STORAGE_CONDITION)?;

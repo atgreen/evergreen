@@ -846,6 +846,20 @@ fn build_condition_instance(
     type_name: &str,
     initarg_pairs: &[BlissVal],
 ) -> Result<BlissVal, BlissError> {
+    build_condition_instance_impl(env, type_name, initarg_pairs, false)
+}
+
+/// Build a condition instance of `type_name` with the given initargs. When
+/// `pinned_gc` is set the instance is allocated in the GC heap and pinned — used
+/// to seed the immortal STORAGE-CONDITION pool with instances whose class the CLI
+/// recognizes (bliss-4v8 + bliss-5mf); otherwise it is a normal std::alloc CLOS
+/// instance like every other condition the interpreter builds.
+fn build_condition_instance_impl(
+    env: &mut Env,
+    type_name: &str,
+    initarg_pairs: &[BlissVal],
+    pinned_gc: bool,
+) -> Result<BlissVal, BlissError> {
     let class = ensure_condition_class_registered(env, type_name)?;
     let slot_specs = condition_slot_specs(env, type_name);
     let mut initargs = Vec::new();
@@ -877,7 +891,15 @@ fn build_condition_instance(
             initargs.push(default_value);
         }
     }
-    let instance = bliss_stdlib::make_instance(class, &initargs)?;
+    let instance = if pinned_gc {
+        // GC-heap + pinned so the pooled instance is immortal and non-moving
+        // (D5.13), while still carrying the CLI-recognized condition class.
+        let inst = bliss_stdlib::clos::allocate_instance_pinned_gc(class)?;
+        bliss_stdlib::clos::initialize_instance(inst, &initargs)?;
+        inst
+    } else {
+        bliss_stdlib::make_instance(class, &initargs)?
+    };
     let explicit_slots: Vec<String> = initargs
         .chunks_exact(2)
         .map(|pair| symbol_bare_name(&sym_name(pair[0])))
@@ -1860,6 +1882,30 @@ impl Env {
         env.define_local("*CONDITION-TYPES*", NIL);
         env.define_local("*CONDITION-DEFINITIONS*", NIL);
         env.define_local("*BREAK-ON-SIGNALS*", NIL);
+
+        // bliss-5mf: reseed the STORAGE-CONDITION pool with CLI-native instances
+        // whose class the CLI's condition matcher and TYPE-OF recognize (the
+        // stdlib preallocated them under its own hardcoded condition-symbol class,
+        // which the CLI reads back as a different symbol). They stay pinned in the
+        // GC heap and immortal (D5.13). Runs after the env is functional and
+        // before any user code; best-effort — a failure leaves the stdlib pool.
+        {
+            let n = bliss_stdlib::conditions::storage_condition_pool_size();
+            let mut pool = Vec::with_capacity(n);
+            let mut ok = true;
+            for _ in 0..n {
+                match build_condition_instance_impl(&mut env, "STORAGE-CONDITION", &[], true) {
+                    Ok(inst) => pool.push(inst),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                let _ = bliss_stdlib::conditions::set_storage_condition_pool(&pool);
+            }
+        }
         env
     }
 
@@ -11294,5 +11340,61 @@ mod jtc5_numeric_tests {
         );
         assert_eq!(read_eval_all("(eq 1/3 1/3)").unwrap(), NIL);
         assert_eq!(read_eval_all("(= (/ 1 2) (/ 2 4))").unwrap(), T);
+    }
+}
+
+#[cfg(test)]
+mod jtc5mf_storage_condition_pool_tests {
+    use super::*;
+
+    /// bliss-5mf: after Env::new reseeds the STORAGE-CONDITION pool with
+    /// CLI-native instances, a preallocated pool condition carries the *same*
+    /// condition class the CLI builds for `(make-condition 'storage-condition)`.
+    /// Because TYPE-OF and HANDLER-CASE type matching both derive from that
+    /// class, the pooled instance is recognized identically — it reports
+    /// STORAGE-CONDITION and is caught by (storage-condition ...) / (condition
+    /// ...) handler clauses, rather than the stdlib's differently-symboled class
+    /// that the CLI reader would read back as an unrelated name.
+    #[test]
+    fn pooled_storage_condition_shares_the_cli_condition_class() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Env::new reseeds the thread-local pool with CLI-native instances.
+        let mut env = Env::new(false);
+
+        let pooled = bliss_stdlib::acquire_preallocated_storage_condition()
+            .expect("pool must yield a preallocated STORAGE-CONDITION");
+        let built = build_condition_instance(&mut env, "STORAGE-CONDITION", &[])
+            .expect("CLI must build a STORAGE-CONDITION");
+
+        assert_eq!(
+            bliss_stdlib::clos::class_of(pooled),
+            bliss_stdlib::clos::class_of(built),
+            "pooled STORAGE-CONDITION must share the CLI-recognized condition class"
+        );
+    }
+
+    /// The reseeded pool instances survive a GC (they are pinned + immortal),
+    /// and re-acquire keeps returning class-correct instances.
+    #[test]
+    fn pooled_storage_condition_survives_gc_and_stays_recognized() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        let expected_class = bliss_stdlib::clos::class_of(
+            build_condition_instance(&mut env, "STORAGE-CONDITION", &[]).expect("build"),
+        );
+
+        // Churn the heap and force collection; pinned pool instances must persist.
+        for _ in 0..64 {
+            let _ = read_eval_all_env("(list 1 2 3 4 5)", &mut env);
+        }
+        let _ = bliss_rt::gc::full_gc();
+
+        let pooled = bliss_stdlib::acquire_preallocated_storage_condition()
+            .expect("pool must survive GC");
+        assert_eq!(
+            bliss_stdlib::clos::class_of(pooled),
+            expected_class,
+            "pooled STORAGE-CONDITION must remain CLI-recognized after GC"
+        );
     }
 }
