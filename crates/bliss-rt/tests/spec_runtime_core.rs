@@ -446,6 +446,25 @@ fn green_threads_run_user_functions_through_the_worker_pool() {
 }
 
 #[test]
+fn many_green_threads_complete_via_work_stealing() {
+    let _guard = lock_serial();
+    // Far more tasks than workers forces the per-worker deques to fill unevenly
+    // and idle workers to steal (bliss-jtc.14.1); every task must still complete.
+    let entry =
+        unsafe { BlissVal::from_function_ptr(green_thread_returns_seven as *const () as *mut u8) };
+    let ids: Vec<_> = (0..200).map(|_| make_thread(entry).unwrap()).collect();
+    let results: Vec<_> = ids
+        .into_iter()
+        .map(|id| join_thread(id).unwrap().as_fixnum())
+        .collect();
+    assert_eq!(results.len(), 200);
+    assert!(
+        results.iter().all(|&r| r == 7),
+        "every local or stolen task must run to completion"
+    );
+}
+
+#[test]
 fn green_threads_have_distinct_cl_stacks_from_each_other_and_from_the_caller() {
     let _guard = lock_serial();
     // Per R2.05, each green thread maintains its own CL stack.

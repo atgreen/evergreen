@@ -8,7 +8,7 @@ use crate::value::{BlissVal, NIL};
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// Unique identifier for a green thread.
@@ -240,77 +240,115 @@ struct WorkerTask {
     result_cell: Arc<ThreadResult>,
 }
 
-/// The global worker pool that multiplexes green threads onto OS worker threads.
+/// One native worker's run queue: a work-stealing deque (bliss-jtc.14.1). The
+/// owning worker pushes/pops at the **back** (LIFO — good locality and depth-
+/// first evaluation); other idle workers steal from the **front** (FIFO — the
+/// oldest, most likely independent work). Each deque has its own lock, so normal
+/// scheduling never contends on a single global run-queue mutex (spec §2.3/§13).
+struct Worker {
+    local: Mutex<VecDeque<WorkerTask>>,
+}
+
+thread_local! {
+    /// The pool-worker index of this OS thread, if it is a pool worker. Lets a
+    /// worker submit follow-on work to its own deque for locality.
+    static WORKER_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The global worker pool that multiplexes green threads onto OS worker threads
+/// via per-worker work-stealing deques.
 struct WorkerPool {
-    /// Shared task queue (work-stealing deque, simplified as a shared queue).
-    queue: Mutex<VecDeque<WorkerTask>>,
-    /// Condvar to wake idle workers when a new task is submitted.
-    task_available: Condvar,
+    workers: Vec<Worker>,
+    /// Parking coordination for idle workers (separate from the run queues).
+    park_mutex: Mutex<()>,
+    park_cv: Condvar,
     /// Flag to signal shutdown to workers.
     shutdown: AtomicBool,
-    /// Whether the pool has been initialized.
+    /// Whether the pool's OS threads have been spawned.
     initialized: AtomicBool,
+    /// Round-robin cursor for submissions from non-worker (external) threads.
+    next: AtomicUsize,
 }
 
 impl WorkerPool {
     fn new() -> Self {
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 64);
+        let workers = (0..num_workers)
+            .map(|_| Worker {
+                local: Mutex::new(VecDeque::new()),
+            })
+            .collect();
         WorkerPool {
-            queue: Mutex::new(VecDeque::new()),
-            task_available: Condvar::new(),
+            workers,
+            park_mutex: Mutex::new(()),
+            park_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
+            next: AtomicUsize::new(0),
         }
     }
 
-    /// Ensure the worker pool OS threads are running.
+    /// Ensure the worker pool OS threads are running (one per deque).
     fn ensure_initialized(&self) {
         if self.initialized.load(Ordering::Acquire) {
             return;
         }
-        // Use compare_exchange to ensure only one thread initializes.
         if self
             .initialized
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            // Spawn OS worker threads. Use available parallelism, capped
-            // to a reasonable number, to implement the M:N model.
-            let num_workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .clamp(2, 64);
-            for i in 0..num_workers {
+            for i in 0..self.workers.len() {
                 std::thread::Builder::new()
-                    .name(format!("bliss-worker-{}", i))
-                    .spawn(move || {
-                        worker_loop();
-                    })
+                    .name(format!("bliss-worker-{i}"))
+                    .spawn(move || worker_loop(i))
                     .expect("failed to spawn worker thread");
             }
         }
     }
 
-    /// Submit a green thread task to the pool.
+    /// Submit a green thread task. A worker submits to its own deque (locality);
+    /// an external thread round-robins across workers. Wakes one parked worker.
     fn submit(&self, task: WorkerTask) {
         self.ensure_initialized();
-        let mut queue = self.queue.lock().unwrap();
-        queue.push_back(task);
-        self.task_available.notify_one();
+        let idx = WORKER_INDEX
+            .with(|w| w.get())
+            .filter(|&i| i < self.workers.len())
+            .unwrap_or_else(|| self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len());
+        self.workers[idx].local.lock().unwrap().push_back(task);
+        self.park_cv.notify_one();
     }
 
-    /// Take the next task from the queue, blocking until one is available
-    /// or shutdown is signaled. Returns None on shutdown.
-    fn take_task(&self) -> Option<WorkerTask> {
-        let mut queue = self.queue.lock().unwrap();
-        loop {
-            if self.shutdown.load(Ordering::Acquire) {
-                return None;
-            }
-            if let Some(task) = queue.pop_front() {
-                return Some(task);
-            }
-            queue = self.task_available.wait(queue).unwrap();
+    /// Pop this worker's own task (LIFO), else steal one (FIFO) from another
+    /// worker's deque. Returns `None` only when every deque is empty.
+    fn pop_or_steal(&self, idx: usize) -> Option<WorkerTask> {
+        if let Some(t) = self.workers[idx].local.lock().unwrap().pop_back() {
+            return Some(t);
         }
+        let n = self.workers.len();
+        for k in 1..n {
+            let victim = (idx + k) % n;
+            if let Some(t) = self.workers[victim].local.lock().unwrap().pop_front() {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    fn any_work(&self) -> bool {
+        self.workers
+            .iter()
+            .any(|w| !w.local.lock().unwrap().is_empty())
+    }
+
+    /// Signal all workers to exit at their next scheduling point.
+    #[allow(dead_code)]
+    fn shutdown_now(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.park_cv.notify_all();
     }
 }
 
@@ -320,27 +358,51 @@ fn worker_pool() -> &'static WorkerPool {
     POOL.get_or_init(WorkerPool::new)
 }
 
-/// The main loop executed by each OS worker thread. Workers pull green
-/// thread tasks from the shared queue and execute them sequentially.
-fn worker_loop() {
+/// The main loop executed by each OS worker thread: run local work LIFO, steal
+/// FIFO when idle, and park when every deque is empty (bliss-jtc.14.1).
+fn worker_loop(idx: usize) {
+    WORKER_INDEX.with(|w| w.set(Some(idx)));
     let pool = worker_pool();
-    while let Some(task) = pool.take_task() {
-        // Execute the green thread's entry.
-        task.thread.set_state(ThreadState::Runnable);
-        let thread = Arc::clone(&task.thread);
-        ACTIVE_GREEN_THREAD.with(|slot| {
-            *slot.borrow_mut() = Some(Arc::clone(&thread));
-        });
-
-        let result = run_green_thread_entry(&thread);
-
-        ACTIVE_GREEN_THREAD.with(|slot| {
-            *slot.borrow_mut() = None;
-        });
-
-        task.thread.set_state(ThreadState::Dead);
-        task.result_cell.complete(result);
+    loop {
+        if pool.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(task) = pool.pop_or_steal(idx) {
+            run_worker_task(task);
+            continue;
+        }
+        // Nothing runnable: park until woken by a submission or a short timeout.
+        // The timeout bounds any wakeup lost in the window between the empty scan
+        // above and the wait below, so a worker can never sleep through work.
+        let guard = pool.park_mutex.lock().unwrap();
+        if pool.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        if pool.any_work() {
+            continue;
+        }
+        let _ = pool
+            .park_cv
+            .wait_timeout(guard, std::time::Duration::from_millis(5));
     }
+}
+
+/// Run one green thread to completion on the current worker.
+fn run_worker_task(task: WorkerTask) {
+    task.thread.set_state(ThreadState::Runnable);
+    let thread = Arc::clone(&task.thread);
+    ACTIVE_GREEN_THREAD.with(|slot| {
+        *slot.borrow_mut() = Some(Arc::clone(&thread));
+    });
+
+    let result = run_green_thread_entry(&thread);
+
+    ACTIVE_GREEN_THREAD.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+
+    task.thread.set_state(ThreadState::Dead);
+    task.result_cell.complete(result);
 }
 
 fn run_green_thread_entry(thread: &GreenThread) -> Result<BlissVal, BlissError> {
