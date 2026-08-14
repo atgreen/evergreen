@@ -89,6 +89,10 @@ enum Instr {
     /// Pop the primary; push a fresh list of the current multiple values
     /// (`MULTIPLE-VALUE-LIST`).
     ValuesToList,
+    /// Evaluate a constant form via the tree-walker and push the result. Used
+    /// for non-capturing `(lambda …)` / `(function …)`: the resulting closure
+    /// is callable by both backends (`funcall`/`apply`/`mapcar` go host).
+    EvalHost(u16),
     /// Discard the top of the operand stack.
     Pop,
     /// Unconditional jump: set the bytecode pointer to `target`.
@@ -268,6 +272,10 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
     // Condition-signalling functions (ordinary functions, normal arg order) —
     // reachable via apply_function, so safe to call from bytecode.
     "ERROR", "SIGNAL", "WARN", "CERROR", "INVOKE-RESTART", "MAKE-CONDITION",
+    // Higher-order application functions (apply a closure/function value).
+    "FUNCALL", "APPLY", "MAPCAR", "MAPC", "MAPCAN", "MAPCON", "MAPLIST", "REDUCE", "REMOVE-IF",
+    "REMOVE-IF-NOT", "FIND-IF", "POSITION-IF", "COUNT-IF", "SOME", "EVERY", "NOTANY", "NOTEVERY",
+    "SORT", "STABLE-SORT",
 ];
 
 /// Compiler state for lowering one function body.
@@ -477,6 +485,8 @@ impl<'e> Lowerer<'e> {
                 "VALUES" => self.lower_values(rest),
                 "MULTIPLE-VALUE-BIND" => self.lower_mvb(rest),
                 "MULTIPLE-VALUE-LIST" => self.lower_mvlist(rest),
+                "LAMBDA" => self.lower_lambda(op, rest),
+                "FUNCTION" => self.lower_function(rest),
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
@@ -1171,6 +1181,69 @@ impl<'e> Lowerer<'e> {
         self.emit(Instr::ValuesToList); // pop primary, push list
         Ok(())
     }
+
+    // ── Closures (nmq.5) ───────────────────────────────────────────
+
+    /// Would a `(lambda params body)` capture an enclosing compiled local?
+    /// Conservative over-approximation: any free symbol of the body (minus the
+    /// lambda's own params) that names an enclosing lexical local.
+    fn lambda_captures_local(&self, params_form: BlissVal, body: BlissVal) -> bool {
+        let params: std::collections::HashSet<String> = list_to_vec(params_form)
+            .iter()
+            .filter(|p| p.is_symbol())
+            .map(|p| sym_name(*p))
+            .filter(|n| !n.starts_with('&'))
+            .collect();
+        let mut used = std::collections::HashSet::new();
+        for f in list_to_vec(body) {
+            collect_symbol_names(f, &mut used);
+        }
+        let enclosing: std::collections::HashSet<&String> =
+            self.scopes.iter().flat_map(|s| s.keys()).collect();
+        used.iter()
+            .any(|u| !params.contains(u) && enclosing.contains(u))
+    }
+
+    /// `(lambda params body...)` — compile a non-capturing lambda to a closure
+    /// value built by the tree-walker (capturing the global frame); a lambda
+    /// that captures an enclosing compiled local bails (its enclosing function
+    /// runs on the tree-walker, where capture works).
+    fn lower_lambda(&mut self, op: BlissVal, rest: BlissVal) -> LowerResult<()> {
+        let (params_form, body) = cp(rest);
+        if self.lambda_captures_local(params_form, body) {
+            return Err(Bail);
+        }
+        let form = arena_cons(op, rest);
+        let c = self.add_const(form);
+        self.emit(Instr::EvalHost(c));
+        self.push_n(1);
+        Ok(())
+    }
+
+    /// `(function name)` / `#'(lambda …)` — a function designator or a
+    /// non-capturing lambda closure value.
+    fn lower_function(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (target, _) = cp(rest);
+        if target.is_cons() {
+            let (t_op, t_rest) = cp(target);
+            if t_op.is_symbol() && sym_name(t_op) == "LAMBDA" {
+                let (params_form, body) = cp(t_rest);
+                if self.lambda_captures_local(params_form, body) {
+                    return Err(Bail);
+                }
+            } else {
+                return Err(Bail);
+            }
+        } else if !target.is_symbol() {
+            return Err(Bail);
+        }
+        let function_sym = resolve_sym("FUNCTION").ok_or(Bail)?;
+        let form = arena_cons(function_sym, rest);
+        let c = self.add_const(form);
+        self.emit(Instr::EvalHost(c));
+        self.push_n(1);
+        Ok(())
+    }
 }
 
 /// Collect the names of all symbols appearing in `form` (recursively), except
@@ -1213,9 +1286,7 @@ fn binding_name_init(b: BlissVal) -> LowerResult<(String, BlissVal)> {
 fn is_bail_special(name: &str) -> bool {
     matches!(
         name,
-        "FUNCTION"
-            | "LAMBDA"
-            | "SETQ"
+        "SETQ"
             | "SETF"
             | "DEFUN"
             | "DEFMACRO"
@@ -1265,8 +1336,6 @@ fn is_bail_special(name: &str) -> bool {
             | "IN-PACKAGE"
             | "DEFINE-SYMBOL-MACRO"
             | "DEFINE-COMPILER-MACRO"
-            | "APPLY"
-            | "FUNCALL"
             | "EVAL"
     )
 }
@@ -1608,6 +1677,16 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     vec![primary]
                 };
                 act.push_op(vec_to_list(&vals));
+            }
+            Instr::EvalHost(idx) => {
+                let form = acts[top_idx].func.constants[idx as usize];
+                match eval_form(form, env) {
+                    Ok(v) => acts[top_idx].push_op(v),
+                    Err(e) => {
+                        let pending = error_to_pending(e, env);
+                        initiate_unwind(acts, stack, env, pending)?;
+                    }
+                }
             }
             Instr::Pop => {
                 acts[top_idx].pop_op();

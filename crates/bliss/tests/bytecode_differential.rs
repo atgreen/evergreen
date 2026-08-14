@@ -166,6 +166,17 @@ const CORPUS: &[&str] = &[
     "(multiple-value-bind (q r) (floor 17 5) (list q r))",
     "(multiple-value-bind (a b) (values 1 2) (multiple-value-bind (c d) (values 3 4) (list a b c d)))",
     "(multiple-value-bind (a b) (if t (values 1 2) 0) (list a b))",
+    // ── Non-capturing closures / higher-order on bytecode (nmq.5) ──
+    "(funcall (function +) 3 4)",
+    "(funcall (lambda (x) (* x x)) 6)",
+    "(mapcar (lambda (x) (* x 2)) (list 1 2 3))",
+    "(mapcar (function 1+) (list 10 20))",
+    "(apply (function +) (list 1 2 3 4))",
+    "(reduce (function +) (list 1 2 3 4 5))",
+    "(defun compose2 (f g x) (funcall f (funcall g x))) (compose2 (function 1+) (function 1+) 5)",
+    "(remove-if (lambda (x) (> x 3)) (list 1 2 3 4 5))",
+    // Capturing lambda bails to the tree-walker (still correct).
+    "(defun adder (n) (lambda (x) (+ x n))) (funcall (adder 10) 5)",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a
