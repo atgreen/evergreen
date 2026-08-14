@@ -625,10 +625,21 @@ pub fn parse_namestring(
         });
     }
 
-    let s = lookup_string(thing).ok_or_else(|| BlissError::TypeError {
-        datum: thing,
-        expected: "registered string".to_string(),
-    })?;
+    // Accept both registry-backed string sentinels and ordinary heap strings
+    // (SIMPLE_BASE_STRING) — e.g. a namestring passed through a function call or
+    // built by FORMAT, which is not in the pathname string registry (bliss-lb6).
+    let s = lookup_string(thing)
+        .or_else(|| {
+            if thing.is_string() {
+                Some(thing.as_string())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| BlissError::TypeError {
+            datum: thing,
+            expected: "string or pathname".to_string(),
+        })?;
     let parsed = parse_namestring_model(&s, host)?;
     let position = s.len();
     let pn = make_record_value(build_record_from_namestring(parsed, host));

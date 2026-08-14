@@ -1627,3 +1627,30 @@
 (defmethod gray-stream-element-type ((stream fundamental-character-stream)) 'character)
 (defmethod gray-stream-element-type ((stream fundamental-binary-stream)) '(unsigned-byte 8))
 (defmethod gray-close ((stream fundamental-stream)) t)
+
+;;; ---------------------------------------------------------------------------
+;;; Pathname namestring helpers (bliss-lb6). These are standard CL functions
+;;; that UIOP/ASDF relies on the host to provide (UIOP only defines them for a
+;;; few odd Lisps). Built on the wired pathname-component accessors.
+;;; ---------------------------------------------------------------------------
+
+(defun file-namestring (p)
+  "The name, type, and version portion of pathname P as a string."
+  (let ((p (pathname p)))
+    (format nil "~@[~a~]~@[.~a~]" (pathname-name p) (pathname-type p))))
+
+(defun directory-namestring (p)
+  "The directory portion of pathname P as a string."
+  (let* ((p (pathname p))
+         (dir (pathname-directory p)))
+    (if (null dir)
+        ""
+        (let ((result (if (eq (car dir) :absolute) "/" "")))
+          (dolist (part (cdr dir) result)
+            (setf result
+                  (concatenate 'string result
+                               (cond ((eq part :up) "..")
+                                     ((eq part :wild) "*")
+                                     ((eq part :wild-inferiors) "**")
+                                     (t part))
+                               "/")))))))
