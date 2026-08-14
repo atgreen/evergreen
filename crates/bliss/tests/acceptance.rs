@@ -1573,3 +1573,57 @@ fn more_list_tree_string_functions() {
         );
     }
 }
+
+// ══════════════════════════════════════════════════════════════════
+// Gray streams — CLOS stream hierarchy + generic-function dispatch
+// (bliss-jtc.7b). A user-defined FUNDAMENTAL-STREAM subclass must
+// dispatch through the Gray generics when the standard stream
+// functions are called on it.
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn gray_output_stream_routes_standard_functions_through_generics() {
+    // counting-stream implements only stream-write-char; write-char,
+    // write-string (default loops write-char), and terpri (default writes
+    // #\Newline) must all reach it. A + bcd + newline = 5 chars.
+    let prog = "(progn \
+       (defclass counting-stream (fundamental-character-output-stream) \
+         ((n :initform 0 :accessor cs-n))) \
+       (defmethod stream-write-char ((s counting-stream) ch) \
+         (setf (cs-n s) (+ 1 (cs-n s))) ch) \
+       (let ((cs (make-instance 'counting-stream))) \
+         (write-char #\\A cs) \
+         (write-string \"bcd\" cs) \
+         (terpri cs) \
+         (format t \"COUNT=~a\" (cs-n cs))))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("COUNT=5"),
+        "expected COUNT=5 (write-char/write-string/terpri routed through stream-write-char), \
+         got stdout: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn gray_input_stream_routes_read_functions_through_generics() {
+    // list-input implements only stream-read-char; read-line (default loops
+    // stream-read-char) and read-char must reach it.
+    let prog = "(progn \
+       (defclass list-input (fundamental-character-input-stream) \
+         ((cs :initarg :cs :accessor li-cs))) \
+       (defmethod stream-read-char ((s list-input)) \
+         (if (li-cs s) \
+             (let ((c (car (li-cs s)))) (setf (li-cs s) (cdr (li-cs s))) c) \
+             :eof)) \
+       (let ((s (make-instance 'list-input :cs (list #\\a #\\b #\\Newline #\\c #\\d)))) \
+         (format t \"L1=~a L2=~a EOF=~a\" (read-line s) (read-line s) (read-char s nil :done))))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("L1=ab") && stdout.contains("L2=cd") && stdout.contains("EOF=DONE"),
+        "expected read-line/read-char routed through stream-read-char, got stdout: '{stdout}', stderr: '{err}'"
+    );
+}

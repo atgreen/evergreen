@@ -1492,3 +1492,120 @@
                 (t (restart-case
                        (error 'type-error :datum ,value :expected-type t)
                      (store-value (v) (setf ,keyplace v) (go ,top)))))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Gray streams: CLOS class hierarchy and generic-function protocol (spec
+;;; §5.5.2, bliss-jtc.7b).
+;;;
+;;; Built-in streams stay Rust-backed for speed; these classes and generics let
+;;; user code define its own stream types. The standard stream functions
+;;; (read-char, write-char, …) dispatch to these generics when their argument is
+;;; a FUNDAMENTAL-STREAM instance, and to the fast Rust path otherwise. The Gray
+;;; generics use fixed arities — the standard functions fill in optional
+;;; start/end/eof arguments before dispatching.
+;;; ---------------------------------------------------------------------------
+
+;;; 5.5.2.1  Base classes.
+(defclass fundamental-stream (standard-object) ())
+(defclass fundamental-input-stream (fundamental-stream) ())
+(defclass fundamental-output-stream (fundamental-stream) ())
+(defclass fundamental-character-stream (fundamental-stream) ())
+(defclass fundamental-binary-stream (fundamental-stream) ())
+(defclass fundamental-character-input-stream
+    (fundamental-input-stream fundamental-character-stream) ())
+(defclass fundamental-character-output-stream
+    (fundamental-output-stream fundamental-character-stream) ())
+(defclass fundamental-binary-input-stream
+    (fundamental-input-stream fundamental-binary-stream) ())
+(defclass fundamental-binary-output-stream
+    (fundamental-output-stream fundamental-binary-stream) ())
+
+;;; 5.5.2.2 / 5.5.2.3 / 5.5.2.4  Generic functions.
+(defgeneric stream-read-char (stream))
+(defgeneric stream-unread-char (stream character))
+(defgeneric stream-read-char-no-hang (stream))
+(defgeneric stream-peek-char (stream))
+(defgeneric stream-listen (stream))
+(defgeneric stream-read-line (stream))
+(defgeneric stream-clear-input (stream))
+(defgeneric stream-read-byte (stream))
+
+(defgeneric stream-write-char (stream character))
+(defgeneric stream-line-column (stream))
+(defgeneric stream-start-line-p (stream))
+(defgeneric stream-write-string (stream string start end))
+(defgeneric stream-terpri (stream))
+(defgeneric stream-fresh-line (stream))
+(defgeneric stream-finish-output (stream))
+(defgeneric stream-force-output (stream))
+(defgeneric stream-clear-output (stream))
+(defgeneric stream-write-byte (stream integer))
+
+(defgeneric gray-stream-element-type (stream))
+(defgeneric gray-close (stream))
+
+;;; Required-to-implement operations: a subclass that does not provide a method
+;;; gets a clear error rather than a mysterious no-applicable-method.
+(defmethod stream-read-char ((stream fundamental-input-stream))
+  (error "stream-read-char must be implemented by ~a" (class-of stream)))
+(defmethod stream-write-char ((stream fundamental-output-stream) character)
+  (error "stream-write-char must be implemented by ~a" (class-of stream)))
+
+;;; Input defaults (§5.5.2.2).
+(defmethod stream-peek-char ((stream fundamental-character-input-stream))
+  (let ((c (stream-read-char stream)))
+    (unless (eq c :eof)
+      (stream-unread-char stream c))
+    c))
+
+(defmethod stream-read-char-no-hang ((stream fundamental-character-input-stream))
+  (stream-read-char stream))
+
+(defmethod stream-listen ((stream fundamental-character-input-stream))
+  (let ((c (stream-read-char-no-hang stream)))
+    (cond ((eq c :eof) nil)
+          ((null c) nil)
+          (t (stream-unread-char stream c) t))))
+
+(defmethod stream-clear-input ((stream fundamental-input-stream)) nil)
+
+(defmethod stream-read-line ((stream fundamental-character-input-stream))
+  (let ((chars nil))
+    (block done
+      (loop
+        (let ((c (stream-read-char stream)))
+          (cond ((eq c :eof)
+                 (return-from done (values (coerce (nreverse chars) 'string) t)))
+                ((eql c #\Newline)
+                 (return-from done (values (coerce (nreverse chars) 'string) nil)))
+                (t (push c chars))))))))
+
+;;; Output defaults (§5.5.2.3).
+(defmethod stream-line-column ((stream fundamental-character-output-stream)) nil)
+
+(defmethod stream-start-line-p ((stream fundamental-character-output-stream))
+  (eql (stream-line-column stream) 0))
+
+(defmethod stream-write-string ((stream fundamental-character-output-stream) string start end)
+  (let ((end (or end (length string))))
+    (do ((i start (1+ i)))
+        ((>= i end) string)
+      (stream-write-char stream (char string i)))))
+
+(defmethod stream-terpri ((stream fundamental-character-output-stream))
+  (stream-write-char stream #\Newline)
+  nil)
+
+(defmethod stream-fresh-line ((stream fundamental-character-output-stream))
+  (if (stream-start-line-p stream)
+      nil
+      (progn (stream-terpri stream) t)))
+
+(defmethod stream-finish-output ((stream fundamental-output-stream)) nil)
+(defmethod stream-force-output ((stream fundamental-output-stream)) nil)
+(defmethod stream-clear-output ((stream fundamental-output-stream)) nil)
+
+;;; Query / lifecycle defaults (§5.5.2.4).
+(defmethod gray-stream-element-type ((stream fundamental-character-stream)) 'character)
+(defmethod gray-stream-element-type ((stream fundamental-binary-stream)) '(unsigned-byte 8))
+(defmethod gray-close ((stream fundamental-stream)) t)

@@ -400,6 +400,17 @@ fn write_str_to(stream: BlissVal, s: &str) -> Result<(), BlissError> {
     bliss_stdlib::stream_write_string(stream, sv, 0, None)
 }
 
+/// True if `s` is a user-defined Gray stream: a CLOS instance whose class
+/// precedence list includes `FUNDAMENTAL-STREAM`. The standard stream functions
+/// route such streams through the Gray generic functions (spec §5.5.2,
+/// bliss-jtc.7b); built-in Rust-backed streams take the fast stdlib path.
+fn is_gray_stream(s: BlissVal) -> bool {
+    bliss_stdlib::is_instance(s)
+        && instance_class_hierarchy_names(s)
+            .map(|names| names.iter().any(|n| n == "FUNDAMENTAL-STREAM"))
+            .unwrap_or(false)
+}
+
 /// The global value of symbol `idx` from its heap value cell, or `None` if the
 /// cell is unbound (bliss-jtc.6 Stage C2). This is the authoritative store for
 /// global (non-lexical) variable values.
@@ -4242,6 +4253,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     eval_form(args[0], env)?
                 };
                 let out = resolve_output_stream(stream, env);
+                if is_gray_stream(out) {
+                    invoke_generic_function("STREAM-TERPRI", &[out], env)?;
+                    return Ok(NIL);
+                }
                 bliss_stdlib::stream_terpri(out)?;
                 return Ok(NIL);
             }
@@ -4253,8 +4268,92 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     eval_form(args[0], env)?
                 };
                 let out = resolve_output_stream(stream, env);
+                if is_gray_stream(out) {
+                    let r = invoke_generic_function("STREAM-FRESH-LINE", &[out], env)?;
+                    return Ok(if r.is_nil() { NIL } else { T });
+                }
                 let emitted = bliss_stdlib::stream_fresh_line(out)?;
                 return Ok(if emitted { T } else { NIL });
+            }
+            "WRITE-CHAR" => {
+                // (write-char character &optional stream)
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "WRITE-CHAR requires a character".into(),
+                    ));
+                }
+                let ch = eval_form(args[0], env)?;
+                let stream = if args.len() > 1 {
+                    eval_form(args[1], env)?
+                } else {
+                    NIL
+                };
+                let out = resolve_output_stream(stream, env);
+                if is_gray_stream(out) {
+                    invoke_generic_function("STREAM-WRITE-CHAR", &[out, ch], env)?;
+                } else {
+                    bliss_stdlib::stream_write_char(out, ch)?;
+                }
+                return Ok(ch);
+            }
+            "READ-CHAR" => {
+                // (read-char &optional stream eof-error-p eof-value)
+                let args = list_to_vec(cdr);
+                let stream = if !args.is_empty() {
+                    eval_form(args[0], env)?
+                } else {
+                    NIL
+                };
+                let eof_error_p = if args.len() > 1 {
+                    eval_form(args[1], env)?
+                } else {
+                    T
+                };
+                let eof_value = if args.len() > 2 {
+                    eval_form(args[2], env)?
+                } else {
+                    NIL
+                };
+                let in_stream = resolve_input_stream(stream, env);
+                let (result, at_eof) = if is_gray_stream(in_stream) {
+                    let r = invoke_generic_function("STREAM-READ-CHAR", &[in_stream], env)?;
+                    let eof = !r.is_character();
+                    (r, eof)
+                } else {
+                    let r = bliss_stdlib::stream_read_char(in_stream)?;
+                    let eof = r == EOF;
+                    (r, eof)
+                };
+                if at_eof {
+                    if eof_error_p.is_nil() {
+                        return Ok(eof_value);
+                    }
+                    return Err(BlissError::StreamError("end of file on READ-CHAR".into()));
+                }
+                return Ok(result);
+            }
+            "UNREAD-CHAR" => {
+                // (unread-char character &optional stream)
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "UNREAD-CHAR requires a character".into(),
+                    ));
+                }
+                let ch = eval_form(args[0], env)?;
+                let stream = if args.len() > 1 {
+                    eval_form(args[1], env)?
+                } else {
+                    NIL
+                };
+                let in_stream = resolve_input_stream(stream, env);
+                if is_gray_stream(in_stream) {
+                    invoke_generic_function("STREAM-UNREAD-CHAR", &[in_stream, ch], env)?;
+                } else {
+                    bliss_stdlib::stream_unread_char(in_stream, ch)?;
+                }
+                return Ok(NIL);
             }
             "+" => return eval_arith(cdr, env, 0, 0.0, |a, b| a + b, bigrat_add),
             "-" => return eval_arith_sub(cdr, env),
@@ -6067,6 +6166,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 };
                 let inp = resolve_input_stream(stream, env);
+                if is_gray_stream(inp) {
+                    // The Gray stream-read-line returns (values string eof-p);
+                    // invoke_generic_function yields the primary value (the line).
+                    let line = invoke_generic_function("STREAM-READ-LINE", &[inp], env)?;
+                    return Ok(line);
+                }
                 let (line_val, missing_newline) = bliss_stdlib::stream_read_line(inp)?;
                 if line_val == EOF {
                     // At end of input: honour the eof designator like the old
@@ -6094,6 +6199,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 };
                 let out = resolve_output_stream(stream, env);
+                if is_gray_stream(out) {
+                    // Dispatch to the Gray stream-write-string generic (start 0,
+                    // end nil → whole string).
+                    invoke_generic_function(
+                        "STREAM-WRITE-STRING",
+                        &[out, string, BlissVal::from_fixnum(0), NIL],
+                        env,
+                    )?;
+                    return Ok(string);
+                }
                 write_str_to(out, &s)?;
                 return Ok(string);
             }
