@@ -30,6 +30,16 @@ fn is_vector(v: BlissVal) -> bool {
     header.type_id() == type_id::SIMPLE_VECTOR
 }
 
+/// True if `v` is a character string usable as a sequence — a real string, and
+/// NOT a pathname. Pathnames are registry-backed values whose BlissVal can pass
+/// `is_string()` (they carry a namestring), but they are not sequences; treating
+/// one as a string in LENGTH/ELT reads a non-string layout and crashes or walks
+/// off the end (bliss-lb6). STRINGP already excludes pathnames the same way.
+#[inline]
+fn is_char_seq(v: BlissVal) -> bool {
+    v.is_string() && !crate::pathnames::is_pathname(v)
+}
+
 /// Collect all elements of a sequence into a Vec.
 fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
     if sequence.is_nil() {
@@ -55,7 +65,7 @@ fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
         }
         return Ok(elems);
     }
-    if sequence.is_string() {
+    if is_char_seq(sequence) {
         return Ok(sequence
             .as_string()
             .chars()
@@ -413,7 +423,7 @@ pub fn length(sequence: BlissVal) -> Result<usize, BlissError> {
     if is_vector(sequence) {
         return Ok(vector_length(sequence));
     }
-    if sequence.is_string() {
+    if is_char_seq(sequence) {
         // Strings are sequences of characters (ANSI). Count characters, not bytes.
         return Ok(sequence.as_string().chars().count());
     }
@@ -458,7 +468,7 @@ pub fn elt(sequence: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
         }
         return Ok(vector_elt(sequence, index));
     }
-    if sequence.is_string() {
+    if is_char_seq(sequence) {
         let s = sequence.as_string();
         match s.chars().nth(index) {
             Some(c) => return Ok(BlissVal::from_char(c)),
@@ -509,7 +519,7 @@ pub fn copy_seq(sequence: BlissVal) -> Result<BlissVal, BlissError> {
         let elems = collect_elements(sequence)?;
         return Ok(build_vector(&elems));
     }
-    if sequence.is_string() {
+    if is_char_seq(sequence) {
         let s: String = collect_elements(sequence)?
             .iter()
             .map(|&c| c.as_char())
@@ -528,7 +538,7 @@ pub fn subseq(
     start: usize,
     end: Option<usize>,
 ) -> Result<BlissVal, BlissError> {
-    if sequence.is_string() {
+    if is_char_seq(sequence) {
         let chars: Vec<char> = sequence.as_string().chars().collect();
         let len = chars.len();
         let actual_end = end.unwrap_or(len);
@@ -579,7 +589,7 @@ pub fn reverse(sequence: BlissVal) -> Result<BlissVal, BlissError> {
     elems.reverse();
     if is_list(sequence) {
         Ok(build_list(&elems))
-    } else if sequence.is_string() {
+    } else if is_char_seq(sequence) {
         // REVERSE of a string is a string (ANSI): same element type as input.
         let s: String = elems.iter().map(|&c| c.as_char()).collect();
         Ok(crate::streams::make_lisp_string_fresh(&s))

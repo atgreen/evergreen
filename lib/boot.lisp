@@ -498,7 +498,7 @@
             (setq acc (if from-end (funcall fn x acc) (funcall fn acc x))))))))
 
 (defun find-if (pred seq &key key (start 0) end from-end)
-  (let ((stop (min (or end (length seq)) (length seq))))
+  (let ((stop (or end (length seq))))
     (flet ((matchp (e) (funcall pred (if key (funcall key e) e))))
       (if from-end
           (loop for i from (1- stop) downto start
@@ -509,7 +509,7 @@
                 when (matchp e) return e)))))
 
 (defun find-if-not (pred seq &key key (start 0) end from-end)
-  (let ((stop (min (or end (length seq)) (length seq))))
+  (let ((stop (or end (length seq))))
     (flet ((matchp (e) (not (funcall pred (if key (funcall key e) e)))))
       (if from-end
           (loop for i from (1- stop) downto start
@@ -520,7 +520,7 @@
                 when (matchp e) return e)))))
 
 (defun position-if (pred seq &key key (start 0) end from-end)
-  (let ((stop (min (or end (length seq)) (length seq))))
+  (let ((stop (or end (length seq))))
     (flet ((matchp (e) (funcall pred (if key (funcall key e) e))))
       (if from-end
           (loop for i from (1- stop) downto start
@@ -529,7 +529,7 @@
                 when (matchp (elt seq i)) return i)))))
 
 (defun position-if-not (pred seq &key key (start 0) end from-end)
-  (let ((stop (min (or end (length seq)) (length seq))))
+  (let ((stop (or end (length seq))))
     (flet ((matchp (e) (not (funcall pred (if key (funcall key e) e)))))
       (if from-end
           (loop for i from (1- stop) downto start
@@ -538,12 +538,12 @@
                 when (matchp (elt seq i)) return i)))))
 
 (defun count-if (pred seq &key key (start 0) end)
-  (let ((stop (min (or end (length seq)) (length seq))))
+  (let ((stop (or end (length seq))))
     (loop for i from start below stop
           count (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e))))))
 
 (defun count-if-not (pred seq &key key (start 0) end)
-  (let ((stop (min (or end (length seq)) (length seq))))
+  (let ((stop (or end (length seq))))
     (loop for i from start below stop
           count (not (funcall pred (let ((e (elt seq i))) (if key (funcall key e) e)))))))
 
@@ -577,7 +577,7 @@
 (defun find (item seq &key key test test-not (start 0) end from-end)
   (let ((testfn (or test test-not #'eql))
         (neg (if test-not t nil))
-        (stop (min (or end (length seq)) (length seq))))
+        (stop (or end (length seq))))
     (flet ((matchp (e)
              (let ((r (funcall testfn item (if key (funcall key e) e))))
                (if neg (not r) r))))
@@ -592,7 +592,7 @@
 (defun position (item seq &key key test test-not (start 0) end from-end)
   (let ((testfn (or test test-not #'eql))
         (neg (if test-not t nil))
-        (stop (min (or end (length seq)) (length seq))))
+        (stop (or end (length seq))))
     (flet ((matchp (e)
              (let ((r (funcall testfn item (if key (funcall key e) e))))
                (if neg (not r) r))))
@@ -605,7 +605,7 @@
 (defun count (item seq &key key test test-not (start 0) end)
   (let ((testfn (or test test-not #'eql))
         (neg (if test-not t nil))
-        (stop (min (or end (length seq)) (length seq))))
+        (stop (or end (length seq))))
     (flet ((matchp (e)
              (let ((r (funcall testfn item (if key (funcall key e) e))))
                (if neg (not r) r))))
@@ -1654,3 +1654,17 @@
                                      ((eq part :wild-inferiors) "**")
                                      (t part))
                                "/")))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Implementation / environment identity (bliss-lb6). ASDF/UIOP build cache
+;;; and output-translation paths from these. Constant values are sufficient for
+;;; loading; they can be wired to real system info later.
+;;; ---------------------------------------------------------------------------
+
+(defun lisp-implementation-type () "Bliss")
+(defun lisp-implementation-version () "0.1.0")
+(defun machine-type () "X86-64")
+(defun machine-version () "X86-64")
+(defun machine-instance () "localhost")
+(defun software-type () "Linux")
+(defun software-version () "1.0")
