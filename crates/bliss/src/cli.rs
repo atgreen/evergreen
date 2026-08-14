@@ -11516,6 +11516,35 @@ mod jtc6_8_function_object_tests {
 }
 
 #[cfg(test)]
+mod jtc3_unified_tiering_tests {
+    use super::*;
+
+    /// bliss-jtc.3: the heap function object is the single tiering record. Every
+    /// invocation on the hot (bytecode) dispatch path accumulates on the object's
+    /// FnMeta invoke counter, which drives T0→T1 promotion — no separate
+    /// per-symbol counter map for named functions.
+    #[test]
+    fn function_object_accumulates_all_invocations() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        read_eval_all_env("(defun c2b-hot (x) (+ x 1))", &mut env).expect("defun");
+        let idx = bliss_rt::symbols::intern("C2B-HOT");
+        let f = bliss_rt::symbols::symbol_function(idx).expect("function cell bound");
+
+        for _ in 0..15 {
+            read_eval_all_env("(c2b-hot 1)", &mut env).expect("call");
+        }
+        assert!(
+            bliss_rt::function::invoke_count(f) >= 15,
+            "all invocations accumulate on the function object (the tiering record)"
+        );
+        // Tier is recorded on the object (0 at T0; promoted to 1 once hot on
+        // backends/arches where native compilation succeeds — see t1_native).
+        assert!(bliss_rt::function::tier(f) <= 2);
+    }
+}
+
+#[cfg(test)]
 mod jtc5mf_storage_condition_pool_tests {
     use super::*;
 

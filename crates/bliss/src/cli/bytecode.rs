@@ -2482,20 +2482,35 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 if let Some(callee) = registry_get(sym) {
                     if callee.arity == nargs {
                         // T1: installed native code → call via the i2c adapter.
-                        // Promote to T1 once the function is hot.
+                        // Unified tiering (bliss-jtc.3): the function object's
+                        // FnMeta is the single tiering record — invoke counter
+                        // (bumped at the top of CallNamed), current tier, and the
+                        // active compiled entry. Promotion is driven by that
+                        // counter and, on success, tier + entry are recorded on
+                        // the object. Anonymous compiled lambdas (gensyms) have no
+                        // function object, so they keep the INVOKE_COUNTS fallback.
+                        let fn_obj = bliss_rt::symbols::symbol_function(sym)
+                            .filter(|&c| bliss_rt::function::is_interpreted_function(c));
                         let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
                         let native = native.or_else(|| {
-                            let count = INVOKE_COUNTS.with(|m| {
-                                let mut b = m.borrow_mut();
-                                let e = b.entry(sym).or_insert(0);
-                                *e += 1;
-                                *e
-                            });
-                            if count >= t1_threshold() {
-                                try_promote_to_t1(sym)
-                            } else {
-                                None
+                            let count = match fn_obj {
+                                Some(f) => bliss_rt::function::invoke_count(f),
+                                None => INVOKE_COUNTS.with(|m| {
+                                    let mut b = m.borrow_mut();
+                                    let e = b.entry(sym).or_insert(0);
+                                    *e += 1;
+                                    *e
+                                }),
+                            };
+                            if count < t1_threshold() {
+                                return None;
                             }
+                            let nc = try_promote_to_t1(sym)?;
+                            if let Some(f) = fn_obj {
+                                bliss_rt::function::set_entry(f, nc.entry as *mut u8);
+                                bliss_rt::function::set_tier(f, 1);
+                            }
+                            Some(nc)
                         });
                         if let Some(nc) = native {
                             match run_native(&nc, &args, env) {
