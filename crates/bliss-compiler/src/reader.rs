@@ -18,30 +18,16 @@ type TokenChars = Vec<(char, bool)>;
 const MAX_READER_NESTING: usize = 4096;
 
 // ── Global symbol table ───────────────────────────────────────────
-static SYMBOL_TABLE: Mutex<Option<SymbolTable>> = Mutex::new(None);
+//
+// The canonical symbol registry now lives in `bliss_rt::symbols`, where each
+// interned symbol is a heap-resident `SymbolData` object (bliss-jtc.6 Stage A).
+// The reader's public entrypoints delegate to it so the reader, interpreter,
+// stdlib, and GC share one symbol identity space rather than parallel name
+// tables. Package name membership (below) is still reader-local pending Stage D.
 static PACKAGE_TABLE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
-struct SymbolTable {
-    name_to_index: HashMap<String, u32>,
-    index_to_name: HashMap<u32, String>,
-    next_index: u32,
-}
-
 pub fn intern_symbol(name: &str) -> u32 {
-    let mut guard = SYMBOL_TABLE.lock().unwrap();
-    let table = guard.get_or_insert_with(|| SymbolTable {
-        name_to_index: HashMap::new(),
-        index_to_name: HashMap::new(),
-        next_index: 0,
-    });
-    if let Some(&idx) = table.name_to_index.get(name) {
-        return idx;
-    }
-    let idx = table.next_index;
-    table.next_index += 1;
-    table.name_to_index.insert(name.to_string(), idx);
-    table.index_to_name.insert(idx, name.to_string());
-    idx
+    bliss_rt::symbols::intern(name)
 }
 
 /// Look up an already-interned symbol index by name WITHOUT interning it.
@@ -49,21 +35,13 @@ pub fn intern_symbol(name: &str) -> u32 {
 /// to answer "does a symbol with this name exist?" without side effects — which
 /// is what a correct FIND-SYMBOL needs (FIND-SYMBOL must not intern).
 pub fn find_symbol_index(name: &str) -> Option<u32> {
-    let guard = SYMBOL_TABLE.lock().unwrap();
-    guard
-        .as_ref()
-        .and_then(|table| table.name_to_index.get(name).copied())
+    bliss_rt::symbols::find_index(name)
 }
 
 /// Look up the name of a symbol by its index.
 /// Returns None if the index is not in the global symbol table.
 pub fn symbol_name(idx: u32) -> Option<String> {
-    let guard = SYMBOL_TABLE.lock().unwrap();
-    if let Some(table) = guard.as_ref() {
-        table.index_to_name.get(&idx).cloned()
-    } else {
-        None
-    }
+    bliss_rt::symbols::symbol_name(idx)
 }
 
 pub fn register_package(name: &str) {
@@ -94,25 +72,13 @@ fn package_exists(name: &str) -> bool {
     set.contains(&name.to_uppercase())
 }
 
-// Counter for uninterned symbols — each gets a unique index
-static UNINTERNED_COUNTER: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0x8000_0000);
-
 /// Create a fresh uninterned symbol with the given name. Each call yields a
-/// distinct symbol (a unique high-range index), but the name IS registered so
-/// `symbol_name`/`string`/`symbol-name` can resolve it. The name is deliberately
-/// not added to the name→index map, so the symbol remains uninterned and is not
-/// found by `intern`/`find-symbol`.
+/// distinct symbol (a unique high-range index) with a real heap object, but the
+/// name is deliberately not added to the name→index map, so the symbol remains
+/// uninterned and is not found by `intern`/`find-symbol`. `symbol_name` can
+/// still resolve it via its heap name cell.
 pub fn make_uninterned_symbol(name: &str) -> BlissVal {
-    let idx = UNINTERNED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut guard = SYMBOL_TABLE.lock().unwrap();
-    let table = guard.get_or_insert_with(|| SymbolTable {
-        name_to_index: HashMap::new(),
-        index_to_name: HashMap::new(),
-        next_index: 0,
-    });
-    table.index_to_name.insert(idx, name.to_string());
-    BlissVal::from_symbol_index(idx)
+    bliss_rt::symbols::make_uninterned(name)
 }
 
 // ── Global macro character tables ─────────────────────────────────
