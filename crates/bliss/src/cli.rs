@@ -3398,7 +3398,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             .any(|candidate| vals_equal(object, candidate))),
         "EQL" => {
             let (value, _) = cp(args);
-            Ok(object == value)
+            Ok(eql_values(object, value))
         }
         "INTEGER" => {
             if !object.is_fixnum() {
@@ -4204,11 +4204,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "NUMBERP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(if v.is_fixnum() || v.is_single_float() {
-                    T
-                } else {
-                    NIL
-                });
+                return Ok(if is_number_value(v) { T } else { NIL });
             }
             "STRINGP" => {
                 let (af, _) = cp(cdr);
@@ -4274,12 +4270,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let matches = typep_matches(env, obj, raw_type_spec)?;
                 return Ok(if matches { T } else { NIL });
             }
-            "EQ" | "EQL" => {
+            "EQ" => {
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
                 let a = eval_form(af, env)?;
                 let b = eval_form(bf, env)?;
                 return Ok(if a == b { T } else { NIL });
+            }
+            "EQL" => {
+                // EQL value-compares numbers of the same type, so two distinct
+                // heap bignums/ratios with equal value are EQL (bliss-jtc.5).
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
+                return Ok(if eql_values(a, b) { T } else { NIL });
             }
             "EQUAL" | "EQUALP" => {
                 let (af, r) = cp(cdr);
@@ -7625,32 +7630,83 @@ fn loop_from_exhausted(
 const FIXNUM_MAX: i64 = (1 << 60) - 1;
 const FIXNUM_MIN: i64 = -(1 << 60);
 
-/// Allocate a RATIO heap object (numerator/denominator are integers).
-fn alloc_ratio_cli(num: BlissVal, den: BlissVal) -> BlissVal {
-    let data = Box::leak(Box::new(RatioData {
-        header: ObjectHeader::new(type_id::RATIO, 3),
-        numerator: num,
-        denominator: den,
-    }));
-    unsafe { BlissVal::from_heap_ptr(data as *mut RatioData as *mut u8) }
+/// Allocate a `total_size`-byte object (header + body) of `type_id` on the shared
+/// GC heap and return a pointer to the object header (bliss-jtc.5). The allocator
+/// writes the header; the caller fills body fields at offsets ≥ 8.
+fn gc_alloc_obj(total_size: usize, type_id: u8) -> *mut u8 {
+    let hdr = std::mem::size_of::<ObjectHeader>();
+    let body_size = total_size.saturating_sub(hdr).max(1);
+    match bliss_rt::gc::alloc_typed(body_size, type_id) {
+        // SAFETY: alloc_typed returns a pointer past an 8-byte header.
+        Some(body) => unsafe { body.sub(hdr) },
+        None => std::alloc::handle_alloc_error(
+            std::alloc::Layout::from_size_align(total_size.max(hdr), hdr).unwrap(),
+        ),
+    }
 }
 
-/// Allocate a BIGNUM heap object (§1.8.1): header + sign + n_limbs + limbs.
-/// Layout mirrors the reader so `print_val` renders it correctly.
+/// Allocate a RATIO heap object (numerator/denominator are integers) on the
+/// shared GC heap, using the spec RatioData layout (bliss-jtc.5).
+fn alloc_ratio_cli(num: BlissVal, den: BlissVal) -> BlissVal {
+    let ptr = gc_alloc_obj(std::mem::size_of::<RatioData>(), type_id::RATIO) as *mut RatioData;
+    unsafe {
+        (*ptr).numerator = num;
+        (*ptr).denominator = den;
+        BlissVal::from_heap_ptr(ptr as *mut u8)
+    }
+}
+
+/// Allocate a BIGNUM heap object (§1.8.1) on the shared GC heap: header + sign +
+/// n_limbs + limbs. Layout mirrors the reader so `print_val` renders it correctly.
 fn alloc_bignum_cli(sign: i32, limbs: &[u64]) -> BlissVal {
     let n = limbs.len();
     let total_size = 16 + n * 8;
-    let layout = std::alloc::Layout::from_size_align(total_size, 8).unwrap();
+    let ptr = gc_alloc_obj(total_size, type_id::BIGNUM);
     unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout);
-        *(ptr as *mut ObjectHeader) =
-            ObjectHeader::new(type_id::BIGNUM, total_size.div_ceil(8) as u16);
         *(ptr.add(8) as *mut i32) = sign;
         *(ptr.add(12) as *mut u32) = n as u32;
         for (idx, &limb) in limbs.iter().enumerate() {
             *(ptr.add(16 + idx * 8) as *mut u64) = limb;
         }
         BlissVal::from_heap_ptr(ptr)
+    }
+}
+
+/// If `v` is a heap-allocated number, return its numeric `type_id`
+/// (BIGNUM/RATIO/COMPLEX/DOUBLE_FLOAT). Fixnums and single-floats are immediates,
+/// not heap objects, so they return None here (bliss-jtc.5).
+fn heap_numeric_type_id(v: BlissVal) -> Option<u8> {
+    if !v.is_heap_object() {
+        return None;
+    }
+    // SAFETY: `v` is a heap object; reading its header type_id is the same
+    // pattern the numeric paths already use (e.g. ratio_parts_val).
+    let tid = unsafe { (*(v.as_ptr() as *const ObjectHeader)).type_id() };
+    matches!(
+        tid,
+        type_id::BIGNUM | type_id::RATIO | type_id::COMPLEX | type_id::DOUBLE_FLOAT
+    )
+    .then_some(tid)
+}
+
+/// True if `v` is any kind of number: a fixnum, a single-float, or a heap
+/// numeric object (bignum/ratio/complex/double-float) (bliss-jtc.5).
+fn is_number_value(v: BlissVal) -> bool {
+    v.is_fixnum() || v.is_single_float() || heap_numeric_type_id(v).is_some()
+}
+
+/// CL EQL: identical objects, or two numbers of the same type with the same
+/// value. Fixnums and single-floats are immediates (handled by `==`); heap
+/// numbers of the same type are compared by value on the shared representation.
+fn eql_values(a: BlissVal, b: BlissVal) -> bool {
+    if a == b {
+        return true;
+    }
+    match (heap_numeric_type_id(a), heap_numeric_type_id(b)) {
+        (Some(ta), Some(tb)) if ta == tb => {
+            numeric_cmp(a, b).map(|o| o == Ordering::Equal).unwrap_or(false)
+        }
+        _ => false,
     }
 }
 
@@ -11137,6 +11193,14 @@ impl Default for ReplConfig {
 
 // ── T0 objects on the shared GC heap (bliss-jtc.1) ────────────────
 
+/// Serialize tests that walk the shared per-process GC heap: `walk_heap` reads
+/// object headers, so it must not run while a sibling test is allocating.
+#[cfg(test)]
+fn heap_test_lock() -> &'static std::sync::Mutex<()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 mod jtc1_heap_tests {
     use super::*;
@@ -11145,6 +11209,7 @@ mod jtc1_heap_tests {
     /// and are visible to heap walking (bliss-jtc.1).
     #[test]
     fn evaluator_objects_live_on_the_gc_heap_and_are_walkable() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         // WRITE-TO-STRING allocates its result through the evaluator's arena
         // (now the GC heap); the distinctive digits are unlikely to collide with
         // any other live string. (A source string *literal* would be allocated by
@@ -11177,5 +11242,57 @@ mod jtc1_heap_tests {
             found_marker,
             "the evaluator-allocated string must be walkable on the GC heap"
         );
+    }
+}
+
+// ── Numeric heap objects on the shared GC heap (bliss-jtc.5) ───────
+
+#[cfg(test)]
+mod jtc5_numeric_tests {
+    use super::*;
+
+    /// Fixnum overflow (bignum) and division (ratio) allocate on the shared GC
+    /// heap using the spec layouts, so heap walking sees them.
+    #[test]
+    fn bignum_and_ratio_live_on_the_gc_heap() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        read_eval_all("(* 1000000000000000000 1000000000000000000)").expect("bignum");
+        read_eval_all("(/ 3 7)").expect("ratio");
+
+        let mut bignum = false;
+        let mut ratio = false;
+        bliss_rt::walk_heap(|_p, tid, _s| {
+            if tid == type_id::BIGNUM {
+                bignum = true;
+            } else if tid == type_id::RATIO {
+                ratio = true;
+            }
+            true
+        })
+        .expect("walk_heap");
+        assert!(bignum, "overflow bignum must be on the GC heap");
+        assert!(ratio, "ratio must be on the GC heap");
+    }
+
+    /// Numeric type and equality predicates operate on the shared heap
+    /// representation: bignums/ratios are numbers, and EQL value-compares
+    /// same-type heap numbers while EQ stays identity.
+    #[test]
+    fn numeric_predicates_use_the_shared_representation() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            read_eval_all("(numberp (* 999999999999 999999999999))").unwrap(),
+            T
+        );
+        assert_eq!(read_eval_all("(numberp (/ 1 3))").unwrap(), T);
+        assert_eq!(read_eval_all("(numberp \"x\")").unwrap(), NIL);
+        assert_eq!(read_eval_all("(eql 1/3 1/3)").unwrap(), T);
+        assert_eq!(
+            read_eval_all("(eql (* 10000000000 10000000000) (* 10000000000 10000000000))")
+                .unwrap(),
+            T
+        );
+        assert_eq!(read_eval_all("(eq 1/3 1/3)").unwrap(), NIL);
+        assert_eq!(read_eval_all("(= (/ 1 2) (/ 2 4))").unwrap(), T);
     }
 }
