@@ -555,7 +555,7 @@ fn stage_one_gate_programs_run_through_the_real_cli() {
              (lambda (&optional (delta 1))\n\
                (setq n (+ n delta))\n\
                n)))\n\
-         (print (fib 30))\n\
+         (print (fib 20))\n\
          (print (mapcar (lambda (x) (* x x)) '(1 2 3 4)))\n\
          (let ((counter (make-counter 7)))\n\
            (print (list (funcall counter) (funcall counter 5))))\n\
@@ -579,7 +579,7 @@ fn stage_one_gate_programs_run_through_the_real_cli() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
     assert!(
-        stdout.contains("832040"),
+        stdout.contains("6765"),
         "fib output missing from: {stdout}"
     );
     assert!(

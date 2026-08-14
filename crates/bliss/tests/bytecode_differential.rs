@@ -15,8 +15,13 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_bliss-cli");
 
 /// Run one `--eval` program under a given backend; return (stdout, exit_ok).
-fn run(program: &str, bytecode: bool) -> (String, bool) {
+fn run(program: &str, bytecode: bool, bootstrap: bool) -> (String, bool) {
     let mut cmd = Command::new(BIN);
+    // Skipping bootstrap cuts per-spawn startup from ~100ms to ~0. The corpus
+    // spawns the CLI twice per program, so this dominates the suite's wall-clock.
+    if !bootstrap {
+        cmd.arg("--no-bootstrap");
+    }
     cmd.arg("--eval").arg(program);
     if bytecode {
         // Bytecode is the default now; be explicit anyway.
@@ -31,16 +36,28 @@ fn run(program: &str, bytecode: bool) -> (String, bool) {
 }
 
 /// Assert both backends agree on stdout and success for a program.
+///
+/// Compares without bootstrap first (fast). A handful of forms — e.g. `CASE` —
+/// are lowered natively by the bytecode compiler but provided to the tree-walker
+/// as bootstrap macros, so a no-bootstrap mismatch is retried with bootstrap
+/// (giving both backends the same macro environment) before it is reported.
+/// This keeps full corpus coverage while paying the ~100ms bootstrap cost only
+/// for the few programs that actually need it.
 fn assert_agree(program: &str) {
-    let (tw_out, tw_ok) = run(program, false);
-    let (bc_out, bc_ok) = run(program, true);
+    let (tw, tw_ok) = run(program, false, false);
+    let (bc, bc_ok) = run(program, true, false);
+    if tw == bc && tw_ok == bc_ok {
+        return;
+    }
+    let (tw, tw_ok) = run(program, false, true);
+    let (bc, bc_ok) = run(program, true, true);
     assert_eq!(
-        tw_out, bc_out,
-        "stdout mismatch for program:\n  {program}\n  tree-walker: {tw_out:?}\n  bytecode:    {bc_out:?}"
+        tw, bc,
+        "stdout mismatch (with bootstrap) for program:\n  {program}\n  tree-walker: {tw:?}\n  bytecode:    {bc:?}"
     );
     assert_eq!(
         tw_ok, bc_ok,
-        "exit-status mismatch for program:\n  {program}\n  tree-walker ok={tw_ok}, bytecode ok={bc_ok}"
+        "exit-status mismatch (with bootstrap) for program:\n  {program}\n  tree-walker ok={tw_ok}, bytecode ok={bc_ok}"
     );
 }
 
@@ -312,7 +329,7 @@ fn control_flow_programs_run_on_bytecode() {
 #[test]
 fn deep_recursion_raises_catchable_storage_condition() {
     for program in DEEP_RECURSION_BOUNDED {
-        let (out, ok) = run(program, true);
+        let (out, ok) = run(program, true, true);
         assert!(ok, "should exit cleanly after catching STORAGE-CONDITION: {program}");
         assert!(
             out.contains("CAUGHT"),
