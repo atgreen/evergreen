@@ -1,5 +1,12 @@
 # Conformance TODO — missing/broken Rust primitives
 
+> **Status:** #1 (`mod`), #2 (`member :key`), #3 (`destructuring-bind`
+> `&optional`/`&rest`), #4 (integer `floor`/`ceiling`/`round`/`truncate`
+> remainder), and #5 (`string<`/`string>` mismatch index) are **FIXED** in the
+> interpreter. #6 (`setf` on `elt`/`aref`), #7 (`vector`/`make-array`), and #8
+> (`rational`/`rationalize` via `integer-decode-float`) remain — they need new
+> Rust array/float-decode primitives, tracked with the stdlib long-tail work.
+
 These ANSI-conformance gaps cannot be fixed in `lib/boot.lisp` alone: they are
 either builtins whose behavior is wrong (and Lisp `defun`/`defmacro` does **not**
 override an interpreter builtin), or capabilities that need a new Rust

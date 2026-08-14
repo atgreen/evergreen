@@ -4520,7 +4520,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let value = eval_form(value_form, env)?;
                 let parent = Rc::clone(&env.frame);
                 return with_child_frame(env, parent, move |env| {
-                    bind_pattern_value(pattern, value, env)?;
+                    // Use the full destructuring binder so &optional/&rest/&key
+                    // work in the pattern (not just plain structural matching).
+                    bind_macro_param(pattern, value, env, None)?;
                     eval_progn(body, env)
                 });
             }
@@ -5050,14 +5052,36 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // function — see bliss-0l1.  No builtin arm here means these names
             // fall through to the user/boot function table below.
             "MEMBER" => {
+                // (member item list &key key test test-not)
                 let (item_f, r) = cp(cdr);
-                let (list_f, _) = cp(r);
+                let (list_f, kwrest) = cp(r);
                 let item = eval_form(item_f, env)?;
                 let list = eval_form(list_f, env)?;
+                let mut kwargs = Vec::new();
+                let mut kc = kwrest;
+                while kc.is_cons() {
+                    let (kf, kr) = cp(kc);
+                    kwargs.push(eval_form(kf, env)?);
+                    kc = kr;
+                }
+                let key_fn = find_key_arg(&kwargs, "KEY");
+                let test_fn = find_key_arg(&kwargs, "TEST");
+                let test_not_fn = find_key_arg(&kwargs, "TEST-NOT");
                 let mut c = list;
                 while c.is_cons() {
                     let (car, cdr_val) = cp(c);
-                    if vals_equal(car, item) {
+                    let probe = match key_fn {
+                        Some(kf) if kf != NIL => apply_function(kf, &[car], env)?,
+                        _ => car,
+                    };
+                    let matched = if let Some(tf) = test_fn {
+                        apply_function(tf, &[item, probe], env)? != NIL
+                    } else if let Some(tnf) = test_not_fn {
+                        apply_function(tnf, &[item, probe], env)? == NIL
+                    } else {
+                        vals_equal(probe, item)
+                    };
+                    if matched {
                         return Ok(c);
                     }
                     c = cdr_val;
@@ -5422,7 +5446,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "FLOOR" => return eval_floor(cdr, env),
-            "MOD" | "REM" => {
+            "REM" => {
+                // REM: remainder of TRUNCATE — the result takes the sign of the
+                // dividend (Rust `%`).
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
                 let a = eval_form(af, env)?;
@@ -5433,6 +5459,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Err(BlissError::ArithmeticError("division by zero".into()));
                 }
                 return Ok(BlissVal::from_fixnum(av % bv));
+            }
+            "MOD" => {
+                // MOD: remainder of FLOOR — the result takes the sign of the
+                // *divisor* (ANSI), so `(mod -7 3)` = 2, not -1.
+                let (af, r) = cp(cdr);
+                let (bf, _) = cp(r);
+                let a = eval_form(af, env)?;
+                let b = eval_form(bf, env)?;
+                let av = num_val(a)? as i64;
+                let bv = num_val(b)? as i64;
+                if bv == 0 {
+                    return Err(BlissError::ArithmeticError("division by zero".into()));
+                }
+                return Ok(BlissVal::from_fixnum(((av % bv) + bv) % bv));
             }
             "TRUNCATE" => {
                 let (af, r) = cp(cdr);
@@ -5446,11 +5486,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         return Err(BlissError::ArithmeticError("division by zero".into()));
                     }
                     let q = (av / bv).trunc() as i64;
-                    let rem = av - (q as f64) * bv;
-                    env.set_mv(vec![
-                        BlissVal::from_fixnum(q),
-                        BlissVal::from_single_float(rem as f32),
-                    ]);
+                    let rem = integer_or_float_remainder(a, b, q, av, bv);
+                    env.set_mv(vec![BlissVal::from_fixnum(q), rem]);
                     return Ok(BlissVal::from_fixnum(q));
                 }
                 return Ok(BlissVal::from_fixnum(av as i64));
@@ -5467,11 +5504,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         return Err(BlissError::ArithmeticError("division by zero".into()));
                     }
                     let q = (av / bv).ceil() as i64;
-                    let rem = av - (q as f64) * bv;
-                    env.set_mv(vec![
-                        BlissVal::from_fixnum(q),
-                        BlissVal::from_single_float(rem as f32),
-                    ]);
+                    let rem = integer_or_float_remainder(a, b, q, av, bv);
+                    env.set_mv(vec![BlissVal::from_fixnum(q), rem]);
                     return Ok(BlissVal::from_fixnum(q));
                 }
                 return Ok(BlissVal::from_fixnum(av.ceil() as i64));
@@ -5487,15 +5521,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if bv == 0.0 {
                         return Err(BlissError::ArithmeticError("division by zero".into()));
                     }
-                    let q = (av / bv).round() as i64;
-                    let rem = av - (q as f64) * bv;
-                    env.set_mv(vec![
-                        BlissVal::from_fixnum(q),
-                        BlissVal::from_single_float(rem as f32),
-                    ]);
+                    let q = round_half_even(av / bv);
+                    let rem = integer_or_float_remainder(a, b, q, av, bv);
+                    env.set_mv(vec![BlissVal::from_fixnum(q), rem]);
                     return Ok(BlissVal::from_fixnum(q));
                 }
-                return Ok(BlissVal::from_fixnum(av.round() as i64));
+                return Ok(BlissVal::from_fixnum(round_half_even(av)));
             }
             "EXPT" => {
                 let (af, r) = cp(cdr);
@@ -6548,23 +6579,27 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "STRING<" => {
+                // ANSI: the mismatch index if string1 < string2, else NIL.
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
                 let a = eval_form(af, env)?;
                 let b = eval_form(bf, env)?;
-                return Ok(if val_as_str(a) < val_as_str(b) {
-                    T
+                let (i, ord) = string_mismatch(&val_as_str(a), &val_as_str(b));
+                return Ok(if ord == std::cmp::Ordering::Less {
+                    BlissVal::from_fixnum(i as i64)
                 } else {
                     NIL
                 });
             }
             "STRING>" => {
+                // ANSI: the mismatch index if string1 > string2, else NIL.
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
                 let a = eval_form(af, env)?;
                 let b = eval_form(bf, env)?;
-                return Ok(if val_as_str(a) > val_as_str(b) {
-                    T
+                let (i, ord) = string_mismatch(&val_as_str(a), &val_as_str(b));
+                return Ok(if ord == std::cmp::Ordering::Greater {
+                    BlissVal::from_fixnum(i as i64)
                 } else {
                     NIL
                 });
@@ -10377,6 +10412,45 @@ fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissV
 }
 
 // ── FLOOR ────────────────────────────────────────────────────────
+/// The remainder for a division whose quotient is `q`: an exact integer when
+/// both operands are fixnums (ANSI: integer args give an integer remainder),
+/// otherwise a float. Fixes the FLOOR/CEILING/TRUNCATE/ROUND second value.
+fn integer_or_float_remainder(a: BlissVal, b: BlissVal, q: i64, av: f64, bv: f64) -> BlissVal {
+    if a.is_fixnum() && b.is_fixnum() {
+        BlissVal::from_fixnum(a.as_fixnum() - q * b.as_fixnum())
+    } else {
+        BlissVal::from_single_float((av - (q as f64) * bv) as f32)
+    }
+}
+
+/// First character index at which strings `a` and `b` differ, plus which is
+/// greater there. If one is a proper prefix of the other, the index is the
+/// shorter length; `Equal` means identical. Char-based (not byte-based) so it is
+/// correct for non-ASCII. Used by STRING</STRING> to return the ANSI mismatch
+/// index rather than a boolean.
+fn string_mismatch(a: &str, b: &str) -> (usize, std::cmp::Ordering) {
+    let av: Vec<char> = a.chars().collect();
+    let bv: Vec<char> = b.chars().collect();
+    let n = av.len().min(bv.len());
+    for i in 0..n {
+        if av[i] != bv[i] {
+            return (i, av[i].cmp(&bv[i]));
+        }
+    }
+    (n, av.len().cmp(&bv.len()))
+}
+
+/// Round to nearest integer, ties to even — ANSI CL ROUND semantics, unlike
+/// Rust's `f64::round` (ties away from zero). `(round 5 2)` = 2, `(round 7 2)` = 4.
+fn round_half_even(x: f64) -> i64 {
+    if (x - x.trunc()).abs() == 0.5 {
+        let lower = x.floor() as i64;
+        if lower % 2 == 0 { lower } else { lower + 1 }
+    } else {
+        x.round() as i64
+    }
+}
+
 fn eval_floor(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (af, r) = cp(cdr);
     let a = eval_form(af, env)?;
@@ -10389,11 +10463,8 @@ fn eval_floor(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             return Err(BlissError::ArithmeticError("division by zero".into()));
         }
         let q = (av / bv).floor() as i64;
-        let rem = av - (q as f64) * bv;
-        env.set_mv(vec![
-            BlissVal::from_fixnum(q),
-            BlissVal::from_fixnum(rem as i64),
-        ]);
+        let rem = integer_or_float_remainder(a, b, q, av, bv);
+        env.set_mv(vec![BlissVal::from_fixnum(q), rem]);
         return Ok(BlissVal::from_fixnum(q));
     }
     let q = av.floor() as i64;
