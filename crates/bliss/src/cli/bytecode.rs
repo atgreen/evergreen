@@ -111,6 +111,8 @@ enum Instr {
     MakeClosureEnv(u16),
     /// Discard the top of the operand stack.
     Pop,
+    /// Duplicate the top of the operand stack.
+    Dup,
     /// Unconditional jump: set the bytecode pointer to `target`.
     Br(u32),
     /// Pop; if it is NIL, jump to `target`, else fall through.
@@ -531,6 +533,11 @@ impl<'e> Lowerer<'e> {
                     Ok(())
                 }
                 "IF" => self.lower_if(rest),
+                "WHEN" => self.lower_when(rest, false),
+                "UNLESS" => self.lower_when(rest, true),
+                "AND" => self.lower_and(rest),
+                "OR" => self.lower_or(rest),
+                "COND" => self.lower_cond(rest),
                 "PROGN" => self.lower_progn(rest),
                 "LET" => self.lower_let(rest, false),
                 "LET*" => self.lower_let(rest, true),
@@ -608,6 +615,179 @@ impl<'e> Lowerer<'e> {
                 self.emit(Instr::Pop);
                 self.pop_n(1);
             }
+        }
+        Ok(())
+    }
+
+    /// `(when test body...)` / `(unless test body...)`.
+    fn lower_when(&mut self, rest: BlissVal, negate: bool) -> LowerResult<()> {
+        let (test, body) = cp(rest);
+        let base = self.cur_stack;
+        self.lower_expr(test)?;
+        if negate {
+            // UNLESS: run the body when the test is NIL. Branch on the test:
+            // BrIfFalse jumps to the body; the true path yields NIL.
+            self.emit(Instr::BrIfFalse(0));
+            let to_body = self.code.len() - 1;
+            self.pop_n(1);
+            let c = self.add_const(NIL);
+            self.emit(Instr::Const(c));
+            self.push_n(1);
+            self.emit(Instr::Br(0));
+            let to_end = self.code.len() - 1;
+            let body_pc = self.code.len() as u32;
+            self.cur_stack = base;
+            self.lower_progn(body)?;
+            let end = self.code.len() as u32;
+            self.code[to_body] = Instr::BrIfFalse(body_pc);
+            self.code[to_end] = Instr::Br(end);
+        } else {
+            self.emit(Instr::BrIfFalse(0));
+            let to_else = self.code.len() - 1;
+            self.pop_n(1);
+            self.lower_progn(body)?;
+            self.emit(Instr::Br(0));
+            let to_end = self.code.len() - 1;
+            let else_pc = self.code.len() as u32;
+            let c = self.add_const(NIL);
+            self.emit(Instr::Const(c));
+            self.push_n(1);
+            let end = self.code.len() as u32;
+            self.code[to_else] = Instr::BrIfFalse(else_pc);
+            self.code[to_end] = Instr::Br(end);
+        }
+        self.cur_stack = base + 1;
+        if self.cur_stack > self.max_stack {
+            self.max_stack = self.cur_stack;
+        }
+        Ok(())
+    }
+
+    /// `(and a b ...)` — short-circuit; NIL on the first false, else the last.
+    fn lower_and(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let args = list_to_vec(rest);
+        let base = self.cur_stack;
+        if args.is_empty() {
+            let c = self.add_const(T);
+            self.emit(Instr::Const(c));
+            self.push_n(1);
+            return Ok(());
+        }
+        let n = args.len();
+        let mut false_jumps = Vec::new();
+        for (i, a) in args.into_iter().enumerate() {
+            self.lower_expr(a)?;
+            if i + 1 < n {
+                self.emit(Instr::BrIfFalse(0)); // pops; jump to the NIL result
+                false_jumps.push(self.code.len() - 1);
+                self.pop_n(1);
+            }
+        }
+        // Last value is on the stack (the result of a successful AND).
+        self.emit(Instr::Br(0));
+        let to_end = self.code.len() - 1;
+        let false_pc = self.code.len() as u32;
+        let c = self.add_const(NIL);
+        self.emit(Instr::Const(c));
+        let end = self.code.len() as u32;
+        for j in false_jumps {
+            self.code[j] = Instr::BrIfFalse(false_pc);
+        }
+        self.code[to_end] = Instr::Br(end);
+        self.cur_stack = base + 1;
+        if self.cur_stack > self.max_stack {
+            self.max_stack = self.cur_stack;
+        }
+        Ok(())
+    }
+
+    /// `(or a b ...)` — short-circuit; the first true value, else the last.
+    fn lower_or(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let args = list_to_vec(rest);
+        let base = self.cur_stack;
+        if args.is_empty() {
+            let c = self.add_const(NIL);
+            self.emit(Instr::Const(c));
+            self.push_n(1);
+            return Ok(());
+        }
+        let n = args.len();
+        let mut end_jumps = Vec::new();
+        for (i, a) in args.into_iter().enumerate() {
+            self.lower_expr(a)?;
+            if i + 1 < n {
+                self.emit(Instr::Dup);
+                self.push_n(1);
+                self.emit(Instr::BrIfFalse(0)); // pop the copy; if false, try next
+                let to_next = self.code.len() - 1;
+                self.pop_n(1);
+                self.emit(Instr::Br(0)); // truthy: keep the value, done
+                end_jumps.push(self.code.len() - 1);
+                let next_pc = self.code.len() as u32;
+                self.code[to_next] = Instr::BrIfFalse(next_pc);
+                self.emit(Instr::Pop); // discard the false value before the next
+                self.pop_n(1);
+            }
+        }
+        let end = self.code.len() as u32;
+        for j in end_jumps {
+            self.code[j] = Instr::Br(end);
+        }
+        self.cur_stack = base + 1;
+        if self.cur_stack > self.max_stack {
+            self.max_stack = self.cur_stack;
+        }
+        Ok(())
+    }
+
+    /// `(cond (test body...)...)` — nested IF; a testless-body clause yields the
+    /// test value.
+    fn lower_cond(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let clauses = list_to_vec(rest);
+        let base = self.cur_stack;
+        let mut end_jumps = Vec::new();
+        for clause in clauses {
+            if !clause.is_cons() {
+                return Err(Bail);
+            }
+            let (test, body) = cp(clause);
+            self.cur_stack = base;
+            self.lower_expr(test)?; // test value on stack
+            if body.is_nil() {
+                // (cond (test)) — the test's value is the result if non-NIL.
+                self.emit(Instr::Dup);
+                self.push_n(1);
+                self.emit(Instr::BrIfFalse(0));
+                let to_next = self.code.len() - 1;
+                self.pop_n(1);
+                self.emit(Instr::Br(0));
+                end_jumps.push(self.code.len() - 1);
+                let next_pc = self.code.len() as u32;
+                self.code[to_next] = Instr::BrIfFalse(next_pc);
+                self.emit(Instr::Pop);
+                self.pop_n(1);
+            } else {
+                self.emit(Instr::BrIfFalse(0));
+                let to_next = self.code.len() - 1;
+                self.pop_n(1);
+                self.lower_progn(body)?;
+                self.emit(Instr::Br(0));
+                end_jumps.push(self.code.len() - 1);
+                let next_pc = self.code.len() as u32;
+                self.code[to_next] = Instr::BrIfFalse(next_pc);
+            }
+        }
+        // No clause matched → NIL.
+        self.cur_stack = base;
+        let c = self.add_const(NIL);
+        self.emit(Instr::Const(c));
+        let end = self.code.len() as u32;
+        for j in end_jumps {
+            self.code[j] = Instr::Br(end);
+        }
+        self.cur_stack = base + 1;
+        if self.cur_stack > self.max_stack {
+            self.max_stack = self.cur_stack;
         }
         Ok(())
     }
@@ -1420,14 +1600,9 @@ fn is_bail_special(name: &str) -> bool {
             | "PROGV"
             | "MULTIPLE-VALUE-CALL"
             | "MULTIPLE-VALUE-PROG1"
-            | "COND"
             | "CASE"
             | "TYPECASE"
             | "ECASE"
-            | "AND"
-            | "OR"
-            | "WHEN"
-            | "UNLESS"
             | "DO"
             | "DO*"
             | "DOLIST"
@@ -1972,6 +2147,12 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
             }
             Instr::Pop => {
                 acts[top_idx].pop_op();
+            }
+            Instr::Dup => {
+                let act = &mut acts[top_idx];
+                let v = act.pop_op();
+                act.push_op(v);
+                act.push_op(v);
             }
             Instr::Br(target) => {
                 acts[top_idx].bcp = target as usize;

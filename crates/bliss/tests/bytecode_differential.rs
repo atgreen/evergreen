@@ -182,6 +182,23 @@ const CORPUS: &[&str] = &[
     "(defun pair () (let ((n 0)) (list (lambda () (setq n (+ n 1))) (lambda () n)))) (let ((p (pair))) (funcall (first p)) (funcall (first p)) (funcall (second p)))",
     "(defun add-n (n lst) (mapcar (lambda (x) (+ x n)) lst)) (add-n 100 (list 1 2 3))",
     "(defun adders () (let ((a 1) (b 2)) (list (lambda () a) (lambda () b)))) (let ((l (adders))) (list (funcall (first l)) (funcall (second l))))",
+    // ── cond / when / unless / and / or on bytecode (nmq.6 coverage) ──
+    "(when t 1 2 3)",
+    "(when nil 1 2)",
+    "(unless nil (quote yes))",
+    "(unless t (quote no))",
+    "(and 1 2 3)",
+    "(and 1 nil 3)",
+    "(and)",
+    "(or nil nil 5)",
+    "(or 1 2)",
+    "(or nil nil)",
+    "(cond ((= 1 2) (quote a)) ((= 1 1) (quote b)) (t (quote c)))",
+    "(cond (nil 1) (2))",
+    "(cond (nil 1))",
+    "(defun classify (n) (cond ((< n 0) (quote neg)) ((= n 0) (quote zero)) (t (quote pos)))) (list (classify -5) (classify 0) (classify 5))",
+    "(defun evenp2 (n) (cond ((= n 0) t) ((= n 1) nil) (t (evenp2 (- n 2))))) (evenp2 10)",
+    "(defun fact (n) (if (and (integerp n) (> n 0)) (* n (fact (- n 1))) 1)) (fact 5)",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a
