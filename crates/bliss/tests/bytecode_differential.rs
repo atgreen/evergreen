@@ -150,6 +150,22 @@ const CORPUS: &[&str] = &[
     "(defun f (x) (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart (quote r) 3)))) (restart-case (error \"x\") (r (v) (+ v x))))) (f 10)",
     "(defun f () (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart (quote continue))))) (restart-case (progn (error \"x\") 5) (continue () 42)))) (f)",
     "(defun g (n) (if (< n 0) (error \"neg\") (* n 2))) (defun f () (handler-case (g -1) (error () (quote was-neg)))) (f)",
+    // ── Multiple values on bytecode (nmq.5) ──
+    "(values 1 2 3)",
+    "(multiple-value-bind (a b) (values 1 2) (list a b))",
+    "(multiple-value-bind (a b c) (values 10 20) (list a b c))",
+    "(multiple-value-bind (a b) 42 (list a b))",
+    "(multiple-value-list (values 1 2 3))",
+    "(multiple-value-list 7)",
+    // mv discipline quirks — must match the tree-walker exactly:
+    "(multiple-value-bind (a b) (progn (values 1 2) 3) (list a b))",
+    "(multiple-value-bind (a b) (+ (values 1 2) 3) (list a b))",
+    "(defun f () (multiple-value-bind (a b) (let ((x 0)) (setq x (values 1 2)) x) (list a b))) (f)",
+    "(defun vv () (values 7 8 9)) (multiple-value-bind (a b c) (vv) (list a b c))",
+    "(defun sv () (+ 1 2)) (multiple-value-bind (a b) (sv) (list a b))",
+    "(multiple-value-bind (q r) (floor 17 5) (list q r))",
+    "(multiple-value-bind (a b) (values 1 2) (multiple-value-bind (c d) (values 3 4) (list a b c d)))",
+    "(multiple-value-bind (a b) (if t (values 1 2) 0) (list a b))",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a
@@ -164,6 +180,8 @@ const MUST_COMPILE: &[&str] = &[
     "(let ((x 1)) (setq x (+ x 10)) x)",
     "(defvar *gg* 3) (defun rr () (setq *gg* (* *gg* 2)))",
     "(defun hc () (handler-case (car 5) (error (e) (quote caught))))",
+    "(multiple-value-bind (a b) (values 1 2) (list a b))",
+    "(values 1 2 3)",
 ];
 
 #[test]

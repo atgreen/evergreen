@@ -43,7 +43,7 @@ use super::{
     arena_cons, bliss_error_to_condition, condition_matches_handler, cp, eval_form,
     handler_case_token, list_to_vec, next_control_token, resolve_sym, restart_invoked_name,
     run_handler_bind_handlers, store_control_value, sym_name, tag_key, take_control_value,
-    val_as_str,
+    val_as_str, vec_to_list,
 };
 
 // ── Backend selection ──────────────────────────────────────────────
@@ -77,6 +77,18 @@ enum Instr {
     LoadGlobal(u32),
     /// Pop and store into the dynamic/global value of `sym` (`STORE_SPECIAL`).
     StoreGlobal(u32),
+    /// Pop `n` values, set them as the multiple values, and push the primary
+    /// (`VALUES`). `n = 0` pushes NIL.
+    SetValues(u16),
+    /// Clear the pending multiple values (single-value context).
+    ClearMv,
+    /// Pop the primary; read the current multiple values; store the first
+    /// `nvars` of them (primary, then secondaries, NIL-padded) into local slots
+    /// `slot_base..slot_base+nvars` (`MULTIPLE-VALUE-BIND`).
+    TakeValuesToLocals { nvars: u16, slot_base: u16 },
+    /// Pop the primary; push a fresh list of the current multiple values
+    /// (`MULTIPLE-VALUE-LIST`).
+    ValuesToList,
     /// Discard the top of the operand stack.
     Pop,
     /// Unconditional jump: set the bytecode pointer to `target`.
@@ -462,6 +474,9 @@ impl<'e> Lowerer<'e> {
                 "HANDLER-CASE" => self.lower_handler_case(rest),
                 "HANDLER-BIND" => self.lower_handler_bind(rest),
                 "RESTART-CASE" => self.lower_restart_case(rest),
+                "VALUES" => self.lower_values(rest),
+                "MULTIPLE-VALUE-BIND" => self.lower_mvb(rest),
+                "MULTIPLE-VALUE-LIST" => self.lower_mvlist(rest),
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
@@ -639,6 +654,8 @@ impl<'e> Lowerer<'e> {
                 Some(slot) => {
                     self.emit(Instr::StoreLocal(slot));
                     self.pop_n(1);
+                    // SETQ is not multiple-value-preserving.
+                    self.emit(Instr::ClearMv);
                     if last {
                         self.emit(Instr::LoadLocal(slot));
                         self.push_n(1);
@@ -648,6 +665,7 @@ impl<'e> Lowerer<'e> {
                     let sym = var.as_symbol_index();
                     self.emit(Instr::StoreGlobal(sym));
                     self.pop_n(1);
+                    self.emit(Instr::ClearMv);
                     if last {
                         self.emit(Instr::LoadGlobal(sym));
                         self.push_n(1);
@@ -1091,6 +1109,68 @@ impl<'e> Lowerer<'e> {
         // Net +1 (the restartable form's value, or a delivered restart result).
         Ok(())
     }
+
+    // ── Multiple values (nmq.5) ────────────────────────────────────
+
+    /// `(values v0 v1 ...)` — set the multiple values, leave the primary.
+    fn lower_values(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let args = list_to_vec(rest);
+        if args.len() > u16::MAX as usize {
+            return Err(Bail);
+        }
+        let n = args.len() as u16;
+        for a in args {
+            self.lower_expr(a)?;
+        }
+        self.emit(Instr::SetValues(n));
+        self.pop_n(n);
+        self.push_n(1);
+        Ok(())
+    }
+
+    /// `(multiple-value-bind (vars...) values-form body...)`.
+    fn lower_mvb(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (vars_form, r2) = cp(rest);
+        let (values_form, body) = cp(r2);
+        let vars = list_to_vec(vars_form);
+        for v in &vars {
+            if !v.is_symbol() {
+                return Err(Bail);
+            }
+        }
+        if vars.len() > u16::MAX as usize {
+            return Err(Bail);
+        }
+
+        // Single-value context around the values form: clear, evaluate, read.
+        self.emit(Instr::ClearMv);
+        self.lower_expr(values_form)?; // primary on stack (+1), mv set
+
+        let saved_next_local = self.next_local;
+        self.enter_scope();
+        let slot_base = self.next_local;
+        for v in &vars {
+            self.alloc_local(&sym_name(*v));
+        }
+        self.emit(Instr::TakeValuesToLocals {
+            nvars: vars.len() as u16,
+            slot_base,
+        });
+        self.pop_n(1); // consumes the primary
+
+        self.lower_progn(body)?; // body value (+1)
+        self.exit_scope(saved_next_local);
+        Ok(())
+    }
+
+    /// `(multiple-value-list form)`.
+    fn lower_mvlist(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (form, _) = cp(rest);
+        self.emit(Instr::ClearMv);
+        self.lower_expr(form)?; // primary (+1), mv set
+        self.emit(Instr::ValuesToList); // pop primary, push list
+        Ok(())
+    }
 }
 
 /// Collect the names of all symbols appearing in `form` (recursively), except
@@ -1152,11 +1232,8 @@ fn is_bail_special(name: &str) -> bool {
             | "EVAL-WHEN"
             | "LOAD-TIME-VALUE"
             | "PROGV"
-            | "MULTIPLE-VALUE-BIND"
             | "MULTIPLE-VALUE-CALL"
             | "MULTIPLE-VALUE-PROG1"
-            | "MULTIPLE-VALUE-LIST"
-            | "VALUES"
             | "COND"
             | "CASE"
             | "TYPECASE"
@@ -1490,6 +1567,47 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 let s = BlissVal::from_symbol_index(sym);
                 let v = acts[top_idx].pop_op();
                 env.set_var_symbol(s, v);
+            }
+            Instr::SetValues(n) => {
+                let act = &mut acts[top_idx];
+                let mut vals = vec![NIL; n as usize];
+                for i in (0..n as usize).rev() {
+                    vals[i] = act.pop_op();
+                }
+                let primary = vals.first().copied().unwrap_or(NIL);
+                env.set_mv(vals);
+                act.push_op(primary);
+            }
+            Instr::ClearMv => {
+                env.clear_mv();
+            }
+            Instr::TakeValuesToLocals { nvars, slot_base } => {
+                let act = &mut acts[top_idx];
+                let primary = act.pop_op();
+                let frame = act.frame;
+                let vals: Vec<BlissVal> = if env.mv_active {
+                    env.mv.clone()
+                } else {
+                    Vec::new()
+                };
+                for i in 0..nvars {
+                    let v = if i == 0 {
+                        primary
+                    } else {
+                        vals.get(i as usize).copied().unwrap_or(NIL)
+                    };
+                    unsafe { slot_set(frame, slot_base + i, v) };
+                }
+            }
+            Instr::ValuesToList => {
+                let act = &mut acts[top_idx];
+                let primary = act.pop_op();
+                let vals: Vec<BlissVal> = if env.mv_active {
+                    env.mv.clone()
+                } else {
+                    vec![primary]
+                };
+                act.push_op(vec_to_list(&vals));
             }
             Instr::Pop => {
                 acts[top_idx].pop_op();
