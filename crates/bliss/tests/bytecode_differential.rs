@@ -199,6 +199,13 @@ const CORPUS: &[&str] = &[
     "(defun classify (n) (cond ((< n 0) (quote neg)) ((= n 0) (quote zero)) (t (quote pos)))) (list (classify -5) (classify 0) (classify 5))",
     "(defun evenp2 (n) (cond ((= n 0) t) ((= n 1) nil) (t (evenp2 (- n 2))))) (evenp2 10)",
     "(defun fact (n) (if (and (integerp n) (> n 0)) (* n (fact (- n 1))) 1)) (fact 5)",
+    // ── case on bytecode (nmq.6 coverage) ──
+    "(case 2 (1 (quote one)) (2 (quote two)) (t (quote other)))",
+    "(case 5 (1 (quote one)) (2 (quote two)) (t (quote other)))",
+    "(case 3 ((1 2 3) (quote low)) ((4 5 6) (quote high)))",
+    "(case (quote b) (a 1) (b 2) (otherwise 99))",
+    "(case 9 (1 (quote one)))",
+    "(defun day (n) (case n (0 (quote sun)) (1 (quote mon)) (otherwise (quote other)))) (list (day 0) (day 1) (day 5))",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a

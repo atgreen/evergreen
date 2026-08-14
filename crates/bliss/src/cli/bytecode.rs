@@ -117,6 +117,8 @@ enum Instr {
     Br(u32),
     /// Pop; if it is NIL, jump to `target`, else fall through.
     BrIfFalse(u32),
+    /// Pop; if it is non-NIL, jump to `target`, else fall through.
+    BrIfTrue(u32),
     /// Call `sym` with `nargs` operands. Resolves to a bytecode function
     /// (native frame push) or falls back to the tree-walker's `apply_function`.
     CallNamed { sym: u32, nargs: u16 },
@@ -538,6 +540,7 @@ impl<'e> Lowerer<'e> {
                 "AND" => self.lower_and(rest),
                 "OR" => self.lower_or(rest),
                 "COND" => self.lower_cond(rest),
+                "CASE" => self.lower_case(rest),
                 "PROGN" => self.lower_progn(rest),
                 "LET" => self.lower_let(rest, false),
                 "LET*" => self.lower_let(rest, true),
@@ -729,6 +732,88 @@ impl<'e> Lowerer<'e> {
                 self.pop_n(1);
             }
         }
+        let end = self.code.len() as u32;
+        for j in end_jumps {
+            self.code[j] = Instr::Br(end);
+        }
+        self.cur_stack = base + 1;
+        if self.cur_stack > self.max_stack {
+            self.max_stack = self.cur_stack;
+        }
+        Ok(())
+    }
+
+    /// `(case key (vals body...)... (otherwise body...))` — evaluate the key
+    /// once, EQL-compare against each clause's designator(s).
+    fn lower_case(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (key_form, clauses_form) = cp(rest);
+        let clauses = list_to_vec(clauses_form);
+        let base = self.cur_stack;
+
+        // Evaluate the key once into a temporary slot.
+        self.lower_expr(key_form)?;
+        let key_slot = self.alloc_slot("__case_key__");
+        self.emit(Instr::StoreLocal(key_slot));
+        self.pop_n(1);
+
+        let eql_sym = resolve_sym("EQL").ok_or(Bail)?.as_symbol_index();
+        let mut end_jumps = Vec::new();
+        for clause in clauses {
+            if !clause.is_cons() {
+                return Err(Bail);
+            }
+            let (designator, body) = cp(clause);
+            self.cur_stack = base;
+            let is_default = (designator.is_symbol()
+                && matches!(sym_name(designator).as_str(), "OTHERWISE" | "T"))
+                || designator == T;
+            if is_default {
+                self.lower_progn(body)?;
+                self.emit(Instr::Br(0));
+                end_jumps.push(self.code.len() - 1);
+                break; // default is terminal
+            }
+            // Designator is a single object or a list of objects.
+            let keys = if designator.is_cons() {
+                list_to_vec(designator)
+            } else {
+                vec![designator]
+            };
+            let mut to_body = Vec::new();
+            for k in keys {
+                self.emit(Instr::LoadLocal(key_slot));
+                self.push_n(1);
+                let c = self.add_const(k);
+                self.emit(Instr::Const(c));
+                self.push_n(1);
+                self.emit(Instr::CallNamed {
+                    sym: eql_sym,
+                    nargs: 2,
+                });
+                self.pop_n(2);
+                self.push_n(1);
+                self.emit(Instr::BrIfTrue(0));
+                to_body.push(self.code.len() - 1);
+                self.pop_n(1);
+            }
+            // No key matched → skip to the next clause.
+            self.emit(Instr::Br(0));
+            let to_next = self.code.len() - 1;
+            let body_pc = self.code.len() as u32;
+            for j in to_body {
+                self.code[j] = Instr::BrIfTrue(body_pc);
+            }
+            self.cur_stack = base;
+            self.lower_progn(body)?;
+            self.emit(Instr::Br(0));
+            end_jumps.push(self.code.len() - 1);
+            let next_pc = self.code.len() as u32;
+            self.code[to_next] = Instr::Br(next_pc);
+        }
+        // Fell through all clauses with no default → NIL.
+        self.cur_stack = base;
+        let c = self.add_const(NIL);
+        self.emit(Instr::Const(c));
         let end = self.code.len() as u32;
         for j in end_jumps {
             self.code[j] = Instr::Br(end);
@@ -1600,7 +1685,6 @@ fn is_bail_special(name: &str) -> bool {
             | "PROGV"
             | "MULTIPLE-VALUE-CALL"
             | "MULTIPLE-VALUE-PROG1"
-            | "CASE"
             | "TYPECASE"
             | "ECASE"
             | "DO"
@@ -2160,6 +2244,12 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
             Instr::BrIfFalse(target) => {
                 let v = acts[top_idx].pop_op();
                 if v.is_nil() {
+                    acts[top_idx].bcp = target as usize;
+                }
+            }
+            Instr::BrIfTrue(target) => {
+                let v = acts[top_idx].pop_op();
+                if !v.is_nil() {
                     acts[top_idx].bcp = target as usize;
                 }
             }
