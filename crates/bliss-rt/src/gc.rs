@@ -1150,6 +1150,12 @@ impl Collector for HeapCollector {
         // still intact and before the nursery is reset.
         Self::relocate_cl_stack_refs(heap_base_addr, state.config.heap_size);
         relocate_entry_continuation(heap_base_addr, heap_end);
+        // Symbol-table roots (bliss-jtc.6 Stage C): a nursery object may be
+        // reachable only from a global symbol's cell; rewrite those cells to the
+        // evacuated location while forwarding is intact.
+        crate::symbols::for_each_root_slot(|slot| unsafe {
+            relocate_slot(slot, heap_base_addr, heap_end)
+        });
 
         // Phase 4: Reset all nursery regions for reuse (after relocation, above,
         // read their forwarding pointers). Retained pinned regions were promoted
@@ -1313,6 +1319,14 @@ impl Collector for HeapCollector {
         // this one walk covers mixed-tier stacks.
         Self::scan_cl_stack_roots(&mut marked, &mut scan_worklist, &object_index);
 
+        // Symbol-table roots (bliss-jtc.6 Stage C): every interned/uninterned
+        // symbol's cells are roots, so a heap object reachable only through a
+        // global symbol (its value/function/plist) survives collection.
+        crate::symbols::for_each_root_slot(|slot| {
+            let v = unsafe { *slot };
+            mark_ref(v, &mut marked, &mut scan_worklist);
+        });
+
         // Transitive closure: trace only the reference fields of each marked
         // object, following its type_id-specific layout.
         while let Some(obj_addr) = scan_worklist.pop() {
@@ -1464,6 +1478,12 @@ impl Collector for HeapCollector {
         Self::relocate_object_fields(state, heap_base_addr, heap_end);
         Self::relocate_cl_stack_refs(heap_base_addr, heap_size);
         relocate_entry_continuation(heap_base_addr, heap_end);
+        // Symbol-table roots (bliss-jtc.6 Stage C): rewrite any symbol cell that
+        // referenced an evacuated object. Idempotent w.r.t. the object-field pass
+        // above (a cell already relocated points at a non-forwarded target).
+        crate::symbols::for_each_root_slot(|slot| unsafe {
+            relocate_slot(slot, heap_base_addr, heap_end)
+        });
 
         // Now free the evacuated regions — their forwarding pointers are no
         // longer needed.

@@ -130,13 +130,26 @@ fn with_registry<R>(f: impl FnOnce(Option<&SymbolRegistry>) -> R) -> R {
 /// Intern `name`, returning its symbol index. Idempotent: the same name always
 /// yields the same index and the same underlying heap object.
 pub fn intern(name: &str) -> u32 {
+    // Fast path: already interned. Takes only a read lock.
+    if let Some(idx) = find_index(name) {
+        return idx;
+    }
+    // Allocate the object and its name string *outside* the registry lock. A
+    // collection triggered by this allocation scans the registry under a read
+    // lock (`for_each_root_slot`); holding the write lock across the allocation
+    // would deadlock. Both objects are pinned before any further allocation, so
+    // a mid-intern collection cannot reclaim them.
+    let name_str = alloc_pinned_name(name);
+    let sym = alloc_pinned_symbol(name_str, NIL);
     with_registry_mut(|reg| {
+        // Re-check under the write lock in case another thread interned `name`
+        // while we were allocating; if so, drop our now-orphaned objects.
         if let Some(&idx) = reg.name_to_index.get(name) {
+            crate::gc::unpin(sym);
+            crate::gc::unpin(name_str);
             return idx;
         }
         let idx = reg.interned.len() as u32;
-        let name_str = alloc_pinned_name(name);
-        let sym = alloc_pinned_symbol(name_str, NIL);
         reg.interned.push(sym);
         reg.name_to_index.insert(name.to_string(), idx);
         idx
@@ -181,6 +194,41 @@ pub fn make_uninterned(name: &str) -> BlissVal {
         reg.uninterned.insert(idx, sym);
     });
     BlissVal::from_symbol_index(idx)
+}
+
+/// Visit every GC-root reference slot held by the registry's symbols — each
+/// symbol's name/value/function/plist/package cell (bliss-jtc.6 Stage C). The
+/// collector calls this so symbol cells act as roots: a heap object reachable
+/// only through a global symbol is marked (major GC) and, if it moves, the cell
+/// is relocated to follow it (both GCs).
+///
+/// Symbols are pinned, so the yielded slot addresses are stable for the duration
+/// of a collection. Only a read lock is held; this must never run while the
+/// caller holds the registry write lock — and it never does, because interning
+/// releases the lock before any allocation that could trigger a collection.
+pub(crate) fn for_each_root_slot(mut f: impl FnMut(*mut BlissVal)) {
+    let guard = REGISTRY.read().expect("symbol registry poisoned");
+    let Some(reg) = guard.as_ref() else {
+        return;
+    };
+    let mut visit = |obj: BlissVal| {
+        // SAFETY: registry objects are pinned live symbols; each ref cell is a
+        // writable BlissVal at a fixed offset within the object.
+        unsafe {
+            let sym = symbol_data(obj);
+            f(&raw mut (*sym).name);
+            f(&raw mut (*sym).value);
+            f(&raw mut (*sym).function);
+            f(&raw mut (*sym).plist);
+            f(&raw mut (*sym).package);
+        }
+    };
+    for &obj in &reg.interned {
+        visit(obj);
+    }
+    for &obj in reg.uninterned.values() {
+        visit(obj);
+    }
 }
 
 // ── Cell accessors (used by later staging; symbols carry their own cells) ────
@@ -316,6 +364,39 @@ mod tests {
         })
         .expect("walk_heap");
         assert!(saw_symbol, "interned symbols must be SYMBOL objects on the GC heap");
+    }
+
+    #[test]
+    fn value_reachable_only_through_a_symbol_cell_survives_gc() {
+        // A cons stored ONLY in a symbol's value cell — no other root anywhere.
+        let idx = intern("STAGE-C-CELL-ROOT");
+        let marker = BlissVal::from_fixnum(0x00C0_FFEE);
+        let cons_body = crate::gc::alloc_typed(16, type_id::CONS).expect("alloc cons");
+        // SAFETY: fresh 16-byte cons body [car | cdr].
+        let cons = unsafe {
+            *(cons_body as *mut BlissVal) = marker;
+            *(cons_body as *mut BlissVal).add(1) = NIL;
+            BlissVal::from_cons_ptr(cons_body)
+        };
+        set_symbol_value(idx, cons);
+
+        // Push it through several generations: heavy churn + repeated collection
+        // promotes the cons to old-gen and drives major evacuation/sweep. Without
+        // the symbol cell acting as a root it would be swept (mark) or its cell
+        // left dangling (relocate); either way the marker would be lost.
+        for cycle in 0..3 {
+            for _ in 0..300 {
+                let _ = crate::gc::alloc_typed(16, type_id::CONS);
+            }
+            crate::gc::full_gc().unwrap_or_else(|_| panic!("full_gc cycle {cycle}"));
+            let cell = symbol_value(idx).expect("value cell present");
+            // SAFETY: a live cons value points at its body; car is the first word.
+            let car = unsafe { *(cell.as_ptr() as *const BlissVal) };
+            assert_eq!(
+                car, marker,
+                "cons reachable only via the symbol cell survived GC cycle {cycle} intact"
+            );
+        }
     }
 
     #[test]
