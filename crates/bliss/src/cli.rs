@@ -4911,6 +4911,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let n = bliss_stdlib::hash_table_count(tbl)?;
                 return Ok(BlissVal::from_fixnum(n as i64));
             }
+            "MAPHASH" => {
+                // (maphash function hash-table): call FUNCTION on each key/value
+                // pair through the unified function protocol (bliss-jtc.8) — any
+                // callable (lambda, closure, heap function object, builtin), not
+                // only a native pointer. Iterates a snapshot so the table may be
+                // mutated (per-key) during the walk. Returns NIL.
+                let (fn_form, r) = cp(cdr);
+                let (tbl_form, _) = cp(r);
+                let function = eval_form(fn_form, env)?;
+                let tbl = eval_form(tbl_form, env)?;
+                for (key, value) in bliss_stdlib::hash_table_entries(tbl)? {
+                    apply_function(function, &[key, value], env)?;
+                }
+                return Ok(NIL);
+            }
             "MAPCAR" => {
                 // (mapcar fn list1 list2 ...) — apply fn to successive tuples,
                 // stopping at the shortest list.
@@ -11512,6 +11527,41 @@ mod jtc6_8_function_object_tests {
             bliss_rt::function::invoke_count(f) > before,
             "a resolved global call must bump the FnMeta invoke counter"
         );
+    }
+}
+
+#[cfg(test)]
+mod jtc8_hashtable_tests {
+    use super::*;
+
+    /// bliss-jtc.8: MAPHASH invokes any callable — here an interpreted lambda —
+    /// through the unified function protocol, not just native pointers.
+    #[test]
+    fn maphash_invokes_interpreted_functions() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let out = read_eval_all(
+            "(let ((h (make-hash-table)) (s 0)) \
+               (setf (gethash :a h) 10) (setf (gethash :b h) 20) \
+               (maphash (lambda (k v) k (setq s (+ s v))) h) s)",
+        )
+        .expect("maphash");
+        assert_eq!(out, BlissVal::from_fixnum(30));
+    }
+
+    /// MAPHASH also dispatches a named global function (its heap function object).
+    #[test]
+    fn maphash_invokes_named_global_functions() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let out = read_eval_all(
+            "(let ((acc nil)) \
+               (defun c8-collect (k v) k (setq acc (cons v acc))) \
+               (let ((h (make-hash-table))) \
+                 (setf (gethash :x h) 1) \
+                 (maphash #'c8-collect h)) \
+               (length acc))",
+        )
+        .expect("maphash named");
+        assert_eq!(out, BlissVal::from_fixnum(1));
     }
 }
 
