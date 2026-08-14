@@ -7,6 +7,7 @@
 
 // ── Object model ──────────────────────────────────────────────────
 pub mod object;
+pub mod packages;
 pub mod symbols;
 pub mod types;
 pub mod value;

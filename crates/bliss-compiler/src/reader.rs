@@ -8,7 +8,7 @@ use bliss_rt::object::{
     type_id,
 };
 use bliss_rt::value::{BlissVal, EOF, MISSING, NIL, T, TAG_HEAP_OBJECT};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 type MacroCharTable = HashMap<(u64, char), (BlissVal, bool)>;
@@ -23,8 +23,8 @@ const MAX_READER_NESTING: usize = 4096;
 // interned symbol is a heap-resident `SymbolData` object (bliss-jtc.6 Stage A).
 // The reader's public entrypoints delegate to it so the reader, interpreter,
 // stdlib, and GC share one symbol identity space rather than parallel name
-// tables. Package name membership (below) is still reader-local pending Stage D.
-static PACKAGE_TABLE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+// tables. Package existence is likewise delegated to the shared bliss_rt package
+// registry of heap PACKAGE objects (bliss-jtc.6 Stage D).
 
 pub fn intern_symbol(name: &str) -> u32 {
     bliss_rt::symbols::intern(name)
@@ -45,31 +45,11 @@ pub fn symbol_name(idx: u32) -> Option<String> {
 }
 
 pub fn register_package(name: &str) {
-    let mut packages = PACKAGE_TABLE.lock().unwrap();
-    let set = packages.get_or_insert_with(|| {
-        let mut builtins = HashSet::new();
-        builtins.insert("CL".to_string());
-        builtins.insert("COMMON-LISP".to_string());
-        builtins.insert("KEYWORD".to_string());
-        builtins.insert("BLISS".to_string());
-        builtins.insert("CL-USER".to_string());
-        builtins
-    });
-    set.insert(name.to_uppercase());
+    bliss_rt::packages::register(name);
 }
 
 fn package_exists(name: &str) -> bool {
-    let mut packages = PACKAGE_TABLE.lock().unwrap();
-    let set = packages.get_or_insert_with(|| {
-        let mut builtins = HashSet::new();
-        builtins.insert("CL".to_string());
-        builtins.insert("COMMON-LISP".to_string());
-        builtins.insert("KEYWORD".to_string());
-        builtins.insert("BLISS".to_string());
-        builtins.insert("CL-USER".to_string());
-        builtins
-    });
-    set.contains(&name.to_uppercase())
+    bliss_rt::packages::exists(name)
 }
 
 /// Create a fresh uninterned symbol with the given name. Each call yields a

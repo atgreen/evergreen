@@ -188,6 +188,25 @@ pub mod type_id {
     pub const RESTART: u8 = 0x17;
 }
 
+// ── Package ────────────────────────────────────────────────────────
+
+/// Heap layout for a package (56 bytes total). §1.12, D1.20.
+///
+/// The `internal_symbols`/`external_symbols` cells hold hash-tables (string →
+/// symbol) in the full model; a package built before that machinery is wired
+/// leaves them `NIL`. `lock` is a raw pointer to a heap-allocated per-package
+/// reader-writer lock, or null.
+#[repr(C)]
+pub struct PackageData {
+    pub header: ObjectHeader,
+    pub name: BlissVal,
+    pub internal_symbols: BlissVal,
+    pub external_symbols: BlissVal,
+    pub use_list: BlissVal,
+    pub nicknames: BlissVal,
+    pub lock: *mut core::ffi::c_void,
+}
+
 // ── Cons cell ──────────────────────────────────────────────────────
 
 /// A headerless 16-byte cons cell (car + cdr).
