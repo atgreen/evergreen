@@ -116,6 +116,13 @@ const CORPUS: &[&str] = &[
     "(defun error-out () (car 5)) (defun work () (unwind-protect (error-out) (throw (quote cu) (quote cleanup-ran)))) (catch (quote cu) (work))",
     // A throw crossing many compiled frames.
     "(defun dig (n) (if (= n 0) (throw (quote out) (quote bottom)) (dig (- n 1)))) (catch (quote out) (dig 500))",
+    // ── Global / special variable access (nmq.5, LOAD/STORE_SPECIAL) ──
+    "(defvar *g* 10) (defun rd () (+ *g* 1)) (rd)",
+    "(defparameter *p* 5) (defun bump () (setq *p* (+ *p* 100))) (bump) *p*",
+    "(defconstant +k+ 42) (defun kk () +k+) (kk)",
+    "(defparameter *c* 0) (defun tick () (setq *c* (+ *c* 1))) (tick) (tick) (tick) *c*",
+    // Unbound special read errors the same way in both backends.
+    "(defun add-pi () (+ 0 pi)) (add-pi)",
 ];
 
 /// Programs that must run on the bytecode backend (not fall back). Each is a
@@ -128,6 +135,7 @@ const MUST_COMPILE: &[&str] = &[
     "(let ((log nil)) (catch (quote e) (unwind-protect (throw (quote e) 0) (setq log (cons 99 log)))) log)",
     "(let ((n 5)) (if (< n 10) (+ n 1) 0))",
     "(let ((x 1)) (setq x (+ x 10)) x)",
+    "(defvar *gg* 3) (defun rr () (setq *gg* (* *gg* 2)))",
 ];
 
 #[test]

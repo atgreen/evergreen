@@ -70,6 +70,10 @@ enum Instr {
     LoadLocal(u16),
     /// Pop and store into local slot `idx`.
     StoreLocal(u16),
+    /// Push the dynamic/global value of symbol `sym` (spec `LOAD_SPECIAL`).
+    LoadGlobal(u32),
+    /// Pop and store into the dynamic/global value of `sym` (`STORE_SPECIAL`).
+    StoreGlobal(u32),
     /// Discard the top of the operand stack.
     Pop,
     /// Unconditional jump: set the bytecode pointer to `target`.
@@ -319,8 +323,15 @@ impl<'e> Lowerer<'e> {
                 self.push_n(1);
                 return Ok(());
             }
-            // A global/special variable — not yet lowered (slice 1).
-            return Err(Bail);
+            // A global / special / symbol-macro reference. Symbol-macros must
+            // expand (tree-walker semantics) — bail on those; otherwise emit a
+            // dynamic value load.
+            if self.env.symbol_macros.contains_key(&form.as_symbol_index()) {
+                return Err(Bail);
+            }
+            self.emit(Instr::LoadGlobal(form.as_symbol_index()));
+            self.push_n(1);
+            return Ok(());
         }
         // Cons: special form or call.
         if form.is_cons() {
@@ -517,17 +528,31 @@ impl<'e> Lowerer<'e> {
             if !var.is_symbol() {
                 return Err(Bail);
             }
-            let slot = match self.lookup_local(&sym_name(var)) {
-                Some(s) => s,
-                None => return Err(Bail),
-            };
+            let name = sym_name(var);
+            // A symbol-macro `setq` is really a `setf` of the expansion — bail.
+            if self.env.symbol_macros.contains_key(&var.as_symbol_index()) {
+                return Err(Bail);
+            }
+            let last = i + 1 == npairs;
             self.lower_expr(val)?; // +1
-            self.emit(Instr::StoreLocal(slot));
-            self.pop_n(1);
-            if i + 1 == npairs {
-                // Last assignment's value is SETQ's result.
-                self.emit(Instr::LoadLocal(slot));
-                self.push_n(1);
+            match self.lookup_local(&name) {
+                Some(slot) => {
+                    self.emit(Instr::StoreLocal(slot));
+                    self.pop_n(1);
+                    if last {
+                        self.emit(Instr::LoadLocal(slot));
+                        self.push_n(1);
+                    }
+                }
+                None => {
+                    let sym = var.as_symbol_index();
+                    self.emit(Instr::StoreGlobal(sym));
+                    self.pop_n(1);
+                    if last {
+                        self.emit(Instr::LoadGlobal(sym));
+                        self.push_n(1);
+                    }
+                }
             }
         }
         Ok(())
@@ -1104,6 +1129,30 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 let v = act.pop_op();
                 unsafe { slot_set(act.frame, idx, v) };
             }
+            Instr::LoadGlobal(sym) => {
+                let s = BlissVal::from_symbol_index(sym);
+                let val = env
+                    .lookup_var_symbol(s)
+                    .or_else(|| env.lookup_var(&sym_name(s)));
+                match val {
+                    Some(v) => acts[top_idx].push_op(v),
+                    None => {
+                        // Unbound: raise like the tree-walker, but via the unwind
+                        // driver so unwind-protect cleanups still run.
+                        initiate_unwind(
+                            acts,
+                            stack,
+                            env,
+                            Pending::Propagate(BlissError::UnboundVariable(s)),
+                        )?;
+                    }
+                }
+            }
+            Instr::StoreGlobal(sym) => {
+                let s = BlissVal::from_symbol_index(sym);
+                let v = acts[top_idx].pop_op();
+                env.set_var_symbol(s, v);
+            }
             Instr::Pop => {
                 acts[top_idx].pop_op();
             }
@@ -1455,10 +1504,16 @@ pub fn eval_toplevel(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
         let result = eval_form(form, env)?;
         if let Some(sym) = symbol_index_of(&name) {
             match compile_function(&name, params, body, env) {
-                Some(bf) => registry_put(sym, Rc::new(bf)),
+                Some(bf) => {
+                    trace("compiled");
+                    registry_put(sym, Rc::new(bf));
+                }
                 // Redefinition that no longer compiles must not leave stale
                 // bytecode behind — drop it so calls fall back to the tree-walker.
-                None => registry_remove(sym),
+                None => {
+                    trace("bailed");
+                    registry_remove(sym);
+                }
             }
         }
         return Ok(result);
