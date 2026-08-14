@@ -564,6 +564,48 @@ fn is_heap_ref(v: BlissVal) -> bool {
     )
 }
 
+/// If `slot` holds a reference to an object that has been evacuated — its header
+/// carries a forwarding pointer — rewrite the slot to the object's new location,
+/// preserving the tag. Bounds-checked against `[heap_base, heap_end)` so a slot
+/// pointing outside the managed heap is never dereferenced. This is the single
+/// relocation primitive shared by every root and object-field update pass
+/// (bliss-jtc.17): CL-stack frames, the entry continuation, the remembered set,
+/// and object reference fields.
+///
+/// # Safety
+/// `slot` must point at a readable/writable `BlissVal`.
+#[inline]
+unsafe fn relocate_slot(slot: *mut BlissVal, heap_base: usize, heap_end: usize) {
+    let v = unsafe { *slot };
+    if !is_heap_ref(v) {
+        return;
+    }
+    let tag = v.0 & crate::value::TAG_MASK;
+    let body = (v.0 & !crate::value::TAG_MASK) as usize;
+    if body < heap_base + OBJECT_HEADER_SIZE || body >= heap_end {
+        return;
+    }
+    // Evacuated objects are normal (offset-8 body); large objects never move, so
+    // the header always precedes the body by OBJECT_HEADER_SIZE here.
+    let header = (body - OBJECT_HEADER_SIZE) as *const u8;
+    // SAFETY: `body` lies within the managed heap; its header precedes it.
+    if unsafe { header_is_forwarded(header) } {
+        let new_body = unsafe { header_forwarding_addr(header) } as u64;
+        unsafe { *slot = BlissVal(new_body | tag) };
+    }
+}
+
+/// Relocate the saved entry-continuation root if it points at an evacuated
+/// object (bliss-jtc.17).
+fn relocate_entry_continuation(heap_base: usize, heap_end: usize) {
+    let cell = entry_continuation_cell();
+    let mut guard = cell.lock().unwrap();
+    let mut v = *guard;
+    // SAFETY: `&mut v` is a valid local BlissVal slot.
+    unsafe { relocate_slot(&mut v as *mut BlissVal, heap_base, heap_end) };
+    *guard = v;
+}
+
 /// Enumerate the `BlissVal` reference fields of a heap object precisely
 /// (bliss-jtc.20). `body` points past the object header; `body_len` is the
 /// object's exact body length in bytes; `type_id` selects the field layout
@@ -573,12 +615,15 @@ fn is_heap_ref(v: BlissVal) -> bool {
 /// can never be mistaken for a live reference. The `visit` closure decides which
 /// visited values are actual heap references.
 ///
+/// The `visit` closure receives a mutable pointer to each reference slot, so it
+/// can both read (marking) and rewrite (evacuation relocation) the field.
+///
 /// Safety: `body` must point at a live object body of at least `body_len` bytes.
 unsafe fn trace_object(
-    body: *const u8,
+    body: *mut u8,
     type_id: u8,
     body_len: usize,
-    mut visit: impl FnMut(BlissVal),
+    mut visit: impl FnMut(*mut BlissVal),
 ) {
     use crate::object::type_id as tid;
     let words = body_len / 8;
@@ -586,7 +631,8 @@ unsafe fn trace_object(
     let word = |i: usize| unsafe { BlissVal(*(body as *const u64).add(i)) };
     let mut visit_word = |i: usize| {
         if i < words {
-            visit(word(i));
+            // Safety: `i < words`, so the slot is within the object body.
+            visit(unsafe { (body as *mut BlissVal).add(i) });
         }
     };
     match type_id {
@@ -732,20 +778,10 @@ impl HeapCollector {
     /// regions are zeroed. `heap_base`/`heap_size` bound the check so a frame
     /// slot pointing outside the managed heap is never dereferenced.
     fn relocate_cl_stack_refs(heap_base: usize, heap_size: usize) {
+        let heap_end = heap_base + heap_size;
         let mut chase = |slot: &mut crate::value::BlissVal| {
-            let tag = slot.0 & 0b111;
-            let body = (slot.0 & !0b111) as usize;
-            if body < heap_base || body >= heap_base + heap_size || body < OBJECT_HEADER_SIZE {
-                return;
-            }
-            // CL-frame references point at object bodies; the header precedes the
-            // body. Objects reachable from a frame are inline-sized (offset 8).
-            let header = (body - OBJECT_HEADER_SIZE) as *const u8;
-            // SAFETY: `body` is within the managed heap; its header precedes it.
-            if unsafe { header_is_forwarded(header) } {
-                let new_body = unsafe { header_forwarding_addr(header) } as u64;
-                slot.0 = new_body | tag;
-            }
+            // SAFETY: `slot` is a live frame slot.
+            unsafe { relocate_slot(slot as *mut BlissVal, heap_base, heap_end) };
         };
         let mut relocate_from = |fp: *const crate::stack::Frame| {
             // SAFETY: `fp` is a valid frame chain.
@@ -759,6 +795,46 @@ impl HeapCollector {
             }
             if let Some(fp) = crate::thread::thread_published_fp(id) {
                 relocate_from(fp);
+            }
+        }
+    }
+
+    /// Rewrite every reference field of every surviving object to its referent's
+    /// forwarded location (bliss-jtc.17). Walks all old-gen/survivor/large-object
+    /// regions — which after evacuation hold the live survivors *and* the fresh
+    /// copies — and, for each non-forwarded object, traces its reference fields
+    /// (precisely, by type_id) and relocates any that point at an evacuated
+    /// object. Forwarded (stale) originals are skipped; their storage is about to
+    /// be reclaimed. Must run after all copying installs forwarding and before
+    /// any region is freed, so no live field is left pointing at a stale location.
+    fn relocate_object_fields(state: &HeapState, heap_base: usize, heap_end: usize) {
+        for region in state.regions.iter() {
+            if !matches!(
+                region.header.kind,
+                RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject
+            ) {
+                continue;
+            }
+            let base = region.base as usize;
+            let top = region.header.alloc_top as usize;
+            let mut cursor = base;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let header_ptr = cursor as *mut u8;
+                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                if body_size == 0 && type_id == 0 {
+                    break;
+                }
+                let total = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                if !unsafe { header_is_forwarded(header_ptr) } {
+                    // SAFETY: a valid live object header at `header_ptr`.
+                    let body = unsafe { header_ptr.add(body_offset(header_ptr)) };
+                    unsafe {
+                        trace_object(body, type_id, body_size as usize, |slot| {
+                            relocate_slot(slot, heap_base, heap_end);
+                        });
+                    }
+                }
+                cursor += total;
             }
         }
     }
@@ -999,23 +1075,17 @@ impl Collector for HeapCollector {
             if slot_addr < heap_base_addr || slot_addr + 8 > heap_end {
                 continue;
             }
-            let slot = slot_addr as *mut BlissVal;
             // SAFETY: slot_addr lies within the managed heap.
-            let val = unsafe { *slot };
-            if !is_heap_ref(val) {
-                continue;
-            }
-            let body = (val.0 & !crate::value::TAG_MASK) as usize;
-            if body < heap_base_addr + OBJECT_HEADER_SIZE || body >= heap_end {
-                continue;
-            }
-            let header = (body - OBJECT_HEADER_SIZE) as *const u8;
-            // SAFETY: `body` is within the heap; its header precedes it.
-            if unsafe { header_is_forwarded(header) } {
-                let new_body = unsafe { header_forwarding_addr(header) } as u64;
-                unsafe { *slot = BlissVal(new_body | (val.0 & crate::value::TAG_MASK)) };
-            }
+            unsafe { relocate_slot(slot_addr as *mut BlissVal, heap_base_addr, heap_end) };
         }
+
+        // Complete the young-object root set (bliss-jtc.17): a nursery object may
+        // also be reachable only from a CL-stack frame or the entry continuation.
+        // Relocate those roots to the moved locations too, while forwarding is
+        // still intact and before the nursery is reset. (Old→young object fields
+        // are covered by the authoritative remembered set above.)
+        Self::relocate_cl_stack_refs(heap_base_addr, state.config.heap_size);
+        relocate_entry_continuation(heap_base_addr, heap_end);
 
         // Phase 4: Reset all nursery regions for reuse (after relocation, above,
         // read their forwarding pointers).
@@ -1180,8 +1250,8 @@ impl Collector for HeapCollector {
             if let Some(&(_total, _idx, type_id, body_len)) = object_index.get(&obj_addr) {
                 // SAFETY: obj_addr is an indexed live object body of body_len bytes.
                 unsafe {
-                    trace_object(obj_addr as *const u8, type_id, body_len, |field| {
-                        mark_ref(field, &mut marked, &mut scan_worklist);
+                    trace_object(obj_addr as *mut u8, type_id, body_len, |slot| {
+                        mark_ref(*slot, &mut marked, &mut scan_worklist);
                     });
                 }
             }
@@ -1311,11 +1381,15 @@ impl Collector for HeapCollector {
 
         }
 
-        // Relocate CL-stack references to evacuated (forwarded) objects before
-        // the source regions are zeroed, so objects held only in interpreter (T0)
-        // or compiled (T1) frames survive and their frame slots point at the new
-        // locations (nmq.3).
+        // Rewrite EVERY live reference to its forwarded location before any
+        // evacuated region is reclaimed (bliss-jtc.17): object reference fields
+        // (traced precisely by type_id), CL-stack frame slots of every green
+        // thread (nmq.3), and the entry-continuation root. After this pass no
+        // reachable slot points at a stale, about-to-be-freed location.
+        let heap_end = heap_base_addr + heap_size;
+        Self::relocate_object_fields(state, heap_base_addr, heap_end);
         Self::relocate_cl_stack_refs(heap_base_addr, heap_size);
+        relocate_entry_continuation(heap_base_addr, heap_end);
 
         // Now free the evacuated regions — their forwarding pointers are no
         // longer needed.
@@ -2506,9 +2580,12 @@ mod trace_tests {
     fn traced(type_id: u8, body: &[u64]) -> Vec<u64> {
         let mut out = Vec::new();
         let bytes = body.len() * 8;
+        let mut body = body.to_vec();
         // SAFETY: `body` is a live slice of at least `bytes` bytes.
         unsafe {
-            trace_object(body.as_ptr() as *const u8, type_id, bytes, |v| out.push(v.0));
+            trace_object(body.as_mut_ptr() as *mut u8, type_id, bytes, |slot| {
+                out.push((*slot).0)
+            });
         }
         out
     }
@@ -2604,5 +2681,83 @@ mod trace_tests {
         assert!(!is_heap_ref(BlissVal::from_fixnum(0x4000)));
         assert!(!is_heap_ref(crate::value::NIL));
         assert!(!is_heap_ref(crate::value::T));
+    }
+}
+
+// ── Reference relocation tests (bliss-jtc.17) ─────────────────────
+
+#[cfg(test)]
+mod relocation_tests {
+    use super::*;
+    use crate::object::type_id as tid;
+
+    const TAG_HEAP: u64 = 0b010;
+
+    /// An evacuated object's reference field is rewritten to the forwarded
+    /// location, and non-reference fields are left untouched. This is the inner
+    /// loop of `relocate_object_fields` (trace_object → relocate_slot).
+    #[test]
+    fn object_field_relocation_rewrites_forwarded_field() {
+        // `target` is forwarded to `moved`; `holder` (a RATIO) references target.
+        let mut target = vec![0u64; 2]; // header@0, body@8
+        let mut moved = vec![0u64; 2];
+        unsafe {
+            write_object_header(target.as_mut_ptr() as *mut u8, tid::DOUBLE_FLOAT, 8);
+            write_object_header(moved.as_mut_ptr() as *mut u8, tid::DOUBLE_FLOAT, 8);
+        }
+        let target_body = unsafe { (target.as_mut_ptr() as *mut u8).add(8) } as usize;
+        let moved_body = unsafe { (moved.as_mut_ptr() as *mut u8).add(8) } as usize;
+        moved[1] = 0xFEED_1234; // marker at moved body
+        unsafe {
+            header_set_forwarded(target.as_mut_ptr() as *mut u8, moved_body as *mut u8);
+        }
+
+        let mut holder = vec![0u64; 3]; // header@0, numerator@8, denominator@16
+        unsafe { write_object_header(holder.as_mut_ptr() as *mut u8, tid::RATIO, 16) };
+        holder[1] = (target_body as u64) | TAG_HEAP; // numerator → target
+        holder[2] = BlissVal::from_fixnum(7).0; // denominator (non-reference)
+        let holder_body = unsafe { (holder.as_mut_ptr() as *mut u8).add(8) };
+
+        // Heap bounds covering every buffer.
+        let starts = [
+            target.as_ptr() as usize,
+            moved.as_ptr() as usize,
+            holder.as_ptr() as usize,
+        ];
+        let lo = *starts.iter().min().unwrap();
+        let hi = *starts.iter().max().unwrap() + 64;
+
+        // SAFETY: holder_body is a live RATIO body of 16 bytes.
+        unsafe {
+            trace_object(holder_body, tid::RATIO, 16, |slot| {
+                relocate_slot(slot, lo, hi);
+            });
+        }
+
+        assert_eq!(holder[1] & !0b111, moved_body as u64, "field relocated to moved body");
+        assert_eq!(holder[1] & 0b111, TAG_HEAP, "tag preserved");
+        assert_eq!(unsafe { *(moved_body as *const u64) }, 0xFEED_1234, "contents intact");
+        assert_eq!(holder[2], BlissVal::from_fixnum(7).0, "non-reference field untouched");
+    }
+
+    /// relocate_slot leaves non-references and references to un-forwarded objects
+    /// unchanged.
+    #[test]
+    fn relocate_slot_leaves_non_forwarded_and_immediates_alone() {
+        let mut obj = vec![0u64; 2];
+        unsafe { write_object_header(obj.as_mut_ptr() as *mut u8, tid::CONS, 8) };
+        let body = unsafe { (obj.as_mut_ptr() as *mut u8).add(8) } as usize;
+        let lo = obj.as_ptr() as usize;
+        let hi = lo + 64;
+
+        // Reference to a live (non-forwarded) object: unchanged.
+        let mut refslot = BlissVal((body as u64) | TAG_HEAP);
+        unsafe { relocate_slot(&mut refslot as *mut BlissVal, lo, hi) };
+        assert_eq!(refslot.0, (body as u64) | TAG_HEAP);
+
+        // Immediate (fixnum): unchanged.
+        let mut fix = BlissVal::from_fixnum(42);
+        unsafe { relocate_slot(&mut fix as *mut BlissVal, lo, hi) };
+        assert_eq!(fix, BlissVal::from_fixnum(42));
     }
 }

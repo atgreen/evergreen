@@ -106,3 +106,39 @@ fn satb_pre_write_logging_captures_overwritten_references_during_marking() {
     set_gc_marking_in_progress(false);
     assert_eq!(logged, vec![old], "SATB logs the overwritten reference");
 }
+
+/// A nursery object reachable ONLY from a CL-stack frame survives a minor GC and
+/// its frame slot is relocated to the moved object (bliss-jtc.17 completes the
+/// young-object root set for minor GC — previously only major GC relocated
+/// frame refs).
+#[test]
+fn nursery_object_held_only_by_cl_frame_relocates_across_minor_gc() {
+    use bliss_rt::{current_thread, BlissStack};
+    let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&gc_config()).unwrap();
+    let mut alloc = HeapAllocator::new().unwrap();
+
+    let young = alloc.alloc_fast(24).unwrap();
+    const MARKER: u64 = 0x0055_1122_3344;
+    unsafe { *(young as *mut u64) = MARKER };
+
+    // Hold `young` only from a frame on the current thread's CL stack.
+    let stack = current_thread().stack();
+    let f = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)
+        .unwrap();
+    unsafe { BlissStack::frame_slots_mut(f)[0] = heap_ref(young) };
+
+    HeapCollector::new().minor_gc().unwrap();
+
+    let relocated = unsafe { BlissStack::frame_slots_mut(f)[0] };
+    let new_body = (relocated.0 & !0b111) as *const u64;
+    assert_ne!(new_body as u64, young as u64, "young object was moved by minor GC");
+    assert_eq!(
+        unsafe { *new_body },
+        MARKER,
+        "frame-held young object survived with intact contents at its new location"
+    );
+
+    stack.pop_frame();
+}
