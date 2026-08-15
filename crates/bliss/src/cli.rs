@@ -2814,6 +2814,30 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
     Ok(last)
 }
 
+fn read_forms_for_compile(source: &str, env: &mut Env) -> Result<Vec<BlissVal>, BlissError> {
+    reader::set_read_eval_hook(Some(read_time_eval));
+    register_declared_packages(source);
+    let chars: Vec<char> = source.chars().collect();
+    let mut pos = 0;
+    let mut forms = Vec::new();
+    loop {
+        while pos < chars.len() && chars[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= chars.len() {
+            break;
+        }
+        let remaining: String = chars[pos..].iter().collect();
+        let (val, consumed) = read_next_form(&remaining, env)?;
+        if val == EOF {
+            break;
+        }
+        forms.push(val);
+        pos += consumed;
+    }
+    Ok(forms)
+}
+
 fn bundled_asdf_path() -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../lib/asdf.lisp")
@@ -3650,14 +3674,18 @@ fn load_bfasl_into_env(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissErr
     with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&src, env))
 }
 
-/// Serialize a source unit to a `.bfasl` byte image (bliss-lb6.6). Minimal
-/// implementation: the portable code section carries the top-level forms as
-/// source text (a valid architecture-neutral payload; the format reserves the
-/// FUNCTIONS bytecode section for the full compiler), plus a source-map section
-/// (the origin path) and the content hash for cache invalidation (R6.70).
-fn build_bfasl_from_source(source: &str, src_path: &str) -> Vec<u8> {
+/// Serialize a source unit to a `.bfasl` byte image (bliss-lb6.6). The portable
+/// code payload is the classfile-like `BYTECODE_UNIT` section; `TOPLEVEL_FORMS`
+/// is retained as the active compatibility loader path until BBU installation
+/// is implemented.
+fn build_bfasl_from_source(source: &str, src_path: &str, env: &mut Env) -> Vec<u8> {
+    let bytecode_unit = match read_forms_for_compile(source, env) {
+        Ok(forms) => bytecode::build_bbu_from_forms(&forms, src_path, source, env),
+        Err(_) => bytecode::build_bbu_from_forms(&[], src_path, source, env),
+    };
     bliss_rt::bfasl::BfaslBuilder::new()
         .content_hash(bliss_rt::bfasl::content_hash(source.as_bytes()))
+        .section(bliss_rt::bfasl::section::BYTECODE_UNIT, bytecode_unit)
         .section(
             bliss_rt::bfasl::section::TOPLEVEL_FORMS,
             source.as_bytes().to_vec(),
@@ -6112,7 +6140,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let source = std::fs::read_to_string(&src_path).map_err(|e| {
                     BlissError::FileError(format!("compile-file: cannot read {src_path}: {e}"))
                 })?;
-                let image = build_bfasl_from_source(&source, &src_path);
+                let image = build_bfasl_from_source(&source, &src_path, env);
                 std::fs::write(&out_path, &image).map_err(|e| {
                     BlissError::FileError(format!("compile-file: cannot write {out_path}: {e}"))
                 })?;

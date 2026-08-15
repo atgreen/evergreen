@@ -23,6 +23,28 @@ fn run(program: &str) -> std::process::Output {
         .expect("spawn bliss-cli")
 }
 
+fn bfasl_section(bytes: &[u8], wanted: u16) -> Option<&[u8]> {
+    let count = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
+    let mut pos = 24usize;
+    let checksum_at = bytes.len().checked_sub(4)?;
+    for _ in 0..count {
+        if pos + 6 > checksum_at {
+            return None;
+        }
+        let kind = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+        let len = u32::from_le_bytes(bytes[pos + 2..pos + 6].try_into().unwrap()) as usize;
+        pos += 6;
+        if pos + len > checksum_at {
+            return None;
+        }
+        if kind == wanted {
+            return Some(&bytes[pos..pos + len]);
+        }
+        pos += len;
+    }
+    None
+}
+
 #[test]
 fn compile_file_then_load_round_trips_in_a_fresh_process() {
     let dir = workdir("roundtrip");
@@ -44,6 +66,12 @@ fn compile_file_then_load_round_trips_in_a_fresh_process() {
     assert!(out.exists(), "compile-file produced no .bfasl");
     let bytes = fs::read(&out).unwrap();
     assert_eq!(&bytes[..6], b"BFASL\0", "output is a real .bfasl");
+    let bbu = bfasl_section(&bytes, 12).expect("compile-file must emit BYTECODE_UNIT");
+    assert_eq!(&bbu[..4], b"BBU\0", "BYTECODE_UNIT has BBU magic");
+    let function_count = u32::from_le_bytes(bbu[16..20].try_into().unwrap());
+    let load_action_count = u32::from_le_bytes(bbu[20..24].try_into().unwrap());
+    assert!(function_count > 0, "BYTECODE_UNIT contains bytecode functions");
+    assert!(load_action_count > 0, "BYTECODE_UNIT contains a load plan");
 
     // Process 2 (fresh runtime): load the .bfasl and call the compiled function.
     let l = run(&format!(
