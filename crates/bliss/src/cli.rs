@@ -10122,9 +10122,12 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
     let (name_form, rest) = cp(cdr);
     let (params_form, body) = cp(rest);
     if !name_form.is_symbol() {
-        return Err(BlissError::Internal(
-            "DEFINE-COMPILER-MACRO: name must be a symbol".into(),
-        ));
+        // A compiler macro is always optional (CLHS 3.2.2.1.3: the compiler is
+        // not required to use one), and our registry keys expanders by symbol.
+        // For a `(setf f)` function name — e.g. ASDF's WITH-DEPRECATION
+        // instrumenting a `(defmethod (setf foo) …)` — just skip defining the
+        // compiler macro; the underlying function/method still works.
+        return Ok(name_form);
     }
 
     // The expander is stored in bliss-compiler's global registry as an
