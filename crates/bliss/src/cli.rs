@@ -14,7 +14,7 @@ use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -2811,11 +2811,16 @@ fn read_time_eval(form: BlissVal) -> Result<BlissVal, BlissError> {
     eval_form(form, env)
 }
 
-/// Read the next form from `remaining`, evaluating any `#.` read-eval forms in
-/// `env`. Restores the read-eval env pointer afterwards so nested loads compose.
-fn read_next_form(remaining: &str, env: &mut Env) -> Result<(BlissVal, usize), BlissError> {
+/// Read the next form from `chars` at `pos`, evaluating any `#.` read-eval forms
+/// in `env`. Returns the absolute position just past the form. Restores the
+/// read-eval env pointer afterwards so nested loads compose.
+fn read_next_form_at(
+    chars: &[char],
+    pos: usize,
+    env: &mut Env,
+) -> Result<(BlissVal, usize), BlissError> {
     let prev = READ_EVAL_ENV.with(|c| c.replace(env as *mut Env));
-    let result = reader::read_from_string_with_base(remaining, 10, true);
+    let result = reader::read_form_at(chars, pos, 10, true);
     READ_EVAL_ENV.with(|c| c.set(prev));
     result
 }
@@ -2824,10 +2829,18 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
     reader::set_read_eval_hook(Some(read_time_eval));
     register_declared_packages(source);
     let chars: Vec<char> = source.chars().collect();
+    // Nesting is checked once for the whole buffer; each form is then read from
+    // the shared slice at an advancing position, so loading is O(length) rather
+    // than O(forms · length) — the quadratic re-scan that made large files
+    // (lib/asdf.lisp) load in tens of seconds (bliss-lb6.5).
+    reader::check_nesting(&chars)?;
     let mut pos = 0;
     let mut last = NIL;
     let trace = std::env::var("BLISS_LOAD_TRACE").is_ok();
+    let timeit = std::env::var("BLISS_LOAD_TIMING").is_ok();
     let mut form_no = 0usize;
+    let mut read_ns = 0u128;
+    let mut eval_ns = 0u128;
     loop {
         while pos < chars.len() && chars[pos].is_ascii_whitespace() {
             pos += 1;
@@ -2835,18 +2848,32 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
         if pos >= chars.len() {
             break;
         }
-        let remaining: String = chars[pos..].iter().collect();
-        let (val, consumed) = read_next_form(&remaining, env)?;
+        if trace {
+            form_no += 1;
+            let snippet: String = chars[pos..].iter().take(70).collect();
+            eprintln!("[LOADTRACE {form_no}] {}", snippet.replace('\n', " "));
+        }
+        let t0 = timeit.then(std::time::Instant::now);
+        let (val, next_pos) = read_next_form_at(&chars, pos, env)?;
+        if let Some(t0) = t0 {
+            read_ns += t0.elapsed().as_nanos();
+        }
         if val == EOF {
             break;
         }
-        if trace {
-            form_no += 1;
-            let snippet: String = remaining.chars().take(70).collect();
-            eprintln!("[LOADTRACE {form_no}] {}", snippet.replace('\n', " "));
-        }
+        let t1 = timeit.then(std::time::Instant::now);
         last = bytecode::eval_toplevel(val, env)?;
-        pos += consumed;
+        if let Some(t1) = t1 {
+            eval_ns += t1.elapsed().as_nanos();
+        }
+        pos = next_pos;
+    }
+    if timeit {
+        eprintln!(
+            "[LOADTIMING] read={}ms eval={}ms",
+            read_ns / 1_000_000,
+            eval_ns / 1_000_000
+        );
     }
     Ok(last)
 }
@@ -3046,31 +3073,51 @@ fn find_symbol_in_package(
     pkg_name: &str,
     bare_name: &str,
 ) -> Option<(BlissVal, &'static str)> {
+    // Uppercase the name once, then walk the use-graph with a visited set. ASDF's
+    // package graph is dense with diamonds (uiop is used by nearly everything and
+    // itself uses ~15 uiop/* packages), so an un-memoised DFS re-walked shared
+    // packages combinatorially — and FIND-SYMBOL is called once per inherited
+    // symbol while a package is being defined. Memoising collapses each lookup
+    // to O(reachable packages) (bliss-lb6.5).
+    let bare_upper = bare_name.to_uppercase();
+    let mut visited: HashSet<String> = HashSet::new();
+    find_symbol_in_package_rec(env, pkg_name, &bare_upper, &mut visited)
+}
+
+fn find_symbol_in_package_rec(
+    env: &Env,
+    pkg_name: &str,
+    bare_upper: &str,
+    visited: &mut HashSet<String>,
+) -> Option<(BlissVal, &'static str)> {
     let pkg_name = resolve_package_name(env, pkg_name);
-    let bare_name = bare_name.to_uppercase();
+    if !visited.insert(pkg_name.clone()) {
+        // Already explored this package on another use-path.
+        return None;
+    }
     if pkg_name == "COMMON-LISP" {
         // COMMON-LISP owns a bare name only if it is an already-interned symbol
         // that no user package homes. Never intern here: FIND-SYMBOL must have
         // no side effects, and fabricating a symbol would make COMMON-LISP
         // appear to export every name ever read.
-        if let Some(idx) = reader::find_symbol_index(&bare_name) {
-            if !name_owned_by_noncl_package(env, &bare_name) {
+        if let Some(idx) = reader::find_symbol_index(bare_upper) {
+            if !name_owned_by_noncl_package(env, bare_upper) {
                 return Some((BlissVal::from_symbol_index(idx), "EXTERNAL"));
             }
         }
     } else if pkg_name == "COMMON-LISP-USER" {
-        if let Some(sym) = resolve_sym(&bare_name) {
+        if let Some(sym) = resolve_sym(bare_upper) {
             return Some((sym, "EXTERNAL"));
         }
     }
     if pkg_name == "KEYWORD" {
-        if let Some(sym) = resolve_sym(&format!(":{}", bare_name)) {
+        if let Some(sym) = resolve_sym(&format!(":{}", bare_upper)) {
             return Some((sym, "EXTERNAL"));
         }
     }
     let package = env.packages.get(&pkg_name)?;
-    if let Some(sym) = package.symbols.get(&bare_name) {
-        let status = if package.exports.iter().any(|name| name == &bare_name) {
+    if let Some(sym) = package.symbols.get(bare_upper) {
+        let status = if package.exports.iter().any(|name| name == bare_upper) {
             "EXTERNAL"
         } else {
             "INTERNAL"
@@ -3078,7 +3125,7 @@ fn find_symbol_in_package(
         return Some((*sym, status));
     }
     for used in &package.uses {
-        if let Some((sym, _)) = find_symbol_in_package(env, used, &bare_name) {
+        if let Some((sym, _)) = find_symbol_in_package_rec(env, used, bare_upper, visited) {
             return Some((sym, "INHERITED"));
         }
     }

@@ -432,13 +432,34 @@ pub fn read_from_string_with_base(
 ) -> Result<(BlissVal, usize), BlissError> {
     let chars: Vec<char> = s.chars().collect();
     ensure_nesting_within_limit(&chars)?;
+    read_form_at(&chars, 0, read_base, read_eval)
+}
+
+/// Read a single form from `chars` starting at `start`, returning the form and
+/// the absolute position just past it.
+///
+/// Unlike [`read_from_string_with_base`], this does NOT collect a fresh
+/// `Vec<char>` or re-scan the input for nesting on each call: the caller passes
+/// an already-collected slice and an advancing position, so reading N forms from
+/// one buffer is O(total length) rather than O(N · length) (bliss-lb6.5 — this
+/// quadratic re-scan was the dominant cost of loading large files such as
+/// lib/asdf.lisp). The recursive token reader self-limits nesting via its `depth`
+/// parameter, so no per-call pre-scan is needed; a caller looping over a whole
+/// buffer should call [`check_nesting`] once up front to keep the early,
+/// clean "reader nesting limit exceeded" error.
+pub fn read_form_at(
+    chars: &[char],
+    start: usize,
+    read_base: u32,
+    read_eval: bool,
+) -> Result<(BlissVal, usize), BlissError> {
     let mut labels = CircularLabels {
         labels: HashMap::new(),
     };
-    let mut pos = 0;
+    let mut pos = start;
     loop {
         let (val, next) = read_token_with_base(
-            &chars,
+            chars,
             pos,
             &mut labels,
             read_base,
@@ -449,11 +470,19 @@ pub fn read_from_string_with_base(
         if val != MISSING {
             return Ok((val, next));
         }
-        pos = skip_whitespace_and_comments(&chars, next);
+        pos = skip_whitespace_and_comments(chars, next);
         if pos >= chars.len() {
             return Ok((EOF, pos));
         }
     }
+}
+
+/// Verify that parenthesis nesting anywhere in `chars` stays within the reader
+/// limit. Intended to be run once over a whole buffer before looping it with
+/// [`read_form_at`], preserving the pre-scan nesting guard without paying for it
+/// on every form.
+pub fn check_nesting(chars: &[char]) -> Result<(), BlissError> {
+    ensure_nesting_within_limit(chars)
 }
 
 fn default_string_reader_circular_mode() -> bool {
