@@ -3901,9 +3901,51 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
     seen.into_values().collect()
 }
 
+fn resolve_load_path(path: &str) -> Result<String, BlissError> {
+    let supplied = Path::new(path);
+    if supplied.exists() {
+        return Ok(path.to_string());
+    }
+    if supplied.extension().is_some() {
+        return Err(BlissError::FileError(format!(
+            "cannot read {}: file does not exist",
+            path
+        )));
+    }
+
+    let source = supplied.with_extension("lisp");
+    let bfasl = supplied.with_extension("bfasl");
+    let source_exists = source.exists();
+    let bfasl_exists = bfasl.exists();
+
+    match (source_exists, bfasl_exists) {
+        (true, true) => {
+            let source_modified = std::fs::metadata(&source).and_then(|m| m.modified());
+            let bfasl_modified = std::fs::metadata(&bfasl).and_then(|m| m.modified());
+            if let (Ok(source_modified), Ok(bfasl_modified)) = (source_modified, bfasl_modified) {
+                if source_modified > bfasl_modified {
+                    return Err(BlissError::FileError(format!(
+                        "compiled file {} is older than source {}; recompile or load the source explicitly",
+                        bfasl.display(),
+                        source.display()
+                    )));
+                }
+            }
+            Ok(bfasl.to_string_lossy().into_owned())
+        }
+        (false, true) => Ok(bfasl.to_string_lossy().into_owned()),
+        (true, false) => Ok(source.to_string_lossy().into_owned()),
+        (false, false) => Err(BlissError::FileError(format!(
+            "cannot read {}: file does not exist",
+            path
+        ))),
+    }
+}
+
 fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
+    let resolved_path = resolve_load_path(path)?;
+    let bytes = std::fs::read(&resolved_path)
+        .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", resolved_path, e)))?;
     // A Bliss FASL (.bfasl) starts with the BFASL magic — verify and load the
     // compiled unit (bliss-lb6.6); otherwise treat the file as source.
     if bytes.len() >= bliss_rt::bfasl::BFASL_MAGIC.len()

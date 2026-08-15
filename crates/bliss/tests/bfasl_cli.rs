@@ -5,6 +5,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_bliss-cli");
 
@@ -94,6 +95,104 @@ fn compile_file_then_load_round_trips_in_a_fresh_process() {
         String::from_utf8_lossy(&l.stdout).trim(),
         "(144 7)",
         "loaded .bfasl must define the function and the variable"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn extensionless_load_uses_defaulted_bfasl() {
+    let dir = workdir("load-default-bfasl");
+    let stem = dir.join("m");
+    let src = dir.join("m.lisp");
+    let out = dir.join("m.bfasl");
+    fs::write(&src, "(defun defaulted-load-value () 31)\n").unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    fs::remove_file(&src).unwrap();
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (defaulted-load-value))",
+        stem.display()
+    ));
+    assert!(
+        l.status.success(),
+        "extensionless load failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&l.stdout),
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "31");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explicit_source_load_does_not_prefer_bfasl() {
+    let dir = workdir("load-explicit-source");
+    let src = dir.join("s.lisp");
+    let out = dir.join("s.bfasl");
+    fs::write(&src, "(defun explicit-source-value () 1)\n").unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(c.status.success());
+    fs::write(&src, "(defun explicit-source-value () 2)\n").unwrap();
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (explicit-source-value))",
+        src.display()
+    ));
+    assert!(
+        l.status.success(),
+        "explicit source load failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&l.stdout),
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "2");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn extensionless_load_rejects_stale_bfasl() {
+    let dir = workdir("load-stale-bfasl");
+    let stem = dir.join("stale");
+    let src = dir.join("stale.lisp");
+    let out = dir.join("stale.bfasl");
+    fs::write(&src, "(defun stale-value () 1)\n").unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(c.status.success());
+    std::thread::sleep(Duration::from_millis(1100));
+    fs::write(&src, "(defun stale-value () 2)\n").unwrap();
+
+    let l = run(&format!("(load \"{}\")", stem.display()));
+    assert!(
+        !l.status.success(),
+        "stale extensionless load should fail; stdout={} stderr={}",
+        String::from_utf8_lossy(&l.stdout),
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&l.stderr).contains("older than source"),
+        "stale error should explain the conflict: {}",
+        String::from_utf8_lossy(&l.stderr)
     );
 
     let _ = fs::remove_dir_all(&dir);
