@@ -427,6 +427,15 @@
 (defvar *read-default-float-format* 'single-float)
 (defvar *read-eval* t)
 (defvar *read-suppress* nil)
+;; Bound to the pathname/truename of the file being LOADed, or NIL when not in a
+;; load (e.g. under --eval). ASDF's DEFSYSTEM reads these to record a system's
+;; source location.
+(defvar *load-pathname* nil)
+(defvar *load-truename* nil)
+(defvar *load-verbose* nil)
+(defvar *load-print* nil)
+(defvar *compile-file-pathname* nil)
+(defvar *compile-file-truename* nil)
 
 ;;; WITH-STANDARD-IO-SYNTAX: evaluate BODY with the standard reader/printer
 ;;; variables bound to their ANSI-standard values. An empty body yields NIL.
