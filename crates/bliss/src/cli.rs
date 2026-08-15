@@ -411,6 +411,66 @@ fn is_gray_stream(s: BlissVal) -> bool {
             .unwrap_or(false)
 }
 
+/// Read one character from an input stream, or `None` at end of input. Handles
+/// both native and Gray streams.
+fn stream_next_char(stream: BlissVal, env: &mut Env) -> Result<Option<char>, BlissError> {
+    if is_gray_stream(stream) {
+        let r = invoke_generic_function("STREAM-READ-CHAR", &[stream], env)?;
+        Ok(r.is_character().then(|| r.as_char()))
+    } else {
+        let r = bliss_stdlib::stream_read_char(stream)?;
+        Ok((r != EOF).then(|| r.as_char()))
+    }
+}
+
+/// Push one character back onto an input stream (its unread buffer holds one).
+fn stream_push_char(stream: BlissVal, ch: char, env: &mut Env) -> Result<(), BlissError> {
+    let cv = BlissVal::from_char(ch);
+    if is_gray_stream(stream) {
+        invoke_generic_function("STREAM-UNREAD-CHAR", &[stream, cv], env)?;
+        Ok(())
+    } else {
+        bliss_stdlib::stream_unread_char(stream, cv)
+    }
+}
+
+/// Read a single Lisp form from an input stream (shared by READ and
+/// READ-PRESERVING-WHITESPACE). The stream only buffers one un-read character, so
+/// we grow a buffer one char at a time and re-parse; the first time a parse
+/// consumes fewer chars than the buffer we have read exactly one terminator past
+/// a complete form, which we push back. Returns `None` at end of input (only
+/// whitespace/comments remained). Neither consumes trailing whitespace beyond the
+/// single terminator. bliss-lb6.14: ASDF's slurp-stream-forms reads source files.
+fn read_one_form_from_stream(
+    stream: BlissVal,
+    env: &mut Env,
+) -> Result<Option<BlissVal>, BlissError> {
+    let mut buffer = String::new();
+    loop {
+        match stream_next_char(stream, env)? {
+            None => {
+                if buffer.trim().is_empty() {
+                    return Ok(None);
+                }
+                let (form, _) = reader::read_from_string(&buffer)?;
+                return Ok(Some(form));
+            }
+            Some(c) => {
+                buffer.push(c);
+                if let Ok((form, consumed)) = reader::read_from_string(&buffer) {
+                    let total = buffer.chars().count();
+                    if consumed < total {
+                        for lc in buffer.chars().skip(consumed).collect::<Vec<_>>().into_iter().rev() {
+                            stream_push_char(stream, lc, env)?;
+                        }
+                        return Ok(Some(form));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The global value of symbol `idx` from its heap value cell, or `None` if the
 /// cell is unbound (bliss-jtc.6 Stage C2). This is the authoritative store for
 /// global (non-lexical) variable values.
@@ -4658,6 +4718,81 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Err(BlissError::StreamError("end of file on READ-CHAR".into()));
                 }
                 return Ok(result);
+            }
+            "READ" | "READ-PRESERVING-WHITESPACE" => {
+                // (read &optional stream eof-error-p eof-value recursive-p)
+                let args = list_to_vec(cdr);
+                let stream = if !args.is_empty() {
+                    eval_form(args[0], env)?
+                } else {
+                    NIL
+                };
+                let eof_error_p = if args.len() > 1 {
+                    eval_form(args[1], env)?
+                } else {
+                    T
+                };
+                let eof_value = if args.len() > 2 {
+                    eval_form(args[2], env)?
+                } else {
+                    NIL
+                };
+                let in_stream = resolve_input_stream(stream, env);
+                match read_one_form_from_stream(in_stream, env)? {
+                    Some(form) => return Ok(form),
+                    None => {
+                        if eof_error_p.is_nil() {
+                            return Ok(eof_value);
+                        }
+                        return Err(BlissError::StreamError("end of file on READ".into()));
+                    }
+                }
+            }
+            "READ-FROM-STRING" => {
+                // (read-from-string string &optional eof-error-p eof-value
+                //  &key (start 0) end preserve-whitespace) => object, position
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::ProgramError(
+                        "READ-FROM-STRING requires a string".into(),
+                    ));
+                }
+                let vals: Vec<BlissVal> =
+                    args.iter().map(|a| eval_form(*a, env)).collect::<Result<_, _>>()?;
+                let s = val_as_str(vals[0]);
+                let chars: Vec<char> = s.chars().collect();
+                let eof_error_p = vals.get(1).copied().unwrap_or(T);
+                let eof_value = vals.get(2).copied().unwrap_or(NIL);
+                // Scan trailing keyword args for :start / :end.
+                let mut start = 0usize;
+                let mut end = chars.len();
+                let mut i = 3;
+                while i + 1 < vals.len() {
+                    match symbol_bare_name(&sym_name(vals[i])).as_str() {
+                        "START" => start = val_as_str(vals[i + 1]).parse().ok().or_else(|| vals[i + 1].is_fixnum().then(|| vals[i + 1].as_fixnum() as usize)).unwrap_or(0),
+                        "END" if !vals[i + 1].is_nil() => {
+                            if vals[i + 1].is_fixnum() {
+                                end = vals[i + 1].as_fixnum() as usize;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 2;
+                }
+                let start = start.min(chars.len());
+                let end = end.min(chars.len()).max(start);
+                let sub: String = chars[start..end].iter().collect();
+                match reader::read_from_string(&sub) {
+                    Ok((form, consumed)) => {
+                        env.set_mv(vec![form, BlissVal::from_fixnum((start + consumed) as i64)]);
+                        return Ok(form);
+                    }
+                    Err(_) if eof_error_p.is_nil() => {
+                        env.set_mv(vec![eof_value, BlissVal::from_fixnum(end as i64)]);
+                        return Ok(eof_value);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             "UNREAD-CHAR" => {
                 // (unread-char character &optional stream)

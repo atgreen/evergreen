@@ -1432,6 +1432,12 @@ pub fn open(
 
     match direction {
         StreamDirection::Input => {
+            if path.is_dir() {
+                return Err(BlissError::FileError(format!(
+                    "cannot open directory as a file: {}",
+                    path_str
+                )));
+            }
             let file = match std::fs::File::open(path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

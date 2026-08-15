@@ -26,8 +26,27 @@ fn is_vector(v: BlissVal) -> bool {
     if !v.is_heap_object() {
         return false;
     }
+    // A registry-backed string sentinel is heap-tagged but its bits are a hash,
+    // not a real pointer — recognise it via the registry rather than
+    // dereferencing (which would segfault). A string is never a vector.
+    if crate::pathnames::registered_string(v).is_some() {
+        return false;
+    }
     let header = unsafe { *(v.as_ptr() as *const ObjectHeader) };
     header.type_id() == type_id::SIMPLE_VECTOR
+}
+
+/// The character content of a string value — a real heap string OR a
+/// registry-backed sentinel (whose bits are a hash, never dereferenced) — or
+/// None for a non-string. Pathnames are excluded (they are not sequences).
+fn string_content(v: BlissVal) -> Option<String> {
+    if crate::pathnames::is_pathname(v) {
+        return None;
+    }
+    if let Some(s) = crate::pathnames::registered_string(v) {
+        return Some(s);
+    }
+    v.is_string().then(|| v.as_string())
 }
 
 /// True if `v` is a character string usable as a sequence — a real string, and
@@ -37,7 +56,7 @@ fn is_vector(v: BlissVal) -> bool {
 /// off the end (bliss-lb6). STRINGP already excludes pathnames the same way.
 #[inline]
 fn is_char_seq(v: BlissVal) -> bool {
-    v.is_string() && !crate::pathnames::is_pathname(v)
+    string_content(v).is_some()
 }
 
 /// Collect all elements of a sequence into a Vec.
@@ -66,8 +85,8 @@ fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
         return Ok(elems);
     }
     if is_char_seq(sequence) {
-        return Ok(sequence
-            .as_string()
+        return Ok(string_content(sequence)
+            .unwrap_or_default()
             .chars()
             .map(BlissVal::from_char)
             .collect());
@@ -423,9 +442,9 @@ pub fn length(sequence: BlissVal) -> Result<usize, BlissError> {
     if is_vector(sequence) {
         return Ok(vector_length(sequence));
     }
-    if is_char_seq(sequence) {
+    if let Some(s) = string_content(sequence) {
         // Strings are sequences of characters (ANSI). Count characters, not bytes.
-        return Ok(sequence.as_string().chars().count());
+        return Ok(s.chars().count());
     }
     Err(BlissError::TypeError {
         datum: sequence,
@@ -469,7 +488,7 @@ pub fn elt(sequence: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
         return Ok(vector_elt(sequence, index));
     }
     if is_char_seq(sequence) {
-        let s = sequence.as_string();
+        let s = string_content(sequence).unwrap_or_default();
         match s.chars().nth(index) {
             Some(c) => return Ok(BlissVal::from_char(c)),
             None => {
@@ -539,7 +558,7 @@ pub fn subseq(
     end: Option<usize>,
 ) -> Result<BlissVal, BlissError> {
     if is_char_seq(sequence) {
-        let chars: Vec<char> = sequence.as_string().chars().collect();
+        let chars: Vec<char> = string_content(sequence).unwrap_or_default().chars().collect();
         let len = chars.len();
         let actual_end = end.unwrap_or(len);
         if start > actual_end {
