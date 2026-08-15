@@ -68,3 +68,8 @@ _bureau_*
 
 # gstack skill scratch output
 .gstack/
+ocicl.csv
+ocicl/
+
+# compiled Bliss FASL artifacts
+*.bfasl

@@ -102,6 +102,28 @@ fn resolve_symbol_via_hook(pkg: Option<&str>, name: &str) -> Option<u32> {
     hook.and_then(|h| h(pkg, name))
 }
 
+// ── Pathname construction ─────────────────────────────────────────
+//
+// `#P"…"` must produce the SAME pathname representation the rest of the system
+// uses (the stdlib's registry-backed PATHNAME), or PATHNAMEP / NAMESTRING / LOAD
+// won't recognise it (bliss-lb6). The reader crate can't depend on bliss-stdlib,
+// so the interpreter installs a constructor that turns the parsed namestring
+// into a real pathname. Returns None to fall back to the reader's own minimal
+// PATHNAME object (used only when no interpreter is wired up, e.g. bare reader
+// tests).
+type PathnameConstructor = fn(BlissVal) -> Option<BlissVal>;
+static PATHNAME_CTOR: Mutex<Option<PathnameConstructor>> = Mutex::new(None);
+
+pub fn set_pathname_constructor(hook: Option<PathnameConstructor>) {
+    *PATHNAME_CTOR.lock().unwrap() = hook;
+}
+
+fn construct_pathname(namestring: BlissVal) -> BlissVal {
+    let hook = *PATHNAME_CTOR.lock().unwrap();
+    hook.and_then(|h| h(namestring))
+        .unwrap_or_else(|| alloc_pathname(namestring))
+}
+
 fn readtable_key(readtable: BlissVal) -> u64 {
     readtable.0 & !bliss_rt::value::TAG_MASK
 }
@@ -2110,7 +2132,7 @@ fn read_pathname_literal(chars: &[char], pos: usize) -> Result<(BlissVal, usize)
         return Err(BlissError::StreamError("expected string after #P".into()));
     }
     let (string_val, end) = read_string(chars, pos + 1)?;
-    Ok((alloc_pathname(string_val), end))
+    Ok((construct_pathname(string_val), end))
 }
 
 #[expect(

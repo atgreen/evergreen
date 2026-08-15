@@ -1288,6 +1288,14 @@ pub(crate) fn extract_path_string(val: BlissVal) -> Result<String, BlissError> {
         return lookup_string(ns)
             .ok_or_else(|| BlissError::FileError("cannot render pathname".to_string()));
     }
+    // Also accept an ordinary heap string (SIMPLE_BASE_STRING) — a namestring
+    // that never entered the pathname string registry, e.g. a literal or one
+    // built by FORMAT (mirrors parse_namestring). Safe: a pathname is a genuine
+    // PATHNAME-typed heap object, so is_string() reads its real header and is
+    // false for it.
+    if val.is_string() {
+        return Ok(val.as_string());
+    }
     Err(BlissError::FileError(
         "cannot extract path string from value".to_string(),
     ))

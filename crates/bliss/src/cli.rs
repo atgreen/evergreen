@@ -2643,12 +2643,29 @@ fn directory_designator_to_namestring(dir: BlissVal) -> Option<String> {
     Some(out)
 }
 
-/// STRINGP that is safe for every value. Pathnames are registry-backed
-/// pseudo-heap values (a counter id wearing `TAG_HEAP_OBJECT`), so the raw
-/// `BlissVal::is_string` dereferences a bogus pointer and segfaults on them.
-/// Guard with the pathname-store check first.
+/// STRINGP that is safe for every value. Some string values are registry-backed
+/// sentinels — a string hash wearing `TAG_HEAP_OBJECT`, not a real heap pointer
+/// — so the raw `BlissVal::is_string` would dereference garbage and segfault on
+/// them (this is how ASDF's namestring comparisons crash). Recognise a
+/// registry-backed string via the store first (no dereference); only then fall
+/// back to reading a genuine heap-string header. Pathnames are a distinct type
+/// and never strings.
 fn is_string_value(v: BlissVal) -> bool {
-    !bliss_stdlib::is_pathname(v) && v.is_string()
+    // Exclude pathnames FIRST: a pathname is a distinct type and never a string,
+    // yet its value can also be present in the string registry (its namestring),
+    // so a registry check ahead of this would wrongly report STRINGP true — which
+    // made UIOP's ENSURE-DIRECTORY-PATHNAME recurse forever (bliss-lb6.15).
+    if bliss_stdlib::is_pathname(v) {
+        return false;
+    }
+    // A registry-backed string sentinel is a real string but NOT a valid heap
+    // pointer (a string hash wearing TAG_HEAP_OBJECT), so recognise it via the
+    // store before the raw is_string() would dereference garbage and segfault
+    // (how ASDF's namestring comparisons crashed).
+    if bliss_stdlib::registered_string(v).is_some() {
+        return true;
+    }
+    v.is_string()
 }
 
 // ── Collect a list into a Vec of elements ─────────────────────────
@@ -2883,6 +2900,17 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
     found.and_then(|(sym, _)| sym.is_symbol().then(|| sym.as_symbol_index()))
 }
 
+/// Reader hook: build a `#P"…"` literal as the stdlib's registry-backed pathname
+/// (the representation PATHNAMEP / NAMESTRING / LOAD understand), rather than the
+/// reader's own minimal PATHNAME object which the rest of the system does not
+/// recognise (bliss-lb6). Returns None on a malformed namestring so the reader
+/// falls back to its default.
+fn reader_pathname_constructor(namestring: BlissVal) -> Option<BlissVal> {
+    bliss_stdlib::parse_namestring(namestring, None, None)
+        .ok()
+        .map(|(pathname, _)| pathname)
+}
+
 fn read_time_eval(form: BlissVal) -> Result<BlissVal, BlissError> {
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() {
@@ -2913,6 +2941,7 @@ fn read_next_form_at(
 fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     reader::set_read_eval_hook(Some(read_time_eval));
     reader::set_symbol_resolver(Some(reader_symbol_resolver));
+    reader::set_pathname_constructor(Some(reader_pathname_constructor));
     register_declared_packages(source);
     let chars: Vec<char> = source.chars().collect();
     // Nesting is checked once for the whole buffer; each form is then read from
@@ -5741,6 +5770,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pathname = eval_form(pathname_form, env)?;
                 return bliss_stdlib::namestring(pathname);
             }
+            "PROBE-FILE" => {
+                // (probe-file pathspec) — truename if the file exists, else NIL.
+                let (pathname_form, _) = cp(cdr);
+                let pathname = eval_form(pathname_form, env)?;
+                return Ok(bliss_stdlib::probe_file(pathname)?.unwrap_or(NIL));
+            }
+            "TRUENAME" => {
+                let (pathname_form, _) = cp(cdr);
+                let pathname = eval_form(pathname_form, env)?;
+                return bliss_stdlib::truename(pathname);
+            }
             "PATHNAME" => {
                 // Coerce a pathname designator to a pathname: an existing
                 // pathname passes through; anything else is parsed as a
@@ -6102,6 +6142,41 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 let nv = num_val(v)?;
                 return Ok(BlissVal::from_single_float(nv.sqrt() as f32));
+            }
+            "RANDOM" => {
+                // (random limit &optional random-state) — a value in [0, limit)
+                // of the same type as LIMIT. The optional random-state arg is
+                // evaluated (for effect) but the shared generator is used.
+                let (limit_form, rest) = cp(cdr);
+                let limit = eval_form(limit_form, env)?;
+                if rest.is_cons() {
+                    eval_form(cp(rest).0, env)?;
+                }
+                if limit.is_fixnum() {
+                    let bound = limit.as_fixnum();
+                    if bound <= 0 {
+                        return Err(BlissError::ProgramError(
+                            "RANDOM limit must be a positive number".into(),
+                        ));
+                    }
+                    let r = (next_random_u64() % bound as u64) as i64;
+                    return Ok(BlissVal::from_fixnum(r));
+                }
+                if limit.is_single_float() {
+                    let bound = limit.as_single_float();
+                    if bound <= 0.0 {
+                        return Err(BlissError::ProgramError(
+                            "RANDOM limit must be a positive number".into(),
+                        ));
+                    }
+                    // 24 random mantissa bits give a uniform unit float in [0,1).
+                    let unit = (next_random_u64() >> 40) as f32 / (1u64 << 24) as f32;
+                    return Ok(BlissVal::from_single_float(unit * bound));
+                }
+                return Err(BlissError::TypeError {
+                    datum: limit,
+                    expected: "positive integer or float".into(),
+                });
             }
             "NTH-VALUE" => {
                 let (nf, r) = cp(cdr);
@@ -6535,9 +6610,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "LOAD" => {
                 let (path_form, _) = cp(cdr);
                 let path_val = eval_form(path_form, env)?;
+                // LOAD accepts a pathname designator — a namestring OR a pathname
+                // object (e.g. `#P"…"`, common in a ~/.blissrc). `val_as_str` on a
+                // pathname yields its debug repr, so coerce via its namestring.
+                let path = path_designator_to_string(path_val)?;
                 // ANSI LOAD returns a generalized boolean (T on success); the
                 // last top-level form's value is not the result.
-                load_path_into_env(&val_as_str(path_val), env)?;
+                load_path_into_env(&path, env)?;
                 return Ok(T);
             }
             "COMPILE-FILE" => {
@@ -7370,6 +7449,8 @@ fn is_loop_keyword(bare: &str) -> bool {
             | "REPEAT"
             // Numeric-iteration and across sub-keywords for `for var ...`.
             | "FROM"
+            | "UPFROM"
+            | "DOWNFROM"
             | "TO"
             | "UPTO"
             | "DOWNTO"
@@ -7807,6 +7888,9 @@ enum ForClause {
         start: BlissVal,
         step: Option<BlissVal>,
         limit: Option<(LoopForLimit, BlissVal)>,
+        /// `:downfrom` counts downward: default step is -1 and a plain `:to` /
+        /// `:below` limit is read as its descending counterpart.
+        descending: bool,
     },
     Across {
         pat: BlissVal,
@@ -8055,7 +8139,10 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                         };
                         for_clauses.push(ForClause::Being { pat, source });
                     }
-                    Some("FROM") => {
+                    // `:from`/`:upfrom` count up; `:downfrom` counts down. All
+                    // share the same `[:by step] [limit]` tail parsing.
+                    Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
+                        let descending = p.peek_kw().as_deref() == Some("DOWNFROM");
                         p.advance();
                         let start = p.read_form()?;
                         let mut step = None;
@@ -8094,6 +8181,7 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                             start,
                             step,
                             limit,
+                            descending,
                         });
                     }
                     _ => {
@@ -8231,21 +8319,41 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     start,
                     step,
                     limit,
+                    descending,
                 } => {
                     let current = eval_form(*start, env)?;
+                    // `:downfrom`, or a DOWNTO/ABOVE limit, counts down by default.
+                    let down = *descending
+                        || matches!(
+                            limit,
+                            Some((LoopForLimit::Downto, _)) | Some((LoopForLimit::Above, _))
+                        );
+                    // `:by` is a positive step magnitude; a descending loop
+                    // applies it as a decrement, so negate an explicit step (and
+                    // default to -1) when counting down.
                     let step = match step {
-                        Some(expr) => eval_form(*expr, env)?,
-                        // DOWNTO/ABOVE count down by default; everything else up.
-                        None => {
-                            let down = matches!(
-                                limit,
-                                Some((LoopForLimit::Downto, _)) | Some((LoopForLimit::Above, _))
-                            );
-                            BlissVal::from_fixnum(if down { -1 } else { 1 })
+                        Some(expr) => {
+                            let s = eval_form(*expr, env)?;
+                            if down { loop_negate_number(s)? } else { s }
                         }
+                        None => BlissVal::from_fixnum(if down { -1 } else { 1 }),
                     };
                     let limit = match limit {
-                        Some((kind, expr)) => Some((*kind, eval_form(*expr, env)?)),
+                        Some((kind, expr)) => {
+                            // Under `:downfrom`, a plain ascending limit is read as
+                            // its descending counterpart (`to`→`downto`,
+                            // `below`→`above`) so termination compares downward.
+                            let kind = if *descending {
+                                match kind {
+                                    LoopForLimit::To | LoopForLimit::Upto => LoopForLimit::Downto,
+                                    LoopForLimit::Below => LoopForLimit::Above,
+                                    other => *other,
+                                }
+                            } else {
+                                *kind
+                            };
+                            Some((kind, eval_form(*expr, env)?))
+                        }
                         None => None,
                     };
                     states.push(ForState::From {
@@ -8464,6 +8572,15 @@ fn loop_add_numbers(lhs: BlissVal, rhs: BlissVal) -> Result<BlissVal, BlissError
     }
     let sum = num_val(lhs)? + num_val(rhs)?;
     Ok(BlissVal::from_single_float(sum as f32))
+}
+
+/// Negate a LOOP step value, preserving fixnum vs float (bliss-lb6): a
+/// `:downfrom … :by n` decrements by `n`.
+fn loop_negate_number(v: BlissVal) -> Result<BlissVal, BlissError> {
+    if v.is_fixnum() {
+        return Ok(BlissVal::from_fixnum(-v.as_fixnum()));
+    }
+    Ok(BlissVal::from_single_float(-(num_val(v)? as f32)))
 }
 
 fn loop_from_exhausted(
@@ -11951,6 +12068,37 @@ fn val_as_str(val: BlissVal) -> String {
     format_val(val)
 }
 
+/// Coerce a pathname designator — a namestring string or a pathname object — to
+/// a filesystem path string. `val_as_str` on a pathname returns its debug repr
+/// rather than the namestring, so callers that take file paths (LOAD, etc.) must
+/// resolve pathnames through `namestring` first. bliss-lb6.
+fn path_designator_to_string(v: BlissVal) -> Result<String, BlissError> {
+    if bliss_stdlib::is_pathname(v) {
+        return Ok(val_as_str(bliss_stdlib::namestring(v)?));
+    }
+    Ok(val_as_str(v))
+}
+
+/// Draw the next 64 random bits from a per-thread SplitMix64 generator, seeded
+/// once from OS entropy via `RandomState` (no external RNG dependency). Backs the
+/// RANDOM builtin; a fresh, unreproducible sequence per process, like a default
+/// CL *RANDOM-STATE*.
+fn next_random_u64() -> u64 {
+    use std::cell::Cell;
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new(RandomState::new().build_hasher().finish() | 1);
+    }
+    STATE.with(|s| {
+        let mut z = s.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        s.set(z);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    })
+}
+
 fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
     if a == b {
         return true;
@@ -11970,6 +12118,29 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
         return vals_equal(a_car, b_car) && vals_equal(a_cdr, b_cdr);
     }
     false
+}
+
+/// Load the user init file at startup (after the bootstrap prelude, before any
+/// --eval/--load/--script/REPL processing). The path is `$BLISS_INIT_FILE` if
+/// set, otherwise `~/.blissrc`. A missing file is normal and skipped silently;
+/// an error while evaluating the init file is reported to stderr but is
+/// non-fatal, so a broken init file never blocks startup. The caller gates this
+/// on `--no-init` / `--script`.
+fn load_init_file(env: &mut Env) {
+    let path = match std::env::var("BLISS_INIT_FILE") {
+        Ok(p) => p,
+        Err(_) => match std::env::var("HOME") {
+            Ok(home) => format!("{}/.blissrc", home),
+            Err(_) => return,
+        },
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        // No init file present — the normal case.
+        return;
+    };
+    if let Err(e) = read_eval_all_env(&contents, env) {
+        eprintln!("; error loading init file {}: {}", path, describe_err(&e));
+    }
 }
 
 // ── CLI driver ─────────────────────────────────────────────────────
@@ -12006,22 +12177,13 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         read_eval_all_env(&contents, &mut env)?;
     }
 
-    // Load init file unless --no-init (issue #8)
+    // Load the user init file (~/.blissrc, or $BLISS_INIT_FILE) when starting an
+    // interactive REPL. Batch modes (--eval, --load, a script) run without it, so
+    // they stay hermetic and reproducible (spec: an explicit --eval overrides
+    // init-file discovery); --no-init opts the REPL out too (issue #8). A missing
+    // file is normal; a broken init file is reported but non-fatal.
     if !ca.no_init && ca.eval.is_none() && ca.load.is_none() && ca.script.is_none() {
-        // Try to load init file
-        if let Ok(init_path) = std::env::var("BLISS_INIT_FILE") {
-            if let Ok(contents) = std::fs::read_to_string(&init_path) {
-                let _ = read_eval_all_env(&contents, &mut env);
-            }
-        } else {
-            // Try ~/.blissrc
-            if let Ok(home) = std::env::var("HOME") {
-                let init_path = format!("{}/.blissrc", home);
-                if let Ok(contents) = std::fs::read_to_string(&init_path) {
-                    let _ = read_eval_all_env(&contents, &mut env);
-                }
-            }
-        }
+        load_init_file(&mut env);
     }
 
     // Load image if specified (issue #8)

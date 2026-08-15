@@ -47,7 +47,17 @@ fn bliss_bin_path() -> &'static Path {
 
 /// Get the path to the bliss-cli binary built by cargo.
 fn bliss_bin() -> Command {
-    Command::new(bliss_bin_path())
+    let mut cmd = Command::new(bliss_bin_path());
+    // Keep tests hermetic against the developer's real ~/.blissrc: point the init
+    // file at a path that does not exist, so REPL-mode runs never load it (a
+    // present init file would otherwise inject output/latency and fail the REPL
+    // prompt tests). Tests that exercise init loading set BLISS_INIT_FILE
+    // themselves, overriding this.
+    cmd.env(
+        "BLISS_INIT_FILE",
+        std::env::temp_dir().join("bliss-tests-nonexistent-init.lisp"),
+    );
+    cmd
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1741,6 +1751,88 @@ fn key_param_named_like_exported_symbol_still_matches_bare_keyword() {
     assert!(
         stdout.contains('7'),
         "exported-symbol &key param should accept a bare keyword, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn hash_p_literal_is_a_real_pathname() {
+    // #P"…" must produce the system's registry-backed PATHNAME (recognised by
+    // PATHNAMEP / NAMESTRING / LOAD), not the reader's own object that the rest
+    // of the system treats as a non-pathname.
+    let prog = "(let ((p #P\"/tmp/x\")) (format t \"~a ~a\" (pathnamep p) (namestring p)))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("T /tmp/x"),
+        "#P should be a pathname with a namestring, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn stringp_of_a_pathname_is_false() {
+    // bliss-lb6.15: a pathname must not satisfy STRINGP, even though its
+    // namestring is registered as a string. When it did, UIOP's
+    // ENSURE-DIRECTORY-PATHNAME — `(cond ((stringp p) (recurse (pathname p))) …)`
+    // — recursed forever (the string branch never cleared), stack-overflowing
+    // the whole ASDF load.
+    let prog = "(let ((p (pathname \"/tmp/d/\"))) (format t \"~a ~a\" (stringp p) (pathnamep p)))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("NIL T"),
+        "a pathname must be pathnamep=T, stringp=NIL, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn load_accepts_a_pathname_designator() {
+    // LOAD must accept a #P pathname, not only a string (common in ~/.blissrc).
+    let dir = std::env::temp_dir().join("bliss_test_load_pathname");
+    let _ = std::fs::create_dir_all(&dir);
+    let file_path = dir.join("p.lisp");
+    std::fs::write(&file_path, "(format t \"LOADED-VIA-PATHNAME\")\n").expect("write");
+    let prog = format!("(load #P\"{}\")", file_path.to_str().unwrap());
+    let output = bliss_bin().args(["--eval", &prog]).output().expect("run bliss");
+    let _ = std::fs::remove_file(&file_path);
+    let _ = std::fs::remove_dir(&dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("LOADED-VIA-PATHNAME"),
+        "LOAD should accept a #P pathname, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn probe_file_reports_existing_and_missing() {
+    // PROBE-FILE returns a truename for an existing file, NIL for a missing one,
+    // and accepts both string and pathname designators.
+    let prog = "(format t \"~a ~a\" \
+                (and (probe-file #P\"/etc/hostname\") t) \
+                (probe-file \"/no/such/file/xyzzy\"))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("T NIL"),
+        "probe-file should report existing=T missing=NIL, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn random_returns_a_value_in_range() {
+    // (random n) yields an integer in [0,n); (random f) a float in [0,f).
+    let prog = "(let ((i (random 5)) (f (random 1.0))) \
+                (format t \"~a ~a\" (and (integerp i) (<= 0 i) (< i 5)) \
+                                    (and (floatp f) (<= 0 f) (< f 1.0))))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("T T"),
+        "random should stay in range, got: '{stdout}', stderr: '{}'",
         String::from_utf8_lossy(&output.stderr)
     );
 }
