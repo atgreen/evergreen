@@ -1862,8 +1862,29 @@ fn invoke_generic_function(
 }
 
 impl Env {
+    /// A fresh top-level environment. Resets the process-global CLOS state so
+    /// each independent program (and each test) starts from a clean class
+    /// registry.
     fn new(sandbox: bool) -> Self {
-        let _ = bliss_stdlib::bootstrap_clos();
+        Self::new_impl(sandbox, true)
+    }
+
+    /// A transient environment for macro / compiler-macro expansion. Unlike
+    /// [`Env::new`] it does NOT reset the process-global CLOS state — it shares
+    /// the caller's classes. Resetting here (as the old `Env::new` did) wiped
+    /// every user class defined before a later macro expansion, which corrupted
+    /// the ASDF load: `make-instance` of an early class (e.g. `system`) failed
+    /// with "no slot layout" because the class had been erased (bliss-lb6).
+    fn new_for_macro_expansion(sandbox: bool) -> Self {
+        Self::new_impl(sandbox, false)
+    }
+
+    fn new_impl(sandbox: bool, reset_clos: bool) -> Self {
+        if reset_clos {
+            let _ = bliss_stdlib::bootstrap_clos();
+        } else {
+            let _ = bliss_stdlib::ensure_clos_bootstrapped();
+        }
         // Establish the condition classes and preallocate the STORAGE-CONDITION
         // pool at startup, before any user code runs, so the heap-exhaustion /
         // stack-overflow path never has to allocate (R5.110, bliss-uh4.2). A
@@ -10147,7 +10168,7 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
         name_form,
         Arc::new(move |form, _macro_env| {
             let (_, args) = cp(form);
-            let mut macro_env = Env::new(sandbox);
+            let mut macro_env = Env::new_for_macro_expansion(sandbox);
             macro_env.frame = thaw_env_frame(&captured_frame);
             macro_env.funs = Rc::new(funs.clone());
             macro_env.macros = Rc::new(HashMap::new());
@@ -10464,7 +10485,7 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
             handle,
             Arc::new(move |form, call_macro_env| {
                 let (_, args) = cp(form);
-                let mut macro_env = Env::new(false);
+                let mut macro_env = Env::new_for_macro_expansion(false);
                 macro_env.frame = thaw_env_frame(&captured_frame);
                 bind_macro_lambda_list(
                     params_form,

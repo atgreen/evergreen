@@ -290,6 +290,11 @@ struct ShortFormMethod {
 struct ClosState {
     /// name → class value
     class_registry: HashMap<BlissVal, BlissVal>,
+    /// bare class name (uppercase, package-stripped) → class value. A fallback
+    /// for `find_class` when a class-name symbol's *identity* has drifted (e.g.
+    /// re-interned by a package RECYCLE/rehome after the class was defined), so
+    /// the symbol-keyed `class_registry` misses even though the class exists.
+    class_by_name: HashMap<String, BlissVal>,
     /// class value → metadata
     class_meta: HashMap<BlissVal, ClassMeta>,
     /// gf id → generic function data
@@ -331,6 +336,7 @@ impl ClosState {
     fn new() -> Self {
         Self {
             class_registry: HashMap::new(),
+            class_by_name: HashMap::new(),
             class_meta: HashMap::new(),
             generic_functions: HashMap::new(),
             method_meta: HashMap::new(),
@@ -405,6 +411,19 @@ fn is_builtin_class(st: &ClosState, class: BlissVal) -> bool {
 
 /// Initialize the CLOS bootstrap: create proto-classes, wire up metaclass
 /// circularity. R5.10.
+/// Bootstrap the CLOS state only if it has not been bootstrapped yet, preserving
+/// any classes already defined. `Env::new` calls this (not [`bootstrap_clos`])
+/// because transient environments — e.g. the macro-expansion env built for every
+/// macro/compiler-macro call — must NOT wipe the process-global class registry
+/// mid-load. (Tests still call [`bootstrap_clos`] directly to force a fresh
+/// state.)
+pub fn ensure_clos_bootstrapped() -> Result<(), BlissError> {
+    if with_state(|st| st.bootstrapped) {
+        return Ok(());
+    }
+    bootstrap_clos()
+}
+
 pub fn bootstrap_clos() -> Result<(), BlissError> {
     with_state_mut(|st| {
         // Full reset so tests are independent
@@ -507,8 +526,32 @@ pub fn bootstrap_clos() -> Result<(), BlissError> {
 // ── Class protocol ─────────────────────────────────────────────────
 
 /// Find a class by name.
+/// The bare, uppercase, package-stripped name of a class-name symbol, used as
+/// the drift-resilient key for [`ClosState::class_by_name`]. Returns `None` for
+/// a non-symbol name.
+fn class_name_key(name: BlissVal) -> Option<String> {
+    if !name.is_symbol() {
+        return None;
+    }
+    let full = bliss_rt::symbols::symbol_name(name.as_symbol_index())?;
+    let bare = full
+        .trim_start_matches("KEYWORD:")
+        .rsplit(':')
+        .next()
+        .unwrap_or(&full);
+    Some(bare.to_uppercase())
+}
+
 pub fn find_class(name: BlissVal) -> Option<BlissVal> {
-    with_state(|st| st.class_registry.get(&name).copied())
+    with_state(|st| {
+        if let Some(&class) = st.class_registry.get(&name) {
+            return Some(class);
+        }
+        // Fallback: the symbol's identity may have drifted since the class was
+        // registered (package RECYCLE/rehome re-interns the name). Match by the
+        // bare class name, which is stable across such re-interning.
+        class_name_key(name).and_then(|key| st.class_by_name.get(&key).copied())
+    })
 }
 
 /// Register a class by name.
@@ -523,6 +566,9 @@ pub fn set_find_class(name: BlissVal, class: BlissVal) -> Result<(), BlissError>
         }
 
         st.class_registry.insert(name, class);
+        if let Some(key) = class_name_key(name) {
+            st.class_by_name.insert(key, class);
+        }
 
         if !st.class_meta.contains_key(&class) {
             let default_supers = if st.bootstrapped && st.standard_object_class != NIL {
@@ -570,6 +616,9 @@ pub fn define_class(
         }
 
         st.class_registry.insert(name, class);
+        if let Some(key) = class_name_key(name) {
+            st.class_by_name.insert(key, class);
+        }
 
         let supers =
             if direct_supers.is_empty() && st.bootstrapped && st.standard_object_class != NIL {

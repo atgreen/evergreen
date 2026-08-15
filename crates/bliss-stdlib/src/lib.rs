@@ -34,7 +34,8 @@ pub mod error;
 
 // ── Re-exports for convenience ────────────────────────────────────
 pub use clos::{
-    MethodCombinationType, MethodQualifier, allocate_instance, bootstrap_clos, change_class,
+    MethodCombinationType, MethodQualifier, allocate_instance, bootstrap_clos,
+    ensure_clos_bootstrapped, change_class,
     class_direct_subclasses, class_direct_superclasses, class_name, class_of, class_slots,
     compute_applicable_methods, compute_class_precedence_list, compute_effective_method,
     define_class, find_class, initialize_instance, is_instance, make_generic_function, make_instance,
