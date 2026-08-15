@@ -8797,6 +8797,23 @@ ASDF to build."))
   (defclass undefined-system (system) ()
     (:documentation "System that was not defined yet."))
 
+  ;; Legacy SYSTEM-* reader accessors. The corresponding (SETF SYSTEM-*) writers
+  ;; are declared as slots on SYSTEM above (and VERSION is inherited from
+  ;; COMPONENT); the readers forward to the underlying COMPONENT-level slot so
+  ;; e.g. the footer's (system-version (registered-system "asdf")) works.
+  (defun system-version (system) (component-version system))
+  (defun system-description (system) (slot-value system 'description))
+  (defun system-long-description (system) (slot-value system 'long-description))
+  (defun system-author (system) (slot-value system 'author))
+  (defun system-maintainer (system) (slot-value system 'maintainer))
+  (defun system-licence (system) (slot-value system 'licence))
+  (defun system-license (system) (slot-value system 'licence))
+  (defun system-homepage (system) (slot-value system 'homepage))
+  (defun system-bug-tracker (system) (slot-value system 'bug-tracker))
+  (defun system-mailto (system) (slot-value system 'mailto))
+  (defun system-long-name (system) (slot-value system 'long-name))
+  (defun system-source-control (system) (slot-value system 'source-control))
+
   (defun reset-system-class (system new-class &rest keys &key &allow-other-keys)
     "Erase any data from a SYSTEM except its basic identity, then reinitialize it
 based on supplied KEYS."
