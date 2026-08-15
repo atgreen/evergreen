@@ -77,6 +77,31 @@ fn read_eval_hook() -> Option<ReadEvalHook> {
     *READ_EVAL_HOOK.lock().unwrap()
 }
 
+// ── Package-aware symbol resolution ───────────────────────────────
+//
+// A bare token read inside package P and the qualified spelling `P:NAME` denote
+// the SAME symbol with ONE value/function cell. The reader alone cannot enforce
+// this: package accessibility (use-lists, exports, home packages) lives in the
+// interpreter's package registry. So the interpreter installs a resolver that,
+// given a package designator (None = the current *PACKAGE*) and a bare name,
+// returns the canonical interned symbol index of the symbol ALREADY accessible
+// there — routing every spelling of one logical symbol to a single identity
+// (bliss-lb6.12). It returns None to defer to the reader's default name-keyed
+// interning: when the name is not yet accessible (so the reader mints it), or
+// when no load environment is active (internal READ-FROM-STRING). Either way
+// those callers keep their existing behaviour.
+type SymbolResolver = fn(Option<&str>, &str) -> Option<u32>;
+static SYMBOL_RESOLVER: Mutex<Option<SymbolResolver>> = Mutex::new(None);
+
+pub fn set_symbol_resolver(hook: Option<SymbolResolver>) {
+    *SYMBOL_RESOLVER.lock().unwrap() = hook;
+}
+
+fn resolve_symbol_via_hook(pkg: Option<&str>, name: &str) -> Option<u32> {
+    let hook = *SYMBOL_RESOLVER.lock().unwrap();
+    hook.and_then(|h| h(pkg, name))
+}
+
 fn readtable_key(readtable: BlissVal) -> u64 {
     readtable.0 & !bliss_rt::value::TAG_MASK
 }
@@ -940,7 +965,11 @@ fn parse_token_with_base(
     if name == "T" && !has_escape {
         return Ok(T);
     }
-    let idx = intern_symbol(&name);
+    // Route a bare symbol through the interpreter's current *PACKAGE* so that a
+    // symbol read bare inside package P shares identity (and its value cell) with
+    // the same symbol written P:NAME (bliss-lb6.12). Falls back to plain
+    // name-keyed interning when no resolver/load environment is active.
+    let idx = resolve_symbol_via_hook(None, &name).unwrap_or_else(|| intern_symbol(&name));
     Ok(BlissVal::from_symbol_index(idx))
 }
 
@@ -980,8 +1009,12 @@ fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
                 Ok(Some(BlissVal::from_symbol_index(idx)))
             }
             _ if package_exists(pkg) => {
-                let full = format!("{}:{}", pkg, sym_name);
-                let idx = intern_symbol(&full);
+                // Resolve the qualified symbol through the interpreter's package
+                // system so it shares identity with the bare-read symbol and with
+                // FIND-SYMBOL's result (bliss-lb6.12); fall back to name-keyed
+                // interning when no load environment is active.
+                let idx = resolve_symbol_via_hook(Some(pkg), sym_name)
+                    .unwrap_or_else(|| intern_symbol(&format!("{}:{}", pkg, sym_name)));
                 Ok(Some(BlissVal::from_symbol_index(idx)))
             }
             _ => Err(BlissError::StreamError(format!(

@@ -1703,6 +1703,49 @@ fn reexported_inherited_symbol_keeps_identity_and_home_package() {
 }
 
 #[test]
+fn bare_read_in_package_shares_value_cell_with_find_symbol() {
+    // bliss-lb6.12: a symbol read BARE inside its home package (e.g. a DEFVAR)
+    // and the same symbol reached via FIND-SYMBOL must be ONE symbol with ONE
+    // value cell — not two name-keyed twins with split cells. This blocked the
+    // ASDF load footer, where (asdf-version) does
+    //   (symbol-value (find-symbol "*ASDF-VERSION*" :asdf))
+    // against a value bound by a bare DEFVAR in ASDF/UPGRADE. The forms are
+    // separate top-level reads so IN-PACKAGE takes effect before the bare read.
+    let prog = "(defpackage :lb612 (:use :cl) (:export #:*v*)) \
+                (in-package :lb612) \
+                (defvar *v* 42) \
+                (in-package :cl-user) \
+                (format t \"~a\" (symbol-value (find-symbol \"*V*\" :lb612)))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("42"),
+        "bare DEFVAR and FIND-SYMBOL should share the value cell, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn key_param_named_like_exported_symbol_still_matches_bare_keyword() {
+    // bliss-lb6.12 regression guard: a &key parameter whose name is an exported
+    // (hence package-qualified) symbol of its own package must still match a
+    // bare :keyword at the call site — the keyword indicator is the variable's
+    // bare name regardless of its home package.
+    let prog = "(defpackage :lb612k (:use :cl) (:export #:f #:wilden)) \
+                (in-package :lb612k) \
+                (defun f (&key wilden) wilden) \
+                (in-package :cl-user) \
+                (format t \"~a\" (lb612k:f :wilden 7))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains('7'),
+        "exported-symbol &key param should accept a bare keyword, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn pathname_directory_returns_a_list_not_a_namestring() {
     // bliss-lb6: PATHNAME-DIRECTORY must return (:absolute|:relative comp…) so
     // UIOP/ANSI directory-list arithmetic works, not a namestring string.

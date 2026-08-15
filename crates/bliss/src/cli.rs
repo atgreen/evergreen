@@ -2834,6 +2834,53 @@ fn read_scan_token(chars: &[char], pos: &mut usize) -> String {
 thread_local! {
     static READ_EVAL_ENV: std::cell::Cell<*mut Env> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
+    // Re-entrancy guard for the package-aware symbol resolver. Resolving a token
+    // calls `intern_into_package`, which internally re-reads names via
+    // `resolve_sym`/`read-from-string`; those nested reads must take the reader's
+    // default name-keyed path, not recurse back into the resolver (bliss-lb6.12).
+    static RESOLVING_SYMBOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Reader hook: resolve a symbol token to the canonical symbol already
+/// accessible in the reader's package context, so a bare read inside package P,
+/// the qualified spelling `P:NAME`, and `FIND-SYMBOL` all converge on ONE symbol
+/// with ONE value/function cell (bliss-lb6.12). `pkg` is the explicit package
+/// designator (`None` = the current `*PACKAGE*`).
+///
+/// It resolves through the SAME read-only `find_symbol_in_package` that
+/// `FIND-SYMBOL` uses, so the two can never disagree. Crucially it does NOT
+/// intern/fabricate a symbol when the name is not yet accessible: it returns
+/// `None`, deferring to the reader's default name-keyed interning. Fabricating
+/// here would mint a package-qualified home symbol for names that are really
+/// inherited from COMMON-LISP but not present in its symbol table — e.g. special
+/// operators like `EVAL-WHEN` — and the interpreter dispatches those by bare
+/// name, so a qualified spelling would break them. `None` is also returned when
+/// no load environment is active (internal `read-from-string`) or for a bare
+/// read whose current package is COMMON-LISP / COMMON-LISP-USER, where the bare
+/// name is already the canonical key.
+fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
+    let ptr = READ_EVAL_ENV.with(|c| c.get());
+    if ptr.is_null() || RESOLVING_SYMBOL.with(|c| c.get()) {
+        return None;
+    }
+    // Safety: the load loop parks its live `&mut Env` here for exactly the span
+    // of each top-level read; reads never run concurrently and the interpreter is
+    // single-threaded, so no other `&mut Env` is live across this call.
+    let env = unsafe { &*ptr };
+    let pkg_name = match pkg {
+        Some(p) => resolve_package_name(env, p),
+        None => env.current_package.clone(),
+    };
+    if pkg.is_none() && (pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER") {
+        return None;
+    }
+    // `find_symbol_in_package` may consult COMMON-LISP-USER / KEYWORD via
+    // `resolve_sym`, which re-reads a name and could re-enter this hook; the guard
+    // routes those nested reads to the reader's default path.
+    RESOLVING_SYMBOL.with(|c| c.set(true));
+    let found = find_symbol_in_package(env, &pkg_name, name);
+    RESOLVING_SYMBOL.with(|c| c.set(false));
+    found.and_then(|(sym, _)| sym.is_symbol().then(|| sym.as_symbol_index()))
 }
 
 fn read_time_eval(form: BlissVal) -> Result<BlissVal, BlissError> {
@@ -2865,6 +2912,7 @@ fn read_next_form_at(
 
 fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     reader::set_read_eval_hook(Some(read_time_eval));
+    reader::set_symbol_resolver(Some(reader_symbol_resolver));
     register_declared_packages(source);
     let chars: Vec<char> = source.chars().collect();
     // Nesting is checked once for the whole buffer; each form is then read from
@@ -3754,17 +3802,31 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
 }
 
 fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
-    // A Bliss FASL (.bfasl) starts with the BFASL magic — verify and load the
-    // compiled unit (bliss-lb6.6); otherwise treat the file as source.
-    if bytes.len() >= bliss_rt::bfasl::BFASL_MAGIC.len()
-        && bytes[..bliss_rt::bfasl::BFASL_MAGIC.len()] == bliss_rt::bfasl::BFASL_MAGIC
-    {
-        return load_bfasl_into_env(&bytes, env);
+    // ANSI LOAD binds *PACKAGE* (and *READTABLE*) for the dynamic extent of the
+    // load, so a file's IN-PACKAGE forms don't leak into the caller — e.g. after
+    // `(load "lib/asdf.lisp")` the REPL returns to CL-USER, not ASDF/FOOTER. We
+    // snapshot the current package and restore it on the way out (on success and
+    // on error), which also keeps `current_package` — the reader's bare-symbol
+    // resolution context (bliss-lb6.12) and the REPL prompt — consistent.
+    let saved_package = env.current_package.clone();
+    let result = (|| {
+        let bytes = std::fs::read(path)
+            .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
+        // A Bliss FASL (.bfasl) starts with the BFASL magic — verify and load the
+        // compiled unit (bliss-lb6.6); otherwise treat the file as source.
+        if bytes.len() >= bliss_rt::bfasl::BFASL_MAGIC.len()
+            && bytes[..bliss_rt::bfasl::BFASL_MAGIC.len()] == bliss_rt::bfasl::BFASL_MAGIC
+        {
+            return load_bfasl_into_env(&bytes, env);
+        }
+        let contents = String::from_utf8_lossy(&bytes).into_owned();
+        with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&contents, env))
+    })();
+    if env.current_package != saved_package {
+        env.current_package = saved_package.clone();
+        env.define_local("*PACKAGE*", arena_str(&saved_package));
     }
-    let contents = String::from_utf8_lossy(&bytes).into_owned();
-    with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&contents, env))
+    result
 }
 
 /// Load a verified `.bfasl` compiled unit (spec §6.11, bliss-lb6.6): verify the
@@ -6473,7 +6535,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "LOAD" => {
                 let (path_form, _) = cp(cdr);
                 let path_val = eval_form(path_form, env)?;
-                return load_path_into_env(&val_as_str(path_val), env);
+                // ANSI LOAD returns a generalized boolean (T on success); the
+                // last top-level form's value is not the result.
+                load_path_into_env(&val_as_str(path_val), env)?;
+                return Ok(T);
             }
             "COMPILE-FILE" => {
                 // (compile-file source &optional output) — compile SOURCE to a
@@ -9565,9 +9630,16 @@ fn parse_var_spec(elem: BlissVal) -> (String, BlissVal, Option<String>) {
 /// Parse a &key element: `var` | `(var [default [supp]])` | `((:kw var) [default [supp]])`.
 /// Returns (keyword-bare-name, var-name, default-form, supplied-p-var).
 fn parse_key_spec(elem: BlissVal) -> (String, String, BlissVal, Option<String>) {
+    // For a `&key var` (or `(var …)`) spec the keyword name is `var`'s *bare*
+    // name (ANSI: the indicator is `(intern (symbol-name var) :keyword)`),
+    // independent of `var`'s home package — so a param whose symbol resolves
+    // package-qualified (e.g. an exported symbol read inside its own package,
+    // bliss-lb6.12) still matches a bare `:var` keyword at the call site. The
+    // bound variable name stays the full symbol name so the body's references
+    // (which resolve to the same symbol) find the binding.
     if elem.is_symbol() {
         let var = sym_name(elem);
-        return (var.clone(), var, NIL, None);
+        return (symbol_bare_name(&var), var, NIL, None);
     }
     if elem.is_cons() {
         let (head, r) = cp(elem);
@@ -9579,7 +9651,7 @@ fn parse_key_spec(elem: BlissVal) -> (String, String, BlissVal, Option<String>) 
         };
         if head.is_symbol() {
             let var = sym_name(head);
-            return (var.clone(), var, default, supp);
+            return (symbol_bare_name(&var), var, default, supp);
         }
         if head.is_cons() {
             let (kw_sym, r3) = cp(head);
