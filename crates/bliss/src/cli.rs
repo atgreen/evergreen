@@ -469,6 +469,7 @@ enum EvalContext {
     Repl,
     Eval,
     Load,
+    CompileFile,
 }
 
 // ── Environment for variable/function bindings ───────────────────
@@ -1913,6 +1914,40 @@ impl Env {
         }
         env.define_local("*FEATURES*", vec_to_list(&features));
         env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
+        env.seed_standard_constant(
+            "MOST-POSITIVE-FIXNUM",
+            BlissVal::from_fixnum((1_i64 << 60) - 1),
+        );
+        env.seed_standard_constant(
+            "MOST-NEGATIVE-FIXNUM",
+            BlissVal::from_fixnum(-(1_i64 << 60)),
+        );
+        env.seed_standard_constant("CHAR-CODE-LIMIT", BlissVal::from_fixnum(0x110000));
+        env.seed_standard_constant("ARRAY-RANK-LIMIT", BlissVal::from_fixnum(8));
+        env.seed_standard_constant(
+            "ARRAY-DIMENSION-LIMIT",
+            BlissVal::from_fixnum((1_i64 << 60) - 1),
+        );
+        env.seed_standard_constant(
+            "ARRAY-TOTAL-SIZE-LIMIT",
+            BlissVal::from_fixnum((1_i64 << 60) - 1),
+        );
+        env.seed_standard_constant(
+            "CALL-ARGUMENTS-LIMIT",
+            BlissVal::from_fixnum((1_i64 << 60) - 1),
+        );
+        env.seed_standard_constant(
+            "LAMBDA-PARAMETERS-LIMIT",
+            BlissVal::from_fixnum((1_i64 << 60) - 1),
+        );
+        env.seed_standard_constant(
+            "MULTIPLE-VALUES-LIMIT",
+            BlissVal::from_fixnum((1_i64 << 60) - 1),
+        );
+        env.seed_standard_constant(
+            "INTERNAL-TIME-UNITS-PER-SECOND",
+            BlissVal::from_fixnum(1000),
+        );
         // Install the stdlib's GC hooks (stream tracing + finalizer dispatch)
         // before allocating any stream, so stream handles are traced and their
         // finalizers can close unclosed file descriptors (bliss-jtc.7a).
@@ -2048,7 +2083,18 @@ impl Env {
         if let Some(val) = parent.and_then(|parent| Self::lookup_symbol_frame(&parent, idx)) {
             return Some(val);
         }
-        global_value_cell(idx)
+        if let Some(val) = global_value_cell(idx) {
+            return Some(val);
+        }
+        let name = sym_name(symbol);
+        if let Some(val) = self.lookup_var(&name) {
+            return Some(val);
+        }
+        let bare = symbol_bare_name(&name);
+        if bare != name {
+            return self.lookup_var(&bare);
+        }
+        None
     }
 
     fn set_var(&mut self, name: &str, val: BlissVal) {
@@ -2093,6 +2139,12 @@ impl Env {
         let mut frame = self.frame.borrow_mut();
         frame.symbol_vars.insert(symbol.as_symbol_index(), val);
         frame.vars.insert(sym_name(symbol), val);
+    }
+
+    fn seed_standard_constant(&mut self, name: &str, val: BlissVal) {
+        self.define_local(name, val);
+        self.define_local(&format!("COMMON-LISP:{name}"), val);
+        self.define_local(&format!("CL:{name}"), val);
     }
 
     fn lookup_frame(frame: &Rc<RefCell<EnvFrame>>, name: &str) -> Option<BlissVal> {
@@ -2722,7 +2774,12 @@ fn register_declared_packages(source: &str) {
             '(' => {
                 pos += 1;
                 let op = read_scan_token(&chars, &mut pos);
-                if op.eq_ignore_ascii_case("DEFPACKAGE") {
+                if op.eq_ignore_ascii_case("DEFPACKAGE")
+                    || op
+                        .rsplit(':')
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("DEFINE-PACKAGE"))
+                {
                     let pkg = read_scan_token(&chars, &mut pos);
                     let pkg = pkg
                         .trim_start_matches(':')
@@ -2778,7 +2835,15 @@ fn read_time_eval(form: BlissVal) -> Result<BlissVal, BlissError> {
     // Safety: `ptr` refers to the load loop's live `&mut Env` for exactly the
     // span of the enclosing read, and reads never run concurrently.
     let env = unsafe { &mut *ptr };
-    eval_form(form, env)
+    match eval_form(form, env) {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            if std::env::var_os("BLISS_BFASL_TRACE").is_some() {
+                eprintln!("[bfasl] #. failed: {} => {}", format_val(form), err);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Read the next form from `remaining`, evaluating any `#.` read-eval forms in
@@ -2815,27 +2880,216 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
 }
 
 fn read_forms_for_compile(source: &str, env: &mut Env) -> Result<Vec<BlissVal>, BlissError> {
-    reader::set_read_eval_hook(Some(read_time_eval));
-    register_declared_packages(source);
-    let chars: Vec<char> = source.chars().collect();
-    let mut pos = 0;
-    let mut forms = Vec::new();
-    loop {
-        while pos < chars.len() && chars[pos].is_ascii_whitespace() {
-            pos += 1;
+    with_eval_context(env, EvalContext::CompileFile, |env| {
+        reader::set_read_eval_hook(Some(read_time_eval));
+        register_declared_packages(source);
+        let chars: Vec<char> = source.chars().collect();
+        let mut pos = 0;
+        let mut forms = Vec::new();
+        loop {
+            while pos < chars.len() && chars[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos >= chars.len() {
+                break;
+            }
+            let remaining: String = chars[pos..].iter().collect();
+            let (val, consumed) = read_next_form(&remaining, env).map_err(|e| {
+                let line = chars[..pos].iter().filter(|&&ch| ch == '\n').count() + 1;
+                BlissError::FileError(format!("compile-file read failed near line {line}: {e}"))
+            })?;
+            if val == EOF {
+                break;
+            }
+            seed_compile_time_definitions(val, env);
+            if let Err(e) = process_compile_toplevel_form(val, env) {
+                if std::env::var_os("BLISS_BFASL_TRACE").is_some() {
+                    let line = chars[..pos].iter().filter(|&&ch| ch == '\n').count() + 1;
+                    eprintln!("[bfasl] ignored compile-time effect near line {line}: {e}");
+                }
+            }
+            forms.extend(compile_file_load_forms(val, env));
+            pos += consumed;
         }
-        if pos >= chars.len() {
-            break;
-        }
-        let remaining: String = chars[pos..].iter().collect();
-        let (val, consumed) = read_next_form(&remaining, env)?;
-        if val == EOF {
-            break;
-        }
-        forms.push(val);
-        pos += consumed;
+        Ok(forms)
+    })
+}
+
+fn seed_compile_time_definitions(form: BlissVal, env: &mut Env) {
+    if !form.is_cons() {
+        return;
     }
-    Ok(forms)
+    let (op, cdr) = cp(form);
+    if op.is_symbol() {
+        let op_name = sym_name(op);
+        match symbol_leaf_name(&op_name) {
+            "DEFVAR" => {
+                let (symbol, rest) = cp(cdr);
+                if symbol.is_symbol() && env.lookup_var_symbol(symbol).is_none() {
+                    let value = if rest.is_cons() {
+                        eval_form(cp(rest).0, env).unwrap_or(NIL)
+                    } else {
+                        NIL
+                    };
+                    seed_compile_time_binding(env, symbol, value);
+                }
+                return;
+            }
+            "DEFPARAMETER" | "DEFCONSTANT" => {
+                let (symbol, rest) = cp(cdr);
+                if symbol.is_symbol() {
+                    let value = if rest.is_cons() {
+                        eval_form(cp(rest).0, env).unwrap_or(NIL)
+                    } else {
+                        NIL
+                    };
+                    seed_compile_time_binding(env, symbol, value);
+                }
+                return;
+            }
+            "QUOTE" | "FUNCTION" => return,
+            _ => {}
+        }
+    }
+    let mut cursor = form;
+    while cursor.is_cons() {
+        let (item, rest) = cp(cursor);
+        seed_compile_time_definitions(item, env);
+        cursor = rest;
+    }
+}
+
+fn seed_compile_time_binding(env: &mut Env, symbol: BlissVal, value: BlissVal) {
+    env.set_var_symbol(symbol, value);
+    let name = sym_name(symbol);
+    env.set_var(&name, value);
+    let bare = symbol_bare_name(&name);
+    if bare != name {
+        env.set_var(&bare, value);
+    }
+}
+
+fn symbol_leaf_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
+}
+
+fn eval_when_has_situation(situations: BlissVal, target: &str) -> bool {
+    list_to_vec(situations).into_iter().any(|situation| {
+        situation.is_symbol() && symbol_leaf_name(&sym_name(situation)) == target
+    })
+}
+
+fn expand_compile_toplevel_form(mut form: BlissVal, env: &mut Env) -> BlissVal {
+    for _ in 0..256 {
+        if !form.is_cons() {
+            return form;
+        }
+        let (op, rest) = cp(form);
+        if !op.is_symbol() {
+            return form;
+        }
+        let name = sym_name(op);
+        let Some(mdef) = env
+            .macros
+            .get(&name)
+            .cloned()
+            .or_else(|| env.macros.get(symbol_leaf_name(&name)).cloned())
+        else {
+            return form;
+        };
+        match expand_macro(&mdef, rest, env) {
+            Ok(expanded) if expanded != form => form = expanded,
+            _ => return form,
+        }
+    }
+    form
+}
+
+fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
+    let form = expand_compile_toplevel_form(form, env);
+    if !form.is_cons() {
+        return vec![form];
+    }
+    let (op, cdr) = cp(form);
+    if !op.is_symbol() {
+        return vec![form];
+    }
+    let op_name = sym_name(op);
+    match symbol_leaf_name(&op_name) {
+        "PROGN" => list_to_vec(cdr)
+            .into_iter()
+            .flat_map(|f| compile_file_load_forms(f, env))
+            .collect(),
+        "EVAL-WHEN" => {
+            let (situations, body) = cp(cdr);
+            if eval_when_has_situation(situations, "LOAD-TOPLEVEL")
+                || eval_when_has_situation(situations, "EXECUTE")
+            {
+                list_to_vec(body)
+                    .into_iter()
+                    .flat_map(|f| compile_file_load_forms(f, env))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => vec![form],
+    }
+}
+
+fn compile_toplevel_form_has_effect(form: BlissVal, env: &Env) -> bool {
+    if !form.is_cons() {
+        return false;
+    }
+    let (op, _) = cp(form);
+    if !op.is_symbol() {
+        return false;
+    }
+    let name = sym_name(op);
+    if env.macros.contains_key(&name)
+        || env.macros.contains_key(symbol_leaf_name(&name))
+    {
+        return true;
+    }
+    matches!(
+        symbol_leaf_name(&name),
+        "EVAL-WHEN"
+            | "PROGN"
+            | "DEFUN"
+            | "DEFMACRO"
+            | "DEFINE-COMPILER-MACRO"
+            | "DEFINE-SYMBOL-MACRO"
+            | "DEFSETF"
+            | "DEFCLASS"
+            | "DEFSTRUCT"
+            | "DEFGENERIC"
+            | "DEFMETHOD"
+            | "DEFPACKAGE"
+            | "DEFINE-PACKAGE"
+            | "IN-PACKAGE"
+            | "MAKE-PACKAGE"
+            | "USE-PACKAGE"
+            | "EXPORT"
+            | "IMPORT"
+            | "SHADOW"
+            | "SHADOWING-IMPORT"
+            | "SETQ"
+            | "SETF"
+    )
+}
+
+fn process_compile_toplevel_form(form: BlissVal, env: &mut Env) -> Result<(), BlissError> {
+    if form.is_cons() {
+        let (op, cdr) = cp(form);
+        if op.is_symbol() && symbol_leaf_name(&sym_name(op)) == "DEFINE-PACKAGE" {
+            eval_defpackage(cdr, env)?;
+            return Ok(());
+        }
+    }
+    if compile_toplevel_form_has_effect(form, env) {
+        eval_form(form, env)?;
+    }
+    Ok(())
 }
 
 fn bundled_asdf_path() -> String {
@@ -3681,7 +3935,12 @@ fn load_bfasl_into_env(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissErr
 fn build_bfasl_from_source(source: &str, src_path: &str, env: &mut Env) -> Vec<u8> {
     let bytecode_unit = match read_forms_for_compile(source, env) {
         Ok(forms) => bytecode::build_bbu_from_forms(&forms, src_path, source, env),
-        Err(_) => bytecode::build_bbu_from_forms(&[], src_path, source, env),
+        Err(e) => {
+            if std::env::var_os("BLISS_BFASL_TRACE").is_some() {
+                eprintln!("[bfasl] bytecode pre-pass failed for {src_path}: {e}");
+            }
+            bytecode::build_bbu_from_forms(&[], src_path, source, env)
+        }
     };
     bliss_rt::bfasl::BfaslBuilder::new()
         .content_hash(bliss_rt::bfasl::content_hash(source.as_bytes()))
@@ -3954,15 +4213,12 @@ fn value_satisfies_declared_type(type_form: BlissVal, value: BlissVal) -> Result
 fn eval_when_should_run(situations: BlissVal, env: &Env) -> bool {
     let has_situation = |target: &str| {
         list_to_vec(situations).into_iter().any(|situation| {
-            situation.is_symbol()
-                && sym_name(situation)
-                    .trim_start_matches("KEYWORD:")
-                    .trim_start_matches("COMMON-LISP:")
-                    == target
+            situation.is_symbol() && symbol_leaf_name(&sym_name(situation)) == target
         })
     };
 
     match env.eval_context {
+        EvalContext::CompileFile => has_situation("COMPILE-TOPLEVEL"),
         EvalContext::Load => has_situation("LOAD-TOPLEVEL") || has_situation("EXECUTE"),
         EvalContext::Eval | EvalContext::Repl => has_situation("EXECUTE"),
     }
@@ -11131,9 +11387,18 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 .trim_start_matches("KEYWORD:")
                 .trim_start_matches(':');
             match key_bare {
-                "USE" => {
+                "USE" | "USE-REEXPORT" | "MIX" | "MIX-REEXPORT" => {
                     for v in list_to_vec(val_list) {
                         uses.push(resolve_package_name(env, &val_as_str(v)));
+                    }
+                }
+                "REEXPORT" => {
+                    for v in list_to_vec(val_list) {
+                        let from = resolve_package_name(env, &val_as_str(v));
+                        uses.push(from.clone());
+                        if let Some(pkg) = env.packages.get(&from) {
+                            exports.extend(pkg.exports.iter().cloned());
+                        }
                     }
                 }
                 "EXPORT" => {
@@ -11160,6 +11425,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                         }
                     }
                 }
+                "RECYCLE" | "UNINTERN" | "DOCUMENTATION" | "LOCAL-NICKNAMES" => {}
                 _ => {}
             }
         }
@@ -11170,13 +11436,16 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         pkg_name.clone(),
         PackageDef {
             name: pkg_name.clone(),
-            nicknames,
+            nicknames: nicknames.clone(),
             exports: exports.clone(),
             uses,
             symbols: HashMap::new(),
         },
     );
     reader::register_package(&pkg_name);
+    for nickname in &nicknames {
+        reader::register_package(nickname);
+    }
 
     // Import named symbols so they are accessible (and identical) in this
     // package; fall back to a fresh internal symbol if the source lacks it.

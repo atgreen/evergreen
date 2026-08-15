@@ -45,6 +45,16 @@ fn bfasl_section(bytes: &[u8], wanted: u16) -> Option<&[u8]> {
     None
 }
 
+fn bbu_counts(bytes: &[u8]) -> (u32, u32, u32) {
+    let bbu = bfasl_section(bytes, 12).expect("compile-file must emit BYTECODE_UNIT");
+    assert_eq!(&bbu[..4], b"BBU\0", "BYTECODE_UNIT has BBU magic");
+    (
+        u32::from_le_bytes(bbu[12..16].try_into().unwrap()),
+        u32::from_le_bytes(bbu[16..20].try_into().unwrap()),
+        u32::from_le_bytes(bbu[20..24].try_into().unwrap()),
+    )
+}
+
 #[test]
 fn compile_file_then_load_round_trips_in_a_fresh_process() {
     let dir = workdir("roundtrip");
@@ -66,10 +76,7 @@ fn compile_file_then_load_round_trips_in_a_fresh_process() {
     assert!(out.exists(), "compile-file produced no .bfasl");
     let bytes = fs::read(&out).unwrap();
     assert_eq!(&bytes[..6], b"BFASL\0", "output is a real .bfasl");
-    let bbu = bfasl_section(&bytes, 12).expect("compile-file must emit BYTECODE_UNIT");
-    assert_eq!(&bbu[..4], b"BBU\0", "BYTECODE_UNIT has BBU magic");
-    let function_count = u32::from_le_bytes(bbu[16..20].try_into().unwrap());
-    let load_action_count = u32::from_le_bytes(bbu[20..24].try_into().unwrap());
+    let (_, function_count, load_action_count) = bbu_counts(&bytes);
     assert!(function_count > 0, "BYTECODE_UNIT contains bytecode functions");
     assert!(load_action_count > 0, "BYTECODE_UNIT contains a load plan");
 
@@ -88,6 +95,70 @@ fn compile_file_then_load_round_trips_in_a_fresh_process() {
         "(144 7)",
         "loaded .bfasl must define the function and the variable"
     );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_file_prepass_handles_eval_when_and_read_time_constants() {
+    let dir = workdir("eval-when");
+    let src = dir.join("e.lisp");
+    let out = dir.join("e.bfasl");
+    fs::write(
+        &src,
+        "(eval-when (:compile-toplevel) (defparameter +cf-read+ 12))
+         (defun cf-readtime () #.(+ +cf-read+ 5))
+         (defun cf-limit () #.most-positive-fixnum)\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&c.stdout),
+        String::from_utf8_lossy(&c.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    let (_, function_count, load_action_count) = bbu_counts(&bytes);
+    assert!(function_count >= 2, "expected both functions in BYTECODE_UNIT");
+    assert!(load_action_count >= 2, "expected load actions for both functions");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compile_file_prepass_registers_define_package_nicknames() {
+    let dir = workdir("define-package");
+    let src = dir.join("p.lisp");
+    let out = dir.join("p.bfasl");
+    fs::write(
+        &src,
+        "(define-package :bf/pkg (:nicknames :bf-pkg) (:use :common-lisp) (:export #:pkg-value))
+         (in-package :bf-pkg)
+         (defun pkg-value () 42)\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&c.stdout),
+        String::from_utf8_lossy(&c.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    let (_, function_count, load_action_count) = bbu_counts(&bytes);
+    assert!(function_count > 0, "BYTECODE_UNIT contains bytecode functions");
+    assert!(load_action_count > 0, "BYTECODE_UNIT contains a load plan");
 
     let _ = fs::remove_dir_all(&dir);
 }
