@@ -6602,6 +6602,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if !nicknames.is_empty() {
                     if let Some(def) = Rc::make_mut(&mut env.packages).get_mut(&pkg_name) {
                         for nick in nicknames {
+                            // Register the nickname with the reader too, so a
+                            // package-qualified symbol written with the nickname
+                            // (e.g. `uiop:foo`, UIOP being a nickname of
+                            // UIOP/DRIVER) resolves at read time (bliss-lb6).
+                            reader::register_package(&nick);
                             if !def.nicknames.contains(&nick) {
                                 def.nicknames.push(nick);
                             }
@@ -11694,6 +11699,12 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         c = rest;
     }
 
+    // Register the canonical name and every nickname with the reader, so
+    // package-qualified symbols written with either resolve at read time.
+    reader::register_package(&pkg_name);
+    for nick in &nicknames {
+        reader::register_package(nick);
+    }
     Rc::make_mut(&mut env.packages).insert(
         pkg_name.clone(),
         PackageDef {
@@ -11704,7 +11715,6 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             symbols: HashMap::new(),
         },
     );
-    reader::register_package(&pkg_name);
 
     // Import named symbols so they are accessible (and identical) in this
     // package; fall back to a fresh internal symbol if the source lacks it.
