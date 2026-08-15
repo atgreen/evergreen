@@ -1531,10 +1531,15 @@ fn builtin_type_specializer_distance(name: &str, arg: BlissVal) -> Option<usize>
         "STRING" | "SIMPLE-STRING" | "BASE-STRING" => is_string_value(arg).then_some(1),
         "CHARACTER" => arg.is_character().then_some(1),
         "NULL" => arg.is_nil().then_some(1),
+        "KEYWORD" => is_keyword_arg(arg).then_some(1),
         "SYMBOL" => arg.is_symbol().then_some(2),
         "CONS" => arg.is_cons().then_some(1),
         "LIST" => arg.is_list().then_some(2),
+        // PATHNAME is a distinct built-in type (not a CLOS instance); ASDF's
+        // source-registry dispatches methods on it (bliss-lb6.14).
+        "PATHNAME" => bliss_stdlib::is_pathname(arg).then_some(1),
         "ATOM" => (!arg.is_cons()).then_some(6),
+        "T" => Some(usize::MAX / 4),
         _ => None,
     }
 }
