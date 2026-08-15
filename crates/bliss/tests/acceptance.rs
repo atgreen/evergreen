@@ -1771,6 +1771,30 @@ fn hash_p_literal_is_a_real_pathname() {
 }
 
 #[test]
+fn let_dynamically_binds_special_variables() {
+    // bliss-lb6.14: a LET on a special (earmuffed) variable must establish a
+    // DYNAMIC binding visible to called functions, not a lexical one — otherwise
+    // `(let ((*x* v)) (helper))` where HELPER reads *x* sees the global value,
+    // which broke ASDF's session cache (a let-bound special read by helpers).
+    // Uses a global defun (compiled on the bytecode backend) plus a closure, to
+    // cover both execution paths; the value is captured into a var so the whole
+    // expression is a compilable top-level form.
+    let prog = "(defvar *dv* :outer) \
+                (defun reader () *dv*) \
+                (defvar *r1* (let ((*dv* :inner)) (reader))) \
+                (defvar *r2* (let ((f (lambda () *dv*))) (let ((*dv* :dyn)) (funcall f)))) \
+                (format t \"~a ~a ~a\" *r1* *r2* *dv*)";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("INNER DYN OUTER"),
+        "let must dynamically bind specials (seen by callees) and restore on exit, \
+         got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn stringp_of_a_pathname_is_false() {
     // bliss-lb6.15: a pathname must not satisfy STRINGP, even though its
     // namestring is registered as a string. When it did, UIOP's

@@ -921,6 +921,19 @@ impl<'e> Lowerer<'e> {
     fn lower_let(&mut self, rest: BlissVal, sequential: bool) -> LowerResult<()> {
         let (bindings, body) = cp(rest);
         let binding_forms = list_to_vec(bindings);
+
+        // A special (dynamically-scoped) variable must be bound in the global
+        // value cell so called functions see it; the bytecode path binds only
+        // lexical locals, so bail to the tree-walker (which dynamic-binds
+        // correctly) whenever a binding names a special — bliss-lb6.14, ASDF's
+        // `(let ((*asdf-session* …)) …)` read by helper functions.
+        if binding_forms
+            .iter()
+            .any(|b| binding_name_init(*b).map(|(n, _)| is_special_name(&n)).unwrap_or(false))
+        {
+            return Err(Bail);
+        }
+
         let saved_next_local = self.next_local;
 
         // A let that binds any captured variable needs a fresh child EnvFrame so
@@ -1854,6 +1867,15 @@ fn collect_symbol_names(form: BlissVal, out: &mut std::collections::HashSet<Stri
 }
 
 /// Extract `(name init)` from a `let` binding, which may also be a bare symbol.
+/// True if `name` (a symbol name, possibly package-qualified) is spelled as a
+/// special variable by the earmuff convention `*…*`. Matches the tree-walker's
+/// `is_special_var` so the two agree on which LET bindings are dynamic.
+fn is_special_name(name: &str) -> bool {
+    let bare = name.rsplit(':').next().unwrap_or(name);
+    let b = bare.as_bytes();
+    b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*'
+}
+
 fn binding_name_init(b: BlissVal) -> LowerResult<(String, BlissVal)> {
     if b.is_symbol() {
         return Ok((sym_name(b), NIL));

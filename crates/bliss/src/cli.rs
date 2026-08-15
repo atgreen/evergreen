@@ -9549,6 +9549,47 @@ fn sort_sequence(
 // DEFUN, or DEFMETHOD nested in a LET — would copy-on-write into the discarded
 // child and never reach the caller. Keeping one env also lets multiple values
 // and dynamic state flow out of the body naturally.
+/// True if `sym` names a special (dynamically-scoped) variable. bliss follows
+/// the universal earmuff convention — a name spelled `*…*` is special — which
+/// covers the standard special variables (`*standard-output*`, `*package*`, …)
+/// and library specials like ASDF's `*asdf-session*`. A `let` on such a name
+/// must establish a DYNAMIC binding (visible to called functions), not a lexical
+/// one (bliss-lb6.14: ASDF's session cache is a `let`-bound special read by
+/// helper functions).
+fn is_special_var(sym: BlissVal) -> bool {
+    if !sym.is_symbol() {
+        return false;
+    }
+    let bare = symbol_bare_name(&sym_name(sym));
+    let b = bare.as_bytes();
+    b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*'
+}
+
+/// RAII guard for a dynamic (special-variable) binding: it saves the symbol's
+/// current global value cell and restores it on drop, so the binding is undone
+/// on every exit path from the `let` — normal return or an error unwinding
+/// through `?`.
+struct DynBind {
+    idx: u32,
+    saved: BlissVal,
+}
+
+impl DynBind {
+    /// Establish a dynamic binding of `sym` to `val`, returning the guard.
+    fn establish(sym: BlissVal, val: BlissVal) -> Self {
+        let idx = sym.as_symbol_index();
+        let saved = bliss_rt::symbols::symbol_value(idx).unwrap_or(bliss_rt::value::UNBOUND);
+        bliss_rt::symbols::set_symbol_value(idx, val);
+        DynBind { idx, saved }
+    }
+}
+
+impl Drop for DynBind {
+    fn drop(&mut self) {
+        bliss_rt::symbols::set_symbol_value(self.idx, self.saved);
+    }
+}
+
 fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, BlissError> {
     let (bindings_form, body) = cp(cdr);
     let parent = Rc::clone(&env.frame);
@@ -9556,6 +9597,10 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
     if sequential {
         // let*: one child frame; each init sees the bindings established before it.
         return with_child_frame(env, parent, move |env| {
+            // Special bindings are dynamic (global cell); the guards restore on
+            // scope exit. Held for the whole body so later inits see earlier
+            // special bindings, matching lexical ones.
+            let mut dyn_binds: Vec<DynBind> = Vec::new();
             let mut c = bindings_form;
             while c.is_cons() {
                 let (binding, rest) = cp(c);
@@ -9563,13 +9608,19 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                     let (var_form, val_rest) = cp(binding);
                     let (val_form, _) = cp(val_rest);
                     let val = eval_form(val_form, env)?;
-                    if var_form.is_symbol() {
+                    if is_special_var(var_form) {
+                        dyn_binds.push(DynBind::establish(var_form, val));
+                    } else if var_form.is_symbol() {
                         env.define_local_symbol(var_form, val);
                     } else {
                         env.define_local(&sym_name(var_form), val);
                     }
                 } else if binding.is_symbol() {
-                    env.define_local_symbol(binding, NIL);
+                    if is_special_var(binding) {
+                        dyn_binds.push(DynBind::establish(binding, NIL));
+                    } else {
+                        env.define_local_symbol(binding, NIL);
+                    }
                 }
                 c = rest;
             }
@@ -9593,8 +9644,13 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
     }
 
     with_child_frame(env, parent, move |env| {
+        // Special bindings are dynamic (global cell) with RAII restore; the rest
+        // are lexical frame bindings.
+        let mut dyn_binds: Vec<DynBind> = Vec::new();
         for (symbol, val) in evaluated {
-            if symbol.is_symbol() {
+            if is_special_var(symbol) {
+                dyn_binds.push(DynBind::establish(symbol, val));
+            } else if symbol.is_symbol() {
                 env.define_local_symbol(symbol, val);
             } else {
                 env.define_local(&sym_name(symbol), val);
