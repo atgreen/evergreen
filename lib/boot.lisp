@@ -439,6 +439,13 @@
 
 ;;; WITH-STANDARD-IO-SYNTAX: evaluate BODY with the standard reader/printer
 ;;; variables bound to their ANSI-standard values. An empty body yields NIL.
+;; WITH-COMPILATION-UNIT batches compiler warnings; this interpreter has no such
+;; batching, so run the body directly and ignore the options (bliss-lb6.14: ASDF
+;; compile-op wraps perform in it).
+(defmacro with-compilation-unit (options &rest body)
+  (declare (ignore options))
+  (cons 'progn body))
+
 (defmacro with-standard-io-syntax (&rest body)
   `(let ((*readtable* :standard-readtable)
          (*package* "COMMON-LISP-USER")
@@ -499,15 +506,18 @@
 ;;; internal apply helper can't invoke interpreter builtins. See spec §5.6.
 ;;; ---------------------------------------------------------------------------
 
-(defun reduce (fn seq &key key from-end (start 0) end initial-value)
+(defun reduce (fn seq &key key from-end (start 0) end (initial-value nil ivp))
+  ;; NB: distinguish an explicit `:initial-value nil` from an omitted one via the
+  ;; supplied-p flag IVP — otherwise (reduce f seq :initial-value nil) on an empty
+  ;; sequence wrongly calls (f) with zero args (bliss-lb6.14: UIOP timestamps).
   (let ((items (coerce seq 'list)))
     (when (or (> start 0) end)
       (setq items (subseq items start (or end (length items)))))
     (when key (setq items (mapcar key items)))
     (when from-end (setq items (reverse items)))
     (if (null items)
-        (if initial-value initial-value (funcall fn))
-        (let ((acc (if initial-value initial-value (pop items))))
+        (if ivp initial-value (funcall fn))
+        (let ((acc (if ivp initial-value (pop items))))
           (dolist (x items acc)
             (setq acc (if from-end (funcall fn x acc) (funcall fn acc x))))))))
 

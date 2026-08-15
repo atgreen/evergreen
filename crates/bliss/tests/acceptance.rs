@@ -1795,6 +1795,38 @@ fn let_dynamically_binds_special_variables() {
 }
 
 #[test]
+fn reduce_honors_explicit_nil_initial_value() {
+    // bliss-lb6.14: (reduce f '() :initial-value nil) must return NIL, not call f
+    // with zero args — an explicit :initial-value nil differs from an omitted one.
+    let prog = "(format t \"~a|~a\" \
+                (reduce (function +) '() :initial-value nil) \
+                (reduce (lambda (a b) (list a b)) '(1 2 3) :initial-value nil))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("NIL|"),
+        "reduce with :initial-value nil on empty seq should return NIL, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn setf_of_a_setf_generic_function() {
+    // bliss-lb6.14: (setf (place …) v) dispatches to a (defmethod (setf place) …)
+    // writer generic — ASDF uses (setf (action-status …) …).
+    let prog = "(defgeneric (setf gsp) (v x)) \
+                (defmethod (setf gsp) (v (x cons)) (setf (car x) v)) \
+                (let ((c (list 0))) (setf (gsp c) 8) (format t \"~a\" c))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(8)"),
+        "setf of a (setf f) generic should mutate the place, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn setf_of_a_setf_function_place() {
     // bliss-lb6.14: (setf (place …) v) must call a (defun (setf place) …) writer
     // (CLHS 5.1.2.9) — ASDF uses (defun (setf operate-level) …).

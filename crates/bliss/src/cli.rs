@@ -5241,6 +5241,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         &args,
                                         Rc::clone(&env.frame),
                                     )?;
+                                } else if {
+                                    let key = format!("(SETF {})", other);
+                                    env.methods.contains_key(&key) || env.generics.contains_key(&key)
+                                } {
+                                    // A (setf place) *generic function* (defmethod
+                                    // (setf place) …): dispatch it with the new
+                                    // value first, then the place's subforms.
+                                    let key = format!("(SETF {})", other);
+                                    let mut args = vec![val];
+                                    let mut ac = aargs;
+                                    while ac.is_cons() {
+                                        let (af, ar) = cp(ac);
+                                        args.push(eval_form(af, env)?);
+                                        ac = ar;
+                                    }
+                                    invoke_generic_function(&key, &args, env)?;
                                 } else {
                                     return Err(BlissError::Internal(format!(
                                         "SETF: unsupported place ({} ...)",
@@ -5875,6 +5891,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (pathname_form, _) = cp(cdr);
                 let pathname = eval_form(pathname_form, env)?;
                 return Ok(bliss_stdlib::probe_file(pathname)?.unwrap_or(NIL));
+            }
+            "FILE-WRITE-DATE" => {
+                // (file-write-date pathspec) — the file's last-modified time as a
+                // CL universal time (seconds since 1900-01-01). ASDF uses it for
+                // staleness checks (bliss-lb6.14).
+                let (path_form, _) = cp(cdr);
+                let pathspec = eval_form(path_form, env)?;
+                let path = path_designator_to_string(pathspec)?;
+                let secs = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map_err(|e| BlissError::FileError(format!("{}: {}", path, e)))?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| BlissError::FileError(e.to_string()))?
+                    .as_secs();
+                // Universal time epoch (1900) precedes the Unix epoch (1970) by
+                // 2208988800 seconds.
+                return Ok(BlissVal::from_fixnum(secs as i64 + 2_208_988_800));
             }
             "DIRECTORY" => {
                 // (directory pathspec &key …) — list pathnames matching a
@@ -11264,7 +11297,7 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
 // ── DEFGENERIC ───────────────────────────────────────────────────
 fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, options) = cp(cdr);
-    let name = sym_name(name_form);
+    let name = function_name_key(name_form);
     let mut combination = bliss_stdlib::MethodCombinationType::Standard;
     // `(:method qualifier* specialized-lambda-list body...)` options each define a
     // method; collect their tails so they can be registered after the generic
@@ -11313,7 +11346,9 @@ fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
 // ── DEFMETHOD ────────────────────────────────────────────────────
 fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, rest) = cp(cdr);
-    let name = sym_name(name_form);
+    // A `(setf place)` method name is a cons; key it as "(SETF PLACE)" so SETF
+    // can find the writer generic (bliss-lb6.14).
+    let name = function_name_key(name_form);
     let combination = env
         .generics
         .get(&name)
