@@ -1118,6 +1118,23 @@ fn method_combination_from_name(name: &str) -> Option<bliss_stdlib::MethodCombin
     }
 }
 
+/// True if `v` is a genuine function object — a real function value
+/// (`is_function`) or an interpreter closure, represented as the cons
+/// `(BLISS::CLOSURE . id)`. A bare symbol (what `#'foo` yields for a named
+/// function) and an ordinary data cons (e.g. `(make-instance c)`) are NOT
+/// functions, so `(typep '(make-instance c) 'function)` is correctly NIL and
+/// UIOP's ENSURE-FUNCTION etypecase falls through to its CONS clause (bliss-lb6).
+fn is_function_value(v: BlissVal) -> bool {
+    if v.is_function() {
+        return true;
+    }
+    if v.is_cons() {
+        let (h, t) = cp(v);
+        return h.is_symbol() && sym_name(h) == "BLISS::CLOSURE" && t.is_fixnum();
+    }
+    false
+}
+
 fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, BlissError> {
     if !class.is_symbol() {
         return Ok(class);
@@ -3588,7 +3605,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "FLOAT" | "SINGLE-FLOAT" => object.is_single_float(),
             "CHARACTER" => object.is_character(),
             "BOOLEAN" => object.is_nil() || object == T,
-            "FUNCTION" => object.is_symbol() || object.is_cons(),
+            "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(object),
             "PACKAGE" => is_package_value(env, object),
             "HASH-TABLE" => bliss_stdlib::hash_table_count(object).is_ok(),
             "PATHNAME" => bliss_stdlib::namestring(object).is_ok(),
@@ -4637,6 +4654,29 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     c = r;
                 }
                 return Ok(NIL);
+            }
+            "FDEFINITION" | "SYMBOL-FUNCTION" => {
+                let (sf, _) = cp(cdr);
+                let spec = eval_form(sf, env)?;
+                // A function name is a symbol or `(setf f)`. Return a callable
+                // designator: the heap function object when one is bound (so it
+                // is FUNCTIONP), otherwise the name itself (funcall/apply accept
+                // a symbol / `(setf f)` designator).
+                if spec.is_symbol() {
+                    let n = sym_name(spec);
+                    if let Some(f) = global_fn(&n) {
+                        return Ok(f);
+                    }
+                    if fn_bound(env, &n)
+                        || env.methods.contains_key(&n)
+                        || env.generics.contains_key(&n)
+                        || env.macros.contains_key(&n)
+                    {
+                        return Ok(spec);
+                    }
+                    return Err(BlissError::UndefinedFunction(spec));
+                }
+                return Ok(spec);
             }
             "FBOUNDP" => {
                 let (sf, _) = cp(cdr);
@@ -11086,6 +11126,14 @@ fn apply_function(
             let (params_form, body) = cp(lr);
             return eval_lambda_call(env, params_form, body, args, Rc::clone(&env.frame));
         }
+    }
+    // A heap interpreted-function object, e.g. from FDEFINITION / SYMBOL-FUNCTION
+    // or a #' on a global defun. Call it by its own lambda list and body.
+    if fn_val.is_heap_object() && bliss_rt::function::is_interpreted_function(fn_val) {
+        bliss_rt::function::record_invocation(fn_val);
+        let params_form = bliss_rt::function::lambda_list(fn_val);
+        let body = bliss_rt::function::body(fn_val);
+        return eval_lambda_call(env, params_form, body, args, Rc::clone(&env.frame));
     }
     Err(BlissError::Internal(format!("Cannot apply: {:?}", fn_val)))
 }
