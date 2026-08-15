@@ -9332,6 +9332,11 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
         _ => body,
     };
+    // Macroexpand the body once, now, so the tree-walker never re-expands (and
+    // re-gensyms) it on every call (bliss-lb6.11). This is a best-effort,
+    // conservative pass: anything it leaves unexpanded is still handled by the
+    // lazy expansion in `eval_list`, so it can only ever under-expand.
+    let body = mx_each(body, env, 0);
     if name_form.is_symbol() {
         // Ordinary global function → the symbol's heap function cell
         // (bliss-jtc.6.8). Redefinition updates the existing function object in
@@ -10125,6 +10130,210 @@ fn params_form_uses_environment(params_form: BlissVal) -> bool {
         c = rest;
     }
     false
+}
+
+/// Depth cap for the definition-time macroexpansion pass. Beyond it we stop
+/// expanding and leave the form to the lazy `eval_list` path — a backstop
+/// against a runaway (self-referential) macro, never hit by real code.
+const MACROEXPAND_ALL_MAX_DEPTH: u32 = 400;
+
+/// Macroexpand each element of the (proper-spine) list `list` independently as
+/// code, rebuilding the list. Symbols (tags, keywords, binding names) and other
+/// atoms pass through untouched; only genuine sub-forms are expanded. The list
+/// spine is walked iteratively so a long body cannot overflow the Rust stack;
+/// only *nesting* recurses (bounded by `MACROEXPAND_ALL_MAX_DEPTH`).
+fn mx_each(list: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
+    let mut items = Vec::new();
+    let mut c = list;
+    while c.is_cons() {
+        let (h, t) = cp(c);
+        items.push(h);
+        c = t;
+    }
+    // `c` is the (usually NIL) tail; preserve it so dotted lists round-trip.
+    let mut out = c;
+    for &it in items.iter().rev() {
+        out = arena_cons(macroexpand_all(it, env, depth), out);
+    }
+    out
+}
+
+/// Expand every macro call reachable in *evaluated position* within `form`,
+/// once (a conservative macroexpand-all / minimal compilation — CLHS 3.2.2.2).
+///
+/// Safety principle: only expand where the position is certainly code. Quoted
+/// data, type specifiers, local-macro scopes (MACROLET/SYMBOL-MACROLET), the
+/// LOOP sublanguage, and binding *names* are left verbatim; a form we are unsure
+/// about is returned unchanged and handled by the lazy expansion in `eval_list`
+/// at call time. An expander error also leaves the form verbatim. Thus the pass
+/// can only ever *under*-expand, never miscompile.
+fn macroexpand_all(form: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
+    if depth >= MACROEXPAND_ALL_MAX_DEPTH || !form.is_cons() {
+        return form;
+    }
+    let d = depth + 1;
+    let (car, cdr) = cp(form);
+
+    // `((lambda (..) ..) args..)` — expand the operator form and the arguments.
+    if car.is_cons() {
+        return arena_cons(macroexpand_all(car, env, d), mx_each(cdr, env, d));
+    }
+    if !car.is_symbol() {
+        return form;
+    }
+    let name = sym_name(car);
+
+    // 1. Macro call → expand once, then recurse into the expansion. On any
+    //    expander error, leave the original form for the lazy path.
+    if let Some(mdef) = env.macros.get(&name).cloned().or_else(|| {
+        name.rsplit(':')
+            .next()
+            .and_then(|bare| env.macros.get(bare).cloned())
+    }) {
+        return match expand_macro(&mdef, cdr, env) {
+            Ok(expanded) => macroexpand_all(expanded, env, d),
+            Err(_) => form,
+        };
+    }
+
+    // 2. Special forms that must NOT be walked generically.
+    match name.as_str() {
+        // Data / sublanguages / local-macro scopes: leave the whole form.
+        "QUOTE" | "BLISS::QUASIQUOTE" | "MACROLET" | "SYMBOL-MACROLET" | "LOOP"
+        | "DECLARE" | "GO" => form,
+
+        // Binding forms: expand init-forms and bodies but preserve the bound
+        // names (a variable named like a macro must not be expanded away).
+        "LET" | "LET*" => {
+            let (bindings, body) = cp(cdr);
+            let new_bindings = mx_bindings(bindings, env, d);
+            arena_cons(car, arena_cons(new_bindings, mx_each(body, env, d)))
+        }
+        "LAMBDA" => {
+            // (lambda lambda-list body...) — keep the lambda list, expand body.
+            let (ll, body) = cp(cdr);
+            arena_cons(car, arena_cons(ll, mx_each(body, env, d)))
+        }
+        "FLET" | "LABELS" => {
+            // (flet ((name lambda-list fbody...) ...) body...)
+            let (defs, body) = cp(cdr);
+            let new_defs = mx_local_fns(defs, env, d);
+            arena_cons(car, arena_cons(new_defs, mx_each(body, env, d)))
+        }
+        "MULTIPLE-VALUE-BIND" => {
+            // (multiple-value-bind (vars) value-form body...)
+            let (vars, rest) = cp(cdr);
+            let (value_form, body) = cp(rest);
+            arena_cons(
+                car,
+                arena_cons(
+                    vars,
+                    arena_cons(macroexpand_all(value_form, env, d), mx_each(body, env, d)),
+                ),
+            )
+        }
+        "DESTRUCTURING-BIND" => {
+            // (destructuring-bind pattern value-form body...)
+            let (pattern, rest) = cp(cdr);
+            let (value_form, body) = cp(rest);
+            arena_cons(
+                car,
+                arena_cons(
+                    pattern,
+                    arena_cons(macroexpand_all(value_form, env, d), mx_each(body, env, d)),
+                ),
+            )
+        }
+        "COND" => {
+            // (cond (test body...) ...) — each clause element is a standalone
+            // form (the clause car is a *test*, not an operator), so expand the
+            // clause element-wise rather than as one call form.
+            let mut clauses = Vec::new();
+            let mut c = cdr;
+            while c.is_cons() {
+                let (clause, rest) = cp(c);
+                clauses.push(if clause.is_cons() {
+                    mx_each(clause, env, d)
+                } else {
+                    clause
+                });
+                c = rest;
+            }
+            let mut out = c;
+            for &cl in clauses.iter().rev() {
+                out = arena_cons(cl, out);
+            }
+            arena_cons(car, out)
+        }
+        "FUNCTION" => {
+            // (function (lambda ...)) — expand the lambda; (function name) — leave.
+            let (target, _) = cp(cdr);
+            if target.is_cons() {
+                arena_cons(car, arena_cons(macroexpand_all(target, env, d), NIL))
+            } else {
+                form
+            }
+        }
+
+        // Everything else — other special forms whose arguments are all code
+        // (PROGN, WHEN, IF, AND, OR, TAGBODY, BLOCK, SETQ, SETF, CATCH, THE,
+        // RETURN-FROM, UNWIND-PROTECT, EVAL-WHEN, …) and ordinary function
+        // calls — expand each argument independently. Symbols in argument
+        // position (tags, block names, setq/setf place symbols) pass through.
+        _ => arena_cons(car, mx_each(cdr, env, d)),
+    }
+}
+
+/// Expand the init-forms of a LET/LET* binding list, preserving each binding's
+/// variable name. A binding is `name`, `(name)`, or `(name init)`.
+fn mx_bindings(bindings: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
+    let mut out_items = Vec::new();
+    let mut c = bindings;
+    while c.is_cons() {
+        let (b, rest) = cp(c);
+        let nb = if b.is_cons() {
+            let (var, init) = cp(b);
+            // Keep `var`; expand every init-form after it.
+            arena_cons(var, mx_each(init, env, depth))
+        } else {
+            b
+        };
+        out_items.push(nb);
+        c = rest;
+    }
+    let mut out = c;
+    for &it in out_items.iter().rev() {
+        out = arena_cons(it, out);
+    }
+    out
+}
+
+/// Expand the bodies of FLET/LABELS local functions, preserving each name and
+/// lambda list: `(name lambda-list fbody...)`.
+fn mx_local_fns(defs: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
+    let mut out_items = Vec::new();
+    let mut c = defs;
+    while c.is_cons() {
+        let (def, rest) = cp(c);
+        let nd = if def.is_cons() {
+            let (fname, after_name) = cp(def);
+            if after_name.is_cons() {
+                let (ll, fbody) = cp(after_name);
+                arena_cons(fname, arena_cons(ll, mx_each(fbody, env, depth)))
+            } else {
+                def
+            }
+        } else {
+            def
+        };
+        out_items.push(nd);
+        c = rest;
+    }
+    let mut out = c;
+    for &it in out_items.iter().rev() {
+        out = arena_cons(it, out);
+    }
+    out
 }
 
 fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
