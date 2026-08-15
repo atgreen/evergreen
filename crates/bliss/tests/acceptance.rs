@@ -1795,6 +1795,54 @@ fn let_dynamically_binds_special_variables() {
 }
 
 #[test]
+fn setf_of_a_setf_function_place() {
+    // bliss-lb6.14: (setf (place …) v) must call a (defun (setf place) …) writer
+    // (CLHS 5.1.2.9) — ASDF uses (defun (setf operate-level) …).
+    let prog = "(defun (setf hd) (v x) (setf (car x) v) v) \
+                (let ((c (list 1 2))) (setf (hd c) 9) (format t \"~a\" c))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(9 2)"),
+        "setf of a (setf f) writer should mutate the place, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn generic_accepts_union_of_method_keywords() {
+    // bliss-lb6.14: a keyword accepted by ANY applicable method is valid for the
+    // generic call, even if the method that runs doesn't list it (CLHS 7.6.5) —
+    // ASDF's OPERATE :around declares :verbose, the primary method doesn't.
+    let prog = "(defgeneric gk (x)) \
+                (defmethod gk :around (x &key verbose) (declare (ignore verbose)) (call-next-method)) \
+                (defmethod gk (x &key mode) (declare (ignore mode)) :ran) \
+                (format t \"~a\" (gk 1 :verbose t :mode :fast))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("RAN"),
+        "a method must not reject a keyword another applicable method declares, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn reader_on_a_non_instance_yields_nil() {
+    // bliss-lb6.14: an accessor/reader applied to a non-instance (e.g. NIL) yields
+    // NIL rather than an uncatchable error — ASDF relies on (system-source-file nil).
+    let prog = "(defclass k () ((s :accessor ks :initform 7))) \
+                (format t \"~a ~a\" (ks (make-instance 'k)) (ks nil))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("7 NIL"),
+        "reader on instance=7, on nil=NIL, got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn stringp_of_a_pathname_is_false() {
     // bliss-lb6.15: a pathname must not satisfy STRINGP, even though its
     // namestring is registered as a string. When it did, UIOP's

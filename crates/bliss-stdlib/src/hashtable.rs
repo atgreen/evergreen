@@ -178,25 +178,33 @@ fn probe_index(key_bits: u64, capacity: usize) -> usize {
     (key_bits as usize) & (capacity - 1)
 }
 
-/// Extract the raw bytes of a heap-allocated string (SIMPLE-BASE-STRING or
-/// SIMPLE-CHARACTER-STRING).  Returns `None` for non-string values.
+/// Extract the bytes of a string value for hashing/equality, or `None` for a
+/// non-string. Handles BOTH real heap strings (SIMPLE-BASE-STRING /
+/// SIMPLE-CHARACTER-STRING) and registry-backed string sentinels. A sentinel is
+/// heap-tagged but its bits are a string hash, NOT a real pointer, so it must be
+/// resolved through the string registry and never dereferenced — otherwise
+/// EQUAL/EQUALP hashing segfaults on e.g. a pathname namestring key
+/// (bliss-lb6.14).
 ///
-/// Layout: [ObjectHeader (8 bytes)] [length: u64 (8 bytes)] [bytes...]
-unsafe fn extract_string_bytes(v: BlissVal) -> Option<&'static [u8]> {
+/// Real string layout: [ObjectHeader (8)] [length: u64 (8)] [bytes...].
+fn extract_string_bytes(v: BlissVal) -> Option<Vec<u8>> {
     if !v.is_heap_object() {
         return None;
     }
-    // Safety: v is a heap object, so as_ptr yields a valid, aligned pointer
-    // to an ObjectHeader followed by the string payload.
+    // Sentinel: resolve content via the registry, without dereferencing.
+    if let Some(s) = crate::pathnames::registered_string(v) {
+        return Some(s.into_bytes());
+    }
+    // A registry lookup miss means this is a genuine heap object with a real
+    // pointer, so reading its header (and, if a string, its payload) is safe.
     unsafe {
         let ptr = v.as_ptr();
-        let header = *(ptr as *const ObjectHeader);
-        let tid = header.type_id();
+        let tid = (*(ptr as *const ObjectHeader)).type_id();
         if tid != type_id::SIMPLE_BASE_STRING && tid != type_id::SIMPLE_CHARACTER_STRING {
             return None;
         }
         let len = *((ptr as *const u64).add(1)) as usize;
-        Some(std::slice::from_raw_parts(ptr.add(16), len))
+        Some(std::slice::from_raw_parts(ptr.add(16), len).to_vec())
     }
 }
 
@@ -390,7 +398,7 @@ fn equal_hash(object: BlissVal, depth: usize) -> u64 {
     if object.is_heap_object() {
         unsafe {
             if let Some(bytes) = extract_string_bytes(object) {
-                return hash_bytes(bytes, false);
+                return hash_bytes(&bytes, false);
             }
         }
         if is_simple_vector(object) {
@@ -429,7 +437,7 @@ fn equalp_hash(object: BlissVal, depth: usize) -> u64 {
     if object.is_heap_object() {
         unsafe {
             if let Some(bytes) = extract_string_bytes(object) {
-                return hash_bytes(bytes, true);
+                return hash_bytes(&bytes, true);
             }
         }
         if is_simple_vector(object) {

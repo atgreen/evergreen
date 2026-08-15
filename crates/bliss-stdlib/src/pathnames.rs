@@ -1313,7 +1313,14 @@ fn pathname_from_fs_path(path: &Path) -> Result<BlissVal, BlissError> {
 }
 
 fn pathname_from_listed_path(path: &Path) -> Result<BlissVal, BlissError> {
-    let path_str = path.to_string_lossy().to_string();
+    let mut path_str = path.to_string_lossy().to_string();
+    // A directory entry becomes a directory pathname (trailing slash): its final
+    // component then lands in the directory list, DIRECTORY-PATHNAME-P is true,
+    // and `*/` wildcard matching works — needed by UIOP's SUBDIRECTORIES /
+    // DIRECTORY-FILES and ASDF's source-registry tree walk (bliss-lb6.14).
+    if path.is_dir() && !path_str.ends_with('/') {
+        path_str.push('/');
+    }
     let parsed = parse_namestring_model(&path_str, None)?;
     Ok(make_record_value(build_record_from_namestring(
         parsed, None,
@@ -1419,7 +1426,12 @@ pub fn directory(pathname: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
 
     let mut result = Vec::new();
     for candidate in candidates {
-        let candidate_str = candidate.to_string_lossy().to_string();
+        let mut candidate_str = candidate.to_string_lossy().to_string();
+        // Mark directory candidates so a `*/` (wild directory) pattern matches
+        // them and a `*.asd` (wild name) pattern does not (bliss-lb6.14).
+        if candidate.is_dir() && !candidate_str.ends_with('/') {
+            candidate_str.push('/');
+        }
         let candidate_rec =
             build_record_from_namestring(parse_namestring_model(&candidate_str, None)?, None);
         if pathname_match_with_captures(&candidate_rec, &rec).is_some() {

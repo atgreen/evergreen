@@ -440,6 +440,20 @@ fn fn_bound(env: &Env, name: &str) -> bool {
 /// Resolve `name` to a callable `(params_form, body)` — lexical `Env.funs` first,
 /// then the global function cell. Records an invocation on the function object
 /// (FnMeta invoke counter) when resolved globally (bliss-jtc.6.8).
+/// Canonical name-map key for a function name form. A `(SETF place)` name (from
+/// `(defun (setf place) …)`) maps to the string `"(SETF PLACE)"`; a plain symbol
+/// maps to its symbol name. `SETF` builds the same key to find the writer
+/// function for a `(setf (place …) v)` form (CLHS 5.1.2.9).
+fn function_name_key(name_form: BlissVal) -> String {
+    if name_form.is_cons() {
+        let (head, tail) = cp(name_form);
+        if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "SETF" && tail.is_cons() {
+            return format!("(SETF {})", sym_name(cp(tail).0));
+        }
+    }
+    sym_name(name_form)
+}
+
 fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
     if let Some(fdef) = env.funs.get(name) {
         return Some((fdef.params_form, fdef.body));
@@ -1258,6 +1272,13 @@ fn read_slot_value(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<Blis
         }
         return Err(BlissError::UnboundVariable(slot));
     }
+    // A slot read on a non-instance (e.g. NIL reaching a reader accessor whose
+    // receiver turned out empty) yields NIL rather than the uncatchable
+    // "not an instance" internal error — ASDF's readers rely on this, e.g.
+    // (system-source-file nil) => nil (bliss-lb6.14).
+    if !bliss_stdlib::is_instance(instance) {
+        return Ok(NIL);
+    }
     bliss_stdlib::slot_value(instance, slot)
 }
 
@@ -1531,8 +1552,11 @@ fn bind_method_params(
     args: &[BlissVal],
 ) -> Result<(), BlissError> {
     // Bind through the ordinary lambda-list binder so &optional/&rest/&key
-    // parameters in method lambda lists behave exactly as in functions.
-    bind_lambda_list(method.lambda_list, args, env)
+    // parameters in method lambda lists behave exactly as in functions — but
+    // with implicit &allow-other-keys, since keyword validation for a generic
+    // call is against the union of all applicable methods' keywords, not this
+    // one method's (CLHS 7.6.5; bliss-lb6.14).
+    bind_lambda_list_ex(method.lambda_list, args, env, true)
 }
 
 fn invoke_method(
@@ -1793,6 +1817,18 @@ fn run_initialization_aux_methods(
         invoke_method(env, &method, args, None)?;
     }
     Ok(())
+}
+
+/// True if the generic `name` has at least one method applicable to `args`.
+fn has_applicable_method(env: &Env, name: &str, args: &[BlissVal]) -> bool {
+    env.methods
+        .get(name)
+        .map(|methods| {
+            methods
+                .iter()
+                .any(|m| method_specificity_vector(env, m, args).is_some())
+        })
+        .unwrap_or(false)
 }
 
 fn invoke_generic_function(
@@ -5141,6 +5177,27 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         val,
                                         env,
                                     )?;
+                                } else if let Some((params_form, body)) =
+                                    callable_body(env, &format!("(SETF {})", other))
+                                {
+                                    // A user-defined writer: (defun (setf place) …).
+                                    // Call it as (funcall #'(setf place) NEW args…):
+                                    // the new value is the first argument, then the
+                                    // place's own subforms (CLHS 5.1.2.9).
+                                    let mut args = vec![val];
+                                    let mut ac = aargs;
+                                    while ac.is_cons() {
+                                        let (af, ar) = cp(ac);
+                                        args.push(eval_form(af, env)?);
+                                        ac = ar;
+                                    }
+                                    eval_lambda_call(
+                                        env,
+                                        params_form,
+                                        body,
+                                        &args,
+                                        Rc::clone(&env.frame),
+                                    )?;
                                 } else {
                                     return Err(BlissError::Internal(format!(
                                         "SETF: unsupported place ({} ...)",
@@ -5775,6 +5832,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (pathname_form, _) = cp(cdr);
                 let pathname = eval_form(pathname_form, env)?;
                 return Ok(bliss_stdlib::probe_file(pathname)?.unwrap_or(NIL));
+            }
+            "DIRECTORY" => {
+                // (directory pathspec &key …) — list pathnames matching a
+                // (possibly wild) pathname. Extra keyword args (e.g. UIOP's
+                // :resolve-symlinks) are accepted and ignored. Needed by ASDF's
+                // source-registry directory walk (bliss-lb6.14).
+                let (path_form, _) = cp(cdr);
+                let pathspec = eval_form(path_form, env)?;
+                let pathname = if bliss_stdlib::is_pathname(pathspec) {
+                    pathspec
+                } else {
+                    bliss_stdlib::parse_namestring(pathspec, None, None)?.0
+                };
+                let entries = bliss_stdlib::directory(pathname)?;
+                return Ok(vec_to_list(&entries));
             }
             "TRUENAME" => {
                 let (pathname_form, _) = cp(cdr);
@@ -7316,17 +7388,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             return eval_lambda_call(env, params_form, body, &args, Rc::clone(&env.frame));
         }
 
-        // Check accessor functions (from DEFCLASS)
-        // Collect matching accessor slot name to avoid borrow conflict
+        // Check accessor functions (from DEFCLASS). Match by full name or bare
+        // name so a package-qualified call resolves to a reader stored under its
+        // defining-package spelling (bliss-lb6.14).
         let mut accessor_slot_name: Option<String> = None;
+        let bare_op = symbol_bare_name(&name);
         for class in env.classes.values() {
             for slot in &class.slots {
                 let reader_match = slot
                     .accessor
                     .as_ref()
-                    .map(|acc| acc == &name)
+                    .map(|acc| acc == &name || symbol_bare_name(acc) == bare_op)
                     .unwrap_or(false)
-                    || slot.readers.iter().any(|reader| reader == &name);
+                    || slot
+                        .readers
+                        .iter()
+                        .any(|reader| reader == &name || symbol_bare_name(reader) == bare_op);
                 if reader_match {
                     accessor_slot_name = Some(slot.name.clone());
                 }
@@ -7335,6 +7412,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         if let Some(slot_name) = accessor_slot_name {
             let (inst_form, _) = cp(cdr);
             let inst = eval_form(inst_form, env)?;
+            // A reader on a non-instance defers to an applicable explicit method
+            // (e.g. ASDF's system-source-file on STRING/SYMBOL); read_slot_value
+            // itself yields NIL for a non-instance rather than crashing.
+            if !bliss_stdlib::is_instance(inst) {
+                let args = [inst];
+                if has_applicable_method(env, &name, &args) {
+                    return invoke_generic_function(&name, &args, env);
+                }
+            }
             return read_slot_value(inst, resolve_sym(&slot_name).unwrap_or(NIL), env);
         }
 
@@ -9704,8 +9790,9 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
         }
     } else {
-        // Non-symbol names, e.g. `(setf foo)`, keep the lexical/name-map path.
-        let name = sym_name(name_form);
+        // Non-symbol names, e.g. `(setf foo)`: store under the canonical
+        // "(SETF FOO)" key so SETF can find the writer function.
+        let name = function_name_key(name_form);
         let params = extract_params(params_form);
         Rc::make_mut(&mut env.funs).insert(
             name,
@@ -9856,6 +9943,21 @@ fn bind_lambda_list(
     args: &[BlissVal],
     env: &mut Env,
 ) -> Result<(), BlissError> {
+    bind_lambda_list_ex(params_form, args, env, false)
+}
+
+/// Bind a lambda list to `args`. `force_allow_other_keys` makes an unrecognised
+/// keyword be ignored rather than a PROGRAM-ERROR: used when binding a CLOS
+/// method, because per CLHS 7.6.5 the *generic function* accepts the union of
+/// all applicable methods' keyword parameters, so an individual method must not
+/// reject a keyword another applicable method declares (bliss-lb6.14: ASDF's
+/// OPERATE :around declares :verbose, the primary method does not).
+fn bind_lambda_list_ex(
+    params_form: BlissVal,
+    args: &[BlissVal],
+    env: &mut Env,
+    force_allow_other_keys: bool,
+) -> Result<(), BlissError> {
     #[derive(PartialEq)]
     enum Mode {
         Req,
@@ -9869,7 +9971,7 @@ fn bind_lambda_list(
     let mut key_start: Option<usize> = None;
     let mut rest_bound = false;
     let mut saw_key = false;
-    let mut allow_other_keys = false;
+    let mut allow_other_keys = force_allow_other_keys;
     let mut key_specs: Vec<(String, String, BlissVal, Option<String>)> = Vec::new();
 
     let mut c = params_form;
