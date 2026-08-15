@@ -311,15 +311,36 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
     "VALUES-LIST", "IDENTITY", "FIRST", "REST", "SECOND", "THIRD", "LENGTH", "APPEND", "REVERSE",
     // Condition-signalling functions (ordinary functions, normal arg order) —
     // reachable via apply_function, so safe to call from bytecode.
-    "ERROR", "SIGNAL", "WARN", "CERROR", "INVOKE-RESTART", "MAKE-CONDITION",
+    "ERROR",
+    "SIGNAL",
+    "WARN",
+    "CERROR",
+    "INVOKE-RESTART",
+    "MAKE-CONDITION",
     // Higher-order application functions (apply a closure/function value).
     // Only the simple applicators without &key/&test arguments are safe through
     // apply_function's synthesize path; sequence functions taking :key/:test
     // (sort, remove-if, find-if, reduce, ...) are left to bail to the tree-walker.
-    "FUNCALL", "APPLY", "MAPCAR", "MAPC", "MAPCAN", "MAPCON", "MAPLIST",
+    "FUNCALL",
+    "APPLY",
+    "MAPCAR",
+    "MAPC",
+    "MAPCAN",
+    "MAPCON",
+    "MAPLIST",
     // I/O functions (fixed positional args) — common in recursive bodies.
-    "FORMAT", "PRINT", "PRINC", "PRIN1", "WRITE-STRING", "WRITE-LINE", "TERPRI", "WRITE-CHAR",
-    "PRINC-TO-STRING", "PRIN1-TO-STRING", "WRITE-TO-STRING", "FRESH-LINE",
+    "FORMAT",
+    "PRINT",
+    "PRINC",
+    "PRIN1",
+    "WRITE-STRING",
+    "WRITE-LINE",
+    "TERPRI",
+    "WRITE-CHAR",
+    "PRINC-TO-STRING",
+    "PRIN1-TO-STRING",
+    "WRITE-TO-STRING",
+    "FRESH-LINE",
 ];
 
 /// Compiler state for lowering one function body.
@@ -454,7 +475,10 @@ impl<'e> Lowerer<'e> {
             }
             VarLoc::Slot(idx)
         };
-        self.scopes.last_mut().unwrap().insert(name.to_string(), loc);
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .insert(name.to_string(), loc);
         loc
     }
 
@@ -1518,11 +1542,8 @@ impl<'e> Lowerer<'e> {
         let (restartable_form, clauses_form) = cp(rest);
         let clauses = list_to_vec(clauses_form);
 
-        let enclosing_locals: std::collections::HashSet<String> = self
-            .scopes
-            .iter()
-            .flat_map(|s| s.keys().cloned())
-            .collect();
+        let enclosing_locals: std::collections::HashSet<String> =
+            self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
 
         let lambda_sym = resolve_sym("LAMBDA").ok_or(Bail)?;
         let mut restarts = Vec::new();
@@ -1641,11 +1662,7 @@ impl<'e> Lowerer<'e> {
     /// Enclosing lexical locals a `(lambda params body)` captures (free symbols
     /// of the body minus the lambda's own params, restricted to names bound in
     /// an enclosing scope).
-    fn lambda_captured_locals(
-        &self,
-        params_form: BlissVal,
-        body: BlissVal,
-    ) -> Vec<String> {
+    fn lambda_captured_locals(&self, params_form: BlissVal, body: BlissVal) -> Vec<String> {
         let params: std::collections::HashSet<String> = list_to_vec(params_form)
             .iter()
             .filter(|p| p.is_symbol())
@@ -2082,6 +2099,501 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
     })
 }
 
+// ── BFASL Bytecode Unit serialization ─────────────────────────────
+
+const BBU_MAGIC: &[u8; 4] = b"BBU\0";
+const BBU_BYTECODE_VERSION: u16 = 0x0100;
+const BBU_VERIFIER_VERSION: u16 = 0x0100;
+const BBU_NO_INDEX: u32 = u32::MAX;
+
+const BBU_FUNC_NAMED: u32 = 1 << 0;
+const BBU_FUNC_LOAD_TIME_THUNK: u32 = 1 << 3;
+
+fn put_u8(out: &mut Vec<u8>, v: u8) {
+    out.push(v);
+}
+
+fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_i64(out: &mut Vec<u8>, v: i64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+#[derive(Default)]
+struct BbuConstPool {
+    entries: Vec<Vec<u8>>,
+    index: HashMap<Vec<u8>, u32>,
+}
+
+impl BbuConstPool {
+    fn intern_encoded(&mut self, bytes: Vec<u8>) -> u32 {
+        if let Some(&idx) = self.index.get(&bytes) {
+            return idx;
+        }
+        let idx = self.entries.len() as u32;
+        self.entries.push(bytes.clone());
+        self.index.insert(bytes, idx);
+        idx
+    }
+
+    fn string(&mut self, s: &str) -> u32 {
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, 8);
+        put_u32(&mut bytes, s.len() as u32);
+        bytes.extend_from_slice(s.as_bytes());
+        self.intern_encoded(bytes)
+    }
+
+    fn package(&mut self, name: &str) -> u32 {
+        let name_ref = self.string(&name.to_uppercase());
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, 10);
+        put_u32(&mut bytes, name_ref);
+        put_u32(&mut bytes, 0);
+        self.intern_encoded(bytes)
+    }
+
+    fn symbol_name_parts(name: &str) -> (String, String, bool) {
+        if let Some(rest) = name
+            .strip_prefix("KEYWORD:")
+            .or_else(|| name.strip_prefix(':'))
+        {
+            return ("KEYWORD".to_string(), rest.to_uppercase(), true);
+        }
+        if let Some((pkg, bare)) = name.rsplit_once("::") {
+            return (pkg.to_uppercase(), bare.to_uppercase(), false);
+        }
+        if let Some((pkg, bare)) = name.rsplit_once(':') {
+            return (pkg.to_uppercase(), bare.to_uppercase(), false);
+        }
+        ("COMMON-LISP".to_string(), name.to_uppercase(), false)
+    }
+
+    fn symbol_by_name(&mut self, name: &str) -> u32 {
+        let (pkg, bare, keyword) = Self::symbol_name_parts(name);
+        if keyword {
+            let name_ref = self.string(&bare);
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 12);
+            put_u32(&mut bytes, name_ref);
+            return self.intern_encoded(bytes);
+        }
+
+        let package_ref = self.package(&pkg);
+        let name_ref = self.string(&bare);
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, 11);
+        put_u32(&mut bytes, package_ref);
+        put_u32(&mut bytes, name_ref);
+        put_u8(&mut bytes, 0);
+        self.intern_encoded(bytes)
+    }
+
+    fn symbol_by_index(&mut self, idx: u32) -> u32 {
+        let name = reader::symbol_name(idx).unwrap_or_else(|| format!("SYM#{idx}"));
+        self.symbol_by_name(&name)
+    }
+
+    fn value(&mut self, v: BlissVal) -> Option<u32> {
+        if v.is_nil() {
+            return Some(self.intern_encoded(vec![0]));
+        }
+        if v == T {
+            return Some(self.intern_encoded(vec![1]));
+        }
+        if v.is_fixnum() {
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 2);
+            put_i64(&mut bytes, v.as_fixnum());
+            return Some(self.intern_encoded(bytes));
+        }
+        if v.is_single_float() {
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 5);
+            bytes.extend_from_slice(&v.as_single_float().to_bits().to_le_bytes());
+            return Some(self.intern_encoded(bytes));
+        }
+        if v.is_character() {
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 7);
+            put_u32(&mut bytes, v.as_char() as u32);
+            return Some(self.intern_encoded(bytes));
+        }
+        if v.is_string() {
+            return Some(self.string(&val_as_str(v)));
+        }
+        if v.is_symbol() {
+            return Some(self.symbol_by_index(v.as_symbol_index()));
+        }
+        if v.is_cons() {
+            let (car, cdr) = cp(v);
+            let car_ref = self.value(car)?;
+            let cdr_ref = self.value(cdr)?;
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 13);
+            put_u32(&mut bytes, car_ref);
+            put_u32(&mut bytes, cdr_ref);
+            return Some(self.intern_encoded(bytes));
+        }
+        None
+    }
+}
+
+struct BbuFunction {
+    name_ref: u32,
+    flags: u32,
+    arity: u16,
+    n_locals: u16,
+    max_stack: u16,
+    code: Vec<u8>,
+    literal_refs: Vec<u32>,
+}
+
+fn bbu_instr_len(i: &Instr) -> Option<usize> {
+    Some(match i {
+        Instr::Const(_) => 5,
+        Instr::LoadLocal(_) | Instr::StoreLocal(_) => 3,
+        Instr::LoadGlobal(_) | Instr::StoreGlobal(_) => 5,
+        Instr::SetValues(_) => 3,
+        Instr::ClearMv => 1,
+        Instr::TakeValuesToLocals { .. } => 5,
+        Instr::ValuesToList => 1,
+        Instr::EvalHost(_) => return None,
+        Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_) | Instr::DefineEnvVar(_) => return None,
+        Instr::PushEnvChild | Instr::PopEnvChild => 1,
+        Instr::MakeClosureEnv(_) => return None,
+        Instr::Pop | Instr::Dup => 1,
+        Instr::Br(_) | Instr::BrIfFalse(_) | Instr::BrIfTrue(_) => 5,
+        Instr::CallNamed { .. } => 7,
+        Instr::Return => 3,
+        Instr::PushCatch { .. } => 7,
+        Instr::PushBlock { .. } => 15,
+        Instr::PushTag { .. } => 7,
+        Instr::PushUnwind { .. } => 7,
+        Instr::PopHandler => 1,
+        Instr::Throw => 1,
+        Instr::ReturnFrom { .. } => 5,
+        Instr::Go { .. } => 9,
+        Instr::EnterCleanupNormal { .. } => 9,
+        Instr::CleanupReturn => 1,
+        Instr::PushHandlerCase { .. } => 7,
+        Instr::PopHandlerCase => 1,
+        Instr::PushHandlerBind { .. } => 5,
+        Instr::PopHandlerBind => 1,
+        Instr::PushRestartCase { .. } => 11,
+        Instr::PopRestartCase => 1,
+    })
+}
+
+fn bbu_pc(target: u32, offsets: &[u32], end: u32) -> Option<u32> {
+    let target = target as usize;
+    if target == offsets.len() {
+        Some(end)
+    } else {
+        offsets.get(target).copied()
+    }
+}
+
+fn serialize_bbu_function(
+    bf: &BytecodeFunction,
+    name_ref: u32,
+    flags: u32,
+    pool: &mut BbuConstPool,
+) -> Option<BbuFunction> {
+    if !bf.handler_cases.is_empty() || !bf.handler_binds.is_empty() || !bf.restart_cases.is_empty()
+    {
+        return None;
+    }
+
+    let mut literal_refs = Vec::with_capacity(bf.constants.len());
+    for &c in &bf.constants {
+        literal_refs.push(pool.value(c)?);
+    }
+
+    let mut offsets = Vec::with_capacity(bf.code.len());
+    let mut pc = 0u32;
+    for instr in &bf.code {
+        offsets.push(pc);
+        pc = pc.checked_add(bbu_instr_len(instr)? as u32)?;
+    }
+    let end_pc = pc;
+
+    let mut code = Vec::with_capacity(end_pc as usize);
+    for instr in &bf.code {
+        match instr {
+            Instr::Const(idx) => {
+                put_u8(&mut code, 0x01);
+                put_u32(&mut code, *idx as u32);
+            }
+            Instr::LoadLocal(slot) => {
+                put_u8(&mut code, 0x02);
+                put_u16(&mut code, *slot);
+            }
+            Instr::StoreLocal(slot) => {
+                put_u8(&mut code, 0x03);
+                put_u16(&mut code, *slot);
+            }
+            Instr::LoadGlobal(sym) => {
+                put_u8(&mut code, 0x07);
+                let cp = pool.symbol_by_index(*sym);
+                put_u32(&mut code, cp);
+            }
+            Instr::StoreGlobal(sym) => {
+                put_u8(&mut code, 0x08);
+                let cp = pool.symbol_by_index(*sym);
+                put_u32(&mut code, cp);
+            }
+            Instr::SetValues(n) => {
+                put_u8(&mut code, 0x13);
+                put_u16(&mut code, *n);
+            }
+            Instr::ClearMv => put_u8(&mut code, 0x14),
+            Instr::TakeValuesToLocals { nvars, slot_base } => {
+                put_u8(&mut code, 0x15);
+                put_u16(&mut code, *slot_base);
+                put_u16(&mut code, *nvars);
+            }
+            Instr::ValuesToList => put_u8(&mut code, 0x16),
+            Instr::PushEnvChild => put_u8(&mut code, 0x36),
+            Instr::PopEnvChild => put_u8(&mut code, 0x37),
+            Instr::Pop => put_u8(&mut code, 0x11),
+            Instr::Dup => put_u8(&mut code, 0x12),
+            Instr::Br(target) => {
+                put_u8(&mut code, 0x18);
+                put_u32(&mut code, bbu_pc(*target, &offsets, end_pc)?);
+            }
+            Instr::BrIfFalse(target) => {
+                put_u8(&mut code, 0x19);
+                put_u32(&mut code, bbu_pc(*target, &offsets, end_pc)?);
+            }
+            Instr::BrIfTrue(target) => {
+                put_u8(&mut code, 0x1a);
+                put_u32(&mut code, bbu_pc(*target, &offsets, end_pc)?);
+            }
+            Instr::CallNamed { sym, nargs } => {
+                put_u8(&mut code, 0x0d);
+                let cp = pool.symbol_by_index(*sym);
+                put_u32(&mut code, cp);
+                put_u16(&mut code, *nargs);
+            }
+            Instr::Return => {
+                put_u8(&mut code, 0x10);
+                put_u16(&mut code, 1);
+            }
+            Instr::PushCatch {
+                resume_bcp,
+                sp_restore,
+            } => {
+                put_u8(&mut code, 0x20);
+                put_u32(&mut code, bbu_pc(*resume_bcp, &offsets, end_pc)?);
+                put_u16(&mut code, *sp_restore);
+            }
+            Instr::PushBlock {
+                block_id,
+                name_idx,
+                resume_bcp,
+                sp_restore,
+            } => {
+                put_u8(&mut code, 0x1e);
+                put_u32(&mut code, *block_id);
+                let name_ref = bf
+                    .names
+                    .get(*name_idx as usize)
+                    .map(|name| pool.string(name))
+                    .unwrap_or(BBU_NO_INDEX);
+                put_u32(&mut code, name_ref);
+                put_u32(&mut code, bbu_pc(*resume_bcp, &offsets, end_pc)?);
+                put_u16(&mut code, *sp_restore);
+            }
+            Instr::PushTag {
+                tagbody_id,
+                sp_restore,
+            } => {
+                put_u8(&mut code, 0x22);
+                put_u32(&mut code, *tagbody_id);
+                put_u16(&mut code, *sp_restore);
+            }
+            Instr::PushUnwind {
+                cleanup_bcp,
+                sp_restore,
+            } => {
+                put_u8(&mut code, 0x24);
+                put_u32(&mut code, bbu_pc(*cleanup_bcp, &offsets, end_pc)?);
+                put_u16(&mut code, *sp_restore);
+            }
+            Instr::PopHandler => put_u8(&mut code, 0x27),
+            Instr::Throw => put_u8(&mut code, 0x21),
+            Instr::ReturnFrom { block_id } => {
+                put_u8(&mut code, 0x1f);
+                put_u32(&mut code, *block_id);
+            }
+            Instr::Go {
+                tagbody_id,
+                target_bcp,
+            } => {
+                put_u8(&mut code, 0x23);
+                put_u32(&mut code, *tagbody_id);
+                put_u32(&mut code, bbu_pc(*target_bcp, &offsets, end_pc)?);
+            }
+            Instr::EnterCleanupNormal {
+                cleanup_bcp,
+                resume_bcp,
+            } => {
+                put_u8(&mut code, 0x25);
+                put_u32(&mut code, bbu_pc(*cleanup_bcp, &offsets, end_pc)?);
+                put_u32(&mut code, bbu_pc(*resume_bcp, &offsets, end_pc)?);
+            }
+            Instr::CleanupReturn => put_u8(&mut code, 0x26),
+            Instr::PushHandlerCase { hc, sp_restore } => {
+                put_u8(&mut code, 0x28);
+                put_u32(&mut code, *hc);
+                put_u16(&mut code, *sp_restore);
+            }
+            Instr::PopHandlerCase => put_u8(&mut code, 0x29),
+            Instr::PushHandlerBind { hb } => {
+                put_u8(&mut code, 0x2a);
+                put_u32(&mut code, *hb);
+            }
+            Instr::PopHandlerBind => put_u8(&mut code, 0x2b),
+            Instr::PushRestartCase {
+                rc,
+                resume_bcp,
+                sp_restore,
+            } => {
+                put_u8(&mut code, 0x2c);
+                put_u32(&mut code, *rc);
+                put_u32(&mut code, bbu_pc(*resume_bcp, &offsets, end_pc)?);
+                put_u16(&mut code, *sp_restore);
+            }
+            Instr::PopRestartCase => put_u8(&mut code, 0x2d),
+            Instr::EvalHost(_)
+            | Instr::LoadEnvVar(_)
+            | Instr::StoreEnvVar(_)
+            | Instr::DefineEnvVar(_)
+            | Instr::MakeClosureEnv(_) => return None,
+        }
+    }
+
+    Some(BbuFunction {
+        name_ref,
+        flags,
+        arity: bf.arity,
+        n_locals: bf.n_locals,
+        max_stack: bf.max_stack.max(1),
+        code,
+        literal_refs,
+    })
+}
+
+fn serialize_bbu_function_record(out: &mut Vec<u8>, f: &BbuFunction) {
+    put_u32(out, f.name_ref);
+    put_u32(out, BBU_NO_INDEX);
+    put_u32(out, BBU_NO_INDEX);
+    put_u32(out, f.flags);
+    put_u16(out, f.arity);
+    put_u16(out, f.arity);
+    put_u16(out, f.n_locals);
+    put_u16(out, f.max_stack);
+    put_u32(out, f.code.len() as u32);
+    out.extend_from_slice(&f.code);
+    put_u32(out, f.literal_refs.len() as u32);
+    for &r in &f.literal_refs {
+        put_u32(out, r);
+    }
+    put_u32(out, 0);
+    put_u32(out, 0);
+    put_u32(out, BBU_NO_INDEX);
+}
+
+/// Build the BFASL `BYTECODE_UNIT` payload for top-level forms that the current
+/// T0 bytecode lowerer can serialize. The legacy source section remains the
+/// active loader path until the BBU deserializer/installer lands.
+pub fn build_bbu_from_forms(
+    forms: &[BlissVal],
+    src_path: &str,
+    source: &str,
+    env: &Env,
+) -> Vec<u8> {
+    let mut pool = BbuConstPool::default();
+    let source_file_ref = pool.string(src_path);
+    let mut functions = Vec::new();
+    let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
+
+    for &form in forms {
+        if let Some((name, params, body)) = as_defun(form) {
+            if let Some(sym) = symbol_index_of(&name) {
+                let name_ref = pool.symbol_by_index(sym);
+                if let Some(bf) = compile_function(&name, params, body, env) {
+                    if let Some(serialized) =
+                        serialize_bbu_function(&bf, name_ref, BBU_FUNC_NAMED, &mut pool)
+                    {
+                        let function_index = functions.len() as u32;
+                        functions.push(serialized);
+                        load_actions.push((3, 0, function_index, name_ref, BBU_NO_INDEX));
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(bf) = compile_thunk(form, env) {
+            if let Some(serialized) =
+                serialize_bbu_function(&bf, BBU_NO_INDEX, BBU_FUNC_LOAD_TIME_THUNK, &mut pool)
+            {
+                let function_index = functions.len() as u32;
+                functions.push(serialized);
+                load_actions.push((7, 0, function_index, BBU_NO_INDEX, BBU_NO_INDEX));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(BBU_MAGIC);
+    put_u16(&mut out, BBU_BYTECODE_VERSION);
+    put_u16(&mut out, BBU_VERIFIER_VERSION);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, pool.entries.len() as u32);
+    put_u32(&mut out, functions.len() as u32);
+    put_u32(&mut out, load_actions.len() as u32);
+    put_u32(&mut out, 0);
+    put_u32(&mut out, source_file_ref);
+    put_u64(&mut out, fnv1a64(source.as_bytes()));
+
+    for entry in &pool.entries {
+        out.extend_from_slice(entry);
+    }
+    for function in &functions {
+        serialize_bbu_function_record(&mut out, function);
+    }
+    for (kind, flags, arg0, arg1, arg2) in load_actions {
+        put_u8(&mut out, kind);
+        put_u8(&mut out, flags);
+        put_u32(&mut out, arg0);
+        put_u32(&mut out, arg1);
+        put_u32(&mut out, arg2);
+    }
+    out
+}
+
 // ── Execution ──────────────────────────────────────────────────────
 
 /// A live non-local-exit handler established on an activation (§2.4.3 frame
@@ -2091,7 +2603,11 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
 #[allow(clippy::enum_variant_names)] // `HandlerCase` mirrors the tree-walker's naming
 enum Handler {
     /// `CATCH`: keyed by the control token shared with `env.catch_stack`.
-    Catch { token: String, resume_bcp: u32, sp_restore: u16 },
+    Catch {
+        token: String,
+        resume_bcp: u32,
+        sp_restore: u16,
+    },
     /// `BLOCK`: keyed by a lexical compile-time id (compiled `return-from`) and
     /// a control token registered in `env.block_stack` (tree-walker `return-from`).
     Block {
@@ -2255,7 +2771,12 @@ fn run(
     let stack = thread.stack();
 
     let frame = stack
-        .push_frame(entry_fn_val, std::ptr::null::<CodeInfo>(), entry.num_slots(), FLAG_CALL)
+        .push_frame(
+            entry_fn_val,
+            std::ptr::null::<CodeInfo>(),
+            entry.num_slots(),
+            FLAG_CALL,
+        )
         .ok_or_else(|| BlissError::StackOverflow(bliss_rt::current_thread_id()))?;
     bind_params(&entry, frame, args);
     let env_frame = make_env_frame(&entry, args, Rc::clone(&env.frame));
@@ -2559,15 +3080,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                                 // BlissStack full → STORAGE-CONDITION, routed
                                 // through the unwind driver so unwind-protect
                                 // cleanups run and a handler-case can catch it.
-                                let e =
-                                    BlissError::StackOverflow(bliss_rt::current_thread_id());
+                                let e = BlissError::StackOverflow(bliss_rt::current_thread_id());
                                 initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                                 continue;
                             }
                         };
                         bind_params(&callee, frame, &args);
-                        let env_frame =
-                            make_env_frame(&callee, &args, Rc::clone(&env.frame));
+                        let env_frame = make_env_frame(&callee, &args, Rc::clone(&env.frame));
                         acts.push(Activation {
                             frame,
                             n_locals: callee.n_locals,
@@ -2678,17 +3197,15 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     sp_restore,
                 });
             }
-            Instr::PopHandler => {
-                match acts[top_idx].handlers.pop() {
-                    Some(Handler::Catch { token, .. }) => {
-                        env.catch_stack.retain(|(_, t)| *t != token);
-                    }
-                    Some(Handler::Block { token, .. }) => {
-                        env.block_stack.retain(|(_, t)| *t != token);
-                    }
-                    _ => {}
+            Instr::PopHandler => match acts[top_idx].handlers.pop() {
+                Some(Handler::Catch { token, .. }) => {
+                    env.catch_stack.retain(|(_, t)| *t != token);
                 }
-            }
+                Some(Handler::Block { token, .. }) => {
+                    env.block_stack.retain(|(_, t)| *t != token);
+                }
+                _ => {}
+            },
             Instr::Throw => {
                 let (value, tag) = {
                     let act = &mut acts[top_idx];
@@ -2927,7 +3444,10 @@ fn initiate_unwind(
                 // `return-from` (e.g. from a handler function) arrives as this
                 // block's control token.
                 let matched = match &pending {
-                    Pending::Return { block_id: bid, value } if *bid == block_id => Some(*value),
+                    Pending::Return {
+                        block_id: bid,
+                        value,
+                    } if *bid == block_id => Some(*value),
                     Pending::Token(t) if *t == token => Some(take_control_value(&token)),
                     _ => None,
                 };
@@ -3077,9 +3597,7 @@ fn unmatched_error(pending: Pending) -> BlissError {
     match pending {
         Pending::Propagate(e) => e,
         Pending::Token(token) => BlissError::Internal(token),
-        Pending::Return { .. } => {
-            BlissError::Internal("RETURN-FROM: no visible block".into())
-        }
+        Pending::Return { .. } => BlissError::Internal("RETURN-FROM: no visible block".into()),
         Pending::Go { .. } => BlissError::Internal("GO: no such tag".into()),
     }
 }
@@ -3199,7 +3717,12 @@ fn run_native(nc: &NativeCode, args: &[BlissVal], env: &mut Env) -> Result<Bliss
     let thread = bliss_rt::current_thread();
     let stack = thread.stack();
     let frame = stack
-        .push_frame(NIL, nc.code_info as *const CodeInfo, nc.num_slots, FLAG_CALL)
+        .push_frame(
+            NIL,
+            nc.code_info as *const CodeInfo,
+            nc.num_slots,
+            FLAG_CALL,
+        )
         .ok_or_else(|| BlissError::StackOverflow(bliss_rt::current_thread_id()))?;
     for (i, a) in args.iter().enumerate() {
         unsafe { slot_set(frame, i as u16, *a) };
@@ -3496,7 +4019,9 @@ mod jtc4_stack_map_tests {
     #[test]
     fn install_stack_map_validates_and_covers_all_slots() {
         let ci = install_stack_map(3).expect("a 3-slot map must install");
-        let map = ci.stack_map(0).expect("entry safepoint must have a stack map");
+        let map = ci
+            .stack_map(0)
+            .expect("entry safepoint must have a stack map");
         // 3 slots → 1 byte, bits 0..3 set (all tagged BlissVal references).
         assert_eq!(map.len(), 1);
         assert_eq!(map[0] & 0b0000_0111, 0b0000_0111);

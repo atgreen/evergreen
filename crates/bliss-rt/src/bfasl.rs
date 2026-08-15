@@ -40,6 +40,7 @@ pub mod section {
     pub const DEPENDENCIES: u16 = 9;
     pub const CACHED_T1: u16 = 10;
     pub const TOPLEVEL_FORMS: u16 = 11;
+    pub const BYTECODE_UNIT: u16 = 12;
 }
 
 /// Why a `.bfasl` failed to load (R6.63). Every variant is a clean rejection,
@@ -162,7 +163,10 @@ impl Bfasl {
 }
 
 fn take<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], BfaslError> {
-    let end = pos.checked_add(n).filter(|&e| e <= data.len()).ok_or(BfaslError::Truncated)?;
+    let end = pos
+        .checked_add(n)
+        .filter(|&e| e <= data.len())
+        .ok_or(BfaslError::Truncated)?;
     let s = &data[*pos..end];
     *pos = end;
     Ok(s)
@@ -235,7 +239,7 @@ mod tests {
         let img = BfaslBuilder::new()
             .content_hash(hash)
             .section(section::TOPLEVEL_FORMS, b"(defun f (x) (+ x 1))".to_vec())
-            .section(section::SOURCE_MAP, b"F\0demo.lisp\0" .to_vec())
+            .section(section::SOURCE_MAP, b"F\0demo.lisp\0".to_vec())
             .build();
 
         let f = load(&img).expect("valid .bfasl loads");
@@ -300,5 +304,15 @@ mod tests {
         let f = load(&img).expect("loads despite unknown section");
         assert_eq!(f.section(0xBEEF).unwrap(), b"future");
         assert_eq!(f.section(section::TOPLEVEL_FORMS).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn bytecode_unit_section_round_trips() {
+        let img = BfaslBuilder::new()
+            .section(section::BYTECODE_UNIT, b"BBU\0payload".to_vec())
+            .section(section::TOPLEVEL_FORMS, b"ok".to_vec())
+            .build();
+        let f = load(&img).expect("loads bfasl with bytecode unit");
+        assert_eq!(f.section(section::BYTECODE_UNIT).unwrap(), b"BBU\0payload");
     }
 }
