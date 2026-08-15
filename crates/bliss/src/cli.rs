@@ -1258,15 +1258,62 @@ fn write_class_slot_value(env: &Env, class_name: &str, slot_name: &str, value: O
     }
 }
 
+/// If `slot_name` names a `:allocation :class` slot reachable from `class_name`,
+/// return the class that OWNS the shared value cell. A class slot's value lives
+/// in its DEFINING class (not the instance's class or a subclass), so an
+/// inherited class slot must be resolved to where it was declared. Walks the CLI
+/// super graph first; falls back to any class declaring the slot class-allocated,
+/// which also papers over CLI/stdlib class-graph divergence for deep multiple
+/// inheritance (bliss-lb6.14: ASDF's LOAD-OP inherits DOWNWARD-OPERATION's class
+/// slot through three superclasses).
+fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<String> {
+    fn walk(
+        env: &Env,
+        class_name: &str,
+        slot_name: &str,
+        seen: &mut HashSet<String>,
+    ) -> Option<String> {
+        if !seen.insert(class_name.to_string()) {
+            return None;
+        }
+        let cd = env.classes.get(class_name)?;
+        // Slot names are stored as the full symbol name (possibly package-
+        // qualified); compare bare-to-bare since `slot_name` is already bare.
+        if let Some(slot) = cd
+            .slots
+            .iter()
+            .find(|s| symbol_bare_name(&s.name) == slot_name)
+        {
+            return (slot.allocation == SlotAllocation::Class).then(|| class_name.to_string());
+        }
+        for sup in &cd.supers {
+            if let Some(owner) = walk(env, sup, slot_name, seen) {
+                return Some(owner);
+            }
+        }
+        None
+    }
+    let mut seen = HashSet::new();
+    walk(env, class_name, slot_name, &mut seen).or_else(|| {
+        env.classes.iter().find_map(|(name, cd)| {
+            cd.slots
+                .iter()
+                .any(|s| symbol_bare_name(&s.name) == slot_name && s.allocation == SlotAllocation::Class)
+                .then(|| name.clone())
+        })
+    })
+}
+
 fn read_slot_value(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<BlissVal, BlissError> {
     let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
     let slot_name = symbol_bare_name(&sym_name(slot));
-    if matches!(
-        lookup_slot_def(env, &class_name, &slot_name).map(|slot| slot.allocation),
-        Some(SlotAllocation::Class)
-    ) {
+    if class_slot_owner(env, &class_name, &slot_name).is_some() {
+        // The shared value is stored in the instance's class under the slot's
+        // full (as-declared) name — see instance initialization below.
+        let key = sym_name(slot);
         if let Some(class_def) = env.classes.get(&class_name) {
-            if let Some(Some(value)) = class_def.class_slot_values.lock().unwrap().get(&slot_name) {
+            let values = class_def.class_slot_values.lock().unwrap();
+            if let Some(Some(value)) = values.get(&key).or_else(|| values.get(&slot_name)) {
                 return Ok(*value);
             }
         }
@@ -1316,13 +1363,12 @@ fn slot_value_or_signal(
 fn slot_is_bound(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<bool, BlissError> {
     let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
     let slot_name = symbol_bare_name(&sym_name(slot));
-    if matches!(
-        lookup_slot_def(env, &class_name, &slot_name).map(|slot| slot.allocation),
-        Some(SlotAllocation::Class)
-    ) {
+    if class_slot_owner(env, &class_name, &slot_name).is_some() {
+        let key = sym_name(slot);
         if let Some(class_def) = env.classes.get(&class_name) {
+            let values = class_def.class_slot_values.lock().unwrap();
             return Ok(matches!(
-                class_def.class_slot_values.lock().unwrap().get(&slot_name),
+                values.get(&key).or_else(|| values.get(&slot_name)),
                 Some(Some(_))
             ));
         }
@@ -1338,11 +1384,8 @@ fn write_slot_value(
 ) -> Result<(), BlissError> {
     let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
     let slot_name = symbol_bare_name(&sym_name(slot));
-    if matches!(
-        lookup_slot_def(env, &class_name, &slot_name).map(|slot| slot.allocation),
-        Some(SlotAllocation::Class)
-    ) {
-        write_class_slot_value(env, &class_name, &slot_name, Some(value));
+    if class_slot_owner(env, &class_name, &slot_name).is_some() {
+        write_class_slot_value(env, &class_name, &sym_name(slot), Some(value));
         return Ok(());
     }
     bliss_stdlib::set_slot_value(instance, slot, value)

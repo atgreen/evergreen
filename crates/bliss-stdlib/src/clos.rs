@@ -1135,7 +1135,7 @@ pub fn slot_value(instance: BlissVal, slot_name: BlissVal) -> Result<BlissVal, B
                     Ok(v)
                 }
             }
-            None => Err(BlissError::Internal("slot not present in class layout".into())),
+            None => Err(BlissError::Internal(format!("slot not present in class layout: {}", bliss_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()))),
         }
     }
 }
@@ -1156,7 +1156,7 @@ pub fn set_slot_value(
                 *slot_cell(instance, idx) = new_value;
                 Ok(())
             }
-            None => Err(BlissError::Internal("slot not present in class layout".into())),
+            None => Err(BlissError::Internal(format!("slot not present in class layout: {}", bliss_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()))),
         }
     }
 }
