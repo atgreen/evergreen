@@ -2905,6 +2905,30 @@ fn resolve_sym(name: &str) -> Option<BlissVal> {
     }
 }
 
+thread_local! {
+    // The QUOTE symbol is a constant, but `resolve_sym` runs the full reader to
+    // produce it. `apply_function` did that on EVERY builtin application (to
+    // synthesize `(name 'a 'b)`), so a fib-style hot loop re-parsed "QUOTE"
+    // millions of times — a dominant cost in profiles of the bytecode/native
+    // path. Cache it once per thread.
+    static QUOTE_SYM: std::cell::Cell<BlissVal> = const { std::cell::Cell::new(NIL) };
+}
+
+/// The interned QUOTE symbol, resolved once per thread (see [`QUOTE_SYM`]).
+fn quote_sym() -> BlissVal {
+    QUOTE_SYM.with(|c| {
+        let v = c.get();
+        // NIL is itself a symbol, so the uncached sentinel (NIL) can't be
+        // detected with is_symbol(); QUOTE is never NIL, so "cached" == non-NIL.
+        if !v.is_nil() {
+            return v;
+        }
+        let q = resolve_sym("QUOTE").unwrap_or(NIL);
+        c.set(q);
+        q
+    })
+}
+
 /// Render a MAKE-PATHNAME `:directory` list — `(:absolute|:relative comp…)` —
 /// to a physical namestring the pathname parser understands. Components are
 /// strings or the `:up`/`:back`/`:wild`/`:wild-inferiors` keywords. Returns None
@@ -12955,10 +12979,16 @@ fn apply_function(
         if env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name) {
             return invoke_generic_function(&name, args, env);
         }
+        // NB: `apply_builtin` looks like a tempting direct-dispatch fast path
+        // here, but its arithmetic is NOT bit-identical to the operator-position
+        // path for the fixnum-overflow→bignum case (it diverged on the stage-5
+        // deopt gate), so builtins must still go through the synthesize-and-eval
+        // path below to stay consistent across tiers. A semantically faithful
+        // direct dispatch is tracked separately (bliss-x5y.8).
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
         // full operator-position builtin set (not just apply_builtin's subset)
         // is reachable through funcall/apply/mapcar.
-        let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
+        let quote_sym = quote_sym();
         let mut items = Vec::with_capacity(args.len() + 1);
         items.push(fn_val);
         for a in args {
