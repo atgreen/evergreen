@@ -390,11 +390,13 @@ and runs a full optimisation pass pipeline.
 
 ### 4.4.5.2  IR Construction
 
-T2 constructs its IR from the expanded AST (not T1 machine code).  SSA form
-is built directly using the Braun et al. (2013) algorithm — no
-dominance-frontier-based φ insertion.  `build_ir(ast, env_shape) → IRGraph`
-walks the AST, creating blocks and parameter nodes, then validates SSA
-invariants.
+T2 constructs its IR from the macroexpanded **bytecode** (`bliss_rt::bytecode`,
+§4.4) — the same bytecode T0 interprets and T1 compiles, so deopt/OSR `bcp`
+coordinates line up by construction — not from the AST or T1 machine code. SSA
+form is built directly using the Braun et al. (2013) algorithm — no
+dominance-frontier-based φ insertion. `build_ir(bytecode_fn) → Function`
+abstractly interprets the bytecode (operand-stack slots and locals become SSA
+values; jump targets start blocks), then validates SSA invariants (§4.3).
 
 Instruction categories: Constants, Arithmetic (`Add`/`Sub`/`Mul`/`Div`/`Mod`),
 Comparison (`Eq`/`Lt`/`NumEq`), Terminators (`Brif`/`Jump`/`Return`/`TailCall`/`Trap`),

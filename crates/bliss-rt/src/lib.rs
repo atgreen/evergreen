@@ -7,6 +7,7 @@
 
 // ── Object model ──────────────────────────────────────────────────
 pub mod bfasl;
+pub mod bytecode;
 pub mod function;
 pub mod object;
 pub mod packages;
