@@ -5572,9 +5572,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(NIL);
             }
-            "+" => return eval_arith(cdr, env, 0, 0.0, |a, b| a + b, bigrat_add),
+            "+" => return eval_arith(cdr, env, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
             "-" => return eval_arith_sub(cdr, env),
-            "*" => return eval_arith(cdr, env, 1, 1.0, |a, b| a * b, bigrat_mul),
+            "*" => return eval_arith(cdr, env, 1, 1.0, |a, b| a * b, bigrat_mul, |a, b| a * b),
             "/" => return eval_arith_div(cdr, env),
             "CONS" => {
                 let (af, r) = cp(cdr);
@@ -10554,6 +10554,13 @@ fn num_val(v: BlissVal) -> Result<f64, BlissError> {
 /// Exact-where-possible numeric comparison. Floats force inexact comparison
 /// (CL contagion); otherwise operands compare as exact rationals.
 fn numeric_cmp(a: BlissVal, b: BlissVal) -> Result<Ordering, BlissError> {
+    // Fixnum fast path (bliss-x5y.10): the overwhelmingly common case is two
+    // fixnums; compare their untagged i64s directly instead of allocating two
+    // heap BigRats. This removes the per-comparison bignum allocation that
+    // dominated arithmetic-heavy code in profiles.
+    if a.is_fixnum() && b.is_fixnum() {
+        return Ok(a.as_fixnum().cmp(&b.as_fixnum()));
+    }
     if a.is_single_float() || b.is_single_float() {
         let av = num_val(a)?;
         let bv = num_val(b)?;
@@ -10579,6 +10586,7 @@ fn eval_arith(
     init_f: f64,
     op_f: fn(f64, f64) -> f64,
     op_r: fn(&BigRat, &BigRat) -> BigRat,
+    op_i: fn(i128, i128) -> i128,
 ) -> Result<BlissVal, BlissError> {
     let mut vals = Vec::new();
     let mut c = args;
@@ -10587,7 +10595,7 @@ fn eval_arith(
         vals.push(eval_form(af, env)?);
         c = r;
     }
-    fold_arith_vals(&vals, init_i, init_f, op_f, op_r)
+    fold_arith_vals(&vals, init_i, init_f, op_f, op_r, op_i)
 }
 
 /// The `+`/`*` fold over already-evaluated operands (int/rational with float
@@ -10601,11 +10609,35 @@ fn fold_arith_vals(
     init_f: f64,
     op_f: fn(f64, f64) -> f64,
     op_r: fn(&BigRat, &BigRat) -> BigRat,
+    op_i: fn(i128, i128) -> i128,
 ) -> Result<BlissVal, BlissError> {
-    let mut acc = BigRat::from_i64(init_i);
+    // Fixnum fast path (bliss-x5y.10): fold in i128 while every operand is a
+    // fixnum and the running result stays in fixnum range, allocating no
+    // BigRat. i128 cannot overflow here — one op on fixnum-range values is at
+    // most ~2^120. A non-fixnum operand or an out-of-range result switches to
+    // the exact int/rational/float fold for the remaining operands, seeded from
+    // the fixnum accumulator.
+    let mut acc_i = init_i as i128;
+    let mut idx = 0;
+    while idx < vals.len() {
+        let v = vals[idx];
+        if !v.is_fixnum() {
+            break;
+        }
+        let r = op_i(acc_i, v.as_fixnum() as i128);
+        if !(FIXNUM_MIN as i128..=FIXNUM_MAX as i128).contains(&r) {
+            break;
+        }
+        acc_i = r;
+        idx += 1;
+    }
+    if idx == vals.len() {
+        return Ok(BlissVal::from_fixnum(acc_i as i64));
+    }
+    let mut acc = BigRat::from_i64(acc_i as i64);
     let mut acc_f = init_f;
     let mut is_float = false;
-    for &v in vals {
+    for &v in &vals[idx..] {
         if v.is_single_float() {
             if !is_float {
                 is_float = true;
@@ -10649,6 +10681,24 @@ fn eval_arith_sub(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
 fn sub_vals(vals: &[BlissVal]) -> Result<BlissVal, BlissError> {
     if vals.is_empty() {
         return Ok(BlissVal::from_fixnum(0));
+    }
+    // Fixnum fast path (bliss-x5y.10): all-fixnum subtraction (or 1-arg negate)
+    // in i128 with a range check — no BigRat allocation. i128 cannot overflow
+    // for any realistic operand count (each |operand| <= 2^60). If the result
+    // leaves fixnum range (e.g. negating FIXNUM_MIN), fall through to the exact
+    // bignum path below.
+    if vals.iter().all(|v| v.is_fixnum()) {
+        let mut acc = vals[0].as_fixnum() as i128;
+        if vals.len() == 1 {
+            acc = -acc;
+        } else {
+            for v in &vals[1..] {
+                acc -= v.as_fixnum() as i128;
+            }
+        }
+        if (FIXNUM_MIN as i128..=FIXNUM_MAX as i128).contains(&acc) {
+            return Ok(BlissVal::from_fixnum(acc as i64));
+        }
     }
     if vals.len() == 1 {
         if vals[0].is_single_float() {
@@ -13005,8 +13055,8 @@ fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, Bl
         Ok(if pred(numeric_cmp(args[0], args[1])?) { T } else { NIL })
     };
     Some(match name {
-        "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add),
-        "*" => fold_arith_vals(args, 1, 1.0, |a, b| a * b, bigrat_mul),
+        "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
+        "*" => fold_arith_vals(args, 1, 1.0, |a, b| a * b, bigrat_mul, |a, b| a * b),
         "-" => sub_vals(args),
         "<" if args.len() == 2 => cmp(|o| o == Ordering::Less),
         ">" if args.len() == 2 => cmp(|o| o == Ordering::Greater),
@@ -13180,9 +13230,9 @@ fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissV
         // Use the shared int/rational cores, NOT an f64 accumulator: the old
         // float arithmetic here lost precision above 2^53 and never promoted to
         // bignum, diverging from operator-position dispatch (bliss-x5y.9).
-        "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add),
+        "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
         "-" => sub_vals(args),
-        "*" => fold_arith_vals(args, 1, 1.0, |a, b| a * b, bigrat_mul),
+        "*" => fold_arith_vals(args, 1, 1.0, |a, b| a * b, bigrat_mul, |a, b| a * b),
         "CONS" => {
             if args.len() >= 2 {
                 Ok(arena_cons(args[0], args[1]))
