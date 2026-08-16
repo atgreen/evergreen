@@ -11,6 +11,10 @@ pub mod reader;
 // ── Intermediate representation ───────────────────────────────────
 pub mod ir;
 
+// ── T2 optimising compiler (block-based SSA, spec §4.3–§4.10) ──────
+// New pipeline; supersedes the sea-of-nodes ir/opt/codegen/osr modules above.
+pub mod t2;
+
 // ── Tiered compilation ────────────────────────────────────────────
 pub mod tiered;
 
