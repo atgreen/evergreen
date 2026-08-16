@@ -3230,16 +3230,23 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                             }
                             Some(nc)
                         });
+                        // Run native only while under the depth cap (bliss-x5y.4);
+                        // once the native call stack is deep, dispatch the callee
+                        // through the flat T0 path below instead of pushing yet
+                        // another native frame, so the real C stack stays bounded.
+                        let over_cap = NATIVE_DEPTH.with(|d| d.get()) >= native_depth_cap();
                         if let Some(nc) = native {
-                            match run_native(&nc, sym, &args, env) {
-                                Ok(v) => {
-                                    acts[top_idx].push_op(v);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    let pending = error_to_pending(e, env);
-                                    initiate_unwind(acts, stack, env, pending)?;
-                                    continue;
+                            if !over_cap {
+                                match run_native(&nc, sym, &args, env) {
+                                    Ok(v) => {
+                                        acts[top_idx].push_op(v);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        let pending = error_to_pending(e, env);
+                                        initiate_unwind(acts, stack, env, pending)?;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -3832,13 +3839,36 @@ extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     // that window.
     let env = unsafe { &mut *env_ptr };
     let args: &[BlissVal] = &[BlissVal(a0), BlissVal(a1), BlissVal(a2)][..n as usize];
-    let fn_val = BlissVal::from_symbol_index(sym as u32);
-    match apply_function(fn_val, args, env) {
+    let sym32 = sym as u32;
+    let fn_val = BlissVal::from_symbol_index(sym32);
+    // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
+    // run_loop dispatches ITS calls flatly on the BlissStack (bliss-x5y.4). This
+    // is what keeps recursion through a native caller bounded: without it, a
+    // native function's self/mutual recursion would go through apply_function
+    // (the tree-walker), which recurses on the unbounded Rust stack and aborts.
+    // With it, a bounded number of native/run frames (the NATIVE_DEPTH cap) give
+    // way to flat Activations, so a runaway recursion raises a catchable
+    // STORAGE-CONDITION instead of a native stack overflow. Non-bytecode callees
+    // (builtins, generics, closures, arity mismatches) still go via apply_function.
+    let result = match registry_get(sym32) {
+        Some(callee) if callee.arity == n as u16 => run(callee, args, fn_val, env),
+        _ => apply_function(fn_val, args, env),
+    };
+    match result {
         Ok(v) => v.0,
-        // A raw error can't unwind through native code cleanly here; stash it so
-        // run_native can re-raise. Return NIL bits as a placeholder.
+        // A raw error can't unwind native code mid-function, so stash it and
+        // return NIL; native execution continues but run_native re-raises on
+        // exit. Crucially, keep the FIRST error (first-error-wins): once one is
+        // pending, later c2i calls that see the placeholder NIL (e.g. `(+ 1 nil)`)
+        // must not overwrite it, or a real STORAGE-CONDITION from deep recursion
+        // gets masked by a spurious downstream type error (bliss-x5y.4).
         Err(e) => {
-            NATIVE_ERROR.with(|c| *c.borrow_mut() = Some(e));
+            NATIVE_ERROR.with(|c| {
+                let mut slot = c.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(e);
+                }
+            });
             NIL.0
         }
     }
@@ -3853,6 +3883,32 @@ thread_local! {
     /// observes it, discards the native result, and re-runs the function in the
     /// interpreter (T0) — a deoptimization that returns the correct value.
     static NATIVE_DEOPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Current native (T1) call-stack depth (bliss-x5y.4). Non-leaf T1 functions
+    /// call through c2i, and although those calls run in the interpreter (which
+    /// is BlissStack-bounded, not native-recursive), this counter bounds any
+    /// native re-entry defensively: past `native_depth_cap()` the dispatcher
+    /// runs the callee in T0 instead of pushing another native frame, so the
+    /// real C stack can never run away.
+    static NATIVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Cap on native (T1) call-stack depth before the dispatcher falls back to the
+/// flat T0 interpreter path (bliss-x5y.4). Env-overridable for tests.
+fn native_depth_cap() -> u32 {
+    std::env::var("BLISS_NATIVE_DEPTH_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(64)
+}
+
+/// Decrements `NATIVE_DEPTH` on drop, so every exit from `run_native` (Ok, Err,
+/// or deopt) restores the count.
+struct NativeDepthGuard;
+impl Drop for NativeDepthGuard {
+    fn drop(&mut self) {
+        NATIVE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
 }
 
 /// Count of speculative deoptimizations, for observability/tests (bliss-jtc.27).
@@ -3987,6 +4043,8 @@ fn run_native(
     args: &[BlissVal],
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
+    NATIVE_DEPTH.with(|d| d.set(d.get() + 1));
+    let _depth_guard = NativeDepthGuard;
     let thread = bliss_rt::current_thread();
     let stack = thread.stack();
     let frame = stack
@@ -4662,18 +4720,14 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
         return None;
     }
     let bf = registry_get(sym)?;
-    // Only promote leaf-ish functions: a T1 function's calls cross back through
-    // c2i into the interpreter, so a call to another *bytecode* function (which
-    // could recurse) would grow the native/Rust stack per level. Functions that
-    // call only primitives/interpreted builtins are safe; recursive and
-    // inter-bytecode-calling functions stay T0 (flat loop, BlissStack-bounded).
-    for instr in &bf.code {
-        if let Instr::CallNamed { sym: callee, .. } = instr {
-            if registry_get(*callee).is_some() {
-                return None;
-            }
-        }
-    }
+    // Non-leaf functions promote too (bliss-x5y.4): a T1 function's CallNamed to
+    // another user function crosses c2i into `apply_function`, which runs the
+    // callee in the interpreter (NOT via `run_native`), so the native call path
+    // is not self-recursive. Any native re-entry is still bounded by the
+    // NATIVE_DEPTH cap in the dispatcher. (The old leaf-only guard here kept
+    // essentially all real, call-heavy library code out of T1.) Speculative
+    // fixnum codegen stays gated on `is_deopt_safe_primitive`, so a non-leaf
+    // function that calls impure helpers emits no deopt-able ops.
     let code = emit_native_x86(&bf)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for

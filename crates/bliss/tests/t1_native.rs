@@ -46,6 +46,70 @@ fn t1_native_execution_matches_interpretation() {
     }
 }
 
+/// Non-leaf (non-terminal) functions — those that call other user functions —
+/// promote to native T1 (bliss-x5y.4), not just leaf functions. Their calls
+/// cross c2i into the interpreter, and the result must match interpretation.
+#[test]
+fn t1_promotes_non_leaf_functions() {
+    let cases = &[
+        // caller -> helper (a non-tail, non-leaf call).
+        "(defun helper (x) (* x x)) (defun caller (x) (+ (helper x) (helper (+ x 1)))) \
+           (caller 2) (caller 3) \
+           (format t \"~a ~a~%\" (bliss-ext:function-tier (quote caller)) (caller 5))",
+        // self-recursion (fib) promotes and stays correct.
+        "(defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 5) (fib 6) \
+           (format t \"~a ~a~%\" (bliss-ext:function-tier (quote fib)) (fib 20))",
+        // mutual recursion.
+        "(defun ev (n) (if (= n 0) t (od (- n 1)))) (defun od (n) (if (= n 0) nil (ev (- n 1)))) \
+           (ev 2) (od 3) (format t \"~a ~a~%\" (ev 100) (od 100))",
+    ];
+    for c in cases {
+        let t1 = Command::new(BIN).args(["--eval", c]).env("BLISS_T1_THRESHOLD", "2").output().expect("spawn");
+        let tw = Command::new(BIN).args(["--eval", c]).env("BLISS_BACKEND", "tree-walker").output().expect("spawn");
+        assert!(t1.status.success() && tw.status.success(), "runs must succeed:\n{c}");
+        // Compare only the result token(s), skipping the tier column (which is 0
+        // under the tree-walker, 1 under T1).
+        let last = |o: &std::process::Output| {
+            String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("")
+                .split_whitespace().last().unwrap_or("").to_string()
+        };
+        assert_eq!(last(&t1), last(&tw), "T1 result must match interpretation:\n{c}");
+    }
+    // The non-leaf caller actually reaches tier 1 (first stdout line).
+    let out = Command::new(BIN)
+        .args(["--eval", "(defun h (x) (* x x)) (defun c (x) (+ (h x) 1)) (c 1)(c 2)(c 3) \
+                          (format t \"~a~%\" (bliss-ext:function-tier (quote c)))"])
+        .env("BLISS_T1_THRESHOLD", "2").output().expect("spawn");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or(""),
+        "1",
+        "non-leaf function must reach T1"
+    );
+}
+
+/// Deep recursion of a promoted non-leaf function must stay bounded and raise a
+/// catchable STORAGE-CONDITION — the native depth cap hands off to the flat
+/// BlissStack path — never a native stack-overflow abort (bliss-x5y.4). The
+/// function must *compile* to bytecode for this to exercise the native path;
+/// functions that bail to the tree-walker hit a separate, pre-existing
+/// interpreter recursion limit (bliss-jtc.24) and are out of scope here.
+#[test]
+fn t1_non_leaf_deep_recursion_is_catchable() {
+    for prog in [
+        // self-recursion that compiles + promotes.
+        "(defun countdown (n) (if (= n 0) 0 (countdown (- n 1)))) (countdown 3)(countdown 3) \
+           (format t \"~a\" (handler-case (countdown 1000000) (storage-condition () :caught)))",
+        // a labels-local recursive function (also compiles + promotes).
+        "(format t \"~a\" (handler-case (labels ((f (n) (+ 1 (f (+ n 1))))) (f 0)) \
+           (storage-condition () :caught)))",
+    ] {
+        let out = Command::new(BIN).args(["--eval", prog]).env("BLISS_T1_THRESHOLD", "1").output().expect("spawn");
+        assert!(out.status.success(), "must not abort: {prog}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).to_uppercase().contains("CAUGHT"),
+            "deep non-leaf recursion must raise a catchable condition: {prog}");
+    }
+}
+
 /// Deep recursion must stay T0 (BlissStack-bounded) even with aggressive T1
 /// promotion, raising a catchable STORAGE-CONDITION rather than aborting.
 #[test]
