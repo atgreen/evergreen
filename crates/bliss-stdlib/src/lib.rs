@@ -88,7 +88,7 @@ pub use pathnames::{
 };
 pub use sequences::{
     build_simple_vector, concatenate, copy_seq, count, elt, find, length, map, nreverse, position,
-    reduce, remove, reverse, set_elt, sort, stable_sort, subseq, substitute,
+    reduce, remove, reverse, set_elt, sort, stable_sort, string_set_char, subseq, substitute,
 };
 pub use streams::GrayStream;
 pub use streams::{

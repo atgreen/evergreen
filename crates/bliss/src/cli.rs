@@ -5141,6 +5141,39 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(ch);
             }
+            "MAKE-STRING" => {
+                // (make-string size &key initial-element element-type) → a FRESH
+                // (non-interned) mutable string, so (setf (char s i) c) / REPLACE
+                // can mutate it without aliasing a shared literal.
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal("MAKE-STRING requires a size".into()));
+                }
+                let size = eval_form(args[0], env)?;
+                if !size.is_fixnum() || size.as_fixnum() < 0 {
+                    return Err(BlissError::TypeError {
+                        datum: size,
+                        expected: "non-negative string size".into(),
+                    });
+                }
+                let mut fill = ' ';
+                let mut i = 1;
+                while i + 1 < args.len() {
+                    let key = eval_form(args[i], env)?;
+                    let val = eval_form(args[i + 1], env)?;
+                    if key.is_symbol()
+                        && symbol_bare_name(&sym_name(key)) == "INITIAL-ELEMENT"
+                        && val.is_character()
+                    {
+                        fill = val.as_char();
+                    }
+                    i += 2;
+                }
+                let content: String = std::iter::repeat(fill)
+                    .take(size.as_fixnum() as usize)
+                    .collect();
+                return Ok(bliss_stdlib::make_lisp_string_fresh(&content));
+            }
             "MAKE-STRING-OUTPUT-STREAM" => {
                 // (make-string-output-stream &key element-type)
                 return bliss_stdlib::make_string_output_stream(NIL);
@@ -5830,6 +5863,40 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 } else {
                                     let name = val_as_str(sym);
                                     env.set_var(&name, val);
+                                }
+                            }
+                            "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT" => {
+                                // (setf (char string index) val) and friends —
+                                // mutate a string or vector element in place.
+                                let seq = eval_form(tgt_form, env)?;
+                                let (idx_form, _) = cp(cp(aargs).1);
+                                let idx = eval_form(idx_form, env)?;
+                                if !idx.is_fixnum() || idx.as_fixnum() < 0 {
+                                    return Err(BlissError::TypeError {
+                                        datum: idx,
+                                        expected: "non-negative sequence index".into(),
+                                    });
+                                }
+                                let i = idx.as_fixnum() as usize;
+                                if is_string_value(seq) {
+                                    bliss_stdlib::string_set_char(seq, i, val)?;
+                                } else if seq.is_cons() && acc == "ELT" {
+                                    // (setf (elt list i) val)
+                                    let mut cursor = seq;
+                                    for _ in 0..i {
+                                        cursor = cp(cursor).1;
+                                    }
+                                    if cursor.is_cons() {
+                                        unsafe {
+                                            (*(cursor.as_ptr() as *mut ConsCell)).car = val;
+                                        }
+                                    } else {
+                                        return Err(BlissError::Internal(
+                                            "SETF ELT: index past end of list".into(),
+                                        ));
+                                    }
+                                } else {
+                                    bliss_stdlib::set_elt(seq, i, val)?;
                                 }
                             }
                             "DOCUMENTATION" => {
@@ -6530,6 +6597,24 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (pathname_form, _) = cp(cdr);
                 let pathname = eval_form(pathname_form, env)?;
                 return Ok(bliss_stdlib::probe_file(pathname)?.unwrap_or(NIL));
+            }
+            "DELETE-FILE" => {
+                // (delete-file pathspec) — delete the file, returning T.
+                let (path_form, _) = cp(cdr);
+                let pathspec = eval_form(path_form, env)?;
+                bliss_stdlib::delete_file(pathspec)?;
+                return Ok(T);
+            }
+            "RENAME-FILE" => {
+                // (rename-file filespec new-name) → (values new-truename old-truename
+                // new-truename). We surface the primary (new) pathname.
+                let (from_form, rest) = cp(cdr);
+                let (to_form, _) = cp(rest);
+                let from = eval_form(from_form, env)?;
+                let to = eval_form(to_form, env)?;
+                let (defaulted, old_true, new_true) = bliss_stdlib::rename_file(from, to)?;
+                env.set_mv(vec![defaulted, old_true, new_true]);
+                return Ok(defaulted);
             }
             "FILE-WRITE-DATE" => {
                 // (file-write-date pathspec) — the file's last-modified time as a
@@ -7450,18 +7535,32 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(T);
             }
             "COMPILE-FILE" => {
-                // (compile-file source &optional output) — compile SOURCE to a
-                // .bfasl (bliss-lb6.6). Returns the output truename. OUTPUT
-                // defaults to SOURCE with a .bfasl extension.
-                let (src_form, rest) = cp(cdr);
-                let src_path = val_as_str(eval_form(src_form, env)?);
-                let out_path = if rest.is_cons() {
-                    let (out_form, _) = cp(rest);
-                    val_as_str(eval_form(out_form, env)?)
-                } else {
+                // (compile-file source &key output-file &allow-other-keys) — compile
+                // SOURCE to a .bfasl (bliss-lb6.6). Returns three values per ANSI:
+                // output-truename, warnings-p, failure-p. ASDF passes the target as
+                // an :output-file keyword (not positional).
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal("COMPILE-FILE requires a source".into()));
+                }
+                let src_path = path_designator_to_string(eval_form(args[0], env)?)?;
+                let mut out_path: Option<String> = None;
+                let mut i = 1;
+                while i + 1 < args.len() {
+                    let key = eval_form(args[i], env)?;
+                    let val = eval_form(args[i + 1], env)?;
+                    if key.is_symbol()
+                        && symbol_bare_name(&sym_name(key)) == "OUTPUT-FILE"
+                        && val != NIL
+                    {
+                        out_path = Some(path_designator_to_string(val)?);
+                    }
+                    i += 2;
+                }
+                let out_path = out_path.unwrap_or_else(|| {
                     let stem = src_path.strip_suffix(".lisp").unwrap_or(&src_path);
                     format!("{stem}.bfasl")
-                };
+                });
                 let source = std::fs::read_to_string(&src_path).map_err(|e| {
                     BlissError::FileError(format!("compile-file: cannot read {src_path}: {e}"))
                 })?;
@@ -7476,7 +7575,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 std::fs::write(&out_path, &image).map_err(|e| {
                     BlissError::FileError(format!("compile-file: cannot write {out_path}: {e}"))
                 })?;
-                return Ok(arena_str(&out_path));
+                let (out_pn, _) =
+                    bliss_stdlib::parse_namestring(arena_str(&out_path), None, None)?;
+                env.set_mv(vec![out_pn, NIL, NIL]);
+                return Ok(out_pn);
             }
             "COMPILE-FILE-PATHNAME" => {
                 // (compile-file-pathname input-file &key output-file &allow-other-keys)
@@ -12908,41 +13010,48 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
         )));
     }
 
-    // Parse options
+    // Parse options. WITH-OPEN-FILE is a macro whose option VALUES are ordinary
+    // forms (e.g. ASDF passes `:direction direction`, a variable), so each value
+    // must be EVALUATED — not read as a literal keyword.
     let opts = list_to_vec(opts_rest);
     let mut direction = bliss_stdlib::StreamDirection::Input;
+    let mut element_type = T;
+    let mut if_exists = T;
+    let mut if_does_not_exist = NIL;
     let mut i = 0;
-    while i < opts.len() {
-        let opt_name = sym_name(opts[i]);
-        let opt_bare = opt_name
-            .trim_start_matches("KEYWORD:")
-            .trim_start_matches(':');
-        if opt_bare == "DIRECTION" {
-            if i + 1 < opts.len() {
-                let dir = sym_name(opts[i + 1]);
-                let dir_bare = dir.trim_start_matches("KEYWORD:").trim_start_matches(':');
-                match dir_bare {
+    while i + 1 < opts.len() {
+        let opt_bare = symbol_bare_name(&sym_name(opts[i]));
+        let value = eval_form(opts[i + 1], env)?;
+        match opt_bare.as_str() {
+            "DIRECTION" => {
+                match symbol_bare_name(&sym_name(value)).as_str() {
                     "OUTPUT" => direction = bliss_stdlib::StreamDirection::Output,
                     "IO" => direction = bliss_stdlib::StreamDirection::Io,
+                    "INPUT" => direction = bliss_stdlib::StreamDirection::Input,
                     _ => {}
                 }
-                i += 2;
-            } else {
-                i += 1;
             }
-        } else {
-            i += 1;
+            "ELEMENT-TYPE" => {
+                // (unsigned-byte 8) or the fixnum 8 selects a byte stream.
+                let is_byte = value == BlissVal::from_fixnum(8)
+                    || (value.is_cons()
+                        && symbol_bare_name(&sym_name(cp(value).0)) == "UNSIGNED-BYTE");
+                element_type = if is_byte { BlissVal::from_fixnum(8) } else { T };
+            }
+            "IF-EXISTS" => if_exists = value,
+            "IF-DOES-NOT-EXIST" => if_does_not_exist = value,
+            _ => {}
         }
+        i += 2;
     }
 
-    // Open the file via the standard-library stream machinery. `T` selects the
-    // default character element type and :supersede if-exists behaviour.
+    // Open the file via the standard-library stream machinery.
     let stream_val = bliss_stdlib::open(
         path_val,
         direction,
-        T,
-        T,
-        NIL,
+        element_type,
+        if_exists,
+        if_does_not_exist,
         bliss_stdlib::ExternalFormat::Utf8,
     )?;
 

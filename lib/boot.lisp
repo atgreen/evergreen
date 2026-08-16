@@ -37,6 +37,10 @@
 ;; stored as n<<3, so the representable range is [-2^60, 2^60-1].
 (defconstant most-positive-fixnum 576460752303423487)
 (defconstant most-negative-fixnum -576460752303423488)
+(defconstant lambda-list-keywords
+  '(&optional &rest &key &allow-other-keys &aux &body &whole &environment))
+(defconstant call-arguments-limit 4611686018427387904)
+(defconstant lambda-parameters-limit 4611686018427387904)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Sequencing
@@ -1136,25 +1140,21 @@
 
 ;;; --- FILL / REPLACE / SEARCH / MISMATCH / MERGE ----------------------------
 
+;; FILL and REPLACE are DESTRUCTIVE: they mutate SEQ/SEQ1 in place (via
+;; SETF ELT, which now works on strings, vectors and lists) and return it.
+;; Callers such as UIOP's REDUCE/STRCAT rely on the in-place mutation.
 (defun fill (seq item &key (start 0) end)
-  (let* ((items (coerce seq 'list)) (len (length items)) (stop (or end len))
-         (i 0) (res nil))
-    (dolist (x items)
-      (push (if (and (>= i start) (< i stop)) item x) res)
-      (incf i))
-    (%coerce-like (reverse res) seq)))
+  (let ((stop (or end (length seq))) (i start))
+    (loop while (< i stop) do (setf (elt seq i) item) (incf i)))
+  seq)
 
 (defun replace (seq1 seq2 &key (start1 0) end1 (start2 0) end2)
-  (let* ((l1 (coerce seq1 'list)) (l2 (coerce seq2 'list))
-         (e1 (or end1 (length l1))) (e2 (or end2 (length l2)))
-         (n (min (- e1 start1) (- e2 start2)))
-         (res nil) (i 0))
-    (dolist (x l1)
-      (if (and (>= i start1) (< i (+ start1 n)))
-          (push (nth (+ start2 (- i start1)) l2) res)
-          (push x res))
-      (incf i))
-    (%coerce-like (reverse res) seq1)))
+  (let* ((e1 (or end1 (length seq1))) (e2 (or end2 (length seq2)))
+         (n (min (- e1 start1) (- e2 start2))) (k 0))
+    (loop while (< k n) do
+      (setf (elt seq1 (+ start1 k)) (elt seq2 (+ start2 k)))
+      (incf k)))
+  seq1)
 
 (defun %match-at (pat list start key testfn neg)
   (let ((ok t) (i start))
@@ -1298,10 +1298,6 @@
           (t nil))))
 
 ;;; --- string builders and STRING-CAPITALIZE / N-string ops ------------------
-
-(defun make-string (n &key (initial-element #\Space) element-type)
-  (declare (ignore element-type))
-  (coerce (make-list n :initial-element initial-element) 'string))
 
 (defun string-capitalize (s &key (start 0) end)
   (let* ((str (string s)) (stop (or end (length str)))

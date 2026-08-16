@@ -14,6 +14,61 @@ const SYMBOL_IDENTITY: u32 = 1;
 const SYMBOL_NEGATE: u32 = 3;
 const SYMBOL_ADDITION: u32 = 4;
 
+/// Mutate character `index` of the heap string `s` in place, returning the
+/// stored character. Only real heap strings are mutable: registry-backed string
+/// sentinels (a namestring hash wearing TAG_HEAP_OBJECT) are not real pointers,
+/// and interning-shared literals must not be aliased-mutated, so both are
+/// rejected. The write re-encodes the string with the replacement character and
+/// stores it back if it still fits the allocated buffer (true for the common
+/// same-byte-width case, e.g. ASCII), updating the length header.
+pub fn string_set_char(s: BlissVal, index: usize, ch: BlissVal) -> Result<BlissVal, BlissError> {
+    if crate::pathnames::registered_string(s).is_some() {
+        return Err(BlissError::Internal(
+            "cannot modify an interned string literal".into(),
+        ));
+    }
+    if !s.is_heap_object() || !s.is_string() {
+        return Err(BlissError::TypeError {
+            datum: s,
+            expected: "mutable string".into(),
+        });
+    }
+    if !ch.is_character() {
+        return Err(BlissError::TypeError {
+            datum: ch,
+            expected: "character".into(),
+        });
+    }
+    let new_char = ch.as_char();
+    unsafe {
+        let ptr = s.as_ptr();
+        let header = *(ptr as *const ObjectHeader);
+        let capacity = (header.size_units() as usize) * 8 - 16;
+        let len = *((ptr as *const u64).add(1)) as usize;
+        let bytes = std::slice::from_raw_parts(ptr.add(16), len);
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| BlissError::StreamError("invalid UTF-8 in string".into()))?;
+        let mut chars: Vec<char> = text.chars().collect();
+        if index >= chars.len() {
+            return Err(BlissError::Internal(format!(
+                "index {index} out of bounds for string of length {}",
+                chars.len()
+            )));
+        }
+        chars[index] = new_char;
+        let updated: String = chars.into_iter().collect();
+        let new_bytes = updated.as_bytes();
+        if new_bytes.len() > capacity {
+            return Err(BlissError::Internal(
+                "string mutation would exceed the allocated buffer".into(),
+            ));
+        }
+        std::ptr::copy_nonoverlapping(new_bytes.as_ptr(), ptr.add(16), new_bytes.len());
+        *((ptr as *mut u64).add(1)) = new_bytes.len() as u64;
+    }
+    Ok(ch)
+}
+
 /// Check if a BlissVal is a list (cons or NIL).
 #[inline]
 fn is_list(v: BlissVal) -> bool {
