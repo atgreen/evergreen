@@ -3828,16 +3828,25 @@ fn find_symbol_in_package_rec(
             return Some((sym, "EXTERNAL"));
         }
     }
-    let package = env.packages.borrow().get(&pkg_name).cloned()?;
-    if let Some(sym) = package.symbols.get(bare_upper) {
-        let status = if package.exports.iter().any(|name| name == bare_upper) {
-            "EXTERNAL"
-        } else {
-            "INTERNAL"
-        };
-        return Some((*sym, status));
-    }
-    for used in &package.uses {
+    // Borrow the package briefly: resolve the symbol directly, and only clone
+    // the small `uses` list (package names, not the symbols map) if we must
+    // recurse. Cloning the whole PackageDef here — its entire `symbols` HashMap
+    // — on every lookup was a dominant cost while defining ASDF's packages
+    // (bliss-gq5.2).
+    let uses = {
+        let packages = env.packages.borrow();
+        let package = packages.get(&pkg_name)?;
+        if let Some(sym) = package.symbols.get(bare_upper) {
+            let status = if package.exports.iter().any(|name| name == bare_upper) {
+                "EXTERNAL"
+            } else {
+                "INTERNAL"
+            };
+            return Some((*sym, status));
+        }
+        package.uses.clone()
+    };
+    for used in &uses {
         if let Some((sym, _)) = find_symbol_in_package_rec(env, used, bare_upper, visited) {
             return Some((sym, "INHERITED"));
         }
@@ -4432,6 +4441,21 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
 
 fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Vec<BlissVal> {
     let package_name = normalize_package_name(package_name);
+    // Fast path (bliss-gq5.3): a normal package's own symbols with no
+    // inheritance — what DO-EXTERNAL-SYMBOLS drives on every ASDF DEFINE-PACKAGE.
+    // Return the values directly: no PackageDef clone, no dedup map, no per-name
+    // String clone. (Names within one package are already unique.)
+    if !include_inherited
+        && package_name != "COMMON-LISP"
+        && package_name != "COMMON-LISP-USER"
+        && package_name != "KEYWORD"
+    {
+        let packages = env.packages.borrow();
+        return packages
+            .get(&package_name)
+            .map(|pkg| pkg.symbols.values().copied().collect())
+            .unwrap_or_default();
+    }
     let mut seen = HashMap::<String, BlissVal>::new();
     if package_name == "COMMON-LISP" {
         // Only bare symbols that no user package homes belong to COMMON-LISP.
@@ -4462,16 +4486,27 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
             }
         }
     }
-    if let Some(pkg) = env.packages.borrow().get(&package_name).cloned() {
-        for (name, sym) in &pkg.symbols {
-            seen.entry(name.clone()).or_insert(*sym);
-        }
-        if include_inherited {
-            for used in &pkg.uses {
-                for sym in package_symbols(env, used, false) {
-                    seen.entry(val_as_str(sym)).or_insert(sym);
-                }
+    // Borrow briefly: merge the package's own symbols into `seen`, and clone
+    // only the small `uses` list for the inherited walk — never the whole
+    // PackageDef (bliss-gq5.3).
+    let uses = {
+        let packages = env.packages.borrow();
+        if let Some(pkg) = packages.get(&package_name) {
+            for (name, sym) in &pkg.symbols {
+                seen.entry(name.clone()).or_insert(*sym);
             }
+            if include_inherited {
+                pkg.uses.clone()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    };
+    for used in &uses {
+        for sym in package_symbols(env, used, false) {
+            seen.entry(val_as_str(sym)).or_insert(sym);
         }
     }
     seen.into_values().collect()
