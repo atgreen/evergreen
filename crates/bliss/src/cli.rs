@@ -820,6 +820,26 @@ thread_local! {
     /// a per-Env `macros` map lost it across files (bliss-lb6.22). MACROLET
     /// macros stay lexical in `Env::macros` and shadow these.
     static GLOBAL_MACROS: RefCell<HashMap<String, MacroDef>> = RefCell::new(HashMap::new());
+
+    /// Memoized macro-expander registrations for the bytecode compiler
+    /// (bliss-gq5.8). Building a MacroexpandEnv used to re-freeze every macro's
+    /// captured frame, allocate a fresh expander closure, and re-parse the
+    /// name — for EVERY compiled form. During a large load (asdf/alexandria)
+    /// that is O(forms × macros) and dominated compile time. Keyed by macro
+    /// name, the value carries the macro's identity (params/body BlissVal bits +
+    /// captured-frame Rc pointer) so a redefinition re-registers, and caches the
+    /// registered handle and resolved symbol so unchanged macros are reused.
+    static MACRO_FN_CACHE: RefCell<HashMap<String, MacroFnCacheEntry>> =
+        RefCell::new(HashMap::new());
+}
+
+#[derive(Clone, Copy)]
+struct MacroFnCacheEntry {
+    params_bits: u64,
+    body_bits: u64,
+    frame_ptr: usize,
+    handle: BlissVal,
+    symbol: BlissVal,
 }
 
 /// Register a global (top-level DEFMACRO) macro.
@@ -12457,31 +12477,66 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         all_macros.insert(name.clone(), def.clone());
     }
     for (name, macro_def) in all_macros.iter() {
-        let handle = next_macro_function_handle();
-        let params_form = macro_def.params_form;
-        let body = macro_def.body;
-        // Registered into bliss-compiler's global Send + Sync macro table, so the
-        // closure owns a frozen snapshot instead of the live Rc frame. See
-        // FrozenEnvFrame. (The ordinary expand_macro path shares the live frame.)
-        let captured_frame = freeze_env_frame(&macro_def.captured_frame);
-        compiler_macroexpand::register_macro_function(
-            handle,
-            Arc::new(move |form, call_macro_env| {
-                let (_, args) = cp(form);
-                let mut macro_env = Env::new_for_macro_expansion(false);
-                macro_env.frame = thaw_env_frame(&captured_frame);
-                // The expander body finds other global macros via GLOBAL_MACROS
-                // (lookup_macro), so the reconstructed Env needs no macro table.
-                bind_macro_lambda_list(
-                    params_form,
-                    &list_to_vec(args),
-                    &mut macro_env,
-                    Some(call_macro_env),
-                )?;
-                eval_progn(body, &mut macro_env)
-            }),
-        );
-        if let Some(symbol) = resolve_sym(name) {
+        let params_bits = macro_def.params_form.0;
+        let body_bits = macro_def.body.0;
+        let frame_ptr = Rc::as_ptr(&macro_def.captured_frame) as usize;
+
+        // Reuse the cached registration if this exact macro definition was
+        // already registered (bliss-gq5.8) — the common case across the many
+        // forms compiled during a load. Only a redefinition (changed params,
+        // body, or captured frame) falls through to re-register.
+        let cached = MACRO_FN_CACHE.with(|c| c.borrow().get(name).copied());
+        let (handle, symbol) = match cached {
+            Some(e) if e.params_bits == params_bits
+                && e.body_bits == body_bits
+                && e.frame_ptr == frame_ptr =>
+            {
+                (e.handle, e.symbol)
+            }
+            _ => {
+                let handle = next_macro_function_handle();
+                let params_form = macro_def.params_form;
+                let body = macro_def.body;
+                // Registered into bliss-compiler's global Send + Sync macro
+                // table, so the closure owns a frozen snapshot instead of the
+                // live Rc frame. See FrozenEnvFrame. (The ordinary expand_macro
+                // path shares the live frame.)
+                let captured_frame = freeze_env_frame(&macro_def.captured_frame);
+                compiler_macroexpand::register_macro_function(
+                    handle,
+                    Arc::new(move |form, call_macro_env| {
+                        let (_, args) = cp(form);
+                        let mut macro_env = Env::new_for_macro_expansion(false);
+                        macro_env.frame = thaw_env_frame(&captured_frame);
+                        // The expander body finds other global macros via
+                        // GLOBAL_MACROS (lookup_macro), so the reconstructed Env
+                        // needs no macro table.
+                        bind_macro_lambda_list(
+                            params_form,
+                            &list_to_vec(args),
+                            &mut macro_env,
+                            Some(call_macro_env),
+                        )?;
+                        eval_progn(body, &mut macro_env)
+                    }),
+                );
+                let symbol = resolve_sym(name).unwrap_or(NIL);
+                MACRO_FN_CACHE.with(|c| {
+                    c.borrow_mut().insert(
+                        name.clone(),
+                        MacroFnCacheEntry {
+                            params_bits,
+                            body_bits,
+                            frame_ptr,
+                            handle,
+                            symbol,
+                        },
+                    );
+                });
+                (handle, symbol)
+            }
+        };
+        if !symbol.is_nil() {
             macro_env = macro_env.augment_function(symbol, FunctionInfo::Macro(handle));
         }
     }
