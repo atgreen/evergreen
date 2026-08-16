@@ -4793,6 +4793,28 @@ pub fn eval_toplevel(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
         return eval_form(form, env);
     }
 
+    // A top-level `(eval-when (situations) body...)` whose situations fire now:
+    // process each body form as a top-level form (bliss-x5y.6). ASDF/UIOP wrap
+    // nearly every definition in eval-when, and without this the whole form is
+    // thunk-compiled, bails, and its inner `defun`s are only tree-walker-defined
+    // — so they never reach compile_function/T1 (the reason uiop:ensure-package
+    // stayed tier 0). `eval_when_should_run` is the SAME predicate the tree-
+    // walker uses, so the situation semantics are unchanged.
+    if form.is_cons() {
+        let (op, cdr) = cp(form);
+        if op.is_symbol() && sym_name(op) == "EVAL-WHEN" && cdr.is_cons() {
+            let (situations, body) = cp(cdr);
+            if super::eval_when_should_run(situations, env) {
+                let mut last = NIL;
+                for f in list_to_vec(body) {
+                    last = eval_toplevel(f, env)?;
+                }
+                return Ok(last);
+            }
+            return Ok(NIL);
+        }
+    }
+
     // A top-level `defun`: let the tree-walker register it (so the oracle and
     // host-fallback path both see it), then compile a bytecode version so
     // calls to it run as native frames.
