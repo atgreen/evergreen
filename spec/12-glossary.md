@@ -25,14 +25,15 @@
 | **Polling page** | A single memory page used for safepoint synchronisation; `mprotect`-ing it to PROT_NONE triggers SIGSEGV-based trapping. | §2.5.1 |
 | **Green thread** | A lightweight, user-space thread (fibre) multiplexed M:N onto OS worker threads; has its own CL stack and state machine. | §2.3 (D2.01) |
 | **Worker thread** | A pinned OS thread from the worker pool; owns a TLAB, a work-stealing deque, and the Rust call stack. | §2.3.1 |
-| **Sea-of-nodes** | An SSA intermediate representation where control flow and data flow are unified in a single graph (edges are data, control, or memory); inspired by HotSpot C2 / Graal. | §4.3 (D4.01, D4.02) |
-| **MachNode** | A platform-specific machine instruction node produced by lowering the sea-of-nodes IR; input to register allocation and code emission. | §4.7 (D4.11) |
+| **Block-based SSA** | The T2 intermediate representation: a CFG of basic blocks with typed block parameters (the SSA form of φ); instructions produce SSA values and terminators carry control-flow edges with block-argument lists. Cranelift / TurboFan-lite lineage. | §4.3 (D4.01, D4.02) |
+| **Block parameter** | A typed SSA value defined at a block's head, receiving its value from each predecessor's terminator block-argument list; replaces φ-nodes and models function parameters and control-flow merges. | §4.3 (D4.01) |
+| **MachNode** | A platform-specific machine instruction node produced by lowering the block-based SSA IR; input to register allocation and code emission. | §4.7 (D4.11) |
 | **Inline cache (IC)** | A per-call-site cache that accelerates generic dispatch and type checks by remembering observed type→target mappings; transitions through Uninitialized → Monomorphic → Polymorphic → Megamorphic. | §4.8 (D4.03, D4.13, A4.11) |
 | **OSR (On-Stack Replacement)** | Transferring execution from one compilation tier to another (typically T0/T1 → T2) at a loop back-edge without restarting the function. | §4.6 (A4.03) |
 | **Deoptimisation** | The reverse of OSR: when a speculative guard fails in T2 code, the compiled frame is deconstructed and execution resumes in the interpreter (T0). | §4.6 (A4.04) |
 | **Uncommon trap** | A guard inserted by the optimising compiler at speculative points; when the guard fails, it triggers deoptimisation and records the reason. | §4.6 (D4.10) |
 | **Bliss bytecode** | Architecture-neutral instruction stream produced from macroexpanded forms; executed by T0, serialized in `.bfasl`, and used as the stable PC coordinate system for debug info, profiling, OSR, and deoptimisation. | §4.4 |
-| **Tier (T0/T1/T2)** | Execution tiers: T0 = bytecode interpreter; T1 = baseline compiler (unoptimised native from bytecode); T2 = optimising compiler (sea-of-nodes, full pass pipeline). | §0 §1.1, §4.4 |
+| **Tier (T0/T1/T2)** | Execution tiers: T0 = bytecode interpreter; T1 = baseline compiler (unoptimised native from bytecode); T2 = optimising compiler (block-based SSA, full pass pipeline). | §0 §1.1, §4.4 |
 | **Type propagation** | A forward data-flow analysis pass in the T2 compiler that infers CL types for IR nodes, enabling specialisation and type-check elimination. | §4.5 (A4.02 step 2) |
 | **Escape analysis** | An optimisation pass that identifies allocations that do not escape their defining scope, enabling stack-allocation or scalar replacement. | §4.5 (D4.09) |
 | **Linear scan** | The register allocation algorithm used by Bliss: a single pass over SSA live ranges assigning physical registers and spilling to stack slots. | §4.7 (A4.10) |
@@ -90,8 +91,8 @@
 | D3.01 | RegionHeader | §3.2.1 | Per-region metadata: kind, generation age, live bytes, alloc pointers |
 | D3.02 | TLAB | §3.2.2 | Thread-Local Allocation Buffer (cursor, limit, region index) |
 | D3.03 | WeakPointer | §3.10.2 | Weak reference with atomically-clearable referent |
-| D4.01 | IR Node Types | §4.3 | Sea-of-nodes SSA node kinds (Start, Return, Call, Branch, Phi, etc.) |
-| D4.02 | IR Edge Types | §4.3 | Data (def-use), control, and memory dependency edges |
+| D4.01 | IR Function/Block/Inst/Value | §4.3 | Block-based SSA: CFG of blocks with block parameters, instructions, and SSA values |
+| D4.02 | IR Edge Types | §4.3 | Data (def-use / block-argument) and control (terminator successor) edges |
 | D4.03 | InlineCacheEntry | §4.8 | Cached type→method mapping for generic dispatch |
 | D4.04 | MethodCounters | §4.9 | Per-function invocation and back-edge counters for tier promotion |
 | D4.05 | Readtable Layout | §4.1 | ASCII fast-path table + HashMap for extended Unicode chars |

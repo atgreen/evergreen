@@ -2,7 +2,7 @@
 
 **Scope:** This section specifies the T2 optimising compiler's
 middle-end passes — their semantics, ordering, key data structures,
-and correctness constraints. All passes operate on the sea-of-nodes
+and correctness constraints. All passes operate on the block-based
 SSA IR defined in §4.3. The pass manager drives passes in a fixed
 pipeline order (A4.02) with an optional profile-guided re-run loop.
 
@@ -171,7 +171,7 @@ Algorithm: TypePropagation(IR)
 | `Arg(i)` with declared type τ | τ |
 | `Add(a, b)` | `numeric-contagion(type(a), type(b))` — follows CL rules (§12.1) |
 | `TypeCheck(v, τ)` | On true-branch: `meet(type(v), τ)`. On false-branch: `type-difference(type(v), τ)` |
-| `Phi(v₁, v₂, …)` | `join(type(v₁), type(v₂), …)` |
+| Block param (incoming args a₁, a₂, …) | `join(type(a₁), type(a₂), …)` |
 | `Call(f, args)` | Derived from `ftype` declarations or inferred return types |
 | `Cons(car, cdr)` | `cons` |
 | `Car(v)` | if `type(v) ⊆ cons` then `T` else `⊤` (may signal error path) |

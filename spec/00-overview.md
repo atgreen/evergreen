@@ -265,10 +265,10 @@ Generational, region-based, with concurrent old-gen marking:
 
 ### 4.4  Compiler IR (§4)
 
-A sea-of-nodes SSA IR (like HotSpot C2 / Graal):
+A block-based SSA IR (Cranelift / TurboFan-lite lineage):
 
-- Nodes: value-producing operations.
-- Edges: data dependencies (def-use) + control dependencies.
+- Basic blocks with typed block parameters (the SSA form of φ).
+- Instructions produce SSA values; terminators carry control-flow edges with block-argument lists.
 - Optimisation passes: type propagation, inlining, escape analysis,
   loop-invariant code motion, dead code elimination, strength
   reduction.

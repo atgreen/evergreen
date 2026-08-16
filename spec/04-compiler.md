@@ -14,13 +14,14 @@ file:
 |-----------------|------|-------|
 | `04-01-reader.md` | §4.1 | CL Reader |
 | `04-02-macroexpand.md` | §4.2 | Macro Expansion |
-| `04-03-ir.md` | §4.3 | Intermediate Representation (Sea-of-Nodes SSA) |
+| `04-03-ir.md` | §4.3 | Intermediate Representation (Block-based SSA) |
 | `04-04-tiered.md` | §4.4 | Tiered Compilation (T0 / T1 / T2) |
 | `04-05-optimisation.md` | §4.5 | Optimisation Passes |
 | `04-06-osr.md` | §4.6 | On-Stack Replacement & Deoptimisation |
 | `04-07-codegen.md` | §4.7 | Code Emission & Register Allocation |
 | `04-08-inline-caches.md` | §4.8 | Inline Caches |
 | `04-09-profiling.md` | §4.9 | Profiling Infrastructure |
+| `04-10-t2-frame-state.md` | §4.10 | T2 Frame State & Deopt-Preserving Optimisation |
 
 Current source map:
 
@@ -28,7 +29,7 @@ Current source map:
 crates/bliss-compiler/src/
 ├── reader.rs          §4.1  CL reader (Rust bootstrap)
 ├── macroexpand.rs     §4.2  Macro expansion engine
-├── ir.rs              §4.3  Sea-of-nodes IR core types
+├── ir.rs              §4.3  Block-based SSA IR core types
 ├── tiered.rs          §4.4  Tiered execution orchestration for T0/T1/T2
 ├── opt.rs             §4.5  Optimisation pipeline and pass coordination
 ├── osr.rs             §4.6  On-stack replacement and deoptimisation support
@@ -82,9 +83,9 @@ subsection; the master list is collected here for cross-referencing.
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R4.17 | IR MUST use sea-of-nodes SSA form with explicit control and memory edges | MUST |
-| R4.18 | Node types MUST include at minimum: Constant, Parameter, Phi, Call, Branch, TypeCheck, Box, Unbox, MemoryAccess, Region, Merge, Return, Start | MUST |
-| R4.19 | Edge types MUST distinguish data (def-use), control, and memory dependency edges | MUST |
+| R4.17 | IR MUST use block-based SSA form: a CFG of basic blocks with typed block parameters (the SSA form of φ); every value has exactly one definition and dominance holds | MUST |
+| R4.18 | Instructions MUST include at minimum: Const*, Call, TypeCheck, Box, Unbox, Load/Store, Guard, and the terminators Jump, Brif, Return; block parameters serve as function parameters and control-flow merges | MUST |
+| R4.19 | Edges MUST distinguish data (def-use, including block-argument lists) from control (terminator successor edges); effect ordering is the program order of effectful instructions within a block (no separate memory edge) | MUST |
 | R4.20 | IR MUST preserve enough source information to generate accurate backtraces | MUST |
 | R4.21 | IR graph MUST be verifiable: a verification pass MUST check SSA dominance, type consistency, and edge well-formedness before codegen | MUST |
 | R4.22 | IR SHOULD support speculative guards (with associated uncommon-trap metadata) for profile-driven optimisation | SHOULD |
@@ -205,38 +206,29 @@ properties.
 
 See `spec/04-03-ir.md` for the full specification.
 
-Bliss uses a **sea-of-nodes SSA IR** inspired by HotSpot C2 and Graal:
+Bliss uses a **block-based SSA IR** in the Cranelift / TurboFan-lite lineage: a
+CFG of basic blocks over instruction/value arenas (D4.01).
 
-**Node types (D4.01):**
+**Structure (D4.01):**
 
-| Node Kind | Inputs | Output | Description |
-|-----------|--------|--------|-------------|
-| `Start` | — | control | Entry point of the graph |
-| `Return` | control, value | — | Function return |
-| `Constant` | — | value | Compile-time constant |
-| `Parameter` | — | value | Function parameter (index) |
-| `Phi` | control, value* | value | SSA merge of values |
-| `Region` | control* | control | Control-flow merge |
-| `Branch` | control, condition | control, control | Conditional fork |
-| `Call` | control, memory, target, args* | control, memory, value | Function call |
-| `TypeCheck` | value | value | Runtime type guard (+ uncommon trap) |
-| `Box` | value | value | Tag an unboxed scalar |
-| `Unbox` | value | value | Untag to raw scalar |
-| `MemLoad` | control, memory, base, offset | memory, value | Heap load |
-| `MemStore` | control, memory, base, offset, value | memory | Heap store |
-| `Safepoint` | control, memory | control, memory | GC safepoint poll |
+| Element | Description |
+|---------|-------------|
+| `Function` | A CFG of blocks over value/instruction arenas; entry block's parameters are the function parameters |
+| `Block` | Typed **block parameters** (the SSA form of φ) + a sequence of instructions ending in exactly one terminator |
+| `Value` | An SSA value, defined by an instruction result or a block parameter; carries an `IRType` and a `ValueRepresentation` (§4.10) |
+| Instructions | Constants, arithmetic (`FixnumAdd`, `FloatAdd`, …), comparisons/`TypeCheck`, memory (`Load`/`Store`/`Car`/…), `Box`/`Unbox`, `Call`, and `Guard` (deoptimising) |
+| Terminators | `Jump`, `Brif`, `BrTable`, `Return`, `TailCall`, `Throw`, `NlxTransfer`, `Trap` — each names successor blocks + block-argument lists |
 
 **Edge types (D4.02):**
 
 | Edge Kind | Semantics |
 |-----------|-----------|
-| Data (def-use) | Value produced by one node, consumed by another |
-| Control | Sequencing: determines execution order for side-effecting nodes |
-| Memory | Serialises memory operations (load/store ordering) |
+| Data (def-use) | An SSA value produced by its definition, consumed at an operand or block-argument site; the definition dominates the use |
+| Control | A terminator's successor edge carrying a block-argument list; the CFG is primary and reducible for natural loops |
 
-The sea-of-nodes representation eliminates the need for a separate CFG:
-control and data flow are unified in the same graph, enabling global code
-motion by default.
+There is no separate memory edge: effect ordering is the program order of
+effectful instructions within a block, refined by alias analysis. A deoptimising
+`Guard` carries a `FrameState` (§4.10 D4.15); passes preserve it (§4.10 R4.60).
 
 ## 4.4  Tiered Compilation — Overview
 
@@ -250,12 +242,12 @@ stack, lexical frame slots, and bytecode PCs for source maps, OSR, and
 deoptimisation.
 
 **T1 — Baseline Compiler:**  Performs a single-pass lowering from bytecode to
-native code without constructing the full sea-of-nodes IR graph.  Inserts
+native code without constructing the T2 SSA IR graph.  Inserts
 profiling stubs at call sites and back-edges.  Target latency: < 1 ms for a
 200-instruction function.  No optimisation beyond peephole lowering and
 constant folding of immediates.
 
-**T2 — Optimising Compiler:**  Builds the sea-of-nodes IR (§4.3), runs the
+**T2 — Optimising Compiler:**  Builds the block-based SSA IR (§4.3), runs the
 optimisation pass pipeline (§4.5), lowers to machine-specific nodes, performs
 register allocation (§4.7), and emits optimised native code.  Runs on a
 background compilation thread.  Code is installed atomically via pointer
@@ -279,12 +271,12 @@ See `spec/04-05-optimisation.md` for the full specification.
 9. Dead code elimination
 10. Null-check elimination
 11. Lower to machine-specific nodes
-12. Register allocation (linear scan)
+12. Register allocation (SSA-based, regalloc2 — §4.7 R4.45)
 13. Code emission
 ```
 
 The pass manager runs passes in this fixed order.  The type-propagation pass
-uses a forward data-flow analysis over the sea-of-nodes graph, propagating
+uses a forward data-flow analysis over the SSA IR, propagating
 CL type specifiers (including `and`, `or`, `not`, `satisfies` where
 statically decidable).  Inlining respects `(declare (inline f))` and
 `(declare (notinline f))`, with a default budget of 50 IR nodes per call

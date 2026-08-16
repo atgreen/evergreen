@@ -1,11 +1,12 @@
 # §4.7 Code Emission & Register Allocation
 
 Code emission transforms optimised IR (§4.4) into executable machine code.
-This section specifies lowering from sea-of-nodes IR to machine-specific
-nodes, backend instruction selection for x86-64 and AArch64, register
-allocation, code buffer management, runtime patching, GC stack maps, and
-code region lifecycle.  The design mirrors HotSpot — linear-scan allocation
-over SSA live ranges, relocatable code buffers, and CAS-based code patching.
+This section specifies lowering from the block-based SSA IR (§4.3) to
+machine-specific nodes, backend instruction selection for x86-64 and AArch64,
+register allocation, code buffer management, runtime patching, GC stack maps, and
+code region lifecycle.  The design mirrors HotSpot — an SSA-based register
+allocator with live-range splitting, relocatable code buffers, and CAS-based
+code patching.
 
 ---
 
@@ -16,7 +17,7 @@ over SSA live ranges, relocatable code buffers, and CAS-based code patching.
 | R4.42 | The compiler MUST lower all IR nodes to platform-specific `MachNode`s before register allocation. Unlowered nodes MUST cause a compilation abort. | MUST |
 | R4.43 | The x86-64 backend MUST comply with System V AMD64 ABI for FFI calls and MUST use SSE2 as the baseline float ISA. SSE4.1 and AVX2 MAY be emitted when detected via `CPUID`. | MUST/MAY |
 | R4.44 | The AArch64 backend MUST comply with AAPCS64. NEON MUST be used for float/SIMD. SVE MAY be emitted when detected. | MUST/MAY |
-| R4.45 | Register allocation MUST use linear-scan over SSA live ranges with interval splitting and spill-slot coalescing. Worst-case time MUST be O(n log n). | MUST |
+| R4.45 | Register allocation MUST use an SSA-based allocator with live-range splitting and spill-slot coalescing — the `regalloc2` library (the Cranelift allocator) or an equivalent. It MUST support at least two register classes (integer/GPR for tagged, unboxed-integer, and pointer values; float/XMM for unboxed floats), honour fixed-register constraints imposed by the SysV/AAPCS64 ABI and the c2i calling convention, and — per §4.10 R4.65 — finalise both the GC stack map (R4.46) and every FrameState `Location` binding at each safepoint and deopt point. | MUST |
 | R4.46 | Every safepoint MUST have a GC stack map. Missing maps MUST be detected at code installation, not GC time. | MUST |
 | R4.47 | Code patching MUST be atomic w.r.t. concurrent threads. x86-64: CAS or single-instruction writes. AArch64: `ISB` barrier after patching. | MUST |
 

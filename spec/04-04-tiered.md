@@ -385,7 +385,7 @@ for background T2 compilation (§4.4.6).
 ### 4.4.5.1  Purpose
 
 T2 produces high-quality native code for hot functions.  It operates on a
-sea-of-nodes SSA intermediate representation (§4.4 overview, §4.3 IR details)
+block-based SSA intermediate representation (§4.4 overview, §4.3 IR details)
 and runs a full optimisation pass pipeline.
 
 ### 4.4.5.2  IR Construction
@@ -396,10 +396,11 @@ dominance-frontier-based φ insertion.  `build_ir(ast, env_shape) → IRGraph`
 walks the AST, creating blocks and parameter nodes, then validates SSA
 invariants.
 
-IR node categories: Constants, Arithmetic (`Add`/`Sub`/`Mul`/`Div`/`Mod`),
-Comparison (`Eq`/`Lt`/`NumEq`), Control (`If`/`Jump`/`Return`/`Phi`/`Call`/`TailCall`),
-Memory (`Load`/`Store`/`Alloc`/`WriteBarrier`), Type ops (`TypeCheck`/`Box`/`Unbox`),
-CL-specific (`ConsCreate`/`Car`/`Cdr`/`Values`/`MvBind`).
+Instruction categories: Constants, Arithmetic (`Add`/`Sub`/`Mul`/`Div`/`Mod`),
+Comparison (`Eq`/`Lt`/`NumEq`), Terminators (`Brif`/`Jump`/`Return`/`TailCall`/`Trap`),
+Call, Memory (`Load`/`Store`/`Alloc`/`WriteBarrier`), Type ops
+(`TypeCheck`/`Box`/`Unbox`/`Guard`), CL-specific (`ConsCreate`/`Car`/`Cdr`/`Values`/`MvBind`).
+Control-flow merges are block parameters, not instructions.
 
 ### 4.4.5.3  Optimisation Pass Pipeline
 

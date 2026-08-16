@@ -16,7 +16,7 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | `01-object-model.md` | §1 | Object Model | BlissVal tagged pointers, type lattice, heap layouts, immediates |
 | `02-runtime-core.md` | §2 | Runtime Core | Thread model, stack layout, safepoints, FFI, signals, startup |
 | `03-memory-gc.md` | §3 | Memory & GC | Nursery/old-gen, TLABs, concurrent marking, compaction, finalization |
-| `04-compiler.md` | §4 | Compiler Pipeline | Overview + 9 sub-chapters (§4.1–§4.9) |
+| `04-compiler.md` | §4 | Compiler Pipeline | Overview + 10 sub-chapters (§4.1–§4.10) |
 | `05-stdlib.md` | §5 | Standard Library | Overview + 7 companion files spanning §5.1–§5.9 |
 | `06-devtools.md` | §6 | Developer Tools | REPL, debugger, profiler, SLIME/SLY protocol |
 | `06-11-bfasl.md` | §6.11 | Bliss FASL format | `.bfasl` portable compiled-artifact format (R6.60–R6.70) |
@@ -41,6 +41,7 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | `04-07-codegen.md` | §4.7 | Code Emission & Register Allocation | R4.42–R4.47 |
 | `04-08-inline-caches.md` | §4.8 | Inline Caches | R4.48–R4.52 |
 | `04-09-profiling.md` | §4.9 | Profiling Infrastructure | R4.53–R4.58 |
+| `04-10-t2-frame-state.md` | §4.10 | T2 Frame State & Deopt-Preserving Optimisation | R4.59–R4.68 |
 
 ## Standard Library Sub-Chapters (§5)
 
@@ -61,7 +62,7 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | §1 Object Model | R1.01–R1.xx | ~20 |
 | §2 Runtime Core | R2.01–R2.xx | ~25 |
 | §3 Memory & GC | R3.01–R3.xx | ~20 |
-| §4 Compiler | R4.01–R4.58 | ~58 |
+| §4 Compiler | R4.01–R4.68 | ~68 |
 | §5 Standard Library | R5.01–R5.203 | ~60 |
 | §6 Developer Tools | R6.01–R6.09 | ~15 |
 | §7 Ops & Portability | R7.01–R7.18 | ~18 |
