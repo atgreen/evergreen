@@ -436,6 +436,13 @@
 (defvar *load-print* nil)
 (defvar *compile-file-pathname* nil)
 (defvar *compile-file-truename* nil)
+;; The pretty-printer dispatch table. This interpreter has no user-extensible
+;; pprint dispatch, but the variable must be bound: ASDF's DEFINE-OP saves and
+;; rebinds it around loading a .asd (bliss-lb6.17).
+(defvar *print-pprint-dispatch* nil)
+;; The default pathname merged against by MERGE-PATHNAMES and friends; ANSI
+;; requires it to be bound to a pathname. Initialize to the startup directory.
+(defvar *default-pathname-defaults* (truename "."))
 
 ;;; WITH-STANDARD-IO-SYNTAX: evaluate BODY with the standard reader/printer
 ;;; variables bound to their ANSI-standard values. An empty body yields NIL.
@@ -445,6 +452,21 @@
 (defmacro with-compilation-unit (options &rest body)
   (declare (ignore options))
   (cons 'progn body))
+
+;;; WITH-OUTPUT-TO-STRING: bind VAR to a fresh string-output-stream, run BODY,
+;;; and return the accumulated string. (A supplied target string with a fill
+;;; pointer is not supported; the stream form is used regardless.)
+(defmacro with-output-to-string ((var &optional string-form &rest keys) &rest body)
+  (declare (ignore string-form keys))
+  `(let ((,var (make-string-output-stream)))
+     ,@body
+     (get-output-stream-string ,var)))
+
+;;; WITH-INPUT-FROM-STRING: bind VAR to a string-input-stream over STRING.
+(defmacro with-input-from-string ((var string &key (start 0) end index) &rest body)
+  (declare (ignore index))
+  `(let ((,var (make-string-input-stream ,string ,start ,end)))
+     ,@body))
 
 (defmacro with-standard-io-syntax (&rest body)
   `(let ((*readtable* :standard-readtable)
@@ -459,6 +481,7 @@
          (*print-level* nil)
          (*print-lines* nil)
          (*print-miser-width* nil)
+         (*print-pprint-dispatch* *print-pprint-dispatch*)
          (*print-pretty* nil)
          (*print-radix* nil)
          (*print-readably* t)

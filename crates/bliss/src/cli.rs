@@ -635,7 +635,9 @@ struct ClassDef {
 #[derive(Clone)]
 struct SlotDef {
     name: String,
-    initarg: Option<String>,
+    /// All `:initarg` names declared for this slot (a slot may declare several,
+    /// e.g. both `:licence` and `:license`). Bare names, no leading colon.
+    initargs: Vec<String>,
     accessor: Option<String>,
     readers: Vec<String>,
     writers: Vec<String>,
@@ -1267,11 +1269,7 @@ fn lookup_slot_def<'a>(env: &'a Env, class_name: &str, slot_name: &str) -> Optio
 fn lookup_slot_by_initarg<'a>(env: &'a Env, class_name: &str, initarg: &str) -> Option<&'a SlotDef> {
     let class_def = env.classes.get(class_name)?;
     if let Some(slot) = class_def.slots.iter().find(|slot| {
-        slot.initarg
-            .as_ref()
-            .map(|slot_initarg| slot_initarg == initarg)
-            .unwrap_or(false)
-            || slot.name == initarg
+        slot.initargs.iter().any(|slot_initarg| slot_initarg == initarg) || slot.name == initarg
     }) {
         return Some(slot);
     }
@@ -2869,6 +2867,34 @@ fn is_string_value(v: BlissVal) -> bool {
     v.is_string()
 }
 
+/// True if `v` is a registry-backed sentinel (a string/namestring hash wearing
+/// TAG_HEAP_OBJECT) — a value that is NOT a real heap pointer and must never be
+/// dereferenced via a raw `ObjectHeader` load.
+fn is_registry_sentinel(v: BlissVal) -> bool {
+    bliss_stdlib::registered_string(v).is_some() || bliss_stdlib::is_pathname(v)
+}
+
+/// Sentinel-safe VECTORP: a string is a vector, and registry sentinels/pathnames
+/// are never real heap vectors. Guards the raw header load in
+/// `bliss_rt::types::vectorp`, which would segfault on a non-pointer sentinel.
+fn is_vector_value(v: BlissVal) -> bool {
+    if is_string_value(v) {
+        return true;
+    }
+    if is_registry_sentinel(v) {
+        return false;
+    }
+    bliss_rt::types::vectorp(v)
+}
+
+/// Sentinel-safe SIMPLE-VECTOR-P (excludes strings and sentinels).
+fn is_simple_vector_value(v: BlissVal) -> bool {
+    if is_string_value(v) || is_registry_sentinel(v) {
+        return false;
+    }
+    bliss_rt::types::vectorp(v)
+}
+
 // ── Collect a list into a Vec of elements ─────────────────────────
 fn list_to_vec(val: BlissVal) -> Vec<BlissVal> {
     let mut result = Vec::new();
@@ -4075,6 +4101,24 @@ fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
     (false, false)
 }
 
+/// True if `object`'s length satisfies a vector/array type's size argument list.
+/// An empty list or a `*` wildcard matches any length; a fixnum must equal the
+/// object's length.
+fn vector_length_matches(size_args: &[BlissVal], object: BlissVal) -> bool {
+    let Some(size) = size_args.first().copied() else {
+        return true;
+    };
+    if size.is_symbol() && symbol_bare_name(&sym_name(size)) == "*" {
+        return true;
+    }
+    if size.is_fixnum() {
+        return bliss_stdlib::length(object)
+            .map(|len| len as i64 == size.as_fixnum())
+            .unwrap_or(false);
+    }
+    true
+}
+
 fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result<bool, BlissError> {
     let type_spec = resolve_type_spec(env, type_spec);
     if type_spec.is_symbol() {
@@ -4115,6 +4159,11 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "HASH-TABLE" => bliss_stdlib::hash_table_count(object).is_ok(),
             "PATHNAME" => bliss_stdlib::namestring(object).is_ok(),
             "STREAM" | "FILE-STREAM" | "SYNONYM-STREAM" => is_stream(object),
+            "SIMPLE-VECTOR" => is_simple_vector_value(object),
+            // A string is a (vector character); an ARRAY includes both general
+            // vectors and strings.
+            "VECTOR" | "ARRAY" | "SIMPLE-ARRAY" => is_vector_value(object),
+            "SEQUENCE" => object.is_list() || is_vector_value(object),
             other => {
                 if let Some(hierarchy) = instance_class_hierarchy_names(object) {
                     hierarchy.iter().any(|name| name == other)
@@ -4150,6 +4199,32 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                 }
             }
             Ok(true)
+        }
+        "SIMPLE-VECTOR" => {
+            // (simple-vector size): a general vector whose length matches SIZE
+            // (or `*`). Used e.g. by ASDF's MATCH-CONDITION-P etypecase.
+            if !is_simple_vector_value(object) {
+                return Ok(false);
+            }
+            Ok(vector_length_matches(&list_to_vec(args), object))
+        }
+        "VECTOR" | "SIMPLE-ARRAY" | "ARRAY" => {
+            // (vector element-type size) / (array element-type dims): accept a
+            // general vector or a string, checking the size/length when given.
+            // Element-type is not tracked, so it is treated as wild.
+            if !is_vector_value(object) {
+                return Ok(false);
+            }
+            // The size/length is the LAST argument (element-type precedes it).
+            let arg_vec = list_to_vec(args);
+            let size_args = if arg_vec.len() >= 2 {
+                arg_vec[1..].to_vec()
+            } else if op == "VECTOR" {
+                arg_vec.clone()
+            } else {
+                Vec::new()
+            };
+            Ok(vector_length_matches(&size_args, object))
         }
         "MEMBER" => Ok(list_to_vec(args)
             .into_iter()
@@ -4307,10 +4382,43 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
     // on error), which also keeps `current_package` — the reader's bare-symbol
     // resolution context (bliss-lb6.12) and the REPL prompt — consistent.
     let saved_package = env.current_package.clone();
+    // ANSI LOAD also binds *LOAD-PATHNAME*/*LOAD-TRUENAME* to the file being
+    // loaded for the dynamic extent of the load. ASDF relies on (load-pathname)
+    // to locate a system's .asd directory, so without this every component
+    // pathname stays relative and find-system fails (bliss-lb6.17). Snapshot and
+    // restore so nested loads see their own file and the caller's binding returns.
+    let saved_load_pathname = env.lookup_var("*LOAD-PATHNAME*");
+    let saved_load_truename = env.lookup_var("*LOAD-TRUENAME*");
+    // Sync the reader's package context to the *current dynamic* value of
+    // *PACKAGE*. bliss's reader resolves bare symbols via env.current_package,
+    // which a dynamic `(let ((*package* X)) (load …))` binding does not update —
+    // so without this, ASDF's DEFINE-OP (which LET-binds *package* to :asdf-user
+    // before loading a .asd) would read `defsystem` in the wrong package and hit
+    // an undefined function (bliss-lb6.17).
+    {
+        // A special LET binding of *PACKAGE* (as ASDF's DEFINE-OP does) lives in
+        // the symbol's dynamic value cell; the root-frame lexical copy shadows it
+        // for name lookup, so consult the cell first, then fall back to the var.
+        let cell_val = resolve_sym("*PACKAGE*")
+            .and_then(|s| global_value_cell(s.as_symbol_index()));
+        let pkg_val = cell_val.or_else(|| env.lookup_var("*PACKAGE*"));
+        if let Some(pkg_val) = pkg_val {
+            let pkg_name = resolve_package_name(env, &val_as_str(pkg_val));
+            if !pkg_name.is_empty() {
+                env.current_package = pkg_name;
+            }
+        }
+    }
     let result = (|| {
         // Resolve the load path (e.g. prefer a compiled .bfasl sibling, like SBCL)
         // before reading (bfasl-bytecode-unit).
         let resolved_path = resolve_load_path(path)?;
+        // Bind *LOAD-PATHNAME*/*LOAD-TRUENAME* to an absolute pathname for the
+        // file now that its real on-disk location is known.
+        if let Some(pathname) = load_pathname_value(&resolved_path) {
+            env.define_local("*LOAD-PATHNAME*", pathname);
+            env.define_local("*LOAD-TRUENAME*", pathname);
+        }
         let bytes = std::fs::read(&resolved_path)
             .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", resolved_path, e)))?;
         // A Bliss FASL (.bfasl) starts with the BFASL magic — verify and load the
@@ -4327,7 +4435,23 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
         env.current_package = saved_package.clone();
         env.define_local("*PACKAGE*", arena_str(&saved_package));
     }
+    // Restore *LOAD-PATHNAME*/*LOAD-TRUENAME* to the caller's binding (NIL at the
+    // top level), so a load doesn't leak its file into the enclosing context.
+    env.define_local("*LOAD-PATHNAME*", saved_load_pathname.unwrap_or(NIL));
+    env.define_local("*LOAD-TRUENAME*", saved_load_truename.unwrap_or(NIL));
     result
+}
+
+/// Build an absolute pathname value for a file being loaded, for
+/// *LOAD-PATHNAME*/*LOAD-TRUENAME*. Canonicalizes to an absolute path when the
+/// file exists so ASDF can derive absolute system directories from it.
+fn load_pathname_value(path: &str) -> Option<BlissVal> {
+    let abs = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    bliss_stdlib::parse_namestring(arena_str(&abs), None, None)
+        .ok()
+        .map(|(pathname, _)| pathname)
 }
 
 /// Load a verified `.bfasl` compiled unit (spec §6.11, bliss-lb6.6): verify the
@@ -5017,6 +5141,42 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(ch);
             }
+            "MAKE-STRING-OUTPUT-STREAM" => {
+                // (make-string-output-stream &key element-type)
+                return bliss_stdlib::make_string_output_stream(NIL);
+            }
+            "GET-OUTPUT-STREAM-STRING" => {
+                let (sf, _) = cp(cdr);
+                let stream = eval_form(sf, env)?;
+                return bliss_stdlib::get_output_stream_string(stream);
+            }
+            "MAKE-STRING-INPUT-STREAM" => {
+                // (make-string-input-stream string &optional start end)
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "MAKE-STRING-INPUT-STREAM requires a string".into(),
+                    ));
+                }
+                let string = eval_form(args[0], env)?;
+                let start = if args.len() > 1 {
+                    let v = eval_form(args[1], env)?;
+                    if v.is_fixnum() { v.as_fixnum() as usize } else { 0 }
+                } else {
+                    0
+                };
+                let end = if args.len() > 2 {
+                    let v = eval_form(args[2], env)?;
+                    if v.is_fixnum() {
+                        Some(v.as_fixnum() as usize)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                return bliss_stdlib::make_string_input_stream(string, start, end);
+            }
             "READ-CHAR" => {
                 // (read-char &optional stream eof-error-p eof-value)
                 let args = list_to_vec(cdr);
@@ -5287,6 +5447,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 return Ok(if v.is_symbol() { T } else { NIL });
             }
+            "KEYWORDP" => {
+                // A keyword is a symbol whose home package is KEYWORD. NIL is a
+                // symbol but not a keyword.
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                return Ok(if is_keyword_arg(v) { T } else { NIL });
+            }
             "DOCUMENTATION" => {
                 // (documentation object &optional doc-type) — the interpreter
                 // does not retain documentation strings; always NIL. Arguments
@@ -5315,6 +5482,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         || env.methods.contains_key(&n)
                         || env.generics.contains_key(&n)
                         || env.macros.contains_key(&n)
+                        || is_builtin_function(&symbol_bare_name(&n))
                     {
                         return Ok(spec);
                     }
@@ -5335,7 +5503,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let bound = fn_bound(env, &name)
                     || env.methods.contains_key(&name)
                     || env.generics.contains_key(&name)
-                    || env.macros.contains_key(&name);
+                    || env.macros.contains_key(&name)
+                    || is_builtin_function(&symbol_bare_name(&name));
                 return Ok(if bound { T } else { NIL });
             }
             "FMAKUNBOUND" => {
@@ -5892,17 +6061,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "VECTORP" | "SIMPLE-VECTOR-P" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(if bliss_rt::types::vectorp(v) { T } else { NIL });
+                return Ok(if is_vector_value(v) { T } else { NIL });
             }
             "ARRAYP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 // bliss arrays are simple-vectors and strings.
-                return Ok(if bliss_rt::types::vectorp(v) || is_string_value(v) {
-                    T
-                } else {
-                    NIL
-                });
+                return Ok(if is_vector_value(v) { T } else { NIL });
             }
             "ARRAY-ELEMENT-TYPE" => {
                 let (af, _) = cp(cdr);
@@ -6527,6 +6692,37 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 });
             }
+            "PATHNAME-MATCH-P" => {
+                // (pathname-match-p pathname wildcard)
+                let (pn_form, rest) = cp(cdr);
+                let (wc_form, _) = cp(rest);
+                let pn = eval_form(pn_form, env)?;
+                let wc = eval_form(wc_form, env)?;
+                return Ok(if bliss_stdlib::pathname_match_p(pn, wc)? {
+                    T
+                } else {
+                    NIL
+                });
+            }
+            "TRANSLATE-PATHNAME" => {
+                // (translate-pathname source from-wildcard to-wildcard)
+                let (src_form, rest) = cp(cdr);
+                let (from_form, rest2) = cp(rest);
+                let (to_form, _) = cp(rest2);
+                let src = eval_form(src_form, env)?;
+                let from = eval_form(from_form, env)?;
+                let to = eval_form(to_form, env)?;
+                return bliss_stdlib::translate_pathname(src, from, to);
+            }
+            "ENSURE-DIRECTORIES-EXIST" => {
+                // (ensure-directories-exist pathspec &key verbose) → pathspec plus
+                // a second value that is true if any directory was created.
+                let (ps_form, _) = cp(cdr);
+                let pathspec = eval_form(ps_form, env)?;
+                let (pn, created) = bliss_stdlib::ensure_directories_exist(pathspec)?;
+                env.set_mv(vec![pn, if created { T } else { NIL }]);
+                return Ok(pn);
+            }
             "STRING" => {
                 // (string x): a string is returned as-is; a symbol yields its
                 // bare SYMBOL-NAME (no package prefix); a character yields a
@@ -6980,9 +7176,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(bliss_stdlib::class_of(object));
             }
             "FIND-CLASS" => {
-                // (find-class name &optional errorp) — return the class metaobject.
-                let (name_form, _) = cp(cdr);
+                // (find-class name &optional (errorp t) environment) — return the
+                // class metaobject, or (when errorp is NIL) NIL if none is found.
+                let (name_form, rest) = cp(cdr);
                 let name = eval_form(name_form, env)?;
+                // errorp defaults to T when the argument is omitted.
+                let errorp = if rest.is_cons() {
+                    let (errorp_form, _) = cp(rest);
+                    eval_form(errorp_form, env)? != NIL
+                } else {
+                    true
+                };
                 if let Some(class) = bliss_stdlib::find_class(name) {
                     return Ok(class);
                 }
@@ -6990,6 +7194,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     && class != name
                 {
                     return Ok(class);
+                }
+                if !errorp {
+                    return Ok(NIL);
                 }
                 let name_str = if name.is_symbol() {
                     sym_name(name)
@@ -7092,21 +7299,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let class = resolve_class_metaobject(env, class_input)?;
                 bliss_stdlib::change_class(instance, class)?;
                 let new_class_name = class_name_for_instance_class(class);
-                let added_slots = if let Some(class_def) = env.classes.get(&new_class_name) {
-                    class_def
-                        .slots
-                        .iter()
-                        .filter(|slot| {
-                            !env.classes
-                                .get(&old_class_name)
-                                .map(|old| old.slots.iter().any(|s| s.name == slot.name))
-                                .unwrap_or(false)
-                        })
-                        .map(|slot| slot.name.clone())
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
+                // Newly-added slots are those in the new class's *effective*
+                // (inherited + direct) slot set that were not effective slots of
+                // the old class. Using effective slots — not just direct slots —
+                // is essential: e.g. change-class to a class that inherits a slot
+                // (parent) which the old class lacked must still apply that slot's
+                // initform (CLOS change-class / update-instance-for-different-class).
+                let old_slot_names: std::collections::HashSet<String> =
+                    effective_slots_for_class(env, &old_class_name)
+                        .into_iter()
+                        .map(|slot| slot.name)
+                        .collect();
+                let added_slots = effective_slots_for_class(env, &new_class_name)
+                    .into_iter()
+                    .filter(|slot| !old_slot_names.contains(&slot.name))
+                    .map(|slot| slot.name)
+                    .collect::<Vec<_>>();
                 apply_class_initforms(instance, &new_class_name, env, Some(&added_slots), &[])?;
                 return Ok(instance);
             }
@@ -7258,10 +7466,55 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     BlissError::FileError(format!("compile-file: cannot read {src_path}: {e}"))
                 })?;
                 let image = build_bfasl_from_source(&source, &src_path, env);
+                // Create the output directory if needed. ASDF's output-translations
+                // route fasls into a per-implementation cache tree whose directories
+                // may not exist yet; real CL relies on ASDF pre-creating them, but
+                // creating them here is harmless and avoids a spurious file error.
+                if let Some(parent) = std::path::Path::new(&out_path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
                 std::fs::write(&out_path, &image).map_err(|e| {
                     BlissError::FileError(format!("compile-file: cannot write {out_path}: {e}"))
                 })?;
                 return Ok(arena_str(&out_path));
+            }
+            "COMPILE-FILE-PATHNAME" => {
+                // (compile-file-pathname input-file &key output-file &allow-other-keys)
+                // Return the pathname COMPILE-FILE would write. With an explicit
+                // :output-file, return that (as a pathname); otherwise the input
+                // with a "fasl" type. ASDF calls this to compute output-files.
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "compile-file-pathname: missing input-file".into(),
+                    ));
+                }
+                let input = eval_form(args[0], env)?;
+                // Scan &key args for :output-file.
+                let mut i = 1;
+                while i + 1 < args.len() {
+                    let key = eval_form(args[i], env)?;
+                    let val = eval_form(args[i + 1], env)?;
+                    if key.is_symbol() && symbol_bare_name(&sym_name(key)) == "OUTPUT-FILE" {
+                        if val != NIL {
+                            let (pn, _) = bliss_stdlib::parse_namestring(
+                                arena_str(&path_designator_to_string(val)?),
+                                None,
+                                None,
+                            )?;
+                            return Ok(pn);
+                        }
+                    }
+                    i += 2;
+                }
+                let src = path_designator_to_string(input)?;
+                let stem = src
+                    .strip_suffix(".lisp")
+                    .or_else(|| src.strip_suffix(".lsp"))
+                    .unwrap_or(&src);
+                let (pn, _) =
+                    bliss_stdlib::parse_namestring(arena_str(&format!("{stem}.fasl")), None, None)?;
+                return Ok(pn);
             }
             "REQUIRE" => {
                 let (module_form, _) = cp(cdr);
@@ -8056,6 +8309,7 @@ fn is_loop_keyword(bare: &str) -> bool {
         "WITH"
             | "AND"
             | "FOR"
+            | "AS"
             | "IN"
             | "ON"
             | "BEING"
@@ -8672,9 +8926,15 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     break;
                 }
             }
-            "FOR" => {
+            // `AS` is a standard synonym for `FOR` (CLHS 6.1.2.1).
+            "FOR" | "AS" => {
                 p.advance();
                 let pat = p.read_form()?;
+                // Optional `:of-type <type>` type declaration is accepted and ignored.
+                if p.at_sym("OF-TYPE") {
+                    p.advance();
+                    p.read_form()?;
+                }
                 match p.peek_kw().as_deref() {
                     Some("IN") => {
                         p.advance();
@@ -11527,7 +11787,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         if slot_form.is_cons() {
             let (slot_name_form, slot_opts) = cp(*slot_form);
             let slot_name = sym_name(slot_name_form);
-            let mut initarg = None;
+            let mut initargs: Vec<String> = Vec::new();
             let mut accessor = None;
             let mut readers = Vec::new();
             let mut writers = Vec::new();
@@ -11545,7 +11805,9 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if opt_bare == "INITARG" {
                     if i + 1 < opts.len() {
                         let ia = sym_name(opts[i + 1]);
-                        initarg = Some(
+                        // A slot may declare more than one :initarg — collect them
+                        // all so make-instance accepts any (e.g. :licence/:license).
+                        initargs.push(
                             ia.trim_start_matches("KEYWORD:")
                                 .trim_start_matches(':')
                                 .to_string(),
@@ -11605,7 +11867,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
             slots.push(SlotDef {
                 name: slot_name,
-                initarg,
+                initargs,
                 accessor,
                 readers,
                 writers,
@@ -11615,7 +11877,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         } else if slot_form.is_symbol() {
             slots.push(SlotDef {
                 name: sym_name(*slot_form),
-                initarg: None,
+                initargs: Vec::new(),
                 accessor: None,
                 readers: Vec::new(),
                 writers: Vec::new(),
@@ -12041,6 +12303,87 @@ fn apply_function(
     dead_code,
     reason = "legacy builtin dispatch is retained during evaluator consolidation"
 )]
+/// True if `name` (a bare, upcased function name) denotes a standard function
+/// bliss implements as a builtin operator. Used by FBOUNDP/FDEFINITION so a
+/// builtin like FUNCALL is reported bound and `(fdefinition 'funcall)` returns a
+/// callable designator — ASDF's ENSURE-FUNCTION relies on this. Special
+/// operators and macros are intentionally excluded (they are not functions).
+fn is_builtin_function(name: &str) -> bool {
+    matches!(
+        name,
+        // Control / function application
+        "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
+            | "CONSTANTLY" | "NOT" | "EQ" | "EQL" | "EQUAL" | "EQUALP"
+            // Conses / lists
+            | "CONS" | "CAR" | "CDR" | "FIRST" | "REST" | "SECOND" | "THIRD" | "FOURTH"
+            | "FIFTH" | "LAST" | "LIST" | "LIST*" | "APPEND" | "NCONC" | "REVERSE"
+            | "NREVERSE" | "NTH" | "NTHCDR" | "CAAR" | "CADR" | "CDAR" | "CDDR"
+            | "CADDR" | "CADDDR" | "COPY-LIST" | "COPY-TREE" | "LDIFF" | "TAILP"
+            | "CONSP" | "ATOM" | "LISTP" | "NULL" | "ENDP" | "ACONS" | "ASSOC"
+            | "RASSOC" | "MEMBER" | "MEMBER-IF" | "ASSOC-IF" | "GETF" | "GET"
+            | "SUBST" | "PAIRLIST" | "PAIRLIS" | "REVAPPEND" | "NRECONC" | "BUTLAST"
+            | "NBUTLAST" | "MAPCAR" | "MAPC" | "MAPCAN" | "MAPCON" | "MAPLIST" | "MAPL"
+            | "SET-DIFFERENCE" | "UNION" | "INTERSECTION" | "ADJOIN"
+            // Sequences
+            | "ELT" | "LENGTH" | "SUBSEQ" | "COPY-SEQ" | "AREF" | "SVREF" | "ROW-MAJOR-AREF"
+            | "MAP" | "MAP-INTO" | "REDUCE" | "COUNT" | "COUNT-IF" | "FIND" | "FIND-IF"
+            | "POSITION" | "POSITION-IF" | "REMOVE" | "REMOVE-IF" | "REMOVE-IF-NOT"
+            | "REMOVE-DUPLICATES" | "DELETE" | "DELETE-IF" | "DELETE-DUPLICATES"
+            | "SUBSTITUTE" | "SUBSTITUTE-IF" | "FILL" | "SORT" | "STABLE-SORT" | "MERGE"
+            | "SEARCH" | "MISMATCH" | "CONCATENATE" | "EVERY" | "SOME" | "NOTEVERY"
+            | "NOTANY" | "VECTOR" | "MAKE-ARRAY" | "MAKE-LIST" | "MAKE-SEQUENCE"
+            | "VECTORP" | "SIMPLE-VECTOR-P" | "ARRAYP" | "ARRAY-DIMENSIONS"
+            | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
+            // Numbers
+            | "+" | "-" | "*" | "/" | "1+" | "1-" | "=" | "/=" | "<" | ">" | "<=" | ">="
+            | "MIN" | "MAX" | "ABS" | "MOD" | "REM" | "FLOOR" | "CEILING" | "TRUNCATE"
+            | "ROUND" | "GCD" | "LCM" | "EXPT" | "SQRT" | "ISQRT" | "SIGNUM" | "FLOAT"
+            | "ZEROP" | "PLUSP" | "MINUSP" | "ODDP" | "EVENP" | "NUMBERP" | "INTEGERP"
+            | "FLOATP" | "RATIONALP" | "REALP" | "NUMERATOR" | "DENOMINATOR"
+            | "LOGAND" | "LOGIOR" | "LOGXOR" | "LOGNOT" | "ASH" | "LOGBITP" | "BOOLE"
+            | "INTEGER-LENGTH" | "RANDOM" | "EXP" | "LOG" | "SIN" | "COS" | "TAN"
+            // Characters
+            | "CHAR" | "CHAR-CODE" | "CODE-CHAR" | "CHAR-UPCASE" | "CHAR-DOWNCASE"
+            | "CHARACTERP" | "CHAR=" | "CHAR<" | "CHAR>" | "CHAR<=" | "CHAR>=" | "CHAR/="
+            | "ALPHA-CHAR-P" | "DIGIT-CHAR-P" | "ALPHANUMERICP" | "UPPER-CASE-P"
+            | "LOWER-CASE-P" | "CHAR-EQUAL" | "DIGIT-CHAR" | "CHAR-INT"
+            // Strings
+            | "STRING" | "STRING=" | "STRING<" | "STRING>" | "STRING<=" | "STRING>="
+            | "STRING/=" | "STRING-EQUAL" | "STRING-UPCASE" | "STRING-DOWNCASE"
+            | "STRING-CAPITALIZE" | "STRING-TRIM" | "STRING-LEFT-TRIM" | "STRING-RIGHT-TRIM"
+            | "STRINGP" | "CHAR-NAME" | "NAME-CHAR" | "PARSE-INTEGER" | "MAKE-STRING"
+            | "STRING-TO-LIST"
+            // Symbols / packages
+            | "SYMBOLP" | "KEYWORDP" | "SYMBOL-NAME" | "SYMBOL-VALUE" | "SYMBOL-FUNCTION"
+            | "SYMBOL-PACKAGE" | "SYMBOL-PLIST" | "MAKE-SYMBOL" | "GENSYM" | "GENTEMP"
+            | "INTERN" | "FIND-SYMBOL" | "FIND-PACKAGE" | "PACKAGE-NAME" | "PACKAGEP"
+            | "BOUNDP" | "FBOUNDP" | "FDEFINITION" | "MAKUNBOUND" | "FMAKUNBOUND"
+            | "SET" | "FUNCTIONP" | "COMPILED-FUNCTION-P" | "SPECIAL-OPERATOR-P"
+            | "COERCE" | "TYPE-OF" | "TYPEP" | "SUBTYPEP"
+            // Hash tables
+            | "MAKE-HASH-TABLE" | "GETHASH" | "REMHASH" | "CLRHASH" | "MAPHASH"
+            | "HASH-TABLE-COUNT" | "HASH-TABLE-P" | "HASH-TABLE-KEYS" | "HASH-TABLE-VALUES"
+            // Pathnames / files
+            | "PATHNAME" | "NAMESTRING" | "MERGE-PATHNAMES" | "MAKE-PATHNAME"
+            | "PATHNAME-NAME" | "PATHNAME-TYPE" | "PATHNAME-DIRECTORY" | "PATHNAME-HOST"
+            | "PATHNAME-DEVICE" | "PATHNAME-VERSION" | "PATHNAMEP" | "PARSE-NAMESTRING"
+            | "PROBE-FILE" | "TRUENAME" | "DIRECTORY" | "WILD-PATHNAME-P"
+            | "PATHNAME-MATCH-P" | "TRANSLATE-PATHNAME" | "ENSURE-DIRECTORIES-EXIST"
+            | "FILE-NAMESTRING" | "DIRECTORY-NAMESTRING" | "ENOUGH-NAMESTRING"
+            | "COMPILE-FILE" | "COMPILE-FILE-PATHNAME" | "FILE-WRITE-DATE"
+            // I/O
+            | "PRINT" | "PRIN1" | "PRINC" | "WRITE" | "WRITE-STRING" | "WRITE-LINE"
+            | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"
+            | "READ-FROM-STRING" | "FORMAT" | "PRIN1-TO-STRING" | "PRINC-TO-STRING"
+            | "WRITE-TO-STRING" | "FORCE-OUTPUT" | "FINISH-OUTPUT" | "CLEAR-OUTPUT"
+            // Misc
+            | "ERROR" | "WARN" | "SIGNAL" | "CERROR" | "MAKE-CONDITION" | "MUFFLE-WARNING"
+            | "INVOKE-RESTART" | "FIND-RESTART" | "COMPUTE-RESTARTS" | "ABORT" | "CONTINUE"
+            | "CLASS-OF" | "CLASS-NAME" | "FIND-CLASS" | "SLOT-VALUE" | "SLOT-BOUNDP"
+            | "MAKE-INSTANCE" | "COPY-STRUCTURE"
+    )
+}
+
 fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissVal, BlissError> {
     match name {
         "+" => {
@@ -12350,9 +12693,14 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
         let (binding, rest) = cp(c);
         let (type_form, handler_rest) = cp(binding);
         let (handler_form, _) = cp(handler_rest);
+        // Per ANSI, each handler spec is a FORM evaluated (in this lexical
+        // environment) to produce the handler function — e.g. `#'(lambda (c) …)`
+        // must become a closure that captures its surroundings, not the raw
+        // `(FUNCTION (LAMBDA …))` list (which apply cannot call). Evaluate it now.
+        let handler_fn = eval_form(handler_form, env)?;
         entries.push(HandlerEntry {
             type_name: sym_name(type_form),
-            handler: HandlerImpl::Function(handler_form),
+            handler: HandlerImpl::Function(handler_fn),
         });
         c = rest;
     }

@@ -4,7 +4,7 @@
 
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{ObjectHeader, type_id};
-use bliss_rt::value::{BlissVal, NIL, TAG_HEAP_OBJECT};
+use bliss_rt::value::{BlissVal, NIL, T, TAG_HEAP_OBJECT};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -133,6 +133,20 @@ fn lookup_string(val: BlissVal) -> Option<String> {
     with_string_registry(|reg| reg.get(&val.0).cloned())
 }
 
+/// Read a string value that may be either a registry-backed string sentinel or
+/// a real heap string (SIMPLE_BASE_STRING). Pathname component values arrive as
+/// both, depending on whether they were produced by the reader/registry or by
+/// ordinary string operations.
+fn component_string(val: BlissVal) -> Option<String> {
+    lookup_string(val).or_else(|| {
+        if val.is_string() {
+            Some(val.as_string())
+        } else {
+            None
+        }
+    })
+}
+
 pub fn register_string(val: BlissVal, s: &str) {
     with_string_registry(|reg| {
         reg.insert(val.0, s.to_string());
@@ -147,7 +161,24 @@ pub fn registered_string(val: BlissVal) -> Option<String> {
 }
 
 fn is_keyword(val: BlissVal, name: &str) -> bool {
-    val.0 == keyword_hash(name)
+    if val.0 == keyword_hash(name) {
+        return true;
+    }
+    // MAKE-PATHNAME and friends pass *live* interpreter keyword symbols (a real
+    // TAG_SYMBOL named "KEYWORD:<name>") rather than the stdlib's hash sentinel,
+    // so recognize those too — otherwise `:wild`/`:newest` components are treated
+    // as opaque literals and wildcard matching (e.g. `*.asd`) silently fails.
+    // Guard against NIL/T, which report `is_symbol()` but have no symbol-table
+    // index (as_symbol_index would panic). Hash sentinels carry TAG_SYMBOL and
+    // are safe: a bogus index simply resolves to no name.
+    if val.is_symbol() && val != NIL && val != T {
+        if let Some(sym) = bliss_rt::symbols::symbol_name(val.as_symbol_index()) {
+            if let Some(bare) = sym.strip_prefix("KEYWORD:") {
+                return bare.eq_ignore_ascii_case(name);
+            }
+        }
+    }
+    false
 }
 
 fn is_wild(val: BlissVal) -> bool {
@@ -408,7 +439,11 @@ fn component_from_val(val: BlissVal, uppercase: bool) -> Option<ComponentSpec> {
     if is_wild(val) {
         return Some(ComponentSpec::Wild);
     }
-    lookup_string(val).map(|s| {
+    // Accept both registry-backed string sentinels and ordinary heap strings:
+    // a NAME/TYPE component computed by string ops (SUBSEQ, SPLIT-NAME-TYPE, …)
+    // is a real SIMPLE_BASE_STRING that never entered the pathname registry, so
+    // registry-only lookup would silently drop it and render an empty namestring.
+    component_string(val).map(|s| {
         let text = if uppercase { s.to_uppercase() } else { s };
         if text == "*" {
             ComponentSpec::Wild
@@ -993,7 +1028,13 @@ fn pathname_match_with_captures(
     if wildcard.device != NIL && pathname.device != wildcard.device {
         return None;
     }
-    if wildcard.version != NIL && pathname.version != wildcard.version && !is_wild(wildcard.version)
+    // `:wild` matches any version; `:newest` is likewise permissive (bliss's
+    // filesystem model carries no version numbers, and ASDF's `*wild-asd*`
+    // pattern uses `:version :newest`, which must still match `foo.asd`).
+    if wildcard.version != NIL
+        && pathname.version != wildcard.version
+        && !is_wild(wildcard.version)
+        && !is_keyword(wildcard.version, "NEWEST")
     {
         return None;
     }
@@ -1196,6 +1237,24 @@ fn translate_pathname_with_patterns(
     ))
 }
 
+/// TRANSLATE-PATHNAME: rewrite SOURCE (which must match FROM-WILDCARD) into the
+/// shape of TO-WILDCARD, carrying wild-component captures across.
+pub fn translate_pathname(
+    source: BlissVal,
+    from_wildcard: BlissVal,
+    to_wildcard: BlissVal,
+) -> Result<BlissVal, BlissError> {
+    let get = |v: BlissVal| {
+        get_record(v).ok_or(BlissError::TypeError {
+            datum: v,
+            expected: "pathname".to_string(),
+        })
+    };
+    let translated =
+        translate_pathname_with_patterns(&get(source)?, &get(from_wildcard)?, &get(to_wildcard)?)?;
+    Ok(make_record_value(translated))
+}
+
 pub fn translate_logical_pathname(pathname: BlissVal) -> Result<BlissVal, BlissError> {
     let rec = get_record(pathname).ok_or_else(|| BlissError::TypeError {
         datum: pathname,
@@ -1305,7 +1364,15 @@ fn pathname_from_fs_path(path: &Path) -> Result<BlissVal, BlissError> {
     let canon = path
         .canonicalize()
         .map_err(|e| BlissError::FileError(format!("{}: {}", path.display(), e)))?;
-    let canon_str = canon.to_string_lossy().to_string();
+    let mut canon_str = canon.to_string_lossy().to_string();
+    // A directory resolves to a directory pathname (trailing slash) so its final
+    // component lands in the directory list and MERGE-PATHNAMES against it keeps
+    // that component — e.g. (truename ".") must be ".../bliss/", not ".../bliss"
+    // with name "bliss", or ASDF's `(:tree (merge-pathnames "ocicl/" ...))` walks
+    // the wrong directory.
+    if canon.is_dir() && !canon_str.ends_with('/') {
+        canon_str.push('/');
+    }
     let parsed = parse_namestring_model(&canon_str, None)?;
     Ok(make_record_value(build_record_from_namestring(
         parsed, None,

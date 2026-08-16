@@ -84,7 +84,7 @@ pub use pathnames::{
     pathname_directory, pathname_directory_components, PathDirComp,
     pathname_host, pathname_match_p, pathname_name, pathname_type, pathname_version, probe_file,
     register_string, registered_string, rename_file, set_logical_pathname_translations,
-    translate_logical_pathname, truename, wild_pathname_p,
+    translate_logical_pathname, translate_pathname, truename, wild_pathname_p,
 };
 pub use sequences::{
     build_simple_vector, concatenate, copy_seq, count, elt, find, length, map, nreverse, position,
