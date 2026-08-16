@@ -3924,7 +3924,25 @@ extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     // STORAGE-CONDITION instead of a native stack overflow. Non-bytecode callees
     // (builtins, generics, closures, arity mismatches) still go via apply_function.
     let result = match registry_get(sym32) {
-        Some(callee) if callee.arity == n as u16 => run(callee, args, fn_val, env),
+        Some(callee) if callee.arity == n as u16 => {
+            // bliss-x5y.8: if the callee is itself installed as native code and
+            // we are under the native depth cap, call its native entry directly
+            // (native → native) instead of rebuilding a full T0 `run()`
+            // activation on every call. This is the difference between tiering
+            // being a win or a loss for call-heavy code: previously every native
+            // call bounced back into the interpreter. Beyond the cap, fall
+            // through to the flat T0 `run()` so deep recursion stays bounded and
+            // raises a catchable STORAGE-CONDITION rather than a C-stack abort.
+            let native = if NATIVE_DEPTH.with(|d| d.get()) >= native_depth_cap() {
+                None
+            } else {
+                NATIVE_REGISTRY.with(|r| r.borrow().get(&sym32).cloned())
+            };
+            match native {
+                Some(nc) => run_native(&nc, sym32, args, env),
+                None => run(callee, args, fn_val, env),
+            }
+        }
         _ => apply_function(fn_val, args, env),
     };
     match result {
@@ -4134,7 +4152,12 @@ fn run_native(
     let slots = unsafe { frame.add(1) as *mut u64 };
 
     let saved = NATIVE_ENV.with(|e| e.replace(env as *mut Env));
-    NATIVE_ERROR.with(|c| *c.borrow_mut() = None);
+    // NATIVE_ERROR is per-invocation. Native calls now nest directly
+    // (native → c2i → run_native → native, bliss-x5y.8), so save any pending
+    // error from an outer native frame, run with a fresh slot, then restore the
+    // outer's on exit — otherwise a nested call would clobber a first-error-wins
+    // error stashed by an enclosing native function.
+    let saved_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_DEOPT.with(|d| d.set(false));
     // SAFETY: `entry` is installed executable code from emit_native_x86 with the
     // SysV signature `fn(*mut u64) -> u64`, reading its activation from `slots`.
@@ -4143,7 +4166,9 @@ fn run_native(
     NATIVE_ENV.with(|e| e.set(saved));
 
     stack.pop_frame();
-    if let Some(err) = NATIVE_ERROR.with(|c| c.borrow_mut().take()) {
+    let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
+    NATIVE_ERROR.with(|c| *c.borrow_mut() = saved_err);
+    if let Some(err) = my_err {
         return Err(err);
     }
     // Deoptimization (bliss-jtc.27): a speculative guard failed. The native code
