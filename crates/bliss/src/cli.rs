@@ -560,10 +560,15 @@ struct Env {
     /// visible globally, matching how DEFUN installs into the symbol cell.
     setf_expanders: Rc<RefCell<HashMap<String, SetfExpander>>>,
     symbol_macros: Rc<HashMap<u32, BlissVal>>,
-    classes: Rc<HashMap<String, ClassDef>>,
-    generics: Rc<HashMap<String, GenericDef>>,
-    methods: Rc<HashMap<String, Vec<MethodDef>>>,
-    packages: Rc<HashMap<String, PackageDef>>,
+    // These four are GLOBAL definitions (packages, classes, generic functions,
+    // methods): shared and mutated in place so a definition made inside a child
+    // Env (a FLET/MACROLET body, as when ASDF loads a system's files) is visible
+    // everywhere, matching CL semantics (bliss-lb6.22). Only `funs`/`macros` are
+    // genuinely lexical (FLET/MACROLET locals) and stay per-Env copy-on-write.
+    classes: Rc<RefCell<HashMap<String, ClassDef>>>,
+    generics: Rc<RefCell<HashMap<String, GenericDef>>>,
+    methods: Rc<RefCell<HashMap<String, Vec<MethodDef>>>>,
+    packages: Rc<RefCell<HashMap<String, PackageDef>>>,
     current_package: String,
     sandbox: bool,
     restarts: Vec<RestartEntry>,
@@ -1326,10 +1331,10 @@ fn class_name_for_instance_class(class: BlissVal) -> String {
     }
 }
 
-fn lookup_slot_def<'a>(env: &'a Env, class_name: &str, slot_name: &str) -> Option<&'a SlotDef> {
-    let class_def = env.classes.get(class_name)?;
+fn lookup_slot_def(env: &Env, class_name: &str, slot_name: &str) -> Option<SlotDef> {
+    let class_def = env.classes.borrow().get(class_name).cloned()?;
     if let Some(slot) = class_def.slots.iter().find(|slot| slot.name == slot_name) {
-        return Some(slot);
+        return Some(slot.clone());
     }
     for super_name in &class_def.supers {
         if let Some(slot) = lookup_slot_def(env, super_name, slot_name) {
@@ -1339,12 +1344,12 @@ fn lookup_slot_def<'a>(env: &'a Env, class_name: &str, slot_name: &str) -> Optio
     None
 }
 
-fn lookup_slot_by_initarg<'a>(env: &'a Env, class_name: &str, initarg: &str) -> Option<&'a SlotDef> {
-    let class_def = env.classes.get(class_name)?;
+fn lookup_slot_by_initarg(env: &Env, class_name: &str, initarg: &str) -> Option<SlotDef> {
+    let class_def = env.classes.borrow().get(class_name).cloned()?;
     if let Some(slot) = class_def.slots.iter().find(|slot| {
         slot.initargs.iter().any(|slot_initarg| slot_initarg == initarg) || slot.name == initarg
     }) {
-        return Some(slot);
+        return Some(slot.clone());
     }
     for super_name in &class_def.supers {
         if let Some(slot) = lookup_slot_by_initarg(env, super_name, initarg) {
@@ -1381,7 +1386,7 @@ fn split_initargs_for_class(
 }
 
 fn write_class_slot_value(env: &Env, class_name: &str, slot_name: &str, value: Option<BlissVal>) {
-    if let Some(class_def) = env.classes.get(class_name) {
+    if let Some(class_def) = env.classes.borrow().get(class_name).cloned() {
         class_def
             .class_slot_values
             .lock()
@@ -1408,7 +1413,7 @@ fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<Stri
         if !seen.insert(class_name.to_string()) {
             return None;
         }
-        let cd = env.classes.get(class_name)?;
+        let cd = env.classes.borrow().get(class_name).cloned()?;
         // Slot names are stored as the full symbol name (possibly package-
         // qualified); compare bare-to-bare since `slot_name` is already bare.
         if let Some(slot) = cd
@@ -1427,7 +1432,7 @@ fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<Stri
     }
     let mut seen = HashSet::new();
     walk(env, class_name, slot_name, &mut seen).or_else(|| {
-        env.classes.iter().find_map(|(name, cd)| {
+        env.classes.borrow().iter().find_map(|(name, cd)| {
             cd.slots
                 .iter()
                 .any(|s| symbol_bare_name(&s.name) == slot_name && s.allocation == SlotAllocation::Class)
@@ -1443,7 +1448,7 @@ fn read_slot_value(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<Blis
         // The shared value is stored in the instance's class under the slot's
         // full (as-declared) name — see instance initialization below.
         let key = sym_name(slot);
-        if let Some(class_def) = env.classes.get(&class_name) {
+        if let Some(class_def) = env.classes.borrow().get(&class_name).cloned() {
             let values = class_def.class_slot_values.lock().unwrap();
             if let Some(Some(value)) = values.get(&key).or_else(|| values.get(&slot_name)) {
                 return Ok(*value);
@@ -1497,7 +1502,7 @@ fn slot_is_bound(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<bool, 
     let slot_name = symbol_bare_name(&sym_name(slot));
     if class_slot_owner(env, &class_name, &slot_name).is_some() {
         let key = sym_name(slot);
-        if let Some(class_def) = env.classes.get(&class_name) {
+        if let Some(class_def) = env.classes.borrow().get(&class_name).cloned() {
             let values = class_def.class_slot_values.lock().unwrap();
             return Ok(matches!(
                 values.get(&key).or_else(|| values.get(&slot_name)),
@@ -1537,7 +1542,7 @@ fn class_precedence_names(env: &Env, class_name: &str) -> Vec<String> {
             return;
         }
         order.push(name.to_string());
-        if let Some(class_def) = env.classes.get(name) {
+        if let Some(class_def) = env.classes.borrow().get(name).cloned() {
             for super_name in &class_def.supers {
                 visit(env, super_name, order, seen);
             }
@@ -1557,7 +1562,7 @@ fn effective_slots_for_class(env: &Env, class_name: &str) -> Vec<SlotDef> {
     let mut result: Vec<SlotDef> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for cname in class_precedence_names(env, class_name) {
-        let Some(class_def) = env.classes.get(&cname) else {
+        let Some(class_def) = env.classes.borrow().get(&cname).cloned() else {
             continue;
         };
         for slot in &class_def.slots {
@@ -1588,6 +1593,7 @@ fn apply_class_initforms(
     let effective = effective_slots_for_class(env, class_name);
     let class_slot_values = env
         .classes
+        .borrow()
         .get(class_name)
         .map(|class_def| Arc::clone(&class_def.class_slot_values));
     for slot in &effective {
@@ -1977,7 +1983,7 @@ fn run_initialization_aux_methods(
     args: &[BlissVal],
     qualifier: bliss_stdlib::MethodQualifier,
 ) -> Result<(), BlissError> {
-    let methods = match env.methods.get(gf_name) {
+    let methods = match env.methods.borrow().get(gf_name).cloned() {
         Some(methods) if !methods.is_empty() => methods.clone(),
         _ => return Ok(()),
     };
@@ -2002,6 +2008,7 @@ fn run_initialization_aux_methods(
 /// True if the generic `name` has at least one method applicable to `args`.
 fn has_applicable_method(env: &Env, name: &str, args: &[BlissVal]) -> bool {
     env.methods
+        .borrow()
         .get(name)
         .map(|methods| {
             methods
@@ -2016,7 +2023,7 @@ fn invoke_generic_function(
     args: &[BlissVal],
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
-    let methods = env.methods.get(name).cloned().unwrap_or_default();
+    let methods = env.methods.borrow().get(name).cloned().unwrap_or_default();
     if methods.is_empty() {
         return Err(no_applicable_method_error(env, name));
     }
@@ -2042,6 +2049,7 @@ fn invoke_generic_function(
 
     let combination = env
         .generics
+        .borrow()
         .get(name)
         .map(|generic| generic.combination)
         .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
@@ -2133,10 +2141,10 @@ impl Env {
             macros: Rc::new(HashMap::new()),
             setf_expanders: Rc::new(RefCell::new(HashMap::new())),
             symbol_macros: Rc::new(HashMap::new()),
-            classes: Rc::new(HashMap::new()),
-            generics: Rc::new(HashMap::new()),
-            methods: Rc::new(HashMap::new()),
-            packages: Rc::new(packages),
+            classes: Rc::new(RefCell::new(HashMap::new())),
+            generics: Rc::new(RefCell::new(HashMap::new())),
+            methods: Rc::new(RefCell::new(HashMap::new())),
+            packages: Rc::new(RefCell::new(packages)),
             current_package: "COMMON-LISP-USER".to_string(),
             sandbox,
             restarts: Vec::new(),
@@ -3634,7 +3642,7 @@ fn home_package_of_name(name: &str) -> String {
 /// over COMMON-LISP from fabricating membership and breaking package algorithms
 /// like UIOP's DEFINE-PACKAGE (which compares symbol home packages).
 fn name_owned_by_noncl_package(env: &Env, bare_name: &str) -> bool {
-    for (pkg_name, pkg) in env.packages.iter() {
+    for (pkg_name, pkg) in env.packages.borrow().iter() {
         if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
             continue;
         }
@@ -3662,10 +3670,10 @@ fn resolve_package_name(env: &Env, raw: &str) -> String {
     if let Some(canonical) = builtin {
         return canonical.to_string();
     }
-    if env.packages.contains_key(&normalized) {
+    if env.packages.borrow().contains_key(&normalized) {
         return normalized;
     }
-    for (canonical, def) in env.packages.iter() {
+    for (canonical, def) in env.packages.borrow().iter() {
         if def.nicknames.iter().any(|nick| nick == &normalized) {
             return canonical.clone();
         }
@@ -3750,7 +3758,7 @@ fn intern_into_package(env: &mut Env, pkg_name: &str, bare_name: &str) -> BlissV
         let pkg = bliss_rt::packages::find_or_create(&pkg_name);
         bliss_rt::symbols::set_symbol_package(sym.as_symbol_index(), pkg);
     }
-    Rc::make_mut(&mut env.packages)
+    env.packages.borrow_mut()
         .get_mut(&pkg_name)
         .expect("package exists")
         .symbols
@@ -3805,7 +3813,7 @@ fn find_symbol_in_package_rec(
             return Some((sym, "EXTERNAL"));
         }
     }
-    let package = env.packages.get(&pkg_name)?;
+    let package = env.packages.borrow().get(&pkg_name).cloned()?;
     if let Some(sym) = package.symbols.get(bare_upper) {
         let status = if package.exports.iter().any(|name| name == bare_upper) {
             "EXTERNAL"
@@ -3823,7 +3831,7 @@ fn find_symbol_in_package_rec(
 }
 
 fn ensure_package_available(env: &mut Env, name: &str, uses: &[&str]) {
-    let packages = Rc::make_mut(&mut env.packages);
+    let mut packages = env.packages.borrow_mut();
     packages
         .entry(name.to_string())
         .or_insert_with(|| PackageDef {
@@ -4145,7 +4153,7 @@ fn is_package_value(env: &Env, value: BlissVal) -> bool {
         return false;
     }
     let pkg_name = normalize_package_name(&val_as_str(value));
-    env.packages.contains_key(&pkg_name)
+    env.packages.borrow().contains_key(&pkg_name)
         || matches!(
             pkg_name.as_str(),
             "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD" | "BLISS-EXT"
@@ -4395,7 +4403,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                         return Ok(false);
                     };
                 let pkg_name = normalize_package_name(&designator);
-                return Ok(env.packages.contains_key(&pkg_name)
+                return Ok(env.packages.borrow().contains_key(&pkg_name)
                     || matches!(
                         pkg_name.as_str(),
                         "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD" | "BLISS-EXT"
@@ -4439,7 +4447,7 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
             }
         }
     }
-    if let Some(pkg) = env.packages.get(&package_name) {
+    if let Some(pkg) = env.packages.borrow().get(&package_name).cloned() {
         for (name, sym) in &pkg.symbols {
             seen.entry(name.clone()).or_insert(*sym);
         }
@@ -4727,8 +4735,8 @@ fn mv_form_preserves_values(name: &str, env: &Env) -> bool {
     let bare = name.rsplit(':').next().unwrap_or(name);
     if fn_bound(env, name)
         || macro_defined(env, name)
-        || env.generics.contains_key(name)
-        || env.methods.contains_key(name)
+        || env.generics.borrow().contains_key(name)
+        || env.methods.borrow().contains_key(name)
         || fn_bound(env, bare)
     {
         return true;
@@ -5632,8 +5640,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         return Ok(f);
                     }
                     if fn_bound(env, &n)
-                        || env.methods.contains_key(&n)
-                        || env.generics.contains_key(&n)
+                        || env.methods.borrow().contains_key(&n)
+                        || env.generics.borrow().contains_key(&n)
                         || macro_defined(env, &n)
                         || is_builtin_function(&symbol_bare_name(&n))
                     {
@@ -5654,8 +5662,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // A name is fbound if it resolves as an ordinary function,
                 // a generic function, or a macro.
                 let bound = fn_bound(env, &name)
-                    || env.methods.contains_key(&name)
-                    || env.generics.contains_key(&name)
+                    || env.methods.borrow().contains_key(&name)
+                    || env.generics.borrow().contains_key(&name)
                     || macro_defined(env, &name)
                     || is_builtin_function(&symbol_bare_name(&name));
                 return Ok(if bound { T } else { NIL });
@@ -6056,7 +6064,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 // returns the assigned value.
                             }
                             other => {
-                                let reader_slot = env.classes.values().find_map(|class| {
+                                let reader_slot = env.classes.borrow().values().find_map(|class| {
                                     class.slots.iter().find_map(|slot| {
                                         let matches_reader = slot
                                             .accessor
@@ -6103,7 +6111,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     )?;
                                 } else if {
                                     let key = format!("(SETF {})", other);
-                                    env.methods.contains_key(&key) || env.generics.contains_key(&key)
+                                    env.methods.borrow().contains_key(&key) || env.generics.borrow().contains_key(&key)
                                 } {
                                     // A (setf place) *generic function* (defmethod
                                     // (setf place) …): dispatch it with the new
@@ -7955,7 +7963,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let use_refs: Vec<&str> = uses.iter().map(String::as_str).collect();
                 ensure_package_available(env, &pkg_name, &use_refs);
                 if !nicknames.is_empty() {
-                    if let Some(def) = Rc::make_mut(&mut env.packages).get_mut(&pkg_name) {
+                    if let Some(def) = env.packages.borrow_mut().get_mut(&pkg_name) {
                         for nick in nicknames {
                             // Register the nickname with the reader too, so a
                             // package-qualified symbol written with the nickname
@@ -7978,7 +7986,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let raw = val_as_str(eval_form(args[0], env)?);
                 let pkg_name = resolve_package_name(env, &raw);
                 return Ok(
-                    if env.packages.contains_key(&pkg_name)
+                    if env.packages.borrow().contains_key(&pkg_name)
                         || matches!(
                             pkg_name.as_str(),
                             "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
@@ -8027,6 +8035,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pkg_name = resolve_package_name(env, &raw);
                 let nicks: Vec<BlissVal> = env
                     .packages
+                    .borrow()
                     .get(&pkg_name)
                     .map(|def| def.nicknames.iter().map(|n| arena_str(n)).collect())
                     .unwrap_or_default();
@@ -8043,6 +8052,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
                 let uses = env
                     .packages
+                    .borrow()
                     .get(&pkg_name)
                     .map(|pkg| {
                         pkg.uses
@@ -8056,7 +8066,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "LIST-ALL-PACKAGES" => {
                 let packages = env
                     .packages
-                    .keys()
+                    .borrow().keys()
                     .map(|name| arena_str(name))
                     .collect::<Vec<_>>();
                 return Ok(vec_to_list(&packages));
@@ -8099,9 +8109,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     env.current_package.clone()
                 };
                 ensure_package_available(env, &target, &[]);
-                let package = Rc::make_mut(&mut env.packages)
-                    .get_mut(&target)
-                    .expect("package exists");
+                let mut __pkgs = env.packages.borrow_mut();
+                    let package = __pkgs.get_mut(&target).expect("package exists");
                 for name in names {
                     if !package.uses.contains(&name) {
                         package.uses.push(name);
@@ -8119,9 +8128,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let old_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
                 let new_name = normalize_package_name(&val_as_str(eval_form(args[1], env)?));
-                if let Some(mut pkg) = Rc::make_mut(&mut env.packages).remove(&old_name) {
+                let removed = env.packages.borrow_mut().remove(&old_name);
+                if let Some(mut pkg) = removed {
                     pkg.name = new_name.clone();
-                    Rc::make_mut(&mut env.packages).insert(new_name.clone(), pkg);
+                    env.packages.borrow_mut().insert(new_name.clone(), pkg);
                 }
                 reader::register_package(&new_name);
                 return Ok(arena_str(&new_name));
@@ -8132,7 +8142,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Ok(T);
                 }
                 let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
-                Rc::make_mut(&mut env.packages).remove(&pkg_name);
+                env.packages.borrow_mut().remove(&pkg_name);
                 return Ok(T);
             }
             "INTERN" => {
@@ -8209,9 +8219,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     };
                     resolved.push((name, sym));
                 }
-                let package = Rc::make_mut(&mut env.packages)
-                    .get_mut(&pkg_name)
-                    .expect("package exists");
+                let mut __pkgs = env.packages.borrow_mut();
+                    let package = __pkgs.get_mut(&pkg_name).expect("package exists");
                 for (name, sym) in resolved {
                     package.symbols.insert(name.clone(), sym);
                     if export_mode && !package.exports.contains(&name) {
@@ -8258,7 +8267,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     env.current_package.clone()
                 };
                 let name = symbol_bare_name(&val_as_str(symbol));
-                let Some(package) = Rc::make_mut(&mut env.packages).get_mut(&pkg_name) else {
+                let mut __pkgs = env.packages.borrow_mut();
+                let Some(package) = __pkgs.get_mut(&pkg_name) else {
                     return Ok(NIL);
                 };
                 let removed_symbol = package.symbols.remove(&name).is_some();
@@ -8471,7 +8481,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         // defining-package spelling (bliss-lb6.14).
         let mut accessor_slot_name: Option<String> = None;
         let bare_op = symbol_bare_name(&name);
-        for class in env.classes.values() {
+        for class in env.classes.borrow().values() {
             for slot in &class.slots {
                 let reader_match = slot
                     .accessor
@@ -8503,7 +8513,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
 
         // Check methods
-        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
+        if env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name) {
             let mut args = Vec::new();
             let mut c = cdr;
             while c.is_cons() {
@@ -10898,39 +10908,6 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 // evaluate the body there; because named functions in this evaluator resolve
 // their names through the current environment's function table at call time,
 // LABELS-style mutual recursion works naturally, and FLET-bound functions are
-/// Propagate GLOBAL definitions made inside a child Env (FLET/LABELS/MACROLET/
-/// SYMBOL-MACROLET body) back to the parent. Those constructs fork a whole Env to
-/// scope their *local* funs/macros, but a DEFPACKAGE/DEFCLASS/DEFGENERIC/DEFMETHOD
-/// evaluated in the body is a global definition and must survive — ASDF loads a
-/// system's files inside such forms, so its DEFPACKAGE would otherwise be lost
-/// (bliss-lb6.22). Local funs/macros are intentionally NOT merged.
-fn merge_global_defs(parent: &mut Env, child: &Env) {
-    if !Rc::ptr_eq(&parent.packages, &child.packages) {
-        let p = Rc::make_mut(&mut parent.packages);
-        for (k, v) in child.packages.iter() {
-            p.insert(k.clone(), v.clone());
-        }
-    }
-    if !Rc::ptr_eq(&parent.classes, &child.classes) {
-        let p = Rc::make_mut(&mut parent.classes);
-        for (k, v) in child.classes.iter() {
-            p.insert(k.clone(), v.clone());
-        }
-    }
-    if !Rc::ptr_eq(&parent.generics, &child.generics) {
-        let p = Rc::make_mut(&mut parent.generics);
-        for (k, v) in child.generics.iter() {
-            p.insert(k.clone(), v.clone());
-        }
-    }
-    if !Rc::ptr_eq(&parent.methods, &child.methods) {
-        let p = Rc::make_mut(&mut parent.methods);
-        for (k, v) in child.methods.iter() {
-            p.insert(k.clone(), v.clone());
-        }
-    }
-}
-
 // visible only within the FLET/LABELS body.
 fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (defs_form, body) = cp(cdr);
@@ -10954,9 +10931,7 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
         c = rest;
     }
-    let __r = eval_progn(body, &mut child_env);
-    merge_global_defs(env, &child_env);
-    __r
+    eval_progn(body, &mut child_env)
 }
 
 // ── Extract parameter names from a lambda list ──────────────────
@@ -11870,9 +11845,9 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
     // lexical frame rather than share the live Rc chain. See FrozenEnvFrame.
     let captured_frame = freeze_env_frame(&env.frame);
     let funs = (*env.funs).clone();
-    let classes = (*env.classes).clone();
-    let methods = (*env.methods).clone();
-    let packages = (*env.packages).clone();
+    let classes = env.classes.borrow().clone();
+    let methods = env.methods.borrow().clone();
+    let packages = env.packages.borrow().clone();
     let current_package = env.current_package.clone();
     let sandbox = env.sandbox;
     let symbol_macros = (*env.symbol_macros).clone();
@@ -11887,9 +11862,9 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
             macro_env.funs = Rc::new(funs.clone());
             macro_env.macros = Rc::new(HashMap::new());
             macro_env.symbol_macros = Rc::new(symbol_macros.clone());
-            macro_env.classes = Rc::new(classes.clone());
-            macro_env.methods = Rc::new(methods.clone());
-            macro_env.packages = Rc::new(packages.clone());
+            macro_env.classes = Rc::new(RefCell::new(classes.clone()));
+            macro_env.methods = Rc::new(RefCell::new(methods.clone()));
+            macro_env.packages = Rc::new(RefCell::new(packages.clone()));
             macro_env.current_package = current_package.clone();
             macro_env.eval_context = eval_context;
             bind_macro_lambda_list(
@@ -12267,9 +12242,7 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             },
         );
     }
-    let __r = eval_progn(body, &mut child_env);
-    merge_global_defs(env, &child_env);
-    __r
+    eval_progn(body, &mut child_env)
 }
 
 fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -12286,9 +12259,7 @@ fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
         let (expansion, _) = cp(expansion_rest);
         child_env.define_symbol_macro(symbol, expansion);
     }
-    let __r = eval_progn(body, &mut child_env);
-    merge_global_defs(env, &child_env);
-    __r
+    eval_progn(body, &mut child_env)
 }
 
 // ── DEFCLASS ─────────────────────────────────────────────────────
@@ -12420,7 +12391,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
     }
 
-    Rc::make_mut(&mut env.classes).insert(
+    env.classes.borrow_mut().insert(
         name.clone(),
         ClassDef {
             name: name.clone(),
@@ -12435,7 +12406,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         .collect();
     // Only :instance-allocated slots get an inline cell in the heap-object
     // instance layout; :class-allocated slots live in ClassDef.class_slot_values.
-    let slot_names: Vec<BlissVal> = env.classes[&name]
+    let slot_names: Vec<BlissVal> = env.classes.borrow()[&name]
         .slots
         .iter()
         .filter(|slot| slot.allocation == SlotAllocation::Instance)
@@ -12586,14 +12557,14 @@ fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         opts = rest;
     }
     let generic_function = bliss_stdlib::make_generic_function(name_form, NIL)?;
-    Rc::make_mut(&mut env.generics).insert(
+    env.generics.borrow_mut().insert(
         name.clone(),
         GenericDef {
             generic_function,
             combination,
         },
     );
-    Rc::make_mut(&mut env.methods).entry(name).or_default();
+    env.methods.borrow_mut().entry(name).or_default();
 
     // Register each :method option by delegating to DEFMETHOD: the option tail
     // `(qualifier* specialized-lambda-list body...)` is exactly a DEFMETHOD cdr
@@ -12613,6 +12584,7 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     let name = function_name_key(name_form);
     let combination = env
         .generics
+        .borrow()
         .get(&name)
         .map(|generic| generic.combination)
         .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
@@ -12691,11 +12663,11 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     }
     let lambda_list = vec_to_list(&plain_params);
 
-    let generic_function = if let Some(generic) = env.generics.get(&name) {
+    let generic_function = if let Some(generic) = env.generics.borrow().get(&name).cloned() {
         generic.generic_function
     } else {
         let gf = bliss_stdlib::make_generic_function(name_form, NIL)?;
-        Rc::make_mut(&mut env.generics).insert(
+        env.generics.borrow_mut().insert(
             name.clone(),
             GenericDef {
                 generic_function: gf,
@@ -12707,7 +12679,7 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     bliss_stdlib::clos::add_method(generic_function, method_id)?;
     bliss_stdlib::set_method_specializers(method_id, vec![], qualifier);
 
-    Rc::make_mut(&mut env.methods)
+    env.methods.borrow_mut()
         .entry(name.clone())
         .or_default()
         .push(MethodDef {
@@ -12778,7 +12750,7 @@ fn apply_function(
         if let Some((params_form, body)) = callable_body(env, &name) {
             return eval_lambda_call(env, params_form, body, args, Rc::clone(&env.frame));
         }
-        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
+        if env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name) {
             return invoke_generic_function(&name, args, env);
         }
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
@@ -13524,7 +13496,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     for v in list_to_vec(val_list) {
                         let from = resolve_package_name(env, &val_as_str(v));
                         uses.push(from.clone());
-                        if let Some(pkg) = env.packages.get(&from) {
+                        if let Some(pkg) = env.packages.borrow().get(&from).cloned() {
                             exports.extend(pkg.exports.iter().cloned());
                         }
                     }
@@ -13566,7 +13538,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     for nick in &nicknames {
         reader::register_package(nick);
     }
-    Rc::make_mut(&mut env.packages).insert(
+    env.packages.borrow_mut().insert(
         pkg_name.clone(),
         PackageDef {
             name: pkg_name.clone(),
@@ -13583,7 +13555,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         let found = find_symbol_in_package(env, from, sym_name_str).map(|(sym, _)| sym);
         match found {
             Some(sym) => {
-                if let Some(def) = Rc::make_mut(&mut env.packages).get_mut(&pkg_name) {
+                if let Some(def) = env.packages.borrow_mut().get_mut(&pkg_name) {
                     def.symbols.insert(sym_name_str.clone(), sym);
                 }
             }
@@ -13605,6 +13577,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     for name in &exports {
         let already = env
             .packages
+            .borrow()
             .get(&pkg_name)
             .map(|def| def.symbols.contains_key(name))
             .unwrap_or(false);
@@ -13612,7 +13585,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             let existing = find_symbol_in_package(env, &pkg_name, name).map(|(s, _)| s);
             match existing {
                 Some(sym) => {
-                    if let Some(def) = Rc::make_mut(&mut env.packages).get_mut(&pkg_name) {
+                    if let Some(def) = env.packages.borrow_mut().get_mut(&pkg_name) {
                         def.symbols.insert(name.clone(), sym);
                     }
                 }
