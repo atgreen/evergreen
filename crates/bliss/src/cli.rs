@@ -491,6 +491,21 @@ fn global_fn(name: &str) -> Option<BlissVal> {
     bliss_rt::function::is_interpreted_function(cell).then_some(cell)
 }
 
+/// Resolve a function designator to its tiered function object (FnMeta), for the
+/// bliss-jtc.10 profiling-introspection builtins. Accepts an interpreted-function
+/// object directly (`#'foo`) or a symbol naming a global function (`'foo`).
+/// Returns `None` for builtins, generics, macros, and lexical functions, which
+/// carry no tiered FnMeta record.
+fn resolve_tiered_fn(val: BlissVal) -> Option<BlissVal> {
+    if bliss_rt::function::is_interpreted_function(val) {
+        return Some(val);
+    }
+    if val.is_symbol() {
+        return global_fn(&sym_name(val));
+    }
+    None
+}
+
 /// True if `name` names a function — lexically (FLET/LABELS or `(setf f)` in
 /// `Env.funs`) or globally (a bound function cell).
 fn fn_bound(env: &Env, name: &str) -> bool {
@@ -7839,6 +7854,33 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(std::env::var(&name)
                     .ok()
                     .map(|value| arena_str(&value))
+                    .unwrap_or(NIL));
+            }
+            // bliss-jtc.10: Lisp-visible tiering introspection. These make the
+            // hotspot engine observable through the real binary — a test (or a
+            // user) can watch a hot loop's counters climb and its tier promote,
+            // then confirm results are identical across tiers (the S5 gate).
+            // Each takes a function designator (a symbol or #'fn) and returns a
+            // fixnum; an unrecognised / non-tiered designator yields NIL.
+            "BLISS-EXT:FUNCTION-TIER" => {
+                let (f_form, _) = cp(cdr);
+                let d = eval_form(f_form, env)?;
+                return Ok(resolve_tiered_fn(d)
+                    .map(|f| BlissVal::from_fixnum(bliss_rt::function::tier(f) as i64))
+                    .unwrap_or(NIL));
+            }
+            "BLISS-EXT:FUNCTION-INVOKE-COUNT" => {
+                let (f_form, _) = cp(cdr);
+                let d = eval_form(f_form, env)?;
+                return Ok(resolve_tiered_fn(d)
+                    .map(|f| BlissVal::from_fixnum(bliss_rt::function::invoke_count(f) as i64))
+                    .unwrap_or(NIL));
+            }
+            "BLISS-EXT:FUNCTION-BACK-EDGE-COUNT" => {
+                let (f_form, _) = cp(cdr);
+                let d = eval_form(f_form, env)?;
+                return Ok(resolve_tiered_fn(d)
+                    .map(|f| BlissVal::from_fixnum(bliss_rt::function::back_edge_count(f) as i64))
                     .unwrap_or(NIL));
             }
             "BLISS-EXT:GETCWD" => {
