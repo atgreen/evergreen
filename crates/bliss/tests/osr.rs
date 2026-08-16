@@ -1,11 +1,14 @@
-//! On-stack replacement (OSR) differential tests (bliss-izt.1).
+//! On-stack replacement (OSR) differential tests (bliss-izt.1/izt.2).
 //!
 //! A function that is one long-running loop is promoted into native T1 code
 //! *mid-execution* — without ever returning and being re-called — once its
-//! back-edge count crosses `BLISS_OSR_THRESHOLD`. The invariant: entering the
-//! native loop from the live interpreter frame produces exactly what pure
-//! interpretation produces. Each case forces a tiny threshold so OSR fires
-//! early, and asserts stdout matches the tree-walker byte for byte.
+//! back-edge count crosses `BLISS_OSR_THRESHOLD`. OSR now speculates: it inlines
+//! fixnum arithmetic and, when a guard fails mid-loop, state-transfer deopt
+//! (bliss-izt.2) resumes the interpreter at that exact bytecode position on the
+//! live frame. The invariant across all of it: entering (and, on a guard
+//! failure, leaving) the native loop from the live interpreter frame produces
+//! exactly what pure interpretation produces. Each case forces a tiny threshold
+//! so OSR fires early, and asserts stdout matches the tree-walker byte for byte.
 
 use std::process::Command;
 
@@ -47,13 +50,23 @@ fn osr_matches_interpretation_across_loop_shapes() {
         // dotimes (lowers to block/let/tagbody/go) with a result form.
         "(defun f (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s (* i i)))))) \
          (format t \"~a~%\" (f 3000))",
-        // The running sum overflows fixnum range into a bignum mid-loop: the
-        // non-speculating OSR code must promote via c2i exactly like the
-        // interpreter (result printed mod a fixnum so both print a small int).
+        // A multiply-heavy hot loop promoted through speculating OSR (bliss-izt.2
+        // inlines the fixnum `*`/`+`); the running sum stays in fixnum range, so
+        // it runs entirely native. Result printed mod a fixnum.
         "(defun bigsum (n) (let ((s 0) (i 1)) \
            (block d (tagbody top (when (> i n) (return-from d (mod s 1000000007))) \
              (setq s (+ s (* i i i))) (setq i (+ i 1)) (go top))))) \
          (format t \"~a~%\" (bigsum 4000))",
+        // Overflow AFTER OSR fires (bliss-izt.2): with threshold 50 the loop is
+        // promoted to speculating native at iteration 50, then `s` overflows the
+        // fixnum range around iteration ~115. Each overflow makes the inlined `+`
+        // guard fail and state-transfer deopt resumes T0 mid-loop at that exact
+        // `CallNamed`, finishing in bignum arithmetic — the value must still match
+        // the tree-walker. Exercises the OsrOutcome::Deopt resume path directly.
+        "(defun ov (n) (let ((s 0) (i 0)) \
+           (block d (tagbody top (when (>= i n) (return-from d (mod s 1000000007))) \
+             (setq s (+ s 10000000000000000)) (setq i (+ i 1)) (go top))))) \
+         (format t \"~a~%\" (ov 200))",
         // Loop that builds a heap list via CONS (c2i allocation inside native).
         "(defun rng (n) (let ((acc nil) (i 0)) \
            (block d (tagbody top (when (>= i n) (return-from d acc)) \
@@ -78,6 +91,28 @@ fn osr_matches_interpretation_across_loop_shapes() {
              (setq i (+ i 1)) (go io))) \
            s)) \
          (format t \"~a~%\" (mul 200 200))",
+        // Single-float accumulator (bliss-izt.3): the SECOND speculation. `s` is
+        // an immediate single-float, so the fixnum guard on `(+ s ...)` / `(* ...)`
+        // / `(- ...)` fails and the inlined single-float path runs — WITHOUT
+        // deopting — while the fixnum index `i` and the `(>= i n)` test take the
+        // fixnum path. All three float ops (addss/subss/mulss) execute native, and
+        // f32 rounding must match the interpreter's f32 arithmetic bit for bit.
+        "(defun fops (n) (let ((s 0.0) (i 0)) \
+           (block d (tagbody top (when (>= i n) (return-from d s)) \
+             (setq s (+ s 2.0)) (setq s (* s 1.001)) (setq s (- s 0.5)) \
+             (setq i (+ i 1)) (go top))))) \
+         (format t \"~a~%\" (fops 3000))",
+        // Both float-fast and the single-float guard's deopt fallback in one
+        // loop, all through deopt-safe primitives so speculation stays on:
+        // `(+ i 0.5)` mixes a fixnum with a single-float, so BOTH the fixnum and
+        // the single-float guard miss and it deopts to T0 (fixnum⊕float ⇒
+        // single-float by contagion); `(+ s <that>)` then takes the native
+        // single-float path. The interleaved deopt must still land on the exact
+        // interpreted value.
+        "(defun fmix (n) (let ((s 0.0) (i 0)) \
+           (block d (tagbody top (when (>= i n) (return-from d s)) \
+             (setq s (+ s (+ i 0.5))) (setq i (+ i 1)) (go top))))) \
+         (format t \"~a~%\" (fmix 400))",
     ];
     for c in cases {
         assert_osr_matches(c);

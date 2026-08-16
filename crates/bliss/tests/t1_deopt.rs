@@ -3,11 +3,13 @@
 //! result."
 //!
 //! Pure functions promote to T1 with inlined fixnum arithmetic (+ - * and the
-//! comparisons), guarded on fixnum operands and no overflow. When a guard fails
-//! — a float/ratio/bignum operand, or a result that overflows the 61-bit fixnum
-//! range — the native code deoptimizes and the interpreter re-runs the call,
-//! producing the value the tree-walker would. These tests drive the shipping
-//! binary and compare against pure interpretation.
+//! comparisons), guarded on fixnum operands and no overflow. Binary + - * also
+//! have a native single-float fast path (bliss-izt.3), so single-float operands
+//! run native rather than deopting. When neither guard applies — a ratio/bignum
+//! operand, a fixnum⊕float mix, a float comparison, or a result that overflows
+//! the 61-bit fixnum range — the native code deoptimizes and the interpreter
+//! re-runs the call, producing the value the tree-walker would. These tests
+//! drive the shipping binary and compare against pure interpretation.
 
 use std::process::Command;
 
@@ -162,14 +164,18 @@ fn overflow_deoptimizes_to_correct_bignum() {
     }
 }
 
-/// Non-fixnum operands (float, ratio) fail the type guard and deoptimize to the
-/// interpreter's generic arithmetic, still correct.
+/// Operands outside the fixnum/single-float fast paths (ratio, fixnum⊕float mix,
+/// float comparison) fall back to the interpreter's generic arithmetic, still
+/// correct. (A pure single-float `*`/`+`/`-` instead runs native — see
+/// `hot_single_float_loop_no_deopt`.)
 #[test]
 fn non_fixnum_operands_deoptimize() {
     let cases = &[
+        // pure single-float `+`/`*`: native fast path, result still correct.
         "(defun g (a b) (+ (* a a) (* b b))) (g 1 1) (format t \"~a~%\" (g 1.5 2.0))",
+        // float comparison: no float compare fast path, so it deopts.
         "(defun h (a b) (< a b)) (h 1 1) (format t \"~a~%\" (list (h 1/3 1/2) (h 1/2 1/3)))",
-        // fixnum and float mixed.
+        // fixnum and float mixed: the single-float guard misses, so it deopts.
         "(defun k (a b) (* a b)) (k 1 1) (format t \"~a~%\" (k 3 2.5))",
     ];
     for c in cases {
@@ -177,23 +183,56 @@ fn non_fixnum_operands_deoptimize() {
     }
 }
 
+/// A hot loop whose accumulator is a single-float promotes to T1 and runs
+/// entirely on the native single-float fast path — zero deopts (bliss-izt.3) —
+/// while the fixnum index and loop test take the fixnum path. The float analog
+/// of `hot_speculative_loop_no_deopt`, and the positive assertion that a float
+/// operand no longer abandons native code.
+#[test]
+fn hot_single_float_loop_no_deopt() {
+    let program = "\
+        (defun fsum (n) (let ((s 0.0) (i 0)) \
+          (tagbody top (when (< i n) (setq s (+ s 1.5)) (setq i (+ i 1)) (go top))) \
+          s)) \
+        (fsum 5) (fsum 5) (fsum 5) \
+        (format t \"~a ~a ~a~%\" \
+                (bliss-ext:function-tier (quote fsum)) \
+                (bliss-ext:deopt-count) \
+                (fsum 100))";
+    let out = eval(program, &[("BLISS_T1_THRESHOLD", "2")]);
+    let fields: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(fields.first().copied(), Some("1"), "single-float loop must reach T1: {out:?}");
+    assert_eq!(fields.get(1).copied(), Some("0"), "single-float loop must not deopt: {out:?}");
+    // 1.5 added 100 times = 150.0, printed as the interpreter prints it.
+    let tw_val = eval(
+        "(defun fsum (n) (let ((s 0.0) (i 0)) \
+           (tagbody top (when (< i n) (setq s (+ s 1.5)) (setq i (+ i 1)) (go top))) s)) \
+         (format t \"~a~%\" (fsum 100))",
+        &[("BLISS_BACKEND", "tree-walker")],
+    );
+    assert_eq!(fields.get(2).copied(), Some(tw_val.as_str()), "result matches interpretation");
+}
+
 /// The deopt counter is observable and increments only on an actual
 /// deoptimization: zero for fixnum calls, one per non-fixnum/overflow call.
 #[test]
 fn deopt_count_is_observable_and_precise() {
+    // NB: a single-float arg does NOT deopt any more — single-float `*` has its
+    // own native fast path (bliss-izt.3). A ratio still falls outside both the
+    // fixnum and single-float domains, so it is the non-overflow deopt here.
     let program = "\
         (defun sq (x) (* x x)) \
         (sq 2) (sq 3) (sq 4) \
         (sq 5) (sq 6) \
         (format t \"~a\" (bliss-ext:deopt-count)) \
-        (sq 1.5) \
+        (sq 1/2) \
         (format t \" ~a\" (bliss-ext:deopt-count)) \
         (sq 9999999999) \
         (format t \" ~a~%\" (bliss-ext:deopt-count))";
     let out = eval(program, &[("BLISS_T1_THRESHOLD", "2")]);
     assert_eq!(
         out, "0 1 2",
-        "fixnum calls deopt 0 times; a float arg then an overflow each add one"
+        "fixnum calls deopt 0 times; a ratio arg then an overflow each add one"
     );
 }
 
@@ -219,15 +258,19 @@ fn hot_speculative_loop_no_deopt() {
 }
 
 /// A function that keeps deoptimizing (always called outside its speculated
-/// fixnum domain) is blacklisted once its deopt count crosses the configured
-/// threshold: its speculative native code is uninstalled, it drops back to T0,
-/// the deopt count stops climbing, and results stay correct (bliss-jtc.27).
+/// fixnum/single-float domain — here, with ratios) is blacklisted once its
+/// deopt count crosses the configured threshold: its speculative native code is
+/// uninstalled, it drops back to T0, the deopt count stops climbing, and results
+/// stay correct (bliss-jtc.27).
 #[test]
 fn repeated_deopts_blacklist_and_back_off_to_t0() {
+    // Ratios (not fixnum, not single-float) deopt on every call; single-float
+    // args would instead take the native float path (bliss-izt.3) and never
+    // blacklist, so this uses ratios to keep exercising the backoff path.
     let program = "\
         (defun g (a b) (+ (* a a) (* b b))) \
         (g 1 1) (g 2 2) \
-        (g 1.0 2.0) (g 1.0 2.0) (g 1.0 2.0) (g 1.0 2.0) (g 1.0 2.0) (g 1.0 2.0) \
+        (g 1/2 1/3) (g 1/2 1/3) (g 1/2 1/3) (g 1/2 1/3) (g 1/2 1/3) (g 1/2 1/3) \
         (format t \"~a ~a ~a~%\" \
                 (bliss-ext:function-tier (quote g)) \
                 (bliss-ext:deopt-count) \

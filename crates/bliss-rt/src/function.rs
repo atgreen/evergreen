@@ -146,6 +146,14 @@ pub fn back_edge_count(f: BlissVal) -> u32 {
     unsafe { (*data(f)).back_edge_count.load(Ordering::Relaxed) }
 }
 
+/// Reset the loop back-edge count to zero. Used as OSR-deopt backoff (bliss-izt.2):
+/// after a speculating OSR loop deoptimizes back to T0, clearing the counter means
+/// the loop must run another full threshold of interpreted iterations before it is
+/// re-promoted, bounding OSR-enter/deopt thrash on a loop that keeps overflowing.
+pub fn reset_back_edge_count(f: BlissVal) {
+    unsafe { (*data(f)).back_edge_count.store(0, Ordering::Relaxed) }
+}
+
 /// The current tier (0/1/2).
 pub fn tier(f: BlissVal) -> u8 {
     unsafe { (*data(f)).tier.load(Ordering::Acquire) }

@@ -48,6 +48,8 @@ use super::{
     run_handler_bind_handlers, store_control_value, sym_name, tag_key, take_control_value,
     val_as_str, vec_to_list,
 };
+// Label-based assembler backing the native (T1) code emitter (see cli::asm).
+use super::asm::{Asm, Cc, Label};
 
 // ── Backend selection ──────────────────────────────────────────────
 
@@ -3519,7 +3521,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 // is empty, finish the activation in native code instead of
                 // interpreting the rest of the loop.
                 match maybe_osr(&acts[top_idx], target_bcp, env) {
-                    Some(Ok(v)) => {
+                    Some(Ok(OsrOutcome::Finished(v))) => {
                         release_activation_handlers(&mut acts[top_idx], env);
                         stack.pop_frame();
                         acts.pop();
@@ -3527,6 +3529,24 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                             Some(caller) => caller.push_op(v),
                             None => return Ok(v),
                         }
+                    }
+                    Some(Ok(OsrOutcome::Deopt { bcp, sp_top })) => {
+                        // A speculating OSR loop hit a fixnum guard mid-run
+                        // (bliss-izt.2). The live frame already holds the updated
+                        // locals and the peek-preserved operands, and this
+                        // activation's handlers were established top-down in T0
+                        // before the loop, so we simply reposition it at the guard
+                        // and keep interpreting — no new frame, no handler replay.
+                        DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Backoff: clear the hot-loop counter so the loop must
+                        // re-warm before another OSR attempt, bounding
+                        // enter/deopt thrash on a loop that keeps overflowing.
+                        if let Some(f) = acts[top_idx].fn_obj {
+                            bliss_rt::function::reset_back_edge_count(f);
+                        }
+                        let act = &mut acts[top_idx];
+                        act.bcp = bcp as usize;
+                        act.sp_top = sp_top;
                     }
                     Some(Err(e)) => {
                         let pending = error_to_pending(e, env);
@@ -4006,6 +4026,14 @@ thread_local! {
     /// observes it, discards the native result, and re-runs the function in the
     /// interpreter (T0) — a deoptimization that returns the correct value.
     static NATIVE_DEOPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Where a speculative guard failed, for state-transfer deopt (bliss-izt.2):
+    /// `(bcp, operand_depth)`. Set alongside `NATIVE_DEOPT` by `c2i_deopt_state`.
+    /// `run_native` reads it to resume T0 at that exact bytecode position on the
+    /// SAME frame — locals and the operand stack are already in the shared frame
+    /// slots — instead of re-running the whole function from the top. `None`
+    /// falls back to the re-run path (e.g. a legacy non-state-recording guard).
+    static NATIVE_DEOPT_RESUME: std::cell::Cell<Option<(u32, u16)>> =
+        const { std::cell::Cell::new(None) };
     /// Current native (T1) call-stack depth (bliss-x5y.4). Non-leaf T1 functions
     /// call through c2i, and although those calls run in the interpreter (which
     /// is BlissStack-bounded, not native-recursive), this counter bounds any
@@ -4075,8 +4103,21 @@ fn maybe_write_perf_map(addr: usize, size: usize, sym: u32) {
 /// Signal a speculative deoptimization from native (T1) code (bliss-jtc.27).
 /// Sets the thread's deopt flag; `run_native` re-runs the function in the
 /// interpreter after the native frame returns.
+#[allow(dead_code)] // superseded by c2i_deopt_state (bliss-izt.2); kept for reference
 extern "C" fn c2i_deopt() {
     NATIVE_DEOPT.with(|d| d.set(true));
+}
+
+/// Signal a speculative deoptimization AND record where to resume in T0
+/// (bliss-izt.2). `bcp` is the bytecode index of the guarded `CallNamed`; `depth`
+/// is the operand-stack depth there (derived native-side from r15/r14). Because
+/// the inlined fast paths PEEK-guard-commit — they never mutate the operand
+/// stack pointer before every guard has passed — the frame slots at deopt still
+/// hold the live locals and the untouched operands, so `run_native` can build a
+/// T0 activation at exactly this position instead of re-running from the top.
+extern "C" fn c2i_deopt_state(bcp: u64, depth: u64) {
+    NATIVE_DEOPT.with(|d| d.set(true));
+    NATIVE_DEOPT_RESUME.with(|c| c.set(Some((bcp as u32, depth as u16))));
 }
 
 /// Installed T1 native code for a function. Its CL activation (locals + operand
@@ -4197,18 +4238,20 @@ fn run_native(
     let ret = f(slots);
     NATIVE_ENV.with(|e| e.set(saved));
 
-    stack.pop_frame();
+    let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
+    let resume = NATIVE_DEOPT_RESUME.with(|c| c.take());
     let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_ERROR.with(|c| *c.borrow_mut() = saved_err);
     if let Some(err) = my_err {
+        stack.pop_frame();
         return Err(err);
     }
-    // Deoptimization (bliss-jtc.27): a speculative guard failed. The native code
-    // only speculates in pure functions (no side effects before any guard), so
-    // re-running the whole function in the interpreter (T0) is observably
-    // equivalent and yields the correct result — e.g. a bignum where the fixnum
-    // fast path overflowed.
-    if NATIVE_DEOPT.with(|d| d.replace(false)) {
+    // Deoptimization (bliss-jtc.27): a speculative guard failed. With
+    // state-transfer deopt (bliss-izt.2) we resume T0 at the guard's bytecode
+    // position on the SAME frame — no work is redone. (The legacy re-run path is
+    // kept as a fallback when no resume point was recorded; purity of every call
+    // makes re-running from the top observably equivalent.)
+    if deopt {
         DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         trace("t1 speculative deopt → interpreter");
         // Backoff/blacklist: an occasional deopt (a rare overflow) is fine and
@@ -4236,9 +4279,99 @@ fn run_native(
         let entry = registry_get(sym).ok_or_else(|| {
             BlissError::Internal("deopt: bytecode function vanished".into())
         })?;
+        if let Some((bcp, sp_top)) = resume {
+            // State-transfer: resume T0 on this frame; `resume_in_t0` owns the
+            // frame's lifecycle from here (do NOT pop it first).
+            return resume_in_t0(entry, frame, bcp, sp_top, sym, env);
+        }
+        stack.pop_frame();
         return run(entry, args, BlissVal::from_symbol_index(sym), env);
     }
+    stack.pop_frame();
     Ok(BlissVal(ret))
+}
+
+/// Resume T0 execution on an EXISTING frame at `(bcp, sp_top)` after a native
+/// speculative guard failed (bliss-izt.2). The frame slots already hold the live
+/// locals and the untouched operands (the fast paths PEEK-guard-commit, so a
+/// failed guard leaves the operand stack coherent), so no value copying is
+/// needed. Native compiles the only handler-establishers it accepts —
+/// `PushBlock`/`PushTag` — as no-ops (their `return-from`/`go` become jumps), so
+/// we replay those over `code[0..bcp]` to rebuild the exact T0 handler stack and
+/// `env.block_stack` a top-down interpretation would hold here. Owns the frame
+/// lifecycle like [`run`]: `run_loop`'s `Return` pops it on the normal path; on
+/// an error we pop any frames left live.
+fn resume_in_t0(
+    entry: Rc<BytecodeFunction>,
+    frame: *mut Frame,
+    bcp: u32,
+    sp_top: u16,
+    sym: u32,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    let thread = bliss_rt::current_thread();
+    let stack = thread.stack();
+
+    let entry_fn_val = BlissVal::from_symbol_index(sym);
+    let fn_obj =
+        Some(entry_fn_val).filter(|&v| bliss_rt::function::is_interpreted_function(v));
+
+    let mut handlers: Vec<Handler> = Vec::new();
+    for instr in entry.code[..bcp as usize].iter() {
+        match instr {
+            Instr::PushBlock {
+                block_id,
+                name_idx,
+                resume_bcp,
+                sp_restore,
+            } => {
+                let name = entry.names[*name_idx as usize].clone();
+                let token = next_control_token("__RETURN_FROM__");
+                env.block_stack.push((name, token.clone()));
+                handlers.push(Handler::Block {
+                    block_id: *block_id,
+                    token,
+                    resume_bcp: *resume_bcp,
+                    sp_restore: *sp_restore,
+                });
+            }
+            Instr::PushTag {
+                tagbody_id,
+                sp_restore,
+            } => {
+                handlers.push(Handler::Tag {
+                    tagbody_id: *tagbody_id,
+                    sp_restore: *sp_restore,
+                });
+            }
+            Instr::PopHandler => {
+                if let Some(Handler::Block { token, .. }) = handlers.pop() {
+                    env.block_stack.retain(|(_, t)| *t != token);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let n_locals = entry.n_locals;
+    let mut acts: Vec<Activation> = vec![Activation {
+        frame,
+        n_locals,
+        env_frame: None,
+        func: entry,
+        bcp: bcp as usize,
+        sp_top,
+        handlers,
+        cleanup_conts: Vec::new(),
+        fn_obj,
+        sym,
+    }];
+    let result = run_loop(&mut acts, env);
+    while !acts.is_empty() {
+        stack.pop_frame();
+        acts.pop();
+    }
+    result
 }
 
 /// Compile a bytecode function to native x86-64 T1 code, or `None` if it uses
@@ -4252,11 +4385,13 @@ fn run_native(
 /// while the dispatch/operand-stack plumbing runs as native code (nmq.2).
 #[cfg(target_arch = "x86_64")]
 /// Emit native x86-64 for `bf`. `allow_speculation` enables the speculative
-/// fixnum fast paths (whose guards deoptimize by re-running the whole function);
-/// OSR entry code passes `false` because a mid-loop deopt cannot re-run from the
-/// top (bliss-izt.1) — it runs arithmetic through c2i instead. Returns the code
-/// plus, for each OSR-eligible loop header (a backward-`Go` target whose operand
-/// stack is empty), the byte offset of an alternate entry stub that sets up the
+/// fixnum fast paths, whose guards deoptimize via state-transfer: they
+/// PEEK-guard-commit and record `(bcp, depth)` so a failure resumes T0 at the
+/// exact position (bliss-izt.2). Both the normal call path and OSR pass `true`;
+/// only differential-testing oracles that want a pure c2i lowering pass `false`.
+/// Returns the code plus, for each OSR-eligible loop header (a backward-`Go`
+/// target whose operand stack is empty), the byte offset of an alternate entry
+/// stub that sets up the
 /// activation registers and jumps straight to that header.
 fn emit_native_x86(
     bf: &BytecodeFunction,
@@ -4272,11 +4407,15 @@ fn emit_native_x86(
     let local_disp = |i: i32| 8 * i;
     let c2i_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64) -> u64 as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
-    let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
+    let deopt_state_addr = c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64;
 
-    let mut c: Vec<u8> = Vec::new();
-    let mut offsets: Vec<usize> = Vec::with_capacity(bf.code.len());
-    let mut patches: Vec<(usize, u32)> = Vec::new();
+    let mut c = Asm::new();
+    // One label per bytecode index, bound as each instruction is emitted, so a
+    // Br/Go/ReturnFrom/BrIfFalse targeting bcp `t` is `c.jmp(bcp_labels[t])` and
+    // the assembler resolves the displacement in `finish`. A target of exactly
+    // `code.len()` (only a malformed body reaches it) has no label and bails via
+    // the `?` on `bcp_labels.get`, matching the old out-of-range `offsets.get`.
+    let bcp_labels: Vec<Label> = (0..bf.code.len()).map(|_| c.label()).collect();
 
     // Loop support (bliss-jtc.25): pre-scan block/tag establishments so a local
     // `ReturnFrom`/`Go` can reset the operand stack to the target's `sp_restore`
@@ -4308,7 +4447,7 @@ fn emit_native_x86(
     }
     // Reset the operand-stack pointer r15 to hold `depth` values above the
     // locals: r15 = r14 + 8*(n_locals + depth). Mirrors the prologue's lea.
-    let reset_r15 = |c: &mut Vec<u8>, depth: u16| {
+    let reset_r15 = |c: &mut Asm, depth: u16| {
         c.extend_from_slice(&[0x4D, 0x8D, 0xBE]); // lea r15, [r14 + disp32]
         let disp = 8 * (n_locals + depth as i32);
         c.extend_from_slice(&disp.to_le_bytes());
@@ -4343,21 +4482,31 @@ fn emit_native_x86(
             }
         }
     }
-    // Sites of `jcc rel32` guard branches that jump to the shared deopt block,
-    // patched once the block's offset is known.
-    let mut deopt_sites: Vec<usize> = Vec::new();
-    // Emit a two-byte-opcode conditional jump (0F xx) to the deopt block.
-    let jcc_deopt = |c: &mut Vec<u8>, sites: &mut Vec<usize>, opcode2: u8| {
-        c.extend_from_slice(&[0x0F, opcode2]);
-        sites.push(c.len());
-        c.extend_from_slice(&[0, 0, 0, 0]);
-    };
+    // Sites of `jcc rel32` guard branches, each tagged with the bytecode index
+    // (`bcp`) of the `CallNamed` it guards (bliss-izt.2). Patched at the end to
+    // point at a per-site deopt stub that records `bcp` for state-transfer
+    // resume. Every guard in one op shares that op's `bcp`.
+    // One deopt-stub label per distinct guarded `bcp`; the guard's `jcc` targets
+    // it, and the epilogue binds it to a stub that records `bcp` for
+    // state-transfer resume. Get-or-create keeps every guard on the same op
+    // sharing one stub, as before.
+    // BTreeMap (not HashMap) so the epilogue emits stubs in a deterministic
+    // order — the generated bytes are then reproducible across runs.
+    let mut deopt_labels: std::collections::BTreeMap<u32, Label> =
+        std::collections::BTreeMap::new();
+    // Emit a conditional jump to this op's deopt stub (allocating its label on
+    // first use).
+    let jcc_deopt =
+        |c: &mut Asm, labels: &mut std::collections::BTreeMap<u32, Label>, cc: Cc, bcp: u32| {
+            let l = *labels.entry(bcp).or_insert_with(|| c.label());
+            c.jcc(cc, l);
+        };
 
     // ── Prologue ───────────────────────────────────────────────
     // Shared by the normal entry and every OSR entry stub (bliss-izt.1): both
     // receive the frame-slots pointer in rdi (SysV) and must set up r14/r15 and
     // 16-align rsp identically, so the one Return epilogue balances either.
-    let emit_prologue = |c: &mut Vec<u8>| {
+    let emit_prologue = |c: &mut Asm| {
         c.extend_from_slice(&[0x41, 0x56]); // push r14
         c.extend_from_slice(&[0x41, 0x57]); // push r15
         c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8 (16-align)
@@ -4368,12 +4517,12 @@ fn emit_native_x86(
     emit_prologue(&mut c);
 
     // push_op rax: mov [r15], rax ; add r15, 8
-    let push_rax = |c: &mut Vec<u8>| {
+    let push_rax = |c: &mut Asm| {
         c.extend_from_slice(&[0x49, 0x89, 0x07]); // mov [r15], rax
         c.extend_from_slice(&[0x49, 0x83, 0xC7, 0x08]); // add r15, 8
     };
     // pop_op into reg: sub r15,8 ; mov reg, [r15]
-    let pop_into = |c: &mut Vec<u8>, modrm_reg: u8, rex_r: bool| {
+    let pop_into = |c: &mut Asm, modrm_reg: u8, rex_r: bool| {
         c.extend_from_slice(&[0x49, 0x83, 0xEF, 0x08]); // sub r15, 8
         let rex = 0x49 | if rex_r { 0x04 } else { 0x00 };
         c.push(rex);
@@ -4381,8 +4530,9 @@ fn emit_native_x86(
         c.push(0b00_000_111 | (modrm_reg << 3)); // mod=00, reg, rm=111 (r15)
     };
 
-    for instr in bf.code.iter() {
-        offsets.push(c.len());
+    for (bcp_idx, instr) in bf.code.iter().enumerate() {
+        c.bind(bcp_labels[bcp_idx]);
+        let bcp = bcp_idx as u32;
         match instr {
             Instr::Const(k) => {
                 let bits = bf.constants[*k as usize].0;
@@ -4421,9 +4571,13 @@ fn emit_native_x86(
                 // the most-negative fixnum sets OF → correct deopt).
                 if deopt_safe && *nargs == 1 {
                     if let Some(op) = inlinable_unary_fixnum_op(*sym) {
-                        pop_into(&mut c, 0, false); // x -> rax
+                        // PEEK-guard-commit (bliss-izt.2): read x without moving
+                        // r15, so a failed guard leaves the operand in its slot for
+                        // a T0 resume at this `CallNamed`. Commit stores in place
+                        // (one operand in, one result out ⇒ r15 unchanged).
+                        c.extend_from_slice(&[0x49, 0x8B, 0x47, 0xF8]); // mov rax, [r15-8]
                         c.extend_from_slice(&[0xA8, 0x07]); // test al, 7
-                        jcc_deopt(&mut c, &mut deopt_sites, 0x85); // jnz deopt
+                        jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jnz deopt
                         match op {
                             UnaryFixnumOp::Incr => {
                                 c.extend_from_slice(&[0x48, 0x83, 0xC0, 0x08]); // add rax, 8
@@ -4435,14 +4589,16 @@ fn emit_native_x86(
                                 c.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
                             }
                         }
-                        jcc_deopt(&mut c, &mut deopt_sites, 0x80); // jo deopt
-                        push_rax(&mut c);
+                        jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp); // jo deopt
+                        c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF8]); // mov [r15-8], rax
                         continue;
                     }
                     if let Some(pred) = inlinable_fixnum_pred(*sym) {
-                        pop_into(&mut c, 0, false); // x -> rax
+                        // PEEK-guard-commit (bliss-izt.2): x stays in its slot
+                        // until the fixnum guard passes.
+                        c.extend_from_slice(&[0x49, 0x8B, 0x47, 0xF8]); // mov rax, [r15-8]
                         c.extend_from_slice(&[0xA8, 0x07]); // test al, 7
-                        jcc_deopt(&mut c, &mut deopt_sites, 0x85); // jnz deopt
+                        jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jnz deopt
                         // Set flags: sign tests use `test rax,rax`; parity tests
                         // check tagged bit 3 (value bit 0) via `test al, 8`.
                         match pred {
@@ -4465,7 +4621,7 @@ fn emit_native_x86(
                             FixnumPred::Oddp => 0x45,  // cmovne (bit set)
                         };
                         c.extend_from_slice(&[0x48, 0x0F, cc, 0xC2]); // cmovCC rax, rdx
-                        push_rax(&mut c);
+                        c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF8]); // mov [r15-8], rax
                         continue;
                     }
                     if let Some(offset) = inlinable_cons_accessor(*sym) {
@@ -4474,7 +4630,9 @@ fn emit_native_x86(
                         // interpreter (which signals the type error) — the same
                         // discrimination the c2i path performs, so equally safe.
                         // No allocation or c2i, hence no GC point mid-sequence.
-                        pop_into(&mut c, 0, false); // x -> rax
+                        // PEEK-guard-commit (bliss-izt.2): x stays in its slot
+                        // until the cons/nil guard passes.
+                        c.extend_from_slice(&[0x49, 0x8B, 0x47, 0xF8]); // mov rax, [r15-8]
                         c.extend_from_slice(&[0x48, 0x3D]); // cmp rax, imm32
                         c.extend_from_slice(&(bliss_rt::value::NIL_BITS as u32).to_le_bytes());
                         c.extend_from_slice(&[0x74, 0x00]); // je rel8 → L_nil (patched)
@@ -4482,7 +4640,7 @@ fn emit_native_x86(
                         c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
                         c.extend_from_slice(&[0x83, 0xE2, 0x07]); // and edx, 7 (tag)
                         c.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1 (TAG_CONS)
-                        jcc_deopt(&mut c, &mut deopt_sites, 0x85); // jne deopt
+                        jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jne deopt
                         c.extend_from_slice(&[0x48, 0x83, 0xE0, 0xF8]); // and rax, -8 (ptr)
                         if offset == 0 {
                             c.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]
@@ -4492,8 +4650,8 @@ fn emit_native_x86(
                         // L_nil: both paths converge here (rax = NIL, or the
                         // loaded field). Patch the forward rel8.
                         let l_nil = c.len();
-                        c[je_site] = (l_nil - (je_site + 1)) as u8;
-                        push_rax(&mut c);
+                        c.patch_u8(je_site, (l_nil - (je_site + 1)) as u8);
+                        c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF8]); // mov [r15-8], rax
                         continue;
                     }
                     if let Some(pred) = inlinable_total_unary(*sym) {
@@ -4549,36 +4707,106 @@ fn emit_native_x86(
                         continue;
                     }
                     if let Some(op) = inlinable_fixnum_op(*sym) {
-                        // Pop operands: top=a1 -> rcx, next=a0 -> rax.
-                        pop_into(&mut c, 1, false); // a1 -> rcx
-                        pop_into(&mut c, 0, false); // a0 -> rax
-                        // Fixnum guard: (a0 | a1) low 3 bits must be 000.
-                        c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
-                        c.extend_from_slice(&[0x48, 0x09, 0xCA]); // or rdx, rcx
-                        c.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
-                        jcc_deopt(&mut c, &mut deopt_sites, 0x85); // jnz deopt
+                        // PEEK-guard-commit (bliss-izt.2): read both operands
+                        // WITHOUT moving r15 — top=a1 -> rcx at [r15-8],
+                        // next=a0 -> rax at [r15-16]. Every guard below fires
+                        // before any operand-stack mutation, so on deopt the two
+                        // inputs remain in their slots and r15 still reflects the
+                        // pre-call depth, letting T0 resume at this `CallNamed`.
+                        c.extend_from_slice(&[0x49, 0x8B, 0x4F, 0xF8]); // mov rcx, [r15-8]
+                        c.extend_from_slice(&[0x49, 0x8B, 0x47, 0xF0]); // mov rax, [r15-16]
+                        // Commit: two operands consumed, one result pushed ⇒
+                        // r15 drops by one slot and the result lands in a0's slot.
+                        let commit_bin = |c: &mut Asm| {
+                            c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF0]); // mov [r15-16], rax
+                            c.extend_from_slice(&[0x49, 0x83, 0xEF, 0x08]); // sub r15, 8
+                        };
                         match op {
-                            FixnumOp::Add => {
-                                // (a0<<3)+(a1<<3) = (a0+a1)<<3; jo iff fixnum
-                                // overflow (result exceeds 61-bit signed).
-                                c.extend_from_slice(&[0x48, 0x01, 0xC8]); // add rax, rcx
-                                jcc_deopt(&mut c, &mut deopt_sites, 0x80); // jo deopt
-                                push_rax(&mut c);
-                            }
-                            FixnumOp::Sub => {
-                                c.extend_from_slice(&[0x48, 0x29, 0xC8]); // sub rax, rcx
-                                jcc_deopt(&mut c, &mut deopt_sites, 0x80); // jo deopt
-                                push_rax(&mut c);
-                            }
-                            FixnumOp::Mul => {
-                                // Untag a0, then a0 * (a1<<3) = (a0*a1)<<3.
-                                c.extend_from_slice(&[0x48, 0xC1, 0xF8, 0x03]); // sar rax, 3
-                                c.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
-                                jcc_deopt(&mut c, &mut deopt_sites, 0x80); // jo deopt
-                                push_rax(&mut c);
+                            // Polymorphic arithmetic (bliss-izt.3), the SECOND
+                            // speculation: same op, a different type assumption.
+                            // fixnum fast path | single-float fast path | deopt.
+                            // Single-floats are IMMEDIATE (f32 bits in the high 32,
+                            // tag 0b100 — see BlissVal::from_single_float), so the
+                            // float path allocates nothing. Crucially, unlike a
+                            // fixnum overflow, a single-float operand does NOT
+                            // abandon native code: the fixnum guard's miss branches
+                            // to the inline float path and keeps running (the
+                            // "stay native on a type the fixnum guard rejects"
+                            // shape this whole line of work is aiming at). Only a
+                            // genuinely non-immediate-numeric operand — bignum,
+                            // ratio, double-float, or a fixnum⊕float mix — still
+                            // deopts to T0, which computes the contagious result.
+                            FixnumOp::Add | FixnumOp::Sub | FixnumOp::Mul => {
+                                let not_fixnum = c.label();
+                                let done = c.label();
+                                // Fixnum guard: (a0 | a1) low 3 bits must be 000.
+                                c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                                c.extend_from_slice(&[0x48, 0x09, 0xCA]); // or rdx, rcx
+                                c.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
+                                c.jcc(Cc::Ne, not_fixnum); // → single-float path
+                                match op {
+                                    FixnumOp::Add => {
+                                        // (a0<<3)+(a1<<3)=(a0+a1)<<3; jo on overflow.
+                                        c.extend_from_slice(&[0x48, 0x01, 0xC8]); // add rax, rcx
+                                        jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp); // jo deopt
+                                    }
+                                    FixnumOp::Sub => {
+                                        c.extend_from_slice(&[0x48, 0x29, 0xC8]); // sub rax, rcx
+                                        jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp); // jo deopt
+                                    }
+                                    FixnumOp::Mul => {
+                                        // Untag a0, then a0 * (a1<<3) = (a0*a1)<<3.
+                                        c.extend_from_slice(&[0x48, 0xC1, 0xF8, 0x03]); // sar rax, 3
+                                        c.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
+                                        jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp); // jo deopt
+                                    }
+                                    _ => unreachable!(),
+                                }
+                                commit_bin(&mut c);
+                                c.jmp(done);
+                                // ── single-float fast path (stay native) ──
+                                c.bind(not_fixnum);
+                                // Both operands must be single-floats (tag 0b100);
+                                // anything else deopts. rax/rcx still hold the
+                                // untouched PEEKed operands (the fixnum arm ran only
+                                // on the other side of the branch).
+                                c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                                c.extend_from_slice(&[0x83, 0xE2, 0x07]); // and edx, 7
+                                c.extend_from_slice(&[0x83, 0xFA, 0x04]); // cmp edx, 4
+                                jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jne deopt
+                                c.extend_from_slice(&[0x48, 0x89, 0xCA]); // mov rdx, rcx
+                                c.extend_from_slice(&[0x83, 0xE2, 0x07]); // and edx, 7
+                                c.extend_from_slice(&[0x83, 0xFA, 0x04]); // cmp edx, 4
+                                jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jne deopt
+                                // Unbox each f32 (high 32 bits → xmm), operate in
+                                // single precision, re-box: bit-identical to the
+                                // interpreter's f32 arithmetic, so the differential
+                                // gate holds.
+                                c.extend_from_slice(&[0x48, 0xC1, 0xE9, 0x20]); // shr rcx, 32
+                                c.extend_from_slice(&[0x66, 0x0F, 0x6E, 0xC9]); // movd xmm1, ecx
+                                c.extend_from_slice(&[0x48, 0xC1, 0xE8, 0x20]); // shr rax, 32
+                                c.extend_from_slice(&[0x66, 0x0F, 0x6E, 0xC0]); // movd xmm0, eax
+                                let ss = match op {
+                                    FixnumOp::Add => 0x58, // addss
+                                    FixnumOp::Sub => 0x5C, // subss
+                                    FixnumOp::Mul => 0x59, // mulss
+                                    _ => unreachable!(),
+                                };
+                                c.extend_from_slice(&[0xF3, 0x0F, ss, 0xC1]); // <op>ss xmm0, xmm1
+                                c.extend_from_slice(&[0x66, 0x0F, 0x7E, 0xC0]); // movd eax, xmm0
+                                c.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x20]); // shl rax, 32
+                                c.extend_from_slice(&[0x48, 0x83, 0xC8, 0x04]); // or rax, TAG_SINGLE_FLOAT
+                                commit_bin(&mut c);
+                                c.bind(done);
                             }
                             FixnumOp::Lt | FixnumOp::Gt | FixnumOp::Le | FixnumOp::Ge
                             | FixnumOp::NumEq => {
+                                // Fixnum-only (float compares deopt): guard both
+                                // operands are fixnums, else deopt.
+                                c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                                c.extend_from_slice(&[0x48, 0x09, 0xCA]); // or rdx, rcx
+                                c.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
+                                jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jnz deopt
                                 // cmp a0, a1 (order-preserving on tagged fixnums),
                                 // then materialise T/NIL by the signed condition.
                                 c.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
@@ -4596,7 +4824,7 @@ fn emit_native_x86(
                                 };
                                 // cmovCC rax, rdx  (48 0F cc C2)
                                 c.extend_from_slice(&[0x48, 0x0F, cmov, 0xC2]);
-                                push_rax(&mut c);
+                                commit_bin(&mut c);
                             }
                         }
                         continue;
@@ -4628,9 +4856,7 @@ fn emit_native_x86(
                 push_rax(&mut c);
             }
             Instr::Br(target) => {
-                c.extend_from_slice(&[0xE9]); // jmp rel32
-                patches.push((c.len(), *target));
-                c.extend_from_slice(&[0, 0, 0, 0]);
+                c.jmp(*bcp_labels.get(*target as usize)?);
             }
             // Block/tagbody loops (bliss-jtc.25): DO/DOTIMES/LOOP lower to
             // (block nil (tagbody ...)). In the interpreter PushBlock/PushTag
@@ -4667,9 +4893,7 @@ fn emit_native_x86(
                 } else {
                     return None; // go with no lexically visible tag: not T1-safe
                 }
-                c.extend_from_slice(&[0xE9]); // jmp rel32
-                patches.push((c.len(), *target_bcp));
-                c.extend_from_slice(&[0, 0, 0, 0]);
+                c.jmp(*bcp_labels.get(*target_bcp as usize)?);
             }
             Instr::ReturnFrom { block_id } => {
                 // The return value is on top of the operand stack. Restore the
@@ -4682,17 +4906,13 @@ fn emit_native_x86(
                 c.extend_from_slice(&[0x49, 0x8B, 0x47, 0xF8]); // mov rax, [r15-8]
                 reset_r15(&mut c, sp);
                 push_rax(&mut c); // depth = sp_restore + 1 (value on top)
-                c.extend_from_slice(&[0xE9]); // jmp rel32
-                patches.push((c.len(), resume_bcp));
-                c.extend_from_slice(&[0, 0, 0, 0]);
+                c.jmp(*bcp_labels.get(resume_bcp as usize)?);
             }
             Instr::BrIfFalse(target) => {
                 pop_into(&mut c, 0, false); // rax = value
                 c.extend_from_slice(&[0x48, 0x3D]); // cmp rax, imm32
                 c.extend_from_slice(&(bliss_rt::value::NIL_BITS as u32).to_le_bytes());
-                c.extend_from_slice(&[0x0F, 0x84]); // je rel32
-                patches.push((c.len(), *target));
-                c.extend_from_slice(&[0, 0, 0, 0]);
+                c.jcc(Cc::E, *bcp_labels.get(*target as usize)?); // je rel32
             }
             Instr::Return => {
                 pop_into(&mut c, 0, false); // rax = result
@@ -4705,35 +4925,38 @@ fn emit_native_x86(
         }
     }
 
-    // Shared deopt block (bliss-jtc.27): reached only via guard branches. Flag a
-    // deoptimization, then return through the normal epilogue (the value is
-    // ignored — run_native re-runs the function in the interpreter). rsp is
-    // 16-aligned here exactly as at any CallNamed, so the call is well-formed.
-    if !deopt_sites.is_empty() {
-        let deopt_off = c.len();
-        c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_deopt)
-        c.extend_from_slice(&deopt_addr.to_le_bytes());
-        c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    // Deopt machinery (bliss-izt.2): a shared state-recording tail plus one small
+    // stub per distinct guard `bcp`. A failed guard jumps to its bcp's stub,
+    // which loads the bcp into edi and falls into the tail; the tail derives the
+    // operand depth from r15/r14 and records (bcp, depth) via c2i_deopt_state, so
+    // run_native resumes T0 at exactly that `CallNamed` instead of re-running the
+    // whole function. rsp is 16-aligned here (as at any CallNamed), so the call
+    // is well-formed. The value returned through the epilogue is ignored.
+    if !deopt_labels.is_empty() {
+        let tail = c.label();
+        c.bind(tail);
+        // depth = (r15 - r14) / 8 - n_locals  → rsi (SysV arg 2).
+        c.extend_from_slice(&[0x4C, 0x89, 0xFE]); // mov rsi, r15
+        c.extend_from_slice(&[0x4C, 0x29, 0xF6]); // sub rsi, r14
+        c.extend_from_slice(&[0x48, 0xC1, 0xFE, 0x03]); // sar rsi, 3
+        c.extend_from_slice(&[0x48, 0x81, 0xEE]); // sub rsi, imm32
+        c.extend_from_slice(&n_locals.to_le_bytes());
+        c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_deopt_state)
+        c.extend_from_slice(&deopt_state_addr.to_le_bytes());
+        c.extend_from_slice(&[0xFF, 0xD0]); // call rax  (edi=bcp set by the stub)
         c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
         c.extend_from_slice(&[0x41, 0x5F]); // pop r15
         c.extend_from_slice(&[0x41, 0x5E]); // pop r14
         c.extend_from_slice(&[0xC3]); // ret
-        for site in deopt_sites {
-            let rel = deopt_off as i64 - (site as i64 + 4);
-            let rel32 = i32::try_from(rel).ok()?;
-            c[site..site + 4].copy_from_slice(&rel32.to_le_bytes());
-        }
-    }
 
-    for (site, target) in patches {
-        // A branch/return target must land on a real instruction offset. A
-        // block `resume_bcp` can equal code.len() only for a well-formed body
-        // that always ends in Return, so an out-of-range target means malformed
-        // input — bail rather than index out of bounds.
-        let target_off = *offsets.get(target as usize)? as i64;
-        let rel = target_off - (site as i64 + 4);
-        let rel32 = i32::try_from(rel).ok()?;
-        c[site..site + 4].copy_from_slice(&rel32.to_le_bytes());
+        // One stub per distinct bcp: bind its label (the guards' `jcc`s already
+        // point here) then `mov edi, bcp ; jmp tail`. finish() resolves the jmp.
+        for (&bcp, &stub) in &deopt_labels {
+            c.bind(stub);
+            c.push(0xBF); // mov edi, imm32
+            c.extend_from_slice(&bcp.to_le_bytes());
+            c.jmp(tail);
+        }
     }
 
     // OSR entry stubs (bliss-izt.1): one alternate entry per eligible loop
@@ -4741,21 +4964,17 @@ fn emit_native_x86(
     // the header; the header sits at an empty operand stack, so no operand
     // values need transferring (the live locals are already in the frame slots
     // passed in rdi). The function's normal Return epilogue balances the stub's
-    // prologue.
+    // prologue. `finish()` patches bytes in place, so a stub offset captured now
+    // stays valid in the returned buffer.
     let mut osr_entries: Vec<(u32, usize)> = Vec::new();
     for header in osr_headers {
-        let header_off = *offsets.get(header as usize)? as i64;
-        let stub_off = c.len();
+        let target = *bcp_labels.get(header as usize)?;
+        let stub_off = c.here();
         emit_prologue(&mut c);
-        c.push(0xE9); // jmp rel32 → header
-        let site = c.len();
-        c.extend_from_slice(&[0, 0, 0, 0]);
-        let rel = header_off - (site as i64 + 4);
-        let rel32 = i32::try_from(rel).ok()?;
-        c[site..site + 4].copy_from_slice(&rel32.to_le_bytes());
+        c.jmp(target);
         osr_entries.push((header, stub_off));
     }
-    Some((c, osr_entries))
+    Some((c.finish()?, osr_entries))
 }
 
 /// Whether `sym` names a primitive that is safe to re-execute from scratch — no
@@ -4977,10 +5196,14 @@ fn compile_osr(sym: u32) -> Option<Rc<OsrCode>> {
     }
     let result = (|| {
         let bf = registry_get(sym)?;
-        // allow_speculation = false: a mid-loop deopt can't re-run from the top,
-        // so OSR code must not speculate (arithmetic goes through c2i, which is
-        // fast after bliss-x5y.8). No guards ⇒ no deopt.
-        let (code, osr) = emit_native_x86(&bf, false)?;
+        // allow_speculation = true (bliss-izt.2): OSR now inlines fixnum
+        // arithmetic. A mid-loop guard failure no longer needs to re-run from the
+        // top — state-transfer deopt resumes T0 at the guard on the LIVE frame
+        // (the loop's locals and operands are already in the shared slots), so
+        // the loop runs at full native speed until (if ever) a value leaves the
+        // fixnum domain. Speculation only actually engages for `deopt_safe`
+        // functions (every call a pure primitive); others fall back to c2i.
+        let (code, osr) = emit_native_x86(&bf, true)?;
         if osr.is_empty() {
             return None;
         }
@@ -5000,16 +5223,28 @@ fn compile_osr(sym: u32) -> Option<Rc<OsrCode>> {
     result
 }
 
+/// The result of entering OSR native code (bliss-izt.1/izt.2): either the loop
+/// ran to the function's `Return` (`Finished`), or a speculative guard failed
+/// mid-loop and the running activation must continue in T0 from `bcp` with the
+/// operand stack at `sp_top` — the live frame already holds the correct locals
+/// and (peek-preserved) operands, so no value transfer is needed (`Deopt`).
+enum OsrOutcome {
+    Finished(BlissVal),
+    Deopt { bcp: u32, sp_top: u16 },
+}
+
 /// Enter OSR native code at `stub_off` to finish the current activation, reading
 /// and writing the LIVE frame slots (`frame`) — no new frame, no arg rebinding
-/// (bliss-izt.1). Returns the function's result. The non-speculating OSR code
-/// never deopts; a c2i error surfaces via NATIVE_ERROR as usual.
+/// (bliss-izt.1). With speculation (bliss-izt.2) the native code may hit a fixnum
+/// guard failure; it records the resume position via `c2i_deopt_state` and
+/// returns, which this surfaces as `OsrOutcome::Deopt` so the caller resumes T0
+/// on the same activation. A c2i error surfaces via NATIVE_ERROR as usual.
 fn run_native_osr(
     osr: &OsrCode,
     stub_off: usize,
     frame: *mut Frame,
     env: &mut Env,
-) -> Result<BlissVal, BlissError> {
+) -> Result<OsrOutcome, BlissError> {
     NATIVE_DEPTH.with(|d| d.set(d.get() + 1));
     let _depth_guard = NativeDepthGuard;
     // The OSR entry reads its activation from the frame slots pointer (rdi), the
@@ -5025,27 +5260,37 @@ fn run_native_osr(
     let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(entry_addr) };
     let ret = f(slots);
     NATIVE_ENV.with(|e| e.set(saved));
+    let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
+    let resume = NATIVE_DEOPT_RESUME.with(|c| c.take());
     let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_ERROR.with(|c| *c.borrow_mut() = saved_err);
-    // Non-speculating code sets no deopt flag; clear defensively.
-    NATIVE_DEOPT.with(|d| d.set(false));
     let _ = osr.num_slots;
     let _ = osr.code_info;
     if let Some(err) = my_err {
         return Err(err);
     }
-    Ok(BlissVal(ret))
+    if deopt {
+        if let Some((bcp, sp_top)) = resume {
+            return Ok(OsrOutcome::Deopt { bcp, sp_top });
+        }
+        // No resume point recorded — should not happen for OSR (speculation
+        // always records one), but treat it as a benign no-progress signal by
+        // resuming at the loop's back-edge target is not possible here, so fall
+        // through to Finished with the returned (dummy) value would be wrong.
+        // Instead surface an internal error to avoid silently returning garbage.
+        return Err(BlissError::Internal("OSR deopt without resume point".into()));
+    }
+    Ok(OsrOutcome::Finished(BlissVal(ret)))
 }
 
 /// If the back-edge to `target_bcp` is a hot loop at an empty operand stack,
-/// compile and enter OSR native code to finish this activation, returning its
-/// result (bliss-izt.1). `None` means not (yet) eligible — the caller keeps
-/// interpreting.
+/// compile and enter OSR native code to finish this activation (bliss-izt.1).
+/// `None` means not (yet) eligible — the caller keeps interpreting.
 fn maybe_osr(
     act: &Activation,
     target_bcp: u32,
     env: &mut Env,
-) -> Option<Result<BlissVal, BlissError>> {
+) -> Option<Result<OsrOutcome, BlissError>> {
     // Backward edge into an empty-operand-stack header, in a named function.
     if (target_bcp as usize) >= act.bcp || act.sp_top != 0 || act.sym == u32::MAX {
         return None;
