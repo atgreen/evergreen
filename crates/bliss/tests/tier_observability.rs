@@ -119,3 +119,33 @@ fn hot_loop_promotes_to_t1_with_identical_result() {
         .map(str::to_string);
     assert_eq!(tw_result.as_deref(), Some("5050"), "interpreter result must also be 5050");
 }
+
+/// Idiomatic DOTIMES/DOLIST loops (bliss-jtc.28) lower to bytecode and promote
+/// to T1 — not just explicit tagbody/go — with results identical to the
+/// interpreter. This is what makes the hotspot engine reach real-world loops.
+#[test]
+fn dotimes_and_dolist_promote_to_t1() {
+    // DOTIMES accumulator: sum of 0..99 = 4950.
+    let dt = "\
+        (defun tri (n) (let ((acc 0)) (dotimes (i n acc) (setq acc (+ acc i))))) \
+        (tri 5) (tri 5) (tri 5) \
+        (format t \"~a ~a~%\" (bliss-ext:function-tier (quote tri)) (tri 100))";
+    let (out, ok) = run(dt, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "dotimes run failed: {out}");
+    let out = out.lines().next().unwrap_or("").to_string();
+    let f: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(f.first().copied(), Some("1"), "dotimes loop must reach T1: {out:?}");
+    assert_eq!(f.get(1).copied(), Some("4950"), "dotimes result");
+
+    // DOLIST sum.
+    let dl = "\
+        (defun sm (lst) (let ((s 0)) (dolist (x lst s) (setq s (+ s x))))) \
+        (sm (list 1 2 3)) (sm (list 1 2 3)) (sm (list 1 2 3)) \
+        (format t \"~a ~a~%\" (bliss-ext:function-tier (quote sm)) (sm (list 10 20 30 40)))";
+    let (out, ok) = run(dl, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "dolist run failed: {out}");
+    let out = out.lines().next().unwrap_or("").to_string();
+    let f: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(f.first().copied(), Some("1"), "dolist loop must reach T1: {out:?}");
+    assert_eq!(f.get(1).copied(), Some("100"), "dolist result");
+}

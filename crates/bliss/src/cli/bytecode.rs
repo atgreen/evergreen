@@ -279,6 +279,16 @@ thread_local! {
     static REGISTRY: RefCell<HashMap<u32, Rc<BytecodeFunction>>> = RefCell::new(HashMap::new());
 }
 
+/// Build a proper list `(items...)` in the arena, for synthesising macro-style
+/// expansions during lowering (bliss-jtc.28, e.g. DOTIMES → block/tagbody).
+fn form_list(items: &[BlissVal]) -> BlissVal {
+    let mut acc = NIL;
+    for &x in items.iter().rev() {
+        acc = arena_cons(x, acc);
+    }
+    acc
+}
+
 fn registry_get(sym: u32) -> Option<Rc<BytecodeFunction>> {
     REGISTRY.with(|r| r.borrow().get(&sym).cloned())
 }
@@ -615,6 +625,8 @@ impl<'e> Lowerer<'e> {
                 "THROW" => self.lower_throw(rest),
                 "TAGBODY" => self.lower_tagbody(rest),
                 "GO" => self.lower_go(rest),
+                "DOTIMES" => self.lower_dotimes(rest),
+                "DOLIST" => self.lower_dolist(rest),
                 "UNWIND-PROTECT" => self.lower_unwind_protect(rest),
                 "HANDLER-CASE" => self.lower_handler_case(rest),
                 "HANDLER-BIND" => self.lower_handler_bind(rest),
@@ -1356,6 +1368,111 @@ impl<'e> Lowerer<'e> {
         self.pending_gos.push((idx, tagbody_id, name));
         self.push_n(1); // notional (go never yields)
         Ok(())
+    }
+
+    /// `(dotimes (var count [result]) body...)` (bliss-jtc.28). Lowered by
+    /// building the standard block/let/tagbody expansion and recursing through
+    /// the already-tested lowering, so idiomatic counting loops become
+    /// promotable bytecode instead of falling back to the tree-walker:
+    ///
+    ///   (block nil
+    ///     (let ((var 0) (limit count))
+    ///       (tagbody top (when (< var limit) body... (setq var (+ var 1)) (go top)))
+    ///       (setq var limit)   ; result-form sees var = count (CLHS)
+    ///       result))
+    fn lower_dotimes(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (binding, body) = cp(rest);
+        if !binding.is_cons() {
+            return Err(Bail);
+        }
+        let (var, br) = cp(binding);
+        if !var.is_symbol() {
+            return Err(Bail);
+        }
+        let (count_form, result_rest) = cp(br);
+        let result = if result_rest.is_cons() { cp(result_rest).0 } else { NIL };
+
+        let id = self.fresh_id();
+        let limit = resolve_sym(&format!("%DOTIMES-LIMIT{id}")).ok_or(Bail)?;
+        let top = resolve_sym(&format!("%DOTIMES-TOP{id}")).ok_or(Bail)?;
+        let s = |n: &str| resolve_sym(n).ok_or(Bail);
+
+        let test = form_list(&[s("<")?, var, limit]);
+        let mut when_items = vec![s("WHEN")?, test];
+        when_items.extend(list_to_vec(body));
+        when_items.push(form_list(&[
+            s("SETQ")?,
+            var,
+            form_list(&[s("+")?, var, BlissVal::from_fixnum(1)]),
+        ]));
+        when_items.push(form_list(&[s("GO")?, top]));
+        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+
+        let bindings = form_list(&[
+            form_list(&[var, BlissVal::from_fixnum(0)]),
+            form_list(&[limit, count_form]),
+        ]);
+        let let_form = form_list(&[
+            s("LET")?,
+            bindings,
+            tagbody_form,
+            form_list(&[s("SETQ")?, var, limit]),
+            result,
+        ]);
+        self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
+    }
+
+    /// `(dolist (var list [result]) body...)` (bliss-jtc.28). Expansion:
+    ///
+    ///   (block nil
+    ///     (let ((var nil) (rest list))
+    ///       (tagbody top (when rest (setq var (car rest)) body...
+    ///                                (setq rest (cdr rest)) (go top)))
+    ///       (setq var nil)   ; result-form sees var = nil (CLHS)
+    ///       result))
+    fn lower_dolist(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let (binding, body) = cp(rest);
+        if !binding.is_cons() {
+            return Err(Bail);
+        }
+        let (var, br) = cp(binding);
+        if !var.is_symbol() {
+            return Err(Bail);
+        }
+        let (list_form, result_rest) = cp(br);
+        let result = if result_rest.is_cons() { cp(result_rest).0 } else { NIL };
+
+        let id = self.fresh_id();
+        let rest_var = resolve_sym(&format!("%DOLIST-REST{id}")).ok_or(Bail)?;
+        let top = resolve_sym(&format!("%DOLIST-TOP{id}")).ok_or(Bail)?;
+        let s = |n: &str| resolve_sym(n).ok_or(Bail);
+
+        let mut when_items = vec![
+            s("WHEN")?,
+            rest_var,
+            form_list(&[s("SETQ")?, var, form_list(&[s("CAR")?, rest_var])]),
+        ];
+        when_items.extend(list_to_vec(body));
+        when_items.push(form_list(&[
+            s("SETQ")?,
+            rest_var,
+            form_list(&[s("CDR")?, rest_var]),
+        ]));
+        when_items.push(form_list(&[s("GO")?, top]));
+        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+
+        let bindings = form_list(&[
+            form_list(&[var, NIL]),
+            form_list(&[rest_var, list_form]),
+        ]);
+        let let_form = form_list(&[
+            s("LET")?,
+            bindings,
+            tagbody_form,
+            form_list(&[s("SETQ")?, var, NIL]),
+            result,
+        ]);
+        self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
     }
 
     /// `(unwind-protect protected cleanup...)` — the cleanup runs on both the
