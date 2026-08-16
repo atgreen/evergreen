@@ -279,6 +279,38 @@ impl Function {
     pub fn inst_mut(&mut self, i: Inst) -> &mut InstData { &mut self.insts[i.index()] }
     pub fn value(&self, v: Value) -> &ValueData { &self.values[v.index()] }
     pub fn num_blocks(&self) -> usize { self.blocks.len() }
+    pub fn num_insts(&self) -> usize { self.insts.len() }
+    pub fn num_values(&self) -> usize { self.values.len() }
+
+    /// Whether a handle is in range for this function's arenas. Verification
+    /// (P2) and any pass handling possibly-malformed IR should gate on these
+    /// before indexing, since the CFG traversals assume in-range successors.
+    pub fn is_valid_block(&self, b: Block) -> bool { b.index() < self.blocks.len() }
+    pub fn is_valid_inst(&self, i: Inst) -> bool { i.index() < self.insts.len() }
+    pub fn is_valid_value(&self, v: Value) -> bool { v.index() < self.values.len() }
+
+    // ── Inferred-fact channel (spec §4.5 R4.31, §4.10) ──
+    // The sanctioned way for an analysis (type inference, unboxing) to write a
+    // refined type / chosen representation back onto a value, instead of a
+    // side table. Type refinement is monotone (narrowing): the tag bits are met
+    // with the current bits, and an inferred range/class is adopted.
+
+    /// Narrow value `v`'s type with `ty` (met bits; adopt inferred range/class).
+    pub fn refine_type(&mut self, v: Value, ty: IRType) {
+        let slot = &mut self.values[v.index()];
+        slot.ty.bits = slot.ty.bits.meet(ty.bits);
+        if ty.range.is_some() {
+            slot.ty.range = ty.range;
+        }
+        if ty.class_id.is_some() {
+            slot.ty.class_id = ty.class_id;
+        }
+    }
+
+    /// Set value `v`'s machine representation (unboxing decision).
+    pub fn set_repr(&mut self, v: Value, repr: ValueRepresentation) {
+        self.values[v.index()].repr = repr;
+    }
 
     // ── Construction primitives (used by P1 builder & the passes) ──
 
@@ -380,7 +412,10 @@ impl Function {
             if idx < succs.len() {
                 stack.push((b, idx + 1));
                 let s = succs[idx];
-                if !visited[s.index()] {
+                // Skip an out-of-range successor rather than panicking: malformed
+                // IR (a dangling block handle) is a verifier finding (P2 V10),
+                // not a reason to abort traversal.
+                if s.index() < visited.len() && !visited[s.index()] {
                     visited[s.index()] = true;
                     stack.push((s, 0));
                 }
