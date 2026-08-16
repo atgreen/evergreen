@@ -89,6 +89,32 @@ fn fixnum_predicates_match_interpretation() {
     }
 }
 
+/// Inlined car/cdr/first/rest (bliss-jtc.27): NIL yields NIL, a cons loads the
+/// field, and a non-list operand deoptimizes to the interpreter's type error —
+/// crucially without dereferencing a non-cons (no segfault). Matches
+/// interpretation, and a list-walking loop promotes to T1.
+#[test]
+fn cons_accessors_match_and_deopt_safely() {
+    let cases = &[
+        "(defun f (x) (car x)) (f (list 1)) \
+           (format t \"~a~%\" (list (f (list 1 2 3)) (f nil) (f (cons 7 8))))",
+        "(defun f (x) (cdr x)) (f (list 1)) \
+           (format t \"~a~%\" (list (f (list 1 2 3)) (f nil) (f (cons 7 8))))",
+        "(defun f (x) (list (first x) (rest x))) (f (list 1)) \
+           (format t \"~a~%\" (list (f (list 9 8 7)) (f nil)))",
+        // list-summing loop with inlined car/cdr.
+        "(defun s (lst) (let ((a 0)) \
+           (loop (when (null lst) (return a)) (setq a (+ a (car lst))) (setq lst (cdr lst))))) \
+         (s (list 1)) (format t \"~a~%\" (s (list 10 20 30 40)))",
+        // non-list operand: the interpreter's type error, reached via deopt, not
+        // a crash — both backends print the same error line.
+        "(defun f (x) (car x)) (f (list 1)) (format t \"~a~%\" (f 5))",
+    ];
+    for c in cases {
+        assert_matches(c);
+    }
+}
+
 /// A fixnum-overflowing result deoptimizes and yields the correct bignum. The
 /// bignum is reduced mod a fixnum so the comparison is over printable values
 /// (bignums print opaquely in both backends).

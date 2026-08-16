@@ -4239,6 +4239,34 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
                         push_rax(&mut c);
                         continue;
                     }
+                    if let Some(offset) = inlinable_cons_accessor(*sym) {
+                        // (car/cdr x): NIL yields NIL; a cons (tag 001) loads the
+                        // field at `offset`; anything else deoptimizes to the
+                        // interpreter (which signals the type error) — the same
+                        // discrimination the c2i path performs, so equally safe.
+                        // No allocation or c2i, hence no GC point mid-sequence.
+                        pop_into(&mut c, 0, false); // x -> rax
+                        c.extend_from_slice(&[0x48, 0x3D]); // cmp rax, imm32
+                        c.extend_from_slice(&(bliss_rt::value::NIL_BITS as u32).to_le_bytes());
+                        c.extend_from_slice(&[0x74, 0x00]); // je rel8 → L_nil (patched)
+                        let je_site = c.len() - 1;
+                        c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                        c.extend_from_slice(&[0x83, 0xE2, 0x07]); // and edx, 7 (tag)
+                        c.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1 (TAG_CONS)
+                        jcc_deopt(&mut c, &mut deopt_sites, 0x85); // jne deopt
+                        c.extend_from_slice(&[0x48, 0x83, 0xE0, 0xF8]); // and rax, -8 (ptr)
+                        if offset == 0 {
+                            c.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]
+                        } else {
+                            c.extend_from_slice(&[0x48, 0x8B, 0x40, offset as u8]); // mov rax, [rax+8]
+                        }
+                        // L_nil: both paths converge here (rax = NIL, or the
+                        // loaded field). Patch the forward rel8.
+                        let l_nil = c.len();
+                        c[je_site] = (l_nil - (je_site + 1)) as u8;
+                        push_rax(&mut c);
+                        continue;
+                    }
                 }
                 // Speculative fixnum fast path (bliss-jtc.27): in a pure function,
                 // inline binary +,-,*,<,>,<=,>=,= for fixnum operands, guarding on
@@ -4529,6 +4557,16 @@ fn inlinable_fixnum_pred(sym: u32) -> Option<FixnumPred> {
         Some("MINUSP") => Some(FixnumPred::Minusp),
         Some("EVENP") => Some(FixnumPred::Evenp),
         Some("ODDP") => Some(FixnumPred::Oddp),
+        _ => None,
+    }
+}
+
+/// car (offset 0) or cdr (offset 8) — the cons-cell field an inlined accessor
+/// loads (bliss-jtc.27). A headerless 16-byte cons {car@0, cdr@8} is tagged 001.
+fn inlinable_cons_accessor(sym: u32) -> Option<i8> {
+    match bliss_rt::symbols::symbol_name(sym).as_deref() {
+        Some("CAR") | Some("FIRST") => Some(0),
+        Some("CDR") | Some("REST") => Some(8),
         _ => None,
     }
 }
