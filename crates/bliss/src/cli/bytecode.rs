@@ -3085,7 +3085,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                             Some(nc)
                         });
                         if let Some(nc) = native {
-                            match run_native(&nc, &args, env) {
+                            match run_native(&nc, sym, &args, env) {
                                 Ok(v) => {
                                     acts[top_idx].push_op(v);
                                     continue;
@@ -3702,6 +3702,26 @@ thread_local! {
     /// Error raised by a c2i callback, re-raised by `run_native` after the
     /// native call returns.
     static NATIVE_ERROR: RefCell<Option<BlissError>> = const { RefCell::new(None) };
+    /// Set by native (T1) code when a speculative guard fails (bliss-jtc.27): a
+    /// non-fixnum operand or a fixnum-overflowing arithmetic result. `run_native`
+    /// observes it, discards the native result, and re-runs the function in the
+    /// interpreter (T0) — a deoptimization that returns the correct value.
+    static NATIVE_DEOPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Count of speculative deoptimizations, for observability/tests (bliss-jtc.27).
+static DEOPT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total T1 speculative deoptimizations observed this process.
+pub fn deopt_count() -> u64 {
+    DEOPT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Signal a speculative deoptimization from native (T1) code (bliss-jtc.27).
+/// Sets the thread's deopt flag; `run_native` re-runs the function in the
+/// interpreter after the native frame returns.
+extern "C" fn c2i_deopt() {
+    NATIVE_DEOPT.with(|d| d.set(true));
 }
 
 /// Installed T1 native code for a function. Its CL activation (locals + operand
@@ -3767,7 +3787,12 @@ fn t1_threshold() -> u32 {
 /// arguments into its leading local slots, run the installed native code (which
 /// addresses the frame through rdi), then pop the frame. The native frame and
 /// any interpreter frames a c2i callback pushes all live on the one BlissStack.
-fn run_native(nc: &NativeCode, args: &[BlissVal], env: &mut Env) -> Result<BlissVal, BlissError> {
+fn run_native(
+    nc: &NativeCode,
+    sym: u32,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
     let thread = bliss_rt::current_thread();
     let stack = thread.stack();
     let frame = stack
@@ -3785,6 +3810,7 @@ fn run_native(nc: &NativeCode, args: &[BlissVal], env: &mut Env) -> Result<Bliss
 
     let saved = NATIVE_ENV.with(|e| e.replace(env as *mut Env));
     NATIVE_ERROR.with(|c| *c.borrow_mut() = None);
+    NATIVE_DEOPT.with(|d| d.set(false));
     // SAFETY: `entry` is installed executable code from emit_native_x86 with the
     // SysV signature `fn(*mut u64) -> u64`, reading its activation from `slots`.
     let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(nc.entry) };
@@ -3794,6 +3820,20 @@ fn run_native(nc: &NativeCode, args: &[BlissVal], env: &mut Env) -> Result<Bliss
     stack.pop_frame();
     if let Some(err) = NATIVE_ERROR.with(|c| c.borrow_mut().take()) {
         return Err(err);
+    }
+    // Deoptimization (bliss-jtc.27): a speculative guard failed. The native code
+    // only speculates in pure functions (no side effects before any guard), so
+    // re-running the whole function in the interpreter (T0) is observably
+    // equivalent and yields the correct result — e.g. a bignum where the fixnum
+    // fast path overflowed. The installed native code stays (fixnum calls remain
+    // fast); repeated deopts are the tuner's signal to back off (future work).
+    if NATIVE_DEOPT.with(|d| d.replace(false)) {
+        DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        trace("t1 speculative deopt → interpreter");
+        let entry = registry_get(sym).ok_or_else(|| {
+            BlissError::Internal("deopt: bytecode function vanished".into())
+        })?;
+        return run(entry, args, BlissVal::from_symbol_index(sym), env);
     }
     Ok(BlissVal(ret))
 }
@@ -3819,6 +3859,7 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
     let local_disp = |i: i32| 8 * i;
     let c2i_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64) -> u64 as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
+    let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
 
     let mut c: Vec<u8> = Vec::new();
     let mut offsets: Vec<usize> = Vec::with_capacity(bf.code.len());
@@ -3858,6 +3899,24 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
         c.extend_from_slice(&[0x4D, 0x8D, 0xBE]); // lea r15, [r14 + disp32]
         let disp = 8 * (n_locals + depth as i32);
         c.extend_from_slice(&disp.to_le_bytes());
+    };
+
+    // Speculative-fixnum eligibility (bliss-jtc.27): only when every call in the
+    // function is to a re-execution-safe primitive may we inline fixnum fast
+    // paths whose guards deoptimize by re-running the whole function. Purity of
+    // every call makes that re-run observably equivalent.
+    let deopt_safe = bf.code.iter().all(|i| match i {
+        Instr::CallNamed { sym, .. } => is_deopt_safe_primitive(*sym),
+        _ => true,
+    });
+    // Sites of `jcc rel32` guard branches that jump to the shared deopt block,
+    // patched once the block's offset is known.
+    let mut deopt_sites: Vec<usize> = Vec::new();
+    // Emit a two-byte-opcode conditional jump (0F xx) to the deopt block.
+    let jcc_deopt = |c: &mut Vec<u8>, sites: &mut Vec<usize>, opcode2: u8| {
+        c.extend_from_slice(&[0x0F, opcode2]);
+        sites.push(c.len());
+        c.extend_from_slice(&[0, 0, 0, 0]);
     };
 
     // ── Prologue ───────────────────────────────────────────────
@@ -3915,6 +3974,67 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
             Instr::CallNamed { sym, nargs } => {
                 if *nargs > 3 {
                     return None;
+                }
+                // Speculative fixnum fast path (bliss-jtc.27): in a pure function,
+                // inline binary +,-,*,<,>,<=,>=,= for fixnum operands, guarding on
+                // both being fixnums and (for arithmetic) no overflow. A failed
+                // guard jumps to the shared deopt block, which flags a deopt and
+                // returns; run_native then re-runs the function in the
+                // interpreter, yielding the correct value (e.g. a bignum).
+                if deopt_safe && *nargs == 2 {
+                    if let Some(op) = inlinable_fixnum_op(*sym) {
+                        // Pop operands: top=a1 -> rcx, next=a0 -> rax.
+                        pop_into(&mut c, 1, false); // a1 -> rcx
+                        pop_into(&mut c, 0, false); // a0 -> rax
+                        // Fixnum guard: (a0 | a1) low 3 bits must be 000.
+                        c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                        c.extend_from_slice(&[0x48, 0x09, 0xCA]); // or rdx, rcx
+                        c.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
+                        jcc_deopt(&mut c, &mut deopt_sites, 0x85); // jnz deopt
+                        match op {
+                            FixnumOp::Add => {
+                                // (a0<<3)+(a1<<3) = (a0+a1)<<3; jo iff fixnum
+                                // overflow (result exceeds 61-bit signed).
+                                c.extend_from_slice(&[0x48, 0x01, 0xC8]); // add rax, rcx
+                                jcc_deopt(&mut c, &mut deopt_sites, 0x80); // jo deopt
+                                push_rax(&mut c);
+                            }
+                            FixnumOp::Sub => {
+                                c.extend_from_slice(&[0x48, 0x29, 0xC8]); // sub rax, rcx
+                                jcc_deopt(&mut c, &mut deopt_sites, 0x80); // jo deopt
+                                push_rax(&mut c);
+                            }
+                            FixnumOp::Mul => {
+                                // Untag a0, then a0 * (a1<<3) = (a0*a1)<<3.
+                                c.extend_from_slice(&[0x48, 0xC1, 0xF8, 0x03]); // sar rax, 3
+                                c.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
+                                jcc_deopt(&mut c, &mut deopt_sites, 0x80); // jo deopt
+                                push_rax(&mut c);
+                            }
+                            FixnumOp::Lt | FixnumOp::Gt | FixnumOp::Le | FixnumOp::Ge
+                            | FixnumOp::NumEq => {
+                                // cmp a0, a1 (order-preserving on tagged fixnums),
+                                // then materialise T/NIL by the signed condition.
+                                c.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, NIL
+                                c.extend_from_slice(&bliss_rt::value::NIL_BITS.to_le_bytes());
+                                c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, T
+                                c.extend_from_slice(&bliss_rt::value::T_BITS.to_le_bytes());
+                                let cmov = match op {
+                                    FixnumOp::Lt => 0x4C,    // cmovl
+                                    FixnumOp::Gt => 0x4F,    // cmovg
+                                    FixnumOp::Le => 0x4E,    // cmovle
+                                    FixnumOp::Ge => 0x4D,    // cmovge
+                                    FixnumOp::NumEq => 0x44, // cmove
+                                    _ => unreachable!(),
+                                };
+                                // cmovCC rax, rdx  (48 0F cc C2)
+                                c.extend_from_slice(&[0x48, 0x0F, cmov, 0xC2]);
+                                push_rax(&mut c);
+                            }
+                        }
+                        continue;
+                    }
                 }
                 // c2i_call(sym, n, a0, a1, a2): rdi=sym, rsi=n, rdx=a0, rcx=a1,
                 // r8=a2. Top of stack is the last arg.
@@ -4019,6 +4139,26 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
         }
     }
 
+    // Shared deopt block (bliss-jtc.27): reached only via guard branches. Flag a
+    // deoptimization, then return through the normal epilogue (the value is
+    // ignored — run_native re-runs the function in the interpreter). rsp is
+    // 16-aligned here exactly as at any CallNamed, so the call is well-formed.
+    if !deopt_sites.is_empty() {
+        let deopt_off = c.len();
+        c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_deopt)
+        c.extend_from_slice(&deopt_addr.to_le_bytes());
+        c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+        c.extend_from_slice(&[0x41, 0x5F]); // pop r15
+        c.extend_from_slice(&[0x41, 0x5E]); // pop r14
+        c.extend_from_slice(&[0xC3]); // ret
+        for site in deopt_sites {
+            let rel = deopt_off as i64 - (site as i64 + 4);
+            let rel32 = i32::try_from(rel).ok()?;
+            c[site..site + 4].copy_from_slice(&rel32.to_le_bytes());
+        }
+    }
+
     for (site, target) in patches {
         // A branch/return target must land on a real instruction offset. A
         // block `resume_bcp` can equal code.len() only for a well-formed body
@@ -4030,6 +4170,59 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
         c[site..site + 4].copy_from_slice(&rel32.to_le_bytes());
     }
     Some(c)
+}
+
+/// Whether `sym` names a primitive that is safe to re-execute from scratch — no
+/// observable side effects (bliss-jtc.27). Speculative T1 codegen deoptimizes by
+/// re-running the whole function in the interpreter, so it may only speculate in
+/// functions whose every call is to such a primitive; then re-running from the
+/// start is guaranteed to produce the same result. Pure numeric/comparison/list
+/// constructors and accessors qualify; anything doing I/O, mutation, RNG, or
+/// time does not, and simply keeps the function out of speculative mode.
+fn is_deopt_safe_primitive(sym: u32) -> bool {
+    matches!(
+        bliss_rt::symbols::symbol_name(sym).as_deref(),
+        Some(
+            // arithmetic / comparison (some inlined, all re-run-safe)
+            "+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=" | "=" | "/="
+            | "1+" | "1-" | "MIN" | "MAX" | "ABS" | "MOD" | "REM" | "GCD" | "LCM"
+            | "FLOOR" | "CEILING" | "TRUNCATE" | "ROUND" | "EXPT" | "ISQRT"
+            | "LOGAND" | "LOGIOR" | "LOGXOR" | "LOGNOT" | "ASH"
+            | "ZEROP" | "PLUSP" | "MINUSP" | "EVENP" | "ODDP"
+            | "NUMBERP" | "INTEGERP" | "FLOATP" | "REALP" | "RATIONALP"
+            // pure list constructors / accessors (allocation is not observable)
+            | "CONS" | "CAR" | "CDR" | "LIST" | "NULL" | "NOT" | "EQ" | "EQL"
+            | "FIRST" | "REST" | "CONSP" | "ATOM" | "SYMBOLP"
+        )
+    )
+}
+
+/// Which binary primitive `sym` has an inlined fixnum fast path in T1 speculative
+/// codegen (bliss-jtc.27), if any. Returns a tag the codegen switches on.
+#[derive(Clone, Copy)]
+enum FixnumOp {
+    Add,
+    Sub,
+    Mul,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    NumEq,
+}
+
+fn inlinable_fixnum_op(sym: u32) -> Option<FixnumOp> {
+    match bliss_rt::symbols::symbol_name(sym).as_deref() {
+        Some("+") => Some(FixnumOp::Add),
+        Some("-") => Some(FixnumOp::Sub),
+        Some("*") => Some(FixnumOp::Mul),
+        Some("<") => Some(FixnumOp::Lt),
+        Some(">") => Some(FixnumOp::Gt),
+        Some("<=") => Some(FixnumOp::Le),
+        Some(">=") => Some(FixnumOp::Ge),
+        Some("=") => Some(FixnumOp::NumEq),
+        _ => None,
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]

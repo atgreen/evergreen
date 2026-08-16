@@ -7883,6 +7883,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .map(|f| BlissVal::from_fixnum(bliss_rt::function::back_edge_count(f) as i64))
                     .unwrap_or(NIL));
             }
+            // Process-wide count of T1 speculative deoptimizations (bliss-jtc.27):
+            // observability for the S5 gate's second half — a failed speculation
+            // deoptimizes to the interpreter and still returns the correct value.
+            "BLISS-EXT:DEOPT-COUNT" => {
+                return Ok(BlissVal::from_fixnum(bytecode::deopt_count() as i64));
+            }
             "BLISS-EXT:GETCWD" => {
                 // Current working directory as a namestring with a trailing
                 // slash (a directory namestring), for ASDF's getcwd (#+bliss).
