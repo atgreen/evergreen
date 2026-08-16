@@ -3834,6 +3834,36 @@ pub fn deopt_count() -> u64 {
     DEOPT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Append a Linux `perf` symbol-map entry for a freshly installed T1 function
+/// (bliss-jtc.10). When BLISS_PERF_MAP is set, `perf` symbolicates JIT frames by
+/// reading `/tmp/perf-<pid>.map`, whose lines are `<hex-addr> <hex-size> <name>`
+/// — so `perf top`/`perf report` show `T1:<function>` instead of an unknown
+/// address, exactly how HotSpot exposes its compiled code. Setting the variable
+/// to a path (any value containing '/') redirects the file, which the tests use;
+/// "1" (or any non-path value) writes the perf-standard `/tmp/perf-<pid>.map`.
+fn maybe_write_perf_map(addr: usize, size: usize, sym: u32) {
+    let Some(val) = std::env::var_os("BLISS_PERF_MAP") else {
+        return;
+    };
+    let val = val.to_string_lossy();
+    let path = if val.contains('/') {
+        val.into_owned()
+    } else {
+        format!("/tmp/perf-{}.map", std::process::id())
+    };
+    let raw = bliss_rt::symbols::symbol_name(sym).unwrap_or_else(|| format!("fn{sym}"));
+    // perf reads everything after the size as the symbol name; keep it a single
+    // token so tools that split on whitespace stay happy.
+    let name: String = raw
+        .chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{addr:x} {size:x} T1:{name}");
+    }
+}
+
 /// Signal a speculative deoptimization from native (T1) code (bliss-jtc.27).
 /// Sets the thread's deopt flag; `run_native` re-runs the function in the
 /// interpreter after the native frame returns.
@@ -4415,6 +4445,9 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
     let code_info = install_stack_map(num_slots)?;
     let buf = bliss_rt::jit::JitBuffer::new(&code)?;
     let entry = buf.leak();
+    // Emit a Linux perf symbol-map entry so `perf` can symbolicate this T1 frame
+    // (bliss-jtc.10) — the same mechanism HotSpot uses for its JIT code.
+    maybe_write_perf_map(entry as usize, code.len(), sym);
     let nc = Rc::new(NativeCode {
         entry,
         num_slots,
