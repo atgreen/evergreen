@@ -4772,6 +4772,7 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "GET-MACRO-CHARACTER"
             | "GET-PROPERTIES"
             | "GET-SETF-EXPANSION"
+            | "BLISS-EXT:RUN-PROGRAM"
             | "COMPILE-FILE"
             | "ENSURE-DIRECTORIES-EXIST"
             | "RENAME-FILE"
@@ -5305,6 +5306,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "MAKE-STRING-OUTPUT-STREAM" => {
                 // (make-string-output-stream &key element-type)
                 return bliss_stdlib::make_string_output_stream(NIL);
+            }
+            "CLOSE" => {
+                // (close stream &key abort) → T. Closing a non-stream is a no-op.
+                let args = list_to_vec(cdr);
+                let stream = if args.is_empty() {
+                    NIL
+                } else {
+                    eval_form(args[0], env)?
+                };
+                let mut abort = false;
+                let mut i = 1;
+                while i + 1 < args.len() {
+                    let key = eval_form(args[i], env)?;
+                    if key.is_symbol() && symbol_bare_name(&sym_name(key)) == "ABORT" {
+                        abort = eval_form(args[i + 1], env)? != NIL;
+                    }
+                    i += 2;
+                }
+                if is_stream(stream) {
+                    bliss_stdlib::close(stream, abort)?;
+                }
+                return Ok(T);
             }
             "GET-OUTPUT-STREAM-STRING" => {
                 let (sf, _) = cp(cdr);
@@ -7832,6 +7855,52 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     })
                     .unwrap_or(NIL));
             }
+            "BLISS-EXT:RUN-PROGRAM" => {
+                // (bliss-ext:run-program command) — run a subprocess synchronously,
+                // capturing stdout/stderr. COMMAND is a list of strings (program +
+                // args, executed directly) or a string (run via `/bin/sh -c`).
+                // Returns (values exit-code stdout-string stderr-string). UIOP's
+                // RUN-PROGRAM builds on this for #+bliss.
+                if env.sandbox {
+                    return Err(BlissError::SandboxViolation(
+                        "subprocess execution denied in sandbox mode".into(),
+                    ));
+                }
+                let (cmd_form, _) = cp(cdr);
+                let cmd_val = eval_form(cmd_form, env)?;
+                let mut command = if is_string_value(cmd_val) {
+                    let mut c = std::process::Command::new("/bin/sh");
+                    c.arg("-c").arg(val_as_str(cmd_val));
+                    c
+                } else {
+                    let parts: Vec<String> =
+                        list_to_vec(cmd_val).iter().map(|v| val_as_str(*v)).collect();
+                    if parts.is_empty() {
+                        return Err(BlissError::Internal(
+                            "run-program: empty command".into(),
+                        ));
+                    }
+                    let mut c = std::process::Command::new(&parts[0]);
+                    c.args(&parts[1..]);
+                    c
+                };
+                match command.output() {
+                    Ok(out) => {
+                        let code = out.status.code().unwrap_or(-1);
+                        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                        env.set_mv(vec![
+                            BlissVal::from_fixnum(code as i64),
+                            arena_str(&stdout),
+                            arena_str(&stderr),
+                        ]);
+                        return Ok(BlissVal::from_fixnum(code as i64));
+                    }
+                    Err(e) => {
+                        return Err(BlissError::FileError(format!("run-program: {e}")));
+                    }
+                }
+            }
             "BLISS-EXT:RAW-COMMAND-LINE-ARGUMENTS" => {
                 // The process argv as a list of strings (program name first),
                 // matching SBCL's sb-ext:*posix-argv*, for ASDF (#+bliss).
@@ -7921,8 +7990,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "DEFPACKAGE" => return eval_defpackage(cdr, env),
             "IN-PACKAGE" => {
                 let (pkg_form, _) = cp(cdr);
-                let pkg_val = eval_form(pkg_form, env)?;
-                let pkg_name = val_as_str(pkg_val)
+                // IN-PACKAGE's argument is a package designator and is NOT
+                // evaluated (CLHS): a symbol (interned or uninterned) or string
+                // whose name is used.
+                let raw = if pkg_form.is_symbol() {
+                    symbol_bare_name(&sym_name(pkg_form))
+                } else if is_string_value(pkg_form) {
+                    val_as_str(pkg_form)
+                } else {
+                    val_as_str(eval_form(pkg_form, env)?)
+                };
+                let pkg_name = raw
                     .trim_start_matches("KEYWORD:")
                     .trim_start_matches(':')
                     .to_uppercase();
@@ -10931,7 +11009,12 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
         c = rest;
     }
-    eval_progn(body, &mut child_env)
+    let __r = eval_progn(body, &mut child_env);
+    // Multiple values produced in the child body must propagate to the caller;
+    // env.child() forks the value registers (bliss-lb6.22).
+    env.mv = std::mem::take(&mut child_env.mv);
+    env.mv_active = child_env.mv_active;
+    __r
 }
 
 // ── Extract parameter names from a lambda list ──────────────────
@@ -12242,7 +12325,12 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             },
         );
     }
-    eval_progn(body, &mut child_env)
+    let __r = eval_progn(body, &mut child_env);
+    // Multiple values produced in the child body must propagate to the caller;
+    // env.child() forks the value registers (bliss-lb6.22).
+    env.mv = std::mem::take(&mut child_env.mv);
+    env.mv_active = child_env.mv_active;
+    __r
 }
 
 fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -12259,7 +12347,12 @@ fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
         let (expansion, _) = cp(expansion_rest);
         child_env.define_symbol_macro(symbol, expansion);
     }
-    eval_progn(body, &mut child_env)
+    let __r = eval_progn(body, &mut child_env);
+    // Multiple values produced in the child body must propagate to the caller;
+    // env.child() forks the value registers (bliss-lb6.22).
+    env.mv = std::mem::take(&mut child_env.mv);
+    env.mv_active = child_env.mv_active;
+    __r
 }
 
 // ── DEFCLASS ─────────────────────────────────────────────────────
@@ -13465,8 +13558,18 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
 // ── DEFPACKAGE ──────────────────────────────────────────────────
 fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, opts) = cp(cdr);
-    let name_val = eval_form(name_form, env)?;
-    let pkg_name = val_as_str(name_val)
+    // DEFPACKAGE's name is a package DESIGNATOR and is NOT evaluated (CLHS): a
+    // string, or a symbol (interned OR uninterned, e.g. `#:ocicl-runtime`) whose
+    // name is used. Evaluating it would look an uninterned symbol up as a
+    // variable and signal UNBOUND-VARIABLE.
+    let name_raw = if name_form.is_symbol() {
+        symbol_bare_name(&sym_name(name_form))
+    } else if is_string_value(name_form) {
+        val_as_str(name_form)
+    } else {
+        val_as_str(eval_form(name_form, env)?)
+    };
+    let pkg_name = name_raw
         .trim_start_matches("KEYWORD:")
         .trim_start_matches(':')
         .to_uppercase();

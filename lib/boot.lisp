@@ -472,6 +472,12 @@
   `(let ((,var (make-string-input-stream ,string ,start ,end)))
      ,@body))
 
+;;; WITH-OPEN-STREAM: bind VAR to STREAM for BODY, closing it on exit.
+(defmacro with-open-stream ((var stream) &rest body)
+  `(let ((,var ,stream))
+     (unwind-protect (progn ,@body)
+       (close ,var))))
+
 (defmacro with-standard-io-syntax (&rest body)
   `(let ((*readtable* :standard-readtable)
          (*package* "COMMON-LISP-USER")

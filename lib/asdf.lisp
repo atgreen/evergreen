@@ -7317,7 +7317,30 @@ RUN-PROGRAM returns 3 values:
 or an indication of failure via the EXIT-CODE of the process"
     (declare (ignorable input output error-output if-input-does-not-exist if-output-exists
                         if-error-output-exists element-type external-format ignore-error-status))
-    #-(or abcl allegro clasp clisp clozure cmucl cormanlisp ecl gcl lispworks mcl mkcl sbcl scl xcl)
+    #+bliss
+    (return-from run-program
+      (multiple-value-bind (exit-code out-str err-str)
+          (bliss-ext:run-program command)
+        (flet ((process (spec str)
+                 ;; Handle the common OUTPUT/ERROR-OUTPUT slurp specs directly
+                 ;; (bliss lacks SLURP-INPUT-STREAM's stream methods).
+                 (cond
+                   ((null spec) nil)
+                   ((or (eq spec t) (eq spec :interactive)) (write-string str) nil)
+                   ((eq spec :string) str)
+                   ((and (consp spec) (eq (first spec) :string))
+                    (if (getf (rest spec) :stripped)
+                        (string-right-trim '(#\Newline #\Return #\Space #\Tab) str)
+                        str))
+                   ((eq spec :form) (with-input-from-string (s str) (read s nil nil)))
+                   (t str))))
+          (let ((out-result (process output out-str))
+                (err-result (process error-output err-str)))
+            (unless (or ignore-error-status (zerop exit-code))
+              (cerror "Continue anyway."
+                      'subprocess-error :command command :code exit-code))
+            (values out-result err-result exit-code)))))
+    #-(or abcl allegro clasp clisp clozure cmucl cormanlisp ecl gcl lispworks mcl mkcl sbcl scl xcl bliss)
     (not-implemented-error 'run-program)
     (apply (if (or force-shell
                    ;; Per doc string, set FORCE-SHELL to T if we get command as a string.
