@@ -122,3 +122,52 @@ fn hot_speculative_loop_no_deopt() {
     // sum of i*i for i in 0..99 = 328350
     assert_eq!(fields.get(2).copied(), Some("328350"), "result must match interpretation");
 }
+
+/// A function that keeps deoptimizing (always called outside its speculated
+/// fixnum domain) is blacklisted once its deopt count crosses the configured
+/// threshold: its speculative native code is uninstalled, it drops back to T0,
+/// the deopt count stops climbing, and results stay correct (bliss-jtc.27).
+#[test]
+fn repeated_deopts_blacklist_and_back_off_to_t0() {
+    let program = "\
+        (defun g (a b) (+ (* a a) (* b b))) \
+        (g 1 1) (g 2 2) \
+        (g 1.0 2.0) (g 1.0 2.0) (g 1.0 2.0) (g 1.0 2.0) (g 1.0 2.0) (g 1.0 2.0) \
+        (format t \"~a ~a ~a~%\" \
+                (bliss-ext:function-tier (quote g)) \
+                (bliss-ext:deopt-count) \
+                (g 3.0 4.0))";
+    let out = eval(program, &[("BLISS_T1_THRESHOLD", "2"), ("BLISS_DEOPT_BLACKLIST_THRESHOLD", "3")]);
+    let fields: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(fields.first().copied(), Some("0"), "blacklisted function drops to T0: {out:?}");
+    // The count stops at the threshold: once blacklisted there is no native code
+    // left to deopt, so the six float calls produce exactly three deopts.
+    assert_eq!(fields.get(1).copied(), Some("3"), "deopt count plateaus at threshold: {out:?}");
+    // (+ (* 3.0 3.0) (* 4.0 4.0)) = 25.0, printed as the tree-walker prints it.
+    let tw_val = eval(
+        "(defun g (a b) (+ (* a a) (* b b))) (format t \"~a~%\" (g 3.0 4.0))",
+        &[("BLISS_BACKEND", "tree-walker")],
+    );
+    assert_eq!(fields.get(2).copied(), Some(tw_val.as_str()), "result stays correct after blacklist");
+}
+
+/// Blacklisting is not triggered by a pure fixnum hot loop: it never deopts, so
+/// it stays at T1 indefinitely (bliss-jtc.27 — backoff only punishes functions
+/// whose speculation actually fails).
+#[test]
+fn pure_fixnum_loop_is_never_blacklisted() {
+    let program = "\
+        (defun sumsq (n) (let ((s 0) (i 0)) \
+          (tagbody top (when (< i n) (setq s (+ s (* i i))) (setq i (+ i 1)) (go top))) \
+          s)) \
+        (sumsq 10) (sumsq 10) (sumsq 10) (sumsq 10) (sumsq 10) \
+        (format t \"~a ~a ~a~%\" \
+                (bliss-ext:function-tier (quote sumsq)) \
+                (bliss-ext:deopt-count) \
+                (sumsq 100))";
+    let out = eval(program, &[("BLISS_T1_THRESHOLD", "2"), ("BLISS_DEOPT_BLACKLIST_THRESHOLD", "3")]);
+    let fields: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(fields.first().copied(), Some("1"), "fixnum loop stays T1: {out:?}");
+    assert_eq!(fields.get(1).copied(), Some("0"), "fixnum loop never deopts: {out:?}");
+    assert_eq!(fields.get(2).copied(), Some("328350"), "result correct");
+}

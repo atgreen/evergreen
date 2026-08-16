@@ -3772,6 +3772,24 @@ thread_local! {
     static NATIVE_REGISTRY: RefCell<HashMap<u32, Rc<NativeCode>>> = RefCell::new(HashMap::new());
     /// Per-function invocation counters driving T0→T1 promotion.
     static INVOKE_COUNTS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+    /// Per-function speculative-deopt counters (bliss-jtc.27). When a function
+    /// deopts more than the backoff threshold, its speculative native code is
+    /// uninstalled and it is blacklisted from re-promotion — HotSpot's policy of
+    /// not repeatedly recompiling code that keeps deoptimizing.
+    static DEOPT_COUNTS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+    /// Functions whose speculation proved unprofitable; kept in T0 thereafter.
+    static DEOPT_BLACKLIST: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Per-function deopt count before a function's speculative code is uninstalled
+/// and blacklisted (bliss-jtc.27). Env-overridable for tests; default 8.
+fn deopt_blacklist_threshold() -> u32 {
+    std::env::var("BLISS_DEOPT_BLACKLIST_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8)
 }
 
 /// T0→T1 promotion threshold (invocations). Env-overridable for tests.
@@ -3825,11 +3843,32 @@ fn run_native(
     // only speculates in pure functions (no side effects before any guard), so
     // re-running the whole function in the interpreter (T0) is observably
     // equivalent and yields the correct result — e.g. a bignum where the fixnum
-    // fast path overflowed. The installed native code stays (fixnum calls remain
-    // fast); repeated deopts are the tuner's signal to back off (future work).
+    // fast path overflowed.
     if NATIVE_DEOPT.with(|d| d.replace(false)) {
         DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         trace("t1 speculative deopt → interpreter");
+        // Backoff/blacklist: an occasional deopt (a rare overflow) is fine and
+        // the fast path stays installed. But a function that keeps deopting is
+        // being called outside its speculated fixnum domain, so past a threshold
+        // uninstall its native code and blacklist it from re-promotion — it runs
+        // in T0 from then on, correct and without per-call deopt overhead. This
+        // is HotSpot's policy of not repeatedly recompiling deoptimizing code.
+        let n = DEOPT_COUNTS.with(|m| {
+            let mut b = m.borrow_mut();
+            let e = b.entry(sym).or_insert(0);
+            *e += 1;
+            *e
+        });
+        if n >= deopt_blacklist_threshold() {
+            NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+            DEOPT_BLACKLIST.with(|s| s.borrow_mut().insert(sym));
+            if let Some(f) = bliss_rt::symbols::symbol_function(sym)
+                .filter(|&c| bliss_rt::function::is_interpreted_function(c))
+            {
+                bliss_rt::function::set_tier(f, 0);
+            }
+            trace("t1 speculation blacklisted → staying T0");
+        }
         let entry = registry_get(sym).ok_or_else(|| {
             BlissError::Internal("deopt: bytecode function vanished".into())
         })?;
@@ -4234,6 +4273,11 @@ fn emit_native_x86(_bf: &BytecodeFunction) -> Option<Vec<u8>> {
 /// executable memory). Returns the installed code, or `None` if it can't be
 /// compiled to native.
 fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
+    // Blacklisted (bliss-jtc.27): a function whose speculation repeatedly failed
+    // is not recompiled — it stays in T0 to avoid churning through deopts.
+    if DEOPT_BLACKLIST.with(|s| s.borrow().contains(&sym)) {
+        return None;
+    }
     let bf = registry_get(sym)?;
     // Only promote leaf-ish functions: a T1 function's calls cross back through
     // c2i into the interpreter, so a call to another *bytecode* function (which
