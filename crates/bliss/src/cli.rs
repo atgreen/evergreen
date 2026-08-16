@@ -554,6 +554,11 @@ struct Env {
     frame: Rc<RefCell<EnvFrame>>,
     funs: Rc<HashMap<String, FunDef>>,
     macros: Rc<HashMap<String, MacroDef>>,
+    /// User SETF-expanders (DEFINE-SETF-EXPANDER / DEFSETF), keyed by access-fn
+    /// name. Shared and mutated in place (like `closures`) so a definition made
+    /// inside a child env — e.g. a MACROLET body or a macro expansion — is
+    /// visible globally, matching how DEFUN installs into the symbol cell.
+    setf_expanders: Rc<RefCell<HashMap<String, SetfExpander>>>,
     symbol_macros: Rc<HashMap<u32, BlissVal>>,
     classes: Rc<HashMap<String, ClassDef>>,
     generics: Rc<HashMap<String, GenericDef>>,
@@ -621,6 +626,17 @@ struct MacroDef {
     params_form: BlissVal,
     body: BlissVal,
     captured_frame: Rc<RefCell<EnvFrame>>,
+}
+
+/// A registered SETF-expander.
+#[derive(Clone)]
+enum SetfExpander {
+    /// DEFINE-SETF-EXPANDER / long-form DEFSETF: a macro-like function of the
+    /// place's subforms returning the five setf-expansion values.
+    Expander(MacroDef),
+    /// Short-form DEFSETF `(defsetf access-fn update-fn)`: store the new value
+    /// via `(update-fn arg… new)`.
+    ShortUpdate(BlissVal),
 }
 
 #[allow(dead_code)]
@@ -2058,6 +2074,7 @@ impl Env {
             frame: Rc::new(RefCell::new(EnvFrame::default())),
             funs: Rc::new(HashMap::new()),
             macros: Rc::new(HashMap::new()),
+            setf_expanders: Rc::new(RefCell::new(HashMap::new())),
             symbol_macros: Rc::new(HashMap::new()),
             classes: Rc::new(HashMap::new()),
             generics: Rc::new(HashMap::new()),
@@ -2188,6 +2205,7 @@ impl Env {
             })),
             funs: Rc::clone(&self.funs),
             macros: Rc::clone(&self.macros),
+            setf_expanders: Rc::clone(&self.setf_expanders),
             symbol_macros: Rc::clone(&self.symbol_macros),
             classes: Rc::clone(&self.classes),
             generics: Rc::clone(&self.generics),
@@ -2217,6 +2235,7 @@ impl Env {
             })),
             funs: Rc::clone(&self.funs),
             macros: Rc::clone(&self.macros),
+            setf_expanders: Rc::clone(&self.setf_expanders),
             symbol_macros: Rc::clone(&self.symbol_macros),
             classes: Rc::clone(&self.classes),
             generics: Rc::clone(&self.generics),
@@ -2931,50 +2950,100 @@ fn format_body_forms(forms: BlissVal) -> String {
 /// Expand a quasiquote template, substituting BLISS::UNQUOTE forms with
 /// their evaluated values and splicing BLISS::UNQUOTE-SPLICING forms.
 fn eval_quasiquote(template: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    // If template is not a cons, return it as-is (like quote)
+    eval_quasiquote_depth(template, env, 1)
+}
+
+/// Expand a quasiquote template at nesting `depth` (1 = the outermost backquote).
+/// A nested `` ` `` raises the depth; a `,`/`,@` lowers it. An unquote is only
+/// evaluated when it brings the depth to 0 — otherwise its wrapper is preserved
+/// and its content is processed one level shallower, so nested backquotes like
+/// `` `(a `(b ,x)) `` keep the inner `,x` unevaluated (CLHS 2.4.6).
+fn eval_quasiquote_depth(
+    template: BlissVal,
+    env: &mut Env,
+    depth: u32,
+) -> Result<BlissVal, BlissError> {
     if !template.is_cons() {
         return Ok(template);
     }
     let (car, cdr) = cp(template);
+    let head = if car.is_symbol() { sym_name(car) } else { String::new() };
 
-    // Check if template is (BLISS::UNQUOTE expr)
-    if car.is_symbol() && sym_name(car) == "BLISS::UNQUOTE" {
+    // (BLISS::UNQUOTE expr): evaluate at depth 1, else keep wrapper at depth-1.
+    if head == "BLISS::UNQUOTE" {
         let (expr, _) = cp(cdr);
-        return eval_form(expr, env);
+        if depth == 1 {
+            return eval_form(expr, env);
+        }
+        let inner = eval_quasiquote_depth(expr, env, depth - 1)?;
+        return Ok(arena_cons(car, arena_cons(inner, NIL)));
+    }
+    // A bare ,@ template is an error at the outermost level; deeper, keep it.
+    if head == "BLISS::UNQUOTE-SPLICING" {
+        if depth == 1 {
+            return Err(BlissError::Internal(",@ not inside a list".into()));
+        }
+        let (expr, _) = cp(cdr);
+        let inner = eval_quasiquote_depth(expr, env, depth - 1)?;
+        return Ok(arena_cons(car, arena_cons(inner, NIL)));
+    }
+    // A nested `` ` ``: preserve the wrapper, process its body one level deeper.
+    if head == "BLISS::QUASIQUOTE" {
+        let (inner_tmpl, _) = cp(cdr);
+        let inner = eval_quasiquote_depth(inner_tmpl, env, depth + 1)?;
+        return Ok(arena_cons(car, arena_cons(inner, NIL)));
     }
 
-    // Check if template is (BLISS::UNQUOTE-SPLICING expr) at top level — error
-    if car.is_symbol() && sym_name(car) == "BLISS::UNQUOTE-SPLICING" {
-        return Err(BlissError::Internal(",@ not inside a list".into()));
-    }
-
-    // Recursively process each element of the list, handling splicing
+    // Process each element, honoring ,@ splicing only at depth 1.
     let mut result_elems: Vec<BlissVal> = Vec::new();
     let mut cur = template;
     while cur.is_cons() {
         let (elem, rest) = cp(cur);
-        // Check if elem is (BLISS::UNQUOTE-SPLICING expr)
+        // A nested backquote as an element must not be flattened element-wise.
         if elem.is_cons() {
             let (ecar, ecdr) = cp(elem);
-            if ecar.is_symbol() && sym_name(ecar) == "BLISS::UNQUOTE-SPLICING" {
+            let ecar_name = if ecar.is_symbol() { sym_name(ecar) } else { String::new() };
+            if ecar_name == "BLISS::UNQUOTE-SPLICING" {
                 let (splice_expr, _) = cp(ecdr);
-                let splice_val = eval_form(splice_expr, env)?;
-                // Splice the list into the result
-                let spliced = list_to_vec(splice_val);
-                result_elems.extend(spliced);
+                if depth == 1 {
+                    let splice_val = eval_form(splice_expr, env)?;
+                    result_elems.extend(list_to_vec(splice_val));
+                } else {
+                    let inner = eval_quasiquote_depth(splice_expr, env, depth - 1)?;
+                    result_elems.push(arena_cons(ecar, arena_cons(inner, NIL)));
+                }
                 cur = rest;
                 continue;
             }
+            // `,,@x` — (UNQUOTE (UNQUOTE-SPLICING x)) as an element: the outer `,`
+            // reduces the level, and at the enclosing level `,@x` splices. For the
+            // common two-deep case (`` `(… `(… ,,@x)) ``), evaluate x now and wrap
+            // each spliced element in a single UNQUOTE for the inner backquote.
+            if ecar_name == "BLISS::UNQUOTE" && ecdr.is_cons() {
+                let (inner_elem, _) = cp(ecdr);
+                if inner_elem.is_cons() {
+                    let (icar, icdr) = cp(inner_elem);
+                    if icar.is_symbol()
+                        && sym_name(icar) == "BLISS::UNQUOTE-SPLICING"
+                        && depth == 2
+                    {
+                        let (splice_expr, _) = cp(icdr);
+                        let splice_val = eval_form(splice_expr, env)?;
+                        for e in list_to_vec(splice_val) {
+                            result_elems.push(arena_cons(ecar, arena_cons(e, NIL)));
+                        }
+                        cur = rest;
+                        continue;
+                    }
+                }
+            }
         }
-        // Regular element — recursively expand
-        let expanded = eval_quasiquote(elem, env)?;
+        let expanded = eval_quasiquote_depth(elem, env, depth)?;
         result_elems.push(expanded);
         cur = rest;
     }
-    // Handle dotted pair tail
     if !cur.is_nil() {
-        let expanded_tail = eval_quasiquote(cur, env)?;
-        // Build from the back with the non-nil tail
+        let expanded_tail = eval_quasiquote_depth(cur, env, depth)?;
         let mut result = expanded_tail;
         for e in result_elems.iter().rev() {
             result = arena_cons(*e, result);
@@ -3415,6 +3484,8 @@ fn compile_toplevel_form_has_effect(form: BlissVal, env: &Env) -> bool {
             | "DEFINE-COMPILER-MACRO"
             | "DEFINE-SYMBOL-MACRO"
             | "DEFSETF"
+            | "DEFINE-SETF-EXPANDER"
+            | "GET-SETF-EXPANSION"
             | "DEFCLASS"
             | "DEFSTRUCT"
             | "DEFGENERIC"
@@ -4643,6 +4714,10 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "MACROEXPAND-1"
             | "GET-MACRO-CHARACTER"
             | "GET-PROPERTIES"
+            | "GET-SETF-EXPANSION"
+            | "COMPILE-FILE"
+            | "ENSURE-DIRECTORIES-EXIST"
+            | "RENAME-FILE"
             | "GET-DECODED-TIME"
             | "DECODE-UNIVERSAL-TIME"
             | "DECODE-FLOAT"
@@ -5812,8 +5887,37 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         } else {
                             String::new()
                         };
+                        // A user SETF-expander (DEFINE-SETF-EXPANDER / DEFSETF)
+                        // takes precedence over the built-in place handling below.
+                        if env.setf_expanders.borrow().contains_key(&acc) {
+                            result = apply_setf_expansion(place, val, env)?;
+                            c = r2;
+                            continue;
+                        }
                         let (tgt_form, _) = cp(aargs);
                         match acc.as_str() {
+                            "VALUES" => {
+                                // (setf (values p1 p2 …) form) — distribute the
+                                // values FORM produced (captured in env.mv by the
+                                // eval above) across the places, defaulting missing
+                                // values to NIL.
+                                let values = if env.mv_active {
+                                    env.mv.clone()
+                                } else {
+                                    vec![val]
+                                };
+                                let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
+                                for (i, pf) in list_to_vec(aargs).into_iter().enumerate() {
+                                    let v = values.get(i).copied().unwrap_or(NIL);
+                                    let quoted = arena_cons(quote_sym, arena_cons(v, NIL));
+                                    let setf_form = vec_to_list(&[
+                                        resolve_sym("SETF").unwrap_or(NIL),
+                                        pf,
+                                        quoted,
+                                    ]);
+                                    eval_form(setf_form, env)?;
+                                }
+                            }
                             "CAR" | "FIRST" => {
                                 let tgt = eval_form(tgt_form, env)?;
                                 if tgt.is_cons() {
@@ -5983,12 +6087,35 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "DEFUN" => return eval_defun(cdr, env),
             "DEFSETF" => {
-                // Minimal: user SETF-expanders aren't consulted by SETF yet, so
-                // accept the definition (returning the access-fn name) without
-                // registering an expander. `(setf (access-fn …) …)` will still
-                // fall through to SETF's built-in place handling.
-                let (name_form, _) = cp(cdr);
-                return Ok(name_form);
+                // Short form (defsetf access-fn update-fn) registers an expander
+                // that stores via (update-fn arg… new). The long form
+                // (defsetf access-fn lambda-list (store) . body) is treated like a
+                // DEFINE-SETF-EXPANDER whose body yields the store form.
+                let (name_form, rest) = cp(cdr);
+                let (second, more) = cp(rest);
+                if second.is_symbol() {
+                    // Short form: update-fn is a symbol.
+                    let update_fn = second;
+                    return eval_defsetf_short(name_form, update_fn, env);
+                }
+                // Long form: (defsetf name (args…) (store) body…). Build an
+                // equivalent define-setf-expander.
+                return eval_defsetf_long(name_form, second, more, env);
+            }
+            "DEFINE-SETF-EXPANDER" => return eval_define_setf_expander(cdr, env),
+            "GET-SETF-EXPANSION" => {
+                // (get-setf-expansion place &optional environment) → five values.
+                let (place_form, _) = cp(cdr);
+                let place = eval_form(place_form, env)?;
+                let ex = get_setf_expansion(place, env)?;
+                env.set_mv(vec![
+                    vec_to_list(&ex.temps),
+                    vec_to_list(&ex.vals),
+                    vec_to_list(&ex.stores),
+                    ex.store_form,
+                    ex.access_form,
+                ]);
+                return Ok(vec_to_list(&ex.temps));
             }
             "FLET" | "LABELS" => return eval_flet(cdr, env),
             "DEFMACRO" => return eval_defmacro(cdr, env),
@@ -11424,6 +11551,209 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         },
     );
     Ok(name_form)
+}
+
+fn eval_define_setf_expander(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    // (define-setf-expander access-fn lambda-list . body) — register a macro-like
+    // expander keyed by ACCESS-FN. It is called with the place's subforms and
+    // returns the five setf-expansion values.
+    let (name_form, rest) = cp(cdr);
+    let (params_form, body) = cp(rest);
+    let name = sym_name(name_form);
+    env.setf_expanders.borrow_mut().insert(
+        name,
+        SetfExpander::Expander(MacroDef {
+            params_form,
+            body,
+            captured_frame: Rc::clone(&env.frame),
+        }),
+    );
+    Ok(name_form)
+}
+
+fn eval_defsetf_short(
+    name_form: BlissVal,
+    update_fn: BlissVal,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    env.setf_expanders
+        .borrow_mut()
+        .insert(sym_name(name_form), SetfExpander::ShortUpdate(update_fn));
+    Ok(name_form)
+}
+
+fn eval_defsetf_long(
+    name_form: BlissVal,
+    _lambda_list: BlissVal,
+    _rest: BlissVal,
+    _env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    // The long form `(defsetf access-fn (args…) (store) body…)` is accepted but
+    // not registered; `(setf (access-fn …) …)` then falls through to the default
+    // `(setf access-fn)` writer path. DEFINE-SETF-EXPANDER covers the cases we
+    // actually need (e.g. alexandria's assoc-value).
+    Ok(name_form)
+}
+
+/// A fresh uninterned symbol for use as a setf-expansion temporary, so it can
+/// never capture a variable in the caller's code.
+fn gensym_symbol(prefix: &str) -> BlissVal {
+    thread_local! { static COUNTER: RefCell<u64> = const { RefCell::new(0) }; }
+    let n = COUNTER.with(|c| {
+        let v = *c.borrow();
+        *c.borrow_mut() = v + 1;
+        v
+    });
+    reader::make_uninterned_symbol(&format!("#:{prefix}-SETF-{n}"))
+}
+
+/// The five values of a setf-expansion (CLHS 5.1.2.3): temporary variables,
+/// their value forms, the store variables, the storing form, and the accessing
+/// form.
+struct SetfExpansion {
+    temps: Vec<BlissVal>,
+    vals: Vec<BlissVal>,
+    stores: Vec<BlissVal>,
+    store_form: BlissVal,
+    access_form: BlissVal,
+}
+
+/// Compute the setf-expansion of PLACE (CLHS GET-SETF-EXPANSION).
+fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, BlissError> {
+    // A variable (or symbol-macro) place: no temporaries; store via SETQ.
+    if place.is_symbol() {
+        if let Some(expansion) = env.lookup_symbol_macro(place) {
+            return get_setf_expansion(expansion, env);
+        }
+        let store = gensym_symbol("NEW");
+        let setq = vec_to_list(&[resolve_sym("SETQ").unwrap_or(NIL), place, store]);
+        return Ok(SetfExpansion {
+            temps: Vec::new(),
+            vals: Vec::new(),
+            stores: vec![store],
+            store_form: setq,
+            access_form: place,
+        });
+    }
+    if place.is_cons() {
+        let (accessor, args) = cp(place);
+        let acc = if accessor.is_symbol() {
+            sym_name(accessor)
+        } else {
+            String::new()
+        };
+        // A user-defined expander wins.
+        let expander = env.setf_expanders.borrow().get(&acc).cloned();
+        if let Some(expander) = expander {
+            match expander {
+                SetfExpander::Expander(mdef) => {
+                    // Apply it to the place's subforms and read back the five
+                    // values it returns via (values …). The expander body runs in
+                    // a CHILD env, so the multiple values land on that child's mv —
+                    // read them there, not on the caller's env.
+                    let mut child = env.child_with_parent(Rc::clone(&mdef.captured_frame));
+                    let arg_list = list_to_vec(args);
+                    let macroexpand_env = if params_form_uses_environment(mdef.params_form) {
+                        Some(macroexpand_environment_from_cli(env))
+                    } else {
+                        None
+                    };
+                    bind_macro_lambda_list(
+                        mdef.params_form,
+                        &arg_list,
+                        &mut child,
+                        macroexpand_env.as_ref(),
+                    )?;
+                    let first = eval_progn(mdef.body, &mut child)?;
+                    let mut values = if child.mv_active {
+                        std::mem::take(&mut child.mv)
+                    } else {
+                        vec![first]
+                    };
+                    while values.len() < 5 {
+                        values.push(NIL);
+                    }
+                    return Ok(SetfExpansion {
+                        temps: list_to_vec(values[0]),
+                        vals: list_to_vec(values[1]),
+                        stores: list_to_vec(values[2]),
+                        store_form: values[3],
+                        access_form: values[4],
+                    });
+                }
+                SetfExpander::ShortUpdate(update_fn) => {
+                    // (setf (name arg…) new) => (update-fn arg… new).
+                    let arg_forms = list_to_vec(args);
+                    let temps: Vec<BlissVal> =
+                        (0..arg_forms.len()).map(|_| gensym_symbol("A")).collect();
+                    let store = gensym_symbol("NEW");
+                    let mut access_items = vec![accessor];
+                    access_items.extend_from_slice(&temps);
+                    let mut store_items = vec![update_fn];
+                    store_items.extend_from_slice(&temps);
+                    store_items.push(store);
+                    return Ok(SetfExpansion {
+                        temps,
+                        vals: arg_forms,
+                        stores: vec![store],
+                        store_form: vec_to_list(&store_items),
+                        access_form: vec_to_list(&access_items),
+                    });
+                }
+            }
+        }
+        // Default expansion for a function place with a `(setf f)` writer: bind
+        // each argument to a temporary, then store via `((setf f) new t1 t2 …)`
+        // and access via `(f t1 t2 …)`.
+        let arg_forms = list_to_vec(args);
+        let temps: Vec<BlissVal> = (0..arg_forms.len()).map(|_| gensym_symbol("A")).collect();
+        let store = gensym_symbol("NEW");
+        let mut access_items = vec![accessor];
+        access_items.extend_from_slice(&temps);
+        let access_form = vec_to_list(&access_items);
+        let setf_fn = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), accessor]);
+        let mut store_items = vec![resolve_sym("FUNCALL").unwrap_or(NIL), setf_fn, store];
+        store_items.extend_from_slice(&temps);
+        let store_form = vec_to_list(&store_items);
+        return Ok(SetfExpansion {
+            temps,
+            vals: arg_forms,
+            stores: vec![store],
+            store_form,
+            access_form,
+        });
+    }
+    Err(BlissError::Internal(format!(
+        "GET-SETF-EXPANSION: not a place: {}",
+        format_val(place)
+    )))
+}
+
+/// Store NEW_VALUE into PLACE using its setf-expansion: bind the temporaries to
+/// their value forms (sequentially, like LET*), bind the store variable to
+/// NEW_VALUE, then evaluate the storing form. Returns NEW_VALUE.
+fn apply_setf_expansion(
+    place: BlissVal,
+    new_value: BlissVal,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    let ex = get_setf_expansion(place, env)?;
+    let parent = Rc::clone(&env.frame);
+    with_child_frame(env, parent, move |env| {
+        for (temp, val_form) in ex.temps.iter().zip(ex.vals.iter()) {
+            let v = eval_form(*val_form, env)?;
+            if temp.is_symbol() {
+                env.define_local_symbol(*temp, v);
+            }
+        }
+        if let Some(store) = ex.stores.first() {
+            if store.is_symbol() {
+                env.define_local_symbol(*store, new_value);
+            }
+        }
+        eval_form(ex.store_form, env)?;
+        Ok(new_value)
+    })
 }
 
 fn eval_define_symbol_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
