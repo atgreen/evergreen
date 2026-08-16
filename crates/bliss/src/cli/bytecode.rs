@@ -627,6 +627,7 @@ impl<'e> Lowerer<'e> {
                 "GO" => self.lower_go(rest),
                 "DOTIMES" => self.lower_dotimes(rest),
                 "DOLIST" => self.lower_dolist(rest),
+                "LOOP" => self.lower_loop(rest),
                 "UNWIND-PROTECT" => self.lower_unwind_protect(rest),
                 "HANDLER-CASE" => self.lower_handler_case(rest),
                 "HANDLER-BIND" => self.lower_handler_bind(rest),
@@ -1473,6 +1474,29 @@ impl<'e> Lowerer<'e> {
             result,
         ]);
         self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
+    }
+
+    /// `(loop form*)` — only the *simple* loop form (bliss-jtc.28 follow-up):
+    /// every form is a compound form and the loop repeats them until an explicit
+    /// RETURN/RETURN-FROM. Lowered to `(block nil (tagbody top form* (go top)))`
+    /// so it promotes like any other loop. The *extended* LOOP (with atomic
+    /// keywords such as FOR/WHILE/COLLECT) is left to the tree-walker.
+    fn lower_loop(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let forms = list_to_vec(rest);
+        // Simple loop iff there is at least one form and all are compound. A bare
+        // atom (a loop keyword or an atom clause) means the extended grammar.
+        if forms.is_empty() || !forms.iter().all(|f| f.is_cons()) {
+            return Err(Bail);
+        }
+        let id = self.fresh_id();
+        let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
+        let s = |n: &str| resolve_sym(n).ok_or(Bail);
+
+        let mut tb = vec![s("TAGBODY")?, top];
+        tb.extend(forms);
+        tb.push(form_list(&[s("GO")?, top]));
+        let block = form_list(&[s("BLOCK")?, NIL, form_list(&tb)]);
+        self.lower_expr(block)
     }
 
     /// `(unwind-protect protected cleanup...)` — the cleanup runs on both the
