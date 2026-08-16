@@ -737,7 +737,11 @@ enum NextMethod {
 struct PackageDef {
     name: String,
     nicknames: Vec<String>,
-    exports: Vec<String>,
+    // A set, not a Vec: external-status checks (`exports.contains`) happen once
+    // per successful FIND-SYMBOL, and a linear scan of a big reexporting
+    // package's exports (uiop exports hundreds) made ASDF loading quadratic
+    // (bliss-gq5.1).
+    exports: HashSet<String>,
     uses: Vec<String>,
     symbols: HashMap<String, BlissVal>,
 }
@@ -2596,7 +2600,7 @@ fn seed_standard_packages(packages: &mut HashMap<String, PackageDef>) {
             PackageDef {
                 name: name.to_string(),
                 nicknames,
-                exports: Vec::new(),
+                exports: HashSet::new(),
                 uses,
                 symbols: HashMap::new(),
             },
@@ -3837,7 +3841,7 @@ fn find_symbol_in_package_rec(
         let packages = env.packages.borrow();
         let package = packages.get(&pkg_name)?;
         if let Some(sym) = package.symbols.get(bare_upper) {
-            let status = if package.exports.iter().any(|name| name == bare_upper) {
+            let status = if package.exports.contains(bare_upper) {
                 "EXTERNAL"
             } else {
                 "INTERNAL"
@@ -3861,7 +3865,7 @@ fn ensure_package_available(env: &mut Env, name: &str, uses: &[&str]) {
         .or_insert_with(|| PackageDef {
             name: name.to_string(),
             nicknames: Vec::new(),
-            exports: Vec::new(),
+            exports: HashSet::new(),
             uses: uses.iter().map(|pkg| (*pkg).to_string()).collect(),
             symbols: HashMap::new(),
         });
@@ -8395,8 +8399,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let package = __pkgs.get_mut(&pkg_name).expect("package exists");
                 for (name, sym) in resolved {
                     package.symbols.insert(name.clone(), sym);
-                    if export_mode && !package.exports.contains(&name) {
-                        package.exports.push(name);
+                    if export_mode {
+                        package.exports.insert(name);
                     }
                 }
                 return Ok(T);
@@ -8445,8 +8449,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 let removed_symbol = package.symbols.remove(&name).is_some();
                 let removed_export =
-                    if let Some(pos) = package.exports.iter().position(|n| n == &name) {
-                        package.exports.remove(pos);
+                    if package.exports.remove(&name) {
                         true
                     } else {
                         false
@@ -13740,7 +13743,7 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         PackageDef {
             name: pkg_name.clone(),
             nicknames: nicknames.clone(),
-            exports: exports.clone(),
+            exports: exports.iter().cloned().collect(),
             uses,
             symbols: HashMap::new(),
         },
