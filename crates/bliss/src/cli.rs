@@ -14440,6 +14440,45 @@ mod jtc6_8_function_object_tests {
             "a resolved global call must bump the FnMeta invoke counter"
         );
     }
+
+    /// bliss-jtc.10.1: a hot loop inside a function bumps that function object's
+    /// back-edge counter once per iteration, and the count scales with the trip
+    /// count — the profiling signal the tier scheduler reads to find hot loops.
+    #[test]
+    fn hot_loop_bumps_the_back_edge_counter() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        // A plain tagbody/go loop counting down from N — the canonical shape
+        // LOOP/DO/DOTIMES all lower to.
+        read_eval_all_env(
+            "(defun c2b-spin (n) \
+               (block done \
+                 (tagbody \
+                  top (when (<= n 0) (return-from done nil)) \
+                      (setq n (- n 1)) \
+                      (go top))))",
+            &mut env,
+        )
+        .expect("defun");
+        let idx = bliss_rt::symbols::intern("C2B-SPIN");
+        let f = bliss_rt::symbols::symbol_function(idx).unwrap();
+
+        let before = bliss_rt::function::back_edge_count(f);
+        read_eval_all_env("(c2b-spin 100)", &mut env).expect("spin 100");
+        let after_100 = bliss_rt::function::back_edge_count(f);
+        assert!(
+            after_100 >= before + 100,
+            "a 100-iteration loop must record >=100 back-edges (before={before}, after={after_100})"
+        );
+
+        // A longer trip count records proportionally more back-edges.
+        read_eval_all_env("(c2b-spin 500)", &mut env).expect("spin 500");
+        let after_500 = bliss_rt::function::back_edge_count(f);
+        assert!(
+            after_500 >= after_100 + 500,
+            "back-edge count must scale with trip count (after_100={after_100}, after_500={after_500})"
+        );
+    }
 }
 
 #[cfg(test)]

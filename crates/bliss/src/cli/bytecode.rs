@@ -2690,6 +2690,13 @@ struct Activation {
     /// shared with any closure it creates. `None` when the function has no
     /// captured locals (the common, fast, slot-only case).
     env_frame: Option<Rc<RefCell<EnvFrame>>>,
+    /// The tiered function object (FnMeta) this activation is executing, when
+    /// one exists. Present for named functions dispatched through `CallNamed`;
+    /// `None` for anonymous/gensym lambdas and toplevel wrappers with no
+    /// interpreted-function object. Back-edges taken inside this activation are
+    /// counted against this object's `back_edge_count` (bliss-jtc.10.1), the
+    /// hot-loop profiling signal the compiler scheduler reads.
+    fn_obj: Option<BlissVal>,
 }
 
 /// Build the base heap `EnvFrame` for a function with captured locals, binding
@@ -2726,6 +2733,22 @@ unsafe fn slot_get(frame: *mut Frame, i: u16) -> BlissVal {
 unsafe fn slot_set(frame: *mut Frame, i: u16, v: BlissVal) {
     unsafe {
         *(frame.add(1) as *mut BlissVal).add(i as usize) = v;
+    }
+}
+
+/// Count a loop back-edge against the executing function object's profiling
+/// counter (bliss-jtc.10.1). A branch is a back-edge when its `target` is at or
+/// before the branch instruction itself — i.e. `target < act.bcp`, since `bcp`
+/// has already been advanced past the branch (so it equals the branch address
+/// plus one). Forward branches (target >= bcp) are not loop edges and are
+/// ignored. Anonymous lambdas and toplevel wrappers carry no `fn_obj`, so their
+/// hot loops simply go uncounted here rather than costing an atomic per edge.
+#[inline]
+fn record_back_edge_if_backward(act: &Activation, target: u32) {
+    if let Some(f) = act.fn_obj {
+        if (target as usize) < act.bcp {
+            bliss_rt::function::record_back_edge(f);
+        }
     }
 }
 
@@ -2780,6 +2803,8 @@ fn run(
         .ok_or_else(|| BlissError::StackOverflow(bliss_rt::current_thread_id()))?;
     bind_params(&entry, frame, args);
     let env_frame = make_env_frame(&entry, args, Rc::clone(&env.frame));
+    let entry_obj = Some(entry_fn_val)
+        .filter(|&v| bliss_rt::function::is_interpreted_function(v));
     let mut acts: Vec<Activation> = vec![Activation {
         frame,
         n_locals: entry.n_locals,
@@ -2789,6 +2814,7 @@ fn run(
         sp_top: 0,
         handlers: Vec::new(),
         cleanup_conts: Vec::new(),
+        fn_obj: entry_obj,
     }];
 
     // Ensure the whole control stack is popped on any early return (error).
@@ -2987,17 +3013,20 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 act.push_op(v);
             }
             Instr::Br(target) => {
+                record_back_edge_if_backward(&acts[top_idx], target);
                 acts[top_idx].bcp = target as usize;
             }
             Instr::BrIfFalse(target) => {
                 let v = acts[top_idx].pop_op();
                 if v.is_nil() {
+                    record_back_edge_if_backward(&acts[top_idx], target);
                     acts[top_idx].bcp = target as usize;
                 }
             }
             Instr::BrIfTrue(target) => {
                 let v = acts[top_idx].pop_op();
                 if !v.is_nil() {
+                    record_back_edge_if_backward(&acts[top_idx], target);
                     acts[top_idx].bcp = target as usize;
                 }
             }
@@ -3096,6 +3125,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                             sp_top: 0,
                             handlers: Vec::new(),
                             cleanup_conts: Vec::new(),
+                            fn_obj,
                         });
                         continue;
                     }
@@ -3239,6 +3269,14 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 tagbody_id,
                 target_bcp,
             } => {
+                // A `go` to an earlier tag within this function is the canonical
+                // loop back-edge — LOOP/DO/DOTIMES all expand to tagbody + go
+                // (bliss-jtc.10.1). Record it against the executing function
+                // object. Cross-function non-local `go` (rare) may unwind to an
+                // enclosing activation; attributing that edge to the current
+                // frame is a harmless profiling approximation, never a
+                // correctness issue.
+                record_back_edge_if_backward(&acts[top_idx], target_bcp);
                 initiate_unwind(
                     acts,
                     stack,

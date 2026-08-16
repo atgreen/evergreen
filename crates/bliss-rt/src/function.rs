@@ -140,6 +140,12 @@ pub fn record_back_edge(f: BlissVal) -> u32 {
     unsafe { (*data(f)).back_edge_count.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
+/// The current loop back-edge count — the hot-loop profiling signal read by the
+/// tier scheduler alongside `invoke_count` (bliss-jtc.10).
+pub fn back_edge_count(f: BlissVal) -> u32 {
+    unsafe { (*data(f)).back_edge_count.load(Ordering::Relaxed) }
+}
+
 /// The current tier (0/1/2).
 pub fn tier(f: BlissVal) -> u8 {
     unsafe { (*data(f)).tier.load(Ordering::Acquire) }
