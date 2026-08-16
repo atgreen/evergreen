@@ -1057,7 +1057,7 @@ impl<'e> Lowerer<'e> {
         // A macro: expand one level (with the same macro functions the
         // tree-walker uses) and lower the expansion. lower_expr recurses, so a
         // macro that expands to another macro is handled too.
-        if self.env.macros.contains_key(name) {
+        if super::macro_defined(self.env, name) {
             let form = arena_cons(op, rest);
             if self.macro_env.is_none() {
                 self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));

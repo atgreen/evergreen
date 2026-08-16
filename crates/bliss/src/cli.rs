@@ -790,6 +790,63 @@ thread_local! {
     static CONTROL_COUNTER: RefCell<u64> = const { RefCell::new(0) };
     static MACROEXPAND_ENVIRONMENTS: RefCell<HashMap<u64, MacroexpandEnv>> = RefCell::new(HashMap::new());
     static NEXT_MACROEXPAND_ENVIRONMENT_ID: RefCell<u64> = const { RefCell::new(1) };
+    /// Global macro table. A top-level DEFMACRO has global effect (like DEFUN,
+    /// which installs into the symbol's function cell), so its definition must
+    /// survive the throwaway child Envs used during compile/load — storing it in
+    /// a per-Env `macros` map lost it across files (bliss-lb6.22). MACROLET
+    /// macros stay lexical in `Env::macros` and shadow these.
+    static GLOBAL_MACROS: RefCell<HashMap<String, MacroDef>> = RefCell::new(HashMap::new());
+}
+
+/// Register a global (top-level DEFMACRO) macro.
+fn global_macro_insert(name: String, def: MacroDef) {
+    GLOBAL_MACROS.with(|m| m.borrow_mut().insert(name, def));
+}
+
+/// Remove a global macro (FMAKUNBOUND / redefinition as a function).
+fn global_macro_remove(name: &str) {
+    GLOBAL_MACROS.with(|m| {
+        m.borrow_mut().remove(name);
+    });
+}
+
+/// Look up a macro visible in `env`: a lexical MACROLET macro shadows a global
+/// one; a package-qualified name also matches by its bare leaf name.
+fn lookup_macro(env: &Env, name: &str) -> Option<MacroDef> {
+    if let Some(def) = env.macros.get(name).cloned() {
+        return Some(def);
+    }
+    let leaf = symbol_leaf_name(name);
+    if leaf != name {
+        if let Some(def) = env.macros.get(leaf).cloned() {
+            return Some(def);
+        }
+    }
+    GLOBAL_MACROS.with(|m| {
+        let g = m.borrow();
+        g.get(name).cloned().or_else(|| {
+            if leaf != name {
+                g.get(leaf).cloned()
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// True if `name` names a macro visible in `env` (lexical or global).
+fn macro_defined(env: &Env, name: &str) -> bool {
+    if env.macros.contains_key(name) {
+        return true;
+    }
+    let leaf = symbol_leaf_name(name);
+    if leaf != name && env.macros.contains_key(leaf) {
+        return true;
+    }
+    GLOBAL_MACROS.with(|m| {
+        let g = m.borrow();
+        g.contains_key(name) || (leaf != name && g.contains_key(leaf))
+    })
 }
 
 static MACRO_FUNCTION_HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -3413,12 +3470,7 @@ fn expand_compile_toplevel_form(mut form: BlissVal, env: &mut Env) -> BlissVal {
             return form;
         }
         let name = sym_name(op);
-        let Some(mdef) = env
-            .macros
-            .get(&name)
-            .cloned()
-            .or_else(|| env.macros.get(symbol_leaf_name(&name)).cloned())
-        else {
+        let Some(mdef) = lookup_macro(env, &name) else {
             return form;
         };
         match expand_macro(&mdef, rest, env) {
@@ -3470,9 +3522,7 @@ fn compile_toplevel_form_has_effect(form: BlissVal, env: &Env) -> bool {
         return false;
     }
     let name = sym_name(op);
-    if env.macros.contains_key(&name)
-        || env.macros.contains_key(symbol_leaf_name(&name))
-    {
+    if macro_defined(env, &name) {
         return true;
     }
     matches!(
@@ -4676,11 +4726,10 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 fn mv_form_preserves_values(name: &str, env: &Env) -> bool {
     let bare = name.rsplit(':').next().unwrap_or(name);
     if fn_bound(env, name)
-        || env.macros.contains_key(name)
+        || macro_defined(env, name)
         || env.generics.contains_key(name)
         || env.methods.contains_key(name)
         || fn_bound(env, bare)
-        || env.macros.contains_key(bare)
     {
         return true;
     }
@@ -4882,12 +4931,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     if car.is_symbol() {
         let name = sym_name(car);
 
-        // Check for macro expansion first
-        if let Some(mdef) = env.macros.get(&name).cloned().or_else(|| {
-            name.rsplit(':')
-                .next()
-                .and_then(|bare| env.macros.get(bare).cloned())
-        }) {
+        // Check for macro expansion first (lexical MACROLET macro, else global).
+        if let Some(mdef) = lookup_macro(env, &name) {
             let expanded = expand_macro(&mdef, cdr, env)?;
             return eval_form(expanded, env);
         }
@@ -5589,7 +5634,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if fn_bound(env, &n)
                         || env.methods.contains_key(&n)
                         || env.generics.contains_key(&n)
-                        || env.macros.contains_key(&n)
+                        || macro_defined(env, &n)
                         || is_builtin_function(&symbol_bare_name(&n))
                     {
                         return Ok(spec);
@@ -5611,7 +5656,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let bound = fn_bound(env, &name)
                     || env.methods.contains_key(&name)
                     || env.generics.contains_key(&name)
-                    || env.macros.contains_key(&name)
+                    || macro_defined(env, &name)
                     || is_builtin_function(&symbol_bare_name(&name));
                 return Ok(if bound { T } else { NIL });
             }
@@ -5630,6 +5675,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 Rc::make_mut(&mut env.funs).remove(&name);
                 Rc::make_mut(&mut env.macros).remove(&name);
+                global_macro_remove(&name);
                 return Ok(sym);
             }
             "CHAR-CODE" => {
@@ -10852,6 +10898,39 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 // evaluate the body there; because named functions in this evaluator resolve
 // their names through the current environment's function table at call time,
 // LABELS-style mutual recursion works naturally, and FLET-bound functions are
+/// Propagate GLOBAL definitions made inside a child Env (FLET/LABELS/MACROLET/
+/// SYMBOL-MACROLET body) back to the parent. Those constructs fork a whole Env to
+/// scope their *local* funs/macros, but a DEFPACKAGE/DEFCLASS/DEFGENERIC/DEFMETHOD
+/// evaluated in the body is a global definition and must survive — ASDF loads a
+/// system's files inside such forms, so its DEFPACKAGE would otherwise be lost
+/// (bliss-lb6.22). Local funs/macros are intentionally NOT merged.
+fn merge_global_defs(parent: &mut Env, child: &Env) {
+    if !Rc::ptr_eq(&parent.packages, &child.packages) {
+        let p = Rc::make_mut(&mut parent.packages);
+        for (k, v) in child.packages.iter() {
+            p.insert(k.clone(), v.clone());
+        }
+    }
+    if !Rc::ptr_eq(&parent.classes, &child.classes) {
+        let p = Rc::make_mut(&mut parent.classes);
+        for (k, v) in child.classes.iter() {
+            p.insert(k.clone(), v.clone());
+        }
+    }
+    if !Rc::ptr_eq(&parent.generics, &child.generics) {
+        let p = Rc::make_mut(&mut parent.generics);
+        for (k, v) in child.generics.iter() {
+            p.insert(k.clone(), v.clone());
+        }
+    }
+    if !Rc::ptr_eq(&parent.methods, &child.methods) {
+        let p = Rc::make_mut(&mut parent.methods);
+        for (k, v) in child.methods.iter() {
+            p.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 // visible only within the FLET/LABELS body.
 fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (defs_form, body) = cp(cdr);
@@ -10875,7 +10954,9 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
         c = rest;
     }
-    eval_progn(body, &mut child_env)
+    let __r = eval_progn(body, &mut child_env);
+    merge_global_defs(env, &child_env);
+    __r
 }
 
 // ── Extract parameter names from a lambda list ──────────────────
@@ -11542,8 +11623,12 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (params_form, body) = cp(rest);
     let name = sym_name(name_form);
 
-    Rc::make_mut(&mut env.macros).insert(
-        name.clone(),
+    // A top-level DEFMACRO is GLOBAL (CLHS): register it in the global macro
+    // table so it survives the throwaway child Envs used while compiling/loading
+    // other files. Also clear any stale same-named global function so the name
+    // resolves as a macro (bliss-lb6.22).
+    global_macro_insert(
+        name,
         MacroDef {
             params_form,
             body,
@@ -11890,11 +11975,7 @@ fn macroexpand_all(form: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
 
     // 1. Macro call → expand once, then recurse into the expansion. On any
     //    expander error, leave the original form for the lazy path.
-    if let Some(mdef) = env.macros.get(&name).cloned().or_else(|| {
-        name.rsplit(':')
-            .next()
-            .and_then(|bare| env.macros.get(bare).cloned())
-    }) {
+    if let Some(mdef) = lookup_macro(env, &name) {
         return match expand_macro(&mdef, cdr, env) {
             Ok(expanded) => macroexpand_all(expanded, env, d),
             Err(_) => form,
@@ -12102,7 +12183,14 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         }
     }
 
-    for (name, macro_def) in env.macros.iter() {
+    // Expose both global (top-level DEFMACRO) and lexical (MACROLET) macros to
+    // the bytecode compiler; a lexical macro of the same name shadows the global.
+    let mut all_macros: HashMap<String, MacroDef> =
+        GLOBAL_MACROS.with(|m| m.borrow().clone());
+    for (name, def) in env.macros.iter() {
+        all_macros.insert(name.clone(), def.clone());
+    }
+    for (name, macro_def) in all_macros.iter() {
         let handle = next_macro_function_handle();
         let params_form = macro_def.params_form;
         let body = macro_def.body;
@@ -12116,6 +12204,8 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
                 let (_, args) = cp(form);
                 let mut macro_env = Env::new_for_macro_expansion(false);
                 macro_env.frame = thaw_env_frame(&captured_frame);
+                // The expander body finds other global macros via GLOBAL_MACROS
+                // (lookup_macro), so the reconstructed Env needs no macro table.
                 bind_macro_lambda_list(
                     params_form,
                     &list_to_vec(args),
@@ -12177,7 +12267,9 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             },
         );
     }
-    eval_progn(body, &mut child_env)
+    let __r = eval_progn(body, &mut child_env);
+    merge_global_defs(env, &child_env);
+    __r
 }
 
 fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -12194,7 +12286,9 @@ fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
         let (expansion, _) = cp(expansion_rest);
         child_env.define_symbol_macro(symbol, expansion);
     }
-    eval_progn(body, &mut child_env)
+    let __r = eval_progn(body, &mut child_env);
+    merge_global_defs(env, &child_env);
+    __r
 }
 
 // ── DEFCLASS ─────────────────────────────────────────────────────
@@ -13404,7 +13498,6 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         .trim_start_matches("KEYWORD:")
         .trim_start_matches(':')
         .to_uppercase();
-
     let mut exports = Vec::new();
     let mut uses = Vec::new();
     let mut nicknames = Vec::new();
