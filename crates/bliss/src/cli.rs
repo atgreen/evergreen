@@ -7783,7 +7783,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let source = std::fs::read_to_string(&src_path).map_err(|e| {
                     BlissError::FileError(format!("compile-file: cannot read {src_path}: {e}"))
                 })?;
+                // ANSI COMPILE-FILE binds *PACKAGE* (and *READTABLE*) for the
+                // dynamic extent of the compilation (CLHS 3.2.1), so a file's
+                // IN-PACKAGE forms don't leak into the caller — after
+                // `(compile-file "lib/asdf.lisp")` the REPL stays in CL-USER, not
+                // ASDF/FOOTER. Snapshot the current package and restore it once
+                // compilation is done (mirrors LOAD in load_path_into_env).
+                let saved_package = env.current_package.clone();
                 let image = build_bfasl_from_source(&source, &src_path, env);
+                if env.current_package != saved_package {
+                    env.current_package = saved_package.clone();
+                    env.define_local("*PACKAGE*", arena_str(&saved_package));
+                }
                 // Create the output directory if needed. ASDF's output-translations
                 // route fasls into a per-implementation cache tree whose directories
                 // may not exist yet; real CL relies on ASDF pre-creating them, but
