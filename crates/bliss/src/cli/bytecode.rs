@@ -4185,6 +4185,32 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
                 if *nargs > 3 {
                     return None;
                 }
+                // Unary speculative fast path (bliss-jtc.27): 1+, 1-, and unary -
+                // saturate loop bodies. Guard the operand is a fixnum, then work
+                // on the tagged value directly: +1<<3 / -1<<3 / two's-complement
+                // negate, each with `jo` for the fixnum-overflow edge (negating
+                // the most-negative fixnum sets OF → correct deopt).
+                if deopt_safe && *nargs == 1 {
+                    if let Some(op) = inlinable_unary_fixnum_op(*sym) {
+                        pop_into(&mut c, 0, false); // x -> rax
+                        c.extend_from_slice(&[0xA8, 0x07]); // test al, 7
+                        jcc_deopt(&mut c, &mut deopt_sites, 0x85); // jnz deopt
+                        match op {
+                            UnaryFixnumOp::Incr => {
+                                c.extend_from_slice(&[0x48, 0x83, 0xC0, 0x08]); // add rax, 8
+                            }
+                            UnaryFixnumOp::Decr => {
+                                c.extend_from_slice(&[0x48, 0x83, 0xE8, 0x08]); // sub rax, 8
+                            }
+                            UnaryFixnumOp::Neg => {
+                                c.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
+                            }
+                        }
+                        jcc_deopt(&mut c, &mut deopt_sites, 0x80); // jo deopt
+                        push_rax(&mut c);
+                        continue;
+                    }
+                }
                 // Speculative fixnum fast path (bliss-jtc.27): in a pure function,
                 // inline binary +,-,*,<,>,<=,>=,= for fixnum operands, guarding on
                 // both being fixnums and (for arithmetic) no overflow. A failed
@@ -4431,6 +4457,26 @@ fn inlinable_fixnum_op(sym: u32) -> Option<FixnumOp> {
         Some("<=") => Some(FixnumOp::Le),
         Some(">=") => Some(FixnumOp::Ge),
         Some("=") => Some(FixnumOp::NumEq),
+        _ => None,
+    }
+}
+
+/// Unary fixnum ops with an inlined T1 fast path (bliss-jtc.27): the increment,
+/// decrement, and negation that saturate loop bodies. On the tagged
+/// representation (n<<3) these are add/sub of 1<<3 and a two's-complement negate,
+/// each guarded by `jo` for the fixnum-overflow boundary.
+#[derive(Clone, Copy)]
+enum UnaryFixnumOp {
+    Incr, // 1+
+    Decr, // 1-
+    Neg,  // - (unary)
+}
+
+fn inlinable_unary_fixnum_op(sym: u32) -> Option<UnaryFixnumOp> {
+    match bliss_rt::symbols::symbol_name(sym).as_deref() {
+        Some("1+") => Some(UnaryFixnumOp::Incr),
+        Some("1-") => Some(UnaryFixnumOp::Decr),
+        Some("-") => Some(UnaryFixnumOp::Neg),
         _ => None,
     }
 }

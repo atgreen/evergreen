@@ -46,6 +46,28 @@ fn speculative_fixnum_arithmetic_matches() {
     }
 }
 
+/// Unary 1+, 1-, and negation have inlined fixnum fast paths that match
+/// interpretation across signs and zero, and deoptimize correctly at the
+/// overflow edge (incrementing the max fixnum, negating the most-negative
+/// fixnum) and for non-fixnum operands (bliss-jtc.27).
+#[test]
+fn unary_fixnum_ops_match_and_deopt_at_edges() {
+    let cases = &[
+        "(defun f (x) (1+ x)) (f 0) (format t \"~a~%\" (list (f 5) (f -3) (f 0)))",
+        "(defun f (x) (1- x)) (f 0) (format t \"~a~%\" (list (f 5) (f -3) (f 0)))",
+        "(defun f (x) (- x)) (f 0) (format t \"~a~%\" (list (f 5) (f -7) (f 0)))",
+        // overflow: (1+ (2^60-1)) and (- most-negative-fixnum) deopt to bignum,
+        // reduced mod a fixnum for a printable comparison.
+        "(defun f (x) (mod (1+ x) 1000000)) (f 0) (format t \"~a~%\" (f 1152921504606846975))",
+        "(defun f (x) (mod (- x) 1000000)) (f 0) (format t \"~a~%\" (f -1152921504606846976))",
+        // non-fixnum operand deopts to generic negation.
+        "(defun f (x) (- x)) (f 0) (format t \"~a~%\" (f 2.5))",
+    ];
+    for c in cases {
+        assert_matches(c);
+    }
+}
+
 /// A fixnum-overflowing result deoptimizes and yields the correct bignum. The
 /// bignum is reduced mod a fixnum so the comparison is over printable values
 /// (bignums print opaquely in both backends).
