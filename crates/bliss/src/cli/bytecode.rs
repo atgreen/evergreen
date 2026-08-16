@@ -2178,13 +2178,18 @@ fn compile_function(
 ) -> Option<BytecodeFunction> {
     let params = list_to_vec(params_form);
     // Slice 1: only simple fixed lambda lists (no &optional/&rest/&key/&aux).
+    // These lambda-list bails happen before the body is even lowered, so record
+    // them here for the x5y.1 diagnostic — they are a top blocker for real
+    // functions (uiop:ensure-package and friends use &key/&optional/&rest).
     let mut param_names = Vec::new();
     for p in &params {
         if !p.is_symbol() {
+            let _ = record_bail(|| "lambda-list:destructure".to_string());
             return None;
         }
         let pn = sym_name(*p);
         if pn.starts_with('&') {
+            let _ = record_bail(|| format!("lambda-list:{pn}"));
             return None;
         }
         param_names.push(pn);
