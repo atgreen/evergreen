@@ -55,6 +55,12 @@ struct SymbolRegistry {
     interned: Vec<BlissVal>,
     uninterned: HashMap<u32, BlissVal>,
     name_to_index: HashMap<String, u32>,
+    /// Reverse of `name_to_index`: the exact key an interned symbol was created
+    /// under, indexed by symbol index. The key uniquely identifies the symbol
+    /// (package-qualified where needed), so `intern(index_to_key[i])` round-trips
+    /// to `i` — which faithful bytecode serialization relies on to reference the
+    /// same symbol across a compile/load boundary (bliss-jtc.23).
+    index_to_key: Vec<String>,
 }
 
 static REGISTRY: RwLock<Option<SymbolRegistry>> = RwLock::new(None);
@@ -119,6 +125,7 @@ fn with_registry_mut<R>(f: impl FnOnce(&mut SymbolRegistry) -> R) -> R {
         interned: Vec::new(),
         uninterned: HashMap::new(),
         name_to_index: HashMap::new(),
+        index_to_key: Vec::new(),
     });
     f(reg)
 }
@@ -153,8 +160,17 @@ pub fn intern(name: &str) -> u32 {
         let idx = reg.interned.len() as u32;
         reg.interned.push(sym);
         reg.name_to_index.insert(name.to_string(), idx);
+        reg.index_to_key.push(name.to_string());
         idx
     })
+}
+
+/// The exact registry key an interned symbol was created under (bliss-jtc.23).
+/// `intern(registry_key(idx))` returns `idx`, so this is a faithful,
+/// round-trippable identity for cross-process bytecode references. Returns
+/// `None` for uninterned symbols (which have no registry key).
+pub fn registry_key(idx: u32) -> Option<String> {
+    with_registry(|reg| reg?.index_to_key.get(idx as usize).cloned())
 }
 
 /// Look up an already-interned symbol index by name without interning it.
@@ -279,6 +295,7 @@ pub fn restore(data: &[u8]) -> Result<(), BlissError> {
         reg.interned.clear();
         reg.uninterned.clear();
         reg.name_to_index.clear();
+        reg.index_to_key.clear();
     });
     for name in names {
         intern(&name);
@@ -412,6 +429,20 @@ mod tests {
     fn heap_test_lock() -> &'static Mutex<()> {
         static L: OnceLock<Mutex<()>> = OnceLock::new();
         L.get_or_init(|| Mutex::new(()))
+    }
+
+    /// bliss-jtc.23: registry_key(intern(name)) == name, and interning the key
+    /// round-trips to the same index — for distinct package-qualified keys too.
+    #[test]
+    fn registry_key_round_trips() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        for name in ["JTC23-ALPHA", "PKGX23::SHARED", "PKGY23::SHARED", "KEYWORD::JTC23KW"] {
+            let idx = intern(name);
+            assert_eq!(registry_key(idx).as_deref(), Some(name), "key must match intern name");
+            assert_eq!(intern(&registry_key(idx).unwrap()), idx, "key must round-trip to index");
+        }
+        // Distinct keys with the same bare name are distinct symbols.
+        assert_ne!(intern("PKGX23::SHARED"), intern("PKGY23::SHARED"));
     }
 
     #[test]

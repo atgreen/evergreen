@@ -2243,9 +2243,14 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
 // ── BFASL Bytecode Unit serialization ─────────────────────────────
 
 const BBU_MAGIC: &[u8; 4] = b"BBU\0";
-const BBU_BYTECODE_VERSION: u16 = 0x0100;
+// 0x0101 (bliss-jtc.23): faithful registry-key symbol encoding + a loadable
+// unit. The loader requires this version; older units fall back to source.
+const BBU_BYTECODE_VERSION: u16 = 0x0101;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
+/// Unit-flags bit: every load form is represented in `load_actions`, so the
+/// loader may execute the bytecode unit in place of the source (bliss-jtc.23).
+const BBU_UNIT_COMPLETE: u32 = 1 << 0;
 
 const BBU_FUNC_NAMED: u32 = 1 << 0;
 const BBU_FUNC_LOAD_TIME_THUNK: u32 = 1 << 3;
@@ -2304,54 +2309,19 @@ impl BbuConstPool {
         self.intern_encoded(bytes)
     }
 
-    fn package(&mut self, name: &str) -> u32 {
-        let name_ref = self.string(&name.to_uppercase());
+    /// Faithful symbol reference (bliss-jtc.23): store the symbol's exact
+    /// registry key (tag 14 + string ref). `intern(key)` at load reconstructs
+    /// the identical symbol — package and all — so compiled code references the
+    /// same symbol across a compile/load boundary. Returns `None` for uninterned
+    /// symbols (no key), which makes the containing function/value unserializable
+    /// and falls the form back to source loading.
+    fn symbol_by_index(&mut self, idx: u32) -> Option<u32> {
+        let key = bliss_rt::symbols::registry_key(idx)?;
+        let name_ref = self.string(&key);
         let mut bytes = Vec::new();
-        put_u8(&mut bytes, 10);
+        put_u8(&mut bytes, 14);
         put_u32(&mut bytes, name_ref);
-        put_u32(&mut bytes, 0);
-        self.intern_encoded(bytes)
-    }
-
-    fn symbol_name_parts(name: &str) -> (String, String, bool) {
-        if let Some(rest) = name
-            .strip_prefix("KEYWORD:")
-            .or_else(|| name.strip_prefix(':'))
-        {
-            return ("KEYWORD".to_string(), rest.to_uppercase(), true);
-        }
-        if let Some((pkg, bare)) = name.rsplit_once("::") {
-            return (pkg.to_uppercase(), bare.to_uppercase(), false);
-        }
-        if let Some((pkg, bare)) = name.rsplit_once(':') {
-            return (pkg.to_uppercase(), bare.to_uppercase(), false);
-        }
-        ("COMMON-LISP".to_string(), name.to_uppercase(), false)
-    }
-
-    fn symbol_by_name(&mut self, name: &str) -> u32 {
-        let (pkg, bare, keyword) = Self::symbol_name_parts(name);
-        if keyword {
-            let name_ref = self.string(&bare);
-            let mut bytes = Vec::new();
-            put_u8(&mut bytes, 12);
-            put_u32(&mut bytes, name_ref);
-            return self.intern_encoded(bytes);
-        }
-
-        let package_ref = self.package(&pkg);
-        let name_ref = self.string(&bare);
-        let mut bytes = Vec::new();
-        put_u8(&mut bytes, 11);
-        put_u32(&mut bytes, package_ref);
-        put_u32(&mut bytes, name_ref);
-        put_u8(&mut bytes, 0);
-        self.intern_encoded(bytes)
-    }
-
-    fn symbol_by_index(&mut self, idx: u32) -> u32 {
-        let name = reader::symbol_name(idx).unwrap_or_else(|| format!("SYM#{idx}"));
-        self.symbol_by_name(&name)
+        Some(self.intern_encoded(bytes))
     }
 
     fn value(&mut self, v: BlissVal) -> Option<u32> {
@@ -2383,7 +2353,7 @@ impl BbuConstPool {
             return Some(self.string(&val_as_str(v)));
         }
         if v.is_symbol() {
-            return Some(self.symbol_by_index(v.as_symbol_index()));
+            return self.symbol_by_index(v.as_symbol_index());
         }
         if v.is_cons() {
             let (car, cdr) = cp(v);
@@ -2495,12 +2465,12 @@ fn serialize_bbu_function(
             }
             Instr::LoadGlobal(sym) => {
                 put_u8(&mut code, 0x07);
-                let cp = pool.symbol_by_index(*sym);
+                let cp = pool.symbol_by_index(*sym)?;
                 put_u32(&mut code, cp);
             }
             Instr::StoreGlobal(sym) => {
                 put_u8(&mut code, 0x08);
-                let cp = pool.symbol_by_index(*sym);
+                let cp = pool.symbol_by_index(*sym)?;
                 put_u32(&mut code, cp);
             }
             Instr::SetValues(n) => {
@@ -2532,7 +2502,7 @@ fn serialize_bbu_function(
             }
             Instr::CallNamed { sym, nargs } => {
                 put_u8(&mut code, 0x0d);
-                let cp = pool.symbol_by_index(*sym);
+                let cp = pool.symbol_by_index(*sym)?;
                 put_u32(&mut code, cp);
                 put_u16(&mut code, *nargs);
             }
@@ -2679,31 +2649,64 @@ pub fn build_bbu_from_forms(
     let mut functions = Vec::new();
     let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
 
+    // Every load form must be representable in order for the unit to be loaded
+    // *instead of* the source (bliss-jtc.23): try, per form, (1) a precompiled
+    // named function, (2) a precompiled load-time thunk, (3) the raw form to be
+    // EVAL'd at load. If a form fits none (e.g. an unserialisable literal), the
+    // unit is marked incomplete and the loader falls back to the source section.
+    let mut complete = true;
     for &form in forms {
+        let mut done = false;
+
+        // (1) A DEFUN whose name and body serialise faithfully → install the
+        // precompiled function directly at load (skips read/macroexpand/compile).
         if let Some((name, params, body)) = as_defun(form) {
             if let Some(sym) = symbol_index_of(&name) {
-                let name_ref = pool.symbol_by_index(sym);
-                if let Some(bf) = compile_function(&name, params, body, env) {
-                    if let Some(serialized) =
-                        serialize_bbu_function(&bf, name_ref, BBU_FUNC_NAMED, &mut pool)
-                    {
-                        let function_index = functions.len() as u32;
-                        functions.push(serialized);
-                        load_actions.push((3, 0, function_index, name_ref, BBU_NO_INDEX));
+                if let Some(name_ref) = pool.symbol_by_index(sym) {
+                    if let Some(bf) = compile_function(&name, params, body, env) {
+                        if let Some(serialized) =
+                            serialize_bbu_function(&bf, name_ref, BBU_FUNC_NAMED, &mut pool)
+                        {
+                            let function_index = functions.len() as u32;
+                            functions.push(serialized);
+                            load_actions.push((3, 0, function_index, name_ref, BBU_NO_INDEX));
+                            done = true;
+                        }
                     }
                 }
             }
-            continue;
         }
 
-        if let Some(bf) = compile_thunk(form, env) {
-            if let Some(serialized) =
-                serialize_bbu_function(&bf, BBU_NO_INDEX, BBU_FUNC_LOAD_TIME_THUNK, &mut pool)
-            {
-                let function_index = functions.len() as u32;
-                functions.push(serialized);
-                load_actions.push((7, 0, function_index, BBU_NO_INDEX, BBU_NO_INDEX));
+        // (2) Any form compilable to a serialisable thunk → run precompiled.
+        if !done {
+            if let Some(bf) = compile_thunk(form, env) {
+                if let Some(serialized) =
+                    serialize_bbu_function(&bf, BBU_NO_INDEX, BBU_FUNC_LOAD_TIME_THUNK, &mut pool)
+                {
+                    let function_index = functions.len() as u32;
+                    functions.push(serialized);
+                    load_actions.push((7, 0, function_index, BBU_NO_INDEX, BBU_NO_INDEX));
+                    done = true;
+                }
             }
+        }
+
+        // (3) Fallback: serialise the raw form into the const pool and EVAL it at
+        // load — correct and in order, just not precompiled (e.g. defmacro,
+        // defpackage, or a defun with an unsupported body).
+        if !done {
+            if let Some(form_ref) = pool.value(form) {
+                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+                done = true;
+            }
+        }
+
+        // A form we cannot represent means the load plan is not a faithful,
+        // ordered substitute for the source — mark the unit incomplete so the
+        // loader keeps using the source section. Keep going so the function
+        // records we *can* build are still present (harmless when incomplete).
+        if !done {
+            complete = false;
         }
     }
 
@@ -2711,7 +2714,9 @@ pub fn build_bbu_from_forms(
     out.extend_from_slice(BBU_MAGIC);
     put_u16(&mut out, BBU_BYTECODE_VERSION);
     put_u16(&mut out, BBU_VERIFIER_VERSION);
-    put_u32(&mut out, 0);
+    // Unit flags: COMPLETE means every load form is represented in `load_actions`
+    // (in order), so the loader can run the unit instead of the source section.
+    put_u32(&mut out, if complete { BBU_UNIT_COMPLETE } else { 0 });
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
