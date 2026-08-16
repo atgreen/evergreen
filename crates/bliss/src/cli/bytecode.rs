@@ -2916,6 +2916,10 @@ struct Activation {
     /// counted against this object's `back_edge_count` (bliss-jtc.10.1), the
     /// hot-loop profiling signal the compiler scheduler reads.
     fn_obj: Option<BlissVal>,
+    /// Symbol index of the function this activation runs, for OSR compilation
+    /// keying (bliss-izt.1). `u32::MAX` for anonymous/toplevel wrappers, which
+    /// are never OSR-compiled.
+    sym: u32,
 }
 
 /// Build the base heap `EnvFrame` for a function with captured locals, binding
@@ -3034,6 +3038,13 @@ fn run(
         handlers: Vec::new(),
         cleanup_conts: Vec::new(),
         fn_obj: entry_obj,
+        // is_symbol() is true for the NIL/T constants too, but as_symbol_index
+        // only accepts a TAG_SYMBOL value — thunks pass NIL here, so exclude them.
+        sym: if entry_fn_val.is_symbol() && !entry_fn_val.is_nil() && entry_fn_val != T {
+            entry_fn_val.as_symbol_index()
+        } else {
+            u32::MAX
+        },
     }];
 
     // Ensure the whole control stack is popped on any early return (error).
@@ -3352,6 +3363,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                             handlers: Vec::new(),
                             cleanup_conts: Vec::new(),
                             fn_obj,
+                            sym,
                         });
                         continue;
                     }
@@ -3503,15 +3515,35 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 // frame is a harmless profiling approximation, never a
                 // correctness issue.
                 record_back_edge_if_backward(&acts[top_idx], target_bcp);
-                initiate_unwind(
-                    acts,
-                    stack,
-                    env,
-                    Pending::Go {
-                        tagbody_id,
-                        target_bcp,
-                    },
-                )?;
+                // OSR (bliss-izt.1): once this loop is hot and the operand stack
+                // is empty, finish the activation in native code instead of
+                // interpreting the rest of the loop.
+                match maybe_osr(&acts[top_idx], target_bcp, env) {
+                    Some(Ok(v)) => {
+                        release_activation_handlers(&mut acts[top_idx], env);
+                        stack.pop_frame();
+                        acts.pop();
+                        match acts.last_mut() {
+                            Some(caller) => caller.push_op(v),
+                            None => return Ok(v),
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let pending = error_to_pending(e, env);
+                        initiate_unwind(acts, stack, env, pending)?;
+                    }
+                    None => {
+                        initiate_unwind(
+                            acts,
+                            stack,
+                            env,
+                            Pending::Go {
+                                tagbody_id,
+                                target_bcp,
+                            },
+                        )?;
+                    }
+                }
             }
             Instr::EnterCleanupNormal {
                 cleanup_bcp,
@@ -4219,7 +4251,17 @@ fn run_native(
 /// calls, and conditionals produce results identical to pure interpretation,
 /// while the dispatch/operand-stack plumbing runs as native code (nmq.2).
 #[cfg(target_arch = "x86_64")]
-fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
+/// Emit native x86-64 for `bf`. `allow_speculation` enables the speculative
+/// fixnum fast paths (whose guards deoptimize by re-running the whole function);
+/// OSR entry code passes `false` because a mid-loop deopt cannot re-run from the
+/// top (bliss-izt.1) — it runs arithmetic through c2i instead. Returns the code
+/// plus, for each OSR-eligible loop header (a backward-`Go` target whose operand
+/// stack is empty), the byte offset of an alternate entry stub that sets up the
+/// activation registers and jumps straight to that header.
+fn emit_native_x86(
+    bf: &BytecodeFunction,
+    allow_speculation: bool,
+) -> Option<(Vec<u8>, Vec<(u32, usize)>)> {
     if bf.arity > 6 {
         return None;
     }
@@ -4276,10 +4318,31 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
     // function is to a re-execution-safe primitive may we inline fixnum fast
     // paths whose guards deoptimize by re-running the whole function. Purity of
     // every call makes that re-run observably equivalent.
-    let deopt_safe = bf.code.iter().all(|i| match i {
-        Instr::CallNamed { sym, .. } => is_deopt_safe_primitive(*sym),
-        _ => true,
-    });
+    let deopt_safe = allow_speculation
+        && bf.code.iter().all(|i| match i {
+            Instr::CallNamed { sym, .. } => is_deopt_safe_primitive(*sym),
+            _ => true,
+        });
+
+    // OSR-eligible loop headers (bliss-izt.1): the target of a backward `Go`
+    // whose tagbody sits at an empty operand stack (sp_restore == 0), so an OSR
+    // entry needs only set up the activation registers and jump — the live
+    // locals are already in the shared frame slots. Collect the target bcps.
+    let mut osr_headers: Vec<u32> = Vec::new();
+    for (i, instr) in bf.code.iter().enumerate() {
+        if let Instr::Go {
+            tagbody_id,
+            target_bcp,
+        } = instr
+        {
+            if (*target_bcp as usize) < i
+                && tag_sp.get(tagbody_id) == Some(&0)
+                && !osr_headers.contains(target_bcp)
+            {
+                osr_headers.push(*target_bcp);
+            }
+        }
+    }
     // Sites of `jcc rel32` guard branches that jump to the shared deopt block,
     // patched once the block's offset is known.
     let mut deopt_sites: Vec<usize> = Vec::new();
@@ -4291,13 +4354,18 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
     };
 
     // ── Prologue ───────────────────────────────────────────────
-    c.extend_from_slice(&[0x41, 0x56]); // push r14
-    c.extend_from_slice(&[0x41, 0x57]); // push r15
-    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8 (16-align for calls)
-    c.extend_from_slice(&[0x49, 0x89, 0xFE]); // mov r14, rdi (frame slots)
-    // lea r15, [r14 + 8*n_locals]   4D 8D BE d32
-    c.extend_from_slice(&[0x4D, 0x8D, 0xBE]);
-    c.extend_from_slice(&(8 * n_locals).to_le_bytes());
+    // Shared by the normal entry and every OSR entry stub (bliss-izt.1): both
+    // receive the frame-slots pointer in rdi (SysV) and must set up r14/r15 and
+    // 16-align rsp identically, so the one Return epilogue balances either.
+    let emit_prologue = |c: &mut Vec<u8>| {
+        c.extend_from_slice(&[0x41, 0x56]); // push r14
+        c.extend_from_slice(&[0x41, 0x57]); // push r15
+        c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8 (16-align)
+        c.extend_from_slice(&[0x49, 0x89, 0xFE]); // mov r14, rdi (frame slots)
+        c.extend_from_slice(&[0x4D, 0x8D, 0xBE]); // lea r15, [r14 + 8*n_locals]
+        c.extend_from_slice(&(8 * n_locals).to_le_bytes());
+    };
+    emit_prologue(&mut c);
 
     // push_op rax: mov [r15], rax ; add r15, 8
     let push_rax = |c: &mut Vec<u8>| {
@@ -4667,7 +4735,27 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
         let rel32 = i32::try_from(rel).ok()?;
         c[site..site + 4].copy_from_slice(&rel32.to_le_bytes());
     }
-    Some(c)
+
+    // OSR entry stubs (bliss-izt.1): one alternate entry per eligible loop
+    // header. Each runs the shared prologue then jumps straight into the body at
+    // the header; the header sits at an empty operand stack, so no operand
+    // values need transferring (the live locals are already in the frame slots
+    // passed in rdi). The function's normal Return epilogue balances the stub's
+    // prologue.
+    let mut osr_entries: Vec<(u32, usize)> = Vec::new();
+    for header in osr_headers {
+        let header_off = *offsets.get(header as usize)? as i64;
+        let stub_off = c.len();
+        emit_prologue(&mut c);
+        c.push(0xE9); // jmp rel32 → header
+        let site = c.len();
+        c.extend_from_slice(&[0, 0, 0, 0]);
+        let rel = header_off - (site as i64 + 4);
+        let rel32 = i32::try_from(rel).ok()?;
+        c[site..site + 4].copy_from_slice(&rel32.to_le_bytes());
+        osr_entries.push((header, stub_off));
+    }
+    Some((c, osr_entries))
 }
 
 /// Whether `sym` names a primitive that is safe to re-execute from scratch — no
@@ -4804,7 +4892,10 @@ fn is_inlinable_eq(sym: u32) -> bool {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn emit_native_x86(_bf: &BytecodeFunction) -> Option<Vec<u8>> {
+fn emit_native_x86(
+    _bf: &BytecodeFunction,
+    _allow_speculation: bool,
+) -> Option<(Vec<u8>, Vec<(u32, usize)>)> {
     None
 }
 
@@ -4826,7 +4917,7 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
     // essentially all real, call-heavy library code out of T1.) Speculative
     // fixnum codegen stays gated on `is_deopt_safe_primitive`, so a non-leaf
     // function that calls impure helpers emits no deopt-able ops.
-    let code = emit_native_x86(&bf)?;
+    let (code, _osr) = emit_native_x86(&bf, true)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
@@ -4843,6 +4934,146 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
     Some(nc)
+}
+
+/// Installed OSR code for a function (bliss-izt.1): a non-speculating native
+/// compilation plus, per OSR-eligible loop header bcp, the byte offset of the
+/// entry stub that jumps into that header. Shares the frame/GC layout with the
+/// normal native tier (same `num_slots`/stack map).
+struct OsrCode {
+    entry: *const u8,
+    num_slots: u16,
+    code_info: &'static CodeInfo,
+    /// header bcp → entry-stub byte offset from `entry`.
+    entries: std::collections::HashMap<u32, usize>,
+}
+
+thread_local! {
+    /// Compiled OSR code per function symbol (bliss-izt.1).
+    static OSR_REGISTRY: RefCell<HashMap<u32, Option<Rc<OsrCode>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// OSR promotion threshold: number of loop back-edges taken in a single running
+/// activation before its hot loop is compiled and entered natively. Env
+/// override `BLISS_OSR_THRESHOLD` (tests use a small value).
+fn osr_threshold() -> u32 {
+    use std::sync::OnceLock;
+    static T: OnceLock<u32> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("BLISS_OSR_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000)
+    })
+}
+
+/// Compile (once, memoized) a non-speculating native version of `sym` with OSR
+/// entry stubs. Returns `None` if it can't be compiled (cached so we don't retry
+/// every back-edge).
+fn compile_osr(sym: u32) -> Option<Rc<OsrCode>> {
+    if let Some(cached) = OSR_REGISTRY.with(|r| r.borrow().get(&sym).cloned()) {
+        return cached;
+    }
+    let result = (|| {
+        let bf = registry_get(sym)?;
+        // allow_speculation = false: a mid-loop deopt can't re-run from the top,
+        // so OSR code must not speculate (arithmetic goes through c2i, which is
+        // fast after bliss-x5y.8). No guards ⇒ no deopt.
+        let (code, osr) = emit_native_x86(&bf, false)?;
+        if osr.is_empty() {
+            return None;
+        }
+        let num_slots = bf.num_slots();
+        let code_info = install_stack_map(num_slots)?;
+        let buf = bliss_rt::jit::JitBuffer::new(&code)?;
+        let entry = buf.leak();
+        maybe_write_perf_map(entry as usize, code.len(), sym);
+        Some(Rc::new(OsrCode {
+            entry,
+            num_slots,
+            code_info,
+            entries: osr.into_iter().collect(),
+        }))
+    })();
+    OSR_REGISTRY.with(|r| r.borrow_mut().insert(sym, result.clone()));
+    result
+}
+
+/// Enter OSR native code at `stub_off` to finish the current activation, reading
+/// and writing the LIVE frame slots (`frame`) — no new frame, no arg rebinding
+/// (bliss-izt.1). Returns the function's result. The non-speculating OSR code
+/// never deopts; a c2i error surfaces via NATIVE_ERROR as usual.
+fn run_native_osr(
+    osr: &OsrCode,
+    stub_off: usize,
+    frame: *mut Frame,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    NATIVE_DEPTH.with(|d| d.set(d.get() + 1));
+    let _depth_guard = NativeDepthGuard;
+    // The OSR entry reads its activation from the frame slots pointer (rdi), the
+    // same slots T0 was using; locals + the (empty) operand stack are already in
+    // place.
+    let slots = unsafe { frame.add(1) as *mut u64 };
+    let saved = NATIVE_ENV.with(|e| e.replace(env as *mut Env));
+    let saved_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
+    NATIVE_DEOPT.with(|d| d.set(false));
+    let entry_addr = osr.entry as usize + stub_off;
+    // SAFETY: `entry_addr` is inside the installed OSR buffer at a stub whose
+    // contract is `fn(*mut u64) -> u64` (prologue + jump to the loop header).
+    let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(entry_addr) };
+    let ret = f(slots);
+    NATIVE_ENV.with(|e| e.set(saved));
+    let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
+    NATIVE_ERROR.with(|c| *c.borrow_mut() = saved_err);
+    // Non-speculating code sets no deopt flag; clear defensively.
+    NATIVE_DEOPT.with(|d| d.set(false));
+    let _ = osr.num_slots;
+    let _ = osr.code_info;
+    if let Some(err) = my_err {
+        return Err(err);
+    }
+    Ok(BlissVal(ret))
+}
+
+/// If the back-edge to `target_bcp` is a hot loop at an empty operand stack,
+/// compile and enter OSR native code to finish this activation, returning its
+/// result (bliss-izt.1). `None` means not (yet) eligible — the caller keeps
+/// interpreting.
+fn maybe_osr(
+    act: &Activation,
+    target_bcp: u32,
+    env: &mut Env,
+) -> Option<Result<BlissVal, BlissError>> {
+    // Backward edge into an empty-operand-stack header, in a named function.
+    if (target_bcp as usize) >= act.bcp || act.sp_top != 0 || act.sym == u32::MAX {
+        return None;
+    }
+    let fn_obj = act.fn_obj?;
+    if bliss_rt::function::back_edge_count(fn_obj) < osr_threshold() {
+        return None;
+    }
+    let osr = compile_osr(act.sym)?;
+    let stub_off = *osr.entries.get(&target_bcp)?;
+    Some(run_native_osr(&osr, stub_off, act.frame, env))
+}
+
+/// Drop a completed activation's non-local-exit handlers from the shared env
+/// stacks (bliss-izt.1). Mirrors the `Return` handler's cleanup — used when an
+/// OSR native finish completes the activation, so no stale block/catch tokens
+/// referencing the popped frame remain.
+fn release_activation_handlers(act: &mut Activation, env: &mut Env) {
+    for h in act.handlers.drain(..) {
+        match h {
+            Handler::Catch { token, .. } => env.catch_stack.retain(|(_, t)| *t != token),
+            Handler::Block { token, .. } => env.block_stack.retain(|(_, t)| *t != token),
+            Handler::HandlerCase { cluster_base, .. }
+            | Handler::HandlerBind { cluster_base } => env.handlers.truncate(cluster_base),
+            Handler::RestartCase { restart_base, .. } => env.restarts.truncate(restart_base),
+            _ => {}
+        }
+    }
 }
 
 // ── Top-level driver ───────────────────────────────────────────────
