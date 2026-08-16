@@ -115,6 +115,32 @@ fn cons_accessors_match_and_deopt_safely() {
     }
 }
 
+/// Total predicates null/not/consp/atom and eq inline as compare+cmov with no
+/// guard and no deopt — correct for every operand type (bliss-jtc.27). A
+/// realistic list loop using them promotes to T1.
+#[test]
+fn total_predicates_and_eq_match_interpretation() {
+    let cases = &[
+        "(defun f (x) (list (null x) (not x) (consp x) (atom x))) (f 1) \
+           (format t \"~a~%\" (list (f nil) (f (list 1)) (f 5) (f 'a)))",
+        "(defun f (a b) (eq a b)) (f 1 1) \
+           (format t \"~a~%\" (list (f 'x 'x) (f 1 1) (f (list 1) (list 1)) (f nil nil)))",
+        // length via null/1+/cdr, and membership via null/eq/car/cdr — both
+        // fully inlined list loops.
+        "(defun len (lst) (let ((n 0)) \
+           (loop (when (null lst) (return n)) (setq n (1+ n)) (setq lst (cdr lst))))) \
+         (len (list 1)) (format t \"~a~%\" (list (len (list 1 2 3 4 5)) (len nil)))",
+        "(defun mem (x lst) \
+           (loop (when (null lst) (return nil)) (when (eq x (car lst)) (return t)) \
+                 (setq lst (cdr lst)))) \
+         (mem 1 (list 1)) \
+         (format t \"~a~%\" (list (mem 'c (list 'a 'b 'c)) (mem 'z (list 'a 'b))))",
+    ];
+    for c in cases {
+        assert_matches(c);
+    }
+}
+
 /// A fixnum-overflowing result deoptimizes and yields the correct bignum. The
 /// bignum is reduced mod a fixnum so the comparison is over printable values
 /// (bignums print opaquely in both backends).

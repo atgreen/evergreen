@@ -4267,6 +4267,37 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
                         push_rax(&mut c);
                         continue;
                     }
+                    if let Some(pred) = inlinable_total_unary(*sym) {
+                        // Total predicate: set flags, then cmov T/NIL. No guard,
+                        // no deopt — correct for every operand type.
+                        pop_into(&mut c, 0, false); // x -> rax
+                        let cc = match pred {
+                            TotalUnaryPred::Null => {
+                                c.extend_from_slice(&[0x48, 0x3D]); // cmp rax, imm32
+                                c.extend_from_slice(&(bliss_rt::value::NIL_BITS as u32).to_le_bytes());
+                                0x44 // cmove: x == NIL
+                            }
+                            TotalUnaryPred::Consp => {
+                                c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                                c.extend_from_slice(&[0x83, 0xE2, 0x07]); // and edx, 7
+                                c.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1
+                                0x44 // cmove: tag == cons
+                            }
+                            TotalUnaryPred::Atom => {
+                                c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
+                                c.extend_from_slice(&[0x83, 0xE2, 0x07]); // and edx, 7
+                                c.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1
+                                0x45 // cmovne: tag != cons
+                            }
+                        };
+                        c.extend_from_slice(&[0x48, 0xB8]); // mov rax, NIL
+                        c.extend_from_slice(&bliss_rt::value::NIL_BITS.to_le_bytes());
+                        c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, T
+                        c.extend_from_slice(&bliss_rt::value::T_BITS.to_le_bytes());
+                        c.extend_from_slice(&[0x48, 0x0F, cc, 0xC2]); // cmovCC rax, rdx
+                        push_rax(&mut c);
+                        continue;
+                    }
                 }
                 // Speculative fixnum fast path (bliss-jtc.27): in a pure function,
                 // inline binary +,-,*,<,>,<=,>=,= for fixnum operands, guarding on
@@ -4275,6 +4306,19 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
                 // returns; run_native then re-runs the function in the
                 // interpreter, yielding the correct value (e.g. a bignum).
                 if deopt_safe && *nargs == 2 {
+                    if is_inlinable_eq(*sym) {
+                        // EQ: bit-identity → total, no guard, no deopt.
+                        pop_into(&mut c, 1, false); // a1 -> rcx
+                        pop_into(&mut c, 0, false); // a0 -> rax
+                        c.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
+                        c.extend_from_slice(&[0x48, 0xB8]); // mov rax, NIL
+                        c.extend_from_slice(&bliss_rt::value::NIL_BITS.to_le_bytes());
+                        c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, T
+                        c.extend_from_slice(&bliss_rt::value::T_BITS.to_le_bytes());
+                        c.extend_from_slice(&[0x48, 0x0F, 0x44, 0xC2]); // cmove rax, rdx
+                        push_rax(&mut c);
+                        continue;
+                    }
                     if let Some(op) = inlinable_fixnum_op(*sym) {
                         // Pop operands: top=a1 -> rcx, next=a0 -> rax.
                         pop_into(&mut c, 1, false); // a1 -> rcx
@@ -4569,6 +4613,33 @@ fn inlinable_cons_accessor(sym: u32) -> Option<i8> {
         Some("CDR") | Some("REST") => Some(8),
         _ => None,
     }
+}
+
+/// Total unary type/nil predicates (bliss-jtc.27): correct for every value, so
+/// they inline as a compare + cmov with no guard and no deopt.
+#[derive(Clone, Copy)]
+enum TotalUnaryPred {
+    Null,  // null / not: x is NIL
+    Consp, // x is a cons (tag 001)
+    Atom,  // x is not a cons
+}
+
+fn inlinable_total_unary(sym: u32) -> Option<TotalUnaryPred> {
+    match bliss_rt::symbols::symbol_name(sym).as_deref() {
+        Some("NULL") | Some("NOT") => Some(TotalUnaryPred::Null),
+        Some("CONSP") => Some(TotalUnaryPred::Consp),
+        Some("ATOM") => Some(TotalUnaryPred::Atom),
+        _ => None,
+    }
+}
+
+/// True if `sym` is EQ — bit-identity, which in this tagged representation is
+/// exactly EQ semantics (immediates compare by value, pointers by identity), so
+/// it inlines as a compare + cmov with no guard and no deopt (bliss-jtc.27).
+/// EQL is deliberately excluded: two distinct bignums with equal value are EQL
+/// but not bit-equal.
+fn is_inlinable_eq(sym: u32) -> bool {
+    bliss_rt::symbols::symbol_name(sym).as_deref() == Some("EQ")
 }
 
 #[cfg(not(target_arch = "x86_64"))]
