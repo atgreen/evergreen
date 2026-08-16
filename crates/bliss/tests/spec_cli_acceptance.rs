@@ -739,6 +739,91 @@ fn stage_four_gate_runs_conditions_clos_and_restarts_through_the_real_cli() {
     fs::remove_dir_all(dir).ok();
 }
 
+/// Stage-5 gate (spec/stages.json stage 5, "hotspot-engine"): a hot loop is
+/// observably promoted through tiers with identical results at each tier, and an
+/// invalidated speculation deoptimizes and still returns the correct result. All
+/// through the real CLI binary.
+///
+/// The script warms a pure fixnum loop until it promotes to T1, then triggers a
+/// deopt by overflowing the fixnum range. It prints tier/deopt observability
+/// lines plus `RESULT` lines. We run it twice — once forcing tier-up
+/// (BLISS_T1_THRESHOLD low) and once under the pure tree-walker (T0) — and prove
+/// the `RESULT` values are identical across tiers, while the forced run also
+/// observes the promotion (TIER 1) and a deoptimization (DEOPTS > 0).
+#[test]
+fn stage_five_gate_hot_loop_promotes_through_tiers_and_deopts_with_identical_results() {
+    let dir = temp_dir("stage5-gate");
+    let script = dir.join("stage5-hotspot.lisp");
+    write_file(
+        &script,
+        // sumsq: a hot pure-fixnum loop (tagbody/go) — promotes to native T1.
+        // f: overflows the fixnum range for large x, forcing a speculative
+        // deopt; the result is reduced mod a fixnum so it prints identically in
+        // both tiers (bignums print opaquely).
+        "(defun sumsq (n)\n\
+           (let ((s 0) (i 0))\n\
+             (tagbody top (when (< i n) (setq s (+ s (* i i))) (setq i (+ i 1)) (go top)))\n\
+             s))\n\
+         (defun f (x) (mod (* x x) 1000000))\n\
+         (sumsq 20) (sumsq 20) (sumsq 20) (sumsq 20) (sumsq 20)\n\
+         (f 3) (f 4) (f 5)\n\
+         (format t \"RESULT loop ~a~%\" (sumsq 100))\n\
+         (format t \"RESULT deopt ~a~%\" (f 3037000500))\n\
+         (format t \"TIER ~a~%\" (bliss-ext:function-tier 'sumsq))\n\
+         (format t \"DEOPTS ~a~%\" (bliss-ext:deopt-count))\n",
+    );
+    let path = script.to_str().expect("utf8 path");
+
+    // Forced tier-up run: low promotion threshold so the loop reaches T1.
+    let t1 = bliss()
+        .env("BLISS_T1_THRESHOLD", "2")
+        .args(["--load", path])
+        .output()
+        .expect("run bliss stage-5 gate (T1)");
+    assert_eq!(
+        t1.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&t1.stdout),
+        String::from_utf8_lossy(&t1.stderr)
+    );
+    let t1_out = String::from_utf8_lossy(&t1.stdout);
+
+    // Pure interpreter run (T0) for the result oracle.
+    let t0 = bliss()
+        .env("BLISS_BACKEND", "tree-walker")
+        .args(["--load", path])
+        .output()
+        .expect("run bliss stage-5 gate (T0)");
+    assert_eq!(t0.status.code(), Some(0), "T0 run failed");
+    let t0_out = String::from_utf8_lossy(&t0.stdout);
+
+    let results = |s: &str| -> Vec<String> {
+        s.lines().filter(|l| l.starts_with("RESULT ")).map(str::to_string).collect()
+    };
+    // Identical results at each tier — the heart of the gate.
+    assert_eq!(
+        results(&t1_out),
+        results(&t0_out),
+        "hot-loop and deopt results must be identical across tiers\nT1:\n{t1_out}\nT0:\n{t0_out}"
+    );
+    assert!(!results(&t1_out).is_empty(), "expected RESULT lines: {t1_out}");
+
+    // The forced run must observe the promotion and at least one deopt.
+    assert!(
+        t1_out.contains("TIER 1"),
+        "the hot loop must be observably promoted to T1: {t1_out}"
+    );
+    let deopts: u64 = t1_out
+        .lines()
+        .find_map(|l| l.strip_prefix("DEOPTS "))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("DEOPTS line present");
+    assert!(deopts >= 1, "the overflow must trigger a deoptimization: {t1_out}");
+
+    fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn stage_four_cli_exposes_condition_readers_and_core_clos_slot_protocol() {
     let output = bliss()
