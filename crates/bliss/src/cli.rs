@@ -10580,13 +10580,32 @@ fn eval_arith(
     op_f: fn(f64, f64) -> f64,
     op_r: fn(&BigRat, &BigRat) -> BigRat,
 ) -> Result<BlissVal, BlissError> {
-    let mut acc = BigRat::from_i64(init_i);
-    let mut acc_f = init_f;
-    let mut is_float = false;
+    let mut vals = Vec::new();
     let mut c = args;
     while c.is_cons() {
         let (af, r) = cp(c);
-        let v = eval_form(af, env)?;
+        vals.push(eval_form(af, env)?);
+        c = r;
+    }
+    fold_arith_vals(&vals, init_i, init_f, op_f, op_r)
+}
+
+/// The `+`/`*` fold over already-evaluated operands (int/rational with float
+/// contagion). Shared by operator-position [`eval_arith`] and the direct
+/// builtin dispatch in [`apply_function`], so both produce bit-identical
+/// results — including the fixnum-overflow→bignum promotion (`op_r` on
+/// `BigRat`) that the float-based `apply_builtin` got wrong (bliss-x5y.9).
+fn fold_arith_vals(
+    vals: &[BlissVal],
+    init_i: i64,
+    init_f: f64,
+    op_f: fn(f64, f64) -> f64,
+    op_r: fn(&BigRat, &BigRat) -> BigRat,
+) -> Result<BlissVal, BlissError> {
+    let mut acc = BigRat::from_i64(init_i);
+    let mut acc_f = init_f;
+    let mut is_float = false;
+    for &v in vals {
         if v.is_single_float() {
             if !is_float {
                 is_float = true;
@@ -10605,7 +10624,6 @@ fn eval_arith(
                 expected: "number".into(),
             });
         }
-        c = r;
     }
     Ok(if is_float {
         BlissVal::from_single_float(acc_f as f32)
@@ -10622,6 +10640,13 @@ fn eval_arith_sub(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         vals.push(eval_form(af, env)?);
         c = r;
     }
+    sub_vals(&vals)
+}
+
+/// The `-` fold (negate for one arg, left-fold subtraction otherwise) over
+/// already-evaluated operands. Shared by [`eval_arith_sub`] and the direct
+/// builtin dispatch so both tiers agree (bliss-x5y.9).
+fn sub_vals(vals: &[BlissVal]) -> Result<BlissVal, BlissError> {
     if vals.is_empty() {
         return Ok(BlissVal::from_fixnum(0));
     }
@@ -12965,6 +12990,34 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
 }
 
 // ── Apply function (lambda or named) ─────────────────────────────
+/// Faithful direct dispatch of the hot numeric/comparison builtins on
+/// already-evaluated args, reusing the SAME cores as operator-position dispatch
+/// (`fold_arith_vals`, `sub_vals`, `numeric_cmp`). Returns `None` for any name
+/// outside this set so behaviour is unchanged for everything else. This lets a
+/// bytecode/native function's `+`/`-`/`<`/… calls (routed through c2i →
+/// apply_function) skip the synthesize-`(name 'a 'b)`-and-re-evaluate detour
+/// (bliss-x5y.8) without the float-arithmetic divergence that ruled out
+/// `apply_builtin` (bliss-x5y.9).
+fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, BlissError>> {
+    // Comparisons are binary in bliss's operator dispatch (eval_cmp / `=`); only
+    // fast-path the 2-arg shape so other arities match the general path exactly.
+    let cmp = |pred: fn(Ordering) -> bool| -> Result<BlissVal, BlissError> {
+        Ok(if pred(numeric_cmp(args[0], args[1])?) { T } else { NIL })
+    };
+    Some(match name {
+        "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add),
+        "*" => fold_arith_vals(args, 1, 1.0, |a, b| a * b, bigrat_mul),
+        "-" => sub_vals(args),
+        "<" if args.len() == 2 => cmp(|o| o == Ordering::Less),
+        ">" if args.len() == 2 => cmp(|o| o == Ordering::Greater),
+        "<=" if args.len() == 2 => cmp(|o| o != Ordering::Greater),
+        ">=" if args.len() == 2 => cmp(|o| o != Ordering::Less),
+        "=" if args.len() == 2 => cmp(|o| o == Ordering::Equal),
+        "/=" if args.len() == 2 => cmp(|o| o != Ordering::Equal),
+        _ => return None,
+    })
+}
+
 fn apply_function(
     fn_val: BlissVal,
     args: &[BlissVal],
@@ -12979,12 +13032,20 @@ fn apply_function(
         if env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name) {
             return invoke_generic_function(&name, args, env);
         }
-        // NB: `apply_builtin` looks like a tempting direct-dispatch fast path
-        // here, but its arithmetic is NOT bit-identical to the operator-position
-        // path for the fixnum-overflow→bignum case (it diverged on the stage-5
-        // deopt gate), so builtins must still go through the synthesize-and-eval
-        // path below to stay consistent across tiers. A semantically faithful
-        // direct dispatch is tracked separately (bliss-x5y.8).
+        // Faithful fast path: the hot numeric/comparison builtins dispatch
+        // directly on the evaluated args through the SAME cores as operator
+        // position (bliss-x5y.8). This is what every +/-/< a bytecode/native
+        // function calls through c2i takes, avoiding the synthesize-and-
+        // re-evaluate detour below. Unlike `apply_builtin` it is bit-identical
+        // to the tree-walker (bliss-x5y.9), so tiers stay consistent.
+        if let Some(res) = apply_numeric_op(&name, args) {
+            // These builtins yield exactly one value; reset the multiple-values
+            // state so a caller's stale MV (e.g. from an arg that was `(values
+            // …)`) does not leak, matching the operator-position path the old
+            // synthesize-and-eval detour went through (bliss-x5y.8).
+            env.clear_mv();
+            return res;
+        }
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
         // full operator-position builtin set (not just apply_builtin's subset)
         // is reachable through funcall/apply/mapcar.
@@ -13116,60 +13177,12 @@ fn is_builtin_function(name: &str) -> bool {
 
 fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissVal, BlissError> {
     match name {
-        "+" => {
-            let mut sum: f64 = 0.0;
-            let mut is_f = false;
-            for a in args {
-                let v = num_val(*a)?;
-                sum += v;
-                if a.is_single_float() {
-                    is_f = true;
-                }
-            }
-            Ok(if is_f {
-                BlissVal::from_single_float(sum as f32)
-            } else {
-                BlissVal::from_fixnum(sum as i64)
-            })
-        }
-        "-" => {
-            if args.is_empty() {
-                return Ok(BlissVal::from_fixnum(0));
-            }
-            if args.len() == 1 {
-                let v = num_val(args[0])?;
-                return Ok(BlissVal::from_fixnum((-v) as i64));
-            }
-            let mut acc = num_val(args[0])?;
-            let mut is_f = args[0].is_single_float();
-            for a in &args[1..] {
-                acc -= num_val(*a)?;
-                if a.is_single_float() {
-                    is_f = true;
-                }
-            }
-            Ok(if is_f {
-                BlissVal::from_single_float(acc as f32)
-            } else {
-                BlissVal::from_fixnum(acc as i64)
-            })
-        }
-        "*" => {
-            let mut prod: f64 = 1.0;
-            let mut is_f = false;
-            for a in args {
-                let v = num_val(*a)?;
-                prod *= v;
-                if a.is_single_float() {
-                    is_f = true;
-                }
-            }
-            Ok(if is_f {
-                BlissVal::from_single_float(prod as f32)
-            } else {
-                BlissVal::from_fixnum(prod as i64)
-            })
-        }
+        // Use the shared int/rational cores, NOT an f64 accumulator: the old
+        // float arithmetic here lost precision above 2^53 and never promoted to
+        // bignum, diverging from operator-position dispatch (bliss-x5y.9).
+        "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add),
+        "-" => sub_vals(args),
+        "*" => fold_arith_vals(args, 1, 1.0, |a, b| a * b, bigrat_mul),
         "CONS" => {
             if args.len() >= 2 {
                 Ok(arena_cons(args[0], args[1]))
