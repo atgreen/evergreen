@@ -87,3 +87,35 @@ fn promotion_to_t1_is_observable_and_result_identical() {
         "tree-walker result must match the T1 result (81)"
     );
 }
+
+/// The gate in miniature for an actual hot loop (bliss-jtc.25): a tagbody/go
+/// loop function is observably promoted to tier 1 and, running as native T1
+/// code, returns the identical value the tree-walker computes. Asserting the
+/// tier explicitly guarantees the loop codegen path is exercised — not merely
+/// that two interpreter runs agree.
+#[test]
+fn hot_loop_promotes_to_t1_with_identical_result() {
+    let program = "\
+        (defun sumto (n) \
+          (let ((acc 0)) \
+            (tagbody top (when (> n 0) (setq acc (+ acc n)) (setq n (- n 1)) (go top))) \
+            acc)) \
+        (sumto 10) (sumto 10) (sumto 10) (sumto 10) \
+        (format t \"~a ~a~%\" (bliss-ext:function-tier (quote sumto)) (sumto 100))";
+
+    let (t1_out, t1_ok) = run(program, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(t1_ok, "T1 run must succeed; got:\n{t1_out}");
+    let fields: Vec<&str> = t1_out.lines().next().unwrap_or("").split_whitespace().collect();
+    assert_eq!(fields.first().copied(), Some("1"), "the loop must reach T1: {t1_out:?}");
+    assert_eq!(fields.get(1).copied(), Some("5050"), "T1 loop result must be 5050");
+
+    // Identical under pure interpretation.
+    let (tw_out, tw_ok) = run(program, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker run must succeed; got:\n{tw_out}");
+    let tw_result = tw_out
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .map(str::to_string);
+    assert_eq!(tw_result.as_deref(), Some("5050"), "interpreter result must also be 5050");
+}

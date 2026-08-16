@@ -65,3 +65,47 @@ fn t1_does_not_break_deep_recursion_bound() {
         "recursive function must stay BlissStack-bounded under T1"
     );
 }
+
+/// bliss-jtc.25: tagbody/go loops (with block/return-from exits) compile to
+/// native T1 code with results identical to interpretation. Each case prints a
+/// value that must match between the tree-walker and the T1 backend. These
+/// specifically exercise the loop-codegen paths: backward `Go`, `ReturnFrom`
+/// operand-stack reset, and the `ClearMv` after SETQ.
+#[test]
+fn t1_native_loops_match_interpretation() {
+    let cases = &[
+        // Countdown accumulator (backward go, SETQ/ClearMv in the loop body).
+        "(defun sumto (n) (let ((acc 0)) \
+           (tagbody top (when (> n 0) (setq acc (+ acc n)) (setq n (- n 1)) (go top))) \
+           acc)) \
+         (format t \"~a~%\" (list (sumto 10) (sumto 100) (sumto 0)))",
+        // Early exit via return-from carrying a computed value out of the loop.
+        "(defun firstsq (n) \
+           (block done (let ((i 0)) \
+             (tagbody top (when (>= i n) (return-from done (* i i))) (setq i (+ i 1)) (go top)) \
+             -1))) \
+         (format t \"~a~%\" (list (firstsq 5) (firstsq 0)))",
+        // return-from nested inside an operand-pushing expression: the native
+        // path must reset the operand stack to the block's entry depth.
+        "(defun g (n) (block b (+ 1000 (progn (when (> n 0) (return-from b n)) 0)))) \
+         (format t \"~a~%\" (list (g 7) (g 0)))",
+        // Loop building a heap object (cons) via c2i.
+        "(defun rng (n) (let ((acc nil) (i 0)) \
+           (tagbody top (when (>= i n) (go done)) (setq acc (cons i acc)) (setq i (+ i 1)) (go top) done) \
+           acc)) \
+         (format t \"~a~%\" (rng 5))",
+        // SETQ of a multiple-valued primitive must not leak extra values.
+        "(defun h () (let ((x 0)) (setq x (floor 7 2)) x)) \
+         (format t \"~a~%\" (multiple-value-list (h)))",
+        // Nested tagbody loops.
+        "(defun mul (a b) (let ((s 0) (i 0)) \
+           (tagbody io (when (>= i a) (go ie)) \
+             (let ((j 0)) (tagbody jo (when (>= j b) (go je)) (setq s (+ s 1)) (setq j (+ j 1)) (go jo) je)) \
+             (setq i (+ i 1)) (go io) ie) \
+           s)) \
+         (format t \"~a~%\" (list (mul 3 4) (mul 0 9) (mul 5 5)))",
+    ];
+    for c in cases {
+        assert_t1_matches(c);
+    }
+}

@@ -3660,6 +3660,22 @@ thread_local! {
 /// (SysV registers), returning the result's raw bits. Also the arithmetic
 /// slow path — native code jumps here on fixnum overflow so bignum promotion
 /// matches pure interpretation.
+/// Clear the current thread's multiple-values state from native (T1) code
+/// (bliss-jtc.25). Mirrors the interpreter's `ClearMv` opcode, which SETQ and a
+/// few other non-value-preserving forms emit. Without it a native function that
+/// stored the primary of a multiple-valued call would leak the extra values to
+/// its caller.
+extern "C" fn c2i_clear_mv() {
+    let env_ptr = NATIVE_ENV.with(|e| e.get());
+    if env_ptr.is_null() {
+        return;
+    }
+    // SAFETY: same window/contract as `c2i_call` — `run_native` keeps
+    // NATIVE_ENV pointing at a live &mut Env for the duration of the call.
+    let env = unsafe { &mut *env_ptr };
+    env.clear_mv();
+}
+
 extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
@@ -3802,10 +3818,47 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
     let n_locals = bf.n_locals as i32;
     let local_disp = |i: i32| 8 * i;
     let c2i_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64) -> u64 as usize as u64;
+    let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
 
     let mut c: Vec<u8> = Vec::new();
     let mut offsets: Vec<usize> = Vec::with_capacity(bf.code.len());
     let mut patches: Vec<(usize, u32)> = Vec::new();
+
+    // Loop support (bliss-jtc.25): pre-scan block/tag establishments so a local
+    // `ReturnFrom`/`Go` can reset the operand stack to the target's `sp_restore`
+    // and jump. The interpreter resets the operand stack on every non-local
+    // transfer; a nested `(return-from nil x)` / `(go tag)` can sit above the
+    // target depth (enclosing operands live on the stack), so a bare jump would
+    // leak them. `lea r15, [r14 + 8*(n_locals + sp_restore)]` restores depth.
+    let mut block_targets: std::collections::HashMap<u32, (u32, u16)> =
+        std::collections::HashMap::new();
+    let mut tag_sp: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+    for instr in bf.code.iter() {
+        match instr {
+            Instr::PushBlock {
+                block_id,
+                resume_bcp,
+                sp_restore,
+                ..
+            } => {
+                block_targets.insert(*block_id, (*resume_bcp, *sp_restore));
+            }
+            Instr::PushTag {
+                tagbody_id,
+                sp_restore,
+            } => {
+                tag_sp.insert(*tagbody_id, *sp_restore);
+            }
+            _ => {}
+        }
+    }
+    // Reset the operand-stack pointer r15 to hold `depth` values above the
+    // locals: r15 = r14 + 8*(n_locals + depth). Mirrors the prologue's lea.
+    let reset_r15 = |c: &mut Vec<u8>, depth: u16| {
+        c.extend_from_slice(&[0x4D, 0x8D, 0xBE]); // lea r15, [r14 + disp32]
+        let disp = 8 * (n_locals + depth as i32);
+        c.extend_from_slice(&disp.to_le_bytes());
+    };
 
     // ── Prologue ───────────────────────────────────────────────
     c.extend_from_slice(&[0x41, 0x56]); // push r14
@@ -3893,6 +3946,60 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
                 patches.push((c.len(), *target));
                 c.extend_from_slice(&[0, 0, 0, 0]);
             }
+            // Block/tagbody loops (bliss-jtc.25): DO/DOTIMES/LOOP lower to
+            // (block nil (tagbody ...)). In the interpreter PushBlock/PushTag
+            // install handlers so a *non-local* return/go (from a captured
+            // block/tag or a deeper frame) can unwind here. A T1-eligible
+            // function is a leaf — try_promote_to_t1 rejects inter-bytecode
+            // calls, and lower_block/lower_go bail on captured block/tag names —
+            // so every compiled ReturnFrom/Go is a lexically local transfer with
+            // no non-local entry possible; the handler state is dead. Native
+            // execution has no Activation handler stack, so PushBlock/PushTag/
+            // PopHandler are elided. Any catch/unwind-protect emits opcodes this
+            // codegen does not handle and bails at the catch-all, so a
+            // PopHandler reaching here can only partner a PushBlock/PushTag.
+            Instr::PushBlock { .. } => {}
+            Instr::PushTag { .. } => {}
+            Instr::PopHandler => {}
+            Instr::ClearMv => {
+                // Reset the thread's multiple-values state (SETQ et al. are not
+                // value-preserving). rax is dead between statements; r14/r15 are
+                // callee-saved across the call, and the prologue keeps rsp
+                // 16-aligned for calls (same contract as CallNamed).
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_clear_mv)
+                c.extend_from_slice(&clear_mv_addr.to_le_bytes());
+                c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            }
+            Instr::Go {
+                tagbody_id,
+                target_bcp,
+            } => {
+                // Reset the operand stack to the tagbody's entry depth, then
+                // jump (go yields no value).
+                if let Some(&sp) = tag_sp.get(tagbody_id) {
+                    reset_r15(&mut c, sp);
+                } else {
+                    return None; // go with no lexically visible tag: not T1-safe
+                }
+                c.extend_from_slice(&[0xE9]); // jmp rel32
+                patches.push((c.len(), *target_bcp));
+                c.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            Instr::ReturnFrom { block_id } => {
+                // The return value is on top of the operand stack. Restore the
+                // block's entry depth, re-push the value (the block yields it),
+                // and jump to the block's resume point.
+                let (resume_bcp, sp) = match block_targets.get(block_id) {
+                    Some(&t) => t,
+                    None => return None, // non-local block: not T1-safe
+                };
+                c.extend_from_slice(&[0x49, 0x8B, 0x47, 0xF8]); // mov rax, [r15-8]
+                reset_r15(&mut c, sp);
+                push_rax(&mut c); // depth = sp_restore + 1 (value on top)
+                c.extend_from_slice(&[0xE9]); // jmp rel32
+                patches.push((c.len(), resume_bcp));
+                c.extend_from_slice(&[0, 0, 0, 0]);
+            }
             Instr::BrIfFalse(target) => {
                 pop_into(&mut c, 0, false); // rax = value
                 c.extend_from_slice(&[0x48, 0x3D]); // cmp rax, imm32
@@ -3913,7 +4020,11 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
     }
 
     for (site, target) in patches {
-        let target_off = offsets[target as usize] as i64;
+        // A branch/return target must land on a real instruction offset. A
+        // block `resume_bcp` can equal code.len() only for a well-formed body
+        // that always ends in Return, so an out-of-range target means malformed
+        // input — bail rather than index out of bounds.
+        let target_off = *offsets.get(target as usize)? as i64;
         let rel = target_off - (site as i64 + 4);
         let rel32 = i32::try_from(rel).ok()?;
         c[site..site + 4].copy_from_slice(&rel32.to_le_bytes());
