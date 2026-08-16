@@ -4210,6 +4210,35 @@ fn emit_native_x86(bf: &BytecodeFunction) -> Option<Vec<u8>> {
                         push_rax(&mut c);
                         continue;
                     }
+                    if let Some(pred) = inlinable_fixnum_pred(*sym) {
+                        pop_into(&mut c, 0, false); // x -> rax
+                        c.extend_from_slice(&[0xA8, 0x07]); // test al, 7
+                        jcc_deopt(&mut c, &mut deopt_sites, 0x85); // jnz deopt
+                        // Set flags: sign tests use `test rax,rax`; parity tests
+                        // check tagged bit 3 (value bit 0) via `test al, 8`.
+                        match pred {
+                            FixnumPred::Zerop | FixnumPred::Plusp | FixnumPred::Minusp => {
+                                c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+                            }
+                            FixnumPred::Evenp | FixnumPred::Oddp => {
+                                c.extend_from_slice(&[0xA8, 0x08]); // test al, 8
+                            }
+                        }
+                        c.extend_from_slice(&[0x48, 0xB8]); // mov rax, NIL
+                        c.extend_from_slice(&bliss_rt::value::NIL_BITS.to_le_bytes());
+                        c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, T
+                        c.extend_from_slice(&bliss_rt::value::T_BITS.to_le_bytes());
+                        let cc = match pred {
+                            FixnumPred::Zerop => 0x44, // cmove  (== 0)
+                            FixnumPred::Plusp => 0x4F, // cmovg  (> 0)
+                            FixnumPred::Minusp => 0x4C, // cmovl (< 0)
+                            FixnumPred::Evenp => 0x44, // cmove  (bit clear)
+                            FixnumPred::Oddp => 0x45,  // cmovne (bit set)
+                        };
+                        c.extend_from_slice(&[0x48, 0x0F, cc, 0xC2]); // cmovCC rax, rdx
+                        push_rax(&mut c);
+                        continue;
+                    }
                 }
                 // Speculative fixnum fast path (bliss-jtc.27): in a pure function,
                 // inline binary +,-,*,<,>,<=,>=,= for fixnum operands, guarding on
@@ -4477,6 +4506,29 @@ fn inlinable_unary_fixnum_op(sym: u32) -> Option<UnaryFixnumOp> {
         Some("1+") => Some(UnaryFixnumOp::Incr),
         Some("1-") => Some(UnaryFixnumOp::Decr),
         Some("-") => Some(UnaryFixnumOp::Neg),
+        _ => None,
+    }
+}
+
+/// Unary fixnum predicates with an inlined T1 fast path (bliss-jtc.27): the sign
+/// and parity tests that gate loop conditions. Each guards a fixnum operand,
+/// sets flags, and materialises T/NIL with cmov — no branch, no c2i.
+#[derive(Clone, Copy)]
+enum FixnumPred {
+    Zerop,
+    Plusp,
+    Minusp,
+    Evenp,
+    Oddp,
+}
+
+fn inlinable_fixnum_pred(sym: u32) -> Option<FixnumPred> {
+    match bliss_rt::symbols::symbol_name(sym).as_deref() {
+        Some("ZEROP") => Some(FixnumPred::Zerop),
+        Some("PLUSP") => Some(FixnumPred::Plusp),
+        Some("MINUSP") => Some(FixnumPred::Minusp),
+        Some("EVENP") => Some(FixnumPred::Evenp),
+        Some("ODDP") => Some(FixnumPred::Oddp),
         _ => None,
     }
 }

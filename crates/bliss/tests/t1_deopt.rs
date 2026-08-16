@@ -68,6 +68,27 @@ fn unary_fixnum_ops_match_and_deopt_at_edges() {
     }
 }
 
+/// Inlined fixnum predicates (zerop/plusp/minusp/evenp/oddp) match
+/// interpretation across sign and parity, and deopt for non-fixnum operands
+/// (bliss-jtc.27).
+#[test]
+fn fixnum_predicates_match_interpretation() {
+    let cases = &[
+        "(defun f (x) (list (zerop x) (plusp x) (minusp x) (evenp x) (oddp x))) (f 0) \
+           (format t \"~a~%\" (list (f 0) (f 5) (f -4) (f 7) (f -6)))",
+        // predicate driving a branch and a counting loop.
+        "(defun cnt (n) (let ((c 0) (i 0)) \
+           (loop (when (>= i n) (return c)) (when (oddp i) (setq c (1+ c))) (setq i (1+ i))))) \
+         (cnt 3) (format t \"~a~%\" (list (cnt 10) (cnt 7) (cnt 0)))",
+        // non-fixnum operands deopt to the interpreter's generic predicates.
+        "(defun f (x) (list (zerop x) (plusp x) (minusp x))) (f 0) \
+           (format t \"~a~%\" (list (f 0.0) (f 1.5) (f -2.5)))",
+    ];
+    for c in cases {
+        assert_matches(c);
+    }
+}
+
 /// A fixnum-overflowing result deoptimizes and yields the correct bignum. The
 /// bignum is reduced mod a fixnum so the comparison is over printable values
 /// (bignums print opaquely in both backends).
