@@ -7939,6 +7939,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "BLISS-EXT:DEOPT-COUNT" => {
                 return Ok(BlissVal::from_fixnum(bytecode::deopt_count() as i64));
             }
+            // Compile-coverage diagnostic (bliss-x5y.1): the histogram of why the
+            // bytecode lowerer bailed to the tree-walker, printed most-frequent
+            // first (requires BLISS_BAIL_TRACE=1 when compiling). Returns the
+            // number of distinct reasons. Use it to find which constructs keep
+            // real code (e.g. uiop:ensure-package) off the bytecode/T1 path.
+            "BLISS-EXT:BAIL-REPORT" => {
+                let report = bytecode::bail_report();
+                for (reason, count) in &report {
+                    println!("{count:>7}  {reason}");
+                }
+                return Ok(BlissVal::from_fixnum(report.len() as i64));
+            }
             "BLISS-EXT:GETCWD" => {
                 // Current working directory as a namestring with a trailing
                 // slash (a directory namestring), for ASDF's getcwd (#+bliss).

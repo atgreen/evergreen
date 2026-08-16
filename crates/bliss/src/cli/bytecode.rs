@@ -309,6 +309,39 @@ struct Bail;
 
 type LowerResult<T> = Result<T, Bail>;
 
+thread_local! {
+    /// Histogram of *why* the bytecode lowerer bailed, keyed by a short reason
+    /// (e.g. "call:MAKE-HASH-TABLE", "special:HANDLER-CASE"), for the
+    /// compile-coverage diagnostic (bliss-x5y.1). Populated only when
+    /// BLISS_BAIL_TRACE is set; read via `bliss-ext:bail-report`.
+    static BAIL_LOG: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+}
+
+fn bail_trace_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLISS_BAIL_TRACE").is_some())
+}
+
+/// Record why the lowerer is about to bail. The reason is built lazily so
+/// there is no cost unless BLISS_BAIL_TRACE is set. Returns `Bail` for
+/// `return Err(record_bail(...))` at bail sites.
+fn record_bail(reason: impl FnOnce() -> String) -> Bail {
+    if bail_trace_on() {
+        BAIL_LOG.with(|m| *m.borrow_mut().entry(reason()).or_insert(0) += 1);
+    }
+    Bail
+}
+
+/// Snapshot of the bail histogram, most frequent first (bliss-x5y.1).
+pub fn bail_report() -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = BAIL_LOG.with(|m| {
+        m.borrow().iter().map(|(k, &n)| (k.clone(), n)).collect()
+    });
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v
+}
+
 /// Primitives whose call semantics the tree-walker owns; a `CallNamed` to one
 /// of these delegates to `apply_function`. The allowlist keeps slice 1 *safe*:
 /// the compiler only emits a call when it is certain the callee is a real
@@ -1078,12 +1111,12 @@ impl<'e> Lowerer<'e> {
             let menv = self.macro_env.as_ref().unwrap();
             match compiler_macroexpand::macroexpand_1(form, menv) {
                 Ok((expanded, true)) => return self.lower_expr(expanded),
-                _ => return Err(Bail),
+                _ => return Err(record_bail(|| format!("macroexpand:{name}"))),
             }
         }
         // An unhandled special operator is not a call.
         if is_bail_special(name) {
-            return Err(Bail);
+            return Err(record_bail(|| format!("special:{name}")));
         }
         // Only emit a call when the callee is certainly a function: a
         // user-defined function (lexical name map or global function cell —
@@ -1091,7 +1124,7 @@ impl<'e> Lowerer<'e> {
         let is_user_fn = self.env.funs.contains_key(name) || super::global_fn(name).is_some();
         let is_prim = PRIMITIVE_ALLOWLIST.contains(&name);
         if !is_user_fn && !is_prim {
-            return Err(Bail);
+            return Err(record_bail(|| format!("call:{name}")));
         }
         let args = list_to_vec(rest);
         let nargs = args.len();
