@@ -5694,6 +5694,13 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         return None;
     }
     let bf = registry_get(sym)?;
+    // T2 deopt (emit_framed → c2i_deopt) is a whole-function rerun, which would
+    // repeat a visible side effect. Until T2 gains precise state-transfer deopt
+    // (bliss-izt.3), decline a function that writes a global: it stays at T1,
+    // whose deopt IS precise, so it still speculates safely there.
+    if bf.code.iter().any(|i| matches!(i, Instr::StoreGlobal(_))) {
+        return None;
+    }
     let func_ptr = Rc::as_ptr(&bf) as usize;
     let name = bf.name.clone();
     t2_log!("{name}: considering for T2 (arity {})", bf.arity);
