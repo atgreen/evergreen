@@ -4225,6 +4225,34 @@ fn is_arith_speculatable(sym: u32) -> bool {
     inlinable_fixnum_op(sym).is_some()
 }
 
+thread_local! {
+    /// Functions promoted to native and not yet deoptimized since that promotion.
+    /// Used to decay the profile exactly once per promotion when a speculation
+    /// fails, so a phase change adapts fast without thrashing.
+    static PROMOTED_FRESH: std::cell::RefCell<std::collections::HashSet<u32>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// A speculation for `func_ptr` just failed. Zero the currently-dominant type at
+/// each of its sites — that is the type we bet on and lost — so the new phase's
+/// samples take over quickly (reaching dominance in ~MIN samples instead of having
+/// to out-vote a large stale count). Called once per promotion; the other type's
+/// samples keep accumulating, so the profile never goes fully cold (which would,
+/// with the cold-site fixnum guess, just re-promote the same wrong type).
+fn decay_failed_speculation(func_ptr: usize) {
+    TYPE_PROFILE.with(|m| {
+        for ((fp, _), p) in m.borrow_mut().iter_mut() {
+            if *fp == func_ptr {
+                if p.fixnum >= p.single_float {
+                    p.fixnum = 0;
+                } else {
+                    p.single_float = 0;
+                }
+            }
+        }
+    });
+}
+
 /// Record the operand types seen at call site `(func_ptr, bcp)`.
 fn record_type_profile(func_ptr: usize, bcp: u32, args: &[BlissVal]) {
     let all_fixnum = args.iter().all(|a| a.is_fixnum());
@@ -4358,6 +4386,14 @@ fn run_native(
             *e += 1;
             *e
         });
+        // Decay the profile once per promotion: the first deopt means the
+        // speculation was wrong for the current phase, so zero the type we bet on
+        // and let the new phase's samples take over quickly.
+        if PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym)) {
+            if let Some(bf) = registry_get(sym) {
+                decay_failed_speculation(Rc::as_ptr(&bf) as usize);
+            }
+        }
         if t2_log_target().is_some() {
             let nm = registry_get(sym).map(|b| b.name.clone()).unwrap_or_default();
             t2_log_write(format_args!(
@@ -5383,7 +5419,10 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
 /// Promote `sym` to the best available native tier: T2 (profile-guided) if
 /// enabled and applicable, else the T1 baseline.
 fn try_promote(sym: u32) -> Option<Rc<NativeCode>> {
-    try_promote_to_t2(sym).or_else(|| try_promote_to_t1(sym))
+    let nc = try_promote_to_t2(sym).or_else(|| try_promote_to_t1(sym))?;
+    // Mark this promotion fresh: the first deopt after it decays the profile once.
+    PROMOTED_FRESH.with(|s| s.borrow_mut().insert(sym));
+    Some(nc)
 }
 
 /// Installed OSR code for a function (bliss-izt.1): a non-speculating native
