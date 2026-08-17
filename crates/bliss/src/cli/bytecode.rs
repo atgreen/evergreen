@@ -116,6 +116,64 @@ fn registry_remove(sym: u32) {
     REGISTRY.with(|r| r.borrow_mut().remove(&sym));
 }
 
+/// Call a registered GLOBAL bytecode function `sym` from the tree-walker,
+/// driving T0→T1 promotion — the same trigger the bytecode `CallNamed` path
+/// uses. Without this, a function called only from tree-walked code (e.g. a
+/// top-level `loop`, which is a tree-walker special form and never compiles to
+/// bytecode) would never cross the promotion threshold and would run
+/// interpreted forever. Returns `None` if `sym` is not a registered bytecode
+/// function of matching arity, so the caller falls back to the tree-walker.
+///
+/// The caller MUST have already established that `sym` names the *global*
+/// function (no lexical FLET/LABELS shadow) and counted the invocation (via
+/// `callable_body`/`global_fn`), so this reads — not re-bumps — the counter for
+/// a function object.
+pub fn call_registered(
+    sym: u32,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Option<Result<BlissVal, BlissError>> {
+    let callee = registry_get(sym)?;
+    if callee.arity as usize != args.len() {
+        return None; // arity mismatch (e.g. &optional/&rest): let the tree-walker bind it
+    }
+    let fn_obj = bliss_rt::symbols::symbol_function(sym)
+        .filter(|&c| bliss_rt::function::is_interpreted_function(c));
+    // Use installed native code, or promote on crossing the threshold.
+    let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
+    let native = native.or_else(|| {
+        let count = match fn_obj {
+            Some(f) => bliss_rt::function::invoke_count(f),
+            None => INVOKE_COUNTS.with(|m| {
+                let mut b = m.borrow_mut();
+                let e = b.entry(sym).or_insert(0);
+                *e += 1;
+                *e
+            }),
+        };
+        if count < t1_threshold() {
+            return None;
+        }
+        let nc = try_promote_to_t1(sym)?;
+        if let Some(f) = fn_obj {
+            bliss_rt::function::set_entry(f, nc.entry as *mut u8);
+            bliss_rt::function::set_tier(f, 1);
+        }
+        Some(nc)
+    });
+    // Dispatch to native ONLY. A not-yet-promoted (or over-depth-cap) function
+    // returns None so the caller keeps tree-walking it — this preserves the
+    // tree-walker's exact semantics (e.g. multiple-values clearing on a
+    // single-valued call) for cold code, changing behaviour for hot functions
+    // only insofar as they now run their T1 native code.
+    match native {
+        Some(nc) if NATIVE_DEPTH.with(|d| d.get()) < native_depth_cap() => {
+            Some(run_native(&nc, sym, args, env))
+        }
+        _ => None,
+    }
+}
+
 /// Render a constant-pool value compactly for a bytecode annotation.
 fn fmt_const_val(v: BlissVal) -> String {
     if v == NIL {

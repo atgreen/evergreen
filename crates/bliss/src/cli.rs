@@ -8704,6 +8704,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 args.push(eval_form(af, env)?);
                 c = r;
             }
+            // T0→T1 tiering: run a GLOBAL compiled callee through the promoting
+            // bytecode/native path so hot functions promote even when called from
+            // tree-walked code (e.g. a `loop`, which never compiles to bytecode).
+            // Guard on no lexical shadow — never redirect an FLET/LABELS binding
+            // to the global registry entry of the same name.
+            if !env.funs.contains_key(&name) {
+                if let Some(sym) = resolve_sym(&name) {
+                    if let Some(res) = bytecode::call_registered(sym.as_symbol_index(), &args, env) {
+                        return res;
+                    }
+                }
+            }
             return eval_lambda_call(env, params_form, body, &args, Rc::clone(&env.frame));
         }
 
