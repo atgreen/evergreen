@@ -3852,6 +3852,24 @@ fn home_package_of_name(name: &str) -> String {
 /// COMMON-LISP must NOT claim it — that is what keeps FIND-SYMBOL / DO-SYMBOLS
 /// over COMMON-LISP from fabricating membership and breaking package algorithms
 /// like UIOP's DEFINE-PACKAGE (which compares symbol home packages).
+/// The set of bare names homed in some non-CL package — the batch form of
+/// [`name_owned_by_noncl_package`], computed once so COMMON-LISP enumeration is
+/// O(all-package-symbols) instead of O(symbols × packages) (bliss-gq5.5).
+fn noncl_owned_names(env: &Env) -> std::collections::HashSet<String> {
+    let mut owned = std::collections::HashSet::new();
+    for (pkg_name, pkg) in env.packages.borrow().iter() {
+        if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
+            continue;
+        }
+        for (bare, sym) in &pkg.symbols {
+            if &home_package_of_name(&sym_name(*sym)) == pkg_name {
+                owned.insert(bare.clone());
+            }
+        }
+    }
+    owned
+}
+
 fn name_owned_by_noncl_package(env: &Env, bare_name: &str) -> bool {
     for (pkg_name, pkg) in env.packages.borrow().iter() {
         if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
@@ -4692,32 +4710,33 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
             .unwrap_or_default();
     }
     let mut seen = HashMap::<String, BlissVal>::new();
+    // Enumerate the whole interned table once (one lock, no fixed 4096 cap — the
+    // old `0..4096` probe truncated large images and re-locked per index,
+    // bliss-gq5.5). COMMON-LISP/-USER are the bare-named symbols; KEYWORD the
+    // `:`-prefixed ones.
     if package_name == "COMMON-LISP" {
         // Only bare symbols that no user package homes belong to COMMON-LISP.
-        for idx in 0..4096u32 {
-            if let Some(name) = reader::symbol_name(idx) {
-                if !name.contains(':') && !name_owned_by_noncl_package(env, &name) {
-                    seen.entry(name.clone())
-                        .or_insert(BlissVal::from_symbol_index(idx));
-                }
+        // Precompute the set of names owned by a non-CL package ONCE, rather than
+        // rescanning every package per symbol (was O(symbols × packages)).
+        let owned = noncl_owned_names(env);
+        for (idx, name) in bliss_rt::symbols::interned_names() {
+            if !name.contains(':') && !owned.contains(&name) {
+                seen.entry(name.clone())
+                    .or_insert(BlissVal::from_symbol_index(idx));
             }
         }
     } else if package_name == "COMMON-LISP-USER" {
-        for idx in 0..4096u32 {
-            if let Some(name) = reader::symbol_name(idx) {
-                if !name.contains(':') {
-                    seen.entry(name.clone())
-                        .or_insert(BlissVal::from_symbol_index(idx));
-                }
+        for (idx, name) in bliss_rt::symbols::interned_names() {
+            if !name.contains(':') {
+                seen.entry(name.clone())
+                    .or_insert(BlissVal::from_symbol_index(idx));
             }
         }
     } else if package_name == "KEYWORD" {
-        for idx in 0..4096u32 {
-            if let Some(name) = reader::symbol_name(idx) {
-                if name.starts_with(':') {
-                    seen.entry(name.clone())
-                        .or_insert(BlissVal::from_symbol_index(idx));
-                }
+        for (idx, name) in bliss_rt::symbols::interned_names() {
+            if name.starts_with(':') {
+                seen.entry(name.clone())
+                    .or_insert(BlissVal::from_symbol_index(idx));
             }
         }
     }

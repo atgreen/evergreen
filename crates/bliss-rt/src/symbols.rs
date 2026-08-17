@@ -180,6 +180,25 @@ pub fn find_index(name: &str) -> Option<u32> {
     with_registry(|reg| reg.and_then(|r| r.name_to_index.get(name).copied()))
 }
 
+/// All interned symbols as `(index, name)` pairs, in index order — one lock
+/// acquisition for callers that enumerate the whole table (e.g. package
+/// enumeration of COMMON-LISP / COMMON-LISP-USER / KEYWORD). Replaces probing a
+/// fixed `0..4096` range with `symbol_name` per index, which both truncated at
+/// 4096 symbols and took a lock per probe (bliss-gq5.5). The name is the
+/// registry key the symbol was interned under (identical to `symbol_name`).
+pub fn interned_names() -> Vec<(u32, String)> {
+    with_registry(|reg| {
+        reg.map(|r| {
+            r.index_to_key
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (i as u32, name.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+    })
+}
+
 /// The object reference for a symbol index, if present.
 fn object_for_index(reg: &SymbolRegistry, idx: u32) -> Option<BlissVal> {
     if idx >= UNINTERNED_BASE {
