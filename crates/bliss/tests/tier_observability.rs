@@ -388,3 +388,40 @@ fn nested_eval_when_compiles_and_promotes() {
     let t1_rest = line.split_once(' ').map(|(_, r)| r.to_string());
     assert_eq!(t1_rest, tw_rest, "eval-when result must match the tree-walker");
 }
+
+/// Definitions nested in a top-level PROGN — including a macro that EXPANDS to
+/// `(progn (defun …) (defun …))` — compile and promote to T1 (bliss-1xw), rather
+/// than bailing the whole thunk. eval_toplevel macroexpands top-level forms and
+/// recurses progn/locally/eval-when subforms as top-level (CLHS 3.2.3.1).
+#[test]
+fn nested_definitions_in_progn_compile() {
+    let prog = "\
+        (progn (defun pa (x) (* x 2)) (defun pb (x) (+ x 100))) \
+        (defmacro defpair (n) \
+          (list (quote progn) \
+                (list (quote defun) (quote qa) (quote (x)) (list (quote -) (quote x) n)) \
+                (list (quote defun) (quote qb) (quote (x)) (list (quote +) (quote x) n)))) \
+        (defpair 7) \
+        (pa 1) (pa 1) (pb 1) (pb 1) (qa 1) (qa 1) (qb 1) (qb 1) \
+        (format t \"~a ~a ~a ~a ~a ~a ~a~%\" \
+          (bliss-ext:function-tier (quote pa)) (bliss-ext:function-tier (quote qa)) \
+          (pa 3) (pb 3) (qa 10) (qb 10) (pb 0))";
+    let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "nested-defs run failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    // pa and qa (from the macro) both reach T1; values follow.
+    assert_eq!(
+        line, "1 1 6 103 3 17 100",
+        "tiers pa/qa then pa/pb/qa/qb/pb values: {line:?}"
+    );
+
+    // Compare only the VALUES (skip the two leading tier fields, which are 0 in
+    // the tree-walker and 1 at T1).
+    let values = |l: &str| l.splitn(3, ' ').nth(2).map(str::to_string);
+    let (tw, _) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert_eq!(
+        values(&line),
+        values(tw.lines().next().unwrap_or("")),
+        "nested-def results must match the tree-walker"
+    );
+}

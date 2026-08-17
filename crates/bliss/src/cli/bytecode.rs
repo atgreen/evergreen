@@ -6323,12 +6323,45 @@ fn is_toplevel_definer(name: &str) -> bool {
             | "DEFINE-COMPILER-MACRO"
             | "DEFINE-SETF-EXPANDER"
             | "DEFSETF"
+            // CLOS definers: register directly. Their bodies (a method's body,
+            // a slot :initform) still run tree-walked — compiling method bodies
+            // is a separate task — but this skips the wasted thunk-compile attempt
+            // that macro-expanded (progn (defmethod …) …) groups otherwise pay on
+            // every load (bliss-1xw).
+            | "DEFCLASS"
+            | "DEFGENERIC"
+            | "DEFMETHOD"
+            // Package operations: run once for effect (never usefully compiled).
+            // They already reach eval_form via the thunk bail; short-circuiting
+            // skips the wasted compile attempt on every top-level occurrence.
+            | "IN-PACKAGE"
+            | "DEFPACKAGE"
     )
 }
 
 pub fn eval_toplevel(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     if !backend_is_bytecode() {
         return eval_form(form, env);
+    }
+
+    // Macroexpand a top-level macro call before dispatching (CLHS 3.2.3.1): a
+    // macro that expands to `(progn (defun …) …)` — asdf/UIOP's with-upgradability
+    // and friends — must have its nested definitions processed as top-level forms,
+    // not hidden inside a bailing thunk (bliss-1xw). Recursing on the expansion
+    // loops through chained macros and then hits the progn/eval-when/definer/defun
+    // cases below. Only the OUTER form is expanded here; inner forms are expanded
+    // by the lowerer as before, so no form is double-expanded.
+    if form.is_cons() {
+        let (op, _) = cp(form);
+        if op.is_symbol() {
+            let name = sym_name(op);
+            if super::macro_defined(env, &name) {
+                let menv = super::macroexpand_environment_from_cli(env);
+                if let Ok((expanded, true)) = compiler_macroexpand::macroexpand_1(form, &menv) {
+                    return eval_toplevel(expanded, env);
+                }
+            }
+        }
     }
 
     // A top-level `(eval-when (situations) body...)` whose situations fire now:
@@ -6350,6 +6383,22 @@ pub fn eval_toplevel(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                 return Ok(last);
             }
             return Ok(NIL);
+        }
+        // A top-level PROGN / LOCALLY: per CLHS 3.2.3.1 its subforms are
+        // themselves top-level forms, so process each recursively (bliss-1xw).
+        // Otherwise a wrapping `(progn (defun …) …)` — or an `(eval-when …
+        // (progn (defun …)))` after the recursion above — hides the nested
+        // definitions inside a thunk, which bails and tree-walks them. LOCALLY's
+        // leading `(declare …)` forms recurse to a harmless NIL.
+        if op.is_symbol() {
+            let bare = symbol_bare_name(&sym_name(op));
+            if bare == "PROGN" || bare == "LOCALLY" {
+                let mut last = NIL;
+                for f in list_to_vec(cdr) {
+                    last = eval_toplevel(f, env)?;
+                }
+                return Ok(last);
+            }
         }
     }
 
