@@ -117,12 +117,20 @@ fn pop_reg(a: &mut Asm, r: u8) {
     a.push(0x58 + (r & 7));
 }
 
-/// `mov r64, [r14 + 8*i]` — load an argument/local from its interpreter frame
-/// slot (r14 = the slots pointer, per the run_native ABI).
-fn mov_from_frame(a: &mut Asm, dst: u8, i: usize) {
-    a.push(0x49 | if dst >= 8 { 0x04 } else { 0 }); // REX.W + B(base r14) [+R]
+/// `mov dst, [base + 8*i]` — load an argument/local from its interpreter frame
+/// slot. `base` is the slots-pointer register (rdi in the frame-less fast path,
+/// or r14 when a frame is set up).
+fn mov_from_frame(a: &mut Asm, dst: u8, base: u8, i: usize) {
+    let mut rex = 0x48; // REX.W
+    if dst >= 8 {
+        rex |= 0x04; // REX.R
+    }
+    if base >= 8 {
+        rex |= 0x01; // REX.B
+    }
+    a.push(rex);
     a.push(0x8B); // mov r64, r/m64
-    a.push(0x40 | ((dst & 7) << 3) | 6); // mod=01(disp8), rm=110(r14)
+    a.push(0x40 | ((dst & 7) << 3) | (base & 7)); // mod=01(disp8), rm=base
     a.push((8 * i) as u8);
 }
 
@@ -145,13 +153,75 @@ fn imul_rr(a: &mut Asm, dst: u8, src: u8) {
 // ── Framed emitter (T2, interpreter-callable) ───────────────────────
 //
 // Emits a straight-line speculated function as native code callable by the T0
-// run_native adapter: the slots pointer arrives in rdi (→ r14), arguments are
-// read from frame slots, the result is returned in rax, and a guard miss calls
-// `c2i_deopt` — the no-resume deopt that makes run_native re-run the (pure)
-// function in the interpreter. This is where the operand stack disappears: the
-// fast path works in registers, only touching memory to load the args.
+// run_native adapter. The slots pointer arrives in rdi; arguments are read
+// straight from `[rdi + 8*i]`. The fast path makes no call, so it needs no stack
+// frame and no callee-saved register — it works entirely in registers and
+// returns in rax. A guard miss jumps to a cold stub that aligns the stack and
+// calls `c2i_deopt` (the no-resume deopt that makes run_native re-run the pure
+// function in the interpreter). Instruction selection folds a constant operand
+// into the multiply immediate and never materialises it, and only the *variable*
+// operand is tag-checked — a statically-known fixnum constant needs no guard.
 
 const SCRATCH: u8 = 2; // rdx — reserved for guard temporaries, never a value reg
+
+/// `test <r low byte>, 7 ; jne deopt` — the fixnum-tag guard on one operand.
+/// Correct for registers 0..=3 and 8..=15 (the framed value pool); registers
+/// 4..=7 would need a REX prefix to name their low byte and are never allocated.
+fn guard_fixnum(a: &mut Asm, r: u8, deopt: bliss_rt::asm::Label) {
+    if r >= 8 {
+        a.push(0x41); // REX.B → r8b..r15b
+    }
+    a.push(0xF6); // test r/m8, imm8  (/0)
+    a.push(0xC0 | (r & 7)); // mod=11, rm=r
+    a.push(0x07);
+    a.jcc(Cc::Ne, deopt);
+}
+
+/// `imul dst, src, imm32` — dst = src * imm, setting OF on overflow. Multiplying
+/// the *tagged* operand by the raw constant yields the tagged product directly
+/// (tagged(x)·c = (x<<3)·c = (x·c)<<3 = tagged(x·c)), so no untag/retag is needed.
+fn imul_imm(a: &mut Asm, dst: u8, src: u8, imm: i32) {
+    a.push(rex_w(dst, src)); // REX.W + R(dst) + B(src)
+    a.push(0x69); // imul r64, r/m64, imm32
+    a.push(modrm_rr(dst, src)); // reg=dst, rm=src
+    a.extend_from_slice(&imm.to_le_bytes());
+}
+
+/// Get value `v` into a register: an already-assigned one, or a deferred fixnum
+/// constant materialised (tagged) into a fresh register on demand.
+fn framed_mat(
+    a: &mut Asm,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    v: crate::t2::ir::Value,
+) -> Result<u8, EmitError> {
+    if let Some(&r) = reg.get(&v) {
+        return Ok(r);
+    }
+    if let Some(&c) = consts.get(&v) {
+        let r = pool.pop().ok_or(EmitError::UnsupportedOp(0xF1))?;
+        reg.insert(v, r);
+        mov_imm64(a, r, bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
+        return Ok(r);
+    }
+    Err(EmitError::UnsupportedOp(0xF2))
+}
+
+/// Assign a register to an instruction result — honouring a pre-assignment (the
+/// return value is bound to rax so the arithmetic lands in the return register).
+fn framed_alloc(
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    v: crate::t2::ir::Value,
+) -> Result<u8, EmitError> {
+    if let Some(&r) = reg.get(&v) {
+        return Ok(r);
+    }
+    let r = pool.pop().ok_or(EmitError::UnsupportedOp(0xF1))?;
+    reg.insert(v, r);
+    Ok(r)
+}
 
 /// Emit `f` (a single-block, speculated straight-line function) as native code.
 /// `c2i_deopt_addr` is the address of the interpreter's `c2i_deopt` routine.
@@ -164,32 +234,36 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<Vec<u8>, EmitErr
     }
     let entry = f.entry();
 
-    // Trivial register assignment: one x86 GPR per SSA value from a small pool
-    // (rax reserved for return/imul, rdx for guard scratch, r14 for the frame).
-    let mut pool: Vec<u8> = vec![10, 9, 8, 6, 1]; // r10, r9, r8, rsi, rcx (pop→rcx first)
+    // rax = return value, rdx = guard scratch, rdi = frame slots pointer. Value
+    // registers: r10, r9, r8, rcx (pop→rcx first) — all have REX-free or REX.B
+    // low bytes, so the tag guard needs no special-casing.
+    let mut pool: Vec<u8> = vec![10, 9, 8, 1];
     let mut reg: HashMap<Value, u8> = HashMap::new();
-    let mut alloc = |v: Value, reg: &mut HashMap<Value, u8>, pool: &mut Vec<u8>| -> Result<u8, EmitError> {
-        if let Some(&r) = reg.get(&v) {
-            return Ok(r);
-        }
-        let r = pool.pop().ok_or(EmitError::UnsupportedOp(0xF1))?; // out of registers
-        reg.insert(v, r);
-        Ok(r)
-    };
-    let get = |v: Value, reg: &HashMap<Value, u8>| -> Result<u8, EmitError> {
-        reg.get(&v).copied().ok_or(EmitError::UnsupportedOp(0xF2))
-    };
+    // Deferred fixnum constants: folded into imul immediates, materialised only
+    // if used somewhere that needs a register (e.g. returned directly).
+    let mut consts: HashMap<Value, i64> = HashMap::new();
+
+    // The terminator must be a Return; bind its value to rax up front so a
+    // FixnumMul writing the return value targets rax with no extra move.
+    let term = f.terminator(entry).ok_or(EmitError::UnsupportedOp(0xF3))?;
+    let term_data = f.inst(term).clone();
+    if term_data.opcode != Opcode::Return {
+        return Err(EmitError::UnsupportedOp(op_tag(term_data.opcode)));
+    }
+    let ret_val = term_data.args.first().copied();
+    if let Some(rv) = ret_val {
+        reg.insert(rv, 0); // rax
+    }
 
     let mut a = Asm::new();
     let deopt = a.label();
 
-    // Prologue: save r14, point it at the frame slots (rdi), load the params.
-    push_reg(&mut a, 14);
-    a.extend_from_slice(&[0x49, 0x89, 0xFE]); // mov r14, rdi
+    // No frame: load params straight from [rdi + 8*i] — rdi stays live because
+    // the fast path never calls, so nothing clobbers it.
     let params = f.block(entry).params.clone();
     for (i, &p) in params.iter().enumerate() {
-        let r = alloc(p, &mut reg, &mut pool)?;
-        mov_from_frame(&mut a, r, i);
+        let r = framed_alloc(&mut reg, &mut pool, p)?;
+        mov_from_frame(&mut a, r, 7 /* rdi */, i);
     }
 
     // Body.
@@ -201,23 +275,40 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<Vec<u8>, EmitErr
                     AuxData::FixnumImm(v) => v,
                     _ => return Err(EmitError::MissingImm),
                 };
-                let dst = alloc(data.results[0], &mut reg, &mut pool)?;
-                // Materialise the tagged BlissVal fixnum.
-                mov_imm64(&mut a, dst, bliss_rt::value::BlissVal::from_fixnum(imm).0 as i64);
+                consts.insert(data.results[0], imm); // defer; fold where possible
             }
             Opcode::FixnumMul => {
-                let x = get(data.args[0], &reg)?;
-                let y = get(data.args[1], &reg)?;
-                let r = alloc(data.results[0], &mut reg, &mut pool)?;
-                // Guard: both operands fixnum, else deopt.
+                let (a0, b0) = (data.args[0], data.args[1]);
+                let dst = framed_alloc(&mut reg, &mut pool, data.results[0])?;
+                // One operand a constant → guard only the other, fold the constant
+                // into the multiply immediate (tagged·raw = tagged product).
+                let folded = if let Some(&c) = consts.get(&b0) {
+                    Some((a0, c))
+                } else if let Some(&c) = consts.get(&a0) {
+                    Some((b0, c))
+                } else {
+                    None
+                };
+                if let Some((var, c)) = folded {
+                    if let Ok(c32) = i32::try_from(c) {
+                        let x = framed_mat(&mut a, &mut reg, &mut pool, &consts, var)?;
+                        guard_fixnum(&mut a, x, deopt);
+                        imul_imm(&mut a, dst, x, c32);
+                        a.jcc(Cc::O, deopt);
+                        continue;
+                    }
+                    // constant too wide for imm32 → fall through to the general path
+                }
+                // General two-register multiply: guard both, untag one, multiply.
+                let x = framed_mat(&mut a, &mut reg, &mut pool, &consts, a0)?;
+                let y = framed_mat(&mut a, &mut reg, &mut pool, &consts, b0)?;
                 alu_rr(&mut a, 0x89, SCRATCH, x); // mov rdx, x
                 alu_rr(&mut a, 0x09, SCRATCH, y); // or  rdx, y
                 a.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
                 a.jcc(Cc::Ne, deopt);
-                // r = (untag x) * y  → tagged product; overflow → deopt.
-                mov_rr(&mut a, r, x);
-                sar_imm(&mut a, r, 3);
-                imul_rr(&mut a, r, y);
+                mov_rr(&mut a, dst, x);
+                sar_imm(&mut a, dst, 3);
+                imul_rr(&mut a, dst, y);
                 a.jcc(Cc::O, deopt);
             }
             other if other.is_terminator() => break, // handled below
@@ -225,26 +316,28 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<Vec<u8>, EmitErr
         }
     }
 
-    // Terminator: Return the value in rax.
-    let term = f.terminator(entry).ok_or(EmitError::UnsupportedOp(0xF3))?;
-    let term_data = f.inst(term).clone();
-    if term_data.opcode != Opcode::Return {
-        return Err(EmitError::UnsupportedOp(op_tag(term_data.opcode)));
+    // Return: make sure the value is in rax — a bare constant is materialised
+    // there directly, otherwise it is already in rax (pre-assigned) or moved in.
+    if let Some(rv) = ret_val {
+        if let Some(&c) = consts.get(&rv) {
+            mov_imm64(&mut a, 0, bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
+        } else {
+            let r = framed_mat(&mut a, &mut reg, &mut pool, &consts, rv)?;
+            if r != 0 {
+                mov_rr(&mut a, 0, r); // mov rax, r
+            }
+        }
     }
-    if let Some(&v) = term_data.args.first() {
-        let r = get(v, &reg)?;
-        mov_rr(&mut a, 0, r); // mov rax, r
-    }
-    pop_reg(&mut a, 14);
-    a.push(0xC3); // ret
+    a.push(0xC3); // ret — no frame to tear down
 
-    // Deopt stub: call c2i_deopt (sets NATIVE_DEOPT with no resume point, so
-    // run_native re-runs the pure function in the interpreter), then return.
+    // Deopt stub: align rsp (entry rsp%16==8; the fast path pushed nothing), call
+    // c2i_deopt, unwind the alignment, return (value ignored on deopt).
     a.bind(deopt);
+    a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
     mov_imm64(&mut a, 0, c2i_deopt_addr as i64); // mov rax, c2i_deopt
     a.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    pop_reg(&mut a, 14);
-    a.push(0xC3); // ret (value ignored on deopt)
+    a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+    a.push(0xC3); // ret
 
     a.finish().ok_or(EmitError::BadBranch)
 }

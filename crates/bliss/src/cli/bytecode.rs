@@ -5224,6 +5224,21 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
     if speculated == 0 {
         return None; // nothing to specialise → T1 is as good; skip T2
     }
+
+    // Route the speculated IR through the mid-end: constant folding + strength
+    // reduction (P4f), global value numbering (P4a), then deopt-aware DCE (P4c).
+    // Each pass preserves well-formedness (spec §4.10 R4.60); re-verify before
+    // emitting, and decline T2 (fall back to T1) if anything went wrong.
+    {
+        use bliss_compiler::t2::pass::PassManager;
+        let mut pm = PassManager::new();
+        pm.add(Box::new(bliss_compiler::t2::opt_fold::ConstFold));
+        pm.add(Box::new(bliss_compiler::t2::opt_gvn::Gvn));
+        pm.add(Box::new(bliss_compiler::t2::opt_dce::Dce));
+        pm.run(&mut f);
+    }
+    bliss_compiler::t2::verify::verify(&f).ok()?;
+
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
     let code = bliss_compiler::t2::emit::emit_framed(&f, deopt_addr).ok()?;
 
