@@ -4933,14 +4933,16 @@ fn emit_native_x86(
     // function is to a re-execution-safe primitive may we inline fixnum fast
     // paths whose guards deoptimize by re-running the whole function. Purity of
     // every call makes that re-run observably equivalent.
+    // T1 deopt is always precise state-transfer: every guard's deopt stub records
+    // its (bcp, depth) via c2i_deopt_state and `run_native` resumes T0 at that
+    // exact bcp, so an already-executed side effect (e.g. StoreGlobal) at an
+    // earlier bcp is never re-run — the guarded ops themselves are pure fixnum
+    // fast paths. Hence side-effecting functions may speculate freely, like C2
+    // (bliss-izt.3). (The whole-function-rerun tail exists only for the T2
+    // emitter's c2i_deopt, which is a separate, non-T1 path.)
     let deopt_safe = allow_speculation
         && bf.code.iter().all(|i| match i {
             Instr::CallNamed { sym, .. } => is_deopt_safe_primitive(*sym),
-            // A global write is a visible side effect: a whole-function deopt-
-            // rerun would repeat it, so a function that stores a global forgoes
-            // speculation entirely (bliss-x5y.15). It still compiles natively;
-            // just with no guarded fixnum fast paths (hence no deopt).
-            Instr::StoreGlobal(_) => false,
             _ => true,
         });
 
