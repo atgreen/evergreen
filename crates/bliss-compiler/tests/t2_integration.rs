@@ -232,7 +232,7 @@ fn branching_if_speculates_and_runs() {
     assert_eq!(n, 2, "both the comparison and the multiply are speculated");
     verify(&f).expect("speculated branching IR verifies");
 
-    let framed = emit_framed(&f, 0).expect("emit branching function");
+    let framed = emit_framed(&f, 0, 0).expect("emit branching function");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 
@@ -244,6 +244,40 @@ fn branching_if_speculates_and_runs() {
     assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 999, "100≮100 → 999");
     let mut frame = [BlissVal::from_fixnum(200).0, 0u64, 0u64, 0u64];
     assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 999, "200≥100 → 999");
+}
+
+/// Function calls reach T2: `(f n) = (* n (g n))` contains a call, so it emits via
+/// the callee-saved path (values survive the c2i call) — the multiply is speculated
+/// and the call is lowered. Emission must succeed (has_calls: compiled_entry = 0).
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn call_containing_function_emits() {
+    use bliss_compiler::t2::emit::emit_framed;
+    use bliss_compiler::t2::speculate::{speculate, SpecType};
+    let g = bliss_rt::symbols::intern("g-callee");
+    let mul = bliss_rt::symbols::intern("*");
+    // 0 LoadLocal 0 (n) ; 1 LoadLocal 0 (n) ; 2 (g n) ; 3 (* n <g>) ; 4 Return
+    let bf = bytecode_fn(
+        "callf",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: g, nargs: 1 },
+            Instr::CallNamed { sym: mul, nargs: 2 },
+            Instr::Return,
+        ],
+        vec![],
+        1,
+        3,
+        1,
+    );
+    let mut f = build_from_bytecode(&bf).expect("build call-containing fn");
+    // Speculate only the multiply (bcp 3); the call at bcp 2 stays a generic Call.
+    let n = speculate(&mut f, &|bcp| (bcp == 3).then_some(SpecType::Fixnum));
+    assert_eq!(n, 1, "the multiply is speculated; the call is not");
+    let framed = emit_framed(&f, 0, 0).expect("a call-containing function must emit");
+    assert!(!framed.code.is_empty());
+    assert_eq!(framed.compiled_entry, 0, "call functions use the frame entry only");
 }
 
 /// Wave-3 milestone: with P5b (block-CFG lowering) + P6b (multi-block regalloc),
