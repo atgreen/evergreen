@@ -668,6 +668,7 @@ impl<'e> Lowerer<'e> {
                 "LET" => self.lower_let(rest, false),
                 "LET*" => self.lower_let(rest, true),
                 "SETQ" => self.lower_setq(rest),
+                "SETF" => self.lower_setf(rest),
                 "BLOCK" => self.lower_block(rest),
                 "RETURN-FROM" => self.lower_return_from(rest),
                 "RETURN" => self.lower_return(rest),
@@ -1222,6 +1223,29 @@ impl<'e> Lowerer<'e> {
             }
         }
         Ok(())
+    }
+
+    /// `(setf place val ...)` — when every place is a plain symbol, SETF is
+    /// exactly SETQ, which the lowerer already handles. Complex places
+    /// (car/aref/slot/…) need the setf-expander machinery, which isn't available
+    /// here, so bail to the tree-walker. This is what unblocks counting loops —
+    /// the increment `(setf i (1+ i))` is the reason idiomatic loops never
+    /// promoted to native code (bliss-jtc.26).
+    fn lower_setf(&mut self, rest: BlissVal) -> LowerResult<()> {
+        let items = list_to_vec(rest);
+        if items.len() % 2 != 0 {
+            return Err(Bail);
+        }
+        let mut i = 0;
+        while i < items.len() {
+            if !items[i].is_symbol() {
+                return Err(Bail);
+            }
+            i += 2;
+        }
+        // Symbol-place SETF has identical semantics to SETQ (lower_setq also
+        // handles the symbol-macro / global / boxed cases and bails as needed).
+        self.lower_setq(rest)
     }
 
     // ── Non-local control flow lowering (nmq.4) ────────────────────
