@@ -187,6 +187,54 @@ fn imul_imm(a: &mut Asm, dst: u8, src: u8, imm: i32) {
     a.extend_from_slice(&imm.to_le_bytes());
 }
 
+// Fixnum value range: 3 tag bits leave 61 signed value bits.
+const FIXNUM_MAX: i64 = (1 << 60) - 1;
+const FIXNUM_MIN: i64 = -(1 << 60);
+
+/// The SIB scale bits for `x·c` expressed as `lea [x + x*(c-1)]`, i.e. c-1 ∈
+/// {1,2,4,8}. Returns `None` for multipliers `lea` can't do in one instruction.
+fn lea_scale(c: i64) -> Option<u8> {
+    match c {
+        2 => Some(0b00), // x + x*1
+        3 => Some(0b01), // x + x*2
+        5 => Some(0b10), // x + x*4
+        9 => Some(0b11), // x + x*8
+        _ => None,
+    }
+}
+
+/// `lea dst, [base + base*scale]` — dst = base·(1+2^scale_field). Because it works
+/// on the *tagged* operand (tagged(x)·c = tagged(x·c)) it needs no untag; because
+/// `lea` sets no flags it can only be used when overflow is proven impossible.
+fn lea_mul(a: &mut Asm, dst: u8, base: u8, scale: u8) {
+    let mut rex = 0x48; // REX.W
+    if dst >= 8 {
+        rex |= 0x04; // REX.R (reg = dst)
+    }
+    if base >= 8 {
+        rex |= 0x03; // REX.X + REX.B (both index and base are `base`)
+    }
+    a.push(rex);
+    a.push(0x8D); // lea r64, m
+    a.push(((dst & 7) << 3) | 0x04); // mod=00, reg=dst, rm=100 → SIB
+    a.push((scale << 6) | ((base & 7) << 3) | (base & 7)); // scale, index=base, base=base
+}
+
+/// Whether `range · c` is provably inside the fixnum range — so the tagged
+/// product `(range·c)<<3` cannot overflow a 64-bit register and no `jo`/deopt is
+/// needed. Conservative: an unknown range, a non-positive `c`, or any arithmetic
+/// overflow in the check itself all answer "no".
+fn mul_cannot_overflow(range: Option<crate::t2::ir::Range>, c: i64) -> bool {
+    let Some(r) = range else { return false };
+    if c <= 0 {
+        return false;
+    }
+    match (r.lo.checked_mul(c), r.hi.checked_mul(c)) {
+        (Some(lo), Some(hi)) => lo >= FIXNUM_MIN && hi <= FIXNUM_MAX,
+        _ => false,
+    }
+}
+
 /// Get value `v` into a register: an already-assigned one, or a deferred fixnum
 /// constant materialised (tagged) into a fresh register on demand.
 fn framed_mat(
@@ -291,10 +339,23 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<Vec<u8>, EmitErr
                 };
                 if let Some((var, c)) = folded {
                     if let Ok(c32) = i32::try_from(c) {
+                        let range = f.value(var).ty.range;
                         let x = framed_mat(&mut a, &mut reg, &mut pool, &consts, var)?;
+                        // The type guard always stays — we speculate that the
+                        // operand is a fixnum. The *overflow* check is what range
+                        // analysis lets us drop: when the product provably stays in
+                        // fixnum range, strength-reduce to `lea` (no flags, no jo);
+                        // otherwise the overflow-detecting `imul + jo` is required.
                         guard_fixnum(&mut a, x, deopt);
-                        imul_imm(&mut a, dst, x, c32);
-                        a.jcc(Cc::O, deopt);
+                        if mul_cannot_overflow(range, c) {
+                            match lea_scale(c) {
+                                Some(scale) => lea_mul(&mut a, dst, x, scale),
+                                None => imul_imm(&mut a, dst, x, c32), // safe: no jo
+                            }
+                        } else {
+                            imul_imm(&mut a, dst, x, c32);
+                            a.jcc(Cc::O, deopt);
+                        }
                         continue;
                     }
                     // constant too wide for imm32 → fall through to the general path
@@ -547,6 +608,95 @@ mod tests {
         DEOPTED.store(false, Ordering::SeqCst);
         let _ = func(frame.as_mut_ptr());
         assert!(DEOPTED.load(Ordering::SeqCst), "a float operand must deopt to the interpreter");
+    }
+
+    /// Build post-speculation IR for `(x) -> x * c` where the param `x` carries
+    /// the given inferred range — i.e. what inlining/the caller ABI would supply.
+    fn build_mul_ranged(c: i64, range: Option<crate::t2::ir::Range>) -> crate::t2::ir::Function {
+        use crate::t2::ir::{AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation};
+        let mut f = Function::new("m");
+        let entry = f.entry();
+        let xty = IRType { bits: TypeBits::FIXNUM, range, class_id: None };
+        let x = f.add_block_param(entry, xty, ValueRepresentation::Tagged);
+        let (_ci, cres) = f.push_inst(
+            entry,
+            InstData {
+                opcode: Opcode::ConstFixnum,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::FixnumImm(c),
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        let (_mi, mres) = f.push_inst(
+            entry,
+            InstData {
+                opcode: Opcode::FixnumMul,
+                args: vec![x, cres[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![mres[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        f
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Range-proven-safe `* 5` strength-reduces to a single `lea` with no overflow
+    /// deopt — matching SBCL's optimised form — and still executes to x*5.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn strength_reduces_to_lea_when_range_is_safe() {
+        use bliss_rt::value::BlissVal;
+        let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit");
+        // `lea rax,[rcx+rcx*4]` = 48 8D 04 89 ; and NO overflow branch (0F 80).
+        assert!(contains(&code, &[0x48, 0x8D, 0x04, 0x89]), "must emit lea for a range-safe *5");
+        assert!(!contains(&code, &[0x0F, 0x80]), "range proves no overflow → no jo deopt");
+        let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
+        let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+        let mut frame = [BlissVal::from_fixnum(7).0, 0u64, 0u64];
+        assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 35, "lea *5 of 7 = 35");
+    }
+
+    /// Without a range, the overflow-detecting `imul + jo` is kept (correctness
+    /// over speed — an unbounded fixnum could overflow to a bignum).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn keeps_imul_and_overflow_check_when_range_unknown() {
+        use bliss_rt::value::BlissVal;
+        let f = build_mul_ranged(5, None);
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit");
+        assert!(contains(&code, &[0x48, 0x69, 0xC1]), "unknown range → imul rax,rcx,5");
+        assert!(contains(&code, &[0x0F, 0x80]), "unknown range → keep the jo overflow deopt");
+        let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
+        let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+        let mut frame = [BlissVal::from_fixnum(7).0, 0u64, 0u64];
+        assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 35, "imul *5 of 7 = 35");
     }
 
     /// A small computation `() -> 7 + 5 = 12`, executed.
