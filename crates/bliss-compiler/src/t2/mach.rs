@@ -60,11 +60,40 @@ pub struct MachInst {
     pub safepoint: bool,
 }
 
-/// A lowered function: machine instructions plus the register-allocation result
-/// once P6 has run.
+/// A machine-level basic block (spec §4.7): the CFG structure regalloc2 (P6) and
+/// code emission need. `insts` is the `[start, end)` half-open range into
+/// `MachFunc::insts` forming this block's body (ending in a branch/return);
+/// `params` are the block's parameter VRegs (regalloc2's φ replacement); `succs`
+/// are the outgoing edges with the VReg args bound to each target's params.
+#[derive(Clone, Debug)]
+pub struct MachBlock {
+    pub params: Vec<VReg>,
+    pub start: usize,
+    pub end: usize,
+    pub succs: Vec<MachSucc>,
+}
+
+/// A machine-block handle (index into `MachFunc::blocks`; block 0 is the entry).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct MachBlockId(pub u32);
+
+/// One CFG edge: a successor block plus the VReg arguments bound to that block's
+/// parameters on this edge (parallel-move / φ semantics).
+#[derive(Clone, Debug)]
+pub struct MachSucc {
+    pub target: MachBlockId,
+    pub args: Vec<VReg>,
+}
+
+/// A lowered function: machine instructions plus the block CFG over them and the
+/// register-allocation result once P6 has run.
 #[derive(Clone, Debug, Default)]
 pub struct MachFunc {
     pub insts: Vec<MachInst>,
+    /// The block CFG over `insts`; `blocks[0]` is the entry. Populated by P5
+    /// lowering. Empty means "not yet block-structured" (a straight-line
+    /// single-block view over `insts` is the fallback P6 uses in that case).
+    pub blocks: Vec<MachBlock>,
     /// Virtual-register → assigned location, filled in by P6.
     pub allocation: Vec<(VReg, Location)>,
     /// Per-safepoint GC stack maps, filled in by P6 (spec §4.7 R4.46).

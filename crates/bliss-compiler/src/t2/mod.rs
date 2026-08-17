@@ -41,3 +41,8 @@ pub mod opt_guard; // P4d — guard elimination + hoisting
 pub mod opt_gvn; // P4a — global value numbering / CSE
 pub mod opt_licm; // P4b — loop-invariant code motion
 pub mod regalloc; // P6 — regalloc2 adapter + stack maps
+
+// ── Wave 3 parcels ────────────────────────────────────────────────
+pub mod opt_escape; // P4e — escape analysis + scalar replacement
+pub mod opt_fold; // P4f — constant folding + strength reduction
+pub mod osr_entry; // P8 — OSR entry region in the IR (A4.03, R4.66)

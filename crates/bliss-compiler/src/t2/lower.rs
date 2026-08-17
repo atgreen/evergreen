@@ -263,7 +263,9 @@ pub fn lower(f: &Function) -> MachFunc {
         }
     }
 
-    MachFunc { insts: lo.insts, allocation: Vec::new(), stack_maps: Vec::new() }
+    // `blocks` is populated by the block-CFG lowering upgrade (P5b); the flat
+    // `insts` view keeps the straight-line path working until then.
+    MachFunc { insts: lo.insts, blocks: Vec::new(), allocation: Vec::new(), stack_maps: Vec::new() }
 }
 
 /// Select a non-terminator IR instruction (spec §4.7.2 maximal munch).
