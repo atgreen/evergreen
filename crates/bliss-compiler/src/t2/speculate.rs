@@ -28,6 +28,15 @@ enum Arith {
     Mul,
 }
 
+#[derive(Copy, Clone)]
+enum Cmp {
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    Eq,
+}
+
 /// The arithmetic op a callee symbol names, if it is one we speculate.
 fn arith_of(sym: u32) -> Option<Arith> {
     match bliss_rt::symbols::symbol_name(sym).as_deref() {
@@ -36,6 +45,37 @@ fn arith_of(sym: u32) -> Option<Arith> {
         Some("*") => Some(Arith::Mul),
         _ => None,
     }
+}
+
+/// The comparison a callee symbol names, if it is one we speculate. These feed
+/// `Brif`, so speculating them (guarded fixnum/float `Cmp`) is what lets a branch
+/// on `(< x n)` reach T2 as a `cmp`+`jcc` instead of a generic call.
+fn cmp_of(sym: u32) -> Option<Cmp> {
+    match bliss_rt::symbols::symbol_name(sym).as_deref() {
+        Some("<") => Some(Cmp::Lt),
+        Some(">") => Some(Cmp::Gt),
+        Some("<=") => Some(Cmp::Le),
+        Some(">=") => Some(Cmp::Ge),
+        Some("=") => Some(Cmp::Eq),
+        _ => None,
+    }
+}
+
+/// The typed comparison opcode for `(kind, speculated-type)`. Fixnum supports all
+/// five; single-float has only Eq/Lt encoders, so Gt/Le/Ge on floats return
+/// `None` (left as a generic call) for now.
+fn typed_cmp_opcode(c: Cmp, s: SpecType) -> Option<Opcode> {
+    use Opcode::*;
+    Some(match (c, s) {
+        (Cmp::Lt, SpecType::Fixnum) => FixnumCmpLt,
+        (Cmp::Gt, SpecType::Fixnum) => FixnumCmpGt,
+        (Cmp::Le, SpecType::Fixnum) => FixnumCmpLe,
+        (Cmp::Ge, SpecType::Fixnum) => FixnumCmpGe,
+        (Cmp::Eq, SpecType::Fixnum) => FixnumCmpEq,
+        (Cmp::Lt, SpecType::SingleFloat) => FloatCmpLt,
+        (Cmp::Eq, SpecType::SingleFloat) => FloatCmpEq,
+        (_, SpecType::SingleFloat) => return None,
+    })
 }
 
 /// The typed opcode a `(kind, speculated-type)` lowers to.
@@ -79,12 +119,20 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
                 AuxData::CallTarget(s) => *s,
                 _ => continue,
             };
-            let Some(arith) = arith_of(sym) else { continue };
             // The site's bcp is on the Call's FrameState (P1 anchors it there).
             let Some(fs) = data.frame_state else { continue };
             let bcp = frame_state_bcp(f, fs);
             let Some(spec) = profile(bcp) else { continue };
-            work.push((inst, typed_opcode(arith, spec), result_type(spec)));
+            if let Some(arith) = arith_of(sym) {
+                // Arithmetic: the typed op's result is the speculated numeric type.
+                work.push((inst, typed_opcode(arith, spec), result_type(spec)));
+            } else if let Some(cmp) = cmp_of(sym) {
+                // Comparison: guarded typed compare; the result is a boolean (T/NIL),
+                // so leave its type unrefined (TOP).
+                if let Some(op) = typed_cmp_opcode(cmp, spec) {
+                    work.push((inst, op, IRType::TOP));
+                }
+            }
         }
     }
 

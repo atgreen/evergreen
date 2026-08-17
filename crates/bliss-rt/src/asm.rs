@@ -43,6 +43,14 @@ pub enum Cc {
     Ne,
     /// OF=1 (signed overflow) — the fixnum-overflow guard edge.
     O,
+    /// Signed less (SF≠OF).
+    L,
+    /// Signed less-or-equal (ZF=1 or SF≠OF).
+    Le,
+    /// Signed greater (ZF=0 and SF=OF).
+    G,
+    /// Signed greater-or-equal (SF=OF).
+    Ge,
 }
 
 impl Cc {
@@ -52,6 +60,24 @@ impl Cc {
             Cc::E => 0x84,
             Cc::Ne => 0x85,
             Cc::O => 0x80,
+            Cc::L => 0x8C,
+            Cc::Ge => 0x8D,
+            Cc::Le => 0x8E,
+            Cc::G => 0x8F,
+        }
+    }
+
+    /// The condition that is true exactly when this one is false — for emitting
+    /// the fall-through/taken split of a two-way branch.
+    pub fn inverse(self) -> Cc {
+        match self {
+            Cc::E => Cc::Ne,
+            Cc::Ne => Cc::E,
+            Cc::O => Cc::O, // no NO code listed; unused for inversion
+            Cc::L => Cc::Ge,
+            Cc::Ge => Cc::L,
+            Cc::Le => Cc::G,
+            Cc::G => Cc::Le,
         }
     }
 }

@@ -192,6 +192,60 @@ fn fixnum_profile_speculates_the_call() {
     verify(&f).expect("speculated IR still verifies");
 }
 
+/// Branching reaches T2: `(x) -> (if (< x 100) (* x 2) 999)` speculates BOTH the
+/// comparison (fused cmp+jcc) and the multiply, emits a multi-block framed
+/// function, and executes correctly on both arms.
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn branching_if_speculates_and_runs() {
+    use bliss_compiler::t2::emit::emit_framed;
+    use bliss_compiler::t2::speculate::{speculate, SpecType};
+    let lt = bliss_rt::symbols::intern("<");
+    let mul = bliss_rt::symbols::intern("*");
+    // 0 LoadLocal 0 ; 1 Const 100 ; 2 (< x 100) ; 3 BrIfFalse->8(else)
+    // 4 LoadLocal 0 ; 5 Const 2 ; 6 (* x 2) ; 7 Br->9 ; 8 Const 999 ; 9 Return
+    let bf = bytecode_fn(
+        "clamp",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::Const(0),
+            Instr::CallNamed { sym: lt, nargs: 2 },
+            Instr::BrIfFalse(8),
+            Instr::LoadLocal(0),
+            Instr::Const(1),
+            Instr::CallNamed { sym: mul, nargs: 2 },
+            Instr::Br(9),
+            Instr::Const(2),
+            Instr::Return,
+        ],
+        vec![
+            BlissVal::from_fixnum(100),
+            BlissVal::from_fixnum(2),
+            BlissVal::from_fixnum(999),
+        ],
+        1,
+        3,
+        1,
+    );
+    let mut f = build_from_bytecode(&bf).expect("build branching");
+    let n = speculate(&mut f, &|bcp| (bcp == 2 || bcp == 6).then_some(SpecType::Fixnum));
+    assert_eq!(n, 2, "both the comparison and the multiply are speculated");
+    verify(&f).expect("speculated branching IR verifies");
+
+    let framed = emit_framed(&f, 0).expect("emit branching function");
+    let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+
+    let mut frame = [BlissVal::from_fixnum(50).0, 0u64, 0u64, 0u64];
+    assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 100, "50<100 → 50*2");
+    let mut frame = [BlissVal::from_fixnum(99).0, 0u64, 0u64, 0u64];
+    assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 198, "99<100 → 99*2");
+    let mut frame = [BlissVal::from_fixnum(100).0, 0u64, 0u64, 0u64];
+    assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 999, "100≮100 → 999");
+    let mut frame = [BlissVal::from_fixnum(200).0, 0u64, 0u64, 0u64];
+    assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 999, "200≥100 → 999");
+}
+
 /// Wave-3 milestone: with P5b (block-CFG lowering) + P6b (multi-block regalloc),
 /// the FULL backend now composes on BRANCHING IR — not just straight-line. This
 /// is the pipeline stage that the single-block limitation previously blocked.

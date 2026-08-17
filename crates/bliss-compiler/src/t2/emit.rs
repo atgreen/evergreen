@@ -393,162 +393,485 @@ pub struct FramedCode {
     pub compiled_entry: usize,
 }
 
-/// Emit `f` (a single-block, speculated straight-line function) as native code.
+/// The branch condition a fixnum comparison opcode is true under. `None` for
+/// non-fixnum-comparison opcodes (float comparisons aren't fused yet).
+fn fixnum_cmp_cc(op: crate::t2::ir::Opcode) -> Option<Cc> {
+    use crate::t2::ir::Opcode::*;
+    Some(match op {
+        FixnumCmpLt => Cc::L,
+        FixnumCmpLe => Cc::Le,
+        FixnumCmpGt => Cc::G,
+        FixnumCmpGe => Cc::Ge,
+        FixnumCmpEq => Cc::E,
+        _ => return None,
+    })
+}
+
+/// The condition for the same comparison with its operands swapped (`a<b` ≡ `b>a`).
+fn cc_swapped(cc: Cc) -> Cc {
+    match cc {
+        Cc::L => Cc::G,
+        Cc::G => Cc::L,
+        Cc::Le => Cc::Ge,
+        Cc::Ge => Cc::Le,
+        Cc::E | Cc::Ne | Cc::O => cc,
+    }
+}
+
+/// `<alu> r64, imm32` — the /digit `ext` selects add=0, sub=5, cmp=7.
+fn alu_r_imm(a: &mut Asm, ext: u8, r: u8, imm: i32) {
+    a.push(rex_w(0, r));
+    a.push(0x81);
+    a.push(0xC0 | (ext << 3) | (r & 7));
+    a.extend_from_slice(&imm.to_le_bytes());
+}
+
+/// `cmp l, r` — signed compare (l − r), setting flags for a following jcc.
+fn cmp_rr(a: &mut Asm, l: u8, r: u8) {
+    a.push(rex_w(l, r));
+    a.push(0x3B); // cmp r64, r/m64 (reg=l, rm=r)
+    a.push(modrm_rr(l, r));
+}
+
+/// The source of a block-argument move on a CFG edge.
+#[derive(Clone, Copy)]
+enum MoveSrc {
+    Reg(u8),
+    FixTagged(i64),
+    FloatTagged(u32),
+}
+
+/// Emit one edge move `dst <- src`.
+fn emit_move(a: &mut Asm, dst: u8, src: MoveSrc) {
+    match src {
+        MoveSrc::Reg(r) => mov_rr(a, dst, r),
+        MoveSrc::FixTagged(c) => mov_imm64(a, dst, bliss_rt::value::BlissVal::from_fixnum(c).0 as i64),
+        MoveSrc::FloatTagged(bits) => mov_imm64(a, dst, (((bits as u64) << 32) | 0b100) as i64),
+    }
+}
+
+/// Emit a set of simultaneous register moves (block-parameter passing on an edge),
+/// ordering them so no move clobbers a source still needed, and breaking any cycle
+/// through the rdx scratch. Self-moves are dropped.
+fn parallel_move(a: &mut Asm, mut moves: Vec<(u8, MoveSrc)>) {
+    moves.retain(|(d, s)| !matches!(s, MoveSrc::Reg(r) if r == d));
+    while !moves.is_empty() {
+        // A move is safe to emit now if its destination is not a source register
+        // of any remaining move.
+        if let Some(i) = moves
+            .iter()
+            .position(|(d, _)| !moves.iter().any(|(_, s)| matches!(s, MoveSrc::Reg(r) if *r == *d)))
+        {
+            let (d, s) = moves.remove(i);
+            emit_move(a, d, s);
+        } else {
+            // Every remaining move's dst is read by another → a cycle. Break it by
+            // routing one source through rdx.
+            if let (d0, MoveSrc::Reg(sr)) = moves[0] {
+                mov_rr(a, SCRATCH, sr);
+                for m in moves.iter_mut() {
+                    if let MoveSrc::Reg(r) = &mut m.1 {
+                        if *r == sr {
+                            *r = SCRATCH;
+                        }
+                    }
+                }
+                let _ = d0;
+            } else {
+                let (d0, s0) = moves.remove(0);
+                emit_move(a, d0, s0);
+            }
+        }
+    }
+}
+
+/// Emit one arithmetic instruction (result register pre-assigned). Operands are
+/// read from `reg`/`consts`; the result lands in its allocated register.
+fn emit_arith_inst(
+    a: &mut Asm,
+    f: &Function,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+    deopt: bliss_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    let tagged32 = |c: i64| i32::try_from(bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
+    match data.opcode {
+        Opcode::FixnumMul => {
+            let (a0, b0) = (data.args[0], data.args[1]);
+            let folded = if let Some(&c) = consts.get(&b0) {
+                Some((a0, c))
+            } else {
+                consts.get(&a0).map(|&c| (b0, c))
+            };
+            if let Some((var, c)) = folded {
+                if let Ok(c32) = i32::try_from(c) {
+                    let range = f.value(var).ty.range;
+                    let x = *reg.get(&var).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                    guard_fixnum(a, x, deopt);
+                    if mul_cannot_overflow(range, c) {
+                        match lea_scale(c) {
+                            Some(s) => lea_mul(a, dst, x, s),
+                            None => imul_imm(a, dst, x, c32),
+                        }
+                    } else {
+                        imul_imm(a, dst, x, c32);
+                        a.jcc(Cc::O, deopt);
+                    }
+                    return Ok(());
+                }
+            }
+            let x = framed_mat(a, reg, pool, consts, a0)?;
+            let y = framed_mat(a, reg, pool, consts, b0)?;
+            alu_rr(a, 0x89, SCRATCH, x);
+            alu_rr(a, 0x09, SCRATCH, y);
+            a.extend_from_slice(&[0xF6, 0xC2, 0x07]);
+            a.jcc(Cc::Ne, deopt);
+            mov_rr(a, dst, x);
+            sar_imm(a, dst, 3);
+            imul_rr(a, dst, y);
+            a.jcc(Cc::O, deopt);
+        }
+        Opcode::FixnumAdd | Opcode::FixnumSub => {
+            let is_add = data.opcode == Opcode::FixnumAdd;
+            let (a0, b0) = (data.args[0], data.args[1]);
+            // Fold a constant right operand (add/sub var, const), or a constant left
+            // operand for the commutative add.
+            let folded = if let Some(&c) = consts.get(&b0) {
+                Some((a0, c))
+            } else if is_add {
+                consts.get(&a0).map(|&c| (b0, c))
+            } else {
+                None
+            };
+            if let Some((var, c)) = folded {
+                if let Ok(t32) = tagged32(c) {
+                    let x = *reg.get(&var).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                    guard_fixnum(a, x, deopt);
+                    mov_rr(a, dst, x);
+                    alu_r_imm(a, if is_add { 0 } else { 5 }, dst, t32);
+                    a.jcc(Cc::O, deopt);
+                    return Ok(());
+                }
+            }
+            let x = framed_mat(a, reg, pool, consts, a0)?;
+            let y = framed_mat(a, reg, pool, consts, b0)?;
+            guard_fixnum(a, x, deopt);
+            guard_fixnum(a, y, deopt);
+            mov_rr(a, dst, x);
+            alu_rr(a, if is_add { 0x01 } else { 0x29 }, dst, y); // tagged±tagged = tagged
+            a.jcc(Cc::O, deopt);
+        }
+        Opcode::FloatMul | Opcode::FloatAdd | Opcode::FloatSub => {
+            float_operand_to_xmm(a, 0, data.args[0], reg, consts, float_consts, deopt)?;
+            float_operand_to_xmm(a, 1, data.args[1], reg, consts, float_consts, deopt)?;
+            let sub = match data.opcode {
+                Opcode::FloatAdd => 0x58,
+                Opcode::FloatMul => 0x59,
+                Opcode::FloatSub => 0x5C,
+                _ => unreachable!(),
+            };
+            ss_op(a, sub, 0, 1);
+            movd_r32_xmm(a, 0, 0);
+            shl_imm(a, 0, 32);
+            or_imm8(a, 0, 4);
+            if dst != 0 {
+                mov_rr(a, dst, 0);
+            }
+        }
+        other => return Err(EmitError::UnsupportedOp(op_tag(other))),
+    }
+    Ok(())
+}
+
+/// Emit a `Return`: the value goes to rax (a constant materialised directly),
+/// then `ret`. No frame to tear down.
+fn emit_return(
+    a: &mut Asm,
+    rv: Option<crate::t2::ir::Value>,
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+) -> Result<(), EmitError> {
+    if let Some(v) = rv {
+        if let Some(&c) = consts.get(&v) {
+            mov_imm64(a, 0, bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
+        } else if let Some(&bits) = float_consts.get(&v) {
+            mov_imm64(a, 0, (((bits as u64) << 32) | 0b100) as i64);
+        } else {
+            let r = *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?;
+            if r != 0 {
+                mov_rr(a, 0, r);
+            }
+        }
+    }
+    a.push(0xC3);
+    Ok(())
+}
+
+/// Collect the block-argument moves for a CFG edge (`tc.args` → the successor's
+/// block parameters).
+fn edge_moves(
+    f: &Function,
+    tc: &crate::t2::ir::BlockCall,
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+) -> Result<Vec<(u8, MoveSrc)>, EmitError> {
+    let params = &f.block(tc.block).params;
+    if params.len() != tc.args.len() {
+        return Err(EmitError::UnsupportedOp(0xF7));
+    }
+    let mut moves = Vec::new();
+    for (&p, &arg) in params.iter().zip(&tc.args) {
+        let dst = *reg.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
+        let src = if let Some(&c) = consts.get(&arg) {
+            MoveSrc::FixTagged(c)
+        } else if let Some(&bits) = float_consts.get(&arg) {
+            MoveSrc::FloatTagged(bits)
+        } else {
+            MoveSrc::Reg(*reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
+        };
+        moves.push((dst, src));
+    }
+    Ok(moves)
+}
+
+/// Emit a fused fixnum comparison (guard operands, `cmp`), returning the condition
+/// under which the comparison is *true* — for the branch that follows.
+fn emit_fused_compare(
+    a: &mut Asm,
+    cmp_data: &crate::t2::ir::InstData,
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    deopt: bliss_rt::asm::Label,
+) -> Result<Cc, EmitError> {
+    let base = fixnum_cmp_cc(cmp_data.opcode).ok_or(EmitError::UnsupportedOp(op_tag(cmp_data.opcode)))?;
+    let (l, r) = (cmp_data.args[0], cmp_data.args[1]);
+    let tagged32 = |c: i64| {
+        i32::try_from(bliss_rt::value::BlissVal::from_fixnum(c).0 as i64)
+            .map_err(|_| EmitError::UnsupportedOp(0xF4))
+    };
+    match (consts.get(&l).copied(), consts.get(&r).copied()) {
+        (None, Some(c)) => {
+            let lr = *reg.get(&l).ok_or(EmitError::UnsupportedOp(0xF2))?;
+            guard_fixnum(a, lr, deopt);
+            alu_r_imm(a, 7, lr, tagged32(c)?); // cmp lr, tagged
+            Ok(base)
+        }
+        (Some(c), None) => {
+            let rr = *reg.get(&r).ok_or(EmitError::UnsupportedOp(0xF2))?;
+            guard_fixnum(a, rr, deopt);
+            alu_r_imm(a, 7, rr, tagged32(c)?);
+            Ok(cc_swapped(base)) // operands swapped
+        }
+        (None, None) => {
+            let lr = *reg.get(&l).ok_or(EmitError::UnsupportedOp(0xF2))?;
+            let rr = *reg.get(&r).ok_or(EmitError::UnsupportedOp(0xF2))?;
+            guard_fixnum(a, lr, deopt);
+            guard_fixnum(a, rr, deopt);
+            cmp_rr(a, lr, rr);
+            Ok(base)
+        }
+        (Some(_), Some(_)) => Err(EmitError::UnsupportedOp(0xF5)), // const-const: folded upstream
+    }
+}
+
+/// Emit `f` (a speculated function, straight-line or branching) as native code.
 /// `c2i_deopt_addr` is the address of the interpreter's `c2i_deopt` routine.
 pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, EmitError> {
-    use crate::t2::ir::{AuxData, Opcode, Value};
-    use std::collections::HashMap;
+    use crate::t2::ir::{AuxData, Block, Opcode, Value, ValueDef};
+    use std::collections::{HashMap, HashSet};
 
-    if f.block_order().len() != 1 {
-        return Err(EmitError::UnsupportedOp(0xF0)); // only straight-line for now
-    }
     let entry = f.entry();
-
-    // rax = return value, rdx = guard scratch, rdi = frame slots pointer. Value
-    // registers: r10, r9, r8, rcx (pop→rcx first) — all have REX-free or REX.B
-    // low bytes, so the tag guard needs no special-casing.
-    let mut pool: Vec<u8> = vec![10, 9, 8, 1];
-    let mut reg: HashMap<Value, u8> = HashMap::new();
-    // Deferred fixnum constants: folded into imul immediates, materialised only
-    // if used somewhere that needs a register (e.g. returned directly).
-    let mut consts: HashMap<Value, i64> = HashMap::new();
-    // Deferred single-float constants (raw f32 bits), materialised into XMM.
-    let mut float_consts: HashMap<Value, u32> = HashMap::new();
-
-    // The terminator must be a Return; bind its value to rax up front so a
-    // FixnumMul writing the return value targets rax with no extra move.
-    let term = f.terminator(entry).ok_or(EmitError::UnsupportedOp(0xF3))?;
-    let term_data = f.inst(term).clone();
-    if term_data.opcode != Opcode::Return {
-        return Err(EmitError::UnsupportedOp(op_tag(term_data.opcode)));
+    // Emit the entry block first (the prologue falls into it).
+    let mut blocks: Vec<Block> = f.block_order().to_vec();
+    if blocks.first() != Some(&entry) {
+        if let Some(pos) = blocks.iter().position(|&b| b == entry) {
+            blocks.remove(pos);
+            blocks.insert(0, entry);
+        }
     }
-    let ret_val = term_data.args.first().copied();
-    if let Some(rv) = ret_val {
-        reg.insert(rv, 0); // rax
+
+    // Record every constant (deferred; folded or materialised at each use).
+    let mut consts: HashMap<Value, i64> = HashMap::new();
+    let mut float_consts: HashMap<Value, u32> = HashMap::new();
+    for &b in &blocks {
+        for &inst in &f.block(b).insts {
+            let d = f.inst(inst);
+            match (d.opcode, &d.aux) {
+                (Opcode::ConstFixnum, AuxData::FixnumImm(v)) => {
+                    consts.insert(d.results[0], *v);
+                }
+                (Opcode::ConstFloat, AuxData::FloatImm(v)) => {
+                    float_consts.insert(d.results[0], v.to_bits());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Use counts: to decide which comparisons can be fused into a branch. The
+    // terminator is itself in `block.insts`, so its own `args` are already counted
+    // by the inst loop — only the edge (BlockCall) arguments are counted here.
+    let mut uses: HashMap<Value, u32> = HashMap::new();
+    for &b in &blocks {
+        for &inst in &f.block(b).insts {
+            for &v in &f.inst(inst).args {
+                *uses.entry(v).or_default() += 1;
+            }
+        }
+        if let Some(t) = f.terminator(b) {
+            for tc in &f.inst(t).targets {
+                for &v in &tc.args {
+                    *uses.entry(v).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    // Fused comparisons: a fixnum comparison whose single use is its own block's
+    // Brif condition is emitted as cmp+jcc and needs no register.
+    let mut fused: HashSet<crate::t2::ir::Inst> = HashSet::new();
+    for &b in &blocks {
+        if let Some(t) = f.terminator(b) {
+            let td = f.inst(t);
+            if td.opcode == Opcode::Brif {
+                let cond = td.args[0];
+                if uses.get(&cond) == Some(&1) {
+                    if let ValueDef::Result { inst, .. } = f.value(cond).def {
+                        if fixnum_cmp_cc(f.inst(inst).opcode).is_some()
+                            && f.block(b).insts.contains(&inst)
+                        {
+                            fused.insert(inst);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Register assignment. rax = return/float scratch, rdx = guard scratch, rdi =
+    // frame slots (interp entry only). Value pool: rcx, r8, r9, r10, r11 — arg
+    // registers first, all with guard-safe low bytes. Constants and fused
+    // comparisons take no register; exhausting the pool declines T2 (=> stay T1).
+    let mut reg: HashMap<Value, u8> = HashMap::new();
+    let mut pool: Vec<u8> = vec![11, 10, 9, 8, 1];
+    // If every Return returns the same non-constant value that isn't an entry
+    // parameter (e.g. an arithmetic result, or a merge block param), bind it to
+    // rax so it lands in the return register with no extra move.
+    let ret_vals: HashSet<Value> = blocks
+        .iter()
+        .filter_map(|&b| {
+            let t = f.terminator(b)?;
+            let td = f.inst(t);
+            (td.opcode == Opcode::Return).then(|| td.args.first().copied()).flatten()
+        })
+        .collect();
+    if ret_vals.len() == 1 {
+        let v = *ret_vals.iter().next().unwrap();
+        if !consts.contains_key(&v)
+            && !float_consts.contains_key(&v)
+            && !f.block(entry).params.contains(&v)
+        {
+            reg.insert(v, 0); // rax
+        }
+    }
+    for &p in &f.block(entry).params {
+        framed_alloc(&mut reg, &mut pool, p)?; // rcx, r8, r9, r10 in order
+    }
+    for &b in &blocks {
+        if b != entry {
+            for &p in &f.block(b).params {
+                framed_alloc(&mut reg, &mut pool, p)?;
+            }
+        }
+        for &inst in &f.block(b).insts {
+            let d = f.inst(inst);
+            if matches!(d.opcode, Opcode::ConstFixnum | Opcode::ConstFloat)
+                || d.opcode.is_terminator()
+                || fused.contains(&inst)
+            {
+                continue;
+            }
+            if let Some(&r0) = d.results.first() {
+                framed_alloc(&mut reg, &mut pool, r0)?;
+            }
+        }
     }
 
     let mut a = Asm::new();
     let deopt = a.label();
+    let mut block_label: HashMap<Block, bliss_rt::asm::Label> = HashMap::new();
+    for &b in &blocks {
+        block_label.insert(b, a.label());
+    }
 
-    // Interpreter entry (offset 0): load params from the frame slots [rdi + 8*i]
-    // into the argument registers, then fall through into the body. Arg register i
-    // is exactly framed_alloc's i-th pick ([rcx, r8, r9, r10]), so a compiled
-    // caller that places args there can jump straight to `compiled_entry` below.
-    let params = f.block(entry).params.clone();
-    for (i, &p) in params.iter().enumerate() {
-        let r = framed_alloc(&mut reg, &mut pool, p)?;
+    // Interpreter entry (offset 0): load entry params from the frame slots into
+    // their argument registers, then fall through into the entry block. A compiled
+    // caller places args in those registers and enters at `compiled_entry`.
+    for (i, &p) in f.block(entry).params.iter().enumerate() {
+        let r = *reg.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
         mov_from_frame(&mut a, r, 7 /* rdi */, i);
     }
-    // Compiled-caller entry: the body, entered with args already in registers.
-    // `here()` is stable — the prologue precedes every branch, so branch patching
-    // in finish() cannot shift it.
     let compiled_entry = a.here();
 
-    // Body.
-    for &inst in &f.block(entry).insts.clone() {
-        let data = f.inst(inst).clone();
-        match data.opcode {
-            Opcode::ConstFixnum => {
-                let imm = match data.aux {
-                    AuxData::FixnumImm(v) => v,
-                    _ => return Err(EmitError::MissingImm),
-                };
-                consts.insert(data.results[0], imm); // defer; fold where possible
+    // Emit each block: bind its label, emit its instructions, then its terminator
+    // (with block-parameter moves on each out-edge).
+    for (bi, &b) in blocks.iter().enumerate() {
+        a.bind(block_label[&b]);
+        for &inst in &f.block(b).insts {
+            let d = f.inst(inst).clone();
+            if matches!(d.opcode, Opcode::ConstFixnum | Opcode::ConstFloat)
+                || d.opcode.is_terminator()
+                || fused.contains(&inst)
+            {
+                continue;
             }
-            Opcode::ConstFloat => {
-                let fv = match data.aux {
-                    AuxData::FloatImm(v) => v,
-                    _ => return Err(EmitError::MissingImm),
-                };
-                float_consts.insert(data.results[0], fv.to_bits());
+            emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, deopt)?;
+        }
+
+        let t = f.terminator(b).ok_or(EmitError::UnsupportedOp(0xF3))?;
+        let td = f.inst(t).clone();
+        match td.opcode {
+            Opcode::Return => {
+                emit_return(&mut a, td.args.first().copied(), &reg, &consts, &float_consts)?;
             }
-            Opcode::FixnumMul => {
-                let (a0, b0) = (data.args[0], data.args[1]);
-                let dst = framed_alloc(&mut reg, &mut pool, data.results[0])?;
-                // One operand a constant → guard only the other, fold the constant
-                // into the multiply immediate (tagged·raw = tagged product).
-                let folded = if let Some(&c) = consts.get(&b0) {
-                    Some((a0, c))
-                } else if let Some(&c) = consts.get(&a0) {
-                    Some((b0, c))
-                } else {
-                    None
-                };
-                if let Some((var, c)) = folded {
-                    if let Ok(c32) = i32::try_from(c) {
-                        let range = f.value(var).ty.range;
-                        let x = framed_mat(&mut a, &mut reg, &mut pool, &consts, var)?;
-                        // The type guard always stays — we speculate that the
-                        // operand is a fixnum. The *overflow* check is what range
-                        // analysis lets us drop: when the product provably stays in
-                        // fixnum range, strength-reduce to `lea` (no flags, no jo);
-                        // otherwise the overflow-detecting `imul + jo` is required.
-                        guard_fixnum(&mut a, x, deopt);
-                        if mul_cannot_overflow(range, c) {
-                            match lea_scale(c) {
-                                Some(scale) => lea_mul(&mut a, dst, x, scale),
-                                None => imul_imm(&mut a, dst, x, c32), // safe: no jo
-                            }
-                        } else {
-                            imul_imm(&mut a, dst, x, c32);
-                            a.jcc(Cc::O, deopt);
-                        }
-                        continue;
-                    }
-                    // constant too wide for imm32 → fall through to the general path
-                }
-                // General two-register multiply: guard both, untag one, multiply.
-                let x = framed_mat(&mut a, &mut reg, &mut pool, &consts, a0)?;
-                let y = framed_mat(&mut a, &mut reg, &mut pool, &consts, b0)?;
-                alu_rr(&mut a, 0x89, SCRATCH, x); // mov rdx, x
-                alu_rr(&mut a, 0x09, SCRATCH, y); // or  rdx, y
-                a.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
-                a.jcc(Cc::Ne, deopt);
-                mov_rr(&mut a, dst, x);
-                sar_imm(&mut a, dst, 3);
-                imul_rr(&mut a, dst, y);
-                a.jcc(Cc::O, deopt);
-            }
-            Opcode::FloatMul | Opcode::FloatAdd | Opcode::FloatSub => {
-                // The float second specialization: unpack both operands into XMM
-                // (constants coerced by contagion, variables guarded single-float),
-                // compute with a scalar-single SSE op, and repack the tagged result
-                // into rax. No overflow trap — IEEE float has none.
-                let dst = framed_alloc(&mut reg, &mut pool, data.results[0])?;
-                float_operand_to_xmm(&mut a, 0, data.args[0], &reg, &consts, &float_consts, deopt)?;
-                float_operand_to_xmm(&mut a, 1, data.args[1], &reg, &consts, &float_consts, deopt)?;
-                let sub = match data.opcode {
-                    Opcode::FloatAdd => 0x58,
-                    Opcode::FloatMul => 0x59,
-                    Opcode::FloatSub => 0x5C,
-                    _ => unreachable!(),
-                };
-                ss_op(&mut a, sub, 0, 1); // xmm0 = xmm0 <op> xmm1
-                movd_r32_xmm(&mut a, 0, 0); // eax = f32 bits of xmm0 (zero-extended)
-                shl_imm(&mut a, 0, 32); // rax = bits << 32
-                or_imm8(&mut a, 0, 4); // tag single-float (0b100)
-                if dst != 0 {
-                    mov_rr(&mut a, dst, 0); // if the result isn't the return value
+            Opcode::Jump => {
+                let tc = &td.targets[0];
+                parallel_move(&mut a, edge_moves(f, tc, &reg, &consts, &float_consts)?);
+                if blocks.get(bi + 1) != Some(&tc.block) {
+                    a.jmp(block_label[&tc.block]);
                 }
             }
-            other if other.is_terminator() => break, // handled below
+            Opcode::Brif => {
+                let cond = td.args[0];
+                let cmp_inst = match f.value(cond).def {
+                    ValueDef::Result { inst, .. } if fused.contains(&inst) => inst,
+                    _ => return Err(EmitError::UnsupportedOp(0xF6)),
+                };
+                let cmp_data = f.inst(cmp_inst).clone();
+                let cc = emit_fused_compare(&mut a, &cmp_data, &reg, &consts, deopt)?;
+                let then_tc = &td.targets[0]; // taken when the comparison is true
+                let else_tc = &td.targets[1];
+                let then_moves = edge_moves(f, then_tc, &reg, &consts, &float_consts)?;
+                let else_moves = edge_moves(f, else_tc, &reg, &consts, &float_consts)?;
+                // jcc(true) → then; fall through into the else moves.
+                let lthen = a.label();
+                a.jcc(cc, lthen);
+                parallel_move(&mut a, else_moves);
+                a.jmp(block_label[&else_tc.block]);
+                a.bind(lthen);
+                parallel_move(&mut a, then_moves);
+                a.jmp(block_label[&then_tc.block]);
+            }
             other => return Err(EmitError::UnsupportedOp(op_tag(other))),
         }
     }
-
-    // Return: make sure the value is in rax — a bare constant is materialised
-    // there directly, otherwise it is already in rax (pre-assigned) or moved in.
-    if let Some(rv) = ret_val {
-        if let Some(&c) = consts.get(&rv) {
-            mov_imm64(&mut a, 0, bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
-        } else {
-            let r = framed_mat(&mut a, &mut reg, &mut pool, &consts, rv)?;
-            if r != 0 {
-                mov_rr(&mut a, 0, r); // mov rax, r
-            }
-        }
-    }
-    a.push(0xC3); // ret — no frame to tear down
 
     // Deopt stub: align rsp (entry rsp%16==8; the fast path pushed nothing), call
     // c2i_deopt, unwind the alignment, return (value ignored on deopt).
