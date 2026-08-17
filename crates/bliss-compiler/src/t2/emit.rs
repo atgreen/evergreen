@@ -444,16 +444,15 @@ fn cmp_rr(a: &mut Asm, l: u8, r: u8) {
 #[derive(Clone, Copy)]
 enum MoveSrc {
     Reg(u8),
-    FixTagged(i64),
-    FloatTagged(u32),
+    /// A tagged BlissVal materialised directly into the destination register.
+    Const(u64),
 }
 
 /// Emit one edge move `dst <- src`.
 fn emit_move(a: &mut Asm, dst: u8, src: MoveSrc) {
     match src {
         MoveSrc::Reg(r) => mov_rr(a, dst, r),
-        MoveSrc::FixTagged(c) => mov_imm64(a, dst, bliss_rt::value::BlissVal::from_fixnum(c).0 as i64),
-        MoveSrc::FloatTagged(bits) => mov_imm64(a, dst, (((bits as u64) << 32) | 0b100) as i64),
+        MoveSrc::Const(bits) => mov_imm64(a, dst, bits as i64),
     }
 }
 
@@ -626,14 +625,11 @@ fn emit_return(
     a: &mut Asm,
     rv: Option<crate::t2::ir::Value>,
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
-    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
-    float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
 ) -> Result<(), EmitError> {
     if let Some(v) = rv {
-        if let Some(&c) = consts.get(&v) {
-            mov_imm64(a, 0, bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
-        } else if let Some(&bits) = float_consts.get(&v) {
-            mov_imm64(a, 0, (((bits as u64) << 32) | 0b100) as i64);
+        if let Some(&bits) = const_tagged.get(&v) {
+            mov_imm64(a, 0, bits as i64);
         } else {
             let r = *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?;
             if r != 0 {
@@ -651,8 +647,7 @@ fn edge_moves(
     f: &Function,
     tc: &crate::t2::ir::BlockCall,
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
-    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
-    float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
 ) -> Result<Vec<(u8, MoveSrc)>, EmitError> {
     let params = &f.block(tc.block).params;
     if params.len() != tc.args.len() {
@@ -661,10 +656,8 @@ fn edge_moves(
     let mut moves = Vec::new();
     for (&p, &arg) in params.iter().zip(&tc.args) {
         let dst = *reg.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
-        let src = if let Some(&c) = consts.get(&arg) {
-            MoveSrc::FixTagged(c)
-        } else if let Some(&bits) = float_consts.get(&arg) {
-            MoveSrc::FloatTagged(bits)
+        let src = if let Some(&bits) = const_tagged.get(&arg) {
+            MoveSrc::Const(bits)
         } else {
             MoveSrc::Reg(*reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
         };
@@ -725,7 +718,17 @@ fn is_fixnum_guarding_op(op: crate::t2::ir::Opcode) -> bool {
     use crate::t2::ir::Opcode::*;
     matches!(
         op,
-        FixnumAdd | FixnumSub | FixnumMul | FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe
+        FixnumAdd | FixnumSub | FixnumMul | FixnumNeg | FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe
+    )
+}
+
+/// A constant-producing opcode (no register, no runtime work — its tagged value
+/// is materialised where used).
+fn is_const_opcode(op: crate::t2::ir::Opcode) -> bool {
+    use crate::t2::ir::Opcode::*;
+    matches!(
+        op,
+        ConstFixnum | ConstFloat | ConstChar | ConstSymbol | ConstNil | ConstT | ConstHeapObj
     )
 }
 
@@ -745,18 +748,42 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
         }
     }
 
-    // Record every constant (deferred; folded or materialised at each use).
+    // Record every constant. `consts` (raw fixnum) drives immediate folding,
+    // `float_consts` (f32 bits) the XMM path, and `const_tagged` (the tagged
+    // BlissVal) the general materialisation of any constant into a register.
     let mut consts: HashMap<Value, i64> = HashMap::new();
     let mut float_consts: HashMap<Value, u32> = HashMap::new();
+    let mut const_tagged: HashMap<Value, u64> = HashMap::new();
     for &b in &blocks {
         for &inst in &f.block(b).insts {
             let d = f.inst(inst);
+            if d.results.is_empty() {
+                continue;
+            }
+            let r = d.results[0];
             match (d.opcode, &d.aux) {
                 (Opcode::ConstFixnum, AuxData::FixnumImm(v)) => {
-                    consts.insert(d.results[0], *v);
+                    consts.insert(r, *v);
+                    const_tagged.insert(r, bliss_rt::value::BlissVal::from_fixnum(*v).0);
                 }
                 (Opcode::ConstFloat, AuxData::FloatImm(v)) => {
-                    float_consts.insert(d.results[0], v.to_bits());
+                    float_consts.insert(r, v.to_bits());
+                    const_tagged.insert(r, ((v.to_bits() as u64) << 32) | 0b100);
+                }
+                (Opcode::ConstChar, AuxData::CharImm(c)) => {
+                    const_tagged.insert(r, bliss_rt::value::BlissVal::from_char(*c).0);
+                }
+                (Opcode::ConstSymbol, AuxData::SymbolRef(idx)) => {
+                    const_tagged.insert(r, bliss_rt::value::BlissVal::from_symbol_index(*idx).0);
+                }
+                (Opcode::ConstHeapObj, AuxData::HeapLiteral(v)) => {
+                    const_tagged.insert(r, v.0);
+                }
+                (Opcode::ConstNil, _) => {
+                    const_tagged.insert(r, bliss_rt::value::NIL.0);
+                }
+                (Opcode::ConstT, _) => {
+                    const_tagged.insert(r, bliss_rt::value::T.0);
                 }
                 _ => {}
             }
@@ -812,7 +839,7 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
         let d = f.inst(inst);
         if d.flags.guard && is_fixnum_guarding_op(d.opcode) {
             for &v in &d.args {
-                if !consts.contains_key(&v) && !float_consts.contains_key(&v) {
+                if !const_tagged.contains_key(&v) {
                     entry_guarded.insert(v);
                 }
             }
@@ -838,8 +865,7 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
         .collect();
     if ret_vals.len() == 1 {
         let v = *ret_vals.iter().next().unwrap();
-        if !consts.contains_key(&v)
-            && !float_consts.contains_key(&v)
+        if !const_tagged.contains_key(&v)
             && !f.block(entry).params.contains(&v)
         {
             reg.insert(v, 0); // rax
@@ -864,8 +890,7 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
             for tc in &f.inst(t).targets {
                 let params = f.block(tc.block).params.clone();
                 for (&p, &arg) in params.iter().zip(&tc.args) {
-                    if consts.contains_key(&arg)
-                        || float_consts.contains_key(&arg)
+                    if const_tagged.contains_key(&arg)
                         || reg.contains_key(&arg)
                         || uses.get(&arg) != Some(&1)
                     {
@@ -881,7 +906,7 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
     for &b in &blocks {
         for &inst in &f.block(b).insts {
             let d = f.inst(inst);
-            if matches!(d.opcode, Opcode::ConstFixnum | Opcode::ConstFloat)
+            if is_const_opcode(d.opcode)
                 || d.opcode.is_terminator()
                 || fused.contains(&inst)
             {
@@ -918,7 +943,7 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
         let proven: HashSet<Value> = if b == entry { HashSet::new() } else { entry_guarded.clone() };
         for &inst in &f.block(b).insts {
             let d = f.inst(inst).clone();
-            if matches!(d.opcode, Opcode::ConstFixnum | Opcode::ConstFloat)
+            if is_const_opcode(d.opcode)
                 || d.opcode.is_terminator()
                 || fused.contains(&inst)
             {
@@ -932,17 +957,32 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
         let td = f.inst(t).clone();
         match td.opcode {
             Opcode::Return => {
-                emit_return(&mut a, td.args.first().copied(), &reg, &consts, &float_consts)?;
+                emit_return(&mut a, td.args.first().copied(), &reg, &const_tagged)?;
             }
             Opcode::Jump => {
                 let tc = &td.targets[0];
-                parallel_move(&mut a, edge_moves(f, tc, &reg, &consts, &float_consts)?);
+                parallel_move(&mut a, edge_moves(f, tc, &reg, &const_tagged)?);
                 if next != Some(tc.block) {
                     a.jmp(block_label[&tc.block]);
                 }
             }
             Opcode::Brif => {
                 let cond = td.args[0];
+                // A constant condition (e.g. cond's trailing `(t ...)` clause) makes
+                // the branch unconditional: jump to the true target unless the
+                // constant is NIL.
+                if let Some(&bits) = const_tagged.get(&cond) {
+                    let taken = if bits == bliss_rt::value::NIL.0 {
+                        &td.targets[1]
+                    } else {
+                        &td.targets[0]
+                    };
+                    parallel_move(&mut a, edge_moves(f, taken, &reg, &const_tagged)?);
+                    if next != Some(taken.block) {
+                        a.jmp(block_label[&taken.block]);
+                    }
+                    continue;
+                }
                 let cmp_inst = match f.value(cond).def {
                     ValueDef::Result { inst, .. } if fused.contains(&inst) => inst,
                     _ => return Err(EmitError::UnsupportedOp(0xF6)),
@@ -951,8 +991,8 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
                 let cc = emit_fused_compare(&mut a, &cmp_data, &reg, &consts, &proven, deopt)?;
                 let then_b = td.targets[0].block; // taken when the comparison is true
                 let else_b = td.targets[1].block;
-                let then_moves = edge_moves(f, &td.targets[0], &reg, &consts, &float_consts)?;
-                let else_moves = edge_moves(f, &td.targets[1], &reg, &consts, &float_consts)?;
+                let then_moves = edge_moves(f, &td.targets[0], &reg, &const_tagged)?;
+                let else_moves = edge_moves(f, &td.targets[1], &reg, &const_tagged)?;
                 match (then_moves.is_empty(), else_moves.is_empty()) {
                     // No edge moves either side: a plain two-way branch. Fall through
                     // to whichever arm is the next block; branch to the other.

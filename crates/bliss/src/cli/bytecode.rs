@@ -5300,12 +5300,20 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
 
     // The profile closure the speculative-lowering pass consumes: this function's
     // observed operand type at each call-site bcp, mapped to the compiler's type.
+    // A site with a clear dominant type speculates that type. A site with samples
+    // but no dominant type is genuinely polymorphic → left generic. A COLD site
+    // (no samples — e.g. a branch not taken during the brief profiling window)
+    // optimistically guesses fixnum: the guard makes it safe (a wrong guess just
+    // deopts), and it stops one cold branch from declining the whole function.
     let profile = |bcp: u32| -> Option<bliss_compiler::t2::speculate::SpecType> {
         use bliss_compiler::t2::speculate::SpecType as Bc;
-        match type_profile_at(func_ptr, bcp).and_then(|p| p.dominant()) {
-            Some(SpecType::Fixnum) => Some(Bc::Fixnum),
-            Some(SpecType::SingleFloat) => Some(Bc::SingleFloat),
-            None => None,
+        match type_profile_at(func_ptr, bcp) {
+            Some(p) => match p.dominant() {
+                Some(SpecType::Fixnum) => Some(Bc::Fixnum),
+                Some(SpecType::SingleFloat) => Some(Bc::SingleFloat),
+                None => None, // has samples but polymorphic
+            },
+            None => Some(Bc::Fixnum), // cold: optimistic, guarded fixnum guess
         }
     };
 
