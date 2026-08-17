@@ -897,6 +897,117 @@ fn is_fixnum_guarding_op(op: crate::t2::ir::Opcode) -> bool {
 /// A fixnum-*producing* op: its result is provably a fixnum (the op yields one or
 /// deopts), so any later use of the result needs no tag guard. Comparisons are
 /// excluded — they produce booleans, not fixnums.
+/// Emit `GenericEq` (Lisp `EQ`, and `NULL` via `EQ x NIL`) as an inline tagged
+/// bit-comparison producing `T`/`NIL` — no runtime call. This is the first T2
+/// intrinsic: `EQ` is bit-equality of the two tagged representations, so it is a
+/// `cmp` plus a select of the two immediate results.
+fn emit_generic_eq(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    if data.results.is_empty() || data.args.len() < 2 {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::GenericEq)));
+    }
+    let (a0, a1) = (data.args[0], data.args[1]);
+    // Both-constant EQ should have been constant-folded by the mid-end; declining
+    // keeps us from contending for the single scratch register.
+    if const_tagged.contains_key(&a0) && const_tagged.contains_key(&a1) {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::GenericEq)));
+    }
+    // Resolve an operand to a register: a live value reg, or a tagged constant
+    // loaded into the reserved scratch. At most one operand is constant here (the
+    // both-constant case is excluded above), so the scratch is never contended.
+    let resolve = |a: &mut Asm, v: crate::t2::ir::Value| -> Result<u8, EmitError> {
+        if let Some(&r) = reg.get(&v) {
+            Ok(r)
+        } else if let Some(&bits) = const_tagged.get(&v) {
+            mov_imm64(a, SCRATCH, bits as i64);
+            Ok(SCRATCH)
+        } else {
+            Err(EmitError::UnsupportedOp(0xF2))
+        }
+    };
+    let r0 = resolve(a, a0)?;
+    let r1 = resolve(a, a1)?;
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    // cmp reads r0/r1 before dst is written, so dst aliasing an operand is safe.
+    cmp_rr(a, r0, r1);
+    mov_imm64(a, dst, bliss_rt::value::T.0 as i64);
+    let done = a.label();
+    a.jcc(Cc::E, done);
+    mov_imm64(a, dst, bliss_rt::value::NIL.0 as i64);
+    a.bind(done);
+    Ok(())
+}
+
+/// Emit `TypeCheck` (the `fixnump`/`consp`/`symbolp` intrinsics) as an inline
+/// tag test producing `T`/`NIL` — no runtime call. Single-tag predicates
+/// (fixnum tag 000, cons tag 001) are one `and`+`cmp`; `symbolp` also accepts
+/// the two special-cased symbols NIL (0x7) and T (0xF), whose tag is not the
+/// SYMBOL tag (101). `dst` is written only after every read of the operand, so a
+/// `dst` that aliases the operand register is safe.
+fn emit_type_check(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::{AuxData, Opcode};
+    use crate::t2::ir::TypeBits;
+    if data.results.is_empty() || data.args.is_empty() {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
+    }
+    let x = data.args[0];
+    // A constant operand should have been folded to T/NIL upstream; decline.
+    if const_tagged.contains_key(&x) {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
+    }
+    let xr = *reg.get(&x).ok_or(EmitError::UnsupportedOp(0xF2))?;
+    let bits = match &data.aux {
+        AuxData::TypeTag(t) => t.bits,
+        _ => return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck))),
+    };
+    // ext codes for `alu_r_imm`: 4 = AND, 7 = CMP. Tag values are the low 3 bits.
+    const AND: u8 = 4;
+    const CMP: u8 = 7;
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    let found = a.label();
+    let end = a.label();
+    let single_tag = |a: &mut Asm, tag: i32| {
+        mov_rr(a, SCRATCH, xr);
+        alu_r_imm(a, AND, SCRATCH, 7); // scratch = x & 7
+        alu_r_imm(a, CMP, SCRATCH, tag);
+    };
+    if bits == TypeBits::FIXNUM {
+        single_tag(a, 0);
+        a.jcc(Cc::E, found);
+    } else if bits == TypeBits::CONS {
+        single_tag(a, 1);
+        a.jcc(Cc::E, found);
+    } else if bits == TypeBits::SYMBOL {
+        single_tag(a, 5); // TAG_SYMBOL
+        a.jcc(Cc::E, found);
+        alu_r_imm(a, CMP, xr, bliss_rt::value::NIL.0 as i32); // NIL is a symbol
+        a.jcc(Cc::E, found);
+        alu_r_imm(a, CMP, xr, bliss_rt::value::T.0 as i32); // T is a symbol
+        a.jcc(Cc::E, found);
+    } else {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
+    }
+    // Fall-through: not the type.
+    mov_imm64(a, dst, bliss_rt::value::NIL.0 as i64);
+    a.jmp(end);
+    a.bind(found);
+    mov_imm64(a, dst, bliss_rt::value::T.0 as i64);
+    a.bind(end);
+    Ok(())
+}
+
 fn is_fixnum_producing_op(op: crate::t2::ir::Opcode) -> bool {
     use crate::t2::ir::Opcode::*;
     matches!(
@@ -1357,6 +1468,10 @@ pub fn emit_framed(
             if d.opcode == Opcode::Call {
                 let self_entry = has_reg_entry.then_some(reg_entry_label);
                 emit_call(&mut a, &d, &reg, &const_tagged, c2i_call_addr, self_sym, self_entry)?;
+            } else if d.opcode == Opcode::GenericEq {
+                emit_generic_eq(&mut a, &d, &mut reg, &mut pool, &const_tagged)?;
+            } else if d.opcode == Opcode::TypeCheck {
+                emit_type_check(&mut a, &d, &mut reg, &mut pool, &const_tagged)?;
             } else {
                 emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, &val_range, &mut proven, deopt)?;
             }

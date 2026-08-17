@@ -32,6 +32,9 @@ pub mod devtools;
 // ── Error types ──────────────────────────────────────────────────
 pub mod error;
 
+// ── Time / date arithmetic ───────────────────────────────────────
+pub mod time;
+
 // ── Re-exports for convenience ────────────────────────────────────
 pub use clos::{
     MethodCombinationType, MethodQualifier, allocate_instance, bootstrap_clos,

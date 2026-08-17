@@ -5372,11 +5372,18 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         }
     };
     let speculated = bliss_compiler::t2::speculate::speculate(&mut f, &profile);
+    // Speculation is an ENHANCEMENT, not the admission test for T2. Even with no
+    // speculatable arithmetic site, T2's mid-end (const-fold + GVN + DCE) still
+    // optimises the code beyond the T1 baseline template JIT — so we proceed and
+    // let the emitter decide. If `emit_framed` can't yet handle this function's
+    // shape (branches / unsupported ops — the first-cut emitter), it errors below
+    // and we fall back to T1, exactly as before. (bliss-x5y: this decouples the
+    // optimizer from speculation; measure how much of real code emit_framed takes.)
     if speculated == 0 {
-        t2_log!("{name}: 0 speculatable sites (cold or polymorphic profile) => stay T1");
-        return None; // nothing to specialise → T1 is as good; skip T2
+        t2_log!("{name}: 0 speculatable sites — compiling generic-optimized (no speculation)");
+    } else {
+        t2_log!("{name}: speculated {speculated} site(s)");
     }
-    t2_log!("{name}: speculated {speculated} site(s)");
 
     // Route the speculated IR through the mid-end: constant folding + strength
     // reduction (P4f), global value numbering (P4a), then deopt-aware DCE (P4c).

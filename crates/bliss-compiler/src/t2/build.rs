@@ -379,6 +379,99 @@ impl<'a> Builder<'a> {
                     if stack.len() < n {
                         return Err(BuildError::Unsupported("stack underflow (CallNamed)"));
                     }
+                    // Intrinsic lowering (bliss): pure tag/identity predicates
+                    // lower to inline IR instead of an opaque runtime `Call`.
+                    // `EQ`/`NULL` → `GenericEq` (NULL = EQ x NIL); the type
+                    // predicates → `TypeCheck` with the tested tag. A user
+                    // shadowing these CL symbols would reuse the same symbol index
+                    // — accepted for now, as redefining them is undefined per CLHS.
+                    if let Some(name) = crate::reader::symbol_name(*sym) {
+                        let bare = name.rsplit(':').next().unwrap_or(&name);
+                        // A single-tag `TypeCheck` if this is a type predicate we
+                        // model inline: `consp`/`symbolp` directly, or
+                        // `(typep x 'TYPE)` for a constant single-tag TYPE (the
+                        // standard `fixnum`/`cons`/`symbol` test — `integer` is
+                        // deferred, it needs a guarded bignum widetag load).
+                        let tag_bits: Option<crate::t2::ir::TypeBits> = match (bare, n) {
+                            ("CONSP", 1) => Some(TypeBits::CONS),
+                            ("SYMBOLP", 1) => Some(TypeBits::SYMBOL),
+                            ("TYPEP", 2) if i > start => {
+                                // The type argument is the immediately-preceding
+                                // constant symbol on the stack.
+                                if let Instr::Const(cidx) = code[i - 1] {
+                                    self.bf
+                                        .constants
+                                        .get(cidx as usize)
+                                        .copied()
+                                        .filter(|v| v.is_symbol())
+                                        .and_then(|v| {
+                                            crate::reader::symbol_name(v.as_symbol_index())
+                                        })
+                                        .and_then(|tn| {
+                                            match tn.rsplit(':').next().unwrap_or(&tn) {
+                                                "FIXNUM" => Some(TypeBits::FIXNUM),
+                                                "CONS" => Some(TypeBits::CONS),
+                                                "SYMBOL" => Some(TypeBits::SYMBOL),
+                                                _ => None,
+                                            }
+                                        })
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(bits) = tag_bits {
+                            // `typep` also has the constant type on the stack above
+                            // `x`; drop it (its ConstSymbol is DCE'd). `consp`/
+                            // `symbolp` have only `x`.
+                            if bare == "TYPEP" {
+                                stack.pop();
+                            }
+                            let x = stack.pop().unwrap();
+                            let r = self
+                                .emit(
+                                    block,
+                                    Opcode::TypeCheck,
+                                    vec![x],
+                                    AuxData::TypeTag(IRType::of(bits)),
+                                    InstFlags::default(),
+                                    None,
+                                    IRType::TOP,
+                                )
+                                .ok_or(BuildError::Unsupported("TypeCheck has a result"))?;
+                            stack.push(r);
+                            continue;
+                        }
+                        // `EQ`/`NULL` → inline identity compare. NULL = EQ x NIL.
+                        let eq_args = match (bare, n) {
+                            ("NULL", 1) => {
+                                let x = stack.pop().unwrap();
+                                Some(vec![x, self.emit_const_nil(block)])
+                            }
+                            ("EQ", 2) => {
+                                let b = stack.pop().unwrap();
+                                let a = stack.pop().unwrap();
+                                Some(vec![a, b])
+                            }
+                            _ => None,
+                        };
+                        if let Some(args) = eq_args {
+                            let r = self
+                                .emit(
+                                    block,
+                                    Opcode::GenericEq,
+                                    args,
+                                    AuxData::None,
+                                    InstFlags::default(),
+                                    None,
+                                    IRType::TOP,
+                                )
+                                .ok_or(BuildError::Unsupported("GenericEq has a result"))?;
+                            stack.push(r);
+                            continue;
+                        }
+                    }
                     // Snapshot the pre-call frame (args still live) for deopt.
                     let bcp = i as u32;
                     let fs = self.build_frame_state(block, &stack, bcp);

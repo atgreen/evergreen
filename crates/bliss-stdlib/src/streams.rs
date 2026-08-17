@@ -1409,7 +1409,7 @@ pub fn open(
     direction: StreamDirection,
     element_type_val: BlissVal,
     if_exists: BlissVal,
-    _if_does_not_exist: BlissVal,
+    if_does_not_exist: BlissVal,
     external_format: ExternalFormat,
 ) -> Result<BlissVal, BlissError> {
     if pathname == NIL {
@@ -1441,6 +1441,13 @@ pub fn open(
             let file = match std::fs::File::open(path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // CLHS: `:if-does-not-exist nil` returns NIL rather than
+                    // signalling — the caller decides. Any other value (the
+                    // default `:error`, or `:create` which we don't create for
+                    // input) signals a file-error.
+                    if if_does_not_exist == NIL {
+                        return Ok(NIL);
+                    }
                     return Err(BlissError::FileError(format!(
                         "file not found: {}",
                         path_str

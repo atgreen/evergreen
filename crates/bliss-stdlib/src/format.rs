@@ -6,6 +6,26 @@ use bliss_rt::error::BlissError;
 use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, NIL, T};
 
+// ── User print-object hook ────────────────────────────────────────
+//
+// FORMAT's `~A`/`~S` must honour user-defined CLOS `print-object` methods, but
+// method dispatch lives in the interpreter, which this crate cannot call
+// directly. The interpreter installs a hook that, given an instance and the
+// `*print-escape*` mode, returns the method's rendering (or None to fall back to
+// the built-in `#<CLASS>` form). Mirrors the reader's hook pattern.
+type PrintObjectHook = fn(BlissVal, bool) -> Option<String>;
+static PRINT_OBJECT_HOOK: std::sync::Mutex<Option<PrintObjectHook>> =
+    std::sync::Mutex::new(None);
+
+pub fn set_print_object_hook(hook: Option<PrintObjectHook>) {
+    *PRINT_OBJECT_HOOK.lock().unwrap() = hook;
+}
+
+fn dispatch_print_object(v: BlissVal, escapep: bool) -> Option<String> {
+    let hook = *PRINT_OBJECT_HOOK.lock().unwrap();
+    hook.and_then(|h| h(v, escapep))
+}
+
 // ── String allocation ─────────────────────────────────────────────
 
 /// Allocate a BlissVal string using the interned string table from the
@@ -67,6 +87,10 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
     // before the generic heap-object branch. A condition prints as its report
     // message (~A/princ semantics); any other instance prints as #<CLASS-NAME>.
     if crate::clos::is_instance(v) {
+        // A user `print-object` method wins when one applies; else fall back.
+        if let Some(s) = dispatch_print_object(v, escapep) {
+            return s;
+        }
         return format_instance(v);
     }
     if v.is_fixnum() {
@@ -96,6 +120,19 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         return format_cons(v, escapep);
     }
     if v.is_heap_object() {
+        // Pathnames are registry-backed pseudo-heap values: render via their
+        // namestring rather than falling through to `#<heap-object>` (which is
+        // what a MERGE-PATHNAMES / MAKE-PATHNAME result — not separately string-
+        // interned — used to show, e.g. ocicl's "; loading ~A" messages).
+        if crate::pathnames::is_pathname(v) {
+            if let Ok(ns) = crate::pathnames::namestring(v) {
+                if let Some(s) = extract_bliss_string(ns) {
+                    // Match cli's print_val: quoted namestring under prin1/~S,
+                    // bare namestring under princ/~A.
+                    return if escapep { format!("\"{}\"", s) } else { s };
+                }
+            }
+        }
         // Check if it's a string and extract its content
         if let Some(s) = extract_bliss_string(v) {
             return if escapep { format!("\"{}\"", s) } else { s };
@@ -794,6 +831,11 @@ fn format_impl(
                             Ok(default)
                         } else if v.is_fixnum() {
                             Ok(v.as_fixnum())
+                        } else if v.is_character() {
+                            // A `v` parameter standing in for a padchar (e.g.
+                            // `~v,vd` with #\0) is a character; hand back its code
+                            // point, which the padchar sites turn back into a char.
+                            Ok(v.as_char() as i64)
                         } else {
                             Err(BlissError::TypeError {
                                 datum: v,

@@ -452,12 +452,12 @@ fn read_one_form_from_stream(
                 if buffer.trim().is_empty() {
                     return Ok(None);
                 }
-                let (form, _) = reader::read_from_string(&buffer)?;
+                let (form, _) = read_from_string_in_env(&buffer, env)?;
                 return Ok(Some(form));
             }
             Some(c) => {
                 buffer.push(c);
-                if let Ok((form, consumed)) = reader::read_from_string(&buffer) {
+                if let Ok((form, consumed)) = read_from_string_in_env(&buffer, env) {
                     let total = buffer.chars().count();
                     if consumed < total {
                         for lc in buffer.chars().skip(consumed).collect::<Vec<_>>().into_iter().rev() {
@@ -2705,7 +2705,13 @@ fn print_val(val: BlissVal, out: &mut String) {
     } else if val == EOF {
         out.push_str("#<EOF>");
     } else if bliss_stdlib::is_instance(val) {
-        // CLOS instances are opaque handles; print as #<CLASS-NAME>.
+        // A user-defined `print-object` method wins when one applies (and a print
+        // env is parked); otherwise CLOS instances are opaque handles printed as
+        // #<CLASS-NAME>.
+        if let Some(rendered) = dispatch_print_object(val, PRINT_ESCAPE.with(|c| c.get())) {
+            out.push_str(&rendered);
+            return;
+        }
         let name = instance_class_hierarchy_names(val)
             .as_ref()
             .and_then(|names| names.first())
@@ -2962,6 +2968,16 @@ fn princ_val(val: BlissVal, out: &mut String) {
         return;
     }
     print_val(val, out);
+}
+
+/// `princ_val` (unescaped), but env-aware: dispatches user `print-object`
+/// methods with `*print-escape*` bound to NIL.
+fn princ_val_env(val: BlissVal, env: &mut Env, out: &mut String) {
+    let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));
+    let prev_escape = PRINT_ESCAPE.with(|c| c.replace(false));
+    princ_val(val, out);
+    PRINT_ENV.with(|c| c.set(prev_env));
+    PRINT_ESCAPE.with(|c| c.set(prev_escape));
 }
 
 // ── Symbol name lookup ────────────────────────────────────────────
@@ -3350,6 +3366,73 @@ thread_local! {
     // `resolve_sym`/`read-from-string`; those nested reads must take the reader's
     // default name-keyed path, not recurse back into the resolver (bliss-lb6.12).
     static RESOLVING_SYMBOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Printing an instance may dispatch a user `print-object` method, which needs
+    // the live env. Like READ_EVAL_ENV, the print entry points park their `&mut
+    // Env` here for the span of one print. PRINT_ESCAPE carries `*print-escape*`
+    // (prin1/write => true, princ => false) to the dispatched method; the
+    // PRINTING_OBJECT guard stops a method that itself prints another instance
+    // from re-entering dispatch (which would alias the parked `&mut`), so nested
+    // instances fall back to the `#<CLASS>` form.
+    static PRINT_ENV: std::cell::Cell<*mut Env> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static PRINT_ESCAPE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static PRINTING_OBJECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Print `val` with the given `*print-escape*` value, dispatching user
+/// `print-object` methods for instances by parking `env` for the printer. The
+/// parked env is restored afterwards so nested prints compose.
+fn print_val_env(val: BlissVal, env: &mut Env, escape: bool, out: &mut String) {
+    let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));
+    let prev_escape = PRINT_ESCAPE.with(|c| c.replace(escape));
+    print_val(val, out);
+    PRINT_ENV.with(|c| c.set(prev_env));
+    PRINT_ESCAPE.with(|c| c.set(prev_escape));
+}
+
+/// `format_val`, but env-aware: dispatches user `print-object` methods.
+fn format_val_env(val: BlissVal, env: &mut Env, escape: bool) -> String {
+    let mut s = String::new();
+    print_val_env(val, env, escape, &mut s);
+    s
+}
+
+/// If `val` is an instance with an applicable user `print-object` method and a
+/// print env is parked (and we are not already inside a print-object call),
+/// invoke the method against a fresh string stream and return its output.
+/// `escape` is the `*print-escape*` value the method should observe.
+fn dispatch_print_object(val: BlissVal, escape: bool) -> Option<String> {
+    let ptr = PRINT_ENV.with(|c| c.get());
+    if ptr.is_null() || PRINTING_OBJECT.with(|c| c.get()) {
+        return None;
+    }
+    // Safety: the parked pointer is the live `&mut Env` of the print entry point;
+    // printing is single-threaded and the outer borrow is dormant for the span of
+    // this call (mirrors READ_EVAL_ENV / read_time_eval).
+    let env = unsafe { &mut *ptr };
+    let stream = bliss_stdlib::make_string_output_stream(NIL).ok()?;
+    if !has_applicable_method(env, "PRINT-OBJECT", &[val, stream]) {
+        return None;
+    }
+    PRINTING_OBJECT.with(|c| c.set(true));
+    // Bind *PRINT-ESCAPE* so the method's `(when *print-escape* …)` sees the
+    // right mode; the guard is restored on every exit path.
+    let result = (|| {
+        let _esc = resolve_sym("*PRINT-ESCAPE*")
+            .map(|s| DynBind::establish(s, if escape { T } else { NIL }));
+        invoke_generic_function("PRINT-OBJECT", &[val, stream], env)
+    })();
+    PRINTING_OBJECT.with(|c| c.set(false));
+    result.ok()?;
+    let s = bliss_stdlib::get_output_stream_string(stream).ok()?;
+    Some(val_as_str(s))
+}
+
+/// Hook installed into the stdlib formatter so its `~A`/`~S` render honour user
+/// `print-object` methods too. Delegates to [`dispatch_print_object`], which
+/// requires a print env to be parked (the FORMAT builtin parks it).
+fn stdlib_print_object_hook(val: BlissVal, escape: bool) -> Option<String> {
+    dispatch_print_object(val, escape)
 }
 
 /// Reader hook: resolve a symbol token to the canonical symbol already
@@ -3440,10 +3523,40 @@ fn read_next_form_at(
     result
 }
 
+/// `reader::read_from_string`, but with the current load environment parked in
+/// `READ_EVAL_ENV` for the span of the read. This activates the package-aware
+/// symbol resolver (and `#.` read-eval) so a runtime `READ` / `READ-FROM-STRING`
+/// resolves a package-qualified token to the SAME symbol identity the file
+/// reader would — otherwise `PKG:NAME` for an inherited/re-exported symbol (e.g.
+/// `ASDF:FIND-SYSTEM`, homed in ASDF/SYSTEM) is mis-interned as a fresh symbol
+/// homed in PKG, with an empty function cell (bliss).
+fn read_from_string_in_env(
+    source: &str,
+    env: &mut Env,
+) -> Result<(BlissVal, usize), BlissError> {
+    // Honour the reader specials. `*READ-EVAL*` defaults to T (so `#.` works in a
+    // runtime READ, as in CL), and `*READ-BASE*` to 10.
+    let read_eval = env
+        .lookup_var("*READ-EVAL*")
+        .map(|v| !v.is_nil())
+        .unwrap_or(true);
+    let read_base = env
+        .lookup_var("*READ-BASE*")
+        .filter(|v| v.is_fixnum())
+        .map(|v| v.as_fixnum() as u32)
+        .filter(|b| (2..=36).contains(b))
+        .unwrap_or(10);
+    let prev = READ_EVAL_ENV.with(|c| c.replace(env as *mut Env));
+    let result = reader::read_from_string_with_base(source, read_base, read_eval);
+    READ_EVAL_ENV.with(|c| c.set(prev));
+    result
+}
+
 fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     reader::set_read_eval_hook(Some(read_time_eval));
     reader::set_symbol_resolver(Some(reader_symbol_resolver));
     reader::set_pathname_constructor(Some(reader_pathname_constructor));
+    bliss_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     register_declared_packages(source);
     let chars: Vec<char> = source.chars().collect();
     // Nesting is checked once for the whole buffer; each form is then read from
@@ -4416,7 +4529,15 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "SYMBOL" => object.is_symbol(),
             "STRING" | "SIMPLE-STRING" | "BASE-STRING" => is_string_value(object),
             "NUMBER" | "REAL" => object.is_fixnum() || object.is_single_float(),
-            "INTEGER" | "FIXNUM" => object.is_fixnum(),
+            "INTEGER" | "FIXNUM" | "BIGNUM" | "RATIONAL" => object.is_fixnum(),
+            // No ratios yet, so RATIONAL collapses to INTEGER above and RATIO
+            // matches nothing.
+            "RATIO" => false,
+            // UNSIGNED-BYTE with no size == (integer 0 *); SIGNED-BYTE with no
+            // size == any integer; BIT == (integer 0 1).
+            "UNSIGNED-BYTE" => object.is_fixnum() && object.as_fixnum() >= 0,
+            "SIGNED-BYTE" => object.is_fixnum(),
+            "BIT" => object.is_fixnum() && matches!(object.as_fixnum(), 0 | 1),
             "FLOAT" | "SINGLE-FLOAT" => object.is_single_float(),
             "CHARACTER" => object.is_character(),
             "BOOLEAN" => object.is_nil() || object == T,
@@ -4528,6 +4649,37 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                 })
                 .unwrap_or(true);
             Ok(lower_ok && upper_ok)
+        }
+        "UNSIGNED-BYTE" | "SIGNED-BYTE" | "MOD" => {
+            if !object.is_fixnum() {
+                return Ok(false);
+            }
+            let value = object.as_fixnum();
+            let bounds = list_to_vec(args);
+            // The size/modulus argument may be omitted or `*` (wild).
+            let size = bounds.first().copied().and_then(|b| {
+                if b.is_symbol() && symbol_bare_name(&sym_name(b)) == "*" {
+                    None
+                } else {
+                    Some(b.as_fixnum())
+                }
+            });
+            let ok = match op.as_str() {
+                // (unsigned-byte s) == (integer 0 (2^s - 1))
+                "UNSIGNED-BYTE" => {
+                    value >= 0 && size.map(|s| value < (1i64 << s)).unwrap_or(true)
+                }
+                // (signed-byte s) == (integer -2^(s-1) (2^(s-1) - 1))
+                "SIGNED-BYTE" => size
+                    .map(|s| {
+                        let limit = 1i64 << (s - 1);
+                        value >= -limit && value < limit
+                    })
+                    .unwrap_or(true),
+                // (mod n) == (integer 0 (n - 1)); n is required.
+                _ => size.map(|n| value >= 0 && value < n).unwrap_or(false),
+            };
+            Ok(ok)
         }
         "SATISFIES" => {
             let (predicate, _) = cp(args);
@@ -5368,8 +5520,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 };
                 let out = resolve_output_stream(stream, env);
+                let rendered = format_val_env(v, env, true);
                 write_str_to(out, "\n")?;
-                write_str_to(out, &format_val(v))?;
+                write_str_to(out, &rendered)?;
                 write_str_to(out, "\n")?;
                 return Ok(v);
             }
@@ -5378,7 +5531,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let args = list_to_vec(cdr);
                 let v = eval_form(args[0], env)?;
                 let mut s = String::new();
-                princ_val(v, &mut s);
+                princ_val_env(v, env, &mut s);
                 let stream = if args.len() > 1 {
                     eval_form(args[1], env)?
                 } else {
@@ -5651,7 +5804,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let start = start.min(chars.len());
                 let end = end.min(chars.len()).max(start);
                 let sub: String = chars[start..end].iter().collect();
-                match reader::read_from_string(&sub) {
+                match read_from_string_in_env(&sub, env) {
                     Ok((form, consumed)) => {
                         env.set_mv(vec![form, BlissVal::from_fixnum((start + consumed) as i64)]);
                         return Ok(form);
@@ -7031,6 +7184,74 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // 2208988800 seconds.
                 return Ok(BlissVal::from_fixnum(secs as i64 + 2_208_988_800));
             }
+            "GET-UNIVERSAL-TIME" => {
+                return Ok(BlissVal::from_fixnum(bliss_stdlib::time::get_universal_time()));
+            }
+            "ENCODE-UNIVERSAL-TIME" => {
+                // (encode-universal-time second minute hour date month year
+                //  &optional time-zone)
+                let args = eval_args(cdr, env)?;
+                if args.len() < 6 {
+                    return Err(BlissError::ProgramError(
+                        "ENCODE-UNIVERSAL-TIME requires at least 6 arguments".into(),
+                    ));
+                }
+                let n = |v: BlissVal| -> Result<i64, BlissError> { Ok(num_val(v)? as i64) };
+                let (second, minute, hour) = (n(args[0])?, n(args[1])?, n(args[2])?);
+                let (date, month, mut year) = (n(args[3])?, n(args[4])?, n(args[5])?);
+                // CLHS 25.1.4: a two-digit year is relative to a 50-year window
+                // around the current year.
+                if (0..=99).contains(&year) {
+                    let current = bliss_stdlib::time::decode_universal_time(
+                        bliss_stdlib::time::get_universal_time(),
+                        Some(0),
+                    )
+                    .5;
+                    let base = current - 50;
+                    year = base + (year - base).rem_euclid(100);
+                }
+                // Time zone is hours west of GMT; NIL / omitted means local,
+                // which we model as GMT (see time.rs).
+                let time_zone = match args.get(6) {
+                    Some(v) if !v.is_nil() => Some(num_val(*v)? as i64),
+                    _ => None,
+                };
+                return Ok(BlissVal::from_fixnum(bliss_stdlib::time::encode_universal_time(
+                    second, minute, hour, date, month, year, time_zone,
+                )));
+            }
+            "DECODE-UNIVERSAL-TIME" => {
+                // (decode-universal-time universal-time &optional time-zone)
+                //   => second, minute, hour, date, month, year,
+                //      day-of-week, daylight-p, zone
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::ProgramError(
+                        "DECODE-UNIVERSAL-TIME requires a universal time".into(),
+                    ));
+                }
+                let universal = num_val(args[0])? as i64;
+                let time_zone = match args.get(1) {
+                    Some(v) if !v.is_nil() => Some(num_val(*v)? as i64),
+                    _ => None,
+                };
+                let (sec, min, hour, date, month, year, dow, dst, zone) =
+                    bliss_stdlib::time::decode_universal_time(universal, time_zone);
+                let values = vec![
+                    BlissVal::from_fixnum(sec),
+                    BlissVal::from_fixnum(min),
+                    BlissVal::from_fixnum(hour),
+                    BlissVal::from_fixnum(date),
+                    BlissVal::from_fixnum(month),
+                    BlissVal::from_fixnum(year),
+                    BlissVal::from_fixnum(dow),
+                    if dst { T } else { NIL },
+                    BlissVal::from_fixnum(zone),
+                ];
+                let first = values[0];
+                env.set_mv(values);
+                return Ok(first);
+            }
             "DIRECTORY" => {
                 // (directory pathspec &key …) — list pathnames matching a
                 // (possibly wild) pathname. Extra keyword args (e.g. UIOP's
@@ -7226,7 +7447,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "WRITE-TO-STRING" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(arena_str(&format_val(v)));
+                return Ok(arena_str(&format_val_env(v, env, true)));
             }
             "1+" | "1-" => {
                 let (af, _) = cp(cdr);
@@ -9022,6 +9243,11 @@ enum LoopClause {
     Never(BlissVal),
     Return(BlissVal),
     ThereIs(BlissVal),
+    // `:while`/`:until` are body clauses: they test at their lexical position,
+    // so an `:until` written after `:collect` terminates only after the collect
+    // has run for the final iteration. Terminating clears no accumulation.
+    While(BlissVal),
+    Until(BlissVal),
     Cond {
         test: BlissVal,
         negate: bool,
@@ -9092,6 +9318,17 @@ impl LoopParser {
             Ok(None)
         }
     }
+    /// Consume an optional trailing `of-type <type>` on an accumulation or
+    /// iteration clause (e.g. `sum 1 into n of-type fixnum`). `OF-TYPE` is not
+    /// a LOOP keyword, so without this the main dispatch would silently stop at
+    /// it and drop every clause that follows.
+    fn skip_of_type(&mut self) -> Result<(), BlissError> {
+        if self.at_sym("OF-TYPE") {
+            self.advance();
+            self.read_form()?;
+        }
+        Ok(())
+    }
     fn parse_clause(&mut self) -> Result<LoopClause, BlissError> {
         let kw = self
             .peek_kw()
@@ -9101,31 +9338,43 @@ impl LoopParser {
             "COLLECT" | "COLLECTING" => {
                 let e = self.read_form()?;
                 let into = self.read_into()?;
+                self.skip_of_type()?;
                 Ok(LoopClause::Collect(e, into))
             }
             "APPEND" | "APPENDING" | "NCONC" | "NCONCING" => {
                 let e = self.read_form()?;
                 let into = self.read_into()?;
+                self.skip_of_type()?;
                 Ok(LoopClause::Append(e, into))
             }
             "SUM" | "SUMMING" => {
                 let e = self.read_form()?;
-                Ok(LoopClause::Sum(e, self.read_into()?))
+                let into = self.read_into()?;
+                self.skip_of_type()?;
+                Ok(LoopClause::Sum(e, into))
             }
             "COUNT" | "COUNTING" => {
                 let e = self.read_form()?;
-                Ok(LoopClause::Count(e, self.read_into()?))
+                let into = self.read_into()?;
+                self.skip_of_type()?;
+                Ok(LoopClause::Count(e, into))
             }
             "MAXIMIZE" | "MAXIMIZING" => {
                 let e = self.read_form()?;
-                Ok(LoopClause::Maximize(e, self.read_into()?))
+                let into = self.read_into()?;
+                self.skip_of_type()?;
+                Ok(LoopClause::Maximize(e, into))
             }
             "MINIMIZE" | "MINIMIZING" => {
                 let e = self.read_form()?;
-                Ok(LoopClause::Minimize(e, self.read_into()?))
+                let into = self.read_into()?;
+                self.skip_of_type()?;
+                Ok(LoopClause::Minimize(e, into))
             }
             "ALWAYS" => Ok(LoopClause::Always(self.read_form()?)),
             "NEVER" => Ok(LoopClause::Never(self.read_form()?)),
+            "WHILE" => Ok(LoopClause::While(self.read_form()?)),
+            "UNTIL" => Ok(LoopClause::Until(self.read_form()?)),
             "DO" | "DOING" => Ok(LoopClause::Do(self.read_forms())),
             "RETURN" => Ok(LoopClause::Return(self.read_form()?)),
             "THEREIS" => Ok(LoopClause::ThereIs(self.read_form()?)),
@@ -9264,6 +9513,19 @@ fn loop_bind(pattern: BlissVal, value: BlissVal, env: &mut Env) {
     }
 }
 
+/// True if any clause is a `:while`/`:until` terminator (recursing into
+/// conditional branches). Such a clause is a terminating driver, so a loop that
+/// has one is neither run-once nor subject to the runaway-iteration cap.
+fn loop_body_has_terminator(clauses: &[LoopClause]) -> bool {
+    clauses.iter().any(|c| match c {
+        LoopClause::While(_) | LoopClause::Until(_) => true,
+        LoopClause::Cond { then, els, .. } => {
+            loop_body_has_terminator(then) || loop_body_has_terminator(els)
+        }
+        _ => false,
+    })
+}
+
 /// Collect every `:into` accumulator name so they can be bound to NIL up
 /// front — LOOP guarantees accumulators are bound even if never accumulated,
 /// and :finally clauses read them.
@@ -9294,12 +9556,13 @@ fn loop_exec_clauses(
     env: &mut Env,
     accs: &mut LoopAccs,
     ret: &mut Option<BlissVal>,
+    terminate: &mut bool,
 ) -> Result<(), BlissError> {
     for c in clauses {
-        if ret.is_some() {
+        if ret.is_some() || *terminate {
             break;
         }
-        loop_exec_clause(c, env, accs, ret)?;
+        loop_exec_clause(c, env, accs, ret, terminate)?;
     }
     Ok(())
 }
@@ -9309,6 +9572,7 @@ fn loop_exec_clause(
     env: &mut Env,
     accs: &mut LoopAccs,
     ret: &mut Option<BlissVal>,
+    terminate: &mut bool,
 ) -> Result<(), BlissError> {
     match c {
         LoopClause::Do(forms) => {
@@ -9364,6 +9628,16 @@ fn loop_exec_clause(
             let v = eval_form(*e, env)?;
             accs.append(into.clone(), v);
         }
+        LoopClause::While(e) => {
+            if eval_form(*e, env)?.is_nil() {
+                *terminate = true;
+            }
+        }
+        LoopClause::Until(e) => {
+            if !eval_form(*e, env)?.is_nil() {
+                *terminate = true;
+            }
+        }
         LoopClause::Cond {
             test,
             negate,
@@ -9373,9 +9647,9 @@ fn loop_exec_clause(
             let t = eval_form(*test, env)?;
             let take = !t.is_nil() ^ *negate;
             if take {
-                loop_exec_clauses(then, env, accs, ret)?;
+                loop_exec_clauses(then, env, accs, ret, terminate)?;
             } else {
-                loop_exec_clauses(els, env, accs, ret)?;
+                loop_exec_clauses(els, env, accs, ret, terminate)?;
             }
         }
     }
@@ -9547,8 +9821,6 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     let mut initially: Vec<BlissVal> = Vec::new();
     let mut finally: Vec<BlissVal> = Vec::new();
     let mut body: Vec<LoopClause> = Vec::new();
-    // Termination guards: (is_until, condition-form), checked before each body.
-    let mut guards: Vec<(bool, BlissVal)> = Vec::new();
     // `repeat N`: run the body at most N times.
     let mut repeat_form: Option<BlissVal> = None;
 
@@ -9736,9 +10008,10 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                         });
                     }
                     _ => {
-                        // :for var = init [:then step]
+                        // :for var = init [:then step]. Both `=` and the
+                        // keyword `:=` are valid LOOP stepping tokens.
                         let eq = p.read_form()?;
-                        if !(eq.is_symbol() && sym_name(eq) == "=") {
+                        if !(eq.is_symbol() && symbol_bare_name(&sym_name(eq)) == "=") {
                             let found = if eq.is_symbol() {
                                 sym_name(eq)
                             } else {
@@ -9770,11 +10043,11 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             }
             "WHILE" => {
                 p.advance();
-                guards.push((false, p.read_form()?));
+                body.push(LoopClause::While(p.read_form()?));
             }
             "UNTIL" => {
                 p.advance();
-                guards.push((true, p.read_form()?));
+                body.push(LoopClause::Until(p.read_form()?));
             }
             "REPEAT" => {
                 p.advance();
@@ -9810,9 +10083,11 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         None => None,
     };
 
-    if for_clauses.is_empty() && guards.is_empty() && repeat_remaining.is_none() {
+    let has_terminator = loop_body_has_terminator(&body);
+    if for_clauses.is_empty() && !has_terminator && repeat_remaining.is_none() {
         // No driver at all: run the body once (when/collect-only loops).
-        loop_exec_clauses(&body, env, &mut accs, &mut ret)?;
+        let mut terminate = false;
+        loop_exec_clauses(&body, env, &mut accs, &mut ret, &mut terminate)?;
     } else {
         // Build cursors, evaluating each list form once.
         let mut states: Vec<ForState> = Vec::with_capacity(for_clauses.len());
@@ -9917,14 +10192,11 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 }
                 ForClause::Across { pat, seq_form } => {
                     let seq = eval_form(*seq_form, env)?;
-                    let items = if seq.is_cons() || seq.is_nil() {
-                        list_to_vec(seq)
-                    } else {
-                        val_as_str(seq)
-                            .chars()
-                            .map(BlissVal::from_char)
-                            .collect::<Vec<_>>()
-                    };
+                    // `:across` walks any vector — a string yields its characters,
+                    // a general vector its elements. `seq_elements` routes through
+                    // the stdlib's ELT/LENGTH, so a non-string vector is iterated
+                    // by element rather than mis-read as its printed string form.
+                    let items = seq_elements(seq)?;
                     states.push(ForState::Across {
                         pat: *pat,
                         items,
@@ -9968,7 +10240,7 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         }
         // repeat/while/until are terminating drivers too, so the runaway cap
         // (which only guards driverless loops) should not misfire on them.
-        if repeat_remaining.is_some() || !guards.is_empty() {
+        if repeat_remaining.is_some() || has_terminator {
             has_stepping_driver = true;
         }
         let mut first = true;
@@ -10046,21 +10318,15 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 }
                 repeat_remaining = Some(rem - 1);
             }
-            // `while`/`until` termination guards (evaluated after driver stepping
-            // so an interleaved `for … while …` sees the current binding).
-            let mut stop = false;
-            for (is_until, cond) in &guards {
-                let v = eval_form(*cond, env)?;
-                let this_stop = if *is_until { !v.is_nil() } else { v.is_nil() };
-                if this_stop {
-                    stop = true;
-                    break;
-                }
-            }
-            if stop {
+            // Run the body. `:while`/`:until` are body clauses evaluated in
+            // lexical order (after driver stepping, so an interleaved
+            // `for … while …` sees the current binding); a triggered one sets
+            // `terminate` and ends the loop after the clauses before it have run.
+            let mut terminate = false;
+            loop_exec_clauses(&body, env, &mut accs, &mut ret, &mut terminate)?;
+            if terminate {
                 break;
             }
-            loop_exec_clauses(&body, env, &mut accs, &mut ret)?;
             first = false;
             if !has_stepping_driver {
                 guard += 1;
@@ -11369,6 +11635,25 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             let (params_form, fbody) = cp(def_rest);
             let name = sym_name(name_form);
             let params = extract_params(params_form);
+            // A local function's body is wrapped in an implicit block named after
+            // the function (ANSI 3.1.2.1 / 6.1 flet-labels), so `(return-from
+            // NAME ...)` inside it works. For a `(setf foo)` name the block is
+            // named `foo`.
+            let block_name = if name_form.is_symbol() {
+                Some(name_form)
+            } else if name_form.is_cons() {
+                let (_head, tail) = cp(name_form);
+                if tail.is_cons() { Some(cp(tail).0) } else { None }
+            } else {
+                None
+            };
+            let fbody = match (block_name, resolve_sym("BLOCK")) {
+                (Some(bn), Some(block_sym)) => {
+                    let block_form = arena_cons(block_sym, arena_cons(bn, fbody));
+                    arena_cons(block_form, NIL)
+                }
+                _ => fbody,
+            };
             Rc::make_mut(&mut child_env.funs).insert(
                 name,
                 FunDef {
@@ -13408,6 +13693,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "PATHNAME-MATCH-P" | "TRANSLATE-PATHNAME" | "ENSURE-DIRECTORIES-EXIST"
             | "FILE-NAMESTRING" | "DIRECTORY-NAMESTRING" | "ENOUGH-NAMESTRING"
             | "COMPILE-FILE" | "COMPILE-FILE-PATHNAME" | "FILE-WRITE-DATE"
+            // Time
+            | "GET-UNIVERSAL-TIME" | "ENCODE-UNIVERSAL-TIME" | "DECODE-UNIVERSAL-TIME"
             // I/O
             | "PRINT" | "PRIN1" | "PRINC" | "WRITE" | "WRITE-STRING" | "WRITE-LINE"
             | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"
@@ -13927,6 +14214,7 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
     let mut element_type = T;
     let mut if_exists = T;
     let mut if_does_not_exist = NIL;
+    let mut if_dne_supplied = false;
     let mut i = 0;
     while i + 1 < opts.len() {
         let opt_bare = symbol_bare_name(&sym_name(opts[i]));
@@ -13948,10 +14236,22 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
                 element_type = if is_byte { BlissVal::from_fixnum(8) } else { T };
             }
             "IF-EXISTS" => if_exists = value,
-            "IF-DOES-NOT-EXIST" => if_does_not_exist = value,
+            "IF-DOES-NOT-EXIST" => {
+                if_does_not_exist = value;
+                if_dne_supplied = true;
+            }
             _ => {}
         }
         i += 2;
+    }
+    // CLHS defaults for `:if-does-not-exist` when unsupplied: `:error` for input
+    // (and for output with `:if-exists :overwrite`/`:append`), `:create`
+    // otherwise. The stdlib `open` treats any non-NIL value as "signal", and
+    // creates missing files on output regardless — so the only default that
+    // matters here is input, where NIL must NOT be passed (it would suppress the
+    // error and hand the body a NIL stream). Represent `:error` as T.
+    if !if_dne_supplied && matches!(direction, bliss_stdlib::StreamDirection::Input) {
+        if_does_not_exist = T;
     }
 
     // Open the file via the standard-library stream machinery.
@@ -13971,7 +14271,10 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
         env.define_local(&var_name, stream_val);
         eval_progn(body, env)
     });
-    bliss_stdlib::close(stream_val, false)?;
+    // `:if-does-not-exist nil` yields a NIL "stream"; there is nothing to close.
+    if !stream_val.is_nil() {
+        bliss_stdlib::close(stream_val, false)?;
+    }
     result
 }
 
@@ -14136,7 +14439,12 @@ fn eval_format(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         av.push(eval_form(af, env)?);
         c = r2;
     }
-    bliss_stdlib::format(dest, &fs, &av)
+    // Park the env so the formatter's `~A`/`~S` can dispatch user print-object
+    // methods (via stdlib_print_object_hook → dispatch_print_object).
+    let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));
+    let result = bliss_stdlib::format(dest, &fs, &av);
+    PRINT_ENV.with(|c| c.set(prev_env));
+    result
 }
 
 fn val_as_str(val: BlissVal) -> String {
@@ -14446,7 +14754,7 @@ fn run_load_report(path: &str, env: &mut Env) -> Result<i32, BlissError> {
 fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, BlissError> {
     match with_eval_context(env, EvalContext::Eval, |env| read_eval_all_env(expr, env)) {
         Ok(result) => {
-            println!("{}", format_val(result));
+            println!("{}", format_val_env(result, env, true));
             // When the top-level form yielded multiple values, echo the
             // secondary values too (one per line). env.mv holds the full value
             // list only when the last form actually produced multiple values;
@@ -14611,7 +14919,7 @@ fn run_repl_reader<R: std::io::BufRead>(
                 }
                 match read_eval_all_env(trimmed, env) {
                     Ok(result) => {
-                        println!("{}", format_val(result));
+                        println!("{}", format_val_env(result, env, true));
                         // Promote allocations from this eval (they may be stored in env)
                         ARENA.with(|a| a.borrow_mut().promote_all());
                     }
