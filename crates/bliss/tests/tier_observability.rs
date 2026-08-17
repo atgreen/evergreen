@@ -251,3 +251,35 @@ fn global_accumulator_loop_reaches_t2_and_deopts_precisely() {
     let twl = tw.lines().next().unwrap_or("").to_string();
     assert_eq!(twl, line, "T2 loop result must match the tree-walker: {line:?} vs {twl:?}");
 }
+
+/// A loop with several call-local temporaries alongside a couple of loop-carried
+/// values reaches T2 by placing the temporaries in caller-saved registers
+/// (bliss-uox: a value whose live range crosses no call needs no callee-saved
+/// register). `mid2` keeps `a`/`b`/`i` across the SymbolValue/SetSymbolValue calls
+/// in the body (callee-saved) while `(+ a b)` and the running-sum add are
+/// call-local; without the second register pool this exceeds the 5 callee-saved
+/// registers and declines to T1. The forced float deopt also exercises a
+/// call-local, deopt-live value being reconstructed out of a caller-saved
+/// register. The T2 result — including that deopt — must equal the tree-walker's.
+#[test]
+fn call_local_temporaries_use_caller_saved_and_deopt_correctly() {
+    let prog = "\
+        (defvar *s* 0) \
+        (defun mid2 (a b) (setf *s* 0) (dotimes (i 5) (setf *s* (+ *s* (+ a b)))) *s*) \
+        (dotimes (k 60) (mid2 3 4)) \
+        (let ((ok (mid2 3 4)) (dp (mid2 1.5 4))) \
+          (format t \"~a ~a ~a~%\" ok dp *s*))";
+
+    let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
+    assert!(ok, "T2 run failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    assert_eq!(
+        line, "35 27.5 27.5",
+        "all-fixnum sum, then the float-deopt sum and *s* (ok dp *s*): {line:?}"
+    );
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker run failed: {tw}");
+    let twl = tw.lines().next().unwrap_or("").to_string();
+    assert_eq!(twl, line, "T2 result must match the tree-walker: {line:?} vs {twl:?}");
+}

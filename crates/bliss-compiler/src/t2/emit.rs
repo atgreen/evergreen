@@ -1347,6 +1347,32 @@ pub fn emit_framed(
     } else {
         vec![11, 10, 9, 8, 1]
     };
+    // Call-local pool (bliss-uox): a value whose live range crosses NO call can
+    // live in a caller-saved register — it is not clobbered because no call
+    // happens while it is live. This roughly extends the 5-register callee-saved
+    // budget so loops with several live temporaries reach T2 instead of declining.
+    // Only registers free of every call/scratch ABI role qualify: rdx is guard
+    // scratch, rcx/r8 are c2i-call arg registers, and r9/r10 are the register-entry
+    // (self-call) arg registers — so r11 is always safe, and r9/r10 too when the
+    // function never self-calls. Empty for a call-free function (its single pool is
+    // already caller-saved, so nothing to split).
+    let self_recursive = self_sym.is_some_and(|ss| {
+        blocks.iter().any(|&b| {
+            f.block(b).insts.iter().any(|&i| {
+                let d = f.inst(i);
+                d.opcode == Opcode::Call && matches!(d.aux, AuxData::CallTarget(s) if s == ss)
+            })
+        })
+    });
+    let mut pool_cl: Vec<u8> = if !has_calls {
+        Vec::new()
+    } else if self_recursive {
+        vec![11]
+    } else {
+        vec![11, 10, 9]
+    };
+    // A caller-saved value register belongs to `pool_cl`; anything else to `pool`.
+    let is_cl_reg = |r: u8| has_calls && matches!(r, 9 | 10 | 11);
     // If every Return returns the same non-constant value that isn't an entry
     // parameter (e.g. an arithmetic result, or a merge block param), bind it to
     // rax so it lands in the return register with no extra move. Not with calls —
@@ -1480,14 +1506,36 @@ pub fn emit_framed(
                 }
             }
         }
+        // Instruction indices in this block that lower to a call (they clobber the
+        // caller-saved `pool_cl` registers). A block-local value whose live range
+        // spans one of these MUST live in a callee-saved register (bliss-uox).
+        let call_indices: Vec<usize> = insts
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| is_call_like(f.inst(**i).opcode))
+            .map(|(idx, _)| idx)
+            .collect();
+        // A value defined at `def` and last used at `l` is call-local iff no call
+        // sits strictly between them. `usize::MAX` (live to the block edge) counts
+        // as the block end. A call at exactly `l` is the value's own consuming call
+        // (it is an argument, moved to an arg register first), so it does not span.
+        let crosses_call = |def: usize, l: usize| {
+            let end = if l == usize::MAX { insts.len() } else { l };
+            call_indices.iter().any(|&c| def < c && c < end)
+        };
         // Block-local values allocated in this block, pending free at their last use.
         let mut pending: Vec<(Value, usize)> = Vec::new();
         for (idx, &inst) in insts.iter().enumerate() {
-            // Free any block-local value whose last use is strictly before this inst.
+            // Free any block-local value whose last use is strictly before this inst,
+            // returning its register to the pool it came from.
             pending.retain(|&(v, last)| {
                 if last < idx {
                     if let Some(&r) = reg.get(&v) {
-                        pool.push(r);
+                        if is_cl_reg(r) {
+                            pool_cl.push(r);
+                        } else {
+                            pool.push(r);
+                        }
                     }
                     false
                 } else {
@@ -1499,6 +1547,11 @@ pub fn emit_framed(
                 continue;
             }
             if let Some(&r0) = d.results.first() {
+                // Call-local (may use a caller-saved register): block-local and its
+                // live range spans no call.
+                let r0_call_local = has_calls
+                    && is_block_local(r0)
+                    && !crosses_call(idx, *last_use.get(&r0).unwrap_or(&idx));
                 if reg.contains_key(&r0) {
                     // Already assigned (e.g. the return value bound to rax) — keep it.
                 } else {
@@ -1516,10 +1569,18 @@ pub fn emit_framed(
                             // frame reconstruction; never overwrite it in place
                             // (bliss-mba).
                             && !(precise && deopt_live.contains(&v))
+                            // Never inherit a caller-saved (call-local) register for a
+                            // result that outlives a call — it would be clobbered
+                            // (bliss-uox).
+                            && !(is_cl_reg(reg[&v]) && !r0_call_local)
                     });
                     if let Some(v) = inplace {
                         reg.insert(r0, reg[&v]);
                         pending.retain(|&(pv, _)| pv != v); // consumed into r0
+                    } else if r0_call_local && !pool_cl.is_empty() {
+                        // Prefer a caller-saved register; fall back to callee-saved.
+                        let r = pool_cl.pop().or_else(|| pool.pop()).ok_or(EmitError::UnsupportedOp(0xF1))?;
+                        reg.insert(r0, r);
                     } else {
                         framed_alloc(&mut reg, &mut pool, r0)?;
                     }
