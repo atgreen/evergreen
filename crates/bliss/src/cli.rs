@@ -8711,7 +8711,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // to the global registry entry of the same name.
             if !env.funs.contains_key(&name) {
                 if let Some(sym) = resolve_sym(&name) {
-                    if let Some(res) = bytecode::call_registered(sym.as_symbol_index(), &args, env) {
+                    if let Some(res) =
+                        bytecode::call_registered(sym.as_symbol_index(), &args, sym, env)
+                    {
                         return res;
                     }
                 }

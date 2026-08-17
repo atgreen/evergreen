@@ -131,6 +131,7 @@ fn registry_remove(sym: u32) {
 pub fn call_registered(
     sym: u32,
     args: &[BlissVal],
+    fn_val: BlissVal,
     env: &mut Env,
 ) -> Option<Result<BlissVal, BlissError>> {
     let callee = registry_get(sym)?;
@@ -161,16 +162,17 @@ pub fn call_registered(
         }
         Some(nc)
     });
-    // Dispatch to native ONLY. A not-yet-promoted (or over-depth-cap) function
-    // returns None so the caller keeps tree-walking it — this preserves the
-    // tree-walker's exact semantics (e.g. multiple-values clearing on a
-    // single-valued call) for cold code, changing behaviour for hot functions
-    // only insofar as they now run their T1 native code.
+    // Dispatch: native if promoted and under the depth cap, else run the callee
+    // as BYTECODE — the profiling warmup tier. This is what gathers the operand
+    // -type profile a function needs before it can be speculated at T2, even when
+    // it is only ever reached from tree-walked code (e.g. a top-level `loop`).
+    // Running through bytecode is MV-correct now that `run` clears stale values
+    // on entry, and is equivalent to the tree-walker for a compiled function.
     match native {
         Some(nc) if NATIVE_DEPTH.with(|d| d.get()) < native_depth_cap() => {
             Some(run_native(&nc, sym, args, env))
         }
-        _ => None,
+        _ => Some(run(callee, args, fn_val, env)),
     }
 }
 
@@ -2993,6 +2995,14 @@ fn run(
     entry_fn_val: BlissVal,
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
+    // A callee's return values are determined by its own body — discard any
+    // multiple-values state left by the caller's argument evaluation, so a
+    // single-valued function returns exactly one value (an enclosing
+    // multiple-value-bind sees NIL secondaries). This matches the tree-walker,
+    // which resets the values on each single-valued form. A function that
+    // genuinely returns multiple values re-establishes them via SetValues before
+    // its Return.
+    env.clear_mv();
     let thread = bliss_rt::current_thread();
     let stack = thread.stack();
 

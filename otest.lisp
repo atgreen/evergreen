@@ -1,4 +1,4 @@
-(defun foo (x) x)
+(defun foo (x) (* x 5))
 
 (disassemble 'foo)
 
