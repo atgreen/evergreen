@@ -963,17 +963,77 @@ pub fn emit_framed(
             }
         }
     }
+    // Block-local liveness: a value defined in a block and used only there can
+    // return its register to the pool after its last use in that block, so it can
+    // be reused (relieves register pressure — e.g. fib's per-branch temporaries).
+    // Always sound: block-local live ranges never overlap across blocks, and a
+    // deopt discards register state entirely (it re-runs in the interpreter).
+    let mut def_block: HashMap<Value, Block> = HashMap::new();
+    let mut use_blocks: HashMap<Value, HashSet<Block>> = HashMap::new();
     for &b in &blocks {
         for &inst in &f.block(b).insts {
+            for &r in &f.inst(inst).results {
+                def_block.insert(r, b);
+            }
+            for &v in &f.inst(inst).args {
+                use_blocks.entry(v).or_default().insert(b);
+            }
+        }
+        if let Some(t) = f.terminator(b) {
+            for tc in &f.inst(t).targets {
+                for &v in &tc.args {
+                    use_blocks.entry(v).or_default().insert(b);
+                }
+            }
+        }
+    }
+    let is_block_local = |v: Value| match def_block.get(&v) {
+        Some(&db) => use_blocks.get(&v).is_none_or(|s| s.iter().all(|&ub| ub == db)),
+        None => false,
+    };
+
+    for &b in &blocks {
+        let insts = f.block(b).insts.clone();
+        // Last inst index in this block that uses each value (usize::MAX if the
+        // terminator uses it — such values live to the block's edge).
+        let mut last_use: HashMap<Value, usize> = HashMap::new();
+        for (idx, &inst) in insts.iter().enumerate() {
             let d = f.inst(inst);
-            if is_const_opcode(d.opcode)
-                || d.opcode.is_terminator()
-                || fused.contains(&inst)
-            {
+            let at = if d.opcode.is_terminator() { usize::MAX } else { idx };
+            for &v in &d.args {
+                last_use.insert(v, at);
+            }
+        }
+        if let Some(t) = f.terminator(b) {
+            for tc in &f.inst(t).targets {
+                for &v in &tc.args {
+                    last_use.insert(v, usize::MAX);
+                }
+            }
+        }
+        // Block-local values allocated in this block, pending free at their last use.
+        let mut pending: Vec<(Value, usize)> = Vec::new();
+        for (idx, &inst) in insts.iter().enumerate() {
+            // Free any block-local value whose last use is strictly before this inst.
+            pending.retain(|&(v, last)| {
+                if last < idx {
+                    if let Some(&r) = reg.get(&v) {
+                        pool.push(r);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            let d = f.inst(inst);
+            if is_const_opcode(d.opcode) || d.opcode.is_terminator() || fused.contains(&inst) {
                 continue;
             }
             if let Some(&r0) = d.results.first() {
                 framed_alloc(&mut reg, &mut pool, r0)?;
+                if is_block_local(r0) {
+                    pending.push((r0, *last_use.get(&r0).unwrap_or(&idx)));
+                }
             }
         }
     }
