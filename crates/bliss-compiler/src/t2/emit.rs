@@ -495,11 +495,19 @@ fn emit_arith_inst(
     pool: &mut Vec<u8>,
     consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
     float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+    proven: &std::collections::HashSet<crate::t2::ir::Value>,
     deopt: bliss_rt::asm::Label,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::Opcode;
     let dst = framed_alloc(reg, pool, data.results[0])?;
     let tagged32 = |c: i64| i32::try_from(bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
+    // Guard a variable operand is a fixnum — unless a dominating guard already
+    // proved it (guard elimination). Constants never need a guard.
+    let guard = |a: &mut Asm, v: crate::t2::ir::Value, r: u8| {
+        if !proven.contains(&v) {
+            guard_fixnum(a, r, deopt);
+        }
+    };
     match data.opcode {
         Opcode::FixnumMul => {
             let (a0, b0) = (data.args[0], data.args[1]);
@@ -512,7 +520,7 @@ fn emit_arith_inst(
                 if let Ok(c32) = i32::try_from(c) {
                     let range = f.value(var).ty.range;
                     let x = *reg.get(&var).ok_or(EmitError::UnsupportedOp(0xF2))?;
-                    guard_fixnum(a, x, deopt);
+                    guard(a, var, x);
                     if mul_cannot_overflow(range, c) {
                         match lea_scale(c) {
                             Some(s) => lea_mul(a, dst, x, s),
@@ -527,10 +535,12 @@ fn emit_arith_inst(
             }
             let x = framed_mat(a, reg, pool, consts, a0)?;
             let y = framed_mat(a, reg, pool, consts, b0)?;
-            alu_rr(a, 0x89, SCRATCH, x);
-            alu_rr(a, 0x09, SCRATCH, y);
-            a.extend_from_slice(&[0xF6, 0xC2, 0x07]);
-            a.jcc(Cc::Ne, deopt);
+            if !(proven.contains(&a0) && proven.contains(&b0)) {
+                alu_rr(a, 0x89, SCRATCH, x);
+                alu_rr(a, 0x09, SCRATCH, y);
+                a.extend_from_slice(&[0xF6, 0xC2, 0x07]);
+                a.jcc(Cc::Ne, deopt);
+            }
             mov_rr(a, dst, x);
             sar_imm(a, dst, 3);
             imul_rr(a, dst, y);
@@ -551,7 +561,7 @@ fn emit_arith_inst(
             if let Some((var, c)) = folded {
                 if let Ok(t32) = tagged32(c) {
                     let x = *reg.get(&var).ok_or(EmitError::UnsupportedOp(0xF2))?;
-                    guard_fixnum(a, x, deopt);
+                    guard(a, var, x);
                     mov_rr(a, dst, x);
                     alu_r_imm(a, if is_add { 0 } else { 5 }, dst, t32);
                     a.jcc(Cc::O, deopt);
@@ -560,8 +570,8 @@ fn emit_arith_inst(
             }
             let x = framed_mat(a, reg, pool, consts, a0)?;
             let y = framed_mat(a, reg, pool, consts, b0)?;
-            guard_fixnum(a, x, deopt);
-            guard_fixnum(a, y, deopt);
+            guard(a, a0, x);
+            guard(a, b0, y);
             mov_rr(a, dst, x);
             alu_rr(a, if is_add { 0x01 } else { 0x29 }, dst, y); // tagged±tagged = tagged
             a.jcc(Cc::O, deopt);
@@ -648,6 +658,7 @@ fn emit_fused_compare(
     cmp_data: &crate::t2::ir::InstData,
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
     consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    proven: &std::collections::HashSet<crate::t2::ir::Value>,
     deopt: bliss_rt::asm::Label,
 ) -> Result<Cc, EmitError> {
     let base = fixnum_cmp_cc(cmp_data.opcode).ok_or(EmitError::UnsupportedOp(op_tag(cmp_data.opcode)))?;
@@ -656,29 +667,44 @@ fn emit_fused_compare(
         i32::try_from(bliss_rt::value::BlissVal::from_fixnum(c).0 as i64)
             .map_err(|_| EmitError::UnsupportedOp(0xF4))
     };
+    let guard = |a: &mut Asm, v: crate::t2::ir::Value, rr: u8| {
+        if !proven.contains(&v) {
+            guard_fixnum(a, rr, deopt);
+        }
+    };
     match (consts.get(&l).copied(), consts.get(&r).copied()) {
         (None, Some(c)) => {
             let lr = *reg.get(&l).ok_or(EmitError::UnsupportedOp(0xF2))?;
-            guard_fixnum(a, lr, deopt);
+            guard(a, l, lr);
             alu_r_imm(a, 7, lr, tagged32(c)?); // cmp lr, tagged
             Ok(base)
         }
         (Some(c), None) => {
             let rr = *reg.get(&r).ok_or(EmitError::UnsupportedOp(0xF2))?;
-            guard_fixnum(a, rr, deopt);
+            guard(a, r, rr);
             alu_r_imm(a, 7, rr, tagged32(c)?);
             Ok(cc_swapped(base)) // operands swapped
         }
         (None, None) => {
             let lr = *reg.get(&l).ok_or(EmitError::UnsupportedOp(0xF2))?;
             let rr = *reg.get(&r).ok_or(EmitError::UnsupportedOp(0xF2))?;
-            guard_fixnum(a, lr, deopt);
-            guard_fixnum(a, rr, deopt);
+            guard(a, l, lr);
+            guard(a, r, rr);
             cmp_rr(a, lr, rr);
             Ok(base)
         }
         (Some(_), Some(_)) => Err(EmitError::UnsupportedOp(0xF5)), // const-const: folded upstream
     }
+}
+
+/// Is `op` a fixnum operation whose guard proves its operands are fixnums (so a
+/// dominating occurrence lets a later use skip its guard)?
+fn is_fixnum_guarding_op(op: crate::t2::ir::Opcode) -> bool {
+    use crate::t2::ir::Opcode::*;
+    matches!(
+        op,
+        FixnumAdd | FixnumSub | FixnumMul | FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe
+    )
 }
 
 /// Emit `f` (a speculated function, straight-line or branching) as native code.
@@ -755,6 +781,22 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
         }
     }
 
+    // Guard elimination: every non-terminator inst in the entry block runs
+    // unconditionally before the branch, so any fixnum operand it guards is proven
+    // a fixnum in every (entry-dominated) block. Those operands need no re-guard.
+    // (Conservative: only the entry block, which dominates all others.)
+    let mut entry_guarded: HashSet<Value> = HashSet::new();
+    for &inst in &f.block(entry).insts {
+        let d = f.inst(inst);
+        if d.flags.guard && is_fixnum_guarding_op(d.opcode) {
+            for &v in &d.args {
+                if !consts.contains_key(&v) && !float_consts.contains_key(&v) {
+                    entry_guarded.insert(v);
+                }
+            }
+        }
+    }
+
     // Register assignment. rax = return/float scratch, rdx = guard scratch, rdi =
     // frame slots (interp entry only). Value pool: rcx, r8, r9, r10, r11 — arg
     // registers first, all with guard-safe low bytes. Constants and fused
@@ -824,6 +866,9 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
     // (with block-parameter moves on each out-edge).
     for (bi, &b) in blocks.iter().enumerate() {
         a.bind(block_label[&b]);
+        // Fixnum operands proven by a dominating guard: the entry block dominates
+        // all others, so its guards carry over (the entry block itself starts fresh).
+        let proven: HashSet<Value> = if b == entry { HashSet::new() } else { entry_guarded.clone() };
         for &inst in &f.block(b).insts {
             let d = f.inst(inst).clone();
             if matches!(d.opcode, Opcode::ConstFixnum | Opcode::ConstFloat)
@@ -832,9 +877,10 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
             {
                 continue;
             }
-            emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, deopt)?;
+            emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, &proven, deopt)?;
         }
 
+        let next = blocks.get(bi + 1).copied();
         let t = f.terminator(b).ok_or(EmitError::UnsupportedOp(0xF3))?;
         let td = f.inst(t).clone();
         match td.opcode {
@@ -844,7 +890,7 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
             Opcode::Jump => {
                 let tc = &td.targets[0];
                 parallel_move(&mut a, edge_moves(f, tc, &reg, &consts, &float_consts)?);
-                if blocks.get(bi + 1) != Some(&tc.block) {
+                if next != Some(tc.block) {
                     a.jmp(block_label[&tc.block]);
                 }
             }
@@ -855,19 +901,52 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
                     _ => return Err(EmitError::UnsupportedOp(0xF6)),
                 };
                 let cmp_data = f.inst(cmp_inst).clone();
-                let cc = emit_fused_compare(&mut a, &cmp_data, &reg, &consts, deopt)?;
-                let then_tc = &td.targets[0]; // taken when the comparison is true
-                let else_tc = &td.targets[1];
-                let then_moves = edge_moves(f, then_tc, &reg, &consts, &float_consts)?;
-                let else_moves = edge_moves(f, else_tc, &reg, &consts, &float_consts)?;
-                // jcc(true) → then; fall through into the else moves.
-                let lthen = a.label();
-                a.jcc(cc, lthen);
-                parallel_move(&mut a, else_moves);
-                a.jmp(block_label[&else_tc.block]);
-                a.bind(lthen);
-                parallel_move(&mut a, then_moves);
-                a.jmp(block_label[&then_tc.block]);
+                let cc = emit_fused_compare(&mut a, &cmp_data, &reg, &consts, &proven, deopt)?;
+                let then_b = td.targets[0].block; // taken when the comparison is true
+                let else_b = td.targets[1].block;
+                let then_moves = edge_moves(f, &td.targets[0], &reg, &consts, &float_consts)?;
+                let else_moves = edge_moves(f, &td.targets[1], &reg, &consts, &float_consts)?;
+                match (then_moves.is_empty(), else_moves.is_empty()) {
+                    // No edge moves either side: a plain two-way branch. Fall through
+                    // to whichever arm is the next block; branch to the other.
+                    (true, true) => {
+                        if next == Some(else_b) {
+                            a.jcc(cc, block_label[&then_b]);
+                        } else if next == Some(then_b) {
+                            a.jcc(cc.inverse(), block_label[&else_b]);
+                        } else {
+                            a.jcc(cc, block_label[&then_b]);
+                            a.jmp(block_label[&else_b]);
+                        }
+                    }
+                    // Only one side has moves: branch straight to the move-free side,
+                    // then emit the other side's moves inline before its jump.
+                    (true, false) => {
+                        a.jcc(cc, block_label[&then_b]);
+                        parallel_move(&mut a, else_moves);
+                        if next != Some(else_b) {
+                            a.jmp(block_label[&else_b]);
+                        }
+                    }
+                    (false, true) => {
+                        a.jcc(cc.inverse(), block_label[&else_b]);
+                        parallel_move(&mut a, then_moves);
+                        if next != Some(then_b) {
+                            a.jmp(block_label[&then_b]);
+                        }
+                    }
+                    // Both sides move: a trampoline for the taken arm, inline fall for
+                    // the other.
+                    (false, false) => {
+                        let lthen = a.label();
+                        a.jcc(cc, lthen);
+                        parallel_move(&mut a, else_moves);
+                        a.jmp(block_label[&else_b]);
+                        a.bind(lthen);
+                        parallel_move(&mut a, then_moves);
+                        a.jmp(block_label[&then_b]);
+                    }
+                }
             }
             other => return Err(EmitError::UnsupportedOp(op_tag(other))),
         }
