@@ -321,3 +321,42 @@ fn hash_table_function_compiles_and_promotes() {
     let t1_result = line.split_once(' ').map(|(_, r)| r.to_string());
     assert_eq!(tw_result, t1_result, "T1 hash result must match the tree-walker");
 }
+
+/// Variadic lambda lists (&optional/&key/&rest, with defaults and supplied-p)
+/// compile to bytecode and promote to T1 (bliss-x5y.7) — previously the single
+/// biggest function-level bail. Defaults (which may reference earlier params) and
+/// keyword matching must match the tree-walker exactly; the binder reuses the
+/// interpreter's own bind_lambda_list into a scratch env, then copies to slots.
+#[test]
+fn variadic_lambda_lists_compile_and_promote() {
+    let prog = "\
+        (defun f (x &optional (y 1) z) (list x y z)) \
+        (defun g (a &key (b 1) (c (* a 2))) (list a b c)) \
+        (defun h (x &rest r) (list x r)) \
+        (f 0) (f 0) (g 0) (g 0) (h 0) (h 0) \
+        (format t \"~a ~a ~a ~a~%\" \
+          (bliss-ext:function-tier (quote f)) \
+          (f 10 20) (g 5 :c 99) (h 1 2 3))";
+    let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "variadic run failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    assert!(line.starts_with("1 "), "&optional fn must reach T1: {line:?}");
+    assert_eq!(
+        line, "1 (10 20 NIL) (5 1 99) (1 (2 3))",
+        "variadic results (tier f, f, g, h): {line:?}"
+    );
+
+    // Tree-walker agreement, including a supplied-p and too-few-args error.
+    let prog2 = "\
+        (defun sp (a &optional (b 9 bp)) (list a b bp)) \
+        (defun r2 (a b) (+ a b)) \
+        (dotimes (i 4) (sp 1) (r2 1 2)) \
+        (format t \"~a ~a~%\" (sp 1) (handler-case (r2 1) (error () :few)))";
+    let (t1, _) = run(prog2, &[("BLISS_T1_THRESHOLD", "2")]);
+    let (tw, _) = run(prog2, &[("BLISS_BACKEND", "tree-walker")]);
+    assert_eq!(
+        t1.lines().next(),
+        tw.lines().next(),
+        "supplied-p + arity error must match the tree-walker"
+    );
+}

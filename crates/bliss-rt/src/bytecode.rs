@@ -158,10 +158,22 @@ pub struct BytecodeFunction {
     pub n_locals: u16,
     /// Maximum operand-stack depth.
     pub max_stack: u16,
-    /// Fixed argument count (slice 1 lowers only fixed lambda lists).
+    /// Required argument count. For a fixed lambda list this is also the exact
+    /// arity; for a variadic one it is the number of required parameters.
     pub arity: u16,
     /// Function name, for debugging.
     pub name: String,
+    /// The raw lambda list, kept only for a variadic function so the call-time
+    /// binder can re-parse it (x5y.7). `NIL` for a fixed lambda list.
+    pub params_form: crate::value::BlissVal,
+    /// Minimum acceptable argument count (= required parameters).
+    pub min_args: u16,
+    /// Maximum acceptable argument count, or `None` when unbounded (`&rest` or
+    /// `&key` present).
+    pub max_args: Option<u16>,
+    /// True when the lambda list has `&optional`/`&rest`/`&key`/`&aux`, so args
+    /// are bound by the variadic binder rather than positionally.
+    pub variadic: bool,
 }
 
 impl BytecodeFunction {

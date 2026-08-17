@@ -128,6 +128,14 @@ fn registry_remove(sym: u32) {
 /// function (no lexical FLET/LABELS shadow) and counted the invocation (via
 /// `callable_body`/`global_fn`), so this reads — not re-bumps — the counter for
 /// a function object.
+/// Whether a compiled callee accepts `n` arguments: at least its required count,
+/// and at most `max_args` unless the lambda list is unbounded (`&rest`/`&key`).
+/// A too-few/too-many count declines to the tree-walker, which raises the proper
+/// PROGRAM-ERROR (x5y.7).
+fn arity_accepts(callee: &BytecodeFunction, n: usize) -> bool {
+    n >= callee.min_args as usize && callee.max_args.is_none_or(|m| n <= m as usize)
+}
+
 pub fn call_registered(
     sym: u32,
     args: &[BlissVal],
@@ -135,8 +143,8 @@ pub fn call_registered(
     env: &mut Env,
 ) -> Option<Result<BlissVal, BlissError>> {
     let callee = registry_get(sym)?;
-    if callee.arity as usize != args.len() {
-        return None; // arity mismatch (e.g. &optional/&rest): let the tree-walker bind it
+    if !arity_accepts(&callee, args.len()) {
+        return None; // arg count outside the lambda list's range: tree-walker binds it
     }
     let fn_obj = bliss_rt::symbols::symbol_function(sym)
         .filter(|&c| bliss_rt::function::is_interpreted_function(c));
@@ -2393,21 +2401,13 @@ fn compile_local_function(
     env: &Env,
     local_fns: &std::collections::HashMap<String, u32>,
 ) -> Option<BytecodeFunction> {
-    let params = list_to_vec(params_form);
-    let mut param_names = Vec::new();
-    for p in &params {
-        if !p.is_symbol() {
-            return None;
-        }
-        let pn = sym_name(*p);
-        if pn.starts_with('&') {
-            return None;
-        }
-        param_names.push(pn);
-    }
+    let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
     lo.local_fns = local_fns.clone();
     lo.captured_names = compute_captured_names(fbody);
+    if variadic && param_names.iter().any(|n| lo.captured_names.contains(n)) {
+        return None;
+    }
     let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
         let loc = lo.alloc_local(pn);
@@ -2428,8 +2428,12 @@ fn compile_local_function(
         has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
-        arity: param_names.len() as u16,
+        arity: min_args,
         name: "<flet>".to_string(),
+        params_form: if variadic { params_form } else { NIL },
+        min_args,
+        max_args,
+        variadic,
     })
 }
 
@@ -2525,6 +2529,127 @@ fn is_bail_special(name: &str) -> bool {
     )
 }
 
+/// The variable name(s) a single &optional/&aux spec binds: `var`, `(var)`,
+/// `(var default)`, or `(var default supplied-p)`. Returns `(var, supplied_p?)`,
+/// or `None` for a shape the binder can't handle (e.g. destructuring).
+fn parse_opt_aux_spec(elem: BlissVal) -> Option<(String, Option<String>)> {
+    if elem.is_symbol() {
+        return Some((sym_name(elem), None));
+    }
+    if elem.is_cons() {
+        let items = list_to_vec(elem);
+        if items.is_empty() || !items[0].is_symbol() {
+            return None;
+        }
+        let var = sym_name(items[0]);
+        // items: [var], [var default], [var default supplied-p]
+        let sp = items.get(2).filter(|v| v.is_symbol()).map(|v| sym_name(*v));
+        return Some((var, sp));
+    }
+    None
+}
+
+/// The variable name(s) a single &key spec binds: `var`, `(var …)`, or
+/// `((keyword var) …)`. Returns `(var, supplied_p?)`.
+fn parse_key_spec(elem: BlissVal) -> Option<(String, Option<String>)> {
+    if elem.is_symbol() {
+        return Some((sym_name(elem), None));
+    }
+    if elem.is_cons() {
+        let items = list_to_vec(elem);
+        if items.is_empty() {
+            return None;
+        }
+        // The name is either `var` or `(keyword var)`.
+        let var = if items[0].is_symbol() {
+            sym_name(items[0])
+        } else if items[0].is_cons() {
+            let kv = list_to_vec(items[0]);
+            if kv.len() != 2 || !kv[1].is_symbol() {
+                return None;
+            }
+            sym_name(kv[1])
+        } else {
+            return None;
+        };
+        let sp = items.get(2).filter(|v| v.is_symbol()).map(|v| sym_name(*v));
+        return Some((var, sp));
+    }
+    None
+}
+
+/// Parse an ordinary lambda list into `(all-variable-names-in-order, min_args,
+/// max_args, variadic)` (x5y.7). Every variable — required, &optional (+ its
+/// supplied-p), &rest, &key (+ supplied-p), &aux — gets a name so the compiler
+/// allocates it a slot; the *values* (including default-form evaluation) are
+/// filled at call time by the tree-walker's `bind_lambda_list`. Returns `None`
+/// for shapes not yet handled (destructuring, an unknown lambda-list keyword).
+fn parse_lambda_list(params_form: BlissVal) -> Option<(Vec<String>, u16, Option<u16>, bool)> {
+    #[derive(PartialEq, Clone, Copy)]
+    enum Mode {
+        Req,
+        Opt,
+        Rest,
+        Key,
+        Aux,
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut n_required: u16 = 0;
+    let mut n_optional: u16 = 0;
+    let mut variadic = false;
+    let mut unbounded = false; // &rest or &key ⇒ no upper arg bound
+    let mut mode = Mode::Req;
+    let mut c = params_form;
+    while c.is_cons() {
+        let (elem, rest) = cp(c);
+        c = rest;
+        if elem.is_symbol() {
+            let n = sym_name(elem);
+            match n.as_str() {
+                "&OPTIONAL" => { mode = Mode::Opt; variadic = true; continue; }
+                "&REST" | "&BODY" => { mode = Mode::Rest; variadic = true; unbounded = true; continue; }
+                "&KEY" => { mode = Mode::Key; variadic = true; unbounded = true; continue; }
+                "&AUX" => { mode = Mode::Aux; variadic = true; continue; }
+                "&ALLOW-OTHER-KEYS" => continue,
+                _ if n.starts_with('&') => return None, // unknown lambda-list keyword
+                _ => {}
+            }
+        }
+        match mode {
+            Mode::Req => {
+                if !elem.is_symbol() {
+                    return None; // destructuring not supported
+                }
+                names.push(sym_name(elem));
+                n_required += 1;
+            }
+            Mode::Opt => {
+                let (var, sp) = parse_opt_aux_spec(elem)?;
+                names.push(var);
+                if let Some(sp) = sp { names.push(sp); }
+                n_optional += 1;
+            }
+            Mode::Rest => {
+                if !elem.is_symbol() {
+                    return None;
+                }
+                names.push(sym_name(elem));
+            }
+            Mode::Key => {
+                let (var, sp) = parse_key_spec(elem)?;
+                names.push(var);
+                if let Some(sp) = sp { names.push(sp); }
+            }
+            Mode::Aux => {
+                let (var, _) = parse_opt_aux_spec(elem)?;
+                names.push(var);
+            }
+        }
+    }
+    let max_args = if unbounded { None } else { Some(n_required + n_optional) };
+    Some((names, n_required, max_args, variadic))
+}
+
 /// Lower a fixed-arity function `(params . body)` to a [`BytecodeFunction`].
 /// Returns `None` if the lambda list is non-trivial or the body uses a form
 /// slice 1 does not yet handle.
@@ -2534,27 +2659,26 @@ fn compile_function(
     body: BlissVal,
     env: &Env,
 ) -> Option<BytecodeFunction> {
-    let params = list_to_vec(params_form);
-    // Slice 1: only simple fixed lambda lists (no &optional/&rest/&key/&aux).
-    // These lambda-list bails happen before the body is even lowered, so record
-    // them here for the x5y.1 diagnostic — they are a top blocker for real
-    // functions (uiop:ensure-package and friends use &key/&optional/&rest).
-    let mut param_names = Vec::new();
-    for p in &params {
-        if !p.is_symbol() {
+    // Parse the lambda list. Fixed and variadic (&optional/&rest/&key/&aux) are
+    // both supported (x5y.7); destructuring / unknown keywords still bail.
+    let (param_names, min_args, max_args, variadic) = match parse_lambda_list(params_form) {
+        Some(p) => p,
+        None => {
             let _ = record_bail(|| "lambda-list:destructure".to_string());
             return None;
         }
-        let pn = sym_name(*p);
-        if pn.starts_with('&') {
-            let _ = record_bail(|| format!("lambda-list:{pn}"));
-            return None;
-        }
-        param_names.push(pn);
-    }
+    };
 
     let mut lo = Lowerer::new(env);
     lo.captured_names = compute_captured_names(body);
+    // A captured (boxed) variadic parameter would need the call-time binder to
+    // populate the heap EnvFrame too; not handled yet, so bail (rare — a nested
+    // closure capturing a &optional/&key/&rest param). Fixed lambda lists keep
+    // their existing boxed-capture support.
+    if variadic && param_names.iter().any(|n| lo.captured_names.contains(n)) {
+        let _ = record_bail(|| "lambda-list:captured-variadic-param".to_string());
+        return None;
+    }
     let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
         let loc = lo.alloc_local(pn);
@@ -2577,8 +2701,12 @@ fn compile_function(
         has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
-        arity: param_names.len() as u16,
+        arity: min_args,
         name: name.to_string(),
+        params_form: if variadic { params_form } else { NIL },
+        min_args,
+        max_args,
+        variadic,
     })
 }
 
@@ -2668,6 +2796,10 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
         max_stack: lo.max_stack.max(1),
         arity: 0,
         name: "<toplevel>".to_string(),
+        params_form: NIL,
+        min_args: 0,
+        max_args: Some(0),
+        variadic: false,
     })
 }
 
@@ -3362,6 +3494,35 @@ fn bind_params(func: &BytecodeFunction, frame: *mut Frame, args: &[BlissVal]) {
     }
 }
 
+/// Bind a variadic lambda list (`&optional`/`&rest`/`&key`/`&aux`) into `frame`'s
+/// slots at call time (x5y.7). The tree-walker's `bind_lambda_list` does the
+/// parsing and default-form evaluation into a throwaway child env — so a default
+/// evaluates in a scope where the earlier parameters are visible, byte-for-byte
+/// as the interpreter would — and then each parameter's value is copied into its
+/// slot. `compile_function` guarantees no variadic parameter is boxed, so only
+/// `Slot` locations occur here.
+fn bind_variadic(
+    func: &BytecodeFunction,
+    frame: *mut Frame,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Result<(), BlissError> {
+    let parent = Rc::clone(&env.frame);
+    super::with_child_frame(env, parent, |env| {
+        super::bind_lambda_list(func.params_form, args, env)?;
+        // Argument/default evaluation is a single-value context.
+        env.clear_mv();
+        let cur = Rc::clone(&env.frame);
+        for (name, loc) in &func.param_layout {
+            if let VarLoc::Slot(s) = loc {
+                let v = super::Env::lookup_frame(&cur, name).unwrap_or(NIL);
+                unsafe { slot_set(frame, *s, v) };
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Run a compiled function to completion on the current green thread's
 /// `BlissStack`. `args` are the actual arguments bound into the entry frame's
 /// leading local slots.
@@ -3390,7 +3551,14 @@ fn run(
             FLAG_CALL,
         )
         .ok_or_else(|| BlissError::StackOverflow(bliss_rt::current_thread_id()))?;
-    bind_params(&entry, frame, args);
+    if entry.variadic {
+        if let Err(e) = bind_variadic(&entry, frame, args, env) {
+            stack.pop_frame();
+            return Err(e);
+        }
+    } else {
+        bind_params(&entry, frame, args);
+    }
     let env_frame = make_env_frame(&entry, args, Rc::clone(&env.frame));
     let entry_obj = Some(entry_fn_val)
         .filter(|&v| bliss_rt::function::is_interpreted_function(v));
@@ -3657,7 +3825,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
 
                 // Bytecode callee → native frame on the BlissStack.
                 if let Some(callee) = registry_get(sym) {
-                    if callee.arity == nargs {
+                    if arity_accepts(&callee, nargs as usize) {
                         // T1: installed native code → call via the i2c adapter.
                         // Unified tiering (bliss-jtc.3): the function object's
                         // FnMeta is the single tiering record — invoke counter
@@ -3726,7 +3894,15 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                                 continue;
                             }
                         };
-                        bind_params(&callee, frame, &args);
+                        if callee.variadic {
+                            if let Err(e) = bind_variadic(&callee, frame, &args, env) {
+                                stack.pop_frame();
+                                initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
+                                continue;
+                            }
+                        } else {
+                            bind_params(&callee, frame, &args);
+                        }
                         let env_frame = make_env_frame(&callee, &args, Rc::clone(&env.frame));
                         acts.push(Activation {
                             frame,
@@ -4366,7 +4542,7 @@ extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     // STORAGE-CONDITION instead of a native stack overflow. Non-bytecode callees
     // (builtins, generics, closures, arity mismatches) still go via apply_function.
     let result = match registry_get(sym32) {
-        Some(callee) if callee.arity == n as u16 => {
+        Some(callee) if arity_accepts(&callee, n as usize) => {
             // bliss-x5y.8: if the callee is itself installed as native code and
             // we are under the native depth cap, call its native entry directly
             // (native → native) instead of rebuilding a full T0 `run()`
@@ -4762,8 +4938,20 @@ fn run_native(
             FLAG_CALL,
         )
         .ok_or_else(|| BlissError::StackOverflow(bliss_rt::current_thread_id()))?;
-    for (i, a) in args.iter().enumerate() {
-        unsafe { slot_set(frame, i as u16, *a) };
+    // A variadic function binds &optional/&rest/&key into slots via the shared
+    // binder (x5y.7); a native variadic function never has boxed params (those
+    // decline native), so slot binding is complete. Fixed functions bind
+    // positionally.
+    let bf = registry_get(sym);
+    if let Some(bf) = bf.as_ref().filter(|b| b.variadic) {
+        if let Err(e) = bind_variadic(bf, frame, args, env) {
+            stack.pop_frame();
+            return Err(e);
+        }
+    } else {
+        for (i, a) in args.iter().enumerate() {
+            unsafe { slot_set(frame, i as u16, *a) };
+        }
     }
     let slots = unsafe { frame.add(1) as *mut u64 };
 
