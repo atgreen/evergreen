@@ -23,31 +23,50 @@
 //!   model. We emit defs first, then uses, and rely on that order to line the
 //!   result `Allocation`s back up (`Output::inst_allocs` is operand-parallel).
 //!
-//! ## Single-block limitation (documented contract gap)
+//! ## Block CFG (P6b) — the real multi-block model
 //!
-//! The frozen `MachFunc` exposes a **flat `insts: Vec<MachInst>`** with no block
-//! structure, successors, predecessors, or block params. regalloc2 is a
-//! CFG-aware allocator whose `Function` trait is built around basic blocks, so
-//! for this first cut we model the whole function as a **single basic block**:
-//! `num_blocks() == 1`, no succs/preds/params, and the **last instruction is
-//! reported as the return** (regalloc2 requires every block to end in a
-//! branch/ret). Consequences:
+//! `MachFunc` now carries a machine-block CFG in `mf.blocks` (mach.rs): a
+//! `Vec<MachBlock>` where `blocks[0]` is the entry, each block is an
+//! `[start, end)` half-open range into `mf.insts`, and edges are `MachSucc`
+//! records (target block + the VReg args bound to that target's params). We map
+//! it onto regalloc2's `Function` CFG directly:
 //!
-//! * Inputs must be SSA-shaped within that block — every use dominated by its
-//!   def — which is exactly what lowering (P5) produces for straight-line code.
-//!   A use with no prior def would be a block live-in, which regalloc2 rejects
-//!   (`RegAllocError::EntryLivein`).
-//! * There is no control flow, so no φ/blockparam handling and no cross-block
-//!   spilling decisions.
+//! * **`num_blocks` / `block_insns`.** One regalloc2 block per `MachBlock`;
+//!   `block_insns(b)` is `[MachBlock.start, MachBlock.end)`.
+//! * **`block_params`.** `MachBlock.params` (VRegs) become regalloc2 block
+//!   params — its SSA-φ replacement. A value that arrives on an incoming edge is
+//!   *defined* by being a block param, so it is live-in **by construction**, not
+//!   a use-before-def. This is what makes branching and looping code (back-edges
+//!   into a loop-header block param) allocate correctly.
+//! * **`block_succs` / `block_preds`.** Successors come from `MachSucc.target`;
+//!   predecessors are the inverted edge set, computed once at build time.
+//! * **`branch_blockparams`.** The outgoing edge args (`MachSucc.args`) for the
+//!   `succ_idx`-th successor, interned to regalloc2 vregs. Their count matches
+//!   the successor's `block_params` count (φ operand parallelism).
+//! * **`is_branch` / `is_ret`.** The terminator of each block is its last
+//!   instruction (`end - 1`). A block **with** successors ends in a branch; a
+//!   block **without** successors ends in a return.
 //!
-//! A **real block-CFG on `MachFunc`** would be a follow-up contract addition:
-//! `MachFunc` needs an explicit block list (each an inst range), per-block
-//! successor/predecessor edges, block-parameter vregs (the SSA φ replacement
-//! regalloc2 uses at merges), and branch instructions carrying their outgoing
-//! blockparam args. `inst_operands`, `is_branch`, `is_ret`, and
-//! `branch_blockparams` would then be driven by that structure instead of the
-//! single-block stub here. Critical edges would also need splitting before
-//! allocation.
+//! ### Critical edges
+//!
+//! regalloc2 rejects unsplit critical edges (a block with >1 successor feeding a
+//! block with >1 predecessor) with `RegAllocError::CritEdge`. This adapter
+//! **asserts none remain**: splitting is the lowering (P5) contract, and a
+//! debug build `debug_assert!`s if a critical edge is detected before we run
+//! (regalloc2 independently rejects any that slip past in release). A plain
+//! diamond (entry→{L,R}→merge) has no critical edges, so it allocates directly.
+//! Relatedly, when a successor has multiple predecessors the branch feeding it
+//! must carry *no* register operands of its own (only blockparam args); our
+//! terminators are pure branches, satisfying regalloc2's `DisallowedBranchArg`
+//! rule.
+//!
+//! ### Empty-blocks fallback (older flat lowering)
+//!
+//! If `mf.blocks` is **empty** (a lowering that has not yet block-structured its
+//! output), we fall back to the original single-basic-block model: one block
+//! spanning all of `mf.insts`, no params/succs/preds, and the last instruction
+//! reported as the return. Straight-line SSA input allocates exactly as before,
+//! so nothing regresses.
 //!
 //! ## Stack maps (documented contract gap)
 //!
@@ -144,9 +163,10 @@ fn machine_env() -> MachineEnv {
     }
 }
 
-/// regalloc2 `Function` adapter over a `MachFunc`, modelled as a single basic
-/// block (see module docs). Owns its interned operand tables so it does not
-/// borrow the `MachFunc` during allocation.
+/// regalloc2 `Function` adapter over a `MachFunc`. Drives the CFG from
+/// `mf.blocks` when present, falling back to a single basic block over all of
+/// `mf.insts` when `mf.blocks` is empty (see module docs). Owns its interned
+/// operand/CFG tables so it does not borrow the `MachFunc` during allocation.
 struct Adapter {
     num_insts: usize,
     num_vregs: usize,
@@ -154,8 +174,19 @@ struct Adapter {
     operands: Vec<Vec<Operand>>,
     /// Dense regalloc2 vreg index → our VReg.
     reverse: Vec<VReg>,
-    /// Index of the instruction reported as the block's return.
-    ret_inst: usize,
+    /// `[start, end)` inst range per block.
+    block_ranges: Vec<(usize, usize)>,
+    /// regalloc2 block params per block (interned `MachBlock.params`).
+    block_params: Vec<Vec<Ra2VReg>>,
+    /// Successor blocks per block.
+    block_succs: Vec<Vec<Block>>,
+    /// Predecessor blocks per block (inverted edge set).
+    block_preds: Vec<Vec<Block>>,
+    /// Outgoing blockparam args per block, indexed `[block][succ_idx]`.
+    branch_args: Vec<Vec<Vec<Ra2VReg>>>,
+    /// Per-instruction terminator flags (length `num_insts`).
+    is_branch: Vec<bool>,
+    is_ret: Vec<bool>,
 }
 
 impl Adapter {
@@ -183,13 +214,99 @@ impl Adapter {
             operands.push(ops);
         }
 
+        let num_insts = mf.insts.len();
+        let mut is_branch = vec![false; num_insts];
+        let mut is_ret = vec![false; num_insts];
+
+        let (block_ranges, block_params, block_succs, branch_args) = if mf.blocks.is_empty() {
+            // ── Fallback: whole function as one basic block over all insts. ──
+            let ret_inst = num_insts.saturating_sub(1);
+            if num_insts > 0 {
+                is_ret[ret_inst] = true;
+            }
+            (
+                vec![(0, num_insts)],
+                vec![Vec::new()],
+                vec![Vec::new()],
+                vec![Vec::new()],
+            )
+        } else {
+            // ── Real block CFG driven by mf.blocks. ──────────────────────────
+            let nb = mf.blocks.len();
+            let mut ranges = Vec::with_capacity(nb);
+            let mut params = Vec::with_capacity(nb);
+            let mut succs: Vec<Vec<Block>> = Vec::with_capacity(nb);
+            let mut args: Vec<Vec<Vec<Ra2VReg>>> = Vec::with_capacity(nb);
+
+            for b in &mf.blocks {
+                ranges.push((b.start, b.end));
+                params.push(b.params.iter().map(|&v| intern(v)).collect());
+
+                let mut this_succs = Vec::with_capacity(b.succs.len());
+                let mut this_args = Vec::with_capacity(b.succs.len());
+                for s in &b.succs {
+                    this_succs.push(Block::new(s.target.0 as usize));
+                    this_args.push(s.args.iter().map(|&v| intern(v)).collect());
+                }
+                succs.push(this_succs);
+                args.push(this_args);
+
+                // Terminator = last inst of the block. Branch if it has
+                // successors, otherwise a return.
+                if b.end > b.start {
+                    let term = b.end - 1;
+                    if b.succs.is_empty() {
+                        is_ret[term] = true;
+                    } else {
+                        is_branch[term] = true;
+                    }
+                }
+            }
+
+            (ranges, params, succs, args)
+        };
+
+        // Invert the successor edges to get predecessors.
+        let nb = block_ranges.len();
+        let mut block_preds: Vec<Vec<Block>> = vec![Vec::new(); nb];
+        for (b, s) in block_succs.iter().enumerate() {
+            for &succ in s {
+                block_preds[succ.index()].push(Block::new(b));
+            }
+        }
+
         Adapter {
-            num_insts: mf.insts.len(),
+            num_insts,
             num_vregs: reverse.len(),
             operands,
             reverse,
-            ret_inst: mf.insts.len().saturating_sub(1),
+            block_ranges,
+            block_params,
+            block_succs,
+            block_preds,
+            branch_args,
+            is_branch,
+            is_ret,
         }
+    }
+
+    /// Detect an unsplit critical edge: a block with >1 successor feeding a
+    /// block with >1 predecessor. Splitting them is lowering's contract; this
+    /// only reports so `allocate` can `debug_assert`.
+    fn has_critical_edge(&self) -> Option<(usize, usize)> {
+        for (b, succs) in self.block_succs.iter().enumerate() {
+            if succs.len() <= 1 {
+                continue;
+            }
+            for &succ in succs {
+                // Entry block has an implicit extra predecessor.
+                let extra = usize::from(succ.index() == 0);
+                if self.block_preds[succ.index()].len() + extra > 1 {
+                    return Some((b, succ.index()));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -199,39 +316,40 @@ impl Ra2Function for Adapter {
     }
 
     fn num_blocks(&self) -> usize {
-        1
+        self.block_ranges.len()
     }
 
     fn entry_block(&self) -> Block {
         Block::new(0)
     }
 
-    fn block_insns(&self, _block: Block) -> InstRange {
-        InstRange::new(Ra2Inst::new(0), Ra2Inst::new(self.num_insts))
+    fn block_insns(&self, block: Block) -> InstRange {
+        let (start, end) = self.block_ranges[block.index()];
+        InstRange::new(Ra2Inst::new(start), Ra2Inst::new(end))
     }
 
-    fn block_succs(&self, _block: Block) -> &[Block] {
-        &[]
+    fn block_succs(&self, block: Block) -> &[Block] {
+        &self.block_succs[block.index()]
     }
 
-    fn block_preds(&self, _block: Block) -> &[Block] {
-        &[]
+    fn block_preds(&self, block: Block) -> &[Block] {
+        &self.block_preds[block.index()]
     }
 
-    fn block_params(&self, _block: Block) -> &[Ra2VReg] {
-        &[]
+    fn block_params(&self, block: Block) -> &[Ra2VReg] {
+        &self.block_params[block.index()]
     }
 
     fn is_ret(&self, insn: Ra2Inst) -> bool {
-        insn.index() == self.ret_inst
+        self.is_ret[insn.index()]
     }
 
-    fn is_branch(&self, _insn: Ra2Inst) -> bool {
-        false
+    fn is_branch(&self, insn: Ra2Inst) -> bool {
+        self.is_branch[insn.index()]
     }
 
-    fn branch_blockparams(&self, _block: Block, _insn: Ra2Inst, _succ_idx: usize) -> &[Ra2VReg] {
-        &[]
+    fn branch_blockparams(&self, block: Block, _insn: Ra2Inst, succ_idx: usize) -> &[Ra2VReg] {
+        &self.branch_args[block.index()][succ_idx]
     }
 
     fn inst_operands(&self, insn: Ra2Inst) -> &[Operand] {
@@ -266,12 +384,22 @@ pub fn allocate(mf: &mut MachFunc) {
     }
 
     let adapter = Adapter::build(mf);
+
+    // Critical edges must be pre-split by lowering (see module docs). Report
+    // loudly in debug; regalloc2 independently returns `CritEdge` otherwise.
+    debug_assert!(
+        adapter.has_critical_edge().is_none(),
+        "unsplit critical edge {:?}; lowering (P5) must split it",
+        adapter.has_critical_edge()
+    );
+
     let env = machine_env();
     let options = RegallocOptions {
         verbose_log: false,
-        // The single-block model does not build the block params / edge splits
-        // the SSA validator expects; lowering (P5) is responsible for producing
-        // SSA-shaped straight-line code.
+        // Inputs are already SSA-shaped (lowering's contract): a single def per
+        // vreg, block params standing in for φ at merges. We leave the extra SSA
+        // validator pass off to match the original behaviour and avoid rejecting
+        // valid-but-unconventional hand-built MachFuncs.
         validate_ssa: false,
         algorithm: Algorithm::Ion,
     };
@@ -345,7 +473,7 @@ pub fn allocate(mf: &mut MachFunc) {
 mod tests {
     use super::*;
     use crate::t2::frame_state::FrameStateId;
-    use crate::t2::mach::MachInst;
+    use crate::t2::mach::{MachBlock, MachBlockId, MachInst, MachSucc};
 
     fn vreg(class: RegClass, num: u32) -> VReg {
         VReg { class, num }
@@ -437,5 +565,124 @@ mod tests {
         allocate(&mut mf);
         assert!(mf.allocation.is_empty());
         assert!(mf.stack_maps.is_empty());
+    }
+
+    /// A diamond CFG with a merge block that has a parameter VReg:
+    ///
+    /// ```text
+    ///        entry (b0): def g0; branch
+    ///        /                 \
+    ///   left (b1)          right (b2)
+    ///   def gL; br(gL)     def gR; br(gR)
+    ///        \                 /
+    ///        merge (b3): param gm
+    ///        safepoint(uses g0, gm); ret(gm)
+    /// ```
+    ///
+    /// No critical edges (each of b1/b2 has one pred and one succ), so it
+    /// allocates directly. gm arrives only via the incoming edge args, exercising
+    /// block-param liveness. The safepoint must yield one StackMap.
+    fn diamond() -> MachFunc {
+        let g0 = vreg(RegClass::Gpr, 0);
+        let gl = vreg(RegClass::Gpr, 1);
+        let gr = vreg(RegClass::Gpr, 2);
+        let gm = vreg(RegClass::Gpr, 3);
+
+        // Terminator branches carry no register operands of their own — their
+        // edge args travel via MachSucc.args / branch_blockparams.
+        let br = || inst(100, vec![], vec![]);
+
+        let safepoint = MachInst {
+            op: 3,
+            defs: vec![],
+            uses: vec![g0, gm],
+            frame_state: Some(FrameStateId(11)),
+            safepoint: true,
+        };
+
+        MachFunc {
+            insts: vec![
+                inst(1, vec![g0], vec![]), // 0: b0 def g0
+                br(),                      // 1: b0 branch
+                inst(2, vec![gl], vec![]), // 2: b1 def gL
+                br(),                      // 3: b1 branch -> merge(gL)
+                inst(2, vec![gr], vec![]), // 4: b2 def gR
+                br(),                      // 5: b2 branch -> merge(gR)
+                safepoint,                 // 6: b3 safepoint (use g0, gm)
+                inst(0, vec![], vec![gm]), // 7: b3 ret (use gm)
+            ],
+            blocks: vec![
+                MachBlock {
+                    params: vec![],
+                    start: 0,
+                    end: 2,
+                    succs: vec![
+                        MachSucc { target: MachBlockId(1), args: vec![] },
+                        MachSucc { target: MachBlockId(2), args: vec![] },
+                    ],
+                },
+                MachBlock {
+                    params: vec![],
+                    start: 2,
+                    end: 4,
+                    succs: vec![MachSucc { target: MachBlockId(3), args: vec![gl] }],
+                },
+                MachBlock {
+                    params: vec![],
+                    start: 4,
+                    end: 6,
+                    succs: vec![MachSucc { target: MachBlockId(3), args: vec![gr] }],
+                },
+                MachBlock {
+                    params: vec![gm],
+                    start: 6,
+                    end: 8,
+                    succs: vec![],
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn diamond_allocates_block_param_and_all_vregs() {
+        let mut mf = diamond();
+        allocate(&mut mf);
+
+        let map: HashMap<VReg, Location> = mf.allocation.iter().copied().collect();
+
+        // Every VReg — including the merge block param gm — is bound to a
+        // class-appropriate location.
+        for v in [
+            vreg(RegClass::Gpr, 0),
+            vreg(RegClass::Gpr, 1),
+            vreg(RegClass::Gpr, 2),
+            vreg(RegClass::Gpr, 3),
+        ] {
+            let loc = map
+                .get(&v)
+                .unwrap_or_else(|| panic!("vreg {v:?} unallocated"));
+            if let Location::Register(preg) = loc {
+                assert_eq!(preg.class, v.class, "class mismatch for {v:?}");
+            }
+        }
+        assert_eq!(map.len(), mf.allocation.len(), "duplicate allocation entry");
+    }
+
+    #[test]
+    fn diamond_safepoint_yields_a_stack_map() {
+        let mut mf = diamond();
+        allocate(&mut mf);
+
+        assert_eq!(mf.stack_maps.len(), 1, "one safepoint => one stack map");
+        let sm = &mf.stack_maps[0];
+        assert_eq!(sm.frame_state, Some(FrameStateId(11)));
+        // The safepoint's two Gpr uses (g0, gm) are recorded as live refs.
+        assert_eq!(sm.live_refs.len(), 2, "both live Gpr refs recorded");
+        for loc in &sm.live_refs {
+            if let Location::Register(preg) = loc {
+                assert_eq!(preg.class, RegClass::Gpr);
+            }
+        }
     }
 }

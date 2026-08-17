@@ -10,7 +10,10 @@
 //!
 //! ## What this pass does
 //!
-//! * Walks blocks in **layout order** (`Function::block_order`).
+//! * Walks blocks in **layout order** (`Function::block_order`), emitting each
+//!   IR block's instructions contiguously into the flat `insts` vector and
+//!   recording a parallel [`MachBlock`] whose `[start,end)` covers them (P5b).
+//!   `blocks[i]` corresponds to `block_order[i]`; `blocks[0]` is the IR entry.
 //! * Maps every SSA [`Value`] to a [`VReg`] whose [`RegClass`] follows the
 //!   value's [`ValueRepresentation`] (`Tagged`/`UnboxedFixnum` → `Gpr`;
 //!   `UnboxedF32`/`UnboxedF64` → `Xmm`). The VReg number is the value's arena
@@ -18,8 +21,13 @@
 //! * Selects one or a short sequence of [`MachInst`]s per IR instruction via a
 //!   maximal-munch-flavoured `match` (spec §4.7.2). Compares expand to a
 //!   flag-setting `CMP`/`UCOMISD` + a `SETcc` materialising the boolean.
-//! * Models block parameters + [`BlockCall`] args as **parallel-move**
-//!   `MachInst`s emitted on the edge, just before the terminator.
+//! * Models block parameters + [`BlockCall`] args **two ways** (P5b): the
+//!   authoritative out-of-SSA form is now [`MachSucc::args`] on each CFG edge
+//!   (regalloc2 / P6b turns block-param args into moves). For backward
+//!   compatibility we *also* still emit the inline parallel-move `MachInst`s just
+//!   before the terminator; a later parcel can drop the explicit moves once P6b
+//!   consumes `MachSucc::args` directly. The two encodings are redundant but
+//!   consistent — both name the same (param ← arg) VReg pairs.
 //! * Carries the `FrameStateId` and safepoint bit of any guarding / safepointing
 //!   IR instruction onto the emitted `MachInst`, so P6 can pin the frame-state
 //!   locations and record the GC stack map (spec §4.10 R4.65, §4.7 R4.46).
@@ -33,11 +41,14 @@
 //!   distinct `SETE`/`SETL` opcodes). Constant immediates and memory
 //!   displacements have nowhere to live on `MachInst`, so they are implied by
 //!   the mnemonic and the (single) def; a real emitter needs an immediate field.
-//! * `MachInst` has no successor/`MachBlock` linkage (spec §4.7.2 wants a
-//!   doubly-linked `MachBlock` list). Block boundaries are implicit in the flat
-//!   `insts` vector; branch targets are not represented, only the branch
-//!   mnemonic + condition use. P6/emit will need block structure added to the
-//!   frozen type or a side table.
+//! * Block structure now lives in `MachFunc::blocks` (P5b): each [`MachBlock`]
+//!   carries its `[start,end)` inst range, param VRegs, and `succs` edges with
+//!   per-edge VReg args. Individual `MachInst`s still have no successor field,
+//!   so the branch *mnemonic* (`JMP`/`BR_COND`/`BR_TABLE`) records only the
+//!   condition use; the actual targets are on the owning block's `succs`, in
+//!   `Function::block_order` position order. The terminator's `targets[k]` maps
+//!   1:1 to `succs[k]`, so P6/emit can recover which mnemonic operand selects
+//!   which successor edge.
 //! * Parallel moves are lowered **sequentially** (no cycle breaking / temp
 //!   insertion) and edge moves for the two-way `Brif` / `BrTable` are emitted
 //!   before the branch without **critical-edge splitting**. Both are only
@@ -46,7 +57,7 @@
 //!   handling. Documented rather than solved because it needs new CFG surface.
 
 use crate::t2::ir::{Function, Inst, Opcode, Value, ValueRepresentation};
-use crate::t2::mach::{MachFunc, MachInst, RegClass, VReg};
+use crate::t2::mach::{MachBlock, MachBlockId, MachFunc, MachInst, MachSucc, RegClass, VReg};
 
 /// Backend mnemonic tags encoded into [`MachInst::op`]. The concrete `u32`
 /// values are arbitrary but stable; grouped by high nibble for readability.
@@ -249,8 +260,25 @@ impl<'f> Lowering<'f> {
 /// safepoint annotations for P6.
 pub fn lower(f: &Function) -> MachFunc {
     let mut lo = Lowering::new(f);
+    let order = f.block_order();
 
-    for &block in f.block_order() {
+    // IR `Block` → `MachBlockId`. Because we emit one `MachBlock` per IR block in
+    // layout order, the MachBlockId of a block is its position in `block_order`.
+    // A block not in the layout (only possible in malformed IR) maps to u32::MAX;
+    // that is a P2 verifier finding, so we record the sentinel rather than panic.
+    let mut mach_id = vec![u32::MAX; f.num_blocks()];
+    for (i, &b) in order.iter().enumerate() {
+        mach_id[b.index()] = i as u32;
+    }
+
+    let mut blocks: Vec<MachBlock> = Vec::with_capacity(order.len());
+
+    for &block in order {
+        let start = lo.insts.len();
+        // Block parameters become this block's `MachBlock::params` (regalloc2's
+        // φ replacement). VReg number = the param SSA value's arena index.
+        let params = lo.vregs(&f.block(block).params);
+
         // Instructions in program order; the last is the terminator (if the
         // block is finished — an unfinished block just has no terminator).
         for &inst in &f.block(block).insts {
@@ -261,11 +289,28 @@ pub fn lower(f: &Function) -> MachFunc {
                 lower_inst(&mut lo, inst);
             }
         }
+        let end = lo.insts.len();
+
+        // One `MachSucc` per terminator `BlockCall`: target = the successor's
+        // MachBlockId, args = the VRegs of the BlockCall args (bound to the
+        // target block's params on this edge). `targets[k]` ↔ `succs[k]`.
+        let succs: Vec<MachSucc> = match f.terminator(block) {
+            Some(t) => f
+                .inst(t)
+                .targets
+                .iter()
+                .map(|c| MachSucc {
+                    target: MachBlockId(mach_id[c.block.index()]),
+                    args: lo.vregs(&c.args),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        blocks.push(MachBlock { params, start, end, succs });
     }
 
-    // `blocks` is populated by the block-CFG lowering upgrade (P5b); the flat
-    // `insts` view keeps the straight-line path working until then.
-    MachFunc { insts: lo.insts, blocks: Vec::new(), allocation: Vec::new(), stack_maps: Vec::new() }
+    MachFunc { insts: lo.insts, blocks, allocation: Vec::new(), stack_maps: Vec::new() }
 }
 
 /// Select a non-terminator IR instruction (spec §4.7.2 maximal munch).
@@ -621,5 +666,148 @@ mod tests {
         f.set_terminator(entry, inst(Opcode::Return, vec![c[0]], AuxData::None));
         let mf = lower(&f);
         assert!(mf.insts.iter().all(|m| m.op != op::PSEUDO_UNSUPPORTED));
+    }
+
+    /// Is `op` a block-ending branch/return MachInst mnemonic?
+    fn is_block_terminator(op: u32) -> bool {
+        matches!(
+            op,
+            op::JMP
+                | op::BR_COND
+                | op::BR_TABLE
+                | op::RET
+                | op::TAILCALL
+                | op::THROW
+                | op::NLX_TRANSFER
+                | op::TRAP
+        )
+    }
+
+    #[test]
+    fn straight_line_yields_exactly_one_block() {
+        // const + add + return in the entry block: a single MachBlock covering
+        // the whole flat inst list, no params, no successors.
+        let mut f = Function::new("straight");
+        let entry = f.entry();
+        let (_, a) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(2)), &[ufix()]);
+        let (_, b) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(3)), &[ufix()]);
+        let (_, c) = f.push_inst(
+            entry,
+            inst(Opcode::FixnumAdd, vec![a[0], b[0]], AuxData::None),
+            &[ufix()],
+        );
+        f.set_terminator(entry, inst(Opcode::Return, vec![c[0]], AuxData::None));
+
+        let mf = lower(&f);
+        assert_eq!(mf.blocks.len(), 1, "straight-line function is one MachBlock");
+        let blk = &mf.blocks[0];
+        assert_eq!(blk.start, 0);
+        assert_eq!(blk.end, mf.insts.len(), "block covers the whole inst list");
+        assert!(blk.params.is_empty(), "entry has no block parameters here");
+        assert!(blk.succs.is_empty(), "a returning block has no successors");
+        // The block ends in a return-shaped MachInst.
+        assert!(is_block_terminator(mf.insts[blk.end - 1].op));
+        assert_eq!(mf.insts[blk.end - 1].op, op::RET);
+    }
+
+    #[test]
+    fn branch_merge_lowers_to_block_cfg() {
+        // Diamond:
+        //   entry: cond, x=10, y=20 ; brif cond -> [left, right]
+        //   left:  jump merge(x)
+        //   right: jump merge(y)
+        //   merge(p): return p
+        let mut f = Function::new("diamond");
+        let entry = f.entry();
+        let left = f.make_block();
+        let right = f.make_block();
+        let merge = f.make_block();
+        let p = f.add_block_param(
+            merge,
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        );
+
+        let (_, cond) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)), &[ufix()]);
+        let (_, x) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(10)), &[ufix()]);
+        let (_, y) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(20)), &[ufix()]);
+        let mut brif = inst(Opcode::Brif, vec![cond[0]], AuxData::None);
+        brif.targets = vec![
+            BlockCall { block: left, args: vec![] },
+            BlockCall { block: right, args: vec![] },
+        ];
+        f.set_terminator(entry, brif);
+
+        let mut ljmp = inst(Opcode::Jump, vec![], AuxData::None);
+        ljmp.targets = vec![BlockCall { block: merge, args: vec![x[0]] }];
+        f.set_terminator(left, ljmp);
+
+        let mut rjmp = inst(Opcode::Jump, vec![], AuxData::None);
+        rjmp.targets = vec![BlockCall { block: merge, args: vec![y[0]] }];
+        f.set_terminator(right, rjmp);
+
+        f.set_terminator(merge, inst(Opcode::Return, vec![p], AuxData::None));
+
+        let mf = lower(&f);
+
+        // Four IR blocks → four MachBlocks, in layout order; ≥3 as required.
+        assert!(mf.blocks.len() >= 3, "branch/merge yields at least 3 blocks");
+        assert_eq!(mf.blocks.len(), 4);
+
+        // Ranges partition the flat inst list contiguously and each block ends in
+        // a branch/return MachInst.
+        assert_eq!(mf.blocks[0].start, 0, "blocks[0] is the entry, starts at 0");
+        assert_eq!(mf.blocks.last().unwrap().end, mf.insts.len());
+        for (i, blk) in mf.blocks.iter().enumerate() {
+            assert!(blk.start < blk.end, "block {i} is non-empty");
+            if i + 1 < mf.blocks.len() {
+                assert_eq!(blk.end, mf.blocks[i + 1].start, "blocks are contiguous");
+            }
+            assert!(
+                is_block_terminator(mf.insts[blk.end - 1].op),
+                "block {i} ends in a branch/return MachInst"
+            );
+        }
+
+        let (mb_entry, mb_left, mb_right, mb_merge) =
+            (&mf.blocks[0], &mf.blocks[1], &mf.blocks[2], &mf.blocks[3]);
+
+        // The merge block carries the block param VReg.
+        assert_eq!(mb_merge.params.len(), 1);
+        assert_eq!(mb_merge.params[0].num, p.0, "merge param is p's vreg");
+        assert_eq!(mb_merge.params[0].class, RegClass::Gpr);
+
+        // Entry has two successors (left, right) with no edge args; targets map
+        // 1:1 to succs, so MachBlockIds are the layout positions 1 and 2.
+        assert_eq!(mb_entry.succs.len(), 2);
+        assert_eq!(mb_entry.succs[0].target, MachBlockId(1));
+        assert_eq!(mb_entry.succs[1].target, MachBlockId(2));
+        assert!(mb_entry.succs[0].args.is_empty());
+        assert!(mb_entry.succs[1].args.is_empty());
+
+        // Predecessors of the merge each have one successor edge into merge
+        // (MachBlockId 3) whose args carry the right source VReg.
+        assert_eq!(mb_left.succs.len(), 1);
+        assert_eq!(mb_left.succs[0].target, MachBlockId(3));
+        assert_eq!(mb_left.succs[0].args.len(), 1);
+        assert_eq!(mb_left.succs[0].args[0].num, x[0].0, "left edge carries x");
+
+        assert_eq!(mb_right.succs.len(), 1);
+        assert_eq!(mb_right.succs[0].target, MachBlockId(3));
+        assert_eq!(mb_right.succs[0].args.len(), 1);
+        assert_eq!(mb_right.succs[0].args[0].num, y[0].0, "right edge carries y");
+
+        // The merge (returning) block has no successors.
+        assert!(mb_merge.succs.is_empty());
+
+        // Backward-compat: the inline edge moves are still emitted (p <- x in the
+        // left block, p <- y in the right block), preceding each JMP.
+        let left_moves: Vec<&MachInst> = mf.insts[mb_left.start..mb_left.end]
+            .iter()
+            .filter(|m| m.op == op::MOV)
+            .collect();
+        assert_eq!(left_moves.len(), 1);
+        assert_eq!(left_moves[0].defs[0].num, p.0);
+        assert_eq!(left_moves[0].uses[0].num, x[0].0);
     }
 }
