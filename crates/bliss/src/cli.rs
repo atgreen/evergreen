@@ -6784,11 +6784,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut test = bliss_stdlib::HashTest::Eql;
                 let mut c = cdr;
                 while c.is_cons() {
-                    let (kw, r) = cp(c);
+                    let (kw_form, r) = cp(c);
                     if !r.is_cons() {
                         break;
                     }
                     let (vf, r2) = cp(r);
+                    // Evaluate the keyword too: called directly the keyword is a
+                    // self-evaluating symbol, but reached through apply_function's
+                    // synthesize path (funcall/apply/bytecode CallNamed) every
+                    // argument arrives quoted as `(quote :test)` (bliss-x5y.2).
+                    let kw = eval_form(kw_form, env)?;
                     let v = eval_form(vf, env)?;
                     if kw.is_symbol() {
                         let kn = sym_name(kw);
@@ -6825,6 +6830,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 let (val, present) = bliss_stdlib::gethash(key, tbl, default)?;
                 env.set_mv(vec![val, if present { T } else { NIL }]);
+                return Ok(val);
+            }
+            "BLISS::PUT-GETHASH" => {
+                // Store primitive for bytecode-lowered `(setf (gethash key table)
+                // value)` (bliss-x5y.2). Arguments arrive already evaluated —
+                // value, key, table, in the SETF handler's value-first order —
+                // through apply_function's synthesize path. Returns the value.
+                let (val_form, r) = cp(cdr);
+                let (key_form, r2) = cp(r);
+                let (tbl_form, _) = cp(r2);
+                let val = eval_form(val_form, env)?;
+                let key = eval_form(key_form, env)?;
+                let tbl = eval_form(tbl_form, env)?;
+                bliss_stdlib::set_gethash(key, tbl, val)?;
                 return Ok(val);
             }
             "REMHASH" => {

@@ -394,7 +394,17 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
     "PATHNAME",
     "NAMESTRING",
     "PROVIDE",
+    // Hash tables (bliss-x5y.2): ordinary functions dispatched through
+    // apply_function's synthesize path. GETHASH reads; the (setf gethash) store
+    // is lowered directly to BLISS::PUT-GETHASH by lower_setf. MAKE-HASH-TABLE's
+    // &key args pass positionally and are parsed by the callee. (Only the ops that
+    // are actually implemented in the interpreter are listed; CLRHASH /
+    // HASH-TABLE-P / HASH-TABLE-KEYS are not yet functions, so they keep bailing.)
     "GETHASH",
+    "MAKE-HASH-TABLE",
+    "REMHASH",
+    "MAPHASH",
+    "HASH-TABLE-COUNT",
     "GENSYM",
     "MAKE-SYMBOL",
     "SYMBOL-NAME",
@@ -1182,43 +1192,51 @@ impl<'e> Lowerer<'e> {
             if !var.is_symbol() {
                 return Err(Bail);
             }
-            let name = sym_name(var);
-            // A symbol-macro `setq` is really a `setf` of the expansion — bail.
-            if self.env.symbol_macros.contains_key(&var.as_symbol_index()) {
-                return Err(Bail);
-            }
             let last = i + 1 == npairs;
             self.lower_expr(val)?; // +1
-            match self.lookup_local(&name) {
-                Some(VarLoc::Slot(slot)) => {
-                    self.emit(Instr::StoreLocal(slot));
-                    self.pop_n(1);
-                    // SETQ is not multiple-value-preserving.
-                    self.emit(Instr::ClearMv);
-                    if last {
-                        self.emit(Instr::LoadLocal(slot));
-                        self.push_n(1);
-                    }
+            self.store_to_symbol_place(var, last)?;
+        }
+        Ok(())
+    }
+
+    /// Store the value on top of the operand stack into a symbol place (local
+    /// slot, boxed env var, or global), clearing multiple values. If `last`, the
+    /// stored value is reloaded so SETQ/SETF leaves it on the stack as the result;
+    /// otherwise the stack is left one shorter. Bails on a symbol-macro place
+    /// (that is really a SETF of the expansion).
+    fn store_to_symbol_place(&mut self, var: BlissVal, last: bool) -> LowerResult<()> {
+        if self.env.symbol_macros.contains_key(&var.as_symbol_index()) {
+            return Err(Bail);
+        }
+        let name = sym_name(var);
+        match self.lookup_local(&name) {
+            Some(VarLoc::Slot(slot)) => {
+                self.emit(Instr::StoreLocal(slot));
+                self.pop_n(1);
+                self.emit(Instr::ClearMv);
+                if last {
+                    self.emit(Instr::LoadLocal(slot));
+                    self.push_n(1);
                 }
-                Some(VarLoc::Boxed) => {
-                    let ni = self.intern_name(&name);
-                    self.emit(Instr::StoreEnvVar(ni));
-                    self.pop_n(1);
-                    self.emit(Instr::ClearMv);
-                    if last {
-                        self.emit(Instr::LoadEnvVar(ni));
-                        self.push_n(1);
-                    }
+            }
+            Some(VarLoc::Boxed) => {
+                let ni = self.intern_name(&name);
+                self.emit(Instr::StoreEnvVar(ni));
+                self.pop_n(1);
+                self.emit(Instr::ClearMv);
+                if last {
+                    self.emit(Instr::LoadEnvVar(ni));
+                    self.push_n(1);
                 }
-                None => {
-                    let sym = var.as_symbol_index();
-                    self.emit(Instr::StoreGlobal(sym));
-                    self.pop_n(1);
-                    self.emit(Instr::ClearMv);
-                    if last {
-                        self.emit(Instr::LoadGlobal(sym));
-                        self.push_n(1);
-                    }
+            }
+            None => {
+                let sym = var.as_symbol_index();
+                self.emit(Instr::StoreGlobal(sym));
+                self.pop_n(1);
+                self.emit(Instr::ClearMv);
+                if last {
+                    self.emit(Instr::LoadGlobal(sym));
+                    self.push_n(1);
                 }
             }
         }
@@ -1236,16 +1254,59 @@ impl<'e> Lowerer<'e> {
         if items.len() % 2 != 0 {
             return Err(Bail);
         }
-        let mut i = 0;
-        while i < items.len() {
-            if !items[i].is_symbol() {
+        if items.is_empty() {
+            let c = self.add_const(NIL);
+            self.emit(Instr::Const(c));
+            self.push_n(1);
+            return Ok(());
+        }
+        let npairs = items.len() / 2;
+        for i in 0..npairs {
+            let place = items[2 * i];
+            let val = items[2 * i + 1];
+            let last = i + 1 == npairs;
+            if place.is_symbol() {
+                // Symbol place: identical to SETQ.
+                self.lower_expr(val)?;
+                self.store_to_symbol_place(place, last)?;
+            } else if let Some((key, table)) = self.gethash_place(place) {
+                // `(setf (gethash key table) val)` → the internal store primitive
+                // BLISS::PUT-GETHASH (bliss-x5y.2). Push value, key, table in the
+                // interpreter's value-first order, then call; the result is the
+                // value. Other complex places (car/aref/slot/…) still bail — the
+                // setf-expander machinery is not available here.
+                let sym = resolve_sym("BLISS::PUT-GETHASH").ok_or(Bail)?.as_symbol_index();
+                self.lower_expr(val)?; // value
+                self.lower_expr(key)?; // key
+                self.lower_expr(table)?; // table
+                self.emit(Instr::CallNamed { sym, nargs: 3 });
+                self.pop_n(3);
+                self.push_n(1); // result: the stored value
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
+            } else {
                 return Err(Bail);
             }
-            i += 2;
         }
-        // Symbol-place SETF has identical semantics to SETQ (lower_setq also
-        // handles the symbol-macro / global / boxed cases and bails as needed).
-        self.lower_setq(rest)
+        Ok(())
+    }
+
+    /// Recognise a `(gethash key table)` place — exactly two arguments, head
+    /// symbol `GETHASH` (any package) — returning `(key, table)` (bliss-x5y.2).
+    fn gethash_place(&self, place: BlissVal) -> Option<(BlissVal, BlissVal)> {
+        if !place.is_cons() {
+            return None;
+        }
+        let items = list_to_vec(place);
+        if items.len() != 3 || !items[0].is_symbol() {
+            return None;
+        }
+        if symbol_bare_name(&sym_name(items[0])) != "GETHASH" {
+            return None;
+        }
+        Some((items[1], items[2]))
     }
 
     // ── Non-local control flow lowering (nmq.4) ────────────────────

@@ -283,3 +283,41 @@ fn call_local_temporaries_use_caller_saved_and_deopt_correctly() {
     let twl = tw.lines().next().unwrap_or("").to_string();
     assert_eq!(twl, line, "T2 result must match the tree-walker: {line:?} vs {twl:?}");
 }
+
+/// A hash-table-using function compiles to bytecode (does NOT bail to the
+/// tree-walker) and promotes to T1 (bliss-x5y.2). make-hash-table (with a :test
+/// keyword), gethash, (setf (gethash ...) ...), remhash, and hash-table-count all
+/// lower to CallNamed — the setf store goes to the internal BLISS::PUT-GETHASH
+/// primitive. A bailed function stays at tier 0, so observing tier 1 proves it
+/// compiled; the value must equal the tree-walker's. (Iteration via maphash with
+/// an inline lambda still bails on closure lowering — a separate concern.)
+#[test]
+fn hash_table_function_compiles_and_promotes() {
+    let prog = "\
+        (defun htf () \
+          (let ((h (make-hash-table :test (quote equal)))) \
+            (setf (gethash \"a\" h) 10) \
+            (setf (gethash \"b\" h) 20) \
+            (setf (gethash \"c\" h) 30) \
+            (remhash \"b\" h) \
+            (setf (gethash \"a\" h) (+ (gethash \"a\" h) 5)) \
+            (list (hash-table-count h) (gethash \"a\" h) (gethash \"b\" h (quote absent))))) \
+        (htf) (htf) (htf) \
+        (format t \"~a ~a~%\" (bliss-ext:function-tier (quote htf)) (htf))";
+
+    let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "hash function run failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    assert!(
+        line.starts_with("1 "),
+        "hash function must compile and reach T1 (tier 1, not a bailed 0): {line:?}"
+    );
+    assert!(line.contains("(2 15 ABSENT)"), "hash result: {line:?}");
+
+    // Identical value under the tree-walker.
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker run failed: {tw}");
+    let tw_result = tw.lines().next().unwrap_or("").split_once(' ').map(|(_, r)| r.to_string());
+    let t1_result = line.split_once(' ').map(|(_, r)| r.to_string());
+    assert_eq!(tw_result, t1_result, "T1 hash result must match the tree-walker");
+}
