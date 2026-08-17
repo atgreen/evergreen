@@ -2262,7 +2262,14 @@ impl Env {
             features.push(resolve_sym(":WINDOWS").unwrap_or(NIL));
             features.push(resolve_sym(":WIN32").unwrap_or(NIL));
         }
-        env.define_local("*FEATURES*", vec_to_list(&features));
+        // *FEATURES* lives in the global symbol-value cell (not a frame binding),
+        // so the reader's #+/#- conditionals can consult it directly — and (push
+        // :foo *features*) routes to the same cell. lookup_var/set_var fall through
+        // to the cell for this interned name.
+        bliss_rt::symbols::set_symbol_value(
+            bliss_rt::symbols::intern("*FEATURES*"),
+            vec_to_list(&features),
+        );
         env.define_local("*MODULES*", NIL); // names of REQUIRE'd/PROVIDE'd modules
         env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
         env.seed_standard_constant(

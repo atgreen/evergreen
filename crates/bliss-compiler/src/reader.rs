@@ -1733,7 +1733,7 @@ fn eval_feature_expression(feature: BlissVal) -> bool {
             .trim_start_matches("KEYWORD:")
             .trim_start_matches(':')
             .trim();
-        return matches!(bare, "BLISS");
+        return runtime_feature_present(bare);
     }
     if !feature.is_cons() {
         return false;
@@ -1777,6 +1777,35 @@ fn eval_feature_expression(feature: BlissVal) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `name` (a bare, upcased feature name) is present in the runtime
+/// `*FEATURES*` list. `*FEATURES*` is a global symbol value, so the reader can
+/// consult it directly — reader conditionals (`#+`/`#-`) then honour every
+/// feature the running image has, not just BLISS. Before `*FEATURES*` is bound
+/// (early bootstrap) only BLISS is recognised.
+fn runtime_feature_present(name: &str) -> bool {
+    let features = bliss_rt::symbols::find_index("*FEATURES*")
+        .and_then(bliss_rt::symbols::symbol_value);
+    let mut list = match features {
+        Some(l) if l.is_cons() => l,
+        _ => return name.eq_ignore_ascii_case("BLISS"),
+    };
+    while list.is_cons() {
+        let (item, next) = cons_parts(list);
+        if item.tag() == bliss_rt::value::TAG_SYMBOL {
+            let iname = feature_symbol_name(item);
+            let bare = iname
+                .trim_start_matches("KEYWORD:")
+                .trim_start_matches(':')
+                .trim();
+            if bare.eq_ignore_ascii_case(name) {
+                return true;
+            }
+        }
+        list = next;
+    }
+    false
 }
 
 fn feature_symbol_name(val: BlissVal) -> String {
