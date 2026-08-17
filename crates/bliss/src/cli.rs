@@ -5541,6 +5541,57 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 write_str_to(out, &s)?;
                 return Ok(v);
             }
+            "PRIN1" => {
+                // (prin1 object &optional stream): the escaped (readable)
+                // representation, no surrounding newlines. Returns the object.
+                let args = list_to_vec(cdr);
+                let v = eval_form(args[0], env)?;
+                let stream = if args.len() > 1 {
+                    eval_form(args[1], env)?
+                } else {
+                    NIL
+                };
+                let rendered = format_val_env(v, env, true);
+                let out = resolve_output_stream(stream, env);
+                write_str_to(out, &rendered)?;
+                return Ok(v);
+            }
+            "WRITE" => {
+                // (write object &key stream escape ...): render OBJECT honouring
+                // :escape (default T → prin1-style; NIL → princ-style) to :stream
+                // (default *standard-output*). Other keywords are accepted and
+                // ignored. Returns the object.
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::ProgramError("WRITE requires an object".into()));
+                }
+                let v = eval_form(args[0], env)?;
+                let mut stream = NIL;
+                let mut escape = true;
+                let mut i = 1;
+                while i + 1 < args.len() {
+                    let key = symbol_bare_name(&sym_name(eval_form(args[i], env)?));
+                    let val = eval_form(args[i + 1], env)?;
+                    match key.as_str() {
+                        "STREAM" => stream = val,
+                        "ESCAPE" => escape = !val.is_nil(),
+                        _ => {}
+                    }
+                    i += 2;
+                }
+                // :escape NIL is princ semantics (unquoted strings/chars);
+                // otherwise prin1 (readable) semantics.
+                let rendered = if escape {
+                    format_val_env(v, env, true)
+                } else {
+                    let mut s = String::new();
+                    princ_val_env(v, env, &mut s);
+                    s
+                };
+                let out = resolve_output_stream(stream, env);
+                write_str_to(out, &rendered)?;
+                return Ok(v);
+            }
             "TERPRI" => {
                 let args = list_to_vec(cdr);
                 let stream = if args.is_empty() {
