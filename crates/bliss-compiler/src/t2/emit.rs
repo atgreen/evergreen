@@ -832,6 +832,31 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
                 framed_alloc(&mut reg, &mut pool, p)?;
             }
         }
+    }
+    // Register coalescing (SBCL's in-place trick): a value that flows into a block
+    // parameter on its ONLY use can share that parameter's register — the producer
+    // computes straight into it and the edge move disappears. Both predecessors of
+    // a merge may coalesce onto the same param register (each writes it directly).
+    for &b in &blocks {
+        if let Some(t) = f.terminator(b) {
+            for tc in &f.inst(t).targets {
+                let params = f.block(tc.block).params.clone();
+                for (&p, &arg) in params.iter().zip(&tc.args) {
+                    if consts.contains_key(&arg)
+                        || float_consts.contains_key(&arg)
+                        || reg.contains_key(&arg)
+                        || uses.get(&arg) != Some(&1)
+                    {
+                        continue;
+                    }
+                    if let Some(&pr) = reg.get(&p) {
+                        reg.insert(arg, pr); // producer writes P's register directly
+                    }
+                }
+            }
+        }
+    }
+    for &b in &blocks {
         for &inst in &f.block(b).insts {
             let d = f.inst(inst);
             if matches!(d.opcode, Opcode::ConstFixnum | Opcode::ConstFloat)
