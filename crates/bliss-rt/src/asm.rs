@@ -171,6 +171,13 @@ impl Asm {
         self.reserve_rel32(l);
     }
 
+    /// `call rel32` to `l` (opcode `E8`) — a direct near call to another point in
+    /// this buffer (e.g. a self-recursive call to the function's own entry).
+    pub fn call(&mut self, l: Label) {
+        self.code.push(0xE8);
+        self.reserve_rel32(l);
+    }
+
     /// Reserve a 4-byte `rel32` slot at the current position, to be patched to
     /// reach `l` in `finish`.
     fn reserve_rel32(&mut self, l: Label) {

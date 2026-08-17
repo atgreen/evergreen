@@ -232,7 +232,7 @@ fn branching_if_speculates_and_runs() {
     assert_eq!(n, 2, "both the comparison and the multiply are speculated");
     verify(&f).expect("speculated branching IR verifies");
 
-    let framed = emit_framed(&f, 0, 0).expect("emit branching function");
+    let framed = emit_framed(&f, 0, 0, None).expect("emit branching function");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 
@@ -275,9 +275,11 @@ fn call_containing_function_emits() {
     // Speculate only the multiply (bcp 3); the call at bcp 2 stays a generic Call.
     let n = speculate(&mut f, &|bcp| (bcp == 3).then_some(SpecType::Fixnum));
     assert_eq!(n, 1, "the multiply is speculated; the call is not");
-    let framed = emit_framed(&f, 0, 0).expect("a call-containing function must emit");
+    let framed = emit_framed(&f, 0, 0, None).expect("a call-containing function must emit");
     assert!(!framed.code.is_empty());
-    assert_eq!(framed.compiled_entry, 0, "call functions use the frame entry only");
+    // A call function with ≤4 params gets a register entry (for direct self-calls),
+    // so its compiled entry sits past the interpreter (frame-loading) entry.
+    assert!(framed.compiled_entry > 0, "call function should expose a register entry");
 }
 
 /// Wave-3 milestone: with P5b (block-CFG lowering) + P6b (multi-block regalloc),

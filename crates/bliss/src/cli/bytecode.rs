@@ -5394,7 +5394,7 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
 
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
     let call_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64) -> u64 as usize as u64;
-    let framed = match bliss_compiler::t2::emit::emit_framed(&f, deopt_addr, call_addr) {
+    let framed = match bliss_compiler::t2::emit::emit_framed(&f, deopt_addr, call_addr, Some(sym)) {
         Ok(fc) => fc,
         Err(e) => {
             t2_log!("{name}: emit_framed failed: {e:?} (shape beyond emitter) => stay T1");

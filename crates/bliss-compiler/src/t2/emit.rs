@@ -644,12 +644,15 @@ fn emit_return(
 /// c2i argument registers (rdx, rcx, r8), set rdi=sym / rsi=nargs, and call.
 /// Values live across the call are in callee-saved registers, so the call cannot
 /// clobber them; the result comes back in rax and is moved to its register.
+#[allow(clippy::too_many_arguments)]
 fn emit_call(
     a: &mut Asm,
     data: &crate::t2::ir::InstData,
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
     const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
     c2i_call_addr: u64,
+    self_sym: Option<u32>,
+    self_entry: Option<bliss_rt::asm::Label>,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
@@ -657,13 +660,35 @@ fn emit_call(
         _ => return Err(EmitError::UnsupportedOp(0xF8)),
     };
     let nargs = data.args.len();
+    // Direct self-call: the target is this very function and it has a register
+    // entry — place args in the arg registers and `call` our own entry, skipping
+    // c2i dispatch entirely (the register entry saves/restores our callee-saved
+    // registers, so our live values survive).
+    if let (Some(ss), Some(entry)) = (self_sym, self_entry) {
+        const ARG_REGS: [u8; 4] = [1, 8, 9, 10]; // rcx, r8, r9, r10
+        if sym == ss && nargs <= ARG_REGS.len() {
+            for (i, &arg) in data.args.iter().enumerate() {
+                let dst = ARG_REGS[i];
+                if let Some(&bits) = const_tagged.get(&arg) {
+                    mov_imm64(a, dst, bits as i64);
+                } else {
+                    mov_rr(a, dst, *reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?);
+                }
+            }
+            a.call(entry);
+            if let Some(&r0) = data.results.first() {
+                mov_rr(a, *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?, 0);
+            }
+            return Ok(());
+        }
+    }
     // c2i_call(sym, n, a0, a1, a2): rdx=a0, rcx=a1, r8=a2.
-    const ARG_REGS: [u8; 3] = [2, 1, 8];
-    if nargs > ARG_REGS.len() {
+    const C2I_ARGS: [u8; 3] = [2, 1, 8];
+    if nargs > C2I_ARGS.len() {
         return Err(EmitError::UnsupportedOp(0xF9));
     }
     for (i, &arg) in data.args.iter().enumerate() {
-        let dst = ARG_REGS[i];
+        let dst = C2I_ARGS[i];
         if let Some(&bits) = const_tagged.get(&arg) {
             mov_imm64(a, dst, bits as i64);
         } else {
@@ -781,6 +806,7 @@ pub fn emit_framed(
     f: &Function,
     c2i_deopt_addr: u64,
     c2i_call_addr: u64,
+    self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
     use crate::t2::ir::{AuxData, Block, Opcode, Value, ValueDef};
     use std::collections::{HashMap, HashSet};
@@ -1071,10 +1097,15 @@ pub fn emit_framed(
         }
     };
 
+    // A call function with ≤4 params also gets a REGISTER entry, so a self-call can
+    // enter directly (args in registers) instead of paying c2i dispatch.
+    let reg_entry_label = a.label();
+    let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
+    let has_reg_entry = has_calls && f.block(entry).params.len() <= arg_regs.len();
+
     // Interpreter entry (offset 0): with calls, push the callee-saved value
     // registers and pad; then load entry params from the frame slots into their
-    // value registers and fall into the entry block. A compiled caller (frameless
-    // functions only) places args in the arg registers and enters at compiled_entry.
+    // value registers and fall (or jump) into the entry block.
     for &r in &saved {
         push_reg(&mut a, r);
     }
@@ -1085,7 +1116,27 @@ pub fn emit_framed(
         let r = *reg.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
         mov_from_frame(&mut a, r, 7 /* rdi */, i);
     }
-    let compiled_entry = if has_calls { 0 } else { a.here() };
+    let compiled_entry;
+    if has_reg_entry {
+        a.jmp(block_label[&entry]); // skip the register entry
+        a.bind(reg_entry_label);
+        compiled_entry = a.here();
+        // Register entry: same prologue, but args arrive in the arg registers and
+        // move into the (callee-saved) value registers; then fall into the body.
+        for &r in &saved {
+            push_reg(&mut a, r);
+        }
+        if pad {
+            a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+        }
+        for (i, &p) in f.block(entry).params.iter().enumerate() {
+            let r = *reg.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
+            mov_rr(&mut a, r, arg_regs[i]);
+        }
+    } else {
+        // Frameless: the body starts here with args already in their value regs.
+        compiled_entry = if has_calls { 0 } else { a.here() };
+    }
 
     // Emit each block: bind its label, emit its instructions, then its terminator
     // (with block-parameter moves on each out-edge).
@@ -1103,7 +1154,8 @@ pub fn emit_framed(
                 continue;
             }
             if d.opcode == Opcode::Call {
-                emit_call(&mut a, &d, &reg, &const_tagged, c2i_call_addr)?;
+                let self_entry = has_reg_entry.then_some(reg_entry_label);
+                emit_call(&mut a, &d, &reg, &const_tagged, c2i_call_addr, self_sym, self_entry)?;
             } else {
                 emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, &proven, deopt)?;
             }
@@ -1402,7 +1454,7 @@ mod tests {
     fn framed_fixnum_mul_runs_and_deopts() {
         use bliss_rt::value::BlissVal;
         let f = speculated_mul5();
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0).expect("emit_framed").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, None).expect("emit_framed").code;
         let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap");
         // extern "C" fn(*mut u64) -> u64 : rdi = frame slots, returns rax.
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
@@ -1484,7 +1536,7 @@ mod tests {
     fn strength_reduces_to_lea_when_range_is_safe() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0).expect("emit").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, None).expect("emit").code;
         // `lea rax,[rcx+rcx*4]` = 48 8D 04 89 ; and NO overflow branch (0F 80).
         assert!(contains(&code, &[0x48, 0x8D, 0x04, 0x89]), "must emit lea for a range-safe *5");
         assert!(!contains(&code, &[0x0F, 0x80]), "range proves no overflow → no jo deopt");
@@ -1501,7 +1553,7 @@ mod tests {
     fn keeps_imul_and_overflow_check_when_range_unknown() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, None);
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0).expect("emit").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, None).expect("emit").code;
         assert!(contains(&code, &[0x48, 0x69, 0xC1]), "unknown range → imul rax,rcx,5");
         assert!(contains(&code, &[0x0F, 0x80]), "unknown range → keep the jo overflow deopt");
         let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
@@ -1519,7 +1571,7 @@ mod tests {
     fn compiled_entry_takes_register_args() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
-        let framed = emit_framed(&f, mock_c2i_deopt as usize as u64, 0).expect("emit");
+        let framed = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, None).expect("emit");
         assert!(framed.compiled_entry > 0, "a register entry must sit past the frame-load prologue");
         let buf = bliss_rt::jit::JitBuffer::new(&framed.code).unwrap();
         let entry = buf.as_ptr() as usize + framed.compiled_entry;
@@ -1604,7 +1656,7 @@ mod tests {
     fn float_mul_runs_and_deopts() {
         use bliss_rt::value::BlissVal;
         let f = build_float_arith(crate::t2::ir::Opcode::FloatMul, 5);
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0).expect("emit").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, None).expect("emit").code;
         let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 
