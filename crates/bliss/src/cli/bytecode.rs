@@ -1567,15 +1567,20 @@ impl<'e> Lowerer<'e> {
             let kw = |f: BlissVal| -> Option<String> {
                 f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
             };
-            if forms.len() >= 3 && kw(forms[0]).as_deref() == Some("FOR") && forms[1].is_symbol()
-            {
-                match kw(forms[2]).as_deref() {
-                    Some("FROM") | Some("UPFROM") => {
-                        return self.lower_loop_numeric_for(&forms);
+            match kw(forms[0]).as_deref() {
+                // while/until loops do not start with `for`.
+                Some("WHILE") | Some("UNTIL") => return self.lower_loop_while(&forms),
+                Some("FOR") if forms.len() >= 3 && forms[1].is_symbol() => {
+                    match kw(forms[2]).as_deref() {
+                        Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
+                            return self.lower_loop_numeric_for(&forms);
+                        }
+                        Some("IN") => return self.lower_loop_for_in(&forms),
+                        Some("ON") => return self.lower_loop_for_on(&forms),
+                        _ => {}
                     }
-                    Some("IN") => return self.lower_loop_for_in(&forms),
-                    _ => {}
                 }
+                _ => {}
             }
             return Err(Bail);
         }
@@ -1607,15 +1612,28 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         let var = forms[1];
-        if !(kw_is(forms[2], "FROM") || kw_is(forms[2], "UPFROM")) {
+        // Direction keyword: `from` is neutral (the limit decides), `upfrom`
+        // ascends, `downfrom` descends.
+        if !(kw_is(forms[2], "FROM") || kw_is(forms[2], "UPFROM") || kw_is(forms[2], "DOWNFROM")) {
             return Err(Bail);
         }
         let start = forms[3];
-        let cmp = match kw(forms[4]).as_deref() {
-            Some("BELOW") => "<",
-            Some("TO") | Some("UPTO") => "<=",
-            _ => return Err(Bail), // descending / other limit → tree-walker
+        // The LIMIT keyword decides direction: below/to/upto ascend, downto/above
+        // descend (CL writes `from N downto M`, so direction comes from here).
+        let (cmp, descending) = match kw(forms[4]).as_deref() {
+            Some("BELOW") => ("<", false),
+            Some("TO") | Some("UPTO") => ("<=", false),
+            Some("ABOVE") => (">", true),
+            Some("DOWNTO") => (">=", true),
+            _ => return Err(Bail),
         };
+        // Reject a direction keyword that contradicts the limit (upfrom..downto).
+        if (descending && kw_is(forms[2], "UPFROM"))
+            || (!descending && kw_is(forms[2], "DOWNFROM"))
+        {
+            return Err(Bail);
+        }
+        let step_op = if descending { "-" } else { "+" };
         let end = forms[5];
         // Optional `by STEP`; then `do`.
         let (step, do_at) = if kw_is(forms[6], "BY") {
@@ -1643,7 +1661,7 @@ impl<'e> Lowerer<'e> {
         when_items.push(form_list(&[
             s("SETQ")?,
             var,
-            form_list(&[s("+")?, var, step_v]),
+            form_list(&[s(step_op)?, var, step_v]),
         ]));
         when_items.push(form_list(&[s("GO")?, top]));
         let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
@@ -1761,6 +1779,87 @@ impl<'e> Lowerer<'e> {
             binding_items.push(form_list(&[acc, acc_init]));
         }
         let bindings = form_list(&binding_items);
+        let let_form = form_list(&[s("LET")?, bindings, tagbody_form, result]);
+        self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
+    }
+
+    /// Extended-LOOP: cons-cell iteration — `(loop for VAR on LIST <action>)` —
+    /// where VAR walks successive tails. Expanded to
+    /// `(block nil (let ((VAR LIST)) (tagbody top (when VAR per-iter...
+    ///     (setq VAR (cdr VAR)) (go top)) result)))`.
+    fn lower_loop_for_on(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
+        let kw = |f: BlissVal| -> Option<String> {
+            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+        };
+        if forms.len() < 5
+            || kw(forms[0]).as_deref() != Some("FOR")
+            || !forms[1].is_symbol()
+            || kw(forms[2]).as_deref() != Some("ON")
+        {
+            return Err(Bail);
+        }
+        let var = forms[1];
+        let list = forms[3];
+
+        let id = self.fresh_id();
+        let s = |n: &str| resolve_sym(n).ok_or(Bail);
+        let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
+        let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
+        let (uses_acc, acc_init, per_iter, result) = self.lower_loop_action(&forms[4..], acc)?;
+
+        let mut when_items = vec![s("WHEN")?, var];
+        when_items.extend(per_iter);
+        when_items.push(form_list(&[s("SETQ")?, var, form_list(&[s("CDR")?, var])]));
+        when_items.push(form_list(&[s("GO")?, top]));
+        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+
+        let mut binding_items = vec![form_list(&[var, list])];
+        if uses_acc {
+            binding_items.push(form_list(&[acc, acc_init]));
+        }
+        let let_form = form_list(&[s("LET")?, form_list(&binding_items), tagbody_form, result]);
+        self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
+    }
+
+    /// Extended-LOOP: `(loop while TEST <action>)` / `(loop until TEST <action>)`.
+    /// `while` runs while TEST is true; `until` while `(not TEST)` (which itself
+    /// bails to the tree-walker if NOT isn't natively lowerable — still correct).
+    /// The test is re-evaluated each turn and references enclosing-scope vars.
+    fn lower_loop_while(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
+        let kw = |f: BlissVal| -> Option<String> {
+            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+        };
+        if forms.len() < 3 {
+            return Err(Bail);
+        }
+        let until = match kw(forms[0]).as_deref() {
+            Some("WHILE") => false,
+            Some("UNTIL") => true,
+            _ => return Err(Bail),
+        };
+        let test_raw = forms[1];
+
+        let id = self.fresh_id();
+        let s = |n: &str| resolve_sym(n).ok_or(Bail);
+        let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
+        let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
+        let (uses_acc, acc_init, per_iter, result) = self.lower_loop_action(&forms[2..], acc)?;
+
+        let test = if until {
+            form_list(&[s("NOT")?, test_raw])
+        } else {
+            test_raw
+        };
+        let mut when_items = vec![s("WHEN")?, test];
+        when_items.extend(per_iter);
+        when_items.push(form_list(&[s("GO")?, top]));
+        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+
+        let bindings = if uses_acc {
+            form_list(&[form_list(&[acc, acc_init])])
+        } else {
+            NIL
+        };
         let let_form = form_list(&[s("LET")?, bindings, tagbody_form, result]);
         self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
     }
