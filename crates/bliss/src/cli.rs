@@ -2265,11 +2265,19 @@ impl Env {
         // *FEATURES* lives in the global symbol-value cell (not a frame binding),
         // so the reader's #+/#- conditionals can consult it directly — and (push
         // :foo *features*) routes to the same cell. lookup_var/set_var fall through
-        // to the cell for this interned name.
-        bliss_rt::symbols::set_symbol_value(
-            bliss_rt::symbols::intern("*FEATURES*"),
-            vec_to_list(&features),
-        );
+        // to the cell for this interned name. Initialise it ONLY ONCE: a later
+        // Env::new (loading a file creates a fresh Env) must NOT reset the global
+        // cell and wipe features another load already added (e.g. asdf's :ASDF*).
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static FEATURES_INITIALISED: AtomicBool = AtomicBool::new(false);
+            if !FEATURES_INITIALISED.swap(true, Ordering::Relaxed) {
+                bliss_rt::symbols::set_symbol_value(
+                    bliss_rt::symbols::intern("*FEATURES*"),
+                    vec_to_list(&features),
+                );
+            }
+        }
         env.define_local("*MODULES*", NIL); // names of REQUIRE'd/PROVIDE'd modules
         env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
         env.seed_standard_constant(
