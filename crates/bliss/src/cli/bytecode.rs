@@ -238,6 +238,7 @@ pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
         }
         // Interpreted: the annotated bytecode listing (spec: "show the bytecode").
         None => {
+            let func_ptr = Rc::as_ptr(&bf) as usize;
             for (pc, instr) in bf.code.iter().enumerate() {
                 let ann = match instr {
                     Instr::Const(i) => bf
@@ -245,7 +246,21 @@ pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
                         .get(*i as usize)
                         .map(|c| fmt_const_val(*c))
                         .unwrap_or_default(),
-                    Instr::CallNamed { sym, nargs } => format!("({} …) / {nargs} arg(s)", sym_label(*sym)),
+                    Instr::CallNamed { sym, nargs } => {
+                        let mut a = format!("({} …) / {nargs} arg(s)", sym_label(*sym));
+                        if let Some(p) = type_profile_at(func_ptr, pc as u32) {
+                            let spec = match p.dominant() {
+                                Some(SpecType::Fixnum) => " ⇒ speculate FIXNUM",
+                                Some(SpecType::SingleFloat) => " ⇒ speculate SINGLE-FLOAT",
+                                None => " ⇒ generic (polymorphic / cold)",
+                            };
+                            a.push_str(&format!(
+                                "  [profile fix:{} float:{} other:{}{}]",
+                                p.fixnum, p.single_float, p.other, spec
+                            ));
+                        }
+                        a
+                    }
                     Instr::LoadGlobal(s) | Instr::StoreGlobal(s) => sym_label(*s),
                     Instr::Br(t) | Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => format!("→ {t}"),
                     Instr::Go { target_bcp, .. } => format!("→ {target_bcp}"),
@@ -3232,6 +3247,15 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     args.reverse();
                 }
 
+                // Type profiling: record operand types at speculatable arithmetic
+                // sites so the optimising tier can commit to one type. `bcp` was
+                // already advanced past this instruction, so the site is bcp-1.
+                if is_arith_speculatable(sym) {
+                    let func_ptr = Rc::as_ptr(&acts[top_idx].func) as usize;
+                    let call_bcp = acts[top_idx].bcp as u32 - 1;
+                    record_type_profile(func_ptr, call_bcp, &args);
+                }
+
                 // bliss-jtc.6.8: bump the callee's FnMeta invoke counter (the
                 // unified tiering substrate) so the function object reflects real
                 // invocations from the bytecode path, not just the tree-walker.
@@ -4125,7 +4149,84 @@ fn install_stack_map(num_slots: u16) -> Option<&'static CodeInfo> {
     Some(ci)
 }
 
+// ── Type profiling (HotSpot-style speculation feedback) ────────────
+//
+// At each speculatable arithmetic call site we record what types the operands
+// actually are, so the optimising tier can commit to ONE type (fixnum OR
+// single-float, mutually exclusive) and guard it, rather than emitting a path
+// for every possibility. Keyed by (containing bytecode function pointer, the
+// CallNamed's bcp); the pointer is the registry `Rc`, so any tier that holds the
+// same `BytecodeFunction` recovers the key. A deopt updates the profile too, so
+// a site that proves polymorphic stops being speculated on the next recompile.
+
+/// The single type a call site may be speculated as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpecType {
+    Fixnum,
+    SingleFloat,
+}
+
+/// Observed operand-type distribution at one call site.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct TypeProfile {
+    pub fixnum: u32,
+    pub single_float: u32,
+    pub other: u32,
+}
+
+impl TypeProfile {
+    pub fn total(&self) -> u32 {
+        self.fixnum + self.single_float + self.other
+    }
+    /// The dominant speculatable type, if the site is overwhelmingly consistent
+    /// (≥90% one type over ≥`MIN` samples). `None` means "not enough data" or
+    /// "polymorphic" — in which case that op is left generic (no speculation).
+    pub fn dominant(&self) -> Option<SpecType> {
+        const MIN: u32 = 20;
+        let t = self.total();
+        if t < MIN {
+            return None;
+        }
+        if self.fixnum * 100 >= t * 90 {
+            Some(SpecType::Fixnum)
+        } else if self.single_float * 100 >= t * 90 {
+            Some(SpecType::SingleFloat)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether `sym` names an op we would speculate a single numeric type for.
+fn is_arith_speculatable(sym: u32) -> bool {
+    inlinable_fixnum_op(sym).is_some()
+}
+
+/// Record the operand types seen at call site `(func_ptr, bcp)`.
+fn record_type_profile(func_ptr: usize, bcp: u32, args: &[BlissVal]) {
+    let all_fixnum = args.iter().all(|a| a.is_fixnum());
+    let all_float = args.iter().all(|a| a.is_single_float());
+    TYPE_PROFILE.with(|m| {
+        let mut b = m.borrow_mut();
+        let e = b.entry((func_ptr, bcp)).or_default();
+        if all_fixnum {
+            e.fixnum += 1;
+        } else if all_float {
+            e.single_float += 1;
+        } else {
+            e.other += 1;
+        }
+    });
+}
+
+/// The profile observed at call site `(func_ptr, bcp)`, if any.
+fn type_profile_at(func_ptr: usize, bcp: u32) -> Option<TypeProfile> {
+    TYPE_PROFILE.with(|m| m.borrow().get(&(func_ptr, bcp)).copied())
+}
+
 thread_local! {
+    /// Operand-type profiles keyed by (bytecode-function pointer, CallNamed bcp).
+    static TYPE_PROFILE: RefCell<HashMap<(usize, u32), TypeProfile>> = RefCell::new(HashMap::new());
     /// Native T1 code keyed by the same symbol index as the bytecode registry.
     static NATIVE_REGISTRY: RefCell<HashMap<u32, Rc<NativeCode>>> = RefCell::new(HashMap::new());
     /// Per-function invocation counters driving T0→T1 promotion.
