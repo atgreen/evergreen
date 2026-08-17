@@ -4228,13 +4228,19 @@ fn is_arith_speculatable(sym: u32) -> bool {
 /// Record the operand types seen at call site `(func_ptr, bcp)`.
 fn record_type_profile(func_ptr: usize, bcp: u32, args: &[BlissVal]) {
     let all_fixnum = args.iter().all(|a| a.is_fixnum());
-    let all_float = args.iter().all(|a| a.is_single_float());
+    // Float contagion: an arithmetic op whose operands are all fixnum-or-float and
+    // include at least one float IS a single-float op — the fixnums coerce
+    // ((* 2.5 5) = 12.5). Classifying `(* float-x 5)` as single_float (not "other")
+    // lets a genuinely float-hot site speculate FloatMul, coercing the fixnum
+    // constant, instead of looking polymorphic and staying generic.
+    let numeric = args.iter().all(|a| a.is_fixnum() || a.is_single_float());
+    let any_float = args.iter().any(|a| a.is_single_float());
     TYPE_PROFILE.with(|m| {
         let mut b = m.borrow_mut();
         let e = b.entry((func_ptr, bcp)).or_default();
         if all_fixnum {
             e.fixnum += 1;
-        } else if all_float {
+        } else if numeric && any_float {
             e.single_float += 1;
         } else {
             e.other += 1;

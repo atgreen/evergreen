@@ -150,6 +150,85 @@ fn imul_rr(a: &mut Asm, dst: u8, src: u8) {
     a.push(modrm_rr(dst, src));
 }
 
+// ── Single-float (XMM) encoders ─────────────────────────────────────
+//
+// A single-float BlissVal is the immediate `(f32_bits << 32) | 0b100`: the raw
+// f32 lives in the high dword, tag 0b100 in the low bits. So the float path
+// unpacks with `shr 32` + `movd` into an XMM, computes with a scalar-single SSE
+// op, then repacks with `movd` + `shl 32` + `or 4`.
+
+/// `mov r32, imm32` (zero-extends into r64).
+fn mov_imm32(a: &mut Asm, r: u8, imm: u32) {
+    if r >= 8 {
+        a.push(0x41); // REX.B
+    }
+    a.push(0xB8 + (r & 7));
+    a.extend_from_slice(&imm.to_le_bytes());
+}
+
+/// `movd xmm, r32` — GPR low dword → XMM (66 0F 6E /r).
+fn movd_xmm_r32(a: &mut Asm, xmm: u8, r: u8) {
+    a.push(0x66);
+    if xmm >= 8 || r >= 8 {
+        a.push(0x40 | (((xmm >> 3) & 1) << 2) | ((r >> 3) & 1)); // REX.R(xmm)+B(r)
+    }
+    a.extend_from_slice(&[0x0F, 0x6E]);
+    a.push(modrm_rr(xmm, r)); // reg=xmm, rm=r
+}
+
+/// `movd r32, xmm` — XMM low dword → GPR, zero-extended (66 0F 7E /r).
+fn movd_r32_xmm(a: &mut Asm, r: u8, xmm: u8) {
+    a.push(0x66);
+    if xmm >= 8 || r >= 8 {
+        a.push(0x40 | (((xmm >> 3) & 1) << 2) | ((r >> 3) & 1)); // REX.R(xmm)+B(r)
+    }
+    a.extend_from_slice(&[0x0F, 0x7E]);
+    a.push(modrm_rr(xmm, r)); // reg=xmm, rm=r
+}
+
+/// A scalar-single SSE op `<op>ss xmm_dst, xmm_src` (F3 0F <sub> /r):
+/// addss=0x58, mulss=0x59, subss=0x5C.
+fn ss_op(a: &mut Asm, sub: u8, dst: u8, src: u8) {
+    a.push(0xF3);
+    if dst >= 8 || src >= 8 {
+        a.push(0x40 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
+    }
+    a.extend_from_slice(&[0x0F, sub]);
+    a.push(modrm_rr(dst, src));
+}
+
+/// `shr r64, imm8` (/5).
+fn shr_imm(a: &mut Asm, r: u8, imm: u8) {
+    a.push(rex_w(0, r));
+    a.push(0xC1);
+    a.push(0xE8 | (r & 7));
+    a.push(imm);
+}
+
+/// `shl r64, imm8` (/4).
+fn shl_imm(a: &mut Asm, r: u8, imm: u8) {
+    a.push(rex_w(0, r));
+    a.push(0xC1);
+    a.push(0xE0 | (r & 7));
+    a.push(imm);
+}
+
+/// `or r64, imm8` sign-extended (/1).
+fn or_imm8(a: &mut Asm, r: u8, imm: u8) {
+    a.push(rex_w(0, r));
+    a.push(0x83);
+    a.push(0xC8 | (r & 7));
+    a.push(imm);
+}
+
+/// Guard that `r` holds a single-float (tag == 0b100), else deopt.
+fn guard_single_float(a: &mut Asm, r: u8, deopt: bliss_rt::asm::Label) {
+    alu_rr(a, 0x89, SCRATCH, r); // mov rdx, r
+    a.extend_from_slice(&[0x80, 0xE2, 0x07]); // and dl, 7
+    a.extend_from_slice(&[0x80, 0xFA, 0x04]); // cmp dl, 4
+    a.jcc(Cc::Ne, deopt);
+}
+
 // ── Framed emitter (T2, interpreter-callable) ───────────────────────
 //
 // Emits a straight-line speculated function as native code callable by the T0
@@ -271,6 +350,34 @@ fn framed_alloc(
     Ok(r)
 }
 
+/// Load one operand of a float op into `xmm`. A fixnum constant is coerced to
+/// single-float at compile time (float contagion — `(* 2.5 5)` = `12.5`) and
+/// materialised; a variable is guarded to be a single-float, then its f32 bits
+/// (high dword of the tagged value) are unpacked into the XMM register.
+fn float_operand_to_xmm(
+    a: &mut Asm,
+    xmm: u8,
+    v: crate::t2::ir::Value,
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+    deopt: bliss_rt::asm::Label,
+) -> Result<(), EmitError> {
+    if let Some(&bits) = float_consts.get(&v) {
+        mov_imm32(a, SCRATCH, bits);
+        movd_xmm_r32(a, xmm, SCRATCH);
+    } else if let Some(&c) = consts.get(&v) {
+        mov_imm32(a, SCRATCH, (c as f32).to_bits());
+        movd_xmm_r32(a, xmm, SCRATCH);
+    } else {
+        let r = *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?;
+        guard_single_float(a, r, deopt);
+        shr_imm(a, r, 32); // r's low dword now holds the f32 bits
+        movd_xmm_r32(a, xmm, r);
+    }
+    Ok(())
+}
+
 /// A framed T2 compilation with its two entry points (spec: compiled-caller ABI).
 ///
 /// The code has a single body reached by two entries:
@@ -305,6 +412,8 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
     // Deferred fixnum constants: folded into imul immediates, materialised only
     // if used somewhere that needs a register (e.g. returned directly).
     let mut consts: HashMap<Value, i64> = HashMap::new();
+    // Deferred single-float constants (raw f32 bits), materialised into XMM.
+    let mut float_consts: HashMap<Value, u32> = HashMap::new();
 
     // The terminator must be a Return; bind its value to rax up front so a
     // FixnumMul writing the return value targets rax with no extra move.
@@ -345,6 +454,13 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
                     _ => return Err(EmitError::MissingImm),
                 };
                 consts.insert(data.results[0], imm); // defer; fold where possible
+            }
+            Opcode::ConstFloat => {
+                let fv = match data.aux {
+                    AuxData::FloatImm(v) => v,
+                    _ => return Err(EmitError::MissingImm),
+                };
+                float_consts.insert(data.results[0], fv.to_bits());
             }
             Opcode::FixnumMul => {
                 let (a0, b0) = (data.args[0], data.args[1]);
@@ -392,6 +508,28 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, Emit
                 sar_imm(&mut a, dst, 3);
                 imul_rr(&mut a, dst, y);
                 a.jcc(Cc::O, deopt);
+            }
+            Opcode::FloatMul | Opcode::FloatAdd | Opcode::FloatSub => {
+                // The float second specialization: unpack both operands into XMM
+                // (constants coerced by contagion, variables guarded single-float),
+                // compute with a scalar-single SSE op, and repack the tagged result
+                // into rax. No overflow trap — IEEE float has none.
+                let dst = framed_alloc(&mut reg, &mut pool, data.results[0])?;
+                float_operand_to_xmm(&mut a, 0, data.args[0], &reg, &consts, &float_consts, deopt)?;
+                float_operand_to_xmm(&mut a, 1, data.args[1], &reg, &consts, &float_consts, deopt)?;
+                let sub = match data.opcode {
+                    Opcode::FloatAdd => 0x58,
+                    Opcode::FloatMul => 0x59,
+                    Opcode::FloatSub => 0x5C,
+                    _ => unreachable!(),
+                };
+                ss_op(&mut a, sub, 0, 1); // xmm0 = xmm0 <op> xmm1
+                movd_r32_xmm(&mut a, 0, 0); // eax = f32 bits of xmm0 (zero-extended)
+                shl_imm(&mut a, 0, 32); // rax = bits << 32
+                or_imm8(&mut a, 0, 4); // tag single-float (0b100)
+                if dst != 0 {
+                    mov_rr(&mut a, dst, 0); // if the result isn't the return value
+                }
             }
             other if other.is_terminator() => break, // handled below
             other => return Err(EmitError::UnsupportedOp(op_tag(other))),
@@ -754,6 +892,81 @@ mod tests {
             );
         }
         assert_eq!(BlissVal(result).as_fixnum(), 35, "compiled entry: 7*5 = 35 from a register arg");
+    }
+
+    /// Build `(x) -> x <op> c` as a float-speculated op: single-float param `x`,
+    /// a fixnum constant `c` (coerced by contagion), guard-flagged float op.
+    fn build_float_arith(op: crate::t2::ir::Opcode, c: i64) -> crate::t2::ir::Function {
+        use crate::t2::ir::{AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation};
+        let mut f = Function::new("m");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::of(TypeBits::SINGLE_FLOAT), ValueRepresentation::Tagged);
+        let (_c, cres) = f.push_inst(
+            entry,
+            InstData {
+                opcode: Opcode::ConstFixnum,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::FixnumImm(c),
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        let (_m, mres) = f.push_inst(
+            entry,
+            InstData {
+                opcode: op,
+                args: vec![x, cres[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::SINGLE_FLOAT), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![mres[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        f
+    }
+
+    /// The float second specialization: a float-speculated `(* x 5)` runs the XMM
+    /// path — a single-float arg gives `x*5.0` (the fixnum constant coerced), and a
+    /// fixnum arg trips the single-float guard and deopts.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn float_mul_runs_and_deopts() {
+        use bliss_rt::value::BlissVal;
+        let f = build_float_arith(crate::t2::ir::Opcode::FloatMul, 5);
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit").code;
+        let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
+        let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+
+        let mut frame = [BlissVal::from_single_float(2.0).0, 0u64, 0u64];
+        DEOPTED.store(false, Ordering::SeqCst);
+        let r = func(frame.as_mut_ptr());
+        assert!(!DEOPTED.load(Ordering::SeqCst), "a single-float arg must not deopt");
+        assert_eq!(BlissVal(r).as_single_float(), 10.0, "2.0 * 5 = 10.0 (fixnum coerced)");
+
+        let mut frame = [BlissVal::from_fixnum(2).0, 0u64, 0u64];
+        DEOPTED.store(false, Ordering::SeqCst);
+        let _ = func(frame.as_mut_ptr());
+        assert!(DEOPTED.load(Ordering::SeqCst), "a fixnum operand must deopt (guard is single-float)");
     }
 
     /// A small computation `() -> 7 + 5 = 12`, executed.
