@@ -1561,10 +1561,23 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         // Simple loop iff all clauses are compound. A bare atom (a loop keyword)
-        // means the extended grammar — try the common numeric-`for` shape, else
-        // bail to the tree-walker's full LOOP.
+        // means the extended grammar — dispatch the common single-`for` shapes by
+        // their iteration keyword, else bail to the tree-walker's full LOOP.
         if !forms.iter().all(|f| f.is_cons()) {
-            return self.lower_loop_numeric_for(&forms);
+            let kw = |f: BlissVal| -> Option<String> {
+                f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+            };
+            if forms.len() >= 3 && kw(forms[0]).as_deref() == Some("FOR") && forms[1].is_symbol()
+            {
+                match kw(forms[2]).as_deref() {
+                    Some("FROM") | Some("UPFROM") => {
+                        return self.lower_loop_numeric_for(&forms);
+                    }
+                    Some("IN") => return self.lower_loop_for_in(&forms),
+                    _ => {}
+                }
+            }
+            return Err(Bail);
         }
         let id = self.fresh_id();
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
@@ -1650,6 +1663,49 @@ impl<'e> Lowerer<'e> {
         ]);
         // LOOP returns NIL unless there is an accumulation/return clause (which we
         // don't handle here), so the block value is NIL.
+        let let_form = form_list(&[s("LET")?, bindings, tagbody_form, NIL]);
+        self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
+    }
+
+    /// Extended-LOOP stage 2 (bliss-x5y.3): list iteration —
+    /// `(loop for VAR in LIST do BODY...)` — expanded to
+    /// `(block nil (let ((%lst LIST) (VAR nil))
+    ///     (tagbody top (when %lst (setq VAR (car %lst)) BODY...
+    ///                             (setq %lst (cdr %lst)) (go top)))))`.
+    /// `for VAR on LIST`, `by`, destructuring, and accumulation clauses bail.
+    fn lower_loop_for_in(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
+        let kw = |f: BlissVal| -> Option<String> {
+            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+        };
+        // for VAR in LIST do BODY...  (min 6 tokens)
+        if forms.len() < 6
+            || kw(forms[0]).as_deref() != Some("FOR")
+            || !forms[1].is_symbol()
+            || kw(forms[2]).as_deref() != Some("IN")
+            || kw(forms[4]).as_deref() != Some("DO")
+        {
+            return Err(Bail);
+        }
+        let var = forms[1];
+        let list = forms[3];
+        let body = &forms[5..];
+        if body.is_empty() || body.iter().any(|f| !f.is_cons()) {
+            return Err(Bail); // trailing clause / non-form body → tree-walker
+        }
+
+        let id = self.fresh_id();
+        let s = |n: &str| resolve_sym(n).ok_or(Bail);
+        let lst = resolve_sym(&format!("%LOOP-LST{id}")).ok_or(Bail)?;
+        let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
+
+        let mut when_items = vec![s("WHEN")?, lst];
+        when_items.push(form_list(&[s("SETQ")?, var, form_list(&[s("CAR")?, lst])]));
+        when_items.extend_from_slice(body);
+        when_items.push(form_list(&[s("SETQ")?, lst, form_list(&[s("CDR")?, lst])]));
+        when_items.push(form_list(&[s("GO")?, top]));
+        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+
+        let bindings = form_list(&[form_list(&[lst, list]), form_list(&[var, NIL])]);
         let let_form = form_list(&[s("LET")?, bindings, tagbody_form, NIL]);
         self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
     }
