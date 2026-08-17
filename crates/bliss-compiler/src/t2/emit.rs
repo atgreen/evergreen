@@ -12,8 +12,9 @@
 //! flagged), calls, float/XMM ops, and folding immediates into ALU ops. An
 //! unsupported instruction returns `EmitError` rather than emitting wrong bytes.
 
-use bliss_rt::asm::Asm;
+use bliss_rt::asm::{Asm, Cc};
 
+use crate::t2::ir::Function;
 use crate::t2::mach::{Location, MachFunc, MachInst, PhysReg, RegClass, VReg};
 
 /// Why emission could not complete (the function stays at T1, spec R4.28/R4.42).
@@ -114,6 +115,142 @@ fn pop_reg(a: &mut Asm, r: u8) {
         a.push(0x41);
     }
     a.push(0x58 + (r & 7));
+}
+
+/// `mov r64, [r14 + 8*i]` — load an argument/local from its interpreter frame
+/// slot (r14 = the slots pointer, per the run_native ABI).
+fn mov_from_frame(a: &mut Asm, dst: u8, i: usize) {
+    a.push(0x49 | if dst >= 8 { 0x04 } else { 0 }); // REX.W + B(base r14) [+R]
+    a.push(0x8B); // mov r64, r/m64
+    a.push(0x40 | ((dst & 7) << 3) | 6); // mod=01(disp8), rm=110(r14)
+    a.push((8 * i) as u8);
+}
+
+/// `sar r64, imm8`.
+fn sar_imm(a: &mut Asm, r: u8, imm: u8) {
+    a.push(rex_w(0, r));
+    a.push(0xC1);
+    a.push(0xF8 | (r & 7)); // /7
+    a.push(imm);
+}
+
+/// `imul r64, r/m64` (two-operand: dst *= src).
+fn imul_rr(a: &mut Asm, dst: u8, src: u8) {
+    a.push(rex_w(dst, src));
+    a.push(0x0F);
+    a.push(0xAF);
+    a.push(modrm_rr(dst, src));
+}
+
+// ── Framed emitter (T2, interpreter-callable) ───────────────────────
+//
+// Emits a straight-line speculated function as native code callable by the T0
+// run_native adapter: the slots pointer arrives in rdi (→ r14), arguments are
+// read from frame slots, the result is returned in rax, and a guard miss calls
+// `c2i_deopt` — the no-resume deopt that makes run_native re-run the (pure)
+// function in the interpreter. This is where the operand stack disappears: the
+// fast path works in registers, only touching memory to load the args.
+
+const SCRATCH: u8 = 2; // rdx — reserved for guard temporaries, never a value reg
+
+/// Emit `f` (a single-block, speculated straight-line function) as native code.
+/// `c2i_deopt_addr` is the address of the interpreter's `c2i_deopt` routine.
+pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<Vec<u8>, EmitError> {
+    use crate::t2::ir::{AuxData, Opcode, Value};
+    use std::collections::HashMap;
+
+    if f.block_order().len() != 1 {
+        return Err(EmitError::UnsupportedOp(0xF0)); // only straight-line for now
+    }
+    let entry = f.entry();
+
+    // Trivial register assignment: one x86 GPR per SSA value from a small pool
+    // (rax reserved for return/imul, rdx for guard scratch, r14 for the frame).
+    let mut pool: Vec<u8> = vec![10, 9, 8, 6, 1]; // r10, r9, r8, rsi, rcx (pop→rcx first)
+    let mut reg: HashMap<Value, u8> = HashMap::new();
+    let mut alloc = |v: Value, reg: &mut HashMap<Value, u8>, pool: &mut Vec<u8>| -> Result<u8, EmitError> {
+        if let Some(&r) = reg.get(&v) {
+            return Ok(r);
+        }
+        let r = pool.pop().ok_or(EmitError::UnsupportedOp(0xF1))?; // out of registers
+        reg.insert(v, r);
+        Ok(r)
+    };
+    let get = |v: Value, reg: &HashMap<Value, u8>| -> Result<u8, EmitError> {
+        reg.get(&v).copied().ok_or(EmitError::UnsupportedOp(0xF2))
+    };
+
+    let mut a = Asm::new();
+    let deopt = a.label();
+
+    // Prologue: save r14, point it at the frame slots (rdi), load the params.
+    push_reg(&mut a, 14);
+    a.extend_from_slice(&[0x49, 0x89, 0xFE]); // mov r14, rdi
+    let params = f.block(entry).params.clone();
+    for (i, &p) in params.iter().enumerate() {
+        let r = alloc(p, &mut reg, &mut pool)?;
+        mov_from_frame(&mut a, r, i);
+    }
+
+    // Body.
+    for &inst in &f.block(entry).insts.clone() {
+        let data = f.inst(inst).clone();
+        match data.opcode {
+            Opcode::ConstFixnum => {
+                let imm = match data.aux {
+                    AuxData::FixnumImm(v) => v,
+                    _ => return Err(EmitError::MissingImm),
+                };
+                let dst = alloc(data.results[0], &mut reg, &mut pool)?;
+                // Materialise the tagged BlissVal fixnum.
+                mov_imm64(&mut a, dst, bliss_rt::value::BlissVal::from_fixnum(imm).0 as i64);
+            }
+            Opcode::FixnumMul => {
+                let x = get(data.args[0], &reg)?;
+                let y = get(data.args[1], &reg)?;
+                let r = alloc(data.results[0], &mut reg, &mut pool)?;
+                // Guard: both operands fixnum, else deopt.
+                alu_rr(&mut a, 0x89, SCRATCH, x); // mov rdx, x
+                alu_rr(&mut a, 0x09, SCRATCH, y); // or  rdx, y
+                a.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
+                a.jcc(Cc::Ne, deopt);
+                // r = (untag x) * y  → tagged product; overflow → deopt.
+                mov_rr(&mut a, r, x);
+                sar_imm(&mut a, r, 3);
+                imul_rr(&mut a, r, y);
+                a.jcc(Cc::O, deopt);
+            }
+            other if other.is_terminator() => break, // handled below
+            other => return Err(EmitError::UnsupportedOp(op_tag(other))),
+        }
+    }
+
+    // Terminator: Return the value in rax.
+    let term = f.terminator(entry).ok_or(EmitError::UnsupportedOp(0xF3))?;
+    let term_data = f.inst(term).clone();
+    if term_data.opcode != Opcode::Return {
+        return Err(EmitError::UnsupportedOp(op_tag(term_data.opcode)));
+    }
+    if let Some(&v) = term_data.args.first() {
+        let r = get(v, &reg)?;
+        mov_rr(&mut a, 0, r); // mov rax, r
+    }
+    pop_reg(&mut a, 14);
+    a.push(0xC3); // ret
+
+    // Deopt stub: call c2i_deopt (sets NATIVE_DEOPT with no resume point, so
+    // run_native re-runs the pure function in the interpreter), then return.
+    a.bind(deopt);
+    mov_imm64(&mut a, 0, c2i_deopt_addr as i64); // mov rax, c2i_deopt
+    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    pop_reg(&mut a, 14);
+    a.push(0xC3); // ret (value ignored on deopt)
+
+    a.finish().ok_or(EmitError::BadBranch)
+}
+
+fn op_tag(op: crate::t2::ir::Opcode) -> u32 {
+    op as u32 | 0x1000
 }
 
 // ── Emitter ─────────────────────────────────────────────────────────
@@ -260,6 +397,63 @@ mod tests {
         // writes rax and returns, preserving callee-saved registers.
         let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
         assert_eq!(f(), 12345, "T2-emitted function must return its constant");
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DEOPTED: AtomicBool = AtomicBool::new(false);
+    extern "C" fn mock_c2i_deopt() {
+        DEOPTED.store(true, Ordering::SeqCst);
+    }
+
+    // Build and speculate `(lambda (x) (* x 5))` into single-guarded-FixnumMul IR.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn speculated_mul5() -> crate::t2::ir::Function {
+        use crate::t2::speculate::{speculate, SpecType};
+        use bliss_rt::bytecode::{BytecodeFunction, Instr};
+        use bliss_rt::value::BlissVal;
+        let star = bliss_rt::symbols::intern("*");
+        let bf = BytecodeFunction {
+            code: vec![
+                Instr::LoadLocal(0),
+                Instr::Const(0),
+                Instr::CallNamed { sym: star, nargs: 2 },
+                Instr::Return,
+            ],
+            constants: vec![BlissVal::from_fixnum(5)],
+            handler_cases: vec![], handler_binds: vec![], names: vec![], restart_cases: vec![],
+            param_layout: vec![], has_env: false, n_locals: 1, max_stack: 2, arity: 1,
+            name: "mul5".into(),
+        };
+        let mut f = crate::t2::build::build_from_bytecode(&bf).expect("build");
+        speculate(&mut f, &|bcp| if bcp == 2 { Some(SpecType::Fixnum) } else { None });
+        f
+    }
+
+    /// The framed-emitter milestone: a T2-emitted `(* x 5)` runs via the
+    /// interpreter frame ABI — a fixnum arg gives `x*5` (fast path, operand stack
+    /// gone), a float arg trips the guard and calls the deopt routine.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn framed_fixnum_mul_runs_and_deopts() {
+        use bliss_rt::value::BlissVal;
+        let f = speculated_mul5();
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit_framed");
+        let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap");
+        // extern "C" fn(*mut u64) -> u64 : rdi = frame slots, returns rax.
+        let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+
+        // Fixnum arg 7 in slot 0 → fast path → 7*5 = 35.
+        let mut frame = [BlissVal::from_fixnum(7).0, 0u64, 0u64];
+        DEOPTED.store(false, Ordering::SeqCst);
+        let r = func(frame.as_mut_ptr());
+        assert!(!DEOPTED.load(Ordering::SeqCst), "fixnum arg must not deopt");
+        assert_eq!(BlissVal(r).as_fixnum(), 35, "T2 must compute 7*5 = 35");
+
+        // Float arg → guard fails → deopt routine called.
+        let mut frame = [BlissVal::from_single_float(2.0).0, 0u64, 0u64];
+        DEOPTED.store(false, Ordering::SeqCst);
+        let _ = func(frame.as_mut_ptr());
+        assert!(DEOPTED.load(Ordering::SeqCst), "a float operand must deopt to the interpreter");
     }
 
     /// A small computation `() -> 7 + 5 = 12`, executed.
