@@ -248,7 +248,7 @@ fn cl_equal(a: BlissVal, b: BlissVal) -> bool {
 
     // Strings: byte-level content comparison (case-sensitive).
     if a.is_heap_object() && b.is_heap_object() {
-        unsafe {
+        {
             if let (Some(sa), Some(sb)) = (extract_string_bytes(a), extract_string_bytes(b)) {
                 return sa == sb;
             }
@@ -315,7 +315,7 @@ fn cl_equalp(a: BlissVal, b: BlissVal) -> bool {
 
     // Strings: case-insensitive byte comparison.
     if a.is_heap_object() && b.is_heap_object() {
-        unsafe {
+        {
             if let (Some(sa), Some(sb)) = (extract_string_bytes(a), extract_string_bytes(b)) {
                 if sa.len() != sb.len() {
                     return false;
@@ -396,7 +396,7 @@ fn equal_hash(object: BlissVal, depth: usize) -> u64 {
         }
     }
     if object.is_heap_object() {
-        unsafe {
+        {
             if let Some(bytes) = extract_string_bytes(object) {
                 return hash_bytes(&bytes, false);
             }
@@ -435,7 +435,7 @@ fn equalp_hash(object: BlissVal, depth: usize) -> u64 {
         }
     }
     if object.is_heap_object() {
-        unsafe {
+        {
             if let Some(bytes) = extract_string_bytes(object) {
                 return hash_bytes(&bytes, true);
             }

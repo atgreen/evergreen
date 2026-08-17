@@ -13323,10 +13323,6 @@ fn apply_function(
     Err(BlissError::Internal(format!("Cannot apply: {:?}", fn_val)))
 }
 
-#[expect(
-    dead_code,
-    reason = "legacy builtin dispatch is retained during evaluator consolidation"
-)]
 /// True if `name` (a bare, upcased function name) denotes a standard function
 /// bliss implements as a builtin operator. Used by FBOUNDP/FDEFINITION so a
 /// builtin like FUNCALL is reported bound and `(fdefinition 'funcall)` returns a
@@ -13410,6 +13406,10 @@ fn is_builtin_function(name: &str) -> bool {
     )
 }
 
+#[expect(
+    dead_code,
+    reason = "legacy builtin dispatch is retained during evaluator consolidation"
+)]
 fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissVal, BlissError> {
     match name {
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode

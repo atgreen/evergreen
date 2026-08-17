@@ -4132,6 +4132,9 @@ struct NativeCode {
     /// Byte offset of the compiled-caller entry point within the code (args in
     /// registers `[rcx, r8, r9, r10]`, no frame — spec: compiled-caller ABI).
     /// 0 means "no distinct compiled entry"; the interpreter entry is always at 0.
+    /// Not yet consumed by the interpreter's dispatch (no compiled→compiled calls
+    /// cross the c2i boundary yet); recorded so that wiring is a local change.
+    #[allow(dead_code)]
     compiled_entry: usize,
     /// Validated GC stack-map metadata for this function's activation, installed
     /// alongside the code (bliss-jtc.4). Passed into every frame the i2c adapter
