@@ -6,6 +6,13 @@
 
 use bliss_compiler::t2::build::build_from_bytecode;
 use bliss_compiler::t2::infer::infer;
+use bliss_compiler::t2::lower::lower;
+use bliss_compiler::t2::opt_dce::Dce;
+use bliss_compiler::t2::opt_guard::GuardElim;
+use bliss_compiler::t2::opt_gvn::Gvn;
+use bliss_compiler::t2::opt_licm::Licm;
+use bliss_compiler::t2::pass::PassManager;
+use bliss_compiler::t2::regalloc::allocate;
 use bliss_compiler::t2::verify::verify;
 use bliss_rt::bytecode::{BytecodeFunction, Instr};
 use bliss_rt::value::BlissVal;
@@ -83,4 +90,63 @@ fn branch_merge_builds_and_verifies() {
     let f = build_from_bytecode(&bf).expect("P1 should build a branch/merge function");
     verify(&f).expect("P2 must accept P1's branch/merge IR (block params on the merge)");
     let _ = infer(&f); // must not panic on merged block parameters
+}
+
+/// Wave-2 mid-end: the four optimisation passes (P4a–d) must compose on real
+/// P1-built branching IR and preserve well-formedness (P2 still accepts it).
+#[test]
+fn optimisation_passes_compose_and_preserve_wellformedness() {
+    let bf = bytecode_fn(
+        "opt",
+        vec![
+            Instr::Const(0),
+            Instr::BrIfFalse(4),
+            Instr::Const(1),
+            Instr::Br(5),
+            Instr::Const(2),
+            Instr::Return,
+        ],
+        vec![
+            BlissVal::from_fixnum(0),
+            BlissVal::from_fixnum(1),
+            BlissVal::from_fixnum(2),
+        ],
+        0,
+        1,
+        0,
+    );
+    let mut f = build_from_bytecode(&bf).expect("build");
+    verify(&f).expect("pre-opt IR must verify");
+
+    let mut pm = PassManager::new();
+    pm.add(Box::new(Gvn));
+    pm.add(Box::new(Licm));
+    pm.add(Box::new(Dce));
+    pm.add(Box::new(GuardElim));
+    pm.run(&mut f);
+
+    // The whole mid-end must leave the IR well-formed (spec §4.10 R4.60 etc.).
+    verify(&f).expect("post-opt IR must still verify");
+}
+
+/// Wave-2 backend: P5 lower → P6 regalloc on real P1-built straight-line IR.
+/// (Branching IR needs the deferred MachFunc block-CFG before P6's single-block
+/// model handles it — see the wave-2 contract-gap notes.)
+#[test]
+fn backend_lowers_and_allocates_straight_line() {
+    let bf = bytecode_fn(
+        "be",
+        vec![Instr::Const(0), Instr::Return],
+        vec![BlissVal::from_fixnum(7)],
+        0,
+        1,
+        0,
+    );
+    let f = build_from_bytecode(&bf).expect("build");
+
+    let mut mf = lower(&f); // P5
+    assert!(!mf.insts.is_empty(), "P5 must produce machine instructions");
+
+    allocate(&mut mf); // P6
+    assert!(!mf.allocation.is_empty(), "P6 must assign a location to each vreg");
 }

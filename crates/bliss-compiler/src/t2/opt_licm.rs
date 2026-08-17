@@ -1,21 +1,684 @@
-//! P4b — Loop-invariant code motion (spec §4.5 R4.34).
+//! P4b — Loop-invariant code motion (spec §4.5 R4.34, §4.5.6).
 //!
-//! **Parcel P4b. Owner: (sub-agent).** Detect natural loops (via the dominator
-//! tree / back-edges — extend `pass::LoopForest::compute`, but keep that logic in
-//! THIS file if it needs a body the frozen stub lacks; do not edit pass.rs) and
-//! hoist pure, loop-invariant instructions into the loop preheader. MUST NOT
-//! hoist effectful instructions or anything that could change deopt behaviour.
-//! Implement `Pass`; unit-test on a hand-built counted loop.
+//! **Parcel P4b.** Detect natural loops via back-edge analysis over the
+//! dominator tree, insert (or reuse) a loop **preheader**, and hoist pure,
+//! loop-invariant instructions into it. MUST NOT hoist effectful / guard /
+//! call instructions, memory accesses, or anything that could change deopt
+//! behaviour. All loop-detection logic lives here (the frozen
+//! `pass::LoopForest::compute` stub is a no-op we deliberately do not depend
+//! on).
+//!
+//! Correctness notes:
+//!  * SSA dominance is preserved: a preheader is the sole non-back-edge
+//!    predecessor of its header, so it dominates the header and (transitively)
+//!    every loop-body block — a value defined in the preheader still dominates
+//!    all of its original in-loop uses.
+//!  * The deopt invariant (spec §4.10 R4.60) holds trivially: we only relocate
+//!    pure, non-guard instructions (which carry no `FrameState`) and never
+//!    change any value's identity, so no `FrameState` operand is orphaned.
 
-use crate::t2::ir::Function;
+use crate::t2::ir::{
+    AuxData, Block, BlockCall, DominatorTree, Function, Inst, InstData, InstFlags, Opcode,
+    ValueDef,
+};
 use crate::t2::pass::{Analyses, Pass};
 
 #[derive(Default)]
 pub struct Licm;
 
 impl Pass for Licm {
-    fn name(&self) -> &'static str { "licm" }
-    fn run(&mut self, _f: &mut Function, _a: &mut Analyses) {
-        todo!("P4b: loop-invariant code motion")
+    fn name(&self) -> &'static str {
+        "licm"
+    }
+
+    fn run(&mut self, f: &mut Function, a: &mut Analyses) {
+        // Detect natural loops from the *current* CFG, then transform each.
+        let dom = f.dominators();
+        let loops = detect_loops(f, &dom);
+
+        let mut changed = false;
+        for lp in &loops {
+            if hoist_loop(f, &dom, lp) {
+                changed = true;
+            }
+        }
+
+        if changed {
+            // We mutated the CFG (new preheader blocks, redirected edges) and
+            // moved value definitions between blocks.
+            a.invalidate();
+        }
+    }
+}
+
+/// A natural loop: its header and the set of blocks in its body (header
+/// included). Bodies are unioned across all back-edges sharing a header.
+struct NaturalLoop {
+    header: Block,
+    body: Vec<Block>,
+}
+
+impl NaturalLoop {
+    fn contains(&self, b: Block) -> bool {
+        self.body.contains(&b)
+    }
+}
+
+/// Identify natural loops (spec §4.5.6.1): a CFG edge `b → h` is a back-edge
+/// when `h` dominates `b`; the loop body is `{h} ∪ {n : n reaches b without
+/// passing through h}`. Bodies for back-edges that share a header are unioned.
+fn detect_loops(f: &Function, dom: &DominatorTree) -> Vec<NaturalLoop> {
+    let mut loops: Vec<NaturalLoop> = Vec::new();
+
+    for &b in f.block_order() {
+        for h in f.succs(b) {
+            if !dom.dominates(h, b) {
+                continue; // not a back-edge
+            }
+            // Natural-loop body for the back-edge b → h.
+            let body = loop_body(f, h, b);
+            // Merge into an existing loop with the same header, else push.
+            if let Some(existing) = loops.iter_mut().find(|l| l.header == h) {
+                for blk in body {
+                    if !existing.body.contains(&blk) {
+                        existing.body.push(blk);
+                    }
+                }
+            } else {
+                loops.push(NaturalLoop { header: h, body });
+            }
+        }
+    }
+
+    loops
+}
+
+/// Collect the loop body of back-edge `tail → header`: `{header}` plus every
+/// block that can reach `tail` without passing through `header` (standard
+/// backward flood that never expands past the header).
+fn loop_body(f: &Function, header: Block, tail: Block) -> Vec<Block> {
+    let mut body = vec![header];
+    let mut stack = Vec::new();
+    if tail != header {
+        body.push(tail);
+        stack.push(tail);
+    }
+    while let Some(n) = stack.pop() {
+        for p in f.preds(n) {
+            if !body.contains(&p) {
+                body.push(p);
+                stack.push(p);
+            }
+        }
+    }
+    body
+}
+
+/// Transform one loop: find hoistable instructions, materialise a preheader,
+/// and move them. Returns whether anything was hoisted.
+fn hoist_loop(f: &mut Function, dom: &DominatorTree, lp: &NaturalLoop) -> bool {
+    // Map every instruction to the block that currently contains it.
+    let inst_block = build_inst_block(f);
+
+    // Iterate to a fixpoint so that chains of invariants hoist together: an
+    // instruction becomes hoistable once all its operands are defined outside
+    // the loop *or* have themselves been marked for hoisting.
+    let mut hoisted: Vec<Inst> = Vec::new();
+    loop {
+        let mut progressed = false;
+        for &b in &lp.body {
+            // Snapshot the block's instruction list (indices) — we don't mutate
+            // it during detection.
+            let insts: Vec<Inst> = f.block(b).insts.clone();
+            for i in insts {
+                if hoisted.contains(&i) {
+                    continue;
+                }
+                if !is_pure_hoistable(f, i) {
+                    continue;
+                }
+                if operands_invariant(f, i, lp, &inst_block, &hoisted) {
+                    hoisted.push(i);
+                    progressed = true;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    if hoisted.is_empty() {
+        return false;
+    }
+
+    // Obtain a preheader (reuse a clean single entry pred, else create one).
+    let ph = ensure_preheader(f, dom, lp);
+
+    // Physically relocate the hoisted instructions.
+    //  1. Remove them from their current (in-loop) blocks.
+    for &b in &lp.body {
+        f.block_mut(b).insts.retain(|i| !hoisted.contains(i));
+    }
+    //  2. Insert them into the preheader, just before its terminator, in the
+    //     order discovered (which respects operand dependencies).
+    let term = f
+        .block_mut(ph)
+        .insts
+        .pop()
+        .expect("preheader must be terminated");
+    for &i in &hoisted {
+        f.block_mut(ph).insts.push(i);
+    }
+    f.block_mut(ph).insts.push(term);
+
+    true
+}
+
+/// Build an `inst index → defining block` table for the whole function.
+fn build_inst_block(f: &Function) -> Vec<Option<Block>> {
+    let mut map = vec![None; f.num_insts()];
+    for &b in f.block_order() {
+        for &i in &f.block(b).insts {
+            if i.index() < map.len() {
+                map[i.index()] = Some(b);
+            }
+        }
+    }
+    map
+}
+
+/// Is instruction `i` pure and shape-eligible for hoisting? Rejects anything
+/// effectful / guard / call / terminator / safepoint (spec §4.5.6.2), and —
+/// conservatively — every memory-access opcode, honouring §4.5.6.3 rules 2 & 4
+/// (loads need proven-invariant addresses; write-barriers must stay adjacent to
+/// their stores). We do not yet do alias analysis, so memory ops are pinned.
+fn is_pure_hoistable(f: &Function, i: Inst) -> bool {
+    let data = f.inst(i);
+    let fl: InstFlags = data.flags;
+    if fl.effectful || fl.guard || fl.call || fl.terminator || fl.safepoint {
+        return false;
+    }
+    opcode_hoist_safe(data.opcode)
+}
+
+/// Whitelist of opcodes safe to hoist (pure computation only). Memory access,
+/// allocation, calls, guards, and terminators are excluded.
+fn opcode_hoist_safe(op: Opcode) -> bool {
+    use Opcode::*;
+    matches!(
+        op,
+        ConstFixnum
+            | ConstFloat
+            | ConstChar
+            | ConstSymbol
+            | ConstNil
+            | ConstT
+            | ConstHeapObj
+            | FixnumAdd
+            | FixnumSub
+            | FixnumMul
+            | FixnumDiv
+            | FixnumRem
+            | FixnumMod
+            | FixnumNeg
+            | FixnumShl
+            | FixnumShr
+            | FloatAdd
+            | FloatSub
+            | FloatMul
+            | FloatDiv
+            | GenericAdd
+            | GenericSub
+            | GenericMul
+            | GenericDiv
+            | LogAnd
+            | LogOr
+            | LogXor
+            | LogNot
+            | BoxFixnum
+            | UnboxFixnum
+            | BoxFloat
+            | UnboxFloat
+            | WidenI32
+            | FixnumCmpEq
+            | FixnumCmpLt
+            | FixnumCmpLe
+            | FixnumCmpGt
+            | FixnumCmpGe
+            | FloatCmpEq
+            | FloatCmpLt
+            | GenericEq
+            | GenericEqual
+            | TypeCheck
+            | InstanceOf
+    )
+}
+
+/// Are all operands of `i` defined outside `lp` (or already hoisted)?
+fn operands_invariant(
+    f: &Function,
+    i: Inst,
+    lp: &NaturalLoop,
+    inst_block: &[Option<Block>],
+    hoisted: &[Inst],
+) -> bool {
+    for &arg in &f.inst(i).args {
+        let def_block = match f.value(arg).def {
+            ValueDef::Param { block, .. } => Some(block),
+            ValueDef::Result { inst, .. } => {
+                if hoisted.contains(&inst) {
+                    // An already-hoisted operand will live in the preheader,
+                    // which is outside the loop — treat as invariant.
+                    continue;
+                }
+                inst_block.get(inst.index()).copied().flatten()
+            }
+        };
+        match def_block {
+            Some(b) if lp.contains(b) => return false, // defined inside the loop → variant
+            _ => {} // outside the loop (or unknown def) → invariant
+        }
+    }
+    true
+}
+
+/// Return a preheader for `lp.header`: a single block that is the header's only
+/// non-back-edge predecessor and jumps unconditionally to it. Reuses an
+/// existing clean entry predecessor when possible, otherwise synthesises one
+/// and redirects all non-back-edge entry edges through it.
+fn ensure_preheader(f: &mut Function, dom: &DominatorTree, lp: &NaturalLoop) -> Block {
+    let header = lp.header;
+    let preds = f.preds(header);
+    // Partition predecessors into back-edge sources (dominated by the header)
+    // and outside entry edges.
+    let outside: Vec<Block> = preds
+        .iter()
+        .copied()
+        .filter(|&p| !dom.dominates(header, p))
+        .collect();
+
+    // Reuse: exactly one outside pred that jumps *only* to the header.
+    if outside.len() == 1 {
+        let p = outside[0];
+        if p != header && f.succs(p) == vec![header] {
+            return p;
+        }
+    }
+
+    // Otherwise synthesise a fresh preheader.
+    let ph = f.make_block();
+
+    // Mirror the header's parameters so multiple entry edges can be merged and
+    // forwarded (preserving SSA). The preheader's params feed the header on the
+    // single new edge.
+    let header_params: Vec<_> = f.block(header).params.clone();
+    let mut fwd_args = Vec::with_capacity(header_params.len());
+    for hp in header_params {
+        let v = f.value(hp);
+        let np = f.add_block_param(ph, v.ty, v.repr);
+        fwd_args.push(np);
+    }
+
+    // Preheader → header jump, forwarding the merged parameters.
+    f.set_terminator(
+        ph,
+        InstData {
+            opcode: Opcode::Jump,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![BlockCall {
+                block: header,
+                args: fwd_args,
+            }],
+            frame_state: None,
+            source_pos: 0,
+        },
+    );
+
+    // Redirect every outside entry edge from the header to the preheader,
+    // keeping the arguments it already supplied (they now bind the preheader's
+    // params).
+    for p in outside {
+        if let Some(term) = f.terminator(p) {
+            for tgt in &mut f.inst_mut(term).targets {
+                if tgt.block == header {
+                    tgt.block = ph;
+                }
+            }
+        }
+    }
+
+    ph
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::t2::ir::{IRType, TypeBits, Value, ValueRepresentation};
+
+    fn tagged_fixnum() -> (IRType, ValueRepresentation) {
+        (IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)
+    }
+
+    fn jump(target: Block, args: Vec<Value>) -> InstData {
+        InstData {
+            opcode: Opcode::Jump,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![BlockCall { block: target, args }],
+            frame_state: None,
+            source_pos: 0,
+        }
+    }
+
+    fn brif(t0: Block, t1: Block, cond: Value, a0: Vec<Value>, a1: Vec<Value>) -> InstData {
+        InstData {
+            opcode: Opcode::Brif,
+            args: vec![cond],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![
+                BlockCall { block: t0, args: a0 },
+                BlockCall { block: t1, args: a1 },
+            ],
+            frame_state: None,
+            source_pos: 0,
+        }
+    }
+
+    fn ret() -> InstData {
+        InstData {
+            opcode: Opcode::Return,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        }
+    }
+
+    /// Which block currently holds instruction `i`?
+    fn block_of(f: &Function, i: Inst) -> Block {
+        for &b in f.block_order() {
+            if f.block(b).insts.contains(&i) {
+                return b;
+            }
+        }
+        panic!("inst not found in any block")
+    }
+
+    /// Build a counted loop:
+    ///
+    /// ```text
+    ///   entry:  n = const 100          ; jump header(0)
+    ///   header(i): cond = i < n        ; brif body, exit
+    ///   body:   inv  = a + b           ; loop-invariant  (hoist me)
+    ///           var  = i + inv         ; loop-variant    (pin: uses i)
+    ///           _eff = <effectful add> ; effectful       (pin)
+    ///           i2   = i + 1           ; jump header(i2)  [back-edge]
+    ///   exit:   return
+    /// ```
+    #[test]
+    fn counted_loop_hoists_invariant_only() {
+        let mut f = Function::new("counted");
+        let (ty, repr) = tagged_fixnum();
+
+        let entry = f.entry();
+        let header = f.make_block();
+        let body = f.make_block();
+        let exit = f.make_block();
+
+        // Loop induction parameter on the header.
+        let i = f.add_block_param(header, ty, repr);
+
+        // entry: two invariant constants + jump header(zero).
+        let (_, a_res) = f.push_inst(
+            entry,
+            const_fixnum(3),
+            &[(ty, repr)],
+        );
+        let a = a_res[0];
+        let (_, b_res) = f.push_inst(
+            entry,
+            const_fixnum(4),
+            &[(ty, repr)],
+        );
+        let b = b_res[0];
+        let (_, zero_res) = f.push_inst(entry, const_fixnum(0), &[(ty, repr)]);
+        let zero = zero_res[0];
+        f.set_terminator(entry, jump(header, vec![zero]));
+
+        // header: cond = i < n-ish; use a constant compare operand for simplicity.
+        let (_, cond_res) = f.push_inst(
+            header,
+            InstData {
+                opcode: Opcode::FixnumCmpLt,
+                args: vec![i, a],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(ty, repr)],
+        );
+        let cond = cond_res[0];
+        f.set_terminator(header, brif(body, exit, cond, vec![], vec![]));
+
+        // body: invariant add (a + b) — both defined in entry, outside loop.
+        let (inv_inst, _) = f.push_inst(
+            body,
+            add(a, b),
+            &[(ty, repr)],
+        );
+        // variant add (i + inv) — uses the header param i, so loop-variant.
+        let (var_inst, var_res) = f.push_inst(
+            body,
+            add(i, f.inst(inv_inst).results[0]),
+            &[(ty, repr)],
+        );
+        let _ = var_res;
+        // effectful add — flags mark a side effect; must NOT hoist even though
+        // its operands are invariant.
+        let (eff_inst, _) = f.push_inst(
+            body,
+            InstData {
+                opcode: Opcode::FixnumAdd,
+                args: vec![a, b],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags { effectful: true, ..InstFlags::default() },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(ty, repr)],
+        );
+        // i2 = i + 1 (back-edge value).
+        let (_, one_res) = f.push_inst(body, const_fixnum(1), &[(ty, repr)]);
+        let one = one_res[0];
+        let (inc_inst, inc_res) = f.push_inst(body, add(i, one), &[(ty, repr)]);
+        let _ = inc_inst;
+        let i2 = inc_res[0];
+        f.set_terminator(body, jump(header, vec![i2]));
+
+        f.set_terminator(exit, ret());
+
+        // Record where each instruction lives before LICM.
+        let inv_before = block_of(&f, inv_inst);
+        let var_before = block_of(&f, var_inst);
+        let eff_before = block_of(&f, eff_inst);
+        assert_eq!(inv_before, body);
+        assert_eq!(var_before, body);
+        assert_eq!(eff_before, body);
+
+        // Run the pass.
+        let mut a_cache = Analyses::new();
+        Licm.run(&mut f, &mut a_cache);
+
+        let inv_after = block_of(&f, inv_inst);
+        let var_after = block_of(&f, var_inst);
+        let eff_after = block_of(&f, eff_inst);
+
+        // The invariant add MUST have moved out of the body.
+        assert_ne!(inv_after, body, "invariant add should have been hoisted");
+        // It landed in the preheader (here: reused `entry`, the sole clean pred).
+        assert_eq!(inv_after, entry, "invariant add should live in the preheader");
+        // The variant add and the effectful add MUST stay pinned in the body.
+        assert_eq!(var_after, body, "loop-variant add must stay in the loop");
+        assert_eq!(eff_after, body, "effectful add must stay in the loop");
+    }
+
+    /// Header with two outside entry edges forces a *fresh* preheader block to
+    /// be synthesised, and the invariant hoists into it.
+    #[test]
+    fn multi_entry_header_creates_preheader() {
+        let mut f = Function::new("multi_entry");
+        let (ty, repr) = tagged_fixnum();
+
+        let entry = f.entry();
+        let ea = f.make_block();
+        let eb = f.make_block();
+        let header = f.make_block();
+        let body = f.make_block();
+        let exit = f.make_block();
+
+        let i = f.add_block_param(header, ty, repr);
+
+        // entry: const cond, brif to two entry blocks.
+        let (_, c_res) = f.push_inst(entry, const_fixnum(1), &[(ty, repr)]);
+        let c = c_res[0];
+        f.set_terminator(entry, brif(ea, eb, c, vec![], vec![]));
+
+        // Two invariant seeds, one per entry arm.
+        let (_, a_res) = f.push_inst(ea, const_fixnum(3), &[(ty, repr)]);
+        let a = a_res[0];
+        let (_, z0) = f.push_inst(ea, const_fixnum(0), &[(ty, repr)]);
+        f.set_terminator(ea, jump(header, vec![z0[0]]));
+
+        let (_, b_res) = f.push_inst(eb, const_fixnum(4), &[(ty, repr)]);
+        let b = b_res[0];
+        let (_, z1) = f.push_inst(eb, const_fixnum(0), &[(ty, repr)]);
+        f.set_terminator(eb, jump(header, vec![z1[0]]));
+
+        // header compare + branch.
+        let (_, cond_res) = f.push_inst(
+            header,
+            InstData {
+                opcode: Opcode::FixnumCmpLt,
+                args: vec![i, a],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(ty, repr)],
+        );
+        let cond = cond_res[0];
+        f.set_terminator(header, brif(body, exit, cond, vec![], vec![]));
+
+        // body: invariant a + b (both defined in the entry arms, outside loop).
+        let (inv_inst, _) = f.push_inst(body, add(a, b), &[(ty, repr)]);
+        let (_, one_res) = f.push_inst(body, const_fixnum(1), &[(ty, repr)]);
+        let (_, inc_res) = f.push_inst(body, add(i, one_res[0]), &[(ty, repr)]);
+        f.set_terminator(body, jump(header, vec![inc_res[0]]));
+
+        f.set_terminator(exit, ret());
+
+        let blocks_before = f.num_blocks();
+        assert_eq!(block_of(&f, inv_inst), body);
+
+        let mut a_cache = Analyses::new();
+        Licm.run(&mut f, &mut a_cache);
+
+        // A fresh preheader block was created.
+        assert_eq!(
+            f.num_blocks(),
+            blocks_before + 1,
+            "a new preheader block should be synthesised"
+        );
+        let inv_after = block_of(&f, inv_inst);
+        assert_ne!(inv_after, body, "invariant should be hoisted out of the body");
+
+        // The preheader is the new block, is the header's only non-back-edge
+        // pred, and jumps to the header.
+        let dom = f.dominators();
+        let preds = f.preds(header);
+        let outside: Vec<_> = preds
+            .iter()
+            .copied()
+            .filter(|&p| !dom.dominates(header, p))
+            .collect();
+        assert_eq!(outside.len(), 1, "header should have a single entry pred now");
+        let ph = outside[0];
+        assert_eq!(inv_after, ph, "invariant should live in the preheader");
+        assert_eq!(f.succs(ph), vec![header]);
+        // Both original entry arms now route into the preheader.
+        assert!(f.succs(ea).contains(&ph));
+        assert!(f.succs(eb).contains(&ph));
+    }
+
+    /// A loop with no invariant instructions leaves the CFG untouched.
+    #[test]
+    fn no_invariant_no_preheader() {
+        let mut f = Function::new("noop");
+        let (ty, repr) = tagged_fixnum();
+
+        let entry = f.entry();
+        let header = f.make_block();
+        let exit = f.make_block();
+        let i = f.add_block_param(header, ty, repr);
+
+        let (_, z) = f.push_inst(entry, const_fixnum(0), &[(ty, repr)]);
+        f.set_terminator(entry, jump(header, vec![z[0]]));
+
+        // Only a variant increment + self-branch; nothing to hoist.
+        let (_, one) = f.push_inst(header, const_fixnum(1), &[(ty, repr)]);
+        let (_, inc) = f.push_inst(header, add(i, one[0]), &[(ty, repr)]);
+        f.set_terminator(header, brif(header, exit, i, vec![inc[0]], vec![]));
+        f.set_terminator(exit, ret());
+
+        let blocks_before = f.num_blocks();
+        let mut a_cache = Analyses::new();
+        Licm.run(&mut f, &mut a_cache);
+        assert_eq!(f.num_blocks(), blocks_before, "no preheader when nothing hoists");
+    }
+
+    // ── small InstData builders ──
+    fn const_fixnum(v: i64) -> InstData {
+        InstData {
+            opcode: Opcode::ConstFixnum,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::FixnumImm(v),
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        }
+    }
+
+    fn add(x: Value, y: Value) -> InstData {
+        InstData {
+            opcode: Opcode::FixnumAdd,
+            args: vec![x, y],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        }
     }
 }
