@@ -9470,7 +9470,12 @@ enum LoopForLimit {
 }
 
 enum LoopBeingSource {
+    /// `:being :the :symbols :in pkg` — all accessible symbols (incl. inherited).
     Symbols(BlissVal),
+    /// `:being :the {:external-symbols | :present-symbols} :in pkg` — the package's
+    /// own symbols (matching DO-EXTERNAL-SYMBOLS; ASDF DEFINE-PACKAGE exports what
+    /// it homes here).
+    OwnSymbols(BlissVal),
     HashKeys(BlissVal),
     HashValues(BlissVal),
 }
@@ -9616,19 +9621,22 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                         };
                         let kind_bare = kind_name.strip_prefix("KEYWORD:").unwrap_or(&kind_name);
                         let source = match kind_bare {
-                            "SYMBOLS" => {
-                                let in_kw = p.read_form()?;
-                                let in_name = if in_kw.is_symbol() {
-                                    sym_name(in_kw)
-                                } else {
-                                    String::new()
-                                };
-                                if in_name.strip_prefix("KEYWORD:").unwrap_or(&in_name) != "IN" {
+                            "SYMBOLS" | "EXTERNAL-SYMBOLS" | "PRESENT-SYMBOLS" => {
+                                // The connective is :in or :of (ANSI accepts both).
+                                let conn = p.read_form()?;
+                                let conn_name = if conn.is_symbol() { sym_name(conn) } else { String::new() };
+                                let conn_bare = conn_name.strip_prefix("KEYWORD:").unwrap_or(&conn_name);
+                                if conn_bare != "IN" && conn_bare != "OF" {
                                     return Err(BlissError::Internal(
-                                        "LOOP :for ... :being :the :symbols expects :in".into(),
+                                        "LOOP :for ... :being <symbols> expects :in or :of".into(),
                                     ));
                                 }
-                                LoopBeingSource::Symbols(p.read_form()?)
+                                let pkg = p.read_form()?;
+                                if kind_bare == "SYMBOLS" {
+                                    LoopBeingSource::Symbols(pkg)
+                                } else {
+                                    LoopBeingSource::OwnSymbols(pkg)
+                                }
                             }
                             "HASH-KEYS" => {
                                 let of_kw = p.read_form()?;
@@ -9660,7 +9668,7 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                             }
                             _ => {
                                 return Err(BlissError::Internal(
-                                    "LOOP :for ... :being supports :symbols / :hash-keys / :hash-values in the bootstrap"
+                                    "LOOP :for ... :being supports :symbols / :external-symbols / :present-symbols / :hash-keys / :hash-values in the bootstrap"
                                         .into(),
                                 ));
                             }
@@ -9912,8 +9920,12 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 ForClause::Being { pat, source } => {
                     let items = match source {
                         LoopBeingSource::Symbols(pkg_form) => {
-                            let _ = eval_form(*pkg_form, env)?;
-                            Vec::new()
+                            let name = normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
+                            package_symbols(env, &name, true)
+                        }
+                        LoopBeingSource::OwnSymbols(pkg_form) => {
+                            let name = normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
+                            package_symbols(env, &name, false)
                         }
                         LoopBeingSource::HashKeys(table_form) => {
                             let table = eval_form(*table_form, env)?;
