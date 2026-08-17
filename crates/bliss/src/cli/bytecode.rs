@@ -4449,6 +4449,33 @@ extern "C" fn c2i_deopt_state(bcp: u64, depth: u64) {
     NATIVE_DEOPT_RESUME.with(|c| c.set(Some((bcp as u32, depth as u16))));
 }
 
+/// Precise state-transfer deopt for T2 optimising code (bliss-mba). Unlike T1,
+/// T2/`emit_framed` is register-based and does NOT keep the interpreter frame's
+/// locals/operand-stack live in memory, so a failed guard cannot resume T0 on
+/// the frame as-is. Instead the guard's per-instruction deopt stub reconstructs
+/// the frame here: `buf` points to `n_total` tagged `BlissVal`s — the guard's
+/// `FrameState` locals (slots `0..n_locals`) followed by its live operand-stack
+/// slots (slots `n_locals..n_total`), in slot-index order — which we write into
+/// the current (top) frame before recording the resume point. `run_native` then
+/// takes the same `resume_in_t0` path T1 uses: no whole-function rerun, so a
+/// side effect committed before `bcp` runs exactly once.
+extern "C" fn c2i_deopt_t2(bcp: u64, sp_top: u64, buf: *const u64, n_total: u64) {
+    // The T2 activation is the current top frame (`run_native` pushed it and no
+    // nested call is live at a guard in the T2 body).
+    let frame = bliss_rt::current_thread().stack().fp() as *mut Frame;
+    if !frame.is_null() {
+        for i in 0..n_total as usize {
+            // SAFETY: `buf` is the stub's on-stack reconstruction buffer of
+            // exactly `n_total` u64s; `frame` has `num_slots >= n_total` slots
+            // (n_locals + max_stack, sized by the compiler from this function).
+            let v = unsafe { BlissVal(*buf.add(i)) };
+            unsafe { slot_set(frame, i as u16, v) };
+        }
+    }
+    NATIVE_DEOPT.with(|d| d.set(true));
+    NATIVE_DEOPT_RESUME.with(|c| c.set(Some((bcp as u32, sp_top as u16))));
+}
+
 /// Installed T1 native code for a function. Its CL activation (locals + operand
 /// stack) lives in a BlissStack frame that the i2c adapter pushes; the native
 /// code addresses it through the frame-slot pointer passed in rdi (§D2.04).
@@ -5772,8 +5799,9 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
     }
 
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
+    let deopt_t2_addr = c2i_deopt_t2 as extern "C" fn(u64, u64, *const u64, u64) as usize as u64;
     let call_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64) -> u64 as usize as u64;
-    let framed = match bliss_compiler::t2::emit::emit_framed(&f, deopt_addr, call_addr, Some(sym)) {
+    let framed = match bliss_compiler::t2::emit::emit_framed(&f, deopt_addr, deopt_t2_addr, call_addr, Some(sym)) {
         Ok(fc) => fc,
         Err(e) => {
             t2_log!("{name}: emit_framed failed: {e:?} (shape beyond emitter) => stay T1");

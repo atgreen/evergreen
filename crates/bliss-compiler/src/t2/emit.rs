@@ -135,6 +135,30 @@ fn mov_from_frame(a: &mut Asm, dst: u8, base: u8, i: usize) {
 }
 
 /// `sar r64, imm8`.
+/// `mov [rsp + disp], src` (REX.W). rsp as the base register forces a SIB byte
+/// (rm=100), so this cannot reuse `mov_from_frame`'s no-SIB encoding. Used by the
+/// precise-deopt stubs (bliss-mba) to spill reconstructed slot values.
+fn store_to_rsp(a: &mut Asm, src: u8, disp: i32) {
+    let mut rex = 0x48u8; // REX.W
+    if src >= 8 {
+        rex |= 0x04; // REX.R
+    }
+    a.push(rex);
+    a.push(0x89); // mov r/m64, r64
+    if disp == 0 {
+        a.push(((src & 7) << 3) | 0x04); // mod=00, rm=100 (SIB follows)
+        a.push(0x24); // SIB: scale=0 index=none base=rsp
+    } else if (-128..=127).contains(&disp) {
+        a.push(0x40 | ((src & 7) << 3) | 0x04); // mod=01 (disp8)
+        a.push(0x24);
+        a.push(disp as u8);
+    } else {
+        a.push(0x80 | ((src & 7) << 3) | 0x04); // mod=10 (disp32)
+        a.push(0x24);
+        a.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
 fn sar_imm(a: &mut Asm, r: u8, imm: u8) {
     a.push(rex_w(0, r));
     a.push(0xC1);
@@ -1053,10 +1077,12 @@ fn is_const_opcode(op: crate::t2::ir::Opcode) -> bool {
 pub fn emit_framed(
     f: &Function,
     c2i_deopt_addr: u64,
+    c2i_deopt_t2_addr: u64,
     c2i_call_addr: u64,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
-    use crate::t2::ir::{AuxData, Block, Opcode, Value, ValueDef};
+    use crate::t2::frame_state::ValueSource;
+    use crate::t2::ir::{AuxData, Block, Inst, Opcode, Value, ValueDef, ValueRepresentation};
     use std::collections::{HashMap, HashSet};
 
     let entry = f.entry();
@@ -1066,6 +1092,37 @@ pub fn emit_framed(
         .block_order()
         .iter()
         .any(|&b| f.block(b).insts.iter().any(|&i| f.inst(i).opcode == Opcode::Call));
+
+    // Precise state-transfer deopt (bliss-mba): a function that CALLS other code
+    // can commit a visible side effect before a later guard fails, so re-running
+    // it whole (the plain `c2i_deopt` path) would double that effect. For such
+    // functions each guard instead reconstructs the interpreter frame at its own
+    // bytecode position and resumes T0 there (like T1). We only need this where a
+    // side effect can precede a guard — i.e. `has_calls` (a no-call function is
+    // pure here: its only side-effect op, StoreGlobal, isn't emittable yet, so it
+    // declines to T1 anyway — and re-running a pure function is observably safe).
+    let precise = has_calls;
+    // The SSA values named by some guard's FrameState — the *deopt-live* set. In
+    // precise mode these must be reconstructable at their guard, so they may not
+    // be freed early (liveness is extended to the guard below) nor overwritten by
+    // an in-place result reuse (which a later overflow `jo` would deopt through).
+    let mut deopt_live: HashSet<Value> = HashSet::new();
+    if precise {
+        for &b in f.block_order() {
+            for &inst in &f.block(b).insts {
+                if let Some(fsid) = f.inst(inst).frame_state {
+                    let fs = f.frame_states.get(fsid);
+                    if let Some(scope) = fs.scopes.last() {
+                        for src in scope.locals.iter().chain(scope.stack.iter()) {
+                            if let ValueSource::Value { value, .. } = src {
+                                deopt_live.insert(*value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Emit the entry block first (the prologue falls into it).
     let mut blocks: Vec<Block> = f.block_order().to_vec();
     if blocks.first() != Some(&entry) {
@@ -1335,6 +1392,21 @@ pub fn emit_framed(
             for &v in &d.args {
                 last_use.insert(v, at);
             }
+            // A guard's FrameState references (deopt-live values) count as a use at
+            // the guard, so a value read only *before* the guard still holds its
+            // register there for reconstruction (bliss-mba).
+            if precise {
+                if let Some(fsid) = d.frame_state {
+                    let fs = f.frame_states.get(fsid);
+                    if let Some(scope) = fs.scopes.last() {
+                        for src in scope.locals.iter().chain(scope.stack.iter()) {
+                            if let ValueSource::Value { value, .. } = src {
+                                last_use.insert(*value, at);
+                            }
+                        }
+                    }
+                }
+            }
         }
         if let Some(t) = f.terminator(b) {
             for tc in &f.inst(t).targets {
@@ -1375,6 +1447,10 @@ pub fn emit_framed(
                             && last_use.get(&v) == Some(&idx)
                             && reg.contains_key(&v)
                             && d.args.get(1) != Some(&v)
+                            // A deopt-live operand must stay intact for its guard's
+                            // frame reconstruction; never overwrite it in place
+                            // (bliss-mba).
+                            && !(precise && deopt_live.contains(&v))
                     });
                     if let Some(v) = inplace {
                         reg.insert(r0, reg[&v]);
@@ -1392,6 +1468,32 @@ pub fn emit_framed(
 
     let mut a = Asm::new();
     let deopt = a.label();
+    // Precise deopt (bliss-mba): each guarding instruction gets its own deopt stub
+    // that reconstructs the interpreter frame at that guard's bytecode position.
+    // Every instruction that reaches `emit_arith_inst` (the only guard emitter)
+    // MUST carry a FrameState, or we cannot resume precisely — decline to T1. In
+    // practice speculation always keeps the FrameState on the ops it types, so
+    // this only rejects exotic shapes.
+    let mut inst_deopt: HashMap<Inst, bliss_rt::asm::Label> = HashMap::new();
+    if precise {
+        for &b in &blocks {
+            for &inst in &f.block(b).insts {
+                let d = f.inst(inst);
+                if is_const_opcode(d.opcode)
+                    || d.opcode.is_terminator()
+                    || fused.contains(&inst)
+                    || matches!(d.opcode, Opcode::Call | Opcode::GenericEq | Opcode::TypeCheck)
+                {
+                    continue;
+                }
+                // Reaches emit_arith_inst → may emit a guard → needs a FrameState.
+                if d.frame_state.is_none() {
+                    return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
+                }
+                inst_deopt.insert(inst, a.label());
+            }
+        }
+    }
     let mut block_label: HashMap<Block, bliss_rt::asm::Label> = HashMap::new();
     for &b in &blocks {
         block_label.insert(b, a.label());
@@ -1496,7 +1598,10 @@ pub fn emit_framed(
             } else if d.opcode == Opcode::TypeCheck {
                 emit_type_check(&mut a, &d, &mut reg, &mut pool, &const_tagged)?;
             } else {
-                emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, &val_range, &mut proven, deopt)?;
+                // In precise mode this inst has its own reconstruction stub (built
+                // above); route its guards there instead of the whole-rerun stub.
+                let inst_deopt_label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
+                emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, &val_range, &mut proven, inst_deopt_label)?;
             }
         }
 
@@ -1616,6 +1721,79 @@ pub fn emit_framed(
     a.extend_from_slice(&[0xFF, 0xD0]); // call rax
     a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
     a.push(0xC3); // ret
+
+    // Precise per-guard deopt stubs (bliss-mba). Each reconstructs the exact T0
+    // interpreter frame this guard's FrameState describes — locals into slots
+    // 0..n_locals, live operands into slots n_locals.., all still tagged (no
+    // unboxing exists yet) — then calls c2i_deopt_t2 to write them into the
+    // current frame and record the resume (bcp, sp_top). run_native then takes the
+    // same resume_in_t0 path T1 uses, so a side effect committed before `bcp`
+    // runs exactly once. The value regs are still live here (read BEFORE the
+    // epilogue restores callee-saved). rsp%16==0 after the has_calls prologue, so
+    // a 16-multiple sub keeps the call aligned.
+    enum SlotSrc {
+        Reg(u8),
+        Imm(u64),
+    }
+    for (&inst, &label) in &inst_deopt {
+        let fsid = f.inst(inst).frame_state.ok_or(EmitError::UnsupportedOp(0xF4))?;
+        let fs = f.frame_states.get(fsid);
+        let scope = fs.scopes.last().ok_or(EmitError::UnsupportedOp(0xF4))?;
+        let n_stack = scope.stack.len();
+        let n_total = scope.locals.len() + n_stack;
+        // Resolve every slot to a register or an immediate; decline (=> stay T1) if
+        // any source cannot be reconstructed as a tagged value.
+        let mut srcs: Vec<SlotSrc> = Vec::with_capacity(n_total);
+        for vs in scope.locals.iter().chain(scope.stack.iter()) {
+            let s = match vs {
+                ValueSource::Value { value, repr } => {
+                    if *repr != ValueRepresentation::Tagged {
+                        return Err(EmitError::UnsupportedOp(0xF5)); // unboxed rebox not modelled
+                    }
+                    if let Some(&bits) = const_tagged.get(value) {
+                        SlotSrc::Imm(bits)
+                    } else if let Some(&r) = reg.get(value) {
+                        SlotSrc::Reg(r)
+                    } else {
+                        return Err(EmitError::UnsupportedOp(0xF6)); // not materialised
+                    }
+                }
+                ValueSource::Const(bv) => SlotSrc::Imm(bv.0),
+                ValueSource::Unbound => SlotSrc::Imm(bliss_rt::value::UNBOUND.0),
+                ValueSource::Remat(_) => return Err(EmitError::UnsupportedOp(0xF7)),
+            };
+            srcs.push(s);
+        }
+        let alloc = ((n_total * 8) + 15) & !15; // 16-aligned buffer bytes
+
+        a.bind(label);
+        if alloc > 0 {
+            a.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, imm32
+            a.extend_from_slice(&(alloc as i32).to_le_bytes());
+        }
+        for (i, s) in srcs.iter().enumerate() {
+            match s {
+                SlotSrc::Reg(r) => store_to_rsp(&mut a, *r, (i * 8) as i32),
+                SlotSrc::Imm(bits) => {
+                    mov_imm64(&mut a, 0 /* rax scratch */, *bits as i64);
+                    store_to_rsp(&mut a, 0, (i * 8) as i32);
+                }
+            }
+        }
+        // c2i_deopt_t2(bcp=rdi, sp_top=rsi, buf=rdx=rsp, n_total=rcx)
+        mov_imm32(&mut a, 7, scope.bcp);
+        mov_imm32(&mut a, 6, n_stack as u32);
+        mov_imm32(&mut a, 1, n_total as u32);
+        mov_rr(&mut a, 2, 4); // mov rdx, rsp
+        mov_imm64(&mut a, 0, c2i_deopt_t2_addr as i64);
+        a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        if alloc > 0 {
+            a.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, imm32
+            a.extend_from_slice(&(alloc as i32).to_le_bytes());
+        }
+        emit_epilogue(&mut a);
+        a.push(0xC3); // ret
+    }
 
     let code = a.finish().ok_or(EmitError::BadBranch)?;
     Ok(FramedCode { code, compiled_entry })
@@ -1809,7 +1987,7 @@ mod tests {
     fn framed_fixnum_mul_runs_and_deopts() {
         use bliss_rt::value::BlissVal;
         let f = speculated_mul5();
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, None).expect("emit_framed").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, None).expect("emit_framed").code;
         let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap");
         // extern "C" fn(*mut u64) -> u64 : rdi = frame slots, returns rax.
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
@@ -1891,7 +2069,7 @@ mod tests {
     fn strength_reduces_to_lea_when_range_is_safe() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, None).expect("emit").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, None).expect("emit").code;
         // `lea rax,[rcx+rcx*4]` = 48 8D 04 89 ; and NO overflow branch (0F 80).
         assert!(contains(&code, &[0x48, 0x8D, 0x04, 0x89]), "must emit lea for a range-safe *5");
         assert!(!contains(&code, &[0x0F, 0x80]), "range proves no overflow → no jo deopt");
@@ -1908,7 +2086,7 @@ mod tests {
     fn keeps_imul_and_overflow_check_when_range_unknown() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, None);
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, None).expect("emit").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, None).expect("emit").code;
         assert!(contains(&code, &[0x48, 0x69, 0xC1]), "unknown range → imul rax,rcx,5");
         assert!(contains(&code, &[0x0F, 0x80]), "unknown range → keep the jo overflow deopt");
         let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
@@ -1926,7 +2104,7 @@ mod tests {
     fn compiled_entry_takes_register_args() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
-        let framed = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, None).expect("emit");
+        let framed = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, None).expect("emit");
         assert!(framed.compiled_entry > 0, "a register entry must sit past the frame-load prologue");
         let buf = bliss_rt::jit::JitBuffer::new(&framed.code).unwrap();
         let entry = buf.as_ptr() as usize + framed.compiled_entry;
@@ -2011,7 +2189,7 @@ mod tests {
     fn float_mul_runs_and_deopts() {
         use bliss_rt::value::BlissVal;
         let f = build_float_arith(crate::t2::ir::Opcode::FloatMul, 5);
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, None).expect("emit").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, None).expect("emit").code;
         let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 
