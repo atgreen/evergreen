@@ -157,6 +157,13 @@ fn neg_r(a: &mut Asm, r: u8) {
     a.push(0xD8 | (r & 7)); // /3
 }
 
+/// `not r64` (one's complement).
+fn not_r(a: &mut Asm, r: u8) {
+    a.push(rex_w(0, r));
+    a.push(0xF7);
+    a.push(0xD0 | (r & 7)); // /2
+}
+
 // ── Single-float (XMM) encoders ─────────────────────────────────────
 //
 // A single-float BlissVal is the immediate `(f32_bits << 32) | 0b100`: the raw
@@ -507,9 +514,8 @@ fn emit_arith_inst(
     use crate::t2::ir::Opcode;
     // Robustness: never index past the operands — decline (=> stay T1) instead of
     // panicking in the JIT path if a speculated op has an unexpected shape.
-    if data.results.is_empty()
-        || data.args.len() < if data.opcode == Opcode::FixnumNeg { 1 } else { 2 }
-    {
+    let is_unary = matches!(data.opcode, Opcode::FixnumNeg | Opcode::LogNot);
+    if data.results.is_empty() || data.args.len() < if is_unary { 1 } else { 2 } {
         return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
     }
     let dst = framed_alloc(reg, pool, data.results[0])?;
@@ -596,6 +602,45 @@ fn emit_arith_inst(
             mov_rr(a, dst, x);
             neg_r(a, dst); // tagged(-x) = -(x<<3)
             a.jcc(Cc::O, deopt); // negating the most-negative fixnum overflows
+        }
+        Opcode::LogAnd | Opcode::LogOr | Opcode::LogXor => {
+            // Exact on the tagged representation: tagged(a) OP tagged(b) =
+            // (a OP b)<<3 = tagged(a OP b). No untag, no overflow.
+            let (a0, b0) = (data.args[0], data.args[1]);
+            let (rr_op, imm_ext) = match data.opcode {
+                Opcode::LogAnd => (0x21u8, 4u8),
+                Opcode::LogOr => (0x09, 1),
+                Opcode::LogXor => (0x31, 6),
+                _ => unreachable!(),
+            };
+            let folded = if let Some(&c) = consts.get(&b0) {
+                Some((a0, c))
+            } else {
+                consts.get(&a0).map(|&c| (b0, c))
+            };
+            if let Some((var, c)) = folded {
+                if let Ok(t32) = tagged32(c) {
+                    let x = *reg.get(&var).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                    guard(a, var, x);
+                    mov_rr(a, dst, x);
+                    alu_r_imm(a, imm_ext, dst, t32); // OP dst, tagged(c)
+                    return Ok(());
+                }
+            }
+            let x = framed_mat(a, reg, pool, consts, a0)?;
+            let y = framed_mat(a, reg, pool, consts, b0)?;
+            guard(a, a0, x);
+            guard(a, b0, y);
+            mov_rr(a, dst, x);
+            alu_rr(a, rr_op, dst, y);
+        }
+        Opcode::LogNot => {
+            let a0 = data.args[0];
+            let x = framed_mat(a, reg, pool, consts, a0)?;
+            guard(a, a0, x);
+            mov_rr(a, dst, x);
+            not_r(a, dst);
+            alu_r_imm(a, 4, dst, -8); // and dst, ~7 → clears the tag bits: tagged(~a)
         }
         Opcode::FloatMul | Opcode::FloatAdd | Opcode::FloatSub => {
             float_operand_to_xmm(a, 0, data.args[0], reg, consts, float_consts, deopt)?;
@@ -784,7 +829,19 @@ fn is_fixnum_guarding_op(op: crate::t2::ir::Opcode) -> bool {
     use crate::t2::ir::Opcode::*;
     matches!(
         op,
-        FixnumAdd | FixnumSub | FixnumMul | FixnumNeg | FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe
+        FixnumAdd
+            | FixnumSub
+            | FixnumMul
+            | FixnumNeg
+            | LogAnd
+            | LogOr
+            | LogXor
+            | LogNot
+            | FixnumCmpEq
+            | FixnumCmpLt
+            | FixnumCmpLe
+            | FixnumCmpGt
+            | FixnumCmpGe
     )
 }
 

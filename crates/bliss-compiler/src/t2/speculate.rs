@@ -47,6 +47,36 @@ fn arith_of(sym: u32) -> Option<Arith> {
     }
 }
 
+#[derive(Copy, Clone)]
+enum Bitwise {
+    And,
+    Or,
+    Xor,
+    Not,
+}
+
+/// A bitwise op we speculate (fixnum only). These are exact on the tagged
+/// representation — `tagged(a) OP tagged(b) = (a OP b)<<3` — so no overflow and no
+/// untag/retag. Crypto/compression/hashing are dominated by these.
+fn bitwise_of(sym: u32) -> Option<Bitwise> {
+    match bliss_rt::symbols::symbol_name(sym).as_deref() {
+        Some("LOGAND") => Some(Bitwise::And),
+        Some("LOGIOR") => Some(Bitwise::Or),
+        Some("LOGXOR") => Some(Bitwise::Xor),
+        Some("LOGNOT") => Some(Bitwise::Not),
+        _ => None,
+    }
+}
+
+fn bitwise_opcode(b: Bitwise) -> Opcode {
+    match b {
+        Bitwise::And => Opcode::LogAnd,
+        Bitwise::Or => Opcode::LogOr,
+        Bitwise::Xor => Opcode::LogXor,
+        Bitwise::Not => Opcode::LogNot,
+    }
+}
+
 /// The comparison a callee symbol names, if it is one we speculate. These feed
 /// `Brif`, so speculating them (guarded fixnum/float `Cmp`) is what lets a branch
 /// on `(< x n)` reach T2 as a `cmp`+`jcc` instead of a generic call.
@@ -142,6 +172,12 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
                     if let Some(op) = typed_cmp_opcode(cmp, spec) {
                         work.push((inst, op, IRType::TOP));
                     }
+                }
+            } else if let Some(bit) = bitwise_of(sym) {
+                // Bitwise ops are fixnum-only. Not is unary; And/Or/Xor are binary.
+                let want = if matches!(bit, Bitwise::Not) { 1 } else { 2 };
+                if spec == SpecType::Fixnum && argc == want {
+                    work.push((inst, bitwise_opcode(bit), result_type(SpecType::Fixnum)));
                 }
             }
         }

@@ -282,6 +282,43 @@ fn call_containing_function_emits() {
     assert!(framed.compiled_entry > 0, "call function should expose a register entry");
 }
 
+/// Bitwise ops reach T2: `(x) -> (logand x 255)` speculates LogAnd and emits a
+/// single `and` on the tagged value (tagged(a) & tagged(b) = tagged(a & b)).
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn bitwise_logand_speculates_and_runs() {
+    use bliss_compiler::t2::emit::emit_framed;
+    use bliss_compiler::t2::ir::Opcode;
+    use bliss_compiler::t2::speculate::{speculate, SpecType};
+    let logand = bliss_rt::symbols::intern("LOGAND");
+    // 0 LoadLocal 0 (x) ; 1 Const 255 ; 2 (logand x 255) ; 3 Return
+    let bf = bytecode_fn(
+        "mask",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::Const(0),
+            Instr::CallNamed { sym: logand, nargs: 2 },
+            Instr::Return,
+        ],
+        vec![BlissVal::from_fixnum(255)],
+        1,
+        2,
+        1,
+    );
+    let mut f = build_from_bytecode(&bf).expect("build");
+    let n = speculate(&mut f, &|bcp| (bcp == 2).then_some(SpecType::Fixnum));
+    assert_eq!(n, 1, "the logand call is speculated");
+    assert!(
+        f.block_order().iter().any(|&b| f.block(b).insts.iter().any(|&i| f.inst(i).opcode == Opcode::LogAnd)),
+        "a LogAnd op must be present"
+    );
+    let framed = emit_framed(&f, 0, 0, None).expect("emit bitwise");
+    let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+    let mut frame = [BlissVal::from_fixnum(0x3E7).0, 0u64, 0u64];
+    assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 0x3E7 & 255, "999 & 255 = 231");
+}
+
 /// Wave-3 milestone: with P5b (block-CFG lowering) + P6b (multi-block regalloc),
 /// the FULL backend now composes on BRANCHING IR — not just straight-line. This
 /// is the pipeline stage that the single-block limitation previously blocked.
