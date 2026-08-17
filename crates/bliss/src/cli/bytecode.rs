@@ -116,6 +116,94 @@ fn registry_remove(sym: u32) {
     REGISTRY.with(|r| r.borrow_mut().remove(&sym));
 }
 
+/// Render a constant-pool value compactly for a bytecode annotation.
+fn fmt_const_val(v: BlissVal) -> String {
+    if v == NIL {
+        "NIL".to_string()
+    } else if v == T {
+        "T".to_string()
+    } else if v.is_fixnum() {
+        format!("{}", v.as_fixnum())
+    } else if v.is_single_float() {
+        format!("{}", v.as_single_float())
+    } else if v.is_symbol() {
+        bliss_rt::symbols::symbol_name(v.as_symbol_index()).unwrap_or_else(|| "?sym".to_string())
+    } else if v.is_cons() {
+        "#<list>".to_string()
+    } else {
+        format!("#<0x{:016x}>", v.0)
+    }
+}
+
+/// The name for a symbol index, for annotations.
+fn sym_label(sym: u32) -> String {
+    bliss_rt::symbols::symbol_name(sym).unwrap_or_else(|| format!("#{sym}"))
+}
+
+/// `disassemble` (spec §6, CL:DISASSEMBLE): render a function's *current tier* —
+/// the annotated bytecode listing when it runs in the T0 interpreter, or the
+/// decoded x86-64 machine instructions when it has been promoted to native (T1).
+/// Returns `None` if `sym` names no compiled Bliss function (e.g. a builtin or a
+/// tree-walked closure), so the caller can fall back.
+pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
+    let bf = registry_get(sym)?;
+    let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
+    let mut out = String::new();
+    use std::fmt::Write;
+
+    let name = sym_label(sym);
+    let tier = if native.is_some() { "T1 (native)" } else { "T0 (bytecode interpreter)" };
+    let _ = writeln!(
+        out,
+        "; disassembly of {name} — {} arg(s), {} local(s), {} stack slot(s)  [tier: {tier}]",
+        bf.arity, bf.n_locals, bf.max_stack
+    );
+
+    match native {
+        // Promoted to native: decode the installed machine code (spec: "otherwise
+        // machine instructions"). The code is R+X-mapped, so reading it is safe.
+        Some(nc) => {
+            let _ = writeln!(out, "; {} bytes of x86-64 at {:p}", nc.code_len, nc.entry);
+            let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
+            let mut dec =
+                iced_x86::Decoder::with_ip(64, bytes, nc.entry as u64, iced_x86::DecoderOptions::NONE);
+            let mut fmt = iced_x86::NasmFormatter::new();
+            let mut insn = iced_x86::Instruction::default();
+            let mut line = String::new();
+            while dec.can_decode() {
+                dec.decode_out(&mut insn);
+                line.clear();
+                use iced_x86::Formatter;
+                fmt.format(&insn, &mut line);
+                let _ = writeln!(out, "  {:#018x}:  {line}", insn.ip());
+            }
+        }
+        // Interpreted: the annotated bytecode listing (spec: "show the bytecode").
+        None => {
+            for (pc, instr) in bf.code.iter().enumerate() {
+                let ann = match instr {
+                    Instr::Const(i) => bf
+                        .constants
+                        .get(*i as usize)
+                        .map(|c| fmt_const_val(*c))
+                        .unwrap_or_default(),
+                    Instr::CallNamed { sym, nargs } => format!("({} …) / {nargs} arg(s)", sym_label(*sym)),
+                    Instr::LoadGlobal(s) | Instr::StoreGlobal(s) => sym_label(*s),
+                    Instr::Br(t) | Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => format!("→ {t}"),
+                    Instr::Go { target_bcp, .. } => format!("→ {target_bcp}"),
+                    _ => String::new(),
+                };
+                if ann.is_empty() {
+                    let _ = writeln!(out, "  {pc:>4}: {instr:?}");
+                } else {
+                    let _ = writeln!(out, "  {pc:>4}: {instr:?}    ; {ann}");
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 // ── Lowering ───────────────────────────────────────────────────────
 
 /// A form the compiler does not (yet) lower. Propagated up to trigger a
@@ -3938,6 +4026,9 @@ extern "C" fn c2i_deopt_state(bcp: u64, depth: u64) {
 /// code addresses it through the frame-slot pointer passed in rdi (§D2.04).
 struct NativeCode {
     entry: *const u8,
+    /// Length of the installed machine code, so `disassemble` can read the
+    /// (R+X mapped) code bytes back for decoding.
+    code_len: usize,
     num_slots: u16,
     /// Validated GC stack-map metadata for this function's activation, installed
     /// alongside the code (bliss-jtc.4). Passed into every frame the i2c adapter
@@ -4961,6 +5052,7 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
     maybe_write_perf_map(entry as usize, code.len(), sym);
     let nc = Rc::new(NativeCode {
         entry,
+        code_len: code.len(),
         num_slots,
         code_info,
     });

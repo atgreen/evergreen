@@ -8791,6 +8791,24 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
     }
 
+    // CL:DISASSEMBLE (spec §6) — render the callee's current tier: annotated
+    // bytecode while interpreted (T0), decoded x86-64 once native (T1).
+    if car.is_symbol() && symbol_bare_name(&sym_name(car)) == "DISASSEMBLE" {
+        let arg = if cdr.is_cons() { eval_form(cp(cdr).0, env)? } else { NIL };
+        let listing = if arg.is_symbol() {
+            bytecode::disassemble_by_symbol(arg.as_symbol_index())
+        } else {
+            None
+        };
+        match listing {
+            Some(s) => print!("{s}"),
+            None => println!(
+                "; DISASSEMBLE: {arg:?} is not a compiled Bliss function (a builtin or interpreted closure)"
+            ),
+        }
+        return Ok(NIL);
+    }
+
     Err(BlissError::UndefinedFunction(car))
 }
 
@@ -13207,8 +13225,10 @@ fn apply_function(
 fn is_builtin_function(name: &str) -> bool {
     matches!(
         name,
-        // Control / function application
-        "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
+        // Introspection / devtools
+        "DISASSEMBLE"
+            // Control / function application
+            | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
             | "CONSTANTLY" | "NOT" | "EQ" | "EQL" | "EQUAL" | "EQUALP"
             // Conses / lists
             | "CONS" | "CAR" | "CDR" | "FIRST" | "REST" | "SECOND" | "THIRD" | "FOURTH"
@@ -13282,6 +13302,24 @@ fn is_builtin_function(name: &str) -> bool {
 
 fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissVal, BlissError> {
     match name {
+        // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
+        // while interpreted (T0), decoded x86-64 once promoted to native (T1).
+        "DISASSEMBLE" => {
+            let listing = args.first().and_then(|a| {
+                if a.is_symbol() {
+                    bytecode::disassemble_by_symbol(a.as_symbol_index())
+                } else {
+                    None
+                }
+            });
+            match listing {
+                Some(s) => print!("{s}"),
+                None => println!(
+                    "; DISASSEMBLE: not a compiled Bliss function (a builtin or interpreted closure)"
+                ),
+            }
+            Ok(NIL)
+        }
         // Use the shared int/rational cores, NOT an f64 accumulator: the old
         // float arithmetic here lost precision above 2^53 and never promoted to
         // bignum, diverging from operator-position dispatch (bliss-x5y.9).

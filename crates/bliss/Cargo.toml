@@ -18,3 +18,4 @@ test = false
 bliss-rt.workspace = true
 bliss-compiler.workspace = true
 bliss-stdlib.workspace = true
+iced-x86 = { version = "1.21.0", default-features = false, features = ["decoder", "nasm", "std"] }
