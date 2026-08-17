@@ -123,14 +123,25 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
             let Some(fs) = data.frame_state else { continue };
             let bcp = frame_state_bcp(f, fs);
             let Some(spec) = profile(bcp) else { continue };
+            let argc = f.inst(inst).args.len();
             if let Some(arith) = arith_of(sym) {
-                // Arithmetic: the typed op's result is the speculated numeric type.
-                work.push((inst, typed_opcode(arith, spec), result_type(spec)));
+                match (arith, argc) {
+                    // Binary arithmetic: the typed op's result is the numeric type.
+                    (_, 2) => work.push((inst, typed_opcode(arith, spec), result_type(spec))),
+                    // Unary minus → negation (fixnum only; no FloatNeg opcode yet).
+                    (Arith::Sub, 1) if spec == SpecType::Fixnum => {
+                        work.push((inst, Opcode::FixnumNeg, result_type(spec)))
+                    }
+                    // 1-arg +/* are identity; variadic (>2) forms: leave generic.
+                    _ => {}
+                }
             } else if let Some(cmp) = cmp_of(sym) {
                 // Comparison: guarded typed compare; the result is a boolean (T/NIL),
                 // so leave its type unrefined (TOP).
-                if let Some(op) = typed_cmp_opcode(cmp, spec) {
-                    work.push((inst, op, IRType::TOP));
+                if argc == 2 {
+                    if let Some(op) = typed_cmp_opcode(cmp, spec) {
+                        work.push((inst, op, IRType::TOP));
+                    }
                 }
             }
         }

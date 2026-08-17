@@ -150,6 +150,13 @@ fn imul_rr(a: &mut Asm, dst: u8, src: u8) {
     a.push(modrm_rr(dst, src));
 }
 
+/// `neg r64` (two's-complement negate; sets OF when negating i64::MIN).
+fn neg_r(a: &mut Asm, r: u8) {
+    a.push(rex_w(0, r));
+    a.push(0xF7);
+    a.push(0xD8 | (r & 7)); // /3
+}
+
 // ── Single-float (XMM) encoders ─────────────────────────────────────
 //
 // A single-float BlissVal is the immediate `(f32_bits << 32) | 0b100`: the raw
@@ -499,6 +506,13 @@ fn emit_arith_inst(
     deopt: bliss_rt::asm::Label,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::Opcode;
+    // Robustness: never index past the operands — decline (=> stay T1) instead of
+    // panicking in the JIT path if a speculated op has an unexpected shape.
+    if data.results.is_empty()
+        || data.args.len() < if data.opcode == Opcode::FixnumNeg { 1 } else { 2 }
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+    }
     let dst = framed_alloc(reg, pool, data.results[0])?;
     let tagged32 = |c: i64| i32::try_from(bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
     // Guard a variable operand is a fixnum — unless a dominating guard already
@@ -575,6 +589,14 @@ fn emit_arith_inst(
             mov_rr(a, dst, x);
             alu_rr(a, if is_add { 0x01 } else { 0x29 }, dst, y); // tagged±tagged = tagged
             a.jcc(Cc::O, deopt);
+        }
+        Opcode::FixnumNeg => {
+            let a0 = data.args[0];
+            let x = framed_mat(a, reg, pool, consts, a0)?;
+            guard(a, a0, x);
+            mov_rr(a, dst, x);
+            neg_r(a, dst); // tagged(-x) = -(x<<3)
+            a.jcc(Cc::O, deopt); // negating the most-negative fixnum overflows
         }
         Opcode::FloatMul | Opcode::FloatAdd | Opcode::FloatSub => {
             float_operand_to_xmm(a, 0, data.args[0], reg, consts, float_consts, deopt)?;
