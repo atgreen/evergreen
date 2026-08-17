@@ -337,14 +337,19 @@ fn framed_mat(
     consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
     v: crate::t2::ir::Value,
 ) -> Result<u8, EmitError> {
+    let _ = pool;
     if let Some(&r) = reg.get(&v) {
         return Ok(r);
     }
     if let Some(&c) = consts.get(&v) {
-        let r = pool.pop().ok_or(EmitError::UnsupportedOp(0xF1))?;
-        reg.insert(v, r);
-        mov_imm64(a, r, bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
-        return Ok(r);
+        // Materialise into the scratch register, NOT a pool register: the pool's
+        // emit-time state is not a valid free list (block-local reuse returns
+        // registers still live at earlier points), so popping it could clobber a
+        // live value. The scratch is safe because a general two-operand path uses
+        // at most one materialised constant (the other operand is a variable, and
+        // both-constant cases are folded upstream / rejected below).
+        mov_imm64(a, SCRATCH, bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
+        return Ok(SCRATCH);
     }
     Err(EmitError::UnsupportedOp(0xF2))
 }
@@ -518,6 +523,11 @@ fn emit_arith_inst(
     if data.results.is_empty() || data.args.len() < if is_unary { 1 } else { 2 } {
         return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
     }
+    // A binary op with BOTH operands constant should have been folded by the
+    // mid-end; decline rather than risk two constants contending for the scratch.
+    if !is_unary && consts.contains_key(&data.args[0]) && consts.contains_key(&data.args[1]) {
+        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+    }
     let dst = framed_alloc(reg, pool, data.results[0])?;
     let tagged32 = |c: i64| i32::try_from(bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
     // Guard a variable operand is a fixnum — unless a dominating guard already
@@ -536,21 +546,23 @@ fn emit_arith_inst(
                 consts.get(&a0).map(|&c| (b0, c))
             };
             if let Some((var, c)) = folded {
-                if let Ok(c32) = i32::try_from(c) {
-                    let range = f.value(var).ty.range;
-                    let x = *reg.get(&var).ok_or(EmitError::UnsupportedOp(0xF2))?;
-                    guard(a, var, x);
-                    if mul_cannot_overflow(range, c) {
-                        match lea_scale(c) {
-                            Some(s) => lea_mul(a, dst, x, s),
-                            None => imul_imm(a, dst, x, c32),
-                        }
-                    } else {
-                        imul_imm(a, dst, x, c32);
-                        a.jcc(Cc::O, deopt);
+                // Fold the constant, or decline if it does not fit the imul immediate
+                // — the general two-register path uses rdx for the guard and cannot
+                // also host a materialised constant there.
+                let c32 = i32::try_from(c).map_err(|_| EmitError::UnsupportedOp(op_tag(data.opcode)))?;
+                let range = f.value(var).ty.range;
+                let x = *reg.get(&var).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                guard(a, var, x);
+                if mul_cannot_overflow(range, c) {
+                    match lea_scale(c) {
+                        Some(s) => lea_mul(a, dst, x, s),
+                        None => imul_imm(a, dst, x, c32),
                     }
-                    return Ok(());
+                } else {
+                    imul_imm(a, dst, x, c32);
+                    a.jcc(Cc::O, deopt);
                 }
+                return Ok(());
             }
             let x = framed_mat(a, reg, pool, consts, a0)?;
             let y = framed_mat(a, reg, pool, consts, b0)?;
