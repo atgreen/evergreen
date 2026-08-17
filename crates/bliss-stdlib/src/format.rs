@@ -1205,6 +1205,11 @@ fn format_impl(
                     output.push('\x0c');
                 }
             }
+            // ~I (indent) and ~_ (conditional/fill newline) are pretty-printer
+            // hints; this linear (non-pretty) printer ignores them. Any numeric
+            // parameter (e.g. ~3i) and the :/@ modifiers are already parsed and
+            // harmlessly discarded. ASDF/UIOP use these inside ~<…~:> blocks.
+            'I' | '_' => {}
             '~' => {
                 let count = if !params.is_empty() {
                     resolve_param(&params[0], 1, arg_idx)?
