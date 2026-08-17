@@ -4785,28 +4785,19 @@ fn emit_native_x86(
                             c.extend_from_slice(&[0x49, 0x83, 0xEF, 0x08]); // sub r15, 8
                         };
                         match op {
-                            // Polymorphic arithmetic (bliss-izt.3), the SECOND
-                            // speculation: same op, a different type assumption.
-                            // fixnum fast path | single-float fast path | deopt.
-                            // Single-floats are IMMEDIATE (f32 bits in the high 32,
-                            // tag 0b100 — see BlissVal::from_single_float), so the
-                            // float path allocates nothing. Crucially, unlike a
-                            // fixnum overflow, a single-float operand does NOT
-                            // abandon native code: the fixnum guard's miss branches
-                            // to the inline float path and keeps running (the
-                            // "stay native on a type the fixnum guard rejects"
-                            // shape this whole line of work is aiming at). Only a
-                            // genuinely non-immediate-numeric operand — bignum,
-                            // ratio, double-float, or a fixnum⊕float mix — still
-                            // deopts to T0, which computes the contagious result.
+                            // Single-type speculation: with no profile, T1 guesses
+                            // FIXNUM and deopts everything else (float, ratio,
+                            // bignum, mixed, overflow). One path, one guard — no
+                            // hedging. A site that is actually float-hot deopts,
+                            // the profiler observes it, and the optimising tier (T2)
+                            // recompiles it committed to float. T1 never emits both.
                             FixnumOp::Add | FixnumOp::Sub | FixnumOp::Mul => {
-                                let not_fixnum = c.label();
-                                let done = c.label();
-                                // Fixnum guard: (a0 | a1) low 3 bits must be 000.
+                                // Fixnum guard: (a0 | a1) low 3 bits must be 000; a
+                                // non-fixnum operand deopts to T0.
                                 c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
                                 c.extend_from_slice(&[0x48, 0x09, 0xCA]); // or rdx, rcx
                                 c.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
-                                c.jcc(Cc::Ne, not_fixnum); // → single-float path
+                                jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jnz deopt
                                 match op {
                                     FixnumOp::Add => {
                                         // (a0<<3)+(a1<<3)=(a0+a1)<<3; jo on overflow.
@@ -4826,41 +4817,6 @@ fn emit_native_x86(
                                     _ => unreachable!(),
                                 }
                                 commit_bin(&mut c);
-                                c.jmp(done);
-                                // ── single-float fast path (stay native) ──
-                                c.bind(not_fixnum);
-                                // Both operands must be single-floats (tag 0b100);
-                                // anything else deopts. rax/rcx still hold the
-                                // untouched PEEKed operands (the fixnum arm ran only
-                                // on the other side of the branch).
-                                c.extend_from_slice(&[0x48, 0x89, 0xC2]); // mov rdx, rax
-                                c.extend_from_slice(&[0x83, 0xE2, 0x07]); // and edx, 7
-                                c.extend_from_slice(&[0x83, 0xFA, 0x04]); // cmp edx, 4
-                                jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jne deopt
-                                c.extend_from_slice(&[0x48, 0x89, 0xCA]); // mov rdx, rcx
-                                c.extend_from_slice(&[0x83, 0xE2, 0x07]); // and edx, 7
-                                c.extend_from_slice(&[0x83, 0xFA, 0x04]); // cmp edx, 4
-                                jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jne deopt
-                                // Unbox each f32 (high 32 bits → xmm), operate in
-                                // single precision, re-box: bit-identical to the
-                                // interpreter's f32 arithmetic, so the differential
-                                // gate holds.
-                                c.extend_from_slice(&[0x48, 0xC1, 0xE9, 0x20]); // shr rcx, 32
-                                c.extend_from_slice(&[0x66, 0x0F, 0x6E, 0xC9]); // movd xmm1, ecx
-                                c.extend_from_slice(&[0x48, 0xC1, 0xE8, 0x20]); // shr rax, 32
-                                c.extend_from_slice(&[0x66, 0x0F, 0x6E, 0xC0]); // movd xmm0, eax
-                                let ss = match op {
-                                    FixnumOp::Add => 0x58, // addss
-                                    FixnumOp::Sub => 0x5C, // subss
-                                    FixnumOp::Mul => 0x59, // mulss
-                                    _ => unreachable!(),
-                                };
-                                c.extend_from_slice(&[0xF3, 0x0F, ss, 0xC1]); // <op>ss xmm0, xmm1
-                                c.extend_from_slice(&[0x66, 0x0F, 0x7E, 0xC0]); // movd eax, xmm0
-                                c.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x20]); // shl rax, 32
-                                c.extend_from_slice(&[0x48, 0x83, 0xC8, 0x04]); // or rax, TAG_SINGLE_FLOAT
-                                commit_bin(&mut c);
-                                c.bind(done);
                             }
                             FixnumOp::Lt | FixnumOp::Gt | FixnumOp::Le | FixnumOp::Ge
                             | FixnumOp::NumEq => {

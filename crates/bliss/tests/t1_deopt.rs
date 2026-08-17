@@ -183,43 +183,41 @@ fn non_fixnum_operands_deoptimize() {
     }
 }
 
-/// A hot loop whose accumulator is a single-float promotes to T1 and runs
-/// entirely on the native single-float fast path — zero deopts (bliss-izt.3) —
-/// while the fixnum index and loop test take the fixnum path. The float analog
-/// of `hot_speculative_loop_no_deopt`, and the positive assertion that a float
-/// operand no longer abandons native code.
+/// A hot loop whose accumulator is a single-float DEOPTS under T1's fixnum-only
+/// speculation — with no profile, T1 guesses fixnum and a float operand abandons
+/// the native path to the interpreter — yet still returns the interpreter's exact
+/// result. This float-hot case is precisely what the profiler observes so the
+/// optimising tier can later commit to *float*; T1 itself never speculates both.
 #[test]
-fn hot_single_float_loop_no_deopt() {
+fn single_float_loop_deopts_but_stays_correct() {
     let program = "\
         (defun fsum (n) (let ((s 0.0) (i 0)) \
           (tagbody top (when (< i n) (setq s (+ s 1.5)) (setq i (+ i 1)) (go top))) \
           s)) \
         (fsum 5) (fsum 5) (fsum 5) \
-        (format t \"~a ~a ~a~%\" \
-                (bliss-ext:function-tier (quote fsum)) \
+        (format t \"~a ~a~%\" \
                 (bliss-ext:deopt-count) \
                 (fsum 100))";
     let out = eval(program, &[("BLISS_T1_THRESHOLD", "2")]);
     let fields: Vec<&str> = out.split_whitespace().collect();
-    assert_eq!(fields.first().copied(), Some("1"), "single-float loop must reach T1: {out:?}");
-    assert_eq!(fields.get(1).copied(), Some("0"), "single-float loop must not deopt: {out:?}");
-    // 1.5 added 100 times = 150.0, printed as the interpreter prints it.
+    let deopts: u32 = fields.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    assert!(deopts >= 1, "single-float loop must deopt under fixnum-only T1: {out:?}");
+    // 1.5 added 100 times = 150.0 — correct despite the deopt to the interpreter.
     let tw_val = eval(
         "(defun fsum (n) (let ((s 0.0) (i 0)) \
            (tagbody top (when (< i n) (setq s (+ s 1.5)) (setq i (+ i 1)) (go top))) s)) \
          (format t \"~a~%\" (fsum 100))",
         &[("BLISS_BACKEND", "tree-walker")],
     );
-    assert_eq!(fields.get(2).copied(), Some(tw_val.as_str()), "result matches interpretation");
+    assert_eq!(fields.get(1).copied(), Some(tw_val.as_str()), "result matches interpretation despite deopt");
 }
 
 /// The deopt counter is observable and increments only on an actual
 /// deoptimization: zero for fixnum calls, one per non-fixnum/overflow call.
 #[test]
 fn deopt_count_is_observable_and_precise() {
-    // NB: a single-float arg does NOT deopt any more — single-float `*` has its
-    // own native fast path (bliss-izt.3). A ratio still falls outside both the
-    // fixnum and single-float domains, so it is the non-overflow deopt here.
+    // T1 speculates fixnum only, so a float, ratio, or bignum arg all deopt. A
+    // ratio is used here as the non-overflow deopt (a float would deopt too).
     let program = "\
         (defun sq (x) (* x x)) \
         (sq 2) (sq 3) (sq 4) \
