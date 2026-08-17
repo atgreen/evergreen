@@ -4266,6 +4266,23 @@ extern "C" fn c2i_clear_mv() {
     env.clear_mv();
 }
 
+/// Read a global/special symbol's dynamic value cell (bliss-x5y.15). Non-
+/// allocating and side-effect-free, so — like `c2i_clear_mv` — it needs no GC
+/// stack map: r14/r15 are callee-saved and rsp stays 16-aligned across the call.
+extern "C" fn c2i_load_global(sym: u64) -> u64 {
+    bliss_rt::symbols::symbol_value(sym as u32)
+        .filter(|v| *v != bliss_rt::value::UNBOUND)
+        .map(|v| v.0)
+        .unwrap_or(bliss_rt::value::NIL.0)
+}
+
+/// Write a global/special symbol's dynamic value cell (bliss-x5y.15). A side
+/// effect, so a function containing `StoreGlobal` opts out of speculation (see
+/// `deopt_safe`) — a whole-function deopt-rerun must never re-run the store.
+extern "C" fn c2i_store_global(sym: u64, val: u64) {
+    bliss_rt::symbols::set_symbol_value(sym as u32, BlissVal(val));
+}
+
 extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
@@ -4864,6 +4881,8 @@ fn emit_native_x86(
     let local_disp = |i: i32| 8 * i;
     let c2i_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64) -> u64 as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
+    let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
+    let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
     let deopt_state_addr = c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64;
 
     let mut c = Asm::new();
@@ -4917,6 +4936,11 @@ fn emit_native_x86(
     let deopt_safe = allow_speculation
         && bf.code.iter().all(|i| match i {
             Instr::CallNamed { sym, .. } => is_deopt_safe_primitive(*sym),
+            // A global write is a visible side effect: a whole-function deopt-
+            // rerun would repeat it, so a function that stores a global forgoes
+            // speculation entirely (bliss-x5y.15). It still compiles natively;
+            // just with no guarded fixnum fast paths (hence no deopt).
+            Instr::StoreGlobal(_) => false,
             _ => true,
         });
 
@@ -5293,6 +5317,27 @@ fn emit_native_x86(
                 // 16-aligned for calls (same contract as CallNamed).
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_clear_mv)
                 c.extend_from_slice(&clear_mv_addr.to_le_bytes());
+                c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            }
+            // Read a global/special var's value cell → push (bliss-x5y.15). Same
+            // non-allocating call contract as ClearMv (r14/r15 callee-saved).
+            Instr::LoadGlobal(sym) => {
+                c.extend_from_slice(&[0xBF]); // mov edi, imm32 (sym) — zero-extends
+                c.extend_from_slice(&sym.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_load_global)
+                c.extend_from_slice(&load_global_addr.to_le_bytes());
+                c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                push_rax(&mut c); // result → operand stack
+            }
+            // Pop the value, write it to the global/special cell (bliss-x5y.15).
+            // Consumes the operand and pushes nothing (SETQ then reloads for its
+            // value). A side effect, so the function is not speculated.
+            Instr::StoreGlobal(sym) => {
+                pop_into(&mut c, 6, false); // value → rsi (arg 2)
+                c.extend_from_slice(&[0xBF]); // mov edi, imm32 (sym, arg 1)
+                c.extend_from_slice(&sym.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_store_global)
+                c.extend_from_slice(&store_global_addr.to_le_bytes());
                 c.extend_from_slice(&[0xFF, 0xD0]); // call rax
             }
             Instr::Go {
