@@ -212,6 +212,14 @@ impl<'f> Lowering<'f> {
         self.insts.push(MachInst { op, defs, uses, imm: None, frame_state: None, safepoint: false });
     }
 
+    /// Emit an immediate-materialising MachInst (a constant load). `imm` is the
+    /// value the emitter moves into `def` — for a constant that reaches a
+    /// function boundary this is the tagged `BlissVal` bits.
+    fn emit_imm(&mut self, op: u32, def: VReg, imm: i64) {
+        self.insts
+            .push(MachInst { op, defs: vec![def], uses: vec![], imm: Some(imm), frame_state: None, safepoint: false });
+    }
+
     /// Emit a MachInst that carries the deopt/safepoint annotations of IR
     /// instruction `i` (spec §4.10 R4.65): a guarding or deoptimising inst keeps
     /// its `FrameStateId`; a safepoint inst sets `safepoint` so P6 records a
@@ -320,6 +328,31 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
     let data = lo.f.inst(inst);
     let defs = lo.vregs(&data.results);
     let uses = lo.vregs(&data.args);
+
+    // Constants materialise a tagged immediate the emitter can move directly
+    // (spec §4.7). Populate `MachInst.imm` from the IR constant's AuxData; a
+    // fixnum/char/nil/t reaching a function boundary is its tagged BlissVal bits.
+    // (Unboxed-representation materialisation + box/unbox insertion is future
+    // work; a bare constant feeding a Return is naturally tagged.)
+    {
+        use crate::t2::ir::AuxData;
+        use bliss_rt::value::{NIL_BITS, T_BITS};
+        let imm: Option<i64> = match (data.opcode, &data.aux) {
+            (ConstFixnum, AuxData::FixnumImm(v)) => {
+                Some(bliss_rt::value::BlissVal::from_fixnum(*v).0 as i64)
+            }
+            (ConstNil, _) => Some(NIL_BITS as i64),
+            (ConstT, _) => Some(T_BITS as i64),
+            _ => None,
+        };
+        if let Some(imm) = imm {
+            if let Some(&def) = defs.first() {
+                let op = if data.opcode == ConstFixnum { op::MOV_IMM } else { op::MOV_TAGGED };
+                lo.emit_imm(op, def, imm);
+                return;
+            }
+        }
+    }
 
     // A binary-op emitter: `op def, use0, use1`.
     macro_rules! bin {

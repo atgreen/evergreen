@@ -177,7 +177,9 @@ fn emit_inst(
 ) -> Result<(), EmitError> {
     use crate::t2::lower::op;
     match mi.op {
-        op::MOV_IMM => {
+        op::MOV_IMM | op::MOV_TAGGED => {
+            // Both materialise a 64-bit immediate into a GPR; MOV_TAGGED's is a
+            // tagged BlissVal, MOV_IMM's a raw/tagged integer — identical encoding.
             let dst = loc_of(mi.defs[0])?;
             let imm = mi.imm.ok_or(EmitError::MissingImm)?;
             mov_imm64(a, dst, imm);

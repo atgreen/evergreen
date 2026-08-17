@@ -42,7 +42,8 @@ pub mod opt_gvn; // P4a — global value numbering / CSE
 pub mod opt_licm; // P4b — loop-invariant code motion
 pub mod regalloc; // P6 — regalloc2 adapter + stack maps
 
-// ── Machine-code emission ─────────────────────────────────────────
+// ── Machine-code emission + pipeline driver ───────────────────────
+pub mod drive; // bytecode → executable T2 code (the tiering primitive)
 pub mod emit; // MachFunc → executable x86-64 bytes (spec §4.7)
 
 // ── Wave 3 parcels ────────────────────────────────────────────────
