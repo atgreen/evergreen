@@ -1143,6 +1143,24 @@ pub fn emit_framed(
             }
         }
     }
+    // Constant hoisting: a large constant (its tagged value exceeds imm32, so it
+    // cannot fold into an immediate) used more than once gets its own register,
+    // materialised ONCE at entry instead of re-loading the 64-bit immediate at every
+    // use — e.g. a 32-bit mask reused across a hashing round.
+    let mut hoisted: Vec<Value> = Vec::new();
+    for (&v, &c) in &consts {
+        let tagged = bliss_rt::value::BlissVal::from_fixnum(c).0;
+        if i32::try_from(tagged as i64).is_err()
+            && uses.get(&v).copied().unwrap_or(0) >= 2
+            && !reg.contains_key(&v)
+        {
+            if let Some(r) = pool.pop() {
+                reg.insert(v, r);
+                hoisted.push(v);
+            }
+        }
+    }
+
     // Block-local liveness: a value defined in a block and used only there can
     // return its register to the pool after its last use in that block, so it can
     // be reused (relieves register pressure — e.g. fib's per-branch temporaries).
@@ -1210,7 +1228,27 @@ pub fn emit_framed(
                 continue;
             }
             if let Some(&r0) = d.results.first() {
-                framed_alloc(&mut reg, &mut pool, r0)?;
+                if reg.contains_key(&r0) {
+                    // Already assigned (e.g. the return value bound to rax) — keep it.
+                } else {
+                    // In-place: reuse a dying block-local first operand's register for
+                    // the result, so a binary op needs no `mov dst, a` before it. Skip
+                    // when the first operand is also the second (an in-place untag
+                    // would corrupt the shared operand).
+                    let inplace = d.args.first().copied().filter(|&v| {
+                        !consts.contains_key(&v)
+                            && is_block_local(v)
+                            && last_use.get(&v) == Some(&idx)
+                            && reg.contains_key(&v)
+                            && d.args.get(1) != Some(&v)
+                    });
+                    if let Some(v) = inplace {
+                        reg.insert(r0, reg[&v]);
+                        pending.retain(|&(pv, _)| pv != v); // consumed into r0
+                    } else {
+                        framed_alloc(&mut reg, &mut pool, r0)?;
+                    }
+                }
                 if is_block_local(r0) {
                     pending.push((r0, *last_use.get(&r0).unwrap_or(&idx)));
                 }
@@ -1296,6 +1334,14 @@ pub fn emit_framed(
     // (with block-parameter moves on each out-edge).
     for (bi, &b) in blocks.iter().enumerate() {
         a.bind(block_label[&b]);
+        // Materialise hoisted constants once, at the entry block (reached by both
+        // the interpreter and register entries), before any use.
+        if b == entry {
+            for &v in &hoisted {
+                let r = *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                mov_imm64(&mut a, r, const_tagged[&v] as i64);
+            }
+        }
         // Fixnum operands proven by a dominating guard: the entry block dominates
         // all others, so its guards carry over (the entry block itself starts fresh).
         let mut proven: HashSet<Value> = if b == entry { HashSet::new() } else { entry_guarded.clone() };
