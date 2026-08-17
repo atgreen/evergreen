@@ -513,7 +513,7 @@ fn emit_arith_inst(
     pool: &mut Vec<u8>,
     consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
     float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
-    proven: &std::collections::HashSet<crate::t2::ir::Value>,
+    proven: &mut std::collections::HashSet<crate::t2::ir::Value>,
     deopt: bliss_rt::asm::Label,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::Opcode;
@@ -530,11 +530,14 @@ fn emit_arith_inst(
     }
     let dst = framed_alloc(reg, pool, data.results[0])?;
     let tagged32 = |c: i64| i32::try_from(bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
-    // Guard a variable operand is a fixnum — unless a dominating guard already
-    // proved it (guard elimination). Constants never need a guard.
-    let guard = |a: &mut Asm, v: crate::t2::ir::Value, r: u8| {
-        if !proven.contains(&v) {
+    // Guard a variable operand is a fixnum — unless it is a constant (known
+    // fixnum) or already proven (a dominating guard, or an earlier guard in this
+    // block). Recording each guarded operand makes a later use in the same block
+    // skip its re-guard.
+    let mut guard = |a: &mut Asm, v: crate::t2::ir::Value, r: u8| {
+        if !proven.contains(&v) && !consts.contains_key(&v) {
             guard_fixnum(a, r, deopt);
+            proven.insert(v);
         }
     };
     match data.opcode {
@@ -879,6 +882,17 @@ fn is_fixnum_guarding_op(op: crate::t2::ir::Opcode) -> bool {
     )
 }
 
+/// A fixnum-*producing* op: its result is provably a fixnum (the op yields one or
+/// deopts), so any later use of the result needs no tag guard. Comparisons are
+/// excluded — they produce booleans, not fixnums.
+fn is_fixnum_producing_op(op: crate::t2::ir::Opcode) -> bool {
+    use crate::t2::ir::Opcode::*;
+    matches!(
+        op,
+        FixnumAdd | FixnumSub | FixnumMul | FixnumNeg | LogAnd | LogOr | LogXor | LogNot | FixnumShl | FixnumShr
+    )
+}
+
 /// A constant-producing opcode (no register, no runtime work — its tagged value
 /// is materialised where used).
 fn is_const_opcode(op: crate::t2::ir::Opcode) -> bool {
@@ -1011,6 +1025,21 @@ pub fn emit_framed(
             for &v in &d.args {
                 if !const_tagged.contains_key(&v) {
                     entry_guarded.insert(v);
+                }
+            }
+        }
+    }
+    // The result of a fixnum-producing op is a fixnum wherever it is used (SSA: the
+    // def dominates every use), so those uses never need a re-guard. This removes
+    // the redundant intermediate guards in a chain of fixnum/bitwise ops — the bulk
+    // of the guard overhead in crypto/hashing kernels.
+    let mut fixnum_valued: HashSet<Value> = HashSet::new();
+    for &b in &blocks {
+        for &inst in &f.block(b).insts {
+            let d = f.inst(inst);
+            if is_fixnum_producing_op(d.opcode) {
+                for &r in &d.results {
+                    fixnum_valued.insert(r);
                 }
             }
         }
@@ -1235,7 +1264,8 @@ pub fn emit_framed(
         a.bind(block_label[&b]);
         // Fixnum operands proven by a dominating guard: the entry block dominates
         // all others, so its guards carry over (the entry block itself starts fresh).
-        let proven: HashSet<Value> = if b == entry { HashSet::new() } else { entry_guarded.clone() };
+        let mut proven: HashSet<Value> = if b == entry { HashSet::new() } else { entry_guarded.clone() };
+        proven.extend(fixnum_valued.iter().copied());
         for &inst in &f.block(b).insts {
             let d = f.inst(inst).clone();
             if is_const_opcode(d.opcode)
@@ -1248,7 +1278,7 @@ pub fn emit_framed(
                 let self_entry = has_reg_entry.then_some(reg_entry_label);
                 emit_call(&mut a, &d, &reg, &const_tagged, c2i_call_addr, self_sym, self_entry)?;
             } else {
-                emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, &proven, deopt)?;
+                emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, &mut proven, deopt)?;
             }
         }
 
