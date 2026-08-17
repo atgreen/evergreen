@@ -42,6 +42,9 @@ pub mod opt_gvn; // P4a — global value numbering / CSE
 pub mod opt_licm; // P4b — loop-invariant code motion
 pub mod regalloc; // P6 — regalloc2 adapter + stack maps
 
+// ── Machine-code emission ─────────────────────────────────────────
+pub mod emit; // MachFunc → executable x86-64 bytes (spec §4.7)
+
 // ── Wave 3 parcels ────────────────────────────────────────────────
 pub mod opt_escape; // P4e — escape analysis + scalar replacement
 pub mod opt_fold; // P4f — constant folding + strength reduction

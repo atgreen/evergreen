@@ -1,4 +1,7 @@
-//! A tiny label-based x86-64 assembler for the native (T1) code emitter.
+//! A tiny label-based x86-64 assembler, shared by the T1 baseline emitter
+//! (`bliss` crate) and the T2 optimising emitter (`bliss-compiler`). It lives in
+//! `bliss-rt` so both tiers emit through the same assembler without a dependency
+//! cycle (same rationale as the relocated bytecode types).
 //!
 //! The emitter used to carry three parallel hand-rolled fixup tables — branch
 //! targets (`offsets`/`patches`), guard→deopt-stub sites (`deopt_sites`), and

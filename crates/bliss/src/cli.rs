@@ -7,7 +7,6 @@ use bliss_compiler::macroexpand::{
 use bliss_compiler::reader;
 use bliss_rt::error::BlissError;
 
-mod asm;
 mod bytecode;
 use bliss_rt::object::{ConsCell, ObjectHeader, RatioData, type_id};
 use bliss_rt::runtime::parse_cli as parse_runtime_cli;

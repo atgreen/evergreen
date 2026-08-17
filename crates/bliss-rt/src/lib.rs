@@ -6,6 +6,7 @@
 //! bridge, image persistence, and security sandbox.
 
 // ── Object model ──────────────────────────────────────────────────
+pub mod asm;
 pub mod bfasl;
 pub mod bytecode;
 pub mod function;

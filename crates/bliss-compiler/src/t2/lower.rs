@@ -209,7 +209,7 @@ impl<'f> Lowering<'f> {
 
     /// Emit a plain (non-safepoint, non-deopt) MachInst.
     fn emit(&mut self, op: u32, defs: Vec<VReg>, uses: Vec<VReg>) {
-        self.insts.push(MachInst { op, defs, uses, frame_state: None, safepoint: false });
+        self.insts.push(MachInst { op, defs, uses, imm: None, frame_state: None, safepoint: false });
     }
 
     /// Emit a MachInst that carries the deopt/safepoint annotations of IR
@@ -224,6 +224,7 @@ impl<'f> Lowering<'f> {
             op,
             defs,
             uses,
+            imm: None,
             frame_state: if carries_state { data.frame_state } else { None },
             safepoint: data.flags.safepoint,
         });

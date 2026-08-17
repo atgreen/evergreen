@@ -53,6 +53,10 @@ pub struct MachInst {
     pub op: u32,
     pub defs: Vec<VReg>,
     pub uses: Vec<VReg>,
+    /// Immediate operand, when the mnemonic takes one (e.g. `MOV_IMM`, shift
+    /// counts). `None` for register-only instructions. Populated by lowering
+    /// (P5) from the IR constant's `AuxData`; consumed by the emitter.
+    pub imm: Option<i64>,
     /// If this instruction is a safepoint or may deopt, the frame state whose
     /// locations the allocator must pin and record (spec §4.10 R4.65).
     pub frame_state: Option<FrameStateId>,

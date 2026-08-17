@@ -49,7 +49,7 @@ use super::{
     val_as_str, vec_to_list,
 };
 // Label-based assembler backing the native (T1) code emitter (see cli::asm).
-use super::asm::{Asm, Cc, Label};
+use bliss_rt::asm::{Asm, Cc, Label};
 
 // ── Backend selection ──────────────────────────────────────────────
 

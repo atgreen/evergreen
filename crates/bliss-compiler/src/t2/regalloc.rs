@@ -484,6 +484,7 @@ mod tests {
             op,
             defs,
             uses,
+            imm: None,
             frame_state: None,
             safepoint: false,
         }
@@ -500,6 +501,7 @@ mod tests {
             op: 3,
             defs: vec![g1],
             uses: vec![g0],
+            imm: None,
             frame_state: Some(FrameStateId(7)),
             safepoint: true,
         };
@@ -596,6 +598,7 @@ mod tests {
             op: 3,
             defs: vec![],
             uses: vec![g0, gm],
+            imm: None,
             frame_state: Some(FrameStateId(11)),
             safepoint: true,
         };
