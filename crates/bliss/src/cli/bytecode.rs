@@ -5721,13 +5721,10 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         return None;
     }
     let bf = registry_get(sym)?;
-    // T2 deopt (emit_framed → c2i_deopt) is a whole-function rerun, which would
-    // repeat a visible side effect. Until T2 gains precise state-transfer deopt
-    // (bliss-izt.3), decline a function that writes a global: it stays at T1,
-    // whose deopt IS precise, so it still speculates safely there.
-    if bf.code.iter().any(|i| matches!(i, Instr::StoreGlobal(_))) {
-        return None;
-    }
+    // (StoreGlobal functions used to be declined here, before T2 had precise
+    // deopt. That is no longer needed: emit_framed now lowers SetSymbolValue and
+    // gives every guard precise state-transfer deopt (bliss-izt.3, bliss-mzp), so
+    // a global-accumulator loop optimises at T2 without double-applying its store.)
     let func_ptr = Rc::as_ptr(&bf) as usize;
     let name = bf.name.clone();
     t2_log!("{name}: considering for T2 (arity {})", bf.arity);
@@ -5801,7 +5798,19 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
     let deopt_t2_addr = c2i_deopt_t2 as extern "C" fn(u64, u64, *const u64, u64) as usize as u64;
     let call_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64) -> u64 as usize as u64;
-    let framed = match bliss_compiler::t2::emit::emit_framed(&f, deopt_addr, deopt_t2_addr, call_addr, Some(sym)) {
+    let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
+    let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
+    let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
+    let framed = match bliss_compiler::t2::emit::emit_framed(
+        &f,
+        deopt_addr,
+        deopt_t2_addr,
+        call_addr,
+        load_global_addr,
+        store_global_addr,
+        clear_mv_addr,
+        Some(sym),
+    ) {
         Ok(fc) => fc,
         Err(e) => {
             t2_log!("{name}: emit_framed failed: {e:?} (shape beyond emitter) => stay T1");

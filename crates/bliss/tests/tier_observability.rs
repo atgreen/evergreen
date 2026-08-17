@@ -181,3 +181,42 @@ fn simple_and_numeric_for_loops_promote() {
     assert_eq!(f.first().copied(), Some("1"), "numeric-for loop reaches T1: {out:?}");
     assert_eq!(f.get(1).copied(), Some("5050"), "extended loop result");
 }
+
+/// A function that writes a global BEFORE a speculated guard reaches T2
+/// (bliss-mzp: SetSymbolValue/SymbolValue emission), and its precise deopt
+/// (bliss-mba) applies that write exactly once. `acc2` increments `*c*`, then
+/// speculates `(+ a 100)`; calling it with a float fails that guard and deopts
+/// AFTER the store has committed. Precise state-transfer resumes T0 past the
+/// store, so `*c*` ends at 61 — a whole-function rerun would double it to 62.
+/// The T2 result must equal the tree-walker's, byte for byte.
+///
+/// Runs only where the optimising tier is available (x86-64); on other targets
+/// `BLISS_T2=1` is a no-op and the assertion below would still hold at T1, so we
+/// keep it unconditional — it exercises the interpreter's global-store path too.
+#[test]
+fn global_store_before_guard_reaches_t2_and_deopts_once() {
+    let prog = "\
+        (defvar *c* 0) \
+        (defun acc2 (a) (setf *c* (+ *c* 1)) (+ a 100)) \
+        (dotimes (k 60) (acc2 k)) \
+        (let ((r (acc2 1.5))) \
+          (format t \"~a ~a~%\" r *c*))";
+
+    // T2 on: acc2 promotes and the float call deopts after the store.
+    let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
+    assert!(ok, "T2 run failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    let f: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(f.first().copied(), Some("101.5"), "deopt result: {line:?}");
+    assert_eq!(
+        f.get(1).copied(),
+        Some("61"),
+        "the global store must apply exactly once (not 62): {line:?}"
+    );
+
+    // Tree-walker: identical observable result.
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker run failed: {tw}");
+    let twl = tw.lines().next().unwrap_or("").to_string();
+    assert_eq!(twl, line, "T2 result must match the tree-walker: {line:?} vs {twl:?}");
+}

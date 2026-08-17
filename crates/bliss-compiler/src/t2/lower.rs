@@ -439,6 +439,9 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         }
         WriteBarrier => lo.emit_annotated(inst, op::WRITE_BARRIER, defs, uses),
 
+        // ── multiple-values reset → runtime helper (no defs/uses) ──
+        ClearMv => lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses),
+
         // ── allocation (safepoint-bearing) ──
         Alloc | AllocCons => lo.emit_annotated(inst, op::ALLOC, defs, uses),
 

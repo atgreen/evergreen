@@ -232,7 +232,7 @@ fn branching_if_speculates_and_runs() {
     assert_eq!(n, 2, "both the comparison and the multiply are speculated");
     verify(&f).expect("speculated branching IR verifies");
 
-    let framed = emit_framed(&f, 0, 0, 0, None).expect("emit branching function");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit branching function");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 
@@ -275,7 +275,7 @@ fn call_containing_function_emits() {
     // Speculate only the multiply (bcp 3); the call at bcp 2 stays a generic Call.
     let n = speculate(&mut f, &|bcp| (bcp == 3).then_some(SpecType::Fixnum));
     assert_eq!(n, 1, "the multiply is speculated; the call is not");
-    let framed = emit_framed(&f, 0, 0, 0, None).expect("a call-containing function must emit");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("a call-containing function must emit");
     assert!(!framed.code.is_empty());
     // A call function with ≤4 params gets a register entry (for direct self-calls),
     // so its compiled entry sits past the interpreter (frame-loading) entry.
@@ -312,7 +312,7 @@ fn bitwise_logand_speculates_and_runs() {
         f.block_order().iter().any(|&b| f.block(b).insts.iter().any(|&i| f.inst(i).opcode == Opcode::LogAnd)),
         "a LogAnd op must be present"
     );
-    let framed = emit_framed(&f, 0, 0, 0, None).expect("emit bitwise");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit bitwise");
     let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let mut frame = [BlissVal::from_fixnum(0x3E7).0, 0u64, 0u64];

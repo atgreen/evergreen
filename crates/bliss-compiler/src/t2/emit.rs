@@ -824,6 +824,58 @@ fn emit_call(
     Ok(())
 }
 
+/// `(symbol-value sym)` — a global read. Lowers to `c2i_load_global(sym) -> rax`,
+/// then moves the result into its value register (bliss-mzp). The call clobbers
+/// caller-saved registers, but a function containing this op is `has_calls`, so
+/// its live values sit in callee-saved registers and survive.
+fn emit_symbol_value(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    c2i_load_global_addr: u64,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::AuxData;
+    let sym = match data.aux {
+        AuxData::SymbolRef(s) => s,
+        _ => return Err(EmitError::UnsupportedOp(0xFA)),
+    };
+    mov_imm64(a, 7, sym as i64); // mov rdi, sym
+    mov_imm64(a, 0, c2i_load_global_addr as i64); // mov rax, c2i_load_global
+    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    let r0 = *data.results.first().ok_or(EmitError::UnsupportedOp(0xFA))?;
+    let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
+    mov_rr(a, dst, 0); // mov result, rax
+    Ok(())
+}
+
+/// `(setf (symbol-value sym) v)` — a global write (side effect). Lowers to
+/// `c2i_store_global(sym, v)`, no result (bliss-mzp).
+fn emit_set_symbol_value(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+    c2i_store_global_addr: u64,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::AuxData;
+    let sym = match data.aux {
+        AuxData::SymbolRef(s) => s,
+        _ => return Err(EmitError::UnsupportedOp(0xFB)),
+    };
+    let v = *data.args.first().ok_or(EmitError::UnsupportedOp(0xFB))?;
+    // rsi = value (from its callee-saved register or an immediate). Set before rdi
+    // (both are scratch here); rdi = sym.
+    if let Some(&bits) = const_tagged.get(&v) {
+        mov_imm64(a, 6, bits as i64); // mov rsi, tagged(v)
+    } else {
+        mov_rr(a, 6, *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?); // mov rsi, v
+    }
+    mov_imm64(a, 7, sym as i64); // mov rdi, sym
+    mov_imm64(a, 0, c2i_store_global_addr as i64); // mov rax, c2i_store_global
+    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    Ok(())
+}
+
 /// Collect the block-argument moves for a CFG edge (`tc.args` → the successor's
 /// block parameters).
 fn edge_moves(
@@ -1079,6 +1131,9 @@ pub fn emit_framed(
     c2i_deopt_addr: u64,
     c2i_deopt_t2_addr: u64,
     c2i_call_addr: u64,
+    c2i_load_global_addr: u64,
+    c2i_store_global_addr: u64,
+    c2i_clear_mv_addr: u64,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
     use crate::t2::frame_state::ValueSource;
@@ -1088,10 +1143,20 @@ pub fn emit_framed(
     let entry = f.entry();
     // Does the function make a call? If so, its live values must survive the call,
     // so they go in callee-saved registers behind a small pushed frame.
+    // "Makes a call" for register-allocation purposes: a plain Call, plus the
+    // global-access ops which lower to c2i_load_global / c2i_store_global calls
+    // (bliss-mzp). All three clobber caller-saved registers, so a function
+    // containing any of them keeps its live values in callee-saved registers.
+    let is_call_like = |op: Opcode| {
+        matches!(
+            op,
+            Opcode::Call | Opcode::SymbolValue | Opcode::SetSymbolValue | Opcode::ClearMv
+        )
+    };
     let has_calls = f
         .block_order()
         .iter()
-        .any(|&b| f.block(b).insts.iter().any(|&i| f.inst(i).opcode == Opcode::Call));
+        .any(|&b| f.block(b).insts.iter().any(|&i| is_call_like(f.inst(i).opcode)));
 
     // Precise state-transfer deopt (bliss-mba): a function that CALLS other code
     // can commit a visible side effect before a later guard fails, so re-running
@@ -1482,7 +1547,15 @@ pub fn emit_framed(
                 if is_const_opcode(d.opcode)
                     || d.opcode.is_terminator()
                     || fused.contains(&inst)
-                    || matches!(d.opcode, Opcode::Call | Opcode::GenericEq | Opcode::TypeCheck)
+                    || matches!(
+                        d.opcode,
+                        Opcode::Call
+                            | Opcode::GenericEq
+                            | Opcode::TypeCheck
+                            | Opcode::SymbolValue
+                            | Opcode::SetSymbolValue
+                            | Opcode::ClearMv
+                    )
                 {
                     continue;
                 }
@@ -1597,6 +1670,14 @@ pub fn emit_framed(
                 emit_generic_eq(&mut a, &d, &mut reg, &mut pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
                 emit_type_check(&mut a, &d, &mut reg, &mut pool, &const_tagged)?;
+            } else if d.opcode == Opcode::SymbolValue {
+                emit_symbol_value(&mut a, &d, &reg, c2i_load_global_addr)?;
+            } else if d.opcode == Opcode::SetSymbolValue {
+                emit_set_symbol_value(&mut a, &d, &reg, &const_tagged, c2i_store_global_addr)?;
+            } else if d.opcode == Opcode::ClearMv {
+                // Reset multiple-values state: a bare c2i_clear_mv() call.
+                mov_imm64(&mut a, 0, c2i_clear_mv_addr as i64); // mov rax, c2i_clear_mv
+                a.extend_from_slice(&[0xFF, 0xD0]); // call rax
             } else {
                 // In precise mode this inst has its own reconstruction stub (built
                 // above); route its guards there instead of the whole-rerun stub.
@@ -1987,7 +2068,7 @@ mod tests {
     fn framed_fixnum_mul_runs_and_deopts() {
         use bliss_rt::value::BlissVal;
         let f = speculated_mul5();
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, None).expect("emit_framed").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, 0, 0, 0, None).expect("emit_framed").code;
         let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap");
         // extern "C" fn(*mut u64) -> u64 : rdi = frame slots, returns rax.
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
@@ -2069,7 +2150,7 @@ mod tests {
     fn strength_reduces_to_lea_when_range_is_safe() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, None).expect("emit").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, 0, 0, 0, None).expect("emit").code;
         // `lea rax,[rcx+rcx*4]` = 48 8D 04 89 ; and NO overflow branch (0F 80).
         assert!(contains(&code, &[0x48, 0x8D, 0x04, 0x89]), "must emit lea for a range-safe *5");
         assert!(!contains(&code, &[0x0F, 0x80]), "range proves no overflow → no jo deopt");
@@ -2086,7 +2167,7 @@ mod tests {
     fn keeps_imul_and_overflow_check_when_range_unknown() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, None);
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, None).expect("emit").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, 0, 0, 0, None).expect("emit").code;
         assert!(contains(&code, &[0x48, 0x69, 0xC1]), "unknown range → imul rax,rcx,5");
         assert!(contains(&code, &[0x0F, 0x80]), "unknown range → keep the jo overflow deopt");
         let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
@@ -2104,7 +2185,7 @@ mod tests {
     fn compiled_entry_takes_register_args() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
-        let framed = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, None).expect("emit");
+        let framed = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, 0, 0, 0, None).expect("emit");
         assert!(framed.compiled_entry > 0, "a register entry must sit past the frame-load prologue");
         let buf = bliss_rt::jit::JitBuffer::new(&framed.code).unwrap();
         let entry = buf.as_ptr() as usize + framed.compiled_entry;
@@ -2189,7 +2270,7 @@ mod tests {
     fn float_mul_runs_and_deopts() {
         use bliss_rt::value::BlissVal;
         let f = build_float_arith(crate::t2::ir::Opcode::FloatMul, 5);
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, None).expect("emit").code;
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, 0, 0, 0, None).expect("emit").code;
         let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 

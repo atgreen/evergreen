@@ -181,6 +181,9 @@ impl<'a> Builder<'a> {
                 Instr::CallNamed { nargs, .. } => {
                     push(i + 1, d - (*nargs as i32) + 1, &mut depth_at, &mut work);
                 }
+                Instr::ClearMv => {
+                    push(i + 1, d, &mut depth_at, &mut work); // no operand-stack effect
+                }
                 Instr::Br(t) => {
                     push(*t as usize, d, &mut depth_at, &mut work);
                 }
@@ -369,6 +372,10 @@ impl<'a> Builder<'a> {
                 }
                 Instr::Pop => {
                     stack.pop().ok_or(BuildError::Unsupported("stack underflow (Pop)"))?;
+                }
+                Instr::ClearMv => {
+                    // Reset multiple-values state; no operand effect (bliss-mzp).
+                    self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, None);
                 }
                 Instr::Dup => {
                     let v = *stack.last().ok_or(BuildError::Unsupported("stack underflow (Dup)"))?;

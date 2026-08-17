@@ -125,6 +125,10 @@ pub enum Opcode {
     Load, Car, Cdr, VecRef, SymbolValue,
     Store, SetCar, SetCdr, VecSet, SetSymbolValue, WriteBarrier,
     Alloc, AllocCons,
+    /// Reset the thread's multiple-values state (interpreter `ClearMv`, emitted
+    /// after SETQ/SETF and in statement position). No operands, no result;
+    /// lowers to a `c2i_clear_mv` call (bliss-mzp).
+    ClearMv,
     // Cat 5a — non-terminator control: calls & guards
     Call, Guard,
     // Cat 5b — terminators
