@@ -683,6 +683,7 @@ impl<'e> Lowerer<'e> {
                 }
                 // (locally decl... body...) — declarations lower to NIL no-ops.
                 "LOCALLY" => self.lower_progn(rest),
+                "EVAL-WHEN" => self.lower_eval_when(rest),
                 "LET" => self.lower_let(rest, false),
                 "LET*" => self.lower_let(rest, true),
                 "SETQ" => self.lower_setq(rest),
@@ -713,6 +714,33 @@ impl<'e> Lowerer<'e> {
         } else {
             // Any other object type self-evaluates.
             let c = self.add_const(form);
+            self.emit(Instr::Const(c));
+            self.push_n(1);
+            Ok(())
+        }
+    }
+
+    /// `(eval-when (situations) body...)` in a non-top-level position (top-level
+    /// ones are handled by `eval_toplevel`). Per CLHS 3.2.3.1 this reduces to
+    /// `(progn body)` when the situations fire at load/execute time, else NIL
+    /// (bliss-x5y.6 follow-up). Real eval-whens carry `:execute`, so this matches
+    /// the tree-walker; the union with `:load-toplevel` matches load-time forms.
+    fn lower_eval_when(&mut self, rest: BlissVal) -> LowerResult<()> {
+        if !rest.is_cons() {
+            return Err(Bail);
+        }
+        let (situations, body) = cp(rest);
+        let fires = list_to_vec(situations).iter().any(|s| {
+            s.is_symbol()
+                && matches!(
+                    symbol_bare_name(&sym_name(*s)).as_str(),
+                    "EXECUTE" | "EVAL" | "LOAD-TOPLEVEL" | "LOAD"
+                )
+        });
+        if fires {
+            self.lower_progn(body)
+        } else {
+            let c = self.add_const(NIL);
             self.emit(Instr::Const(c));
             self.push_n(1);
             Ok(())
@@ -2495,7 +2523,6 @@ fn is_bail_special(name: &str) -> bool {
             | "DEFCONSTANT"
             | "MACROLET"
             | "SYMBOL-MACROLET"
-            | "EVAL-WHEN"
             | "LOAD-TIME-VALUE"
             | "PROGV"
             | "MULTIPLE-VALUE-CALL"
@@ -6282,6 +6309,23 @@ fn release_activation_handlers(act: &mut Activation, env: &mut Env) {
 /// compiles what it can and runs it on the `BlissStack`, falling back to the
 /// tree-walker for everything else. Either way results match the tree-walker
 /// oracle (see module docs).
+/// Top-level definition operators that are evaluated directly rather than
+/// thunk-compiled: they run once to register a definition and never compile
+/// (bliss-x5y.6 follow-up). Matched on the bare (package-stripped) name.
+fn is_toplevel_definer(name: &str) -> bool {
+    matches!(
+        symbol_bare_name(name).as_str(),
+        "DEFMACRO"
+            | "DEFVAR"
+            | "DEFPARAMETER"
+            | "DEFCONSTANT"
+            | "DEFINE-SYMBOL-MACRO"
+            | "DEFINE-COMPILER-MACRO"
+            | "DEFINE-SETF-EXPANDER"
+            | "DEFSETF"
+    )
+}
+
 pub fn eval_toplevel(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     if !backend_is_bytecode() {
         return eval_form(form, env);
@@ -6329,6 +6373,20 @@ pub fn eval_toplevel(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
             }
         }
         return Ok(result);
+    }
+
+    // A top-level definer (defmacro/defvar/defparameter/defconstant/define-*):
+    // these only ever run once, to register the definition, and never compile as
+    // a thunk (they are bail-specials). Evaluate directly so we neither waste a
+    // thunk-compile attempt nor record a spurious bail (bliss-x5y.6 follow-up).
+    // Note: this does NOT compile a defmacro's EXPANDER to bytecode — that needs
+    // macro-lambda-list support (destructuring/&whole/&environment/&body) and is
+    // a separate task; the expander stays tree-walked.
+    if form.is_cons() {
+        let (op, _) = cp(form);
+        if op.is_symbol() && is_toplevel_definer(&sym_name(op)) {
+            return eval_form(form, env);
+        }
     }
 
     // Any other form: compile a thunk, else fall back.

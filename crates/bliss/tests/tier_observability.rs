@@ -360,3 +360,31 @@ fn variadic_lambda_lists_compile_and_promote() {
         "supplied-p + arity error must match the tree-walker"
     );
 }
+
+/// A non-top-level EVAL-WHEN (in a function body) compiles to bytecode and
+/// promotes to T1 (bliss-x5y.6 follow-up) instead of bailing the whole function
+/// to the tree-walker. Per CLHS 3.2.3.1 it reduces to (progn body) when its
+/// situations fire; the result must match the tree-walker.
+#[test]
+fn nested_eval_when_compiles_and_promotes() {
+    let prog = "\
+        (defun compute (n) \
+          (let ((acc 0)) \
+            (eval-when (:execute) (dotimes (i n) (setq acc (+ acc (* i i))))) \
+            acc)) \
+        (defun skipped (x) (eval-when (:compile-toplevel) (setq x 999)) x) \
+        (compute 3) (compute 3) (skipped 5) (skipped 5) \
+        (format t \"~a ~a ~a~%\" \
+          (bliss-ext:function-tier (quote compute)) (compute 10) (skipped 7))";
+    let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "eval-when run failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    // compute reaches T1; (* i i) for 0..9 sums to 285; the :compile-toplevel-only
+    // eval-when does NOT fire at execute time, so skipped returns its arg (7).
+    assert_eq!(line, "1 285 7", "eval-when compile result (tier, compute, skipped): {line:?}");
+
+    let (tw, _) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    let tw_rest = tw.lines().next().unwrap_or("").split_once(' ').map(|(_, r)| r.to_string());
+    let t1_rest = line.split_once(' ').map(|(_, r)| r.to_string());
+    assert_eq!(t1_rest, tw_rest, "eval-when result must match the tree-walker");
+}
