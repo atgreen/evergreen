@@ -271,9 +271,24 @@ fn framed_alloc(
     Ok(r)
 }
 
+/// A framed T2 compilation with its two entry points (spec: compiled-caller ABI).
+///
+/// The code has a single body reached by two entries:
+/// - **interpreter entry** at offset 0 — `extern "C" fn(*mut u64 slots) -> u64`
+///   (the run_native ABI): a short prologue loads arguments from the frame slots
+///   into the argument registers, then falls into the body.
+/// - **compiled entry** at [`compiled_entry`](Self::compiled_entry) — arguments
+///   are already in the argument registers `[rcx, r8, r9, r10]` (arg0..arg3), so
+///   a compiled caller skips the frame load entirely. Result in rax.
+pub struct FramedCode {
+    pub code: Vec<u8>,
+    /// Byte offset of the compiled-caller entry within `code`.
+    pub compiled_entry: usize,
+}
+
 /// Emit `f` (a single-block, speculated straight-line function) as native code.
 /// `c2i_deopt_addr` is the address of the interpreter's `c2i_deopt` routine.
-pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<Vec<u8>, EmitError> {
+pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<FramedCode, EmitError> {
     use crate::t2::ir::{AuxData, Opcode, Value};
     use std::collections::HashMap;
 
@@ -306,13 +321,19 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<Vec<u8>, EmitErr
     let mut a = Asm::new();
     let deopt = a.label();
 
-    // No frame: load params straight from [rdi + 8*i] — rdi stays live because
-    // the fast path never calls, so nothing clobbers it.
+    // Interpreter entry (offset 0): load params from the frame slots [rdi + 8*i]
+    // into the argument registers, then fall through into the body. Arg register i
+    // is exactly framed_alloc's i-th pick ([rcx, r8, r9, r10]), so a compiled
+    // caller that places args there can jump straight to `compiled_entry` below.
     let params = f.block(entry).params.clone();
     for (i, &p) in params.iter().enumerate() {
         let r = framed_alloc(&mut reg, &mut pool, p)?;
         mov_from_frame(&mut a, r, 7 /* rdi */, i);
     }
+    // Compiled-caller entry: the body, entered with args already in registers.
+    // `here()` is stable — the prologue precedes every branch, so branch patching
+    // in finish() cannot shift it.
+    let compiled_entry = a.here();
 
     // Body.
     for &inst in &f.block(entry).insts.clone() {
@@ -400,7 +421,8 @@ pub fn emit_framed(f: &Function, c2i_deopt_addr: u64) -> Result<Vec<u8>, EmitErr
     a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
     a.push(0xC3); // ret
 
-    a.finish().ok_or(EmitError::BadBranch)
+    let code = a.finish().ok_or(EmitError::BadBranch)?;
+    Ok(FramedCode { code, compiled_entry })
 }
 
 fn op_tag(op: crate::t2::ir::Opcode) -> u32 {
@@ -591,7 +613,7 @@ mod tests {
     fn framed_fixnum_mul_runs_and_deopts() {
         use bliss_rt::value::BlissVal;
         let f = speculated_mul5();
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit_framed");
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit_framed").code;
         let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap");
         // extern "C" fn(*mut u64) -> u64 : rdi = frame slots, returns rax.
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
@@ -673,7 +695,7 @@ mod tests {
     fn strength_reduces_to_lea_when_range_is_safe() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit");
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit").code;
         // `lea rax,[rcx+rcx*4]` = 48 8D 04 89 ; and NO overflow branch (0F 80).
         assert!(contains(&code, &[0x48, 0x8D, 0x04, 0x89]), "must emit lea for a range-safe *5");
         assert!(!contains(&code, &[0x0F, 0x80]), "range proves no overflow → no jo deopt");
@@ -690,13 +712,48 @@ mod tests {
     fn keeps_imul_and_overflow_check_when_range_unknown() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, None);
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit");
+        let code = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit").code;
         assert!(contains(&code, &[0x48, 0x69, 0xC1]), "unknown range → imul rax,rcx,5");
         assert!(contains(&code, &[0x0F, 0x80]), "unknown range → keep the jo overflow deopt");
         let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
         let mut frame = [BlissVal::from_fixnum(7).0, 0u64, 0u64];
         assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 35, "imul *5 of 7 = 35");
+    }
+
+    /// Compiled-caller ABI: a compiled caller places args in registers and calls
+    /// the `compiled_entry`, skipping the frame load. Here inline asm invokes it
+    /// directly — arg0 in rcx, result in rax — proving the register entry runs the
+    /// body with no interpreter frame (the memory load `mov rcx,[rdi]` is gone).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn compiled_entry_takes_register_args() {
+        use bliss_rt::value::BlissVal;
+        let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
+        let framed = emit_framed(&f, mock_c2i_deopt as usize as u64).expect("emit");
+        assert!(framed.compiled_entry > 0, "a register entry must sit past the frame-load prologue");
+        let buf = bliss_rt::jit::JitBuffer::new(&framed.code).unwrap();
+        let entry = buf.as_ptr() as usize + framed.compiled_entry;
+        let x = BlissVal::from_fixnum(7).0;
+        let result: u64;
+        // SAFETY: the compiled entry is a leaf reading arg0 from rcx and writing
+        // rax; every caller-saved GPR it may touch is marked clobbered.
+        unsafe {
+            core::arch::asm!(
+                "call {e}",
+                e = in(reg) entry,
+                inout("rcx") x => _,
+                lateout("rax") result,
+                lateout("rdx") _,
+                lateout("rsi") _,
+                lateout("rdi") _,
+                lateout("r8") _,
+                lateout("r9") _,
+                lateout("r10") _,
+                lateout("r11") _,
+            );
+        }
+        assert_eq!(BlissVal(result).as_fixnum(), 35, "compiled entry: 7*5 = 35 from a register arg");
     }
 
     /// A small computation `() -> 7 + 5 = 12`, executed.

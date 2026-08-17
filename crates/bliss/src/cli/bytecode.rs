@@ -4129,6 +4129,10 @@ struct NativeCode {
     /// speculation), false for the T1 baseline. Both share the run_native ABI.
     is_t2: bool,
     num_slots: u16,
+    /// Byte offset of the compiled-caller entry point within the code (args in
+    /// registers `[rcx, r8, r9, r10]`, no frame — spec: compiled-caller ABI).
+    /// 0 means "no distinct compiled entry"; the interpreter entry is always at 0.
+    compiled_entry: usize,
     /// Validated GC stack-map metadata for this function's activation, installed
     /// alongside the code (bliss-jtc.4). Passed into every frame the i2c adapter
     /// pushes, so the collector scans compiled frames through the map.
@@ -5189,6 +5193,7 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
         code_len: code.len(),
         is_t2: false,
         num_slots,
+        compiled_entry: 0, // T1 baseline has no distinct register entry yet
         code_info,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
@@ -5240,7 +5245,8 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
     bliss_compiler::t2::verify::verify(&f).ok()?;
 
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
-    let code = bliss_compiler::t2::emit::emit_framed(&f, deopt_addr).ok()?;
+    let framed = bliss_compiler::t2::emit::emit_framed(&f, deopt_addr).ok()?;
+    let code = framed.code;
 
     let num_slots = bf.num_slots();
     let code_info = install_stack_map(num_slots)?;
@@ -5252,6 +5258,7 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         code_len: code.len(),
         is_t2: true,
         num_slots,
+        compiled_entry: framed.compiled_entry,
         code_info,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
