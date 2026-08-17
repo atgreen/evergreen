@@ -1626,28 +1626,20 @@ impl<'e> Lowerer<'e> {
         } else {
             (BlissVal::from_fixnum(1), 6)
         };
-        if !kw_is(forms[do_at], "DO") {
-            return Err(Bail);
-        }
-        let body = &forms[do_at + 1..];
-        // Every body form must be a compound expression. A bare atom here means a
-        // trailing clause we don't model (finally / collect / another for / a
-        // tag) — bail to the tree-walker rather than mis-lowering it as a do-body
-        // statement.
-        if body.is_empty() || body.iter().any(|f| !f.is_cons()) {
-            return Err(Bail);
-        }
-
         let id = self.fresh_id();
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
         let end_v = resolve_sym(&format!("%LOOP-END{id}")).ok_or(Bail)?;
         let step_v = resolve_sym(&format!("%LOOP-STEP{id}")).ok_or(Bail)?;
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
+        let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
+        // The action clause (do / collect / sum / count) starting at `do_at`.
+        let (uses_acc, acc_init, per_iter, result) =
+            self.lower_loop_action(&forms[do_at..], acc)?;
 
-        // (tagbody top (when (cmp VAR %end) body... (setq VAR (+ VAR %step)) (go top)))
+        // (tagbody top (when (cmp VAR %end) per-iter... (setq VAR (+ VAR %step)) (go top)))
         let test = form_list(&[s(cmp)?, var, end_v]);
         let mut when_items = vec![s("WHEN")?, test];
-        when_items.extend_from_slice(body);
+        when_items.extend(per_iter);
         when_items.push(form_list(&[
             s("SETQ")?,
             var,
@@ -1656,15 +1648,76 @@ impl<'e> Lowerer<'e> {
         when_items.push(form_list(&[s("GO")?, top]));
         let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
 
-        let bindings = form_list(&[
+        let mut binding_items = vec![
             form_list(&[var, start]),
             form_list(&[end_v, end]),
             form_list(&[step_v, step]),
-        ]);
-        // LOOP returns NIL unless there is an accumulation/return clause (which we
-        // don't handle here), so the block value is NIL.
-        let let_form = form_list(&[s("LET")?, bindings, tagbody_form, NIL]);
+        ];
+        if uses_acc {
+            binding_items.push(form_list(&[acc, acc_init]));
+        }
+        let bindings = form_list(&binding_items);
+        let let_form = form_list(&[s("LET")?, bindings, tagbody_form, result]);
         self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
+    }
+
+    /// Parse a LOOP action clause that follows the iteration spec (bliss-x5y.3
+    /// stage 3): `do BODY...` | `{collect|sum|count} EXPR`. Returns
+    /// `(uses_acc, acc_init, per_iteration_forms, result_form)` — the caller adds
+    /// `(acc acc_init)` to the LET when `uses_acc`, runs `per_iteration_forms`
+    /// each turn, and makes `result_form` the loop's value. `acc` is a caller-
+    /// supplied fresh accumulator symbol. Anything else (a trailing clause, a
+    /// second accumulator, `into`, `it`) bails to the tree-walker.
+    fn lower_loop_action(
+        &self,
+        tail: &[BlissVal],
+        acc: BlissVal,
+    ) -> LowerResult<(bool, BlissVal, Vec<BlissVal>, BlissVal)> {
+        let kw = |f: BlissVal| -> Option<String> {
+            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+        };
+        let s = |n: &str| resolve_sym(n).ok_or(Bail);
+        if tail.is_empty() {
+            return Err(Bail);
+        }
+        match kw(tail[0]).as_deref() {
+            Some("DO") | Some("DOING") => {
+                let body = &tail[1..];
+                if body.is_empty() || body.iter().any(|f| !f.is_cons()) {
+                    return Err(Bail);
+                }
+                Ok((false, NIL, body.to_vec(), NIL))
+            }
+            // `collect EXPR`: push onto acc, reverse at the end (O(1) per item).
+            Some("COLLECT") | Some("COLLECTING") => {
+                if tail.len() != 2 {
+                    return Err(Bail);
+                }
+                let per =
+                    vec![form_list(&[s("SETQ")?, acc, form_list(&[s("CONS")?, tail[1], acc])])];
+                Ok((true, NIL, per, form_list(&[s("NREVERSE")?, acc])))
+            }
+            Some("SUM") | Some("SUMMING") => {
+                if tail.len() != 2 {
+                    return Err(Bail);
+                }
+                let per = vec![form_list(&[s("SETQ")?, acc, form_list(&[s("+")?, acc, tail[1]])])];
+                Ok((true, BlissVal::from_fixnum(0), per, acc))
+            }
+            Some("COUNT") | Some("COUNTING") => {
+                if tail.len() != 2 {
+                    return Err(Bail);
+                }
+                let inc = form_list(&[
+                    s("SETQ")?,
+                    acc,
+                    form_list(&[s("+")?, acc, BlissVal::from_fixnum(1)]),
+                ]);
+                let per = vec![form_list(&[s("WHEN")?, tail[1], inc])];
+                Ok((true, BlissVal::from_fixnum(0), per, acc))
+            }
+            _ => Err(Bail),
+        }
     }
 
     /// Extended-LOOP stage 2 (bliss-x5y.3): list iteration —
@@ -1677,36 +1730,38 @@ impl<'e> Lowerer<'e> {
         let kw = |f: BlissVal| -> Option<String> {
             f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
         };
-        // for VAR in LIST do BODY...  (min 6 tokens)
-        if forms.len() < 6
+        // for VAR in LIST {do BODY... | collect/sum/count EXPR}  (min 5 tokens)
+        if forms.len() < 5
             || kw(forms[0]).as_deref() != Some("FOR")
             || !forms[1].is_symbol()
             || kw(forms[2]).as_deref() != Some("IN")
-            || kw(forms[4]).as_deref() != Some("DO")
         {
             return Err(Bail);
         }
         let var = forms[1];
         let list = forms[3];
-        let body = &forms[5..];
-        if body.is_empty() || body.iter().any(|f| !f.is_cons()) {
-            return Err(Bail); // trailing clause / non-form body → tree-walker
-        }
 
         let id = self.fresh_id();
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
         let lst = resolve_sym(&format!("%LOOP-LST{id}")).ok_or(Bail)?;
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
+        let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
+        // The action clause (do / collect / sum / count) starting at index 4.
+        let (uses_acc, acc_init, per_iter, result) = self.lower_loop_action(&forms[4..], acc)?;
 
         let mut when_items = vec![s("WHEN")?, lst];
         when_items.push(form_list(&[s("SETQ")?, var, form_list(&[s("CAR")?, lst])]));
-        when_items.extend_from_slice(body);
+        when_items.extend(per_iter);
         when_items.push(form_list(&[s("SETQ")?, lst, form_list(&[s("CDR")?, lst])]));
         when_items.push(form_list(&[s("GO")?, top]));
         let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
 
-        let bindings = form_list(&[form_list(&[lst, list]), form_list(&[var, NIL])]);
-        let let_form = form_list(&[s("LET")?, bindings, tagbody_form, NIL]);
+        let mut binding_items = vec![form_list(&[lst, list]), form_list(&[var, NIL])];
+        if uses_acc {
+            binding_items.push(form_list(&[acc, acc_init]));
+        }
+        let bindings = form_list(&binding_items);
+        let let_form = form_list(&[s("LET")?, bindings, tagbody_form, result]);
         self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
     }
 
