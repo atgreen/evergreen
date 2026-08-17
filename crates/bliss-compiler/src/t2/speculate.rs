@@ -1,0 +1,189 @@
+//! T2 speculative type lowering — profile-guided, single-type (spec §4.5, §4.10).
+//!
+//! Given the operand-type profile gathered by the interpreter, rewrite a generic
+//! arithmetic `Call` at a site that is *consistently one type* into that single
+//! typed op — `FixnumMul` for a fixnum-hot `*`, `FloatMul` for a float-hot `*`,
+//! and so on. The typed op is **guard-flagged** and keeps the `Call`'s
+//! `FrameState`, so a wrong-type operand (or a fixnum overflow) deopts to the
+//! interpreter at the site's `bcp`. Crucially it emits **one** path — no fallback
+//! for the other type. A site that is polymorphic or cold (profile `None`) is
+//! left as the generic `Call`. If the speculation proves wrong at runtime it
+//! deopts, the profiler observes the new type, and a later recompile commits to
+//! *that* type instead — never both at once.
+
+use crate::t2::frame_state::FrameStateId;
+use crate::t2::ir::{AuxData, Function, IRType, Inst, InstFlags, Opcode, TypeBits};
+
+/// The single type a call site may be speculated as (mutually exclusive).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum SpecType {
+    Fixnum,
+    SingleFloat,
+}
+
+#[derive(Copy, Clone)]
+enum Arith {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// The arithmetic op a callee symbol names, if it is one we speculate.
+fn arith_of(sym: u32) -> Option<Arith> {
+    match bliss_rt::symbols::symbol_name(sym).as_deref() {
+        Some("+") => Some(Arith::Add),
+        Some("-") => Some(Arith::Sub),
+        Some("*") => Some(Arith::Mul),
+        _ => None,
+    }
+}
+
+/// The typed opcode a `(kind, speculated-type)` lowers to.
+fn typed_opcode(a: Arith, s: SpecType) -> Opcode {
+    use Opcode::*;
+    match (a, s) {
+        (Arith::Add, SpecType::Fixnum) => FixnumAdd,
+        (Arith::Sub, SpecType::Fixnum) => FixnumSub,
+        (Arith::Mul, SpecType::Fixnum) => FixnumMul,
+        (Arith::Add, SpecType::SingleFloat) => FloatAdd,
+        (Arith::Sub, SpecType::SingleFloat) => FloatSub,
+        (Arith::Mul, SpecType::SingleFloat) => FloatMul,
+    }
+}
+
+fn result_type(s: SpecType) -> IRType {
+    IRType::of(match s {
+        SpecType::Fixnum => TypeBits::FIXNUM,
+        SpecType::SingleFloat => TypeBits::SINGLE_FLOAT,
+    })
+}
+
+fn frame_state_bcp(f: &Function, fs: FrameStateId) -> u32 {
+    f.frame_states.get(fs).scopes.last().map(|s| s.bcp).unwrap_or(0)
+}
+
+/// Rewrite generic arithmetic `Call`s into single guarded typed ops guided by
+/// `profile` (site `bcp` → the one speculated type, or `None` to leave generic).
+/// Returns the number of sites speculated.
+pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -> usize {
+    // Read phase: collect the calls to rewrite (keeps the borrow off `f` for the
+    // mutation phase).
+    let mut work: Vec<(Inst, Opcode, IRType)> = Vec::new();
+    for &b in f.block_order() {
+        for &inst in &f.block(b).insts {
+            let data = f.inst(inst);
+            if data.opcode != Opcode::Call {
+                continue;
+            }
+            let sym = match &data.aux {
+                AuxData::CallTarget(s) => *s,
+                _ => continue,
+            };
+            let Some(arith) = arith_of(sym) else { continue };
+            // The site's bcp is on the Call's FrameState (P1 anchors it there).
+            let Some(fs) = data.frame_state else { continue };
+            let bcp = frame_state_bcp(f, fs);
+            let Some(spec) = profile(bcp) else { continue };
+            work.push((inst, typed_opcode(arith, spec), result_type(spec)));
+        }
+    }
+
+    // Mutation phase: turn each into a guarded typed op.
+    let n = work.len();
+    for (inst, opcode, ty) in work {
+        let results = f.inst(inst).results.clone();
+        {
+            let data = f.inst_mut(inst);
+            data.opcode = opcode;
+            // No longer a generic call/safepoint — now a deopt point: guard-flagged
+            // and ordered (effectful), keeping its FrameState so a wrong type or
+            // overflow resumes the interpreter. `aux`/`frame_state` are retained.
+            data.flags = InstFlags { guard: true, effectful: true, ..InstFlags::default() };
+        }
+        for r in results {
+            f.refine_type(r, ty);
+        }
+    }
+    n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::t2::frame_state::{FrameScope, FrameState};
+    use crate::t2::ir::ValueRepresentation;
+
+    // Build `(* a b)`: two params, a Call to `*` carrying a FrameState at bcp 2,
+    // then a Return of the result. Returns (function, the call Inst).
+    fn build_star() -> (Function, Inst) {
+        let mut f = Function::new("m");
+        let entry = f.entry();
+        let a = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let b = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+
+        let fs = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope { function: 0, bcp: 2, locals: vec![], stack: vec![] }],
+            remat: vec![],
+        });
+        let star = bliss_rt::symbols::intern("*");
+        let (call, results) = f.push_inst(
+            entry,
+            crate::t2::ir::InstData {
+                opcode: Opcode::Call,
+                args: vec![a, b],
+                results: vec![],
+                aux: AuxData::CallTarget(star),
+                flags: InstFlags { call: true, effectful: true, safepoint: true, ..Default::default() },
+                targets: vec![],
+                frame_state: Some(fs),
+                source_pos: 0,
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            entry,
+            crate::t2::ir::InstData {
+                opcode: Opcode::Return,
+                args: vec![results[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        (f, call)
+    }
+
+    #[test]
+    fn fixnum_site_becomes_guarded_fixnum_mul() {
+        let (mut f, call) = build_star();
+        let n = speculate(&mut f, &|bcp| if bcp == 2 { Some(SpecType::Fixnum) } else { None });
+        assert_eq!(n, 1);
+        let inst = f.inst(call);
+        assert_eq!(inst.opcode, Opcode::FixnumMul, "* speculated fixnum → FixnumMul");
+        assert!(inst.flags.guard, "typed op must be guard-flagged (deopt point)");
+        assert!(!inst.flags.call, "no longer a generic call");
+        assert!(inst.frame_state.is_some(), "keeps the deopt FrameState");
+        assert!(f.value(inst.results[0]).ty.bits.contains(TypeBits::FIXNUM));
+        // and no second (float) op was emitted — still one instruction.
+        assert_eq!(inst.results.len(), 1);
+    }
+
+    #[test]
+    fn float_site_becomes_float_mul() {
+        let (mut f, call) = build_star();
+        let n = speculate(&mut f, &|_| Some(SpecType::SingleFloat));
+        assert_eq!(n, 1);
+        assert_eq!(f.inst(call).opcode, Opcode::FloatMul, "* speculated float → FloatMul");
+    }
+
+    #[test]
+    fn polymorphic_site_is_left_generic() {
+        let (mut f, call) = build_star();
+        let n = speculate(&mut f, &|_| None); // no consistent type
+        assert_eq!(n, 0);
+        assert_eq!(f.inst(call).opcode, Opcode::Call, "polymorphic/cold site stays a Call");
+    }
+}

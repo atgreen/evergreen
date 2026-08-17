@@ -133,6 +133,65 @@ fn optimisation_passes_compose_and_preserve_wellformedness() {
     verify(&f).expect("post-opt IR must still verify");
 }
 
+/// Speculative lowering on real P1 IR: `(* x 5)` with a fixnum-hot profile at the
+/// call site becomes a single guarded `FixnumMul` (no float path), and the result
+/// still verifies. This is the profile → single-type-speculation step end to end.
+#[test]
+fn fixnum_profile_speculates_the_call() {
+    use bliss_compiler::t2::ir::Opcode;
+    use bliss_compiler::t2::speculate::{speculate, SpecType};
+
+    // (lambda (x) (* x 5)): LoadLocal 0, Const 5, CallNamed *, Return. The
+    // CallNamed is at bcp 2.
+    let star = bliss_rt::symbols::intern("*");
+    let bf = BytecodeFunction {
+        code: vec![
+            Instr::LoadLocal(0),
+            Instr::Const(0),
+            Instr::CallNamed { sym: star, nargs: 2 },
+            Instr::Return,
+        ],
+        constants: vec![BlissVal::from_fixnum(5)],
+        handler_cases: vec![],
+        handler_binds: vec![],
+        names: vec![],
+        restart_cases: vec![],
+        param_layout: vec![],
+        has_env: false,
+        n_locals: 1,
+        max_stack: 2,
+        arity: 1,
+        name: "mul5".to_string(),
+    };
+
+    let mut f = build_from_bytecode(&bf).expect("build");
+    verify(&f).expect("pre-speculation IR verifies");
+
+    // The site at bcp 2 is fixnum-hot → speculate FIXNUM.
+    let n = speculate(&mut f, &|bcp| if bcp == 2 { Some(SpecType::Fixnum) } else { None });
+    assert_eq!(n, 1, "the one arithmetic call site must be speculated");
+
+    // Exactly one FixnumMul, guard-flagged, and no FloatMul anywhere.
+    let mut fixnum_muls = 0;
+    let mut float_muls = 0;
+    for b in f.block_order().to_vec() {
+        for &inst in &f.block(b).insts {
+            match f.inst(inst).opcode {
+                Opcode::FixnumMul => {
+                    fixnum_muls += 1;
+                    assert!(f.inst(inst).flags.guard, "FixnumMul must be a guarded deopt point");
+                }
+                Opcode::FloatMul => float_muls += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(fixnum_muls, 1, "one guarded FixnumMul");
+    assert_eq!(float_muls, 0, "no float path emitted (mutually exclusive)");
+
+    verify(&f).expect("speculated IR still verifies");
+}
+
 /// Wave-3 milestone: with P5b (block-CFG lowering) + P6b (multi-block regalloc),
 /// the FULL backend now composes on BRANCHING IR — not just straight-line. This
 /// is the pipeline stage that the single-block limitation previously blocked.

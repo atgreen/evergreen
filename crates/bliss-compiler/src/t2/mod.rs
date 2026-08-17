@@ -39,6 +39,7 @@ pub mod lower; // P5 — IR → MachFunc instruction selection
 pub mod opt_dce; // P4c — deopt-aware DCE + rematerialisation
 pub mod opt_guard; // P4d — guard elimination + hoisting
 pub mod opt_gvn; // P4a — global value numbering / CSE
+pub mod speculate; // profile-guided single-type speculative lowering
 pub mod opt_licm; // P4b — loop-invariant code motion
 pub mod regalloc; // P6 — regalloc2 adapter + stack maps
 
