@@ -60,6 +60,85 @@ fn extract_bliss_string(v: BlissVal) -> Option<String> {
     }
 }
 
+/// Render a bignum (little-endian base-2^64 limbs) as a decimal string.
+/// Shared with the interpreter's printer so `~A`/`~S`, PRINT, and the REPL all
+/// render heap integers the same way (bliss-axe).
+pub fn bignum_to_decimal(sign: i32, limbs: &[u64]) -> String {
+    if sign == 0 || limbs.iter().all(|&l| l == 0) {
+        return "0".into();
+    }
+    const D: u128 = 1_000_000_000;
+    let mut work = limbs.to_vec();
+    let mut chunks: Vec<u32> = Vec::new();
+    loop {
+        let mut rem: u128 = 0;
+        for limb in work.iter_mut().rev() {
+            let cur = (rem << 64) | (*limb as u128);
+            *limb = (cur / D) as u64;
+            rem = cur % D;
+        }
+        chunks.push(rem as u32);
+        while work.len() > 1 && *work.last().unwrap() == 0 {
+            work.pop();
+        }
+        if work.len() == 1 && work[0] == 0 {
+            break;
+        }
+    }
+    let mut s = String::new();
+    if sign < 0 {
+        s.push('-');
+    }
+    for (i, chunk) in chunks.iter().rev().enumerate() {
+        if i == 0 {
+            s.push_str(&chunk.to_string());
+        } else {
+            s.push_str(&format!("{:09}", chunk));
+        }
+    }
+    s
+}
+
+/// If `v` is a heap-allocated number (bignum or ratio), render it to decimal —
+/// otherwise None. Bignums render as digits; ratios as `num/den` (each part is
+/// itself a fixnum or bignum). Reads the same object layout the interpreter's
+/// numeric tower writes (bliss-axe: previously these fell through to the generic
+/// `#<heap-object>` in FORMAT ~A/~S).
+fn heap_number_string(v: BlissVal, escapep: bool) -> Option<String> {
+    if !v.is_heap_object() {
+        return None;
+    }
+    // Registry-backed pseudo-heap values (registered strings, pathnames) have a
+    // sentinel `as_ptr()` that must never be dereferenced.
+    if crate::pathnames::registered_string(v).is_some() || crate::pathnames::is_pathname(v) {
+        return None;
+    }
+    unsafe {
+        let ptr = v.as_ptr();
+        match (*(ptr as *const ObjectHeader)).type_id() {
+            type_id::BIGNUM => {
+                let sign = *(ptr.add(8) as *const i32);
+                let n = *(ptr.add(12) as *const u32) as usize;
+                let mut limbs = Vec::with_capacity(n);
+                for i in 0..n {
+                    limbs.push(*(ptr.add(16 + i * 8) as *const u64));
+                }
+                Some(bignum_to_decimal(sign, &limbs))
+            }
+            type_id::RATIO => {
+                let num = *(ptr.add(8) as *const BlissVal);
+                let den = *(ptr.add(16) as *const BlissVal);
+                Some(format!(
+                    "{}/{}",
+                    blissval_to_print_string(num, escapep),
+                    blissval_to_print_string(den, escapep)
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Walk a cons-cell linked list and collect all car values into a Vec.
 fn cons_list_to_vec(v: BlissVal) -> Vec<BlissVal> {
     let mut result = Vec::new();
@@ -133,9 +212,17 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
                 }
             }
         }
-        // Check if it's a string and extract its content
+        // Check if it's a string and extract its content. This runs BEFORE the
+        // number check because a registered-string sentinel is a pseudo-heap
+        // value whose `as_ptr()` must not be dereferenced (extract_bliss_string
+        // resolves it via the registry); a real string is consumed here too.
         if let Some(s) = extract_bliss_string(v) {
             return if escapep { format!("\"{}\"", s) } else { s };
+        }
+        // Heap-allocated numbers (bignum, ratio) render as digits, not
+        // #<heap-object> (bliss-axe). Only real GC heap objects reach here now.
+        if let Some(s) = heap_number_string(v, escapep) {
+            return s;
         }
         return format!("#<heap-object {:?}>", v);
     }

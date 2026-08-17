@@ -2835,40 +2835,10 @@ fn print_val(val: BlissVal, out: &mut String) {
 }
 
 /// Render a bignum (little-endian base-2^64 limbs) as a decimal string.
+/// Delegates to the stdlib renderer so the interpreter's printer and FORMAT
+/// ~A/~S agree (bliss-axe).
 fn bignum_to_decimal(sign: i32, limbs: &[u64]) -> String {
-    if sign == 0 || limbs.iter().all(|&l| l == 0) {
-        return "0".into();
-    }
-    const D: u128 = 1_000_000_000;
-    let mut work = limbs.to_vec();
-    let mut chunks: Vec<u32> = Vec::new();
-    loop {
-        let mut rem: u128 = 0;
-        for limb in work.iter_mut().rev() {
-            let cur = (rem << 64) | (*limb as u128);
-            *limb = (cur / D) as u64;
-            rem = cur % D;
-        }
-        chunks.push(rem as u32);
-        while work.len() > 1 && *work.last().unwrap() == 0 {
-            work.pop();
-        }
-        if work.len() == 1 && work[0] == 0 {
-            break;
-        }
-    }
-    let mut s = String::new();
-    if sign < 0 {
-        s.push('-');
-    }
-    for (i, chunk) in chunks.iter().rev().enumerate() {
-        if i == 0 {
-            s.push_str(&chunk.to_string());
-        } else {
-            s.push_str(&format!("{:09}", chunk));
-        }
-    }
-    s
+    bliss_stdlib::format::bignum_to_decimal(sign, limbs)
 }
 
 #[inline]
