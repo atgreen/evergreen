@@ -154,7 +154,7 @@ pub fn call_registered(
         if count < t1_threshold() {
             return None;
         }
-        let nc = try_promote_to_t1(sym)?;
+        let nc = try_promote(sym)?;
         if let Some(f) = fn_obj {
             bliss_rt::function::set_entry(f, nc.entry as *mut u8);
             bliss_rt::function::set_tier(f, 1);
@@ -210,7 +210,11 @@ pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
     use std::fmt::Write;
 
     let name = sym_label(sym);
-    let tier = if native.is_some() { "T1 (native)" } else { "T0 (bytecode interpreter)" };
+    let tier = match &native {
+        Some(nc) if nc.is_t2 => "T2 (native, profile-guided)",
+        Some(_) => "T1 (native)",
+        None => "T0 (bytecode interpreter)",
+    };
     let _ = writeln!(
         out,
         "; disassembly of {name} — {} arg(s), {} local(s), {} stack slot(s)  [tier: {tier}]",
@@ -3292,7 +3296,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                             if count < t1_threshold() {
                                 return None;
                             }
-                            let nc = try_promote_to_t1(sym)?;
+                            let nc = try_promote(sym)?;
                             if let Some(f) = fn_obj {
                                 bliss_rt::function::set_entry(f, nc.entry as *mut u8);
                                 bliss_rt::function::set_tier(f, 1);
@@ -4111,6 +4115,9 @@ struct NativeCode {
     /// Length of the installed machine code, so `disassemble` can read the
     /// (R+X mapped) code bytes back for decoding.
     code_len: usize,
+    /// True if this is T2 optimising code (profile-guided single-type
+    /// speculation), false for the T1 baseline. Both share the run_native ABI.
+    is_t2: bool,
     num_slots: u16,
     /// Validated GC stack-map metadata for this function's activation, installed
     /// alongside the code (bliss-jtc.4). Passed into every frame the i2c adapter
@@ -4182,7 +4189,9 @@ impl TypeProfile {
     /// (≥90% one type over ≥`MIN` samples). `None` means "not enough data" or
     /// "polymorphic" — in which case that op is left generic (no speculation).
     pub fn dominant(&self) -> Option<SpecType> {
-        const MIN: u32 = 20;
+        // Low floor so speculation can fire by the T1 promotion threshold (the
+        // function only warms up in bytecode until it promotes).
+        const MIN: u32 = 8;
         let t = self.total();
         if t < MIN {
             return None;
@@ -5168,11 +5177,66 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
     let nc = Rc::new(NativeCode {
         entry,
         code_len: code.len(),
+        is_t2: false,
         num_slots,
         code_info,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
     Some(nc)
+}
+
+/// Try to compile `sym` to T2 optimising native code (profile-guided single-type
+/// speculation). Gated behind `BLISS_T2=1` — off by default. Returns `None`
+/// (fall back to T1) when disabled, when no arithmetic site has a consistent
+/// profile yet, or when the function's shape is beyond the first-cut framed
+/// emitter (branches, unsupported ops). Installs like T1 and shares the
+/// run_native ABI, so dispatch and deopt are identical.
+fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
+    if std::env::var("BLISS_T2").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let bf = registry_get(sym)?;
+    let func_ptr = Rc::as_ptr(&bf) as usize;
+
+    // The profile closure the speculative-lowering pass consumes: this function's
+    // observed operand type at each call-site bcp, mapped to the compiler's type.
+    let profile = |bcp: u32| -> Option<bliss_compiler::t2::speculate::SpecType> {
+        use bliss_compiler::t2::speculate::SpecType as Bc;
+        match type_profile_at(func_ptr, bcp).and_then(|p| p.dominant()) {
+            Some(SpecType::Fixnum) => Some(Bc::Fixnum),
+            Some(SpecType::SingleFloat) => Some(Bc::SingleFloat),
+            None => None,
+        }
+    };
+
+    let mut f = bliss_compiler::t2::build::build_from_bytecode(&bf).ok()?;
+    let speculated = bliss_compiler::t2::speculate::speculate(&mut f, &profile);
+    if speculated == 0 {
+        return None; // nothing to specialise → T1 is as good; skip T2
+    }
+    let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
+    let code = bliss_compiler::t2::emit::emit_framed(&f, deopt_addr).ok()?;
+
+    let num_slots = bf.num_slots();
+    let code_info = install_stack_map(num_slots)?;
+    let buf = bliss_rt::jit::JitBuffer::new(&code)?;
+    let entry = buf.leak();
+    maybe_write_perf_map(entry as usize, code.len(), sym);
+    let nc = Rc::new(NativeCode {
+        entry,
+        code_len: code.len(),
+        is_t2: true,
+        num_slots,
+        code_info,
+    });
+    NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
+    Some(nc)
+}
+
+/// Promote `sym` to the best available native tier: T2 (profile-guided) if
+/// enabled and applicable, else the T1 baseline.
+fn try_promote(sym: u32) -> Option<Rc<NativeCode>> {
+    try_promote_to_t2(sym).or_else(|| try_promote_to_t1(sym))
 }
 
 /// Installed OSR code for a function (bliss-izt.1): a non-speculating native
