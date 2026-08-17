@@ -901,26 +901,26 @@ fn is_fixnum_guarding_op(op: crate::t2::ir::Opcode) -> bool {
 /// bit-comparison producing `T`/`NIL` — no runtime call. This is the first T2
 /// intrinsic: `EQ` is bit-equality of the two tagged representations, so it is a
 /// `cmp` plus a select of the two immediate results.
-fn emit_generic_eq(
+/// Resolve `GenericEq`'s two operands to registers (a live value reg, or a
+/// tagged constant loaded into SCRATCH) and emit `cmp r0, r1`, setting ZF iff the
+/// two tagged reps are equal (Lisp `EQ`). At most one operand may be constant
+/// (both-constant is folded by the mid-end); declines otherwise so the single
+/// scratch is never contended. Shared by the value-producing `emit_generic_eq`
+/// and the fused branch path.
+fn emit_eq_cmp(
     a: &mut Asm,
     data: &crate::t2::ir::InstData,
-    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
-    pool: &mut Vec<u8>,
+    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
     const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::Opcode;
-    if data.results.is_empty() || data.args.len() < 2 {
+    if data.args.len() < 2 {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::GenericEq)));
     }
     let (a0, a1) = (data.args[0], data.args[1]);
-    // Both-constant EQ should have been constant-folded by the mid-end; declining
-    // keeps us from contending for the single scratch register.
     if const_tagged.contains_key(&a0) && const_tagged.contains_key(&a1) {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::GenericEq)));
     }
-    // Resolve an operand to a register: a live value reg, or a tagged constant
-    // loaded into the reserved scratch. At most one operand is constant here (the
-    // both-constant case is excluded above), so the scratch is never contended.
     let resolve = |a: &mut Asm, v: crate::t2::ir::Value| -> Result<u8, EmitError> {
         if let Some(&r) = reg.get(&v) {
             Ok(r)
@@ -933,9 +933,29 @@ fn emit_generic_eq(
     };
     let r0 = resolve(a, a0)?;
     let r1 = resolve(a, a1)?;
-    let dst = framed_alloc(reg, pool, data.results[0])?;
-    // cmp reads r0/r1 before dst is written, so dst aliasing an operand is safe.
     cmp_rr(a, r0, r1);
+    Ok(())
+}
+
+/// Emit `GenericEq` (Lisp `EQ`, and `NULL` via `EQ x NIL`) as an inline tagged
+/// bit-comparison producing `T`/`NIL` — no runtime call. This is the first T2
+/// intrinsic: `EQ` is bit-equality of the two tagged representations, so it is a
+/// `cmp` plus a select of the two immediate results. (When the result only feeds
+/// a branch, the compare is fused straight into the Brif instead — see below.)
+fn emit_generic_eq(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    if data.results.is_empty() {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::GenericEq)));
+    }
+    // Sets flags (ZF iff equal); mov-imm below does not disturb them.
+    emit_eq_cmp(a, data, reg, const_tagged)?;
+    let dst = framed_alloc(reg, pool, data.results[0])?;
     mov_imm64(a, dst, bliss_rt::value::T.0 as i64);
     let done = a.label();
     a.jcc(Cc::E, done);
@@ -1116,8 +1136,10 @@ pub fn emit_framed(
         }
     }
 
-    // Fused comparisons: a fixnum comparison whose single use is its own block's
-    // Brif condition is emitted as cmp+jcc and needs no register.
+    // Fused comparisons: a comparison whose single use is its own block's Brif
+    // condition is emitted as cmp+jcc and needs no register — a fixnum comparison
+    // (FixnumCmp*) or an EQ/NULL identity compare (GenericEq), which fuses to
+    // cmp+je and skips materialising a T/NIL just to re-test it.
     let mut fused: HashSet<crate::t2::ir::Inst> = HashSet::new();
     for &b in &blocks {
         if let Some(t) = f.terminator(b) {
@@ -1126,7 +1148,8 @@ pub fn emit_framed(
                 let cond = td.args[0];
                 if uses.get(&cond) == Some(&1) {
                     if let ValueDef::Result { inst, .. } = f.value(cond).def {
-                        if fixnum_cmp_cc(f.inst(inst).opcode).is_some()
+                        let op = f.inst(inst).opcode;
+                        if (fixnum_cmp_cc(op).is_some() || op == Opcode::GenericEq)
                             && f.block(b).insts.contains(&inst)
                         {
                             fused.insert(inst);
@@ -1510,12 +1533,28 @@ pub fn emit_framed(
                     }
                     continue;
                 }
-                let cmp_inst = match f.value(cond).def {
-                    ValueDef::Result { inst, .. } if fused.contains(&inst) => inst,
-                    _ => return Err(EmitError::UnsupportedOp(0xF6)),
+                // Compute the branch condition code. A fused fixnum comparison
+                // lowers to cmp+jcc directly; any other condition is a general
+                // Lisp truthiness test — only NIL is false, so materialise the
+                // value and branch to the true target (targets[0]) when it != NIL.
+                let cc = match f.value(cond).def {
+                    ValueDef::Result { inst, .. } if fused.contains(&inst) => {
+                        let cmp_data = f.inst(inst).clone();
+                        if cmp_data.opcode == Opcode::GenericEq {
+                            // EQ/NULL fused: cmp the two tagged operands; equal
+                            // (ZF) is "true", taking targets[0].
+                            emit_eq_cmp(&mut a, &cmp_data, &reg, &const_tagged)?;
+                            Cc::E
+                        } else {
+                            emit_fused_compare(&mut a, &cmp_data, &reg, &consts, &proven, deopt)?
+                        }
+                    }
+                    _ => {
+                        let cr = *reg.get(&cond).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                        alu_r_imm(&mut a, 7, cr, bliss_rt::value::NIL.0 as i32); // cmp cr, NIL
+                        Cc::Ne
+                    }
                 };
-                let cmp_data = f.inst(cmp_inst).clone();
-                let cc = emit_fused_compare(&mut a, &cmp_data, &reg, &consts, &proven, deopt)?;
                 let then_b = td.targets[0].block; // taken when the comparison is true
                 let else_b = td.targets[1].block;
                 let then_moves = edge_moves(f, &td.targets[0], &reg, &const_tagged)?;
