@@ -140,7 +140,11 @@ fn integration_acceptance_scripts_execute_through_real_cli_entrypoints() {
     let repl_expected = expected_markers(repl_script);
     let script_body = read(repl_script);
     let mut repl = Command::new(bliss_bin_path());
-    repl.current_dir(repo_root())
+    // --no-init keeps the REPL test hermetic against the developer's ~/.blissrc,
+    // which would otherwise inject its output/latency (and any errors) into this
+    // stdin-driven REPL session.
+    repl.arg("--no-init")
+        .current_dir(repo_root())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
