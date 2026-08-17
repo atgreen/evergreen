@@ -863,6 +863,44 @@
 (defun nconc (&rest lists) (apply (function append) lists))
 (defun revappend (x y) (append (reverse x) y))
 (defun make-list (n &key initial-element) (loop repeat n collect initial-element))
+
+;; MAKE-ARRAY dimensions &key initial-element initial-contents element-type —
+;; one-dimensional only. A character element-type builds a string; otherwise a
+;; simple vector. :adjustable / :fill-pointer are accepted but ignored.
+(defun make-array (dimensions &rest keys)
+  (let* ((size (if (consp dimensions) (car dimensions) dimensions))
+         (iel-cell (member :initial-element keys))
+         (ic-cell (member :initial-contents keys))
+         (et-cell (member :element-type keys))
+         (et (if et-cell (car (cdr et-cell)) t))
+         (stringp (member et '(character base-char standard-char))))
+    (cond
+      (ic-cell
+       (coerce (car (cdr ic-cell)) (if stringp 'string 'vector)))
+      (stringp
+       (if iel-cell (make-string size :initial-element (car (cdr iel-cell))) (make-string size)))
+      (t
+       (apply (function vector)
+              (make-list size :initial-element (if iel-cell (car (cdr iel-cell)) nil)))))))
+
+;; MAKE-SEQUENCE result-type size &key initial-element — a fresh sequence of the
+;; given type. Dispatches on the type's head: list types build a list, string
+;; types (or (vector character …)) a string, everything else a general vector.
+(defun make-sequence (result-type size &rest keys)
+  (let* ((head (if (consp result-type) (car result-type) result-type))
+         (elt (if (consp result-type) (car (cdr result-type)) nil))
+         (iel-cell (member :initial-element keys))
+         (iel (if iel-cell (car (cdr iel-cell)) nil))
+         (stringp (or (member head '(string simple-string base-string simple-base-string))
+                      (and (member head '(vector array simple-array simple-vector))
+                           (member elt '(character base-char standard-char))))))
+    (cond
+      ((member head '(list cons null))
+       (make-list size :initial-element iel))
+      (stringp
+       (if iel-cell (make-string size :initial-element iel) (make-string size)))
+      (t
+       (if iel-cell (make-array size :initial-element iel) (make-array size))))))
 (defun string-equal (a b) (string= (string-downcase a) (string-downcase b)))
 
 (defun subst (new old tree)
