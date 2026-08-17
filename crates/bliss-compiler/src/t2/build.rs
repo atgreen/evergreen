@@ -117,6 +117,7 @@ impl<'a> Builder<'a> {
         self.compute_total_preds()?;
         self.seed_entry();
         self.process_blocks()?;
+        self.simplify_trivial_phis();
         Ok(self.f)
     }
 
@@ -184,6 +185,9 @@ impl<'a> Builder<'a> {
                 Instr::ClearMv => {
                     push(i + 1, d, &mut depth_at, &mut work); // no operand-stack effect
                 }
+                Instr::PushBlock { .. } | Instr::PushTag { .. } | Instr::PopHandler => {
+                    push(i + 1, d, &mut depth_at, &mut work); // handler markers: no stack effect
+                }
                 Instr::Br(t) => {
                     push(*t as usize, d, &mut depth_at, &mut work);
                 }
@@ -244,34 +248,38 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// Successor blocks of the block spanning `[start, end)`, derived from its
-    /// controlling (last) instruction. Order matches the terminator built during
-    /// interpretation, but only the multiset matters here (for pred counting).
-    fn structural_succs(&self, _start: usize, end: usize) -> Result<Vec<Block>, BuildError> {
+    /// Successor blocks of the block spanning `[start, end)`. The block's
+    /// terminator is the **first** control-flow instruction in the range — the
+    /// same one `interpret_block` stops at — NOT `code[end-1]`: an unconditional
+    /// `Br`/`Go`/`Return` is not followed by a leader, so unreachable trailing
+    /// instructions (e.g. a `PopHandler` after a loop's `Go`) may sit after it in
+    /// the same block. Reading the last instruction would then miscount edges and
+    /// mis-seal loop headers (bliss-fe8). Only the successor multiset matters here
+    /// (for predecessor counting); the real edge order comes from `finish_block`.
+    fn structural_succs(&self, start: usize, end: usize) -> Result<Vec<Block>, BuildError> {
         let code = &self.bf.code;
-        let last = end - 1;
         let blk = |t: usize| -> Result<Block, BuildError> {
             self.block_of
                 .get(&t)
                 .copied()
                 .ok_or(BuildError::Unsupported("branch target is not a block leader"))
         };
-        let succs = match &code[last] {
-            Instr::Br(t) => vec![blk(*t as usize)?],
-            Instr::Go { target_bcp, .. } => vec![blk(*target_bcp as usize)?],
-            Instr::BrIfTrue(t) => vec![blk(*t as usize)?, blk(end)?],
-            Instr::BrIfFalse(t) => vec![blk(end)?, blk(*t as usize)?],
-            Instr::Return => vec![],
-            _ => {
-                // Falls through to the next leader (if any).
-                if end < code.len() {
-                    vec![blk(end)?]
-                } else {
-                    vec![]
-                }
+        for instr in &code[start..end] {
+            match instr {
+                Instr::Br(t) => return Ok(vec![blk(*t as usize)?]),
+                Instr::Go { target_bcp, .. } => return Ok(vec![blk(*target_bcp as usize)?]),
+                Instr::BrIfTrue(t) => return Ok(vec![blk(*t as usize)?, blk(end)?]),
+                Instr::BrIfFalse(t) => return Ok(vec![blk(end)?, blk(*t as usize)?]),
+                Instr::Return => return Ok(vec![]),
+                _ => {}
             }
-        };
-        Ok(succs)
+        }
+        // No terminator in range: fall through to the next leader (if any).
+        if end < code.len() {
+            Ok(vec![blk(end)?])
+        } else {
+            Ok(vec![])
+        }
     }
 
     // ── Entry seeding ───────────────────────────────────────────────
@@ -377,6 +385,12 @@ impl<'a> Builder<'a> {
                     // Reset multiple-values state; no operand effect (bliss-mzp).
                     self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, None);
                 }
+                Instr::PushBlock { sp_restore, .. } | Instr::PushTag { sp_restore, .. } => {
+                    if *sp_restore != 0 {
+                        return Err(BuildError::Unsupported("handler with non-empty sp_restore"));
+                    }
+                }
+                Instr::PopHandler => {}
                 Instr::Dup => {
                     let v = *stack.last().ok_or(BuildError::Unsupported("stack underflow (Dup)"))?;
                     stack.push(v);
@@ -646,6 +660,103 @@ impl<'a> Builder<'a> {
             }
         }
         self.sealed[block.index()] = true;
+    }
+
+    // ── Trivial-phi elimination (Braun `tryRemoveTrivialPhi`, spec §4.3.5.1) ──
+
+    /// Collapse trivial block parameters as a fixpoint post-pass. A parameter
+    /// whose incoming arguments (across every predecessor edge) are all either
+    /// itself or one single other value `u` is a trivial phi ≡ `u`. The base
+    /// Braun construction leaves these behind for loop-invariant values — e.g. a
+    /// `dotimes` bound read inside the loop gets a header phi even though it never
+    /// changes — and each one needlessly pins a register, which is what pushes a
+    /// global-accumulator loop past the framed emitter's register budget
+    /// (bliss-fe8). Removing a parameter drops it from the block and drops the
+    /// matching argument from every predecessor edge, keeping the two positionally
+    /// consistent (the emitter correlates params↔args by position, not by id).
+    fn simplify_trivial_phis(&mut self) {
+        loop {
+            let mut found: Option<(Block, usize, Value, Value)> = None;
+            'outer: for &b in self.block_of.values() {
+                let preds = match self.pred_edges.get(&b) {
+                    Some(p) if !p.is_empty() => p.clone(),
+                    _ => continue, // entry / unreachable: no incoming phi arguments
+                };
+                let nparams = self.f.block(b).params.len();
+                for pos in 0..nparams {
+                    let p = self.f.block(b).params[pos];
+                    let mut other: Option<Value> = None;
+                    let mut trivial = true;
+                    for &(pred, idx) in &preds {
+                        let term = self.terminator_inst[&pred];
+                        let arg = self.f.inst(term).targets[idx].args[pos];
+                        if arg == p {
+                            continue; // self-reference: does not disqualify
+                        }
+                        match other {
+                            None => other = Some(arg),
+                            Some(u) if u == arg => {}
+                            Some(_) => {
+                                trivial = false;
+                                break;
+                            }
+                        }
+                    }
+                    // `other == None` means every edge feeds the phi itself — an
+                    // undefined/dead cycle; leave it (a real definition never is).
+                    if trivial {
+                        if let Some(u) = other {
+                            found = Some((b, pos, p, u));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            let Some((b, pos, p, u)) = found else { break };
+            self.replace_value(p, u);
+            self.f.block_mut(b).params.remove(pos);
+            for &(pred, idx) in &self.pred_edges[&b].clone() {
+                let term = self.terminator_inst[&pred];
+                self.f.inst_mut(term).targets[idx].args.remove(pos);
+            }
+        }
+    }
+
+    /// Replace every use of value `p` with `u` — in instruction operands, in edge
+    /// (block-call) arguments, and in deopt frame states — so a removed trivial
+    /// phi leaves no dangling reference.
+    fn replace_value(&mut self, p: Value, u: Value) {
+        let blocks: Vec<Block> = self.block_of.values().copied().collect();
+        for b in blocks {
+            let insts = self.f.block(b).insts.clone();
+            for inst in insts {
+                let d = self.f.inst_mut(inst);
+                for a in d.args.iter_mut() {
+                    if *a == p {
+                        *a = u;
+                    }
+                }
+                for tc in d.targets.iter_mut() {
+                    for a in tc.args.iter_mut() {
+                        if *a == p {
+                            *a = u;
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0..self.f.frame_states.len() {
+            let fs = self.f.frame_states.get_mut(crate::t2::frame_state::FrameStateId(i as u32));
+            for scope in fs.scopes.iter_mut() {
+                for src in scope.locals.iter_mut().chain(scope.stack.iter_mut()) {
+                    if let ValueSource::Value { value, .. } = src {
+                        if *value == p {
+                            *value = u;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── Frame state (deopt anchor) ──────────────────────────────────

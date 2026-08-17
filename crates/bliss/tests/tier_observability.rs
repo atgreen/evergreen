@@ -220,3 +220,34 @@ fn global_store_before_guard_reaches_t2_and_deopts_once() {
     let twl = tw.lines().next().unwrap_or("").to_string();
     assert_eq!(twl, line, "T2 result must match the tree-walker: {line:?} vs {twl:?}");
 }
+
+/// A global-accumulator LOOP reaches T2 (bliss-fe8: the builder's loop SSA is
+/// stitched correctly and its loop-invariant phis are collapsed so it fits the
+/// framed register budget), computes the interpreted result, and deopts
+/// precisely when a guard fails mid-loop. `acc-loop` sums `step` into `*s*` five
+/// times inside a `dotimes`; called with a fixnum it stays all-fixnum (promotes),
+/// and with a float the `(+ *s* step)` guard fails on the first iteration and
+/// deopts — the loop must finish in the interpreter with the exact float sum, and
+/// `*s*` must match. All three observations must equal the tree-walker's.
+#[test]
+fn global_accumulator_loop_reaches_t2_and_deopts_precisely() {
+    let prog = "\
+        (defvar *s* 0) \
+        (defun acc-loop (step) (setf *s* 0) (dotimes (i 5) (setf *s* (+ *s* step))) *s*) \
+        (dotimes (k 60) (acc-loop 2)) \
+        (let ((a (acc-loop 2)) (b (acc-loop 3)) (c (acc-loop 1.5))) \
+          (format t \"~a ~a ~a ~a~%\" a b c *s*))";
+
+    let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
+    assert!(ok, "T2 run failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    assert_eq!(
+        line, "10 15 7.5 7.5",
+        "loop results incl. the mid-loop float deopt (a b c *s*): {line:?}"
+    );
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker run failed: {tw}");
+    let twl = tw.lines().next().unwrap_or("").to_string();
+    assert_eq!(twl, line, "T2 loop result must match the tree-walker: {line:?} vs {twl:?}");
+}
