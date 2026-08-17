@@ -4358,6 +4358,17 @@ fn run_native(
             *e += 1;
             *e
         });
+        if t2_log_target().is_some() {
+            let nm = registry_get(sym).map(|b| b.name.clone()).unwrap_or_default();
+            t2_log_write(format_args!(
+                "{nm}: native guard deopt #{n} => re-running interpreted{}",
+                if n >= deopt_blacklist_threshold() {
+                    " (threshold hit: uninstall + blacklist => T0)"
+                } else {
+                    ""
+                }
+            ));
+        }
         if n >= deopt_blacklist_threshold() {
             NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
             DEOPT_BLACKLIST.with(|s| s.borrow_mut().insert(sym));
@@ -5212,12 +5223,80 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
 /// profile yet, or when the function's shape is beyond the first-cut framed
 /// emitter (branches, unsupported ops). Installs like T1 and shares the
 /// run_native ABI, so dispatch and deopt are identical.
+/// Where T2 trace output goes, decided once from `BLISS_T2_LOG`:
+/// `-`/`1`/`stderr` → stderr; any other non-empty value → that file (appended);
+/// unset → no logging. This is the observability channel: it explains, per
+/// function, why T2 was or wasn't reached and what specialization it chose.
+enum T2LogTarget {
+    Stderr,
+    File(std::sync::Mutex<std::fs::File>),
+}
+
+fn t2_log_target() -> Option<&'static T2LogTarget> {
+    use std::sync::OnceLock;
+    static T: OnceLock<Option<T2LogTarget>> = OnceLock::new();
+    T.get_or_init(|| match std::env::var("BLISS_T2_LOG") {
+        Ok(v) if v == "-" || v == "1" || v == "stderr" => Some(T2LogTarget::Stderr),
+        Ok(v) if !v.is_empty() => std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&v)
+            .ok()
+            .map(|f| T2LogTarget::File(std::sync::Mutex::new(f))),
+        _ => None,
+    })
+    .as_ref()
+}
+
+fn t2_log_write(msg: std::fmt::Arguments) {
+    use std::io::Write;
+    match t2_log_target() {
+        Some(T2LogTarget::Stderr) => {
+            let _ = writeln!(std::io::stderr(), "[T2] {msg}");
+        }
+        Some(T2LogTarget::File(m)) => {
+            if let Ok(mut f) = m.lock() {
+                let _ = writeln!(f, "[T2] {msg}");
+            }
+        }
+        None => {}
+    }
+}
+
+macro_rules! t2_log {
+    ($($a:tt)*) => { t2_log_write(format_args!($($a)*)) };
+}
+
+/// Log every profiled call site of `func_ptr` and the type it resolves to — the
+/// "why" behind a speculation (or a decline).
+fn t2_log_profile(name: &str, func_ptr: usize) {
+    if t2_log_target().is_none() {
+        return;
+    }
+    TYPE_PROFILE.with(|m| {
+        for ((fp, bcp), p) in m.borrow().iter() {
+            if *fp == func_ptr {
+                t2_log!(
+                    "{name}: site bcp={bcp} profile fix={} float={} other={} => {:?}",
+                    p.fixnum,
+                    p.single_float,
+                    p.other,
+                    p.dominant()
+                );
+            }
+        }
+    });
+}
+
 fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
     if std::env::var("BLISS_T2").ok().as_deref() != Some("1") {
         return None;
     }
     let bf = registry_get(sym)?;
     let func_ptr = Rc::as_ptr(&bf) as usize;
+    let name = bf.name.clone();
+    t2_log!("{name}: considering for T2 (arity {})", bf.arity);
+    t2_log_profile(&name, func_ptr);
 
     // The profile closure the speculative-lowering pass consumes: this function's
     // observed operand type at each call-site bcp, mapped to the compiler's type.
@@ -5230,11 +5309,19 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         }
     };
 
-    let mut f = bliss_compiler::t2::build::build_from_bytecode(&bf).ok()?;
+    let mut f = match bliss_compiler::t2::build::build_from_bytecode(&bf) {
+        Ok(f) => f,
+        Err(e) => {
+            t2_log!("{name}: build_from_bytecode failed: {e:?} => stay T1");
+            return None;
+        }
+    };
     let speculated = bliss_compiler::t2::speculate::speculate(&mut f, &profile);
     if speculated == 0 {
+        t2_log!("{name}: 0 speculatable sites (cold or polymorphic profile) => stay T1");
         return None; // nothing to specialise → T1 is as good; skip T2
     }
+    t2_log!("{name}: speculated {speculated} site(s)");
 
     // Route the speculated IR through the mid-end: constant folding + strength
     // reduction (P4f), global value numbering (P4a), then deopt-aware DCE (P4c).
@@ -5248,11 +5335,25 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         pm.add(Box::new(bliss_compiler::t2::opt_dce::Dce));
         pm.run(&mut f);
     }
-    bliss_compiler::t2::verify::verify(&f).ok()?;
+    if let Err(e) = bliss_compiler::t2::verify::verify(&f) {
+        t2_log!("{name}: post-mid-end verify failed: {e:?} => stay T1");
+        return None;
+    }
 
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
-    let framed = bliss_compiler::t2::emit::emit_framed(&f, deopt_addr).ok()?;
+    let framed = match bliss_compiler::t2::emit::emit_framed(&f, deopt_addr) {
+        Ok(fc) => fc,
+        Err(e) => {
+            t2_log!("{name}: emit_framed failed: {e:?} (shape beyond emitter) => stay T1");
+            return None;
+        }
+    };
     let code = framed.code;
+    t2_log!(
+        "{name}: T2 INSTALLED — {} bytes, compiled_entry=+{}",
+        code.len(),
+        framed.compiled_entry
+    );
 
     let num_slots = bf.num_slots();
     let code_info = install_stack_map(num_slots)?;
