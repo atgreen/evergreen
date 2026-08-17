@@ -154,7 +154,7 @@ fn dotimes_and_dolist_promote_to_t1() {
 /// lowers to bytecode and promotes to T1 (bliss-jtc.28 follow-up), while the
 /// extended LOOP (FOR/…/keywords) stays in the tree-walker at T0 — both correct.
 #[test]
-fn simple_loop_promotes_extended_loop_stays_t0() {
+fn simple_and_numeric_for_loops_promote() {
     let simple = "\
         (defun g (n) (let ((s 0) (i 0)) \
           (loop (when (>= i n) (return s)) (setq s (+ s i)) (setq i (+ i 1))))) \
@@ -167,7 +167,9 @@ fn simple_loop_promotes_extended_loop_stays_t0() {
     assert_eq!(f.first().copied(), Some("1"), "simple loop must reach T1: {out:?}");
     assert_eq!(f.get(1).copied(), Some("4950"), "simple loop result");
 
-    // Extended LOOP stays interpreted (tier 0) but returns the same value.
+    // Extended LOOP with an ascending numeric `for` now lowers to the same
+    // block/let/tagbody/go shape as DOTIMES and promotes to T1 (bliss-x5y.3),
+    // with the same value. (Non-numeric-for extended loops still bail to T0.)
     let extended = "\
         (defun h (n) (let ((s 0)) (loop for i from 1 to n do (setq s (+ s i))) s)) \
         (h 5) (h 5) (h 5) \
@@ -176,6 +178,6 @@ fn simple_loop_promotes_extended_loop_stays_t0() {
     assert!(ok, "extended loop run failed: {out}");
     let out = out.lines().next().unwrap_or("").to_string();
     let f: Vec<&str> = out.split_whitespace().collect();
-    assert_eq!(f.first().copied(), Some("0"), "extended loop stays T0: {out:?}");
+    assert_eq!(f.first().copied(), Some("1"), "numeric-for loop reaches T1: {out:?}");
     assert_eq!(f.get(1).copied(), Some("5050"), "extended loop result");
 }

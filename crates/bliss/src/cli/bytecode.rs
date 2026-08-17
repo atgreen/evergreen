@@ -45,8 +45,8 @@ use super::{
     apply_function,
     arena_cons, bliss_error_to_condition, condition_matches_handler, cp, eval_form,
     handler_case_token, list_to_vec, next_control_token, resolve_sym, restart_invoked_name,
-    run_handler_bind_handlers, store_control_value, sym_name, tag_key, take_control_value,
-    val_as_str, vec_to_list,
+    run_handler_bind_handlers, store_control_value, sym_name, symbol_bare_name, tag_key,
+    take_control_value, val_as_str, vec_to_list,
 };
 // Label-based assembler backing the native (T1) code emitter (see cli::asm).
 use bliss_rt::asm::{Asm, Cc, Label};
@@ -1557,10 +1557,14 @@ impl<'e> Lowerer<'e> {
     /// keywords such as FOR/WHILE/COLLECT) is left to the tree-walker.
     fn lower_loop(&mut self, rest: BlissVal) -> LowerResult<()> {
         let forms = list_to_vec(rest);
-        // Simple loop iff there is at least one form and all are compound. A bare
-        // atom (a loop keyword or an atom clause) means the extended grammar.
-        if forms.is_empty() || !forms.iter().all(|f| f.is_cons()) {
+        if forms.is_empty() {
             return Err(Bail);
+        }
+        // Simple loop iff all clauses are compound. A bare atom (a loop keyword)
+        // means the extended grammar — try the common numeric-`for` shape, else
+        // bail to the tree-walker's full LOOP.
+        if !forms.iter().all(|f| f.is_cons()) {
+            return self.lower_loop_numeric_for(&forms);
         }
         let id = self.fresh_id();
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
@@ -1571,6 +1575,83 @@ impl<'e> Lowerer<'e> {
         tb.push(form_list(&[s("GO")?, top]));
         let block = form_list(&[s("BLOCK")?, NIL, form_list(&tb)]);
         self.lower_expr(block)
+    }
+
+    /// Extended-LOOP stage 1 (bliss-x5y.3): the pervasive ascending numeric
+    /// counter — `(loop for VAR from START (below|to|upto) END [by STEP] do
+    /// BODY...)` — expanded to the same block/let/tagbody/go shape as DOTIMES so
+    /// it promotes to native T1. Anything else (list/hash iteration, collect/sum,
+    /// while/until, descending, multiple `for`) bails to the tree-walker.
+    fn lower_loop_numeric_for(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
+        // Bare (KEYWORD:-stripped, upcased) name of a loop-keyword token.
+        let kw = |f: BlissVal| -> Option<String> {
+            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+        };
+        let kw_is = |f: BlissVal, name: &str| kw(f).as_deref() == Some(name);
+
+        // for VAR from START LIMIT-KW END [by STEP] do BODY...  (min 8 tokens)
+        if forms.len() < 8 || !kw_is(forms[0], "FOR") || !forms[1].is_symbol() {
+            return Err(Bail);
+        }
+        let var = forms[1];
+        if !(kw_is(forms[2], "FROM") || kw_is(forms[2], "UPFROM")) {
+            return Err(Bail);
+        }
+        let start = forms[3];
+        let cmp = match kw(forms[4]).as_deref() {
+            Some("BELOW") => "<",
+            Some("TO") | Some("UPTO") => "<=",
+            _ => return Err(Bail), // descending / other limit → tree-walker
+        };
+        let end = forms[5];
+        // Optional `by STEP`; then `do`.
+        let (step, do_at) = if kw_is(forms[6], "BY") {
+            if forms.len() < 10 {
+                return Err(Bail);
+            }
+            (forms[7], 8)
+        } else {
+            (BlissVal::from_fixnum(1), 6)
+        };
+        if !kw_is(forms[do_at], "DO") {
+            return Err(Bail);
+        }
+        let body = &forms[do_at + 1..];
+        // Every body form must be a compound expression. A bare atom here means a
+        // trailing clause we don't model (finally / collect / another for / a
+        // tag) — bail to the tree-walker rather than mis-lowering it as a do-body
+        // statement.
+        if body.is_empty() || body.iter().any(|f| !f.is_cons()) {
+            return Err(Bail);
+        }
+
+        let id = self.fresh_id();
+        let s = |n: &str| resolve_sym(n).ok_or(Bail);
+        let end_v = resolve_sym(&format!("%LOOP-END{id}")).ok_or(Bail)?;
+        let step_v = resolve_sym(&format!("%LOOP-STEP{id}")).ok_or(Bail)?;
+        let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
+
+        // (tagbody top (when (cmp VAR %end) body... (setq VAR (+ VAR %step)) (go top)))
+        let test = form_list(&[s(cmp)?, var, end_v]);
+        let mut when_items = vec![s("WHEN")?, test];
+        when_items.extend_from_slice(body);
+        when_items.push(form_list(&[
+            s("SETQ")?,
+            var,
+            form_list(&[s("+")?, var, step_v]),
+        ]));
+        when_items.push(form_list(&[s("GO")?, top]));
+        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+
+        let bindings = form_list(&[
+            form_list(&[var, start]),
+            form_list(&[end_v, end]),
+            form_list(&[step_v, step]),
+        ]);
+        // LOOP returns NIL unless there is an accumulation/return clause (which we
+        // don't handle here), so the block value is NIL.
+        let let_form = form_list(&[s("LET")?, bindings, tagbody_form, NIL]);
+        self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
     }
 
     /// `(unwind-protect protected cleanup...)` — the cleanup runs on both the
