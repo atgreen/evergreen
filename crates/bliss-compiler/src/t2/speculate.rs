@@ -179,6 +179,12 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
                 if spec == SpecType::Fixnum && argc == want {
                     work.push((inst, bitwise_opcode(bit), result_type(SpecType::Fixnum)));
                 }
+            } else if bliss_rt::symbols::symbol_name(sym).as_deref() == Some("ASH") {
+                // Arithmetic shift by a (constant, checked at emit) amount: left is a
+                // multiply by 2^n (overflow-checked), right is an untag/sar/retag.
+                if spec == SpecType::Fixnum && argc == 2 {
+                    work.push((inst, Opcode::FixnumShl, result_type(SpecType::Fixnum)));
+                }
             }
         }
     }

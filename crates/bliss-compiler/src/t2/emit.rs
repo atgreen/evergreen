@@ -642,6 +642,27 @@ fn emit_arith_inst(
             not_r(a, dst);
             alu_r_imm(a, 4, dst, -8); // and dst, ~7 → clears the tag bits: tagged(~a)
         }
+        Opcode::FixnumShl => {
+            // (ash x n) by a CONSTANT n. Left (n>=0) is x*2^n (tagged(x)*2^n =
+            // tagged(x<<n)) with an overflow check; right (n<0) untags, arithmetic
+            // -shifts, and retags (no overflow). A variable amount declines.
+            let (a0, amt) = (data.args[0], data.args[1]);
+            let n = *consts.get(&amt).ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
+            let x = framed_mat(a, reg, pool, consts, a0)?;
+            guard(a, a0, x);
+            if n >= 0 {
+                if n > 30 {
+                    return Err(EmitError::UnsupportedOp(op_tag(data.opcode))); // 2^n > imm32
+                }
+                imul_imm(a, dst, x, 1i32 << n); // dst = x * 2^n = tagged(x<<n)
+                a.jcc(Cc::O, deopt); // overflow → bignum
+            } else {
+                let k = (-n).min(60) as u8; // right shift by |n|, x86 count kept valid
+                mov_rr(a, dst, x);
+                sar_imm(a, dst, 3 + k); // (x<<3) sar (3+k) = x sar k
+                shl_imm(a, dst, 3); // retag
+            }
+        }
         Opcode::FloatMul | Opcode::FloatAdd | Opcode::FloatSub => {
             float_operand_to_xmm(a, 0, data.args[0], reg, consts, float_consts, deopt)?;
             float_operand_to_xmm(a, 1, data.args[1], reg, consts, float_consts, deopt)?;
@@ -837,6 +858,7 @@ fn is_fixnum_guarding_op(op: crate::t2::ir::Opcode) -> bool {
             | LogOr
             | LogXor
             | LogNot
+            | FixnumShl
             | FixnumCmpEq
             | FixnumCmpLt
             | FixnumCmpLe
