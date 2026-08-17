@@ -5347,7 +5347,15 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
             Some(p) => match p.dominant() {
                 Some(SpecType::Fixnum) => Some(Bc::Fixnum),
                 Some(SpecType::SingleFloat) => Some(Bc::SingleFloat),
-                None => None, // has samples but polymorphic
+                // Below the confidence threshold but UNANIMOUS (only one numeric
+                // type ever seen, no mixed): speculate it anyway — the guard makes
+                // a wrong guess safe, and this covers lightly-exercised sites like a
+                // deep-recursion multiply that runs few times before promotion.
+                None if p.other == 0 && p.single_float == 0 && p.fixnum > 0 => Some(Bc::Fixnum),
+                None if p.other == 0 && p.fixnum == 0 && p.single_float > 0 => {
+                    Some(Bc::SingleFloat)
+                }
+                None => None, // genuinely mixed/polymorphic
             },
             None => Some(Bc::Fixnum), // cold: optimistic, guarded fixnum guess
         }
