@@ -513,6 +513,7 @@ fn emit_arith_inst(
     pool: &mut Vec<u8>,
     consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
     float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+    val_range: &std::collections::HashMap<crate::t2::ir::Value, (i64, i64)>,
     proven: &mut std::collections::HashSet<crate::t2::ir::Value>,
     deopt: bliss_rt::asm::Label,
 ) -> Result<(), EmitError> {
@@ -669,8 +670,19 @@ fn emit_arith_inst(
                 if n > 30 {
                     return Err(EmitError::UnsupportedOp(op_tag(data.opcode))); // 2^n > imm32
                 }
-                imul_imm(a, dst, x, 1i32 << n); // dst = x * 2^n = tagged(x<<n)
-                a.jcc(Cc::O, deopt); // overflow → bignum
+                // If the operand's range proves x<<n stays in fixnum range, use a
+                // plain shift (no overflow trap) — e.g. after a mask. Otherwise the
+                // overflow-checked multiply by 2^n.
+                let safe = val_range.get(&a0).is_some_and(|&(lo, hi)| {
+                    lo >= 0 && hi.checked_shl(n as u32).is_some_and(|v| v <= FIXNUM_MAX)
+                });
+                if safe {
+                    mov_rr(a, dst, x);
+                    shl_imm(a, dst, n as u8); // tagged(x)<<n = tagged(x<<n)
+                } else {
+                    imul_imm(a, dst, x, 1i32 << n); // dst = x * 2^n, with overflow check
+                    a.jcc(Cc::O, deopt);
+                }
             } else {
                 let k = (-n).min(60) as u8; // right shift by |n|, x86 count kept valid
                 mov_rr(a, dst, x);
@@ -1044,6 +1056,28 @@ pub fn emit_framed(
             }
         }
     }
+    // Lightweight value ranges, enough to prove some left shifts can't overflow (so
+    // they become a plain `shl` instead of an overflow-checked multiply): a
+    // constant is exact, and `(logand x c)` with a non-negative mask c bounds the
+    // result to [0, c] — the common "mask to word size" idiom. Processed in program
+    // order so a def's range is available at its uses.
+    let mut val_range: HashMap<Value, (i64, i64)> = HashMap::new();
+    for (&v, &c) in &consts {
+        val_range.insert(v, (c, c));
+    }
+    for &b in &blocks {
+        for &inst in &f.block(b).insts {
+            let d = f.inst(inst);
+            if d.opcode == Opcode::LogAnd && d.results.len() == 1 && d.args.len() == 2 {
+                let mask = consts.get(&d.args[0]).or_else(|| consts.get(&d.args[1]));
+                if let Some(&c) = mask {
+                    if c >= 0 {
+                        val_range.insert(d.results[0], (0, c));
+                    }
+                }
+            }
+        }
+    }
 
     // Register assignment. rax = return/float scratch, rdx = guard scratch, rdi =
     // frame slots (interp entry only). Value pool: rcx, r8, r9, r10, r11 — arg
@@ -1278,7 +1312,7 @@ pub fn emit_framed(
                 let self_entry = has_reg_entry.then_some(reg_entry_label);
                 emit_call(&mut a, &d, &reg, &const_tagged, c2i_call_addr, self_sym, self_entry)?;
             } else {
-                emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, &mut proven, deopt)?;
+                emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, &val_range, &mut proven, deopt)?;
             }
         }
 
