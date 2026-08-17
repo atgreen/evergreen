@@ -1005,6 +1005,55 @@ fn make_simple_error_condition(message: BlissVal, env: &mut Env) -> Result<Bliss
     )
 }
 
+/// A human-readable report for a condition instance — what `~a` and an uncaught
+/// error should show, rather than the bare `#<TYPE-ERROR>` / type name. Uses the
+/// FORMAT-CONTROL/ARGUMENTS of simple conditions, and the standard slots of the
+/// built-in condition types. Returns `None` if `cond` is not a condition instance.
+fn condition_report_string(env: &Env, cond: BlissVal) -> Option<String> {
+    if !bliss_stdlib::is_instance(cond) {
+        return None;
+    }
+    let names = instance_class_hierarchy_names(cond)?;
+    let read = |slot: &str| -> Option<BlissVal> {
+        resolve_sym(slot)
+            .and_then(|s| read_slot_value(cond, s, env).ok())
+            .filter(|v| !v.is_nil())
+    };
+    // Simple conditions carry a format control + arguments.
+    if let Some(fc) = read("FORMAT-CONTROL") {
+        if is_string_value(fc) {
+            let args = read("FORMAT-ARGUMENTS")
+                .map(list_to_vec)
+                .unwrap_or_default();
+            return Some(if args.is_empty() {
+                val_as_str(fc)
+            } else {
+                simple_format_message(&val_as_str(fc), &args)
+            });
+        }
+    }
+    let is = |t: &str| names.iter().any(|n| n == t);
+    if is("TYPE-ERROR") {
+        let datum = read("DATUM").map(format_val).unwrap_or_else(|| "?".into());
+        let expected = read("EXPECTED-TYPE").map(format_val).unwrap_or_else(|| "?".into());
+        return Some(format!("The value {datum} is not of type {expected}."));
+    }
+    if is("UNBOUND-VARIABLE") {
+        let name = read("NAME").map(format_val).unwrap_or_default();
+        return Some(format!("The variable {name} is unbound."));
+    }
+    if is("UNDEFINED-FUNCTION") {
+        let name = read("NAME").map(format_val).unwrap_or_default();
+        return Some(format!("The function {name} is undefined."));
+    }
+    if is("PACKAGE-ERROR") {
+        let pkg = read("PACKAGE").map(format_val).unwrap_or_default();
+        return Some(format!("Package error{}.", if pkg.is_empty() { String::new() } else { format!(": {pkg}") }));
+    }
+    // Fall back to the most specific class name.
+    names.first().cloned()
+}
+
 fn make_simple_warning_condition(message: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let class = ensure_condition_class_registered(env, "SIMPLE-WARNING")?;
     bliss_stdlib::make_instance(
@@ -2214,6 +2263,7 @@ impl Env {
             features.push(resolve_sym(":WIN32").unwrap_or(NIL));
         }
         env.define_local("*FEATURES*", vec_to_list(&features));
+        env.define_local("*MODULES*", NIL); // names of REQUIRE'd/PROVIDE'd modules
         env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
         env.seed_standard_constant(
             "MOST-POSITIVE-FIXNUM",
@@ -4722,14 +4772,39 @@ fn build_bfasl_from_source(source: &str, src_path: &str, env: &mut Env) -> Vec<u
         .build()
 }
 
+/// True if `name` (a module string, matched case-insensitively) is already in
+/// `*MODULES*`.
+fn module_provided(env: &Env, name: &str) -> bool {
+    list_to_vec(env.lookup_var("*MODULES*").unwrap_or(NIL))
+        .iter()
+        .any(|m| val_as_str(*m).eq_ignore_ascii_case(name))
+}
+
+/// Record `name` in `*MODULES*` (pushnew, case-insensitive) so a later REQUIRE is
+/// a no-op.
+fn record_module(env: &mut Env, name: &str) {
+    if !module_provided(env, name) {
+        let cur = env.lookup_var("*MODULES*").unwrap_or(NIL);
+        env.set_var("*MODULES*", arena_cons(arena_str(name), cur));
+    }
+}
+
 fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     let normalized = module
         .trim_start_matches("KEYWORD:")
         .trim_start_matches(':')
         .trim_matches('"')
         .to_uppercase();
+    // ANSI: REQUIRE does nothing if the module is already present (whether loaded
+    // by a prior REQUIRE or a plain LOAD that PROVIDEd it). Re-loading asdf.lisp
+    // over an already-loaded asdf re-defines its packages and errors.
+    if module_provided(env, &normalized) {
+        return Ok(NIL);
+    }
     if normalized == "ASDF" {
         load_path_into_env(&bundled_asdf_path(), env)?;
+        // asdf.lisp PROVIDEs itself; belt-and-suspenders in case it did not.
+        record_module(env, &normalized);
         return Ok(T);
     }
 
@@ -4737,12 +4812,15 @@ fn require_module(module: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
     for provider in providers {
         let provided = apply_function(provider, &[arena_str(&normalized)], env)?;
         if !provided.is_nil() {
+            record_module(env, &normalized);
             return Ok(provided);
         }
     }
 
     let candidate = format!("{}.lisp", normalized.to_ascii_lowercase());
-    load_path_into_env(&candidate, env)
+    let result = load_path_into_env(&candidate, env)?;
+    record_module(env, &normalized);
+    Ok(result)
 }
 
 #[allow(dead_code)]
@@ -5999,8 +6077,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     Some(condition) => condition,
                     None => make_simple_error_condition(arena_str(&message), env)?,
                 };
+                // The terminal message is the condition's REPORT (e.g. "The value X
+                // is not of type Y"), not the bare designator/type name.
+                let report = condition_report_string(env, condition).unwrap_or(message);
                 match signal_condition_object(condition, env) {
-                    Ok(_) => return Err(BlissError::Internal(format!("ERROR: {}", message))),
+                    Ok(_) => return Err(BlissError::Internal(format!("ERROR: {}", report))),
                     Err(error) => return Err(error),
                 }
             }
@@ -7940,6 +8021,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (module_form, _) = cp(cdr);
                 let module_val = eval_form(module_form, env)?;
                 env.define_local("*LAST-PROVIDED-MODULE*", module_val);
+                // Register in *MODULES* so a later (require ...) is a no-op (ANSI).
+                let name = val_as_str(module_val).to_uppercase();
+                record_module(env, &name);
                 return Ok(module_val);
             }
             "BLISS-EXT:GETENV" => {
