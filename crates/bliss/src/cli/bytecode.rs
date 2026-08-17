@@ -5422,6 +5422,15 @@ fn try_promote(sym: u32) -> Option<Rc<NativeCode>> {
     let nc = try_promote_to_t2(sym).or_else(|| try_promote_to_t1(sym))?;
     // Mark this promotion fresh: the first deopt after it decays the profile once.
     PROMOTED_FRESH.with(|s| s.borrow_mut().insert(sym));
+    // Give each promotion its own deopt budget. DEOPT_COUNTS is otherwise
+    // cumulative, so a re-specialized function (e.g. fixnum-T2 that deopted, then
+    // re-promoted to float-T2) would inherit a near-exhausted budget and blacklist
+    // on its first deopt. Resetting per promotion is HotSpot's per-recompile policy;
+    // T2 speculation of a *different* type is never blocked by a prior type's
+    // blacklist (the blacklist gates only the non-speculating T1 baseline).
+    DEOPT_COUNTS.with(|m| {
+        m.borrow_mut().insert(sym, 0);
+    });
     Some(nc)
 }
 
