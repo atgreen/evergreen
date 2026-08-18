@@ -7058,6 +7058,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // bliss arrays are simple-vectors and strings.
                 return Ok(if is_vector_value(v) { T } else { NIL });
             }
+            "ADJUSTABLE-ARRAY-P" => {
+                // Only a COMPLEX_ARRAY created :adjustable is adjustable.
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                let adj = bliss_stdlib::is_complex_vector(v) && bliss_stdlib::cvec_adjustable(v);
+                return Ok(if adj { T } else { NIL });
+            }
+            "ARRAY-HAS-FILL-POINTER-P" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                return Ok(if bliss_stdlib::is_complex_vector(v) { T } else { NIL });
+            }
+            "ARRAY-DISPLACEMENT" => {
+                // bliss has no displaced arrays: (values nil 0).
+                let (af, _) = cp(cdr);
+                eval_form(af, env)?;
+                env.set_mv(vec![NIL, BlissVal::from_fixnum(0)]);
+                return Ok(NIL);
+            }
             "ARRAY-ELEMENT-TYPE" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
@@ -14193,6 +14212,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "VECTORP" | "SIMPLE-VECTOR-P" | "ARRAYP" | "ARRAY-DIMENSIONS"
             | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
             | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR"
+            | "ADJUSTABLE-ARRAY-P" | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT"
             // Numbers
             | "+" | "-" | "*" | "/" | "1+" | "1-" | "=" | "/=" | "<" | ">" | "<=" | ">="
             | "MIN" | "MAX" | "ABS" | "MOD" | "REM" | "FLOOR" | "CEILING" | "TRUNCATE"

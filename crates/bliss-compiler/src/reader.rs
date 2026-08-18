@@ -1380,11 +1380,20 @@ fn read_sharpsign_with_base(
         'o' | 'O' => read_radix_integer(chars, pos, 8),
         'x' | 'X' => read_radix_integer(chars, pos, 16),
         '|' => {
-            // Block comment #| ... |# — possibly nested
+            // Block comment #| ... |# — possibly nested. Like a line comment it
+            // yields no object; read the following form. But if the comment is
+            // the last thing before a list close `)` (or EOF) — e.g. babel's
+            // `(#x110000 #| yay |#)` — there is no following form: return MISSING
+            // so the enclosing list reader closes the list instead of trying to
+            // read `)` as a token ("unexpected )").
             let p = skip_block_comment(chars, pos)?;
+            let p2 = skip_whitespace_and_comments(chars, p);
+            if p2 >= chars.len() || chars[p2] == ')' {
+                return Ok((MISSING, p2));
+            }
             read_token_with_base(
                 chars,
-                p,
+                p2,
                 labels,
                 read_base,
                 read_eval,
