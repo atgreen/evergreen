@@ -132,12 +132,23 @@
 (defvar *type-definitions* nil)
 
 (defmacro deftype (name lambda-list &rest body)
-  (declare (ignore lambda-list))
-  `(progn
-     (setq *type-definitions*
-           (cons (list ',name ',(if body (car body) t))
-                 *type-definitions*))
-     ',name))
+  ;; A deftype body is like a defmacro body: it is CODE that returns a type
+  ;; specifier (alexandria writes `(integer 1 ,most-positive-fixnum), with a
+  ;; docstring before it). For the common zero-parameter case we evaluate the
+  ;; body now so the concrete spec (backquote expanded, docstring dropped) is
+  ;; what TYPEP/CHECK-TYPE consult. Parameterised deftypes fall back to storing
+  ;; the last body form literally.
+  (if lambda-list
+      `(progn
+         (setq *type-definitions*
+               (cons (list ',name ',(if body (car (last body)) t))
+                     *type-definitions*))
+         ',name)
+      `(progn
+         (setq *type-definitions*
+               (cons (list ',name ,(if body (cons 'progn body) t))
+                     *type-definitions*))
+         ',name)))
 
 ;; Track condition definitions so MAKE-CONDITION/SIGNAL can create and match
 ;; real condition instances through the evaluator.

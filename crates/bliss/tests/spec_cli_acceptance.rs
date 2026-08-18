@@ -546,6 +546,27 @@ fn typep_keyword() {
 }
 
 #[test]
+fn deftype_body_is_evaluated_and_skips_docstring() {
+    // A DEFTYPE body is code returning a type specifier, and may carry a
+    // leading docstring (alexandria: POSITIVE-FIXNUM is
+    //   (deftype positive-fixnum () "..." `(integer 1 ,most-positive-fixnum))).
+    // The body must be evaluated (backquote expanded) and the docstring
+    // dropped, otherwise TYPEP/CHECK-TYPE consulted the docstring string.
+    assert_eq!(
+        eval_ok(
+            "(progn (deftype pf () \"a positive fixnum\" `(integer 1 ,most-positive-fixnum)) \
+             (list (typep 8 'pf) (typep 0 'pf) (typep -3 'pf)))"
+        ),
+        "(T NIL NIL)"
+    );
+    // A plainly-quoted body form still works.
+    assert_eq!(
+        eval_ok("(progn (deftype small () '(integer 0 9)) (list (typep 5 'small) (typep 10 'small)))"),
+        "(T NIL)"
+    );
+}
+
+#[test]
 fn equalp_compares_vectors_strings_chars_numbers() {
     // EQUALP (unlike EQUAL) compares vectors element-wise, strings/chars
     // case-insensitively, and numbers across types. babel's define-constant
