@@ -31,7 +31,10 @@
 ;; global binding, like defparameter.
 (defmacro defconstant (name value &rest doc)
   (declare (ignore doc))
-  `(setq ,name ,value))
+  ;; No separate constant cell: model as a global binding, but record the name
+  ;; so CONSTANTP recognises it (alexandria's DEFINE-CONSTANT, used by babel,
+  ;; asks CONSTANTP whether a re-defined constant is already constant).
+  `(progn (setq ,name ,value) (%mark-constant ',name) ',name))
 
 ;; Fixnums are 61-bit signed (BlissVal tags the low 3 bits): the value is
 ;; stored as n<<3, so the representable range is [-2^60, 2^60-1].

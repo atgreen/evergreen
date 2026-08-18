@@ -950,6 +950,13 @@ thread_local! {
     /// (bliss-d0b). FLET-local `(setf place)` writers stay lexical in `Env.funs`.
     static GLOBAL_SETF_FNS: RefCell<HashMap<String, FunDef>> = RefCell::new(HashMap::new());
 
+    /// Names of variables established by DEFCONSTANT — bliss models a constant as
+    /// an ordinary global binding, so this set is how CONSTANTP (and library code
+    /// like alexandria's DEFINE-CONSTANT, used by babel) can tell a defconstant'd
+    /// symbol from a defparameter.
+    static CONSTANT_VARS: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+
     /// Memoized macro-expander registrations for the bytecode compiler
     /// (bliss-gq5.8). Building a MacroexpandEnv used to re-freeze every macro's
     /// captured frame, allocate a fresh expander closure, and re-parse the
@@ -6208,12 +6215,24 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     h.is_symbol() && symbol_bare_name(&sym_name(h)) == "QUOTE"
                 } else if v.is_symbol() {
                     is_keyword_arg(v)
+                        || CONSTANT_VARS.with(|c| c.borrow().contains(&sym_name(v)))
                 } else {
                     // Numbers, characters, strings, and other self-evaluating
                     // heap atoms are constant.
                     true
                 };
                 return Ok(if is_const { T } else { NIL });
+            }
+            "BLISS-INTERNAL::%MARK-CONSTANT" | "BLISS-INTERNAL:%MARK-CONSTANT"
+            | "%MARK-CONSTANT" => {
+                // (%mark-constant 'name) — record NAME as a DEFCONSTANT so
+                // CONSTANTP recognises it. Called by the DEFCONSTANT macro.
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if v.is_symbol() {
+                    CONSTANT_VARS.with(|c| c.borrow_mut().insert(sym_name(v)));
+                }
+                return Ok(v);
             }
             "DOCUMENTATION" => {
                 // (documentation object &optional doc-type) — the interpreter
@@ -14180,8 +14199,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "STRINGP" | "CHAR-NAME" | "NAME-CHAR" | "PARSE-INTEGER" | "MAKE-STRING"
             | "STRING-TO-LIST"
             // Symbols / packages
-            | "SYMBOLP" | "KEYWORDP" | "CONSTANTP" | "SYMBOL-NAME" | "SYMBOL-VALUE"
-            | "SYMBOL-FUNCTION"
+            | "SYMBOLP" | "KEYWORDP" | "CONSTANTP" | "%MARK-CONSTANT" | "SYMBOL-NAME"
+            | "SYMBOL-VALUE" | "SYMBOL-FUNCTION"
             | "SYMBOL-PACKAGE" | "SYMBOL-PLIST" | "MAKE-SYMBOL" | "GENSYM" | "GENTEMP"
             | "INTERN" | "FIND-SYMBOL" | "FIND-PACKAGE" | "PACKAGE-NAME" | "PACKAGEP"
             | "BOUNDP" | "FBOUNDP" | "FDEFINITION" | "MAKUNBOUND" | "FMAKUNBOUND"

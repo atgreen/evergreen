@@ -541,6 +541,12 @@ fn constantp_recognizes_constant_forms() {
         eval_ok("(list (constantp 5) (constantp :k) (constantp t) (constantp nil) (constantp '(quote x)) (constantp 'foo) (constantp '(+ 1 2)))"),
         "(T T T T T NIL NIL)"
     );
+    // A DEFCONSTANT'd symbol is recognised as constant (alexandria's
+    // define-constant / babel rely on this); a defparameter is not.
+    assert_eq!(
+        eval_ok("(progn (defconstant +kk+ 42) (defparameter *pp* 1) (list (constantp '+kk+) (constantp '*pp*)))"),
+        "(T NIL)"
+    );
 }
 
 #[test]
