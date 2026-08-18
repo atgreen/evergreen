@@ -78,8 +78,11 @@ pub use hashtable::{
 };
 pub use packages::PackageRegistry;
 pub use packages::{
-    InternStatus, export, find_symbol, import, intern, shadow, shadowing_import, unexport,
-    unintern, unuse_package, use_package,
+    InternStatus, accessible_symbols, add_nickname, add_symbol, delete_package, export,
+    external_symbols_of, find_package, find_present_symbol, find_symbol, import, intern,
+    is_external_symbol, is_package, list_all_packages, make_package, package_name,
+    package_nicknames, package_use_list, present_symbols, rename_package, shadow,
+    shadowing_import, unexport, unintern, unuse_package, use_package, use_package_by_name,
 };
 pub use pathnames::{
     delete_file, directory, ensure_directories_exist, is_pathname, logical_pathname_translations,

@@ -1530,8 +1530,11 @@ fn string_of_symbol_returns_bare_symbol_name() {
 
 #[test]
 fn symbol_package_reports_real_package() {
-    assert_eq!(eval_ok("(symbol-package :foo)"), "\"KEYWORD\"");
-    assert_eq!(eval_ok("(symbol-package 'car)"), "\"COMMON-LISP\"");
+    // SYMBOL-PACKAGE returns the home PACKAGE object (CLHS), not its name string
+    // (bliss-bhs: first-class packages).
+    assert_eq!(eval_ok("(symbol-package :foo)"), "#<PACKAGE KEYWORD>");
+    assert_eq!(eval_ok("(symbol-package 'car)"), "#<PACKAGE COMMON-LISP>");
+    assert_eq!(eval_ok("(package-name (symbol-package 'car))"), "\"COMMON-LISP\"");
 }
 
 #[test]
@@ -1581,6 +1584,43 @@ fn make_package_with_nicknames() {
     assert_eq!(
         eval_ok("(progn (make-package \"MYPKG\" :nicknames '(\"MP\")) (package-name (find-package :mp)))"),
         "\"MYPKG\""
+    );
+}
+
+#[test]
+fn package_storage_is_registry_backed() {
+    // bliss-bhs Stage 4: all package storage lives in the single stdlib
+    // PackageRegistry. Exercise the full surface — creation, nickname identity,
+    // use-list inheritance, export status, rename, delete — through one program.
+    assert_eq!(
+        eval_ok(
+            "(progn
+               (defpackage :s4 (:use :cl) (:nicknames :s4n) (:export :foo))
+               (let ((p (find-package :s4)))
+                 (list
+                   (packagep p)                                    ; T
+                   (eq p (find-package :s4n))                      ; T (nickname identity)
+                   (package-name p)                                ; \"S4\"
+                   (mapcar #'package-name (package-use-list p))    ; (\"COMMON-LISP\")
+                   (nth-value 1 (find-symbol \"FOO\" :s4))         ; :EXTERNAL
+                   (nth-value 1 (find-symbol \"CAR\" :s4)))))"      // :INHERITED from CL
+        ),
+        "(T T \"S4\" (\"COMMON-LISP\") :EXTERNAL :INHERITED)"
+    );
+    // RENAME-PACKAGE moves name + nicknames in the registry.
+    assert_eq!(
+        eval_ok(
+            "(progn (make-package \"OLDP\" :nicknames '(\"OP\"))
+                    (rename-package :oldp \"NEWP\" '(\"NP\"))
+                    (list (find-package :oldp)          ; NIL — old name gone
+                          (package-name (find-package :np))))"  // \"NEWP\" via new nick
+        ),
+        "(NIL \"NEWP\")"
+    );
+    // DELETE-PACKAGE removes it from the registry.
+    assert_eq!(
+        eval_ok("(progn (make-package \"DELP\") (delete-package :delp) (find-package :delp))"),
+        "NIL"
     );
 }
 

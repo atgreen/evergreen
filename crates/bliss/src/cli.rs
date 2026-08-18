@@ -361,63 +361,100 @@ fn arena_str(s: &str) -> BlissVal {
     val
 }
 
-// ── First-class PACKAGE objects (bliss-bhs) ──────────────────────────
+// ── First-class PACKAGE objects, backed by the stdlib registry (bliss-bhs) ──
 //
-// A package is a distinct CL type, not a string (CLHS 11.1). Bliss represents a
-// package OBJECT as a `SPECIAL`-tagged meta-handle carrying an opaque id, interned
-// one-per-canonical-name so `(eq (find-package :p) (find-package :nickname))` is T
-// and `(typep p 'package)` is true while `(typep "P" 'package)` is NIL.
+// A package is a distinct CL type, not a string (CLHS 11.1), represented as a
+// `SPECIAL`-tagged meta-handle carrying an opaque id — so `(typep p 'package)`
+// is true while `(typep "P" 'package)` is NIL, and `(eq (find-package :p)
+// (find-package :nickname))` is T.
 //
-// The meta-handle id space is shared (fragilely) with CLOS/macro/class handles,
-// each discriminated by its own registry. Package ids are drawn from a reserved
-// HIGH base so they can never coincide with those low-range counters, and are
-// additionally tracked in `PACKAGE_ID_TO_NAME`, so a non-package handle is never
-// misidentified as a package and vice-versa.
-const PACKAGE_ID_BASE: i64 = 1 << 40;
+// Stage 4 of bliss-bhs retired the interpreter's own `env.packages` map: ALL
+// package storage — names, nicknames, use-lists, exports, and each package's
+// symbol index (including COMMON-LISP's) — now lives in the single process-global
+// `bliss_stdlib` PackageRegistry, the authoritative store the standard library
+// already implemented. We keep exactly one registry alive and active for the
+// thread here and drive it through the `bliss_stdlib::{find_package, intern, …}`
+// free functions. Package ids are drawn from a reserved HIGH base (`1 << 40`, in
+// the registry) so they can never coincide with the low-range CLOS/macro/class
+// meta-handles.
+//
+// Symbol *identity* still lives in the global reader symbol table
+// (`bliss_rt::symbols`): a symbol IS a table index, and the interpreter owns the
+// naming scheme (COMMON-LISP symbols are bare `CAR`, keywords `:X`, others
+// `PKG::X`). The registry stores, per package, the map from bare name to that
+// already-interned symbol — it indexes membership, it does not re-allocate.
 
 thread_local! {
-    /// Canonical package name → its interned package object.
-    static PACKAGE_OBJECTS: std::cell::RefCell<std::collections::HashMap<String, BlissVal>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    /// Package handle id → canonical name (reverse lookup + `packagep`/`typep`
-    /// discrimination against other meta-handles).
-    static PACKAGE_ID_TO_NAME: std::cell::RefCell<std::collections::HashMap<i64, String>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    static NEXT_PACKAGE_OBJECT_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(PACKAGE_ID_BASE) };
+    /// The one live package registry for this thread. Kept here so it stays
+    /// active (and un-dropped) for the whole session; never cloned into child
+    /// `Env`s (the activation guard's Drop would deactivate the store).
+    static PACKAGE_REGISTRY: std::cell::RefCell<Option<bliss_stdlib::PackageRegistry>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// The canonical package object for `canonical_name` (nicknames must be resolved
-/// first). Interned: same name ⇒ same `BlissVal`.
+/// Install a fresh registry seeded with the standard packages. Mirrors CLOS's
+/// reset-on-top-level-`Env::new` (`bootstrap_clos`): a new top-level environment
+/// starts from the standard package layout, so tests and REPL sessions are
+/// isolated. `PackageRegistry::new` activates the new store before the old
+/// registry is dropped, so the drop is a no-op for activation.
+fn reset_package_registry() {
+    let reg = bliss_stdlib::PackageRegistry::new();
+    PACKAGE_REGISTRY.with(|cell| *cell.borrow_mut() = Some(reg));
+    seed_standard_packages_registry();
+}
+
+/// Ensure a registry exists without resetting it. Mirrors
+/// `ensure_clos_bootstrapped`: macro / compiler-macro expansion environments
+/// share the caller's live packages rather than wiping them.
+fn ensure_package_registry() {
+    let missing = PACKAGE_REGISTRY.with(|cell| cell.borrow().is_none());
+    if missing {
+        reset_package_registry();
+    }
+}
+
+/// Seed the standard package layout into the active registry. Matches the layout
+/// the interpreter has always used: COMMON-LISP (nick CL); COMMON-LISP-USER
+/// (nick CL-USER) using COMMON-LISP; KEYWORD; BLISS-INTERNAL; BLISS-EXT using
+/// COMMON-LISP. The reader keeps its own parallel package-name registration.
+fn seed_standard_packages_registry() {
+    let _ = bliss_stdlib::make_package("COMMON-LISP", &["CL"], &[]);
+    let _ = bliss_stdlib::make_package("COMMON-LISP-USER", &["CL-USER"], &["COMMON-LISP"]);
+    let _ = bliss_stdlib::make_package("KEYWORD", &[], &[]);
+    let _ = bliss_stdlib::make_package("BLISS-INTERNAL", &[], &[]);
+    let _ = bliss_stdlib::make_package("BLISS-EXT", &[], &["COMMON-LISP"]);
+    for name in [
+        "COMMON-LISP",
+        "COMMON-LISP-USER",
+        "KEYWORD",
+        "BLISS-INTERNAL",
+        "BLISS-EXT",
+    ] {
+        reader::register_package(name);
+    }
+    reader::register_package("CL-USER");
+}
+
+/// The canonical package object for `canonical_name` (nicknames resolved first).
+/// Find-or-create against the registry, so `*PACKAGE*` and package designators
+/// always yield an object; interned by the registry: same name ⇒ same handle.
 fn package_object(canonical_name: &str) -> BlissVal {
-    PACKAGE_OBJECTS.with(|m| {
-        if let Some(&v) = m.borrow().get(canonical_name) {
-            return v;
-        }
-        let id = NEXT_PACKAGE_OBJECT_ID.with(|c| {
-            let id = c.get();
-            c.set(id + 1);
-            id
-        });
-        let v = BlissVal::from_meta_handle(id);
-        m.borrow_mut().insert(canonical_name.to_string(), v);
-        PACKAGE_ID_TO_NAME.with(|r| r.borrow_mut().insert(id, canonical_name.to_string()));
-        v
-    })
+    ensure_package_registry();
+    if let Some(p) = bliss_stdlib::find_package(canonical_name) {
+        return p;
+    }
+    bliss_stdlib::make_package(canonical_name, &[], &[]).unwrap_or(NIL)
 }
 
-/// True if `v` is a first-class package object (a meta-handle in the package id
-/// registry) — the `packagep`/`typep 'package` predicate.
+/// True if `v` is a first-class package object (a live handle in the registry) —
+/// the `packagep` / `typep 'package` predicate.
 fn is_package_object(v: BlissVal) -> bool {
-    v.is_meta_handle()
-        && PACKAGE_ID_TO_NAME.with(|r| r.borrow().contains_key(&v.as_meta_handle_id()))
+    bliss_stdlib::is_package(v)
 }
 
 /// The canonical name of a package object, or `None` if `v` is not one.
 fn package_object_name(v: BlissVal) -> Option<String> {
-    if !v.is_meta_handle() {
-        return None;
-    }
-    PACKAGE_ID_TO_NAME.with(|r| r.borrow().get(&v.as_meta_handle_id()).cloned())
+    bliss_stdlib::package_name(v)
 }
 
 // ── Stream designator resolution ─────────────────────────────────
@@ -642,7 +679,6 @@ struct Env {
     classes: Rc<RefCell<HashMap<String, ClassDef>>>,
     generics: Rc<RefCell<HashMap<String, GenericDef>>>,
     methods: Rc<RefCell<HashMap<String, Vec<MethodDef>>>>,
-    packages: Rc<RefCell<HashMap<String, PackageDef>>>,
     current_package: String,
     sandbox: bool,
     restarts: Vec<RestartEntry>,
@@ -789,20 +825,6 @@ enum NextMethod {
     Primary {
         primary: Vec<MethodDef>,
     },
-}
-
-#[allow(dead_code)]
-#[derive(Clone)]
-struct PackageDef {
-    name: String,
-    nicknames: Vec<String>,
-    // A set, not a Vec: external-status checks (`exports.contains`) happen once
-    // per successful FIND-SYMBOL, and a linear scan of a big reexporting
-    // package's exports (uiop exports hundreds) made ASDF loading quadratic
-    // (bliss-gq5.1).
-    exports: HashSet<String>,
-    uses: Vec<String>,
-    symbols: HashMap<String, BlissVal>,
 }
 
 #[derive(Clone)]
@@ -2273,6 +2295,15 @@ impl Env {
         } else {
             let _ = bliss_stdlib::ensure_clos_bootstrapped();
         }
+        // Package storage is the process-global stdlib registry (bliss-bhs Stage
+        // 4). Follow the same reset/ensure discipline as CLOS above: a top-level
+        // environment starts from the standard package layout; a macro-expansion
+        // environment shares the caller's live packages.
+        if reset_clos {
+            reset_package_registry();
+        } else {
+            ensure_package_registry();
+        }
         // Establish the condition classes and preallocate the STORAGE-CONDITION
         // pool at startup, before any user code runs, so the heap-exhaustion /
         // stack-overflow path never has to allocate (R5.110, bliss-uh4.2). A
@@ -2280,8 +2311,6 @@ impl Env {
         // rather than limping on and lazily allocating on the low-memory path.
         bliss_stdlib::initialize_condition_runtime_support()
             .expect("initialize condition runtime support (STORAGE-CONDITION pool) at startup");
-        let mut packages = HashMap::new();
-        seed_standard_packages(&mut packages);
         let mut env = Env {
             frame: Rc::new(RefCell::new(EnvFrame::default())),
             funs: Rc::new(HashMap::new()),
@@ -2291,7 +2320,6 @@ impl Env {
             classes: Rc::new(RefCell::new(HashMap::new())),
             generics: Rc::new(RefCell::new(HashMap::new())),
             methods: Rc::new(RefCell::new(HashMap::new())),
-            packages: Rc::new(RefCell::new(packages)),
             current_package: "COMMON-LISP-USER".to_string(),
             sandbox,
             restarts: Vec::new(),
@@ -2438,7 +2466,6 @@ impl Env {
             classes: Rc::clone(&self.classes),
             generics: Rc::clone(&self.generics),
             methods: Rc::clone(&self.methods),
-            packages: Rc::clone(&self.packages),
             current_package: self.current_package.clone(),
             sandbox: self.sandbox,
             restarts: self.restarts.clone(),
@@ -2468,7 +2495,6 @@ impl Env {
             classes: Rc::clone(&self.classes),
             generics: Rc::clone(&self.generics),
             methods: Rc::clone(&self.methods),
-            packages: Rc::clone(&self.packages),
             current_package: self.current_package.clone(),
             sandbox: self.sandbox,
             restarts: self.restarts.clone(),
@@ -2725,33 +2751,6 @@ fn with_eval_context<T>(
     let result = f(env);
     env.eval_context = previous;
     result
-}
-
-fn seed_standard_packages(packages: &mut HashMap<String, PackageDef>) {
-    for (name, nicknames, uses) in [
-        ("COMMON-LISP", vec!["CL".to_string()], Vec::<String>::new()),
-        (
-            "COMMON-LISP-USER",
-            vec!["CL-USER".to_string()],
-            vec!["COMMON-LISP".to_string()],
-        ),
-        ("KEYWORD", Vec::new(), Vec::new()),
-        ("BLISS-INTERNAL", Vec::new(), Vec::new()),
-        ("BLISS-EXT", Vec::new(), vec!["COMMON-LISP".to_string()]),
-    ] {
-        packages.insert(
-            name.to_string(),
-            PackageDef {
-                name: name.to_string(),
-                nicknames,
-                exports: HashSet::new(),
-                uses,
-                symbols: HashMap::new(),
-            },
-        );
-        reader::register_package(name);
-    }
-    reader::register_package("CL-USER");
 }
 
 // ── BlissVal printer ──────────────────────────────────────────────
@@ -3922,28 +3921,35 @@ fn home_package_of_name(name: &str) -> String {
 /// The set of bare names homed in some non-CL package — the batch form of
 /// [`name_owned_by_noncl_package`], computed once so COMMON-LISP enumeration is
 /// O(all-package-symbols) instead of O(symbols × packages) (bliss-gq5.5).
-fn noncl_owned_names(env: &Env) -> std::collections::HashSet<String> {
+fn noncl_owned_names(_env: &Env) -> std::collections::HashSet<String> {
     let mut owned = std::collections::HashSet::new();
-    for (pkg_name, pkg) in env.packages.borrow().iter() {
+    for pkg in bliss_stdlib::list_all_packages() {
+        let Some(pkg_name) = bliss_stdlib::package_name(pkg) else {
+            continue;
+        };
         if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
             continue;
         }
-        for (bare, sym) in &pkg.symbols {
-            if &home_package_of_name(&sym_name(*sym)) == pkg_name {
-                owned.insert(bare.clone());
+        for sym in bliss_stdlib::present_symbols(pkg) {
+            let name = sym_name(sym);
+            if home_package_of_name(&name) == pkg_name {
+                owned.insert(symbol_bare_name(&name));
             }
         }
     }
     owned
 }
 
-fn name_owned_by_noncl_package(env: &Env, bare_name: &str) -> bool {
-    for (pkg_name, pkg) in env.packages.borrow().iter() {
+fn name_owned_by_noncl_package(_env: &Env, bare_name: &str) -> bool {
+    for pkg in bliss_stdlib::list_all_packages() {
+        let Some(pkg_name) = bliss_stdlib::package_name(pkg) else {
+            continue;
+        };
         if pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER" {
             continue;
         }
-        if let Some(sym) = pkg.symbols.get(bare_name) {
-            if &home_package_of_name(&sym_name(*sym)) == pkg_name {
+        if let Some(sym) = bliss_stdlib::find_present_symbol(pkg, bare_name) {
+            if home_package_of_name(&sym_name(sym)) == pkg_name {
                 return true;
             }
         }
@@ -3955,23 +3961,20 @@ fn name_owned_by_noncl_package(env: &Env, bare_name: &str) -> bool {
 /// nicknames. Returns the canonical name of the registered package whose name or
 /// nicknames match; if none match, returns the normalized designator unchanged
 /// (so it can name a package about to be created).
-fn resolve_package_name(env: &Env, raw: &str) -> String {
+fn resolve_package_name(_env: &Env, raw: &str) -> String {
     let normalized = normalize_package_name(raw);
     // Built-in nicknames that must resolve even before the registry is consulted.
-    let builtin = match normalized.as_str() {
-        "CL" => Some("COMMON-LISP"),
-        "CL-USER" => Some("COMMON-LISP-USER"),
-        _ => None,
-    };
-    if let Some(canonical) = builtin {
-        return canonical.to_string();
+    match normalized.as_str() {
+        "CL" => return "COMMON-LISP".to_string(),
+        "CL-USER" => return "COMMON-LISP-USER".to_string(),
+        _ => {}
     }
-    if env.packages.borrow().contains_key(&normalized) {
-        return normalized;
-    }
-    for (canonical, def) in env.packages.borrow().iter() {
-        if def.nicknames.iter().any(|nick| nick == &normalized) {
-            return canonical.clone();
+    // The registry resolves a name OR nickname to the package; take its canonical
+    // name. If unknown, return the normalized designator unchanged so it can name
+    // a package about to be created.
+    if let Some(pkg) = bliss_stdlib::find_package(&normalized) {
+        if let Some(canonical) = bliss_stdlib::package_name(pkg) {
+            return canonical;
         }
     }
     normalized
@@ -4054,11 +4057,11 @@ fn intern_into_package(env: &mut Env, pkg_name: &str, bare_name: &str) -> BlissV
         let pkg = bliss_rt::packages::find_or_create(&pkg_name);
         bliss_rt::symbols::set_symbol_package(sym.as_symbol_index(), pkg);
     }
-    env.packages.borrow_mut()
-        .get_mut(&pkg_name)
-        .expect("package exists")
-        .symbols
-        .insert(bare_name, sym);
+    // Record membership in the package's registry index (resolving a nickname to
+    // the canonical package). New symbols start internal; EXPORT promotes them.
+    if let Some(pkg) = bliss_stdlib::find_package(&pkg_name) {
+        let _ = bliss_stdlib::add_symbol(pkg, &bare_name, sym, false);
+    }
     sym
 }
 
@@ -4115,17 +4118,19 @@ fn find_symbol_in_package_rec(
     // — on every lookup was a dominant cost while defining ASDF's packages
     // (bliss-gq5.2).
     let uses = {
-        let packages = env.packages.borrow();
-        let package = packages.get(&pkg_name)?;
-        if let Some(sym) = package.symbols.get(bare_upper) {
-            let status = if package.exports.contains(bare_upper) {
+        let pkg = bliss_stdlib::find_package(&pkg_name)?;
+        if let Some(sym) = bliss_stdlib::find_present_symbol(pkg, bare_upper) {
+            let status = if bliss_stdlib::is_external_symbol(pkg, bare_upper) {
                 "EXTERNAL"
             } else {
                 "INTERNAL"
             };
-            return Some((*sym, status));
+            return Some((sym, status));
         }
-        package.uses.clone()
+        bliss_stdlib::package_use_list(pkg)
+            .into_iter()
+            .filter_map(bliss_stdlib::package_name)
+            .collect::<Vec<_>>()
     };
     for used in &uses {
         if let Some((sym, _)) = find_symbol_in_package_rec(env, used, bare_upper, visited) {
@@ -4135,17 +4140,30 @@ fn find_symbol_in_package_rec(
     None
 }
 
-fn ensure_package_available(env: &mut Env, name: &str, uses: &[&str]) {
-    let mut packages = env.packages.borrow_mut();
-    packages
-        .entry(name.to_string())
-        .or_insert_with(|| PackageDef {
-            name: name.to_string(),
-            nicknames: Vec::new(),
-            exports: HashSet::new(),
-            uses: uses.iter().map(|pkg| (*pkg).to_string()).collect(),
-            symbols: HashMap::new(),
-        });
+fn ensure_package_available(_env: &mut Env, name: &str, uses: &[&str]) {
+    let pkg = match bliss_stdlib::find_package(name) {
+        Some(p) => p,
+        None => match bliss_stdlib::make_package(name, &[], &[]) {
+            Ok(p) => p,
+            Err(_) => return,
+        },
+    };
+    // Record each used package on the use-list, creating a bare placeholder for
+    // one not yet defined (the old name-keyed map recorded uses leniently, and
+    // ASDF's package graph relies on forward `:use` references resolving later).
+    for u in uses {
+        let used = match bliss_stdlib::find_package(u) {
+            Some(p) => p,
+            None => match bliss_stdlib::make_package(u, &[], &[]) {
+                Ok(p) => {
+                    reader::register_package(u);
+                    p
+                }
+                Err(_) => continue,
+            },
+        };
+        let _ = bliss_stdlib::use_package(&[used], pkg);
+    }
     reader::register_package(name);
 }
 
@@ -4741,7 +4759,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                         return Ok(false);
                     };
                 let pkg_name = normalize_package_name(&designator);
-                return Ok(env.packages.borrow().contains_key(&pkg_name)
+                return Ok(bliss_stdlib::find_package(&pkg_name).is_some()
                     || matches!(
                         pkg_name.as_str(),
                         "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD" | "BLISS-EXT"
@@ -4764,10 +4782,8 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
         && package_name != "COMMON-LISP-USER"
         && package_name != "KEYWORD"
     {
-        let packages = env.packages.borrow();
-        return packages
-            .get(&package_name)
-            .map(|pkg| pkg.symbols.values().copied().collect())
+        return bliss_stdlib::find_package(&package_name)
+            .map(bliss_stdlib::present_symbols)
             .unwrap_or_default();
     }
     let mut seen = HashMap::<String, BlissVal>::new();
@@ -4805,13 +4821,15 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
     // only the small `uses` list for the inherited walk — never the whole
     // PackageDef (bliss-gq5.3).
     let uses = {
-        let packages = env.packages.borrow();
-        if let Some(pkg) = packages.get(&package_name) {
-            for (name, sym) in &pkg.symbols {
-                seen.entry(name.clone()).or_insert(*sym);
+        if let Some(pkg) = bliss_stdlib::find_package(&package_name) {
+            for sym in bliss_stdlib::present_symbols(pkg) {
+                seen.entry(symbol_bare_name(&sym_name(sym))).or_insert(sym);
             }
             if include_inherited {
-                pkg.uses.clone()
+                bliss_stdlib::package_use_list(pkg)
+                    .into_iter()
+                    .filter_map(bliss_stdlib::package_name)
+                    .collect::<Vec<_>>()
             } else {
                 Vec::new()
             }
@@ -8635,16 +8653,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let use_refs: Vec<&str> = uses.iter().map(String::as_str).collect();
                 ensure_package_available(env, &pkg_name, &use_refs);
                 if !nicknames.is_empty() {
-                    if let Some(def) = env.packages.borrow_mut().get_mut(&pkg_name) {
+                    if let Some(pkg) = bliss_stdlib::find_package(&pkg_name) {
                         for nick in nicknames {
                             // Register the nickname with the reader too, so a
                             // package-qualified symbol written with the nickname
                             // (e.g. `uiop:foo`, UIOP being a nickname of
                             // UIOP/DRIVER) resolves at read time (bliss-lb6).
                             reader::register_package(&nick);
-                            if !def.nicknames.contains(&nick) {
-                                def.nicknames.push(nick);
-                            }
+                            let _ = bliss_stdlib::add_nickname(pkg, &nick);
                         }
                     }
                 }
@@ -8658,7 +8674,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let raw = val_as_str(eval_form(args[0], env)?);
                 let pkg_name = resolve_package_name(env, &raw);
                 return Ok(
-                    if env.packages.borrow().contains_key(&pkg_name)
+                    if bliss_stdlib::find_package(&pkg_name).is_some()
                         || matches!(
                             pkg_name.as_str(),
                             "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
@@ -8705,11 +8721,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let raw = val_as_str(eval_form(args[0], env)?);
                 let pkg_name = resolve_package_name(env, &raw);
-                let nicks: Vec<BlissVal> = env
-                    .packages
-                    .borrow()
-                    .get(&pkg_name)
-                    .map(|def| def.nicknames.iter().map(|n| arena_str(n)).collect())
+                let nicks: Vec<BlissVal> = bliss_stdlib::find_package(&pkg_name)
+                    .map(|pkg| {
+                        bliss_stdlib::package_nicknames(pkg)
+                            .iter()
+                            .map(|n| arena_str(n))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 return Ok(vec_to_list(&nicks));
             }
@@ -8722,26 +8740,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Ok(NIL);
                 }
                 let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
-                let uses = env
-                    .packages
-                    .borrow()
-                    .get(&pkg_name)
-                    .map(|pkg| {
-                        pkg.uses
-                            .iter()
-                            .map(|name| package_object(name))
-                            .collect::<Vec<_>>()
-                    })
+                let uses = bliss_stdlib::find_package(&pkg_name)
+                    .map(bliss_stdlib::package_use_list)
                     .unwrap_or_default();
                 return Ok(vec_to_list(&uses));
             }
             "LIST-ALL-PACKAGES" => {
-                let packages = env
-                    .packages
-                    .borrow().keys()
-                    .map(|name| package_object(name))
-                    .collect::<Vec<_>>();
-                return Ok(vec_to_list(&packages));
+                return Ok(vec_to_list(&bliss_stdlib::list_all_packages()));
             }
             "BLISS-INTERNAL::PACKAGE-SYMBOLS" | "BLISS-INTERNAL:PACKAGE-SYMBOLS" => {
                 let args = list_to_vec(cdr);
@@ -8770,24 +8775,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let pkgs_val = eval_form(args[0], env)?;
                 if pkgs_val.is_cons() {
                     for pkg in list_to_vec(pkgs_val) {
-                        names.push(normalize_package_name(&val_as_str(pkg)));
+                        names.push(resolve_package_name(env, &val_as_str(pkg)));
                     }
                 } else {
-                    names.push(normalize_package_name(&val_as_str(pkgs_val)));
+                    names.push(resolve_package_name(env, &val_as_str(pkgs_val)));
                 }
                 let target = if args.len() > 1 {
-                    normalize_package_name(&val_as_str(eval_form(args[1], env)?))
+                    let raw = val_as_str(eval_form(args[1], env)?);
+                    resolve_package_name(env, &raw)
                 } else {
                     env.current_package.clone()
                 };
-                ensure_package_available(env, &target, &[]);
-                let mut __pkgs = env.packages.borrow_mut();
-                    let package = __pkgs.get_mut(&target).expect("package exists");
-                for name in names {
-                    if !package.uses.contains(&name) {
-                        package.uses.push(name);
-                    }
-                }
+                // ensure_package_available creates the target if needed and adds
+                // each named package to its use-list (creating a placeholder for
+                // any not yet defined).
+                let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                ensure_package_available(env, &target, &name_refs);
                 return Ok(T);
             }
             "UNUSE-PACKAGE" => return Ok(T),
@@ -8798,12 +8801,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "RENAME-PACKAGE requires package and new name".into(),
                     ));
                 }
-                let old_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                let old_raw = val_as_str(eval_form(args[0], env)?);
+                let old_name = resolve_package_name(env, &old_raw);
                 let new_name = normalize_package_name(&val_as_str(eval_form(args[1], env)?));
-                let removed = env.packages.borrow_mut().remove(&old_name);
-                if let Some(mut pkg) = removed {
-                    pkg.name = new_name.clone();
-                    env.packages.borrow_mut().insert(new_name.clone(), pkg);
+                // Optional new nicknames (3rd arg); default: keep the package's
+                // current nicknames (bliss has always preserved them on rename).
+                if let Some(pkg) = bliss_stdlib::find_package(&old_name) {
+                    let new_nicks: Vec<String> = if args.len() > 2 {
+                        list_to_vec(eval_form(args[2], env)?)
+                            .iter()
+                            .map(|n| normalize_package_name(&val_as_str(*n)))
+                            .collect()
+                    } else {
+                        bliss_stdlib::package_nicknames(pkg)
+                    };
+                    let nick_refs: Vec<&str> = new_nicks.iter().map(String::as_str).collect();
+                    let _ = bliss_stdlib::rename_package(pkg, &new_name, &nick_refs);
+                    for nick in &new_nicks {
+                        reader::register_package(nick);
+                    }
                 }
                 reader::register_package(&new_name);
                 return Ok(package_object(&new_name));
@@ -8813,8 +8829,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if args.is_empty() {
                     return Ok(T);
                 }
-                let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
-                env.packages.borrow_mut().remove(&pkg_name);
+                let del_raw = val_as_str(eval_form(args[0], env)?);
+                let pkg_name = resolve_package_name(env, &del_raw);
+                let _ = bliss_stdlib::delete_package(&pkg_name);
                 return Ok(T);
             }
             "INTERN" => {
@@ -8891,12 +8908,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     };
                     resolved.push((name, sym));
                 }
-                let mut __pkgs = env.packages.borrow_mut();
-                    let package = __pkgs.get_mut(&pkg_name).expect("package exists");
-                for (name, sym) in resolved {
-                    package.symbols.insert(name.clone(), sym);
-                    if export_mode {
-                        package.exports.insert(name);
+                // Make each symbol present in the package (EXPORT → external, so
+                // used packages inherit it; IMPORT/SHADOWING-IMPORT → internal).
+                if let Some(pkg) = bliss_stdlib::find_package(&pkg_name) {
+                    for (name, sym) in resolved {
+                        let _ = bliss_stdlib::add_symbol(pkg, &name, sym, export_mode);
                     }
                 }
                 return Ok(T);
@@ -8939,18 +8955,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     env.current_package.clone()
                 };
                 let name = symbol_bare_name(&val_as_str(symbol));
-                let mut __pkgs = env.packages.borrow_mut();
-                let Some(package) = __pkgs.get_mut(&pkg_name) else {
+                let Some(pkg) = bliss_stdlib::find_package(&pkg_name) else {
                     return Ok(NIL);
                 };
-                let removed_symbol = package.symbols.remove(&name).is_some();
-                let removed_export =
-                    if package.exports.remove(&name) {
-                        true
-                    } else {
-                        false
-                    };
-                return Ok(if removed_symbol || removed_export {
+                let removed = match bliss_stdlib::find_present_symbol(pkg, &name) {
+                    Some(sym) => bliss_stdlib::unintern(sym, pkg).unwrap_or(false),
+                    None => false,
+                };
+                return Ok(if removed {
                     T
                 } else {
                     NIL
@@ -12708,7 +12720,6 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
     let funs = (*env.funs).clone();
     let classes = env.classes.borrow().clone();
     let methods = env.methods.borrow().clone();
-    let packages = env.packages.borrow().clone();
     let current_package = env.current_package.clone();
     let sandbox = env.sandbox;
     let symbol_macros = (*env.symbol_macros).clone();
@@ -12725,7 +12736,6 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
             macro_env.symbol_macros = Rc::new(symbol_macros.clone());
             macro_env.classes = Rc::new(RefCell::new(classes.clone()));
             macro_env.methods = Rc::new(RefCell::new(methods.clone()));
-            macro_env.packages = Rc::new(RefCell::new(packages.clone()));
             macro_env.current_package = current_package.clone();
             macro_env.eval_context = eval_context;
             bind_macro_lambda_list(
@@ -14444,8 +14454,10 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     for v in list_to_vec(val_list) {
                         let from = resolve_package_name(env, &val_as_str(v));
                         uses.push(from.clone());
-                        if let Some(pkg) = env.packages.borrow().get(&from).cloned() {
-                            exports.extend(pkg.exports.iter().cloned());
+                        if let Some(pkg) = bliss_stdlib::find_package(&from) {
+                            for sym in bliss_stdlib::external_symbols_of(pkg) {
+                                exports.push(symbol_bare_name(&sym_name(sym)));
+                            }
                         }
                     }
                 }
@@ -14486,16 +14498,15 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     for nick in &nicknames {
         reader::register_package(nick);
     }
-    env.packages.borrow_mut().insert(
-        pkg_name.clone(),
-        PackageDef {
-            name: pkg_name.clone(),
-            nicknames: nicknames.clone(),
-            exports: exports.iter().cloned().collect(),
-            uses,
-            symbols: HashMap::new(),
-        },
-    );
+    // Create (or reuse) the package in the registry, linking its use-list
+    // (creating placeholders for forward `:use` references), then its nicknames.
+    let use_refs: Vec<&str> = uses.iter().map(String::as_str).collect();
+    ensure_package_available(env, &pkg_name, &use_refs);
+    if let Some(pkg) = bliss_stdlib::find_package(&pkg_name) {
+        for nick in &nicknames {
+            let _ = bliss_stdlib::add_nickname(pkg, nick);
+        }
+    }
 
     // Import named symbols so they are accessible (and identical) in this
     // package; fall back to a fresh internal symbol if the source lacks it.
@@ -14503,8 +14514,8 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         let found = find_symbol_in_package(env, from, sym_name_str).map(|(sym, _)| sym);
         match found {
             Some(sym) => {
-                if let Some(def) = env.packages.borrow_mut().get_mut(&pkg_name) {
-                    def.symbols.insert(sym_name_str.clone(), sym);
+                if let Some(pkg) = bliss_stdlib::find_package(&pkg_name) {
+                    let _ = bliss_stdlib::add_symbol(pkg, sym_name_str, sym, false);
                 }
             }
             None => {
@@ -14518,30 +14529,18 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     }
     // Make each exported name present + external. If a symbol of that name is
     // already accessible in the package — in particular inherited from a used
-    // package — import THAT symbol (preserving its identity and home package)
-    // rather than forking a fresh same-named symbol. Re-exporting an inherited
+    // package — export THAT symbol (preserving its identity and home package)
+    // rather than forking a fresh same-named one. Re-exporting an inherited
     // symbol must keep it EQ to the original, or a downstream package that uses
     // both paths sees two conflicting symbols (bliss-lb6.8).
     for name in &exports {
-        let already = env
-            .packages
-            .borrow()
-            .get(&pkg_name)
-            .map(|def| def.symbols.contains_key(name))
-            .unwrap_or(false);
-        if !already {
-            let existing = find_symbol_in_package(env, &pkg_name, name).map(|(s, _)| s);
-            match existing {
-                Some(sym) => {
-                    if let Some(def) = env.packages.borrow_mut().get_mut(&pkg_name) {
-                        def.symbols.insert(name.clone(), sym);
-                    }
-                }
-                None => {
-                    intern_into_package(env, &pkg_name, name);
-                }
-            }
-        }
+        let Some(pkg) = bliss_stdlib::find_package(&pkg_name) else {
+            continue;
+        };
+        let sym = bliss_stdlib::find_present_symbol(pkg, name)
+            .or_else(|| find_symbol_in_package(env, &pkg_name, name).map(|(s, _)| s))
+            .unwrap_or_else(|| intern_into_package(env, &pkg_name, name));
+        let _ = bliss_stdlib::add_symbol(pkg, name, sym, true);
     }
 
     // DEFPACKAGE returns the package object (CLHS), not T (bliss-bhs).
