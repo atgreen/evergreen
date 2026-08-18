@@ -467,6 +467,30 @@ fn extended_loop_supports_asdf_load_path_clauses() {
 }
 
 #[test]
+fn loop_it_anaphor_binds_conditional_test_value() {
+    // CLHS 6.1.5: inside a selected when/if branch, `it` denotes the value of the
+    // test. ASDF's REGISTER-SYSTEM-DEFINITION relies on this
+    //   (loop :for spec :in dep-forms :when (resolve-dependency-spec nil spec) :collect :it)
+    // so a broken anaphor collected the literal keyword :IT and tried to
+    // load-system it (phantom MISSING-COMPONENT :IT for every :defsystem-depends-on).
+    assert_eq!(
+        eval_ok("(loop for x in '(1 nil 2 nil 3) when x collect it)"),
+        "(1 2 3)"
+    );
+    // LOOP matches anaphora by name, so the keyword :it works exactly as `it`.
+    assert_eq!(
+        eval_ok("(loop for x in '(1 nil 2 nil 3) when x collect :it)"),
+        "(1 2 3)"
+    );
+    // The binding is visible to a nested `it`, and to `if`/`sum`/`do`.
+    assert_eq!(
+        eval_ok("(loop for x in '(1 nil 2) when x collect (cons it it))"),
+        "((1 . 1) (2 . 2))"
+    );
+    assert_eq!(eval_ok("(loop for x in '(1 2 3) if (* x 10) sum it)"), "60");
+}
+
+#[test]
 fn lambda_lists_bind_optional_rest_and_key() {
     // Functions must bind &optional (with defaults), &rest (as a proper list),
     // and &key — required to run ASDF's own utility functions.
@@ -1445,8 +1469,10 @@ fn definitions_inside_loops_persist_globally() {
         eval_ok("(progn (make-package \"LP2\") (loop for n in '(\"A\") do (intern n \"LP2\")) (nth-value 1 (find-symbol \"A\" \"LP2\")))"),
         ":INTERNAL"
     );
+    // PACKAGE-USE-LIST returns package OBJECTS (CLHS; bliss-bhs first-class
+    // packages), so map through PACKAGE-NAME to check the persisted use.
     assert_eq!(
-        eval_ok("(progn (defpackage :usrc (:export #:uq)) (make-package \"UDST\") (dolist (p '(\"UDST\")) (use-package :usrc p)) (package-use-list (find-package \"UDST\")))"),
+        eval_ok("(progn (defpackage :usrc (:export #:uq)) (make-package \"UDST\") (dolist (p '(\"UDST\")) (use-package :usrc p)) (mapcar #'package-name (package-use-list (find-package \"UDST\"))))"),
         "(\"USRC\")"
     );
 }

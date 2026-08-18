@@ -9701,6 +9701,21 @@ fn loop_exec_clauses(
     Ok(())
 }
 
+/// Evaluate a LOOP clause value-form, honouring the `it` anaphor (CLHS 6.1.5):
+/// inside the selected branch of a `when`/`if`/`unless`, the bare token `it`
+/// (symbol `it` or keyword `:it` — LOOP matches anaphora by name) stands for the
+/// value of the conditional test, which the `Cond` executor has bound to the
+/// lexical variable `IT`. A nested `it` (e.g. `collect (list it)`) resolves via
+/// that same binding through the normal evaluator.
+fn loop_it_eval(expr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    if expr.is_symbol() && symbol_bare_name(&sym_name(expr)) == "IT" {
+        if let Some(v) = env.lookup_var("IT") {
+            return Ok(v);
+        }
+    }
+    eval_form(expr, env)
+}
+
 fn loop_exec_clause(
     c: &LoopClause,
     env: &mut Env,
@@ -9714,52 +9729,52 @@ fn loop_exec_clause(
                 if ret.is_some() {
                     break;
                 }
-                eval_form(*f, env)?;
+                loop_it_eval(*f, env)?;
             }
         }
         LoopClause::Return(e) => {
-            *ret = Some(eval_form(*e, env)?);
+            *ret = Some(loop_it_eval(*e, env)?);
         }
         LoopClause::ThereIs(e) => {
-            let v = eval_form(*e, env)?;
+            let v = loop_it_eval(*e, env)?;
             if !v.is_nil() {
                 *ret = Some(v);
             }
         }
         LoopClause::Always(e) => {
             accs.bool_default.get_or_insert(T);
-            if eval_form(*e, env)?.is_nil() {
+            if loop_it_eval(*e, env)?.is_nil() {
                 *ret = Some(NIL);
             }
         }
         LoopClause::Never(e) => {
             accs.bool_default.get_or_insert(T);
-            if !eval_form(*e, env)?.is_nil() {
+            if !loop_it_eval(*e, env)?.is_nil() {
                 *ret = Some(NIL);
             }
         }
         LoopClause::Sum(e, into) => {
-            let v = eval_form(*e, env)?;
+            let v = loop_it_eval(*e, env)?;
             accs.sum(into.clone(), v)?;
         }
         LoopClause::Count(e, into) => {
-            let truthy = !eval_form(*e, env)?.is_nil();
+            let truthy = !loop_it_eval(*e, env)?.is_nil();
             accs.count(into.clone(), truthy);
         }
         LoopClause::Maximize(e, into) => {
-            let v = eval_form(*e, env)?;
+            let v = loop_it_eval(*e, env)?;
             accs.maximize(into.clone(), v)?;
         }
         LoopClause::Minimize(e, into) => {
-            let v = eval_form(*e, env)?;
+            let v = loop_it_eval(*e, env)?;
             accs.minimize(into.clone(), v)?;
         }
         LoopClause::Collect(e, into) => {
-            let v = eval_form(*e, env)?;
+            let v = loop_it_eval(*e, env)?;
             accs.collect(into.clone(), v);
         }
         LoopClause::Append(e, into) => {
-            let v = eval_form(*e, env)?;
+            let v = loop_it_eval(*e, env)?;
             accs.append(into.clone(), v);
         }
         LoopClause::While(e) => {
@@ -9781,6 +9796,10 @@ fn loop_exec_clause(
             let t = eval_form(*test, env)?;
             let take = !t.is_nil() ^ *negate;
             if take {
+                // Bind the `it` anaphor (CLHS 6.1.5) to the test value for the
+                // selected branch, so `when TEST collect it` collects TEST's
+                // value (and a nested `it` resolves through this same binding).
+                env.define_local("IT", t);
                 loop_exec_clauses(then, env, accs, ret, terminate)?;
             } else {
                 loop_exec_clauses(els, env, accs, ret, terminate)?;
