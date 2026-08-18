@@ -536,6 +536,25 @@ fn read_and_write_sequence_builtins() {
 }
 
 #[test]
+fn setf_writer_function_is_global_across_scopes() {
+    // A top-level (defun (setf place) …) is a GLOBAL definition: `(setf (place …)
+    // v)` must find it from any scope, including inside another function defined
+    // separately — babel defines (setf get-abstract-mapping) in one file and uses
+    // it from another. It used to be stored per-Env and lost across files.
+    assert_eq!(
+        eval_ok(
+            "(progn \
+               (defvar *h* (make-hash-table)) \
+               (defun gam (e) (gethash e *h*)) \
+               (defun (setf gam) (v e) (setf (gethash e *h*) v)) \
+               (defun use-it (e) (setf (gam e) 99)) \
+               (use-it :k) (+ 0 (gam :k)))"
+        ),
+        "99"
+    );
+}
+
+#[test]
 fn initarg_from_initialize_instance_key_is_valid() {
     // CLHS 7.1.2: an initarg that matches no slot :initarg is still valid if an
     // applicable INITIALIZE-INSTANCE/SHARED-INITIALIZE method declares it as a

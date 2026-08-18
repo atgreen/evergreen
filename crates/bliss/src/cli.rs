@@ -629,6 +629,14 @@ fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
     if let Some(fdef) = env.funs.get(name) {
         return Some((fdef.params_form, fdef.body));
     }
+    // Global `(setf place)` writers registered by a top-level defun (any file).
+    if let Some(pb) = GLOBAL_SETF_FNS.with(|m| {
+        m.borrow()
+            .get(name)
+            .map(|fdef| (fdef.params_form, fdef.body))
+    }) {
+        return Some(pb);
+    }
     let f = global_fn(name)?;
     bliss_rt::function::record_invocation(f);
     Some((bliss_rt::function::lambda_list(f), bliss_rt::function::body(f)))
@@ -932,6 +940,15 @@ thread_local! {
     /// a per-Env `macros` map lost it across files (bliss-lb6.22). MACROLET
     /// macros stay lexical in `Env::macros` and shadow these.
     static GLOBAL_MACROS: RefCell<HashMap<String, MacroDef>> = RefCell::new(HashMap::new());
+
+    /// Global `(defun (setf place) …)` writer functions, keyed by the canonical
+    /// `"(SETF PLACE)"` string. Like top-level DEFMACRO (above), a top-level
+    /// `(setf place)` defun is a *global* definition and must survive the
+    /// throwaway child Envs used during compile/load — storing it in a per-Env
+    /// `funs` map lost it across files, so `(setf (place …) v)` in a later file
+    /// failed with "SETF: unsupported place" even though the writer was defined
+    /// (bliss-d0b). FLET-local `(setf place)` writers stay lexical in `Env.funs`.
+    static GLOBAL_SETF_FNS: RefCell<HashMap<String, FunDef>> = RefCell::new(HashMap::new());
 
     /// Memoized macro-expander registrations for the bytecode compiler
     /// (bliss-gq5.8). Building a MacroexpandEnv used to re-freeze every macro's
@@ -12042,18 +12059,22 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
         }
     } else {
-        // Non-symbol names, e.g. `(setf foo)`: store under the canonical
-        // "(SETF FOO)" key so SETF can find the writer function.
+        // Non-symbol names, e.g. `(setf foo)`: store GLOBALLY under the canonical
+        // "(SETF FOO)" key so SETF finds the writer function from any Env — in
+        // particular from a different file loaded later (bliss-d0b). A per-Env
+        // `funs` entry was lost across the throwaway compile/load Envs.
         let name = function_name_key(name_form);
         let params = extract_params(params_form);
-        Rc::make_mut(&mut env.funs).insert(
-            name,
-            FunDef {
-                params,
-                params_form,
-                body,
-            },
-        );
+        GLOBAL_SETF_FNS.with(|m| {
+            m.borrow_mut().insert(
+                name,
+                FunDef {
+                    params,
+                    params_form,
+                    body,
+                },
+            )
+        });
     }
     Ok(name_form)
 }
