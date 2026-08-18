@@ -4763,6 +4763,14 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             }
             Ok(true)
         }
+        "QUOTE" => {
+            // A DEFTYPE expander is stored as its body form, e.g. `'(integer 1 N)`
+            // → (QUOTE (INTEGER 1 N)); resolve_type_spec hands back that quoted
+            // form. Match against the quoted type spec (alexandria's
+            // POSITIVE-FIXNUM etc., used by babel).
+            let (inner, _) = cp(args);
+            typep_matches(env, object, inner)
+        }
         "SIMPLE-VECTOR" => {
             // (simple-vector size): a general vector whose length matches SIZE
             // (or `*`). Used e.g. by ASDF's MATCH-CONDITION-P etypecase.
