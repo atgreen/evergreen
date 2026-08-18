@@ -361,6 +361,39 @@ fn variadic_lambda_lists_compile_and_promote() {
     );
 }
 
+/// A variadic (`&rest`) function must stay correct under `BLISS_T2=1`. T2's entry
+/// sequence binds only the fixed positional parameters (locals `0..arity`) and
+/// leaves the rest NIL, so a variadic function is DECLINED from T2 and runs at
+/// T1, whose `bind_variadic` collects `&rest`. This guards the UIOP STRCAT
+/// regression: a T2-compiled `&rest` saw an EMPTY list, so
+/// `(make-string (loop :for s :in strings :sum …))` got NIL — "NIL is not of type
+/// non-negative string size" — and `asdf` failed to load under T2. The hot `&rest`
+/// result must equal the tree-walker's, and the function must NOT be at T2.
+#[test]
+fn variadic_rest_stays_correct_under_t2() {
+    let prog = "\
+        (defun rs (strings) \
+          (make-string (loop :for s :in strings :sum (if (characterp s) 1 (length s))))) \
+        (defun sc (&rest strings) (rs strings)) \
+        (dotimes (k 80) (sc \"ab\" \"cd\" \"ef\")) \
+        (format t \"~a ~a~%\" (bliss-ext:function-tier (quote sc)) (length (sc \"ab\" \"cd\" \"ef\")))";
+    let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
+    assert!(ok, "variadic under T2 failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    assert!(line.ends_with(" 6"), "hot &rest result must be 6: {line:?}");
+    assert!(
+        !line.starts_with("2 "),
+        "variadic fn must be declined from T2 (stay at T1): {line:?}"
+    );
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker run failed: {tw}");
+    assert!(
+        tw.lines().next().unwrap_or("").ends_with(" 6"),
+        "tree-walker &rest length must be 6: {tw:?}"
+    );
+}
+
 /// A non-top-level EVAL-WHEN (in a function body) compiles to bytecode and
 /// promotes to T1 (bliss-x5y.6 follow-up) instead of bailing the whole function
 /// to the tree-walker. Per CLHS 3.2.3.1 it reduces to (progn body) when its

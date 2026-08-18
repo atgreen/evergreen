@@ -5997,6 +5997,21 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         return None;
     }
     let bf = registry_get(sym)?;
+    // T2's entry sequence (build.rs::seed_entry) binds only the fixed positional
+    // parameters — locals `0..arity` — and leaves every other local NIL. It has
+    // no support for collecting &optional/&rest/&key arguments, so a variadic
+    // function compiled to T2 sees an EMPTY &rest: e.g. UIOP's STRCAT sums the
+    // lengths of an empty list, make-string gets NIL, and the load aborts with
+    // "NIL is not of type non-negative string size". T1's bind_variadic handles
+    // these correctly, so keep variadic functions at T1 until T2 grows a variadic
+    // entry (bliss captured-variadic-param follow-up).
+    if bf.variadic {
+        t2_log!(
+            "{}: variadic lambda list not modelled by T2 entry => stay T1",
+            bf.name
+        );
+        return None;
+    }
     // (StoreGlobal functions used to be declined here, before T2 had precise
     // deopt. That is no longer needed: emit_framed now lowers SetSymbolValue and
     // gives every guard precise state-transfer deopt (bliss-izt.3, bliss-mzp), so
