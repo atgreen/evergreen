@@ -8601,6 +8601,47 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 write_str_to(out, &s)?;
                 return Ok(string);
             }
+            "WRITE-LINE" => {
+                // (write-line string &optional stream &key start end) — WRITE-STRING
+                // followed by a newline; returns the string.
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "WRITE-LINE requires an argument".into(),
+                    ));
+                }
+                let string = eval_form(args[0], env)?;
+                let s = val_as_str(string);
+                let stream = if args.len() > 1 && !is_keyword_arg(args[1]) {
+                    eval_form(args[1], env)?
+                } else {
+                    NIL
+                };
+                let out = resolve_output_stream(stream, env);
+                if is_gray_stream(out) {
+                    invoke_generic_function(
+                        "STREAM-WRITE-STRING",
+                        &[out, string, BlissVal::from_fixnum(0), NIL],
+                        env,
+                    )?;
+                    invoke_generic_function("STREAM-TERPRI", &[out], env)?;
+                    return Ok(string);
+                }
+                write_str_to(out, &s)?;
+                bliss_stdlib::stream_terpri(out)?;
+                return Ok(string);
+            }
+            "FILE-LENGTH" => {
+                // (file-length stream) — length in elements of an open file stream.
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "FILE-LENGTH requires a stream".into(),
+                    ));
+                }
+                let stream = eval_form(args[0], env)?;
+                return bliss_stdlib::file_length_fn(stream);
+            }
             "SAVE-IMAGE" => {
                 let (path_form, _) = cp(cdr);
                 let path_val = eval_form(path_form, env)?;
@@ -13878,6 +13919,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"
             | "READ-FROM-STRING" | "FORMAT" | "PRIN1-TO-STRING" | "PRINC-TO-STRING"
             | "WRITE-TO-STRING" | "FORCE-OUTPUT" | "FINISH-OUTPUT" | "CLEAR-OUTPUT"
+            | "FILE-LENGTH"
             // Misc
             | "ERROR" | "WARN" | "SIGNAL" | "CERROR" | "MAKE-CONDITION" | "MUFFLE-WARNING"
             | "INVOKE-RESTART" | "FIND-RESTART" | "COMPUTE-RESTARTS" | "ABORT" | "CONTINUE"

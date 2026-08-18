@@ -467,6 +467,23 @@ fn extended_loop_supports_asdf_load_path_clauses() {
 }
 
 #[test]
+fn write_line_and_file_length_builtins() {
+    // WRITE-LINE was declared a builtin but never dispatched; FILE-LENGTH was
+    // missing entirely. Both are used by ASDF's HTTP-stack dependencies.
+    assert_eq!(eval_ok("(with-output-to-string (s) (write-line \"ab\" s) (write-string \"cd\" s))"), "\"ab\ncd\"");
+    assert_eq!(eval_ok("(write-line \"x\" (make-string-output-stream))"), "\"x\"");
+    // FILE-LENGTH of a freshly-written file returns its element count.
+    assert_eq!(
+        eval_ok(
+            "(let ((p \"/tmp/bliss-fl-test.txt\"))\
+               (with-open-file (s p :direction :output :if-exists :supersede) (write-string \"abcde\" s))\
+               (with-open-file (s p) (file-length s)))"
+        ),
+        "5"
+    );
+}
+
+#[test]
 fn conditions_princ_to_their_report_string() {
     // CLHS 9.1: princ/~A of a condition prints its report; ~S keeps #<TYPE …>.
     // Without a report, an UNDEFINED-FUNCTION printed as an opaque
