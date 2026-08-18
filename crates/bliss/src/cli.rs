@@ -3468,7 +3468,34 @@ fn stdlib_print_object_hook(val: BlissVal, escape: bool) -> Option<String> {
     if let Some(name) = package_object_name(val) {
         return Some(format!("#<PACKAGE {name}>"));
     }
-    dispatch_print_object(val, escape)
+    // A user PRINT-OBJECT method wins if one applies.
+    if let Some(s) = dispatch_print_object(val, escape) {
+        return Some(s);
+    }
+    // `princ` / `~A` of a CONDITION prints its report string (CLHS 9.1); `~S`
+    // keeps the default `#<TYPE …>`. Without this, an UNDEFINED-FUNCTION printed
+    // as an opaque `#<UNDEFINED-FUNCTION>` with no name — making a failed load
+    // (e.g. a missing builtin during an ASDF compile) undiagnosable.
+    if !escape && bliss_stdlib::is_instance(val) && !PRINTING_OBJECT.with(|c| c.get()) {
+        let ptr = PRINT_ENV.with(|c| c.get());
+        if !ptr.is_null() {
+            // Safety: mirrors dispatch_print_object — the parked pointer is the
+            // live print-entry Env; printing is single-threaded.
+            let env = unsafe { &*ptr };
+            let is_condition = instance_class_hierarchy_names(val)
+                .map(|ns| ns.iter().any(|n| n == "CONDITION"))
+                .unwrap_or(false);
+            if is_condition {
+                PRINTING_OBJECT.with(|c| c.set(true));
+                let report = condition_report_string(env, val);
+                PRINTING_OBJECT.with(|c| c.set(false));
+                if let Some(report) = report {
+                    return Some(report);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Reader hook: resolve a symbol token to the canonical symbol already

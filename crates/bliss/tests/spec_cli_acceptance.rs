@@ -467,6 +467,27 @@ fn extended_loop_supports_asdf_load_path_clauses() {
 }
 
 #[test]
+fn conditions_princ_to_their_report_string() {
+    // CLHS 9.1: princ/~A of a condition prints its report; ~S keeps #<TYPE …>.
+    // Without a report, an UNDEFINED-FUNCTION printed as an opaque
+    // #<UNDEFINED-FUNCTION> with no name, making failed ASDF compiles (missing
+    // builtins) undiagnosable.
+    assert_eq!(
+        eval_ok("(format nil \"~a\" (handler-case (funcall (read-from-string \"no-such-fn\")) (undefined-function (e) e)))"),
+        "\"The function NO-SUCH-FN is undefined.\""
+    );
+    assert_eq!(
+        eval_ok("(format nil \"~a\" (handler-case (symbol-value 'no-such-var) (unbound-variable (e) e)))"),
+        "\"The variable NO-SUCH-VAR is unbound.\""
+    );
+    // ~S stays the opaque object form.
+    assert_eq!(
+        eval_ok("(format nil \"~s\" (handler-case (funcall (read-from-string \"nope-fn\")) (undefined-function (e) e)))"),
+        "\"#<UNDEFINED-FUNCTION>\""
+    );
+}
+
+#[test]
 fn loop_it_anaphor_binds_conditional_test_value() {
     // CLHS 6.1.5: inside a selected when/if branch, `it` denotes the value of the
     // test. ASDF's REGISTER-SYSTEM-DEFINITION relies on this
