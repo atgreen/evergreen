@@ -5,7 +5,7 @@
 
 use bliss_rt::error::BlissError;
 use bliss_rt::object::{ConsCell, ObjectHeader, type_id};
-use bliss_rt::value::{BlissVal, NIL};
+use bliss_rt::value::{BlissVal, NIL, T};
 
 // ── Internal helpers ──────────────────────────────────────────────
 
@@ -204,6 +204,175 @@ fn vector_set_elt(v: BlissVal, idx: usize, val: BlissVal) {
     unsafe {
         *(ptr.add(16 + idx * 8) as *mut BlissVal) = val;
     }
+}
+
+// ── COMPLEX_ARRAY: rank-1 vectors with a fill pointer and/or adjustability ──
+//
+// Like simple-vectors, these are leaked (off-GC) heap objects (bliss allocates
+// vectors with `Vec::forget`, so nothing here interacts with the collector).
+// Body layout after the 8-byte header:
+//   word 0 (+8):  storage — a SIMPLE_VECTOR of capacity `array-total-size`
+//   word 1 (+16): fill-pointer, a fixnum (the active LENGTH)
+//   word 2 (+24): adjustable flag (T / NIL)
+// The active length is the fill pointer; `array-total-size` is the storage's
+// length; growth (`vector-push-extend`) replaces the storage with a larger one.
+
+/// True if `v` is a COMPLEX_ARRAY (fill-pointer / adjustable vector).
+pub fn is_complex_vector(v: BlissVal) -> bool {
+    if !v.is_heap_object() {
+        return false;
+    }
+    if crate::pathnames::registered_string(v).is_some() {
+        return false;
+    }
+    let header = unsafe { *(v.as_ptr() as *const ObjectHeader) };
+    header.type_id() == type_id::COMPLEX_ARRAY
+}
+
+#[inline]
+fn cvec_storage(v: BlissVal) -> BlissVal {
+    unsafe { *(v.as_ptr().add(8) as *const BlissVal) }
+}
+#[inline]
+fn cvec_set_storage(v: BlissVal, storage: BlissVal) {
+    unsafe {
+        *(v.as_ptr().add(8) as *mut BlissVal) = storage;
+    }
+}
+/// The fill pointer (= active LENGTH) of a complex vector.
+#[inline]
+pub fn cvec_fill_pointer(v: BlissVal) -> usize {
+    unsafe { (*(v.as_ptr().add(16) as *const BlissVal)).as_fixnum().max(0) as usize }
+}
+#[inline]
+fn cvec_set_fill_pointer_raw(v: BlissVal, n: usize) {
+    unsafe {
+        *(v.as_ptr().add(16) as *mut BlissVal) = BlissVal::from_fixnum(n as i64);
+    }
+}
+/// Whether a complex vector is adjustable (can grow its storage).
+#[inline]
+pub fn cvec_adjustable(v: BlissVal) -> bool {
+    unsafe { !(*(v.as_ptr().add(24) as *const BlissVal)).is_nil() }
+}
+/// `array-total-size` — the capacity of the backing storage.
+#[inline]
+pub fn cvec_capacity(v: BlissVal) -> usize {
+    vector_length(cvec_storage(v))
+}
+
+/// Build a COMPLEX_ARRAY. `capacity` is the backing array-total-size;
+/// `elements` seed positions `0..elements.len()` (rest NIL); `fill_pointer` is
+/// the active length; `adjustable` allows later growth.
+pub fn build_complex_vector(
+    elements: &[BlissVal],
+    capacity: usize,
+    fill_pointer: usize,
+    adjustable: bool,
+) -> BlissVal {
+    let cap = capacity.max(elements.len());
+    let mut store: Vec<BlissVal> = Vec::with_capacity(cap);
+    store.extend_from_slice(elements);
+    store.resize(cap, NIL);
+    let storage = build_vector(&store);
+    let mut buf: Vec<u64> = Vec::with_capacity(4);
+    let header = ObjectHeader::new(type_id::COMPLEX_ARRAY, 4);
+    buf.push(header.0);
+    buf.push(storage.to_raw());
+    buf.push(BlissVal::from_fixnum(fill_pointer.min(cap) as i64).to_raw());
+    buf.push(if adjustable { T } else { NIL }.to_raw());
+    let ptr = buf.as_mut_ptr() as *mut u8;
+    std::mem::forget(buf);
+    unsafe { BlissVal::from_heap_ptr(ptr) }
+}
+
+/// Set the fill pointer of a complex vector (CL `(setf fill-pointer)`), clamped
+/// to the backing capacity. Returns the clamped value.
+pub fn set_fill_pointer(v: BlissVal, n: usize) -> Result<usize, BlissError> {
+    if !is_complex_vector(v) {
+        return Err(BlissError::TypeError {
+            datum: v,
+            expected: "vector with a fill pointer".to_string(),
+        });
+    }
+    let n = n.min(cvec_capacity(v));
+    cvec_set_fill_pointer_raw(v, n);
+    Ok(n)
+}
+
+/// CL `VECTOR-PUSH`: store `value` at the fill pointer and increment it. Returns
+/// the index used, or NIL if the vector is full (no extension).
+pub fn vector_push(v: BlissVal, value: BlissVal) -> Result<BlissVal, BlissError> {
+    if !is_complex_vector(v) {
+        return Err(BlissError::TypeError {
+            datum: v,
+            expected: "vector with a fill pointer".to_string(),
+        });
+    }
+    let fp = cvec_fill_pointer(v);
+    if fp >= cvec_capacity(v) {
+        return Ok(NIL);
+    }
+    vector_set_elt(cvec_storage(v), fp, value);
+    cvec_set_fill_pointer_raw(v, fp + 1);
+    Ok(BlissVal::from_fixnum(fp as i64))
+}
+
+/// CL `VECTOR-PUSH-EXTEND`: like VECTOR-PUSH, but grows an adjustable vector's
+/// storage when full. Returns the index used.
+pub fn vector_push_extend(
+    v: BlissVal,
+    value: BlissVal,
+    extension: Option<usize>,
+) -> Result<BlissVal, BlissError> {
+    if !is_complex_vector(v) {
+        return Err(BlissError::TypeError {
+            datum: v,
+            expected: "adjustable vector with a fill pointer".to_string(),
+        });
+    }
+    let fp = cvec_fill_pointer(v);
+    let cap = cvec_capacity(v);
+    if fp >= cap {
+        if !cvec_adjustable(v) {
+            return Err(BlissError::TypeError {
+                datum: v,
+                expected: "adjustable vector".to_string(),
+            });
+        }
+        // Grow: default to doubling (min 8), or the requested extension.
+        let grow = extension.unwrap_or(cap.max(8));
+        let new_cap = cap + grow.max(1);
+        let mut store: Vec<BlissVal> = Vec::with_capacity(new_cap);
+        for i in 0..cap {
+            store.push(vector_elt(cvec_storage(v), i));
+        }
+        store.resize(new_cap, NIL);
+        cvec_set_storage(v, build_vector(&store));
+    }
+    vector_set_elt(cvec_storage(v), fp, value);
+    cvec_set_fill_pointer_raw(v, fp + 1);
+    Ok(BlissVal::from_fixnum(fp as i64))
+}
+
+/// CL `VECTOR-POP`: decrement the fill pointer and return the element there.
+pub fn vector_pop(v: BlissVal) -> Result<BlissVal, BlissError> {
+    if !is_complex_vector(v) {
+        return Err(BlissError::TypeError {
+            datum: v,
+            expected: "vector with a fill pointer".to_string(),
+        });
+    }
+    let fp = cvec_fill_pointer(v);
+    if fp == 0 {
+        return Err(BlissError::TypeError {
+            datum: v,
+            expected: "non-empty vector".to_string(),
+        });
+    }
+    let val = vector_elt(cvec_storage(v), fp - 1);
+    cvec_set_fill_pointer_raw(v, fp - 1);
+    Ok(val)
 }
 
 /// Collect cons-cell pointers from a proper list.
@@ -497,6 +666,10 @@ pub fn length(sequence: BlissVal) -> Result<usize, BlissError> {
     if is_vector(sequence) {
         return Ok(vector_length(sequence));
     }
+    if is_complex_vector(sequence) {
+        // A fill-pointer vector's LENGTH is its fill pointer.
+        return Ok(cvec_fill_pointer(sequence));
+    }
     if let Some(s) = string_content(sequence) {
         // Strings are sequences of characters (ANSI). Count characters, not bytes.
         return Ok(s.chars().count());
@@ -542,6 +715,16 @@ pub fn elt(sequence: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
         }
         return Ok(vector_elt(sequence, index));
     }
+    if is_complex_vector(sequence) {
+        let len = cvec_fill_pointer(sequence);
+        if index >= len {
+            return Err(BlissError::TypeError {
+                datum: sequence,
+                expected: format!("index {} in bounds (length {})", index, len),
+            });
+        }
+        return Ok(vector_elt(cvec_storage(sequence), index));
+    }
     if is_char_seq(sequence) {
         let s = string_content(sequence).unwrap_or_default();
         match s.chars().nth(index) {
@@ -571,6 +754,17 @@ pub fn set_elt(sequence: BlissVal, index: usize, value: BlissVal) -> Result<(), 
             });
         }
         vector_set_elt(sequence, index, value);
+        return Ok(());
+    }
+    if is_complex_vector(sequence) {
+        let len = cvec_fill_pointer(sequence);
+        if index >= len {
+            return Err(BlissError::TypeError {
+                datum: sequence,
+                expected: format!("index {} in bounds (length {})", index, len),
+            });
+        }
+        vector_set_elt(cvec_storage(sequence), index, value);
         return Ok(());
     }
     // Lists are not setf-elt-able

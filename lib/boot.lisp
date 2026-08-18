@@ -873,8 +873,27 @@
          (ic-cell (member :initial-contents keys))
          (et-cell (member :element-type keys))
          (et (if et-cell (car (cdr et-cell)) t))
-         (stringp (member et '(character base-char standard-char))))
+         (stringp (member et '(character base-char standard-char)))
+         (fp-cell (member :fill-pointer keys))
+         (adj-cell (member :adjustable keys))
+         (fp (and fp-cell (car (cdr fp-cell))))
+         (adjustable (and adj-cell (car (cdr adj-cell)))))
     (cond
+      ;; A :fill-pointer or :adjustable request ⇒ a complex (fill-pointer /
+      ;; adjustable) vector. The fill pointer is the given value, SIZE for
+      ;; :fill-pointer t, or SIZE when only :adjustable is supplied.
+      ((or fp adjustable)
+       (let* ((iel (if iel-cell (car (cdr iel-cell)) nil))
+              (fpn (cond ((eq fp t) size)
+                         ((integerp fp) fp)
+                         (t size)))
+              (v (%make-complex-vector size fpn (and adjustable t) iel)))
+         (when ic-cell
+           (let ((i 0))
+             (dolist (e (coerce (car (cdr ic-cell)) 'list))
+               (setf (aref v i) e)
+               (setq i (+ i 1)))))
+         v))
       (ic-cell
        (coerce (car (cdr ic-cell)) (if stringp 'string 'vector)))
       (stringp

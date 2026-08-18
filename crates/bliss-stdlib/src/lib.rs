@@ -93,8 +93,10 @@ pub use pathnames::{
     translate_logical_pathname, translate_pathname, truename, wild_pathname_p,
 };
 pub use sequences::{
-    build_simple_vector, concatenate, copy_seq, count, elt, find, length, map, nreverse, position,
-    reduce, remove, reverse, set_elt, sort, stable_sort, string_set_char, subseq, substitute,
+    build_complex_vector, build_simple_vector, concatenate, copy_seq, count, cvec_adjustable,
+    cvec_capacity, cvec_fill_pointer, elt, find, is_complex_vector, length, map, nreverse, position,
+    reduce, remove, reverse, set_elt, set_fill_pointer, sort, stable_sort, string_set_char, subseq,
+    substitute, vector_pop, vector_push, vector_push_extend,
 };
 pub use streams::GrayStream;
 pub use streams::{

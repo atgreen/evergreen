@@ -2904,6 +2904,21 @@ fn print_val(val: BlissVal, out: &mut String) {
                     }
                     out.push(')');
                 }
+                type_id::COMPLEX_ARRAY => {
+                    // A fill-pointer / adjustable vector prints as #(...) over its
+                    // active elements (0..fill-pointer) from the backing storage.
+                    let fp = bliss_stdlib::cvec_fill_pointer(val);
+                    let storage = *(ptr.add(8) as *const BlissVal);
+                    let sptr = storage.as_ptr();
+                    out.push_str("#(");
+                    for i in 0..fp {
+                        if i > 0 {
+                            out.push(' ');
+                        }
+                        print_val(*(sptr.add(16 + i * 8) as *const BlissVal), out);
+                    }
+                    out.push(')');
+                }
                 type_id::RATIO => {
                     let num = *(ptr.add(8) as *const BlissVal);
                     let den = *(ptr.add(16) as *const BlissVal);
@@ -6604,6 +6619,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     bliss_stdlib::set_elt(seq, i, val)?;
                                 }
                             }
+                            "FILL-POINTER" => {
+                                // (setf (fill-pointer vector) n) — set the active
+                                // length of a fill-pointer vector.
+                                let vec = eval_form(tgt_form, env)?;
+                                if !val.is_fixnum() || val.as_fixnum() < 0 {
+                                    return Err(BlissError::TypeError {
+                                        datum: val,
+                                        expected: "non-negative fill pointer".into(),
+                                    });
+                                }
+                                bliss_stdlib::set_fill_pointer(vec, val.as_fixnum() as usize)?;
+                            }
                             "DOCUMENTATION" => {
                                 // (setf (documentation object doc-type) val) — the
                                 // interpreter does not retain documentation
@@ -6852,6 +6879,89 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (vector &rest elements) → a fresh simple-vector.
                 let elems = eval_args(cdr, env)?;
                 return Ok(bliss_stdlib::build_simple_vector(&elems));
+            }
+            "BLISS-INTERNAL::%MAKE-COMPLEX-VECTOR"
+            | "BLISS-INTERNAL:%MAKE-COMPLEX-VECTOR"
+            | "%MAKE-COMPLEX-VECTOR" => {
+                // (%make-complex-vector size fill-pointer adjustable-p &optional
+                // initial-element) — build a rank-1 fill-pointer / adjustable
+                // vector. Called by MAKE-ARRAY (boot.lisp) for the
+                // :fill-pointer/:adjustable cases.
+                let args = list_to_vec(cdr);
+                if args.len() < 3 {
+                    return Err(BlissError::Internal(
+                        "%MAKE-COMPLEX-VECTOR requires size, fill-pointer, adjustable".into(),
+                    ));
+                }
+                let size_v = eval_form(args[0], env)?;
+                let size = if size_v.is_fixnum() {
+                    size_v.as_fixnum().max(0) as usize
+                } else {
+                    0
+                };
+                let fp_v = eval_form(args[1], env)?;
+                let fp = if fp_v.is_fixnum() {
+                    fp_v.as_fixnum().max(0) as usize
+                } else {
+                    // :fill-pointer T (or absent) ⇒ full length.
+                    size
+                };
+                let adjustable = !eval_form(args[2], env)?.is_nil();
+                let iel = if args.len() > 3 {
+                    eval_form(args[3], env)?
+                } else {
+                    NIL
+                };
+                let elems = vec![iel; size];
+                return Ok(bliss_stdlib::build_complex_vector(&elems, size, fp, adjustable));
+            }
+            "VECTOR-PUSH" => {
+                // (vector-push new-element vector) → index used, or NIL if full.
+                let args = list_to_vec(cdr);
+                if args.len() < 2 {
+                    return Err(BlissError::Internal("VECTOR-PUSH requires an element and a vector".into()));
+                }
+                let val = eval_form(args[0], env)?;
+                let vec = eval_form(args[1], env)?;
+                return bliss_stdlib::vector_push(vec, val);
+            }
+            "VECTOR-PUSH-EXTEND" => {
+                // (vector-push-extend new-element vector &optional extension)
+                let args = list_to_vec(cdr);
+                if args.len() < 2 {
+                    return Err(BlissError::Internal(
+                        "VECTOR-PUSH-EXTEND requires an element and a vector".into(),
+                    ));
+                }
+                let val = eval_form(args[0], env)?;
+                let vec = eval_form(args[1], env)?;
+                let ext = if args.len() > 2 {
+                    let e = eval_form(args[2], env)?;
+                    e.is_fixnum().then(|| e.as_fixnum().max(0) as usize)
+                } else {
+                    None
+                };
+                return bliss_stdlib::vector_push_extend(vec, val, ext);
+            }
+            "VECTOR-POP" => {
+                // (vector-pop vector) → the element at the (decremented) fill ptr.
+                let (vf, _) = cp(cdr);
+                let vec = eval_form(vf, env)?;
+                return bliss_stdlib::vector_pop(vec);
+            }
+            "FILL-POINTER" => {
+                // (fill-pointer vector) → its fill pointer (an integer).
+                let (vf, _) = cp(cdr);
+                let vec = eval_form(vf, env)?;
+                if bliss_stdlib::is_complex_vector(vec) {
+                    return Ok(BlissVal::from_fixnum(
+                        bliss_stdlib::cvec_fill_pointer(vec) as i64,
+                    ));
+                }
+                return Err(BlissError::TypeError {
+                    datum: vec,
+                    expected: "vector with a fill pointer".into(),
+                });
             }
             "VECTORP" | "SIMPLE-VECTOR-P" => {
                 let (af, _) = cp(cdr);
@@ -13973,6 +14083,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "NOTANY" | "VECTOR" | "MAKE-ARRAY" | "MAKE-LIST" | "MAKE-SEQUENCE"
             | "VECTORP" | "SIMPLE-VECTOR-P" | "ARRAYP" | "ARRAY-DIMENSIONS"
             | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
+            | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR"
             // Numbers
             | "+" | "-" | "*" | "/" | "1+" | "1-" | "=" | "/=" | "<" | ">" | "<=" | ">="
             | "MIN" | "MAX" | "ABS" | "MOD" | "REM" | "FLOOR" | "CEILING" | "TRUNCATE"

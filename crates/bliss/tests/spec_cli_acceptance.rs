@@ -484,6 +484,39 @@ fn write_line_and_file_length_builtins() {
 }
 
 #[test]
+fn fill_pointer_and_adjustable_vectors() {
+    // make-array :fill-pointer/:adjustable ⇒ a complex vector whose LENGTH is its
+    // fill pointer; vector-push-extend grows it; vector-pop / (setf fill-pointer)
+    // shrink it; aref and (setf aref) index the storage. bliss-edt.
+    assert_eq!(
+        eval_ok(
+            "(let ((v (make-array 2 :fill-pointer 0 :adjustable t)))\
+               (vector-push-extend 10 v) (vector-push-extend 20 v)\
+               (vector-push-extend 30 v)\
+               (list (length v) (fill-pointer v) (aref v 2) v))"
+        ),
+        "(3 3 30 #(10 20 30))"
+    );
+    // vector-pop returns the top and shrinks; (setf fill-pointer) truncates.
+    assert_eq!(
+        eval_ok(
+            "(let ((v (make-array 3 :fill-pointer 3 :initial-element 7)))\
+               (list (vector-pop v) (length v) (progn (setf (fill-pointer v) 1) v)))"
+        ),
+        "(7 2 #(7))"
+    );
+    // A fill-pointer vector is a vector and an array; (setf aref) mutates it.
+    assert_eq!(
+        eval_ok(
+            "(let ((v (make-array 3 :fill-pointer 2 :initial-element 0)))\
+               (setf (aref v 1) 42)\
+               (list (vectorp v) (arrayp v) v))"
+        ),
+        "(T T #(0 42))"
+    );
+}
+
+#[test]
 fn read_and_write_sequence_builtins() {
     // READ-SEQUENCE fills a mutable sequence (string or vector) from a stream and
     // returns the stop index; WRITE-SEQUENCE writes a bounded subsequence.

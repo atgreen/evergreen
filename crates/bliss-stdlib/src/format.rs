@@ -139,6 +139,39 @@ fn heap_number_string(v: BlissVal, escapep: bool) -> Option<String> {
     }
 }
 
+/// Render a heap vector — simple-vector or complex (fill-pointer / adjustable) —
+/// as `#(e0 e1 …)`. `None` for non-vector heap objects. A complex vector shows
+/// only its active elements (0..fill-pointer).
+fn heap_vector_string(v: BlissVal, escapep: bool) -> Option<String> {
+    if !v.is_heap_object() {
+        return None;
+    }
+    if crate::pathnames::registered_string(v).is_some() || crate::pathnames::is_pathname(v) {
+        return None;
+    }
+    unsafe {
+        let ptr = v.as_ptr();
+        let (base, count) = match (*(ptr as *const ObjectHeader)).type_id() {
+            type_id::SIMPLE_VECTOR => (ptr, *(ptr.add(8) as *const u64) as usize),
+            type_id::COMPLEX_ARRAY => {
+                let storage = *(ptr.add(8) as *const BlissVal);
+                (storage.as_ptr(), crate::sequences::cvec_fill_pointer(v))
+            }
+            _ => return None,
+        };
+        let mut s = String::from("#(");
+        for i in 0..count {
+            if i > 0 {
+                s.push(' ');
+            }
+            let e = *(base.add(16 + i * 8) as *const BlissVal);
+            s.push_str(&blissval_to_print_string(e, escapep));
+        }
+        s.push(')');
+        Some(s)
+    }
+}
+
 /// Walk a cons-cell linked list and collect all car values into a Vec.
 fn cons_list_to_vec(v: BlissVal) -> Vec<BlissVal> {
     let mut result = Vec::new();
@@ -222,6 +255,10 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         // Heap-allocated numbers (bignum, ratio) render as digits, not
         // #<heap-object> (bliss-axe). Only real GC heap objects reach here now.
         if let Some(s) = heap_number_string(v, escapep) {
+            return s;
+        }
+        // Vectors (simple and complex/fill-pointer) render as #(...).
+        if let Some(s) = heap_vector_string(v, escapep) {
             return s;
         }
         return format!("#<heap-object {:?}>", v);
