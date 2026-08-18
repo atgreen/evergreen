@@ -169,7 +169,26 @@ pub fn build_simple_vector(vals: &[BlissVal]) -> BlissVal {
 }
 
 /// Build a simple-vector from a slice of BlissVals.
+///
+/// Allocated in the shared GC arena (via `alloc_typed`) so the collector traces
+/// and reclaims it — vectors used to be `Vec::forget`'d off-heap and leaked
+/// forever (bliss-18s). Body layout after the header: `[length:u64 |
+/// elements…]`, matching the historical `[header | len | bytes]` scheme the
+/// readers and the GC's SIMPLE_VECTOR tracer expect (the length is stored raw).
 fn build_vector(vals: &[BlissVal]) -> BlissVal {
+    // Body = one length word + the elements.
+    let body_size = 8 + vals.len() * 8;
+    if let Some(body) = bliss_rt::gc::alloc_typed(body_size, type_id::SIMPLE_VECTOR) {
+        unsafe {
+            *(body as *mut u64) = vals.len() as u64;
+            for (i, &v) in vals.iter().enumerate() {
+                *(body.add(8 + i * 8) as *mut u64) = v.to_raw();
+            }
+            // Value points at the object header (body − 8), like alloc_str.
+            return BlissVal::from_heap_ptr(body.sub(8));
+        }
+    }
+    // OOM fallback: a leaked block, so vector allocation never fails.
     let total_u64s = 2 + vals.len();
     let mut buf: Vec<u64> = Vec::with_capacity(total_u64s);
     let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, total_u64s as u16);
@@ -275,12 +294,26 @@ pub fn build_complex_vector(
     store.extend_from_slice(elements);
     store.resize(cap, NIL);
     let storage = build_vector(&store);
+    let fp = BlissVal::from_fixnum(fill_pointer.min(cap) as i64);
+    let adj = if adjustable { T } else { NIL };
+    // Body = [storage-ref | fill-pointer(fixnum) | adjustable(T/NIL)]; only the
+    // storage word is a heap reference (the GC's COMPLEX_ARRAY tracer visits it).
+    let body_size = 3 * 8;
+    if let Some(body) = bliss_rt::gc::alloc_typed(body_size, type_id::COMPLEX_ARRAY) {
+        unsafe {
+            *(body as *mut u64) = storage.to_raw();
+            *(body.add(8) as *mut u64) = fp.to_raw();
+            *(body.add(16) as *mut u64) = adj.to_raw();
+            return BlissVal::from_heap_ptr(body.sub(8));
+        }
+    }
+    // OOM fallback: a leaked block.
     let mut buf: Vec<u64> = Vec::with_capacity(4);
     let header = ObjectHeader::new(type_id::COMPLEX_ARRAY, 4);
     buf.push(header.0);
     buf.push(storage.to_raw());
-    buf.push(BlissVal::from_fixnum(fill_pointer.min(cap) as i64).to_raw());
-    buf.push(if adjustable { T } else { NIL }.to_raw());
+    buf.push(fp.to_raw());
+    buf.push(adj.to_raw());
     let ptr = buf.as_mut_ptr() as *mut u8;
     std::mem::forget(buf);
     unsafe { BlissVal::from_heap_ptr(ptr) }

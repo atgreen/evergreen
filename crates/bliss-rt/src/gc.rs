@@ -688,16 +688,21 @@ unsafe fn trace_object(
             visit_word(1); // imagpart
         }
 
-        // ── Simple vector: [length, elements...]; the length is a fixnum. ──
+        // ── Simple vector: [length, elements...]. `build_vector` stores the
+        //    length word RAW (a plain element count, not a fixnum-tagged value),
+        //    so read it raw here — reading it as a fixnum would under-count and
+        //    leave live elements untraced. ──
         tid::SIMPLE_VECTOR => {
-            let n = if words >= 1 {
-                word(0).as_fixnum().max(0) as usize
-            } else {
-                0
-            };
+            let n = if words >= 1 { word(0).0 as usize } else { 0 };
             for i in 0..n.min(words.saturating_sub(1)) {
                 visit_word(1 + i);
             }
+        }
+        // ── Complex (fill-pointer / adjustable) vector: [storage-ref |
+        //    fill-pointer | adjustable]. Only word 0 (the backing SIMPLE_VECTOR)
+        //    is a heap reference; the fill pointer and flag are immediates. ──
+        tid::COMPLEX_ARRAY => {
+            visit_word(0);
         }
 
         // ── Symbol: name/value/function/plist/package are references; the
