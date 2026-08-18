@@ -361,6 +361,33 @@ fn arena_str(s: &str) -> BlissVal {
     val
 }
 
+thread_local! {
+    /// Canonical package "objects": one interned string per canonical package
+    /// name, so every `find-package`/`package-name` for the same package returns
+    /// the SAME `BlissVal`. Bliss represents a package by its name string
+    /// (bliss-bhs); without this, two look-ups return distinct string objects and
+    /// `(eq (find-package :p) (find-package :p-nickname))` is NIL — which breaks
+    /// uiop's `remove-duplicates` in ensure-package, making it rename a package
+    /// off its own nickname and corrupt the package (the "UIOP/COMMON-LISP is not
+    /// of type PACKAGE" load failure). The canonical name must be passed in
+    /// (nicknames resolve to it) so a nickname look-up shares the handle.
+    static PACKAGE_HANDLES: std::cell::RefCell<std::collections::HashMap<String, BlissVal>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The canonical package value (an interned string) for `canonical_name`. Same
+/// name ⇒ same `BlissVal`, so packages compare `EQ`/`EQL` (bliss-bhs workaround).
+fn package_handle(canonical_name: &str) -> BlissVal {
+    PACKAGE_HANDLES.with(|m| {
+        if let Some(&v) = m.borrow().get(canonical_name) {
+            return v;
+        }
+        let v = arena_str(canonical_name);
+        m.borrow_mut().insert(canonical_name.to_string(), v);
+        v
+    })
+}
+
 // ── Stream designator resolution ─────────────────────────────────
 // The interpreter delegates all stream state to `bliss_stdlib::streams`
 // (a stream is a heap object with type_id STREAM). These helpers turn the
@@ -8603,7 +8630,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
                         )
                     {
-                        arena_str(&pkg_name)
+                        package_handle(&pkg_name)
                     } else {
                         NIL
                     },
