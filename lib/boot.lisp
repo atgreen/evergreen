@@ -139,9 +139,17 @@
   ;; what TYPEP/CHECK-TYPE consult. Parameterised deftypes fall back to storing
   ;; the last body form literally.
   (if lambda-list
+      ;; Parameterised deftype (e.g. alexandria's
+      ;;   (deftype array-index (&optional (length ...)) `(integer 0 (,length)))).
+      ;; Used as a bare type name it expands with every parameter defaulted, so
+      ;; evaluate the expander with no arguments to get the concrete spec. If
+      ;; the expander needs required arguments (or otherwise errors) we can't
+      ;; expand it bare, so fall back to T (match anything) rather than reject.
       `(progn
          (setq *type-definitions*
-               (cons (list ',name ',(if body (car (last body)) t))
+               (cons (list ',name
+                           (or (ignore-errors (funcall (lambda ,lambda-list ,@body)))
+                               t))
                      *type-definitions*))
          ',name)
       `(progn
@@ -875,6 +883,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun char (s i) (elt s i))
+;; SCHAR is CHAR for simple strings; (setf schar) is handled as a place. babel's
+;; string-get/string-set expand to (schar ...) / (setf (schar ...) ...).
+(defun schar (s i) (elt s i))
 (defun acons (key datum alist) (cons (cons key datum) alist))
 (defun list-length (list) (length list))
 (defun nconc (&rest lists) (apply (function append) lists))

@@ -4810,28 +4810,35 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             }
             let bounds = list_to_vec(args);
             let value = object.as_fixnum();
-            let lower_ok = bounds
-                .first()
-                .copied()
-                .map(|bound| {
-                    if bound.is_symbol() && symbol_bare_name(&sym_name(bound)) == "*" {
-                        true
-                    } else {
-                        value >= bound.as_fixnum()
+            // A bound is `*`/omitted (unbounded), an integer (inclusive), or a
+            // one-element list `(n)` (exclusive). `is_lower` picks the
+            // comparison direction. alexandria's ARRAY-INDEX is
+            // `(integer 0 (array-dimension-limit))` — an exclusive upper bound,
+            // so calling as_fixnum on the `(n)` cons used to panic.
+            let bound_ok = |bound: BlissVal, is_lower: bool| -> bool {
+                if bound.is_symbol() && symbol_bare_name(&sym_name(bound)) == "*" {
+                    return true;
+                }
+                if bound.is_cons() {
+                    let (b, _) = cp(bound);
+                    if !b.is_fixnum() {
+                        return true;
                     }
-                })
-                .unwrap_or(true);
-            let upper_ok = bounds
-                .get(1)
-                .copied()
-                .map(|bound| {
-                    if bound.is_symbol() && symbol_bare_name(&sym_name(bound)) == "*" {
-                        true
-                    } else {
-                        value <= bound.as_fixnum()
-                    }
-                })
-                .unwrap_or(true);
+                    let n = b.as_fixnum();
+                    return if is_lower { value > n } else { value < n };
+                }
+                if !bound.is_fixnum() {
+                    return true;
+                }
+                let n = bound.as_fixnum();
+                if is_lower {
+                    value >= n
+                } else {
+                    value <= n
+                }
+            };
+            let lower_ok = bounds.first().copied().map(|b| bound_ok(b, true)).unwrap_or(true);
+            let upper_ok = bounds.get(1).copied().map(|b| bound_ok(b, false)).unwrap_or(true);
             Ok(lower_ok && upper_ok)
         }
         "UNSIGNED-BYTE" | "SIGNED-BYTE" | "MOD" => {
@@ -5393,8 +5400,14 @@ fn value_satisfies_declared_type(type_form: BlissVal, value: BlissVal) -> Result
             value.is_fixnum() || value.is_single_float() || ratio_parts_val(value).is_some()
         }
         "LIST" => value.is_list(),
-        "CONS" => value.is_cons(),
-        "ATOM" => !value.is_cons(),
+        // FUNCTION must agree with FUNCTIONP/TYPEP: an interpreter closure is
+        // the cons `(BLISS::CLOSURE . id)`, so a plain `value.is_cons()` check
+        // would wrongly reject it. babel's string-to-octets funcalls through
+        // `(the function (encoder mapping))`, where the encoder is exactly such
+        // a closure.
+        "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(value),
+        "CONS" => value.is_cons() && !is_function_value(value),
+        "ATOM" => !value.is_cons() || is_function_value(value),
         other => {
             if value.is_heap_object() {
                 let header = unsafe { *(value.as_ptr() as *const ObjectHeader) };
@@ -5506,7 +5519,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (type_form, r) = cp(cdr);
                 let (val_form, _) = cp(r);
                 let value = eval_form(val_form, env)?;
-                if value_satisfies_declared_type(type_form, value)? {
+                // The quick primitive check handles the common declared types;
+                // fall back to full TYPEP so user DEFTYPEs (e.g. babel's
+                // `(the array-index ...)` → alexandria's ARRAY-INDEX) and
+                // bounded/compound specs are honoured rather than rejected.
+                if value_satisfies_declared_type(type_form, value)?
+                    || typep_matches(env, value, type_form)?
+                {
                     return Ok(value);
                 }
                 return Err(BlissError::TypeError {
@@ -10412,11 +10431,27 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             // `AS` is a standard synonym for `FOR` (CLHS 6.1.2.1).
             "FOR" | "AS" => {
                 p.advance();
+                // `for a ... and b ...` chains parallel iteration clauses that
+                // step together (babel's encoders use `for i fixnum from s
+                // below e and di fixnum from d`). We collect each into
+                // for_clauses; for the independent counters seen in practice
+                // parallel and sequential stepping coincide.
+                loop {
                 let pat = p.read_form()?;
                 // Optional `:of-type <type>` type declaration is accepted and ignored.
                 if p.at_sym("OF-TYPE") {
                     p.advance();
                     p.read_form()?;
+                } else if p.at_sym("FIXNUM")
+                    || p.at_sym("FLOAT")
+                    || p.at_sym("T")
+                    || p.at_sym("NIL")
+                {
+                    // CLHS 6.1.1.7: a bare simple-type-spec (fixnum | float |
+                    // t | nil) may follow the loop var, e.g. `for i fixnum from
+                    // 0 below n` (babel's encoders use this). Declarations have
+                    // no bearing on the tree-walker, so skip it.
+                    p.advance();
                 }
                 match p.peek_kw().as_deref() {
                     Some("IN") => {
@@ -10590,6 +10625,12 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                         };
                         for_clauses.push(ForClause::Eq { pat, init, then });
                     }
+                }
+                if p.at_kw("AND") {
+                    p.advance();
+                    continue;
+                }
+                break;
                 }
             }
             "INITIALLY" => {

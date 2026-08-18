@@ -73,3 +73,6 @@ ocicl/
 
 # compiled Bliss FASL artifacts
 *.bfasl
+
+# Local-only standing goal prompt (kept out of the repo per owner)
+GOAL.md

@@ -564,6 +564,72 @@ fn deftype_body_is_evaluated_and_skips_docstring() {
         eval_ok("(progn (deftype small () '(integer 0 9)) (list (typep 5 'small) (typep 10 'small)))"),
         "(T NIL)"
     );
+    // Parameterised deftype used bare expands with its parameters defaulted,
+    // like alexandria's ARRAY-INDEX = (integer 0 (array-dimension-limit)) — an
+    // *exclusive* upper bound.
+    assert_eq!(
+        eval_ok(
+            "(progn (deftype aidx (&optional (n 8)) `(integer 0 (,n))) \
+             (list (typep 0 'aidx) (typep 7 'aidx) (typep 8 'aidx)))"
+        ),
+        "(T T NIL)"
+    );
+}
+
+#[test]
+fn typep_integer_exclusive_bounds() {
+    // CLHS integer type: a bound of the form `(n)` is exclusive. This used to
+    // panic (as_fixnum on the `(n)` cons) — babel reaches it via ARRAY-INDEX.
+    assert_eq!(
+        eval_ok(
+            "(list (typep 4 '(integer 0 (5))) (typep 5 '(integer 0 (5))) \
+             (typep 0 '(integer (0) 5)) (typep 1 '(integer (0) 5)) \
+             (typep 3 '(integer * (5))) (typep 9 '(integer (5) *)))"
+        ),
+        "(T NIL NIL T T T)"
+    );
+}
+
+#[test]
+fn the_function_accepts_interpreter_closures() {
+    // (the function X) must agree with FUNCTIONP: an interpreter closure —
+    // including one from #'localfn (labels/flet) — is a function. babel's
+    // string-to-octets funcalls `(the function (encoder mapping))`.
+    assert_eq!(
+        eval_ok("(funcall (the function (lambda (x) (* x x))) 7)"),
+        "49"
+    );
+    assert_eq!(
+        eval_ok("(funcall (the function (labels ((f (x) (+ x 1))) (function f))) 41)"),
+        "42"
+    );
+}
+
+#[test]
+fn schar_reads_and_writes_simple_strings() {
+    // SCHAR is CHAR for simple strings; (setf (schar ...)) mutates in place.
+    // babel's string-get/string-set expand to schar.
+    assert_eq!(eval_ok("(schar \"abc\" 1)"), "#\\b");
+    assert_eq!(
+        eval_ok("(let ((s (copy-seq \"abc\"))) (setf (schar s 0) #\\X) s)"),
+        "\"Xbc\""
+    );
+}
+
+#[test]
+fn loop_for_var_with_type_spec_and_parallel_and() {
+    // `for i fixnum from ...` (a bare simple-type-spec) and `and` chaining
+    // parallel iteration clauses — both used by babel's encoder loops. The
+    // bounded clause drives termination even though the parallel one is
+    // unbounded.
+    assert_eq!(
+        eval_ok("(loop for i fixnum from 0 below 3 and di fixnum from 10 collect (list i di))"),
+        "((0 10) (1 11) (2 12))"
+    );
+    assert_eq!(
+        eval_ok("(let ((s 0)) (loop for i fixnum from 0 below 5 and d fixnum from 100 do (setf s (+ s d))) s)"),
+        "510"
+    );
 }
 
 #[test]
