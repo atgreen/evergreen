@@ -640,6 +640,37 @@ fn is_keyword_arg(val: BlissVal) -> bool {
     val.is_symbol() && sym_name(val).starts_with("KEYWORD:")
 }
 
+/// Parse trailing (already-evaluated) `:start`/`:end` keyword pairs for a bounded
+/// sequence op, clamped to `[0, len]` with `start <= end`. Defaults: start 0,
+/// end len.
+fn read_start_end_keys(kv: &[BlissVal], len: usize) -> (usize, usize) {
+    let mut start = 0usize;
+    let mut end = len;
+    let mut i = 0;
+    while i + 1 < kv.len() {
+        match symbol_bare_name(&sym_name(kv[i])).as_str() {
+            "START" if kv[i + 1].is_fixnum() => start = kv[i + 1].as_fixnum() as usize,
+            "END" if kv[i + 1].is_fixnum() => end = kv[i + 1].as_fixnum() as usize,
+            _ => {}
+        }
+        i += 2;
+    }
+    let start = start.min(len);
+    let end = end.min(len).max(start);
+    (start, end)
+}
+
+/// Destructively set element `i` of a mutable sequence, dispatching on strings
+/// (character storage via `string_set_char`) vs vectors (`set_elt`).
+fn seq_set_elt(seq: BlissVal, i: usize, val: BlissVal) -> Result<(), BlissError> {
+    if is_string_value(seq) {
+        bliss_stdlib::string_set_char(seq, i, val)?;
+        Ok(())
+    } else {
+        bliss_stdlib::set_elt(seq, i, val)
+    }
+}
+
 // ── Closure representation ───────────────────────────────────────
 #[derive(Clone)]
 struct Closure {
@@ -8570,6 +8601,73 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 env.set_mv(vec![line_val, if missing_newline { T } else { NIL }]);
                 return Ok(line_val);
             }
+            "READ-SEQUENCE" => {
+                // (read-sequence sequence stream &key start end) — destructively
+                // fill SEQUENCE from STREAM; returns the index of the first element
+                // not read into (start + number of elements actually read).
+                let args = list_to_vec(cdr);
+                if args.len() < 2 {
+                    return Err(BlissError::Internal(
+                        "READ-SEQUENCE requires a sequence and a stream".into(),
+                    ));
+                }
+                let vals: Vec<BlissVal> =
+                    args.iter().map(|a| eval_form(*a, env)).collect::<Result<_, _>>()?;
+                let seq = vals[0];
+                let inp = resolve_input_stream(vals[1], env);
+                let seq_len = bliss_stdlib::length(seq)?;
+                let (start, end) = read_start_end_keys(&vals[2..], seq_len);
+                let count = end - start;
+                let mut pos = start;
+                if is_gray_stream(inp) {
+                    for _ in 0..count {
+                        let c = invoke_generic_function("STREAM-READ-CHAR", &[inp], env)?;
+                        if c.is_nil() || c == EOF {
+                            break;
+                        }
+                        seq_set_elt(seq, pos, c)?;
+                        pos += 1;
+                    }
+                } else {
+                    for el in bliss_stdlib::stream_read_sequence(inp, count)? {
+                        seq_set_elt(seq, pos, el)?;
+                        pos += 1;
+                    }
+                }
+                return Ok(BlissVal::from_fixnum(pos as i64));
+            }
+            "WRITE-SEQUENCE" => {
+                // (write-sequence sequence stream &key start end) — write the
+                // subsequence to STREAM; returns SEQUENCE.
+                let args = list_to_vec(cdr);
+                if args.len() < 2 {
+                    return Err(BlissError::Internal(
+                        "WRITE-SEQUENCE requires a sequence and a stream".into(),
+                    ));
+                }
+                let vals: Vec<BlissVal> =
+                    args.iter().map(|a| eval_form(*a, env)).collect::<Result<_, _>>()?;
+                let seq = vals[0];
+                let out = resolve_output_stream(vals[1], env);
+                let seq_len = bliss_stdlib::length(seq)?;
+                let (start, end) = read_start_end_keys(&vals[2..], seq_len);
+                let elems: Vec<BlissVal> = (start..end)
+                    .map(|i| bliss_stdlib::elt(seq, i))
+                    .collect::<Result<_, _>>()?;
+                if is_gray_stream(out) {
+                    for el in &elems {
+                        let gf = if el.is_character() {
+                            "STREAM-WRITE-CHAR"
+                        } else {
+                            "STREAM-WRITE-BYTE"
+                        };
+                        invoke_generic_function(gf, &[out, *el], env)?;
+                    }
+                } else {
+                    bliss_stdlib::stream_write_sequence(out, &elems)?;
+                }
+                return Ok(seq);
+            }
             "WRITE-STRING" => {
                 // (write-string string &optional stream &key start end)
                 let args = list_to_vec(cdr);
@@ -13919,7 +14017,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"
             | "READ-FROM-STRING" | "FORMAT" | "PRIN1-TO-STRING" | "PRINC-TO-STRING"
             | "WRITE-TO-STRING" | "FORCE-OUTPUT" | "FINISH-OUTPUT" | "CLEAR-OUTPUT"
-            | "FILE-LENGTH"
+            | "FILE-LENGTH" | "READ-SEQUENCE" | "WRITE-SEQUENCE"
             // Misc
             | "ERROR" | "WARN" | "SIGNAL" | "CERROR" | "MAKE-CONDITION" | "MUFFLE-WARNING"
             | "INVOKE-RESTART" | "FIND-RESTART" | "COMPUTE-RESTARTS" | "ABORT" | "CONTINUE"

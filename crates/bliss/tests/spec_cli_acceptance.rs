@@ -484,6 +484,25 @@ fn write_line_and_file_length_builtins() {
 }
 
 #[test]
+fn read_and_write_sequence_builtins() {
+    // READ-SEQUENCE fills a mutable sequence (string or vector) from a stream and
+    // returns the stop index; WRITE-SEQUENCE writes a bounded subsequence.
+    assert_eq!(
+        eval_ok("(let ((b (make-string 5))) (with-input-from-string (s \"hello world\") (list (read-sequence b s) b)))"),
+        "(5 \"hello\")"
+    );
+    assert_eq!(
+        eval_ok("(with-output-to-string (s) (write-sequence \"abcdef\" s :start 1 :end 4))"),
+        "\"bcd\""
+    );
+    // Into a vector, with a short read at EOF returning the actual count.
+    assert_eq!(
+        eval_ok("(let ((b (make-array 4))) (with-input-from-string (s \"xy\") (read-sequence b s)))"),
+        "2"
+    );
+}
+
+#[test]
 fn conditions_princ_to_their_report_string() {
     // CLHS 9.1: princ/~A of a condition prints its report; ~S keeps #<TYPE …>.
     // Without a report, an UNDEFINED-FUNCTION printed as an opaque
