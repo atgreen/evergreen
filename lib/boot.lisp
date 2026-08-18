@@ -782,10 +782,13 @@
 (defun char-downcase (c) (if (upper-case-p c) (code-char (+ (char-code c) 32)) c))
 (defun alpha-char-p (c) (or (upper-case-p c) (lower-case-p c)))
 (defun digit-char-p (c &optional (radix 10))
-  (let ((code (char-code c)))
-    (if (and (>= code 48) (<= code 57))
-        (let ((d (- code 48))) (if (< d radix) d nil))
-        nil)))
+  ;; Weight of C as a digit in RADIX (0-9, then A-Z / a-z = 10-35), or NIL.
+  (let* ((code (char-code c))
+         (d (cond ((and (>= code 48) (<= code 57)) (- code 48))         ; 0-9
+                  ((and (>= code 65) (<= code 90)) (+ 10 (- code 65)))  ; A-Z
+                  ((and (>= code 97) (<= code 122)) (+ 10 (- code 97))) ; a-z
+                  (t nil))))
+    (if (and d (< d radix)) d nil)))
 (defun alphanumericp (c)
   (or (alpha-char-p c) (and (>= (char-code c) 48) (<= (char-code c) 57))))
 
