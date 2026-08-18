@@ -536,6 +536,28 @@ fn read_and_write_sequence_builtins() {
 }
 
 #[test]
+fn sharp_quote_local_flet_labels_function_is_callable() {
+    // #'localfn / (function localfn) on an flet/labels function must yield a
+    // callable value that survives the flet scope (CLHS 3.1.2.1.2.2) — e.g.
+    // passed to MAPCAR. It used to return the bare symbol, which resolved
+    // globally (undefined) once out of scope; library macros that build
+    // #'<gensym> (babel's encoders) surfaced this as "undefined function G<n>".
+    assert_eq!(
+        eval_ok("(flet ((sq (x) (* x x))) (mapcar #'sq '(1 2 3)))"),
+        "(1 4 9)"
+    );
+    assert_eq!(
+        eval_ok("(labels ((tri (x) (if (<= x 0) 0 (+ x (tri (1- x)))))) (mapcar #'tri '(1 2 3)))"),
+        "(1 3 6)"
+    );
+    // Also correct after promotion to the native tier (was a T1 crash).
+    assert_eq!(
+        eval_ok("(progn (defun fq (x) (flet ((g (y) (* y y))) (funcall #'g x))) (dotimes (i 3000) (fq 2)) (fq 9))"),
+        "81"
+    );
+}
+
+#[test]
 fn conditions_princ_to_their_report_string() {
     // CLHS 9.1: princ/~A of a condition prints its report; ~S keeps #<TYPE …>.
     // Without a report, an UNDEFINED-FUNCTION printed as an opaque

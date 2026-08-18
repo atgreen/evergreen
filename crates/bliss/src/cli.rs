@@ -6195,6 +6195,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // a symbol / `(setf f)` designator).
                 if spec.is_symbol() {
                     let n = sym_name(spec);
+                    // A local flet/labels function shadows any global; return a
+                    // closure so it survives the flet scope.
+                    if let Some(c) = local_fn_closure(env, &n) {
+                        return Ok(c);
+                    }
                     if let Some(f) = global_fn(&n) {
                         return Ok(f);
                     }
@@ -6762,6 +6767,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (name_form, _) = cp(cdr);
                 if name_form.is_symbol() {
                     let fn_name = sym_name(name_form);
+                    // A local flet/labels function shadows any global; return a
+                    // closure so it stays callable outside the flet scope.
+                    if let Some(c) = local_fn_closure(env, &fn_name) {
+                        return Ok(c);
+                    }
                     if fn_bound(env, &fn_name) {
                         return Ok(name_form); // return the symbol as a function designator
                     }
@@ -12053,6 +12063,27 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 // their names through the current environment's function table at call time,
 // LABELS-style mutual recursion works naturally, and FLET-bound functions are
 // visible only within the FLET/LABELS body.
+/// If `name` names a LOCAL `flet`/`labels` function (present in `env.funs`),
+/// build a closure over the current lexical environment and return it, so that
+/// `#'localfn` / `(function localfn)` / `(fdefinition 'localfn)` yields a value
+/// that is still callable after the `flet` scope exits — e.g. passed to MAPCAR
+/// or stored. Returning the bare symbol (as the code used to) lost the local
+/// binding, so a later `funcall` resolved the name globally and failed with
+/// "undefined function" (notably `#'<gensym>` from library macros — babel's
+/// encoders). Returns `None` for non-local names.
+fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
+    let (params_form, body) = env.funs.get(name).map(|f| (f.params_form, f.body))?;
+    let closure = Closure {
+        params_form,
+        body,
+        captured_frame: Rc::clone(&env.frame),
+    };
+    let id = next_closure_id();
+    env.closures.borrow_mut().insert(id, closure);
+    let closure_sym = resolve_sym("BLISS::CLOSURE").unwrap_or(NIL);
+    Some(arena_cons(closure_sym, BlissVal::from_fixnum(id as i64)))
+}
+
 fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (defs_form, body) = cp(cdr);
     let mut child_env = env.child();

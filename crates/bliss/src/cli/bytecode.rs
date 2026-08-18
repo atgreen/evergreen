@@ -2390,6 +2390,20 @@ impl<'e> Lowerer<'e> {
             }
         }
 
+        // If any local function is referenced as a VALUE (`#'localfn`) — in the
+        // body or in a sibling's body (mutual `labels`) — bail to the tree-walker,
+        // which returns a proper closure for it. The bytecode backend only knows
+        // how to CALL a lowered local function, not to yield it as a value.
+        let local_names: std::collections::HashSet<String> =
+            parsed.iter().map(|(n, _, _, _)| n.clone()).collect();
+        if references_local_fn_value(body, &local_names)
+            || parsed
+                .iter()
+                .any(|(_, _, _, fbody)| references_local_fn_value(*fbody, &local_names))
+        {
+            return Err(Bail);
+        }
+
         let saved_local_fns = self.local_fns.clone();
 
         // LABELS bodies see all siblings + self; FLET bodies do not.
@@ -2480,6 +2494,25 @@ fn collect_symbol_names(form: BlissVal, out: &mut std::collections::HashSet<Stri
         collect_symbol_names(car, out);
         collect_symbol_names(cdr, out);
     }
+}
+
+/// True if `form` references one of `names` as a *function value* via
+/// `(function name)` / `#'name` anywhere within it. The bytecode backend lowers
+/// a local `flet`/`labels` function to a `CallNamed` on a private gensym and has
+/// no way to hand back a callable *value* for it, so a form that takes `#'localfn`
+/// must bail to the tree-walker (which closes over it correctly).
+fn references_local_fn_value(form: BlissVal, names: &std::collections::HashSet<String>) -> bool {
+    if !form.is_cons() {
+        return false;
+    }
+    let (head, rest) = cp(form);
+    if head.is_symbol() && sym_name(head) == "FUNCTION" && rest.is_cons() {
+        let (arg, _) = cp(rest);
+        if arg.is_symbol() && names.contains(&sym_name(arg)) {
+            return true;
+        }
+    }
+    references_local_fn_value(head, names) || references_local_fn_value(rest, names)
 }
 
 /// Extract `(name init)` from a `let` binding, which may also be a bare symbol.
