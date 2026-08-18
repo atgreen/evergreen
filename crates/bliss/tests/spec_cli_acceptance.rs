@@ -536,6 +536,14 @@ fn read_and_write_sequence_builtins() {
 }
 
 #[test]
+fn constantp_recognizes_constant_forms() {
+    assert_eq!(
+        eval_ok("(list (constantp 5) (constantp :k) (constantp t) (constantp nil) (constantp '(quote x)) (constantp 'foo) (constantp '(+ 1 2)))"),
+        "(T T T T T NIL NIL)"
+    );
+}
+
+#[test]
 fn setf_writer_function_is_global_across_scopes() {
     // A top-level (defun (setf place) …) is a GLOBAL definition: `(setf (place …)
     // v)` must find it from any scope, including inside another function defined

@@ -6194,6 +6194,27 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 return Ok(if is_keyword_arg(v) { T } else { NIL });
             }
+            "CONSTANTP" => {
+                // (constantp form &optional environment) — T if FORM always
+                // evaluates to the same value: a self-evaluating object, a
+                // constant variable (keyword / T / NIL), or a (quote …) form.
+                // Conservative for other symbols/compound forms (NIL).
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                let is_const = if v.is_nil() || v == T {
+                    true
+                } else if v.is_cons() {
+                    let (h, _) = cp(v);
+                    h.is_symbol() && symbol_bare_name(&sym_name(h)) == "QUOTE"
+                } else if v.is_symbol() {
+                    is_keyword_arg(v)
+                } else {
+                    // Numbers, characters, strings, and other self-evaluating
+                    // heap atoms are constant.
+                    true
+                };
+                return Ok(if is_const { T } else { NIL });
+            }
             "DOCUMENTATION" => {
                 // (documentation object &optional doc-type) — the interpreter
                 // does not retain documentation strings; always NIL. Arguments
@@ -14159,7 +14180,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "STRINGP" | "CHAR-NAME" | "NAME-CHAR" | "PARSE-INTEGER" | "MAKE-STRING"
             | "STRING-TO-LIST"
             // Symbols / packages
-            | "SYMBOLP" | "KEYWORDP" | "SYMBOL-NAME" | "SYMBOL-VALUE" | "SYMBOL-FUNCTION"
+            | "SYMBOLP" | "KEYWORDP" | "CONSTANTP" | "SYMBOL-NAME" | "SYMBOL-VALUE"
+            | "SYMBOL-FUNCTION"
             | "SYMBOL-PACKAGE" | "SYMBOL-PLIST" | "MAKE-SYMBOL" | "GENSYM" | "GENTEMP"
             | "INTERN" | "FIND-SYMBOL" | "FIND-PACKAGE" | "PACKAGE-NAME" | "PACKAGEP"
             | "BOUNDP" | "FBOUNDP" | "FDEFINITION" | "MAKUNBOUND" | "FMAKUNBOUND"
