@@ -226,6 +226,12 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         }
         return format!("#<heap-object {:?}>", v);
     }
+    // A non-heap opaque value (e.g. a first-class package object, a meta-handle):
+    // let the interpreter's print hook name it (#<PACKAGE …>) before the generic
+    // fallback (bliss-bhs).
+    if let Some(s) = dispatch_print_object(v, escapep) {
+        return s;
+    }
     format!("#<object {:?}>", v)
 }
 

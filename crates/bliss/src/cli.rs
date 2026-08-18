@@ -361,31 +361,63 @@ fn arena_str(s: &str) -> BlissVal {
     val
 }
 
+// ── First-class PACKAGE objects (bliss-bhs) ──────────────────────────
+//
+// A package is a distinct CL type, not a string (CLHS 11.1). Bliss represents a
+// package OBJECT as a `SPECIAL`-tagged meta-handle carrying an opaque id, interned
+// one-per-canonical-name so `(eq (find-package :p) (find-package :nickname))` is T
+// and `(typep p 'package)` is true while `(typep "P" 'package)` is NIL.
+//
+// The meta-handle id space is shared (fragilely) with CLOS/macro/class handles,
+// each discriminated by its own registry. Package ids are drawn from a reserved
+// HIGH base so they can never coincide with those low-range counters, and are
+// additionally tracked in `PACKAGE_ID_TO_NAME`, so a non-package handle is never
+// misidentified as a package and vice-versa.
+const PACKAGE_ID_BASE: i64 = 1 << 40;
+
 thread_local! {
-    /// Canonical package "objects": one interned string per canonical package
-    /// name, so every `find-package`/`package-name` for the same package returns
-    /// the SAME `BlissVal`. Bliss represents a package by its name string
-    /// (bliss-bhs); without this, two look-ups return distinct string objects and
-    /// `(eq (find-package :p) (find-package :p-nickname))` is NIL — which breaks
-    /// uiop's `remove-duplicates` in ensure-package, making it rename a package
-    /// off its own nickname and corrupt the package (the "UIOP/COMMON-LISP is not
-    /// of type PACKAGE" load failure). The canonical name must be passed in
-    /// (nicknames resolve to it) so a nickname look-up shares the handle.
-    static PACKAGE_HANDLES: std::cell::RefCell<std::collections::HashMap<String, BlissVal>> =
+    /// Canonical package name → its interned package object.
+    static PACKAGE_OBJECTS: std::cell::RefCell<std::collections::HashMap<String, BlissVal>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Package handle id → canonical name (reverse lookup + `packagep`/`typep`
+    /// discrimination against other meta-handles).
+    static PACKAGE_ID_TO_NAME: std::cell::RefCell<std::collections::HashMap<i64, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static NEXT_PACKAGE_OBJECT_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(PACKAGE_ID_BASE) };
 }
 
-/// The canonical package value (an interned string) for `canonical_name`. Same
-/// name ⇒ same `BlissVal`, so packages compare `EQ`/`EQL` (bliss-bhs workaround).
-fn package_handle(canonical_name: &str) -> BlissVal {
-    PACKAGE_HANDLES.with(|m| {
+/// The canonical package object for `canonical_name` (nicknames must be resolved
+/// first). Interned: same name ⇒ same `BlissVal`.
+fn package_object(canonical_name: &str) -> BlissVal {
+    PACKAGE_OBJECTS.with(|m| {
         if let Some(&v) = m.borrow().get(canonical_name) {
             return v;
         }
-        let v = arena_str(canonical_name);
+        let id = NEXT_PACKAGE_OBJECT_ID.with(|c| {
+            let id = c.get();
+            c.set(id + 1);
+            id
+        });
+        let v = BlissVal::from_meta_handle(id);
         m.borrow_mut().insert(canonical_name.to_string(), v);
+        PACKAGE_ID_TO_NAME.with(|r| r.borrow_mut().insert(id, canonical_name.to_string()));
         v
     })
+}
+
+/// True if `v` is a first-class package object (a meta-handle in the package id
+/// registry) — the `packagep`/`typep 'package` predicate.
+fn is_package_object(v: BlissVal) -> bool {
+    v.is_meta_handle()
+        && PACKAGE_ID_TO_NAME.with(|r| r.borrow().contains_key(&v.as_meta_handle_id()))
+}
+
+/// The canonical name of a package object, or `None` if `v` is not one.
+fn package_object_name(v: BlissVal) -> Option<String> {
+    if !v.is_meta_handle() {
+        return None;
+    }
+    PACKAGE_ID_TO_NAME.with(|r| r.borrow().get(&v.as_meta_handle_id()).cloned())
 }
 
 // ── Stream designator resolution ─────────────────────────────────
@@ -2306,7 +2338,7 @@ impl Env {
             }
         }
         env.define_local("*MODULES*", NIL); // names of REQUIRE'd/PROVIDE'd modules
-        env.define_local("*PACKAGE*", arena_str("COMMON-LISP-USER"));
+        env.define_local("*PACKAGE*", package_object("COMMON-LISP-USER"));
         env.seed_standard_constant(
             "MOST-POSITIVE-FIXNUM",
             BlissVal::from_fixnum((1_i64 << 60) - 1),
@@ -2731,6 +2763,11 @@ fn print_val(val: BlissVal, out: &mut String) {
         out.push('T');
     } else if val == EOF {
         out.push_str("#<EOF>");
+    } else if let Some(name) = package_object_name(val) {
+        // A first-class package object (bliss-bhs) prints as #<PACKAGE name>.
+        out.push_str("#<PACKAGE ");
+        out.push_str(&name);
+        out.push('>');
     } else if bliss_stdlib::is_instance(val) {
         // A user-defined `print-object` method wins when one applies (and a print
         // env is parked); otherwise CLOS instances are opaque handles printed as
@@ -3429,6 +3466,9 @@ fn dispatch_print_object(val: BlissVal, escape: bool) -> Option<String> {
 /// `print-object` methods too. Delegates to [`dispatch_print_object`], which
 /// requires a print env to be parked (the FORMAT builtin parks it).
 fn stdlib_print_object_hook(val: BlissVal, escape: bool) -> Option<String> {
+    if let Some(name) = package_object_name(val) {
+        return Some(format!("#<PACKAGE {name}>"));
+    }
     dispatch_print_object(val, escape)
 }
 
@@ -4413,16 +4453,10 @@ fn condition_matches_handler(env: &Env, condition: BlissVal, handler_type: &str)
     condition_type_matches(env, &signaled_type, handler_type)
 }
 
-fn is_package_value(env: &Env, value: BlissVal) -> bool {
-    if !is_string_value(value) {
-        return false;
-    }
-    let pkg_name = normalize_package_name(&val_as_str(value));
-    env.packages.borrow().contains_key(&pkg_name)
-        || matches!(
-            pkg_name.as_str(),
-            "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD" | "BLISS-EXT"
-        )
+fn is_package_value(_env: &Env, value: BlissVal) -> bool {
+    // `packagep` / `typep 'package`: strictly a first-class package object
+    // (bliss-bhs, CLHS 11.1). A package NAME string is a STRING, not a PACKAGE.
+    is_package_object(value)
 }
 
 /// The chain of built-in supertypes for a type name (including the type itself),
@@ -4893,7 +4927,7 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
     })();
     if env.current_package != saved_package {
         env.current_package = saved_package.clone();
-        env.define_local("*PACKAGE*", arena_str(&saved_package));
+        env.define_local("*PACKAGE*", package_object(&saved_package));
     }
     // Restore *LOAD-PATHNAME*/*LOAD-TRUENAME* to the caller's binding (NIL at the
     // top level), so a load doesn't leak its file into the enclosing context.
@@ -8279,7 +8313,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let image = build_bfasl_from_source(&source, &src_path, env);
                 if env.current_package != saved_package {
                     env.current_package = saved_package.clone();
-                    env.define_local("*PACKAGE*", arena_str(&saved_package));
+                    env.define_local("*PACKAGE*", package_object(&saved_package));
                 }
                 // Create the output directory if needed. ASDF's output-translations
                 // route fasls into a per-implementation cache tree whose directories
@@ -8565,7 +8599,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .trim_start_matches(':')
                     .to_uppercase();
                 env.current_package = pkg_name;
-                env.define_local("*PACKAGE*", arena_str(&env.current_package));
+                env.define_local("*PACKAGE*", package_object(&env.current_package));
                 return Ok(T);
             }
             "MAKE-PACKAGE" => {
@@ -8614,7 +8648,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         }
                     }
                 }
-                return Ok(arena_str(&pkg_name));
+                return Ok(package_object(&pkg_name));
             }
             "FIND-PACKAGE" => {
                 let args = list_to_vec(cdr);
@@ -8630,7 +8664,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD"
                         )
                     {
-                        package_handle(&pkg_name)
+                        package_object(&pkg_name)
                     } else {
                         NIL
                     },
@@ -8695,7 +8729,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .map(|pkg| {
                         pkg.uses
                             .iter()
-                            .map(|name| arena_str(name))
+                            .map(|name| package_object(name))
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
@@ -8705,7 +8739,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let packages = env
                     .packages
                     .borrow().keys()
-                    .map(|name| arena_str(name))
+                    .map(|name| package_object(name))
                     .collect::<Vec<_>>();
                 return Ok(vec_to_list(&packages));
             }
@@ -8772,7 +8806,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     env.packages.borrow_mut().insert(new_name.clone(), pkg);
                 }
                 reader::register_package(&new_name);
-                return Ok(arena_str(&new_name));
+                return Ok(package_object(&new_name));
             }
             "DELETE-PACKAGE" => {
                 let args = list_to_vec(cdr);
@@ -8941,7 +8975,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     Some("COMMON-LISP".to_string())
                 };
-                return Ok(package.map(|pkg| arena_str(&pkg)).unwrap_or(NIL));
+                return Ok(package
+                    .map(|pkg| package_object(&resolve_package_name(env, &pkg)))
+                    .unwrap_or(NIL));
             }
             "GENSYM" => {
                 thread_local! { static COUNTER: RefCell<u64> = const { RefCell::new(0) }; }
@@ -14508,7 +14544,8 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         }
     }
 
-    Ok(T)
+    // DEFPACKAGE returns the package object (CLHS), not T (bliss-bhs).
+    Ok(package_object(&pkg_name))
 }
 
 // ── FORMAT ───────────────────────────────────────────────────────
@@ -14534,6 +14571,12 @@ fn eval_format(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 }
 
 fn val_as_str(val: BlissVal) -> String {
+    // A package object stringifies to its name, so the many package builtins that
+    // resolve a designator via `val_as_str` accept a package object transparently
+    // (bliss-bhs).
+    if let Some(name) = package_object_name(val) {
+        return name;
+    }
     if let Some(s) = bliss_stdlib::registered_string(val) {
         return s;
     }
