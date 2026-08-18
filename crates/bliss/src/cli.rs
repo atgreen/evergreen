@@ -1513,10 +1513,13 @@ fn resolve_slot_symbol(
     if let Some(slot) = lookup_slot_by_initarg(env, class_name, &key_name) {
         return Ok(resolve_sym(&slot.name).unwrap_or(NIL));
     }
-    Err(BlissError::Internal(format!(
-        "Unknown initarg :{} for class {}",
-        key_name, class_name
-    )))
+    // An initarg that matches no slot :initarg is still valid if an applicable
+    // INITIALIZE-INSTANCE / SHARED-INITIALIZE method declares it as a &key
+    // parameter (CLHS 7.1.2) — e.g. babel's CHARACTER-ENCODING consumes
+    // :literal-char-code-limit that way. Pass it through as its bare-named symbol
+    // rather than erroring: slot-filling skips it (no matching slot) while the
+    // aux-method &key binding still receives it by name.
+    Ok(resolve_sym(&key_name).unwrap_or(key))
 }
 
 fn class_name_for_instance_class(class: BlissVal) -> String {

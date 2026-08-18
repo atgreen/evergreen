@@ -536,6 +536,24 @@ fn read_and_write_sequence_builtins() {
 }
 
 #[test]
+fn initarg_from_initialize_instance_key_is_valid() {
+    // CLHS 7.1.2: an initarg that matches no slot :initarg is still valid if an
+    // applicable INITIALIZE-INSTANCE/SHARED-INITIALIZE method declares it as a
+    // &key. bliss used to reject it ("Unknown initarg") — babel's
+    // CHARACTER-ENCODING consumes :literal-char-code-limit exactly this way.
+    assert_eq!(
+        eval_ok(
+            "(progn \
+               (defclass c () ((x :initarg :x :reader cx))) \
+               (defmethod initialize-instance :after ((o c) &key extra) \
+                 (when extra (setf (slot-value o 'x) (+ (slot-value o 'x) extra)))) \
+               (cx (make-instance 'c :x 1 :extra 41)))"
+        ),
+        "42"
+    );
+}
+
+#[test]
 fn sharp_quote_local_flet_labels_function_is_callable() {
     // #'localfn / (function localfn) on an flet/labels function must yield a
     // callable value that survives the flet scope (CLHS 3.1.2.1.2.2) — e.g.
