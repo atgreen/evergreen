@@ -536,6 +536,26 @@ fn read_and_write_sequence_builtins() {
 }
 
 #[test]
+fn equalp_compares_vectors_strings_chars_numbers() {
+    // EQUALP (unlike EQUAL) compares vectors element-wise, strings/chars
+    // case-insensitively, and numbers across types. babel's define-constant
+    // tables rely on this. EQUAL must stay case- and type-sensitive.
+    assert_eq!(
+        eval_ok("(list (equalp #(1 2 3) #(1 2 3)) (equalp #(1 2) #(1 2 3)) (equalp \"ab\" \"AB\") (equalp #\\a #\\A) (equalp 1 1.0) (equalp '(1 #(2 3)) '(1 #(2 3))))"),
+        "(T NIL T T T T)"
+    );
+    assert_eq!(
+        eval_ok("(list (equal #(1 2 3) #(1 2 3)) (equal \"ab\" \"AB\"))"),
+        "(NIL NIL)"
+    );
+    // Hash tables: same test, count, and EQUALP values.
+    assert_eq!(
+        eval_ok("(let ((a (make-hash-table)) (b (make-hash-table)) (c (make-hash-table))) (setf (gethash 1 a) :x (gethash 1 b) :x (gethash 1 c) :y) (list (equalp a b) (equalp a c)))"),
+        "(T NIL)"
+    );
+}
+
+#[test]
 fn constantp_recognizes_constant_forms() {
     assert_eq!(
         eval_ok("(list (constantp 5) (constantp :k) (constantp t) (constantp nil) (constantp '(quote x)) (constantp 'foo) (constantp '(+ 1 2)))"),

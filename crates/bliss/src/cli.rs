@@ -3221,6 +3221,14 @@ fn is_vector_value(v: BlissVal) -> bool {
     bliss_rt::types::vectorp(v)
 }
 
+/// Sentinel-safe HASH-TABLE-P.
+fn is_hash_table_value(v: BlissVal) -> bool {
+    if !v.is_heap_object() || is_registry_sentinel(v) {
+        return false;
+    }
+    unsafe { (*(v.as_ptr() as *const ObjectHeader)).type_id() == type_id::HASH_TABLE }
+}
+
 /// Sentinel-safe SIMPLE-VECTOR-P (excludes strings and sentinels).
 fn is_simple_vector_value(v: BlissVal) -> bool {
     if is_string_value(v) || is_registry_sentinel(v) {
@@ -6358,7 +6366,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (bf, _) = cp(r);
                 let a = eval_form(af, env)?;
                 let b = eval_form(bf, env)?;
-                return Ok(if vals_equal(a, b) { T } else { NIL });
+                let eq = if name == "EQUALP" {
+                    vals_equalp(a, b)
+                } else {
+                    vals_equal(a, b)
+                };
+                return Ok(if eq { T } else { NIL });
             }
             "=" => {
                 let (af, r) = cp(cdr);
@@ -15041,6 +15054,67 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
         let (a_car, a_cdr) = cp(a);
         let (b_car, b_cdr) = cp(b);
         return vals_equal(a_car, b_car) && vals_equal(a_cdr, b_cdr);
+    }
+    false
+}
+
+/// CL `EQUALP`: like `EQUAL` but numbers compare by value across types
+/// (`1` equalp `1.0`), characters and strings compare case-insensitively, and
+/// vectors/arrays compare element-wise (same length, elements `EQUALP`).
+fn vals_equalp(a: BlissVal, b: BlissVal) -> bool {
+    if a == b {
+        return true;
+    }
+    if is_number_value(a) && is_number_value(b) {
+        return numeric_cmp(a, b)
+            .map(|o| o == Ordering::Equal)
+            .unwrap_or(false);
+    }
+    if a.is_character() && b.is_character() {
+        return a.as_char().eq_ignore_ascii_case(&b.as_char());
+    }
+    if is_string_value(a) && is_string_value(b) {
+        return val_as_str(a).eq_ignore_ascii_case(&val_as_str(b));
+    }
+    if a.is_cons() && b.is_cons() {
+        let (ac, ad) = cp(a);
+        let (bc, bd) = cp(b);
+        return vals_equalp(ac, bc) && vals_equalp(ad, bd);
+    }
+    // Hash tables: same test, same count, and every entry's value EQUALP.
+    if is_hash_table_value(a) && is_hash_table_value(b) {
+        let counts_match = matches!(
+            (bliss_stdlib::hash_table_count(a), bliss_stdlib::hash_table_count(b)),
+            (Ok(x), Ok(y)) if x == y
+        );
+        let tests_match = matches!(
+            (bliss_stdlib::hash_table_test(a), bliss_stdlib::hash_table_test(b)),
+            (Ok(x), Ok(y)) if x == y
+        );
+        if !counts_match || !tests_match {
+            return false;
+        }
+        return match bliss_stdlib::hash_table_entries(a) {
+            Ok(entries) => entries.into_iter().all(|(k, va)| {
+                matches!(bliss_stdlib::gethash(k, b, NIL), Ok((vb, true)) if vals_equalp(va, vb))
+            }),
+            Err(_) => false,
+        };
+    }
+    // Vectors / arrays (simple and fill-pointer): same length, EQUALP elements.
+    if is_vector_value(a) && is_vector_value(b) && !is_string_value(a) && !is_string_value(b) {
+        let la = bliss_stdlib::length(a).unwrap_or(usize::MAX);
+        let lb = bliss_stdlib::length(b).unwrap_or(usize::MAX);
+        if la == usize::MAX || la != lb {
+            return false;
+        }
+        for i in 0..la {
+            match (bliss_stdlib::elt(a, i), bliss_stdlib::elt(b, i)) {
+                (Ok(x), Ok(y)) if vals_equalp(x, y) => {}
+                _ => return false,
+            }
+        }
+        return true;
     }
     false
 }
