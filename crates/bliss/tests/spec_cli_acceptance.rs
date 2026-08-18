@@ -536,6 +536,16 @@ fn read_and_write_sequence_builtins() {
 }
 
 #[test]
+fn typep_keyword() {
+    // TYPEP had no KEYWORD case, so (typep :any 'keyword) was NIL despite
+    // KEYWORDP being T — babel type-checks encoding names as keywords.
+    assert_eq!(
+        eval_ok("(list (typep :utf-16 'keyword) (typep :foo 'keyword) (typep 'foo 'keyword) (typep 5 'keyword))"),
+        "(T T NIL NIL)"
+    );
+}
+
+#[test]
 fn equalp_compares_vectors_strings_chars_numbers() {
     // EQUALP (unlike EQUAL) compares vectors element-wise, strings/chars
     // case-insensitively, and numbers across types. babel's define-constant

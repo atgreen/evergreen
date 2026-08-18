@@ -4702,6 +4702,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "LIST" => object.is_list(),
             "CONS" => object.is_cons(),
             "SYMBOL" => object.is_symbol(),
+            "KEYWORD" => is_keyword_arg(object),
             "STRING" | "SIMPLE-STRING" | "BASE-STRING" => is_string_value(object),
             "NUMBER" | "REAL" => object.is_fixnum() || object.is_single_float(),
             "INTEGER" | "FIXNUM" | "BIGNUM" | "RATIONAL" => object.is_fixnum(),
