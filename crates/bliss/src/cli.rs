@@ -7210,6 +7210,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let n = bliss_stdlib::hash_table_count(tbl)?;
                 return Ok(BlissVal::from_fixnum(n as i64));
             }
+            "HASH-TABLE-P" => {
+                let (tbl_form, _) = cp(cdr);
+                let tbl = eval_form(tbl_form, env)?;
+                return Ok(if is_hash_table_value(tbl) { T } else { NIL });
+            }
+            "HASH-TABLE-KEYS" | "HASH-TABLE-VALUES" => {
+                // alexandria's HASH-TABLE-KEYS/VALUES (used pervasively — babel's
+                // instantiate-concrete-mappings iterates the encoding keys). These
+                // were listed as builtins but never dispatched (undefined at call).
+                let (tbl_form, _) = cp(cdr);
+                let tbl = eval_form(tbl_form, env)?;
+                let entries = bliss_stdlib::hash_table_entries(tbl)?;
+                let items: Vec<BlissVal> = if name == "HASH-TABLE-KEYS" {
+                    entries.into_iter().map(|(k, _)| k).collect()
+                } else {
+                    entries.into_iter().map(|(_, v)| v).collect()
+                };
+                return Ok(vec_to_list(&items));
+            }
             "MAPHASH" => {
                 // (maphash function hash-table): call FUNCTION on each key/value
                 // pair through the unified function protocol (bliss-jtc.8) — any
