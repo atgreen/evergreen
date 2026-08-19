@@ -7,9 +7,62 @@ use bliss_rt::error::BlissError;
 use bliss_rt::value::BlissVal;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
+
+// Package/symbol tables are keyed by internal package ids and interned symbol
+// names (never adversarial input), and `package_name`/`find-symbol` are among
+// the hottest functions in an asdf:load-system profile. The std default
+// `RandomState` (SipHash) both dominated that profile and made iteration order
+// nondeterministic per process. Use a small FxHash-style multiplicative hasher:
+// far cheaper, and deterministic (a fixed seed) — which also removes the
+// run-to-run nondeterminism that made babel loads flaky (bliss-nad).
+#[derive(Default)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, i: u64) {
+        const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(K);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while bytes.len() >= 8 {
+            self.add(u64::from_le_bytes(bytes[..8].try_into().unwrap()));
+            bytes = &bytes[8..];
+        }
+        for &b in bytes {
+            self.add(b as u64);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type FxBuild = BuildHasherDefault<FxHasher>;
+type HashMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
+type HashSet<T> = std::collections::HashSet<T, FxBuild>;
 
 // ── Internal package data ─────────────────────────────────────────
 
@@ -46,8 +99,8 @@ struct PackageStore {
 impl PackageStore {
     fn new() -> Self {
         Self {
-            packages: HashMap::new(),
-            name_index: HashMap::new(),
+            packages: HashMap::default(),
+            name_index: HashMap::default(),
         }
     }
 }
@@ -68,10 +121,10 @@ impl Package {
         Self {
             name: name.to_string(),
             nicknames: Vec::new(),
-            local_nicknames: HashMap::new(),
-            internal_symbols: HashMap::new(),
-            external_symbols: HashMap::new(),
-            shadowing_symbols: HashSet::new(),
+            local_nicknames: HashMap::default(),
+            internal_symbols: HashMap::default(),
+            external_symbols: HashMap::default(),
+            shadowing_symbols: HashSet::default(),
             use_list: Vec::new(),
         }
     }
