@@ -274,6 +274,9 @@ impl Arena {
     }
 
     fn alloc_cons(&mut self, car: BlissVal, cdr: BlissVal) -> BlissVal {
+        let roots = bliss_rt::ShadowRootScope::new();
+        let car = roots.root(car);
+        let cdr = roots.root(cdr);
         // Primary path (bliss-jtc.1): allocate the cons on the shared GC heap so
         // it uses the same layout as compiled code and is visible to heap walking.
         // A headered GC object; the body (car@0, cdr@8) is what `from_cons_ptr`
@@ -281,8 +284,8 @@ impl Arena {
         if let Some(body) = bliss_rt::gc::alloc_typed(16, type_id::CONS) {
             unsafe {
                 let cell = body as *mut ConsCell;
-                (*cell).car = car;
-                (*cell).cdr = cdr;
+                (*cell).car = car.get();
+                (*cell).cdr = cdr.get();
                 return BlissVal::from_cons_ptr(body);
             }
         }
@@ -294,8 +297,8 @@ impl Arena {
                 std::alloc::handle_alloc_error(layout);
             }
             let cell = ptr as *mut ConsCell;
-            (*cell).car = car;
-            (*cell).cdr = cdr;
+            (*cell).car = car.get();
+            (*cell).cdr = cdr.get();
             self.blocks.push((ptr, layout));
             BlissVal::from_cons_ptr(ptr)
         }
@@ -3494,11 +3497,13 @@ fn list_to_vec(val: BlissVal) -> Vec<BlissVal> {
 }
 
 fn vec_to_list(elems: &[BlissVal]) -> BlissVal {
-    let mut result = NIL;
+    let roots = bliss_rt::ShadowRootScope::new();
+    let elems = roots.root_values(elems.iter().copied());
+    let result = roots.root(NIL);
     for e in elems.iter().rev() {
-        result = arena_cons(*e, result);
+        result.set(arena_cons(e.get(), result.get()));
     }
-    result
+    result.get()
 }
 
 fn format_body_forms(forms: BlissVal) -> String {
@@ -5472,6 +5477,9 @@ fn read_eval_all(source: &str) -> Result<BlissVal, BlissError> {
 }
 
 fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let roots = bliss_rt::ShadowRootScope::new();
+    let form = roots.root(form);
+    let form = form.get();
     if form.is_nil() || form == T {
         return Ok(form);
     }
@@ -5772,6 +5780,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
 
         match name.as_str() {
+            #[cfg(test)]
+            "%FORCE-MINOR-GC-FOR-TEST" => {
+                bliss_rt::collect_t0_minor()?;
+                return Ok(NIL);
+            }
             "QUOTE" => {
                 let (q, _) = cp(cdr);
                 return Ok(q);
@@ -6384,18 +6397,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "CONS" => {
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let a = roots.root(eval_form(af, env)?);
                 let b = eval_form(bf, env)?;
-                return Ok(arena_cons(a, b));
+                return Ok(arena_cons(a.get(), b));
             }
             "LIST" => {
+                let roots = bliss_rt::ShadowRootScope::new();
+                let forms = roots.root(cdr);
                 let mut elems = Vec::new();
-                let mut c = cdr;
-                while c.is_cons() {
-                    let (ef, r) = cp(c);
-                    elems.push(eval_form(ef, env)?);
-                    c = r;
+                while forms.get().is_cons() {
+                    let (ef, r) = cp(forms.get());
+                    let rest = roots.root(r);
+                    elems.push(roots.root(eval_form(ef, env)?));
+                    forms.set(rest.get());
                 }
+                let elems: Vec<BlissVal> = elems.iter().map(|value| value.get()).collect();
                 return Ok(vec_to_list(&elems));
             }
             "CAR" | "FIRST" => {
@@ -6652,45 +6669,50 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "TYPEP" => {
                 let (obj_form, r) = cp(cdr);
                 let (type_form, _) = cp(r);
-                let obj = eval_form(obj_form, env)?;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let obj = roots.root(eval_form(obj_form, env)?);
                 let raw_type_spec = eval_form(type_form, env)?;
-                let matches = typep_matches(env, obj, raw_type_spec)?;
+                let matches = typep_matches(env, obj.get(), raw_type_spec)?;
                 return Ok(if matches { T } else { NIL });
             }
             "EQ" => {
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let a = roots.root(eval_form(af, env)?);
                 let b = eval_form(bf, env)?;
-                return Ok(if a == b { T } else { NIL });
+                return Ok(if a.get() == b { T } else { NIL });
             }
             "EQL" => {
                 // EQL value-compares numbers of the same type, so two distinct
                 // heap bignums/ratios with equal value are EQL (bliss-jtc.5).
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let a = roots.root(eval_form(af, env)?);
                 let b = eval_form(bf, env)?;
-                return Ok(if eql_values(a, b) { T } else { NIL });
+                return Ok(if eql_values(a.get(), b) { T } else { NIL });
             }
             "EQUAL" | "EQUALP" => {
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let a = roots.root(eval_form(af, env)?);
                 let b = eval_form(bf, env)?;
                 let eq = if name == "EQUALP" {
-                    vals_equalp(a, b)
+                    vals_equalp(a.get(), b)
                 } else {
-                    vals_equal(a, b)
+                    vals_equal(a.get(), b)
                 };
                 return Ok(if eq { T } else { NIL });
             }
             "=" => {
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let a = roots.root(eval_form(af, env)?);
                 let b = eval_form(bf, env)?;
-                return Ok(if numeric_cmp(a, b)? == Ordering::Equal {
+                return Ok(if numeric_cmp(a.get(), b)? == Ordering::Equal {
                     T
                 } else {
                     NIL
@@ -6711,9 +6733,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "/=" => {
                 let (af, r) = cp(cdr);
                 let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let a = roots.root(eval_form(af, env)?);
                 let b = eval_form(bf, env)?;
-                return Ok(if numeric_cmp(a, b)? != Ordering::Equal {
+                return Ok(if numeric_cmp(a.get(), b)? != Ordering::Equal {
                     T
                 } else {
                     NIL
@@ -6789,13 +6812,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(NIL);
             }
             "VALUES" => {
-                let mut vals = Vec::new();
-                let mut c = cdr;
-                while c.is_cons() {
-                    let (af, r) = cp(c);
-                    vals.push(eval_form(af, env)?);
-                    c = r;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let remaining = roots.root(cdr);
+                let mut rooted_vals = Vec::new();
+                while remaining.get().is_cons() {
+                    let (af, rest) = cp(remaining.get());
+                    let rest = roots.root(rest);
+                    rooted_vals.push(roots.root(eval_form(af, env)?));
+                    remaining.set(rest.get());
                 }
+                let vals: Vec<_> = rooted_vals.iter().map(|value| value.get()).collect();
                 if vals.is_empty() {
                     env.set_mv(Vec::new());
                     return Ok(NIL);
@@ -9922,13 +9948,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         // Check user-defined functions: lexical (FLET/LABELS/`(setf f)`) then the
         // global function cell (bliss-jtc.6.8).
         if let Some((params_form, body)) = callable_body(env, &name) {
-            let mut args = Vec::new();
-            let mut c = cdr;
-            while c.is_cons() {
-                let (af, r) = cp(c);
-                args.push(eval_form(af, env)?);
-                c = r;
+            let roots = bliss_rt::ShadowRootScope::new();
+            let forms = roots.root(cdr);
+            let mut rooted_args = Vec::new();
+            while forms.get().is_cons() {
+                let (af, r) = cp(forms.get());
+                let rest = roots.root(r);
+                rooted_args.push(roots.root(eval_form(af, env)?));
+                forms.set(rest.get());
             }
+            let args: Vec<BlissVal> = rooted_args.iter().map(|arg| arg.get()).collect();
             // T0→T1 tiering: run a GLOBAL compiled callee through the promoting
             // bytecode/native path so hot functions promote even when called from
             // tree-walked code (e.g. a `loop`, which never compiles to bytecode).
@@ -10052,12 +10081,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 }
 
 fn eval_progn(forms: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let roots = bliss_rt::ShadowRootScope::new();
+    let remaining = roots.root(forms);
     let mut r = NIL;
-    let mut c = forms;
-    while c.is_cons() {
-        let (f, rest) = cp(c);
+    while remaining.get().is_cons() {
+        let (f, rest) = cp(remaining.get());
+        let rest = roots.root(rest);
         r = eval_form(f, env)?;
-        c = rest;
+        remaining.set(rest.get());
     }
     Ok(r)
 }
@@ -11397,10 +11428,13 @@ fn gc_alloc_obj(total_size: usize, type_id: u8) -> *mut u8 {
 /// Allocate a RATIO heap object (numerator/denominator are integers) on the
 /// shared GC heap, using the spec RatioData layout (bliss-jtc.5).
 fn alloc_ratio_cli(num: BlissVal, den: BlissVal) -> BlissVal {
+    let roots = bliss_rt::ShadowRootScope::new();
+    let num = roots.root(num);
+    let den = roots.root(den);
     let ptr = gc_alloc_obj(std::mem::size_of::<RatioData>(), type_id::RATIO) as *mut RatioData;
     unsafe {
-        (*ptr).numerator = num;
-        (*ptr).denominator = den;
+        (*ptr).numerator = num.get();
+        (*ptr).denominator = den.get();
         BlissVal::from_heap_ptr(ptr as *mut u8)
     }
 }
@@ -11963,13 +11997,16 @@ fn eval_arith(
     op_r: fn(&BigRat, &BigRat) -> BigRat,
     op_i: fn(i128, i128) -> i128,
 ) -> Result<BlissVal, BlissError> {
-    let mut vals = Vec::new();
-    let mut c = args;
-    while c.is_cons() {
-        let (af, r) = cp(c);
-        vals.push(eval_form(af, env)?);
-        c = r;
+    let roots = bliss_rt::ShadowRootScope::new();
+    let remaining = roots.root(args);
+    let mut rooted_vals = Vec::new();
+    while remaining.get().is_cons() {
+        let (af, rest) = cp(remaining.get());
+        let rest = roots.root(rest);
+        rooted_vals.push(roots.root(eval_form(af, env)?));
+        remaining.set(rest.get());
     }
+    let vals: Vec<_> = rooted_vals.iter().map(|value| value.get()).collect();
     fold_arith_vals(&vals, init_i, init_f, op_f, op_r, op_i)
 }
 
@@ -12040,13 +12077,16 @@ fn fold_arith_vals(
 }
 
 fn eval_arith_sub(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let mut vals = Vec::new();
-    let mut c = args;
-    while c.is_cons() {
-        let (af, r) = cp(c);
-        vals.push(eval_form(af, env)?);
-        c = r;
+    let roots = bliss_rt::ShadowRootScope::new();
+    let remaining = roots.root(args);
+    let mut rooted_vals = Vec::new();
+    while remaining.get().is_cons() {
+        let (af, rest) = cp(remaining.get());
+        let rest = roots.root(rest);
+        rooted_vals.push(roots.root(eval_form(af, env)?));
+        remaining.set(rest.get());
     }
+    let vals: Vec<_> = rooted_vals.iter().map(|value| value.get()).collect();
     sub_vals(&vals)
 }
 
@@ -12118,13 +12158,16 @@ fn sub_vals(vals: &[BlissVal]) -> Result<BlissVal, BlissError> {
 }
 
 fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let mut vals = Vec::new();
-    let mut c = args;
-    while c.is_cons() {
-        let (af, r) = cp(c);
-        vals.push(eval_form(af, env)?);
-        c = r;
+    let roots = bliss_rt::ShadowRootScope::new();
+    let remaining = roots.root(args);
+    let mut rooted_vals = Vec::new();
+    while remaining.get().is_cons() {
+        let (af, rest) = cp(remaining.get());
+        let rest = roots.root(rest);
+        rooted_vals.push(roots.root(eval_form(af, env)?));
+        remaining.set(rest.get());
     }
+    let vals: Vec<_> = rooted_vals.iter().map(|value| value.get()).collect();
     if vals.is_empty() {
         return Err(BlissError::ArithmeticError(
             "/ requires at least one argument".into(),
@@ -12194,9 +12237,14 @@ fn eval_cmp(
 ) -> Result<BlissVal, BlissError> {
     let (af, r) = cp(args);
     let (bf, _) = cp(r);
-    let a = eval_form(af, env)?;
+    let roots = bliss_rt::ShadowRootScope::new();
+    let a = roots.root(eval_form(af, env)?);
     let b = eval_form(bf, env)?;
-    Ok(if pred(numeric_cmp(a, b)?) { T } else { NIL })
+    Ok(if pred(numeric_cmp(a.get(), b)?) {
+        T
+    } else {
+        NIL
+    })
 }
 
 fn eval_args(args: BlissVal, env: &mut Env) -> Result<Vec<BlissVal>, BlissError> {
@@ -16325,6 +16373,40 @@ mod jtc1_heap_tests {
             found_marker,
             "the evaluator-allocated string must be walkable on the GC heap"
         );
+    }
+}
+
+#[cfg(test)]
+mod transient_shadow_root_tests {
+    use super::*;
+
+    /// A collection in the third argument moves the vector and cons produced
+    /// by the first two arguments. VALUES must retain both through precise
+    /// argument roots and publish their rewritten addresses afterward.
+    #[test]
+    fn nested_evaluation_rewrites_scalar_and_argument_vector_temporaries() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        let primary = read_eval_all_env(
+            "(values (vector 10 20 30) (cons 111 222) (%force-minor-gc-for-test))",
+            &mut env,
+        )
+        .expect("nested evaluation across forced minor GC");
+
+        assert_eq!(bliss_stdlib::length(primary).unwrap(), 3);
+        assert_eq!(bliss_stdlib::elt(primary, 0).unwrap().as_fixnum(), 10);
+        assert_eq!(bliss_stdlib::elt(primary, 2).unwrap().as_fixnum(), 30);
+        assert_eq!(env.mv.len(), 3);
+        let (car, cdr) = cp(env.mv[1]);
+        assert_eq!(car.as_fixnum(), 111);
+        assert_eq!(cdr.as_fixnum(), 222);
+        assert!(env.mv[2].is_nil());
+
+        let after = read_eval_all_env("(cons 333 444)", &mut env)
+            .expect("T0 allocator must reacquire a valid TLAB after collection");
+        let (car, cdr) = cp(after);
+        assert_eq!(car.as_fixnum(), 333);
+        assert_eq!(cdr.as_fixnum(), 444);
     }
 }
 

@@ -7,8 +7,12 @@ use crate::value::BlissVal;
 
 use std::alloc::Layout;
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, Once, OnceLock};
+use std::thread::ThreadId;
 // ── Region model ───────────────────────────────────────────────────
 
 /// The kind of a heap region.
@@ -2054,6 +2058,211 @@ fn scan_external_roots(mut visit: impl FnMut(*mut BlissVal)) {
     }
 }
 
+// ── Scoped shadow roots for host-language temporaries (bliss-6b2.1) ────────
+//
+// The tree-walker keeps Lisp values in Rust locals rather than on BlissStack.
+// A copying collection cannot conservatively find or rewrite those values. A
+// ShadowRootScope gives such code stable, precisely scanned handle slots. The
+// slots live in a process registry (partitioned by mutator thread), so the GC
+// can visit every thread's active roots rather than only its own TLS.
+
+fn shadow_roots() -> &'static Mutex<HashMap<ThreadId, Vec<BlissVal>>> {
+    static ROOTS: OnceLock<Mutex<HashMap<ThreadId, Vec<BlissVal>>>> = OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn scan_shadow_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let mut roots = shadow_roots().lock().unwrap_or_else(|e| e.into_inner());
+    for stack in roots.values_mut() {
+        for value in stack {
+            visit(value as *mut BlissVal);
+        }
+    }
+}
+
+fn install_shadow_root_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| register_root_scanner(scan_shadow_roots));
+}
+
+/// A lexical extent containing precise GC handles for Rust-side `BlissVal`
+/// temporaries. Dropping the scope removes every handle created through it,
+/// including during error unwinding.
+///
+/// Scopes are thread-affine and must nest in normal stack order. A rooted value
+/// is read back through [`ShadowRoot::get`] after any operation that may collect;
+/// callers must not retain and later use the original unrooted `BlissVal` copy.
+pub struct ShadowRootScope {
+    thread: ThreadId,
+    base: usize,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl ShadowRootScope {
+    /// Start a new shadow-root extent on the current mutator thread.
+    pub fn new() -> Self {
+        install_shadow_root_scanner();
+        let thread = std::thread::current().id();
+        let base = shadow_roots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(thread)
+            .or_default()
+            .len();
+        Self {
+            thread,
+            base,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Copy `value` into a precise mutable root slot tied to this scope.
+    pub fn root(&self, value: BlissVal) -> ShadowRoot<'_> {
+        assert_eq!(
+            self.thread,
+            std::thread::current().id(),
+            "shadow roots are thread-affine"
+        );
+        let mut roots = shadow_roots().lock().unwrap_or_else(|e| e.into_inner());
+        let stack = roots.entry(self.thread).or_default();
+        let index = stack.len();
+        stack.push(value);
+        ShadowRoot {
+            thread: self.thread,
+            index,
+            _scope: PhantomData,
+        }
+    }
+
+    /// Root every value in iteration order, returning one handle per value.
+    pub fn root_values(&self, values: impl IntoIterator<Item = BlissVal>) -> Vec<ShadowRoot<'_>> {
+        assert_eq!(
+            self.thread,
+            std::thread::current().id(),
+            "shadow roots are thread-affine"
+        );
+        let values: Vec<_> = values.into_iter().collect();
+        let mut roots = shadow_roots().lock().unwrap_or_else(|e| e.into_inner());
+        let stack = roots.entry(self.thread).or_default();
+        let start = stack.len();
+        stack.extend_from_slice(&values);
+        (start..start + values.len())
+            .map(|index| ShadowRoot {
+                thread: self.thread,
+                index,
+                _scope: PhantomData,
+            })
+            .collect()
+    }
+}
+
+impl Default for ShadowRootScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ShadowRootScope {
+    fn drop(&mut self) {
+        assert_eq!(
+            self.thread,
+            std::thread::current().id(),
+            "shadow-root scope dropped on a different thread"
+        );
+        let mut roots = shadow_roots().lock().unwrap_or_else(|e| e.into_inner());
+        let remove = if let Some(stack) = roots.get_mut(&self.thread) {
+            assert!(
+                stack.len() >= self.base,
+                "shadow-root scopes must be dropped in stack order"
+            );
+            stack.truncate(self.base);
+            stack.is_empty()
+        } else {
+            false
+        };
+        if remove {
+            roots.remove(&self.thread);
+        }
+    }
+}
+
+/// A precise, relocatable handle to one `BlissVal` in a [`ShadowRootScope`].
+pub struct ShadowRoot<'scope> {
+    thread: ThreadId,
+    index: usize,
+    _scope: PhantomData<&'scope ShadowRootScope>,
+}
+
+impl ShadowRoot<'_> {
+    /// Read the current value, including any relocation performed by the GC.
+    pub fn get(&self) -> BlissVal {
+        shadow_roots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.thread)
+            .and_then(|stack| stack.get(self.index))
+            .copied()
+            .expect("shadow root used outside its scope")
+    }
+
+    /// Replace the value held by this root slot.
+    pub fn set(&self, value: BlissVal) {
+        let mut roots = shadow_roots().lock().unwrap_or_else(|e| e.into_inner());
+        let slot = roots
+            .get_mut(&self.thread)
+            .and_then(|stack| stack.get_mut(self.index))
+            .expect("shadow root used outside its scope");
+        *slot = value;
+    }
+}
+
+#[cfg(test)]
+mod shadow_root_scope_tests {
+    use super::*;
+
+    fn current_depth() -> usize {
+        shadow_roots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&std::thread::current().id())
+            .map_or(0, Vec::len)
+    }
+
+    #[test]
+    fn scopes_nest_and_unwind_without_leaking_slots() {
+        assert_eq!(current_depth(), 0);
+        let outer = ShadowRootScope::new();
+        let first = outer.root(BlissVal::from_fixnum(1));
+        assert_eq!(current_depth(), 1);
+        {
+            let inner = ShadowRootScope::new();
+            let second = inner.root(BlissVal::from_fixnum(2));
+            assert_eq!(current_depth(), 2);
+            assert_eq!(second.get(), BlissVal::from_fixnum(2));
+        }
+        assert_eq!(current_depth(), 1);
+        assert_eq!(first.get(), BlissVal::from_fixnum(1));
+        drop(outer);
+        assert_eq!(current_depth(), 0);
+
+        let result = std::panic::catch_unwind(|| {
+            let scope = ShadowRootScope::new();
+            let _root = scope.root(BlissVal::from_fixnum(3));
+            panic!("exercise shadow-root unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(current_depth(), 0);
+
+        fn return_error() -> Result<(), BlissError> {
+            let scope = ShadowRootScope::new();
+            let _root = scope.root(BlissVal::from_fixnum(4));
+            Err(BlissError::Internal("exercise Result unwind".into()))
+        }
+        assert!(return_error().is_err());
+        assert_eq!(current_depth(), 0);
+    }
+}
+
 // ── T0 evaluator allocation on the shared GC heap (bliss-jtc.1) ───
 //
 // The tree-walking interpreter allocates its Lisp objects (conses, strings, …)
@@ -2138,6 +2347,20 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         unsafe { set_object_type_id(body, body_size, type_id) };
         Some(body)
     })
+}
+
+/// Run an explicit minor collection for the T0 evaluator.
+///
+/// The evaluator's current TLAB points into nursery space, so it must be
+/// discarded before a moving collection and reacquired lazily on the next
+/// [`alloc_typed`] call. All live evaluator values must already be registered
+/// with a precise root scanner (for Rust temporaries, use [`ShadowRootScope`]).
+/// This does not enable automatic collection in `alloc_typed`.
+pub fn collect_t0_minor() -> Result<(), BlissError> {
+    T0_ALLOCATOR.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+    HeapCollector::new().minor_gc()
 }
 
 // ── Weak references ────────────────────────────────────────────────

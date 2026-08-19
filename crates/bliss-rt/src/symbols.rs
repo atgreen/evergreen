@@ -89,6 +89,9 @@ fn alloc_pinned_name(s: &str) -> BlissVal {
 /// Allocate a pinned `SymbolData` object with the given name string and home
 /// package, all cells unbound/empty. Returns a heap-tagged reference to it.
 fn alloc_pinned_symbol(name: BlissVal, package: BlissVal) -> BlissVal {
+    let roots = crate::gc::ShadowRootScope::new();
+    let name = roots.root(name);
+    let package = roots.root(package);
     let body = crate::gc::alloc_typed(SYMBOL_BODY_SIZE, type_id::SYMBOL)
         .expect("OOM allocating symbol object");
     // SAFETY: `body` is a fresh SYMBOL body; its header sits at `body - header`,
@@ -96,11 +99,11 @@ fn alloc_pinned_symbol(name: BlissVal, package: BlissVal) -> BlissVal {
     unsafe {
         let header = body.sub(header_size());
         let sym = header as *mut SymbolData;
-        (*sym).name = name;
+        (*sym).name = name.get();
         (*sym).value = UNBOUND;
         (*sym).function = UNBOUND;
         (*sym).plist = NIL;
-        (*sym).package = package;
+        (*sym).package = package.get();
         (*sym).flags = 0;
         (*sym).tls_index = 0;
         let v = BlissVal::from_heap_ptr(header);

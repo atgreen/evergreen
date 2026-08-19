@@ -1237,6 +1237,8 @@ fn alloc_stream(
     inner: StreamInner,
     components: Vec<BlissVal>,
 ) -> BlissVal {
+    let roots = bliss_rt::ShadowRootScope::new();
+    let component_roots = roots.root_values(components.iter().copied());
     // The Rust-owned state lives in an off-heap Box (stable address; never
     // relocated by the moving GC). `components` is stored beside the mutex so
     // the GC can trace it lock-free; the mutable state gets a raw back-pointer
@@ -1252,7 +1254,6 @@ fn alloc_stream(
     });
     let cptr: *const [BlissVal] = &*boxed.components;
     boxed.state.get_mut().unwrap().components_ptr = cptr;
-    let box_ptr = Box::into_raw(boxed) as u64;
 
     // The Lisp-visible stream value is a GC-heap handle whose single body word
     // holds the box pointer. Being a normal collectible heap object, its GC
@@ -1261,6 +1262,12 @@ fn alloc_stream(
     // stream (R5.121, bliss-jtc.7a).
     let body = bliss_rt::gc::alloc_typed(8, type_id::STREAM)
         .expect("GC heap unavailable for stream handle");
+    // The handle is now the traceable owner. Publish any component forwarding
+    // performed while it was being allocated before exposing the handle.
+    for (component, root) in boxed.components.iter_mut().zip(&component_roots) {
+        *component = root.get();
+    }
+    let box_ptr = Box::into_raw(boxed) as u64;
     unsafe {
         *(body as *mut u64) = box_ptr;
     }

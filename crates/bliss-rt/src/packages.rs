@@ -64,6 +64,8 @@ fn alloc_pinned_name(s: &str) -> BlissVal {
 /// Allocate a pinned PACKAGE object named `name`, all other cells empty.
 fn alloc_pinned_package(name: &str) -> BlissVal {
     let name_str = alloc_pinned_name(name);
+    let roots = crate::gc::ShadowRootScope::new();
+    let name_str = roots.root(name_str);
     let body = crate::gc::alloc_typed(PACKAGE_BODY_SIZE, type_id::PACKAGE)
         .expect("OOM allocating package object");
     // SAFETY: `body` is a fresh PACKAGE body; the header precedes it and its
@@ -71,7 +73,7 @@ fn alloc_pinned_package(name: &str) -> BlissVal {
     unsafe {
         let header = body.sub(header_size());
         let pkg = header as *mut PackageData;
-        (*pkg).name = name_str;
+        (*pkg).name = name_str.get();
         (*pkg).internal_symbols = NIL;
         (*pkg).external_symbols = NIL;
         (*pkg).use_list = NIL;

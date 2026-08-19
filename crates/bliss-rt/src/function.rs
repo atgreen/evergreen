@@ -60,6 +60,11 @@ pub fn alloc_interpreted(
     env: BlissVal,
     name: BlissVal,
 ) -> BlissVal {
+    let roots = crate::gc::ShadowRootScope::new();
+    let lambda_list = roots.root(lambda_list);
+    let body = roots.root(body);
+    let env = roots.root(env);
+    let name = roots.root(name);
     let body_ptr = crate::gc::alloc_typed(body_size(), type_id::FUNCTION_INTERPRETED)
         .expect("OOM allocating interpreted function object");
     // SAFETY: fresh FUNCTION_INTERPRETED body; header precedes it and its start
@@ -67,10 +72,10 @@ pub fn alloc_interpreted(
     unsafe {
         let header = body_ptr.sub(header_size());
         let d = header as *mut FunctionData;
-        (*d).lambda_list = lambda_list;
-        (*d).body = body;
-        (*d).env = env;
-        (*d).name = name;
+        (*d).lambda_list = lambda_list.get();
+        (*d).body = body.get();
+        (*d).env = env.get();
+        (*d).name = name.get();
         (*d).invoke_count = 0.into();
         (*d).back_edge_count = 0.into();
         (*d).entry = AtomicPtr::new(std::ptr::null_mut());

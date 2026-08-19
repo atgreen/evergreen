@@ -176,13 +176,15 @@ pub fn build_simple_vector(vals: &[BlissVal]) -> BlissVal {
 /// elements…]`, matching the historical `[header | len | bytes]` scheme the
 /// readers and the GC's SIMPLE_VECTOR tracer expect (the length is stored raw).
 fn build_vector(vals: &[BlissVal]) -> BlissVal {
+    let roots = bliss_rt::ShadowRootScope::new();
+    let vals = roots.root_values(vals.iter().copied());
     // Body = one length word + the elements.
     let body_size = 8 + vals.len() * 8;
     if let Some(body) = bliss_rt::gc::alloc_typed(body_size, type_id::SIMPLE_VECTOR) {
         unsafe {
             *(body as *mut u64) = vals.len() as u64;
-            for (i, &v) in vals.iter().enumerate() {
-                *(body.add(8 + i * 8) as *mut u64) = v.to_raw();
+            for (i, value) in vals.iter().enumerate() {
+                *(body.add(8 + i * 8) as *mut u64) = value.get().to_raw();
             }
             // Value points at the object header (body − 8), like alloc_str.
             return BlissVal::from_heap_ptr(body.sub(8));
@@ -194,8 +196,8 @@ fn build_vector(vals: &[BlissVal]) -> BlissVal {
     let header = ObjectHeader::new(type_id::SIMPLE_VECTOR, total_u64s as u16);
     buf.push(header.0);
     buf.push(vals.len() as u64);
-    for &v in vals {
-        buf.push(v.to_raw());
+    for value in &vals {
+        buf.push(value.get().to_raw());
     }
     let ptr = buf.as_mut_ptr() as *mut u8;
     std::mem::forget(buf);
@@ -294,6 +296,8 @@ pub fn build_complex_vector(
     store.extend_from_slice(elements);
     store.resize(cap, NIL);
     let storage = build_vector(&store);
+    let roots = bliss_rt::ShadowRootScope::new();
+    let storage = roots.root(storage);
     let fp = BlissVal::from_fixnum(fill_pointer.min(cap) as i64);
     let adj = if adjustable { T } else { NIL };
     // Body = [storage-ref | fill-pointer(fixnum) | adjustable(T/NIL)]; only the
@@ -301,7 +305,7 @@ pub fn build_complex_vector(
     let body_size = 3 * 8;
     if let Some(body) = bliss_rt::gc::alloc_typed(body_size, type_id::COMPLEX_ARRAY) {
         unsafe {
-            *(body as *mut u64) = storage.to_raw();
+            *(body as *mut u64) = storage.get().to_raw();
             *(body.add(8) as *mut u64) = fp.to_raw();
             *(body.add(16) as *mut u64) = adj.to_raw();
             return BlissVal::from_heap_ptr(body.sub(8));
@@ -311,7 +315,7 @@ pub fn build_complex_vector(
     let mut buf: Vec<u64> = Vec::with_capacity(4);
     let header = ObjectHeader::new(type_id::COMPLEX_ARRAY, 4);
     buf.push(header.0);
-    buf.push(storage.to_raw());
+    buf.push(storage.get().to_raw());
     buf.push(fp.to_raw());
     buf.push(adj.to_raw());
     let ptr = buf.as_mut_ptr() as *mut u8;

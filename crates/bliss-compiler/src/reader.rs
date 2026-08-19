@@ -207,6 +207,9 @@ fn gc_alloc(total_size: usize, type_id: u8) -> *mut u8 {
 }
 
 fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
+    let roots = bliss_rt::ShadowRootScope::new();
+    let car = roots.root(car);
+    let cdr = roots.root(cdr);
     // A headered GC object whose body (car@0, cdr@8) is what `from_cons_ptr`
     // points at — the same representation the T0 evaluator uses.
     let body = match bliss_rt::gc::alloc_typed(16, type_id::CONS) {
@@ -215,8 +218,8 @@ fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
     };
     unsafe {
         let cell = body as *mut ConsCell;
-        (*cell).car = car;
-        (*cell).cdr = cdr;
+        (*cell).car = car.get();
+        (*cell).cdr = cdr.get();
         BlissVal::from_cons_ptr(body)
     }
 }
