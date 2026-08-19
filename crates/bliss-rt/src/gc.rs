@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 use std::thread::ThreadId;
 // ── Region model ───────────────────────────────────────────────────
@@ -1332,9 +1332,32 @@ impl Collector for HeapCollector {
         // object promoted out of the nursery this cycle, while the forwarding
         // pointers are still intact (bliss-jtc.7f). A promoted survivor's key is
         // moved to its new address so its finalizer is NOT fired and its weak
-        // pointers stay valid; only genuinely dead objects are handled by the
-        // range-based passes after the nursery is reset.
+        // pointers stay valid; only genuinely dead objects remain for the
+        // range-based finalizer/weak-pointer passes below.
         relocate_side_tables(heap_base_addr, heap_end);
+
+        let nursery_ranges: Vec<(usize, usize)> = nursery_indices
+            .iter()
+            .filter(|idx| !pinned_indices.contains(idx))
+            .map(|&idx| {
+                let base = state.regions[idx].base as usize;
+                let limit = state.regions[idx].header.alloc_limit as usize;
+                (base, limit)
+            })
+            .collect();
+
+        // Clear weak pointers first, preserving the collector's established
+        // death ordering, then run finalizers while the dead object's header
+        // and payload are still intact (STREAM finalization reads its off-heap
+        // state pointer). Survivor side-table keys were forwarded above; every
+        // key still in these ranges is genuinely dead.
+        break_dead_weak_pointers(&|val: BlissVal| {
+            let addr = val.to_raw() as usize;
+            nursery_ranges
+                .iter()
+                .any(|&(base, limit)| addr >= base && addr < limit)
+        });
+        fire_finalizers_in_ranges(&nursery_ranges);
 
         // Phase 4: Reset all nursery regions for reuse (after relocation, above,
         // read their forwarding pointers). Retained pinned regions were promoted
@@ -1357,32 +1380,6 @@ impl Collector for HeapCollector {
             region.header.gen_age = 0;
         }
 
-        // Break weak pointers to objects that were in nursery regions (now freed).
-        // After resetting, any pointer into these regions is dead.
-        {
-            let nursery_ranges: Vec<(usize, usize)> = nursery_indices
-                .iter()
-                .filter(|idx| !pinned_indices.contains(idx))
-                .map(|&idx| {
-                    let base = state.regions[idx].base as usize;
-                    let limit = state.regions[idx].header.alloc_limit as usize;
-                    (base, limit)
-                })
-                .collect();
-            break_dead_weak_pointers(&|val: BlissVal| {
-                let addr = val.to_raw() as usize;
-                nursery_ranges
-                    .iter()
-                    .any(|&(base, limit)| addr >= base && addr < limit)
-            });
-            // Fire finalizers for objects that genuinely died in the nursery
-            // (e.g. an object lost when a copy failed under GC-time OOM):
-            // survivors have already had their keys forwarded out of these
-            // ranges by relocate_side_tables above, so anything still keyed
-            // inside a freed range is dead (bliss-jtc.7f).
-            fire_finalizers_in_ranges(&nursery_ranges);
-        }
-
         // Update stats.
         state.stats.minor_gc_count += 1;
         state.stats.bytes_promoted += bytes_promoted;
@@ -1392,6 +1389,7 @@ impl Collector for HeapCollector {
 
         // Update local stats copy.
         self.gc_stats = state.stats.clone();
+        GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -2302,8 +2300,14 @@ fn ensure_heap_initialized() {
 thread_local! {
     /// Per-thread bump allocator over the shared GC heap for T0 allocation. The
     /// fast path (TLAB) is lock-free; only a TLAB refill touches the heap lock.
-    static T0_ALLOCATOR: RefCell<Option<HeapAllocator>> = const { RefCell::new(None) };
+    static T0_ALLOCATOR: RefCell<Option<(u64, HeapAllocator)>> = const { RefCell::new(None) };
 }
+
+/// Incremented whenever nursery addresses can become invalid. T0 allocators
+/// compare their cached epoch before every allocation and lazily replace a stale
+/// TLAB. Keeping the old allocator installed throughout collection preserves
+/// the region's walkable reservation frontier.
+static GC_MOVE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Overwrite the type_id of a freshly-allocated object (its size/hash are
 /// already set by the allocator's placeholder header).
@@ -2337,9 +2341,14 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         let mut guard = cell.borrow_mut();
         if guard.is_none() {
             ensure_heap_initialized();
-            *guard = HeapAllocator::new_without_auto_collect().ok();
         }
-        let alloc = guard.as_mut()?;
+        let epoch = GC_MOVE_EPOCH.load(Ordering::Acquire);
+        if guard.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
+            *guard = HeapAllocator::new_without_auto_collect()
+                .ok()
+                .map(|allocator| (epoch, allocator));
+        }
+        let alloc = &mut guard.as_mut()?.1;
         let body = alloc
             .alloc_fast(body_size)
             .or_else(|| alloc.alloc_slow(body_size).ok())?;
@@ -2357,9 +2366,6 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
 /// with a precise root scanner (for Rust temporaries, use [`ShadowRootScope`]).
 /// This does not enable automatic collection in `alloc_typed`.
 pub fn collect_t0_minor() -> Result<(), BlissError> {
-    T0_ALLOCATOR.with(|cell| {
-        *cell.borrow_mut() = None;
-    });
     HeapCollector::new().minor_gc()
 }
 
@@ -2897,6 +2903,7 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
         satb_log: Vec::new(),
     };
     *heap_state().lock().unwrap() = Some(state);
+    GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
 
     Ok(())
 }
