@@ -633,6 +633,42 @@ fn loop_for_var_with_type_spec_and_parallel_and() {
 }
 
 #[test]
+fn equal_compares_pathnames_by_components() {
+    // CLHS: EQUAL on pathnames is true when their components match. bliss's
+    // EQUAL returned NIL for equal pathnames, so ASDF's pathname-keyed caches
+    // and comparisons never matched, breaking asdf:load-system (bliss-nad).
+    assert_eq!(eval_ok("(equal (pathname \"/a/b\") (pathname \"/a/b\"))"), "T");
+    assert_eq!(eval_ok("(equal (pathname \"/a/b\") (pathname \"/a/c\"))"), "NIL");
+    // A pathname is not EQUAL to its namestring.
+    assert_eq!(eval_ok("(equal (pathname \"/a/b\") \"/a/b\")"), "NIL");
+    // EQUAL pathnames must hash together in an EQUAL table (already did).
+    assert_eq!(
+        eval_ok("(let ((h (make-hash-table :test 'equal))) (setf (gethash (pathname \"/a/b\") h) 1) (nth-value 1 (gethash (pathname \"/a/b\") h)))"),
+        "T"
+    );
+}
+
+#[test]
+fn package_used_by_list_reports_using_packages() {
+    // PACKAGE-USED-BY-LIST was stubbed to NIL, which broke UIOP's ensure-package
+    // reconciliation (ensure-exported walks it to propagate exports into
+    // inheriting packages), leaving asdf:load-system unable to converge
+    // (bliss-nad).
+    assert_eq!(
+        eval_ok(
+            "(progn (defpackage :ubl-a (:use)) (defpackage :ubl-b (:use :ubl-a)) \
+             (mapcar #'package-name (package-used-by-list :ubl-a)))"
+        ),
+        "(\"UBL-B\")"
+    );
+    // A package nobody uses reports NIL.
+    assert_eq!(
+        eval_ok("(progn (defpackage :ubl-lonely (:use)) (package-used-by-list :ubl-lonely))"),
+        "NIL"
+    );
+}
+
+#[test]
 fn equalp_compares_vectors_strings_chars_numbers() {
     // EQUALP (unlike EQUAL) compares vectors element-wise, strings/chars
     // case-insensitively, and numbers across types. babel's define-constant

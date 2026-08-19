@@ -5481,6 +5481,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     if car.is_symbol() {
         let name = sym_name(car);
 
+
         // Check for macro expansion first (lexical MACROLET macro, else global).
         if let Some(mdef) = lookup_macro(env, &name) {
             let expanded = expand_macro(&mdef, cdr, env)?;
@@ -9156,8 +9157,32 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .unwrap_or_default();
                 return Ok(vec_to_list(&nicks));
             }
-            "PACKAGE-SHADOWING-SYMBOLS" | "PACKAGE-USED-BY-LIST" => {
+            "PACKAGE-SHADOWING-SYMBOLS" => {
                 return Ok(NIL);
+            }
+            "PACKAGE-USED-BY-LIST" => {
+                // The packages that :USE the given package. Was stubbed to NIL,
+                // which broke UIOP's ensure-package reconciliation: ensure-exported
+                // walks (package-used-by-list from-package) to propagate an export
+                // into inheriting packages, so a NIL result left inheritors in an
+                // inconsistent state that ASDF then re-processed (bliss-nad).
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(NIL);
+                }
+                let raw = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                let target = resolve_package_name(env, &raw);
+                let mut result = Vec::new();
+                for p in bliss_stdlib::list_all_packages() {
+                    let uses_target = bliss_stdlib::package_use_list(p)
+                        .iter()
+                        .filter_map(|u| bliss_stdlib::package_name(*u))
+                        .any(|n| n == target);
+                    if uses_target {
+                        result.push(p);
+                    }
+                }
+                return Ok(vec_to_list(&result));
             }
             "PACKAGE-USE-LIST" => {
                 let args = list_to_vec(cdr);
@@ -15138,6 +15163,18 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
     }
     if is_string_value(a) && is_string_value(b) {
         return val_as_str(a) == val_as_str(b);
+    }
+    // Pathnames: EQUAL when their components match. Comparing namestrings is the
+    // faithful proxy and matches the EQUAL hash-table's `cl_equal`. ASDF compares
+    // pathnames with EQUAL pervasively (find-system caching, output-file dedup,
+    // and — via actions keyed on components — plan-traversal cycle detection);
+    // returning NIL for equal pathnames made those caches never hit, so
+    // asdf:load-system re-traversed forever (bliss-nad).
+    if bliss_stdlib::is_pathname(a) && bliss_stdlib::is_pathname(b) {
+        return match (bliss_stdlib::namestring(a), bliss_stdlib::namestring(b)) {
+            (Ok(na), Ok(nb)) => val_as_str(na) == val_as_str(nb),
+            _ => false,
+        };
     }
     if a.is_cons() && b.is_cons() {
         let (a_car, a_cdr) = cp(a);
