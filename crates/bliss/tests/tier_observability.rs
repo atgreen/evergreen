@@ -348,6 +348,27 @@ fn loop_being_hash_keys_compiles_and_promotes() {
     assert_eq!(tw.lines().next(), Some("0 (30 30)"));
 }
 
+#[test]
+fn hot_leaf_called_only_from_tree_walker_promotes() {
+    // LOOP REPEAT remains a tree-walker-only extended shape. Calls made from
+    // that body must still enter the registered bytecode function and drive its
+    // invocation counter across the T1 threshold.
+    let prog = "\
+        (defun tree-called-leaf (x) (+ x 1)) \
+        (loop repeat 5 do (tree-called-leaf 1)) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote tree-called-leaf)) \
+          (tree-called-leaf 41))";
+
+    let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "tree-called leaf run failed: {out}");
+    assert_eq!(out.lines().next(), Some("1 42"));
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker oracle failed: {tw}");
+    assert_eq!(tw.lines().next(), Some("0 42"));
+}
+
 /// Variadic lambda lists (&optional/&key/&rest, with defaults and supplied-p)
 /// compile to bytecode and promote to T1 (bliss-x5y.7) — previously the single
 /// biggest function-level bail. Defaults (which may reference earlier params) and
