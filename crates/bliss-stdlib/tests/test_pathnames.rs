@@ -11,37 +11,17 @@ use bliss_stdlib::streams;
 
 // ── Helper ────────────────────────────────────────────────────────────
 
-/// Build a BlissVal representing a string.
-///
-/// Uses `BlissVal::from_raw()` with a deterministic hash and heap-object tag (010).
-/// This produces a sentinel value that the implementation must recognise as a
-/// string for tests to pass — a trivial store-and-return will match raw bits,
-/// but parsing / filesystem operations must actually interpret the string content.
-///
-/// NOTE: These are *placeholder* constructors. When real string allocation lands
-/// (e.g. `BlissVal::from_string(&str, &mut Heap) -> BlissVal`), these helpers
-/// should be replaced with calls to the real constructor so that tests exercise
-/// actual heap-allocated string objects.
+/// Build and register a real heap string for pathname operations.
 fn make_string_val(s: &str) -> BlissVal {
-    // We need a deterministic mapping from &str -> u64 with tag 010.
-    // FNV-1a is used purely for determinism; the resulting value is a
-    // sentinel, not a real heap pointer.
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    let val = BlissVal::from_raw((h & !0b111) | 0b010);
-    // Register the string content so the implementation can extract it
-    // for parsing and filesystem operations.
+    let val = streams::make_lisp_string(s);
     register_string(val, s);
     val
 }
 
 /// Make a keyword-style BlissVal (symbol-index tag 101).
 ///
-/// Same caveats as `make_string_val` — this is a sentinel, not a real symbol
-/// table entry. Replace with real keyword constructor when available.
+/// This remains a test-only symbol sentinel; unlike heap objects, symbol values
+/// are registry indices and are never dereferenced as pointers.
 fn make_keyword_val(s: &str) -> BlissVal {
     let mut h: u64 = 0x517cc1b727220a95;
     for b in s.bytes() {
@@ -117,8 +97,7 @@ fn make_pathname_all_components() {
     let pn = make_pathname(host, device, directory, name, type_field, version).unwrap();
     assert_ne!(pn, NIL);
     // Each accessor must return the exact component that was passed in.
-    // Since these are sentinel values, bit-equality is the baseline check.
-    // Once real string constructors exist, we should also verify string content.
+    // Interned test strings preserve identity, so bit-equality is appropriate.
     assert_eq!(pathname_host(pn), host);
     assert_eq!(pathname_device(pn), device);
     assert_eq!(pathname_directory(pn), directory);
@@ -203,7 +182,28 @@ fn namestring_roundtrip() {
 fn namestring_of_root_path() {
     let input = make_string_val("/");
     let (pn, _) = parse_namestring(input, None, None).unwrap();
-    assert_ne!(namestring(pn).unwrap(), NIL);
+    let rendered = namestring(pn).unwrap();
+    assert_ne!(rendered, NIL);
+    assert!(
+        rendered.is_string(),
+        "a namestring must be a real heap string"
+    );
+}
+
+#[test]
+fn synthesized_namestring_has_a_readable_string_header() {
+    let pn = make_pathname(
+        NIL,
+        NIL,
+        NIL,
+        make_string_val("fresh-name"),
+        make_string_val("lisp"),
+        NIL,
+    )
+    .unwrap();
+    let rendered = namestring(pn).unwrap();
+    assert!(rendered.is_string());
+    assert_eq!(rendered.as_string(), "fresh-name.lisp");
 }
 
 // ══════════════════════════════════════════════════════════════════════

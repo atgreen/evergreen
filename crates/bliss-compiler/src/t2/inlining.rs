@@ -17,6 +17,7 @@ pub enum KnownFunction {
     Symbolp,
     Integerp,
     Typep,
+    Stringp,
 }
 
 /// Expansion hook understood by the T2 builder.
@@ -28,6 +29,7 @@ pub enum IntrinsicId {
     Symbolp,
     Integerp,
     TypepConstant,
+    Stringp,
 }
 
 /// Effects of the expansion itself, rather than of an arbitrary generic call
@@ -110,6 +112,14 @@ const KNOWN: &[InlineMetadata] = &[
         effects: EffectSummary::PURE_TOTAL,
         cost: 1,
         expansion: IntrinsicId::TypepConstant,
+    },
+    InlineMetadata {
+        function: KnownFunction::Stringp,
+        name: "STRINGP",
+        fixed_arity: 1,
+        effects: EffectSummary::PURE_TOTAL,
+        cost: 1,
+        expansion: IntrinsicId::Stringp,
     },
 ];
 

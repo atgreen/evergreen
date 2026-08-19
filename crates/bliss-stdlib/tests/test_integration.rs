@@ -975,15 +975,15 @@ fn merge_pathnames_fills_defaults() {
 }
 
 /// Parse a pathname, then attempt to open a stream to it.
-/// (open will likely fail since the file doesn't exist, but the
-///  integration between pathnames and streams is exercised.)
+/// With `:if-does-not-exist NIL`, OPEN returns NIL for a missing file; reaching
+/// that result proves the pathname designator was decoded correctly.
 #[test]
 fn pathname_to_stream_open() {
     let path_str = make_pathname_string("/tmp/bliss-test-nonexistent.lisp");
     // parse_namestring returns (BlissVal, usize)
     let (pathname, _pos) = parse_namestring(path_str, None, None).expect("parse_namestring");
 
-    // Attempting to open a non-existent file for input should error
+    // A missing input file with :if-does-not-exist NIL returns NIL.
     let result = open(
         pathname,
         StreamDirection::Input,
@@ -992,8 +992,7 @@ fn pathname_to_stream_open() {
         NIL,
         ExternalFormat::Utf8,
     );
-    // We expect an error because the file doesn't exist
-    assert!(result.is_err(), "opening non-existent file should fail");
+    assert_eq!(result.expect("pathname designator should be accepted"), NIL);
 }
 
 /// Build a pathname with make_pathname, convert to namestring, parse

@@ -134,6 +134,39 @@ fn mov_from_frame(a: &mut Asm, dst: u8, base: u8, i: usize) {
     a.push((8 * i) as u8);
 }
 
+/// `mov dst, qword ptr [base + disp8]` for bases other than rsp/r12.
+fn mov_mem64_disp8(a: &mut Asm, dst: u8, base: u8, disp: u8) {
+    debug_assert_ne!(base & 7, 4, "rsp/r12 needs a SIB byte");
+    a.push(rex_w(dst, base));
+    a.push(0x8B);
+    a.push(0x40 | ((dst & 7) << 3) | (base & 7));
+    a.push(disp);
+}
+
+/// `cmp lhs, qword ptr [base + disp8]` for bases other than rsp/r12.
+fn cmp_mem64_disp8(a: &mut Asm, lhs: u8, base: u8, disp: u8) {
+    debug_assert_ne!(base & 7, 4, "rsp/r12 needs a SIB byte");
+    a.push(rex_w(lhs, base));
+    a.push(0x3B);
+    a.push(0x40 | ((lhs & 7) << 3) | (base & 7));
+    a.push(disp);
+}
+
+/// `movzx dst32, byte ptr [base + index + disp8]`. The 32-bit destination
+/// zero-extends to 64 bits; using the same register for `dst` and `index` is
+/// valid because address calculation reads the old index first.
+fn movzx_mem8_indexed(a: &mut Asm, dst: u8, base: u8, index: u8, disp: u8) {
+    let rex = 0x40
+        | (((dst >> 3) & 1) << 2)
+        | (((index >> 3) & 1) << 1)
+        | ((base >> 3) & 1);
+    a.push(rex);
+    a.extend_from_slice(&[0x0F, 0xB6]);
+    a.push(0x40 | ((dst & 7) << 3) | 0x04); // mod=01, rm=SIB
+    a.push(((index & 7) << 3) | (base & 7)); // scale=1
+    a.push(disp);
+}
+
 /// `sar r64, imm8`.
 /// `mov [rsp + disp], src` (REX.W). rsp as the base register forces a SIB byte
 /// (rm=100), so this cannot reuse `mov_from_frame`'s no-SIB encoding. Used by the
@@ -280,6 +313,8 @@ fn guard_single_float(a: &mut Asm, r: u8, deopt: bliss_rt::asm::Label) {
 // operand is tag-checked — a statically-known fixnum constant needs no guard.
 
 const SCRATCH: u8 = 2; // rdx — reserved for guard temporaries, never a value reg
+const STRING_SCAN: u8 = 6; // rsi — transient UTF-8 prefix cursor
+const STRING_BYTE: u8 = 7; // rdi — transient byte; frame args are already loaded
 
 /// `test <r low byte>, 7 ; jne deopt` — the fixnum-tag guard on one operand.
 /// Correct for registers 0..=3 and 8..=15 (the framed value pool); registers
@@ -1106,6 +1141,27 @@ fn emit_type_check(
         // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
         a.extend_from_slice(&[0x80, 0x7A, 0x07, bliss_rt::object::type_id::BIGNUM]);
         a.jcc(Cc::E, found);
+    } else if bits == TypeBits::STRING {
+        // A string predicate must prove the heap tag before reading the header.
+        // Both simple UTF-8 string layouts share the same length/data offsets.
+        single_tag(a, bliss_rt::value::TAG_HEAP_OBJECT as i32);
+        a.jcc(Cc::Ne, not_found);
+        mov_rr(a, SCRATCH, xr);
+        alu_r_imm(a, AND, SCRATCH, -8);
+        a.extend_from_slice(&[
+            0x80,
+            0x7A,
+            0x07,
+            bliss_rt::object::type_id::SIMPLE_BASE_STRING,
+        ]);
+        a.jcc(Cc::E, found);
+        a.extend_from_slice(&[
+            0x80,
+            0x7A,
+            0x07,
+            bliss_rt::object::type_id::SIMPLE_CHARACTER_STRING,
+        ]);
+        a.jcc(Cc::E, found);
     } else {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
     }
@@ -1116,6 +1172,127 @@ fn emit_type_check(
     a.bind(found);
     mov_imm64(a, dst, bliss_rt::value::T.0 as i64);
     a.bind(end);
+    Ok(())
+}
+
+/// Guard `x` is one of the two simple UTF-8 string layouts and leave its
+/// untagged object pointer in `SCRATCH`.
+fn guard_simple_string(a: &mut Asm, x: u8, deopt: bliss_rt::asm::Label) {
+    const AND: u8 = 4;
+    const CMP: u8 = 7;
+    mov_rr(a, SCRATCH, x);
+    alu_r_imm(a, AND, SCRATCH, 7);
+    alu_r_imm(a, CMP, SCRATCH, bliss_rt::value::TAG_HEAP_OBJECT as i32);
+    a.jcc(Cc::Ne, deopt);
+    mov_rr(a, SCRATCH, x);
+    alu_r_imm(a, AND, SCRATCH, -8);
+    let layout_ok = a.label();
+    a.extend_from_slice(&[
+        0x80,
+        0x7A,
+        0x07,
+        bliss_rt::object::type_id::SIMPLE_BASE_STRING,
+    ]);
+    a.jcc(Cc::E, layout_ok);
+    a.extend_from_slice(&[
+        0x80,
+        0x7A,
+        0x07,
+        bliss_rt::object::type_id::SIMPLE_CHARACTER_STRING,
+    ]);
+    a.jcc(Cc::Ne, deopt);
+    a.bind(layout_ok);
+}
+
+/// Guarded raw UTF-8 byte-length load. The result is a tagged non-negative
+/// fixnum. This is intentionally below CL:LENGTH: byte length is useful for
+/// emptiness/bounds checks, but is not character length for non-ASCII strings.
+fn emit_string_byte_length(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    deopt: bliss_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    if data.args.len() != 1
+        || data.results.len() != 1
+        || !data.flags.guard
+        || !data.flags.effectful
+        || data.frame_state.is_none()
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::StringByteLength)));
+    }
+    let xr = *reg.get(&data.args[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
+    guard_simple_string(a, xr, deopt);
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    mov_mem64_disp8(a, dst, SCRATCH, 8);
+    shl_imm(a, dst, 3);
+    Ok(())
+}
+
+/// Guarded ASCII fast path for `(CHAR simple-string index)`. UTF-8 leading
+/// bytes >= 128 deliberately deopt so the stdlib performs full codepoint
+/// decoding; the direct path therefore never changes Lisp-visible semantics.
+fn emit_string_ascii_char_at(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+    deopt: bliss_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    if data.args.len() != 2
+        || data.results.len() != 1
+        || !data.flags.guard
+        || !data.flags.effectful
+        || data.frame_state.is_none()
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::StringAsciiCharAt)));
+    }
+    let xr = *reg.get(&data.args[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
+    guard_simple_string(a, xr, deopt);
+
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    let index = data.args[1];
+    if let Some(&tagged) = const_tagged.get(&index) {
+        mov_imm64(a, dst, tagged as i64);
+    } else {
+        let ir = *reg.get(&index).ok_or(EmitError::UnsupportedOp(0xF2))?;
+        mov_rr(a, dst, ir);
+    }
+    // Fixnum tag, non-negative index.
+    a.push(rex_w(0, dst));
+    a.extend_from_slice(&[0xF7, 0xC0 | (dst & 7)]); // test r64, imm32 (/0)
+    a.extend_from_slice(&7i32.to_le_bytes());
+    a.jcc(Cc::Ne, deopt);
+    alu_r_imm(a, 7, dst, 0);
+    a.jcc(Cc::L, deopt);
+    sar_imm(a, dst, 3);
+    // `index >= byte_length` is out of bounds. Both are non-negative, so the
+    // signed comparison is equivalent over all representable object sizes.
+    cmp_mem64_disp8(a, dst, SCRATCH, 8);
+    a.jcc(Cc::Ge, deopt);
+    // A byte index equals a character index only while every byte through the
+    // selected element is ASCII.  Scanning the prefix prevents e.g. byte 2 of
+    // "éa" from being returned as character 2; any multibyte prefix deopts to
+    // the stdlib's UTF-8-aware CL:CHAR implementation.
+    mov_imm64(a, STRING_SCAN, 0);
+    let scan = a.label();
+    let selected = a.label();
+    a.bind(scan);
+    movzx_mem8_indexed(a, STRING_BYTE, SCRATCH, STRING_SCAN, 16);
+    alu_r_imm(a, 7, STRING_BYTE, 128);
+    a.jcc(Cc::Ge, deopt);
+    cmp_rr(a, STRING_SCAN, dst);
+    a.jcc(Cc::E, selected);
+    alu_r_imm(a, 0, STRING_SCAN, 1);
+    a.jmp(scan);
+    a.bind(selected);
+    mov_rr(a, dst, STRING_BYTE);
+    shl_imm(a, dst, 3);
+    or_imm8(a, dst, bliss_rt::value::TAG_CHARACTER as u8);
     Ok(())
 }
 
@@ -1746,6 +1923,19 @@ pub fn emit_framed(
                 emit_generic_eq(&mut a, &d, &mut reg, &mut pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
                 emit_type_check(&mut a, &d, &mut reg, &mut pool, &const_tagged)?;
+            } else if d.opcode == Opcode::StringByteLength {
+                let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
+                emit_string_byte_length(&mut a, &d, &mut reg, &mut pool, label)?;
+            } else if d.opcode == Opcode::StringAsciiCharAt {
+                let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
+                emit_string_ascii_char_at(
+                    &mut a,
+                    &d,
+                    &mut reg,
+                    &mut pool,
+                    &const_tagged,
+                    label,
+                )?;
             } else if d.opcode == Opcode::SymbolValue {
                 emit_symbol_value(&mut a, &d, &reg, c2i_load_global_addr)?;
             } else if d.opcode == Opcode::SetSymbolValue {
@@ -2135,6 +2325,169 @@ mod tests {
         let mut f = crate::t2::build::build_from_bytecode(&bf).expect("build");
         speculate(&mut f, &|bcp| if bcp == 2 { Some(SpecType::Fixnum) } else { None });
         f
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn string_layout_fn(char_at: bool) -> crate::t2::ir::Function {
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+        use crate::t2::ir::{
+            AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits,
+            ValueRepresentation,
+        };
+        let mut f = Function::new(if char_at { "string-char" } else { "string-bytes" });
+        let entry = f.entry();
+        let string = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let mut args = vec![string];
+        let mut locals = vec![ValueSource::Value {
+            value: string,
+            repr: ValueRepresentation::Tagged,
+        }];
+        if char_at {
+            let index = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+            args.push(index);
+            locals.push(ValueSource::Value {
+                value: index,
+                repr: ValueRepresentation::Tagged,
+            });
+        }
+        let fs = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope { function: 0, bcp: 0, locals, stack: vec![] }],
+            remat: vec![],
+        });
+        let opcode = if char_at { Opcode::StringAsciiCharAt } else { Opcode::StringByteLength };
+        let result_ty = if char_at {
+            IRType::of(TypeBits::CHARACTER)
+        } else {
+            IRType::of(TypeBits::FIXNUM)
+        };
+        let (_, results) = f.push_inst(
+            entry,
+            InstData {
+                opcode,
+                args,
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags { effectful: true, guard: true, ..Default::default() },
+                targets: vec![],
+                frame_state: Some(fs),
+                source_pos: 0,
+            },
+            &[(result_ty, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![results[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags { terminator: true, ..Default::default() },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        f
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn test_string(bytes: &[u8]) -> bliss_rt::value::BlissVal {
+        use bliss_rt::object::{ObjectHeader, type_id};
+        let total = (16 + bytes.len() + 7) & !7;
+        let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
+        unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout);
+            *(ptr as *mut ObjectHeader) =
+                ObjectHeader::new(type_id::SIMPLE_BASE_STRING, (total / 8) as u16);
+            *((ptr as *mut u64).add(1)) = bytes.len() as u64;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
+            bliss_rt::value::BlissVal::from_heap_ptr(ptr)
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn string_layout_intrinsics_run_and_guard_every_unsafe_case() {
+        use bliss_rt::value::BlissVal;
+
+        let length_ir = string_layout_fn(false);
+        crate::t2::verify::verify(&length_ir).expect("string length IR verifies");
+        let length_code = emit_framed(
+            &length_ir,
+            mock_c2i_deopt as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("emit string byte length")
+        .code;
+        let length_buf = bliss_rt::jit::JitBuffer::new(&length_code).unwrap();
+        let length: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(length_buf.as_ptr()) };
+        let mut frame = [test_string(b"abc").0, 0];
+        DEOPTED.store(false, Ordering::SeqCst);
+        assert_eq!(BlissVal(length(frame.as_mut_ptr())).as_fixnum(), 3);
+        assert!(!DEOPTED.load(Ordering::SeqCst));
+        frame[0] = BlissVal::from_fixnum(9).0;
+        let _ = length(frame.as_mut_ptr());
+        assert!(DEOPTED.load(Ordering::SeqCst), "wrong-type length must deopt");
+        let pathname_header = Box::new(bliss_rt::object::ObjectHeader::new(
+            bliss_rt::object::type_id::PATHNAME,
+            2,
+        ));
+        frame[0] = unsafe {
+            BlissVal::from_heap_ptr(Box::into_raw(pathname_header).cast::<u8>()).0
+        };
+        DEOPTED.store(false, Ordering::SeqCst);
+        let _ = length(frame.as_mut_ptr());
+        assert!(
+            DEOPTED.load(Ordering::SeqCst),
+            "wrong heap-object layout must deopt"
+        );
+
+        let char_ir = string_layout_fn(true);
+        crate::t2::verify::verify(&char_ir).expect("string char IR verifies");
+        let char_code = emit_framed(
+            &char_ir,
+            mock_c2i_deopt as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("emit string char")
+        .code;
+        let char_buf = bliss_rt::jit::JitBuffer::new(&char_code).unwrap();
+        let char_at: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(char_buf.as_ptr()) };
+
+        let mut char_frame = [test_string(b"abc").0, BlissVal::from_fixnum(1).0, 0];
+        DEOPTED.store(false, Ordering::SeqCst);
+        assert_eq!(BlissVal(char_at(char_frame.as_mut_ptr())).as_char(), 'b');
+        assert!(!DEOPTED.load(Ordering::SeqCst));
+
+        for (string, index, why) in [
+            (test_string(b""), 0, "empty string"),
+            (test_string(b"abc"), 3, "upper bound"),
+            (test_string(b"abc"), -1, "negative index"),
+            (test_string("é".as_bytes()), 0, "non-ASCII UTF-8"),
+            (
+                test_string("éa".as_bytes()),
+                2,
+                "ASCII byte after a multibyte prefix",
+            ),
+        ] {
+            char_frame[0] = string.0;
+            char_frame[1] = BlissVal::from_fixnum(index).0;
+            DEOPTED.store(false, Ordering::SeqCst);
+            let _ = char_at(char_frame.as_mut_ptr());
+            assert!(DEOPTED.load(Ordering::SeqCst), "{why} must deopt");
+        }
     }
 
     /// The framed-emitter milestone: a T2-emitted `(* x 5)` runs via the

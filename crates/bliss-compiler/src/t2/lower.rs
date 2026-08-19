@@ -432,6 +432,9 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
 
         // ── memory loads (may be effectful) ──
         Load | Car | Cdr | VecRef | SymbolValue => un_or_bin(lo, inst, op::LOAD, defs, uses),
+        StringByteLength | StringAsciiCharAt => {
+            lo.emit_annotated(inst, op::LOAD, defs, uses)
+        }
 
         // ── memory stores ──
         Store | SetCar | SetCdr | VecSet | SetSymbolValue => {

@@ -251,6 +251,29 @@ fn metadata_intrinsic_survives_later_forced_deopt() {
     assert_eq!(tw_fields.get(1).copied(), Some("3.5"), "tree-walker oracle: {tw:?}");
 }
 
+/// STRINGP is selected by generic inline metadata and emitted as a safe tagged
+/// pointer/header predicate. Exercise both outcomes after promotion and compare
+/// the values with the tree-walker; compiler integration tests assert that the
+/// T2 body contains TypeCheck rather than a STRINGP runtime call.
+#[test]
+fn metadata_stringp_is_tier_differentially_identical() {
+    let prog = "\
+        (defun string-kind (x) (if (stringp x) 10 20)) \
+        (dotimes (k 60) (string-kind \"warm\")) \
+        (format t \"~a ~a ~a~%\" \
+          (string-kind \"yes\") \
+          (string-kind 7) \
+          (string-kind (namestring (make-pathname :name \"fresh-name\" :type \"lisp\"))))";
+    let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
+    assert!(ok, "T2 STRINGP run failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    assert_eq!(line, "10 20 10");
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker STRINGP run failed: {tw}");
+    assert_eq!(tw.lines().next().unwrap_or(""), line);
+}
+
 /// A global-accumulator LOOP reaches T2 (bliss-fe8: the builder's loop SSA is
 /// stitched correctly and its loop-invariant phis are collapsed so it fits the
 /// framed register budget), computes the interpreted result, and deopts

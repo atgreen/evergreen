@@ -21,12 +21,7 @@ use bliss_stdlib::{
 };
 
 fn pseudo_string(s: &str) -> BlissVal {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    let val = BlissVal::from_raw((h & !0b111) | 0b010);
+    let val = make_lisp_string(s);
     register_string(val, s);
     val
 }

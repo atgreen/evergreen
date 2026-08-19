@@ -134,21 +134,18 @@ fn keyword_hash(s: &str) -> u64 {
     (h & !0b111) | 0b101
 }
 
-fn string_hash(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    (h & !0b111) | 0b010
-}
-
 fn make_string_bv(s: &str) -> BlissVal {
     let existing = with_string_reverse_registry(|rev| rev.get(s).copied());
     if let Some(bv) = existing {
         return bv;
     }
-    let bv = BlissVal::from_raw(string_hash(s));
+    // A heap-object tag is a promise that the payload is a readable object
+    // pointer.  Older pathname code put an FNV hash behind that tag, forcing
+    // every type predicate to consult this side registry before reading an
+    // ObjectHeader and making direct compiled type checks unsafe.  Use the
+    // ordinary string allocator so pathname components obey the same object
+    // representation contract as every other Lisp string.
+    let bv = crate::streams::make_lisp_string(s);
     with_string_registry(|reg| {
         reg.insert(bv.0, s.to_string());
     });
@@ -162,10 +159,8 @@ fn lookup_string(val: BlissVal) -> Option<String> {
     with_string_registry(|reg| reg.get(&val.0).cloned())
 }
 
-/// Read a string value that may be either a registry-backed string sentinel or
-/// a real heap string (SIMPLE_BASE_STRING). Pathname component values arrive as
-/// both, depending on whether they were produced by the reader/registry or by
-/// ordinary string operations.
+/// Read string content, preferring the registry cache before decoding a real
+/// heap string (SIMPLE_BASE_STRING or SIMPLE_CHARACTER_STRING).
 fn component_string(val: BlissVal) -> Option<String> {
     lookup_string(val).or_else(|| {
         if val.is_string() {
@@ -469,10 +464,9 @@ fn component_from_val(val: BlissVal, uppercase: bool) -> Option<ComponentSpec> {
     if is_wild(val) {
         return Some(ComponentSpec::Wild);
     }
-    // Accept both registry-backed string sentinels and ordinary heap strings:
-    // a NAME/TYPE component computed by string ops (SUBSEQ, SPLIT-NAME-TYPE, …)
-    // is a real SIMPLE_BASE_STRING that never entered the pathname registry, so
-    // registry-only lookup would silently drop it and render an empty namestring.
+    // A NAME/TYPE component computed by string ops (SUBSEQ, SPLIT-NAME-TYPE, …)
+    // may never enter the pathname registry, so registry-only lookup would
+    // silently drop it and render an empty namestring.
     component_string(val).map(|s| {
         let text = if uppercase { s.to_uppercase() } else { s };
         if text == "*" {
@@ -703,9 +697,8 @@ pub fn parse_namestring(
         });
     }
 
-    // Accept both registry-backed string sentinels and ordinary heap strings
-    // (SIMPLE_BASE_STRING) — e.g. a namestring passed through a function call or
-    // built by FORMAT, which is not in the pathname string registry (bliss-lb6).
+    // Accept an ordinary heap string not present in the pathname registry —
+    // e.g. a namestring passed through a function call or built by FORMAT.
     let s = lookup_string(thing)
         .or_else(|| {
             if thing.is_string() {

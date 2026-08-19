@@ -43,7 +43,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameState, ValueSource};
-use crate::t2::ir::{Block, Function, Value, ValueDef};
+use crate::t2::ir::{Block, Function, Opcode, Value, ValueDef};
 
 /// A single verification failure (spec §4.3.8.1 checks V1–V10).
 #[derive(Clone, Debug)]
@@ -282,6 +282,21 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                             ));
                         }
                     }
+                }
+
+                // V8 — guarded layout loads can fail on type, bounds, or
+                // representation and therefore must be ordered guards with
+                // enough state to resume in the generic implementation.
+                if matches!(data.opcode, Opcode::StringByteLength | Opcode::StringAsciiCharAt)
+                    && (!data.flags.guard || !data.flags.effectful)
+                {
+                    errors.push(VerifyError::new(
+                        "V8 layout-guard-contract",
+                        format!(
+                            "block{bi} layout load {:?} is not an effectful guard",
+                            data.opcode
+                        ),
+                    ));
                 }
 
                 // V8 — guard/FrameState well-formedness.
@@ -745,6 +760,28 @@ mod tests {
         f.set_terminator(e, ret(vec![]));
         let errs = verify(&f).unwrap_err();
         assert!(errs.iter().any(|e| e.check == "V8 guard-framestate"), "{errs:?}");
+    }
+
+    #[test]
+    fn v8_string_layout_load_must_be_an_effectful_guard() {
+        let mut f = Function::new("unguarded_string_load");
+        let e = f.entry();
+        let string = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
+        f.push_inst(
+            e,
+            InstData {
+                args: vec![string],
+                ..inst(Opcode::StringByteLength)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(e, ret(vec![]));
+        let errs = verify(&f).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.check == "V8 layout-guard-contract"),
+            "{errs:?}"
+        );
     }
 
     // ── V8 positive: a guard with a valid, dominating frame_state ───────

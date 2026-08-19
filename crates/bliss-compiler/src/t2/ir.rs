@@ -123,6 +123,11 @@ pub enum Opcode {
     GenericEq, GenericEqual, TypeCheck, InstanceOf,
     // Cat 4 — memory / object access (effectful unless proven immutable)
     Load, Car, Cdr, VecRef, SymbolValue,
+    /// Guarded direct load of the UTF-8 byte length from a simple string.
+    StringByteLength,
+    /// Guarded simple-string byte access for an ASCII character. Non-ASCII,
+    /// wrong-type, negative, and out-of-bounds cases deopt to CL:CHAR.
+    StringAsciiCharAt,
     Store, SetCar, SetCdr, VecSet, SetSymbolValue, WriteBarrier,
     Alloc, AllocCons,
     /// Reset the thread's multiple-values state (interpreter `ClearMv`, emitted

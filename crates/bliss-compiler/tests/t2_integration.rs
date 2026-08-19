@@ -131,6 +131,51 @@ fn integerp_intrinsic_accepts_fixnums_and_bignums_without_a_call() {
     assert_eq!(run(string), NIL);
 }
 
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn stringp_reaches_string_typecheck_through_inline_metadata() {
+    use bliss_compiler::t2::emit::emit_framed;
+    use bliss_compiler::t2::ir::{AuxData, Opcode, TypeBits};
+
+    let stringp = bliss_rt::symbols::intern("STRINGP");
+    let bf = bytecode_fn(
+        "string-predicate",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::CallNamed { sym: stringp, nargs: 1 },
+            Instr::Return,
+        ],
+        vec![], 1, 1, 1,
+    );
+    let f = build_from_bytecode(&bf).expect("build STRINGP metadata expansion");
+    let check = f.block_order().iter().flat_map(|&b| f.block(b).insts.iter())
+        .map(|&i| f.inst(i))
+        .find(|d| d.opcode == Opcode::TypeCheck)
+        .expect("STRINGP must become TypeCheck");
+    assert!(matches!(&check.aux, AuxData::TypeTag(t) if t.bits == TypeBits::STRING));
+    assert!(!f.block_order().iter().any(|&b| {
+        f.block(b).insts.iter().any(|&i| f.inst(i).opcode == Opcode::Call)
+    }));
+
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit STRINGP");
+    let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+    let run = |value: BlissVal| {
+        let mut frame = [value.0, 0];
+        BlissVal(func(frame.as_mut_ptr()))
+    };
+    let string_header = Box::new(ObjectHeader::new(type_id::SIMPLE_BASE_STRING, 2));
+    let string = unsafe { BlissVal::from_heap_ptr(Box::into_raw(string_header).cast::<u8>()) };
+    let wide_header = Box::new(ObjectHeader::new(type_id::SIMPLE_CHARACTER_STRING, 2));
+    let wide_string = unsafe { BlissVal::from_heap_ptr(Box::into_raw(wide_header).cast::<u8>()) };
+    let pathname_header = Box::new(ObjectHeader::new(type_id::PATHNAME, 2));
+    let pathname = unsafe { BlissVal::from_heap_ptr(Box::into_raw(pathname_header).cast::<u8>()) };
+    assert_eq!(run(string), T);
+    assert_eq!(run(wide_string), T);
+    assert_eq!(run(pathname), NIL);
+    assert_eq!(run(BlissVal::from_fixnum(7)), NIL);
+}
+
 /// `(lambda () 42)` — the smallest real function: push a constant, return it.
 /// P1 builds it, P2 must accept it, P3 must see the fixnum constant.
 #[test]

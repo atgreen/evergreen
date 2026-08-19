@@ -757,6 +757,7 @@ impl<'a> Builder<'a> {
             IntrinsicId::Consp => Some(TypeBits::CONS),
             IntrinsicId::Symbolp => Some(TypeBits::SYMBOL),
             IntrinsicId::Integerp => Some(TypeBits::FIXNUM.join(TypeBits::BIGNUM)),
+            IntrinsicId::Stringp => Some(TypeBits::STRING),
             IntrinsicId::TypepConstant => {
                 if bcp <= block_start {
                     return Ok(false);
@@ -813,7 +814,9 @@ impl<'a> Builder<'a> {
                 vec![a, b]
             }
             IntrinsicId::Consp | IntrinsicId::Symbolp | IntrinsicId::Integerp
-            | IntrinsicId::TypepConstant => unreachable!("handled as TypeCheck above"),
+            | IntrinsicId::TypepConstant | IntrinsicId::Stringp => {
+                unreachable!("handled as TypeCheck above")
+            }
         };
         let result = self.emit(
             block,
