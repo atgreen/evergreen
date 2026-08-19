@@ -2033,6 +2033,48 @@ fn condition_prints_as_its_report_message() {
 }
 
 #[test]
+fn condition_format_control_uses_stdlib_format() {
+    // This is the shape of ASDF's invalid-version diagnostic: nested
+    // conditionals inside a justification/logical-block control, plus pretty
+    // printing directives. ERROR, WARN, CERROR, and a SIMPLE-CONDITION report
+    // must all render it through the same stdlib FORMAT implementation.
+    let expr = r#"
+        (let* ((control "~@<Invalid :version specifier ~S~@[ for component ~S~]~@[ in ~S~]~@[ from file ~A~]~@[, using NIL instead~]~3i~_~@:>")
+               (expected "Invalid :version specifier VERSION for component \"completions\" from file /tmp/completions.asd, using NIL instead")
+               (error-report
+                 (handler-case
+                     (error control 'version "completions" nil "/tmp/completions.asd" t)
+                   (error (c) (format nil "~A" c))))
+               (warning-report
+                 (handler-case
+                     (warn control 'version "completions" nil "/tmp/completions.asd" t)
+                   (warning (c) (format nil "~A" c))))
+               (cerror-report
+                 (let ((report nil))
+                   (handler-bind
+                       ((error (lambda (c)
+                                 (setq report (format nil "~A" c))
+                                 (invoke-restart 'continue))))
+                     (cerror "Continue" control 'version "completions" nil
+                             "/tmp/completions.asd" t))
+                   report))
+               (simple-report
+                 (format nil "~A"
+                         (make-condition
+                           'simple-error
+                           :format-control control
+                           :format-arguments
+                           (list 'version "completions" nil
+                                 "/tmp/completions.asd" t)))))
+          (and (string= error-report expected)
+               (string= warning-report expected)
+               (string= cerror-report expected)
+               (string= simple-report expected)))
+    "#;
+    assert_eq!(eval_ok(expr), "T");
+}
+
+#[test]
 fn instance_without_report_prints_as_class_tag() {
     assert_eq!(
         eval_ok("(progn (defclass point () ((x :initarg :x))) (format nil \"~a\" (make-instance 'point :x 1)))"),

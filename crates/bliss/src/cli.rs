@@ -1151,17 +1151,26 @@ fn restart_invoked_name(error: &BlissError) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn make_simple_error_condition(message: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let class = ensure_condition_class_registered(env, "SIMPLE-ERROR")?;
+fn make_simple_condition(
+    class_name: &str,
+    format_control: BlissVal,
+    format_args: &[BlissVal],
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    let class = ensure_condition_class_registered(env, class_name)?;
     bliss_stdlib::make_instance(
         class,
         &[
             resolve_sym("FORMAT-CONTROL").unwrap_or(NIL),
-            message,
+            format_control,
             resolve_sym("FORMAT-ARGUMENTS").unwrap_or(NIL),
-            NIL,
+            vec_to_list(format_args),
         ],
     )
+}
+
+fn make_simple_error_condition(message: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    make_simple_condition("SIMPLE-ERROR", message, &[], env)
 }
 
 /// A human-readable report for a condition instance — what `~a` and an uncaught
@@ -1184,11 +1193,8 @@ fn condition_report_string(env: &Env, cond: BlissVal) -> Option<String> {
             let args = read("FORMAT-ARGUMENTS")
                 .map(list_to_vec)
                 .unwrap_or_default();
-            return Some(if args.is_empty() {
-                val_as_str(fc)
-            } else {
-                simple_format_message(&val_as_str(fc), &args)
-            });
+            let control = val_as_str(fc);
+            return Some(format_control_message(&control, &args).unwrap_or(control));
         }
     }
     let is = |t: &str| names.iter().any(|n| n == t);
@@ -1213,17 +1219,12 @@ fn condition_report_string(env: &Env, cond: BlissVal) -> Option<String> {
     names.first().cloned()
 }
 
-fn make_simple_warning_condition(message: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let class = ensure_condition_class_registered(env, "SIMPLE-WARNING")?;
-    bliss_stdlib::make_instance(
-        class,
-        &[
-            resolve_sym("FORMAT-CONTROL").unwrap_or(NIL),
-            message,
-            resolve_sym("FORMAT-ARGUMENTS").unwrap_or(NIL),
-            NIL,
-        ],
-    )
+fn make_simple_warning_condition(
+    format_control: BlissVal,
+    format_args: &[BlissVal],
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    make_simple_condition("SIMPLE-WARNING", format_control, format_args, env)
 }
 
 /// Convert a raw evaluator error into the CL condition it denotes, so that
@@ -3474,45 +3475,8 @@ fn format_val(val: BlissVal) -> String {
     s
 }
 
-fn simple_format_message(control: &str, args: &[BlissVal]) -> String {
-    let mut rendered = String::new();
-    let mut chars = control.chars().peekable();
-    let mut arg_index = 0usize;
-    while let Some(ch) = chars.next() {
-        if ch == '~' {
-            if let Some(directive) = chars.next() {
-                match directive {
-                    'A' | 'a' => {
-                        if let Some(arg) = args.get(arg_index) {
-                            let mut out = String::new();
-                            princ_val(*arg, &mut out);
-                            rendered.push_str(&out);
-                            arg_index += 1;
-                            continue;
-                        }
-                    }
-                    'S' | 's' => {
-                        if let Some(arg) = args.get(arg_index) {
-                            rendered.push_str(&format_val(*arg));
-                            arg_index += 1;
-                            continue;
-                        }
-                    }
-                    '~' => {
-                        rendered.push('~');
-                        continue;
-                    }
-                    _ => {
-                        rendered.push('~');
-                        rendered.push(directive);
-                        continue;
-                    }
-                }
-            }
-        }
-        rendered.push(ch);
-    }
-    rendered
+fn format_control_message(control: &str, args: &[BlissVal]) -> Result<String, BlissError> {
+    bliss_stdlib::format(NIL, control, args).map(val_as_str)
 }
 
 #[inline]
@@ -7060,8 +7024,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 for arg in &args[1..] {
                     format_args.push(eval_form(*arg, env)?);
                 }
-                let message = if is_string_value(control) && !format_args.is_empty() {
-                    simple_format_message(&val_as_str(control), &format_args)
+                let message = if is_string_value(control) {
+                    format_control_message(&val_as_str(control), &format_args)?
                 } else {
                     val_as_str(control)
                 };
@@ -7071,7 +7035,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // SIMPLE-ERROR.
                 let condition = match coerce_condition_designator(env, control, &format_args)? {
                     Some(condition) => condition,
-                    None => make_simple_error_condition(arena_str(&message), env)?,
+                    None => make_simple_condition("SIMPLE-ERROR", control, &format_args, env)?,
                 };
                 // The terminal message is the condition's REPORT (e.g. "The value X
                 // is not of type Y"), not the bare designator/type name.
@@ -8789,14 +8753,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 // (warn datum &rest args): a warning-type symbol or condition is
                 // used directly; a format-control string becomes a SIMPLE-WARNING.
-                let message = if is_string_value(datum) && !rest_args.is_empty() {
-                    simple_format_message(&val_as_str(datum), &rest_args)
+                let message = if is_string_value(datum) {
+                    format_control_message(&val_as_str(datum), &rest_args)?
                 } else {
                     val_as_str(datum)
                 };
                 let condition = match coerce_condition_designator(env, datum, &rest_args)? {
                     Some(condition) => condition,
-                    None => make_simple_warning_condition(arena_str(&message), env)?,
+                    None => make_simple_warning_condition(datum, &rest_args, env)?,
                 };
                 // Establish a MUFFLE-WARNING restart for the dynamic extent of the
                 // signal so a handler can suppress the default warning message.
@@ -15500,14 +15464,14 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // (cerror continue-control datum &rest args): datum may be a condition
     // instance, a condition-type symbol (built via MAKE-CONDITION), or a
     // format-control string (→ SIMPLE-ERROR).
-    let message = if is_string_value(datum) && !args.is_empty() {
-        simple_format_message(&val_as_str(datum), &args)
+    let message = if is_string_value(datum) {
+        format_control_message(&val_as_str(datum), &args)?
     } else {
         val_as_str(datum)
     };
     let condition = match coerce_condition_designator(env, datum, &args)? {
         Some(condition) => condition,
-        None => make_simple_error_condition(arena_str(&message), env)?,
+        None => make_simple_condition("SIMPLE-ERROR", datum, &args, env)?,
     };
 
     let base_len = env.restarts.len();

@@ -853,6 +853,28 @@ fn eval_error_produces_nonzero_exit() {
 }
 
 #[test]
+fn eval_warn_renders_asdf_format_control() {
+    let expr = r#"(warn "~@<Invalid :version specifier ~S~@[ for component ~S~]~@[ in ~S~]~@[ from file ~A~]~@[, using NIL instead~]~3i~_~@:>"
+                        'version "completions" nil "/tmp/completions.asd" t)"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "WARNING: Invalid :version specifier VERSION for component \"completions\" from file /tmp/completions.asd, using NIL instead"
+        ),
+        "WARN should render its format control through FORMAT, got: '{stderr}'"
+    );
+    assert!(
+        !stderr.contains("~@<") && !stderr.contains("~@[") && !stderr.contains("~3i"),
+        "WARN leaked FORMAT directives: '{stderr}'"
+    );
+}
+
+#[test]
 fn eval_cerror_with_handler_continues() {
     let expr = r#"(handler-bind ((error (lambda (c) (invoke-restart 'continue))))
   (cerror "Continue anyway" "soft error")
