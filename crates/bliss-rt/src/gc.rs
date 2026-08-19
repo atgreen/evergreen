@@ -341,6 +341,11 @@ pub struct HeapAllocator {
     /// Configuration snapshot (region_size, tlab_size, etc.).
     region_size: usize,
     tlab_size: usize,
+    /// Whether the slow path may invoke the moving collector. The CLI's
+    /// recursive tree-walker still has Rust-side roots that are not registered,
+    /// so its compatibility allocator keeps collection disabled until those
+    /// roots have a precise scanner (bliss-6b2).
+    auto_collect: bool,
 }
 
 // Safety: HeapAllocator owns its TLAB and only the owning thread uses it.
@@ -349,6 +354,16 @@ unsafe impl Send for HeapAllocator {}
 impl HeapAllocator {
     /// Create a new HeapAllocator. The heap must already be initialized via `init_heap`.
     pub fn new() -> Result<Self, BlissError> {
+        Self::new_with_auto_collect(true)
+    }
+
+    /// Create the compatibility allocator used by the T0 tree-walker. Moving
+    /// collection is deliberately disabled; see `auto_collect`.
+    fn new_without_auto_collect() -> Result<Self, BlissError> {
+        Self::new_with_auto_collect(false)
+    }
+
+    fn new_with_auto_collect(auto_collect: bool) -> Result<Self, BlissError> {
         let guard = heap_state().lock().unwrap();
         let state = guard
             .as_ref()
@@ -365,15 +380,16 @@ impl HeapAllocator {
             },
             region_size,
             tlab_size,
+            auto_collect,
         };
         // Try to get an initial TLAB from a nursery region.
         alloc.refill_tlab()?;
         Ok(alloc)
     }
 
-    /// Refill the TLAB from a nursery region. If no nursery space is available,
-    /// lazily converts a Free region to Nursery and retries. Returns OOM only
-    /// if no nursery region with space and no free region can be found.
+    /// Refill the TLAB from a nursery region. If the configured nursery budget
+    /// has room, lazily converts a Free region to Nursery. Returns OOM once the
+    /// budget is full; the collecting slow path uses that result as its trigger.
     fn refill_tlab(&mut self) -> Result<(), BlissError> {
         let mut guard = heap_state().lock().unwrap();
         let state = guard
@@ -400,28 +416,38 @@ impl HeapAllocator {
             }
         }
 
-        // No nursery region with space — convert a Free region to Nursery.
-        for (idx, region) in state.regions.iter_mut().enumerate() {
-            if region.header.kind != RegionKind::Free {
-                continue;
-            }
-            // Convert Free → Nursery.
-            region.header.kind = RegionKind::Nursery;
-            region.header.gen_age = 0;
-            region.header.alloc_top = region.base;
-            region.header.live_bytes = 0;
-            state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
+        // No nursery region with space. Commit another region only while doing
+        // so stays within the configured nursery budget; the rest of the heap
+        // is survivor/old-generation reserve, not an extension of the nursery.
+        let nursery_regions = state
+            .regions
+            .iter()
+            .filter(|region| region.header.kind == RegionKind::Nursery)
+            .count();
+        let nursery_region_limit = state.config.nursery_size.div_ceil(self.region_size);
+        if nursery_regions < nursery_region_limit {
+            for (idx, region) in state.regions.iter_mut().enumerate() {
+                if region.header.kind != RegionKind::Free {
+                    continue;
+                }
+                // Convert Free → Nursery.
+                region.header.kind = RegionKind::Nursery;
+                region.header.gen_age = 0;
+                region.header.alloc_top = region.base;
+                region.header.live_bytes = 0;
+                state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
 
-            let top = region.header.alloc_top as usize;
-            let limit = region.header.alloc_limit as usize;
-            let available = limit.saturating_sub(top);
-            if available >= self.tlab_size {
-                self.tlab.cursor = region.header.alloc_top;
-                self.tlab.limit =
-                    unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
-                self.tlab.region_idx = idx as u16;
-                region.header.alloc_top = unsafe { region.header.alloc_top.add(self.tlab_size) };
-                return Ok(());
+                let top = region.header.alloc_top as usize;
+                let limit = region.header.alloc_limit as usize;
+                let available = limit.saturating_sub(top);
+                if available >= self.tlab_size {
+                    self.tlab.cursor = region.header.alloc_top;
+                    self.tlab.limit =
+                        unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
+                    self.tlab.region_idx = idx as u16;
+                    region.header.alloc_top = unsafe { region.header.alloc_top.add(self.tlab_size) };
+                    return Ok(());
+                }
             }
         }
 
@@ -478,8 +504,19 @@ impl Allocator for HeapAllocator {
             return self.alloc_large(size);
         }
 
-        // Try to refill the TLAB.
-        self.refill_tlab()?;
+        // Try to refill the TLAB. Once the configured nursery budget is full,
+        // collect it and retry against the reset nursery regions. The explicit
+        // no-collection mode is used only by the tree-walker until its Rust-side
+        // evaluator roots are registered.
+        if let Err(err) = self.refill_tlab() {
+            if !self.auto_collect || !matches!(err, BlissError::Oom) {
+                return Err(err);
+            }
+            self.tlab.cursor = std::ptr::null_mut();
+            self.tlab.limit = std::ptr::null();
+            HeapCollector::new().minor_gc()?;
+            self.refill_tlab()?;
+        }
 
         // Retry fast-path allocation after refill.
         self.alloc_fast(size).ok_or(BlissError::Oom)
@@ -2091,7 +2128,7 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         let mut guard = cell.borrow_mut();
         if guard.is_none() {
             ensure_heap_initialized();
-            *guard = HeapAllocator::new().ok();
+            *guard = HeapAllocator::new_without_auto_collect().ok();
         }
         let alloc = guard.as_mut()?;
         let body = alloc
