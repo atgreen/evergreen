@@ -27,6 +27,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+use crate::t2::inlining::{InlineDecision, InlineOptions, IntrinsicId, decide, metadata_for_symbol};
 use crate::t2::ir::{
     AuxData, Block, Function, IRType, Inst, InstData, InstFlags, Opcode, TypeBits, Value,
     ValueRepresentation,
@@ -49,7 +50,17 @@ enum Var {
 
 /// Build a block-based SSA `Function` from `bf` (spec §4.3.5, R4.19).
 pub fn build_from_bytecode(bf: &BytecodeFunction) -> Result<Function, BuildError> {
-    Builder::new(bf).run()
+    build_from_bytecode_with_inline_options(bf, InlineOptions::default())
+}
+
+/// Build T2 IR with explicit per-call-site inlining policy. The ordinary
+/// tiering path uses [`InlineOptions::default`]; this entry point is also the
+/// seam where lexical INLINE/NOTINLINE declarations are supplied.
+pub fn build_from_bytecode_with_inline_options(
+    bf: &BytecodeFunction,
+    inline_options: InlineOptions,
+) -> Result<Function, BuildError> {
+    Builder::new(bf, inline_options).run()
 }
 
 struct Builder<'a> {
@@ -77,10 +88,16 @@ struct Builder<'a> {
     sealed: Vec<bool>,
     /// Incomplete phis (header params) awaiting operand fill at seal time.
     incomplete_phis: HashMap<Block, Vec<(Var, Value)>>,
+    inline_options: InlineOptions,
+    remaining_inline_budget: u32,
+    /// Body cloning will increment this while descending an inline call tree.
+    /// Intrinsic expansions are leaves, so the first implementation stays at 0.
+    inline_depth: u8,
 }
 
 impl<'a> Builder<'a> {
-    fn new(bf: &'a BytecodeFunction) -> Builder<'a> {
+    fn new(bf: &'a BytecodeFunction, inline_options: InlineOptions) -> Builder<'a> {
+        let remaining_inline_budget = inline_options.config.node_budget;
         Builder {
             bf,
             f: Function::new(bf.name.clone()),
@@ -95,6 +112,9 @@ impl<'a> Builder<'a> {
             current_def: HashMap::new(),
             sealed: Vec::new(),
             incomplete_phis: HashMap::new(),
+            inline_options,
+            remaining_inline_budget,
+            inline_depth: 0,
         }
     }
 
@@ -400,103 +420,25 @@ impl<'a> Builder<'a> {
                     if stack.len() < n {
                         return Err(BuildError::Unsupported("stack underflow (CallNamed)"));
                     }
-                    // Intrinsic lowering (bliss): pure tag/identity predicates
-                    // lower to inline IR instead of an opaque runtime `Call`.
-                    // `EQ`/`NULL` → `GenericEq` (NULL = EQ x NIL); the type
-                    // predicates → `TypeCheck` with the tested tag. A user
-                    // shadowing these CL symbols would reuse the same symbol index
-                    // — accepted for now, as redefining them is undefined per CLHS.
-                    if let Some(name) = crate::reader::symbol_name(*sym) {
-                        let bare = name.rsplit(':').next().unwrap_or(&name);
-                        // A single-tag `TypeCheck` if this is a type predicate we
-                        // model inline: `consp`/`symbolp` directly, or
-                        // `(typep x 'TYPE)` for a constant single-tag TYPE (the
-                        // standard `fixnum`/`cons`/`symbol` test — `integer` is
-                        // deferred, it needs a guarded bignum widetag load).
-                        let tag_bits: Option<crate::t2::ir::TypeBits> = match (bare, n) {
-                            ("CONSP", 1) => Some(TypeBits::CONS),
-                            ("SYMBOLP", 1) => Some(TypeBits::SYMBOL),
-                            ("INTEGERP", 1) => {
-                                Some(TypeBits::FIXNUM.join(TypeBits::BIGNUM))
+                    // Compiler-known functions reach T2 through shared metadata
+                    // and call-site policy. An expansion hook can still decline
+                    // for operand-shape reasons (for example dynamic TYPEP),
+                    // leaving the normal Call and its FrameState intact.
+                    if let Some(metadata) = metadata_for_symbol(*sym) {
+                        let policy = self.inline_options.policy_at(i as u32);
+                        let decision = decide(
+                            metadata,
+                            *nargs,
+                            policy,
+                            self.inline_depth,
+                            self.remaining_inline_budget,
+                            self.inline_options.config,
+                        );
+                        if let InlineDecision::Expand(intrinsic) = decision {
+                            if self.expand_intrinsic(intrinsic, block, &mut stack, i, start)? {
+                                self.remaining_inline_budget -= metadata.cost;
+                                continue;
                             }
-                            ("TYPEP", 2) if i > start => {
-                                // The type argument is the immediately-preceding
-                                // constant symbol on the stack.
-                                if let Instr::Const(cidx) = code[i - 1] {
-                                    self.bf
-                                        .constants
-                                        .get(cidx as usize)
-                                        .copied()
-                                        .filter(|v| v.is_symbol())
-                                        .and_then(|v| {
-                                            crate::reader::symbol_name(v.as_symbol_index())
-                                        })
-                                        .and_then(|tn| {
-                                            match tn.rsplit(':').next().unwrap_or(&tn) {
-                                                "FIXNUM" => Some(TypeBits::FIXNUM),
-                                                "CONS" => Some(TypeBits::CONS),
-                                                "SYMBOL" => Some(TypeBits::SYMBOL),
-                                                "INTEGER" => Some(
-                                                    TypeBits::FIXNUM.join(TypeBits::BIGNUM),
-                                                ),
-                                                _ => None,
-                                            }
-                                        })
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        };
-                        if let Some(bits) = tag_bits {
-                            // `typep` also has the constant type on the stack above
-                            // `x`; drop it (its ConstSymbol is DCE'd). `consp`/
-                            // `symbolp` have only `x`.
-                            if bare == "TYPEP" {
-                                stack.pop();
-                            }
-                            let x = stack.pop().unwrap();
-                            let r = self
-                                .emit(
-                                    block,
-                                    Opcode::TypeCheck,
-                                    vec![x],
-                                    AuxData::TypeTag(IRType::of(bits)),
-                                    InstFlags::default(),
-                                    None,
-                                    IRType::TOP,
-                                )
-                                .ok_or(BuildError::Unsupported("TypeCheck has a result"))?;
-                            stack.push(r);
-                            continue;
-                        }
-                        // `EQ`/`NULL` → inline identity compare. NULL = EQ x NIL.
-                        let eq_args = match (bare, n) {
-                            ("NULL", 1) => {
-                                let x = stack.pop().unwrap();
-                                Some(vec![x, self.emit_const_nil(block)])
-                            }
-                            ("EQ", 2) => {
-                                let b = stack.pop().unwrap();
-                                let a = stack.pop().unwrap();
-                                Some(vec![a, b])
-                            }
-                            _ => None,
-                        };
-                        if let Some(args) = eq_args {
-                            let r = self
-                                .emit(
-                                    block,
-                                    Opcode::GenericEq,
-                                    args,
-                                    AuxData::None,
-                                    InstFlags::default(),
-                                    None,
-                                    IRType::TOP,
-                                )
-                                .ok_or(BuildError::Unsupported("GenericEq has a result"))?;
-                            stack.push(r);
-                            continue;
                         }
                     }
                     // Snapshot the pre-call frame (args still live) for deopt.
@@ -800,6 +742,92 @@ impl<'a> Builder<'a> {
         })
     }
 
+    /// Materialise one metadata-selected leaf expansion. `Ok(false)` means the
+    /// hook does not support this operand shape, so the normal call is retained.
+    /// The operand stack is changed only after support is proven.
+    fn expand_intrinsic(
+        &mut self,
+        intrinsic: IntrinsicId,
+        block: Block,
+        stack: &mut Vec<Value>,
+        bcp: usize,
+        block_start: usize,
+    ) -> Result<bool, BuildError> {
+        let type_bits = match intrinsic {
+            IntrinsicId::Consp => Some(TypeBits::CONS),
+            IntrinsicId::Symbolp => Some(TypeBits::SYMBOL),
+            IntrinsicId::Integerp => Some(TypeBits::FIXNUM.join(TypeBits::BIGNUM)),
+            IntrinsicId::TypepConstant => {
+                if bcp <= block_start {
+                    return Ok(false);
+                }
+                let Instr::Const(cidx) = self.bf.code[bcp - 1] else {
+                    return Ok(false);
+                };
+                let Some(type_name) = self.bf.constants
+                    .get(cidx as usize)
+                    .copied()
+                    .filter(|v| v.is_symbol())
+                    .and_then(|v| crate::reader::symbol_name(v.as_symbol_index()))
+                else {
+                    return Ok(false);
+                };
+                match type_name.rsplit(':').next().unwrap_or(&type_name) {
+                    "FIXNUM" => Some(TypeBits::FIXNUM),
+                    "CONS" => Some(TypeBits::CONS),
+                    "SYMBOL" => Some(TypeBits::SYMBOL),
+                    "INTEGER" => Some(TypeBits::FIXNUM.join(TypeBits::BIGNUM)),
+                    _ => return Ok(false),
+                }
+            }
+            IntrinsicId::Eq | IntrinsicId::Null => None,
+        };
+
+        if let Some(bits) = type_bits {
+            if intrinsic == IntrinsicId::TypepConstant {
+                // Its ConstSymbol is now dead and the ordinary DCE pass removes it.
+                stack.pop().ok_or(BuildError::Unsupported("stack underflow (TYPEP type)"))?;
+            }
+            let x = stack.pop().ok_or(BuildError::Unsupported("stack underflow (type predicate)"))?;
+            let result = self.emit(
+                block,
+                Opcode::TypeCheck,
+                vec![x],
+                AuxData::TypeTag(IRType::of(bits)),
+                InstFlags::default(),
+                None,
+                IRType::TOP,
+            ).ok_or(BuildError::Unsupported("TypeCheck has a result"))?;
+            stack.push(result);
+            return Ok(true);
+        }
+
+        let args = match intrinsic {
+            IntrinsicId::Null => {
+                let x = stack.pop().ok_or(BuildError::Unsupported("stack underflow (NULL)"))?;
+                vec![x, self.emit_const_nil(block)]
+            }
+            IntrinsicId::Eq => {
+                let b = stack.pop().ok_or(BuildError::Unsupported("stack underflow (EQ rhs)"))?;
+                let a = stack.pop().ok_or(BuildError::Unsupported("stack underflow (EQ lhs)"))?;
+                vec![a, b]
+            }
+            IntrinsicId::Consp | IntrinsicId::Symbolp | IntrinsicId::Integerp
+            | IntrinsicId::TypepConstant => unreachable!("handled as TypeCheck above"),
+        };
+        let result = self.emit(
+            block,
+            Opcode::GenericEq,
+            args,
+            AuxData::None,
+            InstFlags::default(),
+            None,
+            IRType::TOP,
+        ).ok_or(BuildError::Unsupported("GenericEq has a result"))?;
+        stack.push(result);
+        Ok(true)
+    }
+
     // ── Instruction emit helpers ────────────────────────────────────
 
     fn set_term(&mut self, block: Block, data: InstData) {
@@ -998,6 +1026,7 @@ fn trap() -> InstData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::t2::inlining::{InlineConfig, InlineOptions, InlinePolicy};
     use crate::t2::ir::Opcode;
     use bliss_rt::value::BlissVal;
 
@@ -1210,6 +1239,91 @@ mod tests {
         assert!(call.frame_state.is_some(), "call must carry a FrameState");
         assert_eq!(call.args.len(), 1, "one argument popped for the call");
         assert!(!f.frame_states.is_empty(), "frame-state table populated");
+    }
+
+    #[test]
+    fn notinline_keeps_known_function_as_a_call() {
+        let eq = bliss_rt::symbols::intern("EQ");
+        let input = bf(
+            "notinline-eq",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::LoadLocal(1),
+                Instr::CallNamed { sym: eq, nargs: 2 },
+                Instr::Return,
+            ],
+            vec![], 2, 2, 2,
+        );
+        let options = InlineOptions::default().with_policy(2, InlinePolicy::NotInline);
+        let f = build_from_bytecode_with_inline_options(&input, options).expect("builds");
+        let call = f.block(f.entry()).insts.iter()
+            .map(|&i| f.inst(i))
+            .find(|d| d.opcode == Opcode::Call)
+            .expect("NOTINLINE must retain the call");
+        assert!(call.frame_state.is_some(), "retained call keeps precise deopt state");
+        assert!(!has_opcode(&f, f.entry(), Opcode::GenericEq));
+    }
+
+    #[test]
+    fn budget_and_depth_limits_keep_known_function_as_a_call() {
+        let null = bliss_rt::symbols::intern("NULL");
+        let input = bf(
+            "limited-null",
+            vec![Instr::LoadLocal(0), Instr::CallNamed { sym: null, nargs: 1 }, Instr::Return],
+            vec![], 1, 1, 1,
+        );
+
+        let mut no_budget = InlineOptions::default();
+        no_budget.config.node_budget = 0;
+        let f = build_from_bytecode_with_inline_options(&input, no_budget).expect("builds");
+        assert!(has_opcode(&f, f.entry(), Opcode::Call));
+
+        let mut no_depth = InlineOptions::default();
+        no_depth.config = InlineConfig { max_depth: 0, ..InlineConfig::default() };
+        let f = build_from_bytecode_with_inline_options(&input, no_depth).expect("builds");
+        assert!(has_opcode(&f, f.entry(), Opcode::Call));
+    }
+
+    #[test]
+    fn inline_policy_overrides_profitability_threshold() {
+        let null = bliss_rt::symbols::intern("NULL");
+        let input = bf(
+            "explicit-inline-null",
+            vec![Instr::LoadLocal(0), Instr::CallNamed { sym: null, nargs: 1 }, Instr::Return],
+            vec![], 1, 1, 1,
+        );
+
+        let mut default_policy = InlineOptions::default();
+        default_policy.config.small_threshold = 0;
+        let f = build_from_bytecode_with_inline_options(&input, default_policy).expect("builds");
+        assert!(has_opcode(&f, f.entry(), Opcode::Call));
+
+        let mut explicit_inline = InlineOptions::default().with_policy(1, InlinePolicy::Inline);
+        explicit_inline.config.small_threshold = 0;
+        let f = build_from_bytecode_with_inline_options(&input, explicit_inline).expect("builds");
+        assert!(has_opcode(&f, f.entry(), Opcode::GenericEq));
+        assert!(!has_opcode(&f, f.entry(), Opcode::Call));
+    }
+
+    #[test]
+    fn unsupported_typep_shape_keeps_call_and_frame_state() {
+        let typep = bliss_rt::symbols::intern("TYPEP");
+        let input = bf(
+            "dynamic-typep",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::LoadLocal(1),
+                Instr::CallNamed { sym: typep, nargs: 2 },
+                Instr::Return,
+            ],
+            vec![], 2, 2, 2,
+        );
+        let f = build_from_bytecode(&input).expect("builds");
+        let call = f.block(f.entry()).insts.iter()
+            .map(|&i| f.inst(i))
+            .find(|d| d.opcode == Opcode::Call)
+            .expect("dynamic TYPEP must stay a call");
+        assert!(call.frame_state.is_some());
     }
 
     #[test]

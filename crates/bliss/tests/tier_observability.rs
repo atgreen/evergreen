@@ -221,6 +221,36 @@ fn global_store_before_guard_reaches_t2_and_deopts_once() {
     assert_eq!(twl, line, "T2 result must match the tree-walker: {line:?} vs {twl:?}");
 }
 
+/// The metadata-selected INTEGERP expansion composes with a later speculative
+/// arithmetic guard. Warm fixnums take the inlined true branch; a float takes
+/// the false branch and forces deoptimization at its cold `+`. The resumed T0
+/// result must match the tree-walker and the deopt counter must advance once.
+/// Compiler-level integration tests separately assert that this CallNamed was
+/// replaced by TypeCheck rather than emitted as a runtime call.
+#[test]
+fn metadata_intrinsic_survives_later_forced_deopt() {
+    let prog = "\
+        (defun inline-deopt (x) (if (integerp x) (+ x 1) (+ x 2))) \
+        (dotimes (k 60) (inline-deopt k)) \
+        (let ((before (bliss-ext:deopt-count)) \
+              (value (inline-deopt 1.5))) \
+          (format t \"~a ~a ~a~%\" before value (bliss-ext:deopt-count)))";
+
+    let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
+    assert!(ok, "T2 intrinsic/deopt run failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(fields.get(1).copied(), Some("3.5"), "forced-deopt result: {line:?}");
+    let before: u64 = fields.first().expect("before count").parse().expect("count");
+    let after: u64 = fields.get(2).expect("after count").parse().expect("count");
+    assert_eq!(after, before + 1, "the cold float path must deopt exactly once: {line:?}");
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker run failed: {tw}");
+    let tw_fields: Vec<&str> = tw.lines().next().unwrap_or("").split_whitespace().collect();
+    assert_eq!(tw_fields.get(1).copied(), Some("3.5"), "tree-walker oracle: {tw:?}");
+}
+
 /// A global-accumulator LOOP reaches T2 (bliss-fe8: the builder's loop SSA is
 /// stitched correctly and its loop-invariant phis are collapsed so it fits the
 /// framed register budget), computes the interpreted result, and deopts

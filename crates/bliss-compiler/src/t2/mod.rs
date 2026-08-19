@@ -31,6 +31,7 @@ pub mod pass;
 // ── Wave 1 parcels (one module per sub-agent; disjoint files) ─────
 pub mod build; // P1 — bytecode → SSA
 pub mod infer; // P3 — type/range/representation inference
+pub mod inlining; // call-site policy + compiler-known inline metadata
 pub mod verify; // P2 — IR verifier (A4.07)
 
 // ── Wave 2 parcels ────────────────────────────────────────────────
