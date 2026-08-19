@@ -5,7 +5,7 @@
 
 use bliss_rt::object::{type_id, ObjectHeader};
 use bliss_rt::value::{BlissVal, NIL, TAG_CONS, TAG_MASK};
-use bliss_rt::{current_thread, init_heap, Allocator, BlissStack, Collector, GcConfig};
+use bliss_rt::{current_thread, init_heap, walk_heap, Allocator, BlissStack, Collector, GcConfig};
 use bliss_rt::{HeapAllocator, HeapCollector};
 use std::sync::{Mutex, OnceLock};
 
@@ -68,35 +68,40 @@ fn interconnected_objects_survive_minor_and_major_evacuation_with_identity() {
     init_heap(&gc_config()).expect("init_heap");
     let mut alloc = HeapAllocator::new().expect("allocator");
 
-    // A rooted linked list (100 200 300), plus a lot of unrooted garbage conses
-    // so the promoted old-gen region is mostly dead (forces major evacuation).
+    // A rooted linked list (100 200 300), plus many objects that survive the
+    // minor collection and then become unreachable. That leaves the promoted
+    // old-gen region mostly dead and forces major evacuation.
     let c3 = make_cons(&mut alloc, BlissVal::from_fixnum(300), NIL);
     let c2 = make_cons(&mut alloc, BlissVal::from_fixnum(200), c3);
     let c1 = make_cons(&mut alloc, BlissVal::from_fixnum(100), c2);
-    for _ in 0..400 {
-        let _garbage = make_cons(&mut alloc, BlissVal::from_fixnum(0), NIL);
-    }
+    let garbage: Vec<BlissVal> = (0..400)
+        .map(|_| make_cons(&mut alloc, BlissVal::from_fixnum(0), NIL))
+        .collect();
 
-    // Root only the list head on the current thread's CL stack.
+    // Root the list head and temporary objects on the current thread's CL stack.
     let stack = current_thread().stack();
     let f = stack
-        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 401, 0)
         .unwrap();
-    unsafe { BlissStack::frame_slots_mut(f)[0] = c1 };
+    unsafe {
+        let slots = BlissStack::frame_slots_mut(f);
+        slots[0] = c1;
+        slots[1..].copy_from_slice(&garbage);
+    }
     let orig = c1;
 
-    // MINOR GC: promotes live+garbage to old-gen (threshold 0); relocates the
+    // MINOR GC: promotes the rooted objects to old-gen (threshold 0); relocates the
     // frame root and the list's cdr links to the promoted copies.
     HeapCollector::new().minor_gc().expect("minor_gc");
     let after_minor = unsafe { BlissStack::frame_slots_mut(f)[0] };
     assert_ne!(after_minor.0, orig.0, "list evacuated by minor GC");
     check_list(after_minor, &[100, 200, 300]);
 
-    // Fill the nursery with more garbage, then MAJOR GC: the mostly-dead old-gen
-    // region is evacuated, moving the live list again and rewriting its internal
-    // links + the frame root before the region is freed.
-    for _ in 0..400 {
-        let _garbage = make_cons(&mut alloc, BlissVal::from_fixnum(0), NIL);
+    // Drop the temporary roots, then MAJOR GC: the mostly-dead old-gen region is
+    // evacuated, moving the live list again and rewriting its internal links +
+    // the frame root before the region is freed.
+    unsafe {
+        BlissStack::frame_slots_mut(f)[1..].fill(NIL);
     }
     HeapCollector::new().full_gc().expect("full_gc");
     let after_major = unsafe { BlissStack::frame_slots_mut(f)[0] };
@@ -105,6 +110,43 @@ fn interconnected_objects_survive_minor_and_major_evacuation_with_identity() {
         "list evacuated again by major GC (old-gen compaction)"
     );
     check_list(after_major, &[100, 200, 300]);
+
+    stack.pop_frame();
+}
+
+#[test]
+fn minor_gc_does_not_promote_unreachable_nursery_objects() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&gc_config()).expect("init_heap");
+    let mut alloc = HeapAllocator::new().expect("allocator");
+
+    let live = make_cons(&mut alloc, BlissVal::from_fixnum(42), NIL);
+    for _ in 0..400 {
+        let _ = make_cons(&mut alloc, BlissVal::from_fixnum(0), NIL);
+    }
+
+    let stack = current_thread().stack();
+    let frame = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)
+        .unwrap();
+    unsafe { BlissStack::frame_slots_mut(frame)[0] = live };
+
+    HeapCollector::new().minor_gc().expect("minor_gc");
+
+    let relocated = unsafe { BlissStack::frame_slots_mut(frame)[0] };
+    assert_eq!(car(relocated).as_fixnum(), 42);
+    let mut cons_count = 0;
+    walk_heap(|_, tid, _| {
+        if tid == type_id::CONS {
+            cons_count += 1;
+        }
+        true
+    })
+    .expect("walk_heap");
+    assert_eq!(
+        cons_count, 1,
+        "only the rooted cons should survive the nursery collection"
+    );
 
     stack.pop_frame();
 }

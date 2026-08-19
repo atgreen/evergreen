@@ -996,7 +996,12 @@ impl Collector for HeapCollector {
         // Phase 1: Ensure we have a survivor region to copy into.
         let survivor_idx = Self::find_or_create_target_region(state, RegionKind::Survivor, 1);
 
-        // Phase 2: Walk each nursery region, copy live objects to survivor/old-gen.
+        // Phase 2: Build the precise young-generation live set.  A nursery
+        // collection must not copy every allocated object: doing so merely
+        // turns short-lived garbage into old-generation garbage and makes an
+        // allocation loop consume the whole heap.  Index nursery objects, mark
+        // them from the runtime roots and older generations, then follow young
+        // object fields transitively.
         let mut bytes_promoted: u64 = 0;
         let mut _nursery_used: u64 = 0;
 
@@ -1021,6 +1026,126 @@ impl Collector for HeapCollector {
                 top > base && unsafe { region_has_pinned(base, top) }
             })
             .collect();
+
+        // body address -> (total size, region index, type id, body length)
+        let mut nursery_index: std::collections::HashMap<usize, (usize, usize, u8, usize)> =
+            std::collections::HashMap::new();
+        for &nursery_idx in &nursery_indices {
+            let base = state.regions[nursery_idx].base as usize;
+            let top = state.regions[nursery_idx].header.alloc_top as usize;
+            let mut cursor = base;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let header_ptr = cursor as *const u8;
+                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                if body_size == 0 && type_id == 0 {
+                    break;
+                }
+                let total_size =
+                    align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                if !unsafe { header_is_forwarded(header_ptr) } {
+                    nursery_index.insert(
+                        cursor + OBJECT_HEADER_SIZE,
+                        (total_size, nursery_idx, type_id, body_size as usize),
+                    );
+                }
+                cursor += total_size;
+            }
+        }
+
+        let mut marked: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut mark_worklist: Vec<usize> = Vec::new();
+        let mark_ref = |v: BlissVal,
+                        marked: &mut std::collections::HashSet<usize>,
+                        worklist: &mut Vec<usize>| {
+            if is_heap_ref(v) {
+                let target = ref_body_addr(v);
+                if nursery_index.contains_key(&target) && marked.insert(target) {
+                    worklist.push(target);
+                }
+            }
+        };
+
+        // Direct roots shared with the major collector.
+        mark_ref(get_entry_continuation(), &mut marked, &mut mark_worklist);
+        Self::scan_cl_stack_roots(&mut marked, &mut mark_worklist, &nursery_index);
+        crate::symbols::for_each_root_slot(|slot| {
+            mark_ref(unsafe { *slot }, &mut marked, &mut mark_worklist);
+        });
+        scan_external_roots(|slot| {
+            mark_ref(unsafe { *slot }, &mut marked, &mut mark_worklist);
+        });
+
+        // Barrier-recorded old-to-young slots are roots even when their holder
+        // has an opaque/untyped layout that `trace_object` cannot inspect.
+        let heap_base_addr = state.heap_base as usize;
+        let heap_end = heap_base_addr + state.config.heap_size;
+        for &slot_addr in &state.remembered {
+            if slot_addr >= heap_base_addr && slot_addr + 8 <= heap_end {
+                mark_ref(
+                    unsafe { *(slot_addr as *const BlissVal) },
+                    &mut marked,
+                    &mut mark_worklist,
+                );
+            }
+        }
+
+        // Scan every non-nursery object for young references.  The remembered
+        // set is the fast-path record of old-to-young stores, but a complete
+        // collection must also cover objects constructed before a barrier was
+        // available and survivor-to-nursery edges.
+        for region in state.regions.iter() {
+            if !matches!(
+                region.header.kind,
+                RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject
+            ) {
+                continue;
+            }
+            let mut cursor = region.base as usize;
+            let top = region.header.alloc_top as usize;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let header_ptr = cursor as *const u8;
+                let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                if body_size == 0 && type_id == 0 {
+                    break;
+                }
+                let total_size =
+                    align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                if !unsafe { header_is_forwarded(header_ptr) } {
+                    unsafe {
+                        trace_object(
+                            (cursor + OBJECT_HEADER_SIZE) as *mut u8,
+                            type_id,
+                            body_size as usize,
+                            |slot| mark_ref(*slot, &mut marked, &mut mark_worklist),
+                        );
+                    }
+                }
+                cursor += total_size;
+            }
+        }
+
+        // A pinned nursery region stays in place as a unit.  Treat every object
+        // in it as live so its outbound references are retained and relocated;
+        // otherwise an unmarked neighbour could keep a stale pointer after the
+        // region is promoted wholesale.
+        for &nursery_idx in &pinned_indices {
+            for (&body_addr, &(_, region_idx, _, _)) in &nursery_index {
+                if region_idx == nursery_idx && marked.insert(body_addr) {
+                    mark_worklist.push(body_addr);
+                }
+            }
+        }
+
+        // Young-to-young transitive closure.
+        while let Some(body_addr) = mark_worklist.pop() {
+            if let Some(&(_, _, type_id, body_len)) = nursery_index.get(&body_addr) {
+                unsafe {
+                    trace_object(body_addr as *mut u8, type_id, body_len, |slot| {
+                        mark_ref(*slot, &mut marked, &mut mark_worklist);
+                    });
+                }
+            }
+        }
 
         for &nursery_idx in &nursery_indices {
             if pinned_indices.contains(&nursery_idx) {
@@ -1054,6 +1179,12 @@ impl Collector for HeapCollector {
 
                 let total_size =
                     align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+
+                let body_addr = cursor + OBJECT_HEADER_SIZE;
+                if !marked.contains(&body_addr) {
+                    cursor += total_size;
+                    continue;
+                }
 
                 // Decide target: promote to old-gen if region age >= threshold,
                 // otherwise copy to survivor.
@@ -1125,8 +1256,6 @@ impl Collector for HeapCollector {
         // the forwarding pointers are still intact. Every slot and referent is
         // bounds-checked before it is dereferenced. Remembered slots are cleared:
         // their referents now live in regions a minor GC does not move.
-        let heap_base_addr = state.heap_base as usize;
-        let heap_end = heap_base_addr + state.config.heap_size;
         let remembered: Vec<usize> = state.remembered.drain().collect();
         for slot_addr in remembered {
             if slot_addr < heap_base_addr || slot_addr + 8 > heap_end {
@@ -3093,13 +3222,8 @@ mod trace_tests {
 
     #[test]
     fn simple_vector_traces_elements_not_the_length_word() {
-        // [length=2, elem0, elem1, padding]. The length is a fixnum, not a ref.
-        let body = [
-            BlissVal::from_fixnum(2).0,
-            heapish(0x4000),
-            heapish(0x5000),
-            0,
-        ];
+        // [length=2, elem0, elem1, padding]. The length is a raw count, not a ref.
+        let body = [2, heapish(0x4000), heapish(0x5000), 0];
         assert_eq!(
             traced(tid::SIMPLE_VECTOR, &body),
             vec![heapish(0x4000), heapish(0x5000)]
