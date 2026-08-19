@@ -1040,8 +1040,8 @@ fn emit_generic_eq(
     Ok(())
 }
 
-/// Emit `TypeCheck` (the `fixnump`/`consp`/`symbolp` intrinsics) as an inline
-/// tag test producing `T`/`NIL` — no runtime call. Single-tag predicates
+/// Emit `TypeCheck` type-predicate intrinsics as inline tests producing
+/// `T`/`NIL` — no runtime call. Single-tag predicates
 /// (fixnum tag 000, cons tag 001) are one `and`+`cmp`; `symbolp` also accepts
 /// the two special-cased symbols NIL (0x7) and T (0xF), whose tag is not the
 /// SYMBOL tag (101). `dst` is written only after every read of the operand, so a
@@ -1073,6 +1073,7 @@ fn emit_type_check(
     const CMP: u8 = 7;
     let dst = framed_alloc(reg, pool, data.results[0])?;
     let found = a.label();
+    let not_found = a.label();
     let end = a.label();
     let single_tag = |a: &mut Asm, tag: i32| {
         mov_rr(a, SCRATCH, xr);
@@ -1092,10 +1093,24 @@ fn emit_type_check(
         a.jcc(Cc::E, found);
         alu_r_imm(a, CMP, xr, bliss_rt::value::T.0 as i32); // T is a symbol
         a.jcc(Cc::E, found);
+    } else if bits == TypeBits::FIXNUM.join(TypeBits::BIGNUM) {
+        // INTEGER = immediate fixnum OR a heap object whose header widetag is
+        // BIGNUM. Guard the heap tag before dereferencing the tagged pointer.
+        single_tag(a, 0);
+        a.jcc(Cc::E, found);
+        single_tag(a, bliss_rt::value::TAG_HEAP_OBJECT as i32);
+        a.jcc(Cc::Ne, not_found);
+        mov_rr(a, SCRATCH, xr);
+        alu_r_imm(a, AND, SCRATCH, -8); // clear the low tag bits
+        // cmp byte ptr [scratch + 7], BIGNUM. ObjectHeader::type_id occupies
+        // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
+        a.extend_from_slice(&[0x80, 0x7A, 0x07, bliss_rt::object::type_id::BIGNUM]);
+        a.jcc(Cc::E, found);
     } else {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
     }
     // Fall-through: not the type.
+    a.bind(not_found);
     mov_imm64(a, dst, bliss_rt::value::NIL.0 as i64);
     a.jmp(end);
     a.bind(found);
@@ -2115,6 +2130,7 @@ mod tests {
             handler_cases: vec![], handler_binds: vec![], names: vec![], restart_cases: vec![],
             param_layout: vec![], has_env: false, n_locals: 1, max_stack: 2, arity: 1,
             name: "mul5".into(),
+            params_form: bliss_rt::value::NIL, min_args: 1, max_args: Some(1), variadic: false,
         };
         let mut f = crate::t2::build::build_from_bytecode(&bf).expect("build");
         speculate(&mut f, &|bcp| if bcp == 2 { Some(SpecType::Fixnum) } else { None });

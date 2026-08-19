@@ -112,6 +112,10 @@ mod tests {
             max_stack,
             arity,
             name: name.to_string(),
+            params_form: bliss_rt::value::NIL,
+            min_args: arity,
+            max_args: Some(arity),
+            variadic: false,
         }
     }
 

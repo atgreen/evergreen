@@ -17,7 +17,8 @@ use bliss_compiler::t2::pass::PassManager;
 use bliss_compiler::t2::regalloc::allocate;
 use bliss_compiler::t2::verify::verify;
 use bliss_rt::bytecode::{BytecodeFunction, Instr};
-use bliss_rt::value::BlissVal;
+use bliss_rt::object::{ObjectHeader, type_id};
+use bliss_rt::value::{BlissVal, NIL, T};
 
 fn bytecode_fn(name: &str, code: Vec<Instr>, constants: Vec<BlissVal>, n_locals: u16, max_stack: u16, arity: u16) -> BytecodeFunction {
     BytecodeFunction {
@@ -33,7 +34,101 @@ fn bytecode_fn(name: &str, code: Vec<Instr>, constants: Vec<BlissVal>, n_locals:
         max_stack,
         arity,
         name: name.to_string(),
+        params_form: NIL,
+        min_args: arity,
+        max_args: Some(arity),
+        variadic: false,
     }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn integerp_intrinsic_accepts_fixnums_and_bignums_without_a_call() {
+    use bliss_compiler::t2::emit::emit_framed;
+    use bliss_compiler::t2::ir::Opcode;
+
+    let integerp = bliss_rt::symbols::intern("INTEGERP");
+    let bf = bytecode_fn(
+        "integer-predicate",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::CallNamed {
+                sym: integerp,
+                nargs: 1,
+            },
+            Instr::Return,
+        ],
+        vec![],
+        1,
+        1,
+        1,
+    );
+    let f = build_from_bytecode(&bf).expect("build INTEGERP intrinsic");
+    assert!(f.block_order().iter().any(|&b| {
+        f.block(b)
+            .insts
+            .iter()
+            .any(|&i| f.inst(i).opcode == Opcode::TypeCheck)
+    }));
+    assert!(!f.block_order().iter().any(|&b| {
+        f.block(b)
+            .insts
+            .iter()
+            .any(|&i| f.inst(i).opcode == Opcode::Call)
+    }));
+
+    let typep = bliss_rt::symbols::intern("TYPEP");
+    let integer = bliss_rt::symbols::intern("INTEGER");
+    let typep_bf = bytecode_fn(
+        "integer-typep",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::Const(0),
+            Instr::CallNamed {
+                sym: typep,
+                nargs: 2,
+            },
+            Instr::Return,
+        ],
+        vec![BlissVal::from_symbol_index(integer)],
+        1,
+        2,
+        1,
+    );
+    let typep_f = build_from_bytecode(&typep_bf).expect("build TYPEP INTEGER intrinsic");
+    assert!(typep_f.block_order().iter().any(|&b| {
+        typep_f
+            .block(b)
+            .insts
+            .iter()
+            .any(|&i| typep_f.inst(i).opcode == Opcode::TypeCheck)
+    }));
+    assert!(!typep_f.block_order().iter().any(|&b| {
+        typep_f
+            .block(b)
+            .insts
+            .iter()
+            .any(|&i| typep_f.inst(i).opcode == Opcode::Call)
+    }));
+
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, None).expect("emit INTEGERP intrinsic");
+    let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+    let run = |value: BlissVal| {
+        let mut frame = [value.0, 0u64];
+        BlissVal(func(frame.as_mut_ptr()))
+    };
+
+    assert_eq!(run(BlissVal::from_fixnum(42)), T);
+    assert_eq!(run(NIL), NIL);
+
+    let bignum = Box::new(ObjectHeader::new(type_id::BIGNUM, 1));
+    let bignum = unsafe { BlissVal::from_heap_ptr(Box::into_raw(bignum).cast::<u8>()) };
+    assert_eq!(run(bignum), T);
+
+    let string = Box::new(ObjectHeader::new(type_id::SIMPLE_BASE_STRING, 1));
+    let string = unsafe { BlissVal::from_heap_ptr(Box::into_raw(string).cast::<u8>()) };
+    assert_eq!(run(string), NIL);
 }
 
 /// `(lambda () 42)` — the smallest real function: push a constant, return it.
@@ -162,6 +257,10 @@ fn fixnum_profile_speculates_the_call() {
         max_stack: 2,
         arity: 1,
         name: "mul5".to_string(),
+        params_form: NIL,
+        min_args: 1,
+        max_args: Some(1),
+        variadic: false,
     };
 
     let mut f = build_from_bytecode(&bf).expect("build");

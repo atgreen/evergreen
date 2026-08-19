@@ -416,6 +416,9 @@ impl<'a> Builder<'a> {
                         let tag_bits: Option<crate::t2::ir::TypeBits> = match (bare, n) {
                             ("CONSP", 1) => Some(TypeBits::CONS),
                             ("SYMBOLP", 1) => Some(TypeBits::SYMBOL),
+                            ("INTEGERP", 1) => {
+                                Some(TypeBits::FIXNUM.join(TypeBits::BIGNUM))
+                            }
                             ("TYPEP", 2) if i > start => {
                                 // The type argument is the immediately-preceding
                                 // constant symbol on the stack.
@@ -433,6 +436,9 @@ impl<'a> Builder<'a> {
                                                 "FIXNUM" => Some(TypeBits::FIXNUM),
                                                 "CONS" => Some(TypeBits::CONS),
                                                 "SYMBOL" => Some(TypeBits::SYMBOL),
+                                                "INTEGER" => Some(
+                                                    TypeBits::FIXNUM.join(TypeBits::BIGNUM),
+                                                ),
                                                 _ => None,
                                             }
                                         })
@@ -1009,6 +1015,10 @@ mod tests {
             max_stack,
             arity,
             name: name.to_string(),
+            params_form: bliss_rt::value::NIL,
+            min_args: arity,
+            max_args: Some(arity),
+            variadic: false,
         }
     }
 
