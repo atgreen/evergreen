@@ -5526,13 +5526,12 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
     // on error), which also keeps `current_package` — the reader's bare-symbol
     // resolution context (bliss-lb6.12) and the REPL prompt — consistent.
     let saved_package = env.current_package.clone();
-    // ANSI LOAD also binds *LOAD-PATHNAME*/*LOAD-TRUENAME* to the file being
-    // loaded for the dynamic extent of the load. ASDF relies on (load-pathname)
-    // to locate a system's .asd directory, so without this every component
-    // pathname stays relative and find-system fails (bliss-lb6.17). Snapshot and
-    // restore so nested loads see their own file and the caller's binding returns.
-    let saved_load_pathname = env.lookup_var("*LOAD-PATHNAME*");
-    let saved_load_truename = env.lookup_var("*LOAD-TRUENAME*");
+    // ANSI LOAD also dynamically binds *LOAD-PATHNAME*/*LOAD-TRUENAME* to the
+    // file being loaded.  The binding must live in the symbols' value cells:
+    // functions called by the loaded file run in their captured lexical
+    // environments and cannot see a binding inserted into this Env frame.
+    // DynBind below gives nested loads the expected stack discipline and restores
+    // both cells on success or error (bliss-lb6.23).
     // Sync the reader's package context to the *current dynamic* value of
     // *PACKAGE*. bliss's reader resolves bare symbols via env.current_package,
     // which a dynamic `(let ((*package* X)) (load …))` binding does not update —
@@ -5558,11 +5557,16 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
         // before reading (bfasl-bytecode-unit).
         let resolved_path = resolve_load_path(path)?;
         // Bind *LOAD-PATHNAME*/*LOAD-TRUENAME* to an absolute pathname for the
-        // file now that its real on-disk location is known.
-        if let Some(pathname) = load_pathname_value(&resolved_path) {
-            env.define_local("*LOAD-PATHNAME*", pathname);
-            env.define_local("*LOAD-TRUENAME*", pathname);
-        }
+        // file now that its real on-disk location is known. Keep the guards alive
+        // through parsing and evaluation; dropping them restores the caller.
+        let _load_path_bindings = load_pathname_value(&resolved_path).and_then(|pathname| {
+            let load_pathname = resolve_sym("*LOAD-PATHNAME*")?;
+            let load_truename = resolve_sym("*LOAD-TRUENAME*")?;
+            Some((
+                DynBind::establish(load_pathname, pathname),
+                DynBind::establish(load_truename, pathname),
+            ))
+        });
         let bytes = std::fs::read(&resolved_path)
             .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", resolved_path, e)))?;
         // A Bliss FASL (.bfasl) starts with the BFASL magic — verify and load the
@@ -5579,10 +5583,6 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
         env.current_package = saved_package.clone();
         env.define_local("*PACKAGE*", package_object(&saved_package));
     }
-    // Restore *LOAD-PATHNAME*/*LOAD-TRUENAME* to the caller's binding (NIL at the
-    // top level), so a load doesn't leak its file into the enclosing context.
-    env.define_local("*LOAD-PATHNAME*", saved_load_pathname.unwrap_or(NIL));
-    env.define_local("*LOAD-TRUENAME*", saved_load_truename.unwrap_or(NIL));
     result
 }
 

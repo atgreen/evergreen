@@ -1911,6 +1911,118 @@ fn load_accepts_a_pathname_designator() {
 }
 
 #[test]
+fn load_pathname_is_dynamic_across_called_functions_and_nested_loads() {
+    // bliss-lb6.23: LOAD used to insert *LOAD-PATHNAME* into only the current
+    // evaluator frame. A global function called by a loaded file therefore saw
+    // NIL, and ASDF lost the directory of a .asd file while defining its system.
+    let dir = std::env::temp_dir().join(format!(
+        "bliss_test_dynamic_load_pathname_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create load-pathname test directory");
+    let inner = dir.join("inner.lisp");
+    let outer = dir.join("outer.lisp");
+    let failing = dir.join("failing.lisp");
+    std::fs::write(
+        &inner,
+        "(format t \"INNER=~a,~a;\"\n\
+         (namestring (observed-load-pathname))\n\
+         (namestring (observed-load-truename)))\n",
+    )
+    .expect("write inner load file");
+    std::fs::write(
+        &outer,
+        format!(
+            "(defun observed-load-pathname () *load-pathname*)\n\
+             (defun observed-load-truename () *load-truename*)\n\
+             (format t \"OUTER-BEFORE=~a,~a;\"\n\
+                     (namestring (observed-load-pathname))\n\
+                     (namestring (observed-load-truename)))\n\
+             (load #P\"{}\")\n\
+             (format t \"OUTER-AFTER=~a,~a;\"\n\
+                     (namestring (observed-load-pathname))\n\
+                     (namestring (observed-load-truename)))\n",
+            inner.display()
+        ),
+    )
+    .expect("write outer load file");
+    std::fs::write(&failing, "(undefined-load-pathname-probe)\n")
+        .expect("write failing load file");
+
+    let outer_abs = outer.canonicalize().expect("canonical outer path");
+    let inner_abs = inner.canonicalize().expect("canonical inner path");
+    let prog = format!(
+        "(progn (load #P\"{}\") (format t \"TOP=~a\" *load-pathname*))",
+        outer.display()
+    );
+    let output = bliss_bin().args(["--eval", &prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "load failed: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "OUTER-BEFORE={},{};",
+            outer_abs.display(),
+            outer_abs.display()
+        )),
+        "called function did not see outer *LOAD-PATHNAME*: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "INNER={},{};",
+            inner_abs.display(),
+            inner_abs.display()
+        )),
+        "nested load did not install its *LOAD-PATHNAME*: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "OUTER-AFTER={},{};",
+            outer_abs.display(),
+            outer_abs.display()
+        )),
+        "nested load did not restore outer *LOAD-PATHNAME*: {stdout}"
+    );
+    assert!(
+        stdout.contains("TOP=NIL"),
+        "LOAD leaked *LOAD-PATHNAME* to its caller: {stdout}"
+    );
+
+    // The RAII guards must restore a pre-existing caller binding when reading or
+    // evaluating the loaded file fails, too.
+    let error_prog = format!(
+        "(progn\n\
+           (setq *load-pathname* #P\"/caller/path.lisp\")\n\
+           (setq *load-truename* #P\"/caller/true.lisp\")\n\
+           (handler-case (load #P\"{}\") (error () nil))\n\
+           (format t \"RESTORED=~a,~a\"\n\
+                   (namestring *load-pathname*)\n\
+                   (namestring *load-truename*)))",
+        failing.display()
+    );
+    let error_output = bliss_bin()
+        .args(["--eval", &error_prog])
+        .output()
+        .expect("run failing nested load");
+
+    let _ = std::fs::remove_file(&inner);
+    let _ = std::fs::remove_file(&outer);
+    let _ = std::fs::remove_file(&failing);
+    let _ = std::fs::remove_dir(&dir);
+
+    let error_stdout = String::from_utf8_lossy(&error_output.stdout);
+    let error_stderr = String::from_utf8_lossy(&error_output.stderr);
+    assert!(
+        error_output.status.success(),
+        "handler-case did not catch failing LOAD: {error_stdout}\n{error_stderr}"
+    );
+    assert!(
+        error_stdout.contains("RESTORED=/caller/path.lisp,/caller/true.lisp"),
+        "failing LOAD did not restore caller bindings: {error_stdout}"
+    );
+}
+
+#[test]
 fn probe_file_reports_existing_and_missing() {
     // PROBE-FILE returns a truename for an existing file, NIL for a missing one,
     // and accepts both string and pathname designators.
