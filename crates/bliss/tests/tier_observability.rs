@@ -274,6 +274,48 @@ fn metadata_stringp_is_tier_differentially_identical() {
     assert_eq!(tw.lines().next().unwrap_or(""), line);
 }
 
+/// UIOP/UTILITY:FIRST-CHAR is selected by package-aware inline metadata.  Its
+/// ASCII/non-empty path runs entirely through string layout IR; empty and
+/// wrong-type inputs deopt at the original call and evaluate the Lisp body,
+/// returning NIL exactly as the tree-walker does.
+#[test]
+fn metadata_first_char_fast_path_and_deopts_match_the_lisp_body() {
+    let prog = "\
+        (defpackage :uiop/utility (:use :cl) (:export :first-char)) \
+        (in-package :uiop/utility) \
+        (defun first-char (s) \
+          (and (stringp s) (plusp (length s)) (char s 0))) \
+        (in-package :cl-user) \
+        (defun first-char-probe (x) (uiop/utility:first-char x)) \
+        (dotimes (k 60) (first-char-probe \"warm\")) \
+        (let ((before (bliss-ext:deopt-count))) \
+          (format t \"~a ~a ~a ~a ~a~%\" \
+            (first-char-probe \"abc\") \
+            (first-char-probe \"\") \
+            (first-char-probe 7) \
+            (first-char-probe \"éclair\") \
+            (- (bliss-ext:deopt-count) before)))";
+
+    let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
+    assert!(ok, "T2 FIRST-CHAR run failed: {out}");
+    let line = out.lines().next().unwrap_or("");
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(fields.len(), 5, "unexpected FIRST-CHAR output: {line:?}");
+    assert_eq!(&fields[..4], &["a", "NIL", "NIL", "é"]);
+    assert_eq!(
+        fields.get(4).copied(),
+        Some("3"),
+        "empty, wrong-type, and Unicode cases deopt: {line:?}"
+    );
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker FIRST-CHAR run failed: {tw}");
+    let tw_line = tw.lines().next().unwrap_or("");
+    let tw_fields: Vec<&str> = tw_line.split_whitespace().collect();
+    assert_eq!(tw_fields.len(), 5, "unexpected tree-walker output: {tw_line:?}");
+    assert_eq!(&tw_fields[..4], &fields[..4]);
+}
+
 /// A global-accumulator LOOP reaches T2 (bliss-fe8: the builder's loop SSA is
 /// stitched correctly and its loop-invariant phis are collapsed so it fits the
 /// framed register budget), computes the interpreted result, and deopts

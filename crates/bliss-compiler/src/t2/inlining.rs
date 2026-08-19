@@ -18,6 +18,7 @@ pub enum KnownFunction {
     Integerp,
     Typep,
     Stringp,
+    FirstChar,
 }
 
 /// Expansion hook understood by the T2 builder.
@@ -30,6 +31,17 @@ pub enum IntrinsicId {
     Integerp,
     TypepConstant,
     Stringp,
+    /// Metadata-owned inline template for UIOP/UTILITY:FIRST-CHAR.  It expands
+    /// to the low-level string layout IR; the emitter has no FIRST-CHAR case.
+    FirstChar,
+}
+
+/// Namespace owning the function identity.  Unqualified names denote inherited
+/// COMMON-LISP symbols, while non-CL helpers must match their package exactly.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FunctionNamespace {
+    CommonLisp,
+    Package(&'static str),
 }
 
 /// Effects of the expansion itself, rather than of an arbitrary generic call
@@ -53,6 +65,7 @@ impl EffectSummary {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct InlineMetadata {
     pub function: KnownFunction,
+    pub namespace: FunctionNamespace,
     pub name: &'static str,
     pub fixed_arity: u16,
     pub effects: EffectSummary,
@@ -64,6 +77,7 @@ pub struct InlineMetadata {
 const KNOWN: &[InlineMetadata] = &[
     InlineMetadata {
         function: KnownFunction::Eq,
+        namespace: FunctionNamespace::CommonLisp,
         name: "EQ",
         fixed_arity: 2,
         effects: EffectSummary::PURE_TOTAL,
@@ -72,6 +86,7 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Null,
+        namespace: FunctionNamespace::CommonLisp,
         name: "NULL",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
@@ -80,6 +95,7 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Consp,
+        namespace: FunctionNamespace::CommonLisp,
         name: "CONSP",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
@@ -88,6 +104,7 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Symbolp,
+        namespace: FunctionNamespace::CommonLisp,
         name: "SYMBOLP",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
@@ -96,6 +113,7 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Integerp,
+        namespace: FunctionNamespace::CommonLisp,
         name: "INTEGERP",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
@@ -107,6 +125,7 @@ const KNOWN: &[InlineMetadata] = &[
     // a malformed type specifier.
     InlineMetadata {
         function: KnownFunction::Typep,
+        namespace: FunctionNamespace::CommonLisp,
         name: "TYPEP",
         fixed_arity: 2,
         effects: EffectSummary::PURE_TOTAL,
@@ -115,11 +134,21 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Stringp,
+        namespace: FunctionNamespace::CommonLisp,
         name: "STRINGP",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
         cost: 1,
         expansion: IntrinsicId::Stringp,
+    },
+    InlineMetadata {
+        function: KnownFunction::FirstChar,
+        namespace: FunctionNamespace::Package("UIOP/UTILITY"),
+        name: "FIRST-CHAR",
+        fixed_arity: 1,
+        effects: EffectSummary::PURE_TOTAL,
+        cost: 3,
+        expansion: IntrinsicId::FirstChar,
     },
 ];
 
@@ -129,13 +158,21 @@ const KNOWN: &[InlineMetadata] = &[
 /// other package is not the CL function and must remain a normal call.
 pub fn metadata_for_symbol(sym: u32) -> Option<&'static InlineMetadata> {
     let name = crate::reader::symbol_name(sym)?;
-    let canonical = match name.rsplit_once(':') {
-        None => name.as_str(),
-        Some((package, bare))
-            if matches!(package.trim_end_matches(':'), "CL" | "COMMON-LISP") => bare,
-        Some(_) => return None,
+    let (package, bare) = match name.rsplit_once(':') {
+        None => (None, name.as_str()),
+        Some((package, bare)) => (Some(package.trim_end_matches(':')), bare),
     };
-    KNOWN.iter().find(|m| m.name == canonical)
+    KNOWN.iter().find(|m| {
+        if m.name != bare {
+            return false;
+        }
+        match m.namespace {
+            FunctionNamespace::CommonLisp => {
+                package.is_none() || matches!(package, Some("CL" | "COMMON-LISP"))
+            }
+            FunctionNamespace::Package(owner) => package == Some(owner),
+        }
+    })
 }
 
 /// Lexical declaration in force at an individual call site.
@@ -298,5 +335,16 @@ mod tests {
 
         let shadow = bliss_rt::symbols::intern("SOME-OTHER-PACKAGE:EQ");
         assert_eq!(metadata_for_symbol(shadow), None);
+
+        let first_char = bliss_rt::symbols::intern("UIOP/UTILITY:FIRST-CHAR");
+        assert_eq!(
+            metadata_for_symbol(first_char).map(|m| m.function),
+            Some(KnownFunction::FirstChar)
+        );
+        assert_eq!(metadata_for_symbol(bliss_rt::symbols::intern("FIRST-CHAR")), None);
+        assert_eq!(
+            metadata_for_symbol(bliss_rt::symbols::intern("OTHER:FIRST-CHAR")),
+            None
+        );
     }
 }

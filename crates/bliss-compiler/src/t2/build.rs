@@ -753,6 +753,58 @@ impl<'a> Builder<'a> {
         bcp: usize,
         block_start: usize,
     ) -> Result<bool, BuildError> {
+        if intrinsic == IntrinsicId::FirstChar {
+            // Inline the metadata-owned body below the CL function layer.  Both
+            // layout operations are guards anchored at the original call: a
+            // wrong type, empty string, or non-ASCII representation resumes at
+            // FIRST-CHAR in T0/T1, which evaluates the full Lisp definition and
+            // returns NIL or the Unicode character as appropriate.
+            let fs = self.build_frame_state(block, stack, bcp as u32);
+            let string = stack
+                .pop()
+                .ok_or(BuildError::Unsupported("stack underflow (FIRST-CHAR)"))?;
+            let guard_flags = InstFlags {
+                effectful: true,
+                guard: true,
+                ..InstFlags::default()
+            };
+            let _byte_length = self
+                .emit(
+                    block,
+                    Opcode::StringByteLength,
+                    vec![string],
+                    AuxData::None,
+                    guard_flags,
+                    Some(fs),
+                    IRType::of(TypeBits::FIXNUM),
+                )
+                .ok_or(BuildError::Unsupported("StringByteLength has a result"))?;
+            let zero = self
+                .emit(
+                    block,
+                    Opcode::ConstFixnum,
+                    vec![],
+                    AuxData::FixnumImm(0),
+                    InstFlags::default(),
+                    None,
+                    IRType::of(TypeBits::FIXNUM),
+                )
+                .expect("ConstFixnum has a result");
+            let result = self
+                .emit(
+                    block,
+                    Opcode::StringAsciiCharAt,
+                    vec![string, zero],
+                    AuxData::None,
+                    guard_flags,
+                    Some(fs),
+                    IRType::of(TypeBits::CHARACTER),
+                )
+                .ok_or(BuildError::Unsupported("StringAsciiCharAt has a result"))?;
+            stack.push(result);
+            return Ok(true);
+        }
+
         let type_bits = match intrinsic {
             IntrinsicId::Consp => Some(TypeBits::CONS),
             IntrinsicId::Symbolp => Some(TypeBits::SYMBOL),
@@ -782,6 +834,7 @@ impl<'a> Builder<'a> {
                 }
             }
             IntrinsicId::Eq | IntrinsicId::Null => None,
+            IntrinsicId::FirstChar => unreachable!("handled as an inline body above"),
         };
 
         if let Some(bits) = type_bits {
@@ -817,6 +870,7 @@ impl<'a> Builder<'a> {
             | IntrinsicId::TypepConstant | IntrinsicId::Stringp => {
                 unreachable!("handled as TypeCheck above")
             }
+            IntrinsicId::FirstChar => unreachable!("handled as an inline body above"),
         };
         let result = self.emit(
             block,

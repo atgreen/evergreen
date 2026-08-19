@@ -176,6 +176,102 @@ fn stringp_reaches_string_typecheck_through_inline_metadata() {
     assert_eq!(run(BlissVal::from_fixnum(7)), NIL);
 }
 
+#[cfg(all(target_arch = "x86_64", unix))]
+static FIRST_CHAR_DEOPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(target_arch = "x86_64", unix))]
+extern "C" fn first_char_deopt() {
+    FIRST_CHAR_DEOPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+fn integration_string(bytes: &[u8]) -> BlissVal {
+    let total = (16 + bytes.len() + 7) & !7;
+    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout);
+        *(ptr as *mut ObjectHeader) =
+            ObjectHeader::new(type_id::SIMPLE_BASE_STRING, (total / 8) as u16);
+        *((ptr as *mut u64).add(1)) = bytes.len() as u64;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
+        BlissVal::from_heap_ptr(ptr)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn first_char_metadata_expands_to_guarded_string_layout_ir() {
+    use bliss_compiler::t2::emit::emit_framed;
+    use bliss_compiler::t2::ir::Opcode;
+    use std::sync::atomic::Ordering;
+
+    let first_char = bliss_rt::symbols::intern("UIOP/UTILITY:FIRST-CHAR");
+    let bf = bytecode_fn(
+        "first-char-caller",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::CallNamed {
+                sym: first_char,
+                nargs: 1,
+            },
+            Instr::Return,
+        ],
+        vec![],
+        1,
+        1,
+        1,
+    );
+    let f = build_from_bytecode(&bf).expect("build FIRST-CHAR inline template");
+    let insts: Vec<_> = f
+        .block_order()
+        .iter()
+        .flat_map(|&b| f.block(b).insts.iter().copied())
+        .map(|i| f.inst(i))
+        .collect();
+    assert!(insts.iter().any(|d| d.opcode == Opcode::StringByteLength));
+    assert!(insts.iter().any(|d| d.opcode == Opcode::StringAsciiCharAt));
+    assert!(!insts.iter().any(|d| d.opcode == Opcode::Call));
+    for guard in insts.iter().filter(|d| {
+        matches!(
+            d.opcode,
+            Opcode::StringByteLength | Opcode::StringAsciiCharAt
+        )
+    }) {
+        assert!(guard.flags.guard && guard.flags.effectful);
+        let fs = f.frame_states.get(guard.frame_state.expect("layout guard FrameState"));
+        assert_eq!(fs.scopes.len(), 1);
+        assert_eq!(fs.scopes[0].bcp, 1, "resume at the original CallNamed");
+        assert_eq!(fs.scopes[0].stack.len(), 1, "the argument remains deopt-live");
+    }
+
+    let framed = emit_framed(
+        &f,
+        first_char_deopt as *const () as usize as u64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        None,
+    )
+    .expect("emit FIRST-CHAR fast path");
+    let buf = bliss_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+
+    let mut frame = [integration_string(b"abc").0, 0, 0];
+    FIRST_CHAR_DEOPTED.store(false, Ordering::SeqCst);
+    assert_eq!(BlissVal(run(frame.as_mut_ptr())).as_char(), 'a');
+    assert!(!FIRST_CHAR_DEOPTED.load(Ordering::SeqCst));
+
+    for value in [integration_string(b""), BlissVal::from_fixnum(7)] {
+        frame[0] = value.0;
+        FIRST_CHAR_DEOPTED.store(false, Ordering::SeqCst);
+        let _ = run(frame.as_mut_ptr());
+        assert!(FIRST_CHAR_DEOPTED.load(Ordering::SeqCst));
+    }
+}
+
 /// `(lambda () 42)` — the smallest real function: push a constant, return it.
 /// P1 builds it, P2 must accept it, P3 must see the fixnum constant.
 #[test]
