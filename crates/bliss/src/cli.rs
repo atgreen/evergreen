@@ -11023,6 +11023,18 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     if p.at_sym("OF-TYPE") {
                         p.advance();
                         p.read_form()?;
+                    } else if p
+                        .toks
+                        .get(p.pos + 1)
+                        .is_some_and(|next| {
+                            next.is_symbol()
+                                && symbol_bare_name(&sym_name(*next)) == "="
+                        })
+                    {
+                        // CLHS 6.1.1.7 also permits a bare type specifier
+                        // between the WITH variable and `=`.  Babel's generated
+                        // counters use `with noctets fixnum = 0`.
+                        p.advance();
                     }
                     // `= init` is optional; a bare `:with var` binds var to NIL.
                     let init = if p.at_sym("=") {
@@ -11494,11 +11506,14 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                         step,
                         limit,
                     } => {
+                        // The arithmetic iteration variable is visible to
+                        // FINALLY with the value that failed the limit test.
+                        // For `from 0 below 2`, that final value is 2.
+                        loop_bind(*pat, *current, env);
                         if loop_from_exhausted(*current, limit.as_ref())? {
                             exhausted = true;
                             break;
                         }
-                        loop_bind(*pat, *current, env);
                         *current = loop_add_numbers(*current, *step)?;
                     }
                     ForState::Across { pat, items, idx } => {

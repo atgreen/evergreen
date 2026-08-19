@@ -633,6 +633,18 @@ fn loop_for_var_with_type_spec_and_parallel_and() {
 }
 
 #[test]
+fn loop_with_bare_type_and_final_arithmetic_value() {
+    // Babel's generated UTF-8 counters combine a typed WITH binding with a
+    // FINALLY form that returns both the count and the exhausted loop index.
+    assert_eq!(
+        eval_ok(
+            "(multiple-value-list (loop with n fixnum = 0 for i fixnum from 0 below 2 do (incf n) finally (return (values n i))))"
+        ),
+        "(2 2)"
+    );
+}
+
+#[test]
 fn equal_compares_pathnames_by_components() {
     // CLHS: EQUAL on pathnames is true when their components match. bliss's
     // EQUAL returned NIL for equal pathnames, so ASDF's pathname-keyed caches
