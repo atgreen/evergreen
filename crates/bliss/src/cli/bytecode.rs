@@ -1688,6 +1688,7 @@ impl<'e> Lowerer<'e> {
                         }
                         Some("IN") => return self.lower_loop_for_in(&forms),
                         Some("ON") => return self.lower_loop_for_on(&forms),
+                        Some("BEING") => return self.lower_loop_for_being_hash(&forms),
                         _ => {}
                     }
                 }
@@ -1892,6 +1893,53 @@ impl<'e> Lowerer<'e> {
         let bindings = form_list(&binding_items);
         let let_form = form_list(&[s("LET")?, bindings, tagbody_form, result]);
         self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
+    }
+
+    /// Hash-table iteration — `(loop for VAR being [the] hash-keys|hash-values
+    /// of TABLE <action>)`. Normalize it to the already-supported `for ... in`
+    /// lowering over a stdlib-owned snapshot, preserving the unspecified table
+    /// traversal order while making ASDF/UIOP hash loops tierable.
+    fn lower_loop_for_being_hash(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
+        let kw = |f: BlissVal| -> Option<String> {
+            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+        };
+        if forms.len() < 8
+            || kw(forms[0]).as_deref() != Some("FOR")
+            || !forms[1].is_symbol()
+            || kw(forms[2]).as_deref() != Some("BEING")
+        {
+            return Err(Bail);
+        }
+
+        let mut pos = 3;
+        if kw(forms[pos]).as_deref() == Some("THE") {
+            pos += 1;
+        }
+        let snapshot_fn = match forms.get(pos).and_then(|f| kw(*f)).as_deref() {
+            Some("HASH-KEYS") => "HASH-TABLE-KEYS",
+            Some("HASH-VALUES") => "HASH-TABLE-VALUES",
+            _ => return Err(Bail),
+        };
+        pos += 1;
+        if forms.get(pos).and_then(|f| kw(*f)).as_deref() != Some("OF") {
+            return Err(Bail);
+        }
+        let table = *forms.get(pos + 1).ok_or(Bail)?;
+        let action = forms.get(pos + 2..).ok_or(Bail)?;
+        if action.is_empty() {
+            return Err(Bail);
+        }
+
+        let snapshot_sym = resolve_sym(snapshot_fn).ok_or(Bail)?;
+        let snapshot = form_list(&[snapshot_sym, table]);
+        let mut normalized = vec![
+            forms[0],
+            forms[1],
+            resolve_sym("IN").ok_or(Bail)?,
+            snapshot,
+        ];
+        normalized.extend_from_slice(action);
+        self.lower_loop_for_in(&normalized)
     }
 
     /// Extended-LOOP: cons-cell iteration — `(loop for VAR on LIST <action>)` —

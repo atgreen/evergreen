@@ -327,6 +327,27 @@ fn hash_table_function_compiles_and_promotes() {
     assert_eq!(tw_result, t1_result, "T1 hash result must match the tree-walker");
 }
 
+#[test]
+fn loop_being_hash_keys_compiles_and_promotes() {
+    let prog = "\
+        (defun hash-loop () \
+          (let ((h (make-hash-table))) \
+            (setf (gethash (quote a) h) 10 (gethash (quote b) h) 20) \
+            (list (loop for key being the hash-keys of h sum (gethash key h)) \
+                  (loop for value being hash-values of h sum value)))) \
+        (hash-loop) (hash-loop) (hash-loop) \
+        (format t \"~a ~a~%\" (bliss-ext:function-tier (quote hash-loop)) (hash-loop))";
+
+    let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "hash LOOP run failed: {out}");
+    let line = out.lines().next().unwrap_or("").to_string();
+    assert_eq!(line, "1 (30 30)", "hash LOOP must reach T1 with the right sums");
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker hash LOOP failed: {tw}");
+    assert_eq!(tw.lines().next(), Some("0 (30 30)"));
+}
+
 /// Variadic lambda lists (&optional/&key/&rest, with defaults and supplied-p)
 /// compile to bytecode and promote to T1 (bliss-x5y.7) — previously the single
 /// biggest function-level bail. Defaults (which may reference earlier params) and
