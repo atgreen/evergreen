@@ -286,14 +286,16 @@ fn call_local_temporaries_use_caller_saved_and_deopt_correctly() {
 
 /// A hash-table-using function compiles to bytecode (does NOT bail to the
 /// tree-walker) and promotes to T1 (bliss-x5y.2). make-hash-table (with a :test
-/// keyword), gethash, (setf (gethash ...) ...), remhash, and hash-table-count all
-/// lower to CallNamed — the setf store goes to the internal BLISS::PUT-GETHASH
-/// primitive. A bailed function stays at tier 0, so observing tier 1 proves it
-/// compiled; the value must equal the tree-walker's. (Iteration via maphash with
-/// an inline lambda still bails on closure lowering — a separate concern.)
+/// keyword), gethash, (setf (gethash ...) ...), remhash, hash-table-count, and
+/// MAPHASH iteration all lower to bytecode — the setf store goes to
+/// the internal BLISS::PUT-GETHASH primitive. A bailed function stays at tier 0,
+/// so observing tier 1 proves it compiled; the value must equal the tree-walker's.
 #[test]
 fn hash_table_function_compiles_and_promotes() {
     let prog = "\
+        (defvar *hash-sum* 0) \
+        (defun hash-sum-entry (key value) \
+          (declare (ignore key)) (setf *hash-sum* (+ *hash-sum* value))) \
         (defun htf () \
           (let ((h (make-hash-table :test (quote equal)))) \
             (setf (gethash \"a\" h) 10) \
@@ -301,7 +303,10 @@ fn hash_table_function_compiles_and_promotes() {
             (setf (gethash \"c\" h) 30) \
             (remhash \"b\" h) \
             (setf (gethash \"a\" h) (+ (gethash \"a\" h) 5)) \
-            (list (hash-table-count h) (gethash \"a\" h) (gethash \"b\" h (quote absent))))) \
+            (setf *hash-sum* 0) \
+            (maphash (quote hash-sum-entry) h) \
+            (list (list (hash-table-count h) (gethash \"a\" h) \
+                        (gethash \"b\" h (quote absent))) *hash-sum*))) \
         (htf) (htf) (htf) \
         (format t \"~a ~a~%\" (bliss-ext:function-tier (quote htf)) (htf))";
 
@@ -312,7 +317,7 @@ fn hash_table_function_compiles_and_promotes() {
         line.starts_with("1 "),
         "hash function must compile and reach T1 (tier 1, not a bailed 0): {line:?}"
     );
-    assert!(line.contains("(2 15 ABSENT)"), "hash result: {line:?}");
+    assert!(line.contains("((2 15 ABSENT) 45)"), "hash result: {line:?}");
 
     // Identical value under the tree-walker.
     let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);

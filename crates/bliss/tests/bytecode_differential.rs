@@ -205,6 +205,7 @@ const CORPUS: &[&str] = &[
     // bytecode frame, even when an older captured frame has the same variable.
     "(defparameter *capture-table* (make-hash-table)) (defun capture-table-keys (table) (let ((keys nil)) (maphash (lambda (key value) (declare (ignore value)) (push key keys)) table) keys)) (let ((keys nil)) (declare (ignore keys)) (defmacro captured-key-count (&key (items (capture-table-keys *capture-table*))) (list (quote quote) (length items)))) (setf (gethash (quote a) *capture-table*) 1) (setf (gethash (quote b) *capture-table*) 2) (captured-key-count)",
     "(defun hash-surfaces () (let ((h (make-hash-table))) (setf (gethash (quote a) h) 1 (gethash (quote b) h) 2) (let ((n (+ (length (hash-table-keys h)) (length (hash-table-values h))))) (clrhash h) (list (hash-table-p h) (hash-table-p nil) n (hash-table-count h))))) (hash-surfaces)",
+    "(defun hash-map-inline () (let ((h (make-hash-table)) (sum 0)) (setf (gethash (quote a) h) 1 (gethash (quote b) h) 2) (maphash (lambda (key value) (declare (ignore key)) (setq sum (+ sum value))) h) sum)) (hash-map-inline)",
     // ── cond / when / unless / and / or on bytecode (nmq.6 coverage) ──
     "(when t 1 2 3)",
     "(when nil 1 2)",
@@ -291,6 +292,7 @@ const MUST_COMPILE: &[&str] = &[
     "(defvar *gg* 3) (defun rr () (setq *gg* (* *gg* 2)))",
     "(defun hc () (handler-case (car 5) (error (e) (quote caught))))",
     "(defun hash-surfaces-compile () (let ((h (make-hash-table))) (setf (gethash (quote a) h) 1) (let ((n (+ (length (hash-table-keys h)) (length (hash-table-values h))))) (clrhash h) (list (hash-table-p h) n (hash-table-count h)))))",
+    "(defun hash-map-inline-compile () (let ((h (make-hash-table)) (sum 0)) (setf (gethash (quote a) h) 1) (maphash (lambda (key value) (declare (ignore key)) (setq sum (+ sum value))) h) sum))",
     "(multiple-value-bind (a b) (values 1 2) (list a b))",
     "(values 1 2 3)",
 ];
