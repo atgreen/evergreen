@@ -605,7 +605,7 @@ fn resolve_tiered_fn(val: BlissVal) -> Option<BlissVal> {
 /// True if `name` names a function — lexically (FLET/LABELS or `(setf f)` in
 /// `Env.funs`) or globally (a bound function cell).
 fn fn_bound(env: &Env, name: &str) -> bool {
-    env.funs.contains_key(name) || global_fn(name).is_some()
+    env.funs.borrow().contains_key(name) || global_fn(name).is_some()
 }
 
 /// Resolve `name` to a callable `(params_form, body)` — lexical `Env.funs` first,
@@ -626,7 +626,7 @@ fn function_name_key(name_form: BlissVal) -> String {
 }
 
 fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
-    if let Some(fdef) = env.funs.get(name) {
+    if let Some(fdef) = env.funs.borrow().get(name) {
         return Some((fdef.params_form, fdef.body));
     }
     // Global `(setf place)` writers registered by a top-level defun (any file).
@@ -697,24 +697,26 @@ enum EvalContext {
 }
 
 // ── Environment for variable/function bindings ───────────────────
-// Uses Rc for global definitions (funs, macros, classes, methods, packages)
-// so that child() only clones the local vars HashMap, not the entire env.
+// Uses Rc for shared global definitions (classes, methods, closures). Lexical
+// function, macro, and symbol-macro maps retain copy-on-write isolation, while
+// RefCell makes their BlissVal slots legal relocation targets for the moving
+// collector.
 #[derive(Clone)]
 struct Env {
     frame: Rc<RefCell<EnvFrame>>,
-    funs: Rc<HashMap<String, FunDef>>,
-    macros: Rc<HashMap<String, MacroDef>>,
+    funs: Rc<RefCell<HashMap<String, FunDef>>>,
+    macros: Rc<RefCell<HashMap<String, MacroDef>>>,
     /// User SETF-expanders (DEFINE-SETF-EXPANDER / DEFSETF), keyed by access-fn
     /// name. Shared and mutated in place (like `closures`) so a definition made
     /// inside a child env — e.g. a MACROLET body or a macro expansion — is
     /// visible globally, matching how DEFUN installs into the symbol cell.
     setf_expanders: Rc<RefCell<HashMap<String, SetfExpander>>>,
-    symbol_macros: Rc<HashMap<u32, BlissVal>>,
+    symbol_macros: Rc<RefCell<HashMap<u32, BlissVal>>>,
     // These four are GLOBAL definitions (packages, classes, generic functions,
     // methods): shared and mutated in place so a definition made inside a child
     // Env (a FLET/MACROLET body, as when ASDF loads a system's files) is visible
     // everywhere, matching CL semantics (bliss-lb6.22). Only `funs`/`macros` are
-    // genuinely lexical (FLET/MACROLET locals) and stay per-Env copy-on-write.
+    // genuinely lexical (FLET/MACROLET locals) and are cloned for child Envs.
     classes: Rc<RefCell<HashMap<String, ClassDef>>>,
     generics: Rc<RefCell<HashMap<String, GenericDef>>>,
     methods: Rc<RefCell<HashMap<String, Vec<MethodDef>>>>,
@@ -993,12 +995,12 @@ fn global_macro_remove(name: &str) {
 /// Look up a macro visible in `env`: a lexical MACROLET macro shadows a global
 /// one; a package-qualified name also matches by its bare leaf name.
 fn lookup_macro(env: &Env, name: &str) -> Option<MacroDef> {
-    if let Some(def) = env.macros.get(name).cloned() {
+    if let Some(def) = env.macros.borrow().get(name).cloned() {
         return Some(def);
     }
     let leaf = symbol_leaf_name(name);
     if leaf != name {
-        if let Some(def) = env.macros.get(leaf).cloned() {
+        if let Some(def) = env.macros.borrow().get(leaf).cloned() {
             return Some(def);
         }
     }
@@ -1016,11 +1018,11 @@ fn lookup_macro(env: &Env, name: &str) -> Option<MacroDef> {
 
 /// True if `name` names a macro visible in `env` (lexical or global).
 fn macro_defined(env: &Env, name: &str) -> bool {
-    if env.macros.contains_key(name) {
+    if env.macros.borrow().contains_key(name) {
         return true;
     }
     let leaf = symbol_leaf_name(name);
-    if leaf != name && env.macros.contains_key(leaf) {
+    if leaf != name && env.macros.borrow().contains_key(leaf) {
         return true;
     }
     GLOBAL_MACROS.with(|m| {
@@ -2329,7 +2331,245 @@ fn invoke_generic_function(
     }
 }
 
+/// State shared by one environment-root walk. Captured lexical frames and
+/// class-slot cells can be reachable through several definitions; they must be
+/// visited once so a relocation callback never observes the same mutable slot
+/// twice during one collection.
+#[derive(Default)]
+struct EnvRootVisitState {
+    frames: HashSet<usize>,
+    class_slot_cells: HashSet<usize>,
+}
+
+fn visit_env_frame_roots(
+    frame: &Rc<RefCell<EnvFrame>>,
+    state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    let identity = Rc::as_ptr(frame) as usize;
+    if !state.frames.insert(identity) {
+        return;
+    }
+
+    let parent = {
+        let mut frame = frame.borrow_mut();
+        for value in frame.vars.values_mut() {
+            visit(value as *mut BlissVal);
+        }
+        for value in frame.symbol_vars.values_mut() {
+            visit(value as *mut BlissVal);
+        }
+        frame.parent.clone()
+    };
+    if let Some(parent) = parent {
+        visit_env_frame_roots(&parent, state, visit);
+    }
+}
+
+fn visit_fun_def_roots(def: &mut FunDef, visit: &mut dyn FnMut(*mut BlissVal)) {
+    visit(&mut def.params_form);
+    visit(&mut def.body);
+}
+
+fn visit_macro_def_roots(
+    def: &mut MacroDef,
+    state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    visit(&mut def.params_form);
+    visit(&mut def.body);
+    visit_env_frame_roots(&def.captured_frame, state, visit);
+}
+
+fn visit_setf_expander_roots(
+    expander: &mut SetfExpander,
+    state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    match expander {
+        SetfExpander::Expander(def) => visit_macro_def_roots(def, state, visit),
+        SetfExpander::ShortUpdate(function) => visit(function),
+    }
+}
+
+fn visit_class_def_roots(
+    class: &mut ClassDef,
+    state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    for slot in &mut class.slots {
+        if let Some(initform) = &mut slot.initform {
+            visit(initform);
+        }
+    }
+
+    let identity = Arc::as_ptr(&class.class_slot_values) as usize;
+    if state.class_slot_cells.insert(identity) {
+        let mut cells = match class.class_slot_values.lock() {
+            Ok(cells) => cells,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for value in cells.values_mut().flatten() {
+            visit(value);
+        }
+    }
+}
+
+fn visit_method_def_roots(def: &mut MethodDef, visit: &mut dyn FnMut(*mut BlissVal)) {
+    visit(&mut def.method_id);
+    for specializer in &mut def.specializers {
+        if let MethodSpecializer::Eql(value) = specializer {
+            visit(value);
+        }
+    }
+    visit(&mut def.lambda_list);
+    visit(&mut def.body);
+}
+
+fn visit_next_method_roots(next: &mut NextMethod, visit: &mut dyn FnMut(*mut BlissVal)) {
+    let mut visit_methods = |methods: &mut Vec<MethodDef>| {
+        for method in methods {
+            visit_method_def_roots(method, visit);
+        }
+    };
+    match next {
+        NextMethod::Standard {
+            around,
+            before,
+            primary,
+            after,
+        } => {
+            visit_methods(around);
+            visit_methods(before);
+            visit_methods(primary);
+            visit_methods(after);
+        }
+        NextMethod::Primary { primary } => visit_methods(primary),
+    }
+}
+
+fn visit_restart_function_roots(
+    function: &mut RestartFunction,
+    state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    if let RestartFunction::FunctionForm {
+        function_form,
+        captured_frame,
+    } = function
+    {
+        visit(function_form);
+        visit_env_frame_roots(captured_frame, state, visit);
+    }
+}
+
+fn visit_handler_roots(
+    handler: &mut HandlerImpl,
+    state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    match handler {
+        HandlerImpl::Function(function) => visit(function),
+        HandlerImpl::HandlerCase {
+            body,
+            captured_frame,
+            ..
+        } => {
+            visit(body);
+            visit_env_frame_roots(captured_frame, state, visit);
+        }
+    }
+}
+
 impl Env {
+    fn funs_mut(&mut self) -> std::cell::RefMut<'_, HashMap<String, FunDef>> {
+        if Rc::strong_count(&self.funs) > 1 {
+            let definitions = self.funs.borrow().clone();
+            self.funs = Rc::new(RefCell::new(definitions));
+        }
+        self.funs.borrow_mut()
+    }
+
+    fn macros_mut(&mut self) -> std::cell::RefMut<'_, HashMap<String, MacroDef>> {
+        if Rc::strong_count(&self.macros) > 1 {
+            let definitions = self.macros.borrow().clone();
+            self.macros = Rc::new(RefCell::new(definitions));
+        }
+        self.macros.borrow_mut()
+    }
+
+    fn symbol_macros_mut(&mut self) -> std::cell::RefMut<'_, HashMap<u32, BlissVal>> {
+        if Rc::strong_count(&self.symbol_macros) > 1 {
+            let definitions = self.symbol_macros.borrow().clone();
+            self.symbol_macros = Rc::new(RefCell::new(definitions));
+        }
+        self.symbol_macros.borrow_mut()
+    }
+
+    /// Enumerate every mutable `BlissVal` slot owned by this tree-walker
+    /// environment. A moving collector can rewrite each yielded pointer in
+    /// place. This deliberately does not register the Env with the collector or
+    /// enable T0 automatic collection: transient Rust evaluation values still
+    /// need a shadow-root stack before collection is safe.
+    #[allow(dead_code)]
+    fn visit_gc_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        let mut state = EnvRootVisitState::default();
+
+        visit_env_frame_roots(&self.frame, &mut state, visit);
+
+        for def in self.funs.borrow_mut().values_mut() {
+            visit_fun_def_roots(def, visit);
+        }
+        for def in self.macros.borrow_mut().values_mut() {
+            visit_macro_def_roots(def, &mut state, visit);
+        }
+        for expander in self.setf_expanders.borrow_mut().values_mut() {
+            visit_setf_expander_roots(expander, &mut state, visit);
+        }
+        for expansion in self.symbol_macros.borrow_mut().values_mut() {
+            visit(expansion);
+        }
+        for class in self.classes.borrow_mut().values_mut() {
+            visit_class_def_roots(class, &mut state, visit);
+        }
+        for generic in self.generics.borrow_mut().values_mut() {
+            visit(&mut generic.generic_function);
+        }
+        for methods in self.methods.borrow_mut().values_mut() {
+            for method in methods {
+                visit_method_def_roots(method, visit);
+            }
+        }
+        for restart in &mut self.restarts {
+            visit_restart_function_roots(&mut restart.function, &mut state, visit);
+            if let Some(function) = &mut restart.interactive_function {
+                visit_restart_function_roots(function, &mut state, visit);
+            }
+            if let Some(function) = &mut restart.test_function {
+                visit_restart_function_roots(function, &mut state, visit);
+            }
+        }
+        for cluster in &mut self.handlers {
+            for entry in &mut cluster.entries {
+                visit_handler_roots(&mut entry.handler, &mut state, visit);
+            }
+        }
+        for value in &mut self.mv {
+            visit(value);
+        }
+        for closure in self.closures.borrow_mut().values_mut() {
+            visit(&mut closure.params_form);
+            visit(&mut closure.body);
+            visit_env_frame_roots(&closure.captured_frame, &mut state, visit);
+        }
+        for context in &mut self.method_context {
+            for arg in &mut context.args {
+                visit(arg);
+            }
+            visit_next_method_roots(&mut context.next, visit);
+        }
+    }
+
     /// A fresh top-level environment. Resets the process-global CLOS state so
     /// each independent program (and each test) starts from a clean class
     /// registry.
@@ -2371,10 +2611,10 @@ impl Env {
             .expect("initialize condition runtime support (STORAGE-CONDITION pool) at startup");
         let mut env = Env {
             frame: Rc::new(RefCell::new(EnvFrame::default())),
-            funs: Rc::new(HashMap::new()),
-            macros: Rc::new(HashMap::new()),
+            funs: Rc::new(RefCell::new(HashMap::new())),
+            macros: Rc::new(RefCell::new(HashMap::new())),
             setf_expanders: Rc::new(RefCell::new(HashMap::new())),
-            symbol_macros: Rc::new(HashMap::new()),
+            symbol_macros: Rc::new(RefCell::new(HashMap::new())),
             classes: Rc::new(RefCell::new(HashMap::new())),
             generics: Rc::new(RefCell::new(HashMap::new())),
             methods: Rc::new(RefCell::new(HashMap::new())),
@@ -2508,8 +2748,8 @@ impl Env {
         env
     }
 
-    /// Create a child environment that shares global definitions (funs, macros,
-    /// classes, methods, packages) via Rc and only clones local vars.
+    /// Create a child environment sharing lexical maps until a local definition
+    /// detaches them through the copy-on-write mutation helpers above.
     fn child(&self) -> Self {
         Env {
             frame: Rc::new(RefCell::new(EnvFrame {
@@ -2640,11 +2880,15 @@ impl Env {
     }
 
     fn lookup_symbol_macro(&self, symbol: BlissVal) -> Option<BlissVal> {
-        self.symbol_macros.get(&symbol.as_symbol_index()).copied()
+        self.symbol_macros
+            .borrow()
+            .get(&symbol.as_symbol_index())
+            .copied()
     }
 
     fn define_symbol_macro(&mut self, symbol: BlissVal, expansion: BlissVal) {
-        Rc::make_mut(&mut self.symbol_macros).insert(symbol.as_symbol_index(), expansion);
+        self.symbol_macros_mut()
+            .insert(symbol.as_symbol_index(), expansion);
     }
 
     fn define_local(&mut self, name: &str, val: BlissVal) {
@@ -6381,8 +6625,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if let Some(idx) = bliss_rt::symbols::find_index(&name) {
                     bliss_rt::symbols::set_symbol_function(idx, bliss_rt::value::UNBOUND);
                 }
-                Rc::make_mut(&mut env.funs).remove(&name);
-                Rc::make_mut(&mut env.macros).remove(&name);
+                env.funs_mut().remove(&name);
+                env.macros_mut().remove(&name);
                 global_macro_remove(&name);
                 return Ok(sym);
             }
@@ -9077,7 +9321,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // lexical/name-map ones plus the global ones now in symbol
                 // function cells (bliss-jtc.6.8).
                 let mut image_data = String::new();
-                for (name, fdef) in env.funs.iter() {
+                for (name, fdef) in env.funs.borrow().iter() {
                     let params_str = fdef.params.join(" ");
                     let body_str = format_body_forms(fdef.body);
                     image_data
@@ -9690,7 +9934,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // tree-walked code (e.g. a `loop`, which never compiles to bytecode).
             // Guard on no lexical shadow — never redirect an FLET/LABELS binding
             // to the global registry entry of the same name.
-            if !env.funs.contains_key(&name) {
+            if !env.funs.borrow().contains_key(&name) {
                 if let Some(sym) = resolve_sym(&name) {
                     if let Some(res) =
                         bytecode::call_registered(sym.as_symbol_index(), &args, sym, env)
@@ -12339,7 +12583,11 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 /// "undefined function" (notably `#'<gensym>` from library macros — babel's
 /// encoders). Returns `None` for non-local names.
 fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
-    let (params_form, body) = env.funs.get(name).map(|f| (f.params_form, f.body))?;
+    let (params_form, body) = env
+        .funs
+        .borrow()
+        .get(name)
+        .map(|f| (f.params_form, f.body))?;
     let closure = Closure {
         params_form,
         body,
@@ -12381,7 +12629,7 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 _ => fbody,
             };
-            Rc::make_mut(&mut child_env.funs).insert(
+            child_env.funs_mut().insert(
                 name,
                 FunDef {
                     params,
@@ -13310,12 +13558,12 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
     // Arc<dyn Fn + Send + Sync>, so it must own a Send snapshot of the defining
     // lexical frame rather than share the live Rc chain. See FrozenEnvFrame.
     let captured_frame = freeze_env_frame(&env.frame);
-    let funs = (*env.funs).clone();
+    let funs = env.funs.borrow().clone();
     let classes = env.classes.borrow().clone();
     let methods = env.methods.borrow().clone();
     let current_package = env.current_package.clone();
     let sandbox = env.sandbox;
-    let symbol_macros = (*env.symbol_macros).clone();
+    let symbol_macros = env.symbol_macros.borrow().clone();
     let eval_context = env.eval_context;
 
     compiler_macroexpand::define_compiler_macro(
@@ -13324,9 +13572,9 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
             let (_, args) = cp(form);
             let mut macro_env = Env::new_for_macro_expansion(sandbox);
             macro_env.frame = thaw_env_frame(&captured_frame);
-            macro_env.funs = Rc::new(funs.clone());
-            macro_env.macros = Rc::new(HashMap::new());
-            macro_env.symbol_macros = Rc::new(symbol_macros.clone());
+            macro_env.funs = Rc::new(RefCell::new(funs.clone()));
+            macro_env.macros = Rc::new(RefCell::new(HashMap::new()));
+            macro_env.symbol_macros = Rc::new(RefCell::new(symbol_macros.clone()));
             macro_env.classes = Rc::new(RefCell::new(classes.clone()));
             macro_env.methods = Rc::new(RefCell::new(methods.clone()));
             macro_env.current_package = current_package.clone();
@@ -13596,7 +13844,7 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
     let mut macro_env = MacroexpandEnv::null();
 
     let mut global_symbol_macros = Vec::new();
-    for (&symbol_index, &expansion) in env.symbol_macros.iter() {
+    for (&symbol_index, &expansion) in env.symbol_macros.borrow().iter() {
         global_symbol_macros.push((
             BlissVal::from_symbol_index(symbol_index),
             VariableInfo::SymbolMacro(expansion),
@@ -13626,7 +13874,7 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
     // the bytecode compiler; a lexical macro of the same name shadows the global.
     let mut all_macros: HashMap<String, MacroDef> =
         GLOBAL_MACROS.with(|m| m.borrow().clone());
-    for (name, def) in env.macros.iter() {
+    for (name, def) in env.macros.borrow().iter() {
         all_macros.insert(name.clone(), def.clone());
     }
     for (name, macro_def) in all_macros.iter() {
@@ -13732,7 +13980,7 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         let (name_form, rest) = cp(def);
         let (params_form, macro_body) = cp(rest);
         let name = sym_name(name_form);
-        Rc::make_mut(&mut child_env.macros).insert(
+        child_env.macros_mut().insert(
             name,
             MacroDef {
                 params_form,
@@ -15798,6 +16046,242 @@ impl Default for ReplConfig {
 fn heap_test_lock() -> &'static std::sync::Mutex<()> {
     static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     L.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+mod env_gc_root_tests {
+    use super::*;
+
+    const BASE: i64 = 900_000_000;
+    const ROOT_COUNT: i64 = 36;
+    const RELOCATION_DELTA: i64 = 10_000;
+
+    fn marker(offset: i64) -> BlissVal {
+        BlissVal::from_fixnum(BASE + offset)
+    }
+
+    fn method(offset: i64) -> MethodDef {
+        MethodDef {
+            method_id: marker(offset),
+            specializers: vec![MethodSpecializer::Eql(marker(offset + 1))],
+            lambda_list: marker(offset + 2),
+            qualifier: bliss_stdlib::MethodQualifier::Primary,
+            body: marker(offset + 3),
+        }
+    }
+
+    /// The visitor exposes real mutable storage for every category of value an
+    /// Env can retain. Reusing one captured parent frame through several
+    /// definitions also verifies that shared frame slots are yielded once.
+    #[test]
+    fn env_root_visitor_rewrites_all_retained_value_slots() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        let parent = Rc::new(RefCell::new(EnvFrame::default()));
+
+        env.frame.borrow_mut().vars.insert("ROOT".into(), marker(0));
+        env.frame.borrow_mut().symbol_vars.insert(1, marker(1));
+        env.frame.borrow_mut().parent = Some(Rc::clone(&parent));
+        parent.borrow_mut().vars.insert("PARENT".into(), marker(2));
+        parent.borrow_mut().symbol_vars.insert(2, marker(3));
+
+        env.funs.borrow_mut().insert(
+            "LOCAL-FUN".into(),
+            FunDef {
+                params: Vec::new(),
+                params_form: marker(4),
+                body: marker(5),
+            },
+        );
+        env.macros.borrow_mut().insert(
+            "LOCAL-MACRO".into(),
+            MacroDef {
+                params_form: marker(6),
+                body: marker(7),
+                captured_frame: Rc::clone(&parent),
+            },
+        );
+        env.setf_expanders.borrow_mut().insert(
+            "LONG-SETF".into(),
+            SetfExpander::Expander(MacroDef {
+                params_form: marker(8),
+                body: marker(9),
+                captured_frame: Rc::clone(&parent),
+            }),
+        );
+        env.setf_expanders
+            .borrow_mut()
+            .insert("SHORT-SETF".into(), SetfExpander::ShortUpdate(marker(10)));
+        env.symbol_macros.borrow_mut().insert(3, marker(11));
+
+        let mut class_values = HashMap::new();
+        class_values.insert("SHARED".into(), Some(marker(13)));
+        env.classes.borrow_mut().insert(
+            "ROOT-CLASS".into(),
+            ClassDef {
+                name: "ROOT-CLASS".into(),
+                supers: Vec::new(),
+                slots: vec![SlotDef {
+                    name: "SLOT".into(),
+                    initargs: Vec::new(),
+                    accessor: None,
+                    readers: Vec::new(),
+                    writers: Vec::new(),
+                    initform: Some(marker(12)),
+                    allocation: SlotAllocation::Instance,
+                }],
+                class_slot_values: Arc::new(Mutex::new(class_values)),
+            },
+        );
+        env.generics.borrow_mut().insert(
+            "ROOT-GENERIC".into(),
+            GenericDef {
+                generic_function: marker(14),
+                combination: bliss_stdlib::MethodCombinationType::Standard,
+            },
+        );
+        env.methods
+            .borrow_mut()
+            .insert("ROOT-METHOD".into(), vec![method(15)]);
+
+        env.restarts.push(RestartEntry {
+            name: "ROOT-RESTART".into(),
+            function: RestartFunction::FunctionForm {
+                function_form: marker(19),
+                captured_frame: Rc::clone(&parent),
+            },
+            interactive_function: Some(RestartFunction::FunctionForm {
+                function_form: marker(20),
+                captured_frame: Rc::clone(&parent),
+            }),
+            test_function: Some(RestartFunction::FunctionForm {
+                function_form: marker(21),
+                captured_frame: Rc::clone(&parent),
+            }),
+            unwind_on_invoke: false,
+        });
+        env.handlers.push(HandlerCluster {
+            entries: vec![
+                HandlerEntry {
+                    type_name: "T".into(),
+                    handler: HandlerImpl::Function(marker(22)),
+                },
+                HandlerEntry {
+                    type_name: "T".into(),
+                    handler: HandlerImpl::HandlerCase {
+                        token: "ROOT-HANDLER".into(),
+                        var_name: None,
+                        body: marker(23),
+                        captured_frame: Rc::clone(&parent),
+                    },
+                },
+            ],
+        });
+        env.mv.push(marker(24));
+        env.closures.borrow_mut().insert(
+            1,
+            Closure {
+                params_form: marker(25),
+                body: marker(26),
+                captured_frame: Rc::clone(&parent),
+            },
+        );
+        env.method_context.push(MethodContext {
+            args: vec![marker(27)],
+            next: NextMethod::Standard {
+                around: vec![method(28)],
+                before: Vec::new(),
+                primary: Vec::new(),
+                after: Vec::new(),
+            },
+        });
+        env.method_context.push(MethodContext {
+            args: Vec::new(),
+            next: NextMethod::Primary {
+                primary: vec![method(32)],
+            },
+        });
+
+        let expected: HashSet<i64> = (BASE..BASE + ROOT_COUNT).collect();
+        let mut rewritten = HashSet::new();
+        env.visit_gc_roots(&mut |slot| unsafe {
+            let value = &mut *slot;
+            if value.is_fixnum() {
+                let n = value.as_fixnum();
+                if expected.contains(&n) {
+                    assert!(rewritten.insert(n), "root slot {n} was visited twice");
+                    *value = BlissVal::from_fixnum(n + RELOCATION_DELTA);
+                }
+            }
+        });
+        assert_eq!(rewritten, expected, "every seeded Env root must be yielded");
+
+        let relocated_expected: HashSet<i64> = expected
+            .iter()
+            .map(|n| n + RELOCATION_DELTA)
+            .collect();
+        let mut relocated = HashSet::new();
+        env.visit_gc_roots(&mut |slot| unsafe {
+            let value = &*slot;
+            if value.is_fixnum() && relocated_expected.contains(&value.as_fixnum()) {
+                assert!(relocated.insert(value.as_fixnum()));
+            }
+        });
+        assert_eq!(
+            relocated, relocated_expected,
+            "the visitor must expose the mutable slots, not temporary copies"
+        );
+    }
+
+    /// Child environments inherit lexical definitions by value, so mutating a
+    /// FLET/MACROLET/SYMBOL-MACROLET table in a child cannot leak to its parent.
+    #[test]
+    fn mutable_lexical_root_maps_remain_child_local() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let parent = Env::new(false);
+        parent.funs.borrow_mut().insert(
+            "PARENT".into(),
+            FunDef {
+                params: Vec::new(),
+                params_form: marker(0),
+                body: marker(1),
+            },
+        );
+        parent.symbol_macros.borrow_mut().insert(99, marker(2));
+        parent.macros.borrow_mut().insert(
+            "PARENT-MACRO".into(),
+            MacroDef {
+                params_form: marker(3),
+                body: marker(4),
+                captured_frame: Rc::clone(&parent.frame),
+            },
+        );
+
+        let mut child = parent.child();
+        child.funs_mut().insert(
+            "CHILD".into(),
+            FunDef {
+                params: Vec::new(),
+                params_form: marker(5),
+                body: marker(6),
+            },
+        );
+        child.symbol_macros_mut().insert(100, marker(7));
+        let child_frame = Rc::clone(&child.frame);
+        child.macros_mut().insert(
+            "CHILD-MACRO".into(),
+            MacroDef {
+                params_form: marker(8),
+                body: marker(9),
+                captured_frame: child_frame,
+            },
+        );
+
+        assert!(child.funs.borrow().contains_key("PARENT"));
+        assert!(!parent.funs.borrow().contains_key("CHILD"));
+        assert!(!parent.symbol_macros.borrow().contains_key(&100));
+        assert!(!parent.macros.borrow().contains_key("CHILD-MACRO"));
+    }
 }
 
 #[cfg(test)]

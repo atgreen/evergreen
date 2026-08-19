@@ -634,7 +634,12 @@ impl<'e> Lowerer<'e> {
             // A global / special / symbol-macro reference. Symbol-macros must
             // expand (tree-walker semantics) — bail on those; otherwise emit a
             // dynamic value load.
-            if self.env.symbol_macros.contains_key(&form.as_symbol_index()) {
+            if self
+                .env
+                .symbol_macros
+                .borrow()
+                .contains_key(&form.as_symbol_index())
+            {
                 return Err(Bail);
             }
             self.emit(Instr::LoadGlobal(form.as_symbol_index()));
@@ -1185,7 +1190,8 @@ impl<'e> Lowerer<'e> {
         // Only emit a call when the callee is certainly a function: a
         // user-defined function (lexical name map or global function cell —
         // bliss-jtc.6.8) or an allowlisted primitive.
-        let is_user_fn = self.env.funs.contains_key(name) || super::global_fn(name).is_some();
+        let is_user_fn =
+            self.env.funs.borrow().contains_key(name) || super::global_fn(name).is_some();
         let is_prim = PRIMITIVE_ALLOWLIST.contains(&name);
         if !is_user_fn && !is_prim {
             return Err(record_bail(|| format!("call:{name}")));
@@ -1241,7 +1247,12 @@ impl<'e> Lowerer<'e> {
     /// otherwise the stack is left one shorter. Bails on a symbol-macro place
     /// (that is really a SETF of the expansion).
     fn store_to_symbol_place(&mut self, var: BlissVal, last: bool) -> LowerResult<()> {
-        if self.env.symbol_macros.contains_key(&var.as_symbol_index()) {
+        if self
+            .env
+            .symbol_macros
+            .borrow()
+            .contains_key(&var.as_symbol_index())
+        {
             return Err(Bail);
         }
         let name = sym_name(var);
