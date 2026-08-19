@@ -39,6 +39,20 @@ fn bootstrap_clos_succeeds() {
 }
 
 #[test]
+fn find_class_accepts_immediate_symbol_names_before_bootstrap() {
+    // CLOS state is thread-local, so a fresh thread guarantees that neither
+    // name is already present in the registry.  FIND-CLASS must still treat
+    // NIL and T as symbols without feeding their SPECIAL-tagged values to the
+    // TAG_SYMBOL-only as_symbol_index extractor.
+    std::thread::spawn(|| {
+        assert_eq!(find_class(NIL), None);
+        assert_eq!(find_class(T), None);
+    })
+    .join()
+    .expect("find_class must not panic for immediate symbols");
+}
+
+#[test]
 fn find_class_unknown_none() {
     bootstrap_clos().unwrap();
     assert!(find_class(sym(9999)).is_none());

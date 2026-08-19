@@ -533,6 +533,15 @@ fn class_name_key(name: BlissVal) -> Option<String> {
     if !name.is_symbol() {
         return None;
     }
+    // NIL and T are symbols at the Common Lisp level, but Bliss represents
+    // them with the SPECIAL tag rather than TAG_SYMBOL.  Do not pass either
+    // through as_symbol_index(), which deliberately accepts only TAG_SYMBOL.
+    if name == NIL {
+        return Some("NIL".into());
+    }
+    if name == T {
+        return Some("T".into());
+    }
     let full = bliss_rt::symbols::symbol_name(name.as_symbol_index())?;
     let bare = full
         .trim_start_matches("KEYWORD:")
