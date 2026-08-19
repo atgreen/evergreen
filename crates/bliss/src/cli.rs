@@ -14304,6 +14304,18 @@ fn apply_function(
             env.clear_mv();
             return res;
         }
+        // These structural primitives already have evaluated arguments here.
+        // Dispatch them directly instead of allocating quoted argument forms
+        // and re-entering eval_form. The old bridge allocated four temporary
+        // conses for every unary call, which made shallow recursive list walks
+        // consume memory in proportion to total calls (bliss-jql).
+        if matches!(
+            name.as_str(),
+            "CAR" | "FIRST" | "CDR" | "REST" | "NULL" | "NOT" | "CONSP" | "ATOM" | "LISTP"
+        ) {
+            env.clear_mv();
+            return apply_builtin(&name, args, env);
+        }
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
         // full operator-position builtin set (not just apply_builtin's subset)
         // is reachable through funcall/apply/mapcar.
@@ -14437,10 +14449,6 @@ fn is_builtin_function(name: &str) -> bool {
     )
 }
 
-#[expect(
-    dead_code,
-    reason = "legacy builtin dispatch is retained during evaluator consolidation"
-)]
 fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissVal, BlissError> {
     match name {
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
@@ -14508,6 +14516,26 @@ fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissV
                 expected: "list".into(),
             })
         }
+        "NULL" | "NOT" => Ok(if args.first().copied().unwrap_or(NIL).is_nil() {
+            T
+        } else {
+            NIL
+        }),
+        "CONSP" => Ok(if args.first().copied().unwrap_or(NIL).is_cons() {
+            T
+        } else {
+            NIL
+        }),
+        "ATOM" => Ok(if args.first().copied().unwrap_or(NIL).is_cons() {
+            NIL
+        } else {
+            T
+        }),
+        "LISTP" => Ok(if args.first().copied().unwrap_or(NIL).is_list() {
+            T
+        } else {
+            NIL
+        }),
         _ => Err(BlissError::UndefinedFunction(
             resolve_sym(name).unwrap_or(NIL),
         )),
