@@ -8,7 +8,7 @@ use bliss_rt::value::{BlissVal, NIL, T, TAG_HEAP_OBJECT};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 // ── Internal data ─────────────────────────────────────────────────
 
@@ -57,6 +57,35 @@ static PATHNAME_STORE: Mutex<Option<HashMap<u64, PathnameRecord>>> = Mutex::new(
 static STRING_REGISTRY: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
 static STRING_REVERSE_REGISTRY: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
 static LOGICAL_TRANSLATIONS: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
+
+fn scan_pathname_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let mut store = PATHNAME_STORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(store) = store.as_mut() {
+        for record in store.values_mut() {
+            visit(&mut record.host);
+            visit(&mut record.device);
+            visit(&mut record.directory);
+            visit(&mut record.name);
+            visit(&mut record.type_field);
+            visit(&mut record.version);
+        }
+    }
+    let mut translations = LOGICAL_TRANSLATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(translations) = translations.as_mut() {
+        for value in translations.values_mut() {
+            visit(value);
+        }
+    }
+}
+
+fn install_pathname_global_root_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_pathname_global_roots));
+}
 
 fn with_pathname_store<F, R>(f: F) -> R
 where
@@ -186,6 +215,7 @@ fn is_wild(val: BlissVal) -> bool {
 }
 
 fn alloc_pathname(rec: PathnameRecord) -> BlissVal {
+    install_pathname_global_root_scanner();
     // A pathname is a REAL heap object carrying the PATHNAME type_id in its
     // header (bliss-lb6.9), NOT a fake `(id << 3) | TAG_HEAP_OBJECT` sentinel.
     // The old sentinel had the heap-object tag but pointed at a bogus low
@@ -1307,6 +1337,7 @@ pub fn set_logical_pathname_translations(
     host: &str,
     translations: BlissVal,
 ) -> Result<(), BlissError> {
+    install_pathname_global_root_scanner();
     with_logical_translations(|map| {
         map.insert(host.to_uppercase(), translations);
     });

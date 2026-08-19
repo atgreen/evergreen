@@ -148,6 +148,39 @@ impl Environment {
         }
     }
 
+    /// Yield every movable value slot retained by this compiler environment.
+    ///
+    /// Environment map keys are symbol identity bits and therefore immediate;
+    /// only the binding/declaration payloads can point into the moving heap.
+    /// `Arc::make_mut` safely gives this stored environment its own parent chain
+    /// when another environment shares a frame.
+    pub fn visit_gc_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        for info in self.variables.values_mut() {
+            match info {
+                VariableInfo::Constant(value) | VariableInfo::SymbolMacro(value) => visit(value),
+                VariableInfo::Lexical | VariableInfo::Special => {}
+            }
+        }
+        for info in self.functions.values_mut() {
+            if let FunctionInfo::Macro(value) = info {
+                visit(value);
+            }
+        }
+        for declaration in &mut self.declarations {
+            match declaration {
+                DeclInfo::Type(_, value) | DeclInfo::Custom(_, value) => visit(value),
+                DeclInfo::Optimize(_)
+                | DeclInfo::Declaration(_)
+                | DeclInfo::Ignore(_)
+                | DeclInfo::Ignorable(_)
+                | DeclInfo::Dynamic(_) => {}
+            }
+        }
+        if let Some(parent) = &mut self.parent {
+            Arc::make_mut(parent).visit_gc_roots(visit);
+        }
+    }
+
     /// Query variable information (CLtL2 `variable-information`).
     /// Walks the parent chain to find the binding in the nearest enclosing scope.
     pub fn variable_information(&self, name: BlissVal) -> Option<VariableInfo> {
@@ -354,6 +387,20 @@ const NOTINLINE_SENTINEL: u64 = 0xFFFF_FFFF_DEAD_BEEF;
 static GLOBAL_MACRO_TABLE: LazyLock<RwLock<HashMap<u64, BlissVal>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+fn scan_global_macro_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let mut table = GLOBAL_MACRO_TABLE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for expander in table.values_mut() {
+        visit(expander);
+    }
+}
+
+fn install_global_macro_root_scanner() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_global_macro_roots));
+}
+
 /// Global compiler macro table: maps function name keys to compiler macro
 /// expander functions. Protected by RwLock (spec §4.2.4, §4.2.12).
 /// The expander takes (form, env) and returns either a replacement form
@@ -377,6 +424,7 @@ pub struct ParsedMacro {
 
 /// Register a global macro (DEFMACRO).
 pub fn define_global_macro(name: BlissVal, expander: BlissVal) {
+    install_global_macro_root_scanner();
     let mut table = GLOBAL_MACRO_TABLE.write().unwrap();
     table.insert(name.0, expander);
 }

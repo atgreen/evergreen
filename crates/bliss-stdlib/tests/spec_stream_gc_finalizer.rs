@@ -7,10 +7,11 @@
 //! real stdlib GC hooks (finalizer dispatch + stream tracing), so they are
 //! serialized on a file-local lock like the other GC tests in the tree.
 
-use bliss_rt::value::{NIL, T};
-use bliss_stdlib::streams::{install_gc_hooks, IF_EXISTS_SUPERSEDE_VAL};
+use bliss_rt::value::{BlissVal, NIL, T};
+use bliss_stdlib::streams::{install_gc_hooks, set_symbol_stream, IF_EXISTS_SUPERSEDE_VAL};
 use bliss_stdlib::{
-    make_broadcast_stream, make_lisp_string, make_string_output_stream, open, register_string,
+    make_broadcast_stream, make_lisp_string, make_string_input_stream, make_string_output_stream,
+    make_synonym_stream, open, register_string, stream_read_char,
     stream_write_string, ExternalFormat, StreamDirection,
 };
 use std::sync::{Mutex, OnceLock};
@@ -88,4 +89,22 @@ fn composite_stream_survives_gc_trace_and_finalize() {
         bliss_rt::full_gc().expect("full_gc");
     }
     bliss_rt::full_gc().expect("full_gc");
+}
+
+#[test]
+fn synonym_registry_relocates_its_stream_value() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
+    install_gc_hooks();
+
+    let symbol = BlissVal::from_symbol_index(40_001);
+    let target = make_string_input_stream(make_lisp_string("rooted"), 0, None).unwrap();
+    set_symbol_stream(symbol, target);
+    let roots = bliss_rt::ShadowRootScope::new();
+    let synonym = roots.root(make_synonym_stream(symbol).unwrap());
+
+    bliss_rt::full_gc().expect("full_gc");
+    assert_eq!(
+        stream_read_char(synonym.get()).unwrap(),
+        BlissVal::from_char('r')
+    );
 }

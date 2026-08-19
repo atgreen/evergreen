@@ -380,6 +380,81 @@ thread_local! {
     static CLOS_STATE: RefCell<ClosState> = RefCell::new(ClosState::new());
 }
 
+fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    CLOS_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        // Registry keys are symbols or private meta-handles and never move.
+        // Payloads can include reader-built lambda lists and other heap values.
+        for value in state.class_registry.values_mut() {
+            visit(value);
+        }
+        for value in state.class_by_name.values_mut() {
+            visit(value);
+        }
+        for meta in state.class_meta.values_mut() {
+            visit(&mut meta.name);
+            for value in &mut meta.direct_supers {
+                visit(value);
+            }
+            for value in &mut meta.direct_subs {
+                visit(value);
+            }
+            for value in &mut meta.slots {
+                visit(value);
+            }
+            // Wrapper class ids and slot-layout names are the same immediate
+            // meta-handles/symbols represented above, so they need no rewrite.
+        }
+        for data in state.generic_functions.values_mut() {
+            visit(&mut data.name);
+            visit(&mut data.lambda_list);
+            for method in &mut data.methods {
+                visit(method);
+            }
+        }
+        for meta in state.method_meta.values_mut() {
+            for specializer in &mut meta.specializers {
+                visit(specializer);
+            }
+        }
+        for method in state.effective_methods.values_mut() {
+            for group in [
+                &mut method.around,
+                &mut method.before,
+                &mut method.primary,
+                &mut method.after,
+            ] {
+                for value in group {
+                    visit(value);
+                }
+            }
+        }
+        for method in state.short_form_methods.values_mut() {
+            for value in &mut method.methods {
+                visit(value);
+            }
+        }
+        for (_, class) in &mut state.fixnum_registrations {
+            visit(class);
+        }
+        visit(&mut state.fixnum_class);
+        visit(&mut state.character_class);
+        visit(&mut state.symbol_class);
+        visit(&mut state.null_class);
+        visit(&mut state.t_class_val);
+        visit(&mut state.standard_object_class);
+        visit(&mut state.cons_class);
+        visit(&mut state.float_class);
+        visit(&mut state.function_class);
+        visit(&mut state.heap_object_class);
+    });
+}
+
+fn install_clos_state_root_scanner() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_clos_state_roots));
+}
+
 fn with_state<F, R>(f: F) -> R
 where
     F: FnOnce(&ClosState) -> R,
@@ -425,6 +500,7 @@ pub fn ensure_clos_bootstrapped() -> Result<(), BlissError> {
 }
 
 pub fn bootstrap_clos() -> Result<(), BlissError> {
+    install_clos_state_root_scanner();
     with_state_mut(|st| {
         // Full reset so tests are independent
         *st = ClosState::new();

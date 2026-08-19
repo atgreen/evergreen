@@ -178,10 +178,6 @@ fn funcall(function: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError
 struct RestartEntry {
     name: BlissVal,
     function: BlissVal,
-    #[expect(
-        dead_code,
-        reason = "restart metadata is stored for later reporting hooks"
-    )]
     report_function: Option<BlissVal>,
     interactive_function: Option<BlissVal>,
     test_function: Option<BlissVal>,
@@ -279,6 +275,49 @@ thread_local! {
     static STATE: RefCell<ConditionState> = RefCell::new(ConditionState::new());
     /// Flag set by the MUFFLE-WARNING restart to suppress warning output.
     static WARNING_MUFFLED: RefCell<bool> = const { RefCell::new(false) };
+}
+
+fn scan_condition_state_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        for cluster in &mut state.handler_stack {
+            for (condition_type, handler) in cluster {
+                visit(condition_type);
+                visit(handler);
+            }
+        }
+        for restart in &mut state.restart_registry {
+            visit(&mut restart.name);
+            visit(&mut restart.function);
+            for function in [
+                &mut restart.report_function,
+                &mut restart.interactive_function,
+                &mut restart.test_function,
+            ] {
+                if let Some(function) = function.as_mut() {
+                    visit(function);
+                }
+            }
+        }
+        if let Some(hook) = state.debugger_hook.as_mut() {
+            visit(hook);
+        }
+        if let Some(type_specifier) = state.break_on_signals.as_mut() {
+            visit(type_specifier);
+        }
+        for handler in state.handler_case_clauses.values_mut() {
+            visit(handler);
+        }
+        if let Some((condition, handler)) = state.pending_handler_case.as_mut() {
+            visit(condition);
+            visit(handler);
+        }
+    });
+}
+
+fn install_condition_state_root_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_condition_state_roots));
 }
 
 // ── Condition construction ────────────────────────────────────────
@@ -496,6 +535,7 @@ pub fn install_runtime_init_hook() {
 }
 
 pub fn initialize_condition_runtime_support() -> Result<(), BlissError> {
+    install_condition_state_root_scanner();
     install_runtime_init_hook();
     if storage_condition_pool_is_live() {
         Ok(())

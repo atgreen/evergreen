@@ -1210,8 +1210,23 @@ fn synonym_table() -> &'static Mutex<HashMap<u64, BlissVal>> {
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn scan_synonym_stream_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let mut table = synonym_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for stream in table.values_mut() {
+        visit(stream);
+    }
+}
+
+fn install_synonym_stream_root_scanner() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_synonym_stream_roots));
+}
+
 /// Bind a symbol to a stream value for synonym stream resolution.
 pub fn set_symbol_stream(symbol: BlissVal, stream: BlissVal) {
+    install_synonym_stream_root_scanner();
     let mut table = synonym_table().lock().unwrap();
     table.insert(symbol.0, stream);
 }

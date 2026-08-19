@@ -1202,6 +1202,7 @@ static NEXT_BREAKPOINT_ID: AtomicU64 = AtomicU64::new(1);
 fn breakpoint_map() -> &'static Mutex<HashMap<BreakpointId, BreakpointInfo>> {
     use std::sync::OnceLock;
     static MAP: OnceLock<Mutex<HashMap<BreakpointId, BreakpointInfo>>> = OnceLock::new();
+    install_devtools_root_scanner();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2380,7 +2381,55 @@ struct TraceEntry {
 fn traced_registry() -> &'static Mutex<HashMap<u64, TraceEntry>> {
     use std::sync::OnceLock;
     static R: OnceLock<Mutex<HashMap<u64, TraceEntry>>> = OnceLock::new();
+    install_devtools_root_scanner();
     R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn scan_devtools_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    {
+        let mut breakpoints = breakpoint_map()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for breakpoint in breakpoints.values_mut() {
+            match &mut breakpoint.target {
+                BreakpointTarget::Entry(function) => visit(function),
+                BreakpointTarget::Watch(target) => {
+                    visit(&mut target.name);
+                    visit(&mut target.last_value);
+                    if let Some(predicate) = target.predicate.as_mut() {
+                        visit(predicate);
+                    }
+                }
+                BreakpointTarget::SourceLocation { .. } => {}
+            }
+            if let Some(condition) = breakpoint.condition.as_mut() {
+                visit(condition);
+            }
+        }
+    }
+
+    // Trace entries are keyed by raw function identity, so rebuilding the map
+    // is required when a function object is relocated.
+    let mut traces = traced_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let old = std::mem::take(&mut *traces);
+    for (key, mut entry) in old {
+        let mut function = BlissVal(key);
+        visit(&mut function);
+        if let Some(condition) = entry.condition.as_mut() {
+            visit(condition);
+        }
+        if let Some(original) = entry.original_function.as_mut() {
+            visit(original);
+        }
+        traces.insert(function.0, entry);
+    }
+}
+
+fn install_devtools_root_scanner() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_devtools_roots));
 }
 
 /// Thread-local trace depth for indented output.

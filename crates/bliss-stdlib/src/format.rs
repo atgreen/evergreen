@@ -2123,8 +2123,34 @@ use std::sync::Mutex;
 /// Maps function name (uppercase) to a BlissVal representing the function.
 static FORMAT_FUNCTION_REGISTRY: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
 
+fn scan_format_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let mut registry = FORMAT_FUNCTION_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(registry) = registry.as_mut() {
+        for function in registry.values_mut() {
+            visit(function);
+        }
+    }
+    let mut dispatch = DEFAULT_DISPATCH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(dispatch) = dispatch.as_mut() {
+        for (type_specifier, function, _) in dispatch {
+            visit(type_specifier);
+            visit(function);
+        }
+    }
+}
+
+fn install_format_global_root_scanner() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_format_global_roots));
+}
+
 /// Register a user-defined format function for use with the ~/name/ directive.
 pub fn register_format_function(name: &str, function: BlissVal) {
+    install_format_global_root_scanner();
     let mut registry = FORMAT_FUNCTION_REGISTRY.lock().unwrap();
     if registry.is_none() {
         *registry = Some(HashMap::new());
@@ -2148,6 +2174,7 @@ static DEFAULT_DISPATCH: Mutex<Option<Vec<(BlissVal, BlissVal, f64)>>> = Mutex::
 
 /// NOTE: Leaked allocation — not GC-registered. See make_bliss_string note.
 fn ensure_default_table() {
+    install_format_global_root_scanner();
     let mut table = DEFAULT_DISPATCH.lock().unwrap();
     if table.is_none() {
         // Default table with a catch-all entry
@@ -2235,6 +2262,7 @@ pub fn set_pprint_dispatch(
     priority: f64,
     table: BlissVal,
 ) -> Result<(), BlissError> {
+    install_format_global_root_scanner();
     if !table.is_nil() && is_dispatch_table(table) {
         // Operate on the given heap-encoded dispatch table
         let mut entries = read_dispatch_table_entries(table);

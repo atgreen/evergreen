@@ -17,7 +17,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, Weak};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::thread::ThreadId;
 
@@ -766,11 +766,20 @@ struct EnvFrame {
 /// This copy is therefore load-bearing (a lifetime/`Send` requirement, not the
 /// gd4 aliasing bug) and cannot be replaced by frame sharing while the registry
 /// stays in a separate crate behind `Send + Sync` bounds. See bliss-9sf.
-#[derive(Clone)]
 struct FrozenEnvFrame {
-    vars: HashMap<String, BlissVal>,
-    symbol_vars: HashMap<u32, BlissVal>,
+    vars: Mutex<HashMap<String, BlissVal>>,
+    symbol_vars: Mutex<HashMap<u32, BlissVal>>,
     parent: Option<Arc<FrozenEnvFrame>>,
+}
+
+struct FrozenMacroCapture {
+    params_form: BlissVal,
+    body: BlissVal,
+    captured_frame: Arc<FrozenEnvFrame>,
+    funs: HashMap<String, FunDef>,
+    classes: HashMap<String, ClassDef>,
+    methods: HashMap<String, Vec<MethodDef>>,
+    symbol_macros: HashMap<u32, BlissVal>,
 }
 
 #[derive(Clone)]
@@ -1098,16 +1107,24 @@ fn store_control_value(token: &str, value: BlissVal) {
 fn freeze_env_frame(frame: &Rc<RefCell<EnvFrame>>) -> Arc<FrozenEnvFrame> {
     let borrowed = frame.borrow();
     Arc::new(FrozenEnvFrame {
-        vars: borrowed.vars.clone(),
-        symbol_vars: borrowed.symbol_vars.clone(),
+        vars: Mutex::new(borrowed.vars.clone()),
+        symbol_vars: Mutex::new(borrowed.symbol_vars.clone()),
         parent: borrowed.parent.as_ref().map(freeze_env_frame),
     })
 }
 
 fn thaw_env_frame(frame: &Arc<FrozenEnvFrame>) -> Rc<RefCell<EnvFrame>> {
     Rc::new(RefCell::new(EnvFrame {
-        vars: frame.vars.clone(),
-        symbol_vars: frame.symbol_vars.clone(),
+        vars: frame
+            .vars
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+        symbol_vars: frame
+            .symbol_vars
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
         parent: frame.parent.as_ref().map(thaw_env_frame),
     }))
 }
@@ -2485,6 +2502,127 @@ fn visit_handler_roots(
     }
 }
 
+fn visit_frozen_env_frame_roots(
+    frame: &Arc<FrozenEnvFrame>,
+    visited: &mut HashSet<usize>,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    let identity = Arc::as_ptr(frame) as usize;
+    if !visited.insert(identity) {
+        return;
+    }
+    {
+        let mut vars = frame
+            .vars
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for value in vars.values_mut() {
+            visit(value);
+        }
+    }
+    {
+        let mut vars = frame
+            .symbol_vars
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for value in vars.values_mut() {
+            visit(value);
+        }
+    }
+    if let Some(parent) = &frame.parent {
+        visit_frozen_env_frame_roots(parent, visited, visit);
+    }
+}
+
+fn frozen_macro_captures() -> &'static Mutex<Vec<Weak<Mutex<FrozenMacroCapture>>>> {
+    static CAPTURES: std::sync::OnceLock<Mutex<Vec<Weak<Mutex<FrozenMacroCapture>>>>> =
+        std::sync::OnceLock::new();
+    CAPTURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_frozen_macro_capture(capture: FrozenMacroCapture) -> Arc<Mutex<FrozenMacroCapture>> {
+    install_evaluator_global_root_scanner();
+    let capture = Arc::new(Mutex::new(capture));
+    let mut captures = frozen_macro_captures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    captures.retain(|weak| weak.strong_count() != 0);
+    captures.push(Arc::downgrade(&capture));
+    capture
+}
+
+fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    CONTROL_VALUES.with(|values| {
+        for value in values.borrow_mut().values_mut() {
+            visit(value);
+        }
+    });
+    MACROEXPAND_ENVIRONMENTS.with(|environments| {
+        for environment in environments.borrow_mut().values_mut() {
+            environment.visit_gc_roots(visit);
+        }
+    });
+
+    let mut state = EnvRootVisitState::default();
+    GLOBAL_MACROS.with(|macros| {
+        for definition in macros.borrow_mut().values_mut() {
+            visit_macro_def_roots(definition, &mut state, visit);
+        }
+    });
+    GLOBAL_SETF_FNS.with(|functions| {
+        for definition in functions.borrow_mut().values_mut() {
+            visit_fun_def_roots(definition, visit);
+        }
+    });
+    MACRO_FN_CACHE.with(|cache| {
+        for entry in cache.borrow_mut().values_mut() {
+            let mut params = BlissVal(entry.params_bits);
+            let mut body = BlissVal(entry.body_bits);
+            visit(&mut params);
+            visit(&mut body);
+            entry.params_bits = params.0;
+            entry.body_bits = body.0;
+            visit(&mut entry.handle);
+            visit(&mut entry.symbol);
+        }
+    });
+
+    let captures = frozen_macro_captures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut frozen_frames = HashSet::new();
+    for weak in captures.iter() {
+        let Some(capture) = weak.upgrade() else {
+            continue;
+        };
+        let mut capture = capture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        visit(&mut capture.params_form);
+        visit(&mut capture.body);
+        visit_frozen_env_frame_roots(&capture.captured_frame, &mut frozen_frames, visit);
+        for definition in capture.funs.values_mut() {
+            visit_fun_def_roots(definition, visit);
+        }
+        for class in capture.classes.values_mut() {
+            visit_class_def_roots(class, &mut state, visit);
+        }
+        for methods in capture.methods.values_mut() {
+            for method in methods {
+                visit_method_def_roots(method, visit);
+            }
+        }
+        for expansion in capture.symbol_macros.values_mut() {
+            visit(expansion);
+        }
+    }
+}
+
+fn install_evaluator_global_root_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_evaluator_global_roots));
+}
+
 impl Env {
     fn funs_mut(&mut self) -> std::cell::RefMut<'_, HashMap<String, FunDef>> {
         if Rc::strong_count(&self.funs) > 1 {
@@ -2591,6 +2729,7 @@ impl Env {
     }
 
     fn new_impl(sandbox: bool, reset_clos: bool) -> Self {
+        install_evaluator_global_root_scanner();
         if reset_clos {
             let _ = bliss_stdlib::bootstrap_clos();
         } else {
@@ -13679,18 +13818,36 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
     // The expander is stored in bliss-compiler's global registry as an
     // Arc<dyn Fn + Send + Sync>, so it must own a Send snapshot of the defining
     // lexical frame rather than share the live Rc chain. See FrozenEnvFrame.
-    let captured_frame = freeze_env_frame(&env.frame);
-    let funs = env.funs.borrow().clone();
-    let classes = env.classes.borrow().clone();
-    let methods = env.methods.borrow().clone();
+    let capture = register_frozen_macro_capture(FrozenMacroCapture {
+        params_form,
+        body,
+        captured_frame: freeze_env_frame(&env.frame),
+        funs: env.funs.borrow().clone(),
+        classes: env.classes.borrow().clone(),
+        methods: env.methods.borrow().clone(),
+        symbol_macros: env.symbol_macros.borrow().clone(),
+    });
     let current_package = env.current_package.clone();
     let sandbox = env.sandbox;
-    let symbol_macros = env.symbol_macros.borrow().clone();
     let eval_context = env.eval_context;
 
     compiler_macroexpand::define_compiler_macro(
         name_form,
         Arc::new(move |form, _macro_env| {
+            let (params_form, body, captured_frame, funs, classes, methods, symbol_macros) = {
+                let capture = capture
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (
+                    capture.params_form,
+                    capture.body,
+                    Arc::clone(&capture.captured_frame),
+                    capture.funs.clone(),
+                    capture.classes.clone(),
+                    capture.methods.clone(),
+                    capture.symbol_macros.clone(),
+                )
+            };
             let (_, args) = cp(form);
             let mut macro_env = Env::new_for_macro_expansion(sandbox);
             macro_env.frame = thaw_env_frame(&captured_frame);
@@ -14018,16 +14175,32 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
             }
             _ => {
                 let handle = next_macro_function_handle();
-                let params_form = macro_def.params_form;
-                let body = macro_def.body;
                 // Registered into bliss-compiler's global Send + Sync macro
                 // table, so the closure owns a frozen snapshot instead of the
                 // live Rc frame. See FrozenEnvFrame. (The ordinary expand_macro
                 // path shares the live frame.)
-                let captured_frame = freeze_env_frame(&macro_def.captured_frame);
+                let capture = register_frozen_macro_capture(FrozenMacroCapture {
+                    params_form: macro_def.params_form,
+                    body: macro_def.body,
+                    captured_frame: freeze_env_frame(&macro_def.captured_frame),
+                    funs: HashMap::new(),
+                    classes: HashMap::new(),
+                    methods: HashMap::new(),
+                    symbol_macros: HashMap::new(),
+                });
                 compiler_macroexpand::register_macro_function(
                     handle,
                     Arc::new(move |form, call_macro_env| {
+                        let (params_form, body, captured_frame) = {
+                            let capture = capture
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            (
+                                capture.params_form,
+                                capture.body,
+                                Arc::clone(&capture.captured_frame),
+                            )
+                        };
                         let (_, args) = cp(form);
                         let mut macro_env = Env::new_for_macro_expansion(false);
                         macro_env.frame = thaw_env_frame(&captured_frame);
@@ -16510,6 +16683,52 @@ mod transient_shadow_root_tests {
 
         assert!(read_eval_all_env("missing-env-root-test-variable", &mut env).is_err());
         assert_eq!(live_env_root_depth(), 0, "error unwind must unregister Env");
+    }
+
+    #[test]
+    fn evaluator_global_scanner_rewrites_macro_definition_slots() {
+        const GLOBAL_BASE: i64 = 910_000_000;
+        const DELTA: i64 = 10_000;
+        let marker = |offset| BlissVal::from_fixnum(GLOBAL_BASE + offset);
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        GLOBAL_MACROS.with(|macros| macros.borrow_mut().clear());
+        let frame = Rc::new(RefCell::new(EnvFrame::default()));
+        frame
+            .borrow_mut()
+            .vars
+            .insert("CAPTURED".into(), marker(2));
+        GLOBAL_MACROS.with(|macros| {
+            macros.borrow_mut().insert(
+                "GC-RETAINED-GLOBAL-MACRO".into(),
+                MacroDef {
+                    params_form: marker(0),
+                    body: marker(1),
+                    captured_frame: Rc::clone(&frame),
+                },
+            );
+        });
+
+        scan_evaluator_global_roots(&mut |slot| unsafe {
+            let value = &mut *slot;
+            if value.is_fixnum()
+                && (GLOBAL_BASE..GLOBAL_BASE + 3).contains(&value.as_fixnum())
+            {
+                *value = BlissVal::from_fixnum(value.as_fixnum() + DELTA);
+            }
+        });
+        let definition = GLOBAL_MACROS.with(|macros| {
+            macros
+                .borrow()
+                .get("GC-RETAINED-GLOBAL-MACRO")
+                .cloned()
+                .expect("global macro remains registered")
+        });
+        assert_eq!(definition.params_form.as_fixnum(), GLOBAL_BASE + DELTA);
+        assert_eq!(definition.body.as_fixnum(), GLOBAL_BASE + 1 + DELTA);
+        assert_eq!(
+            frame.borrow().vars["CAPTURED"].as_fixnum(),
+            GLOBAL_BASE + 2 + DELTA
+        );
     }
 }
 
