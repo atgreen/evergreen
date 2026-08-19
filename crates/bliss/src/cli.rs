@@ -17,8 +17,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::thread::ThreadId;
 
 // ── CLI arguments ──────────────────────────────────────────────────
 #[derive(Clone, Debug)]
@@ -2511,10 +2512,9 @@ impl Env {
 
     /// Enumerate every mutable `BlissVal` slot owned by this tree-walker
     /// environment. A moving collector can rewrite each yielded pointer in
-    /// place. This deliberately does not register the Env with the collector or
-    /// enable T0 automatic collection: transient Rust evaluation values still
-    /// need a shadow-root stack before collection is safe.
-    #[allow(dead_code)]
+    /// place. Live top-level evaluation registers this visitor with the runtime
+    /// through [`LiveEnvRootGuard`]; automatic T0 collection remains disabled
+    /// until the remaining global/static evaluator roots are covered.
     fn visit_gc_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
         let mut state = EnvRootVisitState::default();
 
@@ -2989,6 +2989,79 @@ impl Env {
         self.mv = values;
         self.mv_active = true;
     }
+}
+
+// ── Live tree-walker environment roots (bliss-6b2.3) ─────────────
+
+fn live_env_roots() -> &'static Mutex<HashMap<ThreadId, Vec<usize>>> {
+    static ROOTS: std::sync::OnceLock<Mutex<HashMap<ThreadId, Vec<usize>>>> =
+        std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn scan_live_env_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let roots = live_env_roots().lock().unwrap_or_else(|e| e.into_inner());
+    let mut visited = HashSet::new();
+    for stack in roots.values() {
+        for &address in stack {
+            if visited.insert(address) {
+                // SAFETY: guards register an Env only for the lexical extent in
+                // which its originating &mut Env remains live and immobile.
+                unsafe { (&mut *(address as *mut Env)).visit_gc_roots(visit) };
+            }
+        }
+    }
+}
+
+fn install_live_env_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_live_env_roots));
+}
+
+struct LiveEnvRootGuard {
+    thread: ThreadId,
+    address: usize,
+}
+
+impl LiveEnvRootGuard {
+    fn new(env: &mut Env) -> Self {
+        install_live_env_scanner();
+        let thread = std::thread::current().id();
+        let address = env as *mut Env as usize;
+        live_env_roots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(thread)
+            .or_default()
+            .push(address);
+        Self { thread, address }
+    }
+}
+
+impl Drop for LiveEnvRootGuard {
+    fn drop(&mut self) {
+        assert_eq!(self.thread, std::thread::current().id());
+        let mut roots = live_env_roots().lock().unwrap_or_else(|e| e.into_inner());
+        let remove = {
+            let stack = roots
+                .get_mut(&self.thread)
+                .expect("live Env root stack vanished before guard drop");
+            assert_eq!(stack.pop(), Some(self.address));
+            stack.is_empty()
+        };
+        if remove {
+            roots.remove(&self.thread);
+        }
+    }
+}
+
+#[cfg(test)]
+fn live_env_root_depth() -> usize {
+    live_env_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&std::thread::current().id())
+        .map_or(0, Vec::len)
 }
 
 fn with_child_frame<T>(
@@ -3946,6 +4019,7 @@ fn read_from_string_in_env(
 }
 
 fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let _env_roots = LiveEnvRootGuard::new(env);
     reader::set_read_eval_hook(Some(read_time_eval));
     reader::set_symbol_resolver(Some(reader_symbol_resolver));
     reader::set_pathname_constructor(Some(reader_pathname_constructor));
@@ -16407,6 +16481,35 @@ mod transient_shadow_root_tests {
         let (car, cdr) = cp(after);
         assert_eq!(car.as_fixnum(), 333);
         assert_eq!(cdr.as_fixnum(), 444);
+    }
+
+    #[test]
+    fn live_env_registration_rewrites_lexical_values_and_unwinds() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        assert_eq!(live_env_root_depth(), 0);
+
+        let outer = LiveEnvRootGuard::new(&mut env);
+        assert_eq!(live_env_root_depth(), 1);
+        {
+            let _inner = LiveEnvRootGuard::new(&mut env);
+            assert_eq!(live_env_root_depth(), 2);
+        }
+        assert_eq!(live_env_root_depth(), 1);
+
+        let value = read_eval_all_env(
+            "(let ((held (vector 71 72 73))) (%force-minor-gc-for-test) held)",
+            &mut env,
+        )
+        .expect("lexical Env root must survive forced minor GC");
+        assert_eq!(bliss_stdlib::length(value).unwrap(), 3);
+        assert_eq!(bliss_stdlib::elt(value, 1).unwrap().as_fixnum(), 72);
+        assert_eq!(live_env_root_depth(), 1);
+        drop(outer);
+        assert_eq!(live_env_root_depth(), 0);
+
+        assert!(read_eval_all_env("missing-env-root-test-variable", &mut env).is_err());
+        assert_eq!(live_env_root_depth(), 0, "error unwind must unregister Env");
     }
 }
 
