@@ -406,13 +406,16 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
     // apply_function's synthesize path. GETHASH reads; the (setf gethash) store
     // is lowered directly to BLISS::PUT-GETHASH by lower_setf. MAKE-HASH-TABLE's
     // &key args pass positionally and are parsed by the callee. (Only the ops that
-    // are actually implemented in the interpreter are listed; CLRHASH /
-    // HASH-TABLE-P / HASH-TABLE-KEYS are not yet functions, so they keep bailing.)
+    // are actually implemented in the interpreter are listed.)
     "GETHASH",
     "MAKE-HASH-TABLE",
     "REMHASH",
+    "CLRHASH",
     "MAPHASH",
     "HASH-TABLE-COUNT",
+    "HASH-TABLE-P",
+    "HASH-TABLE-KEYS",
+    "HASH-TABLE-VALUES",
     "GENSYM",
     "MAKE-SYMBOL",
     "SYMBOL-NAME",

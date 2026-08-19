@@ -887,6 +887,16 @@ fn hash_tables_and_funcall_of_builtins_work() {
 }
 
 #[test]
+fn hash_table_predicate_snapshots_and_clear_work() {
+    assert_eq!(
+        eval_ok(
+            "(let ((h (make-hash-table))) (setf (gethash 'a h) 1 (gethash 'b h) 2) (let ((keys (hash-table-keys h)) (values (hash-table-values h))) (list (hash-table-p h) (hash-table-p nil) (length keys) (length values) (eq h (clrhash h)) (hash-table-count h))))"
+        ),
+        "(T NIL 2 2 T 0)"
+    );
+}
+
+#[test]
 fn stage_one_gate_programs_run_through_the_real_cli() {
     // Per §0.4 stage 1 and §11.3 / spec/stages.json, the core-evaluator gate
     // is real CLI execution of recursion, higher-order list processing,

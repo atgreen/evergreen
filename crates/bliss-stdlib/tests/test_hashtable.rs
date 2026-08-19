@@ -280,6 +280,14 @@ fn maphash_visits_all_entries() {
 // ── clrhash ───────────────────────────────────────────────────────
 
 #[test]
+fn hash_table_p_recognizes_only_registered_tables() {
+    let ht = make_hash_table(&MakeHashTableOptions::default()).unwrap();
+    assert!(hash_table_p(ht));
+    assert!(!hash_table_p(NIL));
+    assert!(!hash_table_p(BlissVal::from_fixnum(42)));
+}
+
+#[test]
 fn clrhash_empties_table() {
     let ht = make_hash_table(&MakeHashTableOptions::default()).unwrap();
     for i in 0..5 {

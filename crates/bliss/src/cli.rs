@@ -3692,10 +3692,7 @@ fn is_vector_value(v: BlissVal) -> bool {
 
 /// Sentinel-safe HASH-TABLE-P.
 fn is_hash_table_value(v: BlissVal) -> bool {
-    if !v.is_heap_object() || is_registry_sentinel(v) {
-        return false;
-    }
-    unsafe { (*(v.as_ptr() as *const ObjectHeader)).type_id() == type_id::HASH_TABLE }
+    bliss_stdlib::hash_table_p(v)
 }
 
 /// Sentinel-safe SIMPLE-VECTOR-P (excludes strings and sentinels).
@@ -7763,6 +7760,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let tbl = eval_form(tbl_form, env)?;
                 let removed = bliss_stdlib::remhash(key, tbl)?;
                 return Ok(if removed { T } else { NIL });
+            }
+            "CLRHASH" => {
+                let (tbl_form, _) = cp(cdr);
+                let tbl = eval_form(tbl_form, env)?;
+                bliss_stdlib::clrhash(tbl)?;
+                return Ok(tbl);
             }
             "HASH-TABLE-COUNT" => {
                 let (tbl_form, _) = cp(cdr);

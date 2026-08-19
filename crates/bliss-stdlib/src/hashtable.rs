@@ -173,6 +173,23 @@ fn get_table_inner(table: BlissVal) -> Result<*mut HashTableInner, BlissError> {
     Ok(ptr)
 }
 
+/// Return whether `value` is a live hash table (CL `HASH-TABLE-P`).
+///
+/// Consult the allocation registry rather than dereferencing every heap-tagged
+/// value: some bootstrap objects use heap-tagged sentinels that are not valid
+/// pointers, while every table created by `make_hash_table` is registered here.
+pub fn hash_table_p(value: BlissVal) -> bool {
+    if value.tag() != TAG_HEAP_OBJECT {
+        return false;
+    }
+    let addr = unsafe { value.as_ptr() } as usize;
+    LIVE_TABLES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|tables| tables.contains(&addr))
+}
+
 /// Compute the probe index for a key in a table of the given capacity.
 fn probe_index(key_bits: u64, capacity: usize) -> usize {
     (key_bits as usize) & (capacity - 1)
