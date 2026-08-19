@@ -3874,6 +3874,45 @@ fn expand_compile_toplevel_form(mut form: BlissVal, env: &mut Env) -> BlissVal {
     form
 }
 
+/// Format a UNIX timestamp as SBCL's compile-note date, e.g. "16 AUG 2026
+/// 01:04:28 AM" (UTC). Used only for the `*compile-verbose*` progress line, so
+/// exact local-time/zone fidelity is not important. Uses the civil-from-days
+/// algorithm (days since 1970-01-01).
+fn format_compile_note_date(unix_secs: u64) -> String {
+    let secs = unix_secs as i64;
+    let (days, sod) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let (h, mi, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    const MONTHS: [&str; 12] = [
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    ];
+    let (h12, ampm) = match h {
+        0 => (12, "AM"),
+        1..=11 => (h, "AM"),
+        12 => (12, "PM"),
+        _ => (h - 12, "PM"),
+    };
+    format!(
+        "{:02} {} {} {:02}:{:02}:{:02} {}",
+        d,
+        MONTHS[(m - 1) as usize],
+        year,
+        h12,
+        mi,
+        s,
+        ampm
+    )
+}
+
 fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
     let form = expand_compile_toplevel_form(form, env);
     if !form.is_cons() {
@@ -8639,6 +8678,24 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let source = std::fs::read_to_string(&src_path).map_err(|e| {
                     BlissError::FileError(format!("compile-file: cannot read {src_path}: {e}"))
                 })?;
+                // Per-file progress, gated on *COMPILE-VERBOSE* (default T, like
+                // SBCL). Only fires when compilation actually happens — ASDF
+                // calls COMPILE-FILE only for a missing/stale fasl — so warm
+                // loads stay silent.
+                let compile_verbose = env
+                    .lookup_var("*COMPILE-VERBOSE*")
+                    .map(|v| !v.is_nil())
+                    .unwrap_or(true);
+                let compile_start = std::time::Instant::now();
+                if compile_verbose {
+                    let written = std::fs::metadata(&src_path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| format!(" (written {})", format_compile_note_date(d.as_secs())))
+                        .unwrap_or_default();
+                    println!("; compiling file \"{src_path}\"{written}:");
+                }
                 // ANSI COMPILE-FILE binds *PACKAGE* (and *READTABLE*) for the
                 // dynamic extent of the compilation (CLHS 3.2.1), so a file's
                 // IN-PACKAGE forms don't leak into the caller — after
@@ -8661,6 +8718,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 std::fs::write(&out_path, &image).map_err(|e| {
                     BlissError::FileError(format!("compile-file: cannot write {out_path}: {e}"))
                 })?;
+                if compile_verbose {
+                    let el = compile_start.elapsed();
+                    let secs = el.as_secs();
+                    println!("; wrote {out_path}");
+                    println!(
+                        "; compilation finished in {}:{:02}:{:02}.{:03}",
+                        secs / 3600,
+                        (secs % 3600) / 60,
+                        secs % 60,
+                        el.subsec_millis()
+                    );
+                }
                 let (out_pn, _) =
                     bliss_stdlib::parse_namestring(arena_str(&out_path), None, None)?;
                 env.set_mv(vec![out_pn, NIL, NIL]);

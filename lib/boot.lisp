@@ -462,6 +462,10 @@
 (defvar *load-print* nil)
 (defvar *compile-file-pathname* nil)
 (defvar *compile-file-truename* nil)
+;; COMPILE-FILE prints per-file progress when true (default T, as in SBCL); a
+;; per-form printer flag also exists but is quiet by default.
+(defvar *compile-verbose* t)
+(defvar *compile-print* nil)
 ;; The pretty-printer dispatch table. This interpreter has no user-extensible
 ;; pprint dispatch, but the variable must be bound: ASDF's DEFINE-OP saves and
 ;; rebinds it around loading a .asd (bliss-lb6.17).
