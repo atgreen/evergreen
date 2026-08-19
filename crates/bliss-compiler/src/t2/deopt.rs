@@ -49,7 +49,7 @@
 //!   an immortal one interned in the function's constant pool (§4.3 `AuxData::
 //!   HeapLiteral`) and rooted there, so it is intentionally not flagged here.
 
-use crate::t2::frame_state::{FrameScope, FrameState, RematOp, RematRecipeId, ValueSource};
+use crate::t2::frame_state::{FrameState, RematOp, RematRecipeId, ValueSource};
 use crate::t2::ir::{Value, ValueRepresentation};
 use crate::t2::mach::{Location, MachFunc};
 use bliss_rt::value::{BlissVal, UNBOUND};
@@ -124,6 +124,13 @@ pub struct RematDescriptor {
 pub struct LoweredDeopt {
     /// Native code offset of the trap (copied from the source `StackMap`).
     pub code_offset: u32,
+    /// Logical frames, outermost to innermost, matching `FrameState::scopes`.
+    pub scopes: Vec<LoweredScope>,
+}
+
+/// Resolved descriptors for one logical interpreter frame at a deopt site.
+#[derive(Clone, PartialEq, Debug)]
+pub struct LoweredScope {
     /// Bytecode PC T0 resumes at (`resume_pc`, §4.6 D4.10 / A4.04 step 1b).
     pub resume_pc: u32,
     /// Symbol id of the function whose interpreter frame is reconstructed
@@ -194,31 +201,24 @@ pub fn lower_one(
     fs: &FrameState,
     loc_of: &impl Fn(Value) -> Option<Location>,
 ) -> Result<LoweredDeopt, LowerError> {
-    // R4.67: reconstruct the innermost scope (T2 un-inlines to exactly one
-    // interpreter frame; `scopes.last()` is the deoptimising node's own frame).
-    let scope: &FrameScope = fs
-        .scopes
-        .last()
-        .expect("FrameState invariant: scopes is non-empty (D4.15 inv. 1)");
-
-    let mut slots = Vec::with_capacity(scope.locals.len() + scope.stack.len());
-    let mut live_ref_bitmap = Vec::with_capacity(slots.capacity());
-
-    // A4.14: iterate locals ++ stack, in that order.
-    for source in scope.locals.iter().chain(scope.stack.iter()) {
-        let (desc, is_ref) = lower_source(source, fs, loc_of, 0)?;
-        slots.push(desc);
-        live_ref_bitmap.push(is_ref);
+    let mut scopes = Vec::with_capacity(fs.scopes.len());
+    for scope in &fs.scopes {
+        let mut slots = Vec::with_capacity(scope.locals.len() + scope.stack.len());
+        let mut live_ref_bitmap = Vec::with_capacity(slots.capacity());
+        for source in scope.locals.iter().chain(scope.stack.iter()) {
+            let (desc, is_ref) = lower_source(source, fs, loc_of, 0)?;
+            slots.push(desc);
+            live_ref_bitmap.push(is_ref);
+        }
+        scopes.push(LoweredScope {
+            resume_pc: scope.bcp,
+            function: scope.function,
+            slots,
+            num_locals: scope.locals.len(),
+            live_ref_bitmap,
+        });
     }
-
-    Ok(LoweredDeopt {
-        code_offset,
-        resume_pc: scope.bcp,
-        function: scope.function,
-        slots,
-        num_locals: scope.locals.len(),
-        live_ref_bitmap,
-    })
+    Ok(LoweredDeopt { code_offset, scopes })
 }
 
 /// Lower one `ValueSource` to its descriptor. Returns `(descriptor, is_gc_ref)`
@@ -285,6 +285,8 @@ pub trait MachineState {
 /// A reconstructed interpreter frame — the output of A4.04 steps 3 & 6.
 #[derive(Clone, PartialEq, Debug)]
 pub struct ReconstructedFrame {
+    pub function: u32,
+    pub resume_pc: u32,
     /// Tagged value for each interpreter local (index = local number).
     pub locals: Vec<BlissVal>,
     /// Tagged value for each live operand-stack slot, bottom-to-top.
@@ -301,16 +303,25 @@ pub struct ReconstructedFrame {
 /// * `MaterializeConst` → write the immediate directly;
 /// * `Unbound` → UNBOUND-MARKER (step 6);
 /// * `Remat` → replay the cold recipe (A4.13).
-pub fn reconstruct(lowered: &LoweredDeopt, mach: &impl MachineState) -> ReconstructedFrame {
-    let mut values: Vec<BlissVal> = Vec::with_capacity(lowered.slots.len());
-    for slot in &lowered.slots {
-        values.push(eval_slot(slot, mach));
-    }
-    let stack = values.split_off(lowered.num_locals);
-    ReconstructedFrame {
-        locals: values,
-        stack,
-    }
+pub fn reconstruct(lowered: &LoweredDeopt, mach: &impl MachineState) -> Vec<ReconstructedFrame> {
+    lowered
+        .scopes
+        .iter()
+        .map(|scope| {
+            let mut values: Vec<BlissVal> = scope
+                .slots
+                .iter()
+                .map(|slot| eval_slot(slot, mach))
+                .collect();
+            let stack = values.split_off(scope.num_locals);
+            ReconstructedFrame {
+                function: scope.function,
+                resume_pc: scope.resume_pc,
+                locals: values,
+                stack,
+            }
+        })
+        .collect()
 }
 
 /// Resolve one lowered slot descriptor to its tagged interpreter value.
@@ -431,18 +442,20 @@ mod tests {
         let d = &lowered[0];
 
         assert_eq!(d.code_offset, 0x10);
-        assert_eq!(d.resume_pc, 42);
-        assert_eq!(d.function, bliss_rt::symbols::intern("fsum"));
-        assert_eq!(d.num_locals, 4);
+        assert_eq!(d.scopes.len(), 1);
+        let scope = &d.scopes[0];
+        assert_eq!(scope.resume_pc, 42);
+        assert_eq!(scope.function, bliss_rt::symbols::intern("fsum"));
+        assert_eq!(scope.num_locals, 4);
 
         // Tagged value → no rebox; UnboxedFixnum → ReboxFixnum; Const; Unbound.
-        assert_eq!(d.slots[0], SlotDescriptor::InLocation(gpr(0), Rebox::None));
-        assert_eq!(d.slots[1], SlotDescriptor::InLocation(gpr(1), Rebox::ReboxFixnum));
-        assert_eq!(d.slots[2], SlotDescriptor::MaterializeConst(BlissVal::from_fixnum(7)));
-        assert_eq!(d.slots[3], SlotDescriptor::Unbound);
+        assert_eq!(scope.slots[0], SlotDescriptor::InLocation(gpr(0), Rebox::None));
+        assert_eq!(scope.slots[1], SlotDescriptor::InLocation(gpr(1), Rebox::ReboxFixnum));
+        assert_eq!(scope.slots[2], SlotDescriptor::MaterializeConst(BlissVal::from_fixnum(7)));
+        assert_eq!(scope.slots[3], SlotDescriptor::Unbound);
 
         // Only the Tagged value is a GC root.
-        assert_eq!(d.live_ref_bitmap, vec![true, false, false, false]);
+        assert_eq!(scope.live_ref_bitmap, vec![true, false, false, false]);
     }
 
     #[test]
@@ -461,7 +474,8 @@ mod tests {
             regs: vec![(gpr(0), BlissVal::from_fixnum(99).0), (gpr(1), 5u64)],
         };
 
-        let frame = reconstruct(&lowered, &mach);
+        let frames = reconstruct(&lowered, &mach);
+        let frame = &frames[0];
         assert_eq!(
             frame.locals,
             vec![
@@ -488,10 +502,11 @@ mod tests {
         };
         let loc_of = move |q: Value| (q == v).then_some(gpr(4));
         let lowered = lower_one(0, &fs, &loc_of).unwrap();
-        assert_eq!(lowered.slots[0], SlotDescriptor::InLocation(gpr(4), Rebox::ReboxF32));
+        assert_eq!(lowered.scopes[0].slots[0], SlotDescriptor::InLocation(gpr(4), Rebox::ReboxF32));
 
         let mach = MockMachine { regs: vec![(gpr(4), 1.5f32.to_bits() as u64)] };
-        let frame = reconstruct(&lowered, &mach);
+        let frames = reconstruct(&lowered, &mach);
+        let frame = &frames[0];
         assert_eq!(frame.locals, vec![BlissVal::from_single_float(1.5)]);
     }
 
@@ -518,7 +533,7 @@ mod tests {
         let loc_of = |_: Value| None; // no SSA values referenced
         let lowered = lower_one(0, &fs, &loc_of).unwrap();
 
-        match &lowered.slots[0] {
+        match &lowered.scopes[0].slots[0] {
             SlotDescriptor::Remat(r) => {
                 assert_eq!(r.op, RematOp::FixnumAdd);
                 assert_eq!(r.inputs.len(), 2);
@@ -527,10 +542,11 @@ mod tests {
             other => panic!("expected Remat, got {other:?}"),
         }
         // A remat slot is never a GC root on its own.
-        assert_eq!(lowered.live_ref_bitmap, vec![false]);
+        assert_eq!(lowered.scopes[0].live_ref_bitmap, vec![false]);
 
         let mach = MockMachine { regs: vec![] };
-        let frame = reconstruct(&lowered, &mach);
+        let frames = reconstruct(&lowered, &mach);
+        let frame = &frames[0];
         assert_eq!(frame.locals, vec![BlissVal::from_fixnum(7)]);
     }
 
@@ -568,8 +584,8 @@ mod tests {
         map.insert(vstk, gpr(1));
         let loc_of = move |q: Value| map.get(&q).copied();
         let lowered = lower_one(0, &fs, &loc_of).unwrap();
-        assert_eq!(lowered.num_locals, 1);
-        assert_eq!(lowered.slots.len(), 2);
+        assert_eq!(lowered.scopes[0].num_locals, 1);
+        assert_eq!(lowered.scopes[0].slots.len(), 2);
 
         let mach = MockMachine {
             regs: vec![
@@ -577,8 +593,63 @@ mod tests {
                 (gpr(1), 22u64),
             ],
         };
-        let frame = reconstruct(&lowered, &mach);
+        let frames = reconstruct(&lowered, &mach);
+        let frame = &frames[0];
         assert_eq!(frame.locals, vec![BlissVal::from_fixnum(11)]);
         assert_eq!(frame.stack, vec![BlissVal::from_fixnum(22)]);
+    }
+
+    #[test]
+    fn lowers_and_reconstructs_every_inlined_scope_in_order() {
+        let outer_value = Value(0);
+        let inner_value = Value(1);
+        let outer = bliss_rt::symbols::intern("DEOPT-OUTER");
+        let inner = bliss_rt::symbols::intern("DEOPT-INNER");
+        let fs = FrameState {
+            scopes: vec![
+                FrameScope {
+                    function: outer,
+                    bcp: 8,
+                    locals: vec![ValueSource::Value {
+                        value: outer_value,
+                        repr: ValueRepresentation::Tagged,
+                    }],
+                    stack: vec![],
+                },
+                FrameScope {
+                    function: inner,
+                    bcp: 3,
+                    locals: vec![ValueSource::Value {
+                        value: inner_value,
+                        repr: ValueRepresentation::UnboxedFixnum,
+                    }],
+                    stack: vec![ValueSource::Const(BlissVal::from_fixnum(9))],
+                },
+            ],
+            remat: vec![],
+        };
+        let loc_of = |value| match value {
+            v if v == outer_value => Some(gpr(0)),
+            v if v == inner_value => Some(gpr(1)),
+            _ => None,
+        };
+        let lowered = lower_one(0x44, &fs, &loc_of).unwrap();
+        assert_eq!(lowered.scopes.len(), 2);
+        assert_eq!(lowered.scopes[0].function, outer);
+        assert_eq!(lowered.scopes[1].function, inner);
+
+        let mach = MockMachine {
+            regs: vec![
+                (gpr(0), BlissVal::from_fixnum(5).0),
+                (gpr(1), 7),
+            ],
+        };
+        let frames = reconstruct(&lowered, &mach);
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[0].function, frames[0].resume_pc), (outer, 8));
+        assert_eq!(frames[0].locals, vec![BlissVal::from_fixnum(5)]);
+        assert_eq!((frames[1].function, frames[1].resume_pc), (inner, 3));
+        assert_eq!(frames[1].locals, vec![BlissVal::from_fixnum(7)]);
+        assert_eq!(frames[1].stack, vec![BlissVal::from_fixnum(9)]);
     }
 }

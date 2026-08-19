@@ -3,10 +3,13 @@
 //! This is deliberately separate from the SSA builder.  The builder asks this
 //! module what a function *is* and whether a particular call site may expand;
 //! it does not grow a second list of magic CL names.  `IntrinsicId` is the
-//! initial expansion representation.  A later body inliner can add a saved SSA
-//! body without changing the policy or metadata contracts.
+//! leaf expansion representation; saved bytecode bodies are built to SSA and
+//! cloned as CFGs through the same legality, depth, and growth policy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+use bliss_rt::bytecode::{BytecodeFunction, Instr};
 
 /// Stable compiler identity for a function with an inline expansion.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -211,6 +214,8 @@ impl Default for InlineConfig {
 pub struct InlineOptions {
     pub config: InlineConfig,
     policies: HashMap<u32, InlinePolicy>,
+    bodies: HashMap<u32, Rc<BytecodeFunction>>,
+    root_symbol: Option<u32>,
 }
 
 impl InlineOptions {
@@ -221,6 +226,29 @@ impl InlineOptions {
 
     pub fn policy_at(&self, bcp: u32) -> InlinePolicy {
         self.policies.get(&bcp).copied().unwrap_or_default()
+    }
+
+    /// Make a saved bytecode body available to the body inliner.  Merely being
+    /// registered is not enough: [`body_cost`] still applies the conservative
+    /// fixed-arity/purity/effect filter before the body may be cloned.
+    pub fn with_body(mut self, symbol: u32, body: Rc<BytecodeFunction>) -> Self {
+        self.bodies.insert(symbol, body);
+        self
+    }
+
+    /// Identify the function being compiled, for direct/mutual-recursion
+    /// detection and for the outermost deopt scope.
+    pub fn with_root_symbol(mut self, symbol: u32) -> Self {
+        self.root_symbol = Some(symbol);
+        self
+    }
+
+    pub(crate) fn body(&self, symbol: u32) -> Option<Rc<BytecodeFunction>> {
+        self.bodies.get(&symbol).cloned()
+    }
+
+    pub(crate) fn root_symbol(&self) -> Option<u32> {
+        self.root_symbol
     }
 }
 
@@ -234,6 +262,74 @@ pub enum DeclineReason {
     DepthLimit,
     Budget,
     NotProfitable,
+    Recursive,
+    UnsupportedBody,
+}
+
+/// Return the conservative IR-growth estimate for a saved bytecode body.
+///
+/// Body inlining intentionally starts with the safe subset: fixed positional
+/// arguments, no captured environment, allocation, global state, multiple
+/// values, or non-local control. Calls are accepted only when they name an
+/// already-proven pure/total intrinsic or another eligible saved body. The
+/// visited set turns direct and mutual recursion into a clean decline.
+pub(crate) fn body_cost(
+    symbol: u32,
+    options: &InlineOptions,
+    active: &mut HashSet<u32>,
+) -> Result<u32, DeclineReason> {
+    if !active.insert(symbol) {
+        return Err(DeclineReason::Recursive);
+    }
+    let result = (|| {
+        let body = options.body(symbol).ok_or(DeclineReason::UnsupportedBody)?;
+        if body.variadic
+            || body.has_env
+            || body.max_args != Some(body.arity)
+            || body.min_args != body.arity
+        {
+            return Err(DeclineReason::UnsupportedBody);
+        }
+
+        let mut cost = 0u32;
+        for op in &body.code {
+            cost = cost.saturating_add(1);
+            match op {
+                Instr::Const(_)
+                | Instr::LoadLocal(_)
+                | Instr::StoreLocal(_)
+                | Instr::Pop
+                | Instr::Dup
+                | Instr::Br(_)
+                | Instr::BrIfFalse(_)
+                | Instr::BrIfTrue(_)
+                | Instr::Return => {}
+                Instr::CallNamed { sym, nargs } => {
+                    if let Some(m) = metadata_for_symbol(*sym) {
+                        if *nargs != m.fixed_arity
+                            || m.function == KnownFunction::Typep
+                            || !m.effects.pure
+                            || m.effects.allocates
+                            || m.effects.may_signal
+                        {
+                            return Err(DeclineReason::UnsupportedBody);
+                        }
+                        cost = cost.saturating_add(m.cost);
+                    } else {
+                        let nested = options.body(*sym).ok_or(DeclineReason::UnsupportedBody)?;
+                        if *nargs != nested.arity {
+                            return Err(DeclineReason::WrongArity);
+                        }
+                        cost = cost.saturating_add(body_cost(*sym, options, active)?);
+                    }
+                }
+                _ => return Err(DeclineReason::UnsupportedBody),
+            }
+        }
+        Ok(cost)
+    })();
+    active.remove(&symbol);
+    result
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -284,6 +380,28 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bliss_rt::value::NIL;
+
+    fn saved_body(code: Vec<Instr>) -> Rc<BytecodeFunction> {
+        Rc::new(BytecodeFunction {
+            code,
+            constants: vec![],
+            handler_cases: vec![],
+            handler_binds: vec![],
+            names: vec![],
+            restart_cases: vec![],
+            param_layout: vec![],
+            has_env: false,
+            n_locals: 1,
+            max_stack: 1,
+            arity: 1,
+            name: "INLINE-FILTER-FIXTURE".into(),
+            params_form: NIL,
+            min_args: 1,
+            max_args: Some(1),
+            variadic: false,
+        })
+    }
 
     fn eq() -> &'static InlineMetadata {
         KNOWN
@@ -346,5 +464,30 @@ mod tests {
             metadata_for_symbol(bliss_rt::symbols::intern("OTHER:FIRST-CHAR")),
             None
         );
+    }
+
+    #[test]
+    fn saved_body_filter_rejects_effects_closures_nlx_and_variadic_lambdas() {
+        let symbols = [
+            bliss_rt::symbols::intern("INLINE-EFFECT"),
+            bliss_rt::symbols::intern("INLINE-CLOSURE"),
+            bliss_rt::symbols::intern("INLINE-NLX"),
+            bliss_rt::symbols::intern("INLINE-VARIADIC"),
+        ];
+        let mut variadic = saved_body(vec![Instr::LoadLocal(0), Instr::Return]);
+        Rc::get_mut(&mut variadic).unwrap().variadic = true;
+        Rc::get_mut(&mut variadic).unwrap().max_args = None;
+        let options = InlineOptions::default()
+            .with_body(symbols[0], saved_body(vec![Instr::StoreGlobal(7), Instr::Return]))
+            .with_body(symbols[1], saved_body(vec![Instr::MakeClosureEnv(0), Instr::Return]))
+            .with_body(symbols[2], saved_body(vec![Instr::Throw, Instr::Return]))
+            .with_body(symbols[3], variadic);
+
+        for symbol in symbols {
+            assert_eq!(
+                body_cost(symbol, &options, &mut HashSet::new()),
+                Err(DeclineReason::UnsupportedBody)
+            );
+        }
     }
 }

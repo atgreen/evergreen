@@ -24,10 +24,13 @@
 //! exits) return `Err(BuildError::Unsupported(..))`; the caller keeps such a
 //! function at T1 (spec R4.28). Correctness over coverage.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
-use crate::t2::inlining::{InlineDecision, InlineOptions, IntrinsicId, decide, metadata_for_symbol};
+use crate::t2::inlining::{
+    InlineDecision, InlineOptions, InlinePolicy, IntrinsicId, body_cost, decide,
+    metadata_for_symbol,
+};
 use crate::t2::ir::{
     AuxData, Block, Function, IRType, Inst, InstData, InstFlags, Opcode, TypeBits, Value,
     ValueRepresentation,
@@ -60,7 +63,109 @@ pub fn build_from_bytecode_with_inline_options(
     bf: &BytecodeFunction,
     inline_options: InlineOptions,
 ) -> Result<Function, BuildError> {
-    Builder::new(bf, inline_options).run()
+    let mut remaining_budget = inline_options.config.node_budget;
+    let mut active = HashSet::new();
+    if let Some(root) = inline_options.root_symbol() {
+        active.insert(root);
+    }
+    build_with_saved_bodies(
+        bf,
+        &inline_options,
+        inline_options.root_symbol(),
+        0,
+        &mut remaining_budget,
+        &mut active,
+        true,
+    )
+}
+
+fn build_with_saved_bodies(
+    bf: &BytecodeFunction,
+    options: &InlineOptions,
+    current_symbol: Option<u32>,
+    depth: u8,
+    remaining_budget: &mut u32,
+    active: &mut HashSet<u32>,
+    root_policies: bool,
+) -> Result<Function, BuildError> {
+    let builder_options = current_symbol.map_or_else(
+        || options.clone(),
+        |symbol| options.clone().with_root_symbol(symbol),
+    );
+    let mut f = Builder::new(bf, builder_options).run()?;
+    let calls: Vec<Inst> = f
+        .block_order()
+        .iter()
+        .flat_map(|&b| f.block(b).insts.iter().copied())
+        .filter(|&i| f.inst(i).opcode == Opcode::Call)
+        .collect();
+
+    for call in calls {
+        let data = f.inst(call).clone();
+        let AuxData::CallTarget(symbol) = data.aux else {
+            continue;
+        };
+        let nargs = data.args.len() as u16;
+        let Some(body) = options.body(symbol) else {
+            continue;
+        };
+        let Some(fsid) = data.frame_state else {
+            continue;
+        };
+        let call_state = f.frame_states.get(fsid).clone();
+        let Some(current_scope) = call_state.scopes.last() else {
+            continue;
+        };
+        let policy = if root_policies {
+            options.policy_at(current_scope.bcp)
+        } else {
+            InlinePolicy::Unspecified
+        };
+
+        if policy == InlinePolicy::NotInline
+            || nargs != body.arity
+            || depth >= options.config.max_depth
+            || active.contains(&symbol)
+        {
+            continue;
+        }
+        let mut eligibility_stack = active.clone();
+        let Ok(cost) = body_cost(symbol, options, &mut eligibility_stack) else {
+            continue;
+        };
+        if cost > *remaining_budget
+            || (cost > options.config.small_threshold && policy != InlinePolicy::Inline)
+        {
+            continue;
+        }
+
+        active.insert(symbol);
+        let mut callee_budget = *remaining_budget;
+        let callee = build_with_saved_bodies(
+            &body,
+            options,
+            Some(symbol),
+            depth + 1,
+            &mut callee_budget,
+            active,
+            false,
+        )?;
+        active.remove(&symbol);
+
+        // The outer activation is suspended immediately after the invoke: its
+        // arguments have been consumed and the callee's eventual Return will
+        // push the result. Inner scope(s) resume at their own guard bcp.
+        let mut caller_scopes = call_state.scopes;
+        let caller = caller_scopes.last_mut().expect("non-empty FrameState");
+        caller.bcp = caller.bcp.saturating_add(1);
+        caller
+            .stack
+            .truncate(caller.stack.len().saturating_sub(nargs as usize));
+        f.inline_call(call, &callee, &caller_scopes)
+            .map_err(BuildError::Unsupported)?;
+        *remaining_budget = remaining_budget.saturating_sub(cost);
+    }
+    Ok(f)
 }
 
 struct Builder<'a> {
@@ -93,11 +198,15 @@ struct Builder<'a> {
     /// Body cloning will increment this while descending an inline call tree.
     /// Intrinsic expansions are leaves, so the first implementation stays at 0.
     inline_depth: u8,
+    root_symbol: u32,
 }
 
 impl<'a> Builder<'a> {
     fn new(bf: &'a BytecodeFunction, inline_options: InlineOptions) -> Builder<'a> {
         let remaining_inline_budget = inline_options.config.node_budget;
+        let root_symbol = inline_options
+            .root_symbol()
+            .unwrap_or_else(|| bliss_rt::symbols::intern(&bf.name));
         Builder {
             bf,
             f: Function::new(bf.name.clone()),
@@ -115,6 +224,7 @@ impl<'a> Builder<'a> {
             inline_options,
             remaining_inline_budget,
             inline_depth: 0,
+            root_symbol,
         }
     }
 
@@ -731,7 +841,7 @@ impl<'a> Builder<'a> {
             })
             .collect();
         let scope = FrameScope {
-            function: 0, // symbol id unavailable at bytecode level; placeholder.
+            function: self.root_symbol,
             bcp,
             locals,
             stack: stack_srcs,
@@ -1086,6 +1196,7 @@ mod tests {
     use crate::t2::inlining::{InlineConfig, InlineOptions, InlinePolicy};
     use crate::t2::ir::Opcode;
     use bliss_rt::value::BlissVal;
+    use std::rc::Rc;
 
     fn bf(name: &str, code: Vec<Instr>, constants: Vec<BlissVal>, n_locals: u16, arity: u16, max_stack: u16) -> BytecodeFunction {
         BytecodeFunction {
@@ -1395,5 +1506,154 @@ mod tests {
             2,
         ));
         assert!(matches!(r, Err(BuildError::Unsupported(_))));
+    }
+
+    #[test]
+    fn saved_body_clones_cfg_binds_arguments_and_merges_returns() {
+        let helper = bliss_rt::symbols::intern("BODY-INLINE-HELPER");
+        let caller = bliss_rt::symbols::intern("BODY-INLINE-CALLER");
+        let body = Rc::new(bf(
+            "BODY-INLINE-HELPER",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::BrIfFalse(4),
+                Instr::Const(0),
+                Instr::Return,
+                Instr::Const(1),
+                Instr::Return,
+            ],
+            vec![bliss_rt::value::T, bliss_rt::value::NIL],
+            1,
+            1,
+            1,
+        ));
+        let input = bf(
+            "BODY-INLINE-CALLER",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed { sym: helper, nargs: 1 },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        let options = InlineOptions::default()
+            .with_root_symbol(caller)
+            .with_body(helper, body);
+        let f = build_from_bytecode_with_inline_options(&input, options).expect("builds");
+        assert!(f.block_order().iter().all(|&b| {
+            f.block(b).insts.iter().all(|&i| f.inst(i).opcode != Opcode::Call)
+        }));
+        assert!(
+            f.num_blocks() >= 5,
+            "callee diamond and continuation were cloned"
+        );
+        crate::t2::verify::verify(&f).expect("cloned CFG verifies");
+    }
+
+    #[test]
+    fn cloned_guard_has_nested_scopes_and_chained_source_position() {
+        let helper = bliss_rt::symbols::intern("BODY-INLINE-FIRST-CHAR");
+        let caller = bliss_rt::symbols::intern("BODY-INLINE-FIRST-CHAR-CALLER");
+        let first_char = bliss_rt::symbols::intern("UIOP/UTILITY:FIRST-CHAR");
+        let body = Rc::new(bf(
+            "BODY-INLINE-FIRST-CHAR",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed { sym: first_char, nargs: 1 },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        ));
+        let input = bf(
+            "BODY-INLINE-FIRST-CHAR-CALLER",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed { sym: helper, nargs: 1 },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        let options = InlineOptions::default()
+            .with_root_symbol(caller)
+            .with_body(helper, body);
+        let f = build_from_bytecode_with_inline_options(&input, options).expect("builds");
+        let guard = f
+            .block_order()
+            .iter()
+            .flat_map(|&b| f.block(b).insts.iter().copied())
+            .find(|&i| f.inst(i).flags.guard)
+            .expect("FIRST-CHAR guard cloned");
+        let data = f.inst(guard);
+        let scopes = &f.frame_states.get(data.frame_state.unwrap()).scopes;
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes[0].function, caller);
+        assert_eq!(scopes[1].function, helper);
+        assert!(f.source_positions[data.source_pos as usize].inlined_at.is_some());
+        crate::t2::verify::verify(&f).expect("nested metadata verifies");
+    }
+
+    #[test]
+    fn body_limits_recursion_and_notinline_retain_calls() {
+        let helper = bliss_rt::symbols::intern("BODY-INLINE-LIMITED");
+        let caller = bliss_rt::symbols::intern("BODY-INLINE-LIMITED-CALLER");
+        let leaf = Rc::new(bf(
+            "BODY-INLINE-LIMITED",
+            vec![Instr::LoadLocal(0), Instr::Return],
+            vec![],
+            1,
+            1,
+            1,
+        ));
+        let input = bf(
+            "BODY-INLINE-LIMITED-CALLER",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed { sym: helper, nargs: 1 },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        let base = InlineOptions::default()
+            .with_root_symbol(caller)
+            .with_body(helper, Rc::clone(&leaf));
+
+        let mut budget = base.clone();
+        budget.config.node_budget = 0;
+        let f = build_from_bytecode_with_inline_options(&input, budget).unwrap();
+        assert!(f.block_order().iter().any(|&b| has_opcode(&f, b, Opcode::Call)));
+
+        let notinline = base.clone().with_policy(1, InlinePolicy::NotInline);
+        let f = build_from_bytecode_with_inline_options(&input, notinline).unwrap();
+        assert!(f.block_order().iter().any(|&b| has_opcode(&f, b, Opcode::Call)));
+
+        let recursive = Rc::new(bf(
+            "BODY-INLINE-LIMITED",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed { sym: helper, nargs: 1 },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        ));
+        let recursive_options = InlineOptions::default()
+            .with_root_symbol(caller)
+            .with_body(helper, recursive);
+        let f = build_from_bytecode_with_inline_options(&input, recursive_options).unwrap();
+        assert!(f.block_order().iter().any(|&b| has_opcode(&f, b, Opcode::Call)));
     }
 }

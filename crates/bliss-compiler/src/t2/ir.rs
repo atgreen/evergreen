@@ -440,6 +440,282 @@ impl Function {
     pub fn dominators(&self) -> DominatorTree {
         DominatorTree::compute(self)
     }
+
+    /// Replace one ordinary call with a cloned callee CFG. The caller block is
+    /// split at `call`; callee entry parameters bind directly to the call
+    /// arguments, and every callee return jumps to a single continuation block
+    /// whose parameter replaces the call result.
+    ///
+    /// `caller_scopes` describes the suspended logical callers (outermost
+    /// first). It is prefixed to every cloned callee FrameState, and cloned
+    /// source positions have their inline chain terminated at the call site.
+    pub(crate) fn inline_call(
+        &mut self,
+        call: Inst,
+        callee: &Function,
+        caller_scopes: &[crate::t2::frame_state::FrameScope],
+    ) -> Result<(), &'static str> {
+        use crate::t2::frame_state::{FrameState, RematRecipe, ValueSource};
+        use std::collections::HashMap;
+
+        let (caller_block, call_pos) = self
+            .block_order
+            .iter()
+            .find_map(|&b| {
+                self.blocks[b.index()]
+                    .insts
+                    .iter()
+                    .position(|&i| i == call)
+                    .map(|p| (b, p))
+            })
+            .ok_or("inline call is not in a block")?;
+        let call_data = self.inst(call).clone();
+        if call_data.opcode != Opcode::Call || call_data.results.len() != 1 {
+            return Err("inline target is not a single-result call");
+        }
+        let callee_entry_params = callee.block(callee.entry()).params.clone();
+        if callee_entry_params.len() != call_data.args.len() {
+            return Err("callee entry arity does not match call");
+        }
+
+        // Split after the call. The old instruction remains in the arena but is
+        // no longer in block layout, exactly like other dead IR instructions.
+        let continuation = self.make_block();
+        let suffix = self.blocks[caller_block.index()].insts.split_off(call_pos + 1);
+        self.blocks[continuation.index()].insts = suffix;
+        self.blocks[caller_block.index()].insts.pop();
+
+        let old_result = call_data.results[0];
+        let old_result_data = self.value(old_result).clone();
+        let continuation_value = self.add_block_param(
+            continuation,
+            old_result_data.ty,
+            old_result_data.repr,
+        );
+        self.replace_value_everywhere(old_result, continuation_value);
+
+        // Allocate the cloned CFG and bind the callee entry parameters to the
+        // caller's SSA arguments. Other block parameters are cloned normally.
+        let mut block_map: HashMap<Block, Block> = HashMap::new();
+        for &old in callee.block_order() {
+            block_map.insert(old, self.make_block());
+        }
+        let mut value_map: HashMap<Value, Value> = HashMap::new();
+        for (&param, &arg) in callee_entry_params.iter().zip(&call_data.args) {
+            value_map.insert(param, arg);
+        }
+        for &old_block in callee.block_order() {
+            if old_block == callee.entry() {
+                continue;
+            }
+            let new_block = block_map[&old_block];
+            for &old_param in &callee.block(old_block).params {
+                let vd = callee.value(old_param);
+                let new_param = self.add_block_param(new_block, vd.ty, vd.repr);
+                value_map.insert(old_param, new_param);
+            }
+        }
+
+        // Copy and chain the source-position table before cloning instructions.
+        let mut source_map = vec![None; callee.source_positions.len()];
+        fn copy_source(
+            dst: &mut Vec<SourcePosition>,
+            src: &[SourcePosition],
+            map: &mut [Option<u32>],
+            id: u32,
+            call_source: u32,
+        ) -> u32 {
+            if let Some(mapped) = map[id as usize] {
+                return mapped;
+            }
+            let mut pos = src[id as usize];
+            pos.inlined_at = match pos.inlined_at {
+                Some(parent) => Some(copy_source(dst, src, map, parent, call_source)),
+                None => Some(call_source),
+            };
+            let mapped = dst.len() as u32;
+            dst.push(pos);
+            map[id as usize] = Some(mapped);
+            mapped
+        }
+        for id in 0..callee.source_positions.len() as u32 {
+            copy_source(
+                &mut self.source_positions,
+                &callee.source_positions,
+                &mut source_map,
+                id,
+                call_data.source_pos,
+            );
+        }
+
+        fn map_source(source: &ValueSource, values: &HashMap<Value, Value>) -> ValueSource {
+            match source {
+                ValueSource::Value { value, repr } => ValueSource::Value {
+                    value: values[value],
+                    repr: *repr,
+                },
+                ValueSource::Const(v) => ValueSource::Const(*v),
+                ValueSource::Unbound => ValueSource::Unbound,
+                ValueSource::Remat(id) => ValueSource::Remat(*id),
+            }
+        }
+
+        // Clone in block order. SSA definitions precede their uses, so the
+        // value map is complete whenever an operand is encountered.
+        for &old_block in callee.block_order() {
+            let new_block = block_map[&old_block];
+            for &old_inst in &callee.block(old_block).insts {
+                let old = callee.inst(old_inst);
+                if old.opcode == Opcode::Return {
+                    let returned = value_map[&old.args[0]];
+                    self.set_terminator(
+                        new_block,
+                        InstData {
+                            opcode: Opcode::Jump,
+                            args: vec![],
+                            results: vec![],
+                            aux: AuxData::None,
+                            flags: InstFlags {
+                                terminator: true,
+                                ..InstFlags::default()
+                            },
+                            targets: vec![BlockCall {
+                                block: continuation,
+                                args: vec![returned],
+                            }],
+                            frame_state: None,
+                            source_pos: source_map[old.source_pos as usize].unwrap(),
+                        },
+                    );
+                    continue;
+                }
+
+                let frame_state = old.frame_state.map(|id| {
+                    let source = callee.frame_states.get(id);
+                    let mut scopes = caller_scopes.to_vec();
+                    scopes.extend(source.scopes.iter().map(|scope| {
+                        crate::t2::frame_state::FrameScope {
+                            function: scope.function,
+                            bcp: scope.bcp,
+                            locals: scope
+                                .locals
+                                .iter()
+                                .map(|s| map_source(s, &value_map))
+                                .collect(),
+                            stack: scope
+                                .stack
+                                .iter()
+                                .map(|s| map_source(s, &value_map))
+                                .collect(),
+                        }
+                    }));
+                    let remat = source
+                        .remat
+                        .iter()
+                        .map(|r| RematRecipe {
+                            op: r.op,
+                            inputs: r.inputs.iter().map(|s| map_source(s, &value_map)).collect(),
+                            result_repr: r.result_repr,
+                        })
+                        .collect();
+                    self.frame_states.add(FrameState { scopes, remat })
+                });
+                let args = old.args.iter().map(|v| value_map[v]).collect();
+                let targets = old
+                    .targets
+                    .iter()
+                    .map(|target| BlockCall {
+                        block: block_map[&target.block],
+                        args: target.args.iter().map(|v| value_map[v]).collect(),
+                    })
+                    .collect();
+                let data = InstData {
+                    opcode: old.opcode,
+                    args,
+                    results: vec![],
+                    aux: old.aux.clone(),
+                    flags: old.flags,
+                    targets,
+                    frame_state,
+                    source_pos: source_map[old.source_pos as usize].unwrap(),
+                };
+                if old.opcode.is_terminator() {
+                    self.set_terminator(new_block, data);
+                } else {
+                    let result_tys: Vec<_> = old
+                        .results
+                        .iter()
+                        .map(|&v| {
+                            let vd = callee.value(v);
+                            (vd.ty, vd.repr)
+                        })
+                        .collect();
+                    let (_, results) = self.push_inst(new_block, data, &result_tys);
+                    for (&old_value, &new_value) in old.results.iter().zip(&results) {
+                        value_map.insert(old_value, new_value);
+                    }
+                }
+            }
+        }
+
+        self.set_terminator(
+            caller_block,
+            InstData {
+                opcode: Opcode::Jump,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    terminator: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![BlockCall {
+                    block: block_map[&callee.entry()],
+                    args: vec![],
+                }],
+                frame_state: None,
+                source_pos: call_data.source_pos,
+            },
+        );
+        Ok(())
+    }
+
+    fn replace_value_everywhere(&mut self, from: Value, to: Value) {
+        for data in &mut self.insts {
+            for arg in &mut data.args {
+                if *arg == from {
+                    *arg = to;
+                }
+            }
+            for target in &mut data.targets {
+                for arg in &mut target.args {
+                    if *arg == from {
+                        *arg = to;
+                    }
+                }
+            }
+        }
+        for state in self.frame_states.iter_mut() {
+            for scope in &mut state.scopes {
+                for source in scope.locals.iter_mut().chain(&mut scope.stack) {
+                    if let crate::t2::frame_state::ValueSource::Value { value, .. } = source {
+                        if *value == from {
+                            *value = to;
+                        }
+                    }
+                }
+            }
+            for recipe in &mut state.remat {
+                for source in &mut recipe.inputs {
+                    if let crate::t2::frame_state::ValueSource::Value { value, .. } = source {
+                        if *value == from {
+                            *value = to;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Dominator tree ──────────────────────────────────────────────────

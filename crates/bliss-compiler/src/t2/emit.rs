@@ -1345,10 +1345,22 @@ pub fn emit_framed(
             Opcode::Call | Opcode::SymbolValue | Opcode::SetSymbolValue | Opcode::ClearMv
         )
     };
-    let has_calls = f
+    let has_ir_calls = f
         .block_order()
         .iter()
         .any(|&b| f.block(b).insts.iter().any(|&i| is_call_like(f.inst(i).opcode)));
+
+    let has_inlined_scopes = f.block_order().iter().any(|&b| {
+        f.block(b).insts.iter().any(|&inst| {
+            f.inst(inst)
+                .frame_state
+                .is_some_and(|id| f.frame_states.get(id).scopes.len() > 1)
+        })
+    });
+    // A multi-scope guard calls the reconstruction callback even if the fast
+    // path has no ordinary call. Give it the call-capable prologue/register set
+    // so the callback is ABI-aligned and every live value survives the call.
+    let has_calls = has_ir_calls || has_inlined_scopes;
 
     // Precise state-transfer deopt (bliss-mba): a function that CALLS other code
     // can commit a visible side effect before a later guard fails, so re-running
@@ -1369,7 +1381,7 @@ pub fn emit_framed(
             for &inst in &f.block(b).insts {
                 if let Some(fsid) = f.inst(inst).frame_state {
                     let fs = f.frame_states.get(fsid);
-                    if let Some(scope) = fs.scopes.last() {
+                    for scope in &fs.scopes {
                         for src in scope.locals.iter().chain(scope.stack.iter()) {
                             if let ValueSource::Value { value, .. } = src {
                                 deopt_live.insert(*value);
@@ -1681,7 +1693,7 @@ pub fn emit_framed(
             if precise {
                 if let Some(fsid) = d.frame_state {
                     let fs = f.frame_states.get(fsid);
-                    if let Some(scope) = fs.scopes.last() {
+                    for scope in &fs.scopes {
                         for src in scope.locals.iter().chain(scope.stack.iter()) {
                             if let ValueSource::Value { value, .. } = src {
                                 last_use.insert(*value, at);
@@ -2069,14 +2081,13 @@ pub fn emit_framed(
     a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
     a.push(0xC3); // ret
 
-    // Precise per-guard deopt stubs (bliss-mba). Each reconstructs the exact T0
-    // interpreter frame this guard's FrameState describes — locals into slots
-    // 0..n_locals, live operands into slots n_locals.., all still tagged (no
-    // unboxing exists yet) — then calls c2i_deopt_t2 to write them into the
-    // current frame and record the resume (bcp, sp_top). run_native then takes the
-    // same resume_in_t0 path T1 uses, so a side effect committed before `bcp`
-    // runs exactly once. The value regs are still live here (read BEFORE the
-    // epilogue restores callee-saved). rsp%16==0 after the has_calls prologue, so
+    // Precise per-guard deopt stubs (bliss-mba). Each serialises every logical
+    // FrameState scope — outermost to innermost, locals then live operands, all
+    // still tagged (no unboxing exists yet) — for c2i_deopt_t2 to reconstruct
+    // the interpreter activation chain. A side effect committed in an outer
+    // scope therefore runs exactly once. The value regs are still live here
+    // (read BEFORE the epilogue restores callee-saved). rsp%16==0 after the
+    // call-capable prologue, so
     // a 16-multiple sub keeps the call aligned.
     enum SlotSrc {
         Reg(u8),
@@ -2085,33 +2096,44 @@ pub fn emit_framed(
     for (&inst, &label) in &inst_deopt {
         let fsid = f.inst(inst).frame_state.ok_or(EmitError::UnsupportedOp(0xF4))?;
         let fs = f.frame_states.get(fsid);
-        let scope = fs.scopes.last().ok_or(EmitError::UnsupportedOp(0xF4))?;
-        let n_stack = scope.stack.len();
-        let n_total = scope.locals.len() + n_stack;
-        // Resolve every slot to a register or an immediate; decline (=> stay T1) if
-        // any source cannot be reconstructed as a tagged value.
-        let mut srcs: Vec<SlotSrc> = Vec::with_capacity(n_total);
-        for vs in scope.locals.iter().chain(scope.stack.iter()) {
-            let s = match vs {
-                ValueSource::Value { value, repr } => {
-                    if *repr != ValueRepresentation::Tagged {
-                        return Err(EmitError::UnsupportedOp(0xF5)); // unboxed rebox not modelled
-                    }
-                    if let Some(&bits) = const_tagged.get(value) {
-                        SlotSrc::Imm(bits)
-                    } else if let Some(&r) = reg.get(value) {
-                        SlotSrc::Reg(r)
-                    } else {
-                        return Err(EmitError::UnsupportedOp(0xF6)); // not materialised
-                    }
-                }
-                ValueSource::Const(bv) => SlotSrc::Imm(bv.0),
-                ValueSource::Unbound => SlotSrc::Imm(bliss_rt::value::UNBOUND.0),
-                ValueSource::Remat(_) => return Err(EmitError::UnsupportedOp(0xF7)),
-            };
-            srcs.push(s);
+        if fs.scopes.is_empty() {
+            return Err(EmitError::UnsupportedOp(0xF4));
         }
-        let alloc = ((n_total * 8) + 15) & !15; // 16-aligned buffer bytes
+        // Serialized virtual-frame stream: for each outer-to-inner scope,
+        // [function, bcp, nlocals, nstack, locals..., stack...].
+        let n_words: usize = fs
+            .scopes
+            .iter()
+            .map(|scope| 4 + scope.locals.len() + scope.stack.len())
+            .sum();
+        let mut srcs: Vec<SlotSrc> = Vec::with_capacity(n_words);
+        for scope in &fs.scopes {
+            srcs.push(SlotSrc::Imm(scope.function as u64));
+            srcs.push(SlotSrc::Imm(scope.bcp as u64));
+            srcs.push(SlotSrc::Imm(scope.locals.len() as u64));
+            srcs.push(SlotSrc::Imm(scope.stack.len() as u64));
+            for vs in scope.locals.iter().chain(scope.stack.iter()) {
+                let s = match vs {
+                    ValueSource::Value { value, repr } => {
+                        if *repr != ValueRepresentation::Tagged {
+                            return Err(EmitError::UnsupportedOp(0xF5));
+                        }
+                        if let Some(&bits) = const_tagged.get(value) {
+                            SlotSrc::Imm(bits)
+                        } else if let Some(&r) = reg.get(value) {
+                            SlotSrc::Reg(r)
+                        } else {
+                            return Err(EmitError::UnsupportedOp(0xF6));
+                        }
+                    }
+                    ValueSource::Const(bv) => SlotSrc::Imm(bv.0),
+                    ValueSource::Unbound => SlotSrc::Imm(bliss_rt::value::UNBOUND.0),
+                    ValueSource::Remat(_) => return Err(EmitError::UnsupportedOp(0xF7)),
+                };
+                srcs.push(s);
+            }
+        }
+        let alloc = ((n_words * 8) + 15) & !15; // 16-aligned buffer bytes
 
         a.bind(label);
         if alloc > 0 {
@@ -2127,10 +2149,10 @@ pub fn emit_framed(
                 }
             }
         }
-        // c2i_deopt_t2(bcp=rdi, sp_top=rsi, buf=rdx=rsp, n_total=rcx)
-        mov_imm32(&mut a, 7, scope.bcp);
-        mov_imm32(&mut a, 6, n_stack as u32);
-        mov_imm32(&mut a, 1, n_total as u32);
+        // c2i_deopt_t2(n_scopes=rdi, n_words=rsi, buf=rdx, reserved=rcx)
+        mov_imm32(&mut a, 7, fs.scopes.len() as u32);
+        mov_imm32(&mut a, 6, n_words as u32);
+        mov_imm32(&mut a, 1, 0);
         mov_rr(&mut a, 2, 4); // mov rdx, rsp
         mov_imm64(&mut a, 0, c2i_deopt_t2_addr as i64);
         a.extend_from_slice(&[0xFF, 0xD0]); // call rax

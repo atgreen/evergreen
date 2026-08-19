@@ -27,8 +27,7 @@ pub struct RematRecipeId(pub u32);
 /// The abstract interpreter state to reconstruct on a failed guard (spec D4.15).
 #[derive(Clone, Debug)]
 pub struct FrameState {
-    /// Deopt scopes, innermost last (spec R4.67). Length 1 until frame-level
-    /// inlining exists; then one scope per logical CL frame to un-inline.
+    /// Logical deopt frames, outermost first and innermost last (spec R4.67).
     pub scopes: Vec<FrameScope>,
     /// Rematerialisation recipes referenced by `ValueSource::Remat` in this
     /// frame state (spec §4.10 A4.13, parcel P4c).
@@ -111,5 +110,9 @@ impl FrameStateTable {
     pub fn is_empty(&self) -> bool { self.states.is_empty() }
     pub fn iter(&self) -> impl Iterator<Item = (FrameStateId, &FrameState)> {
         self.states.iter().enumerate().map(|(i, fs)| (FrameStateId(i as u32), fs))
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut FrameState> {
+        self.states.iter_mut()
     }
 }

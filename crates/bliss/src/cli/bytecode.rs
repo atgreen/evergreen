@@ -116,6 +116,18 @@ fn registry_remove(sym: u32) {
     REGISTRY.with(|r| r.borrow_mut().remove(&sym));
 }
 
+fn t2_inline_options(root: u32) -> bliss_compiler::t2::inlining::InlineOptions {
+    REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .iter()
+            .fold(
+                bliss_compiler::t2::inlining::InlineOptions::default().with_root_symbol(root),
+                |options, (&symbol, body)| options.with_body(symbol, Rc::clone(body)),
+            )
+    })
+}
+
 /// Call a registered GLOBAL bytecode function `sym` from the tree-walker,
 /// driving T0→T1 promotion — the same trigger the bytecode `CallNamed` path
 /// uses. Without this, a function called only from tree-walked code (e.g. a
@@ -4735,8 +4747,7 @@ thread_local! {
     /// SAME frame — locals and the operand stack are already in the shared frame
     /// slots — instead of re-running the whole function from the top. `None`
     /// falls back to the re-run path (e.g. a legacy non-state-recording guard).
-    static NATIVE_DEOPT_RESUME: std::cell::Cell<Option<(u32, u16)>> =
-        const { std::cell::Cell::new(None) };
+    static NATIVE_DEOPT_RESUME: RefCell<Option<NativeDeoptResume>> = const { RefCell::new(None) };
     /// Current native (T1) call-stack depth (bliss-x5y.4). Non-leaf T1 functions
     /// call through c2i, and although those calls run in the interpreter (which
     /// is BlissStack-bounded, not native-recursive), this counter bounds any
@@ -4744,6 +4755,18 @@ thread_local! {
     /// runs the callee in T0 instead of pushing another native frame, so the
     /// real C stack can never run away.
     static NATIVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+enum NativeDeoptResume {
+    Single { bcp: u32, sp_top: u16 },
+    Inlined(Vec<InlinedResumeScope>),
+}
+
+struct InlinedResumeScope {
+    function: u32,
+    bcp: u32,
+    sp_top: u16,
+    frame: *mut Frame,
 }
 
 /// Cap on native (T1) call-stack depth before the dispatcher falls back to the
@@ -4820,34 +4843,99 @@ extern "C" fn c2i_deopt() {
 /// T0 activation at exactly this position instead of re-running from the top.
 extern "C" fn c2i_deopt_state(bcp: u64, depth: u64) {
     NATIVE_DEOPT.with(|d| d.set(true));
-    NATIVE_DEOPT_RESUME.with(|c| c.set(Some((bcp as u32, depth as u16))));
+    NATIVE_DEOPT_RESUME.with(|c| {
+        *c.borrow_mut() = Some(NativeDeoptResume::Single {
+            bcp: bcp as u32,
+            sp_top: depth as u16,
+        })
+    });
 }
 
 /// Precise state-transfer deopt for T2 optimising code (bliss-mba). Unlike T1,
 /// T2/`emit_framed` is register-based and does NOT keep the interpreter frame's
 /// locals/operand-stack live in memory, so a failed guard cannot resume T0 on
 /// the frame as-is. Instead the guard's per-instruction deopt stub reconstructs
-/// the frame here: `buf` points to `n_total` tagged `BlissVal`s — the guard's
-/// `FrameState` locals (slots `0..n_locals`) followed by its live operand-stack
-/// slots (slots `n_locals..n_total`), in slot-index order — which we write into
-/// the current (top) frame before recording the resume point. `run_native` then
-/// takes the same `resume_in_t0` path T1 uses: no whole-function rerun, so a
-/// side effect committed before `bcp` runs exactly once.
-extern "C" fn c2i_deopt_t2(bcp: u64, sp_top: u64, buf: *const u64, n_total: u64) {
-    // The T2 activation is the current top frame (`run_native` pushed it and no
-    // nested call is live at a guard in the T2 body).
-    let frame = bliss_rt::current_thread().stack().fp() as *mut Frame;
-    if !frame.is_null() {
-        for i in 0..n_total as usize {
-            // SAFETY: `buf` is the stub's on-stack reconstruction buffer of
-            // exactly `n_total` u64s; `frame` has `num_slots >= n_total` slots
-            // (n_locals + max_stack, sized by the compiler from this function).
-            let v = unsafe { BlissVal(*buf.add(i)) };
-            unsafe { slot_set(frame, i as u16, v) };
+/// the logical frames here. `buf` is an outer-to-inner stream of scope headers
+/// followed by tagged locals and operand slots. The outer scope reuses the
+/// current frame; inlined callees get new BlissStack frames. `run_native` then
+/// resumes T0 on the reconstructed activation chain, so committed caller side
+/// effects are not repeated.
+extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserved: u64) {
+    let thread = bliss_rt::current_thread();
+    let stack = thread.stack();
+    let outer = stack.fp() as *mut Frame;
+    let fail = |message: &'static str| {
+        NATIVE_ERROR.with(|c| {
+            let mut error = c.borrow_mut();
+            if error.is_none() {
+                *error = Some(BlissError::Internal(message.into()));
+            }
+        });
+    };
+    if outer.is_null() || buf.is_null() || n_scopes == 0 {
+        fail("T2 deopt supplied an empty virtual-frame stream");
+        return;
+    }
+
+    let words = unsafe { std::slice::from_raw_parts(buf, n_words as usize) };
+    let mut at = 0usize;
+    let mut pushed = 0usize;
+    let mut scopes = Vec::with_capacity(n_scopes as usize);
+    for scope_index in 0..n_scopes as usize {
+        if at + 4 > words.len() {
+            fail("truncated T2 virtual-frame header");
+            break;
         }
+        let function = words[at] as u32;
+        let bcp = words[at + 1] as u32;
+        let n_locals = words[at + 2] as usize;
+        let sp_top = words[at + 3] as usize;
+        at += 4;
+        let n_slots = n_locals.saturating_add(sp_top);
+        let Some(entry) = registry_get(function) else {
+            fail("T2 deopt function is absent from the bytecode registry");
+            break;
+        };
+        if at + n_slots > words.len() || n_slots > entry.num_slots() as usize {
+            fail("invalid T2 virtual-frame slot count");
+            break;
+        }
+        let frame = if scope_index == 0 {
+            outer
+        } else {
+            let Some(frame) = stack.push_frame(
+                BlissVal::from_symbol_index(function),
+                std::ptr::null::<CodeInfo>(),
+                entry.num_slots(),
+                FLAG_CALL,
+            ) else {
+                fail("BlissStack exhausted while reconstructing inlined frames");
+                break;
+            };
+            pushed += 1;
+            frame
+        };
+        for (slot, &bits) in words[at..at + n_slots].iter().enumerate() {
+            unsafe { slot_set(frame, slot as u16, BlissVal(bits)) };
+        }
+        at += n_slots;
+        scopes.push(InlinedResumeScope {
+            function,
+            bcp,
+            sp_top: sp_top as u16,
+            frame,
+        });
+    }
+    if scopes.len() != n_scopes as usize || at != words.len() {
+        for _ in 0..pushed {
+            stack.pop_frame();
+        }
+        return;
     }
     NATIVE_DEOPT.with(|d| d.set(true));
-    NATIVE_DEOPT_RESUME.with(|c| c.set(Some((bcp as u32, sp_top as u16))));
+    NATIVE_DEOPT_RESUME.with(|c| {
+        *c.borrow_mut() = Some(NativeDeoptResume::Inlined(scopes));
+    });
 }
 
 /// Installed T1 native code for a function. Its CL activation (locals + operand
@@ -5113,7 +5201,7 @@ fn run_native(
     NATIVE_ENV.with(|e| e.set(saved));
 
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
-    let resume = NATIVE_DEOPT_RESUME.with(|c| c.take());
+    let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
     let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_ERROR.with(|c| *c.borrow_mut() = saved_err);
     if let Some(err) = my_err {
@@ -5151,7 +5239,7 @@ fn run_native(
         if t2_log_target().is_some() {
             let nm = registry_get(sym).map(|b| b.name.clone()).unwrap_or_default();
             t2_log_write(format_args!(
-                "{nm}: native guard deopt #{n} => re-running interpreted{}",
+                "{nm}: native guard deopt #{n} => resuming interpreted{}",
                 if n >= deopt_blacklist_threshold() {
                     " (threshold hit: uninstall + blacklist => T0)"
                 } else {
@@ -5172,10 +5260,15 @@ fn run_native(
         let entry = registry_get(sym).ok_or_else(|| {
             BlissError::Internal("deopt: bytecode function vanished".into())
         })?;
-        if let Some((bcp, sp_top)) = resume {
-            // State-transfer: resume T0 on this frame; `resume_in_t0` owns the
-            // frame's lifecycle from here (do NOT pop it first).
-            return resume_in_t0(entry, frame, bcp, sp_top, sym, env);
+        if let Some(resume) = resume {
+            return match resume {
+                NativeDeoptResume::Single { bcp, sp_top } => {
+                    // State-transfer: resume T0 on this frame; `resume_in_t0`
+                    // owns the frame's lifecycle from here (do NOT pop it first).
+                    resume_in_t0(entry, frame, bcp, sp_top, sym, env)
+                }
+                NativeDeoptResume::Inlined(scopes) => resume_inlined_in_t0(scopes, env),
+            };
         }
         stack.pop_frame();
         return run(entry, args, BlissVal::from_symbol_index(sym), env);
@@ -5209,7 +5302,31 @@ fn resume_in_t0(
     let fn_obj =
         Some(entry_fn_val).filter(|&v| bliss_rt::function::is_interpreted_function(v));
 
-    let mut handlers: Vec<Handler> = Vec::new();
+    let handlers = rebuild_resume_handlers(&entry, bcp, env);
+
+    let n_locals = entry.n_locals;
+    let mut acts: Vec<Activation> = vec![Activation {
+        frame,
+        n_locals,
+        env_frame: None,
+        func: entry,
+        bcp: bcp as usize,
+        sp_top,
+        handlers,
+        cleanup_conts: Vec::new(),
+        fn_obj,
+        sym,
+    }];
+    let result = run_loop(&mut acts, env);
+    while !acts.is_empty() {
+        stack.pop_frame();
+        acts.pop();
+    }
+    result
+}
+
+fn rebuild_resume_handlers(entry: &BytecodeFunction, bcp: u32, env: &mut Env) -> Vec<Handler> {
+    let mut handlers = Vec::new();
     for instr in entry.code[..bcp as usize].iter() {
         match instr {
             Instr::PushBlock {
@@ -5245,20 +5362,38 @@ fn resume_in_t0(
             _ => {}
         }
     }
+    handlers
+}
 
-    let n_locals = entry.n_locals;
-    let mut acts: Vec<Activation> = vec![Activation {
-        frame,
-        n_locals,
-        env_frame: None,
-        func: entry,
-        bcp: bcp as usize,
-        sp_top,
-        handlers,
-        cleanup_conts: Vec::new(),
-        fn_obj,
-        sym,
-    }];
+/// Resume the interpreter with all logical frames reconstructed by an inlined
+/// T2 deopt. The vector is outermost-to-innermost; `run_loop` therefore returns
+/// through the same activation chain an uninlined execution would have used.
+fn resume_inlined_in_t0(
+    scopes: Vec<InlinedResumeScope>,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    let stack = bliss_rt::current_thread().stack();
+    let mut acts = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let entry = registry_get(scope.function).ok_or_else(|| {
+            BlissError::Internal("deopt: inlined bytecode function vanished".into())
+        })?;
+        let handlers = rebuild_resume_handlers(&entry, scope.bcp, env);
+        let fn_obj = bliss_rt::symbols::symbol_function(scope.function)
+            .filter(|&v| bliss_rt::function::is_interpreted_function(v));
+        acts.push(Activation {
+            frame: scope.frame,
+            n_locals: entry.n_locals,
+            env_frame: None,
+            func: entry,
+            bcp: scope.bcp as usize,
+            sp_top: scope.sp_top,
+            handlers,
+            cleanup_conts: Vec::new(),
+            fn_obj,
+            sym: scope.function,
+        });
+    }
     let result = run_loop(&mut acts, env);
     while !acts.is_empty() {
         stack.pop_frame();
@@ -6164,7 +6299,11 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         }
     };
 
-    let mut f = match bliss_compiler::t2::build::build_from_bytecode(&bf) {
+    let inline_options = t2_inline_options(sym);
+    let mut f = match bliss_compiler::t2::build::build_from_bytecode_with_inline_options(
+        &bf,
+        inline_options,
+    ) {
         Ok(f) => f,
         Err(e) => {
             t2_log!("{name}: build_from_bytecode failed: {e:?} => stay T1");
@@ -6372,7 +6511,7 @@ fn run_native_osr(
     let ret = f(slots);
     NATIVE_ENV.with(|e| e.set(saved));
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
-    let resume = NATIVE_DEOPT_RESUME.with(|c| c.take());
+    let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
     let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_ERROR.with(|c| *c.borrow_mut() = saved_err);
     let _ = osr.num_slots;
@@ -6381,7 +6520,7 @@ fn run_native_osr(
         return Err(err);
     }
     if deopt {
-        if let Some((bcp, sp_top)) = resume {
+        if let Some(NativeDeoptResume::Single { bcp, sp_top }) = resume {
             return Ok(OsrOutcome::Deopt { bcp, sp_top });
         }
         // No resume point recorded — should not happen for OSR (speculation

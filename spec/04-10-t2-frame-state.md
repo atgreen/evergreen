@@ -42,7 +42,7 @@ than hoped-for.
 | R4.64 | The IR verifier (A4.07) MUST reject a FrameState whose local/stack slot counts disagree with the source bytecode's abstract frame at its `bcp`, that references a non-dominating SSA value, that assigns a representation a slot's lowering cannot produce, or whose rematerialisation recipe is cyclic. | MUST |
 | R4.65 | FrameState MUST lower (A4.14) to the §4.6 GC stack map consumed by A4.04 (deopt) and to the OSR entry map (D4.09) consumed by A4.03 (OSR). The register allocator (§4.7) MUST bind every `Value` source to a concrete `Location` and emit a rebox sequence for every unboxed representation, or emit the `Remat` recipe into the cold path; a FrameState that cannot be fully lowered MUST fail compilation (the function stays at T1, R4.28), never install partial metadata. | MUST |
 | R4.66 | OSR entry MUST be modelled in the IR as a dedicated OSR entry region whose live-in values import the interpreter slots — the structural inverse of a FrameState (block parameters in a block-based SSA, a region + φ set in sea-of-nodes). The imported values' representations MUST match the D4.09 `ConversionKind`s, so that the state A4.03 transfers in is exactly the state the loop body consumes. | MUST |
-| R4.67 | A FrameState MUST be a stack of scopes (D4.15 `FrameScope`), innermost last. T2 currently reconstructs exactly one interpreter frame (§4.6 A4.04 inlining note), so the stack has length 1; the shape is mandated now so that frame-level callee inlining can be added later by pushing scopes, without changing A4.04's contract. | MUST |
+| R4.67 | A FrameState MUST be a non-empty stack of logical scopes (D4.15 `FrameScope`), outermost first and innermost last. Frame-level callee inlining MUST prefix the caller scopes to every cloned deoptimising node, and A4.04 MUST reconstruct every scope in that order. | MUST |
 | R4.68 | Each T2 build stage (§4.10.5) MUST pass both the **tier-differential** harness (observable results identical under T0, T1, and T2 for the same program) and the **deopt-correctness** harness (a forced guard failure at that stage's constructs resumes and returns the interpreted result) before the next stage begins. | MUST |
 
 ---
@@ -57,8 +57,7 @@ than hoped-for.
 /// safepoint that may deopt (R4.59). This is the IR-level source of truth;
 /// A4.14 lowers it to the §4.6 GC stack map / D4.09 OSR map.
 struct FrameState {
-    /// Deopt scopes, innermost last (R4.67). Length 1 until frame-level
-    /// inlining exists; then one scope per logical CL frame to un-inline.
+    /// Logical deopt frames, outermost first and innermost last (R4.67).
     scopes: Vec<FrameScope>,
 }
 
@@ -227,17 +226,20 @@ compiled forms:
 ```text
 ALGORITHM A4.14: LOWER-FRAMESTATE(fs, alloc) → StackMapEntry
 ────────────────────────────────────────────────────────────
-entry.resume_pc ← fs.scopes.last().bcp
-FOR each interpreter slot (idx, source) in fs.scopes.last() locals ++ stack:
-  MATCH source:
-    Const(k)         → emit "materialise immediate k" descriptor
-    Unbound          → emit UNBOUND-MARKER descriptor
-    Value{v, repr}   → loc ← alloc.location_of(v)
-                       emit { loc, needs_boxing: repr≠Tagged, box_kind(repr) }
-                       IF loc holds a GC pointer (repr = Tagged, type may be ptr):
-                         set entry.live_ref_bitmap[slot]
-    Remat(r)         → emit the recipe as cold-path reconstruction code,
-                       recursing on its input ValueSources.
+FOR each scope IN fs.scopes, outermost to innermost:
+  lowered.function ← scope.function
+  lowered.resume_pc ← scope.bcp
+  FOR each interpreter slot (idx, source) in scope.locals ++ scope.stack:
+    MATCH source:
+      Const(k)         → emit "materialise immediate k" descriptor
+      Unbound          → emit UNBOUND-MARKER descriptor
+      Value{v, repr}   → loc ← alloc.location_of(v)
+                         emit { loc, needs_boxing: repr≠Tagged, box_kind(repr) }
+                         IF loc holds a GC pointer (repr = Tagged, type may be ptr):
+                           set lowered.live_ref_bitmap[slot]
+      Remat(r)         → emit the recipe as cold-path reconstruction code,
+                         recursing on its input ValueSources.
+  append lowered to entry.scopes
 The result is exactly the stack-map shape A4.04 step 1–3 consumes, and the
 OSR-entry inverse (D4.09 OsrSlotDesc) for A4.03.
 ```

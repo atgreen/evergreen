@@ -316,6 +316,51 @@ fn metadata_first_char_fast_path_and_deopts_match_the_lisp_body() {
     assert_eq!(&tw_fields[..4], &fields[..4]);
 }
 
+/// A guard inside a cloned saved body reconstructs both the inlined callee and
+/// its caller. The caller increments `*inline-hits*` before the call; resuming
+/// or re-running the wrong frame would increment it twice. The empty-string
+/// guard must deopt once, return through the reconstructed callee, and continue
+/// the suspended caller with exactly one committed increment.
+#[test]
+fn body_inline_deopt_reconstructs_callee_and_caller() {
+    let prog = "\
+        (defpackage :uiop/utility (:use :cl) (:export :first-char)) \
+        (in-package :uiop/utility) \
+        (defun first-char (s) \
+          (and (stringp s) (plusp (length s)) (char s 0))) \
+        (in-package :cl-user) \
+        (defvar *inline-hits* 0) \
+        (defun inline-leaf (s) (uiop/utility:first-char s)) \
+        (defun inline-caller (s) \
+          (setq *inline-hits* (+ *inline-hits* 1)) \
+          (inline-leaf s)) \
+        (defun inline-pure-caller (s) (inline-leaf s)) \
+        (dotimes (k 60) (inline-caller \"warm\")) \
+        (dotimes (k 60) (inline-pure-caller \"warm\")) \
+        (let ((before (bliss-ext:deopt-count))) \
+          (format t \"~a ~a ~a ~a ~a ~a~%\" \
+            (bliss-ext:function-tier (quote inline-caller)) \
+            (inline-caller \"\") \
+            (bliss-ext:function-tier (quote inline-pure-caller)) \
+            (inline-pure-caller \"\") \
+            *inline-hits* \
+            (- (bliss-ext:deopt-count) before)))";
+
+    let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
+    assert!(ok, "inlined multi-scope deopt failed: {out}");
+    let line = out.lines().next().unwrap_or("");
+    assert_eq!(
+        line,
+        "1 NIL 1 NIL 61 2",
+        "effectful/pure tiers and results, side effects, deopts: {line:?}"
+    );
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker oracle failed: {tw}");
+    let fields: Vec<_> = tw.lines().next().unwrap_or("").split_whitespace().collect();
+    assert_eq!(&fields[1..5], &["NIL", "0", "NIL", "61"]);
+}
+
 /// A global-accumulator LOOP reaches T2 (bliss-fe8: the builder's loop SSA is
 /// stitched correctly and its loop-invariant phis are collapsed so it fits the
 /// framed register budget), computes the interpreted result, and deopts
