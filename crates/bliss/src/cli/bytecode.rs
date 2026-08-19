@@ -3876,6 +3876,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     args.reverse();
                 }
 
+                // Argument forms are single-value contexts. A producer used as
+                // an argument may have populated env.mv, but those secondary
+                // values belong to argument evaluation, not to the callee's
+                // return. Every dispatch below starts from a clean MV state;
+                // genuine producers re-establish it while executing.
+                env.clear_mv();
+
                 // Type profiling: record operand types at speculatable arithmetic
                 // sites so the optimising tier can commit to one type. `bcp` was
                 // already advanced past this instruction, so the site is bcp-1.
@@ -4997,6 +5004,12 @@ fn run_native(
     args: &[BlissVal],
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
+    // A function call starts a fresh multiple-values context. Argument
+    // evaluation may have left secondary values active (for example GETHASH's
+    // present-p value), but a native callee that simply returns its argument
+    // must return exactly one value. Genuine multiple-value producers called
+    // by the native body re-establish the state through their own call path.
+    env.clear_mv();
     NATIVE_DEPTH.with(|d| d.set(d.get() + 1));
     let _depth_guard = NativeDepthGuard;
     let thread = bliss_rt::current_thread();
