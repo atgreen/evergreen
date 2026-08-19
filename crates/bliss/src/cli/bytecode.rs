@@ -3501,7 +3501,11 @@ fn make_env_frame(
     for (i, (pname, loc)) in func.param_layout.iter().enumerate() {
         if let VarLoc::Boxed = loc {
             if let Some(a) = args.get(i) {
-                frame.borrow_mut().vars.insert(pname.clone(), *a);
+                let mut borrowed = frame.borrow_mut();
+                borrowed.vars.insert(pname.clone(), *a);
+                if let Some(idx) = bliss_rt::symbols::find_index(pname) {
+                    borrowed.symbol_vars.insert(idx, *a);
+                }
             }
         }
     }
@@ -3800,7 +3804,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     .env_frame
                     .clone()
                     .expect("DefineEnvVar without a heap EnvFrame");
-                ef.borrow_mut().vars.insert(name, v);
+                let mut borrowed = ef.borrow_mut();
+                if let Some(idx) = bliss_rt::symbols::find_index(&name) {
+                    borrowed.symbol_vars.insert(idx, v);
+                }
+                borrowed.vars.insert(name, v);
             }
             Instr::PushEnvChild => {
                 let act = &mut acts[top_idx];

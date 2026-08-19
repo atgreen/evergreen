@@ -201,6 +201,9 @@ const CORPUS: &[&str] = &[
     "(defun pair () (let ((n 0)) (list (lambda () (setq n (+ n 1))) (lambda () n)))) (let ((p (pair))) (funcall (first p)) (funcall (first p)) (funcall (second p)))",
     "(defun add-n (n lst) (mapcar (lambda (x) (+ x n)) lst)) (add-n 100 (list 1 2 3))",
     "(defun adders () (let ((a 1) (b 2)) (list (lambda () a) (lambda () b)))) (let ((l (adders))) (list (funcall (first l)) (funcall (second l))))",
+    // A tree-walked closure called from T0 must update the boxed binding in the
+    // bytecode frame, even when an older captured frame has the same variable.
+    "(defparameter *capture-table* (make-hash-table)) (defun capture-table-keys (table) (let ((keys nil)) (maphash (lambda (key value) (declare (ignore value)) (push key keys)) table) keys)) (let ((keys nil)) (declare (ignore keys)) (defmacro captured-key-count (&key (items (capture-table-keys *capture-table*))) (list (quote quote) (length items)))) (setf (gethash (quote a) *capture-table*) 1) (setf (gethash (quote b) *capture-table*) 2) (captured-key-count)",
     // ── cond / when / unless / and / or on bytecode (nmq.6 coverage) ──
     "(when t 1 2 3)",
     "(when nil 1 2)",

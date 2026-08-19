@@ -3086,6 +3086,9 @@ impl Env {
             let mut borrowed = frame.borrow_mut();
             if borrowed.vars.contains_key(name) {
                 borrowed.vars.insert(name.to_string(), val);
+                if let Some(idx) = bliss_rt::symbols::find_index(name) {
+                    borrowed.symbol_vars.insert(idx, val);
+                }
                 return true;
             }
             let parent = borrowed.parent.clone();
@@ -3104,10 +3107,12 @@ impl Env {
     ) -> bool {
         {
             let mut borrowed = frame.borrow_mut();
-            if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                borrowed.symbol_vars.entry(symbol_index)
+            let name = sym_name(BlissVal::from_symbol_index(symbol_index));
+            if borrowed.symbol_vars.contains_key(&symbol_index)
+                || borrowed.vars.contains_key(&name)
             {
-                entry.insert(val);
+                borrowed.symbol_vars.insert(symbol_index, val);
+                borrowed.vars.insert(name, val);
                 return true;
             }
             let parent = borrowed.parent.clone();
