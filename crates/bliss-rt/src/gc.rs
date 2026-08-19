@@ -345,11 +345,6 @@ pub struct HeapAllocator {
     /// Configuration snapshot (region_size, tlab_size, etc.).
     region_size: usize,
     tlab_size: usize,
-    /// Whether the slow path may invoke the moving collector. The CLI's
-    /// recursive tree-walker still has Rust-side roots that are not registered,
-    /// so its compatibility allocator keeps collection disabled until those
-    /// roots have a precise scanner (bliss-6b2).
-    auto_collect: bool,
 }
 
 // Safety: HeapAllocator owns its TLAB and only the owning thread uses it.
@@ -358,16 +353,6 @@ unsafe impl Send for HeapAllocator {}
 impl HeapAllocator {
     /// Create a new HeapAllocator. The heap must already be initialized via `init_heap`.
     pub fn new() -> Result<Self, BlissError> {
-        Self::new_with_auto_collect(true)
-    }
-
-    /// Create the compatibility allocator used by the T0 tree-walker. Moving
-    /// collection is deliberately disabled; see `auto_collect`.
-    fn new_without_auto_collect() -> Result<Self, BlissError> {
-        Self::new_with_auto_collect(false)
-    }
-
-    fn new_with_auto_collect(auto_collect: bool) -> Result<Self, BlissError> {
         let guard = heap_state().lock().unwrap();
         let state = guard
             .as_ref()
@@ -384,7 +369,6 @@ impl HeapAllocator {
             },
             region_size,
             tlab_size,
-            auto_collect,
         };
         // Try to get an initial TLAB from a nursery region.
         alloc.refill_tlab()?;
@@ -459,6 +443,34 @@ impl HeapAllocator {
         Err(BlissError::Oom)
     }
 
+    /// Turn the unused tail of the current TLAB into one inert object.
+    ///
+    /// Region walkers advance object-by-object and treat a zero header as the
+    /// end of allocated space. Without a filler, an under-filled TLAB leaves a
+    /// zero gap before the next TLAB carved from the same region, hiding every
+    /// later object from marking and relocation.
+    fn retire_tlab(&mut self) {
+        let cursor = self.tlab.cursor as usize;
+        let limit = self.tlab.limit as usize;
+        let remaining = limit.saturating_sub(cursor);
+        if cursor != 0 && remaining >= OBJECT_ALIGNMENT {
+            // Type zero with a non-zero body is an internal, reference-free
+            // filler. Its aligned footprint exactly consumes the TLAB tail.
+            let normal_body = remaining - OBJECT_HEADER_SIZE;
+            let (_, needs_large_header) = object_footprint(normal_body);
+            let body_size = if needs_large_header {
+                remaining - LARGE_OBJECT_PAYLOAD_OFFSET
+            } else {
+                normal_body
+            };
+            debug_assert_eq!(object_footprint(body_size).0, remaining);
+            unsafe {
+                write_object_header(self.tlab.cursor, 0, body_size as u32);
+            }
+        }
+        self.tlab.cursor = self.tlab.limit as *mut u8;
+    }
+
     /// Update live_bytes for the nursery region that contains the TLAB
     /// after a successful allocation of `bytes` bytes.
     fn update_nursery_live_bytes(&self, bytes: usize) {
@@ -508,12 +520,14 @@ impl Allocator for HeapAllocator {
             return self.alloc_large(size);
         }
 
+        // Close the old TLAB before carving another one so region walks can
+        // cross its unused tail.
+        self.retire_tlab();
+
         // Try to refill the TLAB. Once the configured nursery budget is full,
-        // collect it and retry against the reset nursery regions. The explicit
-        // no-collection mode is used only by the tree-walker until its Rust-side
-        // evaluator roots are registered.
+        // collect it and retry against the reset nursery regions.
         if let Err(err) = self.refill_tlab() {
-            if !self.auto_collect || !matches!(err, BlissError::Oom) {
+            if !matches!(err, BlissError::Oom) {
                 return Err(err);
             }
             self.tlab.cursor = std::ptr::null_mut();
@@ -2266,18 +2280,18 @@ mod shadow_root_scope_tests {
 // The tree-walking interpreter allocates its Lisp objects (conses, strings, …)
 // through `alloc_typed`, so they use the same object layouts and allocation path
 // as compiled code and are visible to heap stats/walking. The heap is
-// initialized lazily on first use with a large, mostly-nursery configuration;
-// the interpreter never reaches a GC safepoint, so its objects are never moved
-// or collected and stay valid. Reclaiming them awaits interpreter root tracing.
+// initialized lazily on first use. Nursery exhaustion is a T0 safepoint: the
+// collector traces registered evaluator/stdlib roots, evacuates survivors, and
+// reuses the nursery for short-lived allocation.
 
-/// Default heap for a standalone T0 evaluator: large and (lazily committed)
-/// mostly nursery, so a program's live objects fit without a collection cycle.
+/// Default heap for a standalone T0 evaluator, with survivor/old-generation
+/// reserve left outside the nursery so moving collections always have space.
 fn t0_default_config() -> GcConfig {
     let heap_size = 512 * 1024 * 1024;
     GcConfig {
         heap_size,
         heap_max: heap_size,
-        nursery_size: heap_size,
+        nursery_size: 64 * 1024 * 1024,
         tlab_size: 256 * 1024,
         region_size: 1024 * 1024,
         promotion_threshold: 3,
@@ -2331,8 +2345,9 @@ unsafe fn set_object_type_id(body: *mut u8, body_size: usize, type_id: u8) {
 
 /// Allocate a `body_size`-byte object of `type_id` on the shared GC heap and
 /// return a pointer to its body (past the header), or `None` if the heap cannot
-/// be initialized or is exhausted. The T0 evaluator routes all Lisp-object
-/// allocation through this (bliss-jtc.1).
+/// be initialized or is exhausted. Nursery exhaustion automatically runs a
+/// moving minor collection; evaluator and stdlib owners must therefore expose
+/// every live value through precise root scanners.
 pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
     if body_size == 0 {
         return None;
@@ -2344,14 +2359,17 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         }
         let epoch = GC_MOVE_EPOCH.load(Ordering::Acquire);
         if guard.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
-            *guard = HeapAllocator::new_without_auto_collect()
-                .ok()
-                .map(|allocator| (epoch, allocator));
+            *guard = HeapAllocator::new().ok().map(|allocator| (epoch, allocator));
         }
-        let alloc = &mut guard.as_mut()?.1;
-        let body = alloc
-            .alloc_fast(body_size)
-            .or_else(|| alloc.alloc_slow(body_size).ok())?;
+        let body = {
+            let alloc = &mut guard.as_mut()?.1;
+            alloc
+                .alloc_fast(body_size)
+                .or_else(|| alloc.alloc_slow(body_size).ok())?
+        };
+        // The slow path may have collected and then refilled this allocator.
+        // Publish its new epoch so the next allocation reuses that fresh TLAB.
+        guard.as_mut()?.0 = GC_MOVE_EPOCH.load(Ordering::Acquire);
         // SAFETY: `body` is a freshly allocated object body of `body_size` bytes.
         unsafe { set_object_type_id(body, body_size, type_id) };
         Some(body)

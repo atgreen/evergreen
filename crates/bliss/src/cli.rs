@@ -2651,8 +2651,8 @@ impl Env {
     /// Enumerate every mutable `BlissVal` slot owned by this tree-walker
     /// environment. A moving collector can rewrite each yielded pointer in
     /// place. Live top-level evaluation registers this visitor with the runtime
-    /// through [`LiveEnvRootGuard`]; automatic T0 collection remains disabled
-    /// until the remaining global/static evaluator roots are covered.
+    /// through [`LiveEnvRootGuard`], alongside the evaluator's global/static
+    /// scanners and scoped roots for transient Rust locals.
     fn visit_gc_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
         let mut state = EnvRootVisitState::default();
 
@@ -3248,13 +3248,18 @@ fn eval_lambda_call(
     // per-green-thread BlissStack and is bounded by BLISS_STACK_SIZE, raising a
     // catchable STORAGE-CONDITION (R2.20). This tree-walker path is now the
     // fallback for forms the compiler does not yet handle.
+    let roots = bliss_rt::ShadowRootScope::new();
+    let params_form = roots.root(params_form);
+    let body = roots.root(body);
+    let args = roots.root_values(args.iter().copied());
     with_child_frame(env, parent, |env| {
-        bind_lambda_list(params_form, args, env)?;
+        let current_args: Vec<_> = args.iter().map(|arg| arg.get()).collect();
+        bind_lambda_list(params_form.get(), &current_args, env)?;
         // Arguments are a single-value context; a producer evaluated as an
         // argument (or an &optional/&key default) must not leak its extra values
         // into the body. The body's tail form establishes this call's values.
         env.clear_mv();
-        eval_progn(body, env)
+        eval_progn(body.get(), env)
     })
 }
 
@@ -10032,7 +10037,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (binding, body) = cp(cdr);
                 let (var_form, br) = cp(binding);
                 let (count_form, result_rest) = cp(br);
-                let count = eval_form(count_form, env)?;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let var_form = roots.root(var_form);
+                let count_form = roots.root(count_form);
+                let result_rest = roots.root(result_rest);
+                let body = roots.root(body);
+                let count = eval_form(count_form.get(), env)?;
                 let n = num_val(count)? as i64;
                 // Establish a fresh variable frame (so the loop variable shadows
                 // outer bindings and does not leak) while keeping the shared
@@ -10044,12 +10054,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return with_block_nil(env, move |env| {
                     with_child_frame(env, parent, |env| {
                         for i in 0..n {
-                            env.define_local_symbol(var_form, BlissVal::from_fixnum(i));
-                            eval_progn(body, env)?;
+                            env.define_local_symbol(var_form.get(), BlissVal::from_fixnum(i));
+                            eval_progn(body.get(), env)?;
                         }
-                        if result_rest.is_cons() {
-                            let (result_form, _) = cp(result_rest);
-                            env.define_local_symbol(var_form, BlissVal::from_fixnum(n));
+                        if result_rest.get().is_cons() {
+                            let (result_form, _) = cp(result_rest.get());
+                            env.define_local_symbol(var_form.get(), BlissVal::from_fixnum(n));
                             return eval_form(result_form, env);
                         }
                         Ok(NIL)
@@ -10061,18 +10071,24 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (binding, body) = cp(cdr);
                 let (var_form, br) = cp(binding);
                 let (list_form, result_rest) = cp(br);
-                let list = eval_form(list_form, env)?;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let var_form = roots.root(var_form);
+                let list_form = roots.root(list_form);
+                let result_rest = roots.root(result_rest);
+                let body = roots.root(body);
+                let list = eval_form(list_form.get(), env)?;
                 let elems = list_to_vec(list);
+                let elems = roots.root_values(elems);
                 let parent = Rc::clone(&env.frame);
                 return with_block_nil(env, move |env| {
                     with_child_frame(env, parent, |env| {
                         for e in &elems {
-                            env.define_local_symbol(var_form, *e);
-                            eval_progn(body, env)?;
+                            env.define_local_symbol(var_form.get(), e.get());
+                            eval_progn(body.get(), env)?;
                         }
-                        if result_rest.is_cons() {
-                            let (result_form, _) = cp(result_rest);
-                            env.define_local_symbol(var_form, NIL);
+                        if result_rest.get().is_cons() {
+                            let (result_form, _) = cp(result_rest.get());
+                            env.define_local_symbol(var_form.get(), NIL);
                             return eval_form(result_form, env);
                         }
                         Ok(NIL)
@@ -14862,13 +14878,18 @@ fn apply_function(
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
         // full operator-position builtin set (not just apply_builtin's subset)
         // is reachable through funcall/apply/mapcar.
+        let roots = bliss_rt::ShadowRootScope::new();
+        let fn_val = roots.root(fn_val);
+        let args = roots.root_values(args.iter().copied());
         let quote_sym = quote_sym();
         let mut items = Vec::with_capacity(args.len() + 1);
-        items.push(fn_val);
-        for a in args {
-            items.push(arena_cons(quote_sym, arena_cons(*a, NIL)));
+        items.push(roots.root(fn_val.get()));
+        for arg in &args {
+            let quoted_arg = roots.root(arena_cons(arg.get(), NIL));
+            items.push(roots.root(arena_cons(quote_sym, quoted_arg.get())));
         }
-        let form = vec_to_list(&items);
+        let form_items: Vec<_> = items.iter().map(|item| item.get()).collect();
+        let form = vec_to_list(&form_items);
         return eval_form(form, env);
     }
     if fn_val.is_cons() {

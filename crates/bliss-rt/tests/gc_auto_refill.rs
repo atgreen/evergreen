@@ -2,7 +2,8 @@
 
 use bliss_rt::value::{BlissVal, TAG_HEAP_OBJECT, TAG_MASK};
 use bliss_rt::{
-    current_thread, heap_stats, init_heap, Allocator, BlissStack, GcConfig, HeapAllocator,
+    alloc_typed, current_thread, heap_stats, init_heap, Allocator, BlissStack, GcConfig,
+    HeapAllocator, ShadowRootScope,
 };
 use std::sync::{Mutex, OnceLock};
 
@@ -91,4 +92,63 @@ fn automatic_collection_relocates_a_stack_root() {
     );
 
     stack.pop_frame();
+}
+
+#[test]
+fn collection_walks_past_retired_tlab_filler() {
+    let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&config()).expect("init_heap");
+    let mut allocator = HeapAllocator::new().expect("allocator");
+
+    // Leave an 80-byte tail in the first 256-byte TLAB, then request an object
+    // whose 96-byte footprint forces a refill. The retired tail must become a
+    // filler; otherwise the collector stops at its zero header and never sees
+    // this rooted object in the following TLAB.
+    allocator.alloc_fast(160).expect("first TLAB allocation");
+    let rooted_body = allocator.alloc_slow(80).expect("refilled allocation");
+    const MARKER: u64 = 0x0033_4455_6677_8899;
+    unsafe { *(rooted_body as *mut u64) = MARKER };
+    let roots = ShadowRootScope::new();
+    let root = roots.root(BlissVal(
+        ((rooted_body as u64) - std::mem::size_of::<u64>() as u64) | TAG_HEAP_OBJECT,
+    ));
+
+    for _ in 0..600 {
+        let _ = allocate(&mut allocator);
+    }
+
+    let relocated_header = (root.get().0 & !TAG_MASK) as usize;
+    assert_eq!(
+        unsafe { *((relocated_header + 8) as *const u64) },
+        MARKER,
+        "a live object beyond a retired TLAB tail must be marked and relocated"
+    );
+}
+
+#[test]
+fn t0_alloc_typed_collects_and_preserves_shadow_roots() {
+    let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&config()).expect("init_heap");
+
+    let body = alloc_typed(16, bliss_rt::object::type_id::BIGNUM).expect("root allocation");
+    const MARKER: u64 = 0x0011_2233_4455_6677;
+    unsafe { *(body as *mut u64) = MARKER };
+    let roots = ShadowRootScope::new();
+    let root = roots.root(unsafe { BlissVal::from_heap_ptr(body.sub(8)) });
+
+    for _ in 0..1_000 {
+        alloc_typed(48, bliss_rt::object::type_id::BIGNUM)
+            .expect("T0 allocation should collect and retry");
+    }
+
+    let stats = heap_stats();
+    assert!(
+        stats.minor_gc_count >= 3,
+        "alloc_typed must reuse the nursery through repeated minor collections"
+    );
+    assert_eq!(
+        unsafe { *((root.get().as_ptr().add(8)) as *const u64) },
+        MARKER,
+        "a T0 shadow root must retain its contents across automatic collections"
+    );
 }
