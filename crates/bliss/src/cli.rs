@@ -9172,12 +9172,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let raw = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
                 let target = resolve_package_name(env, &raw);
+                // Resolve the target to its canonical handle once, then match
+                // use-list entries by identity — comparing package *handles* is
+                // far cheaper than resolving and string-comparing each entry's
+                // name (this runs O(all-packages) per call, and ASDF calls it
+                // once per exported symbol during reconciliation).
+                let target_pkg = match bliss_stdlib::find_package(&target) {
+                    Some(p) => p,
+                    None => return Ok(NIL),
+                };
                 let mut result = Vec::new();
                 for p in bliss_stdlib::list_all_packages() {
                     let uses_target = bliss_stdlib::package_use_list(p)
                         .iter()
-                        .filter_map(|u| bliss_stdlib::package_name(*u))
-                        .any(|n| n == target);
+                        .any(|u| *u == target_pkg);
                     if uses_target {
                         result.push(p);
                     }
