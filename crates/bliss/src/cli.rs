@@ -657,7 +657,19 @@ pub(super) fn setf_writer_symbol_name(place_name: &str) -> String {
 /// Used by the portable SETF lowering to recognize a user setf-function place.
 pub(super) fn env_has_setf_writer(place_name: &str) -> bool {
     let key = format!("(SETF {place_name})");
-    GLOBAL_SETF_FNS.with(|m| m.borrow().contains_key(&key))
+    if GLOBAL_SETF_FNS.with(|m| m.borrow().contains_key(&key)) {
+        return true;
+    }
+    // A `(defun (setf place) …)` writer loaded from a `.bfasl` installs its
+    // function on the mangled `%SETF-WRITER-place` symbol rather than in
+    // GLOBAL_SETF_FNS (which only records source-evaluated writers). Recognise
+    // that case too, so a place whose writer was defined in an earlier
+    // source-free unit (e.g. alexandria's `(setf lastcar)` from lists.lisp) is
+    // still lowered to the portable writer call. Mirrors the acceptance test in
+    // the tree-walker's SETF `other =>` branch.
+    resolve_sym(&setf_writer_symbol_name(place_name))
+        .map(|s| bytecode::is_registered(s.as_symbol_index()))
+        .unwrap_or(false)
 }
 
 fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
@@ -6949,6 +6961,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 return Ok(if v.is_list() { T } else { NIL });
             }
+            "ENDP" => {
+                // (endp list) — CLHS: T at the end of a proper list (NIL), NIL
+                // for a cons, a type error for anything else.
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if v.is_nil() {
+                    return Ok(T);
+                } else if v.is_cons() {
+                    return Ok(NIL);
+                } else {
+                    return Err(BlissError::TypeError {
+                        datum: v,
+                        expected: "list".into(),
+                    });
+                }
+            }
             "NUMBERP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
@@ -7476,9 +7504,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     env.set_var(&name, val);
                                 }
                             }
-                            "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT" => {
+                            "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT"
+                            | "BIT" | "SBIT" => {
                                 // (setf (char string index) val) and friends —
                                 // mutate a string or vector element in place.
+                                // BIT/SBIT index a bit array exactly like AREF.
                                 let seq = eval_form(tgt_form, env)?;
                                 let (idx_form, _) = cp(cp(aargs).1);
                                 let idx = eval_form(idx_form, env)?;
@@ -7777,8 +7807,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return bliss_stdlib::elt(seq, idx.as_fixnum() as usize);
             }
-            "AREF" | "SVREF" | "ROW-MAJOR-AREF" => {
+            "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "BIT" | "SBIT" => {
                 // One-dimensional array/vector/string access — delegates to elt.
+                // BIT/SBIT read a bit array exactly like AREF (rank-1 here).
                 let args = list_to_vec(cdr);
                 if args.len() != 2 {
                     return Err(BlissError::ProgramError(format!(
@@ -15506,6 +15537,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "SET-DIFFERENCE" | "UNION" | "INTERSECTION" | "ADJOIN"
             // Sequences
             | "ELT" | "LENGTH" | "SUBSEQ" | "COPY-SEQ" | "AREF" | "SVREF" | "ROW-MAJOR-AREF"
+            | "BIT" | "SBIT"
             | "MAP" | "MAP-INTO" | "REDUCE" | "COUNT" | "COUNT-IF" | "FIND" | "FIND-IF"
             | "POSITION" | "POSITION-IF" | "REMOVE" | "REMOVE-IF" | "REMOVE-IF-NOT"
             | "REMOVE-DUPLICATES" | "DELETE" | "DELETE-IF" | "DELETE-DUPLICATES"
@@ -15654,6 +15686,22 @@ fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissV
         } else {
             NIL
         }),
+        "ENDP" => {
+            // (endp list) — T at the end of a proper list (NIL), NIL for a cons,
+            // and a type error for a non-list (CLHS: endp is defined only on
+            // lists).
+            let arg = args.first().copied().unwrap_or(NIL);
+            if arg.is_nil() {
+                Ok(T)
+            } else if arg.is_cons() {
+                Ok(NIL)
+            } else {
+                Err(BlissError::TypeError {
+                    datum: arg,
+                    expected: "list".into(),
+                })
+            }
+        }
         "ATOM" => Ok(if args.first().copied().unwrap_or(NIL).is_cons() {
             NIL
         } else {

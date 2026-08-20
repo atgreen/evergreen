@@ -2068,7 +2068,7 @@ impl<'e> Lowerer<'e> {
         let mut count_acc: Option<BlissVal> = None;
         let mut explicit_result = false;
         let mut nsym = 0usize;
-        let mut fresh = |tag: &str, nsym: &mut usize| -> LowerResult<BlissVal> {
+        let fresh = |tag: &str, nsym: &mut usize| -> LowerResult<BlissVal> {
             *nsym += 1;
             resolve_sym(&format!("%LG-{tag}{id}_{}", *nsym)).ok_or(Bail)
         };
@@ -2271,27 +2271,63 @@ impl<'e> Lowerer<'e> {
                     let negate = key.as_deref() == Some("UNLESS");
                     let test = *forms.get(i + 1).ok_or(Bail)?;
                     i += 2;
-                    let mut acc_forms = Vec::new();
-                    parse_loop_accumulations(
+                    // then-branch: one or more selectable clauses (do/return/
+                    // accumulations, joined by `and`).
+                    let mut then_forms = Vec::new();
+                    parse_loop_selectable(
                         forms,
                         &mut i,
                         &kw,
                         &mut bindings,
-                        &mut finalize,
                         &mut list_acc,
                         &mut sum_acc,
                         &mut count_acc,
                         &mut nsym,
                         id,
-                        &mut acc_forms,
+                        &mut then_forms,
+                        &mut explicit_result,
                     )?;
-                    if acc_forms.is_empty() {
+                    if then_forms.is_empty() {
                         return Err(Bail);
                     }
-                    let mut progn = vec![s("PROGN")?];
-                    progn.extend(acc_forms);
-                    let guard = if negate { "UNLESS" } else { "WHEN" };
-                    body.push(form_list(&[s(guard)?, test, form_list(&progn)]));
+                    // optional `else` branch.
+                    let mut else_forms = Vec::new();
+                    if kw(*forms.get(i).unwrap_or(&NIL)).as_deref() == Some("ELSE") {
+                        i += 1;
+                        parse_loop_selectable(
+                            forms,
+                            &mut i,
+                            &kw,
+                            &mut bindings,
+                            &mut list_acc,
+                            &mut sum_acc,
+                            &mut count_acc,
+                            &mut nsym,
+                            id,
+                            &mut else_forms,
+                            &mut explicit_result,
+                        )?;
+                    }
+                    // optional terminating `end`.
+                    if kw(*forms.get(i).unwrap_or(&NIL)).as_deref() == Some("END") {
+                        i += 1;
+                    }
+                    let mut then_progn = vec![s("PROGN")?];
+                    then_progn.extend(then_forms);
+                    if else_forms.is_empty() {
+                        let guard = if negate { "UNLESS" } else { "WHEN" };
+                        body.push(form_list(&[s(guard)?, test, form_list(&then_progn)]));
+                    } else {
+                        let mut else_progn = vec![s("PROGN")?];
+                        else_progn.extend(else_forms);
+                        // `(if test then else)`, flipping arms for `unless`.
+                        let (a, b) = if negate {
+                            (form_list(&else_progn), form_list(&then_progn))
+                        } else {
+                            (form_list(&then_progn), form_list(&else_progn))
+                        };
+                        body.push(form_list(&[s("IF")?, test, a, b]));
+                    }
                 }
                 Some("COLLECT") | Some("COLLECTING") | Some("APPEND") | Some("APPENDING")
                 | Some("NCONC") | Some("NCONCING") | Some("SUM") | Some("SUMMING")
@@ -3874,7 +3910,7 @@ fn aref_setf_place(place: BlissVal) -> Option<(BlissVal, BlissVal)> {
         return None;
     }
     match symbol_bare_name(&sym_name(items[0])).as_str() {
-        "AREF" | "SVREF" | "CHAR" | "SCHAR" | "ROW-MAJOR-AREF" | "ELT" => {
+        "AREF" | "SVREF" | "CHAR" | "SCHAR" | "ROW-MAJOR-AREF" | "ELT" | "BIT" | "SBIT" => {
             Some((items[1], items[2]))
         }
         _ => None,
@@ -3971,7 +4007,6 @@ fn parse_loop_accumulations(
     id: u32,
     out: &mut Vec<BlissVal>,
 ) -> LowerResult<()> {
-    let s = |n: &str| resolve_sym(n).ok_or(Bail);
     loop {
         let op = kw(forms[*i]).ok_or(Bail)?;
         let expr = *forms.get(*i + 1).ok_or(Bail)?;
@@ -3979,45 +4014,126 @@ fn parse_loop_accumulations(
         if kw(*forms.get(*i).unwrap_or(&NIL)).as_deref() == Some("INTO") {
             return Err(Bail); // `into` not supported yet
         }
+        apply_loop_accumulation(
+            &op, expr, bindings, list_acc, sum_acc, count_acc, nsym, id, out,
+        )?;
+        if kw(*forms.get(*i).unwrap_or(&NIL)).as_deref() == Some("AND") {
+            *i += 1;
+            continue;
+        }
+        break;
+    }
+    Ok(())
+}
+
+/// Emit the per-iteration form(s) for a single LOOP accumulation clause
+/// (`{collect|append|nconc|sum|count} EXPR`), lazily creating the shared
+/// accumulator on first use. Bails on an unrecognised operator.
+#[allow(clippy::too_many_arguments)]
+fn apply_loop_accumulation(
+    op: &str,
+    expr: BlissVal,
+    bindings: &mut Vec<BlissVal>,
+    list_acc: &mut Option<BlissVal>,
+    sum_acc: &mut Option<BlissVal>,
+    count_acc: &mut Option<BlissVal>,
+    nsym: &mut usize,
+    id: u32,
+    out: &mut Vec<BlissVal>,
+) -> LowerResult<()> {
+    let s = |n: &str| resolve_sym(n).ok_or(Bail);
+    match op {
+        "COLLECT" | "COLLECTING" | "APPEND" | "APPENDING" | "NCONC" | "NCONCING" => {
+            if list_acc.is_none() {
+                *nsym += 1;
+                let acc = resolve_sym(&format!("%LG-ACC{id}_{}", *nsym)).ok_or(Bail)?;
+                bindings.push(form_list(&[acc, NIL]));
+                *list_acc = Some(acc);
+            }
+            let acc = list_acc.unwrap();
+            let pushed = if op.starts_with("COLLECT") {
+                form_list(&[s("CONS")?, expr, acc])
+            } else {
+                form_list(&[s("REVAPPEND")?, expr, acc])
+            };
+            out.push(form_list(&[s("SETQ")?, acc, pushed]));
+        }
+        "SUM" | "SUMMING" => {
+            if sum_acc.is_none() {
+                *nsym += 1;
+                let acc = resolve_sym(&format!("%LG-SUM{id}_{}", *nsym)).ok_or(Bail)?;
+                bindings.push(form_list(&[acc, BlissVal::from_fixnum(0)]));
+                *sum_acc = Some(acc);
+            }
+            let acc = sum_acc.unwrap();
+            out.push(form_list(&[s("SETQ")?, acc, form_list(&[s("+")?, acc, expr])]));
+        }
+        "COUNT" | "COUNTING" => {
+            if count_acc.is_none() {
+                *nsym += 1;
+                let acc = resolve_sym(&format!("%LG-CNT{id}_{}", *nsym)).ok_or(Bail)?;
+                bindings.push(form_list(&[acc, BlissVal::from_fixnum(0)]));
+                *count_acc = Some(acc);
+            }
+            let acc = count_acc.unwrap();
+            out.push(form_list(&[
+                s("WHEN")?,
+                expr,
+                form_list(&[s("SETQ")?, acc, form_list(&[s("1+")?, acc])]),
+            ]));
+        }
+        _ => return Err(Bail),
+    }
+    Ok(())
+}
+
+/// Parse the selectable clause body of a LOOP conditional (`when`/`if`/`unless`)
+/// — the forms after the test (and after `else`). Handles `do`/`doing`,
+/// `return`, the accumulation clauses, and chaining with `and`; stops at `else`,
+/// `end`, or any other clause keyword (or end of input) without consuming it.
+/// Sets `explicit_result` when a `return` clause is seen. Bails on an
+/// unrecognised leading operator so the whole LOOP falls back.
+#[allow(clippy::too_many_arguments)]
+fn parse_loop_selectable(
+    forms: &[BlissVal],
+    i: &mut usize,
+    kw: &dyn Fn(BlissVal) -> Option<String>,
+    bindings: &mut Vec<BlissVal>,
+    list_acc: &mut Option<BlissVal>,
+    sum_acc: &mut Option<BlissVal>,
+    count_acc: &mut Option<BlissVal>,
+    nsym: &mut usize,
+    id: u32,
+    out: &mut Vec<BlissVal>,
+    explicit_result: &mut bool,
+) -> LowerResult<()> {
+    let s = |n: &str| resolve_sym(n).ok_or(Bail);
+    loop {
+        let op = kw(*forms.get(*i).ok_or(Bail)?).ok_or(Bail)?;
         match op.as_str() {
-            "COLLECT" | "COLLECTING" | "APPEND" | "APPENDING" | "NCONC" | "NCONCING" => {
-                if list_acc.is_none() {
-                    *nsym += 1;
-                    let acc = resolve_sym(&format!("%LG-ACC{id}_{}", *nsym)).ok_or(Bail)?;
-                    bindings.push(form_list(&[acc, NIL]));
-                    *list_acc = Some(acc);
+            "DO" | "DOING" => {
+                *i += 1;
+                while *i < forms.len() && kw(forms[*i]).is_none() {
+                    out.push(forms[*i]);
+                    *i += 1;
                 }
-                let acc = list_acc.unwrap();
-                let pushed = if op.starts_with("COLLECT") {
-                    form_list(&[s("CONS")?, expr, acc])
-                } else {
-                    form_list(&[s("REVAPPEND")?, expr, acc])
-                };
-                out.push(form_list(&[s("SETQ")?, acc, pushed]));
             }
-            "SUM" | "SUMMING" => {
-                if sum_acc.is_none() {
-                    *nsym += 1;
-                    let acc = resolve_sym(&format!("%LG-SUM{id}_{}", *nsym)).ok_or(Bail)?;
-                    bindings.push(form_list(&[acc, BlissVal::from_fixnum(0)]));
-                    *sum_acc = Some(acc);
-                }
-                let acc = sum_acc.unwrap();
-                out.push(form_list(&[s("SETQ")?, acc, form_list(&[s("+")?, acc, expr])]));
+            "RETURN" => {
+                let e = *forms.get(*i + 1).ok_or(Bail)?;
+                out.push(form_list(&[s("RETURN")?, e]));
+                *explicit_result = true;
+                *i += 2;
             }
-            "COUNT" | "COUNTING" => {
-                if count_acc.is_none() {
-                    *nsym += 1;
-                    let acc = resolve_sym(&format!("%LG-CNT{id}_{}", *nsym)).ok_or(Bail)?;
-                    bindings.push(form_list(&[acc, BlissVal::from_fixnum(0)]));
-                    *count_acc = Some(acc);
+            "COLLECT" | "COLLECTING" | "APPEND" | "APPENDING" | "NCONC" | "NCONCING" | "SUM"
+            | "SUMMING" | "COUNT" | "COUNTING" => {
+                let expr = *forms.get(*i + 1).ok_or(Bail)?;
+                *i += 2;
+                if kw(*forms.get(*i).unwrap_or(&NIL)).as_deref() == Some("INTO") {
+                    return Err(Bail); // `into` not supported yet
                 }
-                let acc = count_acc.unwrap();
-                out.push(form_list(&[
-                    s("WHEN")?,
-                    expr,
-                    form_list(&[s("SETQ")?, acc, form_list(&[s("1+")?, acc])]),
-                ]));
+                apply_loop_accumulation(
+                    &op, expr, bindings, list_acc, sum_acc, count_acc, nsym, id, out,
+                )?;
             }
             _ => return Err(Bail),
         }
@@ -5127,7 +5243,22 @@ impl BbuConstPool {
             return Some(self.string(&val_as_str(v)));
         }
         if v.is_symbol() {
-            return self.symbol_by_index(v.as_symbol_index());
+            let idx = v.as_symbol_index();
+            if let Some(r) = self.symbol_by_index(idx) {
+                return Some(r);
+            }
+            // An uninterned / homeless symbol (no registry key), e.g. a gensym
+            // embedded in macro output or a symbol whose home package is NIL.
+            // Encode by name plus the process-local index: the index keeps
+            // distinct symbols distinct (so the pool does not merge two same-named
+            // gensyms), while load reconstructs a fresh uninterned symbol.
+            let name = bliss_rt::symbols::symbol_name(idx)?;
+            let name_ref = self.string(&name);
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 16);
+            put_u32(&mut bytes, name_ref);
+            put_u32(&mut bytes, idx);
+            return Some(self.intern_encoded(bytes));
         }
         if v.is_cons() {
             let (car, cdr) = cp(v);
@@ -5214,6 +5345,19 @@ fn bbu_pc(target: u32, offsets: &[u32], end: u32) -> Option<u32> {
     }
 }
 
+fn traced_symbol_by_index(pool: &mut BbuConstPool, sym: u32) -> Option<u32> {
+    match pool.symbol_by_index(sym) {
+        Some(r) => Some(r),
+        None => {
+            if std::env::var_os("BLISS_BFASL_FORM").is_some() {
+                let name = bliss_rt::symbols::symbol_name(sym);
+                eprintln!("[bfasl] serialize: non-poolable operand symbol {name:?} (idx {sym})");
+            }
+            None
+        }
+    }
+}
+
 fn serialize_bbu_function(
     bf: &BytecodeFunction,
     name_ref: u32,
@@ -5233,14 +5377,36 @@ fn serialize_bbu_function(
     }
     let mut literal_refs = Vec::with_capacity(bf.constants.len());
     for &c in &bf.constants {
-        literal_refs.push(pool.value(c)?);
+        match pool.value(c) {
+            Some(r) => literal_refs.push(r),
+            None => {
+                if std::env::var_os("BLISS_BFASL_FORM").is_some() {
+                    let desc = if c.is_symbol() {
+                        format!("symbol {:?}", sym_name(c))
+                    } else {
+                        format!("{c:?}")
+                    };
+                    eprintln!("[bfasl] serialize: non-poolable constant {desc}");
+                }
+                return None;
+            }
+        }
     }
 
     let mut offsets = Vec::with_capacity(bf.code.len());
     let mut pc = 0u32;
     for instr in &bf.code {
         offsets.push(pc);
-        pc = pc.checked_add(bbu_instr_len(instr)? as u32)?;
+        let len = match bbu_instr_len(instr) {
+            Some(len) => len,
+            None => {
+                if std::env::var_os("BLISS_BFASL_FORM").is_some() {
+                    eprintln!("[bfasl] serialize: non-portable instr {instr:?}");
+                }
+                return None;
+            }
+        };
+        pc = pc.checked_add(len as u32)?;
     }
     let end_pc = pc;
 
@@ -5261,21 +5427,21 @@ fn serialize_bbu_function(
             }
             Instr::LoadGlobal(sym) => {
                 put_u8(&mut code, 0x07);
-                let cp = pool.symbol_by_index(*sym)?;
+                let cp = traced_symbol_by_index(pool, *sym)?;
                 put_u32(&mut code, cp);
             }
             Instr::StoreGlobal(sym) => {
                 put_u8(&mut code, 0x08);
-                let cp = pool.symbol_by_index(*sym)?;
+                let cp = traced_symbol_by_index(pool, *sym)?;
                 put_u32(&mut code, cp);
             }
             Instr::LoadFunction(sym) => {
                 put_u8(&mut code, 0x09);
-                put_u32(&mut code, pool.symbol_by_index(*sym)?);
+                put_u32(&mut code, traced_symbol_by_index(pool, *sym)?);
             }
             Instr::BindSpecial(sym) => {
                 put_u8(&mut code, 0x1c);
-                put_u32(&mut code, pool.symbol_by_index(*sym)?);
+                put_u32(&mut code, traced_symbol_by_index(pool, *sym)?);
             }
             Instr::UnbindSpecial(count) => {
                 put_u8(&mut code, 0x1d);
@@ -5323,7 +5489,7 @@ fn serialize_bbu_function(
             }
             Instr::CallNamed { sym, nargs } => {
                 put_u8(&mut code, 0x0d);
-                let cp = pool.symbol_by_index(*sym)?;
+                let cp = traced_symbol_by_index(pool, *sym)?;
                 put_u32(&mut code, cp);
                 put_u16(&mut code, *nargs);
             }
@@ -5431,7 +5597,12 @@ fn serialize_bbu_function(
                 // heap frame is captured), so no slot payload follows.
                 put_u16(&mut code, u16::from(*capture_env));
             }
-            Instr::EvalHost(_) | Instr::MakeClosureEnv(_) => return None,
+            Instr::EvalHost(_) | Instr::MakeClosureEnv(_) => {
+                if std::env::var_os("BLISS_BFASL_FORM").is_some() {
+                    eprintln!("[bfasl] serialize: non-portable instr {instr:?}");
+                }
+                return None;
+            }
         }
     }
 
@@ -5811,6 +5982,7 @@ pub fn build_bbu_from_forms(
 
     for (form_index, &form) in forms.iter().enumerate() {
         let mut done = false;
+        reset_last_bail_reason();
 
         // (0) Package creation is a deterministic load action, not an
         // executable source thunk. Its structural constants are validated in
@@ -5943,8 +6115,9 @@ pub fn build_bbu_from_forms(
         if !done {
             if std::env::var_os("BLISS_BFASL_FORM").is_some() {
                 eprintln!(
-                    "[bfasl] form {} failed: {}",
+                    "[bfasl] form {} failed (bail: {}): {}",
                     form_index + 1,
+                    last_bail_reason().unwrap_or_else(|| "?".to_string()),
                     super::fmt_form_debug(form)
                 );
             }
@@ -6020,6 +6193,10 @@ enum BbuConstant {
     LegacySymbol(u32),
     Cons(u32, u32),
     Vector(Vec<u32>),
+    /// An uninterned / homeless symbol: name string ref (the trailing
+    /// process-local index disambiguates distinct symbols at serialize time and
+    /// is not retained).
+    UninternedSymbol(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -6189,6 +6366,11 @@ fn parse_bbu_constant(
                 refs.push(cursor.u32()?);
             }
             BbuConstant::Vector(refs)
+        }
+        16 => {
+            let name_ref = cursor.u32()?;
+            let _index = cursor.u32()?; // disambiguation only; not retained
+            BbuConstant::UninternedSymbol(name_ref)
         }
         tag => return Err(bbu_error(format!("unsupported constant tag {tag}"))),
     })
@@ -6403,6 +6585,10 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<BlissVal>,
             BbuConstant::LegacySymbol(name_ref) => {
                 let key = bbu_string(constants, *name_ref)?;
                 BlissVal::from_symbol_index(bliss_rt::symbols::intern(key))
+            }
+            BbuConstant::UninternedSymbol(name_ref) => {
+                let name = bbu_string(constants, *name_ref)?;
+                bliss_rt::symbols::make_uninterned(name)
             }
             BbuConstant::Cons(car_ref, cdr_ref) => {
                 // The writer emits structural children before their parent.

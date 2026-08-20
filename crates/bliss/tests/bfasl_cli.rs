@@ -258,6 +258,146 @@ fn extended_loop_and_setf_place_bfasl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The LOOP conditional-execution grammar (`when TEST do …`, `when TEST return
+/// …`, and `when TEST … else …`) must lower to source-free bytecode. This is the
+/// shape of alexandria's `ends-with-subseq` / `map-derangements`.
+#[test]
+fn loop_conditional_selectable_clauses_bfasl_round_trip() {
+    let dir = workdir("loop-when");
+    let src = dir.join("w.lisp");
+    let out = dir.join("w.bfasl");
+    fs::write(
+        &src,
+        "(defun first-big (n) (loop for i from 0 below n when (> i 3) do (return-from first-big i) finally (return -1)))\n\
+         (defun tag-parity (n) (loop for i from 0 below n when (evenp i) collect (list :e i) else collect (list :o i)))\n\
+         (defun only-when (n) (loop for i from 0 below n when (oddp i) collect i))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (list (first-big 10) (tag-parity 4) (only-when 6)))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "(4 ((:E 0) (:O 1) (:E 2) (:O 3)) (1 3 5))",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `setf` of a bit-array element (`bit`/`sbit`) must lower to source-free
+/// bytecode (via the shared array-element store) and match the tree-walker.
+/// Bit-array setf is alexandria's `map-derangements` mask update.
+#[test]
+fn bit_array_setf_bfasl_round_trip() {
+    let dir = workdir("bit-setf");
+    let src = dir.join("b.lisp");
+    let out = dir.join("b.bfasl");
+    fs::write(
+        &src,
+        "(defun mask3 ()\n\
+        \x20 (let ((m (make-array 4 :element-type 'bit :initial-element 0)))\n\
+        \x20   (setf (bit m 1) 1)\n\
+        \x20   (setf (sbit m 3) 1)\n\
+        \x20   (list (bit m 0) (bit m 1) (bit m 2) (bit m 3))))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+
+    let l = run(&format!("(progn (load \"{}\") (mask3))", out.display()));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "(0 1 0 1)");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A `(setf (place …) …)` whose `(defun (setf place) …)` writer lives in a
+/// *separate* unit loaded from `.bfasl` (installed on the mangled writer symbol,
+/// not `GLOBAL_SETF_FNS`) must still lower to the portable writer call. This is
+/// alexandria's `(setf (lastcar …) …)` in `sequences.lisp` using the writer from
+/// `lists.lisp`.
+#[test]
+fn cross_unit_setf_writer_bfasl_round_trip() {
+    let dir = workdir("xunit-setf");
+    let wsrc = dir.join("writer.lisp");
+    let wout = dir.join("writer.bfasl");
+    let usrc = dir.join("user.lisp");
+    let uout = dir.join("user.bfasl");
+    fs::write(
+        &wsrc,
+        "(defun (setf second-of) (val list) (setf (cadr list) val) val)\n",
+    )
+    .unwrap();
+    fs::write(
+        &usrc,
+        "(defun poke (l) (setf (second-of l) 42) l)\n",
+    )
+    .unwrap();
+
+    // Compile the writer, load it (installs on the mangled symbol), THEN compile
+    // the user unit — its SETF lowering must recognise the bfasl-loaded writer.
+    let c = run(&format!(
+        "(progn (compile-file \"{}\" \"{}\") (load \"{}\") (compile-file \"{}\" \"{}\"))",
+        wsrc.display(),
+        wout.display(),
+        wout.display(),
+        usrc.display(),
+        uout.display(),
+    ));
+    assert!(
+        c.status.success(),
+        "compile/load/compile failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    assert!(bfasl_section(&fs::read(&uout).unwrap(), 11).is_none());
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (load \"{}\") (poke (list 1 2 3)))",
+        wout.display(),
+        uout.display(),
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "(1 42 3)");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `destructuring-bind` must lower to source-free portable bytecode (required,
 /// `&optional` with defaults, and `&rest`) and execute correctly from a fresh
 /// process. This is a prerequisite for compiling real macros (e.g. alexandria's
