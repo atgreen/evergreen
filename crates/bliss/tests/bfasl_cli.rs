@@ -103,6 +103,66 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
     pos
 }
 
+/// The extended LOOP grammar (`with`, `for … {in|on} … by`, conditional
+/// `collect … and collect`, `finally (return …)`, numeric `from … below`) and
+/// `setf` of a `cdr` place must all lower to source-free bytecode. This is the
+/// shape of alexandria's plist LOOP functions (remove/delete-from-plist).
+#[test]
+fn extended_loop_and_setf_place_bfasl_round_trip() {
+    let dir = workdir("loop-setf");
+    let src = dir.join("l.lisp");
+    let out = dir.join("l.bfasl");
+    fs::write(
+        &src,
+        "(defun rmplist (plist &rest keys)\n\
+        \x20 (loop for (k . rest) on plist by #'cddr\n\
+        \x20       unless (member k keys :test #'eq)\n\
+        \x20       collect k and collect (first rest)))\n\
+         (defun delplist (plist &rest keys)\n\
+        \x20 (loop with head = plist with tail = nil\n\
+        \x20       for (k . rest) on plist by #'cddr\n\
+        \x20       do (if (member k keys :test #'eq)\n\
+        \x20              (let ((next (cdr rest)))\n\
+        \x20                (if tail (setf (cdr tail) next) (setf head next)))\n\
+        \x20              (setf tail rest))\n\
+        \x20       finally (return head)))\n\
+         (defun squares (n) (loop for i from 0 below n collect (* i i)))\n\
+         (defun total (l) (loop for x in l sum x))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+
+    let l = run(&format!(
+        "(progn (load \"{}\") \
+           (list (rmplist '(:a 1 :b 2 :c 3) :b) \
+                 (delplist (list :a 1 :b 2 :c 3) :b) \
+                 (squares 4) (total '(1 2 3 4))))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "((:A 1 :C 3) (:A 1 :C 3) (0 1 4 9) 10)",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `destructuring-bind` must lower to source-free portable bytecode (required,
 /// `&optional` with defaults, and `&rest`) and execute correctly from a fresh
 /// process. This is a prerequisite for compiling real macros (e.g. alexandria's

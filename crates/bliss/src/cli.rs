@@ -7970,6 +7970,32 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_stdlib::set_gethash(key, tbl, val)?;
                 return Ok(val);
             }
+            "BLISS::SET-CAR" | "BLISS::SET-CDR" => {
+                // Store primitives for bytecode-lowered `(setf (car|cdr place)
+                // value)`. Arguments arrive already evaluated (cons, value)
+                // through apply_function's synthesize path; the target's car/cdr
+                // is written in place and the value is returned (SETF semantics).
+                let set_car = name == "BLISS::SET-CAR";
+                let (cons_form, r) = cp(cdr);
+                let (val_form, _) = cp(r);
+                let target = eval_form(cons_form, env)?;
+                let val = eval_form(val_form, env)?;
+                if !target.is_cons() {
+                    return Err(BlissError::TypeError {
+                        datum: target,
+                        expected: "cons".into(),
+                    });
+                }
+                unsafe {
+                    let cell = target.as_ptr() as *mut ConsCell;
+                    if set_car {
+                        (*cell).car = val;
+                    } else {
+                        (*cell).cdr = val;
+                    }
+                }
+                return Ok(val);
+            }
             "REMHASH" => {
                 let (key_form, r) = cp(cdr);
                 let (tbl_form, _) = cp(r);

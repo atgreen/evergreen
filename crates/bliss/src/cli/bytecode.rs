@@ -864,6 +864,7 @@ impl<'e> Lowerer<'e> {
                 }
                 "VALUES" => self.lower_values(rest),
                 "DESTRUCTURING-BIND" => self.lower_destructuring_bind(rest),
+                "ASSERT" => self.lower_assert(rest),
                 "MULTIPLE-VALUE-CALL" => self.lower_multiple_value_call(rest),
                 "MULTIPLE-VALUE-BIND" => self.lower_mvb(rest),
                 "MULTIPLE-VALUE-LIST" => self.lower_mvlist(rest),
@@ -1520,6 +1521,20 @@ impl<'e> Lowerer<'e> {
                 // Symbol place: identical to SETQ.
                 self.lower_expr(val)?;
                 self.store_to_symbol_place(place, last)?;
+            } else if let Some((setter, cons_arg)) = cons_setf_place(place) {
+                // `(setf (car|cdr X) V)` → the internal store primitive
+                // BLISS::SET-CAR / SET-CDR (cons, value), which writes in place
+                // and returns the value.
+                let sym = resolve_sym(setter).ok_or(Bail)?.as_symbol_index();
+                self.lower_expr(cons_arg)?; // cons
+                self.lower_expr(val)?; // value
+                self.emit(Instr::CallNamed { sym, nargs: 2 });
+                self.pop_n(2);
+                self.push_n(1); // result: the stored value
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
             } else if let Some((key, table)) = self.gethash_place(place) {
                 // `(setf (gethash key table) val)` → the internal store primitive
                 // BLISS::PUT-GETHASH (bliss-x5y.2). Push value, key, table in the
@@ -1918,22 +1933,32 @@ impl<'e> Lowerer<'e> {
             let kw = |f: BlissVal| -> Option<String> {
                 f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
             };
-            match kw(forms[0]).as_deref() {
-                // while/until loops do not start with `for`.
-                Some("WHILE") | Some("UNTIL") => return self.lower_loop_while(&forms),
-                Some("REPEAT") => return self.lower_loop_repeat(&forms),
+            // Try the proven specialized handlers first for the shapes they
+            // recognize; each bails during parsing (before emitting) on an
+            // unsupported clause, so falling through to the general compiler is
+            // safe. A partial emit (code grew before a bail) can't be recovered,
+            // so give up in that case.
+            let snapshot = self.code.len();
+            let specialized = match kw(forms[0]).as_deref() {
+                Some("WHILE") | Some("UNTIL") => Some(self.lower_loop_while(&forms)),
+                Some("REPEAT") => Some(self.lower_loop_repeat(&forms)),
                 Some("FOR") if forms.len() >= 3 => match kw(forms[2]).as_deref() {
                     Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
-                        return self.lower_loop_numeric_for(&forms);
+                        Some(self.lower_loop_numeric_for(&forms))
                     }
-                    Some("IN") => return self.lower_loop_for_in(&forms),
-                    Some("ON") => return self.lower_loop_for_on(&forms),
-                    Some("BEING") => return self.lower_loop_for_being_hash(&forms),
-                    _ => {}
+                    Some("IN") => Some(self.lower_loop_for_in(&forms)),
+                    Some("ON") => Some(self.lower_loop_for_on(&forms)),
+                    Some("BEING") => Some(self.lower_loop_for_being_hash(&forms)),
+                    _ => None,
                 },
+                _ => None,
+            };
+            match specialized {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(_)) if self.code.len() != snapshot => return Err(Bail),
                 _ => {}
             }
-            return Err(Bail);
+            return self.lower_loop_general(&forms);
         }
         let id = self.fresh_id();
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
@@ -1944,6 +1969,319 @@ impl<'e> Lowerer<'e> {
         tb.push(form_list(&[s("GO")?, top]));
         let block = form_list(&[s("BLOCK")?, NIL, form_list(&tb)]);
         self.lower_expr(block)
+    }
+
+    /// General extended-LOOP compiler: expand the clause grammar to core forms
+    /// (`block`/`let*`/`tagbody`/`go`/`setq`) and lower that. This is the
+    /// source-free path for the richer shapes the specialized handlers above do
+    /// not cover — `with`, `for … {in|on} … by`, parallel accumulation with
+    /// `when`/`unless`/`and`/`into`, `finally`, `initially`, `while`/`until`,
+    /// `repeat`, `return`. Anything unrecognized bails before any code is
+    /// emitted (the whole form is built as data, then lowered once).
+    fn lower_loop_general(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
+        let id = self.fresh_id();
+        let s = |n: &str| resolve_sym(n).ok_or(Bail);
+        let kw = |f: BlissVal| -> Option<String> {
+            f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
+        };
+        let top = resolve_sym(&format!("%LG-TOP{id}")).ok_or(Bail)?;
+        let end = resolve_sym(&format!("%LG-END{id}")).ok_or(Bail)?;
+
+        let mut bindings: Vec<BlissVal> = Vec::new();
+        let mut top_tests: Vec<BlissVal> = Vec::new();
+        let mut pre: Vec<BlissVal> = Vec::new();
+        let mut body: Vec<BlissVal> = Vec::new();
+        let mut steps: Vec<BlissVal> = Vec::new();
+        let mut initially: Vec<BlissVal> = Vec::new();
+        let mut finally: Vec<BlissVal> = Vec::new();
+        let mut finalize: Vec<BlissVal> = Vec::new();
+        let mut list_acc: Option<BlissVal> = None;
+        let mut sum_acc: Option<BlissVal> = None;
+        let mut count_acc: Option<BlissVal> = None;
+        let mut explicit_result = false;
+        let mut nsym = 0usize;
+        let mut fresh = |tag: &str, nsym: &mut usize| -> LowerResult<BlissVal> {
+            *nsym += 1;
+            resolve_sym(&format!("%LG-{tag}{id}_{}", *nsym)).ok_or(Bail)
+        };
+
+        let mut i = 0;
+        while i < forms.len() {
+            let key = kw(forms[i]);
+            match key.as_deref() {
+                Some("WITH") => {
+                    // with VAR [= EXPR] {and VAR [= EXPR]}*
+                    loop {
+                        let var = *forms.get(i + 1).ok_or(Bail)?;
+                        if !var.is_symbol() {
+                            return Err(Bail);
+                        }
+                        let (init, adv) =
+                            if kw(*forms.get(i + 2).ok_or(Bail)?).as_deref() == Some("=") {
+                                (*forms.get(i + 3).ok_or(Bail)?, 4)
+                            } else {
+                                (NIL, 2)
+                            };
+                        bindings.push(form_list(&[var, init]));
+                        i += adv;
+                        if kw(*forms.get(i).unwrap_or(&NIL)).as_deref() == Some("AND") {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                Some("FOR") | Some("AS") => {
+                    let var = *forms.get(i + 1).ok_or(Bail)?;
+                    match kw(*forms.get(i + 2).ok_or(Bail)?).as_deref() {
+                        Some("IN") | Some("ON") => {
+                            let on = kw(forms[i + 2]).as_deref() == Some("ON");
+                            let list = *forms.get(i + 3).ok_or(Bail)?;
+                            let lst = fresh("LST", &mut nsym)?;
+                            bindings.push(form_list(&[lst, list]));
+                            let mut adv = 4;
+                            // optional `by STEPFN`
+                            let step_expr = if kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref()
+                                == Some("BY")
+                            {
+                                let f = *forms.get(i + 5).ok_or(Bail)?;
+                                adv = 6;
+                                form_list(&[s("FUNCALL")?, f, lst])
+                            } else {
+                                form_list(&[s("CDR")?, lst])
+                            };
+                            top_tests.push(form_list(&[
+                                s("WHEN")?,
+                                form_list(&[s("NULL")?, lst]),
+                                form_list(&[s("GO")?, end]),
+                            ]));
+                            let cur = if on {
+                                lst
+                            } else {
+                                form_list(&[s("CAR")?, lst])
+                            };
+                            loop_pattern_assign(var, cur, &mut bindings, &mut pre)?;
+                            steps.push(form_list(&[s("SETQ")?, lst, step_expr]));
+                            i += adv;
+                        }
+                        Some("=") => {
+                            let expr = *forms.get(i + 3).ok_or(Bail)?;
+                            if !var.is_symbol() {
+                                return Err(Bail);
+                            }
+                            bindings.push(form_list(&[var, NIL]));
+                            pre.push(form_list(&[s("SETQ")?, var, expr]));
+                            i += 4;
+                        }
+                        Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
+                            if !var.is_symbol() {
+                                return Err(Bail);
+                            }
+                            let down = kw(forms[i + 2]).as_deref() == Some("DOWNFROM");
+                            let start = *forms.get(i + 3).ok_or(Bail)?;
+                            bindings.push(form_list(&[var, start]));
+                            let mut adv = 4;
+                            let mut limit: Option<(BlissVal, &str)> = None;
+                            match kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref() {
+                                Some("TO") | Some("UPTO") => {
+                                    limit = Some((*forms.get(i + 5).ok_or(Bail)?, "<="));
+                                    adv = 6;
+                                }
+                                Some("BELOW") => {
+                                    limit = Some((*forms.get(i + 5).ok_or(Bail)?, "<"));
+                                    adv = 6;
+                                }
+                                Some("DOWNTO") => {
+                                    limit = Some((*forms.get(i + 5).ok_or(Bail)?, ">="));
+                                    adv = 6;
+                                }
+                                Some("ABOVE") => {
+                                    limit = Some((*forms.get(i + 5).ok_or(Bail)?, ">"));
+                                    adv = 6;
+                                }
+                                _ => {}
+                            }
+                            let step = if kw(*forms.get(i + adv).unwrap_or(&NIL)).as_deref()
+                                == Some("BY")
+                            {
+                                let by = *forms.get(i + adv + 1).ok_or(Bail)?;
+                                adv += 2;
+                                by
+                            } else {
+                                BlissVal::from_fixnum(1)
+                            };
+                            if let Some((bound, cmp)) = limit {
+                                // terminate when var passes the bound
+                                let test_cmp = if cmp == "<=" {
+                                    ">"
+                                } else if cmp == "<" {
+                                    ">="
+                                } else if cmp == ">=" {
+                                    "<"
+                                } else {
+                                    "<="
+                                };
+                                top_tests.push(form_list(&[
+                                    s("WHEN")?,
+                                    form_list(&[s(test_cmp)?, var, bound]),
+                                    form_list(&[s("GO")?, end]),
+                                ]));
+                            }
+                            let op = if down { "-" } else { "+" };
+                            steps.push(form_list(&[
+                                s("SETQ")?,
+                                var,
+                                form_list(&[s(op)?, var, step]),
+                            ]));
+                            i += adv;
+                        }
+                        _ => return Err(Bail),
+                    }
+                }
+                Some("REPEAT") => {
+                    let n = *forms.get(i + 1).ok_or(Bail)?;
+                    let counter = fresh("REP", &mut nsym)?;
+                    bindings.push(form_list(&[counter, n]));
+                    top_tests.push(form_list(&[
+                        s("WHEN")?,
+                        form_list(&[s("<=")?, counter, BlissVal::from_fixnum(0)]),
+                        form_list(&[s("GO")?, end]),
+                    ]));
+                    steps.push(form_list(&[
+                        s("SETQ")?,
+                        counter,
+                        form_list(&[s("1-")?, counter]),
+                    ]));
+                    i += 2;
+                }
+                Some("WHILE") => {
+                    let test = *forms.get(i + 1).ok_or(Bail)?;
+                    top_tests.push(form_list(&[
+                        s("WHEN")?,
+                        form_list(&[s("NOT")?, test]),
+                        form_list(&[s("GO")?, end]),
+                    ]));
+                    i += 2;
+                }
+                Some("UNTIL") => {
+                    let test = *forms.get(i + 1).ok_or(Bail)?;
+                    top_tests.push(form_list(&[
+                        s("WHEN")?,
+                        test,
+                        form_list(&[s("GO")?, end]),
+                    ]));
+                    i += 2;
+                }
+                Some("DO") | Some("DOING") => {
+                    i += 1;
+                    while i < forms.len() && kw(forms[i]).is_none() {
+                        body.push(forms[i]);
+                        i += 1;
+                    }
+                }
+                Some("INITIALLY") => {
+                    i += 1;
+                    while i < forms.len() && kw(forms[i]).is_none() {
+                        initially.push(forms[i]);
+                        i += 1;
+                    }
+                }
+                Some("FINALLY") => {
+                    i += 1;
+                    while i < forms.len() && kw(forms[i]).is_none() {
+                        finally.push(forms[i]);
+                        i += 1;
+                    }
+                }
+                Some("RETURN") => {
+                    let e = *forms.get(i + 1).ok_or(Bail)?;
+                    body.push(form_list(&[s("RETURN")?, e]));
+                    explicit_result = true;
+                    i += 2;
+                }
+                Some("WHEN") | Some("IF") | Some("UNLESS") => {
+                    let negate = key.as_deref() == Some("UNLESS");
+                    let test = *forms.get(i + 1).ok_or(Bail)?;
+                    i += 2;
+                    let mut acc_forms = Vec::new();
+                    parse_loop_accumulations(
+                        forms,
+                        &mut i,
+                        &kw,
+                        &mut bindings,
+                        &mut finalize,
+                        &mut list_acc,
+                        &mut sum_acc,
+                        &mut count_acc,
+                        &mut nsym,
+                        id,
+                        &mut acc_forms,
+                    )?;
+                    if acc_forms.is_empty() {
+                        return Err(Bail);
+                    }
+                    let mut progn = vec![s("PROGN")?];
+                    progn.extend(acc_forms);
+                    let guard = if negate { "UNLESS" } else { "WHEN" };
+                    body.push(form_list(&[s(guard)?, test, form_list(&progn)]));
+                }
+                Some("COLLECT") | Some("COLLECTING") | Some("APPEND") | Some("APPENDING")
+                | Some("NCONC") | Some("NCONCING") | Some("SUM") | Some("SUMMING")
+                | Some("COUNT") | Some("COUNTING") => {
+                    let mut acc_forms = Vec::new();
+                    parse_loop_accumulations(
+                        forms,
+                        &mut i,
+                        &kw,
+                        &mut bindings,
+                        &mut finalize,
+                        &mut list_acc,
+                        &mut sum_acc,
+                        &mut count_acc,
+                        &mut nsym,
+                        id,
+                        &mut acc_forms,
+                    )?;
+                    body.extend(acc_forms);
+                }
+                _ => return Err(Bail),
+            }
+        }
+
+        // Assemble the result value.
+        let result = if let Some(acc) = list_acc {
+            form_list(&[s("NREVERSE")?, acc])
+        } else if let Some(acc) = sum_acc {
+            acc
+        } else if let Some(acc) = count_acc {
+            acc
+        } else {
+            NIL
+        };
+
+        // (tagbody %top <tests> <pre> <body> <steps> (go %top) %end)
+        let mut tb = vec![s("TAGBODY")?, top];
+        tb.extend(top_tests);
+        tb.extend(pre);
+        tb.extend(body);
+        tb.extend(steps);
+        tb.push(form_list(&[s("GO")?, top]));
+        tb.push(end);
+        let tagbody = form_list(&tb);
+
+        // (let* (bindings) initially... tagbody finalize... finally... result)
+        let mut let_items = vec![s("LET*")?, vec_to_list(&bindings)];
+        let_items.extend(initially);
+        let_items.push(tagbody);
+        let_items.extend(finalize);
+        let_items.extend(finally);
+        // The result is unreachable only if an explicit RETURN always fires; it is
+        // still a valid trailing form.
+        let _ = explicit_result;
+        let_items.push(result);
+        let let_form = vec_to_list(&let_items);
+
+        self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
     }
 
     /// `(loop repeat COUNT {do ...|collect EXPR|sum EXPR|count EXPR})`.
@@ -2852,6 +3190,39 @@ impl<'e> Lowerer<'e> {
         Ok(())
     }
 
+    /// `(assert test [places [format-control format-args...]])` — portable
+    /// subset: lower to `(unless test (error …))`. The interactive
+    /// restart/retry protocol and `places` re-reads are not represented (they
+    /// require the debugger), which is sound for compiled non-interactive code.
+    /// The opportunistic compiler keeps the tree-walker's full ASSERT.
+    fn lower_assert(&mut self, rest: BlissVal) -> LowerResult<()> {
+        if !self.portable {
+            return Err(Bail);
+        }
+        let (test, after) = cp(rest);
+        // Skip the optional `places` list; take format-control + args if present.
+        let error_form = if after.is_cons() {
+            let (_places, fmt_and_args) = cp(after);
+            if fmt_and_args.is_cons() {
+                let mut items = vec![resolve_sym("ERROR").ok_or(Bail)?];
+                items.extend(list_to_vec(fmt_and_args));
+                vec_to_list(&items)
+            } else {
+                form_list(&[
+                    resolve_sym("ERROR").ok_or(Bail)?,
+                    arena_str("Assertion failed"),
+                ])
+            }
+        } else {
+            form_list(&[
+                resolve_sym("ERROR").ok_or(Bail)?,
+                arena_str("Assertion failed"),
+            ])
+        };
+        let unless = form_list(&[resolve_sym("UNLESS").ok_or(Bail)?, test, error_form]);
+        self.lower_expr(unless)
+    }
+
     /// `(multiple-value-call fn form...)` — apply `fn` to all values produced by
     /// each `form`, concatenated. Lowered portably as
     /// `(apply fn (append (multiple-value-list f1) (multiple-value-list f2) …))`,
@@ -3404,6 +3775,131 @@ fn compile_capturing_local(
         max_args,
         variadic,
     })
+}
+
+/// Recognize a `(car|first|cdr|rest X)` SETF place, returning the internal
+/// store primitive name and the cons subform `X`.
+fn cons_setf_place(place: BlissVal) -> Option<(&'static str, BlissVal)> {
+    if !place.is_cons() {
+        return None;
+    }
+    let (op, rest) = cp(place);
+    if !op.is_symbol() || !rest.is_cons() {
+        return None;
+    }
+    let (arg, tail) = cp(rest);
+    if !tail.is_nil() {
+        return None; // exactly one argument
+    }
+    match symbol_bare_name(&sym_name(op)).as_str() {
+        "CAR" | "FIRST" => Some(("BLISS::SET-CAR", arg)),
+        "CDR" | "REST" => Some(("BLISS::SET-CDR", arg)),
+        _ => None,
+    }
+}
+
+/// Emit `let*` binding + `setq` assignment pairs that bind a LOOP iteration
+/// variable, which may be a destructuring cons pattern, from `value`.
+fn loop_pattern_assign(
+    pattern: BlissVal,
+    value: BlissVal,
+    bindings: &mut Vec<BlissVal>,
+    assigns: &mut Vec<BlissVal>,
+) -> LowerResult<()> {
+    let s = |n: &str| resolve_sym(n).ok_or(Bail);
+    if pattern.is_nil() {
+        return Ok(());
+    }
+    if pattern.is_symbol() {
+        bindings.push(form_list(&[pattern, NIL]));
+        assigns.push(form_list(&[s("SETQ")?, pattern, value]));
+        return Ok(());
+    }
+    if !pattern.is_cons() {
+        return Err(Bail);
+    }
+    let (h, t) = cp(pattern);
+    loop_pattern_assign(h, form_list(&[s("CAR")?, value]), bindings, assigns)?;
+    loop_pattern_assign(t, form_list(&[s("CDR")?, value]), bindings, assigns)
+}
+
+/// Parse one or more LOOP accumulation clauses joined by `and`
+/// (`{collect|append|nconc|sum|count} EXPR`), appending the per-iteration
+/// `setq` forms to `out` and lazily creating the shared accumulators. `into` is
+/// not supported and bails. All list accumulators use the push-and-reverse
+/// convention (`cons`/`revappend` now, `nreverse` in the result), so `collect`,
+/// `append`, and `nconc` compose into one shared list.
+#[allow(clippy::too_many_arguments)]
+fn parse_loop_accumulations(
+    forms: &[BlissVal],
+    i: &mut usize,
+    kw: &dyn Fn(BlissVal) -> Option<String>,
+    bindings: &mut Vec<BlissVal>,
+    _finalize: &mut Vec<BlissVal>,
+    list_acc: &mut Option<BlissVal>,
+    sum_acc: &mut Option<BlissVal>,
+    count_acc: &mut Option<BlissVal>,
+    nsym: &mut usize,
+    id: u32,
+    out: &mut Vec<BlissVal>,
+) -> LowerResult<()> {
+    let s = |n: &str| resolve_sym(n).ok_or(Bail);
+    loop {
+        let op = kw(forms[*i]).ok_or(Bail)?;
+        let expr = *forms.get(*i + 1).ok_or(Bail)?;
+        *i += 2;
+        if kw(*forms.get(*i).unwrap_or(&NIL)).as_deref() == Some("INTO") {
+            return Err(Bail); // `into` not supported yet
+        }
+        match op.as_str() {
+            "COLLECT" | "COLLECTING" | "APPEND" | "APPENDING" | "NCONC" | "NCONCING" => {
+                if list_acc.is_none() {
+                    *nsym += 1;
+                    let acc = resolve_sym(&format!("%LG-ACC{id}_{}", *nsym)).ok_or(Bail)?;
+                    bindings.push(form_list(&[acc, NIL]));
+                    *list_acc = Some(acc);
+                }
+                let acc = list_acc.unwrap();
+                let pushed = if op.starts_with("COLLECT") {
+                    form_list(&[s("CONS")?, expr, acc])
+                } else {
+                    form_list(&[s("REVAPPEND")?, expr, acc])
+                };
+                out.push(form_list(&[s("SETQ")?, acc, pushed]));
+            }
+            "SUM" | "SUMMING" => {
+                if sum_acc.is_none() {
+                    *nsym += 1;
+                    let acc = resolve_sym(&format!("%LG-SUM{id}_{}", *nsym)).ok_or(Bail)?;
+                    bindings.push(form_list(&[acc, BlissVal::from_fixnum(0)]));
+                    *sum_acc = Some(acc);
+                }
+                let acc = sum_acc.unwrap();
+                out.push(form_list(&[s("SETQ")?, acc, form_list(&[s("+")?, acc, expr])]));
+            }
+            "COUNT" | "COUNTING" => {
+                if count_acc.is_none() {
+                    *nsym += 1;
+                    let acc = resolve_sym(&format!("%LG-CNT{id}_{}", *nsym)).ok_or(Bail)?;
+                    bindings.push(form_list(&[acc, BlissVal::from_fixnum(0)]));
+                    *count_acc = Some(acc);
+                }
+                let acc = count_acc.unwrap();
+                out.push(form_list(&[
+                    s("WHEN")?,
+                    expr,
+                    form_list(&[s("SETQ")?, acc, form_list(&[s("1+")?, acc])]),
+                ]));
+            }
+            _ => return Err(Bail),
+        }
+        if kw(*forms.get(*i).unwrap_or(&NIL)).as_deref() == Some("AND") {
+            *i += 1;
+            continue;
+        }
+        break;
+    }
+    Ok(())
 }
 
 /// True if `body` (a list of forms) syntactically uses `RETURN-FROM` anywhere
