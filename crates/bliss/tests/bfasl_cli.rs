@@ -220,6 +220,62 @@ fn nested_quasiquote_macro_bfasl_round_trips() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A non-local `return-from` to an enclosing block — from the function's own
+/// implicit block, from a capturing `labels` local, and from a noncapturing
+/// lambda passed to `mapcar` — must compile source-free and unwind correctly
+/// across the closure-call boundary from a fresh process.
+#[test]
+fn nonlocal_return_from_bfasl_round_trips() {
+    let dir = workdir("nonlocal-return");
+    let src = dir.join("r.lisp");
+    let out = dir.join("r.bfasl");
+    fs::write(
+        &src,
+        "(defun direct-rf (x) (if (> x 0) (return-from direct-rf :pos) :nonpos))\n\
+         (defun find-even (xs)\n\
+        \x20 (block found\n\
+        \x20   (labels ((scan (l) (when l (if (evenp (car l)) (return-from found (car l)) (scan (cdr l))))))\n\
+        \x20     (scan xs))\n\
+        \x20   :none))\n\
+         (defun any-big (xs)\n\
+        \x20 (block done\n\
+        \x20   (mapcar (lambda (x) (when (> x 100) (return-from done :big))) xs)\n\
+        \x20   :all-small))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+
+    let l = run(&format!(
+        "(progn (load \"{}\") \
+           (list (direct-rf 5) (direct-rf -1) \
+                 (find-even '(1 3 4 5)) (find-even '(1 3 5)) \
+                 (any-big '(1 200 3)) (any-big '(1 2 3))))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "(:POS :NONPOS 4 :NONE :BIG :ALL-SMALL)",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Parallel `loop for X in L1 for Y in L2 collect …` must lower to source-free
 /// bytecode and step the lists in lockstep, stopping when the shorter list is
 /// exhausted (CL parallel-iteration semantics).

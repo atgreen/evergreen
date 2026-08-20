@@ -565,6 +565,10 @@ struct Lowerer<'e> {
     next_id: u32,
     /// Lexically enclosing blocks: `(name, block_id)`, innermost last.
     block_scope: Vec<(String, u32)>,
+    /// Names of blocks established in an *enclosing* function that this body (a
+    /// capturing closure) may still `return-from` non-locally, resolved at run
+    /// time through the shared block-token stack.
+    enclosing_blocks: std::collections::HashSet<String>,
     /// Lexically enclosing tagbodies: `(tagbody_id, tag → target bcp)`.
     tag_scope: Vec<TagScope>,
     /// `Go` instructions awaiting target-bcp patching once their tagbody's tag
@@ -610,6 +614,7 @@ impl<'e> Lowerer<'e> {
             max_stack: 0,
             next_id: 0,
             block_scope: Vec::new(),
+            enclosing_blocks: std::collections::HashSet::new(),
             tag_scope: Vec::new(),
             pending_gos: Vec::new(),
             handler_cases: Vec::new(),
@@ -1618,15 +1623,9 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         let name = sym_name(name_form);
-        let block_id = match self.block_scope.iter().rev().find(|(n, _)| *n == name) {
-            Some((_, id)) => *id,
-            // Block is not lexically in this function (a closed-over block is a
-            // nmq.5 concern) — bail.
-            None => return Err(Bail),
-        };
         let val_form = if vrest.is_cons() { cp(vrest).0 } else { NIL };
         self.lower_expr(val_form)?; // +1
-        self.emit(Instr::ReturnFrom { block_id });
+        self.emit_return_from(&name)?;
         // ReturnFrom transfers control; model it as consuming the value and
         // notionally yielding one (the trailing slot is dead code).
         self.pop_n(1);
@@ -1634,15 +1633,29 @@ impl<'e> Lowerer<'e> {
         Ok(())
     }
 
+    /// Emit the appropriate `return-from` transfer for block `name`: a local
+    /// `ReturnFrom` when the block is lexical to this function, or a
+    /// `ReturnFromNamed` when it lives in an enclosing function this body closes
+    /// over. Bails if the block is neither.
+    fn emit_return_from(&mut self, name: &str) -> LowerResult<()> {
+        if let Some((_, id)) = self.block_scope.iter().rev().find(|(n, _)| n == name) {
+            let block_id = *id;
+            self.emit(Instr::ReturnFrom { block_id });
+            return Ok(());
+        }
+        if self.enclosing_blocks.contains(name) {
+            let name_idx = self.intern_name(name);
+            self.emit(Instr::ReturnFromNamed { name_idx });
+            return Ok(());
+        }
+        Err(Bail)
+    }
+
     /// `(return value?)` == `(return-from nil value?)`.
     fn lower_return(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let block_id = match self.block_scope.iter().rev().find(|(n, _)| n == "NIL") {
-            Some((_, id)) => *id,
-            None => return Err(Bail),
-        };
         let val_form = if rest.is_cons() { cp(rest).0 } else { NIL };
         self.lower_expr(val_form)?;
-        self.emit(Instr::ReturnFrom { block_id });
+        self.emit_return_from("NIL")?;
         self.pop_n(1);
         self.push_n(1);
         Ok(())
@@ -2930,9 +2943,23 @@ impl<'e> Lowerer<'e> {
         body: BlissVal,
         captured: &[String],
     ) -> LowerResult<()> {
+        let enclosing_blocks: std::collections::HashSet<String> = self
+            .block_scope
+            .iter()
+            .map(|(n, _)| n.clone())
+            .chain(self.enclosing_blocks.iter().cloned())
+            .collect();
         let bf = if captured.is_empty() {
-            compile_function("<lambda>", params_form, body, self.env, self.portable, false)
-                .ok_or(Bail)?
+            compile_function_in(
+                "<lambda>",
+                params_form,
+                body,
+                self.env,
+                self.portable,
+                false,
+                &enclosing_blocks,
+            )
+            .ok_or(Bail)?
         } else {
             // A capturing lambda reaches the enclosing lexicals through the heap
             // frame it captures. Every captured variable must be boxed (in the
@@ -2953,8 +2980,16 @@ impl<'e> Lowerer<'e> {
                 .collect();
             self.has_env = true;
             let callable = self.closure_fns.clone();
-            compile_capturing_local(params_form, body, self.env, &captures, &callable, self.portable)
-                .ok_or(Bail)?
+            compile_capturing_local(
+                params_form,
+                body,
+                self.env,
+                &captures,
+                &callable,
+                &enclosing_blocks,
+                self.portable,
+            )
+            .ok_or(Bail)?
         };
         let idx = self.nested_functions.len();
         if idx > u32::MAX as usize {
@@ -3214,6 +3249,15 @@ impl<'e> Lowerer<'e> {
             self.closure_fns.insert(name.clone());
         }
 
+        // Blocks the closures may non-locally return-from: this function's live
+        // blocks plus any it already inherits.
+        let enclosing_blocks: std::collections::HashSet<String> = self
+            .block_scope
+            .iter()
+            .map(|(n, _)| n.clone())
+            .chain(self.enclosing_blocks.iter().cloned())
+            .collect();
+
         // Build each closure and store it in the child frame.
         for (name, _gensym, params_form, fbody) in parsed {
             let bf = compile_capturing_local(
@@ -3222,6 +3266,7 @@ impl<'e> Lowerer<'e> {
                 self.env,
                 &captures,
                 &callable,
+                &enclosing_blocks,
                 self.portable,
             )
             .ok_or(Bail)?;
@@ -3311,6 +3356,7 @@ fn compile_capturing_local(
     env: &Env,
     captures: &std::collections::HashSet<String>,
     callable: &std::collections::HashSet<String>,
+    enclosing_blocks: &std::collections::HashSet<String>,
     portable: bool,
 ) -> Option<BytecodeFunction> {
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
@@ -3319,6 +3365,7 @@ fn compile_capturing_local(
     lo.captured_names = compute_captured_names(fbody);
     lo.has_env = true;
     lo.closure_fns = callable.clone();
+    lo.enclosing_blocks = enclosing_blocks.clone();
     for name in captures {
         lo.scopes[0].insert(name.clone(), VarLoc::Boxed);
     }
@@ -3357,6 +3404,29 @@ fn compile_capturing_local(
         max_args,
         variadic,
     })
+}
+
+/// True if `body` (a list of forms) syntactically uses `RETURN-FROM` anywhere
+/// (outside quoted data). A conservative over-approximation used to decide
+/// whether a function needs its implicit block established.
+fn body_uses_return_from(body: BlissVal) -> bool {
+    fn walk(form: BlissVal) -> bool {
+        if !form.is_cons() {
+            return false;
+        }
+        let (car, cdr) = cp(form);
+        if car.is_symbol() {
+            let n = symbol_bare_name(&sym_name(car));
+            if n == "RETURN-FROM" {
+                return true;
+            }
+            if n == "QUOTE" {
+                return false;
+            }
+        }
+        walk(car) || walk(cdr)
+    }
+    list_to_vec(body).into_iter().any(walk)
 }
 
 /// Append `let*` bindings that destructure `pattern` against the value held in
@@ -4002,6 +4072,29 @@ fn compile_function(
     portable: bool,
     macro_lambda_list: bool,
 ) -> Option<BytecodeFunction> {
+    compile_function_in(
+        name,
+        params_form,
+        body,
+        env,
+        portable,
+        macro_lambda_list,
+        &std::collections::HashSet::new(),
+    )
+}
+
+/// As [`compile_function`], but with a set of enclosing block names the body may
+/// non-locally `return-from` (used when compiling a lambda nested in another
+/// function). Top-level definitions pass an empty set.
+fn compile_function_in(
+    name: &str,
+    params_form: BlissVal,
+    body: BlissVal,
+    env: &Env,
+    portable: bool,
+    macro_lambda_list: bool,
+    enclosing_blocks: &std::collections::HashSet<String>,
+) -> Option<BytecodeFunction> {
     // Parse the lambda list. Fixed and variadic (&optional/&rest/&key/&aux) are
     // both supported (x5y.7); destructuring / unknown keywords still bail.
     let parsed = if macro_lambda_list {
@@ -4020,6 +4113,7 @@ fn compile_function(
     let mut lo = Lowerer::new(env);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(body);
+    lo.enclosing_blocks = enclosing_blocks.clone();
     let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
         let loc = lo.alloc_local(pn);
@@ -4030,6 +4124,25 @@ fn compile_function(
     } else {
         declared_parameter_types(body, &param_names)?
     };
+
+    // A named DEFUN/DEFMACRO body runs inside an implicit block named after the
+    // function, so `(return-from NAME …)` exits it (directly or from a nested
+    // closure). Only establish it when the body actually uses RETURN-FROM, to
+    // avoid a per-call block handler for the common case. Lambdas ("<lambda>")
+    // have no implicit block.
+    let body = if name != "<lambda>" && body_uses_return_from(body) {
+        if let Some(block_sym) = resolve_sym(name) {
+            let block_op = resolve_sym("BLOCK")?;
+            let mut items = vec![block_op, block_sym];
+            items.extend(list_to_vec(body));
+            arena_cons(vec_to_list(&items), NIL)
+        } else {
+            body
+        }
+    } else {
+        body
+    };
+
     // Body as an implicit progn producing the return value.
     if lower_body(&mut lo, body).is_err() {
         return None;
@@ -4449,6 +4562,7 @@ fn bbu_instr_len(i: &Instr) -> Option<usize> {
         Instr::PopHandler => 1,
         Instr::Throw => 1,
         Instr::ReturnFrom { .. } => 5,
+        Instr::ReturnFromNamed { .. } => 5,
         Instr::Go { .. } => 9,
         Instr::EnterCleanupNormal { .. } => 9,
         Instr::CleanupReturn => 1,
@@ -4633,6 +4747,10 @@ fn serialize_bbu_function(
             Instr::ReturnFrom { block_id } => {
                 put_u8(&mut code, 0x1f);
                 put_u32(&mut code, *block_id);
+            }
+            Instr::ReturnFromNamed { name_idx } => {
+                put_u8(&mut code, 0x3f);
+                put_u32(&mut code, pool.string(bf.names.get(*name_idx as usize)?));
             }
             Instr::Go {
                 tagbody_id,
@@ -5679,6 +5797,17 @@ fn decode_bbu_function(
             0x1f => Instr::ReturnFrom {
                 block_id: cursor.u32()?,
             },
+            0x3f => {
+                let name = bbu_string_from_values(constants, cursor.u32()?)?;
+                let index = names.len();
+                if index > u16::MAX as usize {
+                    return Err(bbu_error("too many block names"));
+                }
+                names.push(name);
+                Instr::ReturnFromNamed {
+                    name_idx: index as u16,
+                }
+            }
             0x20 => Instr::PushCatch {
                 resume_bcp: cursor.u32()?,
                 sp_restore: cursor.u16()?,
@@ -7335,6 +7464,33 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
             Instr::ReturnFrom { block_id } => {
                 let value = acts[top_idx].pop_op();
                 initiate_unwind(acts, stack, env, Pending::Return { block_id, value })?;
+            }
+            Instr::ReturnFromNamed { name_idx } => {
+                // Non-local return from an enclosing block: resolve the block's
+                // control token by name on the shared block stack and unwind to
+                // it (like THROW to a CATCH). The unwind propagates out of this
+                // closure's `run` via the token→BlissError::Internal bridge and
+                // is resumed by the establishing function.
+                let name = acts[top_idx].func.names[name_idx as usize].clone();
+                let value = acts[top_idx].pop_op();
+                let token = env
+                    .block_stack
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, tok)| tok.clone());
+                match token {
+                    Some(tok) => {
+                        store_control_value(&tok, value);
+                        initiate_unwind(acts, stack, env, Pending::Token(tok))?;
+                    }
+                    None => {
+                        let e = BlissError::Internal(format!(
+                            "RETURN-FROM: no visible block {name}"
+                        ));
+                        initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
+                    }
+                }
             }
             Instr::Go {
                 tagbody_id,

@@ -118,6 +118,12 @@ pub enum Instr {
     Throw,
     /// Pop a value and return from the lexical block `block_id`.
     ReturnFrom { block_id: u32 },
+    /// Pop a value and return from an enclosing block named `names[name_idx]`
+    /// that was established outside this function — used when a capturing
+    /// closure performs a non-local `return-from` to a block in its defining
+    /// function. Resolved at run time through the shared block-token stack, so
+    /// the unwind crosses the closure-call boundary.
+    ReturnFromNamed { name_idx: u16 },
     /// Transfer to tag `target_bcp` within tagbody `tagbody_id`, running any
     /// intervening `UNWIND-PROTECT` cleanups.
     Go { tagbody_id: u32, target_bcp: u32 },
