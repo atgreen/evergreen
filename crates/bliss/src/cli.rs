@@ -3435,6 +3435,17 @@ fn with_eval_context<T>(
 
 // ── BlissVal printer ──────────────────────────────────────────────
 #[inline]
+/// Render a form for the `BLISS_BFASL_FORM` compile-file diagnostic (truncated).
+pub(super) fn fmt_form_debug(val: BlissVal) -> String {
+    let mut s = String::new();
+    print_val(val, &mut s);
+    if s.len() > 300 {
+        s.truncate(300);
+        s.push_str("…");
+    }
+    s
+}
+
 fn print_val(val: BlissVal, out: &mut String) {
     if val.is_nil() {
         out.push_str("NIL");

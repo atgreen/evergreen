@@ -5749,6 +5749,13 @@ pub fn build_bbu_from_forms(
         }
 
         if !done {
+            if std::env::var_os("BLISS_BFASL_FORM").is_some() {
+                eprintln!(
+                    "[bfasl] form {} failed: {}",
+                    form_index + 1,
+                    super::fmt_form_debug(form)
+                );
+            }
             return Err(BlissError::FileError(format!(
                 "compile-file: top-level form {} cannot be represented as portable bytecode",
                 form_index + 1
