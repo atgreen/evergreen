@@ -643,6 +643,23 @@ fn function_name_key(name_form: BlissVal) -> String {
     sym_name(name_form)
 }
 
+/// The interned-symbol name under which a source-free `(defun (setf place) …)`
+/// writer is installed and looked up. `place_name` is `sym_name(place)`; both
+/// the compile-file installer and the SETF store path compute it the same way,
+/// so the same symbol identity is used at install and at call. Colons are
+/// sanitized so the whole thing reads back as one symbol in BLISS-INTERNAL.
+pub(super) fn setf_writer_symbol_name(place_name: &str) -> String {
+    format!("BLISS-INTERNAL::%SETF-WRITER-{}", place_name.replace(':', "."))
+}
+
+/// Whether `place_name` (an accessor's `sym_name`) has a user `(defun (setf
+/// place) …)` writer known at compile time (registered as a global setf writer).
+/// Used by the portable SETF lowering to recognize a user setf-function place.
+pub(super) fn env_has_setf_writer(place_name: &str) -> bool {
+    let key = format!("(SETF {place_name})");
+    GLOBAL_SETF_FNS.with(|m| m.borrow().contains_key(&key))
+}
+
 fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
     if let Some(fdef) = env.funs.borrow().get(name) {
         return Some((fdef.params_form, fdef.body));
@@ -7517,6 +7534,30 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         val,
                                         env,
                                     )?;
+                                } else if let Some(writer_sym) = resolve_sym(
+                                    &setf_writer_symbol_name(other),
+                                )
+                                .filter(|s| bytecode::is_registered(s.as_symbol_index()))
+                                {
+                                    // A source-free `(defun (setf place) …)` writer
+                                    // installed from a .bfasl: dispatch its
+                                    // registered bytecode with the new value first,
+                                    // then the place's subforms.
+                                    let mut args = vec![val];
+                                    let mut ac = aargs;
+                                    while ac.is_cons() {
+                                        let (af, ar) = cp(ac);
+                                        args.push(eval_form(af, env)?);
+                                        ac = ar;
+                                    }
+                                    if let Some(res) = bytecode::call_registered(
+                                        writer_sym.as_symbol_index(),
+                                        &args,
+                                        writer_sym,
+                                        env,
+                                    ) {
+                                        res?;
+                                    }
                                 } else if let Some((params_form, body)) =
                                     callable_body(env, &format!("(SETF {})", other))
                                 {

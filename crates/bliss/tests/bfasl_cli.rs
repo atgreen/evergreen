@@ -103,6 +103,54 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
     pos
 }
 
+/// A user `(defun (setf f) …)` writer and its use `(setf (f …) v)` must both
+/// lower to source-free bytecode (the writer installed under a canonical symbol,
+/// the use dispatched through it), and `setf` of composed `c[ad]+r` places must
+/// work. This is the shape of alexandria's `(setf lastcar)`.
+#[test]
+fn setf_function_and_cadr_places_bfasl_round_trip() {
+    let dir = workdir("setf-fn");
+    let src = dir.join("s.lisp");
+    let out = dir.join("s.bfasl");
+    fs::write(
+        &src,
+        "(defun (setf my2) (val list) (setf (cadr list) val) val)\n\
+         (defun use-writer (l) (setf (my2 l) 99) l)\n\
+         (defun set-caddr (l) (setf (caddr l) 7) l)\n\
+         (defun set-cddr (l) (setf (cddr l) '(x)) l)\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+
+    let l = run(&format!(
+        "(progn (load \"{}\") \
+           (list (use-writer (list 1 2 3)) (set-caddr (list 1 2 3)) (set-cddr (list 1 2 3))))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "((1 99 3) (1 2 7) (1 2 X))",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The extended LOOP grammar (`with`, `for … {in|on} … by`, conditional
 /// `collect … and collect`, `finally (return …)`, numeric `from … below`) and
 /// `setf` of a `cdr` place must all lower to source-free bytecode. This is the

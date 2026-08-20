@@ -111,6 +111,12 @@ fn registry_get(sym: u32) -> Option<Rc<BytecodeFunction>> {
     REGISTRY.with(|r| r.borrow().get(&sym).cloned())
 }
 
+/// Whether `sym` currently names a registered bytecode function (e.g. a
+/// source-free `(defun (setf place) …)` writer installed from a `.bfasl`).
+pub(super) fn is_registered(sym: u32) -> bool {
+    REGISTRY.with(|r| r.borrow().contains_key(&sym))
+}
+
 fn registry_put(sym: u32, f: Rc<BytecodeFunction>) {
     REGISTRY_GENERATION.with(|g| {
         let mut generations = g.borrow_mut();
@@ -1219,6 +1225,17 @@ impl<'e> Lowerer<'e> {
         let (bindings, body) = cp(rest);
         let binding_forms = list_to_vec(bindings);
 
+        // A binding captured by a lambda introduced *within* this let body — in
+        // particular one produced by a macro / compiler-macro expansion, e.g.
+        // alexandria's CURRY, which the enclosing function's up-front capture
+        // analysis never saw — must still be boxed. Merge this body's capture set
+        // now so `alloc_local` boxes those variables.
+        if self.portable {
+            for name in compute_captured_names(body) {
+                self.captured_names.insert(name);
+            }
+        }
+
         let saved_next_local = self.next_local;
         let special_count = binding_forms
             .iter()
@@ -1565,11 +1582,47 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
+            } else if let Some((writer, args)) = self.user_setf_writer_place(place) {
+                // `(setf (f a b) val)` for a user `(defun (setf f) …)` writer:
+                // call the writer as `(writer val a b)` (new value first, then the
+                // place subforms), which returns the stored value.
+                let sym = resolve_sym(&writer).ok_or(Bail)?.as_symbol_index();
+                self.lower_expr(val)?; // new value
+                let mut nargs = 1u16;
+                for arg in args {
+                    self.lower_expr(arg)?;
+                    nargs += 1;
+                }
+                self.emit(Instr::CallNamed { sym, nargs });
+                self.pop_n(nargs);
+                self.push_n(1); // result: the stored value
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
             } else {
                 return Err(Bail);
             }
         }
         Ok(())
+    }
+
+    /// Recognise a `(f a b …)` place whose accessor `f` has a user
+    /// `(defun (setf f) …)` writer, returning the mangled writer-symbol name and
+    /// the place's argument forms. Only in portable mode.
+    fn user_setf_writer_place(&self, place: BlissVal) -> Option<(String, Vec<BlissVal>)> {
+        if !self.portable || !place.is_cons() {
+            return None;
+        }
+        let (op, rest) = cp(place);
+        if !op.is_symbol() {
+            return None;
+        }
+        let name = sym_name(op);
+        if !super::env_has_setf_writer(&name) {
+            return None;
+        }
+        Some((super::setf_writer_symbol_name(&name), list_to_vec(rest)))
     }
 
     /// Recognise a `(gethash key table)` place — exactly two arguments, head
@@ -3777,8 +3830,11 @@ fn compile_capturing_local(
     })
 }
 
-/// Recognize a `(car|first|cdr|rest X)` SETF place, returning the internal
-/// store primitive name and the cons subform `X`.
+/// Recognize a `(cXr X)` SETF place — any `c[ad]+r` accessor plus `first`/`rest`
+/// — returning the internal store primitive (`BLISS::SET-CAR`/`SET-CDR`) and the
+/// target cons subform. For a composed accessor the outermost a/d selects the
+/// primitive and the remaining a/d letters form the inner accessor applied to
+/// `X` (e.g. `(cadr x)` → set-car of `(cdr x)`).
 fn cons_setf_place(place: BlissVal) -> Option<(&'static str, BlissVal)> {
     if !place.is_cons() {
         return None;
@@ -3791,11 +3847,32 @@ fn cons_setf_place(place: BlissVal) -> Option<(&'static str, BlissVal)> {
     if !tail.is_nil() {
         return None; // exactly one argument
     }
-    match symbol_bare_name(&sym_name(op)).as_str() {
-        "CAR" | "FIRST" => Some(("BLISS::SET-CAR", arg)),
-        "CDR" | "REST" => Some(("BLISS::SET-CDR", arg)),
-        _ => None,
+    let name = match symbol_bare_name(&sym_name(op)).as_str() {
+        "FIRST" => "CAR".to_string(),
+        "REST" => "CDR".to_string(),
+        other => other.to_string(),
+    };
+    // c<a/d…>r
+    if name.len() < 3 || !name.starts_with('C') || !name.ends_with('R') {
+        return None;
     }
+    let middle = &name[1..name.len() - 1];
+    if middle.is_empty() || !middle.chars().all(|c| c == 'A' || c == 'D') {
+        return None;
+    }
+    let setter = if middle.starts_with('A') {
+        "BLISS::SET-CAR"
+    } else {
+        "BLISS::SET-CDR"
+    };
+    let inner = &middle[1..];
+    let target = if inner.is_empty() {
+        arg
+    } else {
+        let inner_name = format!("C{inner}R");
+        form_list(&[resolve_sym(&inner_name)?, arg])
+    };
+    Some((setter, target))
 }
 
 /// Emit `let*` binding + `setq` assignment pairs that bind a LOOP iteration
@@ -11598,12 +11675,30 @@ fn as_defun(form: BlissVal) -> Option<(String, BlissVal, BlissVal)> {
     if !op.is_symbol() || sym_name(op) != "DEFUN" {
         return None;
     }
-    let (name_sym, rest) = cp(rest);
-    if !name_sym.is_symbol() {
-        return None;
-    }
+    let (name_form, rest) = cp(rest);
     let (params, body) = cp(rest);
-    Some((sym_name(name_sym), params, body))
+    if name_form.is_symbol() {
+        return Some((sym_name(name_form), params, body));
+    }
+    // `(defun (setf place) …)`: install the writer under the canonical
+    // BLISS-INTERNAL setf-writer symbol so the SETF store path can dispatch it.
+    if name_form.is_cons() {
+        let (head, tail) = cp(name_form);
+        if head.is_symbol()
+            && symbol_bare_name(&sym_name(head)) == "SETF"
+            && tail.is_cons()
+        {
+            let (place, _) = cp(tail);
+            if place.is_symbol() {
+                return Some((
+                    super::setf_writer_symbol_name(&sym_name(place)),
+                    params,
+                    body,
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Match `(DEFMACRO name lambda-list . body)` or
