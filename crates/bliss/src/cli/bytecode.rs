@@ -5804,6 +5804,32 @@ pub fn build_bbu_from_forms(
             }
         }
 
+        // (2b) DEFINE-SETF-EXPANDER: the expander is a macro-like function of the
+        // place's subforms; compile it to bytecode and install it as a setf
+        // expander at load, exactly like a macro. (Without this the form would
+        // fall through to the thunk path and be miscompiled as a call that
+        // evaluates the accessor name as a variable.)
+        if !done {
+            if let Some((name, params, body)) = as_setf_expander_definition(form) {
+                if let Some(sym) = symbol_index_of(&name) {
+                    if let Some(name_ref) = pool.symbol_by_index(sym) {
+                        if let Some(bf) = compile_function(&name, params, body, env, true, true) {
+                            if let Some(function_index) = serialize_bbu_function_tree(
+                                &bf,
+                                name_ref,
+                                BBU_FUNC_MACRO,
+                                &mut pool,
+                                &mut functions,
+                            ) {
+                                load_actions.push((8, 0, function_index, name_ref, BBU_NO_INDEX));
+                                done = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // (3) Any form compilable to a serialisable thunk → run precompiled.
         if !done {
             match portable_load_thunk_form(form) {
@@ -6974,16 +7000,19 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                     _ => return Err(bbu_error("InstallFunction name is not a symbol")),
                 }
             }
-            4 | 5 => {
+            4 | 5 | 8 => {
                 if action.flags != 0 || action.arg2 != BBU_NO_INDEX {
                     return Err(bbu_error("macro installation has unsupported arguments"));
                 }
                 let function = &encoded_functions
                     [bbu_index(action.arg0, encoded_functions.len(), "macro function")?];
-                let expected = if action.kind == 4 {
-                    BBU_FUNC_MACRO
-                } else {
+                // A setf-expander (kind 8) and a macro (kind 4) both serialize as
+                // BBU_FUNC_MACRO expander functions; a compiler macro (kind 5) as
+                // BBU_FUNC_COMPILER_MACRO.
+                let expected = if action.kind == 5 {
                     BBU_FUNC_COMPILER_MACRO
+                } else {
+                    BBU_FUNC_MACRO
                 };
                 if function.flags & expected == 0 {
                     return Err(bbu_error("macro action references the wrong function role"));
@@ -7127,6 +7156,16 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 super::install_loaded_compiler_macro(
                     symbol,
                     Rc::clone(&functions[action.arg0 as usize]),
+                );
+                last = symbol;
+            }
+            8 => {
+                let symbol =
+                    constants[bbu_index(action.arg1, constants.len(), "setf expander name")?];
+                super::install_loaded_setf_expander(
+                    symbol,
+                    Rc::clone(&functions[action.arg0 as usize]),
+                    env,
                 );
                 last = symbol;
             }
@@ -11722,6 +11761,24 @@ fn as_macro_definition(form: BlissVal) -> Option<(bool, String, BlissVal, BlissV
     }
     let (params, body) = cp(rest);
     Some((compiler_macro, sym_name(name_sym), params, body))
+}
+
+/// Match `(DEFINE-SETF-EXPANDER access-fn lambda-list . body)`, returning the
+/// accessor name, the expander lambda list, and the body.
+fn as_setf_expander_definition(form: BlissVal) -> Option<(String, BlissVal, BlissVal)> {
+    if !form.is_cons() {
+        return None;
+    }
+    let (op, rest) = cp(form);
+    if !op.is_symbol() || symbol_bare_name(&sym_name(op)) != "DEFINE-SETF-EXPANDER" {
+        return None;
+    }
+    let (name_sym, rest) = cp(rest);
+    if !name_sym.is_symbol() {
+        return None;
+    }
+    let (params, body) = cp(rest);
+    Some((sym_name(name_sym), params, body))
 }
 
 /// Resolve a symbol name to its interned index via the reader.

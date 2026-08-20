@@ -1057,6 +1057,25 @@ fn install_loaded_macro(
     );
 }
 
+/// Install a source-free `(define-setf-expander place …)` writer loaded from a
+/// `.bfasl`: a setf expander whose body is the compiled bytecode function.
+fn install_loaded_setf_expander(
+    name: BlissVal,
+    function: Rc<bliss_rt::bytecode::BytecodeFunction>,
+    env: &Env,
+) {
+    install_evaluator_global_root_scanner();
+    env.setf_expanders.borrow_mut().insert(
+        sym_name(name),
+        SetfExpander::Expander(MacroDef {
+            params_form: NIL,
+            body: NIL,
+            captured_frame: Rc::clone(&env.frame),
+            bytecode: Some(Rc::new(RefCell::new((*function).clone()))),
+        }),
+    );
+}
+
 fn install_loaded_compiler_macro(
     name: BlissVal,
     function: Rc<bliss_rt::bytecode::BytecodeFunction>,
@@ -14060,18 +14079,28 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                     // read them there, not on the caller's env.
                     let mut child = env.child_with_parent(Rc::clone(&mdef.captured_frame));
                     let arg_list = list_to_vec(args);
-                    let macroexpand_env = if params_form_uses_environment(mdef.params_form) {
-                        Some(macroexpand_environment_from_cli(env))
+                    let first = if let Some(function) = &mdef.bytecode {
+                        // A source-free bytecode expander (loaded from a .bfasl):
+                        // run it like a macro; its (values …) land on the child mv.
+                        bytecode::run_macro(
+                            Rc::new(function.borrow().clone()),
+                            &arg_list,
+                            &mut child,
+                        )?
                     } else {
-                        None
+                        let macroexpand_env = if params_form_uses_environment(mdef.params_form) {
+                            Some(macroexpand_environment_from_cli(env))
+                        } else {
+                            None
+                        };
+                        bind_macro_lambda_list(
+                            mdef.params_form,
+                            &arg_list,
+                            &mut child,
+                            macroexpand_env.as_ref(),
+                        )?;
+                        eval_progn(mdef.body, &mut child)?
                     };
-                    bind_macro_lambda_list(
-                        mdef.params_form,
-                        &arg_list,
-                        &mut child,
-                        macroexpand_env.as_ref(),
-                    )?;
-                    let first = eval_progn(mdef.body, &mut child)?;
                     let mut values = if child.mv_active {
                         std::mem::take(&mut child.mv)
                     } else {
