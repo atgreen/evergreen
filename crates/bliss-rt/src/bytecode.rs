@@ -31,6 +31,12 @@ pub enum Instr {
     LoadGlobal(u32),
     /// Pop and store into the dynamic/global value of `sym` (`STORE_SPECIAL`).
     StoreGlobal(u32),
+    /// Push `sym` as a named function designator (`#'name`).
+    LoadFunction(u32),
+    /// Pop a value and dynamically bind the special variable `sym`.
+    BindSpecial(u32),
+    /// Remove the most recent `count` dynamic bindings.
+    UnbindSpecial(u16),
     /// Pop `n` values, set them as the multiple values, and push the primary
     /// (`VALUES`). `n = 0` pushes NIL.
     SetValues(u16),
@@ -62,6 +68,11 @@ pub enum Instr {
     /// Evaluate a `(lambda …)` constant with `env.frame` bound to this
     /// activation's heap `EnvFrame`, so the closure captures it (shared, live).
     MakeClosureEnv(u16),
+    /// Pop cdr then car, allocate a fresh cons, and push it. Quasiquote lowering
+    /// uses this instead of retaining an executable source template.
+    AllocCons,
+    /// Create a callable value for a nested, noncapturing bytecode function.
+    MakeClosure(u32),
     /// Discard the top of the operand stack.
     Pop,
     /// Duplicate the top of the operand stack.
@@ -165,6 +176,8 @@ pub struct BytecodeFunction {
     pub names: Vec<String>,
     /// Static per-`restart-case` tables (indexed by `PushRestartCase`).
     pub restart_cases: Vec<RestartCaseInfo>,
+    /// Nested bytecode bodies referenced by `MakeClosure`.
+    pub nested_functions: Vec<Box<BytecodeFunction>>,
     /// Per-parameter `(name, location)` for the entry sequence.
     pub param_layout: Vec<(String, VarLoc)>,
     /// Primitive parameter types retained from leading `TYPE` declarations.
@@ -235,11 +248,16 @@ pub enum VarLoc {
     Boxed,
 }
 
-/// Static description of one `restart-case` form. Each restart's clause is a
-/// `(lambda params . body)` form run by the shared INVOKE-RESTART machinery
-/// (in `env.frame`); the bytecode only catches the restart-invoked transfer and
-/// delivers the stored result.
+/// Static description of one `restart-case` form. Each restart clause is an
+/// independently lowered function. Keeping executable source forms here would
+/// make a BFASL depend on the reader/compiler at load time.
 #[derive(Debug, Clone)]
 pub struct RestartCaseInfo {
-    pub restarts: Vec<(String, BlissVal)>,
+    pub restarts: Vec<RestartClauseInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestartClauseInfo {
+    pub name: String,
+    pub function: Box<BytecodeFunction>,
 }

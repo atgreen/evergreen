@@ -1388,6 +1388,7 @@ mod tests {
             handler_binds: vec![],
             names: vec![],
             restart_cases: vec![],
+            nested_functions: vec![],
             param_layout: vec![],
             param_types: vec![],
             has_env: false,

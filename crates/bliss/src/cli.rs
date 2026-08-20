@@ -18,8 +18,8 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock, Mutex, Once, Weak};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, LazyLock, Mutex, Once, Weak};
 use std::thread::ThreadId;
 
 // ── CLI arguments ──────────────────────────────────────────────────
@@ -568,7 +568,13 @@ fn read_one_form_from_stream(
                 if let Ok((form, consumed)) = read_from_string_in_env(&buffer, env) {
                     let total = buffer.chars().count();
                     if consumed < total {
-                        for lc in buffer.chars().skip(consumed).collect::<Vec<_>>().into_iter().rev() {
+                        for lc in buffer
+                            .chars()
+                            .skip(consumed)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                        {
                             stream_push_char(stream, lc, env)?;
                         }
                         return Ok(Some(form));
@@ -651,7 +657,10 @@ fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
     }
     let f = global_fn(name)?;
     bliss_rt::function::record_invocation(f);
-    Some((bliss_rt::function::lambda_list(f), bliss_rt::function::body(f)))
+    Some((
+        bliss_rt::function::lambda_list(f),
+        bliss_rt::function::body(f),
+    ))
 }
 
 /// True if `val` is a keyword symbol (name in the KEYWORD package). Used to
@@ -910,6 +919,10 @@ enum RestartFunction {
         // Frozen snapshots dropped writes (bliss-gd4).
         captured_frame: Rc<RefCell<EnvFrame>>,
     },
+    Bytecode {
+        function: Rc<RefCell<bliss_rt::bytecode::BytecodeFunction>>,
+        captured_frame: Rc<RefCell<EnvFrame>>,
+    },
     ContinueNil,
 }
 
@@ -1000,6 +1013,7 @@ struct MacroFnCacheEntry {
     params_bits: u64,
     body_bits: u64,
     frame_ptr: usize,
+    bytecode_ptr: usize,
     handle: BlissVal,
     symbol: BlissVal,
 }
@@ -1045,7 +1059,7 @@ fn install_loaded_compiler_macro(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             let mut env = Env::new_for_macro_expansion(false);
-            bytecode::run(Rc::new(function), &list_to_vec(args), NIL, &mut env)
+            bytecode::run_macro(Rc::new(function), &list_to_vec(args), &mut env)
         }),
     );
 }
@@ -1252,7 +1266,9 @@ fn condition_report_string(env: &Env, cond: BlissVal) -> Option<String> {
     let is = |t: &str| names.iter().any(|n| n == t);
     if is("TYPE-ERROR") {
         let datum = read("DATUM").map(format_val).unwrap_or_else(|| "?".into());
-        let expected = read("EXPECTED-TYPE").map(format_val).unwrap_or_else(|| "?".into());
+        let expected = read("EXPECTED-TYPE")
+            .map(format_val)
+            .unwrap_or_else(|| "?".into());
         return Some(format!("The value {datum} is not of type {expected}."));
     }
     if is("UNBOUND-VARIABLE") {
@@ -1265,7 +1281,14 @@ fn condition_report_string(env: &Env, cond: BlissVal) -> Option<String> {
     }
     if is("PACKAGE-ERROR") {
         let pkg = read("PACKAGE").map(format_val).unwrap_or_default();
-        return Some(format!("Package error{}.", if pkg.is_empty() { String::new() } else { format!(": {pkg}") }));
+        return Some(format!(
+            "Package error{}.",
+            if pkg.is_empty() {
+                String::new()
+            } else {
+                format!(": {pkg}")
+            }
+        ));
     }
     // Fall back to the most specific class name.
     names.first().cloned()
@@ -1478,11 +1501,7 @@ fn signal_condition_object(condition: BlissVal, env: &mut Env) -> Result<BlissVa
 /// `split_off` (no deep clone of the whole stack) and appending it back
 /// afterwards; only the current cluster is cloned so it can be iterated while
 /// `env.handlers` is mutated.
-fn run_handler_cluster(
-    env: &mut Env,
-    condition: BlissVal,
-    ci: usize,
-) -> Result<(), BlissError> {
+fn run_handler_cluster(env: &mut Env, condition: BlissVal, ci: usize) -> Result<(), BlissError> {
     if ci >= env.handlers.len() {
         return Ok(());
     }
@@ -1604,11 +1623,7 @@ fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, Blis
     Ok(class)
 }
 
-fn resolve_slot_symbol(
-    class_name: &str,
-    key: BlissVal,
-    env: &Env,
-) -> Result<BlissVal, BlissError> {
+fn resolve_slot_symbol(class_name: &str, key: BlissVal, env: &Env) -> Result<BlissVal, BlissError> {
     let key_name = symbol_bare_name(&sym_name(key));
     if let Some(slot) = lookup_slot_by_initarg(env, class_name, &key_name) {
         return Ok(resolve_sym(&slot.name).unwrap_or(NIL));
@@ -1650,7 +1665,10 @@ fn lookup_slot_def(env: &Env, class_name: &str, slot_name: &str) -> Option<SlotD
 fn lookup_slot_by_initarg(env: &Env, class_name: &str, initarg: &str) -> Option<SlotDef> {
     let class_def = env.classes.borrow().get(class_name).cloned()?;
     if let Some(slot) = class_def.slots.iter().find(|slot| {
-        slot.initargs.iter().any(|slot_initarg| slot_initarg == initarg) || slot.name == initarg
+        slot.initargs
+            .iter()
+            .any(|slot_initarg| slot_initarg == initarg)
+            || slot.name == initarg
     }) {
         return Some(slot.clone());
     }
@@ -1738,7 +1756,9 @@ fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<Stri
         env.classes.borrow().iter().find_map(|(name, cd)| {
             cd.slots
                 .iter()
-                .any(|s| symbol_bare_name(&s.name) == slot_name && s.allocation == SlotAllocation::Class)
+                .any(|s| {
+                    symbol_bare_name(&s.name) == slot_name && s.allocation == SlotAllocation::Class
+                })
                 .then(|| name.clone())
         })
     })
@@ -1926,7 +1946,10 @@ fn apply_class_initforms(
         match slot.allocation {
             SlotAllocation::Class => {
                 if let Some(values) = class_slot_values.as_ref() {
-                    values.lock().unwrap().insert(slot.name.clone(), Some(value));
+                    values
+                        .lock()
+                        .unwrap()
+                        .insert(slot.name.clone(), Some(value));
                 }
             }
             SlotAllocation::Instance => {
@@ -2085,6 +2108,16 @@ fn invoke_restart_function(
             let mut restart_env = env.child_with_parent(Rc::clone(captured_frame));
             let function = eval_form(*function_form, &mut restart_env)?;
             apply_function(function, args, &mut restart_env)
+        }
+        RestartFunction::Bytecode {
+            function,
+            captured_frame,
+        } => {
+            let function = Rc::new(function.borrow().clone());
+            let saved = std::mem::replace(&mut env.frame, Rc::clone(captured_frame));
+            let result = bytecode::run(function, args, NIL, env);
+            env.frame = saved;
+            result
         }
         RestartFunction::ContinueNil => Ok(args.first().copied().unwrap_or(NIL)),
     }
@@ -2293,9 +2326,7 @@ fn run_initialization_aux_methods(
     let mut applicable: Vec<(MethodDef, Vec<usize>)> = methods
         .into_iter()
         .filter(|method| method.qualifier == qualifier)
-        .filter_map(|method| {
-            method_specificity_vector(env, &method, args).map(|key| (method, key))
-        })
+        .filter_map(|method| method_specificity_vector(env, &method, args).map(|key| (method, key)))
         .collect();
     applicable.sort_by(|a, b| a.1.cmp(&b.1));
     let mut ordered: Vec<MethodDef> = applicable.into_iter().map(|(method, _)| method).collect();
@@ -2532,13 +2563,39 @@ fn visit_restart_function_roots(
     state: &mut EnvRootVisitState,
     visit: &mut dyn FnMut(*mut BlissVal),
 ) {
-    if let RestartFunction::FunctionForm {
-        function_form,
-        captured_frame,
-    } = function
-    {
-        visit(function_form);
-        visit_env_frame_roots(captured_frame, state, visit);
+    match function {
+        RestartFunction::FunctionForm {
+            function_form,
+            captured_frame,
+        } => {
+            visit(function_form);
+            visit_env_frame_roots(captured_frame, state, visit);
+        }
+        RestartFunction::Bytecode {
+            function,
+            captured_frame,
+        } => {
+            visit_bytecode_function_roots(&mut function.borrow_mut(), visit);
+            visit_env_frame_roots(captured_frame, state, visit);
+        }
+        RestartFunction::ContinueNil => {}
+    }
+}
+
+fn visit_bytecode_function_roots(
+    function: &mut bliss_rt::bytecode::BytecodeFunction,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    for constant in &mut function.constants {
+        visit(constant);
+    }
+    for restart_case in &mut function.restart_cases {
+        for restart in &mut restart_case.restarts {
+            visit_bytecode_function_roots(&mut restart.function, visit);
+        }
+    }
+    for nested in &mut function.nested_functions {
+        visit_bytecode_function_roots(nested, visit);
     }
 }
 
@@ -2592,8 +2649,7 @@ fn visit_frozen_env_frame_roots(
     }
 }
 
-fn frozen_macro_captures()
--> &'static OrderedMutex<Vec<Weak<OrderedMutex<FrozenMacroCapture>>>> {
+fn frozen_macro_captures() -> &'static OrderedMutex<Vec<Weak<OrderedMutex<FrozenMacroCapture>>>> {
     static CAPTURES: std::sync::OnceLock<
         OrderedMutex<Vec<Weak<OrderedMutex<FrozenMacroCapture>>>>,
     > = std::sync::OnceLock::new();
@@ -3199,8 +3255,7 @@ impl Env {
         {
             let mut borrowed = frame.borrow_mut();
             let name = sym_name(BlissVal::from_symbol_index(symbol_index));
-            if borrowed.symbol_vars.contains_key(&symbol_index)
-                || borrowed.vars.contains_key(&name)
+            if borrowed.symbol_vars.contains_key(&symbol_index) || borrowed.vars.contains_key(&name)
             {
                 borrowed.symbol_vars.insert(symbol_index, val);
                 borrowed.vars.insert(name, val);
@@ -3819,7 +3874,11 @@ fn eval_quasiquote_depth(
         return Ok(template);
     }
     let (car, cdr) = cp(template);
-    let head = if car.is_symbol() { sym_name(car) } else { String::new() };
+    let head = if car.is_symbol() {
+        sym_name(car)
+    } else {
+        String::new()
+    };
 
     // (BLISS::UNQUOTE expr): evaluate at depth 1, else keep wrapper at depth-1.
     if head == "BLISS::UNQUOTE" {
@@ -3854,7 +3913,11 @@ fn eval_quasiquote_depth(
         // A nested backquote as an element must not be flattened element-wise.
         if elem.is_cons() {
             let (ecar, ecdr) = cp(elem);
-            let ecar_name = if ecar.is_symbol() { sym_name(ecar) } else { String::new() };
+            let ecar_name = if ecar.is_symbol() {
+                sym_name(ecar)
+            } else {
+                String::new()
+            };
             if ecar_name == "BLISS::UNQUOTE-SPLICING" {
                 let (splice_expr, _) = cp(ecdr);
                 if depth == 1 {
@@ -3875,9 +3938,7 @@ fn eval_quasiquote_depth(
                 let (inner_elem, _) = cp(ecdr);
                 if inner_elem.is_cons() {
                     let (icar, icdr) = cp(inner_elem);
-                    if icar.is_symbol()
-                        && sym_name(icar) == "BLISS::UNQUOTE-SPLICING"
-                        && depth == 2
+                    if icar.is_symbol() && sym_name(icar) == "BLISS::UNQUOTE-SPLICING" && depth == 2
                     {
                         let (splice_expr, _) = cp(icdr);
                         let splice_val = eval_form(splice_expr, env)?;
@@ -4203,10 +4264,7 @@ fn read_next_form_at(
 /// reader would — otherwise `PKG:NAME` for an inherited/re-exported symbol (e.g.
 /// `ASDF:FIND-SYSTEM`, homed in ASDF/SYSTEM) is mis-interned as a fresh symbol
 /// homed in PKG, with an empty function cell (bliss).
-fn read_from_string_in_env(
-    source: &str,
-    env: &mut Env,
-) -> Result<(BlissVal, usize), BlissError> {
+fn read_from_string_in_env(source: &str, env: &mut Env) -> Result<(BlissVal, usize), BlissError> {
     // Honour the reader specials. `*READ-EVAL*` defaults to T (so `#.` works in a
     // runtime READ, as in CL), and `*READ-BASE*` to 10.
     let read_eval = env
@@ -4378,9 +4436,9 @@ fn symbol_leaf_name(name: &str) -> &str {
 }
 
 fn eval_when_has_situation(situations: BlissVal, target: &str) -> bool {
-    list_to_vec(situations).into_iter().any(|situation| {
-        situation.is_symbol() && symbol_leaf_name(&sym_name(situation)) == target
-    })
+    list_to_vec(situations)
+        .into_iter()
+        .any(|situation| situation.is_symbol() && symbol_leaf_name(&sym_name(situation)) == target)
 }
 
 fn expand_compile_toplevel_form(mut form: BlissVal, env: &mut Env) -> BlissVal {
@@ -4444,6 +4502,15 @@ fn format_compile_note_date(unix_secs: u64) -> String {
 }
 
 fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
+    // DEFINE-CONDITION has a dedicated structural BFASL lowering. Expanding it
+    // here would flatten the boot macro into SETQ/DEFCLASS source forms and
+    // discard the boundary the portable load action needs.
+    if form.is_cons() {
+        let (op, _) = cp(form);
+        if op.is_symbol() && symbol_leaf_name(&sym_name(op)) == "DEFINE-CONDITION" {
+            return vec![form];
+        }
+    }
     let form = expand_compile_toplevel_form(form, env);
     if !form.is_cons() {
         return vec![form];
@@ -4924,9 +4991,7 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
         "FLOATING-POINT-OVERFLOW" => Some((vec!["ARITHMETIC-ERROR".into()], vec![])),
         "FLOATING-POINT-UNDERFLOW" => Some((vec!["ARITHMETIC-ERROR".into()], vec![])),
         "FLOATING-POINT-INEXACT" => Some((vec!["ARITHMETIC-ERROR".into()], vec![])),
-        "FLOATING-POINT-INVALID-OPERATION" => {
-            Some((vec!["ARITHMETIC-ERROR".into()], vec![]))
-        }
+        "FLOATING-POINT-INVALID-OPERATION" => Some((vec!["ARITHMETIC-ERROR".into()], vec![])),
         "CELL-ERROR" => Some((vec!["ERROR".into()], vec![("NAME".into(), "NAME".into())])),
         "UNBOUND-VARIABLE" => Some((vec!["CELL-ERROR".into()], vec![])),
         "UNDEFINED-FUNCTION" => Some((vec!["CELL-ERROR".into()], vec![])),
@@ -4941,17 +5006,26 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
                 ("EXPECTED-TYPE".into(), "EXPECTED-TYPE".into()),
             ],
         )),
-        "SIMPLE-TYPE-ERROR" => Some((
-            vec!["TYPE-ERROR".into(), "SIMPLE-CONDITION".into()],
-            vec![],
-        )),
+        "SIMPLE-TYPE-ERROR" => Some((vec!["TYPE-ERROR".into(), "SIMPLE-CONDITION".into()], vec![])),
         "CONTROL-ERROR" => Some((vec!["ERROR".into()], vec![])),
-        "FILE-ERROR" => Some((vec!["ERROR".into()], vec![("PATHNAME".into(), "PATHNAME".into())])),
-        "PACKAGE-ERROR" => Some((vec!["ERROR".into()], vec![("PACKAGE".into(), "PACKAGE".into())])),
+        "FILE-ERROR" => Some((
+            vec!["ERROR".into()],
+            vec![("PATHNAME".into(), "PATHNAME".into())],
+        )),
+        "PACKAGE-ERROR" => Some((
+            vec!["ERROR".into()],
+            vec![("PACKAGE".into(), "PACKAGE".into())],
+        )),
         "PARSE-ERROR" => Some((vec!["ERROR".into()], vec![])),
-        "PRINT-NOT-READABLE" => Some((vec!["ERROR".into()], vec![("OBJECT".into(), "OBJECT".into())])),
+        "PRINT-NOT-READABLE" => Some((
+            vec!["ERROR".into()],
+            vec![("OBJECT".into(), "OBJECT".into())],
+        )),
         "PROGRAM-ERROR" => Some((vec!["ERROR".into()], vec![])),
-        "STREAM-ERROR" => Some((vec!["ERROR".into()], vec![("STREAM".into(), "STREAM".into())])),
+        "STREAM-ERROR" => Some((
+            vec!["ERROR".into()],
+            vec![("STREAM".into(), "STREAM".into())],
+        )),
         "END-OF-FILE" => Some((vec!["STREAM-ERROR".into()], vec![])),
         "READER-ERROR" => Some((vec!["STREAM-ERROR".into(), "PARSE-ERROR".into()], vec![])),
         _ => None,
@@ -5083,11 +5157,7 @@ fn instance_class_hierarchy_names(object: BlissVal) -> Option<Vec<String>> {
             names.push(symbol_bare_name(&sym_name(name)));
         }
     }
-    if names.is_empty() {
-        None
-    } else {
-        Some(names)
-    }
+    if names.is_empty() { None } else { Some(names) }
 }
 
 fn condition_type_hierarchy_names(cond: BlissVal) -> Option<Vec<String>> {
@@ -5400,14 +5470,18 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                     return true;
                 }
                 let n = bound.as_fixnum();
-                if is_lower {
-                    value >= n
-                } else {
-                    value <= n
-                }
+                if is_lower { value >= n } else { value <= n }
             };
-            let lower_ok = bounds.first().copied().map(|b| bound_ok(b, true)).unwrap_or(true);
-            let upper_ok = bounds.get(1).copied().map(|b| bound_ok(b, false)).unwrap_or(true);
+            let lower_ok = bounds
+                .first()
+                .copied()
+                .map(|b| bound_ok(b, true))
+                .unwrap_or(true);
+            let upper_ok = bounds
+                .get(1)
+                .copied()
+                .map(|b| bound_ok(b, false))
+                .unwrap_or(true);
             Ok(lower_ok && upper_ok)
         }
         "UNSIGNED-BYTE" | "SIGNED-BYTE" | "MOD" => {
@@ -5426,9 +5500,7 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             });
             let ok = match op.as_str() {
                 // (unsigned-byte s) == (integer 0 (2^s - 1))
-                "UNSIGNED-BYTE" => {
-                    value >= 0 && size.map(|s| value < (1i64 << s)).unwrap_or(true)
-                }
+                "UNSIGNED-BYTE" => value >= 0 && size.map(|s| value < (1i64 << s)).unwrap_or(true),
                 // (signed-byte s) == (integer -2^(s-1) (2^(s-1) - 1))
                 "SIGNED-BYTE" => size
                     .map(|s| {
@@ -5603,8 +5675,8 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
         // A special LET binding of *PACKAGE* (as ASDF's DEFINE-OP does) lives in
         // the symbol's dynamic value cell; the root-frame lexical copy shadows it
         // for name lookup, so consult the cell first, then fall back to the var.
-        let cell_val = resolve_sym("*PACKAGE*")
-            .and_then(|s| global_value_cell(s.as_symbol_index()));
+        let cell_val =
+            resolve_sym("*PACKAGE*").and_then(|s| global_value_cell(s.as_symbol_index()));
         let pkg_val = cell_val.or_else(|| env.lookup_var("*PACKAGE*"));
         if let Some(pkg_val) = pkg_val {
             let pkg_name = resolve_package_name(env, &val_as_str(pkg_val));
@@ -5638,7 +5710,9 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
             return load_bfasl_into_env(&bytes, env);
         }
         let contents = String::from_utf8_lossy(&bytes).into_owned();
-        with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&contents, env))
+        with_eval_context(env, EvalContext::Load, |env| {
+            read_eval_all_env(&contents, env)
+        })
     })();
     if env.current_package != saved_package {
         env.current_package = saved_package.clone();
@@ -5673,8 +5747,7 @@ fn load_bfasl_into_env(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissErr
         .section(bliss_rt::bfasl::section::TOPLEVEL_FORMS)
         .ok_or_else(|| {
             BlissError::FileError(
-                "bfasl: missing authoritative BYTECODE_UNIT (and no legacy TOPLEVEL_FORMS)"
-                    .into(),
+                "bfasl: missing authoritative BYTECODE_UNIT (and no legacy TOPLEVEL_FORMS)".into(),
             )
         })?;
     let src = String::from_utf8_lossy(forms).into_owned();
@@ -6054,7 +6127,6 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (car, cdr) = cp(form);
     if car.is_symbol() {
         let name = sym_name(car);
-
 
         // Check for macro expansion first (lexical MACROLET macro, else global).
         if let Some(mdef) = lookup_macro(env, &name) {
@@ -6524,7 +6596,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let string = eval_form(args[0], env)?;
                 let start = if args.len() > 1 {
                     let v = eval_form(args[1], env)?;
-                    if v.is_fixnum() { v.as_fixnum() as usize } else { 0 }
+                    if v.is_fixnum() {
+                        v.as_fixnum() as usize
+                    } else {
+                        0
+                    }
                 } else {
                     0
                 };
@@ -6614,8 +6690,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "READ-FROM-STRING requires a string".into(),
                     ));
                 }
-                let vals: Vec<BlissVal> =
-                    args.iter().map(|a| eval_form(*a, env)).collect::<Result<_, _>>()?;
+                let vals: Vec<BlissVal> = args
+                    .iter()
+                    .map(|a| eval_form(*a, env))
+                    .collect::<Result<_, _>>()?;
                 let s = val_as_str(vals[0]);
                 let chars: Vec<char> = s.chars().collect();
                 let eof_error_p = vals.get(1).copied().unwrap_or(T);
@@ -6626,7 +6704,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut i = 3;
                 while i + 1 < vals.len() {
                     match symbol_bare_name(&sym_name(vals[i])).as_str() {
-                        "START" => start = val_as_str(vals[i + 1]).parse().ok().or_else(|| vals[i + 1].is_fixnum().then(|| vals[i + 1].as_fixnum() as usize)).unwrap_or(0),
+                        "START" => {
+                            start = val_as_str(vals[i + 1])
+                                .parse()
+                                .ok()
+                                .or_else(|| {
+                                    vals[i + 1]
+                                        .is_fixnum()
+                                        .then(|| vals[i + 1].as_fixnum() as usize)
+                                })
+                                .unwrap_or(0)
+                        }
                         "END" if !vals[i + 1].is_nil() => {
                             if vals[i + 1].is_fixnum() {
                                 end = vals[i + 1].as_fixnum() as usize;
@@ -6834,8 +6922,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (h, _) = cp(v);
                     h.is_symbol() && symbol_bare_name(&sym_name(h)) == "QUOTE"
                 } else if v.is_symbol() {
-                    is_keyword_arg(v)
-                        || CONSTANT_VARS.with(|c| c.borrow().contains(&sym_name(v)))
+                    is_keyword_arg(v) || CONSTANT_VARS.with(|c| c.borrow().contains(&sym_name(v)))
                 } else {
                     // Numbers, characters, strings, and other self-evaluating
                     // heap atoms are constant.
@@ -6843,7 +6930,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 return Ok(if is_const { T } else { NIL });
             }
-            "BLISS-INTERNAL::%MARK-CONSTANT" | "BLISS-INTERNAL:%MARK-CONSTANT"
+            "BLISS-INTERNAL::%MARK-CONSTANT"
+            | "BLISS-INTERNAL:%MARK-CONSTANT"
             | "%MARK-CONSTANT" => {
                 // (%mark-constant 'name) — record NAME as a DEFCONSTANT so
                 // CONSTANTP recognises it. Called by the DEFCONSTANT macro.
@@ -6853,6 +6941,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     CONSTANT_VARS.with(|c| c.borrow_mut().insert(sym_name(v)));
                 }
                 return Ok(v);
+            }
+            "BLISS-INTERNAL::%DEFINE-CONDITION-PORTABLE"
+            | "BLISS-INTERNAL:%DEFINE-CONDITION-PORTABLE"
+            | "%DEFINE-CONDITION-PORTABLE" => {
+                let forms = list_to_vec(cdr);
+                if forms.len() != 4 {
+                    return Err(BlissError::ProgramError(
+                        "%DEFINE-CONDITION-PORTABLE expects four arguments".into(),
+                    ));
+                }
+                let mut values = Vec::with_capacity(4);
+                for form in forms {
+                    values.push(eval_form(form, env)?);
+                }
+                return define_condition_portable(values[0], values[1], values[2], values[3], env);
             }
             "DOCUMENTATION" => {
                 // (documentation object &optional doc-type) — the interpreter
@@ -7384,7 +7487,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     )?;
                                 } else if {
                                     let key = format!("(SETF {})", other);
-                                    env.methods.borrow().contains_key(&key) || env.generics.borrow().contains_key(&key)
+                                    env.methods.borrow().contains_key(&key)
+                                        || env.generics.borrow().contains_key(&key)
                                 } {
                                     // A (setf place) *generic function* (defmethod
                                     // (setf place) …): dispatch it with the new
@@ -7617,13 +7721,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 };
                 let elems = vec![iel; size];
-                return Ok(bliss_stdlib::build_complex_vector(&elems, size, fp, adjustable));
+                return Ok(bliss_stdlib::build_complex_vector(
+                    &elems, size, fp, adjustable,
+                ));
             }
             "VECTOR-PUSH" => {
                 // (vector-push new-element vector) → index used, or NIL if full.
                 let args = list_to_vec(cdr);
                 if args.len() < 2 {
-                    return Err(BlissError::Internal("VECTOR-PUSH requires an element and a vector".into()));
+                    return Err(BlissError::Internal(
+                        "VECTOR-PUSH requires an element and a vector".into(),
+                    ));
                 }
                 let val = eval_form(args[0], env)?;
                 let vec = eval_form(args[1], env)?;
@@ -7659,7 +7767,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let vec = eval_form(vf, env)?;
                 if bliss_stdlib::is_complex_vector(vec) {
                     return Ok(BlissVal::from_fixnum(
-                        bliss_stdlib::cvec_fill_pointer(vec) as i64,
+                        bliss_stdlib::cvec_fill_pointer(vec) as i64
                     ));
                 }
                 return Err(BlissError::TypeError {
@@ -7688,7 +7796,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "ARRAY-HAS-FILL-POINTER-P" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(if bliss_stdlib::is_complex_vector(v) { T } else { NIL });
+                return Ok(if bliss_stdlib::is_complex_vector(v) {
+                    T
+                } else {
+                    NIL
+                });
             }
             "ARRAY-DISPLACEMENT" => {
                 // bliss has no displaced arrays: (values nil 0).
@@ -8039,7 +8151,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "SOME" | "EVERY" | "NOTANY" | "NOTEVERY" => {
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
-                    return Err(BlissError::Internal(format!("{} requires a predicate", name)));
+                    return Err(BlissError::Internal(format!(
+                        "{} requires a predicate",
+                        name
+                    )));
                 }
                 let pred = args[0];
                 let mut seqs = Vec::with_capacity(args.len() - 1);
@@ -8239,7 +8354,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(BlissVal::from_fixnum(secs as i64 + 2_208_988_800));
             }
             "GET-UNIVERSAL-TIME" => {
-                return Ok(BlissVal::from_fixnum(bliss_stdlib::time::get_universal_time()));
+                return Ok(BlissVal::from_fixnum(
+                    bliss_stdlib::time::get_universal_time(),
+                ));
             }
             "ENCODE-UNIVERSAL-TIME" => {
                 // (encode-universal-time second minute hour date month year
@@ -8270,9 +8387,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     Some(v) if !v.is_nil() => Some(num_val(*v)? as i64),
                     _ => None,
                 };
-                return Ok(BlissVal::from_fixnum(bliss_stdlib::time::encode_universal_time(
-                    second, minute, hour, date, month, year, time_zone,
-                )));
+                return Ok(BlissVal::from_fixnum(
+                    bliss_stdlib::time::encode_universal_time(
+                        second, minute, hour, date, month, year, time_zone,
+                    ),
+                ));
             }
             "DECODE-UNIVERSAL-TIME" => {
                 // (decode-universal-time universal-time &optional time-zone)
@@ -8836,8 +8955,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (signal datum &rest args): a condition-type symbol is built into
                 // an instance so handler type-matching runs against the real CLOS
                 // class hierarchy.
-                let cond =
-                    coerce_condition_designator(env, datum, &initargs)?.unwrap_or(datum);
+                let cond = coerce_condition_designator(env, datum, &initargs)?.unwrap_or(datum);
                 return signal_condition_object(cond, env);
             }
             "WARN" => {
@@ -9052,7 +9170,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (instance_form, rest) = cp(cdr);
                 let (class_form, _) = cp(rest);
                 let instance = eval_form(instance_form, env)?;
-                let old_class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
+                let old_class_name =
+                    class_name_for_instance_class(bliss_stdlib::class_of(instance));
                 let class_input = eval_form(class_form, env)?;
                 let class = resolve_class_metaobject(env, class_input)?;
                 bliss_stdlib::change_class(instance, class)?;
@@ -9214,7 +9333,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // an :output-file keyword (not positional).
                 let args = list_to_vec(cdr);
                 if args.is_empty() {
-                    return Err(BlissError::Internal("COMPILE-FILE requires a source".into()));
+                    return Err(BlissError::Internal(
+                        "COMPILE-FILE requires a source".into(),
+                    ));
                 }
                 let src_path = path_designator_to_string(eval_form(args[0], env)?)?;
                 let mut out_path: Option<String> = None;
@@ -9290,8 +9411,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         el.subsec_millis()
                     );
                 }
-                let (out_pn, _) =
-                    bliss_stdlib::parse_namestring(arena_str(&out_path), None, None)?;
+                let (out_pn, _) = bliss_stdlib::parse_namestring(arena_str(&out_path), None, None)?;
                 env.set_mv(vec![out_pn, NIL, NIL]);
                 return Ok(out_pn);
             }
@@ -9433,12 +9553,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     c.arg("-c").arg(val_as_str(cmd_val));
                     c
                 } else {
-                    let parts: Vec<String> =
-                        list_to_vec(cmd_val).iter().map(|v| val_as_str(*v)).collect();
+                    let parts: Vec<String> = list_to_vec(cmd_val)
+                        .iter()
+                        .map(|v| val_as_str(*v))
+                        .collect();
                     if parts.is_empty() {
-                        return Err(BlissError::Internal(
-                            "run-program: empty command".into(),
-                        ));
+                        return Err(BlissError::Internal("run-program: empty command".into()));
                     }
                     let mut c = std::process::Command::new(&parts[0]);
                     c.args(&parts[1..]);
@@ -9501,8 +9621,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "READ-SEQUENCE requires a sequence and a stream".into(),
                     ));
                 }
-                let vals: Vec<BlissVal> =
-                    args.iter().map(|a| eval_form(*a, env)).collect::<Result<_, _>>()?;
+                let vals: Vec<BlissVal> = args
+                    .iter()
+                    .map(|a| eval_form(*a, env))
+                    .collect::<Result<_, _>>()?;
                 let seq = vals[0];
                 let inp = resolve_input_stream(vals[1], env);
                 let seq_len = bliss_stdlib::length(seq)?;
@@ -9535,8 +9657,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "WRITE-SEQUENCE requires a sequence and a stream".into(),
                     ));
                 }
-                let vals: Vec<BlissVal> =
-                    args.iter().map(|a| eval_form(*a, env)).collect::<Result<_, _>>()?;
+                let vals: Vec<BlissVal> = args
+                    .iter()
+                    .map(|a| eval_form(*a, env))
+                    .collect::<Result<_, _>>()?;
                 let seq = vals[0];
                 let out = resolve_output_stream(vals[1], env);
                 let seq_len = bliss_stdlib::length(seq)?;
@@ -9623,9 +9747,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (file-length stream) — length in elements of an open file stream.
                 let args = list_to_vec(cdr);
                 if args.is_empty() {
-                    return Err(BlissError::Internal(
-                        "FILE-LENGTH requires a stream".into(),
-                    ));
+                    return Err(BlissError::Internal("FILE-LENGTH requires a stream".into()));
                 }
                 let stream = eval_form(args[0], env)?;
                 return bliss_stdlib::file_length_fn(stream);
@@ -10050,11 +10172,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     Some(sym) => bliss_stdlib::unintern(sym, pkg).unwrap_or(false),
                     None => false,
                 };
-                return Ok(if removed {
-                    T
-                } else {
-                    NIL
-                });
+                return Ok(if removed { T } else { NIL });
             }
             "SYMBOL-PACKAGE" => {
                 let args = list_to_vec(cdr);
@@ -10211,8 +10329,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // CLOS instances: TYPE-OF returns the direct class name, not the
                 // representation type (previously "FIXNUM"). See bliss-2ke.
                 if bliss_stdlib::is_instance(v) {
-                    if let Some(name) =
-                        instance_class_hierarchy_names(v).as_ref().and_then(|n| n.first())
+                    if let Some(name) = instance_class_hierarchy_names(v)
+                        .as_ref()
+                        .and_then(|n| n.first())
                     {
                         return match resolve_sym(name) {
                             Some(sym) => Ok(sym),
@@ -10364,7 +10483,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // CL:DISASSEMBLE (spec §6) — render the callee's current tier: annotated
     // bytecode while interpreted (T0), decoded x86-64 once native (T1).
     if car.is_symbol() && symbol_bare_name(&sym_name(car)) == "DISASSEMBLE" {
-        let arg = if cdr.is_cons() { eval_form(cp(cdr).0, env)? } else { NIL };
+        let arg = if cdr.is_cons() {
+            eval_form(cp(cdr).0, env)?
+        } else {
+            NIL
+        };
         let listing = if arg.is_symbol() {
             bytecode::disassemble_by_symbol(arg.as_symbol_index())
         } else {
@@ -10688,7 +10811,10 @@ impl LoopAccs {
         self.map.entry(key).or_default().extend(items);
     }
     fn sum(&mut self, key: Option<String>, v: BlissVal) -> Result<(), BlissError> {
-        let entry = self.nums.entry(key).or_insert(NumAcc::Sum(BlissVal::from_fixnum(0)));
+        let entry = self
+            .nums
+            .entry(key)
+            .or_insert(NumAcc::Sum(BlissVal::from_fixnum(0)));
         if let NumAcc::Sum(acc) = entry {
             *acc = loop_add_numbers(*acc, v)?;
         }
@@ -11091,14 +11217,9 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     if p.at_sym("OF-TYPE") {
                         p.advance();
                         p.read_form()?;
-                    } else if p
-                        .toks
-                        .get(p.pos + 1)
-                        .is_some_and(|next| {
-                            next.is_symbol()
-                                && symbol_bare_name(&sym_name(*next)) == "="
-                        })
-                    {
+                    } else if p.toks.get(p.pos + 1).is_some_and(|next| {
+                        next.is_symbol() && symbol_bare_name(&sym_name(*next)) == "="
+                    }) {
                         // CLHS 6.1.1.7 also permits a bare type specifier
                         // between the WITH variable and `=`.  Babel's generated
                         // counters use `with noctets fixnum = 0`.
@@ -11128,200 +11249,211 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 // for_clauses; for the independent counters seen in practice
                 // parallel and sequential stepping coincide.
                 loop {
-                let pat = p.read_form()?;
-                // Optional `:of-type <type>` type declaration is accepted and ignored.
-                if p.at_sym("OF-TYPE") {
-                    p.advance();
-                    p.read_form()?;
-                } else if p.at_sym("FIXNUM")
-                    || p.at_sym("FLOAT")
-                    || p.at_sym("T")
-                    || p.at_sym("NIL")
-                {
-                    // CLHS 6.1.1.7: a bare simple-type-spec (fixnum | float |
-                    // t | nil) may follow the loop var, e.g. `for i fixnum from
-                    // 0 below n` (babel's encoders use this). Declarations have
-                    // no bearing on the tree-walker, so skip it.
-                    p.advance();
-                }
-                match p.peek_kw().as_deref() {
-                    Some("IN") => {
+                    let pat = p.read_form()?;
+                    // Optional `:of-type <type>` type declaration is accepted and ignored.
+                    if p.at_sym("OF-TYPE") {
                         p.advance();
-                        let list_form = p.read_form()?;
-                        let step = if p.at_kw("BY") {
-                            p.advance();
-                            Some(p.read_form()?)
-                        } else {
-                            None
-                        };
-                        for_clauses.push(ForClause::In {
-                            pat,
-                            list_form,
-                            step,
-                        });
+                        p.read_form()?;
+                    } else if p.at_sym("FIXNUM")
+                        || p.at_sym("FLOAT")
+                        || p.at_sym("T")
+                        || p.at_sym("NIL")
+                    {
+                        // CLHS 6.1.1.7: a bare simple-type-spec (fixnum | float |
+                        // t | nil) may follow the loop var, e.g. `for i fixnum from
+                        // 0 below n` (babel's encoders use this). Declarations have
+                        // no bearing on the tree-walker, so skip it.
+                        p.advance();
                     }
-                    Some("ON") => {
-                        p.advance();
-                        let list_form = p.read_form()?;
-                        let step = if p.at_kw("BY") {
+                    match p.peek_kw().as_deref() {
+                        Some("IN") => {
                             p.advance();
-                            Some(p.read_form()?)
-                        } else {
-                            None
-                        };
-                        for_clauses.push(ForClause::On {
-                            pat,
-                            list_form,
-                            step,
-                        });
-                    }
-                    Some("ACROSS") => {
-                        p.advance();
-                        let seq_form = p.read_form()?;
-                        for_clauses.push(ForClause::Across { pat, seq_form });
-                    }
-                    Some("BEING") => {
-                        p.advance();
-                        if p.at_kw("THE") {
-                            p.advance();
+                            let list_form = p.read_form()?;
+                            let step = if p.at_kw("BY") {
+                                p.advance();
+                                Some(p.read_form()?)
+                            } else {
+                                None
+                            };
+                            for_clauses.push(ForClause::In {
+                                pat,
+                                list_form,
+                                step,
+                            });
                         }
-                        let kind = p.read_form()?;
-                        let kind_name = if kind.is_symbol() {
-                            sym_name(kind)
-                        } else {
-                            String::new()
-                        };
-                        let kind_bare = kind_name.strip_prefix("KEYWORD:").unwrap_or(&kind_name);
-                        let source = match kind_bare {
-                            "SYMBOLS" | "EXTERNAL-SYMBOLS" | "PRESENT-SYMBOLS" => {
-                                // The connective is :in or :of (ANSI accepts both).
-                                let conn = p.read_form()?;
-                                let conn_name = if conn.is_symbol() { sym_name(conn) } else { String::new() };
-                                let conn_bare = conn_name.strip_prefix("KEYWORD:").unwrap_or(&conn_name);
-                                if conn_bare != "IN" && conn_bare != "OF" {
-                                    return Err(BlissError::Internal(
-                                        "LOOP :for ... :being <symbols> expects :in or :of".into(),
-                                    ));
-                                }
-                                let pkg = p.read_form()?;
-                                if kind_bare == "SYMBOLS" {
-                                    LoopBeingSource::Symbols(pkg)
-                                } else {
-                                    LoopBeingSource::OwnSymbols(pkg)
-                                }
+                        Some("ON") => {
+                            p.advance();
+                            let list_form = p.read_form()?;
+                            let step = if p.at_kw("BY") {
+                                p.advance();
+                                Some(p.read_form()?)
+                            } else {
+                                None
+                            };
+                            for_clauses.push(ForClause::On {
+                                pat,
+                                list_form,
+                                step,
+                            });
+                        }
+                        Some("ACROSS") => {
+                            p.advance();
+                            let seq_form = p.read_form()?;
+                            for_clauses.push(ForClause::Across { pat, seq_form });
+                        }
+                        Some("BEING") => {
+                            p.advance();
+                            if p.at_kw("THE") {
+                                p.advance();
                             }
-                            "HASH-KEYS" => {
-                                let of_kw = p.read_form()?;
-                                let of_name = if of_kw.is_symbol() {
-                                    sym_name(of_kw)
-                                } else {
-                                    String::new()
-                                };
-                                if of_name.strip_prefix("KEYWORD:").unwrap_or(&of_name) != "OF" {
-                                    return Err(BlissError::Internal(
-                                        "LOOP :for ... :being :the :hash-keys expects :of".into(),
-                                    ));
+                            let kind = p.read_form()?;
+                            let kind_name = if kind.is_symbol() {
+                                sym_name(kind)
+                            } else {
+                                String::new()
+                            };
+                            let kind_bare =
+                                kind_name.strip_prefix("KEYWORD:").unwrap_or(&kind_name);
+                            let source = match kind_bare {
+                                "SYMBOLS" | "EXTERNAL-SYMBOLS" | "PRESENT-SYMBOLS" => {
+                                    // The connective is :in or :of (ANSI accepts both).
+                                    let conn = p.read_form()?;
+                                    let conn_name = if conn.is_symbol() {
+                                        sym_name(conn)
+                                    } else {
+                                        String::new()
+                                    };
+                                    let conn_bare =
+                                        conn_name.strip_prefix("KEYWORD:").unwrap_or(&conn_name);
+                                    if conn_bare != "IN" && conn_bare != "OF" {
+                                        return Err(BlissError::Internal(
+                                            "LOOP :for ... :being <symbols> expects :in or :of"
+                                                .into(),
+                                        ));
+                                    }
+                                    let pkg = p.read_form()?;
+                                    if kind_bare == "SYMBOLS" {
+                                        LoopBeingSource::Symbols(pkg)
+                                    } else {
+                                        LoopBeingSource::OwnSymbols(pkg)
+                                    }
                                 }
-                                LoopBeingSource::HashKeys(p.read_form()?)
-                            }
-                            "HASH-VALUES" => {
-                                let of_kw = p.read_form()?;
-                                let of_name = if of_kw.is_symbol() {
-                                    sym_name(of_kw)
-                                } else {
-                                    String::new()
-                                };
-                                if of_name.strip_prefix("KEYWORD:").unwrap_or(&of_name) != "OF" {
-                                    return Err(BlissError::Internal(
-                                        "LOOP :for ... :being :the :hash-values expects :of".into(),
-                                    ));
+                                "HASH-KEYS" => {
+                                    let of_kw = p.read_form()?;
+                                    let of_name = if of_kw.is_symbol() {
+                                        sym_name(of_kw)
+                                    } else {
+                                        String::new()
+                                    };
+                                    if of_name.strip_prefix("KEYWORD:").unwrap_or(&of_name) != "OF"
+                                    {
+                                        return Err(BlissError::Internal(
+                                            "LOOP :for ... :being :the :hash-keys expects :of"
+                                                .into(),
+                                        ));
+                                    }
+                                    LoopBeingSource::HashKeys(p.read_form()?)
                                 }
-                                LoopBeingSource::HashValues(p.read_form()?)
-                            }
-                            _ => {
-                                return Err(BlissError::Internal(
+                                "HASH-VALUES" => {
+                                    let of_kw = p.read_form()?;
+                                    let of_name = if of_kw.is_symbol() {
+                                        sym_name(of_kw)
+                                    } else {
+                                        String::new()
+                                    };
+                                    if of_name.strip_prefix("KEYWORD:").unwrap_or(&of_name) != "OF"
+                                    {
+                                        return Err(BlissError::Internal(
+                                            "LOOP :for ... :being :the :hash-values expects :of"
+                                                .into(),
+                                        ));
+                                    }
+                                    LoopBeingSource::HashValues(p.read_form()?)
+                                }
+                                _ => {
+                                    return Err(BlissError::Internal(
                                     "LOOP :for ... :being supports :symbols / :external-symbols / :present-symbols / :hash-keys / :hash-values in the bootstrap"
                                         .into(),
                                 ));
-                            }
-                        };
-                        for_clauses.push(ForClause::Being { pat, source });
-                    }
-                    // `:from`/`:upfrom` count up; `:downfrom` counts down. All
-                    // share the same `[:by step] [limit]` tail parsing.
-                    Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
-                        let descending = p.peek_kw().as_deref() == Some("DOWNFROM");
-                        p.advance();
-                        let start = p.read_form()?;
-                        let mut step = None;
-                        let mut limit = None;
-                        loop {
-                            match p.peek_kw().as_deref() {
-                                Some("BY") => {
-                                    p.advance();
-                                    step = Some(p.read_form()?);
                                 }
-                                Some("BELOW") => {
-                                    p.advance();
-                                    limit = Some((LoopForLimit::Below, p.read_form()?));
-                                }
-                                Some("TO") => {
-                                    p.advance();
-                                    limit = Some((LoopForLimit::To, p.read_form()?));
-                                }
-                                Some("UPTO") => {
-                                    p.advance();
-                                    limit = Some((LoopForLimit::Upto, p.read_form()?));
-                                }
-                                Some("ABOVE") => {
-                                    p.advance();
-                                    limit = Some((LoopForLimit::Above, p.read_form()?));
-                                }
-                                Some("DOWNTO") => {
-                                    p.advance();
-                                    limit = Some((LoopForLimit::Downto, p.read_form()?));
-                                }
-                                _ => break,
-                            }
-                        }
-                        for_clauses.push(ForClause::From {
-                            pat,
-                            start,
-                            step,
-                            limit,
-                            descending,
-                        });
-                    }
-                    _ => {
-                        // :for var = init [:then step]. Both `=` and the
-                        // keyword `:=` are valid LOOP stepping tokens.
-                        let eq = p.read_form()?;
-                        if !(eq.is_symbol() && symbol_bare_name(&sym_name(eq)) == "=") {
-                            let found = if eq.is_symbol() {
-                                sym_name(eq)
-                            } else {
-                                format!("{:?}", eq)
                             };
-                            return Err(BlissError::Internal(format!(
-                                "LOOP :for supports :in / :on / :across / :being / :from / = in the bootstrap (got {})",
-                                found
-                            )));
+                            for_clauses.push(ForClause::Being { pat, source });
                         }
-                        let init = p.read_form()?;
-                        let then = if p.at_kw("THEN") {
+                        // `:from`/`:upfrom` count up; `:downfrom` counts down. All
+                        // share the same `[:by step] [limit]` tail parsing.
+                        Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
+                            let descending = p.peek_kw().as_deref() == Some("DOWNFROM");
                             p.advance();
-                            Some(p.read_form()?)
-                        } else {
-                            None
-                        };
-                        for_clauses.push(ForClause::Eq { pat, init, then });
+                            let start = p.read_form()?;
+                            let mut step = None;
+                            let mut limit = None;
+                            loop {
+                                match p.peek_kw().as_deref() {
+                                    Some("BY") => {
+                                        p.advance();
+                                        step = Some(p.read_form()?);
+                                    }
+                                    Some("BELOW") => {
+                                        p.advance();
+                                        limit = Some((LoopForLimit::Below, p.read_form()?));
+                                    }
+                                    Some("TO") => {
+                                        p.advance();
+                                        limit = Some((LoopForLimit::To, p.read_form()?));
+                                    }
+                                    Some("UPTO") => {
+                                        p.advance();
+                                        limit = Some((LoopForLimit::Upto, p.read_form()?));
+                                    }
+                                    Some("ABOVE") => {
+                                        p.advance();
+                                        limit = Some((LoopForLimit::Above, p.read_form()?));
+                                    }
+                                    Some("DOWNTO") => {
+                                        p.advance();
+                                        limit = Some((LoopForLimit::Downto, p.read_form()?));
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            for_clauses.push(ForClause::From {
+                                pat,
+                                start,
+                                step,
+                                limit,
+                                descending,
+                            });
+                        }
+                        _ => {
+                            // :for var = init [:then step]. Both `=` and the
+                            // keyword `:=` are valid LOOP stepping tokens.
+                            let eq = p.read_form()?;
+                            if !(eq.is_symbol() && symbol_bare_name(&sym_name(eq)) == "=") {
+                                let found = if eq.is_symbol() {
+                                    sym_name(eq)
+                                } else {
+                                    format!("{:?}", eq)
+                                };
+                                return Err(BlissError::Internal(format!(
+                                    "LOOP :for supports :in / :on / :across / :being / :from / = in the bootstrap (got {})",
+                                    found
+                                )));
+                            }
+                            let init = p.read_form()?;
+                            let then = if p.at_kw("THEN") {
+                                p.advance();
+                                Some(p.read_form()?)
+                            } else {
+                                None
+                            };
+                            for_clauses.push(ForClause::Eq { pat, init, then });
+                        }
                     }
-                }
-                if p.at_kw("AND") {
-                    p.advance();
-                    continue;
-                }
-                break;
+                    if p.at_kw("AND") {
+                        p.advance();
+                        continue;
+                    }
+                    break;
                 }
             }
             "INITIALLY" => {
@@ -11413,7 +11545,11 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                     });
                     has_stepping_driver = true;
                 }
-                ForClause::On { pat, list_form, step } => {
+                ForClause::On {
+                    pat,
+                    list_form,
+                    step,
+                } => {
                     let list = eval_form(*list_form, env)?;
                     let step = match step {
                         Some(step_form) => Some(eval_form(*step_form, env)?),
@@ -11498,11 +11634,13 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 ForClause::Being { pat, source } => {
                     let items = match source {
                         LoopBeingSource::Symbols(pkg_form) => {
-                            let name = normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
+                            let name =
+                                normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
                             package_symbols(env, &name, true)
                         }
                         LoopBeingSource::OwnSymbols(pkg_form) => {
-                            let name = normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
+                            let name =
+                                normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
                             package_symbols(env, &name, false)
                         }
                         LoopBeingSource::HashKeys(table_form) => {
@@ -11803,9 +11941,9 @@ fn eql_values(a: BlissVal, b: BlissVal) -> bool {
         return true;
     }
     match (heap_numeric_type_id(a), heap_numeric_type_id(b)) {
-        (Some(ta), Some(tb)) if ta == tb => {
-            numeric_cmp(a, b).map(|o| o == Ordering::Equal).unwrap_or(false)
-        }
+        (Some(ta), Some(tb)) if ta == tb => numeric_cmp(a, b)
+            .map(|o| o == Ordering::Equal)
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -12879,7 +13017,11 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         Some(name_form)
     } else if name_form.is_cons() {
         let (_head, tail) = cp(name_form);
-        if tail.is_cons() { Some(cp(tail).0) } else { None }
+        if tail.is_cons() {
+            Some(cp(tail).0)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -12983,7 +13125,11 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 Some(name_form)
             } else if name_form.is_cons() {
                 let (_head, tail) = cp(name_form);
-                if tail.is_cons() { Some(cp(tail).0) } else { None }
+                if tail.is_cons() {
+                    Some(cp(tail).0)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -14057,8 +14203,8 @@ fn macroexpand_all(form: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
     // 2. Special forms that must NOT be walked generically.
     match name.as_str() {
         // Data / sublanguages / local-macro scopes: leave the whole form.
-        "QUOTE" | "BLISS::QUASIQUOTE" | "MACROLET" | "SYMBOL-MACROLET" | "LOOP"
-        | "DECLARE" | "GO" => form,
+        "QUOTE" | "BLISS::QUASIQUOTE" | "MACROLET" | "SYMBOL-MACROLET" | "LOOP" | "DECLARE"
+        | "GO" => form,
 
         // Binding forms: expand init-forms and bodies but preserve the bound
         // names (a variable named like a macro must not be expanded away).
@@ -14198,10 +14344,9 @@ fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissV
     let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
     let arg_list = list_to_vec(args);
     if let Some(function) = &mdef.bytecode {
-        return bytecode::run(
+        return bytecode::run_macro(
             Rc::new(function.borrow().clone()),
             &arg_list,
-            NIL,
             &mut child_env,
         );
     }
@@ -14265,8 +14410,7 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
 
     // Expose both global (top-level DEFMACRO) and lexical (MACROLET) macros to
     // the bytecode compiler; a lexical macro of the same name shadows the global.
-    let mut all_macros: HashMap<String, MacroDef> =
-        GLOBAL_MACROS.with(|m| m.borrow().clone());
+    let mut all_macros: HashMap<String, MacroDef> = GLOBAL_MACROS.with(|m| m.borrow().clone());
     for (name, def) in env.macros.borrow().iter() {
         all_macros.insert(name.clone(), def.clone());
     }
@@ -14274,6 +14418,10 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         let params_bits = macro_def.params_form.0;
         let body_bits = macro_def.body.0;
         let frame_ptr = Rc::as_ptr(&macro_def.captured_frame) as usize;
+        let bytecode_ptr = macro_def
+            .bytecode
+            .as_ref()
+            .map_or(0, |function| Rc::as_ptr(function) as usize);
 
         // Reuse the cached registration if this exact macro definition was
         // already registered (bliss-gq5.8) — the common case across the many
@@ -14281,14 +14429,57 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         // body, or captured frame) falls through to re-register.
         let cached = MACRO_FN_CACHE.with(|c| c.borrow().get(name).copied());
         let (handle, symbol) = match cached {
-            Some(e) if e.params_bits == params_bits
-                && e.body_bits == body_bits
-                && e.frame_ptr == frame_ptr =>
+            Some(e)
+                if e.params_bits == params_bits
+                    && e.body_bits == body_bits
+                    && e.frame_ptr == frame_ptr
+                    && e.bytecode_ptr == bytecode_ptr =>
             {
                 (e.handle, e.symbol)
             }
             _ => {
                 let handle = next_macro_function_handle();
+                if let Some(function) = &macro_def.bytecode {
+                    let function = Arc::new(Mutex::new(function.borrow().clone()));
+                    LOADED_COMPILER_MACRO_FUNCTIONS
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(Arc::downgrade(&function));
+                    compiler_macroexpand::register_macro_function(
+                        handle,
+                        Arc::new(move |form, _call_macro_env| {
+                            let (_, args) = cp(form);
+                            let function = function
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone();
+                            let mut macro_env = Env::new_for_macro_expansion(false);
+                            bytecode::run_macro(
+                                Rc::new(function),
+                                &list_to_vec(args),
+                                &mut macro_env,
+                            )
+                        }),
+                    );
+                    let symbol = resolve_sym(name).unwrap_or(NIL);
+                    MACRO_FN_CACHE.with(|c| {
+                        c.borrow_mut().insert(
+                            name.clone(),
+                            MacroFnCacheEntry {
+                                params_bits,
+                                body_bits,
+                                frame_ptr,
+                                bytecode_ptr,
+                                handle,
+                                symbol,
+                            },
+                        );
+                    });
+                    if !symbol.is_nil() {
+                        macro_env = macro_env.augment_function(symbol, FunctionInfo::Macro(handle));
+                    }
+                    continue;
+                }
                 // Registered into bliss-compiler's global Send + Sync macro
                 // table, so the closure owns a frozen snapshot instead of the
                 // live Rc frame. See FrozenEnvFrame. (The ordinary expand_macro
@@ -14338,6 +14529,7 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
                             params_bits,
                             body_bits,
                             frame_ptr,
+                            bytecode_ptr,
                             handle,
                             symbol,
                         },
@@ -14583,6 +14775,51 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     Ok(name_form)
 }
 
+/// Install the structural payload of a source-free DEFINE-CONDITION load
+/// action. This mirrors boot.lisp's macro without invoking the reader or macro
+/// compiler from a BFASL load.
+fn define_condition_portable(
+    name: BlissVal,
+    parents: BlissVal,
+    slots: BlissVal,
+    options: BlissVal,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    let effective_parents = if parents.is_nil() {
+        vec_to_list(&[resolve_sym("CONDITION").unwrap_or(NIL)])
+    } else {
+        parents
+    };
+    for (variable, entry) in [
+        ("*CONDITION-TYPES*", vec_to_list(&[name, effective_parents])),
+        (
+            "*CONDITION-DEFINITIONS*",
+            vec_to_list(&[name, effective_parents, slots, options]),
+        ),
+    ] {
+        let symbol = resolve_sym(variable).unwrap_or(NIL);
+        let old = env
+            .lookup_var_symbol(symbol)
+            .or_else(|| env.lookup_var(variable))
+            .unwrap_or(NIL);
+        env.set_var_symbol(symbol, arena_cons(entry, old));
+    }
+
+    eval_defclass(vec_to_list(&[name, effective_parents, slots]), env)?;
+
+    // DEFINE-CONDITION also defines requested slot readers/accessors. Reuse the
+    // boot helper that computes those DEFUN forms from the structural slots.
+    if let Some(helper) = resolve_sym("%DEFINE-CONDITION-READER-DEFS") {
+        if fn_bound(env, &sym_name(helper)) {
+            let definitions = apply_function(helper, &[slots], env)?;
+            for definition in list_to_vec(definitions) {
+                eval_form(definition, env)?;
+            }
+        }
+    }
+    Ok(name)
+}
+
 // ── DEFSTRUCT ────────────────────────────────────────────────────
 /// A minimal `defstruct` implemented on top of CLOS: it expands to a `defclass`
 /// plus a `make-NAME` keyword constructor, a `NAME-P` predicate, a `copy-NAME`
@@ -14642,12 +14879,7 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
             ])
         })
         .collect();
-    let defclass_form = vec_to_list(&[
-        sym("DEFCLASS"),
-        name_sym,
-        NIL,
-        vec_to_list(&slot_clauses),
-    ]);
+    let defclass_form = vec_to_list(&[sym("DEFCLASS"), name_sym, NIL, vec_to_list(&slot_clauses)]);
     eval_form(defclass_form, env)?;
 
     // (defun make-NAME (&key (slot default) ...) (make-instance 'NAME :slot slot ...))
@@ -14712,9 +14944,8 @@ fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 match symbol_bare_name(&sym_name(option_name)).as_str() {
                     "METHOD-COMBINATION" => {
                         let method_combination = cp(option_rest).0;
-                        combination =
-                            method_combination_from_name(&sym_name(method_combination))
-                                .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
+                        combination = method_combination_from_name(&sym_name(method_combination))
+                            .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
                     }
                     "METHOD" => method_options.push(option_rest),
                     _ => {}
@@ -14846,7 +15077,8 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     bliss_stdlib::clos::add_method(generic_function, method_id)?;
     bliss_stdlib::set_method_specializers(method_id, vec![], qualifier);
 
-    env.methods.borrow_mut()
+    env.methods
+        .borrow_mut()
         .entry(name.clone())
         .or_default()
         .push(MethodDef {
@@ -14918,7 +15150,11 @@ fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, Bl
     // Comparisons are binary in bliss's operator dispatch (eval_cmp / `=`); only
     // fast-path the 2-arg shape so other arities match the general path exactly.
     let cmp = |pred: fn(Ordering) -> bool| -> Result<BlissVal, BlissError> {
-        Ok(if pred(numeric_cmp(args[0], args[1])?) { T } else { NIL })
+        Ok(if pred(numeric_cmp(args[0], args[1])?) {
+            T
+        } else {
+            NIL
+        })
     };
     Some(match name {
         "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
@@ -14943,6 +15179,21 @@ fn apply_function(
     if fn_val.is_symbol() {
         let name = sym_name(fn_val);
         if let Some((params_form, body)) = callable_body(env, &name) {
+            // Mirror the operator-position path: a GLOBAL function with a
+            // registered bytecode body (e.g. one installed from a `.bfasl`, whose
+            // interpreted-function object carries a NIL body) must dispatch
+            // through the promoting bytecode/native path, not run its empty
+            // fallback body. Guard on no lexical FLET/LABELS shadow so a local
+            // binding is never redirected to the global registry entry.
+            if !env.funs.borrow().contains_key(&name) {
+                if let Some(sym) = resolve_sym(&name) {
+                    if let Some(res) =
+                        bytecode::call_registered(sym.as_symbol_index(), args, sym, env)
+                    {
+                        return res;
+                    }
+                }
+            }
             return eval_lambda_call(env, params_form, body, args, Rc::clone(&env.frame));
         }
         if env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name) {
@@ -15033,12 +15284,9 @@ fn apply_function(
         // registered for their global name.
         let function_name = bliss_rt::function::name(fn_val);
         if function_name.is_symbol() {
-            if let Some(result) = bytecode::call_registered(
-                function_name.as_symbol_index(),
-                args,
-                fn_val,
-                env,
-            ) {
+            if let Some(result) =
+                bytecode::call_registered(function_name.as_symbol_index(), args, fn_val, env)
+            {
                 return result;
             }
         }
@@ -15104,7 +15352,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "STRINGP" | "CHAR-NAME" | "NAME-CHAR" | "PARSE-INTEGER" | "MAKE-STRING"
             | "STRING-TO-LIST"
             // Symbols / packages
-            | "SYMBOLP" | "KEYWORDP" | "CONSTANTP" | "%MARK-CONSTANT" | "SYMBOL-NAME"
+            | "SYMBOLP" | "KEYWORDP" | "CONSTANTP" | "%MARK-CONSTANT"
+            | "%DEFINE-CONDITION-PORTABLE" | "SYMBOL-NAME"
             | "SYMBOL-VALUE" | "SYMBOL-FUNCTION"
             | "SYMBOL-PACKAGE" | "SYMBOL-PLIST" | "MAKE-SYMBOL" | "GENSYM" | "GENTEMP"
             | "INTERN" | "FIND-SYMBOL" | "FIND-PACKAGE" | "PACKAGE-NAME" | "PACKAGEP"
@@ -15477,12 +15726,10 @@ fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     let outcome = match result {
         Ok(value) => Ok(value),
         Err(error) => match bliss_error_to_condition(env, &error) {
-            Ok(Some(condition)) => {
-                match run_handler_bind_handlers(env, condition, cluster_index) {
-                    Ok(()) => Err(error),
-                    Err(transfer) => Err(transfer),
-                }
-            }
+            Ok(Some(condition)) => match run_handler_bind_handlers(env, condition, cluster_index) {
+                Ok(()) => Err(error),
+                Err(transfer) => Err(transfer),
+            },
             _ => Err(error),
         },
     };
@@ -15672,14 +15919,12 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
         let opt_bare = symbol_bare_name(&sym_name(opts[i]));
         let value = eval_form(opts[i + 1], env)?;
         match opt_bare.as_str() {
-            "DIRECTION" => {
-                match symbol_bare_name(&sym_name(value)).as_str() {
-                    "OUTPUT" => direction = bliss_stdlib::StreamDirection::Output,
-                    "IO" => direction = bliss_stdlib::StreamDirection::Io,
-                    "INPUT" => direction = bliss_stdlib::StreamDirection::Input,
-                    _ => {}
-                }
-            }
+            "DIRECTION" => match symbol_bare_name(&sym_name(value)).as_str() {
+                "OUTPUT" => direction = bliss_stdlib::StreamDirection::Output,
+                "IO" => direction = bliss_stdlib::StreamDirection::Io,
+                "INPUT" => direction = bliss_stdlib::StreamDirection::Input,
+                _ => {}
+            },
             "ELEMENT-TYPE" => {
                 // (unsigned-byte 8) or the fixnum 8 selects a byte stream.
                 let is_byte = value == BlissVal::from_fixnum(8)
@@ -16220,7 +16465,9 @@ fn run_load_report(path: &str, env: &mut Env) -> Result<i32, BlissError> {
             let (val, consumed) = match reader::read_from_string(&remaining) {
                 Ok(pair) => pair,
                 Err(e) => {
-                    *category_counts.entry("reader-error".to_string()).or_insert(0) += 1;
+                    *category_counts
+                        .entry("reader-error".to_string())
+                        .or_insert(0) += 1;
                     failures.push((form_index + 1, "<reader>".into(), describe_err(&e)));
                     let next = resync_to_next_toplevel(&chars, pos);
                     if next <= pos {
@@ -16240,9 +16487,7 @@ fn run_load_report(path: &str, env: &mut Env) -> Result<i32, BlissError> {
                 Ok(_) => ok += 1,
                 Err(e) => {
                     let desc = describe_err(&e);
-                    *category_counts
-                        .entry(categorize_error(&desc))
-                        .or_insert(0) += 1;
+                    *category_counts.entry(categorize_error(&desc)).or_insert(0) += 1;
                     failures.push((form_index, preview_form(&form_src), desc));
                 }
             }
@@ -16408,10 +16653,7 @@ pub fn run_repl_with_reader<R: std::io::BufRead>(reader: &mut R) -> Result<i32, 
 
 /// The read/eval/print loop over an arbitrary line source. Real runs pass
 /// `stdin().lock()`; tests inject an empty reader (immediate EOF).
-fn run_repl_reader<R: std::io::BufRead>(
-    env: &mut Env,
-    reader: &mut R,
-) -> Result<i32, BlissError> {
+fn run_repl_reader<R: std::io::BufRead>(env: &mut Env, reader: &mut R) -> Result<i32, BlissError> {
     let _config = ReplConfig::default();
     println!("Bliss Common Lisp {}", env!("CARGO_PKG_VERSION"));
     println!("Type (quit) to exit.");
@@ -16665,10 +16907,8 @@ mod env_gc_root_tests {
         });
         assert_eq!(rewritten, expected, "every seeded Env root must be yielded");
 
-        let relocated_expected: HashSet<i64> = expected
-            .iter()
-            .map(|n| n + RELOCATION_DELTA)
-            .collect();
+        let relocated_expected: HashSet<i64> =
+            expected.iter().map(|n| n + RELOCATION_DELTA).collect();
         let mut relocated = HashSet::new();
         env.visit_gc_roots(&mut |slot| unsafe {
             let value = &*slot;
@@ -16771,7 +17011,10 @@ mod jtc1_heap_tests {
         })
         .expect("walk_heap");
 
-        assert!(cons_count > 0, "evaluator cons cells must be walkable on the GC heap");
+        assert!(
+            cons_count > 0,
+            "evaluator cons cells must be walkable on the GC heap"
+        );
         assert!(
             found_marker,
             "the evaluator-allocated string must be walkable on the GC heap"
@@ -16849,10 +17092,7 @@ mod transient_shadow_root_tests {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         GLOBAL_MACROS.with(|macros| macros.borrow_mut().clear());
         let frame = Rc::new(RefCell::new(EnvFrame::default()));
-        frame
-            .borrow_mut()
-            .vars
-            .insert("CAPTURED".into(), marker(2));
+        frame.borrow_mut().vars.insert("CAPTURED".into(), marker(2));
         GLOBAL_MACROS.with(|macros| {
             macros.borrow_mut().insert(
                 "GC-RETAINED-GLOBAL-MACRO".into(),
@@ -16867,9 +17107,7 @@ mod transient_shadow_root_tests {
 
         scan_evaluator_global_roots(&mut |slot| unsafe {
             let value = &mut *slot;
-            if value.is_fixnum()
-                && (GLOBAL_BASE..GLOBAL_BASE + 3).contains(&value.as_fixnum())
-            {
+            if value.is_fixnum() && (GLOBAL_BASE..GLOBAL_BASE + 3).contains(&value.as_fixnum()) {
                 *value = BlissVal::from_fixnum(value.as_fixnum() + DELTA);
             }
         });
@@ -16932,8 +17170,7 @@ mod jtc5_numeric_tests {
         assert_eq!(read_eval_all("(numberp \"x\")").unwrap(), NIL);
         assert_eq!(read_eval_all("(eql 1/3 1/3)").unwrap(), T);
         assert_eq!(
-            read_eval_all("(eql (* 10000000000 10000000000) (* 10000000000 10000000000))")
-                .unwrap(),
+            read_eval_all("(eql (* 10000000000 10000000000) (* 10000000000 10000000000))").unwrap(),
             T
         );
         assert_eq!(read_eval_all("(eq 1/3 1/3)").unwrap(), NIL);
@@ -17001,7 +17238,11 @@ mod jtc6_8_function_object_tests {
             bliss_rt::function::is_interpreted_function(f),
             "DEFUN must store a heap interpreted-function object in the function cell"
         );
-        assert_eq!(bliss_rt::function::tier(f), 0, "a fresh function starts at tier 0");
+        assert_eq!(
+            bliss_rt::function::tier(f),
+            0,
+            "a fresh function starts at tier 0"
+        );
 
         // The call path resolves through the cell.
         assert_eq!(
@@ -17208,8 +17449,8 @@ mod jtc5mf_storage_condition_pool_tests {
         }
         let _ = bliss_rt::gc::full_gc();
 
-        let pooled = bliss_stdlib::acquire_preallocated_storage_condition()
-            .expect("pool must survive GC");
+        let pooled =
+            bliss_stdlib::acquire_preallocated_storage_condition().expect("pool must survive GC");
         assert_eq!(
             bliss_stdlib::clos::class_of(pooled),
             expected_class,

@@ -220,7 +220,7 @@ Function flags:
 | 1 | `macro_function` | Function is the expander for a load-time macro definition |
 | 2 | `compiler_macro_function` | Function is a compiler-macro expander |
 | 3 | `load_time_thunk` | Function is invoked by the load plan, not directly installed |
-| 4 | `never_inline` | Preserve call boundary for declarations/debugging |
+| 4 | `nested` | Body referenced only from another function (restart clause or `MAKE_CLOSURE` target); never installed in a symbol cell. Exactly one role bit (0–4) MUST be set. |
 | 5 | `contains_eval` | Function may observe dynamic compilation environment |
 | 6 | `requires_full_debug` | Debug metadata is required for correct restart/deopt behavior |
 
@@ -347,6 +347,34 @@ dedicated opcodes cover only the semantic machinery that must be visible to the
 verifier, GC, unwinder, tiering engine, and deoptimizer: lexical slots, dynamic
 bindings, closures, multiple values, non-local control flow, cleanup/restart
 state, load-time cells, branches, and safepoints.
+
+#### Nested functions and `MAKE_CLOSURE` (bytecode version 1.4/1.5)
+
+Function-table entries carry a `nested` role in function-flags bit 4: such a
+record is a body referenced only from within another function, never installed
+in a symbol cell.  Two producers emit nested functions:
+
+- `RESTART-CASE` clauses (bytecode version 1.4), referenced through the
+  restart-table auxiliary table (`table_kind = 7`).
+- Noncapturing `(lambda …)` values (bytecode version 1.5), referenced directly
+  by a `MAKE_CLOSURE` instruction.
+
+`MAKE_CLOSURE` (`0x0b`) is emitted as `u32 function_index`, `u16 capture_count`,
+then `capture_count` capture slots.  The current implementation emits and
+accepts only the **zero-capture** subset (`capture_count = 0`, no slots), which
+covers a lambda that closes over nothing lexical; a nonzero `capture_count` is
+reserved for the general capturing form.  The `function_index` embedded in the
+instruction is a **global** function-table index in the serialized unit; a
+producer MUST serialize a nested function *before* its referencing owner, so the
+reference is always backwards and topological.
+
+The verifier MUST reject a `MAKE_CLOSURE` (and, equivalently, a restart-table
+entry) whose referenced function index is not strictly less than the referencing
+function's own index, is out of range, or does not carry the `nested` role —
+before any function is installed.  On load, the reader rebuilds each owner's
+private nested-function list in first-appearance order and rewrites the embedded
+global index to that local index; a distinct callable identity is materialized
+for the nested function on each evaluation of the `MAKE_CLOSURE`.
 
 ### 6.11.3.5 Load Plan
 

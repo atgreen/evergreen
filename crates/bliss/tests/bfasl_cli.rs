@@ -103,6 +103,175 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
     pos
 }
 
+/// A function installed from a `.bfasl` carries a NIL fallback body (its real
+/// code lives in the bytecode registry). Calling it indirectly via
+/// `funcall`/`apply`/`mapcar` — not just in operator position — must dispatch
+/// through the registered bytecode, not run the empty body and return NIL
+/// (bliss-mwe). ASDF/Babel funcall loaded functions constantly.
+#[test]
+fn funcall_and_apply_on_bfasl_function_dispatch_correctly() {
+    let dir = workdir("funcall-bfasl");
+    let src = dir.join("f.lisp");
+    let out = dir.join("f.bfasl");
+    fs::write(&src, "(defun bf-triple (n) (* n 3))\n").unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(c.status.success(), "compile-file failed");
+
+    let l = run(&format!(
+        "(progn (load \"{}\") \
+           (list (bf-triple 4) \
+                 (funcall 'bf-triple 4) \
+                 (funcall #'bf-triple 4) \
+                 (apply 'bf-triple '(4)) \
+                 (mapcar #'bf-triple '(1 2 3))))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load/call failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "(12 12 12 12 (3 6 9))",
+        "operator-position and funcall/apply/mapcar must all dispatch the bytecode"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// FNV-1a low-32 checksum over `bytes`, matching `bliss_rt::bfasl`'s framing.
+/// Used to re-seal a `.bfasl` after deliberately corrupting a BBU byte so the
+/// loader's structural verifier — not the container checksum — is what rejects
+/// the tampered unit.
+fn reseal_bfasl_checksum(bytes: &mut [u8]) {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let body_len = bytes.len() - 4;
+    for &b in &bytes[..body_len] {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    bytes[body_len..].copy_from_slice(&(h as u32).to_le_bytes());
+}
+
+/// A noncapturing `(lambda …)` passed to a higher-order function must serialize
+/// as a source-free `MakeClosure` referencing a nested bytecode function
+/// (bliss-jtc.23.3), so the whole file compiles to a complete BBU with no
+/// retained source and still executes correctly in a fresh process.
+#[test]
+fn noncapturing_lambda_bfasl_round_trips_source_free() {
+    let dir = workdir("closure-roundtrip");
+    let src = dir.join("c.lisp");
+    let out = dir.join("c.bfasl");
+    let source = "(defun nc-map (xs) (mapcar (lambda (x) (* x x)) xs))\n\
+                  (defun nc-sum (xs) (reduce (lambda (a b) (+ a b)) xs :initial-value 0))\n";
+    fs::write(&src, source).unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "a closure-bearing file must compile to a complete BBU with no TOPLEVEL_FORMS"
+    );
+    assert!(
+        !bytes.windows(6).any(|w| w == b"LAMBDA"),
+        "the artifact must not retain an executable LAMBDA source form"
+    );
+    let (_, function_count, load_action_count) = bbu_counts(&bytes);
+    // Two named defuns plus their two nested lambda bodies.
+    assert!(
+        function_count >= 4,
+        "nested lambda bodies get their own function records (got {function_count})"
+    );
+    assert!(load_action_count >= 2, "both defuns install at load");
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (list (nc-map '(1 2 3)) (nc-sum '(4 5 6))))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "((1 4 9) 15)",
+        "the fresh-loaded closures must compute correct results"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A `MakeClosure` reference that is not a valid backwards/topological pointer
+/// to a nested function must be rejected by the loader's verifier before any
+/// function is installed (bliss-jtc.23.3). The container checksum is repaired
+/// after tampering so it is the structural verifier that does the rejecting.
+#[test]
+fn corrupt_makeclosure_reference_is_rejected() {
+    let dir = workdir("closure-corrupt");
+    let src = dir.join("cc.lisp");
+    let out = dir.join("cc.bfasl");
+    fs::write(&src, "(defun cc (xs) (mapcar (lambda (x) x) xs))\n").unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(c.status.success(), "compile-file failed");
+    let mut bytes = fs::read(&out).unwrap();
+
+    // The sole nested lambda is serialized first (global index 0), so the owner
+    // encodes `MakeClosure` as opcode 0x0b + u32 index 0 + u16 capture-count 0.
+    let pattern = [0x0b, 0, 0, 0, 0, 0, 0];
+    let positions: Vec<usize> = bytes
+        .windows(pattern.len())
+        .enumerate()
+        .filter(|(_, w)| *w == pattern)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        positions.len(),
+        1,
+        "expected exactly one MAKE_CLOSURE encoding to corrupt"
+    );
+    // Rewrite the global function index to a forward/out-of-range value.
+    bytes[positions[0] + 1..positions[0] + 5].copy_from_slice(&0x7fff_ffffu32.to_le_bytes());
+    reseal_bfasl_checksum(&mut bytes);
+    fs::write(&out, &bytes).unwrap();
+
+    let l = run(&format!("(load \"{}\")", out.display()));
+    assert!(
+        !l.status.success(),
+        "loader must reject an out-of-range closure reference; stdout={} stderr={}",
+        String::from_utf8_lossy(&l.stdout),
+        String::from_utf8_lossy(&l.stderr)
+    );
+    // Not a checksum failure — the structural verifier is what rejects it.
+    let stderr = String::from_utf8_lossy(&l.stderr);
+    assert!(
+        !stderr.contains("checksum"),
+        "rejection must come from the closure-reference verifier, not the checksum: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn compile_file_then_load_round_trips_in_a_fresh_process() {
     let dir = workdir("roundtrip");
