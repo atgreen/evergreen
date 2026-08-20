@@ -103,6 +103,53 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
     pos
 }
 
+/// `handler-case` (and therefore `ignore-errors`) must serialize to a source-free
+/// BBU — its clause tables (type name, clause body PC, var slot) round-trip in an
+/// auxiliary table — and dispatch correctly from a fresh process.
+#[test]
+fn handler_case_bfasl_round_trip() {
+    let dir = workdir("handler-case");
+    let src = dir.join("h.lisp");
+    let out = dir.join("h.bfasl");
+    fs::write(
+        &src,
+        "(defun safe-div (x y)\n\
+        \x20 (handler-case (/ x y) (division-by-zero () :div-zero) (error (c) (list :err c))))\n\
+         (defun ie (x) (ignore-errors (/ 10 x)))\n\
+         (defun guard (x) (handler-case (if (< x 0) (error \"neg\") (* x 2)) (error () -1)))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+
+    let l = run(&format!(
+        "(progn (load \"{}\") \
+           (list (safe-div 10 2) (safe-div 10 0) (ie 5) (ie 0) (guard 5) (guard -3)))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "(5 :DIV-ZERO 2 NIL 10 -1)",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A user `(defun (setf f) …)` writer and its use `(setf (f …) v)` must both
 /// lower to source-free bytecode (the writer installed under a canonical symbol,
 /// the use dispatched through it), and `setf` of composed `c[ad]+r` places must
