@@ -103,6 +103,123 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
     pos
 }
 
+/// `destructuring-bind` must lower to source-free portable bytecode (required,
+/// `&optional` with defaults, and `&rest`) and execute correctly from a fresh
+/// process. This is a prerequisite for compiling real macros (e.g. alexandria's
+/// once-only) without retaining source.
+#[test]
+fn destructuring_bind_bfasl_round_trips() {
+    let dir = workdir("dbind-bfasl");
+    let src = dir.join("d.lisp");
+    let out = dir.join("d.bfasl");
+    fs::write(
+        &src,
+        "(defun db-req (s) (destructuring-bind (a b) s (list b a)))\n\
+         (defun db-opt (s) (destructuring-bind (a &optional (b 99)) s (list a b)))\n\
+         (defun db-rest (s) (destructuring-bind (a &rest r) s (list a r)))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(c.status.success(), "compile-file failed");
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "destructuring-bind must compile to a complete source-free BBU"
+    );
+
+    let l = run(&format!(
+        "(progn (load \"{}\") \
+           (list (db-req '(1 2)) (db-opt '(1)) (db-opt '(1 2)) (db-rest '(1 2 3))))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "((2 1) (1 99) (1 2) (1 (2 3)))",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A macro whose expander uses nested quasiquote (`` `` `` with `,,g` and
+/// `,,@x`) must compile to source-free bytecode and behave identically to the
+/// tree-walker. This uses alexandria's exact ONCE-ONLY (the macro that
+/// motivated the nested-quasiquote and destructuring-bind lowering); its
+/// single-evaluation contract is the observable check.
+#[test]
+fn nested_quasiquote_macro_bfasl_round_trips() {
+    let dir = workdir("nestedqq-bfasl");
+    let src = dir.join("q.lisp");
+    let out = dir.join("q.bfasl");
+    // alexandria's ONCE-ONLY verbatim, with a self-contained MAKE-GENSYM-LIST.
+    fs::write(
+        &src,
+        "(defun make-gensym-list (n &optional (x \"G\"))\n\
+        \x20 (let ((s (if (typep x '(integer 0)) x (string x))))\n\
+        \x20   (loop repeat n collect (gensym s))))\n\
+         (defmacro once-only (specs &body forms)\n\
+        \x20 (let ((gensyms (make-gensym-list (length specs) \"ONCE-ONLY\"))\n\
+        \x20       (names-and-forms\n\
+        \x20         (mapcar (lambda (spec)\n\
+        \x20                   (etypecase spec\n\
+        \x20                     (list (destructuring-bind (name form) spec (cons name form)))\n\
+        \x20                     (symbol (cons spec spec))))\n\
+        \x20                 specs)))\n\
+        \x20   `(let ,(mapcar (lambda (g n) (list g `(gensym ,(string (car n)))))\n\
+        \x20                  gensyms names-and-forms)\n\
+        \x20      `(let (,,@(mapcar (lambda (g n) ``(,,g ,,(cdr n)))\n\
+        \x20                        gensyms names-and-forms))\n\
+        \x20         ,(let ,(mapcar (lambda (n g) (list (car n) g)) names-and-forms gensyms)\n\
+        \x20            ,@forms)))))\n\
+         (defmacro cons1 (x) (once-only (x) `(cons ,x ,x)))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "a nested-quasiquote macro must compile to a complete source-free BBU"
+    );
+
+    // Load and use the macro: CONS1 must evaluate its argument exactly once.
+    let l = run(&format!(
+        "(progn (load \"{}\") \
+           (let ((n 0)) (list (cons1 (progn (incf n) 5)) n)))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load/use failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "((5 . 5) 1)",
+        "once-only must evaluate its argument exactly once"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A function installed from a `.bfasl` carries a NIL fallback body (its real
 /// code lives in the bytecode registry). Calling it indirectly via
 /// `funcall`/`apply`/`mapcar` — not just in operator position — must dispatch

@@ -853,6 +853,7 @@ impl<'e> Lowerer<'e> {
                     self.lower_quasiquote_template(cp(rest).0, 1)
                 }
                 "VALUES" => self.lower_values(rest),
+                "DESTRUCTURING-BIND" => self.lower_destructuring_bind(rest),
                 "MULTIPLE-VALUE-BIND" => self.lower_mvb(rest),
                 "MULTIPLE-VALUE-LIST" => self.lower_mvlist(rest),
                 "LAMBDA" => self.lower_lambda(op, rest),
@@ -2549,30 +2550,39 @@ impl<'e> Lowerer<'e> {
         let (head, tail) = cp(form);
         if head.is_symbol() {
             let name = sym_name(head);
-            if name == "BLISS::UNQUOTE" && depth == 1 {
-                return tail
-                    .is_cons()
-                    .then(|| cp(tail).0)
-                    .ok_or(Bail)
-                    .and_then(|expr| self.lower_expr(expr));
+            // Nested quasiquote counts depth: QUASIQUOTE raises it, UNQUOTE and
+            // UNQUOTE-SPLICING lower it. An UNQUOTE only evaluates once its depth
+            // reaches the surrounding template (depth 1); at a deeper level it is
+            // preserved as `(UNQUOTE <arg one level shallower>)` structure so the
+            // outer expansion re-processes it (e.g. `,,g` inside ``…``).
+            if name == "BLISS::UNQUOTE" {
+                let expr = tail.is_cons().then(|| cp(tail).0).ok_or(Bail)?;
+                if depth == 1 {
+                    return self.lower_expr(expr);
+                }
+                return self.build_qq_operator(head, expr, depth - 1);
+            }
+            if name == "BLISS::UNQUOTE-SPLICING" {
+                // A bare splice form only makes sense as preserved deeper-level
+                // structure; at the active level it must appear in element
+                // position (handled below), never as a whole template.
+                let expr = tail.is_cons().then(|| cp(tail).0).ok_or(Bail)?;
+                if depth == 1 {
+                    return Err(Bail);
+                }
+                return self.build_qq_operator(head, expr, depth - 1);
             }
             if name == "BLISS::QUASIQUOTE" {
                 let inner = tail.is_cons().then(|| cp(tail).0).ok_or(Bail)?;
-                self.lower_quasiquote_template(head, depth)?;
-                self.lower_quasiquote_template(inner, depth + 1)?;
-                let nil = self.add_const(NIL);
-                self.emit(Instr::Const(nil));
-                self.push_n(1);
-                self.emit(Instr::AllocCons);
-                self.pop_n(1);
-                self.emit(Instr::AllocCons);
-                self.pop_n(1);
-                return Ok(());
+                return self.build_qq_operator(head, inner, depth + 1);
             }
         }
 
-        // A spliced element contributes its list ahead of the recursively built
-        // tail. APPEND copies the splice's spine, matching CL quasiquote.
+        // A spliced element at the active level contributes its list ahead of the
+        // recursively built tail. APPEND copies the splice's spine, matching CL
+        // quasiquote. At a deeper level the `(UNQUOTE-SPLICING …)` element is
+        // preserved as ordinary structure by the general recursion below (its
+        // head re-enters the symbol branch above).
         if head.is_cons() {
             let (splice_op, splice_rest) = cp(head);
             if splice_op.is_symbol()
@@ -2593,10 +2603,167 @@ impl<'e> Lowerer<'e> {
                 self.pop_n(1);
                 return Ok(());
             }
+            // `,,@x` — (UNQUOTE (UNQUOTE-SPLICING x)) as an element at depth 2:
+            // the outer `,` reduces the level and `,@x` splices at the enclosing
+            // level. Match the tree-walker (eval_quasiquote_depth): evaluate x now
+            // and wrap each spliced element in a single UNQUOTE for the inner
+            // backquote, i.e. splice `(mapcar (lambda (e) (list 'UNQUOTE e)) x)`.
+            if splice_op.is_symbol() && sym_name(splice_op) == "BLISS::UNQUOTE" && depth == 2 {
+                if let Some(inner) = splice_rest.is_cons().then(|| cp(splice_rest).0) {
+                    if inner.is_cons() {
+                        let (inner_op, inner_rest) = cp(inner);
+                        if inner_op.is_symbol()
+                            && sym_name(inner_op) == "BLISS::UNQUOTE-SPLICING"
+                            && inner_rest.is_cons()
+                        {
+                            let x = cp(inner_rest).0;
+                            let wrapped = self.wrap_unquote_mapcar_form(splice_op, x)?;
+                            self.lower_expr(wrapped)?;
+                            self.lower_quasiquote_template(tail, depth)?;
+                            let append = resolve_sym("APPEND").ok_or(Bail)?.as_symbol_index();
+                            self.emit(Instr::CallNamed {
+                                sym: append,
+                                nargs: 2,
+                            });
+                            self.pop_n(1);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
 
         self.lower_quasiquote_template(head, depth)?;
         self.lower_quasiquote_template(tail, depth)?;
+        self.emit(Instr::AllocCons);
+        self.pop_n(1);
+        Ok(())
+    }
+
+    /// Lower `(destructuring-bind pattern expr body...)` by expanding it into a
+    /// portable `let*` that binds the flat pattern from a fresh temporary via
+    /// `nth`/`nthcdr`. This keeps the form source-free without a dedicated
+    /// runtime binder. Supports required, `&optional` (with defaults), and
+    /// `&rest`/`&body`; nested patterns, `&key`, `&aux`, `&whole`, and
+    /// `&environment` bail so the tree-walker's full binder handles them.
+    fn lower_destructuring_bind(&mut self, rest: BlissVal) -> LowerResult<()> {
+        if !self.portable {
+            return Err(Bail);
+        }
+        let (pattern, after) = cp(rest);
+        if !after.is_cons() {
+            return Err(Bail);
+        }
+        let (value_form, body) = cp(after);
+        let g_name = next_control_token("__DBIND__").replace(':', "_");
+        let g = resolve_sym(&g_name).ok_or(Bail)?;
+        let nth_sym = resolve_sym("NTH").ok_or(Bail)?;
+        let nthcdr_sym = resolve_sym("NTHCDR").ok_or(Bail)?;
+        let if_sym = resolve_sym("IF").ok_or(Bail)?;
+
+        // First binding evaluates the expression once into the temporary.
+        let mut bindings: Vec<BlissVal> = vec![form_list(&[g, value_form])];
+        let mut index: i64 = 0;
+        // 0 = required, 1 = &optional, 2 = &rest/&body
+        let mut mode = 0u8;
+        for spec in list_to_vec(pattern) {
+            if spec.is_symbol() {
+                match sym_name(spec).as_str() {
+                    "&OPTIONAL" => {
+                        mode = 1;
+                        continue;
+                    }
+                    "&REST" | "&BODY" => {
+                        mode = 2;
+                        continue;
+                    }
+                    "&KEY" | "&AUX" | "&WHOLE" | "&ENVIRONMENT" => return Err(Bail),
+                    _ => {}
+                }
+            }
+            match mode {
+                0 => {
+                    if !spec.is_symbol() {
+                        return Err(Bail); // nested destructuring: defer to tree-walker
+                    }
+                    let accessor = form_list(&[nth_sym, BlissVal::from_fixnum(index), g]);
+                    bindings.push(form_list(&[spec, accessor]));
+                    index += 1;
+                }
+                1 => {
+                    let (var, default) = if spec.is_symbol() {
+                        (spec, NIL)
+                    } else if spec.is_cons() {
+                        let (v, drest) = cp(spec);
+                        if !v.is_symbol() {
+                            return Err(Bail);
+                        }
+                        (v, if drest.is_cons() { cp(drest).0 } else { NIL })
+                    } else {
+                        return Err(Bail);
+                    };
+                    // (if (nthcdr index #:g) (nth index #:g) default)
+                    let present = form_list(&[nthcdr_sym, BlissVal::from_fixnum(index), g]);
+                    let value = form_list(&[nth_sym, BlissVal::from_fixnum(index), g]);
+                    let guarded = form_list(&[if_sym, present, value, default]);
+                    bindings.push(form_list(&[var, guarded]));
+                    index += 1;
+                }
+                _ => {
+                    if !spec.is_symbol() {
+                        return Err(Bail);
+                    }
+                    let accessor = form_list(&[nthcdr_sym, BlissVal::from_fixnum(index), g]);
+                    bindings.push(form_list(&[spec, accessor]));
+                }
+            }
+        }
+
+        let mut items = vec![resolve_sym("LET*").ok_or(Bail)?, vec_to_list(&bindings)];
+        items.extend(list_to_vec(body));
+        let expansion = vec_to_list(&items);
+        self.lower_expr(expansion)
+    }
+
+    /// Build the form `(mapcar (lambda (#:e) (list 'unquote #:e)) x)` used to
+    /// realize `,,@x` at depth 2: it wraps each element produced by `x` in a
+    /// single UNQUOTE for the inner backquote. `unquote_sym` is the concrete
+    /// `BLISS::UNQUOTE` symbol taken from the source form. The lambda is
+    /// noncapturing, so it lowers to a source-free `MakeClosure`.
+    fn wrap_unquote_mapcar_form(
+        &self,
+        unquote_sym: BlissVal,
+        x: BlissVal,
+    ) -> LowerResult<BlissVal> {
+        let e_name = next_control_token("__QQE__").replace(':', "_");
+        let e = resolve_sym(&e_name).ok_or(Bail)?;
+        let quoted_unquote = form_list(&[resolve_sym("QUOTE").ok_or(Bail)?, unquote_sym]);
+        let list_call = form_list(&[resolve_sym("LIST").ok_or(Bail)?, quoted_unquote, e]);
+        let lambda = form_list(&[resolve_sym("LAMBDA").ok_or(Bail)?, form_list(&[e]), list_call]);
+        Ok(form_list(&[resolve_sym("MAPCAR").ok_or(Bail)?, lambda, x]))
+    }
+
+    /// Build a two-element preserved quasiquote form `(op arg-template)` where
+    /// `arg` is lowered as a template at `arg_depth`. Used for nested
+    /// QUASIQUOTE/UNQUOTE/UNQUOTE-SPLICING that survive as structure rather than
+    /// being evaluated at the current level.
+    fn build_qq_operator(
+        &mut self,
+        op: BlissVal,
+        arg: BlissVal,
+        arg_depth: usize,
+    ) -> LowerResult<()> {
+        let op_const = self.add_const(op);
+        self.emit(Instr::Const(op_const));
+        self.push_n(1);
+        self.lower_quasiquote_template(arg, arg_depth)?;
+        let nil = self.add_const(NIL);
+        self.emit(Instr::Const(nil));
+        self.push_n(1);
+        // (arg . NIL)
+        self.emit(Instr::AllocCons);
+        self.pop_n(1);
+        // (op . (arg))
         self.emit(Instr::AllocCons);
         self.pop_n(1);
         Ok(())
