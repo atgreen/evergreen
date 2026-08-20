@@ -2128,12 +2128,8 @@ impl<'e> Lowerer<'e> {
         {
             return Err(Bail);
         }
-        let pattern = forms[1];
-        let list = forms[3];
-
         let id = self.fresh_id();
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
-        let lst = resolve_sym(&format!("%LOOP-LST{id}")).ok_or(Bail)?;
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
         let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
 
@@ -2160,35 +2156,81 @@ impl<'e> Lowerer<'e> {
             bind_pattern(tail, form_list(&[s("CDR")?, value]), bindings, assignments)
         }
 
-        let mut binding_items = vec![form_list(&[lst, list])];
-        let mut assignments = Vec::new();
-        bind_pattern(
-            pattern,
-            form_list(&[s("CAR")?, lst]),
+        // Parse one or more parallel `for PATTERN in LIST` clauses plus trailing
+        // `for VAR = EXPR` clauses. Parallel list iteration stops when any list is
+        // exhausted (the WHEN guard ANDs every list variable).
+        let mut for_in_lists: Vec<BlissVal> = Vec::new(); // per-clause list variable
+        let mut binding_items: Vec<BlissVal> = Vec::new();
+        let mut assignments: Vec<BlissVal> = Vec::new();
+        let mut steps: Vec<BlissVal> = Vec::new();
+
+        let add_for_in = |pattern: BlissVal,
+                          list: BlissVal,
+                          idx: usize,
+                          binding_items: &mut Vec<BlissVal>,
+                          assignments: &mut Vec<BlissVal>,
+                          steps: &mut Vec<BlissVal>|
+         -> LowerResult<BlissVal> {
+            let lst = resolve_sym(&format!("%LOOP-LST{id}_{idx}")).ok_or(Bail)?;
+            binding_items.push(form_list(&[lst, list]));
+            bind_pattern(pattern, form_list(&[s("CAR")?, lst]), binding_items, assignments)?;
+            steps.push(form_list(&[s("SETQ")?, lst, form_list(&[s("CDR")?, lst])]));
+            Ok(lst)
+        };
+        let lst0 = add_for_in(
+            forms[1],
+            forms[3],
+            0,
             &mut binding_items,
             &mut assignments,
+            &mut steps,
         )?;
+        for_in_lists.push(lst0);
 
         let mut action_at = 4;
         while forms.get(action_at).and_then(|f| kw(*f)).as_deref() == Some("FOR") {
-            let var = *forms.get(action_at + 1).ok_or(Bail)?;
-            if !var.is_symbol()
-                || forms.get(action_at + 2).and_then(|f| kw(*f)).as_deref() != Some("=")
-            {
-                return Err(Bail);
+            match forms.get(action_at + 2).and_then(|f| kw(*f)).as_deref() {
+                Some("IN") => {
+                    let pattern = *forms.get(action_at + 1).ok_or(Bail)?;
+                    let list = *forms.get(action_at + 3).ok_or(Bail)?;
+                    let lst = add_for_in(
+                        pattern,
+                        list,
+                        for_in_lists.len(),
+                        &mut binding_items,
+                        &mut assignments,
+                        &mut steps,
+                    )?;
+                    for_in_lists.push(lst);
+                }
+                Some("=") => {
+                    let var = *forms.get(action_at + 1).ok_or(Bail)?;
+                    if !var.is_symbol() {
+                        return Err(Bail);
+                    }
+                    let expr = *forms.get(action_at + 3).ok_or(Bail)?;
+                    binding_items.push(form_list(&[var, NIL]));
+                    assignments.push(form_list(&[s("SETQ")?, var, expr]));
+                }
+                _ => return Err(Bail),
             }
-            let expr = *forms.get(action_at + 3).ok_or(Bail)?;
-            binding_items.push(form_list(&[var, NIL]));
-            assignments.push(form_list(&[s("SETQ")?, var, expr]));
             action_at += 4;
         }
         let action = forms.get(action_at..).ok_or(Bail)?;
         let (uses_acc, acc_init, per_iter, result) = self.lower_loop_action(action, acc)?;
 
-        let mut when_items = vec![s("WHEN")?, lst];
+        // Guard: every list variable must still be non-nil.
+        let guard = if for_in_lists.len() == 1 {
+            for_in_lists[0]
+        } else {
+            let mut and_items = vec![s("AND")?];
+            and_items.extend(for_in_lists.iter().copied());
+            form_list(&and_items)
+        };
+        let mut when_items = vec![s("WHEN")?, guard];
         when_items.append(&mut assignments);
         when_items.extend(per_iter);
-        when_items.push(form_list(&[s("SETQ")?, lst, form_list(&[s("CDR")?, lst])]));
+        when_items.append(&mut steps);
         when_items.push(form_list(&[s("GO")?, top]));
         let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
 

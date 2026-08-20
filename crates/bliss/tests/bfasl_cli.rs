@@ -220,6 +220,46 @@ fn nested_quasiquote_macro_bfasl_round_trips() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Parallel `loop for X in L1 for Y in L2 collect …` must lower to source-free
+/// bytecode and step the lists in lockstep, stopping when the shorter list is
+/// exhausted (CL parallel-iteration semantics).
+#[test]
+fn parallel_loop_for_in_bfasl_round_trips() {
+    let dir = workdir("parallel-loop");
+    let src = dir.join("p.lisp");
+    let out = dir.join("p.bfasl");
+    fs::write(
+        &src,
+        "(defun zip-add (as bs) (loop for a in as for b in bs collect (+ a b)))\n\
+         (defun zip-uneven (as bs) (loop for a in as for b in bs collect (list a b)))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(c.status.success(), "compile-file failed");
+    assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (list (zip-add '(1 2 3) '(4 5 6)) (zip-uneven '(1 2 3) '(4 5))))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "((5 7 9) ((1 4) (2 5)))",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Capturing `flet`/`labels` locals — closures over enclosing lexicals — and
 /// capturing lambdas must compile to source-free bytecode (env-capturing
 /// `MakeClosure`) and run correctly from a fresh process, including read
