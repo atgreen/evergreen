@@ -8041,6 +8041,41 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_stdlib::set_gethash(key, tbl, val)?;
                 return Ok(val);
             }
+            "BLISS::SET-AREF" => {
+                // Store primitive for bytecode-lowered `(setf (aref|svref|char|
+                // schar|row-major-aref|elt seq index) value)`. Arguments arrive
+                // already evaluated (seq, index, value); the element is mutated in
+                // place and the value returned (SETF semantics).
+                let (seq_form, r) = cp(cdr);
+                let (idx_form, r2) = cp(r);
+                let (val_form, _) = cp(r2);
+                let seq = eval_form(seq_form, env)?;
+                let idx = eval_form(idx_form, env)?;
+                let val = eval_form(val_form, env)?;
+                if !idx.is_fixnum() || idx.as_fixnum() < 0 {
+                    return Err(BlissError::TypeError {
+                        datum: idx,
+                        expected: "non-negative sequence index".into(),
+                    });
+                }
+                let i = idx.as_fixnum() as usize;
+                if is_string_value(seq) {
+                    bliss_stdlib::string_set_char(seq, i, val)?;
+                } else if seq.is_cons() {
+                    let mut cursor = seq;
+                    for _ in 0..i {
+                        cursor = cp(cursor).1;
+                    }
+                    if cursor.is_cons() {
+                        unsafe {
+                            (*(cursor.as_ptr() as *mut ConsCell)).car = val;
+                        }
+                    }
+                } else {
+                    bliss_stdlib::set_elt(seq, i, val)?;
+                }
+                return Ok(val);
+            }
             "BLISS::SET-CAR" | "BLISS::SET-CDR" => {
                 // Store primitives for bytecode-lowered `(setf (car|cdr place)
                 // value)`. Arguments arrive already evaluated (cons, value)

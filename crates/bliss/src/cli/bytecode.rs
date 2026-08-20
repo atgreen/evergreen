@@ -1583,6 +1583,20 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
+            } else if let Some((seq, index)) = aref_setf_place(place) {
+                // `(setf (aref|svref|char|schar|row-major-aref|elt seq i) val)` →
+                // the internal store primitive BLISS::SET-AREF (seq, index, value).
+                let sym = resolve_sym("BLISS::SET-AREF").ok_or(Bail)?.as_symbol_index();
+                self.lower_expr(seq)?;
+                self.lower_expr(index)?;
+                self.lower_expr(val)?;
+                self.emit(Instr::CallNamed { sym, nargs: 3 });
+                self.pop_n(3);
+                self.push_n(1);
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
             } else if let Some((writer, args)) = self.user_setf_writer_place(place) {
                 // `(setf (f a b) val)` for a user `(defun (setf f) …)` writer:
                 // call the writer as `(writer val a b)` (new value first, then the
@@ -3847,6 +3861,24 @@ fn compile_capturing_local(
         max_args,
         variadic,
     })
+}
+
+/// Recognize a single-index element SETF place `(aref|svref|char|schar|
+/// row-major-aref|elt SEQ INDEX)`, returning the sequence and index subforms.
+fn aref_setf_place(place: BlissVal) -> Option<(BlissVal, BlissVal)> {
+    if !place.is_cons() {
+        return None;
+    }
+    let items = list_to_vec(place);
+    if items.len() != 3 || !items[0].is_symbol() {
+        return None;
+    }
+    match symbol_bare_name(&sym_name(items[0])).as_str() {
+        "AREF" | "SVREF" | "CHAR" | "SCHAR" | "ROW-MAJOR-AREF" | "ELT" => {
+            Some((items[1], items[2]))
+        }
+        _ => None,
+    }
 }
 
 /// Recognize a `(cXr X)` SETF place — any `c[ad]+r` accessor plus `first`/`rest`
