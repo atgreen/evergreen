@@ -71,8 +71,12 @@ pub enum Instr {
     /// Pop cdr then car, allocate a fresh cons, and push it. Quasiquote lowering
     /// uses this instead of retaining an executable source template.
     AllocCons,
-    /// Create a callable value for a nested, noncapturing bytecode function.
-    MakeClosure(u32),
+    /// Create a callable value for a nested bytecode function. `func` is the
+    /// owner's local nested-function index. When `capture_env` is set the closure
+    /// captures the creating activation's heap `EnvFrame`, so its body can read
+    /// and write the enclosing lexical bindings (portable `flet`/`labels` locals
+    /// and capturing lambdas); otherwise it is a noncapturing closure.
+    MakeClosure { func: u32, capture_env: bool },
     /// Discard the top of the operand stack.
     Pop,
     /// Duplicate the top of the operand stack.

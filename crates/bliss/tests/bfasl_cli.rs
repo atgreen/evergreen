@@ -220,6 +220,67 @@ fn nested_quasiquote_macro_bfasl_round_trips() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Capturing `flet`/`labels` locals — closures over enclosing lexicals — and
+/// capturing lambdas must compile to source-free bytecode (env-capturing
+/// `MakeClosure`) and run correctly from a fresh process, including read
+/// capture, shared mutation, mutual recursion, and a lambda that closes over a
+/// parameter.
+#[test]
+fn capturing_closures_bfasl_round_trip() {
+    let dir = workdir("capturing-closures");
+    let src = dir.join("c.lisp");
+    let out = dir.join("c.bfasl");
+    fs::write(
+        &src,
+        "(defun cap-read (x) (labels ((h (y) (+ x y))) (h 10)))\n\
+         (defun cap-mutate (x)\n\
+        \x20 (let ((acc 0))\n\
+        \x20   (flet ((add (y) (setf acc (+ acc (* x y)))))\n\
+        \x20     (add 1) (add 2) (add 3) acc)))\n\
+         (defun cap-mutual (n)\n\
+        \x20 (labels ((ev (k) (if (= k 0) t (od (- k 1))))\n\
+        \x20          (od (k) (if (= k 0) nil (ev (- k 1)))))\n\
+        \x20   (list (ev n) (od n))))\n\
+         (defun cap-lambda (mult xs) (mapcar (lambda (x) (* x mult)) xs))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "capturing closures must compile to a complete source-free BBU"
+    );
+
+    let l = run(&format!(
+        "(progn (load \"{}\") \
+           (list (cap-read 5) (cap-mutate 10) (cap-mutual 4) (cap-mutual 3) \
+                 (cap-lambda 3 '(1 2 3))))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load/call failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "(15 60 (T NIL) (NIL T) (3 6 9))",
+        "capturing closures must run correctly from a fresh process",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A function installed from a `.bfasl` carries a NIL fallback body (its real
 /// code lives in the bytecode registry). Calling it indirectly via
 /// `funcall`/`apply`/`mapcar` — not just in operator position — must dispatch

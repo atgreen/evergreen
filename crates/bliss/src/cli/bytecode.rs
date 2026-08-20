@@ -544,6 +544,10 @@ struct Lowerer<'e> {
     /// index its compiled body is registered under. A call to such a name lowers
     /// to a bytecode `CallNamed` on that gensym.
     local_fns: std::collections::HashMap<String, u32>,
+    /// Lexically-visible *capturing* local functions (flet/labels whose bodies
+    /// close over enclosing lexicals). Each is a closure value stored in a boxed
+    /// binding of the same name; a call to it lowers to `(funcall name args…)`.
+    closure_fns: std::collections::HashSet<String>,
     /// Lazily-built macro-expansion environment (mirrors `env`'s macros), used
     /// to compile macro forms by expanding then lowering.
     macro_env: Option<MacroexpandEnv>,
@@ -597,6 +601,7 @@ impl<'e> Lowerer<'e> {
             scopes: vec![HashMap::new()],
             captured_names: std::collections::HashSet::new(),
             local_fns: std::collections::HashMap::new(),
+            closure_fns: std::collections::HashSet::new(),
             macro_env: None,
             has_env: false,
             next_local: 0,
@@ -854,6 +859,7 @@ impl<'e> Lowerer<'e> {
                 }
                 "VALUES" => self.lower_values(rest),
                 "DESTRUCTURING-BIND" => self.lower_destructuring_bind(rest),
+                "MULTIPLE-VALUE-CALL" => self.lower_multiple_value_call(rest),
                 "MULTIPLE-VALUE-BIND" => self.lower_mvb(rest),
                 "MULTIPLE-VALUE-LIST" => self.lower_mvlist(rest),
                 "LAMBDA" => self.lower_lambda(op, rest),
@@ -1327,6 +1333,14 @@ impl<'e> Lowerer<'e> {
             self.push_n(1);
             return Ok(());
         }
+        // A capturing local function is a closure value in a boxed binding of its
+        // name: `(fn args…)` calls it through `funcall`, which dispatches the
+        // closure's registered bytecode (with its captured environment installed).
+        if self.closure_fns.contains(name) {
+            let funcall = resolve_sym("FUNCALL").ok_or(Bail)?;
+            let call = arena_cons(funcall, arena_cons(op, rest));
+            return self.lower_expr(call);
+        }
         // A macro: expand one level (with the same macro functions the
         // tree-walker uses) and lower the expansion. lower_expr recurses, so a
         // macro that expands to another macro is handled too.
@@ -1370,7 +1384,16 @@ impl<'e> Lowerer<'e> {
             self.env.funs.borrow().contains_key(name) || super::global_fn(name).is_some();
         let is_builtin = super::is_builtin_function(&bare) || PRIMITIVE_ALLOWLIST.contains(&name);
         if !is_user_fn && !is_builtin {
-            return Err(record_bail(|| format!("call:{name}")));
+            // Portable (BFASL) compilation represents a forward reference to a
+            // not-yet-defined function directly: emit a named call that resolves
+            // against the symbol's function cell at load/run time. Special
+            // operators, macros, symbol-macros, and quasiquote have all been
+            // handled above, so a remaining unknown operator is a function call.
+            // The opportunistic compiler stays conservative and defers an unknown
+            // operator to the tree-walker instead.
+            if !self.portable {
+                return Err(record_bail(|| format!("call:{name}")));
+            }
         }
         let args = list_to_vec(rest);
         let nargs = args.len();
@@ -2641,11 +2664,12 @@ impl<'e> Lowerer<'e> {
     }
 
     /// Lower `(destructuring-bind pattern expr body...)` by expanding it into a
-    /// portable `let*` that binds the flat pattern from a fresh temporary via
+    /// portable `let*` that binds the pattern from a fresh temporary via
     /// `nth`/`nthcdr`. This keeps the form source-free without a dedicated
-    /// runtime binder. Supports required, `&optional` (with defaults), and
-    /// `&rest`/`&body`; nested patterns, `&key`, `&aux`, `&whole`, and
-    /// `&environment` bail so the tree-walker's full binder handles them.
+    /// runtime binder. Supports required, `&optional` (with defaults),
+    /// `&rest`/`&body`, dotted patterns, and nested sub-patterns (recursively);
+    /// `&key`, `&aux`, `&whole`, and `&environment` bail so the tree-walker's
+    /// full binder handles them.
     fn lower_destructuring_bind(&mut self, rest: BlissVal) -> LowerResult<()> {
         if !self.portable {
             return Err(Bail);
@@ -2657,67 +2681,9 @@ impl<'e> Lowerer<'e> {
         let (value_form, body) = cp(after);
         let g_name = next_control_token("__DBIND__").replace(':', "_");
         let g = resolve_sym(&g_name).ok_or(Bail)?;
-        let nth_sym = resolve_sym("NTH").ok_or(Bail)?;
-        let nthcdr_sym = resolve_sym("NTHCDR").ok_or(Bail)?;
-        let if_sym = resolve_sym("IF").ok_or(Bail)?;
-
         // First binding evaluates the expression once into the temporary.
         let mut bindings: Vec<BlissVal> = vec![form_list(&[g, value_form])];
-        let mut index: i64 = 0;
-        // 0 = required, 1 = &optional, 2 = &rest/&body
-        let mut mode = 0u8;
-        for spec in list_to_vec(pattern) {
-            if spec.is_symbol() {
-                match sym_name(spec).as_str() {
-                    "&OPTIONAL" => {
-                        mode = 1;
-                        continue;
-                    }
-                    "&REST" | "&BODY" => {
-                        mode = 2;
-                        continue;
-                    }
-                    "&KEY" | "&AUX" | "&WHOLE" | "&ENVIRONMENT" => return Err(Bail),
-                    _ => {}
-                }
-            }
-            match mode {
-                0 => {
-                    if !spec.is_symbol() {
-                        return Err(Bail); // nested destructuring: defer to tree-walker
-                    }
-                    let accessor = form_list(&[nth_sym, BlissVal::from_fixnum(index), g]);
-                    bindings.push(form_list(&[spec, accessor]));
-                    index += 1;
-                }
-                1 => {
-                    let (var, default) = if spec.is_symbol() {
-                        (spec, NIL)
-                    } else if spec.is_cons() {
-                        let (v, drest) = cp(spec);
-                        if !v.is_symbol() {
-                            return Err(Bail);
-                        }
-                        (v, if drest.is_cons() { cp(drest).0 } else { NIL })
-                    } else {
-                        return Err(Bail);
-                    };
-                    // (if (nthcdr index #:g) (nth index #:g) default)
-                    let present = form_list(&[nthcdr_sym, BlissVal::from_fixnum(index), g]);
-                    let value = form_list(&[nth_sym, BlissVal::from_fixnum(index), g]);
-                    let guarded = form_list(&[if_sym, present, value, default]);
-                    bindings.push(form_list(&[var, guarded]));
-                    index += 1;
-                }
-                _ => {
-                    if !spec.is_symbol() {
-                        return Err(Bail);
-                    }
-                    let accessor = form_list(&[nthcdr_sym, BlissVal::from_fixnum(index), g]);
-                    bindings.push(form_list(&[spec, accessor]));
-                }
-            }
-        }
+        destructure_pattern(pattern, g, &mut bindings)?;
 
         let mut items = vec![resolve_sym("LET*").ok_or(Bail)?, vec_to_list(&bindings)];
         items.extend(list_to_vec(body));
@@ -2831,6 +2797,37 @@ impl<'e> Lowerer<'e> {
         Ok(())
     }
 
+    /// `(multiple-value-call fn form...)` — apply `fn` to all values produced by
+    /// each `form`, concatenated. Lowered portably as
+    /// `(apply fn (append (multiple-value-list f1) (multiple-value-list f2) …))`,
+    /// reusing MULTIPLE-VALUE-LIST, APPEND, and APPLY. The opportunistic compiler
+    /// defers to the tree-walker's native form.
+    fn lower_multiple_value_call(&mut self, rest: BlissVal) -> LowerResult<()> {
+        if !self.portable {
+            return Err(Bail);
+        }
+        if !rest.is_cons() {
+            return Err(Bail);
+        }
+        let (fn_form, forms) = cp(rest);
+        let mvl = resolve_sym("MULTIPLE-VALUE-LIST").ok_or(Bail)?;
+        let mut value_lists: Vec<BlissVal> = list_to_vec(forms)
+            .into_iter()
+            .map(|f| form_list(&[mvl, f]))
+            .collect();
+        let args_list = match value_lists.len() {
+            0 => NIL,
+            1 => value_lists.pop().unwrap(),
+            _ => {
+                let mut items = vec![resolve_sym("APPEND").ok_or(Bail)?];
+                items.extend(value_lists);
+                vec_to_list(&items)
+            }
+        };
+        let apply_form = form_list(&[resolve_sym("APPLY").ok_or(Bail)?, fn_form, args_list]);
+        self.lower_expr(apply_form)
+    }
+
     // ── Closures (nmq.5) ───────────────────────────────────────────
 
     /// Enclosing lexical locals a `(lambda params body)` captures (free symbols
@@ -2885,22 +2882,47 @@ impl<'e> Lowerer<'e> {
     /// cannot yet lower makes the whole enclosing function bail to the
     /// tree-walker (`Bail`), rather than falling back to a non-portable
     /// `EvalHost` the serializer would reject.
-    fn emit_portable_closure(&mut self, params_form: BlissVal, body: BlissVal) -> LowerResult<()> {
-        let bf = compile_function(
-            "<lambda>",
-            params_form,
-            body,
-            self.env,
-            self.portable,
-            false,
-        )
-        .ok_or(Bail)?;
+    fn emit_portable_closure(
+        &mut self,
+        params_form: BlissVal,
+        body: BlissVal,
+        captured: &[String],
+    ) -> LowerResult<()> {
+        let bf = if captured.is_empty() {
+            compile_function("<lambda>", params_form, body, self.env, self.portable, false)
+                .ok_or(Bail)?
+        } else {
+            // A capturing lambda reaches the enclosing lexicals through the heap
+            // frame it captures. Every captured variable must be boxed (in the
+            // frame); a reference to an enclosing frame slot cannot be captured,
+            // so bail to the tree-walker. The closure resolves any boxed name in
+            // scope, so pass the whole boxed set (plus the enclosing capturing
+            // closures it may call).
+            for name in captured {
+                if matches!(self.lookup_local(name), Some(VarLoc::Slot(_))) {
+                    return Err(Bail);
+                }
+            }
+            let captures: std::collections::HashSet<String> = self
+                .scopes
+                .iter()
+                .flat_map(|s| s.iter())
+                .filter_map(|(k, v)| matches!(v, VarLoc::Boxed).then(|| k.clone()))
+                .collect();
+            self.has_env = true;
+            let callable = self.closure_fns.clone();
+            compile_capturing_local(params_form, body, self.env, &captures, &callable, self.portable)
+                .ok_or(Bail)?
+        };
         let idx = self.nested_functions.len();
         if idx > u32::MAX as usize {
             return Err(Bail);
         }
         self.nested_functions.push(Box::new(bf));
-        self.emit(Instr::MakeClosure(idx as u32));
+        self.emit(Instr::MakeClosure {
+            func: idx as u32,
+            capture_env: !captured.is_empty(),
+        });
         self.push_n(1);
         Ok(())
     }
@@ -2909,8 +2931,8 @@ impl<'e> Lowerer<'e> {
     fn lower_lambda(&mut self, op: BlissVal, rest: BlissVal) -> LowerResult<()> {
         let (params_form, body) = cp(rest);
         let captured = self.lambda_captured_locals(params_form, body);
-        if self.portable && captured.is_empty() {
-            return self.emit_portable_closure(params_form, body);
+        if self.portable {
+            return self.emit_portable_closure(params_form, body, &captured);
         }
         let form = arena_cons(op, rest);
         self.emit_closure(form, &captured)
@@ -2919,6 +2941,11 @@ impl<'e> Lowerer<'e> {
     /// `(function name)` / `#'(lambda …)` — a function designator or a closure.
     fn lower_function(&mut self, rest: BlissVal) -> LowerResult<()> {
         let (target, _) = cp(rest);
+        // `#'localfn` for a capturing flet/labels function is the closure value
+        // itself, held in a boxed binding of its name — load it as a variable.
+        if target.is_symbol() && self.closure_fns.contains(&sym_name(target)) {
+            return self.lower_expr(target);
+        }
         if target.is_symbol() && self.portable {
             self.emit(Instr::LoadFunction(target.as_symbol_index()));
             self.push_n(1);
@@ -2929,8 +2956,8 @@ impl<'e> Lowerer<'e> {
             if t_op.is_symbol() && sym_name(t_op) == "LAMBDA" {
                 let (params_form, body) = cp(t_rest);
                 let captured = self.lambda_captured_locals(params_form, body);
-                if self.portable && captured.is_empty() {
-                    return self.emit_portable_closure(params_form, body);
+                if self.portable {
+                    return self.emit_portable_closure(params_form, body, &captured);
                 }
                 captured
             } else {
@@ -2977,11 +3004,26 @@ impl<'e> Lowerer<'e> {
             parsed.push((sym_name(name_form), gensym, params_form, fbody));
         }
 
-        // Non-capturing check: no local function body may reference an enclosing
-        // lexical local.
+        let local_names: std::collections::HashSet<String> =
+            parsed.iter().map(|(n, _, _, _)| n.clone()).collect();
+
+        // Portable (BFASL) compilation lowers every local function to an
+        // env-capturing closure stored in a heap frame: those serialize as nested
+        // bytecode functions, so the artifact is source-free and a fresh process
+        // can load it. (The gensym `CallNamed` fast path below registers local
+        // bodies only in the compiling process's registry, so it never survives a
+        // .bfasl round-trip.) A capturing closure additionally reaches the
+        // enclosing lexicals through the frame.
+        if self.portable {
+            return self.lower_flet_capturing(&parsed, body, is_labels);
+        }
+
+        // Non-portable opportunistic path. A local function that references an
+        // enclosing lexical (a capture) needs the closure machinery, which is
+        // portable-only, so defer such a form to the tree-walker.
         let enclosing: std::collections::HashSet<String> =
             self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
-        for (_, _, params_form, fbody) in &parsed {
+        let is_capturing = parsed.iter().any(|(_, _, params_form, fbody)| {
             let params: std::collections::HashSet<String> = list_to_vec(*params_form)
                 .iter()
                 .filter(|p| p.is_symbol())
@@ -2992,20 +3034,18 @@ impl<'e> Lowerer<'e> {
             for f in list_to_vec(*fbody) {
                 collect_symbol_names(f, &mut used);
             }
-            if used
-                .iter()
-                .any(|u| enclosing.contains(u) && !params.contains(u))
-            {
-                return Err(Bail);
-            }
+            used.iter().any(|u| {
+                enclosing.contains(u) && !params.contains(u) && !local_names.contains(u)
+            })
+        });
+        if is_capturing {
+            return Err(Bail);
         }
 
         // If any local function is referenced as a VALUE (`#'localfn`) — in the
         // body or in a sibling's body (mutual `labels`) — bail to the tree-walker,
         // which returns a proper closure for it. The bytecode backend only knows
         // how to CALL a lowered local function, not to yield it as a value.
-        let local_names: std::collections::HashSet<String> =
-            parsed.iter().map(|(n, _, _, _)| n.clone()).collect();
         if references_local_fn_value(body, &local_names)
             || parsed
                 .iter()
@@ -3046,6 +3086,122 @@ impl<'e> Lowerer<'e> {
         }
         let r = self.lower_progn(body);
         self.local_fns = saved_local_fns;
+        r
+    }
+
+    /// Portable capturing `flet`/`labels`: each local function closes over
+    /// enclosing lexicals (and, for `labels`, its siblings). The closures live in
+    /// a shared child heap frame so mutual/self recursion resolves; each is bound
+    /// to a boxed variable of its name and called through `funcall` (see
+    /// `lower_call`). Enclosing captured lexicals must already be boxed
+    /// (arranged by `compute_captured_names`); a local that references an unboxed
+    /// enclosing slot bails.
+    fn lower_flet_capturing(
+        &mut self,
+        parsed: &[(String, u32, BlissVal, BlissVal)],
+        body: BlissVal,
+        is_labels: bool,
+    ) -> LowerResult<()> {
+        let local_names: std::collections::HashSet<String> =
+            parsed.iter().map(|(n, _, _, _)| n.clone()).collect();
+
+        // Snapshot the enclosing environment the closures may capture.
+        let enclosing_boxed: std::collections::HashSet<String> = self
+            .scopes
+            .iter()
+            .flat_map(|s| s.iter())
+            .filter_map(|(k, v)| matches!(v, VarLoc::Boxed).then(|| k.clone()))
+            .collect();
+        let enclosing_slots: std::collections::HashSet<String> = self
+            .scopes
+            .iter()
+            .flat_map(|s| s.iter())
+            .filter_map(|(k, v)| matches!(v, VarLoc::Slot(_)).then(|| k.clone()))
+            .collect();
+        let enclosing_callable = self.closure_fns.clone();
+
+        // A captured enclosing lexical must be boxed to live in the heap frame;
+        // if a local body references an unboxed enclosing slot, defer the whole
+        // form to the tree-walker.
+        for (_, _, params_form, fbody) in parsed {
+            let params: std::collections::HashSet<String> = list_to_vec(*params_form)
+                .iter()
+                .filter(|p| p.is_symbol())
+                .map(|p| sym_name(*p))
+                .collect();
+            let mut used = std::collections::HashSet::new();
+            for f in list_to_vec(*fbody) {
+                collect_symbol_names(f, &mut used);
+            }
+            if used.iter().any(|u| {
+                enclosing_slots.contains(u)
+                    && !enclosing_boxed.contains(u)
+                    && !params.contains(u)
+                    && !local_names.contains(u)
+            }) {
+                return Err(Bail);
+            }
+        }
+
+        // Establish a child heap frame to hold the closures, so labels siblings
+        // (defined into the same frame) resolve through capture.
+        self.has_env = true;
+        self.emit(Instr::PushEnvChild);
+        let saved_next = self.next_local;
+        self.enter_scope();
+        let saved_closure_fns = self.closure_fns.clone();
+
+        // Names each closure may resolve. labels closures additionally see all
+        // siblings; flet closures do not.
+        let mut captures = enclosing_boxed;
+        let mut callable = enclosing_callable;
+        if is_labels {
+            for name in &local_names {
+                captures.insert(name.clone());
+                callable.insert(name.clone());
+            }
+        }
+
+        // Register the local-function names as boxed closure bindings, visible in
+        // the body (calls go through funcall via lower_call's closure_fns path).
+        for name in &local_names {
+            self.scopes
+                .last_mut()
+                .unwrap()
+                .insert(name.clone(), VarLoc::Boxed);
+            self.closure_fns.insert(name.clone());
+        }
+
+        // Build each closure and store it in the child frame.
+        for (name, _gensym, params_form, fbody) in parsed {
+            let bf = compile_capturing_local(
+                *params_form,
+                *fbody,
+                self.env,
+                &captures,
+                &callable,
+                self.portable,
+            )
+            .ok_or(Bail)?;
+            let idx = self.nested_functions.len();
+            if idx > u32::MAX as usize {
+                return Err(Bail);
+            }
+            self.nested_functions.push(Box::new(bf));
+            self.emit(Instr::MakeClosure {
+                func: idx as u32,
+                capture_env: true,
+            });
+            self.push_n(1);
+            let ni = self.intern_name(name);
+            self.emit(Instr::DefineEnvVar(ni));
+            self.pop_n(1);
+        }
+
+        let r = self.lower_progn(body);
+        self.closure_fns = saved_closure_fns;
+        self.exit_scope(saved_next);
+        self.emit(Instr::PopEnvChild);
         r
     }
 }
@@ -3099,6 +3255,162 @@ fn compile_local_function(
         max_args,
         variadic,
     })
+}
+
+/// Compile a capturing `flet`/`labels` local function as an env-capturing
+/// closure body. `captures` names bindings resolved through the captured heap
+/// frame (enclosing lexicals plus, for `labels`, sibling closures); `callable`
+/// is the subset of those that are themselves closures and must be invoked via
+/// `funcall`. `has_env` is forced so the closure always has an environment to
+/// reach the captured frame, even when it defines no boxed locals of its own.
+fn compile_capturing_local(
+    params_form: BlissVal,
+    fbody: BlissVal,
+    env: &Env,
+    captures: &std::collections::HashSet<String>,
+    callable: &std::collections::HashSet<String>,
+    portable: bool,
+) -> Option<BytecodeFunction> {
+    let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
+    let mut lo = Lowerer::new(env);
+    lo.portable = portable;
+    lo.captured_names = compute_captured_names(fbody);
+    lo.has_env = true;
+    lo.closure_fns = callable.clone();
+    for name in captures {
+        lo.scopes[0].insert(name.clone(), VarLoc::Boxed);
+    }
+    let mut param_layout = Vec::with_capacity(param_names.len());
+    for pn in &param_names {
+        // A parameter shadows a captured enclosing lexical of the same name.
+        let loc = lo.alloc_local(pn);
+        param_layout.push((pn.clone(), loc));
+    }
+    let param_types = if variadic {
+        vec![DeclaredType::Any; param_names.len()]
+    } else {
+        declared_parameter_types(fbody, &param_names)?
+    };
+    if lower_body(&mut lo, fbody).is_err() {
+        return None;
+    }
+    lo.emit(Instr::Return);
+    Some(BytecodeFunction {
+        code: lo.code,
+        constants: lo.constants,
+        handler_cases: lo.handler_cases,
+        handler_binds: lo.handler_binds,
+        names: lo.names,
+        restart_cases: lo.restart_cases,
+        nested_functions: lo.nested_functions,
+        param_layout,
+        param_types,
+        has_env: true,
+        n_locals: lo.n_locals,
+        max_stack: lo.max_stack.max(1),
+        arity: min_args,
+        name: "<flet-closure>".to_string(),
+        params_form: if variadic { params_form } else { NIL },
+        min_args,
+        max_args,
+        variadic,
+    })
+}
+
+/// Append `let*` bindings that destructure `pattern` against the value held in
+/// the symbol `source`, using `nth`/`nthcdr`. Handles required, `&optional`
+/// (with defaults), `&rest`/`&body`, a dotted tail, and nested list
+/// sub-patterns (recursively, each through a fresh temporary). `&key`, `&aux`,
+/// `&whole`, and `&environment` bail. Positions are indexed from `source`, so
+/// the emitted bindings are order-independent and safe in a `let*`.
+fn destructure_pattern(
+    pattern: BlissVal,
+    source: BlissVal,
+    bindings: &mut Vec<BlissVal>,
+) -> LowerResult<()> {
+    let nth_sym = resolve_sym("NTH").ok_or(Bail)?;
+    let nthcdr_sym = resolve_sym("NTHCDR").ok_or(Bail)?;
+    let if_sym = resolve_sym("IF").ok_or(Bail)?;
+    let nth_at = |i: i64| form_list(&[nth_sym, BlissVal::from_fixnum(i), source]);
+    let nthcdr_at = |i: i64| form_list(&[nthcdr_sym, BlissVal::from_fixnum(i), source]);
+
+    let mut cur = pattern;
+    let mut index: i64 = 0;
+    // 0 = required, 1 = &optional, 2 = &rest/&body
+    let mut mode = 0u8;
+    let mut rest_bound = false;
+    loop {
+        if cur.is_nil() {
+            break;
+        }
+        if cur.is_symbol() {
+            // A dotted tail binds the remaining cdr (e.g. `(a . rest)`).
+            bindings.push(form_list(&[cur, nthcdr_at(index)]));
+            break;
+        }
+        if !cur.is_cons() {
+            return Err(Bail);
+        }
+        let (elem, next) = cp(cur);
+        if elem.is_symbol() {
+            match sym_name(elem).as_str() {
+                "&OPTIONAL" => {
+                    mode = 1;
+                    cur = next;
+                    continue;
+                }
+                "&REST" | "&BODY" => {
+                    mode = 2;
+                    cur = next;
+                    continue;
+                }
+                "&KEY" | "&AUX" | "&WHOLE" | "&ENVIRONMENT" => return Err(Bail),
+                _ => {}
+            }
+        }
+        match mode {
+            0 => {
+                if elem.is_symbol() {
+                    bindings.push(form_list(&[elem, nth_at(index)]));
+                } else if elem.is_cons() {
+                    // Nested sub-pattern: bind a fresh temporary to this position,
+                    // then destructure the sub-pattern against it.
+                    let temp_name = next_control_token("__DBIND__").replace(':', "_");
+                    let temp = resolve_sym(&temp_name).ok_or(Bail)?;
+                    bindings.push(form_list(&[temp, nth_at(index)]));
+                    destructure_pattern(elem, temp, bindings)?;
+                } else {
+                    return Err(Bail);
+                }
+                index += 1;
+            }
+            1 => {
+                let (var, default) = if elem.is_symbol() {
+                    (elem, NIL)
+                } else if elem.is_cons() {
+                    let (v, drest) = cp(elem);
+                    if !v.is_symbol() {
+                        return Err(Bail);
+                    }
+                    (v, if drest.is_cons() { cp(drest).0 } else { NIL })
+                } else {
+                    return Err(Bail);
+                };
+                let guarded = form_list(&[if_sym, nthcdr_at(index), nth_at(index), default]);
+                bindings.push(form_list(&[var, guarded]));
+                index += 1;
+            }
+            _ => {
+                if rest_bound || !elem.is_symbol() {
+                    return Err(Bail);
+                }
+                bindings.push(form_list(&[elem, nthcdr_at(index)]));
+                rest_bound = true;
+            }
+        }
+        cur = next;
+    }
+    Ok(())
 }
 
 /// Compile a `RESTART-CASE` clause as a nested function. `captures` names
@@ -3762,6 +4074,40 @@ fn compute_captured_names(body: BlissVal) -> std::collections::HashSet<String> {
                 }
                 return;
             }
+            if n == "FLET" || n == "LABELS" {
+                // Enclosing lexicals referenced by a local function's body must
+                // be boxed so a capturing flet/labels closure can reach them
+                // through the shared heap frame. Over-approximate: a local body's
+                // free symbols (minus its own params) that name an enclosing
+                // local get boxed; unrelated globals simply never match a local.
+                let (defs_form, flet_body) = cp(cdr);
+                for def in list_to_vec(defs_form) {
+                    if !def.is_cons() {
+                        continue;
+                    }
+                    let (_name, def_rest) = cp(def);
+                    let (params_form, fbody) = cp(def_rest);
+                    let params = list_to_vec(params_form)
+                        .into_iter()
+                        .filter(|param| param.is_symbol())
+                        .map(sym_name)
+                        .collect::<std::collections::HashSet<_>>();
+                    let mut used = std::collections::HashSet::new();
+                    collect_symbol_names(fbody, &mut used);
+                    for name in used {
+                        if !params.contains(&name) {
+                            out.insert(name);
+                        }
+                    }
+                    for form in list_to_vec(fbody) {
+                        walk(form, out);
+                    }
+                }
+                for form in list_to_vec(flet_body) {
+                    walk(form, out);
+                }
+                return;
+            }
             if n == "QUOTE" {
                 return;
             }
@@ -3838,9 +4184,12 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // noncapturing nested lambdas. The referenced nested function is serialized
 // before its owner (backwards/topological), so the reference embedded in the
 // instruction needs no auxiliary table.
+// 0x0106 (bliss-1ja): MAKE_CLOSURE gains an env-capture indicator (capture
+// count 1) for capturing flet/labels locals and capturing lambdas; the closure
+// records the creating activation's heap EnvFrame.
 // A BBU is authoritative: an unsupported version is rejected, never replaced
 // by executing source text from the container.
-const BBU_BYTECODE_VERSION: u16 = 0x0105;
+const BBU_BYTECODE_VERSION: u16 = 0x0106;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -4044,8 +4393,8 @@ fn bbu_instr_len(i: &Instr) -> Option<usize> {
         Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_) | Instr::DefineEnvVar(_) => 5,
         Instr::PushEnvChild | Instr::PopEnvChild => 1,
         Instr::MakeClosureEnv(_) => return None,
-        // opcode + u32 global function index + u16 capture count (0 for now).
-        Instr::MakeClosure(_) => 7,
+        // opcode + u32 global function index + u16 capture indicator.
+        Instr::MakeClosure { .. } => 7,
         Instr::AllocCons => 1,
         Instr::Pop | Instr::Dup => 1,
         Instr::Br(_) | Instr::BrIfFalse(_) | Instr::BrIfTrue(_) => 5,
@@ -4282,13 +4631,15 @@ fn serialize_bbu_function(
                 put_u16(&mut code, *sp_restore);
             }
             Instr::PopRestartCase => put_u8(&mut code, 0x2d),
-            Instr::MakeClosure(local) => {
+            Instr::MakeClosure { func, capture_env } => {
                 put_u8(&mut code, 0x0b);
                 // The referenced nested function was already serialized (child
                 // before owner), so its global index is known and backwards.
-                put_u32(&mut code, *nested_global.get(*local as usize)?);
-                // Capture count: zero for the first noncapturing implementation.
-                put_u16(&mut code, 0);
+                put_u32(&mut code, *nested_global.get(*func as usize)?);
+                // Capture indicator: 0 = noncapturing, 1 = capture enclosing
+                // env frame. Individual capture slots are not used (the whole
+                // heap frame is captured), so no slot payload follows.
+                put_u16(&mut code, u16::from(*capture_env));
             }
             Instr::EvalHost(_) | Instr::MakeClosureEnv(_) => return None,
         }
@@ -5243,10 +5594,13 @@ fn decode_bbu_function(
                 // index after validating the reference is backwards and nested.
                 let global = cursor.u32()?;
                 let captures = cursor.u16()?;
-                if captures != 0 {
-                    return Err(bbu_error("v1.5 MakeClosure must have zero captures"));
+                if captures > 1 {
+                    return Err(bbu_error("MakeClosure capture indicator must be 0 or 1"));
                 }
-                Instr::MakeClosure(global)
+                Instr::MakeClosure {
+                    func: global,
+                    capture_env: captures == 1,
+                }
             }
             0x11 => Instr::Pop,
             0x12 => Instr::Dup,
@@ -5455,13 +5809,40 @@ fn installed_lambda_list(arity: u16) -> BlissVal {
     vec_to_list(&params)
 }
 
-/// Materialize a callable value for a source-free noncapturing nested lambda
-/// (`MakeClosure`). Each evaluation yields a distinct function identity: a fresh
-/// uninterned symbol whose bytecode body is registered, wrapped in an
-/// interpreted-function object. The tree-walker's `apply_function` then
-/// dispatches it through the ordinary registered-bytecode path, so the closure
-/// is callable by `funcall`/`apply`/`mapcar`/`reduce` exactly like any global.
-fn make_bytecode_closure(nested: &BytecodeFunction) -> BlissVal {
+thread_local! {
+    /// Heap `EnvFrame` captured by an env-capturing `MakeClosure`, keyed by the
+    /// closure's private symbol index. `run_with_binding` installs it as the
+    /// closure activation's environment so its body reaches the enclosing
+    /// lexicals. Entries are pruned when their closure symbol's bytecode is
+    /// removed from the registry.
+    static CLOSURE_ENV: RefCell<HashMap<u32, Rc<RefCell<EnvFrame>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The heap environment an env-capturing closure was created in, if any.
+fn closure_captured_env(fn_val: BlissVal) -> Option<Rc<RefCell<EnvFrame>>> {
+    if !fn_val.is_heap_object() || !bliss_rt::function::is_interpreted_function(fn_val) {
+        return None;
+    }
+    let name = bliss_rt::function::name(fn_val);
+    if !name.is_symbol() {
+        return None;
+    }
+    CLOSURE_ENV.with(|m| m.borrow().get(&name.as_symbol_index()).cloned())
+}
+
+/// Materialize a callable value for a nested-lambda `MakeClosure`. Each
+/// evaluation yields a distinct function identity: a fresh uninterned symbol
+/// whose bytecode body is registered, wrapped in an interpreted-function object.
+/// The tree-walker's `apply_function` then dispatches it through the ordinary
+/// registered-bytecode path, so the closure is callable by
+/// `funcall`/`apply`/`mapcar`/`reduce` exactly like any global. When
+/// `captured_env` is `Some`, the closure records that heap frame so its body can
+/// read and write the enclosing lexical bindings (portable `flet`/`labels`).
+fn make_bytecode_closure(
+    nested: &BytecodeFunction,
+    captured_env: Option<Rc<RefCell<EnvFrame>>>,
+) -> BlissVal {
     let sym = bliss_rt::symbols::make_uninterned("CLOSURE");
     let sym_idx = sym.as_symbol_index();
     let lambda_list = if nested.variadic {
@@ -5470,6 +5851,9 @@ fn make_bytecode_closure(nested: &BytecodeFunction) -> BlissVal {
         installed_lambda_list(nested.arity)
     };
     registry_put(sym_idx, Rc::new(nested.clone()));
+    if let Some(frame) = captured_env {
+        CLOSURE_ENV.with(|m| m.borrow_mut().insert(sym_idx, frame));
+    }
     bliss_rt::function::alloc_interpreted(lambda_list, NIL, NIL, sym)
 }
 
@@ -5906,8 +6290,8 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
         let mut nested_functions: Vec<Box<BytecodeFunction>> = Vec::new();
         let mut global_to_local: HashMap<u32, u32> = HashMap::new();
         for instr in &mut function.code {
-            if let Instr::MakeClosure(reference) = instr {
-                let global = *reference;
+            if let Instr::MakeClosure { func, .. } = instr {
+                let global = *func;
                 if global as usize >= index {
                     return Err(bbu_error(
                         "closure function reference is not backwards/topological",
@@ -5921,7 +6305,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                     nested_functions.push(Box::new(decoded_functions[global as usize].clone()));
                     local
                 });
-                *instr = Instr::MakeClosure(local);
+                *func = local;
             }
         }
         function.nested_functions = nested_functions;
@@ -6346,7 +6730,17 @@ fn run_with_binding(
                     .unwrap_or_else(|| bliss_rt::FiberId(bliss_rt::current_thread_id().0)),
             )
         })?;
-    let env_frame = make_env_frame(&entry, Rc::clone(&env.frame));
+    // An env-capturing closure runs with its captured heap frame as the base of
+    // its environment: the closure body's LoadEnvVar/StoreEnvVar reach the
+    // enclosing lexicals (and sibling flet/labels closures) through it. A
+    // closure with its own boxed locals gets a fresh child of the captured
+    // frame; one that only reads the enclosing scope uses the captured frame
+    // directly.
+    let closure_env = closure_captured_env(entry_fn_val);
+    let parent = closure_env
+        .clone()
+        .unwrap_or_else(|| Rc::clone(&env.frame));
+    let env_frame = make_env_frame(&entry, parent).or(closure_env);
     if macro_lambda_list {
         if let Err(e) = bind_macro_variadic(&entry, frame, args, env_frame.as_ref(), env) {
             stack.pop_frame();
@@ -6585,9 +6979,17 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     }
                 }
             }
-            Instr::MakeClosure(local) => {
-                let nested = acts[top_idx].func.nested_functions[local as usize].clone();
-                let closure = make_bytecode_closure(&nested);
+            Instr::MakeClosure { func, capture_env } => {
+                let nested = acts[top_idx].func.nested_functions[func as usize].clone();
+                // A capturing closure records the creating activation's heap
+                // EnvFrame so its body reads/writes the enclosing lexicals; the
+                // frame is installed as the closure's environment when it runs.
+                let captured = if capture_env {
+                    acts[top_idx].env_frame.clone()
+                } else {
+                    None
+                };
+                let closure = make_bytecode_closure(&nested, captured);
                 acts[top_idx].push_op(closure);
             }
             Instr::AllocCons => {

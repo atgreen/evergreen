@@ -360,10 +360,12 @@ in a symbol cell.  Two producers emit nested functions:
   by a `MAKE_CLOSURE` instruction.
 
 `MAKE_CLOSURE` (`0x0b`) is emitted as `u32 function_index`, `u16 capture_count`,
-then `capture_count` capture slots.  The current implementation emits and
-accepts only the **zero-capture** subset (`capture_count = 0`, no slots), which
-covers a lambda that closes over nothing lexical; a nonzero `capture_count` is
-reserved for the general capturing form.  The `function_index` embedded in the
+then `capture_count` capture slots.  The implementation uses `capture_count` as
+an env-capture indicator rather than a per-slot list: `0` is a noncapturing
+closure (closes over nothing lexical); `1` is an **env-capturing** closure that
+records the creating activation's heap `EnvFrame`, so its body reads and writes
+the enclosing lexical bindings (portable `flet`/`labels` locals and capturing
+lambdas).  Neither form carries capture slots.  The `function_index` embedded in the
 instruction is a **global** function-table index in the serialized unit; a
 producer MUST serialize a nested function *before* its referencing owner, so the
 reference is always backwards and topological.
