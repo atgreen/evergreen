@@ -4538,6 +4538,48 @@ fn compile_file_load_forms(form: BlissVal, env: &mut Env) -> Vec<BlissVal> {
                 Vec::new()
             }
         }
+        // A top-level MACROLET establishes local macros for its body, which are
+        // then processed as top-level forms (CLHS 3.2.3.1). Register the local
+        // macros lexically, expand/splice the body through the same pipeline, then
+        // restore the previous bindings so the macros do not leak past the form.
+        "MACROLET" => {
+            let (defs_form, body) = cp(cdr);
+            let mut saved: Vec<(String, Option<MacroDef>)> = Vec::new();
+            for def in list_to_vec(defs_form) {
+                if !def.is_cons() {
+                    continue;
+                }
+                let (name_form, rest) = cp(def);
+                if !name_form.is_symbol() || !rest.is_cons() {
+                    continue;
+                }
+                let (params_form, macro_body) = cp(rest);
+                let name = sym_name(name_form);
+                let mdef = MacroDef {
+                    params_form,
+                    body: macro_body,
+                    captured_frame: Rc::clone(&env.frame),
+                    bytecode: None,
+                };
+                let prev = env.macros_mut().insert(name.clone(), mdef);
+                saved.push((name, prev));
+            }
+            let result: Vec<BlissVal> = list_to_vec(body)
+                .into_iter()
+                .flat_map(|f| compile_file_load_forms(f, env))
+                .collect();
+            for (name, prev) in saved.into_iter().rev() {
+                match prev {
+                    Some(p) => {
+                        env.macros_mut().insert(name, p);
+                    }
+                    None => {
+                        env.macros_mut().remove(&name);
+                    }
+                }
+            }
+            result
+        }
         _ => vec![form],
     }
 }
