@@ -5,10 +5,11 @@
 use std::alloc::Layout;
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 
 use bliss_rt::error::BlissError;
-use bliss_rt::object::{ObjectHeader, type_id};
+use bliss_rt::lock_order::{LockLevel, OrderedMutex, OrderedMutexGuard};
+use bliss_rt::object::{type_id, ObjectHeader};
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
 // ── Gray streams protocol ──────────────────────────────────────────
@@ -101,7 +102,7 @@ struct StreamAlloc {
     components: Box<[BlissVal]>,
     /// Per-stream mutex — every operation spanning multiple elements is atomic
     /// under this lock (R5.120).
-    state: Mutex<StreamMutableState>,
+    state: OrderedMutex<StreamMutableState>,
 }
 
 /// Mutable portion of stream state, protected by the per-stream mutex.
@@ -178,9 +179,7 @@ enum StreamInner {
     /// Components: all broadcast targets (fan-out on write).
     Broadcast,
     /// Components: all source streams; `cursor` is the index of the current one.
-    Concatenated {
-        cursor: usize,
-    },
+    Concatenated { cursor: usize },
     /// Components: `[input, output]`.
     TwoWay,
     /// Components: `[input, output]`.
@@ -194,15 +193,9 @@ enum StreamInner {
         col: u64,
     },
     /// The process standard output.
-    Stdout {
-        line: u64,
-        col: u64,
-    },
+    Stdout { line: u64, col: u64 },
     /// The process error output.
-    Stderr {
-        line: u64,
-        col: u64,
-    },
+    Stderr { line: u64, col: u64 },
 }
 
 impl StreamMutableState {
@@ -949,9 +942,7 @@ impl GrayStream for StreamMutableState {
                 ..
             } => Ok(unread.is_some() || *buf_pos < *buf_fill),
             StreamInner::Concatenated { cursor } => Ok(*cursor < comps.len()),
-            StreamInner::TwoWay | StreamInner::Echo => {
-                crate::streams::stream_listen(comps[0])
-            }
+            StreamInner::TwoWay | StreamInner::Echo => crate::streams::stream_listen(comps[0]),
             StreamInner::Synonym => {
                 let target = resolve_synonym(comps[0])?;
                 crate::streams::stream_listen(target)
@@ -1140,9 +1131,16 @@ impl GrayStream for StreamMutableState {
 
 // ── String allocation ─────────────────────────────────────────────
 
-fn string_intern_table() -> &'static Mutex<HashMap<Vec<u8>, BlissVal>> {
-    static TABLE: OnceLock<Mutex<HashMap<Vec<u8>, BlissVal>>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+fn string_intern_table() -> &'static OrderedMutex<HashMap<Vec<u8>, BlissVal>> {
+    static TABLE: OnceLock<OrderedMutex<HashMap<Vec<u8>, BlissVal>>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::InternedString,
+            1,
+            "interned string table",
+            HashMap::new(),
+        )
+    })
 }
 
 /// Create a BlissVal representing a Lisp string.
@@ -1205,9 +1203,16 @@ fn extract_string_bytes(val: BlissVal) -> Result<&'static [u8], BlissError> {
 
 // ── Synonym stream resolution ─────────────────────────────────────
 
-fn synonym_table() -> &'static Mutex<HashMap<u64, BlissVal>> {
-    static TABLE: OnceLock<Mutex<HashMap<u64, BlissVal>>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+fn synonym_table() -> &'static OrderedMutex<HashMap<u64, BlissVal>> {
+    static TABLE: OnceLock<OrderedMutex<HashMap<u64, BlissVal>>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            13,
+            "synonym stream GC roots",
+            HashMap::new(),
+        )
+    })
 }
 
 fn scan_synonym_stream_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
@@ -1252,6 +1257,11 @@ fn alloc_stream(
     inner: StreamInner,
     components: Vec<BlissVal>,
 ) -> BlissVal {
+    // Composite streams are constructed after their immutable components and
+    // acquire the composite lock first. Descending keys therefore put every
+    // newer composite before all of its older components.
+    static NEXT_STREAM_ORDER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(u64::MAX);
     let roots = bliss_rt::ShadowRootScope::new();
     let component_roots = roots.root_values(components.iter().copied());
     // The Rust-owned state lives in an off-heap Box (stable address; never
@@ -1260,12 +1270,17 @@ fn alloc_stream(
     // to it for the composite op arms.
     let mut boxed = Box::new(StreamAlloc {
         components: components.into_boxed_slice(),
-        state: Mutex::new(StreamMutableState {
-            open: true,
-            element_type,
-            inner,
-            components_ptr: std::ptr::slice_from_raw_parts(std::ptr::null::<BlissVal>(), 0),
-        }),
+        state: OrderedMutex::new(
+            LockLevel::Stream,
+            NEXT_STREAM_ORDER.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
+            "stream state",
+            StreamMutableState {
+                open: true,
+                element_type,
+                inner,
+                components_ptr: std::ptr::slice_from_raw_parts(std::ptr::null::<BlissVal>(), 0),
+            },
+        ),
     });
     let cptr: *const [BlissVal] = &*boxed.components;
     boxed.state.get_mut().unwrap().components_ptr = cptr;
@@ -1419,7 +1434,9 @@ fn get_stream_alloc(stream: BlissVal) -> Result<&'static StreamAlloc, BlissError
 }
 
 /// Lock the per-stream mutex and return a guard. R5.120.
-fn lock_stream(stream: BlissVal) -> Result<MutexGuard<'static, StreamMutableState>, BlissError> {
+fn lock_stream(
+    stream: BlissVal,
+) -> Result<OrderedMutexGuard<'static, StreamMutableState>, BlissError> {
     let alloc = get_stream_alloc(stream)?;
     Ok(alloc.state.lock().unwrap())
 }
@@ -2100,22 +2117,26 @@ fn stream_gc_finalize(_finalizer: BlissVal, object: BlissVal) {
         if box_ptr.is_null() {
             return;
         }
+        // A dead stream has no reachable mutator, hence exclusive ownership of
+        // its off-heap block. Recover the Box first and inspect the mutex state
+        // through `get_mut`; acquiring the level-1 stream lock while the
+        // collector holds the level-8 heap lock would invert the global order.
+        let mut alloc = Box::from_raw(box_ptr);
         if warn_unclosed_enabled() {
-            // The object is unreachable, so no live mutator holds its lock;
-            // try_lock is defensive and never blocks the GC.
-            let alloc: &StreamAlloc = &*box_ptr;
-            if let Ok(state) = alloc.state.try_lock() {
-                if state.open && inner_is_file(&state.inner) {
-                    eprintln!("; Warning: file stream was garbage-collected without being closed");
-                }
+            let state = alloc
+                .state
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.open && inner_is_file(&state.inner) {
+                eprintln!("; Warning: file stream was garbage-collected without being closed");
             }
         }
-        drop(Box::from_raw(box_ptr)); // File::drop closes the fd; buffers freed
-        // Null the handle's box pointer. Finalizers run early in a major GC
-        // (before the relocation pass, which traces *every* non-forwarded object,
-        // including this now-dead handle). Without this, `stream_trace` would
-        // dereference the freed block. A nulled pointer makes the later trace —
-        // and any stray access — skip it safely (bliss-jtc.7a).
+        drop(alloc); // File::drop closes the fd; buffers freed
+                     // Null the handle's box pointer. Finalizers run early in a major GC
+                     // (before the relocation pass, which traces *every* non-forwarded object,
+                     // including this now-dead handle). Without this, `stream_trace` would
+                     // dereference the freed block. A nulled pointer makes the later trace —
+                     // and any stray access — skip it safely (bliss-jtc.7a).
         *(body as *mut u64) = 0;
     }
 }

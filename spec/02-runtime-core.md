@@ -1,8 +1,8 @@
 # §2 Runtime Core
 
 The Runtime Core is the lowest Rust-implemented layer of Bliss. It owns
-process lifecycle (startup → run → shutdown), the thread model (OS worker
-pool + M:N green threads), stack layout and frame walking, safepoint
+process lifecycle (startup → run → shutdown), the thread model (exposed OS
+carrier threads + M:N fibers), stack layout and frame walking, safepoint
 synchronisation, POSIX signal handling, and the C-ABI FFI bridge.
 Source lives in `crates/bliss-rt/src/` (see §0 directory map).
 
@@ -14,23 +14,23 @@ Source lives in `crates/bliss-rt/src/` (see §0 directory map).
 |----|-------------|-------|
 | R2.01 | The runtime MUST boot to a CL `REPL` prompt in < 50 ms cold on commodity hardware (see G3). | MUST |
 | R2.02 | Startup MUST follow the sequence: Rust `main` → parse CLI → init GC heap → load/mmap image → call CL entry point. | MUST |
-| R2.03 | The runtime MUST support a configurable OS worker-thread pool (default = number of hardware threads). | MUST |
-| R2.04 | Green threads (fibers) MUST be multiplexed M:N onto the worker pool with cooperative yield at safepoints. | MUST |
-| R2.05 | Each green thread MUST maintain its own CL control + value stack, separate from the Rust shadow stack. | MUST |
+| R2.03 | The runtime MUST support configurable scheduler groups of exposed OS carrier threads (default carrier count = number of hardware threads). | MUST |
+| R2.04 | Fibers MUST be multiplexed M:N onto a scheduler group's carrier threads with cooperative yield at safepoints. | MUST |
+| R2.05 | Each fiber MUST maintain its own CL control + value stack, separate from its carrier's Rust shadow stack. | MUST |
 | R2.06 | Stack frames MUST be walkable by the debugger and GC without stopping the world (safepoint maps). | MUST |
 | R2.07 | Safepoints MUST be implemented via a polling-page mechanism; a safepoint poll MUST be inserted at every loop back-edge and function prologue. | MUST |
 | R2.08 | `SIGSEGV` on the poisoned safepoint page MUST be caught and converted to a safepoint trap, not a crash. | MUST |
 | R2.09 | `SIGSEGV` on a null-tagged pointer dereference MUST raise a CL `TYPE-ERROR` condition (null-pointer guard pages). | MUST |
-| R2.10 | `SIGINT` (Ctrl-C) MUST be delivered as a CL `INTERRUPT-CONDITION` to the foreground green thread. | MUST |
+| R2.10 | `SIGINT` (Ctrl-C) MUST be delivered as a CL `INTERRUPT-CONDITION` to the foreground fiber, or to the foreground native thread when no fiber is mounted. | MUST |
 | R2.11 | FFI calls to C functions MUST use the platform C ABI (System V AMD64 / AAPCS64). | MUST |
 | R2.12 | The FFI bridge MUST support callbacks from C into CL (closure trampolines). | MUST |
 | R2.13 | Alien type marshalling MUST handle: signed/unsigned integers (8–64 bit), float, double, pointer, struct-by-value, and `void`. | MUST |
 | R2.14 | The runtime SHOULD use `libffi` for variadic and struct-by-value calls; hand-rolled stubs MAY be used for hot-path leaf calls. | SHOULD |
-| R2.15 | FFI calls MUST transition the calling green thread to a "native" state that does not block GC safepoints. | MUST |
+| R2.15 | FFI calls MUST transition the calling fiber to a "native" state that does not block GC safepoints; a plain native thread publishes equivalent root state. | MUST |
 | R2.16 | Environment variables listed in §2.8 MUST be read before any heap allocation. | MUST |
-| R2.17 | Shutdown MUST run all registered finalizers, join worker threads, and exit with a CL-controlled exit code. | MUST |
+| R2.17 | Shutdown MUST run all registered finalizers, finish fibers, join carrier/native threads, and exit with a CL-controlled exit code. | MUST |
 | R2.18 | The runtime MUST NOT call `panic!()` in any production code path; all errors propagate via `Result<T, BlissError>`. | MUST NOT |
-| R2.19 | The runtime MUST support at least 100 000 simultaneous green threads on a 64-bit system with default stack sizes. | MUST |
+| R2.19 | The runtime MUST support at least 100 000 simultaneous fibers on a 64-bit system with default stack sizes. | MUST |
 | R2.20 | Stack overflow on a CL stack MUST raise `STORAGE-CONDITION`, not a process-killing signal. | MUST |
 
 ---
@@ -97,20 +97,25 @@ ms) and is only used during development and cross-compilation (§0.4.5).
 
 ```text
   ┌──────────────────────────────────┐
-  │        Green-thread scheduler    │
-  │  (work-stealing deque per worker)│
+  │          Fiber scheduler         │
+  │ (work-stealing deque per carrier)│
   └──────┬───────┬───────┬──────────┘
          │       │       │
-    ┌────▼──┐┌───▼───┐┌──▼────┐
-    │Worker0││Worker1││WorkerN│    OS threads (1 per core)
-    └───────┘└───────┘└───────┘
+   ┌────▼────┐┌──▼──────┐┌─▼───────┐
+   │Carrier 0││Carrier 1││Carrier N │  exposed OS threads (default 1/core)
+   └─────────┘└─────────┘└─────────┘
 ```
 
 | Component | Description |
 |-----------|-------------|
-| **Worker thread** | A pinned OS thread. Owns a TLAB (§3), a work-stealing deque, and the Rust call stack. |
-| **Green thread (fiber)** | A CL-visible thread. Has its own `BlissStack` (§2.4), a state machine (`Runnable` / `Blocked` / `Native` / `Dead`), and a continuation pointer. |
-| **Scheduler** | Per-worker run-queue (LIFO push/pop) with cross-worker stealing (FIFO). Scheduling decisions happen only at safepoints (§2.5). |
+| **Carrier thread** | An exposed `BLISS-THREAD` OS-backed thread. A scheduler group marks its carriers and gives each a TLAB, a work-stealing deque, and a Rust call stack. User-created native threads and group-owned carriers share the same public thread type. |
+| **Fiber** | A distinct `BLISS-FIBER` lightweight managed execution. Has its own `BlissStack` (§2.4), dynamic state, saved continuation, and lifecycle independent of any one carrier. |
+| **Scheduler** | Internal per-carrier run queue (LIFO push/pop) with cross-carrier stealing (FIFO). A public scheduler-group handle controls carrier/fiber lifecycle; scheduling decisions happen only at safepoints (§2.5). |
+
+**R2.21** Native/carrier threads and fibers MUST be distinct public object
+types. `BLISS-THREAD:MAKE-THREAD` creates a one-to-one OS-backed thread;
+`BLISS-FIBER:MAKE-FIBER` creates a lightweight fiber. Scheduler-group carrier
+threads MUST be observable through both thread introspection and the group.
 
 ### 2.3.2 State Machine
 
@@ -162,51 +167,64 @@ Transitions summary:
   handshake obligations — the safepoint scanner skips it until it
   transitions back.
 - **Waiting:** Blocked on async I/O (epoll/kqueue fd). An I/O poller
-  green thread moves it to Runnable when the fd is ready.
+  scheduler moves it to Runnable when the fd is ready.
 - **Dead:** Returned from its entry function or killed. Resources
   pending finalization.
 
-### 2.3.3 Green Thread Creation
+### 2.3.3 Fiber and Native Thread Creation
 
 ```rust
-/// D2.01 — Green thread descriptor.
-pub struct GreenThread {
-    id:          GreenThreadId,       // monotonic u64
-    state:       AtomicU8,            // enum ThreadState
+/// D2.01 — Fiber descriptor (abridged; see D9.10).
+pub struct Fiber {
+    id:          FiberId,             // monotonic u64
+    state:       AtomicU8,            // enum FiberState
     stack:       BlissStack,          // §2.4
     entry:       BlissVal,            // CL function to call
     result:      UnsafeCell<BlissVal>,
     join_waker:  AtomicWaker,         // for join semantics
-    tls_slots:   Box<[BlissVal; MAX_TLS]>, // per-green-thread TLS
+    continuation: FiberContinuation,  // saved SP/FP + callee-saved registers
+    tls_slots:   Box<[BlissVal; MAX_TLS]>, // per-fiber dynamic bindings
+    handler_stack: Vec<HandlerFrame>,
+    restart_stack: Vec<RestartFrame>,
+    pin_count:   AtomicU32,
+    carrier:     AtomicPtr<NativeThread>,
 }
 ```
 
-Creating a green thread (`BLISS-THREAD:MAKE-THREAD`) allocates a
-`BlissStack` from a pool, sets `state = Runnable`, and pushes the
-descriptor onto the current worker's deque. **R2.19**: with a default
-CL stack of 512 KiB (guard-page protected), 100 000 threads require
+Creating a fiber (`BLISS-FIBER:MAKE-FIBER`) allocates a `BlissStack` from a
+pool and sets `state = Created`. `SUBMIT-FIBER` transitions it to `Runnable`
+and pushes it onto a carrier's deque. Creating a native thread
+(`BLISS-THREAD:MAKE-THREAD`) instead creates a dedicated OS thread and does
+not allocate or submit a fiber. **R2.19**: with a default CL stack of 512 KiB
+(guard-page protected), 100 000 fibers require
 ~50 GiB of virtual address space — feasible on 64-bit with
 overcommit/lazy mapping.
 
 ### 2.3.4 Scheduling Policy
 
-1. A worker pops from its own deque (LIFO — cache-warm).
-2. If empty, it attempts to steal from a random other worker (FIFO —
+1. A carrier pops from its own deque (LIFO — cache-warm).
+2. If empty, it attempts to steal from a random other carrier (FIFO —
    fair, avoids starvation).
-3. If all deques are empty, the worker parks on a futex and is woken by
-   the next `make-thread` or I/O completion event.
+3. If all deques are empty, the carrier parks on a futex and is woken by
+   the next `submit-fiber` or I/O completion event.
 
-Preemption is cooperative: a running green thread yields at the next
-safepoint poll when the scheduler sets a per-thread yield flag (e.g.,
-time-slice expired, higher-priority thread ready).
+A fiber's first submission fixes its owning scheduler group. Synchronization,
+deadline, and I/O wakeups requeue it on that group's carrier pool. Waits use a
+per-fiber generation token and a carrier-consumed pending-wake handshake, so a
+timeout from an old wait cannot wake a new one and an unpark racing with
+unmount cannot mount one continuation on two carriers.
+
+Preemption is cooperative: a running fiber yields at the next safepoint poll
+when the scheduler sets its yield flag (e.g., time-slice expired or a
+higher-priority fiber is ready).
 
 ---
 
 ## 2.4 Stack Layout
 
-Each green thread owns a `BlissStack`: a contiguous virtual memory
+Each fiber owns a `BlissStack`: a contiguous virtual memory
 region used for CL control/value frames. The Rust call stack of the
-OS worker thread (the "shadow stack") is separate.
+carrier thread (the "shadow stack") is separate.
 
 ### 2.4.1 Stack Regions
 
@@ -265,17 +283,17 @@ O(n) stack walks without requiring metadata side-tables (R2.06).
 ### 2.4.4 Unified Control Stack (Interpreted + Compiled Frames)
 
 **Every CL activation — interpreted (T0) or compiled (T1/T2) — lives as a
-frame on the green thread's `BlissStack`** (R2.05), in the §2.4.2 format, so a
+frame on the fiber's `BlissStack`** (R2.05), in the §2.4.2 format, so a
 single call chain freely interleaves tiers and one frame walker (the `prev_fp`
 chain) sees them all. This is the key mechanism deviation from HotSpot noted in
 §0 §1.1: rather than a template (assembly) interpreter whose frames are native
 machine-stack frames, Bliss's baseline interpreter is a host-language (Rust)
-loop, but its frames still live on the CL stack — not on the OS worker's Rust
+loop, but its frames still live on the CL stack — not on the carrier's Rust
 "shadow" stack.
 
 The Rust shadow stack therefore holds only **transient, non-CL** activity: the
 interpreter dispatch loop itself, GC inner loops, and runtime-internal helpers.
-It never holds a durable CL activation, so a green thread can be parked or
+It never holds a durable CL activation, so a fiber can be parked or
 migrated by saving its `BlissStack` pointer alone (§2.3) — interpreter state is
 not stranded on a shared worker stack. Deep interpreted recursion consumes
 `BlissStack` frames and raises `STORAGE-CONDITION` on overflow (R2.20), rather
@@ -430,7 +448,7 @@ The maximum time between safepoint polls MUST be bounded:
 
 All signal handlers are installed in step 2 of startup (§2.2) using
 `sigaction` with `SA_SIGINFO | SA_ONSTACK` on a dedicated alt-stack per
-OS worker thread.
+carrier thread.
 
 ### 2.6.1 Signal Table
 
@@ -464,7 +482,7 @@ fn sigsegv_handler(sig: c_int, info: &siginfo_t, uctx: &mut ucontext_t) {
 }
 ```
 
-The guard regions are pre-registered per green thread at creation and
+The guard regions are pre-registered per fiber at creation and
 per heap region at allocation, allowing O(1) range checks via a sorted
 interval table.
 
@@ -531,7 +549,7 @@ they use fixed-arity, non-variadic signatures.
      into BlissVal
 ```
 
-Step 2 (R2.15): Before entering C code, the green thread sets
+Step 2 (R2.15): Before entering C code, the fiber sets
 `state = Native` and publishes its stack top. This tells the GC that
 the thread's CL stack is quiescent and scannable without cooperation.
 
@@ -573,8 +591,8 @@ declaration. Hand-rolled stubs avoid the ~50 ns overhead of
 | `BLISS_HEAP_SIZE` | `512m` | Initial old-gen heap reservation |
 | `BLISS_TLAB_SIZE` | `2m` | Per-thread TLAB size (§3.2.2, `--tlab-size`) |
 | `BLISS_NURSERY_SIZE` | `64m` | Total nursery region pool (§3.2.2, `--nursery-size`) |
-| `BLISS_STACK_SIZE` | `512k` | CL stack size per green thread |
-| `BLISS_WORKERS` | `nproc` | OS worker thread count |
+| `BLISS_STACK_SIZE` | `512k` | CL stack size per fiber |
+| `BLISS_WORKERS` | `nproc` | Default scheduler-group carrier count (legacy name) |
 | `BLISS_IMAGE` | `bliss.bimg` | Path to boot image |
 | `BLISS_GC_LOG` | (none) | Path to GC log file (enables GC logging) |
 | `BLISS_JIT_DUMP` | `0` | `1` = emit `jitdump` file for `perf` |
@@ -611,10 +629,10 @@ Arguments after `--` are passed to CL as
  1. CL entry function returns (or EXIT is called with code N).
  2. Run *EXIT-HOOKS* (list of thunks, LIFO order).
  3. Set global shutdown flag (atomic).
- 4. Interrupt all green threads → each unwinds via UNWIND-PROTECT.
- 5. Wait for all green threads to reach Dead state (timeout 5 s).
+ 4. Interrupt all fibers → each unwinds via UNWIND-PROTECT.
+ 5. Wait for all fibers to reach Dead state (timeout 5 s).
  6. Run pending finalizers (§3).
- 7. Signal worker threads to exit; join all workers.
+ 7. Signal carrier threads to exit; join all carriers and remaining native threads.
  8. Unmap heap, safepoint page, trampoline pool.
  9. Call libc exit(N).
 ```
@@ -682,13 +700,13 @@ MUST be added to this table with its position in the total order.
 | What | How |
 |------|-----|
 | Startup sequence | Integration test: spawn `bliss --eval '(quit 42)'`, assert exit code 42 and elapsed < 50 ms. |
-| Green thread creation / join | Unit test: spawn 1 000 green threads each incrementing an atomic counter; assert final value. |
+| Fiber creation / join | Unit test: submit 1 000 fibers each incrementing an atomic counter; assert final value. |
 | Safepoint liveness | Unit test: tight loop in T1; verify GC completes within 100 ms. |
 | Stack overflow | Unit test: deeply recursive function; assert `STORAGE-CONDITION` raised, stack intact. |
 | Signal handling | Integration test: send `SIGINT` to process in `(sleep 10)`; assert `INTERRUPT-CONDITION` caught. |
 | FFI round-trip | Unit test: call `strlen` on a CL string; call back into CL from C. |
 | Shutdown | Integration test: register exit hook, verify it runs, verify clean exit. |
-| Stress | Stress test: 100 000 green threads with FFI callbacks; no crash, no leak (valgrind/ASAN). |
+| Stress | Stress test: 100 000 fibers with FFI callbacks; no crash, no leak (valgrind/ASAN). |
 
 ---
 

@@ -1,43 +1,128 @@
-//! Green thread model — M:N threading with work-stealing scheduler.
+//! JVM-style native thread and fiber model.
 //!
 //! See §2.3 of the spec.
 
 use crate::error::BlissError;
+use crate::lock_order::{LockLevel, OrderedMutex};
 use crate::stack::BlissStack;
 use crate::value::{BlissVal, NIL};
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::ptr;
+use std::sync::atomic::{
+    fence, AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
-/// Unique identifier for a green thread.
+/// Unique identifier for a lightweight managed fiber.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct GreenThreadId(pub u64);
+pub struct FiberId(pub u64);
 
-/// Green thread states.
+/// Managed fiber lifecycle states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum ThreadState {
-    /// On a worker's run-queue; may be executing.
-    Runnable = 0,
+pub enum FiberState {
+    /// Allocated but not submitted to a scheduler group.
+    Created = 0,
+    /// On a carrier's run queue.
+    Runnable = 1,
+    /// Mounted and executing on exactly one carrier.
+    Running = 2,
+    /// Cooperatively yielded with a saved continuation.
+    Suspended = 3,
     /// Waiting on a mutex, condition variable, or channel.
-    Blocked = 1,
-    /// Executing a C FFI call; GC skips this thread.
-    Native = 2,
+    Blocked = 4,
+    /// Executing a C FFI call; GC scans published roots without waiting.
+    Native = 5,
     /// Blocked on async I/O.
-    Waiting = 3,
-    /// Entry function returned or thread was killed.
-    Dead = 4,
+    Waiting = 6,
+    /// Entry function returned or the fiber was terminated.
+    Dead = 7,
 }
 
-/// Maximum number of TLS slots per green thread.
+const SUSPEND_NONE: u8 = 0;
+const SUSPEND_YIELD: u8 = 1;
+const SUSPEND_PARK: u8 = 2;
+const SUSPEND_DEAD: u8 = 3;
+
+/// Resume state saved when a fiber unmounts from a carrier.
+#[derive(Debug, Default)]
+pub struct FiberContinuation {
+    saved_sp: AtomicUsize,
+    saved_fp: AtomicUsize,
+    resume_token: AtomicUsize,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+struct FiberExecutionContext {
+    context: Box<UnsafeCell<libc::ucontext_t>>,
+    _native_stack: Box<[u8]>,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl FiberExecutionContext {
+    fn new() -> Result<Self, BlissError> {
+        const NATIVE_STACK_SIZE: usize = 512 * 1024;
+        let mut native_stack = vec![0_u8; NATIVE_STACK_SIZE].into_boxed_slice();
+        let context = Box::new(UnsafeCell::new(unsafe { std::mem::zeroed() }));
+        let context_ptr = context.get();
+        if unsafe { libc::getcontext(context_ptr) } != 0 {
+            return Err(BlissError::Internal("getcontext failed for fiber".into()));
+        }
+        unsafe {
+            (*context_ptr).uc_stack.ss_sp = native_stack.as_mut_ptr().cast();
+            (*context_ptr).uc_stack.ss_size = native_stack.len();
+            (*context_ptr).uc_stack.ss_flags = 0;
+            (*context_ptr).uc_link = ptr::null_mut();
+            libc::makecontext(context_ptr, fiber_context_trampoline, 0);
+        }
+        Ok(Self {
+            context,
+            _native_stack: native_stack,
+        })
+    }
+
+    fn as_ptr(&self) -> *mut libc::ucontext_t {
+        self.context.get()
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+struct FiberExecutionContext;
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+impl FiberExecutionContext {
+    fn new() -> Result<Self, BlissError> {
+        Ok(Self)
+    }
+}
+
+impl FiberContinuation {
+    /// Publish the managed stack position and interpreter/native resume token.
+    pub fn save(&self, sp: usize, fp: usize, resume_token: usize) {
+        self.saved_sp.store(sp, Ordering::Release);
+        self.saved_fp.store(fp, Ordering::Release);
+        self.resume_token.store(resume_token, Ordering::Release);
+    }
+
+    /// Return `(sp, fp, resume-token)` from the last suspension point.
+    pub fn snapshot(&self) -> (usize, usize, usize) {
+        (
+            self.saved_sp.load(Ordering::Acquire),
+            self.saved_fp.load(Ordering::Acquire),
+            self.resume_token.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// Maximum number of TLS slots per fiber.
 pub const MAX_TLS: usize = 4096;
 
-/// Default stack size for green threads (512 KiB).
+/// Default stack size for fibers (512 KiB).
 const DEFAULT_STACK_SIZE: usize = 512 * 1024;
 
-/// Usable `BlissStack` size for a green thread, honouring `BLISS_STACK_SIZE`
+/// Usable `BlissStack` size for a fiber, honouring `BLISS_STACK_SIZE`
 /// (accepts a raw byte count or a `k`/`m`/`g` suffix), defaulting to 512 KiB.
 ///
 /// Deep interpreted recursion is bounded by this size once CL activations live
@@ -63,8 +148,33 @@ fn default_stack_size() -> usize {
         .unwrap_or(DEFAULT_STACK_SIZE)
 }
 
-/// Atomic counter for generating unique thread IDs.
-static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
+/// Unique identifier for an exposed one-to-one OS native thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativeThreadId(pub u64);
+
+/// Lifecycle state of an exposed native/platform thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NativeThreadState {
+    Born = 0,
+    Running = 1,
+    Blocked = 2,
+    Native = 3,
+    Dead = 4,
+    Aborted = 5,
+}
+
+/// Atomic counters for the two deliberately distinct identity spaces.
+static NEXT_NATIVE_THREAD_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_FIBER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn native_object_order(id: NativeThreadId, field: u64) -> u64 {
+    id.0.saturating_mul(32).saturating_add(field).max(1)
+}
+
+fn fiber_object_order(id: FiberId, field: u64) -> u64 {
+    (1_u64 << 62) | id.0.saturating_mul(32).saturating_add(field)
+}
 
 /// Holds the result of a thread's execution and a signal for completion.
 pub(crate) struct ThreadResult {
@@ -105,43 +215,248 @@ impl ThreadResult {
     }
 }
 
-/// Global thread registry mapping IDs to thread descriptors.
-fn thread_registry() -> &'static Mutex<HashMap<GreenThreadId, Arc<GreenThread>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<GreenThreadId, Arc<GreenThread>>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+/// An exposed OS-backed platform thread. Scheduler-owned carrier threads use
+/// this same type and are distinguished only by `is_carrier()`.
+pub struct NativeThread {
+    id: NativeThreadId,
+    name: Option<String>,
+    carrier: bool,
+    entry: BlissVal,
+    state: OrderedMutex<NativeThreadState>,
+    stack: BlissStack,
+    tls: OrderedMutex<Vec<BlissVal>>,
+    result: Arc<ThreadResult>,
+    join_handle: OrderedMutex<Option<std::thread::JoinHandle<()>>>,
+    interrupt_pending: AtomicBool,
+    interrupt_value: OrderedMutex<BlissVal>,
+    yield_requested: AtomicBool,
+    published_sp: AtomicUsize,
+    published_fp: AtomicUsize,
+    /// `pthread_t` for directed SIGUSR1 delivery on Unix (zero until mounted).
+    os_thread_id: AtomicUsize,
 }
 
-// Thread-local cache of the current green thread.
-thread_local! {
-    static CURRENT_THREAD: Arc<GreenThread> = {
-        let id = GreenThreadId(NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed));
-        let thread = Arc::new(GreenThread {
+unsafe impl Send for NativeThread {}
+unsafe impl Sync for NativeThread {}
+
+impl NativeThread {
+    fn new(
+        id: NativeThreadId,
+        name: Option<String>,
+        carrier: bool,
+        entry: BlissVal,
+        result: Arc<ThreadResult>,
+    ) -> Self {
+        Self {
             id,
-            entry: NIL,
-            state: Mutex::new(ThreadState::Runnable),
+            name,
+            carrier,
+            entry,
+            state: OrderedMutex::new(
+                LockLevel::ExecutionObject,
+                native_object_order(id, 1),
+                "native thread state",
+                NativeThreadState::Born,
+            ),
             stack: BlissStack::new(default_stack_size()),
-            tls: Mutex::new(vec![NIL; MAX_TLS]),
-            yield_requested: AtomicBool::new(false),
-            result: Arc::new(ThreadResult::new()),
+            tls: OrderedMutex::new(
+                LockLevel::ExecutionObject,
+                native_object_order(id, 2),
+                "native thread TLS",
+                vec![NIL; MAX_TLS],
+            ),
+            result,
+            join_handle: OrderedMutex::new(
+                LockLevel::ExecutionObject,
+                native_object_order(id, 3),
+                "native thread join handle",
+                None,
+            ),
             interrupt_pending: AtomicBool::new(false),
-            interrupt_value: Mutex::new(NIL),
+            interrupt_value: OrderedMutex::new(
+                LockLevel::ExecutionObject,
+                native_object_order(id, 4),
+                "native thread interrupt",
+                NIL,
+            ),
+            yield_requested: AtomicBool::new(false),
             published_sp: AtomicUsize::new(0),
             published_fp: AtomicUsize::new(0),
-        });
-        thread_registry().lock().unwrap().insert(id, Arc::clone(&thread));
+            os_thread_id: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn id(&self) -> NativeThreadId {
+        self.id
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn is_carrier(&self) -> bool {
+        self.carrier
+    }
+
+    pub fn state(&self) -> NativeThreadState {
+        *self.state.lock().unwrap()
+    }
+
+    pub(crate) fn set_state(&self, state: NativeThreadState) {
+        *self.state.lock().unwrap() = state;
+    }
+
+    pub fn stack(&self) -> &BlissStack {
+        &self.stack
+    }
+
+    pub fn tls_get(&self, index: u32) -> BlissVal {
+        self.tls
+            .lock()
+            .unwrap()
+            .get(index as usize)
+            .copied()
+            .unwrap_or(NIL)
+    }
+
+    pub fn tls_set(&self, index: u32, value: BlissVal) {
+        if let Some(slot) = self.tls.lock().unwrap().get_mut(index as usize) {
+            *slot = value;
+        }
+    }
+
+    pub fn check_and_clear_yield(&self) -> bool {
+        self.yield_requested.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn publish_stack(&self, sp: usize, fp: usize) {
+        self.published_sp.store(sp, Ordering::Release);
+        self.published_fp.store(fp, Ordering::Release);
+    }
+
+    pub fn published_stack(&self) -> (usize, usize) {
+        (
+            self.published_sp.load(Ordering::Acquire),
+            self.published_fp.load(Ordering::Acquire),
+        )
+    }
+
+    fn post_interrupt(&self, condition: BlissVal) {
+        *self.interrupt_value.lock().unwrap() = condition;
+        self.interrupt_pending.store(true, Ordering::Release);
+    }
+
+    fn take_interrupt(&self) -> Option<BlissVal> {
+        self.interrupt_pending
+            .swap(false, Ordering::AcqRel)
+            .then(|| *self.interrupt_value.lock().unwrap())
+    }
+}
+
+fn native_thread_registry() -> &'static OrderedMutex<HashMap<NativeThreadId, Arc<NativeThread>>> {
+    static REGISTRY: OnceLock<OrderedMutex<HashMap<NativeThreadId, Arc<NativeThread>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::ExecutionRegistry,
+            1,
+            "native thread registry",
+            HashMap::new(),
+        )
+    })
+}
+
+thread_local! {
+    static CURRENT_NATIVE_THREAD: RefCell<Option<Arc<NativeThread>>> = const { RefCell::new(None) };
+}
+
+fn install_current_native_thread(thread: Arc<NativeThread>) {
+    #[cfg(unix)]
+    thread
+        .os_thread_id
+        .store(unsafe { libc::pthread_self() as usize }, Ordering::Release);
+    CURRENT_NATIVE_THREAD.with(|slot| *slot.borrow_mut() = Some(thread));
+}
+
+fn ensure_current_native_thread() -> Arc<NativeThread> {
+    CURRENT_NATIVE_THREAD.with(|slot| {
+        if let Some(thread) = slot.borrow().as_ref() {
+            return Arc::clone(thread);
+        }
+        let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
+        let result = Arc::new(ThreadResult::new());
+        let thread = Arc::new(NativeThread::new(
+            id,
+            std::thread::current().name().map(str::to_owned),
+            false,
+            NIL,
+            result,
+        ));
+        thread.set_state(NativeThreadState::Running);
+        native_thread_registry()
+            .lock()
+            .unwrap()
+            .insert(id, Arc::clone(&thread));
+        #[cfg(unix)]
         thread
-    };
-    static ACTIVE_GREEN_THREAD: RefCell<Option<Arc<GreenThread>>> = const { RefCell::new(None) };
+            .os_thread_id
+            .store(unsafe { libc::pthread_self() as usize }, Ordering::Release);
+        *slot.borrow_mut() = Some(Arc::clone(&thread));
+        thread
+    })
+}
+
+/// Global thread registry mapping IDs to thread descriptors.
+fn fiber_registry() -> &'static OrderedMutex<HashMap<FiberId, Arc<Fiber>>> {
+    static REGISTRY: OnceLock<OrderedMutex<HashMap<FiberId, Arc<Fiber>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::ExecutionRegistry,
+            2,
+            "fiber registry",
+            HashMap::new(),
+        )
+    })
+}
+
+// The fiber mounted on this carrier, if any.
+thread_local! {
+    static ACTIVE_FIBER: RefCell<Option<Arc<Fiber>>> = const { RefCell::new(None) };
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    static SCHEDULER_CONTEXT: Cell<*mut libc::ucontext_t> = const { Cell::new(ptr::null_mut()) };
 }
 
 /// Green thread descriptor. D2.01.
-pub struct GreenThread {
-    id: GreenThreadId,
-    /// The CL function (entry point) this thread was created to execute.
+pub struct Fiber {
+    id: FiberId,
+    name: OrderedMutex<Option<String>>,
+    /// The CL function (entry point) this fiber was created to execute.
     entry: BlissVal,
-    state: Mutex<ThreadState>,
+    state: OrderedMutex<FiberState>,
     stack: BlissStack,
-    tls: Mutex<Vec<BlissVal>>,
+    continuation: FiberContinuation,
+    execution_context: FiberExecutionContext,
+    /// Carrier pool chosen by the first scheduler-group submission.  Wakeups
+    /// from timers, synchronization primitives, and I/O always return to this
+    /// pool; a fiber cannot migrate between scheduler groups.
+    scheduler_pool: OrderedMutex<Option<Weak<WorkerPool>>>,
+    /// True from the carrier's mount handshake until it has consumed the
+    /// reason for the fiber's return to the scheduler.  A wake arriving while
+    /// this is true is recorded, not independently enqueued.
+    mounted: AtomicBool,
+    /// An unpark that raced with the carrier-side unmount handshake.
+    wake_pending: AtomicBool,
+    /// Why the continuation most recently returned to its carrier.
+    suspend_reason: AtomicU8,
+    /// Monotonic token distinguishing successive blocking operations.  Stale
+    /// timeout/I/O completions cannot wake a later wait by the same fiber.
+    wait_generation: AtomicU64,
+    tls: OrderedMutex<Vec<BlissVal>>,
+    dynamic_bindings: OrderedMutex<Vec<(BlissVal, BlissVal)>>,
+    handler_stack: OrderedMutex<Vec<BlissVal>>,
+    restart_stack: OrderedMutex<Vec<BlissVal>>,
+    pin_count: AtomicUsize,
+    carrier_id: AtomicU64,
     /// Per-thread yield flag for cooperative preemption at safepoints (§2.5.3 step 4).
     yield_requested: AtomicBool,
     /// Shared result cell — written by the executing thread, read by joiners.
@@ -149,7 +464,7 @@ pub struct GreenThread {
     /// Flag indicating an interrupt has been requested.
     interrupt_pending: AtomicBool,
     /// The condition value to deliver on interrupt.
-    interrupt_value: Mutex<BlissVal>,
+    interrupt_value: OrderedMutex<BlissVal>,
     /// Stack pointer / frame pointer this managed fiber published at its last
     /// safepoint before parking or entering Native (bliss-jtc.14.2). While a
     /// fiber is suspended it does not run its own handshake, so it publishes its
@@ -159,7 +474,49 @@ pub struct GreenThread {
     published_fp: AtomicUsize,
 }
 
-impl GreenThread {
+impl Fiber {
+    pub fn name(&self) -> Option<String> {
+        self.name.lock().unwrap().clone()
+    }
+
+    pub fn continuation(&self) -> &FiberContinuation {
+        &self.continuation
+    }
+
+    pub fn dynamic_bindings(&self) -> Vec<(BlissVal, BlissVal)> {
+        self.dynamic_bindings.lock().unwrap().clone()
+    }
+
+    pub fn handler_stack(&self) -> Vec<BlissVal> {
+        self.handler_stack.lock().unwrap().clone()
+    }
+
+    pub fn restart_stack(&self) -> Vec<BlissVal> {
+        self.restart_stack.lock().unwrap().clone()
+    }
+
+    pub fn pin(&self) {
+        self.pin_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn unpin(&self) -> Result<(), BlissError> {
+        self.pin_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .map(|_| ())
+            .map_err(|_| BlissError::ProgramError("fiber pin count underflow".into()))
+    }
+
+    pub fn can_yield(&self) -> bool {
+        self.pin_count.load(Ordering::Acquire) == 0
+    }
+
+    pub fn carrier_id(&self) -> Option<NativeThreadId> {
+        match self.carrier_id.load(Ordering::Acquire) {
+            0 => None,
+            id => Some(NativeThreadId(id)),
+        }
+    }
+
     /// Publish this fiber's stack roots (SP/FP) at a safepoint, before it parks,
     /// blocks, or enters Native, so the collector can scan them while it is
     /// suspended (bliss-jtc.14.2).
@@ -181,18 +538,18 @@ impl GreenThread {
 /// Number of live (non-`Dead`) managed fibers in the registry — the M in the
 /// N-native-workers × M-managed-fibers model (bliss-jtc.14.2).
 pub fn live_fiber_count() -> usize {
-    thread_registry()
+    fiber_registry()
         .lock()
         .unwrap()
         .values()
-        .filter(|t| t.state() != ThreadState::Dead)
+        .filter(|t| t.state() != FiberState::Dead)
         .count()
 }
 
 /// Request that fiber `id` yield at its next safepoint. Returns `false` if no
 /// such fiber exists (bliss-jtc.14.2).
-pub fn request_fiber_yield(id: GreenThreadId) -> bool {
-    let reg = thread_registry().lock().unwrap();
+pub fn request_fiber_yield(id: FiberId) -> bool {
+    let reg = fiber_registry().lock().unwrap();
     match reg.get(&id) {
         Some(t) => {
             t.yield_requested.store(true, Ordering::Release);
@@ -202,13 +559,13 @@ pub fn request_fiber_yield(id: GreenThreadId) -> bool {
     }
 }
 
-// Safety: GreenThread access is controlled by the scheduler and thread registry.
-unsafe impl Send for GreenThread {}
-unsafe impl Sync for GreenThread {}
+// Safety: Fiber access is controlled by the scheduler and thread registry.
+unsafe impl Send for Fiber {}
+unsafe impl Sync for Fiber {}
 
-impl GreenThread {
+impl Fiber {
     /// Get this thread's unique ID.
-    pub fn id(&self) -> GreenThreadId {
+    pub fn id(&self) -> FiberId {
         self.id
     }
 
@@ -218,12 +575,12 @@ impl GreenThread {
     }
 
     /// Get the current state of this thread.
-    pub fn state(&self) -> ThreadState {
+    pub fn state(&self) -> FiberState {
         *self.state.lock().unwrap()
     }
 
     /// Set the thread state.
-    pub(crate) fn set_state(&self, new_state: ThreadState) {
+    pub(crate) fn set_state(&self, new_state: FiberState) {
         *self.state.lock().unwrap() = new_state;
     }
 
@@ -284,32 +641,149 @@ impl GreenThread {
     }
 }
 
-// ── Worker pool for M:N green threading ──────────────────────────────
+// ── Worker pool for M:N fibering ──────────────────────────────
 
-/// A task submitted to the worker pool: a green thread to execute.
+/// A task submitted to the carrier pool: a fiber to execute.
 struct WorkerTask {
-    thread: Arc<GreenThread>,
+    thread: Arc<Fiber>,
     result_cell: Arc<ThreadResult>,
 }
 
-/// One native worker's run queue: a work-stealing deque (bliss-jtc.14.1). The
-/// owning worker pushes/pops at the **back** (LIFO — good locality and depth-
-/// first evaluation); other idle workers steal from the **front** (FIFO — the
-/// oldest, most likely independent work). Each deque has its own lock, so normal
-/// scheduling never contends on a single global run-queue mutex (spec §2.3/§13).
+const DEQUE_CAPACITY: usize = 1 << 16;
+
+/// Bounded Chase–Lev work-stealing deque. Exactly one carrier owns bottom
+/// push/pop; any carrier may CAS the top to steal the oldest task. Slots contain
+/// owned task pointers and are reclaimed only by the operation that wins the
+/// bottom-vs-top race.
+struct ChaseLevDeque {
+    top: AtomicIsize,
+    bottom: AtomicIsize,
+    slots: Box<[AtomicPtr<WorkerTask>]>,
+}
+
+impl ChaseLevDeque {
+    fn new() -> Self {
+        let slots = (0..DEQUE_CAPACITY)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            top: AtomicIsize::new(0),
+            bottom: AtomicIsize::new(0),
+            slots,
+        }
+    }
+
+    #[inline]
+    fn slot(&self, index: isize) -> &AtomicPtr<WorkerTask> {
+        &self.slots[(index as usize) & (DEQUE_CAPACITY - 1)]
+    }
+
+    /// Owner-only bottom push.
+    fn push(&self, task: WorkerTask) -> Result<(), WorkerTask> {
+        let bottom = self.bottom.load(Ordering::Relaxed);
+        let top = self.top.load(Ordering::Acquire);
+        if bottom - top >= DEQUE_CAPACITY as isize {
+            return Err(task);
+        }
+        let raw = Box::into_raw(Box::new(task));
+        let previous = self.slot(bottom).swap(raw, Ordering::Relaxed);
+        debug_assert!(previous.is_null(), "Chase-Lev slot reused while occupied");
+        fence(Ordering::Release);
+        self.bottom.store(bottom + 1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Owner-only bottom pop (LIFO).
+    fn pop(&self) -> Option<WorkerTask> {
+        let bottom = self.bottom.load(Ordering::Relaxed) - 1;
+        self.bottom.store(bottom, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let top = self.top.load(Ordering::Relaxed);
+        if top > bottom {
+            self.bottom.store(top, Ordering::Relaxed);
+            return None;
+        }
+
+        if top == bottom {
+            if self
+                .top
+                .compare_exchange(top, top + 1, Ordering::SeqCst, Ordering::Relaxed)
+                .is_err()
+            {
+                self.bottom.store(top + 1, Ordering::Relaxed);
+                return None;
+            }
+            self.bottom.store(top + 1, Ordering::Relaxed);
+        }
+
+        let raw = self.slot(bottom).swap(ptr::null_mut(), Ordering::AcqRel);
+        debug_assert!(!raw.is_null(), "claimed Chase-Lev slot was empty");
+        (!raw.is_null()).then(|| unsafe { *Box::from_raw(raw) })
+    }
+
+    /// Multi-thief top steal (FIFO).
+    fn steal(&self) -> Option<WorkerTask> {
+        let top = self.top.load(Ordering::Acquire);
+        fence(Ordering::SeqCst);
+        let bottom = self.bottom.load(Ordering::Acquire);
+        if top >= bottom {
+            return None;
+        }
+        let raw = self.slot(top).load(Ordering::Acquire);
+        if raw.is_null()
+            || self
+                .top
+                .compare_exchange(top, top + 1, Ordering::SeqCst, Ordering::Relaxed)
+                .is_err()
+        {
+            return None;
+        }
+        let claimed = self.slot(top).swap(ptr::null_mut(), Ordering::AcqRel);
+        debug_assert_eq!(
+            claimed, raw,
+            "Chase-Lev slot changed after successful steal"
+        );
+        (!claimed.is_null()).then(|| unsafe { *Box::from_raw(claimed) })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.top.load(Ordering::Acquire) >= self.bottom.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ChaseLevDeque {
+    fn drop(&mut self) {
+        for slot in &self.slots {
+            let raw = slot.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !raw.is_null() {
+                unsafe { drop(Box::from_raw(raw)) };
+            }
+        }
+    }
+}
+
+/// One carrier's owner deque plus an MPSC staging queue for submissions made by
+/// threads that do not own this Chase–Lev bottom.
 struct Worker {
-    local: Mutex<VecDeque<WorkerTask>>,
+    local: ChaseLevDeque,
+    pending: OrderedMutex<VecDeque<WorkerTask>>,
+    deferred: OrderedMutex<VecDeque<WorkerTask>>,
+    /// Fiber mounted on this carrier, or zero while the carrier is idle.
+    current_fiber: AtomicU64,
 }
 
 thread_local! {
-    /// The pool-worker index of this OS thread, if it is a pool worker. Lets a
-    /// worker submit follow-on work to its own deque for locality.
-    static WORKER_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// `(pool-id, carrier-index)` for owner-only bottom operations.
+    static WORKER_CONTEXT: std::cell::Cell<Option<(u64, usize)>> = const { std::cell::Cell::new(None) };
 }
 
-/// The global worker pool that multiplexes green threads onto OS worker threads
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The global carrier pool that multiplexes fibers onto OS carrier threads
 /// via per-worker work-stealing deques.
 struct WorkerPool {
+    id: u64,
     workers: Vec<Worker>,
     /// Parking coordination for idle workers (separate from the run queues).
     park_mutex: Mutex<()>,
@@ -320,31 +794,51 @@ struct WorkerPool {
     initialized: AtomicBool,
     /// Round-robin cursor for submissions from non-worker (external) threads.
     next: AtomicUsize,
+    /// Public identities of the OS threads carrying this pool's fibers.
+    carrier_ids: OrderedMutex<Vec<NativeThreadId>>,
 }
 
 impl WorkerPool {
-    fn new() -> Self {
-        let num_workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(2, 64);
+    fn new(num_workers: usize) -> Self {
+        let num_workers = num_workers.max(1);
+        let id = NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed);
         let workers = (0..num_workers)
-            .map(|_| Worker {
-                local: Mutex::new(VecDeque::new()),
+            .map(|index| Worker {
+                local: ChaseLevDeque::new(),
+                pending: OrderedMutex::new(
+                    LockLevel::ExecutionRegistry,
+                    (id << 32) | ((index as u64) << 2) | 1,
+                    "carrier pending queue",
+                    VecDeque::new(),
+                ),
+                deferred: OrderedMutex::new(
+                    LockLevel::ExecutionRegistry,
+                    (id << 32) | ((index as u64) << 2) | 2,
+                    "carrier deferred queue",
+                    VecDeque::new(),
+                ),
+                current_fiber: AtomicU64::new(0),
             })
             .collect();
         WorkerPool {
+            id,
             workers,
             park_mutex: Mutex::new(()),
             park_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
             next: AtomicUsize::new(0),
+            carrier_ids: OrderedMutex::new(
+                LockLevel::ExecutionRegistry,
+                (id << 32) | u32::MAX as u64,
+                "carrier identity list",
+                Vec::new(),
+            ),
         }
     }
 
-    /// Ensure the worker pool OS threads are running (one per deque).
-    fn ensure_initialized(&self) {
+    /// Ensure the carrier pool OS threads are running (one per deque).
+    fn ensure_initialized(self: &Arc<Self>) {
         if self.initialized.load(Ordering::Acquire) {
             return;
         }
@@ -354,36 +848,121 @@ impl WorkerPool {
             .is_ok()
         {
             for i in 0..self.workers.len() {
-                std::thread::Builder::new()
-                    .name(format!("bliss-worker-{i}"))
-                    .spawn(move || worker_loop(i))
-                    .expect("failed to spawn worker thread");
+                let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
+                let name = format!("bliss-carrier-{i}");
+                let result = Arc::new(ThreadResult::new());
+                let carrier = Arc::new(NativeThread::new(
+                    id,
+                    Some(name.clone()),
+                    true,
+                    NIL,
+                    Arc::clone(&result),
+                ));
+                native_thread_registry()
+                    .lock()
+                    .unwrap()
+                    .insert(id, Arc::clone(&carrier));
+                self.carrier_ids.lock().unwrap().push(id);
+                let running_carrier = Arc::clone(&carrier);
+                let running_pool = Arc::clone(self);
+                let handle = std::thread::Builder::new()
+                    .name(name)
+                    .spawn(move || {
+                        install_current_native_thread(Arc::clone(&running_carrier));
+                        running_carrier.set_state(NativeThreadState::Running);
+                        worker_loop(running_pool, i);
+                        running_carrier.set_state(NativeThreadState::Dead);
+                        result.complete(Ok(NIL));
+                    })
+                    .expect("failed to spawn carrier thread");
+                *carrier.join_handle.lock().unwrap() = Some(handle);
             }
+
+            // HotSpot-style cooperative preemption: a service timer marks the
+            // fibers currently mounted on this pool's carriers. Generated and
+            // interpreted safepoint polls perform the context switch; the timer
+            // thread never suspends a carrier asynchronously.
+            let weak = Arc::downgrade(self);
+            let quantum = std::env::var("BLISS_TIME_SLICE_US")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(1_000);
+            let _ = std::thread::Builder::new()
+                .name(format!("bliss-preemption-{}", self.id))
+                .spawn(move || {
+                    let interval = std::time::Duration::from_micros(quantum);
+                    loop {
+                        std::thread::sleep(interval);
+                        let Some(pool) = weak.upgrade() else {
+                            return;
+                        };
+                        if pool.shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
+                        for worker in &pool.workers {
+                            let id = worker.current_fiber.load(Ordering::Acquire);
+                            if id != 0 {
+                                request_fiber_yield(FiberId(id));
+                            }
+                        }
+                    }
+                });
         }
     }
 
-    /// Submit a green thread task. A worker submits to its own deque (locality);
-    /// an external thread round-robins across workers. Wakes one parked worker.
-    fn submit(&self, task: WorkerTask) {
+    fn carrier_ids(self: &Arc<Self>) -> Vec<NativeThreadId> {
         self.ensure_initialized();
-        let idx = WORKER_INDEX
-            .with(|w| w.get())
-            .filter(|&i| i < self.workers.len())
+        self.carrier_ids.lock().unwrap().clone()
+    }
+
+    /// Submit a fiber task. A worker submits to its own deque (locality);
+    /// an external thread round-robins across workers. Wakes one parked worker.
+    fn submit(self: &Arc<Self>, task: WorkerTask) {
+        self.ensure_initialized();
+        let local = WORKER_CONTEXT.with(|context| context.get());
+        let idx = local
+            .filter(|&(pool, index)| pool == self.id && index < self.workers.len())
+            .map(|(_, index)| index)
             .unwrap_or_else(|| self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len());
-        self.workers[idx].local.lock().unwrap().push_back(task);
+        if local == Some((self.id, idx)) {
+            if let Err(task) = self.workers[idx].local.push(task) {
+                self.workers[idx].pending.lock().unwrap().push_back(task);
+            }
+        } else {
+            self.workers[idx].pending.lock().unwrap().push_back(task);
+        }
         self.park_cv.notify_one();
+    }
+
+    fn drain_pending(&self, idx: usize) {
+        let worker = &self.workers[idx];
+        let mut pending = worker.pending.lock().unwrap();
+        while let Some(task) = pending.pop_front() {
+            if let Err(task) = worker.local.push(task) {
+                pending.push_front(task);
+                break;
+            }
+        }
     }
 
     /// Pop this worker's own task (LIFO), else steal one (FIFO) from another
     /// worker's deque. Returns `None` only when every deque is empty.
     fn pop_or_steal(&self, idx: usize) -> Option<WorkerTask> {
-        if let Some(t) = self.workers[idx].local.lock().unwrap().pop_back() {
+        self.drain_pending(idx);
+        if let Some(t) = self.workers[idx].local.pop() {
+            return Some(t);
+        }
+        if let Some(t) = self.workers[idx].deferred.lock().unwrap().pop_front() {
             return Some(t);
         }
         let n = self.workers.len();
         for k in 1..n {
             let victim = (idx + k) % n;
-            if let Some(t) = self.workers[victim].local.lock().unwrap().pop_front() {
+            if let Some(t) = self.workers[victim].local.steal() {
+                return Some(t);
+            }
+            if let Some(t) = self.workers[victim].deferred.lock().unwrap().pop_front() {
                 return Some(t);
             }
         }
@@ -391,9 +970,11 @@ impl WorkerPool {
     }
 
     fn any_work(&self) -> bool {
-        self.workers
-            .iter()
-            .any(|w| !w.local.lock().unwrap().is_empty())
+        self.workers.iter().any(|w| {
+            !w.local.is_empty()
+                || !w.pending.lock().unwrap().is_empty()
+                || !w.deferred.lock().unwrap().is_empty()
+        })
     }
 
     /// Signal all workers to exit at their next scheduling point.
@@ -402,25 +983,80 @@ impl WorkerPool {
         self.shutdown.store(true, Ordering::Release);
         self.park_cv.notify_all();
     }
+
+    fn shutdown_and_join(&self) -> Result<(), BlissError> {
+        self.shutdown_now();
+        let ids = self.carrier_ids.lock().unwrap().clone();
+        let carriers: Vec<_> = {
+            let registry = native_thread_registry().lock().unwrap();
+            ids.iter()
+                .filter_map(|id| registry.get(id).cloned())
+                .collect()
+        };
+        for carrier in carriers {
+            if let Some(handle) = carrier.join_handle.lock().unwrap().take() {
+                handle.join().map_err(|_| {
+                    BlissError::Internal(format!("carrier thread {} panicked", carrier.id.0))
+                })?;
+            }
+        }
+        let mut registry = native_thread_registry().lock().unwrap();
+        for id in ids {
+            registry.remove(&id);
+        }
+        Ok(())
+    }
 }
 
-/// Access the global worker pool singleton.
-fn worker_pool() -> &'static WorkerPool {
-    static POOL: OnceLock<WorkerPool> = OnceLock::new();
-    POOL.get_or_init(WorkerPool::new)
+/// Access the VM-wide default carrier pool used by the low-level convenience
+/// `submit_fiber` API. Explicit scheduler groups own independent pools.
+fn worker_pool() -> &'static Arc<WorkerPool> {
+    static POOL: OnceLock<Arc<WorkerPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let carriers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 64);
+        Arc::new(WorkerPool::new(carriers))
+    })
+}
+
+/// One scheduler group's private carrier/deque implementation. The public
+/// scheduler module holds this handle but cannot observe or mutate run queues.
+pub(crate) struct CarrierPool {
+    pool: Arc<WorkerPool>,
+}
+
+impl CarrierPool {
+    pub(crate) fn new(carrier_count: usize) -> Self {
+        let pool = Arc::new(WorkerPool::new(carrier_count));
+        pool.ensure_initialized();
+        Self { pool }
+    }
+
+    pub(crate) fn carrier_thread_ids(&self) -> Vec<NativeThreadId> {
+        self.pool.carrier_ids()
+    }
+
+    pub(crate) fn submit(&self, fiber: FiberId) -> Result<(), BlissError> {
+        submit_fiber_to_pool(fiber, &self.pool)
+    }
+
+    pub(crate) fn shutdown_and_join(&self) -> Result<(), BlissError> {
+        self.pool.shutdown_and_join()
+    }
 }
 
 /// The main loop executed by each OS worker thread: run local work LIFO, steal
 /// FIFO when idle, and park when every deque is empty (bliss-jtc.14.1).
-fn worker_loop(idx: usize) {
-    WORKER_INDEX.with(|w| w.set(Some(idx)));
-    let pool = worker_pool();
+fn worker_loop(pool: Arc<WorkerPool>, idx: usize) {
+    WORKER_CONTEXT.with(|context| context.set(Some((pool.id, idx))));
     loop {
         if pool.shutdown.load(Ordering::Acquire) {
             return;
         }
         if let Some(task) = pool.pop_or_steal(idx) {
-            run_worker_task(task);
+            run_worker_task(&pool, idx, task);
             continue;
         }
         // Nothing runnable: park until woken by a submission or a short timeout.
@@ -433,31 +1069,157 @@ fn worker_loop(idx: usize) {
         if pool.any_work() {
             continue;
         }
+        current_thread().set_state(NativeThreadState::Blocked);
         let _ = pool
             .park_cv
             .wait_timeout(guard, std::time::Duration::from_millis(5));
+        current_thread().set_state(NativeThreadState::Running);
     }
 }
 
-/// Run one green thread to completion on the current worker.
-fn run_worker_task(task: WorkerTask) {
-    task.thread.set_state(ThreadState::Runnable);
+/// Mount one fiber on the current carrier until it yields, parks, or dies.
+fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTask) {
+    {
+        let mut state = task.thread.state.lock().unwrap();
+        if *state != FiberState::Runnable || task.thread.mounted.swap(true, Ordering::AcqRel) {
+            let old_state = *state;
+            drop(state);
+            task.result_cell.complete(Err(BlissError::Internal(format!(
+                "attempted to mount fiber in invalid state {old_state:?}"
+            ))));
+            return;
+        }
+        *state = FiberState::Running;
+    }
+    task.thread.publish_stack(0, 0);
+    task.thread
+        .carrier_id
+        .store(current_thread_id().0, Ordering::Release);
     let thread = Arc::clone(&task.thread);
-    ACTIVE_GREEN_THREAD.with(|slot| {
+    pool.workers[carrier_index]
+        .current_fiber
+        .store(thread.id().0, Ordering::Release);
+    ACTIVE_FIBER.with(|slot| {
         *slot.borrow_mut() = Some(Arc::clone(&thread));
     });
 
-    let result = run_green_thread_entry(&thread);
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        let mut scheduler_context: libc::ucontext_t = std::mem::zeroed();
+        SCHEDULER_CONTEXT.with(|slot| slot.set(&mut scheduler_context));
+        let rc = libc::swapcontext(
+            &mut scheduler_context,
+            thread.execution_context.as_ptr().cast_const(),
+        );
+        SCHEDULER_CONTEXT.with(|slot| slot.set(ptr::null_mut()));
+        if rc != 0 {
+            thread.suspend_reason.store(SUSPEND_DEAD, Ordering::Release);
+            thread.set_state(FiberState::Dead);
+            thread.result.complete(Err(BlissError::Internal(
+                "swapcontext failed while mounting fiber".into(),
+            )));
+        }
+    }
 
-    ACTIVE_GREEN_THREAD.with(|slot| {
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        let result = run_fiber_entry(&thread);
+        thread.stack.publish_top();
+        thread.continuation.save(
+            thread.stack.published_sp(),
+            thread.stack.published_fp() as usize,
+            0,
+        );
+        thread.set_state(FiberState::Dead);
+        thread.result.complete(result);
+    }
+
+    ACTIVE_FIBER.with(|slot| {
         *slot.borrow_mut() = None;
     });
+    pool.workers[carrier_index]
+        .current_fiber
+        .store(0, Ordering::Release);
 
-    task.thread.set_state(ThreadState::Dead);
-    task.result_cell.complete(result);
+    let reason = thread.suspend_reason.swap(SUSPEND_NONE, Ordering::AcqRel);
+    let mut state = thread.state.lock().unwrap();
+    thread.mounted.store(false, Ordering::Release);
+    match reason {
+        SUSPEND_YIELD => {
+            *state = FiberState::Runnable;
+            drop(state);
+            pool.workers[carrier_index]
+                .deferred
+                .lock()
+                .unwrap()
+                .push_back(task);
+            pool.park_cv.notify_one();
+        }
+        SUSPEND_PARK => {
+            if thread.wake_pending.swap(false, Ordering::AcqRel) {
+                *state = FiberState::Runnable;
+                drop(state);
+                pool.submit(task);
+            }
+        }
+        SUSPEND_DEAD => {
+            *state = FiberState::Dead;
+        }
+        _ => {
+            let old_state = *state;
+            *state = FiberState::Dead;
+            drop(state);
+            task.result_cell.complete(Err(BlissError::Internal(format!(
+                "fiber returned to scheduler without a suspension reason (state {old_state:?})"
+            ))));
+        }
+    }
 }
 
-fn run_green_thread_entry(thread: &GreenThread) -> Result<BlissVal, BlissError> {
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+extern "C" fn fiber_context_trampoline() {
+    let Some(fiber) = current_fiber() else {
+        unsafe { libc::abort() }
+    };
+    let result = run_fiber_entry(fiber);
+    fiber.stack.publish_top();
+    fiber.continuation.save(
+        fiber.stack.published_sp(),
+        fiber.stack.published_fp() as usize,
+        0,
+    );
+    fiber.set_state(FiberState::Dead);
+    fiber.suspend_reason.store(SUSPEND_DEAD, Ordering::Release);
+    fiber.result.complete(result);
+    unsafe {
+        if swap_fiber_to_scheduler(fiber).is_err() {
+            libc::abort();
+        }
+    }
+    unsafe { libc::abort() };
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+unsafe fn swap_fiber_to_scheduler(fiber: &Fiber) -> Result<(), BlissError> {
+    SCHEDULER_CONTEXT.with(|slot| {
+        let scheduler = slot.get();
+        if scheduler.is_null() {
+            return Err(BlissError::Internal(
+                "fiber has no mounted scheduler context".into(),
+            ));
+        }
+        if unsafe { libc::swapcontext(fiber.execution_context.as_ptr(), scheduler.cast_const()) }
+            != 0
+        {
+            return Err(BlissError::Internal(
+                "swapcontext failed while unmounting fiber".into(),
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn run_fiber_entry(thread: &Fiber) -> Result<BlissVal, BlissError> {
     let mut result = if thread.entry.is_function() {
         let fn_addr = thread.entry.0 & !crate::value::TAG_MASK;
         let func: fn() -> BlissVal = unsafe { std::mem::transmute(fn_addr) };
@@ -481,246 +1243,609 @@ fn run_green_thread_entry(thread: &GreenThread) -> Result<BlissVal, BlissError> 
     result
 }
 
-/// An OS-level worker thread in the worker pool (§2.3.1).
-///
-/// Worker threads own their execution context via thread-local storage:
-/// each OS worker has a TLAB (thread-local allocation buffer) and accesses
-/// the shared work-stealing deque through the global `WorkerPool`. The struct
-/// itself is zero-sized; per-worker state is managed through the pool and
-/// thread-locals, enabling lightweight scheduling without per-struct overhead.
-pub struct WorkerThread {
-    _private: (),
-}
-
-impl WorkerThread {
-    /// Create a new worker thread handle.
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        WorkerThread { _private: () }
-    }
-
-    /// Submit a green thread to the worker pool for execution.
-    #[allow(dead_code)]
-    pub(crate) fn submit_task(thread: Arc<GreenThread>, result_cell: Arc<ThreadResult>) {
-        worker_pool().submit(WorkerTask {
-            thread,
-            result_cell,
-        });
+fn run_entry(entry: BlissVal) -> Result<BlissVal, BlissError> {
+    if entry.is_function() {
+        let fn_addr = entry.0 & !crate::value::TAG_MASK;
+        let function: fn() -> BlissVal = unsafe { std::mem::transmute(fn_addr) };
+        Ok(function())
+    } else if matches!(entry.0, crate::value::NIL_BITS | crate::value::T_BITS) {
+        Ok(entry)
+    } else {
+        Err(BlissError::TypeError {
+            datum: entry,
+            expected: "function".to_string(),
+        })
     }
 }
 
-impl Default for WorkerThread {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ── Exposed native/platform thread API ─────────────────────────────
 
-// ── Thread creation and management ─────────────────────────────────
-
-/// Create a new green thread that will execute `entry`.
-/// The thread starts in `Runnable` state and is submitted to the global
-/// worker pool for M:N scheduling onto OS worker threads. The entry value
-/// is stored on the GreenThread descriptor and invoked as a zero-argument
-/// CL function when scheduled.
-pub fn make_thread(entry: BlissVal) -> Result<GreenThreadId, BlissError> {
-    let id = GreenThreadId(NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed));
-    let result_cell = Arc::new(ThreadResult::new());
-    let thread = Arc::new(GreenThread {
+/// Create a dedicated one-to-one OS-backed native thread.
+pub fn make_thread(entry: BlissVal) -> Result<NativeThreadId, BlissError> {
+    let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
+    let result = Arc::new(ThreadResult::new());
+    let thread = Arc::new(NativeThread::new(
         id,
+        Some(format!("bliss-thread-{}", id.0)),
+        false,
         entry,
-        state: Mutex::new(ThreadState::Runnable),
-        stack: BlissStack::new(default_stack_size()),
-        tls: Mutex::new(vec![NIL; MAX_TLS]),
-        yield_requested: AtomicBool::new(false),
-        result: Arc::clone(&result_cell),
-        interrupt_pending: AtomicBool::new(false),
-        interrupt_value: Mutex::new(NIL),
-        published_sp: AtomicUsize::new(0),
-        published_fp: AtomicUsize::new(0),
-    });
-
-    // Register the thread before submitting so it is visible to other threads.
-    thread_registry()
+        Arc::clone(&result),
+    ));
+    native_thread_registry()
         .lock()
         .unwrap()
         .insert(id, Arc::clone(&thread));
 
-    // Submit the green thread to the worker pool for M:N scheduling,
-    // rather than spawning a dedicated OS thread per green thread.
-    worker_pool().submit(WorkerTask {
-        thread,
-        result_cell,
-    });
-
+    let running = Arc::clone(&thread);
+    let handle = match std::thread::Builder::new()
+        .name(format!("bliss-thread-{}", id.0))
+        .spawn(move || {
+            install_current_native_thread(Arc::clone(&running));
+            running.set_state(NativeThreadState::Running);
+            let mut value = run_entry(running.entry);
+            if let Some(interrupt) = running.take_interrupt() {
+                value = Ok(interrupt);
+            }
+            running.stack.publish_top();
+            running.set_state(NativeThreadState::Dead);
+            result.complete(value);
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            native_thread_registry().lock().unwrap().remove(&id);
+            return Err(BlissError::Internal(format!(
+                "failed to create native thread: {error}"
+            )));
+        }
+    };
+    *thread.join_handle.lock().unwrap() = Some(handle);
     Ok(id)
 }
 
-/// Wait for a green thread to finish, returning its result value.
-///
-/// Blocks the calling thread until the target green thread transitions
-/// to `Dead` state and its result is available. Returns the result
-/// value that the thread's entry function produced. If the thread ID
-/// is not found in the registry, returns an error. After joining, the
-/// thread is removed from the global registry to prevent memory leaks.
-pub fn join_thread(id: GreenThreadId) -> Result<BlissVal, BlissError> {
-    // Look up the thread descriptor to get its result cell.
-    let result_cell = {
-        let registry = thread_registry().lock().unwrap();
-        match registry.get(&id) {
-            Some(thread) => Arc::clone(&thread.result),
-            None => {
-                return Err(BlissError::Internal(format!("no thread with id {}", id.0)));
-            }
-        }
-    };
-
-    // Block until the thread completes, then return the result.
-    let val = result_cell.wait()?;
-
-    // Clean up: remove the dead thread from the registry to avoid leaking memory.
-    thread_registry().lock().unwrap().remove(&id);
-
-    Ok(val)
-}
-
-/// Get the current green thread's ID.
-pub fn current_thread_id() -> GreenThreadId {
-    CURRENT_THREAD.with(|t| t.id)
-}
-
-/// Get a reference to the current green thread.
-///
-/// # Safety rationale
-/// The GreenThread is held in an `Arc` stored both in the global registry
-/// and in a thread-local cache. The thread-local Arc clone keeps the
-/// allocation alive for at least the lifetime of the OS thread, so the
-/// returned `&'static` reference is valid as long as the calling OS thread
-/// is alive.
-pub fn current_thread() -> &'static GreenThread {
-    if let Some(active) = ACTIVE_GREEN_THREAD.with(|slot| slot.borrow().clone()) {
-        unsafe { &*(Arc::as_ptr(&active)) }
-    } else {
-        CURRENT_THREAD.with(|t| unsafe { &*(Arc::as_ptr(t)) })
+/// Join a dedicated native thread and return its entry value.
+pub fn join_thread(id: NativeThreadId) -> Result<BlissVal, BlissError> {
+    if id == current_thread_id() {
+        return Err(BlissError::ProgramError(
+            "a thread cannot join itself".into(),
+        ));
     }
+    let thread = native_thread_registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| BlissError::Internal(format!("no native thread with id {}", id.0)))?;
+    let value = thread.result.wait()?;
+    if let Some(handle) = thread.join_handle.lock().unwrap().take() {
+        handle
+            .join()
+            .map_err(|_| BlissError::Internal(format!("native thread {} panicked", id.0)))?;
+    }
+    native_thread_registry().lock().unwrap().remove(&id);
+    Ok(value)
 }
 
-/// Yield the current green thread at the next safepoint.
-///
-/// Hints to the OS scheduler that this thread is willing to give up
-/// its time slice. In the M:N model this would switch to the next
-/// green thread on the same worker; in the bootstrap implementation
-/// it delegates to `std::thread::yield_now()`.
+pub fn current_thread_id() -> NativeThreadId {
+    ensure_current_native_thread().id()
+}
+
+pub fn current_thread() -> &'static NativeThread {
+    let thread = ensure_current_native_thread();
+    unsafe { &*Arc::as_ptr(&thread) }
+}
+
+pub fn all_thread_ids() -> Vec<NativeThreadId> {
+    let _ = current_thread_id();
+    native_thread_registry()
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .collect()
+}
+
+pub fn thread_is_carrier(id: NativeThreadId) -> Option<bool> {
+    native_thread_registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|thread| thread.is_carrier())
+}
+
+pub fn carrier_thread_ids() -> Vec<NativeThreadId> {
+    worker_pool().carrier_ids()
+}
+
+pub fn interrupt_thread(id: NativeThreadId, condition: BlissVal) -> Result<(), BlissError> {
+    let registry = native_thread_registry().lock().unwrap();
+    let thread = registry
+        .get(&id)
+        .ok_or_else(|| BlissError::Internal(format!("no native thread with id {}", id.0)))?;
+    if thread.state() != NativeThreadState::Dead {
+        thread.post_interrupt(condition);
+    }
+    Ok(())
+}
+
 pub fn thread_yield() {
     std::thread::yield_now();
 }
 
-/// Interrupt a green thread, delivering a condition to it.
-///
-/// Sets the interrupt-pending flag on the target thread and stores the
-/// condition value. The target thread will observe the interrupt at its
-/// next safepoint poll (or when it calls `take_interrupt`). If the
-/// thread ID is not found, returns an error. If the thread is already
-/// dead, the interrupt is silently discarded (no error) since nobody
-/// would consume it.
-pub fn interrupt_thread(id: GreenThreadId, condition: BlissVal) -> Result<(), BlissError> {
-    let registry = thread_registry().lock().unwrap();
-    match registry.get(&id) {
-        Some(thread) => {
-            // Check if the thread is already dead — posting an interrupt
-            // to a dead thread is meaningless since no one will consume it.
-            let state = thread.state();
-            if state == ThreadState::Dead {
-                // Silently discard the interrupt for a dead thread.
-                return Ok(());
+// ── Lightweight fiber API ─────────────────────────────────────────
+
+/// Allocate a fiber in `Created` state. It does not run until submitted.
+pub fn make_fiber(entry: BlissVal) -> Result<FiberId, BlissError> {
+    let id = FiberId(NEXT_FIBER_ID.fetch_add(1, Ordering::Relaxed));
+    let result = Arc::new(ThreadResult::new());
+    let fiber = Arc::new(Fiber {
+        id,
+        name: OrderedMutex::new(
+            LockLevel::ExecutionObject,
+            fiber_object_order(id, 1),
+            "fiber name",
+            None,
+        ),
+        entry,
+        state: OrderedMutex::new(
+            LockLevel::ExecutionObject,
+            fiber_object_order(id, 2),
+            "fiber state",
+            FiberState::Created,
+        ),
+        stack: BlissStack::new(default_stack_size()),
+        continuation: FiberContinuation::default(),
+        execution_context: FiberExecutionContext::new()?,
+        scheduler_pool: OrderedMutex::new(
+            LockLevel::ExecutionObject,
+            fiber_object_order(id, 3),
+            "fiber scheduler owner",
+            None,
+        ),
+        mounted: AtomicBool::new(false),
+        wake_pending: AtomicBool::new(false),
+        suspend_reason: AtomicU8::new(SUSPEND_NONE),
+        wait_generation: AtomicU64::new(0),
+        tls: OrderedMutex::new(
+            LockLevel::ExecutionObject,
+            fiber_object_order(id, 4),
+            "fiber TLS",
+            vec![NIL; MAX_TLS],
+        ),
+        dynamic_bindings: OrderedMutex::new(
+            LockLevel::ExecutionObject,
+            fiber_object_order(id, 5),
+            "fiber dynamic bindings",
+            Vec::new(),
+        ),
+        handler_stack: OrderedMutex::new(
+            LockLevel::ExecutionObject,
+            fiber_object_order(id, 6),
+            "fiber handler stack",
+            Vec::new(),
+        ),
+        restart_stack: OrderedMutex::new(
+            LockLevel::ExecutionObject,
+            fiber_object_order(id, 7),
+            "fiber restart stack",
+            Vec::new(),
+        ),
+        pin_count: AtomicUsize::new(0),
+        carrier_id: AtomicU64::new(0),
+        yield_requested: AtomicBool::new(false),
+        result,
+        interrupt_pending: AtomicBool::new(false),
+        interrupt_value: OrderedMutex::new(
+            LockLevel::ExecutionObject,
+            fiber_object_order(id, 8),
+            "fiber interrupt",
+            NIL,
+        ),
+        published_sp: AtomicUsize::new(0),
+        published_fp: AtomicUsize::new(0),
+    });
+    fiber_registry()
+        .lock()
+        .unwrap()
+        .insert(id, Arc::clone(&fiber));
+    Ok(id)
+}
+
+pub fn submit_fiber(id: FiberId) -> Result<(), BlissError> {
+    submit_fiber_to_pool(id, worker_pool())
+}
+
+fn submit_fiber_to_pool(id: FiberId, pool: &Arc<WorkerPool>) -> Result<(), BlissError> {
+    let fiber = fiber_registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| BlissError::Internal(format!("no fiber with id {}", id.0)))?;
+    {
+        let mut owner = fiber.scheduler_pool.lock().unwrap();
+        match owner.as_ref().and_then(Weak::upgrade) {
+            Some(existing) if !Arc::ptr_eq(&existing, pool) => {
+                return Err(BlissError::ProgramError(format!(
+                    "fiber {} already belongs to another scheduler group",
+                    id.0
+                )));
             }
-            thread.post_interrupt(condition);
-            Ok(())
+            Some(_) => {}
+            None => *owner = Some(Arc::downgrade(pool)),
         }
-        None => Err(BlissError::Internal(format!("no thread with id {}", id.0))),
+    }
+    let enqueue = {
+        let mut state = fiber.state.lock().unwrap();
+        match *state {
+            FiberState::Created => {
+                *state = FiberState::Runnable;
+                true
+            }
+            FiberState::Blocked | FiberState::Waiting => {
+                if fiber.mounted.load(Ordering::Acquire) {
+                    // The carrier will observe this while holding the same
+                    // state lock after swapcontext returns.  That lock closes
+                    // the otherwise-lost-wakeup window around mounted=false.
+                    fiber.wake_pending.store(true, Ordering::Release);
+                    false
+                } else {
+                    *state = FiberState::Runnable;
+                    true
+                }
+            }
+            _ => {
+                return Err(BlissError::ProgramError(format!(
+                    "fiber {} is already submitted",
+                    id.0
+                )));
+            }
+        }
+    };
+    if enqueue {
+        pool.submit(WorkerTask {
+            result_cell: Arc::clone(&fiber.result),
+            thread: fiber,
+        });
+    }
+    Ok(())
+}
+
+pub fn join_fiber(id: FiberId) -> Result<BlissVal, BlissError> {
+    if current_fiber_id() == Some(id) {
+        return Err(BlissError::ProgramError(
+            "a fiber cannot join itself".into(),
+        ));
+    }
+    let result = fiber_registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|fiber| Arc::clone(&fiber.result))
+        .ok_or_else(|| BlissError::Internal(format!("no fiber with id {}", id.0)))?;
+    let value = result.wait()?;
+    fiber_registry().lock().unwrap().remove(&id);
+    Ok(value)
+}
+
+pub fn current_fiber() -> Option<&'static Fiber> {
+    ACTIVE_FIBER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|fiber| unsafe { &*Arc::as_ptr(fiber) })
+    })
+}
+
+pub fn current_fiber_id() -> Option<FiberId> {
+    current_fiber().map(Fiber::id)
+}
+
+pub fn all_fiber_ids() -> Vec<FiberId> {
+    fiber_registry().lock().unwrap().keys().copied().collect()
+}
+
+pub fn fiber_state(id: FiberId) -> Option<FiberState> {
+    fiber_registry().lock().unwrap().get(&id).map(|f| f.state())
+}
+
+pub fn fiber_carrier_thread(id: FiberId) -> Option<NativeThreadId> {
+    fiber_registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .and_then(|fiber| fiber.carrier_id())
+}
+
+pub fn fiber_yield() -> Result<(), BlissError> {
+    let fiber = current_fiber()
+        .ok_or_else(|| BlissError::ProgramError("FIBER-YIELD outside a fiber".into()))?;
+    if !fiber.can_yield() {
+        return Err(BlissError::ProgramError(
+            "cannot yield while fiber is pinned".into(),
+        ));
+    }
+    fiber.stack.publish_top();
+    fiber.continuation.save(
+        fiber.stack.published_sp(),
+        fiber.stack.published_fp() as usize,
+        1,
+    );
+    fiber.publish_stack(
+        fiber.stack.published_sp(),
+        fiber.stack.published_fp() as usize,
+    );
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        fiber.suspend_reason.store(SUSPEND_YIELD, Ordering::Release);
+        fiber.set_state(FiberState::Suspended);
+        unsafe { swap_fiber_to_scheduler(fiber)? };
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    std::thread::yield_now();
+
+    Ok(())
+}
+
+/// Park the mounted fiber without blocking its carrier. `unpark` on the owning
+/// scheduler group makes it runnable again.
+pub fn park_current_fiber() -> Result<(), BlissError> {
+    prepare_current_fiber_park(FiberState::Blocked)?;
+    park_prepared_current_fiber()
+}
+
+/// Publish the mounted fiber's roots and enter a blocked/waiting state while
+/// it is still running on the carrier.  Callers use this while holding their
+/// wait-queue lock, then release that lock and call
+/// [`park_prepared_current_fiber`].  A concurrent wake is recorded in
+/// `wake_pending`, closing the classic enqueue-to-park lost-wakeup window.
+pub(crate) fn prepare_current_fiber_park(state: FiberState) -> Result<(FiberId, u64), BlissError> {
+    if !matches!(state, FiberState::Blocked | FiberState::Waiting) {
+        return Err(BlissError::Internal(
+            "fiber can only prepare a Blocked or Waiting park".into(),
+        ));
+    }
+    let fiber = current_fiber()
+        .ok_or_else(|| BlissError::ProgramError("fiber park outside a fiber".into()))?;
+    if !fiber.can_yield() {
+        return Err(BlissError::ProgramError(
+            "cannot park while fiber is pinned".into(),
+        ));
+    }
+    fiber.stack.publish_top();
+    fiber.continuation.save(
+        fiber.stack.published_sp(),
+        fiber.stack.published_fp() as usize,
+        2,
+    );
+    fiber.publish_stack(
+        fiber.stack.published_sp(),
+        fiber.stack.published_fp() as usize,
+    );
+    let token = fiber.wait_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    fiber.suspend_reason.store(SUSPEND_PARK, Ordering::Release);
+    fiber.set_state(state);
+    Ok((fiber.id(), token))
+}
+
+/// Finish a park prepared by [`prepare_current_fiber_park`].
+pub(crate) fn park_prepared_current_fiber() -> Result<(), BlissError> {
+    let fiber = current_fiber()
+        .ok_or_else(|| BlissError::ProgramError("fiber park outside a fiber".into()))?;
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        if !matches!(fiber.state(), FiberState::Blocked | FiberState::Waiting) {
+            return Err(BlissError::Internal(
+                "fiber park was not prepared before unmount".into(),
+            ));
+        }
+        unsafe { swap_fiber_to_scheduler(fiber)? };
+    }
+
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    std::thread::yield_now();
+
+    Ok(())
+}
+
+/// Undo a prepared park if registration with the blocking subsystem fails.
+pub(crate) fn cancel_prepared_current_fiber_park() {
+    if let Some(fiber) = current_fiber() {
+        fiber.suspend_reason.store(SUSPEND_NONE, Ordering::Release);
+        fiber.set_state(FiberState::Running);
     }
 }
 
-/// List all live green thread IDs.
-pub fn all_thread_ids() -> Vec<GreenThreadId> {
-    // Ensure the current thread is registered first by touching the
-    // thread-local, then take a single lock to collect all IDs.
-    // This avoids the double-lock race where another thread could
-    // modify the registry between two separate lock acquisitions.
-    let _ = current_thread_id();
-    let mut registry = thread_registry().lock().unwrap();
-    prune_orphaned_threads(&mut registry, None);
-    registry.keys().copied().collect()
+/// Wake a blocked fiber if `token` still names its current wait.  This is the
+/// common completion path for synchronization, timers, and I/O readiness.
+pub(crate) fn wake_fiber_wait(id: FiberId, token: u64) -> bool {
+    let fiber = match fiber_registry().lock().unwrap().get(&id).cloned() {
+        Some(fiber) => fiber,
+        None => return false,
+    };
+    if fiber.wait_generation.load(Ordering::Acquire) != token {
+        return false;
+    }
+    let pool = fiber
+        .scheduler_pool
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(Weak::upgrade);
+    let Some(pool) = pool else {
+        return false;
+    };
+    submit_fiber_to_pool(id, &pool).is_ok()
 }
 
-/// The frame pointer a green thread published at its last safepoint, for
-/// precise CL-stack scanning by the GC (nmq.3). Returns `None` if the thread is
-/// not registered.
-pub fn thread_published_fp(id: GreenThreadId) -> Option<*const crate::stack::Frame> {
-    let registry = thread_registry().lock().ok()?;
-    registry.get(&id).map(|t| t.stack().published_fp())
+pub fn interrupt_fiber(id: FiberId, condition: BlissVal) -> Result<(), BlissError> {
+    let registry = fiber_registry().lock().unwrap();
+    let fiber = registry
+        .get(&id)
+        .ok_or_else(|| BlissError::Internal(format!("no fiber with id {}", id.0)))?;
+    if fiber.state() != FiberState::Dead {
+        fiber.post_interrupt(condition);
+    }
+    Ok(())
 }
 
-/// Count threads that must participate in a safepoint handshake.
-///
-/// Native threads are intentionally excluded: while they are inside foreign
-/// code they cannot poll, and the safepoint protocol must not wait for them.
-pub fn safepoint_participant_count_excluding(current: GreenThreadId) -> usize {
-    let _ = current_thread_id();
-    let mut registry = thread_registry().lock().unwrap();
-    prune_orphaned_threads(&mut registry, Some(current));
-    registry
+/// Stack currently executing CL code: mounted fiber first, native thread otherwise.
+pub fn current_stack() -> &'static BlissStack {
+    current_fiber()
+        .map(Fiber::stack)
+        .unwrap_or_else(|| current_thread().stack())
+}
+
+pub fn thread_published_fp(id: NativeThreadId) -> Option<*const crate::stack::Frame> {
+    native_thread_registry()
+        .lock()
+        .ok()?
+        .get(&id)
+        .map(|thread| thread.stack().published_fp())
+}
+
+pub fn fiber_published_fp(id: FiberId) -> Option<*const crate::stack::Frame> {
+    fiber_registry()
+        .lock()
+        .ok()?
+        .get(&id)
+        .map(|fiber| fiber.stack().published_fp())
+}
+
+pub fn safepoint_participant_count_excluding(current: NativeThreadId) -> usize {
+    native_thread_registry()
+        .lock()
+        .unwrap()
         .iter()
         .filter(|(id, thread)| {
             **id != current
-                && thread.state() != ThreadState::Dead
-                && thread.state() != ThreadState::Native
+                && thread.state() == NativeThreadState::Running
+                && !thread.entry.is_nil()
         })
         .count()
 }
 
-fn prune_orphaned_threads(
-    registry: &mut HashMap<GreenThreadId, Arc<GreenThread>>,
-    current: Option<GreenThreadId>,
-) {
-    registry.retain(|id, thread| {
-        if Some(*id) == current {
-            return true;
-        }
-
-        // Thread-local CURRENT_THREAD entries can outlive a runtime instance:
-        // once the owning OS thread exits, the registry may be the last owner.
-        // Those orphaned entries are not runnable work and must not block
-        // shutdown or appear as live threads in subsequent runtimes/tests.
-        Arc::strong_count(thread) > 1 || thread.state() == ThreadState::Dead
-    });
+/// Interrupt running native mutators so a blocking syscall returns `EINTR` and
+/// the thread can observe the pending stop-the-world request at its next poll.
+/// The SIGUSR1 handler itself only sets a flag; it never suspends the thread.
+#[cfg(unix)]
+pub(crate) fn signal_safepoint_participants(current: NativeThreadId) -> usize {
+    let registry = native_thread_registry().lock().unwrap();
+    registry
+        .iter()
+        .filter(|(id, thread)| {
+            **id != current
+                && thread.state() == NativeThreadState::Running
+                && !thread.entry.is_nil()
+        })
+        .filter(|(_, thread)| {
+            let os_thread = thread.os_thread_id.load(Ordering::Acquire);
+            os_thread != 0
+                && unsafe { libc::pthread_kill(os_thread as libc::pthread_t, libc::SIGUSR1) } == 0
+        })
+        .count()
 }
 
-/// Wait until every other registered green thread has finished executing.
-///
-/// Unlike `join_thread`, this preserves each thread's result so callers may
-/// still join later and observe the completed value.
+#[cfg(not(unix))]
+pub(crate) fn signal_safepoint_participants(_current: NativeThreadId) -> usize {
+    0
+}
+
 pub fn wait_for_other_threads() {
     let current = current_thread_id();
     loop {
-        let pending = {
-            let mut registry = thread_registry().lock().unwrap();
-            prune_orphaned_threads(&mut registry, Some(current));
-            registry
-                .iter()
-                .filter(|(id, thread)| {
-                    // Only wait for green threads this runtime actually spawned
-                    // (those created by `make_thread`, which carry a real entry
-                    // function). Bootstrap CURRENT_THREAD entries created lazily
-                    // by *other* OS threads have a NIL entry and are never driven
-                    // to Dead by this runtime, so waiting on them would livelock
-                    // shutdown whenever another runtime/test thread coexists.
-                    **id != current && !thread.entry().is_nil()
-                })
-                .any(|(_, thread)| thread.state() != ThreadState::Dead)
-        };
-        if !pending {
+        let native_pending = native_thread_registry()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, thread)| {
+                *id != current
+                    && !thread.is_carrier()
+                    && !thread.entry.is_nil()
+                    && thread.state() != NativeThreadState::Dead
+            });
+        let fiber_pending =
+            fiber_registry().lock().unwrap().values().any(|fiber| {
+                fiber.state() != FiberState::Created && fiber.state() != FiberState::Dead
+            });
+        if !native_pending && !fiber_pending {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod chase_lev_tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::time::{Duration, Instant};
+
+    fn task(number: i64) -> WorkerTask {
+        let id = make_fiber(BlissVal::from_fixnum(number)).unwrap();
+        let fiber = fiber_registry().lock().unwrap().remove(&id).unwrap();
+        WorkerTask {
+            result_cell: Arc::clone(&fiber.result),
+            thread: fiber,
+        }
+    }
+
+    fn number(task: &WorkerTask) -> i64 {
+        task.thread.entry().as_fixnum()
+    }
+
+    #[test]
+    fn owner_is_lifo_and_thief_is_fifo() {
+        let deque = ChaseLevDeque::new();
+        assert!(deque.push(task(1)).is_ok());
+        assert!(deque.push(task(2)).is_ok());
+        assert!(deque.push(task(3)).is_ok());
+
+        assert_eq!(number(&deque.pop().unwrap()), 3);
+        assert_eq!(number(&deque.steal().unwrap()), 1);
+        assert_eq!(number(&deque.pop().unwrap()), 2);
+        assert!(deque.pop().is_none());
+        assert!(deque.steal().is_none());
+    }
+
+    #[test]
+    fn concurrent_thieves_claim_every_task_exactly_once() {
+        const TASKS: usize = 10_000;
+        const THIEVES: usize = 8;
+        let deque = Arc::new(ChaseLevDeque::new());
+        for id in 0..TASKS {
+            assert!(deque.push(task(id as i64)).is_ok());
+        }
+        let start = Arc::new(Barrier::new(THIEVES));
+        let claimed = Arc::new(AtomicUsize::new(0));
+        let values = Arc::new(Mutex::new(Vec::with_capacity(TASKS)));
+        let mut handles = Vec::new();
+        for _ in 0..THIEVES {
+            let deque = Arc::clone(&deque);
+            let start = Arc::clone(&start);
+            let claimed = Arc::clone(&claimed);
+            let values = Arc::clone(&values);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while claimed.load(Ordering::Acquire) < TASKS && Instant::now() < deadline {
+                    if let Some(task) = deque.steal() {
+                        values.lock().unwrap().push(number(&task));
+                        claimed.fetch_add(1, Ordering::AcqRel);
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut values = values.lock().unwrap().clone();
+        values.sort_unstable();
+        assert_eq!(values, (0..TASKS as i64).collect::<Vec<_>>());
+        assert!(deque.is_empty());
     }
 }

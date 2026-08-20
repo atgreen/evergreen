@@ -387,12 +387,21 @@ by `debug_assert!` in debug builds.
 | Level | Lock | Protects |
 |-------|------|----------|
 | 0 | Thread-local (no lock) | TLAB, handler bindings, dynamic env |
-| 1 | Per-bucket hash table stripe | Hash table entries |
-| 2 | Per-package rwlock | Package interning tables |
+| 1 | Per-stream lock | Stream state and buffers |
+| 2 | Hash-table/table-stripe lock | Hash-table entries |
 | 3 | Global package registry | Package creation/deletion |
-| 4 | Compiler code-cache lock | Code installation |
-| 5 | GC world-stop mutex | Stop-the-world coordination |
-| 6 | Image save mutex | Heap serialisation |
+| 4 | Per-package rwlock | Package interning tables |
+| 5 | Interned-string table | Canonical string identities |
+| 6 | Compiler/code-cache lock | Code installation and debugger metadata |
+| 7 | Profiling-data lock | Tier and developer-tool profiles |
+| 8 | GC world/root lock | Heap coordination and relocatable side roots |
+| 9 | Execution/scheduler registry | Threads, fibers, timers and I/O waits |
+| 10 | Per-execution object | Native threads, fibers and connections |
+| 11 | Image save mutex | Heap serialisation |
+
+The authoritative table, same-level sub-order rules, and protocol-lock
+exception are in §13.3.1. The checked wrappers are
+`bliss_rt::lock_order::{OrderedMutex, OrderedRwLock}`.
 
 ### 8.8.4  Debug-Build Deadlock Detection (R8.21)
 

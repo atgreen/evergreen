@@ -3,12 +3,13 @@
 //! See spec §5.7.
 
 use bliss_rt::error::BlissError;
-use bliss_rt::object::{ObjectHeader, type_id};
+use bliss_rt::lock_order::{LockLevel, OrderedMutex};
+use bliss_rt::object::{type_id, ObjectHeader};
 use bliss_rt::value::{BlissVal, NIL, T, TAG_HEAP_OBJECT};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once};
+use std::sync::Once;
 
 // ── Internal data ─────────────────────────────────────────────────
 
@@ -53,10 +54,18 @@ struct PathnameRecord {
     namestring: Option<String>,
 }
 
-static PATHNAME_STORE: Mutex<Option<HashMap<u64, PathnameRecord>>> = Mutex::new(None);
-static STRING_REGISTRY: Mutex<Option<HashMap<u64, String>>> = Mutex::new(None);
-static STRING_REVERSE_REGISTRY: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
-static LOGICAL_TRANSLATIONS: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
+static PATHNAME_STORE: OrderedMutex<Option<HashMap<u64, PathnameRecord>>> =
+    OrderedMutex::new(LockLevel::GcWorld, 9, "pathname GC roots", None);
+static STRING_REGISTRY: OrderedMutex<Option<HashMap<u64, String>>> =
+    OrderedMutex::new(LockLevel::GcWorld, 10, "pathname string registry", None);
+static STRING_REVERSE_REGISTRY: OrderedMutex<Option<HashMap<String, BlissVal>>> = OrderedMutex::new(
+    LockLevel::GcWorld,
+    11,
+    "pathname reverse string registry",
+    None,
+);
+static LOGICAL_TRANSLATIONS: OrderedMutex<Option<HashMap<String, BlissVal>>> =
+    OrderedMutex::new(LockLevel::GcWorld, 12, "logical pathname GC roots", None);
 
 fn scan_pathname_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
     let mut store = PATHNAME_STORE
@@ -248,7 +257,11 @@ pub fn is_pathname(val: BlissVal) -> bool {
 }
 
 fn nil_if_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 fn resolve_home_path(input: &str) -> Result<String, BlissError> {

@@ -9,8 +9,33 @@ use bliss_rt::gc::{
     drain_satb_log, init_heap, remembered_set_len, set_gc_marking_in_progress, store_ref,
     Allocator, Collector, GcConfig, HeapAllocator, HeapCollector,
 };
-use bliss_rt::value::{BlissVal, TAG_HEAP_OBJECT};
+use bliss_rt::value::{BlissVal, T, TAG_HEAP_OBJECT};
+use bliss_rt::{
+    current_stack, fiber_state, make_fiber, park_current_fiber, BlissStack, FiberState,
+    SchedulerConfig, SchedulerGroup,
+};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+static PARKED_ROOT_INPUT: AtomicU64 = AtomicU64::new(0);
+static PARKED_ROOT_OUTPUT: AtomicU64 = AtomicU64::new(0);
+static PARKED_ROOT_READY: AtomicUsize = AtomicUsize::new(0);
+
+fn fiber_with_parked_stack_root() -> BlissVal {
+    let stack = current_stack();
+    let frame = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)
+        .expect("fiber CL stack frame");
+    unsafe {
+        BlissStack::frame_slots_mut(frame)[0] = BlissVal(PARKED_ROOT_INPUT.load(Ordering::Acquire));
+    }
+    PARKED_ROOT_READY.store(1, Ordering::Release);
+    park_current_fiber().expect("park fiber with published CL stack root");
+    let relocated = unsafe { BlissStack::frame_slots_mut(frame)[0] };
+    PARKED_ROOT_OUTPUT.store(relocated.0, Ordering::Release);
+    stack.pop_frame();
+    T
+}
 
 fn gc_config() -> GcConfig {
     GcConfig {
@@ -55,7 +80,11 @@ fn old_to_young_reference_survives_and_relocates_across_minor_gc() {
     // Store the young pointer into the holder's slot THROUGH the barrier.
     let slot = holder as *mut BlissVal;
     unsafe { store_ref(slot, heap_ref(young)) };
-    assert_eq!(remembered_set_len(), 1, "barrier recorded the old→young slot");
+    assert_eq!(
+        remembered_set_len(),
+        1,
+        "barrier recorded the old→young slot"
+    );
 
     // Minor GC moves the young object; the remembered set must keep it alive and
     // relocate the holder's slot to the new location.
@@ -63,13 +92,21 @@ fn old_to_young_reference_survives_and_relocates_across_minor_gc() {
 
     let relocated = unsafe { *slot };
     let new_header = (relocated.0 & !0b111) as usize;
-    assert_ne!(new_header, young as usize - 8, "young object was evacuated (moved)");
+    assert_ne!(
+        new_header,
+        young as usize - 8,
+        "young object was evacuated (moved)"
+    );
     assert_eq!(
         unsafe { *((new_header + 8) as *const u64) },
         MARKER,
         "young referent survived with intact contents at its new location"
     );
-    assert_eq!(remembered_set_len(), 0, "remembered set cleared after minor GC");
+    assert_eq!(
+        remembered_set_len(),
+        0,
+        "remembered set cleared after minor GC"
+    );
 }
 
 #[test]
@@ -81,7 +118,11 @@ fn immediate_stores_do_not_grow_the_remembered_set() {
     let slot = holder as *mut BlissVal;
 
     unsafe { store_ref(slot, BlissVal::from_fixnum(42)) };
-    assert_eq!(remembered_set_len(), 0, "storing a fixnum records no reference");
+    assert_eq!(
+        remembered_set_len(),
+        0,
+        "storing a fixnum records no reference"
+    );
     assert_eq!(unsafe { *slot }, BlissVal::from_fixnum(42));
 }
 
@@ -98,7 +139,10 @@ fn satb_pre_write_logging_captures_overwritten_references_during_marking() {
     unsafe { *slot = old };
     set_gc_marking_in_progress(false);
     unsafe { store_ref(slot, BlissVal::from_fixnum(1)) };
-    assert!(drain_satb_log().is_empty(), "no SATB logging outside marking");
+    assert!(
+        drain_satb_log().is_empty(),
+        "no SATB logging outside marking"
+    );
 
     // Marking active: the overwritten (pre-write) reference is logged.
     unsafe { *slot = old };
@@ -135,7 +179,11 @@ fn nursery_object_held_only_by_cl_frame_relocates_across_minor_gc() {
 
     let relocated = unsafe { BlissStack::frame_slots_mut(f)[0] };
     let new_header = (relocated.0 & !0b111) as usize;
-    assert_ne!(new_header, young as usize - 8, "young object was moved by minor GC");
+    assert_ne!(
+        new_header,
+        young as usize - 8,
+        "young object was moved by minor GC"
+    );
     assert_eq!(
         unsafe { *((new_header + 8) as *const u64) },
         MARKER,
@@ -143,4 +191,56 @@ fn nursery_object_held_only_by_cl_frame_relocates_across_minor_gc() {
     );
 
     stack.pop_frame();
+}
+
+/// A parked fiber is not participating in the GC handshake, so its published
+/// managed stack must keep roots alive and receive evacuation updates.  This
+/// also proves that the resumed continuation observes the rewritten frame.
+#[test]
+fn nursery_root_relocates_across_fiber_park_and_resume() {
+    let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&gc_config()).unwrap();
+    let mut alloc = HeapAllocator::new().unwrap();
+
+    let young = alloc.alloc_fast(24).unwrap();
+    const MARKER: u64 = 0x0066_7788_99AA;
+    unsafe { *(young as *mut u64) = MARKER };
+    let original = heap_ref(young);
+    PARKED_ROOT_INPUT.store(original.0, Ordering::Release);
+    PARKED_ROOT_OUTPUT.store(0, Ordering::Release);
+    PARKED_ROOT_READY.store(0, Ordering::Release);
+
+    let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
+    let fiber = make_fiber(unsafe {
+        BlissVal::from_function_ptr(fiber_with_parked_stack_root as *const () as *mut u8)
+    })
+    .unwrap();
+    group.submit(fiber).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while (PARKED_ROOT_READY.load(Ordering::Acquire) == 0
+        || fiber_state(fiber) != Some(FiberState::Blocked))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(PARKED_ROOT_READY.load(Ordering::Acquire), 1);
+    assert_eq!(fiber_state(fiber), Some(FiberState::Blocked));
+
+    HeapCollector::new().minor_gc().unwrap();
+    group.unpark(fiber).unwrap();
+    assert_eq!(group.finish().unwrap(), vec![T]);
+
+    let relocated = BlissVal(PARKED_ROOT_OUTPUT.load(Ordering::Acquire));
+    let new_header = (relocated.0 & !0b111) as usize;
+    assert_ne!(
+        new_header,
+        original.0 as usize & !0b111,
+        "parked fiber root was relocated"
+    );
+    assert_eq!(
+        unsafe { *((new_header + 8) as *const u64) },
+        MARKER,
+        "resumed fiber observed the relocated object with intact contents"
+    );
 }

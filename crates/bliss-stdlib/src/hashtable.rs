@@ -8,10 +8,11 @@
 //! See spec §5.7.
 
 use bliss_rt::error::BlissError;
-use bliss_rt::object::{CompiledFunctionData, ConsCell, ObjectHeader, type_id};
+use bliss_rt::lock_order::{LockLevel, OrderedMutex};
+use bliss_rt::object::{type_id, CompiledFunctionData, ConsCell, ObjectHeader};
 use bliss_rt::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
 use std::collections::HashSet;
-use std::sync::{Mutex, Once};
+use std::sync::Once;
 
 // ── GC root tracking for hash-table storage (bliss-jtc.8) ────────────────────
 //
@@ -19,7 +20,8 @@ use std::sync::{Mutex, Once};
 // heap, so its keys/values are invisible to the collector. We track every live
 // table and register a root scanner (bliss_rt::gc) that yields each entry's key
 // and value slot, so the collector marks and relocates them like any other root.
-static LIVE_TABLES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+static LIVE_TABLES: OrderedMutex<Option<HashSet<usize>>> =
+    OrderedMutex::new(LockLevel::GcWorld, 8, "hash-table GC roots", None);
 static REGISTER_SCANNER: Once = Once::new();
 
 /// Track a newly-created table and ensure the GC root scanner is registered.

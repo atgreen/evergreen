@@ -3,7 +3,7 @@
 //! All runtime-internal functions return `Result<T, BlissError>`.
 //! See §2.10 of the spec.
 
-use crate::thread::GreenThreadId;
+use crate::thread::FiberId;
 use crate::value::BlissVal;
 
 /// Runtime error type. D2.04.
@@ -17,7 +17,7 @@ pub enum BlissError {
     Oom,
 
     /// CL stack overflow. Maps to CL `STORAGE-CONDITION`.
-    StackOverflow(GreenThreadId),
+    StackOverflow(FiberId),
 
     /// Invalid or corrupt image file. Maps to `BLISS-EXT:IMAGE-ERROR`.
     InvalidImage(String),

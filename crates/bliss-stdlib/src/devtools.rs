@@ -2,10 +2,11 @@
 //! See spec §6.
 
 use bliss_rt::error::BlissError;
+use bliss_rt::lock_order::{LockLevel, OrderedMutex};
 use bliss_rt::object::ConsCell;
 use bliss_rt::value::{
-    BlissVal, EOF_BITS, MISSING_BITS, NIL, NIL_BITS, T, T_BITS, TAG_CHARACTER, TAG_CONS,
-    TAG_FIXNUM, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK, TAG_SINGLE_FLOAT, TAG_SPECIAL, TAG_SYMBOL,
+    BlissVal, EOF_BITS, MISSING_BITS, NIL, NIL_BITS, T, TAG_CHARACTER, TAG_CONS, TAG_FIXNUM,
+    TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK, TAG_SINGLE_FLOAT, TAG_SPECIAL, TAG_SYMBOL, T_BITS,
     UNBOUND_BITS,
 };
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
@@ -24,7 +25,7 @@ use std::io::{self, BufRead, Read as IoRead, Write as IoWrite};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -699,10 +700,10 @@ struct SteppingState {
     traps: Vec<(usize, Vec<u8>)>,
 }
 
-fn stepping_state() -> &'static Mutex<Option<SteppingState>> {
+fn stepping_state() -> &'static OrderedMutex<Option<SteppingState>> {
     use std::sync::OnceLock;
-    static S: OnceLock<Mutex<Option<SteppingState>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(None))
+    static S: OnceLock<OrderedMutex<Option<SteppingState>>> = OnceLock::new();
+    S.get_or_init(|| OrderedMutex::new(LockLevel::CodeCache, 31, "debugger stepping", None))
 }
 
 /// Install stepping traps for the given mode (A6.04).
@@ -1199,11 +1200,18 @@ pub enum WatchScope {
 
 static NEXT_BREAKPOINT_ID: AtomicU64 = AtomicU64::new(1);
 
-fn breakpoint_map() -> &'static Mutex<HashMap<BreakpointId, BreakpointInfo>> {
+fn breakpoint_map() -> &'static OrderedMutex<HashMap<BreakpointId, BreakpointInfo>> {
     use std::sync::OnceLock;
-    static MAP: OnceLock<Mutex<HashMap<BreakpointId, BreakpointInfo>>> = OnceLock::new();
+    static MAP: OnceLock<OrderedMutex<HashMap<BreakpointId, BreakpointInfo>>> = OnceLock::new();
     install_devtools_root_scanner();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    MAP.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            16,
+            "debugger breakpoint GC roots",
+            HashMap::new(),
+        )
+    })
 }
 
 /// Resolve a function entry address safely.
@@ -1413,12 +1421,13 @@ pub fn watch(
 /// Remove a watchpoint.
 pub fn unwatch(id: BreakpointId) -> Result<(), BlissError> {
     let mut map = breakpoint_map().lock().unwrap();
-    if let Some(info) = map.remove(&id) {
-        if let BreakpointTarget::Watch(ref target) = info.target {
-            if target.scope == WatchScope::Special {
-                remove_watch_guard(target.name);
-            }
-        }
+    let guarded_symbol = map.remove(&id).and_then(|info| match info.target {
+        BreakpointTarget::Watch(target) if target.scope == WatchScope::Special => Some(target.name),
+        _ => None,
+    });
+    drop(map);
+    if let Some(symbol) = guarded_symbol {
+        remove_watch_guard(symbol);
     }
     Ok(())
 }
@@ -1442,10 +1451,17 @@ fn remove_watch_guard(_variable_name: BlissVal) {
         .remove(&_variable_name.to_raw());
 }
 
-fn watch_registry() -> &'static Mutex<HashMap<u64, BreakpointId>> {
+fn watch_registry() -> &'static OrderedMutex<HashMap<u64, BreakpointId>> {
     use std::sync::OnceLock;
-    static R: OnceLock<Mutex<HashMap<u64, BreakpointId>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(HashMap::new()))
+    static R: OnceLock<OrderedMutex<HashMap<u64, BreakpointId>>> = OnceLock::new();
+    R.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::CodeCache,
+            32,
+            "debugger watch registry",
+            HashMap::new(),
+        )
+    })
 }
 
 fn evaluate_watch_predicate(predicate: BlissVal, old_value: BlissVal, new_value: BlissVal) -> bool {
@@ -1569,18 +1585,23 @@ struct ProfileSample {
     thread_id: u64,
 }
 
-fn profiler_state() -> &'static Mutex<ProfilerState> {
+fn profiler_state() -> &'static OrderedMutex<ProfilerState> {
     use std::sync::OnceLock;
-    static S: OnceLock<Mutex<ProfilerState>> = OnceLock::new();
+    static S: OnceLock<OrderedMutex<ProfilerState>> = OnceLock::new();
     S.get_or_init(|| {
-        Mutex::new(ProfilerState {
-            rate_hz: 1000,
-            start: None,
-            sample_count: 0,
-            samples: Vec::new(),
-            sampling_thread: None,
-            target_thread_id: 0,
-        })
+        OrderedMutex::new(
+            LockLevel::Profiling,
+            1,
+            "sampling profiler",
+            ProfilerState {
+                rate_hz: 1000,
+                start: None,
+                sample_count: 0,
+                samples: Vec::new(),
+                sampling_thread: None,
+                target_thread_id: 0,
+            },
+        )
     })
 }
 
@@ -1648,16 +1669,21 @@ struct AllocRecord {
     pc: usize,
 }
 
-fn alloc_state() -> &'static Mutex<AllocState> {
+fn alloc_state() -> &'static OrderedMutex<AllocState> {
     use std::sync::OnceLock;
-    static S: OnceLock<Mutex<AllocState>> = OnceLock::new();
+    static S: OnceLock<OrderedMutex<AllocState>> = OnceLock::new();
     S.get_or_init(|| {
-        Mutex::new(AllocState {
-            start: None,
-            total_allocs: 0,
-            total_bytes: 0,
-            records: Vec::new(),
-        })
+        OrderedMutex::new(
+            LockLevel::Profiling,
+            2,
+            "allocation profiler",
+            AllocState {
+                start: None,
+                total_allocs: 0,
+                total_bytes: 0,
+                records: Vec::new(),
+            },
+        )
     })
 }
 
@@ -1687,15 +1713,20 @@ struct InstrumentEntry {
     nested_depth: u64,
 }
 
-fn instrument_state() -> &'static Mutex<InstrumentState> {
+fn instrument_state() -> &'static OrderedMutex<InstrumentState> {
     use std::sync::OnceLock;
-    static S: OnceLock<Mutex<InstrumentState>> = OnceLock::new();
+    static S: OnceLock<OrderedMutex<InstrumentState>> = OnceLock::new();
     S.get_or_init(|| {
-        Mutex::new(InstrumentState {
-            start: None,
-            functions: HashMap::new(),
-            call_stack: Vec::new(),
-        })
+        OrderedMutex::new(
+            LockLevel::Profiling,
+            3,
+            "instrumentation profiler",
+            InstrumentState {
+                start: None,
+                functions: HashMap::new(),
+                call_stack: Vec::new(),
+            },
+        )
     })
 }
 
@@ -1810,10 +1841,10 @@ pub fn stop_instrumentation_profiler() -> Result<ProfilerReport, BlissError> {
 
 /// Global storage for the last profiler report, so stop_profiler can return
 /// a structured value via BlissVal while also storing the full report.
-fn last_profiler_report() -> &'static Mutex<Option<ProfilerReport>> {
+fn last_profiler_report() -> &'static OrderedMutex<Option<ProfilerReport>> {
     use std::sync::OnceLock;
-    static R: OnceLock<Mutex<Option<ProfilerReport>>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(None))
+    static R: OnceLock<OrderedMutex<Option<ProfilerReport>>> = OnceLock::new();
+    R.get_or_init(|| OrderedMutex::new(LockLevel::Profiling, 4, "last profiler report", None))
 }
 
 /// Retrieve the last profiler report (any kind).
@@ -2378,11 +2409,18 @@ struct TraceEntry {
     active: bool,
 }
 
-fn traced_registry() -> &'static Mutex<HashMap<u64, TraceEntry>> {
+fn traced_registry() -> &'static OrderedMutex<HashMap<u64, TraceEntry>> {
     use std::sync::OnceLock;
-    static R: OnceLock<Mutex<HashMap<u64, TraceEntry>>> = OnceLock::new();
+    static R: OnceLock<OrderedMutex<HashMap<u64, TraceEntry>>> = OnceLock::new();
     install_devtools_root_scanner();
-    R.get_or_init(|| Mutex::new(HashMap::new()))
+    R.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            17,
+            "trace registry GC roots",
+            HashMap::new(),
+        )
+    })
 }
 
 fn scan_devtools_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
@@ -2458,6 +2496,7 @@ pub fn trace_function(
             active: true,
         },
     );
+    drop(registry);
 
     // Register this function in the trace-check table so the interpreter
     // and compiled code wrappers know to call trace_entry/trace_exit.
@@ -2469,12 +2508,8 @@ pub fn trace_function(
 /// Remove a trace, restoring the original fdefinition (§6.4 unencapsulate).
 pub fn untrace_function(function_name: BlissVal) -> Result<(), BlissError> {
     let mut registry = traced_registry().lock().unwrap();
-    if let Some(entry) = registry.remove(&function_name.to_raw()) {
-        // Restore the original function if encapsulated
-        if let Some(_original) = entry.original_function {
-            unregister_trace_hook(function_name);
-        }
-    }
+    registry.remove(&function_name.to_raw());
+    drop(registry);
     unregister_trace_hook(function_name);
     Ok(())
 }
@@ -2496,10 +2531,17 @@ fn unregister_trace_hook(function_name: BlissVal) {
         .remove(&function_name.to_raw());
 }
 
-fn trace_hooks() -> &'static Mutex<HashMap<u64, bool>> {
+fn trace_hooks() -> &'static OrderedMutex<HashMap<u64, bool>> {
     use std::sync::OnceLock;
-    static H: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
-    H.get_or_init(|| Mutex::new(HashMap::new()))
+    static H: OnceLock<OrderedMutex<HashMap<u64, bool>>> = OnceLock::new();
+    H.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::CodeCache,
+            33,
+            "trace hook registry",
+            HashMap::new(),
+        )
+    })
 }
 
 /// Check if a function has a trace hook installed.
@@ -2928,18 +2970,23 @@ pub fn room(verbosity: Option<BlissVal>, _stream: BlissVal) -> Result<(), BlissE
 
 static SWANK_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-fn swank_state() -> &'static Mutex<SwankState> {
+fn swank_state() -> &'static OrderedMutex<SwankState> {
     use std::sync::OnceLock;
-    static S: OnceLock<Mutex<SwankState>> = OnceLock::new();
+    static S: OnceLock<OrderedMutex<SwankState>> = OnceLock::new();
     S.get_or_init(|| {
-        Mutex::new(SwankState {
-            port: 4005,
-            host: "127.0.0.1".into(),
-            conns: 0,
-            listener_thread: None,
-            session_secret: None,
-            connections: Vec::new(),
-        })
+        OrderedMutex::new(
+            LockLevel::ExecutionRegistry,
+            4,
+            "SWANK server registry",
+            SwankState {
+                port: 4005,
+                host: "127.0.0.1".into(),
+                conns: 0,
+                listener_thread: None,
+                session_secret: None,
+                connections: Vec::new(),
+            },
+        )
     })
 }
 
@@ -2975,11 +3022,20 @@ struct SwankConnection {
 }
 
 /// Active SWANK connections registry (R6.35 — multiple simultaneous).
-fn swank_connections() -> &'static Mutex<HashMap<SwankConnectionId, Arc<Mutex<SwankConnection>>>> {
+fn swank_connections(
+) -> &'static OrderedMutex<HashMap<SwankConnectionId, Arc<OrderedMutex<SwankConnection>>>> {
     use std::sync::OnceLock;
-    static C: OnceLock<Mutex<HashMap<SwankConnectionId, Arc<Mutex<SwankConnection>>>>> =
-        OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
+    static C: OnceLock<
+        OrderedMutex<HashMap<SwankConnectionId, Arc<OrderedMutex<SwankConnection>>>>,
+    > = OnceLock::new();
+    C.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::ExecutionRegistry,
+            3,
+            "SWANK connection registry",
+            HashMap::new(),
+        )
+    })
 }
 
 fn generate_session_secret() -> String {
@@ -3097,7 +3153,12 @@ fn handle_swank_connection(mut stream: TcpStream, addr: std::net::SocketAddr, se
         pending_returns: HashMap::new(),
         thread_id: thread_id_current(),
     };
-    let conn_arc = Arc::new(Mutex::new(conn));
+    let conn_arc = Arc::new(OrderedMutex::new(
+        LockLevel::ExecutionObject,
+        conn_id.0,
+        "SWANK connection",
+        conn,
+    ));
     swank_connections()
         .lock()
         .unwrap()

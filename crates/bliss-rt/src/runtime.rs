@@ -4,7 +4,7 @@
 
 use crate::error::BlissError;
 use crate::gc::GcConfig;
-use crate::object::{ObjectHeader, type_id};
+use crate::object::{type_id, ObjectHeader};
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::value::BlissVal;
 
@@ -606,6 +606,18 @@ pub fn install_signal_handlers() -> Result<(), BlissError> {
             libc::SIGTERM,
             sigterm_handler as *const () as libc::sighandler_t,
         );
+        #[cfg(unix)]
+        {
+            // Unlike `signal(2)`, install SIGUSR1 without SA_RESTART so a
+            // blocking syscall returns EINTR and reaches the next safepoint.
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = crate::safepoint::sigusr1_handler as *const () as usize;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) != 0 {
+                return Err(BlissError::SignalError(libc::SIGUSR1));
+            }
+        }
     }
     Ok(())
 }
@@ -685,7 +697,10 @@ impl BootEvalDepthGuard {
         BOOT_EVAL_DEPTH.with(|depth| {
             let next = depth.get() + 1;
             if next > MAX_BOOT_EVAL_DEPTH {
-                Err(BlissError::StackOverflow(crate::thread::current_thread_id()))
+                let execution = crate::thread::current_fiber_id().unwrap_or_else(|| {
+                    crate::thread::FiberId(crate::thread::current_thread_id().0)
+                });
+                Err(BlissError::StackOverflow(execution))
             } else {
                 depth.set(next);
                 Ok(BootEvalDepthGuard)

@@ -4,9 +4,7 @@
 //! region for CL control/value frames. See §2.4 of the spec.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use crate::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
 
@@ -17,7 +15,7 @@ use crate::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
 /// of `sp_offset`/`fp`; the GC reads only the `published_*` snapshot taken at a
 /// safepoint. `sp_offset`/`fp` therefore use `Cell` (single-threaded interior
 /// mutability) so frame push/pop can go through a shared `&BlissStack` (the
-/// only handle `GreenThread::stack()` hands out) without `&mut`.
+/// only handle `Fiber::stack()`/`NativeThread::stack()` hands out) without `&mut`.
 pub struct BlissStack {
     /// Allocated memory buffer for the stack. Fixed-size after `new`, so its
     /// backing buffer never moves and raw pointers into it stay valid.
@@ -83,7 +81,8 @@ impl BlissStack {
     /// Publish the current sp and fp so the GC can scan this thread's
     /// stack while it is parked at a safepoint (§2.5.3).
     pub fn publish_top(&self) {
-        self.published_sp.store(self.sp_offset.get(), Ordering::Release);
+        self.published_sp
+            .store(self.sp_offset.get(), Ordering::Release);
         self.published_fp.store(self.fp.get(), Ordering::Release);
     }
 
@@ -321,56 +320,37 @@ pub struct StackMapEntry {
     pub len: usize,
 }
 
-struct CodeInfoMetadata {
+pub struct CodeInfo {
     source_locations: &'static [SourceLocationEntry],
     stack_maps: &'static [StackMapEntry],
 }
 
-fn code_info_registry() -> &'static Mutex<HashMap<usize, &'static CodeInfoMetadata>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<usize, &'static CodeInfoMetadata>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub struct CodeInfo {
-    _private: (),
-}
-
 impl CodeInfo {
+    /// Empty metadata for tests/bootstrap frames that have no compiled maps.
+    pub const fn empty() -> Self {
+        Self {
+            source_locations: &[],
+            stack_maps: &[],
+        }
+    }
+
     /// Create code metadata from static tables emitted by the compiler.
     pub fn new(
         source_locations: &'static [SourceLocationEntry],
         stack_maps: &'static [StackMapEntry],
     ) -> &'static Self {
-        let handle = Box::leak(Box::new(0u8)) as *mut u8 as *const CodeInfo;
-        let metadata = Box::leak(Box::new(CodeInfoMetadata {
+        Box::leak(Box::new(CodeInfo {
             source_locations: Box::leak(source_locations.to_vec().into_boxed_slice()),
             stack_maps: Box::leak(stack_maps.to_vec().into_boxed_slice()),
-        }));
-        code_info_registry()
-            .lock()
-            .unwrap()
-            .insert(handle as usize, metadata);
-        unsafe { &*handle }
+        }))
     }
 
     fn source_location_entries(&self) -> &[SourceLocationEntry] {
-        let metadata = code_info_registry()
-            .lock()
-            .unwrap()
-            .get(&(self as *const CodeInfo as usize))
-            .copied();
-        metadata
-            .map(|metadata| metadata.source_locations)
-            .unwrap_or(&[])
+        self.source_locations
     }
 
     fn stack_map_entries(&self) -> &[StackMapEntry] {
-        let metadata = code_info_registry()
-            .lock()
-            .unwrap()
-            .get(&(self as *const CodeInfo as usize))
-            .copied();
-        metadata.map(|metadata| metadata.stack_maps).unwrap_or(&[])
+        self.stack_maps
     }
 
     /// Look up the source location for a given PC offset.

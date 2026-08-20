@@ -83,7 +83,7 @@ bytes  : [u8; length]
 | 8 | `RELOCATIONS` | relocation records for cached-T1 code (entry patch sites, c2i/i2c thunks). |
 | 9 | `DEPENDENCIES` | names + `content_hash`es of `.bfasl`s this unit requires (load order, staleness). |
 | 10 | `CACHED_T1` | platform-tagged native code (R6.65); ignored on mismatch. |
-| 11 | `TOPLEVEL_FORMS` | serialized non-`defun` top-level forms to evaluate at load time, in order (e.g. `defvar`, `defmacro`, side-effecting forms). |
+| 11 | `TOPLEVEL_FORMS` | legacy source-form payload, accepted only when `BYTECODE_UNIT` is absent. New writers MUST NOT emit it; it is never a fallback for an invalid or incomplete BBU. |
 | 12 | `BYTECODE_UNIT` | canonical classfile-like `BBU` payload: constant pool, bytecode functions, load plan, verification metadata, source/debug maps, and dependency records. |
 
 The bytecode instruction encoding is the serialization of the §4.4.3
@@ -363,8 +363,8 @@ arg2        : u32
 
 | Kind | Name | Arguments |
 |------|------|-----------|
-| 1 | `EnsurePackage` | `arg0 = Package constant` |
-| 2 | `InternSymbol` | `arg0 = Symbol constant` |
+| 1 | `EnsurePackage` | `arg0 = Package constant`, `arg1 = Vector of use-list package-name Strings`, `arg2 = Vector of exported bare-name Strings` |
+| 2 | `InternSymbol` | `arg0 = Package constant`, `arg1 = bare-name String` |
 | 3 | `InstallFunction` | `arg0 = function index`, `arg1 = Symbol constant` |
 | 4 | `InstallMacro` | `arg0 = function index`, `arg1 = Symbol constant` |
 | 5 | `InstallCompilerMacro` | `arg0 = function index`, `arg1 = Symbol constant` |
@@ -380,6 +380,13 @@ usually becomes a bytecode function plus `InstallFunction`; a `defmacro` becomes
 a bytecode expander plus `InstallMacro`; a side-effecting top-level `(pushnew
 :x *features*)` becomes an `EvalThunk`.  `EVAL-WHEN` controls whether the
 compiler runs a form during compilation, records a load action, both, or neither.
+
+`EnsurePackage` is idempotent. It creates the package when absent, otherwise
+adds the declared nicknames and use-list edges, then makes each exported name
+external. An exported name already inherited through the use-list retains that
+symbol's identity. `InternSymbol` makes a declared `:intern`/`:shadow` name
+present after its package has been ensured. All referenced constants and action
+arguments are verified before either action mutates the package registry.
 
 `EVAL-WHEN` is resolved while building the load plan:
 
@@ -424,11 +431,21 @@ Unknown `table_kind` values MUST be skipped by `length`.
 | `StackMaps` | MUST | root bitmap/value-kind map for safepoint PCs and deopt PCs |
 | `Dependencies` | MUST | required `.bfasl` identities, provided features, package dependencies, content hashes |
 | `Policy` | SHOULD | compiler optimization/safety/debug/speed policy that influenced bytecode |
+| `FunctionMetadata` | MUST for bytecode version 1.3+ | per-function `has_env`/`variadic` flags and parameter name, `VarLoc`, and primitive declared-type entries |
 
 Debug records may include macroexpansion provenance as source spans or compact
 forms for tooling, but the executable semantics remain the bytecode and load
 plan.  A debugger that asks for macroexpanded source should reconstruct it from
 debug metadata when present, not require it for loading.
+
+`FunctionMetadata` is framed with `table_kind = 6`. Its payload begins with a
+`u32 function_count`, followed in function-table order by `u8 has_env`, `u8
+variadic`, `u16 parameter_count`, then entries `{u32 name_ref, u8 location_kind,
+u16 slot, u8 declared_type}`. Location kind 0 names a checked local slot; kind
+1 denotes a boxed binding and uses slot `0xffff`. Declared types 0, 1, and 2
+mean `Any`, `Fixnum`, and `SingleFloat`. A variadic function's core
+`lambda_list_ref` is executable binder metadata and MUST be present; it is not
+a retained function body or source fallback.
 
 ## 6.11.4 Loading Semantics
 
@@ -443,8 +460,10 @@ debug metadata when present, not require it for loading.
 5. Execute the `BBU` load plan in order, installing functions into symbol
    function cells and running load-time thunks (R6.67/R6.74).
 6. If no `BYTECODE_UNIT` section is present, a compatibility loader MAY read the
-   decomposed `SYMBOLS`/`PACKAGES`/`CONSTANT_POOL`/`FUNCTIONS`/`TOPLEVEL_FORMS`
-   sections using the same invariants.
+   decomposed `SYMBOLS`/`PACKAGES`/`CONSTANT_POOL`/`FUNCTIONS` sections or the
+   legacy source-form `TOPLEVEL_FORMS` section using the same invariants. A BBU
+   that is present but invalid or incomplete MUST be rejected; the loader MUST
+   NOT execute `TOPLEVEL_FORMS` as a fallback.
 7. If a matching `CACHED_T1` section is present (R6.65), install its native code
    as the function's T1 entry (still revocable by deopt); otherwise the function
    starts at T0 and promotes normally.

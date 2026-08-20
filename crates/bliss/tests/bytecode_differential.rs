@@ -73,6 +73,7 @@ const CORPUS: &[&str] = &[
     "nil",
     "(quote foo)",
     "(quote (a b c))",
+    "(let ((x 3)) `(a ,x))",
     // Arithmetic (primitives delegate to the oracle).
     "(+ 1 2)",
     "(- 10 3 2)",
@@ -201,6 +202,12 @@ const CORPUS: &[&str] = &[
     "(defun pair () (let ((n 0)) (list (lambda () (setq n (+ n 1))) (lambda () n)))) (let ((p (pair))) (funcall (first p)) (funcall (first p)) (funcall (second p)))",
     "(defun add-n (n lst) (mapcar (lambda (x) (+ x n)) lst)) (add-n 100 (list 1 2 3))",
     "(defun adders () (let ((a 1) (b 2)) (list (lambda () a) (lambda () b)))) (let ((l (adders))) (list (funcall (first l)) (funcall (second l))))",
+    // Captured variadic parameters are boxed after the shared lambda-list
+    // binder resolves defaults, supplied-p flags, rest lists, and keywords.
+    "(defun captured-opt (&optional (x 41 xp)) (funcall (lambda () (list x xp)))) (list (captured-opt) (captured-opt 9))",
+    "(defun captured-rest (&rest xs) (funcall (lambda () (length xs)))) (captured-rest 1 2 3 4)",
+    "(defun captured-key (&key (x 7 xp)) (funcall (lambda () (list x xp)))) (list (captured-key) (captured-key :x 12))",
+    "(flet ((captured-local (&optional (x 4)) (funcall (lambda () x)))) (list (captured-local) (captured-local 9)))",
     // A tree-walked closure called from T0 must update the boxed binding in the
     // bytecode frame, even when an older captured frame has the same variable.
     "(defparameter *capture-table* (make-hash-table)) (defun capture-table-keys (table) (let ((keys nil)) (maphash (lambda (key value) (declare (ignore value)) (push key keys)) table) keys)) (let ((keys nil)) (declare (ignore keys)) (defmacro captured-key-count (&key (items (capture-table-keys *capture-table*))) (list (quote quote) (length items)))) (setf (gethash (quote a) *capture-table*) 1) (setf (gethash (quote b) *capture-table*) 2) (captured-key-count)",
@@ -237,6 +244,7 @@ const CORPUS: &[&str] = &[
     "(sort (list (list 2) (list 1)) (function <) :key (function car))",
     "(count 2 '(1 2 2 3 2) :test (function =))",
     "(remove 1 '((1 a) (2 b) (1 c)) :key (function car) :test-not (function =))",
+    "(let ((x 0)) (list (setf (documentation (progn (setq x (+ x 1)) (quote f)) t) (progn (setq x (+ x 10)) \"doc\")) x))",
     // ── flet / labels on bytecode (nmq.6 coverage) ──
     "(flet ((sq (x) (* x x))) (sq 7))",
     "(flet ((add (a b) (+ a b)) (mul (a b) (* a b))) (+ (add 2 3) (mul 2 3)))",
@@ -246,6 +254,8 @@ const CORPUS: &[&str] = &[
     // ── macroexpand-then-lower: dotimes/dolist and ignore-errors (nmq.6) ──
     "(defun sumto (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s i))))) (sumto 100)",
     "(defun sumlist (l) (let ((s 0)) (dolist (x l s) (setq s (+ s x))))) (sumlist (list 1 2 3 4 5))",
+    "(loop for (a . b) in (quote ((1 . 2) (3 . 4))) for n = (+ a b) collect n)",
+    "(loop for x in (quote (1 2 3)) for y = (* x 2) for z = (+ y 1) sum z)",
     "(ignore-errors (error \"boom\"))",
     "(ignore-errors (+ 1 2))",
     // handler-case clause secondary values are discarded (child-env semantics).
@@ -295,6 +305,13 @@ const MUST_COMPILE: &[&str] = &[
     "(defun hash-map-inline-compile () (let ((h (make-hash-table)) (sum 0)) (setf (gethash (quote a) h) 1) (maphash (lambda (key value) (declare (ignore key)) (setq sum (+ sum value))) h) sum))",
     "(multiple-value-bind (a b) (values 1 2) (list a b))",
     "(values 1 2 3)",
+    "(member (quote b) (quote (a b c)))",
+    "(coerce (quote (#\\a #\\b)) (quote string))",
+    "(make-pathname :name \"compiled-builtin\" :type \"lisp\")",
+    "(let ((x 0)) (setf (documentation (progn (setq x (+ x 1)) (quote f)) t) (progn (setq x (+ x 10)) \"doc\")))",
+    "(fmakunbound (quote bytecode-never-defined))",
+    "(defun forward-caller (x) (forward-callee x)) (defun forward-callee (x) (+ x 1)) (forward-caller 4)",
+    "(loop for (a . b) in (quote ((1 . 2) (3 . 4))) for n = (+ a b) collect n)",
 ];
 
 #[test]
@@ -326,6 +343,44 @@ fn control_flow_programs_run_on_bytecode() {
         assert_eq!(
             last, "[bytecode] compiled",
             "program should compile to bytecode, not bail:\n  {program}\n  last trace: {last:?}"
+        );
+    }
+}
+
+/// A variadic parameter captured by a nested closure must still compile. This
+/// used to hit the explicit `lambda-list:captured-variadic-param` bail before
+/// the call-time binder could place resolved values in the heap environment.
+#[test]
+fn captured_variadic_parameters_compile_to_bytecode() {
+    let program = "\
+        (defun captured-opt (&optional (x 41 xp)) (funcall (lambda () (list x xp)))) \
+        (defun captured-rest (&rest xs) (funcall (lambda () (length xs)))) \
+        (defun captured-key (&key (x 7 xp)) (funcall (lambda () (list x xp)))) \
+        (format t \"~a ~a ~a ~a ~a~%\" \
+          (captured-opt) (captured-opt 9) (captured-rest 1 2 3) \
+          (captured-key) (captured-key :x 12))";
+    let out = Command::new(BIN)
+        .arg("--no-bootstrap")
+        .arg("--eval")
+        .arg(program)
+        .env("BLISS_BACKEND", "bytecode")
+        .env("BLISS_BYTECODE_TRACE_NAMES", "1")
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "captured variadic run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().next(),
+        Some("(41 NIL) (9 T) 3 (7 NIL) (12 T)")
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for name in ["CAPTURED-OPT", "CAPTURED-REST", "CAPTURED-KEY"] {
+        assert!(
+            stderr.contains(&format!("[bytecode] {name}: compiled")),
+            "{name} should compile instead of bailing:\n{stderr}"
         );
     }
 }

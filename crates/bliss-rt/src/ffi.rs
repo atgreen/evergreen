@@ -3,7 +3,7 @@
 //! See §2.7 of the spec.
 
 use crate::error::BlissError;
-use crate::thread::{ThreadState, current_thread};
+use crate::thread::{current_fiber, current_stack, current_thread, FiberState, NativeThreadState};
 use crate::value::BlissVal;
 
 // ── Alien type system ──────────────────────────────────────────────
@@ -114,14 +114,17 @@ pub unsafe fn ffi_call(
     arg_types: &[AlienType],
     args: &[u64],
 ) -> Result<u64, BlissError> {
-    struct NativeStateGuard {
-        thread: &'static crate::thread::GreenThread,
-        previous: ThreadState,
+    enum NativeStateGuard {
+        Fiber(&'static crate::thread::Fiber, FiberState),
+        Thread(&'static crate::thread::NativeThread, NativeThreadState),
     }
 
     impl Drop for NativeStateGuard {
         fn drop(&mut self) {
-            self.thread.set_state(self.previous);
+            match self {
+                NativeStateGuard::Fiber(fiber, previous) => fiber.set_state(*previous),
+                NativeStateGuard::Thread(thread, previous) => thread.set_state(*previous),
+            }
         }
     }
 
@@ -129,12 +132,17 @@ pub unsafe fn ffi_call(
         return Err(BlissError::FfiError("null function pointer".into()));
     }
 
-    let thread = current_thread();
-    let _state_guard = NativeStateGuard {
-        thread,
-        previous: thread.state(),
+    current_stack().publish_top();
+    let _state_guard = if let Some(fiber) = current_fiber() {
+        let guard = NativeStateGuard::Fiber(fiber, fiber.state());
+        fiber.set_state(FiberState::Native);
+        guard
+    } else {
+        let thread = current_thread();
+        let guard = NativeStateGuard::Thread(thread, thread.state());
+        thread.set_state(NativeThreadState::Native);
+        guard
     };
-    thread.set_state(ThreadState::Native);
 
     // Issue #7: Check if the return type or any argument type involves 32-bit int
     // and dispatch appropriately. For the bootstrap, we handle the common cases
@@ -418,7 +426,7 @@ extern "C" fn bootstrap_trampoline() -> u64 {
 /// - Fixnum → treated as a raw C function pointer (useful for testing)
 /// - Any other type → returns NIL
 fn invoke_closure(closure: BlissVal) -> u64 {
-    use crate::object::{ClosureData, CompiledFunctionData, ObjectHeader, type_id};
+    use crate::object::{type_id, ClosureData, CompiledFunctionData, ObjectHeader};
     #[allow(unused_imports)]
     use crate::value::{TAG_FUNCTION, TAG_MASK};
 

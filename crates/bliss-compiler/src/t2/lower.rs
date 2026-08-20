@@ -209,15 +209,42 @@ impl<'f> Lowering<'f> {
 
     /// Emit a plain (non-safepoint, non-deopt) MachInst.
     fn emit(&mut self, op: u32, defs: Vec<VReg>, uses: Vec<VReg>) {
-        self.insts.push(MachInst { op, defs, uses, imm: None, frame_state: None, safepoint: false });
+        self.insts.push(MachInst {
+            source_inst: None,
+            op,
+            defs,
+            uses,
+            imm: None,
+            frame_state: None,
+            safepoint: false,
+        });
+    }
+
+    fn emit_for(&mut self, source_inst: Inst, op: u32, defs: Vec<VReg>, uses: Vec<VReg>) {
+        self.insts.push(MachInst {
+            source_inst: Some(source_inst),
+            op,
+            defs,
+            uses,
+            imm: None,
+            frame_state: None,
+            safepoint: false,
+        });
     }
 
     /// Emit an immediate-materialising MachInst (a constant load). `imm` is the
     /// value the emitter moves into `def` — for a constant that reaches a
     /// function boundary this is the tagged `BlissVal` bits.
-    fn emit_imm(&mut self, op: u32, def: VReg, imm: i64) {
-        self.insts
-            .push(MachInst { op, defs: vec![def], uses: vec![], imm: Some(imm), frame_state: None, safepoint: false });
+    fn emit_imm(&mut self, source_inst: Inst, op: u32, def: VReg, imm: i64) {
+        self.insts.push(MachInst {
+            source_inst: Some(source_inst),
+            op,
+            defs: vec![def],
+            uses: vec![],
+            imm: Some(imm),
+            frame_state: None,
+            safepoint: false,
+        });
     }
 
     /// Emit a MachInst that carries the deopt/safepoint annotations of IR
@@ -229,6 +256,7 @@ impl<'f> Lowering<'f> {
         let data = self.f.inst(i);
         let carries_state = data.flags.guard || data.flags.call || data.frame_state.is_some();
         self.insts.push(MachInst {
+            source_inst: Some(i),
             op,
             defs,
             uses,
@@ -319,7 +347,16 @@ pub fn lower(f: &Function) -> MachFunc {
         blocks.push(MachBlock { params, start, end, succs });
     }
 
-    MachFunc { insts: lo.insts, blocks, allocation: Vec::new(), stack_maps: Vec::new() }
+    MachFunc {
+        insts: lo.insts,
+        blocks,
+        allocation: Vec::new(),
+        inst_allocations: Vec::new(),
+        allocation_edits: Vec::new(),
+        num_spill_slots: 0,
+        value_locations: Vec::new(),
+        stack_maps: Vec::new(),
+    }
 }
 
 /// Select a non-terminator IR instruction (spec §4.7.2 maximal munch).
@@ -348,7 +385,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         if let Some(imm) = imm {
             if let Some(&def) = defs.first() {
                 let op = if data.opcode == ConstFixnum { op::MOV_IMM } else { op::MOV_TAGGED };
-                lo.emit_imm(op, def, imm);
+                lo.emit_imm(inst, op, def, imm);
                 return;
             }
         }
@@ -357,20 +394,20 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
     // A binary-op emitter: `op def, use0, use1`.
     macro_rules! bin {
         ($op:expr) => {{
-            lo.emit($op, defs, uses);
+            lo.emit_for(inst, $op, defs, uses);
         }};
     }
     // A unary-op emitter: `op def, use0`.
     macro_rules! un {
         ($op:expr) => {{
-            lo.emit($op, defs, uses);
+            lo.emit_for(inst, $op, defs, uses);
         }};
     }
     // A comparison: flag-setting compare then SETcc into the GPR result.
     macro_rules! cmp {
         ($cmpop:expr, $setcc:expr) => {{
-            lo.emit($cmpop, vec![], uses);
-            lo.emit($setcc, defs, vec![]);
+            lo.emit_for(inst, $cmpop, vec![], uses);
+            lo.emit_for(inst, $setcc, defs, vec![]);
         }};
     }
 
@@ -454,7 +491,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
 
         // Terminators are handled elsewhere; reaching here is a bug.
         Jump | Brif | BrTable | Return | TailCall | Throw | NlxTransfer | Trap => {
-            lo.emit(op::PSEUDO_UNSUPPORTED, defs, uses);
+            lo.emit_for(inst, op::PSEUDO_UNSUPPORTED, defs, uses);
         }
     }
 }
@@ -478,7 +515,7 @@ fn lower_terminator(lo: &mut Lowering, inst: Inst) {
             let t = &data.targets[0];
             let (blk, args) = (t.block, t.args.clone());
             lo.emit_edge_moves(blk, &args);
-            lo.emit(op::JMP, vec![], vec![]);
+            lo.emit_for(inst, op::JMP, vec![], vec![]);
         }
         Brif => {
             // Two-way branch on args[0]. Edge moves for both successors are
@@ -487,19 +524,19 @@ fn lower_terminator(lo: &mut Lowering, inst: Inst) {
             for t in &data.targets.clone() {
                 lo.emit_edge_moves(t.block, &t.args);
             }
-            lo.emit(op::BR_COND, vec![], cond);
+            lo.emit_for(inst, op::BR_COND, vec![], cond);
         }
         BrTable => {
             let idx = lo.vregs(&data.args);
             for t in &data.targets.clone() {
                 lo.emit_edge_moves(t.block, &t.args);
             }
-            lo.emit(op::BR_TABLE, vec![], idx);
+            lo.emit_for(inst, op::BR_TABLE, vec![], idx);
         }
         Return => {
             // Return values are uses of the ret; no successors.
             let uses = lo.vregs(&data.args);
-            lo.emit(op::RET, vec![], uses);
+            lo.emit_for(inst, op::RET, vec![], uses);
         }
         TailCall => {
             let uses = lo.vregs(&data.args);
@@ -519,7 +556,7 @@ fn lower_terminator(lo: &mut Lowering, inst: Inst) {
             lo.emit_annotated(inst, op::TRAP, vec![], uses);
         }
         // Non-terminators never reach here.
-        _ => lo.emit(op::PSEUDO_UNSUPPORTED, vec![], vec![]),
+        _ => lo.emit_for(inst, op::PSEUDO_UNSUPPORTED, vec![], vec![]),
     }
 }
 

@@ -1,9 +1,10 @@
 //! T2 speculative type lowering — profile-guided, single-type (spec §4.5, §4.10).
 //!
-//! Given the operand-type profile gathered by the interpreter, rewrite a generic
-//! arithmetic `Call` at a site that is *consistently one type* into that single
-//! typed op — `FixnumMul` for a fixnum-hot `*`, `FloatMul` for a float-hot `*`,
-//! and so on. The typed op is **guard-flagged** and keeps the `Call`'s
+//! Given static operand proofs (declarations/inference) or the operand-type
+//! profile gathered by the interpreter, rewrite a generic arithmetic `Call`
+//! into a typed op — `FixnumMul` for fixnums, `FloatMul` for single-floats, and
+//! so on. Static proof takes precedence over profile. The typed op is
+//! **guard-flagged** and keeps the `Call`'s
 //! `FrameState`, so a wrong-type operand (or a fixnum overflow) deopts to the
 //! interpreter at the site's `bcp`. Crucially it emits **one** path — no fallback
 //! for the other type. A site that is polymorphic or cold (profile `None`) is
@@ -132,8 +133,36 @@ fn frame_state_bcp(f: &Function, fs: FrameStateId) -> u32 {
     f.frame_states.get(fs).scopes.last().map(|s| s.bcp).unwrap_or(0)
 }
 
+/// Resolve a numeric specialization entirely from SSA types. This is the path
+/// used by declared parameters: no sampled type is needed, and a stale profile
+/// can never contradict the source assertion. A fixnum constant participates
+/// in a single-float operation through CL float contagion.
+fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value]) -> Option<SpecType> {
+    let subset = |bits: TypeBits, allowed: TypeBits| {
+        !bits.is_bottom() && bits.meet(allowed) == bits
+    };
+    if !args.is_empty()
+        && args
+            .iter()
+            .all(|&arg| subset(f.value(arg).ty.bits, TypeBits::FIXNUM))
+    {
+        return Some(SpecType::Fixnum);
+    }
+
+    let numeric = TypeBits::FIXNUM.join(TypeBits::SINGLE_FLOAT);
+    let all_single_numeric = !args.is_empty()
+        && args
+            .iter()
+            .all(|&arg| subset(f.value(arg).ty.bits, numeric));
+    let has_single = args
+        .iter()
+        .any(|&arg| subset(f.value(arg).ty.bits, TypeBits::SINGLE_FLOAT));
+    (all_single_numeric && has_single).then_some(SpecType::SingleFloat)
+}
+
 /// Rewrite generic arithmetic `Call`s into single guarded typed ops guided by
-/// `profile` (site `bcp` → the one speculated type, or `None` to leave generic).
+/// static SSA proof first, then `profile` (site `bcp` → the one speculated type,
+/// or `None` to leave generic).
 /// Returns the number of sites speculated.
 pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -> usize {
     // Read phase: collect the calls to rewrite (keeps the borrow off `f` for the
@@ -152,7 +181,10 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
             // The site's bcp is on the Call's FrameState (P1 anchors it there).
             let Some(fs) = data.frame_state else { continue };
             let bcp = frame_state_bcp(f, fs);
-            let Some(spec) = profile(bcp) else { continue };
+            let Some(spec) = statically_proven_spec_type(f, &data.args).or_else(|| profile(bcp))
+            else {
+                continue;
+            };
             let argc = f.inst(inst).args.len();
             if let Some(arith) = arith_of(sym) {
                 match (arith, argc) {
@@ -278,6 +310,20 @@ mod tests {
         let n = speculate(&mut f, &|_| Some(SpecType::SingleFloat));
         assert_eq!(n, 1);
         assert_eq!(f.inst(call).opcode, Opcode::FloatMul, "* speculated float → FloatMul");
+    }
+
+    #[test]
+    fn declared_fixnum_operands_override_an_absent_profile() {
+        let (mut f, call) = build_star();
+        let entry = f.entry();
+        let params = f.block(entry).params.clone();
+        for param in params {
+            f.refine_type(param, IRType::of(TypeBits::FIXNUM));
+        }
+
+        let n = speculate(&mut f, &|_| None);
+        assert_eq!(n, 1, "static parameter proof must not require profile samples");
+        assert_eq!(f.inst(call).opcode, Opcode::FixnumMul);
     }
 
     #[test]

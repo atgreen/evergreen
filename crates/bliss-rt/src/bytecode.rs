@@ -138,7 +138,22 @@ pub enum Instr {
 /// A lowered CL function: a linear bytecode plus its constant pool and frame
 /// shape. The frame's value-slot area holds `n_locals` lexical slots followed
 /// by `max_stack` operand slots (spec D2.03).
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum DeclaredType {
+    /// No useful declaration was attached to this parameter.
+    #[default]
+    Any,
+    Fixnum,
+    SingleFloat,
+}
+
+impl DeclaredType {
+    pub fn is_any(self) -> bool {
+        self == Self::Any
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct BytecodeFunction {
     pub code: Vec<Instr>,
     pub constants: Vec<BlissVal>,
@@ -152,6 +167,9 @@ pub struct BytecodeFunction {
     pub restart_cases: Vec<RestartCaseInfo>,
     /// Per-parameter `(name, location)` for the entry sequence.
     pub param_layout: Vec<(String, VarLoc)>,
+    /// Primitive parameter types retained from leading `TYPE` declarations.
+    /// Entries align with `param_layout`; an absent/trailing entry means `Any`.
+    pub param_types: Vec<DeclaredType>,
     /// Whether this function needs a heap `EnvFrame` (has captured locals).
     pub has_env: bool,
     /// Number of lexical local slots (params + `let` bindings).

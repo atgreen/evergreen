@@ -128,6 +128,12 @@ impl Asm {
         self.code.len()
     }
 
+    /// Return whether no instruction bytes have been emitted yet.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.code.is_empty()
+    }
+
     /// Append a single raw byte.
     #[inline]
     pub fn push(&mut self, b: u8) {
@@ -152,10 +158,7 @@ impl Asm {
     /// exactly once before [`finish`](Self::finish); binding twice is a codegen
     /// bug and panics rather than silently resolving to the wrong site.
     pub fn bind(&mut self, l: Label) {
-        debug_assert!(
-            self.labels[l.0].is_none(),
-            "label {l:?} bound twice"
-        );
+        debug_assert!(self.labels[l.0].is_none(), "label {l:?} bound twice");
         self.labels[l.0] = Some(self.code.len());
     }
 

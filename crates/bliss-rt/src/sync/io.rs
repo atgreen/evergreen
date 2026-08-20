@@ -1,0 +1,544 @@
+use super::{blocking_mode, timer, BlockingMode};
+use crate::error::BlissError;
+use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoInterest {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+fn poll_events(interest: IoInterest) -> i16 {
+    match interest {
+        IoInterest::Read => libc::POLLIN,
+        IoInterest::Write => libc::POLLOUT,
+        IoInterest::ReadWrite => libc::POLLIN | libc::POLLOUT,
+    }
+}
+
+fn native_poll(
+    fd: RawFd,
+    interest: IoInterest,
+    timeout: Option<Duration>,
+) -> Result<bool, BlissError> {
+    let timeout_ms = timeout
+        .map(|duration| duration.as_millis().min(i32::MAX as u128) as i32)
+        .unwrap_or(-1);
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: poll_events(interest),
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if result > 0 {
+            return Ok(true);
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(BlissError::StreamError(format!(
+                "fd readiness wait failed: {error}"
+            )));
+        }
+    }
+}
+
+/// Wait for descriptor readiness.  Linux fibers register with a shared epoll
+/// thread; other Unix targets use a poll helper fallback.  Native executions
+/// call poll directly.
+pub fn wait_fd(
+    fd: RawFd,
+    interest: IoInterest,
+    timeout: Option<Duration>,
+) -> Result<bool, BlissError> {
+    if fd < 0 {
+        return Err(BlissError::StreamError(
+            "cannot wait on a negative file descriptor".into(),
+        ));
+    }
+    if timeout.is_some_and(|duration| duration.is_zero()) {
+        return native_poll(fd, interest, timeout);
+    }
+    match blocking_mode("FD-WAIT")? {
+        BlockingMode::Native => native_poll(fd, interest, timeout),
+        BlockingMode::Fiber => fiber_wait_fd(fd, interest, timeout),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fiber_wait_fd(
+    fd: RawFd,
+    interest: IoInterest,
+    timeout: Option<Duration>,
+) -> Result<bool, BlissError> {
+    let (fiber, token) =
+        crate::thread::prepare_current_fiber_park(crate::thread::FiberState::Waiting)?;
+    let ready = Arc::new(AtomicBool::new(false));
+    let registration = match epoll::register(fd, interest, fiber, token, Arc::clone(&ready)) {
+        Ok(registration) => registration,
+        Err(error) => {
+            crate::thread::cancel_prepared_current_fiber_park();
+            return Err(error);
+        }
+    };
+    if let Some(duration) = timeout {
+        if let Err(error) = timer::schedule(fiber, token, Instant::now() + duration) {
+            epoll::cancel(registration);
+            crate::thread::cancel_prepared_current_fiber_park();
+            return Err(error);
+        }
+    }
+    crate::thread::park_prepared_current_fiber()?;
+    epoll::cancel(registration);
+    Ok(ready.load(Ordering::Acquire))
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn fiber_wait_fd(
+    fd: RawFd,
+    interest: IoInterest,
+    timeout: Option<Duration>,
+) -> Result<bool, BlissError> {
+    let (fiber, token) =
+        crate::thread::prepare_current_fiber_park(crate::thread::FiberState::Waiting)?;
+    let ready = Arc::new(AtomicBool::new(false));
+    let registration = match kqueue::register(fd, interest, fiber, token, Arc::clone(&ready)) {
+        Ok(registration) => registration,
+        Err(error) => {
+            crate::thread::cancel_prepared_current_fiber_park();
+            return Err(error);
+        }
+    };
+    if let Some(duration) = timeout {
+        if let Err(error) = timer::schedule(fiber, token, Instant::now() + duration) {
+            kqueue::cancel(registration);
+            crate::thread::cancel_prepared_current_fiber_park();
+            return Err(error);
+        }
+    }
+    crate::thread::park_prepared_current_fiber()?;
+    kqueue::cancel(registration);
+    Ok(ready.load(Ordering::Acquire))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
+fn fiber_wait_fd(
+    fd: RawFd,
+    interest: IoInterest,
+    timeout: Option<Duration>,
+) -> Result<bool, BlissError> {
+    let (fiber, token) =
+        crate::thread::prepare_current_fiber_park(crate::thread::FiberState::Waiting)?;
+    let ready = Arc::new(AtomicBool::new(false));
+    let worker_ready = Arc::clone(&ready);
+    if std::thread::Builder::new()
+        .name("bliss-poll-wait".into())
+        .spawn(move || {
+            if native_poll(fd, interest, timeout).unwrap_or(false) {
+                worker_ready.store(true, Ordering::Release);
+            }
+            crate::thread::wake_fiber_wait(fiber, token);
+        })
+        .is_err()
+    {
+        crate::thread::cancel_prepared_current_fiber_park();
+        return Err(BlissError::Internal(
+            "failed to start fd poll fallback".into(),
+        ));
+    }
+    if let Some(duration) = timeout {
+        if let Err(error) = timer::schedule(fiber, token, Instant::now() + duration) {
+            crate::thread::cancel_prepared_current_fiber_park();
+            return Err(error);
+        }
+    }
+    crate::thread::park_prepared_current_fiber()?;
+    Ok(ready.load(Ordering::Acquire))
+}
+
+#[cfg(target_os = "linux")]
+mod epoll {
+    use super::{IoInterest, RawFd};
+    use crate::error::BlissError;
+    use crate::lock_order::{LockLevel, OrderedMutex};
+    use crate::thread::FiberId;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    struct Registration {
+        fd: RawFd,
+        fiber: FiberId,
+        token: u64,
+        ready: Arc<AtomicBool>,
+    }
+
+    struct Poller {
+        epoll_fd: RawFd,
+        registrations: Arc<OrderedMutex<HashMap<u64, Registration>>>,
+        fds: Arc<OrderedMutex<HashMap<RawFd, u64>>>,
+        started: bool,
+    }
+
+    static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
+
+    fn poller() -> &'static Poller {
+        static POLLER: OnceLock<Poller> = OnceLock::new();
+        POLLER.get_or_init(|| {
+            let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            let registrations = Arc::new(OrderedMutex::new(
+                LockLevel::ExecutionRegistry,
+                101,
+                "epoll fiber registrations",
+                HashMap::new(),
+            ));
+            let fds = Arc::new(OrderedMutex::new(
+                LockLevel::ExecutionRegistry,
+                100,
+                "epoll descriptor registry",
+                HashMap::new(),
+            ));
+            let started = if epoll_fd < 0 {
+                false
+            } else {
+                let worker_registrations = Arc::clone(&registrations);
+                let worker_fds = Arc::clone(&fds);
+                std::thread::Builder::new()
+                    .name("bliss-io-epoll".into())
+                    .spawn(move || epoll_loop(epoll_fd, worker_registrations, worker_fds))
+                    .is_ok()
+            };
+            Poller {
+                epoll_fd,
+                registrations,
+                fds,
+                started,
+            }
+        })
+    }
+
+    fn epoll_events(interest: IoInterest) -> u32 {
+        let events = match interest {
+            IoInterest::Read => libc::EPOLLIN,
+            IoInterest::Write => libc::EPOLLOUT,
+            IoInterest::ReadWrite => libc::EPOLLIN | libc::EPOLLOUT,
+        };
+        (events | libc::EPOLLONESHOT) as u32
+    }
+
+    pub(super) fn register(
+        fd: RawFd,
+        interest: IoInterest,
+        fiber: FiberId,
+        token: u64,
+        ready: Arc<AtomicBool>,
+    ) -> Result<u64, BlissError> {
+        let poller = poller();
+        if !poller.started {
+            return Err(BlissError::StreamError(
+                "failed to initialize epoll readiness service".into(),
+            ));
+        }
+        let id = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
+        let mut fds = poller.fds.lock().unwrap();
+        if fds.contains_key(&fd) {
+            return Err(BlissError::ProgramError(format!(
+                "file descriptor {fd} already has a fiber waiter"
+            )));
+        }
+        let mut event = libc::epoll_event {
+            events: epoll_events(interest),
+            u64: id,
+        };
+        if unsafe { libc::epoll_ctl(poller.epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
+            return Err(BlissError::StreamError(format!(
+                "epoll registration failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        poller.registrations.lock().unwrap().insert(
+            id,
+            Registration {
+                fd,
+                fiber,
+                token,
+                ready,
+            },
+        );
+        fds.insert(fd, id);
+        Ok(id)
+    }
+
+    pub(super) fn cancel(id: u64) {
+        let poller = poller();
+        let registration = poller.registrations.lock().unwrap().remove(&id);
+        if let Some(registration) = registration {
+            poller.fds.lock().unwrap().remove(&registration.fd);
+            unsafe {
+                libc::epoll_ctl(
+                    poller.epoll_fd,
+                    libc::EPOLL_CTL_DEL,
+                    registration.fd,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+
+    fn epoll_loop(
+        epoll_fd: RawFd,
+        registrations: Arc<OrderedMutex<HashMap<u64, Registration>>>,
+        fds: Arc<OrderedMutex<HashMap<RawFd, u64>>>,
+    ) {
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
+        loop {
+            let count =
+                unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, -1) };
+            if count < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            for event in events.iter().take(count as usize) {
+                let id = unsafe { std::ptr::addr_of!(event.u64).read_unaligned() };
+                let registration = registrations.lock().unwrap().remove(&id);
+                let Some(registration) = registration else {
+                    continue;
+                };
+                fds.lock().unwrap().remove(&registration.fd);
+                unsafe {
+                    libc::epoll_ctl(
+                        epoll_fd,
+                        libc::EPOLL_CTL_DEL,
+                        registration.fd,
+                        std::ptr::null_mut(),
+                    );
+                }
+                registration.ready.store(true, Ordering::Release);
+                crate::thread::wake_fiber_wait(registration.fiber, registration.token);
+            }
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+mod kqueue {
+    use super::{IoInterest, RawFd};
+    use crate::error::BlissError;
+    use crate::lock_order::{LockLevel, OrderedMutex};
+    use crate::thread::FiberId;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    struct Registration {
+        fd: RawFd,
+        fiber: FiberId,
+        token: u64,
+        ready: Arc<AtomicBool>,
+    }
+
+    struct Poller {
+        queue_fd: RawFd,
+        registrations: Arc<OrderedMutex<HashMap<u64, Registration>>>,
+        fds: Arc<OrderedMutex<HashMap<RawFd, u64>>>,
+        started: bool,
+    }
+
+    static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
+
+    fn poller() -> &'static Poller {
+        static POLLER: OnceLock<Poller> = OnceLock::new();
+        POLLER.get_or_init(|| {
+            let queue_fd = unsafe { libc::kqueue() };
+            let registrations = Arc::new(OrderedMutex::new(
+                LockLevel::ExecutionRegistry,
+                101,
+                "kqueue fiber registrations",
+                HashMap::new(),
+            ));
+            let fds = Arc::new(OrderedMutex::new(
+                LockLevel::ExecutionRegistry,
+                100,
+                "kqueue descriptor registry",
+                HashMap::new(),
+            ));
+            let started = if queue_fd < 0 {
+                false
+            } else {
+                let worker_registrations = Arc::clone(&registrations);
+                let worker_fds = Arc::clone(&fds);
+                std::thread::Builder::new()
+                    .name("bliss-io-kqueue".into())
+                    .spawn(move || kqueue_loop(queue_fd, worker_registrations, worker_fds))
+                    .is_ok()
+            };
+            Poller {
+                queue_fd,
+                registrations,
+                fds,
+                started,
+            }
+        })
+    }
+
+    fn filters(interest: IoInterest) -> &'static [i16] {
+        match interest {
+            IoInterest::Read => &[libc::EVFILT_READ],
+            IoInterest::Write => &[libc::EVFILT_WRITE],
+            IoInterest::ReadWrite => &[libc::EVFILT_READ, libc::EVFILT_WRITE],
+        }
+    }
+
+    unsafe fn change(queue_fd: RawFd, fd: RawFd, filter: i16, flags: u16, id: u64) -> i32 {
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        event.ident = fd as libc::uintptr_t;
+        event.filter = filter;
+        event.flags = flags;
+        event.udata = id as usize as *mut libc::c_void;
+        unsafe {
+            libc::kevent(
+                queue_fd,
+                &event,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        }
+    }
+
+    pub(super) fn register(
+        fd: RawFd,
+        interest: IoInterest,
+        fiber: FiberId,
+        token: u64,
+        ready: Arc<AtomicBool>,
+    ) -> Result<u64, BlissError> {
+        let poller = poller();
+        if !poller.started {
+            return Err(BlissError::StreamError(
+                "failed to initialize kqueue readiness service".into(),
+            ));
+        }
+        let id = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
+        let mut fds = poller.fds.lock().unwrap();
+        if fds.contains_key(&fd) {
+            return Err(BlissError::ProgramError(format!(
+                "file descriptor {fd} already has a fiber waiter"
+            )));
+        }
+        for &filter in filters(interest) {
+            if unsafe {
+                change(
+                    poller.queue_fd,
+                    fd,
+                    filter,
+                    (libc::EV_ADD | libc::EV_ONESHOT) as u16,
+                    id,
+                )
+            } != 0
+            {
+                return Err(BlissError::StreamError(format!(
+                    "kqueue registration failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        poller.registrations.lock().unwrap().insert(
+            id,
+            Registration {
+                fd,
+                fiber,
+                token,
+                ready,
+            },
+        );
+        fds.insert(fd, id);
+        Ok(id)
+    }
+
+    pub(super) fn cancel(id: u64) {
+        let poller = poller();
+        let registration = poller.registrations.lock().unwrap().remove(&id);
+        if let Some(registration) = registration {
+            poller.fds.lock().unwrap().remove(&registration.fd);
+            for &filter in &[libc::EVFILT_READ, libc::EVFILT_WRITE] {
+                unsafe {
+                    change(
+                        poller.queue_fd,
+                        registration.fd,
+                        filter,
+                        libc::EV_DELETE as u16,
+                        id,
+                    );
+                }
+            }
+        }
+    }
+
+    fn kqueue_loop(
+        queue_fd: RawFd,
+        registrations: Arc<OrderedMutex<HashMap<u64, Registration>>>,
+        fds: Arc<OrderedMutex<HashMap<RawFd, u64>>>,
+    ) {
+        let mut events: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
+        loop {
+            let count = unsafe {
+                libc::kevent(
+                    queue_fd,
+                    std::ptr::null(),
+                    0,
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    std::ptr::null(),
+                )
+            };
+            if count < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            for event in events.iter().take(count as usize) {
+                let id = event.udata as usize as u64;
+                let registration = registrations.lock().unwrap().remove(&id);
+                let Some(registration) = registration else {
+                    continue;
+                };
+                fds.lock().unwrap().remove(&registration.fd);
+                registration.ready.store(true, Ordering::Release);
+                crate::thread::wake_fiber_wait(registration.fiber, registration.token);
+            }
+        }
+    }
+}

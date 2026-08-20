@@ -157,9 +157,8 @@ rehash.  **Complexity:** amortised O(1); expected maximum displacement O(log n) 
 Deadlock-free locking requires the following total order:
 
 ```
-Level 0:  PackageRegistry (global RwLock)
-Level 1:  Package (per-package RwLock fields)
-Level 2:  SymbolTable (embedded in Package RwLock)
+Global level 3:  PackageRegistry (global RwLock)
+Global level 4:  Package (per-package RwLock; symbol tables are embedded)
 ```
 
 **Rule L1:** The registry lock MUST be acquired before any per-package

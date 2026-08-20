@@ -10,10 +10,12 @@
 //!     range/class refinements are covered too. The guard can never fire.
 //!
 //!  2. **Dominating-duplicate removal.** A guard is dead if an *equivalent* guard
-//!     (same opcode, same checked operands, same `TypeTag`) dominates it (strict
-//!     block dominance, or an earlier position in the same block). The dominating
-//!     guard already discharged the speculation for the whole dominated region
-//!     (spec R4.63), so the second check is redundant.
+//!     (same opcode, checked operands, and proof kind) dominates it (strict block
+//!     dominance, or an earlier position in the same block). Proof kinds include
+//!     both type tags and representation refinements such as `StringLayout`.
+//!     The dominating guard already discharged the speculation for the whole
+//!     dominated region (spec R4.63), so the second check is redundant. Refined
+//!     SSA results are forwarded to the dominating guard's corresponding result.
 //!
 //!  3. **Loop-invariant hoisting.** A guard inside a natural loop whose checked
 //!     operands are all defined outside the loop, that dominates every loop
@@ -116,6 +118,15 @@ fn refinements_covered(tau: &IRType, got: &IRType) -> bool {
 
 // ── Transform 2: dominating duplicate guards ────────────────────────
 
+/// A guard's proof identity for redundancy matching.  Layout refinements are
+/// deliberately distinct from `TypeTag(STRING)`: knowing that a value is a CL
+/// string does not prove it has one of the directly addressable simple layouts.
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum GuardKind {
+    Type(IRType),
+    StringLayout,
+}
+
 /// A guard's identity for redundancy matching.
 struct GuardInfo {
     inst: Inst,
@@ -124,35 +135,34 @@ struct GuardInfo {
     pos: usize,
     opcode: Opcode,
     args: Vec<Value>,
-    /// Checked type; only `TypeTag`-carrying guards participate.
-    tag: IRType,
+    kind: GuardKind,
 }
 
 /// Remove any guard that an equivalent guard already dominates.
 fn remove_dominating_duplicates(f: &mut Function, dom: &crate::t2::ir::DominatorTree) -> bool {
-    let guards = collect_type_guards(f);
-    let mut to_remove: Vec<Inst> = Vec::new();
+    let guards = collect_guards(f);
+    let mut to_remove: Vec<(Inst, Inst)> = Vec::new();
 
     for (i, g2) in guards.iter().enumerate() {
-        // Redundant iff some *other* equivalent guard runs strictly before it on
-        // every path (block dominance, or an earlier slot in the same block).
-        let dominated = guards.iter().enumerate().any(|(j, g1)| {
-            j != i && equivalent(g1, g2) && guard_precedes(g1, g2, dom)
-        });
-        if dominated {
-            to_remove.push(g2.inst);
+        // Redundant iff some equivalent guard runs strictly before it on every
+        // path. Keep the leader so a refining guard's result can replace the
+        // dominated result, preserving the explicit proof dependency.
+        if let Some(g1) = guards.iter().enumerate().find_map(|(j, g1)| {
+            (j != i && equivalent(g1, g2) && guard_precedes(g1, g2, dom)).then_some(g1)
+        }) {
+            to_remove.push((g2.inst, g1.inst));
         }
     }
 
     let n = to_remove.len();
-    for inst in to_remove {
-        remove_guard(f, inst);
+    for (inst, leader) in to_remove {
+        remove_redundant_guard(f, inst, leader);
     }
     n > 0
 }
 
-/// Gather every `TypeTag`-checking guard in program order.
-fn collect_type_guards(f: &Function) -> Vec<GuardInfo> {
+/// Gather every guard kind whose proof is reusable in program order.
+fn collect_guards(f: &Function) -> Vec<GuardInfo> {
     let mut out = Vec::new();
     for b in f.block_order().to_vec() {
         for (pos, &inst) in f.block(b).insts.iter().enumerate() {
@@ -160,14 +170,18 @@ fn collect_type_guards(f: &Function) -> Vec<GuardInfo> {
             if !d.flags.guard {
                 continue;
             }
-            let AuxData::TypeTag(tag) = &d.aux else { continue };
+            let kind = match &d.aux {
+                AuxData::TypeTag(tag) => GuardKind::Type(*tag),
+                AuxData::StringLayout => GuardKind::StringLayout,
+                _ => continue,
+            };
             out.push(GuardInfo {
                 inst,
                 block: b,
                 pos,
                 opcode: d.opcode,
                 args: d.args.clone(),
-                tag: *tag,
+                kind,
             });
         }
     }
@@ -176,7 +190,7 @@ fn collect_type_guards(f: &Function) -> Vec<GuardInfo> {
 
 /// Two guards check the same thing.
 fn equivalent(a: &GuardInfo, b: &GuardInfo) -> bool {
-    a.opcode == b.opcode && a.args == b.args && a.tag == b.tag
+    a.opcode == b.opcode && a.args == b.args && a.kind == b.kind
 }
 
 /// Does `g1` provably execute before `g2` on every path that reaches `g2`?
@@ -331,6 +345,21 @@ fn remove_guard(f: &mut Function, inst: Inst) {
     if let Some(v) = operand {
         for r in results {
             replace_all_uses(f, r, v);
+        }
+    }
+    detach_inst(f, inst);
+}
+
+/// Remove a guard made redundant by `leader`.  A guard that yields a refined
+/// SSA identity must forward uses to the leader's refined result, not back to
+/// the unchecked input; result-less type guards retain the old no-op behavior.
+fn remove_redundant_guard(f: &mut Function, inst: Inst, leader: Inst) {
+    let results = f.inst(inst).results.clone();
+    let leader_results = f.inst(leader).results.clone();
+    let operand = f.inst(inst).args.first().copied();
+    for (index, result) in results.into_iter().enumerate() {
+        if let Some(replacement) = leader_results.get(index).copied().or(operand) {
+            replace_all_uses(f, result, replacement);
         }
     }
     detach_inst(f, inst);
@@ -528,6 +557,51 @@ mod tests {
         let survivor_in_entry =
             f.block(e).insts.iter().any(|&i| f.inst(i).flags.guard);
         assert!(survivor_in_entry, "the dominating guard must be the survivor");
+    }
+
+    #[test]
+    fn dominating_layout_guard_forwards_refined_result() {
+        // Shape produced when two independently guarded string bodies are
+        // inlined into one caller: both guards check the same caller SSA value,
+        // while each operation consumes its own guard's refined result.
+        let mut f = Function::new("inlined-layout-guards");
+        let e = f.entry();
+        let string = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
+        let layout = IRType::of(TypeBits::STRING);
+        let make_layout_guard = |arg| InstData {
+            args: vec![arg],
+            aux: AuxData::StringLayout,
+            flags: InstFlags { guard: true, effectful: true, ..InstFlags::default() },
+            ..base(Opcode::Guard)
+        };
+        let (_, first) = f.push_inst(
+            e,
+            make_layout_guard(string),
+            &[(layout, ValueRepresentation::Tagged)],
+        );
+        let (_, second) = f.push_inst(
+            e,
+            make_layout_guard(string),
+            &[(layout, ValueRepresentation::Tagged)],
+        );
+        let (load, _) = f.push_inst(
+            e,
+            InstData {
+                args: vec![second[0]],
+                ..base(Opcode::StringByteLength)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(e, ret());
+
+        run(&mut f);
+
+        assert_eq!(count_guards(&f), 1, "one dominating layout proof remains");
+        assert_eq!(
+            f.inst(load).args,
+            vec![first[0]],
+            "the consumer retains an SSA dependency on the surviving proof"
+        );
     }
 
     #[test]

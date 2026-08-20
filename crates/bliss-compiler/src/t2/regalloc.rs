@@ -90,15 +90,21 @@
 use std::collections::HashMap;
 
 use regalloc2::{
-    Algorithm, Allocation, Block, Function as Ra2Function, Inst as Ra2Inst, InstRange, MachineEnv,
-    Operand, OperandKind, PReg, PRegSet, RegClass as Ra2RegClass, RegallocOptions, VReg as Ra2VReg,
+    Algorithm, Allocation, Block, Edit, Function as Ra2Function, Inst as Ra2Inst, InstPosition,
+    InstRange, MachineEnv, Operand, OperandKind, PReg, PRegSet, RegClass as Ra2RegClass,
+    RegAllocError, RegallocOptions, VReg as Ra2VReg,
 };
 
-use crate::t2::mach::{Location, MachFunc, PhysReg, RegClass, StackMap, StackSlot, VReg};
+use crate::t2::mach::{
+    AllocationEdit, EditPosition, Location, MachFunc, PhysReg, RegClass, StackMap, StackSlot, VReg,
+    ValueLocationRange,
+};
 
 /// Number of allocatable GPRs exposed to the allocator (hw_enc `0..N_GPR`); one
 /// extra encoding above this is reserved as the class scratch register.
-const N_GPR: usize = 14;
+// Keep the final abstract encoding out of the allocatable set: the emitter maps
+// it to r15 and uses it as regalloc2's dedicated edit scratch register.
+const N_GPR: usize = 13;
 /// Number of allocatable XMM registers exposed (hw_enc `0..N_XMM`); one extra
 /// encoding above this is reserved as the class scratch register.
 const N_XMM: usize = 15;
@@ -163,6 +169,32 @@ fn machine_env() -> MachineEnv {
     }
 }
 
+/// Environment used by the live framed emitter.  Registers consumed by its
+/// ABI and instruction templates (rax, rdx, rsi, rdi) are excluded, as are
+/// r9-r11 which form the reload/result-temporary bank.  rcx/r8 are profitable
+/// for call-local ranges; rbx/r12-r15 survive runtime calls.
+fn framed_machine_env() -> MachineEnv {
+    let mut int_regs = PRegSet::empty();
+    for i in [1usize, 5, 9, 10, 11, 12, 13] {
+        int_regs.add(PReg::new(i, Ra2RegClass::Int));
+    }
+    let mut float_regs = PRegSet::empty();
+    for i in 0..N_XMM {
+        float_regs.add(PReg::new(i, Ra2RegClass::Float));
+    }
+    MachineEnv {
+        preferred_regs_by_class: [int_regs, float_regs, PRegSet::empty()],
+        non_preferred_regs_by_class: [PRegSet::empty(), PRegSet::empty(), PRegSet::empty()],
+        // abstract GPR 8 maps to r11, reserved from the set above
+        scratch_by_class: [
+            Some(PReg::new(8, Ra2RegClass::Int)),
+            Some(PReg::new(N_XMM, Ra2RegClass::Float)),
+            None,
+        ],
+        fixed_stack_slots: Vec::new(),
+    }
+}
+
 /// regalloc2 `Function` adapter over a `MachFunc`. Drives the CFG from
 /// `mf.blocks` when present, falling back to a single basic block over all of
 /// `mf.insts` when `mf.blocks` is empty (see module docs). Owns its interned
@@ -187,6 +219,8 @@ struct Adapter {
     /// Per-instruction terminator flags (length `num_insts`).
     is_branch: Vec<bool>,
     is_ret: Vec<bool>,
+    clobbers: Vec<PRegSet>,
+    debug_labels: Vec<(Ra2VReg, Ra2Inst, Ra2Inst, u32)>,
 }
 
 impl Adapter {
@@ -203,6 +237,7 @@ impl Adapter {
         };
 
         let mut operands: Vec<Vec<Operand>> = Vec::with_capacity(mf.insts.len());
+        let mut clobbers: Vec<PRegSet> = Vec::with_capacity(mf.insts.len());
         for inst in &mf.insts {
             let mut ops = Vec::with_capacity(inst.defs.len() + inst.uses.len());
             for &d in &inst.defs {
@@ -212,6 +247,27 @@ impl Adapter {
                 ops.push(Operand::reg_use(intern(u)));
             }
             operands.push(ops);
+
+            let mut set = PRegSet::empty();
+            if matches!(
+                inst.op,
+                crate::t2::lower::op::CALL
+                    | crate::t2::lower::op::CALL_RUNTIME
+                    | crate::t2::lower::op::ALLOC
+                    | crate::t2::lower::op::TAILCALL
+                    | crate::t2::lower::op::THROW
+                    | crate::t2::lower::op::NLX_TRANSFER
+            ) {
+                // Abstract GPR encodings 0..=8 map to SysV caller-saved
+                // rax,rcx,rdx,rsi,rdi,r8-r11 in emit.rs.
+                for i in 0..=8 {
+                    set.add(PReg::new(i, Ra2RegClass::Int));
+                }
+                for i in 0..N_XMM {
+                    set.add(PReg::new(i, Ra2RegClass::Float));
+                }
+            }
+            clobbers.push(set);
         }
 
         let num_insts = mf.insts.len();
@@ -275,6 +331,19 @@ impl Adapter {
             }
         }
 
+        let debug_labels = reverse
+            .iter()
+            .enumerate()
+            .map(|(label, v)| {
+                (
+                    Ra2VReg::new(label, ra2_class(v.class)),
+                    Ra2Inst::new(0),
+                    Ra2Inst::new(num_insts),
+                    label as u32,
+                )
+            })
+            .collect();
+
         Adapter {
             num_insts,
             num_vregs: reverse.len(),
@@ -287,27 +356,11 @@ impl Adapter {
             branch_args,
             is_branch,
             is_ret,
+            clobbers,
+            debug_labels,
         }
     }
 
-    /// Detect an unsplit critical edge: a block with >1 successor feeding a
-    /// block with >1 predecessor. Splitting them is lowering's contract; this
-    /// only reports so `allocate` can `debug_assert`.
-    fn has_critical_edge(&self) -> Option<(usize, usize)> {
-        for (b, succs) in self.block_succs.iter().enumerate() {
-            if succs.len() <= 1 {
-                continue;
-            }
-            for &succ in succs {
-                // Entry block has an implicit extra predecessor.
-                let extra = usize::from(succ.index() == 0);
-                if self.block_preds[succ.index()].len() + extra > 1 {
-                    return Some((b, succ.index()));
-                }
-            }
-        }
-        None
-    }
 }
 
 impl Ra2Function for Adapter {
@@ -356,12 +409,16 @@ impl Ra2Function for Adapter {
         &self.operands[insn.index()]
     }
 
-    fn inst_clobbers(&self, _insn: Ra2Inst) -> PRegSet {
-        PRegSet::empty()
+    fn inst_clobbers(&self, insn: Ra2Inst) -> PRegSet {
+        self.clobbers[insn.index()]
     }
 
     fn num_vregs(&self) -> usize {
         self.num_vregs
+    }
+
+    fn debug_value_labels(&self) -> &[(Ra2VReg, Ra2Inst, Ra2Inst, u32)] {
+        &self.debug_labels
     }
 
     fn spillslot_size(&self, _regclass: Ra2RegClass) -> usize {
@@ -375,25 +432,30 @@ impl Ra2Function for Adapter {
 /// register and pushes one [`StackMap`] per safepoint instruction (spec §4.7
 /// R4.46, §4.10 R4.65). See the module docs for the single-block and
 /// stack-map limitations.
-pub fn allocate(mf: &mut MachFunc) {
+pub fn allocate(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+    allocate_with_env(mf, machine_env())
+}
+
+/// Allocate for the live framed x86 emitter, reserving its ABI and scratch
+/// registers while still using the same regalloc2 pipeline and edit model.
+pub fn allocate_framed(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+    allocate_with_env(mf, framed_machine_env())
+}
+
+fn allocate_with_env(mf: &mut MachFunc, env: MachineEnv) -> Result<(), RegAllocError> {
     mf.allocation.clear();
+    mf.inst_allocations.clear();
+    mf.allocation_edits.clear();
+    mf.num_spill_slots = 0;
+    mf.value_locations.clear();
     mf.stack_maps.clear();
 
     if mf.insts.is_empty() {
-        return;
+        return Ok(());
     }
 
     let adapter = Adapter::build(mf);
 
-    // Critical edges must be pre-split by lowering (see module docs). Report
-    // loudly in debug; regalloc2 independently returns `CritEdge` otherwise.
-    debug_assert!(
-        adapter.has_critical_edge().is_none(),
-        "unsplit critical edge {:?}; lowering (P5) must split it",
-        adapter.has_critical_edge()
-    );
-
-    let env = machine_env();
     let options = RegallocOptions {
         verbose_log: false,
         // Inputs are already SSA-shaped (lowering's contract): a single def per
@@ -404,15 +466,45 @@ pub fn allocate(mf: &mut MachFunc) {
         algorithm: Algorithm::Ion,
     };
 
-    let output = match regalloc2::run(&adapter, &env, &options) {
-        Ok(output) => output,
-        Err(e) => {
-            // No Result channel on this frozen signature; a real pipeline would
-            // surface this. Leave `mf` unallocated and report loudly in debug.
-            debug_assert!(false, "regalloc2 failed: {e:?}");
-            return;
-        }
-    };
+    let output = regalloc2::run(&adapter, &env, &options)?;
+
+    mf.num_spill_slots = output.num_spillslots as u32;
+    mf.inst_allocations = (0..adapter.num_insts)
+        .map(|i| {
+            output
+                .inst_allocs(Ra2Inst::new(i))
+                .iter()
+                .filter_map(|&a| to_location(a))
+                .collect()
+        })
+        .collect();
+    mf.allocation_edits = output
+        .edits
+        .iter()
+        .filter_map(|(point, edit)| match edit {
+            Edit::Move { from, to } => Some(AllocationEdit {
+                inst: point.inst().index(),
+                position: match point.pos() {
+                    InstPosition::Before => EditPosition::Before,
+                    InstPosition::After => EditPosition::After,
+                },
+                from: to_location(*from)?,
+                to: to_location(*to)?,
+            }),
+        })
+        .collect();
+    mf.value_locations = output
+        .debug_locations
+        .iter()
+        .filter_map(|(label, start, end, allocation)| {
+            Some(ValueLocationRange {
+                vreg: *adapter.reverse.get(*label as usize)?,
+                start: start.to_index(),
+                end: end.to_index(),
+                location: to_location(*allocation)?,
+            })
+        })
+        .collect();
 
     // ── Write back VReg → Location. Prefer a value's def-site allocation as its
     // canonical location; fall back to a use site if it is only ever used. ────
@@ -467,6 +559,7 @@ pub fn allocate(mf: &mut MachFunc) {
             frame_state: mf.insts[i].frame_state,
         });
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -481,6 +574,7 @@ mod tests {
 
     fn inst(op: u32, defs: Vec<VReg>, uses: Vec<VReg>) -> MachInst {
         MachInst {
+            source_inst: None,
             op,
             defs,
             uses,
@@ -498,6 +592,7 @@ mod tests {
         let f0 = vreg(RegClass::Xmm, 0);
 
         let safepoint = MachInst {
+            source_inst: None,
             op: 3,
             defs: vec![g1],
             uses: vec![g0],
@@ -520,7 +615,7 @@ mod tests {
     #[test]
     fn every_vreg_gets_a_class_appropriate_location() {
         let mut mf = sample();
-        allocate(&mut mf);
+        allocate(&mut mf).expect("regalloc2");
 
         let map: HashMap<VReg, Location> = mf.allocation.iter().copied().collect();
 
@@ -544,7 +639,7 @@ mod tests {
     #[test]
     fn safepoint_produces_a_stack_map_with_frame_state() {
         let mut mf = sample();
-        allocate(&mut mf);
+        allocate(&mut mf).expect("regalloc2");
 
         assert_eq!(mf.stack_maps.len(), 1, "exactly one safepoint => one map");
         let sm = &mf.stack_maps[0];
@@ -564,7 +659,7 @@ mod tests {
     #[test]
     fn empty_function_is_a_no_op() {
         let mut mf = MachFunc::default();
-        allocate(&mut mf);
+        allocate(&mut mf).expect("regalloc2");
         assert!(mf.allocation.is_empty());
         assert!(mf.stack_maps.is_empty());
     }
@@ -595,6 +690,7 @@ mod tests {
         let br = || inst(100, vec![], vec![]);
 
         let safepoint = MachInst {
+            source_inst: None,
             op: 3,
             defs: vec![],
             uses: vec![g0, gm],
@@ -650,7 +746,7 @@ mod tests {
     #[test]
     fn diamond_allocates_block_param_and_all_vregs() {
         let mut mf = diamond();
-        allocate(&mut mf);
+        allocate(&mut mf).expect("regalloc2");
 
         let map: HashMap<VReg, Location> = mf.allocation.iter().copied().collect();
 
@@ -675,7 +771,7 @@ mod tests {
     #[test]
     fn diamond_safepoint_yields_a_stack_map() {
         let mut mf = diamond();
-        allocate(&mut mf);
+        allocate(&mut mf).expect("regalloc2");
 
         assert_eq!(mf.stack_maps.len(), 1, "one safepoint => one stack map");
         let sm = &mf.stack_maps[0];

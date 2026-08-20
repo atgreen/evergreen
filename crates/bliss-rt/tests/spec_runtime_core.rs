@@ -1,20 +1,23 @@
 use bliss_rt::error::BlissError;
-use bliss_rt::ffi::{AlienType, Callback, ffi_call, marshal_to_c, unmarshal_from_c};
+use bliss_rt::ffi::{ffi_call, marshal_to_c, unmarshal_from_c, AlienType, Callback};
 use bliss_rt::gc::{register_finalizer, set_finalizer_dispatch};
-use bliss_rt::object::{ObjectHeader, type_id};
+use bliss_rt::object::{type_id, ObjectHeader};
 use bliss_rt::runtime::check_sigint;
 use bliss_rt::stack::{
     CodeInfo, Frame, FrameType, FrameWalker, SourceLocation, SourceLocationEntry, StackMapEntry,
 };
-use bliss_rt::thread::{ThreadState, current_thread, join_thread, make_thread, thread_yield};
+use bliss_rt::thread::{
+    current_fiber, current_stack, current_thread, fiber_yield, join_fiber, make_fiber,
+    submit_fiber, FiberId, FiberState,
+};
 use bliss_rt::value::{BlissVal, NIL, T, UNBOUND};
 use bliss_rt::{
-    LogLevel, Runtime, RuntimeConfig, install_signal_handlers, parse_cli, poll_safepoint,
-    resume_all_threads, wait_for_all_threads,
+    install_signal_handlers, parse_cli, poll_safepoint, resume_all_threads, wait_for_all_threads,
+    LogLevel, Runtime, RuntimeConfig,
 };
 use std::path::PathBuf;
-use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::MutexGuard;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -353,20 +356,29 @@ extern "C" fn callback_target() -> u64 {
 }
 
 extern "C" fn ffi_observe_native_state() -> u64 {
-    OBSERVED_THREAD_STATE.store(current_thread().state() as u8, Ordering::SeqCst);
+    let state = current_fiber()
+        .map(|fiber| fiber.state() as u8)
+        .unwrap_or(0xFE);
+    OBSERVED_THREAD_STATE.store(state, Ordering::SeqCst);
     0
 }
 
-fn green_thread_returns_seven() -> BlissVal {
-    thread_yield();
+fn spawn_fiber(entry: BlissVal) -> FiberId {
+    let id = make_fiber(entry).unwrap();
+    submit_fiber(id).unwrap();
+    id
+}
+
+fn fiber_returns_seven() -> BlissVal {
+    fiber_yield().unwrap();
     BlissVal::from_fixnum(7)
 }
 
-fn green_thread_reports_stack_base() -> BlissVal {
-    BlissVal::from_fixnum(current_thread().stack().base() as usize as i64)
+fn fiber_reports_stack_base() -> BlissVal {
+    BlissVal::from_fixnum(current_stack().base() as usize as i64)
 }
 
-fn green_thread_calls_ffi_and_returns_nil() -> BlissVal {
+fn fiber_calls_ffi_and_returns_nil() -> BlissVal {
     let _ = unsafe {
         ffi_call(
             ffi_observe_native_state as *const (),
@@ -378,7 +390,7 @@ fn green_thread_calls_ffi_and_returns_nil() -> BlissVal {
     NIL
 }
 
-fn slow_green_thread() -> BlissVal {
+fn slow_fiber() -> BlissVal {
     std::thread::sleep(Duration::from_millis(150));
     BlissVal::from_fixnum(1)
 }
@@ -431,15 +443,14 @@ fn startup_requires_image_load_unless_the_cli_selects_bootstrap_mode() {
 }
 
 #[test]
-fn green_threads_run_user_functions_through_the_worker_pool() {
+fn fibers_run_user_functions_through_the_carrier_pool() {
     let _guard = lock_serial();
-    // Per R2.04, green threads are multiplexed M:N onto the worker pool.
-    let entry =
-        unsafe { BlissVal::from_function_ptr(green_thread_returns_seven as *const () as *mut u8) };
-    let ids: Vec<_> = (0..8).map(|_| make_thread(entry).unwrap()).collect();
+    // Per R2.04, fibers are multiplexed M:N onto exposed carrier threads.
+    let entry = unsafe { BlissVal::from_function_ptr(fiber_returns_seven as *const () as *mut u8) };
+    let ids: Vec<_> = (0..8).map(|_| spawn_fiber(entry)).collect();
     let results: Vec<_> = ids
         .into_iter()
-        .map(|id| join_thread(id).unwrap().as_fixnum())
+        .map(|id| join_fiber(id).unwrap().as_fixnum())
         .collect();
 
     assert_eq!(results, vec![7; 8]);
@@ -450,24 +461,43 @@ fn fiber_record_publishes_stack_roots() {
     let _guard = lock_serial();
     // A managed fiber publishes its stack roots (SP/FP) at a safepoint so the
     // collector can scan them while it is suspended (bliss-jtc.14.2).
-    let t = current_thread();
-    assert_eq!(t.published_stack(), (0, 0), "unpublished by default");
-    t.publish_stack(0xAAAA_0000, 0xBBBB_0000);
-    assert_eq!(t.published_stack(), (0xAAAA_0000, 0xBBBB_0000));
-    t.publish_stack(0, 0);
+    let entry = unsafe { BlissVal::from_function_ptr(fiber_record_check as *const () as *mut u8) };
+    assert_eq!(join_fiber(spawn_fiber(entry)).unwrap().as_fixnum(), 7);
+}
+
+fn fiber_record_check() -> BlissVal {
+    let Some(fiber) = current_fiber() else {
+        return BlissVal::from_fixnum(-1);
+    };
+    let mut checks = 0;
+    fiber.publish_stack(0xAAAA_0000, 0xBBBB_0000);
+    if fiber.published_stack() == (0xAAAA_0000, 0xBBBB_0000) {
+        checks |= 1;
+    }
+    fiber.continuation().save(11, 22, 33);
+    if fiber.continuation().snapshot() == (11, 22, 33) {
+        checks |= 2;
+    }
+    if fiber.dynamic_bindings().is_empty()
+        && fiber.handler_stack().is_empty()
+        && fiber.restart_stack().is_empty()
+        && fiber.carrier_id().is_some()
+    {
+        checks |= 4;
+    }
+    BlissVal::from_fixnum(checks)
 }
 
 #[test]
-fn many_green_threads_complete_via_work_stealing() {
+fn many_fibers_complete_via_work_stealing() {
     let _guard = lock_serial();
     // Far more tasks than workers forces the per-worker deques to fill unevenly
     // and idle workers to steal (bliss-jtc.14.1); every task must still complete.
-    let entry =
-        unsafe { BlissVal::from_function_ptr(green_thread_returns_seven as *const () as *mut u8) };
-    let ids: Vec<_> = (0..200).map(|_| make_thread(entry).unwrap()).collect();
+    let entry = unsafe { BlissVal::from_function_ptr(fiber_returns_seven as *const () as *mut u8) };
+    let ids: Vec<_> = (0..200).map(|_| spawn_fiber(entry)).collect();
     let results: Vec<_> = ids
         .into_iter()
-        .map(|id| join_thread(id).unwrap().as_fixnum())
+        .map(|id| join_fiber(id).unwrap().as_fixnum())
         .collect();
     assert_eq!(results.len(), 200);
     assert!(
@@ -477,33 +507,32 @@ fn many_green_threads_complete_via_work_stealing() {
 }
 
 #[test]
-fn green_threads_have_distinct_cl_stacks_from_each_other_and_from_the_caller() {
+fn fibers_have_distinct_cl_stacks_from_each_other_and_from_the_caller() {
     let _guard = lock_serial();
-    // Per R2.05, each green thread maintains its own CL stack.
-    let entry = unsafe {
-        BlissVal::from_function_ptr(green_thread_reports_stack_base as *const () as *mut u8)
-    };
+    // Per R2.05, each fiber maintains its own CL stack.
+    let entry =
+        unsafe { BlissVal::from_function_ptr(fiber_reports_stack_base as *const () as *mut u8) };
     // Capture the caller's stack base *first*. current_thread() lazily creates
     // this thread's bootstrap CL stack, so it must be materialized before the
-    // green threads are spawned and freed — otherwise the allocator can hand the
+    // fibers are spawned and freed — otherwise the allocator can hand the
     // caller's freshly-created stack the memory of an already-joined green
     // thread's stack, producing a spurious base-address collision.
     let current = current_thread().stack().base() as usize;
 
-    let id1 = make_thread(entry).unwrap();
-    let id2 = make_thread(entry).unwrap();
+    let id1 = spawn_fiber(entry);
+    let id2 = spawn_fiber(entry);
 
-    let stack1 = join_thread(id1).unwrap().as_fixnum() as usize;
-    let stack2 = join_thread(id2).unwrap().as_fixnum() as usize;
+    let stack1 = join_fiber(id1).unwrap().as_fixnum() as usize;
+    let stack2 = join_fiber(id2).unwrap().as_fixnum() as usize;
 
-    assert_ne!(stack1, stack2, "green threads must not share a CL stack");
+    assert_ne!(stack1, stack2, "fibers must not share a CL stack");
     assert_ne!(
         stack1, current,
-        "green-thread stack must differ from the caller's stack"
+        "fiber stack must differ from the caller's stack"
     );
     assert_ne!(
         stack2, current,
-        "green-thread stack must differ from the caller's stack"
+        "fiber stack must differ from the caller's stack"
     );
 }
 
@@ -696,26 +725,26 @@ fn ffi_marshalling_covers_scalars_pointers_struct_layouts_and_void() {
 }
 
 #[test]
-fn ffi_calls_transition_green_threads_to_native_state() {
+fn ffi_calls_transition_fibers_to_native_state() {
     let _guard = lock_serial();
-    // Per R2.15, FFI calls transition the calling green thread into Native state.
+    // Per R2.15, FFI calls transition the calling fiber into Native state.
     OBSERVED_THREAD_STATE.store(0xFF, Ordering::SeqCst);
     let entry = unsafe {
-        BlissVal::from_function_ptr(green_thread_calls_ffi_and_returns_nil as *const () as *mut u8)
+        BlissVal::from_function_ptr(fiber_calls_ffi_and_returns_nil as *const () as *mut u8)
     };
-    let id = make_thread(entry).unwrap();
-    assert_eq!(join_thread(id).unwrap(), NIL);
+    let id = spawn_fiber(entry);
+    assert_eq!(join_fiber(id).unwrap(), NIL);
     assert_eq!(
         OBSERVED_THREAD_STATE.load(Ordering::SeqCst),
-        ThreadState::Native as u8,
-        "FFI callee should observe the green thread in Native state"
+        FiberState::Native as u8,
+        "FFI callee should observe the fiber in Native state"
     );
 }
 
 #[test]
 fn shutdown_runs_registered_finalizers_and_waits_for_in_flight_workers() {
     let _guard = lock_serial();
-    // Per R2.17, shutdown runs finalizers, joins worker threads, and exits under CL control.
+    // Per R2.17, shutdown runs finalizers, joins carrier threads, and exits under CL control.
     FINALIZER_CALLS.store(0, Ordering::SeqCst);
     LAST_FINALIZER.store(0, Ordering::SeqCst);
     LAST_FINALIZED_OBJECT.store(0, Ordering::SeqCst);
@@ -726,9 +755,8 @@ fn shutdown_runs_registered_finalizers_and_waits_for_in_flight_workers() {
     let finalizer = UNBOUND;
     register_finalizer(object, finalizer).unwrap();
 
-    let slow_entry =
-        unsafe { BlissVal::from_function_ptr(slow_green_thread as *const () as *mut u8) };
-    let slow_thread = make_thread(slow_entry).unwrap();
+    let slow_entry = unsafe { BlissVal::from_function_ptr(slow_fiber as *const () as *mut u8) };
+    let slow_fiber = spawn_fiber(slow_entry);
     let started = Instant::now();
     runtime.shutdown().unwrap();
     let elapsed = started.elapsed();
@@ -750,18 +778,17 @@ fn shutdown_runs_registered_finalizers_and_waits_for_in_flight_workers() {
         LAST_FINALIZED_OBJECT.load(Ordering::SeqCst) as u64,
         object.to_raw()
     );
-    assert_eq!(join_thread(slow_thread).unwrap().as_fixnum(), 1);
+    assert_eq!(join_fiber(slow_fiber).unwrap().as_fixnum(), 1);
 }
 
 #[test]
-fn runtime_accepts_large_green_thread_populations_without_exhausting_the_api() {
+fn runtime_accepts_large_fiber_populations_without_exhausting_the_api() {
     let _guard = lock_serial();
-    // Per R2.19, the runtime supports large populations of simultaneous green threads.
-    let entry =
-        unsafe { BlissVal::from_function_ptr(green_thread_returns_seven as *const () as *mut u8) };
-    let ids: Vec<_> = (0..1024).map(|_| make_thread(entry).unwrap()).collect();
+    // Per R2.19, the runtime supports large populations of simultaneous fibers.
+    let entry = unsafe { BlissVal::from_function_ptr(fiber_returns_seven as *const () as *mut u8) };
+    let ids: Vec<_> = (0..1024).map(|_| spawn_fiber(entry)).collect();
     for id in ids {
-        assert_eq!(join_thread(id).unwrap().as_fixnum(), 7);
+        assert_eq!(join_fiber(id).unwrap().as_fixnum(), 7);
     }
 }
 

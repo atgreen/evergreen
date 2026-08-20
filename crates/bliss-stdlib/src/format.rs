@@ -3,7 +3,8 @@
 //! See spec §5.9.
 
 use bliss_rt::error::BlissError;
-use bliss_rt::object::{ObjectHeader, type_id};
+use bliss_rt::lock_order::{LockLevel, OrderedMutex};
+use bliss_rt::object::{type_id, ObjectHeader};
 use bliss_rt::value::{BlissVal, NIL, T};
 
 // ── User print-object hook ────────────────────────────────────────
@@ -14,8 +15,8 @@ use bliss_rt::value::{BlissVal, NIL, T};
 // `*print-escape*` mode, returns the method's rendering (or None to fall back to
 // the built-in `#<CLASS>` form). Mirrors the reader's hook pattern.
 type PrintObjectHook = fn(BlissVal, bool) -> Option<String>;
-static PRINT_OBJECT_HOOK: std::sync::Mutex<Option<PrintObjectHook>> =
-    std::sync::Mutex::new(None);
+static PRINT_OBJECT_HOOK: OrderedMutex<Option<PrintObjectHook>> =
+    OrderedMutex::new(LockLevel::CodeCache, 30, "print-object hook", None);
 
 pub fn set_print_object_hook(hook: Option<PrintObjectHook>) {
     *PRINT_OBJECT_HOOK.lock().unwrap() = hook;
@@ -290,9 +291,9 @@ fn format_instance(v: BlissVal) -> String {
     let result = match crate::clos::slot_value(v, control_sym) {
         Ok(control) => match extract_bliss_string(control) {
             Some(control_str) => {
-                let args_sym = BlissVal::from_symbol_index(
-                    bliss_compiler::reader::intern_symbol("FORMAT-ARGUMENTS"),
-                );
+                let args_sym = BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol(
+                    "FORMAT-ARGUMENTS",
+                ));
                 let args = crate::clos::slot_value(v, args_sym)
                     .ok()
                     .map(cons_list_to_vec)
@@ -1138,7 +1139,11 @@ fn format_impl(
                 // ~w,dF: d = digits after the decimal point, w = minimum width.
                 let d = if params.len() > 1 {
                     let dd = resolve_param(&params[1], -1, arg_idx)?;
-                    if dd >= 0 { Some(dd as usize) } else { None }
+                    if dd >= 0 {
+                        Some(dd as usize)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -1610,7 +1615,7 @@ fn format_impl(
                 if i < chars.len() {
                     i += 1;
                 } // skip closing /
-                // Consume one argument as per CL spec
+                  // Consume one argument as per CL spec
                 if *arg_idx >= args.len() {
                     return Err(BlissError::Internal(format!(
                         "too few args for ~/{}/",
@@ -1708,7 +1713,11 @@ fn skip_close_directive(chars: &[char], pos: usize) -> usize {
         }
         j += 1;
     }
-    if j < chars.len() { j + 1 } else { j }
+    if j < chars.len() {
+        j + 1
+    } else {
+        j
+    }
 }
 
 /// Find matching close bracket. `start` is first char of body (after opening bracket).
@@ -1870,7 +1879,7 @@ pub fn formatter(control_string: &str) -> Result<BlissVal, BlissError> {
         let closure = ptr as *mut bliss_rt::object::ClosureData;
         (*closure).header = header;
         (*closure).function = ctrl_str; // the captured control string
-        // Store control string in closed_vars slot (offset after ClosureData)
+                                        // Store control string in closed_vars slot (offset after ClosureData)
         *(ptr.add(std::mem::size_of::<bliss_rt::object::ClosureData>()) as *mut BlissVal) =
             ctrl_str;
         // Return as function-tagged pointer so it's callable
@@ -2070,7 +2079,7 @@ struct PprintDispatchTable {
 /// the provided arguments; on any structural mismatch we return an error so
 /// the caller can fall back gracefully.
 fn call_format_dispatch(func: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
-    use bliss_rt::object::{CompiledFunctionData, type_id};
+    use bliss_rt::object::{type_id, CompiledFunctionData};
 
     if !func.is_function() && !func.is_heap_object() {
         return Err(BlissError::Internal(
@@ -2117,11 +2126,11 @@ fn call_format_dispatch(func: BlissVal, args: &[BlissVal]) -> Result<BlissVal, B
 
 // ── User format function registry (~/ directive) ──────────────────
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// Registry for user-defined format functions used by the ~/name/ directive.
 /// Maps function name (uppercase) to a BlissVal representing the function.
-static FORMAT_FUNCTION_REGISTRY: Mutex<Option<HashMap<String, BlissVal>>> = Mutex::new(None);
+static FORMAT_FUNCTION_REGISTRY: OrderedMutex<Option<HashMap<String, BlissVal>>> =
+    OrderedMutex::new(LockLevel::GcWorld, 14, "format function GC roots", None);
 
 fn scan_format_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
     let mut registry = FORMAT_FUNCTION_REGISTRY
@@ -2170,15 +2179,17 @@ fn lookup_format_function(name: &str) -> Option<BlissVal> {
 }
 
 // Global default dispatch table
-static DEFAULT_DISPATCH: Mutex<Option<Vec<(BlissVal, BlissVal, f64)>>> = Mutex::new(None);
+static DEFAULT_DISPATCH: OrderedMutex<Option<Vec<(BlissVal, BlissVal, f64)>>> =
+    OrderedMutex::new(LockLevel::GcWorld, 15, "pprint dispatch GC roots", None);
 
 /// NOTE: Leaked allocation — not GC-registered. See make_bliss_string note.
 fn ensure_default_table() {
     install_format_global_root_scanner();
+    let default_printer = make_bliss_string("default-printer");
     let mut table = DEFAULT_DISPATCH.lock().unwrap();
     if table.is_none() {
         // Default table with a catch-all entry
-        *table = Some(vec![(NIL, make_bliss_string("default-printer"), 0.0)]);
+        *table = Some(vec![(NIL, default_printer, 0.0)]);
     }
 }
 

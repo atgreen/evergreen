@@ -5,9 +5,9 @@
 //! guard fails. See spec §4.6.
 
 use bliss_rt::error::BlissError;
+use bliss_rt::lock_order::{LockLevel, OrderedMutex};
 use bliss_rt::value::BlissVal;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -30,8 +30,15 @@ const DEOPT_WINDOW: u64 = 10_000;
 /// Keyed by the raw `BlissVal` bits of the function. This allows
 /// `deoptimize()` to accumulate deopt history across calls without
 /// requiring callers to thread a `&mut DeoptLog` through every call site.
-static DEOPT_LOGS: std::sync::LazyLock<Mutex<HashMap<u64, DeoptLog>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static DEOPT_LOGS: std::sync::LazyLock<OrderedMutex<HashMap<u64, DeoptLog>>> =
+    std::sync::LazyLock::new(|| {
+        OrderedMutex::new(
+            LockLevel::Profiling,
+            1,
+            "deoptimization logs",
+            HashMap::new(),
+        )
+    });
 
 /// Monotonic tick counter used for timestamps and sliding-window evaluation.
 static MONOTONIC_TICK: AtomicU32 = AtomicU32::new(0);

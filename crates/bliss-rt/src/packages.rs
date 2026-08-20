@@ -8,16 +8,16 @@
 //! Packages are **pinned and immortal**, like interned symbols — a package lives
 //! for the life of the process, so the object references cached here stay valid.
 //!
-//! Staging: this foundation creates the package objects and the name→package
-//! map (retiring the reader's name-set). The `internal_symbols`/`external_symbols`
-//! cells are `NIL` until the per-package symbol maps are migrated onto them; the
-//! interpreter still tracks package membership in its own maps meanwhile.
+//! The package object owns its internal/external symbol-table references.  The
+//! tables themselves are supplied by the standard-library package layer (which
+//! owns the CL hash-table implementation), while the runtime keeps the object
+//! cells visible to GC, images, the interpreter, and compiled code.
 
 use crate::error::BlissError;
+use crate::lock_order::{LockLevel, OrderedRwLock};
 use crate::object::{type_id, ObjectHeader, PackageData};
 use crate::value::{BlissVal, NIL};
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 /// `PackageData` payload size: name + internal + external + use_list + nicknames
 /// (5×8) + lock pointer (8) = 48 bytes past the header.
@@ -44,7 +44,12 @@ struct PackageRegistry {
     packages: Vec<BlissVal>,
 }
 
-static REGISTRY: RwLock<Option<PackageRegistry>> = RwLock::new(None);
+static REGISTRY: OrderedRwLock<Option<PackageRegistry>> = OrderedRwLock::new(
+    LockLevel::PackageRegistry,
+    3,
+    "runtime package registry",
+    None,
+);
 
 /// Allocate a pinned `SIMPLE_BASE_STRING` (matches the reader/symbol encoding).
 fn alloc_pinned_name(s: &str) -> BlissVal {
@@ -142,7 +147,60 @@ pub fn add_nickname(name: &str, nickname: &str) {
     let pkg = find_or_create(name);
     let key = nickname.to_uppercase();
     with_registry_mut(|reg| {
-        reg.name_to_package.entry(key).or_insert(pkg);
+        // Reader/package prepasses may have provisionally created a package
+        // under the nickname before DEFPACKAGE establishes the real alias.
+        // The package layer has already performed the CL conflict check, so
+        // publishing the authoritative alias must replace that placeholder.
+        reg.name_to_package.insert(key, pkg);
+    });
+}
+
+/// Replace a package's primary name and global nicknames while preserving its
+/// heap identity. Returns an error if a requested name belongs to another
+/// package.
+pub fn rename(pkg: BlissVal, new_name: &str, new_nicknames: &[&str]) -> Result<(), BlissError> {
+    if !crate::types::packagep(pkg) {
+        return Err(BlissError::TypeError {
+            datum: pkg,
+            expected: "PACKAGE".into(),
+        });
+    }
+    let primary = new_name.to_uppercase();
+    let nicknames: Vec<String> = new_nicknames
+        .iter()
+        .map(|name| name.to_uppercase())
+        .collect();
+    with_registry_mut(|reg| {
+        for name in std::iter::once(&primary).chain(nicknames.iter()) {
+            if reg
+                .name_to_package
+                .get(name)
+                .is_some_and(|other| *other != pkg)
+            {
+                return Err(BlissError::PackageError(format!(
+                    "Package name {name:?} is already in use"
+                )));
+            }
+        }
+        reg.name_to_package.retain(|_, package| *package != pkg);
+        reg.name_to_package.insert(primary.clone(), pkg);
+        for nickname in &nicknames {
+            reg.name_to_package.insert(nickname.clone(), pkg);
+        }
+        let name = alloc_pinned_name(&primary);
+        // SAFETY: validated PACKAGE object with fixed pinned layout.
+        unsafe {
+            (*(pkg.as_ptr() as *mut PackageData)).name = name;
+        }
+        Ok(())
+    })
+}
+
+/// Remove all global names for a package. The pinned object remains allocated
+/// so existing references stay valid, but subsequent name lookup cannot find it.
+pub fn unregister(pkg: BlissVal) {
+    with_registry_mut(|reg| {
+        reg.name_to_package.retain(|_, package| *package != pkg);
     });
 }
 
@@ -156,6 +214,42 @@ pub fn package_name(pkg: BlissVal) -> Option<String> {
         let data = pkg.as_ptr() as *const PackageData;
         Some((*data).name.as_string())
     }
+}
+
+/// Return the package's internal and external symbol-table objects.
+pub fn symbol_tables(pkg: BlissVal) -> Option<(BlissVal, BlissVal)> {
+    if !crate::types::packagep(pkg) {
+        return None;
+    }
+    // SAFETY: PACKAGE values use the fixed D1.20 layout and packages are pinned.
+    unsafe {
+        let data = pkg.as_ptr() as *const PackageData;
+        Some(((*data).internal_symbols, (*data).external_symbols))
+    }
+}
+
+/// Install the authoritative internal/external symbol tables in a package.
+///
+/// PACKAGE objects are pinned, so publishing the two tagged references while
+/// holding the stdlib package lock is sufficient.  The GC traces both cells.
+pub fn set_symbol_tables(
+    pkg: BlissVal,
+    internal_symbols: BlissVal,
+    external_symbols: BlissVal,
+) -> Result<(), BlissError> {
+    if !crate::types::packagep(pkg) {
+        return Err(BlissError::TypeError {
+            datum: pkg,
+            expected: "PACKAGE".into(),
+        });
+    }
+    // SAFETY: PACKAGE values use the fixed D1.20 layout and packages are pinned.
+    unsafe {
+        let data = pkg.as_ptr() as *mut PackageData;
+        (*data).internal_symbols = internal_symbols;
+        (*data).external_symbols = external_symbols;
+    }
+    Ok(())
 }
 
 // ── Image serialization (bliss-jtc.6 Stage F) ───────────────────────────────

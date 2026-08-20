@@ -43,7 +43,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameState, ValueSource};
-use crate::t2::ir::{Block, Function, Opcode, Value, ValueDef};
+use crate::t2::ir::{AuxData, Block, Function, Opcode, Value, ValueDef};
 
 /// A single verification failure (spec §4.3.8.1 checks V1–V10).
 #[derive(Clone, Debug)]
@@ -284,16 +284,48 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     }
                 }
 
-                // V8 — guarded layout loads can fail on type, bounds, or
-                // representation and therefore must be ordered guards with
-                // enough state to resume in the generic implementation.
-                if matches!(data.opcode, Opcode::StringByteLength | Opcode::StringAsciiCharAt)
+                // V8 — StringByteLength consumes an explicitly layout-refined
+                // SSA value and is a pure load. StringAsciiCharAt consumes the
+                // same refinement but can still fail its bounds/ASCII assumptions,
+                // so it remains an ordered deopt guard.
+                if matches!(data.opcode, Opcode::StringByteLength | Opcode::StringAsciiCharAt) {
+                    let refined = data.args.first().is_some_and(|value| {
+                        valid_values.contains(&value.0)
+                            && matches!(
+                                f.value(*value).def,
+                                ValueDef::Result { inst, .. }
+                                    if f.inst(inst).opcode == Opcode::Guard
+                                        && matches!(&f.inst(inst).aux, AuxData::StringLayout)
+                            )
+                    });
+                    if !refined {
+                        errors.push(VerifyError::new(
+                            "V8 layout-proof",
+                            format!(
+                                "block{bi} {:?} does not consume a StringLayout guard result",
+                                data.opcode
+                            ),
+                        ));
+                    }
+                }
+                if data.opcode == Opcode::StringByteLength
+                    && (data.flags.guard || data.flags.effectful || data.frame_state.is_some())
+                {
+                    errors.push(VerifyError::new(
+                        "V8 layout-guard-contract",
+                        format!(
+                            "block{bi} layout load {:?} is not a pure refined-value load",
+                            data.opcode
+                        ),
+                    ));
+                }
+                if data.opcode == Opcode::StringAsciiCharAt
                     && (!data.flags.guard || !data.flags.effectful)
                 {
                     errors.push(VerifyError::new(
                         "V8 layout-guard-contract",
                         format!(
-                            "block{bi} layout load {:?} is not an effectful guard",
+                            "block{bi} character load {:?} is not an effectful guard",
                             data.opcode
                         ),
                     ));
@@ -763,14 +795,19 @@ mod tests {
     }
 
     #[test]
-    fn v8_string_layout_load_must_be_an_effectful_guard() {
-        let mut f = Function::new("unguarded_string_load");
+    fn v8_refined_string_byte_length_must_be_pure() {
+        let mut f = Function::new("overguarded_string_load");
         let e = f.entry();
         let string = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
         f.push_inst(
             e,
             InstData {
                 args: vec![string],
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
                 ..inst(Opcode::StringByteLength)
             },
             &[(fixnum(), ValueRepresentation::Tagged)],

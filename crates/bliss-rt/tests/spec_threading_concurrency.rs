@@ -5,13 +5,13 @@ use bliss_rt::safepoint::{
 };
 use bliss_rt::scheduler::{Scheduler, SchedulerConfig};
 use bliss_rt::thread::{
-    GreenThreadId, all_thread_ids, current_thread, current_thread_id, interrupt_thread,
-    join_thread, make_thread,
+    all_thread_ids, current_thread, current_thread_id, interrupt_thread, join_thread, make_fiber,
+    make_thread,
 };
 use bliss_rt::value::{BlissVal, T};
 use std::fs;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -81,9 +81,52 @@ fn read_runtime_source(path: &str) -> String {
 }
 
 #[test]
-#[ignore = "stage 5: concurrency"]
+fn fiber_api_design_is_complete_and_distinct_from_exposed_carrier_threads() {
+    // bliss-jtc.14.4: lock the JVM-style public split into an executable
+    // specification contract before the remaining scheduler implementation is
+    // filled in. Carrier/platform threads and fibers are intentionally not
+    // aliases and are introspected through different packages.
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let extensions = fs::read_to_string(repo.join("spec/09-extensions.md"))
+        .expect("read extension specification");
+    let runtime = fs::read_to_string(repo.join("spec/02-runtime-core.md"))
+        .expect("read runtime specification");
+    let concurrency = fs::read_to_string(repo.join("spec/13-concurrency.md"))
+        .expect("read concurrency specification");
+
+    for api in [
+        "BLISS-THREAD",
+        "BLISS-FIBER",
+        "make-fiber",
+        "submit-fiber",
+        "run-fibers",
+        "start-fibers",
+        "finish-fibers",
+        "fiber-join",
+        "fiber-yield",
+        "fiber-park",
+        "fiber-sleep",
+        "fiber-pin",
+        "fiber-state",
+        "print-fiber-backtrace",
+        "scheduler-group-carriers",
+    ] {
+        assert!(
+            extensions
+                .to_ascii_lowercase()
+                .contains(&api.to_ascii_lowercase()),
+            "fiber API contract must specify {api}"
+        );
+    }
+    assert!(extensions.contains("MAKE-THREAD") && extensions.contains("OS thread"));
+    assert!(runtime.contains("distinct public object"));
+    assert!(concurrency.contains("A thread and a fiber MUST NOT be aliases"));
+    assert!(concurrency.contains("exposed carrier"));
+}
+
+#[test]
 fn make_thread_join_and_registry_cleanup_follow_the_public_thread_api() {
-    // Per R2.04 and R13.18, user-visible green threads run via the public make/join entrypoints.
+    // Per R2.04 and R13.18, user-visible fibers run via the public make/join entrypoints.
     let before = all_thread_ids();
     let id = make_thread(T).expect("thread creation must succeed");
     assert!(all_thread_ids().contains(&id));
@@ -96,7 +139,7 @@ fn make_thread_join_and_registry_cleanup_follow_the_public_thread_api() {
 
 #[test]
 fn function_entries_execute_on_worker_threads_and_return_values() {
-    // Per R2.04, green threads are scheduled onto the worker pool.
+    // Per R2.04, fibers are scheduled onto the carrier pool.
     // Per R13.18, MAKE-THREAD and JOIN-THREAD expose observable thread execution.
     let id = make_thread(unsafe { fn_entry(value_returning_entry) }).expect("thread creation");
     let value = join_thread(id).expect("join must succeed");
@@ -113,7 +156,7 @@ fn invalid_thread_entry_surfaces_a_result_error_not_a_panic() {
 
 #[test]
 fn thread_local_storage_is_isolated_between_green_threads() {
-    // Per R2.05, each green thread has its own control/value stack and thread-local state.
+    // Per R2.05, each fiber has its own control/value stack and thread-local state.
     current_thread().tls_set(0, BlissVal::from_fixnum(7));
     let id = make_thread(unsafe { fn_entry(tls_isolated_entry) }).expect("thread creation");
     let child_value = join_thread(id).expect("join must succeed");
@@ -158,17 +201,19 @@ fn all_threads_reports_a_live_thread_until_join_completes() {
 }
 
 #[test]
-fn scheduler_configuration_and_shutdown_are_observable_through_public_api() {
+fn scheduler_group_exposes_carriers_and_runs_real_fibers() {
     // Per R2.03, the runtime supports a configurable worker-thread pool.
     // Per R13.08, scheduling is exposed through the runtime scheduler surface.
     let scheduler = Scheduler::init(&SchedulerConfig { num_workers: 3 })
         .expect("scheduler with explicit worker count must initialize");
-    let thread_id = GreenThreadId(0xCAFE);
-    scheduler.submit(thread_id).expect("submit must succeed");
-    assert_eq!(scheduler.active_thread_count(), 1);
-    scheduler.shutdown().expect("shutdown must succeed");
-    assert_eq!(scheduler.active_thread_count(), 0);
-    assert!(scheduler.submit(thread_id).is_err());
+    let fiber = make_fiber(T).expect("fiber creation");
+    scheduler.submit(fiber).expect("submit must succeed");
+    assert!(!scheduler.carrier_thread_ids().is_empty());
+    assert!(scheduler
+        .carrier_thread_ids()
+        .iter()
+        .all(|id| all_thread_ids().contains(id)));
+    assert_eq!(scheduler.finish().expect("finish must succeed"), vec![T]);
 }
 
 #[test]
@@ -185,7 +230,6 @@ fn enter_safepoint_publishes_the_current_stack_top() {
 }
 
 #[test]
-#[ignore = "stage 5: concurrency"]
 fn stop_the_world_waits_for_polling_threads_and_resumes_them() {
     // Per R2.07, safepoint polls must be observed by running threads.
     // Per R13.10, stop-the-world uses the safepoint handshake rather than async suspension.
@@ -253,7 +297,6 @@ fn sigint_delivery_is_observable_through_the_runtime_interrupt_flag() {
 }
 
 #[test]
-#[ignore = "stage 5: concurrency"]
 fn safepoint_wait_does_not_block_on_a_thread_executing_native_ffi() {
     // Per R2.15 and R13.11, a thread in Native FFI state must not block a safepoint handshake.
     let libc = bliss_rt::ffi::load_foreign_library("libc.so.6")
@@ -307,7 +350,7 @@ fn runtime_sources_define_the_boot_sequence_and_walkable_stack_metadata() {
     assert!(stack_source.contains("pub prev_fp: *mut Frame"));
     assert!(stack_source.contains("pub fn publish_top(&self)"));
     assert!(stack_source.contains("pub fn stack_map(&self, pc_offset: usize)"));
-    assert!(error_source.contains("StackOverflow(GreenThreadId)"));
+    assert!(error_source.contains("StackOverflow(FiberId)"));
     assert!(
         read_runtime_source("crates/bliss-rt/src/thread.rs").contains("100 000"),
         "threading source must account for the 100,000-thread scalability target"
@@ -359,7 +402,7 @@ fn concurrency_sources_expose_atomic_ordering_locking_and_thread_primitives() {
 
 #[test]
 fn thread_sources_describe_thread_local_dynamic_bindings() {
-    // Per R13.17, each green thread must have its own special-variable binding stack.
+    // Per R13.17, each fiber must have its own special-variable binding stack.
     let thread_source = read_runtime_source("crates/bliss-rt/src/thread.rs");
     let stack_source = read_runtime_source("crates/bliss-rt/src/stack.rs");
 

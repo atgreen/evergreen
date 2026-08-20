@@ -68,8 +68,7 @@ fn source_location_clone_and_debug() {
 
 #[test]
 fn code_info_source_location_returns_none_at_zero() {
-    // CodeInfo has a private field; construct via zero-init transmute.
-    let ci: CodeInfo = unsafe { std::mem::zeroed() };
+    let ci = CodeInfo::empty();
     assert!(
         ci.source_location(0).is_none(),
         "CodeInfo::source_location should return None (stub)"
@@ -78,16 +77,14 @@ fn code_info_source_location_returns_none_at_zero() {
 
 #[test]
 fn code_info_source_location_returns_none_at_nonzero() {
-    // CodeInfo has a private field; construct via zero-init transmute.
-    let ci: CodeInfo = unsafe { std::mem::zeroed() };
+    let ci = CodeInfo::empty();
     assert!(ci.source_location(100).is_none());
     assert!(ci.source_location(usize::MAX).is_none());
 }
 
 #[test]
 fn code_info_stack_map_returns_none_at_zero() {
-    // CodeInfo has a private field; construct via zero-init transmute.
-    let ci: CodeInfo = unsafe { std::mem::zeroed() };
+    let ci = CodeInfo::empty();
     assert!(
         ci.stack_map(0).is_none(),
         "CodeInfo::stack_map should return None (stub)"
@@ -96,8 +93,7 @@ fn code_info_stack_map_returns_none_at_zero() {
 
 #[test]
 fn code_info_stack_map_returns_none_at_nonzero() {
-    // CodeInfo has a private field; construct via zero-init transmute.
-    let ci: CodeInfo = unsafe { std::mem::zeroed() };
+    let ci = CodeInfo::empty();
     assert!(ci.stack_map(42).is_none());
     assert!(ci.stack_map(usize::MAX).is_none());
 }

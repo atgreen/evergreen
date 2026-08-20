@@ -3,13 +3,13 @@
 //! Implements the CLHS §2.2 reader algorithm. See spec §4.1.
 
 use bliss_rt::error::BlissError;
+use bliss_rt::lock_order::{LockLevel, OrderedMutex};
 use bliss_rt::object::{
-    ComplexData, ConsCell, ElementTypeTag, ObjectHeader, PathnameData, RatioData, ReadtableData,
-    type_id,
+    type_id, ComplexData, ConsCell, ElementTypeTag, ObjectHeader, PathnameData, RatioData,
+    ReadtableData,
 };
 use bliss_rt::value::{BlissVal, EOF, MISSING, NIL, T, TAG_HEAP_OBJECT};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 type MacroCharTable = HashMap<(u64, char), (BlissVal, bool)>;
 type DispatchCharTable = HashMap<(u64, char), bool>;
@@ -62,11 +62,19 @@ pub fn make_uninterned_symbol(name: &str) -> BlissVal {
 }
 
 // ── Global macro character tables ─────────────────────────────────
-static MACRO_CHARS: Mutex<Option<MacroCharTable>> = Mutex::new(None);
-static DISPATCH_CHARS: Mutex<Option<DispatchCharTable>> = Mutex::new(None);
-static DISPATCH_SUB_CHARS: Mutex<Option<DispatchSubCharTable>> = Mutex::new(None);
+static MACRO_CHARS: OrderedMutex<Option<MacroCharTable>> =
+    OrderedMutex::new(LockLevel::CodeCache, 1, "reader macro characters", None);
+static DISPATCH_CHARS: OrderedMutex<Option<DispatchCharTable>> =
+    OrderedMutex::new(LockLevel::CodeCache, 2, "reader dispatch characters", None);
+static DISPATCH_SUB_CHARS: OrderedMutex<Option<DispatchSubCharTable>> = OrderedMutex::new(
+    LockLevel::CodeCache,
+    3,
+    "reader dispatch sub-characters",
+    None,
+);
 type ReadEvalHook = fn(BlissVal) -> Result<BlissVal, BlissError>;
-static READ_EVAL_HOOK: Mutex<Option<ReadEvalHook>> = Mutex::new(None);
+static READ_EVAL_HOOK: OrderedMutex<Option<ReadEvalHook>> =
+    OrderedMutex::new(LockLevel::CodeCache, 4, "reader eval hook", None);
 
 pub fn set_read_eval_hook(hook: Option<ReadEvalHook>) {
     let mut guard = READ_EVAL_HOOK.lock().unwrap();
@@ -91,7 +99,8 @@ fn read_eval_hook() -> Option<ReadEvalHook> {
 // when no load environment is active (internal READ-FROM-STRING). Either way
 // those callers keep their existing behaviour.
 type SymbolResolver = fn(Option<&str>, &str) -> Option<u32>;
-static SYMBOL_RESOLVER: Mutex<Option<SymbolResolver>> = Mutex::new(None);
+static SYMBOL_RESOLVER: OrderedMutex<Option<SymbolResolver>> =
+    OrderedMutex::new(LockLevel::CodeCache, 5, "reader symbol resolver", None);
 
 pub fn set_symbol_resolver(hook: Option<SymbolResolver>) {
     *SYMBOL_RESOLVER.lock().unwrap() = hook;
@@ -112,7 +121,8 @@ fn resolve_symbol_via_hook(pkg: Option<&str>, name: &str) -> Option<u32> {
 // PATHNAME object (used only when no interpreter is wired up, e.g. bare reader
 // tests).
 type PathnameConstructor = fn(BlissVal) -> Option<BlissVal>;
-static PATHNAME_CTOR: Mutex<Option<PathnameConstructor>> = Mutex::new(None);
+static PATHNAME_CTOR: OrderedMutex<Option<PathnameConstructor>> =
+    OrderedMutex::new(LockLevel::CodeCache, 6, "reader pathname constructor", None);
 
 pub fn set_pathname_constructor(hook: Option<PathnameConstructor>) {
     *PATHNAME_CTOR.lock().unwrap() = hook;
@@ -289,7 +299,8 @@ fn alloc_bit_vector(bits: &[u8]) -> BlissVal {
 }
 
 fn alloc_readtable() -> BlissVal {
-    let ptr = gc_alloc(std::mem::size_of::<ReadtableData>(), type_id::READTABLE) as *mut ReadtableData;
+    let ptr =
+        gc_alloc(std::mem::size_of::<ReadtableData>(), type_id::READTABLE) as *mut ReadtableData;
     unsafe {
         (*ptr).case_mode = 0; // :upcase
         (*ptr)._pad = [0; 7];
@@ -951,7 +962,11 @@ fn parse_token_with_base(
         .iter()
         .map(
             |&(c, escaped)| {
-                if escaped { c } else { c.to_ascii_uppercase() }
+                if escaped {
+                    c
+                } else {
+                    c.to_ascii_uppercase()
+                }
             },
         )
         .collect();
@@ -1797,8 +1812,8 @@ fn eval_feature_expression(feature: BlissVal) -> bool {
 /// feature the running image has, not just BLISS. Before `*FEATURES*` is bound
 /// (early bootstrap) only BLISS is recognised.
 fn runtime_feature_present(name: &str) -> bool {
-    let features = bliss_rt::symbols::find_index("*FEATURES*")
-        .and_then(bliss_rt::symbols::symbol_value);
+    let features =
+        bliss_rt::symbols::find_index("*FEATURES*").and_then(bliss_rt::symbols::symbol_value);
     let mut list = match features {
         Some(l) if l.is_cons() => l,
         _ => return name.eq_ignore_ascii_case("BLISS"),
@@ -2378,9 +2393,11 @@ pub fn make_dispatch_macro_character(
     non_terminating: bool,
 ) -> Result<(), BlissError> {
     let key = readtable.0 & !bliss_rt::value::TAG_MASK;
-    let mut guard = DISPATCH_CHARS.lock().unwrap();
-    let table = guard.get_or_insert_with(HashMap::new);
-    table.insert((key, ch), non_terminating);
+    {
+        let mut guard = DISPATCH_CHARS.lock().unwrap();
+        let table = guard.get_or_insert_with(HashMap::new);
+        table.insert((key, ch), non_terminating);
+    }
     // Also register as a macro char
     set_macro_character(readtable, ch, T, non_terminating)?;
     Ok(())

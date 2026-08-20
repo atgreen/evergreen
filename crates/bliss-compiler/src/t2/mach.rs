@@ -44,11 +44,43 @@ pub enum Location {
     Stack(StackSlot),
 }
 
+/// Where an allocator-inserted move occurs relative to a machine instruction.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum EditPosition {
+    Before,
+    After,
+}
+
+/// A move inserted by register allocation.  These edits are the authoritative
+/// spill/reload and live-range-splitting operations; reducing regalloc2's output
+/// to one location per VReg loses precisely this information.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct AllocationEdit {
+    pub inst: usize,
+    pub position: EditPosition,
+    pub from: Location,
+    pub to: Location,
+}
+
+/// A precise location interval for one VReg, reported by regalloc2's debug
+/// location facility. Program points use regalloc2's stable raw encoding.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct ValueLocationRange {
+    pub vreg: VReg,
+    pub start: u32,
+    pub end: u32,
+    pub location: Location,
+}
+
 /// A machine instruction over virtual (pre-regalloc) or physical (post-regalloc)
 /// operands. The concrete operand model and opcode set are P5's to define; this
 /// is the frozen envelope P6 and code emission bind to.
 #[derive(Clone, Debug)]
 pub struct MachInst {
+    /// SSA instruction selected into this machine instruction. Allocator edits
+    /// and operand locations can therefore be related back to FrameStates,
+    /// deopt guards, and the live framed emitter without re-deriving order.
+    pub source_inst: Option<crate::t2::ir::Inst>,
     /// Backend mnemonic / selector tag (P5-defined encoding).
     pub op: u32,
     pub defs: Vec<VReg>,
@@ -99,7 +131,20 @@ pub struct MachFunc {
     /// single-block view over `insts` is the fallback P6 uses in that case).
     pub blocks: Vec<MachBlock>,
     /// Virtual-register → assigned location, filled in by P6.
+    ///
+    /// This is retained as a summary for diagnostics and legacy deopt tests.
+    /// Emission MUST use `inst_allocations` plus `allocation_edits`, because a
+    /// split live range can occupy different locations at different uses.
     pub allocation: Vec<(VReg, Location)>,
+    /// Operand-parallel locations for each `MachInst` (defs first, then uses).
+    pub inst_allocations: Vec<Vec<Location>>,
+    /// Ordered moves inserted by regalloc2 for spills, reloads, and splits.
+    pub allocation_edits: Vec<AllocationEdit>,
+    /// Number of eight-byte spill slots required by this function.
+    pub num_spill_slots: u32,
+    /// Split-aware location ranges used by deopt/OSR metadata and by the framed
+    /// backend while it is migrated off its old global register map.
+    pub value_locations: Vec<ValueLocationRange>,
     /// Per-safepoint GC stack maps, filled in by P6 (spec §4.7 R4.46).
     pub stack_maps: Vec<StackMap>,
 }

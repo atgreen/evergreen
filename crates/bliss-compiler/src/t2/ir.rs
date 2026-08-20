@@ -123,10 +123,12 @@ pub enum Opcode {
     GenericEq, GenericEqual, TypeCheck, InstanceOf,
     // Cat 4 — memory / object access (effectful unless proven immutable)
     Load, Car, Cdr, VecRef, SymbolValue,
-    /// Guarded direct load of the UTF-8 byte length from a simple string.
+    /// Direct UTF-8 byte-length load from a value refined by a preceding
+    /// `Guard` carrying `AuxData::StringLayout`.
     StringByteLength,
-    /// Guarded simple-string byte access for an ASCII character. Non-ASCII,
-    /// wrong-type, negative, and out-of-bounds cases deopt to CL:CHAR.
+    /// Simple-string byte access for an ASCII character.  Its string operand
+    /// is refined by a preceding `StringLayout` guard; negative, out-of-bounds,
+    /// and non-ASCII cases deopt to CL:CHAR.
     StringAsciiCharAt,
     Store, SetCar, SetCdr, VecSet, SetSymbolValue, WriteBarrier,
     Alloc, AllocCons,
@@ -185,6 +187,10 @@ pub enum AuxData {
     FieldOffset(u32),
     CallTarget(u32),
     TypeTag(IRType),
+    /// Refines a tagged value to the simple string layouts supported by direct
+    /// T2 loads.  Kept distinct from `TypeTag(STRING)`: the latter includes
+    /// string representations whose layout still requires generic dispatch.
+    StringLayout,
     ClassRef(u32),
 }
 
@@ -231,6 +237,17 @@ pub struct BlockData {
     pub insts: Vec<Inst>,
 }
 
+/// A bytecode loop header that may be entered from an already-running lower
+/// tier activation.  The frame state names the live locals at the header after
+/// all SSA rewrites, so the emitter can reconstruct its register state from the
+/// shared BlissStack frame.
+#[derive(Clone, Debug)]
+pub struct OsrEntry {
+    pub bcp: u32,
+    pub block: Block,
+    pub frame_state: crate::t2::frame_state::FrameStateId,
+}
+
 // ── Function ────────────────────────────────────────────────────────
 
 /// A block-based SSA function (spec §4.3.2.1).
@@ -246,6 +263,12 @@ pub struct Function {
     pub frame_states: crate::t2::frame_state::FrameStateTable,
     /// Interned source positions (spec §4.3.7); id 0 is "unknown".
     pub source_positions: Vec<SourcePosition>,
+    /// Root-function loop headers eligible for on-stack replacement.
+    pub osr_entries: Vec<OsrEntry>,
+    /// Entry parameters whose source declaration is enforced by the runtime
+    /// call boundary. This is deliberately separate from `ValueData::ty`: an
+    /// inferred/speculative type is not permission to omit its runtime guard.
+    checked_entry_params: Vec<Value>,
     name: String,
 }
 
@@ -270,6 +293,8 @@ impl Function {
             entry: Block(0),
             frame_states: crate::t2::frame_state::FrameStateTable::default(),
             source_positions: vec![SourcePosition::default()],
+            osr_entries: Vec::new(),
+            checked_entry_params: Vec::new(),
             name: name.into(),
         };
         let entry = f.make_block();
@@ -290,6 +315,16 @@ impl Function {
     pub fn num_blocks(&self) -> usize { self.blocks.len() }
     pub fn num_insts(&self) -> usize { self.insts.len() }
     pub fn num_values(&self) -> usize { self.values.len() }
+
+    pub fn mark_entry_param_checked(&mut self, value: Value) {
+        if !self.checked_entry_params.contains(&value) {
+            self.checked_entry_params.push(value);
+        }
+    }
+
+    pub fn is_entry_param_checked(&self, value: Value) -> bool {
+        self.checked_entry_params.contains(&value)
+    }
 
     /// Whether a handle is in range for this function's arenas. Verification
     /// (P2) and any pass handling possibly-malformed IR should gate on these

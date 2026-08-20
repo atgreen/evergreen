@@ -16,6 +16,8 @@ use bliss_rt::bytecode::{BytecodeFunction, Instr};
 pub enum KnownFunction {
     Eq,
     Null,
+    Car,
+    Cdr,
     Consp,
     Symbolp,
     Integerp,
@@ -29,6 +31,10 @@ pub enum KnownFunction {
 pub enum IntrinsicId {
     Eq,
     Null,
+    /// Guard the argument as a cons and load its first field.
+    Car,
+    /// Guard the argument as a cons and load its second field.
+    Cdr,
     Consp,
     Symbolp,
     Integerp,
@@ -95,6 +101,24 @@ const KNOWN: &[InlineMetadata] = &[
         effects: EffectSummary::PURE_TOTAL,
         cost: 2,
         expansion: IntrinsicId::Null,
+    },
+    InlineMetadata {
+        function: KnownFunction::Car,
+        namespace: FunctionNamespace::CommonLisp,
+        name: "CAR",
+        fixed_arity: 1,
+        effects: EffectSummary::PURE_TOTAL,
+        cost: 2,
+        expansion: IntrinsicId::Car,
+    },
+    InlineMetadata {
+        function: KnownFunction::Cdr,
+        namespace: FunctionNamespace::CommonLisp,
+        name: "CDR",
+        fixed_arity: 1,
+        effects: EffectSummary::PURE_TOTAL,
+        cost: 2,
+        expansion: IntrinsicId::Cdr,
     },
     InlineMetadata {
         function: KnownFunction::Consp,
@@ -195,6 +219,9 @@ pub struct InlineConfig {
     pub small_threshold: u32,
     pub max_depth: u8,
     pub node_budget: u32,
+    /// Minimum calls per 100 profiled caller invocations for a call site to
+    /// receive the larger, budget-limited hot-site allowance.
+    pub hot_frequency_percent: u8,
 }
 
 impl Default for InlineConfig {
@@ -203,7 +230,26 @@ impl Default for InlineConfig {
             small_threshold: 30,
             max_depth: 6,
             node_budget: 500,
+            hot_frequency_percent: 80,
         }
+    }
+}
+
+/// Runtime frequency sample for one bytecode call site. Both counters cover
+/// the same T0/T1 sampling window so their ratio remains meaningful while the
+/// caller moves between those tiers.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct CallSiteProfile {
+    pub calls: u32,
+    pub caller_invocations: u32,
+}
+
+impl CallSiteProfile {
+    fn is_hot(self, threshold_percent: u8) -> bool {
+        self.calls > 0
+            && self.caller_invocations > 0
+            && u64::from(self.calls) * 100
+                >= u64::from(self.caller_invocations) * u64::from(threshold_percent)
     }
 }
 
@@ -215,6 +261,7 @@ pub struct InlineOptions {
     pub config: InlineConfig,
     policies: HashMap<u32, InlinePolicy>,
     bodies: HashMap<u32, Rc<BytecodeFunction>>,
+    call_sites: HashMap<(u32, u32), CallSiteProfile>,
     root_symbol: Option<u32>,
 }
 
@@ -226,6 +273,31 @@ impl InlineOptions {
 
     pub fn policy_at(&self, bcp: u32) -> InlinePolicy {
         self.policies.get(&bcp).copied().unwrap_or_default()
+    }
+
+    /// Attach production profile counters for call-site `bcp` in `caller`.
+    pub fn with_call_site_profile(
+        mut self,
+        caller: u32,
+        bcp: u32,
+        calls: u32,
+        caller_invocations: u32,
+    ) -> Self {
+        self.call_sites.insert(
+            (caller, bcp),
+            CallSiteProfile {
+                calls,
+                caller_invocations,
+            },
+        );
+        self
+    }
+
+    pub(crate) fn call_site_is_hot(&self, caller: u32, bcp: u32) -> bool {
+        self.call_sites
+            .get(&(caller, bcp))
+            .copied()
+            .is_some_and(|p| p.is_hot(self.config.hot_frequency_percent))
     }
 
     /// Make a saved bytecode body available to the body inliner.  Merely being
@@ -287,6 +359,9 @@ pub(crate) fn body_cost(
             || body.has_env
             || body.max_args != Some(body.arity)
             || body.min_args != body.arity
+            // Until the inline boundary grows an explicit checked assertion,
+            // cloning a declared body would bypass the callee-entry validator.
+            || body.param_types.iter().any(|ty| !ty.is_any())
         {
             return Err(DeclineReason::UnsupportedBody);
         }
@@ -345,6 +420,7 @@ pub fn decide(
     metadata: &InlineMetadata,
     nargs: u16,
     policy: InlinePolicy,
+    hot: bool,
     depth: u8,
     remaining_budget: u32,
     config: InlineConfig,
@@ -370,7 +446,7 @@ pub fn decide(
     if metadata.cost > remaining_budget {
         return InlineDecision::Decline(DeclineReason::Budget);
     }
-    if metadata.cost <= config.small_threshold || policy == InlinePolicy::Inline {
+    if metadata.cost <= config.small_threshold || hot || policy == InlinePolicy::Inline {
         InlineDecision::Expand(metadata.expansion)
     } else {
         InlineDecision::Decline(DeclineReason::NotProfitable)
@@ -391,6 +467,7 @@ mod tests {
             names: vec![],
             restart_cases: vec![],
             param_layout: vec![],
+            param_types: vec![],
             has_env: false,
             n_locals: 1,
             max_stack: 1,
@@ -414,19 +491,27 @@ mod tests {
     fn hard_limits_and_notinline_win() {
         let config = InlineConfig::default();
         assert_eq!(
-            decide(eq(), 2, InlinePolicy::NotInline, 0, 500, config),
+            decide(eq(), 2, InlinePolicy::NotInline, true, 0, 500, config),
             InlineDecision::Decline(DeclineReason::NotInline)
         );
         assert_eq!(
-            decide(eq(), 1, InlinePolicy::Inline, 0, 500, config),
+            decide(eq(), 1, InlinePolicy::Inline, true, 0, 500, config),
             InlineDecision::Decline(DeclineReason::WrongArity)
         );
         assert_eq!(
-            decide(eq(), 2, InlinePolicy::Inline, config.max_depth, 500, config),
+            decide(
+                eq(),
+                2,
+                InlinePolicy::Inline,
+                true,
+                config.max_depth,
+                500,
+                config
+            ),
             InlineDecision::Decline(DeclineReason::DepthLimit)
         );
         assert_eq!(
-            decide(eq(), 2, InlinePolicy::Inline, 0, 0, config),
+            decide(eq(), 2, InlinePolicy::Inline, true, 0, 0, config),
             InlineDecision::Decline(DeclineReason::Budget)
         );
     }
@@ -437,29 +522,61 @@ mod tests {
         large.cost = 40;
         let config = InlineConfig::default();
         assert_eq!(
-            decide(&large, 2, InlinePolicy::Unspecified, 0, 500, config),
+            decide(&large, 2, InlinePolicy::Unspecified, false, 0, 500, config),
             InlineDecision::Decline(DeclineReason::NotProfitable)
         );
         assert_eq!(
-            decide(&large, 2, InlinePolicy::Inline, 0, 500, config),
+            decide(&large, 2, InlinePolicy::Inline, false, 0, 500, config),
             InlineDecision::Expand(IntrinsicId::Eq)
         );
+        assert_eq!(
+            decide(&large, 2, InlinePolicy::Unspecified, true, 0, 500, config),
+            InlineDecision::Expand(IntrinsicId::Eq),
+            "a hot site receives the larger budget-limited allowance"
+        );
+    }
+
+    #[test]
+    fn call_site_hotness_uses_runtime_frequency_ratio() {
+        let caller = bliss_rt::symbols::intern("PROFILED-INLINE-CALLER");
+        let options = InlineOptions::default()
+            .with_call_site_profile(caller, 7, 7, 10)
+            .with_call_site_profile(caller, 8, 8, 10);
+        assert!(!options.call_site_is_hot(caller, 7));
+        assert!(options.call_site_is_hot(caller, 8));
     }
 
     #[test]
     fn symbol_lookup_returns_stable_identity_and_rejects_other_packages() {
         let eq_symbol = bliss_rt::symbols::intern("EQ");
-        assert_eq!(metadata_for_symbol(eq_symbol).map(|m| m.function), Some(KnownFunction::Eq));
+        assert_eq!(
+            metadata_for_symbol(eq_symbol).map(|m| m.function),
+            Some(KnownFunction::Eq)
+        );
 
         let shadow = bliss_rt::symbols::intern("SOME-OTHER-PACKAGE:EQ");
         assert_eq!(metadata_for_symbol(shadow), None);
+
+        for (name, function) in [("CAR", KnownFunction::Car), ("CDR", KnownFunction::Cdr)] {
+            assert_eq!(
+                metadata_for_symbol(bliss_rt::symbols::intern(name)).map(|m| m.function),
+                Some(function)
+            );
+            assert_eq!(
+                metadata_for_symbol(bliss_rt::symbols::intern(&format!("OTHER:{name}"))),
+                None
+            );
+        }
 
         let first_char = bliss_rt::symbols::intern("UIOP/UTILITY:FIRST-CHAR");
         assert_eq!(
             metadata_for_symbol(first_char).map(|m| m.function),
             Some(KnownFunction::FirstChar)
         );
-        assert_eq!(metadata_for_symbol(bliss_rt::symbols::intern("FIRST-CHAR")), None);
+        assert_eq!(
+            metadata_for_symbol(bliss_rt::symbols::intern("FIRST-CHAR")),
+            None
+        );
         assert_eq!(
             metadata_for_symbol(bliss_rt::symbols::intern("OTHER:FIRST-CHAR")),
             None
@@ -473,15 +590,26 @@ mod tests {
             bliss_rt::symbols::intern("INLINE-CLOSURE"),
             bliss_rt::symbols::intern("INLINE-NLX"),
             bliss_rt::symbols::intern("INLINE-VARIADIC"),
+            bliss_rt::symbols::intern("INLINE-DECLARED"),
         ];
         let mut variadic = saved_body(vec![Instr::LoadLocal(0), Instr::Return]);
         Rc::get_mut(&mut variadic).unwrap().variadic = true;
         Rc::get_mut(&mut variadic).unwrap().max_args = None;
+        let mut declared = saved_body(vec![Instr::LoadLocal(0), Instr::Return]);
+        Rc::get_mut(&mut declared).unwrap().param_types =
+            vec![bliss_rt::bytecode::DeclaredType::Fixnum];
         let options = InlineOptions::default()
-            .with_body(symbols[0], saved_body(vec![Instr::StoreGlobal(7), Instr::Return]))
-            .with_body(symbols[1], saved_body(vec![Instr::MakeClosureEnv(0), Instr::Return]))
+            .with_body(
+                symbols[0],
+                saved_body(vec![Instr::StoreGlobal(7), Instr::Return]),
+            )
+            .with_body(
+                symbols[1],
+                saved_body(vec![Instr::MakeClosureEnv(0), Instr::Return]),
+            )
             .with_body(symbols[2], saved_body(vec![Instr::Throw, Instr::Return]))
-            .with_body(symbols[3], variadic);
+            .with_body(symbols[3], variadic)
+            .with_body(symbols[4], declared);
 
         for symbol in symbols {
             assert_eq!(

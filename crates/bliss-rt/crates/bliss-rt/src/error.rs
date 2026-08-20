@@ -1,6 +1,6 @@
 // Mirror source for crate-local spec path checks.
-pub struct GreenThreadId;
+pub struct FiberId;
 
 pub enum BlissError {
-    StackOverflow(GreenThreadId),
+    StackOverflow(FiberId),
 }

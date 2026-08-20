@@ -14,6 +14,24 @@ const BIN: &str = env!("CARGO_BIN_EXE_bliss-cli");
 fn run(program: &str, envs: &[(&str, &str)]) -> (String, bool) {
     let mut cmd = Command::new(BIN);
     cmd.args(["--eval", program]);
+    // Tier controls are per-test inputs, not ambient developer-shell state.
+    for name in [
+        "BLISS_T0_T1_THRESHOLD",
+        "BLISS_T1_THRESHOLD",
+        "BLISS_T1_T2_INVOKE_THRESHOLD",
+        "BLISS_T1_T2_THRESHOLD",
+        "BLISS_T2_THRESHOLD",
+        "BLISS_T1_T2_BACKEDGE_THRESHOLD",
+        "BLISS_LOOP_HEAT_THRESHOLD",
+        "BLISS_T2",
+        "BLISS_DISABLE_T2",
+        "BLISS_OSR_THRESHOLD",
+        "BLISS_T2_THREADS",
+        "BLISS_COMPILE_QUEUE_SIZE",
+        "BLISS_DEOPT_BLACKLIST_THRESHOLD",
+    ] {
+        cmd.env_remove(name);
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -22,6 +40,267 @@ fn run(program: &str, envs: &[(&str, &str)]) -> (String, bool) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         out.status.success(),
     )
+}
+
+/// A single long call starts in installed T1, queues T2 from a sampled
+/// backward branch, then enters the optimized loop without returning to the
+/// dispatcher. The high invocation and old T0-OSR thresholds rule out either
+/// of those promotion paths. A back-edge count far below N is also direct
+/// evidence that T1 stopped executing when T2 took over.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn running_t1_loop_osrs_into_background_compiled_t2() {
+    let program = "\
+        (defun live-osr (n) \
+          (let ((sum 0)) \
+            (dotimes (i n sum) (setq sum (+ sum i))))) \
+        (live-osr 1) (live-osr 2) \
+        (format t \"~a~%\" (bliss-ext:function-tier (quote live-osr))) \
+        (let ((answer (live-osr 10000000))) \
+          (format t \"~a ~a ~a~%\" answer \
+            (bliss-ext:function-tier (quote live-osr)) \
+            (bliss-ext:function-back-edge-count (quote live-osr))))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "100000000"),
+            ("BLISS_T1_T2_BACKEDGE_THRESHOLD", "1000"),
+            ("BLISS_OSR_THRESHOLD", "100000000"),
+            ("BLISS_T2_THREADS", "1"),
+        ],
+    );
+    assert!(ok, "live T1→T2 OSR failed: {out}");
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.first().copied(), Some("1"), "long call must start from T1: {out}");
+    let fields: Vec<_> = lines.get(1).unwrap_or(&"").split_whitespace().collect();
+    assert_eq!(fields.first().copied(), Some("49999995000000"), "OSR result: {out}");
+    assert_eq!(fields.get(1).copied(), Some("2"), "T2 must publish during the call: {out}");
+    let back_edges: u32 = fields.get(2).unwrap_or(&"0").parse().unwrap_or(0);
+    assert!(
+        (1000..10_000_000).contains(&back_edges),
+        "T1 should hand off before completing all iterations: {out}"
+    );
+}
+
+/// A guard failure after the live T1→T2 handoff must preserve the operand stack
+/// reconstructed by T2. This overflows one million iterations before loop end,
+/// forcing precise T2→T0 deopt and bignum completion on the same activation.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn t1_to_t2_osr_guard_deopts_with_exact_live_state() {
+    let program = "\
+        (defun live-osr-overflow (n) \
+          (let ((sum 1152921504601846975)) \
+            (dotimes (i n sum) (setq sum (+ sum 1))))) \
+        (live-osr-overflow 1) (live-osr-overflow 2) \
+        (format t \"~a~%\" (bliss-ext:function-tier (quote live-osr-overflow))) \
+        (let ((before (bliss-ext:deopt-count)) \
+              (answer (live-osr-overflow 6000000))) \
+          (format t \"~a ~a ~a~%\" answer \
+            (bliss-ext:function-tier (quote live-osr-overflow)) \
+            (- (bliss-ext:deopt-count) before)))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "100000000"),
+            ("BLISS_T1_T2_BACKEDGE_THRESHOLD", "1000"),
+            ("BLISS_OSR_THRESHOLD", "100000000"),
+            ("BLISS_T2_THREADS", "1"),
+        ],
+    );
+    assert!(ok, "live T2 guard deopt failed: {out}");
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.first().copied(), Some("1"), "long call must start from T1: {out}");
+    let fields: Vec<_> = lines.get(1).unwrap_or(&"").split_whitespace().collect();
+    assert_eq!(
+        fields.first().copied(),
+        Some("1152921504607846975"),
+        "OSR/deopt must complete with the exact bignum result: {out}"
+    );
+    assert_eq!(fields.get(1).copied(), Some("2"), "T2 must remain installed: {out}");
+    let deopts: u64 = fields.get(2).unwrap_or(&"0").parse().unwrap_or(0);
+    assert!(deopts >= 1, "the overflow guard must deopt: {out}");
+}
+
+/// With all tier-control variables absent, the default thresholds eventually
+/// install T2. This is the regression test for removing the old opt-in gate.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn default_tiering_reaches_t2_without_any_t2_environment_variable() {
+    let program = "\
+        (defun default-tier (x) (* x 5)) \
+        (dotimes (i 5010) (default-tier i)) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote default-tier)) (default-tier 7))";
+    let (out, ok) = run(program, &[]);
+    assert!(ok, "default automatic tiering failed: {out}");
+    assert_eq!(
+        out.lines().next(),
+        Some("2 35"),
+        "default settings must reach T2 without BLISS_T2=1: {out}"
+    );
+}
+
+/// A sustained numeric phase change invalidates only the stale speculative T2
+/// version. Dispatch keeps a generic native T1 fallback installed while the
+/// profile compiles the opposite specialization; it must not permanently drop
+/// the function to T0. Exercise both Fixnum→SingleFloat and the reverse.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn numeric_phase_changes_recompile_t2_instead_of_blacklisting() {
+    let program = "\
+        (defun phase-number (x) (* x 5)) \
+        (dotimes (i 20) (phase-number i)) \
+        (format t \"initial=~a~%\" \
+          (bliss-ext:function-tier (quote phase-number))) \
+        (dotimes (i 20) (phase-number 2.5)) \
+        (format t \"float=~a tier=~a~%\" (phase-number 2.5) \
+          (bliss-ext:function-tier (quote phase-number))) \
+        (disassemble (quote phase-number)) \
+        (dotimes (i 20) (phase-number 7)) \
+        (format t \"fixnum=~a tier=~a~%\" (phase-number 7) \
+          (bliss-ext:function-tier (quote phase-number))) \
+        (disassemble (quote phase-number))";
+
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T2", "1"),
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_DEOPT_BLACKLIST_THRESHOLD", "3"),
+            ("BLISS_T2_THREADS", "1"),
+        ],
+    );
+    assert!(ok, "numeric phase-change program failed: {out}");
+    assert!(out.lines().any(|line| line == "initial=2"), "{out}");
+    assert!(out.lines().any(|line| line == "float=12.5 tier=2"), "{out}");
+    assert!(out.lines().any(|line| line == "fixnum=35 tier=2"), "{out}");
+    assert!(out.contains("mulss xmm0,xmm1"), "missing float T2 version:\n{out}");
+    assert!(out.lines().any(|line| line.contains("imul ")), "missing fixnum T2 version:\n{out}");
+}
+
+/// The shipping dispatcher has two real transitions. With T2 enabled by
+/// default, the function is first observable at T1 and only later crosses the
+/// independent T1→T2 invocation threshold; no `BLISS_T2=1` opt-in is used.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn automatic_tiering_observably_progresses_t0_to_t1_to_t2() {
+    let program = "\
+        (defun auto-tier (x) (* x 5)) \
+        (auto-tier 1) (auto-tier 2) (auto-tier 3) \
+        (format t \"~a~%\" (bliss-ext:function-tier (quote auto-tier))) \
+        (auto-tier 4) (auto-tier 5) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote auto-tier)) (auto-tier 7))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "5"),
+        ],
+    );
+    assert!(ok, "automatic tiering run failed: {out}");
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.first().copied(), Some("1"), "T1 must be observable first: {out}");
+    assert_eq!(lines.get(1).copied(), Some("2 35"), "T2 tier/result: {out}");
+}
+
+/// Reaching the T2 threshold is a request, not permission to discard working
+/// code. A variadic body unsupported by the T2 entry ABI keeps its T1 entry.
+#[test]
+fn automatic_t2_decline_retains_t1() {
+    let program = "\
+        (defun auto-rest (&rest xs) (length xs)) \
+        (auto-rest 1) (auto-rest 1 2) (auto-rest 1 2 3) \
+        (auto-rest 1) (auto-rest 1 2) (auto-rest 1 2 3) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote auto-rest)) (auto-rest 1 2 3 4))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "5"),
+        ],
+    );
+    assert!(ok, "T2-decline run failed: {out}");
+    assert_eq!(out.lines().next(), Some("1 4"), "declined T2 must retain T1: {out}");
+}
+
+/// T2 can be disabled for differential/debug runs without restoring the old
+/// opt-in model: normal operation is automatic, while the explicit switch pins
+/// an otherwise-hot function at its working T1 entry.
+#[test]
+fn explicit_t2_disable_pins_hot_function_at_t1() {
+    let program = "\
+        (defun no-t2 (x) (* x 5)) \
+        (dotimes (i 10) (no-t2 i)) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote no-t2)) (no-t2 7))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "5"),
+            ("BLISS_DISABLE_T2", "1"),
+        ],
+    );
+    assert!(ok, "T2-disabled run failed: {out}");
+    assert_eq!(out.lines().next(), Some("1 35"), "disable switch must retain T1: {out}");
+}
+
+/// Once a caller becomes native, its c2i calls still count and promote the
+/// callee. The variadic caller deliberately stays T1 so the fixed-arity leaf is
+/// reached through the native adapter long enough to become T2.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn native_caller_continues_warming_callee_to_t2() {
+    let program = "\
+        (defun warm-leaf (x) (* x 5)) \
+        (defun warm-driver (&rest xs) (warm-leaf (car xs))) \
+        (dotimes (i 10) (warm-driver i)) \
+        (format t \"~a ~a ~a~%\" \
+          (bliss-ext:function-tier (quote warm-driver)) \
+          (bliss-ext:function-tier (quote warm-leaf)) \
+          (warm-driver 7))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "5"),
+        ],
+    );
+    assert!(ok, "native-caller warmup failed: {out}");
+    assert_eq!(out.lines().next(), Some("1 2 35"), "callee must reach T2: {out}");
+}
+
+/// Loop heat accumulated in T0 is an independent T1→T2 trigger. The high
+/// invocation threshold proves the third call promotes because of back-edges.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn automatic_t2_promotion_uses_backedge_threshold() {
+    let program = "\
+        (defun auto-loop (n) \
+          (let ((sum 0)) \
+            (dotimes (i n sum) (setq sum (+ sum i))))) \
+        (auto-loop 20) (auto-loop 2) \
+        (format t \"~a~%\" (bliss-ext:function-tier (quote auto-loop))) \
+        (auto-loop 3) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote auto-loop)) (auto-loop 10))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "1000"),
+            ("BLISS_T1_T2_BACKEDGE_THRESHOLD", "5"),
+        ],
+    );
+    assert!(ok, "back-edge tiering run failed: {out}");
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.first().copied(), Some("1"), "loop reaches T1 first: {out}");
+    assert_eq!(lines.get(1).copied(), Some("2 45"), "loop reaches T2 from heat: {out}");
 }
 
 /// A hot loop's back-edge counter is observable and reflects the trip count,
@@ -351,7 +630,7 @@ fn body_inline_deopt_reconstructs_callee_and_caller() {
     let line = out.lines().next().unwrap_or("");
     assert_eq!(
         line,
-        "1 NIL 1 NIL 61 2",
+        "2 NIL 2 NIL 61 2",
         "effectful/pure tiers and results, side effects, deopts: {line:?}"
     );
 
@@ -359,6 +638,235 @@ fn body_inline_deopt_reconstructs_callee_and_caller() {
     assert!(tw_ok, "tree-walker oracle failed: {tw}");
     let fields: Vec<_> = tw.lines().next().unwrap_or("").split_whitespace().collect();
     assert_eq!(&fields[1..5], &["NIL", "0", "NIL", "61"]);
+}
+
+/// Two independently built callee bodies each carry a simple-string layout
+/// proof.  Once both bodies are cloned into the caller, the production T2
+/// GuardElim pass must retain only the first dominating proof.  This exercises
+/// the real binary/pipeline rather than a FIRST-CHAR-specific template shortcut.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn body_inlining_eliminates_redundant_layout_guards() {
+    let prog = "\
+        (defpackage :uiop/utility (:use :cl) (:export :first-char)) \
+        (in-package :uiop/utility) \
+        (defun first-char (s) \
+          (and (stringp s) (plusp (length s)) (char s 0))) \
+        (in-package :cl-user) \
+        (defun guarded-leaf (s) (uiop/utility:first-char s)) \
+        (defun guarded-pair (s) (guarded-leaf s) (guarded-leaf s)) \
+        (dotimes (k 60) (guarded-pair \"warm\")) \
+        (format t \"~a ~a~%\" (guarded-pair \"abc\") (guarded-pair \"\")) \
+        (disassemble (quote guarded-pair))";
+
+    let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
+    assert!(ok, "general post-inline guard elimination failed: {out}");
+    assert_eq!(out.lines().next().unwrap_or(""), "a NIL");
+    assert!(out.contains("[tier: T2 (native, profile-guided)]"), "{out}");
+    assert_eq!(
+        out.matches("cmp byte [rdx+7],5").count(),
+        1,
+        "two inlined guarded bodies must share one base-string layout proof:\n{out}"
+    );
+    assert_eq!(
+        out.matches("cmp byte [rdx+7],6").count(),
+        1,
+        "two inlined guarded bodies must share one character-string layout proof:\n{out}"
+    );
+}
+
+/// A saved callee deliberately larger than the ordinary 30-bytecode threshold
+/// is nevertheless cloned because its call site executes on every interpreted
+/// caller invocation.  The caller itself contains no string operation, so the
+/// layout fast path in its T2 code is direct evidence that production profile
+/// counters granted the hot-site allowance.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn hot_call_site_inlines_body_above_small_threshold() {
+    let prog = "\
+        (defpackage :uiop/utility (:use :cl) (:export :first-char)) \
+        (in-package :uiop/utility) \
+        (defun first-char (s) \
+          (and (stringp s) (plusp (length s)) (char s 0))) \
+        (in-package :cl-user) \
+        (defun large-leaf (s) \
+          s s s s s s s s s s s s s s s s s s s s \
+          (uiop/utility:first-char s)) \
+        (defun hot-caller (s) (large-leaf s)) \
+        (dotimes (k 60) (hot-caller \"warm\")) \
+        (format t \"~a~%\" (hot-caller \"Bliss\")) \
+        (disassemble (quote hot-caller))";
+
+    let (out, ok) = run(prog, &[("BLISS_T2", "1")]);
+    assert!(ok, "profile-guided large-body inline failed: {out}");
+    assert_eq!(out.lines().next().unwrap_or(""), "B");
+    assert!(out.contains("[tier: T2 (native, profile-guided)]"), "{out}");
+    assert!(
+        out.contains("cmp byte [rdx+7],5") && out.contains("cmp byte [rdx+7],6"),
+        "HOT-CALLER has no string operation of its own; its native layout checks prove LARGE-LEAF was inlined:\n{out}"
+    );
+}
+
+/// A checked parameter declaration becomes an entry proof for T2. The call is
+/// still safe at `(safety 1)`: a wrong argument signals TYPE-ERROR, while the
+/// native multiplication consumes the proof and therefore carries no redundant
+/// fixnum tag guard. Overflow remains guarded because FIXNUM input alone does
+/// not prove that the mathematical result fits a fixnum.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn declared_fixnum_parameter_removes_arithmetic_type_guard() {
+    let program = "\
+        (defun declared-mul5 (x) \
+          (declare (type fixnum x) (optimize (speed 3) (safety 1))) \
+          (* x 5)) \
+        (dotimes (k 60) (declared-mul5 k)) \
+        (format t \"~a~%\" (declared-mul5 9)) \
+        (disassemble (quote declared-mul5)) \
+        (format t \"~a~%\" \
+          (handler-case \
+            (progn (declared-mul5 1.5) (quote missed-type-error)) \
+            (type-error () (quote type-error)))) \
+        (format t \"~a~%\" (declared-mul5 1152921504606846975))";
+
+    let (out, ok) = run(program, &[("BLISS_T2", "1")]);
+    assert!(ok, "declared T2 function failed: {out}");
+    assert_eq!(out.lines().next().unwrap_or(""), "45");
+    assert!(out.contains("[tier: T2 (native, profile-guided)]"), "{out}");
+    assert!(out.contains("checked parameter declarations: X: FIXNUM"), "{out}");
+    assert!(
+        out.lines().any(|line| line.contains("imul ") && line.ends_with(",5")),
+        "expected direct declared fixnum multiply in allocated registers:\n{out}"
+    );
+    assert!(!out.contains("test cl,7"), "declaration proof should remove the operation guard:\n{out}");
+    assert!(out.contains("jo near"), "fixnum overflow must remain guarded:\n{out}");
+    assert!(
+        out.lines().any(|line| line == "TYPE-ERROR"),
+        "wrong declared argument must be caught as TYPE-ERROR:\n{out}"
+    );
+    assert!(
+        out.lines().any(|line| line == "5764607523034234875"),
+        "overflow must deopt to exact bignum multiplication:\n{out}"
+    );
+}
+
+#[test]
+fn declared_parameter_validation_is_shared_by_t0_and_t1() {
+    let program = "\
+        (defun declared-entry (x) (declare (type fixnum x)) x) \
+        (declared-entry 1) (declared-entry 2) (declared-entry 3) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote declared-entry)) \
+          (handler-case \
+            (progn (declared-entry 1.5) (quote missed-type-error)) \
+            (type-error () (quote type-error))))";
+
+    let (t0, t0_ok) = run(program, &[("BLISS_T1_THRESHOLD", "1000")]);
+    assert!(t0_ok, "T0 declaration validation failed: {t0}");
+    assert_eq!(t0.lines().next().unwrap_or(""), "0 TYPE-ERROR");
+
+    let (t1, t1_ok) = run(program, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(t1_ok, "T1 declaration validation failed: {t1}");
+    assert_eq!(t1.lines().next().unwrap_or(""), "1 TYPE-ERROR");
+}
+
+/// The live T2 path uses regalloc2 rather than declining when more values are
+/// simultaneously live than fit in its GPR set. This loop keeps seven arguments,
+/// its induction variable, and its accumulator live; at least one range must be
+/// split to a native spill slot and the result must remain exact.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn t2_regalloc_spills_high_pressure_loop() {
+    let program = "\
+        (defun spill-pressure (n a b c) \
+          (declare (type fixnum n a b c)) \
+          (let ((d (+ a 1)) (e (+ b 2)) (f (+ c 3)) (g (+ a b)) (sum 0)) \
+            (dotimes (i n sum) \
+              (setq sum (+ sum i)) (setq sum (+ sum a)) \
+              (setq sum (+ sum b)) (setq sum (+ sum c)) \
+              (setq sum (+ sum d)) (setq sum (+ sum e)) \
+              (setq sum (+ sum f)) (setq sum (+ sum g))))) \
+        (dotimes (warm 80) (spill-pressure 10 1 2 3)) \
+        (format t \"~a~%\" (spill-pressure 10 1 2 3)) \
+        (format t \"~a~%\" (bliss-ext:function-tier (quote spill-pressure))) \
+        (format t \"~a~%\" (spill-pressure 1 1152921504606846975 0 0)) \
+        (disassemble (quote spill-pressure))";
+
+    let (out, ok) = run(program, &[("BLISS_T2", "1")]);
+    assert!(ok, "spill-pressure program failed: {out}");
+    assert_eq!(out.lines().next().unwrap_or(""), "255", "{out}");
+    assert!(out.lines().any(|line| line == "2"), "function did not reach T2: {out}");
+    assert!(
+        out.lines().any(|line| line == "3458764513820540931"),
+        "overflow deopt did not reconstruct spilled state: {out}"
+    );
+    assert!(out.contains("[tier: T2 (native, profile-guided)]"), "{out}");
+    assert!(
+        out.lines().any(|line| line.contains("[rsp")),
+        "expected native spill/reload addressing in T2 output:\n{out}"
+    );
+}
+
+/// regalloc2 may coalesce a binary result with either input. The framed x86
+/// templates must preserve the RHS when it is also the destination, including
+/// non-commutative subtraction and multiplication's destructive untag step.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn t2_two_address_ops_preserve_a_coalesced_rhs() {
+    let program = "\
+        (defun rhs-add (x y) \
+          (declare (type fixnum x y)) \
+          (+ (+ (* x 5) (* y 9)) 7)) \
+        (defun rhs-sub (x y) \
+          (declare (type fixnum x y)) \
+          (- (* x 5) (* y 9))) \
+        (defun rhs-mul (x y) \
+          (declare (type fixnum x y)) \
+          (* (+ x 1) (+ y 2))) \
+        (defun rhs-xor (x y) \
+          (declare (type fixnum x y)) \
+          (logxor (+ x 1) (+ y 2))) \
+        (dotimes (i 80) \
+          (rhs-add i 4) (rhs-sub i 4) (rhs-mul i 4) (rhs-xor i 4)) \
+        (format t \"~a ~a ~a ~a~%\" \
+          (rhs-add 12 4) (rhs-sub 12 4) (rhs-mul 12 4) (rhs-xor 12 4)) \
+        (format t \"~a ~a ~a ~a~%\" \
+          (bliss-ext:function-tier (quote rhs-add)) \
+          (bliss-ext:function-tier (quote rhs-sub)) \
+          (bliss-ext:function-tier (quote rhs-mul)) \
+          (bliss-ext:function-tier (quote rhs-xor)))";
+
+    let (out, ok) = run(program, &[("BLISS_T2", "1")]);
+    assert!(ok, "two-address alias program failed: {out}");
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(lines.first().copied(), Some("103 24 78 11"), "{out}");
+    assert_eq!(lines.get(1).copied(), Some("2 2 2 2"), "{out}");
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn declared_single_float_parameter_removes_arithmetic_type_guard() {
+    let program = "\
+        (defun declared-float5 (x) \
+          (declare (single-float x) (optimize (speed 3) (safety 1))) \
+          (* x 5)) \
+        (dotimes (k 60) (declared-float5 1.5)) \
+        (format t \"~a~%\" (declared-float5 2.5)) \
+        (disassemble (quote declared-float5)) \
+        (format t \"~a~%\" \
+          (handler-case \
+            (progn (declared-float5 2) (quote missed-type-error)) \
+            (type-error () (quote type-error))))";
+
+    let (out, ok) = run(program, &[("BLISS_T2", "1")]);
+    assert!(ok, "declared single-float T2 function failed: {out}");
+    assert_eq!(out.lines().next().unwrap_or(""), "12.5");
+    assert!(
+        out.contains("checked parameter declarations: X: SINGLE-FLOAT"),
+        "{out}"
+    );
+    assert!(out.contains("mulss xmm0,xmm1"), "expected direct declared float multiply:\n{out}");
+    assert!(!out.contains("cmp dl,4"), "declaration proof should remove the float tag guard:\n{out}");
+    assert!(out.lines().any(|line| line == "TYPE-ERROR"), "{out}");
 }
 
 /// A global-accumulator LOOP reaches T2 (bliss-fe8: the builder's loop SSA is
@@ -486,6 +994,62 @@ fn loop_being_hash_keys_compiles_and_promotes() {
     let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
     assert!(tw_ok, "tree-walker hash LOOP failed: {tw}");
     assert_eq!(tw.lines().next(), Some("0 (30 30)"));
+}
+
+/// T1 passes call arguments as a slice in the caller's BlissStack frame, so a
+/// call-heavy function is not rejected merely because one callee has more than
+/// three arguments.
+#[test]
+fn t1_c2i_supports_calls_with_many_arguments() {
+    let prog = "\
+        (defun add8 (a b c d e f g h) (+ a b c d e f g h)) \
+        (defun call-add8 () (add8 1 2 3 4 5 6 7 8)) \
+        (call-add8) (call-add8) (call-add8) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote call-add8)) (call-add8))";
+    let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "wide c2i call failed: {out}");
+    assert_eq!(out.lines().next(), Some("1 36"));
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker wide call failed: {tw}");
+    assert_eq!(tw.lines().next(), Some("0 36"));
+}
+
+/// Captured parameters/locals, host-evaluated closure construction, and
+/// multiple-value binding share the activation's heap environment in T1.
+#[test]
+fn t1_executes_captured_environment_bytecodes() {
+    let prog = "\
+        (defun captured-native (&optional (x 4)) \
+          (multiple-value-bind (q r) (floor x 3) \
+            (let ((z (+ q r))) (funcall (lambda () (+ x z)))))) \
+        (captured-native 10) (captured-native 10) (captured-native 10) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote captured-native)) \
+          (captured-native 10))";
+    let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "captured-environment T1 run failed: {out}");
+    assert_eq!(out.lines().next(), Some("1 14"));
+
+    let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
+    assert!(tw_ok, "tree-walker captured-environment run failed: {tw}");
+    assert_eq!(tw.lines().next(), Some("0 14"));
+}
+
+/// Calling a retained heap function object through FUNCALL must drive the same
+/// tier transition as calling its global symbol directly.
+#[test]
+fn function_object_calls_participate_in_tiering() {
+    let prog = "\
+        (defun object-hot (x) (+ x 1)) \
+        (let ((f (fdefinition (quote object-hot)))) \
+          (funcall f 1) (funcall f 2) (funcall f 3)) \
+        (format t \"~a ~a~%\" \
+          (bliss-ext:function-tier (quote object-hot)) (object-hot 9))";
+    let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
+    assert!(ok, "function-object tiering failed: {out}");
+    assert_eq!(out.lines().next(), Some("1 10"));
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //! Maps the CL type hierarchy onto BlissVal tag + ObjectHeader type_id.
 //! See §1.16–§1.17 of the spec.
 
-use crate::object::{ElementTypeTag, ObjectHeader, type_id};
+use crate::object::{type_id, ElementTypeTag, ObjectHeader};
 use crate::value::BlissVal;
 
 /// Extract the `type_id` from a heap object's header.

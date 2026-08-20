@@ -8,9 +8,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock};
 
 use bliss_rt::error::BlissError;
+use bliss_rt::lock_order::{LockLevel, OrderedRwLock};
 use bliss_rt::value::{BlissVal, TAG_CONS, TAG_MASK};
 
 use crate::reader::{intern_symbol, symbol_name};
@@ -384,8 +385,14 @@ const NOTINLINE_SENTINEL: u64 = 0xFFFF_FFFF_DEAD_BEEF;
 
 /// Global macro table: maps operator symbol keys to expander BlissVals.
 /// Protected by RwLock for concurrent compilation (spec §4.2.12).
-static GLOBAL_MACRO_TABLE: LazyLock<RwLock<HashMap<u64, BlissVal>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static GLOBAL_MACRO_TABLE: LazyLock<OrderedRwLock<HashMap<u64, BlissVal>>> = LazyLock::new(|| {
+    OrderedRwLock::new(
+        LockLevel::GcWorld,
+        7,
+        "GC-rooted global macro table",
+        HashMap::new(),
+    )
+});
 
 fn scan_global_macro_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
     let mut table = GLOBAL_MACRO_TABLE
@@ -405,8 +412,15 @@ fn install_global_macro_root_scanner() {
 /// expander functions. Protected by RwLock (spec §4.2.4, §4.2.12).
 /// The expander takes (form, env) and returns either a replacement form
 /// or the original form (to decline).
-static COMPILER_MACRO_TABLE: LazyLock<RwLock<HashMap<u64, CompilerMacroFn>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static COMPILER_MACRO_TABLE: LazyLock<OrderedRwLock<HashMap<u64, CompilerMacroFn>>> =
+    LazyLock::new(|| {
+        OrderedRwLock::new(
+            LockLevel::CodeCache,
+            10,
+            "compiler macro table",
+            HashMap::new(),
+        )
+    });
 
 /// Compiler macro function type.
 /// Takes (whole_form, env) and returns either a transformed form or the
@@ -459,13 +473,42 @@ fn lookup_compiler_macro(name: BlissVal) -> Option<CompilerMacroFn> {
     table.get(&name.0).cloned()
 }
 
+/// Apply one compiler-macro expander to an ordinary call form. This is the
+/// non-recursive entry used by T0 lowering: it reports whether the expander
+/// accepted by returning a non-EQ form, leaving recursive expansion/lowering
+/// to the caller.
+pub fn compiler_macroexpand_1(
+    form: BlissVal,
+    env: &Environment,
+) -> Result<(BlissVal, bool), BlissError> {
+    if !form.is_cons() {
+        return Ok((form, false));
+    }
+    let operator = unsafe { cons_car(form) };
+    if !operator.is_symbol() || env.is_notinline(operator) {
+        return Ok((form, false));
+    }
+    let Some(expander) = lookup_compiler_macro(operator) else {
+        return Ok((form, false));
+    };
+    let expanded = expander(form, env)?;
+    Ok((expanded, expanded.0 != form.0))
+}
+
 // ── Macro function invocation registry ────────────────────────────
 
 /// Registry mapping BlissVal expander identities to callable Rust functions.
 /// This enables the default_hook (funcall) to actually invoke macro expanders
 /// that are represented as BlissVal handles (spec §4.2.8 R4.15).
-static MACRO_FUNCTION_REGISTRY: LazyLock<RwLock<HashMap<u64, Arc<MacroFn>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static MACRO_FUNCTION_REGISTRY: LazyLock<OrderedRwLock<HashMap<u64, Arc<MacroFn>>>> =
+    LazyLock::new(|| {
+        OrderedRwLock::new(
+            LockLevel::CodeCache,
+            11,
+            "macro function registry",
+            HashMap::new(),
+        )
+    });
 
 static MACRO_FUNCTION_KEY_COUNTER: AtomicU64 = AtomicU64::new(1);
 

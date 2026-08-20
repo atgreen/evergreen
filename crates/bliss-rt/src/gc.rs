@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Once, OnceLock};
 use std::thread::ThreadId;
 // ── Region model ───────────────────────────────────────────────────
 
@@ -171,7 +171,8 @@ pub fn set_gc_marking_in_progress(active: bool) {
 // tracer, and evacuator (bliss-jtc.19). Header access goes through the helpers
 // below rather than reading raw bytes.
 
-use crate::object::{ObjectHeader, gc_bit};
+use crate::lock_order::{LockLevel, OrderedMutex};
+use crate::object::{gc_bit, ObjectHeader};
 
 /// Size of the base object header (spec §1.3).
 const OBJECT_HEADER_SIZE: usize = 8;
@@ -433,7 +434,8 @@ impl HeapAllocator {
                     self.tlab.limit =
                         unsafe { region.header.alloc_top.add(self.tlab_size) } as *const u8;
                     self.tlab.region_idx = idx as u16;
-                    region.header.alloc_top = unsafe { region.header.alloc_top.add(self.tlab_size) };
+                    region.header.alloc_top =
+                        unsafe { region.header.alloc_top.add(self.tlab_size) };
                     return Ok(());
                 }
             }
@@ -816,6 +818,14 @@ unsafe fn trace_object(
             }
         }
 
+        // ── Package: name, internal/external symbol tables, use-list, and
+        //    nicknames are tagged references; the trailing lock is raw. ──
+        tid::PACKAGE => {
+            for i in 0..5 {
+                visit_word(i);
+            }
+        }
+
         // ── Stream handle: body word 0 is a raw pointer to an off-heap block;
         //    its Lisp-visible component references live in that block and are
         //    traced by the stdlib-registered hook (bliss-jtc.7a). ──
@@ -827,7 +837,7 @@ unsafe fn trace_object(
 
         // ── Kinds whose runtime layout interleaves references with raw fields
         //    or side storage (structures, conditions, hash-tables, specialised
-        //    arrays, packages) are traced by dedicated callbacks once
+        //    arrays) are traced by dedicated callbacks once
         //    real instances are constructed on the GC heap (jtc.1/jtc.2). None
         //    are allocated here yet, so visiting nothing is safe and precise —
         //    never a conservative pointer scan. ──
@@ -858,12 +868,21 @@ impl HeapCollector {
             }
         };
         let cur = crate::thread::current_thread_id();
-        mark_from(crate::thread::current_thread().stack().fp());
+        let current_fiber = crate::thread::current_fiber_id();
+        mark_from(crate::thread::current_stack().fp());
         for id in crate::thread::all_thread_ids() {
             if id == cur {
                 continue;
             }
             if let Some(fp) = crate::thread::thread_published_fp(id) {
+                mark_from(fp);
+            }
+        }
+        for id in crate::thread::all_fiber_ids() {
+            if Some(id) == current_fiber {
+                continue;
+            }
+            if let Some(fp) = crate::thread::fiber_published_fp(id) {
                 mark_from(fp);
             }
         }
@@ -886,12 +905,21 @@ impl HeapCollector {
             unsafe { crate::stack::visit_stack_refs(fp, &mut chase) };
         };
         let cur = crate::thread::current_thread_id();
-        relocate_from(crate::thread::current_thread().stack().fp());
+        let current_fiber = crate::thread::current_fiber_id();
+        relocate_from(crate::thread::current_stack().fp());
         for id in crate::thread::all_thread_ids() {
             if id == cur {
                 continue;
             }
             if let Some(fp) = crate::thread::thread_published_fp(id) {
+                relocate_from(fp);
+            }
+        }
+        for id in crate::thread::all_fiber_ids() {
+            if Some(id) == current_fiber {
+                continue;
+            }
+            if let Some(fp) = crate::thread::fiber_published_fp(id) {
                 relocate_from(fp);
             }
         }
@@ -1288,7 +1316,6 @@ impl Collector for HeapCollector {
             // fire once the freed nursery ranges are known (fire_finalizers_in_ranges).
             // This is bliss's analogue of SBCL's post-mark scan_finalizers
             // discipline (bliss-jtc.7f).
-
         }
 
         // Promote retained (pinned) nursery regions to old-gen in place, before
@@ -1494,17 +1521,16 @@ impl Collector for HeapCollector {
         let mut scan_worklist: Vec<usize> = Vec::new();
 
         // Helper: mark a candidate reference if it targets an indexed object.
-        let mark_ref =
-            |v: BlissVal,
-             marked: &mut std::collections::HashSet<usize>,
-             worklist: &mut Vec<usize>| {
-                if is_heap_ref(v) {
-                    let target = ref_body_addr(v);
-                    if object_index.contains_key(&target) && marked.insert(target) {
-                        worklist.push(target);
-                    }
+        let mark_ref = |v: BlissVal,
+                        marked: &mut std::collections::HashSet<usize>,
+                        worklist: &mut Vec<usize>| {
+            if is_heap_ref(v) {
+                let target = ref_body_addr(v);
+                if object_index.contains_key(&target) && marked.insert(target) {
+                    worklist.push(target);
                 }
-            };
+            }
+        };
 
         // Precise root: the saved entry continuation (§7.2.3).
         mark_ref(get_entry_continuation(), &mut marked, &mut scan_worklist);
@@ -1669,7 +1695,6 @@ impl Collector for HeapCollector {
 
                 cursor += total_size;
             }
-
         }
 
         // Rewrite EVERY live reference to its forwarded location before any
@@ -1820,11 +1845,11 @@ pub struct SatbCardBarrier {
     /// SATB log buffer — stores old reference values for the concurrent marker.
     /// Protected by a mutex for thread safety (in the JIT fast-path, a thread-local
     /// buffer is used; this mutex-guarded buffer is the fallback).
-    satb_buffer: Mutex<Vec<BlissVal>>,
+    satb_buffer: OrderedMutex<Vec<BlissVal>>,
     /// Card table — one byte per 512-byte card. A non-zero byte means the card is dirty.
     /// In a full implementation this would be a fixed-size array mapped over the heap;
     /// here we use a Vec sized to cover the configured heap.
-    card_table: Mutex<Vec<u8>>,
+    card_table: OrderedMutex<Vec<u8>>,
     /// Card size in bytes (default 512).
     card_shift: u32,
     /// Heap base address, used to compute card index from a slot address.
@@ -1842,8 +1867,18 @@ impl SatbCardBarrier {
         let card_count = (state.config.heap_size >> card_shift) + 1;
         let heap_base = state.heap_base as usize;
         Ok(SatbCardBarrier {
-            satb_buffer: Mutex::new(Vec::with_capacity(state.config.satb_buffer_size)),
-            card_table: Mutex::new(vec![0u8; card_count]),
+            satb_buffer: OrderedMutex::new(
+                LockLevel::GcWorld,
+                20,
+                "SATB fallback buffer",
+                Vec::with_capacity(state.config.satb_buffer_size),
+            ),
+            card_table: OrderedMutex::new(
+                LockLevel::GcWorld,
+                21,
+                "GC card table",
+                vec![0u8; card_count],
+            ),
             card_shift,
             heap_base,
         })
@@ -2049,9 +2084,9 @@ pub fn unpin(v: BlissVal) {
 /// A scanner that yields each external root reference slot to `visit`.
 pub type RootScanner = fn(&mut dyn FnMut(*mut BlissVal));
 
-fn root_scanners() -> &'static Mutex<Vec<RootScanner>> {
-    static S: OnceLock<Mutex<Vec<RootScanner>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(Vec::new()))
+fn root_scanners() -> &'static OrderedMutex<Vec<RootScanner>> {
+    static S: OnceLock<OrderedMutex<Vec<RootScanner>>> = OnceLock::new();
+    S.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 3, "GC root scanners", Vec::new()))
 }
 
 /// Register an external root scanner (idempotent by function pointer).
@@ -2078,9 +2113,10 @@ fn scan_external_roots(mut visit: impl FnMut(*mut BlissVal)) {
 // slots live in a process registry (partitioned by mutator thread), so the GC
 // can visit every thread's active roots rather than only its own TLS.
 
-fn shadow_roots() -> &'static Mutex<HashMap<ThreadId, Vec<BlissVal>>> {
-    static ROOTS: OnceLock<Mutex<HashMap<ThreadId, Vec<BlissVal>>>> = OnceLock::new();
-    ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
+fn shadow_roots() -> &'static OrderedMutex<HashMap<ThreadId, Vec<BlissVal>>> {
+    static ROOTS: OnceLock<OrderedMutex<HashMap<ThreadId, Vec<BlissVal>>>> = OnceLock::new();
+    ROOTS
+        .get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 4, "GC shadow roots", HashMap::new()))
 }
 
 fn scan_shadow_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
@@ -2359,7 +2395,9 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         }
         let epoch = GC_MOVE_EPOCH.load(Ordering::Acquire);
         if guard.as_ref().is_none_or(|(seen, _)| *seen != epoch) {
-            *guard = HeapAllocator::new().ok().map(|allocator| (epoch, allocator));
+            *guard = HeapAllocator::new()
+                .ok()
+                .map(|allocator| (epoch, allocator));
         }
         let body = {
             let alloc = &mut guard.as_mut()?.1;
@@ -2446,9 +2484,10 @@ unsafe impl Send for WeakPtrHandle {}
 unsafe impl Sync for WeakPtrHandle {}
 
 /// Global registry of weak pointers so the GC can break them during collection.
-fn weak_pointer_registry() -> &'static Mutex<Vec<WeakPtrHandle>> {
-    static REGISTRY: OnceLock<Mutex<Vec<WeakPtrHandle>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+fn weak_pointer_registry() -> &'static OrderedMutex<Vec<WeakPtrHandle>> {
+    static REGISTRY: OnceLock<OrderedMutex<Vec<WeakPtrHandle>>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 5, "GC weak pointers", Vec::new()))
 }
 
 /// Register a weak pointer with the GC so it can be broken when its referent
@@ -2592,9 +2631,9 @@ struct FinalizerEntry {
 }
 
 /// Global finalizer registry.
-fn finalizer_registry() -> &'static Mutex<Vec<FinalizerEntry>> {
-    static REGISTRY: OnceLock<Mutex<Vec<FinalizerEntry>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+fn finalizer_registry() -> &'static OrderedMutex<Vec<FinalizerEntry>> {
+    static REGISTRY: OnceLock<OrderedMutex<Vec<FinalizerEntry>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 6, "GC finalizers", Vec::new()))
 }
 
 /// Global finalizer dispatch function. Set by the runtime during startup
@@ -2648,29 +2687,31 @@ pub fn register_finalizer(object: BlissVal, finalizer: BlissVal) -> Result<(), B
 /// from a finalizer invocation is caught and silently discarded.
 pub fn run_finalizers_for(object: BlissVal) -> Vec<BlissVal> {
     let mut registry = finalizer_registry().lock().unwrap();
-    let mut invoked = Vec::new();
-    // Collect all finalizers for the given object
-    let mut i = 0;
-    while i < registry.len() {
-        if registry[i].object == object {
-            let entry = registry.remove(i);
-            // Actually invoke the finalizer callback on the object.
-            if let Some(dispatch) = entry.callback {
-                // R3.16: finalizer errors must not corrupt GC state.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    dispatch(entry.finalizer, object);
-                }));
-            } else if let Some(global_dispatch) = FINALIZER_DISPATCH.get() {
-                // Fall back to the global dispatch if the entry didn't capture one.
-                let dispatch = *global_dispatch;
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    dispatch(entry.finalizer, object);
-                }));
-            }
-            invoked.push(entry.finalizer);
+    let mut matching = Vec::new();
+    let mut retained = Vec::with_capacity(registry.len());
+    for entry in registry.drain(..) {
+        if entry.object == object {
+            matching.push(entry);
         } else {
-            i += 1;
+            retained.push(entry);
         }
+    }
+    *registry = retained;
+    drop(registry);
+
+    // Finalizers are arbitrary subsystem callbacks. Never invoke one while the
+    // GC registry is locked: stream finalization, for example, must acquire the
+    // lower-ranked per-stream lock to close its file descriptor.
+    let mut invoked = Vec::with_capacity(matching.len());
+    for entry in matching {
+        let dispatch = entry.callback.or_else(|| FINALIZER_DISPATCH.get().copied());
+        if let Some(dispatch) = dispatch {
+            // R3.16: finalizer errors must not corrupt GC state.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                dispatch(entry.finalizer, object);
+            }));
+        }
+        invoked.push(entry.finalizer);
     }
     invoked
 }
@@ -2778,10 +2819,7 @@ impl Drop for HeapState {
             #[cfg(unix)]
             // SAFETY: heap_base/size came from the anonymous mmap in init_heap.
             unsafe {
-                libc::munmap(
-                    self.heap_base as *mut libc::c_void,
-                    self.heap_layout.size(),
-                );
+                libc::munmap(self.heap_base as *mut libc::c_void, self.heap_layout.size());
             }
             // Safety: heap_base was allocated with heap_layout in init_heap.
             #[cfg(not(unix))]
@@ -2794,9 +2832,9 @@ impl Drop for HeapState {
 }
 
 /// Global heap state, initialized by `init_heap`.
-fn heap_state() -> &'static Mutex<Option<HeapState>> {
-    static STATE: OnceLock<Mutex<Option<HeapState>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(None))
+fn heap_state() -> &'static OrderedMutex<Option<HeapState>> {
+    static STATE: OnceLock<OrderedMutex<Option<HeapState>>> = OnceLock::new();
+    STATE.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 1, "GC heap state", None))
 }
 
 /// Initialize the GC heap. Called once during runtime startup.
@@ -3006,19 +3044,32 @@ where
 
 // ── Image / persistence helpers ───────────────────────────────────
 
-fn entry_continuation_cell() -> &'static Mutex<BlissVal> {
-    static ENTRY: OnceLock<Mutex<BlissVal>> = OnceLock::new();
-    ENTRY.get_or_init(|| Mutex::new(crate::value::NIL))
+fn entry_continuation_cell() -> &'static OrderedMutex<BlissVal> {
+    static ENTRY: OnceLock<OrderedMutex<BlissVal>> = OnceLock::new();
+    ENTRY.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            2,
+            "GC entry continuation",
+            crate::value::NIL,
+        )
+    })
 }
 
-fn byte_store(name: &'static str) -> &'static Mutex<Vec<u8>> {
-    static SYMBOLS: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
-    static PACKAGES: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
-    static CODE: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+fn byte_store(name: &'static str) -> &'static OrderedMutex<Vec<u8>> {
+    static SYMBOLS: OnceLock<OrderedMutex<Vec<u8>>> = OnceLock::new();
+    static PACKAGES: OnceLock<OrderedMutex<Vec<u8>>> = OnceLock::new();
+    static CODE: OnceLock<OrderedMutex<Vec<u8>>> = OnceLock::new();
     match name {
-        "symbols" => SYMBOLS.get_or_init(|| Mutex::new(Vec::new())),
-        "packages" => PACKAGES.get_or_init(|| Mutex::new(Vec::new())),
-        "code" => CODE.get_or_init(|| Mutex::new(Vec::new())),
+        "symbols" => SYMBOLS.get_or_init(|| {
+            OrderedMutex::new(LockLevel::ImageSave, 1, "image symbol bytes", Vec::new())
+        }),
+        "packages" => PACKAGES.get_or_init(|| {
+            OrderedMutex::new(LockLevel::ImageSave, 2, "image package bytes", Vec::new())
+        }),
+        "code" => CODE.get_or_init(|| {
+            OrderedMutex::new(LockLevel::ImageSave, 3, "image code bytes", Vec::new())
+        }),
         _ => unreachable!(),
     }
 }
@@ -3385,7 +3436,10 @@ mod header_tests {
         let ptr = buf.as_mut_ptr() as *mut u8;
         // Request a 13-byte body → footprint align_up(8+13,16) = 32, units = 4.
         let body_off = unsafe { write_object_header(ptr, crate::object::type_id::RATIO, 13) };
-        assert_eq!(body_off, OBJECT_HEADER_SIZE, "small object body at offset 8");
+        assert_eq!(
+            body_off, OBJECT_HEADER_SIZE,
+            "small object body at offset 8"
+        );
         assert!(!unsafe { header_is_free(ptr) });
         assert!(!unsafe { header_is_forwarded(ptr) });
         assert_eq!(unsafe { header_total_bytes(ptr) }, 32);
@@ -3442,8 +3496,12 @@ mod header_tests {
         let mut buf = scratch();
         let ptr = buf.as_mut_ptr() as *mut u8;
         let big = (LARGE_SIZE_SENTINEL as usize) * 8;
-        let body_off = unsafe { write_object_header(ptr, crate::object::type_id::SIMPLE_ARRAY, big as u32) };
-        assert_eq!(body_off, LARGE_OBJECT_PAYLOAD_OFFSET, "large object body at offset 16");
+        let body_off =
+            unsafe { write_object_header(ptr, crate::object::type_id::SIMPLE_ARRAY, big as u32) };
+        assert_eq!(
+            body_off, LARGE_OBJECT_PAYLOAD_OFFSET,
+            "large object body at offset 16"
+        );
         assert_eq!(unsafe { header_at(ptr) }.size_units(), LARGE_SIZE_SENTINEL);
         // The true byte size is stored just after the header and read back.
         let (expected_total, _) = object_footprint(big);
@@ -3501,8 +3559,14 @@ mod trace_tests {
     #[test]
     fn ratio_and_complex_trace_both_reference_fields() {
         let body = [heapish(0x4000), heapish(0x5000)];
-        assert_eq!(traced(tid::RATIO, &body), vec![heapish(0x4000), heapish(0x5000)]);
-        assert_eq!(traced(tid::COMPLEX, &body), vec![heapish(0x4000), heapish(0x5000)]);
+        assert_eq!(
+            traced(tid::RATIO, &body),
+            vec![heapish(0x4000), heapish(0x5000)]
+        );
+        assert_eq!(
+            traced(tid::COMPLEX, &body),
+            vec![heapish(0x4000), heapish(0x5000)]
+        );
     }
 
     #[test]
@@ -3545,11 +3609,11 @@ mod trace_tests {
     fn compiled_function_skips_entry_and_code_size() {
         // [entry_ptr, code_size, name, lambda_list, min/max/tier, constants].
         let body = [
-            0x1111_2222, // entry_point (raw)
-            700,         // code_size (raw)
+            0x1111_2222,     // entry_point (raw)
+            700,             // code_size (raw)
             heapish(0x4000), // name
             heapish(0x5000), // lambda_list
-            0,           // min/max/tier/pad (raw)
+            0,               // min/max/tier/pad (raw)
             heapish(0x6000), // constants
         ];
         assert_eq!(
@@ -3620,10 +3684,22 @@ mod relocation_tests {
             });
         }
 
-        assert_eq!(holder[1] & !0b111, (moved_body as u64) - 8, "field relocated to moved header");
+        assert_eq!(
+            holder[1] & !0b111,
+            (moved_body as u64) - 8,
+            "field relocated to moved header"
+        );
         assert_eq!(holder[1] & 0b111, TAG_HEAP, "tag preserved");
-        assert_eq!(unsafe { *(moved_body as *const u64) }, 0xFEED_1234, "contents intact");
-        assert_eq!(holder[2], BlissVal::from_fixnum(7).0, "non-reference field untouched");
+        assert_eq!(
+            unsafe { *(moved_body as *const u64) },
+            0xFEED_1234,
+            "contents intact"
+        );
+        assert_eq!(
+            holder[2],
+            BlissVal::from_fixnum(7).0,
+            "non-reference field untouched"
+        );
     }
 
     /// relocate_slot leaves non-references and references to un-forwarded objects

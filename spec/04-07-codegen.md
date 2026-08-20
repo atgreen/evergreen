@@ -323,6 +323,19 @@ safepoint. After allocation, map to physical registers / spill slots.
 Only heap-pointer types (per type inference §4.4) are recorded; unboxed
 fixnums, floats, and raw pointers are excluded.
 
+**Current x86-64 T2 boundary form:** the framed emitter realizes the same map
+contract by synchronizing exact live tagged VRegs into dedicated tagged shadow
+slots appended to the owning `BlissStack` activation immediately before every
+runtime call. Unused shadow slots are cleared to `NIL`; after the call, possibly
+relocated values are restored to their allocated GPR or native spill homes.
+This makes moving-GC updates explicit without asynchronously inspecting a host
+register context. Code that needs shadow roots has no frame-less compiled entry.
+The emitted artifact records each sync-site offset plus its register/spill root
+counts; installation rejects a missing site, an out-of-range offset, inconsistent
+counts, or a shadow-slot range outside the installed activation bitmap. A future
+backend may instead expose `live_regs` directly when its safepoint trampoline
+publishes a complete machine context.
+
 **Validation (R4.46):** At code installation, verify: every `is_safepoint`
 instruction has a stack map entry; all slot indices are valid
 (0..frame_slots); live_regs are callee-saved or preserved across the

@@ -193,13 +193,8 @@ fn source_location_clone() {
 
 // ── CodeInfo method tests ─────────────────────────────────────────
 
-/// Helper to create a CodeInfo instance despite private fields.
-/// CodeInfo contains only `_private: ()` (zero-sized), so we can
-/// safely transmute from a unit value.
 fn make_code_info() -> CodeInfo {
-    // CodeInfo has a single ZST field `_private: ()`.
-    // Transmuting from () is safe since the layouts match.
-    unsafe { std::mem::transmute::<(), CodeInfo>(()) }
+    CodeInfo::empty()
 }
 
 #[test]
@@ -344,7 +339,7 @@ fn frame_slots_survive_across_deeper_push() {
 
 #[test]
 fn visit_stack_refs_finds_exactly_the_references() {
-    use bliss_rt::{BlissVal, visit_stack_refs};
+    use bliss_rt::{visit_stack_refs, BlissVal};
     let stack = BlissStack::new(64 * 1024);
     // Frame with a mix of references and non-references.
     let f = stack
@@ -373,7 +368,7 @@ fn visit_stack_refs_finds_exactly_the_references() {
 
 #[test]
 fn visit_stack_refs_can_relocate_a_reference() {
-    use bliss_rt::{BlissVal, visit_stack_refs};
+    use bliss_rt::{visit_stack_refs, BlissVal};
     let stack = BlissStack::new(64 * 1024);
     let f = stack
         .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)
@@ -395,10 +390,14 @@ fn visit_stack_refs_can_relocate_a_reference() {
 
 #[test]
 fn visit_stack_refs_walks_all_frames() {
-    use bliss_rt::{BlissVal, visit_stack_refs};
+    use bliss_rt::{visit_stack_refs, BlissVal};
     let stack = BlissStack::new(64 * 1024);
-    let f1 = stack.push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0).unwrap();
-    let f2 = stack.push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0).unwrap();
+    let f1 = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)
+        .unwrap();
+    let f2 = stack
+        .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)
+        .unwrap();
     unsafe {
         BlissStack::frame_slots_mut(f1)[0] = BlissVal(0x1000 | 0b001);
         BlissStack::frame_slots_mut(f2)[0] = BlissVal(0x2000 | 0b010);

@@ -1,102 +1,139 @@
-//! Scheduler control handle.
+//! Public fiber scheduler-group lifecycle.
 //!
-//! The single real scheduler — N **native OS workers** each owning a
-//! work-stealing deque, running M **managed Bliss fibers** (`GreenThread`) — is
-//! implemented in [`crate::thread`] (the `WorkerPool`/`Worker` structs are
-//! internal there). This module is a thin *control handle* over that runtime
-//! (lifecycle/config + safepoint-mediated control ops), not a competing
-//! scheduler: `park_current`/`request_yield` delegate to the real fiber runtime
-//! (bliss-jtc.14.2). Public thread APIs (`make_thread`, `join_thread`, …) create
-//! and join managed fibers; native workers are never exposed.
-//!
-//! See §2.3.4 of the spec.
+//! Scheduling mechanics live in `thread.rs`: one internal deque per exposed
+//! native carrier thread, local LIFO execution, cross-carrier FIFO stealing,
+//! and carrier park/wakeup. This module owns only the public group lifecycle;
+//! it never maintains a second or phantom run queue.
 
 use crate::error::BlissError;
-use crate::thread::GreenThreadId;
-use std::collections::HashSet;
-use std::sync::Mutex;
+use crate::lock_order::{LockLevel, OrderedMutex};
+use crate::thread::{
+    fiber_state, join_fiber, request_fiber_yield, CarrierPool, FiberId, FiberState, NativeThreadId,
+};
+use crate::value::BlissVal;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Scheduler configuration.
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {
-    /// Number of OS worker threads (default: hardware thread count).
+    /// Requested number of exposed OS carrier threads.
     pub num_workers: usize,
 }
 
-/// The global scheduler instance.
-pub struct Scheduler {
-    /// Number of OS worker threads.
-    _num_workers: usize,
-    /// Set of thread IDs that have been submitted and are active (not dead).
-    active: Mutex<HashSet<GreenThreadId>>,
-    /// Whether the scheduler has been shut down.
-    shut_down: Mutex<bool>,
+/// A public lifecycle handle for fibers scheduled over exposed carrier threads.
+pub struct SchedulerGroup {
+    requested_carriers: usize,
+    pool: CarrierPool,
+    carriers: Vec<NativeThreadId>,
+    submitted: OrderedMutex<Vec<FiberId>>,
+    closed: AtomicBool,
 }
 
-impl Scheduler {
-    /// Initialize the scheduler and spawn worker threads.
+impl SchedulerGroup {
     pub fn init(config: &SchedulerConfig) -> Result<Self, BlissError> {
         if config.num_workers == 0 {
-            return Err(BlissError::Internal(
-                "scheduler requires at least one worker".into(),
+            return Err(BlissError::ProgramError(
+                "scheduler group requires at least one carrier".into(),
             ));
         }
-        Ok(Scheduler {
-            _num_workers: config.num_workers,
-            active: Mutex::new(HashSet::new()),
-            shut_down: Mutex::new(false),
+        let pool = CarrierPool::new(config.num_workers);
+        let carriers = pool.carrier_thread_ids();
+        static NEXT_GROUP_ORDER: AtomicU64 = AtomicU64::new(1);
+        Ok(Self {
+            requested_carriers: config.num_workers,
+            pool,
+            carriers,
+            submitted: OrderedMutex::new(
+                LockLevel::ExecutionRegistry,
+                (1_u64 << 63) | NEXT_GROUP_ORDER.fetch_add(1, Ordering::Relaxed),
+                "scheduler group submissions",
+                Vec::new(),
+            ),
+            closed: AtomicBool::new(false),
         })
     }
 
-    /// Submit a runnable green thread to the current worker's deque.
-    pub fn submit(&self, thread_id: GreenThreadId) -> Result<(), BlissError> {
-        let shut = self.shut_down.lock().unwrap();
-        if *shut {
-            return Err(BlissError::Internal("scheduler is shut down".into()));
+    pub fn submit(&self, fiber: FiberId) -> Result<(), BlissError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(BlissError::ProgramError(
+                "scheduler group is closed to submission".into(),
+            ));
         }
-        drop(shut);
-        let mut active = self.active.lock().unwrap();
-        active.insert(thread_id);
+        self.pool.submit(fiber)?;
+        self.submitted.lock().unwrap().push(fiber);
         Ok(())
     }
 
-    /// Park the current fiber, yielding it at the next safepoint so the fiber
-    /// runtime can run another runnable fiber (bliss-jtc.14.2).
-    pub fn park_current(&self) {
-        crate::thread::thread_yield();
+    pub fn request_yield(&self, fiber: FiberId) {
+        let _ = request_fiber_yield(fiber);
     }
 
-    /// Unpark a blocked green thread (transition to Runnable).
-    pub fn unpark(&self, thread_id: GreenThreadId) -> Result<(), BlissError> {
-        let active = self.active.lock().unwrap();
-        if active.contains(&thread_id) {
-            Ok(())
-        } else {
-            Err(BlissError::Internal(format!(
-                "thread {:?} not found in scheduler",
-                thread_id
-            )))
+    pub fn unpark(&self, fiber: FiberId) -> Result<(), BlissError> {
+        match fiber_state(fiber) {
+            Some(FiberState::Blocked | FiberState::Waiting) => self.pool.submit(fiber),
+            Some(_) => Err(BlissError::ProgramError(format!(
+                "fiber {} is not parked",
+                fiber.0
+            ))),
+            None => Err(BlissError::Internal(format!(
+                "fiber {} is unknown",
+                fiber.0
+            ))),
         }
     }
 
-    /// Request preemption of fiber `thread_id` at its next safepoint poll — sets
-    /// the real per-fiber yield flag in the fiber runtime (bliss-jtc.14.2).
-    pub fn request_yield(&self, thread_id: GreenThreadId) {
-        let _ = crate::thread::request_fiber_yield(thread_id);
-    }
-
-    /// Shut down the scheduler: interrupt all green threads, join workers.
     pub fn shutdown(&self) -> Result<(), BlissError> {
-        let mut active = self.active.lock().unwrap();
-        active.clear();
-        let mut shut = self.shut_down.lock().unwrap();
-        *shut = true;
-        Ok(())
+        self.closed.store(true, Ordering::Release);
+        if self.active_fiber_count() == 0 {
+            self.pool.shutdown_and_join()
+        } else {
+            Err(BlissError::ProgramError(
+                "cannot shut down a scheduler group with active fibers; use finish".into(),
+            ))
+        }
     }
 
-    /// Return the number of live (non-Dead) green threads.
-    pub fn active_thread_count(&self) -> usize {
-        let active = self.active.lock().unwrap();
-        active.len()
+    pub fn finish(&self) -> Result<Vec<BlissVal>, BlissError> {
+        self.closed.store(true, Ordering::Release);
+        let ids = self.submitted.lock().unwrap().clone();
+        let results = ids.into_iter().map(join_fiber).collect();
+        self.pool.shutdown_and_join()?;
+        results
     }
+
+    pub fn active_fiber_count(&self) -> usize {
+        let submitted = self.submitted.lock().unwrap().clone();
+        submitted
+            .iter()
+            .filter(|&&id| !matches!(fiber_state(id), None | Some(FiberState::Dead)))
+            .count()
+    }
+
+    /// Compatibility spelling for older Rust callers.
+    pub fn active_thread_count(&self) -> usize {
+        self.active_fiber_count()
+    }
+
+    pub fn carrier_thread_ids(&self) -> &[NativeThreadId] {
+        &self.carriers
+    }
+
+    pub fn requested_carrier_count(&self) -> usize {
+        self.requested_carriers
+    }
+}
+
+/// Historical Rust facade name. It is a real scheduler group, not a second
+/// scheduler or a thread-ID bookkeeping set.
+pub type Scheduler = SchedulerGroup;
+
+pub fn run_fibers(
+    fibers: &[FiberId],
+    config: &SchedulerConfig,
+) -> Result<Vec<BlissVal>, BlissError> {
+    let group = SchedulerGroup::init(config)?;
+    for &fiber in fibers {
+        group.submit(fiber)?;
+    }
+    group.finish()
 }

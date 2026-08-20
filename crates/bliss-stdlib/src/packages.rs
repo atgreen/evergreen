@@ -4,12 +4,18 @@
 //! the standard package layout. See spec §5.1.
 
 use bliss_rt::error::BlissError;
+use bliss_rt::lock_order::{LockLevel, OrderedRwLock};
 use bliss_rt::value::BlissVal;
 
 use std::cell::RefCell;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use crate::hashtable::{
+    gethash, hash_table_entries, make_hash_table, remhash, set_gethash, HashTest,
+    MakeHashTableOptions,
+};
+use crate::streams::make_lisp_string;
 
 // Package/symbol tables are keyed by internal package ids and interned symbol
 // names (never adversarial input), and `package_name`/`find-symbol` are among
@@ -66,77 +72,117 @@ type HashSet<T> = std::collections::HashSet<T, FxBuild>;
 
 // ── Internal package data ─────────────────────────────────────────
 
-/// Counter for generating unique package IDs (globally unique across threads).
-///
-/// Based at `1 << 40` so package handle ids occupy a reserved high range that
-/// cannot collide with the low-range CLOS class/generic-function/method and
-/// macro meta-handles (which count up from small values). Discrimination is by
-/// registry membership, but keeping the ranges disjoint means a stray id is
-/// never *ambiguously* claimable by two subsystems (bliss-bhs Stage 4 / dx6).
-const PACKAGE_ID_BASE: i64 = 1 << 40;
-static NEXT_PACKAGE_ID: AtomicI64 = AtomicI64::new(PACKAGE_ID_BASE);
-
 thread_local! {
     static CURRENT_STORE: RefCell<Option<Arc<RegistryStore>>> = const { RefCell::new(None) };
 }
 
-fn swap_current_store(
-    new_store: Option<Arc<RegistryStore>>,
-) -> Option<Arc<RegistryStore>> {
+fn swap_current_store(new_store: Option<Arc<RegistryStore>>) -> Option<Arc<RegistryStore>> {
     CURRENT_STORE.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), new_store))
 }
 
 struct RegistryStore {
-    state: RwLock<PackageStore>,
+    state: OrderedRwLock<PackageStore>,
 }
 
 struct PackageStore {
-    packages: HashMap<i64, Arc<RwLock<Package>>>,
-    /// Map from global name/nickname → package id for fast lookup.
-    name_index: HashMap<String, i64>,
+    packages: HashMap<u64, Arc<OrderedRwLock<Package>>>,
 }
 
 impl PackageStore {
     fn new() -> Self {
         Self {
             packages: HashMap::default(),
-            name_index: HashMap::default(),
         }
     }
 }
 
 #[derive(Clone)]
 struct Package {
+    object: BlissVal,
     name: String,
     nicknames: Vec<String>,
-    local_nicknames: HashMap<String, i64>,
-    internal_symbols: HashMap<String, BlissVal>,
-    external_symbols: HashMap<String, BlissVal>,
+    local_nicknames: HashMap<String, BlissVal>,
+    internal_symbols: PackageSymbolTable,
+    external_symbols: PackageSymbolTable,
     shadowing_symbols: HashSet<String>,
     use_list: Vec<BlissVal>,
 }
 
 impl Package {
-    fn new(name: &str) -> Self {
-        Self {
+    fn new(name: &str, object: BlissVal) -> Result<Self, BlissError> {
+        let (internal, external) = match bliss_rt::packages::symbol_tables(object) {
+            Some((internal, external))
+                if crate::hashtable::hash_table_p(internal)
+                    && crate::hashtable::hash_table_p(external) =>
+            {
+                (internal, external)
+            }
+            _ => (make_package_symbol_table()?, make_package_symbol_table()?),
+        };
+        bliss_rt::packages::set_symbol_tables(object, internal, external)?;
+        Ok(Self {
+            object,
             name: name.to_string(),
             nicknames: Vec::new(),
             local_nicknames: HashMap::default(),
-            internal_symbols: HashMap::default(),
-            external_symbols: HashMap::default(),
+            internal_symbols: PackageSymbolTable(internal),
+            external_symbols: PackageSymbolTable(external),
             shadowing_symbols: HashSet::default(),
             use_list: Vec::new(),
-        }
+        })
     }
 }
 
-/// Allocate a fresh BlissVal to represent a package handle.
-fn alloc_package_id() -> (i64, BlissVal) {
-    let id = NEXT_PACKAGE_ID.fetch_add(1, Ordering::Relaxed);
-    // Opaque metaobject handle, not a fixnum: keeps package handles off the
-    // fixnum tag so a plain integer (or a same-id symbol handle) can't collide
-    // with a package in the registry. See bliss-dx6.1.
-    (id, BlissVal::from_meta_handle(id))
+#[derive(Clone, Copy)]
+struct PackageSymbolTable(BlissVal);
+
+fn make_package_symbol_table() -> Result<BlissVal, BlissError> {
+    make_hash_table(&MakeHashTableOptions {
+        test: HashTest::Equal,
+        synchronized: true,
+        ..MakeHashTableOptions::default()
+    })
+}
+
+impl PackageSymbolTable {
+    fn get(self, name: &str) -> Option<BlissVal> {
+        gethash(make_lisp_string(name), self.0, bliss_rt::value::NIL)
+            .ok()
+            .and_then(|(value, present)| present.then_some(value))
+    }
+
+    fn contains_key(self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    fn insert(self, name: &str, symbol: BlissVal) {
+        set_gethash(make_lisp_string(name), self.0, symbol)
+            .expect("package symbol table must remain a valid hash table");
+    }
+
+    fn remove(self, name: &str) -> Option<BlissVal> {
+        let old = self.get(name);
+        if old.is_some() {
+            remhash(make_lisp_string(name), self.0)
+                .expect("package symbol table must remain a valid hash table");
+        }
+        old
+    }
+
+    fn entries(self) -> Vec<(String, BlissVal)> {
+        hash_table_entries(self.0)
+            .expect("package symbol table must remain a valid hash table")
+            .into_iter()
+            .map(|(name, symbol)| (name.as_string(), symbol))
+            .collect()
+    }
+
+    fn values(self) -> Vec<BlissVal> {
+        self.entries()
+            .into_iter()
+            .map(|(_, symbol)| symbol)
+            .collect()
+    }
 }
 
 /// The shared heap-resident symbol for `bare_name` in package `pkg_name`
@@ -151,8 +197,8 @@ fn alloc_symbol(pkg_name: &str, bare_name: &str) -> BlissVal {
 }
 
 /// Extract the package ID from a BlissVal handle.
-fn pkg_id(handle: BlissVal) -> i64 {
-    handle.as_meta_handle_id()
+fn pkg_id(handle: BlissVal) -> u64 {
+    handle.0
 }
 
 fn no_active_registry_error() -> BlissError {
@@ -175,7 +221,7 @@ fn current_store() -> Result<Arc<RegistryStore>, BlissError> {
 fn lookup_package_arc(
     store: &PackageStore,
     package: BlissVal,
-) -> Result<Arc<RwLock<Package>>, BlissError> {
+) -> Result<Arc<OrderedRwLock<Package>>, BlissError> {
     store
         .packages
         .get(&pkg_id(package))
@@ -183,19 +229,30 @@ fn lookup_package_arc(
         .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))
 }
 
-fn find_symbol_name_in_store(store: &PackageStore, sym: BlissVal) -> Result<Option<String>, BlissError> {
+fn lookup_named_package(store: &PackageStore, name: &str) -> Option<BlissVal> {
+    let package = bliss_rt::packages::find(name)?;
+    store
+        .packages
+        .contains_key(&pkg_id(package))
+        .then_some(package)
+}
+
+fn find_symbol_name_in_store(
+    store: &PackageStore,
+    sym: BlissVal,
+) -> Result<Option<String>, BlissError> {
     for package in store.packages.values() {
         let package = package
             .read()
             .map_err(|_| lock_poisoned_error("symbol lookup"))?;
-        for (name, &val) in &package.internal_symbols {
+        for (name, val) in package.internal_symbols.entries() {
             if val == sym {
-                return Ok(Some(name.clone()));
+                return Ok(Some(name));
             }
         }
-        for (name, &val) in &package.external_symbols {
+        for (name, val) in package.external_symbols.entries() {
             if val == sym {
-                return Ok(Some(name.clone()));
+                return Ok(Some(name));
             }
         }
     }
@@ -228,7 +285,12 @@ impl PackageRegistry {
     /// Create a new empty registry and install it as the current store for this thread.
     pub fn new() -> Self {
         let store = Arc::new(RegistryStore {
-            state: RwLock::new(PackageStore::new()),
+            state: OrderedRwLock::new(
+                LockLevel::PackageRegistry,
+                2,
+                "stdlib package registry",
+                PackageStore::new(),
+            ),
         });
         let previous_store = swap_current_store(Some(Arc::clone(&store)));
         Self {
@@ -271,11 +333,7 @@ impl PackageRegistry {
     /// Find a package by global name or nickname.
     pub fn find_package(&self, name: &str) -> Option<BlissVal> {
         let store = self.store.state.read().ok()?;
-        store
-            .name_index
-            .get(name)
-            .copied()
-            .map(BlissVal::from_meta_handle)
+        lookup_named_package(&store, name)
     }
 
     /// Resolve a package designator relative to another package, honoring package-local nicknames first.
@@ -283,14 +341,11 @@ impl PackageRegistry {
         let store = self.store.state.read().ok()?;
         let package = store.packages.get(&pkg_id(package))?.clone();
         let package = package.read().ok()?;
-        if let Some(&id) = package.local_nicknames.get(name) {
-            return Some(BlissVal::from_meta_handle(id));
+        if let Some(&actual) = package.local_nicknames.get(name) {
+            return Some(actual);
         }
-        store
-            .name_index
-            .get(name)
-            .copied()
-            .map(BlissVal::from_meta_handle)
+        drop(package);
+        lookup_named_package(&store, name)
     }
 
     /// Create a new package.
@@ -306,14 +361,14 @@ impl PackageRegistry {
             .write()
             .map_err(|_| lock_poisoned_error("package creation"))?;
 
-        if store.name_index.contains_key(name) {
+        if lookup_named_package(&store, name).is_some() {
             return Err(BlissError::PackageError(format!(
                 "Package named {:?} already exists",
                 name
             )));
         }
         for nick in nicknames {
-            if store.name_index.contains_key(*nick) {
+            if lookup_named_package(&store, nick).is_some() {
                 return Err(BlissError::PackageError(format!(
                     "Nickname {:?} conflicts with an existing package",
                     nick
@@ -323,8 +378,8 @@ impl PackageRegistry {
 
         let mut resolved_uses = Vec::new();
         for use_name in use_list {
-            match store.name_index.get(*use_name) {
-                Some(&id) => resolved_uses.push(BlissVal::from_meta_handle(id)),
+            match lookup_named_package(&store, use_name) {
+                Some(package) => resolved_uses.push(package),
                 None => {
                     return Err(BlissError::PackageError(format!(
                         "Package {:?} not found for use-list",
@@ -334,17 +389,23 @@ impl PackageRegistry {
             }
         }
 
-        let (id, handle) = alloc_package_id();
-        let mut pkg = Package::new(name);
+        let handle = bliss_rt::packages::find_or_create(name);
+        let id = pkg_id(handle);
+        let mut pkg = Package::new(name, handle)?;
         pkg.nicknames = nicknames.iter().map(|s| s.to_string()).collect();
         pkg.use_list = resolved_uses;
 
-        store
-            .packages
-            .insert(id, Arc::new(RwLock::new(pkg)));
-        store.name_index.insert(name.to_string(), id);
+        store.packages.insert(
+            id,
+            Arc::new(OrderedRwLock::new(
+                LockLevel::Package,
+                id.max(1),
+                "package object",
+                pkg,
+            )),
+        );
         for nick in nicknames {
-            store.name_index.insert((*nick).to_string(), id);
+            bliss_rt::packages::add_nickname(name, nick);
         }
 
         Ok(handle)
@@ -369,13 +430,14 @@ impl PackageRegistry {
             .write()
             .map_err(|_| lock_poisoned_error("local nickname add"))?;
         match owner.local_nicknames.get(local_nickname).copied() {
-            Some(existing) if existing != pkg_id(actual_package) => Err(BlissError::PackageError(
-                format!("Local nickname {:?} already points elsewhere", local_nickname),
-            )),
+            Some(existing) if existing != actual_package => Err(BlissError::PackageError(format!(
+                "Local nickname {:?} already points elsewhere",
+                local_nickname
+            ))),
             _ => {
                 owner
                     .local_nicknames
-                    .insert(local_nickname.to_string(), pkg_id(actual_package));
+                    .insert(local_nickname.to_string(), actual_package);
                 Ok(())
             }
         }
@@ -396,10 +458,7 @@ impl PackageRegistry {
         let mut owner = owner
             .write()
             .map_err(|_| lock_poisoned_error("local nickname removal"))?;
-        Ok(owner
-            .local_nicknames
-            .remove(local_nickname)
-            .map(BlissVal::from_meta_handle))
+        Ok(owner.local_nicknames.remove(local_nickname))
     }
 
     pub fn package_local_nicknames(
@@ -418,7 +477,7 @@ impl PackageRegistry {
         Ok(package
             .local_nicknames
             .iter()
-            .map(|(name, &id)| (name.clone(), BlissVal::from_meta_handle(id)))
+            .map(|(name, &package)| (name.clone(), package))
             .collect())
     }
 
@@ -426,19 +485,19 @@ impl PackageRegistry {
         &self,
         package: BlissVal,
     ) -> Result<Vec<BlissVal>, BlissError> {
-        let target = pkg_id(package);
+        let target = package;
         let store = self
             .store
             .state
             .read()
             .map_err(|_| lock_poisoned_error("local nickname reverse lookup"))?;
         let mut out = Vec::new();
-        for (&id, pkg) in &store.packages {
+        for pkg in store.packages.values() {
             let pkg = pkg
                 .read()
                 .map_err(|_| lock_poisoned_error("local nickname reverse lookup"))?;
             if pkg.local_nicknames.values().any(|&other| other == target) {
-                out.push(BlissVal::from_meta_handle(id));
+                out.push(pkg.object);
             }
         }
         Ok(out)
@@ -536,25 +595,25 @@ impl PackageRegistry {
         let package = package
             .read()
             .map_err(|_| lock_poisoned_error("package use check"))?;
-        let used_id = pkg_id(used_package);
-        Ok(package.use_list.iter().any(|handle| pkg_id(*handle) == used_id))
+        Ok(package.use_list.contains(&used_package))
     }
 
     fn ensure_package_alias(&mut self, alias: &str, package: BlissVal) -> Result<(), BlissError> {
         let id = pkg_id(package);
-        let mut store = self
+        let store = self
             .store
             .state
-            .write()
+            .read()
             .map_err(|_| lock_poisoned_error("package aliasing"))?;
-        match store.name_index.get(alias).copied() {
-            Some(existing) if existing == id => Ok(()),
+        match lookup_named_package(&store, alias) {
+            Some(existing) if existing == package => Ok(()),
             Some(_) => Err(BlissError::PackageError(format!(
                 "Package alias {:?} conflicts with an existing package",
                 alias
             ))),
             None => {
-                store.name_index.insert(alias.to_string(), id);
+                let primary = bliss_rt::packages::package_name(package).unwrap_or_default();
+                bliss_rt::packages::add_nickname(&primary, alias);
                 if let Some(pkg) = store.packages.get(&id) {
                     let mut pkg = pkg
                         .write()
@@ -575,11 +634,9 @@ impl PackageRegistry {
             .state
             .write()
             .map_err(|_| lock_poisoned_error("package deletion"))?;
-        let id = store
-            .name_index
-            .get(name)
-            .copied()
+        let handle = lookup_named_package(&store, name)
             .ok_or_else(|| BlissError::PackageError(format!("Package {:?} not found", name)))?;
+        let id = pkg_id(handle);
 
         let pkg = store
             .packages
@@ -588,18 +645,16 @@ impl PackageRegistry {
         let pkg = pkg
             .read()
             .map_err(|_| lock_poisoned_error("package deletion"))?;
-        store.name_index.remove(&pkg.name);
-        for nick in &pkg.nicknames {
-            store.name_index.remove(nick);
-        }
+        let deleted = pkg.object;
         drop(pkg);
+        bliss_rt::packages::unregister(deleted);
 
         for package in store.packages.values() {
             let mut package = package
                 .write()
                 .map_err(|_| lock_poisoned_error("package deletion"))?;
-            package.use_list.retain(|handle| pkg_id(*handle) != id);
-            package.local_nicknames.retain(|_, other| *other != id);
+            package.use_list.retain(|handle| *handle != deleted);
+            package.local_nicknames.retain(|_, other| *other != deleted);
         }
         Ok(())
     }
@@ -612,9 +667,8 @@ impl PackageRegistry {
             .map(|store| {
                 store
                     .packages
-                    .keys()
-                    .copied()
-                    .map(BlissVal::from_meta_handle)
+                    .values()
+                    .filter_map(|package| package.read().ok().map(|package| package.object))
                     .collect()
             })
             .unwrap_or_default()
@@ -662,10 +716,10 @@ pub fn intern(name: &str, package: BlissVal) -> Result<(BlissVal, InternStatus),
         .write()
         .map_err(|_| lock_poisoned_error("intern"))?;
 
-    if let Some(&sym) = package_guard.internal_symbols.get(name) {
+    if let Some(sym) = package_guard.internal_symbols.get(name) {
         return Ok((sym, InternStatus::Internal));
     }
-    if let Some(&sym) = package_guard.external_symbols.get(name) {
+    if let Some(sym) = package_guard.external_symbols.get(name) {
         return Ok((sym, InternStatus::External));
     }
 
@@ -673,27 +727,39 @@ pub fn intern(name: &str, package: BlissVal) -> Result<(BlissVal, InternStatus),
     drop(package_guard);
     for used_pkg_handle in visible_packages {
         if let Some(used_pkg) = registry.packages.get(&pkg_id(used_pkg_handle)) {
-            let used_pkg = used_pkg
-                .read()
-                .map_err(|_| lock_poisoned_error("intern"))?;
-            if let Some(&sym) = used_pkg.external_symbols.get(name) {
+            let used_pkg = used_pkg.read().map_err(|_| lock_poisoned_error("intern"))?;
+            if let Some(sym) = used_pkg.external_symbols.get(name) {
                 return Ok((sym, InternStatus::Inherited));
             }
         }
     }
 
     let package_handle = lookup_package_arc(&registry, package)?;
-    let mut package = package_handle
+    let package_name = {
+        let package = package_handle
+            .read()
+            .map_err(|_| lock_poisoned_error("intern"))?;
+        if let Some(sym) = package.internal_symbols.get(name) {
+            return Ok((sym, InternStatus::Internal));
+        }
+        if let Some(sym) = package.external_symbols.get(name) {
+            return Ok((sym, InternStatus::External));
+        }
+        package.name.clone()
+    };
+    // Symbol/package registry access has a lower global rank than a package
+    // object lock, so allocate before reacquiring the package for insertion.
+    let sym = alloc_symbol(&package_name, name);
+    let package = package_handle
         .write()
         .map_err(|_| lock_poisoned_error("intern"))?;
-    if let Some(&sym) = package.internal_symbols.get(name) {
-        return Ok((sym, InternStatus::Internal));
+    if let Some(existing) = package.internal_symbols.get(name) {
+        return Ok((existing, InternStatus::Internal));
     }
-    if let Some(&sym) = package.external_symbols.get(name) {
-        return Ok((sym, InternStatus::External));
+    if let Some(existing) = package.external_symbols.get(name) {
+        return Ok((existing, InternStatus::External));
     }
-    let sym = alloc_symbol(&package.name, name);
-    package.internal_symbols.insert(name.to_string(), sym);
+    package.internal_symbols.insert(name, sym);
     Ok((sym, InternStatus::New))
 }
 
@@ -721,19 +787,24 @@ pub fn find_symbol(
         .read()
         .map_err(|_| lock_poisoned_error("find-symbol"))?;
 
-    if let Some(&sym) = package.internal_symbols.get(name) {
+    if let Some(sym) = package.internal_symbols.get(name) {
         return Ok(Some((sym, InternStatus::Internal)));
     }
-    if let Some(&sym) = package.external_symbols.get(name) {
+    if let Some(sym) = package.external_symbols.get(name) {
         return Ok(Some((sym, InternStatus::External)));
     }
 
-    for used_pkg_handle in &package.use_list {
-        if let Some(used_pkg) = registry.packages.get(&pkg_id(*used_pkg_handle)) {
+    // Never nest per-package locks just to traverse a use-list. Snapshot the
+    // handles under the target lock, then acquire each used package separately;
+    // true multi-package operations use ascending package-id order.
+    let use_list = package.use_list.clone();
+    drop(package);
+    for used_pkg_handle in use_list {
+        if let Some(used_pkg) = registry.packages.get(&pkg_id(used_pkg_handle)) {
             let used_pkg = used_pkg
                 .read()
                 .map_err(|_| lock_poisoned_error("find-symbol"))?;
-            if let Some(&sym) = used_pkg.external_symbols.get(name) {
+            if let Some(sym) = used_pkg.external_symbols.get(name) {
                 return Ok(Some((sym, InternStatus::Inherited)));
             }
         }
@@ -750,21 +821,25 @@ pub fn export(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissError>
         .read()
         .map_err(|_| lock_poisoned_error("export"))?;
     let package = lookup_package_arc(&registry, package)?;
-    let mut package = package
-        .write()
-        .map_err(|_| lock_poisoned_error("export"))?;
+    let package = package.write().map_err(|_| lock_poisoned_error("export"))?;
 
     for &sym in symbols {
         let sym_name = package
             .internal_symbols
-            .iter()
-            .find(|(_, v)| **v == sym)
-            .map(|(k, _)| k.clone());
+            .entries()
+            .into_iter()
+            .find(|(_, value)| *value == sym)
+            .map(|(name, _)| name);
 
         if let Some(name) = sym_name {
             package.internal_symbols.remove(&name);
-            package.external_symbols.insert(name, sym);
-        } else if !package.external_symbols.values().any(|&v| v == sym) {
+            package.external_symbols.insert(&name, sym);
+        } else if !package
+            .external_symbols
+            .values()
+            .into_iter()
+            .any(|v| v == sym)
+        {
             return Err(BlissError::PackageError(
                 "Symbol not accessible in package".to_string(),
             ));
@@ -781,19 +856,20 @@ pub fn unexport(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissErro
         .read()
         .map_err(|_| lock_poisoned_error("unexport"))?;
     let package = lookup_package_arc(&registry, package)?;
-    let mut package = package
+    let package = package
         .write()
         .map_err(|_| lock_poisoned_error("unexport"))?;
 
     for &sym in symbols {
         let sym_name = package
             .external_symbols
-            .iter()
-            .find(|(_, v)| **v == sym)
-            .map(|(k, _)| k.clone());
+            .entries()
+            .into_iter()
+            .find(|(_, value)| *value == sym)
+            .map(|(name, _)| name);
         if let Some(name) = sym_name {
             package.external_symbols.remove(&name);
-            package.internal_symbols.insert(name, sym);
+            package.internal_symbols.insert(&name, sym);
         }
     }
     Ok(())
@@ -813,9 +889,10 @@ pub fn unintern(symbol: BlissVal, package: BlissVal) -> Result<bool, BlissError>
 
     let removed_internal = package
         .internal_symbols
-        .iter()
-        .find(|(_, v)| **v == symbol)
-        .map(|(k, _)| k.clone());
+        .entries()
+        .into_iter()
+        .find(|(_, value)| *value == symbol)
+        .map(|(name, _)| name);
     if let Some(name) = removed_internal {
         package.internal_symbols.remove(&name);
         package.shadowing_symbols.remove(&name);
@@ -824,9 +901,10 @@ pub fn unintern(symbol: BlissVal, package: BlissVal) -> Result<bool, BlissError>
 
     let removed_external = package
         .external_symbols
-        .iter()
-        .find(|(_, v)| **v == symbol)
-        .map(|(k, _)| k.clone());
+        .entries()
+        .into_iter()
+        .find(|(_, value)| *value == symbol)
+        .map(|(name, _)| name);
     if let Some(name) = removed_external {
         package.external_symbols.remove(&name);
         package.shadowing_symbols.remove(&name);
@@ -891,12 +969,10 @@ pub fn import(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissError>
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut target = target
-        .write()
-        .map_err(|_| lock_poisoned_error("import"))?;
+    let target = target.write().map_err(|_| lock_poisoned_error("import"))?;
 
     for (&sym, name) in symbols.iter().zip(resolved) {
-        if let Some(&existing) = target.internal_symbols.get(&name) {
+        if let Some(existing) = target.internal_symbols.get(&name) {
             if existing != sym {
                 return Err(BlissError::PackageError(format!(
                     "Name conflict for symbol {:?}",
@@ -905,7 +981,7 @@ pub fn import(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissError>
             }
             continue;
         }
-        if let Some(&existing) = target.external_symbols.get(&name) {
+        if let Some(existing) = target.external_symbols.get(&name) {
             if existing != sym {
                 return Err(BlissError::PackageError(format!(
                     "Name conflict for symbol {:?}",
@@ -914,7 +990,7 @@ pub fn import(symbols: &[BlissVal], package: BlissVal) -> Result<(), BlissError>
             }
             continue;
         }
-        target.internal_symbols.insert(name, sym);
+        target.internal_symbols.insert(&name, sym);
     }
     Ok(())
 }
@@ -942,7 +1018,7 @@ pub fn shadowing_import(symbols: &[BlissVal], package: BlissVal) -> Result<(), B
     for (&sym, name) in symbols.iter().zip(resolved) {
         target.internal_symbols.remove(&name);
         target.external_symbols.remove(&name);
-        target.internal_symbols.insert(name.clone(), sym);
+        target.internal_symbols.insert(&name, sym);
         target.shadowing_symbols.insert(name);
     }
     Ok(())
@@ -956,16 +1032,35 @@ pub fn shadow(names: &[&str], package: BlissVal) -> Result<(), BlissError> {
         .read()
         .map_err(|_| lock_poisoned_error("shadow"))?;
     let target = lookup_package_arc(&registry, package)?;
-    let mut target = target
-        .write()
-        .map_err(|_| lock_poisoned_error("shadow"))?;
+    let (package_name, missing) = {
+        let target = target.read().map_err(|_| lock_poisoned_error("shadow"))?;
+        let missing = names
+            .iter()
+            .copied()
+            .filter(|name| {
+                !target.internal_symbols.contains_key(name)
+                    && !target.external_symbols.contains_key(name)
+            })
+            .collect::<Vec<_>>();
+        (target.name.clone(), missing)
+    };
+    // Symbol allocation consults the lower-ranked runtime package registry.
+    // Prepare candidates before reacquiring the package object, then recheck
+    // under the write lock to tolerate concurrent interning.
+    let candidates = missing
+        .into_iter()
+        .map(|name| (name, alloc_symbol(&package_name, name)))
+        .collect::<Vec<_>>();
+    let mut target = target.write().map_err(|_| lock_poisoned_error("shadow"))?;
 
-    for &name in names {
-        if !target.internal_symbols.contains_key(name) && !target.external_symbols.contains_key(name)
+    for (name, sym) in candidates {
+        if !target.internal_symbols.contains_key(name)
+            && !target.external_symbols.contains_key(name)
         {
-            let sym = alloc_symbol(&target.name, name);
-            target.internal_symbols.insert(name.to_string(), sym);
+            target.internal_symbols.insert(name, sym);
         }
+    }
+    for &name in names {
         target.shadowing_symbols.insert(name.to_string());
     }
     Ok(())
@@ -984,30 +1079,27 @@ pub fn shadow(names: &[&str], package: BlissVal) -> Result<(), BlissError> {
 pub fn find_package(name: &str) -> Option<BlissVal> {
     let store = current_store().ok()?;
     let g = store.state.read().ok()?;
-    g.name_index
-        .get(name)
-        .copied()
-        .map(BlissVal::from_meta_handle)
+    lookup_named_package(&g, name)
 }
 
 /// True if `value` is a live package handle in the active registry. Cheap
 /// discriminator for PACKAGEP / TYPEP 'PACKAGE and the printer.
 pub fn is_package(value: BlissVal) -> bool {
-    if !value.is_meta_handle() {
+    if !bliss_rt::types::packagep(value) {
         return false;
     }
     current_store()
         .ok()
         .and_then(|store| {
             let g = store.state.read().ok()?;
-            Some(g.packages.contains_key(&value.as_meta_handle_id()))
+            Some(g.packages.contains_key(&pkg_id(value)))
         })
         .unwrap_or(false)
 }
 
 /// The canonical name of a package handle.
 pub fn package_name(package: BlissVal) -> Option<String> {
-    if !package.is_meta_handle() {
+    if !bliss_rt::types::packagep(package) {
         return None;
     }
     let store = current_store().ok()?;
@@ -1047,9 +1139,8 @@ pub fn list_all_packages() -> Vec<BlissVal> {
             let g = store.state.read().ok()?;
             Some(
                 g.packages
-                    .keys()
-                    .copied()
-                    .map(BlissVal::from_meta_handle)
+                    .values()
+                    .filter_map(|package| package.read().ok().map(|package| package.object))
                     .collect(),
             )
         })
@@ -1063,8 +1154,8 @@ pub fn present_symbols(package: BlissVal) -> Vec<BlissVal> {
         let g = store.state.read().ok()?;
         let pkg = g.packages.get(&pkg_id(package))?;
         let pkg = pkg.read().ok()?;
-        let mut out: Vec<BlissVal> = pkg.internal_symbols.values().copied().collect();
-        out.extend(pkg.external_symbols.values().copied());
+        let mut out = pkg.internal_symbols.values();
+        out.extend(pkg.external_symbols.values());
         Some(out)
     })()
     .unwrap_or_default()
@@ -1076,7 +1167,7 @@ pub fn external_symbols_of(package: BlissVal) -> Vec<BlissVal> {
         let store = current_store().ok()?;
         let g = store.state.read().ok()?;
         let pkg = g.packages.get(&pkg_id(package))?;
-        Some(pkg.read().ok()?.external_symbols.values().copied().collect())
+        Some(pkg.read().ok()?.external_symbols.values())
     })()
     .unwrap_or_default()
 }
@@ -1089,12 +1180,12 @@ pub fn accessible_symbols(package: BlissVal) -> Vec<BlissVal> {
         let g = store.state.read().ok()?;
         let pkg = g.packages.get(&pkg_id(package))?;
         let pkg = pkg.read().ok()?;
-        let mut out: Vec<BlissVal> = pkg.internal_symbols.values().copied().collect();
-        out.extend(pkg.external_symbols.values().copied());
+        let mut out = pkg.internal_symbols.values();
+        out.extend(pkg.external_symbols.values());
         for used in &pkg.use_list {
             if let Some(u) = g.packages.get(&pkg_id(*used)) {
                 if let Ok(u) = u.read() {
-                    out.extend(u.external_symbols.values().copied());
+                    out.extend(u.external_symbols.values());
                 }
             }
         }
@@ -1113,7 +1204,6 @@ pub fn find_present_symbol(package: BlissVal, bare_name: &str) -> Option<BlissVa
     pkg.internal_symbols
         .get(bare_name)
         .or_else(|| pkg.external_symbols.get(bare_name))
-        .copied()
 }
 
 /// True if `name` is externally accessible (present as an external, or the name
@@ -1140,15 +1230,18 @@ pub fn add_symbol(
     external: bool,
 ) -> Result<(), BlissError> {
     let store = current_store()?;
-    let g = store.state.read().map_err(|_| lock_poisoned_error("add_symbol"))?;
+    let g = store
+        .state
+        .read()
+        .map_err(|_| lock_poisoned_error("add_symbol"))?;
     let pkg = lookup_package_arc(&g, package)?;
     drop(g);
-    let mut pkg = pkg.write().map_err(|_| lock_poisoned_error("add_symbol"))?;
+    let pkg = pkg.write().map_err(|_| lock_poisoned_error("add_symbol"))?;
     if external {
         pkg.internal_symbols.remove(bare_name);
-        pkg.external_symbols.insert(bare_name.to_string(), sym);
+        pkg.external_symbols.insert(bare_name, sym);
     } else if !pkg.external_symbols.contains_key(bare_name) {
-        pkg.internal_symbols.insert(bare_name.to_string(), sym);
+        pkg.internal_symbols.insert(bare_name, sym);
     }
     Ok(())
 }
@@ -1164,14 +1257,14 @@ pub fn make_package(
         .state
         .write()
         .map_err(|_| lock_poisoned_error("make_package"))?;
-    if g.name_index.contains_key(name) {
+    if lookup_named_package(&g, name).is_some() {
         return Err(BlissError::PackageError(format!(
             "Package named {:?} already exists",
             name
         )));
     }
     for nick in nicknames {
-        if g.name_index.contains_key(*nick) {
+        if lookup_named_package(&g, nick).is_some() {
             return Err(BlissError::PackageError(format!(
                 "Nickname {:?} conflicts with an existing package",
                 nick
@@ -1180,8 +1273,8 @@ pub fn make_package(
     }
     let mut resolved_uses = Vec::new();
     for use_name in use_list {
-        match g.name_index.get(*use_name) {
-            Some(&id) => resolved_uses.push(BlissVal::from_meta_handle(id)),
+        match lookup_named_package(&g, use_name) {
+            Some(package) => resolved_uses.push(package),
             None => {
                 return Err(BlissError::PackageError(format!(
                     "Package {:?} not found for use-list",
@@ -1190,14 +1283,22 @@ pub fn make_package(
             }
         }
     }
-    let (id, handle) = alloc_package_id();
-    let mut pkg = Package::new(name);
+    let handle = bliss_rt::packages::find_or_create(name);
+    let id = pkg_id(handle);
+    let mut pkg = Package::new(name, handle)?;
     pkg.nicknames = nicknames.iter().map(|s| s.to_string()).collect();
     pkg.use_list = resolved_uses;
-    g.packages.insert(id, Arc::new(RwLock::new(pkg)));
-    g.name_index.insert(name.to_string(), id);
+    g.packages.insert(
+        id,
+        Arc::new(OrderedRwLock::new(
+            LockLevel::Package,
+            id.max(1),
+            "package object",
+            pkg,
+        )),
+    );
     for nick in nicknames {
-        g.name_index.insert((*nick).to_string(), id);
+        bliss_rt::packages::add_nickname(name, nick);
     }
     Ok(handle)
 }
@@ -1206,13 +1307,13 @@ pub fn make_package(
 /// a *different* package.
 pub fn add_nickname(package: BlissVal, nickname: &str) -> Result<(), BlissError> {
     let store = current_store()?;
-    let mut g = store
+    let g = store
         .state
-        .write()
+        .read()
         .map_err(|_| lock_poisoned_error("add_nickname"))?;
     let id = pkg_id(package);
-    match g.name_index.get(nickname).copied() {
-        Some(existing) if existing == id => return Ok(()),
+    match lookup_named_package(&g, nickname) {
+        Some(existing) if existing == package => return Ok(()),
         Some(_) => {
             return Err(BlissError::PackageError(format!(
                 "Nickname {:?} conflicts with an existing package",
@@ -1226,13 +1327,21 @@ pub fn add_nickname(package: BlissVal, nickname: &str) -> Result<(), BlissError>
         .get(&id)
         .cloned()
         .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
-    {
-        let mut pkg = pkg.write().map_err(|_| lock_poisoned_error("add_nickname"))?;
+    let canonical_name = {
+        let mut pkg = pkg
+            .write()
+            .map_err(|_| lock_poisoned_error("add_nickname"))?;
         if !pkg.nicknames.iter().any(|n| n == nickname) {
             pkg.nicknames.push(nickname.to_string());
         }
-    }
-    g.name_index.insert(nickname.to_string(), id);
+        pkg.name.clone()
+    };
+    // Do not recursively enter the package registry through package_name while
+    // its read guard is live. The canonical name is already available from the
+    // package guard above; release both guards before updating the runtime's
+    // global name index.
+    drop(g);
+    bliss_rt::packages::add_nickname(&canonical_name, nickname);
     Ok(())
 }
 
@@ -1243,24 +1352,20 @@ pub fn delete_package(name: &str) -> Result<(), BlissError> {
         .state
         .write()
         .map_err(|_| lock_poisoned_error("delete_package"))?;
-    let Some(id) = g.name_index.get(name).copied() else {
+    let Some(package) = lookup_named_package(&g, name) else {
         return Ok(());
     };
+    let id = pkg_id(package);
     if let Some(pkg) = g.packages.remove(&id) {
         if let Ok(pkg) = pkg.read() {
-            let names: Vec<String> = std::iter::once(pkg.name.clone())
-                .chain(pkg.nicknames.iter().cloned())
-                .collect();
             drop(pkg);
-            for n in names {
-                g.name_index.remove(&n);
-            }
+            bliss_rt::packages::unregister(package);
         }
     }
     for pkg in g.packages.values() {
         if let Ok(mut pkg) = pkg.write() {
-            pkg.use_list.retain(|handle| pkg_id(*handle) != id);
-            pkg.local_nicknames.retain(|_, other| *other != id);
+            pkg.use_list.retain(|handle| *handle != package);
+            pkg.local_nicknames.retain(|_, other| *other != package);
         }
     }
     Ok(())
@@ -1274,13 +1379,13 @@ pub fn rename_package(
     new_nicknames: &[&str],
 ) -> Result<BlissVal, BlissError> {
     let store = current_store()?;
-    let mut g = store
+    let g = store
         .state
-        .write()
+        .read()
         .map_err(|_| lock_poisoned_error("rename_package"))?;
     let id = pkg_id(package);
-    if let Some(&existing) = g.name_index.get(new_name) {
-        if existing != id {
+    if let Some(existing) = lookup_named_package(&g, new_name) {
+        if existing != package {
             return Err(BlissError::PackageError(format!(
                 "Package named {:?} already exists",
                 new_name
@@ -1288,8 +1393,8 @@ pub fn rename_package(
         }
     }
     for nick in new_nicknames {
-        if let Some(&existing) = g.name_index.get(*nick) {
-            if existing != id {
+        if let Some(existing) = lookup_named_package(&g, nick) {
+            if existing != package {
                 return Err(BlissError::PackageError(format!(
                     "Nickname {:?} conflicts with an existing package",
                     nick
@@ -1303,24 +1408,14 @@ pub fn rename_package(
         .cloned()
         .ok_or_else(|| BlissError::PackageError("Package not found".to_string()))?;
     {
-        let pkg = pkg_arc.read().map_err(|_| lock_poisoned_error("rename_package"))?;
-        g.name_index.remove(&pkg.name);
-        for nick in &pkg.nicknames {
-            g.name_index.remove(nick);
-        }
-    }
-    {
         let mut pkg = pkg_arc
             .write()
             .map_err(|_| lock_poisoned_error("rename_package"))?;
         pkg.name = new_name.to_string();
         pkg.nicknames = new_nicknames.iter().map(|s| s.to_string()).collect();
     }
-    g.name_index.insert(new_name.to_string(), id);
-    for nick in new_nicknames {
-        g.name_index.insert((*nick).to_string(), id);
-    }
-    Ok(BlissVal::from_meta_handle(id))
+    bliss_rt::packages::rename(package, new_name, new_nicknames)?;
+    Ok(package)
 }
 
 /// Add `used` to `target`'s use-list by *name* (both must already exist).

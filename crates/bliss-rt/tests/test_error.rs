@@ -5,7 +5,7 @@
 //! Send/Sync bounds, and non_exhaustive match routing.
 
 use bliss_rt::error::BlissError;
-use bliss_rt::thread::GreenThreadId;
+use bliss_rt::thread::FiberId;
 use bliss_rt::value::BlissVal;
 
 // ══════════════════════════════════════════════════════════════════
@@ -17,7 +17,7 @@ fn construct_all_variants() {
     // Verify every variant can be constructed without panic
     let _errs: Vec<BlissError> = vec![
         BlissError::Oom,
-        BlissError::StackOverflow(GreenThreadId(42)),
+        BlissError::StackOverflow(FiberId(42)),
         BlissError::InvalidImage("corrupt header".into()),
         BlissError::FfiError("dlopen failed".into()),
         BlissError::SignalError(11),
@@ -50,17 +50,17 @@ fn display_oom() {
 
 #[test]
 fn display_stack_overflow() {
-    let err = BlissError::StackOverflow(GreenThreadId(7));
+    let err = BlissError::StackOverflow(FiberId(7));
     assert_eq!(err.to_string(), "stack overflow in thread 7");
 }
 
 #[test]
 fn display_stack_overflow_edge_ids() {
     assert_eq!(
-        BlissError::StackOverflow(GreenThreadId(0)).to_string(),
+        BlissError::StackOverflow(FiberId(0)).to_string(),
         "stack overflow in thread 0"
     );
-    let large = BlissError::StackOverflow(GreenThreadId(u64::MAX)).to_string();
+    let large = BlissError::StackOverflow(FiberId(u64::MAX)).to_string();
     assert!(large.contains(&u64::MAX.to_string()));
 }
 
@@ -196,7 +196,7 @@ fn bliss_error_all_variants_as_dyn_error() {
     // Every variant must be usable as dyn Error
     let errors: Vec<Box<dyn std::error::Error>> = vec![
         Box::new(BlissError::Oom),
-        Box::new(BlissError::StackOverflow(GreenThreadId(1))),
+        Box::new(BlissError::StackOverflow(FiberId(1))),
         Box::new(BlissError::InvalidImage("x".into())),
         Box::new(BlissError::FfiError("x".into())),
         Box::new(BlissError::SignalError(2)),
@@ -237,7 +237,7 @@ fn debug_unit_variants() {
 
 #[test]
 fn debug_stack_overflow_contains_thread_id() {
-    let dbg = format!("{:?}", BlissError::StackOverflow(GreenThreadId(99)));
+    let dbg = format!("{:?}", BlissError::StackOverflow(FiberId(99)));
     assert!(dbg.contains("StackOverflow"), "got: {}", dbg);
     assert!(dbg.contains("99"), "got: {}", dbg);
 }
@@ -362,10 +362,7 @@ fn match_routing_with_wildcard_arm() {
         }
     };
     assert_eq!(classify(&BlissError::Oom), "oom");
-    assert_eq!(
-        classify(&BlissError::StackOverflow(GreenThreadId(1))),
-        "stack"
-    );
+    assert_eq!(classify(&BlissError::StackOverflow(FiberId(1))), "stack");
     assert_eq!(classify(&BlissError::InvalidImage("x".into())), "image");
     assert_eq!(classify(&BlissError::FfiError("x".into())), "ffi");
     assert_eq!(classify(&BlissError::SignalError(1)), "signal");

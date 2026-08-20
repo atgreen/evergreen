@@ -5,19 +5,10 @@
 //! (P6) → emit x86-64 (emit.rs) → make executable (`bliss_rt::jit`). The result is
 //! a [`CompiledT2`] whose entry pointer is a callable native function.
 //!
-//! ## Tiering boundary (honest scope)
-//!
-//! [`compile`] is the tiering *primitive*: it turns a hot function's bytecode
-//! into runnable native code. What is NOT wired here is installation into the
-//! **live** interpreter's dispatch (the `bliss` crate's T0/T1 path): doing that
-//! requires the emitter to implement the interpreter's function-call ABI —
-//! reading arguments from the `BlissStack` frame, calling other functions
-//! (`CallNamed` → c2i), spills, and a real stack frame — which the first-cut
-//! emitter (`emit.rs`) does not yet do. Today `compile` therefore succeeds only
-//! for the emittable subset (leaf, no-arg, no-call functions — e.g. a constant
-//! or straight-line integer result); it returns `Err` (staying at T1, spec R4.28)
-//! for anything else. Promotion + atomic install in `bliss` is the next step,
-//! gated on that emitter ABI work.
+//! [`compile`] exercises the compact standalone emitter. Live interpreter
+//! promotion uses `emit_framed` in the `bliss` crate, but both routes share SSA
+//! lowering and regalloc2. Either route declines cleanly when allocation or
+//! emission cannot represent a function (spec R4.28).
 
 use bliss_rt::bytecode::BytecodeFunction;
 use bliss_rt::jit::JitBuffer;
@@ -38,6 +29,7 @@ use crate::t2::verify::{VerifyError, verify};
 pub enum CompileError {
     Build(BuildError),
     Verify(Vec<VerifyError>),
+    RegAlloc(regalloc2::RegAllocError),
     Emit(EmitError),
     /// The executable buffer could not be mapped.
     Jit,
@@ -85,7 +77,7 @@ pub fn compile(bf: &BytecodeFunction, opt: bool) -> Result<CompiledT2, CompileEr
 
     // Back: lower → allocate → emit → make executable.
     let mut mf = lower(&f);
-    allocate(&mut mf);
+    allocate(&mut mf).map_err(CompileError::RegAlloc)?;
     let code = emit(&mf).map_err(CompileError::Emit)?;
     let code_len = code.len();
     let buf = JitBuffer::new(&code).ok_or(CompileError::Jit)?;
@@ -107,6 +99,7 @@ mod tests {
             names: vec![],
             restart_cases: vec![],
             param_layout: vec![],
+            param_types: vec![],
             has_env: false,
             n_locals,
             max_stack,

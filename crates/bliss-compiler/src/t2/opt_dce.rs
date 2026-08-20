@@ -138,9 +138,7 @@ impl Pass for Dce {
                         let v = *value;
                         if is_removable(f, &live, v) {
                             visiting.clear();
-                            if let Some(new @ ValueSource::Remat(_)) =
-                                resolve(f, &live, v, remat, &mut visiting)
-                            {
+                            if let Some(new) = resolve(f, &live, v, remat, &mut visiting) {
                                 *src = new;
                             }
                         }
@@ -271,6 +269,29 @@ fn resolve(
     if visiting.contains(&v) {
         return None; // cyclic — refuse (R4.64)
     }
+    // Constants already have the exact tagged representation a FrameState
+    // needs. Preserve that payload directly; a zero-input `RematOp::Const`
+    // recipe cannot reconstruct which constant it represented.
+    {
+        use crate::t2::ir::AuxData;
+        use bliss_rt::value::{BlissVal, NIL, T};
+        let data = f.inst(inst);
+        let constant = match (data.opcode, &data.aux) {
+            (Opcode::ConstFixnum, AuxData::FixnumImm(n)) => Some(BlissVal::from_fixnum(*n)),
+            (Opcode::ConstFloat, AuxData::FloatImm(x)) => Some(BlissVal::from_single_float(*x)),
+            (Opcode::ConstChar, AuxData::CharImm(c)) => Some(BlissVal::from_char(*c)),
+            (Opcode::ConstSymbol, AuxData::SymbolRef(sym)) => {
+                Some(BlissVal::from_symbol_index(*sym))
+            }
+            (Opcode::ConstHeapObj, AuxData::HeapLiteral(value)) => Some(*value),
+            (Opcode::ConstNil, _) => Some(NIL),
+            (Opcode::ConstT, _) => Some(T),
+            _ => None,
+        };
+        if let Some(value) = constant {
+            return Some(ValueSource::Const(value));
+        }
+    }
     let op = remat_op(f.inst(inst).opcode)?;
     visiting.push(v);
     let args = f.inst(inst).args.clone();
@@ -391,39 +412,38 @@ mod tests {
         Dce::default().run(f, &mut Analyses::new());
     }
 
-    /// A pure value used ONLY by a FrameState is rematerialised: the fast-path
-    /// instruction is gone and the FrameState now holds a `Remat`.
+    /// A constant used only by a FrameState is preserved as its exact tagged
+    /// payload; a zero-input recipe cannot encode which constant it was.
     #[test]
     fn deopt_only_pure_value_is_rematerialised() {
         let mut f = Function::new("remat");
         let entry = f.entry();
+        let mut constant = inst(Opcode::ConstFixnum, vec![], InstFlags::default());
+        constant.aux = AuxData::FixnumImm(7);
         let (cinst, cres) = f.push_inst(
             entry,
-            inst(Opcode::ConstFixnum, vec![], InstFlags::default()),
-            &[(fixnum(), VR::UnboxedFixnum)],
+            constant,
+            &[(fixnum(), VR::Tagged)],
         );
         let c = cres[0];
         f.set_terminator(entry, ret(vec![])); // c has NO real use
         let fsid = f.frame_states.add(frame(vec![ValueSource::Value {
             value: c,
-            repr: VR::UnboxedFixnum,
+            repr: VR::Tagged,
         }]));
 
         run(&mut f);
 
         // Fast-path const instruction removed from the block.
         assert!(!f.block(entry).insts.contains(&cinst));
-        // FrameState slot is now a Remat recipe reconstructing the constant.
+        // FrameState slot carries the exact constant; no ambiguous recipe exists.
         let fs = f.frame_states.get(fsid);
-        match &fs.scopes[0].locals[0] {
-            ValueSource::Remat(id) => {
-                let r = &fs.remat[id.0 as usize];
-                assert_eq!(r.op, RematOp::Const);
-                assert!(r.inputs.is_empty());
-                assert_eq!(r.result_repr, VR::UnboxedFixnum);
-            }
-            other => panic!("expected Remat, got {other:?}"),
-        }
+        assert!(matches!(
+            fs.scopes[0].locals[0],
+            ValueSource::Const(value)
+                if value == bliss_rt::value::BlissVal::from_fixnum(7)
+        ));
+        assert!(fs.remat.is_empty());
     }
 
     /// A value with a real (fast-path) use survives DCE untouched.
@@ -503,9 +523,11 @@ mod tests {
         let mut f = Function::new("compose");
         let entry = f.entry();
         let a = f.add_block_param(entry, fixnum(), VR::Tagged);
+        let mut constant = inst(Opcode::ConstFixnum, vec![], InstFlags::default());
+        constant.aux = AuxData::FixnumImm(11);
         let (cinst, cres) = f.push_inst(
             entry,
-            inst(Opcode::ConstFixnum, vec![], InstFlags::default()),
+            constant,
             &[(fixnum(), VR::Tagged)],
         );
         let c = cres[0];
@@ -535,13 +557,12 @@ mod tests {
         };
         assert_eq!(top.op, RematOp::FixnumAdd);
         assert_eq!(top.inputs.len(), 2);
-        // Input 0 is the nested Const recipe; input 1 is the surviving param `a`.
-        match &top.inputs[0] {
-            ValueSource::Remat(id) => {
-                assert_eq!(fs.remat[id.0 as usize].op, RematOp::Const)
-            }
-            other => panic!("expected nested Remat(Const), got {other:?}"),
-        }
+        // Input 0 is the exact tagged constant; input 1 is the surviving param `a`.
+        assert!(matches!(
+            top.inputs[0],
+            ValueSource::Const(value)
+                if value == bliss_rt::value::BlissVal::from_fixnum(11)
+        ));
         match top.inputs[1] {
             ValueSource::Value { value, .. } => assert_eq!(value, a),
             ref other => panic!("expected Value(a), got {other:?}"),

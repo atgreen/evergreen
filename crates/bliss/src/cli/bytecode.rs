@@ -36,17 +36,16 @@ use std::rc::Rc;
 use bliss_compiler::macroexpand::{self as compiler_macroexpand, Environment as MacroexpandEnv};
 use bliss_compiler::reader;
 use bliss_rt::error::BlissError;
-use bliss_rt::value::{BlissVal, NIL, T};
 use bliss_rt::stack::StackMapEntry;
+use bliss_rt::value::{BlissVal, NIL, T};
 use bliss_rt::{CodeInfo, Frame};
 
 use super::{
     Env, EnvFrame, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry, RestartFunction,
-    apply_function,
-    arena_cons, bliss_error_to_condition, condition_matches_handler, cp, eval_form,
-    handler_case_token, list_to_vec, next_control_token, resolve_sym, restart_invoked_name,
-    run_handler_bind_handlers, store_control_value, sym_name, symbol_bare_name, tag_key,
-    take_control_value, val_as_str, vec_to_list,
+    apply_function, arena_cons, arena_str, bliss_error_to_condition, condition_matches_handler, cp,
+    eval_form, handler_case_token, list_to_vec, next_control_token, resolve_sym,
+    restart_invoked_name, run_handler_bind_handlers, store_control_value, sym_name,
+    symbol_bare_name, tag_key, take_control_value, val_as_str, vec_to_list,
 };
 // Label-based assembler backing the native (T1) code emitter (see cli::asm).
 use bliss_rt::asm::{Asm, Cc, Label};
@@ -82,7 +81,8 @@ pub fn backend_is_bytecode() -> bool {
 // dependency cycle. This crate keeps the *lowering* (forms → bytecode), the T0
 // interpreter, and the T1 native emitter that operate on these types.
 use bliss_rt::bytecode::{
-    BytecodeFunction, ClauseInfo, HandlerBindInfo, HandlerCaseInfo, Instr, RestartCaseInfo, VarLoc,
+    BytecodeFunction, ClauseInfo, DeclaredType, HandlerBindInfo, HandlerCaseInfo, Instr,
+    RestartCaseInfo, VarLoc,
 };
 
 // ── Per-thread registry of compiled functions ─────────────────────
@@ -92,6 +92,9 @@ thread_local! {
     /// first; a hit runs as a native frame on the `BlissStack`, a miss falls
     /// back to `apply_function` (builtins, generics, tree-walker functions).
     static REGISTRY: RefCell<HashMap<u32, Rc<BytecodeFunction>>> = RefCell::new(HashMap::new());
+    /// Definition generations reject background compilations that finish after
+    /// a DEFUN has replaced their bytecode snapshot.
+    static REGISTRY_GENERATION: RefCell<HashMap<u32, u64>> = RefCell::new(HashMap::new());
 }
 
 /// Build a proper list `(items...)` in the arena, for synthesising macro-style
@@ -109,23 +112,46 @@ fn registry_get(sym: u32) -> Option<Rc<BytecodeFunction>> {
 }
 
 fn registry_put(sym: u32, f: Rc<BytecodeFunction>) {
-    REGISTRY.with(|r| r.borrow_mut().insert(sym, f));
+    REGISTRY_GENERATION.with(|g| {
+        let mut generations = g.borrow_mut();
+        let next = generations.get(&sym).copied().unwrap_or(0).wrapping_add(1);
+        generations.insert(sym, next);
+    });
+    let old = REGISTRY.with(|r| r.borrow_mut().insert(sym, f));
+    if let Some(old) = old {
+        clear_bytecode_profiles(Rc::as_ptr(&old) as usize);
+    }
+    // A new definition starts a new tiering lifetime.  In particular, a T2
+    // decline for the old body must not suppress compilation of the new one,
+    // and no native entry compiled from the old bytecode may remain callable.
+    NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+    T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+    T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
+    INVOKE_COUNTS.with(|m| m.borrow_mut().remove(&sym));
+    DEOPT_COUNTS.with(|m| m.borrow_mut().remove(&sym));
+    DEOPT_BLACKLIST.with(|s| s.borrow_mut().remove(&sym));
+    PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
+    LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
 }
 
 fn registry_remove(sym: u32) {
-    REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-}
-
-fn t2_inline_options(root: u32) -> bliss_compiler::t2::inlining::InlineOptions {
-    REGISTRY.with(|registry| {
-        registry
-            .borrow()
-            .iter()
-            .fold(
-                bliss_compiler::t2::inlining::InlineOptions::default().with_root_symbol(root),
-                |options, (&symbol, body)| options.with_body(symbol, Rc::clone(body)),
-            )
-    })
+    REGISTRY_GENERATION.with(|g| {
+        let mut generations = g.borrow_mut();
+        let next = generations.get(&sym).copied().unwrap_or(0).wrapping_add(1);
+        generations.insert(sym, next);
+    });
+    let old = REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+    if let Some(old) = old {
+        clear_bytecode_profiles(Rc::as_ptr(&old) as usize);
+    }
+    NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+    T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+    T2_QUEUED.with(|s| s.borrow_mut().remove(&sym));
+    INVOKE_COUNTS.with(|m| m.borrow_mut().remove(&sym));
+    DEOPT_COUNTS.with(|m| m.borrow_mut().remove(&sym));
+    DEOPT_BLACKLIST.with(|s| s.borrow_mut().remove(&sym));
+    PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
+    LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
 }
 
 /// Call a registered GLOBAL bytecode function `sym` from the tree-walker,
@@ -160,28 +186,14 @@ pub fn call_registered(
     }
     let fn_obj = bliss_rt::symbols::symbol_function(sym)
         .filter(|&c| bliss_rt::function::is_interpreted_function(c));
-    // Use installed native code, or promote on crossing the threshold.
-    let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
-    let native = native.or_else(|| {
-        let count = match fn_obj {
-            Some(f) => bliss_rt::function::invoke_count(f),
-            None => INVOKE_COUNTS.with(|m| {
-                let mut b = m.borrow_mut();
-                let e = b.entry(sym).or_insert(0);
-                *e += 1;
-                *e
-            }),
-        };
-        if count < t1_threshold() {
-            return None;
-        }
-        let nc = try_promote(sym)?;
-        if let Some(f) = fn_obj {
-            bliss_rt::function::set_entry(f, nc.entry as *mut u8);
-            bliss_rt::function::set_tier(f, 1);
-        }
-        Some(nc)
-    });
+    // The tree-walker already bumped named function objects in `callable_body`.
+    // Anonymous/gensym bytecode functions have no FnMeta, so maintain their
+    // fallback counter here on every call (including calls after T1 installs).
+    let count = dispatch_invoke_count(sym, fn_obj);
+    if std::env::var_os("BLISS_T1_TRACE").is_some() {
+        eprintln!("[T1] {}: dispatch at invocation {count}", sym_label(sym));
+    }
+    let native = native_for_dispatch(sym, fn_obj, count);
     // Dispatch: native if promoted and under the depth cap, else run the callee
     // as BYTECODE — the profiling warmup tier. This is what gathers the operand
     // -type profile a function needs before it can be speculated at T2, even when
@@ -242,6 +254,26 @@ pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
         "; disassembly of {name} — {} arg(s), {} local(s), {} stack slot(s)  [tier: {tier}]",
         bf.arity, bf.n_locals, bf.max_stack
     );
+    let declared: Vec<String> = bf
+        .param_layout
+        .iter()
+        .zip(&bf.param_types)
+        .filter_map(|((parameter, _), ty)| {
+            let name = match ty {
+                DeclaredType::Any => return None,
+                DeclaredType::Fixnum => "FIXNUM",
+                DeclaredType::SingleFloat => "SINGLE-FLOAT",
+            };
+            Some(format!("{parameter}: {name}"))
+        })
+        .collect();
+    if !declared.is_empty() {
+        let _ = writeln!(
+            out,
+            "; checked parameter declarations: {}",
+            declared.join(", ")
+        );
+    }
 
     match native {
         // Promoted to native: decode the installed machine code (spec: "otherwise
@@ -249,8 +281,12 @@ pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
         Some(nc) => {
             let _ = writeln!(out, "; {} bytes of x86-64 at {:p}", nc.code_len, nc.entry);
             let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
-            let mut dec =
-                iced_x86::Decoder::with_ip(64, bytes, nc.entry as u64, iced_x86::DecoderOptions::NONE);
+            let mut dec = iced_x86::Decoder::with_ip(
+                64,
+                bytes,
+                nc.entry as u64,
+                iced_x86::DecoderOptions::NONE,
+            );
             let mut fmt = iced_x86::NasmFormatter::new();
             let mut insn = iced_x86::Instruction::default();
             let mut line = String::new();
@@ -317,6 +353,8 @@ thread_local! {
     /// compile-coverage diagnostic (bliss-x5y.1). Populated only when
     /// BLISS_BAIL_TRACE is set; read via `bliss-ext:bail-report`.
     static BAIL_LOG: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+    /// Most recent lowering failure, used by the opt-in named compile trace.
+    static LAST_BAIL_REASON: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 fn bail_trace_on() -> bool {
@@ -330,16 +368,27 @@ fn bail_trace_on() -> bool {
 /// `return Err(record_bail(...))` at bail sites.
 fn record_bail(reason: impl FnOnce() -> String) -> Bail {
     if bail_trace_on() {
-        BAIL_LOG.with(|m| *m.borrow_mut().entry(reason()).or_insert(0) += 1);
+        let reason = reason();
+        LAST_BAIL_REASON.with(|last| *last.borrow_mut() = Some(reason.clone()));
+        BAIL_LOG.with(|m| *m.borrow_mut().entry(reason).or_insert(0) += 1);
     }
     Bail
 }
 
+fn reset_last_bail_reason() {
+    if bail_trace_on() {
+        LAST_BAIL_REASON.with(|last| *last.borrow_mut() = None);
+    }
+}
+
+fn last_bail_reason() -> Option<String> {
+    LAST_BAIL_REASON.with(|last| last.borrow().clone())
+}
+
 /// Snapshot of the bail histogram, most frequent first (bliss-x5y.1).
 pub fn bail_report() -> Vec<(String, u32)> {
-    let mut v: Vec<(String, u32)> = BAIL_LOG.with(|m| {
-        m.borrow().iter().map(|(k, &n)| (k.clone(), n)).collect()
-    });
+    let mut v: Vec<(String, u32)> =
+        BAIL_LOG.with(|m| m.borrow().iter().map(|(k, &n)| (k.clone(), n)).collect());
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     v
 }
@@ -349,11 +398,56 @@ pub fn bail_report() -> Vec<(String, u32)> {
 /// the compiler only emits a call when it is certain the callee is a real
 /// function (a user `defun`, or one of these), never a macro or a special
 /// operator masquerading as a call.
+#[allow(dead_code)] // retained as documentation of the original slice-1 surface
 const PRIMITIVE_ALLOWLIST: &[&str] = &[
-    "+", "-", "*", "/", "<", ">", "<=", ">=", "=", "/=", "1+", "1-", "CAR", "CDR", "CONS", "LIST",
-    "NULL", "NOT", "EQ", "EQL", "EQUAL", "ZEROP", "PLUSP", "MINUSP", "ABS", "MIN", "MAX", "MOD",
-    "REM", "CONSP", "ATOM", "LISTP", "EVENP", "ODDP", "GCD", "EXPT", "FLOOR", "CEILING", "TRUNCATE",
-    "VALUES-LIST", "IDENTITY", "FIRST", "REST", "SECOND", "THIRD", "LENGTH", "APPEND", "REVERSE",
+    "+",
+    "-",
+    "*",
+    "/",
+    "<",
+    ">",
+    "<=",
+    ">=",
+    "=",
+    "/=",
+    "1+",
+    "1-",
+    "CAR",
+    "CDR",
+    "CONS",
+    "LIST",
+    "NULL",
+    "NOT",
+    "EQ",
+    "EQL",
+    "EQUAL",
+    "ZEROP",
+    "PLUSP",
+    "MINUSP",
+    "ABS",
+    "MIN",
+    "MAX",
+    "MOD",
+    "REM",
+    "CONSP",
+    "ATOM",
+    "LISTP",
+    "EVENP",
+    "ODDP",
+    "GCD",
+    "EXPT",
+    "FLOOR",
+    "CEILING",
+    "TRUNCATE",
+    "VALUES-LIST",
+    "IDENTITY",
+    "FIRST",
+    "REST",
+    "SECOND",
+    "THIRD",
+    "LENGTH",
+    "APPEND",
+    "REVERSE",
     // Condition-signalling functions (ordinary functions, normal arg order) —
     // reachable via apply_function, so safe to call from bytecode.
     "ERROR",
@@ -613,6 +707,26 @@ impl<'e> Lowerer<'e> {
 
     /// Lower a form so its single value is left on the operand stack.
     fn lower_expr(&mut self, form: BlissVal) -> LowerResult<()> {
+        let result = self.lower_expr_inner(form);
+        if result.is_err() && bail_trace_on() && last_bail_reason().is_none() {
+            let label = if form.is_cons() {
+                let op = cp(form).0;
+                if op.is_symbol() {
+                    format!("form:{}", sym_name(op))
+                } else {
+                    "form:<computed-operator>".to_string()
+                }
+            } else if form.is_symbol() {
+                format!("symbol:{}", sym_name(form))
+            } else {
+                "form:<object>".to_string()
+            };
+            let _ = record_bail(|| label);
+        }
+        result
+    }
+
+    fn lower_expr_inner(&mut self, form: BlissVal) -> LowerResult<()> {
         // Self-evaluating atoms.
         if form.is_nil() || form == T || form.is_fixnum() || form.is_single_float() {
             let c = self.add_const(form);
@@ -782,7 +896,7 @@ impl<'e> Lowerer<'e> {
         self.emit(Instr::Br(0)); // patched
         let br_at = self.code.len() - 1;
         self.pop_n(1); // then-value is conceptually the result; model branches independently
-        // else
+                       // else
         let else_pc = self.code.len() as u32;
         if parts.len() == 3 {
             self.lower_expr(parts[2])?;
@@ -1081,10 +1195,11 @@ impl<'e> Lowerer<'e> {
         // lexical locals, so bail to the tree-walker (which dynamic-binds
         // correctly) whenever a binding names a special — bliss-lb6.14, ASDF's
         // `(let ((*asdf-session* …)) …)` read by helper functions.
-        if binding_forms
-            .iter()
-            .any(|b| binding_name_init(*b).map(|(n, _)| is_special_name(&n)).unwrap_or(false))
-        {
+        if binding_forms.iter().any(|b| {
+            binding_name_init(*b)
+                .map(|(n, _)| is_special_name(&n))
+                .unwrap_or(false)
+        }) {
             return Err(Bail);
         }
 
@@ -1198,17 +1313,36 @@ impl<'e> Lowerer<'e> {
                 _ => return Err(record_bail(|| format!("macroexpand:{name}"))),
             }
         }
+        // Compiler macros are optional call rewrites, distinct from ordinary
+        // macro operators. Apply exactly one step here and let lower_expr
+        // process the accepted replacement recursively.
+        let form = arena_cons(op, rest);
+        if self.macro_env.is_none() {
+            self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
+        }
+        if let Ok((expanded, true)) = compiler_macroexpand::compiler_macroexpand_1(
+            form,
+            self.macro_env.as_ref().unwrap(),
+        ) {
+            return self.lower_expr(expanded);
+        }
         // An unhandled special operator is not a call.
         if is_bail_special(name) {
             return Err(record_bail(|| format!("special:{name}")));
         }
-        // Only emit a call when the callee is certainly a function: a
-        // user-defined function (lexical name map or global function cell —
-        // bliss-jtc.6.8) or an allowlisted primitive.
+        // Emit a named call only when the compile environment establishes that
+        // the operator is a function. This includes the complete builtin
+        // predicate, not merely the original slice-1 allowlist: treating every
+        // unknown operator as a forward function miscompiled implementation
+        // forms such as quasiquote and can silently change a large source load.
+        // A genuinely forward-referenced function remains correct via the
+        // tree-walker fallback and can be predeclared by a future compilation-
+        // unit pass without weakening this safety boundary.
+        let bare = symbol_bare_name(name);
         let is_user_fn =
             self.env.funs.borrow().contains_key(name) || super::global_fn(name).is_some();
-        let is_prim = PRIMITIVE_ALLOWLIST.contains(&name);
-        if !is_user_fn && !is_prim {
+        let is_builtin = super::is_builtin_function(&bare) || PRIMITIVE_ALLOWLIST.contains(&name);
+        if !is_user_fn && !is_builtin {
             return Err(record_bail(|| format!("call:{name}")));
         }
         let args = list_to_vec(rest);
@@ -1337,13 +1471,26 @@ impl<'e> Lowerer<'e> {
                 // interpreter's value-first order, then call; the result is the
                 // value. Other complex places (car/aref/slot/…) still bail — the
                 // setf-expander machinery is not available here.
-                let sym = resolve_sym("BLISS::PUT-GETHASH").ok_or(Bail)?.as_symbol_index();
+                let sym = resolve_sym("BLISS::PUT-GETHASH")
+                    .ok_or(Bail)?
+                    .as_symbol_index();
                 self.lower_expr(val)?; // value
                 self.lower_expr(key)?; // key
                 self.lower_expr(table)?; // table
                 self.emit(Instr::CallNamed { sym, nargs: 3 });
                 self.pop_n(3);
                 self.push_n(1); // result: the stored value
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
+            } else if self.documentation_place_args(place).is_some() {
+                // Bliss currently treats documentation metadata as advisory:
+                // the tree-walker accepts the store without retaining metadata
+                // or evaluating the ignored place arguments, then returns the
+                // assigned value. Preserve those existing semantics here.
+                self.lower_expr(val)?;
+                self.emit(Instr::ClearMv);
                 if !last {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
@@ -1369,6 +1516,19 @@ impl<'e> Lowerer<'e> {
             return None;
         }
         Some((items[1], items[2]))
+    }
+
+    /// Recognise `(documentation object [doc-type])`, whose setter is an
+    /// intentionally metadata-only no-op in the current runtime.
+    fn documentation_place_args(&self, place: BlissVal) -> Option<Vec<BlissVal>> {
+        if !place.is_cons() {
+            return None;
+        }
+        let items = list_to_vec(place);
+        if !(2..=3).contains(&items.len()) || !items[0].is_symbol() {
+            return None;
+        }
+        (symbol_bare_name(&sym_name(items[0])) == "DOCUMENTATION").then(|| items[1..].to_vec())
     }
 
     // ── Non-local control flow lowering (nmq.4) ────────────────────
@@ -1588,7 +1748,11 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         let (count_form, result_rest) = cp(br);
-        let result = if result_rest.is_cons() { cp(result_rest).0 } else { NIL };
+        let result = if result_rest.is_cons() {
+            cp(result_rest).0
+        } else {
+            NIL
+        };
 
         let id = self.fresh_id();
         let limit = resolve_sym(&format!("%DOTIMES-LIMIT{id}")).ok_or(Bail)?;
@@ -1638,7 +1802,11 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         let (list_form, result_rest) = cp(br);
-        let result = if result_rest.is_cons() { cp(result_rest).0 } else { NIL };
+        let result = if result_rest.is_cons() {
+            cp(result_rest).0
+        } else {
+            NIL
+        };
 
         let id = self.fresh_id();
         let rest_var = resolve_sym(&format!("%DOLIST-REST{id}")).ok_or(Bail)?;
@@ -1659,10 +1827,7 @@ impl<'e> Lowerer<'e> {
         when_items.push(form_list(&[s("GO")?, top]));
         let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
 
-        let bindings = form_list(&[
-            form_list(&[var, NIL]),
-            form_list(&[rest_var, list_form]),
-        ]);
+        let bindings = form_list(&[form_list(&[var, NIL]), form_list(&[rest_var, list_form])]);
         let let_form = form_list(&[
             s("LET")?,
             bindings,
@@ -1693,17 +1858,15 @@ impl<'e> Lowerer<'e> {
             match kw(forms[0]).as_deref() {
                 // while/until loops do not start with `for`.
                 Some("WHILE") | Some("UNTIL") => return self.lower_loop_while(&forms),
-                Some("FOR") if forms.len() >= 3 && forms[1].is_symbol() => {
-                    match kw(forms[2]).as_deref() {
-                        Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
-                            return self.lower_loop_numeric_for(&forms);
-                        }
-                        Some("IN") => return self.lower_loop_for_in(&forms),
-                        Some("ON") => return self.lower_loop_for_on(&forms),
-                        Some("BEING") => return self.lower_loop_for_being_hash(&forms),
-                        _ => {}
+                Some("FOR") if forms.len() >= 3 => match kw(forms[2]).as_deref() {
+                    Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
+                        return self.lower_loop_numeric_for(&forms);
                     }
-                }
+                    Some("IN") => return self.lower_loop_for_in(&forms),
+                    Some("ON") => return self.lower_loop_for_on(&forms),
+                    Some("BEING") => return self.lower_loop_for_being_hash(&forms),
+                    _ => {}
+                },
                 _ => {}
             }
             return Err(Bail);
@@ -1752,8 +1915,7 @@ impl<'e> Lowerer<'e> {
             _ => return Err(Bail),
         };
         // Reject a direction keyword that contradicts the limit (upfrom..downto).
-        if (descending && kw_is(forms[2], "UPFROM"))
-            || (!descending && kw_is(forms[2], "DOWNFROM"))
+        if (descending && kw_is(forms[2], "UPFROM")) || (!descending && kw_is(forms[2], "DOWNFROM"))
         {
             return Err(Bail);
         }
@@ -1835,15 +1997,22 @@ impl<'e> Lowerer<'e> {
                 if tail.len() != 2 {
                     return Err(Bail);
                 }
-                let per =
-                    vec![form_list(&[s("SETQ")?, acc, form_list(&[s("CONS")?, tail[1], acc])])];
+                let per = vec![form_list(&[
+                    s("SETQ")?,
+                    acc,
+                    form_list(&[s("CONS")?, tail[1], acc]),
+                ])];
                 Ok((true, NIL, per, form_list(&[s("NREVERSE")?, acc])))
             }
             Some("SUM") | Some("SUMMING") => {
                 if tail.len() != 2 {
                     return Err(Bail);
                 }
-                let per = vec![form_list(&[s("SETQ")?, acc, form_list(&[s("+")?, acc, tail[1]])])];
+                let per = vec![form_list(&[
+                    s("SETQ")?,
+                    acc,
+                    form_list(&[s("+")?, acc, tail[1]]),
+                ])];
                 Ok((true, BlissVal::from_fixnum(0), per, acc))
             }
             Some("COUNT") | Some("COUNTING") => {
@@ -1862,25 +2031,21 @@ impl<'e> Lowerer<'e> {
         }
     }
 
-    /// Extended-LOOP stage 2 (bliss-x5y.3): list iteration —
-    /// `(loop for VAR in LIST do BODY...)` — expanded to
-    /// `(block nil (let ((%lst LIST) (VAR nil))
-    ///     (tagbody top (when %lst (setq VAR (car %lst)) BODY...
-    ///                             (setq %lst (cdr %lst)) (go top)))))`.
-    /// `for VAR on LIST`, `by`, destructuring, and accumulation clauses bail.
+    /// Extended-LOOP list iteration —
+    /// `(loop for PATTERN in LIST [for VAR = EXPR]* ACTION...)`. PATTERN may
+    /// be a symbol or a cons pattern such as `(package . symbols)`; secondary
+    /// variables are recomputed in order after the primary bindings.
     fn lower_loop_for_in(&mut self, forms: &[BlissVal]) -> LowerResult<()> {
         let kw = |f: BlissVal| -> Option<String> {
             f.is_symbol().then(|| symbol_bare_name(&sym_name(f)))
         };
-        // for VAR in LIST {do BODY... | collect/sum/count EXPR}  (min 5 tokens)
         if forms.len() < 5
             || kw(forms[0]).as_deref() != Some("FOR")
-            || !forms[1].is_symbol()
             || kw(forms[2]).as_deref() != Some("IN")
         {
             return Err(Bail);
         }
-        let var = forms[1];
+        let pattern = forms[1];
         let list = forms[3];
 
         let id = self.fresh_id();
@@ -1888,17 +2053,62 @@ impl<'e> Lowerer<'e> {
         let lst = resolve_sym(&format!("%LOOP-LST{id}")).ok_or(Bail)?;
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
         let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
-        // The action clause (do / collect / sum / count) starting at index 4.
-        let (uses_acc, acc_init, per_iter, result) = self.lower_loop_action(&forms[4..], acc)?;
+
+        fn bind_pattern(
+            pattern: BlissVal,
+            value: BlissVal,
+            bindings: &mut Vec<BlissVal>,
+            assignments: &mut Vec<BlissVal>,
+        ) -> LowerResult<()> {
+            let s = |n: &str| resolve_sym(n).ok_or(Bail);
+            if pattern.is_nil() {
+                return Ok(());
+            }
+            if pattern.is_symbol() {
+                bindings.push(form_list(&[pattern, NIL]));
+                assignments.push(form_list(&[s("SETQ")?, pattern, value]));
+                return Ok(());
+            }
+            if !pattern.is_cons() {
+                return Err(Bail);
+            }
+            let (head, tail) = cp(pattern);
+            bind_pattern(head, form_list(&[s("CAR")?, value]), bindings, assignments)?;
+            bind_pattern(tail, form_list(&[s("CDR")?, value]), bindings, assignments)
+        }
+
+        let mut binding_items = vec![form_list(&[lst, list])];
+        let mut assignments = Vec::new();
+        bind_pattern(
+            pattern,
+            form_list(&[s("CAR")?, lst]),
+            &mut binding_items,
+            &mut assignments,
+        )?;
+
+        let mut action_at = 4;
+        while forms.get(action_at).and_then(|f| kw(*f)).as_deref() == Some("FOR") {
+            let var = *forms.get(action_at + 1).ok_or(Bail)?;
+            if !var.is_symbol()
+                || forms.get(action_at + 2).and_then(|f| kw(*f)).as_deref() != Some("=")
+            {
+                return Err(Bail);
+            }
+            let expr = *forms.get(action_at + 3).ok_or(Bail)?;
+            binding_items.push(form_list(&[var, NIL]));
+            assignments.push(form_list(&[s("SETQ")?, var, expr]));
+            action_at += 4;
+        }
+        let action = forms.get(action_at..).ok_or(Bail)?;
+        let (uses_acc, acc_init, per_iter, result) = self.lower_loop_action(action, acc)?;
 
         let mut when_items = vec![s("WHEN")?, lst];
-        when_items.push(form_list(&[s("SETQ")?, var, form_list(&[s("CAR")?, lst])]));
+        when_items.append(&mut assignments);
         when_items.extend(per_iter);
         when_items.push(form_list(&[s("SETQ")?, lst, form_list(&[s("CDR")?, lst])]));
         when_items.push(form_list(&[s("GO")?, top]));
         let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
 
-        let mut binding_items = vec![form_list(&[lst, list]), form_list(&[var, NIL])];
         if uses_acc {
             binding_items.push(form_list(&[acc, acc_init]));
         }
@@ -1944,12 +2154,7 @@ impl<'e> Lowerer<'e> {
 
         let snapshot_sym = resolve_sym(snapshot_fn).ok_or(Bail)?;
         let snapshot = form_list(&[snapshot_sym, table]);
-        let mut normalized = vec![
-            forms[0],
-            forms[1],
-            resolve_sym("IN").ok_or(Bail)?,
-            snapshot,
-        ];
+        let mut normalized = vec![forms[0], forms[1], resolve_sym("IN").ok_or(Bail)?, snapshot];
         normalized.extend_from_slice(action);
         self.lower_loop_for_in(&normalized)
     }
@@ -2145,8 +2350,8 @@ impl<'e> Lowerer<'e> {
             // the condition already stored in `var_slot`.
             self.cur_stack = sp_restore;
             self.lower_progn(body)?; // clause value (+1)
-            // The tree-walker runs the clause in a child env, so a clause's
-            // secondary values do not propagate out of the handler-case.
+                                     // The tree-walker runs the clause in a child env, so a clause's
+                                     // secondary values do not propagate out of the handler-case.
             self.emit(Instr::ClearMv);
             self.exit_scope(saved_next_local);
             self.emit(Instr::Br(0));
@@ -2521,9 +2726,6 @@ fn compile_local_function(
     let mut lo = Lowerer::new(env);
     lo.local_fns = local_fns.clone();
     lo.captured_names = compute_captured_names(fbody);
-    if variadic && param_names.iter().any(|n| lo.captured_names.contains(n)) {
-        return None;
-    }
     let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
         let loc = lo.alloc_local(pn);
@@ -2533,6 +2735,11 @@ fn compile_local_function(
         return None;
     }
     lo.emit(Instr::Return);
+    let param_types = if variadic {
+        vec![DeclaredType::Any; param_names.len()]
+    } else {
+        declared_parameter_types(fbody, &param_names)?
+    };
     Some(BytecodeFunction {
         code: lo.code,
         constants: lo.constants,
@@ -2541,6 +2748,7 @@ fn compile_local_function(
         names: lo.names,
         restart_cases: lo.restart_cases,
         param_layout,
+        param_types,
         has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
@@ -2660,6 +2868,9 @@ fn is_bail_special(name: &str) -> bool {
             | "DEFINE-SYMBOL-MACRO"
             | "DEFINE-COMPILER-MACRO"
             | "EVAL"
+            | "BLISS::QUASIQUOTE"
+            | "BLISS::UNQUOTE"
+            | "BLISS::UNQUOTE-SPLICING"
     )
 }
 
@@ -2740,10 +2951,28 @@ fn parse_lambda_list(params_form: BlissVal) -> Option<(Vec<String>, u16, Option<
         if elem.is_symbol() {
             let n = sym_name(elem);
             match n.as_str() {
-                "&OPTIONAL" => { mode = Mode::Opt; variadic = true; continue; }
-                "&REST" | "&BODY" => { mode = Mode::Rest; variadic = true; unbounded = true; continue; }
-                "&KEY" => { mode = Mode::Key; variadic = true; unbounded = true; continue; }
-                "&AUX" => { mode = Mode::Aux; variadic = true; continue; }
+                "&OPTIONAL" => {
+                    mode = Mode::Opt;
+                    variadic = true;
+                    continue;
+                }
+                "&REST" | "&BODY" => {
+                    mode = Mode::Rest;
+                    variadic = true;
+                    unbounded = true;
+                    continue;
+                }
+                "&KEY" => {
+                    mode = Mode::Key;
+                    variadic = true;
+                    unbounded = true;
+                    continue;
+                }
+                "&AUX" => {
+                    mode = Mode::Aux;
+                    variadic = true;
+                    continue;
+                }
                 "&ALLOW-OTHER-KEYS" => continue,
                 _ if n.starts_with('&') => return None, // unknown lambda-list keyword
                 _ => {}
@@ -2760,7 +2989,9 @@ fn parse_lambda_list(params_form: BlissVal) -> Option<(Vec<String>, u16, Option<
             Mode::Opt => {
                 let (var, sp) = parse_opt_aux_spec(elem)?;
                 names.push(var);
-                if let Some(sp) = sp { names.push(sp); }
+                if let Some(sp) = sp {
+                    names.push(sp);
+                }
                 n_optional += 1;
             }
             Mode::Rest => {
@@ -2772,7 +3003,9 @@ fn parse_lambda_list(params_form: BlissVal) -> Option<(Vec<String>, u16, Option<
             Mode::Key => {
                 let (var, sp) = parse_key_spec(elem)?;
                 names.push(var);
-                if let Some(sp) = sp { names.push(sp); }
+                if let Some(sp) = sp {
+                    names.push(sp);
+                }
             }
             Mode::Aux => {
                 let (var, _) = parse_opt_aux_spec(elem)?;
@@ -2780,8 +3013,92 @@ fn parse_lambda_list(params_form: BlissVal) -> Option<(Vec<String>, u16, Option<
             }
         }
     }
-    let max_args = if unbounded { None } else { Some(n_required + n_optional) };
+    let max_args = if unbounded {
+        None
+    } else {
+        Some(n_required + n_optional)
+    };
     Some((names, n_required, max_args, variadic))
+}
+
+fn primitive_declared_type(type_form: BlissVal) -> Option<DeclaredType> {
+    if !type_form.is_symbol() {
+        return None;
+    }
+    match symbol_bare_name(&sym_name(type_form)).as_str() {
+        "FIXNUM" => Some(DeclaredType::Fixnum),
+        "SINGLE-FLOAT" => Some(DeclaredType::SingleFloat),
+        _ => None,
+    }
+}
+
+/// Retain primitive parameter assertions from the declaration prefix of a
+/// function body. Both `(type fixnum x)` and the standard shorthand
+/// `(fixnum x)` are accepted. Unknown declaration/type specifiers remain
+/// runtime no-ops for now and therefore contribute `Any`, never an unsound
+/// compiler assumption.
+fn declared_parameter_types(body: BlissVal, params: &[String]) -> Option<Vec<DeclaredType>> {
+    let mut result = vec![DeclaredType::Any; params.len()];
+    let mut forms = list_to_vec(body).into_iter();
+    let mut next = forms.next();
+    if next.is_some_and(BlissVal::is_string) {
+        next = forms.next(); // optional function docstring precedes declarations
+    }
+
+    while let Some(form) = next {
+        if !form.is_cons() {
+            break;
+        }
+        let (op, declarations) = cp(form);
+        if !op.is_symbol() || symbol_bare_name(&sym_name(op)) != "DECLARE" {
+            break;
+        }
+        for declaration in list_to_vec(declarations) {
+            if !declaration.is_cons() {
+                continue;
+            }
+            let (head, tail) = cp(declaration);
+            if !head.is_symbol() {
+                continue;
+            }
+            let head_name = symbol_bare_name(&sym_name(head));
+            let (declared, variables) = if head_name == "TYPE" {
+                if !tail.is_cons() {
+                    continue;
+                }
+                let (type_form, variables) = cp(tail);
+                let Some(declared) = primitive_declared_type(type_form) else {
+                    continue;
+                };
+                (declared, variables)
+            } else {
+                let Some(declared) = primitive_declared_type(head) else {
+                    continue;
+                };
+                (declared, tail)
+            };
+
+            for variable in list_to_vec(variables) {
+                if !variable.is_symbol() {
+                    continue;
+                }
+                let variable_name = sym_name(variable);
+                let Some(index) = params.iter().position(|param| {
+                    param == &variable_name
+                        || symbol_bare_name(param) == symbol_bare_name(&variable_name)
+                }) else {
+                    continue;
+                };
+                let old = result[index];
+                if !old.is_any() && old != declared {
+                    return None; // contradictory primitive assertions
+                }
+                result[index] = declared;
+            }
+        }
+        next = forms.next();
+    }
+    Some(result)
 }
 
 /// Lower a fixed-arity function `(params . body)` to a [`BytecodeFunction`].
@@ -2805,19 +3122,16 @@ fn compile_function(
 
     let mut lo = Lowerer::new(env);
     lo.captured_names = compute_captured_names(body);
-    // A captured (boxed) variadic parameter would need the call-time binder to
-    // populate the heap EnvFrame too; not handled yet, so bail (rare — a nested
-    // closure capturing a &optional/&key/&rest param). Fixed lambda lists keep
-    // their existing boxed-capture support.
-    if variadic && param_names.iter().any(|n| lo.captured_names.contains(n)) {
-        let _ = record_bail(|| "lambda-list:captured-variadic-param".to_string());
-        return None;
-    }
     let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
         let loc = lo.alloc_local(pn);
         param_layout.push((pn.clone(), loc));
     }
+    let param_types = if variadic {
+        vec![DeclaredType::Any; param_names.len()]
+    } else {
+        declared_parameter_types(body, &param_names)?
+    };
     // Body as an implicit progn producing the return value.
     if lower_body(&mut lo, body).is_err() {
         return None;
@@ -2832,6 +3146,7 @@ fn compile_function(
         names: lo.names,
         restart_cases: lo.restart_cases,
         param_layout,
+        param_types,
         has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
@@ -2925,6 +3240,7 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
         names: lo.names,
         restart_cases: lo.restart_cases,
         param_layout: Vec::new(),
+        param_types: Vec::new(),
         has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
@@ -2940,9 +3256,13 @@ fn compile_thunk(form: BlissVal, env: &Env) -> Option<BytecodeFunction> {
 // ── BFASL Bytecode Unit serialization ─────────────────────────────
 
 const BBU_MAGIC: &[u8; 4] = b"BBU\0";
-// 0x0101 (bliss-jtc.23): faithful registry-key symbol encoding + a loadable
-// unit. The loader requires this version; older units fall back to source.
-const BBU_BYTECODE_VERSION: u16 = 0x0101;
+// 0x0103 (bliss-jtc.23.1/.3): spec-aligned Package/Symbol/Keyword/Vector
+// constants, deterministic package load actions, and portable function binder
+// metadata. The reader retains the
+// provisional v1.1 tag-14 registry-key symbol encoding for compatibility.
+// A BBU is authoritative: an unsupported version is rejected, never replaced
+// by executing source text from the container.
+const BBU_BYTECODE_VERSION: u16 = 0x0103;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -2950,7 +3270,10 @@ const BBU_NO_INDEX: u32 = u32::MAX;
 const BBU_UNIT_COMPLETE: u32 = 1 << 0;
 
 const BBU_FUNC_NAMED: u32 = 1 << 0;
+const BBU_FUNC_MACRO: u32 = 1 << 1;
+const BBU_FUNC_COMPILER_MACRO: u32 = 1 << 2;
 const BBU_FUNC_LOAD_TIME_THUNK: u32 = 1 << 3;
+const BBU_AUX_FUNCTION_METADATA: u16 = 6;
 
 fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
@@ -3006,18 +3329,61 @@ impl BbuConstPool {
         self.intern_encoded(bytes)
     }
 
-    /// Faithful symbol reference (bliss-jtc.23): store the symbol's exact
-    /// registry key (tag 14 + string ref). `intern(key)` at load reconstructs
-    /// the identical symbol — package and all — so compiled code references the
-    /// same symbol across a compile/load boundary. Returns `None` for uninterned
-    /// symbols (no key), which makes the containing function/value unserializable
-    /// and falls the form back to source loading.
-    fn symbol_by_index(&mut self, idx: u32) -> Option<u32> {
-        let key = bliss_rt::symbols::registry_key(idx)?;
-        let name_ref = self.string(&key);
+    fn package(&mut self, name: &str, nicknames: &[String]) -> u32 {
+        let name_ref = self.string(name);
+        let nickname_refs = nicknames
+            .iter()
+            .map(|nickname| self.string(nickname))
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, 10);
+        put_u32(&mut bytes, name_ref);
+        put_u32(&mut bytes, nickname_refs.len() as u32);
+        for nickname_ref in nickname_refs {
+            put_u32(&mut bytes, nickname_ref);
+        }
+        self.intern_encoded(bytes)
+    }
+
+    fn vector(&mut self, refs: &[u32]) -> u32 {
         let mut bytes = Vec::new();
         put_u8(&mut bytes, 14);
+        put_u32(&mut bytes, refs.len() as u32);
+        for &reference in refs {
+            put_u32(&mut bytes, reference);
+        }
+        self.intern_encoded(bytes)
+    }
+
+    /// Faithful symbol reference (bliss-jtc.23.1). Package and bare-name are
+    /// structural references, while `kind` preserves the exact registry-key
+    /// separator (internal `::`, external `:`, or unqualified). Keywords use
+    /// their dedicated tag. Returns `None` for genuinely uninterned symbols.
+    fn symbol_by_index(&mut self, idx: u32) -> Option<u32> {
+        let key = bliss_rt::symbols::registry_key(idx)?;
+        if let Some(name) = key.strip_prefix("KEYWORD:") {
+            let name_ref = self.string(name);
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 12);
+            put_u32(&mut bytes, name_ref);
+            return Some(self.intern_encoded(bytes));
+        }
+        let (package, name, kind) = if let Some((package, name)) = key.rsplit_once("::") {
+            (Some(package), name, 0u8)
+        } else if let Some((package, name)) = key.rsplit_once(':') {
+            (Some(package), name, 3u8)
+        } else {
+            (None, key.as_str(), 0u8)
+        };
+        let package_ref = package
+            .map(|package| self.package(package, &[]))
+            .unwrap_or(BBU_NO_INDEX);
+        let name_ref = self.string(name);
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, 11);
+        put_u32(&mut bytes, package_ref);
         put_u32(&mut bytes, name_ref);
+        put_u8(&mut bytes, kind);
         Some(self.intern_encoded(bytes))
     }
 
@@ -3068,12 +3434,17 @@ impl BbuConstPool {
 
 struct BbuFunction {
     name_ref: u32,
+    lambda_list_ref: u32,
     flags: u32,
-    arity: u16,
+    arity_min: u16,
+    arity_max: u16,
     n_locals: u16,
     max_stack: u16,
     code: Vec<u8>,
     literal_refs: Vec<u32>,
+    param_layout: Vec<(u32, VarLoc, DeclaredType)>,
+    has_env: bool,
+    variadic: bool,
 }
 
 fn bbu_instr_len(i: &Instr) -> Option<usize> {
@@ -3127,11 +3498,16 @@ fn serialize_bbu_function(
     flags: u32,
     pool: &mut BbuConstPool,
 ) -> Option<BbuFunction> {
+    // v0x0101 does not serialize captured-environment or variadic binder
+    // metadata. Reject those shapes rather than emitting a function that could
+    // only be made correct by retaining its source lambda list/body.
+    if bf.has_env {
+        return None;
+    }
     if !bf.handler_cases.is_empty() || !bf.handler_binds.is_empty() || !bf.restart_cases.is_empty()
     {
         return None;
     }
-
     let mut literal_refs = Vec::with_capacity(bf.constants.len());
     for &c in &bf.constants {
         literal_refs.push(pool.value(c)?);
@@ -3301,24 +3677,49 @@ fn serialize_bbu_function(
         }
     }
 
+    let lambda_list_ref = if bf.variadic {
+        pool.value(bf.params_form)?
+    } else {
+        BBU_NO_INDEX
+    };
+    let param_layout = bf
+        .param_layout
+        .iter()
+        .enumerate()
+        .map(|(index, (name, location))| {
+            (
+                pool.string(name),
+                *location,
+                bf.param_types
+                    .get(index)
+                    .copied()
+                    .unwrap_or(DeclaredType::Any),
+            )
+        })
+        .collect();
     Some(BbuFunction {
         name_ref,
+        lambda_list_ref,
         flags,
-        arity: bf.arity,
+        arity_min: bf.min_args,
+        arity_max: bf.max_args.unwrap_or(u16::MAX),
         n_locals: bf.n_locals,
         max_stack: bf.max_stack.max(1),
         code,
         literal_refs,
+        param_layout,
+        has_env: bf.has_env,
+        variadic: bf.variadic,
     })
 }
 
 fn serialize_bbu_function_record(out: &mut Vec<u8>, f: &BbuFunction) {
     put_u32(out, f.name_ref);
-    put_u32(out, BBU_NO_INDEX);
+    put_u32(out, f.lambda_list_ref);
     put_u32(out, BBU_NO_INDEX);
     put_u32(out, f.flags);
-    put_u16(out, f.arity);
-    put_u16(out, f.arity);
+    put_u16(out, f.arity_min);
+    put_u16(out, f.arity_max);
     put_u16(out, f.n_locals);
     put_u16(out, f.max_stack);
     put_u32(out, f.code.len() as u32);
@@ -3332,30 +3733,265 @@ fn serialize_bbu_function_record(out: &mut Vec<u8>, f: &BbuFunction) {
     put_u32(out, BBU_NO_INDEX);
 }
 
-/// Build the BFASL `BYTECODE_UNIT` payload for top-level forms that the current
-/// T0 bytecode lowerer can serialize. The legacy source section remains the
-/// active loader path until the BBU deserializer/installer lands.
+fn serialize_bbu_function_metadata(functions: &[BbuFunction]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, functions.len() as u32);
+    for function in functions {
+        put_u8(&mut out, u8::from(function.has_env));
+        put_u8(&mut out, u8::from(function.variadic));
+        put_u16(&mut out, function.param_layout.len() as u16);
+        for &(name_ref, location, declared_type) in &function.param_layout {
+            put_u32(&mut out, name_ref);
+            match location {
+                VarLoc::Slot(slot) => {
+                    put_u8(&mut out, 0);
+                    put_u16(&mut out, slot);
+                }
+                VarLoc::Boxed => {
+                    put_u8(&mut out, 1);
+                    put_u16(&mut out, u16::MAX);
+                }
+            }
+            put_u8(
+                &mut out,
+                match declared_type {
+                    DeclaredType::Any => 0,
+                    DeclaredType::Fixnum => 1,
+                    DeclaredType::SingleFloat => 2,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Rewrite definition-like top-level forms into portable load-time bytecode.
+/// `None` means the form has no load-time action after compile-file has already
+/// resolved its effect (currently IN-PACKAGE and an initializer-less DEFVAR).
+fn portable_load_thunk_form(form: BlissVal) -> Option<BlissVal> {
+    if !form.is_cons() {
+        return Some(form);
+    }
+    let (op, rest) = cp(form);
+    if !op.is_symbol() {
+        return Some(form);
+    }
+    match symbol_bare_name(&sym_name(op)).as_str() {
+        // Package context has already selected the package-qualified identities
+        // serialized into subsequent symbol references. LOAD dynamically
+        // restores *PACKAGE*, so there is no observable load action to retain.
+        "IN-PACKAGE" => None,
+        "DEFVAR" | "DEFPARAMETER" | "DEFCONSTANT" => {
+            let kind = symbol_bare_name(&sym_name(op));
+            let (var, init_and_doc) = cp(rest);
+            if !var.is_symbol() {
+                return Some(form);
+            }
+            if kind == "DEFVAR" && !init_and_doc.is_cons() {
+                return None;
+            }
+            let init = if init_and_doc.is_cons() {
+                cp(init_and_doc).0
+            } else {
+                NIL
+            };
+            let setq = form_list(&[resolve_sym("SETQ")?, var, init]);
+            if kind == "DEFVAR" {
+                let quoted = form_list(&[resolve_sym("QUOTE")?, var]);
+                let boundp = form_list(&[resolve_sym("BOUNDP")?, quoted]);
+                Some(form_list(&[resolve_sym("UNLESS")?, boundp, setq]))
+            } else if kind == "DEFCONSTANT" {
+                let quoted = form_list(&[resolve_sym("QUOTE")?, var]);
+                let mark = form_list(&[resolve_sym("BLISS-INTERNAL::%MARK-CONSTANT")?, quoted]);
+                Some(form_list(&[resolve_sym("PROGN")?, setq, mark]))
+            } else {
+                Some(setq)
+            }
+        }
+        _ => Some(form),
+    }
+}
+
+#[derive(Debug)]
+struct BbuPackagePlan {
+    name: String,
+    nicknames: Vec<String>,
+    uses: Vec<String>,
+    exports: Vec<String>,
+    interns: Vec<String>,
+}
+
+fn bbu_package_designator(value: BlissVal) -> Option<String> {
+    let raw = if value.is_symbol() {
+        symbol_bare_name(&sym_name(value))
+    } else if value.is_string() {
+        val_as_str(value)
+    } else {
+        return None;
+    };
+    Some(
+        raw.trim_start_matches("KEYWORD:")
+            .trim_start_matches(':')
+            .to_uppercase(),
+    )
+}
+
+/// Parse the package-definition subset whose runtime effects have portable
+/// load actions. Options that the tree-walker currently treats as metadata or
+/// no-ops remain harmless; options requiring symbol import/re-export identity
+/// are rejected until their dedicated action encoding lands.
+fn bbu_package_plan(form: BlissVal) -> Result<Option<BbuPackagePlan>, BlissError> {
+    if !form.is_cons() {
+        return Ok(None);
+    }
+    let (op, rest) = cp(form);
+    if !op.is_symbol()
+        || !matches!(
+            symbol_bare_name(&sym_name(op)).as_str(),
+            "DEFPACKAGE" | "DEFINE-PACKAGE"
+        )
+    {
+        return Ok(None);
+    }
+    if !rest.is_cons() {
+        return Err(bbu_error("package definition has no package name"));
+    }
+    let (name_form, options) = cp(rest);
+    let name = bbu_package_designator(name_form)
+        .ok_or_else(|| bbu_error("package name is not a literal designator"))?;
+    let mut plan = BbuPackagePlan {
+        name,
+        nicknames: Vec::new(),
+        uses: Vec::new(),
+        exports: Vec::new(),
+        interns: Vec::new(),
+    };
+    for option in list_to_vec(options) {
+        if !option.is_cons() {
+            continue;
+        }
+        let (key, values) = cp(option);
+        if !key.is_symbol() {
+            continue;
+        }
+        let key = symbol_bare_name(&sym_name(key));
+        let values = list_to_vec(values);
+        let destination = match key.as_str() {
+            "USE" | "MIX" => Some(&mut plan.uses),
+            "NICKNAMES" => Some(&mut plan.nicknames),
+            "EXPORT" => Some(&mut plan.exports),
+            "INTERN" | "SHADOW" => Some(&mut plan.interns),
+            "IMPORT-FROM" | "SHADOWING-IMPORT-FROM" | "REEXPORT" | "USE-REEXPORT"
+            | "MIX-REEXPORT" => {
+                return Err(bbu_error(format!(
+                    "package option :{key} has no portable load action"
+                )));
+            }
+            // These options are intentionally no-ops in eval_defpackage too.
+            "RECYCLE" | "UNINTERN" | "DOCUMENTATION" | "LOCAL-NICKNAMES" => None,
+            _ => None,
+        };
+        if let Some(destination) = destination {
+            for value in values {
+                let item = if matches!(key.as_str(), "EXPORT" | "INTERN" | "SHADOW") {
+                    if !value.is_symbol() && !value.is_string() {
+                        return Err(bbu_error(format!(
+                            "package option :{key} contains a non-literal designator"
+                        )));
+                    }
+                    symbol_bare_name(&val_as_str(value))
+                } else {
+                    bbu_package_designator(value).ok_or_else(|| {
+                        bbu_error(format!(
+                            "package option :{key} contains a non-literal designator"
+                        ))
+                    })?
+                };
+                if !destination.contains(&item) {
+                    destination.push(item);
+                }
+            }
+        }
+    }
+    Ok(Some(plan))
+}
+
+/// Build a complete, source-independent BFASL `BYTECODE_UNIT`. Every top-level
+/// load action must be representable as portable bytecode; otherwise
+/// COMPILE-FILE fails and emits no artifact.
 pub fn build_bbu_from_forms(
     forms: &[BlissVal],
     src_path: &str,
     source: &str,
     env: &Env,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, BlissError> {
     let mut pool = BbuConstPool::default();
     let source_file_ref = pool.string(src_path);
     let mut functions = Vec::new();
     let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
 
-    // Every load form must be representable in order for the unit to be loaded
-    // *instead of* the source (bliss-jtc.23): try, per form, (1) a precompiled
-    // named function, (2) a precompiled load-time thunk, (3) the raw form to be
-    // EVAL'd at load. If a form fits none (e.g. an unserialisable literal), the
-    // unit is marked incomplete and the loader falls back to the source section.
-    let mut complete = true;
-    for &form in forms {
+    for (form_index, &form) in forms.iter().enumerate() {
         let mut done = false;
 
-        // (1) A DEFUN whose name and body serialise faithfully → install the
+        // (0) Package creation is a deterministic load action, not an
+        // executable source thunk. Its structural constants are validated in
+        // full before the loader mutates the package registry.
+        if let Some(plan) = bbu_package_plan(form)? {
+            let package_ref = pool.package(&plan.name, &plan.nicknames);
+            let use_refs = plan
+                .uses
+                .iter()
+                .map(|name| pool.string(name))
+                .collect::<Vec<_>>();
+            let export_refs = plan
+                .exports
+                .iter()
+                .map(|name| pool.string(name))
+                .collect::<Vec<_>>();
+            let uses_ref = pool.vector(&use_refs);
+            let exports_ref = pool.vector(&export_refs);
+            load_actions.push((1, 0, package_ref, uses_ref, exports_ref));
+            for name in plan.interns {
+                let name_ref = pool.string(&name);
+                load_actions.push((2, 0, package_ref, name_ref, BBU_NO_INDEX));
+            }
+            done = true;
+        }
+
+        // (1) Macro expanders are ordinary portable bytecode functions with a
+        // dedicated installation action. The macro body itself is never kept
+        // as an executable source-form constant.
+        if !done {
+            if let Some((compiler_macro, name, params, body)) = as_macro_definition(form) {
+                if let Some(sym) = symbol_index_of(&name) {
+                    if let Some(name_ref) = pool.symbol_by_index(sym) {
+                        if let Some(bf) = compile_function(&name, params, body, env) {
+                            let function_flag = if compiler_macro {
+                                BBU_FUNC_COMPILER_MACRO
+                            } else {
+                                BBU_FUNC_MACRO
+                            };
+                            if let Some(serialized) =
+                                serialize_bbu_function(&bf, name_ref, function_flag, &mut pool)
+                            {
+                                let function_index = functions.len() as u32;
+                                functions.push(serialized);
+                                load_actions.push((
+                                    if compiler_macro { 5 } else { 4 },
+                                    0,
+                                    function_index,
+                                    name_ref,
+                                    BBU_NO_INDEX,
+                                ));
+                                done = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // (2) A DEFUN whose name and body serialise faithfully → install the
         // precompiled function directly at load (skips read/macroexpand/compile).
         if let Some((name, params, body)) = as_defun(form) {
             if let Some(sym) = symbol_index_of(&name) {
@@ -3374,36 +4010,33 @@ pub fn build_bbu_from_forms(
             }
         }
 
-        // (2) Any form compilable to a serialisable thunk → run precompiled.
+        // (3) Any form compilable to a serialisable thunk → run precompiled.
         if !done {
-            if let Some(bf) = compile_thunk(form, env) {
-                if let Some(serialized) =
-                    serialize_bbu_function(&bf, BBU_NO_INDEX, BBU_FUNC_LOAD_TIME_THUNK, &mut pool)
-                {
-                    let function_index = functions.len() as u32;
-                    functions.push(serialized);
-                    load_actions.push((7, 0, function_index, BBU_NO_INDEX, BBU_NO_INDEX));
-                    done = true;
+            match portable_load_thunk_form(form) {
+                None => done = true,
+                Some(thunk_form) => {
+                    if let Some(bf) = compile_thunk(thunk_form, env) {
+                        if let Some(serialized) = serialize_bbu_function(
+                            &bf,
+                            BBU_NO_INDEX,
+                            BBU_FUNC_LOAD_TIME_THUNK,
+                            &mut pool,
+                        ) {
+                            let function_index = functions.len() as u32;
+                            functions.push(serialized);
+                            load_actions.push((7, 0, function_index, BBU_NO_INDEX, BBU_NO_INDEX));
+                            done = true;
+                        }
+                    }
                 }
             }
         }
 
-        // (3) Fallback: serialise the raw form into the const pool and EVAL it at
-        // load — correct and in order, just not precompiled (e.g. defmacro,
-        // defpackage, or a defun with an unsupported body).
         if !done {
-            if let Some(form_ref) = pool.value(form) {
-                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
-                done = true;
-            }
-        }
-
-        // A form we cannot represent means the load plan is not a faithful,
-        // ordered substitute for the source — mark the unit incomplete so the
-        // loader keeps using the source section. Keep going so the function
-        // records we *can* build are still present (harmless when incomplete).
-        if !done {
-            complete = false;
+            return Err(BlissError::FileError(format!(
+                "compile-file: top-level form {} cannot be represented as portable bytecode",
+                form_index + 1
+            )));
         }
     }
 
@@ -3411,13 +4044,11 @@ pub fn build_bbu_from_forms(
     out.extend_from_slice(BBU_MAGIC);
     put_u16(&mut out, BBU_BYTECODE_VERSION);
     put_u16(&mut out, BBU_VERIFIER_VERSION);
-    // Unit flags: COMPLETE means every load form is represented in `load_actions`
-    // (in order), so the loader can run the unit instead of the source section.
-    put_u32(&mut out, if complete { BBU_UNIT_COMPLETE } else { 0 });
+    put_u32(&mut out, BBU_UNIT_COMPLETE);
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 0);
+    put_u32(&mut out, 1);
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(source.as_bytes()));
 
@@ -3434,7 +4065,1069 @@ pub fn build_bbu_from_forms(
         put_u32(&mut out, arg1);
         put_u32(&mut out, arg2);
     }
-    out
+    let metadata = serialize_bbu_function_metadata(&functions);
+    put_u16(&mut out, BBU_AUX_FUNCTION_METADATA);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, metadata.len() as u32);
+    out.extend_from_slice(&metadata);
+    Ok(out)
+}
+
+#[derive(Clone, Debug)]
+enum BbuConstant {
+    Nil,
+    T,
+    Fixnum(i64),
+    SingleFloat(u32),
+    Character(u32),
+    String(String),
+    Package {
+        name_ref: u32,
+        nickname_refs: Vec<u32>,
+    },
+    Symbol {
+        package_ref: u32,
+        name_ref: u32,
+        kind: u8,
+    },
+    Keyword(u32),
+    /// Provisional v1.1 tag-14 encoding: one exact registry-key String ref.
+    LegacySymbol(u32),
+    Cons(u32, u32),
+    Vector(Vec<u32>),
+}
+
+#[derive(Clone, Debug)]
+struct EncodedBbuFunction {
+    name_ref: u32,
+    lambda_list_ref: u32,
+    flags: u32,
+    arity_min: u16,
+    arity_max: u16,
+    n_locals: u16,
+    max_stack: u16,
+    code: Vec<u8>,
+    literal_refs: Vec<u32>,
+    metadata: Option<BbuFunctionMetadata>,
+}
+
+#[derive(Clone, Debug)]
+struct BbuFunctionMetadata {
+    has_env: bool,
+    variadic: bool,
+    params: Vec<(u32, VarLoc, DeclaredType)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BbuLoadAction {
+    kind: u8,
+    flags: u8,
+    arg0: u32,
+    arg1: u32,
+    arg2: u32,
+}
+
+struct BbuCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BbuCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], BlissError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.bytes.len())
+            .ok_or_else(|| bbu_error("truncated bytecode unit"))?;
+        let out = &self.bytes[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn u8(&mut self) -> Result<u8, BlissError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, BlissError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self) -> Result<u32, BlissError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Result<u64, BlissError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn i64(&mut self) -> Result<i64, BlissError> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn done(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
+}
+
+fn bbu_error(message: impl Into<String>) -> BlissError {
+    BlissError::FileError(format!("invalid BBU: {}", message.into()))
+}
+
+fn bbu_index(index: u32, len: usize, what: &str) -> Result<usize, BlissError> {
+    let index = index as usize;
+    if index >= len {
+        return Err(bbu_error(format!("{what} index {index} out of bounds")));
+    }
+    Ok(index)
+}
+
+fn bbu_string(constants: &[BbuConstant], index: u32) -> Result<&str, BlissError> {
+    match &constants[bbu_index(index, constants.len(), "constant")?] {
+        BbuConstant::String(value) => Ok(value),
+        _ => Err(bbu_error("expected string constant")),
+    }
+}
+
+fn bbu_package<'a>(
+    constants: &'a [BbuConstant],
+    index: u32,
+) -> Result<(&'a str, &'a [u32]), BlissError> {
+    match &constants[bbu_index(index, constants.len(), "package constant")?] {
+        BbuConstant::Package {
+            name_ref,
+            nickname_refs,
+        } => Ok((bbu_string(constants, *name_ref)?, nickname_refs)),
+        _ => Err(bbu_error("expected package constant")),
+    }
+}
+
+fn bbu_vector(constants: &[BbuConstant], index: u32) -> Result<&[u32], BlissError> {
+    match &constants[bbu_index(index, constants.len(), "vector constant")?] {
+        BbuConstant::Vector(refs) => Ok(refs),
+        _ => Err(bbu_error("expected vector constant")),
+    }
+}
+
+fn bbu_is_symbol_constant(constant: Option<&BbuConstant>) -> bool {
+    matches!(
+        constant,
+        Some(BbuConstant::Symbol { .. } | BbuConstant::LegacySymbol(_))
+    )
+}
+
+fn parse_bbu_constant(
+    cursor: &mut BbuCursor<'_>,
+    bytecode_version: u16,
+) -> Result<BbuConstant, BlissError> {
+    Ok(match cursor.u8()? {
+        0 => BbuConstant::Nil,
+        1 => BbuConstant::T,
+        2 => BbuConstant::Fixnum(cursor.i64()?),
+        5 => BbuConstant::SingleFloat(cursor.u32()?),
+        7 => BbuConstant::Character(cursor.u32()?),
+        8 => {
+            let len = cursor.u32()? as usize;
+            let text = std::str::from_utf8(cursor.take(len)?)
+                .map_err(|_| bbu_error("string constant is not UTF-8"))?;
+            BbuConstant::String(text.to_string())
+        }
+        10 => {
+            let name_ref = cursor.u32()?;
+            let count = cursor.u32()? as usize;
+            let mut nickname_refs = Vec::with_capacity(count);
+            for _ in 0..count {
+                nickname_refs.push(cursor.u32()?);
+            }
+            BbuConstant::Package {
+                name_ref,
+                nickname_refs,
+            }
+        }
+        11 => BbuConstant::Symbol {
+            package_ref: cursor.u32()?,
+            name_ref: cursor.u32()?,
+            kind: cursor.u8()?,
+        },
+        12 => BbuConstant::Keyword(cursor.u32()?),
+        13 => BbuConstant::Cons(cursor.u32()?, cursor.u32()?),
+        // BBU v1.1 temporarily used tag 14 for a registry-key symbol. v1.2
+        // restores the specified Vector encoding while preserving old reads.
+        14 if bytecode_version <= 0x0101 => BbuConstant::LegacySymbol(cursor.u32()?),
+        14 => {
+            let count = cursor.u32()? as usize;
+            let mut refs = Vec::with_capacity(count);
+            for _ in 0..count {
+                refs.push(cursor.u32()?);
+            }
+            BbuConstant::Vector(refs)
+        }
+        tag => return Err(bbu_error(format!("unsupported constant tag {tag}"))),
+    })
+}
+
+fn parse_bbu_function(cursor: &mut BbuCursor<'_>) -> Result<EncodedBbuFunction, BlissError> {
+    let name_ref = cursor.u32()?;
+    let lambda_list_ref = cursor.u32()?;
+    let _doc_ref = cursor.u32()?;
+    let flags = cursor.u32()?;
+    let arity_min = cursor.u16()?;
+    let arity_max = cursor.u16()?;
+    let n_locals = cursor.u16()?;
+    let max_stack = cursor.u16()?;
+    let code_len = cursor.u32()? as usize;
+    let code = cursor.take(code_len)?.to_vec();
+    let literal_count = cursor.u32()? as usize;
+    let mut literal_refs = Vec::with_capacity(literal_count);
+    for _ in 0..literal_count {
+        literal_refs.push(cursor.u32()?);
+    }
+    if cursor.u32()? != 0 {
+        return Err(bbu_error("v1.1 handler tables are not supported"));
+    }
+    if cursor.u32()? != 0 {
+        return Err(bbu_error("v1.1 pc-info tables are not supported"));
+    }
+    let _debug_ref = cursor.u32()?;
+    if max_stack == 0 {
+        return Err(bbu_error("function max_stack must be nonzero"));
+    }
+    Ok(EncodedBbuFunction {
+        name_ref,
+        lambda_list_ref,
+        flags,
+        arity_min,
+        arity_max,
+        n_locals,
+        max_stack,
+        code,
+        literal_refs,
+        metadata: None,
+    })
+}
+
+fn parse_bbu_function_metadata(
+    bytes: &[u8],
+    function_count: usize,
+) -> Result<Vec<BbuFunctionMetadata>, BlissError> {
+    let mut cursor = BbuCursor::new(bytes);
+    if cursor.u32()? as usize != function_count {
+        return Err(bbu_error("function-metadata count does not match function table"));
+    }
+    let mut metadata = Vec::with_capacity(function_count);
+    for _ in 0..function_count {
+        let has_env = match cursor.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(bbu_error("invalid has-env metadata flag")),
+        };
+        let variadic = match cursor.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(bbu_error("invalid variadic metadata flag")),
+        };
+        let count = cursor.u16()? as usize;
+        let mut params = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name_ref = cursor.u32()?;
+            let location_kind = cursor.u8()?;
+            let slot = cursor.u16()?;
+            let location = match location_kind {
+                0 if slot != u16::MAX => VarLoc::Slot(slot),
+                1 if slot == u16::MAX => VarLoc::Boxed,
+                _ => return Err(bbu_error("invalid parameter location metadata")),
+            };
+            let declared_type = match cursor.u8()? {
+                0 => DeclaredType::Any,
+                1 => DeclaredType::Fixnum,
+                2 => DeclaredType::SingleFloat,
+                _ => return Err(bbu_error("invalid declared parameter type")),
+            };
+            params.push((name_ref, location, declared_type));
+        }
+        metadata.push(BbuFunctionMetadata {
+            has_env,
+            variadic,
+            params,
+        });
+    }
+    if !cursor.done() {
+        return Err(bbu_error("trailing function-metadata bytes"));
+    }
+    Ok(metadata)
+}
+
+fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<BlissVal>, BlissError> {
+    let mut values = Vec::with_capacity(constants.len());
+    for (index, constant) in constants.iter().enumerate() {
+        let value = match constant {
+            BbuConstant::Nil => NIL,
+            BbuConstant::T => T,
+            BbuConstant::Fixnum(value) => {
+                if !(-(1_i64 << 60)..(1_i64 << 60)).contains(value) {
+                    return Err(bbu_error(format!("fixnum constant out of range: {value}")));
+                }
+                BlissVal::from_fixnum(*value)
+            }
+            BbuConstant::SingleFloat(bits) => BlissVal::from_single_float(f32::from_bits(*bits)),
+            BbuConstant::Character(code) => char::from_u32(*code)
+                .map(BlissVal::from_char)
+                .ok_or_else(|| bbu_error(format!("invalid character scalar {code}")))?,
+            BbuConstant::String(value) => arena_str(value),
+            BbuConstant::Package { name_ref, .. } => arena_str(bbu_string(constants, *name_ref)?),
+            BbuConstant::Symbol {
+                package_ref,
+                name_ref,
+                kind,
+            } => {
+                let name = bbu_string(constants, *name_ref)?;
+                let key = match (*package_ref, *kind) {
+                    (BBU_NO_INDEX, 0) => name.to_string(),
+                    (BBU_NO_INDEX, 1 | 2) => {
+                        values.push(bliss_rt::symbols::make_uninterned(name));
+                        continue;
+                    }
+                    (BBU_NO_INDEX, _) => return Err(bbu_error("external symbol has no package")),
+                    (package_ref, 0) => {
+                        let (package, _) = bbu_package(constants, package_ref)?;
+                        format!("{package}::{name}")
+                    }
+                    (package_ref, 3) => {
+                        let (package, _) = bbu_package(constants, package_ref)?;
+                        format!("{package}:{name}")
+                    }
+                    (_, kind) => return Err(bbu_error(format!("invalid symbol kind {kind}"))),
+                };
+                BlissVal::from_symbol_index(bliss_rt::symbols::intern(&key))
+            }
+            BbuConstant::Keyword(name_ref) => {
+                let name = bbu_string(constants, *name_ref)?;
+                BlissVal::from_symbol_index(bliss_rt::symbols::intern(&format!("KEYWORD:{name}")))
+            }
+            BbuConstant::LegacySymbol(name_ref) => {
+                let key = bbu_string(constants, *name_ref)?;
+                BlissVal::from_symbol_index(bliss_rt::symbols::intern(key))
+            }
+            BbuConstant::Cons(car_ref, cdr_ref) => {
+                // The writer emits structural children before their parent.
+                let car = *values.get(*car_ref as usize).ok_or_else(|| {
+                    bbu_error(format!("forward/cyclic cons reference at {index}"))
+                })?;
+                let cdr = *values.get(*cdr_ref as usize).ok_or_else(|| {
+                    bbu_error(format!("forward/cyclic cons reference at {index}"))
+                })?;
+                arena_cons(car, cdr)
+            }
+            BbuConstant::Vector(refs) => {
+                let elements = refs
+                    .iter()
+                    .map(|reference| {
+                        values.get(*reference as usize).copied().ok_or_else(|| {
+                            bbu_error(format!("forward/cyclic vector reference at {index}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                bliss_stdlib::build_simple_vector(&elements)
+            }
+        };
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn bbu_symbol(constants: &[BlissVal], index: u32) -> Result<u32, BlissError> {
+    let value = constants[bbu_index(index, constants.len(), "symbol constant")?];
+    if !value.is_symbol() || value.is_nil() || value == T {
+        return Err(bbu_error("expected symbol constant"));
+    }
+    Ok(value.as_symbol_index())
+}
+
+fn bbu_string_from_values(constants: &[BlissVal], index: u32) -> Result<String, BlissError> {
+    let value = constants[bbu_index(index, constants.len(), "string constant")?];
+    if !value.is_string() {
+        return Err(bbu_error("expected materialized string constant"));
+    }
+    Ok(val_as_str(value))
+}
+
+fn decode_bbu_function(
+    encoded: &EncodedBbuFunction,
+    constants: &[BlissVal],
+) -> Result<BytecodeFunction, BlissError> {
+    let mut cursor = BbuCursor::new(&encoded.code);
+    let mut starts = Vec::new();
+    let mut code = Vec::new();
+    let mut names = Vec::new();
+    while !cursor.done() {
+        starts.push(cursor.pos as u32);
+        let instr = match cursor.u8()? {
+            0x01 => {
+                let literal = cursor.u32()?;
+                if literal > u16::MAX as u32 || literal as usize >= encoded.literal_refs.len() {
+                    return Err(bbu_error("literal operand out of bounds"));
+                }
+                Instr::Const(literal as u16)
+            }
+            0x02 => Instr::LoadLocal(cursor.u16()?),
+            0x03 => Instr::StoreLocal(cursor.u16()?),
+            0x07 => Instr::LoadGlobal(bbu_symbol(constants, cursor.u32()?)?),
+            0x08 => Instr::StoreGlobal(bbu_symbol(constants, cursor.u32()?)?),
+            0x0d => Instr::CallNamed {
+                sym: bbu_symbol(constants, cursor.u32()?)?,
+                nargs: cursor.u16()?,
+            },
+            0x10 => {
+                if cursor.u16()? != 1 {
+                    return Err(bbu_error("v1.1 RETURN must return one value"));
+                }
+                Instr::Return
+            }
+            0x11 => Instr::Pop,
+            0x12 => Instr::Dup,
+            0x13 => Instr::SetValues(cursor.u16()?),
+            0x14 => Instr::ClearMv,
+            0x15 => Instr::TakeValuesToLocals {
+                slot_base: cursor.u16()?,
+                nvars: cursor.u16()?,
+            },
+            0x16 => Instr::ValuesToList,
+            0x18 => Instr::Br(cursor.u32()?),
+            0x19 => Instr::BrIfFalse(cursor.u32()?),
+            0x1a => Instr::BrIfTrue(cursor.u32()?),
+            0x1e => {
+                let block_id = cursor.u32()?;
+                let name_ref = cursor.u32()?;
+                let name = if name_ref == BBU_NO_INDEX {
+                    "NIL".to_string()
+                } else {
+                    val_as_str(constants[bbu_index(name_ref, constants.len(), "block name")?])
+                };
+                let name_idx = names.len();
+                if name_idx > u16::MAX as usize {
+                    return Err(bbu_error("too many block names"));
+                }
+                names.push(name);
+                Instr::PushBlock {
+                    block_id,
+                    name_idx: name_idx as u16,
+                    resume_bcp: cursor.u32()?,
+                    sp_restore: cursor.u16()?,
+                }
+            }
+            0x1f => Instr::ReturnFrom {
+                block_id: cursor.u32()?,
+            },
+            0x20 => Instr::PushCatch {
+                resume_bcp: cursor.u32()?,
+                sp_restore: cursor.u16()?,
+            },
+            0x21 => Instr::Throw,
+            0x22 => Instr::PushTag {
+                tagbody_id: cursor.u32()?,
+                sp_restore: cursor.u16()?,
+            },
+            0x23 => Instr::Go {
+                tagbody_id: cursor.u32()?,
+                target_bcp: cursor.u32()?,
+            },
+            0x24 => Instr::PushUnwind {
+                cleanup_bcp: cursor.u32()?,
+                sp_restore: cursor.u16()?,
+            },
+            0x25 => Instr::EnterCleanupNormal {
+                cleanup_bcp: cursor.u32()?,
+                resume_bcp: cursor.u32()?,
+            },
+            0x26 => Instr::CleanupReturn,
+            0x27 => Instr::PopHandler,
+            0x36 => Instr::PushEnvChild,
+            0x37 => Instr::PopEnvChild,
+            opcode => return Err(bbu_error(format!("unknown opcode 0x{opcode:02x}"))),
+        };
+        code.push(instr);
+    }
+
+    let mut pc_to_bcp = HashMap::new();
+    for (bcp, &pc) in starts.iter().enumerate() {
+        pc_to_bcp.insert(pc, bcp as u32);
+    }
+    pc_to_bcp.insert(encoded.code.len() as u32, code.len() as u32);
+    let map_pc = |pc: u32| {
+        pc_to_bcp
+            .get(&pc)
+            .copied()
+            .ok_or_else(|| bbu_error(format!("branch target {pc} is not an instruction boundary")))
+    };
+    for instr in &mut code {
+        match instr {
+            Instr::Br(target) | Instr::BrIfFalse(target) | Instr::BrIfTrue(target) => {
+                *target = map_pc(*target)?;
+            }
+            Instr::PushCatch { resume_bcp, .. } | Instr::PushBlock { resume_bcp, .. } => {
+                *resume_bcp = map_pc(*resume_bcp)?
+            }
+            Instr::Go { target_bcp, .. } => *target_bcp = map_pc(*target_bcp)?,
+            Instr::PushUnwind { cleanup_bcp, .. } => *cleanup_bcp = map_pc(*cleanup_bcp)?,
+            Instr::EnterCleanupNormal {
+                cleanup_bcp,
+                resume_bcp,
+            } => {
+                *cleanup_bcp = map_pc(*cleanup_bcp)?;
+                *resume_bcp = map_pc(*resume_bcp)?;
+            }
+            _ => {}
+        }
+    }
+
+    for instr in &code {
+        match instr {
+            Instr::LoadLocal(slot) | Instr::StoreLocal(slot) if *slot >= encoded.n_locals => {
+                return Err(bbu_error("local-slot operand out of bounds"));
+            }
+            Instr::TakeValuesToLocals { nvars, slot_base }
+                if slot_base.saturating_add(*nvars) > encoded.n_locals =>
+            {
+                return Err(bbu_error("multiple-value local range out of bounds"));
+            }
+            _ => {}
+        }
+    }
+
+    let literal_values = encoded
+        .literal_refs
+        .iter()
+        .map(|&reference| {
+            constants
+                .get(bbu_index(reference, constants.len(), "literal")?)
+                .copied()
+                .ok_or_else(|| bbu_error("literal index out of bounds"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let name = if encoded.name_ref == BBU_NO_INDEX {
+        "<toplevel>".to_string()
+    } else {
+        sym_name(BlissVal::from_symbol_index(bbu_symbol(
+            constants,
+            encoded.name_ref,
+        )?))
+    };
+    let (param_layout, param_types, has_env, variadic) = if let Some(metadata) = &encoded.metadata {
+        let mut layout = Vec::with_capacity(metadata.params.len());
+        let mut types = Vec::with_capacity(metadata.params.len());
+        for &(name_ref, location, declared_type) in &metadata.params {
+            layout.push((bbu_string_from_values(constants, name_ref)?, location));
+            types.push(declared_type);
+        }
+        (layout, types, metadata.has_env, metadata.variadic)
+    } else {
+        let layout = (0..encoded.arity_min)
+            .map(|slot| (format!("%ARG{slot}"), VarLoc::Slot(slot)))
+            .collect::<Vec<_>>();
+        let types = vec![DeclaredType::Any; layout.len()];
+        (layout, types, false, false)
+    };
+    let params_form = if encoded.lambda_list_ref == BBU_NO_INDEX {
+        NIL
+    } else {
+        constants[bbu_index(
+            encoded.lambda_list_ref,
+            constants.len(),
+            "lambda-list",
+        )?]
+    };
+    Ok(BytecodeFunction {
+        code,
+        constants: literal_values,
+        handler_cases: Vec::new(),
+        handler_binds: Vec::new(),
+        names,
+        restart_cases: Vec::new(),
+        param_types,
+        param_layout,
+        has_env,
+        n_locals: encoded.n_locals,
+        max_stack: encoded.max_stack,
+        arity: encoded.arity_min,
+        name,
+        params_form,
+        min_args: encoded.arity_min,
+        max_args: (encoded.arity_max != u16::MAX).then_some(encoded.arity_max),
+        variadic,
+    })
+}
+
+fn installed_lambda_list(arity: u16) -> BlissVal {
+    let params = (0..arity)
+        .map(|slot| {
+            BlissVal::from_symbol_index(bliss_rt::symbols::intern(&format!(
+                "BLISS-INTERNAL::%BFASL-ARG-{slot}"
+            )))
+        })
+        .collect::<Vec<_>>();
+    vec_to_list(&params)
+}
+
+fn bbu_direct_symbol_for_package(
+    encoded: &[BbuConstant],
+    values: &[BlissVal],
+    package: BlissVal,
+    bare_name: &str,
+) -> Result<Option<(BlissVal, bool)>, BlissError> {
+    for (index, constant) in encoded.iter().enumerate() {
+        let BbuConstant::Symbol {
+            package_ref,
+            name_ref,
+            kind,
+        } = constant
+        else {
+            continue;
+        };
+        if *package_ref == BBU_NO_INDEX || bbu_string(encoded, *name_ref)? != bare_name {
+            continue;
+        }
+        let (package_name, _) = bbu_package(encoded, *package_ref)?;
+        if bliss_stdlib::find_package(package_name) == Some(package) {
+            return Ok(Some((values[index], *kind == 3)));
+        }
+    }
+    Ok(None)
+}
+
+fn execute_bbu_ensure_package(
+    encoded: &[BbuConstant],
+    values: &[BlissVal],
+    action: BbuLoadAction,
+) -> Result<BlissVal, BlissError> {
+    let (name, nickname_refs) = bbu_package(encoded, action.arg0)?;
+    let nicknames = nickname_refs
+        .iter()
+        .map(|&reference| bbu_string(encoded, reference).map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+    let uses = bbu_vector(encoded, action.arg1)?
+        .iter()
+        .map(|&reference| bbu_string(encoded, reference).map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+    let exports = bbu_vector(encoded, action.arg2)?
+        .iter()
+        .map(|&reference| bbu_string(encoded, reference).map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // DEFINE-PACKAGE permits forward use-list references in the source loader;
+    // create the same placeholder package before linking the target.
+    for used in &uses {
+        reader::register_package(used);
+        if bliss_stdlib::find_package(used).is_none() {
+            bliss_stdlib::make_package(used, &[], &[])?;
+        }
+    }
+    reader::register_package(name);
+    for nickname in &nicknames {
+        reader::register_package(nickname);
+    }
+    let package = if let Some(package) = bliss_stdlib::find_package(name) {
+        for nickname in &nicknames {
+            bliss_stdlib::add_nickname(package, nickname)?;
+        }
+        for used in &uses {
+            bliss_stdlib::use_package_by_name(package, used)?;
+        }
+        package
+    } else {
+        let nickname_refs = nicknames.iter().map(String::as_str).collect::<Vec<_>>();
+        let use_refs = uses.iter().map(String::as_str).collect::<Vec<_>>();
+        bliss_stdlib::make_package(name, &nickname_refs, &use_refs)?
+    };
+
+    // Export accessible inherited symbols without changing their identity. If
+    // the name is new, prefer the already-materialized structural Symbol so
+    // function/global references and package lookup remain EQ.
+    for export_name in &exports {
+        let symbol = bliss_stdlib::find_present_symbol(package, export_name)
+            .or(bliss_stdlib::find_symbol(export_name, package)?.map(|entry| entry.0))
+            .or(
+                bbu_direct_symbol_for_package(encoded, values, package, export_name)?
+                    .map(|entry| entry.0),
+            )
+            .unwrap_or(bliss_stdlib::intern(export_name, package)?.0);
+        bliss_stdlib::add_symbol(package, export_name, symbol, true)?;
+        bliss_rt::symbols::set_symbol_package(symbol.as_symbol_index(), package);
+    }
+
+    // Any remaining qualified symbols referenced by functions/thunks are
+    // present internal symbols after load, even when not explicitly exported.
+    for (index, constant) in encoded.iter().enumerate() {
+        let BbuConstant::Symbol {
+            package_ref,
+            name_ref,
+            kind,
+        } = constant
+        else {
+            continue;
+        };
+        if *package_ref == BBU_NO_INDEX {
+            continue;
+        }
+        let (symbol_package_name, _) = bbu_package(encoded, *package_ref)?;
+        if bliss_stdlib::find_package(symbol_package_name) != Some(package) {
+            continue;
+        }
+        let bare_name = bbu_string(encoded, *name_ref)?;
+        if bliss_stdlib::find_symbol(bare_name, package)?.is_none() {
+            bliss_stdlib::add_symbol(package, bare_name, values[index], *kind == 3)?;
+            bliss_rt::symbols::set_symbol_package(values[index].as_symbol_index(), package);
+        }
+    }
+    Ok(package)
+}
+
+/// Verify, decode, and execute an authoritative portable BBU. No source reader
+/// or macroexpander participates in this path.
+pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
+    let mut cursor = BbuCursor::new(bytes);
+    if cursor.take(4)? != BBU_MAGIC {
+        return Err(bbu_error("bad magic"));
+    }
+    let bytecode_version = cursor.u16()?;
+    if bytecode_version >> 8 != BBU_BYTECODE_VERSION >> 8
+        || (bytecode_version & 0xff) > (BBU_BYTECODE_VERSION & 0xff)
+    {
+        return Err(bbu_error(format!(
+            "unsupported bytecode version {bytecode_version:#06x}"
+        )));
+    }
+    let verifier_version = cursor.u16()?;
+    if verifier_version != BBU_VERIFIER_VERSION {
+        return Err(bbu_error(format!(
+            "unsupported verifier version {verifier_version:#06x}"
+        )));
+    }
+    let unit_flags = cursor.u32()?;
+    if unit_flags & BBU_UNIT_COMPLETE == 0 {
+        return Err(bbu_error("incomplete unit (source fallback is forbidden)"));
+    }
+    let constant_count = cursor.u32()? as usize;
+    let function_count = cursor.u32()? as usize;
+    let action_count = cursor.u32()? as usize;
+    let aux_count = cursor.u32()? as usize;
+    let source_file_ref = cursor.u32()?;
+    let _expanded_hash = cursor.u64()?;
+    let mut encoded_constants = Vec::with_capacity(constant_count);
+    for _ in 0..constant_count {
+        encoded_constants.push(parse_bbu_constant(&mut cursor, bytecode_version)?);
+    }
+    if source_file_ref != BBU_NO_INDEX {
+        bbu_string(&encoded_constants, source_file_ref)?;
+    }
+    for constant in &encoded_constants {
+        match constant {
+            BbuConstant::Package {
+                name_ref,
+                nickname_refs,
+            } => {
+                bbu_string(&encoded_constants, *name_ref)?;
+                for &nickname_ref in nickname_refs {
+                    bbu_string(&encoded_constants, nickname_ref)?;
+                }
+            }
+            BbuConstant::Symbol {
+                package_ref,
+                name_ref,
+                kind,
+            } => {
+                bbu_string(&encoded_constants, *name_ref)?;
+                match (*package_ref, *kind) {
+                    (BBU_NO_INDEX, 0 | 1 | 2) => {}
+                    (BBU_NO_INDEX, _) => {
+                        return Err(bbu_error("external symbol has no package"));
+                    }
+                    (package_ref, 0 | 3) => {
+                        bbu_package(&encoded_constants, package_ref)?;
+                    }
+                    (_, kind) => {
+                        return Err(bbu_error(format!("invalid symbol kind {kind}")));
+                    }
+                }
+            }
+            BbuConstant::Keyword(name_ref) | BbuConstant::LegacySymbol(name_ref) => {
+                bbu_string(&encoded_constants, *name_ref)?;
+            }
+            BbuConstant::Cons(car, cdr) => {
+                bbu_index(*car, encoded_constants.len(), "cons car")?;
+                bbu_index(*cdr, encoded_constants.len(), "cons cdr")?;
+            }
+            BbuConstant::Vector(refs) => {
+                for &reference in refs {
+                    bbu_index(reference, encoded_constants.len(), "vector element")?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut encoded_functions = Vec::with_capacity(function_count);
+    for _ in 0..function_count {
+        encoded_functions.push(parse_bbu_function(&mut cursor)?);
+    }
+    for function in &encoded_functions {
+        let role_flags = function.flags
+            & (BBU_FUNC_NAMED
+                | BBU_FUNC_MACRO
+                | BBU_FUNC_COMPILER_MACRO
+                | BBU_FUNC_LOAD_TIME_THUNK);
+        if function.flags
+            & !(BBU_FUNC_NAMED
+                | BBU_FUNC_MACRO
+                | BBU_FUNC_COMPILER_MACRO
+                | BBU_FUNC_LOAD_TIME_THUNK)
+            != 0
+            || role_flags.count_ones() != 1
+        {
+            return Err(bbu_error("invalid function flags"));
+        }
+        if function.name_ref != BBU_NO_INDEX {
+            match encoded_constants.get(bbu_index(
+                function.name_ref,
+                encoded_constants.len(),
+                "function name",
+            )?) {
+                constant if bbu_is_symbol_constant(constant) => {}
+                _ => return Err(bbu_error("function name is not a symbol")),
+            }
+        }
+        for &literal in &function.literal_refs {
+            bbu_index(literal, encoded_constants.len(), "function literal")?;
+        }
+        if function.lambda_list_ref != BBU_NO_INDEX {
+            bbu_index(
+                function.lambda_list_ref,
+                encoded_constants.len(),
+                "lambda-list",
+            )?;
+        }
+    }
+    let mut actions = Vec::with_capacity(action_count);
+    for _ in 0..action_count {
+        actions.push(BbuLoadAction {
+            kind: cursor.u8()?,
+            flags: cursor.u8()?,
+            arg0: cursor.u32()?,
+            arg1: cursor.u32()?,
+            arg2: cursor.u32()?,
+        });
+    }
+    let mut function_metadata = None;
+    for _ in 0..aux_count {
+        let kind = cursor.u16()?;
+        let flags = cursor.u16()?;
+        let len = cursor.u32()? as usize;
+        let bytes = cursor.take(len)?;
+        if flags != 0 {
+            return Err(bbu_error("unsupported auxiliary-table flags"));
+        }
+        if kind == BBU_AUX_FUNCTION_METADATA {
+            if function_metadata.is_some() {
+                return Err(bbu_error("duplicate function-metadata table"));
+            }
+            function_metadata = Some(parse_bbu_function_metadata(bytes, function_count)?);
+        }
+    }
+    if !cursor.done() {
+        return Err(bbu_error("trailing bytes"));
+    }
+    if bytecode_version >= 0x0103 && function_metadata.is_none() {
+        return Err(bbu_error("v1.3 unit is missing function metadata"));
+    }
+    if let Some(metadata) = function_metadata {
+        for (function, metadata) in encoded_functions.iter_mut().zip(metadata) {
+            function.metadata = Some(metadata);
+        }
+    }
+    for function in &encoded_functions {
+        if let Some(metadata) = &function.metadata {
+            if !metadata.variadic && function.arity_min != function.arity_max {
+                return Err(bbu_error("fixed function has a non-fixed arity range"));
+            }
+            if metadata.variadic && function.lambda_list_ref == BBU_NO_INDEX {
+                return Err(bbu_error("variadic function has no lambda-list metadata"));
+            }
+            for &(name_ref, location, _) in &metadata.params {
+                bbu_string(&encoded_constants, name_ref)?;
+                match location {
+                    VarLoc::Slot(slot) if slot < function.n_locals => {}
+                    VarLoc::Boxed if metadata.has_env => {}
+                    _ => return Err(bbu_error("parameter location is out of bounds")),
+                }
+            }
+        } else if function.arity_min != function.arity_max {
+            return Err(bbu_error("legacy unit contains a variadic function"));
+        }
+    }
+
+    // Validate the complete load plan before mutating any function/value cell.
+    for action in &actions {
+        match action.kind {
+            1 => {
+                if action.flags != 0 {
+                    return Err(bbu_error("EnsurePackage has unsupported flags"));
+                }
+                bbu_package(&encoded_constants, action.arg0)?;
+                for &reference in bbu_vector(&encoded_constants, action.arg1)? {
+                    bbu_string(&encoded_constants, reference)?;
+                }
+                for &reference in bbu_vector(&encoded_constants, action.arg2)? {
+                    bbu_string(&encoded_constants, reference)?;
+                }
+            }
+            2 => {
+                if action.flags != 0 || action.arg2 != BBU_NO_INDEX {
+                    return Err(bbu_error("InternSymbol has unsupported flags/arguments"));
+                }
+                bbu_package(&encoded_constants, action.arg0)?;
+                bbu_string(&encoded_constants, action.arg1)?;
+            }
+            3 => {
+                if action.flags != 0 || action.arg2 != BBU_NO_INDEX {
+                    return Err(bbu_error("InstallFunction has unsupported flags/arguments"));
+                }
+                let function = &encoded_functions
+                    [bbu_index(action.arg0, encoded_functions.len(), "function")?];
+                if function.flags & BBU_FUNC_NAMED == 0 {
+                    return Err(bbu_error("InstallFunction references a non-named function"));
+                }
+                match encoded_constants.get(bbu_index(
+                    action.arg1,
+                    encoded_constants.len(),
+                    "function name",
+                )?) {
+                    constant if bbu_is_symbol_constant(constant) => {}
+                    _ => return Err(bbu_error("InstallFunction name is not a symbol")),
+                }
+            }
+            4 | 5 => {
+                if action.flags != 0 || action.arg2 != BBU_NO_INDEX {
+                    return Err(bbu_error("macro installation has unsupported arguments"));
+                }
+                let function = &encoded_functions
+                    [bbu_index(action.arg0, encoded_functions.len(), "macro function")?];
+                let expected = if action.kind == 4 {
+                    BBU_FUNC_MACRO
+                } else {
+                    BBU_FUNC_COMPILER_MACRO
+                };
+                if function.flags & expected == 0 {
+                    return Err(bbu_error("macro action references the wrong function role"));
+                }
+                match encoded_constants.get(bbu_index(
+                    action.arg1,
+                    encoded_constants.len(),
+                    "macro name",
+                )?) {
+                    constant if bbu_is_symbol_constant(constant) => {}
+                    _ => return Err(bbu_error("macro name is not a symbol")),
+                }
+            }
+            7 => {
+                if action.flags != 0 || action.arg2 != BBU_NO_INDEX {
+                    return Err(bbu_error("EvalThunk has unsupported flags/arguments"));
+                }
+                let function =
+                    &encoded_functions[bbu_index(action.arg0, encoded_functions.len(), "thunk")?];
+                if function.flags & BBU_FUNC_LOAD_TIME_THUNK == 0 {
+                    return Err(bbu_error("EvalThunk references a non-thunk function"));
+                }
+                if action.arg1 != BBU_NO_INDEX {
+                    return Err(bbu_error("EvalThunk has an unexpected argument"));
+                }
+            }
+            kind => return Err(bbu_error(format!("unsupported load action {kind}"))),
+        }
+    }
+
+    let constants = materialize_bbu_constants(&encoded_constants)?;
+    let functions = encoded_functions
+        .iter()
+        .map(|function| decode_bbu_function(function, &constants).map(Rc::new))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut last = NIL;
+    for action in actions {
+        match action.kind {
+            1 => {
+                last = execute_bbu_ensure_package(&encoded_constants, &constants, action)?;
+            }
+            2 => {
+                let (package_name, _) = bbu_package(&encoded_constants, action.arg0)?;
+                let package = bliss_stdlib::find_package(package_name).ok_or_else(|| {
+                    bbu_error(format!("package {package_name:?} was not ensured before INTERN"))
+                })?;
+                let name = bbu_string(&encoded_constants, action.arg1)?;
+                last = bliss_stdlib::intern(name, package)?.0;
+            }
+            3 => {
+                let function_index = action.arg0 as usize;
+                let sym = bbu_symbol(&constants, action.arg1)?;
+                let function = Rc::clone(&functions[function_index]);
+                let symbol = BlissVal::from_symbol_index(sym);
+                let lambda_list = if function.variadic {
+                    function.params_form
+                } else {
+                    installed_lambda_list(function.arity)
+                };
+                let fn_obj = match bliss_rt::symbols::symbol_function(sym) {
+                    Some(existing) if bliss_rt::function::is_interpreted_function(existing) => {
+                        // SAFETY: checked immediately above.
+                        unsafe { bliss_rt::function::redefine(existing, lambda_list, NIL, NIL) };
+                        existing
+                    }
+                    _ => {
+                        let allocated =
+                            bliss_rt::function::alloc_interpreted(lambda_list, NIL, NIL, symbol);
+                        bliss_rt::symbols::set_symbol_function(sym, allocated);
+                        allocated
+                    }
+                };
+                registry_put(sym, function);
+                // Keep the function object's tier metadata tied to this loaded
+                // definition; registry_put has already invalidated old native code.
+                bliss_rt::function::set_tier(fn_obj, 0);
+                last = symbol;
+            }
+            4 => {
+                let symbol = constants[bbu_index(
+                    action.arg1,
+                    constants.len(),
+                    "macro name",
+                )?];
+                super::install_loaded_macro(
+                    symbol,
+                    Rc::clone(&functions[action.arg0 as usize]),
+                    env,
+                );
+                last = symbol;
+            }
+            5 => {
+                let symbol = constants[bbu_index(
+                    action.arg1,
+                    constants.len(),
+                    "compiler macro name",
+                )?];
+                super::install_loaded_compiler_macro(
+                    symbol,
+                    Rc::clone(&functions[action.arg0 as usize]),
+                );
+                last = symbol;
+            }
+            7 => {
+                last = run(Rc::clone(&functions[action.arg0 as usize]), &[], NIL, env)?;
+            }
+            _ => unreachable!("load actions were verified above"),
+        }
+    }
+    Ok(last)
 }
 
 // ── Execution ──────────────────────────────────────────────────────
@@ -3546,11 +5239,12 @@ struct Activation {
     sym: u32,
 }
 
-/// Build the base heap `EnvFrame` for a function with captured locals, binding
-/// its boxed parameters; returns `None` for the slot-only case.
+/// Build the base heap `EnvFrame` for a function with captured locals. Parameter
+/// values are populated by [`bind_params`] or [`bind_variadic`], after the
+/// lambda-list binder has resolved defaults, supplied-p variables, and rest/key
+/// arguments. Returns `None` for the slot-only case.
 fn make_env_frame(
     func: &BytecodeFunction,
-    args: &[BlissVal],
     parent: Rc<RefCell<EnvFrame>>,
 ) -> Option<Rc<RefCell<EnvFrame>>> {
     if !func.has_env {
@@ -3561,18 +5255,17 @@ fn make_env_frame(
         symbol_vars: std::collections::HashMap::new(),
         parent: Some(parent),
     }));
-    for (i, (pname, loc)) in func.param_layout.iter().enumerate() {
-        if let VarLoc::Boxed = loc {
-            if let Some(a) = args.get(i) {
-                let mut borrowed = frame.borrow_mut();
-                borrowed.vars.insert(pname.clone(), *a);
-                if let Some(idx) = bliss_rt::symbols::find_index(pname) {
-                    borrowed.symbol_vars.insert(idx, *a);
-                }
-            }
-        }
-    }
     Some(frame)
+}
+
+/// Define a captured parameter in an activation's heap environment. Keep the
+/// name and symbol-index maps in sync, just like `DefineEnvVar`.
+fn bind_boxed_param(env_frame: &Rc<RefCell<EnvFrame>>, name: &str, value: BlissVal) {
+    let mut borrowed = env_frame.borrow_mut();
+    if let Some(idx) = bliss_rt::symbols::find_index(name) {
+        borrowed.symbol_vars.insert(idx, value);
+    }
+    borrowed.vars.insert(name.to_string(), value);
 }
 
 #[inline]
@@ -3620,13 +5313,44 @@ impl Activation {
 /// Frame-type/flags value for an interpreted CALL frame (§2.4.3 `CALL` = 0b00).
 const FLAG_CALL: u32 = 0b00;
 
-/// Bind a call's arguments into their parameters' frame slots (boxed params go
-/// to the heap `EnvFrame` via [`make_env_frame`], not here).
-fn bind_params(func: &BytecodeFunction, frame: *mut Frame, args: &[BlissVal]) {
-    for (i, (_, loc)) in func.param_layout.iter().enumerate() {
-        if let VarLoc::Slot(s) = loc {
-            if let Some(a) = args.get(i) {
-                unsafe { slot_set(frame, *s, *a) };
+fn validate_declared_args(func: &BytecodeFunction, args: &[BlissVal]) -> Result<(), BlissError> {
+    for (ty, value) in func.param_types.iter().copied().zip(args.iter().copied()) {
+        let matches = match ty {
+            DeclaredType::Any => true,
+            DeclaredType::Fixnum => value.is_fixnum(),
+            DeclaredType::SingleFloat => value.is_single_float(),
+        };
+        if !matches {
+            let expected = match ty {
+                DeclaredType::Any => unreachable!(),
+                DeclaredType::Fixnum => "FIXNUM",
+                DeclaredType::SingleFloat => "SINGLE-FLOAT",
+            };
+            return Err(BlissError::TypeError {
+                datum: value,
+                expected: expected.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Bind a fixed-arity call's arguments to stack slots or boxed heap bindings.
+fn bind_params(
+    func: &BytecodeFunction,
+    frame: *mut Frame,
+    args: &[BlissVal],
+    env_frame: Option<&Rc<RefCell<EnvFrame>>>,
+) {
+    for (i, (name, loc)) in func.param_layout.iter().enumerate() {
+        if let Some(a) = args.get(i) {
+            match loc {
+                VarLoc::Slot(s) => unsafe { slot_set(frame, *s, *a) },
+                VarLoc::Boxed => bind_boxed_param(
+                    env_frame.expect("boxed parameter without a heap EnvFrame"),
+                    name,
+                    *a,
+                ),
             }
         }
     }
@@ -3637,12 +5361,12 @@ fn bind_params(func: &BytecodeFunction, frame: *mut Frame, args: &[BlissVal]) {
 /// parsing and default-form evaluation into a throwaway child env — so a default
 /// evaluates in a scope where the earlier parameters are visible, byte-for-byte
 /// as the interpreter would — and then each parameter's value is copied into its
-/// slot. `compile_function` guarantees no variadic parameter is boxed, so only
-/// `Slot` locations occur here.
+/// stack slot or boxed heap binding.
 fn bind_variadic(
     func: &BytecodeFunction,
     frame: *mut Frame,
     args: &[BlissVal],
+    env_frame: Option<&Rc<RefCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<(), BlissError> {
     let parent = Rc::clone(&env.frame);
@@ -3652,9 +5376,14 @@ fn bind_variadic(
         env.clear_mv();
         let cur = Rc::clone(&env.frame);
         for (name, loc) in &func.param_layout {
-            if let VarLoc::Slot(s) = loc {
-                let v = super::Env::lookup_frame(&cur, name).unwrap_or(NIL);
-                unsafe { slot_set(frame, *s, v) };
+            let v = super::Env::lookup_frame(&cur, name).unwrap_or(NIL);
+            match loc {
+                VarLoc::Slot(s) => unsafe { slot_set(frame, *s, v) },
+                VarLoc::Boxed => bind_boxed_param(
+                    env_frame.expect("boxed variadic parameter without a heap EnvFrame"),
+                    name,
+                    v,
+                ),
             }
         }
         Ok(())
@@ -3664,12 +5393,14 @@ fn bind_variadic(
 /// Run a compiled function to completion on the current green thread's
 /// `BlissStack`. `args` are the actual arguments bound into the entry frame's
 /// leading local slots.
-fn run(
+pub(super) fn run(
     entry: Rc<BytecodeFunction>,
     args: &[BlissVal],
     entry_fn_val: BlissVal,
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
+    validate_declared_args(&entry, args)?;
+    record_profiled_invocation(Rc::as_ptr(&entry) as usize);
     // A callee's return values are determined by its own body — discard any
     // multiple-values state left by the caller's argument evaluation, so a
     // single-valued function returns exactly one value (an enclosing
@@ -3688,18 +5419,22 @@ fn run(
             entry.num_slots(),
             FLAG_CALL,
         )
-        .ok_or_else(|| BlissError::StackOverflow(bliss_rt::current_thread_id()))?;
+        .ok_or_else(|| {
+            BlissError::StackOverflow(
+                bliss_rt::current_fiber_id()
+                    .unwrap_or_else(|| bliss_rt::FiberId(bliss_rt::current_thread_id().0)),
+            )
+        })?;
+    let env_frame = make_env_frame(&entry, Rc::clone(&env.frame));
     if entry.variadic {
-        if let Err(e) = bind_variadic(&entry, frame, args, env) {
+        if let Err(e) = bind_variadic(&entry, frame, args, env_frame.as_ref(), env) {
             stack.pop_frame();
             return Err(e);
         }
     } else {
-        bind_params(&entry, frame, args);
+        bind_params(&entry, frame, args, env_frame.as_ref());
     }
-    let env_frame = make_env_frame(&entry, args, Rc::clone(&env.frame));
-    let entry_obj = Some(entry_fn_val)
-        .filter(|&v| bliss_rt::function::is_interpreted_function(v));
+    let entry_obj = Some(entry_fn_val).filter(|&v| bliss_rt::function::is_interpreted_function(v));
     let mut acts: Vec<Activation> = vec![Activation {
         frame,
         n_locals: entry.n_locals,
@@ -3954,28 +5689,36 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 // genuine producers re-establish it while executing.
                 env.clear_mv();
 
-                // Type profiling: record operand types at speculatable arithmetic
-                // sites so the optimising tier can commit to one type. `bcp` was
+                // Only saved bytecode callees are body-inlining candidates.
+                // Reuse this lookup for dispatch below and avoid profiling the
+                // much larger population of builtin calls.
+                let registered_callee = registry_get(sym);
+
+                // Profile every call site's execution frequency.  Type details
+                // remain restricted to speculatable arithmetic sites. `bcp` was
                 // already advanced past this instruction, so the site is bcp-1.
+                let func_ptr = Rc::as_ptr(&acts[top_idx].func) as usize;
+                let call_bcp = acts[top_idx].bcp as u32 - 1;
+                if registered_callee.is_some() {
+                    record_call_site(func_ptr, call_bcp);
+                }
                 if is_arith_speculatable(sym) {
-                    let func_ptr = Rc::as_ptr(&acts[top_idx].func) as usize;
-                    let call_bcp = acts[top_idx].bcp as u32 - 1;
                     record_type_profile(func_ptr, call_bcp, &args);
                 }
 
                 // bliss-jtc.6.8: bump the callee's FnMeta invoke counter (the
                 // unified tiering substrate) so the function object reflects real
                 // invocations from the bytecode path, not just the tree-walker.
-                if let Some(cell) = bliss_rt::symbols::symbol_function(sym) {
-                    if bliss_rt::function::is_interpreted_function(cell) {
-                        bliss_rt::function::record_invocation(cell);
-                    }
+                let fn_obj = bliss_rt::symbols::symbol_function(sym)
+                    .filter(|&cell| bliss_rt::function::is_interpreted_function(cell));
+                if let Some(cell) = fn_obj {
+                    bliss_rt::function::record_invocation(cell);
                 }
 
                 // Bytecode callee → native frame on the BlissStack.
-                if let Some(callee) = registry_get(sym) {
+                if let Some(callee) = registered_callee {
                     if arity_accepts(&callee, nargs as usize) {
-                        // T1: installed native code → call via the i2c adapter.
+                        // Installed native code → call via the i2c adapter.
                         // Unified tiering (bliss-jtc.3): the function object's
                         // FnMeta is the single tiering record — invoke counter
                         // (bumped at the top of CallNamed), current tier, and the
@@ -3983,29 +5726,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                         // counter and, on success, tier + entry are recorded on
                         // the object. Anonymous compiled lambdas (gensyms) have no
                         // function object, so they keep the INVOKE_COUNTS fallback.
-                        let fn_obj = bliss_rt::symbols::symbol_function(sym)
-                            .filter(|&c| bliss_rt::function::is_interpreted_function(c));
-                        let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
-                        let native = native.or_else(|| {
-                            let count = match fn_obj {
-                                Some(f) => bliss_rt::function::invoke_count(f),
-                                None => INVOKE_COUNTS.with(|m| {
-                                    let mut b = m.borrow_mut();
-                                    let e = b.entry(sym).or_insert(0);
-                                    *e += 1;
-                                    *e
-                                }),
-                            };
-                            if count < t1_threshold() {
-                                return None;
-                            }
-                            let nc = try_promote(sym)?;
-                            if let Some(f) = fn_obj {
-                                bliss_rt::function::set_entry(f, nc.entry as *mut u8);
-                                bliss_rt::function::set_tier(f, 1);
-                            }
-                            Some(nc)
-                        });
+                        let count = dispatch_invoke_count(sym, fn_obj);
+                        let native = native_for_dispatch(sym, fn_obj, count);
                         // Run native only while under the depth cap (bliss-x5y.4);
                         // once the native call stack is deep, dispatch the callee
                         // through the flat T0 path below instead of pushing yet
@@ -4026,6 +5748,14 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                                 }
                             }
                         }
+                        // Native entry validates in `run_native`; the flat T0
+                        // activation reaches no adapter, so enforce the same
+                        // declaration contract here before binding its frame.
+                        if let Err(e) = validate_declared_args(&callee, &args) {
+                            let pending = error_to_pending(e, env);
+                            initiate_unwind(acts, stack, env, pending)?;
+                            continue;
+                        }
                         let fn_val = BlissVal::from_symbol_index(sym);
                         let frame = match stack.push_frame(
                             fn_val,
@@ -4038,21 +5768,28 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                                 // BlissStack full → STORAGE-CONDITION, routed
                                 // through the unwind driver so unwind-protect
                                 // cleanups run and a handler-case can catch it.
-                                let e = BlissError::StackOverflow(bliss_rt::current_thread_id());
+                                let e = BlissError::StackOverflow(
+                                    bliss_rt::current_fiber_id().unwrap_or_else(|| {
+                                        bliss_rt::FiberId(bliss_rt::current_thread_id().0)
+                                    }),
+                                );
                                 initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                                 continue;
                             }
                         };
+                        let env_frame = make_env_frame(&callee, Rc::clone(&env.frame));
                         if callee.variadic {
-                            if let Err(e) = bind_variadic(&callee, frame, &args, env) {
+                            if let Err(e) =
+                                bind_variadic(&callee, frame, &args, env_frame.as_ref(), env)
+                            {
                                 stack.pop_frame();
                                 initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                                 continue;
                             }
                         } else {
-                            bind_params(&callee, frame, &args);
+                            bind_params(&callee, frame, &args, env_frame.as_ref());
                         }
-                        let env_frame = make_env_frame(&callee, &args, Rc::clone(&env.frame));
+                        record_profiled_invocation(Rc::as_ptr(&callee) as usize);
                         acts.push(Activation {
                             frame,
                             n_locals: callee.n_locals,
@@ -4630,6 +6367,9 @@ thread_local! {
     /// The `Env` in scope while native T1 code runs, so a c2i callback can
     /// invoke interpreted functions. Set by `run_native` around the call.
     static NATIVE_ENV: std::cell::Cell<*mut Env> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// Captured lexical environment for the currently executing native
+    /// activation. Nested native calls save/restore this just like NATIVE_ENV.
+    static NATIVE_ENV_FRAME: RefCell<Option<Rc<RefCell<EnvFrame>>>> = const { RefCell::new(None) };
 }
 
 /// c2i adapter: call the interpreted function named by `sym` with `n` arguments
@@ -4669,7 +6409,179 @@ extern "C" fn c2i_store_global(sym: u64, val: u64) {
     bliss_rt::symbols::set_symbol_value(sym as u32, BlissVal(val));
 }
 
-extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+fn stash_native_error(error: BlissError) {
+    NATIVE_ERROR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    });
+}
+
+fn native_env_name(function_sym: u64, name_index: u64) -> Option<String> {
+    registry_get(function_sym as u32).and_then(|body| body.names.get(name_index as usize).cloned())
+}
+
+extern "C" fn c2i_load_env(function_sym: u64, name_index: u64) -> u64 {
+    let Some(name) = native_env_name(function_sym, name_index) else {
+        stash_native_error(BlissError::Internal(
+            "native environment name vanished".into(),
+        ));
+        return NIL.0;
+    };
+    NATIVE_ENV_FRAME.with(|slot| {
+        let frame = slot.borrow();
+        match frame
+            .as_ref()
+            .and_then(|frame| Env::lookup_frame(frame, &name))
+        {
+            Some(value) => value.0,
+            None => {
+                let symbol = resolve_sym(&name).unwrap_or(NIL);
+                stash_native_error(BlissError::UnboundVariable(symbol));
+                NIL.0
+            }
+        }
+    })
+}
+
+extern "C" fn c2i_store_env(function_sym: u64, name_index: u64, value: u64) {
+    let Some(name) = native_env_name(function_sym, name_index) else {
+        stash_native_error(BlissError::Internal(
+            "native environment name vanished".into(),
+        ));
+        return;
+    };
+    NATIVE_ENV_FRAME.with(|slot| {
+        if let Some(frame) = slot.borrow().as_ref() {
+            if !Env::set_frame_var(frame, &name, BlissVal(value)) {
+                stash_native_error(BlissError::UnboundVariable(
+                    resolve_sym(&name).unwrap_or(NIL),
+                ));
+            }
+        }
+    });
+}
+
+extern "C" fn c2i_define_env(function_sym: u64, name_index: u64, value: u64) {
+    let Some(name) = native_env_name(function_sym, name_index) else {
+        stash_native_error(BlissError::Internal(
+            "native environment name vanished".into(),
+        ));
+        return;
+    };
+    NATIVE_ENV_FRAME.with(|slot| {
+        if let Some(frame) = slot.borrow().as_ref() {
+            let mut borrowed = frame.borrow_mut();
+            if let Some(symbol_index) = bliss_rt::symbols::find_index(&name) {
+                borrowed.symbol_vars.insert(symbol_index, BlissVal(value));
+            }
+            borrowed.vars.insert(name.clone(), BlissVal(value));
+        }
+    });
+}
+
+extern "C" fn c2i_push_env_child() {
+    NATIVE_ENV_FRAME.with(|slot| {
+        let parent = slot.borrow().clone();
+        *slot.borrow_mut() = Some(Rc::new(RefCell::new(EnvFrame {
+            vars: HashMap::new(),
+            symbol_vars: HashMap::new(),
+            parent,
+        })));
+    });
+}
+
+extern "C" fn c2i_pop_env_child() {
+    NATIVE_ENV_FRAME.with(|slot| {
+        let parent = slot
+            .borrow()
+            .as_ref()
+            .and_then(|frame| frame.borrow().parent.clone());
+        *slot.borrow_mut() = parent;
+    });
+}
+
+fn c2i_eval_form_with_frame(form: BlissVal, capture_native_frame: bool) -> u64 {
+    let env_ptr = NATIVE_ENV.with(|cell| cell.get());
+    if env_ptr.is_null() {
+        return NIL.0;
+    }
+    let env = unsafe { &mut *env_ptr };
+    let saved_frame = if capture_native_frame {
+        NATIVE_ENV_FRAME.with(|slot| {
+            slot.borrow()
+                .clone()
+                .map(|frame| std::mem::replace(&mut env.frame, frame))
+        })
+    } else {
+        None
+    };
+    let result = eval_form(form, env);
+    if let Some(saved) = saved_frame {
+        env.frame = saved;
+    }
+    match result {
+        Ok(value) => value.0,
+        Err(error) => {
+            stash_native_error(error);
+            NIL.0
+        }
+    }
+}
+
+extern "C" fn c2i_eval_host(form: u64) -> u64 {
+    c2i_eval_form_with_frame(BlissVal(form), false)
+}
+
+extern "C" fn c2i_make_closure(form: u64) -> u64 {
+    c2i_eval_form_with_frame(BlissVal(form), true)
+}
+
+extern "C" fn c2i_take_values(primary: u64, dst: *mut BlissVal, n: u64) {
+    let env_ptr = NATIVE_ENV.with(|cell| cell.get());
+    if env_ptr.is_null() || (n != 0 && dst.is_null()) {
+        return;
+    }
+    let env = unsafe { &mut *env_ptr };
+    let values = if env.mv_active {
+        env.mv.clone()
+    } else {
+        Vec::new()
+    };
+    for index in 0..n as usize {
+        let value = if index == 0 {
+            BlissVal(primary)
+        } else {
+            values.get(index).copied().unwrap_or(NIL)
+        };
+        unsafe { dst.add(index).write(value) };
+    }
+}
+
+extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64, profile_site: u64) -> u64 {
+    if n > 3 {
+        return NIL.0;
+    }
+    let storage = [BlissVal(a0), BlissVal(a1), BlissVal(a2)];
+    c2i_call_args(sym, &storage[..n as usize], profile_site)
+}
+
+/// T1's unbounded-arity c2i adapter. Arguments remain contiguous in the native
+/// activation's BlissStack operand area, so passing a slice avoids the old
+/// three-register ceiling without copying or using the host call stack as a
+/// Lisp value stack.
+extern "C" fn c2i_call_slice(sym: u64, n: u64, args: *const BlissVal, profile_site: u64) -> u64 {
+    if n != 0 && args.is_null() {
+        return NIL.0;
+    }
+    // SAFETY: T1 passes a pointer into its live BlissStack frame and invokes the
+    // adapter synchronously. The frame cannot disappear during this call.
+    let args = unsafe { std::slice::from_raw_parts(args, n as usize) };
+    c2i_call_args(sym, args, profile_site)
+}
+
+fn c2i_call_args(sym: u64, args: &[BlissVal], profile_site: u64) -> u64 {
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
         return NIL.0;
@@ -4678,7 +6590,8 @@ extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     // of the native call, and native code only calls this synchronously within
     // that window.
     let env = unsafe { &mut *env_ptr };
-    let args: &[BlissVal] = &[BlissVal(a0), BlissVal(a1), BlissVal(a2)][..n as usize];
+    record_native_call_site(profile_site);
+    let n = args.len();
     let sym32 = sym as u32;
     let fn_val = BlissVal::from_symbol_index(sym32);
     // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
@@ -4691,7 +6604,18 @@ extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     // STORAGE-CONDITION instead of a native stack overflow. Non-bytecode callees
     // (builtins, generics, closures, arity mismatches) still go via apply_function.
     let result = match registry_get(sym32) {
-        Some(callee) if arity_accepts(&callee, n as usize) => {
+        Some(callee) if arity_accepts(&callee, n) => {
+            // Calls emitted by native T1/T2 code do not pass through the
+            // interpreter's CallNamed arm, so this adapter owns the callee's
+            // invocation bump and tier transition. Without it, a callee reached
+            // only from a native caller would stop warming up permanently.
+            let fn_obj = bliss_rt::symbols::symbol_function(sym32)
+                .filter(|&cell| bliss_rt::function::is_interpreted_function(cell));
+            if let Some(cell) = fn_obj {
+                bliss_rt::function::record_invocation(cell);
+            }
+            let count = dispatch_invoke_count(sym32, fn_obj);
+            let selected = native_for_dispatch(sym32, fn_obj, count);
             // bliss-x5y.8: if the callee is itself installed as native code and
             // we are under the native depth cap, call its native entry directly
             // (native → native) instead of rebuilding a full T0 `run()`
@@ -4703,7 +6627,7 @@ extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64) -> u64 {
             let native = if NATIVE_DEPTH.with(|d| d.get()) >= native_depth_cap() {
                 None
             } else {
-                NATIVE_REGISTRY.with(|r| r.borrow().get(&sym32).cloned())
+                selected
             };
             match native {
                 Some(nc) => run_native(&nc, sym32, args, env),
@@ -4760,6 +6684,66 @@ thread_local! {
 enum NativeDeoptResume {
     Single { bcp: u32, sp_top: u16 },
     Inlined(Vec<InlinedResumeScope>),
+}
+
+/// Slow poll reached by a T1 backward branch once per sampled batch. It never
+/// compiles on the application thread: it publishes completed worker results,
+/// queues a request when needed, and—if the matching optimized loop entry is
+/// ready—runs the remainder of this same activation in T2.
+///
+/// Returns 1 when T1 must return through its normal epilogue (T2 completed,
+/// errored, or deoptimized), and 0 when the branch should remain in T1.
+extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64 {
+    let sym = sym as u32;
+    let header_bcp = header_bcp as u32;
+    let Some(body) = registry_get(sym) else {
+        return 0;
+    };
+    let fn_obj = bliss_rt::symbols::symbol_function(sym)
+        .filter(|&v| bliss_rt::function::is_interpreted_function(v));
+    if let Some(f) = fn_obj {
+        bliss_rt::function::record_back_edges(f, t2_backedge_threshold());
+    }
+    if !t2_enabled() {
+        return 0;
+    }
+
+    poll_t2_completions();
+    let current = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
+    if current.as_ref().is_none_or(|nc| !nc.is_t2) {
+        let back_edges = fn_obj
+            .map(bliss_rt::function::back_edge_count)
+            .unwrap_or(t2_backedge_threshold());
+        let priority =
+            (u64::from(back_edges) << 32) | u64::from(dispatch_invoke_count_snapshot(sym, fn_obj));
+        let _ = request_t2_compilation(sym, priority);
+        poll_t2_completions();
+    }
+
+    let Some(t2) = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned()) else {
+        return 0;
+    };
+    if !t2.is_t2 {
+        return 0;
+    }
+    let Some(&offset) = t2.osr_entries.get(&header_bcp) else {
+        return 0;
+    };
+    let entry = t2.entry as usize + offset;
+    // SAFETY: the T2 emitter records only alternate entries having the same
+    // `fn(*mut u64)->u64` ABI. `slots` is r14 from the still-live T1 frame.
+    let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(entry) };
+    let result = f(slots);
+    // On normal completion the first operand slot is dead and carries the
+    // result to T1's shared epilogue. On deopt, however, c2i_deopt_t2 may have
+    // reconstructed a non-empty operand stack starting at this exact slot; do
+    // not overwrite the resume state with the callback's dummy return value.
+    let deopt = NATIVE_DEOPT.with(|state| state.get());
+    let errored = NATIVE_ERROR.with(|error| error.borrow().is_some());
+    if !deopt && !errored {
+        unsafe { slots.add(body.n_locals as usize).write(result) };
+    }
+    1
 }
 
 struct InlinedResumeScope {
@@ -4820,7 +6804,11 @@ fn maybe_write_perf_map(addr: usize, size: usize, sym: u32) {
         .chars()
         .map(|c| if c.is_whitespace() { '_' } else { c })
         .collect();
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         use std::io::Write;
         let _ = writeln!(f, "{addr:x} {size:x} T1:{name}");
     }
@@ -4957,6 +6945,8 @@ struct NativeCode {
     /// cross the c2i boundary yet); recorded so that wiring is a local change.
     #[allow(dead_code)]
     compiled_entry: usize,
+    /// Optimized loop-header entry offsets for T1→T2 on-stack replacement.
+    osr_entries: HashMap<u32, usize>,
     /// Validated GC stack-map metadata for this function's activation, installed
     /// alongside the code (bliss-jtc.4). Passed into every frame the i2c adapter
     /// pushes, so the collector scans compiled frames through the map.
@@ -5055,6 +7045,11 @@ thread_local! {
     /// fails, so a phase change adapts fast without thrashing.
     static PROMOTED_FRESH: std::cell::RefCell<std::collections::HashSet<u32>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Per-site speculation types invalidated by the current native version's
+    /// first deopt. Used to distinguish a supported numeric phase change from
+    /// repeatedly failing the same specialization (for example, fixnum overflow).
+    static LAST_FAILED_SPECULATION: RefCell<HashMap<u32, Vec<(u32, SpecType)>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// A speculation for `func_ptr` just failed. Zero the currently-dominant type at
@@ -5063,18 +7058,52 @@ thread_local! {
 /// to out-vote a large stale count). Called once per promotion; the other type's
 /// samples keep accumulating, so the profile never goes fully cold (which would,
 /// with the cold-site fixnum guess, just re-promote the same wrong type).
-fn decay_failed_speculation(func_ptr: usize) {
+fn decay_failed_speculation(func_ptr: usize, forced: Option<SpecType>) -> Vec<(u32, SpecType)> {
+    let mut failed = Vec::new();
     TYPE_PROFILE.with(|m| {
-        for ((fp, _), p) in m.borrow_mut().iter_mut() {
+        for ((fp, bcp), p) in m.borrow_mut().iter_mut() {
             if *fp == func_ptr {
-                if p.fixnum >= p.single_float {
-                    p.fixnum = 0;
-                } else {
-                    p.single_float = 0;
+                let spec = forced.or_else(|| {
+                    if p.fixnum >= p.single_float && p.fixnum > 0 {
+                        Some(SpecType::Fixnum)
+                    } else if p.single_float > 0 {
+                        Some(SpecType::SingleFloat)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(spec) = spec {
+                    match spec {
+                        SpecType::Fixnum => p.fixnum = 0,
+                        SpecType::SingleFloat => p.single_float = 0,
+                    }
+                    failed.push((*bcp, spec));
                 }
             }
         }
     });
+    failed
+}
+
+/// True when the failed version is now seeing the *other* supported numeric
+/// phase at one of its guarded sites. This is an invalidation/recompile event,
+/// not evidence that native execution is fundamentally unprofitable.
+fn supported_numeric_phase_change(sym: u32) -> bool {
+    let failed = LAST_FAILED_SPECULATION.with(|m| m.borrow().get(&sym).cloned());
+    let Some(failed) = failed else { return false };
+    let Some(body) = registry_get(sym) else {
+        return false;
+    };
+    let func_ptr = Rc::as_ptr(&body) as usize;
+    failed.into_iter().any(|(bcp, old)| {
+        type_profile_at(func_ptr, bcp).is_some_and(|profile| {
+            profile.other == 0
+                && match old {
+                    SpecType::Fixnum => profile.single_float > 0,
+                    SpecType::SingleFloat => profile.fixnum > 0,
+                }
+        })
+    })
 }
 
 /// Record the operand types seen at call site `(func_ptr, bcp)`.
@@ -5105,10 +7134,98 @@ fn type_profile_at(func_ptr: usize, bcp: u32) -> Option<TypeProfile> {
     TYPE_PROFILE.with(|m| m.borrow().get(&(func_ptr, bcp)).copied())
 }
 
+/// Record entry to a saved bytecode function in the shared T0/T1 sampling window.
+fn record_profiled_invocation(func_ptr: usize) {
+    FUNCTION_SAMPLE_PROFILE.with(|m| {
+        let mut counts = m.borrow_mut();
+        let count = counts.entry(func_ptr).or_insert(0);
+        *count = count.saturating_add(1);
+    });
+}
+
+/// Record one execution of a named-call bytecode.
+fn record_call_site(func_ptr: usize, bcp: u32) {
+    let counter = call_site_counter(func_ptr, bcp);
+    let _ = counter.calls.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |n| Some(n.saturating_add(1)),
+    );
+}
+
+struct RuntimeCallSiteProfile {
+    calls: std::sync::atomic::AtomicU32,
+}
+
+fn call_site_counter(func_ptr: usize, bcp: u32) -> &'static RuntimeCallSiteProfile {
+    CALL_SITE_PROFILE.with(|m| {
+        let mut profiles = m.borrow_mut();
+        *profiles.entry((func_ptr, bcp)).or_insert_with(|| {
+            Box::leak(Box::new(RuntimeCallSiteProfile {
+                calls: std::sync::atomic::AtomicU32::new(0),
+            }))
+        })
+    })
+}
+
+/// Stable pointer embedded in T1 code. The record is intentionally leaked:
+/// installed native code may outlive a registry replacement, and an obsolete
+/// site must remain safe to increment even after its profile is detached.
+fn call_site_profile_token(func_ptr: usize, bcp: u32) -> u64 {
+    call_site_counter(func_ptr, bcp) as *const RuntimeCallSiteProfile as usize as u64
+}
+
+fn record_native_call_site(token: u64) {
+    if token == 0 {
+        return;
+    }
+    // SAFETY: tokens are pointers returned by `Box::leak` above and therefore
+    // remain valid for the process lifetime.
+    let profile = unsafe { &*(token as usize as *const RuntimeCallSiteProfile) };
+    let _ = profile.calls.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |n| Some(n.saturating_add(1)),
+    );
+}
+
+/// Snapshot call frequencies for one saved body without retaining profiler
+/// borrows while compiler options are assembled.
+fn call_site_profile_snapshot(func_ptr: usize) -> (u32, Vec<(u32, u32)>) {
+    let invocations =
+        FUNCTION_SAMPLE_PROFILE.with(|m| m.borrow().get(&func_ptr).copied().unwrap_or(0));
+    let sites = CALL_SITE_PROFILE.with(|m| {
+        m.borrow()
+            .iter()
+            .filter_map(|(&(fp, bcp), profile)| {
+                (fp == func_ptr).then_some((
+                    bcp,
+                    profile.calls.load(std::sync::atomic::Ordering::Relaxed),
+                ))
+            })
+            .collect()
+    });
+    (invocations, sites)
+}
+
+fn clear_bytecode_profiles(func_ptr: usize) {
+    TYPE_PROFILE.with(|m| m.borrow_mut().retain(|(fp, _), _| *fp != func_ptr));
+    CALL_SITE_PROFILE.with(|m| m.borrow_mut().retain(|(fp, _), _| *fp != func_ptr));
+    FUNCTION_SAMPLE_PROFILE.with(|m| {
+        m.borrow_mut().remove(&func_ptr);
+    });
+}
+
 thread_local! {
     /// Operand-type profiles keyed by (bytecode-function pointer, CallNamed bcp).
     static TYPE_PROFILE: RefCell<HashMap<(usize, u32), TypeProfile>> = RefCell::new(HashMap::new());
-    /// Native T1 code keyed by the same symbol index as the bytecode registry.
+    /// T0/T1 entries per saved bytecode body. This is the denominator for
+    /// call-site frequency and advances in the same sampling window as calls.
+    static FUNCTION_SAMPLE_PROFILE: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
+    /// Executions per `(saved bytecode body, CallNamed bcp)`.
+    static CALL_SITE_PROFILE: RefCell<HashMap<(usize, u32), &'static RuntimeCallSiteProfile>> =
+        RefCell::new(HashMap::new());
+    /// Installed T1/T2 code keyed by the same symbol index as the bytecode registry.
     static NATIVE_REGISTRY: RefCell<HashMap<u32, Rc<NativeCode>>> = RefCell::new(HashMap::new());
     /// Per-function invocation counters driving T0→T1 promotion.
     static INVOKE_COUNTS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
@@ -5120,6 +7237,161 @@ thread_local! {
     /// Functions whose speculation proved unprofitable; kept in T0 thereafter.
     static DEOPT_BLACKLIST: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
+    /// Bodies that the optimising compiler cannot currently handle.  Remember
+    /// the decline so a hot T1 function does not synchronously retry T2 on every
+    /// invocation.  Redefining/removing the function clears this bit.
+    static T2_DECLINED: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// Symbols with one outstanding background T2 request.  Coalescing here
+    /// prevents a hot dispatch/back-edge from flooding the global queue.
+    static T2_QUEUED: RefCell<HashMap<u32, u64>> = RefCell::new(HashMap::new());
+    /// Each mutator owns its completion channel. Workers return relocatable
+    /// code bytes; executable-memory and tier publication remain on the owner.
+    static T2_COMPLETIONS: RefCell<Option<(
+        std::sync::mpsc::Sender<T2Completion>,
+        std::sync::mpsc::Receiver<T2Completion>,
+    )>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone)]
+struct T2BodySnapshot {
+    symbol: u32,
+    body: BytecodeFunction,
+    invocations: u32,
+    call_sites: Vec<(u32, u32)>,
+}
+
+struct T2CompileInput {
+    sym: u32,
+    generation: u64,
+    priority: u64,
+    body: BytecodeFunction,
+    type_profiles: HashMap<u32, TypeProfile>,
+    inline_bodies: Vec<T2BodySnapshot>,
+}
+
+struct T2Artifact {
+    code: Vec<u8>,
+    compiled_entry: usize,
+    osr_entries: Vec<(u32, usize)>,
+    shadow_root_slots: u16,
+    emitted_safepoints: usize,
+    root_sync_sites: Vec<bliss_compiler::t2::emit::RootSyncSite>,
+}
+
+/// Validate the emitter's native-root synchronization contract before any T2
+/// bytes become executable. A site count mismatch, out-of-range PC, oversized
+/// root set, or register entry that could bypass the owning BlissStack frame is
+/// stale/missing GC metadata and rejects installation under R4.46.
+fn validate_t2_root_sync(activation_slots: u16, artifact: &T2Artifact) -> Option<u16> {
+    if artifact.emitted_safepoints != artifact.root_sync_sites.len()
+        || (artifact.shadow_root_slots != 0 && artifact.compiled_entry != 0)
+        || artifact.root_sync_sites.iter().any(|site| {
+            site.code_offset as usize >= artifact.code.len()
+                || site.live_roots > artifact.shadow_root_slots
+                || site.register_roots.checked_add(site.spill_roots) != Some(site.live_roots)
+        })
+        || artifact
+            .root_sync_sites
+            .windows(2)
+            .any(|pair| pair[0].code_offset >= pair[1].code_offset)
+    {
+        return None;
+    }
+    activation_slots.checked_add(artifact.shadow_root_slots)
+}
+
+struct T2Completion {
+    sym: u32,
+    generation: u64,
+    artifact: Option<T2Artifact>,
+}
+
+struct T2Job {
+    input: T2CompileInput,
+    completion: std::sync::mpsc::Sender<T2Completion>,
+}
+
+struct T2QueueState {
+    jobs: Vec<T2Job>,
+    capacity: usize,
+}
+
+struct T2CompileQueue {
+    state: std::sync::Mutex<T2QueueState>,
+    ready: std::sync::Condvar,
+    dropped: std::sync::atomic::AtomicU64,
+}
+
+impl T2CompileQueue {
+    fn submit(&self, job: T2Job) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.jobs.len() >= state.capacity {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        state.jobs.push(job);
+        self.ready.notify_one();
+        true
+    }
+
+    fn take(&self) -> T2Job {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some((index, _)) = state
+                .jobs
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, job)| job.input.priority)
+            {
+                return state.jobs.swap_remove(index);
+            }
+            state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+fn t2_compile_queue() -> &'static std::sync::Arc<T2CompileQueue> {
+    use std::sync::{Arc, OnceLock};
+    static QUEUE: OnceLock<Arc<T2CompileQueue>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let capacity = positive_env(&["BLISS_COMPILE_QUEUE_SIZE"], 64) as usize;
+        let queue = Arc::new(T2CompileQueue {
+            state: std::sync::Mutex::new(T2QueueState {
+                jobs: Vec::new(),
+                capacity,
+            }),
+            ready: std::sync::Condvar::new(),
+            dropped: std::sync::atomic::AtomicU64::new(0),
+        });
+        let threads = positive_env(&["BLISS_T2_THREADS"], 2).min(32);
+        for index in 0..threads {
+            let worker_queue = Arc::clone(&queue);
+            let _ = std::thread::Builder::new()
+                .name(format!("bliss-t2-{index}"))
+                .spawn(move || loop {
+                    let job = worker_queue.take();
+                    let sym = job.input.sym;
+                    let generation = job.input.generation;
+                    // A compiler bug must fail this request, not silently kill
+                    // a worker and strand force/debug callers waiting forever.
+                    let artifact = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        compile_t2_artifact(job.input)
+                    }))
+                    .ok()
+                    .flatten();
+                    let _ = job.completion.send(T2Completion {
+                        sym,
+                        generation,
+                        artifact,
+                    });
+                });
+        }
+        queue
+    })
 }
 
 /// Per-function deopt count before a function's speculative code is uninstalled
@@ -5132,13 +7404,354 @@ fn deopt_blacklist_threshold() -> u32 {
         .unwrap_or(8)
 }
 
-/// T0→T1 promotion threshold (invocations). Env-overridable for tests.
+fn positive_env(names: &[&str], default: u32) -> u32 {
+    names
+        .iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n > 0)
+        })
+        .unwrap_or(default)
+}
+
+/// T0→T1 promotion threshold (invocations).  The stage-5 spec name is
+/// preferred; `BLISS_T1_THRESHOLD` remains as a compatibility alias.
 fn t1_threshold() -> u32 {
-    std::env::var("BLISS_T1_THRESHOLD")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(10)
+    positive_env(&["BLISS_T0_T1_THRESHOLD", "BLISS_T1_THRESHOLD"], 10)
+}
+
+fn env_flag(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        )
+    })
+}
+
+/// T2 is part of normal tiering.  `BLISS_DISABLE_T2=1` is the explicit debug
+/// off-switch; `BLISS_T2=0` is accepted for compatibility with the old gate.
+fn t2_enabled() -> bool {
+    if env_flag("BLISS_DISABLE_T2") == Some(true) {
+        return false;
+    }
+    env_flag("BLISS_T2") != Some(false)
+}
+
+/// T1→T2 invocation threshold.  The old `BLISS_T2=1` opt-in is retained only
+/// as a force/debug shorthand: absent an explicit threshold it makes T2 eligible
+/// immediately after T1 has been observed.  Normal, unset operation uses 5000.
+fn t2_invoke_threshold() -> u32 {
+    let explicit = [
+        "BLISS_T1_T2_INVOKE_THRESHOLD",
+        "BLISS_T1_T2_THRESHOLD",
+        "BLISS_T2_THRESHOLD",
+    ]
+    .iter()
+    .find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+    });
+    explicit.unwrap_or_else(|| {
+        if env_flag("BLISS_T2") == Some(true) {
+            t1_threshold()
+        } else {
+            5_000
+        }
+    })
+}
+
+/// T1→T2 loop-hotness threshold.  Both spellings used by the stage-5 specs
+/// are accepted; this is independent of the lower OSR threshold machinery.
+fn t2_backedge_threshold() -> u32 {
+    positive_env(
+        &[
+            "BLISS_T1_T2_BACKEDGE_THRESHOLD",
+            "BLISS_LOOP_HEAT_THRESHOLD",
+        ],
+        10_000,
+    )
+}
+
+/// Return the current invocation count. Named functions have already had their
+/// FnMeta counter bumped by the caller; anonymous bytecode functions need the
+/// local fallback counter bumped here on every dispatch.
+fn dispatch_invoke_count(sym: u32, fn_obj: Option<BlissVal>) -> u32 {
+    match fn_obj {
+        Some(f) => bliss_rt::function::invoke_count(f),
+        None => INVOKE_COUNTS.with(|m| {
+            let mut counts = m.borrow_mut();
+            let count = counts.entry(sym).or_insert(0);
+            *count = count.saturating_add(1);
+            *count
+        }),
+    }
+}
+
+fn dispatch_invoke_count_snapshot(sym: u32, fn_obj: Option<BlissVal>) -> u32 {
+    fn_obj
+        .map(bliss_rt::function::invoke_count)
+        .unwrap_or_else(|| INVOKE_COUNTS.with(|m| m.borrow().get(&sym).copied().unwrap_or(0)))
+}
+
+fn publish_native(fn_obj: Option<BlissVal>, nc: &NativeCode) {
+    if let Some(f) = fn_obj {
+        bliss_rt::function::set_entry(f, nc.entry as *mut u8);
+        bliss_rt::function::set_tier(f, if nc.is_t2 { 2 } else { 1 });
+    }
+}
+
+fn background_safe_body(body: &BytecodeFunction) -> bool {
+    // A raw heap/cons literal can move while a worker is reading its snapshot.
+    // Arguments and globals are not embedded in the job, and immediate
+    // constants are inherently stable. Bodies with movable literals retain T1
+    // until the GC exposes a cross-thread compilation-root handle.
+    body.constants
+        .iter()
+        .all(|v| !v.is_cons() && !v.is_heap_object())
+}
+
+fn t2_completion_sender() -> std::sync::mpsc::Sender<T2Completion> {
+    T2_COMPLETIONS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(std::sync::mpsc::channel());
+        }
+        slot.as_ref().unwrap().0.clone()
+    })
+}
+
+fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
+    let root = registry_get(sym)?;
+    if !background_safe_body(&root) {
+        t2_log_write(format_args!(
+            "{}: movable literal cannot be rooted by background compiler => stay T1",
+            root.name
+        ));
+        return None;
+    }
+    let root_ptr = Rc::as_ptr(&root) as usize;
+    let type_profiles = TYPE_PROFILE.with(|profiles| {
+        profiles
+            .borrow()
+            .iter()
+            .filter_map(|(&(fp, bcp), profile)| (fp == root_ptr).then_some((bcp, *profile)))
+            .collect()
+    });
+    let inline_bodies = REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .iter()
+            .filter_map(|(&symbol, body)| {
+                if !background_safe_body(body) {
+                    return None;
+                }
+                let ptr = Rc::as_ptr(body) as usize;
+                let (invocations, call_sites) = call_site_profile_snapshot(ptr);
+                Some(T2BodySnapshot {
+                    symbol,
+                    body: (**body).clone(),
+                    invocations,
+                    call_sites,
+                })
+            })
+            .collect()
+    });
+    let generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
+    Some(T2CompileInput {
+        sym,
+        generation,
+        priority,
+        body: (*root).clone(),
+        type_profiles,
+        inline_bodies,
+    })
+}
+
+fn request_t2_compilation(sym: u32, priority: u64) -> bool {
+    if T2_DECLINED.with(|s| s.borrow().contains(&sym))
+        || T2_QUEUED.with(|s| s.borrow().contains_key(&sym))
+    {
+        return false;
+    }
+    let Some(input) = snapshot_t2_input(sym, priority) else {
+        T2_DECLINED.with(|s| s.borrow_mut().insert(sym));
+        return false;
+    };
+    let generation = input.generation;
+    let job = T2Job {
+        input,
+        completion: t2_completion_sender(),
+    };
+    if !t2_compile_queue().submit(job) {
+        t2_log_write(format_args!(
+            "{}: background compilation queue full; retaining T1",
+            sym_label(sym)
+        ));
+        return false;
+    }
+    T2_QUEUED.with(|s| {
+        s.borrow_mut().insert(sym, generation);
+    });
+    t2_log_write(format_args!(
+        "{}: queued for background T2 compilation",
+        sym_label(sym)
+    ));
+    true
+}
+
+fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
+    let current_generation =
+        REGISTRY_GENERATION.with(|g| g.borrow().get(&done.sym).copied().unwrap_or(0));
+    if current_generation != done.generation {
+        return None;
+    }
+    T2_QUEUED.with(|s| {
+        let mut queued = s.borrow_mut();
+        if queued.get(&done.sym) == Some(&done.generation) {
+            queued.remove(&done.sym);
+        }
+    });
+    let Some(artifact) = done.artifact else {
+        T2_DECLINED.with(|s| s.borrow_mut().insert(done.sym));
+        return None;
+    };
+    let bf = registry_get(done.sym)?;
+    let total_slots = validate_t2_root_sync(bf.num_slots(), &artifact)?;
+    let code_info = install_stack_map(total_slots)?;
+    let buf = bliss_rt::jit::JitBuffer::new(&artifact.code)?;
+    let entry = buf.leak();
+    maybe_write_perf_map(entry as usize, artifact.code.len(), done.sym);
+    let nc = Rc::new(NativeCode {
+        entry,
+        code_len: artifact.code.len(),
+        is_t2: true,
+        num_slots: total_slots,
+        compiled_entry: artifact.compiled_entry,
+        osr_entries: artifact.osr_entries.into_iter().collect(),
+        code_info,
+    });
+    NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(done.sym, Rc::clone(&nc)));
+    let fn_obj = bliss_rt::symbols::symbol_function(done.sym)
+        .filter(|&v| bliss_rt::function::is_interpreted_function(v));
+    mark_fresh_promotion(done.sym);
+    publish_native(fn_obj, &nc);
+    t2_log_write(format_args!("{}: background T2 result published", bf.name));
+    Some(nc)
+}
+
+fn poll_t2_completions() {
+    loop {
+        let done = T2_COMPLETIONS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|(_, receiver)| receiver.try_recv().ok())
+        });
+        let Some(done) = done else { break };
+        let _ = install_t2_completion(done);
+    }
+}
+
+/// Safepoint used by observability tooling. Yielding gives a newly-woken
+/// compiler thread a chance to run; publication itself still happens only when
+/// this owner thread polls.
+pub(super) fn poll_background_compilation() {
+    std::thread::yield_now();
+    poll_t2_completions();
+    if T2_QUEUED.with(|queued| !queued.borrow().is_empty()) {
+        let done = T2_COMPLETIONS.with(|slot| {
+            slot.borrow().as_ref().and_then(|(_, receiver)| {
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .ok()
+            })
+        });
+        if let Some(done) = done {
+            let _ = install_t2_completion(done);
+            poll_t2_completions();
+        }
+    }
+}
+
+fn wait_for_t2(sym: u32) -> Option<Rc<NativeCode>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(nc) = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned()) {
+            if nc.is_t2 {
+                return Some(nc);
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let done = T2_COMPLETIONS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(|(_, receiver)| receiver.recv_timeout(remaining).ok())
+        })?;
+        let installed_sym = done.sym;
+        let installed = install_t2_completion(done);
+        if installed_sym == sym && installed.is_none() {
+            return None;
+        }
+    }
+}
+
+fn mark_fresh_promotion(sym: u32) {
+    PROMOTED_FRESH.with(|s| s.borrow_mut().insert(sym));
+    LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
+    DEOPT_COUNTS.with(|m| {
+        m.borrow_mut().insert(sym, 0);
+    });
+}
+
+/// Drive the shipping tier state machine for one invocation.  A function with
+/// no native entry may only transition to T1 during this dispatch; a later
+/// dispatch observes T1 and may independently transition to T2.  A T2 compiler
+/// decline leaves the existing T1 entry installed.
+fn native_for_dispatch(
+    sym: u32,
+    fn_obj: Option<BlissVal>,
+    invoke_count: u32,
+) -> Option<Rc<NativeCode>> {
+    // Publication is deliberately performed by the owning mutator: workers
+    // compile relocatable bytes only and never touch thread-local registries or
+    // executable mappings.
+    poll_t2_completions();
+    let current = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
+    let Some(current) = current else {
+        if invoke_count < t1_threshold() {
+            return None;
+        }
+        let nc = try_promote_to_t1(sym)?;
+        mark_fresh_promotion(sym);
+        publish_native(fn_obj, &nc);
+        return Some(nc);
+    };
+
+    if current.is_t2 || !t2_enabled() {
+        return Some(current);
+    }
+    let back_edges = fn_obj.map(bliss_rt::function::back_edge_count).unwrap_or(0);
+    if invoke_count < t2_invoke_threshold() && back_edges < t2_backedge_threshold() {
+        return Some(current);
+    }
+    let priority = (u64::from(back_edges) << 32) | u64::from(invoke_count);
+    let requested = request_t2_compilation(sym, priority);
+    // Legacy BLISS_T2=1 remains a deterministic force/debug mode for tests and
+    // disassembly sessions. Compilation still runs on a compiler thread; only
+    // this requesting dispatch waits for publication.
+    if env_flag("BLISS_T2") == Some(true)
+        && (requested || T2_QUEUED.with(|queued| queued.borrow().contains_key(&sym)))
+    {
+        return wait_for_t2(sym).or(Some(current));
+    }
+    Some(current)
 }
 
 /// i2c adapter: push a BlissStack frame for the native activation, bind the
@@ -5151,6 +7764,10 @@ fn run_native(
     args: &[BlissVal],
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
+    let bf = registry_get(sym);
+    if let Some(body) = bf.as_ref() {
+        validate_declared_args(body, args)?;
+    }
     // A function call starts a fresh multiple-values context. Argument
     // evaluation may have left secondary values active (for example GETHASH's
     // present-p value), but a native callee that simply returns its argument
@@ -5168,17 +7785,28 @@ fn run_native(
             nc.num_slots,
             FLAG_CALL,
         )
-        .ok_or_else(|| BlissError::StackOverflow(bliss_rt::current_thread_id()))?;
-    // A variadic function binds &optional/&rest/&key into slots via the shared
-    // binder (x5y.7); a native variadic function never has boxed params (those
-    // decline native), so slot binding is complete. Fixed functions bind
-    // positionally.
-    let bf = registry_get(sym);
+        .ok_or_else(|| {
+            BlissError::StackOverflow(
+                bliss_rt::current_fiber_id()
+                    .unwrap_or_else(|| bliss_rt::FiberId(bliss_rt::current_thread_id().0)),
+            )
+        })?;
+    let env_frame = bf
+        .as_ref()
+        .and_then(|body| make_env_frame(body, Rc::clone(&env.frame)));
+    // Bind both stack and captured parameters before entering native code. The
+    // same heap frame is published through NATIVE_ENV_FRAME for environment
+    // bytecodes and closure construction.
+    if let Some(body) = bf.as_ref() {
+        record_profiled_invocation(Rc::as_ptr(body) as usize);
+    }
     if let Some(bf) = bf.as_ref().filter(|b| b.variadic) {
-        if let Err(e) = bind_variadic(bf, frame, args, env) {
+        if let Err(e) = bind_variadic(bf, frame, args, env_frame.as_ref(), env) {
             stack.pop_frame();
             return Err(e);
         }
+    } else if let Some(body) = bf.as_ref() {
+        bind_params(body, frame, args, env_frame.as_ref());
     } else {
         for (i, a) in args.iter().enumerate() {
             unsafe { slot_set(frame, i as u16, *a) };
@@ -5187,6 +7815,8 @@ fn run_native(
     let slots = unsafe { frame.add(1) as *mut u64 };
 
     let saved = NATIVE_ENV.with(|e| e.replace(env as *mut Env));
+    let saved_env_frame =
+        NATIVE_ENV_FRAME.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env_frame.clone()));
     // NATIVE_ERROR is per-invocation. Native calls now nest directly
     // (native → c2i → run_native → native, bliss-x5y.8), so save any pending
     // error from an outer native frame, run with a fresh slot, then restore the
@@ -5199,6 +7829,7 @@ fn run_native(
     let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(nc.entry) };
     let ret = f(slots);
     NATIVE_ENV.with(|e| e.set(saved));
+    NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
 
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
@@ -5215,13 +7846,11 @@ fn run_native(
     // makes re-running from the top observably equivalent.)
     if deopt {
         DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        trace("t1 speculative deopt → interpreter");
+        trace("native speculative deopt → interpreter");
         // Backoff/blacklist: an occasional deopt (a rare overflow) is fine and
-        // the fast path stays installed. But a function that keeps deopting is
-        // being called outside its speculated fixnum domain, so past a threshold
-        // uninstall its native code and blacklist it from re-promotion — it runs
-        // in T0 from then on, correct and without per-call deopt overhead. This
-        // is HotSpot's policy of not repeatedly recompiling deoptimizing code.
+        // the fast path stays installed. Repeated failures either indicate a
+        // supported numeric phase change (retire this version and recompile) or
+        // a genuinely unsupported domain (permanently blacklist speculation).
         let n = DEOPT_COUNTS.with(|m| {
             let mut b = m.borrow_mut();
             let e = b.entry(sym).or_insert(0);
@@ -5233,39 +7862,68 @@ fn run_native(
         // and let the new phase's samples take over quickly.
         if PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym)) {
             if let Some(bf) = registry_get(sym) {
-                decay_failed_speculation(Rc::as_ptr(&bf) as usize);
+                // T1's optimistic arithmetic templates are always Fixnum. T2
+                // follows the profile that was dominant when it was compiled.
+                let forced = (!nc.is_t2).then_some(SpecType::Fixnum);
+                let failed = decay_failed_speculation(Rc::as_ptr(&bf) as usize, forced);
+                LAST_FAILED_SPECULATION.with(|m| {
+                    m.borrow_mut().insert(sym, failed);
+                });
             }
         }
+        let threshold_hit = n >= deopt_blacklist_threshold();
+        let phase_change = threshold_hit && supported_numeric_phase_change(sym);
         if t2_log_target().is_some() {
-            let nm = registry_get(sym).map(|b| b.name.clone()).unwrap_or_default();
+            let nm = registry_get(sym)
+                .map(|b| b.name.clone())
+                .unwrap_or_default();
             t2_log_write(format_args!(
                 "{nm}: native guard deopt #{n} => resuming interpreted{}",
-                if n >= deopt_blacklist_threshold() {
+                if phase_change {
+                    " (threshold hit: supported numeric phase change => generic T1 + recompile)"
+                } else if threshold_hit {
                     " (threshold hit: uninstall + blacklist => T0)"
                 } else {
                     ""
                 }
             ));
         }
-        if n >= deopt_blacklist_threshold() {
+        if phase_change {
+            // The current T2 assumptions are stale, but native execution itself
+            // is profitable. Replace it immediately with non-speculating T1 so
+            // subsequent calls stay native while dispatch queues a profile-led
+            // replacement T2 version.
+            NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+            T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+            DEOPT_COUNTS.with(|m| m.borrow_mut().insert(sym, 0));
+            PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
+            LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
+            let fn_obj = bliss_rt::symbols::symbol_function(sym)
+                .filter(|&value| bliss_rt::function::is_interpreted_function(value));
+            if let Some(fallback) = try_promote_to_t1_with_speculation(sym, false) {
+                publish_native(fn_obj, &fallback);
+                trace("stale numeric specialization retired → generic T1");
+            } else if let Some(function) = fn_obj {
+                bliss_rt::function::set_tier(function, 0);
+            }
+        } else if threshold_hit {
             NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
             DEOPT_BLACKLIST.with(|s| s.borrow_mut().insert(sym));
-            if let Some(f) = bliss_rt::symbols::symbol_function(sym)
-                .filter(|&c| bliss_rt::function::is_interpreted_function(c))
+            if let Some(function) = bliss_rt::symbols::symbol_function(sym)
+                .filter(|&value| bliss_rt::function::is_interpreted_function(value))
             {
-                bliss_rt::function::set_tier(f, 0);
+                bliss_rt::function::set_tier(function, 0);
             }
             trace("t1 speculation blacklisted → staying T0");
         }
-        let entry = registry_get(sym).ok_or_else(|| {
-            BlissError::Internal("deopt: bytecode function vanished".into())
-        })?;
+        let entry = registry_get(sym)
+            .ok_or_else(|| BlissError::Internal("deopt: bytecode function vanished".into()))?;
         if let Some(resume) = resume {
             return match resume {
                 NativeDeoptResume::Single { bcp, sp_top } => {
                     // State-transfer: resume T0 on this frame; `resume_in_t0`
                     // owns the frame's lifecycle from here (do NOT pop it first).
-                    resume_in_t0(entry, frame, bcp, sp_top, sym, env)
+                    resume_in_t0(entry, frame, bcp, sp_top, sym, env_frame, env)
                 }
                 NativeDeoptResume::Inlined(scopes) => resume_inlined_in_t0(scopes, env),
             };
@@ -5293,14 +7951,14 @@ fn resume_in_t0(
     bcp: u32,
     sp_top: u16,
     sym: u32,
+    env_frame: Option<Rc<RefCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
     let thread = bliss_rt::current_thread();
     let stack = thread.stack();
 
     let entry_fn_val = BlissVal::from_symbol_index(sym);
-    let fn_obj =
-        Some(entry_fn_val).filter(|&v| bliss_rt::function::is_interpreted_function(v));
+    let fn_obj = Some(entry_fn_val).filter(|&v| bliss_rt::function::is_interpreted_function(v));
 
     let handlers = rebuild_resume_handlers(&entry, bcp, env);
 
@@ -5308,7 +7966,7 @@ fn resume_in_t0(
     let mut acts: Vec<Activation> = vec![Activation {
         frame,
         n_locals,
-        env_frame: None,
+        env_frame,
         func: entry,
         bcp: bcp as usize,
         sp_top,
@@ -5424,20 +8082,42 @@ fn resume_inlined_in_t0(
 fn emit_native_x86(
     bf: &BytecodeFunction,
     allow_speculation: bool,
+    sym: u32,
+    backedge_counter: u64,
 ) -> Option<(Vec<u8>, Vec<(u32, usize)>)> {
+    macro_rules! decline_t1 {
+        ($($reason:tt)*) => {{
+            if std::env::var_os("BLISS_T1_TRACE").is_some() {
+                eprintln!("[T1] {}: declined: {}", bf.name, format_args!($($reason)*));
+            }
+            return None;
+        }};
+    }
     if bf.arity > 6 {
-        return None;
+        decline_t1!("required arity {} exceeds entry ABI limit 6", bf.arity);
     }
     // The activation lives in the BlissStack frame passed in rdi. r14 = frame
     // slots pointer; local i at [r14 + 8*i]; r15 = operand-stack pointer
     // (grows up from r14 + 8*n_locals). c2i preserves callee-saved r14/r15.
     let n_locals = bf.n_locals as i32;
     let local_disp = |i: i32| 8 * i;
-    let c2i_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64) -> u64 as usize as u64;
+    let c2i_addr =
+        c2i_call_slice as extern "C" fn(u64, u64, *const BlissVal, u64) -> u64 as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
+    let load_env_addr = c2i_load_env as extern "C" fn(u64, u64) -> u64 as usize as u64;
+    let store_env_addr = c2i_store_env as extern "C" fn(u64, u64, u64) as usize as u64;
+    let define_env_addr = c2i_define_env as extern "C" fn(u64, u64, u64) as usize as u64;
+    let push_env_addr = c2i_push_env_child as extern "C" fn() as usize as u64;
+    let pop_env_addr = c2i_pop_env_child as extern "C" fn() as usize as u64;
+    let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
+    let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
+    let take_values_addr =
+        c2i_take_values as extern "C" fn(u64, *mut BlissVal, u64) as usize as u64;
     let deopt_state_addr = c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64;
+    let t2_backedge_addr =
+        c2i_t1_backedge as extern "C" fn(u64, u64, *mut u64) -> u64 as usize as u64;
 
     let mut c = Asm::new();
     // One label per bytecode index, bound as each instruction is emitted, so a
@@ -5585,7 +8265,7 @@ fn emit_native_x86(
             }
             Instr::StoreLocal(i) => {
                 pop_into(&mut c, 0, false); // -> rax
-                // mov [r14 + d32], rax   49 89 86 d32
+                                            // mov [r14 + d32], rax   49 89 86 d32
                 c.extend_from_slice(&[0x49, 0x89, 0x86]);
                 c.extend_from_slice(&local_disp(*i as i32).to_le_bytes());
             }
@@ -5598,9 +8278,6 @@ fn emit_native_x86(
                 push_rax(&mut c);
             }
             Instr::CallNamed { sym, nargs } => {
-                if *nargs > 3 {
-                    return None;
-                }
                 // Unary speculative fast path (bliss-jtc.27): 1+, 1-, and unary -
                 // saturate loop bodies. Guard the operand is a fixnum, then work
                 // on the tagged value directly: +1<<3 / -1<<3 / two's-complement
@@ -5636,8 +8313,8 @@ fn emit_native_x86(
                         c.extend_from_slice(&[0x49, 0x8B, 0x47, 0xF8]); // mov rax, [r15-8]
                         c.extend_from_slice(&[0xA8, 0x07]); // test al, 7
                         jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jnz deopt
-                        // Set flags: sign tests use `test rax,rax`; parity tests
-                        // check tagged bit 3 (value bit 0) via `test al, 8`.
+                                                                           // Set flags: sign tests use `test rax,rax`; parity tests
+                                                                           // check tagged bit 3 (value bit 0) via `test al, 8`.
                         match pred {
                             FixnumPred::Zerop | FixnumPred::Plusp | FixnumPred::Minusp => {
                                 c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
@@ -5651,11 +8328,11 @@ fn emit_native_x86(
                         c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, T
                         c.extend_from_slice(&bliss_rt::value::T_BITS.to_le_bytes());
                         let cc = match pred {
-                            FixnumPred::Zerop => 0x44, // cmove  (== 0)
-                            FixnumPred::Plusp => 0x4F, // cmovg  (> 0)
+                            FixnumPred::Zerop => 0x44,  // cmove  (== 0)
+                            FixnumPred::Plusp => 0x4F,  // cmovg  (> 0)
                             FixnumPred::Minusp => 0x4C, // cmovl (< 0)
-                            FixnumPred::Evenp => 0x44, // cmove  (bit clear)
-                            FixnumPred::Oddp => 0x45,  // cmovne (bit set)
+                            FixnumPred::Evenp => 0x44,  // cmove  (bit clear)
+                            FixnumPred::Oddp => 0x45,   // cmovne (bit set)
                         };
                         c.extend_from_slice(&[0x48, 0x0F, cc, 0xC2]); // cmovCC rax, rdx
                         c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF8]); // mov [r15-8], rax
@@ -5682,7 +8359,8 @@ fn emit_native_x86(
                         if offset == 0 {
                             c.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]
                         } else {
-                            c.extend_from_slice(&[0x48, 0x8B, 0x40, offset as u8]); // mov rax, [rax+8]
+                            c.extend_from_slice(&[0x48, 0x8B, 0x40, offset as u8]);
+                            // mov rax, [rax+8]
                         }
                         // L_nil: both paths converge here (rax = NIL, or the
                         // loaded field). Patch the forward rel8.
@@ -5698,7 +8376,9 @@ fn emit_native_x86(
                         let cc = match pred {
                             TotalUnaryPred::Null => {
                                 c.extend_from_slice(&[0x48, 0x3D]); // cmp rax, imm32
-                                c.extend_from_slice(&(bliss_rt::value::NIL_BITS as u32).to_le_bytes());
+                                c.extend_from_slice(
+                                    &(bliss_rt::value::NIL_BITS as u32).to_le_bytes(),
+                                );
                                 0x44 // cmove: x == NIL
                             }
                             TotalUnaryPred::Consp => {
@@ -5752,8 +8432,8 @@ fn emit_native_x86(
                         // pre-call depth, letting T0 resume at this `CallNamed`.
                         c.extend_from_slice(&[0x49, 0x8B, 0x4F, 0xF8]); // mov rcx, [r15-8]
                         c.extend_from_slice(&[0x49, 0x8B, 0x47, 0xF0]); // mov rax, [r15-16]
-                        // Commit: two operands consumed, one result pushed ⇒
-                        // r15 drops by one slot and the result lands in a0's slot.
+                                                                        // Commit: two operands consumed, one result pushed ⇒
+                                                                        // r15 drops by one slot and the result lands in a0's slot.
                         let commit_bin = |c: &mut Asm| {
                             c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF0]); // mov [r15-16], rax
                             c.extend_from_slice(&[0x49, 0x83, 0xEF, 0x08]); // sub r15, 8
@@ -5776,23 +8456,29 @@ fn emit_native_x86(
                                     FixnumOp::Add => {
                                         // (a0<<3)+(a1<<3)=(a0+a1)<<3; jo on overflow.
                                         c.extend_from_slice(&[0x48, 0x01, 0xC8]); // add rax, rcx
-                                        jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp); // jo deopt
+                                        jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp);
+                                        // jo deopt
                                     }
                                     FixnumOp::Sub => {
                                         c.extend_from_slice(&[0x48, 0x29, 0xC8]); // sub rax, rcx
-                                        jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp); // jo deopt
+                                        jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp);
+                                        // jo deopt
                                     }
                                     FixnumOp::Mul => {
                                         // Untag a0, then a0 * (a1<<3) = (a0*a1)<<3.
                                         c.extend_from_slice(&[0x48, 0xC1, 0xF8, 0x03]); // sar rax, 3
                                         c.extend_from_slice(&[0x48, 0x0F, 0xAF, 0xC1]); // imul rax, rcx
-                                        jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp); // jo deopt
+                                        jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp);
+                                        // jo deopt
                                     }
                                     _ => unreachable!(),
                                 }
                                 commit_bin(&mut c);
                             }
-                            FixnumOp::Lt | FixnumOp::Gt | FixnumOp::Le | FixnumOp::Ge
+                            FixnumOp::Lt
+                            | FixnumOp::Gt
+                            | FixnumOp::Le
+                            | FixnumOp::Ge
                             | FixnumOp::NumEq => {
                                 // Fixnum-only (float compares deopt): guard both
                                 // operands are fixnums, else deopt.
@@ -5800,8 +8486,8 @@ fn emit_native_x86(
                                 c.extend_from_slice(&[0x48, 0x09, 0xCA]); // or rdx, rcx
                                 c.extend_from_slice(&[0xF6, 0xC2, 0x07]); // test dl, 7
                                 jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp); // jnz deopt
-                                // cmp a0, a1 (order-preserving on tagged fixnums),
-                                // then materialise T/NIL by the signed condition.
+                                                                                   // cmp a0, a1 (order-preserving on tagged fixnums),
+                                                                                   // then materialise T/NIL by the signed condition.
                                 c.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
                                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, NIL
                                 c.extend_from_slice(&bliss_rt::value::NIL_BITS.to_le_bytes());
@@ -5823,29 +8509,28 @@ fn emit_native_x86(
                         continue;
                     }
                 }
-                // c2i_call(sym, n, a0, a1, a2): rdi=sym, rsi=n, rdx=a0, rcx=a1,
-                // r8=a2. Top of stack is the last arg.
-                match *nargs {
-                    0 => {}
-                    1 => pop_into(&mut c, 2, false), // a0 -> rdx
-                    2 => {
-                        pop_into(&mut c, 1, false); // a1 -> rcx
-                        pop_into(&mut c, 2, false); // a0 -> rdx
-                    }
-                    3 => {
-                        pop_into(&mut c, 0, true); // a2 -> r8
-                        pop_into(&mut c, 1, false); // a1 -> rcx
-                        pop_into(&mut c, 2, false); // a0 -> rdx
-                    }
-                    _ => return None,
-                }
+                // c2i_call_slice(sym, n, args, profile): arguments are already
+                // contiguous below r15 in the activation's BlissStack operand
+                // area. This supports arbitrary CL arity without copying values
+                // into a fixed set of host ABI registers.
                 c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, imm64 (sym)
                 c.extend_from_slice(&(*sym as u64).to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, imm64 (nargs)
                 c.extend_from_slice(&(*nargs as u64).to_le_bytes());
+                c.extend_from_slice(&[0x49, 0x8D, 0x97]); // lea rdx,[r15 - 8*nargs]
+                c.extend_from_slice(&(-8_i32 * i32::from(*nargs)).to_le_bytes());
+                let profile_site = if registry_get(*sym).is_some() {
+                    call_site_profile_token(bf as *const BytecodeFunction as usize, bcp as u32)
+                } else {
+                    0
+                };
+                c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64 (profile site)
+                c.extend_from_slice(&profile_site.to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i)
                 c.extend_from_slice(&c2i_addr.to_le_bytes());
                 c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                c.extend_from_slice(&[0x49, 0x81, 0xEF]); // sub r15, 8*nargs
+                c.extend_from_slice(&(8_i32 * i32::from(*nargs)).to_le_bytes());
                 push_rax(&mut c);
             }
             Instr::Br(target) => {
@@ -5874,6 +8559,65 @@ fn emit_native_x86(
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_clear_mv)
                 c.extend_from_slice(&clear_mv_addr.to_le_bytes());
                 c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+            }
+            Instr::LoadEnvVar(name_idx) => {
+                c.push(0xBF); // mov edi, function symbol
+                c.extend_from_slice(&sym.to_le_bytes());
+                c.push(0xBE); // mov esi, name index
+                c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(&load_env_addr.to_le_bytes());
+                c.extend_from_slice(&[0xFF, 0xD0]);
+                push_rax(&mut c);
+            }
+            Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
+                pop_into(&mut c, 2, false); // value -> rdx
+                c.push(0xBF); // mov edi, function symbol
+                c.extend_from_slice(&sym.to_le_bytes());
+                c.push(0xBE); // mov esi, name index
+                c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                let helper = if matches!(instr, Instr::StoreEnvVar(_)) {
+                    store_env_addr
+                } else {
+                    define_env_addr
+                };
+                c.extend_from_slice(&helper.to_le_bytes());
+                c.extend_from_slice(&[0xFF, 0xD0]);
+            }
+            Instr::PushEnvChild | Instr::PopEnvChild => {
+                c.extend_from_slice(&[0x48, 0xB8]);
+                let helper = if matches!(instr, Instr::PushEnvChild) {
+                    push_env_addr
+                } else {
+                    pop_env_addr
+                };
+                c.extend_from_slice(&helper.to_le_bytes());
+                c.extend_from_slice(&[0xFF, 0xD0]);
+            }
+            Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {
+                let form = bf.constants.get(*index as usize)?.0;
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, form
+                c.extend_from_slice(&form.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                let helper = if matches!(instr, Instr::EvalHost(_)) {
+                    eval_host_addr
+                } else {
+                    make_closure_addr
+                };
+                c.extend_from_slice(&helper.to_le_bytes());
+                c.extend_from_slice(&[0xFF, 0xD0]);
+                push_rax(&mut c);
+            }
+            Instr::TakeValuesToLocals { nvars, slot_base } => {
+                pop_into(&mut c, 7, false); // primary -> rdi
+                c.extend_from_slice(&[0x49, 0x8D, 0xB6]); // lea rsi,[r14+slot]
+                c.extend_from_slice(&local_disp(*slot_base as i32).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, nvars
+                c.extend_from_slice(&u64::from(*nvars).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(&take_values_addr.to_le_bytes());
+                c.extend_from_slice(&[0xFF, 0xD0]);
             }
             // Read a global/special var's value cell → push (bliss-x5y.15). Same
             // non-allocating call contract as ClearMv (r14/r15 callee-saved).
@@ -5905,7 +8649,38 @@ fn emit_native_x86(
                 if let Some(&sp) = tag_sp.get(tagbody_id) {
                     reset_r15(&mut c, sp);
                 } else {
-                    return None; // go with no lexically visible tag: not T1-safe
+                    decline_t1!("GO references non-local tagbody {tagbody_id}");
+                }
+                if (*target_bcp as usize) < bcp_idx
+                    && tag_sp.get(tagbody_id) == Some(&0)
+                    && sym != u32::MAX
+                    && backedge_counter != 0
+                {
+                    let keep_t1 = c.label();
+                    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, counter
+                    c.extend_from_slice(&backedge_counter.to_le_bytes());
+                    c.extend_from_slice(&[0x83, 0x00, 0x01]); // add dword [rax],1
+                    c.extend_from_slice(&[0x81, 0x38]); // cmp dword [rax],imm32
+                    c.extend_from_slice(&t2_backedge_threshold().to_le_bytes());
+                    c.jcc(Cc::L, keep_t1);
+                    c.extend_from_slice(&[0xC7, 0x00, 0, 0, 0, 0]); // reset sample
+                    c.push(0xBF); // mov edi,sym
+                    c.extend_from_slice(&sym.to_le_bytes());
+                    c.push(0xBE); // mov esi,header bcp
+                    c.extend_from_slice(&target_bcp.to_le_bytes());
+                    c.extend_from_slice(&[0x4C, 0x89, 0xF2]); // mov rdx,r14 slots
+                    c.extend_from_slice(&[0x48, 0xB8]);
+                    c.extend_from_slice(&t2_backedge_addr.to_le_bytes());
+                    c.extend_from_slice(&[0xFF, 0xD0]); // call callback
+                    c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax,rax
+                    c.jcc(Cc::E, keep_t1);
+                    // T2 finished or deoptimized. Its result/dummy result was
+                    // stored in the first operand slot for the shared epilogue.
+                    c.extend_from_slice(&[0x49, 0x8B, 0x86]);
+                    c.extend_from_slice(&(8 * n_locals).to_le_bytes());
+                    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
+                    c.extend_from_slice(&[0x41, 0x5F, 0x41, 0x5E, 0xC3]);
+                    c.bind(keep_t1);
                 }
                 c.jmp(*bcp_labels.get(*target_bcp as usize)?);
             }
@@ -5915,7 +8690,7 @@ fn emit_native_x86(
                 // and jump to the block's resume point.
                 let (resume_bcp, sp) = match block_targets.get(block_id) {
                     Some(&t) => t,
-                    None => return None, // non-local block: not T1-safe
+                    None => decline_t1!("RETURN-FROM references non-local block {block_id}"),
                 };
                 c.extend_from_slice(&[0x49, 0x8B, 0x47, 0xF8]); // mov rax, [r15-8]
                 reset_r15(&mut c, sp);
@@ -5935,7 +8710,7 @@ fn emit_native_x86(
                 c.extend_from_slice(&[0x41, 0x5E]); // pop r14
                 c.extend_from_slice(&[0xC3]); // ret
             }
-            _ => return None,
+            unsupported => decline_t1!("unsupported opcode at bcp {bcp}: {unsupported:?}"),
         }
     }
 
@@ -6128,6 +8903,8 @@ fn is_inlinable_eq(sym: u32) -> bool {
 fn emit_native_x86(
     _bf: &BytecodeFunction,
     _allow_speculation: bool,
+    _sym: u32,
+    _backedge_counter: u64,
 ) -> Option<(Vec<u8>, Vec<(u32, usize)>)> {
     None
 }
@@ -6136,6 +8913,13 @@ fn emit_native_x86(
 /// executable memory). Returns the installed code, or `None` if it can't be
 /// compiled to native.
 fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
+    try_promote_to_t1_with_speculation(sym, true)
+}
+
+/// Build T1 with or without its optimistic fixnum templates. The
+/// non-speculating form is the stable native fallback while a replacement T2
+/// version is compiled for a newly observed numeric phase.
+fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Option<Rc<NativeCode>> {
     // Blacklisted (bliss-jtc.27): a function whose speculation repeatedly failed
     // is not recompiled — it stays in T0 to avoid churning through deopts.
     if DEOPT_BLACKLIST.with(|s| s.borrow().contains(&sym)) {
@@ -6150,7 +8934,9 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
     // essentially all real, call-heavy library code out of T1.) Speculative
     // fixnum codegen stays gated on `is_deopt_safe_primitive`, so a non-leaf
     // function that calls impure helpers emits no deopt-able ops.
-    let (code, _osr) = emit_native_x86(&bf, true)?;
+    let backedge_counter = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
+        as *mut std::sync::atomic::AtomicU32 as usize as u64;
+    let (code, _osr) = emit_native_x86(&bf, allow_speculation, sym, backedge_counter)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
@@ -6166,6 +8952,7 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
         is_t2: false,
         num_slots,
         compiled_entry: 0, // T1 baseline has no distinct register entry yet
+        osr_entries: HashMap::new(),
         code_info,
     });
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
@@ -6173,11 +8960,10 @@ fn try_promote_to_t1(sym: u32) -> Option<Rc<NativeCode>> {
 }
 
 /// Try to compile `sym` to T2 optimising native code (profile-guided single-type
-/// speculation). Gated behind `BLISS_T2=1` — off by default. Returns `None`
-/// (fall back to T1) when disabled, when no arithmetic site has a consistent
-/// profile yet, or when the function's shape is beyond the first-cut framed
-/// emitter (branches, unsupported ops). Installs like T1 and shares the
-/// run_native ABI, so dispatch and deopt are identical.
+/// speculation). The tier state machine calls this only after an installed T1
+/// reaches an invocation/back-edge threshold. Returns `None` (retain T1) when
+/// the function's shape is beyond the framed emitter. Installs like T1 and
+/// shares the run_native ABI, so dispatch and deopt are identical.
 /// Where T2 trace output goes, decided once from `BLISS_T2_LOG`:
 /// `-`/`1`/`stderr` → stderr; any other non-empty value → that file (appended);
 /// unset → no logging. This is the observability channel: it explains, per
@@ -6222,32 +9008,9 @@ macro_rules! t2_log {
     ($($a:tt)*) => { t2_log_write(format_args!($($a)*)) };
 }
 
-/// Log every profiled call site of `func_ptr` and the type it resolves to — the
-/// "why" behind a speculation (or a decline).
-fn t2_log_profile(name: &str, func_ptr: usize) {
-    if t2_log_target().is_none() {
-        return;
-    }
-    TYPE_PROFILE.with(|m| {
-        for ((fp, bcp), p) in m.borrow().iter() {
-            if *fp == func_ptr {
-                t2_log!(
-                    "{name}: site bcp={bcp} profile fix={} float={} other={} => {:?}",
-                    p.fixnum,
-                    p.single_float,
-                    p.other,
-                    p.dominant()
-                );
-            }
-        }
-    });
-}
-
-fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
-    if std::env::var("BLISS_T2").ok().as_deref() != Some("1") {
-        return None;
-    }
-    let bf = registry_get(sym)?;
+fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
+    let sym = input.sym;
+    let bf = &input.body;
     // T2's entry sequence (build.rs::seed_entry) binds only the fixed positional
     // parameters — locals `0..arity` — and leaves every other local NIL. It has
     // no support for collecting &optional/&rest/&key arguments, so a variadic
@@ -6267,10 +9030,19 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
     // deopt. That is no longer needed: emit_framed now lowers SetSymbolValue and
     // gives every guard precise state-transfer deopt (bliss-izt.3, bliss-mzp), so
     // a global-accumulator loop optimises at T2 without double-applying its store.)
-    let func_ptr = Rc::as_ptr(&bf) as usize;
     let name = bf.name.clone();
     t2_log!("{name}: considering for T2 (arity {})", bf.arity);
-    t2_log_profile(&name, func_ptr);
+    if t2_log_target().is_some() {
+        for (bcp, p) in &input.type_profiles {
+            t2_log!(
+                "{name}: site bcp={bcp} profile fix={} float={} other={} => {:?}",
+                p.fixnum,
+                p.single_float,
+                p.other,
+                p.dominant()
+            );
+        }
+    }
 
     // The profile closure the speculative-lowering pass consumes: this function's
     // observed operand type at each call-site bcp, mapped to the compiler's type.
@@ -6281,7 +9053,7 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
     // deopts), and it stops one cold branch from declining the whole function.
     let profile = |bcp: u32| -> Option<bliss_compiler::t2::speculate::SpecType> {
         use bliss_compiler::t2::speculate::SpecType as Bc;
-        match type_profile_at(func_ptr, bcp) {
+        match input.type_profiles.get(&bcp).copied() {
             Some(p) => match p.dominant() {
                 Some(SpecType::Fixnum) => Some(Bc::Fixnum),
                 Some(SpecType::SingleFloat) => Some(Bc::SingleFloat),
@@ -6299,9 +9071,22 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         }
     };
 
-    let inline_options = t2_inline_options(sym);
+    let mut inline_options =
+        bliss_compiler::t2::inlining::InlineOptions::default().with_root_symbol(sym);
+    for saved in input.inline_bodies {
+        let T2BodySnapshot {
+            symbol,
+            body,
+            invocations,
+            call_sites,
+        } = saved;
+        inline_options = inline_options.with_body(symbol, Rc::new(body));
+        for (bcp, calls) in call_sites {
+            inline_options = inline_options.with_call_site_profile(symbol, bcp, calls, invocations);
+        }
+    }
     let mut f = match bliss_compiler::t2::build::build_from_bytecode_with_inline_options(
-        &bf,
+        bf,
         inline_options,
     ) {
         Ok(f) => f,
@@ -6325,7 +9110,10 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
     }
 
     // Route the speculated IR through the mid-end: constant folding + strength
-    // reduction (P4f), global value numbering (P4a), then deopt-aware DCE (P4c).
+    // reduction (P4f), global value numbering (P4a), dominance-based guard
+    // elimination (P4d), then deopt-aware DCE (P4c).  Guard elimination runs
+    // after body inlining in the builder, so equivalent proofs cloned from
+    // separate callees collapse to one dominating guard.
     // Each pass preserves well-formedness (spec §4.10 R4.60); re-verify before
     // emitting, and decline T2 (fall back to T1) if anything went wrong.
     {
@@ -6333,6 +9121,7 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         let mut pm = PassManager::new();
         pm.add(Box::new(bliss_compiler::t2::opt_fold::ConstFold));
         pm.add(Box::new(bliss_compiler::t2::opt_gvn::Gvn));
+        pm.add(Box::new(bliss_compiler::t2::opt_guard::GuardElim));
         pm.add(Box::new(bliss_compiler::t2::opt_dce::Dce));
         pm.run(&mut f);
     }
@@ -6343,11 +9132,11 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
 
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
     let deopt_t2_addr = c2i_deopt_t2 as extern "C" fn(u64, u64, *const u64, u64) as usize as u64;
-    let call_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64) -> u64 as usize as u64;
+    let call_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 as usize as u64;
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
-    let framed = match bliss_compiler::t2::emit::emit_framed(
+    let framed = match bliss_compiler::t2::emit::emit_framed_with_activation_slots(
         &f,
         deopt_addr,
         deopt_t2_addr,
@@ -6355,6 +9144,7 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
         load_global_addr,
         store_global_addr,
         clear_mv_addr,
+        bf.num_slots(),
         Some(sym),
     ) {
         Ok(fc) => fc,
@@ -6365,44 +9155,24 @@ fn try_promote_to_t2(sym: u32) -> Option<Rc<NativeCode>> {
     };
     let code = framed.code;
     t2_log!(
-        "{name}: T2 INSTALLED — {} bytes, compiled_entry=+{}",
+        "{name}: T2 INSTALLED — {} bytes, compiled_entry=+{}, spill_slots={} (regalloc2={}), edits={}, gc_shadow_slots={}, safepoints={}",
         code.len(),
-        framed.compiled_entry
+        framed.compiled_entry,
+        framed.native_spill_slots,
+        framed.regalloc_spill_slots,
+        framed.allocation_edits,
+        framed.shadow_root_slots,
+        framed.emitted_safepoints,
     );
 
-    let num_slots = bf.num_slots();
-    let code_info = install_stack_map(num_slots)?;
-    let buf = bliss_rt::jit::JitBuffer::new(&code)?;
-    let entry = buf.leak();
-    maybe_write_perf_map(entry as usize, code.len(), sym);
-    let nc = Rc::new(NativeCode {
-        entry,
-        code_len: code.len(),
-        is_t2: true,
-        num_slots,
+    Some(T2Artifact {
+        code,
         compiled_entry: framed.compiled_entry,
-        code_info,
-    });
-    NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(sym, Rc::clone(&nc)));
-    Some(nc)
-}
-
-/// Promote `sym` to the best available native tier: T2 (profile-guided) if
-/// enabled and applicable, else the T1 baseline.
-fn try_promote(sym: u32) -> Option<Rc<NativeCode>> {
-    let nc = try_promote_to_t2(sym).or_else(|| try_promote_to_t1(sym))?;
-    // Mark this promotion fresh: the first deopt after it decays the profile once.
-    PROMOTED_FRESH.with(|s| s.borrow_mut().insert(sym));
-    // Give each promotion its own deopt budget. DEOPT_COUNTS is otherwise
-    // cumulative, so a re-specialized function (e.g. fixnum-T2 that deopted, then
-    // re-promoted to float-T2) would inherit a near-exhausted budget and blacklist
-    // on its first deopt. Resetting per promotion is HotSpot's per-recompile policy;
-    // T2 speculation of a *different* type is never blocked by a prior type's
-    // blacklist (the blacklist gates only the non-speculating T1 baseline).
-    DEOPT_COUNTS.with(|m| {
-        m.borrow_mut().insert(sym, 0);
-    });
-    Some(nc)
+        osr_entries: framed.osr_entries,
+        shadow_root_slots: framed.shadow_root_slots,
+        emitted_safepoints: framed.emitted_safepoints,
+        root_sync_sites: framed.root_sync_sites,
+    })
 }
 
 /// Installed OSR code for a function (bliss-izt.1): a non-speculating native
@@ -6453,7 +9223,7 @@ fn compile_osr(sym: u32) -> Option<Rc<OsrCode>> {
         // the loop runs at full native speed until (if ever) a value leaves the
         // fixnum domain. Speculation only actually engages for `deopt_safe`
         // functions (every call a pure primitive); others fall back to c2i.
-        let (code, osr) = emit_native_x86(&bf, true)?;
+        let (code, osr) = emit_native_x86(&bf, true, u32::MAX, 0)?;
         if osr.is_empty() {
             return None;
         }
@@ -6528,7 +9298,9 @@ fn run_native_osr(
         // resuming at the loop's back-edge target is not possible here, so fall
         // through to Finished with the returned (dummy) value would be wrong.
         // Instead surface an internal error to avoid silently returning garbage.
-        return Err(BlissError::Internal("OSR deopt without resume point".into()));
+        return Err(BlissError::Internal(
+            "OSR deopt without resume point".into(),
+        ));
     }
     Ok(OsrOutcome::Finished(BlissVal(ret)))
 }
@@ -6563,8 +9335,9 @@ fn release_activation_handlers(act: &mut Activation, env: &mut Env) {
         match h {
             Handler::Catch { token, .. } => env.catch_stack.retain(|(_, t)| *t != token),
             Handler::Block { token, .. } => env.block_stack.retain(|(_, t)| *t != token),
-            Handler::HandlerCase { cluster_base, .. }
-            | Handler::HandlerBind { cluster_base } => env.handlers.truncate(cluster_base),
+            Handler::HandlerCase { cluster_base, .. } | Handler::HandlerBind { cluster_base } => {
+                env.handlers.truncate(cluster_base)
+            }
             Handler::RestartCase { restart_base, .. } => env.restarts.truncate(restart_base),
             _ => {}
         }
@@ -6678,15 +9451,18 @@ pub fn eval_toplevel(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     if let Some((name, params, body)) = as_defun(form) {
         let result = eval_form(form, env)?;
         if let Some(sym) = symbol_index_of(&name) {
+            reset_last_bail_reason();
             match compile_function(&name, params, body, env) {
                 Some(bf) => {
                     trace("compiled");
+                    trace_named(&name, "compiled", None);
                     registry_put(sym, Rc::new(bf));
                 }
                 // Redefinition that no longer compiles must not leave stale
                 // bytecode behind — drop it so calls fall back to the tree-walker.
                 None => {
                     trace("bailed");
+                    trace_named(&name, "bailed", last_bail_reason().as_deref());
                     registry_remove(sym);
                 }
             }
@@ -6735,6 +9511,20 @@ fn trace(what: &str) {
     }
 }
 
+/// Optional per-definition compile trace. Kept separate from
+/// `BLISS_BYTECODE_TRACE` so its stable one-word output remains suitable for
+/// tests while workload investigations can identify the exact function and
+/// final lowering reason.
+fn trace_named(name: &str, what: &str, reason: Option<&str>) {
+    if std::env::var_os("BLISS_BYTECODE_TRACE_NAMES").is_none() {
+        return;
+    }
+    match reason {
+        Some(reason) => eprintln!("[bytecode] {name}: {what} ({reason})"),
+        None => eprintln!("[bytecode] {name}: {what}"),
+    }
+}
+
 /// Match `(DEFUN name params . body)`, returning `(name, params, body)`.
 fn as_defun(form: BlissVal) -> Option<(String, BlissVal, BlissVal)> {
     if !form.is_cons() {
@@ -6750,6 +9540,29 @@ fn as_defun(form: BlissVal) -> Option<(String, BlissVal, BlissVal)> {
     }
     let (params, body) = cp(rest);
     Some((sym_name(name_sym), params, body))
+}
+
+/// Match `(DEFMACRO name lambda-list . body)` or
+/// `(DEFINE-COMPILER-MACRO name lambda-list . body)`.
+fn as_macro_definition(form: BlissVal) -> Option<(bool, String, BlissVal, BlissVal)> {
+    if !form.is_cons() {
+        return None;
+    }
+    let (op, rest) = cp(form);
+    if !op.is_symbol() {
+        return None;
+    }
+    let compiler_macro = match symbol_bare_name(&sym_name(op)).as_str() {
+        "DEFMACRO" => false,
+        "DEFINE-COMPILER-MACRO" => true,
+        _ => return None,
+    };
+    let (name_sym, rest) = cp(rest);
+    if !name_sym.is_symbol() {
+        return None;
+    }
+    let (params, body) = cp(rest);
+    Some((compiler_macro, sym_name(name_sym), params, body))
 }
 
 /// Resolve a symbol name to its interned index via the reader.
@@ -6793,5 +9606,60 @@ mod jtc4_stack_map_tests {
             no_maps.stack_map(0).is_none(),
             "a safepoint with no registered map resolves to None — install must reject it"
         );
+    }
+
+    #[test]
+    fn t2_install_rejects_missing_or_stale_native_root_sync_metadata() {
+        let valid = T2Artifact {
+            code: vec![0x90; 8],
+            compiled_entry: 0,
+            osr_entries: vec![],
+            shadow_root_slots: 2,
+            emitted_safepoints: 1,
+            root_sync_sites: vec![bliss_compiler::t2::emit::RootSyncSite {
+                code_offset: 3,
+                live_roots: 2,
+                register_roots: 1,
+                spill_roots: 1,
+            }],
+        };
+        assert_eq!(validate_t2_root_sync(3, &valid), Some(5));
+
+        let mut missing = valid;
+        missing.emitted_safepoints = 2;
+        assert_eq!(validate_t2_root_sync(3, &missing), None);
+
+        missing.emitted_safepoints = 1;
+        missing.root_sync_sites[0].spill_roots = 0;
+        assert_eq!(validate_t2_root_sync(3, &missing), None);
+
+        missing.root_sync_sites[0].spill_roots = 1;
+        missing.root_sync_sites[0].code_offset = missing.code.len() as u32;
+        assert_eq!(validate_t2_root_sync(3, &missing), None);
+    }
+
+    #[test]
+    fn native_call_site_token_updates_the_shared_frequency_window() {
+        let func_ptr = 0x5a17_0000usize;
+        record_profiled_invocation(func_ptr);
+        record_profiled_invocation(func_ptr);
+        let token = call_site_profile_token(func_ptr, 9);
+        record_native_call_site(token);
+        record_native_call_site(token);
+
+        let (invocations, sites) = call_site_profile_snapshot(func_ptr);
+        assert_eq!(invocations, 2);
+        assert_eq!(sites, vec![(9, 2)]);
+        clear_bytecode_profiles(func_ptr);
+    }
+
+    #[test]
+    fn bbu_v11_registry_key_symbol_tag_remains_readable() {
+        let mut cursor = BbuCursor::new(&[14, 3, 0, 0, 0]);
+        assert!(matches!(
+            parse_bbu_constant(&mut cursor, 0x0101).unwrap(),
+            BbuConstant::LegacySymbol(3)
+        ));
+        assert!(cursor.done());
     }
 }

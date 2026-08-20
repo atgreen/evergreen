@@ -176,6 +176,12 @@ Algorithm: TypePropagation(IR)
 | `Cons(car, cdr)` | `cons` |
 | `Car(v)` | if `type(v) ⊆ cons` then `T` else `⊤` (may signal error path) |
 
+Static operand proof from declarations or inference takes precedence over a
+runtime type profile when selecting a typed arithmetic opcode. Once the checked
+entry edge has refined an argument to `fixnum` or `single-float`, dominated
+operations MUST consume that proof without repeating the tag guard. This does
+not by itself remove arithmetic overflow checks: those require a range proof.
+
 **Convergence:** The lattice has finite height (bounded by the number
 of distinct CL types the compiler tracks — capped at 64 union
 elements). The transfer functions are monotone. The algorithm
@@ -226,7 +232,7 @@ A4.09 — Inlining Decision
      └─ YES ──▶ continue
 
   8. PGO data available for C?
-     ├─ YES → call-site frequency ≥ HOT_THRESHOLD?
+     ├─ YES → calls(C) / invocations(caller) ≥ HOT_THRESHOLD?
      │         ├─ YES → INLINE. Deduct cost(F) from budget. Stop.
      │         └─ NO  → do NOT inline. Stop.
      └─ NO ──▶ continue
@@ -243,7 +249,14 @@ A4.09 — Inlining Decision
 | `SMALL_THRESHOLD` | 30 IR nodes | Yes (`bliss.opt.inline.small`) | Functions at or below this size are always inlined (unless `notinline`) |
 | `MAX_INLINE_DEPTH` | 6 | Yes (`bliss.opt.inline.depth`) | Maximum nesting depth of inlined calls |
 | `NODE_BUDGET` | 10 000 IR nodes | Yes (`bliss.opt.inline.budget`) | Total IR growth budget per compilation unit |
-| `HOT_THRESHOLD` | 80th percentile | Yes (`bliss.opt.inline.hot-pct`) | PGO frequency percentile for "hot" classification |
+| `HOT_THRESHOLD` | 80% | Yes (`bliss.opt.inline.hot-pct`) | Minimum executions of the call site per 100 caller invocations; loops may exceed 100% |
+
+The numerator and denominator MUST cover the same profiling window. T0 records
+both while interpreting saved bytecode bodies; T1 continues both counters, with
+the call-site increment attached to its c2i call boundary. A large eligible body
+at or above `HOT_THRESHOLD` receives the remaining compilation-unit node budget
+as its size allowance. Hotness never overrides `NOTINLINE`, legality, recursion,
+depth, or the node budget.
 
 ### 4.5.4.3 Inlining Mechanics
 
@@ -504,7 +517,7 @@ Per-function IR graphs are thread-local during optimisation.
 | `bliss.opt.inline.small` | `30` | — | Small-function threshold (IR nodes) |
 | `bliss.opt.inline.depth` | `6` | — | Max inline depth |
 | `bliss.opt.inline.budget` | `10000` | — | Total IR node budget |
-| `bliss.opt.inline.hot-pct` | `80` | — | PGO hot percentile |
+| `bliss.opt.inline.hot-pct` | `80` | — | Minimum call-site executions per 100 caller invocations |
 | `bliss.opt.escape.stack-max` | `256` | — | Max bytes for stack allocation |
 | `bliss.opt.licm.enable` | `true` | — | Enable/disable LICM |
 | `bliss.opt.type-union-cap` | `64` | — | Max union elements before widening to ⊤ |

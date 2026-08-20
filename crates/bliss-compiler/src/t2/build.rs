@@ -28,14 +28,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
 use crate::t2::inlining::{
-    InlineDecision, InlineOptions, InlinePolicy, IntrinsicId, body_cost, decide,
-    metadata_for_symbol,
+    body_cost, decide, metadata_for_symbol, InlineDecision, InlineOptions, InlinePolicy,
+    IntrinsicId,
 };
 use crate::t2::ir::{
     AuxData, Block, Function, IRType, Inst, InstData, InstFlags, Opcode, TypeBits, Value,
     ValueRepresentation,
 };
-use bliss_rt::bytecode::{BytecodeFunction, Instr};
+use bliss_rt::bytecode::{BytecodeFunction, DeclaredType, Instr};
 
 /// Why the builder could not produce IR for a function (e.g. an opcode not yet
 /// modelled). The caller keeps such a function at T1 (spec R4.28).
@@ -121,6 +121,8 @@ fn build_with_saved_bodies(
         } else {
             InlinePolicy::Unspecified
         };
+        let hot = current_symbol
+            .is_some_and(|caller| options.call_site_is_hot(caller, current_scope.bcp));
 
         if policy == InlinePolicy::NotInline
             || nargs != body.arity
@@ -134,7 +136,7 @@ fn build_with_saved_bodies(
             continue;
         };
         if cost > *remaining_budget
-            || (cost > options.config.small_threshold && policy != InlinePolicy::Inline)
+            || (cost > options.config.small_threshold && !hot && policy != InlinePolicy::Inline)
         {
             continue;
         }
@@ -247,8 +249,35 @@ impl<'a> Builder<'a> {
         self.compute_total_preds()?;
         self.seed_entry();
         self.process_blocks()?;
+        self.capture_osr_entries();
         self.simplify_trivial_phis();
         Ok(self.f)
+    }
+
+    /// Capture the live root-frame locals at empty-stack backward-GO targets.
+    /// These FrameStates participate in the ordinary optimizer rewrite path,
+    /// which keeps OSR entry state correct as phis and values are simplified.
+    fn capture_osr_entries(&mut self) {
+        let mut headers = BTreeSet::new();
+        for (i, instr) in self.bf.code.iter().enumerate() {
+            if let Instr::Go { target_bcp, .. } = instr {
+                let target = *target_bcp as usize;
+                if target < i && self.entry_depth.get(&target) == Some(&0) {
+                    headers.insert(*target_bcp);
+                }
+            }
+        }
+        for bcp in headers {
+            let Some(&block) = self.block_of.get(&(bcp as usize)) else {
+                continue;
+            };
+            let frame_state = self.build_frame_state(block, &[], bcp);
+            self.f.osr_entries.push(crate::t2::ir::OsrEntry {
+                bcp,
+                block,
+                frame_state,
+            });
+        }
     }
 
     // ── Pass 1: basic-block leaders ─────────────────────────────────
@@ -293,15 +322,16 @@ impl<'a> Builder<'a> {
         while let Some(i) = work.pop() {
             let d = depth_at[&i];
             // `push` propagates a depth to a successor index.
-            let push = |idx: usize, nd: i32, depth_at: &mut HashMap<usize, i32>, work: &mut Vec<usize>| {
-                if idx >= code.len() {
-                    return;
-                }
-                if !depth_at.contains_key(&idx) {
-                    depth_at.insert(idx, nd);
-                    work.push(idx);
-                }
-            };
+            let push =
+                |idx: usize, nd: i32, depth_at: &mut HashMap<usize, i32>, work: &mut Vec<usize>| {
+                    if idx >= code.len() {
+                        return;
+                    }
+                    if !depth_at.contains_key(&idx) {
+                        depth_at.insert(idx, nd);
+                        work.push(idx);
+                    }
+                };
             match &code[i] {
                 Instr::Const(_) | Instr::LoadLocal(_) | Instr::LoadGlobal(_) | Instr::Dup => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
@@ -344,7 +374,11 @@ impl<'a> Builder<'a> {
     fn create_blocks(&mut self) {
         let leaders = self.leaders.clone();
         for &l in &leaders {
-            let b = if l == 0 { self.f.entry() } else { self.f.make_block() };
+            let b = if l == 0 {
+                self.f.entry()
+            } else {
+                self.f.make_block()
+            };
             self.block_of.insert(l, b);
         }
         let n = self.f.num_blocks();
@@ -392,7 +426,9 @@ impl<'a> Builder<'a> {
             self.block_of
                 .get(&t)
                 .copied()
-                .ok_or(BuildError::Unsupported("branch target is not a block leader"))
+                .ok_or(BuildError::Unsupported(
+                    "branch target is not a block leader",
+                ))
         };
         for instr in &code[start..end] {
             match instr {
@@ -421,9 +457,23 @@ impl<'a> Builder<'a> {
         let entry = self.f.entry();
         let arity = self.bf.arity.min(self.bf.n_locals);
         for i in 0..arity {
+            let declared = self
+                .bf
+                .param_types
+                .get(i as usize)
+                .copied()
+                .unwrap_or_default();
+            let ty = match declared {
+                DeclaredType::Any => IRType::TOP,
+                DeclaredType::Fixnum => IRType::of(TypeBits::FIXNUM),
+                DeclaredType::SingleFloat => IRType::of(TypeBits::SINGLE_FLOAT),
+            };
             let p = self
                 .f
-                .add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+                .add_block_param(entry, ty, ValueRepresentation::Tagged);
+            if !declared.is_any() {
+                self.f.mark_entry_param_checked(p);
+            }
             self.write_var(Var::Local(i), entry, p);
         }
         for i in arity..self.bf.n_locals {
@@ -483,37 +533,46 @@ impl<'a> Builder<'a> {
                     stack.push(v);
                 }
                 Instr::StoreLocal(s) => {
-                    let v = stack.pop().ok_or(BuildError::Unsupported("stack underflow (StoreLocal)"))?;
+                    let v = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (StoreLocal)"))?;
                     self.write_var(Var::Local(*s), block, v);
                 }
                 Instr::LoadGlobal(sym) => {
+                    let fs = self.build_frame_state(block, &stack, i as u32);
                     let v = self.emit(
                         block,
                         Opcode::SymbolValue,
                         vec![],
                         AuxData::SymbolRef(*sym),
-                        effectful(),
-                        None,
+                        runtime_call_flags(),
+                        Some(fs),
                         IRType::TOP,
                     );
                     stack.push(v.expect("SymbolValue has a result"));
                 }
                 Instr::StoreGlobal(sym) => {
-                    let v = stack.pop().ok_or(BuildError::Unsupported("stack underflow (StoreGlobal)"))?;
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let v = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (StoreGlobal)"))?;
                     self.emit_effect(
                         block,
                         Opcode::SetSymbolValue,
                         vec![v],
                         AuxData::SymbolRef(*sym),
-                        None,
+                        Some(fs),
                     );
                 }
                 Instr::Pop => {
-                    stack.pop().ok_or(BuildError::Unsupported("stack underflow (Pop)"))?;
+                    stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (Pop)"))?;
                 }
                 Instr::ClearMv => {
                     // Reset multiple-values state; no operand effect (bliss-mzp).
-                    self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, None);
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, Some(fs));
                 }
                 Instr::PushBlock { sp_restore, .. } | Instr::PushTag { sp_restore, .. } => {
                     if *sp_restore != 0 {
@@ -522,7 +581,9 @@ impl<'a> Builder<'a> {
                 }
                 Instr::PopHandler => {}
                 Instr::Dup => {
-                    let v = *stack.last().ok_or(BuildError::Unsupported("stack underflow (Dup)"))?;
+                    let v = *stack
+                        .last()
+                        .ok_or(BuildError::Unsupported("stack underflow (Dup)"))?;
                     stack.push(v);
                 }
                 Instr::CallNamed { sym, nargs } => {
@@ -540,6 +601,8 @@ impl<'a> Builder<'a> {
                             metadata,
                             *nargs,
                             policy,
+                            self.inline_options
+                                .call_site_is_hot(self.root_symbol, i as u32),
                             self.inline_depth,
                             self.remaining_inline_budget,
                             self.inline_options.config,
@@ -563,7 +626,12 @@ impl<'a> Builder<'a> {
                             args,
                             results: vec![],
                             aux: AuxData::CallTarget(*sym),
-                            flags: InstFlags { effectful: true, call: true, safepoint: true, ..InstFlags::default() },
+                            flags: InstFlags {
+                                effectful: true,
+                                call: true,
+                                safepoint: true,
+                                ..InstFlags::default()
+                            },
                             targets: vec![],
                             frame_state: Some(fs),
                             source_pos: 0,
@@ -584,14 +652,18 @@ impl<'a> Builder<'a> {
                     break;
                 }
                 Instr::BrIfFalse(t) => {
-                    let cond = stack.pop().ok_or(BuildError::Unsupported("stack underflow (BrIfFalse)"))?;
+                    let cond = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (BrIfFalse)"))?;
                     let false_blk = self.block_of[&(*t as usize)];
                     let true_blk = self.block_of[&end]; // fall-through
                     term = Some(Term::Brif(cond, true_blk, false_blk));
                     break;
                 }
                 Instr::BrIfTrue(t) => {
-                    let cond = stack.pop().ok_or(BuildError::Unsupported("stack underflow (BrIfTrue)"))?;
+                    let cond = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (BrIfTrue)"))?;
                     let true_blk = self.block_of[&(*t as usize)];
                     let false_blk = self.block_of[&end]; // fall-through
                     term = Some(Term::Brif(cond, true_blk, false_blk));
@@ -678,7 +750,10 @@ impl<'a> Builder<'a> {
             let phi = self
                 .f
                 .add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
-            self.incomplete_phis.entry(block).or_default().push((var, phi));
+            self.incomplete_phis
+                .entry(block)
+                .or_default()
+                .push((var, phi));
             self.current_def.insert((var, block), phi);
             return phi;
         }
@@ -804,7 +879,10 @@ impl<'a> Builder<'a> {
             }
         }
         for i in 0..self.f.frame_states.len() {
-            let fs = self.f.frame_states.get_mut(crate::t2::frame_state::FrameStateId(i as u32));
+            let fs = self
+                .f
+                .frame_states
+                .get_mut(crate::t2::frame_state::FrameStateId(i as u32));
             for scope in fs.scopes.iter_mut() {
                 for src in scope.locals.iter_mut().chain(scope.stack.iter_mut()) {
                     if let ValueSource::Value { value, .. } = src {
@@ -863,12 +941,58 @@ impl<'a> Builder<'a> {
         bcp: usize,
         block_start: usize,
     ) -> Result<bool, BuildError> {
+        if matches!(intrinsic, IntrinsicId::Car | IntrinsicId::Cdr) {
+            // Keep the type proof as an ordinary SSA guard.  CAR and CDR use
+            // the same proof identity, so the general dominator-based guard
+            // pass can reuse a CAR proof for a later CDR (and vice versa).
+            // NIL deliberately takes the deopt path: CL defines (CAR NIL) and
+            // (CDR NIL) as NIL, which the generic semantic path preserves.
+            let fs = self.build_frame_state(block, stack, bcp as u32);
+            let cons = stack
+                .pop()
+                .ok_or(BuildError::Unsupported("stack underflow (CAR/CDR)"))?;
+            let guard_flags = InstFlags {
+                effectful: true,
+                guard: true,
+                ..InstFlags::default()
+            };
+            let checked_cons = self
+                .emit(
+                    block,
+                    Opcode::Guard,
+                    vec![cons],
+                    AuxData::TypeTag(IRType::of(TypeBits::CONS)),
+                    guard_flags,
+                    Some(fs),
+                    IRType::of(TypeBits::CONS),
+                )
+                .ok_or(BuildError::Unsupported("cons guard has a result"))?;
+            let opcode = if intrinsic == IntrinsicId::Car {
+                Opcode::Car
+            } else {
+                Opcode::Cdr
+            };
+            let result = self
+                .emit(
+                    block,
+                    opcode,
+                    vec![checked_cons],
+                    AuxData::None,
+                    InstFlags::default(),
+                    None,
+                    IRType::TOP,
+                )
+                .ok_or(BuildError::Unsupported("CAR/CDR has a result"))?;
+            stack.push(result);
+            return Ok(true);
+        }
+
         if intrinsic == IntrinsicId::FirstChar {
-            // Inline the metadata-owned body below the CL function layer.  Both
-            // layout operations are guards anchored at the original call: a
-            // wrong type, empty string, or non-ASCII representation resumes at
-            // FIRST-CHAR in T0/T1, which evaluates the full Lisp definition and
-            // returns NIL or the Unicode character as appropriate.
+            // Inline the metadata-owned body below the CL function layer.  Keep
+            // layout validation as an explicit SSA guard so the post-inlining
+            // dominator pass can merge an equivalent guard cloned from another
+            // callee.  Both raw string operations consume the refined value and
+            // never revalidate its layout themselves.
             let fs = self.build_frame_state(block, stack, bcp as u32);
             let string = stack
                 .pop()
@@ -878,14 +1002,29 @@ impl<'a> Builder<'a> {
                 guard: true,
                 ..InstFlags::default()
             };
+            let checked_string = self
+                .emit(
+                    block,
+                    Opcode::Guard,
+                    vec![string],
+                    AuxData::StringLayout,
+                    guard_flags,
+                    Some(fs),
+                    IRType::of(TypeBits::STRING),
+                )
+                .ok_or(BuildError::Unsupported("StringLayout guard has a result"))?;
+            // This faithfully represents the source LENGTH operation.  Its
+            // result is unused because CHAR-at-zero's bounds guard subsumes the
+            // positive-length branch; ordinary deopt-aware DCE removes the pure
+            // load in the production pipeline.
             let _byte_length = self
                 .emit(
                     block,
                     Opcode::StringByteLength,
-                    vec![string],
+                    vec![checked_string],
                     AuxData::None,
-                    guard_flags,
-                    Some(fs),
+                    InstFlags::default(),
+                    None,
                     IRType::of(TypeBits::FIXNUM),
                 )
                 .ok_or(BuildError::Unsupported("StringByteLength has a result"))?;
@@ -904,7 +1043,7 @@ impl<'a> Builder<'a> {
                 .emit(
                     block,
                     Opcode::StringAsciiCharAt,
-                    vec![string, zero],
+                    vec![checked_string, zero],
                     AuxData::None,
                     guard_flags,
                     Some(fs),
@@ -927,7 +1066,9 @@ impl<'a> Builder<'a> {
                 let Instr::Const(cidx) = self.bf.code[bcp - 1] else {
                     return Ok(false);
                 };
-                let Some(type_name) = self.bf.constants
+                let Some(type_name) = self
+                    .bf
+                    .constants
                     .get(cidx as usize)
                     .copied()
                     .filter(|v| v.is_symbol())
@@ -944,53 +1085,76 @@ impl<'a> Builder<'a> {
                 }
             }
             IntrinsicId::Eq | IntrinsicId::Null => None,
+            IntrinsicId::Car | IntrinsicId::Cdr => {
+                unreachable!("handled as guarded field loads above")
+            }
             IntrinsicId::FirstChar => unreachable!("handled as an inline body above"),
         };
 
         if let Some(bits) = type_bits {
             if intrinsic == IntrinsicId::TypepConstant {
                 // Its ConstSymbol is now dead and the ordinary DCE pass removes it.
-                stack.pop().ok_or(BuildError::Unsupported("stack underflow (TYPEP type)"))?;
+                stack
+                    .pop()
+                    .ok_or(BuildError::Unsupported("stack underflow (TYPEP type)"))?;
             }
-            let x = stack.pop().ok_or(BuildError::Unsupported("stack underflow (type predicate)"))?;
-            let result = self.emit(
-                block,
-                Opcode::TypeCheck,
-                vec![x],
-                AuxData::TypeTag(IRType::of(bits)),
-                InstFlags::default(),
-                None,
-                IRType::TOP,
-            ).ok_or(BuildError::Unsupported("TypeCheck has a result"))?;
+            let x = stack
+                .pop()
+                .ok_or(BuildError::Unsupported("stack underflow (type predicate)"))?;
+            let result = self
+                .emit(
+                    block,
+                    Opcode::TypeCheck,
+                    vec![x],
+                    AuxData::TypeTag(IRType::of(bits)),
+                    InstFlags::default(),
+                    None,
+                    IRType::TOP,
+                )
+                .ok_or(BuildError::Unsupported("TypeCheck has a result"))?;
             stack.push(result);
             return Ok(true);
         }
 
         let args = match intrinsic {
             IntrinsicId::Null => {
-                let x = stack.pop().ok_or(BuildError::Unsupported("stack underflow (NULL)"))?;
+                let x = stack
+                    .pop()
+                    .ok_or(BuildError::Unsupported("stack underflow (NULL)"))?;
                 vec![x, self.emit_const_nil(block)]
             }
             IntrinsicId::Eq => {
-                let b = stack.pop().ok_or(BuildError::Unsupported("stack underflow (EQ rhs)"))?;
-                let a = stack.pop().ok_or(BuildError::Unsupported("stack underflow (EQ lhs)"))?;
+                let b = stack
+                    .pop()
+                    .ok_or(BuildError::Unsupported("stack underflow (EQ rhs)"))?;
+                let a = stack
+                    .pop()
+                    .ok_or(BuildError::Unsupported("stack underflow (EQ lhs)"))?;
                 vec![a, b]
             }
-            IntrinsicId::Consp | IntrinsicId::Symbolp | IntrinsicId::Integerp
-            | IntrinsicId::TypepConstant | IntrinsicId::Stringp => {
+            IntrinsicId::Consp
+            | IntrinsicId::Symbolp
+            | IntrinsicId::Integerp
+            | IntrinsicId::TypepConstant
+            | IntrinsicId::Stringp => {
                 unreachable!("handled as TypeCheck above")
+            }
+            IntrinsicId::Car | IntrinsicId::Cdr => {
+                unreachable!("handled as guarded field loads above")
             }
             IntrinsicId::FirstChar => unreachable!("handled as an inline body above"),
         };
-        let result = self.emit(
-            block,
-            Opcode::GenericEq,
-            args,
-            AuxData::None,
-            InstFlags::default(),
-            None,
-            IRType::TOP,
-        ).ok_or(BuildError::Unsupported("GenericEq has a result"))?;
+        let result = self
+            .emit(
+                block,
+                Opcode::GenericEq,
+                args,
+                AuxData::None,
+                InstFlags::default(),
+                None,
+                IRType::TOP,
+            )
+            .ok_or(BuildError::Unsupported("GenericEq has a result"))?;
         stack.push(result);
         Ok(true)
     }
@@ -1047,7 +1211,7 @@ impl<'a> Builder<'a> {
                 args,
                 results: vec![],
                 aux,
-                flags: effectful(),
+                flags: runtime_call_flags(),
                 targets: vec![],
                 frame_state,
                 source_pos: 0,
@@ -1126,9 +1290,11 @@ enum Term {
 
 // ── Free helpers for terminator InstData ────────────────────────────
 
-fn effectful() -> InstFlags {
+fn runtime_call_flags() -> InstFlags {
     InstFlags {
         effectful: true,
+        call: true,
+        safepoint: true,
         ..InstFlags::default()
     }
 }
@@ -1140,7 +1306,10 @@ fn jump(target: Block) -> InstData {
         results: vec![],
         aux: AuxData::None,
         flags: InstFlags::default(),
-        targets: vec![crate::t2::ir::BlockCall { block: target, args: vec![] }],
+        targets: vec![crate::t2::ir::BlockCall {
+            block: target,
+            args: vec![],
+        }],
         frame_state: None,
         source_pos: 0,
     }
@@ -1154,8 +1323,14 @@ fn brif(cond: Value, t: Block, f: Block) -> InstData {
         aux: AuxData::None,
         flags: InstFlags::default(),
         targets: vec![
-            crate::t2::ir::BlockCall { block: t, args: vec![] },
-            crate::t2::ir::BlockCall { block: f, args: vec![] },
+            crate::t2::ir::BlockCall {
+                block: t,
+                args: vec![],
+            },
+            crate::t2::ir::BlockCall {
+                block: f,
+                args: vec![],
+            },
         ],
         frame_state: None,
         source_pos: 0,
@@ -1198,7 +1373,14 @@ mod tests {
     use bliss_rt::value::BlissVal;
     use std::rc::Rc;
 
-    fn bf(name: &str, code: Vec<Instr>, constants: Vec<BlissVal>, n_locals: u16, arity: u16, max_stack: u16) -> BytecodeFunction {
+    fn bf(
+        name: &str,
+        code: Vec<Instr>,
+        constants: Vec<BlissVal>,
+        n_locals: u16,
+        arity: u16,
+        max_stack: u16,
+    ) -> BytecodeFunction {
         BytecodeFunction {
             code,
             constants,
@@ -1207,6 +1389,7 @@ mod tests {
             names: vec![],
             restart_cases: vec![],
             param_layout: vec![],
+            param_types: vec![],
             has_env: false,
             n_locals,
             max_stack,
@@ -1225,10 +1408,24 @@ mod tests {
     }
 
     fn has_opcode(f: &Function, b: Block, op: Opcode) -> bool {
-        f.block(b)
-            .insts
-            .iter()
-            .any(|&i| f.inst(i).opcode == op)
+        f.block(b).insts.iter().any(|&i| f.inst(i).opcode == op)
+    }
+
+    #[test]
+    fn declared_parameter_type_seeds_entry_ssa() {
+        let mut typed = bf(
+            "typed",
+            vec![Instr::LoadLocal(0), Instr::Return],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        typed.param_types = vec![DeclaredType::Fixnum];
+        let f = build_from_bytecode(&typed).expect("build declared function");
+        let parameter = f.block(f.entry()).params[0];
+        assert_eq!(f.value(parameter).ty, IRType::of(TypeBits::FIXNUM));
+        assert!(f.is_entry_param_checked(parameter));
     }
 
     #[test]
@@ -1302,13 +1499,12 @@ mod tests {
         // Both incoming edges to the merge carry exactly one argument.
         for pred in f.preds(merge) {
             let t = f.terminator(pred).unwrap();
-            let call = f
-                .inst(t)
-                .targets
-                .iter()
-                .find(|c| c.block == merge)
-                .unwrap();
-            assert_eq!(call.args.len(), 1, "edge into merge passes the joined value");
+            let call = f.inst(t).targets.iter().find(|c| c.block == merge).unwrap();
+            assert_eq!(
+                call.args.len(),
+                1,
+                "edge into merge passes the joined value"
+            );
         }
     }
 
@@ -1420,15 +1616,24 @@ mod tests {
                 Instr::CallNamed { sym: eq, nargs: 2 },
                 Instr::Return,
             ],
-            vec![], 2, 2, 2,
+            vec![],
+            2,
+            2,
+            2,
         );
         let options = InlineOptions::default().with_policy(2, InlinePolicy::NotInline);
         let f = build_from_bytecode_with_inline_options(&input, options).expect("builds");
-        let call = f.block(f.entry()).insts.iter()
+        let call = f
+            .block(f.entry())
+            .insts
+            .iter()
             .map(|&i| f.inst(i))
             .find(|d| d.opcode == Opcode::Call)
             .expect("NOTINLINE must retain the call");
-        assert!(call.frame_state.is_some(), "retained call keeps precise deopt state");
+        assert!(
+            call.frame_state.is_some(),
+            "retained call keeps precise deopt state"
+        );
         assert!(!has_opcode(&f, f.entry(), Opcode::GenericEq));
     }
 
@@ -1437,8 +1642,18 @@ mod tests {
         let null = bliss_rt::symbols::intern("NULL");
         let input = bf(
             "limited-null",
-            vec![Instr::LoadLocal(0), Instr::CallNamed { sym: null, nargs: 1 }, Instr::Return],
-            vec![], 1, 1, 1,
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed {
+                    sym: null,
+                    nargs: 1,
+                },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
         );
 
         let mut no_budget = InlineOptions::default();
@@ -1447,7 +1662,10 @@ mod tests {
         assert!(has_opcode(&f, f.entry(), Opcode::Call));
 
         let mut no_depth = InlineOptions::default();
-        no_depth.config = InlineConfig { max_depth: 0, ..InlineConfig::default() };
+        no_depth.config = InlineConfig {
+            max_depth: 0,
+            ..InlineConfig::default()
+        };
         let f = build_from_bytecode_with_inline_options(&input, no_depth).expect("builds");
         assert!(has_opcode(&f, f.entry(), Opcode::Call));
     }
@@ -1457,8 +1675,18 @@ mod tests {
         let null = bliss_rt::symbols::intern("NULL");
         let input = bf(
             "explicit-inline-null",
-            vec![Instr::LoadLocal(0), Instr::CallNamed { sym: null, nargs: 1 }, Instr::Return],
-            vec![], 1, 1, 1,
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed {
+                    sym: null,
+                    nargs: 1,
+                },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
         );
 
         let mut default_policy = InlineOptions::default();
@@ -1481,13 +1709,22 @@ mod tests {
             vec![
                 Instr::LoadLocal(0),
                 Instr::LoadLocal(1),
-                Instr::CallNamed { sym: typep, nargs: 2 },
+                Instr::CallNamed {
+                    sym: typep,
+                    nargs: 2,
+                },
                 Instr::Return,
             ],
-            vec![], 2, 2, 2,
+            vec![],
+            2,
+            2,
+            2,
         );
         let f = build_from_bytecode(&input).expect("builds");
-        let call = f.block(f.entry()).insts.iter()
+        let call = f
+            .block(f.entry())
+            .insts
+            .iter()
             .map(|&i| f.inst(i))
             .find(|d| d.opcode == Opcode::Call)
             .expect("dynamic TYPEP must stay a call");
@@ -1531,7 +1768,10 @@ mod tests {
             "BODY-INLINE-CALLER",
             vec![
                 Instr::LoadLocal(0),
-                Instr::CallNamed { sym: helper, nargs: 1 },
+                Instr::CallNamed {
+                    sym: helper,
+                    nargs: 1,
+                },
                 Instr::Return,
             ],
             vec![],
@@ -1544,7 +1784,10 @@ mod tests {
             .with_body(helper, body);
         let f = build_from_bytecode_with_inline_options(&input, options).expect("builds");
         assert!(f.block_order().iter().all(|&b| {
-            f.block(b).insts.iter().all(|&i| f.inst(i).opcode != Opcode::Call)
+            f.block(b)
+                .insts
+                .iter()
+                .all(|&i| f.inst(i).opcode != Opcode::Call)
         }));
         assert!(
             f.num_blocks() >= 5,
@@ -1562,7 +1805,10 @@ mod tests {
             "BODY-INLINE-FIRST-CHAR",
             vec![
                 Instr::LoadLocal(0),
-                Instr::CallNamed { sym: first_char, nargs: 1 },
+                Instr::CallNamed {
+                    sym: first_char,
+                    nargs: 1,
+                },
                 Instr::Return,
             ],
             vec![],
@@ -1574,7 +1820,10 @@ mod tests {
             "BODY-INLINE-FIRST-CHAR-CALLER",
             vec![
                 Instr::LoadLocal(0),
-                Instr::CallNamed { sym: helper, nargs: 1 },
+                Instr::CallNamed {
+                    sym: helper,
+                    nargs: 1,
+                },
                 Instr::Return,
             ],
             vec![],
@@ -1597,8 +1846,86 @@ mod tests {
         assert_eq!(scopes.len(), 2);
         assert_eq!(scopes[0].function, caller);
         assert_eq!(scopes[1].function, helper);
-        assert!(f.source_positions[data.source_pos as usize].inlined_at.is_some());
+        assert!(f.source_positions[data.source_pos as usize]
+            .inlined_at
+            .is_some());
         crate::t2::verify::verify(&f).expect("nested metadata verifies");
+    }
+
+    #[test]
+    fn hot_profile_inlines_body_above_small_threshold_but_hard_limits_win() {
+        let helper = bliss_rt::symbols::intern("PROFILED-LARGE-INLINE-HELPER");
+        let caller = bliss_rt::symbols::intern("PROFILED-LARGE-INLINE-CALLER");
+        let mut leaf_code = Vec::new();
+        for _ in 0..16 {
+            leaf_code.push(Instr::LoadLocal(0));
+            leaf_code.push(Instr::Pop);
+        }
+        leaf_code.extend([Instr::LoadLocal(0), Instr::Return]);
+        let leaf = Rc::new(bf(
+            "PROFILED-LARGE-INLINE-HELPER",
+            leaf_code,
+            vec![],
+            1,
+            1,
+            1,
+        ));
+        let input = bf(
+            "PROFILED-LARGE-INLINE-CALLER",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::CallNamed {
+                    sym: helper,
+                    nargs: 1,
+                },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        let base = InlineOptions::default()
+            .with_root_symbol(caller)
+            .with_body(helper, leaf);
+
+        let has_call = |f: &Function| {
+            f.block_order()
+                .iter()
+                .any(|&block| has_opcode(f, block, Opcode::Call))
+        };
+
+        let cold = build_from_bytecode_with_inline_options(&input, base.clone()).unwrap();
+        assert!(has_call(&cold), "an unprofiled large body stays a call");
+
+        let below = base.clone().with_call_site_profile(caller, 1, 7, 10);
+        let below = build_from_bytecode_with_inline_options(&input, below).unwrap();
+        assert!(
+            has_call(&below),
+            "70% is below the default 80% hot threshold"
+        );
+
+        let hot = base.clone().with_call_site_profile(caller, 1, 8, 10);
+        let hot = build_from_bytecode_with_inline_options(&input, hot).unwrap();
+        assert!(
+            !has_call(&hot),
+            "an 80% site may inline a larger eligible body"
+        );
+        crate::t2::verify::verify(&hot).expect("profile-guided inline verifies");
+
+        let mut no_budget = base.clone().with_call_site_profile(caller, 1, 10, 10);
+        no_budget.config.node_budget = 33;
+        let no_budget = build_from_bytecode_with_inline_options(&input, no_budget).unwrap();
+        assert!(
+            has_call(&no_budget),
+            "hotness must not override the growth budget"
+        );
+
+        let notinline = base
+            .with_call_site_profile(caller, 1, 10, 10)
+            .with_policy(1, InlinePolicy::NotInline);
+        let notinline = build_from_bytecode_with_inline_options(&input, notinline).unwrap();
+        assert!(has_call(&notinline), "NOTINLINE must override hotness");
     }
 
     #[test]
@@ -1617,7 +1944,10 @@ mod tests {
             "BODY-INLINE-LIMITED-CALLER",
             vec![
                 Instr::LoadLocal(0),
-                Instr::CallNamed { sym: helper, nargs: 1 },
+                Instr::CallNamed {
+                    sym: helper,
+                    nargs: 1,
+                },
                 Instr::Return,
             ],
             vec![],
@@ -1632,17 +1962,26 @@ mod tests {
         let mut budget = base.clone();
         budget.config.node_budget = 0;
         let f = build_from_bytecode_with_inline_options(&input, budget).unwrap();
-        assert!(f.block_order().iter().any(|&b| has_opcode(&f, b, Opcode::Call)));
+        assert!(f
+            .block_order()
+            .iter()
+            .any(|&b| has_opcode(&f, b, Opcode::Call)));
 
         let notinline = base.clone().with_policy(1, InlinePolicy::NotInline);
         let f = build_from_bytecode_with_inline_options(&input, notinline).unwrap();
-        assert!(f.block_order().iter().any(|&b| has_opcode(&f, b, Opcode::Call)));
+        assert!(f
+            .block_order()
+            .iter()
+            .any(|&b| has_opcode(&f, b, Opcode::Call)));
 
         let recursive = Rc::new(bf(
             "BODY-INLINE-LIMITED",
             vec![
                 Instr::LoadLocal(0),
-                Instr::CallNamed { sym: helper, nargs: 1 },
+                Instr::CallNamed {
+                    sym: helper,
+                    nargs: 1,
+                },
                 Instr::Return,
             ],
             vec![],
@@ -1654,6 +1993,9 @@ mod tests {
             .with_root_symbol(caller)
             .with_body(helper, recursive);
         let f = build_from_bytecode_with_inline_options(&input, recursive_options).unwrap();
-        assert!(f.block_order().iter().any(|&b| has_opcode(&f, b, Opcode::Call)));
+        assert!(f
+            .block_order()
+            .iter()
+            .any(|&b| has_opcode(&f, b, Opcode::Call)));
     }
 }

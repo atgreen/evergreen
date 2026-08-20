@@ -6,6 +6,7 @@ use bliss_compiler::macroexpand::{
 };
 use bliss_compiler::reader;
 use bliss_rt::error::BlissError;
+use bliss_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
 use bliss_rt::object::{ConsCell, ObjectHeader, RatioData, type_id};
@@ -17,7 +18,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Once, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Once, Weak};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::thread::ThreadId;
 
@@ -354,6 +355,13 @@ impl Drop for Arena {
 thread_local! {
     static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
 }
+
+/// Bytecode compiler-macro expanders live in bliss-compiler's Send + Sync
+/// global callback table. Keep weak handles here so the evaluator GC scanner
+/// can relocate their literal pools without retaining obsolete redefinitions.
+static LOADED_COMPILER_MACRO_FUNCTIONS: LazyLock<
+    Mutex<Vec<Weak<Mutex<bliss_rt::bytecode::BytecodeFunction>>>>,
+> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn arena_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
     ARENA.with(|a| a.borrow_mut().alloc_cons(car, cdr))
@@ -795,6 +803,9 @@ struct MacroDef {
     params_form: BlissVal,
     body: BlissVal,
     captured_frame: Rc<RefCell<EnvFrame>>,
+    /// Source-free BFASL macros execute this pre-lowered expander. Source and
+    /// lexical MACROLET definitions retain the ordinary body representation.
+    bytecode: Option<Rc<RefCell<bliss_rt::bytecode::BytecodeFunction>>>,
 }
 
 /// A registered SETF-expander.
@@ -996,6 +1007,47 @@ struct MacroFnCacheEntry {
 /// Register a global (top-level DEFMACRO) macro.
 fn global_macro_insert(name: String, def: MacroDef) {
     GLOBAL_MACROS.with(|m| m.borrow_mut().insert(name, def));
+}
+
+fn install_loaded_macro(
+    name: BlissVal,
+    function: Rc<bliss_rt::bytecode::BytecodeFunction>,
+    env: &Env,
+) {
+    install_evaluator_global_root_scanner();
+    global_macro_insert(
+        sym_name(name),
+        MacroDef {
+            params_form: NIL,
+            body: NIL,
+            captured_frame: Rc::clone(&env.frame),
+            bytecode: Some(Rc::new(RefCell::new((*function).clone()))),
+        },
+    );
+}
+
+fn install_loaded_compiler_macro(
+    name: BlissVal,
+    function: Rc<bliss_rt::bytecode::BytecodeFunction>,
+) {
+    install_evaluator_global_root_scanner();
+    let function = Arc::new(Mutex::new((*function).clone()));
+    LOADED_COMPILER_MACRO_FUNCTIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(Arc::downgrade(&function));
+    compiler_macroexpand::define_compiler_macro(
+        name,
+        Arc::new(move |form, _macro_env| {
+            let (_, args) = cp(form);
+            let function = function
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let mut env = Env::new_for_macro_expansion(false);
+            bytecode::run(Rc::new(function), &list_to_vec(args), NIL, &mut env)
+        }),
+    );
 }
 
 /// Remove a global macro (FMAKUNBOUND / redefinition as a function).
@@ -2400,6 +2452,11 @@ fn visit_macro_def_roots(
 ) {
     visit(&mut def.params_form);
     visit(&mut def.body);
+    if let Some(function) = &def.bytecode {
+        for constant in &mut function.borrow_mut().constants {
+            visit(constant);
+        }
+    }
     visit_env_frame_roots(&def.captured_frame, state, visit);
 }
 
@@ -2535,15 +2592,32 @@ fn visit_frozen_env_frame_roots(
     }
 }
 
-fn frozen_macro_captures() -> &'static Mutex<Vec<Weak<Mutex<FrozenMacroCapture>>>> {
-    static CAPTURES: std::sync::OnceLock<Mutex<Vec<Weak<Mutex<FrozenMacroCapture>>>>> =
-        std::sync::OnceLock::new();
-    CAPTURES.get_or_init(|| Mutex::new(Vec::new()))
+fn frozen_macro_captures()
+-> &'static OrderedMutex<Vec<Weak<OrderedMutex<FrozenMacroCapture>>>> {
+    static CAPTURES: std::sync::OnceLock<
+        OrderedMutex<Vec<Weak<OrderedMutex<FrozenMacroCapture>>>>,
+    > = std::sync::OnceLock::new();
+    CAPTURES.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            18,
+            "evaluator frozen macro GC roots",
+            Vec::new(),
+        )
+    })
 }
 
-fn register_frozen_macro_capture(capture: FrozenMacroCapture) -> Arc<Mutex<FrozenMacroCapture>> {
+fn register_frozen_macro_capture(
+    capture: FrozenMacroCapture,
+) -> Arc<OrderedMutex<FrozenMacroCapture>> {
+    static NEXT_CAPTURE_ORDER: AtomicU64 = AtomicU64::new(1);
     install_evaluator_global_root_scanner();
-    let capture = Arc::new(Mutex::new(capture));
+    let capture = Arc::new(OrderedMutex::new(
+        LockLevel::ExecutionObject,
+        NEXT_CAPTURE_ORDER.fetch_add(1, AtomicOrdering::Relaxed),
+        "frozen macro capture",
+        capture,
+    ));
     let mut captures = frozen_macro_captures()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2615,6 +2689,22 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
         }
         for expansion in capture.symbol_macros.values_mut() {
             visit(expansion);
+        }
+    }
+
+    let mut loaded_compiler_macros = LOADED_COMPILER_MACRO_FUNCTIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loaded_compiler_macros.retain(|weak| weak.strong_count() != 0);
+    for weak in loaded_compiler_macros.iter() {
+        let Some(function) = weak.upgrade() else {
+            continue;
+        };
+        let mut function = function
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for constant in &mut function.constants {
+            visit(constant);
         }
     }
 }
@@ -3138,10 +3228,17 @@ impl Env {
 
 // ── Live tree-walker environment roots (bliss-6b2.3) ─────────────
 
-fn live_env_roots() -> &'static Mutex<HashMap<ThreadId, Vec<usize>>> {
-    static ROOTS: std::sync::OnceLock<Mutex<HashMap<ThreadId, Vec<usize>>>> =
+fn live_env_roots() -> &'static OrderedMutex<HashMap<ThreadId, Vec<usize>>> {
+    static ROOTS: std::sync::OnceLock<OrderedMutex<HashMap<ThreadId, Vec<usize>>>> =
         std::sync::OnceLock::new();
-    ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
+    ROOTS.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            19,
+            "live evaluator environment GC roots",
+            HashMap::new(),
+        )
+    })
 }
 
 fn scan_live_env_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
@@ -5562,45 +5659,47 @@ fn load_pathname_value(path: &str) -> Option<BlissVal> {
         .map(|(pathname, _)| pathname)
 }
 
-/// Load a verified `.bfasl` compiled unit (spec §6.11, bliss-lb6.6): verify the
-/// header/version/checksum, then evaluate its top-level forms so the defined
-/// functions install into their symbol function cells and tier normally (R6.67).
+/// Load a verified `.bfasl` compiled unit (spec §6.11). A BYTECODE_UNIT is
+/// authoritative and executes without invoking the source reader or
+/// macroexpander. TOPLEVEL_FORMS is accepted only for legacy artifacts that do
+/// not contain a BBU; a malformed BBU never falls back to source.
 fn load_bfasl_into_env(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
     let unit = bliss_rt::bfasl::load(bytes)
         .map_err(|e| BlissError::FileError(format!("invalid .bfasl: {e}")))?;
+    if let Some(bbu) = unit.section(bliss_rt::bfasl::section::BYTECODE_UNIT) {
+        return with_eval_context(env, EvalContext::Load, |env| bytecode::load_bbu(bbu, env));
+    }
     let forms = unit
         .section(bliss_rt::bfasl::section::TOPLEVEL_FORMS)
-        .ok_or_else(|| BlissError::FileError("bfasl: missing TOPLEVEL_FORMS section".into()))?;
+        .ok_or_else(|| {
+            BlissError::FileError(
+                "bfasl: missing authoritative BYTECODE_UNIT (and no legacy TOPLEVEL_FORMS)"
+                    .into(),
+            )
+        })?;
     let src = String::from_utf8_lossy(forms).into_owned();
     with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&src, env))
 }
 
-/// Serialize a source unit to a `.bfasl` byte image (bliss-lb6.6). The portable
-/// code payload is the classfile-like `BYTECODE_UNIT` section; `TOPLEVEL_FORMS`
-/// is retained as the active compatibility loader path until BBU installation
-/// is implemented.
-fn build_bfasl_from_source(source: &str, src_path: &str, env: &mut Env) -> Vec<u8> {
-    let bytecode_unit = match read_forms_for_compile(source, env) {
-        Ok(forms) => bytecode::build_bbu_from_forms(&forms, src_path, source, env),
-        Err(e) => {
-            if std::env::var_os("BLISS_BFASL_TRACE").is_some() {
-                eprintln!("[bfasl] bytecode pre-pass failed for {src_path}: {e}");
-            }
-            bytecode::build_bbu_from_forms(&[], src_path, source, env)
-        }
-    };
-    bliss_rt::bfasl::BfaslBuilder::new()
+/// Compile a source unit to a source-independent `.bfasl` byte image. New
+/// writers emit only the authoritative BBU plus source/debug metadata; if any
+/// load-time form cannot be represented as bytecode, compilation fails rather
+/// than producing a hybrid artifact.
+fn build_bfasl_from_source(
+    source: &str,
+    src_path: &str,
+    env: &mut Env,
+) -> Result<Vec<u8>, BlissError> {
+    let forms = read_forms_for_compile(source, env)?;
+    let bytecode_unit = bytecode::build_bbu_from_forms(&forms, src_path, source, env)?;
+    Ok(bliss_rt::bfasl::BfaslBuilder::new()
         .content_hash(bliss_rt::bfasl::content_hash(source.as_bytes()))
         .section(bliss_rt::bfasl::section::BYTECODE_UNIT, bytecode_unit)
-        .section(
-            bliss_rt::bfasl::section::TOPLEVEL_FORMS,
-            source.as_bytes().to_vec(),
-        )
         .section(
             bliss_rt::bfasl::section::SOURCE_MAP,
             src_path.as_bytes().to_vec(),
         )
-        .build()
+        .build())
 }
 
 /// True if `name` (a module string, matched case-insensitively) is already in
@@ -9168,6 +9267,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     env.current_package = saved_package.clone();
                     env.define_local("*PACKAGE*", package_object(&saved_package));
                 }
+                let image = image?;
                 // Create the output directory if needed. ASDF's output-translations
                 // route fasls into a per-implementation cache tree whose directories
                 // may not exist yet; real CL relies on ASDF pre-creating them, but
@@ -9264,6 +9364,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "BLISS-EXT:FUNCTION-TIER" => {
                 let (f_form, _) = cp(cdr);
                 let d = eval_form(f_form, env)?;
+                bytecode::poll_background_compilation();
                 return Ok(resolve_tiered_fn(d)
                     .map(|f| BlissVal::from_fixnum(bliss_rt::function::tier(f) as i64))
                     .unwrap_or(NIL));
@@ -13586,6 +13687,7 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             params_form,
             body,
             captured_frame: Rc::clone(&env.frame),
+            bytecode: None,
         },
     );
     Ok(name_form)
@@ -13604,6 +13706,7 @@ fn eval_define_setf_expander(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, B
             params_form,
             body,
             captured_frame: Rc::clone(&env.frame),
+            bytecode: None,
         }),
     );
     Ok(name_form)
@@ -14094,6 +14197,14 @@ fn mx_local_fns(defs: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
 fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
     let arg_list = list_to_vec(args);
+    if let Some(function) = &mdef.bytecode {
+        return bytecode::run(
+            Rc::new(function.borrow().clone()),
+            &arg_list,
+            NIL,
+            &mut child_env,
+        );
+    }
     // Building the macroexpand environment walks every frame and re-registers
     // *all* global macros into bliss-compiler's macro table (with fresh handles
     // and frozen frame snapshots). That is only needed to satisfy an
@@ -14284,6 +14395,7 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 params_form,
                 body: macro_body,
                 captured_frame: Rc::clone(&env.frame),
+                bytecode: None,
             },
         );
     }
@@ -14872,8 +14984,18 @@ fn apply_function(
         let mut items = Vec::with_capacity(args.len() + 1);
         items.push(roots.root(fn_val.get()));
         for arg in &args {
-            let quoted_arg = roots.root(arena_cons(arg.get(), NIL));
-            items.push(roots.root(arena_cons(quote_sym, quoted_arg.get())));
+            // Keywords are self-evaluating and several operator-position
+            // builtin parsers inspect the raw argument form to recognize &key
+            // pairs (SORT :KEY, MEMBER :TEST, MAKE-PATHNAME, ...). Quoting a
+            // keyword produced `(QUOTE :KEY)`, which evaluates equivalently but
+            // hid it from those parsers. Preserve keyword forms directly while
+            // quoting every other already-evaluated value.
+            if is_keyword_arg(arg.get()) {
+                items.push(roots.root(arg.get()));
+            } else {
+                let quoted_arg = roots.root(arena_cons(arg.get(), NIL));
+                items.push(roots.root(arena_cons(quote_sym, quoted_arg.get())));
+            }
         }
         let form_items: Vec<_> = items.iter().map(|item| item.get()).collect();
         let form = vec_to_list(&form_items);
@@ -14904,6 +15026,22 @@ fn apply_function(
     // or a #' on a global defun. Call it by its own lambda list and body.
     if fn_val.is_heap_object() && bliss_rt::function::is_interpreted_function(fn_val) {
         bliss_rt::function::record_invocation(fn_val);
+        // Function-object calls participate in the same tiering dispatch as
+        // operator-position symbol calls. ASDF commonly retains a function
+        // object and invokes it through FUNCALL/MAP; merely bumping FnMeta here
+        // left such hot functions permanently at tier 0 even when bytecode was
+        // registered for their global name.
+        let function_name = bliss_rt::function::name(fn_val);
+        if function_name.is_symbol() {
+            if let Some(result) = bytecode::call_registered(
+                function_name.as_symbol_index(),
+                args,
+                fn_val,
+                env,
+            ) {
+                return result;
+            }
+        }
         let params_form = bliss_rt::function::lambda_list(fn_val);
         let body = bliss_rt::function::body(fn_val);
         return eval_lambda_call(env, params_form, body, args, Rc::clone(&env.frame));
@@ -14970,9 +15108,15 @@ fn is_builtin_function(name: &str) -> bool {
             | "SYMBOL-VALUE" | "SYMBOL-FUNCTION"
             | "SYMBOL-PACKAGE" | "SYMBOL-PLIST" | "MAKE-SYMBOL" | "GENSYM" | "GENTEMP"
             | "INTERN" | "FIND-SYMBOL" | "FIND-PACKAGE" | "PACKAGE-NAME" | "PACKAGEP"
+            | "MAKE-PACKAGE" | "PACKAGE-NAMES" | "PACKAGE-NICKNAMES"
+            | "PACKAGE-SHADOWING-SYMBOLS" | "PACKAGE-USED-BY-LIST" | "PACKAGE-USE-LIST"
+            | "PACKAGE-SYMBOLS"
+            | "USE-PACKAGE" | "UNUSE-PACKAGE" | "RENAME-PACKAGE" | "DELETE-PACKAGE"
+            | "EXPORT" | "UNEXPORT" | "IMPORT" | "SHADOWING-IMPORT" | "SHADOW"
+            | "UNINTERN"
             | "BOUNDP" | "FBOUNDP" | "FDEFINITION" | "MAKUNBOUND" | "FMAKUNBOUND"
             | "SET" | "FUNCTIONP" | "COMPILED-FUNCTION-P" | "SPECIAL-OPERATOR-P"
-            | "COERCE" | "TYPE-OF" | "TYPEP" | "SUBTYPEP"
+            | "COERCE" | "TYPE-OF" | "TYPEP" | "SUBTYPEP" | "DOCUMENTATION"
             // Hash tables
             | "MAKE-HASH-TABLE" | "GETHASH" | "REMHASH" | "CLRHASH" | "MAPHASH"
             | "HASH-TABLE-COUNT" | "HASH-TABLE-P" | "HASH-TABLE-KEYS" | "HASH-TABLE-VALUES"
@@ -16402,6 +16546,7 @@ mod env_gc_root_tests {
                 params_form: marker(6),
                 body: marker(7),
                 captured_frame: Rc::clone(&parent),
+                bytecode: None,
             },
         );
         env.setf_expanders.borrow_mut().insert(
@@ -16410,6 +16555,7 @@ mod env_gc_root_tests {
                 params_form: marker(8),
                 body: marker(9),
                 captured_frame: Rc::clone(&parent),
+                bytecode: None,
             }),
         );
         env.setf_expanders
@@ -16557,6 +16703,7 @@ mod env_gc_root_tests {
                 params_form: marker(3),
                 body: marker(4),
                 captured_frame: Rc::clone(&parent.frame),
+                bytecode: None,
             },
         );
 
@@ -16577,6 +16724,7 @@ mod env_gc_root_tests {
                 params_form: marker(8),
                 body: marker(9),
                 captured_frame: child_frame,
+                bytecode: None,
             },
         );
 
@@ -16712,6 +16860,7 @@ mod transient_shadow_root_tests {
                     params_form: marker(0),
                     body: marker(1),
                     captured_frame: Rc::clone(&frame),
+                    bytecode: None,
                 },
             );
         });

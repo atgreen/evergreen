@@ -22,18 +22,29 @@ packages that re-export the corresponding Bliss symbols.
 
 ---
 
-## 9.2  Threading Extensions (`SB-THREAD` Compatibility)
+## 9.2  Native Threads and Fibers (`SB-THREAD` Compatibility)
 
-**R9.04** Bliss MUST provide the following threading API in `BLISS-THREADS`,
-re-exported via `SB-THREAD`.
+**Design decision (2026-08-20).** Bliss adopts the scheduler-group and fiber
+lifecycle shape described by the SBCL Fibers proposal, but deliberately uses a
+JVM-style two-level public model: OS-backed platform/carrier threads and
+lightweight fibers are separate, exposed object types. This preserves honest
+resource and blocking semantics—code can tell whether it owns an OS thread or
+a schedulable fiber—while still allowing carrier introspection. It rejects the
+earlier design in which `MAKE-THREAD` secretly returned a managed fiber.
 
-### 9.2.1  Thread Lifecycle
+**R9.04** Bliss MUST expose OS-backed platform/carrier threads through the
+`BLISS-THREAD` package and lightweight managed fibers through the distinct
+`BLISS-FIBER` package. `BLISS-THREADS` is a deprecated nickname for
+`BLISS-THREAD`. `SB-THREAD` re-exports the compatible native-thread and
+synchronisation symbols; it MUST NOT make a fiber appear to be an OS thread.
+
+### 9.2.1  Native/Carrier Thread Lifecycle
 
 ```lisp
 (make-thread function &key name arguments ephemeral)
   ;; function   — designator for a function (APPLY'd with ARGUMENTS)
   ;; name       — string or NIL; ephemeral — if T, runtime MAY auto-reap
-  ;; Returns → thread (D9.01).  Thread-safety: safe; allocates under GC-safe state.
+  ;; Returns → native thread (D9.01), backed one-to-one by an OS thread.
 
 (join-thread thread &key default timeout)
   ;; Blocks until THREAD terminates.  timeout — real seconds or NIL.
@@ -46,10 +57,87 @@ re-exported via `SB-THREAD`.
 (abort-thread &optional cond) ;; Cleanly unwinds the calling thread.
 ```
 
-**Special variables:** `*current-thread*` (bound per-thread, read-only),
-`(all-threads)` → list of live thread objects.
+**Special variables:** `*current-thread*` (bound per-native-thread, read-only),
+`(all-threads)` → a snapshot of live native thread objects. Scheduler carrier
+threads are ordinary visible native thread objects and also appear in
+`(scheduler-group-carriers group)` and `(all-threads)`.
 
-### 9.2.2  Mutexes
+`MAKE-THREAD` and `JOIN-THREAD` are native-thread operations, not compatibility
+aliases for fibers. A native thread created by `MAKE-THREAD` runs its function
+directly. A scheduler group creates additional native threads as carriers and
+multiplexes fibers over them. Per-carrier schedulers, work-stealing deques, and
+OS handles remain implementation details even though the carrier thread object
+itself is public.
+
+### 9.2.2  Fiber Lifecycle and Scheduler Groups
+
+**R9.42** Bliss MUST provide the following API in `BLISS-FIBER`:
+
+```lisp
+(make-fiber function &key name arguments stack-size initial-bindings)
+  ;; Create a fiber in :CREATED state without starting it. Returns D9.10.
+
+(fiber-yield)                         ;; Yield the current unpinned fiber.
+(fiber-sleep seconds)                 ;; Cooperative deadline wait.
+(fiber-park predicate &key timeout)   ;; Predicate or timeout; T iff predicate won.
+(fiber-join fiber &key timeout)       ;; Cooperatively wait; return entry values.
+
+(run-fibers fibers &key carrier-count idle-hook) ;; Blocking convenience API.
+(start-fibers fibers &key carrier-count idle-hook) ;; → scheduler-group (D9.11)
+(submit-fiber group fiber)            ;; Thread-safe dynamic submission.
+(finish-fibers group)                 ;; Join carriers; results in submission order.
+(fiber-group-done-p group)            ;; Non-blocking completion predicate.
+(scheduler-group-carriers group)      ;; Snapshot of exposed BLISS-THREAD objects.
+```
+
+A fiber belongs to at most one scheduler group. `START-FIBERS` creates an
+explicit group and its exposed carrier threads; `RUN-FIBERS` is equivalent to
+`START-FIBERS` followed by `FINISH-FIBERS`. `SUBMIT-FIBER` accepts work until
+finishing begins. `FINISH-FIBERS` closes submission, waits for all submitted
+fibers, shuts down and joins the group's carrier threads, and is idempotent.
+Results preserve submission order. `carrier-count` defaults to the number of
+available processors and MUST be at least one.
+
+**R9.43** Fiber pinning MUST use a balanced per-fiber counter:
+
+```lisp
+(fiber-pin &optional fiber)
+(fiber-unpin &optional fiber)
+(fiber-can-yield-p &optional fiber)
+(with-fiber-pinned ((&optional fiber)) &body body)
+*pinned-blocking-action* ; :WARN (default), :ERROR, or NIL
+```
+
+Pinning prevents unmounting/migration from the current carrier. Explicit
+`FIBER-YIELD` while pinned signals `PROGRAM-ERROR`. A fiber-aware blocking
+primitive parks an unpinned fiber without blocking its carrier. If the fiber is
+pinned, `:WARN` warns then uses the OS-blocking operation, `:ERROR` signals an
+error before blocking, and `NIL` silently uses the OS-blocking operation.
+`WITH-FIBER-PINNED` MUST unpin with `UNWIND-PROTECT` semantics.
+The bootstrap runtime maps `*PINNED-BLOCKING-ACTION*` to
+`BLISS_PINNED_BLOCKING_ACTION`; `NIL` and `NATIVE` select the silent native
+fallback spelling.
+
+**R9.44** Fiber introspection MUST include:
+
+```lisp
+(current-fiber)                    ;; Current fiber or NIL on a plain native thread.
+(list-all-fibers)                  ;; Snapshot of all non-reclaimed fiber objects.
+(fiber-state fiber)                ;; :CREATED/:RUNNABLE/:RUNNING/:SUSPENDED/:DEAD
+(fiber-name fiber)                 ;; String or NIL.
+(fiber-result fiber)               ;; Result values as a list after :DEAD.
+(fiber-error-p fiber)              ;; Whether death followed an unhandled condition.
+(fiber-alive-p fiber)              ;; State is not :DEAD.
+(fiber-carrier-thread fiber)       ;; Current/last exposed carrier, or NIL.
+(print-fiber-backtrace fiber &key stream count)
+```
+
+`PRINT-FIBER-BACKTRACE` supports `:CREATED`, `:RUNNABLE`, `:SUSPENDED`, and
+`:DEAD` fibers from their saved continuation. A running fiber MUST first be
+cooperatively brought to a safepoint or the operation signals
+`FIBER-STILL-RUNNING`; its live stack MUST NOT be walked concurrently.
+
+### 9.2.3  Mutexes
 
 ```lisp
 (make-mutex &key name)                ;; → mutex (D9.02). Non-recursive (SBCL compat).
@@ -58,7 +146,7 @@ re-exported via `SB-THREAD`.
 (with-mutex (mutex &key waitp timeout) &body body) ;; UNWIND-PROTECT wrapper.
 ```
 
-### 9.2.3  Condition Variables
+### 9.2.4  Condition Variables
 
 ```lisp
 (make-waitqueue &key name)                              ;; → waitqueue (D9.03)
@@ -67,7 +155,7 @@ re-exported via `SB-THREAD`.
 (condition-broadcast waitqueue)                          ;; Wake all waiters.
 ```
 
-### 9.2.4  Semaphores
+### 9.2.5  Semaphores
 
 ```lisp
 (make-semaphore &key name count)              ;; count — initial permits (default 0) → D9.04
@@ -77,15 +165,15 @@ re-exported via `SB-THREAD`.
 (try-semaphore semaphore &optional (n 1))     ;; Non-blocking. Returns T/NIL.
 ```
 
-### 9.2.5  Memory Barriers
+### 9.2.6  Memory Barriers
 
 ```lisp
 (barrier kind) ;; Macro. KIND ∈ {:READ :WRITE :FULL :DATA-DEPENDENCY}. Default :FULL.
 ```
 
-### 9.2.6  Atomic Operations (CAS)
+### 9.2.7  Atomic Operations (CAS)
 
-**R9.37** Bliss MUST provide SBCL-compatible atomic operations in `BLISS-THREADS`,
+**R9.37** Bliss MUST provide SBCL-compatible atomic operations in `BLISS-THREAD`,
 re-exported via `SB-EXT` and `SB-THREAD`.
 
 ```lisp
@@ -114,7 +202,7 @@ offset at compile time. For special variables, CAS operates on the TLS cell (§2
 with fallback to the global cell. Overflow from fixnum arithmetic in `ATOMIC-INCF`/
 `ATOMIC-DECF` signals `ARITHMETIC-ERROR` (not undefined behaviour).
 
-### 9.2.7  Recursive Locks
+### 9.2.8  Recursive Locks
 
 **R9.38** Bliss MUST provide recursive mutexes compatible with SBCL's `sb-thread:make-lock`.
 
@@ -137,9 +225,9 @@ with fallback to the global cell. Overflow from fixnum arithmetic in `ATOMIC-INC
 
 **D9.09 — Recursive-Lock:** `header(8) | name(8) | owner:AtomicU64(8) | state:AtomicU32(4) | recursion-count:u32(4) | futex(4) | pad(4)` — 40 bytes.
 
-### 9.2.8  Data Structures
+### 9.2.9  Data Structures
 
-**D9.01 — Thread:** `header(8) | name(8) | state:AtomicU8(1) | ephemeral(1) | pad(6) | os-handle(8) | result(8) | mailbox-head:AtomicPtr(8) | join-waiters:AtomicPtr(8)` — 56 bytes. State ∈ {:BORN :RUNNING :DEAD :ABORTED}.
+**D9.01 — Native Thread:** `header(8) | name(8) | state:AtomicU8(1) | ephemeral(1) | carrier(1) | pad(5) | os-handle(8) | result(8) | mailbox-head:AtomicPtr(8) | join-waiters:AtomicPtr(8)` — 56 bytes. State ∈ {:BORN :RUNNING :BLOCKED :NATIVE :DEAD :ABORTED}. `carrier` identifies a thread owned by a scheduler group; it does not change object identity or visibility.
 
 **D9.02 — Mutex:** `header(8) | name(8) | owner:AtomicU64(8) | state:AtomicU32(4) | futex(4)` — 32 bytes. State: 0=free, 1=locked, 2=contended.
 
@@ -149,11 +237,22 @@ with fallback to the global cell. Overflow from fixnum arithmetic in `ATOMIC-INC
 
 **D9.05 — Semaphore-Notification:** `header(8) | status:AtomicU8(1)` — 16 bytes (padded).
 
-### 9.2.9  Compatibility: Bliss vs SBCL
+**D9.10 — Fiber:** A GC-managed descriptor containing identity/name, lifecycle
+state, entry and result, control/value stack, saved continuation, dynamic TLS
+bindings, handler/restart/unwind state, pin count, wake predicate/deadline,
+published SP/FP, scheduler-group membership, and current/last carrier thread.
+
+**D9.11 — Fiber Scheduler Group:** A GC-managed lifecycle handle containing its
+exposed carrier-thread vector, submitted fibers in stable order, active count,
+submission-closed flag, and join notification. Each carrier owns an internal
+work-stealing deque and scheduler state (§13.5).
+
+### 9.2.10  Compatibility: Bliss vs SBCL
 
 | Feature | SBCL | Bliss | Divergence |
 |---------|------|-------|------------|
-| `make-thread` | `:name` only | adds `:arguments`, `:ephemeral` | superset |
+| `make-thread` | OS thread | exposed OS native/carrier thread; adds `:arguments`, `:ephemeral` | superset; never creates a fiber |
+| Fiber API | experimental SBCL proposal | `BLISS-FIBER` | separate package; JVM-style type distinction |
 | Mutex recursion | non-recursive (error) | non-recursive (error) | identical |
 | `interrupt-thread` | safe-point delivery | safepoint delivery (§2.5) | identical |
 | `destroy-thread` | `terminate-thread` | `destroy-thread` + alias | name differs |

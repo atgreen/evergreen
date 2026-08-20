@@ -1,7 +1,7 @@
 # §13 Concurrency Model
 
 **Scope:** Consolidates concurrency specification: memory model, lock
-hierarchy, lock-free structures, green-thread scheduling, GC
+hierarchy, lock-free structures, fiber scheduling, GC
 safepoint/thread-suspension interaction, async signal safety.
 Supersedes fragments in §2.11, §3.11, §5.1.5, §5.4.7, §8.8.
 
@@ -21,17 +21,17 @@ Source: `crates/bliss-rt/src/{thread,scheduler,safepoint,signal}.rs`,
 | R13.05 | A complete lock-ordering hierarchy MUST be defined spanning all subsystems; acquiring locks out of order MUST be detected in debug builds (see also R8.16). | MUST |
 | R13.06 | The lock hierarchy MUST be documented as a single total order with numeric levels; every lock in the system MUST be assigned a level. | MUST |
 | R13.07 | Symbol value cells, inline-cache (IC) patch words, and profiling counters MUST be implemented as lock-free data structures. | MUST |
-| R13.08 | The green-thread scheduler MUST use a work-stealing deque (Chase-Lev) per OS worker thread with LIFO push/pop for local work and FIFO steal for cross-worker balancing. | MUST |
-| R13.09 | The scheduler MUST support cooperative preemption via per-thread yield flags checked at safepoints; time-slice expiry MUST set the yield flag. | MUST |
+| R13.08 | The fiber scheduler MUST use a work-stealing deque (Chase-Lev) per exposed OS carrier thread with LIFO push/pop for local work and FIFO steal for cross-carrier balancing. | MUST |
+| R13.09 | The scheduler MUST support cooperative preemption via per-fiber yield flags checked at safepoints; time-slice expiry MUST set the yield flag. | MUST |
 | R13.10 | GC stop-the-world requests MUST be coordinated via the safepoint polling-page mechanism (§2.5, §3.9); no thread MUST be suspended asynchronously. | MUST |
-| R13.11 | Threads in the `Native` state (executing FFI calls) MUST be excluded from safepoint handshake; their CL stacks MUST be scannable without cooperation. | MUST |
-| R13.12 | Threads in the `Blocked` state MUST publish their stack top before blocking; the GC MUST be able to scan their stacks without waking them. | MUST |
+| R13.11 | Fibers or native threads in the `Native` state (executing FFI calls) MUST be excluded from safepoint handshake; their CL stacks MUST be scannable without cooperation. | MUST |
+| R13.12 | Fibers or native threads in the `Blocked` state MUST publish their stack top before blocking; the GC MUST be able to scan their stacks without waking them. | MUST |
 | R13.13 | All signal handlers MUST be async-signal-safe; non-trivial work MUST be deferred to the next safepoint via per-thread flags (see also R8.10). | MUST |
 | R13.14 | The runtime MUST support a `SIGUSR1` fallback to interrupt threads blocked in long-running syscalls, but the handler MUST only set a flag — it MUST NOT suspend the thread. | MUST |
 | R13.15 | The runtime MUST provide `BLISS-EXT:WITH-ATOMIC` — a macro that disables thread preemption (yield-flag checks) for its dynamic extent, to allow short critical sections without locks. | MUST |
 | R13.16 | `WITH-ATOMIC` sections MUST NOT span safepoints; the compiler MUST reject code that places a safepoint poll inside a `WITH-ATOMIC` body if the body exceeds an estimated 10 µs execution bound. | MUST |
-| R13.17 | The runtime MUST support thread-local dynamic bindings: each green thread has its own binding stack for special variables. Binding a special variable in one thread MUST NOT affect other threads. | MUST |
-| R13.18 | The runtime MUST provide `BLISS-EXT:MAKE-THREAD`, `BLISS-EXT:JOIN-THREAD`, `BLISS-EXT:THREAD-YIELD`, `BLISS-EXT:DESTROY-THREAD`, `BLISS-EXT:CURRENT-THREAD`, and `BLISS-EXT:ALL-THREADS`. | MUST |
+| R13.17 | The runtime MUST support execution-local dynamic bindings: each native thread and each fiber has its own binding stack for special variables. Binding a special variable in one execution MUST NOT affect another. | MUST |
+| R13.18 | The runtime MUST provide exposed OS-backed thread lifecycle and introspection in `BLISS-THREAD`, plus a distinct lightweight fiber lifecycle and introspection API in `BLISS-FIBER` (§9.2). A thread and a fiber MUST NOT be aliases or accepted interchangeably. | MUST |
 | R13.19 | Mutex, condition-variable, read-write-lock, and semaphore primitives MUST be provided in the `BLISS-THREAD` package. | MUST |
 | R13.20 | The runtime SHOULD detect potential deadlocks (lock-wait-graph cycle detection) in debug builds (see also R8.21). | SHOULD |
 
@@ -85,37 +85,43 @@ The JIT MUST NOT reorder memory accesses across these barriers.
 
 ### 13.3.1 Complete Lock Hierarchy
 
-All locks in the system are assigned a numeric level. A thread MUST
-acquire locks in strictly ascending level order. Acquiring a lock at
-level ≤ the highest level currently held by the thread is a violation
-and MUST trigger a `debug_assert!` panic in debug builds (R13.05,
+All locks in the system are assigned a numeric level. A thread MUST acquire
+locks in ascending level order. Locks at the same level may nest only where
+the table defines a stable sub-order, and that sub-order MUST strictly
+increase. Any other acquisition at a level less than or equal to the highest
+level currently held is a violation and MUST panic in debug builds (R13.05,
 R13.06).
 
 | Level | Lock | Protects | Subsystem | Notes |
 |-------|------|----------|-----------|-------|
 | 0 | (thread-local — no lock) | TLAB, dynamic bindings, handler bindings, SATB buffer | §2, §3 | Never contended. |
-| 1 | Per-stream mutex | Stream state and buffer | §5.4 | Ordered by `stream-id` when multiple streams needed. |
-| 2 | Per-bucket hash-table stripe; per-symbol plist RwLock | Hash-table entries; symbol property lists | §5.5, §13.4.1 | Ordered by bucket index within a table. Plist locks are rarely contended. |
-| 3 | Per-package RwLock (internal, external) | Symbol tables within a package | §5.1 | `external` before `internal` (Rule L4, §5.1.5). |
-| 4 | Global package registry RwLock | Package creation/deletion/rename | §5.1 | Must precede per-package locks (Rule L1). |
+| 1 | Per-stream mutex | Stream state and buffer | §5.4 | Ordered by `stream-id` when multiple streams are needed. |
+| 2 | Hash-table/table-stripe lock; per-symbol plist RwLock | Hash-table entries; symbol property lists | §5.5, §13.4.1 | Ordered by table identity then bucket index. |
+| 3 | Global package registries | Package creation/deletion/rename and registry lookup | §5.1 | Acquired before a package object (Rule L1). Multiple registries use their declared sub-order. |
+| 4 | Per-package RwLock | Package metadata and symbol tables | §5.1 | Multiple packages are ordered by `Package.id`. |
+| 5 | Interned-string table | Canonical string-object identities | §5.4 | Package operations may prepare string keys while holding a package lock; no allocation may occur while holding level 6 or above. |
+| 6 | Compiler/code-cache and debugger-metadata locks | Code installation, compiler registries, IC/debug trap coordination | §4, §6 | — |
+| 7 | Profiling-data locks | Sampling, allocation, instrumentation and tier-promotion data | §4.9, §6 | Ordered by the declared profiler sub-order. |
+| 8 | GC world and external-root locks | Heap state, root scanners, weak/finalizer registries, all side tables containing relocatable `BlissVal`s | §3.9 | The heap lock has sub-order 1; root side tables have larger sub-orders. |
+| 9 | Execution and scheduler registries | Native-thread/fiber registries, scheduler groups, timer/I/O registries, SWANK connection registry | §2.3, §13.7 | Must precede per-execution objects. |
+| 10 | Per-execution object locks | Native-thread/fiber state, stacks and individual connection objects | §2.3 | Ordered by stable object identity when multiple objects are needed. |
+| 11 | Image save mutex | Heap serialisation to `.bimg` | §7 | Highest level — no other lock may be acquired while held. |
 
-> **Note:** §5.1.5 defines a local hierarchy (Level 0 = PackageRegistry,
-> Level 1 = Package, Level 2 = SymbolTable) for the package subsystem.
-> The global hierarchy here (levels 3–4) supersedes those local levels.
-> The relative ordering is preserved: registry (global level 4) before
-> per-package (global level 3), matching Rule L1 in §5.1.5.
-| 5 | Compiler code-cache lock | JIT code installation, IC patching coordination | §4 | — |
-| 6 | Profiling-data lock | Tier-promotion decisions, counters rollup | §4.9 | — |
-| 7 | GC world-stop mutex | Stop-the-world coordination | §3.9 | Only the GC controller acquires this. |
-| 8 | Thread registry RwLock | Global list of all green threads | §2.3 | Must precede per-thread locks. |
-| 9 | Image save mutex | Heap serialisation to `.bimg` | §7 | Highest level — no other lock may be held. |
+The implementation names these levels in
+`bliss_rt::lock_order::LockLevel`. Long-lived cross-subsystem locks use
+`OrderedMutex` or `OrderedRwLock`. Condvar wait cells, user-visible Lisp
+locks, and a stream's private I/O mutex are protocol locks: they are assigned
+the level of their owning object but MUST be leaf acquisitions (no other
+runtime lock may be acquired while they are held). They remain ordinary Rust
+mutexes where `Condvar` interoperability is required; the owning operation
+must release the wait cell before entering another subsystem.
 
 ### 13.3.2 Multi-Package Lock Ordering (from §5.1.5)
 
 When an operation (e.g., `USE-PACKAGE`, `IMPORT`) requires write locks
 on multiple packages, the packages MUST be sorted by `Package.id`
 (ascending), deduplicated, and locked in that order (A5.03). This
-sub-ordering operates within level 3 of the global hierarchy.
+sub-ordering operates within level 4 of the global hierarchy.
 
 ### 13.3.3 Multi-Stream Lock Ordering (from §5.4.7.3)
 
@@ -133,11 +139,12 @@ within level 2.
 
 ### 13.3.5 Debug Lock-Stack (D13.01)
 
-A thread-local `Vec<(u8, &'static str)>` records all locks currently
-held. Before every lock acquisition in debug builds,
-`assert_lock_order(level, name)` checks that `level` strictly exceeds
-the top of the stack; violation triggers a panic with the held and
-requested lock names.
+A thread-local stack records `(level, sub-order, lock identity, name)` for
+each ordered lock currently held. Before acquisition in debug builds, the
+wrapper checks that the requested level is greater than the top level, or
+that it has a strictly greater non-zero sub-order within the same level.
+Violation panics with both lock names, levels, and sub-orders. Guards pop the
+stack in reverse acquisition order, including during unwinding.
 
 ### 13.3.6 Deadlock Detection (R13.20)
 
@@ -145,8 +152,9 @@ In debug builds, a background watchdog thread (interval:
 `BLISS_DEADLOCK_WATCHDOG_MS`, default 5 s) scans the lock-wait graph
 for cycles. The graph is constructed from per-thread lock stacks
 (locks held) and a `LOCK_WAITERS` table (thread → waited-for lock).
-A cycle implies deadlock; the watchdog logs thread IDs, lock names, and
-levels to stderr and the crash log directory.
+A cycle implies deadlock; the watchdog reports thread IDs, lock names,
+levels, and sub-orders to stderr. It is informational and does not abort.
+Setting the interval to `0` disables the watchdog.
 
 ---
 
@@ -204,21 +212,21 @@ walking the chain. Each node holds `buffer: [BlissVal; SATB_BUFFER_SIZE]`,
 
 ---
 
-## 13.5 Green Thread Scheduling
+## 13.5 Fiber Scheduling on Exposed Carrier Threads
 
 ### 13.5.1 Architecture Overview
 
-Each OS worker owns a Chase-Lev deque and a TLAB. Workers steal from
-random peers when idle. A global overflow queue and an I/O poller
+Each exposed carrier thread in a scheduler group owns an internal Chase-Lev
+deque and a TLAB. Carriers steal from random peers when idle. A global overflow queue and an I/O poller
 (epoll/kqueue) feed tasks into the system.
 
 ### 13.5.2 Scheduling Algorithm (A13.02)
 
 ```text
-ALGORITHM worker_loop(worker_id):
+ALGORITHM carrier_loop(carrier_id):
   loop:
     // 1. Try local deque (LIFO — cache-warm)
-    task ← worker.deque.pop()
+    task ← carrier.deque.pop()
     if task ≠ EMPTY:
       run(task)
       continue
@@ -230,7 +238,7 @@ ALGORITHM worker_loop(worker_id):
       continue
 
     // 3. Try stealing from a random peer (FIFO — fair)
-    victim ← random_worker(excluding: worker_id)
+    victim ← random_carrier(excluding: carrier_id)
     task ← victim.deque.steal()
     if task ≠ EMPTY:
       run(task)
@@ -240,11 +248,11 @@ ALGORITHM worker_loop(worker_id):
     ready ← io_poller.poll_nonblocking()
     if ready is not empty:
       for task in ready:
-        worker.deque.push(task)
+        carrier.deque.push(task)
       continue
 
     // 5. Park — no work available
-    worker.park_on_futex(timeout: 1ms)
+    carrier.park_on_futex(timeout: 1ms)
     // Woken by: new task push, I/O completion, or timeout
 ```
 
@@ -252,7 +260,9 @@ ALGORITHM worker_loop(worker_id):
 
 | Event | Action |
 |-------|--------|
-| `MAKE-THREAD` | Allocate `GreenThread` (D2.01), push to current worker's deque. Wake a parked worker if any. |
+| `MAKE-FIBER` | Allocate a `Fiber` (D2.01) in `Created`; do not schedule it. |
+| `SUBMIT-FIBER` | Associate a created fiber with one scheduler group, mark `Runnable`, push to a carrier deque, and wake a parked carrier. |
+| `MAKE-THREAD` | Create a dedicated exposed native OS thread. It is not submitted to a fiber run queue. |
 | Yield (cooperative) | Push current task back to deque tail, pop next task. |
 | Block (mutex/condvar) | Remove task from deque, set state `Blocked`, record waker. |
 | I/O submit | Set state `Waiting`, publish stack top, register with I/O poller. Treated like `Blocked` for GC purposes (§13.6.1). |
@@ -262,14 +272,29 @@ ALGORITHM worker_loop(worker_id):
 | FFI return | Set state `Runnable`; if worker's deque is empty, resume immediately. |
 | Death | Set state `Dead`, wake join waiters, return stack to pool. |
 
-### 13.5.4 Cooperative Preemption (R13.09)
+### 13.5.4 Public Scheduler Groups and Carriers
 
-A per-worker timer (1 ms, `timer_create` / `CLOCK_MONOTONIC`) sets a
-per-green-thread `yield_flag`. The safepoint poll checks this flag;
-if set, the green thread is pushed to the back of the local deque and
+The scheduler-group object is public; its per-carrier scheduler and deque are
+not. `START-FIBERS` creates the configured number of exposed
+`BLISS-THREAD` carrier objects and `SCHEDULER-GROUP-CARRIERS` returns a stable
+snapshot of them. Consequently thread monitoring, naming, interruption, and
+backtraces work uniformly for application-created platform threads and runtime
+carriers, while fiber monitoring uses the separate `BLISS-FIBER` API.
+
+Fibers may migrate between carriers only while unpinned. A fiber is mounted on
+at most one carrier at a time, and a carrier runs at most one fiber at a time.
+The fiber's current/last carrier reference is updated before its state becomes
+`:RUNNING`, using release ordering; introspection reads it with acquire ordering.
+
+### 13.5.5 Cooperative Preemption (R13.09)
+
+A scheduler-group service timer (1 ms by default) reads each carrier's
+atomically published mounted-fiber ID and sets that fiber's `yield_flag`. The
+timer never suspends a carrier. Every safepoint poll checks this flag;
+if set, the fiber is pushed to the back of the local deque and
 the next task is popped. Default time slice: 1 ms (`BLISS_TIME_SLICE_US`).
 
-### 13.5.5 Priority Levels
+### 13.5.6 Priority Levels
 
 Four levels: `:low` (0, background/finalizers), `:normal` (1, default),
 `:high` (2, interactive/I/O), `:critical` (3, GC/signals). Stealers
@@ -380,7 +405,7 @@ All Bliss signal handlers MUST obey POSIX async-signal-safety:
 
 | Signal | Flag Set | Safepoint Action |
 |--------|----------|-----------------|
-| `SIGINT` | `pending_interrupt` | Signal `INTERRUPT-CONDITION` to foreground green thread |
+| `SIGINT` | `pending_interrupt` | Signal `INTERRUPT-CONDITION` to foreground fiber/native thread |
 | `SIGSEGV` (safepoint page) | N/A — handler rewrites PC | Thread enters safepoint directly via PC rewrite in `ucontext_t` |
 | `SIGSEGV` (null guard) | N/A — handler rewrites PC | Raise `TYPE-ERROR` via PC rewrite |
 | `SIGSEGV` (stack guard) | N/A — handler rewrites PC | Raise `STORAGE-CONDITION` via PC rewrite |
@@ -412,7 +437,7 @@ handles >99.9% of cases.
 
 ## 13.8 Thread-Local Dynamic Bindings (R13.17)
 
-Each green thread owns a **binding stack**: a stack of `(symbol,
+Each fiber and native thread owns a **binding stack**: a stack of `(symbol,
 previous_value)` pairs representing dynamically-bound special variables.
 
 ### 13.8.1 Binding Protocol
@@ -427,7 +452,7 @@ the global cell with `Acquire` ordering.
 
 ### 13.8.2 Inherited Bindings
 
-New green threads inherit a snapshot of the parent's `*standard-input*`,
+New fibers and native threads inherit a snapshot of the parent's `*standard-input*`,
 `*standard-output*`, `*error-output*`, `*debug-io*`, `*query-io*`,
 `*trace-output*`, `*terminal-io*`, and `*package*` bindings. Other
 specials start with global values.
@@ -448,9 +473,25 @@ specials start with global values.
 
 ### 13.9.2 Green-Thread–Aware Blocking
 
-Blocking on a sync primitive transitions the green thread to `Blocked`
-(§2.3.2), freeing the OS worker for other green threads. Unblocking
-pushes the green thread back onto a worker's run queue.
+Blocking on a sync primitive parks an unpinned fiber (§2.3.2), freeing its
+carrier for other fibers. Unblocking pushes the fiber back onto a carrier's run
+queue. A plain native thread, or a pinned fiber under the configured policy,
+uses the OS-blocking primitive.
+
+Each blocking operation receives a monotonically increasing per-fiber wait
+token. Timer and I/O completions carry that token, so a completion left over
+from an earlier timeout cannot wake a later wait. Enqueue and transition to
+`Blocked`/`Waiting` occur before releasing the primitive's wait-queue lock; a
+wake that races with the carrier-side unmount is recorded as pending and is
+consumed by the carrier after the context switch. This closes both the
+enqueue-to-park lost-wakeup window and the early-unpark double-mount window.
+
+Deadline waits share a runtime timer service rather than creating one native
+thread per sleeping fiber. Descriptor readiness uses a shared epoll poller on
+Linux and kqueue on BSD-family systems, with a `poll(2)` helper fallback on
+other Unix targets. A readiness or deadline completion requeues the fiber on
+the scheduler group that accepted its first submission; a fiber MUST NOT be
+submitted to a second scheduler group.
 
 ---
 
@@ -458,13 +499,14 @@ pushes the green thread back onto a worker's run queue.
 
 | Parameter | Default | Env Var | Description |
 |-----------|---------|---------|-------------|
-| Worker threads | `nproc` | `BLISS_WORKERS` | OS worker-thread count. |
+| Carrier threads | `nproc` | `BLISS_WORKERS` | Default scheduler-group carrier count. |
 | Time slice | 1000 µs | `BLISS_TIME_SLICE_US` | Cooperative preemption interval. |
 | Safepoint spin iterations | 1000 | `BLISS_SAFEPOINT_SPIN` | Spin count before parking at safepoint. |
 | Deadlock watchdog interval | 5 s | `BLISS_DEADLOCK_WATCHDOG_MS` | Debug-build only. 0 = disabled. |
 | SIGUSR1 timeout | 100 ms | `BLISS_SIGUSR1_TIMEOUT_MS` | Delay before sending SIGUSR1 fallback. |
-| Green-thread stack size | 512 KiB | `BLISS_STACK_SIZE` | Per-green-thread CL stack. |
-| Max green threads | 100 000 | `BLISS_MAX_THREADS` | Upper limit (R2.19). |
+| Fiber stack size | 512 KiB | `BLISS_STACK_SIZE` | Per-fiber CL stack. |
+| Max fibers | 100 000 | `BLISS_MAX_FIBERS` | Upper limit (legacy `BLISS_MAX_THREADS` accepted; R2.19). |
+| Pinned blocking | `:WARN` | `BLISS_PINNED_BLOCKING_ACTION` | `WARN`, `ERROR`, or `NIL`/`NATIVE` fallback policy (R9.43). |
 
 ---
 
@@ -475,7 +517,8 @@ pushes the green thread back onto a worker's run queue.
 | Lock-order violation (debug) | `debug_assert!` panic with diagnostic. |
 | Deadlock detected (debug) | Log cycle to stderr and crash log; no abort (informational). |
 | Safepoint timeout (>1 s) | Panic — indicates a bug (thread stuck in unsafe code). |
-| Thread creation failure | Signal `BLISS-EXT:THREAD-ERROR` with `:reason :limit-exceeded` or `:reason :oom`. |
+| Native-thread creation failure | Signal `BLISS-THREAD:THREAD-ERROR` with `:reason :limit-exceeded` or `:reason :oom`. |
+| Fiber creation/submission failure | Signal `BLISS-FIBER:FIBER-ERROR` with `:reason :limit-exceeded`, `:already-submitted`, `:closed-group`, or `:oom`. |
 | SIGUSR1 delivery failure | Log warning; GC proceeds — thread will eventually reach a poll. |
 
 ---
@@ -491,7 +534,7 @@ pushes the green thread back onto a worker's run queue.
 | Safepoint liveness | Tight loop in T1 code; request STW; verify all threads reach safepoint within 10 ms. | p99 < 10 ms. |
 | Native-thread GC safety | Thread in FFI call during GC; verify CL stack scanned correctly. | No GC crash. |
 | Blocked-thread GC safety | Thread blocked on mutex during GC; verify stack scanned correctly. | No GC crash. |
-| Cooperative preemption | 100 CPU-bound green threads on 4 workers; verify all make progress (no starvation) within 100 ms. | All threads run. |
+| Cooperative preemption | 100 CPU-bound fibers on 4 exposed carriers; verify all make progress (no starvation) within 100 ms. | All fibers run. |
 | SIGUSR1 fallback | Thread blocked in `read(2)` on a pipe; request STW; verify thread reaches safepoint via SIGUSR1 within 200 ms. | Safepoint reached. |
 | WITH-ATOMIC correctness | Verify preemption is suppressed inside `WITH-ATOMIC`; verify GC safepoint is NOT suppressed (compile-time check). | Correct behaviour. |
 | Binding stack isolation | Two threads bind the same special to different values; verify no cross-thread leakage. | Thread-local isolation. |
@@ -502,14 +545,16 @@ pushes the green thread back onto a worker's run queue.
 
 | Source File | Responsibility | Key Types / Functions |
 |-------------|---------------|-----------------------|
-| `crates/bliss-rt/src/thread.rs` | Green-thread descriptor, state machine | `GreenThread`, `ThreadState`, `GreenThreadId` |
-| `crates/bliss-rt/src/scheduler.rs` | Work-stealing scheduler, worker loop | `Scheduler`, `WorkerThread`, `WorkStealingDeque` |
+| `crates/bliss-rt/src/thread.rs` | Native-thread/fiber descriptors, continuation switching, carrier pool | `NativeThread`, `Fiber`, `FiberContinuation`, `ChaseLevDeque` |
+| `crates/bliss-rt/src/scheduler.rs` | Public scheduler-group lifecycle over exposed carriers | `SchedulerGroup`, `SchedulerConfig` |
 | `crates/bliss-rt/src/safepoint.rs` | Safepoint page, STW protocol | `SafepointPage`, `stop_the_world()`, `resume_all()` |
 | `crates/bliss-rt/src/sync/mutex.rs` | Green-thread-aware mutex | `BlissMutex`, `BlissRwLock` |
 | `crates/bliss-rt/src/sync/condvar.rs` | Condition variables | `BlissCondVar` |
 | `crates/bliss-rt/src/sync/semaphore.rs` | Counting semaphore, barrier | `BlissSemaphore`, `BlissBarrier` |
+| `crates/bliss-rt/src/sync/timer.rs` | Shared deadline scheduler | per-fiber generation-tagged timer wakeups |
+| `crates/bliss-rt/src/sync/io.rs` | Async descriptor readiness | epoll/kqueue poller; poll fallback |
 | `crates/bliss-rt/src/sync/atomic.rs` | CAS, atomic-incf, memory barriers | `bliss_cas()`, `atomic_incf()` |
-| `crates/bliss-rt/src/signal.rs` | Signal handlers, SIGUSR1 fallback | `install_handlers()`, `sigsegv_handler()` |
+| `crates/bliss-rt/src/{runtime,safepoint,thread}.rs` | Signal handlers, directed SIGUSR1 fallback | `install_signal_handlers()`, `sigusr1_handler()`, participant signalling |
 | `crates/bliss-rt/src/gc/safepoint.rs` | GC-side safepoint coordination | `request_safepoint()`, `wait_at_safepoint()` |
 | `crates/bliss-rt/src/profiling.rs` | Lock-free profiling counters | `FunctionProfile` |
 | `crates/bliss-compiler/src/ic.rs` | Inline cache patching | `MonomorphicIC`, `patch_ic()` |

@@ -439,6 +439,7 @@ CL special variables (in the `BLISS-PROFILER` package).
 | `BLISS_T0_T1_THRESHOLD` | `*t0-t1-threshold*` | u32 | 10 | Invocations before T0→T1 |
 | `BLISS_T1_T2_INVOKE_THRESHOLD` | `*t1-t2-invoke-threshold*` | u32 | 5000 | Invocations before T1→T2 |
 | `BLISS_T1_T2_BACKEDGE_THRESHOLD` | `*t1-t2-backedge-threshold*` | u32 | 10000 | Back-edge iterations before T1→T2 |
+| `BLISS_DISABLE_T2` | — | bool | false | Keep otherwise-hot functions at T1 for debug/differential runs |
 | `BLISS_OSR_BACKEDGE_THRESHOLD` | `*osr-backedge-threshold*` | u32 | 50000 | Back-edge iterations before OSR |
 | `BLISS_DEOPT_PENALTY_MULTIPLIER` | `*deopt-penalty-multiplier*` | f32 | 2.0 | Threshold multiplier after deopt |
 | `BLISS_DEOPT_BLACKLIST_LIMIT` | `*deopt-blacklist-limit*` | u32 | 3 | Consecutive deopts before blacklist |

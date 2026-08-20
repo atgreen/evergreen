@@ -26,11 +26,11 @@
 //! `PACKAGE` objects (Stage D), and persist the table in images (Stage F).
 
 use crate::error::BlissError;
+use crate::lock_order::{LockLevel, OrderedRwLock};
 use crate::object::{type_id, ObjectHeader, SymbolData};
 use crate::value::{BlissVal, NIL, UNBOUND};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::RwLock;
 
 /// `SymbolData` payload size (everything past the 8-byte header): name, value,
 /// function, plist, package (5×8) + flags + tls_index (2×4) = 48 bytes.
@@ -63,7 +63,8 @@ struct SymbolRegistry {
     index_to_key: Vec<String>,
 }
 
-static REGISTRY: RwLock<Option<SymbolRegistry>> = RwLock::new(None);
+static REGISTRY: OrderedRwLock<Option<SymbolRegistry>> =
+    OrderedRwLock::new(LockLevel::GcWorld, 2, "GC-rooted symbol registry", None);
 static UNINTERNED_COUNTER: AtomicU32 = AtomicU32::new(UNINTERNED_BASE);
 
 /// Allocate a pinned `SIMPLE_BASE_STRING` on the GC heap holding `s`.
@@ -329,9 +330,10 @@ pub fn restore(data: &[u8]) -> Result<(), BlissError> {
 fn decode_names(data: &[u8]) -> Result<Vec<String>, BlissError> {
     let mut pos = 0usize;
     let take = |pos: &mut usize, n: usize| -> Result<&[u8], BlissError> {
-        let end = pos.checked_add(n).filter(|&e| e <= data.len()).ok_or_else(|| {
-            BlissError::Internal("truncated symbol-table image section".into())
-        })?;
+        let end = pos
+            .checked_add(n)
+            .filter(|&e| e <= data.len())
+            .ok_or_else(|| BlissError::Internal("truncated symbol-table image section".into()))?;
         let slice = &data[*pos..end];
         *pos = end;
         Ok(slice)
@@ -417,20 +419,29 @@ pub fn set_symbol_package(idx: u32, package: BlissVal) {
 /// (e.g. for image dump) now that they live in the function cell rather than an
 /// interpreter-side name map (bliss-jtc.6.8).
 pub fn for_each_bound_function(mut f: impl FnMut(u32, String, BlissVal)) {
-    with_registry(|reg| {
-        if let Some(r) = reg {
-            for (idx, &obj) in r.interned.iter().enumerate() {
-                // SAFETY: registry entries are pinned live symbols.
-                let (func, name) = unsafe {
-                    let d = symbol_data(obj);
-                    ((*d).function, (*d).name)
-                };
-                if func != UNBOUND {
-                    f(idx as u32, name.as_string(), func);
-                }
-            }
-        }
+    // Snapshot under the registry lock, then invoke arbitrary caller code only
+    // after releasing it. Image serialization formats function bodies in the
+    // callback, which legitimately asks the registry for symbol names again.
+    let bound = with_registry(|reg| {
+        reg.map(|r| {
+            r.interned
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &obj)| {
+                    // SAFETY: registry entries are pinned live symbols.
+                    let (func, name) = unsafe {
+                        let d = symbol_data(obj);
+                        ((*d).function, (*d).name)
+                    };
+                    (func != UNBOUND).then(|| (idx as u32, name.as_string(), func))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
     });
+    for (idx, name, function) in bound {
+        f(idx, name, function);
+    }
 }
 
 #[cfg(test)]
@@ -458,10 +469,23 @@ mod tests {
     #[test]
     fn registry_key_round_trips() {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        for name in ["JTC23-ALPHA", "PKGX23::SHARED", "PKGY23::SHARED", "KEYWORD::JTC23KW"] {
+        for name in [
+            "JTC23-ALPHA",
+            "PKGX23::SHARED",
+            "PKGY23::SHARED",
+            "KEYWORD::JTC23KW",
+        ] {
             let idx = intern(name);
-            assert_eq!(registry_key(idx).as_deref(), Some(name), "key must match intern name");
-            assert_eq!(intern(&registry_key(idx).unwrap()), idx, "key must round-trip to index");
+            assert_eq!(
+                registry_key(idx).as_deref(),
+                Some(name),
+                "key must match intern name"
+            );
+            assert_eq!(
+                intern(&registry_key(idx).unwrap()),
+                idx,
+                "key must round-trip to index"
+            );
         }
         // Distinct keys with the same bare name are distinct symbols.
         assert_ne!(intern("PKGX23::SHARED"), intern("PKGY23::SHARED"));
@@ -512,6 +536,22 @@ mod tests {
         set_symbol_plist(idx, intern_as_value("STAGE-A-CELLS"));
         assert_eq!(symbol_value(idx), Some(BlissVal::from_fixnum(42)));
         assert_eq!(symbol_plist(idx), Some(intern_as_value("STAGE-A-CELLS")));
+    }
+
+    #[test]
+    fn bound_function_callbacks_run_outside_the_registry_lock() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let idx = intern("STAGE-A-BOUND-FUNCTION-SNAPSHOT");
+        set_symbol_function(idx, BlissVal::from_fixnum(17));
+        let mut saw_probe = false;
+        for_each_bound_function(|seen_idx, _, _| {
+            // Re-entering a registry reader is expected callback behaviour (the
+            // image writer does this while formatting function bodies).
+            let _ = symbol_name(seen_idx);
+            saw_probe |= seen_idx == idx;
+        });
+        assert!(saw_probe);
+        set_symbol_function(idx, UNBOUND);
     }
 
     /// The symbol value that flows through the program (tag `101` + index).

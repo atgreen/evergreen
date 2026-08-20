@@ -43,7 +43,11 @@ impl JitBuffer {
             let ptr = ptr as *mut u8;
             std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
             // W^X: drop write, add execute.
-            if libc::mprotect(ptr as *mut libc::c_void, len, libc::PROT_READ | libc::PROT_EXEC) != 0
+            if libc::mprotect(
+                ptr as *mut libc::c_void,
+                len,
+                libc::PROT_READ | libc::PROT_EXEC,
+            ) != 0
             {
                 libc::munmap(ptr as *mut libc::c_void, len);
                 return None;
@@ -51,10 +55,7 @@ impl JitBuffer {
             // Flush the instruction cache (a no-op on x86, required on aarch64).
             #[cfg(target_arch = "aarch64")]
             {
-                std::arch::asm!(
-                    "isb",
-                    options(nostack, preserves_flags),
-                );
+                std::arch::asm!("isb", options(nostack, preserves_flags),);
             }
             Some(JitBuffer { ptr, len })
         }

@@ -397,8 +397,10 @@ reads the profile to insert speculative type guards.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BLISS_T1_THRESHOLD` | 10 | Invocation count to trigger T1 compilation |
-| `BLISS_T2_THRESHOLD` | 5000 | Invocation count to trigger T2 compilation |
+| `BLISS_T0_T1_THRESHOLD` | 10 | Invocation count to trigger T1 compilation (`BLISS_T1_THRESHOLD` alias) |
+| `BLISS_T1_T2_INVOKE_THRESHOLD` | 5000 | Invocation count to trigger T2 compilation (`BLISS_T1_T2_THRESHOLD` / `BLISS_T2_THRESHOLD` aliases) |
+| `BLISS_T1_T2_BACKEDGE_THRESHOLD` | 10000 | Back-edge count to trigger T2 compilation (`BLISS_LOOP_HEAT_THRESHOLD` alias) |
+| `BLISS_DISABLE_T2` | unset | Explicit debug/differential switch that keeps functions at T1 |
 | `BLISS_OSR_THRESHOLD` | 10000 | Back-edge count to trigger OSR entry |
 | `BLISS_INLINE_BUDGET` | 50 | Max IR nodes per inline expansion |
 | `BLISS_INLINE_DEPTH` | 5 | Max inlining depth |

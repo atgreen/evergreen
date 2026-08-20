@@ -24,6 +24,14 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
+/// Flag-only SIGUSR1 handoff. Directed delivery interrupts a blocking syscall;
+/// ordinary code observes this flag at its next safepoint poll.
+static SIGUSR1_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) extern "C" fn sigusr1_handler(_signal: libc::c_int) {
+    SIGUSR1_PENDING.store(true, Ordering::Relaxed);
+}
+
 use crate::error::BlissError;
 
 /// Handle to the safepoint page.
@@ -142,8 +150,27 @@ fn global_safepoint_page() -> &'static SafepointPage {
 #[inline(always)]
 pub fn poll_safepoint() {
     let page = global_safepoint_page();
-    if page.is_requested() {
+    let interrupted = SIGUSR1_PENDING.swap(false, Ordering::Relaxed);
+    if page.is_requested() || interrupted {
         enter_safepoint();
+    } else {
+        check_preemption();
+    }
+}
+
+/// Cooperative scheduling is checked at every safepoint, independently of a
+/// GC stop-the-world request. A time-slice expiry only sets this flag; the
+/// mounted fiber performs the actual context switch at this safe boundary.
+fn check_preemption() {
+    if let Some(fiber) = crate::thread::current_fiber() {
+        if fiber.check_and_clear_yield() {
+            let _ = crate::thread::fiber_yield();
+        }
+    } else {
+        let thread = crate::thread::current_thread();
+        if thread.check_and_clear_yield() {
+            crate::thread::thread_yield();
+        }
     }
 }
 
@@ -174,8 +201,7 @@ pub fn enter_safepoint() {
 
     // §2.5.3: Publish the thread's stack top (sp/fp) to its thread
     // descriptor so the GC can scan the CL stack while parked.
-    let thread = crate::thread::current_thread();
-    thread.stack().publish_top();
+    crate::thread::current_stack().publish_top();
 
     // Issue #1 fix: if no coordination cycle is active (`parked` is
     // false), return immediately — the thread has already published its
@@ -183,6 +209,7 @@ pub fn enter_safepoint() {
     // only `wait_for_all_threads` (which sets `parked = true` before
     // requesting) triggers the full arrive-and-park protocol.
     if !coord.parked.load(Ordering::SeqCst) {
+        check_preemption();
         return;
     }
 
@@ -212,9 +239,7 @@ pub fn enter_safepoint() {
 
     // §2.5.3 step 4: check per-thread yield flag and yield if preemption
     // was requested.
-    if thread.check_and_clear_yield() {
-        crate::thread::thread_yield();
-    }
+    check_preemption();
 }
 
 /// Wait until all mutator threads have reached a safepoint.
@@ -255,6 +280,11 @@ pub fn wait_for_all_threads() -> Result<(), BlissError> {
     // Issue #5 fix: `arrived` is now incremented under `arrival_mutex`,
     // so we hold the same lock when checking and waiting, preventing
     // lost notifications.
+    let fallback_delay = std::env::var("BLISS_SIGUSR1_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100);
     let mut guard = coord.arrival_mutex.lock().unwrap();
     let mut timeouts = 0u32;
     while coord.arrived.load(Ordering::SeqCst) < other_count {
@@ -262,7 +292,7 @@ pub fn wait_for_all_threads() -> Result<(), BlissError> {
         // reaching its next poll point.
         let (new_guard, timeout) = coord
             .arrival_condvar
-            .wait_timeout(guard, std::time::Duration::from_millis(100))
+            .wait_timeout(guard, std::time::Duration::from_millis(fallback_delay))
             .unwrap();
         guard = new_guard;
 
@@ -273,6 +303,12 @@ pub fn wait_for_all_threads() -> Result<(), BlissError> {
                 break;
             }
             timeouts += 1;
+            if timeouts == 1 {
+                // A mutator may be blocked in a syscall and unable to touch the
+                // polling page. Directed SIGUSR1 delivery is flag-only and
+                // exists solely to make that syscall return EINTR.
+                let _ = crate::thread::signal_safepoint_participants(current);
+            }
             // In the bootstrap runtime the thread registry can contain
             // worker threads that never participate in safepoint polling.
             // Bound the wait so GC/debug paths can still make progress.

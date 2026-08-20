@@ -5,30 +5,32 @@
 //! code through the shared label assembler (`bliss_rt::asm`). The result is a
 //! byte buffer that `bliss_rt::jit::JitBuffer` can make executable.
 //!
-//! **First cut.** Supports register-resident straight-line + unconditional-jump
-//! code (MOV_IMM, reg-reg MOV, ADD, SUB, RET, JMP) — enough to emit and *run* a
-//! T2-compiled leaf function. Deferred (documented, not silent): spilled operands
-//! (`Location::Stack`), conditional branches (need the condition-code model P5
-//! flagged), calls, float/XMM ops, and folding immediates into ALU ops. An
-//! unsupported instruction returns `EmitError` rather than emitting wrong bytes.
+//! The compact [`emit`] backend consumes regalloc2's exact per-instruction
+//! allocations and edit stream, including spill/reload moves. The live
+//! interpreter-facing [`emit_framed`] backend uses the same lowering and
+//! allocation pipeline, then gives split ranges stable native-stack homes while
+//! its richer call, guard, deopt, and OSR templates are emitted. Unsupported
+//! instruction shapes return [`EmitError`] and leave the function at T1.
 
 use bliss_rt::asm::{Asm, Cc};
 
 use crate::t2::ir::Function;
-use crate::t2::mach::{Location, MachFunc, MachInst, PhysReg, RegClass, VReg};
+use crate::t2::mach::{EditPosition, Location, MachFunc, MachInst, PhysReg, RegClass, VReg};
 
 /// Why emission could not complete (the function stays at T1, spec R4.28/R4.42).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EmitError {
-    /// An opcode this first-cut emitter does not encode yet.
+    /// An opcode this emitter does not encode yet.
     UnsupportedOp(u32),
-    /// A value was spilled to the stack; the frame/spill path isn't emitted yet.
+    /// regalloc2 could not allocate this function.
+    RegAlloc(String),
+    /// An instruction operand was unexpectedly left in memory after edit insertion.
     Spilled(VReg),
     /// A vreg had no allocation (P6 did not run, or left it unbound).
     Unallocated(VReg),
     /// A `MOV_IMM` with no immediate (lowering did not populate it).
     MissingImm,
-    /// A float/XMM operand reached the integer-only first cut.
+    /// A float/XMM operand reached the integer-only compact emitter.
     FloatUnsupported,
     /// Branch resolution failed (out-of-range / unbound label).
     BadBranch,
@@ -62,13 +64,18 @@ const GPR_X86: [u8; 14] = [
 const CALLEE_SAVED_X86: [u8; 5] = [3, 12, 13, 14, 15];
 
 const RAX: u8 = 0;
+/// Dedicated GPR scratch exposed to regalloc2 (abstract encoding 13).
+const RA_SCRATCH_GPR: u8 = 15;
 
 /// The x86 encoding a GPR `PhysReg` maps to.
 fn gpr_enc(p: PhysReg) -> Result<u8, EmitError> {
     if p.class != RegClass::Gpr {
         return Err(EmitError::FloatUnsupported);
     }
-    GPR_X86.get(p.encoding as usize).copied().ok_or(EmitError::UnsupportedOp(0))
+    GPR_X86
+        .get(p.encoding as usize)
+        .copied()
+        .ok_or(EmitError::UnsupportedOp(0))
 }
 
 // ── x86-64 instruction encoders (REX.W 64-bit forms) ────────────────
@@ -143,6 +150,39 @@ fn mov_mem64_disp8(a: &mut Asm, dst: u8, base: u8, disp: u8) {
     a.push(disp);
 }
 
+/// `mov dst, qword ptr [base + disp]` with an arbitrary signed displacement.
+/// `base` must not be rsp/r12 (which requires a SIB byte).
+fn load_mem64_disp(a: &mut Asm, dst: u8, base: u8, disp: i32) {
+    debug_assert_ne!(base & 7, 4, "rsp/r12 needs a SIB byte");
+    a.push(rex_w(dst, base));
+    a.push(0x8B);
+    if disp == 0 && (base & 7) != 5 {
+        a.push(((dst & 7) << 3) | (base & 7));
+    } else if (-128..=127).contains(&disp) {
+        a.push(0x40 | ((dst & 7) << 3) | (base & 7));
+        a.push(disp as u8);
+    } else {
+        a.push(0x80 | ((dst & 7) << 3) | (base & 7));
+        a.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+/// `mov qword ptr [base + disp], src`, paired with [`load_mem64_disp`].
+fn store_mem64_disp(a: &mut Asm, base: u8, disp: i32, src: u8) {
+    debug_assert_ne!(base & 7, 4, "rsp/r12 needs a SIB byte");
+    a.push(rex_w(src, base));
+    a.push(0x89);
+    if disp == 0 && (base & 7) != 5 {
+        a.push(((src & 7) << 3) | (base & 7));
+    } else if (-128..=127).contains(&disp) {
+        a.push(0x40 | ((src & 7) << 3) | (base & 7));
+        a.push(disp as u8);
+    } else {
+        a.push(0x80 | ((src & 7) << 3) | (base & 7));
+        a.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
 /// `cmp lhs, qword ptr [base + disp8]` for bases other than rsp/r12.
 fn cmp_mem64_disp8(a: &mut Asm, lhs: u8, base: u8, disp: u8) {
     debug_assert_ne!(base & 7, 4, "rsp/r12 needs a SIB byte");
@@ -156,10 +196,7 @@ fn cmp_mem64_disp8(a: &mut Asm, lhs: u8, base: u8, disp: u8) {
 /// zero-extends to 64 bits; using the same register for `dst` and `index` is
 /// valid because address calculation reads the old index first.
 fn movzx_mem8_indexed(a: &mut Asm, dst: u8, base: u8, index: u8, disp: u8) {
-    let rex = 0x40
-        | (((dst >> 3) & 1) << 2)
-        | (((index >> 3) & 1) << 1)
-        | ((base >> 3) & 1);
+    let rex = 0x40 | (((dst >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | ((base >> 3) & 1);
     a.push(rex);
     a.extend_from_slice(&[0x0F, 0xB6]);
     a.push(0x40 | ((dst & 7) << 3) | 0x04); // mod=01, rm=SIB
@@ -187,6 +224,29 @@ fn store_to_rsp(a: &mut Asm, src: u8, disp: i32) {
         a.push(disp as u8);
     } else {
         a.push(0x80 | ((src & 7) << 3) | 0x04); // mod=10 (disp32)
+        a.push(0x24);
+        a.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+/// `mov dst, [rsp + disp]` (REX.W), the reload counterpart to
+/// [`store_to_rsp`].
+fn load_from_rsp(a: &mut Asm, dst: u8, disp: i32) {
+    let mut rex = 0x48u8;
+    if dst >= 8 {
+        rex |= 0x04;
+    }
+    a.push(rex);
+    a.push(0x8B);
+    if disp == 0 {
+        a.push(((dst & 7) << 3) | 0x04);
+        a.push(0x24);
+    } else if (-128..=127).contains(&disp) {
+        a.push(0x40 | ((dst & 7) << 3) | 0x04);
+        a.push(0x24);
+        a.push(disp as u8);
+    } else {
+        a.push(0x80 | ((dst & 7) << 3) | 0x04);
         a.push(0x24);
         a.extend_from_slice(&disp.to_le_bytes());
     }
@@ -407,7 +467,11 @@ fn framed_mat(
         // live value. The scratch is safe because a general two-operand path uses
         // at most one materialised constant (the other operand is a variable, and
         // both-constant cases are folded upstream / rejected below).
-        mov_imm64(a, SCRATCH, bliss_rt::value::BlissVal::from_fixnum(c).0 as i64);
+        mov_imm64(
+            a,
+            SCRATCH,
+            bliss_rt::value::BlissVal::from_fixnum(c).0 as i64,
+        );
         return Ok(SCRATCH);
     }
     Err(EmitError::UnsupportedOp(0xF2))
@@ -439,6 +503,7 @@ fn float_operand_to_xmm(
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
     consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
     float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
+    proven_single_float: &std::collections::HashSet<crate::t2::ir::Value>,
     deopt: bliss_rt::asm::Label,
 ) -> Result<(), EmitError> {
     if let Some(&bits) = float_consts.get(&v) {
@@ -449,9 +514,13 @@ fn float_operand_to_xmm(
         movd_xmm_r32(a, xmm, SCRATCH);
     } else {
         let r = *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?;
-        guard_single_float(a, r, deopt);
-        shr_imm(a, r, 32); // r's low dword now holds the f32 bits
-        movd_xmm_r32(a, xmm, r);
+        if !proven_single_float.contains(&v) {
+            guard_single_float(a, r, deopt);
+        }
+        // Preserve the tagged SSA value for later uses and deopt reconstruction.
+        mov_rr(a, SCRATCH, r);
+        shr_imm(a, SCRATCH, 32); // low dword now holds the f32 bits
+        movd_xmm_r32(a, xmm, SCRATCH);
     }
     Ok(())
 }
@@ -469,6 +538,34 @@ pub struct FramedCode {
     pub code: Vec<u8>,
     /// Byte offset of the compiled-caller entry within `code`.
     pub compiled_entry: usize,
+    /// Bytecode loop-header bcp to alternate entry offset.  Each entry accepts
+    /// the live frame-slot pointer in rdi, reconstructs SSA registers, and
+    /// enters the optimized loop without restarting the function.
+    pub osr_entries: Vec<(u32, usize)>,
+    /// Total eight-byte native stack homes reserved by the framed emitter.
+    pub native_spill_slots: u32,
+    /// Spill slots chosen directly by regalloc2 before split ranges are assigned
+    /// stable homes for the rich framed templates.
+    pub regalloc_spill_slots: u32,
+    /// Spill/reload/live-range-split moves produced by regalloc2.
+    pub allocation_edits: usize,
+    /// Extra tagged slots appended to the BlissStack activation. At each
+    /// runtime safepoint these hold the exact live native roots and are restored
+    /// to their GPR/spill homes after a moving collection.
+    pub shadow_root_slots: u16,
+    /// Number of runtime-call safepoints emitted. Installation verifies that it
+    /// matches `root_sync_sites.len()` before publishing code.
+    pub emitted_safepoints: usize,
+    /// Emitted native offsets and live-root counts for installation validation.
+    pub root_sync_sites: Vec<RootSyncSite>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RootSyncSite {
+    pub code_offset: u32,
+    pub live_roots: u16,
+    pub register_roots: u16,
+    pub spill_roots: u16,
 }
 
 /// The branch condition a fixnum comparison opcode is true under. `None` for
@@ -511,55 +608,105 @@ fn cmp_rr(a: &mut Asm, l: u8, r: u8) {
     a.push(modrm_rr(l, r));
 }
 
-/// The source of a block-argument move on a CFG edge.
-#[derive(Clone, Copy)]
-enum MoveSrc {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FramedHome {
     Reg(u8),
-    /// A tagged BlissVal materialised directly into the destination register.
+    Stack(u32),
+}
+
+#[derive(Clone, Copy)]
+enum HomeMoveSrc {
+    Home(FramedHome),
     Const(u64),
 }
 
-/// Emit one edge move `dst <- src`.
-fn emit_move(a: &mut Asm, dst: u8, src: MoveSrc) {
-    match src {
-        MoveSrc::Reg(r) => mov_rr(a, dst, r),
-        MoveSrc::Const(bits) => mov_imm64(a, dst, bits as i64),
+fn framed_stack_disp(slot: u32) -> i32 {
+    (slot as i32) * 8
+}
+
+fn load_home(a: &mut Asm, dst: u8, home: FramedHome, rsp_adjust: i32) {
+    match home {
+        FramedHome::Reg(src) => mov_rr(a, dst, src),
+        FramedHome::Stack(slot) => load_from_rsp(a, dst, framed_stack_disp(slot) + rsp_adjust),
     }
 }
 
-/// Emit a set of simultaneous register moves (block-parameter passing on an edge),
-/// ordering them so no move clobbers a source still needed, and breaking any cycle
-/// through the rdx scratch. Self-moves are dropped.
-fn parallel_move(a: &mut Asm, mut moves: Vec<(u8, MoveSrc)>) {
-    moves.retain(|(d, s)| !matches!(s, MoveSrc::Reg(r) if r == d));
-    while !moves.is_empty() {
-        // A move is safe to emit now if its destination is not a source register
-        // of any remaining move.
-        if let Some(i) = moves
-            .iter()
-            .position(|(d, _)| !moves.iter().any(|(_, s)| matches!(s, MoveSrc::Reg(r) if *r == *d)))
-        {
-            let (d, s) = moves.remove(i);
-            emit_move(a, d, s);
-        } else {
-            // Every remaining move's dst is read by another → a cycle. Break it by
-            // routing one source through rdx.
-            if let (d0, MoveSrc::Reg(sr)) = moves[0] {
-                mov_rr(a, SCRATCH, sr);
-                for m in moves.iter_mut() {
-                    if let MoveSrc::Reg(r) = &mut m.1 {
-                        if *r == sr {
-                            *r = SCRATCH;
-                        }
-                    }
-                }
-                let _ = d0;
-            } else {
-                let (d0, s0) = moves.remove(0);
-                emit_move(a, d0, s0);
-            }
-        }
+fn store_home(a: &mut Asm, home: FramedHome, src: u8, rsp_adjust: i32) {
+    match home {
+        FramedHome::Reg(dst) => mov_rr(a, dst, src),
+        FramedHome::Stack(slot) => store_to_rsp(a, src, framed_stack_disp(slot) + rsp_adjust),
     }
+}
+
+fn emit_shadow_root_sync(
+    a: &mut Asm,
+    roots: &[crate::t2::ir::Value],
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    frame_base: FramedHome,
+    activation_slots: u16,
+    shadow_slots: u16,
+) -> Result<(), EmitError> {
+    load_home(a, SCRATCH, frame_base, 0);
+    // A single bitmap covers every shadow slot. Clear unused slots at each site
+    // so stale values from a previous safepoint are not retained as false roots.
+    mov_imm64(a, RAX, bliss_rt::value::NIL.0 as i64);
+    for i in 0..shadow_slots {
+        let slot = activation_slots as i32 + i as i32;
+        store_mem64_disp(a, SCRATCH, slot * 8, RAX);
+    }
+    for (i, value) in roots.iter().enumerate() {
+        let home = *homes.get(value).ok_or(EmitError::UnsupportedOp(0xFC))?;
+        load_home(a, RAX, home, 0);
+        let slot = activation_slots as i32 + i as i32;
+        store_mem64_disp(a, SCRATCH, slot * 8, RAX);
+    }
+    Ok(())
+}
+
+fn emit_shadow_root_restore(
+    a: &mut Asm,
+    synced_roots: &[crate::t2::ir::Value],
+    restore_roots: &std::collections::HashSet<crate::t2::ir::Value>,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    frame_base: FramedHome,
+    activation_slots: u16,
+) -> Result<(), EmitError> {
+    load_home(a, SCRATCH, frame_base, 0);
+    for (i, value) in synced_roots.iter().enumerate() {
+        if !restore_roots.contains(value) {
+            continue;
+        }
+        let slot = activation_slots as i32 + i as i32;
+        load_mem64_disp(a, RAX, SCRATCH, slot * 8);
+        let home = *homes.get(value).ok_or(EmitError::UnsupportedOp(0xFC))?;
+        store_home(a, home, RAX, 0);
+    }
+    Ok(())
+}
+
+/// Materialise a simultaneous set of block-parameter moves through a temporary
+/// stack snapshot. This handles register, spill-slot, and cyclic combinations
+/// uniformly; no destination is written until every source has been captured.
+fn parallel_home_move(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)]) {
+    if moves.is_empty() {
+        return;
+    }
+    let bytes = ((moves.len() * 8) + 15) & !15;
+    a.extend_from_slice(&[0x48, 0x81, 0xEC]);
+    a.extend_from_slice(&(bytes as i32).to_le_bytes());
+    for (i, (_, src)) in moves.iter().enumerate() {
+        match src {
+            HomeMoveSrc::Home(home) => load_home(a, RAX, *home, bytes as i32),
+            HomeMoveSrc::Const(bits) => mov_imm64(a, RAX, *bits as i64),
+        }
+        store_to_rsp(a, RAX, (i * 8) as i32);
+    }
+    for (i, (dst, _)) in moves.iter().enumerate() {
+        load_from_rsp(a, RAX, (i * 8) as i32);
+        store_home(a, *dst, RAX, bytes as i32);
+    }
+    a.extend_from_slice(&[0x48, 0x81, 0xC4]);
+    a.extend_from_slice(&(bytes as i32).to_le_bytes());
 }
 
 /// Emit one arithmetic instruction (result register pre-assigned). Operands are
@@ -574,6 +721,7 @@ fn emit_arith_inst(
     float_consts: &std::collections::HashMap<crate::t2::ir::Value, u32>,
     val_range: &std::collections::HashMap<crate::t2::ir::Value, (i64, i64)>,
     proven: &mut std::collections::HashSet<crate::t2::ir::Value>,
+    proven_single_float: &std::collections::HashSet<crate::t2::ir::Value>,
     deopt: bliss_rt::asm::Label,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::Opcode;
@@ -612,7 +760,8 @@ fn emit_arith_inst(
                 // Fold the constant, or decline if it does not fit the imul immediate
                 // — the general two-register path uses rdx for the guard and cannot
                 // also host a materialised constant there.
-                let c32 = i32::try_from(c).map_err(|_| EmitError::UnsupportedOp(op_tag(data.opcode)))?;
+                let c32 =
+                    i32::try_from(c).map_err(|_| EmitError::UnsupportedOp(op_tag(data.opcode)))?;
                 let range = f.value(var).ty.range;
                 let x = *reg.get(&var).ok_or(EmitError::UnsupportedOp(0xF2))?;
                 guard(a, var, x);
@@ -635,9 +784,24 @@ fn emit_arith_inst(
                 a.extend_from_slice(&[0xF6, 0xC2, 0x07]);
                 a.jcc(Cc::Ne, deopt);
             }
-            mov_rr(a, dst, x);
-            sar_imm(a, dst, 3);
-            imul_rr(a, dst, y);
+            if dst == x && x == y {
+                // Preserve the tagged RHS before untagging the coalesced result.
+                // rdx is excluded from the framed allocator and is free once the
+                // combined tag guard above has completed.
+                mov_rr(a, SCRATCH, y);
+                sar_imm(a, dst, 3);
+                imul_rr(a, dst, SCRATCH);
+            } else if dst == y && dst != x {
+                // Multiplication is commutative: untag the RHS in place and use
+                // the untouched tagged LHS, avoiding an otherwise destructive
+                // `mov dst, x`.
+                sar_imm(a, dst, 3);
+                imul_rr(a, dst, x);
+            } else {
+                mov_rr(a, dst, x);
+                sar_imm(a, dst, 3);
+                imul_rr(a, dst, y);
+            }
             a.jcc(Cc::O, deopt);
         }
         Opcode::FixnumAdd | Opcode::FixnumSub => {
@@ -666,8 +830,23 @@ fn emit_arith_inst(
             let y = framed_mat(a, reg, pool, consts, b0)?;
             guard(a, a0, x);
             guard(a, b0, y);
-            mov_rr(a, dst, x);
-            alu_rr(a, if is_add { 0x01 } else { 0x29 }, dst, y); // tagged±tagged = tagged
+            let op = if is_add { 0x01 } else { 0x29 };
+            if dst == y && dst != x {
+                if is_add {
+                    // Addition is commutative, so accumulate the untouched LHS
+                    // into the RHS/result register without a destructive move.
+                    alu_rr(a, op, dst, x);
+                } else {
+                    // Subtraction is not commutative: preserve RHS in reserved
+                    // rdx before overwriting the coalesced destination.
+                    mov_rr(a, SCRATCH, y);
+                    mov_rr(a, dst, x);
+                    alu_rr(a, op, dst, SCRATCH);
+                }
+            } else {
+                mov_rr(a, dst, x);
+                alu_rr(a, op, dst, y);
+            }
             a.jcc(Cc::O, deopt);
         }
         Opcode::FixnumNeg => {
@@ -706,8 +885,13 @@ fn emit_arith_inst(
             let y = framed_mat(a, reg, pool, consts, b0)?;
             guard(a, a0, x);
             guard(a, b0, y);
-            mov_rr(a, dst, x);
-            alu_rr(a, rr_op, dst, y);
+            if dst == y && dst != x {
+                // All three bitwise operations are commutative.
+                alu_rr(a, rr_op, dst, x);
+            } else {
+                mov_rr(a, dst, x);
+                alu_rr(a, rr_op, dst, y);
+            }
         }
         Opcode::LogNot => {
             let a0 = data.args[0];
@@ -722,7 +906,9 @@ fn emit_arith_inst(
             // tagged(x<<n)) with an overflow check; right (n<0) untags, arithmetic
             // -shifts, and retags (no overflow). A variable amount declines.
             let (a0, amt) = (data.args[0], data.args[1]);
-            let n = *consts.get(&amt).ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
+            let n = *consts
+                .get(&amt)
+                .ok_or(EmitError::UnsupportedOp(op_tag(data.opcode)))?;
             let x = framed_mat(a, reg, pool, consts, a0)?;
             guard(a, a0, x);
             if n >= 0 {
@@ -750,8 +936,26 @@ fn emit_arith_inst(
             }
         }
         Opcode::FloatMul | Opcode::FloatAdd | Opcode::FloatSub => {
-            float_operand_to_xmm(a, 0, data.args[0], reg, consts, float_consts, deopt)?;
-            float_operand_to_xmm(a, 1, data.args[1], reg, consts, float_consts, deopt)?;
+            float_operand_to_xmm(
+                a,
+                0,
+                data.args[0],
+                reg,
+                consts,
+                float_consts,
+                proven_single_float,
+                deopt,
+            )?;
+            float_operand_to_xmm(
+                a,
+                1,
+                data.args[1],
+                reg,
+                consts,
+                float_consts,
+                proven_single_float,
+                deopt,
+            )?;
             let sub = match data.opcode {
                 Opcode::FloatAdd => 0x58,
                 Opcode::FloatMul => 0x59,
@@ -767,27 +971,6 @@ fn emit_arith_inst(
             }
         }
         other => return Err(EmitError::UnsupportedOp(op_tag(other))),
-    }
-    Ok(())
-}
-
-/// Emit a `Return`: the value goes to rax (a constant materialised directly),
-/// then `ret`. No frame to tear down.
-fn emit_return(
-    a: &mut Asm,
-    rv: Option<crate::t2::ir::Value>,
-    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
-    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
-) -> Result<(), EmitError> {
-    if let Some(v) = rv {
-        if let Some(&bits) = const_tagged.get(&v) {
-            mov_imm64(a, 0, bits as i64);
-        } else {
-            let r = *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?;
-            if r != 0 {
-                mov_rr(a, 0, r);
-            }
-        }
     }
     Ok(())
 }
@@ -824,7 +1007,11 @@ fn emit_call(
                 if let Some(&bits) = const_tagged.get(&arg) {
                     mov_imm64(a, dst, bits as i64);
                 } else {
-                    mov_rr(a, dst, *reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?);
+                    mov_rr(
+                        a,
+                        dst,
+                        *reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?,
+                    );
                 }
             }
             a.call(entry);
@@ -834,7 +1021,8 @@ fn emit_call(
             return Ok(());
         }
     }
-    // c2i_call(sym, n, a0, a1, a2): rdx=a0, rcx=a1, r8=a2.
+    // c2i_call(sym, n, a0, a1, a2, profile): rdx=a0, rcx=a1, r8=a2.
+    // T2 does not gather another inlining profile after installation, so r9=0.
     const C2I_ARGS: [u8; 3] = [2, 1, 8];
     if nargs > C2I_ARGS.len() {
         return Err(EmitError::UnsupportedOp(0xF9));
@@ -850,6 +1038,7 @@ fn emit_call(
     }
     mov_imm64(a, 7, sym as i64); // mov rdi, sym
     mov_imm64(a, 6, nargs as i64); // mov rsi, nargs
+    mov_imm64(a, 9, 0); // mov r9, no call-site profile
     mov_imm64(a, 0, c2i_call_addr as i64); // mov rax, c2i_call
     a.extend_from_slice(&[0xFF, 0xD0]); // call rax
     if let Some(&r0) = data.results.first() {
@@ -911,29 +1100,173 @@ fn emit_set_symbol_value(
     Ok(())
 }
 
-/// Collect the block-argument moves for a CFG edge (`tc.args` → the successor's
-/// block parameters).
-fn edge_moves(
+fn edge_home_moves(
     f: &Function,
     tc: &crate::t2::ir::BlockCall,
-    reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
     const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
-) -> Result<Vec<(u8, MoveSrc)>, EmitError> {
+) -> Result<Vec<(FramedHome, HomeMoveSrc)>, EmitError> {
     let params = &f.block(tc.block).params;
     if params.len() != tc.args.len() {
-        return Err(EmitError::UnsupportedOp(0xF7));
+        return Err(EmitError::UnsupportedOp(0xE7));
     }
     let mut moves = Vec::new();
-    for (&p, &arg) in params.iter().zip(&tc.args) {
-        let dst = *reg.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
-        let src = if let Some(&bits) = const_tagged.get(&arg) {
-            MoveSrc::Const(bits)
-        } else {
-            MoveSrc::Reg(*reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
+    for (&param, &arg) in params.iter().zip(&tc.args) {
+        let Some(&dst) = homes.get(&param) else {
+            continue;
         };
-        moves.push((dst, src));
+        let src = if let Some(&bits) = const_tagged.get(&arg) {
+            HomeMoveSrc::Const(bits)
+        } else {
+            HomeMoveSrc::Home(*homes.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
+        };
+        if !matches!(src, HomeMoveSrc::Home(home) if home == dst) {
+            moves.push((dst, src));
+        }
     }
     Ok(moves)
+}
+
+/// Load spilled operands into the framed emitter's reserved r9-r11 temporary
+/// bank and choose a register for a spilled result. The returned map is valid
+/// for exactly one SSA instruction; `stores` must be committed afterward.
+fn prepare_framed_inst(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+) -> Result<
+    (
+        std::collections::HashMap<crate::t2::ir::Value, u8>,
+        Vec<(FramedHome, u8)>,
+    ),
+    EmitError,
+> {
+    use std::collections::{HashMap, HashSet};
+    const TEMPS: [u8; 3] = [9, 10, 11]; // r9, r10, r11
+    let mut regs: HashMap<crate::t2::ir::Value, u8> = homes
+        .iter()
+        .filter_map(|(&value, &home)| match home {
+            FramedHome::Reg(reg) => Some((value, reg)),
+            FramedHome::Stack(_) => None,
+        })
+        .collect();
+    let mut used = HashSet::new();
+    for &arg in &data.args {
+        if const_tagged.contains_key(&arg) || regs.contains_key(&arg) {
+            continue;
+        }
+        let home = *homes.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?;
+        let reg = *TEMPS
+            .iter()
+            .find(|r| !used.contains(*r))
+            .ok_or(EmitError::UnsupportedOp(0xF1))?;
+        load_home(a, reg, home, 0);
+        regs.insert(arg, reg);
+        used.insert(reg);
+    }
+
+    let mut stores = Vec::new();
+    for &result in &data.results {
+        let Some(&home) = homes.get(&result) else {
+            continue;
+        };
+        match home {
+            FramedHome::Reg(reg) => {
+                regs.insert(result, reg);
+            }
+            FramedHome::Stack(_) => {
+                let reg = TEMPS
+                    .iter()
+                    .copied()
+                    .find(|r| !used.contains(r))
+                    // Calls may consume all three temps for arguments; after the
+                    // call the first argument register is dead and can receive
+                    // the result from rax.
+                    .or_else(|| TEMPS.first().copied())
+                    .ok_or(EmitError::UnsupportedOp(0xF1))?;
+                regs.insert(result, reg);
+                used.insert(reg);
+                stores.push((home, reg));
+            }
+        }
+    }
+    Ok((regs, stores))
+}
+
+/// Recompute one FrameState source into rax for the cold deopt path. Homes are
+/// addressed relative to the current rsp; recursive binary recipes use a push
+/// and compensate `rsp_adjust` so spilled inputs remain addressable.
+fn emit_deopt_source(
+    a: &mut Asm,
+    source: &crate::t2::frame_state::ValueSource,
+    fs: &crate::t2::frame_state::FrameState,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+    rsp_adjust: i32,
+) -> Result<(), EmitError> {
+    use crate::t2::frame_state::{RematOp, ValueSource};
+    match source {
+        ValueSource::Value { value, repr } => {
+            if *repr != crate::t2::ir::ValueRepresentation::Tagged {
+                return Err(EmitError::UnsupportedOp(0xF5));
+            }
+            if let Some(&bits) = const_tagged.get(value) {
+                mov_imm64(a, RAX, bits as i64);
+            } else {
+                load_home(
+                    a,
+                    RAX,
+                    *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF6))?,
+                    rsp_adjust,
+                );
+            }
+        }
+        ValueSource::Const(value) => mov_imm64(a, RAX, value.0 as i64),
+        ValueSource::Unbound => mov_imm64(a, RAX, bliss_rt::value::UNBOUND.0 as i64),
+        ValueSource::Remat(id) => {
+            let recipe = fs
+                .remat
+                .get(id.0 as usize)
+                .ok_or(EmitError::UnsupportedOp(0xD7))?;
+            match recipe.op {
+                RematOp::Const
+                | RematOp::BoxFixnum
+                | RematOp::UnboxFixnum
+                | RematOp::BoxFloat
+                | RematOp::UnboxFloat => {
+                    let input = recipe
+                        .inputs
+                        .first()
+                        .ok_or(EmitError::UnsupportedOp(0xD7))?;
+                    emit_deopt_source(a, input, fs, homes, const_tagged, rsp_adjust)?;
+                }
+                RematOp::FixnumAdd | RematOp::FixnumSub => {
+                    if recipe.inputs.len() != 2 {
+                        return Err(EmitError::UnsupportedOp(0xD7));
+                    }
+                    emit_deopt_source(a, &recipe.inputs[0], fs, homes, const_tagged, rsp_adjust)?;
+                    push_reg(a, RAX);
+                    emit_deopt_source(
+                        a,
+                        &recipe.inputs[1],
+                        fs,
+                        homes,
+                        const_tagged,
+                        rsp_adjust + 8,
+                    )?;
+                    pop_reg(a, 11);
+                    if recipe.op == RematOp::FixnumAdd {
+                        alu_rr(a, 0x01, RAX, 11);
+                    } else {
+                        alu_rr(a, 0x29, 11, RAX);
+                        mov_rr(a, RAX, 11);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Emit a fused fixnum comparison (guard operands, `cmp`), returning the condition
@@ -946,7 +1279,8 @@ fn emit_fused_compare(
     proven: &std::collections::HashSet<crate::t2::ir::Value>,
     deopt: bliss_rt::asm::Label,
 ) -> Result<Cc, EmitError> {
-    let base = fixnum_cmp_cc(cmp_data.opcode).ok_or(EmitError::UnsupportedOp(op_tag(cmp_data.opcode)))?;
+    let base =
+        fixnum_cmp_cc(cmp_data.opcode).ok_or(EmitError::UnsupportedOp(op_tag(cmp_data.opcode)))?;
     let (l, r) = (cmp_data.args[0], cmp_data.args[1]);
     let tagged32 = |c: i64| {
         i32::try_from(bliss_rt::value::BlissVal::from_fixnum(c).0 as i64)
@@ -1088,8 +1422,8 @@ fn emit_type_check(
     pool: &mut Vec<u8>,
     const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
 ) -> Result<(), EmitError> {
-    use crate::t2::ir::{AuxData, Opcode};
     use crate::t2::ir::TypeBits;
+    use crate::t2::ir::{AuxData, Opcode};
     if data.results.is_empty() || data.args.is_empty() {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
     }
@@ -1137,8 +1471,8 @@ fn emit_type_check(
         a.jcc(Cc::Ne, not_found);
         mov_rr(a, SCRATCH, xr);
         alu_r_imm(a, AND, SCRATCH, -8); // clear the low tag bits
-        // cmp byte ptr [scratch + 7], BIGNUM. ObjectHeader::type_id occupies
-        // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
+                                        // cmp byte ptr [scratch + 7], BIGNUM. ObjectHeader::type_id occupies
+                                        // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
         a.extend_from_slice(&[0x80, 0x7A, 0x07, bliss_rt::object::type_id::BIGNUM]);
         a.jcc(Cc::E, found);
     } else if bits == TypeBits::STRING {
@@ -1204,36 +1538,138 @@ fn guard_simple_string(a: &mut Asm, x: u8, deopt: bliss_rt::asm::Label) {
     a.bind(layout_ok);
 }
 
-/// Guarded raw UTF-8 byte-length load. The result is a tagged non-negative
-/// fixnum. This is intentionally below CL:LENGTH: byte length is useful for
-/// emptiness/bounds checks, but is not character length for non-ASCII strings.
-fn emit_string_byte_length(
+/// Emit an explicit simple-string layout guard.  Its result is the same tagged
+/// value with a refined SSA identity, which gives later raw layout operations a
+/// data dependency on the proof and lets post-inlining guard elimination forward
+/// a dominated guard result to the dominating guard's result.
+fn emit_string_layout_guard(
     a: &mut Asm,
     data: &crate::t2::ir::InstData,
     reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
     pool: &mut Vec<u8>,
     deopt: bliss_rt::asm::Label,
 ) -> Result<(), EmitError> {
-    use crate::t2::ir::Opcode;
+    use crate::t2::ir::{AuxData, Opcode};
     if data.args.len() != 1
         || data.results.len() != 1
+        || !matches!(data.aux, AuxData::StringLayout)
         || !data.flags.guard
         || !data.flags.effectful
         || data.frame_state.is_none()
     {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::Guard)));
+    }
+    let xr = *reg
+        .get(&data.args[0])
+        .ok_or(EmitError::UnsupportedOp(0xF2))?;
+    guard_simple_string(a, xr, deopt);
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    mov_rr(a, dst, xr);
+    Ok(())
+}
+
+/// Guard a tagged value as a cons and return the same value under a refined SSA
+/// identity.  Field loads consume that identity and therefore contain no
+/// private type check; redundant proofs are removed by `GuardElim` before this
+/// emitter runs.
+fn emit_cons_guard(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    deopt: bliss_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::{AuxData, Opcode, TypeBits};
+    if data.args.len() != 1
+        || data.results.len() != 1
+        || !matches!(data.aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
+        || !data.flags.guard
+        || !data.flags.effectful
+        || data.frame_state.is_none()
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(Opcode::Guard)));
+    }
+    let xr = *reg
+        .get(&data.args[0])
+        .ok_or(EmitError::UnsupportedOp(0xF2))?;
+    mov_rr(a, SCRATCH, xr);
+    alu_r_imm(a, 4 /* AND */, SCRATCH, 7);
+    alu_r_imm(
+        a,
+        7, /* CMP */
+        SCRATCH,
+        bliss_rt::value::TAG_CONS as i32,
+    );
+    a.jcc(Cc::Ne, deopt);
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    mov_rr(a, dst, xr);
+    Ok(())
+}
+
+/// Load CAR/CDR from a value refined by an explicit dominating cons guard.
+fn emit_cons_field_load(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    if data.args.len() != 1
+        || data.results.len() != 1
+        || !matches!(data.opcode, Opcode::Car | Opcode::Cdr)
+        || data.flags.guard
+        || data.flags.effectful
+        || data.frame_state.is_some()
+    {
+        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+    }
+    let xr = *reg
+        .get(&data.args[0])
+        .ok_or(EmitError::UnsupportedOp(0xF2))?;
+    // Cons cells are headerless and the tagged pointer differs only in its low
+    // bits. Keep the base in reserved SCRATCH so result/input coalescing is safe.
+    mov_rr(a, SCRATCH, xr);
+    alu_r_imm(a, 4 /* AND */, SCRATCH, -8);
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    let offset = if data.opcode == Opcode::Car { 0 } else { 8 };
+    mov_mem64_disp8(a, dst, SCRATCH, offset);
+    Ok(())
+}
+
+/// Raw UTF-8 byte-length load from an explicitly layout-guarded string.  The
+/// result is a tagged non-negative fixnum. This is intentionally below
+/// CL:LENGTH: byte length is useful for emptiness/bounds checks, but is not
+/// character length for non-ASCII strings.
+fn emit_string_byte_length(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+) -> Result<(), EmitError> {
+    use crate::t2::ir::Opcode;
+    if data.args.len() != 1
+        || data.results.len() != 1
+        || data.flags.guard
+        || data.flags.effectful
+        || data.frame_state.is_some()
+    {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::StringByteLength)));
     }
-    let xr = *reg.get(&data.args[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
-    guard_simple_string(a, xr, deopt);
+    let xr = *reg
+        .get(&data.args[0])
+        .ok_or(EmitError::UnsupportedOp(0xF2))?;
+    mov_rr(a, SCRATCH, xr);
+    alu_r_imm(a, 4 /* AND */, SCRATCH, -8);
     let dst = framed_alloc(reg, pool, data.results[0])?;
     mov_mem64_disp8(a, dst, SCRATCH, 8);
     shl_imm(a, dst, 3);
     Ok(())
 }
 
-/// Guarded ASCII fast path for `(CHAR simple-string index)`. UTF-8 leading
-/// bytes >= 128 deliberately deopt so the stdlib performs full codepoint
-/// decoding; the direct path therefore never changes Lisp-visible semantics.
+/// Guarded ASCII fast path for `(CHAR simple-string index)`.  The string layout
+/// was proved by an explicit dominating guard; this operation guards only its
+/// index, bounds, and UTF-8/ASCII assumptions. UTF-8 leading bytes >= 128 deopt
+/// so the stdlib performs full codepoint decoding.
 fn emit_string_ascii_char_at(
     a: &mut Asm,
     data: &crate::t2::ir::InstData,
@@ -1251,8 +1687,11 @@ fn emit_string_ascii_char_at(
     {
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::StringAsciiCharAt)));
     }
-    let xr = *reg.get(&data.args[0]).ok_or(EmitError::UnsupportedOp(0xF2))?;
-    guard_simple_string(a, xr, deopt);
+    let xr = *reg
+        .get(&data.args[0])
+        .ok_or(EmitError::UnsupportedOp(0xF2))?;
+    mov_rr(a, SCRATCH, xr);
+    alu_r_imm(a, 4 /* AND */, SCRATCH, -8);
 
     let dst = framed_alloc(reg, pool, data.results[0])?;
     let index = data.args[1];
@@ -1300,7 +1739,16 @@ fn is_fixnum_producing_op(op: crate::t2::ir::Opcode) -> bool {
     use crate::t2::ir::Opcode::*;
     matches!(
         op,
-        FixnumAdd | FixnumSub | FixnumMul | FixnumNeg | LogAnd | LogOr | LogXor | LogNot | FixnumShl | FixnumShr
+        FixnumAdd
+            | FixnumSub
+            | FixnumMul
+            | FixnumNeg
+            | LogAnd
+            | LogOr
+            | LogXor
+            | LogNot
+            | FixnumShl
+            | FixnumShr
     )
 }
 
@@ -1328,8 +1776,60 @@ pub fn emit_framed(
     c2i_clear_mv_addr: u64,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
+    emit_framed_inner(
+        f,
+        c2i_deopt_addr,
+        c2i_deopt_t2_addr,
+        c2i_call_addr,
+        c2i_load_global_addr,
+        c2i_store_global_addr,
+        c2i_clear_mv_addr,
+        None,
+        self_sym,
+    )
+}
+
+/// Emit production T2 code whose native roots are synchronized through shadow
+/// slots appended after `activation_slots` in the owning BlissStack frame.
+pub fn emit_framed_with_activation_slots(
+    f: &Function,
+    c2i_deopt_addr: u64,
+    c2i_deopt_t2_addr: u64,
+    c2i_call_addr: u64,
+    c2i_load_global_addr: u64,
+    c2i_store_global_addr: u64,
+    c2i_clear_mv_addr: u64,
+    activation_slots: u16,
+    self_sym: Option<u32>,
+) -> Result<FramedCode, EmitError> {
+    emit_framed_inner(
+        f,
+        c2i_deopt_addr,
+        c2i_deopt_t2_addr,
+        c2i_call_addr,
+        c2i_load_global_addr,
+        c2i_store_global_addr,
+        c2i_clear_mv_addr,
+        Some(activation_slots),
+        self_sym,
+    )
+}
+
+fn emit_framed_inner(
+    f: &Function,
+    c2i_deopt_addr: u64,
+    c2i_deopt_t2_addr: u64,
+    c2i_call_addr: u64,
+    c2i_load_global_addr: u64,
+    c2i_store_global_addr: u64,
+    c2i_clear_mv_addr: u64,
+    activation_slots: Option<u16>,
+    self_sym: Option<u32>,
+) -> Result<FramedCode, EmitError> {
     use crate::t2::frame_state::ValueSource;
-    use crate::t2::ir::{AuxData, Block, Inst, Opcode, Value, ValueDef, ValueRepresentation};
+    use crate::t2::ir::{
+        AuxData, Block, Inst, Opcode, TypeBits, Value, ValueDef, ValueRepresentation,
+    };
     use std::collections::{HashMap, HashSet};
 
     let entry = f.entry();
@@ -1345,10 +1845,12 @@ pub fn emit_framed(
             Opcode::Call | Opcode::SymbolValue | Opcode::SetSymbolValue | Opcode::ClearMv
         )
     };
-    let has_ir_calls = f
-        .block_order()
-        .iter()
-        .any(|&b| f.block(b).insts.iter().any(|&i| is_call_like(f.inst(i).opcode)));
+    let has_ir_calls = f.block_order().iter().any(|&b| {
+        f.block(b)
+            .insts
+            .iter()
+            .any(|&i| is_call_like(f.inst(i).opcode))
+    });
 
     let has_inlined_scopes = f.block_order().iter().any(|&b| {
         f.block(b).insts.iter().any(|&inst| {
@@ -1388,6 +1890,19 @@ pub fn emit_framed(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+    // OSR entry is another simultaneous use point. Values reconstructed from
+    // the live lower-tier frame must not have their registers recycled merely
+    // because ordinary entry-flow liveness considers their definitions local.
+    for osr in &f.osr_entries {
+        let fs = f.frame_states.get(osr.frame_state);
+        for scope in &fs.scopes {
+            for src in scope.locals.iter().chain(scope.stack.iter()) {
+                if let ValueSource::Value { value, .. } = src {
+                    deopt_live.insert(*value);
                 }
             }
         }
@@ -1442,7 +1957,6 @@ pub fn emit_framed(
             }
         }
     }
-
     // Use counts: to decide which comparisons can be fused into a branch. The
     // terminator is itself in `block.insts`, so its own `args` are already counted
     // by the inst loop — only the edge (BlockCall) arguments are counted here.
@@ -1457,6 +1971,16 @@ pub fn emit_framed(
             for tc in &f.inst(t).targets {
                 for &v in &tc.args {
                     *uses.entry(v).or_default() += 1;
+                }
+            }
+        }
+    }
+    for osr in &f.osr_entries {
+        let fs = f.frame_states.get(osr.frame_state);
+        for scope in &fs.scopes {
+            for src in scope.locals.iter().chain(scope.stack.iter()) {
+                if let ValueSource::Value { value, .. } = src {
+                    *uses.entry(*value).or_default() += 1;
                 }
             }
         }
@@ -1501,6 +2025,30 @@ pub fn emit_framed(
             }
         }
     }
+    // Parameter declarations are checked by the shared bytecode/native entry
+    // boundary before this code runs. Seed the emitter's proof sets from their
+    // entry SSA types so typed operations do not emit a second, redundant tag
+    // guard. Declared functions do not expose the unchecked register-entry ABI
+    // below, keeping this assumption true for recursive compiled calls too.
+    let type_is = |value: Value, bits: TypeBits| {
+        let actual = f.value(value).ty.bits;
+        !actual.is_bottom() && actual.meet(bits) == actual
+    };
+    let declared_fixnums: HashSet<Value> = f
+        .block(entry)
+        .params
+        .iter()
+        .copied()
+        .filter(|&value| f.is_entry_param_checked(value) && type_is(value, TypeBits::FIXNUM))
+        .collect();
+    let declared_single_floats: HashSet<Value> = f
+        .block(entry)
+        .params
+        .iter()
+        .copied()
+        .filter(|&value| f.is_entry_param_checked(value) && type_is(value, TypeBits::SINGLE_FLOAT))
+        .collect();
+    let has_declared_params = !declared_fixnums.is_empty() || !declared_single_floats.is_empty();
     // The result of a fixnum-producing op is a fixnum wherever it is used (SSA: the
     // def dominates every use), so those uses never need a re-guard. This removes
     // the redundant intermediate guards in a chain of fixnum/bitwise ops — the bulk
@@ -1539,262 +2087,122 @@ pub fn emit_framed(
         }
     }
 
-    // Register assignment. rax = return/float scratch, rdx = guard scratch, rdi =
-    // frame slots (interp entry only). Value pool: rcx, r8, r9, r10, r11 — arg
-    // registers first, all with guard-safe low bytes. Constants and fused
-    // comparisons take no register; exhausting the pool declines T2 (=> stay T1).
-    let mut reg: HashMap<Value, u8> = HashMap::new();
-    // With calls: callee-saved value pool [rbx, r12, r13, r14, r15] (survive the
-    // c2i call). Without: caller-saved [rcx, r8, r9, r10, r11] (arg regs first).
-    let mut pool: Vec<u8> = if has_calls {
-        vec![15, 14, 13, 12, 3]
-    } else {
-        vec![11, 10, 9, 8, 1]
-    };
-    // Call-local pool (bliss-uox): a value whose live range crosses NO call can
-    // live in a caller-saved register — it is not clobbered because no call
-    // happens while it is live. This roughly extends the 5-register callee-saved
-    // budget so loops with several live temporaries reach T2 instead of declining.
-    // Only registers free of every call/scratch ABI role qualify: rdx is guard
-    // scratch, rcx/r8 are c2i-call arg registers, and r9/r10 are the register-entry
-    // (self-call) arg registers — so r11 is always safe, and r9/r10 too when the
-    // function never self-calls. Empty for a call-free function (its single pool is
-    // already caller-saved, so nothing to split).
-    let self_recursive = self_sym.is_some_and(|ss| {
-        blocks.iter().any(|&b| {
-            f.block(b).insts.iter().any(|&i| {
-                let d = f.inst(i);
-                d.opcode == Opcode::Call && matches!(d.aux, AuxData::CallTarget(s) if s == ss)
-            })
-        })
-    });
-    let mut pool_cl: Vec<u8> = if !has_calls {
-        Vec::new()
-    } else if self_recursive {
-        vec![11]
-    } else {
-        vec![11, 10, 9]
-    };
-    // A caller-saved value register belongs to `pool_cl`; anything else to `pool`.
-    let is_cl_reg = |r: u8| has_calls && matches!(r, 9 | 10 | 11);
-    // If every Return returns the same non-constant value that isn't an entry
-    // parameter (e.g. an arithmetic result, or a merge block param), bind it to
-    // rax so it lands in the return register with no extra move. Not with calls —
-    // rax is caller-saved and a call would clobber it.
-    let ret_vals: HashSet<Value> = blocks
-        .iter()
-        .filter_map(|&b| {
-            let t = f.terminator(b)?;
-            let td = f.inst(t);
-            (td.opcode == Opcode::Return).then(|| td.args.first().copied()).flatten()
-        })
-        .collect();
-    if !has_calls && ret_vals.len() == 1 {
-        let v = *ret_vals.iter().next().unwrap();
-        if !const_tagged.contains_key(&v)
-            && !f.block(entry).params.contains(&v)
+    // Production allocation: SSA -> MachFunc -> regalloc2. A value with one
+    // location for its entire reported live range remains register-resident;
+    // any split range gets a stable spill home consumed by the framed templates.
+    let mut machine = crate::t2::lower::lower(f);
+    crate::t2::regalloc::allocate_framed(&mut machine)
+        .map_err(|error| EmitError::RegAlloc(format!("{error:?}")))?;
+    if !machine.insts.is_empty() && machine.inst_allocations.len() != machine.insts.len() {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
+    let mut ranges: HashMap<Value, Vec<Location>> = HashMap::new();
+    for range in &machine.value_locations {
+        if range.vreg.class == RegClass::Gpr {
+            ranges
+                .entry(Value(range.vreg.num))
+                .or_default()
+                .push(range.location);
+        }
+    }
+    let mut homes: HashMap<Value, FramedHome> = HashMap::new();
+    let mut next_stack = machine.num_spill_slots;
+    for value_num in 0..f.num_values() as u32 {
+        let value = Value(value_num);
+        if const_tagged.contains_key(&value)
+            || fused.iter().any(|&i| f.inst(i).results.contains(&value))
         {
-            reg.insert(v, 0); // rax
+            continue;
         }
-    }
-    for &p in &f.block(entry).params {
-        framed_alloc(&mut reg, &mut pool, p)?; // rcx, r8, r9, r10 in order
-    }
-    for &b in &blocks {
-        if b != entry {
-            for &p in &f.block(b).params {
-                framed_alloc(&mut reg, &mut pool, p)?;
+        let locs = ranges.get(&value).cloned().unwrap_or_default();
+        let stable = locs
+            .first()
+            .copied()
+            .filter(|first| locs.iter().all(|loc| loc == first));
+        let home = match stable {
+            Some(Location::Register(preg)) if preg.class == RegClass::Gpr => {
+                FramedHome::Reg(gpr_enc(preg)?)
             }
-        }
-    }
-    // Register coalescing (SBCL's in-place trick): a value that flows into a block
-    // parameter on its ONLY use can share that parameter's register — the producer
-    // computes straight into it and the edge move disappears. Both predecessors of
-    // a merge may coalesce onto the same param register (each writes it directly).
-    for &b in &blocks {
-        if let Some(t) = f.terminator(b) {
-            for tc in &f.inst(t).targets {
-                let params = f.block(tc.block).params.clone();
-                for (&p, &arg) in params.iter().zip(&tc.args) {
-                    if const_tagged.contains_key(&arg)
-                        || reg.contains_key(&arg)
-                        || uses.get(&arg) != Some(&1)
-                    {
-                        continue;
-                    }
-                    if let Some(&pr) = reg.get(&p) {
-                        reg.insert(arg, pr); // producer writes P's register directly
-                    }
-                }
+            Some(Location::Stack(slot)) => FramedHome::Stack(slot.0),
+            _ => {
+                let slot = next_stack;
+                next_stack += 1;
+                FramedHome::Stack(slot)
             }
-        }
-    }
-    // Constant hoisting: a large constant (its tagged value exceeds imm32, so it
-    // cannot fold into an immediate) used more than once gets its own register,
-    // materialised ONCE at entry instead of re-loading the 64-bit immediate at every
-    // use — e.g. a 32-bit mask reused across a hashing round.
-    let mut hoisted: Vec<Value> = Vec::new();
-    for (&v, &c) in &consts {
-        let tagged = bliss_rt::value::BlissVal::from_fixnum(c).0;
-        if i32::try_from(tagged as i64).is_err()
-            && uses.get(&v).copied().unwrap_or(0) >= 2
-            && !reg.contains_key(&v)
-        {
-            if let Some(r) = pool.pop() {
-                reg.insert(v, r);
-                hoisted.push(v);
-            }
-        }
-    }
-
-    // Block-local liveness: a value defined in a block and used only there can
-    // return its register to the pool after its last use in that block, so it can
-    // be reused (relieves register pressure — e.g. fib's per-branch temporaries).
-    // Always sound: block-local live ranges never overlap across blocks, and a
-    // deopt discards register state entirely (it re-runs in the interpreter).
-    let mut def_block: HashMap<Value, Block> = HashMap::new();
-    let mut use_blocks: HashMap<Value, HashSet<Block>> = HashMap::new();
-    for &b in &blocks {
-        for &inst in &f.block(b).insts {
-            for &r in &f.inst(inst).results {
-                def_block.insert(r, b);
-            }
-            for &v in &f.inst(inst).args {
-                use_blocks.entry(v).or_default().insert(b);
-            }
-        }
-        if let Some(t) = f.terminator(b) {
-            for tc in &f.inst(t).targets {
-                for &v in &tc.args {
-                    use_blocks.entry(v).or_default().insert(b);
-                }
-            }
-        }
-    }
-    let is_block_local = |v: Value| match def_block.get(&v) {
-        Some(&db) => use_blocks.get(&v).is_none_or(|s| s.iter().all(|&ub| ub == db)),
-        None => false,
-    };
-
-    for &b in &blocks {
-        let insts = f.block(b).insts.clone();
-        // Last inst index in this block that uses each value (usize::MAX if the
-        // terminator uses it — such values live to the block's edge).
-        let mut last_use: HashMap<Value, usize> = HashMap::new();
-        for (idx, &inst) in insts.iter().enumerate() {
-            let d = f.inst(inst);
-            let at = if d.opcode.is_terminator() { usize::MAX } else { idx };
-            for &v in &d.args {
-                last_use.insert(v, at);
-            }
-            // A guard's FrameState references (deopt-live values) count as a use at
-            // the guard, so a value read only *before* the guard still holds its
-            // register there for reconstruction (bliss-mba).
-            if precise {
-                if let Some(fsid) = d.frame_state {
-                    let fs = f.frame_states.get(fsid);
-                    for scope in &fs.scopes {
-                        for src in scope.locals.iter().chain(scope.stack.iter()) {
-                            if let ValueSource::Value { value, .. } = src {
-                                last_use.insert(*value, at);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(t) = f.terminator(b) {
-            for tc in &f.inst(t).targets {
-                for &v in &tc.args {
-                    last_use.insert(v, usize::MAX);
-                }
-            }
-        }
-        // Instruction indices in this block that lower to a call (they clobber the
-        // caller-saved `pool_cl` registers). A block-local value whose live range
-        // spans one of these MUST live in a callee-saved register (bliss-uox).
-        let call_indices: Vec<usize> = insts
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| is_call_like(f.inst(**i).opcode))
-            .map(|(idx, _)| idx)
-            .collect();
-        // A value defined at `def` and last used at `l` is call-local iff no call
-        // sits strictly between them. `usize::MAX` (live to the block edge) counts
-        // as the block end. A call at exactly `l` is the value's own consuming call
-        // (it is an argument, moved to an arg register first), so it does not span.
-        let crosses_call = |def: usize, l: usize| {
-            let end = if l == usize::MAX { insts.len() } else { l };
-            call_indices.iter().any(|&c| def < c && c < end)
         };
-        // Block-local values allocated in this block, pending free at their last use.
-        let mut pending: Vec<(Value, usize)> = Vec::new();
-        for (idx, &inst) in insts.iter().enumerate() {
-            // Free any block-local value whose last use is strictly before this inst,
-            // returning its register to the pool it came from.
-            pending.retain(|&(v, last)| {
-                if last < idx {
-                    if let Some(&r) = reg.get(&v) {
-                        if is_cl_reg(r) {
-                            pool_cl.push(r);
-                        } else {
-                            pool.push(r);
-                        }
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
-            let d = f.inst(inst);
-            if is_const_opcode(d.opcode) || d.opcode.is_terminator() || fused.contains(&inst) {
+        homes.insert(value, home);
+    }
+    // Convert regalloc2's split-aware live ranges into exact tagged roots for
+    // each runtime safepoint. The rich emitter uses stable `homes`, so these are
+    // the locations that must be synchronized, not regalloc2's transient edit
+    // locations. Only tagged values are GC roots; unboxed GPR values are omitted.
+    let mut safepoint_roots: HashMap<Inst, Vec<Value>> = HashMap::new();
+    if activation_slots.is_some() {
+        for (mi, machine_inst) in machine.insts.iter().enumerate() {
+            if !machine_inst.safepoint {
                 continue;
             }
-            if let Some(&r0) = d.results.first() {
-                // Call-local (may use a caller-saved register): block-local and its
-                // live range spans no call.
-                let r0_call_local = has_calls
-                    && is_block_local(r0)
-                    && !crosses_call(idx, *last_use.get(&r0).unwrap_or(&idx));
-                if reg.contains_key(&r0) {
-                    // Already assigned (e.g. the return value bound to rax) — keep it.
-                } else {
-                    // In-place: reuse a dying block-local first operand's register for
-                    // the result, so a binary op needs no `mov dst, a` before it. Skip
-                    // when the first operand is also the second (an in-place untag
-                    // would corrupt the shared operand).
-                    let inplace = d.args.first().copied().filter(|&v| {
-                        !consts.contains_key(&v)
-                            && is_block_local(v)
-                            && last_use.get(&v) == Some(&idx)
-                            && reg.contains_key(&v)
-                            && d.args.get(1) != Some(&v)
-                            // A deopt-live operand must stay intact for its guard's
-                            // frame reconstruction; never overwrite it in place
-                            // (bliss-mba).
-                            && !(precise && deopt_live.contains(&v))
-                            // Never inherit a caller-saved (call-local) register for a
-                            // result that outlives a call — it would be clobbered
-                            // (bliss-uox).
-                            && !(is_cl_reg(reg[&v]) && !r0_call_local)
-                    });
-                    if let Some(v) = inplace {
-                        reg.insert(r0, reg[&v]);
-                        pending.retain(|&(pv, _)| pv != v); // consumed into r0
-                    } else if r0_call_local && !pool_cl.is_empty() {
-                        // Prefer a caller-saved register; fall back to callee-saved.
-                        let r = pool_cl.pop().or_else(|| pool.pop()).ok_or(EmitError::UnsupportedOp(0xF1))?;
-                        reg.insert(r0, r);
-                    } else {
-                        framed_alloc(&mut reg, &mut pool, r0)?;
-                    }
+            let mi_u32 = u32::try_from(mi).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
+            let source = machine_inst
+                .source_inst
+                .ok_or(EmitError::UnsupportedOp(0xFD))?;
+            let mut live = HashSet::new();
+            for range in &machine.value_locations {
+                if range.vreg.class != RegClass::Gpr || range.start > mi_u32 || mi_u32 >= range.end
+                {
+                    continue;
                 }
-                if is_block_local(r0) {
-                    pending.push((r0, *last_use.get(&r0).unwrap_or(&idx)));
+                let value = Value(range.vreg.num);
+                // A call result's range starts at the safepoint, but the value
+                // does not exist until the call returns. Restoring a pre-call
+                // shadow for it would overwrite the real result.
+                if machine_inst.defs.contains(&range.vreg) {
+                    continue;
+                }
+                if f.value(value).repr == ValueRepresentation::Tagged && homes.contains_key(&value)
+                {
+                    live.insert(value);
                 }
             }
+            // Early uses can end at the safepoint itself. Include them
+            // explicitly in case the allocator's half-open debug range ends at
+            // this instruction boundary.
+            for vreg in &machine_inst.uses {
+                if vreg.class == RegClass::Gpr {
+                    let value = Value(vreg.num);
+                    if f.value(value).repr == ValueRepresentation::Tagged
+                        && homes.contains_key(&value)
+                    {
+                        live.insert(value);
+                    }
+                }
+            }
+            let mut live: Vec<_> = live.into_iter().collect();
+            live.sort_by_key(|value| value.0);
+            safepoint_roots.insert(source, live);
         }
     }
+    let shadow_root_slots = safepoint_roots.values().map(Vec::len).max().unwrap_or(0);
+    let shadow_root_slots =
+        u16::try_from(shadow_root_slots).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
+    let frame_base_home = if shadow_root_slots == 0 {
+        None
+    } else {
+        let home = FramedHome::Stack(next_stack);
+        next_stack += 1;
+        Some(home)
+    };
+    let native_spill_slots = next_stack;
+    let regalloc_spill_slots = machine.num_spill_slots;
+    let allocation_edits = machine.allocation_edits.len();
+    let spill_bytes = ((native_spill_slots as usize * 8) + 15) & !15;
+    let reg: HashMap<Value, u8> = homes
+        .iter()
+        .filter_map(|(&value, &home)| match home {
+            FramedHome::Reg(r) => Some((value, r)),
+            FramedHome::Stack(_) => None,
+        })
+        .collect();
 
     let mut a = Asm::new();
     let deopt = a.label();
@@ -1817,6 +2225,8 @@ pub fn emit_framed(
                         Opcode::Call
                             | Opcode::GenericEq
                             | Opcode::TypeCheck
+                            | Opcode::Car
+                            | Opcode::Cdr
                             | Opcode::SymbolValue
                             | Opcode::SetSymbolValue
                             | Opcode::ClearMv
@@ -1837,10 +2247,10 @@ pub fn emit_framed(
         block_label.insert(b, a.label());
     }
 
-    // Callee-saved registers to preserve (call functions only), and whether an
+    // Callee-saved registers used by allocated homes, and whether an
     // 8-byte pad is needed to keep rsp 16-aligned before a call (entry rsp%16==8,
     // each push subtracts 8, so an even push count needs one pad).
-    let saved: Vec<u8> = if has_calls {
+    let saved: Vec<u8> = {
         let mut s: Vec<u8> = reg
             .values()
             .copied()
@@ -1850,11 +2260,13 @@ pub fn emit_framed(
             .collect();
         s.sort_unstable();
         s
-    } else {
-        Vec::new()
     };
     let pad = has_calls && saved.len() % 2 == 0;
     let emit_epilogue = |a: &mut Asm| {
+        if spill_bytes != 0 {
+            a.extend_from_slice(&[0x48, 0x81, 0xC4]);
+            a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+        }
         if pad {
             a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
         }
@@ -1867,7 +2279,9 @@ pub fn emit_framed(
     // enter directly (args in registers) instead of paying c2i dispatch.
     let reg_entry_label = a.label();
     let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
-    let has_reg_entry = has_calls && f.block(entry).params.len() <= arg_regs.len();
+    let has_reg_entry = !has_declared_params
+        && frame_base_home.is_none()
+        && f.block(entry).params.len() <= arg_regs.len();
 
     // Interpreter entry (offset 0): with calls, push the callee-saved value
     // registers and pad; then load entry params from the frame slots into their
@@ -1878,9 +2292,22 @@ pub fn emit_framed(
     if pad {
         a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
     }
+    if spill_bytes != 0 {
+        a.extend_from_slice(&[0x48, 0x81, 0xEC]);
+        a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+    }
+    if let Some(home) = frame_base_home {
+        store_home(&mut a, home, 7 /* rdi */, 0);
+    }
     for (i, &p) in f.block(entry).params.iter().enumerate() {
-        let r = *reg.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
-        mov_from_frame(&mut a, r, 7 /* rdi */, i);
+        let home = *homes.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
+        match home {
+            FramedHome::Reg(r) => mov_from_frame(&mut a, r, 7 /* rdi */, i),
+            FramedHome::Stack(_) => {
+                mov_from_frame(&mut a, RAX, 7 /* rdi */, i);
+                store_home(&mut a, home, RAX, 0);
+            }
+        }
     }
     let compiled_entry;
     if has_reg_entry {
@@ -1895,63 +2322,132 @@ pub fn emit_framed(
         if pad {
             a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
         }
+        if spill_bytes != 0 {
+            a.extend_from_slice(&[0x48, 0x81, 0xEC]);
+            a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+        }
         for (i, &p) in f.block(entry).params.iter().enumerate() {
-            let r = *reg.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
-            mov_rr(&mut a, r, arg_regs[i]);
+            let home = *homes.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
+            store_home(&mut a, home, arg_regs[i], 0);
         }
     } else {
         // Frameless: the body starts here with args already in their value regs.
         compiled_entry = if has_calls { 0 } else { a.here() };
     }
 
+    let mut root_sync_sites = Vec::new();
+    let mut emitted_safepoints = 0usize;
+
     // Emit each block: bind its label, emit its instructions, then its terminator
     // (with block-parameter moves on each out-edge).
     for (bi, &b) in blocks.iter().enumerate() {
         a.bind(block_label[&b]);
-        // Materialise hoisted constants once, at the entry block (reached by both
-        // the interpreter and register entries), before any use.
-        if b == entry {
-            for &v in &hoisted {
-                let r = *reg.get(&v).ok_or(EmitError::UnsupportedOp(0xF2))?;
-                mov_imm64(&mut a, r, const_tagged[&v] as i64);
-            }
-        }
         // Fixnum operands proven by a dominating guard: the entry block dominates
         // all others, so its guards carry over (the entry block itself starts fresh).
-        let mut proven: HashSet<Value> = if b == entry { HashSet::new() } else { entry_guarded.clone() };
+        let mut proven: HashSet<Value> = if b == entry {
+            HashSet::new()
+        } else {
+            entry_guarded.clone()
+        };
+        proven.extend(declared_fixnums.iter().copied());
         proven.extend(fixnum_valued.iter().copied());
         for &inst in &f.block(b).insts {
             let d = f.inst(inst).clone();
-            if is_const_opcode(d.opcode)
-                || d.opcode.is_terminator()
-                || fused.contains(&inst)
-            {
+            if is_const_opcode(d.opcode) || d.opcode.is_terminator() || fused.contains(&inst) {
                 continue;
             }
+            let roots = if activation_slots.is_some() && is_call_like(d.opcode) {
+                emitted_safepoints += 1;
+                Some(
+                    safepoint_roots
+                        .get(&inst)
+                        .ok_or(EmitError::UnsupportedOp(0xFD))?,
+                )
+            } else {
+                None
+            };
+            // Dying call arguments may share a stable home with the call's
+            // result. They still need synchronization while the callee runs,
+            // but restoring them afterward would overwrite that result. SSA
+            // guarantees a genuinely live-across value cannot share a home
+            // with a simultaneously live result, so home overlap is the exact
+            // exclusion needed here.
+            let result_homes: HashSet<_> = d
+                .results
+                .iter()
+                .filter_map(|value| homes.get(value).copied())
+                .collect();
+            let restore_roots: Option<HashSet<Value>> = roots.map(|roots| {
+                roots
+                    .iter()
+                    .copied()
+                    .filter(|value| {
+                        homes
+                            .get(value)
+                            .is_some_and(|home| !result_homes.contains(home))
+                    })
+                    .collect()
+            });
+            if let (Some(roots), Some(frame_base), Some(base_slots)) =
+                (roots, frame_base_home, activation_slots)
+            {
+                emit_shadow_root_sync(
+                    &mut a,
+                    roots,
+                    &homes,
+                    frame_base,
+                    base_slots,
+                    shadow_root_slots,
+                )?;
+            }
+            let sync_offset = a.here();
+            let (mut inst_reg, result_stores) =
+                prepare_framed_inst(&mut a, &d, &homes, &const_tagged)?;
+            let mut inst_pool = Vec::new();
             if d.opcode == Opcode::Call {
                 let self_entry = has_reg_entry.then_some(reg_entry_label);
-                emit_call(&mut a, &d, &reg, &const_tagged, c2i_call_addr, self_sym, self_entry)?;
+                emit_call(
+                    &mut a,
+                    &d,
+                    &inst_reg,
+                    &const_tagged,
+                    c2i_call_addr,
+                    self_sym,
+                    self_entry,
+                )?;
             } else if d.opcode == Opcode::GenericEq {
-                emit_generic_eq(&mut a, &d, &mut reg, &mut pool, &const_tagged)?;
+                emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
-                emit_type_check(&mut a, &d, &mut reg, &mut pool, &const_tagged)?;
-            } else if d.opcode == Opcode::StringByteLength {
+                emit_type_check(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
+            } else if d.opcode == Opcode::Guard {
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
-                emit_string_byte_length(&mut a, &d, &mut reg, &mut pool, label)?;
+                match d.aux {
+                    AuxData::StringLayout => {
+                        emit_string_layout_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
+                    }
+                    AuxData::TypeTag(t) if t.bits == TypeBits::CONS => {
+                        emit_cons_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
+                    }
+                    _ => return Err(EmitError::UnsupportedOp(op_tag(Opcode::Guard))),
+                }
+            } else if matches!(d.opcode, Opcode::Car | Opcode::Cdr) {
+                emit_cons_field_load(&mut a, &d, &mut inst_reg, &mut inst_pool)?;
+            } else if d.opcode == Opcode::StringByteLength {
+                emit_string_byte_length(&mut a, &d, &mut inst_reg, &mut inst_pool)?;
             } else if d.opcode == Opcode::StringAsciiCharAt {
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
                 emit_string_ascii_char_at(
                     &mut a,
                     &d,
-                    &mut reg,
-                    &mut pool,
+                    &mut inst_reg,
+                    &mut inst_pool,
                     &const_tagged,
                     label,
                 )?;
             } else if d.opcode == Opcode::SymbolValue {
-                emit_symbol_value(&mut a, &d, &reg, c2i_load_global_addr)?;
+                emit_symbol_value(&mut a, &d, &inst_reg, c2i_load_global_addr)?;
             } else if d.opcode == Opcode::SetSymbolValue {
-                emit_set_symbol_value(&mut a, &d, &reg, &const_tagged, c2i_store_global_addr)?;
+                emit_set_symbol_value(&mut a, &d, &inst_reg, &const_tagged, c2i_store_global_addr)?;
             } else if d.opcode == Opcode::ClearMv {
                 // Reset multiple-values state: a bare c2i_clear_mv() call.
                 mov_imm64(&mut a, 0, c2i_clear_mv_addr as i64); // mov rax, c2i_clear_mv
@@ -1960,7 +2456,56 @@ pub fn emit_framed(
                 // In precise mode this inst has its own reconstruction stub (built
                 // above); route its guards there instead of the whole-rerun stub.
                 let inst_deopt_label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
-                emit_arith_inst(&mut a, f, &d, &mut reg, &mut pool, &consts, &float_consts, &val_range, &mut proven, inst_deopt_label)?;
+                emit_arith_inst(
+                    &mut a,
+                    f,
+                    &d,
+                    &mut inst_reg,
+                    &mut inst_pool,
+                    &consts,
+                    &float_consts,
+                    &val_range,
+                    &mut proven,
+                    &declared_single_floats,
+                    inst_deopt_label,
+                )?;
+            }
+            for (home, src) in result_stores {
+                store_home(&mut a, home, src, 0);
+            }
+            if let Some(roots) = roots {
+                if let (Some(frame_base), Some(base_slots)) = (frame_base_home, activation_slots) {
+                    emit_shadow_root_restore(
+                        &mut a,
+                        roots,
+                        restore_roots
+                            .as_ref()
+                            .expect("root-sync site has restore metadata"),
+                        &homes,
+                        frame_base,
+                        base_slots,
+                    )?;
+                }
+                root_sync_sites.push(RootSyncSite {
+                    code_offset: u32::try_from(sync_offset)
+                        .map_err(|_| EmitError::UnsupportedOp(0xFD))?,
+                    live_roots: u16::try_from(roots.len())
+                        .map_err(|_| EmitError::UnsupportedOp(0xFD))?,
+                    register_roots: u16::try_from(
+                        roots
+                            .iter()
+                            .filter(|value| matches!(homes.get(value), Some(FramedHome::Reg(_))))
+                            .count(),
+                    )
+                    .map_err(|_| EmitError::UnsupportedOp(0xFD))?,
+                    spill_roots: u16::try_from(
+                        roots
+                            .iter()
+                            .filter(|value| matches!(homes.get(value), Some(FramedHome::Stack(_))))
+                            .count(),
+                    )
+                    .map_err(|_| EmitError::UnsupportedOp(0xFD))?,
+                });
             }
         }
 
@@ -1969,13 +2514,24 @@ pub fn emit_framed(
         let td = f.inst(t).clone();
         match td.opcode {
             Opcode::Return => {
-                emit_return(&mut a, td.args.first().copied(), &reg, &const_tagged)?;
+                if let Some(&value) = td.args.first() {
+                    if let Some(&bits) = const_tagged.get(&value) {
+                        mov_imm64(&mut a, RAX, bits as i64);
+                    } else {
+                        load_home(
+                            &mut a,
+                            RAX,
+                            *homes.get(&value).ok_or(EmitError::UnsupportedOp(0xF2))?,
+                            0,
+                        );
+                    }
+                }
                 emit_epilogue(&mut a); // restore callee-saved (no-op frameless)
                 a.push(0xC3); // ret
             }
             Opcode::Jump => {
                 let tc = &td.targets[0];
-                parallel_move(&mut a, edge_moves(f, tc, &reg, &const_tagged)?);
+                parallel_home_move(&mut a, &edge_home_moves(f, tc, &homes, &const_tagged)?);
                 if next != Some(tc.block) {
                     a.jmp(block_label[&tc.block]);
                 }
@@ -1991,7 +2547,7 @@ pub fn emit_framed(
                     } else {
                         &td.targets[0]
                     };
-                    parallel_move(&mut a, edge_moves(f, taken, &reg, &const_tagged)?);
+                    parallel_home_move(&mut a, &edge_home_moves(f, taken, &homes, &const_tagged)?);
                     if next != Some(taken.block) {
                         a.jmp(block_label[&taken.block]);
                     }
@@ -2004,25 +2560,31 @@ pub fn emit_framed(
                 let cc = match f.value(cond).def {
                     ValueDef::Result { inst, .. } if fused.contains(&inst) => {
                         let cmp_data = f.inst(inst).clone();
+                        let (cmp_regs, _) =
+                            prepare_framed_inst(&mut a, &cmp_data, &homes, &const_tagged)?;
                         if cmp_data.opcode == Opcode::GenericEq {
                             // EQ/NULL fused: cmp the two tagged operands; equal
                             // (ZF) is "true", taking targets[0].
-                            emit_eq_cmp(&mut a, &cmp_data, &reg, &const_tagged)?;
+                            emit_eq_cmp(&mut a, &cmp_data, &cmp_regs, &const_tagged)?;
                             Cc::E
                         } else {
-                            emit_fused_compare(&mut a, &cmp_data, &reg, &consts, &proven, deopt)?
+                            emit_fused_compare(
+                                &mut a, &cmp_data, &cmp_regs, &consts, &proven, deopt,
+                            )?
                         }
                     }
                     _ => {
-                        let cr = *reg.get(&cond).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                        let home = *homes.get(&cond).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                        load_home(&mut a, 11, home, 0);
+                        let cr = 11;
                         alu_r_imm(&mut a, 7, cr, bliss_rt::value::NIL.0 as i32); // cmp cr, NIL
                         Cc::Ne
                     }
                 };
                 let then_b = td.targets[0].block; // taken when the comparison is true
                 let else_b = td.targets[1].block;
-                let then_moves = edge_moves(f, &td.targets[0], &reg, &const_tagged)?;
-                let else_moves = edge_moves(f, &td.targets[1], &reg, &const_tagged)?;
+                let then_moves = edge_home_moves(f, &td.targets[0], &homes, &const_tagged)?;
+                let else_moves = edge_home_moves(f, &td.targets[1], &homes, &const_tagged)?;
                 match (then_moves.is_empty(), else_moves.is_empty()) {
                     // No edge moves either side: a plain two-way branch. Fall through
                     // to whichever arm is the next block; branch to the other.
@@ -2040,14 +2602,14 @@ pub fn emit_framed(
                     // then emit the other side's moves inline before its jump.
                     (true, false) => {
                         a.jcc(cc, block_label[&then_b]);
-                        parallel_move(&mut a, else_moves);
+                        parallel_home_move(&mut a, &else_moves);
                         if next != Some(else_b) {
                             a.jmp(block_label[&else_b]);
                         }
                     }
                     (false, true) => {
                         a.jcc(cc.inverse(), block_label[&else_b]);
-                        parallel_move(&mut a, then_moves);
+                        parallel_home_move(&mut a, &then_moves);
                         if next != Some(then_b) {
                             a.jmp(block_label[&then_b]);
                         }
@@ -2057,10 +2619,10 @@ pub fn emit_framed(
                     (false, false) => {
                         let lthen = a.label();
                         a.jcc(cc, lthen);
-                        parallel_move(&mut a, else_moves);
+                        parallel_home_move(&mut a, &else_moves);
                         a.jmp(block_label[&else_b]);
                         a.bind(lthen);
-                        parallel_move(&mut a, then_moves);
+                        parallel_home_move(&mut a, &then_moves);
                         a.jmp(block_label[&then_b]);
                     }
                 }
@@ -2090,11 +2652,15 @@ pub fn emit_framed(
     // call-capable prologue, so
     // a 16-multiple sub keeps the call aligned.
     enum SlotSrc {
-        Reg(u8),
+        Home(FramedHome),
         Imm(u64),
+        Remat(crate::t2::frame_state::RematRecipeId),
     }
     for (&inst, &label) in &inst_deopt {
-        let fsid = f.inst(inst).frame_state.ok_or(EmitError::UnsupportedOp(0xF4))?;
+        let fsid = f
+            .inst(inst)
+            .frame_state
+            .ok_or(EmitError::UnsupportedOp(0xF4))?;
         let fs = f.frame_states.get(fsid);
         if fs.scopes.is_empty() {
             return Err(EmitError::UnsupportedOp(0xF4));
@@ -2120,15 +2686,15 @@ pub fn emit_framed(
                         }
                         if let Some(&bits) = const_tagged.get(value) {
                             SlotSrc::Imm(bits)
-                        } else if let Some(&r) = reg.get(value) {
-                            SlotSrc::Reg(r)
+                        } else if let Some(&home) = homes.get(value) {
+                            SlotSrc::Home(home)
                         } else {
                             return Err(EmitError::UnsupportedOp(0xF6));
                         }
                     }
                     ValueSource::Const(bv) => SlotSrc::Imm(bv.0),
                     ValueSource::Unbound => SlotSrc::Imm(bliss_rt::value::UNBOUND.0),
-                    ValueSource::Remat(_) => return Err(EmitError::UnsupportedOp(0xF7)),
+                    ValueSource::Remat(id) => SlotSrc::Remat(*id),
                 };
                 srcs.push(s);
             }
@@ -2142,10 +2708,24 @@ pub fn emit_framed(
         }
         for (i, s) in srcs.iter().enumerate() {
             match s {
-                SlotSrc::Reg(r) => store_to_rsp(&mut a, *r, (i * 8) as i32),
+                SlotSrc::Home(home) => {
+                    load_home(&mut a, RAX, *home, alloc as i32);
+                    store_to_rsp(&mut a, RAX, (i * 8) as i32);
+                }
                 SlotSrc::Imm(bits) => {
                     mov_imm64(&mut a, 0 /* rax scratch */, *bits as i64);
                     store_to_rsp(&mut a, 0, (i * 8) as i32);
+                }
+                SlotSrc::Remat(id) => {
+                    emit_deopt_source(
+                        &mut a,
+                        &ValueSource::Remat(*id),
+                        fs,
+                        &homes,
+                        &const_tagged,
+                        alloc as i32,
+                    )?;
+                    store_to_rsp(&mut a, RAX, (i * 8) as i32);
                 }
             }
         }
@@ -2164,8 +2744,63 @@ pub fn emit_framed(
         a.push(0xC3); // ret
     }
 
+    // T1→T2 OSR entries.  The lower tier and T2 share the BlissStack slot
+    // layout. Reload the values named by the optimized header FrameState into
+    // their allocated homes, then jump directly to the optimized loop block.
+    // The normal Return epilogue
+    // balances this stub's prologue.
+    let mut osr_entries = Vec::new();
+    for osr in &f.osr_entries {
+        let fs = f.frame_states.get(osr.frame_state);
+        let Some(scope) = fs.scopes.first() else {
+            continue;
+        };
+        if fs.scopes.len() != 1 || !scope.stack.is_empty() {
+            continue;
+        }
+        let offset = a.here();
+        for &r in &saved {
+            push_reg(&mut a, r);
+        }
+        if pad {
+            a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);
+        }
+        if spill_bytes != 0 {
+            a.extend_from_slice(&[0x48, 0x81, 0xEC]);
+            a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+        }
+        if let Some(home) = frame_base_home {
+            store_home(&mut a, home, 7 /* rdi */, 0);
+        }
+        for (slot, src) in scope.locals.iter().enumerate() {
+            if let ValueSource::Value { value, .. } = src {
+                if let Some(&home) = homes.get(value) {
+                    match home {
+                        FramedHome::Reg(r) => mov_from_frame(&mut a, r, 7 /* rdi */, slot),
+                        FramedHome::Stack(_) => {
+                            mov_from_frame(&mut a, RAX, 7 /* rdi */, slot);
+                            store_home(&mut a, home, RAX, 0);
+                        }
+                    }
+                }
+            }
+        }
+        a.jmp(block_label[&osr.block]);
+        osr_entries.push((osr.bcp, offset));
+    }
+
     let code = a.finish().ok_or(EmitError::BadBranch)?;
-    Ok(FramedCode { code, compiled_entry })
+    Ok(FramedCode {
+        code,
+        compiled_entry,
+        osr_entries,
+        native_spill_slots,
+        regalloc_spill_slots,
+        allocation_edits,
+        shadow_root_slots,
+        emitted_safepoints,
+        root_sync_sites,
+    })
 }
 
 fn op_tag(op: crate::t2::ir::Opcode) -> u32 {
@@ -2176,29 +2811,39 @@ fn op_tag(op: crate::t2::ir::Opcode) -> u32 {
 
 /// Emit `mf` to x86-64 machine code. `mf.allocation` must be populated (P6).
 pub fn emit(mf: &MachFunc) -> Result<Vec<u8>, EmitError> {
-    // VReg → its assigned x86 GPR encoding.
-    let loc_of = |v: VReg| -> Result<u8, EmitError> {
-        let (_, loc) = mf
-            .allocation
-            .iter()
-            .find(|(vr, _)| *vr == v)
-            .ok_or(EmitError::Unallocated(v))?;
-        match loc {
-            Location::Register(p) => gpr_enc(*p),
-            Location::Stack(_) => Err(EmitError::Spilled(v)),
-        }
-    };
-
     // Which callee-saved registers the body actually uses → prologue/epilogue.
     let mut used_callee: Vec<u8> = Vec::new();
-    for (_, loc) in &mf.allocation {
-        if let Location::Register(p) = loc {
-            if let Ok(enc) = gpr_enc(*p) {
+    for loc in mf
+        .inst_allocations
+        .iter()
+        .flatten()
+        .chain(mf.allocation_edits.iter().flat_map(|e| [&e.from, &e.to]))
+    {
+        if let Location::Register(p) = *loc {
+            if let Ok(enc) = gpr_enc(p) {
                 if CALLEE_SAVED_X86.contains(&enc) && !used_callee.contains(&enc) {
                     used_callee.push(enc);
                 }
             }
         }
+    }
+    // x86's two-address ADD/SUB needs a temporary when the allocator assigns
+    // the destination to the second input's register.  regalloc2's dedicated
+    // scratch is free within an instruction, but it is callee-saved in SysV.
+    let two_addr_needs_scratch = mf.insts.iter().enumerate().any(|(i, mi)| {
+        if !matches!(mi.op, crate::t2::lower::op::ADD | crate::t2::lower::op::SUB)
+            || mi.defs.len() != 1
+            || mi.uses.len() != 2
+        {
+            return false;
+        }
+        let Some(allocs) = mf.inst_allocations.get(i) else {
+            return false;
+        };
+        allocs.len() == 3 && allocs[0] == allocs[2] && allocs[0] != allocs[1]
+    });
+    if two_addr_needs_scratch && !used_callee.contains(&RA_SCRATCH_GPR) {
+        used_callee.push(RA_SCRATCH_GPR);
     }
 
     let mut a = Asm::new();
@@ -2207,59 +2852,145 @@ pub fn emit(mf: &MachFunc) -> Result<Vec<u8>, EmitError> {
     for &r in &used_callee {
         push_reg(&mut a, r);
     }
+    let spill_bytes = ((mf.num_spill_slots as usize * 8) + 15) & !15;
+    if spill_bytes != 0 {
+        a.extend_from_slice(&[0x48, 0x81, 0xEC]);
+        a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+    }
 
     // Emit the body. A `RET` runs the epilogue (restore + `ret`) inline. Block
     // structure is used for labels once branches are supported; the straight-line
     // first cut walks the flat inst vector in order.
     let epilogue = |a: &mut Asm| {
+        if spill_bytes != 0 {
+            a.extend_from_slice(&[0x48, 0x81, 0xC4]);
+            a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+        }
         for &r in used_callee.iter().rev() {
             pop_reg(a, r);
         }
         a.push(0xC3); // ret
     };
 
-    for mi in &mf.insts {
-        emit_inst(&mut a, mi, &loc_of, &epilogue)?;
+    if mf.inst_allocations.len() != mf.insts.len() {
+        return Err(EmitError::Unallocated(
+            mf.insts
+                .iter()
+                .flat_map(|mi| mi.defs.iter().chain(&mi.uses))
+                .next()
+                .copied()
+                .unwrap_or(VReg {
+                    class: RegClass::Gpr,
+                    num: 0,
+                }),
+        ));
+    }
+
+    for (index, mi) in mf.insts.iter().enumerate() {
+        for edit in mf
+            .allocation_edits
+            .iter()
+            .filter(|e| e.inst == index && e.position == EditPosition::Before)
+        {
+            emit_location_move(&mut a, edit.from, edit.to)?;
+        }
+        emit_inst(&mut a, mi, &mf.inst_allocations[index], &epilogue)?;
+        for edit in mf
+            .allocation_edits
+            .iter()
+            .filter(|e| e.inst == index && e.position == EditPosition::After)
+        {
+            emit_location_move(&mut a, edit.from, edit.to)?;
+        }
     }
 
     a.finish().ok_or(EmitError::BadBranch)
 }
 
+fn spill_disp(slot: crate::t2::mach::StackSlot) -> i32 {
+    (slot.0 as i32) * 8
+}
+
+fn emit_location_move(a: &mut Asm, from: Location, to: Location) -> Result<(), EmitError> {
+    match (from, to) {
+        (Location::Register(src), Location::Register(dst)) => {
+            mov_rr(a, gpr_enc(dst)?, gpr_enc(src)?);
+        }
+        (Location::Register(src), Location::Stack(dst)) => {
+            store_to_rsp(a, gpr_enc(src)?, spill_disp(dst));
+        }
+        (Location::Stack(src), Location::Register(dst)) => {
+            load_from_rsp(a, gpr_enc(dst)?, spill_disp(src));
+        }
+        // regalloc2 guarantees that it never asks clients to encode a direct
+        // memory-to-memory edit.
+        (Location::Stack(_), Location::Stack(_)) => return Err(EmitError::UnsupportedOp(0xFE)),
+    }
+    Ok(())
+}
+
 fn emit_inst(
     a: &mut Asm,
     mi: &MachInst,
-    loc_of: &impl Fn(VReg) -> Result<u8, EmitError>,
+    allocations: &[Location],
     epilogue: &impl Fn(&mut Asm),
 ) -> Result<(), EmitError> {
+    if allocations.len() != mi.defs.len() + mi.uses.len() {
+        return Err(EmitError::Unallocated(
+            mi.defs
+                .first()
+                .or_else(|| mi.uses.first())
+                .copied()
+                .unwrap_or(VReg {
+                    class: RegClass::Gpr,
+                    num: 0,
+                }),
+        ));
+    }
+    let operand_reg = |operand: usize, v: VReg| -> Result<u8, EmitError> {
+        match allocations[operand] {
+            Location::Register(p) => gpr_enc(p),
+            Location::Stack(_) => Err(EmitError::Spilled(v)),
+        }
+    };
+    let def = |n: usize| operand_reg(n, mi.defs[n]);
+    let use_ = |n: usize| operand_reg(mi.defs.len() + n, mi.uses[n]);
+
     use crate::t2::lower::op;
     match mi.op {
         op::MOV_IMM | op::MOV_TAGGED => {
             // Both materialise a 64-bit immediate into a GPR; MOV_TAGGED's is a
             // tagged BlissVal, MOV_IMM's a raw/tagged integer — identical encoding.
-            let dst = loc_of(mi.defs[0])?;
+            let dst = def(0)?;
             let imm = mi.imm.ok_or(EmitError::MissingImm)?;
             mov_imm64(a, dst, imm);
         }
         op::MOV => {
-            let dst = loc_of(mi.defs[0])?;
-            let src = loc_of(mi.uses[0])?;
+            let dst = def(0)?;
+            let src = use_(0)?;
             mov_rr(a, dst, src);
         }
         op::ADD | op::SUB => {
             // def = uses[0] (op) uses[1]. x86 ALU is 2-operand, so realise as
             // `mov def, a; op def, b` (skips the mov when def already is a).
-            let dst = loc_of(mi.defs[0])?;
-            let a0 = loc_of(mi.uses[0])?;
-            let b0 = loc_of(mi.uses[1])?;
-            mov_rr(a, dst, a0);
+            let dst = def(0)?;
+            let a0 = use_(0)?;
+            let b0 = use_(1)?;
             let opcode = if mi.op == op::ADD { 0x01 } else { 0x29 };
-            alu_rr(a, opcode, dst, b0);
+            if dst == b0 && dst != a0 {
+                mov_rr(a, RA_SCRATCH_GPR, b0);
+                mov_rr(a, dst, a0);
+                alu_rr(a, opcode, dst, RA_SCRATCH_GPR);
+            } else {
+                mov_rr(a, dst, a0);
+                alu_rr(a, opcode, dst, b0);
+            }
         }
         op::RET => {
             // Move the return value into rax (SysV return register), then the
             // epilogue restores callee-saved regs and returns.
-            if let Some(&v) = mi.uses.first() {
-                let r = loc_of(v)?;
+            if !mi.uses.is_empty() {
+                let r = use_(0)?;
                 mov_rr(a, RAX, r);
             }
             epilogue(a);
@@ -2277,11 +3008,22 @@ mod tests {
     use crate::t2::regalloc::allocate;
 
     fn gpr(num: u32) -> VReg {
-        VReg { class: RegClass::Gpr, num }
+        VReg {
+            class: RegClass::Gpr,
+            num,
+        }
     }
 
     fn mi(op: u32, defs: Vec<VReg>, uses: Vec<VReg>, imm: Option<i64>) -> MachInst {
-        MachInst { op, defs, uses, imm, frame_state: None, safepoint: false }
+        MachInst {
+            source_inst: None,
+            op,
+            defs,
+            uses,
+            imm,
+            frame_state: None,
+            safepoint: false,
+        }
     }
 
     /// Build `() -> imm`: MOV_IMM v0, imm ; RET v0. Allocate, emit, and check the
@@ -2293,7 +3035,7 @@ mod tests {
             mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(12345)),
             mi(op::RET, vec![], vec![gpr(0)], None),
         ];
-        allocate(&mut mf);
+        allocate(&mut mf).expect("regalloc2");
         let code = emit(&mf).expect("emit const-return");
         assert!(!code.is_empty());
         assert_eq!(*code.last().unwrap(), 0xC3, "must end in ret");
@@ -2309,13 +3051,55 @@ mod tests {
             mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(12345)),
             mi(op::RET, vec![], vec![gpr(0)], None),
         ];
-        allocate(&mut mf);
+        allocate(&mut mf).expect("regalloc2");
         let code = emit(&mf).expect("emit");
         let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap exec");
         // SAFETY: the emitted code is a leaf `extern "C" fn() -> u64` that only
         // writes rax and returns, preserving callee-saved registers.
         let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
         assert_eq!(f(), 12345, "T2-emitted function must return its constant");
+    }
+
+    /// More simultaneously-live values than the allocatable GPR set forces
+    /// regalloc2 to split ranges and spill.  The emitted reload/store edits and
+    /// spill frame must make the result indistinguishable from register-only
+    /// execution.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn regalloc_spills_execute_correctly() {
+        const N: u32 = 24;
+        let mut mf = MachFunc::default();
+        for i in 0..N {
+            mf.insts
+                .push(mi(op::MOV_IMM, vec![gpr(i)], vec![], Some((i + 1) as i64)));
+        }
+        let mut acc = gpr(0);
+        let mut next = N;
+        for i in 1..N {
+            let out = gpr(next);
+            next += 1;
+            mf.insts
+                .push(mi(op::ADD, vec![out], vec![acc, gpr(i)], None));
+            acc = out;
+        }
+        mf.insts.push(mi(op::RET, vec![], vec![acc], None));
+
+        allocate(&mut mf).expect("regalloc2");
+        assert!(
+            mf.num_spill_slots > 0,
+            "test must create actual spill pressure"
+        );
+        assert!(
+            mf.allocation_edits.iter().any(|edit| {
+                matches!(edit.from, Location::Stack(_)) || matches!(edit.to, Location::Stack(_))
+            }),
+            "regalloc2 must provide spill/reload edits"
+        );
+
+        let code = emit(&mf).expect("spill-capable emission");
+        let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap exec");
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+        assert_eq!(f(), (1..=N as u64).sum::<u64>());
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2335,17 +3119,37 @@ mod tests {
             code: vec![
                 Instr::LoadLocal(0),
                 Instr::Const(0),
-                Instr::CallNamed { sym: star, nargs: 2 },
+                Instr::CallNamed {
+                    sym: star,
+                    nargs: 2,
+                },
                 Instr::Return,
             ],
             constants: vec![BlissVal::from_fixnum(5)],
-            handler_cases: vec![], handler_binds: vec![], names: vec![], restart_cases: vec![],
-            param_layout: vec![], has_env: false, n_locals: 1, max_stack: 2, arity: 1,
+            handler_cases: vec![],
+            handler_binds: vec![],
+            names: vec![],
+            restart_cases: vec![],
+            param_layout: vec![],
+            param_types: vec![],
+            has_env: false,
+            n_locals: 1,
+            max_stack: 2,
+            arity: 1,
             name: "mul5".into(),
-            params_form: bliss_rt::value::NIL, min_args: 1, max_args: Some(1), variadic: false,
+            params_form: bliss_rt::value::NIL,
+            min_args: 1,
+            max_args: Some(1),
+            variadic: false,
         };
         let mut f = crate::t2::build::build_from_bytecode(&bf).expect("build");
-        speculate(&mut f, &|bcp| if bcp == 2 { Some(SpecType::Fixnum) } else { None });
+        speculate(&mut f, &|bcp| {
+            if bcp == 2 {
+                Some(SpecType::Fixnum)
+            } else {
+                None
+            }
+        });
         f
     }
 
@@ -2353,10 +3157,13 @@ mod tests {
     fn string_layout_fn(char_at: bool) -> crate::t2::ir::Function {
         use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
         use crate::t2::ir::{
-            AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits,
-            ValueRepresentation,
+            AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,
         };
-        let mut f = Function::new(if char_at { "string-char" } else { "string-bytes" });
+        let mut f = Function::new(if char_at {
+            "string-char"
+        } else {
+            "string-bytes"
+        });
         let entry = f.entry();
         let string = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
         let mut args = vec![string];
@@ -2373,10 +3180,38 @@ mod tests {
             });
         }
         let fs = f.frame_states.add(FrameState {
-            scopes: vec![FrameScope { function: 0, bcp: 0, locals, stack: vec![] }],
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 0,
+                locals,
+                stack: vec![],
+            }],
             remat: vec![],
         });
-        let opcode = if char_at { Opcode::StringAsciiCharAt } else { Opcode::StringByteLength };
+        let (_, checked) = f.push_inst(
+            entry,
+            InstData {
+                opcode: Opcode::Guard,
+                args: vec![string],
+                results: vec![],
+                aux: AuxData::StringLayout,
+                flags: InstFlags {
+                    effectful: true,
+                    guard: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: Some(fs),
+                source_pos: 0,
+            },
+            &[(IRType::of(TypeBits::STRING), ValueRepresentation::Tagged)],
+        );
+        args[0] = checked[0];
+        let opcode = if char_at {
+            Opcode::StringAsciiCharAt
+        } else {
+            Opcode::StringByteLength
+        };
         let result_ty = if char_at {
             IRType::of(TypeBits::CHARACTER)
         } else {
@@ -2389,9 +3224,17 @@ mod tests {
                 args,
                 results: vec![],
                 aux: AuxData::None,
-                flags: InstFlags { effectful: true, guard: true, ..Default::default() },
+                flags: if char_at {
+                    InstFlags {
+                        effectful: true,
+                        guard: true,
+                        ..Default::default()
+                    }
+                } else {
+                    InstFlags::default()
+                },
                 targets: vec![],
-                frame_state: Some(fs),
+                frame_state: char_at.then_some(fs),
                 source_pos: 0,
             },
             &[(result_ty, ValueRepresentation::Tagged)],
@@ -2403,7 +3246,10 @@ mod tests {
                 args: vec![results[0]],
                 results: vec![],
                 aux: AuxData::None,
-                flags: InstFlags { terminator: true, ..Default::default() },
+                flags: InstFlags {
+                    terminator: true,
+                    ..Default::default()
+                },
                 targets: vec![],
                 frame_state: None,
                 source_pos: 0,
@@ -2414,7 +3260,7 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", unix))]
     fn test_string(bytes: &[u8]) -> bliss_rt::value::BlissVal {
-        use bliss_rt::object::{ObjectHeader, type_id};
+        use bliss_rt::object::{type_id, ObjectHeader};
         let total = (16 + bytes.len() + 7) & !7;
         let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
         unsafe {
@@ -2455,14 +3301,16 @@ mod tests {
         assert!(!DEOPTED.load(Ordering::SeqCst));
         frame[0] = BlissVal::from_fixnum(9).0;
         let _ = length(frame.as_mut_ptr());
-        assert!(DEOPTED.load(Ordering::SeqCst), "wrong-type length must deopt");
+        assert!(
+            DEOPTED.load(Ordering::SeqCst),
+            "wrong-type length must deopt"
+        );
         let pathname_header = Box::new(bliss_rt::object::ObjectHeader::new(
             bliss_rt::object::type_id::PATHNAME,
             2,
         ));
-        frame[0] = unsafe {
-            BlissVal::from_heap_ptr(Box::into_raw(pathname_header).cast::<u8>()).0
-        };
+        frame[0] =
+            unsafe { BlissVal::from_heap_ptr(Box::into_raw(pathname_header).cast::<u8>()).0 };
         DEOPTED.store(false, Ordering::SeqCst);
         let _ = length(frame.as_mut_ptr());
         assert!(
@@ -2520,7 +3368,18 @@ mod tests {
     fn framed_fixnum_mul_runs_and_deopts() {
         use bliss_rt::value::BlissVal;
         let f = speculated_mul5();
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, 0, 0, 0, None).expect("emit_framed").code;
+        let code = emit_framed(
+            &f,
+            mock_c2i_deopt as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("emit_framed")
+        .code;
         let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap");
         // extern "C" fn(*mut u64) -> u64 : rdi = frame slots, returns rax.
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
@@ -2536,16 +3395,25 @@ mod tests {
         let mut frame = [BlissVal::from_single_float(2.0).0, 0u64, 0u64];
         DEOPTED.store(false, Ordering::SeqCst);
         let _ = func(frame.as_mut_ptr());
-        assert!(DEOPTED.load(Ordering::SeqCst), "a float operand must deopt to the interpreter");
+        assert!(
+            DEOPTED.load(Ordering::SeqCst),
+            "a float operand must deopt to the interpreter"
+        );
     }
 
     /// Build post-speculation IR for `(x) -> x * c` where the param `x` carries
     /// the given inferred range — i.e. what inlining/the caller ABI would supply.
     fn build_mul_ranged(c: i64, range: Option<crate::t2::ir::Range>) -> crate::t2::ir::Function {
-        use crate::t2::ir::{AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation};
+        use crate::t2::ir::{
+            AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,
+        };
         let mut f = Function::new("m");
         let entry = f.entry();
-        let xty = IRType { bits: TypeBits::FIXNUM, range, class_id: None };
+        let xty = IRType {
+            bits: TypeBits::FIXNUM,
+            range,
+            class_id: None,
+        };
         let x = f.add_block_param(entry, xty, ValueRepresentation::Tagged);
         let (_ci, cres) = f.push_inst(
             entry,
@@ -2568,7 +3436,11 @@ mod tests {
                 args: vec![x, cres[0]],
                 results: vec![],
                 aux: AuxData::None,
-                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..Default::default()
+                },
                 targets: vec![],
                 frame_state: None,
                 source_pos: 0,
@@ -2602,14 +3474,32 @@ mod tests {
     fn strength_reduces_to_lea_when_range_is_safe() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, 0, 0, 0, None).expect("emit").code;
+        let code = emit_framed(
+            &f,
+            mock_c2i_deopt as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("emit")
+        .code;
         // `lea rax,[rcx+rcx*4]` = 48 8D 04 89 ; and NO overflow branch (0F 80).
-        assert!(contains(&code, &[0x48, 0x8D, 0x04, 0x89]), "must emit lea for a range-safe *5");
-        assert!(!contains(&code, &[0x0F, 0x80]), "range proves no overflow → no jo deopt");
+        assert!(code.contains(&0x8D), "must emit lea for a range-safe *5");
+        assert!(
+            !contains(&code, &[0x0F, 0x80]),
+            "range proves no overflow → no jo deopt"
+        );
         let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
         let mut frame = [BlissVal::from_fixnum(7).0, 0u64, 0u64];
-        assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 35, "lea *5 of 7 = 35");
+        assert_eq!(
+            BlissVal(func(frame.as_mut_ptr())).as_fixnum(),
+            35,
+            "lea *5 of 7 = 35"
+        );
     }
 
     /// Without a range, the overflow-detecting `imul + jo` is kept (correctness
@@ -2619,13 +3509,31 @@ mod tests {
     fn keeps_imul_and_overflow_check_when_range_unknown() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, None);
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, 0, 0, 0, None).expect("emit").code;
-        assert!(contains(&code, &[0x48, 0x69, 0xC1]), "unknown range → imul rax,rcx,5");
-        assert!(contains(&code, &[0x0F, 0x80]), "unknown range → keep the jo overflow deopt");
+        let code = emit_framed(
+            &f,
+            mock_c2i_deopt as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("emit")
+        .code;
+        assert!(code.contains(&0x69), "unknown range → imul r64,r64,5");
+        assert!(
+            contains(&code, &[0x0F, 0x80]),
+            "unknown range → keep the jo overflow deopt"
+        );
         let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
         let mut frame = [BlissVal::from_fixnum(7).0, 0u64, 0u64];
-        assert_eq!(BlissVal(func(frame.as_mut_ptr())).as_fixnum(), 35, "imul *5 of 7 = 35");
+        assert_eq!(
+            BlissVal(func(frame.as_mut_ptr())).as_fixnum(),
+            35,
+            "imul *5 of 7 = 35"
+        );
     }
 
     /// Compiled-caller ABI: a compiled caller places args in registers and calls
@@ -2637,8 +3545,21 @@ mod tests {
     fn compiled_entry_takes_register_args() {
         use bliss_rt::value::BlissVal;
         let f = build_mul_ranged(5, Some(crate::t2::ir::Range { lo: 0, hi: 100 }));
-        let framed = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, 0, 0, 0, None).expect("emit");
-        assert!(framed.compiled_entry > 0, "a register entry must sit past the frame-load prologue");
+        let framed = emit_framed(
+            &f,
+            mock_c2i_deopt as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("emit");
+        assert!(
+            framed.compiled_entry > 0,
+            "a register entry must sit past the frame-load prologue"
+        );
         let buf = bliss_rt::jit::JitBuffer::new(&framed.code).unwrap();
         let entry = buf.as_ptr() as usize + framed.compiled_entry;
         let x = BlissVal::from_fixnum(7).0;
@@ -2660,16 +3581,26 @@ mod tests {
                 lateout("r11") _,
             );
         }
-        assert_eq!(BlissVal(result).as_fixnum(), 35, "compiled entry: 7*5 = 35 from a register arg");
+        assert_eq!(
+            BlissVal(result).as_fixnum(),
+            35,
+            "compiled entry: 7*5 = 35 from a register arg"
+        );
     }
 
     /// Build `(x) -> x <op> c` as a float-speculated op: single-float param `x`,
     /// a fixnum constant `c` (coerced by contagion), guard-flagged float op.
     fn build_float_arith(op: crate::t2::ir::Opcode, c: i64) -> crate::t2::ir::Function {
-        use crate::t2::ir::{AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation};
+        use crate::t2::ir::{
+            AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,
+        };
         let mut f = Function::new("m");
         let entry = f.entry();
-        let x = f.add_block_param(entry, IRType::of(TypeBits::SINGLE_FLOAT), ValueRepresentation::Tagged);
+        let x = f.add_block_param(
+            entry,
+            IRType::of(TypeBits::SINGLE_FLOAT),
+            ValueRepresentation::Tagged,
+        );
         let (_c, cres) = f.push_inst(
             entry,
             InstData {
@@ -2691,12 +3622,19 @@ mod tests {
                 args: vec![x, cres[0]],
                 results: vec![],
                 aux: AuxData::None,
-                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..Default::default()
+                },
                 targets: vec![],
                 frame_state: None,
                 source_pos: 0,
             },
-            &[(IRType::of(TypeBits::SINGLE_FLOAT), ValueRepresentation::Tagged)],
+            &[(
+                IRType::of(TypeBits::SINGLE_FLOAT),
+                ValueRepresentation::Tagged,
+            )],
         );
         f.set_terminator(
             entry,
@@ -2722,20 +3660,41 @@ mod tests {
     fn float_mul_runs_and_deopts() {
         use bliss_rt::value::BlissVal;
         let f = build_float_arith(crate::t2::ir::Opcode::FloatMul, 5);
-        let code = emit_framed(&f, mock_c2i_deopt as usize as u64, 0, 0, 0, 0, 0, None).expect("emit").code;
+        let code = emit_framed(
+            &f,
+            mock_c2i_deopt as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("emit")
+        .code;
         let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
         let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 
         let mut frame = [BlissVal::from_single_float(2.0).0, 0u64, 0u64];
         DEOPTED.store(false, Ordering::SeqCst);
         let r = func(frame.as_mut_ptr());
-        assert!(!DEOPTED.load(Ordering::SeqCst), "a single-float arg must not deopt");
-        assert_eq!(BlissVal(r).as_single_float(), 10.0, "2.0 * 5 = 10.0 (fixnum coerced)");
+        assert!(
+            !DEOPTED.load(Ordering::SeqCst),
+            "a single-float arg must not deopt"
+        );
+        assert_eq!(
+            BlissVal(r).as_single_float(),
+            10.0,
+            "2.0 * 5 = 10.0 (fixnum coerced)"
+        );
 
         let mut frame = [BlissVal::from_fixnum(2).0, 0u64, 0u64];
         DEOPTED.store(false, Ordering::SeqCst);
         let _ = func(frame.as_mut_ptr());
-        assert!(DEOPTED.load(Ordering::SeqCst), "a fixnum operand must deopt (guard is single-float)");
+        assert!(
+            DEOPTED.load(Ordering::SeqCst),
+            "a fixnum operand must deopt (guard is single-float)"
+        );
     }
 
     /// A small computation `() -> 7 + 5 = 12`, executed.
@@ -2749,7 +3708,7 @@ mod tests {
             mi(op::ADD, vec![gpr(2)], vec![gpr(0), gpr(1)], None),
             mi(op::RET, vec![], vec![gpr(2)], None),
         ];
-        allocate(&mut mf);
+        allocate(&mut mf).expect("regalloc2");
         let code = emit(&mf).expect("emit");
         let buf = bliss_rt::jit::JitBuffer::new(&code).expect("mmap exec");
         let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };

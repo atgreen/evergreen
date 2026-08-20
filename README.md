@@ -67,6 +67,11 @@ clippy on Linux and macOS, a nightly fuzzing job, and sanitizer builds.
 
 ## CLI Usage
 
+The [Bliss-specific Lisp API manual](docs/bliss-lisp-api.md) documents the
+currently callable extensions and the status of the complete planned Lisp API,
+including fibers, native threads, synchronization, compiler introspection,
+sandboxing, and developer tools.
+
 Run the REPL:
 
 ```sh

@@ -13,6 +13,7 @@ use bliss_stdlib::packages::{
     InternStatus, PackageRegistry, export, find_symbol, import, intern, shadowing_import,
     use_package,
 };
+use bliss_stdlib::{gethash, hash_table_p, make_lisp_string};
 
 fn fresh_registry() -> PackageRegistry {
     let mut registry = PackageRegistry::new();
@@ -90,6 +91,42 @@ fn bootstrap_is_idempotent_and_does_not_duplicate_packages() {
         registry.find_package("COMMON-LISP"),
         registry.find_package("CL"),
         "bootstrap must preserve nickname lookups across repeated initialization",
+    );
+}
+
+#[test]
+fn package_membership_lives_in_heap_object_hash_table_cells() {
+    let mut registry = fresh_registry();
+    let package = registry
+        .make_package("HEAP-MEMBERSHIP-PACKAGE", &[], &[])
+        .expect("package creation");
+    assert!(bliss_rt::types::packagep(package));
+    assert!(!package.is_meta_handle());
+
+    let (symbol, _) = intern("CELL-SYMBOL", package).expect("intern symbol");
+    let (internal, external) = bliss_rt::packages::symbol_tables(package)
+        .expect("package object must expose symbol table cells");
+    assert!(hash_table_p(internal));
+    assert!(hash_table_p(external));
+    assert_eq!(
+        gethash(
+            make_lisp_string("CELL-SYMBOL"),
+            internal,
+            bliss_rt::value::NIL,
+        )
+        .expect("lookup package object table"),
+        (symbol, true),
+    );
+
+    export(&[symbol], package).expect("export symbol");
+    assert_eq!(
+        gethash(
+            make_lisp_string("CELL-SYMBOL"),
+            external,
+            bliss_rt::value::NIL,
+        )
+        .expect("lookup exported package object table"),
+        (symbol, true),
     );
 }
 

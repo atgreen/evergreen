@@ -109,7 +109,6 @@ impl BlissVal {
         ((self.0 & !META_HANDLE_BIT) >> 3) as i64
     }
 
-
     /// Create a cons-tagged pointer.
     ///
     /// # Safety

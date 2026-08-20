@@ -145,6 +145,18 @@ pub fn record_back_edge(f: BlissVal) -> u32 {
     unsafe { (*data(f)).back_edge_count.fetch_add(1, Ordering::Relaxed) + 1 }
 }
 
+/// Add a sampled batch of back-edges. Native tiers poll only periodically, so
+/// charging the batch keeps the shared hotness counter representative without
+/// a runtime call on every loop iteration.
+pub fn record_back_edges(f: BlissVal, count: u32) -> u32 {
+    unsafe {
+        (*data(f))
+            .back_edge_count
+            .fetch_add(count, Ordering::Relaxed)
+            .saturating_add(count)
+    }
+}
+
 /// The current loop back-edge count — the hot-loop profiling signal read by the
 /// tier scheduler alongside `invoke_count` (bliss-jtc.10).
 pub fn back_edge_count(f: BlissVal) -> u32 {
