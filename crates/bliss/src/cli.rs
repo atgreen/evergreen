@@ -12087,7 +12087,7 @@ fn gc_alloc_obj(total_size: usize, type_id: u8) -> *mut u8 {
 
 /// Allocate a RATIO heap object (numerator/denominator are integers) on the
 /// shared GC heap, using the spec RatioData layout (bliss-jtc.5).
-fn alloc_ratio_cli(num: BlissVal, den: BlissVal) -> BlissVal {
+pub(super) fn alloc_ratio_cli(num: BlissVal, den: BlissVal) -> BlissVal {
     let roots = bliss_rt::ShadowRootScope::new();
     let num = roots.root(num);
     let den = roots.root(den);
@@ -12154,7 +12154,7 @@ fn eql_values(a: BlissVal, b: BlissVal) -> bool {
 }
 
 /// Extract (numerator, denominator) BlissVals from a RATIO heap object.
-fn ratio_parts_val(v: BlissVal) -> Option<(BlissVal, BlissVal)> {
+pub(super) fn ratio_parts_val(v: BlissVal) -> Option<(BlissVal, BlissVal)> {
     if !v.is_heap_object() {
         return None;
     }

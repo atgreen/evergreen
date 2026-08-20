@@ -398,6 +398,95 @@ fn cross_unit_setf_writer_bfasl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A local `macrolet` whose macro introduces references to enclosing lexicals
+/// (invisible in the unexpanded source) must be expanded before capture
+/// analysis, so the captured variables are boxed and the capturing `labels`
+/// closures lower to source-free bytecode. This is alexandria's
+/// `gaussian-random` shape.
+#[test]
+fn macrolet_in_body_with_capture_bfasl_round_trip() {
+    let dir = workdir("macrolet-cap");
+    let src = dir.join("m.lisp");
+    let out = dir.join("m.bfasl");
+    fs::write(
+        &src,
+        "(defun clamp-sum (lo hi)\n\
+        \x20 (macrolet ((ok (x) `(<= lo ,x hi)))\n\
+        \x20   (labels ((gen () (+ lo hi))\n\
+        \x20            (pick (x) (if (ok x) x (gen))))\n\
+        \x20     (list (pick 0) (pick lo) (gen)))))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+
+    let l = run(&format!("(progn (load \"{}\") (clamp-sum 2 5))", out.display()));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    // (pick 0): 0 not in [2,5] -> (gen)=7; (pick 2): in range -> 2; (gen)=7.
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "(7 2 7)");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The LOOP `for VAR = INIT then STEP` stepping clause and ratio constants
+/// (`1/2`) must lower to source-free bytecode. This is alexandria's `iota` /
+/// `median` shape.
+#[test]
+fn loop_for_then_and_ratio_constant_bfasl_round_trip() {
+    let dir = workdir("for-then-ratio");
+    let src = dir.join("n.lisp");
+    let out = dir.join("n.bfasl");
+    fs::write(
+        &src,
+        "(defun steps (n) (loop for i = 10 then (+ i 5) repeat n collect i))\n\
+         (defun halves (n) (loop for i from 1 to n collect (* 1/2 i)))\n\
+         (defun a-third () 1/3)\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (list (steps 4) (halves 4) (a-third)))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    // steps: 10,15,20,25. halves: 1/2,1,3/2,2. a-third: 1/3.
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "((10 15 20 25) (1/2 1 3/2 2) 1/3)",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `destructuring-bind` must lower to source-free portable bytecode (required,
 /// `&optional` with defaults, and `&rest`) and execute correctly from a fresh
 /// process. This is a prerequisite for compiling real macros (e.g. alexandria's

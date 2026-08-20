@@ -879,6 +879,7 @@ impl<'e> Lowerer<'e> {
                 "FUNCTION" => self.lower_function(rest),
                 "FLET" => self.lower_flet(rest, false),
                 "LABELS" => self.lower_flet(rest, true),
+                "MACROLET" | "SYMBOL-MACROLET" => self.lower_macrolet(form),
                 _ => self.lower_call(&name, op, rest),
             }
         } else {
@@ -1335,6 +1336,24 @@ impl<'e> Lowerer<'e> {
             self.emit(Instr::PopEnvChild);
         }
         Ok(())
+    }
+
+    /// `(macrolet ((name ll body…) …) body…)` / `(symbol-macrolet …)` in a
+    /// function body: local macros and symbol-macros are purely expand-time, so
+    /// fully expand the whole form (which installs the local definitions, expands
+    /// their uses in the body, and strips the wrapper per §4.2.7) and lower the
+    /// resulting macro-free body. `macroexpand_all` walks into ordinary special
+    /// forms, keeping their operators intact, so the lowerer's dedicated handlers
+    /// (LOOP, TAGBODY, …) still see the structure they expect.
+    fn lower_macrolet(&mut self, form: BlissVal) -> LowerResult<()> {
+        if self.macro_env.is_none() {
+            self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
+        }
+        let menv = self.macro_env.as_ref().unwrap();
+        match compiler_macroexpand::macroexpand_all(form, menv) {
+            Ok(expanded) => self.lower_expr(expanded),
+            Err(_) => Err(record_bail(|| "macroexpand:macrolet".to_string())),
+        }
     }
 
     fn lower_call(&mut self, name: &str, op: BlissVal, rest: BlissVal) -> LowerResult<()> {
@@ -2133,13 +2152,28 @@ impl<'e> Lowerer<'e> {
                             i += adv;
                         }
                         Some("=") => {
-                            let expr = *forms.get(i + 3).ok_or(Bail)?;
+                            let init = *forms.get(i + 3).ok_or(Bail)?;
                             if !var.is_symbol() {
                                 return Err(Bail);
                             }
-                            bindings.push(form_list(&[var, NIL]));
-                            pre.push(form_list(&[s("SETQ")?, var, expr]));
-                            i += 4;
+                            if kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref() == Some("THEN") {
+                                // `for VAR = INIT then STEP`: INIT on the first
+                                // iteration, STEP on every subsequent one. Bind to
+                                // INIT once; re-assign to STEP in the step section
+                                // (which runs after the body, before the next top
+                                // test), so iteration 1 sees INIT and later
+                                // iterations see STEP.
+                                let step = *forms.get(i + 5).ok_or(Bail)?;
+                                bindings.push(form_list(&[var, init]));
+                                steps.push(form_list(&[s("SETQ")?, var, step]));
+                                i += 6;
+                            } else {
+                                // `for VAR = FORM` (no `then`): FORM is re-evaluated
+                                // each iteration.
+                                bindings.push(form_list(&[var, NIL]));
+                                pre.push(form_list(&[s("SETQ")?, var, init]));
+                                i += 4;
+                            }
                         }
                         Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
                             if !var.is_symbol() {
@@ -4146,6 +4180,31 @@ fn parse_loop_selectable(
     Ok(())
 }
 
+/// True if `body` (a list of forms) syntactically contains a `MACROLET` or
+/// `SYMBOL-MACROLET` anywhere (outside quoted data). Used to decide whether the
+/// body must be macro-expanded before capture analysis: a local macro can
+/// introduce references to enclosing lexicals that are invisible in the
+/// unexpanded source (e.g. alexandria's `gaussian-random`).
+fn body_uses_macrolet(body: BlissVal) -> bool {
+    fn walk(form: BlissVal) -> bool {
+        if !form.is_cons() {
+            return false;
+        }
+        let (car, cdr) = cp(form);
+        if car.is_symbol() {
+            let n = symbol_bare_name(&sym_name(car));
+            if n == "MACROLET" || n == "SYMBOL-MACROLET" {
+                return true;
+            }
+            if n == "QUOTE" {
+                return false;
+            }
+        }
+        walk(car) || walk(cdr)
+    }
+    list_to_vec(body).into_iter().any(walk)
+}
+
 /// True if `body` (a list of forms) syntactically uses `RETURN-FROM` anywhere
 /// (outside quoted data). A conservative over-approximation used to decide
 /// whether a function needs its implicit block established.
@@ -4850,6 +4909,28 @@ fn compile_function_in(
         }
     };
 
+    // If the body contains a local `macrolet`/`symbol-macrolet`, fully expand it
+    // up front (macroexpand_all installs the local definitions, expands their
+    // uses, and strips the wrapper while preserving ordinary special forms). This
+    // must happen BEFORE capture analysis and the implicit-block decision below:
+    // a local macro can introduce references to enclosing lexicals (or a
+    // `return-from`) that are invisible in the unexpanded source, so scanning the
+    // raw body would fail to box a captured variable (alexandria's
+    // `gaussian-random`).
+    let body = if body_uses_macrolet(body) {
+        let progn = arena_cons(resolve_sym("PROGN")?, body);
+        let menv = super::macroexpand_environment_from_cli(env);
+        match compiler_macroexpand::macroexpand_all(progn, &menv) {
+            Ok(expanded) => arena_cons(expanded, NIL),
+            Err(_) => {
+                let _ = record_bail(|| "macroexpand:macrolet".to_string());
+                return None;
+            }
+        }
+    } else {
+        body
+    };
+
     let mut lo = Lowerer::new(env);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(body);
@@ -5268,6 +5349,18 @@ impl BbuConstPool {
             put_u8(&mut bytes, 13);
             put_u32(&mut bytes, car_ref);
             put_u32(&mut bytes, cdr_ref);
+            return Some(self.intern_encoded(bytes));
+        }
+        // A ratio (e.g. `1/2`): pool its numerator and denominator (fixnums or
+        // bignums, themselves poolable) and reconstruct the RATIO heap object on
+        // load. Bignum parts that are not poolable make the whole ratio bail.
+        if let Some((num, den)) = super::ratio_parts_val(v) {
+            let num_ref = self.value(num)?;
+            let den_ref = self.value(den)?;
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 17);
+            put_u32(&mut bytes, num_ref);
+            put_u32(&mut bytes, den_ref);
             return Some(self.intern_encoded(bytes));
         }
         None
@@ -6197,6 +6290,8 @@ enum BbuConstant {
     /// process-local index disambiguates distinct symbols at serialize time and
     /// is not retained).
     UninternedSymbol(u32),
+    /// A ratio: numerator and denominator constant refs (each an integer).
+    Ratio(u32, u32),
 }
 
 #[derive(Clone, Debug)]
@@ -6371,6 +6466,11 @@ fn parse_bbu_constant(
             let name_ref = cursor.u32()?;
             let _index = cursor.u32()?; // disambiguation only; not retained
             BbuConstant::UninternedSymbol(name_ref)
+        }
+        17 => {
+            let num_ref = cursor.u32()?;
+            let den_ref = cursor.u32()?;
+            BbuConstant::Ratio(num_ref, den_ref)
         }
         tag => return Err(bbu_error(format!("unsupported constant tag {tag}"))),
     })
@@ -6589,6 +6689,17 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<BlissVal>,
             BbuConstant::UninternedSymbol(name_ref) => {
                 let name = bbu_string(constants, *name_ref)?;
                 bliss_rt::symbols::make_uninterned(name)
+            }
+            BbuConstant::Ratio(num_ref, den_ref) => {
+                // Numerator/denominator were emitted (and materialised) before the
+                // ratio, so they are already present in `values`.
+                let num = *values.get(*num_ref as usize).ok_or_else(|| {
+                    bbu_error(format!("forward/cyclic ratio reference at {index}"))
+                })?;
+                let den = *values.get(*den_ref as usize).ok_or_else(|| {
+                    bbu_error(format!("forward/cyclic ratio reference at {index}"))
+                })?;
+                super::alloc_ratio_cli(num, den)
             }
             BbuConstant::Cons(car_ref, cdr_ref) => {
                 // The writer emits structural children before their parent.
