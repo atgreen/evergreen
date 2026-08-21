@@ -398,6 +398,70 @@ fn cross_unit_setf_writer_bfasl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `(setf (symbol-function s) v)` / `(setf (fdefinition s) v)` must install a
+/// value that is actually callable by the name `s` — for every function
+/// designator, not just an existing `(symbol-function q)`. The FUNCTION form
+/// yields a bare symbol for `#'q` and a closure cons for `(lambda …)`, neither
+/// an interpreted-function object, so a naive verbatim store left `s`
+/// "undefined"/empty (bliss-57m). Round-trips through `.bfasl`: a bfasl-loaded
+/// function is callable only under its registered name, so an aliased name must
+/// dispatch through the resolved object's own name. This is alexandria's
+/// `sequences.lisp` (`(setf (symbol-function 'emptyp) (symbol-function
+/// 'sequence:emptyp))`).
+#[test]
+fn setf_symbol_function_install_bfasl_round_trip() {
+    let dir = workdir("setf-symfn");
+    let src = dir.join("s.lisp");
+    let out = dir.join("s.bfasl");
+    fs::write(
+        &src,
+        // A source lambda installed via SETF SYMBOL-FUNCTION, a `#'name` alias,
+        // and a `(symbol-function name)` alias — all called by their new names,
+        // directly and through funcall/apply/mapcar.
+        "(defun base-sum (a b) (+ a b))\n\
+         (setf (symbol-function 'inst-lambda) (lambda (a b) (* a b)))\n\
+         (setf (symbol-function 'alias-sharp) #'base-sum)\n\
+         (setf (fdefinition 'alias-fdef) (symbol-function 'base-sum))\n\
+         (defun use-all (x y)\n\
+           (list (inst-lambda x y)\n\
+                 (alias-sharp x y)\n\
+                 (funcall #'alias-fdef x y)\n\
+                 (apply #'inst-lambda (list x y))\n\
+                 (mapcar #'alias-sharp (list x) (list y))))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    // Fully lowered: no source-text fallback section.
+    assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (use-all 3 4))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    // (* 3 4)=12, (+ 3 4)=7, (+ 3 4)=7, (* 3 4)=12, (mapcar #'+ '(3) '(4))=(7)
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "(12 7 7 12 (7))",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A local `macrolet` whose macro introduces references to enclosing lexicals
 /// (invisible in the unexpanded source) must be expanded before capture
 /// analysis, so the captured variables are boxed and the capturing `labels`

@@ -605,6 +605,61 @@ fn global_fn(name: &str) -> Option<BlissVal> {
     bliss_rt::function::is_interpreted_function(cell).then_some(cell)
 }
 
+/// Coerce a value being installed into a symbol's global function cell (via
+/// `(setf (symbol-function s) v)` / `(setf (fdefinition s) v)` and the
+/// bytecode-lowered `BLISS::SET-SYMBOL-FUNCTION` primitive) into the canonical
+/// stored representation — an interpreted-function object.
+///
+/// The cell is only honoured by `global_fn`/`fn_bound`/`fboundp`/`callable_body`
+/// when it holds an interpreted-function object. But `(setf (symbol-function s)
+/// v)` accepts any function designator, and two common designators are NOT
+/// interpreted-function objects: `#'foo` (which the FUNCTION form evaluates to
+/// the bare *symbol* FOO when foo is a global) and `(lambda …)` (which evaluates
+/// to the interpreter closure cons `(BLISS::CLOSURE . id)`). Storing either
+/// verbatim left the installed name "undefined" (bliss-57m). Resolve them to a
+/// real function object here:
+///   * an interpreted-function object → stored as-is;
+///   * a symbol designator → the current global definition it names (CL captures
+///     the function, not the name — CLHS 5.1.2.7);
+///   * a non-capturing closure `(BLISS::CLOSURE . id)` → reified into an
+///     interpreted-function object carrying its lambda list and body.
+///
+/// A *capturing* closure installed this way still loses its captures: both the
+/// operator-position path (`callable_body` → `eval_lambda_call`) and the
+/// invoke-object path bind against the caller frame, ignoring the function
+/// object's env cell — that is the capturing-closure work tracked in
+/// bliss-jtc.23.3. Designators this can't resolve (e.g. `#'car`, a builtin) are
+/// returned unchanged.
+fn coerce_installed_function(env: &Env, name_sym: BlissVal, val: BlissVal) -> BlissVal {
+    if bliss_rt::function::is_interpreted_function(val) {
+        return val;
+    }
+    if val.is_symbol() {
+        // `#'foo` / a symbol function designator: install foo's current global
+        // definition, not a by-name alias.
+        return global_fn(&sym_name(val)).unwrap_or(val);
+    }
+    if val.is_cons() {
+        let (h, t) = cp(val);
+        if h.is_symbol() && sym_name(h) == "BLISS::CLOSURE" && t.is_fixnum() {
+            let id = t.as_fixnum() as u64;
+            let closure = { env.closures.borrow().get(&id).cloned() };
+            if let Some(closure) = closure {
+                // params_form/body are bare BlissVals; alloc_interpreted roots
+                // them before it can allocate, and nothing allocates between the
+                // clone above and this call, so they cannot go stale.
+                return bliss_rt::function::alloc_interpreted(
+                    closure.params_form,
+                    closure.body,
+                    NIL,
+                    name_sym,
+                );
+            }
+        }
+    }
+    val
+}
+
 /// Resolve a function designator to its tiered function object (FnMeta), for the
 /// bliss-jtc.10 profiling-introspection builtins. Accepts an interpreted-function
 /// object directly (`#'foo`) or a symbol naming a global function (`'foo`).
@@ -7613,9 +7668,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         format_val(sym)
                                     )));
                                 }
+                                let fnval = coerce_installed_function(env, sym, val.get());
                                 bliss_rt::symbols::set_symbol_function(
                                     sym.as_symbol_index(),
-                                    val.get(),
+                                    fnval,
                                 );
                             }
                             "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT"
@@ -8240,7 +8296,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         format_val(sym)
                     )));
                 }
-                bliss_rt::symbols::set_symbol_function(sym.as_symbol_index(), val);
+                let fnval = coerce_installed_function(env, sym, val);
+                bliss_rt::symbols::set_symbol_function(sym.as_symbol_index(), fnval);
                 return Ok(val);
             }
             "BLISS::SET-CAR" | "BLISS::SET-CDR" => {
@@ -10760,7 +10817,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // Guard on no lexical shadow — never redirect an FLET/LABELS binding
             // to the global registry entry of the same name.
             if !env.funs.borrow().contains_key(&name) {
-                if let Some(sym) = resolve_sym(&name) {
+                // Dispatch through the resolved function object's OWN name, not
+                // the called name. For an aliased installation — `(setf
+                // (symbol-function 'p) (symbol-function 'q))`, `… #'q`, or a
+                // source-free `(lambda …)` whose real code is registered under a
+                // fresh gensym — the alias `p` carries no registry entry and its
+                // interpreted body may be an empty shell, so keying dispatch on
+                // `p` ran the empty body and returned NIL. The object's `name`
+                // cell is the symbol its bytecode is registered under (bliss-57m).
+                let dispatch_sym = global_fn(&name)
+                    .map(bliss_rt::function::name)
+                    .filter(|n| n.is_symbol())
+                    .or_else(|| resolve_sym(&name));
+                if let Some(sym) = dispatch_sym {
                     let args: Vec<BlissVal> = rooted_args.iter().map(|a| a.get()).collect();
                     if let Some(res) =
                         bytecode::call_registered(sym.as_symbol_index(), &args, sym, env)
@@ -15892,10 +15961,18 @@ fn apply_function(
             // registered bytecode body (e.g. one installed from a `.bfasl`, whose
             // interpreted-function object carries a NIL body) must dispatch
             // through the promoting bytecode/native path, not run its empty
-            // fallback body. Guard on no lexical FLET/LABELS shadow so a local
+            // fallback body. Dispatch through the resolved object's OWN name so
+            // an aliased installation — `(setf (symbol-function 'p) #'q)` — routes
+            // to q's registered bytecode rather than the alias p, which carries no
+            // registry entry and whose interpreted body is the empty shell
+            // (bliss-57m). Guard on no lexical FLET/LABELS shadow so a local
             // binding is never redirected to the global registry entry.
             if !env.funs.borrow().contains_key(&name) {
-                if let Some(sym) = resolve_sym(&name) {
+                let dispatch_sym = global_fn(&name)
+                    .map(bliss_rt::function::name)
+                    .filter(|n| n.is_symbol())
+                    .or_else(|| resolve_sym(&name));
+                if let Some(sym) = dispatch_sym {
                     if let Some(res) =
                         bytecode::call_registered(sym.as_symbol_index(), args, sym, env)
                     {
