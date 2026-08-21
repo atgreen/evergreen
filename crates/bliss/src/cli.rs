@@ -3413,12 +3413,45 @@ fn live_env_root_depth() -> usize {
         .map_or(0, Vec::len)
 }
 
+thread_local! {
+    // Caller frames that `with_child_frame` has swapped OUT of `env.frame` while a
+    // nested evaluation runs. For a lexical child the new frame's parent IS the
+    // saved caller frame, so it stays reachable via `env.frame`; but a *function
+    // call* installs the callee's captured frame as parent, taking the caller's
+    // frame (and its locals — e.g. a `loop` iteration variable) off the scanned
+    // `env.frame` chain. Those locals then survive only in this Rust-side stack,
+    // invisible to the relocating GC. Rooting them here keeps them (and the values
+    // they bind) live and relocated for the whole nested call (bliss-6b2 #2).
+    static SUSPENDED_FRAMES: RefCell<Vec<Rc<RefCell<EnvFrame>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn scan_suspended_frames(visit: &mut dyn FnMut(*mut BlissVal)) {
+    SUSPENDED_FRAMES.with(|s| {
+        let frames = s.borrow();
+        let mut state = EnvRootVisitState::default();
+        for frame in frames.iter() {
+            visit_env_frame_roots(frame, &mut state, visit);
+        }
+    });
+}
+
+fn install_suspended_frame_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_suspended_frames));
+}
+
 fn with_child_frame<T>(
     env: &mut Env,
     parent: Rc<RefCell<EnvFrame>>,
     f: impl FnOnce(&mut Env) -> Result<T, BlissError>,
 ) -> Result<T, BlissError> {
+    install_suspended_frame_scanner();
     let saved_frame = Rc::clone(&env.frame);
+    // Keep the swapped-out caller frame rooted for the extent of `f`: a function
+    // call reparents `env.frame` to the callee's captured frame, so without this
+    // the caller's locals would be unscanned during the call (bliss-6b2 #2).
+    SUSPENDED_FRAMES.with(|s| s.borrow_mut().push(Rc::clone(&saved_frame)));
     env.frame = Rc::new(RefCell::new(EnvFrame {
         vars: HashMap::new(),
         symbol_vars: HashMap::new(),
@@ -3426,6 +3459,9 @@ fn with_child_frame<T>(
     }));
     let result = f(env);
     env.frame = saved_frame;
+    SUSPENDED_FRAMES.with(|s| {
+        s.borrow_mut().pop();
+    });
     result
 }
 
@@ -14708,6 +14744,15 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
             macro_env.methods = Rc::new(RefCell::new(methods.clone()));
             macro_env.current_package = current_package.clone();
             macro_env.eval_context = eval_context;
+            // Register the fresh macro-expansion Env as a GC root *before*
+            // binding: it holds the macro parameters (e.g. `&body body`) and
+            // every variable the body binds (e.g. a `case`/`typecase` gensym), on
+            // a frame chain a relocating minor GC would otherwise never scan. The
+            // guard must precede bind_macro_lambda_list — building a `&rest`/
+            // `&body` list allocates (arena_cons), which can fire a GC that would
+            // free the already-bound parameters if the env were still
+            // unregistered (bliss-6b2 #2). Same guard as eval_flet / eval_macrolet.
+            let _macro_env_root = LiveEnvRootGuard::new(&mut macro_env);
             bind_macro_lambda_list(
                 params_form,
                 &list_to_vec(args),
@@ -14959,6 +15004,15 @@ fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissV
     } else {
         None
     };
+    // Register the forked expansion Env as a GC root for the whole expansion:
+    // `env.child_with_parent` forks a whole Env, so the macro parameters and
+    // every variable the body binds (e.g. a `loop`/`case` iteration var inside a
+    // quasiquote — as in asdf's `with-upgradability`) live on a frame chain a
+    // relocating minor GC would otherwise never scan, freeing them mid-expansion
+    // (bliss-6b2 #2). The guard must precede the bind: building a `&rest`/`&body`
+    // list allocates and can fire a GC before the body even runs. Same guard as
+    // eval_flet / eval_macrolet.
+    let _child_root = LiveEnvRootGuard::new(&mut child_env);
     bind_macro_lambda_list(
         mdef.params_form,
         &arg_list,
