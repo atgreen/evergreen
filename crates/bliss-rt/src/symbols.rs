@@ -394,6 +394,14 @@ pub fn set_symbol_function(idx: u32, function: BlissVal) {
     write_cell(idx, |s| s.function = function);
 }
 
+/// Diagnostic: the raw address of a symbol's pinned `SymbolData` object, or
+/// `None` for an unknown index. The `function` cell lives at offset 24. Used to
+/// place a hardware watchpoint on a symbol's function/value cell when chasing
+/// heap corruption (bliss-6b2).
+pub fn symbol_object_ptr(idx: u32) -> Option<usize> {
+    with_registry(|reg| object_for_index(reg?, idx).map(|o| unsafe { o.as_ptr() } as usize))
+}
+
 /// The property list (`NIL` or a cons).
 pub fn symbol_plist(idx: u32) -> Option<BlissVal> {
     read_cell(idx, |s| s.plist)

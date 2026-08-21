@@ -5974,6 +5974,29 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         if let Some(val) = env.lookup_var(&name) {
             return Ok(val);
         }
+        if std::env::var_os("BLISS_TRACE_UNDEF_FN").is_some() && form.is_symbol() {
+            let idx = form.as_symbol_index();
+            let obj = bliss_rt::symbols::symbol_object_ptr(idx);
+            // Is `name` currently mapped in the registry to a DIFFERENT index
+            // whose value IS bound? If so, `idx` is an orphan duplicate created by
+            // a lookup that missed the existing entry — registry corruption.
+            let canonical = bliss_rt::symbols::find_index(&name);
+            let canonical_bound = canonical
+                .map(|ci| bliss_rt::symbols::symbol_value(ci) != Some(bliss_rt::value::UNBOUND));
+            eprintln!(
+                "[unbound-var] symbol {:?} idx={} object_ptr={:?} value_cell_addr={:?} \
+                 find_index={:?} canonical_bound={:?}",
+                name,
+                idx,
+                obj.map(|p| p as *const u8),
+                obj.map(|p| (p + 16) as *const u8),
+                canonical,
+                canonical_bound,
+            );
+            if std::env::var_os("BLISS_TRACE_UNDEF_BT").is_some() {
+                eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            }
+        }
         return Err(BlissError::UnboundVariable(form));
     }
     if form.is_cons() {
@@ -10707,6 +10730,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         return Ok(NIL);
     }
 
+    if std::env::var_os("BLISS_TRACE_UNDEF_FN").is_some() && car.is_symbol() {
+        let idx = car.as_symbol_index();
+        let obj = bliss_rt::symbols::symbol_object_ptr(idx);
+        eprintln!(
+            "[undef-fn] symbol {:?} idx={} object_ptr={:?} function_cell_addr={:?}",
+            sym_name(car),
+            idx,
+            obj.map(|p| p as *const u8),
+            obj.map(|p| (p + 24) as *const u8),
+        );
+    }
     Err(BlissError::UndefinedFunction(car))
 }
 
