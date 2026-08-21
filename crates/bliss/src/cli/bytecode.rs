@@ -156,6 +156,59 @@ fn install_bytecode_root_scanner() {
     INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_bytecode_roots));
 }
 
+thread_local! {
+    /// Constant tables of Lowerers currently compiling. During lowering the
+    /// function is not yet registered/active, so scan_bytecode_roots does not see
+    /// it; without this, a heap literal (float/bignum/string/quoted list) already
+    /// placed in `constants` would be freed or left stale by a relocating GC fired
+    /// by a later lowering allocation — the compiled code would then read a stale
+    /// constant (observed as `NIL is not of type number`) (bliss-6b2 #2).
+    static ACTIVE_LOWERER_CONSTS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn scan_lowerer_consts(visit: &mut dyn FnMut(*mut BlissVal)) {
+    ACTIVE_LOWERER_CONSTS.with(|r| {
+        for &p in r.borrow().iter() {
+            // SAFETY: registered only while the owning Lowerer local is live and
+            // immobile (the guard is dropped before the Lowerer).
+            unsafe {
+                for e in (*(p as *mut Vec<BlissVal>)).iter_mut() {
+                    visit(e as *mut BlissVal);
+                }
+            }
+        }
+    });
+}
+
+fn install_lowerer_const_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_lowerer_consts));
+}
+
+/// Roots a Lowerer's `constants` table for the extent of compilation.
+struct LowererConstGuard(usize);
+
+impl LowererConstGuard {
+    fn new(constants: &mut Vec<BlissVal>) -> Self {
+        install_lowerer_const_scanner();
+        let p = constants as *mut Vec<BlissVal> as usize;
+        ACTIVE_LOWERER_CONSTS.with(|r| r.borrow_mut().push(p));
+        LowererConstGuard(p)
+    }
+}
+
+impl Drop for LowererConstGuard {
+    fn drop(&mut self) {
+        ACTIVE_LOWERER_CONSTS.with(|r| {
+            let mut v = r.borrow_mut();
+            if let Some(i) = v.iter().rposition(|&x| x == self.0) {
+                v.remove(i);
+            }
+        });
+    }
+}
+
 struct ActiveBytecodeRoot {
     ptr: usize,
 }
@@ -3942,6 +3995,7 @@ fn compile_local_function(
 ) -> Option<BytecodeFunction> {
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
+    let _const_guard = LowererConstGuard::new(&mut lo.constants);
     lo.portable = portable;
     lo.local_fns = local_fns.clone();
     lo.captured_names = compute_captured_names(fbody);
@@ -3998,6 +4052,7 @@ fn compile_capturing_local(
 ) -> Option<BytecodeFunction> {
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
+    let _const_guard = LowererConstGuard::new(&mut lo.constants);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(fbody);
     lo.has_env = true;
@@ -4479,6 +4534,7 @@ fn compile_restart_clause(
 ) -> Option<BytecodeFunction> {
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
+    let _const_guard = LowererConstGuard::new(&mut lo.constants);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(body);
     if !captures.is_empty() {
@@ -5076,6 +5132,7 @@ fn compile_function_in(
     }
 
     let mut lo = Lowerer::new(env);
+    let _const_guard = LowererConstGuard::new(&mut lo.constants);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(body.get());
     lo.enclosing_blocks = enclosing_blocks.clone();
@@ -5263,6 +5320,7 @@ fn compile_thunk(form: BlissVal, env: &Env, portable: bool) -> Option<BytecodeFu
     let roots = bliss_rt::ShadowRootScope::new();
     let form = roots.root(form);
     let mut lo = Lowerer::new(env);
+    let _const_guard = LowererConstGuard::new(&mut lo.constants);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(arena_cons(form.get(), NIL));
     if lo.lower_expr(form.get()).is_err() {
