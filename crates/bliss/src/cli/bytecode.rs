@@ -8227,7 +8227,9 @@ fn bind_macro_variadic(
 ) -> Result<(), BlissError> {
     let parent = Rc::clone(&env.frame);
     super::with_child_frame(env, parent, |env| {
-        super::bind_macro_lambda_list(func.params_form, args, env, None)?;
+        // A bytecode (source-free) macro never has `&whole` — the lowerer bails
+        // it to the tree-walker — so no whole-form override is needed here.
+        super::bind_macro_lambda_list(func.params_form, args, env, None, None)?;
         env.clear_mv();
         let current = Rc::clone(&env.frame);
         for (name, location) in &func.param_layout {

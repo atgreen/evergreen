@@ -4650,7 +4650,7 @@ fn expand_compile_toplevel_form(mut form: BlissVal, env: &mut Env) -> BlissVal {
         let Some(mdef) = lookup_macro(env, &name) else {
             return form;
         };
-        match expand_macro(&mdef, rest, env) {
+        match expand_macro(&mdef, rest, env, form) {
             Ok(expanded) if expanded != form => form = expanded,
             _ => return form,
         }
@@ -6411,7 +6411,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
         // Check for macro expansion first (lexical MACROLET macro, else global).
         if let Some(mdef) = lookup_macro(env, &name) {
-            let expanded = expand_macro(&mdef, cdr, env)?;
+            let expanded = expand_macro(&mdef, cdr, env, form)?;
             return eval_form(expanded, env);
         }
 
@@ -14317,7 +14317,9 @@ fn bind_macro_param(
     // the lambda-list binder (handles &optional/&rest/&key).
     if contains_lambda_list_keyword(pattern) {
         let sub_args = list_to_vec(value);
-        return bind_macro_lambda_list(pattern, &sub_args, env, macroexpand_env);
+        // Nested destructuring: `&whole` here binds the sub-list being
+        // destructured (no operator to prepend), which is the default.
+        return bind_macro_lambda_list(pattern, &sub_args, env, macroexpand_env, None);
     }
     // Otherwise destructure structurally, recursing through this function so a
     // keyword-bearing lambda list nested *deeper* is still detected. A symbol in
@@ -14340,6 +14342,11 @@ fn bind_macro_lambda_list(
     args: &[BlissVal],
     env: &mut Env,
     macroexpand_env: Option<&MacroexpandEnv>,
+    // The form an `&whole` parameter binds to. For a top-level macro / setf
+    // expander call this is the ENTIRE call form including the operator (CLHS
+    // 3.4.4) — the caller supplies it because `args` holds only the arguments.
+    // `None` (nested destructuring) defaults to the sub-list being destructured.
+    whole: Option<BlissVal>,
 ) -> Result<(), BlissError> {
     #[derive(PartialEq)]
     enum Mode {
@@ -14358,7 +14365,7 @@ fn bind_macro_lambda_list(
     let mut allow_other_keys = false;
     let mut key_specs: Vec<(String, BlissVal, BlissVal, Option<String>)> = Vec::new();
     let mut whole_var: Option<BlissVal> = None;
-    let whole_form = vec_to_list(args);
+    let whole_form = whole.unwrap_or_else(|| vec_to_list(args));
 
     let mut c = params_form;
     while c.is_cons() {
@@ -14725,6 +14732,8 @@ fn get_setf_expansion(place: BlissVal, env: &mut Env) -> Result<SetfExpansion, B
                             &arg_list,
                             &mut child,
                             macroexpand_env.as_ref(),
+                            // A setf expander's `&whole` binds the whole place form.
+                            Some(place),
                         )?;
                         eval_progn(mdef.body, &mut child)?
                     };
@@ -14900,6 +14909,8 @@ fn eval_define_compiler_macro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, 
                 &list_to_vec(args),
                 &mut macro_env,
                 Some(_macro_env),
+                // A compiler macro's `&whole` binds the whole call form.
+                Some(form),
             )?;
             eval_progn(body, &mut macro_env)
         }),
@@ -14979,7 +14990,7 @@ fn macroexpand_all(form: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
     // 1. Macro call → expand once, then recurse into the expansion. On any
     //    expander error, leave the original form for the lazy path.
     if let Some(mdef) = lookup_macro(env, &name) {
-        return match expand_macro(&mdef, cdr, env) {
+        return match expand_macro(&mdef, cdr, env, form) {
             Ok(expanded) => macroexpand_all(expanded, env, d),
             Err(_) => form,
         };
@@ -15125,7 +15136,17 @@ fn mx_local_fns(defs: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
     out
 }
 
-fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+fn expand_macro(
+    mdef: &MacroDef,
+    args: BlissVal,
+    env: &mut Env,
+    // The whole macro call form `(name . args)`, for an `&whole` parameter.
+    mut whole: BlissVal,
+) -> Result<BlissVal, BlissError> {
+    // `whole` is bound (into `&whole`) only after the child env fork and arg-list
+    // build below, both of which allocate and can fire a relocating minor GC;
+    // root it so the bound form is not left dangling (bliss-6b2 #2).
+    let _whole_root = bliss_rt::gc::StackRoot::new(&mut whole);
     let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
     let arg_list = list_to_vec(args);
     if let Some(function) = &mdef.bytecode {
@@ -15160,6 +15181,7 @@ fn expand_macro(mdef: &MacroDef, args: BlissVal, env: &mut Env) -> Result<BlissV
         &arg_list,
         &mut child_env,
         macroexpand_env.as_ref(),
+        Some(whole),
     )?;
     eval_progn(mdef.body, &mut child_env)
 }
@@ -15318,6 +15340,8 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
                             &list_to_vec(args),
                             &mut macro_env,
                             Some(call_macro_env),
+                            // A macrolet macro's `&whole` binds the whole call form.
+                            Some(form),
                         )?;
                         eval_progn(body, &mut macro_env)
                     }),

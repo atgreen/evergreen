@@ -748,6 +748,29 @@ fn eval_defmacro_and_expansion() {
     );
 }
 
+/// `&whole` binds the ENTIRE macro call form, including the macro name (CLHS
+/// 3.4.4) — `(w 7)` binds `(W 7)`, not `(7)`. A `&whole` on a nested
+/// destructuring sublist still binds only that sublist (no operator).
+#[test]
+fn eval_macro_whole_includes_operator() {
+    let expr = r#"(progn
+  (defmacro w (&whole form x) (declare (ignore x)) (list 'quote form))
+  (defmacro nested ((&whole sub a b)) (declare (ignore a b)) (list 'quote sub))
+  (format nil "~S ~S" (w 7) (nested (8 9))))"#;
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(W 7) (8 9)"),
+        "&whole should bind the whole call form (with operator) at top level and \
+         the sublist when nested, got: '{}'",
+        stdout
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════
 // Multiple values (multiple-value-bind)
 // ══════════════════════════════════════════════════════════════════
