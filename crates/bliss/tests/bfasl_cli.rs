@@ -1110,6 +1110,51 @@ fn corrupt_makeclosure_reference_is_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A `bliss-ext:` builtin called from a source-free `.bfasl` must dispatch to
+/// the builtin. The constant pool records the callee symbol under its registry
+/// key, which can be the internal `BLISS-EXT::NAME` spelling, while the builtin
+/// dispatch arms use the external `BLISS-EXT:NAME` spelling — so a compiled
+/// reference resolved to a distinct, undefined symbol. This is uiop's
+/// `#+bliss (bliss-ext:raw-command-line-arguments)` (bliss-lb6).
+#[test]
+fn bliss_ext_builtin_call_bfasl_round_trips() {
+    let dir = workdir("bliss-ext-builtin");
+    let src = dir.join("b.lisp");
+    let out = dir.join("b.bfasl");
+    // getenv is a stable bliss-ext builtin with a deterministic result here.
+    fs::write(
+        &src,
+        "(defun home-set-p () (if (bliss-ext:getenv \"BLISS_TEST_MARKER\") t nil))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+
+    // Fresh process: calling the compiled function must reach the builtin (not
+    // raise "undefined function: BLISS-EXT::GETENV").
+    let l = run(&format!(
+        "(progn (load \"{}\") (home-set-p))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load/call failed (bliss-ext builtin not dispatched?): {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "NIL");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A top-level `(defsetf access-fn lambda-list (store-vars) body)` must not be
 /// thunk-compiled: the bytecode lowerer doesn't understand DEFSETF, so it would
 /// miscompile it as an ordinary call and evaluate the access-fn name and store

@@ -6407,7 +6407,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let _car_root = bliss_rt::gc::StackRoot::new(&mut car);
     let _cdr_root = bliss_rt::gc::StackRoot::new(&mut cdr);
     if car.is_symbol() {
-        let name = sym_name(car);
+        // A `bliss-ext:` / `bliss-internal:` builtin referenced from a source-free
+        // `.bfasl` can materialise under the INTERNAL `PKG::NAME` spelling (the
+        // constant pool records the symbol's registry key), while the builtin
+        // dispatch arms below and the reader use the EXTERNAL `PKG:NAME` spelling.
+        // Normalise the two builtin packages so a compiled reference (e.g. uiop's
+        // `#+bliss (bliss-ext:raw-command-line-arguments)`) reaches its builtin
+        // instead of resolving to a distinct undefined symbol (bliss-lb6).
+        let name = {
+            let raw = sym_name(car);
+            if let Some(rest) = raw.strip_prefix("BLISS-EXT::") {
+                format!("BLISS-EXT:{rest}")
+            } else if let Some(rest) = raw.strip_prefix("BLISS-INTERNAL::") {
+                format!("BLISS-INTERNAL:{rest}")
+            } else {
+                raw
+            }
+        };
 
         // Check for macro expansion first (lexical MACROLET macro, else global).
         if let Some(mdef) = lookup_macro(env, &name) {
