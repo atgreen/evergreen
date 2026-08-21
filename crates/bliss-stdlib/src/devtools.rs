@@ -948,7 +948,15 @@ pub fn invoke_debugger_ui(
 
 /// Pretty-print a debug frame.
 fn print_frame(out: &mut impl IoWrite, index: usize, frame: &DebugFrame) {
-    let func_desc = format!("{:?}", frame.function());
+    let func = frame.function();
+    // Prefer the symbol's printed name (e.g. `FIND-IF`) over the opaque
+    // `Symbol(194)` debug form.
+    let func_desc = if func.is_symbol() {
+        bliss_rt::symbols::symbol_name(func.as_symbol_index())
+            .unwrap_or_else(|| format!("{:?}", func))
+    } else {
+        format!("{:?}", func)
+    };
     let loc_desc = match &frame.source_loc {
         Some((file, line, col)) => format!("{}:{}:{}", file, line, col),
         None => "(unknown location)".to_string(),

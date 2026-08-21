@@ -2323,11 +2323,29 @@ mod shadow_root_scope_tests {
 /// Default heap for a standalone T0 evaluator, with survivor/old-generation
 /// reserve left outside the nursery so moving collections always have space.
 fn t0_default_config() -> GcConfig {
-    let heap_size = 512 * 1024 * 1024;
+    // `BLISS_HEAP_MB` overrides the total heap size (MiB); useful with
+    // `BLISS_GC_DISABLE` to reserve enough headroom to run to completion without
+    // ever collecting.
+    let heap_size = std::env::var("BLISS_HEAP_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(512 * 1024 * 1024);
+    // `BLISS_GC_DISABLE` makes the whole heap a single nursery so a minor GC is
+    // never triggered until the heap is exhausted — a diagnostic for isolating
+    // GC/heap-corruption bugs (bliss-6b2): if a workload that intermittently
+    // corrupts memory runs cleanly with the collector effectively off, the fault
+    // is in the collector/write-barrier, not the mutator.
+    let gc_disabled = std::env::var_os("BLISS_GC_DISABLE").is_some();
+    let nursery_size = if gc_disabled {
+        heap_size
+    } else {
+        64 * 1024 * 1024
+    };
     GcConfig {
         heap_size,
         heap_max: heap_size,
-        nursery_size: 64 * 1024 * 1024,
+        nursery_size,
         tlab_size: 256 * 1024,
         region_size: 1024 * 1024,
         promotion_threshold: 3,

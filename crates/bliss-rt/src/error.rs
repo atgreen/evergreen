@@ -80,10 +80,10 @@ impl core::fmt::Display for BlissError {
                 write!(f, "type error: {:?} is not of type {}", datum, expected)
             }
             BlissError::UnboundVariable(sym) => {
-                write!(f, "unbound variable: {:?}", sym)
+                write!(f, "unbound variable: {}", describe_symbol(*sym))
             }
             BlissError::UndefinedFunction(sym) => {
-                write!(f, "undefined function: {:?}", sym)
+                write!(f, "undefined function: {}", describe_symbol(*sym))
             }
             BlissError::ArithmeticError(msg) => write!(f, "arithmetic error: {}", msg),
             BlissError::PackageError(msg) => write!(f, "package error: {}", msg),
@@ -95,3 +95,15 @@ impl core::fmt::Display for BlissError {
 }
 
 impl std::error::Error for BlissError {}
+
+/// Render a symbol value by its name (e.g. `FIND-IF`) rather than the opaque
+/// `Symbol(194)` debug form, for user-facing error messages. Falls back to the
+/// debug form for a non-symbol datum or an unnamed index.
+fn describe_symbol(sym: crate::value::BlissVal) -> String {
+    if sym.is_symbol() {
+        if let Some(name) = crate::symbols::symbol_name(sym.as_symbol_index()) {
+            return name;
+        }
+    }
+    format!("{:?}", sym)
+}
