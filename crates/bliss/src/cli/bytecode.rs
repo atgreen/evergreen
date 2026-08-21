@@ -7825,9 +7825,19 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 let restarts = table
                     .iter()
                     .map(|&(name_ref, function_ref)| {
+                        // The clause's expander is a nested function serialized
+                        // before its owner, so it must reference an ALREADY decoded
+                        // function (a lower index). An out-of-range reference would
+                        // otherwise index `decoded_functions` out of bounds and
+                        // panic during load (bliss-jtc.23.4).
+                        let function = decoded_functions
+                            .get(function_ref as usize)
+                            .ok_or_else(|| {
+                                bbu_error("restart clause references an out-of-range function")
+                            })?;
                         Ok(RestartClauseInfo {
                             name: bbu_string_from_values(&constants, name_ref)?,
-                            function: Box::new(decoded_functions[function_ref as usize].clone()),
+                            function: Box::new(function.clone()),
                         })
                     })
                     .collect::<Result<Vec<_>, BlissError>>()?;
@@ -7861,6 +7871,23 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
             }
         }
         function.nested_functions = nested_functions;
+        // Every `PushHandlerCase`/`PushRestartCase` selects a clause table by
+        // index; an out-of-range index would panic when the instruction executes
+        // (`func.handler_cases[hc]` / `restart_cases[rc]`). Reject it at load,
+        // before any action mutates runtime state (bliss-jtc.23.4).
+        let n_handler_cases = function.handler_cases.len() as u32;
+        let n_restart_cases = function.restart_cases.len() as u32;
+        for instr in &function.code {
+            match instr {
+                Instr::PushHandlerCase { hc, .. } if *hc >= n_handler_cases => {
+                    return Err(bbu_error("handler-case index out of range"));
+                }
+                Instr::PushRestartCase { rc, .. } if *rc >= n_restart_cases => {
+                    return Err(bbu_error("restart-case index out of range"));
+                }
+                _ => {}
+            }
+        }
         decoded_functions.push(function);
     }
     let functions = decoded_functions

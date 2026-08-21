@@ -1110,6 +1110,66 @@ fn corrupt_makeclosure_reference_is_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A `PushRestartCase` selects its clause table by index at run time
+/// (`func.restart_cases[rc]`); the loader must reject an out-of-range index
+/// before the instruction can execute, rather than panic on the Vec index
+/// (bliss-jtc.23.4).
+#[test]
+fn corrupt_restart_case_index_is_rejected() {
+    let dir = workdir("rc-corrupt");
+    let src = dir.join("rc.lisp");
+    let out = dir.join("rc.bfasl");
+    fs::write(
+        &src,
+        "(defun rc (x) (restart-case (if (< x 0) (error \"neg\") x) (use-it (v) v)))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(c.status.success(), "compile-file failed");
+    let mut bytes = fs::read(&out).unwrap();
+
+    // The single restart-case is index 0, so `PushRestartCase` encodes as opcode
+    // 0x2c + u32 rc=0 + u32 resume_bcp + u16 sp_restore. Find the opcode+rc=0
+    // prefix and rewrite rc to an out-of-range value.
+    let pattern = [0x2c, 0, 0, 0, 0];
+    let positions: Vec<usize> = bytes
+        .windows(pattern.len())
+        .enumerate()
+        .filter(|(_, w)| *w == pattern)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        positions.len(),
+        1,
+        "expected exactly one PUSH_RESTART_CASE with rc=0 to corrupt"
+    );
+    bytes[positions[0] + 1..positions[0] + 5].copy_from_slice(&0x7fff_ffffu32.to_le_bytes());
+    reseal_bfasl_checksum(&mut bytes);
+    fs::write(&out, &bytes).unwrap();
+
+    let l = run(&format!("(load \"{}\")", out.display()));
+    assert!(
+        !l.status.success(),
+        "loader must reject an out-of-range restart-case index; stdout={} stderr={}",
+        String::from_utf8_lossy(&l.stdout),
+        String::from_utf8_lossy(&l.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&l.stderr);
+    // A CLEAN verifier rejection — not a checksum failure and, crucially, not a
+    // panic/abort from indexing the clause table out of bounds.
+    assert!(
+        stderr.contains("restart-case index out of range"),
+        "expected the restart-case index verifier to reject cleanly, got: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn compile_file_then_load_round_trips_in_a_fresh_process() {
     let dir = workdir("roundtrip");
