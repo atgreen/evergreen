@@ -342,6 +342,9 @@ fn alloc_structure(name: BlissVal, slots: &[BlissVal]) -> BlissVal {
 /// Build a proper list from elements: (a b c) = cons(a, cons(b, cons(c, NIL)))
 fn make_list(elems: &[BlissVal]) -> BlissVal {
     let mut result = NIL;
+    // Root the partial list across alloc_cons (which can fire a relocating GC):
+    // the chain built so far would otherwise dangle mid-build (bliss-6b2 #2).
+    let _r = bliss_rt::gc::StackRoot::new(&mut result);
     for &e in elems.iter().rev() {
         result = alloc_cons(e, result);
     }
@@ -783,7 +786,12 @@ fn read_list_with_base(
     read_circular: bool,
     depth: usize,
 ) -> Result<(BlissVal, usize), BlissError> {
-    let mut elements: Vec<BlissVal> = Vec::new();
+    // Root the accumulated elements: reading each subsequent element allocates
+    // (read_string, nested lists, symbol interning) and can fire a relocating
+    // minor GC that would otherwise free the earlier, already-read sub-forms held
+    // in this plain Vec — corrupting the form before it is ever evaluated
+    // (bliss-6b2 #2). HostRoot keeps the Vec's slots scanned and rewritten.
+    let mut elements = bliss_rt::gc::HostRoot::new(Vec::<BlissVal>::new());
     loop {
         pos = skip_whitespace_and_comments(chars, pos);
         if pos >= chars.len() {
@@ -816,6 +824,7 @@ fn read_list_with_base(
                 }
                 // Build dotted list
                 let mut result = cdr_val;
+                let _r = bliss_rt::gc::StackRoot::new(&mut result);
                 for &e in elements.iter().rev() {
                     result = alloc_cons(e, result);
                 }
@@ -1546,7 +1555,9 @@ fn read_vector_literal_with_base(
     read_circular: bool,
     depth: usize,
 ) -> Result<(BlissVal, usize), BlissError> {
-    let mut elements = Vec::new();
+    // Root the accumulated elements across the allocating element reads
+    // (bliss-6b2 #2), as in read_list_with_base.
+    let mut elements = bliss_rt::gc::HostRoot::new(Vec::<BlissVal>::new());
     loop {
         pos = skip_whitespace_and_comments(chars, pos);
         if pos >= chars.len() {
