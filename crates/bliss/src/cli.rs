@@ -6269,7 +6269,14 @@ fn tag_key(form: BlissVal) -> Option<String> {
 }
 
 fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (car, cdr) = cp(form);
+    // Root the operator and argument-list locals in place for the whole dispatch:
+    // a relocating minor GC fired by any sub-form evaluation would otherwise leave
+    // these (and every `cp(cdr)`-derived cursor read afterwards) dangling
+    // (bliss-6b2 #2). StackRoot rewrites the locals in place, so all existing
+    // reads keep working.
+    let (mut car, mut cdr) = cp(form);
+    let _car_root = bliss_rt::gc::StackRoot::new(&mut car);
+    let _cdr_root = bliss_rt::gc::StackRoot::new(&mut cdr);
     if car.is_symbol() {
         let name = sym_name(car);
 
@@ -6294,7 +6301,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return eval_quasiquote(template, env);
             }
             "IF" => {
-                let (test, r) = cp(cdr);
+                let (test, mut r) = cp(cdr);
+                // `r` (the then/else tail) is held across the test's evaluation;
+                // root it in place so a GC there can't dangle it (bliss-6b2 #2).
+                let _r_root = bliss_rt::gc::StackRoot::new(&mut r);
                 let tv = eval_form(test, env)?;
                 let (then, er) = cp(r);
                 return if !tv.is_nil() {

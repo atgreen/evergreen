@@ -9,6 +9,7 @@ use std::alloc::Layout;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Once, OnceLock};
@@ -2111,6 +2112,226 @@ fn scan_external_roots(mut visit: impl FnMut(*mut BlissVal)) {
     let scanners = root_scanners().lock().unwrap().clone();
     for s in scanners {
         s(&mut visit);
+    }
+}
+
+// ── Host-container / in-place stack roots (bliss-6b2 #2) ───────────────────
+//
+// `StackRoot` registers the *address of an existing Rust local* `BlissVal` slot
+// so a moving collection rewrites that local in place — no `.get()` indirection,
+// so existing evaluator code that reads the local directly keeps working. This
+// is the ergonomic retrofit primitive for the pervasive dispatch-level locals
+// (`eval_list` car/cdr, operand splits) that a copying GC would otherwise leave
+// dangling. `HostRoot<T>` is the owning counterpart for a Rust container (e.g. a
+// `Vec<BlissVal>`) that must stay rooted while its owner calls allocating Lisp
+// code. Both are thread-affine and unregister on drop; the caller must keep the
+// referenced slot immobile (not moved/returned by value) for the guard's extent.
+
+pub trait TraceHostRoots {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal));
+}
+
+impl TraceHostRoots for BlissVal {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        visit(self as *mut BlissVal);
+    }
+}
+
+impl<T: TraceHostRoots> TraceHostRoots for Vec<T> {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        for value in self {
+            value.trace_host_roots(visit);
+        }
+    }
+}
+
+impl<T: TraceHostRoots> TraceHostRoots for Option<T> {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        if let Some(value) = self {
+            value.trace_host_roots(visit);
+        }
+    }
+}
+
+impl<A: TraceHostRoots, B: TraceHostRoots> TraceHostRoots for (A, B) {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        self.0.trace_host_roots(visit);
+        self.1.trace_host_roots(visit);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HostRootEntry {
+    address: usize,
+    trace: unsafe fn(usize, &mut dyn FnMut(*mut BlissVal)),
+}
+
+fn host_roots() -> &'static OrderedMutex<HashMap<ThreadId, Vec<HostRootEntry>>> {
+    static ROOTS: OnceLock<OrderedMutex<HashMap<ThreadId, Vec<HostRootEntry>>>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            5,
+            "GC host-container roots",
+            HashMap::new(),
+        )
+    })
+}
+
+unsafe fn trace_host_root<T: TraceHostRoots>(
+    address: usize,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    // SAFETY: HostRoot registers the address of its boxed T and unregisters it
+    // before dropping the box. Moving HostRoot does not move the box allocation.
+    unsafe { (&mut *(address as *mut T)).trace_host_roots(visit) };
+}
+
+fn scan_host_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let mut roots = host_roots().lock().unwrap_or_else(|e| e.into_inner());
+    for entries in roots.values_mut() {
+        for entry in entries {
+            // SAFETY: every live registry entry belongs to a live HostRoot/StackRoot.
+            unsafe { (entry.trace)(entry.address, visit) };
+        }
+    }
+}
+
+fn install_host_root_scanner() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| register_root_scanner(scan_host_roots));
+}
+
+/// A stable, precisely-scanned owner for Rust containers that hold Lisp values.
+///
+/// Unlike [`ShadowRootScope`], this is suitable for a `Vec<BlissVal>` that must
+/// itself be returned from a helper and remain rooted while its caller invokes
+/// allocating Lisp code. The value is boxed so moving this handle cannot
+/// invalidate the registered address.
+pub struct HostRoot<T: TraceHostRoots> {
+    thread: ThreadId,
+    value: Box<T>,
+    address: usize,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl<T: TraceHostRoots> HostRoot<T> {
+    pub fn new(value: T) -> Self {
+        install_host_root_scanner();
+        let thread = std::thread::current().id();
+        let mut value = Box::new(value);
+        let address = (&mut *value as *mut T) as usize;
+        host_roots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(thread)
+            .or_default()
+            .push(HostRootEntry {
+                address,
+                trace: trace_host_root::<T>,
+            });
+        Self {
+            thread,
+            value,
+            address,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+/// A precise GC root for an existing Rust stack/local `BlissVal` slot.
+///
+/// This is for evaluator code that already keeps values in mutable locals and
+/// must have those locals rewritten in place by a moving collection. The caller
+/// must ensure the referenced slot outlives the guard and is not moved while the
+/// guard is live.
+pub struct StackRoot {
+    thread: ThreadId,
+    address: usize,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl StackRoot {
+    pub fn new(slot: &mut BlissVal) -> Self {
+        install_host_root_scanner();
+        let thread = std::thread::current().id();
+        let address = slot as *mut BlissVal as usize;
+        host_roots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(thread)
+            .or_default()
+            .push(HostRootEntry {
+                address,
+                trace: trace_host_root::<BlissVal>,
+            });
+        Self {
+            thread,
+            address,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for StackRoot {
+    fn drop(&mut self) {
+        assert_eq!(
+            self.thread,
+            std::thread::current().id(),
+            "stack roots are thread-affine"
+        );
+        let mut roots = host_roots().lock().unwrap_or_else(|e| e.into_inner());
+        let remove_thread = if let Some(entries) = roots.get_mut(&self.thread) {
+            let index = entries
+                .iter()
+                .rposition(|entry| entry.address == self.address)
+                .expect("stack root missing from registry");
+            entries.remove(index);
+            entries.is_empty()
+        } else {
+            false
+        };
+        if remove_thread {
+            roots.remove(&self.thread);
+        }
+    }
+}
+
+impl<T: TraceHostRoots> Deref for HostRoot<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T: TraceHostRoots> DerefMut for HostRoot<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
+impl<T: TraceHostRoots> Drop for HostRoot<T> {
+    fn drop(&mut self) {
+        assert_eq!(
+            self.thread,
+            std::thread::current().id(),
+            "host roots are thread-affine"
+        );
+        let mut roots = host_roots().lock().unwrap_or_else(|e| e.into_inner());
+        let remove_thread = if let Some(entries) = roots.get_mut(&self.thread) {
+            let index = entries
+                .iter()
+                .rposition(|entry| entry.address == self.address)
+                .expect("host root missing from registry");
+            entries.remove(index);
+            entries.is_empty()
+        } else {
+            false
+        };
+        if remove_thread {
+            roots.remove(&self.thread);
+        }
     }
 }
 
