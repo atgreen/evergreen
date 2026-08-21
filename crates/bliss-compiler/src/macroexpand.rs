@@ -1922,7 +1922,22 @@ fn eval_local_macro_form(
             if did_expand {
                 eval_local_macro_form(expanded, env, call_env)
             } else {
-                Ok(form)
+                // This mini-evaluator only knows how to run macrolet expander
+                // bodies built from quote/list/cons/append/progn/quasiquote and
+                // (macro) calls. A cons whose operator is a special form (flet,
+                // let, if, …) or an ordinary function (reduce, mapcar, …) must be
+                // *evaluated* to produce the expansion, which we cannot do here.
+                // Returning it unevaluated would emit garbage code that references
+                // the expander's lexicals at runtime (e.g. asdf's `=?` macrolet,
+                // whose flet+reduce body leaves `accessors` free → an "unbound
+                // variable ACCESSORS" at load). Fail instead, so the caller (the
+                // portable lowerer's macrolet pre-expansion) bails and the full
+                // tree-walker — which can evaluate the expander — handles it.
+                let op = get_symbol_name(operator).unwrap_or_else(|| "?".to_string());
+                Err(BlissError::Internal(format!(
+                    "MACROLET: expander body uses `{op}`, which the local-macro \
+                     mini-evaluator cannot evaluate"
+                )))
             }
         }
     }
