@@ -2402,10 +2402,52 @@ unsafe fn set_object_type_id(body: *mut u8, body_size: usize, type_id: u8) {
 /// be initialized or is exhausted. Nursery exhaustion automatically runs a
 /// moving minor collection; evaluator and stdlib owners must therefore expose
 /// every live value through precise root scanners.
+/// Configured stride for `BLISS_GC_STRESS` (0 = disabled). When set to N>0,
+/// [`alloc_typed`] runs a minor collection every N allocations. This is a
+/// diagnostic for rooting bugs (bliss-6b2 root cause #2): the default 64 MiB
+/// nursery makes real minor GCs rare, so a value the tree-walker holds across
+/// an allocation without a `ShadowRootScope` root only rarely moves under a
+/// collection — an intermittent corruption. Forcing frequent minor GCs turns
+/// that into a deterministic, near-immediate failure at the offending site.
+/// Counterpart to `BLISS_GC_DISABLE` (which does the opposite).
+fn gc_stress_stride() -> u64 {
+    static STRIDE: OnceLock<u64> = OnceLock::new();
+    *STRIDE.get_or_init(|| {
+        std::env::var("BLISS_GC_STRESS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+thread_local! {
+    static GC_STRESS_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Run a minor collection every `BLISS_GC_STRESS` allocations, at a GC-safe
+/// point (before this allocation, mirroring the real TLAB-refill trigger — the
+/// caller is not yet holding a half-built object from this call).
+#[inline]
+fn maybe_gc_stress() {
+    let stride = gc_stress_stride();
+    if stride == 0 {
+        return;
+    }
+    let fire = GC_STRESS_COUNTER.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        n % stride == 0
+    });
+    if fire {
+        let _ = collect_t0_minor();
+    }
+}
+
 pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
     if body_size == 0 {
         return None;
     }
+    maybe_gc_stress();
     T0_ALLOCATOR.with(|cell| {
         let mut guard = cell.borrow_mut();
         if guard.is_none() {
