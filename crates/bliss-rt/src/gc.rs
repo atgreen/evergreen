@@ -1413,7 +1413,16 @@ impl Collector for HeapCollector {
                 (region.header.alloc_top as usize).saturating_sub(region.base as usize);
             if region_used > 0 {
                 unsafe {
-                    std::ptr::write_bytes(region.base, 0, region_used);
+                    // bliss-6b2 #2 diagnostic: BLISS_GC_POISON fills reclaimed
+                    // nursery with 0xFA instead of 0. As a BlissVal, 0xFAFA…FA
+                    // is TAG_HEAP_OBJECT (low bits 010) with a non-canonical
+                    // pointer, so an unrooted value the tree-walker held across
+                    // this collection — now pointing here — FAULTS on its next
+                    // dereference (SIGSEGV) instead of silently reading NIL from
+                    // a zeroed slot. Run under gdb to get the backtrace at the
+                    // offending deref, which names the missing GC root.
+                    let fill = if gc_poison_enabled() { 0xFA } else { 0x00 };
+                    std::ptr::write_bytes(region.base, fill, region_used);
                 }
             }
             region.header.alloc_top = region.base;
@@ -2410,6 +2419,12 @@ unsafe fn set_object_type_id(body: *mut u8, body_size: usize, type_id: u8) {
 /// collection — an intermittent corruption. Forcing frequent minor GCs turns
 /// that into a deterministic, near-immediate failure at the offending site.
 /// Counterpart to `BLISS_GC_DISABLE` (which does the opposite).
+/// Whether `BLISS_GC_POISON` is set (cached). See the fill site in `minor_gc`.
+fn gc_poison_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BLISS_GC_POISON").is_some())
+}
+
 fn gc_stress_stride() -> u64 {
     static STRIDE: OnceLock<u64> = OnceLock::new();
     *STRIDE.get_or_init(|| {
