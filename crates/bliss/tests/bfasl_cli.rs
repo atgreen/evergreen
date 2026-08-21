@@ -514,6 +514,70 @@ fn setf_symbol_function_capturing_closure_bfasl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A function whose name is an EXPORTED symbol of a package defined in a
+/// *separately loaded* `.bfasl` must install on the package's canonical symbol,
+/// so it is callable by the package-qualified name in a fresh process. The BBU
+/// materialized an external symbol constant under a raw `"PKG:NAME"` (single
+/// colon) rt key, diverging from the `"PKG::NAME"` key the package system /
+/// reader use, so the function installed on a duplicate symbol and was invisible
+/// (bliss-q6f). This is the shape of every exported alexandria function loaded
+/// across its per-file `.bfasl`s.
+#[test]
+fn cross_unit_exported_function_bfasl_round_trip() {
+    let dir = workdir("xunit-export");
+    let psrc = dir.join("pkg.lisp");
+    let pout = dir.join("pkg.bfasl");
+    let usrc = dir.join("use.lisp");
+    let uout = dir.join("use.bfasl");
+    // The package (with its EXPORT) lives in one unit; the exported function's
+    // definition in another — the units are separate `.bfasl`s.
+    fs::write(&psrc, "(defpackage :xp (:use :cl) (:export #:add1 #:twice))\n").unwrap();
+    fs::write(
+        &usrc,
+        "(in-package :xp)\n\
+         (defun add1 (x) (+ x 1))\n\
+         (defun twice (x) (* x 2))\n",
+    )
+    .unwrap();
+
+    // Compile pkg, load it (creates + exports the symbols), THEN compile use so
+    // its defun names are the external symbols of the already-defined package.
+    let c = run(&format!(
+        "(progn (compile-file \"{}\" \"{}\") (load \"{}\") (compile-file \"{}\" \"{}\"))",
+        psrc.display(),
+        pout.display(),
+        pout.display(),
+        usrc.display(),
+        uout.display(),
+    ));
+    assert!(
+        c.status.success(),
+        "compile/load/compile failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    assert!(bfasl_section(&fs::read(&uout).unwrap(), 11).is_none());
+
+    // Fresh process: load both units, then call the exported functions. Resolve
+    // the names with FIND-SYMBOL at run time so the program text carries no
+    // package-qualified literal to read before XP exists (the loads create it).
+    let l = run(&format!(
+        "(progn (load \"{}\") (load \"{}\") \
+           (list (funcall (find-symbol \"ADD1\" \"XP\") 41) \
+                 (funcall (find-symbol \"TWICE\" \"XP\") 21) \
+                 (if (fboundp (find-symbol \"ADD1\" \"XP\")) t nil)))",
+        pout.display(),
+        uout.display(),
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "(42 42 T)");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A local `macrolet` whose macro introduces references to enclosing lexicals
 /// (invisible in the unexpanded source) must be expanded before capture
 /// analysis, so the captured variables are boxed and the capturing `labels`

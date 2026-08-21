@@ -6925,24 +6925,51 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<BlissVal>,
                 kind,
             } => {
                 let name = bbu_string(constants, *name_ref)?;
-                let key = match (*package_ref, *kind) {
-                    (BBU_NO_INDEX, 0) => name.to_string(),
+                // A package-qualified symbol constant must resolve to the SAME
+                // symbol identity the reader / defpackage produce — otherwise a
+                // function installed on it is invisible to callers using the
+                // canonical package symbol (bliss-q6f). The canonical symbol is
+                // interned through the package system (`bliss_stdlib::intern`,
+                // which allocates under the rt key `"PKG::NAME"`). A raw
+                // `bliss_rt::symbols::intern` here used an ad-hoc key — worst of
+                // all `"PKG:NAME"` (single colon) for an external symbol — which
+                // is a *different* string key and thus a duplicate symbol. So
+                // resolve through the package when it exists.
+                let package_ref = *package_ref;
+                match (package_ref, *kind) {
+                    (BBU_NO_INDEX, 0) => {
+                        values.push(BlissVal::from_symbol_index(bliss_rt::symbols::intern(name)));
+                        continue;
+                    }
                     (BBU_NO_INDEX, 1 | 2) => {
                         values.push(bliss_rt::symbols::make_uninterned(name));
                         continue;
                     }
                     (BBU_NO_INDEX, _) => return Err(bbu_error("external symbol has no package")),
-                    (package_ref, 0) => {
-                        let (package, _) = bbu_package(constants, package_ref)?;
-                        format!("{package}::{name}")
-                    }
-                    (package_ref, 3) => {
-                        let (package, _) = bbu_package(constants, package_ref)?;
-                        format!("{package}:{name}")
+                    (package_ref, kind @ (0 | 3)) => {
+                        let (package_name, _) = bbu_package(constants, package_ref)?;
+                        // Package already ensured (typically by a separately
+                        // loaded unit, e.g. a library's package.bfasl): resolve to
+                        // its existing symbol through the package system so the
+                        // identity matches the reader.
+                        if let Some(package) = bliss_stdlib::find_package(package_name) {
+                            let (sym, _) = bliss_stdlib::intern(name, package)?;
+                            values.push(sym);
+                            continue;
+                        }
+                        // Not yet ensured (a package DEFINED in this same unit by a
+                        // later action): allocate under the canonical `"PKG::NAME"`
+                        // key. The in-unit export reconciles to this very symbol via
+                        // `bbu_direct_symbol_for_package` when EnsurePackage later
+                        // runs, keeping identity stable. Both internal (0) and
+                        // external (3) use `::` so a later export cannot diverge.
+                        let _ = kind;
+                        BlissVal::from_symbol_index(bliss_rt::symbols::intern(&format!(
+                            "{package_name}::{name}"
+                        )))
                     }
                     (_, kind) => return Err(bbu_error(format!("invalid symbol kind {kind}"))),
-                };
-                BlissVal::from_symbol_index(bliss_rt::symbols::intern(&key))
+                }
             }
             BbuConstant::Keyword(name_ref) => {
                 let name = bbu_string(constants, *name_ref)?;
