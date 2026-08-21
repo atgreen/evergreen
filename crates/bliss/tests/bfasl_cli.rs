@@ -1110,6 +1110,54 @@ fn corrupt_makeclosure_reference_is_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A top-level `(defsetf access-fn lambda-list (store-vars) body)` must not be
+/// thunk-compiled: the bytecode lowerer doesn't understand DEFSETF, so it would
+/// miscompile it as an ordinary call and evaluate the access-fn name and store
+/// vars as variables — loading the unit then died with "unbound variable" (uiop's
+/// `(defsetf getenv (x) (val) …)` => unbound UIOP/OS::GETENV). It must reach the
+/// load-source fallback, where the tree-walker registers the setf expander
+/// (bliss-lb6).
+#[test]
+fn defsetf_top_level_bfasl_round_trips() {
+    let dir = workdir("defsetf");
+    let src = dir.join("d.lisp");
+    let out = dir.join("d.bfasl");
+    fs::write(
+        &src,
+        "(defun myenv (x) (declare (ignore x)) nil)\n\
+         (defsetf myenv (x) (val)\n\
+           (declare (ignorable x val))\n\
+           '(error \"not implemented\"))\n\
+         (defun loaded-ok () :loaded)\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+
+    // The whole point: loading the unit runs the defsetf form without error.
+    let l = run(&format!(
+        "(progn (load \"{}\") (loaded-ok))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed (defsetf miscompiled?): {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), ":LOADED");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A `#p"…"` pathname literal in a top-level form must survive compile-file:
 /// the portable compiler can't lower a `defun`, so it falls back to serialising
 /// the form as data — which requires the constant pool to represent the pathname

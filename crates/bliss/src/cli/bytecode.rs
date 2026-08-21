@@ -6452,7 +6452,18 @@ pub fn build_bbu_from_forms(
         }
 
         // (3) Any form compilable to a serialisable thunk → run precompiled.
-        if !done {
+        // DEFSETF is excluded: it is a definer macro the bytecode lowerer does
+        // not understand, so the thunk path would miscompile it as an ordinary
+        // call — evaluating the access-fn name and store vars as variables (e.g.
+        // uiop's `(defsetf getenv (x) (val) …)` => LoadGlobal(GETENV) => unbound
+        // variable at load). Leave it for the load-source fallback, where the
+        // tree-walker registers the setf expander. DEFINE-SETF-EXPANDER is
+        // handled by step (2b); this covers the DEFSETF spelling.
+        let source_only_definer = form.is_cons() && {
+            let (op, _) = cp(form);
+            op.is_symbol() && symbol_bare_name(&sym_name(op)) == "DEFSETF"
+        };
+        if !done && !source_only_definer {
             match portable_load_thunk_form(form) {
                 None => done = true,
                 Some(thunk_form) => {
