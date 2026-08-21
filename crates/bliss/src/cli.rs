@@ -7599,6 +7599,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     env.set_var(&name, val.get());
                                 }
                             }
+                            "SYMBOL-FUNCTION" | "FDEFINITION" => {
+                                // (setf (symbol-function sym) fn) / (setf
+                                // (fdefinition sym) fn) — install fn as the
+                                // symbol's global function definition. alexandria's
+                                // sequences.lisp aliases functions this way
+                                // (`(setf (symbol-function 'emptyp) …)`).
+                                let sym = eval_form(tgt_form, env)?;
+                                if !sym.is_symbol() {
+                                    return Err(BlissError::Internal(format!(
+                                        "SETF {}: expected a symbol name, got {}",
+                                        acc,
+                                        format_val(sym)
+                                    )));
+                                }
+                                bliss_rt::symbols::set_symbol_function(
+                                    sym.as_symbol_index(),
+                                    val.get(),
+                                );
+                            }
                             "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT"
                             | "BIT" | "SBIT" => {
                                 // (setf (char string index) val) and friends —
@@ -8207,6 +8226,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 // Re-read from the rooted args: the store may have allocated.
                 return Ok(args.get(2).copied().unwrap_or(NIL));
+            }
+            "BLISS::SET-SYMBOL-FUNCTION" => {
+                // Store primitive for bytecode-lowered `(setf (symbol-function|
+                // fdefinition sym) fn)`. Args arrive evaluated (sym, value);
+                // install fn as the symbol's global function and return it.
+                let args = eval_args(cdr, env)?;
+                let sym = args.first().copied().unwrap_or(NIL);
+                let val = args.get(1).copied().unwrap_or(NIL);
+                if !sym.is_symbol() {
+                    return Err(BlissError::Internal(format!(
+                        "SET-SYMBOL-FUNCTION: expected a symbol, got {}",
+                        format_val(sym)
+                    )));
+                }
+                bliss_rt::symbols::set_symbol_function(sym.as_symbol_index(), val);
+                return Ok(val);
             }
             "BLISS::SET-CAR" | "BLISS::SET-CDR" => {
                 // Store primitives for bytecode-lowered `(setf (car|cdr place)

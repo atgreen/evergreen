@@ -1760,6 +1760,21 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
+            } else if let Some(sym_form) = symbol_function_setf_place(place) {
+                // `(setf (symbol-function|fdefinition sym) fn)` → the internal
+                // store primitive BLISS::SET-SYMBOL-FUNCTION (sym, value).
+                let setter = resolve_sym("BLISS::SET-SYMBOL-FUNCTION")
+                    .ok_or(Bail)?
+                    .as_symbol_index();
+                self.lower_expr(sym_form)?; // symbol
+                self.lower_expr(val)?; // value
+                self.emit(Instr::CallNamed { sym: setter, nargs: 2 });
+                self.pop_n(2);
+                self.push_n(1);
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
             } else if let Some((writer, args)) = self.user_setf_writer_place(place) {
                 // `(setf (f a b) val)` for a user `(defun (setf f) …)` writer:
                 // call the writer as `(writer val a b)` (new value first, then the
@@ -4100,6 +4115,26 @@ fn compile_capturing_local(
 
 /// Recognize a single-index element SETF place `(aref|svref|char|schar|
 /// row-major-aref|elt SEQ INDEX)`, returning the sequence and index subforms.
+/// `(symbol-function SYM)` or `(fdefinition SYM)` as a SETF place → `Some(SYM)`.
+fn symbol_function_setf_place(place: BlissVal) -> Option<BlissVal> {
+    if !place.is_cons() {
+        return None;
+    }
+    let (head, rest) = cp(place);
+    if !head.is_symbol() {
+        return None;
+    }
+    let n = symbol_bare_name(&sym_name(head));
+    if n != "SYMBOL-FUNCTION" && n != "FDEFINITION" {
+        return None;
+    }
+    let (arg, tail) = cp(rest);
+    if !tail.is_nil() {
+        return None;
+    }
+    Some(arg)
+}
+
 fn aref_setf_place(place: BlissVal) -> Option<(BlissVal, BlissVal)> {
     if !place.is_cons() {
         return None;
