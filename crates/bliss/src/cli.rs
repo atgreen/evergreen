@@ -15164,6 +15164,13 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
                         // The expander body finds other global macros via
                         // GLOBAL_MACROS (lookup_macro), so the reconstructed Env
                         // needs no macro table.
+                        // Root the fresh expansion Env before binding: it holds
+                        // the macro parameters (e.g. `&body body`) and every
+                        // variable the body binds (loop vars, case gensyms) on a
+                        // frame chain the relocating minor GC would otherwise never
+                        // scan — freeing them mid-expansion (bliss-6b2 #2). This is
+                        // the path asdf's `with-upgradability` takes.
+                        let _macro_env_root = LiveEnvRootGuard::new(&mut macro_env);
                         bind_macro_lambda_list(
                             params_form,
                             &list_to_vec(args),
