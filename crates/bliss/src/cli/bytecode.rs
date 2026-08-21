@@ -2346,22 +2346,44 @@ impl<'e> Lowerer<'e> {
                     if kw(*forms.get(i).unwrap_or(&NIL)).as_deref() == Some("END") {
                         i += 1;
                     }
+                    // Bind the `it` anaphor (CLHS 6.1.5) to the test value in a
+                    // fresh temp, then rewrite every `it`/`:it` in the branch
+                    // forms to reference it. LOOP matches the anaphor by *name*,
+                    // so the keyword `:it` works too; a keyword cannot be a
+                    // variable, hence substitution rather than a lexical `it`
+                    // binding. TEST is evaluated exactly once (into the temp) and
+                    // the temp doubles as the branch guard.
+                    let it_temp = fresh("IT", &mut nsym)?;
+                    let then_forms: Vec<BlissVal> = then_forms
+                        .into_iter()
+                        .map(|f| subst_loop_it(f, it_temp))
+                        .collect();
+                    let else_forms: Vec<BlissVal> = else_forms
+                        .into_iter()
+                        .map(|f| subst_loop_it(f, it_temp))
+                        .collect();
                     let mut then_progn = vec![s("PROGN")?];
                     then_progn.extend(then_forms);
-                    if else_forms.is_empty() {
+                    let cond_form = if else_forms.is_empty() {
                         let guard = if negate { "UNLESS" } else { "WHEN" };
-                        body.push(form_list(&[s(guard)?, test, form_list(&then_progn)]));
+                        form_list(&[s(guard)?, it_temp, form_list(&then_progn)])
                     } else {
                         let mut else_progn = vec![s("PROGN")?];
                         else_progn.extend(else_forms);
-                        // `(if test then else)`, flipping arms for `unless`.
+                        // `(if it then else)`, flipping arms for `unless`.
                         let (a, b) = if negate {
                             (form_list(&else_progn), form_list(&then_progn))
                         } else {
                             (form_list(&then_progn), form_list(&else_progn))
                         };
-                        body.push(form_list(&[s("IF")?, test, a, b]));
-                    }
+                        form_list(&[s("IF")?, it_temp, a, b])
+                    };
+                    let binding = form_list(&[it_temp, test]);
+                    body.push(form_list(&[
+                        s("LET")?,
+                        form_list(&[binding]),
+                        cond_form,
+                    ]));
                 }
                 Some("COLLECT") | Some("COLLECTING") | Some("APPEND") | Some("APPENDING")
                 | Some("NCONC") | Some("NCONCING") | Some("SUM") | Some("SUMMING")
@@ -4064,6 +4086,28 @@ fn parse_loop_accumulations(
 /// (`{collect|append|nconc|sum|count} EXPR`), lazily creating the shared
 /// accumulator on first use. Bails on an unrecognised operator.
 #[allow(clippy::too_many_arguments)]
+/// Replace every symbol whose *bare name* is "IT" (so both `it` and the keyword
+/// `:it` — LOOP matches the `when`/`if`/`unless` anaphor by name, CLHS 6.1.5)
+/// with `repl`, everywhere in `form` except inside quoted data or a nested
+/// `loop` (which rebinds its own `it`). Used to wire the anaphor to a fresh temp
+/// bound to the conditional's test value.
+fn subst_loop_it(form: BlissVal, repl: BlissVal) -> BlissVal {
+    if form.is_symbol() && symbol_bare_name(&sym_name(form)) == "IT" {
+        return repl;
+    }
+    if !form.is_cons() {
+        return form;
+    }
+    let (car, cdr) = cp(form);
+    if car.is_symbol() {
+        let n = symbol_bare_name(&sym_name(car));
+        if n == "QUOTE" || n == "LOOP" {
+            return form;
+        }
+    }
+    arena_cons(subst_loop_it(car, repl), subst_loop_it(cdr, repl))
+}
+
 fn apply_loop_accumulation(
     op: &str,
     expr: BlissVal,
