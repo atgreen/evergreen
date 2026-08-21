@@ -7311,7 +7311,7 @@ thread_local! {
 }
 
 /// The heap environment an env-capturing closure was created in, if any.
-fn closure_captured_env(fn_val: BlissVal) -> Option<Rc<RefCell<EnvFrame>>> {
+pub(super) fn closure_captured_env(fn_val: BlissVal) -> Option<Rc<RefCell<EnvFrame>>> {
     if !fn_val.is_heap_object() || !bliss_rt::function::is_interpreted_function(fn_val) {
         return None;
     }
@@ -7320,6 +7320,16 @@ fn closure_captured_env(fn_val: BlissVal) -> Option<Rc<RefCell<EnvFrame>>> {
         return None;
     }
     CLOSURE_ENV.with(|m| m.borrow().get(&name.as_symbol_index()).cloned())
+}
+
+/// Record the captured heap frame for a closure whose interpreted-function object
+/// is named by `sym_idx`. Used when a tree-walker closure `(BLISS::CLOSURE . id)`
+/// is reified into an interpreted-function object (e.g. installed via `(setf
+/// (symbol-function s) (lambda …))` that captures enclosing lexicals): the object
+/// then reaches those lexicals through the same `CLOSURE_ENV` channel the
+/// bytecode `MakeClosure` path uses (bliss-jtc.23.3).
+pub(super) fn register_closure_env(sym_idx: u32, frame: Rc<RefCell<EnvFrame>>) {
+    CLOSURE_ENV.with(|m| m.borrow_mut().insert(sym_idx, frame));
 }
 
 /// Materialize a callable value for a nested-lambda `MakeClosure`. Each

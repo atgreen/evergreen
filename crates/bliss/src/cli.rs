@@ -605,6 +605,32 @@ fn global_fn(name: &str) -> Option<BlissVal> {
     bliss_rt::function::is_interpreted_function(cell).then_some(cell)
 }
 
+/// Resolve a global function NAME to the `(registry index, fn_val)` pair used to
+/// dispatch a call through the promoting bytecode/native path. When `name` names
+/// a global function object, the registry is keyed on the OBJECT's own name (so
+/// an aliased or source-free-closure installation routes to the real registered
+/// code, not the alias) and the OBJECT is returned as `fn_val` (so a captured
+/// closure's environment — held in `CLOSURE_ENV` keyed by the object — is
+/// installed when its body runs). When no object resolves (e.g. a
+/// `GLOBAL_SETF_FNS` writer), fall back to the called name as its own symbol.
+fn dispatch_target(name: &str) -> (Option<u32>, BlissVal) {
+    match global_fn(name) {
+        Some(obj) => {
+            let own = bliss_rt::function::name(obj);
+            let idx = if own.is_symbol() {
+                Some(own.as_symbol_index())
+            } else {
+                resolve_sym(name).map(|s| s.as_symbol_index())
+            };
+            (idx, obj)
+        }
+        None => {
+            let sym = resolve_sym(name);
+            (sym.map(|s| s.as_symbol_index()), sym.unwrap_or(NIL))
+        }
+    }
+}
+
 /// Coerce a value being installed into a symbol's global function cell (via
 /// `(setf (symbol-function s) v)` / `(setf (fdefinition s) v)` and the
 /// bytecode-lowered `BLISS::SET-SYMBOL-FUNCTION` primitive) into the canonical
@@ -621,16 +647,17 @@ fn global_fn(name: &str) -> Option<BlissVal> {
 ///   * an interpreted-function object → stored as-is;
 ///   * a symbol designator → the current global definition it names (CL captures
 ///     the function, not the name — CLHS 5.1.2.7);
-///   * a non-capturing closure `(BLISS::CLOSURE . id)` → reified into an
-///     interpreted-function object carrying its lambda list and body.
+///   * a closure `(BLISS::CLOSURE . id)` → reified into an interpreted-function
+///     object carrying its lambda list and body; if it captures enclosing
+///     lexicals, its captured frame is recorded in `CLOSURE_ENV` (keyed by the
+///     object's fresh private name) so the tree-walker call sites reparent the
+///     body against that frame — a captured `n` in `(setf (symbol-function 's)
+///     (let ((n …)) (lambda …)))` stays visible when `s` is later called
+///     (bliss-jtc.23.3).
 ///
-/// A *capturing* closure installed this way still loses its captures: both the
-/// operator-position path (`callable_body` → `eval_lambda_call`) and the
-/// invoke-object path bind against the caller frame, ignoring the function
-/// object's env cell — that is the capturing-closure work tracked in
-/// bliss-jtc.23.3. Designators this can't resolve (e.g. `#'car`, a builtin) are
-/// returned unchanged.
-fn coerce_installed_function(env: &Env, name_sym: BlissVal, val: BlissVal) -> BlissVal {
+/// Designators this can't resolve (e.g. `#'car`, a builtin) are returned
+/// unchanged.
+fn coerce_installed_function(env: &Env, val: BlissVal) -> BlissVal {
     if bliss_rt::function::is_interpreted_function(val) {
         return val;
     }
@@ -645,6 +672,17 @@ fn coerce_installed_function(env: &Env, name_sym: BlissVal, val: BlissVal) -> Bl
             let id = t.as_fixnum() as u64;
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
+                // Give the object a fresh private name and record the closure's
+                // captured frame under it, mirroring the bytecode MakeClosure
+                // path: the tree-walker call sites reparent the body's frame to
+                // this captured environment so a capturing closure installed via
+                // setf reaches its enclosing lexicals (bliss-jtc.23.3). A
+                // non-capturing closure simply never reads that frame.
+                let fresh = bliss_rt::symbols::make_uninterned("CLOSURE");
+                bytecode::register_closure_env(
+                    fresh.as_symbol_index(),
+                    Rc::clone(&closure.captured_frame),
+                );
                 // params_form/body are bare BlissVals; alloc_interpreted roots
                 // them before it can allocate, and nothing allocates between the
                 // clone above and this call, so they cannot go stale.
@@ -652,7 +690,7 @@ fn coerce_installed_function(env: &Env, name_sym: BlissVal, val: BlissVal) -> Bl
                     closure.params_form,
                     closure.body,
                     NIL,
-                    name_sym,
+                    fresh,
                 );
             }
         }
@@ -7668,7 +7706,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         format_val(sym)
                                     )));
                                 }
-                                let fnval = coerce_installed_function(env, sym, val.get());
+                                let fnval = coerce_installed_function(env, val.get());
                                 bliss_rt::symbols::set_symbol_function(
                                     sym.as_symbol_index(),
                                     fnval,
@@ -8296,7 +8334,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         format_val(sym)
                     )));
                 }
-                let fnval = coerce_installed_function(env, sym, val);
+                let fnval = coerce_installed_function(env, val);
                 bliss_rt::symbols::set_symbol_function(sym.as_symbol_index(), fnval);
                 return Ok(val);
             }
@@ -10816,37 +10854,37 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // tree-walked code (e.g. a `loop`, which never compiles to bytecode).
             // Guard on no lexical shadow — never redirect an FLET/LABELS binding
             // to the global registry entry of the same name.
+            let mut call_parent = Rc::clone(&env.frame);
             if !env.funs.borrow().contains_key(&name) {
-                // Dispatch through the resolved function object's OWN name, not
-                // the called name. For an aliased installation — `(setf
-                // (symbol-function 'p) (symbol-function 'q))`, `… #'q`, or a
-                // source-free `(lambda …)` whose real code is registered under a
-                // fresh gensym — the alias `p` carries no registry entry and its
-                // interpreted body may be an empty shell, so keying dispatch on
-                // `p` ran the empty body and returned NIL. The object's `name`
-                // cell is the symbol its bytecode is registered under (bliss-57m).
-                let dispatch_sym = global_fn(&name)
-                    .map(bliss_rt::function::name)
-                    .filter(|n| n.is_symbol())
-                    .or_else(|| resolve_sym(&name));
-                if let Some(sym) = dispatch_sym {
+                // Dispatch through the resolved function OBJECT, mirroring the
+                // funcall-object path: key the registry on its OWN name (so an
+                // aliased installation — `(setf (symbol-function 'p) (symbol-
+                // function 'q))`, `… #'q`, or a source-free `(lambda …)` whose
+                // real code is registered under a fresh gensym — routes to that
+                // code rather than the alias `p`, which carries no registry entry
+                // and whose interpreted body is an empty shell), and pass the
+                // object as `fn_val` so a captured closure's environment (keyed on
+                // the object in CLOSURE_ENV) is installed when its body runs.
+                // Fall back to the called name when no global object resolves
+                // (e.g. a GLOBAL_SETF_FNS writer). bliss-57m / bliss-jtc.23.3.
+                let (dispatch_idx, fn_val) = dispatch_target(&name);
+                if let Some(idx) = dispatch_idx {
                     let args: Vec<BlissVal> = rooted_args.iter().map(|a| a.get()).collect();
-                    if let Some(res) =
-                        bytecode::call_registered(sym.as_symbol_index(), &args, sym, env)
-                    {
+                    if let Some(res) = bytecode::call_registered(idx, &args, fn_val, env) {
                         return res;
                     }
+                }
+                // Registered bytecode did not consume the call. If the resolved
+                // object is a reified capturing closure, run its interpreted body
+                // against the captured environment, not the caller's frame
+                // (bliss-jtc.23.3).
+                if let Some(frame) = bytecode::closure_captured_env(fn_val) {
+                    call_parent = frame;
                 }
             }
             // Re-read from the roots only now: call_registered may have collected.
             let args: Vec<BlissVal> = rooted_args.iter().map(|a| a.get()).collect();
-            return eval_lambda_call(
-                env,
-                params_form.get(),
-                body.get(),
-                &args,
-                Rc::clone(&env.frame),
-            );
+            return eval_lambda_call(env, params_form.get(), body.get(), &args, call_parent);
         }
 
         // Check accessor functions (from DEFCLASS). Match by full name or bare
@@ -15961,26 +15999,27 @@ fn apply_function(
             // registered bytecode body (e.g. one installed from a `.bfasl`, whose
             // interpreted-function object carries a NIL body) must dispatch
             // through the promoting bytecode/native path, not run its empty
-            // fallback body. Dispatch through the resolved object's OWN name so
-            // an aliased installation — `(setf (symbol-function 'p) #'q)` — routes
-            // to q's registered bytecode rather than the alias p, which carries no
-            // registry entry and whose interpreted body is the empty shell
-            // (bliss-57m). Guard on no lexical FLET/LABELS shadow so a local
+            // fallback body. Dispatch through the resolved OBJECT — key the
+            // registry on its own name so an aliased installation routes to the
+            // real bytecode, and pass the object as `fn_val` so a captured
+            // closure's environment is installed when its body runs (bliss-57m /
+            // bliss-jtc.23.3). Guard on no lexical FLET/LABELS shadow so a local
             // binding is never redirected to the global registry entry.
+            let mut call_parent = Rc::clone(&env.frame);
             if !env.funs.borrow().contains_key(&name) {
-                let dispatch_sym = global_fn(&name)
-                    .map(bliss_rt::function::name)
-                    .filter(|n| n.is_symbol())
-                    .or_else(|| resolve_sym(&name));
-                if let Some(sym) = dispatch_sym {
-                    if let Some(res) =
-                        bytecode::call_registered(sym.as_symbol_index(), args, sym, env)
-                    {
+                let (dispatch_idx, fn_val) = dispatch_target(&name);
+                if let Some(idx) = dispatch_idx {
+                    if let Some(res) = bytecode::call_registered(idx, args, fn_val, env) {
                         return res;
                     }
                 }
+                // A reified capturing closure runs its interpreted body against
+                // the captured environment, not the caller's frame (jtc.23.3).
+                if let Some(frame) = bytecode::closure_captured_env(fn_val) {
+                    call_parent = frame;
+                }
             }
-            return eval_lambda_call(env, params_form, body, args, Rc::clone(&env.frame));
+            return eval_lambda_call(env, params_form, body, args, call_parent);
         }
         if env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name) {
             return invoke_generic_function(&name, args, env);
@@ -16078,7 +16117,11 @@ fn apply_function(
         }
         let params_form = bliss_rt::function::lambda_list(fn_val);
         let body = bliss_rt::function::body(fn_val);
-        return eval_lambda_call(env, params_form, body, args, Rc::clone(&env.frame));
+        // A reified capturing closure runs its interpreted body against the
+        // captured environment, not the caller's frame (bliss-jtc.23.3).
+        let parent =
+            bytecode::closure_captured_env(fn_val).unwrap_or_else(|| Rc::clone(&env.frame));
+        return eval_lambda_call(env, params_form, body, args, parent);
     }
     Err(BlissError::Internal(format!("Cannot apply: {:?}", fn_val)))
 }

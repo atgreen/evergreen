@@ -462,6 +462,58 @@ fn setf_symbol_function_install_bfasl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A CAPTURING closure installed into a global function cell — both a top-level
+/// `(let … (lambda …))` and the value returned by a factory `defun` — must round-
+/// trip source-free and, when called by its installed name, reach the captured
+/// lexicals. The by-name call dispatches through the closure object's own
+/// registered name, and its body runs against the captured environment rather
+/// than the caller frame (bliss-jtc.23.3).
+#[test]
+fn setf_symbol_function_capturing_closure_bfasl_round_trip() {
+    let dir = workdir("setf-capfn");
+    let src = dir.join("c.lisp");
+    let out = dir.join("c.bfasl");
+    fs::write(
+        &src,
+        "(setf (symbol-function 'adder5) (let ((n 5)) (lambda (x) (+ x n))))\n\
+         (defun mk-mul (k) (lambda (x) (* x k)))\n\
+         (setf (symbol-function 'mul3) (mk-mul 3))\n\
+         (setf (symbol-function 'ctr) (let ((c 0)) (lambda () (setf c (+ c 1)) c)))\n\
+         (defun use-all ()\n\
+           (list (adder5 10) (mul3 10) (ctr) (ctr) (funcall #'adder5 20)))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+    assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (use-all))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    // (+ 10 5)=15, (* 10 3)=30, ctr=1, ctr=2, (+ 20 5)=25
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "(15 30 1 2 25)",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A local `macrolet` whose macro introduces references to enclosing lexicals
 /// (invisible in the unexpanded source) must be expanded before capture
 /// analysis, so the captured variables are boxed and the capturing `labels`
