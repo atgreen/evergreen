@@ -15179,6 +15179,13 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             },
         );
     }
+    // Register the forked child Env as a GC root for the extent of the body:
+    // `env.child()` forks a whole Env, so variables bound *inside* the macrolet
+    // body (e.g. a `case`/`typecase` gensym `(let ((g key)) …)`) live on
+    // child_env's frame chain, which — unlike an in-place `with_child_frame` —
+    // is otherwise invisible to the relocating minor GC and would be freed
+    // mid-body (bliss-6b2 #2). Same guard as eval_flet.
+    let _child_root = LiveEnvRootGuard::new(&mut child_env);
     let __r = eval_progn(body, &mut child_env);
     // Multiple values produced in the child body must propagate to the caller;
     // env.child() forks the value registers (bliss-lb6.22).
@@ -15201,6 +15208,9 @@ fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
         let (expansion, _) = cp(expansion_rest);
         child_env.define_symbol_macro(symbol, expansion);
     }
+    // Root the forked child Env for the body's extent so variables bound inside
+    // the symbol-macrolet body survive a relocating minor GC (bliss-6b2 #2).
+    let _child_root = LiveEnvRootGuard::new(&mut child_env);
     let __r = eval_progn(body, &mut child_env);
     // Multiple values produced in the child body must propagate to the caller;
     // env.child() forks the value registers (bliss-lb6.22).
