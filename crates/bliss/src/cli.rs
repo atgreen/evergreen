@@ -1158,8 +1158,6 @@ fn macro_defined(env: &Env, name: &str) -> bool {
     })
 }
 
-static MACRO_FUNCTION_HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
-
 fn next_control_token(prefix: &str) -> String {
     let id = CONTROL_COUNTER.with(|counter| {
         let id = *counter.borrow();
@@ -1170,9 +1168,12 @@ fn next_control_token(prefix: &str) -> String {
 }
 
 fn next_macro_function_handle() -> BlissVal {
-    BlissVal::from_fixnum(
-        MACRO_FUNCTION_HANDLE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64,
-    )
+    // Draw from the compiler's single registry-key counter so global-macro
+    // handles never collide with macrolet-local expander keys in the shared
+    // MACRO_FUNCTION_REGISTRY (bliss-6b2). Two independent fixnum counters both
+    // starting at 1 would mint the same key and one expander would clobber the
+    // other — e.g. an asdf macrolet's `check` overwriting global `defvar`.
+    compiler_macroexpand::next_registered_macro_key()
 }
 
 fn macroexpand_environment_handle_symbol() -> BlissVal {

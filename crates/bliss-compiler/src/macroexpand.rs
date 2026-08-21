@@ -519,7 +519,16 @@ pub fn register_macro_function(key: BlissVal, func: Arc<MacroFn>) {
     registry.insert(key.0, func);
 }
 
-fn next_registered_macro_key() -> BlissVal {
+/// Mint a fresh, process-unique key for `MACRO_FUNCTION_REGISTRY`.
+///
+/// This is the SINGLE source of truth for registry keys. Both macrolet-local
+/// expanders (via [`enclose`]) and the interpreter's global-macro handles
+/// (cli's `next_macro_function_handle`) must draw from this one counter:
+/// the registry is keyed by `key.0`, so two independent fixnum counters would
+/// mint colliding keys and one macro's expander would silently overwrite
+/// another's (bliss-6b2 — a macrolet-local `check` clobbering global `defvar`,
+/// producing an intermittently wrong `defvar` expansion during asdf load).
+pub fn next_registered_macro_key() -> BlissVal {
     BlissVal::from_fixnum(MACRO_FUNCTION_KEY_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64)
 }
 
@@ -2000,4 +2009,43 @@ fn expand_local_quasiquote(
         cursor = unsafe { cons_cdr(cursor) };
     }
     Ok(vec_to_cons(&out))
+}
+
+#[cfg(test)]
+mod registry_key_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// bliss-6b2 regression: `MACRO_FUNCTION_REGISTRY` is a single table keyed by
+    /// `key.0`, and BOTH macrolet-local expanders (via `enclose`) and the
+    /// interpreter's global-macro handles must draw their keys from the one
+    /// `next_registered_macro_key` counter. When two independent fixnum counters
+    /// (both starting at 1) fed this table, a macrolet-local macro's expander
+    /// silently overwrote a global macro's at the same numeric key — an asdf
+    /// macrolet `check` clobbering global `defvar`, so `(defvar x v)` expanded to
+    /// `check`'s `(when x (unless v (err x)))` and `x` was read unbound.
+    ///
+    /// This asserts freshly minted keys are distinct and that registering under
+    /// each leaves BOTH expanders independently retrievable — the property the
+    /// unified counter guarantees.
+    #[test]
+    fn distinct_keys_do_not_clobber_each_other() {
+        let k1 = next_registered_macro_key();
+        let k2 = next_registered_macro_key();
+        assert_ne!(k1.0, k2.0, "registry keys must be unique");
+
+        let f1: Arc<MacroFn> =
+            Arc::new(|_form, _env| Ok(BlissVal::from_fixnum(111)));
+        let f2: Arc<MacroFn> =
+            Arc::new(|_form, _env| Ok(BlissVal::from_fixnum(222)));
+        register_macro_function(k1, f1);
+        register_macro_function(k2, f2);
+
+        let g1 = lookup_macro_function(k1).expect("k1 registered");
+        let g2 = lookup_macro_function(k2).expect("k2 registered");
+        let dummy = bliss_rt::value::NIL;
+        let env = Environment::null();
+        assert_eq!(g1(dummy, &env).unwrap().0, BlissVal::from_fixnum(111).0);
+        assert_eq!(g2(dummy, &env).unwrap().0, BlissVal::from_fixnum(222).0);
+    }
 }
