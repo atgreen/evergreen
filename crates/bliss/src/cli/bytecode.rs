@@ -6314,8 +6314,11 @@ pub fn build_bbu_from_forms(
 
         // (0) Package creation is a deterministic load action, not an
         // executable source thunk. Its structural constants are validated in
-        // full before the loader mutates the package registry.
-        if let Some(plan) = bbu_package_plan(form)? {
+        // full before the loader mutates the package registry. A defpackage
+        // whose options the portable planner doesn't cover (e.g. :import-from)
+        // yields Err here — treat that as "not portably compilable" and fall
+        // through to the load-source fallback rather than failing the file.
+        if let Ok(Some(plan)) = bbu_package_plan(form) {
             let package_ref = pool.package(&plan.name, &plan.nicknames);
             let use_refs = plan
                 .uses
@@ -6443,12 +6446,25 @@ pub fn build_bbu_from_forms(
         if !done {
             if std::env::var_os("BLISS_BFASL_FORM").is_some() {
                 eprintln!(
-                    "[bfasl] form {} failed (bail: {}): {}",
+                    "[bfasl] form {} not portably compilable (bail: {}); load-source fallback: {}",
                     form_index + 1,
                     last_bail_reason().unwrap_or_else(|| "?".to_string()),
                     super::fmt_form_debug(form)
                 );
             }
+            // Load-source fallback (CLHS: compile-file must always produce a
+            // loadable output): a top-level form the portable compiler can't
+            // lower is serialised as data and re-evaluated by the tree-walker at
+            // load time (action kind 9). This keeps whole-file compilation robust
+            // for constructs the bytecode backend doesn't yet cover (e.g.
+            // alexandria's `length=`), at the cost of that one form running
+            // interpreted.
+            if let Some(form_ref) = pool.value(form) {
+                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+                done = true;
+            }
+        }
+        if !done {
             return Err(BlissError::FileError(format!(
                 "compile-file: top-level form {} cannot be represented as portable bytecode",
                 form_index + 1
@@ -7730,6 +7746,18 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                     return Err(bbu_error("EvalThunk has an unexpected argument"));
                 }
             }
+            9 => {
+                // EvalSource: arg0 is a constant-pool index of a source form to
+                // re-evaluate via the tree-walker at load time (the load-source
+                // fallback for forms the portable compiler can't lower).
+                if action.flags != 0
+                    || action.arg1 != BBU_NO_INDEX
+                    || action.arg2 != BBU_NO_INDEX
+                {
+                    return Err(bbu_error("EvalSource has unsupported flags/arguments"));
+                }
+                bbu_index(action.arg0, encoded_constants.len(), "eval-source form")?;
+            }
             kind => return Err(bbu_error(format!("unsupported load action {kind}"))),
         }
     }
@@ -7863,6 +7891,12 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             7 => {
                 last = run(Rc::clone(&functions[action.arg0 as usize]), &[], NIL, env)?;
+            }
+            9 => {
+                // EvalSource: reconstruct the source form from the constant pool
+                // and evaluate it with the tree-walker (load-source fallback).
+                let form = constants[action.arg0 as usize];
+                last = eval_form(form, env)?;
             }
             _ => unreachable!("load actions were verified above"),
         }
