@@ -5598,6 +5598,21 @@ impl BbuConstPool {
             put_u32(&mut bytes, den_ref);
             return Some(self.intern_encoded(bytes));
         }
+        // A literal simple-vector (e.g. `#(…)` in source) → pool its elements and
+        // reconstruct on load. Needed for the load-source fallback of forms that
+        // embed vector literals (babel's encodings.lisp defclass initforms).
+        if v.is_heap_object() {
+            let tid = unsafe { (*(v.as_ptr() as *const bliss_rt::ObjectHeader)).type_id() };
+            if tid == bliss_rt::object::type_id::SIMPLE_VECTOR {
+                let count = unsafe { *(v.as_ptr().add(8) as *const u64) } as usize;
+                let mut refs = Vec::with_capacity(count);
+                for i in 0..count {
+                    let elem = unsafe { *(v.as_ptr().add(16 + i * 8) as *const BlissVal) };
+                    refs.push(self.value(elem)?);
+                }
+                return Some(self.vector(&refs));
+            }
+        }
         None
     }
 }
