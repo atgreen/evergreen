@@ -55,6 +55,46 @@ orientation banner and is safe to run anytime.
 - Before adding a builtin to cli.rs, check whether `bliss-stdlib` already
   implements it. Prefer extending stdlib over growing cli.rs.
 
+## Running rr (reverse debugger) on this machine
+
+This box is an Intel **hybrid** CPU (P-cores 0–5, E-cores 6–13) whose model is
+newer than rr 5.9.0 knows about, so `rr record` fails two ways out of the box:
+runtime CPU detection FATALs (`Intel CPU type 0x… unknown`), and if you force a
+generic microarch the PMU counter self-check FATALs (`Got 0 branch events`)
+because the P-core and E-core PMUs differ and the counter check flakes across
+cores. There is **no passwordless sudo**, so you cannot relax
+`perf_event_paranoid`/`nmi_watchdog` — the fix is purely about pinning + forcing
+the right microarch.
+
+**Recipe:** pin to a single P-core (`taskset -c 0`) and force the Meteorlake
+microarch on **both** record and replay:
+
+```bash
+# Record (pin to core 0, force microarch so detection + counter-check pass)
+taskset -c 0 rr record --microarch='Intel Meteorlake' ./target/release/bliss-cli
+
+# Replay in batch/autopilot (runs to program exit, no debugger).
+# With no trace path, rr replays the most recently recorded trace.
+taskset -c 0 rr replay -A 'Intel Meteorlake' -a
+
+# Replay interactively (drops you into the rr/gdb prompt for reverse-continue etc.)
+taskset -c 0 rr replay -A 'Intel Meteorlake'
+```
+
+Notes / caveats:
+
+- Pinning to **one** core is required; the hybrid counter check flakes if the
+  process migrates between a P-core and an E-core. Core 0 (a P-core) is known
+  good. `--microarch`/`-A` is the same flag.
+- `Intel Arrowlake` is also accepted by this rr build if Meteorlake ever
+  misbehaves.
+- Set `_RR_TRACE_DIR=<dir>` to control where traces land (otherwise
+  `~/.local/share/rr/`).
+- Verified end-to-end 2026-08-21: recorded `bliss-cli` and replayed it to exit
+  0 with no FATAL. Originally captured in bead memory `asdf-load-rr-findings`
+  (`bd memories rr`), where it was used to reproduce the asdf-load corruption
+  under `rr record`.
+
 ## Bead Issue Tracking
 
 This project uses bd (beads) for issue tracking. See [bd prime] for

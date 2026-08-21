@@ -2015,16 +2015,19 @@ fn evaluated_initargs(
     env: &mut Env,
 ) -> Result<Vec<BlissVal>, BlissError> {
     let args_vec = list_to_vec(init_args);
-    let mut initargs = Vec::new();
+    // Root the accumulated key/value pairs across the loop (bliss-6b2 #2): each
+    // later eval_form allocates and can relocate the earlier, Vec-resident values.
+    let roots = bliss_rt::ShadowRootScope::new();
+    let mut initargs: Vec<bliss_rt::ShadowRoot> = Vec::new();
     let mut i = 0;
     while i + 1 < args_vec.len() {
         let key = eval_form(args_vec[i], env)?;
         let value = eval_form(args_vec[i + 1], env)?;
-        initargs.push(resolve_slot_symbol(class_name, key, env)?);
-        initargs.push(value);
+        initargs.push(roots.root(resolve_slot_symbol(class_name, key, env)?));
+        initargs.push(roots.root(value));
         i += 2;
     }
-    Ok(initargs)
+    Ok(initargs.iter().map(|r| r.get()).collect())
 }
 
 /// Specificity distance for a method specialized on a built-in CL type name when
@@ -3967,6 +3970,10 @@ fn eval_quasiquote_depth(
 
     // Process each element, honoring ,@ splicing only at depth 1.
     let mut result_elems: Vec<BlissVal> = Vec::new();
+    // Root the accumulated elements across the element evaluations and the final
+    // cons-up (bliss-6b2 #2): each eval_form / recursive expand / arena_cons can
+    // relocate the earlier, Vec-resident elements.
+    let _rg = VecRootGuard::new(&mut result_elems);
     let mut cur = template;
     while cur.is_cons() {
         let (elem, rest) = cp(cur);
@@ -5994,6 +6001,19 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 canonical,
                 canonical_bound,
             );
+            // Look for other interned symbols sharing this exact name: a bound
+            // twin would prove duplicate-interning / registry corruption.
+            let twins: Vec<(u32, bool)> = bliss_rt::symbols::interned_names()
+                .into_iter()
+                .filter(|(_, n)| *n == name)
+                .map(|(i, _)| {
+                    (
+                        i,
+                        bliss_rt::symbols::symbol_value(i) != Some(bliss_rt::value::UNBOUND),
+                    )
+                })
+                .collect();
+            eprintln!("[unbound-var]   twins(idx,bound) with same name = {twins:?}");
             if std::env::var_os("BLISS_TRACE_UNDEF_BT").is_some() {
                 eprintln!("{}", std::backtrace::Backtrace::force_capture());
             }
@@ -6293,9 +6313,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "LOCALLY" => return eval_progn(cdr, env),
             "DECLARE" => return Ok(NIL),
             "THE" => {
+                let roots = bliss_rt::ShadowRootScope::new();
                 let (type_form, r) = cp(cdr);
+                let type_form = roots.root(type_form);
                 let (val_form, _) = cp(r);
                 let value = eval_form(val_form, env)?;
+                let type_form = type_form.get();
                 // The quick primitive check handles the common declared types;
                 // fall back to full TYPEP so user DEFTYPEs (e.g. babel's
                 // `(the array-index ...)` → alexandria's ARRAY-INDEX) and
@@ -6493,85 +6516,84 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // prin1 representation — routed through the output stream.
                 // Preserves the historical trailing-newline behaviour that the
                 // stage-0 gate depends on.
-                let args = list_to_vec(cdr);
-                let v = eval_form(args[0], env)?;
-                let stream = if args.len() > 1 {
-                    eval_form(args[1], env)?
-                } else {
-                    NIL
-                };
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::ProgramError("PRINT requires an object".into()));
+                }
+                // Render first (dispatching print-object allocates), then resolve
+                // the stream from the rooted args so a GC in between cannot stale
+                // the object or the stream (bliss-6b2 #2).
+                let rendered = format_val_env(args[0], env, true);
+                let stream = if args.len() > 1 { args[1] } else { NIL };
                 let out = resolve_output_stream(stream, env);
-                let rendered = format_val_env(v, env, true);
                 write_str_to(out, "\n")?;
                 write_str_to(out, &rendered)?;
                 write_str_to(out, "\n")?;
-                return Ok(v);
+                return Ok(args[0]);
             }
             "PRINC" => {
                 // (princ object &optional stream)
-                let args = list_to_vec(cdr);
-                let v = eval_form(args[0], env)?;
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::ProgramError("PRINC requires an object".into()));
+                }
                 let mut s = String::new();
-                princ_val_env(v, env, &mut s);
-                let stream = if args.len() > 1 {
-                    eval_form(args[1], env)?
-                } else {
-                    NIL
-                };
+                princ_val_env(args[0], env, &mut s);
+                let stream = if args.len() > 1 { args[1] } else { NIL };
                 let out = resolve_output_stream(stream, env);
                 write_str_to(out, &s)?;
-                return Ok(v);
+                return Ok(args[0]);
             }
             "PRIN1" => {
                 // (prin1 object &optional stream): the escaped (readable)
                 // representation, no surrounding newlines. Returns the object.
-                let args = list_to_vec(cdr);
-                let v = eval_form(args[0], env)?;
-                let stream = if args.len() > 1 {
-                    eval_form(args[1], env)?
-                } else {
-                    NIL
-                };
-                let rendered = format_val_env(v, env, true);
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::ProgramError("PRIN1 requires an object".into()));
+                }
+                let rendered = format_val_env(args[0], env, true);
+                let stream = if args.len() > 1 { args[1] } else { NIL };
                 let out = resolve_output_stream(stream, env);
                 write_str_to(out, &rendered)?;
-                return Ok(v);
+                return Ok(args[0]);
             }
             "WRITE" => {
                 // (write object &key stream escape ...): render OBJECT honouring
                 // :escape (default T → prin1-style; NIL → princ-style) to :stream
                 // (default *standard-output*). Other keywords are accepted and
                 // ignored. Returns the object.
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::ProgramError("WRITE requires an object".into()));
                 }
-                let v = eval_form(args[0], env)?;
-                let mut stream = NIL;
+                let mut stream_idx: Option<usize> = None;
                 let mut escape = true;
                 let mut i = 1;
                 while i + 1 < args.len() {
-                    let key = symbol_bare_name(&sym_name(eval_form(args[i], env)?));
-                    let val = eval_form(args[i + 1], env)?;
+                    let key = symbol_bare_name(&sym_name(args[i]));
+                    let val = args[i + 1];
                     match key.as_str() {
-                        "STREAM" => stream = val,
+                        "STREAM" => stream_idx = Some(i + 1),
                         "ESCAPE" => escape = !val.is_nil(),
                         _ => {}
                     }
                     i += 2;
                 }
                 // :escape NIL is princ semantics (unquoted strings/chars);
-                // otherwise prin1 (readable) semantics.
+                // otherwise prin1 (readable) semantics. Render before resolving the
+                // stream from the rooted args so an allocating render cannot stale
+                // it (bliss-6b2 #2).
                 let rendered = if escape {
-                    format_val_env(v, env, true)
+                    format_val_env(args[0], env, true)
                 } else {
                     let mut s = String::new();
-                    princ_val_env(v, env, &mut s);
+                    princ_val_env(args[0], env, &mut s);
                     s
                 };
+                let stream = stream_idx.map(|k| args[k]).unwrap_or(NIL);
                 let out = resolve_output_stream(stream, env);
                 write_str_to(out, &rendered)?;
-                return Ok(v);
+                return Ok(args[0]);
             }
             "TERPRI" => {
                 let args = list_to_vec(cdr);
@@ -6626,18 +6648,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "WRITE-CHAR" => {
                 // (write-char character &optional stream)
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal(
                         "WRITE-CHAR requires a character".into(),
                     ));
                 }
-                let ch = eval_form(args[0], env)?;
-                let stream = if args.len() > 1 {
-                    eval_form(args[1], env)?
-                } else {
-                    NIL
-                };
+                let ch = args[0];
+                let stream = if args.len() > 1 { args[1] } else { NIL };
                 let out = resolve_output_stream(stream, env);
                 if is_gray_stream(out) {
                     invoke_generic_function("STREAM-WRITE-CHAR", &[out, ch], env)?;
@@ -6650,11 +6668,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (make-string size &key initial-element element-type) → a FRESH
                 // (non-interned) mutable string, so (setf (char s i) c) / REPLACE
                 // can mutate it without aliasing a shared literal.
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal("MAKE-STRING requires a size".into()));
                 }
-                let size = eval_form(args[0], env)?;
+                let size = args[0];
                 if !size.is_fixnum() || size.as_fixnum() < 0 {
                     return Err(BlissError::TypeError {
                         datum: size,
@@ -6664,8 +6682,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut fill = ' ';
                 let mut i = 1;
                 while i + 1 < args.len() {
-                    let key = eval_form(args[i], env)?;
-                    let val = eval_form(args[i + 1], env)?;
+                    let key = args[i];
+                    let val = args[i + 1];
                     if key.is_symbol()
                         && symbol_bare_name(&sym_name(key)) == "INITIAL-ELEMENT"
                         && val.is_character()
@@ -6685,18 +6703,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "CLOSE" => {
                 // (close stream &key abort) → T. Closing a non-stream is a no-op.
-                let args = list_to_vec(cdr);
-                let stream = if args.is_empty() {
-                    NIL
-                } else {
-                    eval_form(args[0], env)?
-                };
+                let args = eval_args(cdr, env)?;
+                let stream = if args.is_empty() { NIL } else { args[0] };
                 let mut abort = false;
                 let mut i = 1;
                 while i + 1 < args.len() {
-                    let key = eval_form(args[i], env)?;
+                    let key = args[i];
                     if key.is_symbol() && symbol_bare_name(&sym_name(key)) == "ABORT" {
-                        abort = eval_form(args[i + 1], env)? != NIL;
+                        abort = args[i + 1] != NIL;
                     }
                     i += 2;
                 }
@@ -6712,30 +6726,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "MAKE-STRING-INPUT-STREAM" => {
                 // (make-string-input-stream string &optional start end)
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal(
                         "MAKE-STRING-INPUT-STREAM requires a string".into(),
                     ));
                 }
-                let string = eval_form(args[0], env)?;
-                let start = if args.len() > 1 {
-                    let v = eval_form(args[1], env)?;
-                    if v.is_fixnum() {
-                        v.as_fixnum() as usize
-                    } else {
-                        0
-                    }
+                let string = args[0];
+                let start = if args.len() > 1 && args[1].is_fixnum() {
+                    args[1].as_fixnum() as usize
                 } else {
                     0
                 };
-                let end = if args.len() > 2 {
-                    let v = eval_form(args[2], env)?;
-                    if v.is_fixnum() {
-                        Some(v.as_fixnum() as usize)
-                    } else {
-                        None
-                    }
+                let end = if args.len() > 2 && args[2].is_fixnum() {
+                    Some(args[2].as_fixnum() as usize)
                 } else {
                     None
                 };
@@ -6743,22 +6747,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "READ-CHAR" => {
                 // (read-char &optional stream eof-error-p eof-value)
-                let args = list_to_vec(cdr);
-                let stream = if !args.is_empty() {
-                    eval_form(args[0], env)?
-                } else {
-                    NIL
-                };
-                let eof_error_p = if args.len() > 1 {
-                    eval_form(args[1], env)?
-                } else {
-                    T
-                };
-                let eof_value = if args.len() > 2 {
-                    eval_form(args[2], env)?
-                } else {
-                    NIL
-                };
+                let args = eval_args(cdr, env)?;
+                let stream = if !args.is_empty() { args[0] } else { NIL };
+                let eof_error_p = if args.len() > 1 { args[1] } else { T };
                 let in_stream = resolve_input_stream(stream, env);
                 let (result, at_eof) = if is_gray_stream(in_stream) {
                     let r = invoke_generic_function("STREAM-READ-CHAR", &[in_stream], env)?;
@@ -6771,7 +6762,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 if at_eof {
                     if eof_error_p.is_nil() {
-                        return Ok(eof_value);
+                        // Re-read eof-value from the rooted args after the
+                        // (allocating) read (bliss-6b2 #2).
+                        return Ok(if args.len() > 2 { args[2] } else { NIL });
                     }
                     return Err(BlissError::StreamError("end of file on READ-CHAR".into()));
                 }
@@ -6779,28 +6772,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "READ" | "READ-PRESERVING-WHITESPACE" => {
                 // (read &optional stream eof-error-p eof-value recursive-p)
-                let args = list_to_vec(cdr);
-                let stream = if !args.is_empty() {
-                    eval_form(args[0], env)?
-                } else {
-                    NIL
-                };
-                let eof_error_p = if args.len() > 1 {
-                    eval_form(args[1], env)?
-                } else {
-                    T
-                };
-                let eof_value = if args.len() > 2 {
-                    eval_form(args[2], env)?
-                } else {
-                    NIL
-                };
+                let args = eval_args(cdr, env)?;
+                let stream = if !args.is_empty() { args[0] } else { NIL };
+                let eof_error_p = if args.len() > 1 { args[1] } else { T };
                 let in_stream = resolve_input_stream(stream, env);
                 match read_one_form_from_stream(in_stream, env)? {
                     Some(form) => return Ok(form),
                     None => {
                         if eof_error_p.is_nil() {
-                            return Ok(eof_value);
+                            // Re-read eof-value from the rooted args after the read.
+                            return Ok(if args.len() > 2 { args[2] } else { NIL });
                         }
                         return Err(BlissError::StreamError("end of file on READ".into()));
                     }
@@ -6815,10 +6796,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "READ-FROM-STRING requires a string".into(),
                     ));
                 }
-                let vals: Vec<BlissVal> = args
-                    .iter()
-                    .map(|a| eval_form(*a, env))
-                    .collect::<Result<_, _>>()?;
+                let vals = eval_forms(args.iter().copied(), env)?;
                 let s = val_as_str(vals[0]);
                 let chars: Vec<char> = s.chars().collect();
                 let eof_error_p = vals.get(1).copied().unwrap_or(T);
@@ -6866,18 +6844,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "UNREAD-CHAR" => {
                 // (unread-char character &optional stream)
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal(
                         "UNREAD-CHAR requires a character".into(),
                     ));
                 }
-                let ch = eval_form(args[0], env)?;
-                let stream = if args.len() > 1 {
-                    eval_form(args[1], env)?
-                } else {
-                    NIL
-                };
+                let ch = args[0];
+                let stream = if args.len() > 1 { args[1] } else { NIL };
                 let in_stream = resolve_input_stream(stream, env);
                 if is_gray_stream(in_stream) {
                     invoke_generic_function("STREAM-UNREAD-CHAR", &[in_stream, ch], env)?;
@@ -6891,11 +6865,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "*" => return eval_arith(cdr, env, 1, 1.0, |a, b| a * b, bigrat_mul, |a, b| a * b),
             "/" => return eval_arith_div(cdr, env),
             "CONS" => {
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
                 let roots = bliss_rt::ShadowRootScope::new();
+                let (af, r) = cp(cdr);
+                // Root the second arg FORM before evaluating the first: a young
+                // arg list relocates under the first eval's GC, dangling a bare
+                // `bf` (bliss-6b2 #2).
+                let bf = roots.root(cp(r).0);
                 let a = roots.root(eval_form(af, env)?);
-                let b = eval_form(bf, env)?;
+                let b = eval_form(bf.get(), env)?;
                 return Ok(arena_cons(a.get(), b));
             }
             "LIST" => {
@@ -7092,22 +7069,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "%DEFINE-CONDITION-PORTABLE expects four arguments".into(),
                     ));
                 }
-                let mut values = Vec::with_capacity(4);
-                for form in forms {
-                    values.push(eval_form(form, env)?);
-                }
+                let values = eval_forms(forms, env)?;
                 return define_condition_portable(values[0], values[1], values[2], values[3], env);
             }
             "DOCUMENTATION" => {
                 // (documentation object &optional doc-type) — the interpreter
                 // does not retain documentation strings; always NIL. Arguments
                 // are still evaluated for their side effects/arity.
-                let mut c = cdr;
-                while c.is_cons() {
-                    let (af, r) = cp(c);
-                    eval_form(af, env)?;
-                    c = r;
-                }
+                let _ = eval_args(cdr, env)?;
                 return Ok(NIL);
             }
             "FDEFINITION" | "SYMBOL-FUNCTION" => {
@@ -7194,38 +7163,47 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "TYPEP" => {
-                let (obj_form, r) = cp(cdr);
-                let (type_form, _) = cp(r);
                 let roots = bliss_rt::ShadowRootScope::new();
+                let (obj_form, r) = cp(cdr);
+                let type_form = roots.root(cp(r).0);
                 let obj = roots.root(eval_form(obj_form, env)?);
-                let raw_type_spec = eval_form(type_form, env)?;
+                let raw_type_spec = eval_form(type_form.get(), env)?;
                 let matches = typep_matches(env, obj.get(), raw_type_spec)?;
                 return Ok(if matches { T } else { NIL });
             }
             "EQ" => {
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
                 let roots = bliss_rt::ShadowRootScope::new();
+                let (af, r) = cp(cdr);
+                // Root the second arg FORM before evaluating the first: a young
+                // arg list relocates under the first eval's GC, dangling a bare
+                // `bf` (bliss-6b2 #2).
+                let bf = roots.root(cp(r).0);
                 let a = roots.root(eval_form(af, env)?);
-                let b = eval_form(bf, env)?;
+                let b = eval_form(bf.get(), env)?;
                 return Ok(if a.get() == b { T } else { NIL });
             }
             "EQL" => {
                 // EQL value-compares numbers of the same type, so two distinct
                 // heap bignums/ratios with equal value are EQL (bliss-jtc.5).
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
                 let roots = bliss_rt::ShadowRootScope::new();
+                let (af, r) = cp(cdr);
+                // Root the second arg FORM before evaluating the first: a young
+                // arg list relocates under the first eval's GC, dangling a bare
+                // `bf` (bliss-6b2 #2).
+                let bf = roots.root(cp(r).0);
                 let a = roots.root(eval_form(af, env)?);
-                let b = eval_form(bf, env)?;
+                let b = eval_form(bf.get(), env)?;
                 return Ok(if eql_values(a.get(), b) { T } else { NIL });
             }
             "EQUAL" | "EQUALP" => {
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
                 let roots = bliss_rt::ShadowRootScope::new();
+                let (af, r) = cp(cdr);
+                // Root the second arg FORM before evaluating the first: a young
+                // arg list relocates under the first eval's GC, dangling a bare
+                // `bf` (bliss-6b2 #2).
+                let bf = roots.root(cp(r).0);
                 let a = roots.root(eval_form(af, env)?);
-                let b = eval_form(bf, env)?;
+                let b = eval_form(bf.get(), env)?;
                 let eq = if name == "EQUALP" {
                     vals_equalp(a.get(), b)
                 } else {
@@ -7234,11 +7212,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if eq { T } else { NIL });
             }
             "=" => {
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
                 let roots = bliss_rt::ShadowRootScope::new();
+                let (af, r) = cp(cdr);
+                // Root the second arg FORM before evaluating the first: a young
+                // arg list relocates under the first eval's GC, dangling a bare
+                // `bf` (bliss-6b2 #2).
+                let bf = roots.root(cp(r).0);
                 let a = roots.root(eval_form(af, env)?);
-                let b = eval_form(bf, env)?;
+                let b = eval_form(bf.get(), env)?;
                 return Ok(if numeric_cmp(a.get(), b)? == Ordering::Equal {
                     T
                 } else {
@@ -7258,11 +7239,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return eval_cmp(cdr, env, |o| o != Ordering::Less);
             }
             "/=" => {
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
                 let roots = bliss_rt::ShadowRootScope::new();
+                let (af, r) = cp(cdr);
+                // Root the second arg FORM before evaluating the first: a young
+                // arg list relocates under the first eval's GC, dangling a bare
+                // `bf` (bliss-6b2 #2).
+                let bf = roots.root(cp(r).0);
                 let a = roots.root(eval_form(af, env)?);
-                let b = eval_form(bf, env)?;
+                let b = eval_form(bf.get(), env)?;
                 return Ok(if numeric_cmp(a.get(), b)? != Ordering::Equal {
                     T
                 } else {
@@ -7270,27 +7254,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "AND" => {
+                // Root the source-form cursor across the sub-evaluations: a young
+                // form list (e.g. a macroexpansion) relocates under a minor GC and
+                // a bare cursor would dangle (bliss-6b2 #2).
+                let roots = bliss_rt::ShadowRootScope::new();
                 let mut result = T;
-                let mut c = cdr;
-                while c.is_cons() {
-                    let (f, r) = cp(c);
+                let c = roots.root(cdr);
+                while c.get().is_cons() {
+                    let (f, r) = cp(c.get());
+                    let rest = roots.root(r);
                     result = eval_form(f, env)?;
                     if result.is_nil() {
                         return Ok(NIL);
                     }
-                    c = r;
+                    c.set(rest.get());
                 }
                 return Ok(result);
             }
             "OR" => {
-                let mut c = cdr;
-                while c.is_cons() {
-                    let (f, r) = cp(c);
+                let roots = bliss_rt::ShadowRootScope::new();
+                let c = roots.root(cdr);
+                while c.get().is_cons() {
+                    let (f, r) = cp(c.get());
+                    let rest = roots.root(r);
                     let v = eval_form(f, env)?;
                     if !v.is_nil() {
                         return Ok(v);
                     }
-                    c = r;
+                    c.set(rest.get());
                 }
                 return Ok(NIL);
             }
@@ -7323,18 +7314,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "COND" => {
-                let mut c = cdr;
-                while c.is_cons() {
-                    let (clause, rest) = cp(c);
+                let roots = bliss_rt::ShadowRootScope::new();
+                let c = roots.root(cdr);
+                while c.get().is_cons() {
+                    let (clause, rest) = cp(c.get());
                     let (test, body) = cp(clause);
+                    // Root `body` across the test evaluation (a young clause could
+                    // relocate) — see AND/OR (bliss-6b2 #2).
+                    let body = roots.root(body);
+                    let rest = roots.root(rest);
                     let tv = eval_form(test, env)?;
                     if !tv.is_nil() {
-                        if body.is_nil() {
+                        if body.get().is_nil() {
                             return Ok(tv);
                         }
-                        return eval_progn(body, env);
+                        return eval_progn(body.get(), env);
                     }
-                    c = rest;
+                    c.set(rest.get());
                 }
                 return Ok(NIL);
             }
@@ -7358,27 +7354,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "FORMAT" => return eval_format(cdr, env),
             "ERROR" => {
-                let args = list_to_vec(cdr);
+                // Root the evaluated datum and format args across the condition
+                // construction, which allocates (bliss-6b2 #2). eval_args keeps
+                // the whole arg vector rooted; a slice into it stays rooted too.
+                let roots = bliss_rt::ShadowRootScope::new();
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal("ERROR".into()));
                 }
-                let control = eval_form(args[0], env)?;
-                let mut format_args = Vec::new();
-                for arg in &args[1..] {
-                    format_args.push(eval_form(*arg, env)?);
-                }
-                let message = if is_string_value(control) {
-                    format_control_message(&val_as_str(control), &format_args)?
+                let control = roots.root(args[0]);
+                let format_args = &args[1..];
+                let message = if is_string_value(control.get()) {
+                    format_control_message(&val_as_str(control.get()), format_args)?
                 } else {
-                    val_as_str(control)
+                    val_as_str(control.get())
                 };
                 // (error datum &rest args): a condition instance is signalled as
                 // is; a condition-type symbol is built via MAKE-CONDITION with the
                 // remaining args as initargs; a format-control string becomes a
                 // SIMPLE-ERROR.
-                let condition = match coerce_condition_designator(env, control, &format_args)? {
+                let condition = match coerce_condition_designator(env, control.get(), format_args)? {
                     Some(condition) => condition,
-                    None => make_simple_condition("SIMPLE-ERROR", control, &format_args, env)?,
+                    None => make_simple_condition("SIMPLE-ERROR", control.get(), format_args, env)?,
                 };
                 // The terminal message is the condition's REPORT (e.g. "The value X
                 // is not of type Y"), not the bare designator/type name.
@@ -7391,11 +7388,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "LET" => return eval_let(cdr, env, false),
             "LET*" => return eval_let(cdr, env, true),
             "SETQ" => {
-                let mut c = cdr;
+                // Root the pair cursor across value evaluation (a young form list
+                // relocates under a minor GC; bliss-6b2 #2). Variable names are
+                // symbols (immortal), so only the cursor needs rooting.
+                let roots = bliss_rt::ShadowRootScope::new();
+                let c = roots.root(cdr);
                 let mut result = NIL;
-                while c.is_cons() {
-                    let (sym_form, r) = cp(c);
+                while c.get().is_cons() {
+                    let (sym_form, r) = cp(c.get());
                     let (val_form, r2) = cp(r);
+                    let r2 = roots.root(r2);
                     if sym_form.is_symbol() {
                         if let Some(expansion) = env.lookup_symbol_macro(sym_form) {
                             let setf_form = arena_cons(
@@ -7403,7 +7405,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 arena_cons(expansion, arena_cons(val_form, NIL)),
                             );
                             result = eval_form(setf_form, env)?;
-                            c = r2;
+                            c.set(r2.get());
                             continue;
                         }
                     }
@@ -7414,7 +7416,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         env.set_var(&sym_name(sym_form), val);
                     }
                     result = val;
-                    c = r2;
+                    c.set(r2.get());
                 }
                 return Ok(result);
             }
@@ -7422,25 +7424,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (setf place value place value ...) — symbol places behave like
                 // SETQ; a handful of common accessor places are supported by
                 // mutating the target in place. Other places error clearly.
-                let mut c = cdr;
+                let roots = bliss_rt::ShadowRootScope::new();
+                let c = roots.root(cdr);
                 let mut result = NIL;
-                while c.is_cons() {
-                    let (place, r) = cp(c);
+                while c.get().is_cons() {
+                    // Root the place form, value form, evaluated value, and cursor
+                    // across the value evaluation and the place mutation (which
+                    // itself evaluates sub-forms) — a young place/value relocates
+                    // under a minor GC (bliss-6b2 #2).
+                    let iroots = bliss_rt::ShadowRootScope::new();
+                    let (place, r) = cp(c.get());
                     let (val_form, r2) = cp(r);
-                    let val = eval_form(val_form, env)?;
-                    if place.is_symbol() {
-                        if let Some(expansion) = env.lookup_symbol_macro(place) {
+                    let place = iroots.root(place);
+                    let val_form = iroots.root(val_form);
+                    let r2 = iroots.root(r2);
+                    let val = iroots.root(eval_form(val_form.get(), env)?);
+                    if place.get().is_symbol() {
+                        if let Some(expansion) = env.lookup_symbol_macro(place.get()) {
                             let setf_form = arena_cons(
                                 resolve_sym("SETF").unwrap_or(NIL),
-                                arena_cons(expansion, arena_cons(val_form, NIL)),
+                                arena_cons(expansion, arena_cons(val_form.get(), NIL)),
                             );
                             result = eval_form(setf_form, env)?;
-                            c = r2;
+                            c.set(r2.get());
                             continue;
                         }
-                        env.set_var_symbol(place, val);
-                    } else if place.is_cons() {
-                        let (accessor, aargs) = cp(place);
+                        env.set_var_symbol(place.get(), val.get());
+                    } else if place.get().is_cons() {
+                        let (accessor, aargs) = cp(place.get());
                         let acc = if accessor.is_symbol() {
                             sym_name(accessor)
                         } else {
@@ -7449,11 +7460,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         // A user SETF-expander (DEFINE-SETF-EXPANDER / DEFSETF)
                         // takes precedence over the built-in place handling below.
                         if env.setf_expanders.borrow().contains_key(&acc) {
-                            result = apply_setf_expansion(place, val, env)?;
-                            c = r2;
+                            result = apply_setf_expansion(place.get(), val.get(), env)?;
+                            c.set(r2.get());
                             continue;
                         }
-                        let (tgt_form, _) = cp(aargs);
+                        let aargs = iroots.root(aargs);
+                        let (tgt_form, _) = cp(aargs.get());
                         match acc.as_str() {
                             "VALUES" => {
                                 // (setf (values p1 p2 …) form) — distribute the
@@ -7463,10 +7475,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 let values = if env.mv_active {
                                     env.mv.clone()
                                 } else {
-                                    vec![val]
+                                    vec![val.get()]
                                 };
                                 let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
-                                for (i, pf) in list_to_vec(aargs).into_iter().enumerate() {
+                                for (i, pf) in list_to_vec(aargs.get()).into_iter().enumerate() {
                                     let v = values.get(i).copied().unwrap_or(NIL);
                                     let quoted = arena_cons(quote_sym, arena_cons(v, NIL));
                                     let setf_form = vec_to_list(&[
@@ -7481,7 +7493,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 let tgt = eval_form(tgt_form, env)?;
                                 if tgt.is_cons() {
                                     unsafe {
-                                        (*(tgt.as_ptr() as *mut ConsCell)).car = val;
+                                        // Route through the write barrier: mutating
+                                        // an OLD cons's car to a YOUNG value must be
+                                        // recorded in the remembered set, else the
+                                        // minor GC frees the young referent
+                                        // (bliss-6b2 root cause #2).
+                                        let cell = tgt.as_ptr() as *mut ConsCell;
+                                        bliss_rt::gc::store_ref(
+                                            std::ptr::addr_of_mut!((*cell).car),
+                                            val.get(),
+                                        );
                                     }
                                 } else {
                                     return Err(BlissError::TypeError {
@@ -7494,7 +7515,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 let tgt = eval_form(tgt_form, env)?;
                                 if tgt.is_cons() {
                                     unsafe {
-                                        (*(tgt.as_ptr() as *mut ConsCell)).cdr = val;
+                                        let cell = tgt.as_ptr() as *mut ConsCell;
+                                        bliss_rt::gc::store_ref(
+                                            std::ptr::addr_of_mut!((*cell).cdr),
+                                            val.get(),
+                                        );
                                     }
                                 } else {
                                     return Err(BlissError::TypeError {
@@ -7506,26 +7531,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             "GETHASH" => {
                                 // (setf (gethash key table) val)
                                 let key = eval_form(tgt_form, env)?;
-                                let (tbl_form, _) = cp(cp(aargs).1);
+                                let (tbl_form, _) = cp(cp(aargs.get()).1);
                                 let tbl = eval_form(tbl_form, env)?;
-                                bliss_stdlib::set_gethash(key, tbl, val)?;
+                                bliss_stdlib::set_gethash(key, tbl, val.get())?;
                             }
                             "SLOT-VALUE" => {
                                 // (setf (slot-value instance slot-name) val)
                                 let instance = eval_form(tgt_form, env)?;
-                                let (slot_form, _) = cp(cp(aargs).1);
+                                let (slot_form, _) = cp(cp(aargs.get()).1);
                                 let slot = eval_form(slot_form, env)?;
-                                write_slot_value(instance, slot, val, env)?;
+                                write_slot_value(instance, slot, val.get(), env)?;
                             }
                             "SYMBOL-VALUE" => {
                                 // (setf (symbol-value sym) val) — assign the
                                 // symbol's dynamic value, like SETQ on the symbol.
                                 let sym = eval_form(tgt_form, env)?;
                                 if sym.is_symbol() {
-                                    env.set_var_symbol(sym, val);
+                                    env.set_var_symbol(sym, val.get());
                                 } else {
                                     let name = val_as_str(sym);
-                                    env.set_var(&name, val);
+                                    env.set_var(&name, val.get());
                                 }
                             }
                             "CHAR" | "SCHAR" | "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "ELT"
@@ -7534,7 +7559,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 // mutate a string or vector element in place.
                                 // BIT/SBIT index a bit array exactly like AREF.
                                 let seq = eval_form(tgt_form, env)?;
-                                let (idx_form, _) = cp(cp(aargs).1);
+                                let (idx_form, _) = cp(cp(aargs.get()).1);
                                 let idx = eval_form(idx_form, env)?;
                                 if !idx.is_fixnum() || idx.as_fixnum() < 0 {
                                     return Err(BlissError::TypeError {
@@ -7544,7 +7569,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 }
                                 let i = idx.as_fixnum() as usize;
                                 if is_string_value(seq) {
-                                    bliss_stdlib::string_set_char(seq, i, val)?;
+                                    bliss_stdlib::string_set_char(seq, i, val.get())?;
                                 } else if seq.is_cons() && acc == "ELT" {
                                     // (setf (elt list i) val)
                                     let mut cursor = seq;
@@ -7553,7 +7578,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     }
                                     if cursor.is_cons() {
                                         unsafe {
-                                            (*(cursor.as_ptr() as *mut ConsCell)).car = val;
+                                            let cell = cursor.as_ptr() as *mut ConsCell;
+                                            bliss_rt::gc::store_ref(
+                                                std::ptr::addr_of_mut!((*cell).car),
+                                                val.get(),
+                                            );
                                         }
                                     } else {
                                         return Err(BlissError::Internal(
@@ -7561,20 +7590,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         ));
                                     }
                                 } else {
-                                    bliss_stdlib::set_elt(seq, i, val)?;
+                                    bliss_stdlib::set_elt(seq, i, val.get())?;
                                 }
                             }
                             "FILL-POINTER" => {
                                 // (setf (fill-pointer vector) n) — set the active
                                 // length of a fill-pointer vector.
                                 let vec = eval_form(tgt_form, env)?;
-                                if !val.is_fixnum() || val.as_fixnum() < 0 {
+                                if !val.get().is_fixnum() || val.get().as_fixnum() < 0 {
                                     return Err(BlissError::TypeError {
-                                        datum: val,
+                                        datum: val.get(),
                                         expected: "non-negative fill pointer".into(),
                                     });
                                 }
-                                bliss_stdlib::set_fill_pointer(vec, val.as_fixnum() as usize)?;
+                                bliss_stdlib::set_fill_pointer(vec, val.get().as_fixnum() as usize)?;
                             }
                             "DOCUMENTATION" => {
                                 // (setf (documentation object doc-type) val) — the
@@ -7604,7 +7633,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     write_slot_value(
                                         tgt,
                                         resolve_sym(&slot_name).unwrap_or(NIL),
-                                        val,
+                                        val.get(),
                                         env,
                                     )?;
                                 } else if let Some(writer_sym) = resolve_sym(
@@ -7616,12 +7645,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     // installed from a .bfasl: dispatch its
                                     // registered bytecode with the new value first,
                                     // then the place's subforms.
-                                    let mut args = vec![val];
-                                    let mut ac = aargs;
-                                    while ac.is_cons() {
-                                        let (af, ar) = cp(ac);
-                                        args.push(eval_form(af, env)?);
-                                        ac = ar;
+                                    let mut args = RootedVals::new(vec![val.get()]);
+                                    for v in eval_args(aargs.get(), env)?.iter() {
+                                        args.push(*v);
                                     }
                                     if let Some(res) = bytecode::call_registered(
                                         writer_sym.as_symbol_index(),
@@ -7638,12 +7664,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     // Call it as (funcall #'(setf place) NEW args…):
                                     // the new value is the first argument, then the
                                     // place's own subforms (CLHS 5.1.2.9).
-                                    let mut args = vec![val];
-                                    let mut ac = aargs;
-                                    while ac.is_cons() {
-                                        let (af, ar) = cp(ac);
-                                        args.push(eval_form(af, env)?);
-                                        ac = ar;
+                                    let mut args = RootedVals::new(vec![val.get()]);
+                                    for v in eval_args(aargs.get(), env)?.iter() {
+                                        args.push(*v);
                                     }
                                     eval_lambda_call(
                                         env,
@@ -7661,12 +7684,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     // (setf place) …): dispatch it with the new
                                     // value first, then the place's subforms.
                                     let key = format!("(SETF {})", other);
-                                    let mut args = vec![val];
-                                    let mut ac = aargs;
-                                    while ac.is_cons() {
-                                        let (af, ar) = cp(ac);
-                                        args.push(eval_form(af, env)?);
-                                        ac = ar;
+                                    let mut args = RootedVals::new(vec![val.get()]);
+                                    for v in eval_args(aargs.get(), env)?.iter() {
+                                        args.push(*v);
                                     }
                                     invoke_generic_function(&key, &args, env)?;
                                 } else {
@@ -7678,8 +7698,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             }
                         }
                     }
-                    result = val;
-                    c = r2;
+                    result = val.get();
+                    c.set(r2.get());
                 }
                 return Ok(result);
             }
@@ -7786,31 +7806,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "FUNCALL" => {
                 let (fn_form, args_form) = cp(cdr);
                 let fn_val = eval_form(fn_form, env)?;
-                let mut args = Vec::new();
-                let mut c = args_form;
-                while c.is_cons() {
-                    let (af, r) = cp(c);
-                    args.push(eval_form(af, env)?);
-                    c = r;
-                }
+                let args = eval_args(args_form, env)?;
                 return apply_function(fn_val, &args, env);
             }
             "APPLY" => {
-                let (fn_form, rest) = cp(cdr);
-                let fn_val = eval_form(fn_form, env)?;
-                let rest_items = list_to_vec(rest);
-                let mut args = Vec::new();
-                for (i, item) in rest_items.iter().enumerate() {
-                    let v = eval_form(*item, env)?;
-                    if i == rest_items.len() - 1 {
-                        // Last arg should be a list to spread
-                        let spread = list_to_vec(v);
-                        args.extend(spread);
+                // Root the function value, the source spine, and the accumulated
+                // arg vector across each evaluation (bliss-6b2 #2): every
+                // eval_form allocates and can relocate the callee, the remaining
+                // unread argument forms, and the already-collected args.
+                let roots = bliss_rt::ShadowRootScope::new();
+                let (fn_form, rest0) = cp(cdr);
+                let rest = roots.root(rest0);
+                let fn_val = roots.root(eval_form(fn_form, env)?);
+                let mut args: Vec<BlissVal> = Vec::new();
+                let _ag = VecRootGuard::new(&mut args);
+                while rest.get().is_cons() {
+                    let (item, r) = cp(rest.get());
+                    let r = roots.root(r);
+                    let is_last = !r.get().is_cons();
+                    let v = eval_form(item, env)?;
+                    rest.set(r.get());
+                    if is_last {
+                        // Last arg is a list to spread.
+                        args.extend(list_to_vec(v));
                     } else {
                         args.push(v);
                     }
                 }
-                return apply_function(fn_val, &args, env);
+                return apply_function(fn_val.get(), &args, env);
             }
             "LENGTH" => {
                 let (af, _) = cp(cdr);
@@ -7819,10 +7842,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "ELT" => {
                 // (elt sequence index) — works on lists, vectors, and strings.
-                let (sf, r) = cp(cdr);
-                let (idxf, _) = cp(r);
-                let seq = eval_form(sf, env)?;
-                let idx = eval_form(idxf, env)?;
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal(
+                        "ELT requires a sequence and an index".into(),
+                    ));
+                }
+                let seq = args[0];
+                let idx = args[1];
                 if !idx.is_fixnum() || idx.as_fixnum() < 0 {
                     return Err(BlissError::TypeError {
                         datum: idx,
@@ -7834,15 +7861,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "AREF" | "SVREF" | "ROW-MAJOR-AREF" | "BIT" | "SBIT" => {
                 // One-dimensional array/vector/string access — delegates to elt.
                 // BIT/SBIT read a bit array exactly like AREF (rank-1 here).
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.len() != 2 {
                     return Err(BlissError::ProgramError(format!(
                         "{}: only one-dimensional arrays are supported",
                         name
                     )));
                 }
-                let arr = eval_form(args[0], env)?;
-                let idx = eval_form(args[1], env)?;
+                let arr = args[0];
+                let idx = args[1];
                 if !idx.is_fixnum() || idx.as_fixnum() < 0 {
                     return Err(BlissError::TypeError {
                         datum: idx,
@@ -7863,31 +7890,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // initial-element) — build a rank-1 fill-pointer / adjustable
                 // vector. Called by MAKE-ARRAY (boot.lisp) for the
                 // :fill-pointer/:adjustable cases.
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.len() < 3 {
                     return Err(BlissError::Internal(
                         "%MAKE-COMPLEX-VECTOR requires size, fill-pointer, adjustable".into(),
                     ));
                 }
-                let size_v = eval_form(args[0], env)?;
-                let size = if size_v.is_fixnum() {
-                    size_v.as_fixnum().max(0) as usize
+                let size = if args[0].is_fixnum() {
+                    args[0].as_fixnum().max(0) as usize
                 } else {
                     0
                 };
-                let fp_v = eval_form(args[1], env)?;
-                let fp = if fp_v.is_fixnum() {
-                    fp_v.as_fixnum().max(0) as usize
+                let fp = if args[1].is_fixnum() {
+                    args[1].as_fixnum().max(0) as usize
                 } else {
                     // :fill-pointer T (or absent) ⇒ full length.
                     size
                 };
-                let adjustable = !eval_form(args[2], env)?.is_nil();
-                let iel = if args.len() > 3 {
-                    eval_form(args[3], env)?
-                } else {
-                    NIL
-                };
+                let adjustable = !args[2].is_nil();
+                let iel = if args.len() > 3 { args[3] } else { NIL };
                 let elems = vec![iel; size];
                 return Ok(bliss_stdlib::build_complex_vector(
                     &elems, size, fp, adjustable,
@@ -7895,28 +7916,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "VECTOR-PUSH" => {
                 // (vector-push new-element vector) → index used, or NIL if full.
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
                     return Err(BlissError::Internal(
                         "VECTOR-PUSH requires an element and a vector".into(),
                     ));
                 }
-                let val = eval_form(args[0], env)?;
-                let vec = eval_form(args[1], env)?;
+                let val = args[0];
+                let vec = args[1];
                 return bliss_stdlib::vector_push(vec, val);
             }
             "VECTOR-PUSH-EXTEND" => {
                 // (vector-push-extend new-element vector &optional extension)
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
                     return Err(BlissError::Internal(
                         "VECTOR-PUSH-EXTEND requires an element and a vector".into(),
                     ));
                 }
-                let val = eval_form(args[0], env)?;
-                let vec = eval_form(args[1], env)?;
+                let val = args[0];
+                let vec = args[1];
                 let ext = if args.len() > 2 {
-                    let e = eval_form(args[2], env)?;
+                    let e = args[2];
                     e.is_fixnum().then(|| e.as_fixnum().max(0) as usize)
                 } else {
                     None
@@ -7997,18 +8018,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(vec_to_list(&[BlissVal::from_fixnum(len)]));
             }
             "APPEND" => {
-                let mut all = Vec::new();
-                let items = list_to_vec(cdr);
-                if items.is_empty() {
+                // Root the accumulated elements AND the source-form spine across
+                // the arg-eval loop (bliss-6b2 #2): a later argument's evaluation
+                // allocates and can relocate both the Vec-resident list elements
+                // and the not-yet-evaluated source forms.
+                let roots = bliss_rt::ShadowRootScope::new();
+                let mut all: Vec<bliss_rt::ShadowRoot> = Vec::new();
+                if !cdr.is_cons() {
                     return Ok(NIL);
                 }
-                for (i, item_form) in items.iter().enumerate() {
-                    let v = eval_form(*item_form, env)?;
-                    if i == items.len() - 1 && v.is_nil() {
+                let c = roots.root(cdr);
+                while c.get().is_cons() {
+                    let (item_form, rest) = cp(c.get());
+                    let rest = roots.root(rest);
+                    let is_last = !rest.get().is_cons();
+                    let v = eval_form(item_form, env)?;
+                    c.set(rest.get());
+                    if is_last && v.is_nil() {
                         continue;
                     }
-                    all.extend(list_to_vec(v));
+                    all.extend(list_to_vec(v).into_iter().map(|e| roots.root(e)));
                 }
+                let all: Vec<BlissVal> = all.iter().map(|r| r.get()).collect();
                 return Ok(vec_to_list(&all));
             }
             "REVERSE" => {
@@ -8020,31 +8051,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return bliss_stdlib::reverse(v);
             }
             "NTH" => {
-                let (nf, r) = cp(cdr);
-                let (lf, _) = cp(r);
-                let n = eval_form(nf, env)?;
-                let l = eval_form(lf, env)?;
-                let idx = num_val(n)? as usize;
-                let elems = list_to_vec(l);
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal("NTH requires an index and a list".into()));
+                }
+                let idx = num_val(args[0])? as usize;
+                let elems = list_to_vec(args[1]);
                 return Ok(if idx < elems.len() { elems[idx] } else { NIL });
             }
             "MAKE-HASH-TABLE" => {
                 // (make-hash-table &key test size ...) — honor :test, evaluate
                 // and ignore the rest. Backed by the real stdlib hash table.
                 let mut test = bliss_stdlib::HashTest::Eql;
-                let mut c = cdr;
-                while c.is_cons() {
-                    let (kw_form, r) = cp(c);
+                let roots = bliss_rt::ShadowRootScope::new();
+                let c = roots.root(cdr);
+                while c.get().is_cons() {
+                    let (kw_form, r) = cp(c.get());
                     if !r.is_cons() {
                         break;
                     }
                     let (vf, r2) = cp(r);
+                    let vf = roots.root(vf);
+                    let r2 = roots.root(r2);
                     // Evaluate the keyword too: called directly the keyword is a
                     // self-evaluating symbol, but reached through apply_function's
                     // synthesize path (funcall/apply/bytecode CallNamed) every
                     // argument arrives quoted as `(quote :test)` (bliss-x5y.2).
                     let kw = eval_form(kw_form, env)?;
-                    let v = eval_form(vf, env)?;
+                    let v = eval_form(vf.get(), env)?;
                     if kw.is_symbol() {
                         let kn = sym_name(kw);
                         if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "TEST" {
@@ -8058,7 +8092,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             };
                         }
                     }
-                    c = r2;
+                    c.set(r2.get());
                 }
                 let opts = bliss_stdlib::MakeHashTableOptions {
                     test,
@@ -8069,15 +8103,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "GETHASH" => {
                 // (gethash key table &optional default) -> value; sets the
                 // second value to the present-p flag.
-                let (key_form, r) = cp(cdr);
-                let (tbl_form, r2) = cp(r);
-                let key = eval_form(key_form, env)?;
-                let tbl = eval_form(tbl_form, env)?;
-                let default = if r2.is_cons() {
-                    eval_form(cp(r2).0, env)?
-                } else {
-                    NIL
-                };
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal("GETHASH requires a key and a table".into()));
+                }
+                let key = args[0];
+                let tbl = args[1];
+                let default = if args.len() >= 3 { args[2] } else { NIL };
                 let (val, present) = bliss_stdlib::gethash(key, tbl, default)?;
                 env.set_mv(vec![val, if present { T } else { NIL }]);
                 return Ok(val);
@@ -8087,26 +8119,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // value)` (bliss-x5y.2). Arguments arrive already evaluated —
                 // value, key, table, in the SETF handler's value-first order —
                 // through apply_function's synthesize path. Returns the value.
-                let (val_form, r) = cp(cdr);
-                let (key_form, r2) = cp(r);
-                let (tbl_form, _) = cp(r2);
-                let val = eval_form(val_form, env)?;
-                let key = eval_form(key_form, env)?;
-                let tbl = eval_form(tbl_form, env)?;
+                let args = eval_args(cdr, env)?;
+                let val = args.first().copied().unwrap_or(NIL);
+                let key = args.get(1).copied().unwrap_or(NIL);
+                let tbl = args.get(2).copied().unwrap_or(NIL);
                 bliss_stdlib::set_gethash(key, tbl, val)?;
-                return Ok(val);
+                // Re-read from the rooted args: set_gethash may rehash/allocate.
+                return Ok(args.first().copied().unwrap_or(NIL));
             }
             "BLISS::SET-AREF" => {
                 // Store primitive for bytecode-lowered `(setf (aref|svref|char|
                 // schar|row-major-aref|elt seq index) value)`. Arguments arrive
                 // already evaluated (seq, index, value); the element is mutated in
                 // place and the value returned (SETF semantics).
-                let (seq_form, r) = cp(cdr);
-                let (idx_form, r2) = cp(r);
-                let (val_form, _) = cp(r2);
-                let seq = eval_form(seq_form, env)?;
-                let idx = eval_form(idx_form, env)?;
-                let val = eval_form(val_form, env)?;
+                let args = eval_args(cdr, env)?;
+                let seq = args.first().copied().unwrap_or(NIL);
+                let idx = args.get(1).copied().unwrap_or(NIL);
+                let val = args.get(2).copied().unwrap_or(NIL);
                 if !idx.is_fixnum() || idx.as_fixnum() < 0 {
                     return Err(BlissError::TypeError {
                         datum: idx,
@@ -8123,13 +8152,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                     if cursor.is_cons() {
                         unsafe {
-                            (*(cursor.as_ptr() as *mut ConsCell)).car = val;
+                            let cell = cursor.as_ptr() as *mut ConsCell;
+                            bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), val);
                         }
                     }
                 } else {
                     bliss_stdlib::set_elt(seq, i, val)?;
                 }
-                return Ok(val);
+                // Re-read from the rooted args: the store may have allocated.
+                return Ok(args.get(2).copied().unwrap_or(NIL));
             }
             "BLISS::SET-CAR" | "BLISS::SET-CDR" => {
                 // Store primitives for bytecode-lowered `(setf (car|cdr place)
@@ -8137,10 +8168,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // through apply_function's synthesize path; the target's car/cdr
                 // is written in place and the value is returned (SETF semantics).
                 let set_car = name == "BLISS::SET-CAR";
-                let (cons_form, r) = cp(cdr);
-                let (val_form, _) = cp(r);
-                let target = eval_form(cons_form, env)?;
-                let val = eval_form(val_form, env)?;
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal("SET-CAR/SET-CDR needs cons and value".into()));
+                }
+                let target = args[0];
+                let val = args[1];
                 if !target.is_cons() {
                     return Err(BlissError::TypeError {
                         datum: target,
@@ -8150,19 +8183,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 unsafe {
                     let cell = target.as_ptr() as *mut ConsCell;
                     if set_car {
-                        (*cell).car = val;
+                        bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).car), val);
                     } else {
-                        (*cell).cdr = val;
+                        bliss_rt::gc::store_ref(std::ptr::addr_of_mut!((*cell).cdr), val);
                     }
                 }
                 return Ok(val);
             }
             "REMHASH" => {
-                let (key_form, r) = cp(cdr);
-                let (tbl_form, _) = cp(r);
-                let key = eval_form(key_form, env)?;
-                let tbl = eval_form(tbl_form, env)?;
-                let removed = bliss_stdlib::remhash(key, tbl)?;
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal("REMHASH requires a key and a table".into()));
+                }
+                let removed = bliss_stdlib::remhash(args[0], args[1])?;
                 return Ok(if removed { T } else { NIL });
             }
             "CLRHASH" => {
@@ -8202,12 +8235,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // callable (lambda, closure, heap function object, builtin), not
                 // only a native pointer. Iterates a snapshot so the table may be
                 // mutated (per-key) during the walk. Returns NIL.
-                let (fn_form, r) = cp(cdr);
-                let (tbl_form, _) = cp(r);
-                let function = eval_form(fn_form, env)?;
-                let tbl = eval_form(tbl_form, env)?;
-                for (key, value) in bliss_stdlib::hash_table_entries(tbl)? {
-                    apply_function(function, &[key, value], env)?;
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal("MAPHASH requires a function and a table".into()));
+                }
+                let roots = bliss_rt::ShadowRootScope::new();
+                let function = roots.root(args[0]);
+                // Root the entry snapshot: each apply_function runs user code that
+                // can relocate the still-pending Vec-resident keys/values (#2).
+                let entries: Vec<(bliss_rt::ShadowRoot, bliss_rt::ShadowRoot)> =
+                    bliss_stdlib::hash_table_entries(args[1])?
+                        .into_iter()
+                        .map(|(k, v)| (roots.root(k), roots.root(v)))
+                        .collect();
+                for (key, value) in &entries {
+                    apply_function(function.get(), &[key.get(), value.get()], env)?;
                 }
                 return Ok(NIL);
             }
@@ -8232,49 +8274,65 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "MAPCAR" => {
                 // (mapcar fn list1 list2 ...) — apply fn to successive tuples,
                 // stopping at the shortest list.
-                let (fn_form, mut r) = cp(cdr);
-                let fn_val = eval_form(fn_form, env)?;
-                let mut lists: Vec<Vec<BlissVal>> = Vec::new();
-                while r.is_cons() {
-                    let (list_form, rest) = cp(r);
-                    lists.push(list_to_vec(eval_form(list_form, env)?));
-                    r = rest;
+                // Root the source spine, the input lists' elements, and the
+                // accumulated results across the loops: each eval_form /
+                // apply_function allocates and can relocate the earlier, bare
+                // `Vec`-resident values and the not-yet-walked spine under a minor
+                // GC (bliss-6b2 #2).
+                let roots = bliss_rt::ShadowRootScope::new();
+                let (fn_form, r0) = cp(cdr);
+                let r = roots.root(r0);
+                let fn_val = roots.root(eval_form(fn_form, env)?);
+                let mut lists: Vec<Vec<bliss_rt::ShadowRoot>> = Vec::new();
+                while r.get().is_cons() {
+                    let (list_form, rest) = cp(r.get());
+                    let rest = roots.root(rest);
+                    let elems = list_to_vec(eval_form(list_form, env)?);
+                    lists.push(elems.into_iter().map(|v| roots.root(v)).collect());
+                    r.set(rest.get());
                 }
                 let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
-                let mut results = Vec::with_capacity(n);
+                let mut results: Vec<bliss_rt::ShadowRoot> = Vec::with_capacity(n);
                 for i in 0..n {
-                    let args: Vec<BlissVal> = lists.iter().map(|l| l[i]).collect();
-                    results.push(apply_function(fn_val, &args, env)?);
+                    let args: Vec<BlissVal> = lists.iter().map(|l| l[i].get()).collect();
+                    results.push(roots.root(apply_function(fn_val.get(), &args, env)?));
                 }
+                let results: Vec<BlissVal> = results.iter().map(|v| v.get()).collect();
                 return Ok(vec_to_list(&results));
             }
             "MAP" => {
-                let args = list_to_vec(cdr);
-                if args.len() < 3 {
+                // Root the source-form spine as well as the result-type/function
+                // and every sequence element and result across the apply loop
+                // (bliss-6b2 #2): each eval_form / apply_function allocates and can
+                // relocate these Rust-heap Vec-resident values and the not-yet-
+                // evaluated source forms.
+                let roots = bliss_rt::ShadowRootScope::new();
+                let src = roots.root_values(list_to_vec(cdr));
+                if src.len() < 3 {
                     return Err(BlissError::Internal(
                         "MAP requires a result type, function, and sequence".into(),
                     ));
                 }
-                let result_type = eval_form(args[0], env)?;
-                let fn_val = eval_form(args[1], env)?;
-                let mut seqs: Vec<Vec<BlissVal>> = Vec::new();
-                for seq_form in &args[2..] {
-                    let seq = eval_form(*seq_form, env)?;
-                    seqs.push(if is_string_value(seq) {
-                        val_as_str(seq)
-                            .chars()
-                            .map(BlissVal::from_char)
-                            .collect::<Vec<_>>()
+                let result_type = roots.root(eval_form(src[0].get(), env)?);
+                let fn_val = roots.root(eval_form(src[1].get(), env)?);
+                let mut seqs: Vec<Vec<bliss_rt::ShadowRoot>> = Vec::new();
+                for seq_form in &src[2..] {
+                    let seq = eval_form(seq_form.get(), env)?;
+                    let elems: Vec<BlissVal> = if is_string_value(seq) {
+                        val_as_str(seq).chars().map(BlissVal::from_char).collect()
                     } else {
                         list_to_vec(seq)
-                    });
+                    };
+                    seqs.push(elems.into_iter().map(|v| roots.root(v)).collect());
                 }
                 let len = seqs.iter().map(Vec::len).min().unwrap_or(0);
-                let mut results = Vec::with_capacity(len);
+                let mut results: Vec<bliss_rt::ShadowRoot> = Vec::with_capacity(len);
                 for i in 0..len {
-                    let call_args = seqs.iter().map(|seq| seq[i]).collect::<Vec<_>>();
-                    results.push(apply_function(fn_val, &call_args, env)?);
+                    let call_args: Vec<BlissVal> = seqs.iter().map(|seq| seq[i].get()).collect();
+                    results.push(roots.root(apply_function(fn_val.get(), &call_args, env)?));
                 }
+                let results: Vec<BlissVal> = results.iter().map(|v| v.get()).collect();
+                let result_type = result_type.get();
                 let result_name = if result_type.is_symbol() {
                     symbol_bare_name(&sym_name(result_type))
                 } else {
@@ -8302,13 +8360,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (list_f, kwrest) = cp(r);
                 let item = eval_form(item_f, env)?;
                 let list = eval_form(list_f, env)?;
-                let mut kwargs = Vec::new();
-                let mut kc = kwrest;
-                while kc.is_cons() {
-                    let (kf, kr) = cp(kc);
-                    kwargs.push(eval_form(kf, env)?);
-                    kc = kr;
-                }
+                let kwargs = eval_args(kwrest, env)?;
                 let key_fn = find_key_arg(&kwargs, "KEY");
                 let test_fn = find_key_arg(&kwargs, "TEST");
                 let test_not_fn = find_key_arg(&kwargs, "TEST-NOT");
@@ -8334,10 +8386,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(NIL);
             }
             "ASSOC" => {
+                let roots = bliss_rt::ShadowRootScope::new();
                 let (key_f, r) = cp(cdr);
-                let (alist_f, _) = cp(r);
-                let key = eval_form(key_f, env)?;
-                let alist = eval_form(alist_f, env)?;
+                let alist_f = roots.root(cp(r).0);
+                let key = roots.root(eval_form(key_f, env)?);
+                let alist = eval_form(alist_f.get(), env)?;
+                let key = key.get();
                 let mut c = alist;
                 while c.is_cons() {
                     let (pair, rest) = cp(c);
@@ -8356,13 +8410,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // same implementation used by lower-level stage-3 tests.
                 let (type_form, rest) = cp(cdr);
                 let result_type = eval_form(type_form, env)?;
-                let mut sequences = Vec::new();
-                let mut c = rest;
-                while c.is_cons() {
-                    let (sf, r) = cp(c);
-                    sequences.push(eval_form(sf, env)?);
-                    c = r;
-                }
+                let sequences = eval_args(rest, env)?;
                 return bliss_stdlib::concatenate(result_type, &sequences);
             }
             "SUBSEQ" => {
@@ -8385,15 +8433,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         name
                     )));
                 }
-                let pred = args[0];
-                let mut seqs = Vec::with_capacity(args.len() - 1);
+                // Root predicate + all sequence elements across the apply loop
+                // (bliss-6b2 #2): apply_function runs user code that can relocate
+                // these Vec-resident values.
+                let roots = bliss_rt::ShadowRootScope::new();
+                let pred = roots.root(args[0]);
+                let mut seqs: Vec<Vec<bliss_rt::ShadowRoot>> = Vec::with_capacity(args.len() - 1);
                 for s in &args[1..] {
-                    seqs.push(seq_elements(*s)?);
+                    seqs.push(seq_elements(*s)?.into_iter().map(|e| roots.root(e)).collect());
                 }
                 let minlen = seqs.iter().map(Vec::len).min().unwrap_or(0);
                 for i in 0..minlen {
-                    let call_args: Vec<BlissVal> = seqs.iter().map(|s| s[i]).collect();
-                    let r = apply_function(pred, &call_args, env)?;
+                    let call_args: Vec<BlissVal> = seqs.iter().map(|s| s[i].get()).collect();
+                    let r = apply_function(pred.get(), &call_args, env)?;
                     match name.as_str() {
                         "SOME" if !r.is_nil() => return Ok(r),
                         "EVERY" if r.is_nil() => return Ok(NIL),
@@ -8690,7 +8742,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "MERGE-PATHNAMES" => {
                 // (merge-pathnames pathname &optional default-pathname default-version)
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::ProgramError(
                         "MERGE-PATHNAMES requires a pathname".into(),
@@ -8704,24 +8756,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         Ok(bliss_stdlib::parse_namestring(v, None, None)?.0)
                     }
                 };
-                let a0 = eval_form(args[0], env)?;
-                let pathname = to_pathname(a0)?;
+                // Root the intermediate pathnames: to_pathname/lookup allocate and
+                // can relocate an earlier result (bliss-6b2 #2).
+                let roots = bliss_rt::ShadowRootScope::new();
+                let pathname = roots.root(to_pathname(args[0])?);
                 let default = if args.len() > 1 {
-                    let d = eval_form(args[1], env)?;
-                    to_pathname(d)?
+                    roots.root(to_pathname(args[1])?)
                 } else {
                     // ANSI default is *default-pathname-defaults*.
-                    match env.lookup_var("*DEFAULT-PATHNAME-DEFAULTS*") {
+                    roots.root(match env.lookup_var("*DEFAULT-PATHNAME-DEFAULTS*") {
                         Some(v) if !v.is_nil() => to_pathname(v)?,
                         _ => to_pathname(bliss_stdlib::make_lisp_string("./"))?,
-                    }
+                    })
                 };
-                let default_version = if args.len() > 2 {
-                    eval_form(args[2], env)?
-                } else {
-                    NIL
-                };
-                return bliss_stdlib::merge_pathnames(pathname, default, default_version);
+                let default_version = if args.len() > 2 { args[2] } else { NIL };
+                return bliss_stdlib::merge_pathnames(
+                    pathname.get(),
+                    default.get(),
+                    default_version,
+                );
             }
             "PATHNAME-NAME" => {
                 let (pathname_form, _) = cp(cdr);
@@ -8781,17 +8834,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "WILD-PATHNAME-P" => {
                 // (wild-pathname-p pathname &optional field-key)
-                let args = list_to_vec(cdr);
-                let pathname = if args.is_empty() {
-                    NIL
-                } else {
-                    eval_form(args[0], env)?
-                };
-                let field = if args.len() > 1 {
-                    Some(eval_form(args[1], env)?)
-                } else {
-                    None
-                };
+                let args = eval_args(cdr, env)?;
+                let pathname = if args.is_empty() { NIL } else { args[0] };
+                let field = if args.len() > 1 { Some(args[1]) } else { None };
                 return Ok(if bliss_stdlib::wild_pathname_p(pathname, field) {
                     T
                 } else {
@@ -8800,10 +8845,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "PATHNAME-MATCH-P" => {
                 // (pathname-match-p pathname wildcard)
-                let (pn_form, rest) = cp(cdr);
-                let (wc_form, _) = cp(rest);
-                let pn = eval_form(pn_form, env)?;
-                let wc = eval_form(wc_form, env)?;
+                let args = eval_args(cdr, env)?;
+                let pn = args.first().copied().unwrap_or(NIL);
+                let wc = args.get(1).copied().unwrap_or(NIL);
                 return Ok(if bliss_stdlib::pathname_match_p(pn, wc)? {
                     T
                 } else {
@@ -8957,11 +9001,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "REM" => {
                 // REM: remainder of TRUNCATE — the result takes the sign of the
                 // dividend (Rust `%`).
+                let roots = bliss_rt::ShadowRootScope::new();
                 let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
-                let b = eval_form(bf, env)?;
-                let av = num_val(a)? as i64;
+                let bf = roots.root(cp(r).0);
+                let a = roots.root(eval_form(af, env)?);
+                let b = eval_form(bf.get(), env)?;
+                let av = num_val(a.get())? as i64;
                 let bv = num_val(b)? as i64;
                 if bv == 0 {
                     return Err(BlissError::ArithmeticError("division by zero".into()));
@@ -8971,24 +9016,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "MOD" => {
                 // MOD: remainder of FLOOR — the result takes the sign of the
                 // *divisor* (ANSI), so `(mod -7 3)` = 2, not -1.
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
-                let b = eval_form(bf, env)?;
-                let av = num_val(a)? as i64;
-                let bv = num_val(b)? as i64;
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal("MOD requires two arguments".into()));
+                }
+                let av = num_val(args[0])? as i64;
+                let bv = num_val(args[1])? as i64;
                 if bv == 0 {
                     return Err(BlissError::ArithmeticError("division by zero".into()));
                 }
                 return Ok(BlissVal::from_fixnum(((av % bv) + bv) % bv));
             }
             "TRUNCATE" => {
-                let (af, r) = cp(cdr);
-                let a = eval_form(af, env)?;
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::Internal("TRUNCATE requires an argument".into()));
+                }
+                let a = args[0];
                 let av = num_val(a)?;
-                if r.is_cons() {
-                    let (bf, _) = cp(r);
-                    let b = eval_form(bf, env)?;
+                if args.len() >= 2 {
+                    let b = args[1];
                     let bv = num_val(b)?;
                     if bv == 0.0 {
                         return Err(BlissError::ArithmeticError("division by zero".into()));
@@ -9001,12 +9048,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(BlissVal::from_fixnum(av as i64));
             }
             "CEILING" => {
-                let (af, r) = cp(cdr);
-                let a = eval_form(af, env)?;
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::Internal("CEILING requires an argument".into()));
+                }
+                let a = args[0];
                 let av = num_val(a)?;
-                if r.is_cons() {
-                    let (bf, _) = cp(r);
-                    let b = eval_form(bf, env)?;
+                if args.len() >= 2 {
+                    let b = args[1];
                     let bv = num_val(b)?;
                     if bv == 0.0 {
                         return Err(BlissError::ArithmeticError("division by zero".into()));
@@ -9019,12 +9068,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(BlissVal::from_fixnum(av.ceil() as i64));
             }
             "ROUND" => {
-                let (af, r) = cp(cdr);
-                let a = eval_form(af, env)?;
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::Internal("ROUND requires an argument".into()));
+                }
+                let a = args[0];
                 let av = num_val(a)?;
-                if r.is_cons() {
-                    let (bf, _) = cp(r);
-                    let b = eval_form(bf, env)?;
+                if args.len() >= 2 {
+                    let b = args[1];
                     let bv = num_val(b)?;
                     if bv == 0.0 {
                         return Err(BlissError::ArithmeticError("division by zero".into()));
@@ -9037,10 +9088,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(BlissVal::from_fixnum(round_half_even(av)));
             }
             "EXPT" => {
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
-                let b = eval_form(bf, env)?;
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal("EXPT requires two arguments".into()));
+                }
+                let a = args[0];
+                let b = args[1];
                 // Exact result when the base is rational and the exponent is an
                 // integer: an exact rational/bignum, promoting past i64 range.
                 if !a.is_single_float() && b.is_fixnum() {
@@ -9103,33 +9156,44 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "NTH-VALUE" => {
+                let roots = bliss_rt::ShadowRootScope::new();
                 let (nf, r) = cp(cdr);
-                let (form, _) = cp(r);
+                let form = roots.root(cp(r).0);
                 let n = eval_form(nf, env)?;
                 let idx = num_val(n)? as usize;
-                let (_, values) = eval_form_collecting_values(form, env)?;
+                let (_, values) = eval_form_collecting_values(form.get(), env)?;
                 return Ok(values.get(idx).copied().unwrap_or(NIL));
             }
             "MULTIPLE-VALUE-BIND" => return eval_multiple_value_bind(cdr, env),
             "MULTIPLE-VALUE-CALL" => {
                 // (multiple-value-call function form*) — gather all the values
                 // produced by each form into a single argument list.
+                let roots = bliss_rt::ShadowRootScope::new();
                 let (fn_form, forms) = cp(cdr);
-                let fn_val = eval_form(fn_form, env)?;
+                // Root the source cursor and the function value across the loop
+                // (bliss-6b2 #2): each form's evaluation allocates and can relocate.
+                let c = roots.root(forms);
+                let fn_val = roots.root(eval_form(fn_form, env)?);
                 let mut args = Vec::new();
-                let mut c = forms;
-                while c.is_cons() {
-                    let (af, r) = cp(c);
+                let _ag = VecRootGuard::new(&mut args);
+                while c.get().is_cons() {
+                    let (af, r) = cp(c.get());
                     let (_, values) = eval_form_collecting_values(af, env)?;
                     args.extend(values);
-                    c = r;
+                    c.set(r);
                 }
-                return apply_function(fn_val, &args, env);
+                return apply_function(fn_val.get(), &args, env);
             }
             "MULTIPLE-VALUE-PROG1" => {
                 let (first_form, rest_forms) = cp(cdr);
                 let (primary, saved_values) = eval_form_collecting_values(first_form, env)?;
-                let _ = eval_progn(rest_forms, env)?;
+                // Root the saved values across the body's allocating forms (bliss-6b2 #2).
+                let saved_values = {
+                    let mut sv = saved_values;
+                    let _sg = VecRootGuard::new(&mut sv);
+                    let _ = eval_progn(rest_forms, env)?;
+                    sv
+                };
                 env.set_mv(saved_values);
                 return Ok(primary);
             }
@@ -9172,41 +9236,38 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "RESTART-BIND" => return eval_restart_bind(cdr, env),
             "RESTART-CASE" => return eval_restart_case(cdr, env),
             "SIGNAL" => {
-                let args = list_to_vec(cdr);
+                let roots = bliss_rt::ShadowRootScope::new();
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal("SIGNAL requires an argument".into()));
                 }
-                let datum = eval_form(args[0], env)?;
-                let mut initargs = Vec::new();
-                for arg in &args[1..] {
-                    initargs.push(eval_form(*arg, env)?);
-                }
+                let datum = roots.root(args[0]);
+                let initargs = &args[1..];
                 // (signal datum &rest args): a condition-type symbol is built into
                 // an instance so handler type-matching runs against the real CLOS
                 // class hierarchy.
-                let cond = coerce_condition_designator(env, datum, &initargs)?.unwrap_or(datum);
+                let cond =
+                    coerce_condition_designator(env, datum.get(), initargs)?.unwrap_or(datum.get());
                 return signal_condition_object(cond, env);
             }
             "WARN" => {
-                let args = list_to_vec(cdr);
+                let roots = bliss_rt::ShadowRootScope::new();
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal("WARN requires an argument".into()));
                 }
-                let datum = eval_form(args[0], env)?;
-                let mut rest_args = Vec::new();
-                for arg in &args[1..] {
-                    rest_args.push(eval_form(*arg, env)?);
-                }
+                let datum = roots.root(args[0]);
+                let rest_args = &args[1..];
                 // (warn datum &rest args): a warning-type symbol or condition is
                 // used directly; a format-control string becomes a SIMPLE-WARNING.
-                let message = if is_string_value(datum) {
-                    format_control_message(&val_as_str(datum), &rest_args)?
+                let message = if is_string_value(datum.get()) {
+                    format_control_message(&val_as_str(datum.get()), rest_args)?
                 } else {
-                    val_as_str(datum)
+                    val_as_str(datum.get())
                 };
-                let condition = match coerce_condition_designator(env, datum, &rest_args)? {
+                let condition = match coerce_condition_designator(env, datum.get(), rest_args)? {
                     Some(condition) => condition,
-                    None => make_simple_warning_condition(datum, &rest_args, env)?,
+                    None => make_simple_warning_condition(datum.get(), rest_args, env)?,
                 };
                 // Establish a MUFFLE-WARNING restart for the dynamic extent of the
                 // signal so a handler can suppress the default warning message.
@@ -9236,39 +9297,34 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
             }
             "MAKE-CONDITION" => {
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal(
                         "MAKE-CONDITION requires a type".into(),
                     ));
                 }
-                let type_val = eval_form(args[0], env)?;
+                let type_val = args[0];
                 let type_name = if type_val.is_symbol() {
                     sym_name(type_val)
                 } else {
                     val_as_str(type_val)
                 };
-                let mut initarg_pairs = Vec::new();
-                let mut i = 1;
-                while i + 1 < args.len() {
-                    initarg_pairs.push(eval_form(args[i], env)?);
-                    initarg_pairs.push(eval_form(args[i + 1], env)?);
-                    i += 2;
-                }
-                return build_condition_instance(env, &type_name, &initarg_pairs);
+                // Initarg key/value pairs (drop an odd trailing arg, as the
+                // original loop did) are already evaluated and rooted in `args`.
+                let pair_count = (args.len().saturating_sub(1)) & !1;
+                let initarg_pairs = &args[1..1 + pair_count];
+                return build_condition_instance(env, &type_name, initarg_pairs);
             }
             "SLOT-VALUE" => {
-                let (instance_form, rest) = cp(cdr);
-                let (slot_form, _) = cp(rest);
-                let instance = eval_form(instance_form, env)?;
-                let slot = eval_form(slot_form, env)?;
+                let args = eval_args(cdr, env)?;
+                let instance = args.first().copied().unwrap_or(NIL);
+                let slot = args.get(1).copied().unwrap_or(NIL);
                 return slot_value_or_signal(instance, slot, env);
             }
             "SLOT-BOUNDP" => {
-                let (instance_form, rest) = cp(cdr);
-                let (slot_form, _) = cp(rest);
-                let instance = eval_form(instance_form, env)?;
-                let slot = eval_form(slot_form, env)?;
+                let args = eval_args(cdr, env)?;
+                let instance = args.first().copied().unwrap_or(NIL);
+                let slot = args.get(1).copied().unwrap_or(NIL);
                 return Ok(if slot_is_bound(instance, slot, env)? {
                     T
                 } else {
@@ -9429,16 +9485,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     BlissError::UndefinedFunction(resolve_sym("CALL-NEXT-METHOD").unwrap_or(NIL))
                 })?;
                 let args = if cdr.is_nil() {
-                    context.args.clone()
+                    RootedVals::new(context.args.clone())
                 } else {
-                    let mut args = Vec::new();
-                    let mut cursor = cdr;
-                    while cursor.is_cons() {
-                        let (arg_form, rest) = cp(cursor);
-                        args.push(eval_form(arg_form, env)?);
-                        cursor = rest;
-                    }
-                    args
+                    eval_args(cdr, env)?
                 };
                 return invoke_next_method(env, &context, &args);
             }
@@ -9459,16 +9508,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(vec_to_list(&restarts));
             }
             "FIND-RESTART" => {
-                let (name_form, rest) = cp(cdr);
+                // Root the source cursor and the evaluated condition across the
+                // evaluations and the applies-loop (bliss-6b2 #2).
+                let roots = bliss_rt::ShadowRootScope::new();
+                let (name_form, rest0) = cp(cdr);
+                let rest = roots.root(rest0);
                 let restart_name = symbol_bare_name(&val_as_str(eval_form(name_form, env)?));
-                let condition = if rest.is_cons() {
-                    Some(eval_form(cp(rest).0, env)?)
+                let condition = if rest.get().is_cons() {
+                    Some(roots.root(eval_form(cp(rest.get()).0, env)?))
                 } else {
                     None
                 };
                 for restart in env.restarts.iter().rev().cloned().collect::<Vec<_>>() {
                     if symbol_bare_name(&restart.name) == restart_name
-                        && restart_applies(&restart, condition, env)?
+                        && restart_applies(&restart, condition.as_ref().map(|c| c.get()), env)?
                     {
                         return Ok(resolve_sym(&restart.name).unwrap_or(NIL));
                     }
@@ -9476,16 +9529,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(NIL);
             }
             "INVOKE-RESTART" => {
-                let (name_form, rest_args) = cp(cdr);
+                // Root the source-arg spine across the name evaluation (bliss-6b2 #2).
+                let roots = bliss_rt::ShadowRootScope::new();
+                let (name_form, rest0) = cp(cdr);
+                let rest_args = roots.root(rest0);
                 let name_val = eval_form(name_form, env)?;
                 let restart_name = val_as_str(name_val).to_uppercase();
-                let mut args = Vec::new();
-                let mut c = rest_args;
-                while c.is_cons() {
-                    let (arg_form, rest) = cp(c);
-                    args.push(eval_form(arg_form, env)?);
-                    c = rest;
-                }
+                let args = eval_args(rest_args.get(), env)?;
                 for restart in env.restarts.iter().rev().cloned().collect::<Vec<_>>() {
                     if restart.name == restart_name {
                         let result = invoke_restart_function(&restart.function, &args, env)?;
@@ -9560,18 +9610,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // SOURCE to a .bfasl (bliss-lb6.6). Returns three values per ANSI:
                 // output-truename, warnings-p, failure-p. ASDF passes the target as
                 // an :output-file keyword (not positional).
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal(
                         "COMPILE-FILE requires a source".into(),
                     ));
                 }
-                let src_path = path_designator_to_string(eval_form(args[0], env)?)?;
+                let src_path = path_designator_to_string(args[0])?;
                 let mut out_path: Option<String> = None;
                 let mut i = 1;
                 while i + 1 < args.len() {
-                    let key = eval_form(args[i], env)?;
-                    let val = eval_form(args[i + 1], env)?;
+                    let key = args[i];
+                    let val = args[i + 1];
                     if key.is_symbol()
                         && symbol_bare_name(&sym_name(key)) == "OUTPUT-FILE"
                         && val != NIL
@@ -9649,18 +9699,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // Return the pathname COMPILE-FILE would write. With an explicit
                 // :output-file, return that (as a pathname); otherwise the input
                 // with a "fasl" type. ASDF calls this to compute output-files.
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal(
                         "compile-file-pathname: missing input-file".into(),
                     ));
                 }
-                let input = eval_form(args[0], env)?;
                 // Scan &key args for :output-file.
                 let mut i = 1;
                 while i + 1 < args.len() {
-                    let key = eval_form(args[i], env)?;
-                    let val = eval_form(args[i + 1], env)?;
+                    let key = args[i];
+                    let val = args[i + 1];
                     if key.is_symbol() && symbol_bare_name(&sym_name(key)) == "OUTPUT-FILE" {
                         if val != NIL {
                             let (pn, _) = bliss_stdlib::parse_namestring(
@@ -9673,7 +9722,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                     i += 2;
                 }
-                let src = path_designator_to_string(input)?;
+                let src = path_designator_to_string(args[0])?;
                 let stem = src
                     .strip_suffix(".lisp")
                     .or_else(|| src.strip_suffix(".lsp"))
@@ -9850,10 +9899,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "READ-SEQUENCE requires a sequence and a stream".into(),
                     ));
                 }
-                let vals: Vec<BlissVal> = args
-                    .iter()
-                    .map(|a| eval_form(*a, env))
-                    .collect::<Result<_, _>>()?;
+                let vals = eval_forms(args.iter().copied(), env)?;
                 let seq = vals[0];
                 let inp = resolve_input_stream(vals[1], env);
                 let seq_len = bliss_stdlib::length(seq)?;
@@ -9886,10 +9932,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "WRITE-SEQUENCE requires a sequence and a stream".into(),
                     ));
                 }
-                let vals: Vec<BlissVal> = args
-                    .iter()
-                    .map(|a| eval_form(*a, env))
-                    .collect::<Result<_, _>>()?;
+                let vals = eval_forms(args.iter().copied(), env)?;
                 let seq = vals[0];
                 let out = resolve_output_stream(vals[1], env);
                 let seq_len = bliss_stdlib::length(seq)?;
@@ -9913,18 +9956,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "WRITE-STRING" => {
                 // (write-string string &optional stream &key start end)
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal(
                         "WRITE-STRING requires an argument".into(),
                     ));
                 }
-                let string = eval_form(args[0], env)?;
-                let s = val_as_str(string);
+                let s = val_as_str(args[0]);
                 // A second positional argument is the stream designator, unless
                 // it is a keyword (the start of &key start/end options).
                 let stream = if args.len() > 1 && !is_keyword_arg(args[1]) {
-                    eval_form(args[1], env)?
+                    args[1]
                 } else {
                     NIL
                 };
@@ -9934,27 +9976,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     // end nil → whole string).
                     invoke_generic_function(
                         "STREAM-WRITE-STRING",
-                        &[out, string, BlissVal::from_fixnum(0), NIL],
+                        &[out, args[0], BlissVal::from_fixnum(0), NIL],
                         env,
                     )?;
-                    return Ok(string);
+                    return Ok(args[0]);
                 }
                 write_str_to(out, &s)?;
-                return Ok(string);
+                return Ok(args[0]);
             }
             "WRITE-LINE" => {
                 // (write-line string &optional stream &key start end) — WRITE-STRING
                 // followed by a newline; returns the string.
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal(
                         "WRITE-LINE requires an argument".into(),
                     ));
                 }
-                let string = eval_form(args[0], env)?;
-                let s = val_as_str(string);
+                let s = val_as_str(args[0]);
                 let stream = if args.len() > 1 && !is_keyword_arg(args[1]) {
-                    eval_form(args[1], env)?
+                    args[1]
                 } else {
                     NIL
                 };
@@ -9962,15 +10003,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if is_gray_stream(out) {
                     invoke_generic_function(
                         "STREAM-WRITE-STRING",
-                        &[out, string, BlissVal::from_fixnum(0), NIL],
+                        &[out, args[0], BlissVal::from_fixnum(0), NIL],
                         env,
                     )?;
                     invoke_generic_function("STREAM-TERPRI", &[out], env)?;
-                    return Ok(string);
+                    return Ok(args[0]);
                 }
                 write_str_to(out, &s)?;
                 bliss_stdlib::stream_terpri(out)?;
-                return Ok(string);
+                return Ok(args[0]);
             }
             "FILE-LENGTH" => {
                 // (file-length stream) — length in elements of an open file stream.
@@ -10028,20 +10069,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(T);
             }
             "MAKE-PACKAGE" => {
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal(
                         "MAKE-PACKAGE requires a package designator".into(),
                     ));
                 }
-                let pkg_name = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                let pkg_name = normalize_package_name(&val_as_str(args[0]));
                 // Parse :nicknames and :use keyword options.
                 let mut nicknames = Vec::new();
                 let mut uses: Vec<String> = Vec::new();
                 let mut i = 1;
                 while i + 1 < args.len() {
-                    let key = symbol_bare_name(&sym_name(eval_form(args[i], env)?));
-                    let value = eval_form(args[i + 1], env)?;
+                    let key = symbol_bare_name(&sym_name(args[i]));
+                    let value = args[i + 1];
                     match key.as_str() {
                         "NICKNAMES" => {
                             for nick in list_to_vec(value) {
@@ -10188,14 +10229,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(vec_to_list(&bliss_stdlib::list_all_packages()));
             }
             "BLISS-INTERNAL::PACKAGE-SYMBOLS" | "BLISS-INTERNAL:PACKAGE-SYMBOLS" => {
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 let package = if args.is_empty() {
                     env.current_package.clone()
                 } else {
-                    normalize_package_name(&val_as_str(eval_form(args[0], env)?))
+                    normalize_package_name(&val_as_str(args[0]))
                 };
                 let include_inherited = if let Some(arg) = args.get(1) {
-                    !eval_form(*arg, env)?.is_nil()
+                    !arg.is_nil()
                 } else {
                     false
                 };
@@ -10206,12 +10247,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 )));
             }
             "USE-PACKAGE" => {
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Ok(T);
                 }
                 let mut names = Vec::new();
-                let pkgs_val = eval_form(args[0], env)?;
+                let pkgs_val = args[0];
                 if pkgs_val.is_cons() {
                     for pkg in list_to_vec(pkgs_val) {
                         names.push(resolve_package_name(env, &val_as_str(pkg)));
@@ -10220,7 +10261,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     names.push(resolve_package_name(env, &val_as_str(pkgs_val)));
                 }
                 let target = if args.len() > 1 {
-                    let raw = val_as_str(eval_form(args[1], env)?);
+                    let raw = val_as_str(args[1]);
                     resolve_package_name(env, &raw)
                 } else {
                     env.current_package.clone()
@@ -10234,20 +10275,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "UNUSE-PACKAGE" => return Ok(T),
             "RENAME-PACKAGE" => {
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
                     return Err(BlissError::Internal(
                         "RENAME-PACKAGE requires package and new name".into(),
                     ));
                 }
-                let old_raw = val_as_str(eval_form(args[0], env)?);
+                let old_raw = val_as_str(args[0]);
                 let old_name = resolve_package_name(env, &old_raw);
-                let new_name = normalize_package_name(&val_as_str(eval_form(args[1], env)?));
+                let new_name = normalize_package_name(&val_as_str(args[1]));
                 // Optional new nicknames (3rd arg); default: keep the package's
                 // current nicknames (bliss has always preserved them on rename).
                 if let Some(pkg) = bliss_stdlib::find_package(&old_name) {
                     let new_nicks: Vec<String> = if args.len() > 2 {
-                        list_to_vec(eval_form(args[2], env)?)
+                        list_to_vec(args[2])
                             .iter()
                             .map(|n| normalize_package_name(&val_as_str(*n)))
                             .collect()
@@ -10274,11 +10315,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(T);
             }
             "INTERN" => {
-                let (name_form, rest) = cp(cdr);
-                let name_val = eval_form(name_form, env)?;
+                let args = eval_args(cdr, env)?;
+                let name_val = args.first().copied().unwrap_or(NIL);
                 let name_str = symbol_bare_name(&val_as_str(name_val));
-                let pkg_name = if rest.is_cons() {
-                    let raw = val_as_str(eval_form(cp(rest).0, env)?);
+                let pkg_name = if args.len() > 1 {
+                    let raw = val_as_str(args[1]);
                     resolve_package_name(env, &raw)
                 } else {
                     env.current_package.clone()
@@ -10295,14 +10336,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(sym);
             }
             "FIND-SYMBOL" => {
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
                     return Err(BlissError::Internal(
                         "FIND-SYMBOL requires a name and package".into(),
                     ));
                 }
-                let name = symbol_bare_name(&val_as_str(eval_form(args[0], env)?));
-                let pkg_raw = val_as_str(eval_form(args[1], env)?);
+                let name = symbol_bare_name(&val_as_str(args[0]));
+                let pkg_raw = val_as_str(args[1]);
                 let pkg_name = resolve_package_name(env, &pkg_raw);
                 if let Some((sym, status)) = find_symbol_in_package(env, &pkg_name, &name) {
                     env.set_mv(vec![sym, package_status_symbol(status)]);
@@ -10312,13 +10353,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(NIL);
             }
             "EXPORT" | "IMPORT" | "SHADOWING-IMPORT" => {
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Ok(T);
                 }
-                let symbols = eval_form(args[0], env)?;
+                let symbols = args[0];
                 let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&val_as_str(eval_form(args[1], env)?))
+                    normalize_package_name(&val_as_str(args[1]))
                 } else {
                     env.current_package.clone()
                 };
@@ -10358,13 +10399,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "UNEXPORT" => return Ok(T),
             "SHADOW" => {
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Ok(T);
                 }
-                let names_val = eval_form(args[0], env)?;
+                let names_val = args[0];
                 let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&val_as_str(eval_form(args[1], env)?))
+                    normalize_package_name(&val_as_str(args[1]))
                 } else {
                     env.current_package.clone()
                 };
@@ -10383,13 +10424,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(T);
             }
             "UNINTERN" => {
-                let args = list_to_vec(cdr);
+                let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Ok(NIL);
                 }
-                let symbol = eval_form(args[0], env)?;
+                let symbol = args[0];
                 let pkg_name = if args.len() > 1 {
-                    normalize_package_name(&val_as_str(eval_form(args[1], env)?))
+                    normalize_package_name(&val_as_str(args[1]))
                 } else {
                     env.current_package.clone()
                 };
@@ -10516,10 +10557,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "STRING=" => {
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
-                let b = eval_form(bf, env)?;
+                let (a, b) = {
+                    // Root both args across evaluation so a young arg list can't
+                    // dangle either (bliss-6b2 #2).
+                    let roots = bliss_rt::ShadowRootScope::new();
+                    let (af, r) = cp(cdr);
+                    let bf = roots.root(cp(r).0);
+                    let a = roots.root(eval_form(af, env)?);
+                    let b = eval_form(bf.get(), env)?;
+                    (a.get(), b)
+                };
                 return Ok(if val_as_str(a) == val_as_str(b) {
                     T
                 } else {
@@ -10528,10 +10575,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "STRING<" => {
                 // ANSI: the mismatch index if string1 < string2, else NIL.
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
-                let b = eval_form(bf, env)?;
+                let (a, b) = {
+                    // Root both args across evaluation so a young arg list can't
+                    // dangle either (bliss-6b2 #2).
+                    let roots = bliss_rt::ShadowRootScope::new();
+                    let (af, r) = cp(cdr);
+                    let bf = roots.root(cp(r).0);
+                    let a = roots.root(eval_form(af, env)?);
+                    let b = eval_form(bf.get(), env)?;
+                    (a.get(), b)
+                };
                 let (i, ord) = string_mismatch(&val_as_str(a), &val_as_str(b));
                 return Ok(if ord == std::cmp::Ordering::Less {
                     BlissVal::from_fixnum(i as i64)
@@ -10541,10 +10594,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "STRING>" => {
                 // ANSI: the mismatch index if string1 > string2, else NIL.
-                let (af, r) = cp(cdr);
-                let (bf, _) = cp(r);
-                let a = eval_form(af, env)?;
-                let b = eval_form(bf, env)?;
+                let (a, b) = {
+                    // Root both args across evaluation so a young arg list can't
+                    // dangle either (bliss-6b2 #2).
+                    let roots = bliss_rt::ShadowRootScope::new();
+                    let (af, r) = cp(cdr);
+                    let bf = roots.root(cp(r).0);
+                    let a = roots.root(eval_form(af, env)?);
+                    let b = eval_form(bf.get(), env)?;
+                    (a.get(), b)
+                };
                 let (i, ord) = string_mismatch(&val_as_str(a), &val_as_str(b));
                 return Ok(if ord == std::cmp::Ordering::Greater {
                     BlissVal::from_fixnum(i as i64)
@@ -10599,6 +10658,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         // global function cell (bliss-jtc.6.8).
         if let Some((params_form, body)) = callable_body(env, &name) {
             let roots = bliss_rt::ShadowRootScope::new();
+            // Root the callee's params/body BEFORE evaluating arguments (which
+            // allocates and can trigger a relocating minor GC). Held as bare
+            // locals, these copies would go stale when the GC moves the callee's
+            // body tree — the local still points at the pre-move location — and
+            // eval_lambda_call would then walk a freed body (bliss-6b2 #2).
+            let params_form = roots.root(params_form);
+            let body = roots.root(body);
             let forms = roots.root(cdr);
             let mut rooted_args = Vec::new();
             while forms.get().is_cons() {
@@ -10607,7 +10673,6 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 rooted_args.push(roots.root(eval_form(af, env)?));
                 forms.set(rest.get());
             }
-            let args: Vec<BlissVal> = rooted_args.iter().map(|arg| arg.get()).collect();
             // T0→T1 tiering: run a GLOBAL compiled callee through the promoting
             // bytecode/native path so hot functions promote even when called from
             // tree-walked code (e.g. a `loop`, which never compiles to bytecode).
@@ -10615,6 +10680,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // to the global registry entry of the same name.
             if !env.funs.borrow().contains_key(&name) {
                 if let Some(sym) = resolve_sym(&name) {
+                    let args: Vec<BlissVal> = rooted_args.iter().map(|a| a.get()).collect();
                     if let Some(res) =
                         bytecode::call_registered(sym.as_symbol_index(), &args, sym, env)
                     {
@@ -10622,7 +10688,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                 }
             }
-            return eval_lambda_call(env, params_form, body, &args, Rc::clone(&env.frame));
+            // Re-read from the roots only now: call_registered may have collected.
+            let args: Vec<BlissVal> = rooted_args.iter().map(|a| a.get()).collect();
+            return eval_lambda_call(
+                env,
+                params_form.get(),
+                body.get(),
+                &args,
+                Rc::clone(&env.frame),
+            );
         }
 
         // Check accessor functions (from DEFCLASS). Match by full name or bare
@@ -10663,13 +10737,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
         // Check methods
         if env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name) {
-            let mut args = Vec::new();
-            let mut c = cdr;
-            while c.is_cons() {
-                let (af, r) = cp(c);
-                args.push(eval_form(af, env)?);
-                c = r;
-            }
+            let args = eval_args(cdr, env)?;
             return invoke_generic_function(&name, &args, env);
         }
 
@@ -10680,13 +10748,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let _pkg_name = parts[0];
                 let fn_name = parts[1].trim_start_matches(':');
                 if let Some((params_form, body)) = callable_body(env, fn_name) {
-                    let mut args = Vec::new();
-                    let mut c = cdr;
-                    while c.is_cons() {
-                        let (af, r) = cp(c);
-                        args.push(eval_form(af, env)?);
-                        c = r;
-                    }
+                    let args = eval_args(cdr, env)?;
                     return eval_lambda_call(env, params_form, body, &args, Rc::clone(&env.frame));
                 }
             }
@@ -10698,13 +10760,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         let (lh, lr) = cp(car);
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
             let (params_form, body_rest) = cp(lr);
-            let mut args = Vec::new();
-            let mut c = cdr;
-            while c.is_cons() {
-                let (af, r) = cp(c);
-                args.push(eval_form(af, env)?);
-                c = r;
-            }
+            let args = eval_args(cdr, env)?;
             return eval_lambda_call(env, params_form, body_rest, &args, Rc::clone(&env.frame));
         }
     }
@@ -11096,6 +11152,206 @@ impl LoopAccs {
     }
 }
 
+impl LoopAccs {
+    /// Visit every `BlissVal` this accumulator holds (bliss-6b2 #2). The values
+    /// live in Rust-heap `Vec`/map buffers the collector can't see, yet persist
+    /// across the whole loop body's allocating iterations — so they must be
+    /// scanned as roots (relocated in place) or a minor/major GC would free or
+    /// move their referents out from under the stored copies.
+    fn visit_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        for vals in self.map.values_mut() {
+            for v in vals.iter_mut() {
+                visit(v as *mut BlissVal);
+            }
+        }
+        for n in self.nums.values_mut() {
+            match n {
+                NumAcc::Sum(v) => visit(v as *mut BlissVal),
+                NumAcc::Max(Some(v)) | NumAcc::Min(Some(v)) => visit(v as *mut BlissVal),
+                _ => {}
+            }
+        }
+        if let Some(v) = self.bool_default.as_mut() {
+            visit(v as *mut BlissVal);
+        }
+    }
+}
+
+impl ForState {
+    /// Visit every `BlissVal` this for-clause cursor holds (bliss-6b2 #2), for the
+    /// same reason as [`LoopAccs::visit_roots`] — `items`/`tail`/`current`/… span
+    /// the loop's allocating body.
+    fn visit_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        match self {
+            ForState::In { pat, items, .. }
+            | ForState::Across { pat, items, .. }
+            | ForState::Being { pat, items, .. } => {
+                visit(pat as *mut BlissVal);
+                for it in items.iter_mut() {
+                    visit(it as *mut BlissVal);
+                }
+            }
+            ForState::On { pat, tail, step } => {
+                visit(pat as *mut BlissVal);
+                visit(tail as *mut BlissVal);
+                if let Some(s) = step.as_mut() {
+                    visit(s as *mut BlissVal);
+                }
+            }
+            ForState::Eq { pat, init, then } => {
+                visit(pat as *mut BlissVal);
+                visit(init as *mut BlissVal);
+                if let Some(t) = then.as_mut() {
+                    visit(t as *mut BlissVal);
+                }
+            }
+            ForState::From {
+                pat,
+                current,
+                step,
+                limit,
+            } => {
+                visit(pat as *mut BlissVal);
+                visit(current as *mut BlissVal);
+                visit(step as *mut BlissVal);
+                if let Some((_, v)) = limit.as_mut() {
+                    visit(v as *mut BlissVal);
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Active extended-LOOP root sources (accumulators + for-clause cursors) on
+    /// this thread, scanned by [`scan_loop_roots`] during every GC (bliss-6b2 #2).
+    static LOOP_ROOTS: RefCell<Vec<(*mut LoopAccs, *mut Vec<ForState>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn scan_loop_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    LOOP_ROOTS.with(|r| {
+        for &(accs, states) in r.borrow().iter() {
+            // SAFETY: guards register these only for the lexical extent in which
+            // the pointed-to locals remain live and immobile (they are not moved
+            // while a guard is on the stack).
+            unsafe {
+                (*accs).visit_roots(visit);
+                for st in (*states).iter_mut() {
+                    st.visit_roots(visit);
+                }
+            }
+        }
+    });
+}
+
+fn install_loop_root_scanner() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| bliss_rt::gc::register_root_scanner(scan_loop_roots));
+}
+
+/// Registers a loop's `accs`/`states` as GC roots for its lexical extent.
+struct LoopRootGuard;
+
+impl LoopRootGuard {
+    fn new(accs: &mut LoopAccs, states: &mut Vec<ForState>) -> Self {
+        install_loop_root_scanner();
+        let accs = accs as *mut LoopAccs;
+        let states = states as *mut Vec<ForState>;
+        LOOP_ROOTS.with(|r| r.borrow_mut().push((accs, states)));
+        LoopRootGuard
+    }
+}
+
+impl Drop for LoopRootGuard {
+    fn drop(&mut self) {
+        LOOP_ROOTS.with(|r| {
+            r.borrow_mut().pop();
+        });
+    }
+}
+
+thread_local! {
+    /// `Vec<BlissVal>` buffers registered as GC roots for a lexical extent
+    /// (bliss-6b2 #2) — for accumulators/scratch the collector can't otherwise
+    /// see (they live on the Rust heap). Scanned in place so the GC relocates
+    /// their contents.
+    static VEC_ROOTS: RefCell<Vec<*mut Vec<BlissVal>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn scan_vec_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    VEC_ROOTS.with(|r| {
+        for &v in r.borrow().iter() {
+            // SAFETY: registered only for the extent its owning local is live.
+            unsafe {
+                for e in (*v).iter_mut() {
+                    visit(e as *mut BlissVal);
+                }
+            }
+        }
+    });
+}
+
+fn install_vec_root_scanner() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| bliss_rt::gc::register_root_scanner(scan_vec_roots));
+}
+
+/// Registers a `Vec<BlissVal>` as a GC root for its lexical extent.
+struct VecRootGuard(*mut Vec<BlissVal>);
+
+impl VecRootGuard {
+    fn new(v: &mut Vec<BlissVal>) -> Self {
+        install_vec_root_scanner();
+        let p = v as *mut Vec<BlissVal>;
+        VEC_ROOTS.with(|r| r.borrow_mut().push(p));
+        VecRootGuard(p)
+    }
+}
+
+impl Drop for VecRootGuard {
+    fn drop(&mut self) {
+        VEC_ROOTS.with(|r| {
+            let mut v = r.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|&p| p == self.0) {
+                v.remove(pos);
+            }
+        });
+    }
+}
+
+/// A `Vec<BlissVal>` kept GC-rooted for its ENTIRE lifetime (bliss-6b2 #2).
+///
+/// `eval_args`/`eval_forms` return this instead of a bare `Vec` so evaluated
+/// arguments stay rooted while the CALLER uses them — e.g. across an
+/// `apply_function` / `eval_lambda_call` / `invoke_generic_function` whose callee
+/// allocates and can relocate them — not merely while they are being evaluated.
+/// (Rooting that ended at the evaluator's return left every caller unprotected.)
+/// The buffer is boxed so it has a stable address the guard can point at even as
+/// the `RootedVals` value is moved (returned) around. Derefs to `[BlissVal]`.
+struct RootedVals {
+    vals: Box<Vec<BlissVal>>,
+    _guard: VecRootGuard,
+}
+
+impl RootedVals {
+    fn new(vals: Vec<BlissVal>) -> Self {
+        let mut vals = Box::new(vals);
+        let guard = VecRootGuard::new(&mut vals);
+        RootedVals { vals, _guard: guard }
+    }
+    fn push(&mut self, v: BlissVal) {
+        self.vals.push(v);
+    }
+}
+
+impl std::ops::Deref for RootedVals {
+    type Target = [BlissVal];
+    fn deref(&self) -> &[BlissVal] {
+        &self.vals
+    }
+}
+
 /// Bind a (possibly destructuring / dotted) pattern against a value.
 fn loop_bind(pattern: BlissVal, value: BlissVal, env: &mut Env) {
     if pattern.is_symbol() {
@@ -11420,13 +11676,26 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         })
         .unwrap_or(false);
     if !starts_with_kw {
+        // Walk the LIVE body cons list through a rooted cursor each iteration
+        // rather than a stale `toks` snapshot (bliss-6b2 #2): the simple loop
+        // runs unbounded, and each body form's evaluation can fire a GC that
+        // relocates the remaining, not-yet-evaluated body forms. Two reused root
+        // slots (never grown in the loop) keep the head and cursor relocated.
+        let roots = bliss_rt::ShadowRootScope::new();
+        let body = roots.root(cdr);
+        let c = roots.root(cdr);
         let mut guard: u64 = 0;
         loop {
-            for f in &toks {
-                if let Some(tgt) = loop_return_target(*f) {
+            c.set(body.get());
+            while c.get().is_cons() {
+                let f = cp(c.get()).0;
+                if let Some(tgt) = loop_return_target(f) {
                     return eval_form(tgt, env);
                 }
-                eval_form(*f, env)?;
+                eval_form(f, env)?;
+                // Re-read the tail from the rooted cursor after evaluation: a GC
+                // fired inside eval_form would have staled a plain `rest` local.
+                c.set(cp(c.get()).1);
             }
             guard += 1;
             if guard > 10_000_000 {
@@ -11747,13 +12016,18 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     };
 
     let has_terminator = loop_body_has_terminator(&body);
+    // Root the accumulators and for-clause cursors for the whole loop: they hold
+    // BlissVals in Rust-heap buffers across the body's allocating iterations
+    // (bliss-6b2 #2). `states` is declared here (outside the branch) so one guard
+    // covers both the no-driver and driver paths.
+    let mut states: Vec<ForState> = Vec::with_capacity(for_clauses.len());
+    let _loop_roots = LoopRootGuard::new(&mut accs, &mut states);
     if for_clauses.is_empty() && !has_terminator && repeat_remaining.is_none() {
         // No driver at all: run the body once (when/collect-only loops).
         let mut terminate = false;
         loop_exec_clauses(&body, env, &mut accs, &mut ret, &mut terminate)?;
     } else {
         // Build cursors, evaluating each list form once.
-        let mut states: Vec<ForState> = Vec::with_capacity(for_clauses.len());
         let mut has_stepping_driver = false;
         for fc in &for_clauses {
             match fc {
@@ -12930,11 +13204,12 @@ fn eval_cmp(
     env: &mut Env,
     pred: fn(Ordering) -> bool,
 ) -> Result<BlissVal, BlissError> {
-    let (af, r) = cp(args);
-    let (bf, _) = cp(r);
     let roots = bliss_rt::ShadowRootScope::new();
+    let (af, r) = cp(args);
+    // Root the second arg form before evaluating the first (bliss-6b2 #2).
+    let bf = roots.root(cp(r).0);
     let a = roots.root(eval_form(af, env)?);
-    let b = eval_form(bf, env)?;
+    let b = eval_form(bf.get(), env)?;
     Ok(if pred(numeric_cmp(a.get(), b)?) {
         T
     } else {
@@ -12942,13 +13217,44 @@ fn eval_cmp(
     })
 }
 
-fn eval_args(args: BlissVal, env: &mut Env) -> Result<Vec<BlissVal>, BlissError> {
-    let mut result = Vec::new();
-    let mut c = args;
-    while c.is_cons() {
-        let (af, r) = cp(c);
-        result.push(eval_form(af, env)?);
-        c = r;
+/// Evaluate each form in `forms`, keeping the results GC-rooted across the whole
+/// evaluation, then return them as a fresh `Vec`. The intermediate results live
+/// in a `Vec<BlissVal>` whose backing buffer is on the Rust heap — invisible to
+/// the collector — so without rooting, evaluating a later form could trigger a
+/// relocating minor GC that leaves the earlier results dangling (bliss-6b2 #2).
+/// Callers hold the returned (bare) `Vec` only briefly; native-stack roots are
+/// covered conservatively by the collector.
+fn eval_forms(
+    forms: impl IntoIterator<Item = BlissVal>,
+    env: &mut Env,
+) -> Result<RootedVals, BlissError> {
+    // Root the input forms first (they may be young source conses reachable only
+    // through a caller's Rust local), then evaluate into a self-rooted result
+    // that stays rooted for the caller (bliss-6b2 #2).
+    let roots = bliss_rt::ShadowRootScope::new();
+    let forms: Vec<bliss_rt::ShadowRoot> = forms.into_iter().map(|f| roots.root(f)).collect();
+    let mut result = RootedVals::new(Vec::new());
+    for f in &forms {
+        let v = eval_form(f.get(), env)?;
+        result.push(v);
+    }
+    Ok(result)
+}
+
+fn eval_args(args: BlissVal, env: &mut Env) -> Result<RootedVals, BlissError> {
+    // Evaluate a cons list of argument forms into a `RootedVals` — kept rooted for
+    // the whole time the CALLER holds it (across the ensuing apply/dispatch, whose
+    // callee allocates), not just during evaluation (bliss-6b2 #2). This is the
+    // shared argument evaluator for many builtins.
+    let roots = bliss_rt::ShadowRootScope::new();
+    let cursor = roots.root(args);
+    let mut result = RootedVals::new(Vec::new());
+    while cursor.get().is_cons() {
+        let (af, r) = cp(cursor.get());
+        let rest = roots.root(r);
+        let v = eval_form(af, env)?;
+        result.push(v);
+        cursor.set(rest.get());
     }
     Ok(result)
 }
@@ -13068,6 +13374,10 @@ fn merge_sort_pred(
     let mid = n / 2;
     let mut left = elems[..mid].to_vec();
     let mut right = elems[mid..].to_vec();
+    // Root the split copies across the predicate/key calls (bliss-6b2 #2): each
+    // comparison runs user code that can relocate these Vec-resident elements.
+    let _lg = VecRootGuard::new(&mut left);
+    let _rg = VecRootGuard::new(&mut right);
     merge_sort_pred(&mut left, predicate, key, env)?;
     merge_sort_pred(&mut right, predicate, key, env)?;
     let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
@@ -13115,6 +13425,7 @@ fn sort_sequence(
         }
         v
     };
+    let _eg = VecRootGuard::new(&mut elems);
     merge_sort_pred(&mut elems, predicate, key, env)?;
     if is_list {
         Ok(vec_to_list(&elems))
@@ -13213,17 +13524,22 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
         });
     }
 
-    // let: every init is evaluated in the outer frame before any binding is visible.
-    let mut evaluated = Vec::new();
+    // let: every init is evaluated in the outer frame before any binding is
+    // visible. The evaluated values must be GC-rooted across the loop: a later
+    // init allocates and can trigger a relocating minor GC that would leave the
+    // earlier (bare `Vec`-resident) values dangling before they are bound into
+    // the — scanned — child frame (bliss-6b2 #2).
+    let roots = bliss_rt::ShadowRootScope::new();
+    let mut evaluated: Vec<(BlissVal, bliss_rt::ShadowRoot)> = Vec::new();
     let mut c = bindings_form;
     while c.is_cons() {
         let (binding, rest) = cp(c);
         if binding.is_cons() {
             let (var_form, val_rest) = cp(binding);
             let (val_form, _) = cp(val_rest);
-            evaluated.push((var_form, eval_form(val_form, env)?));
+            evaluated.push((var_form, roots.root(eval_form(val_form, env)?)));
         } else if binding.is_symbol() {
-            evaluated.push((binding, NIL));
+            evaluated.push((binding, roots.root(NIL)));
         }
         c = rest;
     }
@@ -13232,13 +13548,14 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
         // Special bindings are dynamic (global cell) with RAII restore; the rest
         // are lexical frame bindings.
         let mut dyn_binds: Vec<DynBind> = Vec::new();
-        for (symbol, val) in evaluated {
-            if is_special_var(symbol) {
-                dyn_binds.push(DynBind::establish(symbol, val));
+        for (symbol, val) in &evaluated {
+            let val = val.get();
+            if is_special_var(*symbol) {
+                dyn_binds.push(DynBind::establish(*symbol, val));
             } else if symbol.is_symbol() {
-                env.define_local_symbol(symbol, val);
+                env.define_local_symbol(*symbol, val);
             } else {
-                env.define_local(&sym_name(symbol), val);
+                env.define_local(&sym_name(*symbol), val);
             }
         }
         eval_progn(body, env)
@@ -13391,6 +13708,13 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         }
         c = rest;
     }
+    // Register the forked child Env as a GC root for the extent of the body:
+    // its `funs` map holds the local functions' body cons trees, which are
+    // otherwise unreachable from any scanned root and would be freed by a
+    // relocating minor GC mid-body (bliss-6b2 #2). `env.child()` forks a whole
+    // Env struct, so — unlike `with_child_frame`, which mutates the already-
+    // registered env in place — the child needs its own guard.
+    let _child_root = LiveEnvRootGuard::new(&mut child_env);
     let __r = eval_progn(body, &mut child_env);
     // Multiple values produced in the child body must propagate to the caller;
     // env.child() forks the value registers (bliss-lb6.22).
@@ -13532,12 +13856,23 @@ fn bind_lambda_list_ex(
     let mut rest_bound = false;
     let mut saw_key = false;
     let mut allow_other_keys = force_allow_other_keys;
-    let mut key_specs: Vec<(String, String, BlissVal, Option<String>)> = Vec::new();
+    // Root the source spine and the args snapshot across &optional/&key/&aux
+    // default evaluation (bliss-6b2 #2): each eval_form(default) can relocate
+    // both the params cursor and the remaining unread args. The deferred &key
+    // default forms are held in a separately-rooted Vec so they survive from
+    // collection to the post-loop keyword pass.
+    let roots = bliss_rt::ShadowRootScope::new();
+    let mut args_owned: Vec<BlissVal> = args.to_vec();
+    let _args_guard = VecRootGuard::new(&mut args_owned);
+    let args: &[BlissVal] = &args_owned;
+    let mut key_default_forms: Vec<BlissVal> = Vec::new();
+    let _key_defaults_guard = VecRootGuard::new(&mut key_default_forms);
+    let mut key_specs: Vec<(String, String, usize, Option<String>)> = Vec::new();
 
-    let mut c = params_form;
-    while c.is_cons() {
-        let (elem, rest) = cp(c);
-        c = rest;
+    let c = roots.root(params_form);
+    while c.get().is_cons() {
+        let (elem, rest) = cp(c.get());
+        c.set(rest);
         if elem.is_symbol() {
             match sym_name(elem).as_str() {
                 "&OPTIONAL" => {
@@ -13609,7 +13944,9 @@ fn bind_lambda_list_ex(
             }
             Mode::Key => {
                 let (kw_bare, var, default_form, supp) = parse_key_spec(elem);
-                key_specs.push((kw_bare, var, default_form, supp));
+                let idx = key_default_forms.len();
+                key_default_forms.push(default_form);
+                key_specs.push((kw_bare, var, idx, supp));
             }
             Mode::Aux => {
                 let (var, default_form, _) = parse_var_spec(elem);
@@ -13647,17 +13984,18 @@ fn bind_lambda_list_ex(
             }
         }
 
-        for (kw_bare, var, default_form, supp) in &key_specs {
+        for (kw_bare, var, default_idx, supp) in &key_specs {
             if let Some(v) = find_key_arg(tail, kw_bare) {
                 env.define_local(var, v);
                 if let Some(sp) = supp {
                     env.define_local(sp, T);
                 }
             } else {
-                let dv = if *default_form == NIL {
+                let df = key_default_forms[*default_idx];
+                let dv = if df == NIL {
                     NIL
                 } else {
-                    eval_form(*default_form, env)?
+                    eval_form(df, env)?
                 };
                 env.define_local(var, dv);
                 if let Some(sp) = supp {
@@ -15347,7 +15685,10 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     let class_input = eval_form(class_form, env)?;
     let class = resolve_class_metaobject(env, class_input)?;
     let class_name = class_name_for_instance_class(class);
-    let initargs = evaluated_initargs(&class_name, init_args, env)?;
+    let mut initargs = evaluated_initargs(&class_name, init_args, env)?;
+    // Keep initargs rooted across make_instance, the initforms, and the user
+    // :after methods below — all of which allocate (bliss-6b2 #2).
+    let _ig = VecRootGuard::new(&mut initargs);
     let explicit_slots: Vec<String> = initargs
         .chunks_exact(2)
         .map(|pair| symbol_bare_name(&sym_name(pair[0])))
@@ -15368,10 +15709,12 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     let mut ii_args = Vec::with_capacity(initargs.len() + 1);
     ii_args.push(instance);
     ii_args.extend_from_slice(&initargs);
+    let _iig = VecRootGuard::new(&mut ii_args);
     let mut si_args = Vec::with_capacity(initargs.len() + 2);
     si_args.push(instance);
     si_args.push(T);
     si_args.extend_from_slice(&initargs);
+    let _sig = VecRootGuard::new(&mut si_args);
     run_initialization_aux_methods(
         env,
         "SHARED-INITIALIZE",
@@ -15794,12 +16137,14 @@ fn round_half_even(x: f64) -> i64 {
 }
 
 fn eval_floor(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (af, r) = cp(cdr);
-    let a = eval_form(af, env)?;
+    let args = eval_args(cdr, env)?;
+    if args.is_empty() {
+        return Err(BlissError::Internal("FLOOR requires an argument".into()));
+    }
+    let a = args[0];
     let av = num_val(a)?;
-    if r.is_cons() {
-        let (bf, _) = cp(r);
-        let b = eval_form(bf, env)?;
+    if args.len() >= 2 {
+        let b = args[1];
         let bv = num_val(b)?;
         if bv == 0.0 {
             return Err(BlissError::ArithmeticError("division by zero".into()));
@@ -16112,13 +16457,7 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (_continue_form, rest) = cp(cdr);
     let (datum_form, arg_forms) = cp(rest);
     let datum = eval_form(datum_form, env)?;
-    let mut args = Vec::new();
-    let mut cursor = arg_forms;
-    while cursor.is_cons() {
-        let (arg, next) = cp(cursor);
-        args.push(eval_form(arg, env)?);
-        cursor = next;
-    }
+    let args = eval_args(arg_forms, env)?;
     // (cerror continue-control datum &rest args): datum may be a condition
     // instance, a condition-type symbol (built via MAKE-CONDITION), or a
     // format-control string (→ SIMPLE-ERROR).
@@ -16381,22 +16720,22 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
 
 // ── FORMAT ───────────────────────────────────────────────────────
 fn eval_format(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    // Root the source cursor, the evaluated destination, and the format-arg
+    // spine across each evaluation (bliss-6b2 #2): a young form list relocates
+    // under a minor GC fired inside eval_form.
+    let roots = bliss_rt::ShadowRootScope::new();
     let (df, r) = cp(args);
-    let dest = eval_form(df, env)?;
-    let (ff, fa) = cp(r);
+    let r = roots.root(r);
+    let dest = roots.root(eval_form(df, env)?);
+    let (ff, fa) = cp(r.get());
+    let fa = roots.root(fa);
     let fv = eval_form(ff, env)?;
     let fs = val_as_str(fv);
-    let mut av = Vec::new();
-    let mut c = fa;
-    while c.is_cons() {
-        let (af, r2) = cp(c);
-        av.push(eval_form(af, env)?);
-        c = r2;
-    }
+    let av = eval_args(fa.get(), env)?;
     // Park the env so the formatter's `~A`/`~S` can dispatch user print-object
     // methods (via stdlib_print_object_hook → dispatch_print_object).
     let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));
-    let result = bliss_stdlib::format(dest, &fs, &av);
+    let result = bliss_stdlib::format(dest.get(), &fs, &av);
     PRINT_ENV.with(|c| c.set(prev_env));
     result
 }
