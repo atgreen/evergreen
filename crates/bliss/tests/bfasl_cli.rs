@@ -1110,6 +1110,54 @@ fn corrupt_makeclosure_reference_is_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A `#p"…"` pathname literal in a top-level form must survive compile-file:
+/// the portable compiler can't lower a `defun`, so it falls back to serialising
+/// the form as data — which requires the constant pool to represent the pathname
+/// (as its namestring, rebuilt with parse-namestring on load). uiop's
+/// `null-device-pathname` returns `#p"/dev/null"`; without pooling support the
+/// whole file failed to compile (bliss-lb6).
+#[test]
+fn pathname_literal_bfasl_round_trips() {
+    let dir = workdir("pathname-lit");
+    let src = dir.join("p.lisp");
+    let out = dir.join("p.bfasl");
+    fs::write(
+        &src,
+        "(defun devnull () #p\"/dev/null\")\n\
+         (defun in-dir () #p\"/tmp/sub/file.txt\")\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+
+    let l = run(&format!(
+        "(progn (load \"{}\") \
+           (list (pathnamep (devnull)) (namestring (devnull)) \
+                 (pathnamep (in-dir)) (namestring (in-dir))))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&l.stdout).trim(),
+        "(T \"/dev/null\" T \"/tmp/sub/file.txt\")",
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A `PushRestartCase` selects its clause table by index at run time
 /// (`func.restart_cases[rc]`); the loader must reject an out-of-range index
 /// before the instruction can execute, rather than panic on the Vec index

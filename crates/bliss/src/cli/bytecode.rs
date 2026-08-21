@@ -5402,7 +5402,7 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // clause body PC, var slot) serialize in a new auxiliary table (kind 9).
 // A BBU is authoritative: an unsupported version is rejected, never replaced
 // by executing source text from the container.
-const BBU_BYTECODE_VERSION: u16 = 0x0107;
+const BBU_BYTECODE_VERSION: u16 = 0x0108;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -5596,6 +5596,20 @@ impl BbuConstPool {
             put_u8(&mut bytes, 17);
             put_u32(&mut bytes, num_ref);
             put_u32(&mut bytes, den_ref);
+            return Some(self.intern_encoded(bytes));
+        }
+        // A `#p"…"` pathname literal → pool its namestring and reconstruct with
+        // parse-namestring on load. Pathnames are store-registered values (keyed
+        // by their bits), so a fresh process must rebuild them; the namestring
+        // faithfully round-trips a source literal. Needed for the load-source
+        // fallback of forms embedding pathname literals (uiop's
+        // null-device-pathname => #p"/dev/null").
+        if bliss_stdlib::pathnames::is_pathname(v) {
+            let ns = bliss_stdlib::pathnames::namestring(v).ok()?;
+            let name_ref = self.string(&val_as_str(ns));
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 18);
+            put_u32(&mut bytes, name_ref);
             return Some(self.intern_encoded(bytes));
         }
         // A literal simple-vector (e.g. `#(…)` in source) → pool its elements and
@@ -6558,6 +6572,11 @@ enum BbuConstant {
     UninternedSymbol(u32),
     /// A ratio: numerator and denominator constant refs (each an integer).
     Ratio(u32, u32),
+    /// A `#p"…"` pathname literal, stored as its namestring (a string constant
+    /// ref) and reconstructed with `parse-namestring` on load. Pathnames are
+    /// store-registered values, not plain heap objects, so they cannot be pooled
+    /// structurally; the namestring round-trips a source-level literal faithfully.
+    Pathname { name_ref: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -6738,6 +6757,9 @@ fn parse_bbu_constant(
             let den_ref = cursor.u32()?;
             BbuConstant::Ratio(num_ref, den_ref)
         }
+        18 => BbuConstant::Pathname {
+            name_ref: cursor.u32()?,
+        },
         tag => return Err(bbu_error(format!("unsupported constant tag {tag}"))),
     })
 }
@@ -6993,6 +7015,13 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<BlissVal>,
                     bbu_error(format!("forward/cyclic ratio reference at {index}"))
                 })?;
                 super::alloc_ratio_cli(num, den)
+            }
+            BbuConstant::Pathname { name_ref } => {
+                // Rebuild the pathname from its namestring via parse-namestring so
+                // it re-registers in this process's pathname store (bliss-jtc.23 /
+                // load-source fallback for pathname literals).
+                let ns = arena_str(bbu_string(constants, *name_ref)?);
+                bliss_stdlib::pathnames::parse_namestring(ns, None, None)?.0
             }
             BbuConstant::Cons(car_ref, cdr_ref) => {
                 // The writer emits structural children before their parent.
