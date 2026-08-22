@@ -103,7 +103,7 @@ R13.06).
 | 6 | Compiler/code-cache and debugger-metadata locks | Code installation, compiler registries, IC/debug trap coordination | §4, §6 | — |
 | 7 | Profiling-data locks | Sampling, allocation, instrumentation and tier-promotion data | §4.9, §6 | Ordered by the declared profiler sub-order. |
 | 8 | GC world and external-root locks | Heap state, root scanners, weak/finalizer registries, all side tables containing relocatable `BlissVal`s | §3.9 | The heap lock has sub-order 1; root side tables have larger sub-orders. |
-| 9 | Execution and scheduler registries | Native-thread/fiber registries, scheduler groups, timer/I/O registries, SWANK connection registry | §2.3, §13.7 | Must precede per-execution objects. |
+| 9 | Execution and scheduler registries | Native-thread/fiber registries, scheduler groups, timer/I/O registries, any IDE-backend connection registry (owned by the loaded SLIME/SLY backend, §6.1.5, when it runs multi-threaded) | §2.3, §13.7 | Must precede per-execution objects. |
 | 10 | Per-execution object locks | Native-thread/fiber state, stacks and individual connection objects | §2.3 | Ordered by stable object identity when multiple objects are needed. |
 | 11 | Image save mutex | Heap serialisation to `.bimg` | §7 | Highest level — no other lock may be acquired while held. |
 

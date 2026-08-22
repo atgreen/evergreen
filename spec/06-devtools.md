@@ -67,14 +67,23 @@ programmatically from CL code or an IDE protocol connection.
 
 ### 6.1.5 IDE Protocol
 
+IDE integration (SLIME/SLY, and its wire protocol variously called SWANK or
+Slynk) is **not** built into the Bliss runtime. The protocol is large, tracks
+the editor's releases, and is already maintained upstream; reimplementing it in
+the core would duplicate library behaviour and drift. Instead — exactly as on
+SBCL — Bliss loads a standard upstream backend (`slynk` or `swank`) as an
+ordinary Common Lisp library, and the runtime's job is to provide the primitives
+that backend depends on. A vendored copy of the backend lives under `lib/slynk/`
+with a thin Bliss adapter (`communication-style nil`, single-threaded).
+
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R6.33 | Bliss MUST implement the SWANK protocol for SLIME/SLY compatibility. | MUST |
-| R6.34 | The SWANK server MUST support: `eval`, `compile-string`, `compile-file`, `completions`, `arglist`, `find-definitions`, `macroexpand-1`, `macroexpand-all`, `inspect`, `xref` (callers/callees), `apropos`, `describe`. | MUST |
-| R6.35 | The SWANK server MUST support multiple simultaneous connections (each with its own REPL thread, `*standard-input*`, `*standard-output*`). | MUST |
-| R6.36 | Bliss SHOULD also provide an LSP (Language Server Protocol) server for non-Emacs editors, reusing the same backend operations. | SHOULD |
-| R6.37 | IDE protocol connections MUST be authenticated via a per-session secret file (`~/.bliss/swank-auth`), following the SLIME security model. | MUST |
-| R6.38 | The IDE protocol MUST support thread-listing and thread-focused debugging (select which thread to debug). | MUST |
+| R6.33 | Bliss MUST support SLIME/SLY-based IDE integration by loading a standard upstream backend (`slynk` or `swank`) as an ordinary library, the same way that backend loads on SBCL. Bliss MUST NOT build the IDE wire protocol (message framing, `:emacs-rex` dispatch, the eval/inspect/debug RPCs) into the runtime. | MUST |
+| R6.34 | To host such a backend, Bliss MUST provide the runtime primitives it depends on: TCP stream sockets (listen / accept / local-port / connect / close), `(unsigned-byte 8)` socket streams supporting framed octet I/O (`read-sequence`/`write-sequence`/`read-byte`/`write-byte` and an explicit `finish-output` that flushes to the descriptor), and a blocking single-threaded (`communication-style nil`) serve loop that can be driven entirely from Lisp. | MUST |
+| R6.35 | The introspection operations a SLIME/SLY backend composes MUST be available to loaded Lisp code so that eval, completion, arglist hints, cross-reference, and the inspector work through it: `macroexpand-1`/`macroexpand-all`, function arglists (§9), `find-definitions` and `xref` (callers/callees), `apropos`, `describe`, `inspect`, `compile-string`/`compile-file`, and symbol completion. | MUST |
+| R6.36 | Bliss SHOULD also support an LSP (Language Server Protocol) server for non-Emacs editors, likewise loaded as a library over the same introspection primitives. | SHOULD |
+| R6.37 | Connection authentication and the SLIME security model are the loaded backend's responsibility; Bliss MUST provide the file and socket primitives it uses for a per-session secret, and MUST default socket binding to localhost (`127.0.0.1`). | MUST |
+| R6.38 | When Bliss's threading model (§13) provides threads, the loaded backend MUST be able to enumerate them and drive thread-focused debugging through Bliss's thread-introspection primitives; a single-threaded (`communication-style nil`) backend is permitted when threads are unavailable. | MUST |
 
 ### 6.1.6 Trace, Describe, Inspect, Room, Time
 
@@ -176,13 +185,20 @@ A runtime representation of a single stack frame exposed to the debugger.
 | `alloc-bytes` | `(or null fixnum)` | Non-nil for allocation profiler |
 | `alloc-count` | `(or null fixnum)` | Non-nil for allocation profiler |
 
-### D6.07 — `swank-connection`
+### D6.07 — `swank-connection` (informative)
+
+This connection state is maintained by the **loaded** IDE backend
+(`lib/slynk/`), not by the Bliss runtime — it is documented here only so the
+primitives §6.1.5 requires can be traced to a concrete consumer. Bliss supplies
+the `socket` stream (an `(unsigned-byte 8)` TCP stream, R6.34) and, when threads
+are available (§13), the `thread`/`repl-thread` objects; the remaining fields are
+purely the backend's bookkeeping.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `socket` | `stream` | Bidirectional socket stream |
-| `thread` | `thread` | Dedicated I/O thread for this connection |
-| `repl-thread` | `thread` | REPL evaluation thread |
+| `socket` | `stream` | Bidirectional `(unsigned-byte 8)` socket stream (provided by Bliss) |
+| `thread` | `thread` | Dedicated I/O thread for this connection (multi-threaded style only) |
+| `repl-thread` | `thread` | REPL evaluation thread (multi-threaded style only) |
 | `auth-token` | `string` | Session secret for authentication |
 | `buffer-package` | `package` | Current package for this connection |
 | `pending-returns` | `hash-table` | Continuation-id → callback |
@@ -366,24 +382,30 @@ inserting an allocation-site callback:
    profiler MAY sample (e.g., every Nth allocation) to reduce overhead
    for allocation-heavy workloads.
 
-### 6.3.7 SWANK Protocol Dispatch — A6.07
+### 6.3.7 IDE Protocol Dispatch — A6.07 (informative)
+
+The dispatch loop below is implemented by the **loaded** backend (`lib/slynk/`),
+not by the Bliss runtime; it is shown to make the primitive requirements of
+§6.1.5 concrete. Bliss's contribution is the framed `(unsigned-byte 8)` socket
+I/O (R6.34) that `read-message`/`write-message` build on, the reader/evaluator,
+and the introspection operations `eval-for-emacs` calls (R6.35).
 
 ```text
-PROCEDURE swank-serve(connection):
+PROCEDURE serve(connection):                 // backend code, running on Bliss
   LOOP:
-    message ← read-swank-message(connection.socket)
+    message ← read-message(connection.socket) // framed 6-hex-digit length + s-expr
     CASE message.type OF
-      :emacs-rex  → spawn-or-reuse-thread:
-                      result ← eval-for-emacs(message.form, message.package)
-                      send-to-emacs(connection, (:return (:ok result) message.id))
-      :emacs-interrupt → interrupt-thread(connection.repl-thread)
+      :emacs-rex  → result ← eval-for-emacs(message.form, message.package)
+                    send-to-emacs(connection, (:return (:ok result) message.id))
+      :emacs-interrupt → interrupt(connection.repl-thread)
       :emacs-channel-send → dispatch-channel(message)
 ```
 
-Each `:emacs-rex` evaluation runs on the connection's REPL thread
-(or a fresh thread for concurrent requests when SLIME's
-`:spawn` communication style is used). Thread-safety: the
-connection's `pending-returns` table is protected by a lock.
+Under `communication-style nil` (the single-threaded style Bliss uses today)
+`serve` runs the whole loop on the calling thread and evaluates each `:emacs-rex`
+inline. When Bliss's threading model (§13) provides threads, the same backend can
+run the multi-threaded style, evaluating on a per-connection REPL thread with the
+`pending-returns` table under a lock.
 
 ---
 
@@ -625,8 +647,8 @@ consists of:
 | Profiler sample rate | 1000 Hz | `BLISS_PROF_RATE` | Samples per second (10–10000) |
 | Profiler max depth | 64 frames | `BLISS_PROF_DEPTH` | Maximum backtrace depth per sample |
 | Profiler sample buffer | 1 M samples | `BLISS_PROF_BUFSIZE` | Ring buffer capacity |
-| SWANK port | 4005 | `BLISS_SWANK_PORT` | Default SWANK listen port |
-| SWANK interface | `127.0.0.1` | `BLISS_SWANK_HOST` | Bind address (localhost-only by default for security) |
+| IDE backend listen port | 4005 | — | Default port the loaded backend (`lib/slynk/`) listens on; chosen by the editor/backend, not a runtime knob |
+| IDE backend interface | `127.0.0.1` | — | Bind address; Bliss's socket primitives default to localhost-only for security (R6.37) |
 | ASDF output dir | `~/.cache/bliss/asdf/` | `BLISS_ASDF_CACHE` | Output translation root |
 | Debug default quality | 1 | `BLISS_DEBUG` | Default `(optimize (debug N))` |
 
@@ -663,14 +685,15 @@ lib/
   trace.lisp             # §6.4 — trace/untrace implementation
   profiler.lisp          # CL API: with-profiling, report-profile
   disassemble.lisp       # §6.1.4 — disassemble, source annotation
-  swank/
-    server.lisp          # §6.3.7 — SWANK server, connection management
-    protocol.lisp        # Wire protocol (S-expression encoding)
-    rpc.lisp             # :emacs-rex dispatch table
-    inspector.lisp       # SWANK inspector integration
-    debug.lisp           # SWANK debugger integration (SLDB)
-    completions.lisp     # Completion backend for IDE
-    xref.lisp            # Cross-reference database queries
+  slynk/                 # §6.1.5 — VENDORED upstream SLIME/SLY backend, loaded
+                         #   as a library (NOT a built-in server). Bliss only
+                         #   adds the adapter + prelude below.
+    slynk.lisp           # upstream: message loop, RPCs, inspector, SLDB
+    slynk-rpc.lisp       # upstream: wire protocol (framed s-expressions)
+    slynk-completion.lisp# upstream: completion backend
+    backend/bliss.lisp   # Bliss adapter: sockets, streams, getpid, compile hooks
+    bliss-prelude.lisp   # Bliss shims the upstream code expects
+    bliss-slynk-patch.lisp # single-threaded serve-requests + auth disabling
   asdf.lisp              # Bundled ASDF source
   asdf-integration.lisp  # §6.8 — require hook, output translations
 ```
@@ -687,7 +710,7 @@ lib/
 | Sampling profiler | Run a known CPU-bound loop, verify the top function in the report matches | Self-time of target function > 80% of total; overhead < 5% |
 | Allocation profiler | Allocate known quantities of known types, verify report matches | Reported counts and sizes within 1% of actual |
 | Disassembler | Compile a known function, verify disassembly contains expected instruction patterns | Source annotations point to correct line numbers |
-| SWANK | SLIME test suite (`slime-tests.el`) run against Bliss backend | All SLIME core tests pass (completion, arglist, find-definition, inspector, debugger) |
+| IDE protocol | Load the vendored `lib/slynk/` backend into `bliss`, have it listen, connect a SLIME/SLY client (e.g. `icl`), and exercise the handshake | Client verifies the connection, injects its runtime, and round-trips eval + completion; replies are delivered (framed octets reach the socket) |
 | Trace | Trace a function, call it, verify `*trace-output*` contains expected entry/exit lines | Nested call depth indentation is correct |
 | `room` | Allocate known objects, call `room t`, parse output, verify reported sizes | Nursery/old-gen sizes within 10% of expected |
 | `time` | Time a known-duration form (busy loop), verify wall-clock and bytes-consed | Wall-clock within 20% of expected; bytes-consed accurate |

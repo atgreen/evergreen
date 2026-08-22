@@ -47,7 +47,7 @@
 | **`.bimg`** | The Bliss image file format: a memory-mapped snapshot of the heap, symbol table, package registry, and compiled code cache. | §7.2 (D7.01) |
 | **Relocation table** | A delta-encoded list of heap offsets requiring pointer adjustment when an image is loaded at a different base address. | §7.2.10 (A7.01) |
 | **C3 linearisation** | The algorithm for computing the Class Precedence List (CPL) in CLOS, ensuring a monotonic, consistent ordering of superclasses. | §5.3 (R5.11) |
-| **SWANK** | The IDE communication protocol (SLIME/SLY compatible) providing eval, completion, debugging, and inspection over a socket connection. | §6.1.5, §6.3.7 (D6.07) |
+| **SWANK / Slynk** | The IDE communication protocol (SLIME/SLY compatible) providing eval, completion, debugging, and inspection over a socket connection. Bliss does not implement it; it loads a standard upstream backend as a library and provides the socket/introspection primitives (§6.1.5). | §6.1.5, §6.3.7 (D6.07) |
 | **Trampoline** | A small executable code stub used for FFI callbacks; allocated from a pool of executable pages and freed when the CL callback object is GC'd. | §2.7.5 |
 | **Frame pointer chain** | The linked list of `prev_fp` pointers in CL stack frames enabling O(n) stack walks for debugging and GC root scanning. | §2.4.2 (D2.02) |
 | **AlienType** | The enum describing foreign (C) types for FFI marshalling: Void, Int, Float, Double, Pointer, Struct, Union, FnPtr. | §2.7.2 (D2.03) |
@@ -148,7 +148,7 @@
 | D6.04 | profiler-sample | §6.2 | Sampling profiler record (timestamp, thread, PC, backtrace) |
 | D6.05 | profiler-report | §6.2 | Aggregated profiler report (kind, total samples, entries) |
 | D6.06 | profiler-entry | §6.2 | Per-function profiler statistics (self/total time, alloc) |
-| D6.07 | swank-connection | §6.2 | SWANK IDE protocol connection state |
+| D6.07 | swank-connection | §6.2 | IDE protocol connection state (maintained by the loaded backend; informative) |
 | D7.01 | Image Header | §7.2.3 | 128-byte .bimg file header (magic, version, platform, checksum) |
 | D7.02 | Section Directory | §7.2.5 | Per-section entry in image file (type, offset, size) |
 | D8.01 | CapabilitySet | §8.2.2 | u64 bitfield of sandbox capabilities (deny-by-default) |
@@ -206,7 +206,7 @@
 | A6.04a | Watchpoint Implementation | §6.3.4a | Guarded cells for special vars; compiler instrumentation for lexicals |
 | A6.05 | Sampling Profiler | §6.3.5 | SIGPROF-based PC sampling into lock-free ring buffer |
 | A6.06 | Allocation Profiler | §6.3.6 | TLAB callback recording allocation site, type, and size |
-| A6.07 | SWANK Protocol Dispatch | §6.3.7 | Message-type dispatch for :emacs-rex, :emacs-interrupt, etc. |
+| A6.07 | IDE Protocol Dispatch | §6.3.7 | Message-type dispatch for :emacs-rex, :emacs-interrupt, etc. (implemented by the loaded backend; informative) |
 | A7.01 | Pointer Relocation | §7.2.10 | O(n) delta-decoded relocation pass on image load |
 | A7.02 | Save Atomicity | §7.2.12 | Write to temp file → fsync → atomic rename |
 | A8.01 | FFI Pointer Validation | §8.3.2 | Null-check + alignment check before dereference |
