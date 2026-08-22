@@ -43,11 +43,6 @@ pub struct CliArgs {
     /// FILE, continuing past errors, and print a categorized punch-list of the
     /// forms that failed. A diagnostic aid for bring-up (e.g. loading ASDF).
     pub load_report: Option<String>,
-    /// `--slynk [PORT]`: start a minimal SLY/SLIME-protocol server on
-    /// 127.0.0.1:PORT (default 4005) instead of the REPL, so an editor or
-    /// `icl --connect host:port` can drive this evaluator. Runs single-threaded
-    /// and blocking on the main thread (bliss's runtime is thread-local).
-    pub slynk: Option<u16>,
 }
 
 impl CliArgs {
@@ -62,7 +57,6 @@ impl CliArgs {
         let mut version = false;
         let mut script = None;
         let mut load_report = None;
-        let mut slynk: Option<u16> = None;
         let mut saw_double_dash = false;
 
         let mut i = 0;
@@ -132,21 +126,6 @@ impl CliArgs {
                     load_report = Some(value.clone());
                     i += 2;
                 }
-                "--slynk" | "--swank" => {
-                    // Optional PORT argument; a bare `--slynk` uses the SLIME
-                    // default port 4005. The next token counts as the port only
-                    // if it is a plain number (not another flag/script).
-                    let port = args
-                        .get(i + 1)
-                        .and_then(|v| v.parse::<u16>().ok());
-                    if let Some(p) = port {
-                        slynk = Some(p);
-                        i += 2;
-                    } else {
-                        slynk = Some(4005);
-                        i += 1;
-                    }
-                }
                 s if s.starts_with('-') => {
                     return Err(BlissError::Internal(format!("unknown flag: {}", s)));
                 }
@@ -183,7 +162,6 @@ impl CliArgs {
             cl_args,
             script,
             load_report,
-            slynk,
         };
         if r.image.is_some() && r.no_image {
             return Err(BlissError::Internal(
@@ -18091,7 +18069,6 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         && ca.eval.is_none()
         && ca.load.is_none()
         && ca.script.is_none()
-        && ca.slynk.is_none()
     {
         load_init_file(&mut env);
     }
@@ -18121,9 +18098,6 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     if let Some(ref script) = ca.script {
         return run_script_env(script, &mut env);
     }
-    if let Some(port) = ca.slynk {
-        return run_slynk_server(port, &mut env);
-    }
     // No explicit batch mode: if a loaded image recorded a top-level entry point
     // (SBCL :toplevel), run it as the program's main; otherwise drop to the REPL.
     // Restricted to the saved-executable / `--image` paths so a plain REPL is
@@ -18140,109 +18114,6 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         }
     }
     run_repl_env(&mut env)
-}
-
-/// A minimal SLY/SLIME-protocol server (spec §6.1, editor integration). It
-/// speaks the wire framing every SLIME/SLY client uses — a 6-hex-digit byte
-/// length followed by a `prin1`ed s-expression and a trailing newline — and the
-/// event protocol's request/response pair: it reads `(:emacs-rex FORM PACKAGE
-/// THREAD ID)`, evaluates FORM in the real evaluator, and replies `(:return
-/// (:ok VALUE) ID)` (or `(:return (:abort "…") ID)` on error). That is exactly
-/// what `icl --connect host:port` needs: its slynk-client sends raw forms —
-/// `cl:t` to verify the link, then `(cl:eval (cl:read-from-string "…"))` for
-/// each REPL entry — and reads back the value. Runs single-threaded and blocking
-/// on the calling (main) thread, since the bliss runtime is thread-local; one
-/// client is served at a time.
-fn run_slynk_server(port: u16, env: &mut Env) -> Result<i32, BlissError> {
-    use std::io::{Read, Write};
-    let addr = format!("127.0.0.1:{port}");
-    let listener = std::net::TcpListener::bind(&addr)
-        .map_err(|e| BlissError::Internal(format!("slynk: cannot bind {addr}: {e}")))?;
-    // Ensure the reader hooks the evaluator relies on are installed even if no
-    // prior read_eval_all_env ran (e.g. --no-bootstrap).
-    reader::set_read_eval_hook(Some(read_time_eval));
-    reader::set_symbol_resolver(Some(reader_symbol_resolver));
-    reader::set_pathname_constructor(Some(reader_pathname_constructor));
-    bliss_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
-    let _env_roots = LiveEnvRootGuard::new(env);
-    // Standard REPL history variables (CLHS 25.1.1). A SLIME/SLY client's eval
-    // wrapper reads and `setf`s `*`/`**`/`***` (and expects `+`/`/`/`-` to
-    // exist) after each form; without them the first evaluation fails with
-    // "unbound variable: **". Defining the value cells does not disturb the
-    // same-named `*`/`+`/`/`/`-` functions (separate cells).
-    for var in ["*", "**", "***", "+", "++", "+++", "/", "//", "///", "-"] {
-        if let Ok((form, _)) =
-            reader::read_from_string(&format!("(common-lisp:defparameter {var} common-lisp:nil)"))
-        {
-            let _ = bytecode::eval_toplevel(form, env);
-        }
-    }
-    eprintln!(";; bliss slynk server: listening on {addr} (connect with `icl --connect {addr}`)");
-    ARENA.with(|a| a.borrow_mut().promote_all());
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let _ = stream.set_nodelay(true);
-        eprintln!(";; slynk: client connected");
-        loop {
-            // 6-hex-digit length header.
-            let mut hdr = [0u8; 6];
-            if stream.read_exact(&mut hdr).is_err() {
-                break;
-            }
-            let len = match std::str::from_utf8(&hdr)
-                .ok()
-                .and_then(|s| usize::from_str_radix(s.trim(), 16).ok())
-            {
-                Some(n) if (1..64 * 1024 * 1024).contains(&n) => n,
-                _ => break,
-            };
-            let mut buf = vec![0u8; len];
-            if stream.read_exact(&mut buf).is_err() {
-                break;
-            }
-            let payload = String::from_utf8_lossy(&buf);
-            if let Some(resp) = slynk_handle_message(payload.trim(), env) {
-                let body = format!("{resp}\n");
-                let framed = format!("{:06X}{}", body.as_bytes().len(), body);
-                if stream.write_all(framed.as_bytes()).is_err() || stream.flush().is_err() {
-                    break;
-                }
-            }
-            // The freshly read/evaluated objects survive in `env`; keep them.
-            ARENA.with(|a| a.borrow_mut().promote_all());
-        }
-        eprintln!(";; slynk: client disconnected");
-    }
-    Ok(0)
-}
-
-/// Handle one decoded SLIME message. Returns the response s-expression to frame
-/// back, or `None` for events that expect no reply (e.g. `:emacs-interrupt`).
-fn slynk_handle_message(payload: &str, env: &mut Env) -> Option<String> {
-    let (message, _) = reader::read_from_string(payload).ok()?;
-    let items = list_to_vec(message);
-    let head = items.first().copied()?;
-    if !head.is_symbol() || symbol_bare_name(&sym_name(head)) != "EMACS-REX" {
-        // :emacs-interrupt and friends: the client isn't blocked on a :return.
-        return None;
-    }
-    // (:emacs-rex FORM PACKAGE-NAME THREAD ID)
-    let form = items.get(1).copied().unwrap_or(NIL);
-    let id = items.get(4).and_then(|v| v.is_fixnum().then(|| v.as_fixnum())).unwrap_or(0);
-    match bytecode::eval_toplevel(form, env) {
-        Ok(value) => Some(format!(
-            "(:return (:ok {}) {})",
-            format_val_env(value, env, true),
-            id
-        )),
-        Err(e) => {
-            let reason = describe_err(&e).replace('\\', "\\\\").replace('"', "\\\"");
-            Some(format!("(:return (:abort \"{}\") {})", reason, id))
-        }
-    }
 }
 
 /// Collapse a form's source to a single-line, length-capped preview keyed by its
