@@ -2417,8 +2417,16 @@ impl<'e> Lowerer<'e> {
                     i += 2;
                 }
                 Some("WHILE") => {
+                    // `while`/`until` execute in TEXTUAL order relative to the
+                    // `for VAR = FORM` re-evaluation, which lands in `pre` (runs
+                    // after `top_tests`). Emitting the test here (into `pre`)
+                    // rather than `top_tests` makes `(loop :for x = (next)
+                    // :until (done x) :collect x)` test the CURRENT `x`, so the
+                    // terminating value is not collected (CLHS 6.1.2.1 / 6.1.9;
+                    // was: an off-by-one that collected the sentinel — e.g. asdf's
+                    // slurp-stream-forms appended its EOF marker).
                     let test = *forms.get(i + 1).ok_or(Bail)?;
-                    top_tests.push(form_list(&[
+                    pre.push(form_list(&[
                         s("WHEN")?,
                         form_list(&[s("NOT")?, test]),
                         form_list(&[s("GO")?, end]),
@@ -2427,7 +2435,7 @@ impl<'e> Lowerer<'e> {
                 }
                 Some("UNTIL") => {
                     let test = *forms.get(i + 1).ok_or(Bail)?;
-                    top_tests.push(form_list(&[
+                    pre.push(form_list(&[
                         s("WHEN")?,
                         test,
                         form_list(&[s("GO")?, end]),
@@ -6991,15 +6999,28 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<BlissVal>,
                             continue;
                         }
                         // Not yet ensured (a package DEFINED in this same unit by a
-                        // later action): allocate under the canonical `"PKG::NAME"`
-                        // key. The in-unit export reconciles to this very symbol via
-                        // `bbu_direct_symbol_for_package` when EnsurePackage later
-                        // runs, keeping identity stable. Both internal (0) and
-                        // external (3) use `::` so a later export cannot diverge.
+                        // later action or a load-source `define-package`): CREATE the
+                        // package object now (empty) so the symbol interns through the
+                        // package system as its CANONICAL identity. A raw
+                        // `symbols::intern("PKG::NAME")` here would mint a DIFFERENT
+                        // identity than the package system's symbol, and the later
+                        // define-package (many of asdf's use :import-from/:recycle and
+                        // load via the source fallback, so they never hit the
+                        // EnsurePackage reconciliation) would then diverge — splitting
+                        // param bindings, CLOS slot layouts and special-variable value
+                        // cells (bliss-e7t). The later define-package finds this
+                        // existing package and reconciles into it (it is idempotent by
+                        // design, for upgrades). Interning internal is correct even for
+                        // an external (kind 3) symbol: a later `:export` exports this
+                        // same identity without changing it.
                         let _ = kind;
-                        BlissVal::from_symbol_index(bliss_rt::symbols::intern(&format!(
-                            "{package_name}::{name}"
-                        )))
+                        reader::register_package(package_name);
+                        let package = match bliss_stdlib::find_package(package_name) {
+                            Some(package) => package,
+                            None => bliss_stdlib::make_package(package_name, &[], &[])?,
+                        };
+                        let (sym, _) = bliss_stdlib::intern(name, package)?;
+                        sym
                     }
                     (_, kind) => return Err(bbu_error(format!("invalid symbol kind {kind}"))),
                 }
@@ -8265,13 +8286,29 @@ fn bind_variadic(
     env: &mut Env,
 ) -> Result<(), BlissError> {
     let parent = Rc::clone(&env.frame);
+    // `param_layout` names are frozen into the .bfasl at compile time, but
+    // `bind_lambda_list` binds each parameter under its *live* symbol's
+    // rendered name (`define_local_symbol` keys `vars` by `sym_name`). A
+    // symbol's rendered name can differ between compile and load — e.g. a
+    // package-internal symbol renders `PKG::NAME` after a source-free load but
+    // was `PKG:NAME` when the layout string was captured — so the frozen key
+    // may not match the live binding, silently yielding NIL for a required
+    // parameter (bliss-e7t: UIOP/PATHNAME:SPLIT-UNIX-NAMESTRING-...). Re-derive
+    // the lookup names from the live `params_form` (same order, same symbols
+    // bind_lambda_list just used) so the keys always match.
+    let live_names = parse_lambda_list(func.params_form).map(|(names, ..)| names);
     super::with_child_frame(env, parent, |env| {
         super::bind_lambda_list(func.params_form, args, env)?;
         // Argument/default evaluation is a single-value context.
         env.clear_mv();
         let cur = Rc::clone(&env.frame);
-        for (name, loc) in &func.param_layout {
-            let v = super::Env::lookup_frame(&cur, name).unwrap_or(NIL);
+        for (i, (name, loc)) in func.param_layout.iter().enumerate() {
+            let key = live_names
+                .as_ref()
+                .and_then(|n| n.get(i))
+                .map(String::as_str)
+                .unwrap_or(name.as_str());
+            let v = super::Env::lookup_frame(&cur, key).unwrap_or(NIL);
             match loc {
                 VarLoc::Slot(s) => unsafe { slot_set(frame, *s, v) },
                 VarLoc::Boxed => bind_boxed_param(
@@ -8299,8 +8336,16 @@ fn bind_macro_variadic(
         super::bind_macro_lambda_list(func.params_form, args, env, None, None)?;
         env.clear_mv();
         let current = Rc::clone(&env.frame);
-        for (name, location) in &func.param_layout {
-            let value = super::Env::lookup_frame(&current, name).unwrap_or(NIL);
+        // See bind_variadic: re-derive lookup keys from the live params_form so
+        // a compile-vs-load symbol-rendering change can't orphan a parameter.
+        let live_names = parse_macro_lambda_list(func.params_form).map(|(names, ..)| names);
+        for (i, (name, location)) in func.param_layout.iter().enumerate() {
+            let key = live_names
+                .as_ref()
+                .and_then(|n| n.get(i))
+                .map(String::as_str)
+                .unwrap_or(name.as_str());
+            let value = super::Env::lookup_frame(&current, key).unwrap_or(NIL);
             match location {
                 VarLoc::Slot(slot) => unsafe { slot_set(frame, *slot, value) },
                 VarLoc::Boxed => bind_boxed_param(
@@ -10820,9 +10865,21 @@ fn run_native(
                     .unwrap_or_else(|| bliss_rt::FiberId(bliss_rt::current_thread_id().0)),
             )
         })?;
+    // A native-compiled env-capturing closure must run against its *captured*
+    // heap frame, exactly like the T1 path (`run_with_binding`): its body's
+    // `c2i_load_env`/`c2i_store_env` reach the enclosing lexicals through it.
+    // Building the frame as a child of the caller's `env.frame` instead loses
+    // those bindings — e.g. a T2-promoted `(lambda (x) (… separator))` passed to
+    // substitute-if reports `separator` unbound (bliss-e7t). `CLOSURE_ENV` is
+    // keyed by the closure's own symbol, which is this activation's `sym`.
+    let closure_env = CLOSURE_ENV.with(|m| m.borrow().get(&sym).cloned());
+    let parent = closure_env
+        .clone()
+        .unwrap_or_else(|| Rc::clone(&env.frame));
     let env_frame = bf
         .as_ref()
-        .and_then(|body| make_env_frame(body, Rc::clone(&env.frame)));
+        .and_then(|body| make_env_frame(body, parent))
+        .or(closure_env);
     // Bind both stack and captured parameters before entering native code. The
     // same heap frame is published through NATIVE_ENV_FRAME for environment
     // bytecodes and closure construction.

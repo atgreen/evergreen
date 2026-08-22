@@ -241,8 +241,51 @@ unsafe fn instance_slot_index(inst: BlissVal, slot_name: BlissVal) -> Option<usi
         if w.is_null() || (*w).layout.is_null() {
             return None;
         }
-        (*(*w).layout).index.get(&slot_name).copied()
+        let layout = &*(*w).layout;
+        if let Some(idx) = layout.index.get(&slot_name).copied() {
+            return Some(idx);
+        }
+        // Identity miss: fall back to matching by symbol name. A source-free
+        // .bfasl load can mint a duplicate symbol for a slot whose package was
+        // not yet ensured when a compiled method's constant pool materialized it
+        // (`PKG::NAME` rt-key vs the package system's canonical symbol) — so the
+        // slot defined by the tree-walked defclass and the one named by a
+        // compiled slot-value access are different identities with the same name
+        // (bliss-e7t: ASDF/COMPONENT::SOURCE-FILE). Match on name so the access
+        // still resolves. This is the same compile-vs-load rendering hazard the
+        // variadic binder guards against.
+        slot_name_index_fallback(layout, slot_name)
     }
+}
+
+/// Slow-path slot lookup by symbol name (see `instance_slot_index`). Only runs
+/// after an identity miss, so the linear scan never touches the hot path.
+/// Matches on the *bare* symbol name (package prefix stripped): the two
+/// duplicate identities can also disagree on export-status rendering
+/// (`PKG:NAME` vs `PKG::NAME`), so a full-key comparison would still miss.
+fn slot_name_index_fallback(layout: &SlotLayout, slot_name: BlissVal) -> Option<usize> {
+    if !slot_name.is_symbol() {
+        return None;
+    }
+    let target = bare_symbol_name(slot_name)?;
+    layout
+        .order
+        .iter()
+        .position(|&s| bare_symbol_name(s).as_deref() == Some(target.as_str()))
+}
+
+/// The symbol's name without any `PKG:`/`PKG::` package prefix.
+fn bare_symbol_name(sym: BlissVal) -> Option<String> {
+    if !sym.is_symbol() {
+        return None;
+    }
+    let key = bliss_rt::symbols::symbol_name(sym.as_symbol_index())?;
+    let bare = key
+        .rsplit_once("::")
+        .map(|(_, n)| n)
+        .or_else(|| key.rsplit_once(':').map(|(_, n)| n))
+        .unwrap_or(key.as_str());
+    Some(bare.to_string())
 }
 
 /// Qualifier for a method (for method combination).

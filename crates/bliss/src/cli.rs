@@ -16090,6 +16090,17 @@ fn apply_function(
             env.clear_mv();
             return apply_builtin(&name, args, env);
         }
+        // Direct dispatch for the hottest builtins whose cores take
+        // already-evaluated arguments. The general path below synthesizes a
+        // `(name 'arg …)` form and re-enters `eval_form`, allocating a quoted
+        // arg list per call — 2.2M times when loading a source-free asdf.bfasl
+        // (52% TYPEP, 22% GETHASH), which made the compiled load ~3x slower than
+        // the tree-walker source load (bliss perf). These branches call the SAME
+        // cores the operator-position handlers use, so results and multiple
+        // values stay bit-identical to the tree-walker (bliss-x5y.9).
+        if let Some(res) = apply_builtin_fast(&name, args, env) {
+            return res;
+        }
         // Builtin: synthesize `(name 'arg1 'arg2 ...)` and evaluate it so the
         // full operator-position builtin set (not just apply_builtin's subset)
         // is reachable through funcall/apply/mapcar.
@@ -16261,6 +16272,76 @@ fn is_builtin_function(name: &str) -> bool {
             | "CLASS-OF" | "CLASS-NAME" | "FIND-CLASS" | "SLOT-VALUE" | "SLOT-BOUNDP"
             | "MAKE-INSTANCE" | "COPY-STRUCTURE"
     )
+}
+
+/// Fast evaluated-args dispatch for the hottest builtins, avoiding the
+/// synthesize-a-form-and-re-eval detour in `apply_function`. Returns `None` when
+/// the name/arity is not fast-pathed, so the caller falls through to the general
+/// path. Each branch mirrors the SAME core its operator-position handler runs
+/// (in `eval_list`), including multiple-values, so tier results stay identical
+/// (bliss-x5y.9). This is what closes most of the T1-bytecode-vs-T0-tree-walker
+/// gap on a source-free asdf.bfasl load, where `ensure-package` hammers TYPEP
+/// (check-type) and GETHASH.
+fn apply_builtin_fast(
+    name: &str,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Option<Result<BlissVal, BlissError>> {
+    match name {
+        "TYPEP" if args.len() == 2 => {
+            let r = typep_matches(env, args[0], args[1]).map(|m| if m { T } else { NIL });
+            if r.is_ok() {
+                env.clear_mv();
+            }
+            Some(r)
+        }
+        "EQ" if args.len() == 2 => {
+            env.clear_mv();
+            Some(Ok(if args[0] == args[1] { T } else { NIL }))
+        }
+        "GETHASH" if args.len() >= 2 => {
+            let default = if args.len() >= 3 { args[2] } else { NIL };
+            Some(bliss_stdlib::gethash(args[0], args[1], default).map(|(val, present)| {
+                env.set_mv(vec![val, if present { T } else { NIL }]);
+                val
+            }))
+        }
+        "BLISS::PUT-GETHASH" if args.len() == 3 => {
+            // SETF value-first order: value, key, table (matches the operator handler).
+            let val = args[0];
+            env.clear_mv();
+            Some(bliss_stdlib::set_gethash(args[1], args[2], val).map(|_| val))
+        }
+        "SYMBOL-PACKAGE" if args.len() == 1 => {
+            env.clear_mv();
+            if !args[0].is_symbol() {
+                return Some(Ok(NIL));
+            }
+            let n = sym_name(args[0]);
+            let pkg = if n.starts_with("KEYWORD:") {
+                "KEYWORD".to_string()
+            } else if let Some((pkg, _)) = n.rsplit_once("::") {
+                pkg.to_string()
+            } else if let Some((pkg, _)) = n.rsplit_once(':') {
+                pkg.to_string()
+            } else {
+                "COMMON-LISP".to_string()
+            };
+            Some(Ok(package_object(&resolve_package_name(env, &pkg))))
+        }
+        "FIND-SYMBOL" if args.len() == 2 => {
+            let bare = symbol_bare_name(&val_as_str(args[0]));
+            let pkg_name = resolve_package_name(env, &val_as_str(args[1]));
+            if let Some((sym, status)) = find_symbol_in_package(env, &pkg_name, &bare) {
+                env.set_mv(vec![sym, package_status_symbol(status)]);
+                Some(Ok(sym))
+            } else {
+                env.set_mv(vec![NIL, NIL]);
+                Some(Ok(NIL))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn apply_builtin(name: &str, args: &[BlissVal], _env: &mut Env) -> Result<BlissVal, BlissError> {
