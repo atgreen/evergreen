@@ -3281,6 +3281,18 @@ impl Env {
 
     fn lookup_var_symbol(&self, symbol: BlissVal) -> Option<BlissVal> {
         let idx = symbol.as_symbol_index();
+        // A special variable (earmuff `*…*`) reference is always DYNAMIC: read its
+        // global value cell — which `let`/`DynBind` save-and-restore, so it holds
+        // the current dynamic binding — never a lexical frame binding. Without
+        // this, a stale DEFVAR-seeded frame binding captured by a function's
+        // definition environment (e.g. a top-level defun loaded via a child `load`
+        // env) shadows the live dynamic value, so callers see the DEFVAR default
+        // instead of the LET-bound value (broke slynk's `*emacs-connection*`).
+        if is_special_var(symbol) {
+            if let Some(val) = global_value_cell(idx) {
+                return Some(val);
+            }
+        }
         let frame = self.frame.borrow();
         if let Some(val) = frame.symbol_vars.get(&idx) {
             return Some(*val);
@@ -3700,6 +3712,11 @@ fn print_val(val: BlissVal, out: &mut String) {
             out.push(':');
             out.push_str(bare);
         } else {
+            // Uninterned symbols (make-symbol/gensym) print with the `#:` prefix
+            // under prin1/~S so they read back as fresh uninterned symbols.
+            if bliss_compiler::reader::is_uninterned(val.as_symbol_index()) {
+                out.push_str("#:");
+            }
             out.push_str(&name);
         }
     } else if val.is_cons() {
@@ -4128,6 +4145,28 @@ fn eval_quasiquote_depth(
     let mut cur = template;
     while cur.is_cons() {
         let (elem, rest) = cp(cur);
+        // Dotted-tail unquote: `` `(a . ,x) `` / `` `(a . ,@x) `` read as the spine
+        // `(a . (unquote x))`, i.e. the list's own tail is a bare UNQUOTE /
+        // UNQUOTE-SPLICING symbol (not the cons `(unquote x)` that a `,x` *element*
+        // produces). Splice x in as the improper tail instead of walking `unquote`
+        // and `x` as two more elements (which yielded `(a UNQUOTE x)`).
+        if elem.is_symbol() {
+            let en = sym_name(elem);
+            if en == "BLISS::UNQUOTE" || en == "BLISS::UNQUOTE-SPLICING" {
+                let (tail_expr, _) = cp(rest);
+                let tail = if depth == 1 {
+                    eval_form(tail_expr, env)?
+                } else {
+                    let inner = eval_quasiquote_depth(tail_expr, env, depth - 1)?;
+                    arena_cons(elem, arena_cons(inner, NIL))
+                };
+                let mut result = tail;
+                for e in result_elems.iter().rev() {
+                    result = arena_cons(*e, result);
+                }
+                return Ok(result);
+            }
+        }
         // A nested backquote as an element must not be flattened element-wise.
         if elem.is_cons() {
             let (ecar, ecdr) = cp(elem);
@@ -5620,7 +5659,14 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "PACKAGE" => is_package_value(env, object),
             "HASH-TABLE" => bliss_stdlib::hash_table_count(object).is_ok(),
             "PATHNAME" => bliss_stdlib::namestring(object).is_ok(),
-            "STREAM" | "FILE-STREAM" | "SYNONYM-STREAM" => is_stream(object),
+            "READTABLE" => {
+                object.is_symbol() && symbol_bare_name(&sym_name(object)) == "STANDARD-READTABLE"
+            }
+            "STREAM" | "FILE-STREAM" => is_stream(object),
+            "SYNONYM-STREAM" => bliss_stdlib::synonym_stream_symbol(object).is_some(),
+            "TWO-WAY-STREAM" | "ECHO-STREAM" => {
+                bliss_stdlib::two_way_stream_input_stream(object).is_some()
+            }
             "SIMPLE-VECTOR" => is_simple_vector_value(object),
             // A string is a (vector character); an ARRAY includes both general
             // vectors and strings.
@@ -6820,6 +6866,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         _ => "STREAM-CLEAR-OUTPUT",
                     };
                     invoke_generic_function(gf, &[out], env)?;
+                } else {
+                    // Non-gray streams (file/socket FileIo, file output) buffer
+                    // writes in write_buf and only auto-flush when it fills; the
+                    // flush builtins must push the buffer to the fd, otherwise a
+                    // small framed write (e.g. a SLIME reply) never reaches the
+                    // peer. See streams.rs stream_{finish,force}_output.
+                    match name.as_str() {
+                        "FINISH-OUTPUT" => bliss_stdlib::stream_finish_output(out)?,
+                        "FORCE-OUTPUT" => bliss_stdlib::stream_force_output(out)?,
+                        _ => bliss_stdlib::stream_clear_output(out)?,
+                    }
                 }
                 return Ok(NIL);
             }
@@ -6896,10 +6953,225 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(T);
             }
+            // ── TCP socket primitives (for the slynk backend) ──────────
+            "BLISS::%SOCKET-LISTEN" => {
+                // (%socket-listen host port &optional backlog) → listener-id
+                let args = eval_args(cdr, env)?;
+                let host = if args.is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    val_as_str(args[0])
+                };
+                let port = if args.len() > 1 && args[1].is_fixnum() {
+                    args[1].as_fixnum() as u16
+                } else {
+                    0
+                };
+                let backlog = if args.len() > 2 && args[2].is_fixnum() {
+                    args[2].as_fixnum() as i32
+                } else {
+                    5
+                };
+                let id = bliss_stdlib::socket_listen(&host, port, backlog)?;
+                return Ok(BlissVal::from_fixnum(id as i64));
+            }
+            "BLISS::%SOCKET-LOCAL-PORT" => {
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() || !args[0].is_fixnum() {
+                    return Ok(NIL);
+                }
+                return Ok(bliss_stdlib::socket_local_port(args[0].as_fixnum() as u64)
+                    .map(|p| BlissVal::from_fixnum(p as i64))
+                    .unwrap_or(NIL));
+            }
+            "BLISS::%SOCKET-ACCEPT" => {
+                // (%socket-accept listener-id) → connection stream (blocks)
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() || !args[0].is_fixnum() {
+                    return Err(BlissError::ProgramError(
+                        "%socket-accept: listener id must be an integer".into(),
+                    ));
+                }
+                return bliss_stdlib::socket_accept(args[0].as_fixnum() as u64);
+            }
+            "BLISS::%SOCKET-CLOSE" => {
+                // (%socket-close listener-id) → NIL. Connections are closed via CLOSE.
+                let args = eval_args(cdr, env)?;
+                if let Some(v) = args.first() {
+                    if v.is_fixnum() {
+                        bliss_stdlib::socket_close_listener(v.as_fixnum() as u64);
+                    }
+                }
+                return Ok(NIL);
+            }
+            "BLISS::%SOCKET-FD" => {
+                // (%socket-fd stream) → integer fd | NIL
+                let args = eval_args(cdr, env)?;
+                let s = args.first().copied().unwrap_or(NIL);
+                return Ok(bliss_stdlib::stream_raw_fd(s)
+                    .map(|fd| BlissVal::from_fixnum(fd as i64))
+                    .unwrap_or(NIL));
+            }
+            "BLISS::%SOCKET-WAIT-FOR-INPUT" => {
+                // (%socket-wait-for-input stream &optional timeout-ms) → T | NIL
+                let args = eval_args(cdr, env)?;
+                let s = args.first().copied().unwrap_or(NIL);
+                let timeout = if args.len() > 1 && args[1].is_fixnum() {
+                    Some(args[1].as_fixnum() as i32)
+                } else {
+                    None
+                };
+                return Ok(if bliss_stdlib::stream_wait_for_input(s, timeout)? {
+                    T
+                } else {
+                    NIL
+                });
+            }
+            "WRITE-BYTE" => {
+                // (write-byte integer stream) → integer
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal(
+                        "WRITE-BYTE requires a byte and a stream".into(),
+                    ));
+                }
+                let byte = args[0];
+                let out = resolve_output_stream(args[1], env);
+                if is_gray_stream(out) {
+                    invoke_generic_function("STREAM-WRITE-BYTE", &[out, byte], env)?;
+                } else {
+                    bliss_stdlib::stream_write_byte(out, byte)?;
+                }
+                return Ok(byte);
+            }
+            "READ-BYTE" => {
+                // (read-byte stream &optional eof-error-p eof-value)
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::Internal("READ-BYTE requires a stream".into()));
+                }
+                let inp = resolve_input_stream(args[0], env);
+                let eof_error = args.get(1).map(|v| *v != NIL).unwrap_or(true);
+                let eof_value = args.get(2).copied().unwrap_or(NIL);
+                let b = if is_gray_stream(inp) {
+                    invoke_generic_function("STREAM-READ-BYTE", &[inp], env)?
+                } else {
+                    bliss_stdlib::stream_read_byte(inp)?
+                };
+                if b == EOF {
+                    if eof_error {
+                        return Err(BlissError::StreamError("end of file on READ-BYTE".into()));
+                    }
+                    return Ok(eof_value);
+                }
+                return Ok(b);
+            }
+            "SLEEP" => {
+                // (sleep seconds) → NIL. Blocks the (single) thread.
+                let args = eval_args(cdr, env)?;
+                let secs = if args.is_empty() { 0.0 } else { num_val(args[0])? };
+                if secs > 0.0 {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                }
+                return Ok(NIL);
+            }
+            "BLISS::%GETPID" => {
+                return Ok(BlissVal::from_fixnum(std::process::id() as i64));
+            }
+            "BLISS::%EXIT" => {
+                // (%exit &optional code) — flush and terminate the process.
+                let args = eval_args(cdr, env)?;
+                let code = if !args.is_empty() && args[0].is_fixnum() {
+                    args[0].as_fixnum() as i32
+                } else {
+                    0
+                };
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
             "GET-OUTPUT-STREAM-STRING" => {
                 let (sf, _) = cp(cdr);
                 let stream = eval_form(sf, env)?;
                 return bliss_stdlib::get_output_stream_string(stream);
+            }
+            "SYNONYM-STREAM-SYMBOL" => {
+                let (sf, _) = cp(cdr);
+                let s = eval_form(sf, env)?;
+                return Ok(bliss_stdlib::synonym_stream_symbol(s).unwrap_or(NIL));
+            }
+            "TWO-WAY-STREAM-INPUT-STREAM" => {
+                let (sf, _) = cp(cdr);
+                let s = eval_form(sf, env)?;
+                return Ok(bliss_stdlib::two_way_stream_input_stream(s).unwrap_or(NIL));
+            }
+            "TWO-WAY-STREAM-OUTPUT-STREAM" => {
+                let (sf, _) = cp(cdr);
+                let s = eval_form(sf, env)?;
+                return Ok(bliss_stdlib::two_way_stream_output_stream(s).unwrap_or(NIL));
+            }
+            "MACRO-FUNCTION" => {
+                // (macro-function symbol &optional environment) → an expander or
+                // NIL. bliss macros are not first-class functions; return T for a
+                // macro (callers here use it as a boolean) and NIL otherwise.
+                let args = eval_args(cdr, env)?;
+                let s = args.first().copied().unwrap_or(NIL);
+                if s.is_symbol() {
+                    let name = sym_name(s);
+                    if lookup_macro(env, &name).is_some()
+                        || lookup_macro(env, &symbol_bare_name(&name)).is_some()
+                    {
+                        return Ok(T);
+                    }
+                }
+                return Ok(NIL);
+            }
+            "SYMBOL-PLIST" => {
+                // (symbol-plist symbol) → its property list
+                let (sf, _) = cp(cdr);
+                let s = eval_form(sf, env)?;
+                return Ok(symbol_plist_of(s));
+            }
+            "GET" => {
+                // (get symbol indicator &optional default)
+                let args = eval_args(cdr, env)?;
+                let s = args.first().copied().unwrap_or(NIL);
+                let key = args.get(1).copied().unwrap_or(NIL);
+                let default = args.get(2).copied().unwrap_or(NIL);
+                return Ok(plist_lookup(symbol_plist_of(s), key).unwrap_or(default));
+            }
+            "REMPROP" => {
+                // (remprop symbol indicator) → T if present. Rebuild without the
+                // first matching pair.
+                let args = eval_args(cdr, env)?;
+                let s = args.first().copied().unwrap_or(NIL);
+                let key = args.get(1).copied().unwrap_or(NIL);
+                if !s.is_symbol() {
+                    return Ok(NIL);
+                }
+                let idx = s.as_symbol_index();
+                let plist = bliss_rt::symbols::symbol_plist(idx).unwrap_or(NIL);
+                let mut kept: Vec<BlissVal> = Vec::new();
+                let mut removed = false;
+                let mut c = plist;
+                while c.is_cons() {
+                    let (k, r) = cp(c);
+                    if !r.is_cons() {
+                        break;
+                    }
+                    let (v, r2) = cp(r);
+                    if !removed && k == key {
+                        removed = true;
+                    } else {
+                        kept.push(k);
+                        kept.push(v);
+                    }
+                    c = r2;
+                }
+                if removed {
+                    bliss_rt::symbols::set_symbol_plist(idx, vec_to_list(&kept));
+                }
+                return Ok(if removed { T } else { NIL });
             }
             "MAKE-STRING-INPUT-STREAM" => {
                 // (make-string-input-stream string &optional start end)
@@ -7711,6 +7983,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 let (tbl_form, _) = cp(cp(aargs.get()).1);
                                 let tbl = eval_form(tbl_form, env)?;
                                 bliss_stdlib::set_gethash(key, tbl, val.get())?;
+                            }
+                            "GET" => {
+                                // (setf (get symbol indicator [default]) val)
+                                let sym = eval_form(tgt_form, env)?;
+                                let (key_form, _) = cp(cp(aargs.get()).1);
+                                let key = eval_form(key_form, env)?;
+                                symbol_plist_put(sym, key, val.get());
+                            }
+                            "SYMBOL-PLIST" => {
+                                // (setf (symbol-plist symbol) plist)
+                                let sym = eval_form(tgt_form, env)?;
+                                if sym.is_symbol() {
+                                    bliss_rt::symbols::set_symbol_plist(
+                                        sym.as_symbol_index(),
+                                        val.get(),
+                                    );
+                                }
                             }
                             "SLOT-VALUE" => {
                                 // (setf (slot-value instance slot-name) val)
@@ -8539,11 +8828,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let mut seqs: Vec<Vec<bliss_rt::ShadowRoot>> = Vec::new();
                 for seq_form in &src[2..] {
                     let seq = eval_form(seq_form.get(), env)?;
-                    let elems: Vec<BlissVal> = if is_string_value(seq) {
-                        val_as_str(seq).chars().map(BlissVal::from_char).collect()
-                    } else {
-                        list_to_vec(seq)
-                    };
+                    // Any CL sequence: list, string, or (simple/complex) vector.
+                    let elems: Vec<BlissVal> = seq_elements(seq)?;
                     seqs.push(elems.into_iter().map(|v| roots.root(v)).collect());
                 }
                 let len = seqs.iter().map(Vec::len).min().unwrap_or(0);
@@ -8565,6 +8851,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     "STRING" | "SIMPLE-STRING" | "BASE-STRING" => {
                         let s = results.iter().map(|v| v.as_char()).collect::<String>();
                         arena_str(&s)
+                    }
+                    "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" | "SIMPLE-ARRAY" => {
+                        bliss_stdlib::build_simple_vector(&results)
                     }
                     _ => vec_to_list(&results),
                 });
@@ -9815,8 +10104,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "WITH-OPEN-FILE" => return eval_with_open_file(cdr, env),
             "LOAD" => {
-                let (path_form, _) = cp(cdr);
-                let path_val = eval_form(path_form, env)?;
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::Internal("LOAD requires a pathname".into()));
+                }
+                let path_val = args[0];
+                // :if-does-not-exist nil → return NIL for a missing file instead
+                // of erroring (CLHS; slynk's load-user-init-file relies on this).
+                let mut if_missing_nil = false;
+                let mut i = 1;
+                while i + 1 < args.len() {
+                    if args[i].is_symbol()
+                        && symbol_bare_name(&sym_name(args[i])) == "IF-DOES-NOT-EXIST"
+                    {
+                        if_missing_nil = args[i + 1] == NIL;
+                    }
+                    i += 2;
+                }
                 // LOAD also accepts an open input STREAM (CLHS): read and evaluate
                 // every form from it. A SLY/SLIME client injects its runtime this
                 // way — `(with-input-from-string (s …) (load s))`.
@@ -9840,6 +10144,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // object (e.g. `#P"…"`, common in a ~/.blissrc). `val_as_str` on a
                 // pathname yields its debug repr, so coerce via its namestring.
                 let path = path_designator_to_string(path_val)?;
+                if if_missing_nil && !std::path::Path::new(&path).exists() {
+                    return Ok(NIL);
+                }
                 // ANSI LOAD returns a generalized boolean (T on success); the
                 // last top-level form's value is not the result.
                 load_path_into_env(&path, env)?;
@@ -10155,6 +10462,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         seq_set_elt(seq, pos, c)?;
                         pos += 1;
                     }
+                } else if bliss_stdlib::is_byte_stream(inp) {
+                    // Byte (unsigned-byte 8) stream: transfer octets, not chars.
+                    for _ in 0..count {
+                        let b = bliss_stdlib::stream_read_byte(inp)?;
+                        if b == EOF {
+                            break;
+                        }
+                        seq_set_elt(seq, pos, b)?;
+                        pos += 1;
+                    }
                 } else {
                     for el in bliss_stdlib::stream_read_sequence(inp, count)? {
                         seq_set_elt(seq, pos, el)?;
@@ -10188,6 +10505,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             "STREAM-WRITE-BYTE"
                         };
                         invoke_generic_function(gf, &[out, *el], env)?;
+                    }
+                } else if bliss_stdlib::is_byte_stream(out) {
+                    for el in &elems {
+                        bliss_stdlib::stream_write_byte(out, *el)?;
                     }
                 } else {
                     bliss_stdlib::stream_write_sequence(out, &elems)?;
@@ -10286,6 +10607,114 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 std::fs::write(&path, &image_data)
                     .map_err(|e| BlissError::FileError(format!("save-image: {}", e)))?;
                 return Ok(T);
+            }
+            "SAVE-LISP-AND-DIE" | "SAVE-IMAGE-AND-DIE" => {
+                // (save-lisp-and-die pathname &key executable toplevel …) —
+                // `save-image-and-die` is an accepted alias.
+                // serialize the runtime world (packages, CLOS, user functions,
+                // bound globals) to a source-independent .bfasl image and
+                // terminate the process (bliss-5uj). Restored fast via LOAD or
+                // `--image`. With :executable t the image is appended to a copy
+                // of the runtime binary to make a standalone program; :toplevel
+                // names the entry point run on startup. Other SBCL keyword
+                // options (:compression, :save-runtime-options, …) are accepted
+                // and ignored.
+                let (path_form, rest) = cp(cdr);
+                let path_val = eval_form(path_form, env)?;
+                let path = path_designator_to_string(path_val)?;
+                let mut executable = false;
+                let mut toplevel_set = false;
+                let mut key = rest;
+                while key.is_cons() {
+                    let (k, kr) = cp(key);
+                    let kname = if k.is_symbol() {
+                        symbol_bare_name(&sym_name(k))
+                    } else {
+                        String::new()
+                    };
+                    // A boolean flag written without its value — `:executable`
+                    // where the next form is itself an option keyword (e.g.
+                    // `:executable :toplevel #'main`) or nothing — is read as T,
+                    // and the keyword is re-parsed as the next option rather than
+                    // swallowed as this one's value. None of these options takes a
+                    // keyword as a legitimate value, so this is unambiguous.
+                    let value_is_missing = !kr.is_cons() || {
+                        let (v, _) = cp(kr);
+                        is_keyword_arg(v)
+                    };
+                    match kname.as_str() {
+                        "EXECUTABLE" => {
+                            if value_is_missing {
+                                executable = true;
+                                key = kr;
+                            } else {
+                                let (vform, kr2) = cp(kr);
+                                executable = eval_form(vform, env)? != NIL;
+                                key = kr2;
+                            }
+                        }
+                        "TOPLEVEL" => {
+                            if value_is_missing {
+                                key = kr; // malformed: no entry point given
+                            } else {
+                                let (vform, kr2) = cp(kr);
+                                if let Some(sym) = toplevel_symbol(vform, env)? {
+                                    let idx = bliss_rt::symbols::intern(IMAGE_TOPLEVEL_VAR);
+                                    bliss_rt::symbols::set_symbol_value(idx, sym);
+                                    toplevel_set = true;
+                                }
+                                key = kr2;
+                            }
+                        }
+                        // Unknown option: evaluate its value for effect (unless the
+                        // value is missing) and skip it.
+                        _ => {
+                            if value_is_missing {
+                                key = kr;
+                            } else {
+                                let (vform, kr2) = cp(kr);
+                                let _ = eval_form(vform, env);
+                                key = kr2;
+                            }
+                        }
+                    }
+                }
+                let image = bytecode::build_image_from_runtime(env)?;
+                let bytes = if executable {
+                    wrap_executable(&image).map_err(|e| {
+                        BlissError::FileError(format!(
+                            "save-lisp-and-die :executable: {e}"
+                        ))
+                    })?
+                } else {
+                    image
+                };
+                std::fs::write(&path, &bytes).map_err(|e| {
+                    BlissError::FileError(format!("save-lisp-and-die: {}", e))
+                })?;
+                if executable {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &path,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
+                    }
+                }
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let kind = if executable { "executable" } else { "image" };
+                let entry = if executable && !toplevel_set {
+                    " (no :toplevel — starts a REPL)"
+                } else {
+                    ""
+                };
+                eprintln!(
+                    ";; wrote {kind} to {path} ({} bytes){entry}; exiting",
+                    bytes.len()
+                );
+                std::process::exit(0);
             }
             "DEFPACKAGE" => return eval_defpackage(cdr, env),
             "IN-PACKAGE" => {
@@ -10708,17 +11137,40 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .unwrap_or(NIL));
             }
             "GENSYM" => {
+                // (gensym &optional x) → a fresh UNINTERNED symbol. A string X is
+                // used as the name prefix (default "G"); an integer X names the
+                // suffix directly without bumping *gensym-counter*. Otherwise the
+                // shared counter supplies the suffix and is incremented. The result
+                // must be a real uninterned symbol (prints as #:NAME), never an
+                // interned symbol or a string — the old code returned both.
                 thread_local! { static COUNTER: RefCell<u64> = const { RefCell::new(0) }; }
-                let n = COUNTER.with(|c| {
-                    let v = *c.borrow();
-                    *c.borrow_mut() = v + 1;
-                    v
-                });
-                let name = format!("G{}", n);
-                match resolve_sym(&name) {
-                    Some(sym) => return Ok(sym),
-                    None => return Ok(arena_str(&name)),
-                }
+                let arg = match cdr {
+                    c if c.is_nil() => NIL,
+                    _ => {
+                        let (arg_form, _) = cp(cdr);
+                        eval_form(arg_form, env)?
+                    }
+                };
+                let name = if arg == NIL {
+                    let n = COUNTER.with(|c| {
+                        let v = *c.borrow();
+                        *c.borrow_mut() = v + 1;
+                        v
+                    });
+                    format!("G{}", n)
+                } else if arg.is_fixnum() {
+                    format!("G{}", arg.as_fixnum())
+                } else {
+                    // string (or string-designator) prefix + shared counter suffix
+                    let prefix = val_as_str(arg);
+                    let n = COUNTER.with(|c| {
+                        let v = *c.borrow();
+                        *c.borrow_mut() = v + 1;
+                        v
+                    });
+                    format!("{}{}", prefix, n)
+                };
+                return Ok(reader::make_uninterned_symbol(&name));
             }
             "MAKE-SYMBOL" => {
                 // (make-symbol name) — a fresh uninterned symbol with that name.
@@ -13513,6 +13965,49 @@ fn eval_args(args: BlissVal, env: &mut Env) -> Result<RootedVals, BlissError> {
 
 // ── COERCE ───────────────────────────────────────────────────────
 /// Extract a sequence (list, vector, or string) into a Vec of its elements.
+/// A symbol's property list, or NIL for a non-symbol.
+fn symbol_plist_of(sym: BlissVal) -> BlissVal {
+    if sym.is_symbol() {
+        bliss_rt::symbols::symbol_plist(sym.as_symbol_index()).unwrap_or(NIL)
+    } else {
+        NIL
+    }
+}
+
+/// Scan a property list for `key` (EQ on the indicator, per CLHS GET), returning
+/// the associated value or None.
+fn plist_lookup(plist: BlissVal, key: BlissVal) -> Option<BlissVal> {
+    let mut c = plist;
+    while c.is_cons() {
+        let (k, r) = cp(c);
+        if !r.is_cons() {
+            break;
+        }
+        let (v, r2) = cp(r);
+        if k == key {
+            return Some(v);
+        }
+        c = r2;
+    }
+    None
+}
+
+/// `(setf (get sym key) val)` — prepend `key val` to `sym`'s plist. GET reads the
+/// first match, so the freshest binding wins; a superseded pair is left in place
+/// (REMPROP is unused by the code that needs this).
+fn symbol_plist_put(sym: BlissVal, key: BlissVal, val: BlissVal) {
+    if !sym.is_symbol() {
+        return;
+    }
+    let idx = sym.as_symbol_index();
+    let roots = bliss_rt::ShadowRootScope::new();
+    let plist = roots.root(bliss_rt::symbols::symbol_plist(idx).unwrap_or(NIL));
+    let key_r = roots.root(key);
+    let inner = roots.root(arena_cons(val, plist.get()));
+    let new_plist = arena_cons(key_r.get(), inner.get());
+    bliss_rt::symbols::set_symbol_plist(idx, new_plist);
+}
+
 fn seq_elements(seq: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
     if seq.is_nil() {
         return Ok(Vec::new());
@@ -15734,7 +16229,66 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     };
     let name_str = symbol_bare_name(&sym_name(name_sym));
 
-    // Parse each slot into (slot-symbol, default-form, accessor-symbol, initarg-keyword).
+    // Parse DEFSTRUCT options from the `(name option...)` head. Supported:
+    // :conc-name (accessor prefix), :constructor (custom / BOA / suppressed),
+    // :include (single-inheritance). Others (:print-function/-object, :predicate,
+    // :copier, :type, :named) are accepted and ignored.
+    let mut conc_name = format!("{name_str}-");
+    let mut include_parent: Option<BlissVal> = None;
+    // Each entry: (constructor-name-symbol, Option<BOA positional lambda list>).
+    let mut constructors: Vec<(BlissVal, Option<Vec<BlissVal>>)> = Vec::new();
+    let mut suppress_default_ctor = false;
+    if name_spec.is_cons() {
+        for opt in list_to_vec(cp(name_spec).1) {
+            if !opt.is_cons() {
+                continue;
+            }
+            let (okey, orest) = cp(opt);
+            let oname = if okey.is_symbol() {
+                symbol_bare_name(&sym_name(okey))
+            } else {
+                continue;
+            };
+            match oname.as_str() {
+                "CONC-NAME" => {
+                    let v = if orest.is_cons() { cp(orest).0 } else { NIL };
+                    conc_name = if v == NIL {
+                        String::new()
+                    } else if v.is_symbol() {
+                        symbol_bare_name(&sym_name(v))
+                    } else {
+                        val_as_str(v)
+                    };
+                }
+                "INCLUDE" => {
+                    if orest.is_cons() {
+                        include_parent = Some(cp(orest).0);
+                    }
+                }
+                "CONSTRUCTOR" => {
+                    // (:constructor) → default; (:constructor nil) → none;
+                    // (:constructor name) → keyword; (:constructor name (args)) → BOA.
+                    if !orest.is_cons() {
+                        continue;
+                    }
+                    let (cname, crest) = cp(orest);
+                    if cname == NIL {
+                        suppress_default_ctor = true;
+                    } else if cname.is_symbol() {
+                        let boa = if crest.is_cons() {
+                            Some(list_to_vec(cp(crest).0))
+                        } else {
+                            None
+                        };
+                        constructors.push((cname, boa));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Parse each slot: (slot-symbol default-form . slot-options) or a bare symbol.
     struct StructSlot {
         slot_sym: BlissVal,
         default: BlissVal,
@@ -15753,10 +16307,15 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
             continue;
         }
         let slot_str = symbol_bare_name(&sym_name(slot_sym));
+        let accessor = if conc_name.is_empty() {
+            slot_sym
+        } else {
+            resolve_sym(&format!("{conc_name}{slot_str}")).unwrap_or(NIL)
+        };
         slots.push(StructSlot {
             slot_sym,
             default,
-            accessor: resolve_sym(&format!("{}-{}", name_str, slot_str)).unwrap_or(NIL),
+            accessor,
             initarg: resolve_sym(&format!(":{}", slot_str)).unwrap_or(NIL),
         });
     }
@@ -15765,7 +16324,10 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     let quote = |value: BlissVal| vec_to_list(&[sym("QUOTE"), value]);
     let obj = sym("%STRUCT-OBJECT%");
 
-    // (defclass NAME () ((slot :initarg :slot :accessor NAME-slot) ...))
+    // (defclass NAME (parent?) ((slot :initarg :slot :initform default
+    //                                 :accessor conc-slot) ...))
+    // Defaults live as :initform so inherited slots (via :include) and the
+    // apply-#'make-instance constructor get them without enumerating parents.
     let slot_clauses: Vec<BlissVal> = slots
         .iter()
         .map(|s| {
@@ -15773,31 +16335,71 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                 s.slot_sym,
                 sym(":INITARG"),
                 s.initarg,
+                sym(":INITFORM"),
+                s.default,
                 sym(":ACCESSOR"),
                 s.accessor,
             ])
         })
         .collect();
-    let defclass_form = vec_to_list(&[sym("DEFCLASS"), name_sym, NIL, vec_to_list(&slot_clauses)]);
+    let supers = match include_parent {
+        Some(p) => vec_to_list(&[p]),
+        None => NIL,
+    };
+    let defclass_form =
+        vec_to_list(&[sym("DEFCLASS"), name_sym, supers, vec_to_list(&slot_clauses)]);
     eval_form(defclass_form, env)?;
 
-    // (defun make-NAME (&key (slot default) ...) (make-instance 'NAME :slot slot ...))
-    let mut ctor_params = vec![sym("&KEY")];
-    for s in &slots {
-        ctor_params.push(vec_to_list(&[s.slot_sym, s.default]));
+    // Constructors. A keyword constructor forwards every initarg to
+    // MAKE-INSTANCE (so inherited slots Just Work); a BOA constructor maps its
+    // positional lambda list to slot initargs by name.
+    if constructors.is_empty() && !suppress_default_ctor {
+        constructors.push((sym(&format!("MAKE-{}", name_str)), None));
     }
-    let mut make_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)];
-    for s in &slots {
-        make_call.push(s.initarg);
-        make_call.push(s.slot_sym);
+    for (ctor_name, boa) in &constructors {
+        let ctor_defun = match boa {
+            None => {
+                // (defun CTOR (&rest args) (apply #'make-instance 'NAME args))
+                let args = sym("ARGS");
+                let apply_call = vec_to_list(&[
+                    sym("APPLY"),
+                    vec_to_list(&[sym("FUNCTION"), sym("MAKE-INSTANCE")]),
+                    quote(name_sym),
+                    args,
+                ]);
+                vec_to_list(&[
+                    sym("DEFUN"),
+                    *ctor_name,
+                    vec_to_list(&[sym("&REST"), args]),
+                    apply_call,
+                ])
+            }
+            Some(params) => {
+                // (defun CTOR (params...) (make-instance 'NAME :p p ...)), where a
+                // param named like a slot supplies that slot; lambda-list keywords
+                // (&optional/&key/…) pass through into the lambda list untouched.
+                let mut make_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)];
+                for p in params {
+                    let pname = if p.is_cons() { cp(*p).0 } else { *p };
+                    if pname.is_symbol() {
+                        let bare = symbol_bare_name(&sym_name(pname));
+                        if bare.starts_with('&') {
+                            continue;
+                        }
+                        make_call.push(resolve_sym(&format!(":{bare}")).unwrap_or(NIL));
+                        make_call.push(pname);
+                    }
+                }
+                vec_to_list(&[
+                    sym("DEFUN"),
+                    *ctor_name,
+                    vec_to_list(params),
+                    vec_to_list(&make_call),
+                ])
+            }
+        };
+        eval_form(ctor_defun, env)?;
     }
-    let ctor_defun = vec_to_list(&[
-        sym("DEFUN"),
-        sym(&format!("MAKE-{}", name_str)),
-        vec_to_list(&ctor_params),
-        vec_to_list(&make_call),
-    ]);
-    eval_form(ctor_defun, env)?;
 
     // (defun NAME-P (o) (typep o 'NAME))
     let pred_defun = vec_to_list(&[
@@ -15808,8 +16410,10 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     ]);
     eval_form(pred_defun, env)?;
 
-    // (defun copy-NAME (o) (make-NAME :slot (NAME-slot o) ...))
-    let mut copy_call = vec![sym(&format!("MAKE-{}", name_str))];
+    // (defun copy-NAME (o) (make-instance 'NAME :slot (accessor o) ...))
+    // Copies this struct's own slots (inherited slots via :include are not
+    // enumerated here; that path is unused by the code needing DEFSTRUCT).
+    let mut copy_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)];
     for s in &slots {
         copy_call.push(s.initarg);
         copy_call.push(vec_to_list(&[s.accessor, obj]));
@@ -17324,6 +17928,115 @@ fn load_init_file(env: &mut Env) {
     }
 }
 
+// ── Executable images (save-lisp-and-die :executable) ──────────────
+/// The special variable that a saved image uses to record its top-level entry
+/// point (SBCL `:toplevel`). Stored as the entry symbol; a restoring process
+/// funcalls it when no explicit batch mode is requested.
+const IMAGE_TOPLEVEL_VAR: &str = "BLISS-INTERNAL::*IMAGE-TOPLEVEL*";
+
+/// Trailing marker appended after an embedded image in an `:executable` save:
+/// the 8-byte magic followed by the image length as a little-endian u64. A
+/// normal `bliss-cli` binary has no such trailer, so startup detects a saved
+/// executable by reading just the final 16 bytes.
+const EXE_IMAGE_MAGIC: &[u8; 8] = b"BLISSEXE";
+
+/// The bytes of the currently running runtime binary. On Linux, read the magic
+/// `/proc/self/exe` symlink directly rather than resolving it to a path: the
+/// resolved path gets a `" (deleted)"` suffix (→ ENOENT) when the binary has
+/// been rebuilt or moved while running — common while iterating — whereas the
+/// magic link still refers to the live inode. Fall back to `current_exe` on
+/// other platforms or if `/proc` is unavailable.
+fn current_runtime_bytes() -> std::io::Result<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(bytes) = std::fs::read("/proc/self/exe") {
+            return Ok(bytes);
+        }
+    }
+    std::fs::read(std::env::current_exe()?)
+}
+
+/// Wrap `image` into a standalone executable: the current runtime binary with
+/// the image and a locating trailer appended. The OS loader ignores trailing
+/// bytes after the executable, so the concatenation still runs as the original
+/// program, while [`embedded_image`] recovers the image at startup (the same
+/// runtime-plus-core scheme SBCL uses for `:executable t`).
+fn wrap_executable(image: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut bytes = current_runtime_bytes()?;
+    bytes.extend_from_slice(image);
+    bytes.extend_from_slice(EXE_IMAGE_MAGIC);
+    bytes.extend_from_slice(&(image.len() as u64).to_le_bytes());
+    Ok(bytes)
+}
+
+/// If the running binary has an image appended by an `:executable` save, return
+/// it. Only the 16-byte trailer is read unless the magic matches, so a normal
+/// launch pays almost nothing.
+fn embedded_image() -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let exe_path = std::env::current_exe().ok()?;
+    let mut f = std::fs::File::open(&exe_path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len < 16 {
+        return None;
+    }
+    f.seek(SeekFrom::End(-16)).ok()?;
+    let mut trailer = [0u8; 16];
+    f.read_exact(&mut trailer).ok()?;
+    if &trailer[..8] != EXE_IMAGE_MAGIC {
+        return None;
+    }
+    let image_len = u64::from_le_bytes(trailer[8..16].try_into().ok()?);
+    if image_len == 0 || image_len + 16 > len {
+        return None;
+    }
+    let start = len - 16 - image_len;
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut image = vec![0u8; image_len as usize];
+    f.read_exact(&mut image).ok()?;
+    Some(image)
+}
+
+/// Extract the entry-point symbol from a `:toplevel` function designator. A
+/// `#'name` / `'name` form yields its name unevaluated; otherwise the form is
+/// evaluated and reduced to a symbol (a function object via its name).
+fn toplevel_symbol(form: BlissVal, env: &mut Env) -> Result<Option<BlissVal>, BlissError> {
+    if form.is_cons() {
+        let (op, rest) = cp(form);
+        if op.is_symbol() {
+            let opn = sym_name(op);
+            if (opn == "FUNCTION" || opn == "QUOTE") && rest.is_cons() {
+                let (x, _) = cp(rest);
+                if x.is_symbol() {
+                    return Ok(Some(x));
+                }
+            }
+        }
+    }
+    let v = eval_form(form, env)?;
+    if v.is_symbol() {
+        return Ok(Some(v));
+    }
+    if bliss_rt::function::is_interpreted_function(v) {
+        let n = bliss_rt::function::name(v);
+        if n.is_symbol() {
+            return Ok(Some(n));
+        }
+    }
+    Ok(None)
+}
+
+/// The saved top-level entry symbol, if the loaded image recorded one.
+fn image_toplevel() -> Option<BlissVal> {
+    let idx = bliss_rt::symbols::find_index(IMAGE_TOPLEVEL_VAR)?;
+    let v = bliss_rt::symbols::symbol_value(idx)?;
+    if v != NIL && v != bliss_rt::value::UNBOUND && v.is_symbol() {
+        Some(v)
+    } else {
+        None
+    }
+}
+
 // ── CLI driver ─────────────────────────────────────────────────────
 pub fn run(args: &[String]) -> Result<i32, BlissError> {
     let ca = CliArgs::parse(args)?;
@@ -17358,12 +18071,23 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         read_eval_all_env(&contents, &mut env)?;
     }
 
+    // A saved `:executable` binary carries its image appended to itself. Detect
+    // and load it like `--image`, but treat the process as that saved program:
+    // skip the user init file and run its recorded top-level entry point.
+    let embedded = embedded_image();
+    if let Some(ref bytes) = embedded {
+        if bytes.starts_with(&bliss_rt::bfasl::BFASL_MAGIC) {
+            load_bfasl_into_env(bytes, &mut env)?;
+        }
+    }
+
     // Load the user init file (~/.blissrc, or $BLISS_INIT_FILE) when starting an
     // interactive REPL. Batch modes (--eval, --load, a script) run without it, so
     // they stay hermetic and reproducible (spec: an explicit --eval overrides
     // init-file discovery); --no-init opts the REPL out too (issue #8). A missing
     // file is normal; a broken init file is reported but non-fatal.
     if !ca.no_init
+        && embedded.is_none()
         && ca.eval.is_none()
         && ca.load.is_none()
         && ca.script.is_none()
@@ -17374,7 +18098,13 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
 
     // Load image if specified (issue #8)
     if let Some(ref image_path) = ca.image {
-        if let Ok(contents) = std::fs::read_to_string(image_path) {
+        let bytes = std::fs::read(image_path)
+            .map_err(|e| BlissError::FileError(format!("--image {image_path}: {e}")))?;
+        // A binary image is a `.bfasl` unit (save-lisp-and-die); a legacy text
+        // image is a `.lisp` transcript restored by evaluation.
+        if bytes.starts_with(&bliss_rt::bfasl::BFASL_MAGIC) {
+            load_bfasl_into_env(&bytes, &mut env)?;
+        } else if let Ok(contents) = String::from_utf8(bytes) {
             read_eval_all_env(&contents, &mut env)?;
         }
     }
@@ -17393,6 +18123,21 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     }
     if let Some(port) = ca.slynk {
         return run_slynk_server(port, &mut env);
+    }
+    // No explicit batch mode: if a loaded image recorded a top-level entry point
+    // (SBCL :toplevel), run it as the program's main; otherwise drop to the REPL.
+    // Restricted to the saved-executable / `--image` paths so a plain REPL is
+    // never hijacked by a stale entry symbol.
+    if embedded.is_some() || ca.image.is_some() {
+        if let Some(top) = image_toplevel() {
+            return match apply_function(top, &[], &mut env) {
+                Ok(_) => Ok(0),
+                Err(e) => {
+                    eprintln!("{}", describe_err(&e));
+                    Ok(1)
+                }
+            };
+        }
     }
     run_repl_env(&mut env)
 }

@@ -44,6 +44,12 @@ pub fn symbol_name(idx: u32) -> Option<String> {
     bliss_rt::symbols::symbol_name(idx)
 }
 
+/// True if `idx` names an uninterned symbol (`make-symbol`/`gensym`; no home
+/// package). Used by the printer to emit the `#:` prefix under prin1/`~S`.
+pub fn is_uninterned(idx: u32) -> bool {
+    bliss_rt::symbols::is_uninterned(idx)
+}
+
 pub fn register_package(name: &str) {
     bliss_rt::packages::register(name);
 }

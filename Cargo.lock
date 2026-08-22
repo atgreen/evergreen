@@ -67,6 +67,7 @@ version = "0.1.0"
 dependencies = [
  "bliss-compiler",
  "bliss-rt",
+ "libc",
  "rustyline",
 ]
 

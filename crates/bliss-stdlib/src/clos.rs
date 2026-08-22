@@ -1339,6 +1339,13 @@ pub fn make_generic_function(
     })
 }
 
+/// The name form a generic function was created with (a symbol, or a `(setf …)`
+/// cons). Used by image serialization to recover a generic's real, correctly
+/// package-homed name symbol from its interpreter-side id.
+pub fn generic_function_name(gf: BlissVal) -> Option<BlissVal> {
+    with_state(|st| st.generic_functions.get(&gf).map(|d| d.name))
+}
+
 /// Add a method to a generic function. Upserts the tracking entry if the
 /// function is not already registered here: the interpreter's live dispatch uses
 /// its own method table (cli.rs env.methods), so this map only tracks methods,

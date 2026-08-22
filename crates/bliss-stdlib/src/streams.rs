@@ -543,6 +543,7 @@ impl GrayStream for StreamMutableState {
     // For character-based streams, read a character and return its codepoint.
     fn stream_read_byte(&mut self) -> Result<BlissVal, BlissError> {
         self.check_input()?;
+        let byte_stream = self.element_type == StreamElementType::UnsignedByte8;
         match &mut self.inner {
             StreamInner::FileInput {
                 element_type,
@@ -554,6 +555,15 @@ impl GrayStream for StreamMutableState {
             } if *element_type == StreamElementType::UnsignedByte8 => {
                 file_read_byte_raw(file, read_buf, buf_pos, buf_fill)
             }
+            // Bidirectional byte stream (e.g. a TCP socket connection): read raw
+            // octets from the buffered fd rather than decoding characters.
+            StreamInner::FileIo {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                ..
+            } if byte_stream => file_read_byte_raw(file, read_buf, buf_pos, buf_fill),
             _ => {
                 // Character stream fallback: read char, return codepoint.
                 let ch = self.stream_read_char()?;
@@ -1794,6 +1804,14 @@ pub fn stream_read_byte(stream: BlissVal) -> Result<BlissVal, BlissError> {
     guard.stream_read_byte()
 }
 
+/// True if STREAM has element-type (unsigned-byte 8), so sequence I/O over it
+/// should transfer octets rather than characters.
+pub fn is_byte_stream(stream: BlissVal) -> bool {
+    lock_stream(stream)
+        .map(|g| g.element_type == StreamElementType::UnsignedByte8)
+        .unwrap_or(false)
+}
+
 pub fn stream_write_char(stream: BlissVal, ch: BlissVal) -> Result<(), BlissError> {
     let mut guard = lock_stream(stream)?;
     guard.stream_write_char(ch)
@@ -2146,4 +2164,191 @@ fn stream_gc_finalize(_finalizer: BlissVal, object: BlissVal) {
 pub fn install_gc_hooks() {
     bliss_rt::gc::set_stream_trace_fn(stream_trace);
     bliss_rt::gc::set_finalizer_dispatch(stream_gc_finalize);
+}
+
+// ── TCP sockets ────────────────────────────────────────────────────
+// Minimal networking primitives for the slynk backend (and general Lisp use).
+// A *listening* socket is an opaque integer id into a thread-local registry (it
+// is never read/written as a stream, only accept/close/local-port). An *accepted
+// connection* is returned as an ordinary bidirectional character stream, reusing
+// the FileIo machinery over the socket's file descriptor — so all the Gray-stream
+// I/O (read-char, read-line, write-string, force-output, …) works unchanged.
+use std::cell::{Cell, RefCell};
+use std::net::TcpListener;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+
+thread_local! {
+    static SOCKET_LISTENERS: RefCell<HashMap<u64, TcpListener>> = RefCell::new(HashMap::new());
+    static SOCKET_NEXT_ID: Cell<u64> = const { Cell::new(1) };
+}
+
+/// Create a listening TCP socket bound to `host:port` (port 0 = any free port).
+/// Returns an opaque listener id for `socket_accept`/`socket_local_port`/`socket_close_listener`.
+pub fn socket_listen(host: &str, port: u16, _backlog: i32) -> Result<u64, BlissError> {
+    let listener = TcpListener::bind((host, port))
+        .map_err(|e| BlissError::FileError(format!("socket-listen {host}:{port}: {e}")))?;
+    let id = SOCKET_NEXT_ID.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    SOCKET_LISTENERS.with(|m| m.borrow_mut().insert(id, listener));
+    Ok(id)
+}
+
+/// The actual local port a listener is bound to (resolves port 0).
+pub fn socket_local_port(id: u64) -> Option<u16> {
+    SOCKET_LISTENERS
+        .with(|m| m.borrow().get(&id).and_then(|l| l.local_addr().ok()))
+        .map(|a| a.port())
+}
+
+/// Close and forget a listening socket.
+pub fn socket_close_listener(id: u64) {
+    SOCKET_LISTENERS.with(|m| {
+        m.borrow_mut().remove(&id);
+    });
+}
+
+/// Accept a connection on listener `id`, returning a bidirectional character
+/// stream over the new socket (blocks until a client connects).
+pub fn socket_accept(id: u64) -> Result<BlissVal, BlissError> {
+    let stream = SOCKET_LISTENERS.with(|m| {
+        let map = m.borrow();
+        let listener = map.get(&id).ok_or_else(|| {
+            BlissError::FileError("socket-accept: unknown or closed listener".into())
+        })?;
+        listener
+            .accept()
+            .map(|(s, _)| s)
+            .map_err(|e| BlissError::FileError(format!("socket-accept: {e}")))
+    })?;
+    let _ = stream.set_nodelay(true);
+    let fd = stream.into_raw_fd();
+    // SAFETY: `fd` is a freshly-owned socket descriptor; `File` takes sole
+    // ownership and closes it on drop via the stream's GC finalizer, exactly as
+    // for a file stream. read()/write() on a socket fd are valid on Unix.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    // A byte (unsigned-byte 8) stream: the SLIME/slynk protocol frames its
+    // messages with raw octet I/O (read-sequence into a byte buffer, write-byte /
+    // write-sequence of octets); it does its own UTF-8 conversion in Lisp.
+    Ok(alloc_stream(
+        StreamElementType::UnsignedByte8,
+        StreamInner::FileIo {
+            file,
+            read_buf: Vec::with_capacity(FILE_BUF_SIZE),
+            buf_pos: 0,
+            buf_fill: 0,
+            write_buf: Vec::with_capacity(FILE_BUF_SIZE),
+            line: 0,
+            col: 0,
+            unread: None,
+            external_format: ExternalFormat::Utf8,
+        },
+        vec![],
+    ))
+}
+
+/// The raw file descriptor backing a file/socket IO stream, or None.
+pub fn stream_raw_fd(stream: BlissVal) -> Option<i32> {
+    let guard = lock_stream(stream).ok()?;
+    match &guard.inner {
+        StreamInner::FileIo { file, .. } => Some(file.as_raw_fd()),
+        StreamInner::FileInput { file, .. } => Some(file.as_raw_fd()),
+        StreamInner::FileOutput { file, .. } => Some(file.as_raw_fd()),
+        _ => None,
+    }
+}
+
+/// Block until `stream` has input available, or `timeout_ms` elapses (None =
+/// wait forever). Returns true if readable, false on timeout. Buffered input is
+/// reported immediately; otherwise the underlying fd is polled.
+pub fn stream_wait_for_input(
+    stream: BlissVal,
+    timeout_ms: Option<i32>,
+) -> Result<bool, BlissError> {
+    let fd = {
+        let guard = lock_stream(stream)?;
+        match &guard.inner {
+            StreamInner::FileIo {
+                file,
+                buf_pos,
+                buf_fill,
+                unread,
+                ..
+            }
+            | StreamInner::FileInput {
+                file,
+                buf_pos,
+                buf_fill,
+                unread,
+                ..
+            } => {
+                if unread.is_some() || *buf_pos < *buf_fill {
+                    return Ok(true);
+                }
+                file.as_raw_fd()
+            }
+            _ => {
+                return Err(BlissError::StreamError(
+                    "wait-for-input: not an input stream".into(),
+                ))
+            }
+        }
+    };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout = timeout_ms.unwrap_or(-1);
+    // SAFETY: pfd is a valid single-element pollfd array.
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout) };
+    if rc < 0 {
+        return Err(BlissError::FileError("wait-for-input: poll failed".into()));
+    }
+    Ok(rc > 0 && (pfd.revents & libc::POLLIN) != 0)
+}
+
+// ── Composite-stream accessors (synonym / two-way) ─────────────────
+/// The symbol a SYNONYM-STREAM forwards to, or None if not a synonym stream.
+pub fn synonym_stream_symbol(stream: BlissVal) -> Option<BlissVal> {
+    let alloc = get_stream_alloc(stream).ok()?;
+    let is_syn = {
+        let guard = alloc.state.lock().ok()?;
+        matches!(guard.inner, StreamInner::Synonym)
+    };
+    if is_syn {
+        alloc.components.first().copied()
+    } else {
+        None
+    }
+}
+
+/// The input stream of a TWO-WAY / ECHO stream, or None.
+pub fn two_way_stream_input_stream(stream: BlissVal) -> Option<BlissVal> {
+    let alloc = get_stream_alloc(stream).ok()?;
+    let ok = {
+        let guard = alloc.state.lock().ok()?;
+        matches!(guard.inner, StreamInner::TwoWay | StreamInner::Echo)
+    };
+    if ok {
+        alloc.components.first().copied()
+    } else {
+        None
+    }
+}
+
+/// The output stream of a TWO-WAY / ECHO stream, or None.
+pub fn two_way_stream_output_stream(stream: BlissVal) -> Option<BlissVal> {
+    let alloc = get_stream_alloc(stream).ok()?;
+    let ok = {
+        let guard = alloc.state.lock().ok()?;
+        matches!(guard.inner, StreamInner::TwoWay | StreamInner::Echo)
+    };
+    if ok {
+        alloc.components.get(1).copied()
+    } else {
+        None
+    }
 }

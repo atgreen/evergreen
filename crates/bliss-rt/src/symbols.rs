@@ -203,6 +203,14 @@ pub fn interned_names() -> Vec<(u32, String)> {
     })
 }
 
+/// True if `idx` names an uninterned symbol (one made by `make-symbol`/`gensym`,
+/// with no home package). Uninterned indices live at or above [`UNINTERNED_BASE`]
+/// (the high bit is set), so this is a pure index test — no registry lock needed.
+/// The printer uses it to emit the `#:` prefix for prin1/`~S`.
+pub fn is_uninterned(idx: u32) -> bool {
+    idx >= UNINTERNED_BASE
+}
+
 /// The object reference for a symbol index, if present.
 fn object_for_index(reg: &SymbolRegistry, idx: u32) -> Option<BlissVal> {
     if idx >= UNINTERNED_BASE {

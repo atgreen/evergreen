@@ -224,6 +224,32 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         let idx = v.as_symbol_index();
         let name =
             bliss_compiler::reader::symbol_name(idx).unwrap_or_else(|| format!("SYM#{}", idx));
+        // A keyword's registry name is `KEYWORD:FOO`; it must PRINT as `:FOO`
+        // (both prin1/~S and princ/~A), which is what a reader — including a
+        // SLIME/slynk client parsing the wire — round-trips back to the keyword.
+        if let Some(bare) = name
+            .strip_prefix("KEYWORD::")
+            .or_else(|| name.strip_prefix("KEYWORD:"))
+        {
+            // prin1/~S prints the readable `:FOO`; princ/~A drops the marker.
+            return if escapep {
+                format!(":{}", bare)
+            } else {
+                bare.to_string()
+            };
+        }
+        // An uninterned symbol (make-symbol/gensym, no home package) prints as
+        // `#:NAME` under prin1/~S so it reads back as a fresh uninterned symbol
+        // (CLHS 22.1.3.3, *print-gensym* default T); princ/~A drops the marker.
+        // slynk's UNPARSE-NAME relies on this: `(subseq (prin1-to-string
+        // (make-symbol s)) 2)` strips the `#:` — without it that subseq errors.
+        if bliss_compiler::reader::is_uninterned(idx) {
+            return if escapep {
+                format!("#:{}", name)
+            } else {
+                name
+            };
+        }
         if escapep {
             return name;
         }

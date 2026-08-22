@@ -916,6 +916,26 @@ impl<'e> Lowerer<'e> {
                 self.push_n(1);
                 return Ok(());
             }
+            // A special variable (earmuff `*…*`) reference is always DYNAMIC —
+            // emit a global (dynamic) load even if the compile-time scope has a
+            // captured binding of that name. A top-level DEFVAR seeds the load
+            // env with a frame binding; without this guard a function defined in
+            // that env compiles its `*special*` reads as LoadEnvVar of the stale
+            // captured value instead of the live dynamic value (broke slynk's
+            // `*emacs-connection*`). Symbol-macros still expand.
+            if is_special_name(&name) {
+                if self
+                    .env
+                    .symbol_macros
+                    .borrow()
+                    .contains_key(&form.as_symbol_index())
+                {
+                    return Err(Bail);
+                }
+                self.emit(Instr::LoadGlobal(form.as_symbol_index()));
+                self.push_n(1);
+                return Ok(());
+            }
             if let Some(loc) = self.lookup_local(&name) {
                 match loc {
                     VarLoc::Slot(slot) => self.emit(Instr::LoadLocal(slot)),
@@ -6561,6 +6581,558 @@ pub fn build_bbu_from_forms(
     put_u32(&mut out, handler_cases.len() as u32);
     out.extend_from_slice(&handler_cases);
     Ok(out)
+}
+
+/// Assemble a `BYTECODE_UNIT` payload from an already-populated pool, function
+/// table, and load-action list. Shared by `build_bbu_from_forms` (compile-file)
+/// and `build_image_from_runtime` (save-lisp-and-die).
+fn assemble_bbu(
+    pool: &BbuConstPool,
+    functions: &[BbuFunction],
+    load_actions: &[(u8, u8, u32, u32, u32)],
+    source_file_ref: u32,
+    content_tag: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(BBU_MAGIC);
+    put_u16(&mut out, BBU_BYTECODE_VERSION);
+    put_u16(&mut out, BBU_VERIFIER_VERSION);
+    put_u32(&mut out, BBU_UNIT_COMPLETE);
+    put_u32(&mut out, pool.entries.len() as u32);
+    put_u32(&mut out, functions.len() as u32);
+    put_u32(&mut out, load_actions.len() as u32);
+    put_u32(&mut out, 3);
+    put_u32(&mut out, source_file_ref);
+    put_u64(&mut out, fnv1a64(content_tag));
+    for entry in &pool.entries {
+        out.extend_from_slice(entry);
+    }
+    for function in functions {
+        serialize_bbu_function_record(&mut out, function);
+    }
+    for &(kind, flags, arg0, arg1, arg2) in load_actions {
+        put_u8(&mut out, kind);
+        put_u8(&mut out, flags);
+        put_u32(&mut out, arg0);
+        put_u32(&mut out, arg1);
+        put_u32(&mut out, arg2);
+    }
+    let metadata = serialize_bbu_function_metadata(functions);
+    put_u16(&mut out, BBU_AUX_FUNCTION_METADATA);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, metadata.len() as u32);
+    out.extend_from_slice(&metadata);
+    let restart_tables = serialize_bbu_restart_tables(functions);
+    put_u16(&mut out, BBU_AUX_RESTART_TABLES);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, restart_tables.len() as u32);
+    out.extend_from_slice(&restart_tables);
+    let handler_cases = serialize_bbu_handler_cases(functions);
+    put_u16(&mut out, BBU_AUX_HANDLER_CASES);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, handler_cases.len() as u32);
+    out.extend_from_slice(&handler_cases);
+    out
+}
+
+/// Rebuild a function-name FORM from an `env.methods`/`env.generics` key: a
+/// `(SETF PLACE)` writer key becomes the cons `(SETF PLACE)`; any other key its
+/// interned symbol. Returns None if a needed symbol can't be interned.
+fn image_function_name_form(key: &str) -> Option<BlissVal> {
+    if let Some(inner) = key.strip_prefix("(SETF ").and_then(|s| s.strip_suffix(')')) {
+        let setf = resolve_sym("SETF")?;
+        let place = resolve_sym(inner)?;
+        return Some(arena_cons(setf, arena_cons(place, NIL)));
+    }
+    resolve_sym(key)
+}
+
+/// The real, correctly package-homed name symbol of a user class named `bare`,
+/// recovered from its metaobject (its `class_name`). Reconstructing a class name
+/// by re-reading the bare string would intern it in the wrong package and split
+/// its identity from the callers that reference it; the metaobject preserves the
+/// identity established at `defclass` time. Falls back to a plain read when no
+/// class metaobject is registered (e.g. a built-in superclass).
+fn image_class_symbol(bare: &str) -> Option<BlissVal> {
+    let probe = resolve_sym(bare)?;
+    if let Some(class) = bliss_stdlib::find_class(probe) {
+        let name = bliss_stdlib::class_name(class);
+        if name.is_symbol() {
+            return Some(name);
+        }
+    }
+    Some(probe)
+}
+
+/// The home-package name of an interned symbol (the prefix of its registry key),
+/// or None for an unqualified (COMMON-LISP) symbol.
+fn image_home_package(sym: BlissVal) -> Option<String> {
+    let key = bliss_rt::symbols::registry_key(sym.as_symbol_index())?;
+    let pkg = key
+        .rsplit_once("::")
+        .or_else(|| key.rsplit_once(':'))
+        .map(|(p, _)| p)?;
+    if pkg.is_empty() {
+        None
+    } else {
+        Some(pkg.to_string())
+    }
+}
+
+/// Intern `name` in package `pkg` (or the current package when `pkg` is None), so
+/// a reconstructed symbol lands in the same package as the definition it belongs
+/// to instead of wherever the image happens to be loaded.
+fn image_qualified(pkg: &Option<String>, name: &str) -> Option<BlissVal> {
+    match pkg {
+        Some(p) => resolve_sym(&format!("{p}::{name}")),
+        None => resolve_sym(name),
+    }
+}
+
+/// The source name of a non-standard method combination, for a reconstructed
+/// `(:method-combination …)` option. `Standard` yields None (the default needs
+/// no defgeneric).
+fn image_combination_name(c: bliss_stdlib::MethodCombinationType) -> Option<&'static str> {
+    use bliss_stdlib::MethodCombinationType::*;
+    match c {
+        Standard => None,
+        Plus => Some("+"),
+        And => Some("AND"),
+        Or => Some("OR"),
+        List => Some("LIST"),
+        Append => Some("APPEND"),
+        Nconc => Some("NCONC"),
+        Min => Some("MIN"),
+        Max => Some("MAX"),
+        Progn => Some("PROGN"),
+    }
+}
+
+/// Serialize the current runtime WORLD — user-defined function definitions and
+/// bound global variables — into a source-independent `BYTECODE_UNIT`, so a
+/// fresh process that loads it is restored to this state without re-evaluating
+/// source (bliss-5uj, step 1: reconstruct from the heap using the proven .bfasl
+/// materialize/install path). The image is layered on top of the bootstrap
+/// prelude, which a restoring process loads first. Compiled (bytecode) functions
+/// are serialized directly; a still-tree-walked definition is emitted as a
+/// portable `(defun …)` source action; a global whose value is not serializable
+/// (a stream, a closure, …) is skipped. The user package graph is recreated via
+/// ensure-package load actions, and CLOS classes / generic functions / methods
+/// are reconstructed as `(defclass …)` / `(defgeneric …)` / `(defmethod …)`
+/// source actions from the retained metaobject definitions.
+pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, BlissError> {
+    let mut pool = BbuConstPool::default();
+    let source_file_ref = pool.string("<image>");
+    let mut functions: Vec<BbuFunction> = Vec::new();
+    let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
+    let defun = resolve_sym("DEFUN");
+    let quote = resolve_sym("QUOTE");
+
+    // ── Packages ───────────────────────────────────────────────────
+    // Recreate the user package graph (name, nicknames, use-list, present
+    // symbols) via the same deterministic ensure-package / intern load actions
+    // the compiler emits for DEFPACKAGE. Standard packages are recreated by the
+    // runtime and skipped. Emitted first so later symbols resolve into their
+    // home packages. NOTE: exports are handled LAST, not here — the kind-1
+    // export path's intern fallback can mint a fresh symbol that shadows the
+    // materialized one carrying a function/value; a trailing standard EXPORT on
+    // the canonical symbols only flips their visibility, preserving identity.
+    let mut pending_exports: Vec<(String, Vec<BlissVal>)> = Vec::new();
+    for pkg in bliss_stdlib::list_all_packages() {
+        let Some(pname) = bliss_stdlib::package_name(pkg) else {
+            continue;
+        };
+        if matches!(
+            pname.as_str(),
+            "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD" | "BLISS" | "BLISS-EXT"
+                | "BLISS-INTERNAL"
+        ) {
+            continue;
+        }
+        let nicknames = bliss_stdlib::package_nicknames(pkg);
+        let uses: Vec<String> = bliss_stdlib::package_use_list(pkg)
+            .into_iter()
+            .filter_map(bliss_stdlib::package_name)
+            .collect();
+        let package_ref = pool.package(&pname, &nicknames);
+        let use_refs: Vec<u32> = uses.iter().map(|n| pool.string(n)).collect();
+        let uses_ref = pool.vector(&use_refs);
+        let empty_exports = pool.vector(&[]);
+        load_actions.push((1, 0, package_ref, uses_ref, empty_exports));
+        // Intern every present symbol via the identity-safe kind-2 path so a
+        // package's own symbols (including ones with no function/value) exist.
+        for s in bliss_stdlib::present_symbols(pkg) {
+            let bare = symbol_bare_name(&sym_name(s));
+            let name_ref = pool.string(&bare);
+            load_actions.push((2, 0, package_ref, name_ref, BBU_NO_INDEX));
+        }
+        let exports = bliss_stdlib::external_symbols_of(pkg);
+        if !exports.is_empty() {
+            pending_exports.push((pname, exports));
+        }
+    }
+
+    // ── CLOS classes ───────────────────────────────────────────────
+    // Reconstruct each user class as a `(defclass name (supers) (slots))` source
+    // action. Slot detail (initargs, initform source, readers/writers/accessor,
+    // :class allocation) is re-woven from the retained `SlotDef`s.
+    if let Some(defclass) = resolve_sym("DEFCLASS") {
+        let kw = |name: &str| resolve_sym(&format!(":{}", name));
+        let class_map = env.classes.borrow();
+        // Order classes so each superclass precedes its subclasses — CLOS
+        // requires the supers to exist first, and HashMap order is arbitrary.
+        let all_names: Vec<String> = class_map.keys().cloned().collect();
+        let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut order: Vec<String> = Vec::new();
+        while order.len() < all_names.len() {
+            let mut progressed = false;
+            for n in &all_names {
+                if emitted.contains(n) {
+                    continue;
+                }
+                // Ready once every user-class super has already been emitted;
+                // built-in supers (not in the map) impose no constraint.
+                let ready = class_map[n]
+                    .supers
+                    .iter()
+                    .all(|s| !class_map.contains_key(s) || emitted.contains(s));
+                if ready {
+                    order.push(n.clone());
+                    emitted.insert(n.clone());
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                // Inheritance cycle or naming mismatch: emit the remainder as-is.
+                for n in &all_names {
+                    if emitted.insert(n.clone()) {
+                        order.push(n.clone());
+                    }
+                }
+                break;
+            }
+        }
+        for cname in &order {
+            let cd = &class_map[cname];
+            let Some(name_sym) = image_class_symbol(&cd.name) else {
+                continue;
+            };
+            // Slot names and accessor/reader/writer generics live in the class's
+            // home package; reconstruct them there so their identity matches the
+            // methods and callers that reference them.
+            let pkg = image_home_package(name_sym);
+            let supers: Vec<BlissVal> = cd
+                .supers
+                .iter()
+                .filter_map(|s| image_class_symbol(s).or_else(|| resolve_sym(s)))
+                .collect();
+            let supers_list = vec_to_list(&supers);
+            let mut slot_forms: Vec<BlissVal> = Vec::new();
+            for slot in &cd.slots {
+                let Some(slot_name) = image_qualified(&pkg, &slot.name) else {
+                    continue;
+                };
+                let mut spec: Vec<BlissVal> = vec![slot_name];
+                for ia in &slot.initargs {
+                    if let (Some(k), Some(v)) = (kw("INITARG"), kw(ia)) {
+                        spec.push(k);
+                        spec.push(v);
+                    }
+                }
+                for r in &slot.readers {
+                    if let (Some(k), Some(v)) = (kw("READER"), image_qualified(&pkg, r)) {
+                        spec.push(k);
+                        spec.push(v);
+                    }
+                }
+                for w in &slot.writers {
+                    if let (Some(k), Some(v)) = (kw("WRITER"), image_qualified(&pkg, w)) {
+                        spec.push(k);
+                        spec.push(v);
+                    }
+                }
+                if let Some(acc) = &slot.accessor {
+                    if let (Some(k), Some(v)) = (kw("ACCESSOR"), image_qualified(&pkg, acc)) {
+                        spec.push(k);
+                        spec.push(v);
+                    }
+                }
+                if let Some(initform) = slot.initform {
+                    if let Some(k) = kw("INITFORM") {
+                        spec.push(k);
+                        spec.push(initform);
+                    }
+                }
+                if matches!(slot.allocation, super::SlotAllocation::Class) {
+                    if let (Some(k), Some(v)) = (kw("ALLOCATION"), kw("CLASS")) {
+                        spec.push(k);
+                        spec.push(v);
+                    }
+                }
+                slot_forms.push(vec_to_list(&spec));
+            }
+            let slots_list = vec_to_list(&slot_forms);
+            let form = vec_to_list(&[defclass, name_sym, supers_list, slots_list]);
+            if let Some(form_ref) = pool.value(form) {
+                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+            }
+        }
+    }
+
+    // ── Generic functions (non-standard method combination) ────────
+    // A defmethod auto-creates a standard-combination generic, so only generics
+    // with a non-standard method combination need an explicit defgeneric to set
+    // it; the declared lambda-list arity is taken from a method's specializers.
+    if let Some(defgeneric) = resolve_sym("DEFGENERIC") {
+        for (gname, gd) in env.generics.borrow().iter() {
+            let Some(comb) = image_combination_name(gd.combination) else {
+                continue;
+            };
+            // Recover the generic's real, package-homed name symbol from its
+            // metaobject; the map key is only the bare name.
+            let Some(name_form) = bliss_stdlib::generic_function_name(gd.generic_function)
+                .filter(|n| n.is_symbol() || n.is_cons())
+                .or_else(|| image_function_name_form(gname))
+            else {
+                continue;
+            };
+            let arity = env
+                .methods
+                .borrow()
+                .get(gname)
+                .and_then(|ms| ms.first().map(|m| m.specializers.len()))
+                .unwrap_or(0);
+            let params: Vec<BlissVal> =
+                (0..arity).filter_map(|i| resolve_sym(&format!("A{i}"))).collect();
+            let params_list = vec_to_list(&params);
+            let (Some(mc_kw), Some(comb_sym)) =
+                (resolve_sym(":METHOD-COMBINATION"), resolve_sym(comb))
+            else {
+                continue;
+            };
+            let mc_option = vec_to_list(&[mc_kw, comb_sym]);
+            let form = vec_to_list(&[defgeneric, name_form, params_list, mc_option]);
+            if let Some(form_ref) = pool.value(form) {
+                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+            }
+        }
+    }
+
+    // ── Methods ────────────────────────────────────────────────────
+    // Reconstruct `(defmethod name [qualifier] (specialized-lambda-list) . body)`
+    // by re-weaving the stripped specializers back into the plain lambda list.
+    if let Some(defmethod) = resolve_sym("DEFMETHOD") {
+        let generics = env.generics.borrow();
+        for (mname, defs) in env.methods.borrow().iter() {
+            // Prefer the generic's real name symbol (correct package identity);
+            // fall back to reconstructing it from the bare key.
+            let name_form = generics
+                .get(mname)
+                .and_then(|gd| bliss_stdlib::generic_function_name(gd.generic_function))
+                .filter(|n| n.is_symbol() || n.is_cons())
+                .or_else(|| image_function_name_form(mname));
+            let Some(name_form) = name_form else {
+                continue;
+            };
+            for m in defs {
+                let qual = match m.qualifier {
+                    bliss_stdlib::MethodQualifier::Before => resolve_sym(":BEFORE"),
+                    bliss_stdlib::MethodQualifier::After => resolve_sym(":AFTER"),
+                    bliss_stdlib::MethodQualifier::Around => resolve_sym(":AROUND"),
+                    bliss_stdlib::MethodQualifier::Primary => None,
+                };
+                let plain = list_to_vec(m.lambda_list);
+                let mut spec_params: Vec<BlissVal> = Vec::new();
+                let mut ok = true;
+                for (i, p) in plain.iter().enumerate() {
+                    if i >= m.specializers.len() {
+                        spec_params.push(*p);
+                        continue;
+                    }
+                    match &m.specializers[i] {
+                        super::MethodSpecializer::Any => spec_params.push(*p),
+                        super::MethodSpecializer::Class(c) => {
+                            match image_class_symbol(c).or_else(|| resolve_sym(c)) {
+                                Some(csym) => spec_params.push(vec_to_list(&[*p, csym])),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        super::MethodSpecializer::Eql(v) => {
+                            match (resolve_sym("EQL"), quote) {
+                                (Some(eql), Some(q)) => {
+                                    let quoted = vec_to_list(&[q, *v]);
+                                    let eql_form = vec_to_list(&[eql, quoted]);
+                                    spec_params.push(vec_to_list(&[*p, eql_form]));
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let spec_ll = vec_to_list(&spec_params);
+                // (defmethod name [qualifier] spec_ll . body)
+                let after_ll = arena_cons(spec_ll, m.body);
+                let after_name = match qual {
+                    Some(q) => arena_cons(q, after_ll),
+                    None => after_ll,
+                };
+                let form = arena_cons(defmethod, arena_cons(name_form, after_name));
+                if let Some(form_ref) = pool.value(form) {
+                    load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+                }
+            }
+        }
+    }
+
+    // ── Functions ──────────────────────────────────────────────────
+    // A user function lives either in `env.funs` (tree-walked, with its source
+    // lambda-list + body) or in the symbol's global function cell as installed
+    // bytecode (`registry_get`). Emit the former as a portable `(defun …)`
+    // source action and the latter as a direct bytecode install.
+    let mut done_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(defun) = defun {
+        for (name, fdef) in env.funs.borrow().iter() {
+            let Some(name_sym) = resolve_sym(name) else {
+                continue;
+            };
+            if !name_sym.is_symbol() {
+                continue;
+            }
+            // (defun name lambda-list . body)
+            let form = arena_cons(
+                defun,
+                arena_cons(name_sym, arena_cons(fdef.params_form, fdef.body)),
+            );
+            if let Some(form_ref) = pool.value(form) {
+                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+                done_names.insert(name.clone());
+            }
+        }
+    }
+    let mut fn_syms: Vec<(u32, BlissVal)> = Vec::new();
+    bliss_rt::symbols::for_each_bound_function(|idx, _name, func| fn_syms.push((idx, func)));
+    for (idx, func) in fn_syms {
+        let name = sym_name(BlissVal::from_symbol_index(idx));
+        if done_names.contains(&name) {
+            continue;
+        }
+        let Some(name_ref) = pool.symbol_by_index(idx) else {
+            continue;
+        };
+        // Prefer installed bytecode; otherwise re-express a tree-walked
+        // interpreted-function from its retained source lambda-list + body.
+        if let Some(bf) = registry_get(idx) {
+            if let Some(function_index) =
+                serialize_bbu_function_tree(&bf, name_ref, BBU_FUNC_NAMED, &mut pool, &mut functions)
+            {
+                load_actions.push((3, 0, function_index, name_ref, BBU_NO_INDEX));
+                continue;
+            }
+        }
+        if let Some(defun) = defun {
+            if bliss_rt::function::is_interpreted_function(func) {
+                let body = bliss_rt::function::body(func);
+                if body.is_cons() {
+                    let lambda_list = bliss_rt::function::lambda_list(func);
+                    let name_sym = BlissVal::from_symbol_index(idx);
+                    let form =
+                        arena_cons(defun, arena_cons(name_sym, arena_cons(lambda_list, body)));
+                    if let Some(form_ref) = pool.value(form) {
+                        load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Global variables ───────────────────────────────────────────
+    // A runtime DEFVAR/DEFPARAMETER (a prelude macro) stores into the symbol's
+    // global value cell; a few prelude constants are seeded into the root frame.
+    // Capture both, deduped by symbol index. Values that are not serializable
+    // (streams, closures, live instances) yield `pool.value` == None and are
+    // skipped, leaving user data (numbers, strings, lists, symbols).
+    let defparameter = resolve_sym("DEFPARAMETER");
+    if let (Some(quote), Some(defparameter)) = (quote, defparameter) {
+        let mut emitted: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // Emit `(defparameter sym (quote value))` restoring `sym` to `value` via
+        // the same path the original DEFPARAMETER/DEFVAR used, so lookups find it.
+        // Non-serializable values (streams, packages, hash-tables, instances) can't
+        // be encoded into the constant pool; `pool.value` returns None for them, so
+        // they are silently skipped — leaving user data (numbers, strings, lists,
+        // symbols), which is exactly what a restored image should carry.
+        let mut emit_global = |idx: u32, value: BlissVal, pool: &mut BbuConstPool,
+                               load_actions: &mut Vec<(u8, u8, u32, u32, u32)>| {
+            if !emitted.insert(idx) {
+                return;
+            }
+            if value == bliss_rt::value::UNBOUND {
+                return;
+            }
+            let sym = BlissVal::from_symbol_index(idx);
+            let quoted = arena_cons(quote, arena_cons(value, NIL));
+            let form = arena_cons(defparameter, arena_cons(sym, arena_cons(quoted, NIL)));
+            if let Some(form_ref) = pool.value(form) {
+                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+            }
+        };
+        // (1) Global symbol value cells: runtime DEFPARAMETER/DEFVAR (a prelude
+        //     macro) stores here, not in an env frame.
+        for (idx, _name) in bliss_rt::symbols::interned_names() {
+            if let Some(value) = bliss_rt::symbols::symbol_value(idx) {
+                emit_global(idx, value, &mut pool, &mut load_actions);
+            }
+        }
+        // (2) Frame-level special bindings (e.g. prelude constants seeded into the
+        //     top-level frame) not reflected in a global value cell.
+        let mut frame = Some(Rc::clone(&env.frame));
+        while let Some(f) = frame {
+            let borrowed = f.borrow();
+            for (&idx, &value) in borrowed.symbol_vars.iter() {
+                emit_global(idx, value, &mut pool, &mut load_actions);
+            }
+            frame = borrowed.parent.clone();
+        }
+    }
+
+    // ── Package exports (last) ─────────────────────────────────────
+    // Now that every function/global/CLOS symbol is installed on its canonical
+    // identity, flip the exported ones' visibility with a standard EXPORT so the
+    // package interface is restored without disturbing those bindings.
+    if let (Some(export_op), Some(quote), Some(find_package)) = (
+        resolve_sym("EXPORT"),
+        quote,
+        resolve_sym("FIND-PACKAGE"),
+    ) {
+        for (pname, syms) in &pending_exports {
+            let quoted = vec_to_list(&[quote, vec_to_list(syms)]);
+            let find = vec_to_list(&[find_package, arena_str(pname)]);
+            let form = vec_to_list(&[export_op, quoted, find]);
+            if let Some(form_ref) = pool.value(form) {
+                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+            }
+        }
+    }
+
+    let payload = assemble_bbu(
+        &pool,
+        &functions,
+        &load_actions,
+        source_file_ref,
+        b"bliss-image",
+    );
+    Ok(bliss_rt::bfasl::BfaslBuilder::new()
+        .content_hash(bliss_rt::bfasl::content_hash(b"bliss-image"))
+        .section(bliss_rt::bfasl::section::BYTECODE_UNIT, payload)
+        .build())
 }
 
 #[derive(Clone, Debug)]
