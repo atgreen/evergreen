@@ -3,7 +3,7 @@
 //! Expansion runs after reading and before IR construction.
 //! Implements the algorithm from spec §4.2 / A4.01.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -552,13 +552,127 @@ pub fn parse_macro(
 }
 
 /// Close a parsed macro lambda-expression over the given lexical environment.
+/// A MACROLET local-macro expander's captured state, held where the GC can
+/// find it. The `lambda_list`/`body` are reader-built forms and `defining_env`
+/// carries movable binding payloads; a relocating minor GC moves them while the
+/// expander sits registered, so capturing them by value inside the `Arc` closure
+/// would leave stale pointers that corrupt every later expansion of the macro
+/// (bliss-noh — observed as wrong or cyclic macrolet expansions under
+/// BLISS_GC_STRESS). The closure re-reads the GC-updated values from this table
+/// by key at call time instead.
+struct MacroletCapture {
+    lambda_list: BlissVal,
+    body: BlissVal,
+    defining_env: Environment,
+}
+
+static MACROLET_CAPTURE_TABLE: LazyLock<OrderedRwLock<HashMap<u64, MacroletCapture>>> =
+    LazyLock::new(|| {
+        OrderedRwLock::new(
+            LockLevel::GcWorld,
+            8,
+            "GC-rooted macrolet expander captures",
+            HashMap::new(),
+        )
+    });
+
+fn scan_macrolet_capture_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let mut table = MACROLET_CAPTURE_TABLE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for capture in table.values_mut() {
+        visit(&mut capture.lambda_list);
+        visit(&mut capture.body);
+        capture.defining_env.visit_gc_roots(visit);
+    }
+}
+
+fn install_macrolet_capture_root_scanner() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_macrolet_capture_roots));
+}
+
+thread_local! {
+    /// Addresses of `expansion_env` Environments currently evaluating a MACROLET
+    /// expander body. That environment binds the macro's arguments (which may be
+    /// movable conses) as `VariableInfo::Constant`s and is a plain Rust local, so
+    /// the collector cannot otherwise see it; the mini-evaluator allocates while
+    /// reading those bindings, so a moving GC would leave them stale (bliss-noh).
+    static ACTIVE_EXPANSION_ENVS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+fn scan_active_expansion_envs(visit: &mut dyn FnMut(*mut BlissVal)) {
+    ACTIVE_EXPANSION_ENVS.with(|stack| {
+        for &address in stack.borrow().iter() {
+            // SAFETY: an address is registered only for the lexical extent in
+            // which its owning `Environment` local is live and immobile (the
+            // guard is dropped before the local goes out of scope).
+            unsafe { (*(address as *mut Environment)).visit_gc_roots(visit) };
+        }
+    });
+}
+
+fn install_expansion_env_root_scanner() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_active_expansion_envs));
+}
+
+/// Roots an `expansion_env` for the extent of a MACROLET expander body eval.
+struct ExpansionEnvGuard(usize);
+
+impl ExpansionEnvGuard {
+    fn new(env: &mut Environment) -> Self {
+        install_expansion_env_root_scanner();
+        let address = env as *mut Environment as usize;
+        ACTIVE_EXPANSION_ENVS.with(|stack| stack.borrow_mut().push(address));
+        ExpansionEnvGuard(address)
+    }
+}
+
+impl Drop for ExpansionEnvGuard {
+    fn drop(&mut self) {
+        ACTIVE_EXPANSION_ENVS.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if let Some(index) = stack.iter().rposition(|&a| a == self.0) {
+                stack.remove(index);
+            }
+        });
+    }
+}
+
 pub fn enclose(parsed: ParsedMacro, env: &Environment) -> Result<BlissVal, BlissError> {
     let key = next_registered_macro_key();
-    let defining_env = env.clone();
     let _ = parsed.name;
-    let lambda_list = parsed.lambda_list;
-    let body = parsed.body;
+    install_macrolet_capture_root_scanner();
+    MACROLET_CAPTURE_TABLE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            key.0,
+            MacroletCapture {
+                lambda_list: parsed.lambda_list,
+                body: parsed.body,
+                defining_env: env.clone(),
+            },
+        );
     let func = Arc::new(move |whole_form: BlissVal, call_env: &Environment| {
+        // Re-read the GC-updated capture rather than a stale by-value copy
+        // (bliss-noh). No `alloc_typed` runs while the read lock is held (the
+        // Environment clone uses the Rust allocator, which never fires the
+        // bliss collector), so the GC scanner's write lock cannot deadlock here.
+        let (lambda_list, body, defining_env) = {
+            let table = MACROLET_CAPTURE_TABLE
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let capture = table.get(&key.0).ok_or_else(|| {
+                BlissError::Internal("MACROLET: local macro expander capture vanished".into())
+            })?;
+            (
+                capture.lambda_list,
+                capture.body,
+                capture.defining_env.clone(),
+            )
+        };
         expand_local_macro_call(whole_form, call_env, &defining_env, lambda_list, body)
     });
     register_macro_function(key, func);
@@ -647,15 +761,30 @@ unsafe fn cons_cdr(val: BlissVal) -> BlissVal {
     unsafe { (*ptr).cdr }
 }
 
-/// Allocate a new cons cell with the given car and cdr.
+/// Allocate a new cons cell with the given car and cdr on the shared GC heap.
 /// Returns a cons-tagged BlissVal pointing to the new cell.
 ///
-/// The cell is heap-allocated and leaked (ownership transferred to the GC).
-/// In a full implementation, this would use the GC allocator.
+/// Uses the same allocation path and layout as the reader and the T0 evaluator
+/// (a headered CONS object whose body is `[car@0, cdr@8]`, which `from_cons_ptr`
+/// points at), so the rebuilt-form spines this module builds are traceable by
+/// the collector rather than leaked Rust boxes with fields that rot after a
+/// moving GC (bliss-noh; the earlier `Box::into_raw` cells silently corrupted
+/// macrolet expansions under BLISS_GC_STRESS). Roots `car`/`cdr` across the
+/// allocation, which can itself fire a relocating minor GC.
 fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
-    let cell = Box::new(ConsCell { car, cdr });
-    let ptr = Box::into_raw(cell) as *mut u8;
-    unsafe { BlissVal::from_cons_ptr(ptr) }
+    let roots = bliss_rt::gc::ShadowRootScope::new();
+    let car = roots.root(car);
+    let cdr = roots.root(cdr);
+    let body = match bliss_rt::gc::alloc_typed(16, bliss_rt::object::type_id::CONS) {
+        Some(b) => b,
+        None => std::alloc::handle_alloc_error(std::alloc::Layout::new::<ConsCell>()),
+    };
+    unsafe {
+        let cell = body as *mut ConsCell;
+        (*cell).car = car.get();
+        (*cell).cdr = cdr.get();
+        BlissVal::from_cons_ptr(body)
+    }
 }
 
 // ── Expansion functions ────────────────────────────────────────────
@@ -817,13 +946,15 @@ fn fingerprint_into(form: BlissVal, depth: usize, hasher: &mut DefaultHasher) {
 }
 
 /// Expand a list of forms, returning a new list.
-fn expand_body(forms: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let items = cons_to_vec(forms);
-    let mut expanded_items = Vec::with_capacity(items.len());
+fn expand_body(mut forms: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _forms_root = bliss_rt::gc::StackRoot::new(&mut forms);
+    let items = bliss_rt::gc::HostRoot::new(cons_to_vec(forms));
+    let mut expanded_items = bliss_rt::gc::HostRoot::new(Vec::with_capacity(items.len()));
     let mut changed = false;
-    for item in &items {
-        let exp = macroexpand_all(*item, env)?;
-        if exp != *item {
+    for i in 0..items.len() {
+        let exp = macroexpand_all(items[i], env)?;
+        if exp != items[i] {
             changed = true;
         }
         expanded_items.push(exp);
@@ -862,7 +993,7 @@ fn is_lambda_expression(val: BlissVal) -> bool {
 ///    operator was already checked for macros by macroexpand above.
 pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
     // Step 1: Macroexpand the top-level form
-    let (expanded, _) = macroexpand(form, env)?;
+    let (mut expanded, _) = macroexpand(form, env)?;
 
     // Step 2: If the result is an atom (not a cons), we're done.
     // NIL is an atom (it's the empty list, not a cons cell).
@@ -871,7 +1002,11 @@ pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
     }
 
     // Step 3: The form is a compound (cons cell).
-    let operator = unsafe { cons_car(expanded) };
+    let mut operator = unsafe { cons_car(expanded) };
+
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _expanded_root = bliss_rt::gc::StackRoot::new(&mut expanded);
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
 
     // Step 3.a: QUOTE suppression (spec §4.2.7).
     // Quoted data is opaque — no sub-form expansion should occur.
@@ -918,11 +1053,15 @@ pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
 
 /// Expand the arguments of a function call form, leaving the operator untouched.
 fn expand_function_call_args(
-    operator: BlissVal,
-    form: BlissVal,
+    mut operator: BlissVal,
+    mut form: BlissVal,
     env: &Environment,
 ) -> Result<BlissVal, BlissError> {
-    let cdr = unsafe { cons_cdr(form) };
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let mut cdr = unsafe { cons_cdr(form) };
+    let _cdr_root = bliss_rt::gc::StackRoot::new(&mut cdr);
     let expanded_cdr = if cdr.is_cons() {
         walk_cons(cdr, env)?
     } else if !cdr.is_nil() {
@@ -1012,14 +1151,20 @@ fn expand_special_form(
 /// Expand BLOCK: (block name body...)
 /// Block name is NOT expanded; body forms are expanded.
 /// The block name is registered in the environment.
-fn expand_block(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_block(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let mut operator = unsafe { cons_car(form) };
     let args = unsafe { cons_cdr(form) };
     if !args.is_cons() {
         return Ok(form);
     }
-    let block_name = unsafe { cons_car(args) };
-    let body = unsafe { cons_cdr(args) };
+    let mut block_name = unsafe { cons_car(args) };
+    let mut body = unsafe { cons_cdr(args) };
+
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
+    let _block_name_root = bliss_rt::gc::StackRoot::new(&mut block_name);
+    let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
 
     // Augment env with block name
     let new_env = env.augment_block(block_name);
@@ -1034,19 +1179,24 @@ fn expand_block(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissErro
 
 /// Expand RETURN-FROM: (return-from name result-form)
 /// Block name is NOT expanded; result form is expanded.
-fn expand_return_from(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_return_from(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let mut operator = unsafe { cons_car(form) };
     let args = unsafe { cons_cdr(form) };
     if !args.is_cons() {
         return Ok(form);
     }
-    let block_name = unsafe { cons_car(args) };
+    let mut block_name = unsafe { cons_car(args) };
     let rest = unsafe { cons_cdr(args) };
 
     if !rest.is_cons() {
         return Ok(form);
     }
-    let result_form = unsafe { cons_car(rest) };
+    let mut result_form = unsafe { cons_car(rest) };
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
+    let _block_name_root = bliss_rt::gc::StackRoot::new(&mut block_name);
+    let _result_form_root = bliss_rt::gc::StackRoot::new(&mut result_form);
     let expanded_result = macroexpand_all(result_form, env)?;
 
     if expanded_result == result_form {
@@ -1064,30 +1214,34 @@ fn expand_return_from(form: BlissVal, env: &Environment) -> Result<BlissVal, Bli
 
 /// Expand TAGBODY: (tagbody {tag|form}*)
 /// Tags (symbols and integers) are NOT expanded. Non-tag forms are expanded.
-fn expand_tagbody(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_tagbody(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    let mut operator = unsafe { cons_car(form) };
     let body = unsafe { cons_cdr(form) };
+
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
 
     // First pass: register all tags in the environment
     let mut new_env = env.clone();
-    let items = cons_to_vec(body);
-    for item in &items {
+    let items = bliss_rt::gc::HostRoot::new(cons_to_vec(body));
+    for i in 0..items.len() {
         // Tags are symbols or integers (atoms that are not cons)
-        if item.is_symbol() && !item.is_nil() {
-            new_env = new_env.augment_tag(*item);
+        if items[i].is_symbol() && !items[i].is_nil() {
+            new_env = new_env.augment_tag(items[i]);
         }
     }
 
     // Second pass: expand non-tag forms
-    let mut expanded_items = Vec::with_capacity(items.len());
+    let mut expanded_items = bliss_rt::gc::HostRoot::new(Vec::with_capacity(items.len()));
     let mut changed = false;
-    for item in &items {
-        if (item.is_symbol() && !item.is_nil()) || item.is_fixnum() {
+    for i in 0..items.len() {
+        if (items[i].is_symbol() && !items[i].is_nil()) || items[i].is_fixnum() {
             // Tags: symbols and integers are NOT expanded
-            expanded_items.push(*item);
+            expanded_items.push(items[i]);
         } else {
-            let exp = macroexpand_all(*item, &new_env)?;
-            if exp != *item {
+            let exp = macroexpand_all(items[i], &new_env)?;
+            if exp != items[i] {
                 changed = true;
             }
             expanded_items.push(exp);
@@ -1105,10 +1259,13 @@ fn expand_tagbody(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissEr
 /// For each pair: if var is a symbol macro, convert to (setf expansion expanded-value).
 /// Otherwise, expand value only (var is NOT expanded).
 /// Spec §4.2.6, R4.13.
-fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_setq(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let mut operator = unsafe { cons_car(form) };
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
     let args = unsafe { cons_cdr(form) };
-    let items = cons_to_vec(args);
+    let items = bliss_rt::gc::HostRoot::new(cons_to_vec(args));
 
     if items.len() % 2 != 0 {
         return Err(BlissError::Internal(
@@ -1116,7 +1273,13 @@ fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
         ));
     }
 
-    let mut result_pairs = Vec::new();
+    // result_pairs split into parallel rooted Vecs (3-tuples are not HostRoot-able).
+    let mut rp_vars: bliss_rt::gc::HostRoot<Vec<BlissVal>> =
+        bliss_rt::gc::HostRoot::new(Vec::new());
+    let mut rp_valforms: bliss_rt::gc::HostRoot<Vec<BlissVal>> =
+        bliss_rt::gc::HostRoot::new(Vec::new());
+    let mut rp_setf: bliss_rt::gc::HostRoot<Vec<Option<BlissVal>>> =
+        bliss_rt::gc::HostRoot::new(Vec::new());
     let mut any_symbol_macro = false;
     let mut changed = false;
 
@@ -1128,7 +1291,10 @@ fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
         if let Some(VariableInfo::SymbolMacro(expansion)) = env.variable_information(var) {
             // Convert (setq sym val) -> (setf expansion expanded-val)
             any_symbol_macro = true;
-            let expanded_val = macroexpand_all(val_form, env)?;
+            let mut expansion = expansion;
+            let _expansion_root = bliss_rt::gc::StackRoot::new(&mut expansion);
+            let mut expanded_val = macroexpand_all(val_form, env)?;
+            let _expanded_val_root = bliss_rt::gc::StackRoot::new(&mut expanded_val);
             let setf_sym = make_symbol("SETF");
             let setf_form = alloc_cons(
                 setf_sym,
@@ -1136,24 +1302,30 @@ fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
             );
             // Re-enter expand-form on the setf form
             let expanded_setf = macroexpand_all(setf_form, env)?;
-            result_pairs.push((var, val_form, Some(expanded_setf)));
+            rp_vars.push(items[i]);
+            rp_valforms.push(items[i + 1]);
+            rp_setf.push(Some(expanded_setf));
         } else {
             // Normal case: expand value, don't expand var
             let expanded_val = macroexpand_all(val_form, env)?;
-            if expanded_val != val_form {
+            if expanded_val != items[i + 1] {
                 changed = true;
             }
-            result_pairs.push((var, val_form, None));
+            rp_vars.push(items[i]);
+            rp_valforms.push(items[i + 1]);
+            rp_setf.push(None);
         }
     }
 
     if any_symbol_macro {
         // If we have multiple pairs and any had symbol-macro conversion,
         // wrap in PROGN for multiple setf forms, or return single form.
-        let mut setf_forms = Vec::new();
-        let mut normal_pairs = Vec::new();
-        for (var, val_form, setf_result) in &result_pairs {
-            if let Some(setf_form) = setf_result {
+        let mut setf_forms: bliss_rt::gc::HostRoot<Vec<BlissVal>> =
+            bliss_rt::gc::HostRoot::new(Vec::new());
+        let mut normal_pairs: bliss_rt::gc::HostRoot<Vec<(BlissVal, BlissVal)>> =
+            bliss_rt::gc::HostRoot::new(Vec::new());
+        for idx in 0..rp_setf.len() {
+            if rp_setf[idx].is_some() {
                 // Flush any accumulated normal setq pairs
                 if !normal_pairs.is_empty() {
                     let setq_sym = operator;
@@ -1164,10 +1336,10 @@ fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
                     }
                     setf_forms.push(alloc_cons(setq_sym, vec_to_cons(&setq_args)));
                 }
-                setf_forms.push(*setf_form);
+                setf_forms.push(rp_setf[idx].unwrap());
             } else {
-                let expanded_val = macroexpand_all(*val_form, env)?;
-                normal_pairs.push((*var, expanded_val));
+                let expanded_val = macroexpand_all(rp_valforms[idx], env)?;
+                normal_pairs.push((rp_vars[idx], expanded_val));
             }
         }
         // Flush remaining normal pairs
@@ -1182,7 +1354,7 @@ fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
         }
 
         if setf_forms.len() == 1 {
-            return Ok(setf_forms.into_iter().next().unwrap());
+            return Ok(setf_forms[0]);
         } else {
             let progn_sym = make_symbol("PROGN");
             return Ok(alloc_cons(progn_sym, vec_to_cons(&setf_forms)));
@@ -1195,11 +1367,12 @@ fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
 
     // Reconstruct with expanded values
     let mut new_args = Vec::with_capacity(items.len());
-    for (var, _, _) in &result_pairs {
-        new_args.push(*var);
+    for idx in 0..rp_vars.len() {
+        new_args.push(rp_vars[idx]);
     }
     // Re-expand to get the right values
-    let mut final_args = Vec::with_capacity(items.len());
+    let mut final_args: bliss_rt::gc::HostRoot<Vec<BlissVal>> =
+        bliss_rt::gc::HostRoot::new(Vec::with_capacity(items.len()));
     for i in (0..items.len()).step_by(2) {
         final_args.push(items[i]); // var unchanged
         final_args.push(macroexpand_all(items[i + 1], env)?); // expand value
@@ -1209,18 +1382,23 @@ fn expand_setq(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
 
 /// Expand THE: (the type-spec value-form)
 /// Type specifier is NOT expanded; value form is expanded.
-fn expand_the(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_the(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let mut operator = unsafe { cons_car(form) };
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
     let args = unsafe { cons_cdr(form) };
     if !args.is_cons() {
         return Ok(form);
     }
-    let type_spec = unsafe { cons_car(args) };
+    let mut type_spec = unsafe { cons_car(args) };
+    let _type_spec_root = bliss_rt::gc::StackRoot::new(&mut type_spec);
     let rest = unsafe { cons_cdr(args) };
     if !rest.is_cons() {
         return Ok(form);
     }
-    let value_form = unsafe { cons_car(rest) };
+    let mut value_form = unsafe { cons_car(rest) };
+    let _value_form_root = bliss_rt::gc::StackRoot::new(&mut value_form);
     let expanded_value = macroexpand_all(value_form, env)?;
 
     if expanded_value == value_form {
@@ -1235,14 +1413,19 @@ fn expand_the(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError>
 
 /// Expand EVAL-WHEN: (eval-when (situation...) body...)
 /// Situations list is NOT expanded; body forms are expanded.
-fn expand_eval_when(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_eval_when(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let mut operator = unsafe { cons_car(form) };
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
     let args = unsafe { cons_cdr(form) };
     if !args.is_cons() {
         return Ok(form);
     }
-    let situations = unsafe { cons_car(args) };
-    let body = unsafe { cons_cdr(args) };
+    let mut situations = unsafe { cons_car(args) };
+    let _situations_root = bliss_rt::gc::StackRoot::new(&mut situations);
+    let mut body = unsafe { cons_cdr(args) };
+    let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
 
     let expanded_body = expand_body(body, env)?;
 
@@ -1256,13 +1439,17 @@ fn expand_eval_when(form: BlissVal, env: &Environment) -> Result<BlissVal, Bliss
 /// Expand FUNCTION special form: (function name) or (function (lambda ...))
 /// If the argument is a lambda expression, expand the lambda body.
 /// If it's a function name, no expansion.
-fn expand_function_special(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_function_special(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let mut operator = unsafe { cons_car(form) };
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
     let args = unsafe { cons_cdr(form) };
     if !args.is_cons() {
         return Ok(form);
     }
-    let arg = unsafe { cons_car(args) };
+    let mut arg = unsafe { cons_car(args) };
+    let _arg_root = bliss_rt::gc::StackRoot::new(&mut arg);
 
     // Check if the argument is a lambda expression
     if is_lambda_expression(arg) {
@@ -1284,14 +1471,19 @@ fn expand_function_special(form: BlissVal, env: &Environment) -> Result<BlissVal
 /// Expand a lambda expression: (lambda (params...) body...)
 /// Parameters are NOT expanded (they are binding names).
 /// Body is expanded in an env augmented with param bindings.
-fn expand_lambda_expression(lambda: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let lambda_sym = unsafe { cons_car(lambda) }; // LAMBDA
+fn expand_lambda_expression(mut lambda: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _lambda_root = bliss_rt::gc::StackRoot::new(&mut lambda);
+    let mut lambda_sym = unsafe { cons_car(lambda) }; // LAMBDA
+    let _lambda_sym_root = bliss_rt::gc::StackRoot::new(&mut lambda_sym);
     let rest = unsafe { cons_cdr(lambda) };
     if !rest.is_cons() {
         return Ok(lambda);
     }
-    let params = unsafe { cons_car(rest) }; // parameter list
-    let body = unsafe { cons_cdr(rest) }; // body forms
+    let mut params = unsafe { cons_car(rest) }; // parameter list
+    let _params_root = bliss_rt::gc::StackRoot::new(&mut params);
+    let mut body = unsafe { cons_cdr(rest) }; // body forms
+    let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
 
     // Augment environment with parameter bindings (shadow any symbol macros)
     let mut new_env = env.clone();
@@ -1320,14 +1512,19 @@ fn expand_lambda_expression(lambda: BlissVal, env: &Environment) -> Result<Bliss
 /// Expand a lambda call: ((lambda (params...) body...) arg1 arg2 ...)
 /// Expand the lambda body AND the arguments.
 fn expand_lambda_call(
-    operator: BlissVal,
-    form: BlissVal,
+    mut operator: BlissVal,
+    mut form: BlissVal,
     env: &Environment,
 ) -> Result<BlissVal, BlissError> {
-    let args = unsafe { cons_cdr(form) };
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let mut args = unsafe { cons_cdr(form) };
+    let _args_root = bliss_rt::gc::StackRoot::new(&mut args);
 
     // Expand the lambda expression
-    let expanded_lambda = expand_lambda_expression(operator, env)?;
+    let mut expanded_lambda = expand_lambda_expression(operator, env)?;
+    let _expanded_lambda_root = bliss_rt::gc::StackRoot::new(&mut expanded_lambda);
 
     // Expand the arguments
     let expanded_args = if args.is_cons() {
@@ -1348,32 +1545,40 @@ fn expand_lambda_call(
 /// Body is expanded in an env augmented with the new bindings (shadowing symbol macros).
 /// For LET, all init-forms are expanded in the outer env.
 /// For LET*, each init-form is expanded in an env augmented by prior bindings.
-fn expand_let(form: BlissVal, env: &Environment, sequential: bool) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_let(mut form: BlissVal, env: &Environment, sequential: bool) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let mut operator = unsafe { cons_car(form) };
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
     let args = unsafe { cons_cdr(form) };
     if !args.is_cons() {
         return Ok(form);
     }
     let bindings_list = unsafe { cons_car(args) };
-    let body = unsafe { cons_cdr(args) };
+    let mut body = unsafe { cons_cdr(args) };
+    let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
 
-    let bindings = cons_to_vec(bindings_list);
+    let bindings = bliss_rt::gc::HostRoot::new(cons_to_vec(bindings_list));
 
     // Expand init-forms and collect variable names
-    let mut expanded_bindings = Vec::with_capacity(bindings.len());
+    let mut expanded_bindings: bliss_rt::gc::HostRoot<Vec<BlissVal>> =
+        bliss_rt::gc::HostRoot::new(Vec::with_capacity(bindings.len()));
     let mut bindings_changed = false;
     let mut current_env = env.clone();
 
-    for binding in &bindings {
+    for idx in 0..bindings.len() {
+        let binding = bindings[idx];
         if binding.is_cons() {
             // (var init-form) pair
-            let var = unsafe { cons_car(*binding) };
-            let init_rest = unsafe { cons_cdr(*binding) };
-            let init_form = if init_rest.is_cons() {
+            let mut var = unsafe { cons_car(binding) };
+            let _var_root = bliss_rt::gc::StackRoot::new(&mut var);
+            let init_rest = unsafe { cons_cdr(binding) };
+            let mut init_form = if init_rest.is_cons() {
                 unsafe { cons_car(init_rest) }
             } else {
                 bliss_rt::value::NIL
             };
+            let _init_form_root = bliss_rt::gc::StackRoot::new(&mut init_form);
 
             // For LET*, expand in the progressively-augmented env
             // For LET, expand in the outer env
@@ -1395,18 +1600,19 @@ fn expand_let(form: BlissVal, env: &Environment, sequential: bool) -> Result<Bli
             }
         } else {
             // Bare symbol — (let (x) ...) means (let ((x nil)) ...)
-            expanded_bindings.push(*binding);
+            expanded_bindings.push(binding);
         }
     }
 
     // Build augmented env for the body
     let mut body_env = if sequential { current_env } else { env.clone() };
     if !sequential {
-        for binding in &bindings {
+        for idx in 0..bindings.len() {
+            let binding = bindings[idx];
             let var = if binding.is_cons() {
-                unsafe { cons_car(*binding) }
+                unsafe { cons_car(binding) }
             } else {
-                *binding
+                binding
             };
             if var.is_symbol() && !var.is_nil() {
                 body_env = body_env.augment_variable(var, VariableInfo::Lexical);
@@ -1430,33 +1636,41 @@ fn expand_let(form: BlissVal, env: &Environment, sequential: bool) -> Result<Bli
 /// Expand FLET: (flet ((name (params) fn-body...) ...) body...)
 /// Function names are NOT expanded. Function bodies are expanded in the outer env.
 /// Body is expanded in an env augmented with the function bindings.
-fn expand_flet(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_flet(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let mut operator = unsafe { cons_car(form) };
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
     let args = unsafe { cons_cdr(form) };
     if !args.is_cons() {
         return Ok(form);
     }
     let fn_defs = unsafe { cons_car(args) };
-    let body = unsafe { cons_cdr(args) };
+    let mut body = unsafe { cons_cdr(args) };
+    let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
 
-    let defs = cons_to_vec(fn_defs);
-    let mut expanded_defs = Vec::with_capacity(defs.len());
+    let defs = bliss_rt::gc::HostRoot::new(cons_to_vec(fn_defs));
+    let mut expanded_defs = bliss_rt::gc::HostRoot::new(Vec::with_capacity(defs.len()));
     let mut defs_changed = false;
 
     // FLET: function bodies are expanded in the OUTER env (not the augmented one)
-    for def in &defs {
+    for i in 0..defs.len() {
+        let def = defs[i];
         if !def.is_cons() {
-            expanded_defs.push(*def);
+            expanded_defs.push(def);
             continue;
         }
-        let fn_name = unsafe { cons_car(*def) };
-        let fn_rest = unsafe { cons_cdr(*def) };
+        let mut fn_name = unsafe { cons_car(def) };
+        let _fn_name_root = bliss_rt::gc::StackRoot::new(&mut fn_name);
+        let fn_rest = unsafe { cons_cdr(def) };
         if !fn_rest.is_cons() {
-            expanded_defs.push(*def);
+            expanded_defs.push(def);
             continue;
         }
-        let params = unsafe { cons_car(fn_rest) };
-        let fn_body = unsafe { cons_cdr(fn_rest) };
+        let mut params = unsafe { cons_car(fn_rest) };
+        let _params_root = bliss_rt::gc::StackRoot::new(&mut params);
+        let mut fn_body = unsafe { cons_cdr(fn_rest) };
+        let _fn_body_root = bliss_rt::gc::StackRoot::new(&mut fn_body);
 
         // Augment env with params for expanding the function body
         let mut fn_env = env.clone();
@@ -1481,14 +1695,16 @@ fn expand_flet(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
 
     // Augment env with function names for the body
     let mut body_env = env.clone();
-    for def in &defs {
+    for i in 0..defs.len() {
+        let def = defs[i];
         if def.is_cons() {
-            let fn_name = unsafe { cons_car(*def) };
+            let fn_name = unsafe { cons_car(def) };
             body_env = body_env.augment_function(fn_name, FunctionInfo::Lexical);
         }
     }
 
-    let expanded_body = expand_body(body, &body_env)?;
+    let mut expanded_body = expand_body(body, &body_env)?;
+    let _expanded_body_root = bliss_rt::gc::StackRoot::new(&mut expanded_body);
 
     if !defs_changed && expanded_body == body {
         Ok(form)
@@ -1501,42 +1717,51 @@ fn expand_flet(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError
 /// Expand LABELS: (labels ((name (params) fn-body...) ...) body...)
 /// Like FLET, but function bodies ARE expanded in the augmented env
 /// (functions are visible in their own bodies — recursive).
-fn expand_labels(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_labels(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let mut operator = unsafe { cons_car(form) };
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
     let args = unsafe { cons_cdr(form) };
     if !args.is_cons() {
         return Ok(form);
     }
     let fn_defs = unsafe { cons_car(args) };
-    let body = unsafe { cons_cdr(args) };
+    let mut body = unsafe { cons_cdr(args) };
+    let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
 
-    let defs = cons_to_vec(fn_defs);
+    let defs = bliss_rt::gc::HostRoot::new(cons_to_vec(fn_defs));
 
     // LABELS: first augment env with ALL function names (recursive visibility)
     let mut augmented_env = env.clone();
-    for def in &defs {
+    for i in 0..defs.len() {
+        let def = defs[i];
         if def.is_cons() {
-            let fn_name = unsafe { cons_car(*def) };
+            let fn_name = unsafe { cons_car(def) };
             augmented_env = augmented_env.augment_function(fn_name, FunctionInfo::Lexical);
         }
     }
 
     // Now expand function bodies in the augmented env
-    let mut expanded_defs = Vec::with_capacity(defs.len());
+    let mut expanded_defs = bliss_rt::gc::HostRoot::new(Vec::with_capacity(defs.len()));
     let mut defs_changed = false;
-    for def in &defs {
+    for i in 0..defs.len() {
+        let def = defs[i];
         if !def.is_cons() {
-            expanded_defs.push(*def);
+            expanded_defs.push(def);
             continue;
         }
-        let fn_name = unsafe { cons_car(*def) };
-        let fn_rest = unsafe { cons_cdr(*def) };
+        let mut fn_name = unsafe { cons_car(def) };
+        let _fn_name_root = bliss_rt::gc::StackRoot::new(&mut fn_name);
+        let fn_rest = unsafe { cons_cdr(def) };
         if !fn_rest.is_cons() {
-            expanded_defs.push(*def);
+            expanded_defs.push(def);
             continue;
         }
-        let params = unsafe { cons_car(fn_rest) };
-        let fn_body = unsafe { cons_cdr(fn_rest) };
+        let mut params = unsafe { cons_car(fn_rest) };
+        let _params_root = bliss_rt::gc::StackRoot::new(&mut params);
+        let mut fn_body = unsafe { cons_cdr(fn_rest) };
+        let _fn_body_root = bliss_rt::gc::StackRoot::new(&mut fn_body);
 
         // Augment with params
         let mut fn_env = augmented_env.clone();
@@ -1559,7 +1784,8 @@ fn expand_labels(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissErr
         expanded_defs.push(alloc_cons(fn_name, alloc_cons(params, expanded_fn_body)));
     }
 
-    let expanded_body = expand_body(body, &augmented_env)?;
+    let mut expanded_body = expand_body(body, &augmented_env)?;
+    let _expanded_body_root = bliss_rt::gc::StackRoot::new(&mut expanded_body);
 
     if !defs_changed && expanded_body == body {
         Ok(form)
@@ -1571,14 +1797,17 @@ fn expand_labels(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissErr
 
 /// Expand LOCALLY: (locally decl* body*)
 /// Declarations are processed but NOT expanded. Body is expanded.
-fn expand_locally(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
-    let operator = unsafe { cons_car(form) };
+fn expand_locally(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let mut operator = unsafe { cons_car(form) };
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
     let body = unsafe { cons_cdr(form) };
 
     // Skip declarations (forms starting with DECLARE), expand the rest
     let items = cons_to_vec(body);
-    let mut decls = Vec::new();
-    let mut body_forms = Vec::new();
+    let mut decls = bliss_rt::gc::HostRoot::new(Vec::new());
+    let mut body_forms = bliss_rt::gc::HostRoot::new(Vec::new());
     let mut in_decls = true;
     for item in &items {
         if in_decls && item.is_cons() {
@@ -1592,11 +1821,12 @@ fn expand_locally(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissEr
         body_forms.push(*item);
     }
 
-    let mut expanded_body_forms = Vec::with_capacity(body_forms.len());
+    let mut expanded_body_forms = bliss_rt::gc::HostRoot::new(Vec::with_capacity(body_forms.len()));
     let mut changed = false;
-    for bf in &body_forms {
-        let exp = macroexpand_all(*bf, env)?;
-        if exp != *bf {
+    for i in 0..body_forms.len() {
+        let bf = body_forms[i];
+        let exp = macroexpand_all(bf, env)?;
+        if exp != bf {
             changed = true;
         }
         expanded_body_forms.push(exp);
@@ -1605,8 +1835,9 @@ fn expand_locally(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissEr
     if !changed {
         Ok(form)
     } else {
-        let mut all_items = decls;
-        all_items.extend(expanded_body_forms);
+        let mut all_items: Vec<BlissVal> = Vec::with_capacity(decls.len() + expanded_body_forms.len());
+        all_items.extend(decls.iter().copied());
+        all_items.extend(expanded_body_forms.iter().copied());
         Ok(alloc_cons(operator, vec_to_cons(&all_items)))
     }
 }
@@ -1614,28 +1845,34 @@ fn expand_locally(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissEr
 /// Expand MACROLET: (macrolet ((name lambda-list macro-body...) ...) body...)
 /// Install local macro definitions into a new environment.
 /// Expand body in the augmented env. Strip MACROLET from output (spec §4.2.7).
-fn expand_macrolet(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+fn expand_macrolet(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
     let args = unsafe { cons_cdr(form) };
     if !args.is_cons() {
         return Ok(form);
     }
     let macro_defs = unsafe { cons_car(args) };
-    let body = unsafe { cons_cdr(args) };
+    let mut body = unsafe { cons_cdr(args) };
+    let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
 
     // Install macro definitions in a new environment frame
     let mut augmented_env = env.clone();
-    let defs = cons_to_vec(macro_defs);
-    for def in &defs {
+    let defs = bliss_rt::gc::HostRoot::new(cons_to_vec(macro_defs));
+    for i in 0..defs.len() {
+        let def = defs[i];
         if !def.is_cons() {
             continue;
         }
-        let macro_name = unsafe { cons_car(*def) };
-        let key = make_local_macrolet_expander(*def, env.clone())?;
+        let mut macro_name = unsafe { cons_car(def) };
+        let _macro_name_root = bliss_rt::gc::StackRoot::new(&mut macro_name);
+        let key = make_local_macrolet_expander(def, env.clone())?;
         augmented_env = augmented_env.augment_function(macro_name, FunctionInfo::Macro(key));
     }
 
     // Expand body in augmented env
-    let expanded_body = expand_body(body, &augmented_env)?;
+    let mut expanded_body = expand_body(body, &augmented_env)?;
+    let _expanded_body_root = bliss_rt::gc::StackRoot::new(&mut expanded_body);
 
     // Strip MACROLET wrapper: output as (LOCALLY expanded-body...) or
     // if single body form, just return it.
@@ -1685,7 +1922,9 @@ fn expand_symbol_macrolet(form: BlissVal, env: &Environment) -> Result<BlissVal,
     }
 
     // Expand body in augmented env
-    let expanded_body = expand_body(body, &augmented_env)?;
+    let mut expanded_body = expand_body(body, &augmented_env)?;
+    // Root across the allocating make_symbol (moving GC; bliss-noh).
+    let _expanded_body_root = bliss_rt::gc::StackRoot::new(&mut expanded_body);
 
     // Strip SYMBOL-MACROLET wrapper from output
     let body_items = cons_to_vec(expanded_body);
@@ -1723,15 +1962,21 @@ fn is_quote_symbol(val: BlissVal) -> bool {
 /// are NOT mutated — new cells are allocated when any sub-form changes.
 /// This avoids corrupting shared cons structures (e.g., quoted data referenced
 /// elsewhere, or forms appearing in multiple expansion contexts).
-fn walk_cons(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+fn walk_cons(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
     debug_assert!(form.is_cons(), "walk_cons called on non-cons value");
 
     // Get car and cdr of the current cons cell
-    let car = unsafe { cons_car(form) };
-    let cdr = unsafe { cons_cdr(form) };
+    let mut car = unsafe { cons_car(form) };
+    let mut cdr = unsafe { cons_cdr(form) };
+
+    // Root across the allocating expand recursion (moving GC; bliss-noh).
+    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+    let _car_root = bliss_rt::gc::StackRoot::new(&mut car);
+    let _cdr_root = bliss_rt::gc::StackRoot::new(&mut cdr);
 
     // Recursively expand the car
-    let expanded_car = macroexpand_all(car, env)?;
+    let mut expanded_car = macroexpand_all(car, env)?;
+    let _expanded_car_root = bliss_rt::gc::StackRoot::new(&mut expanded_car);
 
     // Recursively expand the cdr
     // The cdr is typically another cons (rest of list) or NIL (end of list),
@@ -1777,15 +2022,20 @@ fn expand_local_macro_call(
     call_env: &Environment,
     defining_env: &Environment,
     params: BlissVal,
-    body: BlissVal,
+    mut body: BlissVal,
 ) -> Result<BlissVal, BlissError> {
+    // Root body across the allocating bind_macrolet_lambda_list (moving GC; bliss-noh).
+    let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
     let arg_forms = if whole_form.is_cons() {
         unsafe { cons_cdr(whole_form) }
     } else {
         bliss_rt::value::NIL
     };
     let bindings = bind_macrolet_lambda_list(params, arg_forms)?;
-    let expansion_env = defining_env.augment_environment(bindings, Vec::new(), Vec::new());
+    let mut expansion_env = defining_env.augment_environment(bindings, Vec::new(), Vec::new());
+    // Root expansion_env: it binds the macro arguments (possibly movable conses)
+    // and the mini-evaluator allocates while reading them (bliss-noh).
+    let _expansion_env_root = ExpansionEnvGuard::new(&mut expansion_env);
     eval_local_macro_body(body, &expansion_env, call_env)
 }
 
@@ -1795,7 +2045,11 @@ fn bind_macrolet_lambda_list(
 ) -> Result<Vec<(BlissVal, VariableInfo)>, BlissError> {
     let params_vec = cons_to_vec(params);
     let args_vec = cons_to_vec(args);
-    let mut bindings = Vec::new();
+    // Constant values are hidden inside VariableInfo (not scanned by HostRoot),
+    // so accumulate keys/values in parallel rooted Vecs across the trailing
+    // vec_to_cons alloc, then assemble the bindings (moving GC; bliss-noh).
+    let mut keys = bliss_rt::gc::HostRoot::new(Vec::<BlissVal>::new());
+    let mut vals = bliss_rt::gc::HostRoot::new(Vec::<BlissVal>::new());
     let mut arg_i = 0usize;
     let mut rest_target: Option<BlissVal> = None;
     let mut optional_mode = false;
@@ -1840,21 +2094,25 @@ fn bind_macrolet_lambda_list(
                 "MACROLET: too few arguments for local macro".into(),
             ));
         };
-        bindings.push((param, VariableInfo::Constant(value)));
+        keys.push(param);
+        vals.push(value);
         i += 1;
     }
 
     if let Some(rest) = rest_target {
-        bindings.push((
-            rest,
-            VariableInfo::Constant(vec_to_cons(&args_vec[arg_i..])),
-        ));
+        let rest_val = vec_to_cons(&args_vec[arg_i..]);
+        keys.push(rest);
+        vals.push(rest_val);
     } else if arg_i != args_vec.len() {
         return Err(BlissError::Internal(
             "MACROLET: too many arguments for local macro".into(),
         ));
     }
 
+    let mut bindings = Vec::with_capacity(keys.len());
+    for i in 0..keys.len() {
+        bindings.push((keys[i], VariableInfo::Constant(vals[i])));
+    }
     Ok(bindings)
 }
 
@@ -1863,10 +2121,11 @@ fn eval_local_macro_body(
     env: &Environment,
     call_env: &Environment,
 ) -> Result<BlissVal, BlissError> {
-    let forms = cons_to_vec(body);
+    // Root across the allocating eval recursion (moving GC; bliss-noh).
+    let forms = bliss_rt::gc::HostRoot::new(cons_to_vec(body));
     let mut result = bliss_rt::value::NIL;
-    for form in forms {
-        result = eval_local_macro_form(form, env, call_env)?;
+    for i in 0..forms.len() {
+        result = eval_local_macro_form(forms[i], env, call_env)?;
     }
     Ok(result)
 }
@@ -1889,7 +2148,9 @@ fn eval_local_macro_form(
         return Ok(form);
     }
 
-    let operator = unsafe { cons_car(form) };
+    let mut operator = unsafe { cons_car(form) };
+    // Root across the allocating eval recursion / macroexpand_1 (moving GC; bliss-noh).
+    let _operator_root = bliss_rt::gc::StackRoot::new(&mut operator);
     let args = unsafe { cons_cdr(form) };
     let op_name = get_symbol_name(operator).unwrap_or_default();
     match op_name.as_str() {
@@ -1899,21 +2160,22 @@ fn eval_local_macro_form(
             bliss_rt::value::NIL
         }),
         "LIST" => {
-            let mut out = Vec::new();
-            for item in cons_to_vec(args) {
-                out.push(eval_local_macro_form(item, env, call_env)?);
+            let src = bliss_rt::gc::HostRoot::new(cons_to_vec(args));
+            let mut out = bliss_rt::gc::HostRoot::new(Vec::new());
+            for i in 0..src.len() {
+                out.push(eval_local_macro_form(src[i], env, call_env)?);
             }
             Ok(vec_to_cons(&out))
         }
         "CONS" => {
-            let items = cons_to_vec(args);
+            let items = bliss_rt::gc::HostRoot::new(cons_to_vec(args));
             if items.len() != 2 {
                 return Err(BlissError::Internal("MACROLET: CONS expects 2 args".into()));
             }
-            Ok(alloc_cons(
-                eval_local_macro_form(items[0], env, call_env)?,
-                eval_local_macro_form(items[1], env, call_env)?,
-            ))
+            let mut car_val = eval_local_macro_form(items[0], env, call_env)?;
+            let _car_root = bliss_rt::gc::StackRoot::new(&mut car_val);
+            let cdr_val = eval_local_macro_form(items[1], env, call_env)?;
+            Ok(alloc_cons(car_val, cdr_val))
         }
         "APPEND" => eval_local_macro_append(args, env, call_env),
         "PROGN" => eval_local_macro_body(args, env, call_env),
@@ -1957,10 +2219,15 @@ fn eval_local_macro_append(
     env: &Environment,
     call_env: &Environment,
 ) -> Result<BlissVal, BlissError> {
+    // Root result and parts across the allocating eval recursion (moving GC; bliss-noh).
     let mut result = bliss_rt::value::NIL;
-    let parts = cons_to_vec(args);
-    for part in parts.into_iter().rev() {
-        let mut items = cons_to_vec(eval_local_macro_form(part, env, call_env)?);
+    let _result_root = bliss_rt::gc::StackRoot::new(&mut result);
+    let parts = bliss_rt::gc::HostRoot::new(cons_to_vec(args));
+    for idx in (0..parts.len()).rev() {
+        let part = parts[idx];
+        let mut items = bliss_rt::gc::HostRoot::new(cons_to_vec(eval_local_macro_form(
+            part, env, call_env,
+        )?));
         while let Some(item) = items.pop() {
             result = alloc_cons(item, result);
         }
@@ -1987,8 +2254,10 @@ fn expand_local_quasiquote(
         });
     }
 
-    let mut out = Vec::new();
+    // Root out and cursor across the allocating eval recursion (moving GC; bliss-noh).
+    let mut out = bliss_rt::gc::HostRoot::new(Vec::new());
     let mut cursor = form;
+    let _cursor_root = bliss_rt::gc::StackRoot::new(&mut cursor);
     while cursor.is_cons() {
         let item = unsafe { cons_car(cursor) };
         if item.is_cons() && is_symbol_named(unsafe { cons_car(item) }, "BLISS::UNQUOTE-SPLICING") {
