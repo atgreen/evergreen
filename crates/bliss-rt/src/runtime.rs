@@ -590,59 +590,50 @@ pub fn check_sigint() -> bool {
 /// Install signal handlers (SIGSEGV, SIGINT, SIGTERM, etc.). §2.6.
 /// Issue #11: actually install at least SIGINT and SIGTERM using libc.
 pub fn install_signal_handlers() -> Result<(), BlissError> {
-    // Install SIGINT handler for user interrupts (Ctrl-C → CL:BREAK)
+    use crate::syscall;
+    // Direct rt_sigaction (no libc). SIGINT/TERM/SEGV use SA_RESTART; SIGUSR1
+    // (the safepoint interrupt) deliberately omits SA_RESTART so a blocking
+    // syscall returns EINTR and reaches the next safepoint.
+    // SAFETY: each handler is a valid extern "C" fn(i32).
     unsafe {
-        libc::signal(
-            libc::SIGSEGV,
-            sigsegv_handler as *const () as libc::sighandler_t,
-        );
-        // SIGINT: set the atomic flag so the runtime can check it at safepoints
-        libc::signal(
-            libc::SIGINT,
-            sigint_handler as *const () as libc::sighandler_t,
-        );
-        // SIGTERM: initiate graceful shutdown
-        libc::signal(
-            libc::SIGTERM,
-            sigterm_handler as *const () as libc::sighandler_t,
-        );
-        #[cfg(unix)]
-        {
-            // Unlike `signal(2)`, install SIGUSR1 without SA_RESTART so a
-            // blocking syscall returns EINTR and reaches the next safepoint.
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = crate::safepoint::sigusr1_handler as *const () as usize;
-            action.sa_flags = 0;
-            libc::sigemptyset(&mut action.sa_mask);
-            if libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) != 0 {
-                return Err(BlissError::SignalError(libc::SIGUSR1));
-            }
-        }
+        syscall::rt_sigaction(
+            syscall::SIGSEGV,
+            sigsegv_handler as *const () as usize,
+            syscall::SA_RESTART,
+        )
+        .map_err(|_| BlissError::SignalError(syscall::SIGSEGV))?;
+        syscall::rt_sigaction(syscall::SIGINT, sigint_handler as *const () as usize, syscall::SA_RESTART)
+            .map_err(|_| BlissError::SignalError(syscall::SIGINT))?;
+        syscall::rt_sigaction(
+            syscall::SIGTERM,
+            sigterm_handler as *const () as usize,
+            syscall::SA_RESTART,
+        )
+        .map_err(|_| BlissError::SignalError(syscall::SIGTERM))?;
+        syscall::rt_sigaction(
+            syscall::SIGUSR1,
+            crate::safepoint::sigusr1_handler as *const () as usize,
+            0,
+        )
+        .map_err(|_| BlissError::SignalError(syscall::SIGUSR1))?;
     }
     Ok(())
 }
 
-extern "C" fn sigint_handler(_sig: libc::c_int) {
+extern "C" fn sigint_handler(_sig: i32) {
+    // With rt_sigaction the handler stays installed (no SysV one-shot reset), so
+    // no re-arming is needed.
     SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
-    // Re-install the handler (some platforms reset to SIG_DFL after delivery)
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            sigint_handler as *const () as libc::sighandler_t,
-        );
-    }
 }
 
-extern "C" fn sigterm_handler(_sig: libc::c_int) {
+extern "C" fn sigterm_handler(_sig: i32) {
     // For SIGTERM, set the SIGINT flag as well to trigger a clean shutdown
     // path in the runtime's safepoint checks.
     SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-extern "C" fn sigsegv_handler(_sig: libc::c_int) {
-    unsafe {
-        libc::_exit(0);
-    }
+extern "C" fn sigsegv_handler(_sig: i32) {
+    crate::syscall::exit_group(0);
 }
 
 // ══════════════════════════════════════════════════════════════════

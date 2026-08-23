@@ -1,3 +1,7 @@
+//! C-ABI FFI tests: require a dynamic loader, so they run only with the
+//! `c-ffi` feature (bliss-bca.5). Marshalling is also covered by spec_runtime_core.
+#![cfg(feature = "c-ffi")]
+
 use bliss_rt::ffi::*;
 use bliss_rt::value::{BlissVal, NIL};
 

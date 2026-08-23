@@ -220,15 +220,10 @@ pub fn eval_stack_budget() -> usize {
 
     #[cfg(unix)]
     {
-        // SAFETY: getrlimit with a valid, zero-initialised rlimit and a supported
-        // resource id. Reads only; no aliasing concerns.
-        let mut rl = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut rl) } == 0 {
+        // prlimit64(RLIMIT_STACK): the soft stack limit sizes fiber stacks.
+        if let Ok(rl) = crate::syscall::getrlimit(crate::syscall::RLIMIT_STACK) {
             let soft = rl.rlim_cur;
-            if soft != 0 && soft != libc::RLIM_INFINITY {
+            if soft != 0 && soft != crate::syscall::RLIM_INFINITY {
                 return (soft as usize).saturating_sub(RED_ZONE).max(FLOOR);
             }
         }

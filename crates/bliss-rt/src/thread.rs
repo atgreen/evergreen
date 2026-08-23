@@ -7,7 +7,7 @@ use crate::lock_order::{LockLevel, OrderedMutex};
 use crate::stack::BlissStack;
 use crate::value::{BlissVal, NIL};
 
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
 use std::sync::atomic::{
@@ -54,44 +54,37 @@ pub struct FiberContinuation {
     resume_token: AtomicUsize,
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(target_arch = "x86_64", unix))]
 struct FiberExecutionContext {
-    context: Box<UnsafeCell<libc::ucontext_t>>,
+    // The fiber's saved stack pointer. Updated in place each time the fiber
+    // suspends (crate::context::swap writes through this cell).
+    context: Box<UnsafeCell<crate::context::Context>>,
     _native_stack: Box<[u8]>,
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(target_arch = "x86_64", unix))]
 impl FiberExecutionContext {
     fn new() -> Result<Self, BlissError> {
         const NATIVE_STACK_SIZE: usize = 512 * 1024;
         let mut native_stack = vec![0_u8; NATIVE_STACK_SIZE].into_boxed_slice();
-        let context = Box::new(UnsafeCell::new(unsafe { std::mem::zeroed() }));
-        let context_ptr = context.get();
-        if unsafe { libc::getcontext(context_ptr) } != 0 {
-            return Err(BlissError::Internal("getcontext failed for fiber".into()));
-        }
-        unsafe {
-            (*context_ptr).uc_stack.ss_sp = native_stack.as_mut_ptr().cast();
-            (*context_ptr).uc_stack.ss_size = native_stack.len();
-            (*context_ptr).uc_stack.ss_flags = 0;
-            (*context_ptr).uc_link = ptr::null_mut();
-            libc::makecontext(context_ptr, fiber_context_trampoline, 0);
-        }
+        // Portable context switch (no libc ucontext): lay down an initial frame
+        // on the native stack that enters the trampoline on first swap-in.
+        let sp = crate::context::make(&mut native_stack, fiber_context_trampoline);
         Ok(Self {
-            context,
+            context: Box::new(UnsafeCell::new(sp)),
             _native_stack: native_stack,
         })
     }
 
-    fn as_ptr(&self) -> *mut libc::ucontext_t {
+    fn as_ptr(&self) -> *mut crate::context::Context {
         self.context.get()
     }
 }
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(not(all(target_arch = "x86_64", unix)))]
 struct FiberExecutionContext;
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(not(all(target_arch = "x86_64", unix)))]
 impl FiberExecutionContext {
     fn new() -> Result<Self, BlissError> {
         Ok(Self)
@@ -374,7 +367,7 @@ fn install_current_native_thread(thread: Arc<NativeThread>) {
     #[cfg(unix)]
     thread
         .os_thread_id
-        .store(unsafe { libc::pthread_self() as usize }, Ordering::Release);
+        .store(crate::syscall::gettid() as usize, Ordering::Release);
     CURRENT_NATIVE_THREAD.with(|slot| *slot.borrow_mut() = Some(thread));
 }
 
@@ -400,7 +393,7 @@ fn ensure_current_native_thread() -> Arc<NativeThread> {
         #[cfg(unix)]
         thread
             .os_thread_id
-            .store(unsafe { libc::pthread_self() as usize }, Ordering::Release);
+            .store(crate::syscall::gettid() as usize, Ordering::Release);
         *slot.borrow_mut() = Some(Arc::clone(&thread));
         thread
     })
@@ -422,8 +415,6 @@ fn fiber_registry() -> &'static OrderedMutex<HashMap<FiberId, Arc<Fiber>>> {
 // The fiber mounted on this carrier, if any.
 thread_local! {
     static ACTIVE_FIBER: RefCell<Option<Arc<Fiber>>> = const { RefCell::new(None) };
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    static SCHEDULER_CONTEXT: Cell<*mut libc::ucontext_t> = const { Cell::new(ptr::null_mut()) };
 }
 
 /// Green thread descriptor. D2.01.
@@ -436,6 +427,12 @@ pub struct Fiber {
     stack: BlissStack,
     continuation: FiberContinuation,
     execution_context: FiberExecutionContext,
+    /// Pointer (as usize) to the mounting carrier's on-stack scheduler context,
+    /// set on each mount and read when the fiber swaps back. Stored on the fiber
+    /// — NOT in a thread-local — because a fiber can be preempted on one carrier
+    /// and resumed on another, and a compiler-cached thread-local address would
+    /// then be stale (reads the wrong/cleared carrier slot). See bliss-bca.5.
+    scheduler_return: AtomicUsize,
     /// Carrier pool chosen by the first scheduler-group submission.  Wakeups
     /// from timers, synchronization primitives, and I/O always return to this
     /// pool; a fiber cannot migrate between scheduler groups.
@@ -1103,25 +1100,23 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
         *slot.borrow_mut() = Some(Arc::clone(&thread));
     });
 
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(target_arch = "x86_64", unix))]
     unsafe {
-        let mut scheduler_context: libc::ucontext_t = std::mem::zeroed();
-        SCHEDULER_CONTEXT.with(|slot| slot.set(&mut scheduler_context));
-        let rc = libc::swapcontext(
-            &mut scheduler_context,
-            thread.execution_context.as_ptr().cast_const(),
-        );
-        SCHEDULER_CONTEXT.with(|slot| slot.set(ptr::null_mut()));
-        if rc != 0 {
-            thread.suspend_reason.store(SUSPEND_DEAD, Ordering::Release);
-            thread.set_state(FiberState::Dead);
-            thread.result.complete(Err(BlissError::Internal(
-                "swapcontext failed while mounting fiber".into(),
-            )));
-        }
+        // Save the scheduler (carrier) context and switch to the fiber. The
+        // fiber resumes at its trampoline (first mount) or where it last
+        // suspended; control returns here when it swaps back. The return context
+        // is recorded on the FIBER (not a thread-local) so it survives the fiber
+        // migrating to a different carrier between suspend and resume.
+        let mut scheduler_context: crate::context::Context = crate::context::NULL;
+        thread
+            .scheduler_return
+            .store(&mut scheduler_context as *mut _ as usize, Ordering::Release);
+        let fiber_sp = *thread.execution_context.as_ptr();
+        crate::context::swap(&mut scheduler_context, fiber_sp);
+        thread.scheduler_return.store(0, Ordering::Release);
     }
 
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
     {
         let result = run_fiber_entry(&thread);
         thread.stack.publish_top();
@@ -1176,10 +1171,10 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
     }
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(target_arch = "x86_64", unix))]
 extern "C" fn fiber_context_trampoline() {
     let Some(fiber) = current_fiber() else {
-        unsafe { libc::abort() }
+        crate::syscall::abort()
     };
     let result = run_fiber_entry(fiber);
     fiber.stack.publish_top();
@@ -1191,32 +1186,28 @@ extern "C" fn fiber_context_trampoline() {
     fiber.set_state(FiberState::Dead);
     fiber.suspend_reason.store(SUSPEND_DEAD, Ordering::Release);
     fiber.result.complete(result);
-    unsafe {
-        if swap_fiber_to_scheduler(fiber).is_err() {
-            libc::abort();
-        }
+    // SAFETY: called on the fiber's own stack at the trampoline tail, exactly
+    // where a completed fiber must hand control back to its scheduler.
+    if unsafe { swap_fiber_to_scheduler(fiber) }.is_err() {
+        crate::syscall::abort();
     }
-    unsafe { libc::abort() };
+    crate::syscall::abort();
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(target_arch = "x86_64", unix))]
 unsafe fn swap_fiber_to_scheduler(fiber: &Fiber) -> Result<(), BlissError> {
-    SCHEDULER_CONTEXT.with(|slot| {
-        let scheduler = slot.get();
-        if scheduler.is_null() {
-            return Err(BlissError::Internal(
-                "fiber has no mounted scheduler context".into(),
-            ));
-        }
-        if unsafe { libc::swapcontext(fiber.execution_context.as_ptr(), scheduler.cast_const()) }
-            != 0
-        {
-            return Err(BlissError::Internal(
-                "swapcontext failed while unmounting fiber".into(),
-            ));
-        }
-        Ok(())
-    })
+    // Read the scheduler-return context from the fiber (migration-safe; see the
+    // `scheduler_return` field). A thread-local would be unsound here.
+    let scheduler = fiber.scheduler_return.load(Ordering::Acquire) as *mut crate::context::Context;
+    if scheduler.is_null() {
+        return Err(BlissError::Internal(
+            "fiber has no mounted scheduler context".into(),
+        ));
+    }
+    // Save the fiber's context into its cell and switch back to the carrier.
+    // SAFETY: `scheduler` points at the carrier's live on-stack context.
+    unsafe { crate::context::swap(fiber.execution_context.as_ptr(), *scheduler) };
+    Ok(())
 }
 
 fn run_fiber_entry(thread: &Fiber) -> Result<BlissVal, BlissError> {
@@ -1395,6 +1386,7 @@ pub fn make_fiber(entry: BlissVal) -> Result<FiberId, BlissError> {
         stack: BlissStack::new(default_stack_size()),
         continuation: FiberContinuation::default(),
         execution_context: FiberExecutionContext::new()?,
+        scheduler_return: AtomicUsize::new(0),
         scheduler_pool: OrderedMutex::new(
             LockLevel::ExecutionObject,
             fiber_object_order(id, 3),
@@ -1574,14 +1566,14 @@ pub fn fiber_yield() -> Result<(), BlissError> {
         fiber.stack.published_fp() as usize,
     );
 
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(target_arch = "x86_64", unix))]
     {
         fiber.suspend_reason.store(SUSPEND_YIELD, Ordering::Release);
         fiber.set_state(FiberState::Suspended);
         unsafe { swap_fiber_to_scheduler(fiber)? };
     }
 
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
     std::thread::yield_now();
 
     Ok(())
@@ -1633,7 +1625,7 @@ pub(crate) fn park_prepared_current_fiber() -> Result<(), BlissError> {
     let fiber = current_fiber()
         .ok_or_else(|| BlissError::ProgramError("fiber park outside a fiber".into()))?;
 
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(target_arch = "x86_64", unix))]
     {
         if !matches!(fiber.state(), FiberState::Blocked | FiberState::Waiting) {
             return Err(BlissError::Internal(
@@ -1643,7 +1635,7 @@ pub(crate) fn park_prepared_current_fiber() -> Result<(), BlissError> {
         unsafe { swap_fiber_to_scheduler(fiber)? };
     }
 
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
     std::thread::yield_now();
 
     Ok(())
@@ -1740,9 +1732,16 @@ pub(crate) fn signal_safepoint_participants(current: NativeThreadId) -> usize {
                 && !thread.entry.is_nil()
         })
         .filter(|(_, thread)| {
-            let os_thread = thread.os_thread_id.load(Ordering::Acquire);
-            os_thread != 0
-                && unsafe { libc::pthread_kill(os_thread as libc::pthread_t, libc::SIGUSR1) } == 0
+            // Deliver the safepoint interrupt by kernel TID (tgkill), the
+            // no-libc equivalent of pthread_kill(pthread_t, SIGUSR1).
+            let tid = thread.os_thread_id.load(Ordering::Acquire);
+            tid != 0
+                && crate::syscall::tgkill(
+                    crate::syscall::getpid(),
+                    tid as i32,
+                    crate::syscall::SIGUSR1,
+                )
+                .is_ok()
         })
         .count()
 }

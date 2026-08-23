@@ -28,7 +28,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 /// ordinary code observes this flag at its next safepoint poll.
 static SIGUSR1_PENDING: AtomicBool = AtomicBool::new(false);
 
-pub(crate) extern "C" fn sigusr1_handler(_signal: libc::c_int) {
+pub(crate) extern "C" fn sigusr1_handler(_signal: i32) {
     SIGUSR1_PENDING.store(true, Ordering::Relaxed);
 }
 

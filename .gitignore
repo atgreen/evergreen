@@ -76,3 +76,6 @@ ocicl/
 
 # Local-only standing goal prompt (kept out of the repo per owner)
 GOAL.md
+
+# stray build artifact (static bliss-cli copy)
+hellos

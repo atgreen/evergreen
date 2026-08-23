@@ -586,8 +586,115 @@ impl Drop for Callback {
 }
 
 // ── Library loading ────────────────────────────────────────────────
+//
+// Default (static-capable) build: load libraries at runtime with `elf_loader` —
+// a pure-Rust ELF loader that needs no `ld.so`/`dlopen` and works in a fully
+// static musl binary (bliss-bca.5). A loaded library's own undefined symbols
+// (malloc, memcpy, …) resolve against THIS executable's statically-linked musl
+// symbols via a host `SyntheticModule`. `DT_INIT_ARRAY` constructors run during
+// relocation. `ffi_call`/marshalling (which need no loader) are unchanged.
+//
+// The `c-ffi` build instead uses libc `dlopen` (below) — for dynamically-linked
+// targets that load system (glibc) libraries.
+
+#[cfg(not(feature = "c-ffi"))]
+mod elf_backend {
+    use crate::error::BlissError;
+    use elf_loader::{
+        Loader, Relocator,
+        image::{LoadedCore, SyntheticModule, SyntheticSymbol},
+        memory::RegionAccess,
+        relocation::RelocationArch,
+        tls::TlsResolver,
+    };
+    use std::sync::Mutex;
+
+    /// A loaded foreign library, type-erased so the registry need not carry
+    /// elf_loader's generic parameters.
+    trait ForeignLib: Send + Sync {
+        fn symbol(&self, name: &str) -> Option<*const ()>;
+    }
+
+    impl<D, Arch, R, Tls> ForeignLib for LoadedCore<D, Arch, R, Tls>
+    where
+        D: 'static + Send + Sync,
+        Arch: RelocationArch,
+        R: RegionAccess,
+        Tls: TlsResolver<Arch> + 'static,
+        Self: Send + Sync,
+    {
+        fn symbol(&self, name: &str) -> Option<*const ()> {
+            // SAFETY: a plain symbol lookup; the returned address stays valid as
+            // long as the library lives in the registry (which owns it).
+            unsafe { self.get::<extern "C" fn()>(name).map(|s| s.into_raw()) }
+        }
+    }
+
+    /// Loaded libraries, kept alive for the process lifetime (matching dlopen's
+    /// no-`dlclose` model). A handle is a 1-based index; 0 is reserved as null.
+    static LIBS: Mutex<Vec<Box<dyn ForeignLib>>> = Mutex::new(Vec::new());
+
+    /// Host symbols a loaded library may import from us — statically linked into
+    /// this binary from musl. Deliberately minimal (the libc surface plugins
+    /// commonly need); grow this list on demand. An unresolved import produces a
+    /// clear "cannot link" error naming the missing symbol.
+    fn host_symbols() -> Vec<SyntheticSymbol> {
+        macro_rules! host_syms {
+            ($($name:ident),* $(,)?) => {{
+                // Opaque decls: we only take addresses, so signatures are moot.
+                unsafe extern "C" { $( fn $name(); )* }
+                vec![ $( SyntheticSymbol::function(stringify!($name), $name as *const ()) ),* ]
+            }};
+        }
+        host_syms![
+            malloc, calloc, realloc, free, memcpy, memmove, memset, memcmp,
+            strlen, strcmp, strncmp, strcpy, strncpy, strncat, strcat, abort,
+        ]
+    }
+
+    /// Load a shared library by path with `elf_loader`, resolving its undefined
+    /// symbols against the host and running its constructors.
+    pub fn load_foreign_library(name: &str) -> Result<*mut (), BlissError> {
+        let host = SyntheticModule::new("__bliss_host", host_symbols());
+        let lib = Relocator::new()
+            .run(
+                Loader::new()
+                    .load_dylib(name)
+                    .map_err(|e| BlissError::FfiError(format!("cannot load '{name}': {e}")))?,
+            )
+            .scope([host])
+            .relocate::<()>()
+            .map_err(|e| BlissError::FfiError(format!("cannot link '{name}': {e}")))?;
+        // relocate() already ran the library's DT_INIT_ARRAY constructors.
+        let mut libs = LIBS.lock().unwrap();
+        libs.push(Box::new(lib));
+        Ok(libs.len() as *mut ()) // 1-based handle
+    }
+
+    /// Look up a symbol in a previously loaded library.
+    ///
+    /// # Safety
+    /// The returned pointer is valid only while the process lives (libraries are
+    /// never unloaded); calling through it obeys the usual FFI safety rules.
+    pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), BlissError> {
+        let handle = library as usize;
+        if handle == 0 {
+            return Err(BlissError::FfiError("null library handle".into()));
+        }
+        let libs = LIBS.lock().unwrap();
+        let lib = libs
+            .get(handle - 1)
+            .ok_or_else(|| BlissError::FfiError("invalid library handle".into()))?;
+        lib.symbol(name)
+            .ok_or_else(|| BlissError::FfiError(format!("symbol '{name}' not found")))
+    }
+}
+
+#[cfg(not(feature = "c-ffi"))]
+pub use elf_backend::{foreign_symbol, load_foreign_library};
 
 /// Load a shared library by name or path.
+#[cfg(feature = "c-ffi")]
 pub fn load_foreign_library(name: &str) -> Result<*mut (), BlissError> {
     use std::ffi::CString;
     let c_name = CString::new(name)
@@ -617,6 +724,7 @@ pub fn load_foreign_library(name: &str) -> Result<*mut (), BlissError> {
 ///
 /// # Safety
 /// The returned pointer is only valid while the library remains loaded.
+#[cfg(feature = "c-ffi")]
 pub unsafe fn foreign_symbol(library: *mut (), name: &str) -> Result<*const (), BlissError> {
     if library.is_null() {
         return Err(BlissError::FfiError("null library handle".into()));

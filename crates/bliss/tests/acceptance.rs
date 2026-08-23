@@ -31,18 +31,12 @@ fn cargo_lock() -> &'static Mutex<()> {
 }
 
 fn bliss_bin_path() -> &'static Path {
+    // Cargo builds the bin as a prerequisite of this integration test and sets
+    // CARGO_BIN_EXE_bliss-cli to its path — target-aware, so this works whether
+    // the default target is glibc or the static musl target (bliss-bca.5).
     static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let _guard = cargo_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let status = Command::new("cargo")
-            .current_dir(repo_root())
-            .args(["build", "-p", "bliss-cli"])
-            .status()
-            .expect("build bliss-cli");
-        assert!(status.success(), "cargo build -p bliss-cli failed");
-        repo_root().join("target/debug/bliss-cli")
-    })
-    .as_path()
+    BIN.get_or_init(|| PathBuf::from(env!("CARGO_BIN_EXE_bliss-cli")))
+        .as_path()
 }
 
 /// Get the path to the bliss-cli binary built by cargo.

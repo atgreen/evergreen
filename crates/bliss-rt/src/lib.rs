@@ -8,6 +8,10 @@
 // ── Object model ──────────────────────────────────────────────────
 pub mod asm;
 pub mod bfasl;
+/// Direct Linux syscalls (no libc) for runtime-internal OS services (bliss-bca.5).
+pub mod syscall;
+/// Portable fiber context switch (no libc ucontext) — bliss-bca.5.
+pub mod context;
 pub mod bytecode;
 pub mod function;
 pub mod object;

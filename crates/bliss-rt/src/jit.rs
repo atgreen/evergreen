@@ -27,29 +27,29 @@ impl JitBuffer {
         }
         let page = 4096usize;
         let len = code.len().div_ceil(page) * page;
-        // SAFETY: standard anonymous mmap; we check for MAP_FAILED.
+        // SAFETY: standard anonymous mmap; a mapping failure returns Err.
         unsafe {
-            let ptr = libc::mmap(
+            let ptr = match crate::syscall::mmap(
                 std::ptr::null_mut(),
                 len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                crate::syscall::PROT_READ | crate::syscall::PROT_WRITE,
+                crate::syscall::MAP_PRIVATE | crate::syscall::MAP_ANONYMOUS,
                 -1,
                 0,
-            );
-            if ptr == libc::MAP_FAILED {
-                return None;
-            }
-            let ptr = ptr as *mut u8;
+            ) {
+                Ok(p) => p,
+                Err(_) => return None,
+            };
             std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
             // W^X: drop write, add execute.
-            if libc::mprotect(
-                ptr as *mut libc::c_void,
+            if crate::syscall::mprotect(
+                ptr,
                 len,
-                libc::PROT_READ | libc::PROT_EXEC,
-            ) != 0
+                crate::syscall::PROT_READ | crate::syscall::PROT_EXEC,
+            )
+            .is_err()
             {
-                libc::munmap(ptr as *mut libc::c_void, len);
+                let _ = crate::syscall::munmap(ptr, len);
                 return None;
             }
             // Flush the instruction cache (a no-op on x86, required on aarch64).
@@ -85,7 +85,7 @@ impl Drop for JitBuffer {
         #[cfg(unix)]
         // SAFETY: `ptr`/`len` came from a successful mmap in `new`.
         unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            let _ = crate::syscall::munmap(self.ptr, self.len);
         }
     }
 }

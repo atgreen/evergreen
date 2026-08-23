@@ -13,10 +13,11 @@ pub enum IoInterest {
 }
 
 fn poll_events(interest: IoInterest) -> i16 {
+    use crate::syscall::{POLLIN, POLLOUT};
     match interest {
-        IoInterest::Read => libc::POLLIN,
-        IoInterest::Write => libc::POLLOUT,
-        IoInterest::ReadWrite => libc::POLLIN | libc::POLLOUT,
+        IoInterest::Read => POLLIN,
+        IoInterest::Write => POLLOUT,
+        IoInterest::ReadWrite => POLLIN | POLLOUT,
     }
 }
 
@@ -25,27 +26,26 @@ fn native_poll(
     interest: IoInterest,
     timeout: Option<Duration>,
 ) -> Result<bool, BlissError> {
+    const EINTR: i32 = 4;
     let timeout_ms = timeout
         .map(|duration| duration.as_millis().min(i32::MAX as u128) as i32)
         .unwrap_or(-1);
-    let mut descriptor = libc::pollfd {
+    let mut descriptor = crate::syscall::PollFd {
         fd,
         events: poll_events(interest),
         revents: 0,
     };
     loop {
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-        if result > 0 {
-            return Ok(true);
-        }
-        if result == 0 {
-            return Ok(false);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(BlissError::StreamError(format!(
-                "fd readiness wait failed: {error}"
-            )));
+        // SAFETY: `descriptor` is a valid single-element PollFd for the call.
+        match unsafe { crate::syscall::poll(&mut descriptor, 1, timeout_ms) } {
+            Ok(n) if n > 0 => return Ok(true),
+            Ok(_) => return Ok(false),
+            Err(EINTR) => continue,
+            Err(e) => {
+                return Err(BlissError::StreamError(format!(
+                    "fd readiness wait failed: errno {e}"
+                )));
+            }
         }
     }
 }
@@ -205,7 +205,7 @@ mod epoll {
     fn poller() -> &'static Poller {
         static POLLER: OnceLock<Poller> = OnceLock::new();
         POLLER.get_or_init(|| {
-            let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            let epoll_fd = crate::syscall::epoll_create1(crate::syscall::EPOLL_CLOEXEC).unwrap_or(-1);
             let registrations = Arc::new(OrderedMutex::new(
                 LockLevel::ExecutionRegistry,
                 101,
@@ -238,12 +238,13 @@ mod epoll {
     }
 
     fn epoll_events(interest: IoInterest) -> u32 {
+        use crate::syscall::{EPOLLIN, EPOLLONESHOT, EPOLLOUT};
         let events = match interest {
-            IoInterest::Read => libc::EPOLLIN,
-            IoInterest::Write => libc::EPOLLOUT,
-            IoInterest::ReadWrite => libc::EPOLLIN | libc::EPOLLOUT,
+            IoInterest::Read => EPOLLIN,
+            IoInterest::Write => EPOLLOUT,
+            IoInterest::ReadWrite => EPOLLIN | EPOLLOUT,
         };
-        (events | libc::EPOLLONESHOT) as u32
+        events | EPOLLONESHOT
     }
 
     pub(super) fn register(
@@ -266,15 +267,24 @@ mod epoll {
                 "file descriptor {fd} already has a fiber waiter"
             )));
         }
-        let mut event = libc::epoll_event {
+        let mut event = crate::syscall::EpollEvent {
             events: epoll_events(interest),
-            u64: id,
+            data: id,
         };
-        if unsafe { libc::epoll_ctl(poller.epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) } != 0 {
-            return Err(BlissError::StreamError(format!(
-                "epoll registration failed: {}",
-                std::io::Error::last_os_error()
-            )));
+        // SAFETY: `event` is a valid EpollEvent for the duration of the call.
+        if unsafe {
+            crate::syscall::epoll_ctl(
+                poller.epoll_fd,
+                crate::syscall::EPOLL_CTL_ADD,
+                fd,
+                &mut event,
+            )
+        }
+        .is_err()
+        {
+            return Err(BlissError::StreamError(
+                "epoll registration failed".into(),
+            ));
         }
         poller.registrations.lock().unwrap().insert(
             id,
@@ -294,10 +304,11 @@ mod epoll {
         let registration = poller.registrations.lock().unwrap().remove(&id);
         if let Some(registration) = registration {
             poller.fds.lock().unwrap().remove(&registration.fd);
+            // SAFETY: DEL takes no event pointer.
             unsafe {
-                libc::epoll_ctl(
+                let _ = crate::syscall::epoll_ctl(
                     poller.epoll_fd,
-                    libc::EPOLL_CTL_DEL,
+                    crate::syscall::EPOLL_CTL_DEL,
                     registration.fd,
                     std::ptr::null_mut(),
                 );
@@ -310,28 +321,32 @@ mod epoll {
         registrations: Arc<OrderedMutex<HashMap<u64, Registration>>>,
         fds: Arc<OrderedMutex<HashMap<RawFd, u64>>>,
     ) {
-        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
+        const EINTR: i32 = 4;
+        let mut events = [crate::syscall::EpollEvent { events: 0, data: 0 }; 64];
         loop {
-            let count =
-                unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, -1) };
-            if count < 0 {
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            // SAFETY: `events` is a valid writable buffer of `len()` entries.
+            let count = match unsafe {
+                crate::syscall::epoll_wait(epoll_fd, events.as_mut_ptr(), events.len() as i32, -1)
+            } {
+                Ok(n) => n,
+                Err(EINTR) => continue,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            for event in events.iter().take(count as usize) {
-                let id = unsafe { std::ptr::addr_of!(event.u64).read_unaligned() };
+            };
+            for event in events.iter().take(count) {
+                let id = unsafe { std::ptr::addr_of!(event.data).read_unaligned() };
                 let registration = registrations.lock().unwrap().remove(&id);
                 let Some(registration) = registration else {
                     continue;
                 };
                 fds.lock().unwrap().remove(&registration.fd);
+                // SAFETY: DEL takes no event pointer.
                 unsafe {
-                    libc::epoll_ctl(
+                    let _ = crate::syscall::epoll_ctl(
                         epoll_fd,
-                        libc::EPOLL_CTL_DEL,
+                        crate::syscall::EPOLL_CTL_DEL,
                         registration.fd,
                         std::ptr::null_mut(),
                     );

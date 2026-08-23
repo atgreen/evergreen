@@ -19,8 +19,11 @@ static SLOW_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 static RELEASE_SLOW_THREAD: AtomicBool = AtomicBool::new(false);
 static SAFETY_LOOP_EXIT: AtomicBool = AtomicBool::new(false);
 static POLL_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "c-ffi")]
 static NATIVE_FFI_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "c-ffi")]
 static NATIVE_FFI_FINISHED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "c-ffi")]
 static USLEEP_FN: OnceLock<usize> = OnceLock::new();
 
 fn value_returning_entry() -> BlissVal {
@@ -50,6 +53,7 @@ fn polling_entry() -> BlissVal {
     BlissVal::from_fixnum(POLL_ITERATIONS.load(Ordering::Acquire) as i64)
 }
 
+#[cfg(feature = "c-ffi")]
 fn native_ffi_entry() -> BlissVal {
     NATIVE_FFI_STARTED.store(true, Ordering::Release);
     let usleep = *USLEEP_FN.get().expect("usleep must be configured") as *const ();
@@ -296,6 +300,7 @@ fn sigint_delivery_is_observable_through_the_runtime_interrupt_flag() {
     );
 }
 
+#[cfg(feature = "c-ffi")]
 #[test]
 fn safepoint_wait_does_not_block_on_a_thread_executing_native_ffi() {
     // Per R2.15 and R13.11, a thread in Native FFI state must not block a safepoint handshake.

@@ -3115,7 +3115,7 @@ impl Drop for HeapState {
             #[cfg(unix)]
             // SAFETY: heap_base/size came from the anonymous mmap in init_heap.
             unsafe {
-                libc::munmap(self.heap_base as *mut libc::c_void, self.heap_layout.size());
+                let _ = crate::syscall::munmap(self.heap_base, self.heap_layout.size());
             }
             // Safety: heap_base was allocated with heap_layout in init_heap.
             #[cfg(not(unix))]
@@ -3180,21 +3180,17 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     // returns page-aligned memory, satisfying `align`.
     #[cfg(unix)]
     let heap_base = {
-        // SAFETY: standard anonymous mapping; MAP_FAILED is checked below.
-        let p = unsafe {
-            libc::mmap(
+        // SAFETY: standard anonymous mapping; a mapping failure returns Err.
+        unsafe {
+            crate::syscall::mmap(
                 std::ptr::null_mut(),
                 config.heap_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                crate::syscall::PROT_READ | crate::syscall::PROT_WRITE,
+                crate::syscall::MAP_PRIVATE | crate::syscall::MAP_ANONYMOUS,
                 -1,
                 0,
             )
-        };
-        if p == libc::MAP_FAILED {
-            std::ptr::null_mut()
-        } else {
-            p as *mut u8
+            .unwrap_or(std::ptr::null_mut())
         }
     };
     // Safety: layout is valid (non-zero size, power-of-two alignment).

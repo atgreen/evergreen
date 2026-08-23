@@ -5021,6 +5021,34 @@ fn symbol_bare_name(name: &str) -> String {
     base.to_uppercase()
 }
 
+/// Map an alien-type designator keyword (e.g. `:int`, `:pointer`, `:double`) to
+/// a [`bliss_rt::ffi::AlienType`], for the `%ffi-call` primitive. Integer widths
+/// follow the LP64 C ABI. `:string`/`:pointer` marshal as a raw address.
+fn alien_type_from_keyword(kw: BlissVal) -> Result<bliss_rt::ffi::AlienType, BlissError> {
+    use bliss_rt::ffi::AlienType;
+    let int = |signed, bits| AlienType::Int { signed, bits };
+    let name = symbol_bare_name(&sym_name(kw));
+    Ok(match name.as_str() {
+        "VOID" => AlienType::Void,
+        "CHAR" | "INT8" | "SIGNED-CHAR" => int(true, 8),
+        "UCHAR" | "UINT8" | "UNSIGNED-CHAR" => int(false, 8),
+        "SHORT" | "INT16" => int(true, 16),
+        "USHORT" | "UINT16" | "UNSIGNED-SHORT" => int(false, 16),
+        "INT" | "INT32" => int(true, 32),
+        "UINT" | "UINT32" | "UNSIGNED-INT" => int(false, 32),
+        "LONG" | "LONG-LONG" | "INT64" => int(true, 64),
+        "ULONG" | "UINT64" | "UNSIGNED-LONG" | "SIZE-T" => int(false, 64),
+        "FLOAT" => AlienType::Float,
+        "DOUBLE" => AlienType::Double,
+        "POINTER" | "STRING" => AlienType::Pointer(Box::new(AlienType::Void)),
+        other => {
+            return Err(BlissError::Internal(format!(
+                "%ffi-call: unknown alien type :{other}"
+            )));
+        }
+    })
+}
+
 /// The bare `symbol-name` (CL `SYMBOL-NAME` / `STRING` of a symbol): strips any
 /// package prefix but preserves case, unlike `symbol_bare_name` which upper-cases.
 fn symbol_name_string(name: &str) -> String {
@@ -7055,6 +7083,70 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "BLISS::%GETPID" => {
                 return Ok(BlissVal::from_fixnum(std::process::id() as i64));
+            }
+            "BLISS::%LOAD-FOREIGN-LIBRARY" => {
+                // (%load-foreign-library path) → opaque handle (fixnum).
+                // Loads an arbitrary shared library at runtime (via elf_loader,
+                // no dlopen), resolving its imports against the host and running
+                // its constructors. Works in the static build. bliss-bca.5.
+                let args = eval_args(cdr, env)?;
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "%load-foreign-library requires a path string".into(),
+                    ));
+                }
+                let path = val_as_str(args[0]);
+                let handle = bliss_rt::ffi::load_foreign_library(&path)?;
+                return Ok(BlissVal::from_fixnum(handle as usize as i64));
+            }
+            "BLISS::%FOREIGN-SYMBOL" => {
+                // (%foreign-symbol handle name) → function/data address (fixnum).
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 || !args[0].is_fixnum() {
+                    return Err(BlissError::Internal(
+                        "%foreign-symbol requires (handle name-string)".into(),
+                    ));
+                }
+                let handle = args[0].as_fixnum() as usize as *mut ();
+                let name = val_as_str(args[1]);
+                // SAFETY: `handle` came from %load-foreign-library; the library
+                // is kept alive for the process lifetime.
+                let sym = unsafe { bliss_rt::ffi::foreign_symbol(handle, &name)? };
+                return Ok(BlissVal::from_fixnum(sym as usize as i64));
+            }
+            "BLISS::%FFI-CALL" => {
+                // (%ffi-call fn-ptr ret-type arg-types args) → result
+                //   fn-ptr    : address from %foreign-symbol (fixnum)
+                //   ret-type  : an alien-type keyword (see alien_type_from_keyword)
+                //   arg-types : list of alien-type keywords
+                //   args      : list of Lisp values (fixnums/floats/pointers)
+                let args = eval_args(cdr, env)?;
+                if args.len() < 4 || !args[0].is_fixnum() {
+                    return Err(BlissError::Internal(
+                        "%ffi-call requires (fn-ptr ret-type arg-types args)".into(),
+                    ));
+                }
+                let fn_ptr = args[0].as_fixnum() as usize as *const ();
+                let ret_type = alien_type_from_keyword(args[1])?;
+                let arg_type_vals = list_to_vec(args[2]);
+                let arg_vals = list_to_vec(args[3]);
+                if arg_type_vals.len() != arg_vals.len() {
+                    return Err(BlissError::Internal(
+                        "%ffi-call: arg-types and args have different lengths".into(),
+                    ));
+                }
+                let mut arg_types = Vec::with_capacity(arg_type_vals.len());
+                let mut raw_args = Vec::with_capacity(arg_vals.len());
+                for (tv, av) in arg_type_vals.iter().zip(arg_vals.iter()) {
+                    let t = alien_type_from_keyword(*tv)?;
+                    raw_args.push(bliss_rt::ffi::marshal_to_c(*av, &t)?);
+                    arg_types.push(t);
+                }
+                // SAFETY: the caller asserts fn-ptr and the type signature match
+                // the real foreign function (the usual C-ABI FFI contract).
+                let raw =
+                    unsafe { bliss_rt::ffi::ffi_call(fn_ptr, &ret_type, &arg_types, &raw_args)? };
+                return bliss_rt::ffi::unmarshal_from_c(raw, &ret_type);
             }
             "BLISS::%EXIT" => {
                 // (%exit &optional code) — flush and terminate the process.

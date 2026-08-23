@@ -2296,18 +2296,16 @@ pub fn stream_wait_for_input(
             }
         }
     };
-    let mut pfd = libc::pollfd {
+    let mut pfd = bliss_rt::syscall::PollFd {
         fd,
-        events: libc::POLLIN,
+        events: bliss_rt::syscall::POLLIN,
         revents: 0,
     };
     let timeout = timeout_ms.unwrap_or(-1);
-    // SAFETY: pfd is a valid single-element pollfd array.
-    let rc = unsafe { libc::poll(&mut pfd, 1, timeout) };
-    if rc < 0 {
-        return Err(BlissError::FileError("wait-for-input: poll failed".into()));
-    }
-    Ok(rc > 0 && (pfd.revents & libc::POLLIN) != 0)
+    // SAFETY: pfd is a valid single-element PollFd array for the call's duration.
+    let rc = unsafe { bliss_rt::syscall::poll(&mut pfd, 1, timeout) }
+        .map_err(|_| BlissError::FileError("wait-for-input: poll failed".into()))?;
+    Ok(rc > 0 && (pfd.revents & bliss_rt::syscall::POLLIN) != 0)
 }
 
 // ── Composite-stream accessors (synonym / two-way) ─────────────────

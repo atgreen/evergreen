@@ -3,7 +3,7 @@
 # Usage:  lib/slynk/run-bliss-slynk.sh [PORT]
 # Then:   icl --connect 127.0.0.1:PORT     (or M-x sly-connect)
 #
-# Run from the repo root. Requires target/release/bliss-cli built.
+# Run from the repo root. Requires target/x86_64-unknown-linux-musl/release/bliss-cli built.
 set -euo pipefail
 PORT="${1:-4005}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -22,4 +22,4 @@ cat > "$LOADER" <<LISP
          :port ${PORT} :dont-close t)
 LISP
 
-exec target/release/bliss-cli --no-init --load "$LOADER"
+exec target/x86_64-unknown-linux-musl/release/bliss-cli --no-init --load "$LOADER"

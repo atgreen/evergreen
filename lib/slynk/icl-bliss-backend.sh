@@ -36,5 +36,5 @@ LISP
 echo "starting bliss-cli on port $PORT (loader $LOADER)" >> "$DBG"
 # Run bliss (blocks in create-server); tee its output to the debug log and to
 # icl's captured stdout. No `exec` so the wrapper stays the pipeline's parent.
-"${ROOT}/target/release/bliss-cli" --no-init --load "$LOADER" 2>&1 | tee -a "$DBG"
+"${ROOT}/target/x86_64-unknown-linux-musl/release/bliss-cli" --no-init --load "$LOADER" 2>&1 | tee -a "$DBG"
 echo "=== bliss exited rc=${PIPESTATUS[0]} ===" >> "$DBG"

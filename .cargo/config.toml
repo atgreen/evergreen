@@ -1,0 +1,10 @@
+# Default to the fully static musl target so `cargo build`/`cargo run`/`cargo test`
+# produce a statically linked bliss-cli by default (bliss-bca.5). Output lands in
+# target/x86_64-unknown-linux-musl/. The runtime uses direct syscalls and needs
+# no libc; the musl target statically links what std requires.
+#
+# Requires the target once per machine:  rustup target add x86_64-unknown-linux-musl
+# For a dynamic glibc build (e.g. to enable the C-ABI FFI):
+#   cargo build --release --target x86_64-unknown-linux-gnu --features bliss-rt/c-ffi
+[build]
+target = "x86_64-unknown-linux-musl"

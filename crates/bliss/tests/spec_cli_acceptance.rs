@@ -27,7 +27,7 @@ fn bliss_bin_path() -> &'static Path {
             .status()
             .expect("build bliss-cli");
         assert!(status.success(), "cargo build -p bliss-cli failed");
-        repo_root().join("target/debug/bliss-cli")
+        PathBuf::from(env!("CARGO_BIN_EXE_bliss-cli"))
     })
     .as_path()
 }
