@@ -2209,31 +2209,25 @@ impl<'e> Lowerer<'e> {
         let top = resolve_sym(&format!("%DOLIST-TOP{id}")).ok_or(Bail)?;
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
 
-        bliss_rt::rooted!(
-            when_items = vec![
-                s("WHEN")?,
-                rest_var,
-                form_list(&[s("SETQ")?, var, form_list(&[s("CAR")?, rest_var])]),
-            ]
-        );
+        bliss_rt::rooted!(car_rest = form_list(&[s("CAR")?, rest_var]));
+        bliss_rt::rooted!(bind_var = form_list(&[s("SETQ")?, var, *car_rest]));
+        bliss_rt::rooted!(when_items = vec![s("WHEN")?, rest_var, *bind_var]);
         when_items.extend(list_to_vec(body));
-        when_items.push(form_list(&[
-            s("SETQ")?,
-            rest_var,
-            form_list(&[s("CDR")?, rest_var]),
-        ]));
+        bliss_rt::rooted!(cdr_rest = form_list(&[s("CDR")?, rest_var]));
+        when_items.push(form_list(&[s("SETQ")?, rest_var, *cdr_rest]));
         when_items.push(form_list(&[s("GO")?, top]));
-        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        bliss_rt::rooted!(when_form = form_list(&when_items));
+        bliss_rt::rooted!(tagbody_form = form_list(&[s("TAGBODY")?, top, *when_form]));
 
-        let bindings = form_list(&[form_list(&[var, NIL]), form_list(&[rest_var, list_form])]);
-        let let_form = form_list(&[
-            s("LET")?,
-            bindings,
-            tagbody_form,
-            form_list(&[s("SETQ")?, var, NIL]),
-            result,
-        ]);
-        self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
+        bliss_rt::rooted!(var_binding = form_list(&[var, NIL]));
+        bliss_rt::rooted!(rest_binding = form_list(&[rest_var, list_form]));
+        bliss_rt::rooted!(bindings = form_list(&[*var_binding, *rest_binding]));
+        bliss_rt::rooted!(final_setq = form_list(&[s("SETQ")?, var, NIL]));
+        bliss_rt::rooted!(
+            let_form = form_list(&[s("LET")?, *bindings, *tagbody_form, *final_setq, result])
+        );
+        let block_form = form_list(&[s("BLOCK")?, NIL, *let_form]);
+        self.lower_expr(block_form)
     }
 
     /// `(loop form*)` — only the *simple* loop form (bliss-jtc.28 follow-up):

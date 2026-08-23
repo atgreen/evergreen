@@ -1,10 +1,6 @@
 # gc-root-lint baseline (bliss-jaf). Keys are file:function:variable.
 # Regenerate with: cargo run -p gc-root-lint -- --bless
-crates/bliss-compiler/src/macroexpand.rs:expand_function_call_args:expanded_cdr
 crates/bliss-compiler/src/macroexpand.rs:expand_lambda_call:expanded_args
-crates/bliss-compiler/src/macroexpand.rs:expand_macrolet:body_items
-crates/bliss-compiler/src/macroexpand.rs:expand_symbol_macrolet:body_items
-crates/bliss-compiler/src/macroexpand.rs:walk_cons:expanded_cdr
 crates/bliss/src/cli.rs:bliss_error_to_condition:condition
 crates/bliss/src/cli.rs:eval_cerror:arg_forms
 crates/bliss/src/cli.rs:eval_cerror:datum

@@ -762,9 +762,14 @@ fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
 /// global macro table (spec §4.2.3 Phase 1 step 2.e).
 ///
 /// Otherwise returns (form, false).
-pub fn macroexpand_1(form: BlissVal, env: &Environment) -> Result<(BlissVal, bool), BlissError> {
+pub fn macroexpand_1(
+    mut form: BlissVal,
+    env: &Environment,
+) -> Result<(BlissVal, bool), BlissError> {
+    bliss_rt::rooted_ref!(_form_root = &mut form);
     // 1. Check if form is a symbol with a symbol-macro binding
-    if let Some(VariableInfo::SymbolMacro(expansion)) = env.variable_information(form) {
+    if let Some(VariableInfo::SymbolMacro(mut expansion)) = env.variable_information(form) {
+        bliss_rt::rooted_ref!(_expansion_root = &mut expansion);
         let hook = get_macroexpand_hook();
         let result = hook(expansion, expansion, env)?;
         return Ok((result, true));
@@ -772,11 +777,13 @@ pub fn macroexpand_1(form: BlissVal, env: &Environment) -> Result<(BlissVal, boo
 
     // 2. Check if form is a cons with a macro operator
     if form.is_cons() {
-        let operator = unsafe { cons_car(form) };
+        let mut operator = unsafe { cons_car(form) };
+        bliss_rt::rooted_ref!(_operator_root = &mut operator);
 
         // 2.b: Look up operator in local environment
         match env.function_information(operator) {
-            Some(FunctionInfo::Macro(expander)) => {
+            Some(FunctionInfo::Macro(mut expander)) => {
+                bliss_rt::rooted_ref!(_expander_root = &mut expander);
                 // 2.c: Found as macro — invoke hook
                 let hook = get_macroexpand_hook();
                 let result = hook(expander, form, env)?;
@@ -790,7 +797,8 @@ pub fn macroexpand_1(form: BlissVal, env: &Environment) -> Result<(BlissVal, boo
             }
             None => {
                 // 2.e: NOT found in local env — consult global macro table
-                if let Some(expander) = lookup_global_macro(operator) {
+                if let Some(mut expander) = lookup_global_macro(operator) {
+                    bliss_rt::rooted_ref!(_expander_root = &mut expander);
                     let hook = get_macroexpand_hook();
                     let result = hook(expander, form, env)?;
                     return Ok((result, true));
@@ -1021,7 +1029,7 @@ fn expand_function_call_args(
     bliss_rt::rooted_ref!(_form_root = &mut form);
     let mut cdr = unsafe { cons_cdr(form) };
     bliss_rt::rooted_ref!(_cdr_root = &mut cdr);
-    let expanded_cdr = if cdr.is_cons() {
+    let mut expanded_cdr = if cdr.is_cons() {
         walk_cons(cdr, env)?
     } else if !cdr.is_nil() {
         let (expanded_cdr_val, _) = macroexpand(cdr, env)?;
@@ -1029,6 +1037,7 @@ fn expand_function_call_args(
     } else {
         cdr
     };
+    bliss_rt::rooted_ref!(_expanded_cdr_root = &mut expanded_cdr);
 
     if expanded_cdr == cdr {
         Ok(form)
@@ -1695,6 +1704,7 @@ fn expand_labels(mut form: BlissVal, env: &Environment) -> Result<BlissVal, Blis
 
     // LABELS: first augment env with ALL function names (recursive visibility)
     let mut augmented_env = env.clone();
+    bliss_rt::rooted_ref!(_augmented_env_root = &mut augmented_env);
     for i in 0..defs.len() {
         let def = defs[i];
         if def.is_cons() {
@@ -1726,19 +1736,22 @@ fn expand_labels(mut form: BlissVal, env: &Environment) -> Result<BlissVal, Blis
 
         // Augment with params
         let mut fn_env = augmented_env.clone();
-        let param_list = cons_to_vec(params);
-        for param in &param_list {
+        bliss_rt::rooted_ref!(_fn_env_root = &mut fn_env);
+        bliss_rt::rooted!(param_list = cons_to_vec(params));
+        for j in 0..param_list.len() {
+            let param = param_list[j];
             if param.is_symbol() && !param.is_nil() {
-                if let Some(name) = get_symbol_name(*param) {
+                if let Some(name) = get_symbol_name(param) {
                     if name.starts_with('&') {
                         continue;
                     }
                 }
-                fn_env = fn_env.augment_variable(*param, VariableInfo::Lexical);
+                fn_env = fn_env.augment_variable(param, VariableInfo::Lexical);
             }
         }
 
-        let expanded_fn_body = expand_body(fn_body, &fn_env)?;
+        let mut expanded_fn_body = expand_body(fn_body, &fn_env)?;
+        bliss_rt::rooted_ref!(_expanded_fn_body_root = &mut expanded_fn_body);
         if expanded_fn_body != fn_body {
             defs_changed = true;
         }
@@ -1820,6 +1833,7 @@ fn expand_macrolet(mut form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
 
     // Install macro definitions in a new environment frame
     let mut augmented_env = env.clone();
+    bliss_rt::rooted_ref!(_augmented_env_root = &mut augmented_env);
     bliss_rt::rooted!(defs = cons_to_vec(macro_defs));
     for i in 0..defs.len() {
         let def = defs[i];
@@ -1838,7 +1852,7 @@ fn expand_macrolet(mut form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
 
     // Strip MACROLET wrapper: output as (LOCALLY expanded-body...) or
     // if single body form, just return it.
-    let body_items = cons_to_vec(expanded_body);
+    bliss_rt::rooted!(body_items = cons_to_vec(expanded_body));
     if body_items.len() == 1 {
         Ok(body_items[0])
     } else {
@@ -1850,23 +1864,27 @@ fn expand_macrolet(mut form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
 /// Expand SYMBOL-MACROLET: (symbol-macrolet ((sym expansion)...) body...)
 /// Install symbol-macro bindings in the environment.
 /// Expand body in the augmented env. Strip SYMBOL-MACROLET from output (spec §4.2.7).
-fn expand_symbol_macrolet(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+fn expand_symbol_macrolet(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted_ref!(_form_root = &mut form);
     let args = unsafe { cons_cdr(form) };
     if !args.is_cons() {
         return Ok(form);
     }
     let bindings_list = unsafe { cons_car(args) };
-    let body = unsafe { cons_cdr(args) };
+    let mut body = unsafe { cons_cdr(args) };
+    bliss_rt::rooted_ref!(_body_root = &mut body);
 
     // Install symbol-macro bindings
     let mut augmented_env = env.clone();
-    let bindings = cons_to_vec(bindings_list);
-    for binding in &bindings {
+    bliss_rt::rooted_ref!(_augmented_env_root = &mut augmented_env);
+    bliss_rt::rooted!(bindings = cons_to_vec(bindings_list));
+    for i in 0..bindings.len() {
+        let binding = bindings[i];
         if !binding.is_cons() {
             continue;
         }
-        let sym = unsafe { cons_car(*binding) };
-        let expansion_rest = unsafe { cons_cdr(*binding) };
+        let sym = unsafe { cons_car(binding) };
+        let expansion_rest = unsafe { cons_cdr(binding) };
         let expansion = if expansion_rest.is_cons() {
             unsafe { cons_car(expansion_rest) }
         } else {
@@ -1889,7 +1907,7 @@ fn expand_symbol_macrolet(form: BlissVal, env: &Environment) -> Result<BlissVal,
     bliss_rt::rooted_ref!(_expanded_body_root = &mut expanded_body);
 
     // Strip SYMBOL-MACROLET wrapper from output
-    let body_items = cons_to_vec(expanded_body);
+    bliss_rt::rooted!(body_items = cons_to_vec(expanded_body));
     if body_items.len() == 1 {
         Ok(body_items[0])
     } else {
@@ -1942,13 +1960,14 @@ fn walk_cons(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> 
     // Recursively expand the cdr
     // The cdr is typically another cons (rest of list) or NIL (end of list),
     // but could be any value in a dotted pair.
-    let expanded_cdr = if cdr.is_cons() {
+    let mut expanded_cdr = if cdr.is_cons() {
         walk_cons(*cdr, env)?
     } else {
         // For non-cons cdr (NIL or dotted-pair atom), expand as an atom
         let (expanded_cdr_val, _) = macroexpand(*cdr, env)?;
         expanded_cdr_val
     };
+    bliss_rt::rooted_ref!(_expanded_cdr_root = &mut expanded_cdr);
 
     // If nothing changed, return the original cons cell to preserve identity
     // (important for compiler macro decline checks which use pointer equality).
@@ -1962,18 +1981,23 @@ fn walk_cons(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> 
 type MacroFn = dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + Send + Sync;
 
 fn make_local_macrolet_expander(
-    def: BlissVal,
-    defining_env: Environment,
+    mut def: BlissVal,
+    mut defining_env: Environment,
 ) -> Result<BlissVal, BlissError> {
-    let name = unsafe { cons_car(def) };
+    bliss_rt::rooted_ref!(_def_root = &mut def);
+    bliss_rt::rooted_ref!(_defining_env_root = &mut defining_env);
+    let mut name = unsafe { cons_car(def) };
+    bliss_rt::rooted_ref!(_name_root = &mut name);
     let rest = unsafe { cons_cdr(def) };
     if !rest.is_cons() {
         return Err(BlissError::Internal(
             "MACROLET: malformed local macro definition".into(),
         ));
     }
-    let params = unsafe { cons_car(rest) };
-    let body = unsafe { cons_cdr(rest) };
+    let mut params = unsafe { cons_car(rest) };
+    bliss_rt::rooted_ref!(_params_root = &mut params);
+    let mut body = unsafe { cons_cdr(rest) };
+    bliss_rt::rooted_ref!(_body_root = &mut body);
     let parsed = parse_macro(name, params, body, Some(&defining_env))?;
     enclose(parsed, &defining_env)
 }
@@ -2195,17 +2219,20 @@ fn eval_local_macro_append(
 }
 
 fn expand_local_quasiquote(
-    form: BlissVal,
+    mut form: BlissVal,
     env: &Environment,
     call_env: &Environment,
 ) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted_ref!(_form_root = &mut form);
     if !form.is_cons() {
         return Ok(form);
     }
 
-    let operator = unsafe { cons_car(form) };
+    let mut operator = unsafe { cons_car(form) };
+    bliss_rt::rooted_ref!(_operator_root = &mut operator);
     if is_symbol_named(operator, "BLISS::UNQUOTE") {
-        let args = unsafe { cons_cdr(form) };
+        let mut args = unsafe { cons_cdr(form) };
+        bliss_rt::rooted_ref!(_args_root = &mut args);
         return Ok(if args.is_cons() {
             eval_local_macro_form(unsafe { cons_car(args) }, env, call_env)?
         } else {
@@ -2218,21 +2245,23 @@ fn expand_local_quasiquote(
     let mut cursor = form;
     bliss_rt::rooted_ref!(_cursor_root = &mut cursor);
     while cursor.is_cons() {
-        let item = unsafe { cons_car(cursor) };
+        let mut item = unsafe { cons_car(cursor) };
+        bliss_rt::rooted_ref!(_item_root = &mut item);
         if item.is_cons() && is_symbol_named(unsafe { cons_car(item) }, "BLISS::UNQUOTE-SPLICING") {
-            let splice_args = unsafe { cons_cdr(item) };
-            let splice_form = if splice_args.is_cons() {
+            let mut splice_args = unsafe { cons_cdr(item) };
+            bliss_rt::rooted_ref!(_splice_args_root = &mut splice_args);
+            let mut splice_form = if splice_args.is_cons() {
                 unsafe { cons_car(splice_args) }
             } else {
                 bliss_rt::value::NIL
             };
-            out.extend(cons_to_vec(eval_local_macro_form(
-                splice_form,
-                env,
-                call_env,
-            )?));
+            bliss_rt::rooted_ref!(_splice_form_root = &mut splice_form);
+            let mut splice_value = eval_local_macro_form(splice_form, env, call_env)?;
+            bliss_rt::rooted_ref!(_splice_value_root = &mut splice_value);
+            out.extend(cons_to_vec(splice_value));
         } else {
-            out.push(expand_local_quasiquote(item, env, call_env)?);
+            let expanded_item = expand_local_quasiquote(item, env, call_env)?;
+            out.push(expanded_item);
         }
         cursor = unsafe { cons_cdr(cursor) };
     }
