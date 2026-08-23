@@ -1790,3 +1790,49 @@ fn source_only_legacy_bfasl_remains_read_compatible() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn compiled_capturing_closure_is_a_function_for_typep_and_functionp() {
+    // bliss-aid: a capturing flet/labels closure compiled to bytecode (bliss-1ja)
+    // is a heap interpreted-function object — callable, but FUNCTIONP / (typep x
+    // 'function) used to return NIL for it (is_function_value only knew TAG_FUNCTION
+    // values and (BLISS::CLOSURE . id) conses). UIOP's ENSURE-FUNCTION dispatches
+    // on (etypecase fun (function ...) ...), so such a closure fell through every
+    // clause and crashed ASDF's source-registry scan with "ETYPECASE: no clause
+    // matched". Compile-file forces the bytecode representation the REPL's
+    // interpreted closures don't exhibit.
+    let dir = workdir("capturing-closure-functionp");
+    let src = dir.join("cc.lisp");
+    let out = dir.join("cc.bfasl");
+    // make-adder returns a *capturing* local function; the enclosing defun is
+    // compiled, so #'adder is the compiled heap closure representation.
+    fs::write(
+        &src,
+        "(defun make-adder (n) (flet ((adder (x) (+ x n))) #'adder))\n",
+    )
+    .unwrap();
+
+    let prog = format!(
+        "(progn (compile-file #p\"{src}\" :output-file #p\"{out}\") (load \"{out}\") \
+           (let ((f (make-adder 10))) \
+             (format t \"RESULT[~a ~a ~a]\" (functionp f) (typep f 'function) (funcall f 5))))",
+        src = src.display(),
+        out = out.display(),
+    );
+    let r = run(&prog);
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    assert!(
+        r.status.success(),
+        "compile+load+check failed: {stdout}\n{}",
+        String::from_utf8_lossy(&r.stderr),
+    );
+    // compile-file prints progress chatter to stdout, so match the marker.
+    assert!(
+        stdout.contains("RESULT[T T 15]"),
+        "compiled capturing closure must be FUNCTIONP and (typep _ 'function); \
+         got: {stdout}, stderr: {}",
+        String::from_utf8_lossy(&r.stderr),
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

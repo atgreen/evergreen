@@ -1766,6 +1766,16 @@ fn is_function_value(v: BlissVal) -> bool {
     if v.is_function() {
         return true;
     }
+    // A heap interpreted-function object — e.g. a compiled capturing flet/labels
+    // closure (bliss-1ja) or a reified SYMBOL-FUNCTION/#'defun value. `apply_fn`
+    // calls exactly these via `is_interpreted_function` (see the funcall
+    // dispatch), so FUNCTIONP / `(typep x 'function)` must agree they are
+    // functions — otherwise a callable closure passed to UIOP's ENSURE-FUNCTION
+    // fell through its `(function fun)` etypecase clause and crashed ASDF's
+    // source-registry scan (bliss-aid).
+    if v.is_heap_object() && bliss_rt::function::is_interpreted_function(v) {
+        return true;
+    }
     if v.is_cons() {
         let (h, t) = cp(v);
         return h.is_symbol() && sym_name(h) == "BLISS::CLOSURE" && t.is_fixnum();
