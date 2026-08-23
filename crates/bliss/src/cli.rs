@@ -998,6 +998,17 @@ struct SlotDef {
     allocation: SlotAllocation,
 }
 
+/// Rooting support: `eval_defclass` accumulates SlotDefs in a Rust-local Vec
+/// while it keeps allocating (accessor setf names, define_class); HostRoot'ing
+/// that Vec keeps each slot's initform precise across those GCs (bliss-wlf).
+impl bliss_rt::gc::TraceHostRoots for SlotDef {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        if let Some(form) = &mut self.initform {
+            visit(form);
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SlotAllocation {
     Instance,
@@ -1166,8 +1177,42 @@ struct MacroFnCacheEntry {
     symbol: BlissVal,
 }
 
+/// bliss-wlf diagnostic (temporary): walk a form and report any value reading
+/// as the BLISS_GC_POISON fill pattern (0xFAFA…FA), i.e. a pointer into freed
+/// nursery. Gated by BLISS_GC_VALIDATE; run with BLISS_GC_STRESS=1
+/// BLISS_GC_POISON=1 to localize define-time vs expand-time corruption.
+fn debug_validate_form(label: &str, name: &str, v: BlissVal) {
+    fn enabled() -> bool {
+        static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *E.get_or_init(|| std::env::var_os("BLISS_GC_VALIDATE").is_some())
+    }
+    if !enabled() {
+        return;
+    }
+    fn walk(label: &str, name: &str, v: BlissVal, depth: u32, budget: &mut u32) {
+        if depth > 200 || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        if v.0 == 0xFAFA_FAFA_FAFA_FAFA {
+            eprintln!("bliss-wlf VALIDATE[{label}] {name}: POISON at depth {depth}");
+            return;
+        }
+        if !v.is_cons() {
+            return;
+        }
+        let (car, cdr) = cp(v);
+        walk(label, name, car, depth + 1, budget);
+        walk(label, name, cdr, depth + 1, budget);
+    }
+    let mut budget = 100_000;
+    walk(label, name, v, 0, &mut budget);
+}
+
 /// Register a global (top-level DEFMACRO) macro.
 fn global_macro_insert(name: String, def: MacroDef) {
+    debug_validate_form("defmacro", &name, def.params_form);
+    debug_validate_form("defmacro", &name, def.body);
     GLOBAL_MACROS.with(|m| m.borrow_mut().insert(name, def));
 }
 
@@ -3178,6 +3223,14 @@ impl Env {
             method_context: Vec::new(),
             eval_context: EvalContext::Repl,
         };
+        // Root the under-construction Env for the rest of new_impl: the
+        // seeding below allocates repeatedly (resolve_sym interning, stream
+        // construction, the STORAGE-CONDITION pool), and a relocating minor GC
+        // must be able to find and rewrite the values already stored in the
+        // frame — otherwise every earlier binding goes stale (bliss-wlf; under
+        // BLISS_GC_STRESS the standard stream handles corrupted this way).
+        // Dropped explicitly before `env` is returned (moved).
+        let env_guard = LiveEnvRootGuard::new(&mut env);
         env.define_local("*MODULE-PROVIDER-FUNCTIONS*", NIL);
         env.define_local("*LOAD-HOOKS*", NIL);
         // *features*: :BLISS plus the host OS so portable code (e.g. UIOP's
@@ -3254,16 +3307,22 @@ impl Env {
         // backed by the process stdio (see bliss_stdlib::streams). *terminal-io*
         // / *query-io* / *debug-io* share the stdin object for their input side;
         // routing all output builtins through these keeps a single stream model.
-        let stdin_stream = bliss_stdlib::make_stdin();
-        let stdout_stream = bliss_stdlib::make_stdout();
-        let stderr_stream = bliss_stdlib::make_stderr();
-        env.define_local("*STANDARD-INPUT*", stdin_stream);
-        env.define_local("*STANDARD-OUTPUT*", stdout_stream);
-        env.define_local("*ERROR-OUTPUT*", stderr_stream);
-        env.define_local("*TRACE-OUTPUT*", stdout_stream);
-        env.define_local("*TERMINAL-IO*", stdout_stream);
-        env.define_local("*QUERY-IO*", stdout_stream);
-        env.define_local("*DEBUG-IO*", stdout_stream);
+        // Each make_* below allocates a stream handle on the GC heap and can
+        // fire a relocating minor GC — root each handle before the next
+        // allocation, or the earlier Rust locals go stale (bliss-wlf: PRINT
+        // failed with "not a stream" under BLISS_GC_STRESS because
+        // `stdin_stream` was left dangling by make_stdout's collection).
+        let stream_roots = bliss_rt::ShadowRootScope::new();
+        let stdin_stream = stream_roots.root(bliss_stdlib::make_stdin());
+        let stdout_stream = stream_roots.root(bliss_stdlib::make_stdout());
+        let stderr_stream = stream_roots.root(bliss_stdlib::make_stderr());
+        env.define_local("*STANDARD-INPUT*", stdin_stream.get());
+        env.define_local("*STANDARD-OUTPUT*", stdout_stream.get());
+        env.define_local("*ERROR-OUTPUT*", stderr_stream.get());
+        env.define_local("*TRACE-OUTPUT*", stdout_stream.get());
+        env.define_local("*TERMINAL-IO*", stdout_stream.get());
+        env.define_local("*QUERY-IO*", stdout_stream.get());
+        env.define_local("*DEBUG-IO*", stdout_stream.get());
         env.define_local("*TYPE-DEFINITIONS*", NIL);
         env.define_local("*CONDITION-TYPES*", NIL);
         env.define_local("*CONDITION-DEFINITIONS*", NIL);
@@ -3278,6 +3337,10 @@ impl Env {
         {
             let n = bliss_stdlib::conditions::storage_condition_pool_size();
             let mut pool = Vec::with_capacity(n);
+            // Each build_condition_instance_impl allocates; the instances
+            // already accumulated in this Rust-local Vec must be rooted across
+            // those allocations or they relocate out from under it (bliss-wlf).
+            let _pool_root = VecRootGuard::new(&mut pool);
             let mut ok = true;
             for _ in 0..n {
                 match build_condition_instance_impl(&mut env, "STORAGE-CONDITION", &[], true) {
@@ -3292,6 +3355,7 @@ impl Env {
                 let _ = bliss_stdlib::conditions::set_storage_condition_pool(&pool);
             }
         }
+        drop(env_guard);
         env
     }
 
@@ -4199,7 +4263,12 @@ fn eval_quasiquote_depth(
     if !template.is_cons() {
         return Ok(template);
     }
-    let (car, cdr) = cp(template);
+    // Root the head-dispatch cons parts in place: the recursive expands below
+    // allocate before `car` is re-used in an `arena_cons` wrapper, so a relocating
+    // minor GC would otherwise leave `car` dangling (bliss-wlf / bliss-6b2 #2).
+    let (mut car, mut cdr) = cp(template);
+    let _car_root = bliss_rt::gc::StackRoot::new(&mut car);
+    let _cdr_root = bliss_rt::gc::StackRoot::new(&mut cdr);
     let head = if car.is_symbol() {
         sym_name(car)
     } else {
@@ -4237,9 +4306,26 @@ fn eval_quasiquote_depth(
     // cons-up (bliss-6b2 #2): each eval_form / recursive expand / arena_cons can
     // relocate the earlier, Vec-resident elements.
     let _rg = VecRootGuard::new(&mut result_elems);
+    // Root the spine cursor and the per-iteration cons parts in place: any
+    // eval_form / recursive expand / arena_cons in the loop body can fire a
+    // relocating minor GC, which would otherwise leave `cur` (and the `elem` /
+    // `rest` / `ecar` / `ecdr` derived from an earlier `cp`) dangling when they
+    // are re-read or consed later (bliss-wlf / bliss-6b2 #2). StackRoot rewrites
+    // the locals in place, so all existing reads keep working.
     let mut cur = template;
+    let mut elem = NIL;
+    let mut rest = NIL;
+    let mut ecar = NIL;
+    let mut ecdr = NIL;
+    let _cur_root = bliss_rt::gc::StackRoot::new(&mut cur);
+    let _elem_root = bliss_rt::gc::StackRoot::new(&mut elem);
+    let _rest_root = bliss_rt::gc::StackRoot::new(&mut rest);
+    let _ecar_root = bliss_rt::gc::StackRoot::new(&mut ecar);
+    let _ecdr_root = bliss_rt::gc::StackRoot::new(&mut ecdr);
     while cur.is_cons() {
-        let (elem, rest) = cp(cur);
+        let (e, r) = cp(cur);
+        elem = e;
+        rest = r;
         // Dotted-tail unquote: `` `(a . ,x) `` / `` `(a . ,@x) `` read as the spine
         // `(a . (unquote x))`, i.e. the list's own tail is a bare UNQUOTE /
         // UNQUOTE-SPLICING symbol (not the cons `(unquote x)` that a `,x` *element*
@@ -4264,7 +4350,9 @@ fn eval_quasiquote_depth(
         }
         // A nested backquote as an element must not be flattened element-wise.
         if elem.is_cons() {
-            let (ecar, ecdr) = cp(elem);
+            let (ec, ed) = cp(elem);
+            ecar = ec;
+            ecdr = ed;
             let ecar_name = if ecar.is_symbol() {
                 sym_name(ecar)
             } else {
@@ -4294,7 +4382,12 @@ fn eval_quasiquote_depth(
                     {
                         let (splice_expr, _) = cp(icdr);
                         let splice_val = eval_form(splice_expr, env)?;
-                        for e in list_to_vec(splice_val) {
+                        // Root the spliced elements: the arena_cons below allocates
+                        // while elements still sit unyielded in this Vec, which a
+                        // relocating GC would otherwise leave stale (bliss-wlf).
+                        let mut spliced = list_to_vec(splice_val);
+                        let _sg = VecRootGuard::new(&mut spliced);
+                        for &e in spliced.iter() {
                             result_elems.push(arena_cons(ecar, arena_cons(e, NIL)));
                         }
                         cur = rest;
@@ -4668,6 +4761,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
         }
         let t0 = timeit.then(std::time::Instant::now);
         let (val, next_pos) = read_next_form_at(&chars, pos, env)?;
+        debug_validate_form("read", "toplevel", val);
         if let Some(t0) = t0 {
             read_ns += t0.elapsed().as_nanos();
         }
@@ -16046,9 +16140,31 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
     for (name, def) in env.macros.borrow().iter() {
         all_macros.insert(name.clone(), def.clone());
     }
-    for (name, macro_def) in all_macros.iter() {
-        let params_bits = macro_def.params_form.0;
-        let body_bits = macro_def.body.0;
+    // Root every snapshot's params_form/body: the loop below allocates
+    // (freeze_env_frame, resolve_sym interning, Env construction), and a
+    // relocating minor GC moves these BlissVals in GLOBAL_MACROS (the scanned
+    // root) but NOT in this local `all_macros` snapshot — a stale, since-freed
+    // body would then be stored into a frozen macro capture, corrupting every
+    // later expansion of that macro (bliss-wlf; observed as garbage quasiquote
+    // templates under BLISS_GC_STRESS). `captured_frame`/`bytecode` are Rc
+    // (Rust-heap, stable) and the shared EnvFrame's own values relocate via the
+    // GLOBAL_MACROS scan, so only the two by-value BlissVals need rooting here.
+    let macro_names: Vec<String> = all_macros.keys().cloned().collect();
+    let macro_bodies = bliss_rt::gc::HostRoot::new(
+        macro_names
+            .iter()
+            .map(|n| {
+                let d = &all_macros[n];
+                (d.params_form, d.body)
+            })
+            .collect::<Vec<(BlissVal, BlissVal)>>(),
+    );
+    for (idx, name) in macro_names.iter().enumerate() {
+        let macro_def = &all_macros[name];
+        // Always read the rooted, post-relocation params_form/body — never the
+        // stale copies in `macro_def` (from the unrooted `all_macros` snapshot).
+        let params_bits = macro_bodies[idx].0.0;
+        let body_bits = macro_bodies[idx].1.0;
         let frame_ptr = Rc::as_ptr(&macro_def.captured_frame) as usize;
         let bytecode_ptr = macro_def
             .bytecode
@@ -16094,6 +16210,15 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
                         }),
                     );
                     let symbol = resolve_sym(name).unwrap_or(NIL);
+                    // resolve_sym interns (allocates) and can fire a relocating
+                    // minor GC; the loop-top `params_bits`/`body_bits` copies are
+                    // then stale. MACRO_FN_CACHE is a scanned GC root, so storing
+                    // stale bits makes the next GC "relocate" a pointer into
+                    // since-reused nursery memory — forwarding the wrong object
+                    // and corrupting whatever now lives there (bliss-wlf).
+                    // Re-read the rooted, post-relocation values instead.
+                    let params_bits = macro_bodies[idx].0.0;
+                    let body_bits = macro_bodies[idx].1.0;
                     MACRO_FN_CACHE.with(|c| {
                         c.borrow_mut().insert(
                             name.clone(),
@@ -16116,10 +16241,17 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
                 // table, so the closure owns a frozen snapshot instead of the
                 // live Rc frame. See FrozenEnvFrame. (The ordinary expand_macro
                 // path shares the live frame.)
+                // Freeze the frame FIRST (it allocates and can fire a GC), then read
+                // the rooted params_form/body — so the values stored into the capture
+                // are the post-relocation ones, never a copy stranded across the
+                // freeze_env_frame allocation (bliss-wlf).
+                let captured_frame = freeze_env_frame(&macro_def.captured_frame);
+                debug_validate_form("define", name, macro_bodies[idx].0);
+                debug_validate_form("define", name, macro_bodies[idx].1);
                 let capture = register_frozen_macro_capture(FrozenMacroCapture {
-                    params_form: macro_def.params_form,
-                    body: macro_def.body,
-                    captured_frame: freeze_env_frame(&macro_def.captured_frame),
+                    params_form: macro_bodies[idx].0,
+                    body: macro_bodies[idx].1,
+                    captured_frame,
                     funs: HashMap::new(),
                     classes: HashMap::new(),
                     methods: HashMap::new(),
@@ -16128,7 +16260,7 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
                 compiler_macroexpand::register_macro_function(
                     handle,
                     Arc::new(move |form, call_macro_env| {
-                        let (params_form, body, captured_frame) = {
+                        let (mut params_form, mut body, captured_frame) = {
                             let capture = capture
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -16138,7 +16270,21 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
                                 Arc::clone(&capture.captured_frame),
                             )
                         };
-                        let (_, args) = cp(form);
+                        // `params_form` and `body` are copies read out of the frozen
+                        // capture; the capture's stored values are GC roots, but these
+                        // Rust locals are not, and Env::new_for_macro_expansion /
+                        // bind_macro_lambda_list below allocate before `body` reaches
+                        // eval_progn — a relocating minor GC would leave them (and the
+                        // `form` / `args` spine) dangling (bliss-wlf / bliss-6b2 #2).
+                        // StackRoot rewrites the locals in place across those allocs.
+                        let mut form = form;
+                        let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
+                        let _pf_root = bliss_rt::gc::StackRoot::new(&mut params_form);
+                        let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
+                        debug_validate_form("expand", "frozen-macro", params_form);
+                        debug_validate_form("expand", "frozen-macro", body);
+                        let (_, mut args) = cp(form);
+                        let _args_root = bliss_rt::gc::StackRoot::new(&mut args);
                         let mut macro_env = Env::new_for_macro_expansion(false);
                         macro_env.frame = thaw_env_frame(&captured_frame);
                         // The expander body finds other global macros via
@@ -16163,6 +16309,11 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
                     }),
                 );
                 let symbol = resolve_sym(name).unwrap_or(NIL);
+                // Same staleness hazard as the bytecode branch above: resolve_sym
+                // can GC, so re-read the rooted bits before storing them into the
+                // scanned MACRO_FN_CACHE root (bliss-wlf).
+                let params_bits = macro_bodies[idx].0.0;
+                let body_bits = macro_bodies[idx].1.0;
                 MACRO_FN_CACHE.with(|c| {
                     c.borrow_mut().insert(
                         name.clone(),
@@ -16282,7 +16433,12 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
     // Class options follow the slots list. Parse (:default-initargs initarg
     // value-form …); other options (:documentation, :metaclass, …) are ignored.
-    let mut default_initargs: Vec<(String, BlissVal)> = Vec::new();
+    // The value FORMS are heap conses that must stay precise across the many
+    // allocations below (accessor setf names, define_class …), so they are
+    // kept in a rooted Vec parallel to the (unrooted) name Vec and re-paired
+    // when the ClassDef is built (bliss-wlf).
+    let mut default_initarg_names: Vec<String> = Vec::new();
+    let mut default_initarg_forms = bliss_rt::gc::HostRoot::new(Vec::<BlissVal>::new());
     for option in list_to_vec(class_options) {
         if !option.is_cons() {
             continue;
@@ -16300,7 +16456,8 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 .trim_start_matches("KEYWORD:")
                 .trim_start_matches(':')
                 .to_string();
-            default_initargs.push((initarg, pairs[j + 1]));
+            default_initarg_names.push(initarg);
+            default_initarg_forms.push(pairs[j + 1]);
             j += 2;
         }
     }
@@ -16312,18 +16469,27 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         supers.push(sym_name(*s));
     }
 
-    // Parse slots
-    let mut slots = Vec::new();
+    // Parse slots. The slot-spec conses, the accumulated SlotDefs (their
+    // initforms), and the method-spec name forms (a `(setf accessor)` cons)
+    // all live across per-slot allocations (resolve_sym/vec_to_list for the
+    // setf name) and the class-registration allocations below — a relocating
+    // minor GC would otherwise leave them stale, silently dropping later
+    // slots' accessors (bliss-wlf: `py` of the second slot went undefined
+    // under BLISS_GC_STRESS). HostRoot each accumulator; the is-writer flags
+    // ride in a parallel unrooted Vec.
+    let mut slots = bliss_rt::gc::HostRoot::new(Vec::<SlotDef>::new());
     // Reader/writer/accessor generic methods to install, captured as the ORIGINAL
     // symbols (not sym_name strings). Round-tripping a package-qualified symbol
     // through sym_name -> resolve_sym can land on a different symbol object
     // (e.g. PKG::NAME external/internal), splitting env.methods across two keys
     // so dispatch misses the reader (bliss-aid). Keep the symbol the class was
     // written with, matching how callers and explicit defmethods key it.
-    // Each entry: (slot-name-symbol, method-name-form, is-writer).
-    let mut method_specs: Vec<(BlissVal, BlissVal, bool)> = Vec::new();
-    let slot_list = list_to_vec(slots_form);
-    for slot_form in &slot_list {
+    // Each entry: (slot-name-symbol, method-name-form) + parallel is-writer flag.
+    let mut method_specs = bliss_rt::gc::HostRoot::new(Vec::<(BlissVal, BlissVal)>::new());
+    let mut method_spec_writer: Vec<bool> = Vec::new();
+    let slot_list = bliss_rt::gc::HostRoot::new(list_to_vec(slots_form));
+    for slot_i in 0..slot_list.len() {
+        let slot_form = &slot_list[slot_i];
         if slot_form.is_cons() {
             let (slot_name_form, slot_opts) = cp(*slot_form);
             let slot_name = sym_name(slot_name_form);
@@ -16331,7 +16497,9 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             let mut accessor = None;
             let mut readers = Vec::new();
             let mut writers = Vec::new();
-            let mut initform = None;
+            // Rooted: the initform is an arbitrary heap form held across the
+            // setf-name allocation below (bliss-wlf).
+            let mut initform = bliss_rt::gc::HostRoot::new(None::<BlissVal>);
             let mut allocation = SlotAllocation::Instance;
             // Method-name symbols for this slot, captured verbatim (see above).
             let mut reader_syms: Vec<BlissVal> = Vec::new();
@@ -16391,7 +16559,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     }
                 } else if opt_bare == "INITFORM" {
                     if i + 1 < opts.len() {
-                        initform = Some(opts[i + 1]);
+                        *initform = Some(opts[i + 1]);
                         i += 2;
                     } else {
                         i += 1;
@@ -16417,16 +16585,20 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // symbol) once the class is defined. `reader_syms` already includes
             // accessor names; `accessor_sym` also gets a `(setf accessor)` writer.
             for r in &reader_syms {
-                method_specs.push((slot_name_form, *r, false));
+                method_specs.push((slot_name_form, *r));
+                method_spec_writer.push(false);
             }
             for w in &writer_syms {
-                method_specs.push((slot_name_form, *w, true));
+                method_specs.push((slot_name_form, *w));
+                method_spec_writer.push(true);
             }
             if let Some(a) = accessor_sym {
                 let setf_name = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), a]);
-                method_specs.push((slot_name_form, setf_name, true));
+                method_specs.push((slot_name_form, setf_name));
+                method_spec_writer.push(true);
             }
 
+            let initform = initform.take();
             slots.push(SlotDef {
                 name: slot_name,
                 initargs,
@@ -16450,19 +16622,27 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     }
 
     let mut class_slot_values = HashMap::new();
-    for slot in &slots {
+    for slot in slots.iter() {
         if slot.allocation == SlotAllocation::Class {
             // Key by BARE name for read/write consistency (bliss-x4p).
             class_slot_values.insert(symbol_bare_name(&slot.name), None);
         }
     }
 
+    // Re-pair the rooted default-initarg forms with their names; no allocation
+    // occurs between this read and the ClassDef insertion, and once inserted
+    // the ClassDef is scanned via env.classes (visit_class_def_roots).
+    let default_initargs: Vec<(String, BlissVal)> = default_initarg_names
+        .into_iter()
+        .zip(default_initarg_forms.iter().copied())
+        .collect();
+    let slots_vec: Vec<SlotDef> = slots.iter().cloned().collect();
     env.classes.borrow_mut().insert(
         name.clone(),
         ClassDef {
             name: name.clone(),
             supers,
-            slots,
+            slots: slots_vec,
             class_slot_values: Arc::new(Mutex::new(class_slot_values)),
             default_initargs,
         },
@@ -16471,6 +16651,9 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         .iter()
         .map(|super_name| resolve_class_metaobject(env, *super_name))
         .collect();
+    // Rooted: define_class and the slot_names interning below allocate, and
+    // class metaobjects can be heap values (bliss-wlf).
+    let direct_supers = bliss_rt::gc::HostRoot::new(direct_supers?);
     // Only :instance-allocated slots get an inline cell in the heap-object
     // instance layout; :class-allocated slots live in ClassDef.class_slot_values.
     let slot_names: Vec<BlissVal> = env.classes.borrow()[&name]
@@ -16479,14 +16662,17 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         .filter(|slot| slot.allocation == SlotAllocation::Instance)
         .map(|slot| resolve_sym(&slot.name).unwrap_or(NIL))
         .collect();
-    bliss_stdlib::define_class(name_form, name_form, &direct_supers?, &slot_names)?;
+    bliss_stdlib::define_class(name_form, name_form, &direct_supers, &slot_names)?;
 
     // Install real generic methods for slot readers/writers/accessors so they
     // work as function values (`#'reader`, funcall/apply/map), not only in
     // operator position (bliss-aid). The accessor fast-path in `eval_list`
-    // remains an optimization for the common `(reader x)` call.
-    for (slot_sym, method_name, is_writer) in &method_specs {
-        install_slot_accessor_method(env, *method_name, name_form, *slot_sym, *is_writer)?;
+    // remains an optimization for the common `(reader x)` call. Index the
+    // rooted method_specs each iteration: install_slot_accessor_method
+    // allocates, so a copy held across iterations would go stale (bliss-wlf).
+    for i in 0..method_specs.len() {
+        let (slot_sym, method_name) = method_specs[i];
+        install_slot_accessor_method(env, method_name, name_form, slot_sym, method_spec_writer[i])?;
     }
     Ok(name_form)
 }

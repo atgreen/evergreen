@@ -13,7 +13,7 @@ fn args(strs: &[&str]) -> Vec<String> {
 fn crate_root_reexports_cli_surface() {
     let parsed =
         CliArgs::parse(&args(&["--eval", "(+ 1 2)"])).expect("crate-root CliArgs should parse");
-    assert_eq!(parsed.eval.as_deref(), Some("(+ 1 2)"));
+    assert_eq!(parsed.eval_forms, vec!["(+ 1 2)".to_string()]);
 
     let repl = ReplConfig::default();
     assert!(repl.syntax_highlighting);
@@ -28,7 +28,7 @@ fn crate_root_reexports_cli_surface() {
 fn parse_empty_args_gives_defaults() {
     let parsed = CliArgs::parse(&args(&[])).expect("empty args should parse");
     assert!(parsed.image.is_none());
-    assert!(parsed.eval.is_none());
+    assert!(parsed.eval_forms.is_empty());
     assert!(parsed.load.is_none());
     assert!(!parsed.no_image);
     assert!(!parsed.sandbox);
@@ -57,13 +57,13 @@ fn parse_version_flag() {
 #[test]
 fn parse_eval_long_flag() {
     let parsed = CliArgs::parse(&args(&["--eval", "(+ 1 2)"])).expect("--eval should parse");
-    assert_eq!(parsed.eval.as_deref(), Some("(+ 1 2)"));
+    assert_eq!(parsed.eval_forms, vec!["(+ 1 2)".to_string()]);
 }
 
 #[test]
 fn parse_eval_short_flag() {
     let parsed = CliArgs::parse(&args(&["-e", "(print 42)"])).expect("-e should parse");
-    assert_eq!(parsed.eval.as_deref(), Some("(print 42)"));
+    assert_eq!(parsed.eval_forms, vec!["(print 42)".to_string()]);
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn parse_runtime_tuning_flags_are_forwarded() {
         "debug",
     ]))
     .expect("runtime tuning flags should parse");
-    assert!(parsed.eval.is_none());
+    assert!(parsed.eval_forms.is_empty());
     assert!(parsed.load.is_none());
     assert!(parsed.cl_args.is_empty());
 }

@@ -198,6 +198,18 @@ struct CircularLabels {
     labels: HashMap<u32, BlissVal>,
 }
 
+// The labeled (`#n=`) values live across arbitrarily many subsequent reads,
+// each of which allocates and can fire a relocating minor GC — so the table
+// must be a scanned GC root for the duration of a read (bliss-wlf). The
+// construction sites wrap it in `HostRoot`.
+impl bliss_rt::gc::TraceHostRoots for CircularLabels {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        for value in self.labels.values_mut() {
+            visit(value);
+        }
+    }
+}
+
 // ── Heap allocation helpers ───────────────────────────────────────
 // Reader objects are allocated on the shared runtime GC heap (bliss-jtc.15), so
 // they use the same ObjectHeader layouts and allocation path as T0/T1/T2
@@ -264,19 +276,29 @@ fn alloc_vector(elements: &[BlissVal]) -> BlissVal {
 }
 
 fn alloc_ratio(num: BlissVal, den: BlissVal) -> BlissVal {
+    // Root the by-value args across gc_alloc, which can fire a relocating
+    // minor GC — a bignum numerator/denominator would otherwise be stored
+    // stale (bliss-wlf; same idiom as alloc_cons above).
+    let roots = bliss_rt::ShadowRootScope::new();
+    let num = roots.root(num);
+    let den = roots.root(den);
     let ptr = gc_alloc(std::mem::size_of::<RatioData>(), type_id::RATIO) as *mut RatioData;
     unsafe {
-        (*ptr).numerator = num;
-        (*ptr).denominator = den;
+        (*ptr).numerator = num.get();
+        (*ptr).denominator = den.get();
         BlissVal::from_heap_ptr(ptr as *mut u8)
     }
 }
 
 fn alloc_complex(real: BlissVal, imag: BlissVal) -> BlissVal {
+    // Root across gc_alloc — see alloc_ratio (bliss-wlf).
+    let roots = bliss_rt::ShadowRootScope::new();
+    let real = roots.root(real);
+    let imag = roots.root(imag);
     let ptr = gc_alloc(std::mem::size_of::<ComplexData>(), type_id::COMPLEX) as *mut ComplexData;
     unsafe {
-        (*ptr).realpart = real;
-        (*ptr).imagpart = imag;
+        (*ptr).realpart = real.get();
+        (*ptr).imagpart = imag.get();
         BlissVal::from_heap_ptr(ptr as *mut u8)
     }
 }
@@ -318,12 +340,15 @@ fn alloc_readtable() -> BlissVal {
 }
 
 fn alloc_pathname(namestring: BlissVal) -> BlissVal {
+    // Root across gc_alloc — see alloc_ratio (bliss-wlf).
+    let roots = bliss_rt::ShadowRootScope::new();
+    let namestring = roots.root(namestring);
     let ptr = gc_alloc(std::mem::size_of::<PathnameData>(), type_id::PATHNAME) as *mut PathnameData;
     unsafe {
         (*ptr).host = NIL;
         (*ptr).device = NIL;
         (*ptr).directory = NIL;
-        (*ptr).name = namestring;
+        (*ptr).name = namestring.get();
         (*ptr).type_field = NIL;
         (*ptr).version = NIL;
         BlissVal::from_heap_ptr(ptr as *mut u8)
@@ -331,11 +356,16 @@ fn alloc_pathname(namestring: BlissVal) -> BlissVal {
 }
 
 fn alloc_structure(name: BlissVal, slots: &[BlissVal]) -> BlissVal {
+    // Root `name` across gc_alloc — see alloc_ratio (bliss-wlf). The `slots`
+    // slice must point into rooted storage at the caller (the reader's slot
+    // Vecs are HostRoot'ed), so its elements re-read post-GC values.
+    let roots = bliss_rt::ShadowRootScope::new();
+    let name = roots.root(name);
     // Layout: ObjectHeader (8) + name (8) + n_slots (8) + slot data
     let total_size = 8 + 8 + 8 + slots.len() * 8;
     let ptr = gc_alloc(total_size, type_id::STRUCTURE);
     unsafe {
-        *(ptr.add(8) as *mut BlissVal) = name;
+        *(ptr.add(8) as *mut BlissVal) = name.get();
         *(ptr.add(16) as *mut u64) = slots.len() as u64;
         for (i, &slot) in slots.iter().enumerate() {
             *(ptr.add(24 + i * 8) as *mut BlissVal) = slot;
@@ -453,9 +483,9 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
                 if let Ok(s) = std::str::from_utf8(data) {
                     let chars: Vec<char> = s.chars().collect();
                     ensure_nesting_within_limit(&chars)?;
-                    let mut labels = CircularLabels {
+                    let mut labels = bliss_rt::gc::HostRoot::new(CircularLabels {
                         labels: HashMap::new(),
-                    };
+                    });
 
                     // Honor custom readtable entries before falling back to built-ins.
                     let first_pos = skip_whitespace_and_comments(&chars, 0);
@@ -522,9 +552,9 @@ pub fn read_form_at(
     read_base: u32,
     read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
-    let mut labels = CircularLabels {
+    let mut labels = bliss_rt::gc::HostRoot::new(CircularLabels {
         labels: HashMap::new(),
-    };
+    });
     let mut pos = start;
     loop {
         let (val, next) = read_token_with_base(
@@ -617,7 +647,7 @@ fn read_token_with_base(
         ')' => Err(BlissError::StreamError("unexpected ')'".into())),
         '"' => read_string(chars, pos + 1),
         '\'' => {
-            let (val, p) = read_token_with_base(
+            let (mut val, p) = read_token_with_base(
                 chars,
                 pos + 1,
                 labels,
@@ -626,11 +656,18 @@ fn read_token_with_base(
                 read_circular,
                 depth + 1,
             )?;
+            // intern_symbol can allocate (a fresh SymbolData + name string) and
+            // fire a relocating minor GC; `val` — the just-read form, held only
+            // in this Rust local — must be rooted across it or the wrapper list
+            // captures a stale pointer (bliss-wlf: corrupted every prelude
+            // macro body under BLISS_GC_STRESS). Same in the `, `,@ , and #'
+            // handlers below.
+            let _val_root = bliss_rt::gc::StackRoot::new(&mut val);
             let quote_sym = BlissVal::from_symbol_index(intern_symbol("QUOTE"));
             Ok((make_list(&[quote_sym, val]), p))
         }
         '`' => {
-            let (val, p) = read_token_with_base(
+            let (mut val, p) = read_token_with_base(
                 chars,
                 pos + 1,
                 labels,
@@ -639,12 +676,13 @@ fn read_token_with_base(
                 read_circular,
                 depth + 1,
             )?;
+            let _val_root = bliss_rt::gc::StackRoot::new(&mut val);
             let qq_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::QUASIQUOTE"));
             Ok((make_list(&[qq_sym, val]), p))
         }
         ',' => {
             if pos + 1 < chars.len() && chars[pos + 1] == '@' {
-                let (val, p) = read_token_with_base(
+                let (mut val, p) = read_token_with_base(
                     chars,
                     pos + 2,
                     labels,
@@ -653,10 +691,11 @@ fn read_token_with_base(
                     read_circular,
                     depth + 1,
                 )?;
+                let _val_root = bliss_rt::gc::StackRoot::new(&mut val);
                 let uqs_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE-SPLICING"));
                 Ok((make_list(&[uqs_sym, val]), p))
             } else {
-                let (val, p) = read_token_with_base(
+                let (mut val, p) = read_token_with_base(
                     chars,
                     pos + 1,
                     labels,
@@ -665,6 +704,7 @@ fn read_token_with_base(
                     read_circular,
                     depth + 1,
                 )?;
+                let _val_root = bliss_rt::gc::StackRoot::new(&mut val);
                 let uq_sym = BlissVal::from_symbol_index(intern_symbol("BLISS::UNQUOTE"));
                 Ok((make_list(&[uq_sym, val]), p))
             }
@@ -1356,7 +1396,12 @@ fn read_sharpsign_with_base(
                 }
                 pos += 1;
                 // Pre-allocate a placeholder cons cell for circular references
-                let placeholder = alloc_cons(NIL, NIL);
+                let mut placeholder = alloc_cons(NIL, NIL);
+                // The labeled read below allocates and can fire a relocating
+                // minor GC; the labels-table copy is rooted (HostRoot) but this
+                // Rust local is not — root it so the patch below writes into
+                // the placeholder's post-GC address (bliss-wlf).
+                let _ph_root = bliss_rt::gc::StackRoot::new(&mut placeholder);
                 labels.labels.insert(num, placeholder);
                 let (val, p) = read_token_with_base(
                     chars,
@@ -1405,7 +1450,7 @@ fn read_sharpsign_with_base(
     pos += 1;
     match dispatch {
         '\'' => {
-            let (val, p) = read_token_with_base(
+            let (mut val, p) = read_token_with_base(
                 chars,
                 pos,
                 labels,
@@ -1414,6 +1459,9 @@ fn read_sharpsign_with_base(
                 read_circular,
                 depth + 1,
             )?;
+            // Root across intern_symbol's possible allocation — see the '
+            // handler in read_token_with_base (bliss-wlf).
+            let _val_root = bliss_rt::gc::StackRoot::new(&mut val);
             let func_sym = BlissVal::from_symbol_index(intern_symbol("FUNCTION"));
             Ok((make_list(&[func_sym, val]), p))
         }
@@ -1639,7 +1687,7 @@ fn read_complex_literal_with_base(
     }
     pos += 1;
     pos = skip_whitespace_and_comments(chars, pos);
-    let (real, p) = read_token_with_base(
+    let (mut real, p) = read_token_with_base(
         chars,
         pos,
         labels,
@@ -1648,6 +1696,9 @@ fn read_complex_literal_with_base(
         read_circular,
         depth + 1,
     )?;
+    // Root `real` across the second component's read, which allocates and can
+    // fire a relocating minor GC (bliss-wlf).
+    let _real_root = bliss_rt::gc::StackRoot::new(&mut real);
     pos = skip_whitespace_and_comments(chars, p);
     let (imag, p) = read_token_with_base(
         chars,
@@ -2269,7 +2320,7 @@ fn read_struct_literal_with_base(
         ));
     }
     // Read struct name
-    let (name_val, p) = read_token_with_base(
+    let (mut name_val, p) = read_token_with_base(
         chars,
         pos,
         labels,
@@ -2278,9 +2329,13 @@ fn read_struct_literal_with_base(
         read_circular,
         depth + 1,
     )?;
+    // Root the name and the accumulating slot values across the remaining
+    // reads, each of which allocates and can fire a relocating minor GC
+    // (bliss-wlf).
+    let _name_root = bliss_rt::gc::StackRoot::new(&mut name_val);
     pos = p;
     // Read remaining slot key-value pairs as a flat list
-    let mut slots = Vec::new();
+    let mut slots = bliss_rt::gc::HostRoot::new(Vec::new());
     loop {
         pos = skip_whitespace_and_comments(chars, pos);
         if pos >= chars.len() {

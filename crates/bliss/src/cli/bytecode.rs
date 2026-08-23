@@ -156,14 +156,26 @@ fn install_bytecode_root_scanner() {
     INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_bytecode_roots));
 }
 
+/// The GC-bearing tables of one Lowerer currently compiling, registered by
+/// raw address for the extent of compilation (see `LowererConstGuard`).
+#[derive(Clone, Copy, PartialEq)]
+struct LowererRootPtrs {
+    constants: usize,
+    handler_binds: usize,
+    restart_cases: usize,
+    nested_functions: usize,
+}
+
 thread_local! {
-    /// Constant tables of Lowerers currently compiling. During lowering the
+    /// GC-bearing tables of Lowerers currently compiling. During lowering the
     /// function is not yet registered/active, so scan_bytecode_roots does not see
     /// it; without this, a heap literal (float/bignum/string/quoted list) already
     /// placed in `constants` would be freed or left stale by a relocating GC fired
     /// by a later lowering allocation — the compiled code would then read a stale
-    /// constant (observed as `NIL is not of type number`) (bliss-6b2 #2).
-    static ACTIVE_LOWERER_CONSTS: std::cell::RefCell<Vec<usize>> =
+    /// constant (observed as `NIL is not of type number`) (bliss-6b2 #2). The
+    /// same holds for the raw handler forms in `handler_binds` and the constants
+    /// of already-compiled `restart_cases` / `nested_functions` (bliss-wlf).
+    static ACTIVE_LOWERER_CONSTS: std::cell::RefCell<Vec<LowererRootPtrs>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -173,8 +185,23 @@ fn scan_lowerer_consts(visit: &mut dyn FnMut(*mut BlissVal)) {
             // SAFETY: registered only while the owning Lowerer local is live and
             // immobile (the guard is dropped before the Lowerer).
             unsafe {
-                for e in (*(p as *mut Vec<BlissVal>)).iter_mut() {
+                for e in (*(p.constants as *mut Vec<BlissVal>)).iter_mut() {
                     visit(e as *mut BlissVal);
+                }
+                for info in (*(p.handler_binds as *mut Vec<HandlerBindInfo>)).iter_mut() {
+                    for (_, form) in info.bindings.iter_mut() {
+                        visit(form as *mut BlissVal);
+                    }
+                }
+                for info in (*(p.restart_cases as *mut Vec<RestartCaseInfo>)).iter_mut() {
+                    for restart in info.restarts.iter_mut() {
+                        trace_bytecode_function(&mut *restart.function, visit);
+                    }
+                }
+                for nested in
+                    (*(p.nested_functions as *mut Vec<Box<BytecodeFunction>>)).iter_mut()
+                {
+                    trace_bytecode_function(&mut **nested, visit);
                 }
             }
         }
@@ -186,13 +213,19 @@ fn install_lowerer_const_scanner() {
     INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_lowerer_consts));
 }
 
-/// Roots a Lowerer's `constants` table for the extent of compilation.
-struct LowererConstGuard(usize);
+/// Roots a Lowerer's GC-bearing tables (constants, handler-bind forms,
+/// compiled restart clauses, nested lambdas) for the extent of compilation.
+struct LowererConstGuard(LowererRootPtrs);
 
 impl LowererConstGuard {
-    fn new(constants: &mut Vec<BlissVal>) -> Self {
+    fn new(lo: &mut Lowerer) -> Self {
         install_lowerer_const_scanner();
-        let p = constants as *mut Vec<BlissVal> as usize;
+        let p = LowererRootPtrs {
+            constants: &mut lo.constants as *mut Vec<BlissVal> as usize,
+            handler_binds: &mut lo.handler_binds as *mut Vec<HandlerBindInfo> as usize,
+            restart_cases: &mut lo.restart_cases as *mut Vec<RestartCaseInfo> as usize,
+            nested_functions: &mut lo.nested_functions as *mut Vec<Box<BytecodeFunction>> as usize,
+        };
         ACTIVE_LOWERER_CONSTS.with(|r| r.borrow_mut().push(p));
         LowererConstGuard(p)
     }
@@ -873,7 +906,9 @@ impl<'e> Lowerer<'e> {
     // ── Expression lowering ────────────────────────────────────────
 
     /// Lower a form so its single value is left on the operand stack.
-    fn lower_expr(&mut self, form: BlissVal) -> LowerResult<()> {
+    fn lower_expr(&mut self, mut form: BlissVal) -> LowerResult<()> {
+        // Root `form` across the allocating lower_expr_inner recursion (moving GC; bliss-wlf).
+        let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
         let result = self.lower_expr_inner(form);
         if result.is_err() && bail_trace_on() && last_bail_reason().is_none() {
             let label = if form.is_cons() {
@@ -1083,7 +1118,8 @@ impl<'e> Lowerer<'e> {
     }
 
     fn lower_if(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let parts = list_to_vec(rest);
+        // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
+        let parts = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         if parts.len() < 2 || parts.len() > 3 {
             return Err(Bail);
         }
@@ -1113,7 +1149,8 @@ impl<'e> Lowerer<'e> {
     }
 
     fn lower_progn(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let forms = list_to_vec(rest);
+        // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
+        let forms = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         if forms.is_empty() {
             let c = self.add_const(NIL);
             self.emit(Instr::Const(c));
@@ -1121,8 +1158,8 @@ impl<'e> Lowerer<'e> {
             return Ok(());
         }
         let n = forms.len();
-        for (i, f) in forms.into_iter().enumerate() {
-            self.lower_expr(f)?;
+        for i in 0..n {
+            self.lower_expr(forms[i])?;
             if i + 1 < n {
                 // Discard non-final values.
                 self.emit(Instr::Pop);
@@ -1134,7 +1171,9 @@ impl<'e> Lowerer<'e> {
 
     /// `(when test body...)` / `(unless test body...)`.
     fn lower_when(&mut self, rest: BlissVal, negate: bool) -> LowerResult<()> {
-        let (test, body) = cp(rest);
+        // Root `body` across the allocating lower_expr recursion (moving GC; bliss-wlf).
+        let (test, mut body) = cp(rest);
+        let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
         let base = self.cur_stack;
         self.lower_expr(test)?;
         if negate {
@@ -1178,7 +1217,8 @@ impl<'e> Lowerer<'e> {
 
     /// `(and a b ...)` — short-circuit; NIL on the first false, else the last.
     fn lower_and(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let args = list_to_vec(rest);
+        // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
+        let args = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         let base = self.cur_stack;
         if args.is_empty() {
             let c = self.add_const(T);
@@ -1188,8 +1228,8 @@ impl<'e> Lowerer<'e> {
         }
         let n = args.len();
         let mut false_jumps = Vec::new();
-        for (i, a) in args.into_iter().enumerate() {
-            self.lower_expr(a)?;
+        for i in 0..n {
+            self.lower_expr(args[i])?;
             if i + 1 < n {
                 self.emit(Instr::BrIfFalse(0)); // pops; jump to the NIL result
                 false_jumps.push(self.code.len() - 1);
@@ -1216,7 +1256,8 @@ impl<'e> Lowerer<'e> {
 
     /// `(or a b ...)` — short-circuit; the first true value, else the last.
     fn lower_or(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let args = list_to_vec(rest);
+        // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
+        let args = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         let base = self.cur_stack;
         if args.is_empty() {
             let c = self.add_const(NIL);
@@ -1226,8 +1267,8 @@ impl<'e> Lowerer<'e> {
         }
         let n = args.len();
         let mut end_jumps = Vec::new();
-        for (i, a) in args.into_iter().enumerate() {
-            self.lower_expr(a)?;
+        for i in 0..n {
+            self.lower_expr(args[i])?;
             if i + 1 < n {
                 self.emit(Instr::Dup);
                 self.push_n(1);
@@ -1257,7 +1298,8 @@ impl<'e> Lowerer<'e> {
     /// once, EQL-compare against each clause's designator(s).
     fn lower_case(&mut self, rest: BlissVal) -> LowerResult<()> {
         let (key_form, clauses_form) = cp(rest);
-        let clauses = list_to_vec(clauses_form);
+        // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
+        let clauses = bliss_rt::gc::HostRoot::new(list_to_vec(clauses_form));
         let base = self.cur_stack;
 
         // Evaluate the key once into a temporary slot.
@@ -1268,7 +1310,8 @@ impl<'e> Lowerer<'e> {
 
         let eql_sym = resolve_sym("EQL").ok_or(Bail)?.as_symbol_index();
         let mut end_jumps = Vec::new();
-        for clause in clauses {
+        for ci in 0..clauses.len() {
+            let clause = clauses[ci];
             if !clause.is_cons() {
                 return Err(Bail);
             }
@@ -1338,14 +1381,17 @@ impl<'e> Lowerer<'e> {
     /// `(cond (test body...)...)` — nested IF; a testless-body clause yields the
     /// test value.
     fn lower_cond(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let clauses = list_to_vec(rest);
+        // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
+        let clauses = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         let base = self.cur_stack;
         let mut end_jumps = Vec::new();
-        for clause in clauses {
+        for ci in 0..clauses.len() {
+            let clause = clauses[ci];
             if !clause.is_cons() {
                 return Err(Bail);
             }
-            let (test, body) = cp(clause);
+            let (test, mut body) = cp(clause);
+            let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
             self.cur_stack = base;
             self.lower_expr(test)?; // test value on stack
             if body.is_nil() {
@@ -1388,8 +1434,10 @@ impl<'e> Lowerer<'e> {
     }
 
     fn lower_let(&mut self, rest: BlissVal, sequential: bool) -> LowerResult<()> {
-        let (bindings, body) = cp(rest);
-        let binding_forms = list_to_vec(bindings);
+        // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
+        let (bindings, mut body) = cp(rest);
+        let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
+        let binding_forms = bliss_rt::gc::HostRoot::new(list_to_vec(bindings));
 
         // A binding captured by a lambda introduced *within* this let body — in
         // particular one produced by a macro / compiler-macro expansion, e.g.
@@ -1436,8 +1484,8 @@ impl<'e> Lowerer<'e> {
         if sequential {
             // LET*: each init sees prior bindings.
             self.enter_scope();
-            for b in &binding_forms {
-                let (name, init) = binding_name_init(*b)?;
+            for bi in 0..binding_forms.len() {
+                let (name, init) = binding_name_init(binding_forms[bi])?;
                 self.lower_expr(init)?;
                 if is_special_name(&name) {
                     let symbol = resolve_sym(&name).ok_or(Bail)?.as_symbol_index();
@@ -1451,8 +1499,8 @@ impl<'e> Lowerer<'e> {
         } else {
             // LET (parallel): evaluate all inits in the outer scope, then bind.
             let mut names = Vec::new();
-            for b in &binding_forms {
-                let (name, init) = binding_name_init(*b)?;
+            for bi in 0..binding_forms.len() {
+                let (name, init) = binding_name_init(binding_forms[bi])?;
                 self.lower_expr(init)?; // compiled against the *current* scope
                 names.push(name);
             }
@@ -1477,15 +1525,15 @@ impl<'e> Lowerer<'e> {
         }
 
         // Body as an implicit progn.
-        let body_forms = list_to_vec(body);
+        let body_forms = bliss_rt::gc::HostRoot::new(list_to_vec(body));
         if body_forms.is_empty() {
             let c = self.add_const(NIL);
             self.emit(Instr::Const(c));
             self.push_n(1);
         } else {
             let n = body_forms.len();
-            for (i, f) in body_forms.into_iter().enumerate() {
-                self.lower_expr(f)?;
+            for i in 0..n {
+                self.lower_expr(body_forms[i])?;
                 if i + 1 < n {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
@@ -1509,7 +1557,9 @@ impl<'e> Lowerer<'e> {
     /// resulting macro-free body. `macroexpand_all` walks into ordinary special
     /// forms, keeping their operators intact, so the lowerer's dedicated handlers
     /// (LOOP, TAGBODY, …) still see the structure they expect.
-    fn lower_macrolet(&mut self, form: BlissVal) -> LowerResult<()> {
+    fn lower_macrolet(&mut self, mut form: BlissVal) -> LowerResult<()> {
+        // Root across the allocating macro-env build (moving GC; bliss-wlf).
+        let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
         if self.macro_env.is_none() {
             self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
         }
@@ -1520,17 +1570,27 @@ impl<'e> Lowerer<'e> {
         }
     }
 
-    fn lower_call(&mut self, name: &str, op: BlissVal, rest: BlissVal) -> LowerResult<()> {
+    fn lower_call(&mut self, name: &str, mut op: BlissVal, mut rest: BlissVal) -> LowerResult<()> {
+        // Root `op`/`rest` for the whole function: the branches below allocate
+        // (arena_cons, building the macro env, compiler-macroexpand) before
+        // `rest` is walked at the named-call tail, and a relocating minor GC
+        // would leave these Rust locals stale (bliss-wlf — the reproducer's
+        // (print (+ 1 2)) thunk segfaulted lowering its arg list under
+        // BLISS_GC_STRESS). Argument vectors are HostRoot'ed likewise: each
+        // recursive lower_expr can macroexpand (allocate), moving the not-yet-
+        // lowered sibling args out from under a plain Vec.
+        let _op_root = bliss_rt::gc::StackRoot::new(&mut op);
+        let _rest_root = bliss_rt::gc::StackRoot::new(&mut rest);
         // A lexically-visible local function (flet/labels): call its compiled
         // body directly by the gensym it is registered under.
         if let Some(&sym) = self.local_fns.get(name) {
-            let args = list_to_vec(rest);
+            let args = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
             let nargs = args.len();
             if nargs > u16::MAX as usize {
                 return Err(Bail);
             }
-            for a in args {
-                self.lower_expr(a)?;
+            for i in 0..nargs {
+                self.lower_expr(args[i])?;
             }
             self.emit(Instr::CallNamed {
                 sym,
@@ -1602,13 +1662,13 @@ impl<'e> Lowerer<'e> {
                 return Err(record_bail(|| format!("call:{name}")));
             }
         }
-        let args = list_to_vec(rest);
+        let args = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         let nargs = args.len();
         if nargs > u16::MAX as usize {
             return Err(Bail);
         }
-        for a in args {
-            self.lower_expr(a)?;
+        for i in 0..nargs {
+            self.lower_expr(args[i])?;
         }
         self.emit(Instr::CallNamed {
             sym: op.as_symbol_index(),
@@ -1623,7 +1683,9 @@ impl<'e> Lowerer<'e> {
     /// `(setq var val ...)` — store into lexical local slots only; any special
     /// or global assignment bails (a nmq.5 concern).
     fn lower_setq(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let items = list_to_vec(rest);
+        // Root the pair list across the allocating lower_expr recursion (moving
+        // GC; bliss-wlf) and re-read `items[..]` after each lowering.
+        let items = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         if items.is_empty() {
             let c = self.add_const(NIL);
             self.emit(Instr::Const(c));
@@ -1642,7 +1704,7 @@ impl<'e> Lowerer<'e> {
             }
             let last = i + 1 == npairs;
             self.lower_expr(val)?; // +1
-            self.store_to_symbol_place(var, last)?;
+            self.store_to_symbol_place(items[2 * i], last)?;
         }
         Ok(())
     }
@@ -1703,7 +1765,10 @@ impl<'e> Lowerer<'e> {
     /// the increment `(setf i (1+ i))` is the reason idiomatic loops never
     /// promoted to native code (bliss-jtc.26).
     fn lower_setf(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let items = list_to_vec(rest);
+        // Root the pair list across the allocating resolve_sym/lower_expr
+        // recursion (moving GC; bliss-wlf); re-read `items[..]` for the value and
+        // symbol place, and StackRoot/HostRoot the destructured place subforms.
+        let items = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         if items.len() % 2 != 0 {
             return Err(Bail);
         }
@@ -1716,19 +1781,19 @@ impl<'e> Lowerer<'e> {
         let npairs = items.len() / 2;
         for i in 0..npairs {
             let place = items[2 * i];
-            let val = items[2 * i + 1];
             let last = i + 1 == npairs;
             if place.is_symbol() {
                 // Symbol place: identical to SETQ.
-                self.lower_expr(val)?;
-                self.store_to_symbol_place(place, last)?;
-            } else if let Some((setter, cons_arg)) = cons_setf_place(place) {
+                self.lower_expr(items[2 * i + 1])?;
+                self.store_to_symbol_place(items[2 * i], last)?;
+            } else if let Some((setter, mut cons_arg)) = cons_setf_place(place) {
                 // `(setf (car|cdr X) V)` → the internal store primitive
                 // BLISS::SET-CAR / SET-CDR (cons, value), which writes in place
                 // and returns the value.
+                let _cons_arg_root = bliss_rt::gc::StackRoot::new(&mut cons_arg);
                 let sym = resolve_sym(setter).ok_or(Bail)?.as_symbol_index();
                 self.lower_expr(cons_arg)?; // cons
-                self.lower_expr(val)?; // value
+                self.lower_expr(items[2 * i + 1])?; // value
                 self.emit(Instr::CallNamed { sym, nargs: 2 });
                 self.pop_n(2);
                 self.push_n(1); // result: the stored value
@@ -1736,16 +1801,18 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
-            } else if let Some((key, table)) = self.gethash_place(place) {
+            } else if let Some((mut key, mut table)) = self.gethash_place(place) {
                 // `(setf (gethash key table) val)` → the internal store primitive
                 // BLISS::PUT-GETHASH (bliss-x5y.2). Push value, key, table in the
                 // interpreter's value-first order, then call; the result is the
                 // value. Other complex places (car/aref/slot/…) still bail — the
                 // setf-expander machinery is not available here.
+                let _key_root = bliss_rt::gc::StackRoot::new(&mut key);
+                let _table_root = bliss_rt::gc::StackRoot::new(&mut table);
                 let sym = resolve_sym("BLISS::PUT-GETHASH")
                     .ok_or(Bail)?
                     .as_symbol_index();
-                self.lower_expr(val)?; // value
+                self.lower_expr(items[2 * i + 1])?; // value
                 self.lower_expr(key)?; // key
                 self.lower_expr(table)?; // table
                 self.emit(Instr::CallNamed { sym, nargs: 3 });
@@ -1760,19 +1827,21 @@ impl<'e> Lowerer<'e> {
                 // the tree-walker accepts the store without retaining metadata
                 // or evaluating the ignored place arguments, then returns the
                 // assigned value. Preserve those existing semantics here.
-                self.lower_expr(val)?;
+                self.lower_expr(items[2 * i + 1])?;
                 self.emit(Instr::ClearMv);
                 if !last {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
-            } else if let Some((seq, index)) = aref_setf_place(place) {
+            } else if let Some((mut seq, mut index)) = aref_setf_place(place) {
                 // `(setf (aref|svref|char|schar|row-major-aref|elt seq i) val)` →
                 // the internal store primitive BLISS::SET-AREF (seq, index, value).
+                let _seq_root = bliss_rt::gc::StackRoot::new(&mut seq);
+                let _index_root = bliss_rt::gc::StackRoot::new(&mut index);
                 let sym = resolve_sym("BLISS::SET-AREF").ok_or(Bail)?.as_symbol_index();
                 self.lower_expr(seq)?;
                 self.lower_expr(index)?;
-                self.lower_expr(val)?;
+                self.lower_expr(items[2 * i + 1])?;
                 self.emit(Instr::CallNamed { sym, nargs: 3 });
                 self.pop_n(3);
                 self.push_n(1);
@@ -1780,14 +1849,15 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
-            } else if let Some(sym_form) = symbol_function_setf_place(place) {
+            } else if let Some(mut sym_form) = symbol_function_setf_place(place) {
                 // `(setf (symbol-function|fdefinition sym) fn)` → the internal
                 // store primitive BLISS::SET-SYMBOL-FUNCTION (sym, value).
+                let _sym_form_root = bliss_rt::gc::StackRoot::new(&mut sym_form);
                 let setter = resolve_sym("BLISS::SET-SYMBOL-FUNCTION")
                     .ok_or(Bail)?
                     .as_symbol_index();
                 self.lower_expr(sym_form)?; // symbol
-                self.lower_expr(val)?; // value
+                self.lower_expr(items[2 * i + 1])?; // value
                 self.emit(Instr::CallNamed { sym: setter, nargs: 2 });
                 self.pop_n(2);
                 self.push_n(1);
@@ -1799,11 +1869,12 @@ impl<'e> Lowerer<'e> {
                 // `(setf (f a b) val)` for a user `(defun (setf f) …)` writer:
                 // call the writer as `(writer val a b)` (new value first, then the
                 // place subforms), which returns the stored value.
+                let args = bliss_rt::gc::HostRoot::new(args);
                 let sym = resolve_sym(&writer).ok_or(Bail)?.as_symbol_index();
-                self.lower_expr(val)?; // new value
+                self.lower_expr(items[2 * i + 1])?; // new value
                 let mut nargs = 1u16;
-                for arg in args {
-                    self.lower_expr(arg)?;
+                for j in 0..args.len() {
+                    self.lower_expr(args[j])?;
                     nargs += 1;
                 }
                 self.emit(Instr::CallNamed { sym, nargs });
@@ -1945,7 +2016,10 @@ impl<'e> Lowerer<'e> {
     /// `(catch tag body...)` — dynamic non-local exit; shares the tree-walker's
     /// `env.catch_stack` control-token protocol for cross-backend interop.
     fn lower_catch(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let (tag_form, body) = cp(rest);
+        let (tag_form, mut body) = cp(rest);
+        // Root `body` across the allocating lower_expr of the tag (moving GC;
+        // bliss-wlf).
+        let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
         self.lower_expr(tag_form)?; // +1 (tag on stack)
         let sp_restore = self.cur_stack - 1; // depth after PushCatch consumes the tag
         self.emit(Instr::PushCatch {
@@ -1969,7 +2043,10 @@ impl<'e> Lowerer<'e> {
         if !r2.is_cons() {
             return Err(Bail);
         }
-        let (val_form, _) = cp(r2);
+        let (mut val_form, _) = cp(r2);
+        // Root `val_form` across the allocating lower_expr of the tag (moving GC;
+        // bliss-wlf).
+        let _val_root = bliss_rt::gc::StackRoot::new(&mut val_form);
         self.lower_expr(tag_form)?; // tag
         self.lower_expr(val_form)?; // value (on top)
         self.emit(Instr::Throw);
@@ -1981,7 +2058,9 @@ impl<'e> Lowerer<'e> {
     /// `(tagbody {tag | statement}*)` — statements run in order, `go` jumps to
     /// a tag, the form returns NIL.
     fn lower_tagbody(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let items = list_to_vec(rest);
+        // Root the statement list across the allocating lower_expr recursion
+        // (moving GC; bliss-wlf); re-read `items[i]` each iteration.
+        let items = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         let tagbody_id = self.fresh_id();
         let sp_restore = self.cur_stack;
         self.emit(Instr::PushTag {
@@ -1992,7 +2071,7 @@ impl<'e> Lowerer<'e> {
 
         // Pre-register tag names so forward `go`s resolve to this scope.
         let mut tags: HashMap<String, usize> = HashMap::new();
-        for item in &items {
+        for item in items.iter() {
             if let Some(name) = tag_key(*item) {
                 tags.entry(name).or_insert(usize::MAX);
             }
@@ -2002,14 +2081,14 @@ impl<'e> Lowerer<'e> {
             tags,
         });
 
-        for item in &items {
-            if let Some(name) = tag_key(*item) {
+        for i in 0..items.len() {
+            if let Some(name) = tag_key(items[i]) {
                 let bcp = self.code.len();
                 if let Some(scope) = self.tag_scope.last_mut() {
                     scope.tags.insert(name, bcp);
                 }
             } else {
-                self.lower_expr(*item)?; // +1
+                self.lower_expr(items[i])?; // +1
                 self.emit(Instr::Pop);
                 self.pop_n(1);
             }
@@ -2083,20 +2162,27 @@ impl<'e> Lowerer<'e> {
     ///       (setq var limit)   ; result-form sees var = count (CLHS)
     ///       result))
     fn lower_dotimes(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let (binding, body) = cp(rest);
+        let (binding, mut body) = cp(rest);
         if !binding.is_cons() {
             return Err(Bail);
         }
-        let (var, br) = cp(binding);
+        let (mut var, br) = cp(binding);
         if !var.is_symbol() {
             return Err(Bail);
         }
-        let (count_form, result_rest) = cp(br);
-        let result = if result_rest.is_cons() {
+        let (mut count_form, result_rest) = cp(br);
+        let mut result = if result_rest.is_cons() {
             cp(result_rest).0
         } else {
             NIL
         };
+
+        // Root cp-derived source across the allocating resolve_sym/form_list
+        // building (moving GC; bliss-wlf).
+        let _var_root = bliss_rt::gc::StackRoot::new(&mut var);
+        let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
+        let _count_root = bliss_rt::gc::StackRoot::new(&mut count_form);
+        let _result_root = bliss_rt::gc::StackRoot::new(&mut result);
 
         let id = self.fresh_id();
         let limit = resolve_sym(&format!("%DOTIMES-LIMIT{id}")).ok_or(Bail)?;
@@ -2104,7 +2190,7 @@ impl<'e> Lowerer<'e> {
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
 
         let test = form_list(&[s("<")?, var, limit]);
-        let mut when_items = vec![s("WHEN")?, test];
+        let mut when_items = bliss_rt::gc::HostRoot::new(vec![s("WHEN")?, test]);
         when_items.extend(list_to_vec(body));
         when_items.push(form_list(&[
             s("SETQ")?,
@@ -2137,31 +2223,38 @@ impl<'e> Lowerer<'e> {
     ///       (setq var nil)   ; result-form sees var = nil (CLHS)
     ///       result))
     fn lower_dolist(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let (binding, body) = cp(rest);
+        let (binding, mut body) = cp(rest);
         if !binding.is_cons() {
             return Err(Bail);
         }
-        let (var, br) = cp(binding);
+        let (mut var, br) = cp(binding);
         if !var.is_symbol() {
             return Err(Bail);
         }
-        let (list_form, result_rest) = cp(br);
-        let result = if result_rest.is_cons() {
+        let (mut list_form, result_rest) = cp(br);
+        let mut result = if result_rest.is_cons() {
             cp(result_rest).0
         } else {
             NIL
         };
+
+        // Root cp-derived source across the allocating resolve_sym/form_list
+        // building (moving GC; bliss-wlf).
+        let _var_root = bliss_rt::gc::StackRoot::new(&mut var);
+        let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
+        let _list_root = bliss_rt::gc::StackRoot::new(&mut list_form);
+        let _result_root = bliss_rt::gc::StackRoot::new(&mut result);
 
         let id = self.fresh_id();
         let rest_var = resolve_sym(&format!("%DOLIST-REST{id}")).ok_or(Bail)?;
         let top = resolve_sym(&format!("%DOLIST-TOP{id}")).ok_or(Bail)?;
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
 
-        let mut when_items = vec![
+        let mut when_items = bliss_rt::gc::HostRoot::new(vec![
             s("WHEN")?,
             rest_var,
             form_list(&[s("SETQ")?, var, form_list(&[s("CAR")?, rest_var])]),
-        ];
+        ]);
         when_items.extend(list_to_vec(body));
         when_items.push(form_list(&[
             s("SETQ")?,
@@ -2188,7 +2281,10 @@ impl<'e> Lowerer<'e> {
     /// so it promotes like any other loop. The *extended* LOOP (with atomic
     /// keywords such as FOR/WHILE/COLLECT) is left to the tree-walker.
     fn lower_loop(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let forms = list_to_vec(rest);
+        // Root the clause list so the &[BlissVal] slices handed to the
+        // lower_loop_* helpers stay precise across their allocating lowering
+        // (moving GC; bliss-wlf).
+        let forms = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         if forms.is_empty() {
             return Err(Bail);
         }
@@ -2230,8 +2326,8 @@ impl<'e> Lowerer<'e> {
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
 
-        let mut tb = vec![s("TAGBODY")?, top];
-        tb.extend(forms);
+        let mut tb = bliss_rt::gc::HostRoot::new(vec![s("TAGBODY")?, top]);
+        tb.extend(forms.iter().copied());
         tb.push(form_list(&[s("GO")?, top]));
         let block = form_list(&[s("BLOCK")?, NIL, form_list(&tb)]);
         self.lower_expr(block)
@@ -2299,24 +2395,31 @@ impl<'e> Lowerer<'e> {
                     }
                 }
                 Some("FOR") | Some("AS") => {
-                    let var = *forms.get(i + 1).ok_or(Bail)?;
+                    // Root scalar heap copies of slice elements / form_list
+                    // results across the allocating fresh/form_list/lower_*
+                    // recursion (moving GC; bliss-wlf).
+                    let mut var = *forms.get(i + 1).ok_or(Bail)?;
+                    let _var_root = bliss_rt::gc::StackRoot::new(&mut var);
                     match kw(*forms.get(i + 2).ok_or(Bail)?).as_deref() {
                         Some("IN") | Some("ON") => {
                             let on = kw(forms[i + 2]).as_deref() == Some("ON");
-                            let list = *forms.get(i + 3).ok_or(Bail)?;
+                            let mut list = *forms.get(i + 3).ok_or(Bail)?;
+                            let _list_root = bliss_rt::gc::StackRoot::new(&mut list);
                             let lst = fresh("LST", &mut nsym)?;
                             bindings.push(form_list(&[lst, list]));
                             let mut adv = 4;
                             // optional `by STEPFN`
-                            let step_expr = if kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref()
+                            let mut step_expr = if kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref()
                                 == Some("BY")
                             {
-                                let f = *forms.get(i + 5).ok_or(Bail)?;
+                                let mut f = *forms.get(i + 5).ok_or(Bail)?;
+                                let _f_root = bliss_rt::gc::StackRoot::new(&mut f);
                                 adv = 6;
                                 form_list(&[s("FUNCALL")?, f, lst])
                             } else {
                                 form_list(&[s("CDR")?, lst])
                             };
+                            let _step_expr_root = bliss_rt::gc::StackRoot::new(&mut step_expr);
                             top_tests.push(form_list(&[
                                 s("WHEN")?,
                                 form_list(&[s("NULL")?, lst]),
@@ -2332,7 +2435,8 @@ impl<'e> Lowerer<'e> {
                             i += adv;
                         }
                         Some("=") => {
-                            let init = *forms.get(i + 3).ok_or(Bail)?;
+                            let mut init = *forms.get(i + 3).ok_or(Bail)?;
+                            let _init_root = bliss_rt::gc::StackRoot::new(&mut init);
                             if !var.is_symbol() {
                                 return Err(Bail);
                             }
@@ -2343,7 +2447,8 @@ impl<'e> Lowerer<'e> {
                                 // (which runs after the body, before the next top
                                 // test), so iteration 1 sees INIT and later
                                 // iterations see STEP.
-                                let step = *forms.get(i + 5).ok_or(Bail)?;
+                                let mut step = *forms.get(i + 5).ok_or(Bail)?;
+                                let _step_root = bliss_rt::gc::StackRoot::new(&mut step);
                                 bindings.push(form_list(&[var, init]));
                                 steps.push(form_list(&[s("SETQ")?, var, step]));
                                 i += 6;
@@ -2383,7 +2488,7 @@ impl<'e> Lowerer<'e> {
                                 }
                                 _ => {}
                             }
-                            let step = if kw(*forms.get(i + adv).unwrap_or(&NIL)).as_deref()
+                            let mut step = if kw(*forms.get(i + adv).unwrap_or(&NIL)).as_deref()
                                 == Some("BY")
                             {
                                 let by = *forms.get(i + adv + 1).ok_or(Bail)?;
@@ -2392,7 +2497,9 @@ impl<'e> Lowerer<'e> {
                             } else {
                                 BlissVal::from_fixnum(1)
                             };
-                            if let Some((bound, cmp)) = limit {
+                            let _step_root = bliss_rt::gc::StackRoot::new(&mut step);
+                            if let Some((mut bound, cmp)) = limit {
+                                let _bound_root = bliss_rt::gc::StackRoot::new(&mut bound);
                                 // terminate when var passes the bound
                                 let test_cmp = if cmp == "<=" {
                                     ">"
@@ -2421,7 +2528,8 @@ impl<'e> Lowerer<'e> {
                     }
                 }
                 Some("REPEAT") => {
-                    let n = *forms.get(i + 1).ok_or(Bail)?;
+                    let mut n = *forms.get(i + 1).ok_or(Bail)?;
+                    let _n_root = bliss_rt::gc::StackRoot::new(&mut n);
                     let counter = fresh("REP", &mut nsym)?;
                     bindings.push(form_list(&[counter, n]));
                     top_tests.push(form_list(&[
@@ -2445,7 +2553,8 @@ impl<'e> Lowerer<'e> {
                     // terminating value is not collected (CLHS 6.1.2.1 / 6.1.9;
                     // was: an off-by-one that collected the sentinel — e.g. asdf's
                     // slurp-stream-forms appended its EOF marker).
-                    let test = *forms.get(i + 1).ok_or(Bail)?;
+                    let mut test = *forms.get(i + 1).ok_or(Bail)?;
+                    let _test_root = bliss_rt::gc::StackRoot::new(&mut test);
                     pre.push(form_list(&[
                         s("WHEN")?,
                         form_list(&[s("NOT")?, test]),
@@ -2454,7 +2563,8 @@ impl<'e> Lowerer<'e> {
                     i += 2;
                 }
                 Some("UNTIL") => {
-                    let test = *forms.get(i + 1).ok_or(Bail)?;
+                    let mut test = *forms.get(i + 1).ok_or(Bail)?;
+                    let _test_root = bliss_rt::gc::StackRoot::new(&mut test);
                     pre.push(form_list(&[
                         s("WHEN")?,
                         test,
@@ -2484,14 +2594,16 @@ impl<'e> Lowerer<'e> {
                     }
                 }
                 Some("RETURN") => {
-                    let e = *forms.get(i + 1).ok_or(Bail)?;
+                    let mut e = *forms.get(i + 1).ok_or(Bail)?;
+                    let _e_root = bliss_rt::gc::StackRoot::new(&mut e);
                     body.push(form_list(&[s("RETURN")?, e]));
                     explicit_result = true;
                     i += 2;
                 }
                 Some("WHEN") | Some("IF") | Some("UNLESS") => {
                     let negate = key.as_deref() == Some("UNLESS");
-                    let test = *forms.get(i + 1).ok_or(Bail)?;
+                    let mut test = *forms.get(i + 1).ok_or(Bail)?;
+                    let _test_root = bliss_rt::gc::StackRoot::new(&mut test);
                     i += 2;
                     // then-branch: one or more selectable clauses (do/return/
                     // accumulations, joined by `and`).
@@ -2545,7 +2657,7 @@ impl<'e> Lowerer<'e> {
                     let it_temp = fresh("IT", &mut nsym)?;
                     let mut then_progn = HostRoot::new(vec![s("PROGN")?]);
                     then_progn.extend(then_forms.iter().map(|f| subst_loop_it(*f, it_temp)));
-                    let cond_form = if else_forms.is_empty() {
+                    let mut cond_form = if else_forms.is_empty() {
                         let guard = if negate { "UNLESS" } else { "WHEN" };
                         form_list(&[s(guard)?, it_temp, form_list(&then_progn)])
                     } else {
@@ -2559,6 +2671,7 @@ impl<'e> Lowerer<'e> {
                         };
                         form_list(&[s("IF")?, it_temp, a, b])
                     };
+                    let _cond_form_root = bliss_rt::gc::StackRoot::new(&mut cond_form);
                     let binding = form_list(&[it_temp, test]);
                     body.push(form_list(&[
                         s("LET")?,
@@ -2638,21 +2751,27 @@ impl<'e> Lowerer<'e> {
         let count = resolve_sym(&format!("%LOOP-REPEAT{id}")).ok_or(Bail)?;
         let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
-        let (uses_acc, acc_init, per_iter, result) = self.lower_loop_action(&forms[2..], acc)?;
+        let (uses_acc, acc_init, per_iter, mut result) =
+            self.lower_loop_action(&forms[2..], acc)?;
+        // Root the accumulator Vecs and cons intermediates across the allocating
+        // form_list/lower_expr calls (moving GC; bliss-wlf).
+        let per_iter = HostRoot::new(per_iter);
+        let _result_root = bliss_rt::gc::StackRoot::new(&mut result);
 
-        let mut when_items = vec![
+        let mut when_items = HostRoot::new(vec![
             s("WHEN")?,
             form_list(&[s(">")?, count, BlissVal::from_fixnum(0)]),
-        ];
-        when_items.extend(per_iter);
+        ]);
+        when_items.extend(per_iter.iter().copied());
         when_items.push(form_list(&[
             s("SETQ")?,
             count,
             form_list(&[s("1-")?, count]),
         ]));
         when_items.push(form_list(&[s("GO")?, top]));
-        let tagbody = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
-        let mut bindings = vec![form_list(&[count, forms[1]])];
+        let mut tagbody = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let _tagbody_root = bliss_rt::gc::StackRoot::new(&mut tagbody);
+        let mut bindings = HostRoot::new(vec![form_list(&[count, forms[1]])]);
         if uses_acc {
             bindings.push(form_list(&[acc, acc_init]));
         }
@@ -2682,7 +2801,10 @@ impl<'e> Lowerer<'e> {
         if !(kw_is(forms[2], "FROM") || kw_is(forms[2], "UPFROM") || kw_is(forms[2], "DOWNFROM")) {
             return Err(Bail);
         }
-        let start = forms[3];
+        // Root scalar heap copies of slice elements across the allocating
+        // form_list/lower_* calls (moving GC; bliss-wlf).
+        let mut start = forms[3];
+        let _start_root = bliss_rt::gc::StackRoot::new(&mut start);
         // The LIMIT keyword decides direction: below/to/upto ascend, downto/above
         // descend (CL writes `from N downto M`, so direction comes from here).
         let (cmp, descending) = match kw(forms[4]).as_deref() {
@@ -2698,9 +2820,10 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         let step_op = if descending { "-" } else { "+" };
-        let end = forms[5];
+        let mut end = forms[5];
+        let _end_root = bliss_rt::gc::StackRoot::new(&mut end);
         // Optional `by STEP`; then `do`.
-        let (step, do_at) = if kw_is(forms[6], "BY") {
+        let (mut step, do_at) = if kw_is(forms[6], "BY") {
             if forms.len() < 10 {
                 return Err(Bail);
             }
@@ -2708,6 +2831,7 @@ impl<'e> Lowerer<'e> {
         } else {
             (BlissVal::from_fixnum(1), 6)
         };
+        let _step_root = bliss_rt::gc::StackRoot::new(&mut step);
         let id = self.fresh_id();
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
         let end_v = resolve_sym(&format!("%LOOP-END{id}")).ok_or(Bail)?;
@@ -2715,26 +2839,30 @@ impl<'e> Lowerer<'e> {
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
         let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
         // The action clause (do / collect / sum / count) starting at `do_at`.
-        let (uses_acc, acc_init, per_iter, result) =
+        let (uses_acc, acc_init, per_iter, mut result) =
             self.lower_loop_action(&forms[do_at..], acc)?;
+        let per_iter = HostRoot::new(per_iter);
+        let _result_root = bliss_rt::gc::StackRoot::new(&mut result);
 
         // (tagbody top (when (cmp VAR %end) per-iter... (setq VAR (+ VAR %step)) (go top)))
-        let test = form_list(&[s(cmp)?, var, end_v]);
-        let mut when_items = vec![s("WHEN")?, test];
-        when_items.extend(per_iter);
+        let mut test = form_list(&[s(cmp)?, var, end_v]);
+        let _test_root = bliss_rt::gc::StackRoot::new(&mut test);
+        let mut when_items = HostRoot::new(vec![s("WHEN")?, test]);
+        when_items.extend(per_iter.iter().copied());
         when_items.push(form_list(&[
             s("SETQ")?,
             var,
             form_list(&[s(step_op)?, var, step_v]),
         ]));
         when_items.push(form_list(&[s("GO")?, top]));
-        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let _tagbody_form_root = bliss_rt::gc::StackRoot::new(&mut tagbody_form);
 
-        let mut binding_items = vec![
+        let mut binding_items = HostRoot::new(vec![
             form_list(&[var, start]),
             form_list(&[end_v, end]),
             form_list(&[step_v, step]),
-        ];
+        ]);
         if uses_acc {
             binding_items.push(form_list(&[acc, acc_init]));
         }
@@ -2775,12 +2903,16 @@ impl<'e> Lowerer<'e> {
                 if tail.len() != 2 {
                     return Err(Bail);
                 }
-                let per = vec![form_list(&[
+                // Root the per-iteration cons across the trailing NREVERSE
+                // form_list (moving GC; bliss-wlf).
+                let mut item = form_list(&[
                     s("SETQ")?,
                     acc,
                     form_list(&[s("CONS")?, tail[1], acc]),
-                ])];
-                Ok((true, NIL, per, form_list(&[s("NREVERSE")?, acc])))
+                ]);
+                let _item_root = bliss_rt::gc::StackRoot::new(&mut item);
+                let result = form_list(&[s("NREVERSE")?, acc]);
+                Ok((true, NIL, vec![item], result))
             }
             Some("SUM") | Some("SUMMING") => {
                 if tail.len() != 2 {
@@ -2797,11 +2929,12 @@ impl<'e> Lowerer<'e> {
                 if tail.len() != 2 {
                     return Err(Bail);
                 }
-                let inc = form_list(&[
+                let mut inc = form_list(&[
                     s("SETQ")?,
                     acc,
                     form_list(&[s("+")?, acc, BlissVal::from_fixnum(1)]),
                 ]);
+                let _inc_root = bliss_rt::gc::StackRoot::new(&mut inc);
                 let per = vec![form_list(&[s("WHEN")?, tail[1], inc])];
                 Ok((true, BlissVal::from_fixnum(0), per, acc))
             }
@@ -2834,38 +2967,51 @@ impl<'e> Lowerer<'e> {
             bindings: &mut Vec<BlissVal>,
             assignments: &mut Vec<BlissVal>,
         ) -> LowerResult<()> {
+            // Root pattern/value/derived conses across the allocating form_list
+            // recursion (moving GC; bliss-wlf).
+            let pattern = HostRoot::new(pattern);
+            let value = HostRoot::new(value);
             let s = |n: &str| resolve_sym(n).ok_or(Bail);
             if pattern.is_nil() {
                 return Ok(());
             }
             if pattern.is_symbol() {
-                bindings.push(form_list(&[pattern, NIL]));
-                assignments.push(form_list(&[s("SETQ")?, pattern, value]));
+                bindings.push(form_list(&[*pattern, NIL]));
+                assignments.push(form_list(&[s("SETQ")?, *pattern, *value]));
                 return Ok(());
             }
             if !pattern.is_cons() {
                 return Err(Bail);
             }
-            let (head, tail) = cp(pattern);
-            bind_pattern(head, form_list(&[s("CAR")?, value]), bindings, assignments)?;
-            bind_pattern(tail, form_list(&[s("CDR")?, value]), bindings, assignments)
+            let (head, tail) = cp(*pattern);
+            let head = HostRoot::new(head);
+            let tail = HostRoot::new(tail);
+            let car = HostRoot::new(form_list(&[s("CAR")?, *value]));
+            bind_pattern(*head, *car, bindings, assignments)?;
+            let cdr = HostRoot::new(form_list(&[s("CDR")?, *value]));
+            bind_pattern(*tail, *cdr, bindings, assignments)
         }
 
         // Parse one or more parallel `for PATTERN in LIST` clauses plus trailing
         // `for VAR = EXPR` clauses. Parallel list iteration stops when any list is
         // exhausted (the WHEN guard ANDs every list variable).
+        // Root the accumulator Vecs (they hold conses across the allocating
+        // form_list/lower_* calls; moving GC; bliss-wlf). for_in_lists holds only
+        // interned list-variable symbols, which do not move.
         let mut for_in_lists: Vec<BlissVal> = Vec::new(); // per-clause list variable
-        let mut binding_items: Vec<BlissVal> = Vec::new();
-        let mut assignments: Vec<BlissVal> = Vec::new();
-        let mut steps: Vec<BlissVal> = Vec::new();
+        let mut binding_items = HostRoot::new(Vec::<BlissVal>::new());
+        let mut assignments = HostRoot::new(Vec::<BlissVal>::new());
+        let mut steps = HostRoot::new(Vec::<BlissVal>::new());
 
-        let add_for_in = |pattern: BlissVal,
-                          list: BlissVal,
+        let add_for_in = |mut pattern: BlissVal,
+                          mut list: BlissVal,
                           idx: usize,
                           binding_items: &mut Vec<BlissVal>,
                           assignments: &mut Vec<BlissVal>,
                           steps: &mut Vec<BlissVal>|
          -> LowerResult<BlissVal> {
+            let _pattern_root = bliss_rt::gc::StackRoot::new(&mut pattern);
+            let _list_root = bliss_rt::gc::StackRoot::new(&mut list);
             let lst = resolve_sym(&format!("%LOOP-LST{id}_{idx}")).ok_or(Bail)?;
             binding_items.push(form_list(&[lst, list]));
             bind_pattern(pattern, form_list(&[s("CAR")?, lst]), binding_items, assignments)?;
@@ -2903,7 +3049,8 @@ impl<'e> Lowerer<'e> {
                     if !var.is_symbol() {
                         return Err(Bail);
                     }
-                    let expr = *forms.get(action_at + 3).ok_or(Bail)?;
+                    let mut expr = *forms.get(action_at + 3).ok_or(Bail)?;
+                    let _expr_root = bliss_rt::gc::StackRoot::new(&mut expr);
                     binding_items.push(form_list(&[var, NIL]));
                     assignments.push(form_list(&[s("SETQ")?, var, expr]));
                 }
@@ -2912,22 +3059,26 @@ impl<'e> Lowerer<'e> {
             action_at += 4;
         }
         let action = forms.get(action_at..).ok_or(Bail)?;
-        let (uses_acc, acc_init, per_iter, result) = self.lower_loop_action(action, acc)?;
+        let (uses_acc, acc_init, per_iter, mut result) = self.lower_loop_action(action, acc)?;
+        let per_iter = HostRoot::new(per_iter);
+        let _result_root = bliss_rt::gc::StackRoot::new(&mut result);
 
         // Guard: every list variable must still be non-nil.
-        let guard = if for_in_lists.len() == 1 {
+        let mut guard = if for_in_lists.len() == 1 {
             for_in_lists[0]
         } else {
             let mut and_items = vec![s("AND")?];
             and_items.extend(for_in_lists.iter().copied());
             form_list(&and_items)
         };
-        let mut when_items = vec![s("WHEN")?, guard];
+        let _guard_root = bliss_rt::gc::StackRoot::new(&mut guard);
+        let mut when_items = HostRoot::new(vec![s("WHEN")?, guard]);
         when_items.append(&mut assignments);
-        when_items.extend(per_iter);
+        when_items.extend(per_iter.iter().copied());
         when_items.append(&mut steps);
         when_items.push(form_list(&[s("GO")?, top]));
-        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let _tagbody_form_root = bliss_rt::gc::StackRoot::new(&mut tagbody_form);
 
         if uses_acc {
             binding_items.push(form_list(&[acc, acc_init]));
@@ -2966,15 +3117,21 @@ impl<'e> Lowerer<'e> {
         if forms.get(pos).and_then(|f| kw(*f)).as_deref() != Some("OF") {
             return Err(Bail);
         }
-        let table = *forms.get(pos + 1).ok_or(Bail)?;
+        // Root heap copies across the allocating resolve_sym/form_list calls and
+        // root the normalized clause Vec passed to lower_loop_for_in (moving GC;
+        // bliss-wlf).
+        let mut table = *forms.get(pos + 1).ok_or(Bail)?;
+        let _table_root = bliss_rt::gc::StackRoot::new(&mut table);
         let action = forms.get(pos + 2..).ok_or(Bail)?;
         if action.is_empty() {
             return Err(Bail);
         }
 
         let snapshot_sym = resolve_sym(snapshot_fn).ok_or(Bail)?;
-        let snapshot = form_list(&[snapshot_sym, table]);
-        let mut normalized = vec![forms[0], forms[1], resolve_sym("IN").ok_or(Bail)?, snapshot];
+        let mut snapshot = form_list(&[snapshot_sym, table]);
+        let _snapshot_root = bliss_rt::gc::StackRoot::new(&mut snapshot);
+        let mut normalized =
+            HostRoot::new(vec![forms[0], forms[1], resolve_sym("IN").ok_or(Bail)?, snapshot]);
         normalized.extend_from_slice(action);
         self.lower_loop_for_in(&normalized)
     }
@@ -2995,21 +3152,27 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         let var = forms[1];
-        let list = forms[3];
+        // Root heap copies / accumulator Vecs / cons intermediates across the
+        // allocating form_list/lower_* calls (moving GC; bliss-wlf).
+        let mut list = forms[3];
+        let _list_root = bliss_rt::gc::StackRoot::new(&mut list);
 
         let id = self.fresh_id();
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
         let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
-        let (uses_acc, acc_init, per_iter, result) = self.lower_loop_action(&forms[4..], acc)?;
+        let (uses_acc, acc_init, per_iter, mut result) = self.lower_loop_action(&forms[4..], acc)?;
+        let per_iter = HostRoot::new(per_iter);
+        let _result_root = bliss_rt::gc::StackRoot::new(&mut result);
 
-        let mut when_items = vec![s("WHEN")?, var];
-        when_items.extend(per_iter);
+        let mut when_items = HostRoot::new(vec![s("WHEN")?, var]);
+        when_items.extend(per_iter.iter().copied());
         when_items.push(form_list(&[s("SETQ")?, var, form_list(&[s("CDR")?, var])]));
         when_items.push(form_list(&[s("GO")?, top]));
-        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let _tagbody_form_root = bliss_rt::gc::StackRoot::new(&mut tagbody_form);
 
-        let mut binding_items = vec![form_list(&[var, list])];
+        let mut binding_items = HostRoot::new(vec![form_list(&[var, list])]);
         if uses_acc {
             binding_items.push(form_list(&[acc, acc_init]));
         }
@@ -3033,23 +3196,30 @@ impl<'e> Lowerer<'e> {
             Some("UNTIL") => true,
             _ => return Err(Bail),
         };
-        let test_raw = forms[1];
+        // Root heap copies / accumulator Vecs / cons intermediates across the
+        // allocating form_list/lower_* calls (moving GC; bliss-wlf).
+        let mut test_raw = forms[1];
+        let _test_raw_root = bliss_rt::gc::StackRoot::new(&mut test_raw);
 
         let id = self.fresh_id();
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
         let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
-        let (uses_acc, acc_init, per_iter, result) = self.lower_loop_action(&forms[2..], acc)?;
+        let (uses_acc, acc_init, per_iter, mut result) = self.lower_loop_action(&forms[2..], acc)?;
+        let per_iter = HostRoot::new(per_iter);
+        let _result_root = bliss_rt::gc::StackRoot::new(&mut result);
 
-        let test = if until {
+        let mut test = if until {
             form_list(&[s("NOT")?, test_raw])
         } else {
             test_raw
         };
-        let mut when_items = vec![s("WHEN")?, test];
-        when_items.extend(per_iter);
+        let _test_root = bliss_rt::gc::StackRoot::new(&mut test);
+        let mut when_items = HostRoot::new(vec![s("WHEN")?, test]);
+        when_items.extend(per_iter.iter().copied());
         when_items.push(form_list(&[s("GO")?, top]));
-        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let _tagbody_form_root = bliss_rt::gc::StackRoot::new(&mut tagbody_form);
 
         let bindings = if uses_acc {
             form_list(&[form_list(&[acc, acc_init])])
@@ -3063,7 +3233,10 @@ impl<'e> Lowerer<'e> {
     /// `(unwind-protect protected cleanup...)` — the cleanup runs on both the
     /// normal path and any non-local exit through the protected form.
     fn lower_unwind_protect(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let (protected, cleanup_forms) = cp(rest);
+        // `cleanup_forms` must survive the allocating lower_expr(protected)
+        // below (moving GC; bliss-wlf).
+        let (protected, mut cleanup_forms) = cp(rest);
+        let _cleanup_forms_root = bliss_rt::gc::StackRoot::new(&mut cleanup_forms);
         let sp_restore = self.cur_stack;
         self.emit(Instr::PushUnwind {
             cleanup_bcp: 0,
@@ -3084,8 +3257,11 @@ impl<'e> Lowerer<'e> {
         // Cleanup body (values discarded).
         let cleanup_bcp = self.code.len() as u32;
         let saved = self.cur_stack;
-        for f in list_to_vec(cleanup_forms) {
-            self.lower_expr(f)?;
+        // Index a rooted Vec: each lower_expr can allocate and move the not-yet-
+        // lowered cleanup forms (moving GC; bliss-wlf).
+        let cleanup = HostRoot::new(list_to_vec(cleanup_forms));
+        for i in 0..cleanup.len() {
+            self.lower_expr(cleanup[i])?;
             self.emit(Instr::Pop);
             self.pop_n(1);
         }
@@ -3122,9 +3298,11 @@ impl<'e> Lowerer<'e> {
     /// the condition bound to `var`.
     fn lower_handler_case(&mut self, rest: BlissVal) -> LowerResult<()> {
         let (protected, clauses_form) = cp(rest);
-        let clauses = list_to_vec(clauses_form);
+        // Root the clause conses: they are live across the allocating
+        // lower_expr(protected) and lower_progn calls below (moving GC; bliss-wlf).
+        let clauses = HostRoot::new(list_to_vec(clauses_form));
         // `:no-error` clauses are a different protocol — bail if present.
-        for clause in &clauses {
+        for clause in clauses.iter() {
             let (type_form, _) = cp(*clause);
             if type_form.is_symbol() && sym_name(type_form).ends_with("NO-ERROR") {
                 return Err(Bail);
@@ -3146,8 +3324,10 @@ impl<'e> Lowerer<'e> {
 
         let mut clause_infos = Vec::new();
         let mut clause_brs = Vec::new();
-        for clause in &clauses {
-            let (type_form, clause_rest) = cp(*clause);
+        // Index the rooted Vec: each lower_progn can allocate and move the not-
+        // yet-processed clause conses (moving GC; bliss-wlf).
+        for i in 0..clauses.len() {
+            let (type_form, clause_rest) = cp(clauses[i]);
             if !type_form.is_symbol() && !type_form.is_nil() {
                 return Err(Bail); // compound type specifiers not yet handled
             }
@@ -3242,15 +3422,19 @@ impl<'e> Lowerer<'e> {
         if !self.portable {
             return Err(Bail);
         }
-        let (restartable_form, clauses_form) = cp(rest);
-        let clauses = list_to_vec(clauses_form);
+        // Root `restartable_form` across the whole clause loop (compile_restart_clause
+        // allocates) and its use below, and root the clause conses that the loop
+        // indexes across those allocations (moving GC; bliss-wlf).
+        let (mut restartable_form, clauses_form) = cp(rest);
+        let _restartable_form_root = bliss_rt::gc::StackRoot::new(&mut restartable_form);
+        let clauses = HostRoot::new(list_to_vec(clauses_form));
 
         let enclosing_locals: std::collections::HashSet<String> =
             self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
 
         let mut restarts = Vec::new();
-        for clause in &clauses {
-            let (name_form, clause_rest) = cp(*clause);
+        for i in 0..clauses.len() {
+            let (name_form, clause_rest) = cp(clauses[i]);
             if !name_form.is_symbol() {
                 return Err(Bail);
             }
@@ -3307,7 +3491,9 @@ impl<'e> Lowerer<'e> {
             self.push_n(1);
             return Ok(());
         }
-        let (head, tail) = cp(form);
+        let (head, mut tail) = cp(form);
+        // Root the tail across the allocating lower_* recursion (moving GC; bliss-wlf).
+        let _tail_root = bliss_rt::gc::StackRoot::new(&mut tail);
         if head.is_symbol() {
             let name = sym_name(head);
             // Nested quasiquote counts depth: QUASIQUOTE raises it, UNQUOTE and
@@ -3411,18 +3597,23 @@ impl<'e> Lowerer<'e> {
         if !self.portable {
             return Err(Bail);
         }
-        let (pattern, after) = cp(rest);
+        let (mut pattern, after) = cp(rest);
         if !after.is_cons() {
             return Err(Bail);
         }
-        let (value_form, body) = cp(after);
+        let (mut value_form, mut body) = cp(after);
+        // Root source subforms across the allocating expansion (moving GC; bliss-wlf).
+        let _pattern_root = bliss_rt::gc::StackRoot::new(&mut pattern);
+        let _value_root = bliss_rt::gc::StackRoot::new(&mut value_form);
+        let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
         let g_name = next_control_token("__DBIND__").replace(':', "_");
         let g = resolve_sym(&g_name).ok_or(Bail)?;
-        // First binding evaluates the expression once into the temporary.
-        let mut bindings: Vec<BlissVal> = vec![form_list(&[g, value_form])];
+        // First binding evaluates the expression once into the temporary. The
+        // list of (name init) forms is heap-rooted while the pattern is walked.
+        let mut bindings = bliss_rt::gc::HostRoot::new(vec![form_list(&[g, value_form])]);
         destructure_pattern(pattern, g, &mut bindings)?;
 
-        let mut items = vec![resolve_sym("LET*").ok_or(Bail)?, vec_to_list(&bindings)];
+        let mut items = vec![resolve_sym("LET*").ok_or(Bail)?, vec_to_list(&bindings[..])];
         items.extend(list_to_vec(body));
         let expansion = vec_to_list(&items);
         self.lower_expr(expansion)
@@ -3476,13 +3667,14 @@ impl<'e> Lowerer<'e> {
 
     /// `(values v0 v1 ...)` — set the multiple values, leave the primary.
     fn lower_values(&mut self, rest: BlissVal) -> LowerResult<()> {
-        let args = list_to_vec(rest);
+        // Root the argument forms across the allocating lower recursion (bliss-wlf).
+        let args = bliss_rt::gc::HostRoot::new(list_to_vec(rest));
         if args.len() > u16::MAX as usize {
             return Err(Bail);
         }
         let n = args.len() as u16;
-        for a in args {
-            self.lower_expr(a)?;
+        for i in 0..args.len() {
+            self.lower_expr(args[i])?;
         }
         self.emit(Instr::SetValues(n));
         self.pop_n(n);
@@ -3493,7 +3685,9 @@ impl<'e> Lowerer<'e> {
     /// `(multiple-value-bind (vars...) values-form body...)`.
     fn lower_mvb(&mut self, rest: BlissVal) -> LowerResult<()> {
         let (vars_form, r2) = cp(rest);
-        let (values_form, body) = cp(r2);
+        let (values_form, mut body) = cp(r2);
+        // Root the body across the allocating values-form lowering (moving GC; bliss-wlf).
+        let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
         let vars = list_to_vec(vars_form);
         for v in &vars {
             if !v.is_symbol() {
@@ -3541,13 +3735,20 @@ impl<'e> Lowerer<'e> {
         if !self.portable {
             return Err(Bail);
         }
+        // Root heap subforms across the allocating rebuild (moving GC; bliss-wlf);
+        // `cvar` is a symbol (immediate) and needs no root.
+        let mut rest = rest;
+        let _rest_root = bliss_rt::gc::StackRoot::new(&mut rest);
         let c_name = next_control_token("__IE__").replace(':', "_");
         let cvar = resolve_sym(&c_name).ok_or(Bail)?;
         let mut progn_items = vec![resolve_sym("PROGN").ok_or(Bail)?];
         progn_items.extend(list_to_vec(rest));
-        let progn = vec_to_list(&progn_items);
-        let values = form_list(&[resolve_sym("VALUES").ok_or(Bail)?, NIL, cvar]);
-        let clause = form_list(&[resolve_sym("ERROR").ok_or(Bail)?, form_list(&[cvar]), values]);
+        let mut progn = vec_to_list(&progn_items);
+        let _progn_root = bliss_rt::gc::StackRoot::new(&mut progn);
+        let mut values = form_list(&[resolve_sym("VALUES").ok_or(Bail)?, NIL, cvar]);
+        let _values_root = bliss_rt::gc::StackRoot::new(&mut values);
+        let mut clause = form_list(&[resolve_sym("ERROR").ok_or(Bail)?, form_list(&[cvar]), values]);
+        let _clause_root = bliss_rt::gc::StackRoot::new(&mut clause);
         let hc = form_list(&[resolve_sym("HANDLER-CASE").ok_or(Bail)?, progn, clause]);
         self.lower_expr(hc)
     }
@@ -3561,10 +3762,13 @@ impl<'e> Lowerer<'e> {
         if !self.portable {
             return Err(Bail);
         }
-        let (test, after) = cp(rest);
+        let (mut test, after) = cp(rest);
+        // Root heap subforms across the allocating rebuild (moving GC; bliss-wlf).
+        let _test_root = bliss_rt::gc::StackRoot::new(&mut test);
         // Skip the optional `places` list; take format-control + args if present.
-        let error_form = if after.is_cons() {
-            let (_places, fmt_and_args) = cp(after);
+        let mut error_form = if after.is_cons() {
+            let (_places, mut fmt_and_args) = cp(after);
+            let _fa_root = bliss_rt::gc::StackRoot::new(&mut fmt_and_args);
             if fmt_and_args.is_cons() {
                 let mut items = vec![resolve_sym("ERROR").ok_or(Bail)?];
                 items.extend(list_to_vec(fmt_and_args));
@@ -3581,6 +3785,7 @@ impl<'e> Lowerer<'e> {
                 arena_str("Assertion failed"),
             ])
         };
+        let _error_root = bliss_rt::gc::StackRoot::new(&mut error_form);
         let unless = form_list(&[resolve_sym("UNLESS").ok_or(Bail)?, test, error_form]);
         self.lower_expr(unless)
     }
@@ -3597,21 +3802,27 @@ impl<'e> Lowerer<'e> {
         if !rest.is_cons() {
             return Err(Bail);
         }
-        let (fn_form, forms) = cp(rest);
+        let (mut fn_form, forms) = cp(rest);
+        // Root heap subforms across the allocating rebuild (moving GC; bliss-wlf);
+        // `mvl` is a symbol (immediate) and needs no root.
+        let _fn_root = bliss_rt::gc::StackRoot::new(&mut fn_form);
+        let source = bliss_rt::gc::HostRoot::new(list_to_vec(forms));
         let mvl = resolve_sym("MULTIPLE-VALUE-LIST").ok_or(Bail)?;
-        let mut value_lists: Vec<BlissVal> = list_to_vec(forms)
-            .into_iter()
-            .map(|f| form_list(&[mvl, f]))
-            .collect();
-        let args_list = match value_lists.len() {
+        let mut value_lists =
+            bliss_rt::gc::HostRoot::new(Vec::<BlissVal>::with_capacity(source.len()));
+        for i in 0..source.len() {
+            value_lists.push(form_list(&[mvl, source[i]]));
+        }
+        let mut args_list = match value_lists.len() {
             0 => NIL,
             1 => value_lists.pop().unwrap(),
             _ => {
                 let mut items = vec![resolve_sym("APPEND").ok_or(Bail)?];
-                items.extend(value_lists);
+                items.extend(value_lists.iter().copied());
                 vec_to_list(&items)
             }
         };
+        let _args_root = bliss_rt::gc::StackRoot::new(&mut args_list);
         let apply_form = form_list(&[resolve_sym("APPLY").ok_or(Bail)?, fn_form, args_list]);
         self.lower_expr(apply_form)
     }
@@ -3749,7 +3960,10 @@ impl<'e> Lowerer<'e> {
     }
 
     /// `(function name)` / `#'(lambda …)` — a function designator or a closure.
-    fn lower_function(&mut self, rest: BlissVal) -> LowerResult<()> {
+    fn lower_function(&mut self, mut rest: BlissVal) -> LowerResult<()> {
+        // Root `rest` across the closure-form rebuild (resolve_sym/arena_cons can
+        // fire a moving GC; bliss-wlf).
+        let _rest_root = bliss_rt::gc::StackRoot::new(&mut rest);
         let (target, _) = cp(rest);
         // `#'localfn` for a capturing flet/labels function is the closure value
         // itself, held in a boxed binding of its name — load it as a variable.
@@ -3793,29 +4007,36 @@ impl<'e> Lowerer<'e> {
     /// inheritance; anything unsupported inside bails the whole form (so no
     /// tree-walker `env.funs` scoping is needed).
     fn lower_flet(&mut self, rest: BlissVal, is_labels: bool) -> LowerResult<()> {
-        let (defs_form, body) = cp(rest);
-        let defs = list_to_vec(defs_form);
+        let (defs_form, mut body) = cp(rest);
+        // The definition list and the form body are heap-rooted across the
+        // allocating parse (resolve_sym gensyms) and per-function compilation
+        // (moving GC; bliss-wlf). `parsed` holds only names + gensyms (immediate);
+        // each function's params/body are re-derived from the rooted `defs`.
+        let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
+        let defs = bliss_rt::gc::HostRoot::new(list_to_vec(defs_form));
 
         // Parse (name params . fbody) and gensym each local function.
-        let mut parsed: Vec<(String, u32, BlissVal, BlissVal)> = Vec::new();
-        for d in &defs {
+        let mut parsed: Vec<(String, u32)> = Vec::new();
+        for i in 0..defs.len() {
+            let d = defs[i];
             if !d.is_cons() {
                 return Err(Bail);
             }
-            let (name_form, d_rest) = cp(*d);
+            let (name_form, _d_rest) = cp(d);
             if !name_form.is_symbol() {
                 return Err(Bail);
             }
-            let (params_form, fbody) = cp(d_rest);
+            // Capture the name before the allocating gensym below.
+            let name = sym_name(name_form);
             // A colon would be read as a package separator, so keep the gensym
             // name colon-free and unique.
             let gname = next_control_token("__FLET__").replace(':', "_");
             let gensym = resolve_sym(&gname).ok_or(Bail)?.as_symbol_index();
-            parsed.push((sym_name(name_form), gensym, params_form, fbody));
+            parsed.push((name, gensym));
         }
 
         let local_names: std::collections::HashSet<String> =
-            parsed.iter().map(|(n, _, _, _)| n.clone()).collect();
+            parsed.iter().map(|(n, _)| n.clone()).collect();
 
         // Portable (BFASL) compilation lowers every local function to an
         // env-capturing closure stored in a heap frame: those serialize as nested
@@ -3825,7 +4046,7 @@ impl<'e> Lowerer<'e> {
         // .bfasl round-trip.) A capturing closure additionally reaches the
         // enclosing lexicals through the frame.
         if self.portable {
-            return self.lower_flet_capturing(&parsed, body, is_labels);
+            return self.lower_flet_capturing(&parsed, &defs[..], body, is_labels);
         }
 
         // Non-portable opportunistic path. A local function that references an
@@ -3833,15 +4054,16 @@ impl<'e> Lowerer<'e> {
         // portable-only, so defer such a form to the tree-walker.
         let enclosing: std::collections::HashSet<String> =
             self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
-        let is_capturing = parsed.iter().any(|(_, _, params_form, fbody)| {
-            let params: std::collections::HashSet<String> = list_to_vec(*params_form)
+        let is_capturing = (0..parsed.len()).any(|i| {
+            let (params_form, fbody) = flet_def_forms(defs[i]);
+            let params: std::collections::HashSet<String> = list_to_vec(params_form)
                 .iter()
                 .filter(|p| p.is_symbol())
                 .map(|p| sym_name(*p))
                 .filter(|n| !n.starts_with('&'))
                 .collect();
             let mut used = std::collections::HashSet::new();
-            for f in list_to_vec(*fbody) {
+            for f in list_to_vec(fbody) {
                 collect_symbol_names(f, &mut used);
             }
             used.iter().any(|u| {
@@ -3857,9 +4079,10 @@ impl<'e> Lowerer<'e> {
         // which returns a proper closure for it. The bytecode backend only knows
         // how to CALL a lowered local function, not to yield it as a value.
         if references_local_fn_value(body, &local_names)
-            || parsed
-                .iter()
-                .any(|(_, _, _, fbody)| references_local_fn_value(*fbody, &local_names))
+            || (0..parsed.len()).any(|i| {
+                let (_, fbody) = flet_def_forms(defs[i]);
+                references_local_fn_value(fbody, &local_names)
+            })
         {
             return Err(Bail);
         }
@@ -3869,7 +4092,7 @@ impl<'e> Lowerer<'e> {
         // LABELS bodies see all siblings + self; FLET bodies do not.
         let body_local_fns = if is_labels {
             let mut m = self.local_fns.clone();
-            for (name, sym, _, _) in &parsed {
+            for (name, sym) in &parsed {
                 m.insert(name.clone(), *sym);
             }
             m
@@ -3877,21 +4100,24 @@ impl<'e> Lowerer<'e> {
             self.local_fns.clone()
         };
 
-        // Compile and register each local function body.
-        for (_, sym, params_form, fbody) in &parsed {
+        // Compile and register each local function body. Re-derive params/fbody
+        // from the rooted `defs` each iteration (compilation allocates).
+        for i in 0..parsed.len() {
+            let sym = parsed[i].1;
+            let (params_form, fbody) = flet_def_forms(defs[i]);
             let bf = compile_local_function(
-                *params_form,
-                *fbody,
+                params_form,
+                fbody,
                 self.env,
                 &body_local_fns,
                 self.portable,
             )
             .ok_or(Bail)?;
-            registry_put(*sym, Rc::new(bf));
+            registry_put(sym, Rc::new(bf));
         }
 
         // Compile the form body with all local functions visible.
-        for (name, sym, _, _) in &parsed {
+        for (name, sym) in &parsed {
             self.local_fns.insert(name.clone(), *sym);
         }
         let r = self.lower_progn(body);
@@ -3908,12 +4134,16 @@ impl<'e> Lowerer<'e> {
     /// enclosing slot bails.
     fn lower_flet_capturing(
         &mut self,
-        parsed: &[(String, u32, BlissVal, BlissVal)],
-        body: BlissVal,
+        parsed: &[(String, u32)],
+        defs: &[BlissVal],
+        mut body: BlissVal,
         is_labels: bool,
     ) -> LowerResult<()> {
+        // Root the form body across the allocating per-closure compilation
+        // (moving GC; bliss-wlf). `defs` is kept rooted by the caller's HostRoot.
+        let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
         let local_names: std::collections::HashSet<String> =
-            parsed.iter().map(|(n, _, _, _)| n.clone()).collect();
+            parsed.iter().map(|(n, _)| n.clone()).collect();
 
         // Snapshot the enclosing environment the closures may capture.
         let enclosing_boxed: std::collections::HashSet<String> = self
@@ -3933,14 +4163,15 @@ impl<'e> Lowerer<'e> {
         // A captured enclosing lexical must be boxed to live in the heap frame;
         // if a local body references an unboxed enclosing slot, defer the whole
         // form to the tree-walker.
-        for (_, _, params_form, fbody) in parsed {
-            let params: std::collections::HashSet<String> = list_to_vec(*params_form)
+        for i in 0..parsed.len() {
+            let (params_form, fbody) = flet_def_forms(defs[i]);
+            let params: std::collections::HashSet<String> = list_to_vec(params_form)
                 .iter()
                 .filter(|p| p.is_symbol())
                 .map(|p| sym_name(*p))
                 .collect();
             let mut used = std::collections::HashSet::new();
-            for f in list_to_vec(*fbody) {
+            for f in list_to_vec(fbody) {
                 collect_symbol_names(f, &mut used);
             }
             if used.iter().any(|u| {
@@ -3991,11 +4222,13 @@ impl<'e> Lowerer<'e> {
             .chain(self.enclosing_blocks.iter().cloned())
             .collect();
 
-        // Build each closure and store it in the child frame.
-        for (name, _gensym, params_form, fbody) in parsed {
+        // Build each closure and store it in the child frame. Re-derive
+        // params/fbody from the rooted `defs` each iteration (compilation allocates).
+        for i in 0..parsed.len() {
+            let (params_form, fbody) = flet_def_forms(defs[i]);
             let bf = compile_capturing_local(
-                *params_form,
-                *fbody,
+                params_form,
+                fbody,
                 self.env,
                 &captures,
                 &callable,
@@ -4013,7 +4246,7 @@ impl<'e> Lowerer<'e> {
                 capture_env: true,
             });
             self.push_n(1);
-            let ni = self.intern_name(name);
+            let ni = self.intern_name(&parsed[i].0);
             self.emit(Instr::DefineEnvVar(ni));
             self.pop_n(1);
         }
@@ -4026,19 +4259,30 @@ impl<'e> Lowerer<'e> {
     }
 }
 
+/// `(name params . fbody)` → `(params_form, fbody)` for a flet/labels definition.
+/// Reads only; the caller keeps the owning definition list rooted across
+/// allocations, so re-deriving the subforms per iteration is GC-safe.
+fn flet_def_forms(def: BlissVal) -> (BlissVal, BlissVal) {
+    let (_, d_rest) = cp(def);
+    cp(d_rest)
+}
+
 /// Compile a local (flet/labels) function body to a [`BytecodeFunction`],
 /// inheriting the visible local-function namespace so sibling/self calls
 /// resolve. Returns `None` on any unsupported form.
 fn compile_local_function(
-    params_form: BlissVal,
-    fbody: BlissVal,
+    mut params_form: BlissVal,
+    mut fbody: BlissVal,
     env: &Env,
     local_fns: &std::collections::HashMap<String, u32>,
     portable: bool,
 ) -> Option<BytecodeFunction> {
+    // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
+    let _params_root = bliss_rt::gc::StackRoot::new(&mut params_form);
+    let _fbody_root = bliss_rt::gc::StackRoot::new(&mut fbody);
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
-    let _const_guard = LowererConstGuard::new(&mut lo.constants);
+    let _const_guard = LowererConstGuard::new(&mut lo);
     lo.portable = portable;
     lo.local_fns = local_fns.clone();
     lo.captured_names = compute_captured_names(fbody);
@@ -4085,17 +4329,20 @@ fn compile_local_function(
 /// `funcall`. `has_env` is forced so the closure always has an environment to
 /// reach the captured frame, even when it defines no boxed locals of its own.
 fn compile_capturing_local(
-    params_form: BlissVal,
-    fbody: BlissVal,
+    mut params_form: BlissVal,
+    mut fbody: BlissVal,
     env: &Env,
     captures: &std::collections::HashSet<String>,
     callable: &std::collections::HashSet<String>,
     enclosing_blocks: &std::collections::HashSet<String>,
     portable: bool,
 ) -> Option<BytecodeFunction> {
+    // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
+    let _params_root = bliss_rt::gc::StackRoot::new(&mut params_form);
+    let _fbody_root = bliss_rt::gc::StackRoot::new(&mut fbody);
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
-    let _const_guard = LowererConstGuard::new(&mut lo.constants);
+    let _const_guard = LowererConstGuard::new(&mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(fbody);
     lo.has_env = true;
@@ -4589,15 +4836,18 @@ fn destructure_pattern(
 /// bindings in the establishing activation; they are resolved through the
 /// child function's parent heap environment rather than copied as source.
 fn compile_restart_clause(
-    params_form: BlissVal,
-    body: BlissVal,
+    mut params_form: BlissVal,
+    mut body: BlissVal,
     env: &Env,
     captures: &std::collections::HashSet<String>,
     portable: bool,
 ) -> Option<BytecodeFunction> {
+    // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
+    let _params_root = bliss_rt::gc::StackRoot::new(&mut params_form);
+    let _body_root = bliss_rt::gc::StackRoot::new(&mut body);
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
-    let _const_guard = LowererConstGuard::new(&mut lo.constants);
+    let _const_guard = LowererConstGuard::new(&mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(body);
     if !captures.is_empty() {
@@ -5183,7 +5433,9 @@ fn compile_function_in(
     // raw body would fail to box a captured variable (alexandria's
     // `gaussian-random`).
     if body_uses_macrolet(body.get()) {
-        let progn = arena_cons(resolve_sym("PROGN")?, body.get());
+        // Root the rebuilt progn across the allocating macro-env build (bliss-wlf).
+        let mut progn = arena_cons(resolve_sym("PROGN")?, body.get());
+        let _progn_root = bliss_rt::gc::StackRoot::new(&mut progn);
         let menv = super::macroexpand_environment_from_cli(env);
         match compiler_macroexpand::macroexpand_all(progn, &menv) {
             Ok(expanded) => body.set(arena_cons(expanded, NIL)),
@@ -5195,7 +5447,7 @@ fn compile_function_in(
     }
 
     let mut lo = Lowerer::new(env);
-    let _const_guard = LowererConstGuard::new(&mut lo.constants);
+    let _const_guard = LowererConstGuard::new(&mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(body.get());
     lo.enclosing_blocks = enclosing_blocks.clone();
@@ -5383,7 +5635,7 @@ fn compile_thunk(form: BlissVal, env: &Env, portable: bool) -> Option<BytecodeFu
     let roots = bliss_rt::ShadowRootScope::new();
     let form = roots.root(form);
     let mut lo = Lowerer::new(env);
-    let _const_guard = LowererConstGuard::new(&mut lo.constants);
+    let _const_guard = LowererConstGuard::new(&mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(arena_cons(form.get(), NIL));
     if lo.lower_expr(form.get()).is_err() {

@@ -276,10 +276,10 @@ fn slot_name_index_fallback(layout: &SlotLayout, slot_name: BlissVal) -> Option<
 
 /// The symbol's name without any `PKG:`/`PKG::` package prefix.
 fn bare_symbol_name(sym: BlissVal) -> Option<String> {
-    if !sym.is_symbol() {
-        return None;
-    }
-    let key = bliss_rt::symbols::symbol_name(sym.as_symbol_index())?;
+    // symbol_index() (not as_symbol_index) so the special NIL/T constants —
+    // which is_symbol() accepts but which have no table index — return None
+    // instead of panicking (seen via a NIL in a slot layout under GC stress).
+    let key = bliss_rt::symbols::symbol_name(sym.symbol_index()?)?;
     let bare = key
         .rsplit_once("::")
         .map(|(_, n)| n)
@@ -437,6 +437,17 @@ fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
         // allocate while CLOS_STATE is borrowed (tracked separately); this stopgap
         // trades a rare theoretical miss for never aborting.
         let Ok(mut state) = state.try_borrow_mut() else {
+            // Every CLOS op has been restructured to NOT allocate while
+            // CLOS_STATE is borrowed (bliss-wlf), so this skip should be
+            // unreachable. If it fires, some new code path allocates under a
+            // borrow again — shout under the GC fuzzers so it can't hide.
+            static LOUD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *LOUD.get_or_init(|| std::env::var_os("BLISS_GC_STRESS").is_some()) {
+                eprintln!(
+                    "bliss-wlf WARNING: CLOS root scan skipped — allocation \
+                     under a live CLOS_STATE borrow (GC-unsafe call path)"
+                );
+            }
             return;
         };
         // Registry keys are symbols or private meta-handles and never move.
@@ -557,37 +568,43 @@ pub fn ensure_clos_bootstrapped() -> Result<(), BlissError> {
 
 pub fn bootstrap_clos() -> Result<(), BlissError> {
     install_clos_state_root_scanner();
+
+    // Built-in class values (negative fixnums avoid collision with user classes)
+    let t_cls = BlissVal::from_fixnum(-1);
+    let std_obj = BlissVal::from_fixnum(-2);
+    let fix_cls = BlissVal::from_fixnum(-3);
+    let chr_cls = BlissVal::from_fixnum(-4);
+    let sym_cls = BlissVal::from_fixnum(-5);
+    let nul_cls = BlissVal::from_fixnum(-6);
+    let con_cls = BlissVal::from_fixnum(-7);
+    let flt_cls = BlissVal::from_fixnum(-8);
+    let fun_cls = BlissVal::from_fixnum(-9);
+    let hpo_cls = BlissVal::from_fixnum(-10);
+
+    // Names: interned into the shared registry by their real CL names
+    // (bliss-jtc.6 Stage E) so a built-in class's CLASS-NAME / TYPE-OF is the
+    // same symbol the reader and interpreter produce — no reserved 0xFFFE_*
+    // indices that don't correspond to any actual symbol.
+    //
+    // GC safety: `intern` allocates and can fire a minor GC whose root scan
+    // re-enters CLOS_STATE, so ALL interning happens *before* the `with_state_mut`
+    // borrow below (bliss-wlf). Once the borrow is held the closure only stores
+    // these already-interned immediates — it never allocates.
+    let nm = |name: &str| BlissVal::from_symbol_index(bliss_rt::symbols::intern(name));
+    let t_nm = T;
+    let std_nm = nm("STANDARD-OBJECT");
+    let fix_nm = nm("FIXNUM");
+    let chr_nm = nm("CHARACTER");
+    let sym_nm = nm("SYMBOL");
+    let nul_nm = nm("NULL");
+    let con_nm = nm("CONS");
+    let flt_nm = nm("FLOAT");
+    let fun_nm = nm("FUNCTION");
+    let hpo_nm = nm("HEAP-OBJECT");
+
     with_state_mut(|st| {
         // Full reset so tests are independent
         *st = ClosState::new();
-
-        // Built-in class values (negative fixnums avoid collision with user classes)
-        let t_cls = BlissVal::from_fixnum(-1);
-        let std_obj = BlissVal::from_fixnum(-2);
-        let fix_cls = BlissVal::from_fixnum(-3);
-        let chr_cls = BlissVal::from_fixnum(-4);
-        let sym_cls = BlissVal::from_fixnum(-5);
-        let nul_cls = BlissVal::from_fixnum(-6);
-        let con_cls = BlissVal::from_fixnum(-7);
-        let flt_cls = BlissVal::from_fixnum(-8);
-        let fun_cls = BlissVal::from_fixnum(-9);
-        let hpo_cls = BlissVal::from_fixnum(-10);
-
-        // Names: interned into the shared registry by their real CL names
-        // (bliss-jtc.6 Stage E) so a built-in class's CLASS-NAME / TYPE-OF is the
-        // same symbol the reader and interpreter produce — no reserved 0xFFFE_*
-        // indices that don't correspond to any actual symbol.
-        let nm = |name: &str| BlissVal::from_symbol_index(bliss_rt::symbols::intern(name));
-        let t_nm = T;
-        let std_nm = nm("STANDARD-OBJECT");
-        let fix_nm = nm("FIXNUM");
-        let chr_nm = nm("CHARACTER");
-        let sym_nm = nm("SYMBOL");
-        let nul_nm = nm("NULL");
-        let con_nm = nm("CONS");
-        let flt_nm = nm("FLOAT");
-        let fun_nm = nm("FUNCTION");
-        let hpo_nm = nm("HEAP-OBJECT");
 
         // T — root, no supers
         st.class_registry.insert(t_nm, t_cls);
