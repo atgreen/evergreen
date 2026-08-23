@@ -18,11 +18,61 @@ use bliss_compiler::osr::{
 use bliss_compiler::profiling::{BackEdgeCounter, FunctionProfile, InvocationCounter};
 use bliss_compiler::reader::read_from_string;
 use bliss_compiler::tiered::{
-    BaselineCompiler, Interpreter, OptimisingCompiler, Tier, TierConfig, check_promotion,
+    BaselineCompiler, FnMeta, Interpreter, OptimisingCompiler, Tier, TierConfig, check_promotion,
     request_compilation,
 };
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
 use std::sync::Mutex;
+
+/// A zeroed, 8-byte-aligned fake function header large enough to back a full
+/// [`FnMeta`]. Several tiered-runtime entry points (`check_promotion`,
+/// `request_compilation`, `osr_entry`, `deoptimize`, `install`) form a
+/// `&FnMeta` from the tagged pointer and read fields up to and past
+/// `back_edge_count` (offset 16) — e.g. `request_compilation` computes
+/// `invoke + 2 * back_edge`. A bare `Box<[u8; 16]>` both under-sizes and
+/// under-aligns that struct, so those reads hit out-of-bounds heap garbage:
+/// intermittently promoting a Baseline function to Optimising, or overflowing
+/// the priority arithmetic and panicking in debug. That made the whole test
+/// binary flaky under parallel heap churn (bliss-4lb). Back the header with a
+/// `Vec<u64>` (8-byte aligned) sized to `size_of::<FnMeta>()` and index it as
+/// bytes exactly like the old raw header.
+struct FakeFnHeader {
+    backing: Vec<u64>,
+}
+
+impl FakeFnHeader {
+    fn new() -> Self {
+        let words = std::mem::size_of::<FnMeta>().div_ceil(8);
+        FakeFnHeader {
+            backing: vec![0u64; words],
+        }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.backing.as_ptr().cast::<u8>()
+    }
+
+    /// The header as a `TAG_FUNCTION`-tagged value the tiered runtime accepts.
+    fn func_val(&self) -> BlissVal {
+        BlissVal(self.as_ptr() as u64 | bliss_rt::value::TAG_FUNCTION)
+    }
+}
+
+impl std::ops::Deref for FakeFnHeader {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `backing` owns `words * 8` contiguous, initialised bytes.
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.backing.len() * 8) }
+    }
+}
+
+impl std::ops::DerefMut for FakeFnHeader {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above; `&mut self` gives unique access to `backing`.
+        let len = self.backing.len() * 8;
+        unsafe { std::slice::from_raw_parts_mut(self.backing.as_mut_ptr().cast::<u8>(), len) }
+    }
+}
 
 /// Serializes tests that mutate the process-global inline-cache registry
 /// (`IC_SESSION`/`IC_GENERATION`). These statics are shared by every test in
@@ -587,15 +637,10 @@ fn tiered_promotion_full_lifecycle() {
         compile_threads: 1,
     };
 
-    // Function header layout assumed here matches tiered.rs check_promotion()
-    // and CompiledCode::install():
-    //   offset 0:  entry_point (*const u8 / AtomicPtr<u8>) — 8 bytes
-    //   offset 8:  tier (u8)
-    //   offset 9:  padding (3 bytes)
-    //   offset 12: invoke_count (u32, little-endian)
-    // Total: 16 bytes.
-    // See also: tiered.rs lines 350-366, 319-327.
-    let mut header = Box::new([0u8; 16]);
+    // Fake FnMeta header (see FakeFnHeader): offset 8 = tier, 12..16 =
+    // invoke_count, 16..20 = back_edge_count. Must be full FnMeta size/alignment
+    // so check_promotion's back_edge_count read stays in bounds (bliss-4lb).
+    let mut header = FakeFnHeader::new();
 
     // Set tier = Interpreter (0)
     header[8] = 0; // Tier::Interpreter
@@ -604,8 +649,7 @@ fn tiered_promotion_full_lifecycle() {
     header[12..16].copy_from_slice(&0u32.to_le_bytes());
 
     // Create a function-tagged BlissVal pointing to our header
-    let header_ptr = header.as_ptr() as u64;
-    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION);
+    let func_val = header.func_val();
 
     // At 0 invocations, no promotion
     assert_eq!(
@@ -654,13 +698,10 @@ fn tiered_promotion_full_lifecycle() {
 
 #[test]
 fn tiered_compilers_produce_code_with_function_val() {
-    // Per tiered.rs, compile() takes a BlissVal that should be TAG_FUNCTION.
-    // We must allocate a real function header to avoid null-pointer dereference.
-    // Function header layout per tiered.rs:
-    //   [entry_point: 8][tier: 1][pad: 3][invoke_count: 4] = 16 bytes
-    let header = Box::new([0u8; 16]);
-    let header_ptr = header.as_ptr() as u64;
-    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION);
+    // compile() takes a TAG_FUNCTION value; back it with a full-size FnMeta
+    // header so any FnMeta field read stays in bounds (bliss-4lb).
+    let header = FakeFnHeader::new();
+    let func_val = header.func_val();
 
     let bc = BaselineCompiler::new().compile(func_val).unwrap();
     assert_eq!(bc.tier(), Tier::Baseline);
@@ -731,11 +772,10 @@ fn profiling_invocation_counter_triggers_t1_promotion() {
 
     // Now simulate: create a function header with invoke_count=10, tier=Interpreter
     // and verify check_promotion returns Baseline
-    let mut header = Box::new([0u8; 16]);
+    let mut header = FakeFnHeader::new();
     header[8] = 0; // Tier::Interpreter
     header[12..16].copy_from_slice(&10u32.to_le_bytes());
-    let header_ptr = header.as_ptr() as u64;
-    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION);
+    let func_val = header.func_val();
     assert_eq!(
         check_promotion(func_val, &config),
         Some(Tier::Baseline),
@@ -819,11 +859,11 @@ fn profiling_invocation_counter_reset_and_recount() {
 
 #[test]
 fn tiered_request_compilation_accepts_function_val() {
-    // Function header layout per tiered.rs check_promotion() and CompiledCode::install():
-    //   [entry_point: 8][tier: 1][pad: 3][invoke_count: 4] = 16 bytes
-    let header = Box::new([0u8; 16]);
-    let header_ptr = header.as_ptr() as u64;
-    let func_val = BlissVal(header_ptr | bliss_rt::value::TAG_FUNCTION);
+    // Full-size FnMeta header: request_compilation reads invoke_count AND
+    // back_edge_count (priority = invoke + 2*back_edge), so an undersized header
+    // read OOB garbage and overflowed the priority sum in debug (bliss-4lb).
+    let header = FakeFnHeader::new();
+    let func_val = header.func_val();
 
     // request_compilation should accept a function-tagged value and enqueue it
     let result = request_compilation(func_val, Tier::Baseline);
@@ -853,17 +893,15 @@ fn tiered_request_compilation_rejects_non_function() {
 
 #[test]
 fn tiered_compiled_code_install_updates_function_header() {
-    // Function header layout per tiered.rs check_promotion() and CompiledCode::install():
-    //   [entry_point: 8 bytes (AtomicPtr)][tier: 1 byte][padding: 3][invoke_count: 4]
-    // See tiered.rs lines 350-366 (check_promotion reads) and 319-327 (install writes).
-    // We need proper alignment for AtomicPtr, so use a Box<[u8; 16]> via aligned allocation.
+    // install() writes the entry AtomicPtr at offset 0 and the tier byte at
+    // offset 8. Back the header with a full-size, 8-byte-aligned FnMeta buffer
+    // so those and any FnMeta field reads stay in bounds (bliss-4lb).
     use std::sync::atomic::{AtomicPtr, Ordering};
 
-    // Use a Vec with enough space, aligned to pointer size
-    let mut header = [0u8; 32]; // extra room for alignment
+    let mut header = FakeFnHeader::new();
     let header_ptr = header.as_mut_ptr();
 
-    // Ensure the pointer is 8-byte aligned (it should be from Vec)
+    // Vec<u64> backing guarantees 8-byte alignment for the AtomicPtr slot.
     assert_eq!(header_ptr as usize % 8, 0, "header must be 8-byte aligned");
 
     // Initialize: entry_point = null, tier = Interpreter (0)
@@ -1056,9 +1094,9 @@ fn osr_entry_with_compiled_function() {
     // Build a compiled function and attempt OSR entry — this exercises the
     // osr_entry() free function which validates the function and entry map
     // before attempting the (unimplemented) stack transfer.
-    let mut header = Box::new([0u8; 16]);
-    let header_ptr = header.as_mut_ptr();
-    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION);
+    // Full-size FnMeta header so osr_entry/deoptimize field reads stay in bounds (bliss-4lb).
+    let header = FakeFnHeader::new();
+    let func_val = header.func_val();
 
     let entry_map = OsrEntryMap::new(
         vec![LocalMapping {
@@ -1142,9 +1180,9 @@ fn osr_threshold_in_tier_config() {
 fn osr_deoptimize_with_compiled_function() {
     // Exercise the deoptimize() free function with a compiled function.
     // It should validate and then hit unimplemented!() for stack reconstruction.
-    let mut header = Box::new([0u8; 16]);
-    let header_ptr = header.as_mut_ptr();
-    let func_val = BlissVal(header_ptr as u64 | bliss_rt::value::TAG_FUNCTION);
+    // Full-size FnMeta header so osr_entry/deoptimize field reads stay in bounds (bliss-4lb).
+    let header = FakeFnHeader::new();
+    let func_val = header.func_val();
 
     let live_values = [BlissVal::from_fixnum(1), BlissVal::from_fixnum(2)];
     let reason = DeoptReason::TypeMismatch {
