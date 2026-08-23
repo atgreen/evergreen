@@ -2541,6 +2541,302 @@ mod shadow_root_scope_tests {
     }
 }
 
+// ── Intrusive, lock-free precise roots (bliss-a03) ─────────────────────────
+//
+// `Rooted<T>` unifies StackRoot / HostRoot / ShadowRoot into one primitive: an
+// intrusive node on a thread-local singly-linked list (SpiderMonkey's
+// `Rooted<T>` model). Construction links, destruction unlinks — O(1) with no
+// lock on the mutator hot path (the mutex-guarded registries above take a
+// global lock per root construction/drop, and StackRoot's drop is O(n), so
+// deeply-recursive rooted code paid O(n²) in lock-guarded work).
+//
+// The value lives INLINE in the node: reads/writes are direct (Deref/DerefMut),
+// and the collector rewrites the slot in place via the same TraceHostRoots
+// machinery as HostRoot. The one global structure is a registry of each
+// thread's head-cell address, touched once per thread — the scanner walks each
+// list during STW, when mutators are parked and the lists are quiescent (the
+// same quiescence the existing registries rely on).
+//
+// A linked node must not move (the list holds its address), which plain Rust
+// cannot express for a by-value local — so the ONLY blessed constructor is the
+// `rooted!` macro: it creates the unlinked node as a hidden local, then shadows
+// the name with a `RootedGuard` that links on creation and unlinks on drop.
+// While the guard borrows the node, the borrow checker makes the node immobile.
+//
+//     bliss_rt::rooted!(form = some_val);          // form: RootedGuard<BlissVal>
+//     let v = *form;                               // direct read (post-GC value)
+//     *form = other_val;                           // direct write
+//     bliss_rt::rooted!(items = Vec::<BlissVal>::new());
+//     items.push(v);                               // Deref to Vec
+//
+// Out-of-order drops (a guard dropped before a later-created one, e.g. via
+// explicit `drop`) are tolerated: unlink walks from the head when the node is
+// not the head. Normal lexical scoping is LIFO and hits the O(1) fast path.
+
+/// Type-erased intrusive list node embedded in every [`Rooted<T>`].
+#[repr(C)]
+pub struct RootLink {
+    next: *mut RootLink,
+    trace: unsafe fn(*mut RootLink, &mut dyn FnMut(*mut BlissVal)),
+}
+
+thread_local! {
+    /// Head of this thread's intrusive root list. The cell's ADDRESS is stable
+    /// for the thread's lifetime and is what the global registry records.
+    static ROOTED_HEAD: std::cell::Cell<*mut RootLink> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+
+    /// Registers this thread's head cell on first use; its destructor removes
+    /// the registry entry when the thread exits.
+    static ROOTED_HEAD_REGISTRATION: RootedHeadRegistration =
+        RootedHeadRegistration::install();
+}
+
+fn rooted_heads() -> &'static OrderedMutex<Vec<usize>> {
+    static HEADS: OnceLock<OrderedMutex<Vec<usize>>> = OnceLock::new();
+    HEADS.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::GcWorld,
+            20,
+            "GC intrusive rooted-list heads",
+            Vec::new(),
+        )
+    })
+}
+
+struct RootedHeadRegistration {
+    head_address: usize,
+}
+
+impl RootedHeadRegistration {
+    fn install() -> Self {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| register_root_scanner(scan_rooted_lists));
+        let head_address = ROOTED_HEAD.with(|cell| cell as *const _ as usize);
+        rooted_heads()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(head_address);
+        Self { head_address }
+    }
+}
+
+impl Drop for RootedHeadRegistration {
+    fn drop(&mut self) {
+        let mut heads = rooted_heads().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = heads.iter().rposition(|&a| a == self.head_address) {
+            heads.remove(index);
+        }
+    }
+}
+
+fn scan_rooted_lists(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let heads = rooted_heads().lock().unwrap_or_else(|e| e.into_inner());
+    for &head_address in heads.iter() {
+        // SAFETY: the registry holds addresses of live threads' ROOTED_HEAD
+        // cells (removed by the TLS destructor on thread exit), and the lists
+        // are quiescent while the collector runs (mutators parked at
+        // safepoints — the same contract as every registry above).
+        let mut node = unsafe { (*(head_address as *const std::cell::Cell<*mut RootLink>)).get() };
+        while !node.is_null() {
+            unsafe {
+                ((*node).trace)(node, visit);
+                node = (*node).next;
+            }
+        }
+    }
+}
+
+/// The intrusive root node. Create ONLY via the [`rooted!`] macro (see the
+/// module comment): a `Rooted` must not move between [`RootedGuard::new`] and
+/// the guard's drop, which the macro's shadowing guarantees.
+#[repr(C)]
+pub struct Rooted<T: TraceHostRoots> {
+    link: RootLink,
+    value: T,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+unsafe fn trace_rooted<T: TraceHostRoots>(
+    link: *mut RootLink,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    // SAFETY: `link` is the first field of a live, immobile `Rooted<T>`
+    // (repr(C)), so the container pointer is the link pointer.
+    unsafe { (*(link as *mut Rooted<T>)).value.trace_host_roots(visit) };
+}
+
+impl<T: TraceHostRoots> Rooted<T> {
+    /// An UNLINKED node. Not scanned until a [`RootedGuard`] links it; use the
+    /// [`rooted!`] macro rather than calling this directly.
+    pub fn new_unlinked(value: T) -> Self {
+        Rooted {
+            link: RootLink {
+                next: std::ptr::null_mut(),
+                trace: trace_rooted::<T>,
+            },
+            value,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+/// Links a [`Rooted`] onto the thread's root list for the guard's lifetime and
+/// unlinks it on drop. Derefs to the rooted value. The borrow it holds keeps
+/// the node immobile for exactly the linked extent.
+pub struct RootedGuard<'r, T: TraceHostRoots> {
+    node: &'r mut Rooted<T>,
+}
+
+impl<'r, T: TraceHostRoots> RootedGuard<'r, T> {
+    pub fn new(node: &'r mut Rooted<T>) -> Self {
+        ROOTED_HEAD_REGISTRATION.with(|_| {});
+        ROOTED_HEAD.with(|head| {
+            node.link.next = head.get();
+            head.set(&mut node.link as *mut RootLink);
+        });
+        RootedGuard { node }
+    }
+}
+
+impl<T: TraceHostRoots> Deref for RootedGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.node.value
+    }
+}
+
+impl<T: TraceHostRoots> DerefMut for RootedGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.node.value
+    }
+}
+
+impl<T: TraceHostRoots> Drop for RootedGuard<'_, T> {
+    fn drop(&mut self) {
+        let target = &mut self.node.link as *mut RootLink;
+        ROOTED_HEAD.with(|head| {
+            let first = head.get();
+            if first == target {
+                // LIFO fast path: normal lexical scoping.
+                head.set(self.node.link.next);
+                return;
+            }
+            // Out-of-order drop: unlink from the middle.
+            let mut cursor = first;
+            while !cursor.is_null() {
+                // SAFETY: list nodes are live linked Rooteds on this thread.
+                unsafe {
+                    if (*cursor).next == target {
+                        (*cursor).next = (*target).next;
+                        return;
+                    }
+                    cursor = (*cursor).next;
+                }
+            }
+            unreachable!("RootedGuard dropped but its node is not on the root list");
+        });
+    }
+}
+
+/// Root a value for the current lexical scope: `rooted!(name = expr)` binds
+/// `name` to a [`RootedGuard`] over `expr`. Reads/writes go through Deref
+/// (`*name`), always seeing the post-GC (relocated) value.
+#[macro_export]
+macro_rules! rooted {
+    ($name:ident = $value:expr) => {
+        let mut $name = $crate::gc::Rooted::new_unlinked($value);
+        #[allow(unused_mut)]
+        let mut $name = $crate::gc::RootedGuard::new(&mut $name);
+    };
+}
+
+#[cfg(test)]
+mod rooted_tests {
+    use super::*;
+
+    fn list_len() -> usize {
+        let mut n = 0;
+        ROOTED_HEAD.with(|head| {
+            let mut node = head.get();
+            while !node.is_null() {
+                n += 1;
+                node = unsafe { (*node).next };
+            }
+        });
+        n
+    }
+
+    /// Trace only THIS thread's list. `scan_rooted_lists` is process-wide and
+    /// relies on STW quiescence, which parallel test threads don't provide.
+    fn scan_local(visit: &mut dyn FnMut(*mut BlissVal)) {
+        ROOTED_HEAD.with(|head| {
+            let mut node = head.get();
+            while !node.is_null() {
+                unsafe {
+                    ((*node).trace)(node, visit);
+                    node = (*node).next;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn rooted_links_unlinks_and_scans() {
+        assert_eq!(list_len(), 0);
+        {
+            rooted!(a = BlissVal::from_fixnum(1));
+            rooted!(b = vec![BlissVal::from_fixnum(2), BlissVal::from_fixnum(3)]);
+            assert_eq!(list_len(), 2);
+            assert_eq!(*a, BlissVal::from_fixnum(1));
+            assert_eq!(b.len(), 2);
+            // The local scan visits every slot on this thread's list once.
+            let mut seen = Vec::new();
+            scan_local(&mut |slot| seen.push(unsafe { *slot }));
+            assert_eq!(seen.len(), 3);
+            for expected in [1, 2, 3] {
+                assert!(seen.contains(&BlissVal::from_fixnum(expected)));
+            }
+            // Writes through the guard are visible to the scanner.
+            *a = BlissVal::from_fixnum(987654);
+            let mut seen = Vec::new();
+            scan_local(&mut |slot| seen.push(unsafe { *slot }));
+            assert!(seen.contains(&BlissVal::from_fixnum(987654)));
+        }
+        assert_eq!(list_len(), 0);
+    }
+
+    #[test]
+    fn out_of_order_drop_unlinks_correctly() {
+        let mut a = Rooted::new_unlinked(BlissVal::from_fixnum(1));
+        let a = RootedGuard::new(&mut a);
+        let mut b = Rooted::new_unlinked(BlissVal::from_fixnum(2));
+        let b = RootedGuard::new(&mut b);
+        let mut c = Rooted::new_unlinked(BlissVal::from_fixnum(3));
+        let c = RootedGuard::new(&mut c);
+        assert_eq!(list_len(), 3);
+        drop(b); // middle of the list
+        assert_eq!(list_len(), 2);
+        let mut seen = Vec::new();
+        scan_local(&mut |slot| seen.push(unsafe { *slot }));
+        assert!(seen.contains(&BlissVal::from_fixnum(1)));
+        assert!(seen.contains(&BlissVal::from_fixnum(3)));
+        drop(a); // now the tail
+        drop(c); // head
+        assert_eq!(list_len(), 0);
+    }
+
+    #[test]
+    fn unwind_unlinks() {
+        let result = std::panic::catch_unwind(|| {
+            rooted!(_x = BlissVal::from_fixnum(7));
+            panic!("exercise rooted unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(list_len(), 0);
+    }
+}
+
 // ── T0 evaluator allocation on the shared GC heap (bliss-jtc.1) ───
 //
 // The tree-walking interpreter allocates its Lisp objects (conses, strings, …)

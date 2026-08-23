@@ -1962,41 +1962,40 @@ fn is_quote_symbol(val: BlissVal) -> bool {
 /// are NOT mutated — new cells are allocated when any sub-form changes.
 /// This avoids corrupting shared cons structures (e.g., quoted data referenced
 /// elsewhere, or forms appearing in multiple expansion contexts).
-fn walk_cons(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+fn walk_cons(form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
     debug_assert!(form.is_cons(), "walk_cons called on non-cons value");
 
-    // Get car and cdr of the current cons cell
-    let mut car = unsafe { cons_car(form) };
-    let mut cdr = unsafe { cons_cdr(form) };
-
     // Root across the allocating expand recursion (moving GC; bliss-noh).
-    let _form_root = bliss_rt::gc::StackRoot::new(&mut form);
-    let _car_root = bliss_rt::gc::StackRoot::new(&mut car);
-    let _cdr_root = bliss_rt::gc::StackRoot::new(&mut cdr);
+    // `rooted!` (bliss-a03) is the intrusive lock-free root: O(1) link/unlink
+    // per level, vs. a global mutex + O(n) drop per StackRoot — this recursion
+    // runs once per cons of every macroexpanded form, so the difference is the
+    // O(n²) hot case the design targets.
+    bliss_rt::rooted!(form = form);
+    bliss_rt::rooted!(car = unsafe { cons_car(*form) });
+    bliss_rt::rooted!(cdr = unsafe { cons_cdr(*form) });
 
     // Recursively expand the car
-    let mut expanded_car = macroexpand_all(car, env)?;
-    let _expanded_car_root = bliss_rt::gc::StackRoot::new(&mut expanded_car);
+    bliss_rt::rooted!(expanded_car = macroexpand_all(*car, env)?);
 
     // Recursively expand the cdr
     // The cdr is typically another cons (rest of list) or NIL (end of list),
     // but could be any value in a dotted pair.
     let expanded_cdr = if cdr.is_cons() {
-        walk_cons(cdr, env)?
+        walk_cons(*cdr, env)?
     } else {
         // For non-cons cdr (NIL or dotted-pair atom), expand as an atom
-        let (expanded_cdr_val, _) = macroexpand(cdr, env)?;
+        let (expanded_cdr_val, _) = macroexpand(*cdr, env)?;
         expanded_cdr_val
     };
 
     // If nothing changed, return the original cons cell to preserve identity
     // (important for compiler macro decline checks which use pointer equality).
-    if expanded_car == car && expanded_cdr == cdr {
-        return Ok(form);
+    if *expanded_car == *car && expanded_cdr == *cdr {
+        return Ok(*form);
     }
 
     // Build a new cons cell with the expanded values (non-destructive).
-    Ok(alloc_cons(expanded_car, expanded_cdr))
+    Ok(alloc_cons(*expanded_car, expanded_cdr))
 }
 type MacroFn = dyn Fn(BlissVal, &Environment) -> Result<BlissVal, BlissError> + Send + Sync;
 
