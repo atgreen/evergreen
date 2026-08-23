@@ -5059,6 +5059,30 @@ fn alien_type_from_keyword(kw: BlissVal) -> Result<bliss_rt::ffi::AlienType, Bli
     })
 }
 
+/// True if `kw` is the `:string` alien-type keyword. `%ffi-call` handles it
+/// specially: a Lisp string argument is passed as a fresh NUL-terminated
+/// `char*`, and a `:string` return is read back into a Lisp string. The ABI
+/// type is otherwise an ordinary pointer (see [`alien_type_from_keyword`]),
+/// so only the marshalling differs (bliss-124).
+fn is_string_alien_kw(kw: BlissVal) -> bool {
+    kw.is_symbol() && symbol_bare_name(&sym_name(kw)) == "STRING"
+}
+
+/// Read a NUL-terminated C string at address `ptr` into a fresh Lisp string.
+///
+/// # Safety
+/// `ptr` must be non-zero and point to a valid NUL-terminated byte buffer that
+/// stays live for the duration of this call.
+unsafe fn c_string_to_lisp(ptr: u64) -> BlissVal {
+    let p = ptr as *const u8;
+    let mut len = 0usize;
+    while unsafe { *p.add(len) } != 0 {
+        len += 1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(p, len) };
+    arena_str(&String::from_utf8_lossy(bytes))
+}
+
 /// The bare `symbol-name` (CL `SYMBOL-NAME` / `STRING` of a symbol): strips any
 /// package prefix but preserves case, unlike `symbol_bare_name` which upper-cases.
 fn symbol_name_string(name: &str) -> String {
@@ -7137,6 +7161,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     ));
                 }
                 let fn_ptr = args[0].as_fixnum() as usize as *const ();
+                let ret_is_string = is_string_alien_kw(args[1]);
                 let ret_type = alien_type_from_keyword(args[1])?;
                 let arg_type_vals = list_to_vec(args[2]);
                 let arg_vals = list_to_vec(args[3]);
@@ -7147,15 +7172,49 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let mut arg_types = Vec::with_capacity(arg_type_vals.len());
                 let mut raw_args = Vec::with_capacity(arg_vals.len());
+                // NUL-terminated buffers backing any `:string` arguments. Kept
+                // alive until after the call so the `char*` pointers we pass stay
+                // valid for its duration (bliss-124).
+                let mut string_bufs: Vec<Vec<u8>> = Vec::new();
                 for (tv, av) in arg_type_vals.iter().zip(arg_vals.iter()) {
                     let t = alien_type_from_keyword(*tv)?;
-                    raw_args.push(bliss_rt::ffi::marshal_to_c(*av, &t)?);
+                    if is_string_alien_kw(*tv) {
+                        // `:string` — pass a Lisp string as a fresh, owned
+                        // NUL-terminated `char*`; NIL passes a null pointer.
+                        let raw = if av.is_nil() {
+                            0u64
+                        } else if is_string_value(*av) {
+                            let mut buf = val_as_str(*av).into_bytes();
+                            buf.push(0);
+                            string_bufs.push(buf);
+                            string_bufs.last().unwrap().as_ptr() as u64
+                        } else {
+                            return Err(BlissError::FfiError(
+                                "%ffi-call: :string argument must be a string or NIL".into(),
+                            ));
+                        };
+                        raw_args.push(raw);
+                    } else {
+                        raw_args.push(bliss_rt::ffi::marshal_to_c(*av, &t)?);
+                    }
                     arg_types.push(t);
                 }
                 // SAFETY: the caller asserts fn-ptr and the type signature match
                 // the real foreign function (the usual C-ABI FFI contract).
                 let raw =
                     unsafe { bliss_rt::ffi::ffi_call(fn_ptr, &ret_type, &arg_types, &raw_args)? };
+                // `string_bufs` has outlived the call; drop it now.
+                drop(string_bufs);
+                if ret_is_string {
+                    // `char*` return → Lisp string (null → NIL). The callee owns
+                    // the buffer; we only read it (no free), matching CFFI's
+                    // default `:string` return convention.
+                    return Ok(if raw == 0 {
+                        NIL
+                    } else {
+                        unsafe { c_string_to_lisp(raw) }
+                    });
+                }
                 return bliss_rt::ffi::unmarshal_from_c(raw, &ret_type);
             }
             "BLISS::%EXIT" => {
