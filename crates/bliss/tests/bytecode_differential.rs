@@ -256,6 +256,11 @@ const CORPUS: &[&str] = &[
     "(defun sumlist (l) (let ((s 0)) (dolist (x l s) (setq s (+ s x))))) (sumlist (list 1 2 3 4 5))",
     "(loop for (a . b) in (quote ((1 . 2) (3 . 4))) for n = (+ a b) collect n)",
     "(loop for x in (quote (1 2 3)) for y = (* x 2) for z = (+ y 1) sum z)",
+    // bliss-8ai: :until textually after `:for VAR = FORM` must test the CURRENT
+    // iteration's value (post-reassignment), not the previous one — the compiled
+    // lowerer used to test at loop-top and collected the terminating value.
+    "(let ((c 0)) (loop for x = (incf c) until (> x 3) collect x))",
+    "(let ((c 0)) (loop for x = (incf c) while (< x 4) collect x))",
     "(ignore-errors (error \"boom\"))",
     "(ignore-errors (+ 1 2))",
     // handler-case clause secondary values are discarded (child-env semantics).
