@@ -425,7 +425,20 @@ thread_local! {
 
 fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
     CLOS_STATE.with(|state| {
-        let mut state = state.borrow_mut();
+        // A CLOS operation that allocates while holding CLOS_STATE borrowed (e.g.
+        // make_instance building an instance under with_state_mut) can trigger a
+        // minor GC whose root scan re-enters here — an unconditional borrow_mut
+        // then double-borrow-panics, and via the extern "C" c2i boundary that
+        // aborts the process (bliss-011 sibling). Skip when already borrowed:
+        // nearly all CLOS-state roots are symbols/meta-handles (never relocated)
+        // and any movable value (a reader-built generic lambda list) is long-lived
+        // and thus already promoted out of the nursery, so a SKIPPED minor-GC scan
+        // does not leave a stale pointer in practice. The correct fix is to not
+        // allocate while CLOS_STATE is borrowed (tracked separately); this stopgap
+        // trades a rare theoretical miss for never aborting.
+        let Ok(mut state) = state.try_borrow_mut() else {
+            return;
+        };
         // Registry keys are symbols or private meta-handles and never move.
         // Payloads can include reader-built lambda lists and other heap values.
         for value in state.class_registry.values_mut() {

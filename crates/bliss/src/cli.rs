@@ -16973,6 +16973,14 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     // classes default a :allocation :class selfward-operation slot, bliss-x4p).
     let defaults = effective_default_initargs(env, &class_name);
     if !defaults.is_empty() {
+        // The eval_form calls below (supplied-initarg detection + each default's
+        // value form) allocate and can trigger a relocating minor GC, so every
+        // already-evaluated initarg AND each new value must be rooted across
+        // them — otherwise a nursery value moves and the bare Vec copy goes
+        // stale (bliss-6b2). Mirror evaluated_initargs' ShadowRoot discipline.
+        let roots = bliss_rt::ShadowRootScope::new();
+        let mut rooted: Vec<bliss_rt::ShadowRoot> =
+            initargs.iter().map(|v| roots.root(*v)).collect();
         let supplied: std::collections::HashSet<String> = list_to_vec(init_args)
             .chunks_exact(2)
             .filter_map(|pair| eval_form(pair[0], env).ok())
@@ -16989,11 +16997,14 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                 continue;
             }
             let initarg_kw = resolve_sym(&format!(":{}", initarg)).unwrap_or(NIL);
-            let slot_sym = resolve_slot_symbol(&class_name, initarg_kw, env)?;
+            // resolve_slot_symbol interns (allocates); root the slot symbol
+            // before the value form's eval_form can GC.
+            let slot_root = roots.root(resolve_slot_symbol(&class_name, initarg_kw, env)?);
             let value = eval_form(form, env)?;
-            initargs.push(slot_sym);
-            initargs.push(value);
+            rooted.push(slot_root);
+            rooted.push(roots.root(value));
         }
+        initargs = rooted.iter().map(|r| r.get()).collect();
     }
 
     // Keep initargs rooted across make_instance, the initforms, and the user
