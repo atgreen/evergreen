@@ -7,7 +7,18 @@ use bliss_compiler::tiered::{
     process_compilation_request, request_compilation,
 };
 use bliss_rt::value::{BlissVal, NIL};
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+
+/// Serializes the tests that drive the process-global compilation queue
+/// (`request_compilation`/`process_compilation_request`). Those statics are
+/// shared by every test in this binary, so running two queue-driving tests
+/// concurrently lets one test's `process_compilation_request` pop and compile
+/// the OTHER test's request — leaving its own function un-promoted and failing
+/// the `Tier::Optimising` assertion nondeterministically. The lock makes each
+/// enqueue→process→assert sequence atomic without changing behaviour for the
+/// single-threaded case.
+static COMPILATION_QUEUE_SERIAL: Mutex<()> = Mutex::new(());
 
 fn read_expand(source: &str) -> BlissVal {
     let (form, _) = read_from_string(source).expect("reader should accept spec fixture");
@@ -75,6 +86,10 @@ fn acceptance_read_macroexpand_ir_and_t2_codegen_for_branching_form() {
 
 #[test]
 fn acceptance_real_calls_promote_t0_function_then_publish_t2_switch() {
+    // Own the global compilation queue for this test's enqueue→process span.
+    let _queue = COMPILATION_QUEUE_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Per R4.23 every user-defined function starts in T0.
     // Per R4.24/R4.26 the next tier is T1, and per R4.27 a later T2 install
     // must publish the new entry atomically for subsequent calls.
@@ -166,6 +181,10 @@ fn acceptance_public_pipeline_compiles_small_cl_fixture_independently_at_both_ti
 fn acceptance_background_compilation_request_processes_real_function_object() {
     // Per R4.25-R4.27, hot functions must transition through the tiered pipeline
     // using the public orchestration APIs rather than a fake seam.
+    // Own the global compilation queue for this test's enqueue→process span.
+    let _queue = COMPILATION_QUEUE_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (function, meta) = make_function(BlissVal::from_fixnum(9), NIL);
     let mut interpreter = Interpreter::new();
     let config = TierConfig {
