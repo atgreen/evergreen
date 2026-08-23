@@ -702,6 +702,45 @@ fn defclass_accessors_work_as_function_values() {
     );
 }
 
+/// Regression for bliss-x4p: `:allocation :class` slots are shared across
+/// subclasses (stored in the owning class), a subclass may redeclare a class
+/// slot with an `:initform`, and `:default-initargs` bind slots the caller
+/// didn't supply — the shape ASDF's operation classes rely on (e.g.
+/// SELFWARD-OPERATION's class slot set by LOAD-OP's `:initform '(prepare-op …)`).
+#[test]
+fn class_allocated_slots_and_default_initargs() {
+    let expr = r#"(progn
+  ;; class slot shared across subclasses
+  (defclass owner () ((cs :allocation :class :reader cs-of :initarg :cs)))
+  (defclass sub (owner) ())
+  (make-instance 'owner :cs 'shared)
+  ;; subclass redeclaring a class slot with an initform
+  (defclass op () ())
+  (defclass swo (op) ((swo :reader swo :allocation :class)))
+  (defclass load-op (swo) ((swo :initform '(prep comp) :allocation :class)))
+  ;; :default-initargs (instance slot) + explicit override
+  (defclass base () ((s :initarg :s)))
+  (defclass di (base) () (:default-initargs :s 42))
+  (format nil "~A ~A ~A ~A ~A"
+    (cs-of (make-instance 'owner))          ; SHARED
+    (cs-of (make-instance 'sub))            ; SHARED (inherited class slot)
+    (swo (make-instance 'load-op))          ; (PREP COMP)
+    (slot-value (make-instance 'di) 's)     ; 42
+    (slot-value (make-instance 'di :s 9) 's)))"#; // 9 (explicit overrides default)
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("SHARED SHARED (PREP COMP) 42 9"),
+        "class-allocated slots + default-initargs; got: '{}', stderr: '{}'",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// Regression for bliss-2ke: CLOS instances must not be representable as
 /// fixnums. Instance ids were once `from_fixnum(id)` (starting at 100000), so a
 /// plain integer equal to a live instance id collided with it in the registry

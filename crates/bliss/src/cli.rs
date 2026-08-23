@@ -979,6 +979,10 @@ struct ClassDef {
     supers: Vec<String>,
     slots: Vec<SlotDef>,
     class_slot_values: Arc<Mutex<HashMap<String, Option<BlissVal>>>>,
+    /// `(:default-initargs initarg value-form …)` from the class options: the
+    /// bare initarg name and its (unevaluated) default value form. Applied at
+    /// MAKE-INSTANCE time for any initarg the caller did not supply (CLHS 7.1.4).
+    default_initargs: Vec<(String, BlissVal)>,
 }
 
 #[derive(Clone)]
@@ -1881,13 +1885,35 @@ fn split_initargs_for_class(
 }
 
 fn write_class_slot_value(env: &Env, class_name: &str, slot_name: &str, value: Option<BlissVal>) {
-    if let Some(class_def) = env.classes.borrow().get(class_name).cloned() {
+    // A shared `:allocation :class` value lives in the OWNING class's cell so all
+    // subclass instances see it (bliss-x4p). Resolve the owner (idempotent when
+    // `class_name` already owns the slot); fall back to `class_name` if the slot
+    // is not found as class-allocated (e.g. transitional/bootstrap classes).
+    let bare = symbol_bare_name(slot_name);
+    let owner = class_slot_owner(env, class_name, &bare).unwrap_or_else(|| class_name.to_string());
+    if let Some(class_def) = env.classes.borrow().get(&owner).cloned() {
+        // Key by BARE slot name for consistency with reads (bliss-x4p).
         class_def
             .class_slot_values
             .lock()
             .unwrap()
-            .insert(slot_name.to_string(), value);
+            .insert(bare, value);
     }
+}
+
+/// The shared value cell for a `:allocation :class` slot named `slot_bare`
+/// reachable from `class_name` — the OWNING class's map, so all subclass
+/// instances read and write the one shared value (bliss-x4p).
+fn class_slot_cell(
+    env: &Env,
+    class_name: &str,
+    slot_bare: &str,
+) -> Option<Arc<Mutex<HashMap<String, Option<BlissVal>>>>> {
+    let owner = class_slot_owner(env, class_name, slot_bare)?;
+    env.classes
+        .borrow()
+        .get(&owner)
+        .map(|cd| Arc::clone(&cd.class_slot_values))
 }
 
 /// If `slot_name` names a `:allocation :class` slot reachable from `class_name`,
@@ -1938,16 +1964,63 @@ fn class_slot_owner(env: &Env, class_name: &str, slot_name: &str) -> Option<Stri
     })
 }
 
+/// The effective `:default-initargs` for `class_name`: the union over the class
+/// and its superclasses (most-specific first), keeping the first (most specific)
+/// default for each initarg name (CLHS 7.1.4). Each entry is `(bare-initarg-name,
+/// value-form)`; the form is evaluated at MAKE-INSTANCE time only when the
+/// caller did not supply that initarg.
+fn effective_default_initargs(env: &Env, class_name: &str) -> Vec<(String, BlissVal)> {
+    fn walk(
+        env: &Env,
+        class_name: &str,
+        out: &mut Vec<(String, BlissVal)>,
+        seen_initargs: &mut HashSet<String>,
+        seen_classes: &mut HashSet<String>,
+    ) {
+        if !seen_classes.insert(class_name.to_string()) {
+            return;
+        }
+        let Some(cd) = env.classes.borrow().get(class_name).cloned() else {
+            return;
+        };
+        for (initarg, form) in &cd.default_initargs {
+            if seen_initargs.insert(initarg.clone()) {
+                out.push((initarg.clone(), *form));
+            }
+        }
+        for sup in &cd.supers {
+            walk(env, sup, out, seen_initargs, seen_classes);
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen_initargs = HashSet::new();
+    let mut seen_classes = HashSet::new();
+    walk(
+        env,
+        class_name,
+        &mut out,
+        &mut seen_initargs,
+        &mut seen_classes,
+    );
+    out
+}
+
 fn read_slot_value(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<BlissVal, BlissError> {
     let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
     let slot_name = symbol_bare_name(&sym_name(slot));
-    if class_slot_owner(env, &class_name, &slot_name).is_some() {
-        // The shared value is stored in the instance's class under the slot's
-        // full (as-declared) name — see instance initialization below.
-        let key = sym_name(slot);
-        if let Some(class_def) = env.classes.borrow().get(&class_name).cloned() {
+    if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
+        // A `:allocation :class` value is SHARED by every subclass, so it lives
+        // in the OWNING class's cell — not the instance's own class. Reading it
+        // from the instance class made an inherited class slot look unbound to
+        // subclass instances (bliss-x4p: ASDF's selfward-operation).
+        if let Some(class_def) = env.classes.borrow().get(&owner).cloned() {
             let values = class_def.class_slot_values.lock().unwrap();
-            if let Some(Some(value)) = values.get(&key).or_else(|| values.get(&slot_name)) {
+            // Keyed by BARE slot name so a package-qualified declaration and a
+            // bare/differently-qualified read agree (bliss-x4p).
+            if let Some(Some(value)) = values
+                .get(&slot_name)
+                .or_else(|| values.get(&sym_name(slot)))
+            {
                 return Ok(*value);
             }
         }
@@ -1997,12 +2070,11 @@ fn slot_value_or_signal(
 fn slot_is_bound(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<bool, BlissError> {
     let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
     let slot_name = symbol_bare_name(&sym_name(slot));
-    if class_slot_owner(env, &class_name, &slot_name).is_some() {
-        let key = sym_name(slot);
-        if let Some(class_def) = env.classes.borrow().get(&class_name).cloned() {
+    if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
+        if let Some(class_def) = env.classes.borrow().get(&owner).cloned() {
             let values = class_def.class_slot_values.lock().unwrap();
             return Ok(matches!(
-                values.get(&key).or_else(|| values.get(&slot_name)),
+                values.get(&slot_name).or_else(|| values.get(&sym_name(slot))),
                 Some(Some(_))
             ));
         }
@@ -2018,8 +2090,10 @@ fn write_slot_value(
 ) -> Result<(), BlissError> {
     let class_name = class_name_for_instance_class(bliss_stdlib::class_of(instance));
     let slot_name = symbol_bare_name(&sym_name(slot));
-    if class_slot_owner(env, &class_name, &slot_name).is_some() {
-        write_class_slot_value(env, &class_name, &sym_name(slot), Some(value));
+    if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
+        // Write the shared value into the OWNING class's cell so all subclass
+        // instances see it (bliss-x4p).
+        write_class_slot_value(env, &owner, &sym_name(slot), Some(value));
         return Ok(());
     }
     bliss_stdlib::set_slot_value(instance, slot, value)
@@ -2084,15 +2158,10 @@ fn apply_class_initforms(
     explicit_slots: &[String],
 ) -> Result<(), BlissError> {
     // Walk the full class precedence list so inherited slot initforms are
-    // applied, not just those declared on the instance's own class. Class-
-    // allocated slot values are stored in the instance class's shared map,
-    // consistent with `read_slot_value`/`write_class_slot_value`.
+    // applied, not just those declared on the instance's own class. A
+    // `:allocation :class` slot's value lives in its OWNING class's shared cell
+    // (bliss-x4p), resolved per slot via `class_slot_cell`.
     let effective = effective_slots_for_class(env, class_name);
-    let class_slot_values = env
-        .classes
-        .borrow()
-        .get(class_name)
-        .map(|class_def| Arc::clone(&class_def.class_slot_values));
     for slot in &effective {
         if explicit_slots.iter().any(|name| name == &slot.name) {
             continue;
@@ -2106,10 +2175,14 @@ fn apply_class_initforms(
             continue;
         };
         let slot_sym = resolve_sym(&slot.name).unwrap_or(NIL);
+        let class_cell = matches!(slot.allocation, SlotAllocation::Class)
+            .then(|| class_slot_cell(env, class_name, &symbol_bare_name(&slot.name)))
+            .flatten();
+        let bare = symbol_bare_name(&slot.name);
         let already_bound = match slot.allocation {
-            SlotAllocation::Class => class_slot_values
+            SlotAllocation::Class => class_cell
                 .as_ref()
-                .map(|values| matches!(values.lock().unwrap().get(&slot.name), Some(Some(_))))
+                .map(|values| matches!(values.lock().unwrap().get(&bare), Some(Some(_))))
                 .unwrap_or(false),
             SlotAllocation::Instance => bliss_stdlib::slot_boundp(instance, slot_sym)?,
         };
@@ -2119,11 +2192,9 @@ fn apply_class_initforms(
         let value = eval_form(initform, env)?;
         match slot.allocation {
             SlotAllocation::Class => {
-                if let Some(values) = class_slot_values.as_ref() {
-                    values
-                        .lock()
-                        .unwrap()
-                        .insert(slot.name.clone(), Some(value));
+                if let Some(values) = class_cell.as_ref() {
+                    // Key by BARE slot name for read/write consistency (bliss-x4p).
+                    values.lock().unwrap().insert(bare, Some(value));
                 }
             }
             SlotAllocation::Instance => {
@@ -16190,9 +16261,34 @@ fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
 fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, rest) = cp(cdr);
     let (supers_form, rest2) = cp(rest);
-    let (slots_form, _) = cp(rest2);
+    let (slots_form, class_options) = cp(rest2);
 
     let name = sym_name(name_form);
+
+    // Class options follow the slots list. Parse (:default-initargs initarg
+    // value-form …); other options (:documentation, :metaclass, …) are ignored.
+    let mut default_initargs: Vec<(String, BlissVal)> = Vec::new();
+    for option in list_to_vec(class_options) {
+        if !option.is_cons() {
+            continue;
+        }
+        let (opt_key, opt_rest) = cp(option);
+        if !opt_key.is_symbol()
+            || symbol_bare_name(&sym_name(opt_key)) != "DEFAULT-INITARGS"
+        {
+            continue;
+        }
+        let pairs = list_to_vec(opt_rest);
+        let mut j = 0;
+        while j + 1 < pairs.len() {
+            let initarg = symbol_bare_name(&sym_name(pairs[j]))
+                .trim_start_matches("KEYWORD:")
+                .trim_start_matches(':')
+                .to_string();
+            default_initargs.push((initarg, pairs[j + 1]));
+            j += 2;
+        }
+    }
 
     // Parse superclasses
     let mut supers = Vec::new();
@@ -16341,7 +16437,8 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let mut class_slot_values = HashMap::new();
     for slot in &slots {
         if slot.allocation == SlotAllocation::Class {
-            class_slot_values.insert(slot.name.clone(), None);
+            // Key by BARE name for read/write consistency (bliss-x4p).
+            class_slot_values.insert(symbol_bare_name(&slot.name), None);
         }
     }
 
@@ -16352,6 +16449,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             supers,
             slots,
             class_slot_values: Arc::new(Mutex::new(class_slot_values)),
+            default_initargs,
         },
     );
     let direct_supers: Result<Vec<BlissVal>, BlissError> = super_list
@@ -16852,6 +16950,37 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     let class = resolve_class_metaobject(env, class_input)?;
     let class_name = class_name_for_instance_class(class);
     let mut initargs = evaluated_initargs(&class_name, init_args, env)?;
+
+    // Apply :default-initargs (CLHS 7.1.4): for each effective default whose
+    // initarg the caller did NOT supply, evaluate its value form and append it
+    // as a (slot-symbol value) pair so the ordinary initarg path binds it. This
+    // covers both instance- and class-allocated slots (e.g. ASDF's operation
+    // classes default a :allocation :class selfward-operation slot, bliss-x4p).
+    let defaults = effective_default_initargs(env, &class_name);
+    if !defaults.is_empty() {
+        let supplied: std::collections::HashSet<String> = list_to_vec(init_args)
+            .chunks_exact(2)
+            .filter_map(|pair| eval_form(pair[0], env).ok())
+            .filter(|k| k.is_symbol())
+            .map(|k| {
+                symbol_bare_name(&sym_name(k))
+                    .trim_start_matches("KEYWORD:")
+                    .trim_start_matches(':')
+                    .to_string()
+            })
+            .collect();
+        for (initarg, form) in defaults {
+            if supplied.contains(&initarg) {
+                continue;
+            }
+            let initarg_kw = resolve_sym(&format!(":{}", initarg)).unwrap_or(NIL);
+            let slot_sym = resolve_slot_symbol(&class_name, initarg_kw, env)?;
+            let value = eval_form(form, env)?;
+            initargs.push(slot_sym);
+            initargs.push(value);
+        }
+    }
+
     // Keep initargs rooted across make_instance, the initforms, and the user
     // :after methods below — all of which allocate (bliss-6b2 #2).
     let _ig = VecRootGuard::new(&mut initargs);
@@ -18840,6 +18969,7 @@ mod env_gc_root_tests {
                     allocation: SlotAllocation::Instance,
                 }],
                 class_slot_values: Arc::new(Mutex::new(class_values)),
+                default_initargs: Vec::new(),
             },
         );
         env.generics.borrow_mut().insert(
