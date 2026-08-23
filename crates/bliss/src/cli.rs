@@ -1019,7 +1019,7 @@ struct GenericDef {
     combination: bliss_stdlib::MethodCombinationType,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum MethodSpecializer {
     Any,
     Class(String),
@@ -16203,6 +16203,14 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
     // Parse slots
     let mut slots = Vec::new();
+    // Reader/writer/accessor generic methods to install, captured as the ORIGINAL
+    // symbols (not sym_name strings). Round-tripping a package-qualified symbol
+    // through sym_name -> resolve_sym can land on a different symbol object
+    // (e.g. PKG::NAME external/internal), splitting env.methods across two keys
+    // so dispatch misses the reader (bliss-aid). Keep the symbol the class was
+    // written with, matching how callers and explicit defmethods key it.
+    // Each entry: (slot-name-symbol, method-name-form, is-writer).
+    let mut method_specs: Vec<(BlissVal, BlissVal, bool)> = Vec::new();
     let slot_list = list_to_vec(slots_form);
     for slot_form in &slot_list {
         if slot_form.is_cons() {
@@ -16214,6 +16222,10 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             let mut writers = Vec::new();
             let mut initform = None;
             let mut allocation = SlotAllocation::Instance;
+            // Method-name symbols for this slot, captured verbatim (see above).
+            let mut reader_syms: Vec<BlissVal> = Vec::new();
+            let mut writer_syms: Vec<BlissVal> = Vec::new();
+            let mut accessor_sym: Option<BlissVal> = None;
 
             // Parse slot options
             let opts = list_to_vec(slot_opts);
@@ -16242,6 +16254,8 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         let accessor_name = sym_name(opts[i + 1]);
                         accessor = Some(accessor_name.clone());
                         readers.push(accessor_name);
+                        reader_syms.push(opts[i + 1]);
+                        accessor_sym = Some(opts[i + 1]);
                         i += 2;
                     } else {
                         i += 1;
@@ -16249,6 +16263,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else if opt_bare == "READER" {
                     if i + 1 < opts.len() {
                         readers.push(sym_name(opts[i + 1]));
+                        reader_syms.push(opts[i + 1]);
                         i += 2;
                     } else {
                         i += 1;
@@ -16257,6 +16272,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if i + 1 < opts.len() {
                         if opts[i + 1].is_symbol() {
                             writers.push(sym_name(opts[i + 1]));
+                            writer_syms.push(opts[i + 1]);
                         }
                         i += 2;
                     } else {
@@ -16284,6 +16300,20 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     i += 1;
                 }
+            }
+
+            // Record reader/writer/accessor methods to install (with the slot
+            // symbol) once the class is defined. `reader_syms` already includes
+            // accessor names; `accessor_sym` also gets a `(setf accessor)` writer.
+            for r in &reader_syms {
+                method_specs.push((slot_name_form, *r, false));
+            }
+            for w in &writer_syms {
+                method_specs.push((slot_name_form, *w, true));
+            }
+            if let Some(a) = accessor_sym {
+                let setf_name = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), a]);
+                method_specs.push((slot_name_form, setf_name, true));
             }
 
             slots.push(SlotDef {
@@ -16337,6 +16367,14 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         .map(|slot| resolve_sym(&slot.name).unwrap_or(NIL))
         .collect();
     bliss_stdlib::define_class(name_form, name_form, &direct_supers?, &slot_names)?;
+
+    // Install real generic methods for slot readers/writers/accessors so they
+    // work as function values (`#'reader`, funcall/apply/map), not only in
+    // operator position (bliss-aid). The accessor fast-path in `eval_list`
+    // remains an optimization for the common `(reader x)` call.
+    for (slot_sym, method_name, is_writer) in &method_specs {
+        install_slot_accessor_method(env, *method_name, name_form, *slot_sym, *is_writer)?;
+    }
     Ok(name_form)
 }
 
@@ -16763,6 +16801,48 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
             body,
         });
     Ok(name_form)
+}
+
+/// Install a `defclass` slot `:reader`/`:writer`/`:accessor` as a *real* generic
+/// method, equivalent to
+///   (defmethod NAME ((o CLASS)) (slot-value o 'SLOT))                 ; reader
+///   (defmethod NAME (v (o CLASS)) (setf (slot-value o 'SLOT) v))      ; writer
+/// Operator-position reads `(reader x)` short-circuit through an accessor
+/// fast-path in `eval_list`, but `#'reader`, `funcall`, `apply`, and `mapcar`
+/// dispatch through the generic-function method table — which previously had NO
+/// method for a defclass reader, so a slot reader used as a *function value*
+/// signalled "no applicable method". UIOP's ENSURE-FUNCTION calls ASDF slot
+/// readers exactly that way, which broke `asdf:load-system` (bliss-aid).
+/// `method_name` is the reader symbol, the writer symbol, or a `(SETF acc)` cons.
+fn install_slot_accessor_method(
+    env: &mut Env,
+    method_name: BlissVal,
+    class_form: BlissVal,
+    slot_sym: BlissVal,
+    is_writer: bool,
+) -> Result<(), BlissError> {
+    let obj = reader::make_uninterned_symbol("O");
+    let obj_spec = vec_to_list(&[obj, class_form]); // (o CLASS)
+    let quoted_slot = vec_to_list(&[quote_sym(), slot_sym]); // 'SLOT
+    let slot_place = vec_to_list(&[
+        resolve_sym("SLOT-VALUE").unwrap_or(NIL),
+        obj,
+        quoted_slot,
+    ]); // (slot-value o 'SLOT)
+    let (lambda_list, body) = if is_writer {
+        let val = reader::make_uninterned_symbol("V");
+        // (v (o CLASS)) — value unspecialized, object specialized on CLASS
+        let ll = vec_to_list(&[val, obj_spec]);
+        // (setf (slot-value o 'SLOT) v)
+        let setf = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), slot_place, val]);
+        (ll, setf)
+    } else {
+        // ((o CLASS)) — a one-argument reader specialized on CLASS
+        (vec_to_list(&[obj_spec]), slot_place)
+    };
+    let defmethod_cdr = arena_cons(method_name, arena_cons(lambda_list, vec_to_list(&[body])));
+    eval_defmethod(defmethod_cdr, env)?;
+    Ok(())
 }
 
 // ── MAKE-INSTANCE ────────────────────────────────────────────────

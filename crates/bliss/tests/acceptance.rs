@@ -664,6 +664,44 @@ fn eval_defclass_and_make_instance() {
     );
 }
 
+/// Regression for bliss-aid: a defclass `:reader`/`:accessor`/`:writer` must be
+/// a real generic method, callable as a *function value* (`#'reader`, funcall,
+/// apply, mapcar), not only in operator position. Previously readers were only
+/// resolved by an accessor fast-path in operator position, so `(funcall #'reader
+/// x)` signalled "no applicable method" — which broke UIOP's ENSURE-FUNCTION
+/// calling ASDF slot readers during `asdf:load-system`.
+#[test]
+fn defclass_accessors_work_as_function_values() {
+    // Includes the ASDF-shaped case: an explicit defgeneric + a `null` method
+    // coexisting with a defclass :reader of the same (package-qualified) name.
+    let expr = r#"(progn
+  (defgeneric g (x))
+  (defmethod g ((x null)) 'null-m)
+  (defclass c () ((s :initarg :s :initform 9 :reader g :writer set-g :accessor acc)))
+  (let ((o (make-instance 'c :s 1)))
+    (setf (acc o) 8)
+    (funcall #'set-g 7 o)
+    (format nil "~A ~A ~A ~A ~A"
+      (funcall #'g o)          ; reader as function value -> 7
+      (apply #'acc (list o))   ; accessor via apply     -> 7
+      (mapcar #'g (list o))    ; reader via mapcar       -> (7)
+      (g o)                    ; operator position       -> 7
+      (funcall #'g nil))))"#; // explicit null method still applies -> NULL-M
+    let output = bliss_bin()
+        .args(["--eval", expr])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("7 7 (7) 7 NULL-M"),
+        "defclass reader/accessor must dispatch as a function value and coexist \
+         with an explicit null method; got: '{}', stderr: '{}'",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// Regression for bliss-2ke: CLOS instances must not be representable as
 /// fixnums. Instance ids were once `from_fixnum(id)` (starting at 100000), so a
 /// plain integer equal to a live instance id collided with it in the registry
