@@ -11,8 +11,14 @@
 //! spec §4.6 (the SBCL/ECL two-backend model).
 
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 const BIN: &str = env!("CARGO_BIN_EXE_bliss-cli");
+
+fn gc_stress_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Run one `--eval` program under a given backend; return (stdout, exit_ok).
 fn run(program: &str, bytecode: bool, bootstrap: bool) -> (String, bool) {
@@ -463,6 +469,9 @@ fn recursion_bound_scales_with_stack_size() {
 
 #[test]
 fn gc_stress_defun_dotimes_push_keeps_body_roots() {
+    let _guard = gc_stress_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let program = "(progn (defun r () (let ((a nil)) (dotimes (i 5) (push (* i i) a)) a)) (r))";
 
     for backend in ["bytecode", "tree-walker", "treewalk"] {
@@ -483,6 +492,73 @@ fn gc_stress_defun_dotimes_push_keeps_body_roots() {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             "(16 9 4 1 0)",
+            "{backend} produced wrong output under GC stress"
+        );
+    }
+}
+
+#[test]
+fn gc_stress_macrolet_symbol_macrolet_labels_keeps_symbol_macro_value() {
+    let _guard = gc_stress_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let program = "(macrolet ((m (x) `(list ,x y))) (symbol-macrolet ((y 40)) (labels ((f (z) (m z))) (f 2))))";
+
+    let out = Command::new(BIN)
+        .args(["--no-init", "--eval", program])
+        .env("BLISS_BACKEND", "bytecode")
+        .env("BLISS_HEAP_MB", "4096")
+        .env("BLISS_GC_STRESS", "8")
+        .env("BLISS_GC_POISON", "1")
+        .output()
+        .expect("spawn bliss-cli");
+    assert!(
+        out.status.success(),
+        "bytecode failed under GC stress\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "(2 40)",
+        "bytecode produced wrong output under GC stress"
+    );
+}
+
+#[test]
+fn gc_stress_mx_clean_macrolet_symbol_macrolet_labels() {
+    let _guard = gc_stress_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let program = "(progn
+        (defun run ()
+          (macrolet ((sq (x) `(* ,x ,x))
+                     (add3 (a b c) `(+ ,a ,b ,c))
+                     (twice (f x) `(,f (,f ,x)))
+                     (mklist (&rest xs) `(list ,@xs)))
+            (symbol-macrolet ((ten 10))
+              (labels ((f (n) (add3 (sq n) (twice sq n) ten)))
+                (mklist (f 1) (f 2) (f 3) (add3 ten ten (sq 4)))))))
+        (run))";
+
+    for backend in ["bytecode", "tree-walker"] {
+        let out = Command::new(BIN)
+            .args(["--no-init", "--eval", program])
+            .env("BLISS_BACKEND", backend)
+            .env("BLISS_HEAP_MB", "4096")
+            .env("BLISS_GC_STRESS", "8")
+            .env("BLISS_GC_POISON", "1")
+            .output()
+            .expect("spawn bliss-cli");
+        assert!(
+            out.status.success(),
+            "{backend} failed under GC stress\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "(12 30 100 36)",
             "{backend} produced wrong output under GC stress"
         );
     }

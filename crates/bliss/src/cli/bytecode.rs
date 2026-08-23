@@ -3446,8 +3446,9 @@ impl<'e> Lowerer<'e> {
             self.push_n(1);
             return Ok(());
         }
-        let (head, mut tail) = cp(form);
-        // Root the tail across the allocating lower_* recursion (moving GC; bliss-wlf).
+        let (mut head, mut tail) = cp(form);
+        // Root the head/tail across the allocating lower_* recursion (moving GC; bliss-wlf).
+        bliss_rt::rooted_ref!(_head_root = &mut head);
         bliss_rt::rooted_ref!(_tail_root = &mut tail);
         if head.is_symbol() {
             let name = sym_name(head);
@@ -3647,9 +3648,9 @@ impl<'e> Lowerer<'e> {
         let (values_form, mut body) = cp(r2);
         // Root the body across the allocating values-form lowering (moving GC; bliss-wlf).
         bliss_rt::rooted_ref!(_body_root = &mut body);
-        let vars = list_to_vec(vars_form);
-        for v in &vars {
-            if !v.is_symbol() {
+        bliss_rt::rooted!(vars = list_to_vec(vars_form));
+        for i in 0..vars.len() {
+            if !vars[i].is_symbol() {
                 return Err(Bail);
             }
         }
@@ -3664,8 +3665,8 @@ impl<'e> Lowerer<'e> {
         let saved_next_local = self.next_local;
         self.enter_scope();
         let slot_base = self.next_local;
-        for v in &vars {
-            self.alloc_slot(&sym_name(*v));
+        for i in 0..vars.len() {
+            self.alloc_slot(&sym_name(vars[i]));
         }
         self.emit(Instr::TakeValuesToLocals {
             nvars: vars.len() as u16,
@@ -3917,8 +3918,8 @@ impl<'e> Lowerer<'e> {
         if self.portable {
             return self.emit_portable_closure(params_form, body, &captured);
         }
-        let form = arena_cons(op, rest);
-        self.emit_closure(form, &captured)
+        bliss_rt::rooted!(form = arena_cons(op, rest));
+        self.emit_closure(*form, &captured)
     }
 
     /// `(function name)` / `#'(lambda …)` — a function designator or a closure.
@@ -3926,7 +3927,8 @@ impl<'e> Lowerer<'e> {
         // Root `rest` across the closure-form rebuild (resolve_sym/arena_cons can
         // fire a moving GC; bliss-wlf).
         bliss_rt::rooted_ref!(_rest_root = &mut rest);
-        let (target, _) = cp(rest);
+        let (mut target, _) = cp(rest);
+        bliss_rt::rooted_ref!(_target_root = &mut target);
         // `#'localfn` for a capturing flet/labels function is the closure value
         // itself, held in a boxed binding of its name — load it as a variable.
         if target.is_symbol() && self.closure_fns.contains(&sym_name(target)) {
@@ -3955,8 +3957,8 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         };
         let function_sym = resolve_sym("FUNCTION").ok_or(Bail)?;
-        let form = arena_cons(function_sym, rest);
-        self.emit_closure(form, &captured)
+        bliss_rt::rooted!(form = arena_cons(function_sym, rest));
+        self.emit_closure(*form, &captured)
     }
 
     /// `(flet ((name params body...)...) body...)` / `(labels (...) body...)`.
@@ -5394,7 +5396,10 @@ fn compile_function_in(
         bliss_rt::rooted_ref!(_progn_root = &mut progn);
         let menv = super::macroexpand_environment_from_cli(env);
         match compiler_macroexpand::macroexpand_all(progn, &menv) {
-            Ok(expanded) => *body = arena_cons(expanded, NIL),
+            Ok(mut expanded) => {
+                bliss_rt::rooted_ref!(_expanded_root = &mut expanded);
+                *body = arena_cons(expanded, NIL);
+            }
             Err(_) => {
                 let _ = record_bail(|| "macroexpand:macrolet".to_string());
                 return None;

@@ -751,8 +751,7 @@ fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
 /// Perform one step of macro expansion (CLHS `macroexpand-1`).
 /// Returns `(expanded_form, expanded_p)`.
 ///
-/// If form has a SymbolMacro binding in env, invokes the macroexpand hook
-/// with (expansion_value, expansion_value, env) and returns (result, true).
+/// If form has a SymbolMacro binding in env, returns the expansion value.
 ///
 /// If form is a cons whose car is a symbol with a Macro function binding,
 /// invokes the macroexpand hook with (expander, form, env) and returns
@@ -768,11 +767,8 @@ pub fn macroexpand_1(
 ) -> Result<(BlissVal, bool), BlissError> {
     bliss_rt::rooted_ref!(_form_root = &mut form);
     // 1. Check if form is a symbol with a symbol-macro binding
-    if let Some(VariableInfo::SymbolMacro(mut expansion)) = env.variable_information(form) {
-        bliss_rt::rooted_ref!(_expansion_root = &mut expansion);
-        let hook = get_macroexpand_hook();
-        let result = hook(expansion, expansion, env)?;
-        return Ok((result, true));
+    if let Some(VariableInfo::SymbolMacro(expansion)) = env.variable_information(form) {
+        return Ok((expansion, true));
     }
 
     // 2. Check if form is a cons with a macro operator
@@ -1494,11 +1490,12 @@ fn expand_lambda_call(
     bliss_rt::rooted_ref!(_expanded_lambda_root = &mut expanded_lambda);
 
     // Expand the arguments
-    let expanded_args = if args.is_cons() {
+    let mut expanded_args = if args.is_cons() {
         walk_cons(args, env)?
     } else {
         args
     };
+    bliss_rt::rooted_ref!(_expanded_args_root = &mut expanded_args);
 
     if expanded_lambda == operator && expanded_args == args {
         Ok(form)

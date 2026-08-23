@@ -1547,7 +1547,7 @@ fn bliss_error_to_condition(
     error: &BlissError,
 ) -> Result<Option<BlissVal>, BlissError> {
     let name_sym = resolve_sym("NAME").unwrap_or(NIL);
-    let condition = match error {
+    let mut condition = match error {
         BlissError::TypeError { datum, expected } => build_condition_instance(
             env,
             "TYPE-ERROR",
@@ -1592,6 +1592,7 @@ fn bliss_error_to_condition(
         BlissError::ProgramError(_) => build_condition_instance(env, "PROGRAM-ERROR", &[])?,
         _ => return Ok(None),
     };
+    bliss_rt::rooted_ref!(_condition_root = &mut condition);
     Ok(Some(condition))
 }
 
@@ -6645,13 +6646,13 @@ fn eval_form_collecting_values(
     env: &mut Env,
 ) -> Result<(BlissVal, Vec<BlissVal>), BlissError> {
     env.clear_mv();
-    let primary = eval_form(form, env)?;
+    bliss_rt::rooted!(primary = eval_form(form, env)?);
     let values = if env.mv_active {
         env.mv.clone()
     } else {
-        vec![primary]
+        vec![*primary]
     };
-    Ok((primary, values))
+    Ok((*primary, values))
 }
 
 fn cp(val: BlissVal) -> (BlissVal, BlissVal) {
@@ -14272,8 +14273,8 @@ fn eval_cmp(
     // Root the second arg form before evaluating the first (bliss-6b2 #2).
     bliss_rt::rooted!(bf = cp(r).0);
     bliss_rt::rooted!(a = eval_form(af, env)?);
-    let b = eval_form(*bf, env)?;
-    Ok(if pred(numeric_cmp(*a, b)?) { T } else { NIL })
+    bliss_rt::rooted!(b = eval_form(*bf, env)?);
+    Ok(if pred(numeric_cmp(*a, *b)?) { T } else { NIL })
 }
 
 /// Evaluate each form in `forms`, keeping the results GC-rooted across the whole
@@ -14357,8 +14358,8 @@ fn symbol_plist_put(sym: BlissVal, key: BlissVal, val: BlissVal) {
     bliss_rt::rooted!(plist = bliss_rt::symbols::symbol_plist(idx).unwrap_or(NIL));
     bliss_rt::rooted!(key_r = key);
     bliss_rt::rooted!(inner = arena_cons(val, *plist));
-    let new_plist = arena_cons(*key_r, *inner);
-    bliss_rt::symbols::set_symbol_plist(idx, new_plist);
+    bliss_rt::rooted!(new_plist = arena_cons(*key_r, *inner));
+    bliss_rt::symbols::set_symbol_plist(idx, *new_plist);
 }
 
 fn seq_elements(seq: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
@@ -14795,7 +14796,8 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
 }
 
 fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (defs_form, body) = cp(cdr);
+    let (defs_form, mut body) = cp(cdr);
+    bliss_rt::rooted_ref!(_body_root = &mut body);
     let mut child_env = env.child();
     let mut c = defs_form;
     while c.is_cons() {
@@ -16395,7 +16397,7 @@ fn eval_macroexpand(
     bliss_rt::rooted_ref!(_rest_root = &mut rest);
     let mut form = eval_form(form_expr, env)?;
     bliss_rt::rooted_ref!(_form_root = &mut form);
-    let macro_env = if rest.is_cons() {
+    let mut macro_env = if rest.is_cons() {
         let (env_expr, _) = cp(rest);
         let env_value = eval_form(env_expr, env)?;
         load_macroexpand_environment(env_value).ok_or_else(|| {
@@ -16404,6 +16406,7 @@ fn eval_macroexpand(
     } else {
         macroexpand_environment_from_cli(env)
     };
+    bliss_rt::rooted_ref!(_macro_env_root = &mut macro_env);
     let (expanded, expanded_p) = if single_step {
         compiler_macroexpand::macroexpand_1(form, &macro_env)?
     } else {
@@ -16475,9 +16478,10 @@ fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
 
 // ── DEFCLASS ─────────────────────────────────────────────────────
 fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (name_form, rest) = cp(cdr);
+    let (mut name_form, rest) = cp(cdr);
     let (supers_form, rest2) = cp(rest);
     let (slots_form, class_options) = cp(rest2);
+    bliss_rt::rooted_ref!(_name_form_root = &mut name_form);
 
     let name = sym_name(name_form);
 
@@ -16512,9 +16516,9 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
     // Parse superclasses
     let mut supers = Vec::new();
-    let super_list = list_to_vec(supers_form);
-    for s in &super_list {
-        supers.push(sym_name(*s));
+    bliss_rt::rooted!(super_list = list_to_vec(supers_form));
+    for i in 0..super_list.len() {
+        supers.push(sym_name(super_list[i]));
     }
 
     // Parse slots. The slot-spec conses, the accumulated SlotDefs (their
@@ -16902,9 +16906,10 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         Some(p) => vec_to_list(&[p]),
         None => NIL,
     };
+    bliss_rt::rooted!(name_sym_r = name_sym);
     let defclass_form = vec_to_list(&[
         sym("DEFCLASS"),
-        name_sym,
+        *name_sym_r,
         supers,
         vec_to_list(&slot_clauses),
     ]);
@@ -16986,18 +16991,19 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     ]);
     eval_form(copy_defun, env)?;
 
-    Ok(name_sym)
+    Ok(*name_sym_r)
 }
 
 // ── DEFGENERIC ───────────────────────────────────────────────────
 fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (name_form, options) = cp(cdr);
+    let (mut name_form, options) = cp(cdr);
+    bliss_rt::rooted_ref!(_name_form_root = &mut name_form);
     let name = function_name_key(name_form);
     let mut combination = bliss_stdlib::MethodCombinationType::Standard;
     // `(:method qualifier* specialized-lambda-list body...)` options each define a
     // method; collect their tails so they can be registered after the generic
     // function exists (with its method combination already known).
-    let mut method_options: Vec<BlissVal> = Vec::new();
+    bliss_rt::rooted!(method_options = Vec::<BlissVal>::new());
     let mut opts = options;
     while opts.is_cons() {
         let (option, rest) = cp(opts);
@@ -17030,8 +17036,8 @@ fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     // Register each :method option by delegating to DEFMETHOD: the option tail
     // `(qualifier* specialized-lambda-list body...)` is exactly a DEFMETHOD cdr
     // once the generic-function name is consed on the front.
-    for method_option in method_options {
-        let defmethod_cdr = arena_cons(name_form, method_option);
+    for i in 0..method_options.len() {
+        let defmethod_cdr = arena_cons(name_form, method_options[i]);
         eval_defmethod(defmethod_cdr, env)?;
     }
     Ok(name_form)
@@ -17039,7 +17045,8 @@ fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
 
 // ── DEFMETHOD ────────────────────────────────────────────────────
 fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (name_form, rest) = cp(cdr);
+    let (mut name_form, rest) = cp(cdr);
+    bliss_rt::rooted_ref!(_name_form_root = &mut name_form);
     // A `(setf place)` method name is a cons; key it as "(SETF PLACE)" so SETF
     // can find the writer generic (bliss-lb6.14).
     let name = function_name_key(name_form);
@@ -17071,7 +17078,9 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         }
         cursor = tail;
     }
-    let (spec_params_form, body) = cp(cursor);
+    let (mut spec_params_form, mut body) = cp(cursor);
+    bliss_rt::rooted_ref!(_spec_params_form_root = &mut spec_params_form);
+    bliss_rt::rooted_ref!(_body_root = &mut body);
     let method_id = next_stdlib_class_id();
 
     // Parse the specialized lambda list. Required parameters (before any
@@ -17079,30 +17088,31 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     // once a keyword such as &optional/&rest/&key/&aux is seen, the remaining
     // parameters are ordinary (unspecialized) and are passed through verbatim so
     // the standard lambda-list binder handles them.
-    let params_list = list_to_vec(spec_params_form);
+    bliss_rt::rooted!(params_list = list_to_vec(spec_params_form));
     let mut specializers = Vec::new();
-    let mut plain_params: Vec<BlissVal> = Vec::new();
+    bliss_rt::rooted!(plain_params = Vec::<BlissVal>::new());
     let mut past_required = false;
 
-    for p in &params_list {
+    for i in 0..params_list.len() {
+        let p = params_list[i];
         if p.is_symbol() {
-            let bare = symbol_bare_name(&sym_name(*p));
+            let bare = symbol_bare_name(&sym_name(p));
             if bare.starts_with('&') {
                 past_required = true;
-                plain_params.push(*p);
+                plain_params.push(p);
                 continue;
             }
-            plain_params.push(*p);
+            plain_params.push(p);
             if !past_required {
                 specializers.push(MethodSpecializer::Any);
             }
         } else if p.is_cons() {
             if past_required {
                 // &optional/&key parameter with a default form, e.g. (y 10).
-                plain_params.push(*p);
+                plain_params.push(p);
                 continue;
             }
-            let (var_form, rest_p) = cp(*p);
+            let (var_form, rest_p) = cp(p);
             plain_params.push(var_form);
             let (class_form, _) = cp(rest_p);
             if class_form.is_cons() {
@@ -17122,7 +17132,7 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
             }
         }
     }
-    let lambda_list = vec_to_list(&plain_params);
+    bliss_rt::rooted!(lambda_list = vec_to_list(&plain_params));
 
     let generic_function = if let Some(generic) = env.generics.borrow().get(&name).cloned() {
         generic.generic_function
@@ -17147,7 +17157,7 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         .push(MethodDef {
             method_id,
             specializers,
-            lambda_list,
+            lambda_list: *lambda_list,
             qualifier,
             body,
         });
@@ -17197,8 +17207,8 @@ fn install_slot_accessor_method(
     bliss_rt::rooted!(lambda_list_r = lambda_list);
     bliss_rt::rooted!(body_tail = vec_to_list(&[body]));
     bliss_rt::rooted!(inner = arena_cons(*lambda_list_r, *body_tail));
-    let defmethod_cdr = arena_cons(*method_name_r, *inner);
-    eval_defmethod(defmethod_cdr, env)?;
+    bliss_rt::rooted!(defmethod_cdr = arena_cons(*method_name_r, *inner));
+    eval_defmethod(*defmethod_cdr, env)?;
     Ok(())
 }
 
@@ -17207,8 +17217,8 @@ fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     let (class_form, mut init_args) = cp(cdr);
     // Root across the allocating class-form evaluation (moving GC; bliss-8qf).
     bliss_rt::rooted_ref!(_initargs_root = &mut init_args);
-    let class_input = eval_form(class_form, env)?;
-    let class = resolve_class_metaobject(env, class_input)?;
+    bliss_rt::rooted!(class_input = eval_form(class_form, env)?);
+    let class = resolve_class_metaobject(env, *class_input)?;
     let class_name = class_name_for_instance_class(class);
     let mut initargs = evaluated_initargs(&class_name, init_args, env)?;
 
@@ -17834,7 +17844,7 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
 
     // Evaluate the values form
     env.clear_mv();
-    let primary = eval_form(values_form, env)?;
+    bliss_rt::rooted!(primary = eval_form(values_form, env)?);
     let mv = env.mv.clone();
 
     // Bind variables in a fresh frame on the SAME env (see eval_let) so that
@@ -17848,7 +17858,7 @@ fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, Bl
     with_child_frame(env, parent, move |env| {
         for (i, var_name) in var_names.iter().enumerate() {
             let val = if i == 0 {
-                primary
+                *primary
             } else if i < mv.len() {
                 mv[i]
             } else {
@@ -17957,7 +17967,8 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
 
 // ── HANDLER-BIND ────────────────────────────────────────────────
 fn eval_handler_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (bindings_form, body) = cp(cdr);
+    let (bindings_form, mut body) = cp(cdr);
+    bliss_rt::rooted_ref!(_body_root = &mut body);
     let base_len = env.handlers.len();
 
     // Parse all bindings into one cluster (this HANDLER-BIND form), in source
@@ -18125,20 +18136,21 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
 // ── CERROR ───────────────────────────────────────────────────────
 fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (_continue_form, rest) = cp(cdr);
-    let (datum_form, arg_forms) = cp(rest);
-    let datum = eval_form(datum_form, env)?;
+    let (datum_form, mut arg_forms) = cp(rest);
+    bliss_rt::rooted_ref!(_arg_forms_root = &mut arg_forms);
+    bliss_rt::rooted!(datum = eval_form(datum_form, env)?);
     let args = eval_args(arg_forms, env)?;
     // (cerror continue-control datum &rest args): datum may be a condition
     // instance, a condition-type symbol (built via MAKE-CONDITION), or a
     // format-control string (→ SIMPLE-ERROR).
-    let message = if is_string_value(datum) {
-        format_control_message(&val_as_str(datum), &args)?
+    let message = if is_string_value(*datum) {
+        format_control_message(&val_as_str(*datum), &args)?
     } else {
-        val_as_str(datum)
+        val_as_str(*datum)
     };
-    let condition = match coerce_condition_designator(env, datum, &args)? {
+    let condition = match coerce_condition_designator(env, *datum, &args)? {
         Some(condition) => condition,
-        None => make_simple_condition("SIMPLE-ERROR", datum, &args, env)?,
+        None => make_simple_condition("SIMPLE-ERROR", *datum, &args, env)?,
     };
 
     let base_len = env.restarts.len();
@@ -18266,7 +18278,8 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
 
 // ── DEFPACKAGE ──────────────────────────────────────────────────
 fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (name_form, opts) = cp(cdr);
+    let (name_form, mut opts) = cp(cdr);
+    bliss_rt::rooted_ref!(_opts_root = &mut opts);
     // DEFPACKAGE's name is a package DESIGNATOR and is NOT evaluated (CLHS): a
     // string, or a symbol (interned OR uninterned, e.g. `#:ocicl-runtime`) whose
     // name is used. Evaluating it would look an uninterned symbol up as a
@@ -18276,7 +18289,8 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     } else if is_string_value(name_form) {
         val_as_str(name_form)
     } else {
-        val_as_str(eval_form(name_form, env)?)
+        bliss_rt::rooted!(name_value = eval_form(name_form, env)?);
+        val_as_str(*name_value)
     };
     let pkg_name = name_raw
         .trim_start_matches("KEYWORD:")
@@ -18411,8 +18425,8 @@ fn eval_format(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     bliss_rt::rooted!(dest = eval_form(df, env)?);
     let (ff, fa) = cp(*r);
     bliss_rt::rooted!(fa = fa);
-    let fv = eval_form(ff, env)?;
-    let fs = val_as_str(fv);
+    bliss_rt::rooted!(fv = eval_form(ff, env)?);
+    let fs = val_as_str(*fv);
     let av = eval_args(*fa, env)?;
     // Park the env so the formatter's `~A`/`~S` can dispatch user print-object
     // methods (via stdlib_print_object_hook → dispatch_print_object).
@@ -18686,12 +18700,12 @@ fn toplevel_symbol(form: BlissVal, env: &mut Env) -> Result<Option<BlissVal>, Bl
             }
         }
     }
-    let v = eval_form(form, env)?;
+    bliss_rt::rooted!(v = eval_form(form, env)?);
     if v.is_symbol() {
-        return Ok(Some(v));
+        return Ok(Some(*v));
     }
-    if bliss_rt::function::is_interpreted_function(v) {
-        let n = bliss_rt::function::name(v);
+    if bliss_rt::function::is_interpreted_function(*v) {
+        let n = bliss_rt::function::name(*v);
         if n.is_symbol() {
             return Ok(Some(n));
         }
