@@ -2589,8 +2589,16 @@ fn t0_default_config() -> GcConfig {
 /// Ensure the shared GC heap is initialized (idempotent) so the interpreter can
 /// allocate without an explicit runtime boot.
 fn ensure_heap_initialized() {
-    let initialized = heap_state().lock().unwrap().is_some();
-    if !initialized {
+    // Serialize auto-boot: the check-and-init must be atomic. Two threads that
+    // both observe an uninitialized heap would both call init_heap, which
+    // unconditionally re-mmaps the heap and drops (munmaps) the previous
+    // HeapState — leaving a concurrent allocator writing into a freed mapping,
+    // i.e. a SIGSEGV (bliss-52k). A dedicated lock (NOT the heap lock, which
+    // init_heap re-acquires internally) closes the TOCTOU; unlike a `Once` it
+    // still permits a legitimate re-boot after an explicit shutdown.
+    static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serialize = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if heap_state().lock().unwrap().is_none() {
         let _ = init_heap(&t0_default_config());
     }
 }
