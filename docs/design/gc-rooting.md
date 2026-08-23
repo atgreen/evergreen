@@ -265,8 +265,34 @@ Part A's core is implemented and validated:
 
   **32.5×** on the root-op hot path.
 
-**Not yet done from Part A:** the per-safepoint `published_root_head` publish in
-thread.rs (the PoC scanner reads live head cells under the STW quiescence
-contract, same as the existing registries — adequate until bliss-h6z tightens
-cross-thread STW); and migrating the remaining `StackRoot`/`HostRoot`/bespoke
-users (plan §7 step 4).
+**Not yet done from Part A:** migrating the remaining
+`StackRoot`/`HostRoot`/bespoke users (plan §7 step 4 — tracked as bliss-yab).
+
+## 10. Amendments from the migration (bliss-yab / bliss-jaf)
+
+- **`RootedRef<T>` / `rooted_ref!`** — the borrowed-target counterpart of
+  `Rooted`: roots EXISTING data (a local, a `Vec`, an `Env`/`Lowerer`/
+  `Environment` struct) in place on the same intrusive list, with `StackRoot`'s
+  released-borrow contract (caller keeps the target live and immobile). This is
+  what `StackRoot`/`VecRootGuard`/`LiveEnvRootGuard`/`LowererConstGuard`/
+  `ExpansionEnvGuard` migrate to; `TraceHostRoots` impls for `Env`, `Lowerer`,
+  and `Environment` let one guard root a whole struct via its existing
+  `visit_gc_roots`.
+- **Cross-thread publication resolved without new machinery:** the registered
+  head-cell address (stable for the thread's lifetime, deregistered by a TLS
+  destructor) *is* the thread's published root list. A separate per-safepoint
+  `published_root_head` atomic would be redundant — nothing would read it until
+  the bliss-h6z.5 STW protocol exists, and that protocol only needs the
+  quiescence guarantee it must provide for every legacy registry anyway.
+  Recorded as a handoff note on bliss-h6z.5.
+- **Fiber constraint (inherited, now documented):** root guards link onto the
+  *carrier* thread's list, so a fiber must not suspend across a live guard.
+  This is the same constraint the `ThreadId`-keyed legacy registries already
+  imposed; bliss-h6z.5 must design for it if guard scopes ever span suspension
+  points.
+- **Part B rung 1 shipped as `tools/gc-root-lint`** (bliss-jaf): a syn-based
+  checker flagging producer-bound / `BlissVal`-typed locals read after a
+  known-allocating call without rooting, ratcheted by a checked-in baseline
+  (`--check` fails only on findings not in `tools/gc-root-lint/baseline.txt`;
+  `--bless` regenerates it). Keys are `file:function:variable` so unrelated
+  edits don't churn the baseline.

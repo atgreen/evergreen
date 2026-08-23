@@ -1272,8 +1272,7 @@ fn alloc_stream(
     // newer composite before all of its older components.
     static NEXT_STREAM_ORDER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(u64::MAX);
-    let roots = bliss_rt::ShadowRootScope::new();
-    let component_roots = roots.root_values(components.iter().copied());
+    bliss_rt::rooted!(component_roots = components.clone());
     // The Rust-owned state lives in an off-heap Box (stable address; never
     // relocated by the moving GC). `components` is stored beside the mutex so
     // the GC can trace it lock-free; the mutable state gets a raw back-pointer
@@ -1304,8 +1303,8 @@ fn alloc_stream(
         .expect("GC heap unavailable for stream handle");
     // The handle is now the traceable owner. Publish any component forwarding
     // performed while it was being allocated before exposing the handle.
-    for (component, root) in boxed.components.iter_mut().zip(&component_roots) {
-        *component = root.get();
+    for (component, root) in boxed.components.iter_mut().zip(component_roots.iter()) {
+        *component = *root;
     }
     let box_ptr = Box::into_raw(boxed) as u64;
     unsafe {

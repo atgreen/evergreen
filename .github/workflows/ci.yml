@@ -22,5 +22,7 @@ jobs:
         run: cargo test --workspace
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: gc-root-lint (bliss-jaf — new unrooted-across-alloc candidates fail)
+        run: bash scripts/gc-root-lint.sh
       - name: ansi-test
         run: cargo test -p bliss --test spec_validation_infra ansi_expected_failures_and_ci_contracts

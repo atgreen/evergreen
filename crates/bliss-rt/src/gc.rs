@@ -2557,6 +2557,20 @@ mod shadow_root_scope_tests {
 // list during STW, when mutators are parked and the lists are quiescent (the
 // same quiescence the existing registries rely on).
 //
+// Cross-thread publication: the registered head-cell address IS this thread's
+// published root list — a stable location the collector reads while the thread
+// is parked. When the native-thread STW protocol lands (bliss-h6z.5), its
+// safepoint parking must guarantee quiescence of these lists exactly as it
+// must for the mutex-guarded registries above; no separate per-safepoint
+// republication is needed because the cell's address never changes.
+//
+// Fiber caveat (same constraint as StackRoot/HostRoot, inherited not new): a
+// root guard links onto the CARRIER thread's list, so a fiber must not suspend
+// (context-switch off its carrier) while a Rooted/RootedRef guard is live —
+// unlinking on a different carrier would corrupt both lists. Evaluator code
+// holding these guards runs to completion on one carrier today; revisit under
+// bliss-h6z.5 if guard scopes ever span suspension points.
+//
 // A linked node must not move (the list holds its address), which plain Rust
 // cannot express for a by-value local — so the ONLY blessed constructor is the
 // `rooted!` macro: it creates the unlinked node as a hidden local, then shadows
@@ -2751,6 +2765,105 @@ macro_rules! rooted {
     };
 }
 
+/// The borrowed-target counterpart of [`Rooted`]: an intrusive node that roots
+/// EXISTING data in place (a Rust local, a `Vec`, an `Env`/`Lowerer` struct)
+/// instead of owning a value. This is `StackRoot`/`VecRootGuard`/
+/// `LiveEnvRootGuard` semantics — the target keeps being read and written
+/// directly by the surrounding code and the GC rewrites it in place — but on
+/// the lock-free thread-local list instead of the mutex-guarded registries.
+///
+/// Like those guards, the borrow on the target is released immediately (a raw
+/// pointer is stored), so the CALLER must keep the target immobile and live for
+/// the guard's extent — same contract as `StackRoot` today. The node itself is
+/// pinned by the [`rooted_ref!`] macro's guard-shadowing, like [`rooted!`].
+#[repr(C)]
+pub struct RootedRef<T: TraceHostRoots> {
+    link: RootLink,
+    target: *mut T,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+unsafe fn trace_rooted_ref<T: TraceHostRoots>(
+    link: *mut RootLink,
+    visit: &mut dyn FnMut(*mut BlissVal),
+) {
+    // SAFETY: `link` is the first field of a live, immobile `RootedRef<T>`
+    // (repr(C)), and its target outlives the guard per the caller contract.
+    unsafe { (*(*(link as *mut RootedRef<T>)).target).trace_host_roots(visit) };
+}
+
+impl<T: TraceHostRoots> RootedRef<T> {
+    /// An UNLINKED node over `target`. Not scanned until a [`RootedRefGuard`]
+    /// links it; use the [`rooted_ref!`] macro rather than calling this
+    /// directly.
+    pub fn new_unlinked(target: &mut T) -> Self {
+        RootedRef {
+            link: RootLink {
+                next: std::ptr::null_mut(),
+                trace: trace_rooted_ref::<T>,
+            },
+            target: target as *mut T,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+/// Links a [`RootedRef`] for its lifetime and unlinks on drop (LIFO fast path,
+/// mid-list tolerated), exactly like [`RootedGuard`].
+pub struct RootedRefGuard<'r, T: TraceHostRoots> {
+    node: &'r mut RootedRef<T>,
+}
+
+impl<'r, T: TraceHostRoots> RootedRefGuard<'r, T> {
+    pub fn new(node: &'r mut RootedRef<T>) -> Self {
+        ROOTED_HEAD_REGISTRATION.with(|_| {});
+        ROOTED_HEAD.with(|head| {
+            node.link.next = head.get();
+            head.set(&mut node.link as *mut RootLink);
+        });
+        RootedRefGuard { node }
+    }
+}
+
+impl<T: TraceHostRoots> Drop for RootedRefGuard<'_, T> {
+    fn drop(&mut self) {
+        let target = &mut self.node.link as *mut RootLink;
+        ROOTED_HEAD.with(|head| {
+            let first = head.get();
+            if first == target {
+                head.set(self.node.link.next);
+                return;
+            }
+            let mut cursor = first;
+            while !cursor.is_null() {
+                // SAFETY: list nodes are live linked roots on this thread.
+                unsafe {
+                    if (*cursor).next == target {
+                        (*cursor).next = (*target).next;
+                        return;
+                    }
+                    cursor = (*cursor).next;
+                }
+            }
+            unreachable!("RootedRefGuard dropped but its node is not on the root list");
+        });
+    }
+}
+
+/// Root EXISTING data in place for the current lexical scope:
+/// `rooted_ref!(_g = &mut local)` keeps `local` scanned and rewritten by the GC
+/// while `_g` is live — the drop-in replacement for
+/// `let _g = StackRoot::new(&mut local)` (and `VecRootGuard` /
+/// `LiveEnvRootGuard`-style struct rooting, given a `TraceHostRoots` impl),
+/// with O(1) lock-free link/unlink.
+#[macro_export]
+macro_rules! rooted_ref {
+    ($name:ident = $target:expr) => {
+        let mut $name = $crate::gc::RootedRef::new_unlinked($target);
+        let $name = $crate::gc::RootedRefGuard::new(&mut $name);
+    };
+}
+
 #[cfg(test)]
 mod rooted_tests {
     use super::*;
@@ -2834,6 +2947,33 @@ mod rooted_tests {
         });
         assert!(result.is_err());
         assert_eq!(list_len(), 0);
+    }
+
+    #[test]
+    fn rooted_ref_scans_target_in_place() {
+        let mut local = BlissVal::from_fixnum(41);
+        let mut vec = vec![BlissVal::from_fixnum(42), BlissVal::from_fixnum(43)];
+        {
+            rooted_ref!(_a = &mut local);
+            rooted_ref!(_b = &mut vec);
+            assert_eq!(list_len(), 2);
+            let mut seen = Vec::new();
+            scan_local(&mut |slot| seen.push(unsafe { *slot }));
+            assert_eq!(seen.len(), 3);
+            for expected in [41, 42, 43] {
+                assert!(seen.contains(&BlissVal::from_fixnum(expected)));
+            }
+            // The scanner writes through to the ORIGINAL storage (in-place
+            // rewrite), which is the whole point of the borrowed variant.
+            scan_local(&mut |slot| unsafe {
+                if *slot == BlissVal::from_fixnum(41) {
+                    *slot = BlissVal::from_fixnum(410);
+                }
+            });
+        }
+        assert_eq!(list_len(), 0);
+        assert_eq!(local, BlissVal::from_fixnum(410));
+        assert_eq!(vec[0], BlissVal::from_fixnum(42));
     }
 }
 

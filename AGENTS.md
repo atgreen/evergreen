@@ -68,13 +68,24 @@ recurring, hard-to-spot bugs (bliss-6b2 / asdf-6b2 / h6z / 011) — hold the lin
 1. **Root every Rust-local `BlissVal` that must survive an allocation.** A
    `BlissVal` held only in a Rust local, register, or `Vec` across an alloc that
    can GC is invisible to the collector: the object moves and your copy is a
-   stale (or poisoned) pointer. Wrap the live values in a `ShadowRootScope`
-   (`bliss_rt::ShadowRootScope::new()` → `roots.root(v)` → `r.get()` for the
-   post-GC address), or `VecRootGuard` / `StackRoot`. The evaluator's own code is
-   the template: see `evaluated_initargs` and `eval_make_instance` in cli.rs.
+   stale (or poisoned) pointer. Use the intrusive lock-free root macros
+   (bliss-a03; docs/design/gc-rooting.md):
+
+   ```rust
+   bliss_rt::rooted!(v = eval_form(expr, env)?);   // OWNS v; read/write as *v
+   bliss_rt::rooted_ref!(_g = &mut existing);      // roots EXISTING local/Vec/
+                                                   // struct in place; keep
+                                                   // using `existing` directly
+   ```
+
+   `rooted_ref!` also roots whole structs (`Env`, `Lowerer`, `Environment`)
+   via their `TraceHostRoots` impls. The legacy `ShadowRootScope`/`StackRoot`/
+   `HostRoot` primitives still exist in bliss-rt but new code should not add
+   uses — they cost a global lock per operation and are queued for removal.
    Classic smell: `let v = eval_form(..)?; <more eval_form/alloc>; use(v)` with
-   `v` unrooted, or pushing into a `Vec` and calling `eval_form` again before the
-   `Vec` is rooted.
+   `v` unrooted, or pushing into a `Vec` and calling `eval_form` again before
+   the `Vec` is rooted. CI runs `scripts/gc-root-lint.sh` (ratcheted baseline
+   in tools/gc-root-lint/baseline.txt) to catch new instances of this smell.
 
 2. **Never hold a `RefCell` borrow (or a raw `&mut`) to GC-scanned state across
    an allocation.** The registered root scanners re-enter those cells during a

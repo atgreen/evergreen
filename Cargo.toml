@@ -5,6 +5,7 @@ members = [
     "crates/bliss-compiler",
     "crates/bliss-stdlib",
     "crates/bliss",
+    "tools/gc-root-lint",
 ]
 
 [workspace.package]
