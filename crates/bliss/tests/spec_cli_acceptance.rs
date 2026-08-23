@@ -140,7 +140,15 @@ fn script_mode_executes_the_positional_script_entrypoint() {
 fn repl_acceptance_drives_the_real_binary_through_read_eval_print_and_exit() {
     // Per R6.01, the REPL MUST implement ANSI read-eval-print loop semantics.
     // Per R10.06, this acceptance test drives the real CLI through stdin/stdout.
+    // Isolate the init file (bliss-5s3): without this the REPL loads the
+    // developer's ambient ~/.blissrc — a full ASDF bootstrap — which under a
+    // debug build takes minutes and hangs the test. This test only needs a
+    // hermetic read-eval-print, so point at a nonexistent init file.
     let mut child = bliss()
+        .env(
+            "BLISS_INIT_FILE",
+            temp_dir("repl").join("nonexistent-init.lisp"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
