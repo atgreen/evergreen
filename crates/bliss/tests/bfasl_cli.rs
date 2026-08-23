@@ -1836,3 +1836,52 @@ fn compiled_capturing_closure_is_a_function_for_typep_and_functionp() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn bfasl_setf_writer_dispatches_from_top_level_setf() {
+    // bliss-d0b: a `(defun (setf place) …)` writer compiled into a .bfasl is
+    // installed on the mangled BLISS-INTERNAL %SETF-WRITER-place symbol. When a
+    // FRESH process loads that .bfasl it lands in the symbol's function cell as an
+    // interpreted function (not the bytecode registry). A subsequent tree-walked
+    // `(setf (place …) v)` must still find and call it — the SETF store path used
+    // to gate on the bytecode registry and look the symbol up via the reader
+    // (which normalises PKG::NAME to PKG:NAME, a different symbol), so it failed
+    // with "SETF: unsupported place". This is how babel's
+    // `(setf (get-abstract-mapping …))` broke under `asdf:load-system`.
+    let dir = workdir("bfasl-setf-writer");
+    let src = dir.join("w.lisp");
+    let out = dir.join("w.bfasl");
+    fs::write(
+        &src,
+        "(defparameter *h* (make-hash-table))\n\
+         (defun gm (e) (gethash e *h*))\n\
+         (defun (setf gm) (v e) (setf (gethash e *h*) v))\n",
+    )
+    .unwrap();
+
+    let compile = run(&format!(
+        "(compile-file #p\"{}\" :output-file #p\"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(compile.status.success(), "compile-file failed");
+
+    // Fresh process: load the .bfasl, then a TOP-LEVEL (tree-walked) setf.
+    let loaded = run(&format!(
+        "(progn (load \"{}\") (setf (gm :y) 99) (format t \"R[~A]\" (gm :y)))",
+        out.display()
+    ));
+    let stdout = String::from_utf8_lossy(&loaded.stdout);
+    assert!(
+        loaded.status.success(),
+        "top-level setf of a bfasl-loaded writer failed: {stdout}\n{}",
+        String::from_utf8_lossy(&loaded.stderr),
+    );
+    assert!(
+        stdout.contains("R[99]"),
+        "expected R[99]; got: {stdout}, stderr: {}",
+        String::from_utf8_lossy(&loaded.stderr),
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

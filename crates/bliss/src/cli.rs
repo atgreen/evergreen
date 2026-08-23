@@ -8357,27 +8357,32 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         val.get(),
                                         env,
                                     )?;
-                                } else if let Some(writer_sym) = resolve_sym(
+                                } else if let Some(writer_sym) = bliss_rt::symbols::find_index(
                                     &setf_writer_symbol_name(other),
                                 )
-                                .filter(|s| bytecode::is_registered(s.as_symbol_index()))
+                                .filter(|&idx| {
+                                    bytecode::is_registered(idx)
+                                        || bliss_rt::symbols::symbol_function(idx)
+                                            .is_some_and(|f| f != bliss_rt::value::UNBOUND)
+                                })
+                                .map(BlissVal::from_symbol_index)
                                 {
                                     // A source-free `(defun (setf place) …)` writer
-                                    // installed from a .bfasl: dispatch its
-                                    // registered bytecode with the new value first,
-                                    // then the place's subforms.
+                                    // installed from a .bfasl on the mangled
+                                    // %SETF-WRITER-place symbol. It may be bytecode
+                                    // OR interpreted (a fresh process loading the
+                                    // .bfasl installs it as an interpreted function
+                                    // cell), so dispatch through apply_function,
+                                    // which handles both — the old `is_registered`
+                                    // gate rejected the interpreted case and SETF
+                                    // then failed with "unsupported place" (bliss-d0b:
+                                    // e.g. babel's `(setf (get-abstract-mapping …))`).
+                                    // New value first, then the place's subforms.
                                     let mut args = RootedVals::new(vec![val.get()]);
                                     for v in eval_args(aargs.get(), env)?.iter() {
                                         args.push(*v);
                                     }
-                                    if let Some(res) = bytecode::call_registered(
-                                        writer_sym.as_symbol_index(),
-                                        &args,
-                                        writer_sym,
-                                        env,
-                                    ) {
-                                        res?;
-                                    }
+                                    apply_function(writer_sym, &args, env)?;
                                 } else if let Some((params_form, body)) =
                                     callable_body(env, &format!("(SETF {})", other))
                                 {
