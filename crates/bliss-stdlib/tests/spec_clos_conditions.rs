@@ -31,15 +31,28 @@ fn fx(i: i64) -> BlissVal {
     BlissVal::from_fixnum(i)
 }
 
-fn reset_state() {
+fn test_lock() -> &'static Mutex<()> {
+    static L: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+}
+
+/// Reset shared CLOS/GC state and return a serialization guard. Every test in
+/// this binary holds it for its whole body: they share the process-global GC
+/// heap and CLOS bootstrap state, and racing on it under cargo's parallel test
+/// harness corrupts the heap -> SIGSEGV (bliss-110). Recover from a poisoned
+/// lock so one panicking test does not cascade-fail the rest.
+#[must_use = "hold the returned guard for the whole test to keep it serialized"]
+fn reset_state() -> std::sync::MutexGuard<'static, ()> {
+    let guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     bootstrap_clos().expect("bootstrap_clos");
     clear_funcall_hook();
     set_debugger_hook(None);
+    guard
 }
 
 #[test]
 fn clos_bootstrap_exposes_core_classes_and_rejects_builtin_instantiation() {
-    reset_state();
+    let _guard = reset_state();
 
     // Per R5.87 and R11.03, built-in classes participate in the hierarchy
     // but are not user-instantiable through the public CLOS entrypoints.
@@ -61,7 +74,7 @@ fn clos_bootstrap_exposes_core_classes_and_rejects_builtin_instantiation() {
 
 #[test]
 fn clos_class_definition_tracks_slots_subclasses_and_c3_order() {
-    reset_state();
+    let _guard = reset_state();
 
     let class_a = fx(3001);
     let class_b = fx(3002);
@@ -94,7 +107,7 @@ fn clos_class_definition_tracks_slots_subclasses_and_c3_order() {
 
 #[test]
 fn clos_initialization_protocol_filters_and_reapplies_initargs() {
-    reset_state();
+    let _guard = reset_state();
 
     let class = fx(3200);
     let slot_a = sym(3201);
@@ -122,7 +135,7 @@ fn clos_initialization_protocol_filters_and_reapplies_initargs() {
 
 #[test]
 fn clos_slot_protocol_distinguishes_bound_unbound_and_missing_paths() {
-    reset_state();
+    let _guard = reset_state();
 
     let class = fx(3300);
     let declared = sym(3301);
@@ -148,7 +161,7 @@ fn clos_slot_protocol_distinguishes_bound_unbound_and_missing_paths() {
 
 #[test]
 fn clos_change_class_preserves_shared_slots_and_rebinds_class() {
-    reset_state();
+    let _guard = reset_state();
 
     let old_class = fx(3400);
     let new_class = fx(3401);
@@ -171,7 +184,7 @@ fn clos_change_class_preserves_shared_slots_and_rebinds_class() {
 
 #[test]
 fn clos_generic_dispatch_prefers_more_specific_methods_and_reflects_mutation() {
-    reset_state();
+    let _guard = reset_state();
 
     let animal = fx(3500);
     let dog = fx(3501);
@@ -211,7 +224,7 @@ fn clos_generic_dispatch_prefers_more_specific_methods_and_reflects_mutation() {
 
 #[test]
 fn clos_effective_method_surfaces_standard_and_short_form_combinations() {
-    reset_state();
+    let _guard = reset_state();
 
     let gf = make_generic_function(sym(3600), NIL).unwrap();
     let around = fx(3601);
@@ -253,7 +266,7 @@ fn clos_effective_method_surfaces_standard_and_short_form_combinations() {
 
 #[test]
 fn conditions_signal_runs_newest_matching_handlers_without_unwinding() {
-    reset_state();
+    let _guard = reset_state();
 
     let log = Arc::new(Mutex::new(Vec::new()));
     let newest_handler = fx(4001);
@@ -286,7 +299,7 @@ fn conditions_signal_runs_newest_matching_handlers_without_unwinding() {
 
 #[test]
 fn conditions_handler_case_matches_registered_conditions_and_passes_through_values() {
-    reset_state();
+    let _guard = reset_state();
 
     let condition = make_simple_error("handler-case", &[]);
 
@@ -304,7 +317,7 @@ fn conditions_handler_case_matches_registered_conditions_and_passes_through_valu
 
 #[test]
 fn conditions_restarts_are_newest_first_filtered_invokable_and_thread_local() {
-    reset_state();
+    let _guard = reset_state();
 
     let same_name = sym(4100);
     let hidden_name = sym(4101);
@@ -392,7 +405,7 @@ fn compute_restarts_none() -> Vec<BlissVal> {
 
 #[test]
 fn conditions_warn_and_cerror_expose_default_restarts() {
-    reset_state();
+    let _guard = reset_state();
 
     let warning_handler = fx(4200);
     let continue_handler = fx(4201);
@@ -428,7 +441,7 @@ fn conditions_warn_and_cerror_expose_default_restarts() {
 
 #[test]
 fn conditions_error_calls_debugger_hook_before_reporting_unhandled_error() {
-    reset_state();
+    let _guard = reset_state();
 
     let hook = fx(4300);
     let calls = Arc::new(Mutex::new(Vec::<(BlissVal, Vec<BlissVal>)>::new()));
@@ -458,7 +471,7 @@ fn conditions_error_calls_debugger_hook_before_reporting_unhandled_error() {
 
 #[test]
 fn conditions_oom_path_uses_preallocated_storage_condition_instances() {
-    reset_state();
+    let _guard = reset_state();
     conditions::initialize_condition_runtime_support().unwrap();
 
     let handler = fx(4301);
@@ -504,6 +517,10 @@ fn conditions_oom_path_uses_preallocated_storage_condition_instances() {
 // invariant, never a lazy allocator.
 #[test]
 fn storage_condition_acquire_without_init_is_a_hard_error_not_lazy_alloc() {
+    // Serialize against the other tests (bliss-110), but do NOT reset_state():
+    // this test deliberately exercises uninitialized thread-local condition
+    // state, so it must not bootstrap here.
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // A freshly spawned thread has fresh thread-local condition state: the
     // STORAGE-CONDITION pool has never been initialized there. Acquiring on the
     // storage-failure path must fail hard rather than lazily defining classes or
@@ -519,7 +536,7 @@ fn storage_condition_acquire_without_init_is_a_hard_error_not_lazy_alloc() {
 
 #[test]
 fn storage_condition_pool_rotates_and_reuses_preallocated_instances() {
-    reset_state();
+    let _guard = reset_state();
     conditions::initialize_condition_runtime_support().unwrap();
     // STORAGE_CONDITION_POOL_SIZE is 4 (conditions.rs). Acquiring many more than
     // that must cycle through exactly those preallocated instances and never
@@ -545,7 +562,7 @@ fn storage_condition_pool_rotates_and_reuses_preallocated_instances() {
 
 #[test]
 fn clos_and_conditions_top_level_entrypoints_compose_in_an_acceptance_scenario() {
-    reset_state();
+    let _guard = reset_state();
 
     let class = fx(4400);
     let slot = sym(4401);
@@ -583,7 +600,7 @@ fn clos_and_conditions_top_level_entrypoints_compose_in_an_acceptance_scenario()
 /// GC the same instances come back at the same addresses, still valid.
 #[test]
 fn storage_condition_pool_is_pinned_in_gc_heap_and_survives_collection() {
-    reset_state();
+    let _guard = reset_state();
     conditions::initialize_condition_runtime_support().unwrap();
 
     // Snapshot the four pinned pool instances: claim all four distinct slots,
