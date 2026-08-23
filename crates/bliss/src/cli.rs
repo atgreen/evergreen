@@ -3907,10 +3907,14 @@ fn sym_name(val: BlissVal) -> String {
 }
 
 fn resolve_sym(name: &str) -> Option<BlissVal> {
-    match reader::read_from_string(name) {
-        Ok((sym, _)) if sym.is_symbol() => Some(sym),
-        _ => None,
-    }
+    // `name` is always a known, delimiter-free symbol name (a Rust string
+    // literal at every call site), so bypass the full reader — its
+    // tokenizer/number-parser/nesting-scan showed up as dominant eval self-time
+    // when invoked from find-symbol/keyword resolution paths (bliss-gq5.4).
+    // `read_symbol_token` reproduces the reader's symbol semantics exactly; a
+    // number-named or package-not-found token yields None, matching the old
+    // `is_symbol()`/error fallthrough.
+    reader::read_symbol_token(name).ok().flatten()
 }
 
 thread_local! {

@@ -1028,6 +1028,50 @@ fn parse_token_with_base(
     Ok(BlissVal::from_symbol_index(idx))
 }
 
+/// Resolve an already-delimited symbol token to its symbol value using the
+/// exact package/keyword/`NIL`/`T` semantics of the reader, but WITHOUT running
+/// the full read pipeline — no `Vec<char>` collection, no nesting pre-scan, no
+/// token delimiter scan. `name` is treated as one bare, unescaped token and is
+/// upcased exactly as the reader upcases unescaped tokens.
+///
+/// Returns `Ok(Some(sym))` when the token names a symbol, `Ok(None)` when it
+/// would read as a number or is empty (i.e. not a symbol), and propagates a
+/// package-not-found error. This is the eval-time fast path for resolving
+/// known symbol names (`resolve_sym`), which previously ran `read_from_string`
+/// on tiny constant names and made the reader dominate eval self-time
+/// (bliss-gq5.4).
+pub fn read_symbol_token(name: &str) -> Result<Option<BlissVal>, BlissError> {
+    let upper: String = name.chars().map(|c| c.to_ascii_uppercase()).collect();
+    if upper.is_empty() {
+        return Ok(None);
+    }
+    // Same decision order as the reader's non-escaped token path:
+    // package-qualified, keyword, numeric, then NIL/T, then bare symbol.
+    if let Some(result) = try_package_qualified(&upper)? {
+        return Ok(Some(result));
+    }
+    if let Some(kw_name) = upper.strip_prefix(':') {
+        if kw_name.is_empty() {
+            return Ok(None);
+        }
+        let full = format!("KEYWORD:{}", kw_name);
+        return Ok(Some(BlissVal::from_symbol_index(intern_symbol(&full))));
+    }
+    // A token that parses as a number is not a symbol (mirrors the reader
+    // falling through to its numeric branch). `read_from_string` uses base 10.
+    if let Ok(Some(_)) = try_parse_number_with_base(&upper, 10) {
+        return Ok(None);
+    }
+    if upper == "NIL" {
+        return Ok(Some(NIL));
+    }
+    if upper == "T" {
+        return Ok(Some(T));
+    }
+    let idx = resolve_symbol_via_hook(None, &upper).unwrap_or_else(|| intern_symbol(&upper));
+    Ok(Some(BlissVal::from_symbol_index(idx)))
+}
+
 fn try_package_qualified(name: &str) -> Result<Option<BlissVal>, BlissError> {
     // Check for PKG::SYM or PKG:SYM (but not :keyword which starts with :)
     if name.starts_with(':') {
