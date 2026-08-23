@@ -380,6 +380,21 @@ fn arena_str(s: &str) -> BlissVal {
     val
 }
 
+/// Coerce a pathname designator to a pathname, as ANSI requires for the
+/// `PATHNAME-*` accessors: a value that is already a pathname is returned
+/// unchanged; a namestring is parsed. This mirrors what `PATHNAME-DIRECTORY`
+/// already did inline — the other accessors (`PATHNAME-NAME`/`-TYPE`/`-HOST`/
+/// `-DEVICE`/`-VERSION`) skipped it and so returned NIL for a string designator,
+/// which broke UIOP's `pathname-directory-pathname`/`subpathname` (they call
+/// these accessors on namestrings during ASDF's source-registry scan, bliss-aid).
+fn coerce_pathname_designator(v: BlissVal) -> Result<BlissVal, BlissError> {
+    if bliss_stdlib::is_pathname(v) {
+        Ok(v)
+    } else {
+        Ok(bliss_stdlib::parse_namestring(v, None, None)?.0)
+    }
+}
+
 // ── First-class PACKAGE objects, backed by the stdlib registry (bliss-bhs) ──
 //
 // A package is a distinct CL type, not a string (CLHS 11.1), represented as a
@@ -9199,10 +9214,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     i += 2;
                 }
                 // Components not explicitly supplied are taken from :defaults
-                // (ANSI). `pathname_directory` returns the directory as a
-                // namestring, which is what make_pathname expects. With no valid
-                // :defaults, unsupplied components stay NIL.
-                let d = defaults.filter(|v| bliss_stdlib::is_pathname(*v));
+                // (ANSI). :defaults is a pathname *designator*, so a namestring
+                // string must be coerced to a pathname first — otherwise its
+                // components are silently dropped and, e.g., UIOP's
+                // `pathname-directory-pathname` (make-pathname :defaults <string>)
+                // loses the directory (bliss-aid). A non-coercible value stays
+                // unused, as before.
+                let d = match defaults {
+                    Some(v) if bliss_stdlib::is_pathname(v) => Some(v),
+                    Some(v) => coerce_pathname_designator(v).ok(),
+                    None => None,
+                };
                 let resolve = |supplied: Option<BlissVal>, from: fn(BlissVal) -> BlissVal| {
                     supplied.unwrap_or_else(|| d.map(from).unwrap_or(NIL))
                 };
@@ -9427,12 +9449,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "PATHNAME-NAME" => {
                 let (pathname_form, _) = cp(cdr);
-                let pathname = eval_form(pathname_form, env)?;
+                let pathname = coerce_pathname_designator(eval_form(pathname_form, env)?)?;
                 return Ok(bliss_stdlib::pathname_name(pathname));
             }
             "PATHNAME-TYPE" => {
                 let (pathname_form, _) = cp(cdr);
-                let pathname = eval_form(pathname_form, env)?;
+                let pathname = coerce_pathname_designator(eval_form(pathname_form, env)?)?;
                 return Ok(bliss_stdlib::pathname_type(pathname));
             }
             "PATHNAME-DIRECTORY" => {
@@ -9468,17 +9490,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "PATHNAME-HOST" => {
                 let (pathname_form, _) = cp(cdr);
-                let pathname = eval_form(pathname_form, env)?;
+                let pathname = coerce_pathname_designator(eval_form(pathname_form, env)?)?;
                 return Ok(bliss_stdlib::pathname_host(pathname));
             }
             "PATHNAME-DEVICE" => {
                 let (pathname_form, _) = cp(cdr);
-                let pathname = eval_form(pathname_form, env)?;
+                let pathname = coerce_pathname_designator(eval_form(pathname_form, env)?)?;
                 return Ok(bliss_stdlib::pathname_device(pathname));
             }
             "PATHNAME-VERSION" => {
                 let (pathname_form, _) = cp(cdr);
-                let pathname = eval_form(pathname_form, env)?;
+                let pathname = coerce_pathname_designator(eval_form(pathname_form, env)?)?;
                 return Ok(bliss_stdlib::pathname_version(pathname));
             }
             "WILD-PATHNAME-P" => {

@@ -2131,6 +2131,28 @@ fn pathname_directory_returns_a_list_not_a_namestring() {
 }
 
 #[test]
+fn pathname_accessors_coerce_a_namestring_designator() {
+    // bliss-aid: PATHNAME-NAME/-TYPE/-HOST/-DEVICE/-VERSION must accept a
+    // namestring designator (coerce it to a pathname), like PATHNAME-DIRECTORY.
+    // They previously returned NIL for a string, which broke UIOP's
+    // pathname-directory-pathname / subpathname during ASDF's source-registry
+    // scan. Also check make-pathname :defaults coerces a string designator so the
+    // directory is inherited rather than silently dropped.
+    let prog = "(format t \"~a|~a|~a\" \
+       (pathname-name \"/a/b/foo.txt\") \
+       (pathname-type \"/a/b/foo.txt\") \
+       (namestring (make-pathname :name nil :type nil :version nil \
+                                  :defaults \"/a/b/foo.txt\")))";
+    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("foo|txt|/a/b/"),
+        "expected 'foo|txt|/a/b/', got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn unsupplied_optional_and_key_params_shadow_enclosing_bindings() {
     // bliss-lb6: an unsupplied &optional/&key parameter must default to its
     // default form (NIL here), not inherit a same-named variable from an
