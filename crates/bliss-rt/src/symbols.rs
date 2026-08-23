@@ -153,20 +153,30 @@ pub fn intern(name: &str) -> u32 {
     // a mid-intern collection cannot reclaim them.
     let name_str = alloc_pinned_name(name);
     let sym = alloc_pinned_symbol(name_str, NIL);
-    with_registry_mut(|reg| {
-        // Re-check under the write lock in case another thread interned `name`
-        // while we were allocating; if so, drop our now-orphaned objects.
+    // Decide the result under the write lock, but do NOT touch the GC heap while
+    // holding it. The re-check's `gc::unpin` acquires `heap_state` (lock order 1),
+    // and the registry write lock is order 2 — but the collector holds heap_state
+    // (order 1) FIRST, then takes the registry (order 2) in `for_each_root_slot`.
+    // Unpinning under the registry lock inverts that (ABBA deadlock hazard, and in
+    // debug builds the lock-order checker panics and poisons the registry). So
+    // when we lose the race, unpin the orphaned objects AFTER releasing the lock;
+    // they stay pinned until then, so a mid-intern collection can't reclaim them.
+    // (bliss-52k)
+    let (idx, lost_race) = with_registry_mut(|reg| {
         if let Some(&idx) = reg.name_to_index.get(name) {
-            crate::gc::unpin(sym);
-            crate::gc::unpin(name_str);
-            return idx;
+            return (idx, true);
         }
         let idx = reg.interned.len() as u32;
         reg.interned.push(sym);
         reg.name_to_index.insert(name.to_string(), idx);
         reg.index_to_key.push(name.to_string());
-        idx
-    })
+        (idx, false)
+    });
+    if lost_race {
+        crate::gc::unpin(sym);
+        crate::gc::unpin(name_str);
+    }
+    idx
 }
 
 /// The exact registry key an interned symbol was created under (bliss-jtc.23).
