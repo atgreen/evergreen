@@ -1599,11 +1599,18 @@ mod tests {
     #[test]
     fn call_carries_frame_state() {
         // (lambda (x) (foo x)) — one named call, which must anchor a FrameState.
+        // Use a freshly-interned, test-private callee so the inline pass can
+        // never resolve it to an inlinable body and delete the Call. A hardcoded
+        // symbol index is not a stable "unknown function": whether it names an
+        // inlinable/defined function depends on the process-global symbol
+        // registry + function cells other parallel tests mutate, which made this
+        // test flaky (bliss-dck).
+        let foo = bliss_rt::symbols::intern("T2-BUILD-FRAME-STATE-UNDEFINED-CALLEE");
         let f = build_from_bytecode(&bf(
             "call",
             vec![
                 Instr::LoadLocal(0),
-                Instr::CallNamed { sym: 7, nargs: 1 },
+                Instr::CallNamed { sym: foo, nargs: 1 },
                 Instr::Return,
             ],
             vec![],
