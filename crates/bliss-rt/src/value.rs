@@ -274,6 +274,16 @@ impl BlissVal {
         (self.0 >> 3) as u32
     }
 
+    /// The symbol table index if this is a *real* symbol (`TAG_SYMBOL`), else
+    /// `None`. Unlike [`as_symbol_index`], this is safe for the special NIL/T
+    /// constants — which [`is_symbol`] reports as symbols but which have no
+    /// symbol-table index — so callers that may receive NIL/T (e.g. a debugger
+    /// backtrace where a foreign frame is marked with `T`) don't panic.
+    #[inline]
+    pub fn symbol_index(self) -> Option<u32> {
+        (self.tag() == TAG_SYMBOL).then(|| (self.0 >> 3) as u32)
+    }
+
     /// Extract a heap string as a Rust `String`.
     ///
     /// Bliss currently stores simple strings as an object header, a u64 byte
@@ -329,5 +339,27 @@ impl core::fmt::Debug for BlissVal {
                 _ => write!(f, "BlissVal({:#x})", self.0),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod symbol_index_tests {
+    use super::*;
+
+    #[test]
+    fn symbol_index_is_none_for_nil_and_t() {
+        // is_symbol() reports the NIL/T constants as symbols, but they carry no
+        // symbol-table index; symbol_index() must return None (bliss-hkf).
+        assert!(NIL.is_symbol());
+        assert!(T.is_symbol());
+        assert_eq!(NIL.symbol_index(), None);
+        assert_eq!(T.symbol_index(), None);
+    }
+
+    #[test]
+    fn symbol_index_round_trips_real_symbols() {
+        let s = BlissVal::from_symbol_index(1234);
+        assert_eq!(s.symbol_index(), Some(1234));
+        assert_eq!(s.as_symbol_index(), 1234);
     }
 }

@@ -951,11 +951,13 @@ fn print_frame(out: &mut impl IoWrite, index: usize, frame: &DebugFrame) {
     let func = frame.function();
     // Prefer the symbol's printed name (e.g. `FIND-IF`) over the opaque
     // `Symbol(194)` debug form.
-    let func_desc = if func.is_symbol() {
-        bliss_rt::symbols::symbol_name(func.as_symbol_index())
-            .unwrap_or_else(|| format!("{:?}", func))
-    } else {
-        format!("{:?}", func)
+    // Use the real symbol-table index only for actual symbols. `is_symbol()`
+    // also reports the special NIL/T constants as symbols, but they have no
+    // index — a native/foreign backtrace frame is marked with `T`, so guarding
+    // on `is_symbol()` and calling `as_symbol_index()` panicked here (bliss-hkf).
+    let func_desc = match func.symbol_index() {
+        Some(idx) => bliss_rt::symbols::symbol_name(idx).unwrap_or_else(|| format!("{:?}", func)),
+        None => format!("{:?}", func),
     };
     let loc_desc = match &frame.source_loc {
         Some((file, line, col)) => format!("{}:{}:{}", file, line, col),

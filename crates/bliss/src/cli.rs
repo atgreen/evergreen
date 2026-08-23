@@ -4450,7 +4450,7 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
     RESOLVING_SYMBOL.with(|c| c.set(true));
     let found = find_symbol_in_package(env, &pkg_name, name);
     RESOLVING_SYMBOL.with(|c| c.set(false));
-    found.and_then(|(sym, _)| sym.is_symbol().then(|| sym.as_symbol_index()))
+    found.and_then(|(sym, _)| sym.symbol_index())
 }
 
 /// Reader hook: build a `#P"…"` literal as the stdlib's registry-backed pathname

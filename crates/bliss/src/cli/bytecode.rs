@@ -13278,7 +13278,9 @@ fn as_setf_expander_definition(form: BlissVal) -> Option<(String, BlissVal, Blis
 /// Resolve a symbol name to its interned index via the reader.
 fn symbol_index_of(name: &str) -> Option<u32> {
     match reader::read_from_string(name) {
-        Ok((sym, _)) if sym.is_symbol() => Some(sym.as_symbol_index()),
+        // `symbol_index()` (not `as_symbol_index`) so NIL/T — which read as
+        // symbols but have no index — yield None instead of panicking (bliss-hkf).
+        Ok((sym, _)) => sym.symbol_index(),
         _ => None,
     }
 }
