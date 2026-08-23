@@ -10145,23 +10145,57 @@ extern "C" fn c2i_pop_env_child() {
     });
 }
 
+/// Run `f` — which reenters the interpreter from a c2i `extern "C"` adapter —
+/// converting a Rust panic into a catchable `BlissError` instead of letting it
+/// unwind across the `extern "C"` boundary, which Rust turns into a process
+/// ABORT (bliss-011). A panic reached here is a defensive invariant tripping
+/// deep in the interpreter (e.g. a RefCell reentrancy in the GC root scan
+/// reached via this boundary); it must become a condition `run_native` re-raises,
+/// never kill the process. The closure's captured state is asserted unwind-safe:
+/// a panic drops the RAII borrow guards on the way out, so RefCells are released.
+fn guard_c2i<F>(f: F) -> Result<BlissVal, BlissError>
+where
+    F: FnOnce() -> Result<BlissVal, BlissError>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic".to_string());
+            Err(BlissError::Internal(format!(
+                "recovered a panic reached from compiled code (bliss-011): {msg}"
+            )))
+        }
+    }
+}
+
 fn c2i_eval_form_with_frame(form: BlissVal, capture_native_frame: bool) -> u64 {
     let env_ptr = NATIVE_ENV.with(|cell| cell.get());
     if env_ptr.is_null() {
         return NIL.0;
     }
-    let env = unsafe { &mut *env_ptr };
     let saved_frame = if capture_native_frame {
         NATIVE_ENV_FRAME.with(|slot| {
-            slot.borrow()
-                .clone()
-                .map(|frame| std::mem::replace(&mut env.frame, frame))
+            slot.borrow().clone().map(|frame| {
+                let env = unsafe { &mut *env_ptr };
+                std::mem::replace(&mut env.frame, frame)
+            })
         })
     } else {
         None
     };
-    let result = eval_form(form, env);
+    // Guard the interpreter reentry: a panic here (not just an Err) must not
+    // abort across this `extern "C"` boundary (bliss-011). The frame is restored
+    // afterwards on BOTH the ok and panic paths.
+    let result = guard_c2i(|| {
+        let env = unsafe { &mut *env_ptr };
+        eval_form(form, env)
+    });
     if let Some(saved) = saved_frame {
+        let env = unsafe { &mut *env_ptr };
         env.frame = saved;
     }
     match result {
@@ -10232,11 +10266,15 @@ fn c2i_call_args(sym: u64, args: &[BlissVal], profile_site: u64) -> u64 {
     // SAFETY: `run_native` sets NATIVE_ENV to a live &mut Env for the duration
     // of the native call, and native code only calls this synchronously within
     // that window.
-    let env = unsafe { &mut *env_ptr };
     record_native_call_site(profile_site);
     let n = args.len();
     let sym32 = sym as u32;
     let fn_val = BlissVal::from_symbol_index(sym32);
+    // Guard the interpreter reentry so a panic deep in the callee (e.g. a GC
+    // root-scan RefCell reentrancy, bliss-011) is caught and re-raised as a
+    // catchable condition rather than aborting across this `extern "C"` frame.
+    let result = guard_c2i(|| {
+    let env = unsafe { &mut *env_ptr };
     // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
     // run_loop dispatches ITS calls flatly on the BlissStack (bliss-x5y.4). This
     // is what keeps recursion through a native caller bounded: without it, a
@@ -10246,7 +10284,7 @@ fn c2i_call_args(sym: u64, args: &[BlissVal], profile_site: u64) -> u64 {
     // way to flat Activations, so a runaway recursion raises a catchable
     // STORAGE-CONDITION instead of a native stack overflow. Non-bytecode callees
     // (builtins, generics, closures, arity mismatches) still go via apply_function.
-    let result = match registry_get(sym32) {
+    match registry_get(sym32) {
         Some(callee) if arity_accepts(&callee, n) => {
             // Calls emitted by native T1/T2 code do not pass through the
             // interpreter's CallNamed arm, so this adapter owns the callee's
@@ -10278,7 +10316,8 @@ fn c2i_call_args(sym: u64, args: &[BlissVal], profile_site: u64) -> u64 {
             }
         }
         _ => apply_function(fn_val, args, env),
-    };
+        }
+    });
     match result {
         Ok(v) => v.0,
         // A raw error can't unwind native code mid-function, so stash it and

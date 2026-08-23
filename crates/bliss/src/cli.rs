@@ -2732,8 +2732,18 @@ fn visit_macro_def_roots(
     visit(&mut def.params_form);
     visit(&mut def.body);
     if let Some(function) = &def.bytecode {
-        for constant in &mut function.borrow_mut().constants {
-            visit(constant);
+        // A minor GC can fire mid-macro-expansion (alloc during the macro's own
+        // bytecode run), and `expand_macro`/`run_loop` already hold this cell
+        // borrowed — so an unconditional `borrow_mut` here double-borrows and
+        // panics, and because the GC is reached across the `extern "C"`
+        // c2i_call_slice boundary the panic aborts the process (bliss-011).
+        // Skip when the function is executing: its constants are compile-time
+        // values (not nursery), so a minor GC never relocates them, and the live
+        // ones are already reachable through the running activation's roots.
+        if let Ok(mut f) = function.try_borrow_mut() {
+            for constant in &mut f.constants {
+                visit(constant);
+            }
         }
     }
     visit_env_frame_roots(&def.captured_frame, state, visit);
