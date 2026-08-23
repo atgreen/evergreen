@@ -59,6 +59,29 @@ fn bliss_bin() -> Command {
 // ══════════════════════════════════════════════════════════════════
 
 #[test]
+fn multiple_eval_forms_all_run_and_share_one_env() {
+    // bliss-7zl: every --eval form must run, in order, sharing one env — so
+    // state (a defvar here) created by an earlier form is visible to later ones.
+    // Previously only the last --eval ran.
+    let output = bliss_bin()
+        .args([
+            "--no-init",
+            "--eval",
+            "(defvar *seven-z-l* 41)",
+            "--eval",
+            "(princ (+ *seven-z-l* 1))",
+        ])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "exit code should be 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("42"),
+        "second --eval should see the first's defvar (expect 42), got: {stdout}"
+    );
+}
+
+#[test]
 fn help_flag_prints_usage_and_exits_zero() {
     let output = bliss_bin()
         .arg("--help")

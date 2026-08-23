@@ -26,7 +26,9 @@ use std::thread::ThreadId;
 #[derive(Clone, Debug)]
 pub struct CliArgs {
     pub image: Option<String>,
-    pub eval: Option<String>,
+    /// All `--eval`/`-e` forms in command-line order, evaluated in sequence in
+    /// one shared env so later forms see earlier state (bliss-7zl).
+    pub eval_forms: Vec<String>,
     pub load: Option<String>,
     pub no_image: bool,
     pub bootstrap: bool,
@@ -57,6 +59,7 @@ impl CliArgs {
         let mut version = false;
         let mut script = None;
         let mut load_report = None;
+        let mut eval_forms: Vec<String> = Vec::new();
         let mut saw_double_dash = false;
 
         let mut i = 0;
@@ -81,6 +84,18 @@ impl CliArgs {
                     }
                     i += 1;
                 }
+                // Collect ALL --eval/-e forms (bliss-7zl): they are evaluated in
+                // sequence sharing one env, so state (packages, defvars, …)
+                // created by an earlier form is visible to later ones. Handled
+                // here rather than forwarded to the runtime config, whose single
+                // eval_form slot kept only the last form.
+                "--eval" | "-e" => {
+                    let value = args.get(i + 1).ok_or_else(|| {
+                        BlissError::Internal(format!("{arg} requires a value"))
+                    })?;
+                    eval_forms.push(value.clone());
+                    i += 2;
+                }
                 s if is_forwarded_runtime_flag(s) => {
                     shared_args.push(arg.clone());
                     if runtime_flag_requires_value(arg) {
@@ -92,14 +107,6 @@ impl CliArgs {
                     } else {
                         i += 1;
                     }
-                }
-                "-e" => {
-                    shared_args.push("--eval".into());
-                    let value = args
-                        .get(i + 1)
-                        .ok_or_else(|| BlissError::Internal("-e requires a value".into()))?;
-                    shared_args.push(value.clone());
-                    i += 2;
                 }
                 "--bootstrap" => {
                     // The prelude now loads by default; --bootstrap is kept as an
@@ -145,7 +152,7 @@ impl CliArgs {
 
         let r = CliArgs {
             image: extract_flag_value(&shared_args, "--image"),
-            eval: config.eval_form.clone(),
+            eval_forms,
             load: config.load_file.clone(),
             no_image: shared_args.iter().any(|arg| arg == "--no-image"),
             bootstrap,
@@ -173,7 +180,7 @@ impl CliArgs {
                 "--sandbox and --no-image are contradictory".into(),
             ));
         }
-        if r.eval.is_some() && r.load.is_some() {
+        if !r.eval_forms.is_empty() && r.load.is_some() {
             return Err(BlissError::Internal(
                 "--eval and --load are contradictory".into(),
             ));
@@ -18158,7 +18165,7 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     // file is normal; a broken init file is reported but non-fatal.
     if !ca.no_init
         && embedded.is_none()
-        && ca.eval.is_none()
+        && ca.eval_forms.is_empty()
         && ca.load.is_none()
         && ca.script.is_none()
     {
@@ -18181,8 +18188,15 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
     if let Some(ref path) = ca.load_report {
         return run_load_report(path, &mut env);
     }
-    if let Some(ref expr) = ca.eval {
-        return run_eval_env(expr, &mut env);
+    if !ca.eval_forms.is_empty() {
+        // Evaluate every --eval/-e form in order, all in the SAME env, so state
+        // created by an earlier form (packages, defvars, loaded systems) is
+        // visible to later ones (bliss-7zl). An error aborts the sequence.
+        let mut code = 0;
+        for expr in &ca.eval_forms {
+            code = run_eval_env(expr, &mut env)?;
+        }
+        return Ok(code);
     }
     if let Some(ref path) = ca.load {
         return run_load_env(path, &mut env);
