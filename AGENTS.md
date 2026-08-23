@@ -55,6 +55,53 @@ orientation banner and is safe to run anytime.
 - Before adding a builtin to cli.rs, check whether `bliss-stdlib` already
   implements it. Prefer extending stdlib over growing cli.rs.
 
+## GC safety (READ THIS before touching allocating code)
+
+bliss has a **moving, precise** minor GC: any allocation (`Arena::alloc_cons`,
+`alloc_typed`, `arena_str`, building a list/instance/error, `resolve_sym`
+interning, `eval_form`, `apply_function`, macro expansion, …) can fire a minor
+GC that **relocates nursery objects** and updates every root the GC can find.
+Two invariants must hold, or you get intermittent segfaults / "already borrowed"
+panics / (across the `extern "C"` c2i boundary) a process **abort**. These are
+recurring, hard-to-spot bugs (bliss-6b2 / asdf-6b2 / h6z / 011) — hold the line.
+
+1. **Root every Rust-local `BlissVal` that must survive an allocation.** A
+   `BlissVal` held only in a Rust local, register, or `Vec` across an alloc that
+   can GC is invisible to the collector: the object moves and your copy is a
+   stale (or poisoned) pointer. Wrap the live values in a `ShadowRootScope`
+   (`bliss_rt::ShadowRootScope::new()` → `roots.root(v)` → `r.get()` for the
+   post-GC address), or `VecRootGuard` / `StackRoot`. The evaluator's own code is
+   the template: see `evaluated_initargs` and `eval_make_instance` in cli.rs.
+   Classic smell: `let v = eval_form(..)?; <more eval_form/alloc>; use(v)` with
+   `v` unrooted, or pushing into a `Vec` and calling `eval_form` again before the
+   `Vec` is rooted.
+
+2. **Never hold a `RefCell` borrow (or a raw `&mut`) to GC-scanned state across
+   an allocation.** The registered root scanners re-enter those cells during a
+   GC — `CLOS_STATE` (bliss-stdlib clos.rs), a macro's bytecode-function
+   `RefCell` (cli.rs `visit_macro_def_roots`), `EnvFrame`s. If a `borrow_mut`
+   is held (e.g. `with_state_mut { … alloc … }`) when GC fires, the scan's
+   `borrow_mut` double-borrows and panics — and reached via compiled code across
+   the `extern "C"` c2i adapters it **aborts**. Drop the borrow before you
+   allocate (collect what you need, release, then alloc), don't call
+   allocating/evaluating functions inside a `with_state_mut`/`borrow_mut` closure.
+
+**Prove it before you commit.** Run the affected path under the GC fuzzers —
+they turn these latent, load-dependent bugs into deterministic failures:
+
+```bash
+# Fire a minor GC on (almost) every allocation — the deterministic reproducer
+# for BOTH invariants above:
+BLISS_GC_STRESS=1 ./target/.../bliss-cli --no-init --eval '(your form)'
+# Fill freed nursery with 0xFA (non-canonical HEAP_OBJECT) so a stale deref
+# segfaults immediately instead of silently reading moved data:
+BLISS_GC_STRESS=1 BLISS_GC_POISON=1 ./target/.../bliss-cli --no-init --eval '…'
+```
+
+An "already borrowed" panic, a segfault, or an abort under stress that passes
+without it means you have one of these. A clean run under `BLISS_GC_STRESS=1`
+is the cheapest evidence a change that allocates is GC-safe.
+
 ## Running rr (reverse debugger) on this machine
 
 This box is an Intel **hybrid** CPU (P-cores 0–5, E-cores 6–13) whose model is
