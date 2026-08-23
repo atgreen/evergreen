@@ -4236,8 +4236,7 @@ fn next_stdlib_class_id() -> BlissVal {
     })
 }
 
-fn register_declared_packages(source: &str) {
-    let chars: Vec<char> = source.chars().collect();
+fn register_declared_packages(chars: &[char]) {
     let mut pos = 0;
     while pos < chars.len() {
         match chars[pos] {
@@ -4261,14 +4260,14 @@ fn register_declared_packages(source: &str) {
             }
             '(' => {
                 pos += 1;
-                let op = read_scan_token(&chars, &mut pos);
+                let op = read_scan_token(chars, &mut pos);
                 if op.eq_ignore_ascii_case("DEFPACKAGE")
                     || op
                         .rsplit(':')
                         .next()
                         .is_some_and(|name| name.eq_ignore_ascii_case("DEFINE-PACKAGE"))
                 {
-                    let pkg = read_scan_token(&chars, &mut pos);
+                    let pkg = read_scan_token(chars, &mut pos);
                     let pkg = pkg
                         .trim_start_matches(':')
                         .trim_start_matches("KEYWORD:")
@@ -4535,8 +4534,8 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
     reader::set_symbol_resolver(Some(reader_symbol_resolver));
     reader::set_pathname_constructor(Some(reader_pathname_constructor));
     bliss_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
-    register_declared_packages(source);
     let chars: Vec<char> = source.chars().collect();
+    register_declared_packages(&chars);
     // Nesting is checked once for the whole buffer; each form is then read from
     // the shared slice at an advancing position, so loading is O(length) rather
     // than O(forms · length) — the quadratic re-scan that made large files
@@ -4589,8 +4588,8 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
 fn read_forms_for_compile(source: &str, env: &mut Env) -> Result<Vec<BlissVal>, BlissError> {
     with_eval_context(env, EvalContext::CompileFile, |env| {
         reader::set_read_eval_hook(Some(read_time_eval));
-        register_declared_packages(source);
         let chars: Vec<char> = source.chars().collect();
+        register_declared_packages(&chars);
         let mut pos = 0;
         let mut forms = Vec::new();
         loop {
@@ -18293,8 +18292,8 @@ fn run_load_report(path: &str, env: &mut Env) -> Result<i32, BlissError> {
     use std::collections::BTreeMap;
     let contents = std::fs::read_to_string(path)
         .map_err(|e| BlissError::FileError(format!("cannot read {}: {}", path, e)))?;
-    register_declared_packages(&contents);
     let chars: Vec<char> = contents.chars().collect();
+    register_declared_packages(&chars);
     let mut pos = 0usize;
     let mut form_index = 0usize;
     let mut ok = 0usize;
