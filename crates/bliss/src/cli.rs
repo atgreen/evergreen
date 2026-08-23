@@ -89,9 +89,9 @@ impl CliArgs {
                 // here rather than forwarded to the runtime config, whose single
                 // eval_form slot kept only the last form.
                 "--eval" | "-e" => {
-                    let value = args.get(i + 1).ok_or_else(|| {
-                        BlissError::Internal(format!("{arg} requires a value"))
-                    })?;
+                    let value = args
+                        .get(i + 1)
+                        .ok_or_else(|| BlissError::Internal(format!("{arg} requires a value")))?;
                     eval_forms.push(value.clone());
                     i += 2;
                 }
@@ -762,7 +762,10 @@ fn function_name_key(name_form: BlissVal) -> String {
 /// so the same symbol identity is used at install and at call. Colons are
 /// sanitized so the whole thing reads back as one symbol in BLISS-INTERNAL.
 pub(super) fn setf_writer_symbol_name(place_name: &str) -> String {
-    format!("BLISS-INTERNAL::%SETF-WRITER-{}", place_name.replace(':', "."))
+    format!(
+        "BLISS-INTERNAL::%SETF-WRITER-{}",
+        place_name.replace(':', ".")
+    )
 }
 
 /// Whether `place_name` (an accessor's `sym_name`) has a user `(defun (setf
@@ -1187,7 +1190,14 @@ fn debug_validate_form(label: &str, name: &str, v: BlissVal) {
     if !enabled() {
         return;
     }
-    fn walk(label: &str, name: &str, v: BlissVal, depth: u32, budget: &mut u32) {
+    fn walk(
+        label: &str,
+        name: &str,
+        v: BlissVal,
+        depth: u32,
+        budget: &mut u32,
+        spine: &mut Vec<u64>,
+    ) {
         if depth > 200 || *budget == 0 {
             return;
         }
@@ -1199,12 +1209,24 @@ fn debug_validate_form(label: &str, name: &str, v: BlissVal) {
         if !v.is_cons() {
             return;
         }
+        // A cons reachable from itself is a cycle no reader-built source form
+        // can contain — it is GC corruption (a slot forwarded into its own
+        // ancestor), and the evaluator will spin on it (bliss-8qf).
+        if spine.contains(&v.0) {
+            eprintln!(
+                "bliss-8qf VALIDATE[{label}] {name}: CYCLE at depth {depth} (cons {:#x})",
+                v.0
+            );
+            return;
+        }
+        spine.push(v.0);
         let (car, cdr) = cp(v);
-        walk(label, name, car, depth + 1, budget);
-        walk(label, name, cdr, depth + 1, budget);
+        walk(label, name, car, depth + 1, budget, spine);
+        walk(label, name, cdr, depth + 1, budget, spine);
+        spine.pop();
     }
     let mut budget = 100_000;
-    walk(label, name, v, 0, &mut budget);
+    walk(label, name, v, 0, &mut budget, &mut Vec::new());
 }
 
 /// Register a global (top-level DEFMACRO) macro.
@@ -2117,7 +2139,9 @@ fn slot_is_bound(instance: BlissVal, slot: BlissVal, env: &Env) -> Result<bool, 
         if let Some(class_def) = env.classes.borrow().get(&owner).cloned() {
             let values = class_def.class_slot_values.lock().unwrap();
             return Ok(matches!(
-                values.get(&slot_name).or_else(|| values.get(&sym_name(slot))),
+                values
+                    .get(&slot_name)
+                    .or_else(|| values.get(&sym_name(slot))),
                 Some(Some(_))
             ));
         }
@@ -2913,6 +2937,24 @@ fn visit_handler_roots(
         } => {
             visit(body);
             visit_env_frame_roots(captured_frame, state, visit);
+        }
+    }
+}
+
+/// Let `rooted!`/`rooted_ref!` cover evaluator temporaries that hold heap forms
+/// in Rust-side containers across allocating evaluation (moving GC; bliss-8qf):
+/// handler clauses (HANDLER-CASE/HANDLER-BIND) and method specializers.
+impl bliss_rt::gc::TraceHostRoots for HandlerEntry {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        let mut state = EnvRootVisitState::default();
+        visit_handler_roots(&mut self.handler, &mut state, visit);
+    }
+}
+
+impl bliss_rt::gc::TraceHostRoots for MethodSpecializer {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        if let MethodSpecializer::Eql(value) = self {
+            visit(value);
         }
     }
 }
@@ -4172,6 +4214,11 @@ fn format_body_forms(forms: BlissVal) -> String {
 /// Expand a quasiquote template, substituting BLISS::UNQUOTE forms with
 /// their evaluated values and splicing BLISS::UNQUOTE-SPLICING forms.
 fn eval_quasiquote(template: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    if std::env::var_os("BLISS_GC_VALIDATE").is_some() {
+        let result = eval_quasiquote_depth(template, env, 1)?;
+        debug_validate_form("qq-result", "quasiquote", result);
+        return Ok(result);
+    }
     eval_quasiquote_depth(template, env, 1)
 }
 
@@ -5254,9 +5301,12 @@ fn intern_into_package(env: &mut Env, pkg_name: &str, bare_name: &str) -> BlissV
     if let Some((sym, _)) = find_symbol_in_package(env, &pkg_name, &bare_name) {
         return sym;
     }
-    let sym = symbol_for_package(&pkg_name, &bare_name)
+    let mut sym = symbol_for_package(&pkg_name, &bare_name)
         .or_else(|| resolve_sym(&bare_name))
         .unwrap_or_else(|| arena_str(&bare_name));
+    // Root across the allocating package creation below: the `arena_str`
+    // fallback yields a heap string (moving GC; bliss-8qf).
+    bliss_rt::rooted_ref!(_sym_root = &mut sym);
     ensure_package_available(env, &pkg_name, &[]);
     // Record the symbol's home package in its heap cell, pointing at the shared
     // bliss_rt PACKAGE object (bliss-jtc.6 Stage D). A no-op if the symbol is not
@@ -7232,7 +7282,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "SLEEP" => {
                 // (sleep seconds) → NIL. Blocks the (single) thread.
                 let args = eval_args(cdr, env)?;
-                let secs = if args.is_empty() { 0.0 } else { num_val(args[0])? };
+                let secs = if args.is_empty() {
+                    0.0
+                } else {
+                    num_val(args[0])?
+                };
                 if secs > 0.0 {
                     std::thread::sleep(std::time::Duration::from_secs_f64(secs));
                 }
@@ -7961,6 +8015,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // Root the source-form cursor across the sub-evaluations: a young
                 // form list (e.g. a macroexpansion) relocates under a minor GC and
                 // a bare cursor would dangle (bliss-6b2 #2).
+                if std::env::var_os("BLISS_8QF_DEBUG").is_some() {
+                    eprintln!("AND enter: form={:#x} cdr={:#x}", form.0, cdr.0);
+                    debug_validate_form("and-enter", "and", form);
+                }
                 let mut result = T;
                 bliss_rt::rooted!(c = cdr);
                 while c.is_cons() {
@@ -8372,15 +8430,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         *val,
                                         env,
                                     )?;
-                                } else if let Some(writer_sym) = bliss_rt::symbols::find_index(
-                                    &setf_writer_symbol_name(other),
-                                )
-                                .filter(|&idx| {
-                                    bytecode::is_registered(idx)
-                                        || bliss_rt::symbols::symbol_function(idx)
-                                            .is_some_and(|f| f != bliss_rt::value::UNBOUND)
-                                })
-                                .map(BlissVal::from_symbol_index)
+                                } else if let Some(writer_sym) =
+                                    bliss_rt::symbols::find_index(&setf_writer_symbol_name(other))
+                                        .filter(|&idx| {
+                                            bytecode::is_registered(idx)
+                                                || bliss_rt::symbols::symbol_function(idx)
+                                                    .is_some_and(|f| f != bliss_rt::value::UNBOUND)
+                                        })
+                                        .map(BlissVal::from_symbol_index)
                                 {
                                     // A source-free `(defun (setf place) …)` writer
                                     // installed from a .bfasl on the mangled
@@ -8798,7 +8855,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "NTH" => {
                 let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
-                    return Err(BlissError::Internal("NTH requires an index and a list".into()));
+                    return Err(BlissError::Internal(
+                        "NTH requires an index and a list".into(),
+                    ));
                 }
                 let idx = num_val(args[0])? as usize;
                 let elems = list_to_vec(args[1]);
@@ -8849,7 +8908,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // second value to the present-p flag.
                 let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
-                    return Err(BlissError::Internal("GETHASH requires a key and a table".into()));
+                    return Err(BlissError::Internal(
+                        "GETHASH requires a key and a table".into(),
+                    ));
                 }
                 let key = args[0];
                 let tbl = args[1];
@@ -8931,7 +8992,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let set_car = name == "BLISS::SET-CAR";
                 let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
-                    return Err(BlissError::Internal("SET-CAR/SET-CDR needs cons and value".into()));
+                    return Err(BlissError::Internal(
+                        "SET-CAR/SET-CDR needs cons and value".into(),
+                    ));
                 }
                 let target = args[0];
                 let val = args[1];
@@ -8954,7 +9017,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "REMHASH" => {
                 let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
-                    return Err(BlissError::Internal("REMHASH requires a key and a table".into()));
+                    return Err(BlissError::Internal(
+                        "REMHASH requires a key and a table".into(),
+                    ));
                 }
                 let removed = bliss_stdlib::remhash(args[0], args[1])?;
                 return Ok(if removed { T } else { NIL });
@@ -8998,7 +9063,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // mutated (per-key) during the walk. Returns NIL.
                 let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
-                    return Err(BlissError::Internal("MAPHASH requires a function and a table".into()));
+                    return Err(BlissError::Internal(
+                        "MAPHASH requires a function and a table".into(),
+                    ));
                 }
                 bliss_rt::rooted!(function = args[0]);
                 // Root the entry snapshot: each apply_function runs user code that
@@ -9997,8 +10064,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (signal datum &rest args): a condition-type symbol is built into
                 // an instance so handler type-matching runs against the real CLOS
                 // class hierarchy.
-                let cond =
-                    coerce_condition_designator(env, *datum, initargs)?.unwrap_or(*datum);
+                let cond = coerce_condition_designator(env, *datum, initargs)?.unwrap_or(*datum);
                 return signal_condition_object(cond, env);
             }
             "WARN" => {
@@ -10922,24 +10988,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let image = bytecode::build_image_from_runtime(env)?;
                 let bytes = if executable {
                     wrap_executable(&image).map_err(|e| {
-                        BlissError::FileError(format!(
-                            "save-lisp-and-die :executable: {e}"
-                        ))
+                        BlissError::FileError(format!("save-lisp-and-die :executable: {e}"))
                     })?
                 } else {
                     image
                 };
-                std::fs::write(&path, &bytes).map_err(|e| {
-                    BlissError::FileError(format!("save-lisp-and-die: {}", e))
-                })?;
+                std::fs::write(&path, &bytes)
+                    .map_err(|e| BlissError::FileError(format!("save-lisp-and-die: {}", e)))?;
                 if executable {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            &path,
-                            std::fs::Permissions::from_mode(0o755),
-                        );
+                        let _ =
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
                     }
                 }
                 use std::io::Write;
@@ -11436,6 +11497,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(body = body);
                 let count = eval_form(*count_form, env)?;
                 let n = num_val(count)? as i64;
+                if std::env::var_os("BLISS_8QF_DEBUG").is_some() {
+                    eprintln!(
+                        "DOTIMES: n={} count_bits={:#x} var_bits={:#x} body_bits={:#x} body_is_cons={}",
+                        n,
+                        count.0,
+                        (*var_form).0,
+                        (*body).0,
+                        (*body).is_cons()
+                    );
+                }
                 // Establish a fresh variable frame (so the loop variable shadows
                 // outer bindings and does not leak) while keeping the shared
                 // global tables — packages, functions, … — mutable in place, so
@@ -11849,6 +11920,33 @@ enum LoopClause {
         then: Vec<LoopClause>,
         els: Vec<LoopClause>,
     },
+}
+
+impl bliss_rt::gc::TraceHostRoots for LoopClause {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        match self {
+            LoopClause::Do(forms) => forms.trace_host_roots(visit),
+            LoopClause::Collect(expr, _)
+            | LoopClause::Append(expr, _)
+            | LoopClause::Sum(expr, _)
+            | LoopClause::Count(expr, _)
+            | LoopClause::Maximize(expr, _)
+            | LoopClause::Minimize(expr, _)
+            | LoopClause::Always(expr)
+            | LoopClause::Never(expr)
+            | LoopClause::Return(expr)
+            | LoopClause::ThereIs(expr)
+            | LoopClause::While(expr)
+            | LoopClause::Until(expr) => visit(expr),
+            LoopClause::Cond {
+                test, then, els, ..
+            } => {
+                visit(test);
+                then.trace_host_roots(visit);
+                els.trace_host_roots(visit);
+            }
+        }
+    }
 }
 
 struct LoopParser {
@@ -12482,6 +12580,65 @@ enum ForClause {
     },
 }
 
+impl bliss_rt::gc::TraceHostRoots for LoopBeingSource {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        match self {
+            LoopBeingSource::Symbols(form)
+            | LoopBeingSource::OwnSymbols(form)
+            | LoopBeingSource::HashKeys(form)
+            | LoopBeingSource::HashValues(form) => visit(form),
+        }
+    }
+}
+
+impl bliss_rt::gc::TraceHostRoots for ForClause {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        match self {
+            ForClause::In {
+                pat,
+                list_form,
+                step,
+            }
+            | ForClause::On {
+                pat,
+                list_form,
+                step,
+            } => {
+                visit(pat);
+                visit(list_form);
+                step.trace_host_roots(visit);
+            }
+            ForClause::Eq { pat, init, then } => {
+                visit(pat);
+                visit(init);
+                then.trace_host_roots(visit);
+            }
+            ForClause::From {
+                pat,
+                start,
+                step,
+                limit,
+                ..
+            } => {
+                visit(pat);
+                visit(start);
+                step.trace_host_roots(visit);
+                if let Some((_, value)) = limit {
+                    visit(value);
+                }
+            }
+            ForClause::Across { pat, seq_form } => {
+                visit(pat);
+                visit(seq_form);
+            }
+            ForClause::Being { pat, source } => {
+                visit(pat);
+                source.trace_host_roots(visit);
+            }
+        }
+    }
+}
+
 /// Runtime cursor for a `:for` clause.
 enum ForState {
     In {
@@ -12551,20 +12708,18 @@ fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 }
 
 fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let toks = list_to_vec(cdr);
-
     // Simple LOOP: no leading keyword -> repeat body until a top-level return.
-    let starts_with_kw = toks
-        .first()
-        .and_then(|v| {
-            if v.is_symbol() {
-                let n = sym_name(*v);
-                Some(is_loop_keyword(n.strip_prefix("KEYWORD:").unwrap_or(&n)))
-            } else {
-                None
-            }
-        })
-        .unwrap_or(false);
+    let starts_with_kw = if cdr.is_cons() {
+        let head = cp(cdr).0;
+        if head.is_symbol() {
+            let n = sym_name(head);
+            is_loop_keyword(n.strip_prefix("KEYWORD:").unwrap_or(&n))
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     if !starts_with_kw {
         // Walk the LIVE body cons list through a rooted cursor each iteration
         // rather than a stale `toks` snapshot (bliss-6b2 #2): the simple loop
@@ -12595,7 +12750,21 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         }
     }
 
-    // Extended LOOP.
+    eval_loop_extended(cdr, env)
+}
+
+fn eval_loop_repeat_remaining(
+    repeat_form: Option<BlissVal>,
+    env: &mut Env,
+) -> Result<Option<u64>, BlissError> {
+    match repeat_form {
+        Some(form) => Ok(Some(num_val(eval_form(form, env)?)?.max(0.0) as u64)),
+        None => Ok(None),
+    }
+}
+
+fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let toks = list_to_vec(cdr);
     let mut p = LoopParser { toks, pos: 0 };
     let mut with_bindings: Vec<(BlissVal, BlissVal)> = Vec::new();
     let mut for_clauses: Vec<ForClause> = Vec::new();
@@ -12878,6 +13047,16 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         }
     }
 
+    // Extended LOOP parsing stores source forms in Rust Vecs/enums. They are
+    // used across allocating evaluation below, so root the whole parsed plan
+    // until execution finishes (moving GC; bliss-s76).
+    bliss_rt::rooted_ref!(_with_bindings_root = &mut with_bindings);
+    bliss_rt::rooted_ref!(_for_clauses_root = &mut for_clauses);
+    bliss_rt::rooted_ref!(_initially_root = &mut initially);
+    bliss_rt::rooted_ref!(_finally_root = &mut finally);
+    bliss_rt::rooted_ref!(_body_root = &mut body);
+    bliss_rt::rooted_ref!(_repeat_form_root = &mut repeat_form);
+
     // Establish :with bindings (sequential, LET*-style).
     for (var, init) in &with_bindings {
         let v = eval_form(*init, env)?;
@@ -12899,10 +13078,7 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     }
 
     // `repeat N`: evaluate the count once (negative/NIL → 0 iterations).
-    let mut repeat_remaining: Option<u64> = match repeat_form {
-        Some(f) => Some(num_val(eval_form(f, env)?)?.max(0.0) as u64),
-        None => None,
-    };
+    let mut repeat_remaining = eval_loop_repeat_remaining(repeat_form, env)?;
 
     let has_terminator = loop_body_has_terminator(&body);
     // Root the accumulators and for-clause cursors for the whole loop: they hold
@@ -14097,11 +14273,7 @@ fn eval_cmp(
     bliss_rt::rooted!(bf = cp(r).0);
     bliss_rt::rooted!(a = eval_form(af, env)?);
     let b = eval_form(*bf, env)?;
-    Ok(if pred(numeric_cmp(*a, b)?) {
-        T
-    } else {
-        NIL
-    })
+    Ok(if pred(numeric_cmp(*a, b)?) { T } else { NIL })
 }
 
 /// Evaluate each form in `forms`, keeping the results GC-rooted across the whole
@@ -14414,6 +14586,15 @@ impl Drop for DynBind {
     }
 }
 
+/// `saved` is a heap-capable value held for the whole body evaluation; a
+/// rooted `Vec<DynBind>` keeps it precise across allocation, so the restore on
+/// drop writes back a relocated — not stale — value (moving GC; bliss-8qf).
+impl bliss_rt::gc::TraceHostRoots for DynBind {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        visit(&mut self.saved);
+    }
+}
+
 fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, BlissError> {
     let (bindings_form, body) = cp(cdr);
     let parent = Rc::clone(&env.frame);
@@ -14421,13 +14602,20 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
     if sequential {
         // let*: one child frame; each init sees the bindings established before it.
         return with_child_frame(env, parent, move |env| {
+            // Root the binding-list cursor, the body, and the DynBind guards
+            // (their `saved` cells) across the allocating init evaluations
+            // (moving GC; bliss-8qf).
+            bliss_rt::rooted!(body = body);
+            bliss_rt::rooted!(c = bindings_form);
             // Special bindings are dynamic (global cell); the guards restore on
             // scope exit. Held for the whole body so later inits see earlier
             // special bindings, matching lexical ones.
-            let mut dyn_binds: Vec<DynBind> = Vec::new();
-            let mut c = bindings_form;
+            bliss_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
             while c.is_cons() {
-                let (binding, rest) = cp(c);
+                let (binding, rest) = cp(*c);
+                // Advance the rooted cursor first so the rest of the list stays
+                // precise across the init evaluation.
+                *c = rest;
                 if binding.is_cons() {
                     let (var_form, val_rest) = cp(binding);
                     let (val_form, _) = cp(val_rest);
@@ -14446,9 +14634,8 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                         env.define_local_symbol(binding, NIL);
                     }
                 }
-                c = rest;
             }
-            eval_progn(body, env)
+            eval_progn(*body, env)
         });
     }
 
@@ -14456,11 +14643,17 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
     // visible. The evaluated values must be GC-rooted across the loop: a later
     // init allocates and can trigger a relocating minor GC that would leave the
     // earlier (bare `Vec`-resident) values dangling before they are bound into
-    // the — scanned — child frame (bliss-6b2 #2).
+    // the — scanned — child frame (bliss-6b2 #2). The list cursor and the body
+    // are heap conses that must stay precise across the same evaluations
+    // (moving GC; bliss-8qf).
     bliss_rt::rooted!(evaluated = Vec::<(BlissVal, BlissVal)>::new());
-    let mut c = bindings_form;
+    bliss_rt::rooted!(body = body);
+    bliss_rt::rooted!(c = bindings_form);
     while c.is_cons() {
-        let (binding, rest) = cp(c);
+        let (binding, rest) = cp(*c);
+        // Advance the rooted cursor first so the rest of the list stays precise
+        // across the init evaluation.
+        *c = rest;
         if binding.is_cons() {
             let (var_form, val_rest) = cp(binding);
             let (val_form, _) = cp(val_rest);
@@ -14469,13 +14662,16 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
         } else if binding.is_symbol() {
             evaluated.push((binding, NIL));
         }
-        c = rest;
     }
 
+    // Re-read the (GC-maintained) rooted body before moving a copy into the
+    // closure; nothing allocates between here and its use.
+    let body = *body;
     with_child_frame(env, parent, move |env| {
         // Special bindings are dynamic (global cell) with RAII restore; the rest
-        // are lexical frame bindings.
-        let mut dyn_binds: Vec<DynBind> = Vec::new();
+        // are lexical frame bindings. Rooted: the guards' saved cells stay
+        // precise across the body evaluation (moving GC; bliss-8qf).
+        bliss_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
         for i in 0..evaluated.len() {
             let (symbol, val) = evaluated[i];
             if is_special_var(symbol) {
@@ -14492,8 +14688,14 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
 
 // ── DEFUN ────────────────────────────────────────────────────────
 fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (name_form, rest) = cp(cdr);
-    let (params_form, body) = cp(rest);
+    let (mut name_form, rest) = cp(cdr);
+    let (mut params_form, mut body) = cp(rest);
+    // The implicit BLOCK wrapping and definition-time macroexpand allocate.
+    // Keep the source name/lambda-list/body precise until the function object
+    // or global SETF entry owns them (moving GC; bliss-8qf).
+    bliss_rt::rooted_ref!(_name_root = &mut name_form);
+    bliss_rt::rooted_ref!(_params_root = &mut params_form);
+    bliss_rt::rooted_ref!(_body_root = &mut body);
     // A defun body is wrapped in an implicit block named after the function
     // (ANSI 3.1.2.1), so `(return-from NAME ...)` works from anywhere in the
     // body — including inside nested flet/loop/etypecase forms. For `(setf x)`
@@ -14510,10 +14712,11 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     } else {
         None
     };
-    let body = match (block_name, resolve_sym("BLOCK")) {
+    body = match (block_name, resolve_sym("BLOCK")) {
         (Some(bn), Some(block_sym)) => {
-            let block_form = arena_cons(block_sym, arena_cons(bn, body));
-            arena_cons(block_form, NIL)
+            bliss_rt::rooted!(block_tail = arena_cons(bn, body));
+            bliss_rt::rooted!(block_form = arena_cons(block_sym, *block_tail));
+            arena_cons(*block_form, NIL)
         }
         _ => body,
     };
@@ -14521,7 +14724,7 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // re-gensyms) it on every call (bliss-lb6.11). This is a best-effort,
     // conservative pass: anything it leaves unexpanded is still handled by the
     // lazy expansion in `eval_list`, so it can only ever under-expand.
-    let body = mx_each(body, env, 0);
+    body = mx_each(body, env, 0);
     if name_form.is_symbol() {
         // Ordinary global function → the symbol's heap function cell
         // (bliss-jtc.6.8). Redefinition updates the existing function object in
@@ -14919,11 +15122,7 @@ fn bind_lambda_list_ex(
                 }
             } else {
                 let df = key_default_forms[*default_idx];
-                let dv = if df == NIL {
-                    NIL
-                } else {
-                    eval_form(df, env)?
-                };
+                let dv = if df == NIL { NIL } else { eval_form(df, env)? };
                 env.define_local(var, dv);
                 if let Some(sp) = supp {
                     env.define_local(sp, NIL);
@@ -15695,8 +15894,13 @@ fn mx_each(list: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
     }
     // `c` is the (usually NIL) tail; preserve it so dotted lists round-trip.
     let mut out = c;
-    for &it in items.iter().rev() {
-        out = arena_cons(macroexpand_all(it, env, depth), out);
+    // `items` and `out` hold heap-capable forms across recursive expansion and
+    // cons allocation; keep both precise under the moving collector (bliss-l3n).
+    bliss_rt::rooted_ref!(_items_root = &mut items);
+    bliss_rt::rooted_ref!(_out_root = &mut out);
+    for i in (0..items.len()).rev() {
+        let expanded = macroexpand_all(items[i], env, depth);
+        out = arena_cons(expanded, out);
     }
     out
 }
@@ -15719,7 +15923,11 @@ fn macroexpand_all(form: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
 
     // `((lambda (..) ..) args..)` — expand the operator form and the arguments.
     if car.is_cons() {
-        return arena_cons(macroexpand_all(car, env, d), mx_each(cdr, env, d));
+        // Root across the allocating recursive expansions (moving GC; bliss-8qf).
+        bliss_rt::rooted!(cdr_r = cdr);
+        bliss_rt::rooted!(new_car = macroexpand_all(car, env, d));
+        let tail = mx_each(*cdr_r, env, d);
+        return arena_cons(*new_car, tail);
     }
     if !car.is_symbol() {
         return form;
@@ -15729,17 +15937,20 @@ fn macroexpand_all(form: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
     // 1. Macro call → expand once, then recurse into the expansion. On any
     //    expander error, leave the original form for the lazy path.
     if let Some(mdef) = lookup_macro(env, &name) {
+        // Root the original form across the allocating expansion: the Err path
+        // returns it verbatim (moving GC; bliss-8qf).
+        bliss_rt::rooted!(form_r = form);
         return match expand_macro(&mdef, cdr, env, form) {
             Ok(expanded) => macroexpand_all(expanded, env, d),
-            Err(_) => form,
+            Err(_) => *form_r,
         };
     }
 
     // 2. Special forms that must NOT be walked generically.
     match name.as_str() {
         // Data / sublanguages / local-macro scopes: leave the whole form.
-        "QUOTE" | "BLISS::QUASIQUOTE" | "MACROLET" | "SYMBOL-MACROLET" | "LOOP" | "DECLARE"
-        | "GO" => form,
+        "QUOTE" | "BLISS::QUASIQUOTE" | "MACROLET" | "SYMBOL-MACROLET" | "LOOP" | "DOTIMES"
+        | "DOLIST" | "DECLARE" | "GO" => form,
 
         // Binding forms: expand init-forms and bodies but preserve the bound
         // names (a variable named like a macro must not be expanded away).
@@ -15887,7 +16098,19 @@ fn expand_macro(
     // root it so the bound form is not left dangling (bliss-6b2 #2).
     bliss_rt::rooted_ref!(_whole_root = &mut whole);
     let mut child_env = env.child_with_parent(Rc::clone(&mdef.captured_frame));
-    let arg_list = list_to_vec(args);
+    // Root the forked expansion Env for the WHOLE expansion — both branches:
+    // run_macro (bytecode expanders) and the tree-walked body below allocate
+    // heavily, and the fork's frame chain is otherwise unscanned (bliss-8qf;
+    // previously only the tree-walk branch was rooted).
+    bliss_rt::rooted_ref!(_child_root = &mut child_env);
+    // Root the macro-call argument FORMS: they are conses from the call site,
+    // held across every allocation below until bind_macro_lambda_list binds
+    // them. Unrooted, a stress-stride GC left them stale and the expansion was
+    // built from scrambled/cyclic forms — the bliss-8qf corruption (silently
+    // wrong dotimes/push results, "undefined function: I", eval spinning on a
+    // self-referential AND). This was gc-root-lint baseline finding
+    // `expand_macro:arg_list`.
+    bliss_rt::rooted!(arg_list = list_to_vec(args));
     if let Some(function) = &mdef.bytecode {
         return bytecode::run_macro(
             Rc::new(function.borrow().clone()),
@@ -15906,15 +16129,8 @@ fn expand_macro(
     } else {
         None
     };
-    // Register the forked expansion Env as a GC root for the whole expansion:
-    // `env.child_with_parent` forks a whole Env, so the macro parameters and
-    // every variable the body binds (e.g. a `loop`/`case` iteration var inside a
-    // quasiquote — as in asdf's `with-upgradability`) live on a frame chain a
-    // relocating minor GC would otherwise never scan, freeing them mid-expansion
-    // (bliss-6b2 #2). The guard must precede the bind: building a `&rest`/`&body`
-    // list allocates and can fire a GC before the body even runs. Same guard as
-    // eval_flet / eval_macrolet.
-    bliss_rt::rooted_ref!(_child_root = &mut child_env);
+    // (child_env is rooted above, before the arg-list build — the guard must
+    // precede every allocation, including building a `&rest`/`&body` list.)
     bind_macro_lambda_list(
         mdef.params_form,
         &arg_list,
@@ -15922,7 +16138,9 @@ fn expand_macro(
         macroexpand_env.as_ref(),
         Some(whole),
     )?;
-    eval_progn(mdef.body, &mut child_env)
+    let expansion = eval_progn(mdef.body, &mut child_env)?;
+    debug_validate_form("expand-result", "tree-walk-macro", expansion);
+    Ok(expansion)
 }
 
 fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
@@ -16172,8 +16390,11 @@ fn eval_macroexpand(
     env: &mut Env,
     single_step: bool,
 ) -> Result<BlissVal, BlissError> {
-    let (form_expr, rest) = cp(cdr);
-    let form = eval_form(form_expr, env)?;
+    let (form_expr, mut rest) = cp(cdr);
+    // Root across the allocating form/env evaluations (moving GC; bliss-8qf).
+    bliss_rt::rooted_ref!(_rest_root = &mut rest);
+    let mut form = eval_form(form_expr, env)?;
+    bliss_rt::rooted_ref!(_form_root = &mut form);
     let macro_env = if rest.is_cons() {
         let (env_expr, _) = cp(rest);
         let env_value = eval_form(env_expr, env)?;
@@ -16273,9 +16494,7 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             continue;
         }
         let (opt_key, opt_rest) = cp(option);
-        if !opt_key.is_symbol()
-            || symbol_bare_name(&sym_name(opt_key)) != "DEFAULT-INITARGS"
-        {
+        if !opt_key.is_symbol() || symbol_bare_name(&sym_name(opt_key)) != "DEFAULT-INITARGS" {
             continue;
         }
         let pairs = list_to_vec(opt_rest);
@@ -16683,8 +16902,12 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         Some(p) => vec_to_list(&[p]),
         None => NIL,
     };
-    let defclass_form =
-        vec_to_list(&[sym("DEFCLASS"), name_sym, supers, vec_to_list(&slot_clauses)]);
+    let defclass_form = vec_to_list(&[
+        sym("DEFCLASS"),
+        name_sym,
+        supers,
+        vec_to_list(&slot_clauses),
+    ]);
     eval_form(defclass_form, env)?;
 
     // Constructors. A keyword constructor forwards every initarg to
@@ -16950,32 +17173,40 @@ fn install_slot_accessor_method(
     is_writer: bool,
 ) -> Result<(), BlissError> {
     let obj = reader::make_uninterned_symbol("O");
-    let obj_spec = vec_to_list(&[obj, class_form]); // (o CLASS)
-    let quoted_slot = vec_to_list(&[quote_sym(), slot_sym]); // 'SLOT
-    let slot_place = vec_to_list(&[
-        resolve_sym("SLOT-VALUE").unwrap_or(NIL),
-        obj,
-        quoted_slot,
-    ]); // (slot-value o 'SLOT)
+    // Root each fresh cons across the subsequent allocating list builds
+    // (moving GC; bliss-8qf): `method_name` may itself be a `(SETF acc)` cons.
+    bliss_rt::rooted!(method_name_r = method_name);
+    bliss_rt::rooted!(obj_spec = vec_to_list(&[obj, class_form])); // (o CLASS)
+    bliss_rt::rooted!(quoted_slot = vec_to_list(&[quote_sym(), slot_sym])); // 'SLOT
+    bliss_rt::rooted!(
+        slot_place = vec_to_list(&[resolve_sym("SLOT-VALUE").unwrap_or(NIL), obj, *quoted_slot,])
+    ); // (slot-value o 'SLOT)
     let (lambda_list, body) = if is_writer {
         let val = reader::make_uninterned_symbol("V");
         // (v (o CLASS)) — value unspecialized, object specialized on CLASS
-        let ll = vec_to_list(&[val, obj_spec]);
+        bliss_rt::rooted!(ll = vec_to_list(&[val, *obj_spec]));
         // (setf (slot-value o 'SLOT) v)
-        let setf = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), slot_place, val]);
-        (ll, setf)
+        let setf = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *slot_place, val]);
+        (*ll, setf)
     } else {
         // ((o CLASS)) — a one-argument reader specialized on CLASS
-        (vec_to_list(&[obj_spec]), slot_place)
+        (vec_to_list(&[*obj_spec]), *slot_place)
     };
-    let defmethod_cdr = arena_cons(method_name, arena_cons(lambda_list, vec_to_list(&[body])));
+    // Sequence the nested conses through roots: a value held in a Rust temp
+    // across a nested allocating call is invisible to the GC (bliss-8qf).
+    bliss_rt::rooted!(lambda_list_r = lambda_list);
+    bliss_rt::rooted!(body_tail = vec_to_list(&[body]));
+    bliss_rt::rooted!(inner = arena_cons(*lambda_list_r, *body_tail));
+    let defmethod_cdr = arena_cons(*method_name_r, *inner);
     eval_defmethod(defmethod_cdr, env)?;
     Ok(())
 }
 
 // ── MAKE-INSTANCE ────────────────────────────────────────────────
 fn eval_make_instance(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (class_form, init_args) = cp(cdr);
+    let (class_form, mut init_args) = cp(cdr);
+    // Root across the allocating class-form evaluation (moving GC; bliss-8qf).
+    bliss_rt::rooted_ref!(_initargs_root = &mut init_args);
     let class_input = eval_form(class_form, env)?;
     let class = resolve_class_metaobject(env, class_input)?;
     let class_name = class_name_for_instance_class(class);
@@ -17371,10 +17602,12 @@ fn apply_builtin_fast(
         }
         "GETHASH" if args.len() >= 2 => {
             let default = if args.len() >= 3 { args[2] } else { NIL };
-            Some(bliss_stdlib::gethash(args[0], args[1], default).map(|(val, present)| {
-                env.set_mv(vec![val, if present { T } else { NIL }]);
-                val
-            }))
+            Some(
+                bliss_stdlib::gethash(args[0], args[1], default).map(|(val, present)| {
+                    env.set_mv(vec![val, if present { T } else { NIL }]);
+                    val
+                }),
+            )
         }
         "BLISS::PUT-GETHASH" if args.len() == 3 => {
             // SETF value-first order: value, key, table (matches the operator handler).
@@ -17592,8 +17825,12 @@ fn eval_floor(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
 // ── MULTIPLE-VALUE-BIND ─────────────────────────────────────────
 fn eval_multiple_value_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (vars_form, rest) = cp(cdr);
-    let (values_form, body) = cp(rest);
+    let (mut vars_form, rest) = cp(cdr);
+    let (values_form, mut body) = cp(rest);
+
+    // Root across the allocating values-form evaluation (moving GC; bliss-8qf).
+    bliss_rt::rooted_ref!(_vars_root = &mut vars_form);
+    bliss_rt::rooted_ref!(_body_root = &mut body);
 
     // Evaluate the values form
     env.clear_mv();
@@ -17842,14 +18079,19 @@ fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
 
 // ── RESTART-CASE ────────────────────────────────────────────────
 fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (restartable_form, clauses) = cp(cdr);
+    let (mut restartable_form, clauses) = cp(cdr);
     let base_len = env.restarts.len();
     let captured_frame = Rc::clone(&env.frame);
-    let mut c = clauses;
+    // Root the protected form and the clause cursor across the allocating
+    // clause-lambda conses (moving GC; bliss-8qf).
+    bliss_rt::rooted_ref!(_form_root = &mut restartable_form);
+    bliss_rt::rooted!(c = clauses);
     while c.is_cons() {
-        let (clause, rest) = cp(c);
+        let (clause, _) = cp(*c);
         let (name_form, clause_rest) = cp(clause);
-        let (params_form, body) = cp(clause_rest);
+        let (mut params_form, mut body) = cp(clause_rest);
+        bliss_rt::rooted_ref!(_params_root = &mut params_form);
+        bliss_rt::rooted_ref!(_clause_body_root = &mut body);
         env.restarts.push(RestartEntry {
             name: sym_name(name_form).to_uppercase(),
             function: RestartFunction::FunctionForm {
@@ -17863,7 +18105,8 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
             test_function: None,
             unwind_on_invoke: true,
         });
-        c = rest;
+        // Re-read the tail from the rooted cursor after the allocations.
+        *c = cp(*c).1;
     }
 
     let result = eval_form(restartable_form, env);
@@ -17922,12 +18165,16 @@ fn eval_cerror(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 
 // ── WITH-OPEN-FILE ──────────────────────────────────────────────
 fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (binding, body) = cp(cdr);
+    let (binding, mut body) = cp(cdr);
     let (var_form, rest) = cp(binding);
-    let (path_form, opts_rest) = cp(rest);
+    let (path_form, mut opts_rest) = cp(rest);
 
     let var_name = sym_name(var_form);
-    let path_val = eval_form(path_form, env)?;
+    // Root across the allocating path/option evaluations (moving GC; bliss-8qf).
+    bliss_rt::rooted_ref!(_body_root = &mut body);
+    bliss_rt::rooted_ref!(_opts_rest_root = &mut opts_rest);
+    let mut path_val = eval_form(path_form, env)?;
+    bliss_rt::rooted_ref!(_path_root = &mut path_val);
     let path = val_as_str(path_val);
 
     // Check sandbox mode
@@ -17941,11 +18188,17 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
     // Parse options. WITH-OPEN-FILE is a macro whose option VALUES are ordinary
     // forms (e.g. ASDF passes `:direction direction`, a variable), so each value
     // must be EVALUATED — not read as a literal keyword.
-    let opts = list_to_vec(opts_rest);
+    let mut opts = list_to_vec(opts_rest);
+    // Root the option forms and the evaluated option values across the
+    // allocating per-option evaluations below (moving GC; bliss-8qf).
+    bliss_rt::rooted_ref!(_opts_vec_root = &mut opts);
     let mut direction = bliss_stdlib::StreamDirection::Input;
     let mut element_type = T;
+    bliss_rt::rooted_ref!(_element_type_root = &mut element_type);
     let mut if_exists = T;
+    bliss_rt::rooted_ref!(_if_exists_root = &mut if_exists);
     let mut if_does_not_exist = NIL;
+    bliss_rt::rooted_ref!(_if_dne_root = &mut if_does_not_exist);
     let mut if_dne_supplied = false;
     let mut i = 0;
     while i + 1 < opts.len() {
@@ -17985,7 +18238,7 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
     }
 
     // Open the file via the standard-library stream machinery.
-    let stream_val = bliss_stdlib::open(
+    let mut stream_val = bliss_stdlib::open(
         path_val,
         direction,
         element_type,
@@ -17993,6 +18246,9 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
         if_does_not_exist,
         bliss_stdlib::ExternalFormat::Utf8,
     )?;
+    // Root the stream (a heap object) across the allocating body evaluation:
+    // it is dereferenced by `close` after the body runs (moving GC; bliss-8qf).
+    bliss_rt::rooted_ref!(_stream_root = &mut stream_val);
 
     let parent = Rc::clone(&env.frame);
     // Evaluate body in a fresh frame on the same env, then close the stream

@@ -44,10 +44,9 @@ use bliss_rt::{CodeInfo, Frame};
 use super::{
     DynBind, Env, EnvFrame, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry,
     RestartFunction, apply_function, arena_cons, arena_str, bliss_error_to_condition,
-    condition_matches_handler, cp, eval_form, handler_case_token, list_to_vec,
-    next_control_token, resolve_sym, restart_invoked_name, run_handler_bind_handlers,
-    store_control_value, sym_name, symbol_bare_name, tag_key, take_control_value, val_as_str,
-    vec_to_list,
+    condition_matches_handler, cp, eval_form, handler_case_token, list_to_vec, next_control_token,
+    resolve_sym, restart_invoked_name, run_handler_bind_handlers, store_control_value, sym_name,
+    symbol_bare_name, tag_key, take_control_value, val_as_str, vec_to_list,
 };
 // Label-based assembler backing the native (T1) code emitter (see cli::asm).
 use bliss_rt::asm::{Asm, Cc, Label};
@@ -65,10 +64,23 @@ pub fn backend_is_bytecode() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("BLISS_BACKEND") {
-        Ok(v) => !matches!(
-            v.to_ascii_lowercase().as_str(),
-            "tree-walker" | "treewalker" | "tree_walker" | "tw" | "interp" | "walker"
-        ),
+        Ok(v) => {
+            let lower = v.to_ascii_lowercase();
+            match lower.as_str() {
+                // "treewalk" included: its absence silently selected the
+                // bytecode backend, which cost a debugging session (bliss-8qf).
+                "tree-walker" | "treewalker" | "treewalk" | "tree_walker" | "tw" | "interp"
+                | "walker" => false,
+                "bytecode" | "bc" => true,
+                other => {
+                    eprintln!(
+                        "bliss: unrecognized BLISS_BACKEND={other:?}; defaulting to \
+                         bytecode (use \"bytecode\" or \"tree-walker\")"
+                    );
+                    true
+                }
+            }
+        }
         Err(_) => true,
     })
 }
@@ -1555,7 +1567,9 @@ impl<'e> Lowerer<'e> {
         // tree-walker uses) and lower the expansion. lower_expr recurses, so a
         // macro that expands to another macro is handled too.
         if super::macro_defined(self.env, name) {
-            let form = arena_cons(op, rest);
+            let mut form = arena_cons(op, rest);
+            // Root across the allocating macro-env build (moving GC; bliss-8qf).
+            bliss_rt::rooted_ref!(_form_root = &mut form);
             if self.macro_env.is_none() {
                 self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
             }
@@ -1568,7 +1582,9 @@ impl<'e> Lowerer<'e> {
         // Compiler macros are optional call rewrites, distinct from ordinary
         // macro operators. Apply exactly one step here and let lower_expr
         // process the accepted replacement recursively.
-        let form = arena_cons(op, rest);
+        let mut form = arena_cons(op, rest);
+        // Root across the allocating macro-env build (moving GC; bliss-8qf).
+        bliss_rt::rooted_ref!(_form_root = &mut form);
         if self.macro_env.is_none() {
             self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
         }
@@ -1781,7 +1797,9 @@ impl<'e> Lowerer<'e> {
                 // the internal store primitive BLISS::SET-AREF (seq, index, value).
                 bliss_rt::rooted_ref!(_seq_root = &mut seq);
                 bliss_rt::rooted_ref!(_index_root = &mut index);
-                let sym = resolve_sym("BLISS::SET-AREF").ok_or(Bail)?.as_symbol_index();
+                let sym = resolve_sym("BLISS::SET-AREF")
+                    .ok_or(Bail)?
+                    .as_symbol_index();
                 self.lower_expr(seq)?;
                 self.lower_expr(index)?;
                 self.lower_expr(items[2 * i + 1])?;
@@ -1801,7 +1819,10 @@ impl<'e> Lowerer<'e> {
                     .as_symbol_index();
                 self.lower_expr(sym_form)?; // symbol
                 self.lower_expr(items[2 * i + 1])?; // value
-                self.emit(Instr::CallNamed { sym: setter, nargs: 2 });
+                self.emit(Instr::CallNamed {
+                    sym: setter,
+                    nargs: 2,
+                });
                 self.pop_n(2);
                 self.push_n(1);
                 if !last {
@@ -2135,26 +2156,21 @@ impl<'e> Lowerer<'e> {
         let test = form_list(&[s("<")?, var, limit]);
         bliss_rt::rooted!(when_items = vec![s("WHEN")?, test]);
         when_items.extend(list_to_vec(body));
-        when_items.push(form_list(&[
-            s("SETQ")?,
-            var,
-            form_list(&[s("+")?, var, BlissVal::from_fixnum(1)]),
-        ]));
+        bliss_rt::rooted!(inc = form_list(&[s("+")?, var, BlissVal::from_fixnum(1)]));
+        when_items.push(form_list(&[s("SETQ")?, var, *inc]));
         when_items.push(form_list(&[s("GO")?, top]));
-        let tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        bliss_rt::rooted!(when_form = form_list(&when_items));
+        bliss_rt::rooted!(tagbody_form = form_list(&[s("TAGBODY")?, top, *when_form]));
 
-        let bindings = form_list(&[
-            form_list(&[var, BlissVal::from_fixnum(0)]),
-            form_list(&[limit, count_form]),
-        ]);
-        let let_form = form_list(&[
-            s("LET")?,
-            bindings,
-            tagbody_form,
-            form_list(&[s("SETQ")?, var, limit]),
-            result,
-        ]);
-        self.lower_expr(form_list(&[s("BLOCK")?, NIL, let_form]))
+        bliss_rt::rooted!(var_binding = form_list(&[var, BlissVal::from_fixnum(0)]));
+        bliss_rt::rooted!(limit_binding = form_list(&[limit, count_form]));
+        bliss_rt::rooted!(bindings = form_list(&[*var_binding, *limit_binding]));
+        bliss_rt::rooted!(final_setq = form_list(&[s("SETQ")?, var, limit]));
+        bliss_rt::rooted!(
+            let_form = form_list(&[s("LET")?, *bindings, *tagbody_form, *final_setq, result])
+        );
+        let block_form = form_list(&[s("BLOCK")?, NIL, *let_form]);
+        self.lower_expr(block_form)
     }
 
     /// `(dolist (var list [result]) body...)` (bliss-jtc.28). Expansion:
@@ -2193,11 +2209,13 @@ impl<'e> Lowerer<'e> {
         let top = resolve_sym(&format!("%DOLIST-TOP{id}")).ok_or(Bail)?;
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
 
-        bliss_rt::rooted!(when_items = vec![
-            s("WHEN")?,
-            rest_var,
-            form_list(&[s("SETQ")?, var, form_list(&[s("CAR")?, rest_var])]),
-        ]);
+        bliss_rt::rooted!(
+            when_items = vec![
+                s("WHEN")?,
+                rest_var,
+                form_list(&[s("SETQ")?, var, form_list(&[s("CAR")?, rest_var])]),
+            ]
+        );
         when_items.extend(list_to_vec(body));
         when_items.push(form_list(&[
             s("SETQ")?,
@@ -2352,16 +2370,15 @@ impl<'e> Lowerer<'e> {
                             bindings.push(form_list(&[lst, list]));
                             let mut adv = 4;
                             // optional `by STEPFN`
-                            let mut step_expr = if kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref()
-                                == Some("BY")
-                            {
-                                let mut f = *forms.get(i + 5).ok_or(Bail)?;
-                                bliss_rt::rooted_ref!(_f_root = &mut f);
-                                adv = 6;
-                                form_list(&[s("FUNCALL")?, f, lst])
-                            } else {
-                                form_list(&[s("CDR")?, lst])
-                            };
+                            let mut step_expr =
+                                if kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref() == Some("BY") {
+                                    let mut f = *forms.get(i + 5).ok_or(Bail)?;
+                                    bliss_rt::rooted_ref!(_f_root = &mut f);
+                                    adv = 6;
+                                    form_list(&[s("FUNCALL")?, f, lst])
+                                } else {
+                                    form_list(&[s("CDR")?, lst])
+                                };
                             bliss_rt::rooted_ref!(_step_expr_root = &mut step_expr);
                             top_tests.push(form_list(&[
                                 s("WHEN")?,
@@ -2508,11 +2525,7 @@ impl<'e> Lowerer<'e> {
                 Some("UNTIL") => {
                     let mut test = *forms.get(i + 1).ok_or(Bail)?;
                     bliss_rt::rooted_ref!(_test_root = &mut test);
-                    pre.push(form_list(&[
-                        s("WHEN")?,
-                        test,
-                        form_list(&[s("GO")?, end]),
-                    ]));
+                    pre.push(form_list(&[s("WHEN")?, test, form_list(&[s("GO")?, end])]));
                     i += 2;
                 }
                 Some("DO") | Some("DOING") => {
@@ -2616,11 +2629,7 @@ impl<'e> Lowerer<'e> {
                     };
                     bliss_rt::rooted_ref!(_cond_form_root = &mut cond_form);
                     let binding = form_list(&[it_temp, test]);
-                    body.push(form_list(&[
-                        s("LET")?,
-                        form_list(&[binding]),
-                        cond_form,
-                    ]));
+                    body.push(form_list(&[s("LET")?, form_list(&[binding]), cond_form]));
                 }
                 Some("COLLECT") | Some("COLLECTING") | Some("APPEND") | Some("APPENDING")
                 | Some("NCONC") | Some("NCONCING") | Some("SUM") | Some("SUMMING")
@@ -2701,10 +2710,12 @@ impl<'e> Lowerer<'e> {
         bliss_rt::rooted!(per_iter = per_iter);
         bliss_rt::rooted_ref!(_result_root = &mut result);
 
-        bliss_rt::rooted!(when_items = vec![
-            s("WHEN")?,
-            form_list(&[s(">")?, count, BlissVal::from_fixnum(0)]),
-        ]);
+        bliss_rt::rooted!(
+            when_items = vec![
+                s("WHEN")?,
+                form_list(&[s(">")?, count, BlissVal::from_fixnum(0)]),
+            ]
+        );
         when_items.extend(per_iter.iter().copied());
         when_items.push(form_list(&[
             s("SETQ")?,
@@ -2801,11 +2812,13 @@ impl<'e> Lowerer<'e> {
         let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
         bliss_rt::rooted_ref!(_tagbody_form_root = &mut tagbody_form);
 
-        bliss_rt::rooted!(binding_items = vec![
-            form_list(&[var, start]),
-            form_list(&[end_v, end]),
-            form_list(&[step_v, step]),
-        ]);
+        bliss_rt::rooted!(
+            binding_items = vec![
+                form_list(&[var, start]),
+                form_list(&[end_v, end]),
+                form_list(&[step_v, step]),
+            ]
+        );
         if uses_acc {
             binding_items.push(form_list(&[acc, acc_init]));
         }
@@ -2848,11 +2861,8 @@ impl<'e> Lowerer<'e> {
                 }
                 // Root the per-iteration cons across the trailing NREVERSE
                 // form_list (moving GC; bliss-wlf).
-                let mut item = form_list(&[
-                    s("SETQ")?,
-                    acc,
-                    form_list(&[s("CONS")?, tail[1], acc]),
-                ]);
+                let mut item =
+                    form_list(&[s("SETQ")?, acc, form_list(&[s("CONS")?, tail[1], acc])]);
                 bliss_rt::rooted_ref!(_item_root = &mut item);
                 let result = form_list(&[s("NREVERSE")?, acc]);
                 Ok((true, NIL, vec![item], result))
@@ -2957,7 +2967,12 @@ impl<'e> Lowerer<'e> {
             bliss_rt::rooted_ref!(_list_root = &mut list);
             let lst = resolve_sym(&format!("%LOOP-LST{id}_{idx}")).ok_or(Bail)?;
             binding_items.push(form_list(&[lst, list]));
-            bind_pattern(pattern, form_list(&[s("CAR")?, lst]), binding_items, assignments)?;
+            bind_pattern(
+                pattern,
+                form_list(&[s("CAR")?, lst]),
+                binding_items,
+                assignments,
+            )?;
             steps.push(form_list(&[s("SETQ")?, lst, form_list(&[s("CDR")?, lst])]));
             Ok(lst)
         };
@@ -3073,7 +3088,9 @@ impl<'e> Lowerer<'e> {
         let snapshot_sym = resolve_sym(snapshot_fn).ok_or(Bail)?;
         let mut snapshot = form_list(&[snapshot_sym, table]);
         bliss_rt::rooted_ref!(_snapshot_root = &mut snapshot);
-        bliss_rt::rooted!(normalized = vec![forms[0], forms[1], resolve_sym("IN").ok_or(Bail)?, snapshot]);
+        bliss_rt::rooted!(
+            normalized = vec![forms[0], forms[1], resolve_sym("IN").ok_or(Bail)?, snapshot]
+        );
         normalized.extend_from_slice(action);
         self.lower_loop_for_in(&normalized)
     }
@@ -3103,7 +3120,8 @@ impl<'e> Lowerer<'e> {
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
         let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
-        let (uses_acc, acc_init, per_iter, mut result) = self.lower_loop_action(&forms[4..], acc)?;
+        let (uses_acc, acc_init, per_iter, mut result) =
+            self.lower_loop_action(&forms[4..], acc)?;
         bliss_rt::rooted!(per_iter = per_iter);
         bliss_rt::rooted_ref!(_result_root = &mut result);
 
@@ -3147,7 +3165,8 @@ impl<'e> Lowerer<'e> {
         let s = |n: &str| resolve_sym(n).ok_or(Bail);
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
         let acc = resolve_sym(&format!("%LOOP-ACC{id}")).ok_or(Bail)?;
-        let (uses_acc, acc_init, per_iter, mut result) = self.lower_loop_action(&forms[2..], acc)?;
+        let (uses_acc, acc_init, per_iter, mut result) =
+            self.lower_loop_action(&forms[2..], acc)?;
         bliss_rt::rooted!(per_iter = per_iter);
         bliss_rt::rooted_ref!(_result_root = &mut result);
 
@@ -3575,7 +3594,11 @@ impl<'e> Lowerer<'e> {
         let e = resolve_sym(&e_name).ok_or(Bail)?;
         let quoted_unquote = form_list(&[resolve_sym("QUOTE").ok_or(Bail)?, unquote_sym]);
         let list_call = form_list(&[resolve_sym("LIST").ok_or(Bail)?, quoted_unquote, e]);
-        let lambda = form_list(&[resolve_sym("LAMBDA").ok_or(Bail)?, form_list(&[e]), list_call]);
+        let lambda = form_list(&[
+            resolve_sym("LAMBDA").ok_or(Bail)?,
+            form_list(&[e]),
+            list_call,
+        ]);
         Ok(form_list(&[resolve_sym("MAPCAR").ok_or(Bail)?, lambda, x]))
     }
 
@@ -3689,7 +3712,11 @@ impl<'e> Lowerer<'e> {
         bliss_rt::rooted_ref!(_progn_root = &mut progn);
         let mut values = form_list(&[resolve_sym("VALUES").ok_or(Bail)?, NIL, cvar]);
         bliss_rt::rooted_ref!(_values_root = &mut values);
-        let mut clause = form_list(&[resolve_sym("ERROR").ok_or(Bail)?, form_list(&[cvar]), values]);
+        let mut clause = form_list(&[
+            resolve_sym("ERROR").ok_or(Bail)?,
+            form_list(&[cvar]),
+            values,
+        ]);
         bliss_rt::rooted_ref!(_clause_root = &mut clause);
         let hc = form_list(&[resolve_sym("HANDLER-CASE").ok_or(Bail)?, progn, clause]);
         self.lower_expr(hc)
@@ -4007,9 +4034,8 @@ impl<'e> Lowerer<'e> {
             for f in list_to_vec(fbody) {
                 collect_symbol_names(f, &mut used);
             }
-            used.iter().any(|u| {
-                enclosing.contains(u) && !params.contains(u) && !local_names.contains(u)
-            })
+            used.iter()
+                .any(|u| enclosing.contains(u) && !params.contains(u) && !local_names.contains(u))
         });
         if is_capturing {
             return Err(Bail);
@@ -4559,11 +4585,7 @@ fn apply_loop_accumulation(
             let acc = count_acc.unwrap();
             bliss_rt::rooted!(inc = form_list(&[s("1+")?, acc]));
             bliss_rt::rooted!(setq = form_list(&[s("SETQ")?, acc, *inc]));
-            out.push(form_list(&[
-                s("WHEN")?,
-                *expr,
-                *setq,
-            ]));
+            out.push(form_list(&[s("WHEN")?, *expr, *setq]));
         }
         _ => return Err(Bail),
     }
@@ -6935,7 +6957,11 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, BlissError> {
         };
         if matches!(
             pname.as_str(),
-            "COMMON-LISP" | "COMMON-LISP-USER" | "KEYWORD" | "BLISS" | "BLISS-EXT"
+            "COMMON-LISP"
+                | "COMMON-LISP-USER"
+                | "KEYWORD"
+                | "BLISS"
+                | "BLISS-EXT"
                 | "BLISS-INTERNAL"
         ) {
             continue;
@@ -7093,8 +7119,9 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, BlissError> {
                 .get(gname)
                 .and_then(|ms| ms.first().map(|m| m.specializers.len()))
                 .unwrap_or(0);
-            let params: Vec<BlissVal> =
-                (0..arity).filter_map(|i| resolve_sym(&format!("A{i}"))).collect();
+            let params: Vec<BlissVal> = (0..arity)
+                .filter_map(|i| resolve_sym(&format!("A{i}")))
+                .collect();
             let params_list = vec_to_list(&params);
             let (Some(mc_kw), Some(comb_sym)) =
                 (resolve_sym(":METHOD-COMBINATION"), resolve_sym(comb))
@@ -7151,19 +7178,17 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, BlissError> {
                                 }
                             }
                         }
-                        super::MethodSpecializer::Eql(v) => {
-                            match (resolve_sym("EQL"), quote) {
-                                (Some(eql), Some(q)) => {
-                                    let quoted = vec_to_list(&[q, *v]);
-                                    let eql_form = vec_to_list(&[eql, quoted]);
-                                    spec_params.push(vec_to_list(&[*p, eql_form]));
-                                }
-                                _ => {
-                                    ok = false;
-                                    break;
-                                }
+                        super::MethodSpecializer::Eql(v) => match (resolve_sym("EQL"), quote) {
+                            (Some(eql), Some(q)) => {
+                                let quoted = vec_to_list(&[q, *v]);
+                                let eql_form = vec_to_list(&[eql, quoted]);
+                                spec_params.push(vec_to_list(&[*p, eql_form]));
                             }
-                        }
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        },
                     }
                 }
                 if !ok {
@@ -7222,9 +7247,13 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, BlissError> {
         // Prefer installed bytecode; otherwise re-express a tree-walked
         // interpreted-function from its retained source lambda-list + body.
         if let Some(bf) = registry_get(idx) {
-            if let Some(function_index) =
-                serialize_bbu_function_tree(&bf, name_ref, BBU_FUNC_NAMED, &mut pool, &mut functions)
-            {
+            if let Some(function_index) = serialize_bbu_function_tree(
+                &bf,
+                name_ref,
+                BBU_FUNC_NAMED,
+                &mut pool,
+                &mut functions,
+            ) {
                 load_actions.push((3, 0, function_index, name_ref, BBU_NO_INDEX));
                 continue;
             }
@@ -7260,21 +7289,24 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, BlissError> {
         // be encoded into the constant pool; `pool.value` returns None for them, so
         // they are silently skipped — leaving user data (numbers, strings, lists,
         // symbols), which is exactly what a restored image should carry.
-        let mut emit_global = |idx: u32, value: BlissVal, pool: &mut BbuConstPool,
-                               load_actions: &mut Vec<(u8, u8, u32, u32, u32)>| {
-            if !emitted.insert(idx) {
-                return;
-            }
-            if value == bliss_rt::value::UNBOUND {
-                return;
-            }
-            let sym = BlissVal::from_symbol_index(idx);
-            let quoted = arena_cons(quote, arena_cons(value, NIL));
-            let form = arena_cons(defparameter, arena_cons(sym, arena_cons(quoted, NIL)));
-            if let Some(form_ref) = pool.value(form) {
-                load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
-            }
-        };
+        let mut emit_global =
+            |idx: u32,
+             value: BlissVal,
+             pool: &mut BbuConstPool,
+             load_actions: &mut Vec<(u8, u8, u32, u32, u32)>| {
+                if !emitted.insert(idx) {
+                    return;
+                }
+                if value == bliss_rt::value::UNBOUND {
+                    return;
+                }
+                let sym = BlissVal::from_symbol_index(idx);
+                let quoted = arena_cons(quote, arena_cons(value, NIL));
+                let form = arena_cons(defparameter, arena_cons(sym, arena_cons(quoted, NIL)));
+                if let Some(form_ref) = pool.value(form) {
+                    load_actions.push((9, 0, form_ref, BBU_NO_INDEX, BBU_NO_INDEX));
+                }
+            };
         // (1) Global symbol value cells: runtime DEFPARAMETER/DEFVAR (a prelude
         //     macro) stores here, not in an env frame.
         for (idx, _name) in bliss_rt::symbols::interned_names() {
@@ -7298,11 +7330,9 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, BlissError> {
     // Now that every function/global/CLOS symbol is installed on its canonical
     // identity, flip the exported ones' visibility with a standard EXPORT so the
     // package interface is restored without disturbing those bindings.
-    if let (Some(export_op), Some(quote), Some(find_package)) = (
-        resolve_sym("EXPORT"),
-        quote,
-        resolve_sym("FIND-PACKAGE"),
-    ) {
+    if let (Some(export_op), Some(quote), Some(find_package)) =
+        (resolve_sym("EXPORT"), quote, resolve_sym("FIND-PACKAGE"))
+    {
         for (pname, syms) in &pending_exports {
             let quoted = vec_to_list(&[quote, vec_to_list(syms)]);
             let find = vec_to_list(&[find_package, arena_str(pname)]);
@@ -7358,7 +7388,9 @@ enum BbuConstant {
     /// ref) and reconstructed with `parse-namestring` on load. Pathnames are
     /// store-registered values, not plain heap objects, so they cannot be pooled
     /// structurally; the namestring round-trips a source-level literal faithfully.
-    Pathname { name_ref: u32 },
+    Pathname {
+        name_ref: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -8626,10 +8658,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 // EvalSource: arg0 is a constant-pool index of a source form to
                 // re-evaluate via the tree-walker at load time (the load-source
                 // fallback for forms the portable compiler can't lower).
-                if action.flags != 0
-                    || action.arg1 != BBU_NO_INDEX
-                    || action.arg2 != BBU_NO_INDEX
-                {
+                if action.flags != 0 || action.arg1 != BBU_NO_INDEX || action.arg2 != BBU_NO_INDEX {
                     return Err(bbu_error("EvalSource has unsupported flags/arguments"));
                 }
                 bbu_index(action.arg0, encoded_constants.len(), "eval-source form")?;
@@ -8641,8 +8670,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
     let constants = materialize_bbu_constants(&encoded_constants)?;
     let mut decoded_functions: Vec<BytecodeFunction> = Vec::with_capacity(encoded_functions.len());
     for (index, encoded) in encoded_functions.iter().enumerate() {
-        let mut function =
-            decode_bbu_function(encoded, &constants, &handler_case_tables[index])?;
+        let mut function = decode_bbu_function(encoded, &constants, &handler_case_tables[index])?;
         function.restart_cases = restart_tables[index]
             .iter()
             .map(|table| {
@@ -8654,11 +8682,12 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                         // function (a lower index). An out-of-range reference would
                         // otherwise index `decoded_functions` out of bounds and
                         // panic during load (bliss-jtc.23.4).
-                        let function = decoded_functions
-                            .get(function_ref as usize)
-                            .ok_or_else(|| {
-                                bbu_error("restart clause references an out-of-range function")
-                            })?;
+                        let function =
+                            decoded_functions
+                                .get(function_ref as usize)
+                                .ok_or_else(|| {
+                                    bbu_error("restart clause references an out-of-range function")
+                                })?;
                         Ok(RestartClauseInfo {
                             name: bbu_string_from_values(&constants, name_ref)?,
                             function: Box::new(function.clone()),
@@ -9183,9 +9212,7 @@ fn run_with_binding(
     // frame; one that only reads the enclosing scope uses the captured frame
     // directly.
     let closure_env = closure_captured_env(entry_fn_val);
-    let parent = closure_env
-        .clone()
-        .unwrap_or_else(|| Rc::clone(&env.frame));
+    let parent = closure_env.clone().unwrap_or_else(|| Rc::clone(&env.frame));
     let env_frame = make_env_frame(&entry, parent).or(closure_env);
     if macro_lambda_list {
         if let Err(e) = bind_macro_variadic(&entry, frame, args, env_frame.as_ref(), env) {
@@ -9331,11 +9358,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
             Instr::ValuesToList => {
                 let act = &mut acts[top_idx];
                 let primary = act.pop_op();
-                bliss_rt::rooted!(vals = if env.mv_active {
-                    env.mv.clone()
-                } else {
-                    vec![primary]
-                });
+                bliss_rt::rooted!(
+                    vals = if env.mv_active {
+                        env.mv.clone()
+                    } else {
+                        vec![primary]
+                    }
+                );
                 act.push_op(vec_to_list(&vals));
             }
             Instr::EvalHost(idx) => {
@@ -9763,9 +9792,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                         initiate_unwind(acts, stack, env, Pending::Token(tok))?;
                     }
                     None => {
-                        let e = BlissError::Internal(format!(
-                            "RETURN-FROM: no visible block {name}"
-                        ));
+                        let e =
+                            BlissError::Internal(format!("RETURN-FROM: no visible block {name}"));
                         initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                     }
                 }
@@ -10465,48 +10493,48 @@ fn c2i_call_args(sym: u64, args: &[BlissVal], profile_site: u64) -> u64 {
     // root-scan RefCell reentrancy, bliss-011) is caught and re-raised as a
     // catchable condition rather than aborting across this `extern "C"` frame.
     let result = guard_c2i(|| {
-    let env = unsafe { &mut *env_ptr };
-    // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
-    // run_loop dispatches ITS calls flatly on the BlissStack (bliss-x5y.4). This
-    // is what keeps recursion through a native caller bounded: without it, a
-    // native function's self/mutual recursion would go through apply_function
-    // (the tree-walker), which recurses on the unbounded Rust stack and aborts.
-    // With it, a bounded number of native/run frames (the NATIVE_DEPTH cap) give
-    // way to flat Activations, so a runaway recursion raises a catchable
-    // STORAGE-CONDITION instead of a native stack overflow. Non-bytecode callees
-    // (builtins, generics, closures, arity mismatches) still go via apply_function.
-    match registry_get(sym32) {
-        Some(callee) if arity_accepts(&callee, n) => {
-            // Calls emitted by native T1/T2 code do not pass through the
-            // interpreter's CallNamed arm, so this adapter owns the callee's
-            // invocation bump and tier transition. Without it, a callee reached
-            // only from a native caller would stop warming up permanently.
-            let fn_obj = bliss_rt::symbols::symbol_function(sym32)
-                .filter(|&cell| bliss_rt::function::is_interpreted_function(cell));
-            if let Some(cell) = fn_obj {
-                bliss_rt::function::record_invocation(cell);
+        let env = unsafe { &mut *env_ptr };
+        // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
+        // run_loop dispatches ITS calls flatly on the BlissStack (bliss-x5y.4). This
+        // is what keeps recursion through a native caller bounded: without it, a
+        // native function's self/mutual recursion would go through apply_function
+        // (the tree-walker), which recurses on the unbounded Rust stack and aborts.
+        // With it, a bounded number of native/run frames (the NATIVE_DEPTH cap) give
+        // way to flat Activations, so a runaway recursion raises a catchable
+        // STORAGE-CONDITION instead of a native stack overflow. Non-bytecode callees
+        // (builtins, generics, closures, arity mismatches) still go via apply_function.
+        match registry_get(sym32) {
+            Some(callee) if arity_accepts(&callee, n) => {
+                // Calls emitted by native T1/T2 code do not pass through the
+                // interpreter's CallNamed arm, so this adapter owns the callee's
+                // invocation bump and tier transition. Without it, a callee reached
+                // only from a native caller would stop warming up permanently.
+                let fn_obj = bliss_rt::symbols::symbol_function(sym32)
+                    .filter(|&cell| bliss_rt::function::is_interpreted_function(cell));
+                if let Some(cell) = fn_obj {
+                    bliss_rt::function::record_invocation(cell);
+                }
+                let count = dispatch_invoke_count(sym32, fn_obj);
+                let selected = native_for_dispatch(sym32, fn_obj, count);
+                // bliss-x5y.8: if the callee is itself installed as native code and
+                // we are under the native depth cap, call its native entry directly
+                // (native → native) instead of rebuilding a full T0 `run()`
+                // activation on every call. This is the difference between tiering
+                // being a win or a loss for call-heavy code: previously every native
+                // call bounced back into the interpreter. Beyond the cap, fall
+                // through to the flat T0 `run()` so deep recursion stays bounded and
+                // raises a catchable STORAGE-CONDITION rather than a C-stack abort.
+                let native = if NATIVE_DEPTH.with(|d| d.get()) >= native_depth_cap() {
+                    None
+                } else {
+                    selected
+                };
+                match native {
+                    Some(nc) => run_native(&nc, sym32, args, env),
+                    None => run(callee, args, fn_val, env),
+                }
             }
-            let count = dispatch_invoke_count(sym32, fn_obj);
-            let selected = native_for_dispatch(sym32, fn_obj, count);
-            // bliss-x5y.8: if the callee is itself installed as native code and
-            // we are under the native depth cap, call its native entry directly
-            // (native → native) instead of rebuilding a full T0 `run()`
-            // activation on every call. This is the difference between tiering
-            // being a win or a loss for call-heavy code: previously every native
-            // call bounced back into the interpreter. Beyond the cap, fall
-            // through to the flat T0 `run()` so deep recursion stays bounded and
-            // raises a catchable STORAGE-CONDITION rather than a C-stack abort.
-            let native = if NATIVE_DEPTH.with(|d| d.get()) >= native_depth_cap() {
-                None
-            } else {
-                selected
-            };
-            match native {
-                Some(nc) => run_native(&nc, sym32, args, env),
-                None => run(callee, args, fn_val, env),
-            }
-        }
-        _ => apply_function(fn_val, args, env),
+            _ => apply_function(fn_val, args, env),
         }
     });
     match result {
@@ -11675,9 +11703,7 @@ fn run_native(
     // substitute-if reports `separator` unbound (bliss-e7t). `CLOSURE_ENV` is
     // keyed by the closure's own symbol, which is this activation's `sym`.
     let closure_env = CLOSURE_ENV.with(|m| m.borrow().get(&sym).cloned());
-    let parent = closure_env
-        .clone()
-        .unwrap_or_else(|| Rc::clone(&env.frame));
+    let parent = closure_env.clone().unwrap_or_else(|| Rc::clone(&env.frame));
     let env_frame = bf
         .as_ref()
         .and_then(|body| make_env_frame(body, parent))
@@ -13353,14 +13379,7 @@ pub fn eval_toplevel(mut form: BlissVal, env: &mut Env) -> Result<BlissVal, Blis
         let result = eval_form(*form, env)?;
         if let Some(sym) = symbol_index_of(&name) {
             reset_last_bail_reason();
-            match compile_function(
-                &name,
-                *params,
-                *body,
-                env,
-                false,
-                false,
-            ) {
+            match compile_function(&name, *params, *body, env, false, false) {
                 Some(bf) => {
                     trace("compiled");
                     trace_named(&name, "compiled", None);
@@ -13451,10 +13470,7 @@ fn as_defun(form: BlissVal) -> Option<(String, BlissVal, BlissVal)> {
     // BLISS-INTERNAL setf-writer symbol so the SETF store path can dispatch it.
     if name_form.is_cons() {
         let (head, tail) = cp(name_form);
-        if head.is_symbol()
-            && symbol_bare_name(&sym_name(head)) == "SETF"
-            && tail.is_cons()
-        {
+        if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "SETF" && tail.is_cons() {
             let (place, _) = cp(tail);
             if place.is_symbol() {
                 return Some((

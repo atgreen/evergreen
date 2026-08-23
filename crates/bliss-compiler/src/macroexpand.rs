@@ -1161,13 +1161,12 @@ fn expand_return_from(mut form: BlissVal, env: &Environment) -> Result<BlissVal,
     if expanded_result == result_form {
         Ok(form)
     } else {
-        Ok(alloc_cons(
-            operator,
-            alloc_cons(
-                block_name,
-                alloc_cons(expanded_result, bliss_rt::value::NIL),
-            ),
-        ))
+        // Sequence the conses so `block_name`/`operator` are re-read after
+        // each inner allocation instead of being copied into stale argument
+        // temps before it (moving GC; bliss-8qf).
+        bliss_rt::rooted!(tail = alloc_cons(expanded_result, bliss_rt::value::NIL));
+        bliss_rt::rooted!(name_tail = alloc_cons(block_name, *tail));
+        Ok(alloc_cons(operator, *name_tail))
     }
 }
 
@@ -1357,10 +1356,13 @@ fn expand_the(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissEr
     if expanded_value == value_form {
         Ok(form)
     } else {
-        Ok(alloc_cons(
-            operator,
-            alloc_cons(type_spec, alloc_cons(expanded_value, bliss_rt::value::NIL)),
-        ))
+        // Sequence the conses so `type_spec` (which can be a heap cons, e.g.
+        // (integer 0 10)) and `operator` are re-read after each inner
+        // allocation instead of being copied into stale argument temps
+        // before it (moving GC; bliss-8qf).
+        bliss_rt::rooted!(tail = alloc_cons(expanded_value, bliss_rt::value::NIL));
+        bliss_rt::rooted!(spec_tail = alloc_cons(type_spec, *tail));
+        Ok(alloc_cons(operator, *spec_tail))
     }
 }
 
@@ -1424,7 +1426,10 @@ fn expand_function_special(mut form: BlissVal, env: &Environment) -> Result<Blis
 /// Expand a lambda expression: (lambda (params...) body...)
 /// Parameters are NOT expanded (they are binding names).
 /// Body is expanded in an env augmented with param bindings.
-fn expand_lambda_expression(mut lambda: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+fn expand_lambda_expression(
+    mut lambda: BlissVal,
+    env: &Environment,
+) -> Result<BlissVal, BlissError> {
     // Root across the allocating expand recursion (moving GC; bliss-noh).
     bliss_rt::rooted_ref!(_lambda_root = &mut lambda);
     let mut lambda_sym = unsafe { cons_car(lambda) }; // LAMBDA
@@ -1498,7 +1503,11 @@ fn expand_lambda_call(
 /// Body is expanded in an env augmented with the new bindings (shadowing symbol macros).
 /// For LET, all init-forms are expanded in the outer env.
 /// For LET*, each init-form is expanded in an env augmented by prior bindings.
-fn expand_let(mut form: BlissVal, env: &Environment, sequential: bool) -> Result<BlissVal, BlissError> {
+fn expand_let(
+    mut form: BlissVal,
+    env: &Environment,
+    sequential: bool,
+) -> Result<BlissVal, BlissError> {
     // Root across the allocating expand recursion (moving GC; bliss-noh).
     bliss_rt::rooted_ref!(_form_root = &mut form);
     let mut operator = unsafe { cons_car(form) };
@@ -1787,7 +1796,8 @@ fn expand_locally(mut form: BlissVal, env: &Environment) -> Result<BlissVal, Bli
     if !changed {
         Ok(form)
     } else {
-        let mut all_items: Vec<BlissVal> = Vec::with_capacity(decls.len() + expanded_body_forms.len());
+        let mut all_items: Vec<BlissVal> =
+            Vec::with_capacity(decls.len() + expanded_body_forms.len());
         all_items.extend(decls.iter().copied());
         all_items.extend(expanded_body_forms.iter().copied());
         Ok(alloc_cons(operator, vec_to_cons(&all_items)))
@@ -2176,9 +2186,7 @@ fn eval_local_macro_append(
     bliss_rt::rooted!(parts = cons_to_vec(args));
     for idx in (0..parts.len()).rev() {
         let part = parts[idx];
-        bliss_rt::rooted!(items = cons_to_vec(eval_local_macro_form(
-            part, env, call_env,
-        )?));
+        bliss_rt::rooted!(items = cons_to_vec(eval_local_macro_form(part, env, call_env,)?));
         while let Some(item) = items.pop() {
             result = alloc_cons(item, result);
         }
@@ -2254,10 +2262,8 @@ mod registry_key_tests {
         let k2 = next_registered_macro_key();
         assert_ne!(k1.0, k2.0, "registry keys must be unique");
 
-        let f1: Arc<MacroFn> =
-            Arc::new(|_form, _env| Ok(BlissVal::from_fixnum(111)));
-        let f2: Arc<MacroFn> =
-            Arc::new(|_form, _env| Ok(BlissVal::from_fixnum(222)));
+        let f1: Arc<MacroFn> = Arc::new(|_form, _env| Ok(BlissVal::from_fixnum(111)));
+        let f2: Arc<MacroFn> = Arc::new(|_form, _env| Ok(BlissVal::from_fixnum(222)));
         register_macro_function(k1, f1);
         register_macro_function(k2, f2);
 

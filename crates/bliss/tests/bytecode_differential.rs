@@ -397,7 +397,10 @@ fn captured_variadic_parameters_compile_to_bytecode() {
 fn deep_recursion_raises_catchable_storage_condition() {
     for program in DEEP_RECURSION_BOUNDED {
         let (out, ok) = run(program, true, true);
-        assert!(ok, "should exit cleanly after catching STORAGE-CONDITION: {program}");
+        assert!(
+            ok,
+            "should exit cleanly after catching STORAGE-CONDITION: {program}"
+        );
         assert!(
             out.contains("CAUGHT"),
             "deep recursion should be caught as STORAGE-CONDITION for {program}, got: {out:?}"
@@ -416,7 +419,9 @@ fn deep_recursion_raises_catchable_storage_condition() {
             "guard-free deep recursion should be caught (exit 0), not abort: {program}"
         );
         assert!(
-            String::from_utf8_lossy(&out.stdout).to_uppercase().contains("CAUGHT"),
+            String::from_utf8_lossy(&out.stdout)
+                .to_uppercase()
+                .contains("CAUGHT"),
             "storage-condition must fire for {program}: {}",
             String::from_utf8_lossy(&out.stdout)
         );
@@ -454,4 +459,31 @@ fn recursion_bound_scales_with_stack_size() {
         !small.status.success(),
         "depth 3000 should overflow a 16 KiB stack"
     );
+}
+
+#[test]
+fn gc_stress_defun_dotimes_push_keeps_body_roots() {
+    let program = "(progn (defun r () (let ((a nil)) (dotimes (i 5) (push (* i i) a)) a)) (r))";
+
+    for backend in ["bytecode", "tree-walker", "treewalk"] {
+        let out = Command::new(BIN)
+            .args(["--no-init", "--eval", program])
+            .env("BLISS_BACKEND", backend)
+            .env("BLISS_HEAP_MB", "4096")
+            .env("BLISS_GC_STRESS", "3")
+            .env("BLISS_GC_POISON", "1")
+            .output()
+            .expect("spawn bliss-cli");
+        assert!(
+            out.status.success(),
+            "{backend} failed under GC stress\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "(16 9 4 1 0)",
+            "{backend} produced wrong output under GC stress"
+        );
+    }
 }
