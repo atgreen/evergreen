@@ -14,7 +14,6 @@ use std::collections::HashMap;
 type MacroCharTable = HashMap<(u64, char), (BlissVal, bool)>;
 type DispatchCharTable = HashMap<(u64, char), bool>;
 type DispatchSubCharTable = HashMap<(u64, char, char), BlissVal>;
-type TokenChars = Vec<(char, bool)>;
 const MAX_READER_NESTING: usize = 4096;
 
 // ── Global symbol table ───────────────────────────────────────────
@@ -909,11 +908,14 @@ fn read_atom_with_base(
     parse_token_with_base(&token, has_escape, read_base).map(|v| (v, end))
 }
 
-/// Collect a token respecting single-escape (\) and multiple-escape (|...|).
-/// Returns (token_chars_with_case_info, end_position, had_any_escape).
-fn collect_token(chars: &[char], mut pos: usize) -> Result<(TokenChars, usize, bool), BlissError> {
-    // Each element is (char, escaped) where escaped means preserve case
-    let mut token: TokenChars = Vec::new();
+/// Scan one token, returning its readtable-cased name (`:upcase`: escaped chars
+/// keep their case, unescaped chars are upcased), the position just past it, and
+/// whether any escape was seen. The cased name is built directly here rather
+/// than via an intermediate `Vec<(char, escaped)>` — every caller only ever
+/// wanted this string, and tokenizing dominates the load-time allocation profile
+/// (bliss-gq5.9).
+fn collect_token(chars: &[char], mut pos: usize) -> Result<(String, usize, bool), BlissError> {
+    let mut name = String::new();
     let mut in_multiple_escape = false;
     let mut had_escape = false;
 
@@ -925,7 +927,7 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(TokenChars, usize, b
                 pos += 1;
                 continue;
             }
-            token.push((c, true));
+            name.push(c); // escaped: preserve case
             pos += 1;
             continue;
         }
@@ -936,7 +938,7 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(TokenChars, usize, b
                 if pos >= chars.len() {
                     return Err(BlissError::StreamError("trailing single escape".into()));
                 }
-                token.push((chars[pos], true));
+                name.push(chars[pos]); // escaped: preserve case
                 pos += 1;
             }
             '|' => {
@@ -946,7 +948,7 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(TokenChars, usize, b
             }
             c if is_delimiter(c) => break,
             c => {
-                token.push((c, false));
+                name.push(c.to_ascii_uppercase());
                 pos += 1;
             }
         }
@@ -956,35 +958,17 @@ fn collect_token(chars: &[char], mut pos: usize) -> Result<(TokenChars, usize, b
             "unterminated multiple escape".into(),
         ));
     }
-    Ok((token, pos, had_escape))
+    Ok((name, pos, had_escape))
 }
 
-#[expect(
-    dead_code,
-    reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
-)]
-fn parse_token(token: &[(char, bool)], has_escape: bool) -> Result<BlissVal, BlissError> {
-    parse_token_with_base(token, has_escape, 10)
-}
-
+/// Interpret an already readtable-cased token `name` as a number, keyword,
+/// package-qualified symbol, `NIL`/`T`, or bare symbol. `has_escape` records
+/// whether the token contained any escape (an escaped token is never a number).
 fn parse_token_with_base(
-    token: &[(char, bool)],
+    name: &str,
     has_escape: bool,
     read_base: u32,
 ) -> Result<BlissVal, BlissError> {
-    // Build the upcased name (upcased for non-escaped chars)
-    let name: String = token
-        .iter()
-        .map(
-            |&(c, escaped)| {
-                if escaped {
-                    c
-                } else {
-                    c.to_ascii_uppercase()
-                }
-            },
-        )
-        .collect();
 
     if name.is_empty() {
         return Err(BlissError::StreamError("empty token".into()));
@@ -993,7 +977,7 @@ fn parse_token_with_base(
     // Don't try numeric interpretation if there are escape chars
     if !has_escape {
         // Check for package-qualified symbols first
-        if let Some(result) = try_package_qualified(&name)? {
+        if let Some(result) = try_package_qualified(name)? {
             return Ok(result);
         }
         // Check for keyword symbols
@@ -1006,7 +990,7 @@ fn parse_token_with_base(
             return Ok(BlissVal::from_symbol_index(idx));
         }
         // Try numeric parse
-        match try_parse_number_with_base(&name, read_base) {
+        match try_parse_number_with_base(name, read_base) {
             Ok(Some(val)) => return Ok(val),
             Ok(None) => {}           // Not a number, fall through to symbol
             Err(e) => return Err(e), // e.g. division by zero in ratio
@@ -1024,7 +1008,7 @@ fn parse_token_with_base(
     // symbol read bare inside package P shares identity (and its value cell) with
     // the same symbol written P:NAME (bliss-lb6.12). Falls back to plain
     // name-keyed interning when no resolver/load environment is active.
-    let idx = resolve_symbol_via_hook(None, &name).unwrap_or_else(|| intern_symbol(&name));
+    let idx = resolve_symbol_via_hook(None, name).unwrap_or_else(|| intern_symbol(name));
     Ok(BlissVal::from_symbol_index(idx))
 }
 
@@ -1480,11 +1464,7 @@ fn read_sharpsign_with_base(
         }
         ':' => {
             // Uninterned symbol
-            let (token, end, _) = collect_token(chars, pos)?;
-            let name: String = token
-                .iter()
-                .map(|&(c, esc)| if esc { c } else { c.to_ascii_uppercase() })
-                .collect();
+            let (name, end, _) = collect_token(chars, pos)?;
             Ok((make_uninterned_symbol(&name), end))
         }
         'P' | 'p' => read_pathname_literal(chars, pos),
