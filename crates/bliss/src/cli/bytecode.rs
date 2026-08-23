@@ -12671,17 +12671,22 @@ macro_rules! t2_log {
 fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
     let sym = input.sym;
     let bf = &input.body;
-    // T2's entry sequence (build.rs::seed_entry) binds only the fixed positional
-    // parameters — locals `0..arity` — and leaves every other local NIL. It has
-    // no support for collecting &optional/&rest/&key arguments, so a variadic
-    // function compiled to T2 sees an EMPTY &rest: e.g. UIOP's STRCAT sums the
-    // lengths of an empty list, make-string gets NIL, and the load aborts with
-    // "NIL is not of type non-negative string size". T1's bind_variadic handles
-    // these correctly, so keep variadic functions at T1 until T2 grows a variadic
-    // entry (bliss captured-variadic-param follow-up).
-    if bf.variadic {
+    // The shared native invoke path (run_native) calls bind_variadic BEFORE the
+    // compiled body, filling every frame *slot* param — &optional/&rest/&key
+    // included — so T2's entry (build.rs::seed_entry, now seeding 0..slot-params)
+    // sees the real values, not an empty &rest (bliss-32l). This only holds when
+    // every param lives in a slot; a CAPTURING variadic function has boxed params
+    // that T2's slot-only entry cannot reconstruct, so keep those at T1
+    // (bliss captured-variadic-param follow-up).
+    if bf.variadic
+        && (bf.has_env
+            || bf
+                .param_layout
+                .iter()
+                .any(|(_, loc)| matches!(loc, bliss_rt::bytecode::VarLoc::Boxed)))
+    {
         t2_log!(
-            "{}: variadic lambda list not modelled by T2 entry => stay T1",
+            "{}: capturing variadic lambda list not modelled by T2 entry => stay T1",
             bf.name
         );
         return None;

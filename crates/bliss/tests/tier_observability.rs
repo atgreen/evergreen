@@ -208,11 +208,13 @@ fn automatic_tiering_observably_progresses_t0_to_t1_to_t2() {
 }
 
 /// Reaching the T2 threshold is a request, not permission to discard working
-/// code. A variadic body unsupported by the T2 entry ABI keeps its T1 entry.
+/// code. A CAPTURING variadic body (its &rest is boxed for a closure) is
+/// unsupported by T2's slot-only entry, so it keeps its T1 entry (bliss-32l;
+/// non-capturing variadic functions do reach T2).
 #[test]
 fn automatic_t2_decline_retains_t1() {
     let program = "\
-        (defun auto-rest (&rest xs) (length xs)) \
+        (defun auto-rest (&rest xs) (funcall (lambda () (length xs)))) \
         (auto-rest 1) (auto-rest 1 2) (auto-rest 1 2 3) \
         (auto-rest 1) (auto-rest 1 2) (auto-rest 1 2 3) \
         (format t \"~a ~a~%\" \
@@ -251,14 +253,15 @@ fn explicit_t2_disable_pins_hot_function_at_t1() {
 }
 
 /// Once a caller becomes native, its c2i calls still count and promote the
-/// callee. The variadic caller deliberately stays T1 so the fixed-arity leaf is
-/// reached through the native adapter long enough to become T2.
+/// callee. The CAPTURING variadic caller deliberately stays T1 (its &rest is
+/// boxed for the closure, so it is declined from T2 — bliss-32l) so the
+/// fixed-arity leaf is reached through the native adapter long enough to become T2.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn native_caller_continues_warming_callee_to_t2() {
     let program = "\
         (defun warm-leaf (x) (* x 5)) \
-        (defun warm-driver (&rest xs) (warm-leaf (car xs))) \
+        (defun warm-driver (&rest xs) (funcall (lambda () (warm-leaf (car xs))))) \
         (dotimes (i 10) (warm-driver i)) \
         (format t \"~a ~a ~a~%\" \
           (bliss-ext:function-tier (quote warm-driver)) \
@@ -1115,11 +1118,13 @@ fn variadic_lambda_lists_compile_and_promote() {
 /// A variadic (`&rest`) function must stay correct under `BLISS_T2=1`. T2's entry
 /// sequence binds only the fixed positional parameters (locals `0..arity`) and
 /// leaves the rest NIL, so a variadic function is DECLINED from T2 and runs at
-/// T1, whose `bind_variadic` collects `&rest`. This guards the UIOP STRCAT
-/// regression: a T2-compiled `&rest` saw an EMPTY list, so
+/// the shared `bind_variadic` path (run_native), which collects `&rest` into a
+/// frame slot BEFORE the compiled body runs. This guards the UIOP STRCAT
+/// regression: a T2 `&rest` used to see an EMPTY list, so
 /// `(make-string (loop :for s :in strings :sum …))` got NIL — "NIL is not of type
-/// non-negative string size" — and `asdf` failed to load under T2. The hot `&rest`
-/// result must equal the tree-walker's, and the function must NOT be at T2.
+/// non-negative string size" — and `asdf` failed to load under T2. A NON-capturing
+/// variadic function now DOES reach T2 (bliss-32l), and its `&rest` result must
+/// still equal the tree-walker's.
 #[test]
 fn variadic_rest_stays_correct_under_t2() {
     let prog = "\
@@ -1133,8 +1138,8 @@ fn variadic_rest_stays_correct_under_t2() {
     let line = out.lines().next().unwrap_or("").to_string();
     assert!(line.ends_with(" 6"), "hot &rest result must be 6: {line:?}");
     assert!(
-        !line.starts_with("2 "),
-        "variadic fn must be declined from T2 (stay at T1): {line:?}"
+        line.starts_with("2 "),
+        "non-capturing variadic fn should now reach T2 (bliss-32l): {line:?}"
     );
 
     let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);

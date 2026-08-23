@@ -2279,7 +2279,12 @@ fn emit_framed_inner(
     // enter directly (args in registers) instead of paying c2i dispatch.
     let reg_entry_label = a.label();
     let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
+    // A variadic function's entry params are pre-collected frame slots (the
+    // &rest list etc.), not positional call args, so it must NOT get a register
+    // entry — a register self-call would pass raw args into those slots
+    // (bliss-32l). Its self-calls take the interpreter/c2i entry instead.
     let has_reg_entry = !has_declared_params
+        && !f.is_variadic()
         && frame_base_home.is_none()
         && f.block(entry).params.len() <= arg_regs.len();
 

@@ -269,6 +269,11 @@ pub struct Function {
     /// call boundary. This is deliberately separate from `ValueData::ty`: an
     /// inferred/speculative type is not permission to omit its runtime guard.
     checked_entry_params: Vec<Value>,
+    /// True if the source function has a variadic lambda list. Its entry-block
+    /// params are pre-collected frame slots (&rest list, &optional/&key values)
+    /// filled by the shared bind_variadic path, NOT positional call arguments —
+    /// so a positional register self-call entry must be suppressed (bliss-32l).
+    variadic: bool,
     name: String,
 }
 
@@ -295,6 +300,7 @@ impl Function {
             source_positions: vec![SourcePosition::default()],
             osr_entries: Vec::new(),
             checked_entry_params: Vec::new(),
+            variadic: false,
             name: name.into(),
         };
         let entry = f.make_block();
@@ -304,6 +310,9 @@ impl Function {
 
     pub fn name(&self) -> &str { &self.name }
     pub fn entry(&self) -> Block { self.entry }
+    /// Whether the source function has a variadic lambda list (bliss-32l).
+    pub fn is_variadic(&self) -> bool { self.variadic }
+    pub fn set_variadic(&mut self, v: bool) { self.variadic = v; }
     pub fn block_order(&self) -> &[Block] { &self.block_order }
 
     // ── Arena accessors ──

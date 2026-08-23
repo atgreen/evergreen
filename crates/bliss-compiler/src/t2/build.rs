@@ -35,7 +35,7 @@ use crate::t2::ir::{
     AuxData, Block, Function, IRType, Inst, InstData, InstFlags, Opcode, TypeBits, Value,
     ValueRepresentation,
 };
-use bliss_rt::bytecode::{BytecodeFunction, DeclaredType, Instr};
+use bliss_rt::bytecode::{BytecodeFunction, DeclaredType, Instr, VarLoc};
 
 /// Why the builder could not produce IR for a function (e.g. an opcode not yet
 /// modelled). The caller keeps such a function at T1 (spec R4.28).
@@ -454,8 +454,28 @@ impl<'a> Builder<'a> {
     /// block parameters); locals `arity..n_locals` start as NIL so a read before
     /// the first store never hits an undefined variable.
     fn seed_entry(&mut self) {
+        // Record variadic-ness so the emitter can suppress the positional
+        // register self-call entry (bliss-32l): a variadic function's entry
+        // params are pre-collected slots, not positional arguments.
+        self.f.set_variadic(self.bf.variadic);
         let entry = self.f.entry();
-        let arity = self.bf.arity.min(self.bf.n_locals);
+        // Number of parameters that live in frame slots (the contiguous slot
+        // prefix `0..p`). For a fixed lambda list this is `arity`. For a
+        // NON-capturing variadic one it also covers the &optional/&rest/&key
+        // slots, which the shared `bind_variadic` path (run_native) fills BEFORE
+        // the compiled body runs — so T2 must seed them from their slots, not
+        // NIL them out (bliss-32l). Capturing variadic functions (boxed params)
+        // are declined from T2 upstream, so here they never occur.
+        let arity = if self.bf.variadic {
+            self.bf
+                .param_layout
+                .iter()
+                .filter(|(_, loc)| matches!(loc, VarLoc::Slot(_)))
+                .count() as u16
+        } else {
+            self.bf.arity
+        }
+        .min(self.bf.n_locals);
         for i in 0..arity {
             let declared = self
                 .bf
