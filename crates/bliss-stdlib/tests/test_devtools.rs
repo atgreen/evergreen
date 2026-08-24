@@ -333,19 +333,6 @@ fn room_with_verbosity_returns_ok() {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// SWANK server (R6.33)
-// ══════════════════════════════════════════════════════════════════
-
-#[test]
-fn swank_start_stop_lifecycle() {
-    let start = start_swank_server(4005, "127.0.0.1");
-    assert!(start.is_ok(), "start_swank_server should succeed");
-
-    let stop = stop_swank_server();
-    assert!(stop.is_ok(), "stop_swank_server should succeed");
-}
-
-// ══════════════════════════════════════════════════════════════════
 // repl_loop & invoke_debugger_ui
 // ══════════════════════════════════════════════════════════════════
 

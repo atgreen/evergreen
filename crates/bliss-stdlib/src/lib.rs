@@ -62,9 +62,9 @@ pub use devtools::{
     eval_in_frame, get_last_profiler_report, has_trace_hook, inspect, instrument_function_entry,
     instrument_function_exit, invoke_debugger_ui, is_traced, list_breakpoints, record_allocation,
     record_safepoint_pc, remove_breakpoint, repl_loop, room, start_allocation_profiler,
-    start_instrumentation_profiler, start_profiler, start_swank_server, stop_allocation_profiler,
-    stop_instrumentation_profiler, stop_profiler, stop_swank_server, time_execution, trace_entry,
-    trace_exit, trace_function, untrace_function, unwatch, walk_stack, watch,
+    start_instrumentation_profiler, start_profiler, stop_allocation_profiler,
+    stop_instrumentation_profiler, stop_profiler, time_execution, trace_entry, trace_exit,
+    trace_function, untrace_function, unwatch, walk_stack, watch,
 };
 pub use error::StdlibError;
 pub use format::{

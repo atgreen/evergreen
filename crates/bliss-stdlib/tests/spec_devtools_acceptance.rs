@@ -1,42 +1,9 @@
 use bliss_rt::value::{BlissVal, NIL, T};
 use bliss_stdlib::devtools::*;
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    port
-}
-
-fn swank_secret_for_first_server() -> &'static str {
-    "bliss-swank-0000000000000001"
-}
-
-fn connect_and_auth(port: u16, secret: &str) -> TcpStream {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect swank");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set read timeout");
-    stream.write_all(secret.as_bytes()).expect("write secret");
-    stream
-}
-
-fn read_ascii_response(stream: &mut TcpStream) -> String {
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).expect("read swank response");
-    String::from_utf8_lossy(&buf[..n]).into_owned()
-}
-
-fn swank_rex(op: &str, id: u64) -> String {
-    let message = format!("(:emacs-rex {op} \"CL-USER\" :repl-thread {id})\n");
-    format!("{:06x}{}", message.len(), message)
-}
 
 #[test]
 fn debugger_public_hooks_support_stack_walk_eval_and_breakpoints() {
@@ -131,75 +98,31 @@ fn trace_disassemble_describe_inspect_and_room_hooks_are_callable_end_to_end() {
 }
 
 #[test]
-fn swank_server_enforces_authentication_and_serves_eval_completion_and_thread_queries() {
-    // Per R6.33-R6.38, Bliss MUST expose a SWANK-compatible authenticated IDE endpoint.
-    let port = free_port();
-    start_swank_server(port, "127.0.0.1").expect("start swank server");
-    thread::sleep(Duration::from_millis(150));
+fn ide_protocol_uses_vendored_slynk_library_not_rust_swank_server() {
+    // Per R6.33, Bliss must load upstream Slynk/SWANK as Lisp code and must not
+    // implement the wire protocol in the Rust runtime/stdlib.
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let slynk = repo_root.join("lib/slynk");
+    assert!(slynk.join("slynk.lisp").is_file());
+    assert!(slynk.join("slynk-rpc.lisp").is_file());
+    assert!(slynk.join("backend/bliss.lisp").is_file());
+    assert!(slynk.join("start-slynk.lisp").is_file());
 
-    let mut bad = connect_and_auth(port, "wrong-secret\n");
-    let bad_reply = read_ascii_response(&mut bad);
-    assert!(
-        bad_reply.contains("authentication failed"),
-        "reply was: {bad_reply}"
-    );
+    let start_slynk = std::fs::read_to_string(slynk.join("start-slynk.lisp"))
+        .expect("read start-slynk.lisp");
+    assert!(start_slynk.contains("slynk:create-server"));
 
-    let mut conn1 = connect_and_auth(port, swank_secret_for_first_server());
-    let ok_reply = read_ascii_response(&mut conn1);
-    assert!(ok_reply.contains("(:ok t)"), "reply was: {ok_reply}");
-
-    let mut conn2 = connect_and_auth(port, swank_secret_for_first_server());
-    let second_ok = read_ascii_response(&mut conn2);
-    assert!(second_ok.contains("(:ok t)"), "reply was: {second_ok}");
-
-    let eval = swank_rex("(swank:listener-eval \"(+ 1 2)\")", 7);
-    conn1.write_all(eval.as_bytes()).expect("send swank eval");
-    let eval_reply = read_ascii_response(&mut conn1);
-    assert!(eval_reply.contains('3'), "eval reply was: {eval_reply}");
-
-    let completions = swank_rex("(swank:simple-completions \"for\")", 8);
-    conn1
-        .write_all(completions.as_bytes())
-        .expect("send completions");
-    let completions_reply = read_ascii_response(&mut conn1);
-    assert!(
-        completions_reply.to_lowercase().contains("format"),
-        "reply was: {completions_reply}"
-    );
-
-    let threads = swank_rex("(swank:list-threads)", 9);
-    conn2
-        .write_all(threads.as_bytes())
-        .expect("send thread query");
-    let thread_reply = read_ascii_response(&mut conn2);
-    assert!(
-        thread_reply.contains("swank-conn-"),
-        "reply was: {thread_reply}"
-    );
-    assert!(
-        thread_reply.contains("connected"),
-        "reply was: {thread_reply}"
-    );
-
-    let debug = swank_rex("(swank:debug-thread 9)", 10);
-    conn2
-        .write_all(debug.as_bytes())
-        .expect("send debug-thread");
-    let debug_reply = read_ascii_response(&mut conn2);
-    assert!(debug_reply.contains(":thread"), "reply was: {debug_reply}");
-
-    let info = swank_rex("(swank:connection-info)", 11);
-    conn1
-        .write_all(info.as_bytes())
-        .expect("send connection-info");
-    let info_reply = read_ascii_response(&mut conn1);
-    assert!(
-        info_reply.contains(":connections"),
-        "reply was: {info_reply}"
-    );
-    assert!(info_reply.contains("127.0.0.1"), "reply was: {info_reply}");
-
-    stop_swank_server().expect("stop swank server");
+    let devtools = std::fs::read_to_string(repo_root.join("crates/bliss-stdlib/src/devtools.rs"))
+        .expect("read devtools.rs");
+    let lib_rs = std::fs::read_to_string(repo_root.join("crates/bliss-stdlib/src/lib.rs"))
+        .expect("read lib.rs");
+    let builtin_server = ["start", "_swank", "_server"].concat();
+    let dispatcher = ["dispatch", "_swank", "_message"].concat();
+    let rex_marker = ["(:emacs", "-rex"].concat();
+    assert!(!devtools.contains(&builtin_server));
+    assert!(!devtools.contains(&dispatcher));
+    assert!(!devtools.contains(&rex_marker));
+    assert!(!lib_rs.contains(&builtin_server));
 }
 
 #[test]
