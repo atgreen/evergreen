@@ -501,6 +501,33 @@ fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
                 visit(value);
             }
         }
+        // Every live instance's inline slot cells are GC roots (bliss-4bp).
+        // Instances are std::alloc'd outside the GC regions, so nothing else
+        // marks or relocates the BlissVals stored in their slots — a minor GC
+        // moved a slot-held cons and left the cell stale, which is how ASDF's
+        // session/component state corrupted mid plan-traversal (false
+        // circular-dependency detection, freed-nursery reads). Mirror the
+        // hash-table entry scanner: yield every slot cell of every live
+        // instance so the collector marks and rewrites them like any root.
+        for inst in state.live_instances.iter() {
+            // SAFETY: live_instances holds live STANDARD_OBJECT allocations
+            // for the process lifetime; slot cells are inline behind the
+            // header+wrapper words. resolve_forwarding chases change-class
+            // stubs to the live copy (idempotent if several keys forward to
+            // the same object).
+            unsafe {
+                let live = resolve_forwarding(*inst);
+                let w = *(live.as_ptr().add(8) as *const *mut ClassWrapper);
+                if w.is_null() {
+                    continue;
+                }
+                let n = (*w).slot_count as usize;
+                let cells = live.as_ptr().add(16) as *mut BlissVal;
+                for idx in 0..n {
+                    visit(cells.add(idx));
+                }
+            }
+        }
         for (_, class) in &mut state.fixnum_registrations {
             visit(class);
         }
