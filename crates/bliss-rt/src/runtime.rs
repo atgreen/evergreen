@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Condvar, Mutex, OnceLock};
 
 /// Default boot-image path. Unlike an explicitly-requested image, its absence
 /// is not fatal: the runtime bootstraps from the prelude instead.
@@ -65,6 +65,76 @@ pub enum LogLevel {
 type RuntimeInitHook = fn() -> Result<(), BlissError>;
 
 static RUNTIME_INIT_HOOK: OnceLock<RuntimeInitHook> = OnceLock::new();
+
+struct RuntimeLifecycle {
+    state: Mutex<RuntimeLifecycleState>,
+    available: Condvar,
+}
+
+struct RuntimeLifecycleState {
+    owner: Option<std::thread::ThreadId>,
+    depth: usize,
+}
+
+struct RuntimeLifecycleGuard {
+    owner: std::thread::ThreadId,
+}
+
+fn runtime_lifecycle() -> &'static RuntimeLifecycle {
+    static LIFECYCLE: OnceLock<RuntimeLifecycle> = OnceLock::new();
+    LIFECYCLE.get_or_init(|| RuntimeLifecycle {
+        state: Mutex::new(RuntimeLifecycleState {
+            owner: None,
+            depth: 0,
+        }),
+        available: Condvar::new(),
+    })
+}
+
+fn acquire_runtime_lifecycle() -> RuntimeLifecycleGuard {
+    let lifecycle = runtime_lifecycle();
+    let current = std::thread::current().id();
+    let mut state = lifecycle
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    loop {
+        match state.owner {
+            None => {
+                state.owner = Some(current);
+                state.depth = 1;
+                return RuntimeLifecycleGuard { owner: current };
+            }
+            Some(owner) if owner == current => {
+                state.depth += 1;
+                return RuntimeLifecycleGuard { owner: current };
+            }
+            Some(_) => {
+                state = lifecycle
+                    .available
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
+    }
+}
+
+impl Drop for RuntimeLifecycleGuard {
+    fn drop(&mut self) {
+        let lifecycle = runtime_lifecycle();
+        let mut state = lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.owner == Some(self.owner) {
+            state.depth = state.depth.saturating_sub(1);
+            if state.depth == 0 {
+                state.owner = None;
+                lifecycle.available.notify_one();
+            }
+        }
+    }
+}
 
 /// Register an optional startup hook that runs during `Runtime::init`.
 ///
@@ -384,12 +454,15 @@ pub struct Runtime {
     shutdown: bool,
     /// The scheduler instance, initialized during Runtime::init.
     _scheduler: Scheduler,
+    /// Owns the process-global heap/scheduler lifecycle while this Runtime lives.
+    _lifecycle_guard: RuntimeLifecycleGuard,
 }
 
 impl Runtime {
     /// Initialize the runtime: parse config, init GC, init scheduler,
     /// load image, spawn workers. §2.2.
     pub fn init(config: RuntimeConfig) -> Result<Self, BlissError> {
+        let lifecycle_guard = acquire_runtime_lifecycle();
         if let Some(hook) = RUNTIME_INIT_HOOK.get() {
             hook()?;
         }
@@ -431,6 +504,7 @@ impl Runtime {
             config,
             shutdown: false,
             _scheduler: scheduler,
+            _lifecycle_guard: lifecycle_guard,
         })
     }
 
@@ -602,8 +676,12 @@ pub fn install_signal_handlers() -> Result<(), BlissError> {
             syscall::SA_RESTART,
         )
         .map_err(|_| BlissError::SignalError(syscall::SIGSEGV))?;
-        syscall::rt_sigaction(syscall::SIGINT, sigint_handler as *const () as usize, syscall::SA_RESTART)
-            .map_err(|_| BlissError::SignalError(syscall::SIGINT))?;
+        syscall::rt_sigaction(
+            syscall::SIGINT,
+            sigint_handler as *const () as usize,
+            syscall::SA_RESTART,
+        )
+        .map_err(|_| BlissError::SignalError(syscall::SIGINT))?;
         syscall::rt_sigaction(
             syscall::SIGTERM,
             sigterm_handler as *const () as usize,

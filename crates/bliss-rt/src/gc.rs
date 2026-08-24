@@ -1063,11 +1063,11 @@ impl Default for HeapCollector {
     }
 }
 
-impl Collector for HeapCollector {
+impl HeapCollector {
     /// Stop-the-world minor (nursery) collection.
     /// Cheney-style scavenge: copies live nursery objects into survivor space
     /// or promotes to old-gen based on gen_age vs promotion_threshold.
-    fn minor_gc(&mut self) -> Result<(), BlissError> {
+    fn minor_gc_stw_body(&mut self) -> Result<(), BlissError> {
         let start = std::time::Instant::now();
 
         let mut guard = heap_state().lock().unwrap();
@@ -1445,6 +1445,27 @@ impl Collector for HeapCollector {
         Ok(())
     }
 
+    fn minor_gc_stop_the_world(&mut self) -> Result<(), BlissError> {
+        crate::safepoint::wait_for_all_threads()?;
+        retire_current_t0_tlab_for_safepoint();
+        let body_result = self.minor_gc_stw_body();
+        let resume_result = crate::safepoint::resume_all_threads();
+        body_result?;
+        resume_result
+    }
+}
+
+impl Collector for HeapCollector {
+    /// Stop-the-world minor (nursery) collection.
+    /// Cheney-style scavenge: copies live nursery objects into survivor space
+    /// or promotes to old-gen based on gen_age vs promotion_threshold.
+    fn minor_gc(&mut self) -> Result<(), BlissError> {
+        let _gc_cycle = gc_cycle_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.minor_gc_stop_the_world()
+    }
+
     /// Concurrent old-gen marking + evacuation cycle (A3.02).
     ///
     /// Simplified sequential implementation that runs under the heap lock:
@@ -1455,11 +1476,14 @@ impl Collector for HeapCollector {
     /// 3. Evacuation: copy live objects from selected regions to fresh old-gen
     ///    regions, install forwarding pointers, and free evacuated regions.
     fn major_gc(&mut self) -> Result<(), BlissError> {
+        let _gc_cycle = gc_cycle_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let start = std::time::Instant::now();
 
         // A standalone major collection must first drain nursery state so
         // nursery deaths trigger finalizers and weak-reference clearing too.
-        self.minor_gc()?;
+        self.minor_gc_stop_the_world()?;
 
         // Set marking flag (§3.6.2: SATB barrier only fires when marking active).
         set_gc_marking_in_progress(true);
@@ -2096,7 +2120,7 @@ pub type RootScanner = fn(&mut dyn FnMut(*mut BlissVal));
 
 fn root_scanners() -> &'static OrderedMutex<Vec<RootScanner>> {
     static S: OnceLock<OrderedMutex<Vec<RootScanner>>> = OnceLock::new();
-    S.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 3, "GC root scanners", Vec::new()))
+    S.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 4, "GC root scanners", Vec::new()))
 }
 
 /// Register an external root scanner (idempotent by function pointer).
@@ -2160,6 +2184,38 @@ impl<A: TraceHostRoots, B: TraceHostRoots> TraceHostRoots for (A, B) {
     }
 }
 
+impl<T: TraceHostRoots, E: TraceHostRoots> TraceHostRoots for Result<T, E> {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        match self {
+            Ok(value) => value.trace_host_roots(visit),
+            Err(error) => error.trace_host_roots(visit),
+        }
+    }
+}
+
+impl TraceHostRoots for BlissError {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        match self {
+            BlissError::TypeError { datum, .. }
+            | BlissError::UnboundVariable(datum)
+            | BlissError::UndefinedFunction(datum) => datum.trace_host_roots(visit),
+            BlissError::Oom
+            | BlissError::StackOverflow(_)
+            | BlissError::InvalidImage(_)
+            | BlissError::FfiError(_)
+            | BlissError::SignalError(_)
+            | BlissError::Shutdown
+            | BlissError::Internal(_)
+            | BlissError::ProgramError(_)
+            | BlissError::ArithmeticError(_)
+            | BlissError::PackageError(_)
+            | BlissError::StreamError(_)
+            | BlissError::FileError(_)
+            | BlissError::SandboxViolation(_) => {}
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct HostRootEntry {
     address: usize,
@@ -2171,17 +2227,14 @@ fn host_roots() -> &'static OrderedMutex<HashMap<ThreadId, Vec<HostRootEntry>>> 
     ROOTS.get_or_init(|| {
         OrderedMutex::new(
             LockLevel::GcWorld,
-            5,
+            6,
             "GC host-container roots",
             HashMap::new(),
         )
     })
 }
 
-unsafe fn trace_host_root<T: TraceHostRoots>(
-    address: usize,
-    visit: &mut dyn FnMut(*mut BlissVal),
-) {
+unsafe fn trace_host_root<T: TraceHostRoots>(address: usize, visit: &mut dyn FnMut(*mut BlissVal)) {
     // SAFETY: HostRoot registers the address of its boxed T and unregisters it
     // before dropping the box. Moving HostRoot does not move the box allocation.
     unsafe { (&mut *(address as *mut T)).trace_host_roots(visit) };
@@ -2346,7 +2399,7 @@ impl<T: TraceHostRoots> Drop for HostRoot<T> {
 fn shadow_roots() -> &'static OrderedMutex<HashMap<ThreadId, Vec<BlissVal>>> {
     static ROOTS: OnceLock<OrderedMutex<HashMap<ThreadId, Vec<BlissVal>>>> = OnceLock::new();
     ROOTS
-        .get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 4, "GC shadow roots", HashMap::new()))
+        .get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 5, "GC shadow roots", HashMap::new()))
 }
 
 fn scan_shadow_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
@@ -3127,6 +3180,8 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
     if body_size == 0 {
         return None;
     }
+    let _ = crate::thread::current_thread_id();
+    crate::safepoint::poll_safepoint();
     maybe_gc_stress();
     T0_ALLOCATOR.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -3152,6 +3207,25 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         unsafe { set_object_type_id(body, body_size, type_id) };
         Some(body)
     })
+}
+
+/// Retire the current thread's T0 TLAB before it reports safepoint arrival.
+///
+/// A TLAB reservation advances its nursery region's `alloc_top`, while heap
+/// walkers stop at a zero header. Turning the unused tail into filler makes the
+/// whole reserved slice walkable before a moving collector scans that region.
+pub(crate) fn retire_current_t0_tlab_for_safepoint() {
+    T0_ALLOCATOR.with(|cell| {
+        let Ok(mut guard) = cell.try_borrow_mut() else {
+            // The current thread is collecting from alloc_slow with its T0
+            // allocator already borrowed; alloc_slow retired that TLAB before
+            // triggering GC, so there is nothing more to publish here.
+            return;
+        };
+        if let Some((_, allocator)) = guard.as_mut() {
+            allocator.retire_tlab();
+        }
+    });
 }
 
 /// Run an explicit minor collection for the T0 evaluator.
@@ -3227,7 +3301,7 @@ unsafe impl Sync for WeakPtrHandle {}
 fn weak_pointer_registry() -> &'static OrderedMutex<Vec<WeakPtrHandle>> {
     static REGISTRY: OnceLock<OrderedMutex<Vec<WeakPtrHandle>>> = OnceLock::new();
     REGISTRY
-        .get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 5, "GC weak pointers", Vec::new()))
+        .get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 6, "GC weak pointers", Vec::new()))
 }
 
 /// Register a weak pointer with the GC so it can be broken when its referent
@@ -3373,7 +3447,7 @@ struct FinalizerEntry {
 /// Global finalizer registry.
 fn finalizer_registry() -> &'static OrderedMutex<Vec<FinalizerEntry>> {
     static REGISTRY: OnceLock<OrderedMutex<Vec<FinalizerEntry>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 6, "GC finalizers", Vec::new()))
+    REGISTRY.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 7, "GC finalizers", Vec::new()))
 }
 
 /// Global finalizer dispatch function. Set by the runtime during startup
@@ -3574,7 +3648,15 @@ impl Drop for HeapState {
 /// Global heap state, initialized by `init_heap`.
 fn heap_state() -> &'static OrderedMutex<Option<HeapState>> {
     static STATE: OnceLock<OrderedMutex<Option<HeapState>>> = OnceLock::new();
-    STATE.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 1, "GC heap state", None))
+    STATE.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 2, "GC heap state", None))
+}
+
+/// Serializes collector cycles. This is only the collector-entry lock; it does
+/// not exclude mutators, which must be handled by the native safepoint/STW
+/// handshake in the follow-up h6z increments.
+fn gc_cycle_lock() -> &'static OrderedMutex<()> {
+    static LOCK: OnceLock<OrderedMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| OrderedMutex::new(LockLevel::GcWorld, 1, "GC cycle", ()))
 }
 
 /// Initialize the GC heap. Called once during runtime startup.
@@ -3785,7 +3867,7 @@ fn entry_continuation_cell() -> &'static OrderedMutex<BlissVal> {
     ENTRY.get_or_init(|| {
         OrderedMutex::new(
             LockLevel::GcWorld,
-            2,
+            3,
             "GC entry continuation",
             crate::value::NIL,
         )

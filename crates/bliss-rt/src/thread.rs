@@ -3,6 +3,7 @@
 //! See §2.3 of the spec.
 
 use crate::error::BlissError;
+use crate::gc::{register_root_scanner, TraceHostRoots};
 use crate::lock_order::{LockLevel, OrderedMutex};
 use crate::stack::BlissStack;
 use crate::value::{BlissVal, NIL};
@@ -214,7 +215,8 @@ pub struct NativeThread {
     id: NativeThreadId,
     name: Option<String>,
     carrier: bool,
-    entry: BlissVal,
+    auto_registered: bool,
+    entry: AtomicU64,
     state: OrderedMutex<NativeThreadState>,
     stack: BlissStack,
     tls: OrderedMutex<Vec<BlissVal>>,
@@ -223,6 +225,7 @@ pub struct NativeThread {
     interrupt_pending: AtomicBool,
     interrupt_value: OrderedMutex<BlissVal>,
     yield_requested: AtomicBool,
+    gc_participates: AtomicBool,
     published_sp: AtomicUsize,
     published_fp: AtomicUsize,
     /// `pthread_t` for directed SIGUSR1 delivery on Unix (zero until mounted).
@@ -237,6 +240,7 @@ impl NativeThread {
         id: NativeThreadId,
         name: Option<String>,
         carrier: bool,
+        auto_registered: bool,
         entry: BlissVal,
         result: Arc<ThreadResult>,
     ) -> Self {
@@ -244,7 +248,8 @@ impl NativeThread {
             id,
             name,
             carrier,
-            entry,
+            auto_registered,
+            entry: AtomicU64::new(entry.0),
             state: OrderedMutex::new(
                 LockLevel::ExecutionObject,
                 native_object_order(id, 1),
@@ -273,6 +278,7 @@ impl NativeThread {
                 NIL,
             ),
             yield_requested: AtomicBool::new(false),
+            gc_participates: AtomicBool::new(false),
             published_sp: AtomicUsize::new(0),
             published_fp: AtomicUsize::new(0),
             os_thread_id: AtomicUsize::new(0),
@@ -291,6 +297,10 @@ impl NativeThread {
         self.carrier
     }
 
+    fn is_inactive_auto_registered(&self) -> bool {
+        self.auto_registered && !self.gc_participates()
+    }
+
     pub fn state(&self) -> NativeThreadState {
         *self.state.lock().unwrap()
     }
@@ -301,6 +311,10 @@ impl NativeThread {
 
     pub fn stack(&self) -> &BlissStack {
         &self.stack
+    }
+
+    pub fn entry(&self) -> BlissVal {
+        BlissVal(self.entry.load(Ordering::Acquire))
     }
 
     pub fn tls_get(&self, index: u32) -> BlissVal {
@@ -320,6 +334,14 @@ impl NativeThread {
 
     pub fn check_and_clear_yield(&self) -> bool {
         self.yield_requested.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_gc_participates(&self, participates: bool) {
+        self.gc_participates.store(participates, Ordering::Release);
+    }
+
+    pub(crate) fn gc_participates(&self) -> bool {
+        self.gc_participates.load(Ordering::Acquire)
     }
 
     pub fn publish_stack(&self, sp: usize, fp: usize) {
@@ -344,6 +366,36 @@ impl NativeThread {
             .swap(false, Ordering::AcqRel)
             .then(|| *self.interrupt_value.lock().unwrap())
     }
+
+    fn trace_execution_roots(&self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        trace_atomic_bliss_val(&self.entry, visit);
+        self.tls.lock().unwrap().trace_host_roots(visit);
+        self.interrupt_value.lock().unwrap().trace_host_roots(visit);
+        self.result.value.lock().unwrap().trace_host_roots(visit);
+    }
+}
+
+fn trace_atomic_bliss_val(slot: &AtomicU64, visit: &mut dyn FnMut(*mut BlissVal)) {
+    let mut value = BlissVal(slot.load(Ordering::Acquire));
+    value.trace_host_roots(visit);
+    slot.store(value.0, Ordering::Release);
+}
+
+fn install_execution_root_scanner() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| register_root_scanner(scan_execution_roots));
+}
+
+fn scan_execution_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
+    let threads = native_threads_snapshot();
+    for thread in threads {
+        thread.trace_execution_roots(visit);
+    }
+
+    let fibers: Vec<Arc<Fiber>> = fiber_registry().lock().unwrap().values().cloned().collect();
+    for fiber in fibers {
+        fiber.trace_execution_roots(visit);
+    }
 }
 
 fn native_thread_registry() -> &'static OrderedMutex<HashMap<NativeThreadId, Arc<NativeThread>>> {
@@ -359,22 +411,56 @@ fn native_thread_registry() -> &'static OrderedMutex<HashMap<NativeThreadId, Arc
     })
 }
 
+fn prune_inactive_auto_registered_threads(
+    registry: &mut HashMap<NativeThreadId, Arc<NativeThread>>,
+) {
+    registry.retain(|_, thread| !thread.is_inactive_auto_registered());
+}
+
+fn native_threads_snapshot() -> Vec<Arc<NativeThread>> {
+    let mut registry = native_thread_registry().lock().unwrap();
+    prune_inactive_auto_registered_threads(&mut registry);
+    registry.values().cloned().collect()
+}
+
 thread_local! {
-    static CURRENT_NATIVE_THREAD: RefCell<Option<Arc<NativeThread>>> = const { RefCell::new(None) };
+    static CURRENT_NATIVE_THREAD: RefCell<Option<CurrentNativeThread>> =
+        const { RefCell::new(None) };
+}
+
+struct CurrentNativeThread {
+    thread: Arc<NativeThread>,
+}
+
+impl CurrentNativeThread {
+    fn new(thread: Arc<NativeThread>) -> Self {
+        thread.set_gc_participates(true);
+        Self { thread }
+    }
+}
+
+impl Drop for CurrentNativeThread {
+    fn drop(&mut self) {
+        self.thread.set_gc_participates(false);
+    }
 }
 
 fn install_current_native_thread(thread: Arc<NativeThread>) {
+    install_execution_root_scanner();
     #[cfg(unix)]
     thread
         .os_thread_id
         .store(crate::syscall::gettid() as usize, Ordering::Release);
-    CURRENT_NATIVE_THREAD.with(|slot| *slot.borrow_mut() = Some(thread));
+    CURRENT_NATIVE_THREAD.with(|slot| {
+        *slot.borrow_mut() = Some(CurrentNativeThread::new(thread));
+    });
 }
 
 fn ensure_current_native_thread() -> Arc<NativeThread> {
+    install_execution_root_scanner();
     CURRENT_NATIVE_THREAD.with(|slot| {
-        if let Some(thread) = slot.borrow().as_ref() {
-            return Arc::clone(thread);
+        if let Some(current) = slot.borrow().as_ref() {
+            return Arc::clone(&current.thread);
         }
         let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
         let result = Arc::new(ThreadResult::new());
@@ -382,6 +468,7 @@ fn ensure_current_native_thread() -> Arc<NativeThread> {
             id,
             std::thread::current().name().map(str::to_owned),
             false,
+            true,
             NIL,
             result,
         ));
@@ -394,7 +481,7 @@ fn ensure_current_native_thread() -> Arc<NativeThread> {
         thread
             .os_thread_id
             .store(crate::syscall::gettid() as usize, Ordering::Release);
-        *slot.borrow_mut() = Some(Arc::clone(&thread));
+        *slot.borrow_mut() = Some(CurrentNativeThread::new(Arc::clone(&thread)));
         thread
     })
 }
@@ -422,7 +509,7 @@ pub struct Fiber {
     id: FiberId,
     name: OrderedMutex<Option<String>>,
     /// The CL function (entry point) this fiber was created to execute.
-    entry: BlissVal,
+    entry: AtomicU64,
     state: OrderedMutex<FiberState>,
     stack: BlissStack,
     continuation: FiberContinuation,
@@ -568,7 +655,7 @@ impl Fiber {
 
     /// Get the entry value this thread was created to execute.
     pub fn entry(&self) -> BlissVal {
-        self.entry
+        BlissVal(self.entry.load(Ordering::Acquire))
     }
 
     /// Get the current state of this thread.
@@ -635,6 +722,19 @@ impl Fiber {
     fn post_interrupt(&self, condition: BlissVal) {
         *self.interrupt_value.lock().unwrap() = condition;
         self.interrupt_pending.store(true, Ordering::Release);
+    }
+
+    fn trace_execution_roots(&self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        trace_atomic_bliss_val(&self.entry, visit);
+        self.tls.lock().unwrap().trace_host_roots(visit);
+        self.dynamic_bindings
+            .lock()
+            .unwrap()
+            .trace_host_roots(visit);
+        self.handler_stack.lock().unwrap().trace_host_roots(visit);
+        self.restart_stack.lock().unwrap().trace_host_roots(visit);
+        self.interrupt_value.lock().unwrap().trace_host_roots(visit);
+        self.result.value.lock().unwrap().trace_host_roots(visit);
     }
 }
 
@@ -852,6 +952,7 @@ impl WorkerPool {
                     id,
                     Some(name.clone()),
                     true,
+                    false,
                     NIL,
                     Arc::clone(&result),
                 ));
@@ -868,6 +969,7 @@ impl WorkerPool {
                         install_current_native_thread(Arc::clone(&running_carrier));
                         running_carrier.set_state(NativeThreadState::Running);
                         worker_loop(running_pool, i);
+                        running_carrier.set_gc_participates(false);
                         running_carrier.set_state(NativeThreadState::Dead);
                         result.complete(Ok(NIL));
                     })
@@ -1211,18 +1313,16 @@ unsafe fn swap_fiber_to_scheduler(fiber: &Fiber) -> Result<(), BlissError> {
 }
 
 fn run_fiber_entry(thread: &Fiber) -> Result<BlissVal, BlissError> {
-    let mut result = if thread.entry.is_function() {
-        let fn_addr = thread.entry.0 & !crate::value::TAG_MASK;
+    let entry = thread.entry();
+    let mut result = if entry.is_function() {
+        let fn_addr = entry.0 & !crate::value::TAG_MASK;
         let func: fn() -> BlissVal = unsafe { std::mem::transmute(fn_addr) };
         Ok(func())
-    } else if matches!(
-        thread.entry.0,
-        crate::value::NIL_BITS | crate::value::T_BITS
-    ) {
-        Ok(thread.entry)
+    } else if matches!(entry.0, crate::value::NIL_BITS | crate::value::T_BITS) {
+        Ok(entry)
     } else {
         Err(BlissError::TypeError {
-            datum: thread.entry,
+            datum: entry,
             expected: "function".to_string(),
         })
     };
@@ -1259,6 +1359,7 @@ pub fn make_thread(entry: BlissVal) -> Result<NativeThreadId, BlissError> {
         id,
         Some(format!("bliss-thread-{}", id.0)),
         false,
+        false,
         entry,
         Arc::clone(&result),
     ));
@@ -1273,11 +1374,12 @@ pub fn make_thread(entry: BlissVal) -> Result<NativeThreadId, BlissError> {
         .spawn(move || {
             install_current_native_thread(Arc::clone(&running));
             running.set_state(NativeThreadState::Running);
-            let mut value = run_entry(running.entry);
+            let mut value = run_entry(running.entry());
             if let Some(interrupt) = running.take_interrupt() {
                 value = Ok(interrupt);
             }
             running.stack.publish_top();
+            running.set_gc_participates(false);
             running.set_state(NativeThreadState::Dead);
             result.complete(value);
         }) {
@@ -1300,12 +1402,14 @@ pub fn join_thread(id: NativeThreadId) -> Result<BlissVal, BlissError> {
             "a thread cannot join itself".into(),
         ));
     }
-    let thread = native_thread_registry()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| BlissError::Internal(format!("no native thread with id {}", id.0)))?;
+    let thread = {
+        let mut registry = native_thread_registry().lock().unwrap();
+        prune_inactive_auto_registered_threads(&mut registry);
+        registry
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| BlissError::Internal(format!("no native thread with id {}", id.0)))?
+    };
     let value = thread.result.wait()?;
     if let Some(handle) = thread.join_handle.lock().unwrap().take() {
         handle
@@ -1327,20 +1431,15 @@ pub fn current_thread() -> &'static NativeThread {
 
 pub fn all_thread_ids() -> Vec<NativeThreadId> {
     let _ = current_thread_id();
-    native_thread_registry()
-        .lock()
-        .unwrap()
-        .keys()
-        .copied()
-        .collect()
+    let mut registry = native_thread_registry().lock().unwrap();
+    prune_inactive_auto_registered_threads(&mut registry);
+    registry.keys().copied().collect()
 }
 
 pub fn thread_is_carrier(id: NativeThreadId) -> Option<bool> {
-    native_thread_registry()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .map(|thread| thread.is_carrier())
+    let mut registry = native_thread_registry().lock().unwrap();
+    prune_inactive_auto_registered_threads(&mut registry);
+    registry.get(&id).map(|thread| thread.is_carrier())
 }
 
 pub fn carrier_thread_ids() -> Vec<NativeThreadId> {
@@ -1348,7 +1447,8 @@ pub fn carrier_thread_ids() -> Vec<NativeThreadId> {
 }
 
 pub fn interrupt_thread(id: NativeThreadId, condition: BlissVal) -> Result<(), BlissError> {
-    let registry = native_thread_registry().lock().unwrap();
+    let mut registry = native_thread_registry().lock().unwrap();
+    prune_inactive_auto_registered_threads(&mut registry);
     let thread = registry
         .get(&id)
         .ok_or_else(|| BlissError::Internal(format!("no native thread with id {}", id.0)))?;
@@ -1376,7 +1476,7 @@ pub fn make_fiber(entry: BlissVal) -> Result<FiberId, BlissError> {
             "fiber name",
             None,
         ),
-        entry,
+        entry: AtomicU64::new(entry.0),
         state: OrderedMutex::new(
             LockLevel::ExecutionObject,
             fiber_object_order(id, 2),
@@ -1690,9 +1790,9 @@ pub fn current_stack() -> &'static BlissStack {
 }
 
 pub fn thread_published_fp(id: NativeThreadId) -> Option<*const crate::stack::Frame> {
-    native_thread_registry()
-        .lock()
-        .ok()?
+    let mut registry = native_thread_registry().lock().ok()?;
+    prune_inactive_auto_registered_threads(&mut registry);
+    registry
         .get(&id)
         .map(|thread| thread.stack().published_fp())
 }
@@ -1706,14 +1806,14 @@ pub fn fiber_published_fp(id: FiberId) -> Option<*const crate::stack::Frame> {
 }
 
 pub fn safepoint_participant_count_excluding(current: NativeThreadId) -> usize {
-    native_thread_registry()
-        .lock()
-        .unwrap()
+    let mut registry = native_thread_registry().lock().unwrap();
+    prune_inactive_auto_registered_threads(&mut registry);
+    registry
         .iter()
         .filter(|(id, thread)| {
             **id != current
                 && thread.state() == NativeThreadState::Running
-                && !thread.entry.is_nil()
+                && thread.gc_participates()
         })
         .count()
 }
@@ -1723,13 +1823,14 @@ pub fn safepoint_participant_count_excluding(current: NativeThreadId) -> usize {
 /// The SIGUSR1 handler itself only sets a flag; it never suspends the thread.
 #[cfg(unix)]
 pub(crate) fn signal_safepoint_participants(current: NativeThreadId) -> usize {
-    let registry = native_thread_registry().lock().unwrap();
+    let mut registry = native_thread_registry().lock().unwrap();
+    prune_inactive_auto_registered_threads(&mut registry);
     registry
         .iter()
         .filter(|(id, thread)| {
             **id != current
                 && thread.state() == NativeThreadState::Running
-                && !thread.entry.is_nil()
+                && thread.gc_participates()
         })
         .filter(|(_, thread)| {
             // Deliver the safepoint interrupt by kernel TID (tgkill), the
@@ -1754,16 +1855,16 @@ pub(crate) fn signal_safepoint_participants(_current: NativeThreadId) -> usize {
 pub fn wait_for_other_threads() {
     let current = current_thread_id();
     loop {
-        let native_pending = native_thread_registry()
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(id, thread)| {
+        let native_pending = {
+            let mut registry = native_thread_registry().lock().unwrap();
+            prune_inactive_auto_registered_threads(&mut registry);
+            registry.iter().any(|(id, thread)| {
                 *id != current
                     && !thread.is_carrier()
-                    && !thread.entry.is_nil()
+                    && thread.gc_participates()
                     && thread.state() != NativeThreadState::Dead
-            });
+            })
+        };
         let fiber_pending =
             fiber_registry().lock().unwrap().values().any(|fiber| {
                 fiber.state() != FiberState::Created && fiber.state() != FiberState::Dead

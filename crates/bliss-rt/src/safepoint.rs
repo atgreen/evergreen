@@ -213,6 +213,8 @@ pub fn enter_safepoint() {
         return;
     }
 
+    crate::gc::retire_current_t0_tlab_for_safepoint();
+
     // Issue #5 fix: increment `arrived` while holding `arrival_mutex`
     // so the notification cannot be lost between the increment and
     // the condvar wait in `wait_for_all_threads`.
@@ -307,13 +309,17 @@ pub fn wait_for_all_threads() -> Result<(), BlissError> {
                 // A mutator may be blocked in a syscall and unable to touch the
                 // polling page. Directed SIGUSR1 delivery is flag-only and
                 // exists solely to make that syscall return EINTR.
+                crate::runtime::install_signal_handlers()?;
                 let _ = crate::thread::signal_safepoint_participants(current);
             }
             // In the bootstrap runtime the thread registry can contain
             // worker threads that never participate in safepoint polling.
-            // Bound the wait so GC/debug paths can still make progress.
             if timeouts >= 10 {
-                break;
+                let arrived = coord.arrived.load(Ordering::SeqCst);
+                let _ = resume_all_threads();
+                return Err(BlissError::Internal(format!(
+                    "safepoint handshake failed: arrived {arrived}/{other_count} mutator threads"
+                )));
             }
         }
     }

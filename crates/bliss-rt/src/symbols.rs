@@ -64,7 +64,7 @@ struct SymbolRegistry {
 }
 
 static REGISTRY: OrderedRwLock<Option<SymbolRegistry>> =
-    OrderedRwLock::new(LockLevel::GcWorld, 2, "GC-rooted symbol registry", None);
+    OrderedRwLock::new(LockLevel::GcWorld, 3, "GC-rooted symbol registry", None);
 static UNINTERNED_COUNTER: AtomicU32 = AtomicU32::new(UNINTERNED_BASE);
 
 /// Allocate a pinned `SIMPLE_BASE_STRING` on the GC heap holding `s`.
@@ -153,9 +153,9 @@ pub fn intern(name: &str) -> u32 {
     let name_str = alloc_pinned_name(name);
     let sym = alloc_pinned_symbol(name_str, NIL);
     // Decide the result under the write lock, but do NOT touch the GC heap while
-    // holding it. The re-check's `gc::unpin` acquires `heap_state` (lock order 1),
-    // and the registry write lock is order 2 — but the collector holds heap_state
-    // (order 1) FIRST, then takes the registry (order 2) in `for_each_root_slot`.
+    // holding it. The re-check's `gc::unpin` acquires `heap_state` (lock order 2),
+    // and the registry write lock is order 3 — but the collector holds heap_state
+    // (order 2) FIRST, then takes the registry (order 3) in `for_each_root_slot`.
     // Unpinning under the registry lock inverts that (ABBA deadlock hazard, and in
     // debug builds the lock-order checker panics and poisons the registry). So
     // when we lose the race, unpin the orphaned objects AFTER releasing the lock;

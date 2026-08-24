@@ -1,4 +1,5 @@
 use bliss_rt::error::BlissError;
+use bliss_rt::object::type_id;
 use bliss_rt::runtime::{check_sigint, install_signal_handlers};
 use bliss_rt::safepoint::{
     enter_safepoint, poll_safepoint, resume_all_threads, wait_for_all_threads,
@@ -6,12 +7,13 @@ use bliss_rt::safepoint::{
 use bliss_rt::scheduler::{Scheduler, SchedulerConfig};
 use bliss_rt::thread::{
     all_thread_ids, current_thread, current_thread_id, interrupt_thread, join_thread, make_fiber,
-    make_thread,
+    make_thread, safepoint_participant_count_excluding, thread_is_carrier,
 };
-use bliss_rt::value::{BlissVal, T};
+use bliss_rt::value::{BlissVal, NIL, T};
+use bliss_rt::{alloc_typed, Collector, GcConfig, HeapCollector};
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -19,12 +21,44 @@ static SLOW_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 static RELEASE_SLOW_THREAD: AtomicBool = AtomicBool::new(false);
 static SAFETY_LOOP_EXIT: AtomicBool = AtomicBool::new(false);
 static POLL_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
+static T0_ALLOC_LOOP_EXIT: AtomicBool = AtomicBool::new(false);
+static T0_ALLOC_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "c-ffi")]
 static NATIVE_FFI_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "c-ffi")]
 static NATIVE_FFI_FINISHED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "c-ffi")]
 static USLEEP_FN: OnceLock<usize> = OnceLock::new();
+
+fn gc_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn gc_config() -> GcConfig {
+    GcConfig {
+        heap_size: 64 * 1024,
+        heap_max: 128 * 1024,
+        nursery_size: 8 * 1024,
+        tlab_size: 256,
+        region_size: 4 * 1024,
+        promotion_threshold: 1,
+        pause_target_ms: 10,
+        gc_workers: 1,
+        satb_buffer_size: 32,
+        old_occupancy_trigger: 0.5,
+    }
+}
+
+fn heap_value_with_marker(marker: u64) -> BlissVal {
+    let body = alloc_typed(16, type_id::BIGNUM).expect("heap value allocation");
+    unsafe { *(body as *mut u64) = marker };
+    unsafe { BlissVal::from_heap_ptr(body.sub(8)) }
+}
+
+fn heap_marker(value: BlissVal) -> u64 {
+    unsafe { *((value.as_ptr().add(8)) as *const u64) }
+}
 
 fn value_returning_entry() -> BlissVal {
     BlissVal::from_fixnum(1234)
@@ -51,6 +85,15 @@ fn polling_entry() -> BlissVal {
         std::thread::yield_now();
     }
     BlissVal::from_fixnum(POLL_ITERATIONS.load(Ordering::Acquire) as i64)
+}
+
+fn t0_allocating_entry() -> BlissVal {
+    while !T0_ALLOC_LOOP_EXIT.load(Ordering::Acquire) {
+        alloc_typed(16, type_id::BIGNUM).expect("T0 allocation should succeed");
+        T0_ALLOC_ITERATIONS.fetch_add(1, Ordering::AcqRel);
+        std::thread::yield_now();
+    }
+    BlissVal::from_fixnum(T0_ALLOC_ITERATIONS.load(Ordering::Acquire) as i64)
 }
 
 #[cfg(feature = "c-ffi")]
@@ -142,6 +185,65 @@ fn make_thread_join_and_registry_cleanup_follow_the_public_thread_api() {
 }
 
 #[test]
+fn lazily_registered_host_threads_participate_in_gc_safepoints() {
+    // Host/test threads that enter the runtime through CURRENT-THREAD have no Lisp
+    // entry function, but they can still allocate on the GC heap and must be counted
+    // as native mutators until their TLS registration is dropped.
+    let current = current_thread_id();
+    let before = safepoint_participant_count_excluding(current);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let handle = std::thread::spawn(move || {
+        let id = current_thread_id();
+        ready_tx.send(id).expect("send registered thread id");
+        release_rx.recv().expect("wait for release");
+    });
+
+    let worker = ready_rx.recv().expect("worker should register");
+    assert_ne!(worker, current);
+    let during = safepoint_participant_count_excluding(current);
+    assert!(
+        during > before,
+        "a lazily registered NIL-entry host thread must count as a GC mutator"
+    );
+
+    release_tx.send(()).expect("release worker");
+    handle.join().expect("worker exits cleanly");
+    assert!(
+        safepoint_participant_count_excluding(current) < during,
+        "lazy host thread TLS drop should remove it from GC safepoint participation"
+    );
+}
+
+#[test]
+fn exited_lazy_host_threads_are_pruned_from_public_registry_views() {
+    // h6z.6: lazy host/test thread records must not be removed from TLS drop
+    // with an OrderedMutex, but they should disappear on later safe registry
+    // access once their TLS registration has ended.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+    let handle = std::thread::spawn(move || {
+        ready_tx
+            .send(current_thread_id())
+            .expect("send registered thread id");
+    });
+
+    let worker = ready_rx.recv().expect("worker should register");
+    handle.join().expect("worker exits cleanly");
+
+    assert!(
+        !all_thread_ids().contains(&worker),
+        "exited lazy host thread must not leak through ALL-THREADS"
+    );
+    assert_eq!(
+        thread_is_carrier(worker),
+        None,
+        "exited lazy host thread must not remain queryable as a public thread"
+    );
+}
+
+#[test]
 fn function_entries_execute_on_worker_threads_and_return_values() {
     // Per R2.04, fibers are scheduled onto the carrier pool.
     // Per R13.18, MAKE-THREAD and JOIN-THREAD expose observable thread execution.
@@ -167,6 +269,22 @@ fn thread_local_storage_is_isolated_between_green_threads() {
 
     assert_eq!(child_value, BlissVal::from_fixnum(99));
     assert_eq!(current_thread().tls_get(0), BlissVal::from_fixnum(7));
+}
+
+#[test]
+fn native_thread_tls_roots_survive_minor_gc() {
+    // h6z.5: native thread-owned TLS slots live outside the heap but must be
+    // scanned and rewritten by a moving minor collection.
+    let _guard = gc_lock().lock().unwrap_or_else(|e| e.into_inner());
+    bliss_rt::init_heap(&gc_config()).expect("init_heap");
+
+    const MARKER: u64 = 0x5100_0000_0000_0001;
+    current_thread().tls_set(0, heap_value_with_marker(MARKER));
+
+    HeapCollector::new().minor_gc().expect("minor GC");
+
+    assert_eq!(heap_marker(current_thread().tls_get(0)), MARKER);
+    current_thread().tls_set(0, NIL);
 }
 
 #[test]
@@ -221,6 +339,27 @@ fn scheduler_group_exposes_carriers_and_runs_real_fibers() {
 }
 
 #[test]
+fn fiber_interrupt_roots_survive_minor_gc() {
+    // h6z.5: fiber-owned interrupt storage is also an external execution root,
+    // including while the fiber is only queued in the scheduler registry.
+    let _guard = gc_lock().lock().unwrap_or_else(|e| e.into_inner());
+    bliss_rt::init_heap(&gc_config()).expect("init_heap");
+
+    const MARKER: u64 = 0x5100_0000_0000_0002;
+    let fiber = make_fiber(T).expect("fiber creation");
+    bliss_rt::interrupt_fiber(fiber, heap_value_with_marker(MARKER)).expect("interrupt fiber");
+
+    HeapCollector::new().minor_gc().expect("minor GC");
+
+    let scheduler =
+        Scheduler::init(&SchedulerConfig { num_workers: 1 }).expect("scheduler creation");
+    scheduler.submit(fiber).expect("submit fiber");
+    let results = scheduler.finish().expect("finish scheduler");
+    assert_eq!(results.len(), 1);
+    assert_eq!(heap_marker(results[0]), MARKER);
+}
+
+#[test]
 fn enter_safepoint_publishes_the_current_stack_top() {
     // Per R2.07 and R13.10, safepoints use cooperative polling rather than async suspension.
     let stack = current_thread().stack();
@@ -261,6 +400,63 @@ fn stop_the_world_waits_for_polling_threads_and_resumes_them() {
 
     SAFETY_LOOP_EXIT.store(true, Ordering::Release);
     let result = join_thread(id).expect("polling thread must finish");
+    assert!(result.as_fixnum() >= iterations_during_stop as i64);
+}
+
+#[test]
+fn failed_safepoint_handshake_is_reported_and_cleans_up() {
+    // h6z.4: a moving GC must never proceed after a failed safepoint
+    // handshake. A running thread that never polls should make the handshake
+    // fail, and the failure path must resume/clear coordination state so the
+    // target can still be joined.
+    install_signal_handlers().expect("signal handlers must install before SIGUSR1 nudging");
+    SLOW_THREAD_STARTED.store(false, Ordering::Release);
+    RELEASE_SLOW_THREAD.store(false, Ordering::Release);
+
+    let id = make_thread(unsafe { fn_entry(slow_interruptible_entry) }).expect("thread creation");
+    while !SLOW_THREAD_STARTED.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    let err = wait_for_all_threads().expect_err("non-polling mutator must fail handshake");
+    assert!(
+        format!("{err}").contains("safepoint handshake failed"),
+        "unexpected safepoint error: {err}"
+    );
+
+    RELEASE_SLOW_THREAD.store(true, Ordering::Release);
+    assert_eq!(join_thread(id).expect("join must succeed after cleanup"), T);
+}
+
+#[test]
+fn t0_alloc_typed_observes_safepoints_before_touching_its_tlab() {
+    // h6z.3: T0 allocation is a native-mutator entry point. A thread that only
+    // allocates through alloc_typed must still park at a GC safepoint before it
+    // touches its TLAB again.
+    T0_ALLOC_LOOP_EXIT.store(false, Ordering::Release);
+    T0_ALLOC_ITERATIONS.store(0, Ordering::Release);
+
+    let id = make_thread(unsafe { fn_entry(t0_allocating_entry) }).expect("thread creation");
+    while T0_ALLOC_ITERATIONS.load(Ordering::Acquire) == 0 {
+        std::thread::yield_now();
+    }
+
+    wait_for_all_threads().expect("alloc_typed-only mutator should reach safepoint");
+    let iterations_during_stop = T0_ALLOC_ITERATIONS.load(Ordering::Acquire);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        T0_ALLOC_ITERATIONS.load(Ordering::Acquire),
+        iterations_during_stop,
+        "alloc_typed must poll and park before touching the T0 TLAB"
+    );
+
+    resume_all_threads().expect("resume must succeed");
+    while T0_ALLOC_ITERATIONS.load(Ordering::Acquire) == iterations_during_stop {
+        std::thread::yield_now();
+    }
+
+    T0_ALLOC_LOOP_EXIT.store(true, Ordering::Release);
+    let result = join_thread(id).expect("allocating thread must finish");
     assert!(result.as_fixnum() >= iterations_during_stop as i64);
 }
 
