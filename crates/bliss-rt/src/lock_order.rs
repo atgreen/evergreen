@@ -5,7 +5,11 @@
 //! hierarchy: their ordering is controlled by the program/protocol rather than
 //! by runtime subsystem nesting.
 
+// The lock-order checker itself is compiled only under debug_assertions, so
+// its imports are gated the same way or release builds warn on them.
+#[cfg(debug_assertions)]
 use std::cell::RefCell;
+#[cfg(debug_assertions)]
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
