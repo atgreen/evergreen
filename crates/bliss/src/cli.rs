@@ -14736,10 +14736,12 @@ fn eval_args(args: BlissVal, env: &mut Env) -> Result<RootedVals, BlissError> {
 /// Extract a sequence (list, vector, or string) into a Vec of its elements.
 /// A symbol's property list, or NIL for a non-symbol.
 fn symbol_plist_of(sym: BlissVal) -> BlissVal {
-    if sym.is_symbol() {
-        bliss_rt::symbols::symbol_plist(sym.as_symbol_index()).unwrap_or(NIL)
-    } else {
-        NIL
+    // symbol_index (not as_symbol_index): is_symbol reports NIL/T as symbols
+    // but they carry no symbol-table index, so `(get nil …)` — legal CL,
+    // cl-ppcre does it — panicked here (bliss-d0b). NIL/T's plist is ().
+    match sym.symbol_index() {
+        Some(idx) => bliss_rt::symbols::symbol_plist(idx).unwrap_or(NIL),
+        None => NIL,
     }
 }
 
@@ -14765,10 +14767,11 @@ fn plist_lookup(plist: BlissVal, key: BlissVal) -> Option<BlissVal> {
 /// first match, so the freshest binding wins; a superseded pair is left in place
 /// (REMPROP is unused by the code that needs this).
 fn symbol_plist_put(sym: BlissVal, key: BlissVal, val: BlissVal) {
-    if !sym.is_symbol() {
+    // symbol_index: is_symbol includes NIL/T, which have no table index
+    // (see symbol_plist_of; bliss-d0b).
+    let Some(idx) = sym.symbol_index() else {
         return;
-    }
-    let idx = sym.as_symbol_index();
+    };
     bliss_rt::rooted!(plist = bliss_rt::symbols::symbol_plist(idx).unwrap_or(NIL));
     bliss_rt::rooted!(key_r = key);
     bliss_rt::rooted!(inner = arena_cons(val, *plist));
