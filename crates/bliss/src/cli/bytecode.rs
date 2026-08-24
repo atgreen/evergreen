@@ -9449,6 +9449,7 @@ fn record_back_edge_if_backward(act: &Activation, target: u32) {
 impl Activation {
     #[inline]
     fn push_op(&mut self, v: BlissVal) {
+        super::poison_trap(v, "bytecode push_op");
         unsafe { slot_set(self.frame, self.n_locals + self.sp_top, v) };
         self.sp_top += 1;
     }

@@ -2760,7 +2760,36 @@ fn has_applicable_method(env: &Env, name: &str, args: &[BlissVal]) -> bool {
         .unwrap_or(false)
 }
 
+/// `BLISS_CALLTRACE=1`: print the named-function chain a TYPE-ERROR propagates
+/// through (innermost frame first), one line per named call. The Rust
+/// backtrace is all `eval_form` frames and the tree-walker pushes no runtime
+/// frames, so this is the cheapest way to localize a type error deep in
+/// tree-walked Lisp (bliss-4bp). Zero cost unless the variable is set.
+fn calltrace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLISS_CALLTRACE").is_ok_and(|v| v == "1"))
+}
+
+fn calltrace_note(name: &str, e: &BlissError) {
+    if calltrace_enabled() && matches!(e, BlissError::TypeError { .. }) {
+        eprintln!("[calltrace] {name}");
+    }
+}
+
 fn invoke_generic_function(
+    name: &str,
+    args: &[BlissVal],
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    let res = invoke_generic_function_inner(name, args, env);
+    if let Err(e) = &res {
+        calltrace_note(name, e);
+    }
+    res
+}
+
+fn invoke_generic_function_inner(
     name: &str,
     args: &[BlissVal],
     env: &mut Env,
@@ -6516,7 +6545,25 @@ fn read_eval_all(source: &str) -> Result<BlissVal, BlissError> {
     read_eval_all_env(source, &mut env)
 }
 
+/// `BLISS_POISON_TRAP=1` (with `BLISS_GC_POISON=1`): abort the moment a
+/// value composed of the 0xFA poison fill is observed at a chokepoint, so the
+/// stack points near the first ingestion of freed-nursery data rather than at
+/// whatever derefs it much later (bliss-4bp debugging aid).
+fn poison_trap_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLISS_POISON_TRAP").is_ok_and(|v| v == "1"))
+}
+
+#[inline]
+fn poison_trap(v: BlissVal, what: &str) {
+    if poison_trap_enabled() && v.0 == 0xFAFA_FAFA_FAFA_FAFA {
+        panic!("poison value observed at {what}");
+    }
+}
+
 fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    poison_trap(form, "eval_form entry");
     bliss_rt::rooted!(form = form);
     let form = *form;
     if form.is_nil() || form == T {
@@ -6787,7 +6834,12 @@ fn cp(val: BlissVal) -> (BlissVal, BlissVal) {
     }
     unsafe {
         let c = val.as_ptr() as *const ConsCell;
-        ((*c).car, (*c).cdr)
+        let (car, cdr) = ((*c).car, (*c).cdr);
+        if poison_trap_enabled() {
+            poison_trap(car, "cp car (freed cons read)");
+            poison_trap(cdr, "cp cdr (freed cons read)");
+        }
+        (car, cdr)
     }
 }
 
@@ -8423,10 +8475,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             }
                             "GETHASH" => {
                                 // (setf (gethash key table) val)
-                                let key = eval_form(tgt_form, env)?;
+                                // Root the evaluated key across the table-form
+                                // evaluation: unrooted, a minor GC there moved
+                                // the key and set_gethash stored the stale
+                                // pre-move pointer into the (root-scanned)
+                                // entry table, where it outlived the nursery
+                                // reset (bliss-4bp, caught by BLISS_GC_VERIFY).
+                                bliss_rt::rooted!(key = eval_form(tgt_form, env)?);
                                 let (tbl_form, _) = cp(cp(*aargs).1);
                                 let tbl = eval_form(tbl_form, env)?;
-                                bliss_stdlib::set_gethash(key, tbl, *val)?;
+                                bliss_stdlib::set_gethash(*key, tbl, *val)?;
                             }
                             "GET" => {
                                 // (setf (get symbol indicator [default]) val)
@@ -9315,30 +9373,49 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (member item list &key key test test-not)
                 let (item_f, r) = cp(cdr);
                 let (list_f, kwrest) = cp(r);
-                let item = eval_form(item_f, env)?;
-                let list = eval_form(list_f, env)?;
-                let kwargs = eval_args(kwrest, env)?;
-                let key_fn = find_key_arg(&kwargs, "KEY");
-                let test_fn = find_key_arg(&kwargs, "TEST");
-                let test_not_fn = find_key_arg(&kwargs, "TEST-NOT");
-                let mut c = list;
+                // Root everything held across the allocating :key/:test calls
+                // (arbitrary Lisp functions): the unevaluated forms, item, the
+                // spine cursor, and the function values themselves (a :test can
+                // be a closure cons). Unrooted, ASDF's circular-dependency
+                // check `(member action list :test 'equal)` walked freed
+                // nursery after a mid-walk minor GC (bliss-4bp).
+                bliss_rt::rooted!(list_f = list_f);
+                bliss_rt::rooted!(kwrest = kwrest);
+                bliss_rt::rooted!(item = eval_form(item_f, env)?);
+                bliss_rt::rooted!(c = eval_form(*list_f, env)?);
+                // eval_args returns RootedVals (already GC-rooted).
+                let kwargs = eval_args(*kwrest, env)?;
+                let has_key = matches!(find_key_arg(&kwargs, "KEY"), Some(v) if v != NIL);
+                let has_test = find_key_arg(&kwargs, "TEST").is_some();
+                let has_test_not = find_key_arg(&kwargs, "TEST-NOT").is_some();
+                let mut fns = vec![
+                    find_key_arg(&kwargs, "KEY").unwrap_or(NIL),
+                    find_key_arg(&kwargs, "TEST").unwrap_or(NIL),
+                    find_key_arg(&kwargs, "TEST-NOT").unwrap_or(NIL),
+                ];
+                bliss_rt::rooted_ref!(_fns_root = &mut fns);
                 while c.is_cons() {
-                    let (car, cdr_val) = cp(c);
-                    let probe = match key_fn {
-                        Some(kf) if kf != NIL => apply_function(kf, &[car], env)?,
-                        _ => car,
-                    };
-                    let matched = if let Some(tf) = test_fn {
-                        apply_function(tf, &[item, probe], env)? != NIL
-                    } else if let Some(tnf) = test_not_fn {
-                        apply_function(tnf, &[item, probe], env)? == NIL
+                    let (car, _) = cp(*c);
+                    let probe = if has_key {
+                        apply_function(fns[0], &[car], env)?
                     } else {
-                        vals_equal(probe, item)
+                        car
+                    };
+                    let matched = if has_test {
+                        apply_function(fns[1], &[*item, probe], env)? != NIL
+                    } else if has_test_not {
+                        apply_function(fns[2], &[*item, probe], env)? == NIL
+                    } else {
+                        vals_equal(probe, *item)
                     };
                     if matched {
-                        return Ok(c);
+                        return Ok(*c);
                     }
-                    c = cdr_val;
+                    // Re-read the (rooted, GC-current) cell only after the
+                    // allocating calls above — a cdr copied before them would
+                    // be stale.
+                    let (_, next) = cp(*c);
+                    *c = next;
                 }
                 return Ok(NIL);
             }
@@ -11866,7 +11943,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             // The rooted argument vector is rewritten in place by any collection
             // (call_registered may have collected), so it is always current.
-            return eval_lambda_call(env, *params_form, *body, &rooted_args, call_parent);
+            let res = eval_lambda_call(env, *params_form, *body, &rooted_args, call_parent);
+            if let Err(e) = &res {
+                calltrace_note(&name, e);
+            }
+            return res;
         }
 
         // Check accessor functions (from DEFCLASS). Match by full name or bare
@@ -16113,45 +16194,51 @@ fn macroexpand_all(form: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
 
         // Binding forms: expand init-forms and bodies but preserve the bound
         // names (a variable named like a macro must not be expanded away).
+        // Every cp() result held across an allocating expansion (mx_each /
+        // mx_bindings / macroexpand_all / arena_cons) is rooted: the moving
+        // minor GC otherwise leaves the Rust-local copy stale, and the rebuilt
+        // form is read from freed nursery (bliss-4bp; same class as bliss-l3n).
         "LET" | "LET*" => {
             let (bindings, body) = cp(cdr);
-            let new_bindings = mx_bindings(bindings, env, d);
-            arena_cons(car, arena_cons(new_bindings, mx_each(body, env, d)))
+            bliss_rt::rooted!(body = body);
+            bliss_rt::rooted!(new_bindings = mx_bindings(bindings, env, d));
+            let new_body = mx_each(*body, env, d);
+            arena_cons(car, arena_cons(*new_bindings, new_body))
         }
         "LAMBDA" => {
             // (lambda lambda-list body...) — keep the lambda list, expand body.
             let (ll, body) = cp(cdr);
-            arena_cons(car, arena_cons(ll, mx_each(body, env, d)))
+            bliss_rt::rooted!(ll = ll);
+            let new_body = mx_each(body, env, d);
+            arena_cons(car, arena_cons(*ll, new_body))
         }
         "FLET" | "LABELS" => {
             // (flet ((name lambda-list fbody...) ...) body...)
             let (defs, body) = cp(cdr);
-            let new_defs = mx_local_fns(defs, env, d);
-            arena_cons(car, arena_cons(new_defs, mx_each(body, env, d)))
+            bliss_rt::rooted!(body = body);
+            bliss_rt::rooted!(new_defs = mx_local_fns(defs, env, d));
+            let new_body = mx_each(*body, env, d);
+            arena_cons(car, arena_cons(*new_defs, new_body))
         }
         "MULTIPLE-VALUE-BIND" => {
             // (multiple-value-bind (vars) value-form body...)
             let (vars, rest) = cp(cdr);
             let (value_form, body) = cp(rest);
-            arena_cons(
-                car,
-                arena_cons(
-                    vars,
-                    arena_cons(macroexpand_all(value_form, env, d), mx_each(body, env, d)),
-                ),
-            )
+            bliss_rt::rooted!(vars = vars);
+            bliss_rt::rooted!(body = body);
+            bliss_rt::rooted!(new_value = macroexpand_all(value_form, env, d));
+            let new_body = mx_each(*body, env, d);
+            arena_cons(car, arena_cons(*vars, arena_cons(*new_value, new_body)))
         }
         "DESTRUCTURING-BIND" => {
             // (destructuring-bind pattern value-form body...)
             let (pattern, rest) = cp(cdr);
             let (value_form, body) = cp(rest);
-            arena_cons(
-                car,
-                arena_cons(
-                    pattern,
-                    arena_cons(macroexpand_all(value_form, env, d), mx_each(body, env, d)),
-                ),
-            )
+            bliss_rt::rooted!(pattern = pattern);
+            bliss_rt::rooted!(body = body);
+            bliss_rt::rooted!(new_value = macroexpand_all(value_form, env, d));
+            let new_body = mx_each(*body, env, d);
+            arena_cons(car, arena_cons(*pattern, arena_cons(*new_value, new_body)))
         }
         "COND" => {
             // (cond (test body...) ...) — each clause element is a standalone
@@ -16159,18 +16246,24 @@ fn macroexpand_all(form: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
             // clause element-wise rather than as one call form.
             let mut clauses = Vec::new();
             let mut c = cdr;
+            // The spine cursor and collected clauses live across the allocating
+            // per-clause expansion; unrooted, the next cp(c) read freed nursery
+            // after a mid-loop minor GC (bliss-4bp: ASDF corruption at scale).
+            bliss_rt::rooted_ref!(_clauses_root = &mut clauses);
+            bliss_rt::rooted_ref!(_c_root = &mut c);
             while c.is_cons() {
                 let (clause, rest) = cp(c);
+                c = rest;
                 clauses.push(if clause.is_cons() {
                     mx_each(clause, env, d)
                 } else {
                     clause
                 });
-                c = rest;
             }
             let mut out = c;
-            for &cl in clauses.iter().rev() {
-                out = arena_cons(cl, out);
+            bliss_rt::rooted_ref!(_out_root = &mut out);
+            for i in (0..clauses.len()).rev() {
+                out = arena_cons(clauses[i], out);
             }
             arena_cons(car, out)
         }
@@ -16198,21 +16291,29 @@ fn macroexpand_all(form: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
 fn mx_bindings(bindings: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
     let mut out_items = Vec::new();
     let mut c = bindings;
+    // Spine cursor, collected bindings, and the per-binding variable name all
+    // live across the allocating init-form expansion — root them so a mid-loop
+    // minor GC doesn't leave stale copies (bliss-4bp; same class as bliss-l3n).
+    bliss_rt::rooted_ref!(_out_items_root = &mut out_items);
+    bliss_rt::rooted_ref!(_c_root = &mut c);
     while c.is_cons() {
         let (b, rest) = cp(c);
+        c = rest;
         let nb = if b.is_cons() {
             let (var, init) = cp(b);
+            bliss_rt::rooted!(var = var);
             // Keep `var`; expand every init-form after it.
-            arena_cons(var, mx_each(init, env, depth))
+            let new_init = mx_each(init, env, depth);
+            arena_cons(*var, new_init)
         } else {
             b
         };
         out_items.push(nb);
-        c = rest;
     }
     let mut out = c;
-    for &it in out_items.iter().rev() {
-        out = arena_cons(it, out);
+    bliss_rt::rooted_ref!(_out_root = &mut out);
+    for i in (0..out_items.len()).rev() {
+        out = arena_cons(out_items[i], out);
     }
     out
 }
@@ -16222,13 +16323,23 @@ fn mx_bindings(bindings: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
 fn mx_local_fns(defs: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
     let mut out_items = Vec::new();
     let mut c = defs;
+    // Root everything held across the allocating body expansion: the spine
+    // cursor, collected definitions, and each definition's name/lambda-list
+    // (a `(setf name)` fname and the lambda list are heap conses) — a mid-loop
+    // minor GC otherwise leaves stale copies (bliss-4bp; bliss-l3n class).
+    bliss_rt::rooted_ref!(_out_items_root = &mut out_items);
+    bliss_rt::rooted_ref!(_c_root = &mut c);
     while c.is_cons() {
         let (def, rest) = cp(c);
+        c = rest;
         let nd = if def.is_cons() {
             let (fname, after_name) = cp(def);
             if after_name.is_cons() {
                 let (ll, fbody) = cp(after_name);
-                arena_cons(fname, arena_cons(ll, mx_each(fbody, env, depth)))
+                bliss_rt::rooted!(fname = fname);
+                bliss_rt::rooted!(ll = ll);
+                let new_body = mx_each(fbody, env, depth);
+                arena_cons(*fname, arena_cons(*ll, new_body))
             } else {
                 def
             }
@@ -16236,11 +16347,11 @@ fn mx_local_fns(defs: BlissVal, env: &mut Env, depth: u32) -> BlissVal {
             def
         };
         out_items.push(nd);
-        c = rest;
     }
     let mut out = c;
-    for &it in out_items.iter().rev() {
-        out = arena_cons(it, out);
+    bliss_rt::rooted_ref!(_out_root = &mut out);
+    for i in (0..out_items.len()).rev() {
+        out = arena_cons(out_items[i], out);
     }
     out
 }
@@ -17558,7 +17669,11 @@ fn apply_function(
                     call_parent = frame;
                 }
             }
-            return eval_lambda_call(env, params_form, body, args, call_parent);
+            let res = eval_lambda_call(env, params_form, body, args, call_parent);
+            if let Err(e) = &res {
+                calltrace_note(&name, e);
+            }
+            return res;
         }
         if env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name) {
             return invoke_generic_function(&name, args, env);

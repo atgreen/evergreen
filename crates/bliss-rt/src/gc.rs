@@ -1401,6 +1401,106 @@ impl HeapCollector {
         });
         fire_finalizers_in_ranges(&nursery_ranges);
 
+        // BLISS_GC_VERIFY: every reference must have been relocated out of the
+        // evacuated ranges by the passes above; a survivor pointer into them is
+        // an untraced/unrelocated slot — panic now, naming the holder, instead
+        // of letting the reset turn it into delayed corruption (bliss-4bp).
+        if gc_verify_enabled() {
+            let stale = |v: BlissVal| -> bool {
+                if !is_heap_ref(v) {
+                    return false;
+                }
+                let a = ref_body_addr(v);
+                nursery_ranges.iter().any(|&(b, l)| a >= b && a < l)
+            };
+            let check = |v: BlissVal, holder: &str, slot_addr: usize| {
+                if stale(v) {
+                    panic!(
+                        "gc-verify: reference {:#x} into evacuated nursery survives minor GC \
+                         in {holder} slot {slot_addr:#x}",
+                        v.to_raw()
+                    );
+                }
+            };
+            check(get_entry_continuation(), "entry-continuation", 0);
+            crate::symbols::for_each_root_slot(|slot| {
+                check(unsafe { *slot }, "symbol-root", slot as usize);
+            });
+            scan_external_roots(|slot| {
+                check(unsafe { *slot }, "external-root", slot as usize);
+            });
+            {
+                let mut chase = |slot: &mut BlissVal| {
+                    check(*slot, "cl-stack-frame", slot as *mut BlissVal as usize);
+                };
+                let mut verify_from = |fp: *const crate::stack::Frame| {
+                    // SAFETY: `fp` is a valid published frame chain (STW).
+                    unsafe { crate::stack::visit_stack_refs(fp, &mut chase) };
+                };
+                let cur = crate::thread::current_thread_id();
+                let current_fiber = crate::thread::current_fiber_id();
+                verify_from(crate::thread::current_stack().fp());
+                for id in crate::thread::all_thread_ids() {
+                    if id == cur {
+                        continue;
+                    }
+                    if let Some(fp) = crate::thread::thread_published_fp(id) {
+                        verify_from(fp);
+                    }
+                }
+                for id in crate::thread::all_fiber_ids() {
+                    if Some(id) == current_fiber {
+                        continue;
+                    }
+                    if let Some(fp) = crate::thread::fiber_published_fp(id) {
+                        verify_from(fp);
+                    }
+                }
+            }
+            for region in state.regions.iter() {
+                if !matches!(
+                    region.header.kind,
+                    RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject
+                ) {
+                    continue;
+                }
+                let mut cursor = region.base as usize;
+                let top = region.header.alloc_top as usize;
+                while cursor + OBJECT_HEADER_SIZE <= top {
+                    let header_ptr = cursor as *const u8;
+                    let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
+                    if body_size == 0 && type_id == 0 {
+                        break;
+                    }
+                    let total_size =
+                        align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                    if !unsafe { header_is_forwarded(header_ptr) } {
+                        let body_addr = cursor + OBJECT_HEADER_SIZE;
+                        unsafe {
+                            trace_object(
+                                body_addr as *mut u8,
+                                type_id,
+                                body_size as usize,
+                                |slot| {
+                                    let v = *slot;
+                                    if stale(v) {
+                                        panic!(
+                                            "gc-verify: reference {:#x} into evacuated nursery \
+                                             survives minor GC in live object body {body_addr:#x} \
+                                             (type {type_id}) slot {:#x}",
+                                            v.to_raw(),
+                                            slot as *mut BlissVal as usize
+                                        );
+                                    }
+                                },
+                            );
+                        }
+                    }
+                    cursor += total_size;
+                }
+            }
+        }
+
         // Phase 4: Reset all nursery regions for reuse (after relocation, above,
         // read their forwarding pointers). Retained pinned regions were promoted
         // to old-gen in place and must NOT be zeroed (bliss-jtc.18).
@@ -3143,6 +3243,18 @@ unsafe fn set_object_type_id(body: *mut u8, body_size: usize, type_id: u8) {
 fn gc_poison_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("BLISS_GC_POISON").is_some())
+}
+
+/// Whether `BLISS_GC_VERIFY` is set (cached). After the relocation passes of a
+/// minor GC (before the evacuated nursery is reset), walk every root slot and
+/// every live non-nursery object field and panic on any reference still
+/// pointing into the about-to-be-freed ranges. Such a reference is a slot the
+/// collector failed to trace or update — the direct cause of the "stale value
+/// read from freed nursery" corruption class (bliss-4bp) — and this names the
+/// holder at the exact collection that orphaned it.
+fn gc_verify_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BLISS_GC_VERIFY").is_some())
 }
 
 fn gc_stress_stride() -> u64 {
