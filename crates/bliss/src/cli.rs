@@ -6524,15 +6524,31 @@ fn build_bfasl_from_source(
 ) -> Result<Vec<u8>, BlissError> {
     let mut forms = read_forms_for_compile(source, env)?;
     bliss_rt::rooted_ref!(_forms_root = &mut forms);
-    let bytecode_unit = bytecode::build_bbu_from_forms(&forms, src_path, source, env)?;
-    Ok(bliss_rt::bfasl::BfaslBuilder::new()
-        .content_hash(bliss_rt::bfasl::content_hash(source.as_bytes()))
-        .section(bliss_rt::bfasl::section::BYTECODE_UNIT, bytecode_unit)
-        .section(
-            bliss_rt::bfasl::section::SOURCE_MAP,
-            src_path.as_bytes().to_vec(),
-        )
-        .build())
+    match bytecode::build_bbu_from_forms(&forms, src_path, source, env)? {
+        Some(bytecode_unit) => Ok(bliss_rt::bfasl::BfaslBuilder::new()
+            .content_hash(bliss_rt::bfasl::content_hash(source.as_bytes()))
+            .section(bliss_rt::bfasl::section::BYTECODE_UNIT, bytecode_unit)
+            .section(
+                bliss_rt::bfasl::section::SOURCE_MAP,
+                src_path.as_bytes().to_vec(),
+            )
+            .build()),
+        // A form's literals cannot be externalized (bit vectors, read-time
+        // `#.` hash tables, structs): emit a legacy source-only artifact so
+        // the output is still loadable — the loader re-reads the text and
+        // reconstructs read-time values at load (bliss-d0b).
+        None => Ok(bliss_rt::bfasl::BfaslBuilder::new()
+            .content_hash(bliss_rt::bfasl::content_hash(source.as_bytes()))
+            .section(
+                bliss_rt::bfasl::section::TOPLEVEL_FORMS,
+                source.as_bytes().to_vec(),
+            )
+            .section(
+                bliss_rt::bfasl::section::SOURCE_MAP,
+                src_path.as_bytes().to_vec(),
+            )
+            .build()),
+    }
 }
 
 /// True if `name` (a module string, matched case-insensitively) is already in

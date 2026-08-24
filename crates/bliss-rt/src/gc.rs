@@ -622,8 +622,11 @@ pub struct HeapCollector {
 /// True if `v` is a tagged heap reference (cons, heap object, or function
 /// pointer) whose referent the GC must trace. Immediates — fixnums, chars,
 /// single-floats, symbols-by-id, NIL/T — are not references.
+/// Public: code generators must know which values may MOVE under the minor GC
+/// (a movable value can never be embedded as a raw immediate in native code —
+/// it must be loaded through a GC-visible slot; bliss-d0b T1 constants).
 #[inline]
-fn is_heap_ref(v: BlissVal) -> bool {
+pub fn is_heap_ref(v: BlissVal) -> bool {
     matches!(
         v.0 & crate::value::TAG_MASK,
         crate::value::TAG_CONS | crate::value::TAG_HEAP_OBJECT | crate::value::TAG_FUNCTION

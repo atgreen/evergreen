@@ -6607,12 +6607,15 @@ fn bbu_package_plan(form: BlissVal) -> Result<Option<BbuPackagePlan>, BlissError
 /// Build a complete, source-independent BFASL `BYTECODE_UNIT`. Every top-level
 /// load action must be representable as portable bytecode; otherwise
 /// COMPILE-FILE fails and emits no artifact.
+/// Returns `Ok(None)` when some top-level form's literals cannot be
+/// externalized into the portable pool — the caller must fall back to a
+/// source-only artifact (CLHS: COMPILE-FILE always produces loadable output).
 pub fn build_bbu_from_forms(
     forms: &[BlissVal],
     src_path: &str,
     source: &str,
     env: &Env,
-) -> Result<Vec<u8>, BlissError> {
+) -> Result<Option<Vec<u8>>, BlissError> {
     let mut forms = forms.to_vec();
     bliss_rt::rooted_ref!(_forms_root = &mut forms);
     let mut pool = BbuConstPool::default();
@@ -6790,10 +6793,28 @@ pub fn build_bbu_from_forms(
             }
         }
         if !done {
-            return Err(BlissError::FileError(format!(
-                "compile-file: top-level form {} cannot be represented as portable bytecode",
-                form_index + 1
-            )));
+            // CLHS 3.2.3: COMPILE-FILE must always produce loadable output.
+            // A form whose literals the portable pool cannot externalize —
+            // bit vectors (cl-ppcre's #*0 defstruct default), read-time `#.`
+            // values like quri's etld hash tables, structs — makes the WHOLE
+            // file fall back to a source-only artifact: the caller emits a
+            // legacy TOPLEVEL_FORMS image whose loader re-reads the original
+            // text, so read-time evaluation and non-poolable literals are
+            // reconstructed at load (bliss-d0b). Slower to load, but correct;
+            // pool coverage can grow later.
+            let verbose = env
+                .lookup_var("*COMPILE-VERBOSE*")
+                .map(|v| !v.is_nil())
+                .unwrap_or(true);
+            if verbose {
+                println!(
+                    "; note: form {} is not externalizable — writing {} as a \
+                     source-only fasl",
+                    form_index + 1,
+                    src_path
+                );
+            }
+            return Ok(None);
         }
     }
 
@@ -6837,7 +6858,7 @@ pub fn build_bbu_from_forms(
     put_u16(&mut out, 0);
     put_u32(&mut out, handler_cases.len() as u32);
     out.extend_from_slice(&handler_cases);
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// Assemble a `BYTECODE_UNIT` payload from an already-populated pool, function
@@ -13140,9 +13161,25 @@ fn emit_native_x86(
         let bcp = bcp_idx as u32;
         match instr {
             Instr::Const(k) => {
-                let bits = bf.constants[*k as usize].0;
-                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
-                c.extend_from_slice(&bits.to_le_bytes());
+                let slot = &bf.constants[*k as usize] as *const BlissVal;
+                let val = bf.constants[*k as usize];
+                if bliss_rt::gc::is_heap_ref(val) {
+                    // A movable heap constant must NEVER be baked into the code
+                    // as an immediate: the moving minor GC rewrites the
+                    // registry-rooted constants Vec in place but cannot patch
+                    // machine code, so the immediate goes stale and native code
+                    // pushes a freed-nursery pointer (bliss-d0b: compiled
+                    // asdf/uiop typep clause lists read as (0 . 0)). Load
+                    // through the constants slot instead — its address is
+                    // stable for the life of the registry Rc that native code
+                    // is keyed to.
+                    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 slot
+                    c.extend_from_slice(&(slot as u64).to_le_bytes());
+                    c.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]
+                } else {
+                    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+                    c.extend_from_slice(&val.0.to_le_bytes());
+                }
                 push_rax(&mut c);
             }
             Instr::LoadLocal(i) => {
@@ -13504,9 +13541,12 @@ fn emit_native_x86(
                 emit_c2i_helper_call(&mut c);
             }
             Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {
-                let form = bf.constants.get(*index as usize)?.0;
-                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, form
-                c.extend_from_slice(&form.to_le_bytes());
+                // Like Const: the form is a movable heap cons — load it through
+                // the GC-rewritten constants slot, never as a baked immediate.
+                let slot = bf.constants.get(*index as usize)? as *const BlissVal;
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, imm64 slot
+                c.extend_from_slice(&(slot as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0x8B, 0x3F]); // mov rdi, [rdi]
                 c.extend_from_slice(&[0x48, 0xB8]);
                 let helper = if matches!(instr, Instr::EvalHost(_)) {
                     eval_host_addr
