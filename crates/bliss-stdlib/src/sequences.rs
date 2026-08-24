@@ -154,13 +154,27 @@ fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
 
 /// Build a proper list from a slice of BlissVals.
 fn build_list(vals: &[BlissVal]) -> BlissVal {
-    let mut list = NIL;
+    bliss_rt::rooted!(vals = vals.to_vec());
+    bliss_rt::rooted!(list = NIL);
     for &v in vals.iter().rev() {
-        let cell = Box::leak(Box::new(ConsCell { car: v, cdr: list }));
-        let ptr = cell as *mut ConsCell as *mut u8;
-        list = unsafe { BlissVal::from_cons_ptr(ptr) };
+        *list = alloc_cons(v, *list);
     }
-    list
+    *list
+}
+
+fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
+    bliss_rt::rooted!(car = car);
+    bliss_rt::rooted!(cdr = cdr);
+    let body = match bliss_rt::gc::alloc_typed(16, type_id::CONS) {
+        Some(b) => b,
+        None => std::alloc::handle_alloc_error(std::alloc::Layout::new::<ConsCell>()),
+    };
+    unsafe {
+        let cell = body as *mut ConsCell;
+        (*cell).car = *car;
+        (*cell).cdr = *cdr;
+        BlissVal::from_cons_ptr(body)
+    }
 }
 
 /// Build a simple-vector from a slice of BlissVals (public entry point).
