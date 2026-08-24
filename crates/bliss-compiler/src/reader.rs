@@ -2024,7 +2024,29 @@ fn skip_sharpsign_form(chars: &[char], mut pos: usize, depth: usize) -> Result<u
     let dispatch = chars[pos];
     match dispatch {
         '\'' | '+' | '-' | '.' => skip_form(chars, pos + 1, depth + 1),
-        '\\' | ':' | 'b' | 'B' | 'o' | 'O' | 'x' | 'X' => skip_atom(chars, pos + 1),
+        '\\' => {
+            // #\c — a character literal. The character after the backslash is
+            // consumed UNCONDITIONALLY, even when it is a macro or escape
+            // character (#\', #\`, #\(, #\), #\", #\;, #\\); a multi-char name
+            // (#\Space, #\Newline) then continues over trailing constituents.
+            // Routing this through skip_atom treated #\' as an empty token
+            // (leaving the quote to misparse what follows) and #\\ as an
+            // escape that swallowed the next character — either way a
+            // skipped #+feature form containing character CASE keys derailed
+            // into "unterminated list" (bliss-d0b: cl-ppcre api.lisp).
+            let mut p = pos + 1;
+            if p < chars.len() {
+                p += 1; // the character itself, whatever it is
+                while p < chars.len()
+                    && !chars[p].is_whitespace()
+                    && !matches!(chars[p], '(' | ')' | '"' | '\'' | '`' | ',' | ';')
+                {
+                    p += 1;
+                }
+            }
+            Ok(p)
+        }
+        ':' | 'b' | 'B' | 'o' | 'O' | 'x' | 'X' => skip_atom(chars, pos + 1),
         '(' => skip_list(chars, pos + 1, depth + 1),
         'C' | 'c' => skip_form(chars, pos + 1, depth + 1),
         '*' => skip_atom(chars, pos + 1),

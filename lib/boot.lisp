@@ -1785,6 +1785,11 @@
                                      (t part))
                                "/")))))))
 
+;; All bliss strings are simple (no fill pointers / displacement yet), so the
+;; SIMPLE- predicates coincide with their general counterparts (bliss-d0b:
+;; cl-cookie calls simple-string-p via ppcre).
+(defun simple-string-p (x) (stringp x))
+
 (defun enough-namestring (pathname &optional (defaults *default-pathname-defaults*))
   "A namestring just sufficient to identify PATHNAME relative to DEFAULTS:
 the namestring with DEFAULTS' directory prefix stripped when PATHNAME lies
