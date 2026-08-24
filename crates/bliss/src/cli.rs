@@ -2789,16 +2789,28 @@ fn calltrace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("BLISS_CALLTRACE").is_ok_and(|v| v == "1"))
 }
 
+/// Optional substring filter: `BLISS_CALLTRACE_MATCH=text` traces any error
+/// whose rendered message contains `text` (in addition to the defaults).
+fn calltrace_match() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static M: OnceLock<Option<String>> = OnceLock::new();
+    M.get_or_init(|| std::env::var("BLISS_CALLTRACE_MATCH").ok())
+        .as_deref()
+}
+
 fn calltrace_note(name: &str, e: &BlissError) {
     if !calltrace_enabled() {
         return;
     }
     // TYPE-ERRORs always; ETYPECASE misses surface as Internal/ProgramError
-    // with an identifying message (bliss-4bp successor debugging).
+    // with an identifying message (bliss-4bp successor debugging); any error
+    // matching BLISS_CALLTRACE_MATCH.
     let matches = match e {
         BlissError::TypeError { .. } => true,
-        BlissError::Internal(msg) | BlissError::ProgramError(msg) => msg.contains("ETYPECASE"),
-        _ => false,
+        BlissError::Internal(msg) | BlissError::ProgramError(msg) => {
+            msg.contains("ETYPECASE") || calltrace_match().is_some_and(|m| msg.contains(m))
+        }
+        _ => calltrace_match().is_some_and(|m| format!("{e:?}").contains(m)),
     };
     if matches {
         eprintln!("[calltrace] {name}");
@@ -11988,6 +12000,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             _ => {}
         }
 
+        // BLISS_DISPATCH_DEBUG=<bare-name>: report which eval_list branch
+        // claims a named call (function cell vs accessor vs generic) — the
+        // decisive question in name-resolution bugs (bliss-d0b).
+        if let Ok(dbg) = std::env::var("BLISS_DISPATCH_DEBUG")
+            && symbol_bare_name(&name) == dbg
+        {
+            let cb = callable_body(env, &name);
+            eprintln!(
+                "[dispatch] {name}: callable_body={} generics={} methods={} params={} body={}",
+                cb.is_some(),
+                env.generics.borrow().contains_key(&name),
+                env.methods.borrow().contains_key(&name),
+                cb.map(|(p, _)| fmt_form_debug(p)).unwrap_or_default(),
+                cb.map(|(_, b)| fmt_form_debug(b)).unwrap_or_default()
+            );
+        }
         // Check user-defined functions: lexical (FLET/LABELS/`(setf f)`) then the
         // global function cell (bliss-jtc.6.8).
         if let Some((params_form, body)) = callable_body(env, &name) {
@@ -12075,11 +12103,29 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             let inst = eval_form(inst_form, env)?;
             // A reader on a non-instance defers to an applicable explicit method
             // (e.g. ASDF's system-source-file on STRING/SYMBOL); read_slot_value
-            // itself yields NIL for a non-instance rather than crashing.
+            // itself yields NIL for a non-instance rather than crashing. The
+            // accessor above matched by full OR bare name, so resolve the
+            // methods-table key just as loosely: a package-qualified call must
+            // find designator methods registered under the defining package's
+            // spelling, or the defer check silently misses and the reader
+            // returns NIL (bliss-d0b: ASDF:SYSTEM-SOURCE-FILE on :quri).
             if !bliss_stdlib::is_instance(inst) {
                 let args = [inst];
-                if has_applicable_method(env, &name, &args) {
-                    return invoke_generic_function(&name, &args, env);
+                let method_key = {
+                    let methods = env.methods.borrow();
+                    if methods.contains_key(&name) {
+                        Some(name.clone())
+                    } else {
+                        methods
+                            .keys()
+                            .find(|k| symbol_bare_name(k) == bare_op)
+                            .cloned()
+                    }
+                };
+                if let Some(key) = method_key {
+                    if has_applicable_method(env, &key, &args) {
+                        return invoke_generic_function(&key, &args, env);
+                    }
                 }
             }
             return read_slot_value(inst, resolve_sym(&slot_name).unwrap_or(NIL), env);
@@ -15523,8 +15569,9 @@ fn bind_pattern_value(pattern: BlissVal, value: BlissVal, env: &mut Env) -> Resu
 
     if !pattern.is_cons() {
         return Err(BlissError::ProgramError(format!(
-            "invalid destructuring pattern: {}",
-            format_val(pattern)
+            "invalid destructuring pattern: {} (binding value {})",
+            format_val(pattern),
+            format_val(value)
         )));
     }
 
@@ -15595,8 +15642,9 @@ fn bind_macro_param(
     }
     if !pattern.is_cons() {
         return Err(BlissError::ProgramError(format!(
-            "invalid destructuring pattern: {}",
-            format_val(pattern)
+            "invalid destructuring pattern: {} (binding value {})",
+            format_val(pattern),
+            format_val(value)
         )));
     }
     // A sub-pattern that is a destructuring lambda list at *this* level goes to

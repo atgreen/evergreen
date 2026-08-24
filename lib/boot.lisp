@@ -128,6 +128,14 @@
 ;; declaim: declarations have no bearing on the tree-walking interpreter.
 (defmacro declaim (&rest ignore) nil)
 
+;; proclaim: the run-time counterpart (ANSI 3.8). Accepted and ignored like
+;; declaim — inline/optimize/ftype/type proclamations carry no weight here.
+;; KNOWN GAP (bliss-e2h): (proclaim '(special x)) is also ignored; specialness
+;; is currently an earmuff-name heuristic, not a proclamation registry.
+(defun proclaim (declaration-specifier)
+  (declare (ignore declaration-specifier))
+  nil)
+
 ;; Track bootstrap type aliases so TYPEP/CHECK-TYPE can consult them.
 (defvar *type-definitions* nil)
 
@@ -163,31 +171,15 @@
 (defvar *condition-types* nil)
 (defvar *condition-definitions* nil)
 
-(defun %define-condition-option-reader-defs (slot-name opts)
-  (if opts
-      (let ((key (car opts))
-            (value (car (cdr opts))))
-        (if (or (eq key :reader) (eq key :accessor))
-            (cons `(defun ,value (instance)
-                     (slot-value instance ',slot-name))
-                  (%define-condition-option-reader-defs slot-name (cdr (cdr opts))))
-            (%define-condition-option-reader-defs slot-name (cdr (cdr opts)))))
-      nil))
-
-(defun %define-condition-slot-reader-defs (slot)
-  (if (consp slot)
-      (%define-condition-option-reader-defs (car slot) (cdr slot))
-      nil))
-
-(defun %define-condition-reader-defs (slots)
-  (if slots
-      (append (%define-condition-slot-reader-defs (car slots))
-              (%define-condition-reader-defs (cdr slots)))
-      nil))
-
+;; NOTE: slot :reader/:accessor options are installed as real generic METHODS
+;; by the DEFCLASS expansion below (install_slot_accessor_method), exactly like
+;; any defclass. They were previously ALSO emitted here as plain DEFUNs, which
+;; clobbered the whole generic function: asdf's (define-condition bad-system-name
+;; … (source-file :reader system-source-file)) overwrote ASDF:SYSTEM-SOURCE-FILE's
+;; designator methods, so (system-source-file :quri) returned NIL and
+;; system-relative-pathname yielded relative paths (bliss-d0b, quri).
 (defmacro define-condition (name parents slots &rest options)
-  (let ((effective-parents (if parents parents '(condition)))
-        (reader-defs (%define-condition-reader-defs slots)))
+  (let ((effective-parents (if parents parents '(condition))))
     `(progn
        (setq *condition-types*
              (cons (list ',name ',effective-parents)
@@ -196,7 +188,6 @@
              (cons (list ',name ',effective-parents ',slots ',options)
                    *condition-definitions*))
        (defclass ,name ,effective-parents ,slots)
-       ,@reader-defs
        ',name)))
 
 (defmacro check-type (place typespec &rest ignore)
