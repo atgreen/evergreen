@@ -2305,12 +2305,22 @@ fn apply_class_initforms(
     eligible_slots: Option<&[String]>,
     explicit_slots: &[String],
 ) -> Result<(), BlissError> {
+    // Every initform evaluation below can fire a relocating minor GC. Root the
+    // instance (a moving heap object) and the initform FORMS (heap conses held
+    // in the plain `effective` Vec) for the whole loop, or a mid-loop GC leaves
+    // them stale and slot writes corrupt freed memory (bliss-4bp).
+    bliss_rt::rooted!(instance = instance);
     // Walk the full class precedence list so inherited slot initforms are
     // applied, not just those declared on the instance's own class. A
     // `:allocation :class` slot's value lives in its OWNING class's shared cell
     // (bliss-x4p), resolved per slot via `class_slot_cell`.
     let effective = effective_slots_for_class(env, class_name);
-    for slot in &effective {
+    let mut initforms: Vec<BlissVal> = effective
+        .iter()
+        .map(|s| s.initform.unwrap_or(NIL))
+        .collect();
+    bliss_rt::rooted_ref!(_initforms_root = &mut initforms);
+    for (slot_index, slot) in effective.iter().enumerate() {
         if explicit_slots.iter().any(|name| name == &slot.name) {
             continue;
         }
@@ -2332,12 +2342,15 @@ fn apply_class_initforms(
                 .as_ref()
                 .map(|values| matches!(values.lock().unwrap().get(&bare), Some(Some(_))))
                 .unwrap_or(false),
-            SlotAllocation::Instance => bliss_stdlib::slot_boundp(instance, slot_sym)?,
+            SlotAllocation::Instance => bliss_stdlib::slot_boundp(*instance, slot_sym)?,
         };
         if already_bound {
             continue;
         }
-        let value = eval_form(initform, env)?;
+        // Read the (GC-current) rooted copy of the initform, not the plain
+        // Vec-resident one captured before earlier iterations allocated.
+        let _ = initform;
+        let value = eval_form(initforms[slot_index], env)?;
         match slot.allocation {
             SlotAllocation::Class => {
                 if let Some(values) = class_cell.as_ref() {
@@ -2346,7 +2359,7 @@ fn apply_class_initforms(
                 }
             }
             SlotAllocation::Instance => {
-                bliss_stdlib::set_slot_value(instance, slot_sym, value)?;
+                bliss_stdlib::set_slot_value(*instance, slot_sym, value)?;
             }
         }
     }
@@ -2358,15 +2371,20 @@ fn evaluated_initargs(
     init_args: BlissVal,
     env: &mut Env,
 ) -> Result<Vec<BlissVal>, BlissError> {
-    let args_vec = list_to_vec(init_args);
-    // Root the accumulated key/value pairs across the loop (bliss-6b2 #2): each
-    // later eval_form allocates and can relocate the earlier, Vec-resident values.
+    let mut args_vec = list_to_vec(init_args);
+    // Root the source FORMS and the accumulated key/value pairs across the
+    // loop (bliss-6b2 #2 / bliss-4bp): each eval_form allocates and can
+    // relocate the earlier Vec-resident forms and values.
+    bliss_rt::rooted_ref!(_args_vec_root = &mut args_vec);
     bliss_rt::rooted!(initargs = Vec::<BlissVal>::new());
     let mut i = 0;
     while i + 1 < args_vec.len() {
-        let key = eval_form(args_vec[i], env)?;
+        bliss_rt::rooted!(key = eval_form(args_vec[i], env)?);
+        // Resolve the slot key before the value eval so neither the key nor
+        // the resolved symbol is held bare across an allocating call.
+        bliss_rt::rooted!(resolved = resolve_slot_symbol(class_name, *key, env)?);
         let value = eval_form(args_vec[i + 1], env)?;
-        initargs.push(resolve_slot_symbol(class_name, key, env)?);
+        initargs.push(*resolved);
         initargs.push(value);
         i += 2;
     }
@@ -8505,10 +8523,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             }
                             "SLOT-VALUE" => {
                                 // (setf (slot-value instance slot-name) val)
-                                let instance = eval_form(tgt_form, env)?;
+                                // Root the instance across the slot-name eval:
+                                // instances are moving heap objects (bliss-4bp).
+                                bliss_rt::rooted!(instance = eval_form(tgt_form, env)?);
                                 let (slot_form, _) = cp(cp(*aargs).1);
                                 let slot = eval_form(slot_form, env)?;
-                                write_slot_value(instance, slot, *val, env)?;
+                                write_slot_value(*instance, slot, *val, env)?;
                             }
                             "SYMBOL-VALUE" => {
                                 // (setf (symbol-value sym) val) — assign the
@@ -8546,9 +8566,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 // (setf (char string index) val) and friends —
                                 // mutate a string or vector element in place.
                                 // BIT/SBIT index a bit array exactly like AREF.
-                                let seq = eval_form(tgt_form, env)?;
+                                // Root the sequence across the index eval — it
+                                // is a moving heap object (bliss-4bp).
+                                bliss_rt::rooted!(seq_r = eval_form(tgt_form, env)?);
                                 let (idx_form, _) = cp(cp(*aargs).1);
                                 let idx = eval_form(idx_form, env)?;
+                                let seq = *seq_r;
                                 if !idx.is_fixnum() || idx.as_fixnum() < 0 {
                                     return Err(BlissError::TypeError {
                                         datum: idx,
@@ -9441,22 +9464,29 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "CONCATENATE" => {
                 // Delegate to stdlib so CLI sequence behavior matches the
                 // same implementation used by lower-level stage-3 tests.
+                // Root the arg spine and the result type across the argument
+                // evaluations (moving GC; bliss-4bp).
                 let (type_form, rest) = cp(cdr);
-                let result_type = eval_form(type_form, env)?;
-                let sequences = eval_args(rest, env)?;
-                return bliss_stdlib::concatenate(result_type, &sequences);
+                bliss_rt::rooted!(rest = rest);
+                bliss_rt::rooted!(result_type = eval_form(type_form, env)?);
+                let sequences = eval_args(*rest, env)?;
+                return bliss_stdlib::concatenate(*result_type, &sequences);
             }
             "SUBSEQ" => {
+                // Root the sequence and pending arg forms across the index
+                // evaluations (moving GC; bliss-4bp).
                 let (seq_form, rest) = cp(cdr);
                 let (start_form, rest2) = cp(rest);
-                let seq = eval_form(seq_form, env)?;
-                let start = num_val(eval_form(start_form, env)?)? as usize;
+                bliss_rt::rooted!(start_form = start_form);
+                bliss_rt::rooted!(rest2 = rest2);
+                bliss_rt::rooted!(seq = eval_form(seq_form, env)?);
+                let start = num_val(eval_form(*start_form, env)?)? as usize;
                 let end = if rest2.is_cons() {
-                    Some(num_val(eval_form(cp(rest2).0, env)?)? as usize)
+                    Some(num_val(eval_form(cp(*rest2).0, env)?)? as usize)
                 } else {
                     None
                 };
-                return bliss_stdlib::subseq(seq, start, end);
+                return bliss_stdlib::subseq(*seq, start, end);
             }
             "SOME" | "EVERY" | "NOTANY" | "NOTEVERY" => {
                 let args = eval_args(cdr, env)?;
@@ -9493,19 +9523,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "COERCE" => {
+                // Root the value and pending type form across the second eval
+                // (moving GC; bliss-4bp).
                 let (val_form, rest) = cp(cdr);
                 let (type_form, _) = cp(rest);
-                let value = eval_form(val_form, env)?;
-                let type_val = eval_form(type_form, env)?;
-                return coerce_value(value, type_val);
+                bliss_rt::rooted!(type_form = type_form);
+                bliss_rt::rooted!(value = eval_form(val_form, env)?);
+                let type_val = eval_form(*type_form, env)?;
+                return coerce_value(*value, type_val);
             }
             "SORT" => {
+                // Root the sequence, predicate, and pending arg forms across
+                // the later argument evaluations (moving GC; bliss-4bp).
                 let (seq_form, rest) = cp(cdr);
                 let (pred_form, rest2) = cp(rest);
-                let seq = eval_form(seq_form, env)?;
-                let predicate = eval_form(pred_form, env)?;
+                bliss_rt::rooted!(pred_form = pred_form);
+                bliss_rt::rooted!(rest2 = rest2);
+                bliss_rt::rooted!(seq = eval_form(seq_form, env)?);
+                bliss_rt::rooted!(predicate = eval_form(*pred_form, env)?);
                 let key = if rest2.is_cons() {
-                    let (kw_form, rest3) = cp(rest2);
+                    let (kw_form, rest3) = cp(*rest2);
                     if kw_form.is_symbol()
                         && symbol_bare_name(&sym_name(kw_form)).eq_ignore_ascii_case("KEY")
                         && rest3.is_cons()
@@ -9517,15 +9554,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     None
                 };
-                return sort_sequence(seq, predicate, key, env);
+                return sort_sequence(*seq, *predicate, key, env);
             }
             "STABLE-SORT" => {
+                // Root the sequence, predicate, and pending arg forms across
+                // the later argument evaluations (moving GC; bliss-4bp).
                 let (seq_form, rest) = cp(cdr);
                 let (pred_form, rest2) = cp(rest);
-                let seq = eval_form(seq_form, env)?;
-                let predicate = eval_form(pred_form, env)?;
+                bliss_rt::rooted!(pred_form = pred_form);
+                bliss_rt::rooted!(rest2 = rest2);
+                bliss_rt::rooted!(seq = eval_form(seq_form, env)?);
+                bliss_rt::rooted!(predicate = eval_form(*pred_form, env)?);
                 let key = if rest2.is_cons() {
-                    let (kw_form, rest3) = cp(rest2);
+                    let (kw_form, rest3) = cp(*rest2);
                     if kw_form.is_symbol()
                         && symbol_bare_name(&sym_name(kw_form)).eq_ignore_ascii_case("KEY")
                         && rest3.is_cons()
@@ -9537,7 +9578,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     None
                 };
-                return sort_sequence(seq, predicate, key, env);
+                return sort_sequence(*seq, *predicate, key, env);
             }
             "PATHNAMEP" => {
                 let (thing_form, _) = cp(cdr);
@@ -9619,10 +9660,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "PARSE-NAMESTRING" => {
                 let (thing_form, rest) = cp(cdr);
+                // Keep the pending arg spine rooted across the thing eval
+                // (moving GC; bliss-4bp).
+                bliss_rt::rooted!(rest = rest);
                 let mut thing = eval_form(thing_form, env)?;
                 bliss_rt::rooted_ref!(_thing_root = &mut thing);
                 let mut host = if rest.is_cons() {
-                    Some(eval_form(cp(rest).0, env)?)
+                    Some(eval_form(cp(*rest).0, env)?)
                 } else {
                     None
                 };
@@ -9654,9 +9698,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // new-truename). We surface the primary (new) pathname.
                 let (from_form, rest) = cp(cdr);
                 let (to_form, _) = cp(rest);
-                let from = eval_form(from_form, env)?;
-                let to = eval_form(to_form, env)?;
-                let (defaulted, old_true, new_true) = bliss_stdlib::rename_file(from, to)?;
+                // Root across the second eval (moving GC; bliss-4bp).
+                bliss_rt::rooted!(to_form = to_form);
+                bliss_rt::rooted!(from = eval_form(from_form, env)?);
+                let to = eval_form(*to_form, env)?;
+                let (defaulted, old_true, new_true) = bliss_stdlib::rename_file(*from, to)?;
                 env.set_mv(vec![defaulted, old_true, new_true]);
                 return Ok(defaulted);
             }
@@ -9900,13 +9946,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "TRANSLATE-PATHNAME" => {
                 // (translate-pathname source from-wildcard to-wildcard)
+                // Root values and pending forms across the later evaluations
+                // (moving GC; bliss-4bp).
                 let (src_form, rest) = cp(cdr);
                 let (from_form, rest2) = cp(rest);
                 let (to_form, _) = cp(rest2);
-                let src = eval_form(src_form, env)?;
-                let from = eval_form(from_form, env)?;
-                let to = eval_form(to_form, env)?;
-                return bliss_stdlib::translate_pathname(src, from, to);
+                bliss_rt::rooted!(from_form = from_form);
+                bliss_rt::rooted!(to_form = to_form);
+                bliss_rt::rooted!(src = eval_form(src_form, env)?);
+                bliss_rt::rooted!(from = eval_form(*from_form, env)?);
+                let to = eval_form(*to_form, env)?;
+                return bliss_stdlib::translate_pathname(*src, *from, to);
             }
             "ENSURE-DIRECTORIES-EXIST" => {
                 // (ensure-directories-exist pathspec &key verbose) → pathspec plus
@@ -10168,10 +10218,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // of the same type as LIMIT. The optional random-state arg is
                 // evaluated (for effect) but the shared generator is used.
                 let (limit_form, rest) = cp(cdr);
-                let limit = eval_form(limit_form, env)?;
+                // Root the pending spine and limit across the optional
+                // random-state eval (moving GC; bliss-4bp).
+                bliss_rt::rooted!(rest = rest);
+                bliss_rt::rooted!(limit_r = eval_form(limit_form, env)?);
                 if rest.is_cons() {
-                    eval_form(cp(rest).0, env)?;
+                    eval_form(cp(*rest).0, env)?;
                 }
+                let limit = *limit_r;
                 if limit.is_fixnum() {
                     let bound = limit.as_fixnum();
                     if bound <= 0 {
@@ -10378,14 +10432,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (find-class name &optional (errorp t) environment) — return the
                 // class metaobject, or (when errorp is NIL) NIL if none is found.
                 let (name_form, rest) = cp(cdr);
-                let name = eval_form(name_form, env)?;
+                // Root the pending spine and name across the errorp eval
+                // (moving GC; bliss-4bp).
+                bliss_rt::rooted!(rest = rest);
+                bliss_rt::rooted!(name_r = eval_form(name_form, env)?);
                 // errorp defaults to T when the argument is omitted.
                 let errorp = if rest.is_cons() {
-                    let (errorp_form, _) = cp(rest);
+                    let (errorp_form, _) = cp(*rest);
                     eval_form(errorp_form, env)? != NIL
                 } else {
                     true
                 };
+                let name = *name_r;
                 if let Some(class) = bliss_stdlib::find_class(name) {
                     return Ok(class);
                 }
@@ -10415,10 +10473,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (subtypep type1 type2) → two values: subtype-p and certain-p.
                 let (t1_form, rest) = cp(cdr);
                 let (t2_form, _) = cp(rest);
-                let t1 = eval_form(t1_form, env)?;
-                let t2 = eval_form(t2_form, env)?;
-                let t1 = resolve_type_spec(env, t1);
-                let t2 = resolve_type_spec(env, t2);
+                // Root across later evals/resolutions: type specs are often
+                // heap conses like (OR NULL PATHNAME) (moving GC; bliss-4bp).
+                bliss_rt::rooted!(t2_form = t2_form);
+                bliss_rt::rooted!(t1_r = eval_form(t1_form, env)?);
+                bliss_rt::rooted!(t2_r = eval_form(*t2_form, env)?);
+                bliss_rt::rooted!(t1_res = resolve_type_spec(env, *t1_r));
+                let t2 = resolve_type_spec(env, *t2_r);
+                let t1 = *t1_res;
                 let (subtype_p, certain_p) = subtypep_relation(t1, t2);
                 let subp = if subtype_p { T } else { NIL };
                 let certainp = if certain_p { T } else { NIL };
@@ -10435,10 +10497,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "SLOT-MAKUNBOUND" => {
                 let (instance_form, rest) = cp(cdr);
                 let (slot_form, _) = cp(rest);
-                let instance = eval_form(instance_form, env)?;
-                let slot = eval_form(slot_form, env)?;
-                bliss_stdlib::slot_makunbound(instance, slot)?;
-                return Ok(instance);
+                // Root the instance across the slot-name eval (moving GC;
+                // bliss-4bp).
+                bliss_rt::rooted!(slot_form = slot_form);
+                bliss_rt::rooted!(instance = eval_form(instance_form, env)?);
+                let slot = eval_form(*slot_form, env)?;
+                bliss_stdlib::slot_makunbound(*instance, slot)?;
+                return Ok(*instance);
             }
             "SLOT-EXISTS-P" => {
                 let (instance_form, rest) = cp(cdr);
@@ -10492,11 +10557,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "CHANGE-CLASS" => {
                 let (instance_form, rest) = cp(cdr);
                 let (class_form, _) = cp(rest);
-                let instance = eval_form(instance_form, env)?;
+                // Root the instance across the class-form eval (moving GC;
+                // bliss-4bp).
+                bliss_rt::rooted!(class_form = class_form);
+                bliss_rt::rooted!(instance_r = eval_form(instance_form, env)?);
                 let old_class_name =
-                    class_name_for_instance_class(bliss_stdlib::class_of(instance));
-                let class_input = eval_form(class_form, env)?;
+                    class_name_for_instance_class(bliss_stdlib::class_of(*instance_r));
+                let class_input = eval_form(*class_form, env)?;
                 let class = resolve_class_metaobject(env, class_input)?;
+                let instance = *instance_r;
                 bliss_stdlib::change_class(instance, class)?;
                 let new_class_name = class_name_for_instance_class(class);
                 // Newly-added slots are those in the new class's *effective*
@@ -13335,21 +13404,24 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                     list_form,
                     step,
                 } => {
-                    let list = eval_form(*list_form, env)?;
+                    // Root the list, step function, walk cursor, and collected
+                    // items across the allocating step-fn calls (moving GC;
+                    // bliss-4bp): `for x in plist by #'cddr` is common in uiop.
+                    bliss_rt::rooted!(list = eval_form(*list_form, env)?);
                     let items = match step {
                         // `for x in list by fn`: x takes the car of each stepped
                         // tail (list, (fn list), (fn (fn list)), …).
                         Some(step_form) => {
-                            let step_fn = eval_form(*step_form, env)?;
-                            let mut items = Vec::new();
-                            let mut tail = list;
+                            bliss_rt::rooted!(step_fn = eval_form(*step_form, env)?);
+                            bliss_rt::rooted!(items = Vec::<BlissVal>::new());
+                            bliss_rt::rooted!(tail = *list);
                             while tail.is_cons() {
-                                items.push(cp(tail).0);
-                                tail = apply_function(step_fn, &[tail], env)?;
+                                items.push(cp(*tail).0);
+                                *tail = apply_function(*step_fn, &[*tail], env)?;
                             }
-                            items
+                            std::mem::take(&mut *items)
                         }
-                        None => list_to_vec(list),
+                        None => list_to_vec(*list),
                     };
                     states.push(ForState::In {
                         pat: *pat,
@@ -13363,11 +13435,14 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                     list_form,
                     step,
                 } => {
-                    let list = eval_form(*list_form, env)?;
+                    // Root the list across the step-form eval (moving GC;
+                    // bliss-4bp).
+                    bliss_rt::rooted!(list_r = eval_form(*list_form, env)?);
                     let step = match step {
                         Some(step_form) => Some(eval_form(*step_form, env)?),
                         None => None,
                     };
+                    let list = *list_r;
                     states.push(ForState::On {
                         pat: *pat,
                         tail: list,
@@ -13387,7 +13462,9 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                     limit,
                     descending,
                 } => {
-                    let current = eval_form(*start, env)?;
+                    // Root across the step eval: a bignum/float start is a
+                    // moving heap object (moving GC; bliss-4bp).
+                    bliss_rt::rooted!(current_r = eval_form(*start, env)?);
                     // `:downfrom`, or a DOWNTO/ABOVE limit, counts down by default.
                     let down = *descending
                         || matches!(
@@ -13404,6 +13481,7 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                         }
                         None => BlissVal::from_fixnum(if down { -1 } else { 1 }),
                     };
+                    let current = *current_r;
                     let limit = match limit {
                         Some((kind, expr)) => {
                             // Under `:downfrom`, a plain ascending limit is read as
