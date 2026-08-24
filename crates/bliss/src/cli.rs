@@ -4478,7 +4478,12 @@ fn eval_quasiquote_depth(
             return eval_form(expr, env);
         }
         let inner = eval_quasiquote_depth(expr, env, depth - 1)?;
-        return Ok(arena_cons(car, arena_cons(inner, NIL)));
+        // Build the tail FIRST: in `arena_cons(car, arena_cons(..))` Rust
+        // copies `car` before the inner allocation runs, and that copy goes
+        // stale if the inner alloc fires a minor GC (bliss-4bp class). `car`
+        // is rooted in place, so reading it after the alloc is current.
+        let tail = arena_cons(inner, NIL);
+        return Ok(arena_cons(car, tail));
     }
     // A bare ,@ template is an error at the outermost level; deeper, keep it.
     if head == "BLISS::UNQUOTE-SPLICING" {
@@ -4487,13 +4492,15 @@ fn eval_quasiquote_depth(
         }
         let (expr, _) = cp(cdr);
         let inner = eval_quasiquote_depth(expr, env, depth - 1)?;
-        return Ok(arena_cons(car, arena_cons(inner, NIL)));
+        let tail = arena_cons(inner, NIL);
+        return Ok(arena_cons(car, tail));
     }
     // A nested `` ` ``: preserve the wrapper, process its body one level deeper.
     if head == "BLISS::QUASIQUOTE" {
         let (inner_tmpl, _) = cp(cdr);
         let inner = eval_quasiquote_depth(inner_tmpl, env, depth + 1)?;
-        return Ok(arena_cons(car, arena_cons(inner, NIL)));
+        let tail = arena_cons(inner, NIL);
+        return Ok(arena_cons(car, tail));
     }
 
     // Process each element, honoring ,@ splicing only at depth 1.
