@@ -8408,6 +8408,300 @@ fn execute_bbu_ensure_package(
     Ok(package)
 }
 
+/// Operand-stack dataflow verification for a decoded portable function
+/// (bliss-jtc.23.4). The T0 interpreter's `pop_op` decrements `sp_top` with no
+/// guard and `push_op` writes `frame[n_locals + sp_top]`, so crafted
+/// (checksum-valid) bytecode that underflows the operand stack or exceeds the
+/// declared `max_stack` reads/writes out of the frame's slot area. Abstract-
+/// interpret every reachable pc with a single (height, cleanup-region) state:
+///
+/// - height mirrors the interpreter's per-opcode stack effect exactly (MV ops,
+///   handler establishment, calls);
+/// - every runtime entry to a pc arrives at the verified height: branches and
+///   fall-through are walked, and every non-local resume point *resets*
+///   `sp_top` to its `sp_restore` (then pushes at most one value), so resume
+///   targets are seeded with exactly that height;
+/// - `CleanupReturn` resumes at `EnterCleanupNormal.resume_bcp` *without* a
+///   reset (it pushes the saved value at the current height), so cleanup
+///   bodies carry a region tag (the entry pc): the tag statically pairs each
+///   `CleanupReturn` with the `EnterCleanupNormal`/`PushUnwind` entries of its
+///   region, and join states must agree on it. A `CleanupReturn` outside any
+///   region would panic at runtime (empty `cleanup_conts`) and is rejected.
+///
+/// Heights at join points must be equal (the interpreter has one concrete
+/// height per pc entry); a mismatch means some path under- or over-supplies
+/// operands and is rejected before any load action mutates runtime state.
+fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), BlissError> {
+    let code = &func.code;
+    let n = code.len();
+    let fail = |pc: usize, msg: &str| -> BlissError {
+        bbu_error(format!(
+            "stack verification failed in {} at bcp {pc}: {msg}",
+            func.name
+        ))
+    };
+    if n == 0 {
+        return Err(bbu_error(format!(
+            "stack verification failed in {}: function has no instructions",
+            func.name
+        )));
+    }
+    let max_stack = func.max_stack as u32;
+    type Region = Option<u32>;
+    // Per-pc verified state; every runtime entry must arrive at exactly this.
+    let mut states: Vec<Option<(u32, Region)>> = vec![None; n];
+    let mut work: Vec<(u32, u32, Region)> = vec![(0, 0, None)];
+    // Deferred pairing (either side may be reached first by the walk):
+    // cleanup region entry pc -> the (resume_bcp, outer region) of each
+    // EnterCleanupNormal targeting it, and the heights of each CleanupReturn
+    // observed inside it.
+    let mut cleanup_resumes: HashMap<u32, Vec<(u32, Region)>> = HashMap::new();
+    let mut cleanup_exit_heights: HashMap<u32, Vec<u32>> = HashMap::new();
+    // tagbody id -> (sp_restore, region) of each PushTag; and the pending Go
+    // targets seen before their PushTag.
+    let mut tag_entries: HashMap<u32, Vec<(u32, Region)>> = HashMap::new();
+    let mut pending_gos: HashMap<u32, Vec<u32>> = HashMap::new();
+
+    while let Some((pc, height, region)) = work.pop() {
+        let pcu = pc as usize;
+        if pcu >= n {
+            // Also catches fall-through/branch/resume targets at code.len():
+            // the interpreter's next fetch would index `code` out of bounds.
+            return Err(bbu_error(format!(
+                "stack verification failed in {}: control transfer to {pc} flows off the end",
+                func.name
+            )));
+        }
+        match states[pcu] {
+            Some((h0, r0)) => {
+                if h0 != height {
+                    return Err(fail(
+                        pcu,
+                        &format!("inconsistent stack height at join ({h0} vs {height})"),
+                    ));
+                }
+                if r0 != region {
+                    return Err(fail(pcu, "inconsistent cleanup region at join"));
+                }
+                continue;
+            }
+            None => states[pcu] = Some((height, region)),
+        }
+
+        // (pops, pushes) per the T0 interpreter; `None` = handled specially.
+        let effect: Option<(u32, u32)> = match &code[pcu] {
+            Instr::Const(_)
+            | Instr::LoadLocal(_)
+            | Instr::LoadGlobal(_)
+            | Instr::LoadFunction(_)
+            | Instr::EvalHost(_)
+            | Instr::LoadEnvVar(_)
+            | Instr::MakeClosureEnv(_)
+            | Instr::MakeClosure { .. } => Some((0, 1)),
+            Instr::StoreLocal(_)
+            | Instr::StoreGlobal(_)
+            | Instr::BindSpecial(_)
+            | Instr::TakeValuesToLocals { .. }
+            | Instr::StoreEnvVar(_)
+            | Instr::DefineEnvVar(_)
+            | Instr::Pop => Some((1, 0)),
+            Instr::UnbindSpecial(_)
+            | Instr::ClearMv
+            | Instr::PushEnvChild
+            | Instr::PopEnvChild
+            | Instr::PopHandler
+            | Instr::PopHandlerCase
+            | Instr::PopHandlerBind
+            | Instr::PopRestartCase => Some((0, 0)),
+            Instr::ValuesToList => Some((1, 1)),
+            Instr::SetValues(nvals) => Some((*nvals as u32, 1)),
+            Instr::AllocCons => Some((2, 1)),
+            Instr::Dup => Some((1, 2)),
+            Instr::CallNamed { nargs, .. } => Some((*nargs as u32, 1)),
+            Instr::PushHandlerBind { hb } => {
+                if *hb as usize >= func.handler_binds.len() {
+                    return Err(fail(pcu, "handler-bind index out of range"));
+                }
+                Some((0, 0))
+            }
+            _ => None,
+        };
+        if let Some((pops, pushes)) = effect {
+            if height < pops {
+                return Err(fail(pcu, "operand stack underflow"));
+            }
+            let after = height - pops + pushes;
+            if after > max_stack {
+                return Err(fail(
+                    pcu,
+                    &format!("operand stack exceeds declared max_stack {max_stack}"),
+                ));
+            }
+            work.push((pc + 1, after, region));
+            continue;
+        }
+
+        match code[pcu] {
+            Instr::Br(target) => work.push((target, height, region)),
+            Instr::BrIfFalse(target) | Instr::BrIfTrue(target) => {
+                if height < 1 {
+                    return Err(fail(pcu, "operand stack underflow"));
+                }
+                work.push((target, height - 1, region));
+                work.push((pc + 1, height - 1, region));
+            }
+            // Terminators: no fall-through. Their non-local continuations are
+            // the resume points seeded by the establishing Push* instructions.
+            Instr::Return | Instr::ReturnFrom { .. } | Instr::ReturnFromNamed { .. } => {
+                if height < 1 {
+                    return Err(fail(pcu, "operand stack underflow"));
+                }
+            }
+            Instr::Throw => {
+                if height < 2 {
+                    return Err(fail(pcu, "operand stack underflow"));
+                }
+            }
+            Instr::Go {
+                tagbody_id,
+                target_bcp,
+            } => {
+                // An in-function Go resumes at the tag with the establishing
+                // PushTag's sp_restore. A Go with no in-function PushTag is a
+                // non-local transfer out of a closure: nothing to seed here.
+                for &(sp, tag_region) in tag_entries.get(&tagbody_id).into_iter().flatten() {
+                    work.push((target_bcp, sp, tag_region));
+                }
+                pending_gos.entry(tagbody_id).or_default().push(target_bcp);
+            }
+            Instr::PushCatch {
+                resume_bcp,
+                sp_restore,
+            } => {
+                if height < 1 {
+                    return Err(fail(pcu, "operand stack underflow"));
+                }
+                let after = height - 1;
+                let sp = sp_restore as u32;
+                if sp > after {
+                    return Err(fail(pcu, "sp_restore above current stack height"));
+                }
+                if sp + 1 > max_stack {
+                    return Err(fail(pcu, "resume push exceeds declared max_stack"));
+                }
+                work.push((resume_bcp, sp + 1, region));
+                work.push((pc + 1, after, region));
+            }
+            Instr::PushBlock {
+                resume_bcp,
+                sp_restore,
+                ..
+            }
+            | Instr::PushRestartCase {
+                resume_bcp,
+                sp_restore,
+                ..
+            } => {
+                let sp = sp_restore as u32;
+                if sp > height {
+                    return Err(fail(pcu, "sp_restore above current stack height"));
+                }
+                if sp + 1 > max_stack {
+                    return Err(fail(pcu, "resume push exceeds declared max_stack"));
+                }
+                work.push((resume_bcp, sp + 1, region));
+                work.push((pc + 1, height, region));
+            }
+            Instr::PushTag {
+                tagbody_id,
+                sp_restore,
+            } => {
+                let sp = sp_restore as u32;
+                if sp > height {
+                    return Err(fail(pcu, "sp_restore above current stack height"));
+                }
+                for &target in pending_gos.get(&tagbody_id).into_iter().flatten() {
+                    work.push((target, sp, region));
+                }
+                tag_entries.entry(tagbody_id).or_default().push((sp, region));
+                work.push((pc + 1, height, region));
+            }
+            Instr::PushUnwind {
+                cleanup_bcp,
+                sp_restore,
+            } => {
+                let sp = sp_restore as u32;
+                if sp > height {
+                    return Err(fail(pcu, "sp_restore above current stack height"));
+                }
+                // The unwind path enters the cleanup at exactly sp_restore.
+                work.push((cleanup_bcp, sp, Some(cleanup_bcp)));
+                work.push((pc + 1, height, region));
+            }
+            Instr::PushHandlerCase { hc, sp_restore } => {
+                let sp = sp_restore as u32;
+                if sp > height {
+                    return Err(fail(pcu, "sp_restore above current stack height"));
+                }
+                let info = func
+                    .handler_cases
+                    .get(hc as usize)
+                    .ok_or_else(|| fail(pcu, "handler-case index out of range"))?;
+                for clause in &info.clauses {
+                    if let Some(slot) = clause.var_slot {
+                        if slot >= func.n_locals {
+                            return Err(fail(pcu, "handler-case var slot out of bounds"));
+                        }
+                    }
+                    // A matching condition resets to sp_restore and enters the
+                    // clause body (the condition goes to a local, not the stack).
+                    work.push((clause.body_bcp, sp, region));
+                }
+                work.push((pc + 1, height, region));
+            }
+            Instr::EnterCleanupNormal {
+                cleanup_bcp,
+                resume_bcp,
+            } => {
+                if height < 1 {
+                    return Err(fail(pcu, "operand stack underflow"));
+                }
+                let after = height - 1;
+                work.push((cleanup_bcp, after, Some(cleanup_bcp)));
+                // CleanupReturn pushes the saved value at the height the
+                // cleanup body ends at — pair through the region tag.
+                for &exit_height in cleanup_exit_heights.get(&cleanup_bcp).into_iter().flatten() {
+                    work.push((resume_bcp, exit_height + 1, region));
+                }
+                cleanup_resumes
+                    .entry(cleanup_bcp)
+                    .or_default()
+                    .push((resume_bcp, region));
+            }
+            Instr::CleanupReturn => {
+                let Some(region_entry) = region else {
+                    // Runtime would panic: empty cleanup_conts.
+                    return Err(fail(pcu, "CleanupReturn outside a cleanup region"));
+                };
+                if height + 1 > max_stack {
+                    return Err(fail(pcu, "resume push exceeds declared max_stack"));
+                }
+                for &(resume_bcp, outer) in
+                    cleanup_resumes.get(&region_entry).into_iter().flatten()
+                {
+                    work.push((resume_bcp, height + 1, outer));
+                }
+                cleanup_exit_heights
+                    .entry(region_entry)
+                    .or_default()
+                    .push(height);
+            }
+            _ => unreachable!("instruction with a simple stack effect handled above"),
+        }
+    }
+    Ok(())
+}
+
 /// Verify, decode, and execute an authoritative portable BBU. No source reader
 /// or macroexpander participates in this path.
 pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
@@ -8802,6 +9096,9 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 _ => {}
             }
         }
+        // Complete control-flow stack verification (bliss-jtc.23.4): reject
+        // the whole unit before any load action mutates runtime state.
+        verify_operand_stack_discipline(&function)?;
         decoded_functions.push(function);
     }
     let functions = decoded_functions

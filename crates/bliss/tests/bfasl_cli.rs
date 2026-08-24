@@ -1309,6 +1309,71 @@ fn corrupt_restart_case_index_is_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Craft a unit whose sole `CallNamed` has its `nargs` operand rewritten, then
+/// reseal the checksum. `patched_nargs` beyond the available operands must be
+/// rejected as an underflow (the interpreter's unguarded `pop_op` would read
+/// below the operand stack); `patched_nargs` of 0 leaves an extra operand that
+/// pushes the result past the declared `max_stack` (an out-of-frame write).
+/// Both must be clean load-time rejections, before any action runs
+/// (bliss-jtc.23.4).
+fn assert_corrupt_callnamed_nargs_rejected(tag: &str, patched_nargs: u16, expected: &str) {
+    let dir = workdir(tag);
+    let src = dir.join("v.lisp");
+    let out = dir.join("v.bfasl");
+    // `voof` is undefined at compile time, so the call stays a CallNamed.
+    fs::write(&src, "(defun vg (a b) (voof a b))\n").unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(c.status.success(), "compile-file failed");
+    let mut bytes = fs::read(&out).unwrap();
+
+    // CallNamed encodes as opcode 0x0d + u32 callee sym + u16 nargs (= 2 here).
+    let positions: Vec<usize> = (0..bytes.len().saturating_sub(7))
+        .filter(|&i| bytes[i] == 0x0d && bytes[i + 5] == 0x02 && bytes[i + 6] == 0x00)
+        .collect();
+    assert_eq!(
+        positions.len(),
+        1,
+        "expected exactly one CALL_NAMED encoding to corrupt"
+    );
+    bytes[positions[0] + 5..positions[0] + 7].copy_from_slice(&patched_nargs.to_le_bytes());
+    reseal_bfasl_checksum(&mut bytes);
+    fs::write(&out, &bytes).unwrap();
+
+    let l = run(&format!("(load \"{}\")", out.display()));
+    assert!(
+        !l.status.success(),
+        "loader must reject the corrupt stack discipline; stdout={} stderr={}",
+        String::from_utf8_lossy(&l.stdout),
+        String::from_utf8_lossy(&l.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&l.stderr);
+    assert!(
+        stderr.contains(expected),
+        "expected a clean stack-verifier rejection ({expected}), got: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn corrupt_call_arity_stack_underflow_is_rejected() {
+    assert_corrupt_callnamed_nargs_rejected("stack-underflow", 9, "operand stack underflow");
+}
+
+#[test]
+fn corrupt_call_arity_stack_overflow_is_rejected() {
+    assert_corrupt_callnamed_nargs_rejected(
+        "stack-overflow",
+        0,
+        "operand stack exceeds declared max_stack",
+    );
+}
+
 #[test]
 fn compile_file_then_load_round_trips_in_a_fresh_process() {
     let dir = workdir("roundtrip");
