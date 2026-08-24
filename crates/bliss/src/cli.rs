@@ -10774,13 +10774,33 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let src_path = path_designator_to_string(args[0])?;
                 let mut out_path: Option<String> = None;
                 let mut i = 1;
+                // Extension: accept `(compile-file src out)` with a positional
+                // output file (string/pathname). ANSI makes OUTPUT-FILE a
+                // keyword, but the positional form is what callers reach for,
+                // and it was previously ACCEPTED AND SILENTLY IGNORED — the
+                // compile overwrote the default output path (bliss-m1a).
+                if i < args.len() && !args[i].is_symbol() {
+                    out_path = Some(path_designator_to_string(args[i])?);
+                    i += 1;
+                }
+                // The remaining tail must be a well-formed &key list (output-file
+                // verbose print external-format …, other keys tolerated) —
+                // reject malformed tails instead of dropping arguments.
+                if (args.len() - i) % 2 != 0 {
+                    return Err(BlissError::ProgramError(
+                        "COMPILE-FILE: odd number of &KEY arguments".into(),
+                    ));
+                }
                 while i + 1 < args.len() {
                     let key = args[i];
                     let val = args[i + 1];
-                    if key.is_symbol()
-                        && symbol_bare_name(&sym_name(key)) == "OUTPUT-FILE"
-                        && val != NIL
-                    {
+                    if !key.is_symbol() {
+                        return Err(BlissError::ProgramError(format!(
+                            "COMPILE-FILE: {} is not a keyword argument name",
+                            format_val(key)
+                        )));
+                    }
+                    if symbol_bare_name(&sym_name(key)) == "OUTPUT-FILE" && val != NIL {
                         out_path = Some(path_designator_to_string(val)?);
                     }
                     i += 2;

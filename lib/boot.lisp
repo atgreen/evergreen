@@ -1794,6 +1794,20 @@
                                      (t part))
                                "/")))))))
 
+(defun enough-namestring (pathname &optional (defaults *default-pathname-defaults*))
+  "A namestring just sufficient to identify PATHNAME relative to DEFAULTS:
+the namestring with DEFAULTS' directory prefix stripped when PATHNAME lies
+under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
+  (let* ((p (pathname pathname))
+         (d (pathname defaults))
+         (full (namestring p))
+         (base (directory-namestring d)))
+    (if (and (> (length base) 0)
+             (>= (length full) (length base))
+             (string= base (subseq full 0 (length base))))
+        (subseq full (length base))
+        full)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Implementation / environment identity (bliss-lb6). ASDF/UIOP build cache
 ;;; and output-translation paths from these. Constant values are sufficient for
