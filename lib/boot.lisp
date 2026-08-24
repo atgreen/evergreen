@@ -1790,6 +1790,30 @@
 ;; cl-cookie calls simple-string-p via ppcre).
 (defun simple-string-p (x) (stringp x))
 
+(defun sublis (alist tree &key key (test #'eql) test-not)
+  "Substitute through TREE: any subtree/leaf matching an ALIST key is replaced
+by that pair's cdr (ANSI 14.2; bliss-d0b: flexi-streams)."
+  (labels ((lookup (x)
+             (let ((k (if key (funcall key x) x)))
+               (let ((found nil))
+                 (dolist (pair alist)
+                   (when (and (not found)
+                              (consp pair)
+                              (if test-not
+                                  (not (funcall test-not k (car pair)))
+                                  (funcall test k (car pair))))
+                     (setq found pair)))
+                 found)))
+           (walk (x)
+             (let ((pair (lookup x)))
+               (cond (pair (cdr pair))
+                     ((consp x) (cons (walk (car x)) (walk (cdr x))))
+                     (t x)))))
+    (walk tree)))
+
+(defun nsublis (alist tree &rest args)
+  (apply #'sublis alist tree args))
+
 (defun enough-namestring (pathname &optional (defaults *default-pathname-defaults*))
   "A namestring just sufficient to identify PATHNAME relative to DEFAULTS:
 the namestring with DEFAULTS' directory prefix stripped when PATHNAME lies

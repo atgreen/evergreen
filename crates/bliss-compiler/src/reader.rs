@@ -1743,9 +1743,28 @@ fn read_radix_integer(
     }
     let digits: String = chars[start..pos].iter().collect();
     let digits = digits.trim_start_matches('+').trim_start_matches('-');
-    let n = i64::from_str_radix(digits, radix)
-        .map_err(|_| BlissError::StreamError(format!("invalid radix-{} integer", radix)))?;
-    Ok((BlissVal::from_fixnum(if negative { -n } else { n }), pos))
+    // Fixnum-range values stay immediate; anything larger — including i64
+    // overflow like fast-http's #xFFFFFFFFFFFFFFFF content-length bound —
+    // becomes a bignum, exactly like the base-10 token path (bliss-d0b).
+    if let Ok(n) = i64::from_str_radix(digits, radix) {
+        let n = if negative { -n } else { n };
+        if fits_fixnum(n) {
+            return Ok((BlissVal::from_fixnum(n), pos));
+        }
+        return Ok((alloc_bignum_from_i64(n), pos));
+    }
+    let signed = if negative {
+        format!("-{digits}")
+    } else {
+        digits.to_string()
+    };
+    match parse_bignum(&signed, radix) {
+        Some(b) => Ok((b, pos)),
+        None => Err(BlissError::StreamError(format!(
+            "invalid radix-{} integer",
+            radix
+        ))),
+    }
 }
 
 fn skip_block_comment(chars: &[char], mut pos: usize) -> Result<usize, BlissError> {

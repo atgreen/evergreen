@@ -1032,6 +1032,42 @@ fn infer_group_supers(st: &ClosState, class: BlissVal) -> Option<Vec<BlissVal>> 
 }
 
 fn c3_linearize(st: &ClosState, class: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
+    c3_linearize_guarded(st, class, &mut Vec::new())
+}
+
+/// `visiting` is the chain of classes currently being linearized; re-entering
+/// one means the (possibly heuristic-inferred) super graph is CYCLIC, which
+/// previously recursed to a stack-overflow SIGSEGV (bliss-d0b:
+/// trivial-gray-streams' fundamental-stream vs the bootstrap stream classes).
+/// Report it as a catchable error naming the class instead.
+fn c3_linearize_guarded(
+    st: &ClosState,
+    class: BlissVal,
+    visiting: &mut Vec<BlissVal>,
+) -> Result<Vec<BlissVal>, BlissError> {
+    if visiting.contains(&class) {
+        let name = st.class_meta.get(&class).map(|m| m.name).unwrap_or(class);
+        let rendered = if name.is_symbol() {
+            bliss_rt::symbols::symbol_name(name.as_symbol_index())
+                .unwrap_or_else(|| format!("{name:?}"))
+        } else {
+            format!("{name:?}")
+        };
+        return Err(BlissError::Internal(format!(
+            "cyclic class hierarchy: {rendered} appears among its own superclasses"
+        )));
+    }
+    visiting.push(class);
+    let result = c3_linearize_inner(st, class, visiting);
+    visiting.pop();
+    result
+}
+
+fn c3_linearize_inner(
+    st: &ClosState,
+    class: BlissVal,
+    visiting: &mut Vec<BlissVal>,
+) -> Result<Vec<BlissVal>, BlissError> {
     let direct_supers = match st.class_meta.get(&class) {
         Some(meta) => {
             // Only use inferred supers when the class's current direct_supers
@@ -1060,7 +1096,7 @@ fn c3_linearize(st: &ClosState, class: BlissVal) -> Result<Vec<BlissVal>, BlissE
     // L(C) = C + merge(L(S1), …, L(Sn), [S1, …, Sn])
     let mut lists: Vec<Vec<BlissVal>> = Vec::with_capacity(direct_supers.len() + 1);
     for s in &direct_supers {
-        lists.push(c3_linearize(st, *s)?);
+        lists.push(c3_linearize_guarded(st, *s, visiting)?);
     }
     lists.push(direct_supers);
 

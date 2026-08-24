@@ -3000,15 +3000,19 @@ fn visit_macro_def_roots(
     visit(&mut def.body);
     if let Some(function) = &def.bytecode {
         // A minor GC can fire mid-macro-expansion (alloc during the macro's own
-        // bytecode run), and `expand_macro`/`run_loop` already hold this cell
-        // borrowed — so an unconditional `borrow_mut` here double-borrows and
-        // panics, and because the GC is reached across the `extern "C"`
-        // c2i_call_slice boundary the panic aborts the process (bliss-011).
-        // Skip when the function is executing: its constants are compile-time
-        // values (not nursery), so a minor GC never relocates them, and the live
-        // ones are already reachable through the running activation's roots.
-        if let Ok(mut f) = function.try_borrow_mut() {
-            visit_bytecode_function_roots(&mut f, visit);
+        // bytecode run) while `expand_macro`/`run_loop` hold this cell borrowed,
+        // so a `borrow_mut` here would double-borrow-panic (bliss-011) — and
+        // SKIPPING the visit is wrong too: a bfasl-loaded macro's constants and
+        // params_form are nursery values materialized at load, so an unvisited
+        // executing macro was left with stale pointers after the move — its
+        // params_form read back as poison/zeroed during argument binding
+        // (bliss-d0b: trivial-gray-streams macros crashing smart-buffer /
+        // fast-http loads). The scan runs stop-the-world, so bypass the borrow
+        // flag and rewrite through the cell's raw pointer — the same aliasing
+        // discipline scan_bytecode_roots uses for registry functions that
+        // running activations reference.
+        unsafe {
+            visit_bytecode_function_roots(&mut *function.as_ptr(), visit);
         }
     }
     visit_env_frame_roots(&def.captured_frame, state, visit);
