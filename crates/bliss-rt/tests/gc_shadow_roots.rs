@@ -101,7 +101,10 @@ fn t0_reacquires_a_walkable_tlab_after_explicit_full_gc() {
         true
     })
     .expect("walk post-GC T0 allocation");
-    assert!(found, "post-GC T0 allocation must be on the walkable heap frontier");
+    assert!(
+        found,
+        "post-GC T0 allocation must be on the walkable heap frontier"
+    );
 
     let roots = ShadowRootScope::new();
     let second = roots.root(second);

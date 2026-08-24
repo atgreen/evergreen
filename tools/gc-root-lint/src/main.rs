@@ -113,8 +113,20 @@ const PRODUCERS: &[&str] = &[
 ];
 
 /// A rooted/whitelisted use: passing the variable to any of these clears it.
-const ROOTERS: &[&str] = &["rooted", "rooted_ref", "new_unlinked", "root", "root_values"];
-const ROOTER_TYPES: &[&str] = &["StackRoot", "HostRoot", "VecRootGuard", "Rooted", "RootedRef"];
+const ROOTERS: &[&str] = &[
+    "rooted",
+    "rooted_ref",
+    "new_unlinked",
+    "root",
+    "root_values",
+];
+const ROOTER_TYPES: &[&str] = &[
+    "StackRoot",
+    "HostRoot",
+    "VecRootGuard",
+    "Rooted",
+    "RootedRef",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Finding {
@@ -162,7 +174,11 @@ fn main() {
             out.push('\n');
         }
         std::fs::write(&baseline_path, out).expect("write baseline");
-        println!("blessed {} findings into {}", keys.len(), baseline_path.display());
+        println!(
+            "blessed {} findings into {}",
+            keys.len(),
+            baseline_path.display()
+        );
         return;
     }
 
@@ -202,7 +218,9 @@ fn main() {
         fresh
     );
     if check && fresh > 0 {
-        eprintln!("gc-root-lint: FAIL — new unrooted-across-alloc candidates (root them or bless the baseline)");
+        eprintln!(
+            "gc-root-lint: FAIL — new unrooted-across-alloc candidates (root them or bless the baseline)"
+        );
         std::process::exit(1);
     }
 }
@@ -301,9 +319,9 @@ fn lint_block(block: &syn::Block, file: &str, function: &str, findings: &mut Vec
                 }
                 // A read is any mention that is not this statement re-rooting it.
                 let is_rooting_stmt = macros.iter().any(|m| ROOTERS.contains(&m.as_str()))
-                    || calls
-                        .iter()
-                        .any(|c| ROOTERS.contains(&c.as_str()) || ROOTER_TYPES.contains(&c.as_str()));
+                    || calls.iter().any(|c| {
+                        ROOTERS.contains(&c.as_str()) || ROOTER_TYPES.contains(&c.as_str())
+                    });
                 if idents.contains(name) {
                     if is_rooting_stmt {
                         rooted.insert(name.clone());
@@ -369,13 +387,14 @@ fn lint_block(block: &syn::Block, file: &str, function: &str, findings: &mut Vec
 
 fn local_is_typed_blissval(local: &syn::Local) -> bool {
     if let syn::Pat::Type(t) = &local.pat
-        && let syn::Type::Path(p) = &*t.ty {
-            return p
-                .path
-                .segments
-                .last()
-                .is_some_and(|s| s.ident == "BlissVal");
-        }
+        && let syn::Type::Path(p) = &*t.ty
+    {
+        return p
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "BlissVal");
+    }
     false
 }
 
@@ -438,14 +457,15 @@ fn collect_call_names(stmt: &syn::Stmt) -> Vec<String> {
     impl<'ast> Visit<'ast> for V {
         fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
             if let syn::Expr::Path(p) = &*c.func
-                && let Some(seg) = p.path.segments.last() {
-                    self.0.push(seg.ident.to_string());
-                    // Also record the type for Type::method paths (StackRoot::new).
-                    if p.path.segments.len() >= 2 {
-                        self.0
-                            .push(p.path.segments[p.path.segments.len() - 2].ident.to_string());
-                    }
+                && let Some(seg) = p.path.segments.last()
+            {
+                self.0.push(seg.ident.to_string());
+                // Also record the type for Type::method paths (StackRoot::new).
+                if p.path.segments.len() >= 2 {
+                    self.0
+                        .push(p.path.segments[p.path.segments.len() - 2].ident.to_string());
                 }
+            }
             syn::visit::visit_expr_call(self, c);
         }
         fn visit_expr_method_call(&mut self, m: &'ast syn::ExprMethodCall) {

@@ -37,14 +37,13 @@ pub mod time;
 
 // ── Re-exports for convenience ────────────────────────────────────
 pub use clos::{
-    MethodCombinationType, MethodQualifier, allocate_instance, bootstrap_clos,
-    ensure_clos_bootstrapped, change_class,
+    MethodCombinationType, MethodQualifier, allocate_instance, bootstrap_clos, change_class,
     class_direct_subclasses, class_direct_superclasses, class_name, class_of, class_slots,
     compute_applicable_methods, compute_class_precedence_list, compute_effective_method,
-    define_class, find_class, generic_function_name, initialize_instance, is_instance,
-    make_generic_function, make_instance,
-    reinitialize_instance, set_find_class, set_method_specializers, set_slot_value,
-    shared_initialize, shared_initialize_with_list, slot_boundp, slot_makunbound, slot_value,
+    define_class, ensure_clos_bootstrapped, find_class, generic_function_name, initialize_instance,
+    is_instance, make_generic_function, make_instance, reinitialize_instance, set_find_class,
+    set_method_specializers, set_slot_value, shared_initialize, shared_initialize_with_list,
+    slot_boundp, slot_makunbound, slot_value,
 };
 pub use conditions::{
     HandlerBinding, RestartSpec, acquire_preallocated_storage_condition, clear_funcall_hook,
@@ -52,8 +51,8 @@ pub use conditions::{
     initialize_condition_runtime_support, install_runtime_init_hook, invoke_debugger,
     invoke_restart, invoke_restart_interactively, make_simple_error, make_type_error,
     release_preallocated_storage_condition, restart_bind, restart_bind_fn, set_break_on_signals,
-    set_debugger_hook, set_funcall_hook,
-    signal_condition, signal_storage_condition_for_runtime_error, warn_condition,
+    set_debugger_hook, set_funcall_hook, signal_condition,
+    signal_storage_condition_for_runtime_error, warn_condition,
 };
 pub use devtools::{
     BreakpointId, DebugFrame, ProfilerEntry, ProfilerKind, ProfilerReport, ReplState, StepMode,
@@ -82,38 +81,37 @@ pub use packages::{
     InternStatus, accessible_symbols, add_nickname, add_symbol, delete_package, export,
     external_symbols_of, find_package, find_present_symbol, find_symbol, import, intern,
     is_external_symbol, is_package, list_all_packages, make_package, package_name,
-    package_nicknames, package_use_list, present_symbols, rename_package, shadow,
-    shadowing_import, unexport, unintern, unuse_package, use_package, use_package_by_name,
+    package_nicknames, package_use_list, present_symbols, rename_package, shadow, shadowing_import,
+    unexport, unintern, unuse_package, use_package, use_package_by_name,
 };
 pub use pathnames::{
-    delete_file, directory, ensure_directories_exist, is_pathname, logical_pathname_translations,
-    make_pathname, merge_pathnames, namestring, parse_namestring, pathname_device,
-    pathname_directory, pathname_directory_components, PathDirComp,
-    pathname_host, pathname_match_p, pathname_name, pathname_type, pathname_version, probe_file,
-    register_string, registered_string, rename_file, set_logical_pathname_translations,
-    translate_logical_pathname, translate_pathname, truename, wild_pathname_p,
+    PathDirComp, delete_file, directory, ensure_directories_exist, is_pathname,
+    logical_pathname_translations, make_pathname, merge_pathnames, namestring, parse_namestring,
+    pathname_device, pathname_directory, pathname_directory_components, pathname_host,
+    pathname_match_p, pathname_name, pathname_type, pathname_version, probe_file, register_string,
+    registered_string, rename_file, set_logical_pathname_translations, translate_logical_pathname,
+    translate_pathname, truename, wild_pathname_p,
 };
 pub use sequences::{
     build_complex_vector, build_simple_vector, concatenate, copy_seq, count, cvec_adjustable,
-    cvec_capacity, cvec_fill_pointer, elt, find, is_complex_vector, length, map, nreverse, position,
-    reduce, remove, reverse, set_elt, set_fill_pointer, sort, stable_sort, string_set_char, subseq,
-    substitute, vector_pop, vector_push, vector_push_extend,
+    cvec_capacity, cvec_fill_pointer, elt, find, is_complex_vector, length, map, nreverse,
+    position, reduce, remove, reverse, set_elt, set_fill_pointer, sort, stable_sort,
+    string_set_char, subseq, substitute, vector_pop, vector_push, vector_push_extend,
 };
 pub use streams::GrayStream;
 pub use streams::{
     ExternalFormat, StreamDirection, StreamElementType, close, file_length_fn, file_position,
-    get_output_stream_string, input_stream_p, interactive_stream_p, make_broadcast_stream,
-    make_concatenated_stream, make_echo_stream, make_lisp_string, make_lisp_string_fresh,
-    make_stderr, make_stdin, make_stdout, make_string_input_stream, make_string_output_stream,
-    make_synonym_stream, make_two_way_stream,
-    open, open_stream_p, output_stream_p, set_file_position,
-    is_byte_stream, socket_accept, socket_close_listener, socket_listen, socket_local_port, stream_raw_fd,
-    synonym_stream_symbol, two_way_stream_input_stream, two_way_stream_output_stream,
-    stream_wait_for_input, stream_advance_to_column,
-    stream_clear_input, stream_clear_output, stream_element_type, stream_external_format,
-    stream_finish_output, stream_force_output, stream_fresh_line, stream_line_column,
-    stream_line_number, stream_listen, stream_peek_char, stream_read_byte, stream_read_char,
-    stream_read_char_no_hang, stream_read_line, stream_read_sequence, stream_start_line_p,
-    stream_terpri, stream_unread_char, stream_write_byte, stream_write_char, stream_write_sequence,
-    stream_write_string,
+    get_output_stream_string, input_stream_p, interactive_stream_p, is_byte_stream,
+    make_broadcast_stream, make_concatenated_stream, make_echo_stream, make_lisp_string,
+    make_lisp_string_fresh, make_stderr, make_stdin, make_stdout, make_string_input_stream,
+    make_string_output_stream, make_synonym_stream, make_two_way_stream, open, open_stream_p,
+    output_stream_p, set_file_position, socket_accept, socket_close_listener, socket_listen,
+    socket_local_port, stream_advance_to_column, stream_clear_input, stream_clear_output,
+    stream_element_type, stream_external_format, stream_finish_output, stream_force_output,
+    stream_fresh_line, stream_line_column, stream_line_number, stream_listen, stream_peek_char,
+    stream_raw_fd, stream_read_byte, stream_read_char, stream_read_char_no_hang, stream_read_line,
+    stream_read_sequence, stream_start_line_p, stream_terpri, stream_unread_char,
+    stream_wait_for_input, stream_write_byte, stream_write_char, stream_write_sequence,
+    stream_write_string, synonym_stream_symbol, two_way_stream_input_stream,
+    two_way_stream_output_stream,
 };

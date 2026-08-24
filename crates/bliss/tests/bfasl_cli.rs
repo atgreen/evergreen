@@ -9,6 +9,13 @@ use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_bliss-cli");
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root")
+}
+
 fn workdir(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("bliss-bfasl-{}-{}", std::process::id(), tag));
@@ -360,11 +367,7 @@ fn cross_unit_setf_writer_bfasl_round_trip() {
         "(defun (setf second-of) (val list) (setf (cadr list) val) val)\n",
     )
     .unwrap();
-    fs::write(
-        &usrc,
-        "(defun poke (l) (setf (second-of l) 42) l)\n",
-    )
-    .unwrap();
+    fs::write(&usrc, "(defun poke (l) (setf (second-of l) 42) l)\n").unwrap();
 
     // Compile the writer, load it (installs on the mangled symbol), THEN compile
     // the user unit — its SETF lowering must recognise the bfasl-loaded writer.
@@ -454,10 +457,7 @@ fn setf_symbol_function_install_bfasl_round_trip() {
         String::from_utf8_lossy(&l.stderr)
     );
     // (* 3 4)=12, (+ 3 4)=7, (+ 3 4)=7, (* 3 4)=12, (mapcar #'+ '(3) '(4))=(7)
-    assert_eq!(
-        String::from_utf8_lossy(&l.stdout).trim(),
-        "(12 7 7 12 (7))",
-    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "(12 7 7 12 (7))",);
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -496,20 +496,14 @@ fn setf_symbol_function_capturing_closure_bfasl_round_trip() {
     );
     assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
 
-    let l = run(&format!(
-        "(progn (load \"{}\") (use-all))",
-        out.display()
-    ));
+    let l = run(&format!("(progn (load \"{}\") (use-all))", out.display()));
     assert!(
         l.status.success(),
         "load failed: {}",
         String::from_utf8_lossy(&l.stderr)
     );
     // (+ 10 5)=15, (* 10 3)=30, ctr=1, ctr=2, (+ 20 5)=25
-    assert_eq!(
-        String::from_utf8_lossy(&l.stdout).trim(),
-        "(15 30 1 2 25)",
-    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "(15 30 1 2 25)",);
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -531,7 +525,11 @@ fn cross_unit_exported_function_bfasl_round_trip() {
     let uout = dir.join("use.bfasl");
     // The package (with its EXPORT) lives in one unit; the exported function's
     // definition in another — the units are separate `.bfasl`s.
-    fs::write(&psrc, "(defpackage :xp (:use :cl) (:export #:add1 #:twice))\n").unwrap();
+    fs::write(
+        &psrc,
+        "(defpackage :xp (:use :cl) (:export #:add1 #:twice))\n",
+    )
+    .unwrap();
     fs::write(
         &usrc,
         "(in-package :xp)\n\
@@ -610,7 +608,10 @@ fn macrolet_in_body_with_capture_bfasl_round_trip() {
     );
     assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
 
-    let l = run(&format!("(progn (load \"{}\") (clamp-sum 2 5))", out.display()));
+    let l = run(&format!(
+        "(progn (load \"{}\") (clamp-sum 2 5))",
+        out.display()
+    ));
     assert!(
         l.status.success(),
         "load failed: {}",
@@ -1189,10 +1190,7 @@ fn defsetf_top_level_bfasl_round_trips() {
     );
 
     // The whole point: loading the unit runs the defsetf form without error.
-    let l = run(&format!(
-        "(progn (load \"{}\") (loaded-ok))",
-        out.display()
-    ));
+    let l = run(&format!("(progn (load \"{}\") (loaded-ok))", out.display()));
     assert!(
         l.status.success(),
         "load failed (defsetf miscompiled?): {}",
@@ -1338,11 +1336,16 @@ fn compile_file_then_load_round_trips_in_a_fresh_process() {
         "new .bfasl writers must not emit legacy TOPLEVEL_FORMS"
     );
     assert!(
-        !bytes.windows(source.len()).any(|window| window == source.as_bytes()),
+        !bytes
+            .windows(source.len())
+            .any(|window| window == source.as_bytes()),
         "the artifact must not retain its source text"
     );
     let (_, function_count, load_action_count) = bbu_counts(&bytes);
-    assert!(function_count > 0, "BYTECODE_UNIT contains bytecode functions");
+    assert!(
+        function_count > 0,
+        "BYTECODE_UNIT contains bytecode functions"
+    );
     assert!(load_action_count > 0, "BYTECODE_UNIT contains a load plan");
 
     // Process 2 (fresh runtime): load the .bfasl and call the compiled function.
@@ -1488,8 +1491,14 @@ fn compile_file_prepass_handles_eval_when_and_read_time_constants() {
     );
     let bytes = fs::read(&out).unwrap();
     let (_, function_count, load_action_count) = bbu_counts(&bytes);
-    assert!(function_count >= 2, "expected both functions in BYTECODE_UNIT");
-    assert!(load_action_count >= 2, "expected load actions for both functions");
+    assert!(
+        function_count >= 2,
+        "expected both functions in BYTECODE_UNIT"
+    );
+    assert!(
+        load_action_count >= 2,
+        "expected load actions for both functions"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1499,7 +1508,8 @@ fn compile_file_round_trips_define_package_without_source() {
     let dir = workdir("define-package");
     let src = dir.join("p.lisp");
     let out = dir.join("p.bfasl");
-    let source = "(define-package :bf/pkg (:nicknames :bf-pkg) (:use :common-lisp) (:export #:pkg-value))
+    let source =
+        "(define-package :bf/pkg (:nicknames :bf-pkg) (:use :common-lisp) (:export #:pkg-value))
          (in-package :bf-pkg)
          (defun pkg-value () 42)\n";
     fs::write(&src, source).unwrap();
@@ -1740,10 +1750,7 @@ fn present_bbu_is_authoritative_and_never_falls_back_to_legacy_source() {
     let dir = workdir("authoritative-bbu");
     let out = dir.join("bad.bfasl");
     let image = bliss_rt::bfasl::BfaslBuilder::new()
-        .section(
-            bliss_rt::bfasl::section::BYTECODE_UNIT,
-            b"BBU\0".to_vec(),
-        )
+        .section(bliss_rt::bfasl::section::BYTECODE_UNIT, b"BBU\0".to_vec())
         .section(
             bliss_rt::bfasl::section::TOPLEVEL_FORMS,
             b"(defparameter *source-fallback-ran* t)".to_vec(),
@@ -1884,4 +1891,49 @@ fn bfasl_setf_writer_dispatches_from_top_level_setf() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn asdf_bfasl_load_asd_runs_under_bytecode() {
+    // bliss-a27: ASDF loaded from the bundled .bfasl must behave the same when
+    // called by the bytecode backend as it does under the tree-walker. This
+    // explicit LOAD-ASD path is the smallest stable slice of the Babel/OCICL
+    // corruption: it fails before system lookup needs the user OCICL runtime.
+    let root = repo_root();
+    let asdf = root.join("lib/asdf.bfasl");
+    let babel_asd = root.join("ocicl/babel-20250905-4eaf3f2/babel.asd");
+    assert!(
+        asdf.exists(),
+        "missing bundled ASDF bfasl: {}",
+        asdf.display()
+    );
+    assert!(
+        babel_asd.exists(),
+        "missing bundled Babel asd: {}",
+        babel_asd.display()
+    );
+
+    let form = format!(
+        "#-asdf (load #P\"{asdf}\") \
+         (asdf:load-asd #P\"{babel_asd}\" :name \"babel\") \
+         (format t \"LOAD-ASD-OK\")",
+        asdf = asdf.display(),
+        babel_asd = babel_asd.display()
+    );
+    let output = Command::new(BIN)
+        .env("BLISS_T1_THRESHOLD", "999999999")
+        .args(["--no-init", "--eval", &form])
+        .output()
+        .expect("spawn bliss-cli");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "ASDF bfasl LOAD-ASD failed under bytecode\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("LOAD-ASD-OK"),
+        "missing success marker\nstdout: {stdout}\nstderr: {stderr}"
+    );
 }

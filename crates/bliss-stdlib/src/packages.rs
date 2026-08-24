@@ -12,8 +12,8 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::hashtable::{
-    gethash, hash_table_entries, make_hash_table, remhash, set_gethash, HashTest,
-    MakeHashTableOptions,
+    HashTest, MakeHashTableOptions, gethash, hash_table_entries, make_hash_table, remhash,
+    set_gethash,
 };
 use crate::streams::make_lisp_string;
 

@@ -520,7 +520,10 @@ fn strings_are_sequences() {
     assert!(sequences::elt(s, 5).is_err()); // out of bounds
 
     // REVERSE and SUBSEQ of a string are strings (same element type).
-    assert_eq!(lisp_string_to_string(sequences::reverse(s).unwrap()), "olleh");
+    assert_eq!(
+        lisp_string_to_string(sequences::reverse(s).unwrap()),
+        "olleh"
+    );
     assert_eq!(
         lisp_string_to_string(sequences::subseq(s, 1, Some(3)).unwrap()),
         "el"

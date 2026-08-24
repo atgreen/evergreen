@@ -10,7 +10,7 @@
 //! intact. The scanner integration itself is wired into the GC's old-gen marker
 //! (scan_cl_stack_roots) and evacuation (relocate_cl_stack_refs).
 
-use bliss_rt::object::{gc_bit, ObjectHeader};
+use bliss_rt::object::{ObjectHeader, gc_bit};
 use bliss_rt::{BlissStack, BlissVal, visit_stack_refs};
 
 const HDR: usize = 8; // OBJECT_HEADER_SIZE
@@ -84,8 +84,16 @@ fn cl_frame_object_relocates_correctly_across_move() {
     // fixnum slot is untouched.
     unsafe {
         let s = BlissStack::frame_slots_mut(f);
-        assert_eq!((s[0].0 & !0b111) as usize, new_body, "ref relocated to new body");
-        assert_eq!(*((s[0].0 & !0b111) as *const u64), 0xDEAD_BEEF, "contents intact");
+        assert_eq!(
+            (s[0].0 & !0b111) as usize,
+            new_body,
+            "ref relocated to new body"
+        );
+        assert_eq!(
+            *((s[0].0 & !0b111) as *const u64),
+            0xDEAD_BEEF,
+            "contents intact"
+        );
         assert_eq!(s[1], BlissVal::from_fixnum(7), "non-reference untouched");
     }
 }
@@ -103,7 +111,11 @@ fn non_forwarded_refs_are_left_alone() {
     unsafe { BlissStack::frame_slots_mut(f)[0] = original };
     unsafe { visit_stack_refs(stack.fp(), chase) };
     unsafe {
-        assert_eq!(BlissStack::frame_slots_mut(f)[0], original, "non-forwarded ref unchanged");
+        assert_eq!(
+            BlissStack::frame_slots_mut(f)[0],
+            original,
+            "non-forwarded ref unchanged"
+        );
     }
 }
 
@@ -136,8 +148,8 @@ fn full_gc_with_cl_frame_refs_does_not_crash() {
 /// tag-only.
 #[test]
 fn compiled_frame_scanned_precisely_via_gc_stack_map() {
-    use bliss_rt::stack::StackMapEntry;
     use bliss_rt::CodeInfo;
+    use bliss_rt::stack::StackMapEntry;
 
     let bitmap: &'static [u8] = Box::leak(vec![0b01u8].into_boxed_slice());
     let entries: &'static [StackMapEntry] = Box::leak(

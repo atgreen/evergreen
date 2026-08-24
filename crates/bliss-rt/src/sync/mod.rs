@@ -11,7 +11,7 @@ mod semaphore;
 mod timer;
 
 pub use condvar::BlissCondVar;
-pub use io::{wait_fd, IoInterest};
+pub use io::{IoInterest, wait_fd};
 pub use mutex::BlissMutex;
 pub use semaphore::BlissSemaphore;
 

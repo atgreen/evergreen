@@ -4,6 +4,7 @@
 //! region for CL control/value frames. See §2.4 of the spec.
 
 use std::cell::Cell;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
@@ -17,9 +18,13 @@ use crate::value::{BlissVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
 /// mutability) so frame push/pop can go through a shared `&BlissStack` (the
 /// only handle `Fiber::stack()`/`NativeThread::stack()` hands out) without `&mut`.
 pub struct BlissStack {
-    /// Allocated memory buffer for the stack. Fixed-size after `new`, so its
-    /// backing buffer never moves and raw pointers into it stay valid.
-    memory: Vec<u8>,
+    /// mmap allocation base, including the protected guard page.
+    mapping: *mut u8,
+    mapping_len: usize,
+    /// Usable stack base, directly after the low guard page.
+    base: *mut u8,
+    capacity: usize,
+    guard: *mut u8,
     /// Stack pointer offset from base (grows upward from base).
     sp_offset: Cell<usize>,
     /// Frame pointer (null if no frames pushed).
@@ -34,9 +39,51 @@ impl BlissStack {
     /// Allocate a new stack with the given usable size in bytes.
     /// Sets up guard pages for overflow detection.
     pub fn new(size: usize) -> Self {
-        let memory = vec![0u8; size];
+        let page = stack_page_size();
+        if size == 0 {
+            let dangling = NonNull::<u8>::dangling().as_ptr();
+            return BlissStack {
+                mapping: std::ptr::null_mut(),
+                mapping_len: 0,
+                base: dangling,
+                capacity: 0,
+                guard: std::ptr::null_mut(),
+                sp_offset: Cell::new(0),
+                fp: Cell::new(std::ptr::null_mut()),
+                published_sp: AtomicUsize::new(0),
+                published_fp: AtomicPtr::new(std::ptr::null_mut()),
+            };
+        }
+
+        let usable_len = align_up(size, page);
+        let mapping_len = page
+            .checked_add(usable_len)
+            .and_then(|n| n.checked_add(page))
+            .expect("BlissStack mapping size overflow");
+        let mapping = unsafe {
+            crate::syscall::mmap(
+                std::ptr::null_mut(),
+                mapping_len,
+                crate::syscall::PROT_READ | crate::syscall::PROT_WRITE,
+                crate::syscall::MAP_PRIVATE | crate::syscall::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+            .expect("BlissStack mmap failed")
+        };
+        let guard = unsafe { mapping.add(page + usable_len) };
+        unsafe {
+            crate::syscall::mprotect(guard, page, crate::syscall::PROT_NONE)
+                .expect("BlissStack guard mprotect failed");
+        }
+        crate::runtime::register_sigsegv_stack_guard_range(guard as usize, page);
+
         BlissStack {
-            memory,
+            mapping,
+            mapping_len,
+            base: unsafe { mapping.add(page) },
+            capacity: size,
+            guard,
             sp_offset: Cell::new(0),
             fp: Cell::new(std::ptr::null_mut()),
             published_sp: AtomicUsize::new(0),
@@ -46,7 +93,7 @@ impl BlissStack {
 
     /// Get the base (lowest) address of the stack.
     pub fn base(&self) -> *const u8 {
-        self.memory.as_ptr()
+        self.base as *const u8
     }
 
     /// Mutable base pointer into the backing buffer.
@@ -55,12 +102,12 @@ impl BlissStack {
     /// mutator is this thread's interpreter, which never holds a `&[u8]`/
     /// `&mut [u8]` slice over the same region while frames are live.
     fn base_mut(&self) -> *mut u8 {
-        self.memory.as_ptr() as *mut u8
+        self.base
     }
 
     /// Get the current stack pointer.
     pub fn sp(&self) -> *const u8 {
-        unsafe { self.memory.as_ptr().add(self.sp_offset.get()) }
+        unsafe { self.base.add(self.sp_offset.get()) }
     }
 
     /// Get the current frame pointer.
@@ -70,12 +117,17 @@ impl BlissStack {
 
     /// Returns total usable size in bytes.
     pub fn capacity(&self) -> usize {
-        self.memory.len()
+        self.capacity
     }
 
     /// Returns bytes currently in use.
     pub fn used(&self) -> usize {
         self.sp_offset.get()
+    }
+
+    /// Base address of the protected overflow guard page, if this stack is nonempty.
+    pub fn guard_base(&self) -> Option<*const u8> {
+        (!self.guard.is_null()).then_some(self.guard as *const u8)
     }
 
     /// Publish the current sp and fp so the GC can scan this thread's
@@ -112,7 +164,7 @@ impl BlissStack {
         let start = align_up(self.sp_offset.get(), std::mem::align_of::<Frame>());
         let frame_bytes = header + num_slots as usize * std::mem::size_of::<BlissVal>();
         let end = start.checked_add(frame_bytes)?;
-        if end > self.memory.len() {
+        if end > self.capacity {
             return None;
         }
 
@@ -153,7 +205,7 @@ impl BlissStack {
         // SAFETY: `fp` is a frame this stack pushed; its `prev_fp` and address
         // are valid. `offset_from` is within the same allocation.
         unsafe {
-            let start = (fp as *const u8).offset_from(self.memory.as_ptr()) as usize;
+            let start = (fp as *const u8).offset_from(self.base as *const u8) as usize;
             self.sp_offset.set(start);
             self.fp.set((*fp).prev_fp);
         }
@@ -189,6 +241,17 @@ impl BlissStack {
     /// Read the published frame pointer (for GC scanning).
     pub fn published_fp(&self) -> *const Frame {
         self.published_fp.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for BlissStack {
+    fn drop(&mut self) {
+        if !self.guard.is_null() {
+            crate::runtime::unregister_sigsegv_stack_guard_range(self.guard as usize);
+        }
+        if !self.mapping.is_null() && self.mapping_len != 0 {
+            let _ = unsafe { crate::syscall::munmap(self.mapping, self.mapping_len) };
+        }
     }
 }
 
@@ -236,6 +299,11 @@ pub fn eval_stack_budget() -> usize {
 #[inline]
 fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
+}
+
+#[inline]
+fn stack_page_size() -> usize {
+    4096
 }
 
 // ── Frame layout ───────────────────────────────────────────────────

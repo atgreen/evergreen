@@ -9,16 +9,18 @@
 //! hook via `set_funcall_hook` so that handlers, restarts, and debugger hooks
 //! are actually called at runtime.
 
-use bliss_rt::error::BlissError;
-use bliss_rt::value::{BlissVal, NIL, TAG_SYMBOL};
 use crate::clos::{
     allocate_instance_pinned_gc, bootstrap_clos, class_direct_superclasses, class_name, class_of,
     define_class, find_class, initialize_instance, make_instance,
 };
 use crate::streams::make_lisp_string_fresh;
+use bliss_rt::error::BlissError;
+use bliss_rt::stack::{BlissStack, Frame, FrameType};
+use bliss_rt::thread::current_stack;
+use bliss_rt::thread::{ConditionHandlerCluster, ConditionRestartCluster};
+use bliss_rt::value::{BlissVal, NIL, TAG_SYMBOL};
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Once};
 
@@ -81,6 +83,8 @@ const STORAGE_CONDITION_POOL_SIZE: usize = 4;
 const KNOWN_CONDITION_TYPE_NAMES: &[&str] = &[
     "CONDITION",
     "WARNING",
+    "INTERRUPT-CONDITION",
+    "TIMEOUT-CONDITION",
     "SERIOUS-CONDITION",
     "ERROR",
     "SIMPLE-ERROR",
@@ -141,8 +145,7 @@ fn funcall(function: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError
         return Ok(args.first().copied().unwrap_or(NIL));
     }
     if function.is_fixnum() && function.as_fixnum() <= INTERNAL_HANDLER_CASE_FN_BASE {
-        let matched = STATE.with(|s| {
-            let mut state = s.borrow_mut();
+        let matched = with_state(|state| {
             let handler_val = state.handler_case_clauses.get(&function.to_raw()).copied();
             if let Some(handler_val) = handler_val {
                 state.pending_handler_case =
@@ -171,48 +174,163 @@ fn funcall(function: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError
     })
 }
 
-// ── Thread-local condition system state ───────────────────────────
+// ── Runtime-owned condition system state ─────────────────────────
 
-/// Internal restart entry stored in thread-local state.
-#[allow(dead_code)]
-struct RestartEntry {
-    name: BlissVal,
-    function: BlissVal,
-    report_function: Option<BlissVal>,
-    interactive_function: Option<BlissVal>,
-    test_function: Option<BlissVal>,
+fn with_state<T>(f: impl FnOnce(&mut bliss_rt::thread::ThreadConditionState) -> T) -> T {
+    bliss_rt::with_current_condition_state_mut(f)
 }
 
-/// Per-thread condition system state.
-struct ConditionState {
-    /// Handler stack for handler_bind (each frame is a set of bindings).
-    handler_stack: Vec<Vec<(BlissVal, BlissVal)>>,
-    /// Persistent restart registry (restarts survive restart_bind return).
-    restart_registry: Vec<RestartEntry>,
-    /// Current debugger hook (*DEBUGGER-HOOK*).
-    debugger_hook: Option<BlissVal>,
-    /// Current *BREAK-ON-SIGNALS* value.
-    break_on_signals: Option<BlissVal>,
-    /// Flag set when debugger was invoked (for testing).
-    debugger_invoked: bool,
-    handler_case_clauses: HashMap<u64, BlissVal>,
-    pending_handler_case: Option<(BlissVal, BlissVal)>,
-    next_handler_case_id: i64,
+struct ConditionClusterFrameGuard {
+    stack: &'static BlissStack,
 }
 
-impl ConditionState {
-    fn new() -> Self {
-        ConditionState {
-            handler_stack: Vec::new(),
-            restart_registry: Vec::new(),
-            debugger_hook: None,
-            break_on_signals: None,
-            debugger_invoked: false,
-            handler_case_clauses: HashMap::new(),
-            pending_handler_case: None,
-            next_handler_case_id: 0,
+impl Drop for ConditionClusterFrameGuard {
+    fn drop(&mut self) {
+        self.stack.pop_frame();
+    }
+}
+
+struct HandlerClusterGuard {
+    _frame: ConditionClusterFrameGuard,
+}
+
+impl Drop for HandlerClusterGuard {
+    fn drop(&mut self) {
+        with_state(|state| {
+            state.handler_stack.pop();
+        });
+    }
+}
+
+struct RestartClusterGuard {
+    _frame: ConditionClusterFrameGuard,
+}
+
+impl Drop for RestartClusterGuard {
+    fn drop(&mut self) {
+        with_state(|state| {
+            state.restart_stack.pop();
+        });
+    }
+}
+
+fn push_condition_cluster_frame(
+    num_slots: usize,
+) -> Result<(*mut Frame, ConditionClusterFrameGuard), BlissError> {
+    let num_slots = u16::try_from(num_slots).map_err(|_| {
+        BlissError::ProgramError("condition cluster has too many entries for one frame".into())
+    })?;
+    let stack = current_stack();
+    let frame = stack
+        .push_frame(NIL, std::ptr::null(), num_slots, FrameType::Special as u32)
+        .ok_or_else(|| BlissError::Internal("BlissStack exhausted for condition cluster".into()))?;
+    Ok((frame, ConditionClusterFrameGuard { stack }))
+}
+
+fn push_handler_cluster_frame(
+    bindings: &[(BlissVal, BlissVal)],
+) -> Result<(ConditionClusterFrameGuard, ConditionHandlerCluster), BlissError> {
+    let slots_len = bindings.len().saturating_mul(2);
+    let (frame, guard) = push_condition_cluster_frame(slots_len)?;
+    unsafe {
+        let slots = BlissStack::frame_slots_mut(frame);
+        for (i, (condition_type, handler_fn)) in bindings.iter().enumerate() {
+            slots[i * 2] = *condition_type;
+            slots[i * 2 + 1] = *handler_fn;
         }
     }
+    Ok((
+        guard,
+        ConditionHandlerCluster {
+            frame: frame as usize,
+            count: bindings.len(),
+        },
+    ))
+}
+
+fn establish_handler_cluster(
+    bindings: &[(BlissVal, BlissVal)],
+) -> Result<HandlerClusterGuard, BlissError> {
+    let (frame, cluster) = push_handler_cluster_frame(bindings)?;
+    with_state(|state| state.handler_stack.push(cluster));
+    Ok(HandlerClusterGuard { _frame: frame })
+}
+
+fn push_restart_cluster_frame(
+    restarts: &[RestartSpec],
+) -> Result<(ConditionClusterFrameGuard, ConditionRestartCluster), BlissError> {
+    let slots_len = restarts.len().saturating_mul(5);
+    let (frame, guard) = push_condition_cluster_frame(slots_len)?;
+    unsafe {
+        let slots = BlissStack::frame_slots_mut(frame);
+        for (i, spec) in restarts.iter().enumerate() {
+            let base = i * 5;
+            slots[base] = spec.name;
+            slots[base + 1] = spec.function;
+            slots[base + 2] = spec.interactive_function.unwrap_or(NIL);
+            slots[base + 3] = spec.report_function.unwrap_or(NIL);
+            slots[base + 4] = spec.test_function.unwrap_or(NIL);
+        }
+    }
+    Ok((
+        guard,
+        ConditionRestartCluster {
+            frame: frame as usize,
+            count: restarts.len(),
+        },
+    ))
+}
+
+fn establish_restart_cluster(restarts: &[RestartSpec]) -> Result<RestartClusterGuard, BlissError> {
+    let (frame, cluster) = push_restart_cluster_frame(restarts)?;
+    with_state(|state| state.restart_stack.push(cluster));
+    Ok(RestartClusterGuard { _frame: frame })
+}
+
+fn handler_cluster_entry(cluster: ConditionHandlerCluster, index: usize) -> (BlissVal, BlissVal) {
+    debug_assert!(index < cluster.count);
+    unsafe {
+        let slots = BlissStack::frame_slots_mut(cluster.frame as *mut Frame);
+        (slots[index * 2], slots[index * 2 + 1])
+    }
+}
+
+fn restart_cluster_entry(
+    cluster: ConditionRestartCluster,
+    index: usize,
+) -> (
+    BlissVal,
+    BlissVal,
+    Option<BlissVal>,
+    Option<BlissVal>,
+    Option<BlissVal>,
+) {
+    debug_assert!(index < cluster.count);
+    unsafe {
+        let slots = BlissStack::frame_slots_mut(cluster.frame as *mut Frame);
+        let base = index * 5;
+        let interactive = (!slots[base + 2].is_nil()).then_some(slots[base + 2]);
+        let report = (!slots[base + 3].is_nil()).then_some(slots[base + 3]);
+        let test = (!slots[base + 4].is_nil()).then_some(slots[base + 4]);
+        (slots[base], slots[base + 1], report, interactive, test)
+    }
+}
+
+fn active_restart_entries() -> Vec<(
+    BlissVal,
+    BlissVal,
+    Option<BlissVal>,
+    Option<BlissVal>,
+    Option<BlissVal>,
+)> {
+    let clusters = with_state(|state| state.restart_stack.clone());
+    let mut entries = Vec::new();
+    for cluster in clusters.iter().rev() {
+        for i in (0..cluster.count).rev() {
+            entries.push(restart_cluster_entry(*cluster, i));
+        }
+    }
+    entries
 }
 
 // ── Pre-allocated STORAGE-CONDITION pool (D5.13, R5.110, bliss-wzw) ──────────
@@ -272,52 +390,8 @@ thread_local! {
 }
 
 thread_local! {
-    static STATE: RefCell<ConditionState> = RefCell::new(ConditionState::new());
     /// Flag set by the MUFFLE-WARNING restart to suppress warning output.
     static WARNING_MUFFLED: RefCell<bool> = const { RefCell::new(false) };
-}
-
-fn scan_condition_state_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        for cluster in &mut state.handler_stack {
-            for (condition_type, handler) in cluster {
-                visit(condition_type);
-                visit(handler);
-            }
-        }
-        for restart in &mut state.restart_registry {
-            visit(&mut restart.name);
-            visit(&mut restart.function);
-            for function in [
-                &mut restart.report_function,
-                &mut restart.interactive_function,
-                &mut restart.test_function,
-            ] {
-                if let Some(function) = function.as_mut() {
-                    visit(function);
-                }
-            }
-        }
-        if let Some(hook) = state.debugger_hook.as_mut() {
-            visit(hook);
-        }
-        if let Some(type_specifier) = state.break_on_signals.as_mut() {
-            visit(type_specifier);
-        }
-        for handler in state.handler_case_clauses.values_mut() {
-            visit(handler);
-        }
-        if let Some((condition, handler)) = state.pending_handler_case.as_mut() {
-            visit(condition);
-            visit(handler);
-        }
-    });
-}
-
-fn install_condition_state_root_scanner() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_condition_state_roots));
 }
 
 // ── Condition construction ────────────────────────────────────────
@@ -331,6 +405,8 @@ fn condition_class_spec(name: &str) -> (&'static [&'static str], &'static [&'sta
         "SERIOUS-CONDITION" => (&["CONDITION"], &[]),
         "ERROR" => (&["SERIOUS-CONDITION"], &[]),
         "WARNING" => (&["CONDITION"], &[]),
+        "INTERRUPT-CONDITION" => (&["CONDITION"], &[]),
+        "TIMEOUT-CONDITION" => (&["ERROR"], &[]),
         "SIMPLE-CONDITION" => (&["CONDITION"], &["FORMAT-CONTROL", "FORMAT-ARGUMENTS"]),
         "SIMPLE-ERROR" => (&["ERROR", "SIMPLE-CONDITION"], &[]),
         "TYPE-ERROR" => (&["ERROR"], &["DATUM", "EXPECTED-TYPE"]),
@@ -373,6 +449,7 @@ fn ensure_builtin_condition_classes() -> Result<(), BlissError> {
         "WARNING",
         "SIMPLE-CONDITION",
         "SIMPLE-ERROR",
+        "TIMEOUT-CONDITION",
         "TYPE-ERROR",
         "SIMPLE-WARNING",
         "CONTROL-ERROR",
@@ -535,7 +612,6 @@ pub fn install_runtime_init_hook() {
 }
 
 pub fn initialize_condition_runtime_support() -> Result<(), BlissError> {
-    install_condition_state_root_scanner();
     install_runtime_init_hook();
     if storage_condition_pool_is_live() {
         Ok(())
@@ -594,7 +670,10 @@ pub fn make_type_error(datum: BlissVal, expected_type: BlissVal) -> BlissVal {
 
 /// Check if a BlissVal is a condition instance rooted at CONDITION.
 fn is_condition(val: BlissVal) -> bool {
-    class_inherits_from(class_of(val), BlissVal::from_symbol_index(*SYMBOL_CONDITION))
+    class_inherits_from(
+        class_of(val),
+        BlissVal::from_symbol_index(*SYMBOL_CONDITION),
+    )
 }
 
 /// Check if a handler's condition-type specification matches a given condition.
@@ -648,16 +727,17 @@ pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
     // `handler_stack[ci..]` out with `split_off` and appends it back afterwards —
     // no clone of the whole stack, only the current cluster is copied so it can
     // be iterated while the TLS stack is mutated.
-    let cluster_count = STATE.with(|s| s.borrow().handler_stack.len());
+    let cluster_count = with_state(|state| state.handler_stack.len());
     for ci in (0..cluster_count).rev() {
-        let Some(cluster) = STATE.with(|s| s.borrow().handler_stack.get(ci).cloned()) else {
+        let Some(cluster) = with_state(|state| state.handler_stack.get(ci).copied()) else {
             continue;
         };
-        for (condition_type, handler_fn) in &cluster {
-            if condition_type_matches(condition, *condition_type) {
-                let tail = STATE.with(|s| s.borrow_mut().handler_stack.split_off(ci));
-                let handler_result = funcall(*handler_fn, &[condition]);
-                STATE.with(|s| s.borrow_mut().handler_stack.extend(tail));
+        for i in 0..cluster.count {
+            let (condition_type, handler_fn) = handler_cluster_entry(cluster, i);
+            if condition_type_matches(condition, condition_type) {
+                let tail = with_state(|state| state.handler_stack.split_off(ci));
+                let handler_result = funcall(handler_fn, &[condition]);
+                with_state(|state| state.handler_stack.extend(tail));
                 // A handler that returns normally *declines* — keep searching;
                 // one that transferred control surfaces here as Err and propagates.
                 handler_result?;
@@ -670,7 +750,7 @@ pub fn signal_condition(condition: BlissVal) -> Result<(), BlissError> {
 }
 
 fn break_on_signals_gate(condition: BlissVal) -> Result<(), BlissError> {
-    let break_spec = STATE.with(|s| s.borrow().break_on_signals);
+    let break_spec = with_state(|state| state.break_on_signals);
     let Some(break_spec) = break_spec else {
         return Ok(());
     };
@@ -678,13 +758,9 @@ fn break_on_signals_gate(condition: BlissVal) -> Result<(), BlissError> {
         return Ok(());
     }
 
-    STATE.with(|s| {
-        s.borrow_mut().break_on_signals = None;
-    });
+    with_state(|state| state.break_on_signals = None);
     let _ = invoke_debugger(condition);
-    STATE.with(|s| {
-        s.borrow_mut().break_on_signals = Some(break_spec);
-    });
+    with_state(|state| state.break_on_signals = Some(break_spec));
     Ok(())
 }
 
@@ -718,18 +794,15 @@ pub fn error_condition(condition: BlissVal) -> Result<(), BlissError> {
 /// the CONTINUE restart allows returning from the debugger.
 pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissError> {
     // Establish a CONTINUE restart using the named constant (issue 8 fix).
-    let continue_name = BlissVal::from_symbol_index(*SYMBOL_CONTINUE);
-    let continue_restart = RestartEntry {
-        name: continue_name,
+    let continue_restart = RestartSpec {
+        name: BlissVal::from_symbol_index(*SYMBOL_CONTINUE),
         function: BlissVal::from_symbol_index(*INTERNAL_CONTINUE_RESTART_FN),
         report_function: None,
         interactive_function: None,
         test_function: None,
     };
 
-    STATE.with(|s| {
-        s.borrow_mut().restart_registry.push(continue_restart);
-    });
+    let _cluster = establish_restart_cluster(&[continue_restart])?;
 
     // Signal the condition through handlers via signal_condition.
     signal_condition(condition)?;
@@ -738,18 +811,6 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
     // Per A5.10 / R5.105, CERROR calls invoke_debugger when unhandled.
     // The CONTINUE restart allows the debugger (or hook) to return.
     let _debugger_result = invoke_debugger(condition);
-
-    // Remove the CONTINUE restart (dynamic extent).
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        if let Some(pos) = state
-            .restart_registry
-            .iter()
-            .rposition(|e| e.name == continue_name)
-        {
-            state.restart_registry.remove(pos);
-        }
-    });
 
     // Per CERROR semantics, the CONTINUE restart was implicitly invoked
     // (either by the debugger hook or by default), allowing execution to
@@ -766,9 +827,8 @@ pub fn cerror(_continue_string: &str, condition: BlissVal) -> Result<(), BlissEr
 pub fn warn_condition(condition: BlissVal) -> Result<(), BlissError> {
     initialize_condition_runtime_support()?;
     // Establish a MUFFLE-WARNING restart using the named constant (issue 8 fix).
-    let muffle_name = BlissVal::from_symbol_index(*SYMBOL_MUFFLE_WARNING);
-    let muffle_restart = RestartEntry {
-        name: muffle_name,
+    let muffle_restart = RestartSpec {
+        name: BlissVal::from_symbol_index(*SYMBOL_MUFFLE_WARNING),
         function: BlissVal::from_symbol_index(*INTERNAL_MUFFLE_WARNING_RESTART_FN),
         report_function: None,
         interactive_function: None,
@@ -778,25 +838,11 @@ pub fn warn_condition(condition: BlissVal) -> Result<(), BlissError> {
     // Reset the muffled flag before signalling.
     WARNING_MUFFLED.with(|m| *m.borrow_mut() = false);
 
-    STATE.with(|s| {
-        s.borrow_mut().restart_registry.push(muffle_restart);
-    });
+    let _cluster = establish_restart_cluster(&[muffle_restart])?;
 
     // Signal the warning through handlers via signal_condition.
     // Per CL semantics, warnings do not enter the debugger.
     signal_condition(condition)?;
-
-    // Remove the MUFFLE-WARNING restart (dynamic extent).
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        if let Some(pos) = state
-            .restart_registry
-            .iter()
-            .rposition(|e| e.name == muffle_name)
-        {
-            state.restart_registry.remove(pos);
-        }
-    });
 
     // Per R5.104: only print the warning if MUFFLE-WARNING was NOT invoked.
     let muffled = WARNING_MUFFLED.with(|m| *m.borrow());
@@ -846,10 +892,7 @@ pub fn handler_bind(
     bindings: &[(BlissVal, BlissVal)],
     body: BlissVal,
 ) -> Result<BlissVal, BlissError> {
-    let frame: Vec<(BlissVal, BlissVal)> = bindings.to_vec();
-    STATE.with(|s| {
-        s.borrow_mut().handler_stack.push(frame);
-    });
+    let _cluster = establish_handler_cluster(bindings)?;
 
     // Evaluate the body via funcall if the value looks like a callable
     // (function tag), otherwise return it directly.  This provides backward
@@ -860,11 +903,6 @@ pub fn handler_bind(
     } else {
         Ok(body)
     };
-
-    // Pop bindings from handler stack (dynamic extent).
-    STATE.with(|s| {
-        s.borrow_mut().handler_stack.pop();
-    });
 
     result
 }
@@ -877,17 +915,9 @@ pub fn handler_bind_fn(
     bindings: &[(BlissVal, BlissVal)],
     body: impl FnOnce() -> Result<BlissVal, BlissError>,
 ) -> Result<BlissVal, BlissError> {
-    let frame: Vec<(BlissVal, BlissVal)> = bindings.to_vec();
-    STATE.with(|s| {
-        s.borrow_mut().handler_stack.push(frame);
-    });
+    let _cluster = establish_handler_cluster(bindings)?;
 
     let result = body();
-
-    // Pop bindings from handler stack (dynamic extent).
-    STATE.with(|s| {
-        s.borrow_mut().handler_stack.pop();
-    });
 
     result
 }
@@ -938,14 +968,15 @@ pub fn handler_case_fn(
 
     let mut bindings = Vec::with_capacity(clauses.len());
     let mut installed = Vec::with_capacity(clauses.len());
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
+    with_state(|state| {
         state.pending_handler_case = None;
         for (clause_type, handler_val) in clauses {
             let id = INTERNAL_HANDLER_CASE_FN_BASE - state.next_handler_case_id;
             state.next_handler_case_id += 1;
             let token = BlissVal::from_fixnum(id);
-            state.handler_case_clauses.insert(token.to_raw(), *handler_val);
+            state
+                .handler_case_clauses
+                .insert(token.to_raw(), *handler_val);
             bindings.push((*clause_type, token));
             installed.push(token.to_raw());
         }
@@ -954,15 +985,15 @@ pub fn handler_case_fn(
     let result = handler_bind_fn(&bindings, body);
 
     for raw in installed {
-        STATE.with(|s| {
-            s.borrow_mut().handler_case_clauses.remove(&raw);
+        with_state(|state| {
+            state.handler_case_clauses.remove(&raw);
         });
     }
 
     match result {
         Ok(value) => Ok(value),
         Err(BlissError::Internal(message)) if message == "__HANDLER_CASE__" => {
-            let matched = STATE.with(|s| s.borrow_mut().pending_handler_case.take());
+            let matched = with_state(|state| state.pending_handler_case.take());
             if let Some((condition, handler_val)) = matched {
                 if handler_val.is_function() {
                     funcall(handler_val, &[condition])
@@ -970,7 +1001,9 @@ pub fn handler_case_fn(
                     Ok(handler_val)
                 }
             } else {
-                Err(BlissError::Internal("handler-case lost pending match".into()))
+                Err(BlissError::Internal(
+                    "handler-case lost pending match".into(),
+                ))
             }
         }
         Err(err) => Err(err),
@@ -997,21 +1030,7 @@ pub struct RestartSpec {
 /// When `body` is a pre-evaluated BlissVal, it is returned directly.
 /// For real body evaluation with restarts active, use `restart_bind_fn`.
 pub fn restart_bind(restarts: &[RestartSpec], body: BlissVal) -> Result<BlissVal, BlissError> {
-    let count = restarts.len();
-
-    // Register all restart specs in thread-local state.
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        for spec in restarts {
-            state.restart_registry.push(RestartEntry {
-                name: spec.name,
-                function: spec.function,
-                report_function: spec.report_function,
-                interactive_function: spec.interactive_function,
-                test_function: spec.test_function,
-            });
-        }
-    });
+    let _cluster = establish_restart_cluster(restarts)?;
 
     // Evaluate the body.  If it's a function, invoke it via funcall;
     // otherwise return the pre-evaluated value directly.
@@ -1020,13 +1039,6 @@ pub fn restart_bind(restarts: &[RestartSpec], body: BlissVal) -> Result<BlissVal
     } else {
         Ok(body)
     };
-
-    // Remove the restarts we added (dynamic extent).
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        let len = state.restart_registry.len();
-        state.restart_registry.truncate(len - count);
-    });
 
     result
 }
@@ -1039,28 +1051,9 @@ pub fn restart_bind_fn(
     restarts: &[RestartSpec],
     body: impl FnOnce() -> Result<BlissVal, BlissError>,
 ) -> Result<BlissVal, BlissError> {
-    let count = restarts.len();
-
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        for spec in restarts {
-            state.restart_registry.push(RestartEntry {
-                name: spec.name,
-                function: spec.function,
-                report_function: spec.report_function,
-                interactive_function: spec.interactive_function,
-                test_function: spec.test_function,
-            });
-        }
-    });
+    let _cluster = establish_restart_cluster(restarts)?;
 
     let result = body();
-
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
-        let len = state.restart_registry.len();
-        state.restart_registry.truncate(len - count);
-    });
 
     result
 }
@@ -1072,29 +1065,20 @@ pub fn restart_bind_fn(
 /// If a condition is provided, restarts whose test_function rejects the
 /// condition are filtered out.
 pub fn compute_restarts(condition: Option<BlissVal>) -> Vec<BlissVal> {
-    STATE.with(|s| {
-        let state = s.borrow();
-        state
-            .restart_registry
-            .iter()
-            .rev() // newest-first per spec
-            .filter(|entry| {
-                // Apply test_function filtering per R5.97 / A5.08.
-                if let (Some(test_fn), Some(cond)) = (entry.test_function, condition) {
-                    // Funcall the test function with the condition.
-                    // A result of NIL (or error) means reject; non-NIL means accept.
-                    match funcall(test_fn, &[cond]) {
-                        Ok(result) => !result.is_nil(),
-                        Err(_) => false,
-                    }
-                } else {
-                    // No test function — restart is always visible.
-                    true
+    active_restart_entries()
+        .into_iter()
+        .filter(|(_, _, _, _, test_function)| {
+            if let (Some(test_fn), Some(cond)) = (*test_function, condition) {
+                match funcall(test_fn, &[cond]) {
+                    Ok(result) => !result.is_nil(),
+                    Err(_) => false,
                 }
-            })
-            .map(|entry| entry.name)
-            .collect()
-    })
+            } else {
+                true
+            }
+        })
+        .map(|(name, _, _, _, _)| name)
+        .collect()
 }
 
 /// Find a restart by name.
@@ -1104,25 +1088,19 @@ pub fn compute_restarts(condition: Option<BlissVal>) -> Vec<BlissVal> {
 /// a condition is provided, restarts whose test_function rejects the
 /// condition are skipped.  Returns the restart's function value if found.
 pub fn find_restart(name: BlissVal, condition: Option<BlissVal>) -> Option<BlissVal> {
-    STATE.with(|s| {
-        let state = s.borrow();
-        for entry in state.restart_registry.iter().rev() {
-            if entry.name == name {
-                // Apply test_function filtering when a condition is provided,
-                // consistent with compute_restarts (per R5.98).
-                if let (Some(test_fn), Some(cond)) = (entry.test_function, condition) {
-                    match funcall(test_fn, &[cond]) {
-                        Ok(result) if !result.is_nil() => return Some(entry.function),
-                        _ => continue, // test rejected or errored — skip
-                    }
-                } else {
-                    // No test function — restart is applicable.
-                    return Some(entry.function);
+    for (entry_name, function, _, _, test_function) in active_restart_entries() {
+        if entry_name == name {
+            if let (Some(test_fn), Some(cond)) = (test_function, condition) {
+                match funcall(test_fn, &[cond]) {
+                    Ok(result) if !result.is_nil() => return Some(function),
+                    _ => continue,
                 }
+            } else {
+                return Some(function);
             }
         }
-        None
-    })
+    }
+    None
 }
 
 /// Invoke a restart by its function value or name.
@@ -1135,15 +1113,16 @@ pub fn find_restart(name: BlissVal, condition: Option<BlissVal>) -> Option<Bliss
 /// a CONTROL-ERROR is signalled per §5.4.9.
 pub fn invoke_restart(restart: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
     // Look up the restart entry by function value or name.
-    let restart_entry = STATE.with(|s| {
-        let state = s.borrow();
-        for entry in state.restart_registry.iter().rev() {
-            if entry.function == restart || entry.name == restart {
-                return Some((entry.function, entry.name));
-            }
-        }
-        None
-    });
+    let restart_entry =
+        active_restart_entries()
+            .into_iter()
+            .find_map(|(name, function, _, _, _)| {
+                if function == restart || name == restart {
+                    Some((function, name))
+                } else {
+                    None
+                }
+            });
 
     // If invoking MUFFLE-WARNING, set the muffled flag so warn_condition
     // knows to suppress the warning message (issue 2 fix).
@@ -1187,15 +1166,16 @@ pub fn invoke_restart(restart: BlissVal, args: &[BlissVal]) -> Result<BlissVal, 
 /// If no interactive function is present, invokes the restart with no arguments.
 pub fn invoke_restart_interactively(restart: BlissVal) -> Result<BlissVal, BlissError> {
     // Look up the restart entry to find the interactive_function.
-    let interactive_fn = STATE.with(|s| {
-        let state = s.borrow();
-        for entry in state.restart_registry.iter().rev() {
-            if entry.function == restart || entry.name == restart {
-                return entry.interactive_function;
-            }
-        }
-        None
-    });
+    let interactive_fn =
+        active_restart_entries()
+            .into_iter()
+            .find_map(|(name, function, _, interactive, _)| {
+                if function == restart || name == restart {
+                    interactive
+                } else {
+                    None
+                }
+            });
 
     if let Some(int_fn) = interactive_fn {
         // Per A5.09: funcall the interactive function to produce an arg list.
@@ -1216,8 +1196,7 @@ pub fn invoke_restart_interactively(restart: BlissVal) -> Result<BlissVal, Bliss
 /// entering the debugger for unhandled conditions.  Set to `None` to
 /// clear the hook.
 pub fn set_debugger_hook(hook: Option<BlissVal>) {
-    STATE.with(|s| {
-        let mut state = s.borrow_mut();
+    with_state(|state| {
         state.debugger_hook = hook;
         if hook.is_none() {
             state.debugger_invoked = false;
@@ -1227,9 +1206,7 @@ pub fn set_debugger_hook(hook: Option<BlissVal>) {
 
 /// Set `*BREAK-ON-SIGNALS*`.
 pub fn set_break_on_signals(type_spec: Option<BlissVal>) {
-    STATE.with(|s| {
-        s.borrow_mut().break_on_signals = type_spec;
-    });
+    with_state(|state| state.break_on_signals = type_spec);
 }
 
 /// Invoke the debugger for an unhandled condition.
@@ -1243,17 +1220,13 @@ pub fn set_break_on_signals(type_spec: Option<BlissVal>) {
 /// Returns `Err` to indicate the debugger was entered.
 pub fn invoke_debugger(condition: BlissVal) -> Result<(), BlissError> {
     initialize_condition_runtime_support()?;
-    let hook = STATE.with(|s| {
-        let state = s.borrow();
-        state.debugger_hook
-    });
+    let hook = with_state(|state| state.debugger_hook);
 
     if let Some(hook_fn) = hook {
         // Per ANSI CL A5.11: set *DEBUGGER-HOOK* to NIL before calling
         // the hook, to prevent infinite recursion if the hook itself
         // signals an error.
-        STATE.with(|s| {
-            let mut state = s.borrow_mut();
+        with_state(|state| {
             state.debugger_hook = None;
             state.debugger_invoked = true;
         });
@@ -1287,7 +1260,9 @@ pub fn signal_storage_condition_for_runtime_error(
     match error {
         BlissError::Oom | BlissError::StackOverflow(_) => {
             let condition = acquire_preallocated_storage_condition()?;
-            signal_condition(condition)?;
+            let result = signal_condition(condition);
+            release_preallocated_storage_condition(condition);
+            result?;
             Ok(condition)
         }
         _ => Err(BlissError::Internal(
@@ -1320,7 +1295,10 @@ mod storage_pool_cas_tests {
             .collect();
         let mut got: Vec<u64> = claims.iter().map(|c| c.0).collect();
         got.sort_unstable();
-        assert_eq!(got, vec![sentinel(1).0, sentinel(2).0, sentinel(3).0, sentinel(4).0]);
+        assert_eq!(
+            got,
+            vec![sentinel(1).0, sentinel(2).0, sentinel(3).0, sentinel(4).0]
+        );
 
         // Pool exhausted → deterministic fallback to slot 0, no error.
         let fallback = acquire_preallocated_storage_condition().unwrap();

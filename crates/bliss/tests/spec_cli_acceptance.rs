@@ -478,8 +478,14 @@ fn extended_loop_supports_asdf_load_path_clauses() {
 fn write_line_and_file_length_builtins() {
     // WRITE-LINE was declared a builtin but never dispatched; FILE-LENGTH was
     // missing entirely. Both are used by ASDF's HTTP-stack dependencies.
-    assert_eq!(eval_ok("(with-output-to-string (s) (write-line \"ab\" s) (write-string \"cd\" s))"), "\"ab\ncd\"");
-    assert_eq!(eval_ok("(write-line \"x\" (make-string-output-stream))"), "\"x\"");
+    assert_eq!(
+        eval_ok("(with-output-to-string (s) (write-line \"ab\" s) (write-string \"cd\" s))"),
+        "\"ab\ncd\""
+    );
+    assert_eq!(
+        eval_ok("(write-line \"x\" (make-string-output-stream))"),
+        "\"x\""
+    );
     // FILE-LENGTH of a freshly-written file returns its element count.
     assert_eq!(
         eval_ok(
@@ -529,7 +535,9 @@ fn read_and_write_sequence_builtins() {
     // READ-SEQUENCE fills a mutable sequence (string or vector) from a stream and
     // returns the stop index; WRITE-SEQUENCE writes a bounded subsequence.
     assert_eq!(
-        eval_ok("(let ((b (make-string 5))) (with-input-from-string (s \"hello world\") (list (read-sequence b s) b)))"),
+        eval_ok(
+            "(let ((b (make-string 5))) (with-input-from-string (s \"hello world\") (list (read-sequence b s) b)))"
+        ),
         "(5 \"hello\")"
     );
     assert_eq!(
@@ -538,7 +546,9 @@ fn read_and_write_sequence_builtins() {
     );
     // Into a vector, with a short read at EOF returning the actual count.
     assert_eq!(
-        eval_ok("(let ((b (make-array 4))) (with-input-from-string (s \"xy\") (read-sequence b s)))"),
+        eval_ok(
+            "(let ((b (make-array 4))) (with-input-from-string (s \"xy\") (read-sequence b s)))"
+        ),
         "2"
     );
 }
@@ -548,7 +558,9 @@ fn typep_keyword() {
     // TYPEP had no KEYWORD case, so (typep :any 'keyword) was NIL despite
     // KEYWORDP being T — babel type-checks encoding names as keywords.
     assert_eq!(
-        eval_ok("(list (typep :utf-16 'keyword) (typep :foo 'keyword) (typep 'foo 'keyword) (typep 5 'keyword))"),
+        eval_ok(
+            "(list (typep :utf-16 'keyword) (typep :foo 'keyword) (typep 'foo 'keyword) (typep 5 'keyword))"
+        ),
         "(T T NIL NIL)"
     );
 }
@@ -569,7 +581,9 @@ fn deftype_body_is_evaluated_and_skips_docstring() {
     );
     // A plainly-quoted body form still works.
     assert_eq!(
-        eval_ok("(progn (deftype small () '(integer 0 9)) (list (typep 5 'small) (typep 10 'small)))"),
+        eval_ok(
+            "(progn (deftype small () '(integer 0 9)) (list (typep 5 'small) (typep 10 'small)))"
+        ),
         "(T NIL)"
     );
     // Parameterised deftype used bare expands with its parameters defaulted,
@@ -635,7 +649,9 @@ fn loop_for_var_with_type_spec_and_parallel_and() {
         "((0 10) (1 11) (2 12))"
     );
     assert_eq!(
-        eval_ok("(let ((s 0)) (loop for i fixnum from 0 below 5 and d fixnum from 100 do (setf s (+ s d))) s)"),
+        eval_ok(
+            "(let ((s 0)) (loop for i fixnum from 0 below 5 and d fixnum from 100 do (setf s (+ s d))) s)"
+        ),
         "510"
     );
 }
@@ -657,13 +673,21 @@ fn equal_compares_pathnames_by_components() {
     // CLHS: EQUAL on pathnames is true when their components match. bliss's
     // EQUAL returned NIL for equal pathnames, so ASDF's pathname-keyed caches
     // and comparisons never matched, breaking asdf:load-system (bliss-nad).
-    assert_eq!(eval_ok("(equal (pathname \"/a/b\") (pathname \"/a/b\"))"), "T");
-    assert_eq!(eval_ok("(equal (pathname \"/a/b\") (pathname \"/a/c\"))"), "NIL");
+    assert_eq!(
+        eval_ok("(equal (pathname \"/a/b\") (pathname \"/a/b\"))"),
+        "T"
+    );
+    assert_eq!(
+        eval_ok("(equal (pathname \"/a/b\") (pathname \"/a/c\"))"),
+        "NIL"
+    );
     // A pathname is not EQUAL to its namestring.
     assert_eq!(eval_ok("(equal (pathname \"/a/b\") \"/a/b\")"), "NIL");
     // EQUAL pathnames must hash together in an EQUAL table (already did).
     assert_eq!(
-        eval_ok("(let ((h (make-hash-table :test 'equal))) (setf (gethash (pathname \"/a/b\") h) 1) (nth-value 1 (gethash (pathname \"/a/b\") h)))"),
+        eval_ok(
+            "(let ((h (make-hash-table :test 'equal))) (setf (gethash (pathname \"/a/b\") h) 1) (nth-value 1 (gethash (pathname \"/a/b\") h)))"
+        ),
         "T"
     );
 }
@@ -694,7 +718,9 @@ fn equalp_compares_vectors_strings_chars_numbers() {
     // case-insensitively, and numbers across types. babel's define-constant
     // tables rely on this. EQUAL must stay case- and type-sensitive.
     assert_eq!(
-        eval_ok("(list (equalp #(1 2 3) #(1 2 3)) (equalp #(1 2) #(1 2 3)) (equalp \"ab\" \"AB\") (equalp #\\a #\\A) (equalp 1 1.0) (equalp '(1 #(2 3)) '(1 #(2 3))))"),
+        eval_ok(
+            "(list (equalp #(1 2 3) #(1 2 3)) (equalp #(1 2) #(1 2 3)) (equalp \"ab\" \"AB\") (equalp #\\a #\\A) (equalp 1 1.0) (equalp '(1 #(2 3)) '(1 #(2 3))))"
+        ),
         "(T NIL T T T T)"
     );
     assert_eq!(
@@ -703,7 +729,9 @@ fn equalp_compares_vectors_strings_chars_numbers() {
     );
     // Hash tables: same test, count, and EQUALP values.
     assert_eq!(
-        eval_ok("(let ((a (make-hash-table)) (b (make-hash-table)) (c (make-hash-table))) (setf (gethash 1 a) :x (gethash 1 b) :x (gethash 1 c) :y) (list (equalp a b) (equalp a c)))"),
+        eval_ok(
+            "(let ((a (make-hash-table)) (b (make-hash-table)) (c (make-hash-table))) (setf (gethash 1 a) :x (gethash 1 b) :x (gethash 1 c) :y) (list (equalp a b) (equalp a c)))"
+        ),
         "(T NIL)"
     );
 }
@@ -711,13 +739,17 @@ fn equalp_compares_vectors_strings_chars_numbers() {
 #[test]
 fn constantp_recognizes_constant_forms() {
     assert_eq!(
-        eval_ok("(list (constantp 5) (constantp :k) (constantp t) (constantp nil) (constantp '(quote x)) (constantp 'foo) (constantp '(+ 1 2)))"),
+        eval_ok(
+            "(list (constantp 5) (constantp :k) (constantp t) (constantp nil) (constantp '(quote x)) (constantp 'foo) (constantp '(+ 1 2)))"
+        ),
         "(T T T T T NIL NIL)"
     );
     // A DEFCONSTANT'd symbol is recognised as constant (alexandria's
     // define-constant / babel rely on this); a defparameter is not.
     assert_eq!(
-        eval_ok("(progn (defconstant +kk+ 42) (defparameter *pp* 1) (list (constantp '+kk+) (constantp '*pp*)))"),
+        eval_ok(
+            "(progn (defconstant +kk+ 42) (defparameter *pp* 1) (list (constantp '+kk+) (constantp '*pp*)))"
+        ),
         "(T NIL)"
     );
 }
@@ -776,7 +808,9 @@ fn sharp_quote_local_flet_labels_function_is_callable() {
     );
     // Also correct after promotion to the native tier (was a T1 crash).
     assert_eq!(
-        eval_ok("(progn (defun fq (x) (flet ((g (y) (* y y))) (funcall #'g x))) (dotimes (i 3000) (fq 2)) (fq 9))"),
+        eval_ok(
+            "(progn (defun fq (x) (flet ((g (y) (* y y))) (funcall #'g x))) (dotimes (i 3000) (fq 2)) (fq 9))"
+        ),
         "81"
     );
 }
@@ -788,16 +822,22 @@ fn conditions_princ_to_their_report_string() {
     // #<UNDEFINED-FUNCTION> with no name, making failed ASDF compiles (missing
     // builtins) undiagnosable.
     assert_eq!(
-        eval_ok("(format nil \"~a\" (handler-case (funcall (read-from-string \"no-such-fn\")) (undefined-function (e) e)))"),
+        eval_ok(
+            "(format nil \"~a\" (handler-case (funcall (read-from-string \"no-such-fn\")) (undefined-function (e) e)))"
+        ),
         "\"The function NO-SUCH-FN is undefined.\""
     );
     assert_eq!(
-        eval_ok("(format nil \"~a\" (handler-case (symbol-value 'no-such-var) (unbound-variable (e) e)))"),
+        eval_ok(
+            "(format nil \"~a\" (handler-case (symbol-value 'no-such-var) (unbound-variable (e) e)))"
+        ),
         "\"The variable NO-SUCH-VAR is unbound.\""
     );
     // ~S stays the opaque object form.
     assert_eq!(
-        eval_ok("(format nil \"~s\" (handler-case (funcall (read-from-string \"nope-fn\")) (undefined-function (e) e)))"),
+        eval_ok(
+            "(format nil \"~s\" (handler-case (funcall (read-from-string \"nope-fn\")) (undefined-function (e) e)))"
+        ),
         "\"#<UNDEFINED-FUNCTION>\""
     );
 }
@@ -948,10 +988,7 @@ fn stage_one_gate_programs_run_through_the_real_cli() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout).to_uppercase();
-    assert!(
-        stdout.contains("6765"),
-        "fib output missing from: {stdout}"
-    );
+    assert!(stdout.contains("6765"), "fib output missing from: {stdout}");
     assert!(
         stdout.contains("(1 4 9 16)"),
         "mapcar/lambda output missing from: {stdout}"
@@ -1169,7 +1206,10 @@ fn stage_five_gate_hot_loop_promotes_through_tiers_and_deopts_with_identical_res
     let t0_out = String::from_utf8_lossy(&t0.stdout);
 
     let results = |s: &str| -> Vec<String> {
-        s.lines().filter(|l| l.starts_with("RESULT ")).map(str::to_string).collect()
+        s.lines()
+            .filter(|l| l.starts_with("RESULT "))
+            .map(str::to_string)
+            .collect()
     };
     // Identical results at each tier — the heart of the gate.
     assert_eq!(
@@ -1177,7 +1217,10 @@ fn stage_five_gate_hot_loop_promotes_through_tiers_and_deopts_with_identical_res
         results(&t0_out),
         "hot-loop and deopt results must be identical across tiers\nT1:\n{t1_out}\nT0:\n{t0_out}"
     );
-    assert!(!results(&t1_out).is_empty(), "expected RESULT lines: {t1_out}");
+    assert!(
+        !results(&t1_out).is_empty(),
+        "expected RESULT lines: {t1_out}"
+    );
 
     // The forced run must observe the promotion and at least one deopt.
     assert!(
@@ -1189,7 +1232,10 @@ fn stage_five_gate_hot_loop_promotes_through_tiers_and_deopts_with_identical_res
         .find_map(|l| l.strip_prefix("DEOPTS "))
         .and_then(|n| n.trim().parse().ok())
         .expect("DEOPTS line present");
-    assert!(deopts >= 1, "the overflow must trigger a deoptimization: {t1_out}");
+    assert!(
+        deopts >= 1,
+        "the overflow must trigger a deoptimization: {t1_out}"
+    );
 
     fs::remove_dir_all(dir).ok();
 }
@@ -1657,7 +1703,9 @@ fn condition_standard_type_error_accessors() {
 #[test]
 fn condition_simple_condition_format_control_accessor() {
     assert_eq!(
-        eval_ok("(handler-case (error \"boom\") (simple-error (c) (simple-condition-format-control c)))"),
+        eval_ok(
+            "(handler-case (error \"boom\") (simple-error (c) (simple-condition-format-control c)))"
+        ),
         "\"boom\""
     );
 }
@@ -1682,21 +1730,33 @@ fn format_aesthetic_prints_lists() {
 
 #[test]
 fn format_nested_and_dotted_lists() {
-    assert_eq!(eval_ok("(format nil \"~a\" '(a (b c) d))"), "\"(A (B C) D)\"");
+    assert_eq!(
+        eval_ok("(format nil \"~a\" '(a (b c) d))"),
+        "\"(A (B C) D)\""
+    );
     assert_eq!(eval_ok("(format nil \"~a\" (cons 1 2))"), "\"(1 . 2)\"");
 }
 
 #[test]
 fn format_standard_escapes_strings_inside_lists() {
     // ~S escapes strings/symbols recursively; ~A does not escape strings.
-    assert_eq!(eval_ok("(format nil \"~s\" (list \"a\" 'b 3))"), "\"(\\\"a\\\" B 3)\"");
-    assert_eq!(eval_ok("(format nil \"~a\" (list \"x\" \"y\"))"), "\"(x y)\"");
+    assert_eq!(
+        eval_ok("(format nil \"~s\" (list \"a\" 'b 3))"),
+        "\"(\\\"a\\\" B 3)\""
+    );
+    assert_eq!(
+        eval_ok("(format nil \"~a\" (list \"x\" \"y\"))"),
+        "\"(x y)\""
+    );
 }
 
 #[test]
 fn printers_princ_and_prin1_to_string_handle_lists() {
     assert_eq!(eval_ok("(princ-to-string (list 1 2 3))"), "\"(1 2 3)\"");
-    assert_eq!(eval_ok("(prin1-to-string (list \"a\" 'b))"), "\"(\\\"a\\\" B)\"");
+    assert_eq!(
+        eval_ok("(prin1-to-string (list \"a\" 'b))"),
+        "\"(\\\"a\\\" B)\""
+    );
 }
 
 #[test]
@@ -1725,9 +1785,14 @@ fn clos_integer_specializer_does_not_capture_instances() {
 
 #[test]
 fn macro_typecase_dispatches_on_type() {
-    assert_eq!(eval_ok("(typecase 5 (string 's) (integer 'i) (t 'other))"), "I");
     assert_eq!(
-        eval_ok("(progn (defclass a () ()) (typecase (make-instance 'a) (integer 'i) (a 'is-a) (t 'other)))"),
+        eval_ok("(typecase 5 (string 's) (integer 'i) (t 'other))"),
+        "I"
+    );
+    assert_eq!(
+        eval_ok(
+            "(progn (defclass a () ()) (typecase (make-instance 'a) (integer 'i) (a 'is-a) (t 'other)))"
+        ),
         "IS-A"
     );
 }
@@ -1766,11 +1831,15 @@ fn clos_find_class_and_class_name_roundtrip() {
 #[test]
 fn clos_slot_exists_p_and_slot_makunbound() {
     assert_eq!(
-        eval_ok("(progn (defclass a () ((x))) (list (slot-exists-p (make-instance 'a) 'x) (slot-exists-p (make-instance 'a) 'y)))"),
+        eval_ok(
+            "(progn (defclass a () ((x))) (list (slot-exists-p (make-instance 'a) 'x) (slot-exists-p (make-instance 'a) 'y)))"
+        ),
         "(T NIL)"
     );
     assert_eq!(
-        eval_ok("(progn (defclass a () ((x :initform 1))) (let ((o (make-instance 'a))) (slot-makunbound o 'x) (slot-boundp o 'x)))"),
+        eval_ok(
+            "(progn (defclass a () ((x :initform 1))) (let ((o (make-instance 'a))) (slot-makunbound o 'x) (slot-boundp o 'x)))"
+        ),
         "NIL"
     );
 }
@@ -1786,7 +1855,9 @@ fn clos_method_lambda_list_supports_optional_rest_key() {
         "(5 (6 7))"
     );
     assert_eq!(
-        eval_ok("(progn (defmethod g ((x integer) &key (scale 1)) (* x scale)) (list (g 5) (g 5 :scale 3)))"),
+        eval_ok(
+            "(progn (defmethod g ((x integer) &key (scale 1)) (* x scale)) (list (g 5) (g 5 :scale 3)))"
+        ),
         "(5 15)"
     );
 }
@@ -1808,17 +1879,23 @@ fn definitions_inside_loops_persist_globally() {
     // keep the shared global tables mutable in place, so definitions made in
     // their body (intern, use-package, defun) persist after the loop.
     assert_eq!(
-        eval_ok("(progn (make-package \"LP\") (dolist (n '(\"A\")) (intern n \"LP\")) (nth-value 1 (find-symbol \"A\" \"LP\")))"),
+        eval_ok(
+            "(progn (make-package \"LP\") (dolist (n '(\"A\")) (intern n \"LP\")) (nth-value 1 (find-symbol \"A\" \"LP\")))"
+        ),
         ":INTERNAL"
     );
     assert_eq!(
-        eval_ok("(progn (make-package \"LP2\") (loop for n in '(\"A\") do (intern n \"LP2\")) (nth-value 1 (find-symbol \"A\" \"LP2\")))"),
+        eval_ok(
+            "(progn (make-package \"LP2\") (loop for n in '(\"A\") do (intern n \"LP2\")) (nth-value 1 (find-symbol \"A\" \"LP2\")))"
+        ),
         ":INTERNAL"
     );
     // PACKAGE-USE-LIST returns package OBJECTS (CLHS; bliss-bhs first-class
     // packages), so map through PACKAGE-NAME to check the persisted use.
     assert_eq!(
-        eval_ok("(progn (defpackage :usrc (:export #:uq)) (make-package \"UDST\") (dolist (p '(\"UDST\")) (use-package :usrc p)) (mapcar #'package-name (package-use-list (find-package \"UDST\"))))"),
+        eval_ok(
+            "(progn (defpackage :usrc (:export #:uq)) (make-package \"UDST\") (dolist (p '(\"UDST\")) (use-package :usrc p)) (mapcar #'package-name (package-use-list (find-package \"UDST\"))))"
+        ),
         "(\"USRC\")"
     );
 }
@@ -1827,7 +1904,10 @@ fn definitions_inside_loops_persist_globally() {
 fn uninterned_symbol_names_resolve() {
     // #: uninterned symbols and make-symbol must carry a resolvable name.
     assert_eq!(eval_ok("(string '#:foo)"), "\"FOO\"");
-    assert_eq!(eval_ok("(symbol-name (make-symbol \"HELLO\"))"), "\"HELLO\"");
+    assert_eq!(
+        eval_ok("(symbol-name (make-symbol \"HELLO\"))"),
+        "\"HELLO\""
+    );
     assert_eq!(eval_ok("(eq '#:a '#:a)"), "NIL");
 }
 
@@ -1838,11 +1918,15 @@ fn defpackage_export_and_import_from_are_interned() {
         ":EXTERNAL"
     );
     assert_eq!(
-        eval_ok("(progn (defpackage :isrc (:export #:sfoo)) (defpackage :idst (:import-from :isrc #:sfoo)) (nth-value 1 (find-symbol \"SFOO\" :idst)))"),
+        eval_ok(
+            "(progn (defpackage :isrc (:export #:sfoo)) (defpackage :idst (:import-from :isrc #:sfoo)) (nth-value 1 (find-symbol \"SFOO\" :idst)))"
+        ),
         ":INTERNAL"
     );
     assert_eq!(
-        eval_ok("(progn (defpackage :dx (:export #:a #:b)) (let (r) (do-external-symbols (s :dx) (push (string s) r)) (sort r #'string<)))"),
+        eval_ok(
+            "(progn (defpackage :dx (:export #:a #:b)) (let (r) (do-external-symbols (s :dx) (push (string s) r)) (sort r #'string<)))"
+        ),
         "(\"A\" \"B\")"
     );
 }
@@ -1861,7 +1945,9 @@ fn iteration_variables_shadow_outer_bindings() {
         "NIL"
     );
     assert_eq!(
-        eval_ok("(progn (defun g (name) (let ((r nil)) (dolist (name '(:a :b) (reverse r)) (push name r)))) (g :outer))"),
+        eval_ok(
+            "(progn (defun g (name) (let ((r nil)) (dolist (name '(:a :b) (reverse r)) (push name r)))) (g :outer))"
+        ),
         "(:A :B)"
     );
 }
@@ -1869,8 +1955,14 @@ fn iteration_variables_shadow_outer_bindings() {
 #[test]
 fn dolist_and_dotimes_establish_fresh_scope() {
     // The iteration variable does not leak past the loop.
-    assert_eq!(eval_ok("(let ((x :outer)) (dolist (x '(1 2)) nil) x)"), ":OUTER");
-    assert_eq!(eval_ok("(let ((i :outer)) (dotimes (i 3) nil) i)"), ":OUTER");
+    assert_eq!(
+        eval_ok("(let ((x :outer)) (dolist (x '(1 2)) nil) x)"),
+        ":OUTER"
+    );
+    assert_eq!(
+        eval_ok("(let ((i :outer)) (dotimes (i 3) nil) i)"),
+        ":OUTER"
+    );
 }
 
 #[test]
@@ -1906,7 +1998,10 @@ fn symbol_package_reports_real_package() {
     // (bliss-bhs: first-class packages).
     assert_eq!(eval_ok("(symbol-package :foo)"), "#<PACKAGE KEYWORD>");
     assert_eq!(eval_ok("(symbol-package 'car)"), "#<PACKAGE COMMON-LISP>");
-    assert_eq!(eval_ok("(package-name (symbol-package 'car))"), "\"COMMON-LISP\"");
+    assert_eq!(
+        eval_ok("(package-name (symbol-package 'car))"),
+        "\"COMMON-LISP\""
+    );
 }
 
 #[test]
@@ -1926,7 +2021,10 @@ fn find_symbol_resolves_package_nicknames_and_two_values() {
 
 #[test]
 fn find_package_resolves_nicknames() {
-    assert_eq!(eval_ok("(package-name (find-package :cl))"), "\"COMMON-LISP\"");
+    assert_eq!(
+        eval_ok("(package-name (find-package :cl))"),
+        "\"COMMON-LISP\""
+    );
     assert_eq!(
         eval_ok("(package-name (find-package :cl-user))"),
         "\"COMMON-LISP-USER\""
@@ -1942,11 +2040,15 @@ fn packagep_predicate() {
 #[test]
 fn defpackage_nicknames_are_registered_and_resolvable() {
     assert_eq!(
-        eval_ok("(progn (defpackage :foopkg (:nicknames :fp :foolib) (:use :cl)) (package-name (find-package :foolib)))"),
+        eval_ok(
+            "(progn (defpackage :foopkg (:nicknames :fp :foolib) (:use :cl)) (package-name (find-package :foolib)))"
+        ),
         "\"FOOPKG\""
     );
     assert_eq!(
-        eval_ok("(progn (defpackage :barpkg (:nicknames :bp)) (package-nicknames (find-package :barpkg)))"),
+        eval_ok(
+            "(progn (defpackage :barpkg (:nicknames :bp)) (package-nicknames (find-package :barpkg)))"
+        ),
         "(\"BP\")"
     );
 }
@@ -1954,7 +2056,9 @@ fn defpackage_nicknames_are_registered_and_resolvable() {
 #[test]
 fn make_package_with_nicknames() {
     assert_eq!(
-        eval_ok("(progn (make-package \"MYPKG\" :nicknames '(\"MP\")) (package-name (find-package :mp)))"),
+        eval_ok(
+            "(progn (make-package \"MYPKG\" :nicknames '(\"MP\")) (package-name (find-package :mp)))"
+        ),
         "\"MYPKG\""
     );
 }
@@ -1975,7 +2079,7 @@ fn package_storage_is_registry_backed() {
                    (package-name p)                                ; \"S4\"
                    (mapcar #'package-name (package-use-list p))    ; (\"COMMON-LISP\")
                    (nth-value 1 (find-symbol \"FOO\" :s4))         ; :EXTERNAL
-                   (nth-value 1 (find-symbol \"CAR\" :s4)))))"      // :INHERITED from CL
+                   (nth-value 1 (find-symbol \"CAR\" :s4)))))" // :INHERITED from CL
         ),
         "(T T \"S4\" (\"COMMON-LISP\") :EXTERNAL :INHERITED)"
     );
@@ -1985,7 +2089,7 @@ fn package_storage_is_registry_backed() {
             "(progn (make-package \"OLDP\" :nicknames '(\"OP\"))
                     (rename-package :oldp \"NEWP\" '(\"NP\"))
                     (list (find-package :oldp)          ; NIL — old name gone
-                          (package-name (find-package :np))))"  // \"NEWP\" via new nick
+                          (package-name (find-package :np))))" // \"NEWP\" via new nick
         ),
         "(NIL \"NEWP\")"
     );
@@ -2005,11 +2109,15 @@ fn macro_lambda_list_supports_nested_destructuring() {
         "3"
     );
     assert_eq!(
-        eval_ok("(progn (defmacro foo ((&optional x) &rest body) `(list ,x ,@body)) (foo (5) 6 7))"),
+        eval_ok(
+            "(progn (defmacro foo ((&optional x) &rest body) `(list ,x ,@body)) (foo (5) 6 7))"
+        ),
         "(5 6 7)"
     );
     assert_eq!(
-        eval_ok("(progn (defmacro bar ((&key (v 10)) &body body) `(list ,v ,@body)) (list (bar () 1) (bar (:v 99) 2)))"),
+        eval_ok(
+            "(progn (defmacro bar ((&key (v 10)) &body body) `(list ,v ,@body)) (list (bar () 1) (bar (:v 99) 2)))"
+        ),
         "((10 1) (99 2))"
     );
 }
@@ -2017,12 +2125,16 @@ fn macro_lambda_list_supports_nested_destructuring() {
 #[test]
 fn macro_lambda_list_deeply_nested_destructuring() {
     assert_eq!(
-        eval_ok("(progn (defmacro d ((a (b &optional c)) &body body) `(list ,a ,b ,c ,@body)) (d (1 (2 3)) 9))"),
+        eval_ok(
+            "(progn (defmacro d ((a (b &optional c)) &body body) `(list ,a ,b ,c ,@body)) (d (1 (2 3)) 9))"
+        ),
         "(1 2 3 9)"
     );
     // Missing optional in the nested pattern defaults to NIL.
     assert_eq!(
-        eval_ok("(progn (defmacro d ((a (b &optional c)) &body body) `(list ,a ,b ,c ,@body)) (d (1 (2)) 9))"),
+        eval_ok(
+            "(progn (defmacro d ((a (b &optional c)) &body body) `(list ,a ,b ,c ,@body)) (d (1 (2)) 9))"
+        ),
         "(1 2 NIL 9)"
     );
 }
@@ -2085,7 +2197,9 @@ fn condition_format_control_uses_stdlib_format() {
 #[test]
 fn instance_without_report_prints_as_class_tag() {
     assert_eq!(
-        eval_ok("(progn (defclass point () ((x :initarg :x))) (format nil \"~a\" (make-instance 'point :x 1)))"),
+        eval_ok(
+            "(progn (defclass point () ((x :initarg :x))) (format nil \"~a\" (make-instance 'point :x 1)))"
+        ),
         "\"#<POINT>\""
     );
     assert_eq!(
@@ -2097,7 +2211,9 @@ fn instance_without_report_prints_as_class_tag() {
 #[test]
 fn defstruct_constructor_and_accessors() {
     assert_eq!(
-        eval_ok("(progn (defstruct point x y) (let ((p (make-point :x 1 :y 2))) (list (point-x p) (point-y p))))"),
+        eval_ok(
+            "(progn (defstruct point x y) (let ((p (make-point :x 1 :y 2))) (list (point-x p) (point-y p))))"
+        ),
         "(1 2)"
     );
 }
@@ -2105,10 +2221,15 @@ fn defstruct_constructor_and_accessors() {
 #[test]
 fn defstruct_slot_defaults_are_evaluated() {
     assert_eq!(
-        eval_ok("(progn (defstruct pt (x 0) (y 10)) (let ((p (make-pt :x 5))) (list (pt-x p) (pt-y p))))"),
+        eval_ok(
+            "(progn (defstruct pt (x 0) (y 10)) (let ((p (make-pt :x 5))) (list (pt-x p) (pt-y p))))"
+        ),
         "(5 10)"
     );
-    assert_eq!(eval_ok("(progn (defstruct pt (x (+ 2 3))) (pt-x (make-pt)))"), "5");
+    assert_eq!(
+        eval_ok("(progn (defstruct pt (x (+ 2 3))) (pt-x (make-pt)))"),
+        "5"
+    );
 }
 
 #[test]
@@ -2117,7 +2238,10 @@ fn defstruct_predicate_and_typep() {
         eval_ok("(progn (defstruct pt x) (list (pt-p (make-pt :x 1)) (pt-p 5)))"),
         "(T NIL)"
     );
-    assert_eq!(eval_ok("(progn (defstruct pt x) (typep (make-pt :x 1) 'pt))"), "T");
+    assert_eq!(
+        eval_ok("(progn (defstruct pt x) (typep (make-pt :x 1) 'pt))"),
+        "T"
+    );
 }
 
 #[test]

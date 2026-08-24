@@ -1,11 +1,11 @@
 //! Tests for bliss-stdlib conditions module (spec §5.4).
 use bliss_rt::value::{BlissVal, NIL};
+use bliss_rt::{BlissError, FrameType, current_stack};
 use bliss_stdlib::conditions::*;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    Mutex,
 };
 
 fn sym(i: u32) -> BlissVal {
@@ -52,6 +52,45 @@ fn condition_values_participate_in_the_root_and_error_hierarchies() {
 #[test]
 fn signal_no_handler_ok() {
     assert!(signal_condition(make_simple_error("t", &[])).is_ok());
+}
+
+#[test]
+fn handler_bind_establishes_a_bliss_stack_cluster_frame() {
+    let stack = current_stack();
+    let before = stack.frame_depth();
+
+    handler_bind_fn(&[(sym(*SYMBOL_ERROR), fx(99))], || {
+        assert_eq!(stack.frame_depth(), before + 1);
+        let frame = stack.fp();
+        assert_eq!(unsafe { (*frame).frame_type() }, FrameType::Special);
+        Ok(NIL)
+    })
+    .unwrap();
+
+    assert_eq!(stack.frame_depth(), before);
+}
+
+#[test]
+fn restart_bind_establishes_a_bliss_stack_cluster_frame() {
+    let stack = current_stack();
+    let before = stack.frame_depth();
+    let spec = RestartSpec {
+        name: sym(71),
+        function: fx(72),
+        report_function: Some(fx(73)),
+        interactive_function: Some(fx(74)),
+        test_function: Some(fx(75)),
+    };
+
+    restart_bind_fn(&[spec], || {
+        assert_eq!(stack.frame_depth(), before + 1);
+        let frame = stack.fp();
+        assert_eq!(unsafe { (*frame).frame_type() }, FrameType::Special);
+        Ok(NIL)
+    })
+    .unwrap();
+
+    assert_eq!(stack.frame_depth(), before);
 }
 
 // Issue 10: error_condition_with_debugger_hook must verify the hook was actually called.
@@ -430,6 +469,48 @@ fn cleanup_runs_when_handler_transfer_unwinds_the_dynamic_extent() {
 }
 
 #[test]
+fn handler_cluster_descriptor_is_restored_when_body_unwinds() {
+    let before = bliss_rt::thread::current_condition_state_snapshot();
+
+    let unwound = panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = handler_bind_fn(
+            &[(sym(*SYMBOL_ERROR), fx(81))],
+            || -> Result<BlissVal, BlissError> {
+                panic!("leave handler dynamic extent");
+            },
+        );
+    }));
+
+    assert!(unwound.is_err());
+    let after = bliss_rt::thread::current_condition_state_snapshot();
+    assert_eq!(after.handler_depth, before.handler_depth);
+    assert_eq!(after.restart_depth, before.restart_depth);
+}
+
+#[test]
+fn restart_cluster_descriptor_is_restored_when_body_unwinds() {
+    let before = bliss_rt::thread::current_condition_state_snapshot();
+    let spec = RestartSpec {
+        name: sym(82),
+        function: fx(83),
+        report_function: None,
+        interactive_function: None,
+        test_function: None,
+    };
+
+    let unwound = panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = restart_bind_fn(&[spec], || -> Result<BlissVal, BlissError> {
+            panic!("leave restart dynamic extent");
+        });
+    }));
+
+    assert!(unwound.is_err());
+    let after = bliss_rt::thread::current_condition_state_snapshot();
+    assert_eq!(after.handler_depth, before.handler_depth);
+    assert_eq!(after.restart_depth, before.restart_depth);
+}
+
+#[test]
 fn break_on_signals_invokes_break_before_handler_search() {
     let hook = fx(81);
     let handler = fx(82);
@@ -451,11 +532,13 @@ fn break_on_signals_invokes_break_before_handler_search() {
 
     // Per R5.203, BREAK must run before the normal handler search when the
     // signalled condition matches *BREAK-ON-SIGNALS*.
-    assert!(handler_bind_fn(&[(sym(*SYMBOL_ERROR), handler)], || {
-        signal_condition(make_simple_error("debug", &[]))?;
-        Ok(NIL)
-    })
-    .is_ok());
+    assert!(
+        handler_bind_fn(&[(sym(*SYMBOL_ERROR), handler)], || {
+            signal_condition(make_simple_error("debug", &[]))?;
+            Ok(NIL)
+        })
+        .is_ok()
+    );
     assert_eq!(&*seen.lock().unwrap(), &["break", "handler"]);
 
     set_break_on_signals(None);

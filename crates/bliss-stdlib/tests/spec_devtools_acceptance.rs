@@ -108,8 +108,8 @@ fn ide_protocol_uses_vendored_slynk_library_not_rust_swank_server() {
     assert!(slynk.join("backend/bliss.lisp").is_file());
     assert!(slynk.join("start-slynk.lisp").is_file());
 
-    let start_slynk = std::fs::read_to_string(slynk.join("start-slynk.lisp"))
-        .expect("read start-slynk.lisp");
+    let start_slynk =
+        std::fs::read_to_string(slynk.join("start-slynk.lisp")).expect("read start-slynk.lisp");
     assert!(start_slynk.contains("slynk:create-server"));
 
     let devtools = std::fs::read_to_string(repo_root.join("crates/bliss-stdlib/src/devtools.rs"))

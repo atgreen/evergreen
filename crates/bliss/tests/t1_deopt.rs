@@ -22,7 +22,11 @@ fn eval(program: &str, envs: &[(&str, &str)]) -> String {
         cmd.env(k, v);
     }
     let out = cmd.output().expect("spawn bliss-cli");
-    String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").to_string()
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// The T1 (threshold=1) output must equal the tree-walker output.
@@ -201,7 +205,10 @@ fn single_float_loop_deopts_but_stays_correct() {
     let out = eval(program, &[("BLISS_T1_THRESHOLD", "2")]);
     let fields: Vec<&str> = out.split_whitespace().collect();
     let deopts: u32 = fields.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    assert!(deopts >= 1, "single-float loop must deopt under fixnum-only T1: {out:?}");
+    assert!(
+        deopts >= 1,
+        "single-float loop must deopt under fixnum-only T1: {out:?}"
+    );
     // 1.5 added 100 times = 150.0 — correct despite the deopt to the interpreter.
     let tw_val = eval(
         "(defun fsum (n) (let ((s 0.0) (i 0)) \
@@ -209,7 +216,11 @@ fn single_float_loop_deopts_but_stays_correct() {
          (format t \"~a~%\" (fsum 100))",
         &[("BLISS_BACKEND", "tree-walker")],
     );
-    assert_eq!(fields.get(1).copied(), Some(tw_val.as_str()), "result matches interpretation despite deopt");
+    assert_eq!(
+        fields.get(1).copied(),
+        Some(tw_val.as_str()),
+        "result matches interpretation despite deopt"
+    );
 }
 
 /// The deopt counter is observable and increments only on an actual
@@ -249,10 +260,22 @@ fn hot_speculative_loop_no_deopt() {
                 (sumsq 100))";
     let out = eval(program, &[("BLISS_T1_THRESHOLD", "2")]);
     let fields: Vec<&str> = out.split_whitespace().collect();
-    assert_eq!(fields.first().copied(), Some("1"), "loop must reach T1: {out:?}");
-    assert_eq!(fields.get(1).copied(), Some("0"), "pure fixnum loop must not deopt: {out:?}");
+    assert_eq!(
+        fields.first().copied(),
+        Some("1"),
+        "loop must reach T1: {out:?}"
+    );
+    assert_eq!(
+        fields.get(1).copied(),
+        Some("0"),
+        "pure fixnum loop must not deopt: {out:?}"
+    );
     // sum of i*i for i in 0..99 = 328350
-    assert_eq!(fields.get(2).copied(), Some("328350"), "result must match interpretation");
+    assert_eq!(
+        fields.get(2).copied(),
+        Some("328350"),
+        "result must match interpretation"
+    );
 }
 
 /// A function that keeps deoptimizing (always called outside its speculated
@@ -273,18 +296,36 @@ fn repeated_deopts_blacklist_and_back_off_to_t0() {
                 (bliss-ext:function-tier (quote g)) \
                 (bliss-ext:deopt-count) \
                 (g 3.0 4.0))";
-    let out = eval(program, &[("BLISS_T1_THRESHOLD", "2"), ("BLISS_DEOPT_BLACKLIST_THRESHOLD", "3")]);
+    let out = eval(
+        program,
+        &[
+            ("BLISS_T1_THRESHOLD", "2"),
+            ("BLISS_DEOPT_BLACKLIST_THRESHOLD", "3"),
+        ],
+    );
     let fields: Vec<&str> = out.split_whitespace().collect();
-    assert_eq!(fields.first().copied(), Some("0"), "blacklisted function drops to T0: {out:?}");
+    assert_eq!(
+        fields.first().copied(),
+        Some("0"),
+        "blacklisted function drops to T0: {out:?}"
+    );
     // The count stops at the threshold: once blacklisted there is no native code
     // left to deopt, so the six float calls produce exactly three deopts.
-    assert_eq!(fields.get(1).copied(), Some("3"), "deopt count plateaus at threshold: {out:?}");
+    assert_eq!(
+        fields.get(1).copied(),
+        Some("3"),
+        "deopt count plateaus at threshold: {out:?}"
+    );
     // (+ (* 3.0 3.0) (* 4.0 4.0)) = 25.0, printed as the tree-walker prints it.
     let tw_val = eval(
         "(defun g (a b) (+ (* a a) (* b b))) (format t \"~a~%\" (g 3.0 4.0))",
         &[("BLISS_BACKEND", "tree-walker")],
     );
-    assert_eq!(fields.get(2).copied(), Some(tw_val.as_str()), "result stays correct after blacklist");
+    assert_eq!(
+        fields.get(2).copied(),
+        Some(tw_val.as_str()),
+        "result stays correct after blacklist"
+    );
 }
 
 /// Blacklisting is not triggered by a pure fixnum hot loop: it never deopts, so
@@ -301,9 +342,23 @@ fn pure_fixnum_loop_is_never_blacklisted() {
                 (bliss-ext:function-tier (quote sumsq)) \
                 (bliss-ext:deopt-count) \
                 (sumsq 100))";
-    let out = eval(program, &[("BLISS_T1_THRESHOLD", "2"), ("BLISS_DEOPT_BLACKLIST_THRESHOLD", "3")]);
+    let out = eval(
+        program,
+        &[
+            ("BLISS_T1_THRESHOLD", "2"),
+            ("BLISS_DEOPT_BLACKLIST_THRESHOLD", "3"),
+        ],
+    );
     let fields: Vec<&str> = out.split_whitespace().collect();
-    assert_eq!(fields.first().copied(), Some("1"), "fixnum loop stays T1: {out:?}");
-    assert_eq!(fields.get(1).copied(), Some("0"), "fixnum loop never deopts: {out:?}");
+    assert_eq!(
+        fields.first().copied(),
+        Some("1"),
+        "fixnum loop stays T1: {out:?}"
+    );
+    assert_eq!(
+        fields.get(1).copied(),
+        Some("0"),
+        "fixnum loop never deopts: {out:?}"
+    );
     assert_eq!(fields.get(2).copied(), Some("328350"), "result correct");
 }

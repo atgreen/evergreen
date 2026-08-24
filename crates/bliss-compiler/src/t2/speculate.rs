@@ -130,7 +130,12 @@ fn result_type(s: SpecType) -> IRType {
 }
 
 fn frame_state_bcp(f: &Function, fs: FrameStateId) -> u32 {
-    f.frame_states.get(fs).scopes.last().map(|s| s.bcp).unwrap_or(0)
+    f.frame_states
+        .get(fs)
+        .scopes
+        .last()
+        .map(|s| s.bcp)
+        .unwrap_or(0)
 }
 
 /// Resolve a numeric specialization entirely from SSA types. This is the path
@@ -138,9 +143,8 @@ fn frame_state_bcp(f: &Function, fs: FrameStateId) -> u32 {
 /// can never contradict the source assertion. A fixnum constant participates
 /// in a single-float operation through CL float contagion.
 fn statically_proven_spec_type(f: &Function, args: &[crate::t2::ir::Value]) -> Option<SpecType> {
-    let subset = |bits: TypeBits, allowed: TypeBits| {
-        !bits.is_bottom() && bits.meet(allowed) == bits
-    };
+    let subset =
+        |bits: TypeBits, allowed: TypeBits| !bits.is_bottom() && bits.meet(allowed) == bits;
     if !args.is_empty()
         && args
             .iter()
@@ -231,7 +235,11 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
             // No longer a generic call/safepoint — now a deopt point: guard-flagged
             // and ordered (effectful), keeping its FrameState so a wrong type or
             // overflow resumes the interpreter. `aux`/`frame_state` are retained.
-            data.flags = InstFlags { guard: true, effectful: true, ..InstFlags::default() };
+            data.flags = InstFlags {
+                guard: true,
+                effectful: true,
+                ..InstFlags::default()
+            };
         }
         for r in results {
             f.refine_type(r, ty);
@@ -255,7 +263,12 @@ mod tests {
         let b = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
 
         let fs = f.frame_states.add(FrameState {
-            scopes: vec![FrameScope { function: 0, bcp: 2, locals: vec![], stack: vec![] }],
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 2,
+                locals: vec![],
+                stack: vec![],
+            }],
             remat: vec![],
         });
         let star = bliss_rt::symbols::intern("*");
@@ -266,7 +279,12 @@ mod tests {
                 args: vec![a, b],
                 results: vec![],
                 aux: AuxData::CallTarget(star),
-                flags: InstFlags { call: true, effectful: true, safepoint: true, ..Default::default() },
+                flags: InstFlags {
+                    call: true,
+                    effectful: true,
+                    safepoint: true,
+                    ..Default::default()
+                },
                 targets: vec![],
                 frame_state: Some(fs),
                 source_pos: 0,
@@ -292,11 +310,24 @@ mod tests {
     #[test]
     fn fixnum_site_becomes_guarded_fixnum_mul() {
         let (mut f, call) = build_star();
-        let n = speculate(&mut f, &|bcp| if bcp == 2 { Some(SpecType::Fixnum) } else { None });
+        let n = speculate(&mut f, &|bcp| {
+            if bcp == 2 {
+                Some(SpecType::Fixnum)
+            } else {
+                None
+            }
+        });
         assert_eq!(n, 1);
         let inst = f.inst(call);
-        assert_eq!(inst.opcode, Opcode::FixnumMul, "* speculated fixnum → FixnumMul");
-        assert!(inst.flags.guard, "typed op must be guard-flagged (deopt point)");
+        assert_eq!(
+            inst.opcode,
+            Opcode::FixnumMul,
+            "* speculated fixnum → FixnumMul"
+        );
+        assert!(
+            inst.flags.guard,
+            "typed op must be guard-flagged (deopt point)"
+        );
         assert!(!inst.flags.call, "no longer a generic call");
         assert!(inst.frame_state.is_some(), "keeps the deopt FrameState");
         assert!(f.value(inst.results[0]).ty.bits.contains(TypeBits::FIXNUM));
@@ -309,7 +340,11 @@ mod tests {
         let (mut f, call) = build_star();
         let n = speculate(&mut f, &|_| Some(SpecType::SingleFloat));
         assert_eq!(n, 1);
-        assert_eq!(f.inst(call).opcode, Opcode::FloatMul, "* speculated float → FloatMul");
+        assert_eq!(
+            f.inst(call).opcode,
+            Opcode::FloatMul,
+            "* speculated float → FloatMul"
+        );
     }
 
     #[test]
@@ -322,7 +357,10 @@ mod tests {
         }
 
         let n = speculate(&mut f, &|_| None);
-        assert_eq!(n, 1, "static parameter proof must not require profile samples");
+        assert_eq!(
+            n, 1,
+            "static parameter proof must not require profile samples"
+        );
         assert_eq!(f.inst(call).opcode, Opcode::FixnumMul);
     }
 
@@ -331,6 +369,10 @@ mod tests {
         let (mut f, call) = build_star();
         let n = speculate(&mut f, &|_| None); // no consistent type
         assert_eq!(n, 0);
-        assert_eq!(f.inst(call).opcode, Opcode::Call, "polymorphic/cold site stays a Call");
+        assert_eq!(
+            f.inst(call).opcode,
+            Opcode::Call,
+            "polymorphic/cold site stays a Call"
+        );
     }
 }

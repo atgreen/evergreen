@@ -596,11 +596,7 @@ mod tests {
         let mut fl = InstFlags::default();
         fl.effectful = true;
         // SetCdr(outer, inner): outer at pos 0 (object), inner at pos 1 (value).
-        f.push_inst(
-            entry,
-            inst(Opcode::SetCdr, vec![outer, inner], fl),
-            &[],
-        );
+        f.push_inst(entry, inst(Opcode::SetCdr, vec![outer, inner], fl), &[]);
         f.set_terminator(entry, ret(vec![outer]));
 
         let r = analyse(&f);

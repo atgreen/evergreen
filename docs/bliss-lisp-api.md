@@ -24,14 +24,15 @@ bootstrap.
 
 | Package | Purpose | Current status | Compatibility |
 | --- | --- | --- | --- |
-| `BLISS` | Older spelling for general public extensions | Specified in older chapters; not created today | Being consolidated with `BLISS-EXT` |
-| `BLISS-EXT` | General runtime, compiler, process, package, and image extensions | Package and selected functions available | Planned `SB-EXT` re-exports |
-| `BLISS-THREAD` | OS-backed native threads and synchronization | Specified | Planned `SB-THREAD` re-exports; `BLISS-THREADS` is a deprecated nickname |
+| `BLISS-EXT` | General runtime, compiler, process, package, image, atomic, and memory-barrier extensions | Package and selected functions available | Planned `SB-EXT` re-exports |
+| `BLISS` | Deprecated nickname for `BLISS-EXT` | Specified compatibility alias; not created today | Older spelling only |
+| `BLISS-THREAD` | OS-backed native threads and synchronization objects | Specified | Planned `SB-THREAD` re-exports |
+| `BLISS-THREADS` | Deprecated nickname for `BLISS-THREAD` | Specified compatibility alias; not created today | Older spelling only |
 | `BLISS-FIBER` | Lightweight M:N fibers and scheduler groups | Specified | Deliberately distinct from native threads |
 | `BLISS-MOP` | Metaobject protocol | Partial internals; public package specified | Planned `SB-MOP` re-exports |
 | `BLISS-CLTL2` | Compile-time environment inspection | Specified | Planned `SB-CLTL2` alias |
 | `BLISS-GRAY-STREAMS` | Gray stream classes and generic functions | Partial internal dispatch | Intended to be re-exported from `COMMON-LISP` |
-| `BLISS-FFI` | Typed foreign calls and callbacks | Partial Rust runtime; Lisp API not yet complete | CFFI/SB-ALIEN migration surface |
+| `BLISS-FFI` | Typed foreign calls and callbacks | Partial Rust runtime; Lisp package not yet installed | CFFI/SB-ALIEN migration surface |
 | `BLISS-DEBUG` | Breakpoints, watchpoints, and debugger plumbing | Partial Rust library; Lisp API specified | Bliss-specific |
 | `BLISS-PROFILER` | Runtime profiling controls and reports | Specified; tier counters have separate available accessors | Bliss-specific |
 | `BLISS-GC` | GC counters used by developer tools | Specified | Bliss-specific |
@@ -39,15 +40,14 @@ bootstrap.
 | `BLISS-SBCL-COMPAT` | Opt-in SBCL migration re-exports | Specified | Transition aid, not a new semantic API |
 
 `COMMON-LISP-USER` uses `COMMON-LISP` and `BLISS-EXT`, but portable code
-should still qualify extension names. Compatibility packages are not yet
-created by the bootstrap package initializer.
+should still qualify extension names. The canonical public names are
+`BLISS-EXT`, `BLISS-THREAD`, `BLISS-FIBER`, and `BLISS-FFI`. Older `BLISS` and
+`BLISS-THREADS` references are compatibility spellings only; new spec text must
+not introduce fresh primary APIs under those package names. Compatibility
+packages are not yet created by the bootstrap package initializer.
 
-Some older spec chapters use `BLISS` where the newer extension chapter uses
-`BLISS-EXT`, notably for images, GC controls, weak pointers, and exit. This
-manual shows the spelling from each defining contract and treats the pair as a
-package-consolidation issue, not as two different operations. Neither spelling
-is currently an implicit compatibility alias. `BLISS-INTERNALS`/`BI` is an
-unstable implementation package and is intentionally not a supported API.
+`BLISS-INTERNALS`/`BI` is an unstable implementation package and is
+intentionally not a supported API.
 
 ## Currently available API
 
@@ -271,7 +271,7 @@ specified-only.
 
 | API | Contract |
 | --- | --- |
-| `(bliss:save-image path &key executable compression purify)` | Save a full relocatable heap image and return its pathname; `:COMPRESSION` is `:NONE` or `:ZSTD` |
+| `(bliss-ext:save-image path &key executable compression purify)` | Save a full relocatable heap image and return its pathname; `:COMPRESSION` is `:NONE` or `:ZSTD`; deprecated alias `BLISS:SAVE-IMAGE` |
 | `(sb-ext:save-lisp-and-die path &rest options)` | Compatibility alias that saves and exits |
 | `(bliss-ext:exit &key (code 0) abort timeout)` | Orderly process exit; `:ABORT` skips cleanup and `:TIMEOUT` bounds joins |
 | `(bliss-ext:quit &key (unix-status 0) recklessly-p)` | SBCL-compatible spelling of `EXIT` |
@@ -292,26 +292,26 @@ The extension condition/type surface comprises:
 - `BLISS-EXT:FOREIGN-POINTER`, an opaque validated foreign-address wrapper.
 
 `BLISS-EXT:INTERNAL-ERROR` denotes a Bliss bug and is not a recoverable
-application condition. The older image chapter spells the image condition
-`BLISS:IMAGE-ERROR`.
+application condition. `BLISS:IMAGE-ERROR` is a deprecated compatibility
+spelling.
 
-Older public-package contracts additionally specify:
+The deprecated `BLISS` compatibility package additionally specifies:
 
 | API | Contract |
 | --- | --- |
-| `(bliss:gc &rest options)` | Request garbage collection |
-| `bliss:*gc-run-time*` | Accumulated GC time |
+| `(bliss:gc &rest options)` | Older-package spelling of `BLISS-EXT:GC` |
+| `bliss:*gc-run-time*` | Older-package spelling of `BLISS-EXT:*GC-RUN-TIME*` |
 | `(bliss:defglobal name value &optional documentation)` | Older-package spelling of `BLISS-EXT:DEFGLOBAL` |
 | `(bliss:make-weak-pointer object)` | Older-package spelling of `BLISS-EXT:MAKE-WEAK-POINTER` |
 | `(bliss:exit &key code abort timeout)` | Older-package spelling of `BLISS-EXT:EXIT` |
-| `(bliss:struct-slot-offset structure-type slot-name)` | Return the implementation slot offset used by migration/FFI code |
+| `(bliss:struct-slot-offset structure-type slot-name)` | Older-package spelling of `BLISS-EXT:STRUCT-SLOT-OFFSET` |
 | `(bliss:deprecated-symbols)` | Return `(symbol replacement removal-version)` entries |
 
-The public tuning specials are `BLISS:*DEFAULT-EXTERNAL-FORMAT*` (default
-`:UTF-8`), `BLISS:*HASH-TABLE-DEFAULT-SIZE*` (16),
-`BLISS:*HASH-TABLE-SYNCHRONIZED-DEFAULT*` (`NIL`),
-`BLISS:*SORT-PARALLEL-THRESHOLD*` (10000), and
-`BLISS:*READER-SOURCE-TRACKING*` (`T`). They are **Specified** and are not
+The public tuning specials are `BLISS-EXT:*DEFAULT-EXTERNAL-FORMAT*` (default
+`:UTF-8`), `BLISS-EXT:*HASH-TABLE-DEFAULT-SIZE*` (16),
+`BLISS-EXT:*HASH-TABLE-SYNCHRONIZED-DEFAULT*` (`NIL`),
+`BLISS-EXT:*SORT-PARALLEL-THRESHOLD*` (10000), and
+`BLISS-EXT:*READER-SOURCE-TRACKING*` (`T`). They are **Specified** and are not
 installed by the bootstrap today.
 
 ### Sandboxing
@@ -370,15 +370,38 @@ destroy requests take effect at safepoints.
 ### Condition variables
 
 ```lisp
-(bliss-thread:make-waitqueue &key name) -> waitqueue
-(bliss-thread:condition-wait waitqueue mutex &key timeout) -> boolean
-(bliss-thread:condition-notify waitqueue &optional (count 1))
-(bliss-thread:condition-broadcast waitqueue)
+(bliss-thread:make-condition-variable &key name) -> condition-variable
+(bliss-thread:condition-wait condition-variable mutex &key timeout) -> boolean
+(bliss-thread:condition-notify condition-variable &optional (count 1)) -> count
+(bliss-thread:condition-broadcast condition-variable) -> count
 ```
 
 `CONDITION-WAIT` atomically releases the mutex and waits, then reacquires it.
 As with SBCL condition variables, callers must recheck their predicate after
-waking.
+waking. `TIMEOUT` is either `NIL` (wait indefinitely) or a non-negative real
+number of seconds; the result is true if notified and `NIL` on timeout.
+
+`MAKE-WAITQUEUE`, `CONDITION-WAIT`, `CONDITION-NOTIFY`, and
+`CONDITION-BROADCAST` are accepted as deprecated aliases for the same
+condition-variable API.
+
+### Read-write locks
+
+```lisp
+(bliss-thread:make-rw-lock &key name) -> rw-lock
+(bliss-thread:grab-rw-lock-read rw-lock &key (waitp t) timeout) -> boolean
+(bliss-thread:grab-rw-lock-write rw-lock &key (waitp t) timeout) -> boolean
+(bliss-thread:release-rw-lock-read rw-lock &key (if-not-owner :error)) -> nil
+(bliss-thread:release-rw-lock-write rw-lock &key (if-not-owner :error)) -> nil
+(bliss-thread:with-rw-lock-read (rw-lock &key (waitp t) timeout) body*) -> values
+(bliss-thread:with-rw-lock-write (rw-lock &key (waitp t) timeout) body*) -> values
+```
+
+RW-locks use writer preference to prevent writer starvation. `WAITP NIL`
+performs a try-lock. `TIMEOUT` has the same meaning as for condition variables.
+`IF-NOT-OWNER` accepts `:ERROR`, `:WARN`, or `:IGNORE`; write-lock ownership is
+tracked per thread, while read-lock release only verifies that the current
+thread holds at least one read acquisition.
 
 ### Semaphores
 
@@ -407,10 +430,9 @@ Every successful recursive acquisition must be matched by a release.
 (bliss-ext:cas place old new) -> previous-value
 (bliss-ext:atomic-incf place &optional (delta 1)) -> previous-value
 (bliss-ext:atomic-decf place &optional (delta 1)) -> previous-value
-(bliss-thread:barrier &optional (kind :full))
-(bliss-ext:memory-barrier)
-(bliss-ext:load-barrier)
-(bliss-ext:store-barrier)
+(bliss-ext:memory-barrier &optional (kind :full)) -> nil
+(bliss-ext:load-barrier) -> nil
+(bliss-ext:store-barrier) -> nil
 (bliss-ext:with-atomic () body*)
 ```
 
@@ -420,22 +442,33 @@ value. Specified places are special variables, structure slots, `SVREF`,
 `ATOMIC-INCF` and `ATOMIC-DECF` support fixnum cells and return the value before
 the update; overflow signals `ARITHMETIC-ERROR`.
 
-Barrier kinds are `:READ`, `:WRITE`, `:FULL`, and `:DATA-DEPENDENCY`.
+Memory-barrier kinds are `:READ`, `:WRITE`, `:FULL`, and
+`:DATA-DEPENDENCY`.
 `WITH-ATOMIC` suppresses scheduler preemption for a short dynamic extent but
 does not suppress GC safepoints.
 
-The concurrency spec also requires public `RW-LOCK`, `CONDITION-VARIABLE`, and
-N-party `BARRIER` object types. Their Lisp constructors and operation lambda
-lists have not yet been fixed; only their required behavior is specified. They
-must prefer waiting writers, support wait/notify/notify-all for condition
-variables, and release all participants when a barrier's configured count
-arrives.
+### N-party barriers
+
+```lisp
+(bliss-thread:make-barrier count &key name) -> barrier
+(bliss-thread:barrier-wait barrier &key timeout) -> index, status
+(bliss-thread:barrier-count barrier) -> positive-integer
+(bliss-thread:barrier-waiting-count barrier) -> non-negative-integer
+(bliss-thread:reset-barrier barrier) -> nil
+```
+
+`COUNT` is the number of arrivals required to release a generation. `WAIT`
+returns a zero-based arrival index and status `:OK`, or `NIL, :TIMEOUT` if the
+timeout expires. `RESET-BARRIER` breaks the current generation and starts a new
+one; waiters released by reset receive `NIL, :RESET`.
 
 The fully qualified type names are `BLISS-THREAD:MUTEX`,
-`BLISS-THREAD:RW-LOCK`, and `BLISS-THREAD:CONDITION-VARIABLE`. Lifecycle errors
-signal `BLISS-THREAD:THREAD-ERROR`. Older migration text uses
-`BLISS-THREADS:MAKE-THREAD` and `BLISS-THREADS:MAKE-LOCK`; the current contract
-keeps `BLISS-THREADS` only as a deprecated nickname for `BLISS-THREAD`.
+`BLISS-THREAD:RW-LOCK`, `BLISS-THREAD:CONDITION-VARIABLE`,
+`BLISS-THREAD:SEMAPHORE`, and `BLISS-THREAD:BARRIER`. Lifecycle and
+synchronization errors signal `BLISS-THREAD:THREAD-ERROR`. Older migration text
+uses `BLISS-THREADS:MAKE-THREAD` and `BLISS-THREADS:MAKE-LOCK`; the current
+contract keeps `BLISS-THREADS` only as a deprecated nickname for
+`BLISS-THREAD`.
 
 ## Fibers
 
@@ -813,20 +846,37 @@ their zero-argument uses in `TIME`.
 ## Foreign-function interface
 
 The FFI is **Partial**: typed marshalling, foreign-call support, sandbox checks,
-and callback structures exist in Rust, but the Lisp surface is not yet fully
-specified or installed. The public names already committed by the spec are:
+and callback structures exist in Rust, but the Lisp surface is not installed in
+the bootstrap package initializer yet. The public contract is:
 
 ```lisp
-(bliss-ffi:define-foreign-function name foreign-name return-type argument-types
-  &rest options)
-(bliss-ffi:make-callback function return-type argument-types &rest options)
+(bliss-ffi:load-foreign-library path &key search system) -> foreign-library
+(bliss-ffi:close-foreign-library foreign-library) -> nil
+(bliss-ffi:foreign-symbol foreign-library name) -> foreign-pointer
+
+(bliss-ffi:define-foreign-function lisp-name
+    (foreign-name &key library calling-convention)
+    return-type
+    argument-types
+  &key documentation sandbox-capability)
+  -> lisp-name
+
+(bliss-ffi:foreign-funcall foreign-pointer return-type argument-types &rest args)
+  -> value
+
+(bliss-ffi:make-callback function return-type argument-types
+  &key calling-convention keepalive-name) -> foreign-pointer
+
+(bliss-ffi:free-callback foreign-pointer) -> nil
 ```
 
 `BLISS-FFI:FFI-ERROR` is the public error condition. Foreign addresses must be
 wrapped as validated `BLISS-EXT:FOREIGN-POINTER` objects; user code never
-receives a raw address. Foreign operations require the sandbox `:FFI`
-capability. Until the Lisp surface is finalized, use of the Rust FFI crate is
-an embedding interface, not a portable Bliss Lisp API.
+receives a raw address. `RETURN-TYPE` and each element of `ARGUMENT-TYPES` are
+foreign type designators from the FFI type table (`:VOID`, signed and unsigned
+integer widths, pointer, C string, and callback pointer). Foreign operations
+require the sandbox `:FFI` capability; a missing capability signals
+`BLISS-EXT:SANDBOX-VIOLATION`.
 
 ## Deferred extensible sequences
 

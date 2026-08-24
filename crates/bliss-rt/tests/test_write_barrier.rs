@@ -6,13 +6,13 @@
 //! referents alive and relocate the old slots after the nursery moves.
 
 use bliss_rt::gc::{
-    drain_satb_log, init_heap, remembered_set_len, set_gc_marking_in_progress, store_ref,
-    Allocator, Collector, GcConfig, HeapAllocator, HeapCollector,
+    Allocator, Collector, GcConfig, HeapAllocator, HeapCollector, drain_satb_log, init_heap,
+    remembered_set_len, set_gc_marking_in_progress, store_ref,
 };
 use bliss_rt::value::{BlissVal, T, TAG_HEAP_OBJECT};
 use bliss_rt::{
-    current_stack, fiber_state, make_fiber, park_current_fiber, BlissStack, FiberState,
-    SchedulerConfig, SchedulerGroup,
+    BlissStack, FiberState, SchedulerConfig, SchedulerGroup, current_stack, fiber_state,
+    make_fiber, park_current_fiber,
 };
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -159,7 +159,7 @@ fn satb_pre_write_logging_captures_overwritten_references_during_marking() {
 /// frame refs).
 #[test]
 fn nursery_object_held_only_by_cl_frame_relocates_across_minor_gc() {
-    use bliss_rt::{current_thread, BlissStack};
+    use bliss_rt::{BlissStack, current_thread};
     let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     init_heap(&gc_config()).unwrap();
     let mut alloc = HeapAllocator::new().unwrap();

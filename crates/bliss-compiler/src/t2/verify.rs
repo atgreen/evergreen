@@ -55,7 +55,10 @@ pub struct VerifyError {
 
 impl VerifyError {
     fn new(check: &'static str, detail: impl Into<String>) -> VerifyError {
-        VerifyError { check, detail: detail.into() }
+        VerifyError {
+            check,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -119,7 +122,10 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
             } else if !data.targets.is_empty() {
                 errors.push(VerifyError::new(
                     "V6 terminator",
-                    format!("non-terminator {:?} in block{} carries targets", data.opcode, bi),
+                    format!(
+                        "non-terminator {:?} in block{} carries targets",
+                        data.opcode, bi
+                    ),
                 ));
             }
         }
@@ -171,7 +177,10 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     if !valid_values.contains(&arg.0) {
                         errors.push(VerifyError::new(
                             "V1 dangling-value",
-                            format!("block{bi} → block{} arg #{i} v{} is not live", call.block.0, arg.0),
+                            format!(
+                                "block{bi} → block{} arg #{i} v{} is not live",
+                                call.block.0, arg.0
+                            ),
                         ));
                         continue;
                     }
@@ -220,7 +229,10 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
             match f.value(v).def {
                 ValueDef::Param { block, .. } => Some(DefLoc { block, pos: None }),
                 ValueDef::Result { inst, .. } => {
-                    inst_loc.get(&inst.0).map(|&(block, pos)| DefLoc { block, pos: Some(pos) })
+                    inst_loc.get(&inst.0).map(|&(block, pos)| DefLoc {
+                        block,
+                        pos: Some(pos),
+                    })
                 }
             }
         };
@@ -230,8 +242,8 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
             match def_loc(v) {
                 None => false,
                 Some(d) if d.block == use_block => match d.pos {
-                    None => true,            // block parameter: precedes all insts
-                    Some(p) => p < use_pos,  // result: must appear earlier
+                    None => true,           // block parameter: precedes all insts
+                    Some(p) => p < use_pos, // result: must appear earlier
                 },
                 Some(d) => dom.dominates(d.block, use_block),
             }
@@ -248,7 +260,10 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     if !valid_values.contains(&arg.0) {
                         errors.push(VerifyError::new(
                             "V1 dangling-value",
-                            format!("block{bi} {:?} arg #{ai} v{} is not live", data.opcode, arg.0),
+                            format!(
+                                "block{bi} {:?} arg #{ai} v{} is not live",
+                                data.opcode, arg.0
+                            ),
                         ));
                         continue;
                     }
@@ -288,7 +303,10 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 // SSA value and is a pure load. StringAsciiCharAt consumes the
                 // same refinement but can still fail its bounds/ASCII assumptions,
                 // so it remains an ordered deopt guard.
-                if matches!(data.opcode, Opcode::StringByteLength | Opcode::StringAsciiCharAt) {
+                if matches!(
+                    data.opcode,
+                    Opcode::StringByteLength | Opcode::StringAsciiCharAt
+                ) {
                     let refined = data.args.first().is_some_and(|value| {
                         valid_values.contains(&value.0)
                             && matches!(
@@ -412,7 +430,10 @@ fn check_frame_state(
             } else if !dominates_use(*value, use_block, use_pos) {
                 errors.push(VerifyError::new(
                     "V8 framestate-dominance",
-                    format!("block{bi} frame_state value v{} does not dominate the guard", value.0),
+                    format!(
+                        "block{bi} frame_state value v{} does not dominate the guard",
+                        value.0
+                    ),
                 ));
             }
         }
@@ -518,17 +539,26 @@ mod tests {
     }
 
     fn jump(to: Block, args: Vec<Value>) -> InstData {
-        InstData { targets: vec![BlockCall { block: to, args }], ..inst(Opcode::Jump) }
+        InstData {
+            targets: vec![BlockCall { block: to, args }],
+            ..inst(Opcode::Jump)
+        }
     }
 
     fn ret(vals: Vec<Value>) -> InstData {
-        InstData { args: vals, ..inst(Opcode::Return) }
+        InstData {
+            args: vals,
+            ..inst(Opcode::Return)
+        }
     }
 
     fn const_fixnum(f: &mut Function, block: Block, imm: i64) -> Value {
         let (_, r) = f.push_inst(
             block,
-            InstData { aux: AuxData::FixnumImm(imm), ..inst(Opcode::ConstFixnum) },
+            InstData {
+                aux: AuxData::FixnumImm(imm),
+                ..inst(Opcode::ConstFixnum)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         r[0]
@@ -544,7 +574,10 @@ mod tests {
         let b = const_fixnum(&mut f, e, 2);
         let (_, sum) = f.push_inst(
             e,
-            InstData { args: vec![a, b], ..inst(Opcode::FixnumAdd) },
+            InstData {
+                args: vec![a, b],
+                ..inst(Opcode::FixnumAdd)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         f.set_terminator(e, ret(vec![sum[0]]));
@@ -568,8 +601,14 @@ mod tests {
             InstData {
                 args: vec![cond],
                 targets: vec![
-                    BlockCall { block: b1, args: vec![] },
-                    BlockCall { block: b2, args: vec![] },
+                    BlockCall {
+                        block: b1,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: b2,
+                        args: vec![],
+                    },
                 ],
                 ..inst(Opcode::Brif)
             },
@@ -598,7 +637,10 @@ mod tests {
         // header: next = hp + 1; loop back, and also exit.
         let (_, next) = f.push_inst(
             header,
-            InstData { args: vec![hp, hp], ..inst(Opcode::FixnumAdd) },
+            InstData {
+                args: vec![hp, hp],
+                ..inst(Opcode::FixnumAdd)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         let cond = const_fixnum(&mut f, header, 1);
@@ -607,8 +649,14 @@ mod tests {
             InstData {
                 args: vec![cond],
                 targets: vec![
-                    BlockCall { block: header, args: vec![next[0]] }, // back-edge
-                    BlockCall { block: exit, args: vec![] },
+                    BlockCall {
+                        block: header,
+                        args: vec![next[0]],
+                    }, // back-edge
+                    BlockCall {
+                        block: exit,
+                        args: vec![],
+                    },
                 ],
                 ..inst(Opcode::Brif)
             },
@@ -639,7 +687,10 @@ mod tests {
         f.push_inst(
             e,
             InstData {
-                targets: vec![BlockCall { block: other, args: vec![] }],
+                targets: vec![BlockCall {
+                    block: other,
+                    args: vec![],
+                }],
                 ..inst(Opcode::ConstNil)
             },
             &[(IRType::of(TypeBits::NULL), ValueRepresentation::Tagged)],
@@ -662,7 +713,10 @@ mod tests {
         f.set_terminator(e, jump(target, vec![]));
         f.set_terminator(target, ret(vec![]));
         let errs = verify(&f).unwrap_err();
-        assert!(errs.iter().any(|e| e.check == "V4 block-param arity"), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.check == "V4 block-param arity"),
+            "{errs:?}"
+        );
     }
 
     // ── V4: type/repr disagreement on a block argument ──────────────────
@@ -679,7 +733,10 @@ mod tests {
         f.set_terminator(e, jump(target, vec![v]));
         f.set_terminator(target, ret(vec![]));
         let errs = verify(&f).unwrap_err();
-        assert!(errs.iter().any(|e| e.check == "V4 block-param repr"), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.check == "V4 block-param repr"),
+            "{errs:?}"
+        );
     }
 
     // ── V3: a value used where its definition does not dominate ─────────
@@ -698,8 +755,14 @@ mod tests {
             InstData {
                 args: vec![cond],
                 targets: vec![
-                    BlockCall { block: b1, args: vec![] },
-                    BlockCall { block: b2, args: vec![] },
+                    BlockCall {
+                        block: b1,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: b2,
+                        args: vec![],
+                    },
                 ],
                 ..inst(Opcode::Brif)
             },
@@ -731,7 +794,10 @@ mod tests {
         // check.
         let (_, addr) = f.push_inst(
             e,
-            InstData { args: vec![a, Value(a.0 + 2)], ..inst(Opcode::FixnumAdd) },
+            InstData {
+                args: vec![a, Value(a.0 + 2)],
+                ..inst(Opcode::FixnumAdd)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         let b = const_fixnum(&mut f, e, 2);
@@ -751,7 +817,10 @@ mod tests {
         // Jump to a block index that was never allocated.
         f.set_terminator(e, jump(Block(42), vec![]));
         let errs = verify(&f).unwrap_err();
-        assert!(errs.iter().any(|e| e.check == "V10 succ-exists"), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.check == "V10 succ-exists"),
+            "{errs:?}"
+        );
     }
 
     // ── V1: a dangling value operand ────────────────────────────────────
@@ -764,12 +833,18 @@ mod tests {
         // Reference a value id far beyond anything defined.
         f.push_inst(
             e,
-            InstData { args: vec![a, Value(9999)], ..inst(Opcode::FixnumAdd) },
+            InstData {
+                args: vec![a, Value(9999)],
+                ..inst(Opcode::FixnumAdd)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         f.set_terminator(e, ret(vec![]));
         let errs = verify(&f).unwrap_err();
-        assert!(errs.iter().any(|e| e.check == "V1 dangling-value"), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.check == "V1 dangling-value"),
+            "{errs:?}"
+        );
     }
 
     // ── V8: a guard with no frame_state ─────────────────────────────────
@@ -783,7 +858,11 @@ mod tests {
             e,
             InstData {
                 args: vec![a],
-                flags: InstFlags { guard: true, effectful: true, ..InstFlags::default() },
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
                 frame_state: None,
                 ..inst(Opcode::Guard)
             },
@@ -791,7 +870,10 @@ mod tests {
         );
         f.set_terminator(e, ret(vec![]));
         let errs = verify(&f).unwrap_err();
-        assert!(errs.iter().any(|e| e.check == "V8 guard-framestate"), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.check == "V8 guard-framestate"),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -815,8 +897,7 @@ mod tests {
         f.set_terminator(e, ret(vec![]));
         let errs = verify(&f).unwrap_err();
         assert!(
-            errs.iter()
-                .any(|e| e.check == "V8 layout-guard-contract"),
+            errs.iter().any(|e| e.check == "V8 layout-guard-contract"),
             "{errs:?}"
         );
     }
@@ -845,7 +926,11 @@ mod tests {
             e,
             InstData {
                 args: vec![a],
-                flags: InstFlags { guard: true, effectful: true, ..InstFlags::default() },
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
                 frame_state: Some(id),
                 ..inst(Opcode::Guard)
             },
@@ -870,8 +955,14 @@ mod tests {
             InstData {
                 args: vec![cond],
                 targets: vec![
-                    BlockCall { block: b1, args: vec![] },
-                    BlockCall { block: b2, args: vec![] },
+                    BlockCall {
+                        block: b1,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: b2,
+                        args: vec![],
+                    },
                 ],
                 ..inst(Opcode::Brif)
             },
@@ -899,7 +990,11 @@ mod tests {
             b2,
             InstData {
                 args: vec![cond2],
-                flags: InstFlags { guard: true, effectful: true, ..InstFlags::default() },
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
                 frame_state: Some(id),
                 ..inst(Opcode::Guard)
             },
@@ -948,7 +1043,11 @@ mod tests {
             e,
             InstData {
                 args: vec![a],
-                flags: InstFlags { guard: true, effectful: true, ..InstFlags::default() },
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
                 frame_state: Some(id),
                 ..inst(Opcode::Guard)
             },
@@ -956,6 +1055,9 @@ mod tests {
         );
         f.set_terminator(e, ret(vec![]));
         let errs = verify(&f).unwrap_err();
-        assert!(errs.iter().any(|e| e.check == "V8 remat-recipe"), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.check == "V8 remat-recipe"),
+            "{errs:?}"
+        );
     }
 }

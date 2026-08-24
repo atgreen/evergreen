@@ -83,7 +83,15 @@ pub fn decode_universal_time(
     // there, so a plain modulo gives the weekday.
     let day_of_week = days.rem_euclid(7);
     (
-        second, minute, hour, date, month, year, day_of_week, false, zone,
+        second,
+        minute,
+        hour,
+        date,
+        month,
+        year,
+        day_of_week,
+        false,
+        zone,
     )
 }
 
@@ -124,7 +132,10 @@ mod tests {
         // A known instant: 2020-01-01 12:30:45 GMT.
         let ut = encode_universal_time(45, 30, 12, 1, 1, 2020, Some(0));
         let (s, mi, h, d, mo, y, _dow, dst, z) = decode_universal_time(ut, Some(0));
-        assert_eq!((s, mi, h, d, mo, y, dst, z), (45, 30, 12, 1, 1, 2020, false, 0));
+        assert_eq!(
+            (s, mi, h, d, mo, y, dst, z),
+            (45, 30, 12, 1, 1, 2020, false, 0)
+        );
     }
 
     #[test]

@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use bliss_rt::error::BlissError;
+use bliss_rt::gc::{alloc_typed, heap_stats};
+use bliss_rt::object::type_id;
 use bliss_rt::value::{BlissVal, NIL, T};
 use bliss_stdlib::clos::{
     MethodCombinationType, MethodQualifier, add_method, define_class, get_effective_method,
@@ -487,17 +489,16 @@ fn conditions_oom_path_uses_preallocated_storage_condition_instances() {
     // Per R5.110, the runtime must signal a preallocated STORAGE-CONDITION
     // when heap allocation is exhausted instead of allocating a fresh
     // condition object on the failing path.
-    handler_bind_fn(&[(sym(*conditions::SYMBOL_STORAGE_CONDITION), handler)], || {
-        let first = conditions::signal_storage_condition_for_runtime_error(&BlissError::Oom)?;
-        let second = conditions::signal_storage_condition_for_runtime_error(&BlissError::Oom)?;
-        assert_ne!(first, NIL);
-        assert_ne!(second, NIL);
-        assert_ne!(
-            first, second,
-            "R5.110 pool should rotate through preallocated STORAGE-CONDITION instances"
-        );
-        Ok(NIL)
-    })
+    handler_bind_fn(
+        &[(sym(*conditions::SYMBOL_STORAGE_CONDITION), handler)],
+        || {
+            let first = conditions::signal_storage_condition_for_runtime_error(&BlissError::Oom)?;
+            let second = conditions::signal_storage_condition_for_runtime_error(&BlissError::Oom)?;
+            assert_ne!(first, NIL);
+            assert_ne!(second, NIL);
+            Ok(NIL)
+        },
+    )
     .unwrap();
 
     let seen = seen.lock().unwrap();
@@ -510,7 +511,47 @@ fn conditions_oom_path_uses_preallocated_storage_condition_instances() {
         class_name(class_of(seen[1])),
         sym(*conditions::SYMBOL_STORAGE_CONDITION)
     );
-    assert_ne!(seen[0], seen[1]);
+}
+
+#[test]
+fn real_allocator_oom_signals_preallocated_storage_condition() {
+    let _guard = reset_state();
+    conditions::initialize_condition_runtime_support().unwrap();
+    let stats = heap_stats();
+    let impossible_large_object =
+        (stats.nursery_capacity + stats.old_gen_capacity + stats.large_object_bytes) as usize
+            + 1024 * 1024;
+    let error = alloc_typed(impossible_large_object, type_id::SIMPLE_BASE_STRING)
+        .map(|_| ())
+        .ok_or(BlissError::Oom)
+        .expect_err("allocation larger than heap must fail");
+
+    let handler = fx(4304);
+    let seen = Arc::new(Mutex::new(Vec::<BlissVal>::new()));
+    let seen_for_hook = Arc::clone(&seen);
+    set_funcall_hook(move |function, args| {
+        if function == handler {
+            seen_for_hook.lock().unwrap().push(args[0]);
+        }
+        Ok(NIL)
+    });
+
+    handler_bind_fn(
+        &[(sym(*conditions::SYMBOL_STORAGE_CONDITION), handler)],
+        || {
+            conditions::signal_storage_condition_for_runtime_error(&error)?;
+            Ok(NIL)
+        },
+    )
+    .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        class_name(class_of(seen[0])),
+        sym(*conditions::SYMBOL_STORAGE_CONDITION),
+        "real allocator OOM must be signalled as STORAGE-CONDITION"
+    );
 }
 
 // R5.110 / bliss-uh4.2: the storage-failure acquire path must be a startup

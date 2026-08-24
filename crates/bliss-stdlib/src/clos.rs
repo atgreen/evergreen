@@ -1100,7 +1100,10 @@ pub fn allocate_instance(class: BlissVal) -> Result<BlissVal, BlissError> {
         ));
     }
     let size = 16 + 8 * slot_count;
-    debug_assert!(size / 8 <= 0xFFFE, "instance too large for header size field");
+    debug_assert!(
+        size / 8 <= 0xFFFE,
+        "instance too large for header size field"
+    );
     unsafe {
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         let ptr = std::alloc::alloc_zeroed(layout);
@@ -1153,7 +1156,10 @@ pub fn allocate_instance_pinned_gc(class: BlissVal) -> Result<BlissVal, BlissErr
         ));
     }
     let size = 16 + 8 * slot_count;
-    debug_assert!(size / 8 <= 0xFFFE, "instance too large for header size field");
+    debug_assert!(
+        size / 8 <= 0xFFFE,
+        "instance too large for header size field"
+    );
     // The GC allocator writes an 8-byte STANDARD_OBJECT header and returns the
     // body pointer; the instance value points at the header (body − 8).
     let body = bliss_rt::gc::alloc_typed(size - 8, type_id::STANDARD_OBJECT)
@@ -1293,7 +1299,10 @@ pub fn slot_value(instance: BlissVal, slot_name: BlissVal) -> Result<BlissVal, B
                     Ok(v)
                 }
             }
-            None => Err(BlissError::Internal(format!("slot not present in class layout: {}", bliss_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()))),
+            None => Err(BlissError::Internal(format!(
+                "slot not present in class layout: {}",
+                bliss_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()
+            ))),
         }
     }
 }
@@ -1314,7 +1323,10 @@ pub fn set_slot_value(
                 *slot_cell(instance, idx) = new_value;
                 Ok(())
             }
-            None => Err(BlissError::Internal(format!("slot not present in class layout: {}", bliss_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()))),
+            None => Err(BlissError::Internal(format!(
+                "slot not present in class layout: {}",
+                bliss_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()
+            ))),
         }
     }
 }
@@ -1735,7 +1747,11 @@ pub fn change_class(instance: BlissVal, new_class: BlissVal) -> Result<(), Bliss
     // capacity (the number of cells the allocation was sized for).
     let (old_capacity, snapshot): (usize, Vec<(BlissVal, BlissVal)>) = unsafe {
         let ow = instance_wrapper(instance);
-        let cap = if ow.is_null() { 0 } else { (*ow).slot_count as usize };
+        let cap = if ow.is_null() {
+            0
+        } else {
+            (*ow).slot_count as usize
+        };
         let mut snap = Vec::new();
         if !ow.is_null() && !(*ow).layout.is_null() {
             let ol = &*(*ow).layout;

@@ -74,10 +74,22 @@ impl TypeBits {
     pub const OTHER_HEAP: TypeBits = TypeBits(1 << 14);
     pub const TOP: TypeBits = TypeBits(0x7FFF);
 
-    #[inline] pub fn meet(self, o: TypeBits) -> TypeBits { TypeBits(self.0 & o.0) } // intersection
-    #[inline] pub fn join(self, o: TypeBits) -> TypeBits { TypeBits(self.0 | o.0) } // union
-    #[inline] pub fn is_bottom(self) -> bool { self.0 == 0 }
-    #[inline] pub fn contains(self, o: TypeBits) -> bool { self.0 & o.0 == o.0 }
+    #[inline]
+    pub fn meet(self, o: TypeBits) -> TypeBits {
+        TypeBits(self.0 & o.0)
+    } // intersection
+    #[inline]
+    pub fn join(self, o: TypeBits) -> TypeBits {
+        TypeBits(self.0 | o.0)
+    } // union
+    #[inline]
+    pub fn is_bottom(self) -> bool {
+        self.0 == 0
+    }
+    #[inline]
+    pub fn contains(self, o: TypeBits) -> bool {
+        self.0 & o.0 == o.0
+    }
 }
 
 /// Inclusive integer sub-range refinement, load-bearing for overflow-guard
@@ -97,9 +109,23 @@ pub struct IRType {
 }
 
 impl IRType {
-    pub const BOTTOM: IRType = IRType { bits: TypeBits::BOTTOM, range: None, class_id: None };
-    pub const TOP: IRType = IRType { bits: TypeBits::TOP, range: None, class_id: None };
-    pub fn of(bits: TypeBits) -> IRType { IRType { bits, range: None, class_id: None } }
+    pub const BOTTOM: IRType = IRType {
+        bits: TypeBits::BOTTOM,
+        range: None,
+        class_id: None,
+    };
+    pub const TOP: IRType = IRType {
+        bits: TypeBits::TOP,
+        range: None,
+        class_id: None,
+    };
+    pub fn of(bits: TypeBits) -> IRType {
+        IRType {
+            bits,
+            range: None,
+            class_id: None,
+        }
+    }
 }
 
 // ── Opcodes & instructions ──────────────────────────────────────────
@@ -109,20 +135,58 @@ impl IRType {
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Opcode {
     // Cat 1 — constants (payload in AuxData). Block parameters are the params.
-    ConstFixnum, ConstFloat, ConstChar, ConstSymbol, ConstNil, ConstT, ConstHeapObj,
+    ConstFixnum,
+    ConstFloat,
+    ConstChar,
+    ConstSymbol,
+    ConstNil,
+    ConstT,
+    ConstHeapObj,
     // Cat 2 — arithmetic / logic
-    FixnumAdd, FixnumSub, FixnumMul, FixnumDiv, FixnumRem, FixnumMod, FixnumNeg,
-    FixnumShl, FixnumShr,
-    FloatAdd, FloatSub, FloatMul, FloatDiv,
-    GenericAdd, GenericSub, GenericMul, GenericDiv,
-    LogAnd, LogOr, LogXor, LogNot,
-    BoxFixnum, UnboxFixnum, BoxFloat, UnboxFloat, WidenI32,
+    FixnumAdd,
+    FixnumSub,
+    FixnumMul,
+    FixnumDiv,
+    FixnumRem,
+    FixnumMod,
+    FixnumNeg,
+    FixnumShl,
+    FixnumShr,
+    FloatAdd,
+    FloatSub,
+    FloatMul,
+    FloatDiv,
+    GenericAdd,
+    GenericSub,
+    GenericMul,
+    GenericDiv,
+    LogAnd,
+    LogOr,
+    LogXor,
+    LogNot,
+    BoxFixnum,
+    UnboxFixnum,
+    BoxFloat,
+    UnboxFloat,
+    WidenI32,
     // Cat 3 — comparison / type checks
-    FixnumCmpEq, FixnumCmpLt, FixnumCmpLe, FixnumCmpGt, FixnumCmpGe,
-    FloatCmpEq, FloatCmpLt,
-    GenericEq, GenericEqual, TypeCheck, InstanceOf,
+    FixnumCmpEq,
+    FixnumCmpLt,
+    FixnumCmpLe,
+    FixnumCmpGt,
+    FixnumCmpGe,
+    FloatCmpEq,
+    FloatCmpLt,
+    GenericEq,
+    GenericEqual,
+    TypeCheck,
+    InstanceOf,
     // Cat 4 — memory / object access (effectful unless proven immutable)
-    Load, Car, Cdr, VecRef, SymbolValue,
+    Load,
+    Car,
+    Cdr,
+    VecRef,
+    SymbolValue,
     /// Direct UTF-8 byte-length load from a value refined by a preceding
     /// `Guard` carrying `AuxData::StringLayout`.
     StringByteLength,
@@ -130,23 +194,40 @@ pub enum Opcode {
     /// is refined by a preceding `StringLayout` guard; negative, out-of-bounds,
     /// and non-ASCII cases deopt to CL:CHAR.
     StringAsciiCharAt,
-    Store, SetCar, SetCdr, VecSet, SetSymbolValue, WriteBarrier,
-    Alloc, AllocCons,
+    Store,
+    SetCar,
+    SetCdr,
+    VecSet,
+    SetSymbolValue,
+    WriteBarrier,
+    Alloc,
+    AllocCons,
     /// Reset the thread's multiple-values state (interpreter `ClearMv`, emitted
     /// after SETQ/SETF and in statement position). No operands, no result;
     /// lowers to a `c2i_clear_mv` call (bliss-mzp).
     ClearMv,
     // Cat 5a — non-terminator control: calls & guards
-    Call, Guard,
+    Call,
+    Guard,
     // Cat 5b — terminators
-    Jump, Brif, BrTable, Return, TailCall, Throw, NlxTransfer, Trap,
+    Jump,
+    Brif,
+    BrTable,
+    Return,
+    TailCall,
+    Throw,
+    NlxTransfer,
+    Trap,
 }
 
 impl Opcode {
     /// Whether this opcode ends a block (carries `BlockCall` successors).
     pub fn is_terminator(self) -> bool {
         use Opcode::*;
-        matches!(self, Jump | Brif | BrTable | Return | TailCall | Throw | NlxTransfer | Trap)
+        matches!(
+            self,
+            Jump | Brif | BrTable | Return | TailCall | Throw | NlxTransfer | Trap
+        )
     }
 }
 
@@ -308,22 +389,48 @@ impl Function {
         f
     }
 
-    pub fn name(&self) -> &str { &self.name }
-    pub fn entry(&self) -> Block { self.entry }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn entry(&self) -> Block {
+        self.entry
+    }
     /// Whether the source function has a variadic lambda list (bliss-32l).
-    pub fn is_variadic(&self) -> bool { self.variadic }
-    pub fn set_variadic(&mut self, v: bool) { self.variadic = v; }
-    pub fn block_order(&self) -> &[Block] { &self.block_order }
+    pub fn is_variadic(&self) -> bool {
+        self.variadic
+    }
+    pub fn set_variadic(&mut self, v: bool) {
+        self.variadic = v;
+    }
+    pub fn block_order(&self) -> &[Block] {
+        &self.block_order
+    }
 
     // ── Arena accessors ──
-    pub fn block(&self, b: Block) -> &BlockData { &self.blocks[b.index()] }
-    pub fn block_mut(&mut self, b: Block) -> &mut BlockData { &mut self.blocks[b.index()] }
-    pub fn inst(&self, i: Inst) -> &InstData { &self.insts[i.index()] }
-    pub fn inst_mut(&mut self, i: Inst) -> &mut InstData { &mut self.insts[i.index()] }
-    pub fn value(&self, v: Value) -> &ValueData { &self.values[v.index()] }
-    pub fn num_blocks(&self) -> usize { self.blocks.len() }
-    pub fn num_insts(&self) -> usize { self.insts.len() }
-    pub fn num_values(&self) -> usize { self.values.len() }
+    pub fn block(&self, b: Block) -> &BlockData {
+        &self.blocks[b.index()]
+    }
+    pub fn block_mut(&mut self, b: Block) -> &mut BlockData {
+        &mut self.blocks[b.index()]
+    }
+    pub fn inst(&self, i: Inst) -> &InstData {
+        &self.insts[i.index()]
+    }
+    pub fn inst_mut(&mut self, i: Inst) -> &mut InstData {
+        &mut self.insts[i.index()]
+    }
+    pub fn value(&self, v: Value) -> &ValueData {
+        &self.values[v.index()]
+    }
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+    pub fn num_insts(&self) -> usize {
+        self.insts.len()
+    }
+    pub fn num_values(&self) -> usize {
+        self.values.len()
+    }
 
     pub fn mark_entry_param_checked(&mut self, value: Value) {
         if !self.checked_entry_params.contains(&value) {
@@ -338,9 +445,15 @@ impl Function {
     /// Whether a handle is in range for this function's arenas. Verification
     /// (P2) and any pass handling possibly-malformed IR should gate on these
     /// before indexing, since the CFG traversals assume in-range successors.
-    pub fn is_valid_block(&self, b: Block) -> bool { b.index() < self.blocks.len() }
-    pub fn is_valid_inst(&self, i: Inst) -> bool { i.index() < self.insts.len() }
-    pub fn is_valid_value(&self, v: Value) -> bool { v.index() < self.values.len() }
+    pub fn is_valid_block(&self, b: Block) -> bool {
+        b.index() < self.blocks.len()
+    }
+    pub fn is_valid_inst(&self, i: Inst) -> bool {
+        i.index() < self.insts.len()
+    }
+    pub fn is_valid_value(&self, v: Value) -> bool {
+        v.index() < self.values.len()
+    }
 
     // ── Inferred-fact channel (spec §4.5 R4.31, §4.10) ──
     // The sanctioned way for an analysis (type inference, unboxing) to write a
@@ -376,10 +489,19 @@ impl Function {
     }
 
     /// Add a typed parameter to `block`, returning its `Value`.
-    pub fn add_block_param(&mut self, block: Block, ty: IRType, repr: ValueRepresentation) -> Value {
+    pub fn add_block_param(
+        &mut self,
+        block: Block,
+        ty: IRType,
+        repr: ValueRepresentation,
+    ) -> Value {
         let num = self.blocks[block.index()].params.len() as u16;
         let v = Value(self.values.len() as u32);
-        self.values.push(ValueData { def: ValueDef::Param { block, num }, ty, repr });
+        self.values.push(ValueData {
+            def: ValueDef::Param { block, num },
+            ty,
+            repr,
+        });
         self.blocks[block.index()].params.push(v);
         v
     }
@@ -392,12 +514,22 @@ impl Function {
         mut data: InstData,
         result_tys: &[(IRType, ValueRepresentation)],
     ) -> (Inst, Vec<Value>) {
-        debug_assert!(!data.opcode.is_terminator(), "use set_terminator for terminators");
+        debug_assert!(
+            !data.opcode.is_terminator(),
+            "use set_terminator for terminators"
+        );
         let inst = Inst(self.insts.len() as u32);
         let mut results = Vec::with_capacity(result_tys.len());
         for (num, &(ty, repr)) in result_tys.iter().enumerate() {
             let v = Value(self.values.len() as u32);
-            self.values.push(ValueData { def: ValueDef::Result { inst, num: num as u16 }, ty, repr });
+            self.values.push(ValueData {
+                def: ValueDef::Result {
+                    inst,
+                    num: num as u16,
+                },
+                ty,
+                repr,
+            });
             results.push(v);
         }
         data.results = results.clone();
@@ -409,8 +541,14 @@ impl Function {
     /// Finish `block` with a terminator instruction (spec §4.3: exactly one,
     /// last). Panics if the block already has a terminator.
     pub fn set_terminator(&mut self, block: Block, mut data: InstData) -> Inst {
-        debug_assert!(data.opcode.is_terminator(), "set_terminator needs a terminator opcode");
-        debug_assert!(!self.block_has_terminator(block), "block already terminated");
+        debug_assert!(
+            data.opcode.is_terminator(),
+            "set_terminator needs a terminator opcode"
+        );
+        debug_assert!(
+            !self.block_has_terminator(block),
+            "block already terminated"
+        );
         data.flags.terminator = true;
         let inst = Inst(self.insts.len() as u32);
         self.insts.push(data);
@@ -437,7 +575,11 @@ impl Function {
     /// Successor blocks of `block` (derived from its terminator's `targets`).
     pub fn succs(&self, block: Block) -> Vec<Block> {
         match self.terminator(block) {
-            Some(t) => self.insts[t.index()].targets.iter().map(|c| c.block).collect(),
+            Some(t) => self.insts[t.index()]
+                .targets
+                .iter()
+                .map(|c| c.block)
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -525,17 +667,16 @@ impl Function {
         // Split after the call. The old instruction remains in the arena but is
         // no longer in block layout, exactly like other dead IR instructions.
         let continuation = self.make_block();
-        let suffix = self.blocks[caller_block.index()].insts.split_off(call_pos + 1);
+        let suffix = self.blocks[caller_block.index()]
+            .insts
+            .split_off(call_pos + 1);
         self.blocks[continuation.index()].insts = suffix;
         self.blocks[caller_block.index()].insts.pop();
 
         let old_result = call_data.results[0];
         let old_result_data = self.value(old_result).clone();
-        let continuation_value = self.add_block_param(
-            continuation,
-            old_result_data.ty,
-            old_result_data.repr,
-        );
+        let continuation_value =
+            self.add_block_param(continuation, old_result_data.ty, old_result_data.repr);
         self.replace_value_everywhere(old_result, continuation_value);
 
         // Allocate the cloned CFG and bind the callee entry parameters to the
@@ -859,7 +1000,10 @@ mod tests {
             results: vec![],
             aux: AuxData::None,
             flags: InstFlags::default(),
-            targets: vec![BlockCall { block: b, args: vec![] }],
+            targets: vec![BlockCall {
+                block: b,
+                args: vec![],
+            }],
             frame_state: None,
             source_pos: 0,
         }
@@ -874,31 +1018,43 @@ mod tests {
         let merge = f.make_block();
 
         // entry: brif-ish → for the smoke test just branch to both via two targets.
-        f.set_terminator(entry, InstData {
-            opcode: Opcode::Brif,
-            args: vec![],
-            results: vec![],
-            aux: AuxData::None,
-            flags: InstFlags::default(),
-            targets: vec![
-                BlockCall { block: b1, args: vec![] },
-                BlockCall { block: b2, args: vec![] },
-            ],
-            frame_state: None,
-            source_pos: 0,
-        });
+        f.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Brif,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![
+                    BlockCall {
+                        block: b1,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: b2,
+                        args: vec![],
+                    },
+                ],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
         f.set_terminator(b1, jump_to(merge));
         f.set_terminator(b2, jump_to(merge));
-        f.set_terminator(merge, InstData {
-            opcode: Opcode::Return,
-            args: vec![],
-            results: vec![],
-            aux: AuxData::None,
-            flags: InstFlags::default(),
-            targets: vec![],
-            frame_state: None,
-            source_pos: 0,
-        });
+        f.set_terminator(
+            merge,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
 
         assert_eq!(f.succs(entry), vec![b1, b2]);
         assert_eq!(f.preds(merge), vec![b1, b2]);
@@ -920,7 +1076,11 @@ mod tests {
     fn ssa_value_defs_are_tracked() {
         let mut f = Function::new("vals");
         let entry = f.entry();
-        let p = f.add_block_param(entry, IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged);
+        let p = f.add_block_param(
+            entry,
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::Tagged,
+        );
         // A constant instruction producing one fixnum result.
         let (inst, results) = f.push_inst(
             entry,
@@ -934,10 +1094,19 @@ mod tests {
                 frame_state: None,
                 source_pos: 0,
             },
-            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::UnboxedFixnum)],
+            &[(
+                IRType::of(TypeBits::FIXNUM),
+                ValueRepresentation::UnboxedFixnum,
+            )],
         );
         assert_eq!(results.len(), 1);
-        assert_eq!(f.value(p).def, ValueDef::Param { block: entry, num: 0 });
+        assert_eq!(
+            f.value(p).def,
+            ValueDef::Param {
+                block: entry,
+                num: 0
+            }
+        );
         assert_eq!(f.value(results[0]).def, ValueDef::Result { inst, num: 0 });
         assert_eq!(f.value(results[0]).repr, ValueRepresentation::UnboxedFixnum);
     }

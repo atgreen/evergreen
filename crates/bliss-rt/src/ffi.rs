@@ -3,7 +3,7 @@
 //! See §2.7 of the spec.
 
 use crate::error::BlissError;
-use crate::thread::{current_fiber, current_stack, current_thread, FiberState, NativeThreadState};
+use crate::thread::{FiberState, NativeThreadState, current_fiber, current_stack, current_thread};
 use crate::value::BlissVal;
 
 // ── Alien type system ──────────────────────────────────────────────
@@ -426,7 +426,7 @@ extern "C" fn bootstrap_trampoline() -> u64 {
 /// - Fixnum → treated as a raw C function pointer (useful for testing)
 /// - Any other type → returns NIL
 fn invoke_closure(closure: BlissVal) -> u64 {
-    use crate::object::{type_id, ClosureData, CompiledFunctionData, ObjectHeader};
+    use crate::object::{ClosureData, CompiledFunctionData, ObjectHeader, type_id};
     #[allow(unused_imports)]
     use crate::value::{TAG_FUNCTION, TAG_MASK};
 
@@ -647,8 +647,8 @@ mod elf_backend {
             }};
         }
         host_syms![
-            malloc, calloc, realloc, free, memcpy, memmove, memset, memcmp,
-            strlen, strcmp, strncmp, strcpy, strncpy, strncat, strcat, abort,
+            malloc, calloc, realloc, free, memcpy, memmove, memset, memcmp, strlen, strcmp,
+            strncmp, strcpy, strncpy, strncat, strcat, abort,
         ]
     }
 

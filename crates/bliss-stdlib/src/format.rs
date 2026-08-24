@@ -4,7 +4,7 @@
 
 use bliss_rt::error::BlissError;
 use bliss_rt::lock_order::{LockLevel, OrderedMutex};
-use bliss_rt::object::{type_id, ObjectHeader};
+use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, NIL, T};
 
 // ── User print-object hook ────────────────────────────────────────
@@ -244,11 +244,7 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         // slynk's UNPARSE-NAME relies on this: `(subseq (prin1-to-string
         // (make-symbol s)) 2)` strips the `#:` — without it that subseq errors.
         if bliss_compiler::reader::is_uninterned(idx) {
-            return if escapep {
-                format!("#:{}", name)
-            } else {
-                name
-            };
+            return if escapep { format!("#:{}", name) } else { name };
         }
         if escapep {
             return name;
@@ -1165,11 +1161,7 @@ fn format_impl(
                 // ~w,dF: d = digits after the decimal point, w = minimum width.
                 let d = if params.len() > 1 {
                     let dd = resolve_param(&params[1], -1, arg_idx)?;
-                    if dd >= 0 {
-                        Some(dd as usize)
-                    } else {
-                        None
-                    }
+                    if dd >= 0 { Some(dd as usize) } else { None }
                 } else {
                     None
                 };
@@ -1641,7 +1633,7 @@ fn format_impl(
                 if i < chars.len() {
                     i += 1;
                 } // skip closing /
-                  // Consume one argument as per CL spec
+                // Consume one argument as per CL spec
                 if *arg_idx >= args.len() {
                     return Err(BlissError::Internal(format!(
                         "too few args for ~/{}/",
@@ -1739,11 +1731,7 @@ fn skip_close_directive(chars: &[char], pos: usize) -> usize {
         }
         j += 1;
     }
-    if j < chars.len() {
-        j + 1
-    } else {
-        j
-    }
+    if j < chars.len() { j + 1 } else { j }
 }
 
 /// Find matching close bracket. `start` is first char of body (after opening bracket).
@@ -1905,7 +1893,7 @@ pub fn formatter(control_string: &str) -> Result<BlissVal, BlissError> {
         let closure = ptr as *mut bliss_rt::object::ClosureData;
         (*closure).header = header;
         (*closure).function = ctrl_str; // the captured control string
-                                        // Store control string in closed_vars slot (offset after ClosureData)
+        // Store control string in closed_vars slot (offset after ClosureData)
         *(ptr.add(std::mem::size_of::<bliss_rt::object::ClosureData>()) as *mut BlissVal) =
             ctrl_str;
         // Return as function-tagged pointer so it's callable
@@ -2105,7 +2093,7 @@ struct PprintDispatchTable {
 /// the provided arguments; on any structural mismatch we return an error so
 /// the caller can fall back gracefully.
 fn call_format_dispatch(func: BlissVal, args: &[BlissVal]) -> Result<BlissVal, BlissError> {
-    use bliss_rt::object::{type_id, CompiledFunctionData};
+    use bliss_rt::object::{CompiledFunctionData, type_id};
 
     if !func.is_function() && !func.is_heap_object() {
         return Err(BlissError::Internal(

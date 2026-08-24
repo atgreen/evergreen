@@ -51,7 +51,10 @@ pub struct FrameScope {
 pub enum ValueSource {
     /// A live SSA value in representation `repr`. The register allocator (P6)
     /// binds it to a location; if `repr` is unboxed, the deopt path reboxes it.
-    Value { value: Value, repr: ValueRepresentation },
+    Value {
+        value: Value,
+        repr: ValueRepresentation,
+    },
     /// A compile-time-constant immediate.
     Const(BlissVal),
     /// Not live in T2 — the interpreter slot receives UNBOUND-MARKER.
@@ -106,10 +109,17 @@ impl FrameStateTable {
         &mut self.states[id.0 as usize]
     }
 
-    pub fn len(&self) -> usize { self.states.len() }
-    pub fn is_empty(&self) -> bool { self.states.is_empty() }
+    pub fn len(&self) -> usize {
+        self.states.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
     pub fn iter(&self) -> impl Iterator<Item = (FrameStateId, &FrameState)> {
-        self.states.iter().enumerate().map(|(i, fs)| (FrameStateId(i as u32), fs))
+        self.states
+            .iter()
+            .enumerate()
+            .map(|(i, fs)| (FrameStateId(i as u32), fs))
     }
 
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut FrameState> {

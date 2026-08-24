@@ -70,7 +70,10 @@ pub fn make(stack: &mut [u8], entry: extern "C" fn()) -> Context {
     // executes with rsp ≡ 8 (mod 16) — the SysV state at a function's first
     // instruction.
     let aligned_top = end & !15usize;
-    debug_assert!(aligned_top.saturating_sub(64) >= base, "fiber stack too small");
+    debug_assert!(
+        aligned_top.saturating_sub(64) >= base,
+        "fiber stack too small"
+    );
     let sp = (aligned_top - 64) as *mut usize;
     // SAFETY: `sp .. sp+56` lies within the stack slice.
     unsafe {

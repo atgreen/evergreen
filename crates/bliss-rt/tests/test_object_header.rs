@@ -5,8 +5,8 @@
 //! walker, tracer, and evacuator must all agree on (spec §1.3).
 
 use bliss_rt::object::{
-    gc_bit, type_id, BignumHeader, ClosureData, ComplexData, CompiledFunctionData, ConsCell,
-    DoubleFloatData, InterpretedFunctionData, ObjectHeader, RatioData, SymbolData,
+    BignumHeader, ClosureData, CompiledFunctionData, ComplexData, ConsCell, DoubleFloatData,
+    InterpretedFunctionData, ObjectHeader, RatioData, SymbolData, gc_bit, type_id,
 };
 use std::mem::{offset_of, size_of};
 

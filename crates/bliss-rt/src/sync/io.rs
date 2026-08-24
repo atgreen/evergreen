@@ -1,8 +1,8 @@
-use super::{blocking_mode, timer, BlockingMode};
+use super::{BlockingMode, blocking_mode, timer};
 use crate::error::BlissError;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,7 +205,8 @@ mod epoll {
     fn poller() -> &'static Poller {
         static POLLER: OnceLock<Poller> = OnceLock::new();
         POLLER.get_or_init(|| {
-            let epoll_fd = crate::syscall::epoll_create1(crate::syscall::EPOLL_CLOEXEC).unwrap_or(-1);
+            let epoll_fd =
+                crate::syscall::epoll_create1(crate::syscall::EPOLL_CLOEXEC).unwrap_or(-1);
             let registrations = Arc::new(OrderedMutex::new(
                 LockLevel::ExecutionRegistry,
                 101,
@@ -282,9 +283,7 @@ mod epoll {
         }
         .is_err()
         {
-            return Err(BlissError::StreamError(
-                "epoll registration failed".into(),
-            ));
+            return Err(BlissError::StreamError("epoll registration failed".into()));
         }
         poller.registrations.lock().unwrap().insert(
             id,

@@ -149,10 +149,10 @@ cooperatively brought to a safepoint or the operation signals
 ### 9.2.4  Condition Variables
 
 ```lisp
-(make-waitqueue &key name)                              ;; → waitqueue (D9.03)
-(condition-wait waitqueue mutex &key timeout)            ;; Atomically release+block. Returns T/NIL.
-(condition-notify waitqueue &optional (count 1))         ;; Wake COUNT waiters.
-(condition-broadcast waitqueue)                          ;; Wake all waiters.
+(bliss-thread:make-condition-variable &key name) ;; → condition-variable (D9.03)
+(bliss-thread:condition-wait condition-variable mutex &key timeout) ;; Atomically release+block. Returns T/NIL.
+(bliss-thread:condition-notify condition-variable &optional (count 1)) ;; Wake COUNT waiters.
+(bliss-thread:condition-broadcast condition-variable) ;; Wake all waiters.
 ```
 
 ### 9.2.5  Semaphores
@@ -168,16 +168,19 @@ cooperatively brought to a safepoint or the operation signals
 ### 9.2.6  Memory Barriers
 
 ```lisp
-(barrier kind) ;; Macro. KIND ∈ {:READ :WRITE :FULL :DATA-DEPENDENCY}. Default :FULL.
+(bliss-ext:memory-barrier &optional (kind :full)) ;; KIND ∈ {:READ :WRITE :FULL :DATA-DEPENDENCY}.
+(bliss-ext:load-barrier)
+(bliss-ext:store-barrier)
 ```
 
 ### 9.2.7  Atomic Operations (CAS)
 
-**R9.37** Bliss MUST provide SBCL-compatible atomic operations in `BLISS-THREAD`,
-re-exported via `SB-EXT` and `SB-THREAD`.
+**R9.37** Bliss MUST provide SBCL-compatible atomic operations in `BLISS-EXT`,
+re-exported via `SB-EXT` and, where SBCL compatibility requires it,
+`SB-THREAD`.
 
 ```lisp
-(cas place old new)
+(bliss-ext:cas place old new)
   ;; Macro. Atomically: if PLACE holds OLD (by EQ), store NEW, return OLD value.
   ;; If PLACE does not hold OLD, return actual current value; no store.
   ;; Applicable place types: special variables, structure slots (defstruct),
@@ -185,13 +188,13 @@ re-exported via `SB-EXT` and `SB-THREAD`.
   ;; Expansion: compiler-generated CAS intrinsic per place type.
   ;; Thread-safety: lock-free; full memory barrier on success.
 
-(atomic-incf place &optional (delta 1))
+(bliss-ext:atomic-incf place &optional (delta 1))
   ;; Atomically increment PLACE by DELTA (a fixnum). Returns previous value.
   ;; Applicable places: fixnum-typed special variables, structure slots
   ;;   declared (type fixnum), SVREF of (simple-array fixnum).
   ;; Thread-safety: lock-free fetch-and-add.
 
-(atomic-decf place &optional (delta 1))
+(bliss-ext:atomic-decf place &optional (delta 1))
   ;; Atomically decrement PLACE by DELTA (a fixnum). Returns previous value.
   ;; Same applicable places and semantics as ATOMIC-INCF.
 ```
@@ -257,11 +260,11 @@ work-stealing deque and scheduler state (§13.5).
 | `interrupt-thread` | safe-point delivery | safepoint delivery (§2.5) | identical |
 | `destroy-thread` | `terminate-thread` | `destroy-thread` + alias | name differs |
 | `condition-wait` spurious | possible | possible | identical |
-| `barrier` | internal | exported | Bliss addition |
+| `memory-barrier` | internal | `bliss-ext:memory-barrier` | Bliss addition |
 | `cas` | `sb-ext:cas` macro | `bliss-ext:cas` macro | identical semantics |
 | `atomic-incf`/`decf` | `sb-ext:atomic-incf` | `bliss-ext:atomic-incf` | identical; overflow signals error |
 | CAS places | specials, struct, svref, car/cdr | same set | identical |
-| `make-lock` (recursive) | `sb-thread:make-lock` | `bliss-threads:make-lock` | identical |
+| `make-lock` (recursive) | `sb-thread:make-lock` | `bliss-thread:make-lock` | identical; `BLISS-THREADS` is a deprecated nickname |
 | Recursive lock semantics | re-entrant, counted | re-entrant, counted | identical |
 
 ---

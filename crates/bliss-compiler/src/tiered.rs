@@ -2,16 +2,16 @@
 //!
 //! See spec §4.4.
 
-use crate::codegen::{native_arch, TargetArch};
+use crate::codegen::{TargetArch, native_arch};
 use crate::ir::{EdgeKind, IrBuilder, IrGraph, NodeKind};
 use crate::opt::PassManager;
 use bliss_rt::error::BlissError;
 use bliss_rt::value::{
-    BlissVal, NIL_BITS, TAG_CONS, TAG_FUNCTION, TAG_SPECIAL, TAG_SYMBOL, T_BITS,
+    BlissVal, NIL_BITS, T_BITS, TAG_CONS, TAG_FUNCTION, TAG_SPECIAL, TAG_SYMBOL,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 /// Compilation tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1363,9 +1363,9 @@ impl BaselineCompiler {
 
                     // Pop callee into rax
                     c.extend_from_slice(&[0x58]); // pop rax
-                                                  // Move to a non-argument register for the call
+                    // Move to a non-argument register for the call
                     c.extend_from_slice(&[0x49, 0x89, 0xC2]); // mov r10, rax
-                                                              // Call through r10
+                    // Call through r10
                     c.extend_from_slice(&[0x41, 0xFF, 0xD2]); // call *r10
                     return;
                 }
@@ -1406,7 +1406,7 @@ impl BaselineCompiler {
                     c.push(0xB9); // mov rcx, NIL_BITS
                     c.extend_from_slice(&NIL_BITS.to_le_bytes());
                     c.extend_from_slice(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
-                                                              // je else_branch (placeholder)
+                    // je else_branch (placeholder)
                     c.extend_from_slice(&[0x0F, 0x84]);
                     let jmp_offset_pos = c.len();
                     c.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // placeholder
@@ -1581,12 +1581,12 @@ impl BaselineCompiler {
         emit_imm64_aarch64(c, form_id as u64);
         // Save x0 to x2 temporarily
         c.extend_from_slice(&0xAA0003E2u32.to_le_bytes()); // mov x2, x0
-                                                           // Load args bits into x1 (second argument) — use x0 then move
+        // Load args bits into x1 (second argument) — use x0 then move
         emit_imm64_aarch64(c, args.0);
         c.extend_from_slice(&0xAA0003E1u32.to_le_bytes()); // mov x1, x0
-                                                           // Restore form_id to x0
+        // Restore form_id to x0
         c.extend_from_slice(&0xAA0203E0u32.to_le_bytes()); // mov x0, x2
-                                                           // Load address of helper
+        // Load address of helper
         emit_imm64_aarch64(c, t1_runtime_eval_special_form as *const u8 as u64);
         // Need x0 for helper address — save form_id from x2 via stack
         // Actually, we need: x0 = form_id, x1 = args. Helper addr in x2.
@@ -1594,7 +1594,7 @@ impl BaselineCompiler {
         // x0 still has helper addr from emit_imm64_aarch64
         c.extend_from_slice(&0xAA0003E3u32.to_le_bytes()); // mov x3, x0 (helper addr)
         c.extend_from_slice(&0xAA0203E0u32.to_le_bytes()); // mov x0, x2 (form_id)
-                                                           // blr x3
+        // blr x3
         c.extend_from_slice(&0xD63F0060u32.to_le_bytes());
     }
 
@@ -1618,13 +1618,13 @@ impl BaselineCompiler {
             emit_imm64_aarch64(c, form.0);
             // Save x0 to x1
             c.extend_from_slice(&0xAA0003E1u32.to_le_bytes()); // mov x1, x0
-                                                               // Load lookup function address
+            // Load lookup function address
             emit_imm64_aarch64(c, t1_runtime_symbol_lookup as *const u8 as u64);
             // Save helper addr in x2
             c.extend_from_slice(&0xAA0003E2u32.to_le_bytes()); // mov x2, x0
-                                                               // Restore symbol bits to x0
+            // Restore symbol bits to x0
             c.extend_from_slice(&0xAA0103E0u32.to_le_bytes()); // mov x0, x1
-                                                               // blr x2
+            // blr x2
             c.extend_from_slice(&0xD63F0040u32.to_le_bytes());
             return;
         }

@@ -28,8 +28,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
 use crate::t2::inlining::{
-    body_cost, decide, metadata_for_symbol, InlineDecision, InlineOptions, InlinePolicy,
-    IntrinsicId,
+    InlineDecision, InlineOptions, InlinePolicy, IntrinsicId, body_cost, decide,
+    metadata_for_symbol,
 };
 use crate::t2::ir::{
     AuxData, Block, Function, IRType, Inst, InstData, InstFlags, Opcode, TypeBits, Value,
@@ -342,6 +342,9 @@ impl<'a> Builder<'a> {
                 Instr::CallNamed { nargs, .. } => {
                     push(i + 1, d - (*nargs as i32) + 1, &mut depth_at, &mut work);
                 }
+                Instr::SetValues(n) => {
+                    push(i + 1, d - (*n as i32) + 1, &mut depth_at, &mut work);
+                }
                 Instr::ClearMv => {
                     push(i + 1, d, &mut depth_at, &mut work); // no operand-stack effect
                 }
@@ -593,6 +596,36 @@ impl<'a> Builder<'a> {
                     // Reset multiple-values state; no operand effect (bliss-mzp).
                     let fs = self.build_frame_state(block, &stack, i as u32);
                     self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, Some(fs));
+                }
+                Instr::SetValues(n) => {
+                    let n = *n as usize;
+                    if stack.len() < n {
+                        return Err(BuildError::Unsupported("stack underflow (SetValues)"));
+                    }
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let split = stack.len() - n;
+                    let args: Vec<Value> = stack.split_off(split);
+                    let values_sym = bliss_rt::symbols::intern("VALUES");
+                    let (_inst, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::Call,
+                            args,
+                            results: vec![],
+                            aux: AuxData::CallTarget(values_sym),
+                            flags: InstFlags {
+                                effectful: true,
+                                call: true,
+                                safepoint: true,
+                                ..InstFlags::default()
+                            },
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
+                    stack.push(results[0]);
                 }
                 Instr::PushBlock { sp_restore, .. } | Instr::PushTag { sp_restore, .. } => {
                     if *sp_restore != 0 {
@@ -1874,9 +1907,11 @@ mod tests {
         assert_eq!(scopes.len(), 2);
         assert_eq!(scopes[0].function, caller);
         assert_eq!(scopes[1].function, helper);
-        assert!(f.source_positions[data.source_pos as usize]
-            .inlined_at
-            .is_some());
+        assert!(
+            f.source_positions[data.source_pos as usize]
+                .inlined_at
+                .is_some()
+        );
         crate::t2::verify::verify(&f).expect("nested metadata verifies");
     }
 
@@ -1990,17 +2025,19 @@ mod tests {
         let mut budget = base.clone();
         budget.config.node_budget = 0;
         let f = build_from_bytecode_with_inline_options(&input, budget).unwrap();
-        assert!(f
-            .block_order()
-            .iter()
-            .any(|&b| has_opcode(&f, b, Opcode::Call)));
+        assert!(
+            f.block_order()
+                .iter()
+                .any(|&b| has_opcode(&f, b, Opcode::Call))
+        );
 
         let notinline = base.clone().with_policy(1, InlinePolicy::NotInline);
         let f = build_from_bytecode_with_inline_options(&input, notinline).unwrap();
-        assert!(f
-            .block_order()
-            .iter()
-            .any(|&b| has_opcode(&f, b, Opcode::Call)));
+        assert!(
+            f.block_order()
+                .iter()
+                .any(|&b| has_opcode(&f, b, Opcode::Call))
+        );
 
         let recursive = Rc::new(bf(
             "BODY-INLINE-LIMITED",
@@ -2021,9 +2058,10 @@ mod tests {
             .with_root_symbol(caller)
             .with_body(helper, recursive);
         let f = build_from_bytecode_with_inline_options(&input, recursive_options).unwrap();
-        assert!(f
-            .block_order()
-            .iter()
-            .any(|&b| has_opcode(&f, b, Opcode::Call)));
+        assert!(
+            f.block_order()
+                .iter()
+                .any(|&b| has_opcode(&f, b, Opcode::Call))
+        );
     }
 }

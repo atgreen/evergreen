@@ -4,7 +4,7 @@
 
 use crate::error::BlissError;
 use crate::gc::GcConfig;
-use crate::object::{type_id, ObjectHeader};
+use crate::object::{ObjectHeader, type_id};
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::value::BlissVal;
 
@@ -655,25 +655,176 @@ pub fn parse_cli(args: &[String]) -> Result<(RuntimeConfig, Vec<String>), BlissE
 
 /// Global flag set by the SIGINT handler to indicate a user interrupt.
 static SIGINT_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Global flag set by the SIGTERM handler to request orderly shutdown.
+static SIGTERM_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Global flag set by the SIGFPE handler to defer arithmetic-condition delivery.
+static SIGFPE_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Global flag set by the SIGPIPE handler to defer stream-condition delivery.
+static SIGPIPE_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Global flag set by the SIGSEGV handler for deferred null-guard TYPE-ERROR delivery.
+static SIGSEGV_NULL_GUARD_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Global flag set by the SIGSEGV handler for deferred stack-overflow delivery.
+static SIGSEGV_STACK_GUARD_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const SIGSEGV_RECOVERY_SLOTS: usize = 128;
+static SIGSEGV_RECOVERY_TIDS: [std::sync::atomic::AtomicUsize; SIGSEGV_RECOVERY_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_RECOVERY_SLOTS];
+static SIGSEGV_NULL_GUARD_RECOVERY_IPS: [std::sync::atomic::AtomicUsize; SIGSEGV_RECOVERY_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_RECOVERY_SLOTS];
+static SIGSEGV_STACK_GUARD_RECOVERY_IPS: [std::sync::atomic::AtomicUsize; SIGSEGV_RECOVERY_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_RECOVERY_SLOTS];
+const SIGSEGV_STACK_GUARD_SLOTS: usize = 128;
+static SIGSEGV_STACK_GUARD_ADDRS: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK_GUARD_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_STACK_GUARD_SLOTS];
+static SIGSEGV_STACK_GUARD_LENS: [std::sync::atomic::AtomicUsize; SIGSEGV_STACK_GUARD_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; SIGSEGV_STACK_GUARD_SLOTS];
+static SIGNAL_ALT_STACK: std::sync::OnceLock<Box<[u8]>> = std::sync::OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigsegvFaultKind {
+    SafepointPoll,
+    StackGuard,
+    NullGuard,
+    Ordinary,
+}
+
+pub fn classify_sigsegv_address(addr: usize) -> SigsegvFaultKind {
+    if crate::safepoint::safepoint_page_contains(addr) {
+        SigsegvFaultKind::SafepointPoll
+    } else if sigsegv_stack_guard_contains(addr) {
+        SigsegvFaultKind::StackGuard
+    } else if addr < 4096 {
+        SigsegvFaultKind::NullGuard
+    } else {
+        SigsegvFaultKind::Ordinary
+    }
+}
 
 /// Check whether a SIGINT has been received since the last check.
 pub fn check_sigint() -> bool {
     SIGINT_RECEIVED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Check whether SIGTERM has requested orderly shutdown since the last check.
+pub fn check_sigterm() -> bool {
+    SIGTERM_RECEIVED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Check whether SIGFPE has been received since the last check.
+pub fn check_sigfpe() -> bool {
+    SIGFPE_RECEIVED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Check whether SIGPIPE has been received since the last output operation.
+pub fn check_sigpipe() -> bool {
+    SIGPIPE_RECEIVED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Check whether a null-guard SIGSEGV has been classified since the last check.
+pub fn check_sigsegv_null_guard() -> bool {
+    SIGSEGV_NULL_GUARD_RECEIVED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn post_sigsegv_null_guard() {
+    SIGSEGV_NULL_GUARD_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_sigsegv_null_guard_recovery_ip(ip: usize) {
+    let tid = crate::syscall::gettid() as usize;
+    if let Some(slot) = sigsegv_recovery_slot_for_tid(tid) {
+        SIGSEGV_NULL_GUARD_RECOVERY_IPS[slot].store(ip, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub fn current_sigsegv_null_guard_recovery_ip() -> usize {
+    sigsegv_null_guard_recovery_ip_for_tid(crate::syscall::gettid() as usize)
+}
+
+/// Check whether a stack-guard SIGSEGV has been classified since the last check.
+pub fn check_sigsegv_stack_guard() -> bool {
+    SIGSEGV_STACK_GUARD_RECEIVED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn post_sigsegv_stack_guard() {
+    SIGSEGV_STACK_GUARD_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_sigsegv_stack_guard_recovery_ip(ip: usize) {
+    let tid = crate::syscall::gettid() as usize;
+    if let Some(slot) = sigsegv_recovery_slot_for_tid(tid) {
+        SIGSEGV_STACK_GUARD_RECOVERY_IPS[slot].store(ip, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub fn current_sigsegv_stack_guard_recovery_ip() -> usize {
+    sigsegv_stack_guard_recovery_ip_for_tid(crate::syscall::gettid() as usize)
+}
+
+pub fn register_sigsegv_stack_guard_range(addr: usize, len: usize) {
+    if addr == 0 || len == 0 {
+        return;
+    }
+
+    for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
+        if SIGSEGV_STACK_GUARD_ADDRS[i].load(std::sync::atomic::Ordering::Relaxed) == addr {
+            SIGSEGV_STACK_GUARD_LENS[i].store(len, std::sync::atomic::Ordering::Release);
+            return;
+        }
+    }
+
+    for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
+        if SIGSEGV_STACK_GUARD_ADDRS[i]
+            .compare_exchange(
+                0,
+                addr,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            SIGSEGV_STACK_GUARD_LENS[i].store(len, std::sync::atomic::Ordering::Release);
+            return;
+        }
+    }
+}
+
+pub fn unregister_sigsegv_stack_guard_range(addr: usize) {
+    if addr == 0 {
+        return;
+    }
+    for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
+        if SIGSEGV_STACK_GUARD_ADDRS[i].load(std::sync::atomic::Ordering::Relaxed) == addr {
+            SIGSEGV_STACK_GUARD_LENS[i].store(0, std::sync::atomic::Ordering::Release);
+            SIGSEGV_STACK_GUARD_ADDRS[i].store(0, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
 /// Install signal handlers (SIGSEGV, SIGINT, SIGTERM, etc.). §2.6.
 /// Issue #11: actually install at least SIGINT and SIGTERM using libc.
 pub fn install_signal_handlers() -> Result<(), BlissError> {
     use crate::syscall;
+    let alt_stack = SIGNAL_ALT_STACK.get_or_init(|| vec![0_u8; 64 * 1024].into_boxed_slice());
+    let stack = syscall::StackT {
+        ss_sp: alt_stack.as_ptr() as *mut u8,
+        ss_flags: 0,
+        ss_size: alt_stack.len(),
+    };
+    // SAFETY: `stack` points at process-lifetime storage retained by OnceLock.
+    unsafe { syscall::sigaltstack(&stack as *const syscall::StackT, core::ptr::null_mut()) }
+        .map_err(|_| BlissError::SignalError(syscall::SIGSEGV))?;
+
     // Direct rt_sigaction (no libc). SIGINT/TERM/SEGV use SA_RESTART; SIGUSR1
     // (the safepoint interrupt) deliberately omits SA_RESTART so a blocking
     // syscall returns EINTR and reaches the next safepoint.
     // SAFETY: each handler is a valid extern "C" fn(i32).
     unsafe {
-        syscall::rt_sigaction(
+        syscall::rt_sigaction_siginfo(
             syscall::SIGSEGV,
             sigsegv_handler as *const () as usize,
-            syscall::SA_RESTART,
+            syscall::SA_RESTART | syscall::SA_ONSTACK,
         )
         .map_err(|_| BlissError::SignalError(syscall::SIGSEGV))?;
         syscall::rt_sigaction(
@@ -688,6 +839,18 @@ pub fn install_signal_handlers() -> Result<(), BlissError> {
             syscall::SA_RESTART,
         )
         .map_err(|_| BlissError::SignalError(syscall::SIGTERM))?;
+        syscall::rt_sigaction(
+            syscall::SIGFPE,
+            sigfpe_handler as *const () as usize,
+            syscall::SA_RESTART,
+        )
+        .map_err(|_| BlissError::SignalError(syscall::SIGFPE))?;
+        syscall::rt_sigaction(
+            syscall::SIGPIPE,
+            sigpipe_handler as *const () as usize,
+            syscall::SA_RESTART,
+        )
+        .map_err(|_| BlissError::SignalError(syscall::SIGPIPE))?;
         syscall::rt_sigaction(
             syscall::SIGUSR1,
             crate::safepoint::sigusr1_handler as *const () as usize,
@@ -705,13 +868,152 @@ extern "C" fn sigint_handler(_sig: i32) {
 }
 
 extern "C" fn sigterm_handler(_sig: i32) {
-    // For SIGTERM, set the SIGINT flag as well to trigger a clean shutdown
-    // path in the runtime's safepoint checks.
-    SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+    SIGTERM_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-extern "C" fn sigsegv_handler(_sig: i32) {
-    crate::syscall::exit_group(0);
+extern "C" fn sigfpe_handler(_sig: i32) {
+    SIGFPE_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+extern "C" fn sigpipe_handler(_sig: i32) {
+    SIGPIPE_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+extern "C" fn sigsegv_handler(
+    _sig: i32,
+    _info: *mut core::ffi::c_void,
+    _context: *mut core::ffi::c_void,
+) {
+    let addr = siginfo_fault_addr(_info);
+    match classify_sigsegv_address(addr) {
+        SigsegvFaultKind::SafepointPoll => {
+            if crate::safepoint::recover_poll_page_sigsegv() {
+                return;
+            }
+            crate::syscall::dbg_write(b"bliss: safepoint poll SIGSEGV\n")
+        }
+        SigsegvFaultKind::NullGuard => {
+            post_sigsegv_null_guard();
+            let recovery_ip =
+                sigsegv_null_guard_recovery_ip_for_tid(crate::syscall::gettid() as usize);
+            if recovery_ip != 0 && rewrite_ucontext_ip(_context, recovery_ip) {
+                return;
+            }
+            crate::syscall::dbg_write(b"bliss: null guard SIGSEGV\n")
+        }
+        SigsegvFaultKind::StackGuard => {
+            post_sigsegv_stack_guard();
+            let recovery_ip =
+                sigsegv_stack_guard_recovery_ip_for_tid(crate::syscall::gettid() as usize);
+            if recovery_ip != 0 && rewrite_ucontext_ip(_context, recovery_ip) {
+                return;
+            }
+            crate::syscall::dbg_write(b"bliss: stack guard SIGSEGV\n")
+        }
+        SigsegvFaultKind::Ordinary => crate::syscall::dbg_write(b"bliss: unhandled SIGSEGV\n"),
+    }
+    crate::syscall::exit_group(128 + crate::syscall::SIGSEGV);
+}
+
+fn sigsegv_recovery_slot_for_tid(tid: usize) -> Option<usize> {
+    if tid == 0 {
+        return None;
+    }
+
+    for i in 0..SIGSEGV_RECOVERY_SLOTS {
+        if SIGSEGV_RECOVERY_TIDS[i].load(std::sync::atomic::Ordering::Acquire) == tid {
+            return Some(i);
+        }
+    }
+
+    for i in 0..SIGSEGV_RECOVERY_SLOTS {
+        if SIGSEGV_RECOVERY_TIDS[i]
+            .compare_exchange(
+                0,
+                tid,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Some(i);
+        }
+    }
+
+    None
+}
+
+fn sigsegv_recovery_slot_index(tid: usize) -> Option<usize> {
+    if tid == 0 {
+        return None;
+    }
+    for i in 0..SIGSEGV_RECOVERY_SLOTS {
+        if SIGSEGV_RECOVERY_TIDS[i].load(std::sync::atomic::Ordering::Acquire) == tid {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn sigsegv_null_guard_recovery_ip_for_tid(tid: usize) -> usize {
+    sigsegv_recovery_slot_index(tid).map_or(0, |slot| {
+        SIGSEGV_NULL_GUARD_RECOVERY_IPS[slot].load(std::sync::atomic::Ordering::Acquire)
+    })
+}
+
+fn sigsegv_stack_guard_recovery_ip_for_tid(tid: usize) -> usize {
+    sigsegv_recovery_slot_index(tid).map_or(0, |slot| {
+        SIGSEGV_STACK_GUARD_RECOVERY_IPS[slot].load(std::sync::atomic::Ordering::Acquire)
+    })
+}
+
+fn sigsegv_stack_guard_contains(addr: usize) -> bool {
+    for i in 0..SIGSEGV_STACK_GUARD_SLOTS {
+        let len = SIGSEGV_STACK_GUARD_LENS[i].load(std::sync::atomic::Ordering::Acquire);
+        if len == 0 {
+            continue;
+        }
+        let base = SIGSEGV_STACK_GUARD_ADDRS[i].load(std::sync::atomic::Ordering::Relaxed);
+        let Some(end) = base.checked_add(len) else {
+            continue;
+        };
+        if addr >= base && addr < end {
+            return true;
+        }
+    }
+    false
+}
+
+fn siginfo_fault_addr(info: *mut core::ffi::c_void) -> usize {
+    if info.is_null() {
+        return usize::MAX;
+    }
+    // Linux siginfo_t stores si_addr for SIGSEGV at offset 16 on the supported
+    // 64-bit ABIs. This is read-only, allocation-free handler work.
+    unsafe { core::ptr::read_unaligned((info as *const u8).add(16) as *const usize) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
+    if context.is_null() {
+        return false;
+    }
+    // Linux x86_64 ucontext_t begins with:
+    // uc_flags:8, uc_link:8, stack_t:24, then mcontext_t.gregs.
+    // REG_RIP is gregs[16], so RIP lives at byte offset 40 + 16 * 8.
+    const UCONTEXT_RIP_OFFSET: usize = 168;
+    unsafe {
+        core::ptr::write_unaligned(
+            (context as *mut u8).add(UCONTEXT_RIP_OFFSET) as *mut usize,
+            ip,
+        );
+    }
+    true
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn rewrite_ucontext_ip(_context: *mut core::ffi::c_void, _ip: usize) -> bool {
+    false
 }
 
 // ══════════════════════════════════════════════════════════════════

@@ -52,7 +52,11 @@ fn loads_a_library_and_calls_a_function() {
     // Imports host memcpy and depends on its constructor having run (ctor == 5).
     let viahost = unsafe { bliss_rt::ffi::foreign_symbol(lib, "viahost") }.expect("viahost");
     let viahost: extern "C" fn(i32) -> i32 = unsafe { std::mem::transmute(viahost) };
-    assert_eq!(viahost(10), 15, "host memcpy + constructor should give x + 5");
+    assert_eq!(
+        viahost(10),
+        15,
+        "host memcpy + constructor should give x + 5"
+    );
 
     // A missing symbol and a bad path both error cleanly.
     assert!(unsafe { bliss_rt::ffi::foreign_symbol(lib, "does_not_exist") }.is_err());

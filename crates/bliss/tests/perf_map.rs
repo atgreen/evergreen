@@ -29,7 +29,10 @@ fn parse_and_collect_names(map: &str) -> Vec<String> {
         );
         let size = u64::from_str_radix(parts[1], 16).expect("size is hex");
         assert!(size > 0, "T1 code size must be positive: {line:?}");
-        assert!(parts[2].starts_with("T1:"), "name must be tagged T1:: {line:?}");
+        assert!(
+            parts[2].starts_with("T1:"),
+            "name must be tagged T1:: {line:?}"
+        );
         names.push(parts[2].trim_start_matches("T1:").to_string());
     }
     names
@@ -48,12 +51,22 @@ fn perf_map_lists_promoted_functions_in_perf_format() {
         .env("BLISS_PERF_MAP", &map_path)
         .output()
         .expect("spawn");
-    assert!(out.status.success(), "run failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let map = std::fs::read_to_string(&map_path).expect("perf map written");
     let names = parse_and_collect_names(&map);
-    assert!(names.iter().any(|n| n == "SQ"), "SQ must be mapped: {map:?}");
-    assert!(names.iter().any(|n| n == "SUMSQ"), "SUMSQ must be mapped: {map:?}");
+    assert!(
+        names.iter().any(|n| n == "SQ"),
+        "SQ must be mapped: {map:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "SUMSQ"),
+        "SUMSQ must be mapped: {map:?}"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -76,7 +89,10 @@ fn perf_map_writes_standard_pid_path() {
     let path = format!("/tmp/perf-{pid}.map");
     let map = std::fs::read_to_string(&path).expect("perf-<pid>.map written");
     let names = parse_and_collect_names(&map);
-    assert!(names.iter().any(|n| n == "SUMSQ"), "SUMSQ must be mapped: {map:?}");
+    assert!(
+        names.iter().any(|n| n == "SUMSQ"),
+        "SUMSQ must be mapped: {map:?}"
+    );
     std::fs::remove_file(&path).ok();
 }
 

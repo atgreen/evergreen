@@ -173,7 +173,7 @@ pub fn set_gc_marking_in_progress(active: bool) {
 // below rather than reading raw bytes.
 
 use crate::lock_order::{LockLevel, OrderedMutex};
-use crate::object::{gc_bit, ObjectHeader};
+use crate::object::{ObjectHeader, gc_bit};
 
 /// Size of the base object header (spec §1.3).
 const OBJECT_HEADER_SIZE: usize = 8;
@@ -2204,6 +2204,8 @@ impl TraceHostRoots for BlissError {
             | BlissError::InvalidImage(_)
             | BlissError::FfiError(_)
             | BlissError::SignalError(_)
+            | BlissError::Interrupt
+            | BlissError::Timeout
             | BlissError::Shutdown
             | BlissError::Internal(_)
             | BlissError::ProgramError(_)
@@ -3207,6 +3209,104 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         unsafe { set_object_type_id(body, body_size, type_id) };
         Some(body)
     })
+}
+
+/// Allocate an immortal pinned object directly in old-gen.
+///
+/// This is for process-lifetime objects whose raw addresses are cached outside
+/// the moving heap, such as interned symbols and their names. Unlike
+/// [`alloc_typed`], this path intentionally does not run `BLISS_GC_STRESS`
+/// before allocation: stress collections are meant to shake out ordinary
+/// nursery relocation bugs, while allocating a pinned object in the nursery
+/// would promote a whole TLAB/region for each object.
+pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
+    if body_size == 0 {
+        return None;
+    }
+    let _ = crate::thread::current_thread_id();
+    crate::safepoint::poll_safepoint();
+    ensure_heap_initialized();
+
+    let (total_size, large) = object_footprint(body_size);
+    let mut guard = heap_state().lock().unwrap();
+    let state = guard.as_mut()?;
+
+    if large {
+        let regions_needed = total_size.div_ceil(state.config.region_size);
+        let total = state.regions.len();
+        'outer: for start in 0..total {
+            if start + regions_needed > total {
+                break;
+            }
+            for offset in 0..regions_needed {
+                if state.regions[start + offset].header.kind != RegionKind::Free {
+                    continue 'outer;
+                }
+            }
+            let ptr = state.regions[start].base;
+            for offset in 0..regions_needed {
+                state.regions[start + offset].header.kind = RegionKind::LargeObject;
+                state.regions[start + offset].header.gen_age = 0;
+            }
+            state.regions[start].header.alloc_top = unsafe { ptr.add(total_size) };
+            state.regions[start].header.live_bytes = total_size as u32;
+            state.stats.large_object_bytes += total_size as u64;
+            state.stats.bytes_allocated += total_size as u64;
+            state.stats.regions_free = state
+                .stats
+                .regions_free
+                .saturating_sub(regions_needed as u32);
+            let body_off = unsafe { write_object_header(ptr, type_id, body_size as u32) };
+            let header = ptr as *mut ObjectHeader;
+            unsafe {
+                (*header).set_pinned();
+            }
+            return Some(unsafe { ptr.add(body_off) });
+        }
+        return None;
+    }
+
+    let mut target_idx = None;
+    for (idx, region) in state.regions.iter().enumerate() {
+        if region.header.kind != RegionKind::OldGen {
+            continue;
+        }
+        let top = region.header.alloc_top as usize;
+        let limit = region.header.alloc_limit as usize;
+        if limit.saturating_sub(top) >= total_size {
+            target_idx = Some(idx);
+            break;
+        }
+    }
+
+    if target_idx.is_none() {
+        for (idx, region) in state.regions.iter_mut().enumerate() {
+            if region.header.kind != RegionKind::Free {
+                continue;
+            }
+            region.header.kind = RegionKind::OldGen;
+            region.header.gen_age = 0;
+            region.header.alloc_top = region.base;
+            region.header.live_bytes = 0;
+            state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
+            target_idx = Some(idx);
+            break;
+        }
+    }
+
+    let idx = target_idx?;
+    let region = &mut state.regions[idx];
+    let ptr = region.header.alloc_top;
+    let body_off = unsafe { write_object_header(ptr, type_id, body_size as u32) };
+    let header = ptr as *mut ObjectHeader;
+    unsafe {
+        (*header).set_pinned();
+    }
+    region.header.alloc_top = unsafe { region.header.alloc_top.add(total_size) };
+    region.header.live_bytes = region.header.live_bytes.saturating_add(total_size as u32);
+    state.stats.bytes_allocated += total_size as u64;
+    state.stats.old_gen_used += total_size as u64;
+    Some(unsafe { ptr.add(body_off) })
 }
 
 /// Retire the current thread's T0 TLAB before it reports safepoint arrival.

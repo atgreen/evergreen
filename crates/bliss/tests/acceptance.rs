@@ -1041,6 +1041,54 @@ fn sandbox_mode_restricts_file_access() {
     );
 }
 
+#[test]
+fn sandbox_cpu_timeout_is_catchable_timeout_condition() {
+    let expr =
+        "(handler-case (loop) (bliss-ext:timeout-condition (e) (declare (ignore e)) :timeout))";
+    let mut child = bliss_bin()
+        .env("BLISS_SANDBOX_CPU_MS", "25")
+        .args(["--sandbox", "--eval", expr])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bliss sandbox timeout check");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll bliss timeout child") {
+            let output = child
+                .wait_with_output()
+                .expect("collect bliss timeout child");
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "stderr: {} stdout: {}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .to_uppercase()
+                    .contains("TIMEOUT"),
+                "timeout condition should be caught and printed, stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("collect killed child");
+            panic!(
+                "sandbox runaway loop was not interrupted within 2s; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════
 // --no-init: skip init file loading
 // ══════════════════════════════════════════════════════════════════
@@ -1249,7 +1297,10 @@ fn handler_bind_resignal_is_seen_by_outer_handler_not_itself() {
 fn mutations_inside_restart_functions_persist() {
     // setq of an outer lexical variable inside a RESTART-CASE restart persists.
     let out1 = bliss_bin()
-        .args(["--eval", "(let ((x 0)) (restart-case (invoke-restart 'bump) (bump () (setq x 99))) x)"])
+        .args([
+            "--eval",
+            "(let ((x 0)) (restart-case (invoke-restart 'bump) (bump () (setq x 99))) x)",
+        ])
         .output()
         .expect("run bliss");
     assert_eq!(out1.status.code(), Some(0));
@@ -1295,11 +1346,17 @@ fn loop_numeric_iteration_and_accumulation() {
         ("(loop for i from 1 to 10 when (evenp i) sum i)", "30"),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            stdout
+                .trim()
+                .to_uppercase()
+                .contains(&expected.to_uppercase()),
             "{expr} => expected {expected}, got: {stdout}"
         );
     }
@@ -1311,17 +1368,32 @@ fn loop_while_until_repeat_drivers() {
     let cases = [
         ("(loop repeat 3 collect 'x)", "(X X X)"),
         ("(loop repeat 0 collect 'x)", "NIL"),
-        ("(let ((i 0)) (loop while (< i 4) do (incf i) collect i))", "(1 2 3 4)"),
-        ("(let ((i 0)) (loop until (>= i 3) do (incf i) collect i))", "(1 2 3)"),
-        ("(loop for i from 1 to 100 while (< i 4) collect i)", "(1 2 3)"),
+        (
+            "(let ((i 0)) (loop while (< i 4) do (incf i) collect i))",
+            "(1 2 3 4)",
+        ),
+        (
+            "(let ((i 0)) (loop until (>= i 3) do (incf i) collect i))",
+            "(1 2 3)",
+        ),
+        (
+            "(loop for i from 1 to 100 while (< i 4) collect i)",
+            "(1 2 3)",
+        ),
         ("(loop for i from 1 repeat 3 collect i)", "(1 2 3)"),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            stdout
+                .trim()
+                .to_uppercase()
+                .contains(&expected.to_uppercase()),
             "{expr} => expected {expected}, got: {stdout}"
         );
     }
@@ -1334,12 +1406,21 @@ fn loop_while_until_repeat_drivers() {
 fn return_exits_dotimes_and_dolist() {
     let cases = [
         ("(dotimes (i 5 :done) (when (= i 2) (return :hit)))", "HIT"),
-        ("(dolist (x '(a b c) :done) (when (eq x 'b) (return x)))", "B"),
+        (
+            "(dolist (x '(a b c) :done) (when (eq x 'b) (return x)))",
+            "B",
+        ),
         ("(dotimes (i 5 :done) nil)", "DONE"),
-        ("(block nil (dotimes (i 10) (when (> i 3) (return-from nil i))))", "4"),
+        (
+            "(block nil (dotimes (i 10) (when (> i 3) (return-from nil i))))",
+            "4",
+        ),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
@@ -1365,11 +1446,17 @@ fn reduce_and_if_predicate_family() {
         ("(assoc-if (function evenp) '((1 . a) (2 . b)))", "(2 . B)"),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            stdout
+                .trim()
+                .to_uppercase()
+                .contains(&expected.to_uppercase()),
             "{expr} => expected {expected}, got: {stdout}"
         );
     }
@@ -1390,20 +1477,45 @@ fn sequence_key_test_with_real_functions() {
         // Lambda as :test.
         ("(find 10 '(1 5 10 20) :test (lambda (a b) (= a b)))", "10"),
         // :from-end, :start, strings, :test-not.
-        ("(find 2 '((2 a) (2 b)) :key (function car) :from-end t)", "(2 B)"),
+        (
+            "(find 2 '((2 a) (2 b)) :key (function car) :from-end t)",
+            "(2 B)",
+        ),
         ("(position #\\a \"banana\" :start 2)", "3"),
-        ("(sort (list (list 2) (list 1)) (function <) :key (function car))", "((1) (2))"),
-        ("(remove \"x\" '(\"a\" \"x\" \"b\") :test (function equal))", "(\"a\" \"b\")"),
-        ("(remove 1 '((1 a) (2 b) (1 c)) :key (function car) :test-not (function =))", "((1 A) (1 C))"),
+        (
+            "(sort (list (list 2) (list 1)) (function <) :key (function car))",
+            "((1) (2))",
+        ),
+        (
+            "(remove \"x\" '(\"a\" \"x\" \"b\") :test (function equal))",
+            "(\"a\" \"b\")",
+        ),
+        (
+            "(remove 1 '((1 a) (2 b) (1 c)) :key (function car) :test-not (function =))",
+            "((1 A) (1 C))",
+        ),
         // The unsupported-function path must be catchable, never abort.
-        ("(ignore-errors (find 2 '((1 a) (2 b)) :key (function car)))", "(2 B)"),
+        (
+            "(ignore-errors (find 2 '((1 a) (2 b)) :key (function car)))",
+            "(2 B)",
+        ),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
-        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (no panic/abort)");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{expr} should exit 0 (no panic/abort)"
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            stdout
+                .trim()
+                .to_uppercase()
+                .contains(&expected.to_uppercase()),
             "{expr} => expected {expected}, got: {stdout}"
         );
     }
@@ -1473,11 +1585,17 @@ fn handler_bind_raw_errors_and_program_error() {
         ),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            stdout
+                .trim()
+                .to_uppercase()
+                .contains(&expected.to_uppercase()),
             "{expr} => expected {expected}, got: {stdout}"
         );
     }
@@ -1534,11 +1652,17 @@ fn handler_clusters_disestablish_whole_cluster_on_resignal() {
         ),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            stdout
+                .trim()
+                .to_uppercase()
+                .contains(&expected.to_uppercase()),
             "{expr} => expected {expected}, got: {stdout}"
         );
     }
@@ -1558,9 +1682,15 @@ fn deep_recursion_raises_catchable_storage_condition_not_sigsegv() {
         ])
         .output()
         .expect("run bliss");
-    assert_eq!(caught.status.code(), Some(0), "overflow should be catchable, exit 0");
+    assert_eq!(
+        caught.status.code(),
+        Some(0),
+        "overflow should be catchable, exit 0"
+    );
     assert!(
-        String::from_utf8_lossy(&caught.stdout).to_uppercase().contains("CAUGHT"),
+        String::from_utf8_lossy(&caught.stdout)
+            .to_uppercase()
+            .contains("CAUGHT"),
         "storage-condition clause should fire: {}",
         String::from_utf8_lossy(&caught.stdout)
     );
@@ -1575,7 +1705,9 @@ fn deep_recursion_raises_catchable_storage_condition_not_sigsegv() {
         .output()
         .expect("run bliss");
     assert!(
-        String::from_utf8_lossy(&via_super.stdout).to_uppercase().contains("CAUGHT"),
+        String::from_utf8_lossy(&via_super.stdout)
+            .to_uppercase()
+            .contains("CAUGHT"),
         "condition clause should fire on overflow"
     );
 
@@ -1600,7 +1732,11 @@ fn deep_recursion_raises_catchable_storage_condition_not_sigsegv() {
         .output()
         .expect("run bliss");
     assert_eq!(ok.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&ok.stdout).to_uppercase().contains("DONE"));
+    assert!(
+        String::from_utf8_lossy(&ok.stdout)
+            .to_uppercase()
+            .contains("DONE")
+    );
 }
 
 /// Regression: PSETQ, DO, and DO* iteration macros (bliss-2pt.11).
@@ -1608,16 +1744,28 @@ fn deep_recursion_raises_catchable_storage_condition_not_sigsegv() {
 fn do_dostar_psetq() {
     let cases = [
         ("(let ((a 1) (b 2)) (psetq a b b a) (list a b))", "(2 1)"),
-        ("(do ((i 0 (1+ i)) (acc nil)) ((= i 3) (reverse acc)) (push i acc))", "(0 1 2)"),
-        ("(do* ((i 0 (1+ i)) (j (* i 10) (* i 10))) ((= i 3) j))", "30"),
+        (
+            "(do ((i 0 (1+ i)) (acc nil)) ((= i 3) (reverse acc)) (push i acc))",
+            "(0 1 2)",
+        ),
+        (
+            "(do* ((i 0 (1+ i)) (j (* i 10) (* i 10))) ((= i 3) j))",
+            "30",
+        ),
         ("(do ((i 0 (1+ i)) (s 0 (+ s i))) ((= i 5) s))", "10"),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            stdout
+                .trim()
+                .to_uppercase()
+                .contains(&expected.to_uppercase()),
             "{expr} => expected {expected}, got: {stdout}"
         );
     }
@@ -1644,11 +1792,17 @@ fn char_string_and_list_functions() {
         ("(nreverse (list 1 2 3))", "(3 2 1)"),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            stdout
+                .trim()
+                .to_uppercase()
+                .contains(&expected.to_uppercase()),
             "{expr} => expected {expected}, got: {stdout}"
         );
     }
@@ -1666,7 +1820,10 @@ fn gcd_lcm_and_string_trim() {
         ("(string-right-trim \" \" \"hi  \")", "\"hi\""),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
@@ -1688,7 +1845,10 @@ fn format_fixed_float_directive() {
         ("(format nil \"~f\" 2.5)", "\"2.5\""),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
@@ -1713,11 +1873,17 @@ fn more_list_tree_string_functions() {
         ("(subst 'x 'a '(a b (a c)))", "(X B (X C))"),
     ];
     for (expr, expected) in cases {
-        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
         assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.trim().to_uppercase().contains(&expected.to_uppercase()),
+            stdout
+                .trim()
+                .to_uppercase()
+                .contains(&expected.to_uppercase()),
             "{expr} => expected {expected}, got: {stdout}"
         );
     }
@@ -1745,7 +1911,10 @@ fn gray_output_stream_routes_standard_functions_through_generics() {
          (write-string \"bcd\" cs) \
          (terpri cs) \
          (format t \"COUNT=~a\" (cs-n cs))))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("COUNT=5"),
@@ -1768,7 +1937,10 @@ fn gray_input_stream_routes_read_functions_through_generics() {
              :eof)) \
        (let ((s (make-instance 'list-input :cs (list #\\a #\\b #\\Newline #\\c #\\d)))) \
          (format t \"L1=~a L2=~a EOF=~a\" (read-line s) (read-line s) (read-char s nil :done))))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1789,7 +1961,10 @@ fn sequence_if_functions_accept_start_end_from_end() {
        (position-if (function evenp) (list 1 3 4 5 6) :from-end t) \
        (find-if (function evenp) (list 1 3 4 5) :start 1 :end 3) \
        (count-if (function evenp) (list 1 2 3 4 5 6) :end 4))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     // first even @2; last even @4; find-if even in [1,3)=(3 4)->4; evens in first 4=(1 2 3 4)->2
     assert!(
@@ -1805,7 +1980,10 @@ fn loop_supports_by_step_for_numeric_and_lists() {
        (loop for i from 0 to 10 by 3 collect i) \
        (loop for x in (list 1 2 3 4 5 6) by (function cddr) collect x) \
        (loop for x on (list 1 2 3 4) by (function cddr) collect (car x)))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("(0 3 6 9)|(1 3 5)|(1 3)"),
@@ -1818,7 +1996,10 @@ fn loop_supports_by_step_for_numeric_and_lists() {
 fn unknown_keyword_argument_is_a_catchable_program_error() {
     let prog = "(handler-case (find-if (function evenp) (list 1 2) :bogus 3) \
        (program-error (e) (declare (ignore e)) (format t \"CAUGHT\")))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("CAUGHT"),
@@ -1842,7 +2023,10 @@ fn reexported_inherited_symbol_keeps_identity_and_home_package() {
              (c (find-symbol \"SYM\" :lb6c))) \
          (format t \"~a ~a ~a\" \
            (package-name (symbol-package b)) (eq a b) (eq a c))))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("LB6A T T"),
@@ -1865,7 +2049,10 @@ fn bare_read_in_package_shares_value_cell_with_find_symbol() {
                 (defvar *v* 42) \
                 (in-package :cl-user) \
                 (format t \"~a\" (symbol-value (find-symbol \"*V*\" :lb612)))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("42"),
@@ -1885,7 +2072,10 @@ fn key_param_named_like_exported_symbol_still_matches_bare_keyword() {
                 (defun f (&key wilden) wilden) \
                 (in-package :cl-user) \
                 (format t \"~a\" (lb612k:f :wilden 7))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains('7'),
@@ -1900,7 +2090,10 @@ fn hash_p_literal_is_a_real_pathname() {
     // PATHNAMEP / NAMESTRING / LOAD), not the reader's own object that the rest
     // of the system treats as a non-pathname.
     let prog = "(let ((p #P\"/tmp/x\")) (format t \"~a ~a\" (pathnamep p) (namestring p)))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("T /tmp/x"),
@@ -1923,7 +2116,10 @@ fn let_dynamically_binds_special_variables() {
                 (defvar *r1* (let ((*dv* :inner)) (reader))) \
                 (defvar *r2* (let ((f (lambda () *dv*))) (let ((*dv* :dyn)) (funcall f)))) \
                 (format t \"~a ~a ~a\" *r1* *r2* *dv*)";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("INNER DYN OUTER"),
@@ -1940,7 +2136,10 @@ fn reduce_honors_explicit_nil_initial_value() {
     let prog = "(format t \"~a|~a\" \
                 (reduce (function +) '() :initial-value nil) \
                 (reduce (lambda (a b) (list a b)) '(1 2 3) :initial-value nil))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("NIL|"),
@@ -1956,7 +2155,10 @@ fn setf_of_a_setf_generic_function() {
     let prog = "(defgeneric (setf gsp) (v x)) \
                 (defmethod (setf gsp) (v (x cons)) (setf (car x) v)) \
                 (let ((c (list 0))) (setf (gsp c) 8) (format t \"~a\" c))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("(8)"),
@@ -1971,7 +2173,10 @@ fn setf_of_a_setf_function_place() {
     // (CLHS 5.1.2.9) — ASDF uses (defun (setf operate-level) …).
     let prog = "(defun (setf hd) (v x) (setf (car x) v) v) \
                 (let ((c (list 1 2))) (setf (hd c) 9) (format t \"~a\" c))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("(9 2)"),
@@ -1989,7 +2194,10 @@ fn generic_accepts_union_of_method_keywords() {
                 (defmethod gk :around (x &key verbose) (declare (ignore verbose)) (call-next-method)) \
                 (defmethod gk (x &key mode) (declare (ignore mode)) :ran) \
                 (format t \"~a\" (gk 1 :verbose t :mode :fast))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("RAN"),
@@ -2004,7 +2212,10 @@ fn reader_on_a_non_instance_yields_nil() {
     // NIL rather than an uncatchable error — ASDF relies on (system-source-file nil).
     let prog = "(defclass k () ((s :accessor ks :initform 7))) \
                 (format t \"~a ~a\" (ks (make-instance 'k)) (ks nil))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("7 NIL"),
@@ -2021,7 +2232,10 @@ fn stringp_of_a_pathname_is_false() {
     // — recursed forever (the string branch never cleared), stack-overflowing
     // the whole ASDF load.
     let prog = "(let ((p (pathname \"/tmp/d/\"))) (format t \"~a ~a\" (stringp p) (pathnamep p)))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("NIL T"),
@@ -2038,7 +2252,10 @@ fn load_accepts_a_pathname_designator() {
     let file_path = dir.join("p.lisp");
     std::fs::write(&file_path, "(format t \"LOADED-VIA-PATHNAME\")\n").expect("write");
     let prog = format!("(load #P\"{}\")", file_path.to_str().unwrap());
-    let output = bliss_bin().args(["--eval", &prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", &prog])
+        .output()
+        .expect("run bliss");
     let _ = std::fs::remove_file(&file_path);
     let _ = std::fs::remove_dir(&dir);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2085,8 +2302,7 @@ fn load_pathname_is_dynamic_across_called_functions_and_nested_loads() {
         ),
     )
     .expect("write outer load file");
-    std::fs::write(&failing, "(undefined-load-pathname-probe)\n")
-        .expect("write failing load file");
+    std::fs::write(&failing, "(undefined-load-pathname-probe)\n").expect("write failing load file");
 
     let outer_abs = outer.canonicalize().expect("canonical outer path");
     let inner_abs = inner.canonicalize().expect("canonical inner path");
@@ -2094,7 +2310,10 @@ fn load_pathname_is_dynamic_across_called_functions_and_nested_loads() {
         "(progn (load #P\"{}\") (format t \"TOP=~a\" *load-pathname*))",
         outer.display()
     );
-    let output = bliss_bin().args(["--eval", &prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", &prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "load failed: {stdout}\n{stderr}");
@@ -2168,7 +2387,10 @@ fn probe_file_reports_existing_and_missing() {
     let prog = "(format t \"~a ~a\" \
                 (and (probe-file #P\"/etc/hostname\") t) \
                 (probe-file \"/no/such/file/xyzzy\"))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("T NIL"),
@@ -2183,7 +2405,10 @@ fn random_returns_a_value_in_range() {
     let prog = "(let ((i (random 5)) (f (random 1.0))) \
                 (format t \"~a ~a\" (and (integerp i) (<= 0 i) (< i 5)) \
                                     (and (floatp f) (<= 0 f) (< f 1.0))))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("T T"),
@@ -2198,7 +2423,10 @@ fn pathname_directory_returns_a_list_not_a_namestring() {
     // UIOP/ANSI directory-list arithmetic works, not a namestring string.
     let prog = "(let ((d (pathname-directory (make-pathname :directory (list :absolute \"a\" \"b\"))))) \
        (format t \"~a ~a ~a\" (eq (car d) :absolute) (second d) (third d)))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("T a b"),
@@ -2220,7 +2448,10 @@ fn pathname_accessors_coerce_a_namestring_designator() {
        (pathname-type \"/a/b/foo.txt\") \
        (namestring (make-pathname :name nil :type nil :version nil \
                                   :defaults \"/a/b/foo.txt\")))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("foo|txt|/a/b/"),
@@ -2242,7 +2473,10 @@ fn unsupplied_optional_and_key_params_shadow_enclosing_bindings() {
          (car (let ((end 99)) (pk \"ab\"))) \
          (let ((end 88)) (po)) \
          (let ((end 7)) (find #\\x \"ab\"))))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("NIL NIL NIL"),
@@ -2260,7 +2494,10 @@ fn defun_establishes_implicit_block_for_return_from() {
        (defun f (x) (declare (ignore x)) (return-from f 42) 99) \
        (defun g (n) (dolist (i (list 1 2 3)) (when (= i n) (return-from g i))) :none) \
        (format t \"~a ~a ~a\" (f 1) (g 2) (g 9)))";
-    let output = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    let output = bliss_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run bliss");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("42 2 NONE"),

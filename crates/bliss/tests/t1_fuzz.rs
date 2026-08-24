@@ -22,7 +22,10 @@ const BIN: &str = env!("CARGO_BIN_EXE_bliss-cli");
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
@@ -42,7 +45,12 @@ const SMALL: &[&str] = &["0", "1", "2", "3", "-1", "-2", "7", "-5", "10"];
 /// A pure fixnum-arithmetic expression over the inlined ops.
 fn arith(rng: &mut Rng, depth: usize) -> String {
     if depth == 0 || rng.below(3) == 0 {
-        return if rng.below(2) == 0 { rng.pick(VARS) } else { rng.pick(SMALL) }.to_string();
+        return if rng.below(2) == 0 {
+            rng.pick(VARS)
+        } else {
+            rng.pick(SMALL)
+        }
+        .to_string();
     }
     match rng.below(6) {
         0 => format!("(+ {} {})", arith(rng, depth - 1), arith(rng, depth - 1)),
@@ -83,8 +91,16 @@ fn boolean(rng: &mut Rng, depth: usize) -> String {
         };
     }
     match rng.below(3) {
-        0 => format!("(and {} {})", boolean(rng, depth - 1), boolean(rng, depth - 1)),
-        1 => format!("(or {} {})", boolean(rng, depth - 1), boolean(rng, depth - 1)),
+        0 => format!(
+            "(and {} {})",
+            boolean(rng, depth - 1),
+            boolean(rng, depth - 1)
+        ),
+        1 => format!(
+            "(or {} {})",
+            boolean(rng, depth - 1),
+            boolean(rng, depth - 1)
+        ),
         _ => format!("(not {})", boolean(rng, depth - 1)),
     }
 }
@@ -95,9 +111,9 @@ const ARG_TUPLES: &[&str] = &[
     "3 -7 12",
     "-5 5 -1",
     "1000000000 3 2",
-    "1152921504606846975 1 2",     // near +fixnum-max
-    "-1152921504606846976 -1 1",   // fixnum-min
-    "2 1073741824 2",              // squares overflow
+    "1152921504606846975 1 2",   // near +fixnum-max
+    "-1152921504606846976 -1 1", // fixnum-min
+    "2 1073741824 2",            // squares overflow
 ];
 
 fn build_program(seed: u64, count: usize) -> String {
@@ -126,7 +142,10 @@ fn run(program_path: &str, envs: &[(&str, &str)]) -> (String, bool) {
         cmd.env(k, v);
     }
     let out = cmd.output().expect("spawn bliss-cli");
-    (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.success())
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
 }
 
 #[test]

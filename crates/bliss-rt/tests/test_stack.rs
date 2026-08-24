@@ -30,6 +30,16 @@ fn stack_used_le_capacity() {
 }
 
 #[test]
+fn nonempty_stack_has_registered_guard_page() {
+    let stack = BlissStack::new(4096);
+    let guard = stack.guard_base().expect("nonempty stack has a guard page") as usize;
+    assert_eq!(
+        bliss_rt::runtime::classify_sigsegv_address(guard),
+        bliss_rt::runtime::SigsegvFaultKind::StackGuard
+    );
+}
+
+#[test]
 fn frame_type_repr_values() {
     assert_eq!(FrameType::Call as u8, 0b00);
     assert_eq!(FrameType::Catch as u8, 0b01);
@@ -339,7 +349,7 @@ fn frame_slots_survive_across_deeper_push() {
 
 #[test]
 fn visit_stack_refs_finds_exactly_the_references() {
-    use bliss_rt::{visit_stack_refs, BlissVal};
+    use bliss_rt::{BlissVal, visit_stack_refs};
     let stack = BlissStack::new(64 * 1024);
     // Frame with a mix of references and non-references.
     let f = stack
@@ -368,7 +378,7 @@ fn visit_stack_refs_finds_exactly_the_references() {
 
 #[test]
 fn visit_stack_refs_can_relocate_a_reference() {
-    use bliss_rt::{visit_stack_refs, BlissVal};
+    use bliss_rt::{BlissVal, visit_stack_refs};
     let stack = BlissStack::new(64 * 1024);
     let f = stack
         .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)
@@ -390,7 +400,7 @@ fn visit_stack_refs_can_relocate_a_reference() {
 
 #[test]
 fn visit_stack_refs_walks_all_frames() {
-    use bliss_rt::{visit_stack_refs, BlissVal};
+    use bliss_rt::{BlissVal, visit_stack_refs};
     let stack = BlissStack::new(64 * 1024);
     let f1 = stack
         .push_frame(BlissVal::from_fixnum(0), std::ptr::null(), 1, 0)

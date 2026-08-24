@@ -10,7 +10,7 @@ use bliss_rt::thread::{
     make_thread, safepoint_participant_count_excluding, thread_is_carrier,
 };
 use bliss_rt::value::{BlissVal, NIL, T};
-use bliss_rt::{alloc_typed, Collector, GcConfig, HeapCollector};
+use bliss_rt::{Collector, GcConfig, HeapCollector, alloc_typed};
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -331,10 +331,12 @@ fn scheduler_group_exposes_carriers_and_runs_real_fibers() {
     let fiber = make_fiber(T).expect("fiber creation");
     scheduler.submit(fiber).expect("submit must succeed");
     assert!(!scheduler.carrier_thread_ids().is_empty());
-    assert!(scheduler
-        .carrier_thread_ids()
-        .iter()
-        .all(|id| all_thread_ids().contains(id)));
+    assert!(
+        scheduler
+            .carrier_thread_ids()
+            .iter()
+            .all(|id| all_thread_ids().contains(id))
+    );
     assert_eq!(scheduler.finish().expect("finish must succeed"), vec![T]);
 }
 

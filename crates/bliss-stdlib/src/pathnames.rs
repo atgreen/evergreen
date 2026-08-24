@@ -4,7 +4,7 @@
 
 use bliss_rt::error::BlissError;
 use bliss_rt::lock_order::{LockLevel, OrderedMutex};
-use bliss_rt::object::{type_id, ObjectHeader};
+use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, NIL, T, TAG_HEAP_OBJECT};
 
 use std::collections::HashMap;
@@ -81,6 +81,37 @@ fn scan_pathname_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
             visit(&mut record.version);
         }
     }
+    // The string registries are keyed by (or hold) raw value bits of GC-heap
+    // strings from make_string_bv. A moving GC invalidates those bits: a stale
+    // forward-registry key falsely matches whatever object is later allocated
+    // at the recycled address (format/sequences then treat an unrelated value
+    // as that string), and a stale reverse-registry value hands out a dangling
+    // pointer. Visit each key/value as a root — pinning the string live and
+    // letting the relocation pass rewrite the slot — then rebuild the forward
+    // map under the post-move bits (bliss-a27). Off-heap pathname keys
+    // (make_record_value) are outside the managed heap and pass through
+    // untouched.
+    let mut registry = STRING_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(registry) = registry.as_mut() {
+        let mut entries: Vec<(BlissVal, String)> = registry
+            .drain()
+            .map(|(bits, s)| (BlissVal(bits), s))
+            .collect();
+        for (key, _) in entries.iter_mut() {
+            visit(key);
+        }
+        registry.extend(entries.into_iter().map(|(key, s)| (key.0, s)));
+    }
+    let mut reverse = STRING_REVERSE_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(reverse) = reverse.as_mut() {
+        for value in reverse.values_mut() {
+            visit(value);
+        }
+    }
     let mut translations = LOGICAL_TRANSLATIONS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -144,6 +175,7 @@ fn keyword_hash(s: &str) -> u64 {
 }
 
 fn make_string_bv(s: &str) -> BlissVal {
+    install_pathname_global_root_scanner();
     let existing = with_string_reverse_registry(|rev| rev.get(s).copied());
     if let Some(bv) = existing {
         return bv;
@@ -181,6 +213,7 @@ fn component_string(val: BlissVal) -> Option<String> {
 }
 
 pub fn register_string(val: BlissVal, s: &str) {
+    install_pathname_global_root_scanner();
     with_string_registry(|reg| {
         reg.insert(val.0, s.to_string());
     });
@@ -257,11 +290,7 @@ pub fn is_pathname(val: BlissVal) -> bool {
 }
 
 fn nil_if_empty(s: String) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn resolve_home_path(input: &str) -> Result<String, BlissError> {
@@ -494,7 +523,7 @@ fn directory_from_val(val: BlissVal, uppercase: bool) -> Result<Option<Directory
     if val == NIL {
         return Ok(None);
     }
-    if let Some(s) = lookup_string(val) {
+    if let Some(s) = component_string(val) {
         if s.contains(';') || (!s.starts_with('/') && s.contains(':')) {
             return Ok(parse_logical_namestring(
                 &format!("H:{}", s.trim_start_matches("H:")),

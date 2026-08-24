@@ -15,7 +15,7 @@
 
 use crate::error::BlissError;
 use crate::lock_order::{LockLevel, OrderedRwLock};
-use crate::object::{type_id, ObjectHeader, PackageData};
+use crate::object::{ObjectHeader, PackageData, type_id};
 use crate::value::{BlissVal, NIL};
 use std::collections::HashMap;
 
@@ -54,14 +54,13 @@ static REGISTRY: OrderedRwLock<Option<PackageRegistry>> = OrderedRwLock::new(
 /// Allocate a pinned `SIMPLE_BASE_STRING` (matches the reader/symbol encoding).
 fn alloc_pinned_name(s: &str) -> BlissVal {
     let bytes = s.as_bytes();
-    let body = crate::gc::alloc_typed(8 + bytes.len(), type_id::SIMPLE_BASE_STRING)
+    let body = crate::gc::alloc_pinned_typed(8 + bytes.len(), type_id::SIMPLE_BASE_STRING)
         .expect("OOM allocating package name string");
     // SAFETY: `body` points past a freshly written header.
     unsafe {
         *(body as *mut u64) = bytes.len() as u64;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), body.add(8), bytes.len());
         let v = BlissVal::from_heap_ptr(body.sub(header_size()));
-        crate::gc::pin(v);
         v
     }
 }
@@ -70,7 +69,7 @@ fn alloc_pinned_name(s: &str) -> BlissVal {
 fn alloc_pinned_package(name: &str) -> BlissVal {
     let name_str = alloc_pinned_name(name);
     crate::rooted!(name_str = name_str);
-    let body = crate::gc::alloc_typed(PACKAGE_BODY_SIZE, type_id::PACKAGE)
+    let body = crate::gc::alloc_pinned_typed(PACKAGE_BODY_SIZE, type_id::PACKAGE)
         .expect("OOM allocating package object");
     // SAFETY: `body` is a fresh PACKAGE body; the header precedes it and its
     // start coincides with `PackageData`'s first field.
@@ -84,7 +83,6 @@ fn alloc_pinned_package(name: &str) -> BlissVal {
         (*pkg).nicknames = NIL;
         (*pkg).lock = std::ptr::null_mut();
         let v = BlissVal::from_heap_ptr(header);
-        crate::gc::pin(v);
         v
     }
 }

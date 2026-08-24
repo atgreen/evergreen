@@ -8,7 +8,7 @@
 use crate::error::BlissError;
 use crate::lock_order::{LockLevel, OrderedMutex};
 use crate::thread::{
-    fiber_state, join_fiber, request_fiber_yield, CarrierPool, FiberId, FiberState, NativeThreadId,
+    CarrierPool, FiberId, FiberState, NativeThreadId, fiber_state, join_fiber, request_fiber_yield,
 };
 use crate::value::BlissVal;
 use std::sync::atomic::AtomicU64;

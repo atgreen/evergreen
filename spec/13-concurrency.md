@@ -471,6 +471,47 @@ specials start with global values.
 | Semaphore | `BLISS-THREAD:SEMAPHORE` | Counting semaphore; `WAIT` decrements, `SIGNAL` increments. |
 | Barrier | `BLISS-THREAD:BARRIER` | N-thread barrier with `WAIT` that blocks until all N threads arrive. |
 
+`BLISS-THREADS` is a deprecated compatibility nickname for `BLISS-THREAD`; new
+APIs and examples use `BLISS-THREAD`.
+
+### 13.9.1.1 Public Lambda Lists
+
+```lisp
+(bliss-thread:make-mutex &key name recursive) -> mutex
+(bliss-thread:grab-mutex mutex &key (waitp t) timeout) -> boolean
+(bliss-thread:release-mutex mutex &key (if-not-owner :error)) -> nil
+(bliss-thread:with-mutex (mutex &key (waitp t) timeout) body*) -> values
+
+(bliss-thread:make-rw-lock &key name) -> rw-lock
+(bliss-thread:grab-rw-lock-read rw-lock &key (waitp t) timeout) -> boolean
+(bliss-thread:grab-rw-lock-write rw-lock &key (waitp t) timeout) -> boolean
+(bliss-thread:release-rw-lock-read rw-lock &key (if-not-owner :error)) -> nil
+(bliss-thread:release-rw-lock-write rw-lock &key (if-not-owner :error)) -> nil
+(bliss-thread:with-rw-lock-read (rw-lock &key (waitp t) timeout) body*) -> values
+(bliss-thread:with-rw-lock-write (rw-lock &key (waitp t) timeout) body*) -> values
+
+(bliss-thread:make-condition-variable &key name) -> condition-variable
+(bliss-thread:condition-wait condition-variable mutex &key timeout) -> boolean
+(bliss-thread:condition-notify condition-variable &optional (count 1)) -> count
+(bliss-thread:condition-broadcast condition-variable) -> count
+
+(bliss-thread:make-semaphore &key name (count 0)) -> semaphore
+(bliss-thread:signal-semaphore semaphore &optional (count 1)) -> nil
+(bliss-thread:wait-on-semaphore semaphore &key timeout notification) -> boolean
+(bliss-thread:try-semaphore semaphore &optional (count 1)) -> boolean
+(bliss-thread:semaphore-count semaphore) -> non-negative-integer
+
+(bliss-thread:make-barrier count &key name) -> barrier
+(bliss-thread:barrier-wait barrier &key timeout) -> index, status
+(bliss-thread:barrier-count barrier) -> positive-integer
+(bliss-thread:barrier-waiting-count barrier) -> non-negative-integer
+(bliss-thread:reset-barrier barrier) -> nil
+```
+
+`TIMEOUT` is `NIL` or a non-negative real number of seconds. `WAITP NIL`
+performs a non-blocking try. `IF-NOT-OWNER` accepts `:ERROR`, `:WARN`, or
+`:IGNORE`. Barrier wait status is `:OK`, `:TIMEOUT`, or `:RESET`.
+
 ### 13.9.2 Green-Thread–Aware Blocking
 
 Blocking on a sync primitive parks an unpinned fiber (§2.3.2), freeing its

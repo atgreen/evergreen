@@ -3,9 +3,9 @@
 //! with their structure and identity intact — every internal reference and root
 //! is relocated before any region is reclaimed (bliss-jtc.17).
 
-use bliss_rt::object::{type_id, ObjectHeader};
+use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, NIL, TAG_CONS, TAG_MASK};
-use bliss_rt::{current_thread, init_heap, walk_heap, Allocator, BlissStack, Collector, GcConfig};
+use bliss_rt::{Allocator, BlissStack, Collector, GcConfig, current_thread, init_heap, walk_heap};
 use bliss_rt::{HeapAllocator, HeapCollector};
 use std::sync::{Mutex, OnceLock};
 

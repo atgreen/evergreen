@@ -28,6 +28,12 @@ pub enum BlissError {
     /// Signal handling error. Maps to `BLISS-EXT:SIGNAL-ERROR`.
     SignalError(i32),
 
+    /// User interrupt (SIGINT / Ctrl-C). Maps to CL `INTERRUPT-CONDITION`.
+    Interrupt,
+
+    /// Sandbox CPU deadline exceeded. Maps to `BLISS-EXT:TIMEOUT-CONDITION`.
+    Timeout,
+
     /// Clean shutdown requested. Not signalled as a CL condition.
     Shutdown,
 
@@ -73,6 +79,8 @@ impl core::fmt::Display for BlissError {
             BlissError::InvalidImage(msg) => write!(f, "invalid image: {}", msg),
             BlissError::FfiError(msg) => write!(f, "FFI error: {}", msg),
             BlissError::SignalError(sig) => write!(f, "signal error: signal {}", sig),
+            BlissError::Interrupt => write!(f, "interrupt"),
+            BlissError::Timeout => write!(f, "sandbox CPU timeout"),
             BlissError::Shutdown => write!(f, "shutdown requested"),
             BlissError::Internal(msg) => write!(f, "internal error: {}", msg),
             BlissError::ProgramError(msg) => write!(f, "program error: {}", msg),

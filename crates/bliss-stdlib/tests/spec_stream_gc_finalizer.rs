@@ -8,11 +8,11 @@
 //! serialized on a file-local lock like the other GC tests in the tree.
 
 use bliss_rt::value::{BlissVal, NIL, T};
-use bliss_stdlib::streams::{install_gc_hooks, set_symbol_stream, IF_EXISTS_SUPERSEDE_VAL};
+use bliss_stdlib::streams::{IF_EXISTS_SUPERSEDE_VAL, install_gc_hooks, set_symbol_stream};
 use bliss_stdlib::{
-    make_broadcast_stream, make_lisp_string, make_string_input_stream, make_string_output_stream,
-    make_synonym_stream, open, register_string, stream_read_char,
-    stream_write_string, ExternalFormat, StreamDirection,
+    ExternalFormat, StreamDirection, make_broadcast_stream, make_lisp_string,
+    make_string_input_stream, make_string_output_stream, make_synonym_stream, open,
+    register_string, stream_read_char, stream_write_string,
 };
 use std::sync::{Mutex, OnceLock};
 

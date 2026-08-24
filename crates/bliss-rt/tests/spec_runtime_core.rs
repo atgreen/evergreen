@@ -1,23 +1,22 @@
 use bliss_rt::error::BlissError;
-use bliss_rt::ffi::{ffi_call, marshal_to_c, unmarshal_from_c, AlienType, Callback};
+use bliss_rt::ffi::{AlienType, Callback, ffi_call, marshal_to_c, unmarshal_from_c};
 use bliss_rt::gc::{register_finalizer, set_finalizer_dispatch};
-use bliss_rt::object::{type_id, ObjectHeader};
+use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::runtime::check_sigint;
 use bliss_rt::stack::{
     CodeInfo, Frame, FrameType, FrameWalker, SourceLocation, SourceLocationEntry, StackMapEntry,
 };
 use bliss_rt::thread::{
-    current_fiber, current_stack, current_thread, fiber_yield, join_fiber, make_fiber,
-    submit_fiber, FiberId, FiberState,
+    FiberId, FiberState, current_fiber, current_stack, current_thread, fiber_yield, join_fiber,
+    make_fiber, submit_fiber,
 };
 use bliss_rt::value::{BlissVal, NIL, T, UNBOUND};
 use bliss_rt::{
-    install_signal_handlers, parse_cli, poll_safepoint, resume_all_threads, wait_for_all_threads,
-    LogLevel, Runtime, RuntimeConfig,
+    LogLevel, Runtime, RuntimeConfig, enter_safepoint, install_signal_handlers, parse_cli,
 };
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -590,9 +589,7 @@ fn safepoint_polling_publishes_stack_state_for_gc_walkers() {
     let _guard = lock_serial();
     // Per R2.07, safepoint polling publishes the CL stack top for GC/debugger consumers.
     let thread = current_thread();
-    wait_for_all_threads().unwrap();
-    poll_safepoint();
-    resume_all_threads().unwrap();
+    enter_safepoint();
 
     assert_eq!(thread.stack().published_sp(), thread.stack().used());
     assert_eq!(thread.stack().published_fp(), thread.stack().fp());
@@ -828,16 +825,255 @@ fn subprocess_acceptance_translates_cl_stack_overflow_into_storage_condition() {
 }
 
 #[test]
+fn subprocess_acceptance_aborts_unclassified_sigsegv_without_success() {
+    let _guard = lock_serial();
+    let output = run_helper("ordinary-segv", Duration::from_secs(2));
+
+    assert!(
+        !output.status.success(),
+        "ordinary SIGSEGV must not be reported as a successful subprocess"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unhandled SIGSEGV"),
+        "ordinary SIGSEGV should emit the minimal handler diagnostic; stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn subprocess_acceptance_recovers_safepoint_poll_page_sigsegv() {
+    let _guard = lock_serial();
+    let output = run_helper("safepoint-page-fault", Duration::from_secs(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "safepoint poll-page SIGSEGV should recover and continue; status={:?} stderr={stderr:?}",
+        output.status
+    );
+    assert!(
+        stdout.contains("SAFEPOINT_TRAP"),
+        "safepoint poll-page SIGSEGV should reach the post-fault path; stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn subprocess_acceptance_rewrites_null_guard_sigsegv_to_recovery_ip() {
+    let _guard = lock_serial();
+    let output = run_helper("null-guard-recovery", Duration::from_secs(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "null-guard SIGSEGV should recover outside the signal handler; status={:?} stdout={stdout:?} stderr={stderr:?}",
+        output.status
+    );
+    assert!(
+        stderr.contains("NULL_GUARD_RECOVERED"),
+        "recovery path should observe the deferred null-guard flag; stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn subprocess_acceptance_rewrites_stack_guard_sigsegv_to_recovery_ip() {
+    let _guard = lock_serial();
+    let output = run_helper("stack-guard-recovery", Duration::from_secs(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "stack-guard SIGSEGV should recover outside the signal handler; status={:?} stdout={stdout:?} stderr={stderr:?}",
+        output.status
+    );
+    assert!(
+        stderr.contains("STORAGE_CONDITION"),
+        "recovery path should observe the deferred stack-guard flag; stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn subprocess_acceptance_rewrites_bliss_stack_guard_sigsegv_to_recovery_ip() {
+    let _guard = lock_serial();
+    let output = run_helper("bliss-stack-guard-recovery", Duration::from_secs(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "BlissStack guard SIGSEGV should recover outside the signal handler; status={:?} stdout={stdout:?} stderr={stderr:?}",
+        output.status
+    );
+    assert!(
+        stderr.contains("STORAGE_CONDITION"),
+        "BlissStack guard recovery should observe the deferred stack-guard flag; stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn signal_installation_enables_current_thread_sigaltstack() {
+    let _guard = lock_serial();
+    install_signal_handlers().unwrap();
+
+    let stack = bliss_rt::syscall::current_sigaltstack().unwrap();
+    assert_eq!(
+        stack.ss_flags & bliss_rt::syscall::SS_DISABLE,
+        0,
+        "SIGSEGV handler must have an alternate signal stack"
+    );
+    assert!(
+        stack.ss_size >= bliss_rt::syscall::MIN_SIGSTKSZ,
+        "alternate signal stack is too small: {}",
+        stack.ss_size
+    );
+}
+
+#[test]
+fn sigsegv_address_classifier_distinguishes_null_guard_from_ordinary_faults() {
+    let page = bliss_rt::safepoint::SafepointPage::init().unwrap();
+    assert_eq!(
+        bliss_rt::runtime::classify_sigsegv_address(0),
+        bliss_rt::runtime::SigsegvFaultKind::NullGuard
+    );
+    assert_eq!(
+        bliss_rt::runtime::classify_sigsegv_address(0xfff),
+        bliss_rt::runtime::SigsegvFaultKind::NullGuard
+    );
+    assert_eq!(
+        bliss_rt::runtime::classify_sigsegv_address(0x1_0000),
+        bliss_rt::runtime::SigsegvFaultKind::Ordinary
+    );
+    assert_eq!(
+        bliss_rt::runtime::classify_sigsegv_address(page.address() as usize),
+        bliss_rt::runtime::SigsegvFaultKind::SafepointPoll
+    );
+    bliss_rt::runtime::register_sigsegv_stack_guard_range(0x2_0000, 4096);
+    assert_eq!(
+        bliss_rt::runtime::classify_sigsegv_address(0x2_0000),
+        bliss_rt::runtime::SigsegvFaultKind::StackGuard
+    );
+    bliss_rt::runtime::register_sigsegv_stack_guard_range(0x3_0000, 4096);
+    assert_eq!(
+        bliss_rt::runtime::classify_sigsegv_address(0x2_0000),
+        bliss_rt::runtime::SigsegvFaultKind::StackGuard,
+        "registering another stack guard must not erase an existing live guard"
+    );
+    assert_eq!(
+        bliss_rt::runtime::classify_sigsegv_address(0x3_0000),
+        bliss_rt::runtime::SigsegvFaultKind::StackGuard
+    );
+}
+
+#[test]
+fn null_guard_sigsegv_flag_is_deferred_and_one_shot() {
+    bliss_rt::runtime::post_sigsegv_null_guard();
+    assert!(bliss_rt::runtime::check_sigsegv_null_guard());
+    assert!(!bliss_rt::runtime::check_sigsegv_null_guard());
+}
+
+#[test]
+fn sigsegv_recovery_ips_are_native_thread_local() {
+    extern "C" fn main_null_recovery() -> ! {
+        bliss_rt::syscall::exit_group(71);
+    }
+    extern "C" fn other_null_recovery() -> ! {
+        bliss_rt::syscall::exit_group(72);
+    }
+    extern "C" fn main_stack_recovery() -> ! {
+        bliss_rt::syscall::exit_group(73);
+    }
+    extern "C" fn other_stack_recovery() -> ! {
+        bliss_rt::syscall::exit_group(74);
+    }
+
+    bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(main_null_recovery as *const () as usize);
+    bliss_rt::runtime::set_sigsegv_stack_guard_recovery_ip(
+        main_stack_recovery as *const () as usize,
+    );
+
+    std::thread::spawn(|| {
+        bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(
+            other_null_recovery as *const () as usize,
+        );
+        bliss_rt::runtime::set_sigsegv_stack_guard_recovery_ip(
+            other_stack_recovery as *const () as usize,
+        );
+        assert_eq!(
+            bliss_rt::runtime::current_sigsegv_null_guard_recovery_ip(),
+            other_null_recovery as *const () as usize
+        );
+        assert_eq!(
+            bliss_rt::runtime::current_sigsegv_stack_guard_recovery_ip(),
+            other_stack_recovery as *const () as usize
+        );
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(
+        bliss_rt::runtime::current_sigsegv_null_guard_recovery_ip(),
+        main_null_recovery as *const () as usize
+    );
+    assert_eq!(
+        bliss_rt::runtime::current_sigsegv_stack_guard_recovery_ip(),
+        main_stack_recovery as *const () as usize
+    );
+}
+
+extern "C" fn null_guard_recovery_exit() -> ! {
+    if bliss_rt::runtime::check_sigsegv_null_guard() {
+        bliss_rt::syscall::dbg_write(b"NULL_GUARD_RECOVERED\n");
+        bliss_rt::syscall::exit_group(0);
+    }
+    bliss_rt::syscall::dbg_write(b"NULL_GUARD_FLAG_MISSING\n");
+    bliss_rt::syscall::exit_group(1);
+}
+
+extern "C" fn null_guard_type_error_exit() -> ! {
+    if bliss_rt::runtime::check_sigsegv_null_guard() {
+        unsafe {
+            bliss_rt::syscall::syscall3(
+                bliss_rt::syscall::nr::WRITE,
+                1,
+                b"TYPE_ERROR\n".as_ptr() as usize,
+                b"TYPE_ERROR\n".len(),
+            );
+        }
+        bliss_rt::syscall::exit_group(0);
+    }
+    bliss_rt::syscall::dbg_write(b"NULL_GUARD_FLAG_MISSING\n");
+    bliss_rt::syscall::exit_group(1);
+}
+
+extern "C" fn stack_guard_recovery_exit() -> ! {
+    if bliss_rt::runtime::check_sigsegv_stack_guard() {
+        bliss_rt::syscall::dbg_write(b"STORAGE_CONDITION\n");
+        bliss_rt::syscall::exit_group(0);
+    }
+    bliss_rt::syscall::dbg_write(b"STACK_GUARD_FLAG_MISSING\n");
+    bliss_rt::syscall::exit_group(1);
+}
+
+#[test]
 fn spec_runtime_core_subprocess_helper() {
     match std::env::var("BLISS_RT_SPEC_HELPER").ok().as_deref() {
         Some("safepoint-segv") => {
             install_signal_handlers().unwrap();
+            let page = bliss_rt::safepoint::SafepointPage::init().unwrap();
+            page.request_safepoint().unwrap();
+            unsafe {
+                std::ptr::read_volatile(page.address());
+            }
+            page.resume().unwrap();
             println!("SAFEPOINT_TRAP");
-            unsafe { libc::raise(libc::SIGSEGV) };
         }
         Some("null-deref-segv") => {
             install_signal_handlers().unwrap();
-            println!("TYPE_ERROR");
+            bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(
+                null_guard_type_error_exit as *const () as usize,
+            );
             unsafe {
                 let ptr: *mut u8 = std::ptr::null_mut();
                 std::ptr::write_volatile(ptr, 1);
@@ -847,6 +1083,72 @@ fn spec_runtime_core_subprocess_helper() {
             let mut runtime = Runtime::init(minimal_config()).unwrap();
             let _ = runtime.eval("(progn (defun loop () (loop)) (loop))");
             println!("STORAGE_CONDITION");
+        }
+        Some("ordinary-segv") => {
+            install_signal_handlers().unwrap();
+            unsafe {
+                let ptr = bliss_rt::syscall::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    bliss_rt::syscall::PROT_NONE,
+                    bliss_rt::syscall::MAP_PRIVATE | bliss_rt::syscall::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+                .unwrap();
+                std::ptr::write_volatile(ptr, 1);
+            }
+        }
+        Some("safepoint-page-fault") => {
+            install_signal_handlers().unwrap();
+            let page = bliss_rt::safepoint::SafepointPage::init().unwrap();
+            page.request_safepoint().unwrap();
+            unsafe {
+                std::ptr::read_volatile(page.address());
+            }
+            page.resume().unwrap();
+            println!("SAFEPOINT_TRAP");
+        }
+        Some("null-guard-recovery") => {
+            install_signal_handlers().unwrap();
+            bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(
+                null_guard_recovery_exit as *const () as usize,
+            );
+            unsafe {
+                let ptr: *mut u8 = std::ptr::null_mut();
+                std::ptr::write_volatile(ptr, 1);
+            }
+        }
+        Some("stack-guard-recovery") => {
+            install_signal_handlers().unwrap();
+            let ptr = unsafe {
+                bliss_rt::syscall::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    bliss_rt::syscall::PROT_NONE,
+                    bliss_rt::syscall::MAP_PRIVATE | bliss_rt::syscall::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+                .unwrap()
+            };
+            bliss_rt::runtime::register_sigsegv_stack_guard_range(ptr as usize, 4096);
+            bliss_rt::runtime::set_sigsegv_stack_guard_recovery_ip(
+                stack_guard_recovery_exit as *const () as usize,
+            );
+            unsafe {
+                std::ptr::write_volatile(ptr, 1);
+            }
+        }
+        Some("bliss-stack-guard-recovery") => {
+            install_signal_handlers().unwrap();
+            let stack = bliss_rt::BlissStack::new(4096);
+            bliss_rt::runtime::set_sigsegv_stack_guard_recovery_ip(
+                stack_guard_recovery_exit as *const () as usize,
+            );
+            unsafe {
+                std::ptr::write_volatile(stack.guard_base().unwrap() as *mut u8, 1);
+            }
         }
         _ => {}
     }

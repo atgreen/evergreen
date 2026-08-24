@@ -27,7 +27,7 @@
 
 use crate::error::BlissError;
 use crate::lock_order::{LockLevel, OrderedRwLock};
-use crate::object::{type_id, ObjectHeader, SymbolData};
+use crate::object::{ObjectHeader, SymbolData, type_id};
 use crate::value::{BlissVal, NIL, UNBOUND};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -74,7 +74,7 @@ static UNINTERNED_COUNTER: AtomicU32 = AtomicU32::new(UNINTERNED_BASE);
 /// object reference cached in the registry.
 fn alloc_pinned_name(s: &str) -> BlissVal {
     let bytes = s.as_bytes();
-    let body = crate::gc::alloc_typed(8 + bytes.len(), type_id::SIMPLE_BASE_STRING)
+    let body = crate::gc::alloc_pinned_typed(8 + bytes.len(), type_id::SIMPLE_BASE_STRING)
         .expect("OOM allocating symbol name string");
     // SAFETY: `body` points past a freshly written header at `body - header`.
     unsafe {
@@ -82,7 +82,6 @@ fn alloc_pinned_name(s: &str) -> BlissVal {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), body.add(8), bytes.len());
         let header = body.sub(header_size());
         let v = BlissVal::from_heap_ptr(header);
-        crate::gc::pin(v);
         v
     }
 }
@@ -92,7 +91,7 @@ fn alloc_pinned_name(s: &str) -> BlissVal {
 fn alloc_pinned_symbol(name: BlissVal, package: BlissVal) -> BlissVal {
     crate::rooted!(name = name);
     crate::rooted!(package = package);
-    let body = crate::gc::alloc_typed(SYMBOL_BODY_SIZE, type_id::SYMBOL)
+    let body = crate::gc::alloc_pinned_typed(SYMBOL_BODY_SIZE, type_id::SYMBOL)
         .expect("OOM allocating symbol object");
     // SAFETY: `body` is a fresh SYMBOL body; its header sits at `body - header`,
     // and the header start coincides with `SymbolData`'s first field.
@@ -107,7 +106,6 @@ fn alloc_pinned_symbol(name: BlissVal, package: BlissVal) -> BlissVal {
         (*sym).flags = 0;
         (*sym).tls_index = 0;
         let v = BlissVal::from_heap_ptr(header);
-        crate::gc::pin(v);
         v
     }
 }

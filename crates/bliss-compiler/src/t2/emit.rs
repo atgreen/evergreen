@@ -986,6 +986,7 @@ fn emit_call(
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
     const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
     c2i_call_addr: u64,
+    c2i_recovery_toggle_addr: u64,
     self_sym: Option<u32>,
     self_entry: Option<bliss_rt::asm::Label>,
 ) -> Result<(), EmitError> {
@@ -1040,7 +1041,7 @@ fn emit_call(
     mov_imm64(a, 6, nargs as i64); // mov rsi, nargs
     mov_imm64(a, 9, 0); // mov r9, no call-site profile
     mov_imm64(a, 0, c2i_call_addr as i64); // mov rax, c2i_call
-    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
     if let Some(&r0) = data.results.first() {
         let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
         mov_rr(a, dst, 0); // mov result, rax
@@ -1057,6 +1058,7 @@ fn emit_symbol_value(
     data: &crate::t2::ir::InstData,
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
     c2i_load_global_addr: u64,
+    c2i_recovery_toggle_addr: u64,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
@@ -1065,7 +1067,7 @@ fn emit_symbol_value(
     };
     mov_imm64(a, 7, sym as i64); // mov rdi, sym
     mov_imm64(a, 0, c2i_load_global_addr as i64); // mov rax, c2i_load_global
-    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
     let r0 = *data.results.first().ok_or(EmitError::UnsupportedOp(0xFA))?;
     let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
     mov_rr(a, dst, 0); // mov result, rax
@@ -1080,6 +1082,7 @@ fn emit_set_symbol_value(
     reg: &std::collections::HashMap<crate::t2::ir::Value, u8>,
     const_tagged: &std::collections::HashMap<crate::t2::ir::Value, u64>,
     c2i_store_global_addr: u64,
+    c2i_recovery_toggle_addr: u64,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
@@ -1096,8 +1099,48 @@ fn emit_set_symbol_value(
     }
     mov_imm64(a, 7, sym as i64); // mov rdi, sym
     mov_imm64(a, 0, c2i_store_global_addr as i64); // mov rax, c2i_store_global
-    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    emit_runtime_helper_call(a, c2i_recovery_toggle_addr);
     Ok(())
+}
+
+fn emit_runtime_helper_call(a: &mut Asm, c2i_recovery_toggle_addr: u64) {
+    if c2i_recovery_toggle_addr == 0 {
+        a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        return;
+    }
+
+    // The helper target is in rax; runtime helper arguments may already occupy
+    // rdi/rsi/rdx/rcx/r8/r9. Preserve that caller ABI state while disabling
+    // native-frame SIGSEGV recovery for the Rust helper frame.
+    a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 64
+    a.extend_from_slice(&[0x48, 0x89, 0x3C, 0x24]); // mov [rsp], rdi
+    a.extend_from_slice(&[0x48, 0x89, 0x74, 0x24, 0x08]); // mov [rsp+8], rsi
+    a.extend_from_slice(&[0x48, 0x89, 0x54, 0x24, 0x10]); // mov [rsp+16], rdx
+    a.extend_from_slice(&[0x48, 0x89, 0x4C, 0x24, 0x18]); // mov [rsp+24], rcx
+    a.extend_from_slice(&[0x4C, 0x89, 0x44, 0x24, 0x20]); // mov [rsp+32], r8
+    a.extend_from_slice(&[0x4C, 0x89, 0x4C, 0x24, 0x28]); // mov [rsp+40], r9
+    a.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // mov [rsp+48], rax
+    mov_imm32(a, 7, 0); // mov edi, 0
+    mov_imm64(a, 0, c2i_recovery_toggle_addr as i64); // mov rax, toggle
+    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    a.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x30]); // mov rax, [rsp+48]
+    a.extend_from_slice(&[0x4C, 0x8B, 0x4C, 0x24, 0x28]); // mov r9, [rsp+40]
+    a.extend_from_slice(&[0x4C, 0x8B, 0x44, 0x24, 0x20]); // mov r8, [rsp+32]
+    a.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x18]); // mov rcx, [rsp+24]
+    a.extend_from_slice(&[0x48, 0x8B, 0x54, 0x24, 0x10]); // mov rdx, [rsp+16]
+    a.extend_from_slice(&[0x48, 0x8B, 0x74, 0x24, 0x08]); // mov rsi, [rsp+8]
+    a.extend_from_slice(&[0x48, 0x8B, 0x3C, 0x24]); // mov rdi, [rsp]
+    a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x40]); // add rsp, 64
+
+    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+
+    a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
+    a.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    mov_imm32(a, 7, 1); // mov edi, 1
+    mov_imm64(a, 0, c2i_recovery_toggle_addr as i64); // mov rax, toggle
+    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    a.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp]
+    a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 16
 }
 
 fn edge_home_moves(
@@ -1471,8 +1514,8 @@ fn emit_type_check(
         a.jcc(Cc::Ne, not_found);
         mov_rr(a, SCRATCH, xr);
         alu_r_imm(a, AND, SCRATCH, -8); // clear the low tag bits
-                                        // cmp byte ptr [scratch + 7], BIGNUM. ObjectHeader::type_id occupies
-                                        // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
+        // cmp byte ptr [scratch + 7], BIGNUM. ObjectHeader::type_id occupies
+        // bits 63:56, hence byte offset 7 on the supported little-endian x86-64.
         a.extend_from_slice(&[0x80, 0x7A, 0x07, bliss_rt::object::type_id::BIGNUM]);
         a.jcc(Cc::E, found);
     } else if bits == TypeBits::STRING {
@@ -1784,6 +1827,7 @@ pub fn emit_framed(
         c2i_load_global_addr,
         c2i_store_global_addr,
         c2i_clear_mv_addr,
+        0,
         None,
         self_sym,
     )
@@ -1799,6 +1843,7 @@ pub fn emit_framed_with_activation_slots(
     c2i_load_global_addr: u64,
     c2i_store_global_addr: u64,
     c2i_clear_mv_addr: u64,
+    c2i_recovery_toggle_addr: u64,
     activation_slots: u16,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
@@ -1810,6 +1855,7 @@ pub fn emit_framed_with_activation_slots(
         c2i_load_global_addr,
         c2i_store_global_addr,
         c2i_clear_mv_addr,
+        c2i_recovery_toggle_addr,
         Some(activation_slots),
         self_sym,
     )
@@ -1823,6 +1869,7 @@ fn emit_framed_inner(
     c2i_load_global_addr: u64,
     c2i_store_global_addr: u64,
     c2i_clear_mv_addr: u64,
+    c2i_recovery_toggle_addr: u64,
     activation_slots: Option<u16>,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
@@ -2417,6 +2464,7 @@ fn emit_framed_inner(
                     &inst_reg,
                     &const_tagged,
                     c2i_call_addr,
+                    c2i_recovery_toggle_addr,
                     self_sym,
                     self_entry,
                 )?;
@@ -2450,13 +2498,26 @@ fn emit_framed_inner(
                     label,
                 )?;
             } else if d.opcode == Opcode::SymbolValue {
-                emit_symbol_value(&mut a, &d, &inst_reg, c2i_load_global_addr)?;
+                emit_symbol_value(
+                    &mut a,
+                    &d,
+                    &inst_reg,
+                    c2i_load_global_addr,
+                    c2i_recovery_toggle_addr,
+                )?;
             } else if d.opcode == Opcode::SetSymbolValue {
-                emit_set_symbol_value(&mut a, &d, &inst_reg, &const_tagged, c2i_store_global_addr)?;
+                emit_set_symbol_value(
+                    &mut a,
+                    &d,
+                    &inst_reg,
+                    &const_tagged,
+                    c2i_store_global_addr,
+                    c2i_recovery_toggle_addr,
+                )?;
             } else if d.opcode == Opcode::ClearMv {
                 // Reset multiple-values state: a bare c2i_clear_mv() call.
                 mov_imm64(&mut a, 0, c2i_clear_mv_addr as i64); // mov rax, c2i_clear_mv
-                a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr);
             } else {
                 // In precise mode this inst has its own reconstruction stub (built
                 // above); route its guards there instead of the whole-rerun stub.
@@ -2644,7 +2705,7 @@ fn emit_framed_inner(
     emit_epilogue(&mut a);
     a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
     mov_imm64(&mut a, 0, c2i_deopt_addr as i64); // mov rax, c2i_deopt
-    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr);
     a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
     a.push(0xC3); // ret
 
@@ -2740,7 +2801,7 @@ fn emit_framed_inner(
         mov_imm32(&mut a, 1, 0);
         mov_rr(&mut a, 2, 4); // mov rdx, rsp
         mov_imm64(&mut a, 0, c2i_deopt_t2_addr as i64);
-        a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr);
         if alloc > 0 {
             a.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, imm32
             a.extend_from_slice(&(alloc as i32).to_le_bytes());
@@ -3046,6 +3107,28 @@ mod tests {
         assert_eq!(*code.last().unwrap(), 0xC3, "must end in ret");
     }
 
+    #[test]
+    fn runtime_helper_call_can_bracket_recovery_for_production_c2i_crossings() {
+        let mut asm = Asm::new();
+        emit_runtime_helper_call(&mut asm, 0x1234_5678);
+        let code = asm.finish().unwrap();
+
+        assert_eq!(
+            code.windows(2)
+                .filter(|bytes| *bytes == [0xFF, 0xD0])
+                .count(),
+            3
+        );
+        assert!(
+            code.windows(5).any(|bytes| bytes == [0xBF, 0, 0, 0, 0]),
+            "production helper crossing must disable native recovery before Rust"
+        );
+        assert!(
+            code.windows(5).any(|bytes| bytes == [0xBF, 1, 0, 0, 0]),
+            "production helper crossing must restore native recovery after Rust"
+        );
+    }
+
     /// The real milestone: emit a T2 function and EXECUTE it. `() -> 12345` must
     /// return 12345 when called as a native C function.
     #[cfg(all(target_arch = "x86_64", unix))]
@@ -3116,7 +3199,7 @@ mod tests {
     // Build and speculate `(lambda (x) (* x 5))` into single-guarded-FixnumMul IR.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn speculated_mul5() -> crate::t2::ir::Function {
-        use crate::t2::speculate::{speculate, SpecType};
+        use crate::t2::speculate::{SpecType, speculate};
         use bliss_rt::bytecode::{BytecodeFunction, Instr};
         use bliss_rt::value::BlissVal;
         let star = bliss_rt::symbols::intern("*");
@@ -3266,7 +3349,7 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", unix))]
     fn test_string(bytes: &[u8]) -> bliss_rt::value::BlissVal {
-        use bliss_rt::object::{type_id, ObjectHeader};
+        use bliss_rt::object::{ObjectHeader, type_id};
         let total = (16 + bytes.len() + 7) & !7;
         let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
         unsafe {

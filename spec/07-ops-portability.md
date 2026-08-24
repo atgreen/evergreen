@@ -241,15 +241,18 @@ preserved (R7.20).
 
 ## 7.3  Image Save / Load Operations
 
-### 7.3.1  Save (`BLISS:SAVE-IMAGE`)
+### 7.3.1  Save (`BLISS-EXT:SAVE-IMAGE`)
 
 ```lisp
-(bliss:save-image pathname &key (executable nil)
-                                (compression :none)  ; or :zstd
-                                (purify t))
+(bliss-ext:save-image pathname &key (executable nil)
+                                    (compression :none)  ; or :zstd
+                                    (purify t))
 ;; Returns: pathname on success.
-;; Signals BLISS:IMAGE-ERROR on failure.
+;; Signals BLISS-EXT:IMAGE-ERROR on failure.
 ```
+
+`BLISS:SAVE-IMAGE` and `BLISS:IMAGE-ERROR` are deprecated compatibility
+spellings for older migration code.
 
 1. Trigger a full GC to compact the heap and clear the nursery.
 2. If `purify` is true, promote all live objects to old-gen and
@@ -554,7 +557,7 @@ class Bliss < Formula
     # lib/boot.lisp without requiring a pre-existing image, providing
     # enough of the CL environment to execute SAVE-IMAGE.
     system bin/"bliss", "--bootstrap", "--eval",
-           "(bliss:save-image \"#{lib}/bliss/bliss.bimg\")"
+           "(bliss-ext:save-image \"#{lib}/bliss/bliss.bimg\")"
   end
 end
 ```
@@ -778,7 +781,7 @@ Bootstrap mode MUST:
 - Search for `lib/boot.lisp` relative to the current working directory,
   then relative to the installed prefix, and fail with `FILE-ERROR` if
   neither location is valid.
-- Permit `(bliss:save-image ...)` once the bootstrap sequence has
+- Permit `(bliss-ext:save-image ...)` once the bootstrap sequence has
   completed successfully.
 - Continue to load the standard bootstrap prelude unless
   `--no-bootstrap` is set; `--no-bootstrap` selects the raw

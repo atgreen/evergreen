@@ -29,6 +29,7 @@ fn run(program: &str, envs: &[(&str, &str)]) -> (String, bool) {
         "BLISS_T2_THREADS",
         "BLISS_COMPILE_QUEUE_SIZE",
         "BLISS_DEOPT_BLACKLIST_THRESHOLD",
+        "BLISS_PROFILING_DISABLED",
     ] {
         cmd.env_remove(name);
     }
@@ -36,10 +37,90 @@ fn run(program: &str, envs: &[(&str, &str)]) -> (String, bool) {
         cmd.env(k, v);
     }
     let out = cmd.output().expect("spawn bliss-cli");
-    (
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        out.status.success(),
-    )
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.status.success() {
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+    }
+    (text, out.status.success())
+}
+
+/// BLISS_PROFILING_DISABLED is the zero-overhead profiling mode from R4.58:
+/// counters stay cold and automatic tier promotion is disabled, while ordinary
+/// execution remains correct.
+#[test]
+fn profiling_disabled_omits_counters_and_tier_promotion() {
+    let program = "\
+        (defun profile-off-loop (n) \
+          (let ((s 0)) \
+            (dotimes (i n s) (setq s (+ s i))))) \
+        (dotimes (k 20) (profile-off-loop 30)) \
+        (format t \"~a ~a ~a ~a~%\" \
+          (profile-off-loop 5) \
+          (bliss-ext:function-tier (quote profile-off-loop)) \
+          (bliss-ext:function-invoke-count (quote profile-off-loop)) \
+          (bliss-ext:function-back-edge-count (quote profile-off-loop)))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_PROFILING_DISABLED", "1"),
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "2"),
+            ("BLISS_T1_T2_BACKEDGE_THRESHOLD", "2"),
+        ],
+    );
+    assert!(ok, "profiling-disabled run failed: {out}");
+    let line = out.lines().next().unwrap_or("");
+    assert_eq!(
+        line, "10 0 0 0",
+        "disabled profiling must leave counters and tier cold: {line:?}"
+    );
+}
+
+/// Generic dispatch records a bounded receiver profile for the first argument:
+/// total calls keep increasing, but distinct receiver types are capped at the
+/// fixed ring size required by R4.54. The disabled profiling mode keeps the
+/// same profile cold.
+#[test]
+fn generic_dispatch_records_bounded_receiver_profile() {
+    let program = "\
+        (defclass rp-a () ()) \
+        (defclass rp-b () ()) \
+        (defclass rp-c () ()) \
+        (defclass rp-d () ()) \
+        (defclass rp-e () ()) \
+        (defgeneric rp-g (x)) \
+        (defmethod rp-g ((x rp-a)) 1) \
+        (defmethod rp-g ((x rp-b)) 2) \
+        (defmethod rp-g ((x rp-c)) 3) \
+        (defmethod rp-g ((x rp-d)) 4) \
+        (defmethod rp-g ((x rp-e)) 5) \
+        (let ((a (make-instance (quote rp-a))) \
+              (b (make-instance (quote rp-b))) \
+              (c (make-instance (quote rp-c))) \
+              (d (make-instance (quote rp-d))) \
+              (e (make-instance (quote rp-e)))) \
+          (rp-g a) (rp-g b) (rp-g c) (rp-g d) (rp-g a) (rp-g e) \
+          (format t \"~a ~a~%\" \
+            (bliss-ext:generic-receiver-profile-count (quote rp-g)) \
+            (bliss-ext:generic-receiver-profile-distinct-count (quote rp-g))))";
+    let (out, ok) = run(program, &[]);
+    assert!(ok, "receiver-profile run failed: {out}");
+    let line = out.lines().next().unwrap_or("");
+    assert_eq!(
+        line, "6 4",
+        "profile should count all calls but retain a four-type ring: {line:?}"
+    );
+
+    let (disabled, disabled_ok) = run(program, &[("BLISS_PROFILING_DISABLED", "1")]);
+    assert!(
+        disabled_ok,
+        "disabled receiver-profile run failed: {disabled}"
+    );
+    let disabled_line = disabled.lines().next().unwrap_or("");
+    assert_eq!(
+        disabled_line, "0 0",
+        "disabled profiling must not record receiver profiles: {disabled_line:?}"
+    );
 }
 
 /// A single long call starts in installed T1, queues T2 from a sampled
@@ -72,10 +153,22 @@ fn running_t1_loop_osrs_into_background_compiled_t2() {
     );
     assert!(ok, "live T1→T2 OSR failed: {out}");
     let lines: Vec<_> = out.lines().collect();
-    assert_eq!(lines.first().copied(), Some("1"), "long call must start from T1: {out}");
+    assert_eq!(
+        lines.first().copied(),
+        Some("1"),
+        "long call must start from T1: {out}"
+    );
     let fields: Vec<_> = lines.get(1).unwrap_or(&"").split_whitespace().collect();
-    assert_eq!(fields.first().copied(), Some("49999995000000"), "OSR result: {out}");
-    assert_eq!(fields.get(1).copied(), Some("2"), "T2 must publish during the call: {out}");
+    assert_eq!(
+        fields.first().copied(),
+        Some("49999995000000"),
+        "OSR result: {out}"
+    );
+    assert_eq!(
+        fields.get(1).copied(),
+        Some("2"),
+        "T2 must publish during the call: {out}"
+    );
     let back_edges: u32 = fields.get(2).unwrap_or(&"0").parse().unwrap_or(0);
     assert!(
         (1000..10_000_000).contains(&back_edges),
@@ -112,16 +205,222 @@ fn t1_to_t2_osr_guard_deopts_with_exact_live_state() {
     );
     assert!(ok, "live T2 guard deopt failed: {out}");
     let lines: Vec<_> = out.lines().collect();
-    assert_eq!(lines.first().copied(), Some("1"), "long call must start from T1: {out}");
+    assert_eq!(
+        lines.first().copied(),
+        Some("1"),
+        "long call must start from T1: {out}"
+    );
     let fields: Vec<_> = lines.get(1).unwrap_or(&"").split_whitespace().collect();
     assert_eq!(
         fields.first().copied(),
         Some("1152921504607846975"),
         "OSR/deopt must complete with the exact bignum result: {out}"
     );
-    assert_eq!(fields.get(1).copied(), Some("2"), "T2 must remain installed: {out}");
+    assert_eq!(
+        fields.get(1).copied(),
+        Some("2"),
+        "T2 must remain installed: {out}"
+    );
     let deopts: u64 = fields.get(2).unwrap_or(&"0").parse().unwrap_or(0);
     assert!(deopts >= 1, "the overflow guard must deopt: {out}");
+}
+
+/// Dynamic control state surrounding a live T1→T2 OSR and later T2→T0 deopt
+/// must remain intact. The loop reads the special `*osr-step*` every iteration:
+/// the dynamic binding to 2 changes the final bignum result, the catch tag
+/// receives that deopt-completed value, and the unwind-protect cleanup runs
+/// exactly once while unwinding through the catch.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn t1_to_t2_osr_deopt_preserves_dynamic_state() {
+    let program = "\
+        (defvar *osr-step* 1) \
+        (defvar *osr-log* nil) \
+        (defun dynamic-osr-loop (n) \
+          (let ((sum 1152921504601846975)) \
+            (dotimes (i n sum) (setq sum (+ sum *osr-step*))))) \
+        (dynamic-osr-loop 1) (dynamic-osr-loop 2) \
+        (format t \"~a~%\" (bliss-ext:function-tier (quote dynamic-osr-loop))) \
+        (let ((*osr-step* 2)) \
+          (setq *osr-log* nil) \
+          (let ((answer \
+                  (catch (quote done) \
+                    (unwind-protect \
+                      (throw (quote done) (dynamic-osr-loop 4000000)) \
+                      (setq *osr-log* (cons (quote cleanup) *osr-log*)))))) \
+            (format t \"~a ~a ~a ~a ~a~%\" \
+              answer *osr-step* *osr-log* \
+              (bliss-ext:function-tier (quote dynamic-osr-loop)) \
+              (bliss-ext:function-back-edge-count (quote dynamic-osr-loop)))))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "100000000"),
+            ("BLISS_T1_T2_BACKEDGE_THRESHOLD", "1000"),
+            ("BLISS_OSR_THRESHOLD", "100000000"),
+            ("BLISS_T2_THREADS", "1"),
+        ],
+    );
+    assert!(ok, "dynamic-state OSR/deopt failed: {out}");
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("1"),
+        "long call must start from T1: {out}"
+    );
+    let fields: Vec<_> = lines.get(1).unwrap_or(&"").split_whitespace().collect();
+    assert_eq!(
+        fields.first().copied(),
+        Some("1152921504609846975"),
+        "dynamic special binding must affect the deopt-completed result: {out}"
+    );
+    assert_eq!(
+        fields.get(1).copied(),
+        Some("2"),
+        "dynamic binding must still be active: {out}"
+    );
+    assert_eq!(
+        fields.get(2).copied(),
+        Some("(CLEANUP)"),
+        "unwind-protect cleanup: {out}"
+    );
+    assert_eq!(
+        fields.get(3).copied(),
+        Some("2"),
+        "T2 must publish during the call: {out}"
+    );
+    let back_edges: u32 = fields.get(4).unwrap_or(&"0").parse().unwrap_or(0);
+    assert!(
+        (1000..4_000_000).contains(&back_edges),
+        "T1 should hand off to T2 before completing the loop: {out}"
+    );
+}
+
+/// A heap object live in the activation must remain rooted while the function
+/// OSRs from T1 to T2 and then deopts back to T0. GC stress/poison forces
+/// moving collections around allocation-heavy setup and deopt completion; if
+/// the transition loses the `root` slot, the final CAR/LENGTH check will crash
+/// or read poison.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn t1_to_t2_osr_deopt_keeps_heap_roots_under_gc_stress() {
+    let program = "\
+        (defun gc-osr-loop (root n) \
+          (let ((sum 1152921504606845000)) \
+            (dotimes (i n root) (setq sum (+ sum 1))))) \
+        (let ((root (list (quote anchor) (cons 1 2) \"payload\"))) \
+          (gc-osr-loop root 1) (gc-osr-loop root 2) \
+          (format t \"~a~%\" (bliss-ext:function-tier (quote gc-osr-loop))) \
+          (let ((before (bliss-ext:deopt-count)) \
+                (r (gc-osr-loop root 5000))) \
+            (format t \"~a ~a ~a ~a ~a~%\" \
+              (car r) (length r) \
+              (bliss-ext:function-tier (quote gc-osr-loop)) \
+              (bliss-ext:function-back-edge-count (quote gc-osr-loop)) \
+              (- (bliss-ext:deopt-count) before))))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "100000000"),
+            ("BLISS_T1_T2_BACKEDGE_THRESHOLD", "1000"),
+            ("BLISS_OSR_THRESHOLD", "100000000"),
+            ("BLISS_T2_THREADS", "1"),
+            ("BLISS_HEAP_MB", "4096"),
+            ("BLISS_GC_STRESS", "8"),
+            ("BLISS_GC_POISON", "1"),
+        ],
+    );
+    assert!(ok, "GC-stress OSR/deopt failed: {out}");
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("1"),
+        "long call must start from T1: {out}"
+    );
+    let fields: Vec<_> = lines.get(1).unwrap_or(&"").split_whitespace().collect();
+    assert_eq!(
+        fields.first().copied(),
+        Some("ANCHOR"),
+        "heap list root must survive transition GC stress: {out}"
+    );
+    assert_eq!(
+        fields.get(1).copied(),
+        Some("3"),
+        "root list structure must survive transition GC stress: {out}"
+    );
+    assert_eq!(
+        fields.get(2).copied(),
+        Some("2"),
+        "T2 must publish during the call: {out}"
+    );
+    let back_edges: u32 = fields.get(3).unwrap_or(&"0").parse().unwrap_or(0);
+    assert!(
+        (1000..5000).contains(&back_edges),
+        "T1 should hand off to T2 before completing the loop: {out}"
+    );
+    let deopts: u64 = fields.get(4).unwrap_or(&"0").parse().unwrap_or(0);
+    assert!(deopts >= 1, "overflow guard must deopt under stress: {out}");
+}
+
+/// Multiple values produced after a T2 guard deopt must flow through the
+/// reconstructed interpreter continuation. The hot loop OSRs from T1 to T2,
+/// overflows in the native body, resumes in T0, completes the DOTIMES result
+/// form, and returns both values to MULTIPLE-VALUE-BIND.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn t1_to_t2_osr_deopt_preserves_multiple_values() {
+    let program = "\
+        (defun mv-osr-loop (n) \
+          (let ((sum 1152921504601846975)) \
+            (dotimes (i n (values sum (+ sum 1))) \
+              (setq sum (+ sum 2))))) \
+        (mv-osr-loop 1) (mv-osr-loop 2) \
+        (format t \"~a~%\" (bliss-ext:function-tier (quote mv-osr-loop))) \
+        (multiple-value-bind (primary secondary) (mv-osr-loop 4000000) \
+          (format t \"~a ~a ~a ~a~%\" \
+            primary secondary \
+            (bliss-ext:function-tier (quote mv-osr-loop)) \
+            (bliss-ext:function-back-edge-count (quote mv-osr-loop))))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "100000000"),
+            ("BLISS_T1_T2_BACKEDGE_THRESHOLD", "1000"),
+            ("BLISS_OSR_THRESHOLD", "100000000"),
+            ("BLISS_T2_THREADS", "1"),
+        ],
+    );
+    assert!(ok, "multiple-value OSR/deopt failed: {out}");
+    let lines: Vec<_> = out.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("1"),
+        "long call must start from T1: {out}"
+    );
+    let fields: Vec<_> = lines.get(1).unwrap_or(&"").split_whitespace().collect();
+    assert_eq!(
+        fields.first().copied(),
+        Some("1152921504609846975"),
+        "primary value must be the deopt-completed sum: {out}"
+    );
+    assert_eq!(
+        fields.get(1).copied(),
+        Some("1152921504609846976"),
+        "secondary value must survive the reconstructed continuation: {out}"
+    );
+    assert_eq!(
+        fields.get(2).copied(),
+        Some("2"),
+        "T2 must publish during the call: {out}"
+    );
+    let back_edges: u32 = fields.get(3).unwrap_or(&"0").parse().unwrap_or(0);
+    assert!(
+        (1000..4_000_000).contains(&back_edges),
+        "T1 should hand off to T2 before completing the loop: {out}"
+    );
 }
 
 /// With all tier-control variables absent, the default thresholds eventually
@@ -177,8 +476,14 @@ fn numeric_phase_changes_recompile_t2_instead_of_blacklisting() {
     assert!(out.lines().any(|line| line == "initial=2"), "{out}");
     assert!(out.lines().any(|line| line == "float=12.5 tier=2"), "{out}");
     assert!(out.lines().any(|line| line == "fixnum=35 tier=2"), "{out}");
-    assert!(out.contains("mulss xmm0,xmm1"), "missing float T2 version:\n{out}");
-    assert!(out.lines().any(|line| line.contains("imul ")), "missing fixnum T2 version:\n{out}");
+    assert!(
+        out.contains("mulss xmm0,xmm1"),
+        "missing float T2 version:\n{out}"
+    );
+    assert!(
+        out.lines().any(|line| line.contains("imul ")),
+        "missing fixnum T2 version:\n{out}"
+    );
 }
 
 /// The shipping dispatcher has two real transitions. With T2 enabled by
@@ -203,7 +508,11 @@ fn automatic_tiering_observably_progresses_t0_to_t1_to_t2() {
     );
     assert!(ok, "automatic tiering run failed: {out}");
     let lines: Vec<_> = out.lines().collect();
-    assert_eq!(lines.first().copied(), Some("1"), "T1 must be observable first: {out}");
+    assert_eq!(
+        lines.first().copied(),
+        Some("1"),
+        "T1 must be observable first: {out}"
+    );
     assert_eq!(lines.get(1).copied(), Some("2 35"), "T2 tier/result: {out}");
 }
 
@@ -227,7 +536,11 @@ fn automatic_t2_decline_retains_t1() {
         ],
     );
     assert!(ok, "T2-decline run failed: {out}");
-    assert_eq!(out.lines().next(), Some("1 4"), "declined T2 must retain T1: {out}");
+    assert_eq!(
+        out.lines().next(),
+        Some("1 4"),
+        "declined T2 must retain T1: {out}"
+    );
 }
 
 /// T2 can be disabled for differential/debug runs without restoring the old
@@ -249,7 +562,11 @@ fn explicit_t2_disable_pins_hot_function_at_t1() {
         ],
     );
     assert!(ok, "T2-disabled run failed: {out}");
-    assert_eq!(out.lines().next(), Some("1 35"), "disable switch must retain T1: {out}");
+    assert_eq!(
+        out.lines().next(),
+        Some("1 35"),
+        "disable switch must retain T1: {out}"
+    );
 }
 
 /// Once a caller becomes native, its c2i calls still count and promote the
@@ -275,7 +592,11 @@ fn native_caller_continues_warming_callee_to_t2() {
         ],
     );
     assert!(ok, "native-caller warmup failed: {out}");
-    assert_eq!(out.lines().next(), Some("1 2 35"), "callee must reach T2: {out}");
+    assert_eq!(
+        out.lines().next(),
+        Some("1 2 35"),
+        "callee must reach T2: {out}"
+    );
 }
 
 /// Loop heat accumulated in T0 is an independent T1→T2 trigger. The high
@@ -302,8 +623,16 @@ fn automatic_t2_promotion_uses_backedge_threshold() {
     );
     assert!(ok, "back-edge tiering run failed: {out}");
     let lines: Vec<_> = out.lines().collect();
-    assert_eq!(lines.first().copied(), Some("1"), "loop reaches T1 first: {out}");
-    assert_eq!(lines.get(1).copied(), Some("2 45"), "loop reaches T2 from heat: {out}");
+    assert_eq!(
+        lines.first().copied(),
+        Some("1"),
+        "loop reaches T1 first: {out}"
+    );
+    assert_eq!(
+        lines.get(1).copied(),
+        Some("2 45"),
+        "loop reaches T2 from heat: {out}"
+    );
 }
 
 /// A hot loop's back-edge counter is observable and reflects the trip count,
@@ -352,8 +681,16 @@ fn promotion_to_t1_is_observable_and_result_identical() {
     assert!(t1_ok, "T1 run must succeed; got:\n{t1_out}");
     let t1_line = t1_out.lines().next().unwrap_or("");
     let t1_fields: Vec<&str> = t1_line.split_whitespace().collect();
-    assert_eq!(t1_fields.first().copied(), Some("1"), "sq must reach T1: {t1_line:?}");
-    assert_eq!(t1_fields.get(1).copied(), Some("81"), "T1 result must be 81: {t1_line:?}");
+    assert_eq!(
+        t1_fields.first().copied(),
+        Some("1"),
+        "sq must reach T1: {t1_line:?}"
+    );
+    assert_eq!(
+        t1_fields.get(1).copied(),
+        Some("81"),
+        "T1 result must be 81: {t1_line:?}"
+    );
 
     // Under the pure tree-walker, the result is identical (tier is 0 there).
     let (tw_out, tw_ok) = run(program, &[("BLISS_BACKEND", "tree-walker")]);
@@ -387,9 +724,22 @@ fn hot_loop_promotes_to_t1_with_identical_result() {
 
     let (t1_out, t1_ok) = run(program, &[("BLISS_T1_THRESHOLD", "2")]);
     assert!(t1_ok, "T1 run must succeed; got:\n{t1_out}");
-    let fields: Vec<&str> = t1_out.lines().next().unwrap_or("").split_whitespace().collect();
-    assert_eq!(fields.first().copied(), Some("1"), "the loop must reach T1: {t1_out:?}");
-    assert_eq!(fields.get(1).copied(), Some("5050"), "T1 loop result must be 5050");
+    let fields: Vec<&str> = t1_out
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        fields.first().copied(),
+        Some("1"),
+        "the loop must reach T1: {t1_out:?}"
+    );
+    assert_eq!(
+        fields.get(1).copied(),
+        Some("5050"),
+        "T1 loop result must be 5050"
+    );
 
     // Identical under pure interpretation.
     let (tw_out, tw_ok) = run(program, &[("BLISS_BACKEND", "tree-walker")]);
@@ -399,7 +749,11 @@ fn hot_loop_promotes_to_t1_with_identical_result() {
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .map(str::to_string);
-    assert_eq!(tw_result.as_deref(), Some("5050"), "interpreter result must also be 5050");
+    assert_eq!(
+        tw_result.as_deref(),
+        Some("5050"),
+        "interpreter result must also be 5050"
+    );
 }
 
 /// Idiomatic DOTIMES/DOLIST loops (bliss-jtc.28) lower to bytecode and promote
@@ -416,7 +770,11 @@ fn dotimes_and_dolist_promote_to_t1() {
     assert!(ok, "dotimes run failed: {out}");
     let out = out.lines().next().unwrap_or("").to_string();
     let f: Vec<&str> = out.split_whitespace().collect();
-    assert_eq!(f.first().copied(), Some("1"), "dotimes loop must reach T1: {out:?}");
+    assert_eq!(
+        f.first().copied(),
+        Some("1"),
+        "dotimes loop must reach T1: {out:?}"
+    );
     assert_eq!(f.get(1).copied(), Some("4950"), "dotimes result");
 
     // DOLIST sum.
@@ -428,7 +786,11 @@ fn dotimes_and_dolist_promote_to_t1() {
     assert!(ok, "dolist run failed: {out}");
     let out = out.lines().next().unwrap_or("").to_string();
     let f: Vec<&str> = out.split_whitespace().collect();
-    assert_eq!(f.first().copied(), Some("1"), "dolist loop must reach T1: {out:?}");
+    assert_eq!(
+        f.first().copied(),
+        Some("1"),
+        "dolist loop must reach T1: {out:?}"
+    );
     assert_eq!(f.get(1).copied(), Some("100"), "dolist result");
 }
 
@@ -446,7 +808,11 @@ fn simple_and_numeric_for_loops_promote() {
     assert!(ok, "simple loop run failed: {out}");
     let out = out.lines().next().unwrap_or("").to_string();
     let f: Vec<&str> = out.split_whitespace().collect();
-    assert_eq!(f.first().copied(), Some("1"), "simple loop must reach T1: {out:?}");
+    assert_eq!(
+        f.first().copied(),
+        Some("1"),
+        "simple loop must reach T1: {out:?}"
+    );
     assert_eq!(f.get(1).copied(), Some("4950"), "simple loop result");
 
     // Extended LOOP with an ascending numeric `for` now lowers to the same
@@ -460,7 +826,11 @@ fn simple_and_numeric_for_loops_promote() {
     assert!(ok, "extended loop run failed: {out}");
     let out = out.lines().next().unwrap_or("").to_string();
     let f: Vec<&str> = out.split_whitespace().collect();
-    assert_eq!(f.first().copied(), Some("1"), "numeric-for loop reaches T1: {out:?}");
+    assert_eq!(
+        f.first().copied(),
+        Some("1"),
+        "numeric-for loop reaches T1: {out:?}"
+    );
     assert_eq!(f.get(1).copied(), Some("5050"), "extended loop result");
 }
 
@@ -500,7 +870,10 @@ fn global_store_before_guard_reaches_t2_and_deopts_once() {
     let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
     assert!(tw_ok, "tree-walker run failed: {tw}");
     let twl = tw.lines().next().unwrap_or("").to_string();
-    assert_eq!(twl, line, "T2 result must match the tree-walker: {line:?} vs {twl:?}");
+    assert_eq!(
+        twl, line,
+        "T2 result must match the tree-walker: {line:?} vs {twl:?}"
+    );
 }
 
 /// The metadata-selected INTEGERP expansion composes with a later speculative
@@ -522,15 +895,31 @@ fn metadata_intrinsic_survives_later_forced_deopt() {
     assert!(ok, "T2 intrinsic/deopt run failed: {out}");
     let line = out.lines().next().unwrap_or("").to_string();
     let fields: Vec<&str> = line.split_whitespace().collect();
-    assert_eq!(fields.get(1).copied(), Some("3.5"), "forced-deopt result: {line:?}");
-    let before: u64 = fields.first().expect("before count").parse().expect("count");
+    assert_eq!(
+        fields.get(1).copied(),
+        Some("3.5"),
+        "forced-deopt result: {line:?}"
+    );
+    let before: u64 = fields
+        .first()
+        .expect("before count")
+        .parse()
+        .expect("count");
     let after: u64 = fields.get(2).expect("after count").parse().expect("count");
-    assert_eq!(after, before + 1, "the cold float path must deopt exactly once: {line:?}");
+    assert_eq!(
+        after,
+        before + 1,
+        "the cold float path must deopt exactly once: {line:?}"
+    );
 
     let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
     assert!(tw_ok, "tree-walker run failed: {tw}");
     let tw_fields: Vec<&str> = tw.lines().next().unwrap_or("").split_whitespace().collect();
-    assert_eq!(tw_fields.get(1).copied(), Some("3.5"), "tree-walker oracle: {tw:?}");
+    assert_eq!(
+        tw_fields.get(1).copied(),
+        Some("3.5"),
+        "tree-walker oracle: {tw:?}"
+    );
 }
 
 /// STRINGP is selected by generic inline metadata and emitted as a safe tagged
@@ -594,7 +983,11 @@ fn metadata_first_char_fast_path_and_deopts_match_the_lisp_body() {
     assert!(tw_ok, "tree-walker FIRST-CHAR run failed: {tw}");
     let tw_line = tw.lines().next().unwrap_or("");
     let tw_fields: Vec<&str> = tw_line.split_whitespace().collect();
-    assert_eq!(tw_fields.len(), 5, "unexpected tree-walker output: {tw_line:?}");
+    assert_eq!(
+        tw_fields.len(),
+        5,
+        "unexpected tree-walker output: {tw_line:?}"
+    );
     assert_eq!(&tw_fields[..4], &fields[..4]);
 }
 
@@ -632,8 +1025,7 @@ fn body_inline_deopt_reconstructs_callee_and_caller() {
     assert!(ok, "inlined multi-scope deopt failed: {out}");
     let line = out.lines().next().unwrap_or("");
     assert_eq!(
-        line,
-        "2 NIL 2 NIL 61 2",
+        line, "2 NIL 2 NIL 61 2",
         "effectful/pure tiers and results, side effects, deopts: {line:?}"
     );
 
@@ -735,13 +1127,23 @@ fn declared_fixnum_parameter_removes_arithmetic_type_guard() {
     assert!(ok, "declared T2 function failed: {out}");
     assert_eq!(out.lines().next().unwrap_or(""), "45");
     assert!(out.contains("[tier: T2 (native, profile-guided)]"), "{out}");
-    assert!(out.contains("checked parameter declarations: X: FIXNUM"), "{out}");
     assert!(
-        out.lines().any(|line| line.contains("imul ") && line.ends_with(",5")),
+        out.contains("checked parameter declarations: X: FIXNUM"),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line.contains("imul ") && line.ends_with(",5")),
         "expected direct declared fixnum multiply in allocated registers:\n{out}"
     );
-    assert!(!out.contains("test cl,7"), "declaration proof should remove the operation guard:\n{out}");
-    assert!(out.contains("jo near"), "fixnum overflow must remain guarded:\n{out}");
+    assert!(
+        !out.contains("test cl,7"),
+        "declaration proof should remove the operation guard:\n{out}"
+    );
+    assert!(
+        out.contains("jo near"),
+        "fixnum overflow must remain guarded:\n{out}"
+    );
     assert!(
         out.lines().any(|line| line == "TYPE-ERROR"),
         "wrong declared argument must be caught as TYPE-ERROR:\n{out}"
@@ -797,7 +1199,10 @@ fn t2_regalloc_spills_high_pressure_loop() {
     let (out, ok) = run(program, &[("BLISS_T2", "1")]);
     assert!(ok, "spill-pressure program failed: {out}");
     assert_eq!(out.lines().next().unwrap_or(""), "255", "{out}");
-    assert!(out.lines().any(|line| line == "2"), "function did not reach T2: {out}");
+    assert!(
+        out.lines().any(|line| line == "2"),
+        "function did not reach T2: {out}"
+    );
     assert!(
         out.lines().any(|line| line == "3458764513820540931"),
         "overflow deopt did not reconstruct spilled state: {out}"
@@ -867,8 +1272,14 @@ fn declared_single_float_parameter_removes_arithmetic_type_guard() {
         out.contains("checked parameter declarations: X: SINGLE-FLOAT"),
         "{out}"
     );
-    assert!(out.contains("mulss xmm0,xmm1"), "expected direct declared float multiply:\n{out}");
-    assert!(!out.contains("cmp dl,4"), "declaration proof should remove the float tag guard:\n{out}");
+    assert!(
+        out.contains("mulss xmm0,xmm1"),
+        "expected direct declared float multiply:\n{out}"
+    );
+    assert!(
+        !out.contains("cmp dl,4"),
+        "declaration proof should remove the float tag guard:\n{out}"
+    );
     assert!(out.lines().any(|line| line == "TYPE-ERROR"), "{out}");
 }
 
@@ -900,7 +1311,10 @@ fn global_accumulator_loop_reaches_t2_and_deopts_precisely() {
     let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
     assert!(tw_ok, "tree-walker run failed: {tw}");
     let twl = tw.lines().next().unwrap_or("").to_string();
-    assert_eq!(twl, line, "T2 loop result must match the tree-walker: {line:?} vs {twl:?}");
+    assert_eq!(
+        twl, line,
+        "T2 loop result must match the tree-walker: {line:?} vs {twl:?}"
+    );
 }
 
 /// A loop with several call-local temporaries alongside a couple of loop-carried
@@ -932,7 +1346,10 @@ fn call_local_temporaries_use_caller_saved_and_deopt_correctly() {
     let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
     assert!(tw_ok, "tree-walker run failed: {tw}");
     let twl = tw.lines().next().unwrap_or("").to_string();
-    assert_eq!(twl, line, "T2 result must match the tree-walker: {line:?} vs {twl:?}");
+    assert_eq!(
+        twl, line,
+        "T2 result must match the tree-walker: {line:?} vs {twl:?}"
+    );
 }
 
 /// A hash-table-using function compiles to bytecode (does NOT bail to the
@@ -973,9 +1390,17 @@ fn hash_table_function_compiles_and_promotes() {
     // Identical value under the tree-walker.
     let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
     assert!(tw_ok, "tree-walker run failed: {tw}");
-    let tw_result = tw.lines().next().unwrap_or("").split_once(' ').map(|(_, r)| r.to_string());
+    let tw_result = tw
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_once(' ')
+        .map(|(_, r)| r.to_string());
     let t1_result = line.split_once(' ').map(|(_, r)| r.to_string());
-    assert_eq!(tw_result, t1_result, "T1 hash result must match the tree-walker");
+    assert_eq!(
+        tw_result, t1_result,
+        "T1 hash result must match the tree-walker"
+    );
 }
 
 #[test]
@@ -992,7 +1417,10 @@ fn loop_being_hash_keys_compiles_and_promotes() {
     let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
     assert!(ok, "hash LOOP run failed: {out}");
     let line = out.lines().next().unwrap_or("").to_string();
-    assert_eq!(line, "1 (30 30)", "hash LOOP must reach T1 with the right sums");
+    assert_eq!(
+        line, "1 (30 30)",
+        "hash LOOP must reach T1 with the right sums"
+    );
 
     let (tw, tw_ok) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
     assert!(tw_ok, "tree-walker hash LOOP failed: {tw}");
@@ -1094,7 +1522,10 @@ fn variadic_lambda_lists_compile_and_promote() {
     let (out, ok) = run(prog, &[("BLISS_T1_THRESHOLD", "2")]);
     assert!(ok, "variadic run failed: {out}");
     let line = out.lines().next().unwrap_or("").to_string();
-    assert!(line.starts_with("1 "), "&optional fn must reach T1: {line:?}");
+    assert!(
+        line.starts_with("1 "),
+        "&optional fn must reach T1: {line:?}"
+    );
     assert_eq!(
         line, "1 (10 20 NIL) (5 1 99) (1 (2 3))",
         "variadic results (tier f, f, g, h): {line:?}"
@@ -1170,12 +1601,23 @@ fn nested_eval_when_compiles_and_promotes() {
     let line = out.lines().next().unwrap_or("").to_string();
     // compute reaches T1; (* i i) for 0..9 sums to 285; the :compile-toplevel-only
     // eval-when does NOT fire at execute time, so skipped returns its arg (7).
-    assert_eq!(line, "1 285 7", "eval-when compile result (tier, compute, skipped): {line:?}");
+    assert_eq!(
+        line, "1 285 7",
+        "eval-when compile result (tier, compute, skipped): {line:?}"
+    );
 
     let (tw, _) = run(prog, &[("BLISS_BACKEND", "tree-walker")]);
-    let tw_rest = tw.lines().next().unwrap_or("").split_once(' ').map(|(_, r)| r.to_string());
+    let tw_rest = tw
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_once(' ')
+        .map(|(_, r)| r.to_string());
     let t1_rest = line.split_once(' ').map(|(_, r)| r.to_string());
-    assert_eq!(t1_rest, tw_rest, "eval-when result must match the tree-walker");
+    assert_eq!(
+        t1_rest, tw_rest,
+        "eval-when result must match the tree-walker"
+    );
 }
 
 /// Definitions nested in a top-level PROGN — including a macro that EXPANDS to

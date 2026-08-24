@@ -95,7 +95,10 @@ impl Pass for TypeInference {
 
 // ── Lattice helpers on IRType (ir exposes meet/join only on TypeBits) ─
 
-const FULL: Range = Range { lo: i64::MIN, hi: i64::MAX };
+const FULL: Range = Range {
+    lo: i64::MIN,
+    hi: i64::MAX,
+};
 
 /// CL boolean: a comparison yields `T` (a symbol) or `NIL` (the null type).
 fn boolean() -> IRType {
@@ -145,7 +148,11 @@ fn ty_join(a: IRType, b: IRType) -> IRType {
     IRType {
         bits: a.bits.join(b.bits),
         range,
-        class_id: if a.class_id == b.class_id { a.class_id } else { None },
+        class_id: if a.class_id == b.class_id {
+            a.class_id
+        } else {
+            None
+        },
     }
 }
 
@@ -286,14 +293,22 @@ fn eval(opcode: Opcode, aux: &AuxData, ops: &[IRType]) -> IRType {
                 .iter()
                 .fold(TypeBits::BOTTOM, |acc, o| acc.join(o.bits))
                 .meet(TypeBits::SINGLE_FLOAT.join(TypeBits::DOUBLE_FLOAT));
-            let bits = if bits.is_bottom() { TypeBits::SINGLE_FLOAT } else { bits };
+            let bits = if bits.is_bottom() {
+                TypeBits::SINGLE_FLOAT
+            } else {
+                bits
+            };
             IRType::of(bits)
         }
         BoxFloat | UnboxFloat => {
             let bits = ops[0]
                 .bits
                 .meet(TypeBits::SINGLE_FLOAT.join(TypeBits::DOUBLE_FLOAT));
-            IRType::of(if bits.is_bottom() { TypeBits::SINGLE_FLOAT } else { bits })
+            IRType::of(if bits.is_bottom() {
+                TypeBits::SINGLE_FLOAT
+            } else {
+                bits
+            })
         }
 
         // Generic (tower) arithmetic: numeric contagion — the join of the operand
@@ -372,42 +387,96 @@ fn narrow_cmp(op: Opcode, a: Value, b: Value, taken: bool, g: &Facts) -> Vec<Ref
         FixnumCmpLt => {
             // a < b : a ≤ b.hi-1 ; b ≥ a.lo+1
             if let Some(rb) = rb {
-                out.push(Refine { value: a, ty: fix(Range { lo: i64::MIN, hi: sat_sub(rb.hi, 1) }) });
+                out.push(Refine {
+                    value: a,
+                    ty: fix(Range {
+                        lo: i64::MIN,
+                        hi: sat_sub(rb.hi, 1),
+                    }),
+                });
             }
             if let Some(ra) = ra {
-                out.push(Refine { value: b, ty: fix(Range { lo: sat_add(ra.lo, 1), hi: i64::MAX }) });
+                out.push(Refine {
+                    value: b,
+                    ty: fix(Range {
+                        lo: sat_add(ra.lo, 1),
+                        hi: i64::MAX,
+                    }),
+                });
             }
         }
         FixnumCmpLe => {
             if let Some(rb) = rb {
-                out.push(Refine { value: a, ty: fix(Range { lo: i64::MIN, hi: rb.hi }) });
+                out.push(Refine {
+                    value: a,
+                    ty: fix(Range {
+                        lo: i64::MIN,
+                        hi: rb.hi,
+                    }),
+                });
             }
             if let Some(ra) = ra {
-                out.push(Refine { value: b, ty: fix(Range { lo: ra.lo, hi: i64::MAX }) });
+                out.push(Refine {
+                    value: b,
+                    ty: fix(Range {
+                        lo: ra.lo,
+                        hi: i64::MAX,
+                    }),
+                });
             }
         }
         FixnumCmpGt => {
             if let Some(rb) = rb {
-                out.push(Refine { value: a, ty: fix(Range { lo: sat_add(rb.lo, 1), hi: i64::MAX }) });
+                out.push(Refine {
+                    value: a,
+                    ty: fix(Range {
+                        lo: sat_add(rb.lo, 1),
+                        hi: i64::MAX,
+                    }),
+                });
             }
             if let Some(ra) = ra {
-                out.push(Refine { value: b, ty: fix(Range { lo: i64::MIN, hi: sat_sub(ra.hi, 1) }) });
+                out.push(Refine {
+                    value: b,
+                    ty: fix(Range {
+                        lo: i64::MIN,
+                        hi: sat_sub(ra.hi, 1),
+                    }),
+                });
             }
         }
         FixnumCmpGe => {
             if let Some(rb) = rb {
-                out.push(Refine { value: a, ty: fix(Range { lo: rb.lo, hi: i64::MAX }) });
+                out.push(Refine {
+                    value: a,
+                    ty: fix(Range {
+                        lo: rb.lo,
+                        hi: i64::MAX,
+                    }),
+                });
             }
             if let Some(ra) = ra {
-                out.push(Refine { value: b, ty: fix(Range { lo: i64::MIN, hi: ra.hi }) });
+                out.push(Refine {
+                    value: b,
+                    ty: fix(Range {
+                        lo: i64::MIN,
+                        hi: ra.hi,
+                    }),
+                });
             }
         }
         FixnumCmpEq => {
             // a == b : both take the intersection of the two ranges.
             if let (Some(ra), Some(rb)) = (ra, rb) {
                 if let Some(m) = range_meet(ra, rb) {
-                    out.push(Refine { value: a, ty: fix(m) });
-                    out.push(Refine { value: b, ty: fix(m) });
+                    out.push(Refine {
+                        value: a,
+                        ty: fix(m),
+                    });
+                    out.push(Refine {
+                        value: b,
+                        ty: fix(m),
+                    });
                 }
             }
         }
@@ -489,10 +558,10 @@ pub fn infer(f: &Function) -> InferenceResult {
                 if matches!(idef.opcode, Opcode::TypeCheck | Opcode::Guard) && !idef.args.is_empty()
                 {
                     if let AuxData::TypeTag(tag) = &idef.aux {
-                        check_refine
-                            .entry(b.index())
-                            .or_default()
-                            .push(Refine { value: idef.args[0], ty: *tag });
+                        check_refine.entry(b.index()).or_default().push(Refine {
+                            value: idef.args[0],
+                            ty: *tag,
+                        });
                     }
                 }
             }
@@ -534,15 +603,20 @@ pub fn infer(f: &Function) -> InferenceResult {
             loop {
                 if let Some(refs) = edge_refine.get(&d.index()) {
                     for rf in refs {
-                        let cur = env.get(&rf.value).copied().unwrap_or_else(|| g.get(rf.value));
+                        let cur = env
+                            .get(&rf.value)
+                            .copied()
+                            .unwrap_or_else(|| g.get(rf.value));
                         env.insert(rf.value, ty_meet(cur, rf.ty));
                     }
                 }
                 if d != b {
                     if let Some(refs) = check_refine.get(&d.index()) {
                         for rf in refs {
-                            let cur =
-                                env.get(&rf.value).copied().unwrap_or_else(|| g.get(rf.value));
+                            let cur = env
+                                .get(&rf.value)
+                                .copied()
+                                .unwrap_or_else(|| g.get(rf.value));
                             env.insert(rf.value, ty_meet(cur, rf.ty));
                         }
                     }
@@ -639,7 +713,10 @@ mod tests {
     fn const_fixnum(f: &mut Function, b: crate::t2::ir::Block, v: i64) -> Value {
         let (_, r) = f.push_inst(
             b,
-            InstData { aux: AuxData::FixnumImm(v), ..inst(Opcode::ConstFixnum) },
+            InstData {
+                aux: AuxData::FixnumImm(v),
+                ..inst(Opcode::ConstFixnum)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         r[0]
@@ -669,17 +746,28 @@ mod tests {
         let e = f.entry();
         let a = f.add_block_param(
             e,
-            IRType { bits: TypeBits::FIXNUM, range: Some(Range { lo: 1, hi: 5 }), class_id: None },
+            IRType {
+                bits: TypeBits::FIXNUM,
+                range: Some(Range { lo: 1, hi: 5 }),
+                class_id: None,
+            },
             ValueRepresentation::UnboxedFixnum,
         );
         let b = f.add_block_param(
             e,
-            IRType { bits: TypeBits::FIXNUM, range: Some(Range { lo: 10, hi: 20 }), class_id: None },
+            IRType {
+                bits: TypeBits::FIXNUM,
+                range: Some(Range { lo: 10, hi: 20 }),
+                class_id: None,
+            },
             ValueRepresentation::UnboxedFixnum,
         );
         let (_, sum) = f.push_inst(
             e,
-            InstData { args: vec![a, b], ..inst(Opcode::FixnumAdd) },
+            InstData {
+                args: vec![a, b],
+                ..inst(Opcode::FixnumAdd)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         f.set_terminator(e, ret());
@@ -695,17 +783,28 @@ mod tests {
         let e = f.entry();
         let a = f.add_block_param(
             e,
-            IRType { bits: TypeBits::FIXNUM, range: Some(Range { lo: 10, hi: 20 }), class_id: None },
+            IRType {
+                bits: TypeBits::FIXNUM,
+                range: Some(Range { lo: 10, hi: 20 }),
+                class_id: None,
+            },
             ValueRepresentation::UnboxedFixnum,
         );
         let b = f.add_block_param(
             e,
-            IRType { bits: TypeBits::FIXNUM, range: Some(Range { lo: 1, hi: 4 }), class_id: None },
+            IRType {
+                bits: TypeBits::FIXNUM,
+                range: Some(Range { lo: 1, hi: 4 }),
+                class_id: None,
+            },
             ValueRepresentation::UnboxedFixnum,
         );
         let (_, d) = f.push_inst(
             e,
-            InstData { args: vec![a, b], ..inst(Opcode::FixnumSub) },
+            InstData {
+                args: vec![a, b],
+                ..inst(Opcode::FixnumSub)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         f.set_terminator(e, ret());
@@ -721,7 +820,10 @@ mod tests {
         let b = const_fixnum(&mut f, e, 2);
         let (_, c) = f.push_inst(
             e,
-            InstData { args: vec![a, b], ..inst(Opcode::FixnumCmpLt) },
+            InstData {
+                args: vec![a, b],
+                ..inst(Opcode::FixnumCmpLt)
+            },
             &[(fixnum(), ValueRepresentation::Tagged)],
         );
         f.set_terminator(e, ret());
@@ -740,7 +842,10 @@ mod tests {
             InstData {
                 args: vec![p],
                 aux: AuxData::TypeTag(fixnum()),
-                flags: InstFlags { guard: true, ..InstFlags::default() },
+                flags: InstFlags {
+                    guard: true,
+                    ..InstFlags::default()
+                },
                 ..inst(Opcode::TypeCheck)
             },
             &[(IRType::TOP, ValueRepresentation::Tagged)],
@@ -766,7 +871,10 @@ mod tests {
             InstData {
                 args: vec![p],
                 aux: AuxData::TypeTag(fixnum()),
-                flags: InstFlags { guard: true, ..InstFlags::default() },
+                flags: InstFlags {
+                    guard: true,
+                    ..InstFlags::default()
+                },
                 ..inst(Opcode::Guard)
             },
             &[],
@@ -774,12 +882,21 @@ mod tests {
         let bb = f.make_block();
         f.set_terminator(
             e,
-            InstData { targets: vec![BlockCall { block: bb, args: vec![] }], ..inst(Opcode::Jump) },
+            InstData {
+                targets: vec![BlockCall {
+                    block: bb,
+                    args: vec![],
+                }],
+                ..inst(Opcode::Jump)
+            },
         );
         let one = const_fixnum(&mut f, bb, 1);
         let (_, x) = f.push_inst(
             bb,
-            InstData { args: vec![p, one], ..inst(Opcode::FixnumAdd) },
+            InstData {
+                args: vec![p, one],
+                ..inst(Opcode::FixnumAdd)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         f.set_terminator(bb, ret());
@@ -805,13 +922,22 @@ mod tests {
         let bound = const_fixnum(&mut f, e, 10);
         f.set_terminator(
             e,
-            InstData { targets: vec![BlockCall { block: header, args: vec![i0] }], ..inst(Opcode::Jump) },
+            InstData {
+                targets: vec![BlockCall {
+                    block: header,
+                    args: vec![i0],
+                }],
+                ..inst(Opcode::Jump)
+            },
         );
 
         // header: cond = i < 10 ; brif cond -> body, exit.
         let (_, cond) = f.push_inst(
             header,
-            InstData { args: vec![i, bound], ..inst(Opcode::FixnumCmpLt) },
+            InstData {
+                args: vec![i, bound],
+                ..inst(Opcode::FixnumCmpLt)
+            },
             &[(fixnum(), ValueRepresentation::Tagged)],
         );
         f.set_terminator(
@@ -819,8 +945,14 @@ mod tests {
             InstData {
                 args: vec![cond[0]],
                 targets: vec![
-                    BlockCall { block: body, args: vec![] },
-                    BlockCall { block: exit, args: vec![] },
+                    BlockCall {
+                        block: body,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: exit,
+                        args: vec![],
+                    },
                 ],
                 ..inst(Opcode::Brif)
             },
@@ -830,12 +962,21 @@ mod tests {
         let one = const_fixnum(&mut f, body, 1);
         let (_, i1) = f.push_inst(
             body,
-            InstData { args: vec![i, one], ..inst(Opcode::FixnumAdd) },
+            InstData {
+                args: vec![i, one],
+                ..inst(Opcode::FixnumAdd)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         f.set_terminator(
             body,
-            InstData { targets: vec![BlockCall { block: header, args: vec![i1[0]] }], ..inst(Opcode::Jump) },
+            InstData {
+                targets: vec![BlockCall {
+                    block: header,
+                    args: vec![i1[0]],
+                }],
+                ..inst(Opcode::Jump)
+            },
         );
 
         f.set_terminator(exit, ret());

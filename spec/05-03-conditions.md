@@ -219,6 +219,30 @@ slot 0 (shared) so the storage path can always produce a condition to signal.
 The acquire and release paths take no lock that could block or allocate behind
 the already-failing allocator.
 
+**Design decision (bliss-7z8): pool-first, with guard-page detection.** Bliss
+keeps the pre-allocated object pool as the normative R5.110 mechanism rather
+than adopting an SBCL-style reserve-only model. The pool gives the one property
+the storage-failure path cannot fake: producing a signallable
+`STORAGE-CONDITION` requires no heap allocation, no symbol lookup, no class
+definition, and no contended lock after memory is already exhausted. Reserve
+headroom remains useful as a detection and recovery aid, but it is not the
+condition-construction contract.
+
+| Model | Strength | Weakness | Bliss decision |
+|-------|----------|----------|----------------|
+| Pool-only | The failure path is small, deterministic, and allocation-free. | Pooled instances carry minimal detail and must be pinned/thread-local. | Kept as the required last-resort payload for heap exhaustion and stack overflow. |
+| Reserve-only | Normal condition construction can carry rich, freshly allocated diagnostic data. | Requires careful reserve sizing, disarm/re-arm discipline, and can still fail if the reserve path allocates unexpectedly. | Rejected as the normative contract for R5.110. |
+| Hybrid | Guard pages or reserved headroom detect/contain the failure, while a canned condition handles the no-allocation edge. | More moving parts than the pool alone. | Adopted only for detection: stack guards and stack-capacity checks may report overflow, but signalling still uses the pool. |
+
+For stack overflow, Bliss may borrow the guard-page part of the reserve model:
+the stack implementation can reserve an inaccessible guard page or maintain a
+checked stack-capacity boundary, and the runtime maps that event to
+`BlissError::StackOverflow`. The condition system must then acquire from
+`STORAGE_POOL`; it must not attempt to allocate a fresh `STORAGE-CONDITION`
+inside the overflow handler. For heap exhaustion, any future allocator
+headroom/watermark may be used to finish unwinding, logging, or cleanup, but the
+first signalled condition remains one of the pre-allocated pooled instances.
+
 ---
 
 ## 5.4.4 Algorithms & Control Flow
@@ -549,8 +573,8 @@ bind its own debugger hook independently.
 |--------------|----------|
 | `INVOKE-RESTART` with non-existent restart name | Signal `CONTROL-ERROR` |
 | `ERROR` with no handler and no debugger available | Print condition to stderr, call `(ABORT)` restart; if none, `std::process::exit(1)` |
-| Stack overflow during handler search | Use pre-allocated `STORAGE-CONDITION` (R5.110), attempt abbreviated handler search with reduced stack |
-| Heap exhaustion during `MAKE-CONDITION` | Use pre-allocated `STORAGE-CONDITION` pool (D5.13); pool is 4 instances, recycled via flag |
+| Stack overflow during handler search | Detect via stack guard/capacity checks, then signal with a pre-allocated `STORAGE-CONDITION` (R5.110); attempt abbreviated handler search with reduced stack |
+| Heap exhaustion during `MAKE-CONDITION` | Use the pre-allocated `STORAGE-CONDITION` pool (D5.13); optional allocator headroom may support cleanup, but must not be required to construct the condition |
 | Recursive debugger entry | `*DEBUGGER-HOOK*` is set to `NIL` before calling the hook (A5.11), preventing infinite recursion |
 | Condition signalled during `UNWIND-PROTECT` cleanup | Normal handler search from the cleanup's dynamic environment; does not interfere with the in-progress unwind |
 

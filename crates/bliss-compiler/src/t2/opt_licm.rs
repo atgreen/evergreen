@@ -18,8 +18,7 @@
 //!    change any value's identity, so no `FrameState` operand is orphaned.
 
 use crate::t2::ir::{
-    AuxData, Block, BlockCall, DominatorTree, Function, Inst, InstData, InstFlags, Opcode,
-    ValueDef,
+    AuxData, Block, BlockCall, DominatorTree, Function, Inst, InstData, InstFlags, Opcode, ValueDef,
 };
 use crate::t2::pass::{Analyses, Pass};
 
@@ -370,7 +369,10 @@ mod tests {
             results: vec![],
             aux: AuxData::None,
             flags: InstFlags::default(),
-            targets: vec![BlockCall { block: target, args }],
+            targets: vec![BlockCall {
+                block: target,
+                args,
+            }],
             frame_state: None,
             source_pos: 0,
         }
@@ -384,8 +386,14 @@ mod tests {
             aux: AuxData::None,
             flags: InstFlags::default(),
             targets: vec![
-                BlockCall { block: t0, args: a0 },
-                BlockCall { block: t1, args: a1 },
+                BlockCall {
+                    block: t0,
+                    args: a0,
+                },
+                BlockCall {
+                    block: t1,
+                    args: a1,
+                },
             ],
             frame_state: None,
             source_pos: 0,
@@ -440,17 +448,9 @@ mod tests {
         let i = f.add_block_param(header, ty, repr);
 
         // entry: two invariant constants + jump header(zero).
-        let (_, a_res) = f.push_inst(
-            entry,
-            const_fixnum(3),
-            &[(ty, repr)],
-        );
+        let (_, a_res) = f.push_inst(entry, const_fixnum(3), &[(ty, repr)]);
         let a = a_res[0];
-        let (_, b_res) = f.push_inst(
-            entry,
-            const_fixnum(4),
-            &[(ty, repr)],
-        );
+        let (_, b_res) = f.push_inst(entry, const_fixnum(4), &[(ty, repr)]);
         let b = b_res[0];
         let (_, zero_res) = f.push_inst(entry, const_fixnum(0), &[(ty, repr)]);
         let zero = zero_res[0];
@@ -475,17 +475,10 @@ mod tests {
         f.set_terminator(header, brif(body, exit, cond, vec![], vec![]));
 
         // body: invariant add (a + b) — both defined in entry, outside loop.
-        let (inv_inst, _) = f.push_inst(
-            body,
-            add(a, b),
-            &[(ty, repr)],
-        );
+        let (inv_inst, _) = f.push_inst(body, add(a, b), &[(ty, repr)]);
         // variant add (i + inv) — uses the header param i, so loop-variant.
-        let (var_inst, var_res) = f.push_inst(
-            body,
-            add(i, f.inst(inv_inst).results[0]),
-            &[(ty, repr)],
-        );
+        let (var_inst, var_res) =
+            f.push_inst(body, add(i, f.inst(inv_inst).results[0]), &[(ty, repr)]);
         let _ = var_res;
         // effectful add — flags mark a side effect; must NOT hoist even though
         // its operands are invariant.
@@ -496,7 +489,10 @@ mod tests {
                 args: vec![a, b],
                 results: vec![],
                 aux: AuxData::None,
-                flags: InstFlags { effectful: true, ..InstFlags::default() },
+                flags: InstFlags {
+                    effectful: true,
+                    ..InstFlags::default()
+                },
                 targets: vec![],
                 frame_state: None,
                 source_pos: 0,
@@ -532,7 +528,10 @@ mod tests {
         // The invariant add MUST have moved out of the body.
         assert_ne!(inv_after, body, "invariant add should have been hoisted");
         // It landed in the preheader (here: reused `entry`, the sole clean pred).
-        assert_eq!(inv_after, entry, "invariant add should live in the preheader");
+        assert_eq!(
+            inv_after, entry,
+            "invariant add should live in the preheader"
+        );
         // The variant add and the effectful add MUST stay pinned in the body.
         assert_eq!(var_after, body, "loop-variant add must stay in the loop");
         assert_eq!(eff_after, body, "effectful add must stay in the loop");
@@ -609,7 +608,10 @@ mod tests {
             "a new preheader block should be synthesised"
         );
         let inv_after = block_of(&f, inv_inst);
-        assert_ne!(inv_after, body, "invariant should be hoisted out of the body");
+        assert_ne!(
+            inv_after, body,
+            "invariant should be hoisted out of the body"
+        );
 
         // The preheader is the new block, is the header's only non-back-edge
         // pred, and jumps to the header.
@@ -620,7 +622,11 @@ mod tests {
             .copied()
             .filter(|&p| !dom.dominates(header, p))
             .collect();
-        assert_eq!(outside.len(), 1, "header should have a single entry pred now");
+        assert_eq!(
+            outside.len(),
+            1,
+            "header should have a single entry pred now"
+        );
         let ph = outside[0];
         assert_eq!(inv_after, ph, "invariant should live in the preheader");
         assert_eq!(f.succs(ph), vec![header]);
@@ -652,7 +658,11 @@ mod tests {
         let blocks_before = f.num_blocks();
         let mut a_cache = Analyses::new();
         Licm.run(&mut f, &mut a_cache);
-        assert_eq!(f.num_blocks(), blocks_before, "no preheader when nothing hoists");
+        assert_eq!(
+            f.num_blocks(),
+            blocks_before,
+            "no preheader when nothing hoists"
+        );
     }
 
     // ── small InstData builders ──

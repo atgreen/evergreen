@@ -76,10 +76,14 @@ fn remove_inference_proven(f: &mut Function) -> bool {
             if !d.flags.guard {
                 continue;
             }
-            let AuxData::TypeTag(tau) = &d.aux else { continue };
+            let AuxData::TypeTag(tau) = &d.aux else {
+                continue;
+            };
             let Some(&v) = d.args.first() else { continue };
             let got = inf.ty(v);
-            if !got.bits.is_bottom() && tau.bits.contains(got.bits) && refinements_covered(tau, &got)
+            if !got.bits.is_bottom()
+                && tau.bits.contains(got.bits)
+                && refinements_covered(tau, &got)
             {
                 to_remove.push(inst);
             }
@@ -224,7 +228,9 @@ fn hoist_loop_invariant(f: &mut Function, dom: &crate::t2::ir::DominatorTree) ->
     for (&hidx, tails) in &latches {
         let header = Block(hidx as u32);
         let body = natural_loop_body(f, header, tails);
-        let Some(ph) = preheader(f, header, &body) else { continue };
+        let Some(ph) = preheader(f, header, &body) else {
+            continue;
+        };
 
         for &b in &body {
             for &inst in &f.block(b).insts {
@@ -404,7 +410,9 @@ fn replace_all_uses(f: &mut Function, old: Value, new: Value) {
         }
     }
     for k in 0..f.frame_states.len() {
-        let fs = f.frame_states.get_mut(crate::t2::frame_state::FrameStateId(k as u32));
+        let fs = f
+            .frame_states
+            .get_mut(crate::t2::frame_state::FrameStateId(k as u32));
         let repl = |vs: &mut ValueSource| {
             if let ValueSource::Value { value, .. } = vs {
                 if *value == old {
@@ -450,9 +458,7 @@ fn def_block(f: &Function, inst_block: &[Option<Block>], v: Value) -> Option<Blo
 mod tests {
     use super::*;
     use crate::t2::frame_state::{FrameScope, FrameState};
-    use crate::t2::ir::{
-        BlockCall, InstData, InstFlags, IRType, TypeBits, ValueRepresentation,
-    };
+    use crate::t2::ir::{BlockCall, IRType, InstData, InstFlags, TypeBits, ValueRepresentation};
 
     fn base(op: Opcode) -> InstData {
         InstData {
@@ -476,7 +482,13 @@ mod tests {
     }
 
     fn jump(b: Block) -> InstData {
-        InstData { targets: vec![BlockCall { block: b, args: vec![] }], ..base(Opcode::Jump) }
+        InstData {
+            targets: vec![BlockCall {
+                block: b,
+                args: vec![],
+            }],
+            ..base(Opcode::Jump)
+        }
     }
 
     /// A guard on `v` requiring type `tag`.
@@ -484,7 +496,10 @@ mod tests {
         InstData {
             args: vec![v],
             aux: AuxData::TypeTag(tag),
-            flags: InstFlags { guard: true, ..InstFlags::default() },
+            flags: InstFlags {
+                guard: true,
+                ..InstFlags::default()
+            },
             ..base(Opcode::Guard)
         }
     }
@@ -511,7 +526,10 @@ mod tests {
         let e = f.entry();
         let (_, c) = f.push_inst(
             e,
-            InstData { aux: AuxData::FixnumImm(42), ..base(Opcode::ConstFixnum) },
+            InstData {
+                aux: AuxData::FixnumImm(42),
+                ..base(Opcode::ConstFixnum)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         f.push_inst(e, guard(c[0], fixnum()), &[]);
@@ -519,7 +537,11 @@ mod tests {
 
         assert_eq!(count_guards(&f), 1);
         run(&mut f);
-        assert_eq!(count_guards(&f), 0, "inference-proven guard must be removed");
+        assert_eq!(
+            count_guards(&f),
+            0,
+            "inference-proven guard must be removed"
+        );
     }
 
     #[test]
@@ -552,11 +574,17 @@ mod tests {
 
         assert_eq!(count_guards(&f), 2);
         run(&mut f);
-        assert_eq!(count_guards(&f), 1, "the dominated duplicate must be removed");
+        assert_eq!(
+            count_guards(&f),
+            1,
+            "the dominated duplicate must be removed"
+        );
         // The surviving guard is the dominating one, in the entry block.
-        let survivor_in_entry =
-            f.block(e).insts.iter().any(|&i| f.inst(i).flags.guard);
-        assert!(survivor_in_entry, "the dominating guard must be the survivor");
+        let survivor_in_entry = f.block(e).insts.iter().any(|&i| f.inst(i).flags.guard);
+        assert!(
+            survivor_in_entry,
+            "the dominating guard must be the survivor"
+        );
     }
 
     #[test]
@@ -571,7 +599,11 @@ mod tests {
         let make_layout_guard = |arg| InstData {
             args: vec![arg],
             aux: AuxData::StringLayout,
-            flags: InstFlags { guard: true, effectful: true, ..InstFlags::default() },
+            flags: InstFlags {
+                guard: true,
+                effectful: true,
+                ..InstFlags::default()
+            },
             ..base(Opcode::Guard)
         };
         let (_, first) = f.push_inst(
@@ -613,7 +645,10 @@ mod tests {
         let e = f.entry();
         let (_, c) = f.push_inst(
             e,
-            InstData { aux: AuxData::FixnumImm(7), ..base(Opcode::ConstFixnum) },
+            InstData {
+                aux: AuxData::FixnumImm(7),
+                ..base(Opcode::ConstFixnum)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         let (_, r) = f.push_inst(
@@ -621,14 +656,20 @@ mod tests {
             InstData {
                 args: vec![c[0]],
                 aux: AuxData::TypeTag(fixnum()),
-                flags: InstFlags { guard: true, ..InstFlags::default() },
+                flags: InstFlags {
+                    guard: true,
+                    ..InstFlags::default()
+                },
                 ..base(Opcode::TypeCheck)
             },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         let (add, _x) = f.push_inst(
             e,
-            InstData { args: vec![r[0], c[0]], ..base(Opcode::FixnumAdd) },
+            InstData {
+                args: vec![r[0], c[0]],
+                ..base(Opcode::FixnumAdd)
+            },
             &[(fixnum(), ValueRepresentation::UnboxedFixnum)],
         );
         f.set_terminator(e, ret());
@@ -636,7 +677,11 @@ mod tests {
         run(&mut f);
         assert_eq!(count_guards(&f), 0, "the proven TypeCheck guard is removed");
         // The add's first operand must have been rewritten from r to c.
-        assert_eq!(f.inst(add).args, vec![c[0], c[0]], "result forwarded to operand");
+        assert_eq!(
+            f.inst(add).args,
+            vec![c[0], c[0]],
+            "result forwarded to operand"
+        );
     }
 
     #[test]
@@ -659,30 +704,49 @@ mod tests {
             scopes: vec![FrameScope {
                 function: 0,
                 bcp: 0,
-                locals: vec![ValueSource::Value { value: v, repr: ValueRepresentation::Tagged }],
+                locals: vec![ValueSource::Value {
+                    value: v,
+                    repr: ValueRepresentation::Tagged,
+                }],
                 stack: vec![],
             }],
             remat: vec![],
         });
         let (gi, _) = f.push_inst(
             header,
-            InstData { frame_state: Some(fsid), ..guard(v, fixnum()) },
+            InstData {
+                frame_state: Some(fsid),
+                ..guard(v, fixnum())
+            },
             &[],
         );
 
         // A trivial loop condition so the header is a real branch.
         let (_, cond) = f.push_inst(
             header,
-            InstData { args: vec![v], aux: AuxData::TypeTag(fixnum()), ..base(Opcode::InstanceOf) },
-            &[(IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)), ValueRepresentation::Tagged)],
+            InstData {
+                args: vec![v],
+                aux: AuxData::TypeTag(fixnum()),
+                ..base(Opcode::InstanceOf)
+            },
+            &[(
+                IRType::of(TypeBits::SYMBOL.join(TypeBits::NULL)),
+                ValueRepresentation::Tagged,
+            )],
         );
         f.set_terminator(
             header,
             InstData {
                 args: vec![cond[0]],
                 targets: vec![
-                    BlockCall { block: body, args: vec![] },
-                    BlockCall { block: exit, args: vec![] },
+                    BlockCall {
+                        block: body,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: exit,
+                        args: vec![],
+                    },
                 ],
                 ..base(Opcode::Brif)
             },
@@ -694,8 +758,14 @@ mod tests {
         assert!(f.block(header).insts.contains(&gi));
         run(&mut f);
         // After: it has moved into the preheader (entry) and left the header.
-        assert!(f.block(e).insts.contains(&gi), "guard must be hoisted to preheader");
-        assert!(!f.block(header).insts.contains(&gi), "guard must leave the loop body");
+        assert!(
+            f.block(e).insts.contains(&gi),
+            "guard must be hoisted to preheader"
+        );
+        assert!(
+            !f.block(header).insts.contains(&gi),
+            "guard must leave the loop body"
+        );
         assert_eq!(count_guards(&f), 1, "hoisting preserves the guard");
     }
 }

@@ -17,7 +17,7 @@ use bliss_compiler::t2::pass::PassManager;
 use bliss_compiler::t2::regalloc::allocate;
 use bliss_compiler::t2::verify::verify;
 use bliss_rt::bytecode::{BytecodeFunction, Instr};
-use bliss_rt::object::{type_id, ConsCell, ObjectHeader};
+use bliss_rt::object::{ConsCell, ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, NIL, T};
 
 fn bytecode_fn(
@@ -297,8 +297,8 @@ extern "C" fn moving_gc_c2i(
 #[test]
 fn moving_gc_relocates_t2_roots_in_registers_and_native_spills() {
     use bliss_compiler::t2::emit::emit_framed_with_activation_slots;
-    use bliss_rt::stack::StackMapEntry;
     use bliss_rt::CodeInfo;
+    use bliss_rt::stack::StackMapEntry;
 
     const ROOTS: usize = 8;
     // Private callback IDs avoid interning symbols on the GC heap. Symbols are
@@ -345,6 +345,7 @@ fn moving_gc_relocates_t2_roots_in_registers_and_native_spills() {
         0,
         0,
         moving_gc_c2i as *const () as usize as u64,
+        0,
         0,
         0,
         0,
@@ -926,7 +927,7 @@ fn optimisation_passes_compose_and_preserve_wellformedness() {
 #[test]
 fn fixnum_profile_speculates_the_call() {
     use bliss_compiler::t2::ir::Opcode;
-    use bliss_compiler::t2::speculate::{speculate, SpecType};
+    use bliss_compiler::t2::speculate::{SpecType, speculate};
 
     // (lambda (x) (* x 5)): LoadLocal 0, Const 5, CallNamed *, Return. The
     // CallNamed is at bcp 2.
@@ -1004,7 +1005,7 @@ fn fixnum_profile_speculates_the_call() {
 #[test]
 fn branching_if_speculates_and_runs() {
     use bliss_compiler::t2::emit::emit_framed;
-    use bliss_compiler::t2::speculate::{speculate, SpecType};
+    use bliss_compiler::t2::speculate::{SpecType, speculate};
     let lt = bliss_rt::symbols::intern("<");
     let mul = bliss_rt::symbols::intern("*");
     // 0 LoadLocal 0 ; 1 Const 100 ; 2 (< x 100) ; 3 BrIfFalse->8(else)
@@ -1076,7 +1077,7 @@ fn branching_if_speculates_and_runs() {
 #[test]
 fn call_containing_function_emits() {
     use bliss_compiler::t2::emit::emit_framed;
-    use bliss_compiler::t2::speculate::{speculate, SpecType};
+    use bliss_compiler::t2::speculate::{SpecType, speculate};
     let g = bliss_rt::symbols::intern("g-callee");
     let mul = bliss_rt::symbols::intern("*");
     // 0 LoadLocal 0 (n) ; 1 LoadLocal 0 (n) ; 2 (g n) ; 3 (* n <g>) ; 4 Return
@@ -1116,7 +1117,7 @@ fn call_containing_function_emits() {
 fn bitwise_logand_speculates_and_runs() {
     use bliss_compiler::t2::emit::emit_framed;
     use bliss_compiler::t2::ir::Opcode;
-    use bliss_compiler::t2::speculate::{speculate, SpecType};
+    use bliss_compiler::t2::speculate::{SpecType, speculate};
     let logand = bliss_rt::symbols::intern("LOGAND");
     // 0 LoadLocal 0 (x) ; 1 Const 255 ; 2 (logand x 255) ; 3 Return
     let bf = bytecode_fn(

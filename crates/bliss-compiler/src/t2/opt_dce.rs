@@ -420,11 +420,7 @@ mod tests {
         let entry = f.entry();
         let mut constant = inst(Opcode::ConstFixnum, vec![], InstFlags::default());
         constant.aux = AuxData::FixnumImm(7);
-        let (cinst, cres) = f.push_inst(
-            entry,
-            constant,
-            &[(fixnum(), VR::Tagged)],
-        );
+        let (cinst, cres) = f.push_inst(entry, constant, &[(fixnum(), VR::Tagged)]);
         let c = cres[0];
         f.set_terminator(entry, ret(vec![])); // c has NO real use
         let fsid = f.frame_states.add(frame(vec![ValueSource::Value {
@@ -508,10 +504,7 @@ mod tests {
         // Kept on the fast path because it cannot be rematerialised.
         assert!(f.block(entry).insts.contains(&mul_inst));
         let fs = f.frame_states.get(fsid);
-        assert!(matches!(
-            fs.scopes[0].locals[0],
-            ValueSource::Value { .. }
-        ));
+        assert!(matches!(fs.scopes[0].locals[0], ValueSource::Value { .. }));
         assert!(fs.remat.is_empty());
     }
 
@@ -525,11 +518,7 @@ mod tests {
         let a = f.add_block_param(entry, fixnum(), VR::Tagged);
         let mut constant = inst(Opcode::ConstFixnum, vec![], InstFlags::default());
         constant.aux = AuxData::FixnumImm(11);
-        let (cinst, cres) = f.push_inst(
-            entry,
-            constant,
-            &[(fixnum(), VR::Tagged)],
-        );
+        let (cinst, cres) = f.push_inst(entry, constant, &[(fixnum(), VR::Tagged)]);
         let c = cres[0];
         let (add_inst, add_res) = f.push_inst(
             entry,

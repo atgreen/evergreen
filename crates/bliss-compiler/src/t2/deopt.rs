@@ -218,7 +218,10 @@ pub fn lower_one(
             live_ref_bitmap,
         });
     }
-    Ok(LoweredDeopt { code_offset, scopes })
+    Ok(LoweredDeopt {
+        code_offset,
+        scopes,
+    })
 }
 
 /// Lower one `ValueSource` to its descriptor. Returns `(descriptor, is_gc_ref)`
@@ -370,13 +373,16 @@ fn eval_remat(recipe: &RematDescriptor, mach: &impl MachineState) -> BlissVal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::t2::frame_state::FrameStateId;
     use crate::t2::frame_state::{FrameScope, FrameState, RematRecipe};
     use crate::t2::mach::{PhysReg, RegClass, StackMap, StackSlot};
-    use crate::t2::frame_state::FrameStateId;
     use std::collections::HashMap;
 
     fn gpr(n: u8) -> Location {
-        Location::Register(PhysReg { class: RegClass::Gpr, encoding: n })
+        Location::Register(PhysReg {
+            class: RegClass::Gpr,
+            encoding: n,
+        })
     }
 
     /// A mock T2 frame: a location→raw-word table plus a trivial double boxer.
@@ -410,8 +416,14 @@ mod tests {
                 function: bliss_rt::symbols::intern("fsum"),
                 bcp: 42,
                 locals: vec![
-                    ValueSource::Value { value: v_n, repr: ValueRepresentation::Tagged },
-                    ValueSource::Value { value: v_i, repr: ValueRepresentation::UnboxedFixnum },
+                    ValueSource::Value {
+                        value: v_n,
+                        repr: ValueRepresentation::Tagged,
+                    },
+                    ValueSource::Value {
+                        value: v_i,
+                        repr: ValueRepresentation::UnboxedFixnum,
+                    },
                     ValueSource::Const(BlissVal::from_fixnum(7)),
                     ValueSource::Unbound,
                 ],
@@ -449,9 +461,18 @@ mod tests {
         assert_eq!(scope.num_locals, 4);
 
         // Tagged value → no rebox; UnboxedFixnum → ReboxFixnum; Const; Unbound.
-        assert_eq!(scope.slots[0], SlotDescriptor::InLocation(gpr(0), Rebox::None));
-        assert_eq!(scope.slots[1], SlotDescriptor::InLocation(gpr(1), Rebox::ReboxFixnum));
-        assert_eq!(scope.slots[2], SlotDescriptor::MaterializeConst(BlissVal::from_fixnum(7)));
+        assert_eq!(
+            scope.slots[0],
+            SlotDescriptor::InLocation(gpr(0), Rebox::None)
+        );
+        assert_eq!(
+            scope.slots[1],
+            SlotDescriptor::InLocation(gpr(1), Rebox::ReboxFixnum)
+        );
+        assert_eq!(
+            scope.slots[2],
+            SlotDescriptor::MaterializeConst(BlissVal::from_fixnum(7))
+        );
         assert_eq!(scope.slots[3], SlotDescriptor::Unbound);
 
         // Only the Tagged value is a GC root.
@@ -495,16 +516,24 @@ mod tests {
             scopes: vec![FrameScope {
                 function: bliss_rt::symbols::intern("g"),
                 bcp: 3,
-                locals: vec![ValueSource::Value { value: v, repr: ValueRepresentation::UnboxedF32 }],
+                locals: vec![ValueSource::Value {
+                    value: v,
+                    repr: ValueRepresentation::UnboxedF32,
+                }],
                 stack: vec![],
             }],
             remat: vec![],
         };
         let loc_of = move |q: Value| (q == v).then_some(gpr(4));
         let lowered = lower_one(0, &fs, &loc_of).unwrap();
-        assert_eq!(lowered.scopes[0].slots[0], SlotDescriptor::InLocation(gpr(4), Rebox::ReboxF32));
+        assert_eq!(
+            lowered.scopes[0].slots[0],
+            SlotDescriptor::InLocation(gpr(4), Rebox::ReboxF32)
+        );
 
-        let mach = MockMachine { regs: vec![(gpr(4), 1.5f32.to_bits() as u64)] };
+        let mach = MockMachine {
+            regs: vec![(gpr(4), 1.5f32.to_bits() as u64)],
+        };
         let frames = reconstruct(&lowered, &mach);
         let frame = &frames[0];
         assert_eq!(frame.locals, vec![BlissVal::from_single_float(1.5)]);
@@ -537,7 +566,10 @@ mod tests {
             SlotDescriptor::Remat(r) => {
                 assert_eq!(r.op, RematOp::FixnumAdd);
                 assert_eq!(r.inputs.len(), 2);
-                assert_eq!(r.inputs[0], SlotDescriptor::MaterializeConst(BlissVal::from_fixnum(3)));
+                assert_eq!(
+                    r.inputs[0],
+                    SlotDescriptor::MaterializeConst(BlissVal::from_fixnum(3))
+                );
             }
             other => panic!("expected Remat, got {other:?}"),
         }
@@ -557,7 +589,10 @@ mod tests {
             scopes: vec![FrameScope {
                 function: 0,
                 bcp: 0,
-                locals: vec![ValueSource::Value { value: v, repr: ValueRepresentation::Tagged }],
+                locals: vec![ValueSource::Value {
+                    value: v,
+                    repr: ValueRepresentation::Tagged,
+                }],
                 stack: vec![],
             }],
             remat: vec![],
@@ -574,8 +609,14 @@ mod tests {
             scopes: vec![FrameScope {
                 function: 0,
                 bcp: 7,
-                locals: vec![ValueSource::Value { value: vloc, repr: ValueRepresentation::Tagged }],
-                stack: vec![ValueSource::Value { value: vstk, repr: ValueRepresentation::UnboxedFixnum }],
+                locals: vec![ValueSource::Value {
+                    value: vloc,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![ValueSource::Value {
+                    value: vstk,
+                    repr: ValueRepresentation::UnboxedFixnum,
+                }],
             }],
             remat: vec![],
         };
@@ -639,10 +680,7 @@ mod tests {
         assert_eq!(lowered.scopes[1].function, inner);
 
         let mach = MockMachine {
-            regs: vec![
-                (gpr(0), BlissVal::from_fixnum(5).0),
-                (gpr(1), 7),
-            ],
+            regs: vec![(gpr(0), BlissVal::from_fixnum(5).0), (gpr(1), 7)],
         };
         let frames = reconstruct(&lowered, &mach);
         assert_eq!(frames.len(), 2);

@@ -489,17 +489,17 @@ users porting existing code.
 
 | Area | SBCL | Bliss | Migration action |
 |------|------|-------|------------------|
-| Package for extensions | `SB-EXT`, `SB-THREAD`, etc. | `BLISS`, `BLISS-THREADS`, etc. | Use compatibility package (see below) or `#+`/`#-` conditionals |
-| Thread API | `sb-thread:make-thread` | `bliss-threads:make-thread` (BORDEAUX-THREADS compatible) | Use `bordeaux-threads` for portability |
-| GC control | `(sb-ext:gc)`, `sb-ext:*gc-run-time*` | `(bliss:gc)`, `bliss:*gc-run-time*` | Rename calls |
+| Package for extensions | `SB-EXT`, `SB-THREAD`, etc. | `BLISS-EXT`, `BLISS-THREAD`, etc.; `BLISS` and `BLISS-THREADS` are deprecated compatibility spellings | Use compatibility package (see below) or `#+`/`#-` conditionals |
+| Thread API | `sb-thread:make-thread` | `bliss-thread:make-thread` (BORDEAUX-THREADS compatible) | Use `bordeaux-threads` for portability |
+| GC control | `(sb-ext:gc)`, `sb-ext:*gc-run-time*` | `(bliss-ext:gc)`, `bliss-ext:*gc-run-time*` | Rename calls |
 | Compiler policy | `(declare (optimize (speed 3)))` | Same ANSI syntax; Bliss interprets values similarly | No change needed |
-| `defglobal` | `sb-ext:defglobal` | `bliss:defglobal` | Rename or use compat package |
-| Image save | `sb-ext:save-lisp-and-die` | `bliss:save-image` | Rename; keyword args differ (see §7) |
+| `defglobal` | `sb-ext:defglobal` | `bliss-ext:defglobal` | Rename or use compat package |
+| Image save | `sb-ext:save-lisp-and-die` | `bliss-ext:save-image` | Rename; keyword args differ (see §7) |
 | Foreign calls | `sb-alien:define-alien-routine` | `bliss-ffi:define-foreign-function` | Rewrite FFI declarations |
-| Weak pointers | `sb-ext:make-weak-pointer` | `bliss:make-weak-pointer` | Rename |
+| Weak pointers | `sb-ext:make-weak-pointer` | `bliss-ext:make-weak-pointer` | Rename |
 | MOP | Full AMOP via `sb-mop` | Partial MOP via `bliss-mop` (Phase 2); full AMOP deferred | Test MOP usage; use `closer-mop` shim |
-| `*posix-argv*` | `sb-ext:*posix-argv*` | `bliss:*command-line-arguments*` | Rename |
-| Exit | `sb-ext:exit` | `bliss:exit` | Rename; compatible keyword args |
+| `*posix-argv*` | `sb-ext:*posix-argv*` | `bliss-ext:*command-line-arguments*` | Rename |
+| Exit | `sb-ext:exit` | `bliss-ext:exit` | Rename; compatible keyword args |
 
 ### 11.12.2  Compatibility Package
 
@@ -518,8 +518,12 @@ commonly used SBCL extensions:
    ;; sb-thread equivalents
    #:make-thread #:join-thread #:thread-alive-p
    #:make-mutex #:grab-mutex #:release-mutex #:with-mutex
-   #:make-waitqueue #:condition-wait #:condition-notify))
+   #:make-condition-variable #:condition-wait #:condition-notify
+   #:condition-broadcast))
 ```
+
+The compatibility package may additionally export deprecated aliases such as
+`MAKE-WAITQUEUE`, but new examples use `MAKE-CONDITION-VARIABLE`.
 
 ### 11.12.3  Porting Checklist
 
@@ -530,7 +534,7 @@ commonly used SBCL extensions:
 3. Audit FFI declarations — Bliss uses `bliss-ffi:define-foreign-function`
    with keyword syntax closer to CFFI than to `sb-alien`.
 4. Test `defstruct` `:include` chains — Bliss Phase 2 supports them but
-   layout may differ from SBCL (check `bliss:struct-slot-offset`).
+   layout may differ from SBCL (check `bliss-ext:struct-slot-offset`).
 5. Replace `sb-mop` usage with `closer-mop` or `bliss-mop`; verify
    that only the supported MOP subset is used (see §5.3).
 6. Test `LOOP` — Bliss implements ANSI `LOOP` exactly; some SBCL `LOOP`
@@ -538,7 +542,7 @@ commonly used SBCL extensions:
 7. Run the application's test suite under Bliss with
    `(pushnew :sbcl *features*)` removed.
 8. Check startup time — Bliss images are not identical to SBCL cores;
-   rebuild via `bliss:save-image`.
+   rebuild via `bliss-ext:save-image`.
 
 ## 11.13  Deprecation Policy for Internal APIs
 

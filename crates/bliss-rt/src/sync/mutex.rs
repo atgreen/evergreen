@@ -1,6 +1,6 @@
-use super::{blocking_mode, timer, BlockingMode, FiberWaiter};
+use super::{BlockingMode, FiberWaiter, blocking_mode, timer};
 use crate::error::BlissError;
-use crate::thread::{current_fiber_id, current_thread_id, NativeThreadId};
+use crate::thread::{NativeThreadId, current_fiber_id, current_thread_id};
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};

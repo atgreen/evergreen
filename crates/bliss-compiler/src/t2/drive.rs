@@ -81,7 +81,10 @@ pub fn compile(bf: &BytecodeFunction, opt: bool) -> Result<CompiledT2, CompileEr
     let code = emit(&mf).map_err(CompileError::Emit)?;
     let code_len = code.len();
     let buf = JitBuffer::new(&code).ok_or(CompileError::Jit)?;
-    Ok(CompiledT2 { code: buf, code_len })
+    Ok(CompiledT2 {
+        code: buf,
+        code_len,
+    })
 }
 
 #[cfg(test)]
@@ -90,7 +93,14 @@ mod tests {
     use bliss_rt::bytecode::Instr;
     use bliss_rt::value::BlissVal;
 
-    fn bytecode_fn(name: &str, code: Vec<Instr>, constants: Vec<BlissVal>, n_locals: u16, max_stack: u16, arity: u16) -> BytecodeFunction {
+    fn bytecode_fn(
+        name: &str,
+        code: Vec<Instr>,
+        constants: Vec<BlissVal>,
+        n_locals: u16,
+        max_stack: u16,
+        arity: u16,
+    ) -> BytecodeFunction {
         BytecodeFunction {
             code,
             constants,
@@ -143,7 +153,14 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn compiled_nil_matches_interpretation() {
-        let bf = bytecode_fn("givenil", vec![Instr::Const(0), Instr::Return], vec![bliss_rt::value::NIL], 0, 1, 0);
+        let bf = bytecode_fn(
+            "givenil",
+            vec![Instr::Const(0), Instr::Return],
+            vec![bliss_rt::value::NIL],
+            0,
+            1,
+            0,
+        );
         let compiled = compile(&bf, false).expect("compile nil");
         let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(compiled.entry_ptr()) };
         assert_eq!(BlissVal(f()), bliss_rt::value::NIL, "T2 must return NIL");
@@ -163,6 +180,9 @@ mod tests {
             0,
         );
         // Either build/lower/emit rejects it — but it must be an Err, not a panic.
-        assert!(compile(&bf, false).is_err(), "an unsupported function must fail to compile, not crash");
+        assert!(
+            compile(&bf, false).is_err(),
+            "an unsupported function must fail to compile, not crash"
+        );
     }
 }

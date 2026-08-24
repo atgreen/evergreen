@@ -91,8 +91,8 @@ use std::collections::HashMap;
 
 use regalloc2::{
     Algorithm, Allocation, Block, Edit, Function as Ra2Function, Inst as Ra2Inst, InstPosition,
-    InstRange, MachineEnv, Operand, OperandKind, PReg, PRegSet, RegClass as Ra2RegClass,
-    RegAllocError, RegallocOptions, VReg as Ra2VReg,
+    InstRange, MachineEnv, Operand, OperandKind, PReg, PRegSet, RegAllocError,
+    RegClass as Ra2RegClass, RegallocOptions, VReg as Ra2VReg,
 };
 
 use crate::t2::mach::{
@@ -360,7 +360,6 @@ impl Adapter {
             debug_labels,
         }
     }
-
 }
 
 impl Ra2Function for Adapter {
@@ -603,10 +602,10 @@ mod tests {
 
         MachFunc {
             insts: vec![
-                inst(1, vec![g0], vec![]),      // def g0
-                inst(2, vec![f0], vec![]),      // def f0
-                safepoint,                      // def g1, use g0  (safepoint)
-                inst(0, vec![], vec![g1, f0]),  // ret: use g1, f0  (last => is_ret)
+                inst(1, vec![g0], vec![]),     // def g0
+                inst(2, vec![f0], vec![]),     // def f0
+                safepoint,                     // def g1, use g0  (safepoint)
+                inst(0, vec![], vec![g1, f0]), // ret: use g1, f0  (last => is_ret)
             ],
             ..Default::default()
         }
@@ -625,7 +624,9 @@ mod tests {
             vreg(RegClass::Gpr, 1),
             vreg(RegClass::Xmm, 0),
         ] {
-            let loc = map.get(&v).unwrap_or_else(|| panic!("vreg {v:?} unallocated"));
+            let loc = map
+                .get(&v)
+                .unwrap_or_else(|| panic!("vreg {v:?} unallocated"));
             // If bound to a register, its class must match the vreg's class.
             if let Location::Register(preg) = loc {
                 assert_eq!(preg.class, v.class, "class mismatch for {v:?}");
@@ -716,21 +717,33 @@ mod tests {
                     start: 0,
                     end: 2,
                     succs: vec![
-                        MachSucc { target: MachBlockId(1), args: vec![] },
-                        MachSucc { target: MachBlockId(2), args: vec![] },
+                        MachSucc {
+                            target: MachBlockId(1),
+                            args: vec![],
+                        },
+                        MachSucc {
+                            target: MachBlockId(2),
+                            args: vec![],
+                        },
                     ],
                 },
                 MachBlock {
                     params: vec![],
                     start: 2,
                     end: 4,
-                    succs: vec![MachSucc { target: MachBlockId(3), args: vec![gl] }],
+                    succs: vec![MachSucc {
+                        target: MachBlockId(3),
+                        args: vec![gl],
+                    }],
                 },
                 MachBlock {
                     params: vec![],
                     start: 4,
                     end: 6,
-                    succs: vec![MachSucc { target: MachBlockId(3), args: vec![gr] }],
+                    succs: vec![MachSucc {
+                        target: MachBlockId(3),
+                        args: vec![gr],
+                    }],
                 },
                 MachBlock {
                     params: vec![gm],

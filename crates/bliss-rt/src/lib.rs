@@ -8,15 +8,15 @@
 // ── Object model ──────────────────────────────────────────────────
 pub mod asm;
 pub mod bfasl;
-/// Direct Linux syscalls (no libc) for runtime-internal OS services (bliss-bca.5).
-pub mod syscall;
+pub mod bytecode;
 /// Portable fiber context switch (no libc ucontext) — bliss-bca.5.
 pub mod context;
-pub mod bytecode;
 pub mod function;
 pub mod object;
 pub mod packages;
 pub mod symbols;
+/// Direct Linux syscalls (no libc) for runtime-internal OS services (bliss-bca.5).
+pub mod syscall;
 pub mod types;
 pub mod value;
 
@@ -49,41 +49,46 @@ pub mod runtime;
 
 // ── Re-exports for convenience ────────────────────────────────────
 pub use error::BlissError;
-pub use ffi::{load_foreign_library, marshal_to_c, unmarshal_from_c, AlienType, Callback};
+pub use ffi::{AlienType, Callback, load_foreign_library, marshal_to_c, unmarshal_from_c};
 pub use gc::{
+    Allocator, Collector, GcConfig, GcStats, HeapAllocator, HeapCollector, RegionHeader,
+    RegionKind, SatbCardBarrier, ShadowRoot, ShadowRootScope, Tlab, WeakPointer, WriteBarrier,
     alloc_typed, collect_t0_minor, drain_satb_log, full_gc, heap_stats, init_heap, pin,
-    register_finalizer, remembered_set_len, store_ref, unpin, walk_heap, write_barrier, Allocator,
-    Collector, GcConfig, GcStats, HeapAllocator, HeapCollector, RegionHeader, RegionKind,
-    SatbCardBarrier, ShadowRoot, ShadowRootScope, Tlab, WeakPointer, WriteBarrier,
+    register_finalizer, remembered_set_len, store_ref, unpin, walk_heap, write_barrier,
 };
 pub use image::{
+    Arch, ImageCompression, ImageHeader, Os, SaveImageOptions, SectionEntry, SectionType,
     current_platform_tag, find_appended_image, load_image, platform_tag, save_image,
-    validate_image_header, Arch, ImageCompression, ImageHeader, Os, SaveImageOptions, SectionEntry,
-    SectionType,
+    validate_image_header,
 };
 pub use object::ObjectHeader;
 pub use runtime::{
-    check_sigint, install_signal_handlers, parse_cli, set_runtime_init_hook, LogLevel, Runtime,
-    RuntimeConfig,
+    LogLevel, Runtime, RuntimeConfig, check_sigfpe, check_sigint, check_sigpipe,
+    check_sigsegv_null_guard, check_sigsegv_stack_guard, check_sigterm, install_signal_handlers,
+    parse_cli, set_runtime_init_hook,
 };
 pub use safepoint::{
-    enter_safepoint, poll_safepoint, resume_all_threads, wait_for_all_threads, SafepointPage,
+    SafepointPage, enter_safepoint, poll_safepoint, resume_all_threads, wait_for_all_threads,
 };
 pub use sandbox::{Sandbox, SandboxPolicy};
-pub use scheduler::{run_fibers, Scheduler, SchedulerConfig, SchedulerGroup};
+pub use scheduler::{Scheduler, SchedulerConfig, SchedulerGroup, run_fibers};
 pub use stack::{
-    eval_stack_budget, visit_stack_refs, BlissStack, CodeInfo, Frame, FrameType, FrameWalker,
-    SourceLocation, SourceLocationEntry, StackMapEntry,
+    BlissStack, CodeInfo, Frame, FrameType, FrameWalker, SourceLocation, SourceLocationEntry,
+    StackMapEntry, eval_stack_budget, visit_stack_refs,
 };
 pub use sync::{
-    fiber_sleep, set_pinned_blocking_action, wait_fd, BlissCondVar, BlissMutex, BlissSemaphore,
-    IoInterest, PinnedBlockingAction,
+    BlissCondVar, BlissMutex, BlissSemaphore, IoInterest, PinnedBlockingAction, fiber_sleep,
+    set_pinned_blocking_action, wait_fd,
 };
 pub use thread::{
-    all_fiber_ids, all_thread_ids, carrier_thread_ids, current_fiber, current_fiber_id,
-    current_stack, current_thread, current_thread_id, fiber_carrier_thread, fiber_state,
-    fiber_yield, interrupt_fiber, interrupt_thread, join_fiber, join_thread, make_fiber,
-    make_thread, park_current_fiber, submit_fiber, thread_is_carrier, thread_yield, Fiber,
-    FiberContinuation, FiberId, FiberState, NativeThread, NativeThreadId, NativeThreadState,
+    Fiber, FiberContinuation, FiberId, FiberState, NativeThread, NativeThreadId, NativeThreadState,
+    PendingSignal, all_fiber_ids, all_thread_ids, carrier_thread_ids,
+    clear_current_sandbox_cpu_deadline, current_fiber, current_fiber_id, current_stack,
+    current_thread, current_thread_id, fiber_carrier_thread, fiber_state, fiber_yield,
+    interrupt_fiber, interrupt_thread, join_fiber, join_thread, make_fiber, make_thread,
+    park_current_fiber, poll_current_sandbox_cpu_deadline, post_current_pending_signal,
+    post_foreground_pending_signal, set_current_execution_foreground,
+    start_current_sandbox_cpu_deadline, submit_fiber, take_current_pending_signal,
+    thread_is_carrier, thread_yield, with_current_condition_state_mut,
 };
 pub use value::BlissVal;

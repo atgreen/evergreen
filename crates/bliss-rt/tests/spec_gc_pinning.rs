@@ -2,10 +2,10 @@
 //! object keeps its address across collections, references to it from moved
 //! objects stay valid, and large objects are never copied.
 
-use bliss_rt::object::{type_id, ObjectHeader};
+use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, NIL, TAG_CONS, TAG_MASK};
-use bliss_rt::{current_thread, init_heap, pin, Allocator, BlissStack, Collector, GcConfig};
-use bliss_rt::{full_gc, walk_heap, HeapAllocator, HeapCollector};
+use bliss_rt::{Allocator, BlissStack, Collector, GcConfig, current_thread, init_heap, pin};
+use bliss_rt::{HeapAllocator, HeapCollector, full_gc, walk_heap};
 use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {
@@ -82,8 +82,16 @@ fn pinned_object_keeps_its_address_while_others_are_evacuated() {
     let q_after = unsafe { BlissStack::frame_slots_mut(f)[1] };
     assert_eq!(p_after.0 & !TAG_MASK, p_addr, "pinned object was NOT moved");
     assert_eq!(car(p_after).as_fixnum(), 999, "pinned contents intact");
-    assert_ne!(q_after.0 & !TAG_MASK, q.0 & !TAG_MASK, "unpinned object WAS moved");
-    assert_eq!(car(q_after).as_fixnum(), 111, "moved object contents intact");
+    assert_ne!(
+        q_after.0 & !TAG_MASK,
+        q.0 & !TAG_MASK,
+        "unpinned object WAS moved"
+    );
+    assert_eq!(
+        car(q_after).as_fixnum(),
+        111,
+        "moved object contents intact"
+    );
 
     stack.pop_frame();
 }
@@ -110,9 +118,17 @@ fn reference_to_a_pinned_object_from_a_moved_object_stays_valid() {
     HeapCollector::new().minor_gc().expect("minor_gc");
 
     let o_after = unsafe { BlissStack::frame_slots_mut(f)[0] };
-    assert_ne!(o_after.0 & !TAG_MASK, o.0 & !TAG_MASK, "referencing object moved");
+    assert_ne!(
+        o_after.0 & !TAG_MASK,
+        o.0 & !TAG_MASK,
+        "referencing object moved"
+    );
     // O's cdr still points at the un-moved pinned object, whose contents are intact.
-    assert_eq!(cdr(o_after).0 & !TAG_MASK, p_addr, "cdr still points at pinned object");
+    assert_eq!(
+        cdr(o_after).0 & !TAG_MASK,
+        p_addr,
+        "cdr still points at pinned object"
+    );
     assert_eq!(car(cdr(o_after)).as_fixnum(), 555, "pinned referent intact");
 
     stack.pop_frame();
@@ -139,7 +155,11 @@ fn large_object_is_never_moved_across_repeated_major_collections() {
     }
 
     // The large object is still at its original address, walkable, contents intact.
-    assert_eq!(unsafe { *(large_addr as *const u64) }, 0x00BA_DA55, "large object intact");
+    assert_eq!(
+        unsafe { *(large_addr as *const u64) },
+        0x00BA_DA55,
+        "large object intact"
+    );
     let mut found = false;
     walk_heap(|ptr, _tid, _size| {
         if ptr as u64 == large_addr {

@@ -1,11 +1,11 @@
 use bliss_rt::scheduler::*;
 use bliss_rt::thread::{
-    all_thread_ids, fiber_state, fiber_yield, make_fiber, park_current_fiber, thread_is_carrier,
-    FiberId, FiberState,
+    FiberId, FiberState, all_thread_ids, fiber_state, fiber_yield, make_fiber, park_current_fiber,
+    thread_is_carrier,
 };
 use bliss_rt::value::{BlissVal, T};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static YIELD_TRACE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static PARK_PROGRESS: AtomicUsize = AtomicUsize::new(0);
@@ -71,14 +71,18 @@ fn scheduler_group_exposes_real_native_carrier_threads() {
     assert_eq!(group.requested_carrier_count(), 3);
     assert_eq!(group.carrier_thread_ids().len(), 3);
     let all_threads = all_thread_ids();
-    assert!(group
-        .carrier_thread_ids()
-        .iter()
-        .all(|id| all_threads.contains(id)));
-    assert!(group
-        .carrier_thread_ids()
-        .iter()
-        .all(|&id| thread_is_carrier(id) == Some(true)));
+    assert!(
+        group
+            .carrier_thread_ids()
+            .iter()
+            .all(|id| all_threads.contains(id))
+    );
+    assert!(
+        group
+            .carrier_thread_ids()
+            .iter()
+            .all(|&id| thread_is_carrier(id) == Some(true))
+    );
     group.shutdown().unwrap();
 }
 

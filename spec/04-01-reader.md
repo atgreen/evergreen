@@ -601,7 +601,7 @@ pub struct ReaderErrorData {
 | `*READ-SUPPRESS*` | NIL | Suppress object construction (for `#+`/`#-`) |
 | `*PACKAGE*` | `COMMON-LISP-USER` | Current package for interning |
 | `*FEATURES*` | `(:BLISS :ANSI-CL :IEEE-FLOATING-POINT :64-BIT ...)` | Feature list for `#+`/`#-` |
-| `BLISS:*READER-SOURCE-TRACKING*` | T | Enable source-span collection (disable for batch loads where debug info is unwanted) |
+| `BLISS-EXT:*READER-SOURCE-TRACKING*` | T | Enable source-span collection; `BLISS:*READER-SOURCE-TRACKING*` is a deprecated compatibility spelling |
 
 ---
 

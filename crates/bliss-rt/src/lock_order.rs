@@ -202,13 +202,15 @@ fn start_watchdog() {
         if interval > 0 {
             let _ = std::thread::Builder::new()
                 .name("bliss-deadlock-watchdog".into())
-                .spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_millis(interval));
-                    let graph = wait_graph()
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if let Some(cycle) = find_cycle(&graph) {
-                        eprintln!("{}", cycle_diagnostic(&graph, &cycle));
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(interval));
+                        let graph = wait_graph()
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        if let Some(cycle) = find_cycle(&graph) {
+                            eprintln!("{}", cycle_diagnostic(&graph, &cycle));
+                        }
                     }
                 });
         }

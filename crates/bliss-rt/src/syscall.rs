@@ -304,9 +304,11 @@ pub fn sched_yield() {
 // Signal numbers (Linux; identical across the common architectures except a
 // few real-time-signal shifts that do not affect these).
 pub const SIGINT: i32 = 2;
+pub const SIGFPE: i32 = 8;
 pub const SIGABRT: i32 = 6;
 pub const SIGSEGV: i32 = 11;
 pub const SIGUSR1: i32 = 10;
+pub const SIGPIPE: i32 = 13;
 pub const SIGTERM: i32 = 15;
 
 // ── Signal installation via rt_sigaction ─────────────────────────────────────
@@ -317,7 +319,11 @@ pub const SIGTERM: i32 = 15;
 
 pub const SA_RESTORER: u64 = 0x0400_0000;
 pub const SA_RESTART: u64 = 0x1000_0000;
+pub const SA_ONSTACK: u64 = 0x0800_0000;
 pub const SA_SIGINFO: u64 = 0x0000_0004;
+pub const SS_DISABLE: i32 = 2;
+pub const MIN_SIGSTKSZ: usize = 2048;
+pub const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
 
 #[repr(C)]
 struct KernelSigaction {
@@ -358,6 +364,74 @@ pub unsafe fn rt_sigaction(sig: i32, handler: usize, extra_flags: u64) -> Result
         8, // sigsetsize = _NSIG/8
     );
     check(r).map(|_| ())
+}
+
+/// Install a three-argument SA_SIGINFO handler for `sig`.
+///
+/// SAFETY: `handler` must be a valid
+/// `extern "C" fn(i32, *mut SigInfo, *mut core::ffi::c_void)` appropriate for
+/// `sig`.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn rt_sigaction_siginfo(sig: i32, handler: usize, extra_flags: u64) -> Result<(), i32> {
+    rt_sigaction(sig, handler, extra_flags | SA_SIGINFO)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct StackT {
+    pub ss_sp: *mut u8,
+    pub ss_flags: i32,
+    pub ss_size: usize,
+}
+
+/// `sigaltstack(2)`.
+///
+/// SAFETY: `new` and `old` must be null or valid pointers for the syscall's
+/// duration.
+#[inline]
+pub unsafe fn sigaltstack(new: *const StackT, old: *mut StackT) -> Result<(), i32> {
+    check(syscall2(nr::SIGALTSTACK, new as usize, old as usize)).map(|_| ())
+}
+
+pub fn current_sigaltstack() -> Result<StackT, i32> {
+    let mut out = StackT {
+        ss_sp: core::ptr::null_mut(),
+        ss_flags: 0,
+        ss_size: 0,
+    };
+    // SAFETY: `old` points at writable stack_t storage; `new=NULL` only queries.
+    unsafe { sigaltstack(core::ptr::null(), &mut out as *mut StackT) }.map(|_| out)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TimeSpec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+/// `clock_gettime(2)`.
+///
+/// SAFETY: `ts` must point at writable `TimeSpec` storage.
+#[inline]
+pub unsafe fn clock_gettime(clock_id: i32, ts: *mut TimeSpec) -> Result<(), i32> {
+    check(syscall2(
+        nr::CLOCK_GETTIME,
+        clock_id as isize as usize,
+        ts as usize,
+    ))
+    .map(|_| ())
+}
+
+pub fn thread_cpu_time_ns() -> Result<u64, i32> {
+    let mut ts = TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts as *mut TimeSpec) }?;
+    let secs = u64::try_from(ts.tv_sec).map_err(|_| -1_i32)?;
+    let nanos = u64::try_from(ts.tv_nsec).map_err(|_| -1_i32)?;
+    Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
 }
 
 // poll.

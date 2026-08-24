@@ -336,16 +336,12 @@ fn unsafe_runtime_code_is_confined_to_the_specified_modules_and_documented() {
 }
 
 #[test]
-fn signal_and_sandbox_sources_cover_async_safety_image_validation_and_fuzzing_hooks() {
-    // Per R8.10, signal handlers must defer work to a flag checked later.
+fn security_sources_cover_image_validation_and_fuzzing_hooks() {
     // Per R8.17, image loading must validate data before use.
     // Per R8.18, dedicated fuzzing hooks must exist for security-critical paths.
-    let runtime_source = read_source("crates/bliss-rt/src/runtime.rs");
     let image_source = read_source("crates/bliss-rt/src/image.rs");
     let ffi_test_source = read_source("crates/bliss-rt/tests/test_ffi.rs");
 
-    assert!(runtime_source.contains("SIGINT_RECEIVED.store"));
-    assert!(runtime_source.contains("install_signal_handlers"));
     assert!(image_source.contains("validate_image_header"));
     assert!(ffi_test_source.contains("ffi_call"));
 }

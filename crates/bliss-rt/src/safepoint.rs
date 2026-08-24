@@ -24,6 +24,9 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
+static SAFEPOINT_PAGE_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SAFEPOINT_PAGE_LEN: AtomicUsize = AtomicUsize::new(0);
+
 /// Flag-only SIGUSR1 handoff. Directed delivery interrupts a blocking syscall;
 /// ordinary code observes this flag at its next safepoint poll.
 static SIGUSR1_PENDING: AtomicBool = AtomicBool::new(false);
@@ -38,10 +41,10 @@ use crate::error::BlissError;
 pub struct SafepointPage {
     /// Page-aligned memory buffer (4096 bytes).
     page: *mut u8,
-    /// Layout used for deallocation.
-    layout: std::alloc::Layout,
     /// Whether a safepoint is currently requested.
     requested: AtomicBool,
+    /// Whether the polling page is currently protected with PROT_NONE.
+    protected: AtomicBool,
 }
 
 // SafepointPage is shared across threads for GC coordination.
@@ -51,7 +54,7 @@ unsafe impl Sync for SafepointPage {}
 impl Drop for SafepointPage {
     fn drop(&mut self) {
         if !self.page.is_null() {
-            unsafe { std::alloc::dealloc(self.page, self.layout) };
+            let _ = unsafe { crate::syscall::munmap(self.page, 4096) };
         }
     }
 }
@@ -59,16 +62,23 @@ impl Drop for SafepointPage {
 impl SafepointPage {
     /// Allocate and map the safepoint page (called once at startup).
     pub fn init() -> Result<Self, BlissError> {
-        let layout = std::alloc::Layout::from_size_align(4096, 4096)
-            .map_err(|e| BlissError::Internal(format!("safepoint layout: {}", e)))?;
-        let page = unsafe { std::alloc::alloc_zeroed(layout) };
-        if page.is_null() {
-            return Err(BlissError::Oom);
+        let page = unsafe {
+            crate::syscall::mmap(
+                std::ptr::null_mut(),
+                4096,
+                crate::syscall::PROT_READ | crate::syscall::PROT_WRITE,
+                crate::syscall::MAP_PRIVATE | crate::syscall::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
         }
+        .map_err(|errno| BlissError::Internal(format!("safepoint mmap failed: errno {errno}")))?;
+        SAFEPOINT_PAGE_ADDR.store(page as usize, Ordering::Release);
+        SAFEPOINT_PAGE_LEN.store(4096, Ordering::Release);
         Ok(SafepointPage {
             page,
-            layout,
             requested: AtomicBool::new(false),
+            protected: AtomicBool::new(false),
         })
     }
 
@@ -82,6 +92,10 @@ impl SafepointPage {
     /// Sets the `requested` flag so that `poll_safepoint()` will cause
     /// mutator threads to enter the safepoint and park.
     pub fn request_safepoint(&self) -> Result<(), BlissError> {
+        unsafe { crate::syscall::mprotect(self.page, 4096, crate::syscall::PROT_NONE) }.map_err(
+            |errno| BlissError::Internal(format!("safepoint mprotect failed: errno {errno}")),
+        )?;
+        self.protected.store(true, Ordering::SeqCst);
         self.requested.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -91,6 +105,17 @@ impl SafepointPage {
     /// Clears the `requested` flag. Threads that have not yet observed
     /// the flag will continue running without parking.
     pub fn resume(&self) -> Result<(), BlissError> {
+        unsafe {
+            crate::syscall::mprotect(
+                self.page,
+                4096,
+                crate::syscall::PROT_READ | crate::syscall::PROT_WRITE,
+            )
+        }
+        .map_err(|errno| {
+            BlissError::Internal(format!("safepoint mprotect restore failed: errno {errno}"))
+        })?;
+        self.protected.store(false, Ordering::SeqCst);
         self.requested.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -99,6 +124,36 @@ impl SafepointPage {
     pub fn is_requested(&self) -> bool {
         self.requested.load(Ordering::SeqCst)
     }
+
+    pub fn poll_page_is_protected(&self) -> bool {
+        self.protected.load(Ordering::SeqCst)
+    }
+}
+
+pub fn safepoint_page_contains(addr: usize) -> bool {
+    let base = SAFEPOINT_PAGE_ADDR.load(Ordering::Acquire);
+    let len = SAFEPOINT_PAGE_LEN.load(Ordering::Acquire);
+    base != 0 && addr.wrapping_sub(base) < len
+}
+
+pub(crate) fn recover_poll_page_sigsegv() -> bool {
+    let base = SAFEPOINT_PAGE_ADDR.load(Ordering::Acquire);
+    let len = SAFEPOINT_PAGE_LEN.load(Ordering::Acquire);
+    if base == 0 || len == 0 {
+        return false;
+    }
+    let restored = unsafe {
+        crate::syscall::mprotect(
+            base as *mut u8,
+            len,
+            crate::syscall::PROT_READ | crate::syscall::PROT_WRITE,
+        )
+    }
+    .is_ok();
+    if restored {
+        SIGUSR1_PENDING.store(true, Ordering::Relaxed);
+    }
+    restored
 }
 
 // ── Global safepoint coordination state ──────────────────────────────

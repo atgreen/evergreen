@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 use bliss_rt::error::BlissError;
 use bliss_rt::lock_order::{LockLevel, OrderedMutex, OrderedMutexGuard};
-use bliss_rt::object::{type_id, ObjectHeader};
+use bliss_rt::object::{ObjectHeader, type_id};
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
 // ── Gray streams protocol ──────────────────────────────────────────
@@ -2149,11 +2149,11 @@ fn stream_gc_finalize(_finalizer: BlissVal, object: BlissVal) {
             }
         }
         drop(alloc); // File::drop closes the fd; buffers freed
-                     // Null the handle's box pointer. Finalizers run early in a major GC
-                     // (before the relocation pass, which traces *every* non-forwarded object,
-                     // including this now-dead handle). Without this, `stream_trace` would
-                     // dereference the freed block. A nulled pointer makes the later trace —
-                     // and any stray access — skip it safely (bliss-jtc.7a).
+        // Null the handle's box pointer. Finalizers run early in a major GC
+        // (before the relocation pass, which traces *every* non-forwarded object,
+        // including this now-dead handle). Without this, `stream_trace` would
+        // dereference the freed block. A nulled pointer makes the later trace —
+        // and any stray access — skip it safely (bliss-jtc.7a).
         *(body as *mut u64) = 0;
     }
 }
@@ -2291,7 +2291,7 @@ pub fn stream_wait_for_input(
             _ => {
                 return Err(BlissError::StreamError(
                     "wait-for-input: not an input stream".into(),
-                ))
+                ));
             }
         }
     };

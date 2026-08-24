@@ -321,7 +321,8 @@ fn shared_registry_supports_concurrent_bootstrap_lookup_and_mutation() {
 
     for thread_index in 0..THREADS {
         assert!(
-            root.find_package(&format!("THREAD-PKG-{thread_index}")).is_some(),
+            root.find_package(&format!("THREAD-PKG-{thread_index}"))
+                .is_some(),
             "packages created on worker threads must remain visible through the shared registry",
         );
     }

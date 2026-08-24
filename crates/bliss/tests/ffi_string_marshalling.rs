@@ -79,8 +79,14 @@ fn ffi_call_marshals_strings_both_ways() {
         output.status
     );
 
-    assert!(stdout.contains("len=5"), "string arg length; got:\n{stdout}");
-    assert!(stdout.contains("empty=0"), "empty string arg; got:\n{stdout}");
+    assert!(
+        stdout.contains("len=5"),
+        "string arg length; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("empty=0"),
+        "empty string arg; got:\n{stdout}"
+    );
     assert!(
         stdout.contains("nil=-1"),
         "NIL must pass a null pointer; got:\n{stdout}"

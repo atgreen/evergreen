@@ -3,7 +3,7 @@
 //! See §2.3 of the spec.
 
 use crate::error::BlissError;
-use crate::gc::{register_root_scanner, TraceHostRoots};
+use crate::gc::{TraceHostRoots, register_root_scanner};
 use crate::lock_order::{LockLevel, OrderedMutex};
 use crate::stack::BlissStack;
 use crate::value::{BlissVal, NIL};
@@ -12,7 +12,7 @@ use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
 use std::sync::atomic::{
-    fence, AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicIsize, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering, fence,
 };
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
@@ -158,9 +158,117 @@ pub enum NativeThreadState {
     Aborted = 5,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingSignal {
+    Interrupt,
+    Shutdown,
+    NullGuard,
+    StackGuard,
+    Arithmetic,
+    Pipe,
+    Timeout,
+}
+
+impl PendingSignal {
+    fn bit(self) -> u8 {
+        match self {
+            PendingSignal::Interrupt => 1 << 0,
+            PendingSignal::Shutdown => 1 << 1,
+            PendingSignal::NullGuard => 1 << 2,
+            PendingSignal::StackGuard => 1 << 3,
+            PendingSignal::Arithmetic => 1 << 4,
+            PendingSignal::Pipe => 1 << 5,
+            PendingSignal::Timeout => 1 << 6,
+        }
+    }
+
+    fn from_bits(bits: u8) -> Option<Self> {
+        if bits & PendingSignal::Shutdown.bit() != 0 {
+            Some(PendingSignal::Shutdown)
+        } else if bits & PendingSignal::Timeout.bit() != 0 {
+            Some(PendingSignal::Timeout)
+        } else if bits & PendingSignal::NullGuard.bit() != 0 {
+            Some(PendingSignal::NullGuard)
+        } else if bits & PendingSignal::StackGuard.bit() != 0 {
+            Some(PendingSignal::StackGuard)
+        } else if bits & PendingSignal::Arithmetic.bit() != 0 {
+            Some(PendingSignal::Arithmetic)
+        } else if bits & PendingSignal::Pipe.bit() != 0 {
+            Some(PendingSignal::Pipe)
+        } else if bits & PendingSignal::Interrupt.bit() != 0 {
+            Some(PendingSignal::Interrupt)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConditionHandlerCluster {
+    pub frame: usize,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConditionRestartCluster {
+    pub frame: usize,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ThreadConditionState {
+    pub handler_stack: Vec<ConditionHandlerCluster>,
+    pub restart_stack: Vec<ConditionRestartCluster>,
+    pub debugger_hook: Option<BlissVal>,
+    pub break_on_signals: Option<BlissVal>,
+    pub debugger_invoked: bool,
+    pub handler_case_clauses: HashMap<u64, BlissVal>,
+    pub pending_handler_case: Option<(BlissVal, BlissVal)>,
+    pub next_handler_case_id: i64,
+}
+
+impl ThreadConditionState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl TraceHostRoots for ThreadConditionState {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        if let Some(value) = self.debugger_hook.as_mut() {
+            visit(value);
+        }
+        if let Some(value) = self.break_on_signals.as_mut() {
+            visit(value);
+        }
+        for value in self.handler_case_clauses.values_mut() {
+            visit(value);
+        }
+        if let Some((condition, handler)) = self.pending_handler_case.as_mut() {
+            visit(condition);
+            visit(handler);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConditionStateSnapshot {
+    pub handler_depth: usize,
+    pub restart_depth: usize,
+    pub debugger_hook: Option<BlissVal>,
+    pub break_on_signals: Option<BlissVal>,
+    pub handler_case_clause_count: usize,
+    pub pending_handler_case: bool,
+}
+
 /// Atomic counters for the two deliberately distinct identity spaces.
 static NEXT_NATIVE_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_FIBER_ID: AtomicU64 = AtomicU64::new(1);
+static FOREGROUND_EXECUTION_KIND: AtomicU8 = AtomicU8::new(0);
+static FOREGROUND_EXECUTION_ID: AtomicU64 = AtomicU64::new(0);
+
+const FOREGROUND_NATIVE_THREAD: u8 = 1;
+const FOREGROUND_FIBER: u8 = 2;
 
 fn native_object_order(id: NativeThreadId, field: u64) -> u64 {
     id.0.saturating_mul(32).saturating_add(field).max(1)
@@ -220,6 +328,7 @@ pub struct NativeThread {
     state: OrderedMutex<NativeThreadState>,
     stack: BlissStack,
     tls: OrderedMutex<Vec<BlissVal>>,
+    condition_state: OrderedMutex<ThreadConditionState>,
     result: Arc<ThreadResult>,
     join_handle: OrderedMutex<Option<std::thread::JoinHandle<()>>>,
     interrupt_pending: AtomicBool,
@@ -230,6 +339,7 @@ pub struct NativeThread {
     published_fp: AtomicUsize,
     /// `pthread_t` for directed SIGUSR1 delivery on Unix (zero until mounted).
     os_thread_id: AtomicUsize,
+    pending_signals: AtomicU8,
 }
 
 unsafe impl Send for NativeThread {}
@@ -263,6 +373,12 @@ impl NativeThread {
                 "native thread TLS",
                 vec![NIL; MAX_TLS],
             ),
+            condition_state: OrderedMutex::new(
+                LockLevel::ExecutionObject,
+                native_object_order(id, 9),
+                "native thread condition state",
+                ThreadConditionState::new(),
+            ),
             result,
             join_handle: OrderedMutex::new(
                 LockLevel::ExecutionObject,
@@ -282,6 +398,7 @@ impl NativeThread {
             published_sp: AtomicUsize::new(0),
             published_fp: AtomicUsize::new(0),
             os_thread_id: AtomicUsize::new(0),
+            pending_signals: AtomicU8::new(0),
         }
     }
 
@@ -326,6 +443,23 @@ impl NativeThread {
             .unwrap_or(NIL)
     }
 
+    pub fn with_condition_state_mut<T>(&self, f: impl FnOnce(&mut ThreadConditionState) -> T) -> T {
+        let mut state = self.condition_state.lock().unwrap();
+        f(&mut state)
+    }
+
+    pub fn condition_state_snapshot(&self) -> ConditionStateSnapshot {
+        let state = self.condition_state.lock().unwrap();
+        ConditionStateSnapshot {
+            handler_depth: state.handler_stack.len(),
+            restart_depth: state.restart_stack.len(),
+            debugger_hook: state.debugger_hook,
+            break_on_signals: state.break_on_signals,
+            handler_case_clause_count: state.handler_case_clauses.len(),
+            pending_handler_case: state.pending_handler_case.is_some(),
+        }
+    }
+
     pub fn tls_set(&self, index: u32, value: BlissVal) {
         if let Some(slot) = self.tls.lock().unwrap().get_mut(index as usize) {
             *slot = value;
@@ -367,9 +501,30 @@ impl NativeThread {
             .then(|| *self.interrupt_value.lock().unwrap())
     }
 
+    fn post_pending_signal(&self, signal: PendingSignal) {
+        self.pending_signals
+            .fetch_or(signal.bit(), Ordering::Release);
+    }
+
+    fn take_pending_signal(&self) -> Option<PendingSignal> {
+        loop {
+            let bits = self.pending_signals.load(Ordering::Acquire);
+            let signal = PendingSignal::from_bits(bits)?;
+            let new_bits = bits & !signal.bit();
+            if self
+                .pending_signals
+                .compare_exchange(bits, new_bits, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(signal);
+            }
+        }
+    }
+
     fn trace_execution_roots(&self, visit: &mut dyn FnMut(*mut BlissVal)) {
         trace_atomic_bliss_val(&self.entry, visit);
         self.tls.lock().unwrap().trace_host_roots(visit);
+        self.condition_state.lock().unwrap().trace_host_roots(visit);
         self.interrupt_value.lock().unwrap().trace_host_roots(visit);
         self.result.value.lock().unwrap().trace_host_roots(visit);
     }
@@ -426,6 +581,7 @@ fn native_threads_snapshot() -> Vec<Arc<NativeThread>> {
 thread_local! {
     static CURRENT_NATIVE_THREAD: RefCell<Option<CurrentNativeThread>> =
         const { RefCell::new(None) };
+    static SANDBOX_CPU_DEADLINE_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 struct CurrentNativeThread {
@@ -539,6 +695,7 @@ pub struct Fiber {
     dynamic_bindings: OrderedMutex<Vec<(BlissVal, BlissVal)>>,
     handler_stack: OrderedMutex<Vec<BlissVal>>,
     restart_stack: OrderedMutex<Vec<BlissVal>>,
+    condition_state: OrderedMutex<ThreadConditionState>,
     pin_count: AtomicUsize,
     carrier_id: AtomicU64,
     /// Per-thread yield flag for cooperative preemption at safepoints (§2.5.3 step 4).
@@ -556,6 +713,7 @@ pub struct Fiber {
     /// `0` means "running normally, not published".
     published_sp: AtomicUsize,
     published_fp: AtomicUsize,
+    pending_signals: AtomicU8,
 }
 
 impl Fiber {
@@ -577,6 +735,23 @@ impl Fiber {
 
     pub fn restart_stack(&self) -> Vec<BlissVal> {
         self.restart_stack.lock().unwrap().clone()
+    }
+
+    pub fn with_condition_state_mut<T>(&self, f: impl FnOnce(&mut ThreadConditionState) -> T) -> T {
+        let mut state = self.condition_state.lock().unwrap();
+        f(&mut state)
+    }
+
+    pub fn condition_state_snapshot(&self) -> ConditionStateSnapshot {
+        let state = self.condition_state.lock().unwrap();
+        ConditionStateSnapshot {
+            handler_depth: state.handler_stack.len(),
+            restart_depth: state.restart_stack.len(),
+            debugger_hook: state.debugger_hook,
+            break_on_signals: state.break_on_signals,
+            handler_case_clause_count: state.handler_case_clauses.len(),
+            pending_handler_case: state.pending_handler_case.is_some(),
+        }
     }
 
     pub fn pin(&self) {
@@ -724,6 +899,26 @@ impl Fiber {
         self.interrupt_pending.store(true, Ordering::Release);
     }
 
+    fn post_pending_signal(&self, signal: PendingSignal) {
+        self.pending_signals
+            .fetch_or(signal.bit(), Ordering::Release);
+    }
+
+    fn take_pending_signal(&self) -> Option<PendingSignal> {
+        loop {
+            let bits = self.pending_signals.load(Ordering::Acquire);
+            let signal = PendingSignal::from_bits(bits)?;
+            let new_bits = bits & !signal.bit();
+            if self
+                .pending_signals
+                .compare_exchange(bits, new_bits, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(signal);
+            }
+        }
+    }
+
     fn trace_execution_roots(&self, visit: &mut dyn FnMut(*mut BlissVal)) {
         trace_atomic_bliss_val(&self.entry, visit);
         self.tls.lock().unwrap().trace_host_roots(visit);
@@ -733,6 +928,7 @@ impl Fiber {
             .trace_host_roots(visit);
         self.handler_stack.lock().unwrap().trace_host_roots(visit);
         self.restart_stack.lock().unwrap().trace_host_roots(visit);
+        self.condition_state.lock().unwrap().trace_host_roots(visit);
         self.interrupt_value.lock().unwrap().trace_host_roots(visit);
         self.result.value.lock().unwrap().trace_host_roots(visit);
     }
@@ -1458,6 +1654,106 @@ pub fn interrupt_thread(id: NativeThreadId, condition: BlissVal) -> Result<(), B
     Ok(())
 }
 
+pub fn post_current_pending_signal(signal: PendingSignal) {
+    if let Some(fiber) = current_fiber() {
+        fiber.post_pending_signal(signal);
+    } else {
+        current_thread().post_pending_signal(signal);
+    }
+}
+
+/// Mark the mounted fiber, or otherwise the current native thread, as the
+/// foreground execution target for process-directed deferred signals.
+pub fn set_current_execution_foreground() {
+    if let Some(fiber) = current_fiber() {
+        FOREGROUND_EXECUTION_ID.store(fiber.id().0, Ordering::Release);
+        FOREGROUND_EXECUTION_KIND.store(FOREGROUND_FIBER, Ordering::Release);
+    } else {
+        let id = current_thread_id();
+        FOREGROUND_EXECUTION_ID.store(id.0, Ordering::Release);
+        FOREGROUND_EXECUTION_KIND.store(FOREGROUND_NATIVE_THREAD, Ordering::Release);
+    }
+}
+
+pub fn post_foreground_pending_signal(signal: PendingSignal) -> Result<(), BlissError> {
+    let kind = FOREGROUND_EXECUTION_KIND.load(Ordering::Acquire);
+    let id = FOREGROUND_EXECUTION_ID.load(Ordering::Acquire);
+    match kind {
+        FOREGROUND_NATIVE_THREAD => {
+            let mut registry = native_thread_registry().lock().unwrap();
+            prune_inactive_auto_registered_threads(&mut registry);
+            let thread = registry.get(&NativeThreadId(id)).ok_or_else(|| {
+                BlissError::Internal(format!("no foreground native thread with id {id}"))
+            })?;
+            thread.post_pending_signal(signal);
+            Ok(())
+        }
+        FOREGROUND_FIBER => {
+            let registry = fiber_registry().lock().unwrap();
+            let fiber = registry
+                .get(&FiberId(id))
+                .ok_or_else(|| BlissError::Internal(format!("no foreground fiber with id {id}")))?;
+            fiber.post_pending_signal(signal);
+            Ok(())
+        }
+        _ => Err(BlissError::Internal(
+            "no foreground execution is registered".into(),
+        )),
+    }
+}
+
+pub fn take_current_pending_signal() -> Option<PendingSignal> {
+    current_fiber()
+        .and_then(Fiber::take_pending_signal)
+        .or_else(|| current_thread().take_pending_signal())
+}
+
+pub fn with_current_condition_state_mut<T>(f: impl FnOnce(&mut ThreadConditionState) -> T) -> T {
+    if let Some(fiber) = current_fiber() {
+        fiber.with_condition_state_mut(f)
+    } else {
+        current_thread().with_condition_state_mut(f)
+    }
+}
+
+pub fn current_condition_state_snapshot() -> ConditionStateSnapshot {
+    if let Some(fiber) = current_fiber() {
+        fiber.condition_state_snapshot()
+    } else {
+        current_thread().condition_state_snapshot()
+    }
+}
+
+pub fn start_current_sandbox_cpu_deadline(limit_ms: u64) -> Result<(), BlissError> {
+    if limit_ms == 0 {
+        clear_current_sandbox_cpu_deadline();
+        return Ok(());
+    }
+    let now = crate::syscall::thread_cpu_time_ns()
+        .map_err(|errno| BlissError::Internal(format!("clock_gettime failed: {errno}")))?;
+    let limit_ns = limit_ms.saturating_mul(1_000_000);
+    SANDBOX_CPU_DEADLINE_NS.with(|deadline| deadline.set(now.saturating_add(limit_ns).max(1)));
+    Ok(())
+}
+
+pub fn clear_current_sandbox_cpu_deadline() {
+    SANDBOX_CPU_DEADLINE_NS.with(|deadline| deadline.set(0));
+}
+
+pub fn poll_current_sandbox_cpu_deadline() -> Result<(), BlissError> {
+    let deadline = SANDBOX_CPU_DEADLINE_NS.with(|deadline| deadline.get());
+    if deadline == 0 {
+        return Ok(());
+    }
+    let now = crate::syscall::thread_cpu_time_ns()
+        .map_err(|errno| BlissError::Internal(format!("clock_gettime failed: {errno}")))?;
+    if now >= deadline {
+        clear_current_sandbox_cpu_deadline();
+        post_current_pending_signal(PendingSignal::Timeout);
+    }
+    Ok(())
+}
+
 pub fn thread_yield() {
     std::thread::yield_now();
 }
@@ -1521,6 +1817,12 @@ pub fn make_fiber(entry: BlissVal) -> Result<FiberId, BlissError> {
             "fiber restart stack",
             Vec::new(),
         ),
+        condition_state: OrderedMutex::new(
+            LockLevel::ExecutionObject,
+            fiber_object_order(id, 9),
+            "fiber condition state",
+            ThreadConditionState::new(),
+        ),
         pin_count: AtomicUsize::new(0),
         carrier_id: AtomicU64::new(0),
         yield_requested: AtomicBool::new(false),
@@ -1534,6 +1836,7 @@ pub fn make_fiber(entry: BlissVal) -> Result<FiberId, BlissError> {
         ),
         published_sp: AtomicUsize::new(0),
         published_fp: AtomicUsize::new(0),
+        pending_signals: AtomicU8::new(0),
     });
     fiber_registry()
         .lock()

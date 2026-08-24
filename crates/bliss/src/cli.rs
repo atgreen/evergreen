@@ -37,6 +37,7 @@ pub struct CliArgs {
     pub help: bool,
     pub version: bool,
     pub sandbox: bool,
+    pub sandbox_cpu_ms: Option<u64>,
     pub no_init: bool,
     pub cl_args: Vec<String>,
     pub script: Option<String>,
@@ -148,6 +149,21 @@ impl CliArgs {
         if !runtime_cl_args.is_empty() {
             cl_args.extend(runtime_cl_args);
         }
+        let sandbox_cpu_ms = if sandbox {
+            match std::env::var("BLISS_SANDBOX_CPU_MS") {
+                Ok(value) => Some(value.parse::<u64>().map_err(|_| {
+                    BlissError::Internal("BLISS_SANDBOX_CPU_MS requires a numeric value".into())
+                })?),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(BlissError::Internal(
+                        "BLISS_SANDBOX_CPU_MS must be valid Unicode".into(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
 
         let r = CliArgs {
             image: extract_flag_value(&shared_args, "--image"),
@@ -164,6 +180,7 @@ impl CliArgs {
             help,
             version,
             sandbox,
+            sandbox_cpu_ms,
             no_init,
             cl_args,
             script,
@@ -389,6 +406,8 @@ fn coerce_pathname_designator(v: BlissVal) -> Result<BlissVal, BlissError> {
     if bliss_stdlib::is_pathname(v) {
         Ok(v)
     } else {
+        let mut v = v;
+        bliss_rt::rooted_ref!(_v_root = &mut v);
         Ok(bliss_stdlib::parse_namestring(v, None, None)?.0)
     }
 }
@@ -524,8 +543,65 @@ fn resolve_input_stream(designator: BlissVal, env: &Env) -> BlissVal {
 
 /// Write a string to a resolved output stream via the stdlib stream API.
 fn write_str_to(stream: BlissVal, s: &str) -> Result<(), BlissError> {
+    check_pending_sigpipe_for_output()?;
     let sv = bliss_stdlib::make_lisp_string(s);
     bliss_stdlib::stream_write_string(stream, sv, 0, None)
+}
+
+fn claim_process_signal_flags_for_current_execution() {
+    fn post(signal: bliss_rt::PendingSignal) {
+        if bliss_rt::post_foreground_pending_signal(signal).is_err() {
+            bliss_rt::post_current_pending_signal(signal);
+        }
+    }
+
+    let _ = bliss_rt::poll_current_sandbox_cpu_deadline();
+    if bliss_rt::check_sigterm() {
+        post(bliss_rt::PendingSignal::Shutdown);
+    }
+    if bliss_rt::check_sigfpe() {
+        post(bliss_rt::PendingSignal::Arithmetic);
+    }
+    if bliss_rt::check_sigpipe() {
+        post(bliss_rt::PendingSignal::Pipe);
+    }
+    if bliss_rt::check_sigsegv_null_guard() {
+        post(bliss_rt::PendingSignal::NullGuard);
+    }
+    if bliss_rt::check_sigsegv_stack_guard() {
+        post(bliss_rt::PendingSignal::StackGuard);
+    }
+    if bliss_rt::check_sigint() {
+        post(bliss_rt::PendingSignal::Interrupt);
+    }
+}
+
+fn pending_signal_error_for_current_execution() -> Option<BlissError> {
+    claim_process_signal_flags_for_current_execution();
+    match bliss_rt::take_current_pending_signal()? {
+        bliss_rt::PendingSignal::Shutdown => Some(BlissError::Shutdown),
+        bliss_rt::PendingSignal::Arithmetic => Some(BlissError::ArithmeticError(
+            "floating point exception".into(),
+        )),
+        bliss_rt::PendingSignal::NullGuard => Some(BlissError::TypeError {
+            datum: NIL,
+            expected: "non-null object reference".into(),
+        }),
+        bliss_rt::PendingSignal::StackGuard => Some(BlissError::StackOverflow(
+            bliss_rt::current_fiber_id()
+                .unwrap_or_else(|| bliss_rt::FiberId(bliss_rt::current_thread_id().0)),
+        )),
+        bliss_rt::PendingSignal::Pipe => Some(BlissError::StreamError("broken pipe".into())),
+        bliss_rt::PendingSignal::Interrupt => Some(BlissError::Interrupt),
+        bliss_rt::PendingSignal::Timeout => Some(BlissError::Timeout),
+    }
+}
+
+fn check_pending_sigpipe_for_output() -> Result<(), BlissError> {
+    if let Some(error) = pending_signal_error_for_current_execution() {
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// True if `s` is a user-defined Gray stream: a CLOS instance whose class
@@ -801,7 +877,9 @@ fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
         return Some(pb);
     }
     let f = global_fn(name)?;
-    bliss_rt::function::record_invocation(f);
+    if !bytecode::profiling_disabled() {
+        bliss_rt::function::record_invocation(f);
+    }
     Some((
         bliss_rt::function::lambda_list(f),
         bliss_rt::function::body(f),
@@ -1575,6 +1653,8 @@ fn bliss_error_to_condition(
         BlissError::PackageError(_) => build_condition_instance(env, "PACKAGE-ERROR", &[])?,
         BlissError::StreamError(_) => build_condition_instance(env, "STREAM-ERROR", &[])?,
         BlissError::FileError(_) => build_condition_instance(env, "FILE-ERROR", &[])?,
+        BlissError::Interrupt => build_condition_instance(env, "INTERRUPT-CONDITION", &[])?,
+        BlissError::Timeout => build_condition_instance(env, "TIMEOUT-CONDITION", &[])?,
         BlissError::Oom => {
             // Heap is exhausted: the storage-failure path must not allocate, so
             // hand back a STORAGE-CONDITION preallocated at startup rather than
@@ -1582,11 +1662,11 @@ fn bliss_error_to_condition(
             bliss_stdlib::acquire_preallocated_storage_condition()?
         }
         BlissError::StackOverflow(_) => {
-            // Only the control stack overflowed — the heap is fine — so build a
-            // CLI-native STORAGE-CONDITION here (allocation is safe, and unlike a
-            // preallocated stdlib-pool instance it is recognised by the CLI's
-            // condition type matching). R2.20; see bliss-nmq.
-            build_condition_instance(env, "STORAGE-CONDITION", &[])?
+            // Control-stack overflow must use the same no-allocation
+            // STORAGE-CONDITION payload as heap exhaustion (D5.13 / bliss-7z8).
+            // Env::new reseeds the thread-local pool with CLI-native instances,
+            // so handler matching still sees the CLI-recognized class.
+            bliss_stdlib::acquire_preallocated_storage_condition()?
         }
         BlissError::SandboxViolation(msg) => make_simple_error_condition(arena_str(msg), env)?,
         BlissError::ProgramError(_) => build_condition_instance(env, "PROGRAM-ERROR", &[])?,
@@ -2393,20 +2473,22 @@ fn invoke_method(
     next: Option<NextMethod>,
 ) -> Result<BlissVal, BlissError> {
     let parent = Rc::clone(&env.frame);
-    let pushed = next.is_some();
-    with_child_frame(env, parent, move |env| {
-        bind_method_params(env, method, args)?;
-        if let Some(next) = next {
+    if let Some(mut next) = next {
+        bliss_rt::rooted_ref!(_next_root = &mut next);
+        return with_child_frame(env, parent, |env| {
+            bind_method_params(env, method, args)?;
             env.method_context.push(MethodContext {
                 args: args.to_vec(),
-                next,
+                next: next.clone(),
             });
-        }
-        let result = eval_progn(method.body, env);
-        if pushed {
+            let result = eval_progn(method.body, env);
             env.method_context.pop();
-        }
-        result
+            result
+        });
+    }
+    with_child_frame(env, parent, |env| {
+        bind_method_params(env, method, args)?;
+        eval_progn(method.body, env)
     })
 }
 
@@ -2634,22 +2716,33 @@ fn run_initialization_aux_methods(
     args: &[BlissVal],
     qualifier: bliss_stdlib::MethodQualifier,
 ) -> Result<(), BlissError> {
-    let methods = match env.methods.borrow().get(gf_name).cloned() {
-        Some(methods) if !methods.is_empty() => methods.clone(),
+    let mut methods = match env.methods.borrow().get(gf_name).cloned() {
+        Some(methods) if !methods.is_empty() => methods,
         _ => return Ok(()),
     };
-    let mut applicable: Vec<(MethodDef, Vec<usize>)> = methods
-        .into_iter()
-        .filter(|method| method.qualifier == qualifier)
-        .filter_map(|method| method_specificity_vector(env, &method, args).map(|key| (method, key)))
-        .collect();
+    bliss_rt::rooted_ref!(_methods_root = &mut methods);
+    let mut applicable: Vec<(usize, Vec<usize>)> = Vec::new();
+    for index in 0..methods.len() {
+        if methods[index].qualifier != qualifier {
+            continue;
+        }
+        let mut method = methods[index].clone();
+        bliss_rt::rooted_ref!(_method_root = &mut method);
+        if let Some(key) = method_specificity_vector(env, &method, args) {
+            applicable.push((index, key));
+        }
+    }
     applicable.sort_by(|a, b| a.1.cmp(&b.1));
-    let mut ordered: Vec<MethodDef> = applicable.into_iter().map(|(method, _)| method).collect();
+    let mut ordered: Vec<MethodDef> = applicable
+        .into_iter()
+        .map(|(index, _)| methods[index].clone())
+        .collect();
+    bliss_rt::rooted_ref!(_ordered_root = &mut ordered);
     if qualifier == bliss_stdlib::MethodQualifier::After {
         ordered.reverse();
     }
-    for method in ordered {
-        invoke_method(env, &method, args, None)?;
+    for index in 0..ordered.len() {
+        invoke_method(env, &ordered[index], args, None)?;
     }
     Ok(())
 }
@@ -2672,29 +2765,36 @@ fn invoke_generic_function(
     args: &[BlissVal],
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
-    let methods = env.methods.borrow().get(name).cloned().unwrap_or_default();
+    if let Some(receiver) = args.first() {
+        let receiver_class = bliss_stdlib::class_of(*receiver);
+        bytecode::record_generic_receiver_profile(name, receiver_class.0);
+    }
+    let mut methods = env.methods.borrow().get(name).cloned().unwrap_or_default();
     if methods.is_empty() {
         return Err(no_applicable_method_error(env, name));
     }
+    bliss_rt::rooted_ref!(_methods_root = &mut methods);
 
-    let mut applicable: Vec<(MethodDef, Vec<usize>)> = methods
-        .into_iter()
-        .filter_map(|method| method_specificity_vector(env, &method, args).map(|key| (method, key)))
-        .collect();
+    let mut applicable: Vec<(usize, Vec<usize>)> = Vec::new();
+    for index in 0..methods.len() {
+        let mut method = methods[index].clone();
+        bliss_rt::rooted_ref!(_method_root = &mut method);
+        if let Some(key) = method_specificity_vector(env, &method, args) {
+            applicable.push((index, key));
+        }
+    }
     applicable.sort_by(|a, b| a.1.cmp(&b.1));
     if applicable.is_empty() {
         return Err(no_applicable_method_error(env, name));
     }
 
-    let ordered: Vec<MethodDef> = applicable.into_iter().map(|(method, _)| method).collect();
-    let mut method_map = HashMap::new();
-    let method_ids: Vec<BlissVal> = ordered
-        .iter()
-        .map(|method| {
-            method_map.insert(method.method_id, method.clone());
-            method.method_id
-        })
+    let mut ordered: Vec<MethodDef> = applicable
+        .into_iter()
+        .map(|(index, _)| methods[index].clone())
         .collect();
+    bliss_rt::rooted_ref!(_ordered_root = &mut ordered);
+    let mut method_ids: Vec<BlissVal> = ordered.iter().map(|method| method.method_id).collect();
+    bliss_rt::rooted_ref!(_method_ids_root = &mut method_ids);
 
     let combination = env
         .generics
@@ -2714,20 +2814,48 @@ fn invoke_generic_function(
             };
             let around: Vec<MethodDef> = around_ids
                 .into_iter()
-                .filter_map(|id| method_map.get(&id).cloned())
+                .filter_map(|id| {
+                    ordered
+                        .iter()
+                        .find(|method| method.method_id == id)
+                        .cloned()
+                })
                 .collect();
             let before: Vec<MethodDef> = before_ids
                 .into_iter()
-                .filter_map(|id| method_map.get(&id).cloned())
+                .filter_map(|id| {
+                    ordered
+                        .iter()
+                        .find(|method| method.method_id == id)
+                        .cloned()
+                })
                 .collect();
             let primary: Vec<MethodDef> = primary_ids
                 .into_iter()
-                .filter_map(|id| method_map.get(&id).cloned())
+                .filter_map(|id| {
+                    ordered
+                        .iter()
+                        .find(|method| method.method_id == id)
+                        .cloned()
+                })
                 .collect();
             let after: Vec<MethodDef> = after_ids
                 .into_iter()
-                .filter_map(|id| method_map.get(&id).cloned())
+                .filter_map(|id| {
+                    ordered
+                        .iter()
+                        .find(|method| method.method_id == id)
+                        .cloned()
+                })
                 .collect();
+            let mut around = around;
+            let mut before = before;
+            let mut primary = primary;
+            let mut after = after;
+            bliss_rt::rooted_ref!(_around_root = &mut around);
+            bliss_rt::rooted_ref!(_before_root = &mut before);
+            bliss_rt::rooted_ref!(_primary_root = &mut primary);
+            bliss_rt::rooted_ref!(_after_root = &mut after);
             invoke_standard_methods(env, &around, &before, &primary, &after, args)
         }
         other => {
@@ -2741,9 +2869,12 @@ fn invoke_generic_function(
             debug_assert_eq!(other, short_combination);
             let mut results = Vec::new();
             for method_id in method_ids {
-                let method = method_map.get(&method_id).ok_or_else(|| {
-                    BlissError::Internal("short-form method lookup failed".into())
-                })?;
+                let method = ordered
+                    .iter()
+                    .find(|method| method.method_id == method_id)
+                    .ok_or_else(|| {
+                        BlissError::Internal("short-form method lookup failed".into())
+                    })?;
                 results.push(invoke_method(env, method, args, None)?);
             }
             combine_short_form_results(short_combination, &results)
@@ -2808,9 +2939,7 @@ fn visit_macro_def_roots(
         // values (not nursery), so a minor GC never relocates them, and the live
         // ones are already reachable through the running activation's roots.
         if let Ok(mut f) = function.try_borrow_mut() {
-            for constant in &mut f.constants {
-                visit(constant);
-            }
+            visit_bytecode_function_roots(&mut f, visit);
         }
     }
     visit_env_frame_roots(&def.captured_frame, state, visit);
@@ -2861,6 +2990,12 @@ fn visit_method_def_roots(def: &mut MethodDef, visit: &mut dyn FnMut(*mut BlissV
     visit(&mut def.body);
 }
 
+impl bliss_rt::gc::TraceHostRoots for MethodDef {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        visit_method_def_roots(self, visit);
+    }
+}
+
 fn visit_next_method_roots(next: &mut NextMethod, visit: &mut dyn FnMut(*mut BlissVal)) {
     let mut visit_methods = |methods: &mut Vec<MethodDef>| {
         for method in methods {
@@ -2880,6 +3015,21 @@ fn visit_next_method_roots(next: &mut NextMethod, visit: &mut dyn FnMut(*mut Bli
             visit_methods(after);
         }
         NextMethod::Primary { primary } => visit_methods(primary),
+    }
+}
+
+impl bliss_rt::gc::TraceHostRoots for NextMethod {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        visit_next_method_roots(self, visit);
+    }
+}
+
+impl bliss_rt::gc::TraceHostRoots for MethodContext {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        for arg in &mut self.args {
+            visit(arg);
+        }
+        visit_next_method_roots(&mut self.next, visit);
     }
 }
 
@@ -2913,6 +3063,12 @@ fn visit_bytecode_function_roots(
 ) {
     for constant in &mut function.constants {
         visit(constant);
+    }
+    visit(&mut function.params_form);
+    for handler_bind in &mut function.handler_binds {
+        for (_, form) in &mut handler_bind.bindings {
+            visit(form);
+        }
     }
     for restart_case in &mut function.restart_cases {
         for restart in &mut restart_case.restarts {
@@ -3102,9 +3258,7 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
         let mut function = function
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for constant in &mut function.constants {
-            visit(constant);
-        }
+        visit_bytecode_function_roots(&mut function, visit);
     }
 }
 
@@ -4765,6 +4919,7 @@ fn read_forms_for_compile(source: &str, env: &mut Env) -> Result<Vec<BlissVal>, 
         register_declared_packages(&chars);
         let mut pos = 0;
         let mut forms = Vec::new();
+        bliss_rt::rooted_ref!(_forms_root = &mut forms);
         loop {
             while pos < chars.len() && chars[pos].is_ascii_whitespace() {
                 pos += 1;
@@ -4779,6 +4934,8 @@ fn read_forms_for_compile(source: &str, env: &mut Env) -> Result<Vec<BlissVal>, 
             if val == EOF {
                 break;
             }
+            let mut val = val;
+            bliss_rt::rooted_ref!(_val_root = &mut val);
             seed_compile_time_definitions(val, env);
             if let Err(e) = process_compile_toplevel_form(val, env) {
                 if std::env::var_os("BLISS_BFASL_TRACE").is_some() {
@@ -5484,6 +5641,8 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
         "SERIOUS-CONDITION" => Some((vec!["CONDITION".into()], vec![])),
         "ERROR" => Some((vec!["SERIOUS-CONDITION".into()], vec![])),
         "WARNING" => Some((vec!["CONDITION".into()], vec![])),
+        "INTERRUPT-CONDITION" => Some((vec!["CONDITION".into()], vec![])),
+        "TIMEOUT-CONDITION" => Some((vec!["ERROR".into()], vec![])),
         "STYLE-WARNING" => Some((vec!["WARNING".into()], vec![])),
         "STORAGE-CONDITION" => Some((vec!["SERIOUS-CONDITION".into()], vec![])),
         "SIMPLE-CONDITION" => Some((
@@ -6250,7 +6409,9 @@ fn load_pathname_value(path: &str) -> Option<BlissVal> {
     let abs = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string());
-    bliss_stdlib::parse_namestring(arena_str(&abs), None, None)
+    let mut namestring = arena_str(&abs);
+    bliss_rt::rooted_ref!(_namestring_root = &mut namestring);
+    bliss_stdlib::parse_namestring(namestring, None, None)
         .ok()
         .map(|(pathname, _)| pathname)
 }
@@ -6285,7 +6446,8 @@ fn build_bfasl_from_source(
     src_path: &str,
     env: &mut Env,
 ) -> Result<Vec<u8>, BlissError> {
-    let forms = read_forms_for_compile(source, env)?;
+    let mut forms = read_forms_for_compile(source, env)?;
+    bliss_rt::rooted_ref!(_forms_root = &mut forms);
     let bytecode_unit = bytecode::build_bbu_from_forms(&forms, src_path, source, env)?;
     Ok(bliss_rt::bfasl::BfaslBuilder::new()
         .content_hash(bliss_rt::bfasl::content_hash(source.as_bytes()))
@@ -6393,42 +6555,6 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         // Check variable environment
         if let Some(val) = env.lookup_var(&name) {
             return Ok(val);
-        }
-        if std::env::var_os("BLISS_TRACE_UNDEF_FN").is_some() && form.is_symbol() {
-            let idx = form.as_symbol_index();
-            let obj = bliss_rt::symbols::symbol_object_ptr(idx);
-            // Is `name` currently mapped in the registry to a DIFFERENT index
-            // whose value IS bound? If so, `idx` is an orphan duplicate created by
-            // a lookup that missed the existing entry — registry corruption.
-            let canonical = bliss_rt::symbols::find_index(&name);
-            let canonical_bound = canonical
-                .map(|ci| bliss_rt::symbols::symbol_value(ci) != Some(bliss_rt::value::UNBOUND));
-            eprintln!(
-                "[unbound-var] symbol {:?} idx={} object_ptr={:?} value_cell_addr={:?} \
-                 find_index={:?} canonical_bound={:?}",
-                name,
-                idx,
-                obj.map(|p| p as *const u8),
-                obj.map(|p| (p + 16) as *const u8),
-                canonical,
-                canonical_bound,
-            );
-            // Look for other interned symbols sharing this exact name: a bound
-            // twin would prove duplicate-interning / registry corruption.
-            let twins: Vec<(u32, bool)> = bliss_rt::symbols::interned_names()
-                .into_iter()
-                .filter(|(_, n)| *n == name)
-                .map(|(i, _)| {
-                    (
-                        i,
-                        bliss_rt::symbols::symbol_value(i) != Some(bliss_rt::value::UNBOUND),
-                    )
-                })
-                .collect();
-            eprintln!("[unbound-var]   twins(idx,bound) with same name = {twins:?}");
-            if std::env::var_os("BLISS_TRACE_UNDEF_BT").is_some() {
-                eprintln!("{}", std::backtrace::Backtrace::force_capture());
-            }
         }
         return Err(BlissError::UnboundVariable(form));
     }
@@ -6931,11 +7057,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "UNWIND-PROTECT" => {
                 // (unwind-protect protected cleanup...) — cleanup runs whether the
                 // protected form returns normally or exits non-locally.
-                let (protected, cleanup) = cp(cdr);
+                let (mut protected, mut cleanup) = cp(cdr);
+                bliss_rt::rooted_ref!(_protected_root = &mut protected);
+                bliss_rt::rooted_ref!(_cleanup_root = &mut cleanup);
                 let result = eval_form(protected, env);
                 match result {
-                    Ok(v) => {
-                        let saved_mv = env.mv.clone();
+                    Ok(mut v) => {
+                        bliss_rt::rooted_ref!(_value_root = &mut v);
+                        let mut saved_mv = env.mv.clone();
+                        bliss_rt::rooted_ref!(_saved_mv_root = &mut saved_mv);
                         let saved_mv_active = env.mv_active;
                         eval_progn(cleanup, env)?;
                         env.mv = saved_mv;
@@ -7040,6 +7170,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     eval_form(args[0], env)?
                 };
                 let out = resolve_output_stream(stream, env);
+                check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     invoke_generic_function("STREAM-TERPRI", &[out], env)?;
                     return Ok(NIL);
@@ -7055,6 +7186,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     eval_form(args[0], env)?
                 };
                 let out = resolve_output_stream(stream, env);
+                check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     let r = invoke_generic_function("STREAM-FRESH-LINE", &[out], env)?;
                     return Ok(if r.is_nil() { NIL } else { T });
@@ -7073,6 +7205,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     eval_form(args[0], env)?
                 };
                 let out = resolve_output_stream(stream, env);
+                check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     let gf = match name.as_str() {
                         "FINISH-OUTPUT" => "STREAM-FINISH-OUTPUT",
@@ -7105,6 +7238,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let ch = args[0];
                 let stream = if args.len() > 1 { args[1] } else { NIL };
                 let out = resolve_output_stream(stream, env);
+                check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     invoke_generic_function("STREAM-WRITE-CHAR", &[out, ch], env)?;
                 } else {
@@ -7251,6 +7385,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let byte = args[0];
                 let out = resolve_output_stream(args[1], env);
+                check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     invoke_generic_function("STREAM-WRITE-BYTE", &[out, byte], env)?;
                 } else {
@@ -9118,7 +9253,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let n = lists.iter().map(|l| l.len()).min().unwrap_or(0);
                 bliss_rt::rooted!(results = Vec::<BlissVal>::with_capacity(n));
                 for i in 0..n {
-                    let args: Vec<BlissVal> = lists.iter().map(|l| l[i]).collect();
+                    let mut args: Vec<BlissVal> = lists.iter().map(|l| l[i]).collect();
+                    bliss_rt::rooted_ref!(_args_root = &mut args);
                     results.push(apply_function(*fn_val, &args, env)?);
                 }
                 return Ok(vec_to_list(&results));
@@ -9399,17 +9535,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     format!("{home}/")
                 };
-                let (pathname, _) = bliss_stdlib::parse_namestring(arena_str(&dir), None, None)?;
+                let mut namestring = arena_str(&dir);
+                bliss_rt::rooted_ref!(_namestring_root = &mut namestring);
+                let (pathname, _) = bliss_stdlib::parse_namestring(namestring, None, None)?;
                 return Ok(pathname);
             }
             "PARSE-NAMESTRING" => {
                 let (thing_form, rest) = cp(cdr);
-                let thing = eval_form(thing_form, env)?;
-                let host = if rest.is_cons() {
+                let mut thing = eval_form(thing_form, env)?;
+                bliss_rt::rooted_ref!(_thing_root = &mut thing);
+                let mut host = if rest.is_cons() {
                     Some(eval_form(cp(rest).0, env)?)
                 } else {
                     None
                 };
+                bliss_rt::rooted_ref!(_host_root = &mut host);
                 let (pathname, position) = bliss_stdlib::parse_namestring(thing, host, None)?;
                 env.set_mv(vec![pathname, BlissVal::from_fixnum(position as i64)]);
                 return Ok(pathname);
@@ -9538,7 +9678,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // :resolve-symlinks) are accepted and ignored. Needed by ASDF's
                 // source-registry directory walk (bliss-lb6.14).
                 let (path_form, _) = cp(cdr);
-                let pathspec = eval_form(path_form, env)?;
+                let mut pathspec = eval_form(path_form, env)?;
+                bliss_rt::rooted_ref!(_pathspec_root = &mut pathspec);
                 let pathname = if bliss_stdlib::is_pathname(pathspec) {
                     pathspec
                 } else {
@@ -9559,7 +9700,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // backed pseudo-heap values, so calling is_string on one (as the
                 // string branch would) dereferences a bogus pointer and crashes.
                 let (thing_form, _) = cp(cdr);
-                let thing = eval_form(thing_form, env)?;
+                let mut thing = eval_form(thing_form, env)?;
+                bliss_rt::rooted_ref!(_thing_root = &mut thing);
                 if bliss_stdlib::is_pathname(thing) {
                     return Ok(thing);
                 }
@@ -9579,6 +9721,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if bliss_stdlib::is_pathname(v) {
                         Ok(v)
                     } else {
+                        let mut v = v;
+                        bliss_rt::rooted_ref!(_v_root = &mut v);
                         Ok(bliss_stdlib::parse_namestring(v, None, None)?.0)
                     }
                 };
@@ -10298,9 +10442,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(instance);
             }
             "CALL-NEXT-METHOD" => {
-                let context = env.method_context.last().cloned().ok_or_else(|| {
+                let mut context = env.method_context.last().cloned().ok_or_else(|| {
                     BlissError::UndefinedFunction(resolve_sym("CALL-NEXT-METHOD").unwrap_or(NIL))
                 })?;
+                bliss_rt::rooted_ref!(_context_root = &mut context);
                 let args = if cdr.is_nil() {
                     RootedVals::new(context.args.clone())
                 } else {
@@ -10635,6 +10780,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .map(|f| BlissVal::from_fixnum(bliss_rt::function::back_edge_count(f) as i64))
                     .unwrap_or(NIL));
             }
+            "BLISS-EXT:GENERIC-RECEIVER-PROFILE-COUNT" => {
+                let (name_form, _) = cp(cdr);
+                let name = sym_name(eval_form(name_form, env)?);
+                let (total, _) = bytecode::generic_receiver_profile_counts(&name);
+                return Ok(BlissVal::from_fixnum(total as i64));
+            }
+            "BLISS-EXT:GENERIC-RECEIVER-PROFILE-DISTINCT-COUNT" => {
+                let (name_form, _) = cp(cdr);
+                let name = sym_name(eval_form(name_form, env)?);
+                let (_, distinct) = bytecode::generic_receiver_profile_counts(&name);
+                return Ok(BlissVal::from_fixnum(distinct as i64));
+            }
             // Process-wide count of T1 speculative deoptimizations (bliss-jtc.27):
             // observability for the S5 gate's second half — a failed speculation
             // deoptimizes to the interpreter and still returns the correct value.
@@ -10799,6 +10956,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let vals = eval_forms(args.iter().copied(), env)?;
                 let seq = vals[0];
                 let out = resolve_output_stream(vals[1], env);
+                check_pending_sigpipe_for_output()?;
                 let seq_len = bliss_stdlib::length(seq)?;
                 let (start, end) = read_start_end_keys(&vals[2..], seq_len);
                 let elems: Vec<BlissVal> = (start..end)
@@ -10839,6 +10997,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 };
                 let out = resolve_output_stream(stream, env);
+                check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     // Dispatch to the Gray stream-write-string generic (start 0,
                     // end nil → whole string).
@@ -10868,6 +11027,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     NIL
                 };
                 let out = resolve_output_stream(stream, env);
+                check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     invoke_generic_function(
                         "STREAM-WRITE-STRING",
@@ -11797,17 +11957,6 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
         return Ok(NIL);
     }
 
-    if std::env::var_os("BLISS_TRACE_UNDEF_FN").is_some() && car.is_symbol() {
-        let idx = car.as_symbol_index();
-        let obj = bliss_rt::symbols::symbol_object_ptr(idx);
-        eprintln!(
-            "[undef-fn] symbol {:?} idx={} object_ptr={:?} function_cell_addr={:?}",
-            sym_name(car),
-            idx,
-            obj.map(|p| p as *const u8),
-            obj.map(|p| (p + 24) as *const u8),
-        );
-    }
     Err(BlissError::UndefinedFunction(car))
 }
 
@@ -12731,6 +12880,9 @@ fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         bliss_rt::rooted!(c = cdr);
         let mut guard: u64 = 0;
         loop {
+            if let Some(error) = pending_signal_error_for_current_execution() {
+                return Err(error);
+            }
             *c = *body;
             while c.is_cons() {
                 let f = cp(*c).0;
@@ -14800,11 +14952,16 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     bliss_rt::rooted_ref!(_body_root = &mut body);
     let mut child_env = env.child();
     let mut c = defs_form;
+    bliss_rt::rooted_ref!(_defs_cursor_root = &mut c);
     while c.is_cons() {
         let (def, rest) = cp(c);
+        c = rest;
         if def.is_cons() {
-            let (name_form, def_rest) = cp(def);
-            let (params_form, fbody) = cp(def_rest);
+            let (mut name_form, def_rest) = cp(def);
+            let (mut params_form, mut fbody) = cp(def_rest);
+            bliss_rt::rooted_ref!(_name_root = &mut name_form);
+            bliss_rt::rooted_ref!(_params_root = &mut params_form);
+            bliss_rt::rooted_ref!(_fbody_root = &mut fbody);
             let name = sym_name(name_form);
             let params = extract_params(params_form);
             // A local function's body is wrapped in an implicit block named after
@@ -14823,10 +14980,11 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             } else {
                 None
             };
-            let fbody = match (block_name, resolve_sym("BLOCK")) {
+            fbody = match (block_name, resolve_sym("BLOCK")) {
                 (Some(bn), Some(block_sym)) => {
-                    let block_form = arena_cons(block_sym, arena_cons(bn, fbody));
-                    arena_cons(block_form, NIL)
+                    bliss_rt::rooted!(block_tail = arena_cons(bn, fbody));
+                    bliss_rt::rooted!(block_form = arena_cons(block_sym, *block_tail));
+                    arena_cons(*block_form, NIL)
                 }
                 _ => fbody,
             };
@@ -14839,7 +14997,6 @@ fn eval_flet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 },
             );
         }
-        c = rest;
     }
     // Register the forked child Env as a GC root for the extent of the body:
     // its `funs` map holds the local functions' body cons trees, which are
@@ -16417,14 +16574,21 @@ fn eval_macroexpand(
 }
 
 fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (defs_form, body) = cp(cdr);
+    let (defs_form, mut body) = cp(cdr);
+    bliss_rt::rooted_ref!(_body_root = &mut body);
     let mut child_env = env.child();
-    for def in list_to_vec(defs_form) {
+    let mut defs = list_to_vec(defs_form);
+    bliss_rt::rooted_ref!(_defs_root = &mut defs);
+    for i in 0..defs.len() {
+        let def = defs[i];
         if !def.is_cons() {
             continue;
         }
-        let (name_form, rest) = cp(def);
-        let (params_form, macro_body) = cp(rest);
+        let (mut name_form, rest) = cp(def);
+        let (mut params_form, mut macro_body) = cp(rest);
+        bliss_rt::rooted_ref!(_name_root = &mut name_form);
+        bliss_rt::rooted_ref!(_params_root = &mut params_form);
+        bliss_rt::rooted_ref!(_macro_body_root = &mut macro_body);
         let name = sym_name(name_form);
         child_env.macros_mut().insert(
             name,
@@ -16452,17 +16616,23 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 }
 
 fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (bindings_form, body) = cp(cdr);
+    let (bindings_form, mut body) = cp(cdr);
+    bliss_rt::rooted_ref!(_body_root = &mut body);
     let mut child_env = env.child();
-    for binding in list_to_vec(bindings_form) {
+    let mut bindings = list_to_vec(bindings_form);
+    bliss_rt::rooted_ref!(_bindings_root = &mut bindings);
+    for i in 0..bindings.len() {
+        let binding = bindings[i];
         if !binding.is_cons() {
             continue;
         }
-        let (symbol, expansion_rest) = cp(binding);
+        let (mut symbol, expansion_rest) = cp(binding);
         if !symbol.is_symbol() {
             continue;
         }
-        let (expansion, _) = cp(expansion_rest);
+        let (mut expansion, _) = cp(expansion_rest);
+        bliss_rt::rooted_ref!(_symbol_root = &mut symbol);
+        bliss_rt::rooted_ref!(_expansion_root = &mut expansion);
         child_env.define_symbol_macro(symbol, expansion);
     }
     // Root the forked child Env for the body's extent so variables bound inside
@@ -16733,17 +16903,22 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 /// action. This mirrors boot.lisp's macro without invoking the reader or macro
 /// compiler from a BFASL load.
 fn define_condition_portable(
-    name: BlissVal,
-    parents: BlissVal,
-    slots: BlissVal,
-    options: BlissVal,
+    mut name: BlissVal,
+    mut parents: BlissVal,
+    mut slots: BlissVal,
+    mut options: BlissVal,
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
-    let effective_parents = if parents.is_nil() {
+    bliss_rt::rooted_ref!(_name_root = &mut name);
+    bliss_rt::rooted_ref!(_parents_root = &mut parents);
+    bliss_rt::rooted_ref!(_slots_root = &mut slots);
+    bliss_rt::rooted_ref!(_options_root = &mut options);
+    let mut effective_parents = if parents.is_nil() {
         vec_to_list(&[resolve_sym("CONDITION").unwrap_or(NIL)])
     } else {
         parents
     };
+    bliss_rt::rooted_ref!(_effective_parents_root = &mut effective_parents);
     for (variable, entry) in [
         ("*CONDITION-TYPES*", vec_to_list(&[name, effective_parents])),
         (
@@ -16759,17 +16934,26 @@ fn define_condition_portable(
         env.set_var_symbol(symbol, arena_cons(entry, old));
     }
 
-    eval_defclass(vec_to_list(&[name, effective_parents, slots]), env)?;
-
     // DEFINE-CONDITION also defines requested slot readers/accessors. Reuse the
     // boot helper that computes those DEFUN forms from the structural slots.
-    if let Some(helper) = resolve_sym("%DEFINE-CONDITION-READER-DEFS") {
+    // Match boot.lisp's macro order: compute reader-defs before DEFCLASS allocates
+    // and installs class metadata, then evaluate the definitions afterward.
+    let mut reader_definitions = NIL;
+    bliss_rt::rooted_ref!(_reader_definitions_root = &mut reader_definitions);
+    if let Some(mut helper) = resolve_sym("%DEFINE-CONDITION-READER-DEFS") {
+        bliss_rt::rooted_ref!(_helper_root = &mut helper);
         if fn_bound(env, &sym_name(helper)) {
-            let definitions = apply_function(helper, &[slots], env)?;
-            for definition in list_to_vec(definitions) {
-                eval_form(definition, env)?;
-            }
+            bliss_rt::rooted!(reader_args = vec![slots]);
+            reader_definitions = apply_function(helper, &reader_args, env)?;
         }
+    }
+
+    eval_defclass(vec_to_list(&[name, effective_parents, slots]), env)?;
+
+    let mut definitions = list_to_vec(reader_definitions);
+    bliss_rt::rooted_ref!(_definitions_root = &mut definitions);
+    for index in 0..definitions.len() {
+        eval_form(definitions[index], env)?;
     }
     Ok(name)
 }
@@ -17339,10 +17523,13 @@ fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, Bl
 }
 
 fn apply_function(
-    fn_val: BlissVal,
+    mut fn_val: BlissVal,
     args: &[BlissVal],
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted_ref!(_fn_val_root = &mut fn_val);
+    bliss_rt::rooted!(args = args.to_vec());
+    let args: &[BlissVal] = &args;
     // Function could be a lambda form, a symbol naming a function, or a closure
     if fn_val.is_symbol() {
         let name = sym_name(fn_val);
@@ -17436,7 +17623,8 @@ fn apply_function(
                 items.push(arena_cons(quote_sym, *quoted_arg));
             }
         }
-        let form = vec_to_list(&items);
+        let mut form = vec_to_list(&items);
+        bliss_rt::rooted_ref!(_form_root = &mut form);
         return eval_form(form, env);
     }
     if fn_val.is_cons() {
@@ -17463,7 +17651,9 @@ fn apply_function(
     // A heap interpreted-function object, e.g. from FDEFINITION / SYMBOL-FUNCTION
     // or a #' on a global defun. Call it by its own lambda list and body.
     if fn_val.is_heap_object() && bliss_rt::function::is_interpreted_function(fn_val) {
-        bliss_rt::function::record_invocation(fn_val);
+        if !bytecode::profiling_disabled() {
+            bliss_rt::function::record_invocation(fn_val);
+        }
         // Function-object calls participate in the same tiering dispatch as
         // operator-position symbol calls. ASDF commonly retains a function
         // object and invokes it through FUNCALL/MAP; merely bumping FnMeta here
@@ -17902,6 +18092,7 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     // One HANDLER-CASE form is one cluster, its clauses held in source order.
     // SIGNAL tries a cluster's entries front-to-back, so the first matching
     // clause wins (ANSI CL) — no reverse needed.
+    bliss_rt::rooted_ref!(_installed_handlers_root = &mut installed);
     env.handlers.push(HandlerCluster {
         entries: installed.clone(),
     });
@@ -17941,24 +18132,28 @@ fn eval_handler_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
             // matches handle it, so HANDLER-CASE catches system errors — not only
             // those raised through SIGNAL/ERROR. Errors that are not conditions
             // (control-flow tokens, Shutdown) yield None and propagate unchanged.
-            if let Ok(Some(condition)) = bliss_error_to_condition(env, &error) {
-                for handler in installed {
-                    if let HandlerImpl::HandlerCase {
-                        var_name,
-                        body,
-                        captured_frame,
-                        ..
-                    } = handler.handler
-                    {
-                        if condition_matches_handler(env, condition, &handler.type_name) {
-                            let mut handler_env = env.child_with_parent(captured_frame);
-                            if let Some(name) = var_name {
-                                handler_env.define_local(&name, condition);
+            match bliss_error_to_condition(env, &error)? {
+                Some(mut condition) => {
+                    bliss_rt::rooted_ref!(_condition_root = &mut condition);
+                    for handler in installed {
+                        if let HandlerImpl::HandlerCase {
+                            var_name,
+                            body,
+                            captured_frame,
+                            ..
+                        } = handler.handler
+                        {
+                            if condition_matches_handler(env, condition, &handler.type_name) {
+                                let mut handler_env = env.child_with_parent(captured_frame);
+                                if let Some(name) = var_name {
+                                    handler_env.define_local(&name, condition);
+                                }
+                                return eval_progn(body, &mut handler_env);
                             }
-                            return eval_progn(body, &mut handler_env);
                         }
                     }
                 }
+                None => {}
             }
             Err(error)
         }
@@ -18736,6 +18931,9 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         return Ok(0);
     }
 
+    bliss_rt::install_signal_handlers()?;
+    bliss_rt::set_current_execution_foreground();
+
     let mut env = Env::new(ca.sandbox);
 
     // Set *command-line-args* (issue #4)
@@ -18795,6 +18993,8 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         }
     }
 
+    let _sandbox_cpu_deadline = SandboxCpuDeadlineGuard::start(ca.sandbox_cpu_ms)?;
+
     if let Some(ref path) = ca.load_report {
         return run_load_report(path, &mut env);
     }
@@ -18830,6 +19030,29 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         }
     }
     run_repl_env(&mut env)
+}
+
+struct SandboxCpuDeadlineGuard {
+    active: bool,
+}
+
+impl SandboxCpuDeadlineGuard {
+    fn start(limit_ms: Option<u64>) -> Result<Self, BlissError> {
+        if let Some(limit_ms) = limit_ms {
+            bliss_rt::start_current_sandbox_cpu_deadline(limit_ms)?;
+            Ok(Self { active: true })
+        } else {
+            Ok(Self { active: false })
+        }
+    }
+}
+
+impl Drop for SandboxCpuDeadlineGuard {
+    fn drop(&mut self) {
+        if self.active {
+            bliss_rt::clear_current_sandbox_cpu_deadline();
+        }
+    }
 }
 
 /// Collapse a form's source to a single-line, length-capped preview keyed by its
@@ -19908,6 +20131,28 @@ mod jtc5mf_storage_condition_pool_tests {
             bliss_stdlib::clos::class_of(pooled),
             expected_class,
             "pooled STORAGE-CONDITION must remain CLI-recognized after GC"
+        );
+    }
+
+    #[test]
+    fn stack_overflow_error_maps_to_preallocated_storage_condition_pool() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        let pool: Vec<BlissVal> = (0..bliss_stdlib::conditions::storage_condition_pool_size())
+            .map(|_| bliss_stdlib::acquire_preallocated_storage_condition().expect("pool claim"))
+            .collect();
+        for condition in &pool {
+            bliss_stdlib::release_preallocated_storage_condition(*condition);
+        }
+
+        let mapped =
+            bliss_error_to_condition(&mut env, &BlissError::StackOverflow(bliss_rt::FiberId(99)))
+                .expect("stack overflow maps")
+                .expect("stack overflow is a condition");
+
+        assert!(
+            pool.contains(&mapped),
+            "stack overflow must signal one of the preallocated STORAGE-CONDITION instances"
         );
     }
 }

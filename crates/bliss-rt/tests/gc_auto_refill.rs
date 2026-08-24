@@ -2,8 +2,8 @@
 
 use bliss_rt::value::{BlissVal, TAG_HEAP_OBJECT, TAG_MASK};
 use bliss_rt::{
-    alloc_typed, current_thread, heap_stats, init_heap, Allocator, BlissStack, GcConfig,
-    HeapAllocator, ShadowRootScope,
+    Allocator, BlissStack, GcConfig, HeapAllocator, ShadowRootScope, alloc_typed, current_thread,
+    heap_stats, init_heap,
 };
 use std::sync::{Mutex, OnceLock};
 

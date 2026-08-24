@@ -22,10 +22,13 @@ companion is authoritative for §5.3.
 | `COMMON-LISP` | `CL` | — | All 978 ANSI-specified external symbols |
 | `COMMON-LISP-USER` | `CL-USER` | `(CL)` | Default interactive package |
 | `KEYWORD` | — | — | Self-evaluating keyword symbols |
-| `BLISS` | `BL` | `(CL)` | Bliss-specific public extensions (§9) |
-| `BLISS-INTERNALS` | `BL-INT` | `(CL BL)` | Runtime internals, GC hooks, compiler intrinsics |
-| `BLISS-THREADS` | `BL-THR` | `(CL BL)` | Threading API (BORDEAUX-THREADS-compatible, §2) |
-| `BLISS-FFI` | `BL-FFI` | `(CL BL)` | Foreign function interface (§2) |
+| `BLISS-EXT` | — | `(CL)` | Canonical Bliss-specific public extensions (§9) |
+| `BLISS` | `BL` | `(CL BLISS-EXT)` | Deprecated compatibility nickname/package for older extension spelling |
+| `BLISS-INTERNALS` | `BL-INT` | `(CL BLISS-EXT)` | Runtime internals, GC hooks, compiler intrinsics |
+| `BLISS-THREAD` | — | `(CL BLISS-EXT)` | OS-backed native threads and synchronization API (§13) |
+| `BLISS-THREADS` | `BL-THR` | `(CL BLISS-THREAD)` | Deprecated compatibility spelling for `BLISS-THREAD` |
+| `BLISS-FIBER` | — | `(CL BLISS-EXT)` | Lightweight managed fibers and scheduler groups (§13) |
+| `BLISS-FFI` | `BL-FFI` | `(CL BLISS-EXT)` | Foreign function interface (§2, §8) |
 
 **R5.01** The `COMMON-LISP` package MUST export exactly the 978 external
 symbols specified by ANSI X3.226-1994. No Bliss-specific symbols may leak
@@ -34,8 +37,14 @@ into `CL`.
 **R5.02** The `KEYWORD` package MUST intern symbols as self-evaluating
 constants with their name as the value. `(symbol-package :foo)` → `KEYWORD`.
 
-**R5.03** `BLISS-INTERNALS` symbols MUST NOT be exported into `BLISS` or
-`CL` without explicit review — they constitute an unstable API.
+**R5.03** `BLISS-INTERNALS` symbols MUST NOT be exported into `BLISS-EXT`,
+`BLISS`, or `CL` without explicit review — they constitute an unstable API.
+
+**R5.03a** New Bliss extension APIs MUST use `BLISS-EXT` for general runtime
+extensions, `BLISS-THREAD` for native thread/synchronization objects,
+`BLISS-FIBER` for lightweight fibers, and `BLISS-FFI` for foreign-function
+interfaces. `BLISS` and `BLISS-THREADS` are compatibility spellings only and
+MUST NOT be used as the primary package in new specification text.
 
 **R5.04** Package objects MUST be protected by per-package reader-writer
 locks (see §2). Read operations (`find-symbol`, `do-symbols`) acquire a
@@ -462,10 +471,10 @@ concurrently on disjoint data without synchronisation.
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `BLISS:*DEFAULT-EXTERNAL-FORMAT*` | `:UTF-8` | Used by `OPEN`, stream creation |
-| `BLISS:*HASH-TABLE-DEFAULT-SIZE*` | `16` | Initial capacity |
-| `BLISS:*HASH-TABLE-SYNCHRONIZED-DEFAULT*` | `NIL` | Extension: default :synchronized |
-| `BLISS:*SORT-PARALLEL-THRESHOLD*` | `10000` | Vectors larger than this MAY use parallel sort |
+| `BLISS-EXT:*DEFAULT-EXTERNAL-FORMAT*` | `:UTF-8` | Used by `OPEN`, stream creation; `BLISS:*DEFAULT-EXTERNAL-FORMAT*` is a deprecated compatibility spelling |
+| `BLISS-EXT:*HASH-TABLE-DEFAULT-SIZE*` | `16` | Initial capacity; `BLISS:*HASH-TABLE-DEFAULT-SIZE*` is a deprecated compatibility spelling |
+| `BLISS-EXT:*HASH-TABLE-SYNCHRONIZED-DEFAULT*` | `NIL` | Extension: default :synchronized; `BLISS:*HASH-TABLE-SYNCHRONIZED-DEFAULT*` is a deprecated compatibility spelling |
+| `BLISS-EXT:*SORT-PARALLEL-THRESHOLD*` | `10000` | Vectors larger than this MAY use parallel sort; `BLISS:*SORT-PARALLEL-THRESHOLD*` is a deprecated compatibility spelling |
 
 ---
 

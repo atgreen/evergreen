@@ -130,7 +130,13 @@ impl Pass for ConstFold {
                 // without holding an immutable borrow across those calls.
                 let (op, args, results, effectful, call) = {
                     let d = f.inst(inst);
-                    (d.opcode, d.args.clone(), d.results.clone(), d.flags.effectful, d.flags.call)
+                    (
+                        d.opcode,
+                        d.args.clone(),
+                        d.results.clone(),
+                        d.flags.effectful,
+                        d.flags.call,
+                    )
                 };
 
                 // Only pure arithmetic/logic/compare opcodes are eligible. An
@@ -142,8 +148,16 @@ impl Pass for ConstFold {
                 }
 
                 let n = args.len();
-                let a0 = if n >= 1 { cval(&consts, &replacement, args[0]) } else { None };
-                let a1 = if n >= 2 { cval(&consts, &replacement, args[1]) } else { None };
+                let a0 = if n >= 1 {
+                    cval(&consts, &replacement, args[0])
+                } else {
+                    None
+                };
+                let a1 = if n >= 2 {
+                    cval(&consts, &replacement, args[1])
+                } else {
+                    None
+                };
 
                 // ── Full constant fold: all operands constant. ──
                 if n == 2 {
@@ -151,9 +165,15 @@ impl Pass for ConstFold {
                         // Arithmetic/logic → a fixnum (range-checked); a
                         // comparison → T/NIL.
                         let folded: Option<Fold> = match op {
-                            FixnumAdd => (x as i128 + y as i128).pipe(in_fixnum_range).map(Fold::Fix),
-                            FixnumSub => (x as i128 - y as i128).pipe(in_fixnum_range).map(Fold::Fix),
-                            FixnumMul => (x as i128 * y as i128).pipe(in_fixnum_range).map(Fold::Fix),
+                            FixnumAdd => {
+                                (x as i128 + y as i128).pipe(in_fixnum_range).map(Fold::Fix)
+                            }
+                            FixnumSub => {
+                                (x as i128 - y as i128).pipe(in_fixnum_range).map(Fold::Fix)
+                            }
+                            FixnumMul => {
+                                (x as i128 * y as i128).pipe(in_fixnum_range).map(Fold::Fix)
+                            }
                             FixnumDiv if y != 0 => {
                                 in_fixnum_range(x as i128 / y as i128).map(Fold::Fix)
                             }
@@ -403,7 +423,11 @@ fn make_const_fixnum(f: &mut Function, inst: Inst, k: i64, consts: &mut HashMap<
 fn make_const_bool(f: &mut Function, inst: Inst, truthy: bool) {
     let result = f.inst(inst).results.first().copied();
     let d = f.inst_mut(inst);
-    d.opcode = if truthy { Opcode::ConstT } else { Opcode::ConstNil };
+    d.opcode = if truthy {
+        Opcode::ConstT
+    } else {
+        Opcode::ConstNil
+    };
     d.args.clear();
     d.aux = AuxData::None;
     d.flags = InstFlags::default();
@@ -436,12 +460,22 @@ fn insert_const_fixnum_before(
             frame_state: None,
             source_pos: 0,
         },
-        &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::UnboxedFixnum)],
+        &[(
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        )],
     );
     let insts = &mut f.block_mut(block).insts;
     let popped = insts.pop();
-    debug_assert_eq!(popped, Some(cinst), "push_inst appends the new const at the end");
-    let pos = insts.iter().position(|&i| i == before).unwrap_or(insts.len());
+    debug_assert_eq!(
+        popped,
+        Some(cinst),
+        "push_inst appends the new const at the end"
+    );
+    let pos = insts
+        .iter()
+        .position(|&i| i == before)
+        .unwrap_or(insts.len());
     insts.insert(pos, cinst);
     consts.insert(cres[0], n);
     cres[0]
@@ -454,7 +488,10 @@ mod tests {
     use crate::t2::ir::{Block, BlockCall};
 
     fn ufix() -> (IRType, ValueRepresentation) {
-        (IRType::of(TypeBits::FIXNUM), ValueRepresentation::UnboxedFixnum)
+        (
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        )
     }
     fn tagged() -> (IRType, ValueRepresentation) {
         (IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)
@@ -575,7 +612,11 @@ mod tests {
         let (add_inst, _) = binop(&mut f2, e2, Opcode::FixnumAdd, vec![m, one]);
         ret(&mut f2, e2);
         run(&mut f2);
-        assert_eq!(f2.inst(add_inst).opcode, Opcode::FixnumAdd, "MAX+1 must not wrap");
+        assert_eq!(
+            f2.inst(add_inst).opcode,
+            Opcode::FixnumAdd,
+            "MAX+1 must not wrap"
+        );
     }
 
     // FixnumMul(x, 8) strength-reduces to FixnumShl(x, 3).
@@ -583,7 +624,11 @@ mod tests {
     fn mul_by_power_of_two_becomes_shift() {
         let mut f = Function::new("shift");
         let e = f.entry();
-        let x = f.add_block_param(e, IRType::of(TypeBits::FIXNUM), ValueRepresentation::UnboxedFixnum);
+        let x = f.add_block_param(
+            e,
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        );
         let c8 = const_fixnum(&mut f, e, 8);
         let (mul_inst, _) = binop(&mut f, e, Opcode::FixnumMul, vec![x, c8]);
         ret(&mut f, e);
@@ -600,7 +645,10 @@ mod tests {
         assert!(matches!(shdef.aux, AuxData::FixnumImm(3)));
         // The shift-amount const precedes the shift in program order.
         let order = &f.block(e).insts;
-        let shamt_pos = order.iter().position(|&i| f.inst(i).results.contains(&shamt)).unwrap();
+        let shamt_pos = order
+            .iter()
+            .position(|&i| f.inst(i).results.contains(&shamt))
+            .unwrap();
         let shl_pos = order.iter().position(|&i| i == mul_inst).unwrap();
         assert!(shamt_pos < shl_pos, "shift amount must dominate the shift");
     }
@@ -610,7 +658,11 @@ mod tests {
     fn algebraic_identities() {
         let mut f = Function::new("ident");
         let e = f.entry();
-        let x = f.add_block_param(e, IRType::of(TypeBits::FIXNUM), ValueRepresentation::UnboxedFixnum);
+        let x = f.add_block_param(
+            e,
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        );
         let c0 = const_fixnum(&mut f, e, 0);
         let c1 = const_fixnum(&mut f, e, 1);
         // x+0 → x, x*1 → x, x*0 → 0
@@ -681,7 +733,11 @@ mod tests {
     fn frame_state_value_updated() {
         let mut f = Function::new("deopt");
         let e = f.entry();
-        let x = f.add_block_param(e, IRType::of(TypeBits::FIXNUM), ValueRepresentation::UnboxedFixnum);
+        let x = f.add_block_param(
+            e,
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        );
         let c0 = const_fixnum(&mut f, e, 0);
         let (_, addz) = binop(&mut f, e, Opcode::FixnumAdd, vec![x, c0]);
 
@@ -715,11 +771,19 @@ mod tests {
     fn block_call_args_updated() {
         let mut f = Function::new("blockcall");
         let e = f.entry();
-        let x = f.add_block_param(e, IRType::of(TypeBits::FIXNUM), ValueRepresentation::UnboxedFixnum);
+        let x = f.add_block_param(
+            e,
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        );
         let c0 = const_fixnum(&mut f, e, 0);
         let (_, addz) = binop(&mut f, e, Opcode::FixnumAdd, vec![x, c0]);
         let target = f.make_block();
-        let _tp = f.add_block_param(target, IRType::of(TypeBits::FIXNUM), ValueRepresentation::UnboxedFixnum);
+        let _tp = f.add_block_param(
+            target,
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        );
         f.set_terminator(
             e,
             InstData {
@@ -728,7 +792,10 @@ mod tests {
                 results: vec![],
                 aux: AuxData::None,
                 flags: InstFlags::default(),
-                targets: vec![BlockCall { block: target, args: vec![addz] }],
+                targets: vec![BlockCall {
+                    block: target,
+                    args: vec![addz],
+                }],
                 frame_state: None,
                 source_pos: 0,
             },
@@ -738,6 +805,10 @@ mod tests {
         run(&mut f);
 
         let t = f.terminator(e).unwrap();
-        assert_eq!(f.inst(t).targets[0].args, vec![x], "edge arg must reroute to x");
+        assert_eq!(
+            f.inst(t).targets[0].args,
+            vec![x],
+            "edge arg must reroute to x"
+        );
     }
 }

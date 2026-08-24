@@ -12,8 +12,8 @@
 //! and death without relying on unreachable nursery garbage being promoted.
 
 use bliss_rt::gc::{
-    alloc_typed, init_heap, register_finalizer, register_root_scanner, register_weak_pointer,
-    set_finalizer_dispatch, walk_heap, Collector, GcConfig, HeapCollector, WeakPointer,
+    Collector, GcConfig, HeapCollector, WeakPointer, alloc_typed, init_heap, register_finalizer,
+    register_root_scanner, register_weak_pointer, set_finalizer_dispatch, walk_heap,
 };
 use bliss_rt::value::{BlissVal, NIL};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -119,7 +119,10 @@ fn finalizer_survives_evacuation_and_fires_once_on_death() {
         new_addr,
         "finalizer must fire keyed on the forwarded address, not the stale one"
     );
-    assert!(find_probe().is_none(), "object must be collected after death");
+    assert!(
+        find_probe().is_none(),
+        "object must be collected after death"
+    );
 
     // Collection #3: no re-fire (the entry was removed on firing).
     collector.major_gc().expect("major_gc #3");

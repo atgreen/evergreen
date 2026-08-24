@@ -39,7 +39,7 @@ use bliss_compiler::reader;
 use bliss_rt::error::BlissError;
 use bliss_rt::stack::StackMapEntry;
 use bliss_rt::value::{BlissVal, NIL, T};
-use bliss_rt::{CodeInfo, Frame};
+use bliss_rt::{CodeInfo, Frame, FrameType};
 
 use super::{
     DynBind, Env, EnvFrame, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry,
@@ -3374,9 +3374,6 @@ impl<'e> Lowerer<'e> {
     /// a clause are boxed in this activation's heap environment and the restart
     /// captures that live frame when it is established.
     fn lower_restart_case(&mut self, rest: BlissVal) -> LowerResult<()> {
-        if !self.portable {
-            return Err(Bail);
-        }
         // Root `restartable_form` across the whole clause loop (compile_restart_clause
         // allocates) and its use below, and root the clause conses that the loop
         // indexes across those allocations (moving GC; bliss-wlf).
@@ -3408,6 +3405,18 @@ impl<'e> Lowerer<'e> {
                 .into_iter()
                 .filter(|u| enclosing_locals.contains(u) && !params.contains(u))
                 .collect::<std::collections::HashSet<_>>();
+            // Every captured local must already be boxed. `captured_names` is a
+            // syntactic pre-scan of the UNEXPANDED body, so a restart-case
+            // reached through a macro expansion (e.g. CHECK-TYPE's STORE-VALUE
+            // clause) can capture a local the scan never saw; that local lives
+            // in a plain frame slot the clause function cannot reach. Bail so
+            // the enclosing form tree-walks (mirrors emit_closure).
+            for capture in &captures {
+                match self.lookup_local(capture) {
+                    Some(VarLoc::Boxed) | None => {}
+                    Some(VarLoc::Slot(_)) => return Err(Bail),
+                }
+            }
             let function =
                 compile_restart_clause(params_form, body, self.env, &captures, self.portable)
                     .ok_or(Bail)?;
@@ -5391,6 +5400,10 @@ fn compile_function_in(
     // raw body would fail to box a captured variable (alexandria's
     // `gaussian-random`).
     if body_uses_macrolet(*body) {
+        if macro_lambda_list {
+            let _ = record_bail(|| "macroexpand:macrolet-macro".to_string());
+            return None;
+        }
         // Root the rebuilt progn across the allocating macro-env build (bliss-wlf).
         let mut progn = arena_cons(resolve_sym("PROGN")?, *body);
         bliss_rt::rooted_ref!(_progn_root = &mut progn);
@@ -5458,7 +5471,15 @@ fn compile_function_in(
         max_stack: lo.max_stack.max(1),
         arity: min_args,
         name: name.to_string(),
-        params_form: if variadic { *params_form } else { NIL },
+        // Ordinary fixed-arity functions can install a synthetic lambda list
+        // from arity, but source-free macros always re-run the macro binder at
+        // expansion time. Keep their original lambda list even when fixed-arity
+        // so `(defmacro m (x) ...)` does not reload with a NIL/invalid pattern.
+        params_form: if variadic || macro_lambda_list {
+            *params_form
+        } else {
+            NIL
+        },
         min_args,
         max_args,
         variadic,
@@ -5770,7 +5791,8 @@ impl BbuConstPool {
         Some(self.intern_encoded(bytes))
     }
 
-    fn value(&mut self, v: BlissVal) -> Option<u32> {
+    fn value(&mut self, mut v: BlissVal) -> Option<u32> {
+        bliss_rt::rooted_ref!(_v_root = &mut v);
         if v.is_nil() {
             return Some(self.intern_encoded(vec![0]));
         }
@@ -5817,7 +5839,9 @@ impl BbuConstPool {
             return Some(self.intern_encoded(bytes));
         }
         if v.is_cons() {
-            let (car, cdr) = cp(v);
+            let (mut car, mut cdr) = cp(v);
+            bliss_rt::rooted_ref!(_car_root = &mut car);
+            bliss_rt::rooted_ref!(_cdr_root = &mut cdr);
             let car_ref = self.value(car)?;
             let cdr_ref = self.value(cdr)?;
             let mut bytes = Vec::new();
@@ -5829,7 +5853,9 @@ impl BbuConstPool {
         // A ratio (e.g. `1/2`): pool its numerator and denominator (fixnums or
         // bignums, themselves poolable) and reconstruct the RATIO heap object on
         // load. Bignum parts that are not poolable make the whole ratio bail.
-        if let Some((num, den)) = super::ratio_parts_val(v) {
+        if let Some((mut num, mut den)) = super::ratio_parts_val(v) {
+            bliss_rt::rooted_ref!(_num_root = &mut num);
+            bliss_rt::rooted_ref!(_den_root = &mut den);
             let num_ref = self.value(num)?;
             let den_ref = self.value(den)?;
             let mut bytes = Vec::new();
@@ -5861,7 +5887,8 @@ impl BbuConstPool {
                 let count = unsafe { *(v.as_ptr().add(8) as *const u64) } as usize;
                 let mut refs = Vec::with_capacity(count);
                 for i in 0..count {
-                    let elem = unsafe { *(v.as_ptr().add(16 + i * 8) as *const BlissVal) };
+                    let mut elem = unsafe { *(v.as_ptr().add(16 + i * 8) as *const BlissVal) };
+                    bliss_rt::rooted_ref!(_elem_root = &mut elem);
                     refs.push(self.value(elem)?);
                 }
                 return Some(self.vector(&refs));
@@ -6203,7 +6230,9 @@ fn serialize_bbu_function(
         }
     }
 
-    let lambda_list_ref = if bf.variadic {
+    let needs_lambda_list_metadata =
+        bf.variadic || flags & (BBU_FUNC_MACRO | BBU_FUNC_COMPILER_MACRO) != 0;
+    let lambda_list_ref = if needs_lambda_list_metadata {
         pool.value(bf.params_form)?
     } else {
         BBU_NO_INDEX
@@ -6436,20 +6465,32 @@ fn portable_load_thunk_form(form: BlissVal) -> Option<BlissVal> {
             }
         }
         "DEFINE-CONDITION" => {
-            let (name, after_name) = cp(rest);
-            let (parents, after_parents) = cp(after_name);
-            let (slots, options) = cp(after_parents);
+            let (mut name, mut after_name) = cp(rest);
+            bliss_rt::rooted_ref!(_name_root = &mut name);
+            bliss_rt::rooted_ref!(_after_name_root = &mut after_name);
+            let (mut parents, mut after_parents) = cp(after_name);
+            bliss_rt::rooted_ref!(_parents_root = &mut parents);
+            bliss_rt::rooted_ref!(_after_parents_root = &mut after_parents);
+            let (mut slots, mut options) = cp(after_parents);
+            bliss_rt::rooted_ref!(_slots_root = &mut slots);
+            bliss_rt::rooted_ref!(_options_root = &mut options);
             if !name.is_symbol() {
                 return Some(form);
             }
-            let quote = resolve_sym("QUOTE")?;
-            let quoted = |value| form_list(&[quote, value]);
+            let mut quote = resolve_sym("QUOTE")?;
+            let mut portable = resolve_sym("BLISS-INTERNAL::%DEFINE-CONDITION-PORTABLE")?;
+            bliss_rt::rooted_ref!(_quote_root = &mut quote);
+            bliss_rt::rooted_ref!(_portable_root = &mut portable);
+            bliss_rt::rooted!(quoted_name = form_list(&[quote, name]));
+            bliss_rt::rooted!(quoted_parents = form_list(&[quote, parents]));
+            bliss_rt::rooted!(quoted_slots = form_list(&[quote, slots]));
+            bliss_rt::rooted!(quoted_options = form_list(&[quote, options]));
             Some(form_list(&[
-                resolve_sym("BLISS-INTERNAL::%DEFINE-CONDITION-PORTABLE")?,
-                quoted(name),
-                quoted(parents),
-                quoted(slots),
-                quoted(options),
+                portable,
+                *quoted_name,
+                *quoted_parents,
+                *quoted_slots,
+                *quoted_options,
             ]))
         }
         _ => Some(form),
@@ -6572,12 +6613,16 @@ pub fn build_bbu_from_forms(
     source: &str,
     env: &Env,
 ) -> Result<Vec<u8>, BlissError> {
+    let mut forms = forms.to_vec();
+    bliss_rt::rooted_ref!(_forms_root = &mut forms);
     let mut pool = BbuConstPool::default();
     let source_file_ref = pool.string(src_path);
     let mut functions = Vec::new();
     let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
 
-    for (form_index, &form) in forms.iter().enumerate() {
+    for form_index in 0..forms.len() {
+        let mut form = forms[form_index];
+        bliss_rt::rooted_ref!(_form_root = &mut form);
         let mut done = false;
         reset_last_bail_reason();
 
@@ -7738,6 +7783,7 @@ fn parse_bbu_handler_cases(
 
 fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<BlissVal>, BlissError> {
     let mut values = Vec::with_capacity(constants.len());
+    bliss_rt::rooted_ref!(_values_root = &mut values);
     for (index, constant) in constants.iter().enumerate() {
         let value = match constant {
             BbuConstant::Nil => NIL,
@@ -7834,33 +7880,38 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<BlissVal>,
             BbuConstant::Ratio(num_ref, den_ref) => {
                 // Numerator/denominator were emitted (and materialised) before the
                 // ratio, so they are already present in `values`.
-                let num = *values.get(*num_ref as usize).ok_or_else(|| {
+                let mut num = *values.get(*num_ref as usize).ok_or_else(|| {
                     bbu_error(format!("forward/cyclic ratio reference at {index}"))
                 })?;
-                let den = *values.get(*den_ref as usize).ok_or_else(|| {
+                let mut den = *values.get(*den_ref as usize).ok_or_else(|| {
                     bbu_error(format!("forward/cyclic ratio reference at {index}"))
                 })?;
+                bliss_rt::rooted_ref!(_num_root = &mut num);
+                bliss_rt::rooted_ref!(_den_root = &mut den);
                 super::alloc_ratio_cli(num, den)
             }
             BbuConstant::Pathname { name_ref } => {
                 // Rebuild the pathname from its namestring via parse-namestring so
                 // it re-registers in this process's pathname store (bliss-jtc.23 /
                 // load-source fallback for pathname literals).
-                let ns = arena_str(bbu_string(constants, *name_ref)?);
+                let mut ns = arena_str(bbu_string(constants, *name_ref)?);
+                bliss_rt::rooted_ref!(_ns_root = &mut ns);
                 bliss_stdlib::pathnames::parse_namestring(ns, None, None)?.0
             }
             BbuConstant::Cons(car_ref, cdr_ref) => {
                 // The writer emits structural children before their parent.
-                let car = *values.get(*car_ref as usize).ok_or_else(|| {
+                let mut car = *values.get(*car_ref as usize).ok_or_else(|| {
                     bbu_error(format!("forward/cyclic cons reference at {index}"))
                 })?;
-                let cdr = *values.get(*cdr_ref as usize).ok_or_else(|| {
+                let mut cdr = *values.get(*cdr_ref as usize).ok_or_else(|| {
                     bbu_error(format!("forward/cyclic cons reference at {index}"))
                 })?;
+                bliss_rt::rooted_ref!(_car_root = &mut car);
+                bliss_rt::rooted_ref!(_cdr_root = &mut cdr);
                 arena_cons(car, cdr)
             }
             BbuConstant::Vector(refs) => {
-                let elements = refs
+                let mut elements = refs
                     .iter()
                     .map(|reference| {
                         values.get(*reference as usize).copied().ok_or_else(|| {
@@ -7868,6 +7919,7 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<BlissVal>,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                bliss_rt::rooted_ref!(_elements_root = &mut elements);
                 bliss_stdlib::build_simple_vector(&elements)
             }
         };
@@ -8315,13 +8367,14 @@ fn execute_bbu_ensure_package(
     // the name is new, prefer the already-materialized structural Symbol so
     // function/global references and package lookup remain EQ.
     for export_name in &exports {
-        let symbol = bliss_stdlib::find_present_symbol(package, export_name)
+        let mut symbol = bliss_stdlib::find_present_symbol(package, export_name)
             .or(bliss_stdlib::find_symbol(export_name, package)?.map(|entry| entry.0))
             .or(
                 bbu_direct_symbol_for_package(encoded, values, package, export_name)?
                     .map(|entry| entry.0),
             )
             .unwrap_or(bliss_stdlib::intern(export_name, package)?.0);
+        bliss_rt::rooted_ref!(_symbol_root = &mut symbol);
         bliss_stdlib::add_symbol(package, export_name, symbol, true)?;
         bliss_rt::symbols::set_symbol_package(symbol.as_symbol_index(), package);
     }
@@ -8346,8 +8399,10 @@ fn execute_bbu_ensure_package(
         }
         let bare_name = bbu_string(encoded, *name_ref)?;
         if bliss_stdlib::find_symbol(bare_name, package)?.is_none() {
-            bliss_stdlib::add_symbol(package, bare_name, values[index], *kind == 3)?;
-            bliss_rt::symbols::set_symbol_package(values[index].as_symbol_index(), package);
+            let mut symbol = values[index];
+            bliss_rt::rooted_ref!(_symbol_root = &mut symbol);
+            bliss_stdlib::add_symbol(package, bare_name, symbol, *kind == 3)?;
+            bliss_rt::symbols::set_symbol_package(symbol.as_symbol_index(), package);
         }
     }
     Ok(package)
@@ -8356,6 +8411,7 @@ fn execute_bbu_ensure_package(
 /// Verify, decode, and execute an authoritative portable BBU. No source reader
 /// or macroexpander participates in this path.
 pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted_ref!(_env_roots = env);
     let mut cursor = BbuCursor::new(bytes);
     if cursor.take(4)? != BBU_MAGIC {
         return Err(bbu_error("bad magic"));
@@ -8542,6 +8598,11 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
             if metadata.variadic && function.lambda_list_ref == BBU_NO_INDEX {
                 return Err(bbu_error("variadic function has no lambda-list metadata"));
             }
+            if function.flags & (BBU_FUNC_MACRO | BBU_FUNC_COMPILER_MACRO) != 0
+                && function.lambda_list_ref == BBU_NO_INDEX
+            {
+                return Err(bbu_error("macro function has no lambda-list metadata"));
+            }
             for &(name_ref, location, _) in &metadata.params {
                 bbu_string(&encoded_constants, name_ref)?;
                 match location {
@@ -8666,7 +8727,8 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
         }
     }
 
-    let constants = materialize_bbu_constants(&encoded_constants)?;
+    let mut constants = materialize_bbu_constants(&encoded_constants)?;
+    bliss_rt::rooted_ref!(_constants_root = &mut constants);
     let mut decoded_functions: Vec<BytecodeFunction> = Vec::with_capacity(encoded_functions.len());
     for (index, encoded) in encoded_functions.iter().enumerate() {
         let mut function = decode_bbu_function(encoded, &constants, &handler_case_tables[index])?;
@@ -8746,8 +8808,17 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
         .into_iter()
         .map(Rc::new)
         .collect::<Vec<_>>();
+    // Load actions execute in order, and earlier actions can allocate before a
+    // later thunk/function has been registered or made active. Keep every
+    // decoded function's constants rooted for the whole load plan so structural
+    // literals embedded in future thunks are rewritten by a moving GC.
+    let _function_roots = functions
+        .iter()
+        .map(ActiveBytecodeRoot::new)
+        .collect::<Vec<_>>();
 
     let mut last = NIL;
+    bliss_rt::rooted_ref!(_last_root = &mut last);
     for action in actions {
         match action.kind {
             1 => {
@@ -8767,12 +8838,14 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 let function_index = action.arg0 as usize;
                 let sym = bbu_symbol(&constants, action.arg1)?;
                 let function = Rc::clone(&functions[function_index]);
-                let symbol = BlissVal::from_symbol_index(sym);
-                let lambda_list = if function.variadic {
+                let mut symbol = BlissVal::from_symbol_index(sym);
+                bliss_rt::rooted_ref!(_symbol_root = &mut symbol);
+                let mut lambda_list = if function.variadic {
                     function.params_form
                 } else {
                     installed_lambda_list(function.arity)
                 };
+                bliss_rt::rooted_ref!(_lambda_list_root = &mut lambda_list);
                 let fn_obj = match bliss_rt::symbols::symbol_function(sym) {
                     Some(existing) if bliss_rt::function::is_interpreted_function(existing) => {
                         // SAFETY: checked immediately above.
@@ -8793,7 +8866,8 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 last = symbol;
             }
             4 => {
-                let symbol = constants[bbu_index(action.arg1, constants.len(), "macro name")?];
+                let mut symbol = constants[bbu_index(action.arg1, constants.len(), "macro name")?];
+                bliss_rt::rooted_ref!(_symbol_root = &mut symbol);
                 super::install_loaded_macro(
                     symbol,
                     Rc::clone(&functions[action.arg0 as usize]),
@@ -8802,8 +8876,9 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 last = symbol;
             }
             5 => {
-                let symbol =
+                let mut symbol =
                     constants[bbu_index(action.arg1, constants.len(), "compiler macro name")?];
+                bliss_rt::rooted_ref!(_symbol_root = &mut symbol);
                 super::install_loaded_compiler_macro(
                     symbol,
                     Rc::clone(&functions[action.arg0 as usize]),
@@ -8811,8 +8886,9 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
                 last = symbol;
             }
             8 => {
-                let symbol =
+                let mut symbol =
                     constants[bbu_index(action.arg1, constants.len(), "setf expander name")?];
+                bliss_rt::rooted_ref!(_symbol_root = &mut symbol);
                 super::install_loaded_setf_expander(
                     symbol,
                     Rc::clone(&functions[action.arg0 as usize]),
@@ -8826,7 +8902,8 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<BlissVal, BlissError> {
             9 => {
                 // EvalSource: reconstruct the source form from the constant pool
                 // and evaluate it with the tree-walker (load-source fallback).
-                let form = constants[action.arg0 as usize];
+                let mut form = constants[action.arg0 as usize];
+                bliss_rt::rooted_ref!(_form_root = &mut form);
                 last = eval_form(form, env)?;
             }
             _ => unreachable!("load actions were verified above"),
@@ -8867,16 +8944,21 @@ enum Handler {
         clauses: Vec<RuntimeClause>,
         sp_restore: u16,
         cluster_base: usize,
+        cluster_frame: *mut Frame,
     },
     /// `HANDLER-BIND`: handlers already registered in `env.handlers`. On a raw
     /// structured error unwinding through here, the handlers get their turn.
-    HandlerBind { cluster_base: usize },
+    HandlerBind {
+        cluster_base: usize,
+        cluster_frame: *mut Frame,
+    },
     /// `RESTART-CASE`: restarts registered in `env.restarts`. A restart-invoked
     /// transfer unwinding through here delivers the stored result.
     RestartCase {
         restart_base: usize,
         resume_bcp: u32,
         sp_restore: u16,
+        cluster_frame: *mut Frame,
     },
 }
 
@@ -8913,6 +8995,28 @@ enum Pending {
     Propagate(BlissError),
 }
 
+fn visit_pending_roots(pending: &mut Pending, visit: &mut dyn FnMut(*mut BlissVal)) {
+    match pending {
+        Pending::Return { value, .. } => visit(value),
+        Pending::Token(_) | Pending::Go { .. } | Pending::Propagate(_) => {}
+    }
+}
+
+impl bliss_rt::gc::TraceHostRoots for Pending {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        visit_pending_roots(self, visit);
+    }
+}
+
+impl bliss_rt::gc::TraceHostRoots for CleanupCont {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        match self {
+            CleanupCont::Normal { value, .. } => visit(value),
+            CleanupCont::Resume(pending) => visit_pending_roots(pending, visit),
+        }
+    }
+}
+
 /// One live bytecode activation. `frame` owns the value slots on the
 /// `BlissStack`; `bcp`/`sp_top` are the interpreter cursor (D2.03 keeps these
 /// per-`bcp` for OSR/deopt — slice 1 keeps them Rust-side; nmq.3 moves them
@@ -8944,6 +9048,24 @@ struct Activation {
     /// keying (bliss-izt.1). `u32::MAX` for anonymous/toplevel wrappers, which
     /// are never OSR-compiled.
     sym: u32,
+}
+
+impl bliss_rt::gc::TraceHostRoots for Activation {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        if let Some(fn_obj) = &mut self.fn_obj {
+            visit(fn_obj);
+        }
+        for cleanup in &mut self.cleanup_conts {
+            cleanup.trace_host_roots(visit);
+        }
+        for binding in &mut self.dyn_binds {
+            binding.trace_host_roots(visit);
+        }
+        if let Some(env_frame) = &self.env_frame {
+            let mut state = super::EnvRootVisitState::default();
+            super::visit_env_frame_roots(env_frame, &mut state, visit);
+        }
+    }
 }
 
 /// Build the base heap `EnvFrame` for a function with captured locals. Parameter
@@ -8987,6 +9109,27 @@ unsafe fn slot_set(frame: *mut Frame, i: u16, v: BlissVal) {
     }
 }
 
+fn push_condition_cluster_frame(
+    stack: &bliss_rt::BlissStack,
+    values: &[BlissVal],
+) -> Result<*mut Frame, BlissError> {
+    let num_slots = u16::try_from(values.len()).map_err(|_| {
+        BlissError::ProgramError("condition cluster has too many entries for one frame".into())
+    })?;
+    let frame = stack
+        .push_frame(NIL, std::ptr::null(), num_slots, FrameType::Special as u32)
+        .ok_or_else(|| BlissError::Internal("BlissStack exhausted for condition cluster".into()))?;
+    unsafe {
+        bliss_rt::BlissStack::frame_slots_mut(frame).copy_from_slice(values);
+    }
+    Ok(frame)
+}
+
+fn pop_condition_cluster_frame(stack: &bliss_rt::BlissStack, frame: *mut Frame) {
+    debug_assert_eq!(stack.fp(), frame as *const Frame);
+    stack.pop_frame();
+}
+
 /// Count a loop back-edge against the executing function object's profiling
 /// counter (bliss-jtc.10.1). A branch is a back-edge when its `target` is at or
 /// before the branch instruction itself — i.e. `target < act.bcp`, since `bcp`
@@ -8996,6 +9139,9 @@ unsafe fn slot_set(frame: *mut Frame, i: u16, v: BlissVal) {
 /// hot loops simply go uncounted here rather than costing an atomic per edge.
 #[inline]
 fn record_back_edge_if_backward(act: &Activation, target: u32) {
+    if profiling_disabled() {
+        return;
+    }
     if let Some(f) = act.fn_obj {
         if (target as usize) < act.bcp {
             bliss_rt::function::record_back_edge(f);
@@ -9124,7 +9270,9 @@ fn bind_macro_variadic(
     super::with_child_frame(env, parent, |env| {
         // A bytecode (source-free) macro never has `&whole` — the lowerer bails
         // it to the tree-walker — so no whole-form override is needed here.
-        super::bind_macro_lambda_list(func.params_form, args, env, None, None)?;
+        if let Err(error) = super::bind_macro_lambda_list(func.params_form, args, env, None, None) {
+            return Err(error);
+        }
         env.clear_mv();
         let current = Rc::clone(&env.frame);
         // See bind_variadic: re-derive lookup keys from the live params_form so
@@ -9178,7 +9326,8 @@ fn run_with_binding(
     macro_lambda_list: bool,
 ) -> Result<BlissVal, BlissError> {
     let _active_bytecode_root = ActiveBytecodeRoot::new(&entry);
-    validate_declared_args(&entry, args)?;
+    bliss_rt::rooted!(args = args.to_vec());
+    validate_declared_args(&entry, &args)?;
     record_profiled_invocation(Rc::as_ptr(&entry) as usize);
     // A callee's return values are determined by its own body — discard any
     // multiple-values state left by the caller's argument evaluation, so a
@@ -9214,17 +9363,17 @@ fn run_with_binding(
     let parent = closure_env.clone().unwrap_or_else(|| Rc::clone(&env.frame));
     let env_frame = make_env_frame(&entry, parent).or(closure_env);
     if macro_lambda_list {
-        if let Err(e) = bind_macro_variadic(&entry, frame, args, env_frame.as_ref(), env) {
+        if let Err(e) = bind_macro_variadic(&entry, frame, &args, env_frame.as_ref(), env) {
             stack.pop_frame();
             return Err(e);
         }
     } else if entry.variadic {
-        if let Err(e) = bind_variadic(&entry, frame, args, env_frame.as_ref(), env) {
+        if let Err(e) = bind_variadic(&entry, frame, &args, env_frame.as_ref(), env) {
             stack.pop_frame();
             return Err(e);
         }
     } else {
-        bind_params(&entry, frame, args, env_frame.as_ref());
+        bind_params(&entry, frame, &args, env_frame.as_ref());
     }
     let entry_obj = Some(entry_fn_val).filter(|&v| bliss_rt::function::is_interpreted_function(v));
     let mut acts: Vec<Activation> = vec![Activation {
@@ -9246,6 +9395,7 @@ fn run_with_binding(
             u32::MAX
         },
     }];
+    bliss_rt::rooted_ref!(_acts_root = &mut acts);
 
     // Ensure the whole control stack is popped on any early return (error).
     let result = run_loop(&mut acts, env);
@@ -9257,11 +9407,80 @@ fn run_with_binding(
     result
 }
 
+fn claim_process_signal_flags_for_current_execution() {
+    fn post(signal: bliss_rt::PendingSignal) {
+        if bliss_rt::post_foreground_pending_signal(signal).is_err() {
+            bliss_rt::post_current_pending_signal(signal);
+        }
+    }
+
+    if bliss_rt::check_sigterm() {
+        post(bliss_rt::PendingSignal::Shutdown);
+    }
+    if bliss_rt::check_sigfpe() {
+        post(bliss_rt::PendingSignal::Arithmetic);
+    }
+    if bliss_rt::check_sigpipe() {
+        post(bliss_rt::PendingSignal::Pipe);
+    }
+    if bliss_rt::check_sigsegv_null_guard() {
+        post(bliss_rt::PendingSignal::NullGuard);
+    }
+    if bliss_rt::check_sigsegv_stack_guard() {
+        post(bliss_rt::PendingSignal::StackGuard);
+    }
+    if bliss_rt::check_sigint() {
+        post(bliss_rt::PendingSignal::Interrupt);
+    }
+    let _ = bliss_rt::poll_current_sandbox_cpu_deadline();
+}
+
+fn pending_signal_error_for_current_execution() -> Option<BlissError> {
+    claim_process_signal_flags_for_current_execution();
+    match bliss_rt::take_current_pending_signal()? {
+        bliss_rt::PendingSignal::Shutdown => Some(BlissError::Shutdown),
+        bliss_rt::PendingSignal::Arithmetic => Some(BlissError::ArithmeticError(
+            "floating point exception".into(),
+        )),
+        bliss_rt::PendingSignal::NullGuard => Some(BlissError::TypeError {
+            datum: NIL,
+            expected: "non-null object reference".into(),
+        }),
+        bliss_rt::PendingSignal::StackGuard => Some(BlissError::StackOverflow(
+            bliss_rt::current_fiber_id()
+                .unwrap_or_else(|| bliss_rt::FiberId(bliss_rt::current_thread_id().0)),
+        )),
+        bliss_rt::PendingSignal::Pipe => Some(BlissError::StreamError("broken pipe".into())),
+        bliss_rt::PendingSignal::Interrupt => Some(BlissError::Interrupt),
+        bliss_rt::PendingSignal::Timeout => Some(BlissError::Timeout),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+unsafe extern "C" fn native_sigsegv_recovery_epilogue() {
+    core::arch::naked_asm!("mov rax, 7", "add rsp, 8", "pop r15", "pop r14", "ret",)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn native_sigsegv_recovery_ip() -> usize {
+    native_sigsegv_recovery_epilogue as *const () as usize
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn native_sigsegv_recovery_ip() -> usize {
+    0
+}
+
 fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, BlissError> {
     let thread = bliss_rt::current_thread();
     let stack = thread.stack();
 
     loop {
+        if let Some(error) = pending_signal_error_for_current_execution() {
+            initiate_unwind(acts, stack, env, Pending::Propagate(error))?;
+            continue;
+        }
         let (instr, top_idx) = {
             let act = acts.last_mut().unwrap();
             let instr = act.func.code[act.bcp].clone();
@@ -9541,7 +9760,9 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 // invocations from the bytecode path, not just the tree-walker.
                 let fn_obj = bliss_rt::symbols::symbol_function(sym)
                     .filter(|&cell| bliss_rt::function::is_interpreted_function(cell));
-                if let Some(cell) = fn_obj {
+                if !profiling_disabled()
+                    && let Some(cell) = fn_obj
+                {
                     bliss_rt::function::record_invocation(cell);
                 }
 
@@ -9652,7 +9873,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 }
             }
             Instr::Return => {
-                let v = {
+                let mut v = {
                     let act = &mut acts[top_idx];
                     // Balanced bytecode leaves no live handlers at RETURN; drop
                     // any catch_stack entries defensively.
@@ -9664,18 +9885,32 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                             Handler::Block { token, .. } => {
                                 env.block_stack.retain(|(_, t)| *t != token);
                             }
-                            Handler::HandlerCase { cluster_base, .. }
-                            | Handler::HandlerBind { cluster_base } => {
-                                env.handlers.truncate(cluster_base);
+                            Handler::HandlerCase {
+                                cluster_base,
+                                cluster_frame,
+                                ..
                             }
-                            Handler::RestartCase { restart_base, .. } => {
+                            | Handler::HandlerBind {
+                                cluster_base,
+                                cluster_frame,
+                            } => {
+                                env.handlers.truncate(cluster_base);
+                                pop_condition_cluster_frame(stack, cluster_frame);
+                            }
+                            Handler::RestartCase {
+                                restart_base,
+                                cluster_frame,
+                                ..
+                            } => {
                                 env.restarts.truncate(restart_base);
+                                pop_condition_cluster_frame(stack, cluster_frame);
                             }
                             _ => {}
                         }
                     }
                     act.pop_op()
                 };
+                bliss_rt::rooted_ref!(_return_root = &mut v);
                 stack.pop_frame();
                 acts.pop();
                 match acts.last_mut() {
@@ -9814,7 +10049,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 // interpreting the rest of the loop.
                 match maybe_osr(&acts[top_idx], target_bcp, env) {
                     Some(Ok(OsrOutcome::Finished(v))) => {
-                        release_activation_handlers(&mut acts[top_idx], env);
+                        release_activation_handlers(&mut acts[top_idx], stack, env);
                         stack.pop_frame();
                         acts.pop();
                         match acts.last_mut() {
@@ -9888,6 +10123,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 let cluster_base = env.handlers.len();
                 let mut runtime_clauses = Vec::with_capacity(info.clauses.len());
                 let mut entries = Vec::with_capacity(info.clauses.len());
+                let mut cluster_values = Vec::with_capacity(info.clauses.len().saturating_mul(2));
                 for clause in &info.clauses {
                     // A control token shared with the tree-walker: a host SIGNAL
                     // that matches this clause's type stores the condition here
@@ -9909,19 +10145,33 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                         body_bcp: clause.body_bcp,
                         var_slot: clause.var_slot,
                     });
+                    cluster_values.push(resolve_sym(&clause.type_name).ok_or_else(|| {
+                        BlissError::Internal(format!(
+                            "handler-case condition type {} is not interned",
+                            clause.type_name
+                        ))
+                    })?);
+                    cluster_values.push(NIL);
                 }
+                bliss_rt::rooted_ref!(_cluster_values_root = &mut cluster_values);
+                let cluster_frame = push_condition_cluster_frame(stack, &cluster_values)?;
                 env.handlers.push(HandlerCluster { entries });
                 acts[top_idx].handlers.push(Handler::HandlerCase {
                     clauses: runtime_clauses,
                     sp_restore,
                     cluster_base,
+                    cluster_frame,
                 });
             }
             Instr::PopHandlerCase => {
-                if let Some(Handler::HandlerCase { cluster_base, .. }) =
-                    acts[top_idx].handlers.pop()
+                if let Some(Handler::HandlerCase {
+                    cluster_base,
+                    cluster_frame,
+                    ..
+                }) = acts[top_idx].handlers.pop()
                 {
                     env.handlers.truncate(cluster_base);
+                    pop_condition_cluster_frame(stack, cluster_frame);
                 }
             }
             Instr::PushHandlerBind { hb } => {
@@ -9929,6 +10179,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 let env_frame = acts[top_idx].env_frame.clone();
                 let cluster_base = env.handlers.len();
                 let mut entries = Vec::with_capacity(info.bindings.len());
+                let mut cluster_values = Vec::with_capacity(info.bindings.len().saturating_mul(2));
                 for (type_name, handler_form) in &info.bindings {
                     // When this function has boxed (captured) locals, evaluate
                     // the handler form now into a closure that captures them, so
@@ -9945,19 +10196,37 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     } else {
                         HandlerImpl::Function(*handler_form)
                     };
+                    let handler_value = match &handler {
+                        HandlerImpl::Function(value) => *value,
+                        HandlerImpl::HandlerCase { .. } => NIL,
+                    };
                     entries.push(HandlerEntry {
                         type_name: type_name.clone(),
                         handler,
                     });
+                    cluster_values.push(resolve_sym(type_name).ok_or_else(|| {
+                        BlissError::Internal(format!(
+                            "handler-bind condition type {type_name} is not interned"
+                        ))
+                    })?);
+                    cluster_values.push(handler_value);
                 }
+                bliss_rt::rooted_ref!(_cluster_values_root = &mut cluster_values);
+                let cluster_frame = push_condition_cluster_frame(stack, &cluster_values)?;
                 env.handlers.push(HandlerCluster { entries });
-                acts[top_idx]
-                    .handlers
-                    .push(Handler::HandlerBind { cluster_base });
+                acts[top_idx].handlers.push(Handler::HandlerBind {
+                    cluster_base,
+                    cluster_frame,
+                });
             }
             Instr::PopHandlerBind => {
-                if let Some(Handler::HandlerBind { cluster_base }) = acts[top_idx].handlers.pop() {
+                if let Some(Handler::HandlerBind {
+                    cluster_base,
+                    cluster_frame,
+                }) = acts[top_idx].handlers.pop()
+                {
                     env.handlers.truncate(cluster_base);
+                    pop_condition_cluster_frame(stack, cluster_frame);
                 }
             }
             Instr::PushRestartCase {
@@ -9971,6 +10240,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     .env_frame
                     .clone()
                     .unwrap_or_else(|| Rc::clone(&env.frame));
+                let mut cluster_values = Vec::with_capacity(info.restarts.len().saturating_mul(5));
                 for restart in &info.restarts {
                     env.restarts.push(RestartEntry {
                         name: restart.name.clone(),
@@ -9982,18 +10252,35 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                         test_function: None,
                         unwind_on_invoke: true,
                     });
+                    cluster_values.push(resolve_sym(&restart.name).ok_or_else(|| {
+                        BlissError::Internal(format!(
+                            "restart-case name {} is not interned",
+                            restart.name
+                        ))
+                    })?);
+                    cluster_values.push(NIL);
+                    cluster_values.push(NIL);
+                    cluster_values.push(NIL);
+                    cluster_values.push(NIL);
                 }
+                bliss_rt::rooted_ref!(_cluster_values_root = &mut cluster_values);
+                let cluster_frame = push_condition_cluster_frame(stack, &cluster_values)?;
                 acts[top_idx].handlers.push(Handler::RestartCase {
                     restart_base,
                     resume_bcp,
                     sp_restore,
+                    cluster_frame,
                 });
             }
             Instr::PopRestartCase => {
-                if let Some(Handler::RestartCase { restart_base, .. }) =
-                    acts[top_idx].handlers.pop()
+                if let Some(Handler::RestartCase {
+                    restart_base,
+                    cluster_frame,
+                    ..
+                }) = acts[top_idx].handlers.pop()
                 {
                     env.restarts.truncate(restart_base);
+                    pop_condition_cluster_frame(stack, cluster_frame);
                 }
             }
         }
@@ -10094,9 +10381,11 @@ fn initiate_unwind(
                 clauses,
                 sp_restore,
                 cluster_base,
+                cluster_frame,
             }) => {
                 acts[top].handlers.pop();
                 env.handlers.truncate(cluster_base);
+                pop_condition_cluster_frame(stack, cluster_frame);
                 // Only an error (raw, or a host SIGNAL that selected one of this
                 // cluster's clauses) can be caught by HANDLER-CASE. Block/go/throw
                 // transfers pass straight through.
@@ -10107,13 +10396,19 @@ fn initiate_unwind(
                                 .iter()
                                 .find(|c| c.token == tok)
                                 .map(|c| (c.clone(), take_control_value(&tok)))
-                        } else if let Ok(Some(cond)) = bliss_error_to_condition(env, error) {
-                            clauses
-                                .iter()
-                                .find(|c| condition_matches_handler(env, cond, &c.type_name))
-                                .map(|c| (c.clone(), cond))
                         } else {
-                            None
+                            match bliss_error_to_condition(env, error)? {
+                                Some(mut cond) => {
+                                    bliss_rt::rooted_ref!(_condition_root = &mut cond);
+                                    clauses
+                                        .iter()
+                                        .find(|c| {
+                                            condition_matches_handler(env, cond, &c.type_name)
+                                        })
+                                        .map(|c| (c.clone(), cond))
+                                }
+                                None => None,
+                            }
                         }
                     }
                     _ => None,
@@ -10129,7 +10424,10 @@ fn initiate_unwind(
                 }
                 // No clause matched — keep unwinding.
             }
-            Some(Handler::HandlerBind { cluster_base }) => {
+            Some(Handler::HandlerBind {
+                cluster_base,
+                cluster_frame,
+            }) => {
                 acts[top].handlers.pop();
                 // Mirror eval_handler_bind: only a *raw* structured error (one
                 // bliss_error_to_condition can denote) gives these handlers their
@@ -10148,15 +10446,18 @@ fn initiate_unwind(
                     }
                 }
                 env.handlers.truncate(cluster_base);
+                pop_condition_cluster_frame(stack, cluster_frame);
                 // Keep unwinding with the (possibly transferred) pending.
             }
             Some(Handler::RestartCase {
                 restart_base,
                 resume_bcp,
                 sp_restore,
+                cluster_frame,
             }) => {
                 acts[top].handlers.pop();
                 env.restarts.truncate(restart_base);
+                pop_condition_cluster_frame(stack, cluster_frame);
                 // A restart invoked (by a handler) unwinds here carrying its
                 // stored result — mirror eval_restart_case.
                 let delivered = match &pending {
@@ -10268,6 +10569,55 @@ extern "C" fn c2i_load_global(sym: u64) -> u64 {
 /// `deopt_safe`) — a whole-function deopt-rerun must never re-run the store.
 extern "C" fn c2i_store_global(sym: u64, val: u64) {
     bliss_rt::symbols::set_symbol_value(sym as u32, BlissVal(val));
+}
+
+extern "C" fn c2i_set_native_sigsegv_recovery(enabled: u64) {
+    let recovery = if enabled != 0 {
+        native_sigsegv_recovery_ip()
+    } else {
+        0
+    };
+    bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(recovery);
+    bliss_rt::runtime::set_sigsegv_stack_guard_recovery_ip(recovery);
+}
+
+fn emit_c2i_helper_call(c: &mut Asm) {
+    let set_recovery = c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
+
+    // Disable native-frame SIGSEGV recovery while the Rust c2i helper frame is
+    // active. The helper target is already in rax and arguments may already be in
+    // rdi/rsi/rdx/rcx, so preserve that caller ABI state around the toggle.
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x30]); // sub rsp, 48
+    c.extend_from_slice(&[0x48, 0x89, 0x3C, 0x24]); // mov [rsp], rdi
+    c.extend_from_slice(&[0x48, 0x89, 0x74, 0x24, 0x08]); // mov [rsp+8], rsi
+    c.extend_from_slice(&[0x48, 0x89, 0x54, 0x24, 0x10]); // mov [rsp+16], rdx
+    c.extend_from_slice(&[0x48, 0x89, 0x4C, 0x24, 0x18]); // mov [rsp+24], rcx
+    c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // mov [rsp+32], rax
+    c.extend_from_slice(&[0xBF]); // mov edi, 0
+    c.extend_from_slice(&0_u32.to_le_bytes());
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, set_recovery
+    c.extend_from_slice(&set_recovery.to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0x48, 0x8B, 0x44, 0x24, 0x20]); // mov rax, [rsp+32]
+    c.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x18]); // mov rcx, [rsp+24]
+    c.extend_from_slice(&[0x48, 0x8B, 0x54, 0x24, 0x10]); // mov rdx, [rsp+16]
+    c.extend_from_slice(&[0x48, 0x8B, 0x74, 0x24, 0x08]); // mov rsi, [rsp+8]
+    c.extend_from_slice(&[0x48, 0x8B, 0x3C, 0x24]); // mov rdi, [rsp]
+    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x30]); // add rsp, 48
+
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+
+    // Re-enable native-frame recovery after the helper returns, preserving the
+    // Lisp result in rax across the toggle call.
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
+    c.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    c.extend_from_slice(&[0xBF]); // mov edi, 1
+    c.extend_from_slice(&1_u32.to_le_bytes());
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, set_recovery
+    c.extend_from_slice(&set_recovery.to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp]
+    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 16
 }
 
 fn stash_native_error(error: BlissError) {
@@ -10510,7 +10860,9 @@ fn c2i_call_args(sym: u64, args: &[BlissVal], profile_site: u64) -> u64 {
                 // only from a native caller would stop warming up permanently.
                 let fn_obj = bliss_rt::symbols::symbol_function(sym32)
                     .filter(|&cell| bliss_rt::function::is_interpreted_function(cell));
-                if let Some(cell) = fn_obj {
+                if !profiling_disabled()
+                    && let Some(cell) = fn_obj
+                {
                     bliss_rt::function::record_invocation(cell);
                 }
                 let count = dispatch_invoke_count(sym32, fn_obj);
@@ -10601,7 +10953,9 @@ extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64
     };
     let fn_obj = bliss_rt::symbols::symbol_function(sym)
         .filter(|&v| bliss_rt::function::is_interpreted_function(v));
-    if let Some(f) = fn_obj {
+    if !profiling_disabled()
+        && let Some(f) = fn_obj
+    {
         bliss_rt::function::record_back_edges(f, t2_backedge_threshold());
     }
     if !t2_enabled() {
@@ -10711,6 +11065,126 @@ fn maybe_write_perf_map(addr: usize, size: usize, sym: u32) {
     {
         use std::io::Write;
         let _ = writeln!(f, "{addr:x} {size:x} T1:{name}");
+    }
+}
+
+struct JitDumpWriter {
+    file: std::sync::Mutex<std::fs::File>,
+    code_index: std::sync::atomic::AtomicU64,
+}
+
+fn timestamp_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn elf_machine() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        62
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        183
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
+fn jitdump_writer() -> Option<&'static JitDumpWriter> {
+    use std::io::Write;
+    use std::sync::OnceLock;
+
+    static WRITER: OnceLock<Option<JitDumpWriter>> = OnceLock::new();
+    WRITER
+        .get_or_init(|| {
+            let val = std::env::var_os("BLISS_PERF_JITDUMP")?;
+            let val = val.to_string_lossy();
+            if matches!(
+                val.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            ) {
+                return None;
+            }
+            let path = if val.contains('/') {
+                val.into_owned()
+            } else {
+                format!("/tmp/jit-{}.dump", std::process::id())
+            };
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)
+                .ok()?;
+
+            let pid = std::process::id();
+            let header_size = 40_u32;
+            let mut header = Vec::with_capacity(header_size as usize);
+            header.extend_from_slice(&0x4A695444_u32.to_ne_bytes());
+            header.extend_from_slice(&1_u32.to_ne_bytes());
+            header.extend_from_slice(&header_size.to_ne_bytes());
+            header.extend_from_slice(&elf_machine().to_ne_bytes());
+            header.extend_from_slice(&0_u32.to_ne_bytes());
+            header.extend_from_slice(&pid.to_ne_bytes());
+            header.extend_from_slice(&timestamp_nanos().to_ne_bytes());
+            header.extend_from_slice(&0_u64.to_ne_bytes());
+            file.write_all(&header).ok()?;
+
+            Some(JitDumpWriter {
+                file: std::sync::Mutex::new(file),
+                code_index: std::sync::atomic::AtomicU64::new(0),
+            })
+        })
+        .as_ref()
+}
+
+fn maybe_write_jitdump_code_load(tier: &str, addr: usize, code: &[u8], sym: u32) {
+    use std::io::Write;
+
+    let Some(writer) = jitdump_writer() else {
+        return;
+    };
+    let raw = bliss_rt::symbols::symbol_name(sym).unwrap_or_else(|| format!("fn{sym}"));
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect();
+    let name = format!("{tier}:{cleaned}");
+    let record_size = 56_usize
+        .saturating_add(name.len())
+        .saturating_add(1)
+        .saturating_add(code.len());
+    let Ok(record_size_u32) = u32::try_from(record_size) else {
+        return;
+    };
+    let pid = std::process::id();
+    let code_index = writer
+        .code_index
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+
+    let mut record = Vec::with_capacity(record_size);
+    record.extend_from_slice(&0_u32.to_ne_bytes()); // JIT_CODE_LOAD
+    record.extend_from_slice(&record_size_u32.to_ne_bytes());
+    record.extend_from_slice(&timestamp_nanos().to_ne_bytes());
+    record.extend_from_slice(&pid.to_ne_bytes());
+    record.extend_from_slice(&pid.to_ne_bytes());
+    record.extend_from_slice(&(addr as u64).to_ne_bytes());
+    record.extend_from_slice(&(addr as u64).to_ne_bytes());
+    record.extend_from_slice(&(code.len() as u64).to_ne_bytes());
+    record.extend_from_slice(&code_index.to_ne_bytes());
+    record.extend_from_slice(name.as_bytes());
+    record.push(0);
+    record.extend_from_slice(code);
+
+    if let Ok(mut file) = writer.file.lock() {
+        let _ = file.write_all(&record);
+        let _ = file.flush();
     }
 }
 
@@ -11008,6 +11482,9 @@ fn supported_numeric_phase_change(sym: u32) -> bool {
 
 /// Record the operand types seen at call site `(func_ptr, bcp)`.
 fn record_type_profile(func_ptr: usize, bcp: u32, args: &[BlissVal]) {
+    if profiling_disabled() {
+        return;
+    }
     let all_fixnum = args.iter().all(|a| a.is_fixnum());
     // Float contagion: an arithmetic op whose operands are all fixnum-or-float and
     // include at least one float IS a single-float op — the fixnums coerce
@@ -11036,6 +11513,9 @@ fn type_profile_at(func_ptr: usize, bcp: u32) -> Option<TypeProfile> {
 
 /// Record entry to a saved bytecode function in the shared T0/T1 sampling window.
 fn record_profiled_invocation(func_ptr: usize) {
+    if profiling_disabled() {
+        return;
+    }
     FUNCTION_SAMPLE_PROFILE.with(|m| {
         let mut counts = m.borrow_mut();
         let count = counts.entry(func_ptr).or_insert(0);
@@ -11045,6 +11525,9 @@ fn record_profiled_invocation(func_ptr: usize) {
 
 /// Record one execution of a named-call bytecode.
 fn record_call_site(func_ptr: usize, bcp: u32) {
+    if profiling_disabled() {
+        return;
+    }
     let counter = call_site_counter(func_ptr, bcp);
     let _ = counter.calls.fetch_update(
         std::sync::atomic::Ordering::Relaxed,
@@ -11055,6 +11538,164 @@ fn record_call_site(func_ptr: usize, bcp: u32) {
 
 struct RuntimeCallSiteProfile {
     calls: std::sync::atomic::AtomicU32,
+}
+
+pub(super) const RECEIVER_TYPE_PROFILE_SIZE: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReceiverTypeProfileEntrySnapshot {
+    pub(super) receiver_type: u64,
+    pub(super) count: u32,
+}
+
+struct ReceiverTypeProfileEntry {
+    receiver_type: std::sync::atomic::AtomicU64,
+    count: std::sync::atomic::AtomicU32,
+}
+
+impl ReceiverTypeProfileEntry {
+    fn new() -> Self {
+        Self {
+            receiver_type: std::sync::atomic::AtomicU64::new(0),
+            count: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+pub(super) struct ReceiverTypeProfile {
+    entries: [ReceiverTypeProfileEntry; RECEIVER_TYPE_PROFILE_SIZE],
+    cursor: std::sync::atomic::AtomicU8,
+    total_count: std::sync::atomic::AtomicU32,
+    disabled: bool,
+}
+
+impl ReceiverTypeProfile {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| ReceiverTypeProfileEntry::new()),
+            cursor: std::sync::atomic::AtomicU8::new(0),
+            total_count: std::sync::atomic::AtomicU32::new(0),
+            disabled: false,
+        }
+    }
+
+    pub(super) fn disabled() -> Self {
+        Self {
+            entries: std::array::from_fn(|_| ReceiverTypeProfileEntry::new()),
+            cursor: std::sync::atomic::AtomicU8::new(0),
+            total_count: std::sync::atomic::AtomicU32::new(0),
+            disabled: true,
+        }
+    }
+
+    pub(super) fn record(&self, receiver_type: u64) {
+        if self.disabled || receiver_type == 0 {
+            return;
+        }
+        self.total_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        for entry in &self.entries {
+            if entry
+                .receiver_type
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == receiver_type
+            {
+                entry
+                    .count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+
+        for entry in &self.entries {
+            if entry
+                .receiver_type
+                .compare_exchange(
+                    0,
+                    receiver_type,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                entry.count.store(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+
+        let slot = self
+            .cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize
+            % RECEIVER_TYPE_PROFILE_SIZE;
+        let entry = &self.entries[slot];
+        entry
+            .receiver_type
+            .store(receiver_type, std::sync::atomic::Ordering::Relaxed);
+        entry.count.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn snapshot(&self) -> Vec<ReceiverTypeProfileEntrySnapshot> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let receiver_type = entry
+                    .receiver_type
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if receiver_type == 0 {
+                    return None;
+                }
+                Some(ReceiverTypeProfileEntrySnapshot {
+                    receiver_type,
+                    count: entry.count.load(std::sync::atomic::Ordering::Relaxed),
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn total_count(&self) -> u32 {
+        self.total_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn generic_receiver_profile(name: &str) -> &'static ReceiverTypeProfile {
+    GENERIC_RECEIVER_PROFILE.with(|m| {
+        let mut profiles = m.borrow_mut();
+        *profiles.entry(name.to_string()).or_insert_with(|| {
+            Box::leak(Box::new(if profiling_disabled() {
+                ReceiverTypeProfile::disabled()
+            } else {
+                ReceiverTypeProfile::new()
+            }))
+        })
+    })
+}
+
+pub(super) fn record_generic_receiver_profile(name: &str, receiver_type: u64) {
+    if profiling_disabled() {
+        return;
+    }
+    generic_receiver_profile(name).record(receiver_type);
+}
+
+pub(super) fn generic_receiver_profile_counts(name: &str) -> (u32, usize) {
+    GENERIC_RECEIVER_PROFILE.with(|m| {
+        let Some(profile) = m.borrow().get(name).copied() else {
+            return (0, 0);
+        };
+        let snapshot = profile.snapshot();
+        (profile.total_count(), snapshot.len())
+    })
+}
+
+fn snapshot_receiver_profiles_for_t2() -> Vec<(String, Vec<ReceiverTypeProfileEntrySnapshot>)> {
+    GENERIC_RECEIVER_PROFILE.with(|m| {
+        m.borrow()
+            .iter()
+            .map(|(name, profile)| (name.clone(), profile.snapshot()))
+            .filter(|(_, snapshot)| !snapshot.is_empty())
+            .collect()
+    })
 }
 
 fn call_site_counter(func_ptr: usize, bcp: u32) -> &'static RuntimeCallSiteProfile {
@@ -11125,6 +11766,9 @@ thread_local! {
     /// Executions per `(saved bytecode body, CallNamed bcp)`.
     static CALL_SITE_PROFILE: RefCell<HashMap<(usize, u32), &'static RuntimeCallSiteProfile>> =
         RefCell::new(HashMap::new());
+    /// Receiver class/type profiles keyed by generic function name.
+    static GENERIC_RECEIVER_PROFILE: RefCell<HashMap<String, &'static ReceiverTypeProfile>> =
+        RefCell::new(HashMap::new());
     /// Installed T1/T2 code keyed by the same symbol index as the bytecode registry.
     static NATIVE_REGISTRY: RefCell<HashMap<u32, Rc<NativeCode>>> = RefCell::new(HashMap::new());
     /// Per-function invocation counters driving T0→T1 promotion.
@@ -11167,6 +11811,7 @@ struct T2CompileInput {
     priority: u64,
     body: BytecodeFunction,
     type_profiles: HashMap<u32, TypeProfile>,
+    receiver_profiles: Vec<(String, Vec<ReceiverTypeProfileEntrySnapshot>)>,
     inline_bodies: Vec<T2BodySnapshot>,
 }
 
@@ -11334,9 +11979,18 @@ fn env_flag(name: &str) -> Option<bool> {
     })
 }
 
+pub(super) fn profiling_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| env_flag("BLISS_PROFILING_DISABLED") == Some(true))
+}
+
 /// T2 is part of normal tiering.  `BLISS_DISABLE_T2=1` is the explicit debug
 /// off-switch; `BLISS_T2=0` is accepted for compatibility with the old gate.
 fn t2_enabled() -> bool {
+    if profiling_disabled() {
+        return false;
+    }
     if env_flag("BLISS_DISABLE_T2") == Some(true) {
         return false;
     }
@@ -11384,6 +12038,9 @@ fn t2_backedge_threshold() -> u32 {
 /// FnMeta counter bumped by the caller; anonymous bytecode functions need the
 /// local fallback counter bumped here on every dispatch.
 fn dispatch_invoke_count(sym: u32, fn_obj: Option<BlissVal>) -> u32 {
+    if profiling_disabled() {
+        return 0;
+    }
     match fn_obj {
         Some(f) => bliss_rt::function::invoke_count(f),
         None => INVOKE_COUNTS.with(|m| {
@@ -11445,6 +12102,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
             .filter_map(|(&(fp, bcp), profile)| (fp == root_ptr).then_some((bcp, *profile)))
             .collect()
     });
+    let receiver_profiles = snapshot_receiver_profiles_for_t2();
     let inline_bodies = REGISTRY.with(|registry| {
         registry
             .borrow()
@@ -11471,6 +12129,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
         priority,
         body: (*root).clone(),
         type_profiles,
+        receiver_profiles,
         inline_bodies,
     })
 }
@@ -11529,6 +12188,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     let buf = bliss_rt::jit::JitBuffer::new(&artifact.code)?;
     let entry = buf.leak();
     maybe_write_perf_map(entry as usize, artifact.code.len(), done.sym);
+    maybe_write_jitdump_code_load("T2", entry as usize, &artifact.code, done.sym);
     let nc = Rc::new(NativeCode {
         entry,
         code_len: artifact.code.len(),
@@ -11622,6 +12282,9 @@ fn native_for_dispatch(
     fn_obj: Option<BlissVal>,
     invoke_count: u32,
 ) -> Option<Rc<NativeCode>> {
+    if profiling_disabled() {
+        return None;
+    }
     // Publication is deliberately performed by the owning mutator: workers
     // compile relocatable bytes only and never touch thread-local registries or
     // executable mappings.
@@ -11737,10 +12400,17 @@ fn run_native(
     // error stashed by an enclosing native function.
     let saved_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_DEOPT.with(|d| d.set(false));
+    let saved_null_recovery = bliss_rt::runtime::current_sigsegv_null_guard_recovery_ip();
+    let saved_stack_recovery = bliss_rt::runtime::current_sigsegv_stack_guard_recovery_ip();
+    let native_recovery = native_sigsegv_recovery_ip();
+    bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(native_recovery);
+    bliss_rt::runtime::set_sigsegv_stack_guard_recovery_ip(native_recovery);
     // SAFETY: `entry` is installed executable code from emit_native_x86 with the
     // SysV signature `fn(*mut u64) -> u64`, reading its activation from `slots`.
     let f: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(nc.entry) };
     let ret = f(slots);
+    bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(saved_null_recovery);
+    bliss_rt::runtime::set_sigsegv_stack_guard_recovery_ip(saved_stack_recovery);
     NATIVE_ENV.with(|e| e.set(saved));
     NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
 
@@ -11748,6 +12418,10 @@ fn run_native(
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
     let my_err = NATIVE_ERROR.with(|c| c.borrow_mut().take());
     NATIVE_ERROR.with(|c| *c.borrow_mut() = saved_err);
+    if let Some(error) = pending_signal_error_for_current_execution() {
+        stack.pop_frame();
+        return Err(error);
+    }
     if let Some(err) = my_err {
         stack.pop_frame();
         return Err(err);
@@ -12033,6 +12707,7 @@ fn emit_native_x86(
     let deopt_state_addr = c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64;
     let t2_backedge_addr =
         c2i_t1_backedge as extern "C" fn(u64, u64, *mut u64) -> u64 as usize as u64;
+    let values_sym = resolve_sym("VALUES")?.as_symbol_index();
 
     let mut c = Asm::new();
     // One label per bytecode index, bound as each instruction is emitted, so a
@@ -12443,7 +13118,7 @@ fn emit_native_x86(
                 c.extend_from_slice(&profile_site.to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i)
                 c.extend_from_slice(&c2i_addr.to_le_bytes());
-                c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                emit_c2i_helper_call(&mut c);
                 c.extend_from_slice(&[0x49, 0x81, 0xEF]); // sub r15, 8*nargs
                 c.extend_from_slice(&(8_i32 * i32::from(*nargs)).to_le_bytes());
                 push_rax(&mut c);
@@ -12466,6 +13141,26 @@ fn emit_native_x86(
             Instr::PushBlock { .. } => {}
             Instr::PushTag { .. } => {}
             Instr::PopHandler => {}
+            Instr::SetValues(n) => {
+                // Reuse the ordinary Lisp VALUES function so native code and the
+                // interpreter share one multiple-values contract. The values are
+                // contiguous below r15; c2i_call_slice copies them into Env.mv
+                // and returns the primary value in rax.
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, imm64 (VALUES)
+                c.extend_from_slice(&(values_sym as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, imm64 (nargs)
+                c.extend_from_slice(&(*n as u64).to_le_bytes());
+                c.extend_from_slice(&[0x49, 0x8D, 0x97]); // lea rdx,[r15 - 8*n]
+                c.extend_from_slice(&(-8_i32 * i32::from(*n)).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64 (profile site)
+                c.extend_from_slice(&0_u64.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i)
+                c.extend_from_slice(&c2i_addr.to_le_bytes());
+                emit_c2i_helper_call(&mut c);
+                c.extend_from_slice(&[0x49, 0x81, 0xEF]); // sub r15, 8*n
+                c.extend_from_slice(&(8_i32 * i32::from(*n)).to_le_bytes());
+                push_rax(&mut c);
+            }
             Instr::ClearMv => {
                 // Reset the thread's multiple-values state (SETQ et al. are not
                 // value-preserving). rax is dead between statements; r14/r15 are
@@ -12473,7 +13168,7 @@ fn emit_native_x86(
                 // 16-aligned for calls (same contract as CallNamed).
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_clear_mv)
                 c.extend_from_slice(&clear_mv_addr.to_le_bytes());
-                c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                emit_c2i_helper_call(&mut c);
             }
             Instr::LoadEnvVar(name_idx) => {
                 c.push(0xBF); // mov edi, function symbol
@@ -12482,7 +13177,7 @@ fn emit_native_x86(
                 c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]);
                 c.extend_from_slice(&load_env_addr.to_le_bytes());
-                c.extend_from_slice(&[0xFF, 0xD0]);
+                emit_c2i_helper_call(&mut c);
                 push_rax(&mut c);
             }
             Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
@@ -12498,7 +13193,7 @@ fn emit_native_x86(
                     define_env_addr
                 };
                 c.extend_from_slice(&helper.to_le_bytes());
-                c.extend_from_slice(&[0xFF, 0xD0]);
+                emit_c2i_helper_call(&mut c);
             }
             Instr::PushEnvChild | Instr::PopEnvChild => {
                 c.extend_from_slice(&[0x48, 0xB8]);
@@ -12508,7 +13203,7 @@ fn emit_native_x86(
                     pop_env_addr
                 };
                 c.extend_from_slice(&helper.to_le_bytes());
-                c.extend_from_slice(&[0xFF, 0xD0]);
+                emit_c2i_helper_call(&mut c);
             }
             Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {
                 let form = bf.constants.get(*index as usize)?.0;
@@ -12521,7 +13216,7 @@ fn emit_native_x86(
                     make_closure_addr
                 };
                 c.extend_from_slice(&helper.to_le_bytes());
-                c.extend_from_slice(&[0xFF, 0xD0]);
+                emit_c2i_helper_call(&mut c);
                 push_rax(&mut c);
             }
             Instr::TakeValuesToLocals { nvars, slot_base } => {
@@ -12532,7 +13227,7 @@ fn emit_native_x86(
                 c.extend_from_slice(&u64::from(*nvars).to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]);
                 c.extend_from_slice(&take_values_addr.to_le_bytes());
-                c.extend_from_slice(&[0xFF, 0xD0]);
+                emit_c2i_helper_call(&mut c);
             }
             // Read a global/special var's value cell → push (bliss-x5y.15). Same
             // non-allocating call contract as ClearMv (r14/r15 callee-saved).
@@ -12541,7 +13236,7 @@ fn emit_native_x86(
                 c.extend_from_slice(&sym.to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_load_global)
                 c.extend_from_slice(&load_global_addr.to_le_bytes());
-                c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                emit_c2i_helper_call(&mut c);
                 push_rax(&mut c); // result → operand stack
             }
             // Pop the value, write it to the global/special cell (bliss-x5y.15).
@@ -12553,7 +13248,7 @@ fn emit_native_x86(
                 c.extend_from_slice(&sym.to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_store_global)
                 c.extend_from_slice(&store_global_addr.to_le_bytes());
-                c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                emit_c2i_helper_call(&mut c);
             }
             Instr::Go {
                 tagbody_id,
@@ -12586,7 +13281,7 @@ fn emit_native_x86(
                     c.extend_from_slice(&[0x4C, 0x89, 0xF2]); // mov rdx,r14 slots
                     c.extend_from_slice(&[0x48, 0xB8]);
                     c.extend_from_slice(&t2_backedge_addr.to_le_bytes());
-                    c.extend_from_slice(&[0xFF, 0xD0]); // call callback
+                    emit_c2i_helper_call(&mut c);
                     c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax,rax
                     c.jcc(Cc::E, keep_t1);
                     // T2 finished or deoptimized. Its result/dummy result was
@@ -12647,7 +13342,7 @@ fn emit_native_x86(
         c.extend_from_slice(&n_locals.to_le_bytes());
         c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_deopt_state)
         c.extend_from_slice(&deopt_state_addr.to_le_bytes());
-        c.extend_from_slice(&[0xFF, 0xD0]); // call rax  (edi=bcp set by the stub)
+        emit_c2i_helper_call(&mut c);
         c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
         c.extend_from_slice(&[0x41, 0x5F]); // pop r15
         c.extend_from_slice(&[0x41, 0x5E]); // pop r14
@@ -12861,6 +13556,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // Emit a Linux perf symbol-map entry so `perf` can symbolicate this T1 frame
     // (bliss-jtc.10) — the same mechanism HotSpot uses for its JIT code.
     maybe_write_perf_map(entry as usize, code.len(), sym);
+    maybe_write_jitdump_code_load("T1", entry as usize, &code, sym);
     let nc = Rc::new(NativeCode {
         entry,
         code_len: code.len(),
@@ -12962,6 +13658,16 @@ fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
                 p.dominant()
             );
         }
+        for (generic, entries) in &input.receiver_profiles {
+            let rendered: Vec<String> = entries
+                .iter()
+                .map(|entry| format!("{}:{}", entry.receiver_type, entry.count))
+                .collect();
+            t2_log!(
+                "{name}: generic receiver profile {generic} [{}]",
+                rendered.join(",")
+            );
+        }
     }
 
     // The profile closure the speculative-lowering pass consumes: this function's
@@ -13056,6 +13762,8 @@ fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
+    let recovery_toggle_addr =
+        c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
     let framed = match bliss_compiler::t2::emit::emit_framed_with_activation_slots(
         &f,
         deopt_addr,
@@ -13064,6 +13772,7 @@ fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
         load_global_addr,
         store_global_addr,
         clear_mv_addr,
+        recovery_toggle_addr,
         bf.num_slots(),
         Some(sym),
     ) {
@@ -13152,6 +13861,7 @@ fn compile_osr(sym: u32) -> Option<Rc<OsrCode>> {
         let buf = bliss_rt::jit::JitBuffer::new(&code)?;
         let entry = buf.leak();
         maybe_write_perf_map(entry as usize, code.len(), sym);
+        maybe_write_jitdump_code_load("OSR", entry as usize, &code, sym);
         Some(Rc::new(OsrCode {
             entry,
             num_slots,
@@ -13250,15 +13960,31 @@ fn maybe_osr(
 /// stacks (bliss-izt.1). Mirrors the `Return` handler's cleanup — used when an
 /// OSR native finish completes the activation, so no stale block/catch tokens
 /// referencing the popped frame remain.
-fn release_activation_handlers(act: &mut Activation, env: &mut Env) {
-    for h in act.handlers.drain(..) {
+fn release_activation_handlers(act: &mut Activation, stack: &bliss_rt::BlissStack, env: &mut Env) {
+    while let Some(h) = act.handlers.pop() {
         match h {
             Handler::Catch { token, .. } => env.catch_stack.retain(|(_, t)| *t != token),
             Handler::Block { token, .. } => env.block_stack.retain(|(_, t)| *t != token),
-            Handler::HandlerCase { cluster_base, .. } | Handler::HandlerBind { cluster_base } => {
-                env.handlers.truncate(cluster_base)
+            Handler::HandlerCase {
+                cluster_base,
+                cluster_frame,
+                ..
             }
-            Handler::RestartCase { restart_base, .. } => env.restarts.truncate(restart_base),
+            | Handler::HandlerBind {
+                cluster_base,
+                cluster_frame,
+            } => {
+                env.handlers.truncate(cluster_base);
+                pop_condition_cluster_frame(stack, cluster_frame);
+            }
+            Handler::RestartCase {
+                restart_base,
+                cluster_frame,
+                ..
+            } => {
+                env.restarts.truncate(restart_base);
+                pop_condition_cluster_frame(stack, cluster_frame);
+            }
             _ => {}
         }
     }
@@ -13294,6 +14020,11 @@ fn is_toplevel_definer(name: &str) -> bool {
             | "DEFCLASS"
             | "DEFGENERIC"
             | "DEFMETHOD"
+            // ASDF system definitions are top-level definers too. Compiling an
+            // `.asd` DEFSYSTEM form as an ordinary thunk makes the macro-expanded
+            // registration path run under bytecode and can corrupt pathname
+            // initargs while loading source-free ASDF (bliss-a27).
+            | "DEFSYSTEM"
             // Package operations: run once for effect (never usefully compiled).
             // They already reach eval_form via the thunk bail; short-circuiting
             // skips the wasted compile attempt on every top-level occurrence.
@@ -13612,6 +14343,205 @@ mod jtc4_stack_map_tests {
         assert_eq!(invocations, 2);
         assert_eq!(sites, vec![(9, 2)]);
         clear_bytecode_profiles(func_ptr);
+    }
+
+    #[test]
+    fn receiver_type_profile_counts_hits_and_eviction_in_fixed_ring() {
+        let profile = ReceiverTypeProfile::new();
+
+        profile.record(10);
+        profile.record(20);
+        profile.record(10);
+        profile.record(30);
+        profile.record(40);
+        assert_eq!(
+            profile.snapshot(),
+            vec![
+                ReceiverTypeProfileEntrySnapshot {
+                    receiver_type: 10,
+                    count: 2,
+                },
+                ReceiverTypeProfileEntrySnapshot {
+                    receiver_type: 20,
+                    count: 1,
+                },
+                ReceiverTypeProfileEntrySnapshot {
+                    receiver_type: 30,
+                    count: 1,
+                },
+                ReceiverTypeProfileEntrySnapshot {
+                    receiver_type: 40,
+                    count: 1,
+                },
+            ]
+        );
+
+        profile.record(50);
+        let snapshot = profile.snapshot();
+        assert_eq!(snapshot.len(), RECEIVER_TYPE_PROFILE_SIZE);
+        assert!(
+            snapshot.iter().any(|entry| entry.receiver_type == 50),
+            "new receiver type should evict one ring entry: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.iter().any(|entry| entry.receiver_type == 10),
+            "oldest ring entry should be evicted first: {snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_receiver_type_profile_stays_cold() {
+        let profile = ReceiverTypeProfile::disabled();
+        profile.record(10);
+        profile.record(20);
+        assert!(profile.snapshot().is_empty());
+    }
+
+    #[test]
+    fn receiver_profiles_are_snapshotted_for_t2_input() {
+        record_generic_receiver_profile("T2-RP-G", 101);
+        record_generic_receiver_profile("T2-RP-G", 202);
+        record_generic_receiver_profile("T2-RP-G", 101);
+
+        let snapshots = snapshot_receiver_profiles_for_t2();
+        let (_, entries) = snapshots
+            .iter()
+            .find(|(name, _)| name == "T2-RP-G")
+            .expect("generic receiver profile is available to T2");
+        assert_eq!(
+            entries,
+            &vec![
+                ReceiverTypeProfileEntrySnapshot {
+                    receiver_type: 101,
+                    count: 2,
+                },
+                ReceiverTypeProfileEntrySnapshot {
+                    receiver_type: 202,
+                    count: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn native_sigsegv_recovery_epilogue_returns_to_run_native_boundary() {
+        bliss_rt::install_signal_handlers().unwrap();
+        bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(
+            native_sigsegv_recovery_epilogue as *const () as usize,
+        );
+
+        let code = [
+            0x41, 0x56, // push r14
+            0x41, 0x57, // push r15
+            0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+            0x31, 0xC0, // xor eax, eax
+            0x48, 0x89, 0x00, // mov [rax], rax => null-guard SIGSEGV
+        ];
+        let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
+        let entry = buf.leak();
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(entry) };
+
+        let ret = f();
+        bliss_rt::runtime::set_sigsegv_null_guard_recovery_ip(0);
+
+        assert_eq!(ret, bliss_rt::value::NIL_BITS);
+        assert!(bliss_rt::runtime::check_sigsegv_null_guard());
+    }
+
+    #[test]
+    fn run_native_rewrites_null_guard_sigsegv_to_type_error() {
+        bliss_rt::install_signal_handlers().unwrap();
+        let _ = bliss_rt::runtime::check_sigsegv_null_guard();
+
+        let code = [
+            0x41, 0x56, // push r14
+            0x41, 0x57, // push r15
+            0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+            0x31, 0xC0, // xor eax, eax
+            0x48, 0x89, 0x00, // mov [rax], rax => null-guard SIGSEGV
+        ];
+        let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
+        let entry = buf.leak();
+        let code_info = install_stack_map(1).unwrap();
+        let nc = NativeCode {
+            entry,
+            code_len: code.len(),
+            is_t2: false,
+            num_slots: 1,
+            compiled_entry: 0,
+            osr_entries: HashMap::new(),
+            code_info,
+        };
+        let mut env = Env::new(false);
+
+        let error = run_native(&nc, u32::MAX, &[], &mut env).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BlissError::TypeError {
+                datum,
+                expected
+            } if datum == NIL && expected == "non-null object reference"
+        ));
+    }
+
+    #[test]
+    fn run_native_rewrites_stack_guard_sigsegv_to_stack_overflow() {
+        bliss_rt::install_signal_handlers().unwrap();
+        let _ = bliss_rt::runtime::check_sigsegv_stack_guard();
+
+        let guard = bliss_rt::current_thread()
+            .stack()
+            .guard_base()
+            .expect("current thread stack must have a registered guard page")
+            as u64;
+        let mut code = vec![
+            0x41, 0x56, // push r14
+            0x41, 0x57, // push r15
+            0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+            0x48, 0xB8, // mov rax, guard
+        ];
+        code.extend_from_slice(&guard.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x89, 0x00]); // mov [rax], rax
+        let buf = bliss_rt::jit::JitBuffer::new(&code).unwrap();
+        let entry = buf.leak();
+        let code_info = install_stack_map(1).unwrap();
+        let nc = NativeCode {
+            entry,
+            code_len: code.len(),
+            is_t2: false,
+            num_slots: 1,
+            compiled_entry: 0,
+            osr_entries: HashMap::new(),
+            code_info,
+        };
+        let mut env = Env::new(false);
+
+        let error = run_native(&nc, u32::MAX, &[], &mut env).unwrap_err();
+
+        assert!(matches!(error, BlissError::StackOverflow(_)));
+    }
+
+    #[test]
+    fn c2i_helper_calls_disable_native_sigsegv_recovery_around_rust_frame() {
+        let mut asm = Asm::new();
+        emit_c2i_helper_call(&mut asm);
+        let code = asm.finish().unwrap();
+
+        assert_eq!(
+            code.windows(2)
+                .filter(|bytes| *bytes == [0xFF, 0xD0])
+                .count(),
+            3
+        );
+        assert!(
+            code.windows(5).any(|bytes| bytes == [0xBF, 0, 0, 0, 0]),
+            "helper call must clear native SIGSEGV recovery before crossing into Rust"
+        );
+        assert!(
+            code.windows(5).any(|bytes| bytes == [0xBF, 1, 0, 0, 0]),
+            "helper call must restore native SIGSEGV recovery after returning from Rust"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //! the object, because inline caches, tracing, and deopt policy key off object
 //! identity.
 
-use crate::object::{type_id, FunctionData, ObjectHeader};
+use crate::object::{FunctionData, ObjectHeader, type_id};
 use crate::value::BlissVal;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -64,7 +64,7 @@ pub fn alloc_interpreted(
     crate::rooted!(body = body);
     crate::rooted!(env = env);
     crate::rooted!(name = name);
-    let body_ptr = crate::gc::alloc_typed(body_size(), type_id::FUNCTION_INTERPRETED)
+    let body_ptr = crate::gc::alloc_pinned_typed(body_size(), type_id::FUNCTION_INTERPRETED)
         .expect("OOM allocating interpreted function object");
     // SAFETY: fresh FUNCTION_INTERPRETED body; header precedes it and its start
     // coincides with FunctionData's first field.
@@ -81,7 +81,6 @@ pub fn alloc_interpreted(
         (*d).tier = 0.into();
         (*d).flags = 0.into();
         let v = BlissVal::from_heap_ptr(header);
-        crate::gc::pin(v);
         v
     }
 }

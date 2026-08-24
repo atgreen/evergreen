@@ -5,8 +5,8 @@
 use bliss_rt::error::BlissError;
 use bliss_rt::lock_order::{LockLevel, OrderedMutex};
 use bliss_rt::object::{
-    type_id, ComplexData, ConsCell, ElementTypeTag, ObjectHeader, PathnameData, RatioData,
-    ReadtableData,
+    ComplexData, ConsCell, ElementTypeTag, ObjectHeader, PathnameData, RatioData, ReadtableData,
+    type_id,
 };
 use bliss_rt::value::{BlissVal, EOF, MISSING, NIL, T, TAG_HEAP_OBJECT};
 use std::collections::HashMap;
@@ -478,9 +478,11 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
                 if let Ok(s) = std::str::from_utf8(data) {
                     let chars: Vec<char> = s.chars().collect();
                     ensure_nesting_within_limit(&chars)?;
-                    bliss_rt::rooted!(labels = CircularLabels {
-                        labels: HashMap::new(),
-                    });
+                    bliss_rt::rooted!(
+                        labels = CircularLabels {
+                            labels: HashMap::new(),
+                        }
+                    );
 
                     // Honor custom readtable entries before falling back to built-ins.
                     let first_pos = skip_whitespace_and_comments(&chars, 0);
@@ -547,9 +549,11 @@ pub fn read_form_at(
     read_base: u32,
     read_eval: bool,
 ) -> Result<(BlissVal, usize), BlissError> {
-    bliss_rt::rooted!(labels = CircularLabels {
-        labels: HashMap::new(),
-    });
+    bliss_rt::rooted!(
+        labels = CircularLabels {
+            labels: HashMap::new(),
+        }
+    );
     let mut pos = start;
     loop {
         let (val, next) = read_token_with_base(
@@ -1004,7 +1008,6 @@ fn parse_token_with_base(
     has_escape: bool,
     read_base: u32,
 ) -> Result<BlissVal, BlissError> {
-
     if name.is_empty() {
         return Err(BlissError::StreamError("empty token".into()));
     }

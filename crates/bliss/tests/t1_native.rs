@@ -23,7 +23,11 @@ fn assert_t1_matches(program: &str) {
         String::from_utf8_lossy(&t1.stdout),
         "T1 output must match interpretation:\n  {program}"
     );
-    assert_eq!(tw.status.success(), t1.status.success(), "exit mismatch: {program}");
+    assert_eq!(
+        tw.status.success(),
+        t1.status.success(),
+        "exit mismatch: {program}"
+    );
 }
 
 #[test]
@@ -64,24 +68,53 @@ fn t1_promotes_non_leaf_functions() {
            (ev 2) (od 3) (format t \"~a ~a~%\" (ev 100) (od 100))",
     ];
     for c in cases {
-        let t1 = Command::new(BIN).args(["--eval", c]).env("BLISS_T1_THRESHOLD", "2").output().expect("spawn");
-        let tw = Command::new(BIN).args(["--eval", c]).env("BLISS_BACKEND", "tree-walker").output().expect("spawn");
-        assert!(t1.status.success() && tw.status.success(), "runs must succeed:\n{c}");
+        let t1 = Command::new(BIN)
+            .args(["--eval", c])
+            .env("BLISS_T1_THRESHOLD", "2")
+            .output()
+            .expect("spawn");
+        let tw = Command::new(BIN)
+            .args(["--eval", c])
+            .env("BLISS_BACKEND", "tree-walker")
+            .output()
+            .expect("spawn");
+        assert!(
+            t1.status.success() && tw.status.success(),
+            "runs must succeed:\n{c}"
+        );
         // Compare only the result token(s), skipping the tier column (which is 0
         // under the tree-walker, 1 under T1).
         let last = |o: &std::process::Output| {
-            String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("")
-                .split_whitespace().last().unwrap_or("").to_string()
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .last()
+                .unwrap_or("")
+                .to_string()
         };
-        assert_eq!(last(&t1), last(&tw), "T1 result must match interpretation:\n{c}");
+        assert_eq!(
+            last(&t1),
+            last(&tw),
+            "T1 result must match interpretation:\n{c}"
+        );
     }
     // The non-leaf caller actually reaches tier 1 (first stdout line).
     let out = Command::new(BIN)
-        .args(["--eval", "(defun h (x) (* x x)) (defun c (x) (+ (h x) 1)) (c 1)(c 2)(c 3) \
-                          (format t \"~a~%\" (bliss-ext:function-tier (quote c)))"])
-        .env("BLISS_T1_THRESHOLD", "2").output().expect("spawn");
+        .args([
+            "--eval",
+            "(defun h (x) (* x x)) (defun c (x) (+ (h x) 1)) (c 1)(c 2)(c 3) \
+                          (format t \"~a~%\" (bliss-ext:function-tier (quote c)))",
+        ])
+        .env("BLISS_T1_THRESHOLD", "2")
+        .output()
+        .expect("spawn");
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or(""),
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or(""),
         "1",
         "non-leaf function must reach T1"
     );
@@ -103,10 +136,22 @@ fn t1_non_leaf_deep_recursion_is_catchable() {
         "(format t \"~a\" (handler-case (labels ((f (n) (+ 1 (f (+ n 1))))) (f 0)) \
            (storage-condition () :caught)))",
     ] {
-        let out = Command::new(BIN).args(["--eval", prog]).env("BLISS_T1_THRESHOLD", "1").output().expect("spawn");
-        assert!(out.status.success(), "must not abort: {prog}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
-        assert!(String::from_utf8_lossy(&out.stdout).to_uppercase().contains("CAUGHT"),
-            "deep non-leaf recursion must raise a catchable condition: {prog}");
+        let out = Command::new(BIN)
+            .args(["--eval", prog])
+            .env("BLISS_T1_THRESHOLD", "1")
+            .output()
+            .expect("spawn");
+        assert!(
+            out.status.success(),
+            "must not abort: {prog}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .to_uppercase()
+                .contains("CAUGHT"),
+            "deep non-leaf recursion must raise a catchable condition: {prog}"
+        );
     }
 }
 
@@ -123,9 +168,14 @@ fn t1_does_not_break_deep_recursion_bound() {
         .env("BLISS_T1_THRESHOLD", "1")
         .output()
         .expect("spawn");
-    assert!(out.status.success(), "deep recursion should be caught, not abort");
     assert!(
-        String::from_utf8_lossy(&out.stdout).to_uppercase().contains("CAUGHT"),
+        out.status.success(),
+        "deep recursion should be caught, not abort"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .to_uppercase()
+            .contains("CAUGHT"),
         "recursive function must stay BlissStack-bounded under T1"
     );
 }

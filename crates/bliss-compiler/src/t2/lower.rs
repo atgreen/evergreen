@@ -188,12 +188,19 @@ struct Lowering<'f> {
 impl<'f> Lowering<'f> {
     fn new(f: &'f Function) -> Self {
         // SSA values own VReg numbers `0..num_values`; temporaries start above.
-        Lowering { f, insts: Vec::new(), next_temp: f.num_values() as u32 }
+        Lowering {
+            f,
+            insts: Vec::new(),
+            next_temp: f.num_values() as u32,
+        }
     }
 
     /// The VReg for SSA value `v`: number = arena index, class = its repr.
     fn vreg(&self, v: Value) -> VReg {
-        VReg { class: class_of(self.f.value(v).repr), num: v.0 }
+        VReg {
+            class: class_of(self.f.value(v).repr),
+            num: v.0,
+        }
     }
 
     fn vregs(&self, vs: &[Value]) -> Vec<VReg> {
@@ -261,7 +268,11 @@ impl<'f> Lowering<'f> {
             defs,
             uses,
             imm: None,
-            frame_state: if carries_state { data.frame_state } else { None },
+            frame_state: if carries_state {
+                data.frame_state
+            } else {
+                None
+            },
             safepoint: data.flags.safepoint,
         });
     }
@@ -344,7 +355,12 @@ pub fn lower(f: &Function) -> MachFunc {
             None => Vec::new(),
         };
 
-        blocks.push(MachBlock { params, start, end, succs });
+        blocks.push(MachBlock {
+            params,
+            start,
+            end,
+            succs,
+        });
     }
 
     MachFunc {
@@ -384,7 +400,11 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
         };
         if let Some(imm) = imm {
             if let Some(&def) = defs.first() {
-                let op = if data.opcode == ConstFixnum { op::MOV_IMM } else { op::MOV_TAGGED };
+                let op = if data.opcode == ConstFixnum {
+                    op::MOV_IMM
+                } else {
+                    op::MOV_TAGGED
+                };
                 lo.emit_imm(inst, op, def, imm);
                 return;
             }
@@ -469,9 +489,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
 
         // ── memory loads (may be effectful) ──
         Load | Car | Cdr | VecRef | SymbolValue => un_or_bin(lo, inst, op::LOAD, defs, uses),
-        StringByteLength | StringAsciiCharAt => {
-            lo.emit_annotated(inst, op::LOAD, defs, uses)
-        }
+        StringByteLength | StringAsciiCharAt => lo.emit_annotated(inst, op::LOAD, defs, uses),
 
         // ── memory stores ──
         Store | SetCar | SetCdr | VecSet | SetSymbolValue => {
@@ -583,10 +601,16 @@ mod tests {
     }
 
     fn ufix() -> (IRType, ValueRepresentation) {
-        (IRType::of(TypeBits::FIXNUM), ValueRepresentation::UnboxedFixnum)
+        (
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        )
     }
     fn uf64() -> (IRType, ValueRepresentation) {
-        (IRType::of(TypeBits::DOUBLE_FLOAT), ValueRepresentation::UnboxedF64)
+        (
+            IRType::of(TypeBits::DOUBLE_FLOAT),
+            ValueRepresentation::UnboxedF64,
+        )
     }
 
     #[test]
@@ -594,8 +618,16 @@ mod tests {
         let mut f = Function::new("add");
         let entry = f.entry();
 
-        let (_, a) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(2)), &[ufix()]);
-        let (_, b) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(3)), &[ufix()]);
+        let (_, a) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(2)),
+            &[ufix()],
+        );
+        let (_, b) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(3)),
+            &[ufix()],
+        );
         let (_, c) = f.push_inst(
             entry,
             inst(Opcode::FixnumAdd, vec![a[0], b[0]], AuxData::None),
@@ -615,7 +647,11 @@ mod tests {
         assert_eq!(add.defs.len(), 1);
         assert_eq!(add.uses.len(), 2);
         for r in add.defs.iter().chain(add.uses.iter()) {
-            assert_eq!(r.class, RegClass::Gpr, "unboxed-fixnum operands must be GPR");
+            assert_eq!(
+                r.class,
+                RegClass::Gpr,
+                "unboxed-fixnum operands must be GPR"
+            );
         }
 
         // The sequence ends in a return-shaped instruction whose use is the sum.
@@ -630,8 +666,16 @@ mod tests {
         let mut f = Function::new("fadd");
         let entry = f.entry();
 
-        let (_, a) = f.push_inst(entry, inst(Opcode::ConstFloat, vec![], AuxData::FloatImm(1.5)), &[uf64()]);
-        let (_, b) = f.push_inst(entry, inst(Opcode::ConstFloat, vec![], AuxData::FloatImm(2.5)), &[uf64()]);
+        let (_, a) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFloat, vec![], AuxData::FloatImm(1.5)),
+            &[uf64()],
+        );
+        let (_, b) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFloat, vec![], AuxData::FloatImm(2.5)),
+            &[uf64()],
+        );
         let (_, c) = f.push_inst(
             entry,
             inst(Opcode::FloatAdd, vec![a[0], b[0]], AuxData::None),
@@ -640,7 +684,11 @@ mod tests {
         f.set_terminator(entry, inst(Opcode::Return, vec![c[0]], AuxData::None));
 
         let mf = lower(&f);
-        let fadd = mf.insts.iter().find(|m| m.op == op::FADD).expect("float add selected");
+        let fadd = mf
+            .insts
+            .iter()
+            .find(|m| m.op == op::FADD)
+            .expect("float add selected");
         assert_eq!(fadd.defs.len(), 1);
         assert_eq!(fadd.uses.len(), 2);
         for r in fadd.defs.iter().chain(fadd.uses.iter()) {
@@ -664,23 +712,30 @@ mod tests {
         );
 
         // Intern a (minimal) frame state and attach it to a safepointing call.
-        let fsid: FrameStateId = f.frame_states.add(FrameState { scopes: vec![], remat: vec![] });
+        let fsid: FrameStateId = f.frame_states.add(FrameState {
+            scopes: vec![],
+            remat: vec![],
+        });
         let mut call = inst(Opcode::Call, vec![a[0]], AuxData::CallTarget(1));
         call.flags.call = true;
         call.flags.safepoint = true;
         call.frame_state = Some(fsid);
-        let (_, r) = f.push_inst(
-            entry,
-            call,
-            &[(IRType::TOP, ValueRepresentation::Tagged)],
-        );
+        let (_, r) = f.push_inst(entry, call, &[(IRType::TOP, ValueRepresentation::Tagged)]);
 
         f.set_terminator(entry, inst(Opcode::Return, vec![r[0]], AuxData::None));
 
         let mf = lower(&f);
-        let call_mi = mf.insts.iter().find(|m| m.op == op::CALL).expect("call selected");
+        let call_mi = mf
+            .insts
+            .iter()
+            .find(|m| m.op == op::CALL)
+            .expect("call selected");
         assert!(call_mi.safepoint, "call MachInst must be a safepoint");
-        assert_eq!(call_mi.frame_state, Some(fsid), "call must carry its frame state");
+        assert_eq!(
+            call_mi.frame_state,
+            Some(fsid),
+            "call must carry its frame state"
+        );
         // Its argument and result are tagged GPRs.
         assert_eq!(call_mi.uses[0].class, RegClass::Gpr);
         assert_eq!(call_mi.defs[0].class, RegClass::Gpr);
@@ -690,9 +745,16 @@ mod tests {
     fn guard_carries_frame_state() {
         let mut f = Function::new("guard");
         let entry = f.entry();
-        let (_, a) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)), &[ufix()]);
+        let (_, a) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)),
+            &[ufix()],
+        );
 
-        let fsid = f.frame_states.add(FrameState { scopes: vec![], remat: vec![] });
+        let fsid = f.frame_states.add(FrameState {
+            scopes: vec![],
+            remat: vec![],
+        });
         let mut g = inst(Opcode::Guard, vec![a[0]], AuxData::None);
         g.flags.guard = true;
         g.flags.safepoint = true;
@@ -701,7 +763,11 @@ mod tests {
         f.set_terminator(entry, inst(Opcode::Return, vec![], AuxData::None));
 
         let mf = lower(&f);
-        let guard_mi = mf.insts.iter().find(|m| m.op == op::GUARD).expect("guard selected");
+        let guard_mi = mf
+            .insts
+            .iter()
+            .find(|m| m.op == op::GUARD)
+            .expect("guard selected");
         assert_eq!(guard_mi.frame_state, Some(fsid));
         assert!(guard_mi.safepoint);
     }
@@ -712,17 +778,32 @@ mod tests {
         let mut f = Function::new("edge");
         let entry = f.entry();
         let merge = f.make_block();
-        let p = f.add_block_param(merge, IRType::of(TypeBits::FIXNUM), ValueRepresentation::UnboxedFixnum);
+        let p = f.add_block_param(
+            merge,
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::UnboxedFixnum,
+        );
 
-        let (_, v) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(9)), &[ufix()]);
+        let (_, v) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(9)),
+            &[ufix()],
+        );
         let mut jmp = inst(Opcode::Jump, vec![], AuxData::None);
-        jmp.targets = vec![BlockCall { block: merge, args: vec![v[0]] }];
+        jmp.targets = vec![BlockCall {
+            block: merge,
+            args: vec![v[0]],
+        }];
         f.set_terminator(entry, jmp);
         f.set_terminator(merge, inst(Opcode::Return, vec![p], AuxData::None));
 
         let mf = lower(&f);
         // A MOV move for the edge binding p <- v must precede the JMP.
-        let mov_idx = mf.insts.iter().position(|m| m.op == op::MOV).expect("edge move emitted");
+        let mov_idx = mf
+            .insts
+            .iter()
+            .position(|m| m.op == op::MOV)
+            .expect("edge move emitted");
         let jmp_idx = mf.insts.iter().position(|m| m.op == op::JMP).unwrap();
         assert!(mov_idx < jmp_idx, "edge move must precede the branch");
         let mov = &mf.insts[mov_idx];
@@ -738,8 +819,16 @@ mod tests {
         // PSEUDO_UNSUPPORTED for the const+add+return shape.
         let mut f = Function::new("nostub");
         let entry = f.entry();
-        let (_, a) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(2)), &[ufix()]);
-        let (_, c) = f.push_inst(entry, inst(Opcode::FixnumNeg, vec![a[0]], AuxData::None), &[ufix()]);
+        let (_, a) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(2)),
+            &[ufix()],
+        );
+        let (_, c) = f.push_inst(
+            entry,
+            inst(Opcode::FixnumNeg, vec![a[0]], AuxData::None),
+            &[ufix()],
+        );
         f.set_terminator(entry, inst(Opcode::Return, vec![c[0]], AuxData::None));
         let mf = lower(&f);
         assert!(mf.insts.iter().all(|m| m.op != op::PSEUDO_UNSUPPORTED));
@@ -766,8 +855,16 @@ mod tests {
         // the whole flat inst list, no params, no successors.
         let mut f = Function::new("straight");
         let entry = f.entry();
-        let (_, a) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(2)), &[ufix()]);
-        let (_, b) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(3)), &[ufix()]);
+        let (_, a) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(2)),
+            &[ufix()],
+        );
+        let (_, b) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(3)),
+            &[ufix()],
+        );
         let (_, c) = f.push_inst(
             entry,
             inst(Opcode::FixnumAdd, vec![a[0], b[0]], AuxData::None),
@@ -776,7 +873,11 @@ mod tests {
         f.set_terminator(entry, inst(Opcode::Return, vec![c[0]], AuxData::None));
 
         let mf = lower(&f);
-        assert_eq!(mf.blocks.len(), 1, "straight-line function is one MachBlock");
+        assert_eq!(
+            mf.blocks.len(),
+            1,
+            "straight-line function is one MachBlock"
+        );
         let blk = &mf.blocks[0];
         assert_eq!(blk.start, 0);
         assert_eq!(blk.end, mf.insts.len(), "block covers the whole inst list");
@@ -805,22 +906,46 @@ mod tests {
             ValueRepresentation::UnboxedFixnum,
         );
 
-        let (_, cond) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)), &[ufix()]);
-        let (_, x) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(10)), &[ufix()]);
-        let (_, y) = f.push_inst(entry, inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(20)), &[ufix()]);
+        let (_, cond) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)),
+            &[ufix()],
+        );
+        let (_, x) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(10)),
+            &[ufix()],
+        );
+        let (_, y) = f.push_inst(
+            entry,
+            inst(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(20)),
+            &[ufix()],
+        );
         let mut brif = inst(Opcode::Brif, vec![cond[0]], AuxData::None);
         brif.targets = vec![
-            BlockCall { block: left, args: vec![] },
-            BlockCall { block: right, args: vec![] },
+            BlockCall {
+                block: left,
+                args: vec![],
+            },
+            BlockCall {
+                block: right,
+                args: vec![],
+            },
         ];
         f.set_terminator(entry, brif);
 
         let mut ljmp = inst(Opcode::Jump, vec![], AuxData::None);
-        ljmp.targets = vec![BlockCall { block: merge, args: vec![x[0]] }];
+        ljmp.targets = vec![BlockCall {
+            block: merge,
+            args: vec![x[0]],
+        }];
         f.set_terminator(left, ljmp);
 
         let mut rjmp = inst(Opcode::Jump, vec![], AuxData::None);
-        rjmp.targets = vec![BlockCall { block: merge, args: vec![y[0]] }];
+        rjmp.targets = vec![BlockCall {
+            block: merge,
+            args: vec![y[0]],
+        }];
         f.set_terminator(right, rjmp);
 
         f.set_terminator(merge, inst(Opcode::Return, vec![p], AuxData::None));
@@ -828,7 +953,10 @@ mod tests {
         let mf = lower(&f);
 
         // Four IR blocks → four MachBlocks, in layout order; ≥3 as required.
-        assert!(mf.blocks.len() >= 3, "branch/merge yields at least 3 blocks");
+        assert!(
+            mf.blocks.len() >= 3,
+            "branch/merge yields at least 3 blocks"
+        );
         assert_eq!(mf.blocks.len(), 4);
 
         // Ranges partition the flat inst list contiguously and each block ends in
@@ -872,7 +1000,10 @@ mod tests {
         assert_eq!(mb_right.succs.len(), 1);
         assert_eq!(mb_right.succs[0].target, MachBlockId(3));
         assert_eq!(mb_right.succs[0].args.len(), 1);
-        assert_eq!(mb_right.succs[0].args[0].num, y[0].0, "right edge carries y");
+        assert_eq!(
+            mb_right.succs[0].args[0].num, y[0].0,
+            "right edge carries y"
+        );
 
         // The merge (returning) block has no successors.
         assert!(mb_merge.succs.is_empty());

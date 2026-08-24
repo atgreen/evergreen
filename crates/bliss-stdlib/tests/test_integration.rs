@@ -5,8 +5,8 @@
 
 use bliss_rt::value::{BlissVal, NIL, T};
 use bliss_stdlib::clos::{
-    bootstrap_clos, class_name, class_of, define_class, find_class, make_instance,
-    set_slot_value, slot_boundp, slot_value,
+    bootstrap_clos, class_name, class_of, define_class, find_class, make_instance, set_slot_value,
+    slot_boundp, slot_value,
 };
 use bliss_stdlib::conditions::{
     RestartSpec, compute_restarts, find_restart, handler_case, make_simple_error, make_type_error,

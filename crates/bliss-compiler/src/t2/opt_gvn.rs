@@ -262,10 +262,28 @@ mod tests {
         let e = f.entry();
         let a = fixnum_param(&mut f, e);
         let b = fixnum_param(&mut f, e);
-        let r1 = binop(&mut f, e, Opcode::FixnumAdd, vec![a, b], InstFlags::default());
-        let r2 = binop(&mut f, e, Opcode::FixnumAdd, vec![a, b], InstFlags::default());
+        let r1 = binop(
+            &mut f,
+            e,
+            Opcode::FixnumAdd,
+            vec![a, b],
+            InstFlags::default(),
+        );
+        let r2 = binop(
+            &mut f,
+            e,
+            Opcode::FixnumAdd,
+            vec![a, b],
+            InstFlags::default(),
+        );
         // Consumer uses both results; after GVN both must be r1.
-        let sum = binop(&mut f, e, Opcode::FixnumAdd, vec![r1, r2], InstFlags::default());
+        let sum = binop(
+            &mut f,
+            e,
+            Opcode::FixnumAdd,
+            vec![r1, r2],
+            InstFlags::default(),
+        );
         ret(&mut f, e);
 
         run_gvn(&mut f);
@@ -283,7 +301,11 @@ mod tests {
         let b1 = f.make_block();
         let b2 = f.make_block();
         let merge = f.make_block();
-        let m = f.add_block_param(merge, IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged);
+        let m = f.add_block_param(
+            merge,
+            IRType::of(TypeBits::FIXNUM),
+            ValueRepresentation::Tagged,
+        );
         let _ = m;
 
         f.set_terminator(
@@ -295,15 +317,33 @@ mod tests {
                 aux: AuxData::None,
                 flags: InstFlags::default(),
                 targets: vec![
-                    BlockCall { block: b1, args: vec![] },
-                    BlockCall { block: b2, args: vec![] },
+                    BlockCall {
+                        block: b1,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: b2,
+                        args: vec![],
+                    },
                 ],
                 frame_state: None,
                 source_pos: 0,
             },
         );
-        let r1 = binop(&mut f, b1, Opcode::FixnumAdd, vec![a, b], InstFlags::default());
-        let r2 = binop(&mut f, b2, Opcode::FixnumAdd, vec![a, b], InstFlags::default());
+        let r1 = binop(
+            &mut f,
+            b1,
+            Opcode::FixnumAdd,
+            vec![a, b],
+            InstFlags::default(),
+        );
+        let r2 = binop(
+            &mut f,
+            b2,
+            Opcode::FixnumAdd,
+            vec![a, b],
+            InstFlags::default(),
+        );
         jump(&mut f, b1, merge, vec![r1]);
         jump(&mut f, b2, merge, vec![r2]);
         ret(&mut f, merge);
@@ -312,7 +352,11 @@ mod tests {
 
         // b2's edge into merge still carries r2, not r1.
         let t2 = f.terminator(b2).unwrap();
-        assert_eq!(f.inst(t2).targets[0].args, vec![r2], "sibling add must not fold");
+        assert_eq!(
+            f.inst(t2).targets[0].args,
+            vec![r2],
+            "sibling add must not fold"
+        );
         let t1 = f.terminator(b1).unwrap();
         assert_eq!(f.inst(t1).targets[0].args, vec![r1]);
     }
@@ -324,15 +368,28 @@ mod tests {
         let mut f = Function::new("effectful");
         let e = f.entry();
         let p = fixnum_param(&mut f, e);
-        let eff = InstFlags { effectful: true, ..InstFlags::default() };
+        let eff = InstFlags {
+            effectful: true,
+            ..InstFlags::default()
+        };
         let l1 = binop(&mut f, e, Opcode::Load, vec![p], eff);
         let l2 = binop(&mut f, e, Opcode::Load, vec![p], eff);
-        let sum = binop(&mut f, e, Opcode::FixnumAdd, vec![l1, l2], InstFlags::default());
+        let sum = binop(
+            &mut f,
+            e,
+            Opcode::FixnumAdd,
+            vec![l1, l2],
+            InstFlags::default(),
+        );
         ret(&mut f, e);
 
         run_gvn(&mut f);
 
-        assert_eq!(producer_args(&f, sum), vec![l1, l2], "loads must both survive");
+        assert_eq!(
+            producer_args(&f, sum),
+            vec![l1, l2],
+            "loads must both survive"
+        );
     }
 
     // A value folded by GVN is also rewritten inside a FrameState (R4.60).
@@ -342,15 +399,30 @@ mod tests {
         let e = f.entry();
         let a = fixnum_param(&mut f, e);
         let b = fixnum_param(&mut f, e);
-        let r1 = binop(&mut f, e, Opcode::FixnumAdd, vec![a, b], InstFlags::default());
-        let r2 = binop(&mut f, e, Opcode::FixnumAdd, vec![a, b], InstFlags::default());
+        let r1 = binop(
+            &mut f,
+            e,
+            Opcode::FixnumAdd,
+            vec![a, b],
+            InstFlags::default(),
+        );
+        let r2 = binop(
+            &mut f,
+            e,
+            Opcode::FixnumAdd,
+            vec![a, b],
+            InstFlags::default(),
+        );
 
         // A frame state naming the (about-to-be-redundant) r2 in a local slot.
         let fsid = f.frame_states.add(FrameState {
             scopes: vec![FrameScope {
                 function: 0,
                 bcp: 0,
-                locals: vec![ValueSource::Value { value: r2, repr: ValueRepresentation::Tagged }],
+                locals: vec![ValueSource::Value {
+                    value: r2,
+                    repr: ValueRepresentation::Tagged,
+                }],
                 stack: vec![],
             }],
             remat: vec![],

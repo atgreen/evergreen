@@ -1,4 +1,4 @@
-use super::{blocking_mode, timer, BlissMutex, BlockingMode, FiberWaiter};
+use super::{BlissMutex, BlockingMode, FiberWaiter, blocking_mode, timer};
 use crate::error::BlissError;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;

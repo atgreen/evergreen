@@ -7,7 +7,7 @@
 
 use bliss_rt::object::type_id;
 use bliss_rt::value::{BlissVal, NIL};
-use bliss_stdlib::{gethash, make_hash_table, set_gethash, MakeHashTableOptions};
+use bliss_stdlib::{MakeHashTableOptions, gethash, make_hash_table, set_gethash};
 use std::sync::{Mutex, OnceLock};
 
 fn lock() -> &'static Mutex<()> {

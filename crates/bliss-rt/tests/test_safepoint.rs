@@ -3,7 +3,7 @@ use bliss_rt::safepoint::*;
 #[cfg(unix)]
 use bliss_rt::value::T;
 #[cfg(unix)]
-use bliss_rt::{install_signal_handlers, join_thread, make_thread, BlissVal};
+use bliss_rt::{BlissVal, install_signal_handlers, join_thread, make_thread};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
@@ -59,6 +59,20 @@ fn request_then_resume_cycle() {
         assert!(page.is_requested());
         page.resume().unwrap();
         assert!(!page.is_requested());
+    }
+}
+
+#[test]
+fn request_protects_poll_page_and_resume_restores_readability() {
+    let page = SafepointPage::init().unwrap();
+
+    page.request_safepoint().unwrap();
+    assert!(page.poll_page_is_protected());
+
+    page.resume().unwrap();
+    assert!(!page.poll_page_is_protected());
+    unsafe {
+        std::ptr::read_volatile(page.address());
     }
 }
 

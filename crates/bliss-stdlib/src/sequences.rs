@@ -276,7 +276,11 @@ fn cvec_set_storage(v: BlissVal, storage: BlissVal) {
 /// The fill pointer (= active LENGTH) of a complex vector.
 #[inline]
 pub fn cvec_fill_pointer(v: BlissVal) -> usize {
-    unsafe { (*(v.as_ptr().add(16) as *const BlissVal)).as_fixnum().max(0) as usize }
+    unsafe {
+        (*(v.as_ptr().add(16) as *const BlissVal))
+            .as_fixnum()
+            .max(0) as usize
+    }
 }
 #[inline]
 fn cvec_set_fill_pointer_raw(v: BlissVal, n: usize) {
@@ -856,7 +860,10 @@ pub fn subseq(
     end: Option<usize>,
 ) -> Result<BlissVal, BlissError> {
     if is_char_seq(sequence) {
-        let chars: Vec<char> = string_content(sequence).unwrap_or_default().chars().collect();
+        let chars: Vec<char> = string_content(sequence)
+            .unwrap_or_default()
+            .chars()
+            .collect();
         let len = chars.len();
         let actual_end = end.unwrap_or(len);
         if start > actual_end {

@@ -1,8 +1,8 @@
 use bliss_rt::sync::{
-    fiber_sleep, set_pinned_blocking_action, wait_fd, BlissCondVar, BlissMutex, BlissSemaphore,
-    IoInterest, PinnedBlockingAction,
+    BlissCondVar, BlissMutex, BlissSemaphore, IoInterest, PinnedBlockingAction, fiber_sleep,
+    set_pinned_blocking_action, wait_fd,
 };
-use bliss_rt::thread::{current_fiber, fiber_state, make_fiber, FiberState};
+use bliss_rt::thread::{FiberState, current_fiber, fiber_state, make_fiber};
 use bliss_rt::value::{BlissVal, T};
 use bliss_rt::{SchedulerConfig, SchedulerGroup};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
@@ -70,11 +70,13 @@ fn condition_waiter() -> BlissVal {
     let mutex = COND_MUTEX.get().unwrap();
     mutex.grab(true, None).unwrap();
     COND_READY.fetch_add(1, Ordering::AcqRel);
-    assert!(CONDVAR
-        .get()
-        .unwrap()
-        .wait(mutex, Some(Duration::from_secs(1)))
-        .unwrap());
+    assert!(
+        CONDVAR
+            .get()
+            .unwrap()
+            .wait(mutex, Some(Duration::from_secs(1)))
+            .unwrap()
+    );
     COND_DONE.fetch_add(1, Ordering::AcqRel);
     mutex.release().unwrap();
     T
@@ -104,11 +106,13 @@ static SEMAPHORE: OnceLock<BlissSemaphore> = OnceLock::new();
 static SEM_DONE: AtomicUsize = AtomicUsize::new(0);
 
 fn semaphore_waiter() -> BlissVal {
-    assert!(SEMAPHORE
-        .get()
-        .unwrap()
-        .wait(Some(Duration::from_secs(1)))
-        .unwrap());
+    assert!(
+        SEMAPHORE
+            .get()
+            .unwrap()
+            .wait(Some(Duration::from_secs(1)))
+            .unwrap()
+    );
     SEM_DONE.fetch_add(1, Ordering::AcqRel);
     T
 }

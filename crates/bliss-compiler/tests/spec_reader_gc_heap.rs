@@ -3,7 +3,7 @@
 
 use bliss_compiler::read_from_string;
 use bliss_rt::value::{BlissVal, TAG_MASK};
-use bliss_rt::{current_thread, BlissStack, Collector, HeapCollector};
+use bliss_rt::{BlissStack, Collector, HeapCollector, current_thread};
 use std::sync::{Mutex, OnceLock};
 
 /// Serialize the GC-forcing tests: they collect the shared per-process heap, so
@@ -72,9 +72,16 @@ fn reader_shared_structure_retains_identity_across_gc() {
     // form = (X X) where both elements are the same object #1=(a).
     let first = car(relocated);
     let second = car(cdr(relocated));
-    assert_eq!(first.0, second.0, "shared object identity preserved across GC");
+    assert_eq!(
+        first.0, second.0,
+        "shared object identity preserved across GC"
+    );
     // And it is a live, relocated cons (tag preserved) reachable through the root.
-    assert_eq!(first.0 & TAG_MASK, bliss_rt::value::TAG_CONS, "shared object is a live cons");
+    assert_eq!(
+        first.0 & TAG_MASK,
+        bliss_rt::value::TAG_CONS,
+        "shared object is a live cons"
+    );
 
     stack.pop_frame();
 }

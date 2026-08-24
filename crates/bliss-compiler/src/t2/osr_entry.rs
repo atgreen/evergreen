@@ -12,9 +12,7 @@
 //! hand-built counted-loop `Function`: the OSR block's params match the header's
 //! live-in values and it branches to the header with matching args.
 
-use crate::t2::ir::{
-    AuxData, Block, BlockCall, Function, InstData, InstFlags, Opcode, Value,
-};
+use crate::t2::ir::{AuxData, Block, BlockCall, Function, InstData, InstFlags, Opcode, Value};
 
 /// Per-slot import descriptor for the OSR entry map (spec §4.6 D4.09 inverse).
 #[derive(Clone, Debug)]
