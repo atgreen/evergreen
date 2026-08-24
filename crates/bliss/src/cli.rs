@@ -2790,7 +2790,17 @@ fn calltrace_enabled() -> bool {
 }
 
 fn calltrace_note(name: &str, e: &BlissError) {
-    if calltrace_enabled() && matches!(e, BlissError::TypeError { .. }) {
+    if !calltrace_enabled() {
+        return;
+    }
+    // TYPE-ERRORs always; ETYPECASE misses surface as Internal/ProgramError
+    // with an identifying message (bliss-4bp successor debugging).
+    let matches = match e {
+        BlissError::TypeError { .. } => true,
+        BlissError::Internal(msg) | BlissError::ProgramError(msg) => msg.contains("ETYPECASE"),
+        _ => false,
+    };
+    if matches {
         eprintln!("[calltrace] {name}");
     }
 }

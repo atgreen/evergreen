@@ -304,7 +304,8 @@
         (push `((typep ,value ',type) ,@body) expanded)))
     `(let ((,value ,keyform))
        (cond ,@expanded
-             (t (error (format nil "ETYPECASE: no clause matched ~s" ,value)))))))
+             (t (error (format nil "ETYPECASE: no clause matched ~s (expected one of ~s)"
+                               ,value ',(mapcar #'car clauses))))))))
 
 (defmacro ecase (keyform &rest clauses)
   (let ((value (gensym))
