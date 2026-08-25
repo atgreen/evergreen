@@ -18459,7 +18459,11 @@ fn apply_function(
     // Function could be a lambda form, a symbol naming a function, or a closure
     if fn_val.is_symbol() {
         let name = sym_name(fn_val);
-        if let Some((params_form, body)) = callable_body(env, &name) {
+        if let Some((mut params_form, mut body)) = callable_body(env, &name) {
+            // Root across a possible lazy compile below (compile_function
+            // allocates/GCs), since these locals feed eval_lambda_call later.
+            bliss_rt::rooted_ref!(_params_form_root = &mut params_form);
+            bliss_rt::rooted_ref!(_body_root = &mut body);
             // Mirror the operator-position path: a GLOBAL function with a
             // registered bytecode body (e.g. one installed from a `.bfasl`, whose
             // interpreted-function object carries a NIL body) must dispatch
@@ -18472,6 +18476,10 @@ fn apply_function(
             // binding is never redirected to the global registry entry.
             let mut call_parent = Rc::clone(&env.frame);
             if !env.funs.borrow().contains_key(&name) {
+                // Lazy compile when hot (bliss-x5y) — this path handles a global
+                // function reached through funcall/apply or the c2i fallback from
+                // compiled code (e.g. a call inside a compiled top-level thunk).
+                maybe_lazy_compile(&name, params_form, body, env);
                 let (dispatch_idx, fn_val) = dispatch_target(&name);
                 if let Some(idx) = dispatch_idx {
                     if let Some(res) = bytecode::call_registered(idx, args, fn_val, env) {
