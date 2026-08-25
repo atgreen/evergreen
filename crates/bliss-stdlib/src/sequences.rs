@@ -293,6 +293,40 @@ fn cvec_set_fill_pointer_raw(v: BlissVal, n: usize) {
 pub fn cvec_adjustable(v: BlissVal) -> bool {
     unsafe { !(*(v.as_ptr().add(24) as *const BlissVal)).is_nil() }
 }
+/// Whether a complex vector has element-type CHARACTER — i.e. it is a
+/// (fill-pointer / adjustable) STRING and must answer STRINGP / TYPEP STRING /
+/// print as `"…"`. Encoded as an immediate fixnum tag in body word 3 (1 =
+/// character, 0/absent = general T). Word 3 is only present on 4-word
+/// COMPLEX_ARRAYs built by `build_complex_vector`; the reader is safe because
+/// every COMPLEX_ARRAY this crate allocates now carries it.
+#[inline]
+pub fn cvec_is_string(v: BlissVal) -> bool {
+    unsafe {
+        let tag = *(v.as_ptr().add(32) as *const BlissVal);
+        tag.is_fixnum() && tag.as_fixnum() == 1
+    }
+}
+/// Materialise the active characters (0..fill-pointer) of a character-typed
+/// complex vector into a Rust `String`. Returns `None` if `v` is not a
+/// character-typed complex vector, or if any active slot is not a character
+/// (NIL padding beyond an uninitialised element is treated as `\0`).
+pub fn cvec_char_contents(v: BlissVal) -> Option<String> {
+    if !is_complex_vector(v) || !cvec_is_string(v) {
+        return None;
+    }
+    let storage = cvec_storage(v);
+    let n = cvec_fill_pointer(v);
+    let mut s = String::with_capacity(n);
+    for i in 0..n {
+        let e = elt(storage, i).ok()?;
+        if e.is_character() {
+            s.push(e.as_char());
+        } else {
+            s.push('\0');
+        }
+    }
+    Some(s)
+}
 /// `array-total-size` — the capacity of the backing storage.
 #[inline]
 pub fn cvec_capacity(v: BlissVal) -> usize {
@@ -301,12 +335,14 @@ pub fn cvec_capacity(v: BlissVal) -> usize {
 
 /// Build a COMPLEX_ARRAY. `capacity` is the backing array-total-size;
 /// `elements` seed positions `0..elements.len()` (rest NIL); `fill_pointer` is
-/// the active length; `adjustable` allows later growth.
+/// the active length; `adjustable` allows later growth. `element_is_char` marks
+/// element-type CHARACTER, i.e. a (fill-pointer / adjustable) STRING.
 pub fn build_complex_vector(
     elements: &[BlissVal],
     capacity: usize,
     fill_pointer: usize,
     adjustable: bool,
+    element_is_char: bool,
 ) -> BlissVal {
     let cap = capacity.max(elements.len());
     let mut store: Vec<BlissVal> = Vec::with_capacity(cap);
@@ -316,24 +352,29 @@ pub fn build_complex_vector(
     bliss_rt::rooted!(storage = storage);
     let fp = BlissVal::from_fixnum(fill_pointer.min(cap) as i64);
     let adj = if adjustable { T } else { NIL };
-    // Body = [storage-ref | fill-pointer(fixnum) | adjustable(T/NIL)]; only the
-    // storage word is a heap reference (the GC's COMPLEX_ARRAY tracer visits it).
-    let body_size = 3 * 8;
+    // Element-type tag: immediate fixnum, 1 = CHARACTER (a string), 0 = general.
+    let elt = BlissVal::from_fixnum(if element_is_char { 1 } else { 0 });
+    // Body = [storage-ref | fill-pointer(fixnum) | adjustable(T/NIL) |
+    //         element-type(fixnum)]; only the storage word is a heap reference
+    //         (the GC's COMPLEX_ARRAY tracer visits word 0 only).
+    let body_size = 4 * 8;
     if let Some(body) = bliss_rt::gc::alloc_typed(body_size, type_id::COMPLEX_ARRAY) {
         unsafe {
             *(body as *mut u64) = (*storage).to_raw();
             *(body.add(8) as *mut u64) = fp.to_raw();
             *(body.add(16) as *mut u64) = adj.to_raw();
+            *(body.add(24) as *mut u64) = elt.to_raw();
             return BlissVal::from_heap_ptr(body.sub(8));
         }
     }
-    // OOM fallback: a leaked block.
-    let mut buf: Vec<u64> = Vec::with_capacity(4);
-    let header = ObjectHeader::new(type_id::COMPLEX_ARRAY, 4);
+    // OOM fallback: a leaked block (header + 4 body words).
+    let mut buf: Vec<u64> = Vec::with_capacity(5);
+    let header = ObjectHeader::new(type_id::COMPLEX_ARRAY, 5);
     buf.push(header.0);
     buf.push((*storage).to_raw());
     buf.push(fp.to_raw());
     buf.push(adj.to_raw());
+    buf.push(elt.to_raw());
     let ptr = buf.as_mut_ptr() as *mut u8;
     std::mem::forget(buf);
     unsafe { BlissVal::from_heap_ptr(ptr) }

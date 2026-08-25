@@ -915,7 +915,10 @@ fn read_start_end_keys(kv: &[BlissVal], len: usize) -> (usize, usize) {
 /// Destructively set element `i` of a mutable sequence, dispatching on strings
 /// (character storage via `string_set_char`) vs vectors (`set_elt`).
 fn seq_set_elt(seq: BlissVal, i: usize, val: BlissVal) -> Result<(), BlissError> {
-    if is_string_value(seq) {
+    // A character-typed complex vector is STRINGP, but its elements live in the
+    // backing vector — store through `set_elt`, not `string_set_char` (which only
+    // handles simple strings) (bliss-9q4).
+    if !bliss_stdlib::is_complex_vector(seq) && is_string_value(seq) {
         bliss_stdlib::string_set_char(seq, i, val)?;
         Ok(())
     } else {
@@ -4367,6 +4370,13 @@ fn is_string_value(v: BlissVal) -> bool {
     // store before the raw is_string() would dereference garbage and segfault
     // (how ASDF's namestring comparisons crashed).
     if bliss_stdlib::registered_string(v).is_some() {
+        return true;
+    }
+    // A (fill-pointer / adjustable) array with element-type CHARACTER is a
+    // string (CLHS: a string is a specialised vector of characters). cl-ppcre's
+    // lexer builds these via MAKE-ARRAY :element-type 'character and dispatches
+    // on STRINGP (bliss-9q4).
+    if bliss_stdlib::is_complex_vector(v) && bliss_stdlib::cvec_is_string(v) {
         return true;
     }
     v.is_string()
@@ -8463,6 +8473,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         }
                         env.set_var_symbol(*place, *val);
                     } else if place.is_cons() {
+                        // (setf (the TYPE PLACE) val) ≡ (setf PLACE val): THE is a
+                        // type assertion, not a place of its own. Unwrap it (and any
+                        // nesting) before dispatching (bliss-9q4; cl-ppcre's
+                        // `(incf (the fixnum pos))`).
+                        while {
+                            let (head, _) = cp(*place);
+                            head.is_symbol() && sym_name(head) == "THE"
+                        } {
+                            // place = (THE type inner); inner = (caddr place)
+                            *place = cp(cp(cp(*place).1).1).0;
+                        }
+                        if place.is_symbol() {
+                            env.set_var_symbol(*place, *val);
+                            *c = *r2;
+                            continue;
+                        }
                         let (accessor, aargs) = cp(*place);
                         let acc = if accessor.is_symbol() {
                             sym_name(accessor)
@@ -8538,6 +8564,69 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         datum: tgt,
                                         expected: "cons".into(),
                                     });
+                                }
+                            }
+                            "SECOND" | "THIRD" | "FOURTH" | "FIFTH" | "SIXTH"
+                            | "SEVENTH" | "EIGHTH" | "NINTH" | "TENTH" => {
+                                // (setf (Nth-ordinal list) val) — store the car of
+                                // the k-th cons (bliss-9q4; cl-ppcre's convert.lisp).
+                                let k = match acc.as_str() {
+                                    "SECOND" => 1,
+                                    "THIRD" => 2,
+                                    "FOURTH" => 3,
+                                    "FIFTH" => 4,
+                                    "SIXTH" => 5,
+                                    "SEVENTH" => 6,
+                                    "EIGHTH" => 7,
+                                    "NINTH" => 8,
+                                    "TENTH" => 9,
+                                    _ => 0,
+                                };
+                                let mut tgt = eval_form(tgt_form, env)?;
+                                for _ in 0..k {
+                                    tgt = cp(tgt).1;
+                                }
+                                if tgt.is_cons() {
+                                    unsafe {
+                                        let cell = tgt.as_ptr() as *mut ConsCell;
+                                        bliss_rt::gc::store_ref(
+                                            std::ptr::addr_of_mut!((*cell).car),
+                                            *val,
+                                        );
+                                    }
+                                } else {
+                                    return Err(BlissError::Internal(format!(
+                                        "SETF {}: index past end of list",
+                                        acc
+                                    )));
+                                }
+                            }
+                            "NTH" => {
+                                // (setf (nth n list) val) — store the car of the
+                                // n-th cons (bliss-9q4).
+                                let n = eval_form(tgt_form, env)?;
+                                let (list_form, _) = cp(cp(*aargs).1);
+                                let mut tgt = eval_form(list_form, env)?;
+                                let k = if n.is_fixnum() {
+                                    n.as_fixnum().max(0) as usize
+                                } else {
+                                    0
+                                };
+                                for _ in 0..k {
+                                    tgt = cp(tgt).1;
+                                }
+                                if tgt.is_cons() {
+                                    unsafe {
+                                        let cell = tgt.as_ptr() as *mut ConsCell;
+                                        bliss_rt::gc::store_ref(
+                                            std::ptr::addr_of_mut!((*cell).car),
+                                            *val,
+                                        );
+                                    }
+                                } else {
+                                    return Err(BlissError::Internal(
+                                        "SETF NTH: index past end of list".into(),
+                                    ));
                                 }
                             }
                             "GETHASH" => {
@@ -8628,7 +8717,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     });
                                 }
                                 let i = idx.as_fixnum() as usize;
-                                if is_string_value(seq) {
+                                if !bliss_stdlib::is_complex_vector(seq) && is_string_value(seq) {
+                                    // Char-typed complex vectors are STRINGP but
+                                    // store elements in the backing vector; only
+                                    // simple strings use string_set_char (bliss-9q4).
                                     bliss_stdlib::string_set_char(seq, i, *val)?;
                                 } else if seq.is_cons() && acc == "ELT" {
                                     // (setf (elt list i) val)
@@ -8979,9 +9071,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 let adjustable = !args[2].is_nil();
                 let iel = if args.len() > 3 { args[3] } else { NIL };
+                // 5th arg (optional): non-NIL ⇒ element-type CHARACTER (a string).
+                let element_is_char = args.len() > 4 && !args[4].is_nil();
                 let elems = vec![iel; size];
                 return Ok(bliss_stdlib::build_complex_vector(
-                    &elems, size, fp, adjustable,
+                    &elems,
+                    size,
+                    fp,
+                    adjustable,
+                    element_is_char,
                 ));
             }
             "VECTOR-PUSH" => {
@@ -9214,7 +9312,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     });
                 }
                 let i = idx.as_fixnum() as usize;
-                if is_string_value(seq) {
+                if !bliss_stdlib::is_complex_vector(seq) && is_string_value(seq) {
+                    // Char-typed complex vectors are STRINGP but store elements in
+                    // the backing vector; only simple strings use string_set_char
+                    // (bliss-9q4).
                     bliss_stdlib::string_set_char(seq, i, val)?;
                 } else if seq.is_cons() {
                     let mut cursor = seq;
@@ -18940,6 +19041,11 @@ fn val_as_str(val: BlissVal) -> String {
         return name;
     }
     if let Some(s) = bliss_stdlib::registered_string(val) {
+        return s;
+    }
+    // A (fill-pointer / adjustable) character array stringifies to its active
+    // characters (bliss-9q4).
+    if let Some(s) = bliss_stdlib::cvec_char_contents(val) {
         return s;
     }
     if val.is_heap_object() {

@@ -2304,6 +2304,11 @@ impl<'e> Lowerer<'e> {
         };
         let top = resolve_sym(&format!("%LG-TOP{id}")).ok_or(Bail)?;
         let end = resolve_sym(&format!("%LG-END{id}")).ok_or(Bail)?;
+        // First-iteration flag: `for VAR = INIT then STEP` evaluates INIT only on
+        // iteration 1 (guarded by this flag in `pre`, in source order) and STEP on
+        // later iterations. Only bound when a `= … then …` clause is present.
+        let first_flag = resolve_sym(&format!("%LG-FIRST{id}")).ok_or(Bail)?;
+        let mut has_then = false;
 
         bliss_rt::rooted!(bindings = Vec::<BlissVal>::new());
         bliss_rt::rooted!(top_tests = Vec::<BlissVal>::new());
@@ -2396,15 +2401,30 @@ impl<'e> Lowerer<'e> {
                             }
                             if kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref() == Some("THEN") {
                                 // `for VAR = INIT then STEP`: INIT on the first
-                                // iteration, STEP on every subsequent one. Bind to
-                                // INIT once; re-assign to STEP in the step section
-                                // (which runs after the body, before the next top
-                                // test), so iteration 1 sees INIT and later
-                                // iterations see STEP.
+                                // iteration, STEP on every subsequent one. Both the
+                                // INIT and the STEP must be evaluated at the TOP of
+                                // the iteration in source order (in `pre`), like
+                                // every other `for` clause — so that a STEP/INIT
+                                // referencing an earlier clause's variable sees that
+                                // clause's freshly-stepped value for THIS iteration.
+                                // Emitting the STEP into the bottom `steps` section
+                                // instead made it read the *previous* iteration's
+                                // value of earlier variables (e.g. cl-ppcre `seq`'s
+                                // `(make-array-from-two-chars seq quant)` combined the
+                                // char with a stale `quant`, yielding "aab" for
+                                // "abc"); hoisting the INIT into the LET* bindings
+                                // evaluated it before earlier clauses' `pre` setqs ran
+                                // (bliss-9q4).
                                 let mut step = *forms.get(i + 5).ok_or(Bail)?;
                                 bliss_rt::rooted_ref!(_step_root = &mut step);
-                                bindings.push(form_list(&[var, init]));
-                                steps.push(form_list(&[s("SETQ")?, var, step]));
+                                bindings.push(form_list(&[var, NIL]));
+                                pre.push(form_list(&[
+                                    s("IF")?,
+                                    first_flag,
+                                    form_list(&[s("SETQ")?, var, init]),
+                                    form_list(&[s("SETQ")?, var, step]),
+                                ]));
+                                has_then = true;
                                 i += 6;
                             } else {
                                 // `for VAR = FORM` (no `then`): FORM is re-evaluated
@@ -2646,6 +2666,14 @@ impl<'e> Lowerer<'e> {
                 }
                 _ => return Err(Bail),
             }
+        }
+
+        // If any `= … then …` clause is present, bind the first-iteration flag and
+        // clear it at the end of `pre` (after all the guarded INIT setqs), so
+        // iteration 1 runs the INITs and every later iteration skips them.
+        if has_then {
+            bindings.push(form_list(&[first_flag, T]));
+            pre.push(form_list(&[s("SETQ")?, first_flag, NIL]));
         }
 
         // Assemble the result value.

@@ -1399,6 +1399,67 @@ fn loop_while_until_repeat_drivers() {
     }
 }
 
+/// Regression (bliss-9q4): several gaps found while making cl-ppcre load.
+///  - LOOP `for VAR = INIT then STEP`: INIT/STEP must run in source order with
+///    the other clauses' steppings, so one referencing an earlier `for` variable
+///    sees that variable's value for the current iteration (was: INIT hoisted to
+///    the LET* bindings / STEP emitted to the bottom `steps`, both reading a stale
+///    earlier variable).
+///  - MAKE-ARRAY :element-type 'character with :fill-pointer/:adjustable is a
+///    STRING (STRINGP true, CHAR/VECTOR-PUSH-EXTEND/COERCE work).
+///  - SUBST accepts &key test.
+///  - SETF of (THE type place), and of (nth/third/fourth … list).
+#[test]
+fn cl_ppcre_enabling_regressions() {
+    let cases = [
+        // LOOP for = then, cross-referencing an earlier clause.
+        (
+            "(loop for q = 7 for s = q then (1+ s) repeat 3 collect s)",
+            "(7 8 9)",
+        ),
+        (
+            "(loop for a = 1 for b = a for s = b then 0 repeat 1 collect (list a b s))",
+            "((1 1 1))",
+        ),
+        ("(loop for s = 100 then (1+ s) repeat 3 collect s)", "(100 101 102)"),
+        // Adjustable/fill-pointer character array is a string.
+        (
+            "(let ((s (make-array 0 :element-type 'character :fill-pointer t :adjustable t)))\
+               (vector-push-extend #\\a s) (vector-push-extend #\\b s)\
+               (list (stringp s) (length s) (coerce s 'simple-string)))",
+            "(T 2 \"ab\")",
+        ),
+        (
+            "(stringp (make-array 3 :element-type 'character :fill-pointer 0 :adjustable t))",
+            "T",
+        ),
+        // SUBST with :test.
+        ("(subst 'z 'b '(a b (c b)) :test #'eql)", "(A Z (C Z))"),
+        // SETF of (THE type place) and ordinal / nth places.
+        (
+            "(let ((l (list 1 2 3 4))) (setf (the fixnum (third l)) 99) l)",
+            "(1 2 99 4)",
+        ),
+        (
+            "(let ((l (list 1 2 3 4 5))) (setf (fourth l) 40) (setf (nth 4 l) 50) l)",
+            "(1 2 3 40 50)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout} (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.

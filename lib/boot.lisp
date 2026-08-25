@@ -830,6 +830,16 @@
   (nthcdr (max 0 (- (length list) n)) list))
 (defun butlast (list &optional (n 1))
   (subseq list 0 (max 0 (- (length list) n))))
+;; Ordinal list accessors. FIRST..THIRD have interpreter fast-paths, but the
+;; higher ordinals (used by e.g. cl-ppcre's convert.lisp) need real function
+;; cells so compiled code can call them (bliss-9q4).
+(defun fourth (list) (nth 3 list))
+(defun fifth (list) (nth 4 list))
+(defun sixth (list) (nth 5 list))
+(defun seventh (list) (nth 6 list))
+(defun eighth (list) (nth 7 list))
+(defun ninth (list) (nth 8 list))
+(defun tenth (list) (nth 9 list))
 (defun mapc (fn &rest lists)
   (apply (function mapcar) fn lists)
   (car lists))
@@ -911,7 +921,7 @@
               (fpn (cond ((eq fp t) size)
                          ((integerp fp) fp)
                          (t size)))
-              (v (%make-complex-vector size fpn (and adjustable t) iel)))
+              (v (%make-complex-vector size fpn (and adjustable t) iel (and stringp t))))
          (when ic-cell
            (let ((i 0))
              (dolist (e (coerce (car (cdr ic-cell)) 'list))
@@ -946,11 +956,21 @@
        (if iel-cell (make-array size :initial-element iel) (make-array size))))))
 (defun string-equal (a b) (string= (string-downcase a) (string-downcase b)))
 
-(defun subst (new old tree)
-  (cond ((eql tree old) new)
-        ((consp tree) (cons (subst new old (car tree))
-                            (subst new old (cdr tree))))
-        (t tree)))
+;; SUBST new old tree &key key test test-not — substitute NEW for every subtree
+;; of TREE that satisfies the test against OLD. Full CL lambda list: cl-ppcre's
+;; INSERT-ADVANCE-FN calls (subst ... :test #'equalp) (bliss-9q4).
+(defun subst (new old tree &key key test test-not)
+  (let ((key (or key (function identity))))
+    (labels ((match (x)
+               (let ((k (funcall key x)))
+                 (cond (test-not (not (funcall test-not old k)))
+                       (test (funcall test old k))
+                       (t (eql old k)))))
+             (rec (tree)
+               (cond ((match tree) new)
+                     ((consp tree) (cons (rec (car tree)) (rec (cdr tree))))
+                     (t tree))))
+      (rec tree))))
 
 ;;; ===========================================================================
 ;;; Conformance layer: sequence/list/string/number/control functions that were

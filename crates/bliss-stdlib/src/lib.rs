@@ -94,7 +94,8 @@ pub use pathnames::{
 };
 pub use sequences::{
     build_complex_vector, build_simple_vector, concatenate, copy_seq, count, cvec_adjustable,
-    cvec_capacity, cvec_fill_pointer, elt, find, is_complex_vector, length, map, nreverse,
+    cvec_capacity, cvec_char_contents, cvec_fill_pointer, cvec_is_string, elt, find,
+    is_complex_vector, length, map, nreverse,
     position, reduce, remove, reverse, set_elt, set_fill_pointer, sort, stable_sort,
     string_set_char, subseq, substitute, vector_pop, vector_push, vector_push_extend,
 };

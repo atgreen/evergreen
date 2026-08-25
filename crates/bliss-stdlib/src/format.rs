@@ -280,6 +280,11 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         if let Some(s) = heap_number_string(v, escapep) {
             return s;
         }
+        // A character-typed (fill-pointer / adjustable) array is a string and
+        // prints as one, not as #(...) (bliss-9q4).
+        if let Some(s) = crate::sequences::cvec_char_contents(v) {
+            return if escapep { format!("\"{}\"", s) } else { s };
+        }
         // Vectors (simple and complex/fill-pointer) render as #(...).
         if let Some(s) = heap_vector_string(v, escapep) {
             return s;
