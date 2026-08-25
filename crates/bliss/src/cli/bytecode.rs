@@ -8458,6 +8458,35 @@ thread_local! {
         RefCell::new(std::collections::HashSet::new());
 }
 
+/// True if a function body syntactically contains a loop construct (LOOP,
+/// DOTIMES, DOLIST, DO/DO*, TAGBODY, PROG/PROG*). Such functions benefit from
+/// OSR/back-edge promotion even when called once, and a hot loop in them can
+/// only be observed if the function is compiled — so the hybrid lazy policy
+/// EAGER-compiles them and defers only straight-line/leaf functions, which is
+/// what removes the asdf load penalty without losing hot-loop tiering (the
+/// stage-5 gate) (bliss-x5y).
+fn body_contains_loop(body: BlissVal) -> bool {
+    fn walk(v: BlissVal, depth: u32) -> bool {
+        if depth > 400 {
+            return true; // deep/odd form — err toward eager
+        }
+        if v.is_cons() {
+            let (car, cdr) = cp(v);
+            if car.is_symbol() {
+                match symbol_bare_name(&sym_name(car)).as_str() {
+                    "LOOP" | "DOTIMES" | "DOLIST" | "DO" | "DO*" | "TAGBODY" | "PROG"
+                    | "PROG*" => return true,
+                    "QUOTE" => return false, // quoted data is not code
+                    _ => {}
+                }
+            }
+            return walk(car, depth + 1) || walk(cdr, depth + 1);
+        }
+        false
+    }
+    walk(body, 0)
+}
+
 /// Reset lazy-compile bookkeeping for a (re)defined DEFUN: drop any stale
 /// registry entry and the declined flag so the new body gets a fresh chance.
 pub(super) fn clear_lazy_state(sym: u32) {
@@ -14662,11 +14691,18 @@ pub fn eval_toplevel(mut form: BlissVal, env: &mut Env) -> Result<BlissVal, Blis
         bliss_rt::rooted!(body = body);
         let result = eval_form(*form, env)?;
         if let Some(sym) = symbol_index_of(&name) {
-            // Lazy mode: defer compilation to the first hot call (bliss-x5y).
-            // Just clear any stale bytecode/declined state for this (re)definition.
-            if lazy_compile_enabled() {
+            // Lazy mode: defer compilation to the first hot call (bliss-x5y) —
+            // UNLESS the body contains a loop, which needs eager compilation so a
+            // hot loop (even in a once-called function) promotes via OSR/back-edge
+            // (the stage-5 gate). Straight-line/leaf functions defer, removing the
+            // asdf load penalty. Clear stale state for the (re)definition either
+            // way.
+            if lazy_compile_enabled() && !body_contains_loop(*body) {
                 clear_lazy_state(sym);
                 return Ok(result);
+            }
+            if lazy_compile_enabled() {
+                clear_lazy_state(sym);
             }
             reset_last_bail_reason();
             match compile_function(&name, *params, *body, env, false, false) {
