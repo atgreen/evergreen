@@ -1497,6 +1497,35 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-ok5): LOOP ALWAYS/NEVER return T by vacuous truth when the
+/// range is empty (the test is never evaluated, CLHS 6.1.6). The default was
+/// seeded lazily inside the per-iteration body, so an empty range wrongly
+/// returned NIL. THEREIS still defaults to NIL.
+#[test]
+fn loop_always_never_vacuous_truth() {
+    let cases = [
+        // Empty range: ALWAYS/NEVER are vacuously true.
+        ("(loop for i from 0 below 0 always nil)", "T"),
+        ("(loop for i from 0 below 0 always (> i 5))", "T"),
+        ("(loop for i from 0 below 0 never t)", "T"),
+        // THEREIS over an empty range is NIL (nothing found).
+        ("(loop for i from 0 below 0 thereis t)", "NIL"),
+        // Non-empty ranges keep their normal short-circuit semantics.
+        ("(loop for i from 0 below 3 always (< i 5))", "T"),
+        ("(loop for i from 0 below 3 always (< i 2))", "NIL"),
+        ("(loop for i from 0 below 3 never (> i 5))", "T"),
+        ("(loop for i from 0 below 3 never (> i 1))", "NIL"),
+        ("(loop for i in '(1 2 3) thereis (> i 2))", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-cm0): CONCATENATE with a VECTOR result-type returns a
 /// VECTOR, not a LIST. The result type was matched against a hardcoded intern
 /// index that the VECTOR symbol did not reliably occupy, so `(concatenate

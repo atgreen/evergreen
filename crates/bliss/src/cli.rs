@@ -13270,6 +13270,23 @@ fn loop_collect_intos(clauses: &[LoopClause], out: &mut Vec<String>) {
     }
 }
 
+/// True if `clauses` contain an ALWAYS or NEVER boolean-accumulation clause
+/// (recursing into conditional branches). Such a loop's default result is T
+/// (vacuous truth): `(loop for i below 0 always nil)` is T because the test is
+/// never evaluated (CLHS 6.1.6). The per-iteration handler seeds `bool_default`
+/// lazily, which is too late for an empty range — the body never runs — so the
+/// default must be established at loop setup instead (bliss-ok5). THEREIS is
+/// excluded: its default is NIL, which the absent-accumulator fallback provides.
+fn loop_has_boolean_clause(clauses: &[LoopClause]) -> bool {
+    clauses.iter().any(|c| match c {
+        LoopClause::Always(_) | LoopClause::Never(_) => true,
+        LoopClause::Cond { then, els, .. } => {
+            loop_has_boolean_clause(then) || loop_has_boolean_clause(els)
+        }
+        _ => false,
+    })
+}
+
 fn loop_exec_clauses(
     clauses: &[LoopClause],
     env: &mut Env,
@@ -13945,6 +13962,11 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
     }
 
     let mut accs = LoopAccs::default();
+    // Establish the vacuous-truth default for ALWAYS/NEVER at setup so an
+    // empty-range loop (whose body never runs) still returns T (bliss-ok5).
+    if loop_has_boolean_clause(&body) {
+        accs.bool_default.get_or_insert(T);
+    }
     let mut ret: Option<BlissVal> = None;
 
     for f in &initially {
