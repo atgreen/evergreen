@@ -1049,6 +1049,9 @@ fn is_known_special_operator(val: BlissVal) -> bool {
             name.as_str(),
             "BLOCK"
                 | "CATCH"
+                // COND is lowered directly (not a macro): macroexpand must expand
+                // its clauses so symbol-macros inside them are handled (bliss-x5y.20).
+                | "COND"
                 | "EVAL-WHEN"
                 | "FLET"
                 | "FUNCTION"
@@ -1096,6 +1099,7 @@ fn expand_special_form(
         "THE" => expand_the(form, env),
         "EVAL-WHEN" => expand_eval_when(form, env),
         "FUNCTION" => expand_function_special(form, env),
+        "COND" => expand_cond(form, env),
         "LET" => expand_let(form, env, false),
         "LET*" => expand_let(form, env, true),
         "FLET" => expand_flet(form, env),
@@ -1111,6 +1115,37 @@ fn expand_special_form(
 }
 
 // ── Special form handlers ─────────────────────────────────────────
+
+/// Expand COND: `(cond (test body...) ...)`. COND is not a macro in bliss (it is
+/// lowered directly by the tree-walker and the bytecode compiler), so
+/// macroexpand_all must expand each clause's test and body itself — otherwise a
+/// symbol-macro referenced inside a clause (e.g. a WITH-SLOTS slot used in a
+/// `(cond ((zerop maximum) …))` test) is left unexpanded and reads as an unbound
+/// variable once the clause is compiled (bliss-x5y.20). WHEN/UNLESS/AND/OR need
+/// no handler — their subforms are plain expressions the generic arg-walk
+/// already expands; only COND's `(test . body)` clause shape needs this.
+fn expand_cond(mut form: BlissVal, env: &Environment) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted_ref!(_form_root = &mut form);
+    bliss_rt::rooted!(operator = unsafe { cons_car(form) });
+    bliss_rt::rooted!(clauses = cons_to_vec(unsafe { cons_cdr(form) }));
+    bliss_rt::rooted!(out = Vec::<BlissVal>::with_capacity(clauses.len()));
+    for i in 0..clauses.len() {
+        let clause = clauses[i];
+        if !clause.is_cons() {
+            out.push(clause);
+            continue;
+        }
+        // Root test and body before any allocation (macroexpand/expand_body and
+        // alloc_cons all allocate; moving GC — bliss-noh).
+        bliss_rt::rooted!(test = unsafe { cons_car(clause) });
+        bliss_rt::rooted!(cbody = unsafe { cons_cdr(clause) });
+        bliss_rt::rooted!(etest = macroexpand_all(*test, env)?);
+        bliss_rt::rooted!(ebody = expand_body(*cbody, env)?);
+        out.push(alloc_cons(*etest, *ebody));
+    }
+    bliss_rt::rooted!(clause_list = vec_to_cons(&out));
+    Ok(alloc_cons(*operator, *clause_list))
+}
 
 /// Expand BLOCK: (block name body...)
 /// Block name is NOT expanded; body forms are expanded.

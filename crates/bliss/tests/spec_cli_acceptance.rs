@@ -1299,10 +1299,14 @@ fn stage_four_cli_supports_call_next_method_eql_specializers_and_short_form_comb
                (defmethod pick ((x (eql 7))) 'seven)
                (defmethod pick ((x t)) 'other)
                (defgeneric collect (x) (:method-combination list))
-               (defmethod collect ((x t)) 'a)
+               ;; Two DISTINCT specializers, both applicable to an integer, so the
+               ;; list combination collects from both (most-specific first). Same
+               ;; parameter specializers would be one method — the second replaces
+               ;; the first per CLHS 7.6.2 (bliss-day).
+               (defmethod collect ((x integer)) 'a)
                (defmethod collect ((x t)) 'b)
                (defgeneric sum-values (x) (:method-combination +))
-               (defmethod sum-values + ((x t)) 1)
+               (defmethod sum-values + ((x integer)) 1)
                (defmethod sum-values + ((x t)) 2)
                (list (speak (make-instance 'dog))
                      (pick 7)

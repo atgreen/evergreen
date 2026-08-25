@@ -1606,8 +1606,11 @@ impl<'e> Lowerer<'e> {
         // tree-walker fallback and can be predeclared by a future compilation-
         // unit pass without weakening this safety boundary.
         let bare = symbol_bare_name(name);
-        let is_user_fn =
-            self.env.funs.borrow().contains_key(name) || super::global_fn(name).is_some();
+        let is_generic =
+            self.env.generics.borrow().contains_key(name) || self.env.methods.borrow().contains_key(name);
+        let is_user_fn = is_generic
+            || self.env.funs.borrow().contains_key(name)
+            || super::global_fn(name).is_some();
         let is_builtin = super::is_builtin_function(&bare) || PRIMITIVE_ALLOWLIST.contains(&name);
         if !is_user_fn && !is_builtin {
             // Portable (BFASL) compilation represents a forward reference to a

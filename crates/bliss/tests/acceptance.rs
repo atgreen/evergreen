@@ -1820,6 +1820,38 @@ fn defmethod_redefinition_replaces() {
     }
 }
 
+/// Regression (bliss-x5y.20): COND is not a macro in bliss — it is lowered
+/// directly by the tree-walker and the bytecode compiler — but the macroexpander
+/// did not descend into its clauses, so a symbol-macro referenced inside a COND
+/// clause (e.g. a WITH-SLOTS slot used in a `(cond ((zerop maximum) …))` test)
+/// was left unexpanded and read as an unbound variable once compiled. WHEN/UNLESS
+/// /AND/OR/IF were fine (plain-expression subforms); only COND's `(test . body)`
+/// clause shape needed handling. This blocked cl-ppcre's create-matcher-aux.
+#[test]
+fn cond_expands_symbol_macros_in_clauses() {
+    let cases = [
+        // Slot read in a COND test, in a compiled defun and a compiled method.
+        ("(progn (defclass r () ((a :initform 7))) \
+            (defun f (o) (with-slots (a) o (cond ((eql a 7) :yes) (t :no)))) \
+            (format t \"~s\" (f (make-instance 'r))))", ":YES"),
+        ("(progn (defclass r () ((mn :initform 2) (mx :initform 2))) \
+            (defgeneric cm (x)) \
+            (defmethod cm ((o r)) (with-slots (mn mx) o \
+              (cond ((= mn mx 1) :one) ((eql mn mx) :eq) (t :other)))) \
+            (format t \"~s\" (cm (make-instance 'r))))", ":EQ"),
+        // Multiple slots, one used only in a clause body.
+        ("(progn (defclass r () ((a :initform 3) (b :initform 9))) \
+            (defun f (o) (with-slots (a b) o (cond ((eql a 3) b) (t a)))) \
+            (format t \"~s\" (f (make-instance 'r))))", "9"),
+    ];
+    for (prog, expected) in cases {
+        let out = bliss_bin().args(["--no-init", "--eval", prog]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{prog} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.to_uppercase().contains(&expected.to_uppercase()), "expected {expected}, got: {stdout}");
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.

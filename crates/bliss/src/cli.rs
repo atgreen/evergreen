@@ -2960,6 +2960,25 @@ fn run_standard_from_ids(
     invoke_standard_methods(env, &around, &before, &primary, &after, args).map(Some)
 }
 
+/// True if `name` is a slot reader/accessor on some class. Used to preserve the
+/// "reader on a non-instance yields NIL" behavior (bliss-lb6.14) uniformly across
+/// dispatch paths — the tree-walker's operator-position fast path has it, but a
+/// FUNCALL/APPLY or compiled `CallNamed` reaches the generic through
+/// `invoke_generic_function`, which would otherwise signal no-applicable-method.
+fn generic_is_slot_reader(env: &Env, name: &str) -> bool {
+    let bare = symbol_bare_name(name);
+    env.classes.borrow().values().any(|c| {
+        c.slots.iter().any(|s| {
+            s.accessor
+                .as_ref()
+                .is_some_and(|a| a == name || symbol_bare_name(a) == bare)
+                || s.readers
+                    .iter()
+                    .any(|r| r == name || symbol_bare_name(r) == bare)
+        })
+    })
+}
+
 fn invoke_generic_function(
     name: &str,
     args: &[BlissVal],
@@ -3030,6 +3049,12 @@ fn invoke_generic_function_inner(
     }
     applicable.sort_by(|a, b| a.1.cmp(&b.1));
     if applicable.is_empty() {
+        // A slot reader applied to a non-instance yields NIL rather than
+        // no-applicable-method (bliss-lb6.14), matching the tree-walker's
+        // operator-position path — so a compiled `(reader nil)` agrees.
+        if args.len() == 1 && !bliss_stdlib::is_instance(args[0]) && generic_is_slot_reader(env, name) {
+            return Ok(NIL);
+        }
         return Err(no_applicable_method_error(env, name));
     }
 
