@@ -18085,17 +18085,29 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     bliss_stdlib::clos::add_method(generic_function, method_id)?;
     bliss_stdlib::set_method_specializers(method_id, vec![], qualifier);
 
-    env.methods
-        .borrow_mut()
-        .entry(name.clone())
-        .or_default()
-        .push(MethodDef {
+    {
+        let mut methods_map = env.methods.borrow_mut();
+        let list = methods_map.entry(name.clone()).or_default();
+        // CLHS 7.6.2: DEFMETHOD with the same qualifier and specializers REPLACES
+        // the existing method rather than adding a second one. Appending left the
+        // stale method applicable, so a redefinition never took effect (bliss-oo8).
+        if let Some(pos) = list
+            .iter()
+            .position(|m| m.qualifier == qualifier && specializers_equal(&m.specializers, &specializers))
+        {
+            let old_id = list[pos].method_id;
+            list.remove(pos);
+            METHOD_COMPILED.with(|m| m.borrow_mut().remove(&old_id.0));
+            METHOD_CAPTURED_ENV.with(|m| m.borrow_mut().remove(&old_id.0));
+        }
+        list.push(MethodDef {
             method_id,
             specializers,
             lambda_list: *lambda_list,
             qualifier,
             body,
         });
+    }
     // A method defined inside a user binding form closes over it (like a DEFUN —
     // bliss-sdd), e.g. cl-ppcre's build-replacement-template over the lexical
     // REG-SCANNER. Detect nesting exactly as eval_defun (frame differs from the
@@ -18133,6 +18145,20 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         }
     }
     Ok(name_form)
+}
+
+/// Structural equality of two method specializer lists, for CLHS 7.6.2 method
+/// replacement: same length and each position matches (Any/Class-by-name/Eql-by
+/// -value). Eql values are compared by identity bits (the reader interns equal
+/// literals; this matches how the tree-walker's EQL dispatch resolves them).
+fn specializers_equal(a: &[MethodSpecializer], b: &[MethodSpecializer]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| match (x, y) {
+            (MethodSpecializer::Any, MethodSpecializer::Any) => true,
+            (MethodSpecializer::Class(n1), MethodSpecializer::Class(n2)) => n1 == n2,
+            (MethodSpecializer::Eql(v1), MethodSpecializer::Eql(v2)) => v1.0 == v2.0,
+            _ => false,
+        })
 }
 
 /// True if a method lambda list contains `&key`. A method's keyword parameters

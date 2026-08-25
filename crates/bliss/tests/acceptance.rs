@@ -1796,6 +1796,30 @@ fn method_dispatch_cache_preserves_clos_semantics() {
     }
 }
 
+/// Regression (bliss-day): DEFMETHOD with the same qualifier and specializers
+/// REPLACES the existing method (CLHS 7.6.2). bliss appended it, leaving the
+/// stale method applicable so a redefinition never took effect.
+#[test]
+fn defmethod_redefinition_replaces() {
+    let cases = [
+        ("(progn (defgeneric r (x)) (defmethod r ((n integer)) :v1) \
+            (defmethod r ((n integer)) :v2) (format t \"~s\" (r 1)))", ":V2"),
+        // Replace only after the cache is warm (invalidation on redefinition).
+        ("(progn (defgeneric r (x)) (defmethod r ((n integer)) :v1) (r 1) \
+            (defmethod r ((n integer)) :v2) (format t \"~s\" (r 1)))", ":V2"),
+        // A different specializer is a distinct method, not a replacement.
+        ("(progn (defgeneric d (x)) (defmethod d ((n integer)) :int) \
+            (defmethod d ((s string)) :str) (format t \"~s\" (list (d 1) (d \"x\"))))",
+         "(:INT :STR)"),
+    ];
+    for (prog, expected) in cases {
+        let out = bliss_bin().args(["--no-init", "--eval", prog]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{prog} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.to_uppercase().contains(&expected.to_uppercase()), "expected {expected}, got: {stdout}");
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.
