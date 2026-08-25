@@ -637,8 +637,6 @@ const SYMBOL_CUSTOM_TEST: u32 = 2;
 const SYMBOL_SUBTRACTION: u32 = 5;
 /// Symbol index constant for multiplication.
 const SYMBOL_MULTIPLICATION: u32 = 6;
-/// Symbol index constant for VECTOR result-type.
-const SYMBOL_VECTOR: u32 = 7;
 
 /// Test two values for equality using the given test function.
 /// - NIL (default): EQL semantics — raw BlissVal equality (works for fixnums, chars, symbols).
@@ -1060,10 +1058,28 @@ pub fn nreverse(sequence: BlissVal) -> Result<BlissVal, BlissError> {
     })
 }
 
-/// Check if a result_type BlissVal indicates VECTOR.
+/// Check if a result_type BlissVal indicates a VECTOR type. Matched by symbol
+/// NAME (not a hardcoded intern index, which is fragile — the VECTOR symbol does
+/// not reliably land at a fixed index, so the old identity check silently failed
+/// and CONCATENATE 'VECTOR returned a LIST — bliss-cm0). Accepts the bare type
+/// name and the common compound `(vector element-type [size])` / `(simple-vector
+/// …)` specifier forms.
 fn result_type_is_vector(result_type: BlissVal) -> bool {
+    fn name_is_vector(idx: u32) -> bool {
+        matches!(
+            bliss_compiler::reader::symbol_name(idx).as_deref(),
+            Some("VECTOR" | "SIMPLE-VECTOR")
+        )
+    }
     if result_type.tag() == bliss_rt::value::TAG_SYMBOL {
-        return result_type.as_symbol_index() == SYMBOL_VECTOR;
+        return name_is_vector(result_type.as_symbol_index());
+    }
+    // A compound specifier like (VECTOR T) / (SIMPLE-VECTOR 5): dispatch on the car.
+    if result_type.is_cons() {
+        let car = unsafe { (*(result_type.as_ptr() as *const ConsCell)).car };
+        if car.tag() == bliss_rt::value::TAG_SYMBOL {
+            return name_is_vector(car.as_symbol_index());
+        }
     }
     false
 }

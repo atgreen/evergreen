@@ -1497,6 +1497,29 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-cm0): CONCATENATE with a VECTOR result-type returns a
+/// VECTOR, not a LIST. The result type was matched against a hardcoded intern
+/// index that the VECTOR symbol did not reliably occupy, so `(concatenate
+/// 'vector …)` silently produced a list; matched by symbol NAME now.
+#[test]
+fn concatenate_vector_result_type() {
+    let cases = [
+        ("(vectorp (concatenate 'vector #(1 2) #(3 4)))", "T"),
+        ("(vectorp (concatenate 'vector '(1 2) '(3 4)))", "T"),
+        ("(vectorp (concatenate '(vector t) '(1 2) '(3 4)))", "T"),
+        ("(concatenate 'vector #(1 2) '(3))", "#(1 2 3)"),
+        // String and list result types are unaffected.
+        ("(concatenate 'string \"ab\" \"cd\")", "abcd"),
+        ("(concatenate 'list #(1 2) '(3))", "(1 2 3)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expected), "{expr} => expected {expected}, got: {stdout}");
+    }
+}
+
 /// Regression (bliss-5ir, bliss-omw): further gaps found making cl-ppcre's
 /// matcher run correctly.
 ///  - `#'foo` / a closure is FUNCTIONP, TYPEP FUNCTION, and TYPE-OF FUNCTION, and
