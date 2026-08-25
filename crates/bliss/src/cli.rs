@@ -12478,6 +12478,38 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 cb.map(|(_, b)| fmt_form_debug(b)).unwrap_or_default()
             );
         }
+        // Compiler macros: apply exactly one step before dispatching an ordinary
+        // GLOBAL function call, so an INTERPRETED call gives the same result as a
+        // compiled one. The bytecode compiler applies compiler macros during
+        // lowering (bytecode.rs `lower_call`); the tree-walker must match, or a
+        // cold/never-compiled function behaves differently from a hot/compiled
+        // one — which breaks the "identical results across tiers" contract and,
+        // once BLISS_LAZY_COMPILE is the default, is the difference between a
+        // deferred defun and an eagerly compiled one (bliss-x5y.24). Special
+        // operators, macros (checked at the top of eval_list), and the builtin
+        // fast-path arms above have all been handled, so reaching here with a
+        // compiler-macro'd symbol operator means an ordinary function call.
+        // A local FLET/LABELS binding of the same name shadows the global and
+        // suppresses its compiler macro (CLHS 3.2.2.1.3), so guard on that.
+        if compiler_macroexpand::has_compiler_macro(car) && !env.funs.borrow().contains_key(&name) {
+            // Reconstruct the call form from the rooted operator/args (the
+            // original `form` cons is not separately rooted here). A well-behaved
+            // compiler macro that declines returns its argument EQ, so
+            // `compiler_macroexpand_1` reports `changed=false` and we fall
+            // through to the normal call below.
+            bliss_rt::rooted!(cm_form = arena_cons(car, cdr));
+            let null_env = MacroexpandEnv::null();
+            if let Ok((expanded, true)) =
+                compiler_macroexpand::compiler_macroexpand_1(*cm_form, &null_env)
+            {
+                // Root the expansion across eval_form's allocations, then
+                // evaluate it (which re-enters eval_list, so a compiler macro
+                // expanding to another compiler-macro'd call is handled too).
+                bliss_rt::rooted!(expanded = expanded);
+                return eval_form(*expanded, env);
+            }
+        }
+
         // Check user-defined functions: lexical (FLET/LABELS/`(setf f)`) then the
         // global function cell (bliss-jtc.6.8).
         if let Some((params_form, body)) = callable_body(env, &name) {

@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock};
 
 use bliss_rt::error::BlissError;
@@ -463,8 +463,35 @@ fn lookup_global_macro(name: BlissVal) -> Option<BlissVal> {
     table.get(&name.0).copied()
 }
 
+/// Cheap "are there ANY compiler macros defined?" gate. The tree-walker
+/// consults compiler macros on every global function call (so interpreted code
+/// gives the same results as compiled code — bliss-x5y.24); this AtomicBool lets
+/// the overwhelmingly common no-compiler-macro program skip the table read-lock
+/// entirely. Set the first time a compiler macro is defined; never cleared (the
+/// cost of a spurious read-lock after every compiler macro is undefined is
+/// negligible and clearing it racily would be wrong).
+static ANY_COMPILER_MACROS: AtomicBool = AtomicBool::new(false);
+
+/// True if at least one compiler macro has ever been defined. A `false` return
+/// is authoritative (no lock needed); a `true` return means callers should
+/// consult [`has_compiler_macro`] / [`compiler_macroexpand_1`].
+pub fn any_compiler_macros() -> bool {
+    ANY_COMPILER_MACROS.load(AtomicOrdering::Relaxed)
+}
+
+/// True if `name` currently has a compiler macro registered. Cheap-gated by
+/// [`any_compiler_macros`] so the common case pays a single relaxed load.
+pub fn has_compiler_macro(name: BlissVal) -> bool {
+    if !any_compiler_macros() {
+        return false;
+    }
+    let table = COMPILER_MACRO_TABLE.read().unwrap();
+    table.contains_key(&name.0)
+}
+
 /// Register a compiler macro (DEFINE-COMPILER-MACRO).
 pub fn define_compiler_macro(name: BlissVal, expander: CompilerMacroFn) {
+    ANY_COMPILER_MACROS.store(true, AtomicOrdering::Relaxed);
     let mut table = COMPILER_MACRO_TABLE.write().unwrap();
     table.insert(name.0, expander);
 }
