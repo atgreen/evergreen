@@ -1918,6 +1918,37 @@ fn let_declared_special_and_slot_value_setf() {
     }
 }
 
+/// Regression (bliss-x5y): opt-in lazy compilation (BLISS_LAZY_COMPILE) defers a
+/// DEFUN's bytecode compile from definition time to the first call that crosses
+/// the invoke threshold — cold functions never compile (removing the load-time
+/// penalty that made the bytecode backend slower than the tree-walker on
+/// asdf.lisp). Results must be identical to eager compilation, and a hot,
+/// repeatedly-called function must still compile and give the right answer.
+#[test]
+fn lazy_compile_preserves_results() {
+    let cases = [
+        // A hot recursive function crosses the threshold and compiles mid-run.
+        ("(progn (defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) \
+            (format t \"~s\" (fib 20)))", "6765"),
+        // Cold function (called once) stays interpreted but still correct.
+        ("(progn (defun once (x) (* x x)) (format t \"~s\" (once 9)))", "81"),
+        // Redefinition after warmup takes effect (lazy state cleared).
+        ("(progn (defun g (x) (* x 2)) (dotimes (i 20) (g i)) \
+            (defun g (x) (* x 3)) (format t \"~s\" (g 10)))", "30"),
+    ];
+    for (prog, expected) in cases {
+        let out = bliss_bin()
+            .env("BLISS_LAZY_COMPILE", "1")
+            .env("BLISS_LAZY_THRESHOLD", "4")
+            .args(["--no-init", "--eval", prog])
+            .output()
+            .expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{prog} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expected), "expected {expected}, got: {stdout}");
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.

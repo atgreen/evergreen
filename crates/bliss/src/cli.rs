@@ -886,6 +886,29 @@ fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
     ))
 }
 
+/// Lazy-compile trigger (bliss-x5y): in lazy mode a global DEFUN is compiled to
+/// bytecode the first time its invoke count crosses the threshold, rather than
+/// eagerly at definition. Called on the global-function call path just before
+/// the bytecode dispatch, after `callable_body` has bumped the invoke count.
+/// A no-op unless lazy mode is on, the function is a hot global interpreted
+/// function, and it is not already compiled.
+fn maybe_lazy_compile(name: &str, params: BlissVal, body: BlissVal, env: &Env) {
+    if !bytecode::lazy_compile_enabled() {
+        return;
+    }
+    let Some(f) = global_fn(name) else {
+        return;
+    };
+    if !bliss_rt::function::is_interpreted_function(f)
+        || bliss_rt::function::invoke_count(f) < bytecode::lazy_compile_threshold()
+    {
+        return;
+    }
+    if let Some(sym) = resolve_sym(name).map(|s| s.as_symbol_index()) {
+        bytecode::lazy_compile_defun(sym, name, params, body, env);
+    }
+}
+
 /// True if `val` is a keyword symbol (name in the KEYWORD package). Used to
 /// tell an optional positional stream argument apart from &key start/end.
 fn is_keyword_arg(val: BlissVal) -> bool {
@@ -12482,6 +12505,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // to the global registry entry of the same name.
             let mut call_parent = Rc::clone(&env.frame);
             if !env.funs.borrow().contains_key(&name) {
+                maybe_lazy_compile(&name, *params_form, *body, env);
                 // Dispatch through the resolved function OBJECT, mirroring the
                 // funcall-object path: key the registry on its OWN name (so an
                 // aliased installation — `(setf (symbol-function 'p) (symbol-

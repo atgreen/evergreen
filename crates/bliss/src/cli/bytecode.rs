@@ -8425,6 +8425,75 @@ fn make_bytecode_closure(
     bliss_rt::function::alloc_interpreted(lambda_list, NIL, NIL, sym)
 }
 
+/// Lazy (deferred) compilation of top-level DEFUNs (bliss-x5y). Eagerly
+/// compiling every defun at load time costs more than it saves for a big library
+/// load (asdf) whose functions are mostly never hot — the bytecode backend loads
+/// asdf SLOWER than the tree-walker because of that definition-time cost. With
+/// lazy mode on, eval_toplevel skips the eager compile; a function is compiled
+/// the first time its invoke count crosses the threshold at a call site, so cold
+/// functions pay nothing and hot ones still tier.
+pub(super) fn lazy_compile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLISS_LAZY_COMPILE").is_some())
+}
+
+/// Invocations before a lazily-compiled function is compiled. Cold functions
+/// (called fewer times, e.g. one-shot asdf definitions) never compile.
+pub(super) fn lazy_compile_threshold() -> u32 {
+    use std::sync::OnceLock;
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BLISS_LAZY_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+thread_local! {
+    /// DEFUN symbols whose lazy compile already bailed — don't retry every call.
+    /// Cleared for a symbol when it is (re)defined.
+    static LAZY_DECLINED: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Reset lazy-compile bookkeeping for a (re)defined DEFUN: drop any stale
+/// registry entry and the declined flag so the new body gets a fresh chance.
+pub(super) fn clear_lazy_state(sym: u32) {
+    registry_remove(sym);
+    LAZY_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+}
+
+/// Compile a hot DEFUN body to bytecode and register it under `sym`, so
+/// subsequent calls dispatch through the tiering path. Returns true if `sym` is
+/// (now) registered. Records a bail so it is not retried on every call.
+pub(super) fn lazy_compile_defun(
+    sym: u32,
+    name: &str,
+    params: BlissVal,
+    body: BlissVal,
+    env: &super::Env,
+) -> bool {
+    if REGISTRY.with(|r| r.borrow().contains_key(&sym)) {
+        return true;
+    }
+    if LAZY_DECLINED.with(|s| s.borrow().contains(&sym)) {
+        return false;
+    }
+    reset_last_bail_reason();
+    match compile_function(name, params, body, env, false, false) {
+        Some(bf) => {
+            registry_put(sym, Rc::new(bf));
+            true
+        }
+        None => {
+            LAZY_DECLINED.with(|s| s.borrow_mut().insert(sym));
+            false
+        }
+    }
+}
+
 /// Compile a standalone lambda (`lambda_list` + `body`) to bytecode and reify it
 /// as a callable interpreted-function object under a fresh uninterned symbol, so
 /// `apply_function` dispatches it through the ordinary tiering ladder (T0
@@ -14593,6 +14662,12 @@ pub fn eval_toplevel(mut form: BlissVal, env: &mut Env) -> Result<BlissVal, Blis
         bliss_rt::rooted!(body = body);
         let result = eval_form(*form, env)?;
         if let Some(sym) = symbol_index_of(&name) {
+            // Lazy mode: defer compilation to the first hot call (bliss-x5y).
+            // Just clear any stale bytecode/declined state for this (re)definition.
+            if lazy_compile_enabled() {
+                clear_lazy_state(sym);
+                return Ok(result);
+            }
             reset_last_bail_reason();
             match compile_function(&name, *params, *body, env, false, false) {
                 Some(bf) => {
