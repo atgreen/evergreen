@@ -1852,6 +1852,38 @@ fn cond_expands_symbol_macros_in_clauses() {
     }
 }
 
+/// Regression (bliss-x5y.21): a closure created inside SYMBOL-MACROLET/WITH-SLOTS
+/// and invoked AFTER the form exits must still see the symbol-macro expansion.
+/// The symbol-macro table is per-Env, not part of the lexical frame a closure
+/// captures, so the lazy path lost it for escaping closures (unbound variable).
+/// eval_symbol_macrolet now expands the body eagerly (baking the expansion in),
+/// respecting inner LET shadowing and QUOTE.
+#[test]
+fn escaping_closure_sees_symbol_macrolet() {
+    let cases = [
+        // Escaping closure over a bare symbol-macro.
+        ("(format t \"~s\" (funcall (funcall (lambda () (symbol-macrolet ((m 42)) (lambda () m))))))", "42"),
+        // Escaping closure over a WITH-SLOTS slot (the cl-ppcre shape).
+        ("(progn (defclass k () ((s :initform 5))) \
+            (defun mk (o) (with-slots (s) o (lambda () s))) \
+            (format t \"~s\" (funcall (mk (make-instance 'k)))))", "5"),
+        // Inner LET still shadows the symbol-macro.
+        ("(format t \"~s\" (symbol-macrolet ((m 42)) (let ((m 7)) m)))", "7"),
+        // QUOTE still suppresses expansion.
+        ("(format t \"~s\" (symbol-macrolet ((m 42)) 'm))", "M"),
+        // Common with-slots read/write unaffected.
+        ("(progn (defclass k () ((s :initform 0))) \
+            (defun f (o) (with-slots (s) o (setf s 9) s)) \
+            (format t \"~s\" (f (make-instance 'k))))", "9"),
+    ];
+    for (prog, expected) in cases {
+        let out = bliss_bin().args(["--no-init", "--eval", prog]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{prog} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.to_uppercase().contains(&expected.to_uppercase()), "expected {expected}, got: {stdout}");
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.

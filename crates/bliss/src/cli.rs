@@ -17387,7 +17387,23 @@ fn eval_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
 }
 
 fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
-    let (bindings_form, mut body) = cp(cdr);
+    // Eagerly expand the symbol-macros through the whole body (respecting quote,
+    // lexical shadowing, and lambda params) so a closure created in the body and
+    // invoked AFTER the symbol-macrolet exits still sees the expansion — the
+    // symbol-macro table is per-Env, not part of the lexical frame a closure
+    // captures, so the lazy path below lost it for escaping closures (bliss-x5y.21).
+    // Fall back to the lazy path if the compiler macroexpander can't handle the
+    // body (its result is then evaluated with the runtime symbol-macro table).
+    bliss_rt::rooted!(cdr = cdr);
+    if let Some(sm_sym) = resolve_sym("SYMBOL-MACROLET") {
+        bliss_rt::rooted!(form = arena_cons(sm_sym, *cdr));
+        let menv = macroexpand_environment_from_cli(env);
+        if let Ok(expanded) = bliss_compiler::macroexpand::macroexpand_all(*form, &menv) {
+            return eval_form(expanded, env);
+        }
+    }
+    let (mut bindings_form, mut body) = cp(*cdr);
+    bliss_rt::rooted_ref!(_bindings_form_root = &mut bindings_form);
     bliss_rt::rooted_ref!(_body_root = &mut body);
     let mut child_env = env.child();
     let mut bindings = list_to_vec(bindings_form);

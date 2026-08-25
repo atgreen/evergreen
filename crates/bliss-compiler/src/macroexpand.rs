@@ -1058,6 +1058,9 @@ fn is_known_special_operator(val: BlissVal) -> bool {
                 | "GO"
                 | "IF"
                 | "LABELS"
+                // A bare `(lambda (params) body)` form: expand the body with the
+                // params shadowing any enclosing symbol-macro (bliss-x5y.21).
+                | "LAMBDA"
                 | "LET"
                 | "LET*"
                 | "LOAD-TIME-VALUE"
@@ -1099,6 +1102,7 @@ fn expand_special_form(
         "THE" => expand_the(form, env),
         "EVAL-WHEN" => expand_eval_when(form, env),
         "FUNCTION" => expand_function_special(form, env),
+        "LAMBDA" => expand_lambda_expression(form, env),
         "COND" => expand_cond(form, env),
         "LET" => expand_let(form, env, false),
         "LET*" => expand_let(form, env, true),
