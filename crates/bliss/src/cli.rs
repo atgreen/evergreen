@@ -11698,7 +11698,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(vec_to_list(&nicks));
             }
             "PACKAGE-SHADOWING-SYMBOLS" => {
-                return Ok(NIL);
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Ok(NIL);
+                }
+                let raw = normalize_package_name(&val_as_str(eval_form(args[0], env)?));
+                let name = resolve_package_name(env, &raw);
+                let syms = match bliss_stdlib::find_package(&name) {
+                    Some(pkg) => bliss_stdlib::package_shadowing_symbols(pkg),
+                    None => return Ok(NIL),
+                };
+                return Ok(vec_to_list(&syms));
             }
             "PACKAGE-USED-BY-LIST" => {
                 // The packages that :USE the given package. Was stubbed to NIL,
@@ -11936,8 +11946,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     names.push(symbol_bare_name(&val_as_str(names_val)));
                 }
-                for name in names {
-                    intern_into_package(env, &pkg_name, &name);
+                // SHADOW forks a distinct present symbol shadowing any inherited
+                // same-named one (bliss-b1o) — not a plain intern.
+                if let Some(pkg) = bliss_stdlib::find_package(&pkg_name) {
+                    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                    let _ = bliss_stdlib::shadow(&refs, pkg);
                 }
                 return Ok(T);
             }
@@ -18975,6 +18988,10 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     let mut uses = Vec::new();
     let mut nicknames = Vec::new();
     let mut interns: Vec<String> = Vec::new();
+    // :shadow names — must fork a distinct present symbol that shadows any
+    // same-named inherited one (not a plain intern, which would return the
+    // inherited symbol unchanged). See bliss-b1o.
+    let mut shadows: Vec<String> = Vec::new();
     // (from-package, symbol-name) pairs to import into this package.
     let mut import_from: Vec<(String, String)> = Vec::new();
 
@@ -19014,9 +19031,14 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                         nicknames.push(normalize_package_name(&val_as_str(v)));
                     }
                 }
-                "INTERN" | "SHADOW" => {
+                "INTERN" => {
                     for v in list_to_vec(val_list) {
                         interns.push(symbol_bare_name(&sym_name(v)));
+                    }
+                }
+                "SHADOW" => {
+                    for v in list_to_vec(val_list) {
+                        shadows.push(symbol_bare_name(&sym_name(v)));
                     }
                 }
                 "IMPORT-FROM" | "SHADOWING-IMPORT-FROM" => {
@@ -19066,9 +19088,20 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             }
         }
     }
-    // Intern :intern/:shadow symbols as internal symbols.
+    // Intern :intern symbols as internal symbols.
     for name in &interns {
         intern_into_package(env, &pkg_name, name);
+    }
+    // :shadow — fork a distinct present symbol that shadows any same-named
+    // inherited symbol, and record it in the package's shadowing list. A plain
+    // intern would return the inherited symbol (e.g. CL:DEFCONSTANT), leaving
+    // the shadowing name EQ to the inherited one and breaking `cl:x`-vs-local-x
+    // macros (bliss-b1o).
+    if !shadows.is_empty() {
+        if let Some(pkg) = bliss_stdlib::find_package(&pkg_name) {
+            let refs: Vec<&str> = shadows.iter().map(String::as_str).collect();
+            let _ = bliss_stdlib::shadow(&refs, pkg);
+        }
     }
     // Make each exported name present + external. If a symbol of that name is
     // already accessible in the package — in particular inherited from a used

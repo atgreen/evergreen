@@ -1519,6 +1519,49 @@ fn cl_ppcre_matcher_regressions() {
     }
 }
 
+/// Regression (bliss-b1o): `defpackage :shadow` (and the `shadow` function) must
+/// intern a NEW symbol home-owned by the shadowing package, distinct from the
+/// same-named inherited (e.g. CL:) symbol — not a plain intern that returns the
+/// inherited symbol. cl-ppcre `(:shadow :defconstant)` then defines a macro whose
+/// body expands to `cl:defconstant`; if the two names stayed EQ the macro
+/// re-invoked itself → infinite expansion → SIGSEGV while loading util.lisp.
+/// Verifies distinctness, home package, PACKAGE-SHADOWING-SYMBOLS, and that the
+/// self-referential macro pattern terminates.
+#[test]
+fn defpackage_shadow_interns_distinct_symbol() {
+    let dir = std::env::temp_dir().join("bliss_test_shadow");
+    let _ = std::fs::create_dir_all(&dir);
+    let file_path = dir.join("shadow.lisp");
+    // Separate top-level forms: IN-PACKAGE must take effect (at read time of the
+    // *next* form) before the shadowed name is read, so this cannot be one progn.
+    std::fs::write(
+        &file_path,
+        "(defpackage :shtest (:use :cl) (:shadow :defconstant))\n\
+         (in-package :shtest)\n\
+         (format t \"~&DISTINCT=~s~%\" (eq 'cl:defconstant 'defconstant))\n\
+         (format t \"~&HOME=~s~%\" (package-name (symbol-package 'defconstant)))\n\
+         (format t \"~&SHADOWING=~s~%\" (mapcar #'symbol-name (package-shadowing-symbols :shtest)))\n\
+         (defmacro defconstant (n v &optional d) (declare (ignore d)) (list 'cl:defconstant n v))\n\
+         (defconstant +ok+ 42)\n\
+         (format t \"~&VALUE=~s~%\" +ok+)\n",
+    )
+    .expect("write shadow test file");
+
+    let out = bliss_bin()
+        .args(["--load", file_path.to_str().unwrap()])
+        .output()
+        .expect("run bliss");
+    let _ = std::fs::remove_file(&file_path);
+    let _ = std::fs::remove_dir(&dir);
+
+    assert_eq!(out.status.code(), Some(0), "shadow load should exit 0 (not SIGSEGV)");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_uppercase();
+    assert!(stdout.contains("DISTINCT=NIL"), "cl:defconstant must differ from shadowed defconstant, got: {stdout}");
+    assert!(stdout.contains("HOME=\"SHTEST\""), "shadowed symbol home package must be SHTEST, got: {stdout}");
+    assert!(stdout.contains("SHADOWING=(\"DEFCONSTANT\")"), "package-shadowing-symbols must list DEFCONSTANT, got: {stdout}");
+    assert!(stdout.contains("VALUE=42"), "self-referential defconstant macro must terminate, got: {stdout}");
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.

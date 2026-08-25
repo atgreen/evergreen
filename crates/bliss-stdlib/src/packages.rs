@@ -1161,6 +1161,30 @@ pub fn present_symbols(package: BlissVal) -> Vec<BlissVal> {
     .unwrap_or_default()
 }
 
+/// The package's shadowing symbols (present symbols that shadow inherited
+/// same-named ones), as required by PACKAGE-SHADOWING-SYMBOLS. A shadowing
+/// entry is a bare name; resolve it to the package's present symbol.
+pub fn package_shadowing_symbols(package: BlissVal) -> Vec<BlissVal> {
+    (|| -> Option<Vec<BlissVal>> {
+        let store = current_store().ok()?;
+        let g = store.state.read().ok()?;
+        let pkg = g.packages.get(&pkg_id(package))?;
+        let pkg = pkg.read().ok()?;
+        let mut out = Vec::new();
+        for name in &pkg.shadowing_symbols {
+            if let Some(sym) = pkg
+                .internal_symbols
+                .get(name.as_str())
+                .or_else(|| pkg.external_symbols.get(name.as_str()))
+            {
+                out.push(sym);
+            }
+        }
+        Some(out)
+    })()
+    .unwrap_or_default()
+}
+
 /// The package's own *external* (exported) symbols. For DO-EXTERNAL-SYMBOLS.
 pub fn external_symbols_of(package: BlissVal) -> Vec<BlissVal> {
     (|| -> Option<Vec<BlissVal>> {
