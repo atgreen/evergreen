@@ -1666,6 +1666,67 @@ fn variadic_numeric_comparisons() {
     }
 }
 
+/// Regression (bliss-sdd): a DEFUN or DEFMETHOD written inside a user binding
+/// form closes over that lexical environment (CLHS 3.1.2.1.3), e.g. cl-ppcre's
+/// `(let ((reg-scanner …)) (defmethod build-replacement-template …))`. bliss
+/// previously ran the body with no captured environment, so the free lexical was
+/// unbound. The capture must fire ONLY for genuine nesting, not for a top-level
+/// (or nested-LOAD top-level) definition — otherwise every library function would
+/// wrongly run against the load frame.
+#[test]
+fn defun_and_defmethod_close_over_enclosing_lexicals() {
+    let dir = std::env::temp_dir().join("bliss_test_sdd");
+    let _ = std::fs::create_dir_all(&dir);
+    let file_path = dir.join("sdd.lisp");
+    std::fs::write(
+        &file_path,
+        // Separate top-level forms so each is evaluated at the load top level.
+        "(let ((x 42)) (defun f () x))\n\
+         (format t \"~&F=~s~%\" (f))\n\
+         (let ((c 0)) (defun inc () (incf c)) (defun cur () c))\n\
+         (inc) (inc)\n\
+         (format t \"~&CUR=~s~%\" (cur))\n\
+         (let ((y 10)) (defmethod gm ((n integer)) (+ n y)))\n\
+         (format t \"~&GM=~s~%\" (gm 5))\n\
+         (defun top () 7)\n\
+         (format t \"~&TOP=~s~%\" (top))\n",
+    )
+    .expect("write sdd test file");
+    let out = bliss_bin()
+        .args(["--load", file_path.to_str().unwrap()])
+        .output()
+        .expect("run bliss");
+    let _ = std::fs::remove_file(&file_path);
+    let _ = std::fs::remove_dir(&dir);
+    assert_eq!(out.status.code(), Some(0), "sdd load should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_uppercase();
+    assert!(stdout.contains("F=42"), "defun closes over x, got: {stdout}");
+    assert!(stdout.contains("CUR=2"), "two defuns share captured mutable c, got: {stdout}");
+    assert!(stdout.contains("GM=15"), "defmethod closes over y, got: {stdout}");
+    assert!(stdout.contains("TOP=7"), "a top-level defun still works (no spurious capture), got: {stdout}");
+}
+
+/// Regression (bliss-sdd follow-ons found via cl-ppcre regex-replace): WRITE-STRING
+/// / WRITE-LINE must honor the `:start`/`:end` bounding keywords (cl-ppcre stitches
+/// replacement output with them; ignoring them emitted the whole string each time),
+/// and ARRAY-DIMENSION (singular, axis 0) returns a vector's length.
+#[test]
+fn write_string_bounds_and_array_dimension() {
+    let cases = [
+        ("(with-output-to-string (s) (write-string \"hello world\" s :start 2 :end 5))", "\"llo\""),
+        ("(with-output-to-string (s) (write-string \"abcdef\" s :start 3))", "\"def\""),
+        ("(with-output-to-string (s) (write-string \"abcdef\" s))", "\"abcdef\""),
+        ("(array-dimension (vector 1 2 3 4) 0)", "4"),
+        ("(array-dimension (make-array 5 :initial-element 0) 0)", "5"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--no-init", "--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expected), "{expr} => expected {expected}, got: {stdout}");
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.

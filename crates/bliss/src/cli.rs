@@ -1221,6 +1221,24 @@ thread_local! {
     /// macros stay lexical in `Env::macros` and shadow these.
     static GLOBAL_MACROS: RefCell<HashMap<String, MacroDef>> = RefCell::new(HashMap::new());
 
+    /// Identity (pointer address) of the lexical frame current at the start of
+    /// each top-level form under evaluation, one entry per active load/eval
+    /// nesting level. A DEFUN closes over its enclosing lexicals only when its
+    /// frame is NOT this base — i.e. it is genuinely nested inside a user binding
+    /// form (LET/FLET/lambda body/…), not merely at the top level of a (possibly
+    /// nested) LOAD, whose frame carries incidental lexical copies (bliss-sdd).
+    static TOPLEVEL_FRAME_BASE: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+
+    /// Captured lexical environment for a DEFMETHOD written inside a user binding
+    /// form (e.g. cl-ppcre's `(let ((reg-scanner …)) (defmethod
+    /// build-replacement-template …))`). Keyed by the method's `method_id` bits.
+    /// A method with an entry runs its body against this frame instead of the
+    /// caller's. MethodDef itself must stay `Send` (the macro-capture path freezes
+    /// it), so the non-`Send` frame lives here, not in the struct. The frames are
+    /// traced as GC roots by `scan_evaluator_global_roots` (bliss-sdd).
+    static METHOD_CAPTURED_ENV: RefCell<HashMap<u64, Rc<RefCell<EnvFrame>>>> =
+        RefCell::new(HashMap::new());
+
     /// Global `(defun (setf place) …)` writer functions, keyed by the canonical
     /// `"(SETF PLACE)"` string. Like top-level DEFMACRO (above), a top-level
     /// `(setf place)` defun is a *global* definition and must survive the
@@ -1247,6 +1265,12 @@ thread_local! {
     /// registered handle and resolved symbol so unchanged macros are reused.
     static MACRO_FN_CACHE: RefCell<HashMap<String, MacroFnCacheEntry>> =
         RefCell::new(HashMap::new());
+}
+
+/// Address-identity of an `EnvFrame`, for comparing whether the current frame is
+/// the top-level base or a genuinely nested binding frame (bliss-sdd).
+fn frame_addr(frame: &Rc<RefCell<EnvFrame>>) -> usize {
+    Rc::as_ptr(frame) as usize
 }
 
 #[derive(Clone, Copy)]
@@ -2499,7 +2523,11 @@ fn invoke_method(
     args: &[BlissVal],
     next: Option<NextMethod>,
 ) -> Result<BlissVal, BlissError> {
-    let parent = Rc::clone(&env.frame);
+    // A method defined inside a user binding form runs its body against that
+    // captured lexical environment, not the caller's frame (bliss-sdd).
+    let parent = METHOD_CAPTURED_ENV
+        .with(|m| m.borrow().get(&method.method_id.0).cloned())
+        .unwrap_or_else(|| Rc::clone(&env.frame));
     if let Some(mut next) = next {
         bliss_rt::rooted_ref!(_next_root = &mut next);
         return with_child_frame(env, parent, |env| {
@@ -3276,6 +3304,14 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
     });
 
     let mut state = EnvRootVisitState::default();
+    // Lexical frames captured by DEFMETHODs defined inside binding forms
+    // (bliss-sdd) are roots: the moving collector must rewrite the BlissVals they
+    // hold (e.g. cl-ppcre's REG-SCANNER) so the method body reads live pointers.
+    METHOD_CAPTURED_ENV.with(|m| {
+        for frame in m.borrow().values() {
+            visit_env_frame_roots(frame, &mut state, visit);
+        }
+    });
     GLOBAL_MACROS.with(|macros| {
         for definition in macros.borrow_mut().values_mut() {
             visit_macro_def_roots(definition, &mut state, visit);
@@ -4992,7 +5028,16 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
             break;
         }
         let t1 = timeit.then(std::time::Instant::now);
-        last = bytecode::eval_toplevel(val, env)?;
+        // Mark the frame current at this top-level form so a DEFUN nested inside
+        // a user binding form (but not one merely at top level of this load) is
+        // recognised and closes over its lexicals (bliss-sdd). Pop before
+        // propagating so an error unwinds the base stack cleanly.
+        TOPLEVEL_FRAME_BASE.with(|s| s.borrow_mut().push(frame_addr(&env.frame)));
+        let eval_result = bytecode::eval_toplevel(val, env);
+        TOPLEVEL_FRAME_BASE.with(|s| {
+            s.borrow_mut().pop();
+        });
+        last = eval_result?;
         if let Some(t1) = t1 {
             eval_ns += t1.elapsed().as_nanos();
         }
@@ -9247,6 +9292,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let len = bliss_stdlib::length(v)? as i64;
                 return Ok(vec_to_list(&[BlissVal::from_fixnum(len)]));
             }
+            "ARRAY-DIMENSION" => {
+                // (array-dimension array axis-number). bliss arrays are 1-D, so
+                // axis 0 is the length and any other axis is out of range.
+                let (af, r) = cp(cdr);
+                bliss_rt::rooted!(av = eval_form(af, env)?);
+                let axis = eval_form(cp(r).0, env)?;
+                let axis = axis.as_fixnum();
+                if axis != 0 {
+                    return Err(BlissError::Internal(format!(
+                        "ARRAY-DIMENSION: axis {axis} out of range for a rank-1 array"
+                    )));
+                }
+                let len = bliss_stdlib::length(*av)? as i64;
+                return Ok(BlissVal::from_fixnum(len));
+            }
             "APPEND" => {
                 // Root the accumulated elements AND the source-form spine across
                 // the arg-eval loop (bliss-6b2 #2): a later argument's evaluation
@@ -11366,22 +11426,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "WRITE-STRING requires an argument".into(),
                     ));
                 }
-                let s = val_as_str(args[0]);
+                let full = val_as_str(args[0]);
                 // A second positional argument is the stream designator, unless
                 // it is a keyword (the start of &key start/end options).
-                let stream = if args.len() > 1 && !is_keyword_arg(args[1]) {
-                    args[1]
+                let (stream, kv_from) = if args.len() > 1 && !is_keyword_arg(args[1]) {
+                    (args[1], 2)
                 } else {
-                    NIL
+                    (NIL, 1)
                 };
+                // Honor &key start/end: write only the substring (cl-ppcre's
+                // regex-replace stitches output with `(write-string s :start :end)`
+                // and produced garbage when these were ignored).
+                let chars: Vec<char> = full.chars().collect();
+                let (kstart, kend) = read_start_end_keys(&args[kv_from..], chars.len());
+                let s: String = chars[kstart..kend].iter().collect();
                 let out = resolve_output_stream(stream, env);
                 check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     // Dispatch to the Gray stream-write-string generic (start 0,
-                    // end nil → whole string).
+                    // end nil → whole string), passing the already-bounded slice.
                     invoke_generic_function(
                         "STREAM-WRITE-STRING",
-                        &[out, args[0], BlissVal::from_fixnum(0), NIL],
+                        &[out, arena_str(&s), BlissVal::from_fixnum(0), NIL],
                         env,
                     )?;
                     return Ok(args[0]);
@@ -11398,18 +11464,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "WRITE-LINE requires an argument".into(),
                     ));
                 }
-                let s = val_as_str(args[0]);
-                let stream = if args.len() > 1 && !is_keyword_arg(args[1]) {
-                    args[1]
+                let full = val_as_str(args[0]);
+                let (stream, kv_from) = if args.len() > 1 && !is_keyword_arg(args[1]) {
+                    (args[1], 2)
                 } else {
-                    NIL
+                    (NIL, 1)
                 };
+                let chars: Vec<char> = full.chars().collect();
+                let (kstart, kend) = read_start_end_keys(&args[kv_from..], chars.len());
+                let s: String = chars[kstart..kend].iter().collect();
                 let out = resolve_output_stream(stream, env);
                 check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     invoke_generic_function(
                         "STREAM-WRITE-STRING",
-                        &[out, args[0], BlissVal::from_fixnum(0), NIL],
+                        &[out, arena_str(&s), BlissVal::from_fixnum(0), NIL],
                         env,
                     )?;
                     invoke_generic_function("STREAM-TERPRI", &[out], env)?;
@@ -15384,6 +15453,33 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::symbols::set_symbol_function(idx, f);
             }
         }
+        // A DEFUN evaluated inside an enclosing lexical scope closes over it
+        // (CLHS 3.1.2.1.3): `(let ((x 42)) (defun f () x))` makes a global F that
+        // returns 42. Record the definition-time frame so F's interpreted body
+        // reaches those lexicals through the same CLOSURE_ENV channel a reified
+        // closure uses (see apply_function). Only when there IS an enclosing
+        // scope — a top-level DEFUN keeps no capture (and clears a stale one from
+        // an earlier in-LET definition), so it is never pinned out of tiering
+        // (bliss-sdd).
+        // Capture the enclosing lexicals only for a DEFUN genuinely nested inside
+        // a user binding form: its frame differs from the top-level base recorded
+        // for the current form. A DEFUN at the top level of a (possibly nested)
+        // LOAD runs with the base frame itself and must NOT capture it — that
+        // frame carries incidental lexical copies (*package* etc.) and belongs to
+        // the load loop, so closing over it would wrongly run every library
+        // function against the load environment (bliss-sdd).
+        let nested_in_binding = TOPLEVEL_FRAME_BASE.with(|s| {
+            s.borrow()
+                .last()
+                .is_some_and(|&base| base != frame_addr(&env.frame))
+        });
+        if nested_in_binding {
+            bytecode::register_closure_env(idx, Rc::clone(&env.frame));
+        } else {
+            // Top-level (re)definition: drop any stale capture from an earlier
+            // in-scope definition of the same name.
+            bytecode::clear_closure_env(idx);
+        }
     } else {
         // Non-symbol names, e.g. `(setf foo)`: store GLOBALLY under the canonical
         // "(SETF FOO)" key so SETF finds the writer function from any Env — in
@@ -17868,6 +17964,20 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
             qualifier,
             body,
         });
+    // A method defined inside a user binding form closes over it (like a DEFUN —
+    // bliss-sdd), e.g. cl-ppcre's build-replacement-template over the lexical
+    // REG-SCANNER. Detect nesting exactly as eval_defun (frame differs from the
+    // current top-level base) and record the frame keyed by this method's id.
+    let nested_in_binding = TOPLEVEL_FRAME_BASE.with(|s| {
+        s.borrow()
+            .last()
+            .is_some_and(|&base| base != frame_addr(&env.frame))
+    });
+    if nested_in_binding {
+        METHOD_CAPTURED_ENV.with(|m| m.borrow_mut().insert(method_id.0, Rc::clone(&env.frame)));
+    } else {
+        METHOD_CAPTURED_ENV.with(|m| m.borrow_mut().remove(&method_id.0));
+    }
     Ok(name_form)
 }
 

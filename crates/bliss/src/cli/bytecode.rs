@@ -8315,6 +8315,13 @@ pub(super) fn register_closure_env(sym_idx: u32, frame: Rc<RefCell<EnvFrame>>) {
     CLOSURE_ENV.with(|m| m.borrow_mut().insert(sym_idx, frame));
 }
 
+/// Drop any captured heap frame recorded for `sym_idx`. Used when a global
+/// function is (re)defined at top level, so a stale lexical capture from an
+/// earlier definition inside a `let` does not linger (bliss-sdd).
+pub(super) fn clear_closure_env(sym_idx: u32) {
+    CLOSURE_ENV.with(|m| m.borrow_mut().remove(&sym_idx));
+}
+
 /// Materialize a callable value for a nested-lambda `MakeClosure`. Each
 /// evaluation yields a distinct function identity: a fresh uninterned symbol
 /// whose bytecode body is registered, wrapped in an interpreted-function object.
