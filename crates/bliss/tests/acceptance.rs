@@ -1460,6 +1460,43 @@ fn cl_ppcre_enabling_regressions() {
     }
 }
 
+/// Regression (bliss-w5t): SUBSEQ / REVERSE / COPY-SEQ / CONCATENATE accept
+/// COMPLEX_ARRAY (fill-pointer / adjustable) vectors as input — previously they
+/// bailed with "not of type sequence" because collect_elements only handled
+/// simple vectors. A general fill-pointer vector yields a vector result; a
+/// character-typed fill-pointer vector (a fill-pointer STRING) yields a string.
+#[test]
+fn complex_vector_sequence_ops() {
+    let cases = [
+        // General (non-character) adjustable fill-pointer vector.
+        (
+            "(let ((v (make-array 0 :adjustable t :fill-pointer 0)))\
+               (dolist (x '(10 20 30)) (vector-push-extend x v))\
+               (list (subseq v 1) (reverse v) (copy-seq v) (concatenate 'list v '(99))))",
+            "(#(20 30) #(30 20 10) #(10 20 30) (10 20 30 99))",
+        ),
+        // Character-typed fill-pointer vector: results are STRINGS.
+        (
+            "(let ((s (make-array 0 :element-type 'character :adjustable t :fill-pointer 0)))\
+               (dolist (c '(#\\a #\\b #\\c)) (vector-push-extend c s))\
+               (list (subseq s 1) (reverse s) (copy-seq s) (concatenate 'string s \"XY\")))",
+            "(\"bc\" \"cba\" \"abc\" \"abcXY\")",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(expected),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}
+
 /// Regression (bliss-5ir, bliss-omw): further gaps found making cl-ppcre's
 /// matcher run correctly.
 ///  - `#'foo` / a closure is FUNCTIONP, TYPEP FUNCTION, and TYPE-OF FUNCTION, and

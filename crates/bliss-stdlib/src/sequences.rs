@@ -101,6 +101,15 @@ fn string_content(v: BlissVal) -> Option<String> {
     if let Some(s) = crate::pathnames::registered_string(v) {
         return Some(s);
     }
+    // A character-typed COMPLEX_ARRAY is a (fill-pointer / adjustable) STRING and
+    // is a string sequence: materialise its active characters so SUBSEQ/REVERSE/
+    // COPY-SEQ return a STRING (not a vector) for it, matching STRINGP (bliss-w5t).
+    // Callers that must distinguish a fill-pointer vector from a string by shape
+    // (LENGTH, ELT) test is_complex_vector BEFORE reaching here, so this does not
+    // change their behaviour.
+    if let Some(s) = cvec_char_contents(v) {
+        return Some(s);
+    }
     v.is_string().then(|| v.as_string())
 }
 
@@ -136,6 +145,21 @@ fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
         for i in 0..len {
             let val = unsafe { *(ptr.add(16 + i * 8) as *const BlissVal) };
             elems.push(val);
+        }
+        return Ok(elems);
+    }
+    if is_complex_vector(sequence) {
+        // A fill-pointer / adjustable vector's active elements are the prefix
+        // (0..fill-pointer) of its backing storage — the same view LENGTH and ELT
+        // present. This is what lets SUBSEQ/REVERSE/CONCATENATE/COPY-SEQ accept
+        // them (bliss-w5t); a char-typed complex vector (a fill-pointer STRING)
+        // stores CHARACTER values here, so collecting the storage prefix is
+        // correct for both general and character complex vectors.
+        let storage = cvec_storage(sequence);
+        let len = cvec_fill_pointer(sequence);
+        let mut elems = Vec::with_capacity(len);
+        for i in 0..len {
+            elems.push(vector_elt(storage, i));
         }
         return Ok(elems);
     }
@@ -919,6 +943,12 @@ pub fn copy_seq(sequence: BlissVal) -> Result<BlissVal, BlissError> {
             .map(|&c| c.as_char())
             .collect();
         return Ok(crate::streams::make_lisp_string_fresh(&s));
+    }
+    // A general (non-character) fill-pointer / adjustable vector — char-typed ones
+    // are handled by the is_char_seq branch above (bliss-w5t).
+    if is_complex_vector(sequence) {
+        let elems = collect_elements(sequence)?;
+        return Ok(build_vector(&elems));
     }
     Err(BlissError::TypeError {
         datum: sequence,
