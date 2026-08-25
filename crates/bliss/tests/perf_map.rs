@@ -48,6 +48,10 @@ fn perf_map_lists_promoted_functions_in_perf_format() {
     let out = Command::new(BIN)
         .args(["--eval", WARM])
         .env("BLISS_T1_THRESHOLD", "2")
+        // Asserts the straight-line SQ is mapped too; pin eager so it compiles at
+        // definition rather than deferring under the lazy default (SUMSQ contains
+        // a loop and is eager-compiled by the hybrid policy regardless).
+        .env("BLISS_LAZY_COMPILE", "0")
         .env("BLISS_PERF_MAP", &map_path)
         .output()
         .expect("spawn");

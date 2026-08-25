@@ -8435,18 +8435,20 @@ fn make_bytecode_closure(
 pub(super) fn lazy_compile_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    // Opt-in for now (BLISS_LAZY_COMPILE=1). Deferred compilation removes the
-    // definition-time cost that makes the bytecode backend load asdf slower than
-    // the tree-walker, but flipping the DEFAULT changes compiler-macro expansion
-    // timing (a cold function is not compiled, so its compiler-macros are not
-    // applied) — which compile-file/.bfasl relies on. Making it default is
-    // tracked in x5y.24 (compile-file must force eager for AOT).
+    // DEFAULT ON (bliss-x5y.24). Deferred compilation removes the definition-time
+    // cost that made the bytecode backend load asdf slower than the tree-walker,
+    // while hot functions and loop-containing defuns still tier (the hybrid policy
+    // in eval_toplevel eager-compiles bodies that contain a loop). The two former
+    // blockers to defaulting on are resolved: compile-file already force-compiles
+    // via build_bbu_from_forms, and the tree-walker now applies compiler macros on
+    // global calls (commit d3e1bea) so lazy-vs-eager no longer changes results.
+    // Set BLISS_LAZY_COMPILE=0 (or off/eager/false) to restore eager compilation.
     *ON.get_or_init(|| match std::env::var("BLISS_LAZY_COMPILE") {
         Ok(v) => !matches!(
             v.to_ascii_lowercase().as_str(),
-            "0" | "no" | "off" | "eager" | "false" | ""
+            "0" | "no" | "off" | "eager" | "false"
         ),
-        Err(_) => false,
+        Err(_) => true,
     })
 }
 

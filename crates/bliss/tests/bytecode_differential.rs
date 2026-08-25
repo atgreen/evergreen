@@ -376,6 +376,9 @@ fn captured_variadic_parameters_compile_to_bytecode() {
         .arg(program)
         .env("BLISS_BACKEND", "bytecode")
         .env("BLISS_BYTECODE_TRACE_NAMES", "1")
+        // Assert definition-time compile coverage: pin eager so these functions
+        // compile at definition rather than deferring under the lazy default.
+        .env("BLISS_LAZY_COMPILE", "0")
         .output()
         .expect("spawn");
     assert!(

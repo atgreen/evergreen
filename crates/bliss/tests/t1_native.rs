@@ -108,6 +108,9 @@ fn t1_promotes_non_leaf_functions() {
                           (format t \"~a~%\" (bliss-ext:function-tier (quote c)))",
         ])
         .env("BLISS_T1_THRESHOLD", "2")
+        // Observes tier promotion after a 3-call warm-up; pin eager so `c`
+        // compiles at definition rather than deferring under the lazy default.
+        .env("BLISS_LAZY_COMPILE", "0")
         .output()
         .expect("spawn");
     assert_eq!(

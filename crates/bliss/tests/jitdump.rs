@@ -29,6 +29,9 @@ fn jitdump_writes_header_and_code_load_record() {
     let out = Command::new(BIN)
         .args(["--eval", WARM])
         .env("BLISS_T0_T1_THRESHOLD", "2")
+        // Needs native code to emit a jitdump record; pin eager so `sq` compiles
+        // at definition rather than deferring under the lazy default.
+        .env("BLISS_LAZY_COMPILE", "0")
         .env("BLISS_PERF_JITDUMP", &dump_path)
         .output()
         .expect("spawn");

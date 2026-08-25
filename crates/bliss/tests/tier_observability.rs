@@ -30,9 +30,19 @@ fn run(program: &str, envs: &[(&str, &str)]) -> (String, bool) {
         "BLISS_COMPILE_QUEUE_SIZE",
         "BLISS_DEOPT_BLACKLIST_THRESHOLD",
         "BLISS_PROFILING_DISABLED",
+        "BLISS_LAZY_COMPILE",
     ] {
         cmd.env_remove(name);
     }
+    // These tests observe the tier LADDER given a compiled function, with small
+    // per-test tier thresholds and short warm-up loops. Since BLISS_LAZY_COMPILE
+    // is now the shipping default, a straight-line function would not compile
+    // until the (separate, higher) lazy invoke threshold — well past these tests'
+    // warm-up — so pin eager compilation here. The ladder mechanics are identical
+    // however the function first compiled; lazy-trigger behaviour is covered by
+    // the stage-5 gate and the lazy_compile_preserves_results acceptance test. A
+    // test may still opt into lazy by passing BLISS_LAZY_COMPILE in `envs`.
+    cmd.env("BLISS_LAZY_COMPILE", "0");
     for (k, v) in envs {
         cmd.env(k, v);
     }
