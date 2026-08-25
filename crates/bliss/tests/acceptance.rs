@@ -1918,12 +1918,14 @@ fn let_declared_special_and_slot_value_setf() {
     }
 }
 
-/// Regression (bliss-x5y): opt-in lazy compilation (BLISS_LAZY_COMPILE) defers a
-/// DEFUN's bytecode compile from definition time to the first call that crosses
-/// the invoke threshold — cold functions never compile (removing the load-time
-/// penalty that made the bytecode backend slower than the tree-walker on
-/// asdf.lisp). Results must be identical to eager compilation, and a hot,
-/// repeatedly-called function must still compile and give the right answer.
+/// Regression (bliss-x5y): lazy compilation (BLISS_LAZY_COMPILE, now the default
+/// — bliss-x5y.24) defers a DEFUN's bytecode compile from definition time to the
+/// first call that crosses the invoke threshold — cold functions never compile
+/// (removing the load-time penalty that made the bytecode backend slower than the
+/// tree-walker on asdf.lisp). Results must be identical to eager compilation, and
+/// a hot, repeatedly-called function must still compile and give the right answer.
+/// This test pins the mode/threshold explicitly so it stays meaningful regardless
+/// of the default.
 #[test]
 fn lazy_compile_preserves_results() {
     let cases = [
