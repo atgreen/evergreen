@@ -1562,6 +1562,64 @@ fn defpackage_shadow_interns_distinct_symbol() {
     assert!(stdout.contains("VALUE=42"), "self-referential defconstant macro must terminate, got: {stdout}");
 }
 
+/// Regression (bliss-255): the tree-walker's FUNCALL and TAGBODY arms held a
+/// `BlissVal` across an allocation that can fire a relocating minor GC, without
+/// rooting it — the classic invariant-#1 violation (AGENTS.md "GC safety"):
+///   - FUNCALL: the callee `fn_val` sat unrooted across `eval_args` (which
+///     allocates), so a moved young closure went stale → "Cannot apply: Cons(..)".
+///   - TAGBODY: the `items` statement `Vec<BlissVal>` was unrooted across the
+///     per-statement `eval_form`, so a moved statement form read back as a zeroed
+///     cons (car => Fixnum(0)) → "undefined function:".
+/// Both surfaced deep in cl-ppcre's tagbody-heavy, `(funcall next-fn ..)` CPS
+/// scanner closures. `BLISS_GC_STRESS` fires a minor GC on (almost) every
+/// allocation, turning the load-dependent corruption into a deterministic one;
+/// the callee/statements must be freshly allocated (young) at the vulnerable
+/// point, and TAGBODY needs a moderate stride so its fresh form is not promoted
+/// out of the nursery before the collection. Each program computes a known total
+/// that only comes out right if nothing went stale.
+#[test]
+fn gc_roots_funcall_callee_and_tagbody_statements() {
+    // FUNCALL: `g` is a fresh young closure; the `(list i i)` argument allocates
+    // (firing the GC) while `g` is the in-flight callee. eval forces the
+    // tree-walker path. Sum of (i+i+i) for i in 0..59 = 3*1770 = 5310.
+    let funcall_prog = "(let ((s 0)) \
+         (dotimes (i 60) \
+           (let ((g (let ((k i)) (lambda (p) (+ k (car p) (cadr p)))))) \
+             (setf s (+ s (eval '(funcall g (list i i))))))) \
+         (format t \"~s\" s))";
+    // TAGBODY: a freshly-consed tagbody form each iteration; a statement allocates
+    // mid-body. zz = (cons 0 (list 1 2 3 4 5)) => length 6, over 200 iters = 1200.
+    let tagbody_prog = "(defvar zz nil) \
+       (let ((s 0)) \
+         (dotimes (i 200) \
+           (let ((form (list 'tagbody \
+                             (list 'setq 'zz (list 'list 1 2 3 4 5)) \
+                             (list 'go 'done) 'done \
+                             (list 'setq 'zz (list 'cons 0 'zz))))) \
+             (eval form) \
+             (setf s (+ s (length zz))))) \
+         (format t \"~s\" s))";
+    for (prog, stride, expected) in [(funcall_prog, "1", "5310"), (tagbody_prog, "17", "1200")] {
+        let out = bliss_bin()
+            .env("BLISS_GC_STRESS", stride)
+            .args(["--no-init", "--eval", prog])
+            .output()
+            .expect("run bliss");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "GC-stress program should exit 0, not crash (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(expected),
+            "expected {expected} under BLISS_GC_STRESS={stride}, got: {stdout} (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.

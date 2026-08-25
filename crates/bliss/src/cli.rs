@@ -7123,7 +7123,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (tagbody {tag | statement}*)
                 // Tags are symbols or integers; statements are forms evaluated in
                 // order. GO transfers control to a tag; TAGBODY returns NIL.
-                let items = list_to_vec(cdr);
+                let mut items = list_to_vec(cdr);
+                // Root the statement vector in place: it holds BlissVals across the
+                // `eval_form(item)` below, which can fire a relocating minor GC. An
+                // unrooted Vec is invisible to the collector, so a moved statement
+                // form would be read back stale — a zeroed cons whose car is
+                // Fixnum(0), surfacing as "undefined function:" deep in cl-ppcre's
+                // tagbody-heavy scanner closures (bliss-255).
+                bliss_rt::rooted_ref!(_items_root = &mut items);
                 let token = next_control_token("__GO__");
                 // Record tag name -> statement index (index just after the tag).
                 let mut tag_index: HashMap<String, usize> = HashMap::new();
@@ -9013,10 +9020,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return eval_form(form, env);
             }
             "FUNCALL" => {
+                // Root the callee across argument evaluation: eval_args allocates
+                // and can fire a relocating minor GC, leaving an unrooted `fn_val`
+                // pointing at the moved (now stale/zeroed) closure — "Cannot apply:
+                // Cons(..)" deep in cl-ppcre's `(funcall next-fn ..)` CPS matchers.
+                // This is the twin of the already-rooted APPLY arm below (bliss-255
+                // / bliss-6b2 #2).
                 let (fn_form, args_form) = cp(cdr);
-                let fn_val = eval_form(fn_form, env)?;
+                bliss_rt::rooted!(fn_val = eval_form(fn_form, env)?);
                 let args = eval_args(args_form, env)?;
-                return apply_function(fn_val, &args, env);
+                return apply_function(*fn_val, &args, env);
             }
             "APPLY" => {
                 // Root the function value, the source spine, and the accumulated
