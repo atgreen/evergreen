@@ -8250,18 +8250,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if eq { T } else { NIL });
             }
             "=" => {
-                let (af, r) = cp(cdr);
-                // Root the second arg FORM before evaluating the first: a young
-                // arg list relocates under the first eval's GC, dangling a bare
-                // `bf` (bliss-6b2 #2).
-                bliss_rt::rooted!(bf = cp(r).0);
-                bliss_rt::rooted!(a = eval_form(af, env)?);
-                let b = eval_form(*bf, env)?;
-                return Ok(if numeric_cmp(*a, b)? == Ordering::Equal {
-                    T
-                } else {
-                    NIL
-                });
+                return eval_cmp(cdr, env, |o| o == Ordering::Equal);
             }
             "<" => {
                 return eval_cmp(cdr, env, |o| o == Ordering::Less);
@@ -8276,18 +8265,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return eval_cmp(cdr, env, |o| o != Ordering::Less);
             }
             "/=" => {
-                let (af, r) = cp(cdr);
-                // Root the second arg FORM before evaluating the first: a young
-                // arg list relocates under the first eval's GC, dangling a bare
-                // `bf` (bliss-6b2 #2).
-                bliss_rt::rooted!(bf = cp(r).0);
-                bliss_rt::rooted!(a = eval_form(af, env)?);
-                let b = eval_form(*bf, env)?;
-                return Ok(if numeric_cmp(*a, b)? != Ordering::Equal {
-                    T
-                } else {
-                    NIL
-                });
+                return eval_not_equal(cdr, env);
             }
             "AND" => {
                 // Root the source-form cursor across the sub-evaluations: a young
@@ -14883,17 +14861,60 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     }
 }
 
+/// The monotonic numeric comparators `< > <= >= =` are VARIADIC in CL: `(op x1
+/// x2 … xn)` is true iff every adjacent pair satisfies `op` (so all-equal for
+/// `=`, strictly/weakly ordered for the others). One argument is always true
+/// (after a numeric type-check); zero arguments is a program error. Previously
+/// these compared only the first two arguments (`(< 1 2 1)` => T, `(= 2 2 1)` =>
+/// T), which broke cl-ppcre's `(= minimum maximum 1)` repetition dispatch.
 fn eval_cmp(
     args: BlissVal,
     env: &mut Env,
     pred: fn(Ordering) -> bool,
 ) -> Result<BlissVal, BlissError> {
-    let (af, r) = cp(args);
-    // Root the second arg form before evaluating the first (bliss-6b2 #2).
-    bliss_rt::rooted!(bf = cp(r).0);
-    bliss_rt::rooted!(a = eval_form(af, env)?);
-    bliss_rt::rooted!(b = eval_form(*bf, env)?);
-    Ok(if pred(numeric_cmp(*a, *b)?) { T } else { NIL })
+    let vals = eval_args(args, env)?;
+    let v: &[BlissVal] = &vals;
+    if v.is_empty() {
+        return Err(BlissError::Internal(
+            "numeric comparison requires at least one argument".into(),
+        ));
+    }
+    if v.len() == 1 {
+        // Single argument: true, but must still be a number (CL type rules).
+        numeric_cmp(v[0], v[0])?;
+        return Ok(T);
+    }
+    for i in 0..v.len() - 1 {
+        if !pred(numeric_cmp(v[i], v[i + 1])?) {
+            return Ok(NIL);
+        }
+    }
+    Ok(T)
+}
+
+/// `(/= x1 … xn)` is true iff the arguments are PAIRWISE distinct — every pair,
+/// not just adjacent ones (`(/= 1 2 1)` is false). O(n²), which is fine for the
+/// small arities this ever sees.
+fn eval_not_equal(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    let vals = eval_args(args, env)?;
+    let v: &[BlissVal] = &vals;
+    if v.is_empty() {
+        return Err(BlissError::Internal(
+            "/= requires at least one argument".into(),
+        ));
+    }
+    if v.len() == 1 {
+        numeric_cmp(v[0], v[0])?;
+        return Ok(T);
+    }
+    for i in 0..v.len() {
+        for j in i + 1..v.len() {
+            if numeric_cmp(v[i], v[j])? == Ordering::Equal {
+                return Ok(NIL);
+            }
+        }
+    }
+    Ok(T)
 }
 
 /// Evaluate each form in `forms`, keeping the results GC-rooted across the whole

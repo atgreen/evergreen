@@ -1620,6 +1620,52 @@ fn gc_roots_funcall_callee_and_tagbody_statements() {
     }
 }
 
+/// Regression (bliss-7bi): the numeric comparators `< > <= >= = /=` are variadic
+/// in CL — `(op x1 … xn)` holds iff every adjacent pair satisfies `op` (and `/=`
+/// iff all pairs are distinct); one argument is always true. They previously
+/// compared only the first two arguments, so `(= 2 2 1)` and `(< 1 2 1)` wrongly
+/// returned T and `(< 5)` errored. cl-ppcre's REPETITION dispatch does
+/// `(= minimum maximum 1)`; with the bug, `b{2}` (min=max=2) matched
+/// `(= 2 2 1)` => T and signalled "Got REPETITION with MAXIMUM 1 and MINIMUM 1",
+/// so all bounded repetitions `{n}`/`{n,m}`/`{n,}` were unusable.
+#[test]
+fn variadic_numeric_comparisons() {
+    let cases = [
+        // = : all-equal
+        ("(= 2 2 2)", "T"),
+        ("(= 2 2 1)", "NIL"),
+        ("(= 2 2.0 2)", "T"),
+        // < / > : strictly monotonic across every adjacent pair
+        ("(< 1 2 3)", "T"),
+        ("(< 1 2 2)", "NIL"),
+        ("(< 1 2 1)", "NIL"),
+        ("(> 3 2 1)", "T"),
+        ("(> 3 2 3)", "NIL"),
+        // <= / >= : weakly monotonic
+        ("(<= 1 2 2 3)", "T"),
+        ("(>= 3 3 2 2)", "T"),
+        ("(<= 1 3 2)", "NIL"),
+        // /= : pairwise distinct (not just adjacent)
+        ("(/= 1 2 3)", "T"),
+        ("(/= 1 2 1)", "NIL"),
+        // single argument is always true (after a numeric type check)
+        ("(< 5)", "T"),
+        ("(= 5)", "T"),
+        ("(/= 5)", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Match the exact printed token so "NIL" does not satisfy a "T" expectation.
+        let got = stdout.trim().to_uppercase();
+        assert!(
+            got.split_whitespace().any(|t| t == expected),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.
