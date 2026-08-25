@@ -1884,6 +1884,40 @@ fn escaping_closure_sees_symbol_macrolet() {
     }
 }
 
+/// Regression (bliss-x5y): a LET/LET* binding declared `(declare (special v))`
+/// for a non-earmuffed name must bind v DYNAMICALLY so a nested function's
+/// dynamic reference sees it (cl-ppcre's `convert` binds FLAGS specially and
+/// calls CONVERT-AUX which reads it). The bytecode compiler bound it lexically —
+/// a silent miscompile (unbound in the callee). It now bails such a LET to the
+/// tree-walker, which handles it. Also covers `(setf (slot-value obj slot) val)`
+/// compiling for ordinary (non-declared-special) functions.
+#[test]
+fn let_declared_special_and_slot_value_setf() {
+    let cases = [
+        // Special LET binding seen by a nested function's dynamic reference.
+        ("(progn (defun helper () (declare (special v)) v) \
+            (defun caller () (let ((v 42)) (declare (special v)) (helper))) \
+            (format t \"~s\" (caller)))", "42"),
+        // LET* form (init of a later binding calls the reader), like cl-ppcre convert.
+        ("(progn (defun helper () (declare (special v)) v) \
+            (defun caller () (let* ((v 7) (w (helper))) (declare (special v)) w)) \
+            (format t \"~s\" (caller)))", "7"),
+        // (setf (slot-value ...)) in a compiled defun and method.
+        ("(progn (defclass k () ((s :initform 0))) \
+            (defun f (o v) (setf (slot-value o 's) v) (slot-value o 's)) \
+            (format t \"~s\" (f (make-instance 'k) 42)))", "42"),
+        ("(progn (defclass k () ((s :initform 0))) (defgeneric g (o v)) \
+            (defmethod g ((o k) v) (setf (slot-value o 's) (* v 2)) (slot-value o 's)) \
+            (format t \"~s\" (g (make-instance 'k) 21)))", "42"),
+    ];
+    for (prog, expected) in cases {
+        let out = bliss_bin().args(["--no-init", "--eval", prog]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{prog} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expected), "expected {expected}, got: {stdout}");
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.

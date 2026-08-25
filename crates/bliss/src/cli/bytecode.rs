@@ -1394,6 +1394,22 @@ impl<'e> Lowerer<'e> {
         bliss_rt::rooted_ref!(_body_root = &mut body);
         bliss_rt::rooted!(binding_forms = list_to_vec(bindings));
 
+        // The compiler can't yet dynamically bind a non-earmuffed `(declare
+        // (special v))` let variable (it would bind it lexically, breaking a
+        // nested function's dynamic read). Bail such a let to the tree-walker,
+        // which handles it correctly, rather than silently miscompiling it
+        // (bliss-x5y — surfaced by cl-ppcre's convert binding FLAGS specially).
+        let declared_special = body_declared_special(body);
+        if !declared_special.is_empty()
+            && binding_forms.iter().any(|b| {
+                binding_name_init(*b)
+                    .map(|(n, _)| !is_special_name(&n) && declared_special.contains(&n))
+                    .unwrap_or(false)
+            })
+        {
+            return Err(record_bail(|| "let:declared-special".to_string()));
+        }
+
         // A binding captured by a lambda introduced *within* this let body — in
         // particular one produced by a macro / compiler-macro expansion, e.g.
         // alexandria's CURRY, which the enclosing function's up-front capture
@@ -1851,6 +1867,17 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
+            } else if let Some((mut inst, mut slot)) = slot_value_setf_place(place) {
+                bliss_rt::rooted_ref!(_inst_root = &mut inst);
+                bliss_rt::rooted_ref!(_slot_root = &mut slot);
+                let sym = resolve_sym("BLISS::SET-SLOT-VALUE").ok_or(Bail)?.as_symbol_index();
+                self.lower_expr(inst)?;
+                self.lower_expr(slot)?;
+                self.lower_expr(items[2 * i + 1])?;
+                self.emit(Instr::CallNamed { sym, nargs: 3 });
+                self.pop_n(3);
+                self.push_n(1);
+                if !last { self.emit(Instr::Pop); self.pop_n(1); }
             } else {
                 return Err(Bail);
             }
@@ -4429,6 +4456,13 @@ fn aref_setf_place(place: BlissVal) -> Option<(BlissVal, BlissVal)> {
     }
 }
 
+fn slot_value_setf_place(place: BlissVal) -> Option<(BlissVal, BlissVal)> {
+    if !place.is_cons() { return None; }
+    let items = list_to_vec(place);
+    if items.len() != 3 || !items[0].is_symbol() { return None; }
+    if symbol_bare_name(&sym_name(items[0])) == "SLOT-VALUE" { Some((items[1], items[2])) } else { None }
+}
+
 /// Recognize a `(cXr X)` SETF place — any `c[ad]+r` accessor plus `first`/`rest`
 /// — returning the internal store primitive (`BLISS::SET-CAR`/`SET-CDR`) and the
 /// target cons subform. For a composed accessor the outermost a/d selects the
@@ -5307,6 +5341,46 @@ fn primitive_declared_type(type_form: BlissVal) -> Option<DeclaredType> {
 /// `(fixnum x)` are accepted. Unknown declaration/type specifiers remain
 /// runtime no-ops for now and therefore contribute `Any`, never an unsound
 /// compiler assumption.
+/// Collect the bare names declared `(declare (special …))` in a body's leading
+/// declarations. The bytecode compiler does not yet bind/reference a
+/// non-earmuffed special variable dynamically — it would bind it lexically, so a
+/// nested function's dynamic reference reads unbound (e.g. cl-ppcre's `convert`
+/// dynamically binds FLAGS and calls CONVERT-AUX which reads it). `lower_let`
+/// uses this to BAIL such a let to the tree-walker, which handles it, instead of
+/// silently miscompiling it (bliss-x5y).
+fn body_declared_special(body: BlissVal) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut forms = list_to_vec(body).into_iter();
+    let mut next = forms.next();
+    if next.is_some_and(BlissVal::is_string) {
+        next = forms.next();
+    }
+    while let Some(form) = next {
+        if !form.is_cons() {
+            break;
+        }
+        let (op, declarations) = cp(form);
+        if !op.is_symbol() || symbol_bare_name(&sym_name(op)) != "DECLARE" {
+            break;
+        }
+        for declaration in list_to_vec(declarations) {
+            if !declaration.is_cons() {
+                continue;
+            }
+            let (head, vars) = cp(declaration);
+            if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "SPECIAL" {
+                for v in list_to_vec(vars) {
+                    if v.is_symbol() {
+                        out.insert(sym_name(v));
+                    }
+                }
+            }
+        }
+        next = forms.next();
+    }
+    out
+}
+
 fn declared_parameter_types(body: BlissVal, params: &[String]) -> Option<Vec<DeclaredType>> {
     let mut result = vec![DeclaredType::Any; params.len()];
     let mut forms = list_to_vec(body).into_iter();

@@ -9625,6 +9625,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::symbols::set_symbol_function(sym.as_symbol_index(), fnval);
                 return Ok(val);
             }
+            "BLISS::SET-SLOT-VALUE" => {
+                let args = eval_args(cdr, env)?;
+                let instance = args.first().copied().unwrap_or(NIL);
+                let slot = args.get(1).copied().unwrap_or(NIL);
+                let val = args.get(2).copied().unwrap_or(NIL);
+                write_slot_value(instance, slot, val, env)?;
+                return Ok(val);
+            }
             "BLISS::SET-CAR" | "BLISS::SET-CDR" => {
                 // Store primitives for bytecode-lowered `(setf (car|cdr place)
                 // value)`. Arguments arrive already evaluated (cons, value)
