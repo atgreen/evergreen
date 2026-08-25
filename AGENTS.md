@@ -41,6 +41,24 @@ For Claude Code, `.claude/settings.json`:
 just run it manually at the start of a session. The script's stdout is the
 orientation banner and is safe to run anytime.
 
+## The `/grind` skill
+
+`.agents/skills/grind/SKILL.md` (checked in) is the project's autonomous work
+loop: survey the Beads queue, pick the highest-value next task (correctness +
+progress toward the HotSpot-like tiered-JIT goal, without rat-holing), reprioritize
+the queue, and execute it end-to-end with the GC-safety and validation discipline
+below. Codex and other agents that read `.agents/skills/` pick it up directly.
+
+Claude Code discovers skills from `.claude/skills/`, which is **gitignored**, so
+each checkout wires it locally once (like the orientation hook above):
+
+```bash
+ln -sfn ../../.agents/skills/grind .claude/skills/grind   # from the repo root
+```
+
+Then invoke it with `/grind`. Editing `.agents/skills/grind/SKILL.md` updates the
+skill for everyone (the symlink points at the tracked file).
+
 ## Architecture Principles
 
 - **The interpreter MUST NOT duplicate functionality that belongs in the
