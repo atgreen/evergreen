@@ -449,6 +449,38 @@ pub fn vector_push_extend(
     Ok(BlissVal::from_fixnum(fp as i64))
 }
 
+/// CL `ADJUST-ARRAY` for a rank-1 complex (fill-pointer / adjustable) vector:
+/// ensure the backing storage holds at least `new_size` elements (existing ones
+/// preserved, new slots set to `initial_element`), and set the fill pointer to
+/// `fill_pointer` (defaulting to `new_size`). Adjusts IN PLACE and returns `v`
+/// (cl-ppcre's optimize.lisp/convert.lisp grow adjustable char arrays this way,
+/// discarding the result — so in-place is required) (bliss-omw).
+pub fn adjust_complex_vector(
+    v: BlissVal,
+    new_size: usize,
+    fill_pointer: Option<usize>,
+    initial_element: BlissVal,
+) -> Result<BlissVal, BlissError> {
+    if !is_complex_vector(v) {
+        return Err(BlissError::TypeError {
+            datum: v,
+            expected: "adjustable vector".to_string(),
+        });
+    }
+    let cap = cvec_capacity(v);
+    if new_size > cap {
+        let mut store: Vec<BlissVal> = Vec::with_capacity(new_size);
+        for i in 0..cap {
+            store.push(vector_elt(cvec_storage(v), i));
+        }
+        store.resize(new_size, initial_element);
+        cvec_set_storage(v, build_vector(&store));
+    }
+    let fp = fill_pointer.unwrap_or(new_size).min(new_size);
+    cvec_set_fill_pointer_raw(v, fp);
+    Ok(v)
+}
+
 /// CL `VECTOR-POP`: decrement the fill pointer and return the element there.
 pub fn vector_pop(v: BlissVal) -> Result<BlissVal, BlissError> {
     if !is_complex_vector(v) {

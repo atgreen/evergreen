@@ -1460,6 +1460,65 @@ fn cl_ppcre_enabling_regressions() {
     }
 }
 
+/// Regression (bliss-5ir, bliss-omw): further gaps found making cl-ppcre's
+/// matcher run correctly.
+///  - `#'foo` / a closure is FUNCTIONP, TYPEP FUNCTION, and TYPE-OF FUNCTION, and
+///    a `(function)` method specializer dispatches on it.
+///  - PSETF assigns in parallel (a later place sees the earlier place's OLD
+///    value) — cl-ppcre's parser splices sequence elements with
+///    `(psetf last-cdr cons (cdr last-cdr) cons)`.
+///  - Variadic char comparisons `(char<= lo c hi)`.
+///  - ADJUST-ARRAY grows an adjustable char vector in place.
+#[test]
+fn cl_ppcre_matcher_regressions() {
+    let cases = [
+        // Function-ness of #' (for a user function) and closures. (Builtins like
+        // #'car have no reified cell yet — a separate, out-of-scope gap.)
+        ("(progn (defun ftest (x) x) (functionp #'ftest))", "T"),
+        ("(progn (defun ftest2 (x) x) (type-of #'ftest2))", "FUNCTION"),
+        ("(typep (lambda (x) x) 'function)", "T"),
+        ("(type-of (lambda (x) x))", "FUNCTION"),
+        // A (function) method specializer must dispatch on a closure.
+        (
+            "(progn (defgeneric gg (x)) (defmethod gg ((f function)) :got-fn) \
+               (defmethod gg ((x integer)) :got-int) \
+               (list (gg (lambda () 1)) (gg 5)))",
+            "(:GOT-FN :GOT-INT)",
+        ),
+        // PSETF parallel semantics: swap, and the cl-ppcre splice pattern.
+        ("(let ((x 1) (y 2)) (psetf x y y x) (list x y))", "(2 1)"),
+        (
+            "(let* ((a (list 1)) (lc a) (c (list 99))) \
+               (psetf lc c (cdr lc) c) a)",
+            "(1 99)",
+        ),
+        // Variadic char comparisons (range test).
+        ("(char<= #\\0 #\\5 #\\9)", "T"),
+        ("(char<= #\\0 #\\a #\\9)", "NIL"),
+        ("(char= #\\a #\\a #\\a)", "T"),
+        // ADJUST-ARRAY grows an adjustable string in place.
+        (
+            "(let ((s (make-array 1 :element-type 'character :fill-pointer t :adjustable t))) \
+               (setf (char s 0) #\\a) (adjust-array s 3 :fill-pointer 3) \
+               (setf (char s 1) #\\b) (setf (char s 2) #\\c) (coerce s 'simple-string))",
+            "\"abc\"",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.to_uppercase().contains(&expected.to_uppercase()),
+            "{expr} => expected {expected}, got: {stdout} (stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.

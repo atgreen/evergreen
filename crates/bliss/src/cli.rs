@@ -2413,12 +2413,18 @@ fn builtin_type_specializer_distance(name: &str, arg: BlissVal) -> Option<usize>
         "NULL" => arg.is_nil().then_some(1),
         "KEYWORD" => is_keyword_arg(arg).then_some(1),
         "SYMBOL" => arg.is_symbol().then_some(2),
-        "CONS" => arg.is_cons().then_some(1),
-        "LIST" => arg.is_list().then_some(2),
+        // A function value (real function object or an interpreter closure, which
+        // is represented as a `(BLISS::CLOSURE . id)` cons) dispatches to the
+        // FUNCTION class — and must NOT match CONS/LIST, else cl-ppcre's
+        // `(create-scanner (scanner function))` method was skipped and a scanner
+        // closure fell through to the `(parse-tree t)` method (bliss-5ir).
+        "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(arg).then_some(1),
+        "CONS" => (arg.is_cons() && !is_function_value(arg)).then_some(1),
+        "LIST" => (arg.is_list() && !is_function_value(arg)).then_some(2),
         // PATHNAME is a distinct built-in type (not a CLOS instance); ASDF's
         // source-registry dispatches methods on it (bliss-lb6.14).
         "PATHNAME" => bliss_stdlib::is_pathname(arg).then_some(1),
-        "ATOM" => (!arg.is_cons()).then_some(6),
+        "ATOM" => (!arg.is_cons() || is_function_value(arg)).then_some(6),
         "T" => Some(usize::MAX / 4),
         _ => None,
     }
@@ -8629,6 +8635,37 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                     ));
                                 }
                             }
+                            "SUBSEQ" => {
+                                // (setf (subseq seq start [end]) new) — replace the
+                                // elements seq[start..end] with those of NEW, up to
+                                // the shorter length (REPLACE semantics). cl-ppcre's
+                                // string gathering stores into an adjustable string
+                                // this way (bliss-omw).
+                                bliss_rt::rooted!(seq_r = eval_form(tgt_form, env)?);
+                                let (start_form, rest2) = cp(cp(*aargs).1);
+                                let start_v = eval_form(start_form, env)?;
+                                let start = if start_v.is_fixnum() {
+                                    start_v.as_fixnum().max(0) as usize
+                                } else {
+                                    0
+                                };
+                                let end = if rest2.is_cons() {
+                                    let (end_form, _) = cp(rest2);
+                                    let ev = eval_form(end_form, env)?;
+                                    ev.is_fixnum().then(|| ev.as_fixnum().max(0) as usize)
+                                } else {
+                                    None
+                                };
+                                let seq = *seq_r;
+                                let dst_len = bliss_stdlib::length(seq)?;
+                                let src_len = bliss_stdlib::length(*val)?;
+                                let limit = end.unwrap_or(dst_len).min(dst_len);
+                                let n = limit.saturating_sub(start).min(src_len);
+                                for i in 0..n {
+                                    let e = bliss_stdlib::elt(*val, i)?;
+                                    seq_set_elt(seq, start + i, e)?;
+                                }
+                            }
                             "GETHASH" => {
                                 // (setf (gethash key table) val)
                                 // Root the evaluated key across the table-form
@@ -8913,8 +8950,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if let Some(c) = local_fn_closure(env, &fn_name) {
                         return Ok(c);
                     }
+                    // Return the actual heap function object when one is bound, so
+                    // `#'foo` is FUNCTIONP and `(typep #'foo 'function)` is true and
+                    // CLOS dispatches it to the FUNCTION class (bliss-5ir). This
+                    // mirrors SYMBOL-FUNCTION. Generics/macros/builtins without a
+                    // heap cell fall back to the bare symbol designator, which
+                    // funcall/apply still accept.
+                    if let Some(f) = global_fn(&fn_name) {
+                        return Ok(f);
+                    }
                     if fn_bound(env, &fn_name) {
-                        return Ok(name_form); // return the symbol as a function designator
+                        return Ok(name_form); // symbol as a function designator
                     }
                 }
                 // (function (lambda (params) body...)) — create a closure
@@ -9081,6 +9127,31 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     adjustable,
                     element_is_char,
                 ));
+            }
+            "BLISS-INTERNAL::%ADJUST-ARRAY"
+            | "BLISS-INTERNAL:%ADJUST-ARRAY"
+            | "%ADJUST-ARRAY" => {
+                // (%adjust-array complex-vector new-size fill-pointer initial-elt)
+                // — grow a rank-1 fill-pointer/adjustable vector in place and set
+                // its fill pointer. Called by MAKE-ARRAY's ADJUST-ARRAY wrapper.
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal(
+                        "%ADJUST-ARRAY requires an array and a new size".into(),
+                    ));
+                }
+                let arr = args[0];
+                let new_size = if args[1].is_fixnum() {
+                    args[1].as_fixnum().max(0) as usize
+                } else {
+                    0
+                };
+                let fill_pointer = args
+                    .get(2)
+                    .filter(|fp| fp.is_fixnum())
+                    .map(|fp| fp.as_fixnum().max(0) as usize);
+                let iel = args.get(3).copied().unwrap_or(NIL);
+                return bliss_stdlib::adjust_complex_vector(arr, new_size, fill_pointer, iel);
             }
             "VECTOR-PUSH" => {
                 // (vector-push new-element vector) → index used, or NIL if full.
@@ -12113,6 +12184,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     "CHARACTER"
                 } else if v.is_symbol() {
                     "SYMBOL"
+                } else if is_function_value(v) {
+                    // A function value — a real function object or an interpreter
+                    // closure (represented as a `(BLISS::CLOSURE . id)` cons). This
+                    // must precede the `is_cons` check so a closure's TYPE-OF is
+                    // FUNCTION, not CONS, and CLOS dispatch on the FUNCTION class
+                    // recognises it (bliss-5ir; cl-ppcre passes scanners as funcs).
+                    "FUNCTION"
                 } else if v.is_cons() {
                     "CONS"
                 } else if is_string_value(v) {

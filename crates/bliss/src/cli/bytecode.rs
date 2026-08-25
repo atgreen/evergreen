@@ -9876,7 +9876,15 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 env.set_var_symbol(s, v);
             }
             Instr::LoadFunction(sym) => {
-                acts[top_idx].push_op(BlissVal::from_symbol_index(sym));
+                // `#'foo`: push the actual heap function object when `foo` names an
+                // interpreted/compiled function, so it is FUNCTIONP / TYPEP FUNCTION
+                // and CLOS dispatches it to the FUNCTION class (bliss-5ir). Fall
+                // back to the bare symbol designator (builtins/generics/macros with
+                // no reified cell), which funcall/apply still accept.
+                let v = bliss_rt::symbols::symbol_function(sym)
+                    .filter(|c| bliss_rt::function::is_interpreted_function(*c))
+                    .unwrap_or_else(|| BlissVal::from_symbol_index(sym));
+                acts[top_idx].push_op(v);
             }
             Instr::BindSpecial(sym) => {
                 let value = acts[top_idx].pop_op();

@@ -784,12 +784,32 @@
 ;;; Character functions (over CHAR-CODE / CODE-CHAR; ASCII case mapping).
 ;;; ---------------------------------------------------------------------------
 
-(defun char= (a b) (= (char-code a) (char-code b)))
-(defun char/= (a b) (/= (char-code a) (char-code b)))
-(defun char< (a b) (< (char-code a) (char-code b)))
-(defun char> (a b) (> (char-code a) (char-code b)))
-(defun char<= (a b) (<= (char-code a) (char-code b)))
-(defun char>= (a b) (>= (char-code a) (char-code b)))
+;; CHAR= and the ordered char comparisons are variadic in CL: CHAR< etc. test a
+;; monotonic sequence, CHAR= that all args are equal, CHAR/= that all are
+;; pairwise distinct. cl-ppcre's char-class matcher relies on (char<= lo c hi)
+;; range tests (3 args) (bliss-omw).
+(defun char= (c &rest more)
+  (dolist (x more t) (unless (= (char-code c) (char-code x)) (return nil))))
+(defun char/= (&rest cs)
+  (do ((tail cs (cdr tail))) ((null tail) t)
+    (dolist (y (cdr tail))
+      (when (= (char-code (car tail)) (char-code y)) (return-from char/= nil)))))
+(defun char< (c &rest more)
+  (let ((prev (char-code c)))
+    (dolist (x more t)
+      (let ((cur (char-code x))) (unless (< prev cur) (return nil)) (setq prev cur)))))
+(defun char> (c &rest more)
+  (let ((prev (char-code c)))
+    (dolist (x more t)
+      (let ((cur (char-code x))) (unless (> prev cur) (return nil)) (setq prev cur)))))
+(defun char<= (c &rest more)
+  (let ((prev (char-code c)))
+    (dolist (x more t)
+      (let ((cur (char-code x))) (unless (<= prev cur) (return nil)) (setq prev cur)))))
+(defun char>= (c &rest more)
+  (let ((prev (char-code c)))
+    (dolist (x more t)
+      (let ((cur (char-code x))) (unless (>= prev cur) (return nil)) (setq prev cur)))))
 
 (defun upper-case-p (c) (and (>= (char-code c) 65) (<= (char-code c) 90)))
 (defun lower-case-p (c) (and (>= (char-code c) 97) (<= (char-code c) 122)))
@@ -935,6 +955,23 @@
       (t
        (apply (function vector)
               (make-list size :initial-element (if iel-cell (car (cdr iel-cell)) nil)))))))
+
+;; ADJUST-ARRAY array new-dimensions &key fill-pointer initial-element — grow (or
+;; shrink) a rank-1 fill-pointer/adjustable vector in place. cl-ppcre grows its
+;; adjustable char collectors this way (bliss-omw). Only the fill-pointer/
+;; adjustable rank-1 case is supported (delegated to %adjust-array); other cases
+;; are uncommon in the libraries we load.
+(defun adjust-array (array new-dimensions &rest keys)
+  (let* ((size (if (consp new-dimensions) (car new-dimensions) new-dimensions))
+         (fp-cell (member :fill-pointer keys))
+         (iel-cell (member :initial-element keys))
+         (fp (and fp-cell (car (cdr fp-cell))))
+         (iel (if iel-cell (car (cdr iel-cell)) nil))
+         (fpn (cond ((eq fp t) size)
+                    ((integerp fp) fp)
+                    ((array-has-fill-pointer-p array) (fill-pointer array))
+                    (t size))))
+    (%adjust-array array size fpn iel)))
 
 ;; MAKE-SEQUENCE result-type size &key initial-element — a fresh sequence of the
 ;; given type. Dispatches on the type's head: list types build a list, string
@@ -1587,17 +1624,34 @@
 ;;; --- place-mutating and control macros -------------------------------------
 
 ;; PSETF: evaluate all value forms, then assign to all places (parallel).
+;; PSETF assigns to all places in PARALLEL: every value form AND every place's
+;; own subforms are evaluated before any assignment happens. The previous version
+;; evaluated only the values up front and then did `(setf place temp)` in order,
+;; so a later place that referenced an earlier place's variable read the mutated
+;; value — e.g. cl-ppcre's parser `(psetf last-cdr cons (cdr last-cdr) cons)`
+;; spliced into `(cdr cons)` (self-loop) instead of the old last-cdr, dropping a
+;; sequence element (bliss-omw). We capture each accessor place's argument
+;; subforms into fresh temps too, so the assignment targets the original cells.
 (defmacro psetf (&rest pairs)
-  (let ((places nil) (temps nil) (vals nil) (p pairs))
+  (let ((rev-bindings nil) (rev-assigns nil) (p pairs))
     (loop while (consp (cdr p)) do
-      (push (car p) places)
-      (push (gensym) temps)
-      (push (cadr p) vals)
-      (setq p (cddr p)))
-    (setq places (reverse places) temps (reverse temps) vals (reverse vals))
-    `(let ,(mapcar (function list) temps vals)
-       ,@(mapcar (lambda (pl tp) (list 'setf pl tp)) places temps)
-       nil)))
+      (let ((place (car p)) (val (cadr p)) (vtemp (gensym)))
+        (if (consp place)
+            ;; (op arg...) : bind a temp for each argument (evaluated now), then
+            ;; assign through those temps so the place refers to the ORIGINAL
+            ;; locations regardless of other assignments.
+            (let* ((op (car place))
+                   (args (cdr place))
+                   (atemps (mapcar (lambda (a) (declare (ignore a)) (gensym)) args)))
+              (mapc (lambda (tp a) (setq rev-bindings (cons (list tp a) rev-bindings)))
+                    atemps args)
+              (setq rev-bindings (cons (list vtemp val) rev-bindings))
+              (setq rev-assigns (cons (list 'setf (cons op atemps) vtemp) rev-assigns)))
+            (progn
+              (setq rev-bindings (cons (list vtemp val) rev-bindings))
+              (setq rev-assigns (cons (list 'setq place vtemp) rev-assigns))))
+        (setq p (cddr p))))
+    `(let* ,(reverse rev-bindings) ,@(reverse rev-assigns) nil)))
 
 ;; ROTATEF: each place receives the (old) value of the next; last gets first.
 (defmacro rotatef (&rest places)
