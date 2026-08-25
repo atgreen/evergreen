@@ -8435,7 +8435,19 @@ fn make_bytecode_closure(
 pub(super) fn lazy_compile_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BLISS_LAZY_COMPILE").is_some())
+    // Opt-in for now (BLISS_LAZY_COMPILE=1). Deferred compilation removes the
+    // definition-time cost that makes the bytecode backend load asdf slower than
+    // the tree-walker, but flipping the DEFAULT changes compiler-macro expansion
+    // timing (a cold function is not compiled, so its compiler-macros are not
+    // applied) — which compile-file/.bfasl relies on. Making it default is
+    // tracked in x5y.24 (compile-file must force eager for AOT).
+    *ON.get_or_init(|| match std::env::var("BLISS_LAZY_COMPILE") {
+        Ok(v) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "no" | "off" | "eager" | "false" | ""
+        ),
+        Err(_) => false,
+    })
 }
 
 /// Invocations before a lazily-compiled function is compiled. Cold functions

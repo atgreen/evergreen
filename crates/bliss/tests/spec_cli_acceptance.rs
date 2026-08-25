@@ -1173,7 +1173,7 @@ fn stage_five_gate_hot_loop_promotes_through_tiers_and_deopts_with_identical_res
              s))\n\
          (defun f (x) (mod (* x x) 1000000))\n\
          (sumsq 20) (sumsq 20) (sumsq 20) (sumsq 20) (sumsq 20)\n\
-         (f 3) (f 4) (f 5)\n\
+         (dotimes (i 40) (f (+ 3 i)))\n\
          (format t \"RESULT loop ~a~%\" (sumsq 100))\n\
          (format t \"RESULT deopt ~a~%\" (f 3037000500))\n\
          (format t \"TIER ~a~%\" (bliss-ext:function-tier 'sumsq))\n\
