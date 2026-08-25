@@ -1239,6 +1239,28 @@ thread_local! {
     static METHOD_CAPTURED_ENV: RefCell<HashMap<u64, Rc<RefCell<EnvFrame>>>> =
         RefCell::new(HashMap::new());
 
+    /// Compiled (bytecode) body for a DEFMETHOD, keyed by the method's
+    /// `method_id` bits. When present, `invoke_method` dispatches the method
+    /// through `apply_function` on this reified interpreted-function object — so
+    /// the body runs as tiered bytecode/native instead of `eval_progn`
+    /// (bliss-x5y.20). The value is an interpreted-function object (pinned by the
+    /// allocator); it is also visited as a GC root so it stays live.
+    static METHOD_COMPILED: RefCell<HashMap<u64, BlissVal>> = RefCell::new(HashMap::new());
+
+    /// Effective-method dispatch cache (bliss-x5y.20). Standard method
+    /// combination with class-only specializers is a pure function of (generic
+    /// name, argument classes): the applicable-method set, its ordering, and the
+    /// around/before/primary/after split never change unless a method or class
+    /// is (re)defined. Recomputing it per call — cloning the whole method vector,
+    /// computing specificity, sorting, and building the effective method — is the
+    /// dominant cost of a method call and made compiling method bodies pointless.
+    /// Cache the four method-id lists (each id is a `from_meta_handle` immediate,
+    /// so no GC tracing is needed), keyed by (name, arg-class identity bits) and
+    /// stamped with the generation bumped on any DEFMETHOD/DEFGENERIC/DEFCLASS.
+    static GF_DISPATCH_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GF_DISPATCH_CACHE: RefCell<HashMap<(String, Vec<u64>), GfDispatchEntry>> =
+        RefCell::new(HashMap::new());
+
     /// Global `(defun (setf place) …)` writer functions, keyed by the canonical
     /// `"(SETF PLACE)"` string. Like top-level DEFMACRO (above), a top-level
     /// `(setf place)` defun is a *global* definition and must survive the
@@ -2523,6 +2545,13 @@ fn invoke_method(
     args: &[BlissVal],
     next: Option<NextMethod>,
 ) -> Result<BlissVal, BlissError> {
+    // If the body compiled to bytecode (no captured lexicals, no
+    // call-next-method — bliss-x5y.20), dispatch it through apply_function so it
+    // runs as tiered bytecode/native. The compiled body binds its own params and
+    // never consults env.method_context, so `next` is irrelevant here.
+    if let Some(callable) = METHOD_COMPILED.with(|m| m.borrow().get(&method.method_id.0).copied()) {
+        return apply_function(callable, args, env);
+    }
     // A method defined inside a user binding form runs its body against that
     // captured lexical environment, not the caller's frame (bliss-sdd).
     let parent = METHOD_CAPTURED_ENV
@@ -2854,6 +2883,83 @@ fn calltrace_note(name: &str, e: &BlissError) {
     }
 }
 
+/// A cached standard-combination effective method: the applicable methods, split
+/// by role, as `method_id` immediates (bliss-x5y.20).
+struct GfDispatchEntry {
+    generation: u64,
+    around: Vec<BlissVal>,
+    before: Vec<BlissVal>,
+    primary: Vec<BlissVal>,
+    after: Vec<BlissVal>,
+}
+
+/// Invalidate every cached dispatch decision. Cheap (a counter bump); called when
+/// a method or class (re)definition could change applicability or ordering.
+fn invalidate_gf_dispatch_cache() {
+    GF_DISPATCH_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+}
+
+/// True if any method on `name` specializes a parameter with `(eql value)` —
+/// then dispatch depends on argument VALUES, not just classes, so the class-keyed
+/// cache is unsound and must be bypassed.
+fn generic_has_eql_specializer(env: &Env, name: &str) -> bool {
+    env.methods.borrow().get(name).is_some_and(|methods| {
+        methods.iter().any(|m| {
+            m.specializers
+                .iter()
+                .any(|s| matches!(s, MethodSpecializer::Eql(_)))
+        })
+    })
+}
+
+/// The class-identity key for a generic call: the `class_of` identity bits of
+/// each argument. Over-keying on non-dispatched trailing args only lowers the hit
+/// rate, never correctness.
+fn dispatch_class_key(args: &[BlissVal]) -> Vec<u64> {
+    args.iter().map(|a| bliss_stdlib::class_of(*a).0).collect()
+}
+
+/// Look up the `MethodDef`s named by `ids` (in order) from the generic's method
+/// list, cloning only those (not the whole vector). Returns None if any id is
+/// missing (a stale cache entry), so the caller recomputes.
+fn methods_by_ids(env: &Env, name: &str, ids: &[BlissVal]) -> Option<Vec<MethodDef>> {
+    let methods = env.methods.borrow();
+    let list = methods.get(name)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let m = list.iter().find(|m| m.method_id == *id)?;
+        out.push(m.clone());
+    }
+    Some(out)
+}
+
+/// Reconstruct the standard-combination method roles from cached/computed
+/// `method_id` lists and run them. Returns `Ok(None)` if any id is missing (a
+/// stale cache entry), so the caller recomputes from scratch.
+fn run_standard_from_ids(
+    env: &mut Env,
+    around_ids: &[BlissVal],
+    before_ids: &[BlissVal],
+    primary_ids: &[BlissVal],
+    after_ids: &[BlissVal],
+    name: &str,
+    args: &[BlissVal],
+) -> Result<Option<BlissVal>, BlissError> {
+    let (Some(mut around), Some(mut before), Some(mut primary), Some(mut after)) = (
+        methods_by_ids(env, name, around_ids),
+        methods_by_ids(env, name, before_ids),
+        methods_by_ids(env, name, primary_ids),
+        methods_by_ids(env, name, after_ids),
+    ) else {
+        return Ok(None);
+    };
+    bliss_rt::rooted_ref!(_around_root = &mut around);
+    bliss_rt::rooted_ref!(_before_root = &mut before);
+    bliss_rt::rooted_ref!(_primary_root = &mut primary);
+    bliss_rt::rooted_ref!(_after_root = &mut after);
+    invoke_standard_methods(env, &around, &before, &primary, &after, args).map(Some)
+}
+
 fn invoke_generic_function(
     name: &str,
     args: &[BlissVal],
@@ -2875,6 +2981,39 @@ fn invoke_generic_function_inner(
         let receiver_class = bliss_stdlib::class_of(*receiver);
         bytecode::record_generic_receiver_profile(name, receiver_class.0);
     }
+
+    let combination = env
+        .generics
+        .borrow()
+        .get(name)
+        .map(|generic| generic.combination)
+        .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
+    // Class-keyed effective-method cache for the common case (bliss-x5y.20).
+    let cacheable = matches!(combination, bliss_stdlib::MethodCombinationType::Standard)
+        && !generic_has_eql_specializer(env, name);
+    let dispatch_key = if cacheable {
+        Some((name.to_string(), dispatch_class_key(args)))
+    } else {
+        None
+    };
+    if let Some(key) = &dispatch_key {
+        let generation = GF_DISPATCH_GENERATION.with(|g| g.get());
+        let cached = GF_DISPATCH_CACHE.with(|c| {
+            c.borrow().get(key).filter(|e| e.generation == generation).map(|e| {
+                (e.around.clone(), e.before.clone(), e.primary.clone(), e.after.clone())
+            })
+        });
+        if let Some((around, before, primary, after)) = cached {
+            if let Some(result) =
+                run_standard_from_ids(env, &around, &before, &primary, &after, name, args)?
+            {
+                return Ok(result);
+            }
+            // A cached id no longer resolves (method redefined without a
+            // generation bump would be a bug, but tolerate it): recompute below.
+        }
+    }
+
     let mut methods = env.methods.borrow().get(name).cloned().unwrap_or_default();
     if methods.is_empty() {
         return Err(no_applicable_method_error(env, name));
@@ -2902,12 +3041,6 @@ fn invoke_generic_function_inner(
     let mut method_ids: Vec<BlissVal> = ordered.iter().map(|method| method.method_id).collect();
     bliss_rt::rooted_ref!(_method_ids_root = &mut method_ids);
 
-    let combination = env
-        .generics
-        .borrow()
-        .get(name)
-        .map(|generic| generic.combination)
-        .unwrap_or(bliss_stdlib::MethodCombinationType::Standard);
     let effective = bliss_stdlib::compute_effective_method(NIL, combination, &method_ids)?;
     match combination {
         bliss_stdlib::MethodCombinationType::Standard => {
@@ -2918,51 +3051,39 @@ fn invoke_generic_function_inner(
                     "missing standard effective method".into(),
                 ));
             };
-            let around: Vec<MethodDef> = around_ids
-                .into_iter()
-                .filter_map(|id| {
-                    ordered
-                        .iter()
-                        .find(|method| method.method_id == id)
-                        .cloned()
-                })
-                .collect();
-            let before: Vec<MethodDef> = before_ids
-                .into_iter()
-                .filter_map(|id| {
-                    ordered
-                        .iter()
-                        .find(|method| method.method_id == id)
-                        .cloned()
-                })
-                .collect();
-            let primary: Vec<MethodDef> = primary_ids
-                .into_iter()
-                .filter_map(|id| {
-                    ordered
-                        .iter()
-                        .find(|method| method.method_id == id)
-                        .cloned()
-                })
-                .collect();
-            let after: Vec<MethodDef> = after_ids
-                .into_iter()
-                .filter_map(|id| {
-                    ordered
-                        .iter()
-                        .find(|method| method.method_id == id)
-                        .cloned()
-                })
-                .collect();
-            let mut around = around;
-            let mut before = before;
-            let mut primary = primary;
-            let mut after = after;
-            bliss_rt::rooted_ref!(_around_root = &mut around);
-            bliss_rt::rooted_ref!(_before_root = &mut before);
-            bliss_rt::rooted_ref!(_primary_root = &mut primary);
-            bliss_rt::rooted_ref!(_after_root = &mut after);
-            invoke_standard_methods(env, &around, &before, &primary, &after, args)
+            // Cache this (name, arg-classes) → effective-method decision for the
+            // next call with the same classes (bliss-x5y.20). Only reached on a
+            // cacheable generic (see `dispatch_key`).
+            if let Some(key) = dispatch_key {
+                let generation = GF_DISPATCH_GENERATION.with(|g| g.get());
+                GF_DISPATCH_CACHE.with(|c| {
+                    c.borrow_mut().insert(
+                        key,
+                        GfDispatchEntry {
+                            generation,
+                            around: around_ids.clone(),
+                            before: before_ids.clone(),
+                            primary: primary_ids.clone(),
+                            after: after_ids.clone(),
+                        },
+                    );
+                });
+            }
+            match run_standard_from_ids(
+                env,
+                &around_ids,
+                &before_ids,
+                &primary_ids,
+                &after_ids,
+                name,
+                args,
+            )? {
+                Some(result) => Ok(result),
+                // The ids came from `ordered` just now, so they must resolve.
+                None => Err(BlissError::Internal(
+                    "effective method vanished during dispatch".into(),
+                )),
+            }
         }
         other => {
             let Some((short_combination, method_ids)) =
@@ -3310,6 +3431,12 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
     METHOD_CAPTURED_ENV.with(|m| {
         for frame in m.borrow().values() {
             visit_env_frame_roots(frame, &mut state, visit);
+        }
+    });
+    // Keep each method's compiled body object live (bliss-x5y.20).
+    METHOD_COMPILED.with(|m| {
+        for callable in m.borrow_mut().values_mut() {
+            visit(callable);
         }
     });
     GLOBAL_MACROS.with(|macros| {
@@ -17267,6 +17394,9 @@ fn eval_symbol_macrolet(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissE
 
 // ── DEFCLASS ─────────────────────────────────────────────────────
 fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    // A new/redefined class can change class-of results and precedence, so every
+    // cached dispatch decision may be stale (bliss-x5y.20).
+    invalidate_gf_dispatch_cache();
     let (mut name_form, rest) = cp(cdr);
     let (supers_form, rest2) = cp(rest);
     let (slots_form, class_options) = cp(rest2);
@@ -17584,6 +17714,7 @@ fn define_condition_portable(
 /// options (e.g. `:conc-name`, `:constructor`) are accepted but ignored; the
 /// standard default names are used.
 fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    invalidate_gf_dispatch_cache(); // new struct class (bliss-x5y.20)
     let (name_spec, slots_form) = cp(cdr);
     let name_sym = if name_spec.is_cons() {
         cp(name_spec).0
@@ -17799,6 +17930,7 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
 
 // ── DEFGENERIC ───────────────────────────────────────────────────
 fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
+    invalidate_gf_dispatch_cache(); // generic (re)definition (bliss-x5y.20)
     let (mut name_form, options) = cp(cdr);
     bliss_rt::rooted_ref!(_name_form_root = &mut name_form);
     let name = function_name_key(name_form);
@@ -17978,7 +18110,69 @@ fn eval_defmethod(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     } else {
         METHOD_CAPTURED_ENV.with(|m| m.borrow_mut().remove(&method_id.0));
     }
+    // A new/redefined method changes applicability and ordering (bliss-x5y.20).
+    invalidate_gf_dispatch_cache();
+
+    // Tier the method: compile its body to bytecode so invoke_method dispatches
+    // it through the native tier ladder instead of eval_progn (bliss-x5y.20).
+    // Restrict to the tractable, high-value case — a method with no captured
+    // lexical environment (the compiler can't resolve free captured vars) and no
+    // CALL-NEXT-METHOD/NEXT-METHOD-P (which need env.method_context, unknown to
+    // the bytecode compiler). Everything else keeps tree-walking. A redefinition
+    // drops any stale compiled body first.
+    METHOD_COMPILED.with(|m| m.borrow_mut().remove(&method_id.0));
+    if std::env::var_os("BLISS_NO_METHOD_COMPILE").is_none()
+        && !nested_in_binding
+        && !body_uses_next_method(body)
+        && !lambda_list_has_key(*lambda_list)
+    {
+        if let Some(callable) =
+            bytecode::compile_and_reify_lambda("METHOD", *lambda_list, body, env)
+        {
+            METHOD_COMPILED.with(|m| m.borrow_mut().insert(method_id.0, callable));
+        }
+    }
     Ok(name_form)
+}
+
+/// True if a method lambda list contains `&key`. A method's keyword parameters
+/// are bound with implicit `&allow-other-keys` (CLHS 7.6.5: a generic call
+/// accepts the union of all applicable methods' keywords), which the standalone
+/// compiled function's strict keyword binding does not provide — so such methods
+/// keep tree-walking through `bind_method_params` (bliss-x5y.20).
+fn lambda_list_has_key(lambda_list: BlissVal) -> bool {
+    let mut cur = lambda_list;
+    while cur.is_cons() {
+        let (item, rest) = cp(cur);
+        if item.is_symbol() && symbol_bare_name(&sym_name(item)) == "&KEY" {
+            return true;
+        }
+        cur = rest;
+    }
+    false
+}
+
+/// True if a method body references CALL-NEXT-METHOD or NEXT-METHOD-P anywhere
+/// (as an operator or otherwise). Such a body needs env.method_context, which the
+/// bytecode compiler does not model, so it must keep tree-walking (bliss-x5y.20).
+fn body_uses_next_method(body: BlissVal) -> bool {
+    fn walk(v: BlissVal, depth: u32) -> bool {
+        if depth > 512 {
+            // Give up (treat as "uses") on pathologically deep forms rather than
+            // overflow — err toward tree-walking.
+            return true;
+        }
+        if v.is_symbol() {
+            let n = symbol_bare_name(&sym_name(v));
+            return n == "CALL-NEXT-METHOD" || n == "NEXT-METHOD-P";
+        }
+        if v.is_cons() {
+            let (car, cdr) = cp(v);
+            return walk(car, depth + 1) || walk(cdr, depth + 1);
+        }
+        false
+    }
+    walk(body, 0)
 }
 
 /// Install a `defclass` slot `:reader`/`:writer`/`:accessor` as a *real* generic

@@ -1727,6 +1727,75 @@ fn write_string_bounds_and_array_dimension() {
     }
 }
 
+/// Regression (bliss-x5y.20): compiling method bodies and caching the effective
+/// method by argument class must not change CLOS semantics. Exercises repeated
+/// calls (cache warm), cross-class dispatch under one generic (distinct cache
+/// keys), eql specializers (must bypass the class-keyed cache), subclass
+/// precedence + call-next-method, before/after auxiliary methods, and cache
+/// invalidation on class definition.
+#[test]
+fn method_dispatch_cache_preserves_clos_semantics() {
+    let cases = [
+        // Repeated calls (warm cache) return the same result.
+        (
+            "(progn (defgeneric g (x)) (defmethod g ((n integer)) (* n 2)) \
+               (format t \"~s\" (list (g 1) (g 2) (g 3))))",
+            "(2 4 6)",
+        ),
+        // Two classes under one generic: each class must keep its own decision.
+        (
+            "(progn (defgeneric h (x)) (defmethod h ((n integer)) :int) \
+               (defmethod h ((s string)) :str) \
+               (format t \"~s\" (list (h 5) (h \"a\") (h 6) (h \"b\"))))",
+            "(:INT :STR :INT :STR)",
+        ),
+        // Eql specializer: dispatch depends on VALUE, so the class cache must be
+        // bypassed — (e 5) and (e 6) differ though both are integers.
+        (
+            "(progn (defgeneric e (x)) (defmethod e ((x (eql 5))) :five) \
+               (defmethod e ((n integer)) :int) \
+               (format t \"~s\" (list (e 5) (e 6) (e 5) (e 7))))",
+            "(:FIVE :INT :FIVE :INT)",
+        ),
+        // Subclass precedence + call-next-method (never compiled/cached-away).
+        (
+            "(progn (defclass a () ()) (defclass b (a) ()) (defgeneric w (x)) \
+               (defmethod w ((o a)) (list :a)) \
+               (defmethod w ((o b)) (cons :b (call-next-method))) \
+               (format t \"~s\" (w (make-instance 'b))))",
+            "(:B :A)",
+        ),
+        // Before/after auxiliary methods run around the primary.
+        (
+            "(progn (defvar *l* nil) (defgeneric m (x)) \
+               (defmethod m ((n integer)) (push :prim *l*) n) \
+               (defmethod m :before ((n integer)) (push :before *l*)) \
+               (defmethod m :after ((n integer)) (push :after *l*)) \
+               (m 1) (m 2) (format t \"~s\" (reverse *l*)))",
+            "(:BEFORE :PRIM :AFTER :BEFORE :PRIM :AFTER)",
+        ),
+        // Defining a new subclass after warming the cache must invalidate it:
+        // a `c` (subclass of b) now dispatches to w's b-method, not a's.
+        (
+            "(progn (defclass a () ()) (defclass b (a) ()) (defgeneric w (x)) \
+               (defmethod w ((o a)) :a) (defmethod w ((o b)) :b) \
+               (w (make-instance 'a)) \
+               (defclass c (b) ()) \
+               (format t \"~s\" (w (make-instance 'c))))",
+            ":B",
+        ),
+    ];
+    for (prog, expected) in cases {
+        let out = bliss_bin().args(["--no-init", "--eval", prog]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{prog} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.to_uppercase().contains(&expected.to_uppercase()),
+            "expected {expected}, got: {stdout}"
+        );
+    }
+}
+
 /// Regression: DOTIMES/DOLIST establish an implicit `block nil`, so `(return x)`
 /// in the body exits the loop with x. Previously this errored "no block named
 /// NIL", breaking the ubiquitous (dolist (x l) (when … (return …))) pattern.

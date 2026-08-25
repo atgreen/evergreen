@@ -8348,6 +8348,33 @@ fn make_bytecode_closure(
     bliss_rt::function::alloc_interpreted(lambda_list, NIL, NIL, sym)
 }
 
+/// Compile a standalone lambda (`lambda_list` + `body`) to bytecode and reify it
+/// as a callable interpreted-function object under a fresh uninterned symbol, so
+/// `apply_function` dispatches it through the ordinary tiering ladder (T0
+/// bytecode → T1/T2 native). Returns `None` if the compiler bails, in which case
+/// the caller keeps tree-walking the body. Used to tier DEFMETHOD bodies
+/// (bliss-x5y.20): a method whose body compiles runs as native frames instead of
+/// `eval_progn`. The interpreted `body` is kept in the object as the fallback the
+/// dispatch path uses if the bytecode is ever invalidated.
+pub(super) fn compile_and_reify_lambda(
+    label: &str,
+    lambda_list: BlissVal,
+    body: BlissVal,
+    env: &super::Env,
+) -> Option<BlissVal> {
+    reset_last_bail_reason();
+    let bf = compile_function(label, lambda_list, body, env, false, false)?;
+    let sym = bliss_rt::symbols::make_uninterned(label);
+    let sym_idx = sym.as_symbol_index();
+    registry_put(sym_idx, Rc::new(bf));
+    Some(bliss_rt::function::alloc_interpreted(
+        lambda_list,
+        body,
+        NIL,
+        sym,
+    ))
+}
+
 fn bbu_direct_symbol_for_package(
     encoded: &[BbuConstant],
     values: &[BlissVal],
