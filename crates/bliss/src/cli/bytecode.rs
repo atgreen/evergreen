@@ -648,6 +648,12 @@ struct Lowerer<'e> {
     /// Names captured by a nested closure — these locals live in the shared
     /// heap `EnvFrame` (boxed) instead of a frame slot.
     captured_names: std::collections::HashSet<String>,
+    /// Names currently declared SPECIAL by an enclosing `(declare (special v))`
+    /// (dynamic extent), as a nesting count. A reference to such a name reads the
+    /// dynamic value (global cell) even if an outer lexical binding of the same
+    /// name has a slot, and a LET binding of it is established with
+    /// BindSpecial/UnbindSpecial (bliss-x5y.23).
+    declared_special: std::collections::HashMap<String, u32>,
     /// Lexically-visible local functions (flet/labels): name → the gensym symbol
     /// index its compiled body is registered under. A call to such a name lowers
     /// to a bytecode `CallNamed` on that gensym.
@@ -742,6 +748,7 @@ impl<'e> Lowerer<'e> {
             constants: Vec::new(),
             scopes: vec![HashMap::new()],
             captured_names: std::collections::HashSet::new(),
+            declared_special: std::collections::HashMap::new(),
             local_fns: std::collections::HashMap::new(),
             closure_fns: std::collections::HashSet::new(),
             macro_env: None,
@@ -858,6 +865,24 @@ impl<'e> Lowerer<'e> {
         self.next_local = saved_next_local;
     }
 
+    /// Enter/leave a dynamic `(declare (special …))` scope, tracked as per-name
+    /// nesting counts so references in the extent read dynamically (bliss-x5y.23).
+    fn push_declared_special(&mut self, names: &std::collections::HashSet<String>) {
+        for n in names {
+            *self.declared_special.entry(n.clone()).or_insert(0) += 1;
+        }
+    }
+    fn pop_declared_special(&mut self, names: &std::collections::HashSet<String>) {
+        for n in names {
+            if let Some(c) = self.declared_special.get_mut(n) {
+                *c -= 1;
+                if *c == 0 {
+                    self.declared_special.remove(n);
+                }
+            }
+        }
+    }
+
     // ── Expression lowering ────────────────────────────────────────
 
     /// Lower a form so its single value is left on the operand stack.
@@ -913,7 +938,7 @@ impl<'e> Lowerer<'e> {
             // that env compiles its `*special*` reads as LoadEnvVar of the stale
             // captured value instead of the live dynamic value (broke slynk's
             // `*emacs-connection*`). Symbol-macros still expand.
-            if is_special_name(&name) {
+            if is_special_name(&name) || self.declared_special.contains_key(&name) {
                 if self
                     .env
                     .symbol_macros
@@ -1394,21 +1419,14 @@ impl<'e> Lowerer<'e> {
         bliss_rt::rooted_ref!(_body_root = &mut body);
         bliss_rt::rooted!(binding_forms = list_to_vec(bindings));
 
-        // The compiler can't yet dynamically bind a non-earmuffed `(declare
-        // (special v))` let variable (it would bind it lexically, breaking a
-        // nested function's dynamic read). Bail such a let to the tree-walker,
-        // which handles it correctly, rather than silently miscompiling it
-        // (bliss-x5y — surfaced by cl-ppcre's convert binding FLAGS specially).
-        let declared_special = body_declared_special(body);
-        if !declared_special.is_empty()
-            && binding_forms.iter().any(|b| {
-                binding_name_init(*b)
-                    .map(|(n, _)| !is_special_name(&n) && declared_special.contains(&n))
-                    .unwrap_or(false)
-            })
-        {
-            return Err(record_bail(|| "let:declared-special".to_string()));
-        }
+        // Names this LET's body declares special via `(declare (special v))`. A
+        // binding of such a name is dynamic (BindSpecial), and references to it in
+        // the body read the dynamic value — even without the earmuff convention
+        // (bliss-x5y.23; e.g. cl-ppcre's convert binds FLAGS/REG-NUM/… specially).
+        // `is_here_special` combines this with the earmuff test.
+        let decl_special = body_declared_special(body);
+        let is_here_special =
+            |name: &str| is_special_name(name) || decl_special.contains(name);
 
         // A binding captured by a lambda introduced *within* this let body — in
         // particular one produced by a macro / compiler-macro expansion, e.g.
@@ -1426,7 +1444,7 @@ impl<'e> Lowerer<'e> {
             .iter()
             .filter(|binding| {
                 binding_name_init(**binding)
-                    .map(|(name, _)| is_special_name(&name))
+                    .map(|(name, _)| is_here_special(&name))
                     .unwrap_or(false)
             })
             .count() as u16;
@@ -1435,7 +1453,7 @@ impl<'e> Lowerer<'e> {
         // each entry captures a distinct binding.
         let has_boxed = binding_forms.iter().any(|b| {
             binding_name_init(*b)
-                .map(|(n, _)| !is_special_name(&n) && self.captured_names.contains(&n))
+                .map(|(n, _)| !is_here_special(&n) && self.captured_names.contains(&n))
                 .unwrap_or(false)
         });
         if has_boxed {
@@ -1458,7 +1476,7 @@ impl<'e> Lowerer<'e> {
             for bi in 0..binding_forms.len() {
                 let (name, init) = binding_name_init(binding_forms[bi])?;
                 self.lower_expr(init)?;
-                if is_special_name(&name) {
+                if is_here_special(&name) {
                     let symbol = resolve_sym(&name).ok_or(Bail)?.as_symbol_index();
                     self.emit(Instr::BindSpecial(symbol));
                 } else {
@@ -1480,7 +1498,7 @@ impl<'e> Lowerer<'e> {
             for name in &names {
                 locs.push((
                     name.clone(),
-                    (!is_special_name(name)).then(|| self.alloc_local(name)),
+                    (!is_here_special(name)).then(|| self.alloc_local(name)),
                 ));
             }
             // Values are on the stack in binding order; store in reverse.
@@ -1494,6 +1512,11 @@ impl<'e> Lowerer<'e> {
                 self.pop_n(1);
             }
         }
+
+        // The `(declare (special …))` names are dynamic for the extent of the
+        // body: a reference to one reads the dynamic value even if an outer
+        // lexical binding shadows it (bliss-x5y.23). Scope this around the body.
+        self.push_declared_special(&decl_special);
 
         // Body as an implicit progn.
         bliss_rt::rooted!(body_forms = list_to_vec(body));
@@ -1511,6 +1534,7 @@ impl<'e> Lowerer<'e> {
                 }
             }
         }
+        self.pop_declared_special(&decl_special);
         self.exit_scope(saved_next_local);
         if special_count != 0 {
             self.emit(Instr::UnbindSpecial(special_count));

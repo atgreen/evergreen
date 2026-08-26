@@ -1497,6 +1497,60 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-x5y.23): the bytecode compiler binds a LOCAL
+/// `(declare (special v))` LET variable dynamically (BindSpecial) and reads it
+/// dynamically in the body, instead of bailing to the tree-walker. Verified on
+/// the default (bytecode) backend; results match interpretation.
+#[test]
+fn compiler_local_declare_special_binds_dynamically() {
+    let cases: [(&[&str], &str, &str); 4] = [
+        // A LET-bound declared-special var is visible (dynamically) to a callee.
+        (
+            &["(defun ds-helper () ds-v)",
+              "(defun ds-caller () (let ((ds-v 42)) (declare (special ds-v)) (ds-helper)))",
+              "(defparameter ds-v 1)"],
+            "(ds-caller)",
+            "42",
+        ),
+        // The body reads/updates the dynamic binding directly.
+        (
+            &["(defun ds-f (x) (let ((ds-acc 0)) (declare (special ds-acc)) \
+                 (setq ds-acc (+ ds-acc x)) ds-acc))"],
+            "(ds-f 5)",
+            "5",
+        ),
+        // A declared-special inner LET shadows an outer LEXICAL binding: the
+        // callee sees the dynamic (inner) value, not the outer lexical.
+        (
+            &["(defun ds-rd () ds-x)",
+              "(defun ds-g () (let ((ds-x 1)) (let ((ds-x 99)) (declare (special ds-x)) (ds-rd))))",
+              "(defparameter ds-x 7)"],
+            "(ds-g)",
+            "99",
+        ),
+        // A special declaration is pervasive: an inner LET rebinding of the same
+        // name is also dynamic, and the body reads that inner dynamic value.
+        (
+            &["(defun ds-nested () (let ((ds-z 1)) (declare (special ds-z)) \
+                 (let ((ds-z 2)) (+ ds-z ds-z))))"],
+            "(ds-nested)",
+            "4",
+        ),
+    ];
+    for (setup, final_expr, expected) in cases {
+        let mut cmd = bliss_bin();
+        for form in setup {
+            cmd.args(["--eval", form]);
+        }
+        cmd.args(["--eval", &format!("(print {final_expr})")]);
+        let out = cmd.output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{final_expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).rev().find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{final_expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-7na): `(declaim (special x))` / `(proclaim '(special x))`
 /// register a NON-earmuffed name as special via the proclamation registry, so a
 /// LET on it establishes a DYNAMIC binding (visible to a called function) on both
