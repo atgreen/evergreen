@@ -450,6 +450,28 @@ fn format_integer(
     }
 }
 
+/// Append `s` to `output` in a `~A`/`~S` field: at least `minpad` `padchar`s of
+/// padding, widened to `mincol` total (measured in CHARACTERS, not bytes). With
+/// `@` the padding goes on the left (right-justify), otherwise on the right
+/// (bliss-znib).
+fn pad_format_field(
+    output: &mut String,
+    s: &str,
+    mincol: usize,
+    minpad: usize,
+    padchar: char,
+    at_sign: bool,
+) {
+    let pad = mincol.saturating_sub(s.chars().count()).max(minpad);
+    if at_sign {
+        output.extend(std::iter::repeat_n(padchar, pad));
+        output.push_str(s);
+    } else {
+        output.push_str(s);
+        output.extend(std::iter::repeat_n(padchar, pad));
+    }
+}
+
 fn insert_commas(s: &str) -> String {
     let mut result = String::new();
     for (i, c) in s.chars().rev().enumerate() {
@@ -1032,11 +1054,22 @@ fn format_impl(
 
         match directive {
             'A' => {
-                // Resolve V/# params BEFORE consuming the main argument
-                let mincol = if !params.is_empty() {
-                    resolve_param(&params[0], 0, arg_idx)? as usize
-                } else {
-                    0
+                // ~mincol,colinc,minpad,padchar A. Resolve params in order BEFORE
+                // consuming the main arg so any v/# params consume the right args;
+                // honour minpad and padchar (padchar was ignored — bliss-znib).
+                let mincol = params
+                    .first()
+                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .max(0) as usize;
+                let _colinc = params.get(1).map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
+                let minpad = params
+                    .get(2)
+                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .max(0) as usize;
+                let padchar = match params.get(3) {
+                    Some(p) => char::from_u32(resolve_param(p, ' ' as i64, arg_idx)? as u32)
+                        .unwrap_or(' '),
+                    None => ' ',
                 };
                 if *arg_idx >= args.len() {
                     return Err(BlissError::Internal("too few args for ~A".into()));
@@ -1048,29 +1081,23 @@ fn format_impl(
                 } else {
                     blissval_to_print_string(val, false)
                 };
-                if s.len() < mincol {
-                    let pad = mincol - s.len();
-                    if at_sign {
-                        for _ in 0..pad {
-                            output.push(' ');
-                        }
-                        output.push_str(&s);
-                    } else {
-                        output.push_str(&s);
-                        for _ in 0..pad {
-                            output.push(' ');
-                        }
-                    }
-                } else {
-                    output.push_str(&s);
-                }
+                pad_format_field(output, &s, mincol, minpad, padchar, at_sign);
             }
             'S' => {
-                // Resolve V/# params BEFORE consuming the main argument
-                let mincol = if !params.is_empty() {
-                    resolve_param(&params[0], 0, arg_idx)? as usize
-                } else {
-                    0
+                // ~mincol,colinc,minpad,padchar S — same padding as ~A (bliss-znib).
+                let mincol = params
+                    .first()
+                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .max(0) as usize;
+                let _colinc = params.get(1).map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
+                let minpad = params
+                    .get(2)
+                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .max(0) as usize;
+                let padchar = match params.get(3) {
+                    Some(p) => char::from_u32(resolve_param(p, ' ' as i64, arg_idx)? as u32)
+                        .unwrap_or(' '),
+                    None => ' ',
                 };
                 if *arg_idx >= args.len() {
                     return Err(BlissError::Internal("too few args for ~S".into()));
@@ -1082,22 +1109,7 @@ fn format_impl(
                 } else {
                     blissval_to_print_string(val, true)
                 };
-                if s.len() < mincol {
-                    let pad = mincol - s.len();
-                    if at_sign {
-                        for _ in 0..pad {
-                            output.push(' ');
-                        }
-                        output.push_str(&s);
-                    } else {
-                        output.push_str(&s);
-                        for _ in 0..pad {
-                            output.push(' ');
-                        }
-                    }
-                } else {
-                    output.push_str(&s);
-                }
+                pad_format_field(output, &s, mincol, minpad, padchar, at_sign);
             }
             'D' | 'B' | 'O' | 'X' => {
                 let radix = match directive {

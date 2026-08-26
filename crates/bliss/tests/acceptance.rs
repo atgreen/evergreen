@@ -1497,6 +1497,33 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-znib): FORMAT ~A/~S honour the minpad and padchar params
+/// (`~mincol,colinc,minpad,padchar`), which were ignored — padding always used a
+/// space. Width is measured in characters.
+#[test]
+fn format_a_s_padchar() {
+    let cases = [
+        (r#"(format nil "~10,,,'*a" "hi")"#, "hi********"),
+        (r#"(format nil "~10,,,'*@a" "hi")"#, "********hi"),
+        (r#"(format nil "~5,,2,'-a" "ab")"#, "ab---"),
+        (r#"(format nil "~v,,,'*a" 6 "hi")"#, "hi****"),
+        // Defaults (space) still work; plain ~a unchanged.
+        (r#"(format nil "~10a" "hi")"#, "hi        "),
+        (r#"(format nil "~10@a" "hi")"#, "        hi"),
+        (r#"(format nil "~a" "plain")"#, "plain"),
+    ];
+    for (expr, expected) in cases {
+        // princ the padded string then a newline, so the first line is exactly it
+        // (trailing padding preserved).
+        let prog = format!("(progn (princ {expr}) (terpri))");
+        let out = bliss_bin().args(["--eval", &prog]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().next().unwrap_or("");
+        assert_eq!(got, expected, "{expr} => {got:?} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-h7ay): a numeric LOOP `for` clause may omit the start,
 /// beginning with a limit/step keyword — `for i below 5` ≡ `for i from 0 below 5`
 /// (CLHS 6.1.2.1). Previously only `from`/`upfrom`/`downfrom` entered the numeric
