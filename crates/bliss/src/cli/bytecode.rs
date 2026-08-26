@@ -4966,7 +4966,13 @@ fn references_local_fn_value(form: BlissVal, names: &std::collections::HashSet<S
 fn is_special_name(name: &str) -> bool {
     let bare = name.rsplit(':').next().unwrap_or(name);
     let b = bare.as_bytes();
-    b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*'
+    if b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*' {
+        return true;
+    }
+    // A name proclaimed special (declaim/proclaim) is dynamic even without
+    // earmuffs — consult the shared registry so the compiler agrees with the
+    // tree-walker (bliss-7na).
+    super::is_proclaimed_special(bare)
 }
 
 fn binding_name_init(b: BlissVal) -> LowerResult<(String, BlissVal)> {

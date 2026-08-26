@@ -1497,6 +1497,56 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-7na): `(declaim (special x))` / `(proclaim '(special x))`
+/// register a NON-earmuffed name as special via the proclamation registry, so a
+/// LET on it establishes a DYNAMIC binding (visible to a called function) on both
+/// backends. Previously declaim/proclaim were no-ops and specialness was an
+/// earmuff-only heuristic, so the LET bound lexically.
+#[test]
+fn declaim_proclaim_special_binds_dynamically() {
+    // Each case is (setup top-level forms, final expression, expected). The forms
+    // are passed as separate top-level `--eval`s (like real file/REPL top-level
+    // forms) rather than one wrapped expression, so declaim/defparameter/let bind
+    // with top-level semantics.
+    let cases: [(&[&str], &str, &str); 4] = [
+        // declaim special → dynamic LET binding seen by the called function.
+        (
+            &["(declaim (special na-zz))", "(defun na-rd () na-zz)", "(defparameter na-zz 1)"],
+            "(let ((na-zz 99)) (na-rd))",
+            "99",
+        ),
+        // proclaim (the run-time counterpart) → same.
+        (
+            &["(proclaim '(special na-qq))", "(defun na-rq () na-qq)", "(defparameter na-qq 1)"],
+            "(let ((na-qq 77)) (na-rq))",
+            "77",
+        ),
+        // A non-proclaimed, non-earmuffed name stays LEXICAL: the LET is invisible
+        // to the called function, which reads the global.
+        (
+            &["(defun na-ry () na-yy)", "(defparameter na-yy 1)"],
+            "(let ((na-yy 99)) (na-ry))",
+            "1",
+        ),
+        // declaim tolerates and ignores non-special declarations.
+        (&["(declaim (optimize (speed 3)) (type fixnum na-foo))"], ":ok", ":OK"),
+    ];
+    for (setup, final_expr, expected) in cases {
+        let mut cmd = bliss_bin();
+        for form in setup {
+            cmd.args(["--eval", form]);
+        }
+        cmd.args(["--eval", &format!("(print {final_expr})")]);
+        let out = cmd.output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{final_expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Each `--eval` echoes its result, so the final `(print …)` value is the
+        // LAST non-empty line, not the first.
+        let got = stdout.lines().map(|l| l.trim()).rev().find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{final_expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-zg9): bit-vectors (`#*…`) support the predicates
 /// BIT-VECTOR-P / SIMPLE-BIT-VECTOR-P, the sequence protocol (LENGTH/ELT/AREF/BIT
 /// and COERCE via collect_elements), TYPE-OF `(SIMPLE-BIT-VECTOR n)`, and print in

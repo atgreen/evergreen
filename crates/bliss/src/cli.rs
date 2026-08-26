@@ -9410,6 +9410,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let elems = eval_args(cdr, env)?;
                 return Ok(bliss_stdlib::build_simple_vector(&elems));
             }
+            // (%proclaim-special (a b c)) — register each symbol in the argument
+            // list as globally special. The declaim macro and proclaim function in
+            // boot.lisp call this for `(special …)` declarations (bliss-7na).
+            "BLISS-INTERNAL::%PROCLAIM-SPECIAL"
+            | "BLISS-INTERNAL:%PROCLAIM-SPECIAL"
+            | "%PROCLAIM-SPECIAL" => {
+                let (arg, _) = cp(cdr);
+                let mut list = eval_form(arg, env)?;
+                bliss_rt::rooted_ref!(_list_root = &mut list);
+                while list.is_cons() {
+                    let (sym, rest) = cp(list);
+                    proclaim_special(sym);
+                    list = rest;
+                }
+                return Ok(NIL);
+            }
             "BLISS-INTERNAL::%MAKE-COMPLEX-VECTOR"
             | "BLISS-INTERNAL:%MAKE-COMPLEX-VECTOR"
             | "%MAKE-COMPLEX-VECTOR" => {
@@ -15624,20 +15640,53 @@ fn sort_sequence(
 // DEFUN, or DEFMETHOD nested in a LET — would copy-on-write into the discarded
 // child and never reach the caller. Keeping one env also lets multiple values
 // and dynamic state flow out of the body naturally.
+thread_local! {
+    // Bare names proclaimed globally SPECIAL via `(declaim (special x))` /
+    // `(proclaim '(special x))`. Consulted by `is_special_var` (tree-walker) and
+    // `bytecode::is_special_name` (compiler) in addition to the earmuff
+    // convention, so a non-earmuffed proclaimed-special variable `let`-binds
+    // DYNAMICALLY on BOTH backends (bliss-7na). Keyed by bare name to match the
+    // existing earmuff checks (which are also bare-name based). Populated by the
+    // `%PROCLAIM-SPECIAL` builtin.
+    static PROCLAIMED_SPECIAL: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Register `sym` as globally special (idempotent). No-op for non-symbols.
+fn proclaim_special(sym: BlissVal) {
+    if sym.is_symbol() {
+        let bare = symbol_bare_name(&sym_name(sym));
+        PROCLAIMED_SPECIAL.with(|s| s.borrow_mut().insert(bare));
+    }
+}
+
+/// True if `name` (a bare symbol name) has been proclaimed special. Shared by the
+/// tree-walker and the bytecode compiler so both agree which LET bindings are
+/// dynamic (bliss-7na).
+pub(super) fn is_proclaimed_special(name: &str) -> bool {
+    PROCLAIMED_SPECIAL.with(|s| s.borrow().contains(name))
+}
+
 /// True if `sym` names a special (dynamically-scoped) variable. bliss follows
 /// the universal earmuff convention — a name spelled `*…*` is special — which
 /// covers the standard special variables (`*standard-output*`, `*package*`, …)
-/// and library specials like ASDF's `*asdf-session*`. A `let` on such a name
-/// must establish a DYNAMIC binding (visible to called functions), not a lexical
-/// one (bliss-lb6.14: ASDF's session cache is a `let`-bound special read by
-/// helper functions).
+/// and library specials like ASDF's `*asdf-session*`; plus any name proclaimed
+/// special via declaim/proclaim (bliss-7na). A `let` on such a name must
+/// establish a DYNAMIC binding (visible to called functions), not a lexical one
+/// (bliss-lb6.14: ASDF's session cache is a `let`-bound special read by helper
+/// functions).
 fn is_special_var(sym: BlissVal) -> bool {
     if !sym.is_symbol() {
         return false;
     }
     let bare = symbol_bare_name(&sym_name(sym));
     let b = bare.as_bytes();
-    b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*'
+    if b.len() > 2 && b[0] == b'*' && b[b.len() - 1] == b'*' {
+        return true;
+    }
+    // A name proclaimed special (declaim/proclaim) is special even without
+    // earmuffs (bliss-7na).
+    is_proclaimed_special(&bare)
 }
 
 /// RAII guard for a dynamic (special-variable) binding: it saves the symbol's

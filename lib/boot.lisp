@@ -125,15 +125,24 @@
 ;;; bootstrap evaluator.
 ;;; ---------------------------------------------------------------------------
 
-;; declaim: declarations have no bearing on the tree-walking interpreter.
-(defmacro declaim (&rest ignore) nil)
+;; declaim: most declarations (inline/optimize/ftype/type) have no bearing on
+;; the tree-walking interpreter and are ignored, but (special x …) IS honoured
+;; via the proclamation registry so a non-earmuffed special var binds
+;; dynamically (bliss-7na). Emit a %proclaim-special call per (special …) spec.
+(defmacro declaim (&rest specs)
+  (let ((forms nil))
+    (dolist (spec specs)
+      (when (and (consp spec) (eq (car spec) 'special))
+        (push (list 'bliss-internal::%proclaim-special (list 'quote (cdr spec)))
+              forms)))
+    (if forms (cons 'progn (nreverse forms)) nil)))
 
-;; proclaim: the run-time counterpart (ANSI 3.8). Accepted and ignored like
-;; declaim — inline/optimize/ftype/type proclamations carry no weight here.
-;; KNOWN GAP (bliss-e2h): (proclaim '(special x)) is also ignored; specialness
-;; is currently an earmuff-name heuristic, not a proclamation registry.
+;; proclaim: the run-time counterpart (ANSI 3.8). Non-special declarations are
+;; accepted and ignored; (special x …) registers the variables as special.
 (defun proclaim (declaration-specifier)
-  (declare (ignore declaration-specifier))
+  (when (and (consp declaration-specifier)
+             (eq (car declaration-specifier) 'special))
+    (bliss-internal::%proclaim-special (cdr declaration-specifier)))
   nil)
 
 ;; Track bootstrap type aliases so TYPEP/CHECK-TYPE can consult them.
