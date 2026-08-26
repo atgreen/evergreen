@@ -5860,11 +5860,12 @@ fn find_symbol_in_package_rec(
                 return Some((BlissVal::from_symbol_index(idx), "EXTERNAL"));
             }
         }
-    } else if pkg_name == "COMMON-LISP-USER" {
-        if let Some(sym) = resolve_sym(bare_upper) {
-            return Some((sym, "EXTERNAL"));
-        }
     }
+    // (COMMON-LISP-USER is NOT special-cased: it used resolve_sym, which INTERNS
+    // the name — FIND-SYMBOL must have no side effects — and reported :EXTERNAL,
+    // but CL-USER exports nothing by default. It now falls through to the general
+    // present-symbol lookup below, so an unknown name yields (NIL NIL) and a homed
+    // symbol yields :INTERNAL / inherited CL symbols :INHERITED (bliss-6w2y).)
     if pkg_name == "KEYWORD" {
         if let Some(sym) = resolve_sym(&format!(":{}", bare_upper)) {
             return Some((sym, "EXTERNAL"));
@@ -12410,15 +12411,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     env.current_package.clone()
                 };
+                // ANSI INTERN 2nd value: an EXISTING symbol reports its actual
+                // accessibility (:INTERNAL/:EXTERNAL/:INHERITED); a freshly created
+                // one reports NIL — it was not always :INTERNAL (bliss-6w2y). Read
+                // the status (a String, GC-safe) before interning allocates.
+                let existing_status =
+                    find_symbol_in_package(env, &pkg_name, &name_str).map(|(_, s)| s);
                 let sym = intern_into_package(env, &pkg_name, &name_str);
-                env.set_mv(vec![
-                    sym,
-                    if sym.is_symbol() {
-                        package_status_symbol("INTERNAL")
-                    } else {
-                        NIL
-                    },
-                ]);
+                let status = match existing_status {
+                    Some(s) if sym.is_symbol() => package_status_symbol(&s),
+                    _ => NIL,
+                };
+                env.set_mv(vec![sym, status]);
                 return Ok(sym);
             }
             "FIND-SYMBOL" => {

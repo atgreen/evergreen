@@ -1497,6 +1497,36 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-6w2y): FIND-SYMBOL has no side effects and reports the right
+/// accessibility. It used to intern a fresh symbol for any name in CL-USER and
+/// report :EXTERNAL, so a never-seen name wrongly "found" a symbol; and INTERN
+/// always returned :INTERNAL as its second value. Now a non-existent name yields
+/// (NIL NIL), a newly-interned symbol yields NIL, and existing symbols report
+/// their real status.
+#[test]
+fn find_symbol_intern_accessibility() {
+    let cases = [
+        // FIND-SYMBOL of a never-interned name: (NIL NIL), no symbol created.
+        ("(multiple-value-list (find-symbol \"NEVER-SEEN-QQ\" :cl-user))", "(NIL NIL)"),
+        // INTERN a brand-new symbol: second value NIL (freshly created).
+        ("(nth-value 1 (intern \"BRAND-NEW-QQ\" :cl-user))", "NIL"),
+        // CL builtins are :EXTERNAL, consistently via FIND-SYMBOL and INTERN.
+        ("(nth-value 1 (find-symbol \"CAR\" :cl))", ":EXTERNAL"),
+        ("(nth-value 1 (intern \"CONS\" :common-lisp))", ":EXTERNAL"),
+        // A CL symbol inherited into CL-USER is :INHERITED.
+        ("(nth-value 1 (find-symbol \"CAR\" :cl-user))", ":INHERITED"),
+        // Keywords are external.
+        ("(nth-value 1 (find-symbol \"SOME-KW\" :keyword))", ":EXTERNAL"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-znib): FORMAT ~A/~S honour the minpad and padchar params
 /// (`~mincol,colinc,minpad,padchar`), which were ignored — padding always used a
 /// space. Width is measured in characters.
