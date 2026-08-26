@@ -116,6 +116,29 @@ pub fn bit_vector_p(v: BlissVal) -> bool {
     }
 }
 
+/// Length of a bit-vector (the count of bits), or `None` if `v` is not a
+/// bit-vector. Layout (see the reader's `alloc_bit_vector`): ObjectHeader(8) +
+/// element-type tag word(8) + length:u64(8) + LSB-first packed bits.
+pub fn bit_vector_len(v: BlissVal) -> Option<usize> {
+    if !bit_vector_p(v) {
+        return None;
+    }
+    let ptr = unsafe { v.as_ptr() };
+    Some(unsafe { *(ptr.add(16) as *const u64) } as usize)
+}
+
+/// Bit `i` (0 or 1) of a bit-vector, or `None` if `v` is not a bit-vector or `i`
+/// is out of bounds.
+pub fn bit_vector_ref(v: BlissVal, i: usize) -> Option<u8> {
+    let len = bit_vector_len(v)?;
+    if i >= len {
+        return None;
+    }
+    let ptr = unsafe { v.as_ptr() };
+    let byte = unsafe { *ptr.add(24 + i / 8) };
+    Some((byte >> (i % 8)) & 1)
+}
+
 /// `NUMBERP` — fixnum, single-float, or heap numeric types.
 pub fn numberp(v: BlissVal) -> bool {
     if v.is_fixnum() || v.is_single_float() {

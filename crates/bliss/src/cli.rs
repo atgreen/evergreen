@@ -4386,6 +4386,17 @@ fn print_val(val: BlissVal, out: &mut String) {
                     }
                     out.push_str(&bignum_to_decimal(sign, &limbs));
                 }
+                type_id::SIMPLE_ARRAY if bliss_rt::types::bit_vector_p(val) => {
+                    // A bit-vector prints in `#*bits` syntax (bliss-zg9).
+                    let len = bliss_rt::types::bit_vector_len(val).unwrap_or(0);
+                    out.push_str("#*");
+                    for i in 0..len {
+                        out.push(match bliss_rt::types::bit_vector_ref(val, i) {
+                            Some(1) => '1',
+                            _ => '0',
+                        });
+                    }
+                }
                 _ => out.push_str(&format!("#<heap-object type={}>", hdr.type_id())),
             }
         }
@@ -9482,6 +9493,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // bliss arrays are simple-vectors and strings.
                 return Ok(if is_vector_value(v) { T } else { NIL });
             }
+            // A bit-vector is a rank-1 array of BITs (reader `#*…`). All bit
+            // vectors bliss builds are simple, so SIMPLE-BIT-VECTOR-P coincides
+            // with BIT-VECTOR-P (bliss-zg9).
+            "BIT-VECTOR-P" | "SIMPLE-BIT-VECTOR-P" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                return Ok(if bliss_rt::types::bit_vector_p(v) { T } else { NIL });
+            }
             "ADJUSTABLE-ARRAY-P" => {
                 // Only a COMPLEX_ARRAY created :adjustable is adjustable.
                 let (af, _) = cp(cdr);
@@ -12484,6 +12503,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             None => Ok(arena_str(name)),
                         };
                     }
+                }
+                // A bit-vector's TYPE-OF is the compound (SIMPLE-BIT-VECTOR n)
+                // specifier, not a bare symbol (bliss-zg9).
+                if bliss_rt::types::bit_vector_p(v) {
+                    let len = bliss_rt::types::bit_vector_len(v).unwrap_or(0);
+                    bliss_rt::rooted!(inner = arena_cons(BlissVal::from_fixnum(len as i64), NIL));
+                    let sym = resolve_sym("SIMPLE-BIT-VECTOR").unwrap_or(NIL);
+                    return Ok(arena_cons(sym, *inner));
                 }
                 let type_name = if v.is_nil() {
                     "NULL"
@@ -18759,7 +18786,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "SUBSTITUTE" | "SUBSTITUTE-IF" | "FILL" | "SORT" | "STABLE-SORT" | "MERGE"
             | "SEARCH" | "MISMATCH" | "CONCATENATE" | "EVERY" | "SOME" | "NOTEVERY"
             | "NOTANY" | "VECTOR" | "MAKE-ARRAY" | "MAKE-LIST" | "MAKE-SEQUENCE"
-            | "VECTORP" | "SIMPLE-VECTOR-P" | "ARRAYP" | "ARRAY-DIMENSIONS"
+            | "VECTORP" | "SIMPLE-VECTOR-P" | "BIT-VECTOR-P" | "SIMPLE-BIT-VECTOR-P"
+            | "ARRAYP" | "ARRAY-DIMENSIONS"
             | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
             | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR"
             | "ADJUSTABLE-ARRAY-P" | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT"

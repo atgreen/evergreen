@@ -163,6 +163,15 @@ fn collect_elements(sequence: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
         }
         return Ok(elems);
     }
+    if let Some(len) = bliss_rt::types::bit_vector_len(sequence) {
+        let mut elems = Vec::with_capacity(len);
+        for i in 0..len {
+            elems.push(BlissVal::from_fixnum(
+                bliss_rt::types::bit_vector_ref(sequence, i).unwrap_or(0) as i64,
+            ));
+        }
+        return Ok(elems);
+    }
     if is_char_seq(sequence) {
         return Ok(string_content(sequence)
             .unwrap_or_default()
@@ -818,6 +827,9 @@ pub fn length(sequence: BlissVal) -> Result<usize, BlissError> {
         // A fill-pointer vector's LENGTH is its fill pointer.
         return Ok(cvec_fill_pointer(sequence));
     }
+    if let Some(n) = bliss_rt::types::bit_vector_len(sequence) {
+        return Ok(n);
+    }
     if let Some(s) = string_content(sequence) {
         // Strings are sequences of characters (ANSI). Count characters, not bytes.
         return Ok(s.chars().count());
@@ -872,6 +884,19 @@ pub fn elt(sequence: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
             });
         }
         return Ok(vector_elt(cvec_storage(sequence), index));
+    }
+    if bliss_rt::types::bit_vector_p(sequence) {
+        return match bliss_rt::types::bit_vector_ref(sequence, index) {
+            Some(bit) => Ok(BlissVal::from_fixnum(bit as i64)),
+            None => Err(BlissError::TypeError {
+                datum: sequence,
+                expected: format!(
+                    "index {} in bounds (length {})",
+                    index,
+                    bliss_rt::types::bit_vector_len(sequence).unwrap_or(0)
+                ),
+            }),
+        };
     }
     if is_char_seq(sequence) {
         let s = string_content(sequence).unwrap_or_default();

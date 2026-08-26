@@ -1497,6 +1497,38 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-zg9): bit-vectors (`#*…`) support the predicates
+/// BIT-VECTOR-P / SIMPLE-BIT-VECTOR-P, the sequence protocol (LENGTH/ELT/AREF/BIT
+/// and COERCE via collect_elements), TYPE-OF `(SIMPLE-BIT-VECTOR n)`, and print in
+/// `#*bits` syntax. Previously `#*01` read but these all failed / were undefined.
+#[test]
+fn bit_vector_support() {
+    let cases = [
+        ("(bit-vector-p #*101)", "T"),
+        ("(simple-bit-vector-p #*101)", "T"),
+        ("(bit-vector-p #(1 0 1))", "NIL"),
+        ("(bit-vector-p 'foo)", "NIL"),
+        ("(vectorp #*101)", "T"),
+        ("(length #*10110)", "5"),
+        ("(aref #*101 0)", "1"),
+        ("(aref #*101 1)", "0"),
+        ("(elt #*1100 2)", "0"),
+        ("(bit #*1100 0)", "1"),
+        ("(type-of #*101)", "(SIMPLE-BIT-VECTOR 3)"),
+        ("(coerce #*101 'list)", "(1 0 1)"),
+        ("(prin1-to-string #*10110)", "\"#*10110\""),
+        // Callable predicate through the builtin function object (bliss-uuh).
+        ("(funcall #'bit-vector-p #*1)", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-uuh): `#'<builtin>` is a FUNCTIONP function object (a wrapper
 /// closure), callable via funcall/apply/higher-order functions, while the bare
 /// symbol `'car` stays non-FUNCTIONP. Builtins have no heap function cell, so

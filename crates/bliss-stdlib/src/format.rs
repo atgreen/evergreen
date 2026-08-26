@@ -285,6 +285,21 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         if let Some(s) = crate::sequences::cvec_char_contents(v) {
             return if escapep { format!("\"{}\"", s) } else { s };
         }
+        // A bit-vector renders in `#*bits` syntax, not `#(…)` (bliss-zg9). Checked
+        // before the general vector path since it is also a rank-1 array.
+        if bliss_rt::types::bit_vector_p(v) {
+            let len = bliss_rt::types::bit_vector_len(v).unwrap_or(0);
+            let mut s = String::with_capacity(2 + len);
+            s.push_str("#*");
+            for i in 0..len {
+                s.push(if bliss_rt::types::bit_vector_ref(v, i) == Some(1) {
+                    '1'
+                } else {
+                    '0'
+                });
+            }
+            return s;
+        }
         // Vectors (simple and complex/fill-pointer) render as #(...).
         if let Some(s) = heap_vector_string(v, escapep) {
             return s;
