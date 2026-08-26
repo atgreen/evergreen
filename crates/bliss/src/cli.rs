@@ -2470,13 +2470,18 @@ fn evaluated_initargs(
 /// `fixnum` specializer outranks `integer` outranks `number`, etc.
 fn builtin_type_specializer_distance(name: &str, arg: BlissVal) -> Option<usize> {
     match symbol_bare_name(name).as_str() {
+        // Numeric specializers over the real heap numeric types (not just
+        // fixnum/single-float), so a method on INTEGER/NUMBER/… dispatches on a
+        // bignum/ratio/complex too (bliss-c0m).
         "FIXNUM" => arg.is_fixnum().then_some(1),
-        "INTEGER" => arg.is_fixnum().then_some(2),
-        "RATIONAL" => arg.is_fixnum().then_some(3),
-        "REAL" => (arg.is_fixnum() || arg.is_single_float()).then_some(4),
-        "NUMBER" => (arg.is_fixnum() || arg.is_single_float()).then_some(5),
+        "INTEGER" => bliss_rt::types::integerp(arg).then_some(2),
+        "RATIONAL" => bliss_rt::types::rationalp(arg).then_some(3),
+        "REAL" => bliss_rt::types::realp(arg).then_some(4),
+        "NUMBER" => bliss_rt::types::numberp(arg).then_some(5),
+        "COMPLEX" => bliss_rt::types::complexp(arg).then_some(2),
         "SINGLE-FLOAT" => arg.is_single_float().then_some(1),
-        "FLOAT" => arg.is_single_float().then_some(2),
+        "DOUBLE-FLOAT" => (bliss_rt::types::floatp(arg) && !arg.is_single_float()).then_some(1),
+        "FLOAT" => bliss_rt::types::floatp(arg).then_some(2),
         "STRING" | "SIMPLE-STRING" | "BASE-STRING" => is_string_value(arg).then_some(1),
         "CHARACTER" => arg.is_character().then_some(1),
         "NULL" => arg.is_nil().then_some(1),
@@ -4377,6 +4382,16 @@ fn print_val(val: BlissVal, out: &mut String) {
                     out.push('/');
                     print_val(den, out);
                 }
+                type_id::COMPLEX => {
+                    // #C(realpart imagpart) (bliss-c0m).
+                    let rp = *(ptr.add(8) as *const BlissVal);
+                    let ip = *(ptr.add(16) as *const BlissVal);
+                    out.push_str("#C(");
+                    print_val(rp, out);
+                    out.push(' ');
+                    print_val(ip, out);
+                    out.push(')');
+                }
                 type_id::BIGNUM => {
                     let sign = *(ptr.add(8) as *const i32);
                     let n = *(ptr.add(12) as *const u32) as usize;
@@ -6239,6 +6254,7 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
         }
         "FLOAT" => &["REAL", "NUMBER", "ATOM", "T"],
         "REAL" => &["NUMBER", "ATOM", "T"],
+        "COMPLEX" => &["NUMBER", "ATOM", "T"],
         "NUMBER" => &["ATOM", "T"],
         "CHARACTER" => &["ATOM", "T"],
         "SYMBOL" => &["ATOM", "T"],
@@ -6344,17 +6360,33 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "SYMBOL" => object.is_symbol(),
             "KEYWORD" => is_keyword_arg(object),
             "STRING" | "SIMPLE-STRING" | "BASE-STRING" => is_string_value(object),
-            "NUMBER" | "REAL" => object.is_fixnum() || object.is_single_float(),
-            "INTEGER" | "FIXNUM" | "BIGNUM" | "RATIONAL" => object.is_fixnum(),
-            // No ratios yet, so RATIONAL collapses to INTEGER above and RATIO
-            // matches nothing.
-            "RATIO" => false,
+            // Numeric lattice over the real heap numeric types (bignum, ratio,
+            // double-float, complex), via the runtime predicates — the earlier
+            // checks only recognised fixnum/single-float, so (typep (expt 2 100)
+            // 'number), (typep 1/2 'rational), (typep #c(1 2) 'number), etc. all
+            // wrongly returned NIL (bliss-c0m).
+            "NUMBER" => bliss_rt::types::numberp(object),
+            "REAL" => bliss_rt::types::realp(object),
+            "RATIONAL" => bliss_rt::types::rationalp(object),
+            "INTEGER" => bliss_rt::types::integerp(object),
+            "FIXNUM" => object.is_fixnum(),
+            "BIGNUM" => bliss_rt::types::integerp(object) && !object.is_fixnum(),
+            "RATIO" => {
+                bliss_rt::types::rationalp(object) && !bliss_rt::types::integerp(object)
+            }
+            "COMPLEX" => bliss_rt::types::complexp(object),
             // UNSIGNED-BYTE with no size == (integer 0 *); SIGNED-BYTE with no
-            // size == any integer; BIT == (integer 0 1).
+            // size == any integer; BIT == (integer 0 1). (UNSIGNED-BYTE stays
+            // fixnum-only: a bignum's sign is not checked here, and a negative
+            // bignum must not match.)
             "UNSIGNED-BYTE" => object.is_fixnum() && object.as_fixnum() >= 0,
-            "SIGNED-BYTE" => object.is_fixnum(),
+            "SIGNED-BYTE" => bliss_rt::types::integerp(object),
             "BIT" => object.is_fixnum() && matches!(object.as_fixnum(), 0 | 1),
-            "FLOAT" | "SINGLE-FLOAT" => object.is_single_float(),
+            "FLOAT" => bliss_rt::types::floatp(object),
+            "SINGLE-FLOAT" | "SHORT-FLOAT" => object.is_single_float(),
+            "DOUBLE-FLOAT" | "LONG-FLOAT" => {
+                bliss_rt::types::floatp(object) && !object.is_single_float()
+            }
             "CHARACTER" => object.is_character(),
             "BOOLEAN" => object.is_nil() || object == T,
             "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(object),
@@ -8344,6 +8376,39 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(if is_number_value(v) { T } else { NIL });
+            }
+            "COMPLEXP" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                return Ok(if bliss_rt::types::complexp(v) { T } else { NIL });
+            }
+            // REALPART/IMAGPART: for a COMPLEX return the stored part; for a real
+            // number REALPART is the number itself and IMAGPART is 0 (of the same
+            // type — an integer 0 for a rational, 0.0 for a float) (CLHS).
+            "REALPART" | "IMAGPART" => {
+                let want_real = name == "REALPART";
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if let Some(rp) = bliss_rt::types::complex_realpart(v) {
+                    return Ok(if want_real {
+                        rp
+                    } else {
+                        bliss_rt::types::complex_imagpart(v).unwrap_or(NIL)
+                    });
+                }
+                if is_number_value(v) {
+                    return Ok(if want_real {
+                        v
+                    } else if v.is_single_float() {
+                        BlissVal::from_single_float(0.0)
+                    } else {
+                        BlissVal::from_fixnum(0)
+                    });
+                }
+                return Err(BlissError::TypeError {
+                    datum: v,
+                    expected: "number".to_string(),
+                });
             }
             "STRINGP" => {
                 let (af, _) = cp(cdr);
@@ -12571,6 +12636,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     bliss_rt::rooted!(inner = arena_cons(BlissVal::from_fixnum(len as i64), NIL));
                     let sym = resolve_sym("SIMPLE-BIT-VECTOR").unwrap_or(NIL);
                     return Ok(arena_cons(sym, *inner));
+                }
+                if bliss_rt::types::complexp(v) {
+                    return Ok(resolve_sym("COMPLEX").unwrap_or(NIL));
                 }
                 let type_name = if v.is_nil() {
                     "NULL"
@@ -18890,6 +18958,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "ROUND" | "GCD" | "LCM" | "EXPT" | "SQRT" | "ISQRT" | "SIGNUM" | "FLOAT"
             | "ZEROP" | "PLUSP" | "MINUSP" | "ODDP" | "EVENP" | "NUMBERP" | "INTEGERP"
             | "FLOATP" | "RATIONALP" | "REALP" | "NUMERATOR" | "DENOMINATOR"
+            | "COMPLEXP" | "REALPART" | "IMAGPART"
             | "LOGAND" | "LOGIOR" | "LOGXOR" | "LOGNOT" | "ASH" | "LOGBITP" | "BOOLE"
             | "INTEGER-LENGTH" | "RANDOM" | "EXP" | "LOG" | "SIN" | "COS" | "TAN"
             // Characters

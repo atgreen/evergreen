@@ -1497,6 +1497,43 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-c0m): TYPEP recognises the real heap numeric types (bignum,
+/// ratio, double-float, complex) — previously its NUMBER/REAL/RATIONAL/INTEGER/
+/// FLOAT checks only saw fixnum/single-float, so e.g. (typep (expt 2 100)
+/// 'number) wrongly returned NIL. Plus complex introspection: REALPART/IMAGPART/
+/// COMPLEXP and #C(r i) printing, consistent across tree-walker and compiler.
+#[test]
+fn typep_heap_numerics_and_complex_introspection() {
+    let cases = [
+        ("(typep (expt 2 100) 'number)", "T"),
+        ("(typep (expt 2 100) 'integer)", "T"),
+        ("(typep (expt 2 100) 'bignum)", "T"),
+        ("(typep 1/2 'rational)", "T"),
+        ("(typep 1/2 'ratio)", "T"),
+        ("(typep 1/2 'number)", "T"),
+        ("(typep 1/2 'integer)", "NIL"),
+        ("(typep #c(1 2) 'complex)", "T"),
+        ("(typep #c(1 2) 'number)", "T"),
+        ("(typep 3 'complex)", "NIL"),
+        // Complex introspection.
+        ("(complexp #c(1 2))", "T"),
+        ("(complexp 5)", "NIL"),
+        ("(realpart #c(3 4))", "3"),
+        ("(imagpart #c(3 4))", "4"),
+        ("(realpart 7)", "7"),
+        ("(imagpart 7)", "0"),
+        ("(type-of #c(1 2))", "COMPLEX"),
+        ("(prin1-to-string #c(1 2))", "\"#C(1 2)\""),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-av5): DEFVAR/DEFPARAMETER proclaim the variable SPECIAL
 /// (ANSI 3.8), so a later LET binds it dynamically on BOTH backends. Previously
 /// only the tree-walker treated a globally-bound var as dynamic while the

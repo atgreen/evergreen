@@ -135,6 +135,15 @@ fn heap_number_string(v: BlissVal, escapep: bool) -> Option<String> {
                     blissval_to_print_string(den, escapep)
                 ))
             }
+            type_id::COMPLEX => {
+                let rp = *(ptr.add(8) as *const BlissVal);
+                let ip = *(ptr.add(16) as *const BlissVal);
+                Some(format!(
+                    "#C({} {})",
+                    blissval_to_print_string(rp, escapep),
+                    blissval_to_print_string(ip, escapep)
+                ))
+            }
             _ => None,
         }
     }

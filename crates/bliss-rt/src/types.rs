@@ -190,6 +190,23 @@ pub fn complexp(v: BlissVal) -> bool {
     heap_type_id(v) == Some(type_id::COMPLEX)
 }
 
+/// The real part of a COMPLEX heap object, or `None` if `v` is not complex.
+/// Layout (ComplexData): ObjectHeader(8) + realpart@8 + imagpart@16.
+pub fn complex_realpart(v: BlissVal) -> Option<BlissVal> {
+    if !complexp(v) {
+        return None;
+    }
+    Some(unsafe { *(v.as_ptr().add(8) as *const BlissVal) })
+}
+
+/// The imaginary part of a COMPLEX heap object, or `None` if `v` is not complex.
+pub fn complex_imagpart(v: BlissVal) -> Option<BlissVal> {
+    if !complexp(v) {
+        return None;
+    }
+    Some(unsafe { *(v.as_ptr().add(16) as *const BlissVal) })
+}
+
 /// `PACKAGEP` — package object.
 pub fn packagep(v: BlissVal) -> bool {
     heap_type_id(v) == Some(type_id::PACKAGE)
