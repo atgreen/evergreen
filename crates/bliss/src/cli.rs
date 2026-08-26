@@ -14163,12 +14163,31 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                             };
                             for_clauses.push(ForClause::Being { pat, source });
                         }
-                        // `:from`/`:upfrom` count up; `:downfrom` counts down. All
-                        // share the same `[:by step] [limit]` tail parsing.
-                        Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
-                            let descending = p.peek_kw().as_deref() == Some("DOWNFROM");
-                            p.advance();
-                            let start = p.read_form()?;
+                        // `:from`/`:upfrom` count up; `:downfrom` counts down. A
+                        // numeric for may also OMIT the start, beginning with a
+                        // limit/step keyword (`for i below 5` ≡ `for i from 0 below
+                        // 5`); then the start defaults to 0 (bliss-h7ay). All share
+                        // the same `[:by step] [limit]` tail parsing.
+                        Some("FROM") | Some("UPFROM") | Some("DOWNFROM") | Some("BELOW")
+                        | Some("TO") | Some("UPTO") | Some("ABOVE") | Some("DOWNTO")
+                        | Some("BY") => {
+                            let lead = p.peek_kw();
+                            let has_from = matches!(
+                                lead.as_deref(),
+                                Some("FROM") | Some("UPFROM") | Some("DOWNFROM")
+                            );
+                            // Descending for :downfrom, or — with no explicit start
+                            // — a downward limit keyword (:above / :downto).
+                            let descending = lead.as_deref() == Some("DOWNFROM")
+                                || (!has_from
+                                    && matches!(lead.as_deref(), Some("ABOVE") | Some("DOWNTO")));
+                            let start = if has_from {
+                                p.advance();
+                                p.read_form()?
+                            } else {
+                                // Leave the limit/step keyword for the tail loop.
+                                BlissVal::from_fixnum(0)
+                            };
                             let mut step = None;
                             let mut limit = None;
                             loop {

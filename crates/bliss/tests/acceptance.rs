@@ -1497,6 +1497,33 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-h7ay): a numeric LOOP `for` clause may omit the start,
+/// beginning with a limit/step keyword — `for i below 5` ≡ `for i from 0 below 5`
+/// (CLHS 6.1.2.1). Previously only `from`/`upfrom`/`downfrom` entered the numeric
+/// branch, so a bare `below`/`to`/`upto` errored.
+#[test]
+fn loop_numeric_for_without_explicit_from() {
+    let cases = [
+        ("(loop for i below 5 collect i)", "(0 1 2 3 4)"),
+        ("(loop for i to 3 collect i)", "(0 1 2 3)"),
+        ("(loop for i upto 3 collect i)", "(0 1 2 3)"),
+        ("(loop for i below 6 by 2 collect i)", "(0 2 4)"),
+        ("(loop for i to 10 by 3 collect i)", "(0 3 6 9)"),
+        ("(loop for i below 0 collect i)", "NIL"),
+        ("(loop for i to 4 sum i)", "10"),
+        // Explicit-from forms still work.
+        ("(loop for i from 2 to 5 collect i)", "(2 3 4 5)"),
+        ("(loop for i downfrom 5 above 0 collect i)", "(5 4 3 2 1)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-v304): (COERCE symbol 'FUNCTION) returns the FUNCTION named
 /// by the symbol (fdefinition), so the result is FUNCTIONP and callable — it used
 /// to return the symbol unchanged. `#'name` is unaffected (shared helper).
