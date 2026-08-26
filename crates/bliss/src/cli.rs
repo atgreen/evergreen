@@ -7253,6 +7253,42 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: BlissVal, bare: &str) -> BlissVal
     arena_cons(closure_sym, BlissVal::from_fixnum(id as i64))
 }
 
+/// If `v` is a reified builtin wrapper closure `(BLISS::CLOSURE . id)` produced by
+/// [`builtin_fn_wrapper`], return the underlying builtin's bare name. Lets code
+/// that must recognise a function DESIGNATOR by name (e.g. MAKE-HASH-TABLE's
+/// `:test #'equal`) see through the wrapper `#'<builtin>` returns (bliss-uuh):
+/// before that change `#'equal` WAS the symbol EQUAL, which such call sites
+/// matched directly.
+fn builtin_wrapper_name(v: BlissVal) -> Option<String> {
+    if !v.is_cons() {
+        return None;
+    }
+    // Recognise `(BLISS::CLOSURE . id)` by name — no allocation, so nothing is
+    // held across a GC (mirrors is_closure_ref at cli.rs:2003).
+    let (car, cdr) = cp(v);
+    if !cdr.is_fixnum() || !car.is_symbol() || sym_name(car) != "BLISS::CLOSURE" {
+        return None;
+    }
+    let id = cdr.as_fixnum() as u64;
+    BUILTIN_FN_WRAPPERS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(_, wid)| **wid == id)
+            .map(|(n, _)| n.clone())
+    })
+}
+
+/// The bare name of a function DESIGNATOR — a symbol's name, or the builtin name
+/// behind a `#'<builtin>` wrapper closure. `None` for other values. Used where a
+/// KNOWN function must be recognised by name (hash-table :test, …) rather than
+/// merely funcalled.
+fn function_designator_name(v: BlissVal) -> Option<String> {
+    if v.is_symbol() {
+        return Some(sym_name(v));
+    }
+    builtin_wrapper_name(v)
+}
+
 /// Write `bytes` to `out_path` atomically: create a temp file in the SAME
 /// directory (so `rename` stays on one filesystem and is atomic), fully write +
 /// flush it, then rename it over the target. A crash or error mid-write leaves
@@ -9743,7 +9779,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     if kw.is_symbol() {
                         let kn = sym_name(kw);
                         if kn.strip_prefix("KEYWORD:").unwrap_or(&kn) == "TEST" {
-                            let tn = sym_name(v);
+                            // :test accepts a function DESIGNATOR — the symbol
+                            // (eq/eql/equal/equalp) OR the function `#'equal`,
+                            // which bliss-uuh now reifies as a wrapper closure;
+                            // resolve either to the test name (bliss-lac).
+                            let tn = function_designator_name(v).unwrap_or_default();
                             let tb = tn.strip_prefix("KEYWORD:").unwrap_or(&tn).to_uppercase();
                             test = match tb.as_str() {
                                 "EQ" => bliss_stdlib::HashTest::Eq,

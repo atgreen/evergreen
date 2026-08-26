@@ -1497,6 +1497,35 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-lac): MAKE-HASH-TABLE :test accepts a function DESIGNATOR
+/// (the FUNCTION `#'equal`, not just the symbol `'equal`). bliss-uuh made
+/// `#'<builtin>` a wrapper closure rather than the bare symbol, which the :test
+/// parser (matching by symbol name) then ignored, silently defaulting to EQL — so
+/// an EQUAL table with list/string keys wrongly missed. Resolved via a
+/// function-designator name lookup.
+#[test]
+fn make_hash_table_test_accepts_function_designator() {
+    let cases = [
+        // #'equal with list AND string keys.
+        ("(let ((h (make-hash-table :test #'equal))) (setf (gethash (list 1 2) h) :a) (gethash (list 1 2) h))", ":A"),
+        ("(let ((h (make-hash-table :test #'equal))) (setf (gethash \"s\" h) :b) (gethash \"s\" h))", ":B"),
+        // #'equalp (case-insensitive).
+        ("(let ((h (make-hash-table :test #'equalp))) (setf (gethash \"AbC\" h) :c) (gethash \"abc\" h))", ":C"),
+        // The symbol form still works.
+        ("(let ((h (make-hash-table :test 'equal))) (setf (gethash (list 9) h) :d) (gethash (list 9) h))", ":D"),
+        // Default EQL: a fresh list key does NOT match (identity), fixnum does.
+        ("(let ((h (make-hash-table))) (setf (gethash (list 1) h) :e) (gethash (list 1) h))", "NIL"),
+        ("(let ((h (make-hash-table))) (setf (gethash 5 h) :f) (gethash 5 h))", ":F"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-apr): rational/heap-numeric stdlib gaps — ABS works on
 /// ratios/bignums (not just fixnum/single-float); NUMERATOR/DENOMINATOR/FLOAT are
 /// defined; and ratio LITERALS are reduced to lowest terms with a positive
