@@ -131,10 +131,10 @@ bd update <id> --claim
 3. Run the relevant suites (`cargo test -p bliss-cli --test <suite>`, plus
    `-p bliss-stdlib` / `-p bliss-compiler` when touched). Run the lib tests
    single-threaded (`--lib -- --test-threads=1`) — the deliberate-SIGSEGV
-   recovery tests flake under parallel signal contention (pre-existing race,
-   `bliss-lb6.20`); a known pre-existing failure is `bliss-ms0`
-   (`macroexpand_hook_is_invoked_during_expansion`). Don't attribute either to
-   your change without checking in isolation.
+   recovery tests (`jtc4_stack_map_tests`) and some `bliss-rt`
+   `spec_threading_concurrency` tests flake under parallel signal/safepoint
+   contention (pre-existing race, `bliss-lb6.20`); they pass in isolation. Don't
+   attribute a flake to your change without re-running the suite single-threaded.
 4. GC fuzz + lint any allocating path you touched (§3).
 5. Commit with an imperative subject citing the bead id and a GC-safety note
    when relevant; end the message with:
