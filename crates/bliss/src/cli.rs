@@ -7221,6 +7221,46 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: BlissVal, bare: &str) -> BlissVal
     arena_cons(closure_sym, BlissVal::from_fixnum(id as i64))
 }
 
+/// Write `bytes` to `out_path` atomically: create a temp file in the SAME
+/// directory (so `rename` stays on one filesystem and is atomic), fully write +
+/// flush it, then rename it over the target. A crash or error mid-write leaves
+/// only the temp file — never a truncated `out_path` — so a later reader always
+/// sees either the old complete file or the new complete file (bliss-c3i).
+fn write_file_atomic(out_path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::path::Path::new(out_path);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let file_name = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "compile-file-output".into());
+    let tmp = dir.join(format!(
+        ".{file_name}.tmp{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        // Best-effort durability; not fatal if the platform declines.
+        let _ = f.sync_all();
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // Root the operator and argument-list locals in place for the whole dispatch:
     // a relocating minor GC fired by any sub-form evaluation would otherwise leave
@@ -11371,7 +11411,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if let Some(parent) = std::path::Path::new(&out_path).parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                std::fs::write(&out_path, &image).map_err(|e| {
+                // Write the fasl ATOMICALLY (temp file in the same directory +
+                // rename), so an interrupted or failed compile never leaves a
+                // half-written .bfasl that a later LOAD would choke on ("HeapObj
+                // not of type sequence") instead of recompiling (bliss-c3i).
+                write_file_atomic(&out_path, &image).map_err(|e| {
                     BlissError::FileError(format!("compile-file: cannot write {out_path}: {e}"))
                 })?;
                 if compile_verbose {

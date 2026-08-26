@@ -1729,6 +1729,55 @@ fn macro_and_compiler_macro_expanders_round_trip_as_bytecode() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Regression (bliss-c3i): COMPILE-FILE writes the fasl atomically (temp +
+/// rename), so a successful compile leaves exactly the `.bfasl` and no temp
+/// remnant, and the result loads cleanly.
+#[test]
+fn compile_file_writes_fasl_atomically_without_temp_leak() {
+    let dir = workdir("atomic-write");
+    let src = dir.join("atomic.lisp");
+    let out = dir.join("atomic.bfasl");
+    fs::write(&src, "(defun c3i-sq (x) (* x x))\n").unwrap();
+
+    let compiled = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        compiled.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(out.exists(), "the .bfasl must exist after compile");
+
+    // No leftover temp file (the atomic writer uses a `.atomic.bfasl.tmp…`
+    // sibling that must have been renamed away).
+    let leftovers: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "atomic write left temp files behind: {leftovers:?}"
+    );
+
+    let loaded = run(&format!(
+        "(progn (load \"{}\") (format t \"~s\" (c3i-sq 9)))",
+        out.display()
+    ));
+    assert!(loaded.status.success(), "load failed: {}", String::from_utf8_lossy(&loaded.stderr));
+    assert!(
+        String::from_utf8_lossy(&loaded.stdout).contains("81"),
+        "loaded fasl gave wrong result: {}",
+        String::from_utf8_lossy(&loaded.stdout)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn variadic_lambda_lists_and_declared_types_survive_bbu_round_trip() {
     let dir = workdir("variadic-metadata");
