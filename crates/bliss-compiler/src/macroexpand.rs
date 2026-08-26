@@ -564,7 +564,14 @@ pub fn register_macro_function(key: BlissVal, func: Arc<MacroFn>) {
 /// another's (bliss-6b2 — a macrolet-local `check` clobbering global `defvar`,
 /// producing an intermittently wrong `defvar` expansion during asdf load).
 pub fn next_registered_macro_key() -> BlissVal {
-    BlissVal::from_fixnum(MACRO_FUNCTION_KEY_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64)
+    // Mint a SPECIAL-tagged macro handle, NOT a bare fixnum: the registry is
+    // keyed by `key.0`, and `default_hook` looks up its `expander` argument
+    // there, so a fixnum key could be aliased by any ordinary literal whose
+    // integer value collided with it (bliss-skx: a fixnum symbol-macro
+    // expansion misread as a macro handle → wrong expander; same family as
+    // bliss-6b2). `from_macro_handle` puts keys on a tag no literal — and no
+    // CLOS meta handle — can occupy, making the conflation impossible.
+    BlissVal::from_macro_handle(MACRO_FUNCTION_KEY_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64)
 }
 
 /// Parse a macro definition into a lambda-expression suitable for `enclose`.
@@ -804,14 +811,14 @@ pub fn macroexpand_1(
     if let Some(VariableInfo::SymbolMacro(mut expansion)) = env.variable_information(form) {
         bliss_rt::rooted_ref!(_expansion_root = &mut expansion);
         let hook = get_macroexpand_hook();
-        // The DEFAULT hook resolves its first argument as a macro-function-registry
-        // key (keys are bare fixnums minted from a counter), so a symbol-macro
-        // EXPANSION that is a fixnum (or otherwise collides with a live key) would
-        // be misinterpreted as a macro handle and the wrong expander invoked —
-        // observed as `(symbol-macrolet ((m 42)) m)` failing with "unbound M" once
-        // enough macros are registered. For the default hook the result is just the
-        // expansion, so return it directly and skip that hazard. A CUSTOM hook is
-        // still invoked (expansion in both the expander and form positions, per the
+        // Fast-path the default hook: its result for a symbol macro is just the
+        // expansion (the expander IS the value), so return it directly and skip
+        // the macro-function-registry lock. Correctness here no longer depends on
+        // this shortcut — macro keys are now SPECIAL-tagged handles that no fixnum
+        // expansion can alias (bliss-skx), so even routed through default_hook a
+        // fixnum expansion would fall through the registry miss to `Ok(expander)`.
+        // This is purely an allocation/lock elision. A CUSTOM hook is still
+        // invoked (expansion in both the expander and form positions, per the
         // default_hook contract) so it can transform symbol-macro expansions
         // (CLHS: *macroexpand-hook* mediates symbol-macro expansion too; bliss-ms0).
         if hook as usize == (default_hook as MacroexpandHook) as usize {
@@ -2388,5 +2395,53 @@ mod registry_key_tests {
         let env = Environment::null();
         assert_eq!(g1(dummy, &env).unwrap().0, BlissVal::from_fixnum(111).0);
         assert_eq!(g2(dummy, &env).unwrap().0, BlissVal::from_fixnum(222).0);
+    }
+
+    /// bliss-skx regression: `default_hook` looks up its `expander` argument in
+    /// `MACRO_FUNCTION_REGISTRY` (keyed by `key.0`). When keys were bare fixnums
+    /// minted from a counter, a literal expander (e.g. a fixnum symbol-macro
+    /// expansion) whose `.0` aliased a live key was misread as a macro handle and
+    /// the WRONG expander ran. Macro keys are now SPECIAL-tagged handles
+    /// (`from_macro_handle`), so no fixnum value can occupy a key's bit pattern.
+    ///
+    /// This registers many keys, then passes fixnum expanders straight through
+    /// `default_hook` and asserts each is returned verbatim (the symbol-macro
+    /// contract) rather than dispatched to a registered function.
+    #[test]
+    fn fixnum_expander_never_aliases_a_macro_key() {
+        // Mint and register enough keys to cover the low fixnum range that a
+        // symbol-macro expansion would land in.
+        let mut keys = Vec::new();
+        for i in 0..64i64 {
+            let k = next_registered_macro_key();
+            // Keys must never carry the fixnum tag, or a plain integer could alias
+            // them.
+            assert!(k.is_macro_handle(), "key must be a macro handle, not a fixnum");
+            assert!(!k.is_fixnum(), "macro key must not be fixnum-tagged");
+            let sentinel = 900_000 + i; // distinct from any fixnum expander below
+            let f: Arc<MacroFn> =
+                Arc::new(move |_form, _env| Ok(BlissVal::from_fixnum(sentinel)));
+            register_macro_function(k, f);
+            keys.push(k);
+        }
+
+        let env = Environment::null();
+        // Every small fixnum, routed through default_hook as its own expander
+        // (the symbol-macro calling convention), must come back unchanged — never
+        // a sentinel from a registered function.
+        for n in 0..64i64 {
+            let expansion = BlissVal::from_fixnum(n);
+            let got = default_hook(expansion, expansion, &env).unwrap();
+            assert_eq!(
+                got.0, expansion.0,
+                "fixnum expansion {n} was misdispatched to a registered macro fn"
+            );
+        }
+
+        // And the real handles still dispatch to their functions.
+        for (i, k) in keys.iter().enumerate() {
+            let got = default_hook(*k, bliss_rt::value::NIL, &env).unwrap();
+            assert_eq!(got.0, BlissVal::from_fixnum(900_000 + i as i64).0);
+        }
     }
 }

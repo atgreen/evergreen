@@ -40,6 +40,18 @@ pub const TAG_MASK: u64 = 0b111;
 /// and issue bliss-dx6.
 pub const META_HANDLE_BIT: u64 = 1 << 62;
 
+/// Payload bit marking an opaque macro-function-registry handle under the
+/// `SPECIAL` tag. Same rationale as [`META_HANDLE_BIT`] (bliss-dx6) but for the
+/// macro-expander registry (bliss-skx): macro keys were minted as bare fixnums
+/// from a counter, so a symbol-macro expansion or any literal whose value
+/// aliased a live key's integer was misinterpreted as a macro handle and the
+/// wrong expander invoked (same family as bliss-6b2). Encoding macro keys off
+/// the fixnum tag — and on a bit DISTINCT from `META_HANDLE_BIT` so they also
+/// can't alias CLOS metaobject handles — makes the conflation structurally
+/// impossible. Handle ids are small positive counters (well within 58 bits),
+/// so they never reach this bit. See [`BlissVal::from_macro_handle`].
+pub const MACRO_HANDLE_BIT: u64 = 1 << 61;
+
 // ── Special-value constants ────────────────────────────────────────
 
 pub const NIL_BITS: u64 = 0x0000_0000_0000_0007; // tag 111, payload 0
@@ -107,6 +119,23 @@ impl BlissVal {
             "as_meta_handle_id called on non-handle value"
         );
         ((self.0 & !META_HANDLE_BIT) >> 3) as i64
+    }
+
+    /// Encode an opaque macro-function-registry handle id as a `SPECIAL`-tagged
+    /// immediate with [`MACRO_HANDLE_BIT`] set. Keeps macro keys off the fixnum
+    /// tag (and off `META_HANDLE_BIT`) so no ordinary literal — nor a CLOS
+    /// metaobject handle — can alias one in `MACRO_FUNCTION_REGISTRY`
+    /// (bliss-skx). `id` must be a small non-negative counter (within 58 bits).
+    #[inline(always)]
+    pub fn from_macro_handle(id: i64) -> Self {
+        debug_assert!(id >= 0 && (id as u64) < (1 << 58));
+        BlissVal(((id as u64) << 3) | TAG_SPECIAL | MACRO_HANDLE_BIT)
+    }
+
+    /// True if this value is an opaque macro-function-registry handle.
+    #[inline(always)]
+    pub fn is_macro_handle(self) -> bool {
+        self.tag() == TAG_SPECIAL && (self.0 & MACRO_HANDLE_BIT) != 0
     }
 
     /// Create a cons-tagged pointer.
