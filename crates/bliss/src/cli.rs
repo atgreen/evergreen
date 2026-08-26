@@ -3808,13 +3808,26 @@ impl Env {
         bliss_rt::rooted!(stdin_stream = bliss_stdlib::make_stdin());
         bliss_rt::rooted!(stdout_stream = bliss_stdlib::make_stdout());
         bliss_rt::rooted!(stderr_stream = bliss_stdlib::make_stderr());
-        env.define_local("*STANDARD-INPUT*", *stdin_stream);
-        env.define_local("*STANDARD-OUTPUT*", *stdout_stream);
-        env.define_local("*ERROR-OUTPUT*", *stderr_stream);
-        env.define_local("*TRACE-OUTPUT*", *stdout_stream);
-        env.define_local("*TERMINAL-IO*", *stdout_stream);
-        env.define_local("*QUERY-IO*", *stdout_stream);
-        env.define_local("*DEBUG-IO*", *stdout_stream);
+        // The stream specials are seeded in the GLOBAL value cell, NOT a lexical
+        // frame binding: a `(let ((*standard-output* s)) …)` rebinding is DYNAMIC
+        // (BindSpecial / DynBind writes the global cell), and lookup_var checks
+        // lexical frames first — so a define_local seed here shadowed the
+        // rebinding, and PRINT/PRINC/FORMAT-T/WRITE-STRING (which resolve their
+        // default stream via lookup_var) wrote to the original stdout regardless.
+        // Seeding the cell instead makes the common capture idiom
+        // `(with-output-to-string (*standard-output*) …)` work (bliss-oht4).
+        let set_global = |name: &str, val: BlissVal| {
+            if let Some(s) = resolve_sym(name) {
+                bliss_rt::symbols::set_symbol_value(s.as_symbol_index(), val);
+            }
+        };
+        set_global("*STANDARD-INPUT*", *stdin_stream);
+        set_global("*STANDARD-OUTPUT*", *stdout_stream);
+        set_global("*ERROR-OUTPUT*", *stderr_stream);
+        set_global("*TRACE-OUTPUT*", *stdout_stream);
+        set_global("*TERMINAL-IO*", *stdout_stream);
+        set_global("*QUERY-IO*", *stdout_stream);
+        set_global("*DEBUG-IO*", *stdout_stream);
         env.define_local("*TYPE-DEFINITIONS*", NIL);
         env.define_local("*CONDITION-TYPES*", NIL);
         env.define_local("*CONDITION-DEFINITIONS*", NIL);
@@ -20014,6 +20027,14 @@ fn eval_format(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (df, r) = cp(args);
     bliss_rt::rooted!(r = r);
     bliss_rt::rooted!(dest = eval_form(df, env)?);
+    // Resolve a `t` destination to the CURRENT *standard-output* STREAM so
+    // `(format t …)` honours a dynamic rebinding — the stdlib formatter writes a
+    // bare `t` to the process stdout and cannot see the dynamic binding
+    // (bliss-oht4). NIL (return a string) and explicit stream/string destinations
+    // pass through unchanged; the resolved stream is handled like any stream dest.
+    if *dest == T {
+        *dest = resolve_output_stream(T, env);
+    }
     let (ff, fa) = cp(*r);
     bliss_rt::rooted!(fa = fa);
     bliss_rt::rooted!(fv = eval_form(ff, env)?);

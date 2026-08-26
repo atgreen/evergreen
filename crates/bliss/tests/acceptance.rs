@@ -1497,6 +1497,32 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-oht4): PRINT/PRINC/FORMAT-T/WRITE-STRING honour a DYNAMIC
+/// rebinding of *standard-output*, so (with-output-to-string (*standard-output*)
+/// …) captures their output. The stream specials were seeded as lexical frame
+/// bindings that shadowed the dynamic-bind cell, so a rebinding was ignored and
+/// output leaked to the real stdout.
+#[test]
+fn dynamic_standard_output_rebinding_is_honoured() {
+    let cases = [
+        // Each op's output is captured by the *standard-output* rebinding.
+        (r#"(with-output-to-string (*standard-output*) (princ "hi"))"#, "hi"),
+        (r#"(with-output-to-string (*standard-output*) (write-string "ws"))"#, "ws"),
+        (r#"(with-output-to-string (*standard-output*) (format t "f~d" 9))"#, "f9"),
+        (r#"(let ((s (make-string-output-stream))) (let ((*standard-output* s)) (princ 42)) (get-output-stream-string s))"#, "42"),
+        (r#"(with-output-to-string (*standard-output*) (dotimes (i 3) (format t "~d," i)))"#, "0,1,2,"),
+    ];
+    for (expr, expected) in cases {
+        // princ the captured string + terpri, so the first line is exactly it.
+        let prog = format!("(progn (princ {expr}) (terpri))");
+        let out = bliss_bin().args(["--eval", &prog]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().next().unwrap_or("");
+        assert_eq!(got, expected, "{expr} => {got:?} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-6w2y): FIND-SYMBOL has no side effects and reports the right
 /// accessibility. It used to intern a fresh symbol for any name in CL-USER and
 /// report :EXTERNAL, so a never-seen name wrongly "found" a symbol; and INTERN
