@@ -1497,6 +1497,28 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-gijz): REMOVE-IF / REMOVE-IF-NOT / DELETE-IF operate on any
+/// sequence and return a sequence of the SAME type. They used DOLIST, so a vector
+/// or string argument errored "not of type list".
+#[test]
+fn remove_if_over_sequences() {
+    let cases = [
+        ("(remove-if #'oddp (vector 1 2 3 4))", "#(2 4)"),
+        ("(remove-if-not #'evenp (vector 1 2 3 4))", "#(2 4)"),
+        ("(remove-if #'oddp (list 1 2 3 4))", "(2 4)"),
+        ("(delete-if #'oddp (vector 1 2 3 4))", "#(2 4)"),
+        ("(remove-if (lambda (c) (char= c #\\l)) \"hello\")", "\"heo\""),
+        ("(remove-if #'plusp #())", "#()"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-lac): MAKE-HASH-TABLE :test accepts a function DESIGNATOR
 /// (the FUNCTION `#'equal`, not just the symbol `'equal`). bliss-uuh made
 /// `#'<builtin>` a wrapper closure rather than the bare symbol, which the :test
