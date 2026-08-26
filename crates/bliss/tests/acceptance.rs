@@ -1497,6 +1497,39 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-av5): DEFVAR/DEFPARAMETER proclaim the variable SPECIAL
+/// (ANSI 3.8), so a later LET binds it dynamically on BOTH backends. Previously
+/// only the tree-walker treated a globally-bound var as dynamic while the
+/// compiler bound it lexically — the same function returned different values
+/// cold (tree-walked) vs hot (compiled), a tier inconsistency.
+#[test]
+fn defparameter_proclaims_special_tier_consistent() {
+    // A defparameter'd var LET-bound and read by a callee → dynamic (99), and the
+    // result is the SAME cold and hot (compiled), with low tier thresholds.
+    let mut cmd = bliss_bin();
+    cmd.env("BLISS_T0_T1_THRESHOLD", "2").env("BLISS_T1_T2_INVOKE_THRESHOLD", "3");
+    cmd.args([
+        "--eval", "(defun av-rd () av-pv)",
+        "--eval", "(defun av-h () (let ((av-pv 99)) (av-rd)))",
+        "--eval", "(defparameter av-pv 5)",
+        "--eval", "(format t \"cold=~a~%\" (av-h))",
+        "--eval", "(dotimes (i 20) (av-h))",
+        "--eval", "(format t \"hot=~a~%\" (av-h))",
+    ]);
+    let out = cmd.output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("cold=99"), "cold should be 99: {stdout}");
+    assert!(stdout.contains("hot=99"), "hot must match cold (tier-consistent): {stdout}");
+    // defvar likewise proclaims special; and defparameter returns the NAME (ANSI).
+    let out2 = bliss_bin()
+        .args(["--eval", "(defun av-rd2 () av-dv)",
+               "--eval", "(defvar av-dv 5)",
+               "--eval", "(print (let ((av-dv 42)) (av-rd2)))"])
+        .output().expect("run bliss");
+    assert!(String::from_utf8_lossy(&out2.stdout).contains("42"), "defvar var is special: {}", String::from_utf8_lossy(&out2.stdout));
+}
+
 /// Regression (bliss-x5y.23): the bytecode compiler binds a LOCAL
 /// `(declare (special v))` LET variable dynamically (BindSpecial) and reads it
 /// dynamically in the body, instead of bailing to the tree-walker. Verified on
@@ -1562,7 +1595,7 @@ fn declaim_proclaim_special_binds_dynamically() {
     // are passed as separate top-level `--eval`s (like real file/REPL top-level
     // forms) rather than one wrapped expression, so declaim/defparameter/let bind
     // with top-level semantics.
-    let cases: [(&[&str], &str, &str); 4] = [
+    let cases: [(&[&str], &str, &str); 3] = [
         // declaim special → dynamic LET binding seen by the called function.
         (
             &["(declaim (special na-zz))", "(defun na-rd () na-zz)", "(defparameter na-zz 1)"],
@@ -1574,13 +1607,6 @@ fn declaim_proclaim_special_binds_dynamically() {
             &["(proclaim '(special na-qq))", "(defun na-rq () na-qq)", "(defparameter na-qq 1)"],
             "(let ((na-qq 77)) (na-rq))",
             "77",
-        ),
-        // A non-proclaimed, non-earmuffed name stays LEXICAL: the LET is invisible
-        // to the called function, which reads the global.
-        (
-            &["(defun na-ry () na-yy)", "(defparameter na-yy 1)"],
-            "(let ((na-yy 99)) (na-ry))",
-            "1",
         ),
         // declaim tolerates and ignores non-special declarations.
         (&["(declaim (optimize (speed 3)) (type fixnum na-foo))"], ":ok", ":OK"),

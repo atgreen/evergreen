@@ -17,15 +17,25 @@
 ;;; Global variable definitions
 ;;; ---------------------------------------------------------------------------
 
+;; DEFVAR/DEFPARAMETER proclaim NAME globally SPECIAL (ANSI 3.8), so a later LET
+;; on it binds dynamically on BOTH backends. Without this the tree-walker treated
+;; a globally-bound var as dynamic while the compiler bound it lexically — the
+;; same function then returned different values cold vs hot, a tier inconsistency
+;; (bliss-av5). The %proclaim-special registry (bliss-7na) is consulted by
+;; is_special_var (tree-walker) and is_special_name (compiler).
 (defmacro defvar (name &rest value)
   `(progn
+     (bliss-internal::%proclaim-special (list ',name))
      (if (boundp ',name)
          ,name
          (setq ,name ,(if value (car value) nil)))
      ',name))
 
 (defmacro defparameter (name &rest value)
-  `(setq ,name ,(if value (car value) nil)))
+  `(progn
+     (bliss-internal::%proclaim-special (list ',name))
+     (setq ,name ,(if value (car value) nil))
+     ',name))
 
 ;; defconstant: this interpreter has no separate constant cell; model it as a
 ;; global binding, like defparameter.
