@@ -1497,6 +1497,44 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-apr): rational/heap-numeric stdlib gaps — ABS works on
+/// ratios/bignums (not just fixnum/single-float); NUMERATOR/DENOMINATOR/FLOAT are
+/// defined; and ratio LITERALS are reduced to lowest terms with a positive
+/// denominator (6/4 => 3/2, 4/2 => 2).
+#[test]
+fn rational_numeric_ops_and_ratio_literal_reduction() {
+    let cases = [
+        // Ratio literals canonicalize (reader).
+        ("6/4", "3/2"),
+        ("4/2", "2"),
+        ("-6/4", "-3/2"),
+        ("6/-4", "-3/2"),
+        ("10/5", "2"),
+        ("7/7", "1"),
+        // ABS over the numeric tower.
+        ("(abs -3/4)", "3/4"),
+        ("(abs (- (expt 2 80)))", "1208925819614629174706176"),
+        ("(abs -5)", "5"),
+        ("(abs -2.5)", "2.5"),
+        // NUMERATOR/DENOMINATOR/FLOAT.
+        ("(numerator 6/4)", "3"),
+        ("(denominator 6/4)", "2"),
+        ("(numerator 5)", "5"),
+        ("(denominator 5)", "1"),
+        ("(float 1/4)", "0.25"),
+        ("(float 3)", "3.0"),
+        // usable via #'.
+        ("(funcall #'abs -7/8)", "7/8"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-c0m): TYPEP recognises the real heap numeric types (bignum,
 /// ratio, double-float, complex) — previously its NUMBER/REAL/RATIONAL/INTEGER/
 /// FLOAT checks only saw fixnum/single-float, so e.g. (typep (expt 2 100)

@@ -10688,9 +10688,57 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if v.is_single_float() {
                     return Ok(BlissVal::from_single_float(v.as_single_float().abs()));
                 }
+                // Any other REAL (bignum, ratio, double-float): |x| = x if x>=0
+                // else -x, via the generic compare/subtract cores so the exact
+                // type is preserved (bliss-apr). Complex ABS (magnitude) is left
+                // to complex arithmetic (bliss-qng).
+                if bliss_rt::types::realp(v) {
+                    let zero = BlissVal::from_fixnum(0);
+                    if numeric_cmp(v, zero)? == std::cmp::Ordering::Less {
+                        return sub_vals(&[zero, v]);
+                    }
+                    return Ok(v);
+                }
                 return Err(BlissError::TypeError {
                     datum: v,
                     expected: "number".into(),
+                });
+            }
+            // NUMERATOR/DENOMINATOR of a rational: an integer is n/1; a ratio
+            // stores numerator@8 / denominator@16 (RatioData) (bliss-apr).
+            "NUMERATOR" | "DENOMINATOR" => {
+                let want_num = name == "NUMERATOR";
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if bliss_rt::types::integerp(v) {
+                    return Ok(if want_num { v } else { BlissVal::from_fixnum(1) });
+                }
+                // A ratio (rational but not integer) stores numerator@8 /
+                // denominator@16 in its RatioData body.
+                if bliss_rt::types::rationalp(v) {
+                    let off = if want_num { 8 } else { 16 };
+                    return Ok(unsafe { *(v.as_ptr().add(off) as *const BlissVal) });
+                }
+                return Err(BlissError::TypeError {
+                    datum: v,
+                    expected: "rational".into(),
+                });
+            }
+            // FLOAT: coerce a real to a float. (float x) => single-float; with a
+            // float prototype, the prototype's format. bliss floats are single;
+            // route through num_val (bliss-apr).
+            "FLOAT" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if v.is_single_float() {
+                    return Ok(v);
+                }
+                if bliss_rt::types::realp(v) {
+                    return Ok(BlissVal::from_single_float(num_val(v)? as f32));
+                }
+                return Err(BlissError::TypeError {
+                    datum: v,
+                    expected: "real".into(),
                 });
             }
             "MIN" => {

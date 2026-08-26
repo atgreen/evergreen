@@ -1181,6 +1181,29 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
                         "division by zero in ratio".into(),
                     ));
                 }
+                // Canonicalize: reduce to lowest terms with a POSITIVE
+                // denominator, and collapse to an integer when the denominator
+                // becomes 1 — a ratio literal like `6/4` denotes the rational
+                // 3/2, and `4/2` the integer 2 (CLHS 2.3.2.3; bliss-apr).
+                fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+                    a = a.abs();
+                    b = b.abs();
+                    while b != 0 {
+                        let t = a % b;
+                        a = b;
+                        b = t;
+                    }
+                    a
+                }
+                let g = gcd_i64(n, d).max(1);
+                let (mut n, mut d) = (n / g, d / g);
+                if d < 0 {
+                    n = -n;
+                    d = -d;
+                }
+                if d == 1 {
+                    return Ok(Some(BlissVal::from_fixnum(n)));
+                }
                 return Ok(Some(alloc_ratio(
                     BlissVal::from_fixnum(n),
                     BlissVal::from_fixnum(d),
