@@ -1497,6 +1497,35 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-uuh): `#'<builtin>` is a FUNCTIONP function object (a wrapper
+/// closure), callable via funcall/apply/higher-order functions, while the bare
+/// symbol `'car` stays non-FUNCTIONP. Builtins have no heap function cell, so
+/// `#'car` used to return the symbol CAR (not FUNCTIONP).
+#[test]
+fn sharp_quote_builtin_is_functionp() {
+    let cases = [
+        ("(functionp #'car)", "T"),
+        ("(functionp #'+)", "T"),
+        ("(typep #'cons 'function)", "T"),
+        // The bare symbol is NOT a function.
+        ("(functionp 'car)", "NIL"),
+        // Callable directly and as a higher-order argument.
+        ("(funcall #'car '(1 2))", "1"),
+        ("(apply #'+ '(1 2 3))", "6"),
+        ("(mapcar #'car '((1 2) (3 4)))", "(1 3)"),
+        ("(sort (list 3 1 2) #'<)", "(1 2 3)"),
+        // A builtin call in operator position is unaffected.
+        ("(car '(9 8))", "9"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-ok5): LOOP ALWAYS/NEVER return T by vacuous truth when the
 /// range is empty (the test is never evaluated, CLHS 6.1.6). The default was
 /// seeded lazily inside the per-iteration body, so an empty range wrongly

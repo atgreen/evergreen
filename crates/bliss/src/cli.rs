@@ -7161,6 +7161,55 @@ fn tag_key(form: BlissVal) -> Option<String> {
     None
 }
 
+thread_local! {
+    /// Reified builtin function-object wrappers, keyed by the builtin's bare name
+    /// → the closure id in the shared `env.closures` table (bliss-uuh). Builtins
+    /// have no heap function cell, so `#'car` used to return the bare symbol CAR,
+    /// which is not FUNCTIONP. Instead return a wrapper closure
+    /// `(lambda (&rest a) (apply '<builtin> a))`; APPLY dispatches the builtin by
+    /// name (the tree-walker's builtin arm), so it never recurses back into the
+    /// wrapper. Cached so repeated `#'car` yields the SAME object (EQ) and does not
+    /// grow `env.closures` without bound. `env.closures` is shared via `Rc` across
+    /// the whole env tree (one root map per process), so an id minted once resolves
+    /// everywhere for the life of the session.
+    static BUILTIN_FN_WRAPPERS: RefCell<std::collections::HashMap<String, u64>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Reify (and cache) a callable, FUNCTIONP wrapper closure for the builtin named
+/// `bare` (interned symbol `name_sym`). See [`BUILTIN_FN_WRAPPERS`] (bliss-uuh).
+fn builtin_fn_wrapper(env: &mut Env, name_sym: BlissVal, bare: &str) -> BlissVal {
+    let closure_sym = resolve_sym("BLISS::CLOSURE").unwrap_or(NIL);
+    if let Some(id) = BUILTIN_FN_WRAPPERS.with(|c| c.borrow().get(bare).copied()) {
+        return arena_cons(closure_sym, BlissVal::from_fixnum(id as i64));
+    }
+    // Build (&REST %args) and ((APPLY (QUOTE <name>) %args)), rooting each
+    // intermediate across the allocating arena_cons calls (moving minor GC).
+    bliss_rt::rooted!(name_sym = name_sym);
+    let rest_kw = resolve_sym("&REST").unwrap_or(NIL);
+    let args_sym = resolve_sym("BLISS::%BUILTIN-WRAPPER-ARGS").unwrap_or(NIL);
+    let apply_sym = resolve_sym("APPLY").unwrap_or(NIL);
+    let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
+    bliss_rt::rooted!(params_form = arena_cons(args_sym, NIL));
+    *params_form = arena_cons(rest_kw, *params_form);
+    bliss_rt::rooted!(quoted = arena_cons(*name_sym, NIL));
+    *quoted = arena_cons(quote_sym, *quoted);
+    bliss_rt::rooted!(call = arena_cons(args_sym, NIL));
+    *call = arena_cons(*quoted, *call);
+    *call = arena_cons(apply_sym, *call);
+    bliss_rt::rooted!(body = arena_cons(*call, NIL));
+    let id = next_closure_id();
+    let closure = Closure {
+        params_form: *params_form,
+        body: *body,
+        captured_frame: Rc::clone(&env.frame),
+    };
+    // Once inserted, params_form/body are rooted via the GC scan of env.closures.
+    env.closures.borrow_mut().insert(id, closure);
+    BUILTIN_FN_WRAPPERS.with(|c| c.borrow_mut().insert(bare.to_string(), id));
+    arena_cons(closure_sym, BlissVal::from_fixnum(id as i64))
+}
+
 fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // Root the operator and argument-list locals in place for the whole dispatch:
     // a relocating minor GC fired by any sub-form evaluation would otherwise leave
@@ -9163,6 +9212,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     // funcall/apply still accept.
                     if let Some(f) = global_fn(&fn_name) {
                         return Ok(f);
+                    }
+                    // A builtin function has no heap cell; reify `#'car` as a
+                    // wrapper closure so it is FUNCTIONP / TYPEP FUNCTION and CLOS
+                    // dispatches it (bliss-uuh). Special operators (IF/LET/…) are
+                    // excluded — is_builtin_function lists only real functions.
+                    let bare = symbol_bare_name(&fn_name);
+                    if is_builtin_function(&bare) {
+                        return Ok(builtin_fn_wrapper(env, name_form, &bare));
                     }
                     if fn_bound(env, &fn_name) {
                         return Ok(name_form); // symbol as a function designator
