@@ -793,9 +793,32 @@ pub fn macroexpand_1(
     env: &Environment,
 ) -> Result<(BlissVal, bool), BlissError> {
     bliss_rt::rooted_ref!(_form_root = &mut form);
-    // 1. Check if form is a symbol with a symbol-macro binding
-    if let Some(VariableInfo::SymbolMacro(expansion)) = env.variable_information(form) {
-        return Ok((expansion, true));
+    // 1. Check if form is a symbol with a symbol-macro binding. *macroexpand-hook*
+    // applies to symbol-macro expansion too (CLHS macroexpand-1: the hook mediates
+    // the expansion of both macros and symbol macros), so route through it rather
+    // than returning the expansion raw (bliss-ms0). The expansion value is passed
+    // in BOTH the expander and form positions per the default_hook contract: that
+    // way default_hook (returns the expander) and identity_hook (returns the form)
+    // both yield the expansion, while a transforming hook can override it. Root the
+    // expansion across the hook call, which may allocate (mirrors the macro paths).
+    if let Some(VariableInfo::SymbolMacro(mut expansion)) = env.variable_information(form) {
+        bliss_rt::rooted_ref!(_expansion_root = &mut expansion);
+        let hook = get_macroexpand_hook();
+        // The DEFAULT hook resolves its first argument as a macro-function-registry
+        // key (keys are bare fixnums minted from a counter), so a symbol-macro
+        // EXPANSION that is a fixnum (or otherwise collides with a live key) would
+        // be misinterpreted as a macro handle and the wrong expander invoked —
+        // observed as `(symbol-macrolet ((m 42)) m)` failing with "unbound M" once
+        // enough macros are registered. For the default hook the result is just the
+        // expansion, so return it directly and skip that hazard. A CUSTOM hook is
+        // still invoked (expansion in both the expander and form positions, per the
+        // default_hook contract) so it can transform symbol-macro expansions
+        // (CLHS: *macroexpand-hook* mediates symbol-macro expansion too; bliss-ms0).
+        if hook as usize == (default_hook as MacroexpandHook) as usize {
+            return Ok((expansion, true));
+        }
+        let result = hook(expansion, expansion, env)?;
+        return Ok((result, true));
     }
 
     // 2. Check if form is a cons with a macro operator
