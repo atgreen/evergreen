@@ -7289,6 +7289,33 @@ fn function_designator_name(v: BlissVal) -> Option<String> {
     builtin_wrapper_name(v)
 }
 
+/// Resolve a function-NAME symbol to its function OBJECT, mirroring `#'name`: a
+/// lexical FLET/LABELS closure, else a global function object, else a reified
+/// builtin wrapper (bliss-uuh), else — if the name is fbound as some other kind
+/// (generic/macro/setf) — the bare symbol designator. `None` when `name_sym` is
+/// not a symbol or names no function. Shared by the FUNCTION special form and
+/// `(coerce sym 'function)` (bliss-v304).
+fn symbol_function_object(env: &mut Env, name_sym: BlissVal) -> Option<BlissVal> {
+    if !name_sym.is_symbol() {
+        return None;
+    }
+    let fn_name = sym_name(name_sym);
+    if let Some(c) = local_fn_closure(env, &fn_name) {
+        return Some(c);
+    }
+    if let Some(f) = global_fn(&fn_name) {
+        return Some(f);
+    }
+    let bare = symbol_bare_name(&fn_name);
+    if is_builtin_function(&bare) {
+        return Some(builtin_fn_wrapper(env, name_sym, &bare));
+    }
+    if fn_bound(env, &fn_name) {
+        return Some(name_sym);
+    }
+    None
+}
+
 /// Write `bytes` to `out_path` atomically: create a temp file in the SAME
 /// directory (so `rename` stays on one filesystem and is atomic), fully write +
 /// flush it, then rename it over the target. A crash or error mid-write leaves
@@ -9350,31 +9377,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "FUNCTION" => {
                 let (name_form, _) = cp(cdr);
                 if name_form.is_symbol() {
-                    let fn_name = sym_name(name_form);
-                    // A local flet/labels function shadows any global; return a
-                    // closure so it stays callable outside the flet scope.
-                    if let Some(c) = local_fn_closure(env, &fn_name) {
-                        return Ok(c);
-                    }
-                    // Return the actual heap function object when one is bound, so
-                    // `#'foo` is FUNCTIONP and `(typep #'foo 'function)` is true and
-                    // CLOS dispatches it to the FUNCTION class (bliss-5ir). This
-                    // mirrors SYMBOL-FUNCTION. Generics/macros/builtins without a
-                    // heap cell fall back to the bare symbol designator, which
-                    // funcall/apply still accept.
-                    if let Some(f) = global_fn(&fn_name) {
+                    // `#'name` → the function object (a lexical closure, global
+                    // function object, or reified builtin wrapper), so it is
+                    // FUNCTIONP / TYPEP FUNCTION and CLOS dispatches it (bliss-5ir,
+                    // bliss-uuh). An unbound name falls through to the bare-symbol
+                    // designator below (funcall/apply still accept it).
+                    if let Some(f) = symbol_function_object(env, name_form) {
                         return Ok(f);
-                    }
-                    // A builtin function has no heap cell; reify `#'car` as a
-                    // wrapper closure so it is FUNCTIONP / TYPEP FUNCTION and CLOS
-                    // dispatches it (bliss-uuh). Special operators (IF/LET/…) are
-                    // excluded — is_builtin_function lists only real functions.
-                    let bare = symbol_bare_name(&fn_name);
-                    if is_builtin_function(&bare) {
-                        return Ok(builtin_fn_wrapper(env, name_form, &bare));
-                    }
-                    if fn_bound(env, &fn_name) {
-                        return Ok(name_form); // symbol as a function designator
                     }
                 }
                 // (function (lambda (params) body...)) — create a closure
@@ -10222,6 +10231,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(type_form = type_form);
                 bliss_rt::rooted!(value = eval_form(val_form, env)?);
                 let type_val = eval_form(*type_form, env)?;
+                // COERCE to FUNCTION: a symbol coerces to the function it NAMES
+                // (fdefinition), not the symbol itself, so the result is FUNCTIONP
+                // (bliss-v304). An already-callable value passes through.
+                if type_val.is_symbol()
+                    && symbol_bare_name(&sym_name(type_val)) == "FUNCTION"
+                {
+                    if is_function_value(*value) {
+                        return Ok(*value);
+                    }
+                    if let Some(f) = symbol_function_object(env, *value) {
+                        return Ok(f);
+                    }
+                    return Err(BlissError::TypeError {
+                        datum: *value,
+                        expected: "a function or the name of a function".into(),
+                    });
+                }
                 return coerce_value(*value, type_val);
             }
             "SORT" => {

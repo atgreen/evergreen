@@ -1497,6 +1497,41 @@ fn complex_vector_sequence_ops() {
     }
 }
 
+/// Regression (bliss-v304): (COERCE symbol 'FUNCTION) returns the FUNCTION named
+/// by the symbol (fdefinition), so the result is FUNCTIONP and callable — it used
+/// to return the symbol unchanged. `#'name` is unaffected (shared helper).
+#[test]
+fn coerce_symbol_to_function() {
+    // Builtins.
+    let out = bliss_bin().args([
+        "--eval", "(defun v304-uf (x) (* x x))",
+        "--eval", "(print (list (functionp (coerce 'car 'function)) \
+                    (funcall (coerce 'car 'function) '(9 8)) \
+                    (functionp (coerce '+ 'function)) \
+                    (functionp (coerce 'v304-uf 'function)) \
+                    (funcall (coerce 'v304-uf 'function) 5)))",
+    ]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Two --eval forms each echo; the print result is the LAST non-empty line.
+    let got = stdout.lines().map(|l| l.trim()).rev().find(|l| !l.is_empty()).unwrap_or("");
+    assert_eq!(got, "(T 9 T T 25)", "coerce-to-function: {stdout:?}");
+
+    // An already-callable value passes through; #'name still FUNCTIONP; an
+    // unbound name errors.
+    for (expr, expected) in [
+        ("(functionp (coerce (lambda (x) x) 'function))", "T"),
+        ("(functionp #'car)", "T"),
+        ("(handler-case (coerce 'no-such-fn-xyz 'function) (error () :err))", ":ERR"),
+    ] {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr}: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => {got}");
+    }
+}
+
 /// Regression (bliss-gijz): REMOVE-IF / REMOVE-IF-NOT / DELETE-IF operate on any
 /// sequence and return a sequence of the SAME type. They used DOLIST, so a vector
 /// or string argument errored "not of type list".
