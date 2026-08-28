@@ -5724,23 +5724,45 @@ fn compile_function_in(
     // `return-from`) that are invisible in the unexpanded source, so scanning the
     // raw body would fail to box a captured variable (alexandria's
     // `gaussian-random`).
-    if body_uses_macrolet(*body) {
-        if macro_lambda_list {
+    let uses_macrolet = body_uses_macrolet(*body);
+    // A body that builds a nested closure may capture an enclosing local only
+    // through a (global) macro expansion, invisible to the syntactic capture
+    // pre-scan — so the local is never boxed and the closure mis-resolves it as a
+    // global at run time (bliss-9u6d). Expanding the whole body once up front
+    // (like macrolet) surfaces the reference so `compute_captured_names` boxes it,
+    // and the closure then captures it correctly on every backend. Done once per
+    // function (nested closures inherit the expanded forms), and the macro env is
+    // cached (bliss-usb2), so it no longer dominates load compile time. Skipped
+    // for macro-defining bodies (their lambda list must survive) and bodies with
+    // no closure. `body_may_capture_closure` only reads structure (no GC).
+    let capture_expand = !macro_lambda_list
+        && !uses_macrolet
+        && body_may_capture_closure(&list_to_vec(*body));
+    if uses_macrolet || capture_expand {
+        if uses_macrolet && macro_lambda_list {
             let _ = record_bail(|| "macroexpand:macrolet-macro".to_string());
             return None;
         }
         // Root the rebuilt progn across the allocating macro-env build (bliss-wlf).
         let mut progn = arena_cons(resolve_sym("PROGN")?, *body);
         bliss_rt::rooted_ref!(_progn_root = &mut progn);
-        let menv = super::macroexpand_environment_from_cli(env);
+        // Root the macro env across macroexpand_all's allocations: it carries
+        // symbol-macro payloads the source env does not keep live for this call
+        // (bliss-9u6d).
+        let mut menv = super::macroexpand_environment_from_cli(env);
+        bliss_rt::rooted_ref!(_menv_root = &mut menv);
         match compiler_macroexpand::macroexpand_all(progn, &menv) {
             Ok(mut expanded) => {
                 bliss_rt::rooted_ref!(_expanded_root = &mut expanded);
                 *body = arena_cons(expanded, NIL);
             }
             Err(_) => {
-                let _ = record_bail(|| "macroexpand:macrolet".to_string());
-                return None;
+                // A macrolet body that will not expand cannot be lowered; a
+                // capture-expand failure is best-effort — keep the raw body.
+                if uses_macrolet {
+                    let _ = record_bail(|| "macroexpand:macrolet".to_string());
+                    return None;
+                }
             }
         }
     }

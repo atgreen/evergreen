@@ -1683,7 +1683,12 @@ fn expand_let(
         }
     }
 
-    let expanded_body = expand_body(body, &body_env)?;
+    let mut expanded_body = expand_body(body, &body_env)?;
+    // Root the expanded body: `vec_to_cons` below allocates (moving GC), and an
+    // unrooted `expanded_body` would go stale — its slot reused by one of the
+    // freshly-consed bindings, producing a cyclic form that later walkers loop on
+    // (bliss-9u6d; observed as a macroexpand CYCLE under BLISS_GC_STRESS).
+    bliss_rt::rooted_ref!(_expanded_body_root = &mut expanded_body);
 
     if !bindings_changed && expanded_body == body {
         Ok(form)

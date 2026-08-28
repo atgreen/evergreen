@@ -471,6 +471,92 @@ fn macro_hidden_handler_bind_capture_bails_and_stays_correct() {
     );
 }
 
+/// bliss-9u6d: an eager-compiled DEFUN whose nested closure (lambda / flet /
+/// labels) captures an enclosing frame-slot local revealed only after macro
+/// expansion must stay correct on the non-portable runtime backend too. The
+/// once-per-function up-front macroexpand surfaces the reference so it is boxed
+/// (lambda) or the form bails (flet/labels); either way the result matches the
+/// tree-walker, never :UNTOUCHED / unbound-variable.
+#[test]
+fn macro_hidden_closure_capture_stays_correct_when_eager() {
+    let program = "\
+        (defvar *o* :untouched) \
+        (defmacro gx () 'x) \
+        (defun via-lambda () (setq *o* :untouched) \
+          (let ((x 42)) (funcall (lambda () (setf *o* (gx)))) *o*)) \
+        (defun via-flet () (setq *o* :untouched) \
+          (let ((x 7)) (flet ((g () (setf *o* (gx)))) (g)) *o*)) \
+        (defun via-labels () (setq *o* :untouched) \
+          (let ((x 9)) (labels ((g () (setf *o* (gx)))) (g)) *o*)) \
+        (format t \"~a ~a ~a~%\" (via-lambda) (via-flet) (via-labels))";
+    let mut outputs = Vec::new();
+    for backend in ["tree-walker", "bytecode"] {
+        let out = Command::new(BIN)
+            .arg("--eval")
+            .arg(program)
+            .env("BLISS_BACKEND", backend)
+            .env("BLISS_LAZY_COMPILE", "0")
+            .output()
+            .expect("spawn");
+        assert!(
+            out.status.success(),
+            "{backend} run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        outputs.push(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    assert_eq!(outputs[0], "42 7 9", "tree-walker oracle");
+    assert_eq!(
+        outputs[1], outputs[0],
+        "eager bytecode must capture the macro-hidden slot on the non-portable path"
+    );
+}
+
+/// bliss-9u6d: the once-per-function up-front macroexpand walks and rebuilds a
+/// closure-bearing body (LET* / FLET) under the moving GC. A regression in
+/// `expand_let` (an unrooted expanded body across the binding rebuild) produced a
+/// cyclic form that later walkers looped on — a crash only under GC stress.
+/// Eager-compiling such a function under stress must stay clean and correct.
+#[test]
+fn gc_stress_macroexpand_letstar_closure_stays_acyclic() {
+    let _guard = gc_stress_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A LET* binding an init-form wrapping a FLET closure whose body calls a
+    // global macro — the shape of stdlib MISMATCH that first tripped this.
+    let program = "(defmacro gm (x) `(+ ,x 1)) \
+        (defun r () (let* ((a 1) (b (+ a 1))) \
+          (flet ((f (z) (gm z))) (+ (f a) (f b))))) \
+        (format t \"~a~%\" (r))";
+    for backend in ["bytecode", "tree-walker"] {
+        let out = Command::new(BIN)
+            .args(["--no-init", "--eval", program])
+            .env("BLISS_BACKEND", backend)
+            .env("BLISS_LAZY_COMPILE", "0")
+            .env("BLISS_HEAP_MB", "2048")
+            .env("BLISS_GC_STRESS", "4")
+            .env("BLISS_GC_POISON", "1")
+            .output()
+            .expect("spawn bliss-cli");
+        assert!(
+            out.status.success(),
+            "{backend} failed under GC stress\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).lines().next(),
+            Some("5")
+        );
+    }
+}
+
 /// Deep recursion under the bytecode backend is bounded by the `BlissStack`
 /// capacity and raises a catchable `STORAGE-CONDITION` (R2.20) — it must not
 /// abort the process. Covers plain recursion and labels-local recursion.
