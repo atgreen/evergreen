@@ -3472,6 +3472,8 @@ impl<'e> Lowerer<'e> {
     /// signalling context (no unwind unless a handler transfers control).
     fn lower_handler_bind(&mut self, rest: BlissVal) -> LowerResult<()> {
         let (bindings_form, body) = cp(rest);
+        let enclosing_locals: std::collections::HashSet<String> =
+            self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
         let mut bindings = Vec::new();
         for binding in list_to_vec(bindings_form) {
             if !binding.is_cons() {
@@ -3486,6 +3488,26 @@ impl<'e> Lowerer<'e> {
             } else {
                 return Err(Bail);
             };
+            // The handler form is evaluated at run time against this activation's
+            // heap env frame (PushHandlerBind), which holds only the *boxed*
+            // locals. `captured_names` is a syntactic pre-scan of the UNEXPANDED
+            // body, so a handler lambda reached through a macro expansion can
+            // capture an enclosing local the scan never saw; that local stays in
+            // a plain frame slot the handler cannot reach, and it would silently
+            // read as unbound/global. Bail so the enclosing form tree-walks —
+            // the same Slot-capture guard `lower_restart_case` applies (bliss-pgu,
+            // sibling of bliss-8lr).
+            let (params, handler_body) = handler_lambda_parts(handler_form);
+            let mut used = std::collections::HashSet::new();
+            collect_symbol_names(handler_body, &mut used);
+            for name in &used {
+                if params.contains(name) || !enclosing_locals.contains(name) {
+                    continue;
+                }
+                if matches!(self.lookup_local(name), Some(VarLoc::Slot(_))) {
+                    return Err(Bail);
+                }
+            }
             bindings.push((sym_name(type_form), handler_form));
         }
 
@@ -5020,6 +5042,40 @@ fn compile_restart_clause(
 
 /// Collect the names of all symbols appearing in `form` (recursively), except
 /// inside `quote`. Used for a conservative free-variable over-approximation.
+/// Split a HANDLER-BIND handler form into `(bound-param-names, capture-scan-body)`
+/// for the Slot-capture guard (bliss-pgu). For `(lambda (params...) . body)` and
+/// `(function (lambda (params...) . body))` the lambda list's own variables are
+/// returned as `params` (they shadow enclosing locals, so are not captures) and
+/// the body is scanned for free references. Any other handler form (a symbol,
+/// `(function name)`, a call producing a function) has no bound params, so the
+/// whole form is scanned.
+fn handler_lambda_parts(
+    handler_form: BlissVal,
+) -> (std::collections::HashSet<String>, BlissVal) {
+    let mut form = handler_form;
+    // Unwrap `(function <x>)` to reach a bare lambda inside `#'(lambda …)`.
+    if form.is_cons() {
+        let (head, rest) = cp(form);
+        if head.is_symbol() && sym_name(head) == "FUNCTION" && rest.is_cons() {
+            form = cp(rest).0;
+        }
+    }
+    if form.is_cons() {
+        let (head, rest) = cp(form);
+        if head.is_symbol() && sym_name(head) == "LAMBDA" && rest.is_cons() {
+            let (params_form, body) = cp(rest);
+            let params: std::collections::HashSet<String> = list_to_vec(params_form)
+                .iter()
+                .filter(|p| p.is_symbol())
+                .map(|p| sym_name(*p))
+                .filter(|n| !n.starts_with('&'))
+                .collect();
+            return (params, body);
+        }
+    }
+    (std::collections::HashSet::new(), handler_form)
+}
+
 fn collect_symbol_names(form: BlissVal, out: &mut std::collections::HashSet<String>) {
     if form.is_symbol() {
         out.insert(sym_name(form));

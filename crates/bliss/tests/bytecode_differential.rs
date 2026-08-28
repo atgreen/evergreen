@@ -165,6 +165,14 @@ const CORPUS: &[&str] = &[
     "(defun f () (handler-case (car 5) (division-by-zero () (quote no)))) (handler-case (f) (type-error () (quote outer-caught)))",
     // ── HANDLER-BIND on bytecode (nmq.7) ──
     "(defun f () (handler-case (handler-bind ((error (lambda (c) (declare (ignore c)) nil))) (car 5)) (error () (quote outer)))) (f)",
+    // A handler lambda directly capturing an enclosing let local (visible to the
+    // pre-scan, so boxed and reachable) must stay correct on bytecode.
+    "(defvar *o* nil) (defun f () (let ((secret 42)) (handler-case (handler-bind ((error (lambda (c) (declare (ignore c)) (setf *o* secret)))) (error \"boom\")) (error () nil)) *o*)) (f)",
+    // A handler lambda that captures an enclosing local only revealed AFTER macro
+    // expansion (compute_captured_names pre-scan miss): the local lives in a plain
+    // frame slot the handler cannot reach, so lowering must bail to the tree-walker
+    // rather than silently lose it (bliss-pgu, sibling of the restart-case guard).
+    "(defvar *o* nil) (defmacro hbm () (quote (handler-bind ((error (lambda (c) (declare (ignore c)) (setf *o* secret)))) (error \"boom\")))) (defun f () (let ((secret 42)) (handler-case (hbm) (error () nil)) *o*)) (f)",
     "(defun f () (catch (quote out) (handler-bind ((error (lambda (c) (declare (ignore c)) (throw (quote out) (quote handled))))) (car 5)))) (f)",
     "(defun f () (block b (handler-bind ((error (lambda (c) (declare (ignore c)) (return-from b (quote via-handler))))) (car 5)))) (f)",
     "(defun f () (handler-bind ((error (lambda (c) c))) (+ 2 3))) (f)",
@@ -413,6 +421,54 @@ fn captured_variadic_parameters_compile_to_bytecode() {
             "{name} should compile instead of bailing:\n{stderr}"
         );
     }
+}
+
+/// bliss-pgu: a HANDLER-BIND handler lambda that captures an enclosing local
+/// only revealed after macro expansion must not miscompile. The
+/// `compute_captured_names` pre-scan runs on the UNEXPANDED body, so it never
+/// boxes `secret`; the handler, evaluated against the activation's heap frame,
+/// cannot reach the plain frame slot. Lowering must bail to the tree-walker (the
+/// same Slot-capture guard `lower_restart_case` applies) so the result stays
+/// correct. Runs eager so the enclosing DEFUN actually reaches the compiler.
+#[test]
+fn macro_hidden_handler_bind_capture_bails_and_stays_correct() {
+    // Both an eager-compiled DEFUN and the tree-walker must return 42 (the
+    // captured value), never :UNTOUCHED (capture lost).
+    let program = "\
+        (defvar *o* :untouched) \
+        (defmacro hbm () \
+          (quote (handler-bind ((error (lambda (c) (declare (ignore c)) (setf *o* secret)))) \
+                   (error \"boom\")))) \
+        (defun f () (setq *o* :untouched) \
+          (let ((secret 42)) (handler-case (hbm) (error () nil)) *o*)) \
+        (format t \"~a~%\" (f))";
+    let mut outputs = Vec::new();
+    for backend in ["tree-walker", "bytecode"] {
+        let out = Command::new(BIN)
+            .arg("--eval")
+            .arg(program)
+            .env("BLISS_BACKEND", backend)
+            .env("BLISS_LAZY_COMPILE", "0")
+            .output()
+            .expect("spawn");
+        assert!(
+            out.status.success(),
+            "{backend} run failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        outputs.push(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    assert_eq!(outputs[0], "42", "tree-walker oracle should capture secret");
+    assert_eq!(
+        outputs[1], outputs[0],
+        "eager-compiled bytecode must match the oracle, not lose the macro-hidden capture"
+    );
 }
 
 /// Deep recursion under the bytecode backend is bounded by the `BlissStack`
