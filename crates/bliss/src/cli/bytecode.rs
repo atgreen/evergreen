@@ -11166,10 +11166,20 @@ extern "C" fn c2i_clear_mv() {
 /// allocating and side-effect-free, so — like `c2i_clear_mv` — it needs no GC
 /// stack map: r14/r15 are callee-saved and rsp stays 16-aligned across the call.
 extern "C" fn c2i_load_global(sym: u64) -> u64 {
-    bliss_rt::symbols::symbol_value(sym as u32)
-        .filter(|v| *v != bliss_rt::value::UNBOUND)
-        .map(|v| v.0)
-        .unwrap_or(bliss_rt::value::NIL.0)
+    match bliss_rt::symbols::symbol_value(sym as u32).filter(|v| *v != bliss_rt::value::UNBOUND) {
+        Some(v) => v.0,
+        None => {
+            // Unbound global/special read: signal UNBOUND-VARIABLE like the T0
+            // interpreter's LoadGlobal arm (and c2i_load_env), rather than
+            // silently yielding NIL. Without this the compiled tier returns NIL
+            // where the tree-walker errors — a tier inconsistency (bliss-56rc).
+            // The error surfaces via NATIVE_ERROR, unwinding the native frame.
+            stash_native_error(BlissError::UnboundVariable(BlissVal::from_symbol_index(
+                sym as u32,
+            )));
+            NIL.0
+        }
+    }
 }
 
 /// Write a global/special symbol's dynamic value cell (bliss-x5y.15). A side
