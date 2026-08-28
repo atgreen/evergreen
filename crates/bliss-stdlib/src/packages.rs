@@ -1218,6 +1218,36 @@ pub fn accessible_symbols(package: BlissVal) -> Vec<BlissVal> {
     .unwrap_or_default()
 }
 
+/// Home `sym` as a *present* INTERNAL symbol of `package` under `bare_name`,
+/// unless a symbol is already present there (internal or external) under that
+/// name — in which case the existing homing wins and this is a no-op. Unlike
+/// [`intern`], this homes an ALREADY-interned symbol without minting a new one,
+/// so the caller (the reader) keeps the symbol's identity. Used to register a
+/// freshly-read bare symbol in the current package so FIND-SYMBOL reports
+/// `:INTERNAL` rather than a fabricated `:INHERITED` (bliss-v15i).
+pub fn intern_present(
+    package: BlissVal,
+    bare_name: &str,
+    sym: BlissVal,
+) -> Result<(), BlissError> {
+    let store = current_store()?;
+    let registry = store
+        .state
+        .read()
+        .map_err(|_| lock_poisoned_error("intern_present"))?;
+    let handle = lookup_package_arc(&registry, package)?;
+    let package = handle
+        .write()
+        .map_err(|_| lock_poisoned_error("intern_present"))?;
+    if package.internal_symbols.get(bare_name).is_some()
+        || package.external_symbols.get(bare_name).is_some()
+    {
+        return Ok(());
+    }
+    package.internal_symbols.insert(bare_name, sym);
+    Ok(())
+}
+
 /// The symbol *present* under `bare_name` in `package` (its own internal or
 /// external map only — NOT inherited from used packages). `None` if absent.
 pub fn find_present_symbol(package: BlissVal, bare_name: &str) -> Option<BlissVal> {

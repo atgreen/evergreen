@@ -4987,6 +4987,12 @@ thread_local! {
     // `resolve_sym`/`read-from-string`; those nested reads must take the reader's
     // default name-keyed path, not recurse back into the resolver (bliss-lb6.12).
     static RESOLVING_SYMBOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // False while the bootstrap prelude (lib/boot.lisp) is loading, true once it
+    // finishes. The prelude defines the standard library with bare (nominally
+    // COMMON-LISP) symbols in the CL-USER context, so `home_defined_symbol` must
+    // NOT home those into CL-USER; only user-level DEFUN/DEFVAR after boot should
+    // be registered present there (bliss-v15i).
+    static BOOT_COMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Printing an instance may dispatch a user `print-object` method, which needs
     // the live env. Like READ_EVAL_ENV, the print entry points park their `&mut
     // Env` here for the span of one print. PRINT_ESCAPE carries `*print-escape*`
@@ -5358,6 +5364,48 @@ fn seed_compile_time_binding(env: &mut Env, symbol: BlissVal, value: BlissVal) {
     let bare = symbol_bare_name(&name);
     if bare != name && !name.starts_with("KEYWORD:") {
         env.set_var(&bare, value);
+    }
+}
+
+/// Home a top-level definition's name as a *present* INTERNAL symbol of the
+/// current package, so FIND-SYMBOL reports `:INTERNAL` (bliss-v15i). A bare
+/// DEFUN/DEFVAR in CL-USER creates the symbol there, but the reader mints it
+/// name-keyed in the global registry without homing it in the package map, so it
+/// was mis-reported as `:INHERITED` via the COMMON-LISP fallback in
+/// `find_symbol_in_package`. This homes the reader's exact handle (identity
+/// preserved) at *definition* time — never at read time, which would wrongly
+/// home every standard/library symbol read during boot.
+///
+/// Scoped to COMMON-LISP-USER (the reported case) and to an unqualified name
+/// (`full == bare`), so a package-qualified or already-homed symbol is left
+/// alone. A standard symbol inherited from COMMON-LISP stays inherited (never
+/// shadowed by a present copy). GC-safe: symbol handles are immediates and the
+/// package registry stores them directly — no Bliss allocation.
+fn home_defined_symbol(env: &Env, name_sym: BlissVal) {
+    if !name_sym.is_symbol() || env.current_package != "COMMON-LISP-USER" {
+        return;
+    }
+    // The bootstrap prelude defines the standard library in the CL-USER context
+    // with bare symbols; those must stay inherited, so home nothing until boot is
+    // complete.
+    if !BOOT_COMPLETE.with(|c| c.get()) {
+        return;
+    }
+    let full = sym_name(name_sym);
+    let bare = symbol_bare_name(&full);
+    if full != bare {
+        // Package-qualified (or keyword) print name: homed by whoever interned
+        // it; do not re-home into CL-USER.
+        return;
+    }
+    if let Some(cl) = bliss_stdlib::find_package("COMMON-LISP") {
+        if bliss_stdlib::find_present_symbol(cl, &bare).is_some() {
+            // A standard CL symbol inherited into CL-USER stays inherited.
+            return;
+        }
+    }
+    if let Some(pkg) = bliss_stdlib::find_package("COMMON-LISP-USER") {
+        let _ = bliss_stdlib::intern_present(pkg, &bare, name_sym);
     }
 }
 
@@ -8561,6 +8609,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 if v.is_symbol() {
                     CONSTANT_VARS.with(|c| c.borrow_mut().insert(sym_name(v)));
+                    // DEFCONSTANT routes its name here; home it present INTERNAL
+                    // in CL-USER so FIND-SYMBOL reports :INTERNAL (bliss-v15i).
+                    home_defined_symbol(env, v);
                 }
                 return Ok(v);
             }
@@ -9546,6 +9597,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 while list.is_cons() {
                     let (sym, rest) = cp(list);
                     proclaim_special(sym);
+                    // DEFVAR/DEFPARAMETER/DECLAIM route their name here; home it
+                    // present INTERNAL in CL-USER so FIND-SYMBOL reports :INTERNAL
+                    // (bliss-v15i). Boot-time proclaims are skipped by the
+                    // BOOT_COMPLETE gate inside the helper.
+                    home_defined_symbol(env, sym);
                     list = rest;
                 }
                 return Ok(NIL);
@@ -16152,6 +16208,9 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::symbols::set_symbol_function(idx, f);
             }
         }
+        // Register the name as present INTERNAL in CL-USER so FIND-SYMBOL reports
+        // :INTERNAL, not a fabricated :INHERITED (bliss-v15i).
+        home_defined_symbol(env, name_form);
         // A DEFUN evaluated inside an enclosing lexical scope closes over it
         // (CLHS 3.1.2.1.3): `(let ((x 42)) (defun f () x))` makes a global F that
         // returns 42. Record the definition-time frame so F's interpreted body
@@ -20450,6 +20509,9 @@ pub fn run(args: &[String]) -> Result<i32, BlissError> {
         let contents = boot_prelude_source()?;
         read_eval_all_env(&contents, &mut env)?;
     }
+    // The prelude is loaded; subsequent DEFUN/DEFVAR are user-level and may be
+    // homed present in CL-USER (bliss-v15i).
+    BOOT_COMPLETE.with(|c| c.set(true));
 
     // A saved `:executable` binary carries its image appended to itself. Detect
     // and load it like `--image`, but treat the process as that saved program:
