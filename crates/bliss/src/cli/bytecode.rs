@@ -688,6 +688,17 @@ struct Lowerer<'e> {
     /// through the shared tag-token stack (`env.tag_stack`) — the tagbody
     /// analogue of `enclosing_blocks` (bliss-x8t).
     enclosing_tags: std::collections::HashSet<String>,
+    /// Names bound to an *unboxed frame slot* in an enclosing function that this
+    /// body (a nested closure) closes over. Such a name cannot be reached from
+    /// the child — the parent slot lives on the bytecode operand frame, not in
+    /// the captured heap env frame — so a reference to one (which can surface
+    /// only after macro expansion, invisible to the pre-scan that decides
+    /// boxing) must bail the compile to the tree-walker (bliss-9u6d). This
+    /// closes the *portable* (BFASL) path: a capturing closure there is lowered
+    /// to a nested bytecode function, and this catches the reference at the point
+    /// it resolves. Empty for top-level functions. (The non-portable EvalHost
+    /// path defers closures to the tree-walker and is tracked separately.)
+    enclosing_slots: std::collections::HashSet<String>,
     /// Lexically enclosing tagbodies: `(tagbody_id, tag → target bcp)`.
     tag_scope: Vec<TagScope>,
     /// `Go` instructions awaiting target-bcp patching once their tagbody's tag
@@ -766,6 +777,7 @@ impl<'e> Lowerer<'e> {
             block_scope: Vec::new(),
             enclosing_blocks: std::collections::HashSet::new(),
             enclosing_tags: std::collections::HashSet::new(),
+            enclosing_slots: std::collections::HashSet::new(),
             tag_scope: Vec::new(),
             pending_gos: Vec::new(),
             handler_cases: Vec::new(),
@@ -967,6 +979,15 @@ impl<'e> Lowerer<'e> {
                 }
                 self.push_n(1);
                 return Ok(());
+            }
+            // A name bound to an unboxed slot in an enclosing function is a
+            // lexical reference this nested closure cannot represent (the slot is
+            // not in the captured heap frame). It reaches here only when macro
+            // expansion revealed it after the boxing pre-scan, so bail the
+            // compile to the tree-walker rather than mis-resolve it as a global
+            // (bliss-9u6d).
+            if self.enclosing_slots.contains(&name) {
+                return Err(Bail);
             }
             // A global / special / symbol-macro reference. Symbol-macros must
             // expand (tree-walker semantics) — bail on those; otherwise emit a
@@ -1753,6 +1774,12 @@ impl<'e> Lowerer<'e> {
                 }
             }
             None => {
+                // Assigning a name bound to an enclosing function's unboxed slot
+                // (revealed post-macro-expansion) cannot be represented here; bail
+                // rather than clobber a global of the same name (bliss-9u6d).
+                if self.enclosing_slots.contains(&name) {
+                    return Err(Bail);
+                }
                 let sym = var.as_symbol_index();
                 self.emit(Instr::StoreGlobal(sym));
                 self.pop_n(1);
@@ -3956,6 +3983,19 @@ impl<'e> Lowerer<'e> {
     /// Enclosing lexical locals a `(lambda params body)` captures (free symbols
     /// of the body minus the lambda's own params, restricted to names bound in
     /// an enclosing scope).
+    /// Names bound to an unboxed frame slot anywhere in the current lexical
+    /// scope, plus any inherited from an outer function — the set a nested
+    /// closure compiled from here must not reference (bliss-9u6d).
+    fn enclosing_slot_names(&self) -> std::collections::HashSet<String> {
+        self.scopes
+            .iter()
+            .flat_map(|s| s.iter())
+            .filter(|(_, v)| matches!(v, VarLoc::Slot(_)))
+            .map(|(k, _)| k.clone())
+            .chain(self.enclosing_slots.iter().cloned())
+            .collect()
+    }
+
     fn lambda_captured_locals(&self, params_form: BlissVal, body: BlissVal) -> Vec<String> {
         let params: std::collections::HashSet<String> = list_to_vec(params_form)
             .iter()
@@ -4026,6 +4066,10 @@ impl<'e> Lowerer<'e> {
             .flat_map(|s| s.tags.keys().cloned())
             .chain(self.enclosing_tags.iter().cloned())
             .collect();
+        // Slot-bound names an enclosing function owns: a macro-revealed reference
+        // to one inside this closure body must bail, not resolve as a global
+        // (bliss-9u6d).
+        let enclosing_slots = self.enclosing_slot_names();
         let bf = if captured.is_empty() {
             compile_function_in(
                 "<lambda>",
@@ -4036,6 +4080,7 @@ impl<'e> Lowerer<'e> {
                 false,
                 &enclosing_blocks,
                 &enclosing_tags,
+                &enclosing_slots,
             )
             .ok_or(Bail)?
         } else {
@@ -4066,6 +4111,7 @@ impl<'e> Lowerer<'e> {
                 &callable,
                 &enclosing_blocks,
                 &enclosing_tags,
+                &enclosing_slots,
                 self.portable,
             )
             .ok_or(Bail)?
@@ -4364,6 +4410,9 @@ impl<'e> Lowerer<'e> {
             .flat_map(|s| s.tags.keys().cloned())
             .chain(self.enclosing_tags.iter().cloned())
             .collect();
+        // Enclosing slot names (incl. inherited) so a macro-revealed reference to
+        // an unboxed parent slot inside a closure body bails (bliss-9u6d).
+        let child_enclosing_slots = self.enclosing_slot_names();
 
         // Build each closure and store it in the child frame. Re-derive
         // params/fbody from the rooted `defs` each iteration (compilation allocates).
@@ -4377,6 +4426,7 @@ impl<'e> Lowerer<'e> {
                 &callable,
                 &enclosing_blocks,
                 &enclosing_tags,
+                &child_enclosing_slots,
                 self.portable,
             )
             .ok_or(Bail)?;
@@ -4481,6 +4531,7 @@ fn compile_capturing_local(
     callable: &std::collections::HashSet<String>,
     enclosing_blocks: &std::collections::HashSet<String>,
     enclosing_tags: &std::collections::HashSet<String>,
+    enclosing_slots: &std::collections::HashSet<String>,
     portable: bool,
 ) -> Option<BytecodeFunction> {
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
@@ -4495,6 +4546,13 @@ fn compile_capturing_local(
     lo.closure_fns = callable.clone();
     lo.enclosing_blocks = enclosing_blocks.clone();
     lo.enclosing_tags = enclosing_tags.clone();
+    // A capture/param of the same name shadows an enclosing slot (it resolves
+    // locally first), so keep only genuinely-free enclosing slots (bliss-9u6d).
+    lo.enclosing_slots = enclosing_slots
+        .iter()
+        .filter(|n| !captures.contains(*n) && !param_names.contains(n))
+        .cloned()
+        .collect();
     for name in captures {
         lo.scopes[0].insert(name.clone(), VarLoc::Boxed);
     }
@@ -5622,6 +5680,7 @@ fn compile_function(
         macro_lambda_list,
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
     )
 }
 
@@ -5638,6 +5697,7 @@ fn compile_function_in(
     macro_lambda_list: bool,
     enclosing_blocks: &std::collections::HashSet<String>,
     enclosing_tags: &std::collections::HashSet<String>,
+    enclosing_slots: &std::collections::HashSet<String>,
 ) -> Option<BytecodeFunction> {
     bliss_rt::rooted!(params_form = params_form);
     bliss_rt::rooted!(body = body);
@@ -5691,6 +5751,13 @@ fn compile_function_in(
     lo.captured_names = compute_captured_names(*body);
     lo.enclosing_blocks = enclosing_blocks.clone();
     lo.enclosing_tags = enclosing_tags.clone();
+    // Drop names shadowed by this function's own params: only genuinely-free
+    // references to an unreachable enclosing slot should bail (bliss-9u6d).
+    lo.enclosing_slots = enclosing_slots
+        .iter()
+        .filter(|n| !param_names.contains(n))
+        .cloned()
+        .collect();
     let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
         let loc = lo.alloc_local(pn);

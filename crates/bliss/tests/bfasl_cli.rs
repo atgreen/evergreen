@@ -157,6 +157,52 @@ fn handler_case_bfasl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// bliss-9u6d: a nested closure (lambda / flet) that captures an enclosing
+/// frame-slot local only through a macro expansion inside the closure body must
+/// not miscompile in a portable `.bfasl`. The macro-blind capture pre-scan never
+/// boxes the local, so a naively-compiled closure resolves it as a global and the
+/// loaded fasl raises `unbound variable`. The compiler must instead bail such a
+/// definition to the source fallback (it loads and runs on the tree-walker),
+/// giving the correct captured value after a round trip.
+#[test]
+fn macro_hidden_closure_capture_bfasl_round_trip() {
+    let dir = workdir("macro-hidden-capture");
+    let src = dir.join("mh.lisp");
+    let out = dir.join("mh.bfasl");
+    fs::write(
+        &src,
+        "(defvar *o* :untouched)\n\
+         (defmacro gx () 'x)\n\
+         (defun via-lambda () (let ((x 42)) (funcall (lambda () (setf *o* (gx)))) *o*))\n\
+         (defun via-flet () (let ((x 7)) (flet ((g () (setf *o* (gx)))) (g)) *o*))\n",
+    )
+    .unwrap();
+
+    let c = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        c.status.success(),
+        "compile-file failed: {}",
+        String::from_utf8_lossy(&c.stderr)
+    );
+
+    let l = run(&format!(
+        "(progn (load \"{}\") (list (via-lambda) (via-flet)))",
+        out.display()
+    ));
+    assert!(
+        l.status.success(),
+        "load failed (macro-hidden capture must not raise unbound-variable): {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&l.stdout).trim(), "(42 7)");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A user `(defun (setf f) …)` writer and its use `(setf (f …) v)` must both
 /// lower to source-free bytecode (the writer installed under a canonical symbol,
 /// the use dispatched through it), and `setf` of composed `c[ad]+r` places must
