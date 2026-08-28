@@ -178,11 +178,13 @@
                            (or (ignore-errors (funcall (lambda ,lambda-list ,@body)))
                                t))
                      *type-definitions*))
+         (bliss-internal::%home-symbol ',name)
          ',name)
       `(progn
          (setq *type-definitions*
                (cons (list ',name ,(if body (cons 'progn body) t))
                      *type-definitions*))
+         (bliss-internal::%home-symbol ',name)
          ',name)))
 
 ;; Track condition definitions so MAKE-CONDITION/SIGNAL can create and match

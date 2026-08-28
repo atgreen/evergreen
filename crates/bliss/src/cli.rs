@@ -8638,6 +8638,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(v);
             }
+            "BLISS-INTERNAL::%HOME-SYMBOL"
+            | "BLISS-INTERNAL:%HOME-SYMBOL"
+            | "%HOME-SYMBOL" => {
+                // (%home-symbol 'name) — register NAME present INTERNAL in the
+                // current package (CL-USER), for Lisp-level definers (e.g. the
+                // DEFTYPE macro) that have no dedicated Rust choke point
+                // (bliss-4n3h). Returns the symbol.
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                home_defined_symbol(env, v);
+                return Ok(v);
+            }
             "BLISS-INTERNAL::%DEFINE-CONDITION-PORTABLE"
             | "BLISS-INTERNAL:%DEFINE-CONDITION-PORTABLE"
             | "%DEFINE-CONDITION-PORTABLE" => {
@@ -17065,6 +17077,8 @@ fn eval_defmacro(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, rest) = cp(cdr);
     let (params_form, body) = cp(rest);
     let name = sym_name(name_form);
+    // Register the name present INTERNAL in CL-USER (bliss-v15i / bliss-4n3h).
+    home_defined_symbol(env, name_form);
 
     // A top-level DEFMACRO is GLOBAL (CLHS): register it in the global macro
     // table so it survives the throwaway child Envs used while compiling/loading
@@ -18074,6 +18088,8 @@ fn eval_defclass(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (supers_form, rest2) = cp(rest);
     let (slots_form, class_options) = cp(rest2);
     bliss_rt::rooted_ref!(_name_form_root = &mut name_form);
+    // Register the class name present INTERNAL in CL-USER (bliss-4n3h).
+    home_defined_symbol(env, name_form);
 
     let name = sym_name(name_form);
 
@@ -18394,6 +18410,8 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     } else {
         name_spec
     };
+    // Register the struct name present INTERNAL in CL-USER (bliss-4n3h).
+    home_defined_symbol(env, name_sym);
     let name_str = symbol_bare_name(&sym_name(name_sym));
 
     // Parse DEFSTRUCT options from the `(name option...)` head. Supported:
@@ -18606,6 +18624,9 @@ fn eval_defgeneric(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     invalidate_gf_dispatch_cache(); // generic (re)definition (bliss-x5y.20)
     let (mut name_form, options) = cp(cdr);
     bliss_rt::rooted_ref!(_name_form_root = &mut name_form);
+    // Register the generic-function name present INTERNAL in CL-USER (a `(setf
+    // f)` name is a list and is skipped by the helper) (bliss-4n3h).
+    home_defined_symbol(env, name_form);
     let name = function_name_key(name_form);
     let mut combination = bliss_stdlib::MethodCombinationType::Standard;
     // `(:method qualifier* specialized-lambda-list body...)` options each define a
