@@ -264,9 +264,18 @@
 ;; String-producing printers, built on FORMAT now that ~A/~S print lists.
 (defun princ-to-string (x) (format nil "~a" x))
 (defun prin1-to-string (x) (format nil "~s" x))
-(defun write-to-string (x &rest ignore)
-  (declare (ignore ignore))
-  (format nil "~s" x))
+(defun write-to-string (x &rest keys)
+  ;; Honour the print-control keywords that affect integer/general output:
+  ;; :base rebinds *print-base* (the printer reads it), and :escape selects
+  ;; ~S (readable, default) vs ~A. Other keys are accepted and ignored for now
+  ;; (bliss-82lz). *print-base*/*print-escape* are defvar'd later in this file;
+  ;; the body runs post-boot, so they are bound and special by call time.
+  (let* ((base-tail (member :base keys))
+         (escape-tail (member :escape keys))
+         (*print-base* (if base-tail (cadr base-tail) *print-base*)))
+    (if (and escape-tail (null (cadr escape-tail)))
+        (format nil "~a" x)
+        (format nil "~s" x))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Control-flow macros still needed during the Stage 2 bootstrap.

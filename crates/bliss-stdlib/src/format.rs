@@ -61,6 +61,72 @@ fn extract_bliss_string(v: BlissVal) -> Option<String> {
     }
 }
 
+/// The current `*PRINT-BASE*` radix (CLHS 22.1.1.1), read directly from the
+/// special's global value cell — which a dynamic `(let ((*print-base* r)) …)`
+/// save/restores — so BOTH printers (the interpreter's `print_val` and this
+/// stdlib printer) honour it identically, keeping tree-walked and compiled
+/// integer output the same (bliss-82lz). Clamped to `[2, 36]`; defaults to 10
+/// when unbound or out of range. Reads via `find_index` (the reliable registry
+/// lookup), NOT `resolve_sym`, which mints a distinct symbol whose cell stays at
+/// the default.
+pub fn print_base() -> u32 {
+    bliss_rt::symbols::find_index("*PRINT-BASE*")
+        .and_then(bliss_rt::symbols::symbol_value)
+        .filter(|v| v.is_fixnum())
+        .map(|v| v.as_fixnum())
+        .filter(|&b| (2..=36).contains(&b))
+        .map(|b| b as u32)
+        .unwrap_or(10)
+}
+
+/// Render a fixnum in `radix` (2..=36) with a leading `-` for negatives and
+/// upper-cased digits — the plain-integer form used by `~A`/`~S`/PRINT under
+/// `*print-base*`. Shared by this printer and the interpreter's `print_val` so
+/// both tiers agree (bliss-82lz).
+pub fn fixnum_to_radix(n: i64, radix: u32) -> String {
+    format_integer(n, radix, false, false, 0, ' ')
+}
+
+/// Render a bignum (little-endian base-2^64 limbs) in `radix` (2..=36), digits
+/// upper-cased. `radix == 10` delegates to the chunked [`bignum_to_decimal`]
+/// (faster, and the `~D`/comma path); other radices use straight long division
+/// so `*print-base*` is honoured for heap integers too (bliss-82lz).
+pub fn bignum_to_radix(sign: i32, limbs: &[u64], radix: u32) -> String {
+    if radix == 10 {
+        return bignum_to_decimal(sign, limbs);
+    }
+    if sign == 0 || limbs.iter().all(|&l| l == 0) {
+        return "0".into();
+    }
+    let mut work = limbs.to_vec();
+    let mut digits: Vec<char> = Vec::new();
+    loop {
+        let mut rem: u128 = 0;
+        for limb in work.iter_mut().rev() {
+            let cur = (rem << 64) | (*limb as u128);
+            *limb = (cur / radix as u128) as u64;
+            rem = cur % radix as u128;
+        }
+        digits.push(
+            char::from_digit(rem as u32, radix)
+                .unwrap()
+                .to_ascii_uppercase(),
+        );
+        while work.len() > 1 && *work.last().unwrap() == 0 {
+            work.pop();
+        }
+        if work.len() == 1 && work[0] == 0 {
+            break;
+        }
+    }
+    let mut s = String::new();
+    if sign < 0 {
+        s.push('-');
+    }
+    s.extend(digits.iter().rev());
+    s
+}
+
 /// Render a bignum (little-endian base-2^64 limbs) as a decimal string.
 /// Shared with the interpreter's printer so `~A`/`~S`, PRINT, and the REPL all
 /// render heap integers the same way (bliss-axe).
@@ -124,7 +190,7 @@ fn heap_number_string(v: BlissVal, escapep: bool) -> Option<String> {
                 for i in 0..n {
                     limbs.push(*(ptr.add(16 + i * 8) as *const u64));
                 }
-                Some(bignum_to_decimal(sign, &limbs))
+                Some(bignum_to_radix(sign, &limbs, print_base()))
             }
             type_id::RATIO => {
                 let num = *(ptr.add(8) as *const BlissVal);
@@ -216,7 +282,11 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         return format_instance(v);
     }
     if v.is_fixnum() {
-        return format!("{}", v.as_fixnum());
+        let base = print_base();
+        if base == 10 {
+            return format!("{}", v.as_fixnum());
+        }
+        return fixnum_to_radix(v.as_fixnum(), base);
     }
     if v.is_character() {
         let c = v.as_char();

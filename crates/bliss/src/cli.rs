@@ -4279,7 +4279,16 @@ fn print_val(val: BlissVal, out: &mut String) {
         out.push_str(&name);
         out.push('>');
     } else if val.is_fixnum() {
-        out.push_str(&val.as_fixnum().to_string());
+        // Honour *PRINT-BASE* so tree-walked PRINT/PRIN1 matches the stdlib
+        // printer (FORMAT ~A/~S and the compiled write-to-string path); a
+        // dynamic `(let ((*print-base* r)) …)` binding is read from the value
+        // cell (bliss-82lz).
+        let base = bliss_stdlib::format::print_base();
+        if base == 10 {
+            out.push_str(&val.as_fixnum().to_string());
+        } else {
+            out.push_str(&bliss_stdlib::format::fixnum_to_radix(val.as_fixnum(), base));
+        }
     } else if val.is_single_float() {
         let s = format!("{}", val.as_single_float());
         out.push_str(&s);
@@ -4412,7 +4421,11 @@ fn print_val(val: BlissVal, out: &mut String) {
                     for i in 0..n {
                         limbs.push(*(ptr.add(16 + i * 8) as *const u64));
                     }
-                    out.push_str(&bignum_to_decimal(sign, &limbs));
+                    out.push_str(&bliss_stdlib::format::bignum_to_radix(
+                        sign,
+                        &limbs,
+                        bliss_stdlib::format::print_base(),
+                    ));
                 }
                 type_id::SIMPLE_ARRAY if bliss_rt::types::bit_vector_p(val) => {
                     // A bit-vector prints in `#*bits` syntax (bliss-zg9).
@@ -4431,13 +4444,6 @@ fn print_val(val: BlissVal, out: &mut String) {
     } else {
         out.push_str(&format!("#<unknown {:#x}>", val.0));
     }
-}
-
-/// Render a bignum (little-endian base-2^64 limbs) as a decimal string.
-/// Delegates to the stdlib renderer so the interpreter's printer and FORMAT
-/// ~A/~S agree (bliss-axe).
-fn bignum_to_decimal(sign: i32, limbs: &[u64]) -> String {
-    bliss_stdlib::format::bignum_to_decimal(sign, limbs)
 }
 
 #[inline]
@@ -10773,6 +10779,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(arena_str(&s));
             }
             "WRITE-TO-STRING" => {
+                // Fallback path (the boot.lisp WRITE-TO-STRING defun normally
+                // handles the print-control keywords, incl. :base/:escape —
+                // bliss-82lz). Reached only if that global is unavailable.
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(arena_str(&format_val_env(v, env, true)));
