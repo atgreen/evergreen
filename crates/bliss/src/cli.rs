@@ -12904,6 +12904,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (bliss-jtc.23.3).
                 if let Some(frame) = bytecode::closure_captured_env(fn_val) {
                     call_parent = frame;
+                } else {
+                    // Non-closure GLOBAL defun: its definition environment is the
+                    // null lexical environment (top level), NOT the caller's
+                    // frame. Free-variable lookup must see only the callee's own
+                    // params plus globals/specials (resolved via the symbol value
+                    // cell in lookup_var), never the caller's lexical locals —
+                    // otherwise a callee dynamically scopes the caller's LET, and
+                    // the cold tree-walked result diverges from the lexical
+                    // bytecode backend (a tier inconsistency). bliss-20o.
+                    call_parent = Rc::new(RefCell::new(EnvFrame::default()));
                 }
             }
             // The rooted argument vector is rewritten in place by any collection
@@ -15907,6 +15917,57 @@ fn is_special_var(sym: BlissVal) -> bool {
     is_proclaimed_special(&bare)
 }
 
+/// Collect the symbol indices named in leading `(declare (special v …))` forms
+/// at the head of a LET/LET* body. Per CLHS 3.3.4, such a binding is *dynamic*
+/// (value-cell, save/restore) even when the name is not globally special —
+/// without this a callee reached from the body cannot see the binding, and the
+/// body's own reference falls through to the global cell as unbound (bliss-20o).
+/// Pure list-walk over already-live conses — no Bliss allocation, GC-safe.
+fn let_body_special_decls(body: BlissVal) -> Vec<u32> {
+    let mut specials = Vec::new();
+    let mut cursor = body;
+    while cursor.is_cons() {
+        let (form, rest) = cp(cursor);
+        // Declarations must precede every non-declaration form; stop at the
+        // first form that is not `(declare …)`.
+        if !form.is_cons() {
+            break;
+        }
+        let (head, decls) = cp(form);
+        if !(head.is_symbol() && symbol_bare_name(&sym_name(head)) == "DECLARE") {
+            break;
+        }
+        let mut d = decls;
+        while d.is_cons() {
+            let (spec, drest) = cp(d);
+            d = drest;
+            if !spec.is_cons() {
+                continue;
+            }
+            let (kind, names) = cp(spec);
+            if kind.is_symbol() && symbol_bare_name(&sym_name(kind)) == "SPECIAL" {
+                let mut n = names;
+                while n.is_cons() {
+                    let (nm, nrest) = cp(n);
+                    n = nrest;
+                    if nm.is_symbol() {
+                        specials.push(nm.as_symbol_index());
+                    }
+                }
+            }
+        }
+        cursor = rest;
+    }
+    specials
+}
+
+/// True when a LET/LET* binding of `sym` must be dynamic: earmuffed/proclaimed
+/// special, or named in a `(declare (special …))` at the head of that let's
+/// body (`body_specials`, from [`let_body_special_decls`]). bliss-20o.
+fn let_binding_is_dynamic(sym: BlissVal, body_specials: &[u32]) -> bool {
+    is_special_var(sym) || (sym.is_symbol() && body_specials.contains(&sym.as_symbol_index()))
+}
+
 /// RAII guard for a dynamic (special-variable) binding: it saves the symbol's
 /// current global value cell and restores it on drop, so the binding is undone
 /// on every exit path from the `let` — normal return or an error unwinding
@@ -15945,8 +16006,13 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
     let (bindings_form, body) = cp(cdr);
     let parent = Rc::clone(&env.frame);
 
+    // Names made dynamic by a `(declare (special v))` at the head of the body,
+    // in addition to earmuffed / proclaimed specials (CLHS 3.3.4; bliss-20o).
+    let body_specials = let_body_special_decls(body);
+
     if sequential {
         // let*: one child frame; each init sees the bindings established before it.
+        let body_specials = body_specials.clone();
         return with_child_frame(env, parent, move |env| {
             // Root the binding-list cursor, the body, and the DynBind guards
             // (their `saved` cells) across the allocating init evaluations
@@ -15966,7 +16032,7 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                     let (var_form, val_rest) = cp(binding);
                     let (val_form, _) = cp(val_rest);
                     let val = eval_form(val_form, env)?;
-                    if is_special_var(var_form) {
+                    if let_binding_is_dynamic(var_form, &body_specials) {
                         dyn_binds.push(DynBind::establish(var_form, val));
                     } else if var_form.is_symbol() {
                         env.define_local_symbol(var_form, val);
@@ -15974,7 +16040,7 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
                         env.define_local(&sym_name(var_form), val);
                     }
                 } else if binding.is_symbol() {
-                    if is_special_var(binding) {
+                    if let_binding_is_dynamic(binding, &body_specials) {
                         dyn_binds.push(DynBind::establish(binding, NIL));
                     } else {
                         env.define_local_symbol(binding, NIL);
@@ -16020,7 +16086,7 @@ fn eval_let(cdr: BlissVal, env: &mut Env, sequential: bool) -> Result<BlissVal, 
         bliss_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
         for i in 0..evaluated.len() {
             let (symbol, val) = evaluated[i];
-            if is_special_var(symbol) {
+            if let_binding_is_dynamic(symbol, &body_specials) {
                 dyn_binds.push(DynBind::establish(symbol, val));
             } else if symbol.is_symbol() {
                 env.define_local_symbol(symbol, val);
@@ -18939,6 +19005,13 @@ fn apply_function(
                 // the captured environment, not the caller's frame (jtc.23.3).
                 if let Some(frame) = bytecode::closure_captured_env(fn_val) {
                     call_parent = frame;
+                } else {
+                    // Non-closure GLOBAL defun reached through funcall/apply/c2i:
+                    // its definition environment is the null lexical environment,
+                    // NOT the caller's frame, so free vars resolve to params +
+                    // globals/specials only (bliss-20o; see operator-position
+                    // path for the full rationale).
+                    call_parent = Rc::new(RefCell::new(EnvFrame::default()));
                 }
             }
             let res = eval_lambda_call(env, params_form, body, args, call_parent);
