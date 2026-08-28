@@ -4284,10 +4284,15 @@ fn print_val(val: BlissVal, out: &mut String) {
         // dynamic `(let ((*print-base* r)) …)` binding is read from the value
         // cell (bliss-82lz).
         let base = bliss_stdlib::format::print_base();
-        if base == 10 {
-            out.push_str(&val.as_fixnum().to_string());
+        let digits = if base == 10 {
+            val.as_fixnum().to_string()
         } else {
-            out.push_str(&bliss_stdlib::format::fixnum_to_radix(val.as_fixnum(), base));
+            bliss_stdlib::format::fixnum_to_radix(val.as_fixnum(), base)
+        };
+        if bliss_stdlib::format::print_radix_active() {
+            out.push_str(&bliss_stdlib::format::decorate_integer_radix(digits, base));
+        } else {
+            out.push_str(&digits);
         }
     } else if val.is_single_float() {
         let s = format!("{}", val.as_single_float());
@@ -4400,9 +4405,19 @@ fn print_val(val: BlissVal, out: &mut String) {
                 type_id::RATIO => {
                     let num = *(ptr.add(8) as *const BlissVal);
                     let den = *(ptr.add(16) as *const BlissVal);
+                    // A ratio takes one leading radix specifier under
+                    // *print-radix*; suppress per-part decoration while printing
+                    // num/den (bliss-6i2z).
+                    let radix = bliss_stdlib::format::print_radix_active();
+                    if radix {
+                        let base = bliss_stdlib::format::print_base();
+                        out.push_str(&bliss_stdlib::format::ratio_radix_prefix(base));
+                    }
+                    let prev = bliss_stdlib::format::suppress_integer_radix(true);
                     print_val(num, out);
                     out.push('/');
                     print_val(den, out);
+                    bliss_stdlib::format::suppress_integer_radix(prev);
                 }
                 type_id::COMPLEX => {
                     // #C(realpart imagpart) (bliss-c0m).
@@ -4421,11 +4436,13 @@ fn print_val(val: BlissVal, out: &mut String) {
                     for i in 0..n {
                         limbs.push(*(ptr.add(16 + i * 8) as *const u64));
                     }
-                    out.push_str(&bliss_stdlib::format::bignum_to_radix(
-                        sign,
-                        &limbs,
-                        bliss_stdlib::format::print_base(),
-                    ));
+                    let base = bliss_stdlib::format::print_base();
+                    let digits = bliss_stdlib::format::bignum_to_radix(sign, &limbs, base);
+                    if bliss_stdlib::format::print_radix_active() {
+                        out.push_str(&bliss_stdlib::format::decorate_integer_radix(digits, base));
+                    } else {
+                        out.push_str(&digits);
+                    }
                 }
                 type_id::SIMPLE_ARRAY if bliss_rt::types::bit_vector_p(val) => {
                     // A bit-vector prints in `#*bits` syntax (bliss-zg9).

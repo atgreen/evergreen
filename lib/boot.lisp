@@ -271,8 +271,10 @@
   ;; (bliss-82lz). *print-base*/*print-escape* are defvar'd later in this file;
   ;; the body runs post-boot, so they are bound and special by call time.
   (let* ((base-tail (member :base keys))
+         (radix-tail (member :radix keys))
          (escape-tail (member :escape keys))
-         (*print-base* (if base-tail (cadr base-tail) *print-base*)))
+         (*print-base* (if base-tail (cadr base-tail) *print-base*))
+         (*print-radix* (if radix-tail (cadr radix-tail) *print-radix*)))
     (if (and escape-tail (null (cadr escape-tail)))
         (format nil "~a" x)
         (format nil "~s" x))))

@@ -87,6 +87,62 @@ pub fn fixnum_to_radix(n: i64, radix: u32) -> String {
     format_integer(n, radix, false, false, 0, ' ')
 }
 
+thread_local! {
+    // Set while printing a rational's numerator/denominator so those integer
+    // components are NOT individually radix-decorated: a ratio takes a single
+    // leading radix specifier around the whole `num/den`, not a per-part
+    // decoration (CLHS 22.1.3.1.1; bliss-6i2z).
+    static SUPPRESS_INT_RADIX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The current `*PRINT-RADIX*` flag, read from the value cell via `find_index`
+/// (like [`print_base`]). Defaults to NIL. bliss-6i2z.
+fn print_radix() -> bool {
+    bliss_rt::symbols::find_index("*PRINT-RADIX*")
+        .and_then(bliss_rt::symbols::symbol_value)
+        .map(|v| !v.is_nil())
+        .unwrap_or(false)
+}
+
+/// True when an integer should be decorated with a `*print-radix*` specifier
+/// right now: `*print-radix*` is set AND we are not inside a ratio's part-print
+/// (which suppresses per-part decoration). Both printers gate on this.
+pub fn print_radix_active() -> bool {
+    print_radix() && !SUPPRESS_INT_RADIX.with(|c| c.get())
+}
+
+/// Enter/leave the ratio-part context; returns the previous value so the caller
+/// can restore it after printing the numerator and denominator.
+pub fn suppress_integer_radix(v: bool) -> bool {
+    SUPPRESS_INT_RADIX.with(|c| c.replace(v))
+}
+
+/// Decorate an integer's already-rendered `digits` (in `base`, sign included)
+/// with its `*print-radix*` specifier (CLHS 22.1.3.1.1): base 10 → trailing
+/// `.`; base 2/8/16 → leading `#b`/`#o`/`#x`; else `#<base>r`. The caller applies
+/// this only when [`print_radix_active`] is true.
+pub fn decorate_integer_radix(digits: String, base: u32) -> String {
+    match base {
+        10 => format!("{}.", digits),
+        2 => format!("#b{}", digits),
+        8 => format!("#o{}", digits),
+        16 => format!("#x{}", digits),
+        b => format!("#{}r{}", b, digits),
+    }
+}
+
+/// The leading radix specifier for a RATIO under `*print-radix*`: `#b`/`#o`/`#x`
+/// for base 2/8/16, else `#<base>r` (base 10 → `#10r`, per CLHS — ratios use a
+/// leading specifier, not the integer's trailing dot). bliss-6i2z.
+pub fn ratio_radix_prefix(base: u32) -> String {
+    match base {
+        2 => "#b".into(),
+        8 => "#o".into(),
+        16 => "#x".into(),
+        b => format!("#{}r", b),
+    }
+}
+
 /// Render a bignum (little-endian base-2^64 limbs) in `radix` (2..=36), digits
 /// upper-cased. `radix == 10` delegates to the chunked [`bignum_to_decimal`]
 /// (faster, and the `~D`/comma path); other radices use straight long division
@@ -190,16 +246,33 @@ fn heap_number_string(v: BlissVal, escapep: bool) -> Option<String> {
                 for i in 0..n {
                     limbs.push(*(ptr.add(16 + i * 8) as *const u64));
                 }
-                Some(bignum_to_radix(sign, &limbs, print_base()))
+                let base = print_base();
+                let digits = bignum_to_radix(sign, &limbs, base);
+                Some(if print_radix_active() {
+                    decorate_integer_radix(digits, base)
+                } else {
+                    digits
+                })
             }
             type_id::RATIO => {
                 let num = *(ptr.add(8) as *const BlissVal);
                 let den = *(ptr.add(16) as *const BlissVal);
-                Some(format!(
+                let base = print_base();
+                let radix = print_radix_active();
+                // Print num/den WITHOUT per-part radix decoration; the ratio
+                // takes a single leading specifier (bliss-6i2z).
+                let prev = suppress_integer_radix(true);
+                let body = format!(
                     "{}/{}",
                     blissval_to_print_string(num, escapep),
                     blissval_to_print_string(den, escapep)
-                ))
+                );
+                suppress_integer_radix(prev);
+                Some(if radix {
+                    format!("{}{}", ratio_radix_prefix(base), body)
+                } else {
+                    body
+                })
             }
             type_id::COMPLEX => {
                 let rp = *(ptr.add(8) as *const BlissVal);
@@ -283,10 +356,16 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
     }
     if v.is_fixnum() {
         let base = print_base();
-        if base == 10 {
-            return format!("{}", v.as_fixnum());
-        }
-        return fixnum_to_radix(v.as_fixnum(), base);
+        let digits = if base == 10 {
+            format!("{}", v.as_fixnum())
+        } else {
+            fixnum_to_radix(v.as_fixnum(), base)
+        };
+        return if print_radix_active() {
+            decorate_integer_radix(digits, base)
+        } else {
+            digits
+        };
     }
     if v.is_character() {
         let c = v.as_char();
