@@ -1310,6 +1310,23 @@ thread_local! {
     /// registered handle and resolved symbol so unchanged macros are reused.
     static MACRO_FN_CACHE: RefCell<HashMap<String, MacroFnCacheEntry>> =
         RefCell::new(HashMap::new());
+
+    /// Bumped whenever the global macro table (`GLOBAL_MACROS`) changes, to
+    /// invalidate the cached global-macro MacroexpandEnv below (bliss-usb2).
+    static MACRO_ENV_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Cached `(generation, env)` where `env` holds every global macro in its
+    /// function map. `macroexpand_environment_from_cli` was rebuilding this for
+    /// EVERY compiled form — cloning all of GLOBAL_MACROS and re-augmenting once
+    /// per macro — which dominated load compile time and blocked any per-closure
+    /// macro-aware analysis (bliss-usb2 / bliss-9u6d). The function-map values are
+    /// immediate macro handles (`from_macro_handle`), so this env holds no movable
+    /// GC pointers and is safe to retain across collections without tracing.
+    static CLI_GLOBAL_MACRO_ENV: RefCell<Option<(u64, MacroexpandEnv)>> =
+        const { RefCell::new(None) };
+}
+
+fn bump_macro_env_generation() {
+    MACRO_ENV_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
 }
 
 /// Address-identity of an `EnvFrame`, for comparing whether the current frame is
@@ -1384,6 +1401,7 @@ fn global_macro_insert(name: String, def: MacroDef) {
     debug_validate_form("defmacro", &name, def.params_form);
     debug_validate_form("defmacro", &name, def.body);
     GLOBAL_MACROS.with(|m| m.borrow_mut().insert(name, def));
+    bump_macro_env_generation();
 }
 
 fn install_loaded_macro(
@@ -1451,6 +1469,7 @@ fn global_macro_remove(name: &str) {
     GLOBAL_MACROS.with(|m| {
         m.borrow_mut().remove(name);
     });
+    bump_macro_env_generation();
 }
 
 /// Look up a macro visible in `env`: a lexical MACROLET macro shadows a global
@@ -17728,7 +17747,12 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         frames.push(Rc::clone(frame));
     }
 
-    let mut macro_env = MacroexpandEnv::null();
+    // Global macros come from a cached base env (rebuilt only on macro
+    // (re)definition; bliss-usb2). Symbol macros and lexical variables live in
+    // the independent variables map, so augmenting them on top preserves the
+    // original shadowing; lexical MACROLET macros are augmented last so they
+    // shadow a same-named global.
+    let mut macro_env = cli_global_macro_env();
 
     let mut global_symbol_macros = Vec::new();
     for (&symbol_index, &expansion) in env.symbol_macros.borrow().iter() {
@@ -17757,12 +17781,43 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
         }
     }
 
-    // Expose both global (top-level DEFMACRO) and lexical (MACROLET) macros to
-    // the bytecode compiler; a lexical macro of the same name shadows the global.
-    let mut all_macros: HashMap<String, MacroDef> = GLOBAL_MACROS.with(|m| m.borrow().clone());
-    for (name, def) in env.macros.borrow().iter() {
-        all_macros.insert(name.clone(), def.clone());
+    // Only lexical MACROLET macros remain to fold in (globals are in the base).
+    if env.macros.borrow().is_empty() {
+        return macro_env;
     }
+    let all_macros: HashMap<String, MacroDef> = env.macros.borrow().clone();
+    augment_env_with_macros(macro_env, &all_macros)
+}
+
+/// The cached MacroexpandEnv whose function map holds every global macro
+/// (bliss-usb2). Rebuilt only when `MACRO_ENV_GENERATION` (bumped on any global
+/// DEFMACRO change) advances; between changes every compiled form reuses it via
+/// a shallow clone instead of re-cloning GLOBAL_MACROS and re-augmenting per
+/// macro. Immediate-handle-only, so it carries no movable GC roots.
+fn cli_global_macro_env() -> MacroexpandEnv {
+    let generation = MACRO_ENV_GENERATION.with(|g| g.get());
+    if let Some(cached) = CLI_GLOBAL_MACRO_ENV.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(cached_gen, _)| *cached_gen == generation)
+            .map(|(_, env)| env.clone())
+    }) {
+        return cached;
+    }
+    let globals: HashMap<String, MacroDef> = GLOBAL_MACROS.with(|m| m.borrow().clone());
+    let base = augment_env_with_macros(MacroexpandEnv::null(), &globals);
+    CLI_GLOBAL_MACRO_ENV.with(|c| *c.borrow_mut() = Some((generation, base.clone())));
+    base
+}
+
+/// Register each macro's expander (reusing `MACRO_FN_CACHE`) and augment
+/// `macro_env`'s function map with it. Extracted from
+/// `macroexpand_environment_from_cli` so the global-macro base can be built once
+/// and cached (bliss-usb2).
+fn augment_env_with_macros(
+    mut macro_env: MacroexpandEnv,
+    all_macros: &HashMap<String, MacroDef>,
+) -> MacroexpandEnv {
     // Root every snapshot's params_form/body: the loop below allocates
     // (freeze_env_frame, resolve_sym interning, Env construction), and a
     // relocating minor GC moves these BlissVals in GLOBAL_MACROS (the scanned
