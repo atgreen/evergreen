@@ -214,6 +214,22 @@ const CORPUS: &[&str] = &[
     "(defun captured-rest (&rest xs) (funcall (lambda () (length xs)))) (captured-rest 1 2 3 4)",
     "(defun captured-key (&key (x 7 xp)) (funcall (lambda () (list x xp)))) (list (captured-key) (captured-key :x 12))",
     "(flet ((captured-local (&optional (x 4)) (funcall (lambda () x)))) (list (captured-local) (captured-local 9)))",
+    // ── Non-local GO out of a capturing closure (bliss-x8t) ──
+    // A `go` in a lambda/flet closure targeting a tag in the enclosing function
+    // lowers to GoNamed and unwinds through the shared tag-token stack.
+    "(let ((r nil)) (tagbody (funcall (lambda () (go done))) (setq r :nope) done (setq r :ok)) r)",
+    "(let ((r nil)) (tagbody (flet ((f () (go done))) (f)) (setq r :nope) done (setq r :ok)) r)",
+    // Resume at the correct named tag among several, not merely the last.
+    "(let ((r nil)) (tagbody (funcall (lambda () (go two))) one (setq r (cons :one r)) two (setq r (cons :two r))) r)",
+    // A closure-driven loop: the non-local go is a back-edge re-entered per call.
+    "(let ((i 0) (log nil)) (tagbody top (when (< i 3) (funcall (lambda () (setq log (cons i log)) (setq i (+ i 1)) (go top)))) done) (list i log))",
+    // Nested closures each unwinding a frame to the same enclosing tag.
+    "(let ((r nil)) (tagbody (funcall (lambda () (funcall (lambda () (go out))))) (setq r :nope) out (setq r :ok)) r)",
+    // Non-local go crossing an unwind-protect runs the cleanup.
+    "(let ((log nil)) (tagbody (unwind-protect (funcall (lambda () (go done))) (setq log (cons :cleanup log))) (setq log (cons :nope log)) done (setq log (cons :done log))) log)",
+    // A tree-walked closure whose go targets an eager-compiled enclosing tagbody
+    // (cross-backend token bridge): mapcar's lambda bails to T0 yet still exits.
+    "(let ((r nil)) (tagbody (mapcar (lambda (x) (declare (ignore x)) (go done)) (list 1)) (setq r :nope) done (setq r :ok)) r)",
     // A tree-walked closure called from T0 must update the boxed binding in the
     // bytecode frame, even when an older captured frame has the same variable.
     "(defparameter *capture-table* (make-hash-table)) (defun capture-table-keys (table) (let ((keys nil)) (maphash (lambda (key value) (declare (ignore value)) (push key keys)) table) keys)) (let ((keys nil)) (declare (ignore keys)) (defmacro captured-key-count (&key (items (capture-table-keys *capture-table*))) (list (quote quote) (length items)))) (setf (gethash (quote a) *capture-table*) 1) (setf (gethash (quote b) *capture-table*) 2) (captured-key-count)",

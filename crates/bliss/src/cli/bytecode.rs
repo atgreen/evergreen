@@ -683,6 +683,11 @@ struct Lowerer<'e> {
     /// capturing closure) may still `return-from` non-locally, resolved at run
     /// time through the shared block-token stack.
     enclosing_blocks: std::collections::HashSet<String>,
+    /// Names of tags established in an *enclosing* function that this body (a
+    /// capturing closure) may still `go` to non-locally, resolved at run time
+    /// through the shared tag-token stack (`env.tag_stack`) — the tagbody
+    /// analogue of `enclosing_blocks` (bliss-x8t).
+    enclosing_tags: std::collections::HashSet<String>,
     /// Lexically enclosing tagbodies: `(tagbody_id, tag → target bcp)`.
     tag_scope: Vec<TagScope>,
     /// `Go` instructions awaiting target-bcp patching once their tagbody's tag
@@ -760,6 +765,7 @@ impl<'e> Lowerer<'e> {
             next_id: 0,
             block_scope: Vec::new(),
             enclosing_blocks: std::collections::HashSet::new(),
+            enclosing_tags: std::collections::HashSet::new(),
             tag_scope: Vec::new(),
             pending_gos: Vec::new(),
             handler_cases: Vec::new(),
@@ -2089,11 +2095,30 @@ impl<'e> Lowerer<'e> {
 
         // Pre-register tag names so forward `go`s resolve to this scope.
         let mut tags: HashMap<String, usize> = HashMap::new();
+        let mut tag_order: Vec<String> = Vec::new();
         for item in items.iter() {
             if let Some(name) = tag_key(*item) {
-                tags.entry(name).or_insert(usize::MAX);
+                if tags.insert(name.clone(), usize::MAX).is_none() {
+                    tag_order.push(name);
+                }
             }
         }
+
+        // If this tagbody's body can create a capturing closure, register each
+        // tag on the shared control-token stack via NamedTag so a non-local
+        // `GO` from that closure (GoNamed) can unwind here (bliss-x8t). Emitted
+        // right after PushTag (runs once at tagbody entry); tag_bcp is patched
+        // below once tag PCs are known, like pending_gos. Gated so ordinary
+        // loops emit none and their bytecode is unchanged.
+        let mut named_tag_idxs: Vec<(usize, String)> = Vec::new();
+        if body_may_capture_closure(&items) {
+            for name in &tag_order {
+                let name_idx = self.intern_name(name);
+                self.emit(Instr::NamedTag { name_idx, tag_bcp: 0 });
+                named_tag_idxs.push((self.code.len() - 1, name.clone()));
+            }
+        }
+
         self.tag_scope.push(TagScope {
             id: tagbody_id,
             tags,
@@ -2135,6 +2160,17 @@ impl<'e> Lowerer<'e> {
             }
         }
 
+        // Patch NamedTag resume PCs now that tag positions are known (bliss-x8t).
+        for (idx, name) in &named_tag_idxs {
+            let target = *scope.tags.get(name).ok_or(Bail)?;
+            if target == usize::MAX {
+                return Err(Bail);
+            }
+            if let Instr::NamedTag { tag_bcp, .. } = &mut self.code[*idx] {
+                *tag_bcp = target as u32;
+            }
+        }
+
         // TAGBODY returns NIL.
         let c = self.add_const(NIL);
         self.emit(Instr::Const(c));
@@ -2156,8 +2192,20 @@ impl<'e> Lowerer<'e> {
             .find(|s| s.tags.contains_key(&name))
         {
             Some(s) => s.id,
-            // Tag not lexically visible (closed-over tagbody is a nmq.5 concern).
-            None => return Err(Bail),
+            None => {
+                // Tag not lexically visible in this function, but established in
+                // an enclosing function this body closes over: emit a non-local
+                // GoNamed resolved through env.tag_stack at run time, mirroring
+                // ReturnFromNamed (bliss-x8t). The enclosing tagbody registers a
+                // control token via NamedTag.
+                if self.enclosing_tags.contains(&name) {
+                    let name_idx = self.intern_name(&name);
+                    self.emit(Instr::GoNamed { name_idx });
+                    self.push_n(1); // notional (go never yields)
+                    return Ok(());
+                }
+                return Err(Bail);
+            }
         };
         self.emit(Instr::Go {
             tagbody_id,
@@ -3947,6 +3995,15 @@ impl<'e> Lowerer<'e> {
             .map(|(n, _)| n.clone())
             .chain(self.enclosing_blocks.iter().cloned())
             .collect();
+        // Tag names of every lexically enclosing tagbody, plus tags inherited
+        // from an outer function, so a `go` in this closure to one of them lowers
+        // to GoNamed (bliss-x8t).
+        let enclosing_tags: std::collections::HashSet<String> = self
+            .tag_scope
+            .iter()
+            .flat_map(|s| s.tags.keys().cloned())
+            .chain(self.enclosing_tags.iter().cloned())
+            .collect();
         let bf = if captured.is_empty() {
             compile_function_in(
                 "<lambda>",
@@ -3956,6 +4013,7 @@ impl<'e> Lowerer<'e> {
                 self.portable,
                 false,
                 &enclosing_blocks,
+                &enclosing_tags,
             )
             .ok_or(Bail)?
         } else {
@@ -3985,6 +4043,7 @@ impl<'e> Lowerer<'e> {
                 &captures,
                 &callable,
                 &enclosing_blocks,
+                &enclosing_tags,
                 self.portable,
             )
             .ok_or(Bail)?
@@ -4275,6 +4334,14 @@ impl<'e> Lowerer<'e> {
             .map(|(n, _)| n.clone())
             .chain(self.enclosing_blocks.iter().cloned())
             .collect();
+        // Tags the closures may non-locally `go` to: this function's live
+        // tagbody tags plus any it already inherits (bliss-x8t).
+        let enclosing_tags: std::collections::HashSet<String> = self
+            .tag_scope
+            .iter()
+            .flat_map(|s| s.tags.keys().cloned())
+            .chain(self.enclosing_tags.iter().cloned())
+            .collect();
 
         // Build each closure and store it in the child frame. Re-derive
         // params/fbody from the rooted `defs` each iteration (compilation allocates).
@@ -4287,6 +4354,7 @@ impl<'e> Lowerer<'e> {
                 &captures,
                 &callable,
                 &enclosing_blocks,
+                &enclosing_tags,
                 self.portable,
             )
             .ok_or(Bail)?;
@@ -4382,6 +4450,7 @@ fn compile_local_function(
 /// is the subset of those that are themselves closures and must be invoked via
 /// `funcall`. `has_env` is forced so the closure always has an environment to
 /// reach the captured frame, even when it defines no boxed locals of its own.
+#[allow(clippy::too_many_arguments)]
 fn compile_capturing_local(
     mut params_form: BlissVal,
     mut fbody: BlissVal,
@@ -4389,6 +4458,7 @@ fn compile_capturing_local(
     captures: &std::collections::HashSet<String>,
     callable: &std::collections::HashSet<String>,
     enclosing_blocks: &std::collections::HashSet<String>,
+    enclosing_tags: &std::collections::HashSet<String>,
     portable: bool,
 ) -> Option<BytecodeFunction> {
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
@@ -4402,6 +4472,7 @@ fn compile_capturing_local(
     lo.has_env = true;
     lo.closure_fns = callable.clone();
     lo.enclosing_blocks = enclosing_blocks.clone();
+    lo.enclosing_tags = enclosing_tags.clone();
     for name in captures {
         lo.scopes[0].insert(name.clone(), VarLoc::Boxed);
     }
@@ -5494,12 +5565,14 @@ fn compile_function(
         portable,
         macro_lambda_list,
         &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
     )
 }
 
 /// As [`compile_function`], but with a set of enclosing block names the body may
 /// non-locally `return-from` (used when compiling a lambda nested in another
 /// function). Top-level definitions pass an empty set.
+#[allow(clippy::too_many_arguments)]
 fn compile_function_in(
     name: &str,
     params_form: BlissVal,
@@ -5508,6 +5581,7 @@ fn compile_function_in(
     portable: bool,
     macro_lambda_list: bool,
     enclosing_blocks: &std::collections::HashSet<String>,
+    enclosing_tags: &std::collections::HashSet<String>,
 ) -> Option<BytecodeFunction> {
     bliss_rt::rooted!(params_form = params_form);
     bliss_rt::rooted!(body = body);
@@ -5560,6 +5634,7 @@ fn compile_function_in(
     lo.portable = portable;
     lo.captured_names = compute_captured_names(*body);
     lo.enclosing_blocks = enclosing_blocks.clone();
+    lo.enclosing_tags = enclosing_tags.clone();
     let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
         let loc = lo.alloc_local(pn);
@@ -6084,6 +6159,8 @@ fn bbu_instr_len(i: &Instr) -> Option<usize> {
         Instr::ReturnFrom { .. } => 5,
         Instr::ReturnFromNamed { .. } => 5,
         Instr::Go { .. } => 9,
+        Instr::NamedTag { .. } => 9,
+        Instr::GoNamed { .. } => 5,
         Instr::EnterCleanupNormal { .. } => 9,
         Instr::CleanupReturn => 1,
         Instr::PushHandlerCase { .. } => 7,
@@ -6306,6 +6383,15 @@ fn serialize_bbu_function(
             Instr::ReturnFromNamed { name_idx } => {
                 put_u8(&mut code, 0x3f);
                 put_u32(&mut code, pool.string(bf.names.get(*name_idx as usize)?));
+            }
+            Instr::GoNamed { name_idx } => {
+                put_u8(&mut code, 0x40);
+                put_u32(&mut code, pool.string(bf.names.get(*name_idx as usize)?));
+            }
+            Instr::NamedTag { name_idx, tag_bcp } => {
+                put_u8(&mut code, 0x41);
+                put_u32(&mut code, pool.string(bf.names.get(*name_idx as usize)?));
+                put_u32(&mut code, bbu_pc(*tag_bcp, &offsets, end_pc)?);
             }
             Instr::Go {
                 tagbody_id,
@@ -8196,6 +8282,30 @@ fn decode_bbu_function(
                     name_idx: index as u16,
                 }
             }
+            0x40 => {
+                let name = bbu_string_from_values(constants, cursor.u32()?)?;
+                let index = names.len();
+                if index > u16::MAX as usize {
+                    return Err(bbu_error("too many tag names"));
+                }
+                names.push(name);
+                Instr::GoNamed {
+                    name_idx: index as u16,
+                }
+            }
+            0x41 => {
+                let name = bbu_string_from_values(constants, cursor.u32()?)?;
+                let tag_bcp = cursor.u32()?;
+                let index = names.len();
+                if index > u16::MAX as usize {
+                    return Err(bbu_error("too many tag names"));
+                }
+                names.push(name);
+                Instr::NamedTag {
+                    name_idx: index as u16,
+                    tag_bcp,
+                }
+            }
             0x20 => Instr::PushCatch {
                 resume_bcp: cursor.u32()?,
                 sp_restore: cursor.u16()?,
@@ -8274,6 +8384,7 @@ fn decode_bbu_function(
             }
             Instr::PushRestartCase { resume_bcp, .. } => *resume_bcp = map_pc(*resume_bcp)?,
             Instr::Go { target_bcp, .. } => *target_bcp = map_pc(*target_bcp)?,
+            Instr::NamedTag { tag_bcp, .. } => *tag_bcp = map_pc(*tag_bcp)?,
             Instr::PushUnwind { cleanup_bcp, .. } => *cleanup_bcp = map_pc(*cleanup_bcp)?,
             Instr::EnterCleanupNormal {
                 cleanup_bcp,
@@ -8529,6 +8640,32 @@ fn body_contains_loop(body: BlissVal) -> bool {
         false
     }
     walk(body, 0)
+}
+
+/// True if `body` lexically contains a closure-creating form (`LAMBDA`,
+/// `FUNCTION`, `FLET`, `LABELS`, `NAMED-LAMBDA`). Used to gate the tagbody
+/// `NamedTag` side-channel (bliss-x8t): only such a body can produce a capturing
+/// closure whose non-local `GO` must resolve through `env.tag_stack`. Loops with
+/// no closure emit no `NamedTag`, leaving the hot LOOP/DO/DOTIMES path untouched.
+fn body_may_capture_closure(items: &[BlissVal]) -> bool {
+    fn walk(v: BlissVal, depth: u32) -> bool {
+        if depth > 400 {
+            return true; // deep/odd form — err toward registering (safe, additive)
+        }
+        if v.is_cons() {
+            let (car, cdr) = cp(v);
+            if car.is_symbol() {
+                match symbol_bare_name(&sym_name(car)).as_str() {
+                    "LAMBDA" | "FUNCTION" | "FLET" | "LABELS" | "NAMED-LAMBDA" => return true,
+                    "QUOTE" => return false, // quoted data is not code
+                    _ => {}
+                }
+            }
+            return walk(car, depth + 1) || walk(cdr, depth + 1);
+        }
+        false
+    }
+    items.iter().any(|it| walk(*it, 0))
 }
 
 /// Reset lazy-compile bookkeeping for a (re)defined DEFUN: drop any stale
@@ -8814,6 +8951,9 @@ fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), BlissE
             | Instr::PopHandler
             | Instr::PopHandlerCase
             | Instr::PopHandlerBind
+            // NamedTag registers a control token for a capturing tagbody's
+            // non-local GO (bliss-x8t); no operand-stack effect, falls through.
+            | Instr::NamedTag { .. }
             | Instr::PopRestartCase => Some((0, 0)),
             Instr::ValuesToList => Some((1, 1)),
             Instr::SetValues(nvals) => Some((*nvals as u32, 1)),
@@ -8859,6 +8999,11 @@ fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), BlissE
                     return Err(fail(pcu, "operand stack underflow"));
                 }
             }
+            // Non-local GO to a tag in an enclosing function (bliss-x8t): a
+            // terminator like out-of-closure Go — no fall-through, and the tag
+            // name travels via the control token, not the operand stack, so no
+            // height requirement. Its target is seeded by the enclosing tagbody.
+            Instr::GoNamed { .. } => {}
             Instr::Throw => {
                 if height < 2 {
                     return Err(fail(pcu, "operand stack underflow"));
@@ -9533,8 +9678,17 @@ enum Handler {
         resume_bcp: u32,
         sp_restore: u16,
     },
-    /// `TAGBODY`: keyed by a lexical compile-time id; `GO` targets a tag PC.
-    Tag { tagbody_id: u32, sp_restore: u16 },
+    /// `TAGBODY`: keyed by a lexical compile-time id; a local `GO` targets a tag
+    /// PC. For a tagbody whose body captures a closure, `NamedTag` instructions
+    /// also fill `token` (registered in `env.tag_stack`) and `tag_bcps`
+    /// (tag-name → resume PC) so a non-local `GoNamed` from that closure unwinds
+    /// here and resumes at the right tag (bliss-x8t). Empty for ordinary loops.
+    Tag {
+        tagbody_id: u32,
+        sp_restore: u16,
+        token: Option<String>,
+        tag_bcps: Vec<(String, u32)>,
+    },
     /// `UNWIND-PROTECT`: a cleanup to run on any unwind through this point.
     Unwind { cleanup_bcp: u32, sp_restore: u16 },
     /// `HANDLER-CASE`: a cluster of condition-typed clauses. `cluster_base` is
@@ -10565,7 +10719,31 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 acts[top_idx].handlers.push(Handler::Tag {
                     tagbody_id,
                     sp_restore,
+                    token: None,
+                    tag_bcps: Vec::new(),
                 });
+            }
+            Instr::NamedTag { name_idx, tag_bcp } => {
+                // Register one named tag of the innermost TAGBODY for non-local
+                // GO (bliss-x8t). The first NamedTag mints the tagbody's control
+                // token and shares it on env.tag_stack; each tag name maps to its
+                // resume PC in the handler.
+                let name = acts[top_idx].func.names[name_idx as usize].clone();
+                let tok = match acts[top_idx].handlers.last_mut() {
+                    Some(Handler::Tag {
+                        token, tag_bcps, ..
+                    }) => {
+                        let tok = token
+                            .get_or_insert_with(|| next_control_token("__GO__"))
+                            .clone();
+                        tag_bcps.push((name.clone(), tag_bcp));
+                        tok
+                    }
+                    // Defensive: NamedTag is only emitted immediately after its
+                    // PushTag, so the innermost handler is always that Tag.
+                    _ => next_control_token("__GO__"),
+                };
+                env.tag_stack.push((name, tok));
             }
             Instr::PushUnwind {
                 cleanup_bcp,
@@ -10582,6 +10760,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                 }
                 Some(Handler::Block { token, .. }) => {
                     env.block_stack.retain(|(_, t)| *t != token);
+                }
+                // A named tagbody shared a control token on env.tag_stack for its
+                // non-local GO support; drop it on normal exit (bliss-x8t).
+                Some(Handler::Tag {
+                    token: Some(tok), ..
+                }) => {
+                    env.tag_stack.retain(|(_, t)| *t != tok);
                 }
                 _ => {}
             },
@@ -10636,6 +10821,31 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     None => {
                         let e =
                             BlissError::Internal(format!("RETURN-FROM: no visible block {name}"));
+                        initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
+                    }
+                }
+            }
+            Instr::GoNamed { name_idx } => {
+                // Non-local GO from a capturing closure to a tag established in an
+                // enclosing function: resolve the tag's control token by name on
+                // the shared tag stack and unwind to it, carrying the tag NAME as
+                // the control value so the establishing tagbody resumes at the
+                // matching tag (bliss-x8t). Mirrors ReturnFromNamed; interoperates
+                // with a tree-walked establishing tagbody via the token bridge.
+                let name = acts[top_idx].func.names[name_idx as usize].clone();
+                let token = env
+                    .tag_stack
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, tok)| tok.clone());
+                match token {
+                    Some(tok) => {
+                        store_control_value(&tok, arena_str(&name));
+                        initiate_unwind(acts, stack, env, Pending::Token(tok))?;
+                    }
+                    None => {
+                        let e = BlissError::Internal(format!("GO: no such tag {name}"));
                         initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                     }
                 }
@@ -10969,6 +11179,8 @@ fn initiate_unwind(
             Some(Handler::Tag {
                 tagbody_id,
                 sp_restore,
+                token,
+                tag_bcps,
             }) => {
                 if let Pending::Go {
                     tagbody_id: tid,
@@ -10982,6 +11194,28 @@ fn initiate_unwind(
                         act.bcp = *target_bcp as usize;
                         return Ok(());
                     }
+                }
+                // Non-local GO (GoNamed, or a tree-walked GO) arriving as this
+                // tagbody's control token: resume at the named tag's PC. The tag
+                // name is carried in the token's control value (bliss-x8t). Keep
+                // the handler live — the tagbody remains active after a GO.
+                if let (Pending::Token(t), Some(tok)) = (&pending, &token) {
+                    if t == tok {
+                        let tag_name = val_as_str(take_control_value(tok));
+                        if let Some((_, bcp)) =
+                            tag_bcps.iter().find(|(n, _)| *n == tag_name)
+                        {
+                            let bcp = *bcp;
+                            let act = &mut acts[top];
+                            act.sp_top = sp_restore;
+                            act.bcp = bcp as usize;
+                            return Ok(());
+                        }
+                    }
+                }
+                // Unwound past this tagbody: drop its shared tag-stack token.
+                if let Some(tok) = &token {
+                    env.tag_stack.retain(|(_, t)| t != tok);
                 }
                 acts[top].handlers.pop();
             }
@@ -11100,11 +11334,14 @@ fn initiate_unwind(
 /// propagates after running cleanups.
 fn error_to_pending(e: BlissError, env: &Env) -> Pending {
     if let BlissError::Internal(token) = &e {
-        // A control token naming one of our live bytecode CATCH or BLOCK handlers
-        // (a THROW / RETURN-FROM performed by tree-walker code) becomes a Token
-        // transfer the unwind driver routes to that handler.
+        // A control token naming one of our live bytecode CATCH, BLOCK, or
+        // TAGBODY handlers (a THROW / RETURN-FROM / GO performed by tree-walker
+        // code — e.g. a bailed closure whose `go` targets a compiled enclosing
+        // tagbody) becomes a Token transfer the unwind driver routes to that
+        // handler (bliss-x8t).
         if env.catch_stack.iter().any(|(_, t)| t == token)
             || env.block_stack.iter().any(|(_, t)| t == token)
+            || env.tag_stack.iter().any(|(_, t)| t == token)
         {
             return Pending::Token(token.clone());
         }
@@ -13216,13 +13453,37 @@ fn rebuild_resume_handlers(entry: &BytecodeFunction, bcp: u32, env: &mut Env) ->
                 handlers.push(Handler::Tag {
                     tagbody_id: *tagbody_id,
                     sp_restore: *sp_restore,
+                    token: None,
+                    tag_bcps: Vec::new(),
                 });
             }
-            Instr::PopHandler => {
-                if let Some(Handler::Block { token, .. }) = handlers.pop() {
-                    env.block_stack.retain(|(_, t)| *t != token);
+            Instr::NamedTag { name_idx, tag_bcp } => {
+                // Re-establish the named-tag registration so a resumed activation
+                // inside a closure-capturing tagbody keeps its non-local GO
+                // support (bliss-x8t).
+                let name = entry.names[*name_idx as usize].clone();
+                if let Some(Handler::Tag {
+                    token, tag_bcps, ..
+                }) = handlers.last_mut()
+                {
+                    let tok = token
+                        .get_or_insert_with(|| next_control_token("__GO__"))
+                        .clone();
+                    tag_bcps.push((name.clone(), *tag_bcp));
+                    env.tag_stack.push((name, tok));
                 }
             }
+            Instr::PopHandler => match handlers.pop() {
+                Some(Handler::Block { token, .. }) => {
+                    env.block_stack.retain(|(_, t)| *t != token);
+                }
+                Some(Handler::Tag {
+                    token: Some(tok), ..
+                }) => {
+                    env.tag_stack.retain(|(_, t)| *t != tok);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }

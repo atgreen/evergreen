@@ -127,6 +127,18 @@ pub enum Instr {
     /// Transfer to tag `target_bcp` within tagbody `tagbody_id`, running any
     /// intervening `UNWIND-PROTECT` cleanups.
     Go { tagbody_id: u32, target_bcp: u32 },
+    /// Register one named tag of the just-established (innermost) TAGBODY for
+    /// non-local `GO`: names[name_idx] resumes at `tag_bcp`. Emitted right after
+    /// `PushTag`, only for a tagbody whose body captures a closure, so a `GO` in
+    /// that closure (`GoNamed`) can unwind here across the closure-call boundary.
+    /// The first one establishes the tagbody's control token in `env.tag_stack`.
+    /// Loops with no captured closure emit none, keeping the hot path untouched.
+    NamedTag { name_idx: u16, tag_bcp: u32 },
+    /// `GO` to a tag `names[name_idx]` established in an enclosing function this
+    /// body closes over. Resolved at run time through the shared tag-token stack
+    /// (`env.tag_stack`), so the transfer crosses the closure-call boundary —
+    /// the tagbody analogue of `ReturnFromNamed`.
+    GoNamed { name_idx: u16 },
     /// Normal-path `UNWIND-PROTECT`: save the protected value, run the cleanup
     /// at `cleanup_bcp`, then resume at `resume_bcp` with the value restored.
     EnterCleanupNormal { cleanup_bcp: u32, resume_bcp: u32 },
