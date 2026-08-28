@@ -877,6 +877,29 @@ pub fn namestring(pathname: BlissVal) -> Result<BlissVal, BlissError> {
     Ok(make_string_bv(&rendered))
 }
 
+/// The rendered namestring of a record, as borrowed or freshly-built Rust text.
+/// Never allocates a `BlissVal`, so — unlike [`namestring`] — it cannot fire a
+/// relocating minor GC (bliss-8jt).
+fn record_namestring(rec: &PathnameRecord) -> std::borrow::Cow<'_, str> {
+    match &rec.namestring {
+        Some(s) => std::borrow::Cow::Borrowed(s),
+        None => std::borrow::Cow::Owned(render_namestring_from_parsed(&rec.parsed)),
+    }
+}
+
+/// CL `EQUAL` on two pathnames, comparing namestrings **without allocating on
+/// the GC heap** — the GC-safe replacement for comparing the results of
+/// [`namestring`] (which allocates a Lisp string and can relocate the nursery
+/// mid-comparison). Non-pathname arguments compare unequal. This is the faithful
+/// proxy ASDF relies on for its pervasive pathname-EQUAL caching (bliss-nad,
+/// bliss-8jt).
+pub fn pathnames_equal(a: BlissVal, b: BlissVal) -> bool {
+    match (get_record(a), get_record(b)) {
+        (Some(ra), Some(rb)) => record_namestring(&ra) == record_namestring(&rb),
+        _ => false,
+    }
+}
+
 pub fn pathname_host(pathname: BlissVal) -> BlissVal {
     get_record(pathname).map_or(NIL, |r| r.host)
 }

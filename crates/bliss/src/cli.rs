@@ -20314,10 +20314,12 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
     // returning NIL for equal pathnames made those caches never hit, so
     // asdf:load-system re-traversed forever (bliss-nad).
     if bliss_stdlib::is_pathname(a) && bliss_stdlib::is_pathname(b) {
-        return match (bliss_stdlib::namestring(a), bliss_stdlib::namestring(b)) {
-            (Ok(na), Ok(nb)) => val_as_str(na) == val_as_str(nb),
-            _ => false,
-        };
+        // Compare via the non-allocating pathname EQUAL: rendering a namestring
+        // to a Lisp string (the old `bliss_stdlib::namestring` path) allocates
+        // and can fire a relocating minor GC mid-walk, so every list walker
+        // holding bare Rust locals across this call (e.g. ASSOC) was latently
+        // GC-unsafe (bliss-8jt).
+        return bliss_stdlib::pathnames_equal(a, b);
     }
     if a.is_cons() && b.is_cons() {
         let (a_car, a_cdr) = cp(a);
