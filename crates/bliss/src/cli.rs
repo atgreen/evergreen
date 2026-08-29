@@ -9,7 +9,7 @@ use bliss_rt::error::BlissError;
 use bliss_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
-use bliss_rt::object::{ConsCell, ObjectHeader, RatioData, type_id};
+use bliss_rt::object::{ComplexData, ConsCell, ObjectHeader, RatioData, type_id};
 use bliss_rt::runtime::parse_cli as parse_runtime_cli;
 use bliss_rt::value::{BlissVal, EOF, NIL, T};
 
@@ -8577,6 +8577,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     expected: "number".to_string(),
                 });
             }
+            // (COMPLEX realpart &optional imagpart) — build a complex number
+            // with type contagion + canonicalisation (CLHS 12.1.3.3). imagpart
+            // defaults to a rational 0, so a rational realpart with no imagpart
+            // returns the realpart itself (bliss-qng).
+            "COMPLEX" => {
+                let (rf, rrest) = cp(cdr);
+                bliss_rt::rooted!(real = eval_form(rf, env)?);
+                let imag = if rrest.is_cons() {
+                    let (iform, _) = cp(rrest);
+                    eval_form(iform, env)?
+                } else {
+                    BlissVal::from_fixnum(0)
+                };
+                return make_complex(*real, imag);
+            }
             "STRINGP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
@@ -14862,6 +14877,233 @@ pub(super) fn alloc_ratio_cli(num: BlissVal, den: BlissVal) -> BlissVal {
     }
 }
 
+/// Allocate a COMPLEX heap object with the given (already-canonicalised) parts.
+/// Both `real` and `imag` are rooted across the allocation (same idiom as
+/// [`alloc_ratio_cli`]; bliss-wlf/bliss-jtc.5).
+fn alloc_complex_cli(real: BlissVal, imag: BlissVal) -> BlissVal {
+    bliss_rt::rooted!(real = real);
+    bliss_rt::rooted!(imag = imag);
+    let ptr = gc_alloc_obj(std::mem::size_of::<ComplexData>(), type_id::COMPLEX) as *mut ComplexData;
+    unsafe {
+        (*ptr).realpart = *real;
+        (*ptr).imagpart = *imag;
+        BlissVal::from_heap_ptr(ptr as *mut u8)
+    }
+}
+
+/// Is `v` the rational zero (integer/ratio equal to 0)? Floats are excluded —
+/// `0.0` is not a *rational* zero, so a float part never canonicalises away.
+fn is_rational_zero(v: BlissVal) -> bool {
+    if v.is_fixnum() {
+        return v.as_fixnum() == 0;
+    }
+    as_bigrat(v).map(|r| r.num.is_zero()).unwrap_or(false)
+}
+
+/// A real number (rational or float) — anything valid as a COMPLEX part.
+fn is_real_number(v: BlissVal) -> bool {
+    v.is_single_float() || as_bigrat(v).is_some()
+}
+
+/// The CL `COMPLEX` constructor with type-contagion + canonicalisation (CLHS
+/// 12.1.3.3): if either part is a float, both parts are coerced to float and the
+/// result stays complex; otherwise a rational complex with a zero imaginary part
+/// canonicalises to its (rational) real part. `real`/`imag` must be reals.
+fn make_complex(real: BlissVal, imag: BlissVal) -> Result<BlissVal, BlissError> {
+    if !is_real_number(real) {
+        return Err(BlissError::TypeError {
+            datum: real,
+            expected: "real".into(),
+        });
+    }
+    if !is_real_number(imag) {
+        return Err(BlissError::TypeError {
+            datum: imag,
+            expected: "real".into(),
+        });
+    }
+    // Float contagion: a float in either part makes both parts single-floats,
+    // and floats never canonicalise (even a 0.0 imaginary part stays).
+    if real.is_single_float() || imag.is_single_float() {
+        let r = BlissVal::from_single_float(num_val(real)? as f32);
+        let i = BlissVal::from_single_float(num_val(imag)? as f32);
+        return Ok(alloc_complex_cli(r, i));
+    }
+    // Both rational: a zero imaginary part collapses to the real part.
+    if is_rational_zero(imag) {
+        return Ok(real);
+    }
+    Ok(alloc_complex_cli(real, imag))
+}
+
+/// The four complex-capable arithmetic folds.
+#[derive(Clone, Copy)]
+enum CxOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// Decompose a real or complex number into (realpart, imagpart) BlissVals. A
+/// real `x` yields `(x, 0)`. The parts of a COMPLEX are field reads (no
+/// allocation), so the caller roots them before the next allocating op.
+fn complex_parts(v: BlissVal) -> Result<(BlissVal, BlissVal), BlissError> {
+    if let Some(re) = bliss_rt::types::complex_realpart(v) {
+        return Ok((re, bliss_rt::types::complex_imagpart(v).unwrap_or(NIL)));
+    }
+    if is_real_number(v) {
+        return Ok((v, BlissVal::from_fixnum(0)));
+    }
+    Err(BlissError::TypeError {
+        datum: v,
+        expected: "number".into(),
+    })
+}
+
+// Two-argument real arithmetic on complex *parts*. Each may allocate (BigRat /
+// RATIO promotion), so callers keep every live operand rooted across them.
+fn radd(a: BlissVal, b: BlissVal) -> Result<BlissVal, BlissError> {
+    fold_arith_vals(&[a, b], 0, 0.0, |x, y| x + y, bigrat_add, |x, y| x + y)
+}
+fn rsub(a: BlissVal, b: BlissVal) -> Result<BlissVal, BlissError> {
+    sub_vals(&[a, b])
+}
+fn rmul(a: BlissVal, b: BlissVal) -> Result<BlissVal, BlissError> {
+    fold_arith_vals(&[a, b], 1, 1.0, |x, y| x * y, bigrat_mul, |x, y| x * y)
+}
+/// Real division `a / b` (rational-exact or float-contagious), matching the
+/// two-argument behaviour of [`eval_arith_div`]. Errors on a zero divisor.
+fn rdiv(a: BlissVal, b: BlissVal) -> Result<BlissVal, BlissError> {
+    if a.is_single_float() || b.is_single_float() {
+        let bv = num_val(b)?;
+        if bv == 0.0 {
+            return Err(BlissError::ArithmeticError("division by zero".into()));
+        }
+        return Ok(BlissVal::from_single_float((num_val(a)? / bv) as f32));
+    }
+    match (as_bigrat(a), as_bigrat(b)) {
+        (Some(ra), Some(rb)) => {
+            if rb.num.is_zero() {
+                return Err(BlissError::ArithmeticError("division by zero".into()));
+            }
+            Ok(bigrat_div(&ra, &rb).to_val())
+        }
+        (None, _) => Err(BlissError::TypeError {
+            datum: a,
+            expected: "number".into(),
+        }),
+        (_, None) => Err(BlissError::TypeError {
+            datum: b,
+            expected: "number".into(),
+        }),
+    }
+}
+
+/// Complex-number fold for `+ - * /` when any operand is complex. Reduces over
+/// the operands using real arithmetic on the parts, then canonicalises via
+/// [`make_complex`] (so e.g. `i*i` collapses to the real `-1`). Every live part
+/// is rooted across the allocating real-part ops (GC-safety invariant 1).
+fn complex_arith(op: CxOp, vals: &[BlissVal]) -> Result<BlissVal, BlissError> {
+    // Only ever called with a complex present, hence a non-empty operand list.
+    debug_assert!(!vals.is_empty());
+    let (re0, im0) = complex_parts(vals[0])?;
+    bliss_rt::rooted!(acc_re = re0);
+    bliss_rt::rooted!(acc_im = im0);
+
+    if vals.len() == 1 {
+        // Unary `-z` negates; unary `/z` reciprocates; unary `+z`/`*z` is `z`.
+        match op {
+            CxOp::Sub => {
+                let nr = rsub(BlissVal::from_fixnum(0), *acc_re)?;
+                bliss_rt::rooted!(nr = nr);
+                let ni = rsub(BlissVal::from_fixnum(0), *acc_im)?;
+                *acc_re = *nr;
+                *acc_im = ni;
+            }
+            CxOp::Div => {
+                // Unary `/z` is `1/z`; reuse the binary reciprocal path.
+                return complex_arith(CxOp::Div, &[BlissVal::from_fixnum(1), vals[0]]);
+            }
+            _ => {}
+        }
+        return make_complex(*acc_re, *acc_im);
+    }
+
+    for v in &vals[1..] {
+        let (cre, cim) = complex_parts(*v)?;
+        bliss_rt::rooted!(c = cre);
+        bliss_rt::rooted!(d = cim);
+        match op {
+            CxOp::Add => {
+                let nr = radd(*acc_re, *c)?;
+                bliss_rt::rooted!(nr = nr);
+                let ni = radd(*acc_im, *d)?;
+                *acc_re = *nr;
+                *acc_im = ni;
+            }
+            CxOp::Sub => {
+                let nr = rsub(*acc_re, *c)?;
+                bliss_rt::rooted!(nr = nr);
+                let ni = rsub(*acc_im, *d)?;
+                *acc_re = *nr;
+                *acc_im = ni;
+            }
+            CxOp::Mul => {
+                // (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+                let ac = rmul(*acc_re, *c)?;
+                bliss_rt::rooted!(ac = ac);
+                let bd = rmul(*acc_im, *d)?;
+                bliss_rt::rooted!(bd = bd);
+                let ad = rmul(*acc_re, *d)?;
+                bliss_rt::rooted!(ad = ad);
+                let bc = rmul(*acc_im, *c)?;
+                bliss_rt::rooted!(bc = bc);
+                let nr = rsub(*ac, *bd)?;
+                bliss_rt::rooted!(nr = nr);
+                let ni = radd(*ad, *bc)?;
+                *acc_re = *nr;
+                *acc_im = ni;
+            }
+            CxOp::Div => {
+                // (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c^2 + d^2)
+                let cc = rmul(*c, *c)?;
+                bliss_rt::rooted!(cc = cc);
+                let dd = rmul(*d, *d)?;
+                bliss_rt::rooted!(dd = dd);
+                let denom = radd(*cc, *dd)?;
+                bliss_rt::rooted!(denom = denom);
+                if is_rational_zero(*denom) || num_val(*denom)? == 0.0 {
+                    return Err(BlissError::ArithmeticError("division by zero".into()));
+                }
+                let ac = rmul(*acc_re, *c)?;
+                bliss_rt::rooted!(ac = ac);
+                let bd = rmul(*acc_im, *d)?;
+                bliss_rt::rooted!(bd = bd);
+                let bc = rmul(*acc_im, *c)?;
+                bliss_rt::rooted!(bc = bc);
+                let ad = rmul(*acc_re, *d)?;
+                bliss_rt::rooted!(ad = ad);
+                let nr_num = radd(*ac, *bd)?;
+                bliss_rt::rooted!(nr_num = nr_num);
+                let ni_num = rsub(*bc, *ad)?;
+                bliss_rt::rooted!(ni_num = ni_num);
+                let nr = rdiv(*nr_num, *denom)?;
+                bliss_rt::rooted!(nr = nr);
+                let ni = rdiv(*ni_num, *denom)?;
+                *acc_re = *nr;
+                *acc_im = ni;
+            }
+        }
+    }
+    make_complex(*acc_re, *acc_im)
+}
+
+/// Does any operand require the complex arithmetic fold?
+fn any_complex(vals: &[BlissVal]) -> bool {
+    vals.iter().any(|v| bliss_rt::types::complexp(*v))
+}
+
 /// Allocate a BIGNUM heap object (§1.8.1) on the shared GC heap: header + sign +
 /// n_limbs + limbs. Layout mirrors the reader so `print_val` renders it correctly.
 fn alloc_bignum_cli(sign: i32, limbs: &[u64]) -> BlissVal {
@@ -15446,6 +15688,11 @@ fn fold_arith_vals(
     op_r: fn(&BigRat, &BigRat) -> BigRat,
     op_i: fn(i128, i128) -> i128,
 ) -> Result<BlissVal, BlissError> {
+    // Complex operands leave the real tower: `+` (init 0) and `*` (init 1) are
+    // the only ops routed here, so init_i selects the complex fold (bliss-qng).
+    if any_complex(vals) {
+        return complex_arith(if init_i == 0 { CxOp::Add } else { CxOp::Mul }, vals);
+    }
     // Fixnum fast path (bliss-x5y.10): fold in i128 while every operand is a
     // fixnum and the running result stays in fixnum range, allocating no
     // BigRat. i128 cannot overflow here — one op on fixnum-range values is at
@@ -15519,6 +15766,9 @@ fn eval_arith_sub(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
 fn sub_vals(vals: &[BlissVal]) -> Result<BlissVal, BlissError> {
     if vals.is_empty() {
         return Ok(BlissVal::from_fixnum(0));
+    }
+    if any_complex(vals) {
+        return complex_arith(CxOp::Sub, vals);
     }
     // Fixnum fast path (bliss-x5y.10): all-fixnum subtraction (or 1-arg negate)
     // in i128 with a range check — no BigRat allocation. i128 cannot overflow
@@ -15595,6 +15845,9 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         return Err(BlissError::ArithmeticError(
             "/ requires at least one argument".into(),
         ));
+    }
+    if any_complex(&vals) {
+        return complex_arith(CxOp::Div, &vals);
     }
     if vals.len() == 1 {
         if vals[0].is_single_float() {

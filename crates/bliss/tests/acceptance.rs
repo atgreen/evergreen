@@ -1768,6 +1768,43 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-qng: the COMPLEX constructor (type contagion + canonicalisation) and
+/// complex arithmetic (+ - * /) over the numeric tower, including real⇄complex
+/// mixing, unary negate/reciprocal, and canonicalisation of a rational complex
+/// with zero imaginary part back to a real.
+#[test]
+fn complex_constructor_and_arithmetic() {
+    let cases = [
+        // Constructor + canonicalisation (CLHS 12.1.3.3).
+        ("(complex 1 2)", "#C(1 2)"),
+        ("(complex 3 0)", "3"),      // rational, zero imag ⇒ real
+        ("(complex 3)", "3"),        // default imag 0
+        ("(complex 1.0 0.0)", "#C(1.0 0.0)"), // float never canonicalises
+        ("(complex 1 2.0)", "#C(1.0 2.0)"),   // float contagion on both parts
+        ("(complexp (complex 3 0))", "NIL"),
+        // Addition / subtraction.
+        ("(+ #c(1 2) #c(3 4))", "#C(4 6)"),
+        ("(- #c(5 3) #c(1 1))", "#C(4 2)"),
+        ("(+ 1 #c(0 1))", "#C(1 1)"),          // real + complex
+        ("(- #c(2 2))", "#C(-2 -2)"),          // unary negate
+        ("(complexp (+ #c(1 1) #c(1 -1)))", "NIL"), // 2+0i ⇒ real
+        // Multiplication (incl. i*i ⇒ -1, N-ary).
+        ("(* #c(0 1) #c(0 1))", "-1"),
+        ("(* 2 #c(1 1))", "#C(2 2)"),
+        ("(* #c(1 2) 3 #c(1 0))", "#C(3 6)"),
+        // Division (exact rational parts) + unary reciprocal.
+        ("(/ #c(1 2) #c(3 4))", "#C(11/25 2/25)"),
+        ("(/ #c(1 2))", "#C(1/5 -2/5)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Regression (bliss-av5): DEFVAR/DEFPARAMETER proclaim the variable SPECIAL
 /// (ANSI 3.8), so a later LET binds it dynamically on BOTH backends. Previously
 /// only the tree-walker treated a globally-bound var as dynamic while the
