@@ -1768,6 +1768,41 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-44qp: the transcendental functions (EXP, LOG 1-/2-arg, SIN/COS/TAN,
+/// ASIN/ACOS/ATAN 1-/2-arg, hyperbolics) — previously all "undefined function".
+#[test]
+fn transcendental_functions() {
+    let cases = [
+        ("(exp 0)", "1.0"),
+        ("(log 8 2)", "3.0"),
+        ("(log 100 10)", "2.0"),
+        ("(log 1)", "0.0"),
+        ("(sin 0)", "0.0"),
+        ("(cos 0)", "1.0"),
+        ("(tan 0)", "0.0"),
+        ("(atan 1 1)", "0.7853982"),
+        ("(asin 1)", "1.5707964"),
+        ("(sinh 0)", "0.0"),
+        ("(cosh 0)", "1.0"),
+        ("(tanh 0)", "0.0"),
+        // Round-trips and identities.
+        ("(exp (log 5))", "5.0"),
+        ("(* 4 (atan 1))", "3.1415927"),
+        // LOG of a negative real is complex (matches SQRT).
+        ("(log -1)", "#C(0.0 3.1415927)"),
+        // First-class use.
+        ("(funcall #'sin 0)", "0.0"),
+        ("(mapcar #'exp '(0 1))", "(1.0 2.7182817)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// bliss-kzhq: FORMAT ~A/~S print whole single-floats with a decimal point
 /// (2.0, not 2) so they read back as floats — matching cli PRINC/PRIN1. Was a
 /// tier/path divergence (stdlib format dropped the .0).

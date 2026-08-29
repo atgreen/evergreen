@@ -11342,6 +11342,62 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(BlissVal::from_single_float(nv.sqrt() as f32));
             }
+            // Transcendental functions on reals → single-float (bliss-44qp).
+            // Computed in f64 then narrowed. Complex arguments and the complex
+            // codomain of out-of-real-range inputs (e.g. (asin 2), (acosh 0))
+            // are a follow-up; num_val rejects a complex argument here.
+            "EXP" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "SINH" | "COSH" | "TANH"
+            | "ASINH" | "ACOSH" | "ATANH" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                let x = num_val(v)?;
+                let r = match name.as_str() {
+                    "EXP" => x.exp(),
+                    "SIN" => x.sin(),
+                    "COS" => x.cos(),
+                    "TAN" => x.tan(),
+                    "ASIN" => x.asin(),
+                    "ACOS" => x.acos(),
+                    "SINH" => x.sinh(),
+                    "COSH" => x.cosh(),
+                    "TANH" => x.tanh(),
+                    "ASINH" => x.asinh(),
+                    "ACOSH" => x.acosh(),
+                    "ATANH" => x.atanh(),
+                    _ => unreachable!(),
+                };
+                return Ok(BlissVal::from_single_float(r as f32));
+            }
+            // (ATAN y) = arctangent; (ATAN y x) = phase of x+yi (atan2).
+            "ATAN" => {
+                let (yf, r) = cp(cdr);
+                bliss_rt::rooted!(yv = eval_form(yf, env)?);
+                let y = num_val(*yv)?;
+                if r.is_cons() {
+                    let x = num_val(eval_form(cp(r).0, env)?)?;
+                    return Ok(BlissVal::from_single_float(y.atan2(x) as f32));
+                }
+                return Ok(BlissVal::from_single_float(y.atan() as f32));
+            }
+            // (LOG x) = natural log; (LOG x base) = log_base(x) = ln x / ln base.
+            // A negative real has a complex log ln|x| + iπ (matches SQRT).
+            "LOG" => {
+                let (xf, r) = cp(cdr);
+                bliss_rt::rooted!(xv = eval_form(xf, env)?);
+                if r.is_cons() {
+                    let base = num_val(eval_form(cp(r).0, env)?)?;
+                    let x = num_val(*xv)?;
+                    return Ok(BlissVal::from_single_float((x.ln() / base.ln()) as f32));
+                }
+                let x = num_val(*xv)?;
+                if x < 0.0 {
+                    return make_complex(
+                        BlissVal::from_single_float(x.abs().ln() as f32),
+                        BlissVal::from_single_float(std::f32::consts::PI),
+                    );
+                }
+                return Ok(BlissVal::from_single_float(x.ln() as f32));
+            }
             "RANDOM" => {
                 // (random limit &optional random-state) — a value in [0, limit)
                 // of the same type as LIMIT. The optional random-state arg is
