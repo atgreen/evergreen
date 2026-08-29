@@ -11286,7 +11286,27 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "SQRT" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
+                // Complex argument → principal complex square root (bliss-k0jg
+                // follow-up): sqrt(a+bi) = √((r+a)/2) + sign(b)·√((r−a)/2)·i.
+                if let Some(re) = bliss_rt::types::complex_realpart(v) {
+                    let a = num_val(re)?;
+                    let b = num_val(bliss_rt::types::complex_imagpart(v).unwrap_or(NIL))?;
+                    let r = a.hypot(b);
+                    let re_out = ((r + a) / 2.0).sqrt();
+                    let im_out = ((r - a) / 2.0).sqrt() * if b < 0.0 { -1.0 } else { 1.0 };
+                    return make_complex(
+                        BlissVal::from_single_float(re_out as f32),
+                        BlissVal::from_single_float(im_out as f32),
+                    );
+                }
                 let nv = num_val(v)?;
+                // A negative real has a pure-imaginary root #C(0.0 √|x|), not NaN.
+                if nv < 0.0 {
+                    return make_complex(
+                        BlissVal::from_single_float(0.0),
+                        BlissVal::from_single_float((-nv).sqrt() as f32),
+                    );
+                }
                 return Ok(BlissVal::from_single_float(nv.sqrt() as f32));
             }
             "RANDOM" => {

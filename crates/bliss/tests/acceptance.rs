@@ -1768,6 +1768,34 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-k0jg follow-up: SQRT of a negative real returns the pure-imaginary
+/// complex root (not NaN), and SQRT of a complex returns the principal complex
+/// root; non-negative reals still return a float.
+#[test]
+fn sqrt_of_negative_and_complex() {
+    let cases = [
+        ("(sqrt -4)", "#C(0.0 2.0)"),
+        ("(sqrt -1)", "#C(0.0 1.0)"),
+        ("(sqrt -2.0)", "#C(0.0 1.4142135)"),
+        ("(sqrt #C(0 2))", "#C(1.0 1.0)"),
+        ("(sqrt #C(-1 0))", "#C(0.0 1.0)"),
+        ("(* (sqrt -1) (sqrt -1))", "#C(-1.0 0.0)"),
+        // Non-negative reals unchanged.
+        ("(sqrt 4)", "2.0"),
+        ("(sqrt 0)", "0.0"),
+        ("(complexp (sqrt -9))", "T"),
+        ("(realpart (sqrt -9))", "0.0"),
+        ("(imagpart (sqrt -9))", "3.0"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// bliss-k0jg: RATIONAL (exact float → rational) and RATIONALIZE (simplest
 /// rational that reads back to the same float). Both leave integers/ratios
 /// unchanged and round-trip through FLOAT.
