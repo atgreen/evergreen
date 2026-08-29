@@ -1768,6 +1768,40 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// Complex numbers compare correctly under all the equality predicates:
+/// EQL/EQUAL/EQUALP componentwise (CLHS: same-type numbers with eql parts), and
+/// =//= numerically (they are defined on complex, which is unordered). This was
+/// broken because the shared numeric compare (numeric_cmp) errors on complex.
+#[test]
+fn complex_number_equality_predicates() {
+    let cases = [
+        ("(eql #c(0 2) #c(0 2))", "T"),
+        ("(eql #c(1 2) #c(1 3))", "NIL"),
+        ("(equal #c(0 2) #c(0 2))", "T"),
+        ("(equalp #c(0 2) #c(0 2))", "T"),
+        ("(= #c(0 2) #c(0 2))", "T"),
+        ("(= #c(1 2) #c(1 3))", "NIL"),
+        ("(/= #c(1 2) #c(1 3))", "T"),
+        // = across real/complex when the imaginary part is zero.
+        ("(= 2 #c(2 0.0))", "T"),
+        // eql is type-strict on the parts (0 vs 0.0 differ).
+        ("(eql #c(0 2) #c(0.0 2.0))", "NIL"),
+        // member/assoc (built on eql) find complex keys.
+        ("(if (member #c(1 2) (list #c(3 4) #c(1 2))) t nil)", "T"),
+        // Ordering predicates and cross-type = unchanged.
+        ("(= 1 1.0)", "T"),
+        ("(eql 1 1.0)", "NIL"),
+        ("(< 1 2 3)", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Functions/closures print as #<FUNCTION>, not as the internal
 /// (BLISS::CLOSURE . id) data list — in cli PRINT/PRIN1 and in FORMAT ~A/~S,
 /// including nested in a list. Data conses (incl. NIL/T cars) are unaffected.

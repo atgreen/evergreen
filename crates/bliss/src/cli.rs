@@ -8904,7 +8904,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if eq { T } else { NIL });
             }
             "=" => {
-                return eval_cmp(cdr, env, |o| o == Ordering::Equal);
+                // `=` (unlike the ordering comparisons) is defined on complex
+                // numbers, which are unordered — so it can't route through the
+                // Ordering-based eval_cmp when a complex operand is present.
+                let vals = eval_args(cdr, env)?;
+                if vals.is_empty() {
+                    return Err(BlissError::Internal(
+                        "= requires at least one argument".into(),
+                    ));
+                }
+                if vals.len() == 1 {
+                    // One argument: T, but it must be a number.
+                    numeric_equal(vals[0], vals[0])?;
+                    return Ok(T);
+                }
+                for i in 0..vals.len() - 1 {
+                    if !numeric_equal(vals[i], vals[i + 1])? {
+                        return Ok(NIL);
+                    }
+                }
+                return Ok(T);
             }
             "<" => {
                 return eval_cmp(cdr, env, |o| o == Ordering::Less);
@@ -15525,6 +15544,17 @@ fn eql_values(a: BlissVal, b: BlissVal) -> bool {
     if a == b {
         return true;
     }
+    // Complex numbers are unordered (numeric_cmp fails on them), so compare
+    // componentwise: EQL iff both parts are EQL (CLHS: same-type numbers with
+    // eql parts). bliss-052e-adjacent.
+    if let (Some(ra), Some(rb)) = (
+        bliss_rt::types::complex_realpart(a),
+        bliss_rt::types::complex_realpart(b),
+    ) {
+        let ia = bliss_rt::types::complex_imagpart(a).unwrap_or(NIL);
+        let ib = bliss_rt::types::complex_imagpart(b).unwrap_or(NIL);
+        return eql_values(ra, rb) && eql_values(ia, ib);
+    }
     match (heap_numeric_type_id(a), heap_numeric_type_id(b)) {
         (Some(ta), Some(tb)) if ta == tb => numeric_cmp(a, b)
             .map(|o| o == Ordering::Equal)
@@ -16002,6 +16032,19 @@ fn num_val(v: BlissVal) -> Result<f64, BlissError> {
 
 /// Exact-where-possible numeric comparison. Floats force inexact comparison
 /// (CL contagion); otherwise operands compare as exact rationals.
+/// CL numeric equality (`=`), which — unlike `<`/`>` — is defined on COMPLEX:
+/// two numbers are `=` iff their real and imaginary parts are numerically equal
+/// (a real `x` is `#C(x 0)`). Reals fall through to [`numeric_cmp`].
+fn numeric_equal(a: BlissVal, b: BlissVal) -> Result<bool, BlissError> {
+    if bliss_rt::types::complexp(a) || bliss_rt::types::complexp(b) {
+        let (ar, ai) = complex_parts(a)?;
+        let (br, bi) = complex_parts(b)?;
+        return Ok(numeric_cmp(ar, br)? == Ordering::Equal
+            && numeric_cmp(ai, bi)? == Ordering::Equal);
+    }
+    Ok(numeric_cmp(a, b)? == Ordering::Equal)
+}
+
 fn numeric_cmp(a: BlissVal, b: BlissVal) -> Result<Ordering, BlissError> {
     // Fixnum fast path (bliss-x5y.10): the overwhelmingly common case is two
     // fixnums; compare their untagged i64s directly instead of allocating two
@@ -16329,7 +16372,7 @@ fn eval_not_equal(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
     }
     for i in 0..v.len() {
         for j in i + 1..v.len() {
-            if numeric_cmp(v[i], v[j])? == Ordering::Equal {
+            if numeric_equal(v[i], v[j])? {
                 return Ok(NIL);
             }
         }
@@ -19746,8 +19789,10 @@ fn apply_numeric_op(name: &str, args: &[BlissVal]) -> Option<Result<BlissVal, Bl
         ">" if args.len() == 2 => cmp(|o| o == Ordering::Greater),
         "<=" if args.len() == 2 => cmp(|o| o != Ordering::Greater),
         ">=" if args.len() == 2 => cmp(|o| o != Ordering::Less),
-        "=" if args.len() == 2 => cmp(|o| o == Ordering::Equal),
-        "/=" if args.len() == 2 => cmp(|o| o != Ordering::Equal),
+        // `=`/`/=` are defined on complex numbers (unordered), so they use the
+        // componentwise numeric_equal rather than the Ordering-based cmp.
+        "=" if args.len() == 2 => numeric_equal(args[0], args[1]).map(|e| if e { T } else { NIL }),
+        "/=" if args.len() == 2 => numeric_equal(args[0], args[1]).map(|e| if e { NIL } else { T }),
         _ => return None,
     })
 }
@@ -20987,6 +21032,11 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
     if a.is_single_float() && b.is_single_float() {
         return a.as_single_float() == b.as_single_float();
     }
+    // On numbers EQUAL is EQL — delegate so heap numerics (bignum/ratio/complex)
+    // with equal value/type compare EQUAL (e.g. two distinct #C(0 2) objects).
+    if is_number_value(a) && is_number_value(b) {
+        return eql_values(a, b);
+    }
     if is_string_value(a) && is_string_value(b) {
         return val_as_str(a) == val_as_str(b);
     }
@@ -21020,9 +21070,8 @@ fn vals_equalp(a: BlissVal, b: BlissVal) -> bool {
         return true;
     }
     if is_number_value(a) && is_number_value(b) {
-        return numeric_cmp(a, b)
-            .map(|o| o == Ordering::Equal)
-            .unwrap_or(false);
+        // numeric_equal handles COMPLEX (unordered → numeric_cmp fails on it).
+        return numeric_equal(a, b).unwrap_or(false);
     }
     if a.is_character() && b.is_character() {
         return a.as_char().eq_ignore_ascii_case(&b.as_char());
