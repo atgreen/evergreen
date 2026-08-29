@@ -286,6 +286,20 @@ fn operands_invariant(
 /// non-back-edge predecessor and jumps unconditionally to it. Reuses an
 /// existing clean entry predecessor when possible, otherwise synthesises one
 /// and redirects all non-back-edge entry edges through it.
+///
+/// OSR safety (bliss-enc, spec §4.6). An OSR entry block (`osr_entry::
+/// build_osr_entry`) is an alternate CFG entry that jumps straight into the loop
+/// header importing the live loop-carried slots. It is a genuine non-back-edge
+/// predecessor of the header (the header does not dominate it — it is not even
+/// reachable from `f.entry()`), so it lands in `outside` and is redirected
+/// *through* the synthesised preheader exactly like the normal entry edge. That
+/// is what makes hoisting safe on the OSR path: a value sunk into the preheader
+/// is still computed before the header is reached via OSR, never bypassed.
+/// INVARIANT (must hold when LICM is eventually wired alongside OSR): the OSR
+/// entry region MUST be materialised in the CFG *before* LICM runs. If an OSR
+/// edge is added after hoisting, it would jump directly to the header and skip
+/// the preheader — reintroducing the pre-header-bypass landmine this ordering
+/// avoids. The `hoist_respects_preexisting_osr_entry` test pins this.
 fn ensure_preheader(f: &mut Function, dom: &DominatorTree, lp: &NaturalLoop) -> Block {
     let header = lp.header;
     let preds = f.preds(header);
@@ -663,6 +677,129 @@ mod tests {
             blocks_before,
             "no preheader when nothing hoists"
         );
+    }
+
+    /// OSR pre-header-bypass guardrail (bliss-enc, spec §4.6).
+    ///
+    /// Build a counted loop with a hoistable loop-invariant, then materialise an
+    /// OSR entry block (the alternate entry that jumps straight into the header)
+    /// *before* running LICM. LICM must treat the OSR edge as a genuine
+    /// alternate predecessor and route it *through* the synthesised preheader so
+    /// the hoisted invariant is still computed on the OSR path — never bypassed.
+    #[test]
+    fn hoist_respects_preexisting_osr_entry() {
+        use crate::t2::osr_entry::build_osr_entry;
+
+        let mut f = Function::new("osr_loop");
+        let (ty, repr) = tagged_fixnum();
+
+        let entry = f.entry();
+        let header = f.make_block();
+        let body = f.make_block();
+        let exit = f.make_block();
+
+        // Loop induction parameter on the header (the single loop-carried slot).
+        let i = f.add_block_param(header, ty, repr);
+
+        // entry: two invariant seeds + jump header(0).
+        let (_, a_res) = f.push_inst(entry, const_fixnum(3), &[(ty, repr)]);
+        let a = a_res[0];
+        let (_, b_res) = f.push_inst(entry, const_fixnum(4), &[(ty, repr)]);
+        let b = b_res[0];
+        let (_, zero_res) = f.push_inst(entry, const_fixnum(0), &[(ty, repr)]);
+        f.set_terminator(entry, jump(header, vec![zero_res[0]]));
+
+        // header: cond = i < a; brif body, exit.
+        let (_, cond_res) = f.push_inst(
+            header,
+            InstData {
+                opcode: Opcode::FixnumCmpLt,
+                args: vec![i, a],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(ty, repr)],
+        );
+        f.set_terminator(header, brif(body, exit, cond_res[0], vec![], vec![]));
+
+        // body: invariant add (a + b), a loop-variant use of it, and the increment.
+        let (inv_inst, inv_res) = f.push_inst(body, add(a, b), &[(ty, repr)]);
+        // Use the invariant inside the loop so it is genuinely live on every
+        // iteration (including the OSR-entered one).
+        let (_var_inst, _) = f.push_inst(body, add(i, inv_res[0]), &[(ty, repr)]);
+        let (_, one_res) = f.push_inst(body, const_fixnum(1), &[(ty, repr)]);
+        let (_, inc_res) = f.push_inst(body, add(i, one_res[0]), &[(ty, repr)]);
+        f.set_terminator(body, jump(header, vec![inc_res[0]]));
+
+        f.set_terminator(exit, ret());
+
+        // Materialise the OSR entry region BEFORE LICM (the required ordering).
+        // It becomes an alternate, non-dominated predecessor of the header.
+        let osr = build_osr_entry(&mut f, header);
+        assert_eq!(
+            f.succs(osr.entry_block),
+            vec![header],
+            "freshly built OSR entry jumps straight to the header"
+        );
+        assert_eq!(block_of(&f, inv_inst), body);
+
+        // Run LICM.
+        let mut a_cache = Analyses::new();
+        Licm.run(&mut f, &mut a_cache);
+
+        // (1) The invariant was hoisted out of the loop body.
+        let inv_after = block_of(&f, inv_inst);
+        assert_ne!(inv_after, body, "invariant add should have been hoisted");
+
+        // (2) The block it landed in is the header's sole non-back-edge
+        //     predecessor (the preheader) and jumps to the header.
+        let ph = inv_after;
+        let dom = f.dominators();
+        let outside: Vec<_> = f
+            .preds(header)
+            .into_iter()
+            .filter(|&p| !dom.dominates(header, p))
+            .collect();
+        assert_eq!(
+            outside,
+            vec![ph],
+            "the header must have exactly one non-back-edge pred: the preheader"
+        );
+        assert_eq!(f.succs(ph), vec![header], "preheader jumps to the header");
+
+        // (3) THE GUARDRAIL: the OSR entry edge was redirected THROUGH the
+        //     preheader, not left bypassing it into the header. So execution
+        //     entering via OSR still computes the hoisted invariant.
+        assert_eq!(
+            f.succs(osr.entry_block),
+            vec![ph],
+            "OSR entry must route through the preheader so the hoisted invariant \
+             is not bypassed on the OSR path"
+        );
+        // The normal entry edge is likewise routed through the preheader.
+        assert_eq!(f.succs(entry), vec![ph]);
+        // Nothing jumps directly to the header except the preheader and the
+        // loop's own back-edge (body) — i.e. no alternate entry bypasses it.
+        for &blk in f.block_order() {
+            if blk == ph || blk == body {
+                continue;
+            }
+            assert!(
+                !f.succs(blk).contains(&header),
+                "no block other than the preheader/back-edge may jump straight \
+                 into the header (block {blk:?} does)"
+            );
+        }
+
+        // The OSR import map is untouched: it still describes the one live slot,
+        // imported into the OSR block's own param (rerouting only changed the
+        // terminator's target, not the imports).
+        let _ = b;
+        assert_eq!(osr.imports.len(), 1, "one loop-carried slot imported");
     }
 
     // ── small InstData builders ──
