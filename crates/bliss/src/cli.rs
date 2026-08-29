@@ -11053,19 +11053,13 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "1+" | "1-" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                let delta = if name == "1+" { 1 } else { -1 };
-                if v.is_fixnum() {
-                    return Ok(BlissVal::from_fixnum(v.as_fixnum() + delta));
+                // Delegate to the shared numeric tower so bignum/ratio/complex
+                // operands work (a fixnum-only path rejected them; bliss-05hy).
+                let one = BlissVal::from_fixnum(1);
+                if name == "1+" {
+                    return fold_arith_vals(&[v, one], 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b);
                 }
-                if v.is_single_float() {
-                    return Ok(BlissVal::from_single_float(
-                        v.as_single_float() + delta as f32,
-                    ));
-                }
-                return Err(BlissError::TypeError {
-                    datum: v,
-                    expected: "number".into(),
-                });
+                return sub_vals(&[v, one]);
             }
             "ZEROP" | "PLUSP" | "MINUSP" => {
                 let (af, _) = cp(cdr);
@@ -11080,12 +11074,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "EVENP" | "ODDP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                let n = if v.is_fixnum() {
-                    v.as_fixnum()
+                // Parity must be exact: a bignum via f64 (num_val as i64)
+                // overflows and gives the wrong bit (bliss-05hy).
+                let even = if v.is_fixnum() {
+                    v.as_fixnum() % 2 == 0
+                } else if let Some(n) = bigint_from_val(v) {
+                    // Even iff the least-significant limb is even (0 ⇒ even).
+                    n.mag.first().copied().unwrap_or(0) & 1 == 0
                 } else {
-                    num_val(v)? as i64
+                    return Err(BlissError::TypeError {
+                        datum: v,
+                        expected: "integer".into(),
+                    });
                 };
-                let even = n % 2 == 0;
                 return Ok(if even == (name == "EVENP") { T } else { NIL });
             }
             "ABS" => {
@@ -11202,92 +11203,59 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "FLOOR" => return eval_floor(cdr, env),
             "REM" => {
-                // REM: remainder of TRUNCATE — the result takes the sign of the
-                // dividend (Rust `%`).
-                let (af, r) = cp(cdr);
-                bliss_rt::rooted!(bf = cp(r).0);
-                bliss_rt::rooted!(a = eval_form(af, env)?);
-                let b = eval_form(*bf, env)?;
-                let av = num_val(*a)? as i64;
-                let bv = num_val(b)? as i64;
-                if bv == 0 {
+                // REM: remainder of TRUNCATE (sign of the dividend). Exact for
+                // rationals (bliss-05hy); f64 fallback for floats.
+                let args = eval_args(cdr, env)?;
+                if args.len() < 2 {
+                    return Err(BlissError::Internal("REM requires two arguments".into()));
+                }
+                if let Some(res) = exact_int_div(args[0], args[1], RoundMode::Truncate) {
+                    return Ok(res?.1);
+                }
+                let av = num_val(args[0])?;
+                let bv = num_val(args[1])?;
+                if bv == 0.0 {
                     return Err(BlissError::ArithmeticError("division by zero".into()));
                 }
-                return Ok(BlissVal::from_fixnum(av % bv));
+                return Ok(BlissVal::from_single_float((av % bv) as f32));
             }
             "MOD" => {
-                // MOD: remainder of FLOOR — the result takes the sign of the
-                // *divisor* (ANSI), so `(mod -7 3)` = 2, not -1.
+                // MOD: remainder of FLOOR (sign of the *divisor*, ANSI), so
+                // (mod -7 3) = 2. Exact for rationals; f64 fallback for floats.
                 let args = eval_args(cdr, env)?;
                 if args.len() < 2 {
                     return Err(BlissError::Internal("MOD requires two arguments".into()));
                 }
-                let av = num_val(args[0])? as i64;
-                let bv = num_val(args[1])? as i64;
-                if bv == 0 {
+                if let Some(res) = exact_int_div(args[0], args[1], RoundMode::Floor) {
+                    return Ok(res?.1);
+                }
+                let av = num_val(args[0])?;
+                let bv = num_val(args[1])?;
+                if bv == 0.0 {
                     return Err(BlissError::ArithmeticError("division by zero".into()));
                 }
-                return Ok(BlissVal::from_fixnum(((av % bv) + bv) % bv));
+                return Ok(BlissVal::from_single_float(av.rem_euclid(bv) as f32));
             }
             "TRUNCATE" => {
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal("TRUNCATE requires an argument".into()));
                 }
-                let a = args[0];
-                let av = num_val(a)?;
-                if args.len() >= 2 {
-                    let b = args[1];
-                    let bv = num_val(b)?;
-                    if bv == 0.0 {
-                        return Err(BlissError::ArithmeticError("division by zero".into()));
-                    }
-                    let q = (av / bv).trunc() as i64;
-                    let rem = integer_or_float_remainder(a, b, q, av, bv);
-                    env.set_mv(vec![BlissVal::from_fixnum(q), rem]);
-                    return Ok(BlissVal::from_fixnum(q));
-                }
-                return Ok(BlissVal::from_fixnum(av as i64));
+                return eval_int_div(args[0], args.get(1).copied(), RoundMode::Truncate, env);
             }
             "CEILING" => {
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal("CEILING requires an argument".into()));
                 }
-                let a = args[0];
-                let av = num_val(a)?;
-                if args.len() >= 2 {
-                    let b = args[1];
-                    let bv = num_val(b)?;
-                    if bv == 0.0 {
-                        return Err(BlissError::ArithmeticError("division by zero".into()));
-                    }
-                    let q = (av / bv).ceil() as i64;
-                    let rem = integer_or_float_remainder(a, b, q, av, bv);
-                    env.set_mv(vec![BlissVal::from_fixnum(q), rem]);
-                    return Ok(BlissVal::from_fixnum(q));
-                }
-                return Ok(BlissVal::from_fixnum(av.ceil() as i64));
+                return eval_int_div(args[0], args.get(1).copied(), RoundMode::Ceiling, env);
             }
             "ROUND" => {
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::Internal("ROUND requires an argument".into()));
                 }
-                let a = args[0];
-                let av = num_val(a)?;
-                if args.len() >= 2 {
-                    let b = args[1];
-                    let bv = num_val(b)?;
-                    if bv == 0.0 {
-                        return Err(BlissError::ArithmeticError("division by zero".into()));
-                    }
-                    let q = round_half_even(av / bv);
-                    let rem = integer_or_float_remainder(a, b, q, av, bv);
-                    env.set_mv(vec![BlissVal::from_fixnum(q), rem]);
-                    return Ok(BlissVal::from_fixnum(q));
-                }
-                return Ok(BlissVal::from_fixnum(round_half_even(av)));
+                return eval_int_div(args[0], args.get(1).copied(), RoundMode::Round, env);
             }
             "EXPT" => {
                 let args = eval_args(cdr, env)?;
@@ -15914,6 +15882,100 @@ fn big_divexact(a: &BigInt, g: &BigInt) -> BigInt {
     big_divmod(a, g).0
 }
 
+/// The rounding mode for the CL integer-division family.
+#[derive(Clone, Copy)]
+enum RoundMode {
+    Floor,
+    Ceiling,
+    Truncate,
+    Round,
+}
+
+/// `|n|`.
+fn big_abs(n: &BigInt) -> BigInt {
+    BigInt::from_mag(1, n.mag.clone())
+}
+
+/// Round the exact rational `r` (den > 0) to an integer per `mode`
+/// (FLOOR toward −∞, CEILING toward +∞, TRUNCATE toward 0, ROUND to nearest,
+/// ties to even).
+fn bigrat_round_to_int(r: &BigRat, mode: RoundMode) -> BigInt {
+    // big_divmod truncates toward zero; `rem` carries the numerator's sign.
+    let (q, rem) = big_divmod(&r.num, &r.den);
+    if rem.is_zero() {
+        return q;
+    }
+    let neg = r.num.sign < 0;
+    let away = |q: &BigInt| {
+        if neg {
+            big_sub(q, &BigInt::one())
+        } else {
+            big_add(q, &BigInt::one())
+        }
+    };
+    match mode {
+        RoundMode::Truncate => q,
+        RoundMode::Floor => {
+            if neg {
+                away(&q)
+            } else {
+                q
+            }
+        }
+        RoundMode::Ceiling => {
+            if neg {
+                q
+            } else {
+                away(&q)
+            }
+        }
+        RoundMode::Round => {
+            // Compare 2·|rem| with den: <half keeps q, >half rounds away, and a
+            // tie rounds to the even neighbour.
+            let two_rem = big_mul(&BigInt::from_i64(2), &big_abs(&rem));
+            match big_cmp(&two_rem, &r.den) {
+                Ordering::Less => q,
+                Ordering::Greater => away(&q),
+                Ordering::Equal => {
+                    let even = q.mag.first().copied().unwrap_or(0) & 1 == 0;
+                    if even {
+                        q
+                    } else {
+                        away(&q)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Exact FLOOR/CEILING/TRUNCATE/ROUND of `a`/`b` for rational operands (fixnum,
+/// bignum, ratio). Returns the (quotient, remainder = a − quotient·b) as
+/// BlissVals, or `None` if either operand is a float (the caller then uses the
+/// f64 path). This replaces the old `num_val`→f64→`as i64` path, which
+/// overflowed and lost precision on bignums/ratios (bliss-05hy).
+fn exact_int_div(
+    a: BlissVal,
+    b: BlissVal,
+    mode: RoundMode,
+) -> Option<Result<(BlissVal, BlissVal), BlissError>> {
+    if a.is_single_float() || b.is_single_float() {
+        return None;
+    }
+    let ra = as_bigrat(a)?;
+    let rb = as_bigrat(b)?;
+    if rb.num.is_zero() {
+        return Some(Err(BlissError::ArithmeticError("division by zero".into())));
+    }
+    let q = bigrat_round_to_int(&bigrat_div(&ra, &rb), mode);
+    // remainder = a − q·b (exact), computed in Rust-native BigRat.
+    let rem = bigrat_sub(&ra, &bigrat_mul(&BigRat::from_bigint(q.clone()), &rb));
+    // Convert to BlissVals, rooting the quotient across the remainder alloc.
+    bliss_rt::rooted!(q_val = q.to_val());
+    let rem_val = rem.to_val();
+    Some(Ok((*q_val, rem_val)))
+}
+
 /// Non-negative gcd of two integers (gcd(0,0) == 0).
 fn big_gcd(x: &BigInt, y: &BigInt) -> BigInt {
     let mut a = BigInt::from_mag(1, x.mag.clone());
@@ -20353,25 +20415,41 @@ fn eval_floor(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     if args.is_empty() {
         return Err(BlissError::Internal("FLOOR requires an argument".into()));
     }
-    let a = args[0];
-    let av = num_val(a)?;
-    if args.len() >= 2 {
-        let b = args[1];
-        let bv = num_val(b)?;
-        if bv == 0.0 {
-            return Err(BlissError::ArithmeticError("division by zero".into()));
-        }
-        let q = (av / bv).floor() as i64;
-        let rem = integer_or_float_remainder(a, b, q, av, bv);
-        env.set_mv(vec![BlissVal::from_fixnum(q), rem]);
-        return Ok(BlissVal::from_fixnum(q));
+    eval_int_div(args[0], args.get(1).copied(), RoundMode::Floor, env)
+}
+
+/// Shared body for FLOOR/CEILING/TRUNCATE/ROUND: exact rational quotient +
+/// remainder when the operands are rationals, else an f64 fallback for floats.
+/// Sets the two values (quotient, remainder) and returns the quotient.
+fn eval_int_div(
+    a: BlissVal,
+    b: Option<BlissVal>,
+    mode: RoundMode,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    // A missing divisor means "of a itself" — i.e. divide by 1.
+    let divisor = b.unwrap_or(BlissVal::from_fixnum(1));
+    if let Some(res) = exact_int_div(a, divisor, mode) {
+        let (q, rem) = res?;
+        bliss_rt::rooted!(q = q);
+        env.set_mv(vec![*q, rem]);
+        return Ok(*q);
     }
-    let q = av.floor() as i64;
-    let rem = av - q as f64;
-    env.set_mv(vec![
-        BlissVal::from_fixnum(q),
-        BlissVal::from_single_float(rem as f32),
-    ]);
+    // Float fallback: at least one operand is a float.
+    let av = num_val(a)?;
+    let bv = num_val(divisor)?;
+    if bv == 0.0 {
+        return Err(BlissError::ArithmeticError("division by zero".into()));
+    }
+    let quot = av / bv;
+    let q = match mode {
+        RoundMode::Floor => quot.floor(),
+        RoundMode::Ceiling => quot.ceil(),
+        RoundMode::Truncate => quot.trunc(),
+        RoundMode::Round => round_half_even(quot) as f64,
+    } as i64;
+    let rem = integer_or_float_remainder(a, divisor, q, av, bv);
+    env.set_mv(vec![BlissVal::from_fixnum(q), rem]);
     Ok(BlissVal::from_fixnum(q))
 }
 

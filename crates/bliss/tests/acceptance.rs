@@ -1768,6 +1768,47 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-05hy: FLOOR/CEILING/TRUNCATE/ROUND/MOD/REM and EVENP/ODDP were computed
+/// via f64 (num_val + `as i64`), which overflows and loses precision on bignums
+/// (and large fixnums) — (floor (expt 2 70) 2) returned -1. They now use exact
+/// rational division; this also transitively fixes bignum LOGAND (via boot's
+/// bit-recursion through FLOOR).
+#[test]
+fn integer_division_is_exact_on_bignums() {
+    let cases = [
+        // The reported bug: bignum FLOOR/TRUNCATE.
+        ("(floor (expt 2 70) 2)", "590295810358705651712"),
+        ("(truncate (expt 2 70) 2)", "590295810358705651712"),
+        ("(floor (expt 2 70) 3)", "393530540239137101141"),
+        ("(nth-value 1 (floor (expt 2 70) 3))", "1"),
+        // Transitively fixed: bignum bitwise ops (boot recurses via FLOOR).
+        ("(logand (expt 2 70) (expt 2 70))", "1180591620717411303424"),
+        ("(evenp (expt 2 70))", "T"),
+        ("(oddp (1+ (expt 2 70)))", "T"),
+        // Rounding-mode correctness (fixnum regressions).
+        ("(floor -7 2)", "-4"),
+        ("(ceiling -7 2)", "-3"),
+        ("(truncate -7 2)", "-3"),
+        ("(mod -7 3)", "2"),
+        ("(rem -7 3)", "-1"),
+        // ROUND ties to even.
+        ("(round 5 2)", "2"),
+        ("(round 7 2)", "4"),
+        ("(round -5 2)", "-2"),
+        // Ratios and floats still work.
+        ("(floor 7/2)", "3"),
+        ("(floor 3.7)", "3"),
+        ("(round 2.5)", "2"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// bliss-44qp: the transcendental functions (EXP, LOG 1-/2-arg, SIN/COS/TAN,
 /// ASIN/ACOS/ATAN 1-/2-arg, hyperbolics) — previously all "undefined function".
 #[test]
