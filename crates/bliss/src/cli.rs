@@ -8410,6 +8410,55 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(result);
             }
+            "PEEK-CHAR" => {
+                // (peek-char &optional peek-type stream eof-error-p eof-value
+                //  recursive-p): return the next character WITHOUT consuming it.
+                // peek-type NIL = next char; T = skip whitespace; a character =
+                // skip until that character (all of which are consumed).
+                let args = eval_args(cdr, env)?;
+                let peek_type = args.first().copied().unwrap_or(NIL);
+                let stream = args.get(1).copied().unwrap_or(NIL);
+                let eof_error_p = args.get(2).copied().unwrap_or(T);
+                let in_stream = resolve_input_stream(stream, env);
+                let skip_ws = peek_type == T;
+                let until = if peek_type.is_character() {
+                    Some(peek_type.as_char())
+                } else {
+                    None
+                };
+                loop {
+                    // Read one character (gray-stream aware, like READ-CHAR).
+                    let (c, at_eof) = if is_gray_stream(in_stream) {
+                        let r = invoke_generic_function("STREAM-READ-CHAR", &[in_stream], env)?;
+                        (r, !r.is_character())
+                    } else {
+                        let r = bliss_stdlib::stream_read_char(in_stream)?;
+                        (r, r == EOF)
+                    };
+                    if at_eof {
+                        if eof_error_p.is_nil() {
+                            return Ok(args.get(3).copied().unwrap_or(NIL));
+                        }
+                        return Err(BlissError::StreamError("end of file on PEEK-CHAR".into()));
+                    }
+                    let ch = c.as_char();
+                    let stop = match (skip_ws, until) {
+                        (true, _) => !ch.is_whitespace(),
+                        (false, Some(u)) => ch == u,
+                        (false, None) => true,
+                    };
+                    if stop {
+                        // Put the peeked character back and return it.
+                        if is_gray_stream(in_stream) {
+                            invoke_generic_function("STREAM-UNREAD-CHAR", &[in_stream, c], env)?;
+                        } else {
+                            bliss_stdlib::stream_unread_char(in_stream, c)?;
+                        }
+                        return Ok(c);
+                    }
+                    // Otherwise the character is consumed; keep scanning.
+                }
+            }
             "READ" | "READ-PRESERVING-WHITESPACE" => {
                 // (read &optional stream eof-error-p eof-value recursive-p)
                 let args = eval_args(cdr, env)?;
@@ -20239,6 +20288,7 @@ fn is_builtin_function(name: &str) -> bool {
             // I/O
             | "PRINT" | "PRIN1" | "PRINC" | "WRITE" | "WRITE-STRING" | "WRITE-LINE"
             | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"
+            | "PEEK-CHAR" | "UNREAD-CHAR"
             | "READ-FROM-STRING" | "FORMAT" | "PRIN1-TO-STRING" | "PRINC-TO-STRING"
             | "WRITE-TO-STRING" | "FORCE-OUTPUT" | "FINISH-OUTPUT" | "CLEAR-OUTPUT"
             | "FILE-LENGTH" | "READ-SEQUENCE" | "WRITE-SEQUENCE"

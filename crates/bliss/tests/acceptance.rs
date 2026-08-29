@@ -1768,6 +1768,31 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// PEEK-CHAR (was undefined): returns the next character without consuming it;
+/// peek-type NIL = next char, T = skip whitespace, a character = skip until it.
+#[test]
+fn peek_char_all_peek_types() {
+    let cases = [
+        // NIL: peek doesn't consume — the next READ-CHAR returns the same char.
+        ("(let ((s (make-string-input-stream \"abc\"))) (list (peek-char nil s) (read-char s) (read-char s)))", "(#\\a #\\a #\\b)"),
+        // T: skip leading whitespace, leave the found char unconsumed.
+        ("(let ((s (make-string-input-stream \"   xy\"))) (list (peek-char t s) (read-char s)))", "(#\\x #\\x)"),
+        // a character: skip until it, leave it unconsumed.
+        ("(let ((s (make-string-input-stream \"abcXd\"))) (list (peek-char #\\X s) (read-char s)))", "(#\\X #\\X)"),
+        // EOF handling with eof-error-p NIL and an eof-value.
+        ("(peek-char nil (make-string-input-stream \"\") nil :eof)", ":EOF"),
+        ("(fboundp 'peek-char)", "T"),
+        ("(with-input-from-string (s \"  42\") (list (peek-char t s) (read s)))", "(#\\4 42)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// LOOP `named NAME` establishes a block named NAME (CLHS 6.1.1.4) so
 /// (return-from NAME …) exits the loop — previously "unbound variable: NAMED".
 #[test]
