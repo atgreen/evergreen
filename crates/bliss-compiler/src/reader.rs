@@ -274,6 +274,100 @@ fn alloc_vector(elements: &[BlissVal]) -> BlissVal {
     }
 }
 
+/// Build an MD_ARRAY (rank ≥ 2) from its row-major `flat` storage and per-axis
+/// `dims`, mirroring `bliss_stdlib::build_md_array` (the reader can't depend on
+/// bliss-stdlib). Body = [storage-ref | dims-ref | rank]. `flat` must be rooted
+/// by the caller across this call; the storage/dims vectors are rooted here
+/// across the MD_ARRAY allocation.
+fn alloc_md_array(dims: &[usize], flat: &[BlissVal]) -> BlissVal {
+    let storage = alloc_vector(flat);
+    bliss_rt::rooted!(storage = storage);
+    let dim_vals: Vec<BlissVal> = dims
+        .iter()
+        .map(|&d| BlissVal::from_fixnum(d as i64))
+        .collect();
+    let dims_vec = alloc_vector(&dim_vals);
+    bliss_rt::rooted!(dims_vec = dims_vec);
+    let ptr = gc_alloc(8 + 3 * 8, type_id::MD_ARRAY);
+    unsafe {
+        *(ptr.add(8) as *mut BlissVal) = *storage;
+        *(ptr.add(16) as *mut BlissVal) = *dims_vec;
+        *(ptr.add(24) as *mut BlissVal) = BlissVal::from_fixnum(dims.len() as i64);
+        BlissVal::from_heap_ptr(ptr)
+    }
+}
+
+/// Read a `#nA(nested-lists)` array literal of rank `rank`. Reads the following
+/// nested-list form, derives the dimensions from the (rectangular) nesting,
+/// flattens row-major, and builds a SIMPLE_VECTOR (rank ≤ 1) or MD_ARRAY.
+#[allow(clippy::too_many_arguments)]
+fn read_nd_array_literal(
+    chars: &[char],
+    mut pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
+    read_circular: bool,
+    depth: usize,
+    rank: u32,
+) -> Result<(BlissVal, usize), BlissError> {
+    pos = skip_whitespace_and_comments(chars, pos);
+    let (mut contents, p) = read_token_with_base(
+        chars,
+        pos,
+        labels,
+        read_base,
+        read_eval,
+        read_circular,
+        depth,
+    )?;
+    // The nested contents are conses held across the allocating builds below.
+    bliss_rt::rooted_ref!(_contents_root = &mut contents);
+    let mut dims: Vec<usize> = Vec::new();
+    bliss_rt::rooted!(flat = Vec::<BlissVal>::new());
+    nd_collect(contents, rank, 0, &mut dims, &mut flat)?;
+    if rank <= 1 {
+        Ok((alloc_vector(&flat), p))
+    } else {
+        Ok((alloc_md_array(&dims, &flat), p))
+    }
+}
+
+/// Recursively descend `rank` levels of the `#nA` nested contents, recording the
+/// per-level dimension (validating that the array is rectangular) and appending
+/// leaves to `flat` in row-major order.
+fn nd_collect(
+    node: BlissVal,
+    rank: u32,
+    level: usize,
+    dims: &mut Vec<usize>,
+    flat: &mut Vec<BlissVal>,
+) -> Result<(), BlissError> {
+    if rank == 0 {
+        flat.push(node);
+        return Ok(());
+    }
+    // Collect this level's elements (a proper list).
+    let mut items = Vec::new();
+    let mut cur = node;
+    while cur.is_cons() {
+        let (car, cdr) = cons_parts(cur);
+        items.push(car);
+        cur = cdr;
+    }
+    if dims.len() <= level {
+        dims.push(items.len());
+    } else if dims[level] != items.len() {
+        return Err(BlissError::StreamError(
+            "non-rectangular #nA array literal".into(),
+        ));
+    }
+    for item in items {
+        nd_collect(item, rank - 1, level + 1, dims, flat)?;
+    }
+    Ok(())
+}
+
 fn alloc_ratio(num: BlissVal, den: BlissVal) -> BlissVal {
     // Root the by-value args across gc_alloc, which can fire a relocating
     // minor GC — a bignum numerator/denominator would otherwise be stored
@@ -1408,6 +1502,22 @@ fn read_sharpsign_with_base(
             'R' => {
                 pos += 1;
                 return read_radix_integer(chars, pos, num);
+            }
+            // #nA(nested-lists) — a rank-`num` array literal (CLHS 2.4.8.12). The
+            // printer emits this for multidimensional arrays (bliss-rh0t), so the
+            // reader must round-trip it.
+            'A' => {
+                pos += 1;
+                return read_nd_array_literal(
+                    chars,
+                    pos,
+                    labels,
+                    read_base,
+                    read_eval,
+                    read_circular,
+                    depth + 1,
+                    num,
+                );
             }
             '=' => {
                 if !read_circular {

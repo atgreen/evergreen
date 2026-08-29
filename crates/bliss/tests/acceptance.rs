@@ -1768,6 +1768,36 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-rh0t: the reader reads the `#nA(...)` multidimensional-array literal
+/// (the printer already emits it), and EQUALP compares multidim arrays
+/// element-wise — so an array round-trips through print → read → EQUALP.
+#[test]
+fn read_nd_array_literal_and_equalp_roundtrip() {
+    let cases = [
+        ("(array-rank (read-from-string \"#2A((1 2 3) (4 5 6))\"))", "2"),
+        ("(aref (read-from-string \"#2A((1 2 3) (4 5 6))\") 1 2)", "6"),
+        ("(array-dimensions (read-from-string \"#2A((1 2 3) (4 5 6))\"))", "(2 3)"),
+        ("(aref (read-from-string \"#3A(((1 2) (3 4)) ((5 6) (7 8)))\") 1 0 1)", "6"),
+        ("(vectorp (read-from-string \"#1A(1 2 3)\"))", "T"),
+        // EQUALP on multidim arrays.
+        ("(equalp #2A((1 2)) #2A((1 2)))", "T"),
+        ("(equalp #2A((1 2)) #2A((1 3)))", "NIL"),
+        ("(equalp #2A((1 2)) #2A((1 2 3)))", "NIL"),
+        ("(equalp #2A((1.0 2)) #2A((1 2)))", "T"),
+        // The full print → read → EQUALP round-trip.
+        ("(let ((a (make-array '(2 3) :initial-contents '((1 2 3) (4 5 6))))) (equalp a (read-from-string (prin1-to-string a))))", "T"),
+        // Non-rectangular literals are rejected.
+        ("(handler-case (read-from-string \"#2A((1 2) (3))\") (error () :err))", ":ERR"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// The stdlib printer (PRIN1-TO-STRING / WRITE-TO-STRING / FORMAT ~S) names the
 /// non-graphic characters under *print-escape* (#\Newline, not `#\`+literal),
 /// matching cli PRIN1 — this was a tier/path divergence (stdlib emitted the raw

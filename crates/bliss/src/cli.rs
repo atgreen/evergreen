@@ -21280,6 +21280,30 @@ fn vals_equalp(a: BlissVal, b: BlissVal) -> bool {
         }
         return true;
     }
+    // Multidimensional arrays: EQUALP iff same dimensions and every element is
+    // EQUALP (CLHS 5.3; row-major storage comparison; bliss-rh0t).
+    if bliss_rt::types::md_array_p(a) && bliss_rt::types::md_array_p(b) {
+        if md_dims(a).ok() != md_dims(b).ok() {
+            return false;
+        }
+        let (Some(sa), Some(sb)) = (
+            bliss_rt::types::md_array_storage(a),
+            bliss_rt::types::md_array_storage(b),
+        ) else {
+            return false;
+        };
+        let n = bliss_stdlib::length(sa).unwrap_or(usize::MAX);
+        if n == usize::MAX || Some(n) != bliss_stdlib::length(sb).ok() {
+            return false;
+        }
+        for i in 0..n {
+            match (bliss_stdlib::elt(sa, i), bliss_stdlib::elt(sb, i)) {
+                (Ok(x), Ok(y)) if vals_equalp(x, y) => {}
+                _ => return false,
+            }
+        }
+        return true;
+    }
     false
 }
 
