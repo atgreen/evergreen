@@ -442,7 +442,14 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         };
     }
     if v.is_single_float() {
-        return format!("{}", v.as_single_float());
+        // A CL float always prints with a decimal point (2.0, not 2) so it reads
+        // back as a float — match cli print_val (bliss-kzhq).
+        let s = format!("{}", v.as_single_float());
+        return if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("NaN") {
+            s
+        } else {
+            format!("{s}.0")
+        };
     }
     if v.is_symbol() {
         let idx = v.as_symbol_index();

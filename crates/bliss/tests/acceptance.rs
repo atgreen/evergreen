@@ -1768,6 +1768,36 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-kzhq: FORMAT ~A/~S print whole single-floats with a decimal point
+/// (2.0, not 2) so they read back as floats — matching cli PRINC/PRIN1. Was a
+/// tier/path divergence (stdlib format dropped the .0).
+#[test]
+fn format_prints_whole_floats_with_decimal_point() {
+    let cases = [
+        ("(format nil \"~a\" 2.0)", "\"2.0\""),
+        ("(format nil \"~s\" 2.0)", "\"2.0\""),
+        ("(format nil \"~a\" 0.0)", "\"0.0\""),
+        ("(format nil \"~a\" -3.0)", "\"-3.0\""),
+        ("(format nil \"~a\" 100.0)", "\"100.0\""),
+        ("(format nil \"~a\" 2.5)", "\"2.5\""),
+        // Fractional/exponent floats and the ~F directive are unaffected.
+        ("(format nil \"~a\" 1234.5)", "\"1234.5\""),
+        ("(format nil \"~,2f\" 3.14159)", "\"3.14\""),
+        // Floats nested in aggregates, and complex float parts, print right.
+        ("(format nil \"~a\" (list 1.0 2.5))", "\"(1.0 2.5)\""),
+        ("(format nil \"~a\" (sqrt -4))", "\"#C(0.0 2.0)\""),
+        // Matches princ (same value, both paths).
+        ("(equal (format nil \"~a\" 7.0) (princ-to-string 7.0))", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Complex numbers compare correctly under all the equality predicates:
 /// EQL/EQUAL/EQUALP componentwise (CLHS: same-type numbers with eql parts), and
 /// =//= numerically (they are defined on complex, which is unordered). This was
