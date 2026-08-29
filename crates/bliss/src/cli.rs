@@ -4269,6 +4269,35 @@ pub(super) fn fmt_form_debug(val: BlissVal) -> String {
     s
 }
 
+/// Render one axis of a multidimensional array's row-major storage as nested
+/// parenthesised lists for the `#nA` printer. `base` is the storage vector's
+/// object pointer, `dims` the remaining axes, `start` the flat offset. Returns
+/// the number of leaf elements consumed.
+fn print_md_nested(base: *const u8, dims: &[usize], start: usize, out: &mut String) -> usize {
+    out.push('(');
+    let mut consumed = 0;
+    if dims.len() <= 1 {
+        let n = dims.first().copied().unwrap_or(0);
+        for i in 0..n {
+            if i > 0 {
+                out.push(' ');
+            }
+            let e = unsafe { *(base.add(16 + (start + i) * 8) as *const BlissVal) };
+            print_val(e, out);
+        }
+        consumed = n;
+    } else {
+        for i in 0..dims[0] {
+            if i > 0 {
+                out.push(' ');
+            }
+            consumed += print_md_nested(base, &dims[1..], start + consumed, out);
+        }
+    }
+    out.push(')');
+    consumed
+}
+
 fn print_val(val: BlissVal, out: &mut String) {
     if val.is_nil() {
         out.push_str("NIL");
@@ -4473,6 +4502,16 @@ fn print_val(val: BlissVal, out: &mut String) {
                             _ => '0',
                         });
                     }
+                }
+                type_id::MD_ARRAY => {
+                    // #<rank>A(nested row-major lists) (bliss-rh0t).
+                    let storage = *(ptr.add(8) as *const BlissVal);
+                    let rank = (*(ptr.add(24) as *const BlissVal)).as_fixnum().max(0);
+                    let dims = md_dims(val).unwrap_or_default();
+                    out.push('#');
+                    out.push_str(&rank.to_string());
+                    out.push('A');
+                    print_md_nested(storage.as_ptr(), &dims, 0, out);
                 }
                 _ => out.push_str(&format!("#<heap-object type={}>", hdr.type_id())),
             }
@@ -6506,9 +6545,13 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                 bliss_stdlib::two_way_stream_input_stream(object).is_some()
             }
             "SIMPLE-VECTOR" => is_simple_vector_value(object),
-            // A string is a (vector character); an ARRAY includes both general
-            // vectors and strings.
-            "VECTOR" | "ARRAY" | "SIMPLE-ARRAY" => is_vector_value(object),
+            // A string is a (vector character); an ARRAY includes general
+            // vectors, strings, AND multidimensional arrays — but a multidim
+            // array is not a VECTOR (rank ≥ 2).
+            "VECTOR" => is_vector_value(object),
+            "ARRAY" | "SIMPLE-ARRAY" => {
+                is_vector_value(object) || bliss_rt::types::md_array_p(object)
+            }
             "SEQUENCE" => object.is_list() || is_vector_value(object),
             other => {
                 if let Some(hierarchy) = instance_class_hierarchy_names(object) {
@@ -6566,6 +6609,11 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             // (vector element-type size) / (array element-type dims): accept a
             // general vector or a string, checking the size/length when given.
             // Element-type is not tracked, so it is treated as wild.
+            // A multidimensional array satisfies ARRAY/SIMPLE-ARRAY but not
+            // VECTOR (rank ≥ 2). Dimension specs are treated as wild here.
+            if bliss_rt::types::md_array_p(object) {
+                return Ok(op != "VECTOR");
+            }
             if !is_vector_value(object) {
                 return Ok(false);
             }
@@ -9311,6 +9359,35 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 // Root the sequence across the index eval — it
                                 // is a moving heap object (bliss-4bp).
                                 bliss_rt::rooted!(seq_r = eval_form(tgt_form, env)?);
+                                // Multidimensional array: `(setf (aref a i j …) v)`
+                                // (one subscript per axis) or `(setf (row-major-aref
+                                // a k) v)`. Compute the row-major flat index and
+                                // store into the backing storage.
+                                if bliss_rt::types::md_array_p(*seq_r) {
+                                    let idx_forms: Vec<BlissVal> = list_to_vec(cp(*aargs).1);
+                                    bliss_rt::rooted!(subs = Vec::<BlissVal>::new());
+                                    for f in idx_forms {
+                                        let s = eval_form(f, env)?;
+                                        subs.push(s);
+                                    }
+                                    let flat = if acc == "ROW-MAJOR-AREF" {
+                                        let k = subs.first().copied().unwrap_or(NIL);
+                                        if !k.is_fixnum() || k.as_fixnum() < 0 {
+                                            return Err(BlissError::TypeError {
+                                                datum: k,
+                                                expected: "non-negative row-major index".into(),
+                                            });
+                                        }
+                                        k.as_fixnum() as usize
+                                    } else {
+                                        md_row_major_index(*seq_r, &subs)?
+                                    };
+                                    let storage = bliss_rt::types::md_array_storage(*seq_r).unwrap();
+                                    bliss_stdlib::set_elt(storage, flat, *val)?;
+                                    *c = *r2;
+                                    result = *val;
+                                    continue;
+                                }
                                 let (idx_form, _) = cp(cp(*aargs).1);
                                 let idx = eval_form(idx_form, env)?;
                                 let seq = *seq_r;
@@ -9633,6 +9710,25 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // One-dimensional array/vector/string access — delegates to elt.
                 // BIT/SBIT read a bit array exactly like AREF (rank-1 here).
                 let args = eval_args(cdr, env)?;
+                let arr0 = args.first().copied().unwrap_or(NIL);
+                // Multidimensional (rank ≥ 2) array: AREF takes one subscript per
+                // axis (row-major); ROW-MAJOR-AREF takes a single flat index.
+                if bliss_rt::types::md_array_p(arr0) {
+                    let storage = bliss_rt::types::md_array_storage(arr0).unwrap();
+                    let flat = if name == "ROW-MAJOR-AREF" {
+                        let idx = args.get(1).copied().unwrap_or(NIL);
+                        if !idx.is_fixnum() || idx.as_fixnum() < 0 {
+                            return Err(BlissError::TypeError {
+                                datum: idx,
+                                expected: "non-negative row-major index".into(),
+                            });
+                        }
+                        idx.as_fixnum() as usize
+                    } else {
+                        md_row_major_index(arr0, &args[1..])?
+                    };
+                    return bliss_stdlib::elt(storage, flat);
+                }
                 if args.len() != 2 {
                     return Err(BlissError::ProgramError(format!(
                         "{}: only one-dimensional arrays are supported",
@@ -9653,6 +9749,31 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (vector &rest elements) → a fresh simple-vector.
                 let elems = eval_args(cdr, env)?;
                 return Ok(bliss_stdlib::build_simple_vector(&elems));
+            }
+            // (%make-md-array dims-list initial-element) — build a rank ≥ 2
+            // multidimensional array with row-major storage seeded with
+            // initial-element. MAKE-ARRAY (boot.lisp) routes list dimensions of
+            // length ≥ 2 here (bliss-rh0t).
+            "BLISS-INTERNAL::%MAKE-MD-ARRAY"
+            | "BLISS-INTERNAL:%MAKE-MD-ARRAY"
+            | "%MAKE-MD-ARRAY" => {
+                let args = eval_args(cdr, env)?;
+                bliss_rt::rooted!(fill = args.get(1).copied().unwrap_or(NIL));
+                let dims_list = args.first().copied().unwrap_or(NIL);
+                let mut dims = Vec::new();
+                let mut c = dims_list;
+                while c.is_cons() {
+                    let (d, rest) = cp(c);
+                    if !d.is_fixnum() || d.as_fixnum() < 0 {
+                        return Err(BlissError::TypeError {
+                            datum: d,
+                            expected: "non-negative array dimension".into(),
+                        });
+                    }
+                    dims.push(d.as_fixnum() as usize);
+                    c = rest;
+                }
+                return Ok(bliss_stdlib::build_md_array(&dims, *fill));
             }
             // (%proclaim-special (a b c)) — register each symbol in the argument
             // list as globally special. The declaim macro and proclaim function in
@@ -9795,8 +9916,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "ARRAYP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                // bliss arrays are simple-vectors and strings.
-                return Ok(if is_vector_value(v) { T } else { NIL });
+                // bliss arrays are simple-vectors, strings, and multidim arrays.
+                let is_array = is_vector_value(v) || bliss_rt::types::md_array_p(v);
+                return Ok(if is_array { T } else { NIL });
             }
             // A bit-vector is a rank-1 array of BITs (reader `#*…`). All bit
             // vectors bliss builds are simple, so SIMPLE-BIT-VECTOR-P coincides
@@ -9838,23 +9960,44 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "ARRAY-RANK" => {
                 let (af, _) = cp(cdr);
-                let _v = eval_form(af, env)?;
-                // All bliss arrays are one-dimensional.
+                let v = eval_form(af, env)?;
+                // Multidimensional arrays carry their rank; every other bliss
+                // array (vector/string) is rank-1.
+                if let Some(rank) = bliss_rt::types::md_array_rank(v) {
+                    return Ok(rank);
+                }
                 return Ok(BlissVal::from_fixnum(1));
             }
             "ARRAY-DIMENSIONS" => {
                 let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
-                let len = bliss_stdlib::length(v)? as i64;
+                bliss_rt::rooted!(v = eval_form(af, env)?);
+                if bliss_rt::types::md_array_p(*v) {
+                    let dims = md_dims(*v)?;
+                    let dim_vals: Vec<BlissVal> =
+                        dims.iter().map(|&d| BlissVal::from_fixnum(d as i64)).collect();
+                    return Ok(vec_to_list(&dim_vals));
+                }
+                let len = bliss_stdlib::length(*v)? as i64;
                 return Ok(vec_to_list(&[BlissVal::from_fixnum(len)]));
             }
             "ARRAY-DIMENSION" => {
-                // (array-dimension array axis-number). bliss arrays are 1-D, so
-                // axis 0 is the length and any other axis is out of range.
+                // (array-dimension array axis-number). For a multidim array this
+                // is dims[axis]; a rank-1 array (vector/string) has only axis 0
+                // (its length).
                 let (af, r) = cp(cdr);
                 bliss_rt::rooted!(av = eval_form(af, env)?);
                 let axis = eval_form(cp(r).0, env)?;
                 let axis = axis.as_fixnum();
+                if bliss_rt::types::md_array_p(*av) {
+                    let dims = md_dims(*av)?;
+                    if axis < 0 || axis as usize >= dims.len() {
+                        return Err(BlissError::ProgramError(format!(
+                            "ARRAY-DIMENSION: axis {axis} out of range for a rank-{} array",
+                            dims.len()
+                        )));
+                    }
+                    return Ok(BlissVal::from_fixnum(dims[axis as usize] as i64));
+                }
                 if axis != 0 {
                     return Err(BlissError::Internal(format!(
                         "ARRAY-DIMENSION: axis {axis} out of range for a rank-1 array"
@@ -9862,6 +10005,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let len = bliss_stdlib::length(*av)? as i64;
                 return Ok(BlissVal::from_fixnum(len));
+            }
+            "ARRAY-TOTAL-SIZE" => {
+                // Product of the dimensions = capacity of the row-major storage
+                // (multidim), else the vector/string length.
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                if let Some(storage) = bliss_rt::types::md_array_storage(v) {
+                    return Ok(BlissVal::from_fixnum(bliss_stdlib::length(storage)? as i64));
+                }
+                return Ok(BlissVal::from_fixnum(bliss_stdlib::length(v)? as i64));
             }
             "APPEND" => {
                 // Root the accumulated elements AND the source-form spine across
@@ -9994,7 +10147,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     });
                 }
                 let i = idx.as_fixnum() as usize;
-                if !bliss_stdlib::is_complex_vector(seq) && is_string_value(seq) {
+                if let Some(storage) = bliss_rt::types::md_array_storage(seq) {
+                    // A multidimensional place lowered by aref_setf_place carries a
+                    // single (row-major) index — store straight into the backing
+                    // storage (bliss-rh0t).
+                    bliss_stdlib::set_elt(storage, i, val)?;
+                } else if !bliss_stdlib::is_complex_vector(seq) && is_string_value(seq) {
                     // Char-typed complex vectors are STRINGP but store elements in
                     // the backing vector; only simple strings use string_set_char
                     // (bliss-9q4).
@@ -12899,6 +13057,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if bliss_rt::types::complexp(v) {
                     return Ok(resolve_sym("COMPLEX").unwrap_or(NIL));
                 }
+                // A multidimensional array's TYPE-OF is the compound specifier
+                // (SIMPLE-ARRAY T (d0 d1 …)) (bliss-rh0t).
+                if bliss_rt::types::md_array_p(v) {
+                    let dims = md_dims(v)?;
+                    let dim_vals: Vec<BlissVal> =
+                        dims.iter().map(|&d| BlissVal::from_fixnum(d as i64)).collect();
+                    bliss_rt::rooted!(dims_list = vec_to_list(&dim_vals));
+                    let spec = vec![
+                        resolve_sym("SIMPLE-ARRAY").unwrap_or(NIL),
+                        resolve_sym("T").unwrap_or(T),
+                        *dims_list,
+                    ];
+                    return Ok(vec_to_list(&spec));
+                }
                 let type_name = if v.is_nil() {
                     "NULL"
                 } else if v == T {
@@ -15102,6 +15274,47 @@ fn complex_arith(op: CxOp, vals: &[BlissVal]) -> Result<BlissVal, BlissError> {
 /// Does any operand require the complex arithmetic fold?
 fn any_complex(vals: &[BlissVal]) -> bool {
     vals.iter().any(|v| bliss_rt::types::complexp(*v))
+}
+
+// ── Multidimensional arrays (bliss-rh0t) ────────────────────────────
+
+/// The dimensions of a multidimensional array as a `Vec<usize>` (read from its
+/// dims SIMPLE_VECTOR). Pure reads — no allocation.
+fn md_dims(arr: BlissVal) -> Result<Vec<usize>, BlissError> {
+    let dims_vec = bliss_rt::types::md_array_dims(arr).ok_or(BlissError::TypeError {
+        datum: arr,
+        expected: "array".into(),
+    })?;
+    let rank = bliss_stdlib::length(dims_vec)? as usize;
+    let mut dims = Vec::with_capacity(rank);
+    for k in 0..rank {
+        dims.push(bliss_stdlib::elt(dims_vec, k)?.as_fixnum().max(0) as usize);
+    }
+    Ok(dims)
+}
+
+/// Row-major flat index into a multidimensional array's storage from per-axis
+/// subscripts, validating rank and per-axis bounds (CLHS AREF/`(setf aref)`).
+fn md_row_major_index(arr: BlissVal, subscripts: &[BlissVal]) -> Result<usize, BlissError> {
+    let dims = md_dims(arr)?;
+    if subscripts.len() != dims.len() {
+        return Err(BlissError::ProgramError(format!(
+            "AREF: {} subscripts supplied for a rank-{} array",
+            subscripts.len(),
+            dims.len()
+        )));
+    }
+    let mut flat = 0usize;
+    for (k, (&dim, &sub)) in dims.iter().zip(subscripts).enumerate() {
+        if !sub.is_fixnum() || sub.as_fixnum() < 0 || (sub.as_fixnum() as usize) >= dim {
+            return Err(BlissError::TypeError {
+                datum: sub,
+                expected: format!("index in [0,{dim}) for array axis {k}"),
+            });
+        }
+        flat = flat * dim + sub.as_fixnum() as usize;
+    }
+    Ok(flat)
 }
 
 /// Allocate a BIGNUM heap object (§1.8.1) on the shared GC heap: header + sign +

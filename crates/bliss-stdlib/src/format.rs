@@ -300,6 +300,20 @@ fn heap_vector_string(v: BlissVal, escapep: bool) -> Option<String> {
     }
     unsafe {
         let ptr = v.as_ptr();
+        // Multidimensional array → `#<rank>A(nested row-major lists)`.
+        if (*(ptr as *const ObjectHeader)).type_id() == type_id::MD_ARRAY {
+            let storage = *(ptr.add(8) as *const BlissVal);
+            let dims_vec = *(ptr.add(16) as *const BlissVal);
+            let rank = (*(ptr.add(24) as *const BlissVal)).as_fixnum().max(0) as usize;
+            let dbase = dims_vec.as_ptr();
+            let dn = *(dbase.add(8) as *const u64) as usize;
+            let mut dims = Vec::with_capacity(dn);
+            for k in 0..dn {
+                dims.push((*(dbase.add(16 + k * 8) as *const BlissVal)).as_fixnum().max(0) as usize);
+            }
+            let (nested, _) = md_render(storage.as_ptr(), &dims, 0, escapep);
+            return Some(format!("#{rank}A{nested}"));
+        }
         let (base, count) = match (*(ptr as *const ObjectHeader)).type_id() {
             type_id::SIMPLE_VECTOR => (ptr, *(ptr.add(8) as *const u64) as usize),
             type_id::COMPLEX_ARRAY => {
@@ -318,6 +332,40 @@ fn heap_vector_string(v: BlissVal, escapep: bool) -> Option<String> {
         }
         s.push(')');
         Some(s)
+    }
+}
+
+/// Render one axis of a multidimensional array's row-major storage as nested
+/// parenthesised lists (CLHS `#nA` syntax). `base` is the storage SIMPLE_VECTOR
+/// object pointer, `dims` the remaining axes, `start` the flat offset of this
+/// subtree. Returns the rendered subtree and the number of leaf elements it
+/// consumed.
+unsafe fn md_render(base: *const u8, dims: &[usize], start: usize, escapep: bool) -> (String, usize) {
+    if dims.len() <= 1 {
+        let n = dims.first().copied().unwrap_or(0);
+        let mut s = String::from("(");
+        for i in 0..n {
+            if i > 0 {
+                s.push(' ');
+            }
+            let e = unsafe { *(base.add(16 + (start + i) * 8) as *const BlissVal) };
+            s.push_str(&blissval_to_print_string(e, escapep));
+        }
+        s.push(')');
+        (s, n)
+    } else {
+        let mut s = String::from("(");
+        let mut consumed = 0;
+        for i in 0..dims[0] {
+            if i > 0 {
+                s.push(' ');
+            }
+            let (sub, c) = unsafe { md_render(base, &dims[1..], start + consumed, escapep) };
+            s.push_str(&sub);
+            consumed += c;
+        }
+        s.push(')');
+        (s, consumed)
     }
 }
 

@@ -186,6 +186,11 @@ pub mod type_id {
     pub const READTABLE: u8 = 0x15;
     pub const CONDITION: u8 = 0x16;
     pub const RESTART: u8 = 0x17;
+    /// Multidimensional (rank ≥ 2) array. Body = [storage-ref | dims-ref |
+    /// rank]; storage is a row-major SIMPLE_VECTOR of ARRAY-TOTAL-SIZE, dims is
+    /// a SIMPLE_VECTOR of the fixnum dimensions. Both are heap references the GC
+    /// traces; rank is an immediate fixnum. Rank-1 arrays stay plain vectors.
+    pub const MD_ARRAY: u8 = 0x18;
 }
 
 // ── Package ────────────────────────────────────────────────────────
@@ -316,6 +321,17 @@ pub struct ComplexData {
     pub header: ObjectHeader,
     pub realpart: BlissVal,
     pub imagpart: BlissVal,
+}
+
+/// Multidimensional array (rank ≥ 2). `storage` is a row-major SIMPLE_VECTOR of
+/// ARRAY-TOTAL-SIZE elements; `dims` is a SIMPLE_VECTOR of the fixnum
+/// dimensions; `rank` is an immediate fixnum. Both vector fields are GC-traced.
+#[repr(C)]
+pub struct MdArrayData {
+    pub header: ObjectHeader,
+    pub storage: BlissVal,
+    pub dims: BlissVal,
+    pub rank: BlissVal,
 }
 
 /// Heap-allocated double-float. §1.8.4.

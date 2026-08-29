@@ -207,6 +207,36 @@ pub fn complex_imagpart(v: BlissVal) -> Option<BlissVal> {
     Some(unsafe { *(v.as_ptr().add(16) as *const BlissVal) })
 }
 
+/// `MD-ARRAY-P` — a multidimensional (rank ≥ 2) array. Layout (MdArrayData):
+/// ObjectHeader(8) + storage@8 + dims@16 + rank@24.
+pub fn md_array_p(v: BlissVal) -> bool {
+    heap_type_id(v) == Some(type_id::MD_ARRAY)
+}
+
+/// The row-major storage SIMPLE_VECTOR of a multidimensional array, or `None`.
+pub fn md_array_storage(v: BlissVal) -> Option<BlissVal> {
+    if !md_array_p(v) {
+        return None;
+    }
+    Some(unsafe { *(v.as_ptr().add(8) as *const BlissVal) })
+}
+
+/// The dimensions SIMPLE_VECTOR (of fixnums) of a multidimensional array.
+pub fn md_array_dims(v: BlissVal) -> Option<BlissVal> {
+    if !md_array_p(v) {
+        return None;
+    }
+    Some(unsafe { *(v.as_ptr().add(16) as *const BlissVal) })
+}
+
+/// The rank (a fixnum) of a multidimensional array.
+pub fn md_array_rank(v: BlissVal) -> Option<BlissVal> {
+    if !md_array_p(v) {
+        return None;
+    }
+    Some(unsafe { *(v.as_ptr().add(24) as *const BlissVal) })
+}
+
 /// `PACKAGEP` — package object.
 pub fn packagep(v: BlissVal) -> bool {
     heap_type_id(v) == Some(type_id::PACKAGE)

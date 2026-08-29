@@ -965,9 +965,27 @@
 (defun revappend (x y) (append (reverse x) y))
 (defun make-list (n &key initial-element) (loop repeat n collect initial-element))
 
-;; MAKE-ARRAY dimensions &key initial-element initial-contents element-type —
-;; one-dimensional only. A character element-type builds a string; otherwise a
-;; simple vector. :adjustable / :fill-pointer are accepted but ignored.
+;; Row-major flatten of nested :initial-contents matching DIMENSIONS: the
+;; innermost axis contributes its elements; outer axes recurse and concatenate.
+(defun %flatten-md-contents (contents dimensions)
+  (if (null (cdr dimensions))
+      (coerce contents 'list)
+      (apply (function append)
+             (mapcar (lambda (sub) (%flatten-md-contents sub (cdr dimensions)))
+                     (coerce contents 'list)))))
+
+;; Fill a freshly made multidimensional array from nested :initial-contents,
+;; walking the array in row-major order.
+(defun fill-md-array-from-contents (arr dimensions contents)
+  (let ((i 0))
+    (dolist (e (%flatten-md-contents contents dimensions))
+      (setf (row-major-aref arr i) e)
+      (setq i (+ i 1)))))
+
+;; MAKE-ARRAY dimensions &key initial-element initial-contents element-type.
+;; A dimension list of rank ≥ 2 builds a real multidimensional array (row-major
+;; storage); rank-0/1 build a string (character element-type) or simple/complex
+;; vector as before. :adjustable / :fill-pointer apply to the rank-1 vector case.
 (defun make-array (dimensions &rest keys)
   (let* ((size (if (consp dimensions) (car dimensions) dimensions))
          (iel-cell (member :initial-element keys))
@@ -978,8 +996,16 @@
          (fp-cell (member :fill-pointer keys))
          (adj-cell (member :adjustable keys))
          (fp (and fp-cell (car (cdr fp-cell))))
-         (adjustable (and adj-cell (car (cdr adj-cell)))))
+         (adjustable (and adj-cell (car (cdr adj-cell))))
+         ;; A dimension LIST of rank ≥ 2 ⇒ a real multidimensional array
+         ;; (row-major storage). Rank-0/1 fall through to the vector paths.
+         (mdp (and (consp dimensions) (consp (cdr dimensions)))))
     (cond
+      (mdp
+       (let ((arr (%make-md-array dimensions (if iel-cell (car (cdr iel-cell)) nil))))
+         (when ic-cell
+           (fill-md-array-from-contents arr dimensions (car (cdr ic-cell))))
+         arr))
       ;; A :fill-pointer or :adjustable request ⇒ a complex (fill-pointer /
       ;; adjustable) vector. The fill pointer is the given value, SIZE for
       ;; :fill-pointer t, or SIZE when only :adjustable is supplied.

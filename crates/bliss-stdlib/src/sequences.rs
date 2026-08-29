@@ -413,6 +413,48 @@ pub fn build_complex_vector(
     unsafe { BlissVal::from_heap_ptr(ptr) }
 }
 
+/// Build a multidimensional (rank ≥ 2) array: `dims` gives the per-axis
+/// dimensions, `fill` seeds every element of the row-major storage. GC-safe: the
+/// storage vector is rooted while the dims vector is built, and both are rooted
+/// across the MD_ARRAY allocation (bliss-rh0t).
+pub fn build_md_array(dims: &[usize], fill: BlissVal) -> BlissVal {
+    let total: usize = dims.iter().product();
+    // Row-major storage: `total` copies of the fill element.
+    bliss_rt::rooted!(fill = fill);
+    let store_vec = vec![*fill; total];
+    let storage = build_vector(&store_vec);
+    bliss_rt::rooted!(storage = storage);
+    // Dimensions as a SIMPLE_VECTOR of fixnums.
+    let dim_vals: Vec<BlissVal> = dims
+        .iter()
+        .map(|&d| BlissVal::from_fixnum(d as i64))
+        .collect();
+    let dims_vec = build_vector(&dim_vals);
+    bliss_rt::rooted!(dims_vec = dims_vec);
+    let rank = BlissVal::from_fixnum(dims.len() as i64);
+    // Body = [storage-ref | dims-ref | rank]; words 0,1 are heap references the
+    // GC's MD_ARRAY tracer visits, rank is immediate.
+    let body_size = 3 * 8;
+    if let Some(body) = bliss_rt::gc::alloc_typed(body_size, type_id::MD_ARRAY) {
+        unsafe {
+            *(body as *mut u64) = (*storage).to_raw();
+            *(body.add(8) as *mut u64) = (*dims_vec).to_raw();
+            *(body.add(16) as *mut u64) = rank.to_raw();
+            return BlissVal::from_heap_ptr(body.sub(8));
+        }
+    }
+    // OOM fallback: a leaked block (header + 3 body words).
+    let mut buf: Vec<u64> = Vec::with_capacity(4);
+    let header = ObjectHeader::new(type_id::MD_ARRAY, 4);
+    buf.push(header.0);
+    buf.push((*storage).to_raw());
+    buf.push((*dims_vec).to_raw());
+    buf.push(rank.to_raw());
+    let ptr = buf.as_mut_ptr() as *mut u8;
+    std::mem::forget(buf);
+    unsafe { BlissVal::from_heap_ptr(ptr) }
+}
+
 /// Set the fill pointer of a complex vector (CL `(setf fill-pointer)`), clamped
 /// to the backing capacity. Returns the clamped value.
 pub fn set_fill_pointer(v: BlissVal, n: usize) -> Result<usize, BlissError> {

@@ -1768,6 +1768,63 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-rh0t: real multidimensional (rank ≥ 2) arrays — make-array on a
+/// dimension list builds a row-major array with the right rank/dimensions/total
+/// size, AREF/(setf AREF) address it per-axis, ROW-MAJOR-AREF addresses the flat
+/// storage, :initial-contents fills nested, and it prints/types as an array (not
+/// a vector).
+#[test]
+fn multidimensional_arrays() {
+    let cases = [
+        ("(array-rank (make-array '(2 3)))", "2"),
+        ("(array-dimensions (make-array '(2 3)))", "(2 3)"),
+        ("(array-total-size (make-array '(2 3)))", "6"),
+        ("(array-dimension (make-array '(2 3 4)) 2)", "4"),
+        ("(aref (make-array '(2 3) :initial-element 7) 1 2)", "7"),
+        (
+            "(let ((a (make-array '(2 3) :initial-element 0))) (setf (aref a 1 2) 99) (aref a 1 2))",
+            "99",
+        ),
+        (
+            "(aref (make-array '(2 3) :initial-contents '((1 2 3) (4 5 6))) 1 0)",
+            "4",
+        ),
+        (
+            "(row-major-aref (make-array '(2 3) :initial-contents '((1 2 3) (4 5 6))) 4)",
+            "5",
+        ),
+        (
+            "(let ((a (make-array '(2 2 2) :initial-element 0))) (setf (aref a 1 0 1) 7) (aref a 1 0 1))",
+            "7",
+        ),
+        // Predicates / type.
+        ("(arrayp (make-array '(2 3)))", "T"),
+        ("(vectorp (make-array '(2 3)))", "NIL"),
+        ("(typep (make-array '(2 3)) 'array)", "T"),
+        ("(typep (make-array '(2 3)) 'vector)", "NIL"),
+        ("(type-of (make-array '(2 3)))", "(SIMPLE-ARRAY T (2 3))"),
+        // Printing (#nA row-major nesting).
+        (
+            "(prin1-to-string (make-array '(2 3) :initial-contents '((1 2 3) (4 5 6))))",
+            "\"#2A((1 2 3) (4 5 6))\"",
+        ),
+        (
+            "(prin1-to-string (make-array '(2 2 2) :initial-contents '(((1 2) (3 4)) ((5 6) (7 8)))))",
+            "\"#3A(((1 2) (3 4)) ((5 6) (7 8)))\"",
+        ),
+        // Rank-1 list dimension stays an ordinary vector.
+        ("(array-rank (make-array 5))", "1"),
+        ("(vectorp (make-array '(5)))", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// bliss-qng: the COMPLEX constructor (type contagion + canonicalisation) and
 /// complex arithmetic (+ - * /) over the numeric tower, including real⇄complex
 /// mixing, unary negate/reciprocal, and canonicalisation of a rational complex

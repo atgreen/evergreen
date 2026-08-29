@@ -765,6 +765,13 @@ unsafe fn trace_object(
         tid::COMPLEX_ARRAY => {
             visit_word(0);
         }
+        // ── Multidimensional array: [storage-ref | dims-ref | rank]. Words 0
+        //    (row-major SIMPLE_VECTOR) and 1 (dims SIMPLE_VECTOR) are heap
+        //    references; word 2 (rank) is an immediate fixnum. ──
+        tid::MD_ARRAY => {
+            visit_word(0);
+            visit_word(1);
+        }
 
         // ── Symbol: name/value/function/plist/package are references; the
         //    trailing flags/tls_index words are raw (§1.7). ──
