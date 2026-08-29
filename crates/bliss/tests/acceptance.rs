@@ -1783,6 +1783,11 @@ fn peek_char_all_peek_types() {
         ("(peek-char nil (make-string-input-stream \"\") nil :eof)", ":EOF"),
         ("(fboundp 'peek-char)", "T"),
         ("(with-input-from-string (s \"  42\") (list (peek-char t s) (read s)))", "(#\\4 42)"),
+        // WITH-SIMPLE-RESTART (also was undefined): normal value passes through;
+        // invoking the restart aborts the body and yields (values nil t).
+        ("(with-simple-restart (foo \"d\") 42)", "42"),
+        ("(multiple-value-list (with-simple-restart (foo \"desc\") (invoke-restart 'foo)))", "(NIL T)"),
+        ("(handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart 'use)))) (with-simple-restart (use \"skip\") (error \"x\")) :recovered)", ":RECOVERED"),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");

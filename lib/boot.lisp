@@ -349,6 +349,16 @@
   `(handler-case (progn ,@body)
      (error (c) (values nil c))))
 
+;; WITH-SIMPLE-RESTART (CLHS 9.1) — run BODY with a single named restart that,
+;; when invoked, aborts BODY and returns (values NIL T). Used pervasively by
+;; UIOP/ASDF around operations. Expands over RESTART-CASE with a :report that
+;; formats the given control string and arguments.
+(defmacro with-simple-restart ((name format-control &rest format-arguments) &rest body)
+  `(restart-case (progn ,@body)
+     (,name ()
+       :report (lambda (%wsr-stream) (format %wsr-stream ,format-control ,@format-arguments))
+       (values nil t))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Sequence / list helpers (Common Lisp, now that lambda lists bind properly)
 ;;; ---------------------------------------------------------------------------
