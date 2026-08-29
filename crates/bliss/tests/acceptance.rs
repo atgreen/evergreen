@@ -1768,6 +1768,33 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-bjue: defstruct's generated constructor/accessor/predicate/copier were
+/// built from movable cons intermediates left unrooted across allocating
+/// sym()/quote()/vec_to_list() calls, so under a minor GC (BLISS_GC_STRESS) the
+/// forms were corrupted — (make-NAME …) aborted with "undefined function: &REST".
+/// This exercises the whole defstruct surface under GC stress; it must not abort.
+#[test]
+fn defstruct_is_gc_safe_under_stress() {
+    let prog = "\
+        (defstruct box a b) \
+        (defstruct (animal) name) \
+        (defstruct (dog (:include animal)) breed) \
+        (dotimes (k 30) \
+          (let ((x (make-box :a k :b (list k)))) \
+            (when (or (/= (box-a x) k) (not (box-p x)) \
+                      (not (equal (box-b (copy-box x)) (list k)))) \
+              (error \"box\"))) \
+          (let ((d (make-dog :name k :breed (list k)))) \
+            (when (or (/= (animal-name d) k) (not (dog-p d))) (error \"dog\")))) \
+        (princ :ok)";
+    let mut cmd = bliss_bin();
+    cmd.env("BLISS_GC_STRESS", "1").env("BLISS_GC_POISON", "1");
+    cmd.args(["--eval", prog]);
+    let out = cmd.output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "defstruct under GC stress must not abort (stderr: {})", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("OK"), "expected OK: {}", String::from_utf8_lossy(&out.stdout));
+}
+
 /// bliss-44qp-adjacent: COPY-STRUCTURE (was fboundp => T but "undefined
 /// function") shallow-copies any structure/instance — a distinct object with the
 /// same class and every bound slot copied, including inherited (:include) slots.

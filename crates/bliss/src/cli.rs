@@ -19368,31 +19368,31 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     //                                 :accessor conc-slot) ...))
     // Defaults live as :initform so inherited slots (via :include) and the
     // apply-#'make-instance constructor get them without enumerating parents.
-    let slot_clauses: Vec<BlissVal> = slots
-        .iter()
-        .map(|s| {
-            vec_to_list(&[
-                s.slot_sym,
-                sym(":INITARG"),
-                s.initarg,
-                sym(":INITFORM"),
-                s.default,
-                sym(":ACCESSOR"),
-                s.accessor,
-            ])
-        })
-        .collect();
-    let supers = match include_parent {
+    // Root every movable cons intermediate: a clause already in the Vec (or an
+    // already-built sub-form) that sits unrooted while the next allocating
+    // sym()/vec_to_list() call fires a minor GC would go stale, corrupting the
+    // DEFCLASS form so its accessors never register (bliss-bjue).
+    bliss_rt::rooted!(slot_clauses = Vec::<BlissVal>::new());
+    for s in &slots {
+        bliss_rt::rooted!(default = s.default);
+        let clause = vec_to_list(&[
+            s.slot_sym,
+            sym(":INITARG"),
+            s.initarg,
+            sym(":INITFORM"),
+            *default,
+            sym(":ACCESSOR"),
+            s.accessor,
+        ]);
+        slot_clauses.push(clause);
+    }
+    bliss_rt::rooted!(supers = match include_parent {
         Some(p) => vec_to_list(&[p]),
         None => NIL,
-    };
+    });
     bliss_rt::rooted!(name_sym_r = name_sym);
-    let defclass_form = vec_to_list(&[
-        sym("DEFCLASS"),
-        *name_sym_r,
-        supers,
-        vec_to_list(&slot_clauses),
-    ]);
+    bliss_rt::rooted!(clauses_list = vec_to_list(&slot_clauses));
+    let defclass_form = vec_to_list(&[sym("DEFCLASS"), *name_sym_r, *supers, *clauses_list]);
     eval_form(defclass_form, env)?;
 
     // Constructors. A keyword constructor forwards every initarg to
@@ -19404,20 +19404,19 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     for (ctor_name, boa) in &constructors {
         let ctor_defun = match boa {
             None => {
-                // (defun CTOR (&rest args) (apply #'make-instance 'NAME args))
-                let args = sym("ARGS");
-                let apply_call = vec_to_list(&[
-                    sym("APPLY"),
-                    vec_to_list(&[sym("FUNCTION"), sym("MAKE-INSTANCE")]),
-                    quote(name_sym),
-                    args,
-                ]);
-                vec_to_list(&[
-                    sym("DEFUN"),
-                    *ctor_name,
-                    vec_to_list(&[sym("&REST"), args]),
-                    apply_call,
-                ])
+                // (defun CTOR (&rest args) (apply #'make-instance 'NAME args)).
+                // Every movable cons intermediate is rooted before the next
+                // allocating sym()/quote()/vec_to_list() call — otherwise, under a
+                // minor GC (BLISS_GC_STRESS), a cons sitting unrooted in a Rust
+                // array while a later element allocates goes stale and the built
+                // form is corrupted (make-NAME then evaluated `(&REST args)` as a
+                // call → "undefined function: &REST") (bliss-bjue).
+                bliss_rt::rooted!(args = sym("ARGS"));
+                bliss_rt::rooted!(fn_mi = vec_to_list(&[sym("FUNCTION"), sym("MAKE-INSTANCE")]));
+                bliss_rt::rooted!(qname = quote(name_sym));
+                bliss_rt::rooted!(apply_call = vec_to_list(&[sym("APPLY"), *fn_mi, *qname, *args]));
+                bliss_rt::rooted!(lambda_list = vec_to_list(&[sym("&REST"), *args]));
+                vec_to_list(&[sym("DEFUN"), *ctor_name, *lambda_list, *apply_call])
             }
             Some(params) => {
                 // (defun CTOR (params...) (make-instance 'NAME :p p ...)), where a
@@ -19446,29 +19445,29 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
         eval_form(ctor_defun, env)?;
     }
 
-    // (defun NAME-P (o) (typep o 'NAME))
-    let pred_defun = vec_to_list(&[
-        sym("DEFUN"),
-        sym(&format!("{}-P", name_str)),
-        vec_to_list(&[obj]),
-        vec_to_list(&[sym("TYPEP"), obj, quote(name_sym)]),
-    ]);
+    // (defun NAME-P (o) (typep o 'NAME)) — root the movable intermediates so a
+    // minor GC while a later element allocates cannot stale them (bliss-bjue).
+    bliss_rt::rooted!(pred_params = vec_to_list(&[obj]));
+    bliss_rt::rooted!(pred_body = vec_to_list(&[sym("TYPEP"), obj, quote(name_sym)]));
+    let pred_name = sym(&format!("{}-P", name_str));
+    let pred_defun = vec_to_list(&[sym("DEFUN"), pred_name, *pred_params, *pred_body]);
     eval_form(pred_defun, env)?;
 
     // (defun copy-NAME (o) (make-instance 'NAME :slot (accessor o) ...))
     // Copies this struct's own slots (inherited slots via :include are not
     // enumerated here; that path is unused by the code needing DEFSTRUCT).
-    let mut copy_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)];
+    // The accumulator holds movable conses, so root it across the per-slot
+    // allocations (bliss-bjue).
+    bliss_rt::rooted!(copy_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)]);
     for s in &slots {
+        let accessor_call = vec_to_list(&[s.accessor, obj]);
         copy_call.push(s.initarg);
-        copy_call.push(vec_to_list(&[s.accessor, obj]));
+        copy_call.push(accessor_call);
     }
-    let copy_defun = vec_to_list(&[
-        sym("DEFUN"),
-        sym(&format!("COPY-{}", name_str)),
-        vec_to_list(&[obj]),
-        vec_to_list(&copy_call),
-    ]);
+    bliss_rt::rooted!(copy_params = vec_to_list(&[obj]));
+    bliss_rt::rooted!(copy_body = vec_to_list(&copy_call));
+    let copy_name = sym(&format!("COPY-{}", name_str));
+    let copy_defun = vec_to_list(&[sym("DEFUN"), copy_name, *copy_params, *copy_body]);
     eval_form(copy_defun, env)?;
 
     Ok(*name_sym_r)
