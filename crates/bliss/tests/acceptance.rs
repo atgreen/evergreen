@@ -1768,6 +1768,30 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-44qp-adjacent: COPY-STRUCTURE (was fboundp => T but "undefined
+/// function") shallow-copies any structure/instance — a distinct object with the
+/// same class and every bound slot copied, including inherited (:include) slots.
+#[test]
+fn copy_structure_shallow_copies_instances() {
+    let prog = "\
+        (defstruct point x y) \
+        (defstruct (animal) name) \
+        (defstruct (dog (:include animal)) breed) \
+        (let* ((p (make-point :x 1 :y 2)) (q (copy-structure p))) \
+          (setf (point-x q) 99) \
+          (let ((d (make-dog :name \"rex\" :breed \"lab\"))) \
+            (let ((e (copy-structure d))) \
+              (format t \"~a|~a|~a|~a|~a|~a\" \
+                (point-x p) (point-x q) (not (eq p q)) \
+                (animal-name e) (dog-breed e) (typep e 'dog)))))";
+    let out = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // original x unchanged (1), copy's x mutated (99), distinct objects (T),
+    // inherited + own slots copied, and the copy is still a DOG.
+    assert!(stdout.contains("1|99|T|rex|lab|T"), "copy-structure: {stdout}");
+}
+
 /// bliss-05hy: FLOOR/CEILING/TRUNCATE/ROUND/MOD/REM and EVENP/ODDP were computed
 /// via f64 (num_val + `as i64`), which overflows and loses precision on bignums
 /// (and large fixnums) — (floor (expt 2 70) 2) returned -1. They now use exact

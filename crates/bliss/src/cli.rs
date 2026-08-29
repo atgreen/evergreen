@@ -11557,6 +11557,41 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let object = eval_form(object_form, env)?;
                 return Ok(bliss_stdlib::class_of(object));
             }
+            // (COPY-STRUCTURE structure) — a fresh instance of the same class
+            // with every bound slot shallow-copied (CLHS). Works for any
+            // structure/instance regardless of type.
+            "COPY-STRUCTURE" => {
+                let (object_form, _) = cp(cdr);
+                bliss_rt::rooted!(orig = eval_form(object_form, env)?);
+                if !bliss_stdlib::is_instance(*orig) {
+                    return Err(BlissError::TypeError {
+                        datum: *orig,
+                        expected: "structure".into(),
+                    });
+                }
+                let class = bliss_stdlib::class_of(*orig);
+                // All slot names across the class precedence list (inherited
+                // included), de-duplicated. Slot names are interned symbols.
+                let mut slot_names: Vec<BlissVal> = Vec::new();
+                for c in bliss_stdlib::compute_class_precedence_list(class)? {
+                    for s in bliss_stdlib::class_slots(c) {
+                        if !slot_names.contains(&s) {
+                            slot_names.push(s);
+                        }
+                    }
+                }
+                // Allocate the copy, then copy each bound slot. slot_value reads
+                // and set_slot_value writes an inline cell (no allocation in the
+                // loop); orig and the copy are rooted across allocate_instance.
+                bliss_rt::rooted!(copy = bliss_stdlib::allocate_instance(class)?);
+                for sn in &slot_names {
+                    if bliss_stdlib::slot_boundp(*orig, *sn)? {
+                        let v = bliss_stdlib::slot_value(*orig, *sn)?;
+                        bliss_stdlib::set_slot_value(*copy, *sn, v)?;
+                    }
+                }
+                return Ok(*copy);
+            }
             "FIND-CLASS" => {
                 // (find-class name &optional (errorp t) environment) — return the
                 // class metaobject, or (when errorp is NIL) NIL if none is found.
