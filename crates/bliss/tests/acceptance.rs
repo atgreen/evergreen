@@ -1768,6 +1768,40 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-k0jg: RATIONAL (exact float → rational) and RATIONALIZE (simplest
+/// rational that reads back to the same float). Both leave integers/ratios
+/// unchanged and round-trip through FLOAT.
+#[test]
+fn rational_and_rationalize() {
+    let cases = [
+        ("(rational 0.5)", "1/2"),
+        ("(rational 0.25)", "1/4"),
+        ("(rational 1.0)", "1"),
+        ("(rational -0.5)", "-1/2"),
+        ("(rational 3)", "3"),
+        ("(rational 1/3)", "1/3"),
+        ("(integerp (rational 4.0))", "T"),
+        ("(rationalize 0.5)", "1/2"),
+        ("(rationalize 0.1)", "1/10"),
+        ("(rationalize -0.1)", "-1/10"),
+        ("(rationalize 2.5)", "5/2"),
+        ("(rationalize 0.0)", "0"),
+        // The defining property: FLOAT of the result reproduces the input float.
+        ("(= (float (rational 0.1)) 0.1)", "T"),
+        ("(= (float (rationalize 0.1)) 0.1)", "T"),
+        ("(= (float (rationalize 0.333333)) 0.333333)", "T"),
+        // Usable as a first-class function.
+        ("(mapcar #'rational '(0.5 0.25 1.0))", "(1/2 1/4 1)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// bliss-rh0t: real multidimensional (rank ≥ 2) arrays — make-array on a
 /// dimension list builds a row-major array with the right rank/dimensions/total
 /// size, AREF/(setf AREF) address it per-axis, ROW-MAJOR-AREF addresses the flat

@@ -8640,6 +8640,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 };
                 return make_complex(*real, imag);
             }
+            // (RATIONAL x) / (RATIONALIZE x) — float → exact rational (bliss-k0jg).
+            "RATIONAL" | "RATIONALIZE" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                return if name == "RATIONAL" {
+                    cl_rational(v)
+                } else {
+                    cl_rationalize(v)
+                };
+            }
             "STRINGP" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
@@ -15354,6 +15364,124 @@ fn heap_numeric_type_id(v: BlissVal) -> Option<u8> {
 /// numeric object (bignum/ratio/complex/double-float) (bliss-jtc.5).
 fn is_number_value(v: BlissVal) -> bool {
     v.is_fixnum() || v.is_single_float() || heap_numeric_type_id(v).is_some()
+}
+
+// ── RATIONAL / RATIONALIZE (bliss-k0jg) ─────────────────────────────
+
+/// `2^k` as a BigInt (k small — single-float exponents span ~[-149, 104]).
+fn pow2_bigint(k: u32) -> BigInt {
+    let two = BigInt::from_i64(2);
+    let mut r = BigInt::one();
+    for _ in 0..k {
+        r = big_mul(&r, &two);
+    }
+    r
+}
+
+/// The EXACT value of a single-float as a reduced rational (`mantissa · 2^e`),
+/// per IEEE-754 binary32 decoding. Zero maps to 0.
+fn f32_to_bigrat(f: f32) -> BigRat {
+    if f == 0.0 {
+        return BigRat::from_i64(0);
+    }
+    let bits = f.to_bits();
+    let sign: i64 = if bits >> 31 == 1 { -1 } else { 1 };
+    let exp_field = ((bits >> 23) & 0xFF) as i32;
+    let mant_field = (bits & 0x7F_FFFF) as i64;
+    // Subnormals have a 0 exponent field and no implicit leading 1.
+    let (mant, e) = if exp_field == 0 {
+        (mant_field, -149)
+    } else {
+        (mant_field | 0x80_0000, exp_field - 127 - 23)
+    };
+    let m = BigInt::from_i64(sign * mant);
+    if e >= 0 {
+        BigRat::from_bigint(big_mul(&m, &pow2_bigint(e as u32)))
+    } else {
+        BigRat::new(m, pow2_bigint((-e) as u32))
+    }
+}
+
+/// Floor of a *positive* rational as a BigInt (truncation == floor for ≥ 0).
+fn bigrat_floor_pos(r: &BigRat) -> BigInt {
+    big_divmod(&r.num, &r.den).0
+}
+
+/// Reciprocal `den/num` of a nonzero rational.
+fn bigrat_recip(r: &BigRat) -> BigRat {
+    BigRat::new(r.den.clone(), r.num.clone())
+}
+
+/// The simplest rational in the closed interval `[lo, hi]` with `0 < lo ≤ hi`
+/// (continued-fraction / Stern–Brocot search). Used by RATIONALIZE.
+fn simplest_between(lo: &BigRat, hi: &BigRat) -> BigRat {
+    let flo = bigrat_floor_pos(lo);
+    let flo_rat = BigRat::from_bigint(flo.clone());
+    // `lo` itself integral ⇒ it is the simplest rational in the interval.
+    if bigrat_cmp(&flo_rat, lo) == Ordering::Equal {
+        return flo_rat;
+    }
+    if big_cmp(&flo, &bigrat_floor_pos(hi)) == Ordering::Equal {
+        // Same integer part: recurse on the reciprocals of the fractional parts
+        // (reciprocation reverses order, so hi_frac feeds the low argument).
+        let lo_frac = bigrat_sub(lo, &flo_rat);
+        let hi_frac = bigrat_sub(hi, &flo_rat);
+        let rec = simplest_between(&bigrat_recip(&hi_frac), &bigrat_recip(&lo_frac));
+        bigrat_add(&flo_rat, &bigrat_recip(&rec))
+    } else {
+        // An integer (floor(lo)+1) lies within (lo, hi] — the simplest choice.
+        BigRat::from_bigint(big_add(&flo, &BigInt::one()))
+    }
+}
+
+/// CL `RATIONAL`: the exact rational equal to a float's value; a rational (or
+/// integer) is returned reduced unchanged.
+fn cl_rational(v: BlissVal) -> Result<BlissVal, BlissError> {
+    if v.is_single_float() {
+        return Ok(f32_to_bigrat(v.as_single_float()).to_val());
+    }
+    if let Some(r) = as_bigrat(v) {
+        return Ok(r.to_val());
+    }
+    Err(BlissError::TypeError {
+        datum: v,
+        expected: "real".into(),
+    })
+}
+
+/// CL `RATIONALIZE`: the simplest rational that reads back to the same float
+/// (the simplest rational within the float's rounding interval); a rational is
+/// returned reduced unchanged.
+fn cl_rationalize(v: BlissVal) -> Result<BlissVal, BlissError> {
+    if v.is_single_float() {
+        let f = v.as_single_float();
+        if f == 0.0 {
+            return Ok(BlissVal::from_fixnum(0));
+        }
+        let neg = f < 0.0;
+        let af = f.abs();
+        let bits = af.to_bits();
+        // Rounding interval [lo, hi] = reals nearest to `af`: midpoints to the
+        // adjacent representable floats. (af > 0, so bits±1 stay same-signed.)
+        let x = f32_to_bigrat(af);
+        let lower = f32_to_bigrat(f32::from_bits(bits - 1));
+        let upper = f32_to_bigrat(f32::from_bits(bits + 1));
+        let two = BigRat::from_i64(2);
+        let lo = bigrat_div(&bigrat_add(&x, &lower), &two);
+        let hi = bigrat_div(&bigrat_add(&x, &upper), &two);
+        let mut r = simplest_between(&lo, &hi);
+        if neg {
+            r = bigrat_neg(&r);
+        }
+        return Ok(r.to_val());
+    }
+    if let Some(r) = as_bigrat(v) {
+        return Ok(r.to_val());
+    }
+    Err(BlissError::TypeError {
+        datum: v,
+        expected: "real".into(),
+    })
 }
 
 /// CL EQL: identical objects, or two numbers of the same type with the same
