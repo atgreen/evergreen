@@ -6738,6 +6738,22 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             }
             Ok(!apply_function(predicate, &[object], env)?.is_nil())
         }
+        // (not type) — the complement combinator (CLHS 4.2.3). Was unhandled and
+        // fell through to the false default, so (typep x '(not integer)) was
+        // always NIL and (and integer (not (eql 0))) never matched.
+        "NOT" => {
+            let (inner, _) = cp(args);
+            Ok(!typep_matches(env, object, inner)?)
+        }
+        // (string size) / (simple-string size) / (base-string size): a string of
+        // the given length (or `*`). The bare STRING/… symbols are handled by the
+        // atom path; only the compound (with a size) reaches here.
+        "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING" => {
+            if !is_string_value(object) {
+                return Ok(false);
+            }
+            Ok(vector_length_matches(&list_to_vec(args), object))
+        }
         _ => Ok(false),
     }
 }

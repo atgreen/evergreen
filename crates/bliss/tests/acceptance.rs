@@ -1768,6 +1768,37 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// TYPEP compound-type combinators: (NOT type) — was unhandled and always
+/// returned NIL, breaking (and integer (not (eql 0))) etc. — and (string N) /
+/// (simple-string N) length-qualified string types.
+#[test]
+fn typep_not_and_string_length_compounds() {
+    let cases = [
+        // (NOT type): the complement combinator.
+        ("(typep 3.0 '(not integer))", "T"),
+        ("(typep 3 '(not integer))", "NIL"),
+        ("(typep 'x '(not integer))", "T"),
+        ("(typep 5 '(not (not integer)))", "T"),
+        // (NOT ...) composed under AND (a common declared type).
+        ("(typep 5 '(and integer (not (eql 0))))", "T"),
+        ("(typep 0 '(and integer (not (eql 0))))", "NIL"),
+        ("(typep 3.0 '(and number (not integer)))", "T"),
+        // length-qualified string types.
+        ("(typep \"abc\" '(string 3))", "T"),
+        ("(typep \"abc\" '(string 2))", "NIL"),
+        ("(typep \"ab\" '(simple-string 2))", "T"),
+        ("(typep \"abc\" '(string *))", "T"),
+        ("(typep 5 '(string 3))", "NIL"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// bliss-bjue: defstruct's generated constructor/accessor/predicate/copier were
 /// built from movable cons intermediates left unrooted across allocating
 /// sym()/quote()/vec_to_list() calls, so under a minor GC (BLISS_GC_STRESS) the
