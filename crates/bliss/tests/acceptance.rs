@@ -1786,6 +1786,10 @@ fn defstruct_is_gc_safe_under_stress() {
               (error \"box\"))) \
           (let ((d (make-dog :name k :breed (list k)))) \
             (when (or (/= (animal-name d) k) (not (dog-p d))) (error \"dog\")))) \
+        (defstruct (v3 (:constructor mk-v3 (x y z)) (:conc-name v-)) x y z) \
+        (dotimes (k 30) \
+          (let ((v (mk-v3 k (* 2 k) (* 3 k)))) \
+            (when (/= (v-z v) (* 3 k)) (error \"boa\")))) \
         (princ :ok)";
     let mut cmd = bliss_bin();
     cmd.env("BLISS_GC_STRESS", "1").env("BLISS_GC_POISON", "1");

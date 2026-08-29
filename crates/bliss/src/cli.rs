@@ -19422,7 +19422,10 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                 // (defun CTOR (params...) (make-instance 'NAME :p p ...)), where a
                 // param named like a slot supplies that slot; lambda-list keywords
                 // (&optional/&key/…) pass through into the lambda list untouched.
-                let mut make_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)];
+                // Root the accumulator + intermediates so a minor GC during the
+                // per-param resolve_sym / vec_to_list cannot stale the movable
+                // quote(name_sym) cons already in it (bliss-bjue).
+                bliss_rt::rooted!(make_call = vec![sym("MAKE-INSTANCE"), quote(name_sym)]);
                 for p in params {
                     let pname = if p.is_cons() { cp(*p).0 } else { *p };
                     if pname.is_symbol() {
@@ -19430,16 +19433,14 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
                         if bare.starts_with('&') {
                             continue;
                         }
-                        make_call.push(resolve_sym(&format!(":{bare}")).unwrap_or(NIL));
+                        let kw = resolve_sym(&format!(":{bare}")).unwrap_or(NIL);
+                        make_call.push(kw);
                         make_call.push(pname);
                     }
                 }
-                vec_to_list(&[
-                    sym("DEFUN"),
-                    *ctor_name,
-                    vec_to_list(params),
-                    vec_to_list(&make_call),
-                ])
+                bliss_rt::rooted!(boa_lambda = vec_to_list(params));
+                bliss_rt::rooted!(boa_body = vec_to_list(&make_call));
+                vec_to_list(&[sym("DEFUN"), *ctor_name, *boa_lambda, *boa_body])
             }
         };
         eval_form(ctor_defun, env)?;
