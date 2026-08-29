@@ -11151,55 +11151,31 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     expected: "real".into(),
                 });
             }
-            "MIN" => {
+            "MIN" | "MAX" => {
+                // Return the actual extreme ARGUMENT (preserving its exact type),
+                // compared with numeric_cmp — the old f64 path lost precision and
+                // overflowed the `as i64` cast on bignums (bliss-05hy).
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
-                    return Err(BlissError::Internal(
-                        "MIN requires at least one argument".into(),
-                    ));
+                    return Err(BlissError::Internal(format!(
+                        "{name} requires at least one argument"
+                    )));
                 }
-                let mut min = num_val(args[0])?;
-                let mut is_f = args[0].is_single_float();
-                for a in &args[1..] {
-                    let v = num_val(*a)?;
-                    let is_single_float = a.is_single_float();
-                    if v < min {
-                        min = v;
-                    }
-                    if is_single_float {
-                        is_f = true;
-                    }
-                }
-                return Ok(if is_f {
-                    BlissVal::from_single_float(min as f32)
-                } else {
-                    BlissVal::from_fixnum(min as i64)
-                });
-            }
-            "MAX" => {
-                let args = eval_args(cdr, env)?;
-                if args.is_empty() {
-                    return Err(BlissError::Internal(
-                        "MAX requires at least one argument".into(),
-                    ));
-                }
-                let mut max = num_val(args[0])?;
-                let mut is_f = args[0].is_single_float();
-                for a in &args[1..] {
-                    let v = num_val(*a)?;
-                    let is_single_float = a.is_single_float();
-                    if v > max {
-                        max = v;
-                    }
-                    if is_single_float {
-                        is_f = true;
+                let want_min = name == "MIN";
+                let mut best = args[0];
+                numeric_cmp(best, best)?; // type-check the first argument
+                for &a in &args[1..] {
+                    let ord = numeric_cmp(a, best)?;
+                    let take = if want_min {
+                        ord == Ordering::Less
+                    } else {
+                        ord == Ordering::Greater
+                    };
+                    if take {
+                        best = a;
                     }
                 }
-                return Ok(if is_f {
-                    BlissVal::from_single_float(max as f32)
-                } else {
-                    BlissVal::from_fixnum(max as i64)
-                });
+                return Ok(best);
             }
             "FLOOR" => return eval_floor(cdr, env),
             "REM" => {

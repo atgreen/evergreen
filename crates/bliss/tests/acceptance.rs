@@ -1799,6 +1799,12 @@ fn integer_division_is_exact_on_bignums() {
         ("(floor 7/2)", "3"),
         ("(floor 3.7)", "3"),
         ("(round 2.5)", "2"),
+        // MIN/MAX return the exact extreme argument (were f64→i64, giving -1).
+        ("(min (expt 2 70) (expt 2 69))", "590295810358705651712"),
+        ("(max (expt 2 70) 5)", "1180591620717411303424"),
+        ("(min 1/2 1/3)", "1/3"),
+        ("(max 1.5 2.5 0.5)", "2.5"),
+        ("(min 3 1 2)", "1"),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
