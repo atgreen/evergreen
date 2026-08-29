@@ -2024,6 +2024,17 @@ fn is_function_value(v: BlissVal) -> bool {
     false
 }
 
+/// True iff `v` is the interpreter closure representation `(BLISS::CLOSURE . id)`
+/// — a callable that must PRINT as `#<FUNCTION>`, not as the data list it is
+/// structurally. Reads only a genuine cons's car, so no sentinel is dereferenced.
+fn is_closure_cons(v: BlissVal) -> bool {
+    if !v.is_cons() {
+        return false;
+    }
+    let (h, t) = cp(v);
+    h.is_symbol() && t.is_fixnum() && sym_name(h) == "BLISS::CLOSURE"
+}
+
 fn resolve_class_metaobject(env: &Env, class: BlissVal) -> Result<BlissVal, BlissError> {
     if !class.is_symbol() {
         return Ok(class);
@@ -4370,6 +4381,9 @@ fn print_val(val: BlissVal, out: &mut String) {
             }
             out.push_str(&name);
         }
+    } else if is_closure_cons(val) {
+        // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not data.
+        out.push_str("#<FUNCTION>");
     } else if val.is_cons() {
         out.push('(');
         print_list_body(val, out);

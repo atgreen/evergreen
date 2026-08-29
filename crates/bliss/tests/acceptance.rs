@@ -1768,6 +1768,38 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// Functions/closures print as #<FUNCTION>, not as the internal
+/// (BLISS::CLOSURE . id) data list — in cli PRINT/PRIN1 and in FORMAT ~A/~S,
+/// including nested in a list. Data conses (incl. NIL/T cars) are unaffected.
+#[test]
+fn functions_print_as_function_objects() {
+    // String-returning exprs print with surrounding quotes under (print …).
+    let cases = [
+        ("(princ-to-string (lambda (x) x))", "\"#<FUNCTION>\""),
+        ("(princ-to-string #'car)", "\"#<FUNCTION>\""),
+        ("(prin1-to-string (complement #'evenp))", "\"#<FUNCTION>\""),
+        ("(format nil \"~a\" #'car)", "\"#<FUNCTION>\""),
+        ("(format nil \"~s\" (constantly 7))", "\"#<FUNCTION>\""),
+        (
+            "(princ-to-string (list #'car #'cdr))",
+            "\"(#<FUNCTION> #<FUNCTION>)\"",
+        ),
+        // Regression: printing data lists with NIL/T in the car must not crash
+        // the closure-cons detector (as_symbol_index panics on NIL/T).
+        ("(format nil \"~a\" '((nil 1) (t 2)))", "\"((NIL 1) (T 2))\""),
+        ("(princ-to-string (cons nil 5))", "\"(NIL . 5)\""),
+        // The functions still work.
+        ("(funcall (complement #'evenp) 3)", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// bliss-k0jg follow-up: SQRT of a negative real returns the pure-imaginary
 /// complex root (not NaN), and SQRT of a complex returns the principal complex
 /// root; non-negative reals still return a float.

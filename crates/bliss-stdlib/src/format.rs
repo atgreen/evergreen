@@ -369,6 +369,24 @@ unsafe fn md_render(base: *const u8, dims: &[usize], start: usize, escapep: bool
     }
 }
 
+/// True iff `v` is the interpreter closure representation `(BLISS::CLOSURE . id)`
+/// — a callable that must print as `#<FUNCTION>`. Reads only a genuine cons's
+/// car (no sentinel dereference).
+fn is_closure_cons(v: BlissVal) -> bool {
+    if !v.is_cons() {
+        return false;
+    }
+    let car = unsafe { (*(v.as_ptr() as *const bliss_rt::object::ConsCell)).car };
+    // NIL and T report is_symbol() == true but have no symbol-table index
+    // (as_symbol_index panics on them), so exclude them before indexing.
+    if car == NIL || car == T || !car.is_symbol() {
+        return false;
+    }
+    bliss_compiler::reader::symbol_name(car.as_symbol_index())
+        .map(|n| n == "BLISS::CLOSURE")
+        .unwrap_or(false)
+}
+
 /// Walk a cons-cell linked list and collect all car values into a Vec.
 fn cons_list_to_vec(v: BlissVal) -> Vec<BlissVal> {
     let mut result = Vec::new();
@@ -456,6 +474,11 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
             return name;
         }
         return name.trim_start_matches("KEYWORD:").to_string();
+    }
+    // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not the data
+    // list it is structurally — print it as #<FUNCTION> (matches cli print_val).
+    if is_closure_cons(v) {
+        return "#<FUNCTION>".to_string();
     }
     if v.is_cons() {
         return format_cons(v, escapep);
