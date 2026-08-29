@@ -6421,7 +6421,9 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
         "LIST" => &["SEQUENCE", "T"],
         "SIMPLE-STRING" | "BASE-STRING" => &["STRING", "VECTOR", "ARRAY", "SEQUENCE", "ATOM", "T"],
         "STRING" => &["VECTOR", "ARRAY", "SEQUENCE", "ATOM", "T"],
+        "SIMPLE-VECTOR" => &["VECTOR", "ARRAY", "SEQUENCE", "ATOM", "T"],
         "VECTOR" => &["ARRAY", "SEQUENCE", "ATOM", "T"],
+        "SIMPLE-ARRAY" => &["ARRAY", "ATOM", "T"],
         "ARRAY" => &["ATOM", "T"],
         "SEQUENCE" => &["T"],
         "HASH-TABLE" | "FUNCTION" | "PACKAGE" | "PATHNAME" | "STREAM" => &["ATOM", "T"],
@@ -6437,9 +6439,48 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
 /// lattices and CLOS class subtyping via the class precedence list; returns
 /// `(false, false)` — "unknown" — for relationships it cannot decide.
 fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
+    // A compound (parameterized/bounded) SUBTYPE narrows its head type, so it is
+    // a subtype of whatever its head type is a subtype of: (integer 0 10) ⊆
+    // integer/number, (vector t 3) ⊆ vector, (string 5) ⊆ string, (mod 5) ⊆
+    // integer. (The supertype t2 is NOT reduced — a wider type is not a subtype
+    // of a narrower one.) sym_name on a cons yields "", which previously made any
+    // two compound types compare equal (a false positive).
+    if t1.is_cons() {
+        let (head, _) = cp(t1);
+        let hname = symbol_bare_name(&sym_name(head));
+        let base = match hname.as_str() {
+            "MOD" | "UNSIGNED-BYTE" | "SIGNED-BYTE" | "BIT" => "INTEGER",
+            other => other,
+        };
+        if !t2.is_cons() {
+            // Compare the narrowed base atom against the atomic supertype.
+            if let Some(base_sym) = resolve_sym(base) {
+                return subtypep_relation(base_sym, t2);
+            }
+            return (false, false);
+        }
+        // Both compound: a same-head parameterized type is treated as a subtype
+        // (e.g. (integer 0 10) ⊆ (integer 0 20)); different heads are unrelated.
+        let (h2, _) = cp(t2);
+        if symbol_bare_name(&sym_name(h2)) == hname {
+            return (true, true);
+        }
+        return (false, false);
+    }
     let n1 = symbol_bare_name(&sym_name(t1));
-    let n2 = symbol_bare_name(&sym_name(t2));
-    if n2 == "T" || n1 == "NIL" || n1 == n2 {
+    // NIL (the empty type) is a subtype of every type, including bounded ones.
+    if n1 == "NIL" {
+        return (true, true);
+    }
+    let n2 = if t2.is_cons() {
+        // An atomic subtype vs a compound (bounded) supertype: a wider atom is
+        // not a subtype of a narrower bounded type, and we don't range-check —
+        // leave it undetermined.
+        return (false, false);
+    } else {
+        symbol_bare_name(&sym_name(t2))
+    };
+    if n2 == "T" || n1 == n2 {
         return (true, true);
     }
     // Built-in atomic type lattice.

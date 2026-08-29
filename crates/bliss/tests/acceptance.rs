@@ -1768,6 +1768,39 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// SUBTYPEP with a compound (parameterized/bounded) SUBTYPE: it narrows its head
+/// type, so it is a subtype of whatever the head is — (integer 0 10) ⊆ integer,
+/// (vector t 3) ⊆ array, (mod 5) ⊆ integer. Previously sym_name on the cons gave
+/// "", so any two compounds compared equal (a false positive) and compound-vs-
+/// atom gave NIL. Also fills SIMPLE-ARRAY/SIMPLE-VECTOR into the type lattice.
+#[test]
+fn subtypep_compound_subtypes() {
+    let cases = [
+        ("(subtypep '(integer 0 10) 'integer)", "(T T)"),
+        ("(subtypep '(integer 0 10) 'number)", "(T T)"),
+        ("(subtypep '(vector t 3) 'vector)", "(T T)"),
+        ("(subtypep '(vector t 3) 'array)", "(T T)"),
+        ("(subtypep '(string 5) 'string)", "(T T)"),
+        ("(subtypep '(mod 5) 'integer)", "(T T)"),
+        ("(subtypep '(unsigned-byte 8) 'integer)", "(T T)"),
+        ("(subtypep '(simple-array t) 'array)", "(T T)"),
+        ("(subtypep 'simple-vector 'vector)", "(T T)"),
+        // A wider type is NOT a subtype of a narrower bounded one.
+        ("(subtypep 'integer '(integer 0 10))", "(NIL NIL)"),
+        // Different compound heads are unrelated (no false positive).
+        ("(subtypep '(integer 0 10) '(vector t))", "(NIL NIL)"),
+        // NIL is a subtype of everything, including bounded types.
+        ("(subtypep nil '(integer 0 5))", "(T T)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print (multiple-value-list {expr}))")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// PEEK-CHAR (was undefined): returns the next character without consuming it;
 /// peek-type NIL = next char, T = skip whitespace, a character = skip until it.
 #[test]
