@@ -1768,6 +1768,32 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// LOOP `named NAME` establishes a block named NAME (CLHS 6.1.1.4) so
+/// (return-from NAME …) exits the loop — previously "unbound variable: NAMED".
+#[test]
+fn loop_named_establishes_a_block() {
+    let cases = [
+        ("(loop named outer for i from 1 to 3 do (return-from outer i))", "1"),
+        ("(loop named outer for i from 1 to 5 when (> i 3) do (return-from outer i))", "4"),
+        ("(loop named foo for i from 1 to 10 do (when (= i 5) (return-from foo (* i 100))))", "500"),
+        // A named loop still collects/sums normally.
+        ("(loop named foo for i from 1 to 3 collect i)", "(1 2 3)"),
+        ("(loop named n for i in '(1 2 3) sum i)", "6"),
+        // return-from an ENCLOSING block passes through the named loop.
+        ("(block b (loop named inner for i from 1 to 3 do (return-from b (* i 10))) 999)", "10"),
+        // Unnamed loops and the RETURN clause are unaffected.
+        ("(loop for i from 1 to 5 when (= i 3) return (* i 11))", "33"),
+        ("(loop for i from 1 to 3 collect i)", "(1 2 3)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// bliss-rh0t: the reader reads the `#nA(...)` multidimensional-array literal
 /// (the printer already emits it), and EQUALP compares multidim arrays
 /// element-wise — so an array round-trips through print → read → EQUALP.

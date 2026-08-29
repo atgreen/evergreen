@@ -14350,16 +14350,50 @@ enum LoopBeingSource {
     HashValues(BlissVal),
 }
 
+/// Split a leading `named NAME` off a LOOP form (CLHS 6.1.1.4): returns the
+/// block name (as the return-from name string) and the remaining loop body.
+fn loop_split_named(cdr: BlissVal) -> (Option<String>, BlissVal) {
+    if cdr.is_cons() {
+        let (head, rest) = cp(cdr);
+        if head.is_symbol()
+            && symbol_bare_name(&sym_name(head)) == "NAMED"
+            && rest.is_cons()
+        {
+            let (name, body) = cp(rest);
+            if name.is_symbol() {
+                return (Some(sym_name(name)), body);
+            }
+        }
+    }
+    (None, cdr)
+}
+
 fn eval_loop(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     // Run the loop in a fresh variable frame (for iteration variables and
     // accumulators) while keeping the shared global tables mutable in place, so
     // definitions made in the loop body (intern, use-package, defun, …) persist.
     let parent = Rc::clone(&env.frame);
-    // LOOP establishes an implicit `block nil`, so a bare `(return x)` in the
-    // body (e.g. simple loops) exits with x, alongside LOOP's own RETURN clause.
-    with_block_nil(env, move |env| {
-        with_child_frame(env, parent, |env| eval_loop_inner(cdr, env))
-    })
+    // `loop named NAME` establishes a block named NAME so (return-from NAME …)
+    // exits the loop; every LOOP also establishes the implicit `block nil` so a
+    // bare (return x) exits with x. Both share one control token — a return
+    // through either unwinds the loop.
+    let (block_name, body) = loop_split_named(cdr);
+    let token = next_control_token("__RETURN_FROM__");
+    env.block_stack.push(("NIL".to_string(), token.clone()));
+    let pushed_name = matches!(&block_name, Some(n) if n != "NIL");
+    if pushed_name {
+        env.block_stack
+            .push((block_name.clone().unwrap(), token.clone()));
+    }
+    let result = with_child_frame(env, parent, |env| eval_loop_inner(body, env));
+    if pushed_name {
+        env.block_stack.pop();
+    }
+    env.block_stack.pop();
+    match result {
+        Err(BlissError::Internal(msg)) if msg == token => Ok(take_control_value(&token)),
+        other => other,
+    }
 }
 
 fn eval_loop_inner(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
