@@ -1768,6 +1768,33 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// The stdlib printer (PRIN1-TO-STRING / WRITE-TO-STRING / FORMAT ~S) names the
+/// non-graphic characters under *print-escape* (#\Newline, not `#\`+literal),
+/// matching cli PRIN1 — this was a tier/path divergence (stdlib emitted the raw
+/// char).
+#[test]
+fn character_prin1_names_nongraphic_chars() {
+    let cases = [
+        ("(prin1-to-string #\\Newline)", "\"#\\\\Newline\""),
+        ("(prin1-to-string #\\Space)", "\"#\\\\Space\""),
+        ("(prin1-to-string #\\Tab)", "\"#\\\\Tab\""),
+        ("(prin1-to-string #\\Return)", "\"#\\\\Return\""),
+        ("(prin1-to-string #\\a)", "\"#\\\\a\""),
+        ("(format nil \"~s\" #\\Space)", "\"#\\\\Space\""),
+        // princ/~A still emits the literal character.
+        ("(format nil \"~a\" #\\a)", "\"a\""),
+        // cli PRIN1 and the stdlib printer must agree.
+        ("(equal (prin1-to-string #\\Newline) (with-output-to-string (s) (prin1 #\\Newline s)))", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// TYPEP compound-type combinators: (NOT type) — was unhandled and always
 /// returned NIL, breaking (and integer (not (eql 0))) etc. — and (string N) /
 /// (simple-string N) length-qualified string types.

@@ -436,7 +436,18 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
     if v.is_character() {
         let c = v.as_char();
         return if escapep {
-            format!("#\\{}", c)
+            // prin1/~S names the non-graphic characters so they read back
+            // (CLHS 22.1.3.2) — must match cli print_val, which was correct while
+            // the stdlib printer emitted `#\` + the literal char.
+            let mut s = String::from("#\\");
+            match c {
+                ' ' => s.push_str("Space"),
+                '\n' => s.push_str("Newline"),
+                '\t' => s.push_str("Tab"),
+                '\r' => s.push_str("Return"),
+                other => s.push(other),
+            }
+            s
         } else {
             format!("{}", c)
         };
