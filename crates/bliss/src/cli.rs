@@ -6659,6 +6659,18 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                 bliss_rt::types::floatp(object) && !object.is_single_float()
             }
             "CHARACTER" => object.is_character(),
+            // STANDARD-CHAR: the 96 standard characters — #\Newline plus the
+            // printable ASCII range (matches boot.lisp STANDARD-CHAR-P). Bliss
+            // has no extended characters, so BASE-CHAR ≡ CHARACTER (its required
+            // superset of STANDARD-CHAR) and EXTENDED-CHAR is empty (bliss-vdtz).
+            "STANDARD-CHAR" => {
+                object.is_character() && {
+                    let code = object.as_char() as u32;
+                    code == 10 || (32..127).contains(&code)
+                }
+            }
+            "BASE-CHAR" => object.is_character(),
+            "EXTENDED-CHAR" => false,
             "BOOLEAN" => object.is_nil() || object == T,
             "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(object),
             "PACKAGE" => is_package_value(env, object),

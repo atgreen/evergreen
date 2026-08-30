@@ -1758,6 +1758,14 @@ fn typep_heap_numerics_and_complex_introspection() {
         ("(imagpart 7)", "0"),
         ("(type-of #c(1 2))", "COMPLEX"),
         ("(prin1-to-string #c(1 2))", "\"#C(1 2)\""),
+        // Character subtypes: STANDARD-CHAR (newline + printable ASCII),
+        // BASE-CHAR (all chars here), EXTENDED-CHAR (none). (bliss-vdtz)
+        ("(typep #\\a 'standard-char)", "T"),
+        ("(typep #\\Newline 'standard-char)", "T"),
+        ("(typep #\\Tab 'standard-char)", "NIL"),
+        ("(typep #\\a 'base-char)", "T"),
+        ("(typep #\\a 'extended-char)", "NIL"),
+        ("(typep 5 'standard-char)", "NIL"),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
