@@ -3918,6 +3918,18 @@ fn format_decimal_comma_params() {
         ("(format nil \"~,,'.:d\" 1234567)", "\"1.234.567\""),
         ("(format nil \"~,,,2:d\" 1234)", "\"12,34\""),
         ("(format nil \"~:d\" -1234567)", "\"-1,234,567\""),
+        // ~D/~X/~B render bignums (previously type-errored on non-fixnums,
+        // though ~A/PRINT rendered them). (bliss-0mh7)
+        ("(format nil \"~d\" (expt 2 70))", "\"1180591620717411303424\""),
+        (
+            "(format nil \"~:d\" (expt 2 70))",
+            "\"1,180,591,620,717,411,303,424\"",
+        ),
+        ("(format nil \"~x\" (expt 2 70))", "\"400000000000000000\""),
+        (
+            "(format nil \"~d\" (- (expt 2 70)))",
+            "\"-1180591620717411303424\"",
+        ),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin()

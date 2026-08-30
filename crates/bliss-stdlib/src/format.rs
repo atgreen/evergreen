@@ -958,17 +958,46 @@ fn format_integer(
         }
         d.chars().rev().collect()
     };
+    format_integer_parts(
+        negative,
+        &digits,
+        radix,
+        colon,
+        at_sign,
+        mincol,
+        padchar,
+        commachar,
+        comma_interval,
+    )
+}
+
+/// Format an already-rendered magnitude (`digits`, no sign) in a `~D`/`~B`/`~O`/
+/// `~X` field: optional comma grouping (radix 10 + `:`), a `-`/`+` sign, and left
+/// padding to `mincol`. Shared by the fixnum path and the bignum path so both
+/// honor the same parameters (bliss-1kib).
+#[allow(clippy::too_many_arguments)]
+fn format_integer_parts(
+    negative: bool,
+    digits: &str,
+    radix: u32,
+    colon: bool,
+    at_sign: bool,
+    mincol: usize,
+    padchar: char,
+    commachar: char,
+    comma_interval: usize,
+) -> String {
     let with_commas = if colon && radix == 10 {
-        insert_commas(&digits, commachar, comma_interval)
+        insert_commas(digits, commachar, comma_interval)
     } else {
-        digits
+        digits.to_string()
     };
     let sign = if negative {
-        "-".to_string()
+        "-"
     } else if at_sign {
-        "+".to_string()
+        "+"
     } else {
-        String::new()
+        ""
     };
     let result = format!("{}{}", sign, with_commas);
     if result.len() < mincol {
@@ -976,6 +1005,61 @@ fn format_integer(
         format!("{}{}", pad, result)
     } else {
         result
+    }
+}
+
+/// Extract `(negative, magnitude_digits)` from an integer BlissVal (fixnum or
+/// bignum) in `radix`, or `None` if `val` is not an integer. Lets FORMAT ~D/~B/
+/// ~O/~X render bignums, which used to type-error (only `is_fixnum()` was
+/// accepted) even though ~A/PRINT already print them (bliss-1kib).
+fn integer_magnitude(val: BlissVal, radix: u32) -> Option<(bool, String)> {
+    if val.is_fixnum() {
+        let n = val.as_fixnum();
+        let negative = n < 0;
+        let abs = if n == i64::MIN {
+            (n as u128).wrapping_neg() as u64
+        } else {
+            n.unsigned_abs()
+        };
+        let digits = if abs == 0 {
+            "0".to_string()
+        } else {
+            let mut d = String::new();
+            let mut v = abs;
+            while v > 0 {
+                let rem = (v % radix as u64) as u32;
+                d.push(char::from_digit(rem, radix).unwrap().to_ascii_uppercase());
+                v /= radix as u64;
+            }
+            d.chars().rev().collect()
+        };
+        return Some((negative, digits));
+    }
+    if !val.is_heap_object() {
+        return None;
+    }
+    // Registry-backed pseudo-heap values (registered strings, pathnames) carry a
+    // sentinel as_ptr() that must never be dereferenced (mirrors
+    // heap_number_string's guard).
+    if crate::pathnames::registered_string(val).is_some() || crate::pathnames::is_pathname(val) {
+        return None;
+    }
+    unsafe {
+        let ptr = val.as_ptr();
+        if (*(ptr as *const ObjectHeader)).type_id() != type_id::BIGNUM {
+            return None;
+        }
+        let sign = *(ptr.add(8) as *const i32);
+        let n = *(ptr.add(12) as *const u32) as usize;
+        let mut limbs = Vec::with_capacity(n);
+        for i in 0..n {
+            limbs.push(*(ptr.add(16 + i * 8) as *const u64));
+        }
+        // bignum_to_radix emits a leading '-' for negatives; split it back into
+        // (negative, magnitude) so the ~D sign/comma/pad logic applies uniformly.
+        let s = bignum_to_radix(sign, &limbs, radix);
+        let negative = s.starts_with('-');
+        Some((negative, s.trim_start_matches('-').to_string()))
     }
 }
 
@@ -1682,14 +1766,21 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                if !val.is_fixnum() {
-                    return Err(BlissError::TypeError {
-                        datum: val,
-                        expected: "integer".into(),
-                    });
-                }
-                output.push_str(&format_integer(
-                    val.as_fixnum(),
+                // Accept fixnums AND bignums (previously bignums type-errored,
+                // even though ~A/PRINT render them). integer_magnitude returns
+                // None for non-integers -> TYPE-ERROR.
+                let (negative, digits) = match integer_magnitude(val, radix) {
+                    Some(parts) => parts,
+                    None => {
+                        return Err(BlissError::TypeError {
+                            datum: val,
+                            expected: "integer".into(),
+                        });
+                    }
+                };
+                output.push_str(&format_integer_parts(
+                    negative,
+                    &digits,
                     radix,
                     colon,
                     at_sign,
