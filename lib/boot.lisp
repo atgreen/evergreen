@@ -369,6 +369,17 @@
 (defun get-decoded-time ()
   (decode-universal-time (get-universal-time)))
 
+;; FFLOOR/FCEILING/FTRUNCATE/FROUND (CLHS 12.2) — like FLOOR/&c but the quotient
+;; is a float. Second value is the (exact) remainder.
+(defun ffloor (number &optional (divisor 1))
+  (multiple-value-bind (q r) (floor number divisor) (values (float q 1.0) r)))
+(defun fceiling (number &optional (divisor 1))
+  (multiple-value-bind (q r) (ceiling number divisor) (values (float q 1.0) r)))
+(defun ftruncate (number &optional (divisor 1))
+  (multiple-value-bind (q r) (truncate number divisor) (values (float q 1.0) r)))
+(defun fround (number &optional (divisor 1))
+  (multiple-value-bind (q r) (round number divisor) (values (float q 1.0) r)))
+
 ;; UPGRADED-ARRAY-ELEMENT-TYPE (CLHS 15.1.1): the element type the implementation
 ;; actually stores. bliss specialises only bit and character arrays; every other
 ;; element type upgrades to T.

@@ -11406,6 +11406,80 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // Computed in f64 then narrowed. Complex arguments and the complex
             // codomain of out-of-real-range inputs (e.g. (asin 2), (acosh 0))
             // are a follow-up; num_val rejects a complex argument here.
+            // Float introspection / manipulation (CLHS 12.2). All single-float
+            // (bliss's float type). No heap allocation: results are fixnums/floats.
+            "FLOAT-RADIX" => {
+                let (af, _) = cp(cdr);
+                eval_form(af, env)?;
+                return Ok(BlissVal::from_fixnum(2));
+            }
+            "FLOAT-DIGITS" => {
+                let (af, _) = cp(cdr);
+                eval_form(af, env)?;
+                return Ok(BlissVal::from_fixnum(24)); // binary32 mantissa incl. implicit bit
+            }
+            "FLOAT-PRECISION" => {
+                let (af, _) = cp(cdr);
+                let v = eval_form(af, env)?;
+                let f = num_val(v)? as f32;
+                return Ok(BlissVal::from_fixnum(if f == 0.0 { 0 } else { 24 }));
+            }
+            "FLOAT-SIGN" => {
+                // (float-sign f1 &optional f2): the sign of f1 applied to |f2|
+                // (default f2 = 1.0).
+                let (f1f, rest) = cp(cdr);
+                bliss_rt::rooted!(rest = rest);
+                let f1 = num_val(eval_form(f1f, env)?)? as f32;
+                let mag = if rest.is_cons() {
+                    (num_val(eval_form(cp(*rest).0, env)?)? as f32).abs()
+                } else {
+                    1.0
+                };
+                let signed = if f1.is_sign_negative() { -mag } else { mag };
+                return Ok(BlissVal::from_single_float(signed));
+            }
+            "SCALE-FLOAT" => {
+                // (scale-float f n) = f * 2^n.
+                let (ff, rest) = cp(cdr);
+                bliss_rt::rooted!(rest = rest);
+                let f = num_val(eval_form(ff, env)?)? as f64;
+                let n = num_val(eval_form(cp(*rest).0, env)?)? as i32;
+                return Ok(BlissVal::from_single_float((f * 2f64.powi(n)) as f32));
+            }
+            "INTEGER-DECODE-FLOAT" => {
+                // => (values mantissa exponent sign): f = mantissa·2^exponent·sign.
+                let (af, _) = cp(cdr);
+                let f = num_val(eval_form(af, env)?)? as f32;
+                let (sign, mantissa, exp) = decode_f32(f);
+                env.set_mv(vec![
+                    BlissVal::from_fixnum(mantissa as i64),
+                    BlissVal::from_fixnum(exp as i64),
+                    BlissVal::from_fixnum(sign as i64),
+                ]);
+                return Ok(BlissVal::from_fixnum(mantissa as i64));
+            }
+            "DECODE-FLOAT" => {
+                // => (values significand exponent sign), significand in [1/2, 1).
+                let (af, _) = cp(cdr);
+                let f = num_val(eval_form(af, env)?)? as f32;
+                let (sign, mantissa, exp) = decode_f32(f);
+                let (significand, exponent) = if mantissa == 0 {
+                    (0.0f32, 0i32)
+                } else {
+                    // value = mantissa·2^exp; put the significand in [1/2,1):
+                    // significand = mantissa·2^(exp - E), where E makes it so.
+                    let bits = (64 - mantissa.leading_zeros()) as i32; // bit length
+                    let exponent = exp + bits;
+                    let significand = mantissa as f32 * 2f32.powi(exp - exponent);
+                    (significand, exponent)
+                };
+                env.set_mv(vec![
+                    BlissVal::from_single_float(significand),
+                    BlissVal::from_fixnum(exponent as i64),
+                    BlissVal::from_single_float(sign as f32),
+                ]);
+                return Ok(BlissVal::from_single_float(significand));
+            }
             "EXP" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "SINH" | "COSH" | "TANH"
             | "ASINH" | "ACOSH" | "ATANH" => {
                 let (af, _) = cp(cdr);
@@ -15614,6 +15688,24 @@ fn pow2_bigint(k: u32) -> BigInt {
         r = big_mul(&r, &two);
     }
     r
+}
+
+/// Decompose a single-float into `(sign, mantissa, exponent)` with
+/// value = sign · mantissa · 2^exponent (mantissa a non-negative integer) — the
+/// core of INTEGER-DECODE-FLOAT / DECODE-FLOAT.
+fn decode_f32(f: f32) -> (i32, u64, i32) {
+    if f == 0.0 {
+        return (if f.is_sign_negative() { -1 } else { 1 }, 0, 0);
+    }
+    let bits = f.to_bits();
+    let sign = if bits >> 31 == 1 { -1 } else { 1 };
+    let exp_field = ((bits >> 23) & 0xFF) as i32;
+    let mant_field = (bits & 0x7F_FFFF) as u64;
+    if exp_field == 0 {
+        (sign, mant_field, -149) // subnormal
+    } else {
+        (sign, mant_field | 0x80_0000, exp_field - 127 - 23)
+    }
 }
 
 /// The EXACT value of a single-float as a reduced rational (`mantissa · 2^e`),
@@ -20340,6 +20432,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "PRINT" | "PRIN1" | "PRINC" | "WRITE" | "WRITE-STRING" | "WRITE-LINE"
             | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"
             | "PEEK-CHAR" | "UNREAD-CHAR"
+            | "FLOAT-RADIX" | "FLOAT-DIGITS" | "FLOAT-PRECISION" | "FLOAT-SIGN"
+            | "SCALE-FLOAT" | "DECODE-FLOAT" | "INTEGER-DECODE-FLOAT"
             | "READ-FROM-STRING" | "FORMAT" | "PRIN1-TO-STRING" | "PRINC-TO-STRING"
             | "WRITE-TO-STRING" | "FORCE-OUTPUT" | "FINISH-OUTPUT" | "CLEAR-OUTPUT"
             | "FILE-LENGTH" | "READ-SEQUENCE" | "WRITE-SEQUENCE"

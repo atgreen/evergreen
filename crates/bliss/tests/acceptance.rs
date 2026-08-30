@@ -1768,6 +1768,37 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// The float introspection/manipulation family (were undefined): DECODE-FLOAT,
+/// INTEGER-DECODE-FLOAT, SCALE-FLOAT, FLOAT-SIGN, FLOAT-RADIX/DIGITS/PRECISION,
+/// and FFLOOR/FCEILING/FTRUNCATE/FROUND (float-quotient rounding).
+#[test]
+fn float_introspection_and_frounding() {
+    let cases = [
+        ("(multiple-value-list (integer-decode-float 1.0))", "(8388608 -23 1)"),
+        ("(multiple-value-list (integer-decode-float 0.5))", "(8388608 -24 1)"),
+        ("(multiple-value-list (decode-float 1.0))", "(0.5 1 1.0)"),
+        ("(multiple-value-list (decode-float 8.0))", "(0.5 4 1.0)"),
+        ("(scale-float 1.5 2)", "6.0"),
+        ("(scale-float 1.0 -1)", "0.5"),
+        ("(float-sign -3.0)", "-1.0"),
+        ("(float-sign -1.0 5.0)", "-5.0"),
+        ("(list (float-radix 1.0) (float-digits 1.0) (float-precision 0.0))", "(2 24 0)"),
+        // F-rounding: float quotient + exact remainder.
+        ("(multiple-value-list (ffloor 17 5))", "(3.0 2)"),
+        ("(values (fround 3.5))", "4.0"),
+        ("(values (ftruncate 3.7))", "3.0"),
+        // fboundp is consistent.
+        ("(list (fboundp 'scale-float) (fboundp 'ffloor))", "(T T)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// bliss-3bk3: GET-DECODED-TIME, UPGRADED-ARRAY-ELEMENT-TYPE,
 /// UPGRADED-COMPLEX-PART-TYPE (were undefined), and PATHNAME-MATCH-P coercing
 /// string designators (was a type-error on strings).
