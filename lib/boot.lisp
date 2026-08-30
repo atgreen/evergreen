@@ -281,6 +281,15 @@
         (format nil "~a" x)
         (format nil "~s" x))))
 
+;; Minimal PPRINT: a fresh newline, then the escaped printed representation of
+;; OBJECT, with no trailing space, returning no values (CLHS). Full XP pretty-
+;; printing (spec R5.166) is not yet implemented, so this is the degenerate
+;; *print-pretty* NIL case — equivalent to (terpri) followed by WRITE.
+(defun pprint (object &optional stream)
+  (terpri stream)
+  (write object :stream stream :escape t)
+  (values))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Control-flow macros still needed during the Stage 2 bootstrap.
 ;;; ---------------------------------------------------------------------------

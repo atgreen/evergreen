@@ -4386,6 +4386,38 @@ fn write_to_string_honors_print_control_keywords() {
     }
 }
 
+/// PPRINT is bound and behaves as the degenerate (non-pretty) case: a leading
+/// fresh newline, the escaped representation, no trailing space, no values.
+/// (bliss-nopz — full XP pretty-printing remains a separate epic.)
+#[test]
+fn pprint_minimal_behavior() {
+    let cases = [
+        // Leading fresh newline, then the printed list (to a string stream so
+        // it doesn't interleave with the test's own output).
+        (
+            "(equal (with-output-to-string (o) (pprint '(1 2 3) o)) (format nil \"~%(1 2 3)\"))",
+            "T",
+        ),
+        // Escapes strings (prin1-style) and returns no values.
+        (
+            "(equal (with-output-to-string (o) (pprint \"hi\" o)) (format nil \"~%~s\" \"hi\"))",
+            "T",
+        ),
+        ("(multiple-value-list (pprint 5 (make-string-output-stream)))", "NIL"),
+        ("(fboundp 'pprint)", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got}");
+    }
+}
+
 /// (setf (getf place indicator) val) updates the plist: overwrite an existing
 /// indicator's value in place, or prepend a new indicator/value pair and store
 /// the new head back into the place. Was an uncatchable "unsupported place".
