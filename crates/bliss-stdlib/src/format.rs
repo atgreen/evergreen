@@ -2150,11 +2150,23 @@ fn format_impl(
                 let body_end = find_matching_close(&chars, i, '{')?;
                 let body: String = chars[body_start..body_end].iter().collect();
                 i = skip_close_directive(&chars, body_end);
+                // The prefix parameter of ~{ is the maximum iteration count:
+                // `~2{...~}` runs the body at most twice (CLHS 22.3.5.2).
+                // Resolved before the list argument is consumed (a `~V{` count
+                // comes from an argument). None = unlimited.
+                let max_iter: Option<i64> = if !params.is_empty() {
+                    Some(resolve_param(&params[0], 0, arg_idx)?)
+                } else {
+                    None
+                };
+                let reached = |n: i64| max_iter.is_some_and(|m| n >= m);
                 if at_sign && colon {
                     // ~:@{...~} — each remaining arg is itself a list (cons cell)
-                    while *arg_idx < args.len() {
+                    let mut iters = 0i64;
+                    while *arg_idx < args.len() && !reached(iters) {
                         let sub = args[*arg_idx];
                         *arg_idx += 1;
+                        iters += 1;
                         if sub.is_nil() {
                             continue;
                         } // empty sublist
@@ -2164,8 +2176,10 @@ fn format_impl(
                     }
                 } else if at_sign {
                     // ~@{...~} — remaining args form the iteration list
-                    while *arg_idx < args.len() {
+                    let mut iters = 0i64;
+                    while *arg_idx < args.len() && !reached(iters) {
                         format_impl(&body, args, arg_idx, output)?;
+                        iters += 1;
                     }
                 } else if colon {
                     // ~:{...~} — arg is a list of sublists; apply body to each sublist
@@ -2176,7 +2190,10 @@ fn format_impl(
                     *arg_idx += 1;
                     if !list_val.is_nil() {
                         let sublists = cons_list_to_vec(list_val);
-                        for sublist in &sublists {
+                        for (iters, sublist) in sublists.iter().enumerate() {
+                            if reached(iters as i64) {
+                                break;
+                            }
                             let sub_args = if sublist.is_nil() {
                                 Vec::new()
                             } else {
@@ -2196,8 +2213,10 @@ fn format_impl(
                     if !list_val.is_nil() {
                         let list_elements = cons_list_to_vec(list_val);
                         let mut sub_idx = 0;
-                        while sub_idx < list_elements.len() {
+                        let mut iters = 0i64;
+                        while sub_idx < list_elements.len() && !reached(iters) {
                             format_impl(&body, &list_elements, &mut sub_idx, output)?;
+                            iters += 1;
                         }
                     }
                 }
