@@ -1761,6 +1761,7 @@ fn bliss_error_to_condition(
         }
         BlissError::SandboxViolation(msg) => make_simple_error_condition(arena_str(msg), env)?,
         BlissError::ProgramError(_) => build_condition_instance(env, "PROGRAM-ERROR", &[])?,
+        BlissError::ControlError(_) => build_condition_instance(env, "CONTROL-ERROR", &[])?,
         _ => return Ok(None),
     };
     bliss_rt::rooted_ref!(_condition_root = &mut condition);
@@ -7715,7 +7716,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     store_control_value(token, value);
                     return Err(BlissError::Internal(token.clone()));
                 }
-                return Err(BlissError::Internal(format!(
+                return Err(BlissError::ControlError(format!(
                     "RETURN-FROM: no block named {} is currently visible",
                     name
                 )));
@@ -7732,7 +7733,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     store_control_value(token, value);
                     return Err(BlissError::Internal(token.clone()));
                 }
-                return Err(BlissError::Internal(
+                return Err(BlissError::ControlError(
                     "RETURN: no block named NIL is currently visible".into(),
                 ));
             }
@@ -7764,7 +7765,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     store_control_value(token, value);
                     return Err(BlissError::Internal(token.clone()));
                 }
-                return Err(BlissError::Internal(format!("uncaught throw to {}", tag)));
+                // A THROW with no matching CATCH is a catchable CONTROL-ERROR
+                // (CLHS 5.2), not an uncatchable internal error.
+                return Err(BlissError::ControlError(format!(
+                    "attempt to THROW to a tag that is not active: {tag}"
+                )));
             }
             "TAGBODY" => {
                 // (tagbody {tag | statement}*)
@@ -7841,7 +7846,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     store_control_value(&token, arena_str(&name));
                     return Err(BlissError::Internal(token));
                 }
-                return Err(BlissError::Internal(format!("GO: no such tag {}", name)));
+                return Err(BlissError::ControlError(format!("GO: no such tag {}", name)));
             }
             "UNWIND-PROTECT" => {
                 // (unwind-protect protected cleanup...) — cleanup runs whether the

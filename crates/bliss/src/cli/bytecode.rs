@@ -10935,7 +10935,12 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                         initiate_unwind(acts, stack, env, Pending::Token(tok))?;
                     }
                     None => {
-                        let e = BlissError::Internal(format!("uncaught throw to {tag_str}"));
+                        // No active CATCH for this tag ⇒ catchable CONTROL-ERROR
+                        // (CLHS 5.2), not an uncatchable internal error (matches
+                        // the tree-walker THROW arm).
+                        let e = BlissError::ControlError(format!(
+                            "attempt to THROW to a tag that is not active: {tag_str}"
+                        ));
                         initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                     }
                 }
@@ -10965,7 +10970,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     }
                     None => {
                         let e =
-                            BlissError::Internal(format!("RETURN-FROM: no visible block {name}"));
+                            BlissError::ControlError(format!("RETURN-FROM: no visible block {name}"));
                         initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                     }
                 }
@@ -10990,7 +10995,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                         initiate_unwind(acts, stack, env, Pending::Token(tok))?;
                     }
                     None => {
-                        let e = BlissError::Internal(format!("GO: no such tag {name}"));
+                        let e = BlissError::ControlError(format!("GO: no such tag {name}"));
                         initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                     }
                 }
@@ -11500,8 +11505,8 @@ fn unmatched_error(pending: Pending) -> BlissError {
     match pending {
         Pending::Propagate(e) => e,
         Pending::Token(token) => BlissError::Internal(token),
-        Pending::Return { .. } => BlissError::Internal("RETURN-FROM: no visible block".into()),
-        Pending::Go { .. } => BlissError::Internal("GO: no such tag".into()),
+        Pending::Return { .. } => BlissError::ControlError("RETURN-FROM: no visible block".into()),
+        Pending::Go { .. } => BlissError::ControlError("GO: no such tag".into()),
     }
 }
 

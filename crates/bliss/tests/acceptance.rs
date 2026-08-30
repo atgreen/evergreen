@@ -1768,6 +1768,33 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// A non-local exit with no active target — THROW to a tag with no CATCH, GO to
+/// a dead tag, RETURN-FROM to a dead block — signals a catchable CONTROL-ERROR
+/// (CLHS 5.2), not an uncatchable internal error. Covers both the tree-walker
+/// and the bytecode-compiled path.
+#[test]
+fn uncaught_nonlocal_exit_is_catchable_control_error() {
+    let cases = [
+        ("(handler-case (throw 'nope 1) (control-error () :ce))", ":CE"),
+        ("(handler-case (throw 'nope 1) (error () :err))", ":ERR"),
+        ("(handler-case (return-from nowhere 5) (control-error () :ce))", ":CE"),
+        ("(handler-case (go nowhere) (control-error () :ce))", ":CE"),
+        ("(ignore-errors (throw 'x 1))", "NIL"),
+        // A THROW inside a called (compiled) function takes the bytecode path.
+        ("(progn (defun thr () (throw 'gone 1)) (handler-case (thr) (control-error () :ce)))", ":CE"),
+        // Normal non-local exits are unaffected.
+        ("(catch 't1 (throw 't1 99))", "99"),
+        ("(block b (return-from b 7))", "7"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// bliss-8zrb: FORMAT ~E/~G format a single-float from the f32 itself (shortest
 /// round-trip) rather than its widened f64, which exposed binary32 imprecision
 /// ((format nil "~e" 0.001) had been 1.0000000474974513E-3). ~E keeps a decimal

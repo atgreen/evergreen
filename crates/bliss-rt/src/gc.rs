@@ -2323,7 +2323,8 @@ impl TraceHostRoots for BlissError {
             | BlissError::PackageError(_)
             | BlissError::StreamError(_)
             | BlissError::FileError(_)
-            | BlissError::SandboxViolation(_) => {}
+            | BlissError::SandboxViolation(_)
+            | BlissError::ControlError(_) => {}
         }
     }
 }

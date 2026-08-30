@@ -69,6 +69,12 @@ pub enum BlissError {
 
     /// Sandbox policy violation.
     SandboxViolation(String),
+
+    /// A control-flow error in the CL sense: a THROW to a tag with no matching
+    /// CATCH, a GO/RETURN-FROM to a no-longer-active tag/block, etc. Maps to CL
+    /// `CONTROL-ERROR`, so it is catchable — unlike `Internal`, which also
+    /// carries the evaluator's live control-flow tokens and must keep propagating.
+    ControlError(String),
 }
 
 impl core::fmt::Display for BlissError {
@@ -98,6 +104,7 @@ impl core::fmt::Display for BlissError {
             BlissError::StreamError(msg) => write!(f, "stream error: {}", msg),
             BlissError::FileError(msg) => write!(f, "file error: {}", msg),
             BlissError::SandboxViolation(msg) => write!(f, "sandbox violation: {}", msg),
+            BlissError::ControlError(msg) => write!(f, "control error: {}", msg),
         }
     }
 }
