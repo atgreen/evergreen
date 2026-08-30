@@ -1766,6 +1766,13 @@ fn typep_heap_numerics_and_complex_introspection() {
         ("(typep #\\a 'base-char)", "T"),
         ("(typep #\\a 'extended-char)", "NIL"),
         ("(typep 5 'standard-char)", "NIL"),
+        // Standard float constants: PI (single-precision approximation) and the
+        // single-float magnitude extremes. (bliss-ncor)
+        ("(floatp pi)", "T"),
+        ("(and (> pi 3.1415) (< pi 3.1416))", "T"),
+        ("(< (abs (- pi (* 4 (atan 1)))) 0.001)", "T"),
+        ("(> most-positive-single-float 1.0e38)", "T"),
+        ("(< most-negative-single-float -1.0e38)", "T"),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");

@@ -50,6 +50,13 @@
 ;; stored as n<<3, so the representable range is [-2^60, 2^60-1].
 (defconstant most-positive-fixnum 576460752303423487)
 (defconstant most-negative-fixnum -576460752303423488)
+;; PI (a float approximation of π; bliss floats are single-precision, so the
+;; long-float literal rounds to 3.1415927) and the single-float magnitude
+;; extremes. The epsilon / least-positive / double-float constants are not yet
+;; defined (bliss has no distinct double-float) — see bliss follow-up.
+(defconstant pi 3.141592653589793)
+(defconstant most-positive-single-float 3.4028235e38)
+(defconstant most-negative-single-float -3.4028235e38)
 (defconstant lambda-list-keywords
   '(&optional &rest &key &allow-other-keys &aux &body &whole &environment))
 (defconstant call-arguments-limit 4611686018427387904)
