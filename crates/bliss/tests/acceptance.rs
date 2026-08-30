@@ -3819,6 +3819,25 @@ fn gcd_lcm_and_string_trim() {
         ("(gcd 12 18)", "6"),
         ("(gcd 12 18 24)", "6"),
         ("(lcm 4 6)", "12"),
+        // GCD/LCM require integers: a ratio/float argument is a catchable
+        // TYPE-ERROR, not a silently-computed result (bliss-fvni).
+        (
+            "(handler-case (gcd 1/2 1/3) (type-error () :ok))",
+            ":OK",
+        ),
+        (
+            "(handler-case (lcm 3 1.0) (type-error () :ok))",
+            ":OK",
+        ),
+        // MIN/MAX with no arguments is a catchable PROGRAM-ERROR (bliss-pxim).
+        (
+            "(handler-case (min) (program-error () :ok))",
+            ":OK",
+        ),
+        (
+            "(handler-case (max) (program-error () :ok))",
+            ":OK",
+        ),
         ("(string-trim \" \" \"  hi  \")", "\"hi\""),
         ("(string-left-trim \" x\" \"xx hi\")", "\"hi\""),
         ("(string-right-trim \" \" \"hi  \")", "\"hi\""),

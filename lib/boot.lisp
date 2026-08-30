@@ -980,12 +980,20 @@
 
 (defun %gcd2 (a b) (if (= b 0) a (%gcd2 b (mod a b))))
 
+(defun %require-integers (integers)
+  ;; ANSI: GCD/LCM accept only integers; a ratio/float/etc. is a TYPE-ERROR.
+  (dolist (n integers)
+    (unless (integerp n)
+      (error 'type-error :datum n :expected-type 'integer))))
+
 (defun gcd (&rest integers)
+  (%require-integers integers)
   (if (null integers)
       0
       (reduce (lambda (a b) (%gcd2 (abs a) (abs b))) integers)))
 
 (defun lcm (&rest integers)
+  (%require-integers integers)
   (if (null integers)
       1
       (reduce (lambda (a b)

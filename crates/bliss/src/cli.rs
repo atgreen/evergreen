@@ -11352,7 +11352,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // overflowed the `as i64` cast on bignums (bliss-05hy).
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
-                    return Err(BlissError::Internal(format!(
+                    // ANSI: MIN/MAX require at least one argument; too few args
+                    // is a (catchable) PROGRAM-ERROR, not an internal error.
+                    return Err(BlissError::ProgramError(format!(
                         "{name} requires at least one argument"
                     )));
                 }
