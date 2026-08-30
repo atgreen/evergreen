@@ -2673,6 +2673,21 @@ fn multidimensional_arrays() {
         // Rank-1 list dimension stays an ordinary vector.
         ("(array-rank (make-array 5))", "1"),
         ("(vectorp (make-array '(5)))", "T"),
+        // ARRAY-TOTAL-SIZE is the backing capacity, not the fill pointer;
+        // ADJUST-ARRAY grows a plain adjustable array (length tracks the new
+        // size) while preserving a real fill pointer. (bliss-6wng)
+        ("(array-total-size (make-array 5 :fill-pointer 3))", "5"),
+        ("(length (make-array 5 :fill-pointer 3))", "3"),
+        (
+            "(let ((a (make-array 3 :adjustable t :initial-element 0))) \
+               (adjust-array a 5 :initial-element 1) (list (length a) (aref a 4) (aref a 0)))",
+            "(5 1 0)",
+        ),
+        (
+            "(let ((a (make-array 5 :fill-pointer 3 :adjustable t))) \
+               (adjust-array a 8) (list (fill-pointer a) (array-total-size a)))",
+            "(3 8)",
+        ),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");

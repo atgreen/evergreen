@@ -1132,9 +1132,20 @@
          (iel-cell (member :initial-element keys))
          (fp (and fp-cell (car (cdr fp-cell))))
          (iel (if iel-cell (car (cdr iel-cell)) nil))
+         ;; No :fill-pointer supplied. Bliss represents both plain adjustable
+         ;; arrays and fill-pointer arrays as complex vectors, so
+         ;; ARRAY-HAS-FILL-POINTER-P can't tell them apart (it answers T for
+         ;; both — see bliss-6wng). Heuristic: a plain adjustable array's length
+         ;; equals its total size, so if the current fill pointer already spans
+         ;; the whole storage, treat it as a plain array and let its length track
+         ;; the new SIZE; only a fill pointer strictly below capacity is a real
+         ;; (user) fill pointer worth preserving. Without this, growing a plain
+         ;; adjustable array left its length pinned at the old size (bliss-6wng).
          (fpn (cond ((eq fp t) size)
                     ((integerp fp) fp)
-                    ((array-has-fill-pointer-p array) (fill-pointer array))
+                    ((and (array-has-fill-pointer-p array)
+                          (< (fill-pointer array) (array-total-size array)))
+                     (fill-pointer array))
                     (t size))))
     (%adjust-array array size fpn iel)))
 

@@ -10368,11 +10368,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             }
             "ARRAY-TOTAL-SIZE" => {
                 // Product of the dimensions = capacity of the row-major storage
-                // (multidim), else the vector/string length.
+                // (multidim), else the vector/string length. For a fill-pointer /
+                // adjustable vector this is the BACKING capacity, not the active
+                // length — LENGTH follows the fill pointer, ARRAY-TOTAL-SIZE does
+                // not (bliss-6wng: (make-array 5 :fill-pointer 3) has total size
+                // 5, not 3).
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 if let Some(storage) = bliss_rt::types::md_array_storage(v) {
                     return Ok(BlissVal::from_fixnum(bliss_stdlib::length(storage)? as i64));
+                }
+                if bliss_stdlib::is_complex_vector(v) {
+                    return Ok(BlissVal::from_fixnum(bliss_stdlib::cvec_capacity(v) as i64));
                 }
                 return Ok(BlissVal::from_fixnum(bliss_stdlib::length(v)? as i64));
             }
