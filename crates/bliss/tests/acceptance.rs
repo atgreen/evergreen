@@ -1829,6 +1829,40 @@ fn print_length_and_level() {
     }
 }
 
+/// COERCE must not silently return a wrong value for a non-coercible target:
+/// an integer is not a character designator (65 was becoming #\6), and there is
+/// no coercion to INTEGER/RATIONAL/REAL/NUMBER — a mismatched object type-errors
+/// rather than passing through unchanged (bliss-vv1b).
+#[test]
+fn coerce_rejects_non_designators_and_bad_numeric_targets() {
+    let cases = [
+        // Wrong-result cases now signal a catchable type-error.
+        ("(handler-case (coerce 65 'character) (type-error () :err))", ":ERR"),
+        ("(handler-case (coerce (code-char 65) 'integer) (type-error () :err))", ":ERR"),
+        ("(handler-case (coerce 1.5 'integer) (type-error () :err))", ":ERR"),
+        ("(handler-case (coerce #\\a 'integer) (type-error () :err))", ":ERR"),
+        // Multi-character strings are not character designators.
+        ("(handler-case (coerce \"ab\" 'character) (type-error () :err))", ":ERR"),
+        // Valid coercions and identity cases are unchanged.
+        ("(coerce \"A\" 'character)", "#\\A"),
+        ("(coerce #\\A 'character)", "#\\A"),
+        // 'a reads as the symbol A (reader upcases), so its name char is A.
+        ("(coerce 'a 'character)", "#\\A"),
+        ("(coerce 3 'integer)", "3"),
+        ("(coerce 1/2 'rational)", "1/2"),
+        ("(coerce 3 'real)", "3"),
+        ("(coerce 7 'number)", "7"),
+        ("(coerce 3 'float)", "3.0"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// *PRINT-CIRCLE* t: shared and circular structure prints with #N=/#N# labels
 /// and terminates, instead of looping forever (bliss-dlil). Covers both the
 /// stdlib printer (prin1-to-string) and — via the returned string — the fact

@@ -16994,6 +16994,23 @@ fn seq_elements(seq: BlissVal) -> Result<Vec<BlissVal>, BlissError> {
 /// CL COERCE for the type specifiers that actually occur in practice. The
 /// result-type is reduced to the head symbol of the spec (e.g. `(vector t)` →
 /// VECTOR). Unknown specifiers pass the value through unchanged.
+/// COERCE to a type that has no conversion rule (the numeric types): return
+/// the value when it already satisfies the type, else signal a type-error.
+fn require_coerce_type(
+    value: BlissVal,
+    already: bool,
+    expected: &str,
+) -> Result<BlissVal, BlissError> {
+    if already {
+        Ok(value)
+    } else {
+        Err(BlissError::TypeError {
+            datum: value,
+            expected: expected.into(),
+        })
+    }
+}
+
 fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissError> {
     // Reduce the type spec to a bare head-symbol name.
     let head = if type_val.is_cons() {
@@ -17029,14 +17046,26 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
             }
             Ok(arena_str(&s))
         }
-        "CHARACTER" => {
+        "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" | "EXTENDED-CHAR" => {
             if value.is_character() {
                 return Ok(value);
             }
-            let s = val_as_str(value);
-            match s.chars().next() {
-                Some(c) => Ok(BlissVal::from_char(c)),
-                None => Err(BlissError::TypeError {
+            // A character designator is a character, a one-element string, or a
+            // symbol whose name is a single character — NOT an arbitrary object.
+            // Stringifying anything (e.g. the integer 65 -> "65" -> #\6) is a
+            // silent wrong result; a non-designator must type-error (bliss-vv1b).
+            let s_opt: Option<String> = if is_string_value(value) {
+                Some(val_as_str(value))
+            } else if value.is_symbol() {
+                Some(symbol_bare_name(&sym_name(value)))
+            } else {
+                None
+            };
+            match s_opt {
+                Some(ref s) if s.chars().count() == 1 => {
+                    Ok(BlissVal::from_char(s.chars().next().unwrap()))
+                }
+                _ => Err(BlissError::TypeError {
                     datum: value,
                     expected: "character".into(),
                 }),
@@ -17045,6 +17074,19 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
         "FLOAT" | "SINGLE-FLOAT" | "DOUBLE-FLOAT" | "SHORT-FLOAT" | "LONG-FLOAT" => {
             Ok(BlissVal::from_single_float(num_val(value)? as f32))
         }
+        // COERCE performs no conversion TO these numeric types: it returns the
+        // object when it is already of the type, else signals a type-error
+        // (e.g. `(coerce #\A 'integer)` and `(coerce 1.5 'integer)` must error,
+        // not silently pass the argument through — bliss-vv1b).
+        "INTEGER" | "FIXNUM" | "BIGNUM" => require_coerce_type(value, bliss_rt::types::integerp(value), "integer"),
+        "RATIONAL" => require_coerce_type(value, bliss_rt::types::rationalp(value), "rational"),
+        "RATIO" => require_coerce_type(
+            value,
+            bliss_rt::types::rationalp(value) && !bliss_rt::types::integerp(value),
+            "ratio",
+        ),
+        "REAL" => require_coerce_type(value, bliss_rt::types::realp(value), "real"),
+        "NUMBER" => require_coerce_type(value, bliss_rt::types::numberp(value), "number"),
         // FUNCTION: bliss symbols and closures are already callable via funcall.
         "FUNCTION" => Ok(value),
         // Unknown / identity specifiers: pass through unchanged.
