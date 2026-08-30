@@ -9502,9 +9502,39 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 let src_len = bliss_stdlib::length(*val)?;
                                 let limit = end.unwrap_or(dst_len).min(dst_len);
                                 let n = limit.saturating_sub(start).min(src_len);
-                                for i in 0..n {
-                                    let e = bliss_stdlib::elt(*val, i)?;
-                                    seq_set_elt(seq, start + i, e)?;
+                                if seq.is_cons() {
+                                    // (setf (subseq list start end) new): set_elt
+                                    // rejects lists, so mutate the spine in place
+                                    // (REPLACE semantics), like the (setf (elt list
+                                    // i)) arm. GC-safe: elt reads an element and
+                                    // never allocates, so `cursor` (a raw cons
+                                    // pointer) stays valid across the loop.
+                                    let mut cursor = seq;
+                                    for _ in 0..start {
+                                        if !cursor.is_cons() {
+                                            break;
+                                        }
+                                        cursor = cp(cursor).1;
+                                    }
+                                    for i in 0..n {
+                                        if !cursor.is_cons() {
+                                            break;
+                                        }
+                                        let e = bliss_stdlib::elt(*val, i)?;
+                                        unsafe {
+                                            let cell = cursor.as_ptr() as *mut ConsCell;
+                                            bliss_rt::gc::store_ref(
+                                                std::ptr::addr_of_mut!((*cell).car),
+                                                e,
+                                            );
+                                        }
+                                        cursor = cp(cursor).1;
+                                    }
+                                } else {
+                                    for i in 0..n {
+                                        let e = bliss_stdlib::elt(*val, i)?;
+                                        seq_set_elt(seq, start + i, e)?;
+                                    }
                                 }
                             }
                             "GETHASH" => {

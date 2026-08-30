@@ -4298,6 +4298,30 @@ fn reduce_honors_explicit_nil_initial_value() {
     );
 }
 
+/// (setf (subseq place …) new) works on lists, not just vectors/strings —
+/// set_elt rejects lists, so the list case walks the spine in place with
+/// REPLACE semantics (bounded by the shorter of place-slice / new). (bliss-mnee)
+#[test]
+fn setf_subseq_on_a_list() {
+    let cases = [
+        ("(let ((l (list 1 2 3 4))) (setf (subseq l 1 3) '(20 30)) l)", "(1 20 30 4)"),
+        ("(let ((l (list 1 2 3 4))) (setf (subseq l 1) '(20 30 40)) l)", "(1 20 30 40)"),
+        // New shorter than the slice: only its elements are stored.
+        ("(let ((l (list 1 2 3 4))) (setf (subseq l 1 3) '(9)) l)", "(1 9 3 4)"),
+        // New longer than the destination: bounded by the list length.
+        ("(let ((l (list 1 2 3))) (setf (subseq l 0) '(7 8 9 10)) l)", "(7 8 9)"),
+        // Vectors still work.
+        ("(let ((v (vector 1 2 3 4))) (setf (subseq v 1 3) #(20 30)) v)", "#(1 20 30 4)"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got}");
+    }
+}
+
 #[test]
 fn setf_of_a_setf_generic_function() {
     // bliss-lb6.14: (setf (place …) v) dispatches to a (defmethod (setf place) …)
