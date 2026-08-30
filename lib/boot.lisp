@@ -1786,6 +1786,20 @@
 (defun logbitp (index n)
   (= 1 (%lowbit (floor n (expt 2 index)))))
 
+;;; Complex-number helpers built on REALPART/IMAGPART/COMPLEX (CLHS 12.2).
+;; CONJUGATE negates the imaginary part; a real is its own conjugate.
+(defun conjugate (n)
+  (if (complexp n)
+      (complex (realpart n) (- (imagpart n)))
+      n))
+;; PHASE is the angle of the polar representation: atan(imagpart, realpart).
+;; For a real it is 0 (non-negative) or pi (negative).
+(defun phase (n)
+  (atan (imagpart n) (realpart n)))
+;; CIS: the unit complex number e^(i*radians) = cos(r) + i*sin(r).
+(defun cis (radians)
+  (complex (cos radians) (sin radians)))
+
 (defun integer-length (n)
   (cond ((< n 0) (integer-length (lognot n)))
         ((= n 0) 0)

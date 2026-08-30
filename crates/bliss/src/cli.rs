@@ -11495,14 +11495,22 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 // Any other REAL (bignum, ratio, double-float): |x| = x if x>=0
                 // else -x, via the generic compare/subtract cores so the exact
-                // type is preserved (bliss-apr). Complex ABS (magnitude) is left
-                // to complex arithmetic (bliss-qng).
+                // type is preserved (bliss-apr).
                 if bliss_rt::types::realp(v) {
                     let zero = BlissVal::from_fixnum(0);
                     if numeric_cmp(v, zero)? == std::cmp::Ordering::Less {
                         return sub_vals(&[zero, v]);
                     }
                     return Ok(v);
+                }
+                // ABS of a complex number is its magnitude, sqrt(re^2+im^2),
+                // returned as a (single) float — previously this type-errored
+                // (bliss-dhrx).
+                if bliss_rt::types::complexp(v) {
+                    let zero = BlissVal::from_fixnum(0);
+                    let re = num_val(bliss_rt::types::complex_realpart(v).unwrap_or(zero))?;
+                    let im = num_val(bliss_rt::types::complex_imagpart(v).unwrap_or(zero))?;
+                    return Ok(BlissVal::from_single_float((re * re + im * im).sqrt() as f32));
                 }
                 return Err(BlissError::TypeError {
                     datum: v,

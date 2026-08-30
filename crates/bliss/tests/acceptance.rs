@@ -2732,6 +2732,14 @@ fn complex_constructor_and_arithmetic() {
         // Division (exact rational parts) + unary reciprocal.
         ("(/ #c(1 2) #c(3 4))", "#C(11/25 2/25)"),
         ("(/ #c(1 2))", "#C(1/5 -2/5)"),
+        // ABS magnitude, CONJUGATE, PHASE, CIS (bliss-dhrx).
+        ("(abs #c(3 4))", "5.0"),
+        ("(conjugate #c(3 4))", "#C(3 -4)"),
+        ("(conjugate 5)", "5"),
+        ("(< (abs (- (phase #c(0 1)) 1.5707964)) 0.001)", "T"),
+        ("(< (abs (phase 5)) 0.001)", "T"),
+        ("(realpart (cis 0))", "1.0"),
+        ("(< (abs (imagpart (cis 0))) 0.001)", "T"),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
