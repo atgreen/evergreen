@@ -13507,41 +13507,29 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // bounded) substrings for character equality. The bounds were
                 // previously ignored, so (string= "xabcy" "abc" :start1 1 :end1 4)
                 // returned NIL (bliss-cnzs).
-                let (a, b) = string_compare_bounds(cdr, env)?;
+                let (a, b, _start1) = string_compare_bounds(cdr, env)?;
                 return Ok(if a == b { T } else { NIL });
             }
             "STRING<" => {
-                // ANSI: the mismatch index if string1 < string2, else NIL.
-                let (a, b) = {
-                    // Root both args across evaluation so a young arg list can't
-                    // dangle either (bliss-6b2 #2).
-                    let (af, r) = cp(cdr);
-                    bliss_rt::rooted!(bf = cp(r).0);
-                    bliss_rt::rooted!(a = eval_form(af, env)?);
-                    let b = eval_form(*bf, env)?;
-                    (*a, b)
-                };
-                let (i, ord) = string_mismatch(&val_as_str(a), &val_as_str(b));
+                // ANSI: the mismatch index (in string1's coordinates) if
+                // string1 < string2, else NIL — honoring the :start1/:end1/
+                // :start2/:end2 bounds, which used to be ignored (bliss-c62r).
+                let (a, b, start1) = string_compare_bounds(cdr, env)?;
+                let (i, ord) = string_mismatch(&a, &b);
                 return Ok(if ord == std::cmp::Ordering::Less {
-                    BlissVal::from_fixnum(i as i64)
+                    BlissVal::from_fixnum((start1 + i) as i64)
                 } else {
                     NIL
                 });
             }
             "STRING>" => {
-                // ANSI: the mismatch index if string1 > string2, else NIL.
-                let (a, b) = {
-                    // Root both args across evaluation so a young arg list can't
-                    // dangle either (bliss-6b2 #2).
-                    let (af, r) = cp(cdr);
-                    bliss_rt::rooted!(bf = cp(r).0);
-                    bliss_rt::rooted!(a = eval_form(af, env)?);
-                    let b = eval_form(*bf, env)?;
-                    (*a, b)
-                };
-                let (i, ord) = string_mismatch(&val_as_str(a), &val_as_str(b));
+                // ANSI: the mismatch index (in string1's coordinates) if
+                // string1 > string2, else NIL — honoring the bounding keywords
+                // (bliss-c62r).
+                let (a, b, start1) = string_compare_bounds(cdr, env)?;
+                let (i, ord) = string_mismatch(&a, &b);
                 return Ok(if ord == std::cmp::Ordering::Greater {
-                    BlissVal::from_fixnum(i as i64)
+                    BlissVal::from_fixnum((start1 + i) as i64)
                 } else {
                     NIL
                 });
@@ -17864,10 +17852,15 @@ fn find_key_arg(plist: &[BlissVal], kw_bare: &str) -> Option<BlissVal> {
 /// Evaluate the operands of a two-string comparator and apply the ANSI
 /// `:start1/:end1/:start2/:end2` bounding keywords (defaults: 0 and the string
 /// length; a NIL `:endN` also means the length). Returns the two bounded
-/// substrings ready for character comparison. GC-safe: `eval_args` returns
-/// rooted values and no Bliss allocation happens after the string contents are
-/// copied into owned Rust `String`s (bliss-cnzs).
-fn string_compare_bounds(cdr: BlissVal, env: &mut Env) -> Result<(String, String), BlissError> {
+/// substrings ready for character comparison, plus `start1` — the ordering
+/// comparators report the mismatch index in string1's ORIGINAL coordinates, so
+/// they add `start1` back to the substring-relative index. GC-safe: `eval_args`
+/// returns rooted values and no Bliss allocation happens after the string
+/// contents are copied into owned Rust `String`s (bliss-cnzs).
+fn string_compare_bounds(
+    cdr: BlissVal,
+    env: &mut Env,
+) -> Result<(String, String, usize), BlissError> {
     let args = eval_args(cdr, env)?;
     if args.len() < 2 {
         return Err(BlissError::ProgramError(
@@ -17891,7 +17884,7 @@ fn string_compare_bounds(cdr: BlissVal, env: &mut Env) -> Result<(String, String
     let end2 = bound("END2", s2.len()).min(s2.len()).max(start2);
     let sub1: String = s1[start1..end1].iter().collect();
     let sub2: String = s2[start2..end2].iter().collect();
-    Ok((sub1, sub2))
+    Ok((sub1, sub2, start1))
 }
 
 fn bind_lambda_list(

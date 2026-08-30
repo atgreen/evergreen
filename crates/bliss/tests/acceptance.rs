@@ -4334,6 +4334,12 @@ fn string_equal_honors_bounds_keywords() {
         ("(string= \"abc\" \"abd\")", "NIL"),
         ("(string-equal \"XABCY\" \"abc\" :start1 1 :end1 4)", "T"),
         ("(string-equal \"ABC\" \"abc\")", "T"),
+        // STRING< / STRING> honor the bounds too, and report the mismatch index
+        // in string1's original coordinates (start1 + offset). (bliss-c62r)
+        ("(string< \"Zabc\" \"abd\" :start1 1)", "3"),
+        ("(string< \"abc\" \"abd\")", "2"),
+        ("(string> \"abd\" \"abc\")", "2"),
+        ("(string< \"hello\" \"help\" :end1 3 :end2 3)", "NIL"),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin()
