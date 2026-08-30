@@ -3791,6 +3791,14 @@ fn char_string_and_list_functions() {
         ("(last '(1 2 3))", "(3)"),
         ("(butlast '(1 2 3))", "(1 2)"),
         ("(nthcdr 2 '(a b c d))", "(C D)"),
+        // NTH/NTHCDR reject a negative index with a catchable TYPE-ERROR
+        // instead of silently returning element 0 / the whole list (bliss-novy).
+        ("(handler-case (nth -1 '(1 2 3)) (type-error () :ok))", ":OK"),
+        (
+            "(handler-case (nthcdr -1 '(1 2 3)) (type-error () :ok))",
+            ":OK",
+        ),
+        ("(nth 2 '(a b c d))", "C"),
         ("(mapcan (function list) '(1 2 3))", "(1 2 3)"),
         ("(getf '(:a 1 :b 2) :b)", "2"),
         ("(nreverse (list 1 2 3))", "(3 2 1)"),

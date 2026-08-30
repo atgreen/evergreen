@@ -935,7 +935,11 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun nthcdr (n list)
-  (if (or (<= n 0) (null list)) list (nthcdr (- n 1) (cdr list))))
+  ;; ANSI: N is a non-negative integer; a negative index is a TYPE-ERROR
+  ;; (previously (<= n 0) silently returned the whole list).
+  (unless (and (integerp n) (>= n 0))
+    (error 'type-error :datum n :expected-type '(integer 0)))
+  (if (or (= n 0) (null list)) list (nthcdr (- n 1) (cdr list))))
 (defun last (list &optional (n 1))
   (nthcdr (max 0 (- (length list) n)) list))
 (defun butlast (list &optional (n 1))

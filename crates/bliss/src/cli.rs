@@ -10280,7 +10280,23 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         "NTH requires an index and a list".into(),
                     ));
                 }
-                let idx = num_val(args[0])? as usize;
+                // ANSI: NTH's index is a non-negative integer. A negative
+                // index (or a non-integer) is a TYPE-ERROR, not a saturated 0 —
+                // `num_val(-1) as usize` used to silently return element 0.
+                let nidx = args[0];
+                if !bliss_rt::types::integerp(nidx) || num_val(nidx)? < 0.0 {
+                    return Err(BlissError::TypeError {
+                        datum: nidx,
+                        expected: "(integer 0)".into(),
+                    });
+                }
+                // A valid fixnum index; any (non-negative) bignum is far past
+                // the end of a real list, so it reads as NIL.
+                let idx = if nidx.is_fixnum() {
+                    nidx.as_fixnum() as usize
+                } else {
+                    usize::MAX
+                };
                 let elems = list_to_vec(args[1]);
                 return Ok(if idx < elems.len() { elems[idx] } else { NIL });
             }
