@@ -3907,6 +3907,32 @@ fn format_fixed_float_directive() {
     }
 }
 
+/// Regression: FORMAT ~D honors its 3rd/4th params (comma character and comma
+/// interval); previously both were ignored and it always grouped by 3 with ','.
+/// (bliss-ycv8)
+#[test]
+fn format_decimal_comma_params() {
+    let cases = [
+        ("(format nil \"~:d\" 1234567)", "\"1,234,567\""),
+        ("(format nil \"~,,' ,4:d\" 12345678)", "\"1234 5678\""),
+        ("(format nil \"~,,'.:d\" 1234567)", "\"1.234.567\""),
+        ("(format nil \"~,,,2:d\" 1234)", "\"12,34\""),
+        ("(format nil \"~:d\" -1234567)", "\"-1,234,567\""),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin()
+            .args(["--eval", expr])
+            .output()
+            .expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(expected),
+            "{expr} => expected {expected}, got: {stdout}"
+        );
+    }
+}
+
 /// Regression: CHAR, ACONS, LIST-LENGTH, NCONC, REVAPPEND, MAKE-LIST,
 /// STRING-EQUAL, and SUBST were undefined. (bliss-2pt stdlib completeness.)
 #[test]

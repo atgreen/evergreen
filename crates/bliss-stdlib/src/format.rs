@@ -312,7 +312,7 @@ pub fn print_base() -> u32 {
 /// `*print-base*`. Shared by this printer and the interpreter's `print_val` so
 /// both tiers agree (bliss-82lz).
 pub fn fixnum_to_radix(n: i64, radix: u32) -> String {
-    format_integer(n, radix, false, false, 0, ' ')
+    format_integer(n, radix, false, false, 0, ' ', ',', 3)
 }
 
 thread_local! {
@@ -929,6 +929,7 @@ fn format_cons(v: BlissVal, escapep: bool) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_integer(
     n: i64,
     radix: u32,
@@ -936,6 +937,8 @@ fn format_integer(
     at_sign: bool,
     mincol: usize,
     padchar: char,
+    commachar: char,
+    comma_interval: usize,
 ) -> String {
     let negative = n < 0;
     let abs = if n == i64::MIN {
@@ -956,7 +959,7 @@ fn format_integer(
         d.chars().rev().collect()
     };
     let with_commas = if colon && radix == 10 {
-        insert_commas(&digits)
+        insert_commas(&digits, commachar, comma_interval)
     } else {
         digits
     };
@@ -998,11 +1001,14 @@ fn pad_format_field(
     }
 }
 
-fn insert_commas(s: &str) -> String {
+fn insert_commas(s: &str, commachar: char, interval: usize) -> String {
+    if interval == 0 {
+        return s.to_string();
+    }
     let mut result = String::new();
     for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
+        if i > 0 && i % interval == 0 {
+            result.push(commachar);
         }
         result.push(c);
     }
@@ -1655,6 +1661,19 @@ fn format_impl(
                 } else {
                     ' '
                 };
+                // Third/fourth ~D params are the comma character and comma
+                // interval (CLHS 22.3.2.1); `~,,' ,4:d` groups every 4 digits
+                // with a space. Previously both were ignored (hardcoded ",", 3).
+                let commachar = if params.len() > 2 {
+                    resolve_param(&params[2], ',' as i64, arg_idx)? as u8 as char
+                } else {
+                    ','
+                };
+                let comma_interval = if params.len() > 3 {
+                    resolve_param(&params[3], 3, arg_idx)? as usize
+                } else {
+                    3
+                };
                 if *arg_idx >= args.len() {
                     return Err(BlissError::Internal(format!(
                         "too few args for ~{}",
@@ -1676,6 +1695,8 @@ fn format_impl(
                     at_sign,
                     mincol,
                     padchar,
+                    commachar,
+                    comma_interval,
                 ));
             }
             'R' => {
@@ -1698,7 +1719,7 @@ fn format_impl(
                 }
                 let n = val.as_fixnum();
                 if let Some(radix) = radix_param {
-                    output.push_str(&format_integer(n, radix, colon, at_sign, 0, ' '));
+                    output.push_str(&format_integer(n, radix, colon, at_sign, 0, ' ', ',', 3));
                 } else if colon && at_sign {
                     output.push_str(&to_roman(n, true));
                 } else if at_sign {
