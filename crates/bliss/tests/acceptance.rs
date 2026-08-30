@@ -3799,6 +3799,11 @@ fn char_string_and_list_functions() {
             ":OK",
         ),
         ("(nth 2 '(a b c d))", "C"),
+        // MAKE-LIST / MAKE-ARRAY reject a negative size with a catchable
+        // TYPE-ERROR instead of a silently-empty result (bliss-czum).
+        ("(handler-case (make-list -1) (type-error () :ok))", ":OK"),
+        ("(handler-case (make-array -1) (type-error () :ok))", ":OK"),
+        ("(make-list 0)", "NIL"),
         ("(mapcan (function list) '(1 2 3))", "(1 2 3)"),
         ("(getf '(:a 1 :b 2) :b)", "2"),
         ("(nreverse (list 1 2 3))", "(3 2 1)"),

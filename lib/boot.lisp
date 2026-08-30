@@ -1031,7 +1031,16 @@
 (defun list-length (list) (length list))
 (defun nconc (&rest lists) (apply (function append) lists))
 (defun revappend (x y) (append (reverse x) y))
-(defun make-list (n &key initial-element) (loop repeat n collect initial-element))
+;; ANSI: a sequence/array size (and each array dimension) is a non-negative
+;; integer; a negative or non-integer value is a TYPE-ERROR, not a silently
+;; empty result. (make-list -1) used to return NIL; (make-array -1) => #().
+(defun %check-nonneg-index (d)
+  (unless (and (integerp d) (>= d 0))
+    (error 'type-error :datum d :expected-type '(integer 0))))
+
+(defun make-list (n &key initial-element)
+  (%check-nonneg-index n)
+  (loop repeat n collect initial-element))
 
 ;; Row-major flatten of nested :initial-contents matching DIMENSIONS: the
 ;; innermost axis contributes its elements; outer axes recurse and concatenate.
@@ -1055,6 +1064,12 @@
 ;; storage); rank-0/1 build a string (character element-type) or simple/complex
 ;; vector as before. :adjustable / :fill-pointer apply to the rank-1 vector case.
 (defun make-array (dimensions &rest keys)
+  ;; Each dimension must be a non-negative integer (a list of them for rank ≥ 2,
+  ;; or a bare integer for a vector). An empty list falls through to the
+  ;; existing rank-0 path.
+  (if (listp dimensions)
+      (dolist (d dimensions) (%check-nonneg-index d))
+      (%check-nonneg-index dimensions))
   (let* ((size (if (consp dimensions) (car dimensions) dimensions))
          (iel-cell (member :initial-element keys))
          (ic-cell (member :initial-contents keys))
