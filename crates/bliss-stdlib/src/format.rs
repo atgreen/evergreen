@@ -69,6 +69,38 @@ fn extract_bliss_string(v: BlissVal) -> Option<String> {
 /// when unbound or out of range. Reads via `find_index` (the reliable registry
 /// lookup), NOT `resolve_sym`, which mints a distinct symbol whose cell stays at
 /// the default.
+/// Apply `*PRINT-CASE*` to an (internally upper-case) symbol name for output.
+/// `:UPCASE` (the default) leaves it unchanged; `:DOWNCASE` lower-cases; and
+/// `:CAPITALIZE` title-cases each alphanumeric word. CLHS 22.1.3.3.
+pub fn apply_print_case(name: &str) -> String {
+    let case = bliss_rt::symbols::find_index("*PRINT-CASE*")
+        .and_then(bliss_rt::symbols::symbol_value)
+        .filter(|v| v.is_symbol())
+        .and_then(|v| bliss_compiler::reader::symbol_name(v.as_symbol_index()));
+    match case.as_deref() {
+        Some("KEYWORD:DOWNCASE") => name.to_lowercase(),
+        Some("KEYWORD:CAPITALIZE") => {
+            let mut out = String::with_capacity(name.len());
+            let mut word_start = true;
+            for c in name.chars() {
+                if c.is_alphanumeric() {
+                    if word_start {
+                        out.extend(c.to_uppercase());
+                    } else {
+                        out.extend(c.to_lowercase());
+                    }
+                    word_start = false;
+                } else {
+                    out.push(c);
+                    word_start = true;
+                }
+            }
+            out
+        }
+        _ => name.to_string(), // :UPCASE or unset
+    }
+}
+
 pub fn print_base() -> u32 {
     bliss_rt::symbols::find_index("*PRINT-BASE*")
         .and_then(bliss_rt::symbols::symbol_value)
@@ -484,10 +516,11 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
             .or_else(|| name.strip_prefix("KEYWORD:"))
         {
             // prin1/~S prints the readable `:FOO`; princ/~A drops the marker.
+            let bare = apply_print_case(bare);
             return if escapep {
                 format!(":{}", bare)
             } else {
-                bare.to_string()
+                bare
             };
         }
         // An uninterned symbol (make-symbol/gensym, no home package) prints as
@@ -496,12 +529,10 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         // slynk's UNPARSE-NAME relies on this: `(subseq (prin1-to-string
         // (make-symbol s)) 2)` strips the `#:` — without it that subseq errors.
         if bliss_compiler::reader::is_uninterned(idx) {
+            let name = apply_print_case(&name);
             return if escapep { format!("#:{}", name) } else { name };
         }
-        if escapep {
-            return name;
-        }
-        return name.trim_start_matches("KEYWORD:").to_string();
+        return apply_print_case(name.trim_start_matches("KEYWORD:"));
     }
     // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not the data
     // list it is structurally — print it as #<FUNCTION> (matches cli print_val).

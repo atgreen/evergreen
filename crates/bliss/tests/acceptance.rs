@@ -1768,6 +1768,31 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// *PRINT-CASE* (was ignored) controls how symbol names are cased on output:
+/// :UPCASE (default), :DOWNCASE, :CAPITALIZE — in prin1/princ/format/write.
+#[test]
+fn print_case_variable() {
+    let cases = [
+        ("(let ((*print-case* :downcase)) (prin1-to-string 'foo-bar))", "\"foo-bar\""),
+        ("(let ((*print-case* :capitalize)) (prin1-to-string 'foo-bar))", "\"Foo-Bar\""),
+        ("(let ((*print-case* :upcase)) (prin1-to-string 'foo-bar))", "\"FOO-BAR\""),
+        ("(prin1-to-string 'foo-bar)", "\"FOO-BAR\""),
+        // Keyword keeps its colon; the name is cased.
+        ("(let ((*print-case* :downcase)) (prin1-to-string :my-key))", "\":my-key\""),
+        // Applies recursively and through format/write.
+        ("(let ((*print-case* :downcase)) (prin1-to-string '(a b (c d))))", "\"(a b (c d))\""),
+        ("(let ((*print-case* :downcase)) (format nil \"~a\" 'hello))", "\"hello\""),
+        ("(let ((*print-case* :downcase)) (write-to-string 'abc))", "\"abc\""),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// MAP-INTO (was undefined) destructively fills the result sequence with the
 /// results of applying the function to successive elements, up to the shortest
 /// input length (or the whole result when there are no input sequences).

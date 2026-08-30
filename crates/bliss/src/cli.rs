@@ -4373,14 +4373,15 @@ fn print_val(val: BlissVal, out: &mut String) {
         let name = sym_name(val);
         if let Some(bare) = name.strip_prefix("KEYWORD:") {
             out.push(':');
-            out.push_str(bare);
+            // *PRINT-CASE* applies to symbol names (CLHS 22.1.3.3).
+            out.push_str(&bliss_stdlib::format::apply_print_case(bare));
         } else {
             // Uninterned symbols (make-symbol/gensym) print with the `#:` prefix
             // under prin1/~S so they read back as fresh uninterned symbols.
             if bliss_compiler::reader::is_uninterned(val.as_symbol_index()) {
                 out.push_str("#:");
             }
-            out.push_str(&name);
+            out.push_str(&bliss_stdlib::format::apply_print_case(&name));
         }
     } else if is_closure_cons(val) {
         // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not data.
