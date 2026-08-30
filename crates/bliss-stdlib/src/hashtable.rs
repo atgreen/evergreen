@@ -250,9 +250,61 @@ fn vector_elt(v: BlissVal, idx: usize) -> BlissVal {
 ///
 /// Recurses into cons cells and compares strings by content
 /// (case-sensitive).  All other types fall back to bit (EQL) equality.
+/// Value equality for two heap numerics of the SAME type (bignum/ratio/complex/
+/// double-float) — so two distinct objects with equal value compare equal under
+/// EQL/EQUAL/EQUALP. Returns false for non-heap-numeric or mismatched types.
+fn heap_numeric_equal(a: BlissVal, b: BlissVal) -> bool {
+    if !a.is_heap_object() || !b.is_heap_object() {
+        return false;
+    }
+    let (ta, tb) = unsafe {
+        (
+            (*(a.as_ptr() as *const ObjectHeader)).type_id(),
+            (*(b.as_ptr() as *const ObjectHeader)).type_id(),
+        )
+    };
+    if ta != tb {
+        return false;
+    }
+    unsafe {
+        let (pa, pb) = (a.as_ptr(), b.as_ptr());
+        match ta {
+            type_id::BIGNUM => {
+                let (sa, na) = (
+                    *(pa.add(8) as *const i32),
+                    *(pa.add(12) as *const u32) as usize,
+                );
+                let (sb, nb) = (
+                    *(pb.add(8) as *const i32),
+                    *(pb.add(12) as *const u32) as usize,
+                );
+                sa == sb
+                    && na == nb
+                    && (0..na).all(|i| {
+                        *(pa.add(16 + i * 8) as *const u64) == *(pb.add(16 + i * 8) as *const u64)
+                    })
+            }
+            type_id::RATIO | type_id::COMPLEX => {
+                let a0 = *(pa.add(8) as *const BlissVal);
+                let a1 = *(pa.add(16) as *const BlissVal);
+                let b0 = *(pb.add(8) as *const BlissVal);
+                let b1 = *(pb.add(16) as *const BlissVal);
+                (a0.0 == b0.0 || heap_numeric_equal(a0, b0))
+                    && (a1.0 == b1.0 || heap_numeric_equal(a1, b1))
+            }
+            type_id::DOUBLE_FLOAT => *(pa.add(8) as *const f64) == *(pb.add(8) as *const f64),
+            _ => false,
+        }
+    }
+}
+
 fn cl_equal(a: BlissVal, b: BlissVal) -> bool {
     // Fast path: identical bits ⇒ always equal.
     if a.0 == b.0 {
+        return true;
+    }
+    // Distinct heap numerics with equal value (EQUAL is EQL on numbers).
+    if heap_numeric_equal(a, b) {
         return true;
     }
 
@@ -322,6 +374,10 @@ fn cl_equalp(a: BlissVal, b: BlissVal) -> bool {
     if a.is_single_float() && b.is_single_float() {
         return a.as_single_float() == b.as_single_float();
     }
+    // Distinct heap numerics (bignum/ratio/complex/double) with equal value.
+    if heap_numeric_equal(a, b) {
+        return true;
+    }
 
     // Cons cells: recurse with equalp semantics.
     if a.tag() == TAG_CONS && b.tag() == TAG_CONS {
@@ -372,7 +428,9 @@ fn cl_equalp(a: BlissVal, b: BlissVal) -> bool {
 ///   and characters, numeric cross-type comparison.
 fn keys_equal(a: BlissVal, b: BlissVal, test: HashTest) -> bool {
     match test {
-        HashTest::Eq | HashTest::Eql => a.0 == b.0,
+        HashTest::Eq => a.0 == b.0,
+        // EQL of two distinct heap numerics is T by value (e.g. two bignums).
+        HashTest::Eql => a.0 == b.0 || heap_numeric_equal(a, b),
         HashTest::Equal => cl_equal(a, b),
         HashTest::Equalp => cl_equalp(a, b),
     }
@@ -401,9 +459,55 @@ fn combine_hashes(a: u64, b: u64) -> u64 {
     a.rotate_left(13) ^ b.rotate_right(7) ^ 0x9e37_79b9_7f4a_7c15
 }
 
+/// Value-based hash for a heap numeric (bignum / ratio / complex / double-float)
+/// so two distinct-but-numerically-equal objects hash equal — otherwise a hash
+/// table keyed on such a value never finds its entry, because the fall-through
+/// hashed the object's ADDRESS (`object.0`) rather than its value. Returns `None`
+/// for anything that is not a heap numeric.
+fn numeric_value_hash(object: BlissVal, depth: usize) -> Option<u64> {
+    if depth == 0 || !object.is_heap_object() {
+        return None;
+    }
+    let tid = unsafe { (*(object.as_ptr() as *const ObjectHeader)).type_id() };
+    unsafe {
+        let p = object.as_ptr();
+        match tid {
+            type_id::BIGNUM => {
+                let sign = *(p.add(8) as *const i32);
+                let n = *(p.add(12) as *const u32) as usize;
+                let mut h = hash_u64(sign as u64);
+                for i in 0..n {
+                    h = combine_hashes(h, hash_u64(*(p.add(16 + i * 8) as *const u64)));
+                }
+                Some(h)
+            }
+            type_id::RATIO | type_id::COMPLEX => {
+                // RatioData / ComplexData both hold two BlissVal parts at +8/+16.
+                let a = *(p.add(8) as *const BlissVal);
+                let b = *(p.add(16) as *const BlissVal);
+                Some(combine_hashes(
+                    numeric_or_scalar_hash(a, depth - 1),
+                    numeric_or_scalar_hash(b, depth - 1),
+                ))
+            }
+            type_id::DOUBLE_FLOAT => Some(hash_u64((*(p.add(8) as *const f64)).to_bits())),
+            _ => None,
+        }
+    }
+}
+
+/// Hash a numeric part by value: a heap numeric via [`numeric_value_hash`], an
+/// immediate (fixnum / single-float) by its bits.
+fn numeric_or_scalar_hash(object: BlissVal, depth: usize) -> u64 {
+    numeric_value_hash(object, depth).unwrap_or_else(|| hash_u64(object.0))
+}
+
 fn equal_hash(object: BlissVal, depth: usize) -> u64 {
     if depth == 0 {
         return 0;
+    }
+    if let Some(h) = numeric_value_hash(object, depth) {
+        return h;
     }
     if object.tag() == TAG_CONS {
         unsafe {
@@ -444,6 +548,9 @@ fn equalp_hash(object: BlissVal, depth: usize) -> u64 {
     if object.is_single_float() {
         return hash_u64((object.as_single_float() as f64).to_bits());
     }
+    if let Some(h) = numeric_value_hash(object, depth) {
+        return h;
+    }
     if object.tag() == TAG_CONS {
         unsafe {
             let cell = &*(object.as_ptr() as *const ConsCell);
@@ -472,7 +579,11 @@ fn equalp_hash(object: BlissVal, depth: usize) -> u64 {
 
 fn hash_for_test(object: BlissVal, test: HashTest) -> u64 {
     match test {
-        HashTest::Eq | HashTest::Eql => hash_u64(object.0),
+        // EQL of two distinct heap numerics (bignum/ratio/complex) is T by value,
+        // so they must hash by value, not address (EQ stays identity-based).
+        HashTest::Eq => hash_u64(object.0),
+        HashTest::Eql => numeric_value_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT)
+            .unwrap_or_else(|| hash_u64(object.0)),
         HashTest::Equal => equal_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT),
         HashTest::Equalp => equalp_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT),
     }

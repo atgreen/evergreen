@@ -10419,6 +10419,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let tbl = eval_form(tbl_form, env)?;
                 return Ok(if is_hash_table_value(tbl) { T } else { NIL });
             }
+            "HASH-TABLE-TEST" => {
+                let (tbl_form, _) = cp(cdr);
+                let tbl = eval_form(tbl_form, env)?;
+                let name = match bliss_stdlib::hash_table_test(tbl)? {
+                    bliss_stdlib::HashTest::Eq => "EQ",
+                    bliss_stdlib::HashTest::Eql => "EQL",
+                    bliss_stdlib::HashTest::Equal => "EQUAL",
+                    bliss_stdlib::HashTest::Equalp => "EQUALP",
+                };
+                return Ok(resolve_sym(name).unwrap_or(NIL));
+            }
             "HASH-TABLE-KEYS" | "HASH-TABLE-VALUES" => {
                 // alexandria's HASH-TABLE-KEYS/VALUES (used pervasively — babel's
                 // instantiate-concrete-mappings iterates the encoding keys). These
@@ -20422,7 +20433,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "COERCE" | "TYPE-OF" | "TYPEP" | "SUBTYPEP" | "DOCUMENTATION"
             // Hash tables
             | "MAKE-HASH-TABLE" | "GETHASH" | "REMHASH" | "CLRHASH" | "MAPHASH"
-            | "HASH-TABLE-COUNT" | "HASH-TABLE-P" | "HASH-TABLE-KEYS" | "HASH-TABLE-VALUES"
+            | "HASH-TABLE-COUNT" | "HASH-TABLE-P" | "HASH-TABLE-TEST" | "HASH-TABLE-KEYS"
+            | "HASH-TABLE-VALUES"
             // Pathnames / files
             | "PATHNAME" | "NAMESTRING" | "MERGE-PATHNAMES" | "MAKE-PATHNAME"
             | "PATHNAME-NAME" | "PATHNAME-TYPE" | "PATHNAME-DIRECTORY" | "PATHNAME-HOST"

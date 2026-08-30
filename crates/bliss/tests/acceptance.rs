@@ -1768,6 +1768,38 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// Heap numerics (bignum/ratio/complex/double-float) hash and compare by VALUE,
+/// so they work as hash-table keys under EQL/EQUAL/EQUALP — previously SXHASH and
+/// the key comparison used the object's address, so two distinct-but-equal keys
+/// never matched. Also HASH-TABLE-TEST (was undefined).
+#[test]
+fn hash_tables_with_heap_numeric_keys() {
+    let cases = [
+        // SXHASH is value-consistent for heap numerics.
+        ("(= (sxhash #c(1 2)) (sxhash #c(1 2)))", "T"),
+        ("(= (sxhash (expt 2 70)) (sxhash (expt 2 70)))", "T"),
+        ("(= (sxhash (/ 1 3)) (sxhash (/ 1 3)))", "T"),
+        // Keys found under each test.
+        ("(let ((h (make-hash-table :test 'equal))) (setf (gethash #c(1 2) h) :cx) (gethash #c(1 2) h))", ":CX"),
+        ("(let ((h (make-hash-table :test 'eql))) (setf (gethash #c(1 2) h) :x) (gethash #c(1 2) h))", ":X"),
+        ("(let ((h (make-hash-table :test 'equal))) (setf (gethash (/ 1 3) h) :r) (gethash (/ 1 3) h))", ":R"),
+        ("(let ((h (make-hash-table :test 'eql))) (setf (gethash (expt 2 70) h) :b) (gethash (expt 2 70) h))", ":B"),
+        // Regressions: fixnum/string/list keys unaffected.
+        ("(let ((h (make-hash-table))) (setf (gethash 1.5 h) :f) (gethash 1.5 h))", ":F"),
+        ("(let ((h (make-hash-table :test 'equal))) (setf (gethash (list 1 2) h) :l) (gethash (list 1 2) h))", ":L"),
+        // HASH-TABLE-TEST.
+        ("(hash-table-test (make-hash-table :test 'equal))", "EQUAL"),
+        ("(hash-table-test (make-hash-table))", "EQL"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// A non-local exit with no active target — THROW to a tag with no CATCH, GO to
 /// a dead tag, RETURN-FROM to a dead block — signals a catchable CONTROL-ERROR
 /// (CLHS 5.2), not an uncatchable internal error. Covers both the tree-walker
