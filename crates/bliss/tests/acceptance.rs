@@ -1768,6 +1768,34 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// *PRINT-LENGTH* (truncate a list with `...` after N elements) and *PRINT-LEVEL*
+/// (print `#` past a nesting depth) — both were ignored, so lists always printed
+/// in full.
+#[test]
+fn print_length_and_level() {
+    let cases = [
+        ("(let ((*print-length* 3)) (prin1-to-string '(1 2 3 4 5)))", "\"(1 2 3 ...)\""),
+        ("(let ((*print-length* 2)) (prin1-to-string '(a b c)))", "\"(A B ...)\""),
+        // Fewer than the limit prints in full (no ...).
+        ("(let ((*print-length* 3)) (prin1-to-string '(1 2)))", "\"(1 2)\""),
+        ("(let ((*print-level* 2)) (prin1-to-string '(1 (2 (3 (4))))))", "\"(1 (2 #))\""),
+        ("(let ((*print-level* 1)) (prin1-to-string '(1 (2) 3)))", "\"(1 # 3)\""),
+        ("(let ((*print-level* 0)) (prin1-to-string '(1 2)))", "\"#\""),
+        // Combined, and honored via FORMAT ~A.
+        ("(let ((*print-length* 3) (*print-level* 2)) (prin1-to-string '(1 2 3 4 (5 (6 7)))))", "\"(1 2 3 ...)\""),
+        ("(let ((*print-length* 2)) (format nil \"~a\" '(a b c d)))", "\"(A B ...)\""),
+        // Default (unbounded) is unchanged.
+        ("(prin1-to-string '(1 2 3 4 5))", "\"(1 2 3 4 5)\""),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// *PRINT-CASE* (was ignored) controls how symbol names are cased on output:
 /// :UPCASE (default), :DOWNCASE, :CAPITALIZE — in prin1/princ/format/write.
 #[test]

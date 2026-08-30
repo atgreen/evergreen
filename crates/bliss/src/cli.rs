@@ -4310,6 +4310,13 @@ fn print_md_nested(base: *const u8, dims: &[usize], start: usize, out: &mut Stri
     consumed
 }
 
+thread_local! {
+    /// Current structural nesting depth for *PRINT-LEVEL* (0 at the top level).
+    /// Incremented around each list body; balanced, so it returns to 0 after a
+    /// top-level print.
+    static PRINT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn print_val(val: BlissVal, out: &mut String) {
     if val.is_nil() {
         out.push_str("NIL");
@@ -4387,9 +4394,17 @@ fn print_val(val: BlissVal, out: &mut String) {
         // An interpreter closure `(BLISS::CLOSURE . id)` is a function, not data.
         out.push_str("#<FUNCTION>");
     } else if val.is_cons() {
-        out.push('(');
-        print_list_body(val, out);
-        out.push(')');
+        // *PRINT-LEVEL*: past the depth limit, a nested list prints as `#`.
+        let depth = PRINT_DEPTH.with(|d| d.get());
+        if bliss_stdlib::format::print_level().is_some_and(|lvl| depth >= lvl) {
+            out.push('#');
+        } else {
+            out.push('(');
+            PRINT_DEPTH.with(|d| d.set(depth + 1));
+            print_list_body(val, out);
+            PRINT_DEPTH.with(|d| d.set(depth));
+            out.push(')');
+        }
     } else if val.is_heap_object() {
         if let Some(s) = bliss_stdlib::registered_string(val) {
             out.push('"');
@@ -4539,18 +4554,27 @@ fn print_val(val: BlissVal, out: &mut String) {
 
 #[inline]
 fn print_list_body(val: BlissVal, out: &mut String) {
+    // *PRINT-LENGTH*: after this many elements, print `...` and stop.
+    let limit = bliss_stdlib::format::print_length();
     let mut cur = val;
-    let mut first = true;
+    let mut count = 0usize;
     while cur.is_cons() {
-        if !first {
+        if limit.is_some_and(|n| count >= n) {
+            if count > 0 {
+                out.push(' ');
+            }
+            out.push_str("...");
+            return;
+        }
+        if count > 0 {
             out.push(' ');
         }
-        first = false;
         unsafe {
             let c = cur.as_ptr() as *const ConsCell;
             print_val((*c).car, out);
             cur = (*c).cdr;
         }
+        count += 1;
     }
     if !cur.is_nil() {
         out.push_str(" . ");

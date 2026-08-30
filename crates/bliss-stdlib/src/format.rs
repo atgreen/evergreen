@@ -22,6 +22,12 @@ pub fn set_print_object_hook(hook: Option<PrintObjectHook>) {
     *PRINT_OBJECT_HOOK.lock().unwrap() = hook;
 }
 
+thread_local! {
+    /// Structural nesting depth for *PRINT-LEVEL* (0 at the top level).
+    /// Incremented around each list body; balanced, so it returns to 0.
+    static PRINT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn dispatch_print_object(v: BlissVal, escapep: bool) -> Option<String> {
     let hook = *PRINT_OBJECT_HOOK.lock().unwrap();
     hook.and_then(|h| h(v, escapep))
@@ -99,6 +105,24 @@ pub fn apply_print_case(name: &str) -> String {
         }
         _ => name.to_string(), // :UPCASE or unset
     }
+}
+
+/// `*PRINT-LENGTH*`: the max number of elements of a list/vector to print before
+/// `...`, or `None` (unbounded) when the variable is NIL/unset.
+pub fn print_length() -> Option<usize> {
+    bliss_rt::symbols::find_index("*PRINT-LENGTH*")
+        .and_then(bliss_rt::symbols::symbol_value)
+        .filter(|v| v.is_fixnum())
+        .map(|v| v.as_fixnum().max(0) as usize)
+}
+
+/// `*PRINT-LEVEL*`: the max nesting depth to print before `#`, or `None`
+/// (unbounded) when the variable is NIL/unset.
+pub fn print_level() -> Option<usize> {
+    bliss_rt::symbols::find_index("*PRINT-LEVEL*")
+        .and_then(bliss_rt::symbols::symbol_value)
+        .filter(|v| v.is_fixnum())
+        .map(|v| v.as_fixnum().max(0) as usize)
 }
 
 pub fn print_base() -> u32 {
@@ -540,7 +564,15 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
         return "#<FUNCTION>".to_string();
     }
     if v.is_cons() {
-        return format_cons(v, escapep);
+        // *PRINT-LEVEL*: past the depth limit, a nested list prints as `#`.
+        let depth = PRINT_DEPTH.with(|d| d.get());
+        if print_level().is_some_and(|lvl| depth >= lvl) {
+            return "#".to_string();
+        }
+        PRINT_DEPTH.with(|d| d.set(depth + 1));
+        let s = format_cons(v, escapep);
+        PRINT_DEPTH.with(|d| d.set(depth));
+        return s;
     }
     if v.is_heap_object() {
         // Pathnames are registry-backed pseudo-heap values: render via their
@@ -656,20 +688,29 @@ fn instance_class_tag(v: BlissVal) -> String {
 /// recursively, and dotted tails as `(a . b)`. `escapep` propagates so `~S`
 /// escapes strings and characters inside the list.
 fn format_cons(v: BlissVal, escapep: bool) -> String {
+    // *PRINT-LENGTH*: after this many elements, print `...` and stop.
+    let limit = print_length();
     let mut out = String::from("(");
     let mut current = v;
-    let mut first = true;
+    let mut count = 0usize;
     loop {
         if current.is_cons() {
-            unsafe {
-                let ptr = current.as_ptr() as *const bliss_rt::object::ConsCell;
-                if !first {
+            if limit.is_some_and(|n| count >= n) {
+                if count > 0 {
                     out.push(' ');
                 }
-                first = false;
+                out.push_str("...");
+                break;
+            }
+            unsafe {
+                let ptr = current.as_ptr() as *const bliss_rt::object::ConsCell;
+                if count > 0 {
+                    out.push(' ');
+                }
                 out.push_str(&blissval_to_print_string((*ptr).car, escapep));
                 current = (*ptr).cdr;
             }
+            count += 1;
         } else if current.is_nil() {
             break;
         } else {
