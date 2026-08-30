@@ -2257,19 +2257,31 @@ fn format_impl(
                         *arg_idx += 1; // consume the nil
                     }
                 } else {
-                    // Numeric conditional
-                    if *arg_idx >= args.len() {
-                        return Err(BlissError::Internal("too few args for ~[".into()));
-                    }
-                    let val = args[*arg_idx];
-                    *arg_idx += 1;
-                    if !val.is_fixnum() {
-                        return Err(BlissError::TypeError {
-                            datum: val,
-                            expected: "integer".into(),
-                        });
-                    }
-                    let idx = val.as_fixnum() as usize;
+                    // Numeric conditional. An explicit prefix parameter (~n[ or
+                    // ~#[) supplies the selector directly WITHOUT consuming an
+                    // argument — `#` resolves to the number of remaining args, so
+                    // `~#[none~;one~:;many~]` dispatches on the arg count (CLHS
+                    // 22.3.7.2). Otherwise the next argument is the selector, which
+                    // must be an integer (bliss-qzxu).
+                    let idx_i64 = if params.first().is_some_and(|p| !matches!(p, Param::None)) {
+                        resolve_param(&params[0], 0, arg_idx)?
+                    } else {
+                        if *arg_idx >= args.len() {
+                            return Err(BlissError::Internal("too few args for ~[".into()));
+                        }
+                        let val = args[*arg_idx];
+                        *arg_idx += 1;
+                        if !val.is_fixnum() {
+                            return Err(BlissError::TypeError {
+                                datum: val,
+                                expected: "integer".into(),
+                            });
+                        }
+                        val.as_fixnum()
+                    };
+                    // A negative selector wraps to a huge usize -> out of range ->
+                    // the ~:; default clause (if any), matching an unmatched index.
+                    let idx = idx_i64 as usize;
                     // An in-range index selects that clause; otherwise fall back
                     // to the `~:;` default clause if the body has one (bliss-mrmv).
                     let chosen = if idx < clauses.len() {

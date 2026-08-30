@@ -3974,6 +3974,13 @@ fn format_decimal_comma_params() {
         ("(format nil \"~0{~a ~}\" '(1 2 3))", "\"\""),
         ("(format nil \"~2@{~a ~}\" 1 2 3 4)", "\"1 2 \""),
         ("(format nil \"~{~a ~}\" '(1 2 3 4))", "\"1 2 3 4 \""),
+        // ~#[ dispatches on the remaining-arg count (was an uncatchable error),
+        // and an explicit ~n[ prefix param selects without consuming an arg.
+        // (bliss-qzxu)
+        ("(format nil \"~#[none~;one~:;many~]\")", "\"none\""),
+        ("(format nil \"~#[none~;one~:;many~]\" 'a)", "\"one\""),
+        ("(format nil \"~#[none~;one~:;many~]\" 'a 'b 'c)", "\"many\""),
+        ("(format nil \"~2[a~;b~;c~]\")", "\"c\""),
         // ~D/~X/~B render bignums (previously type-errored on non-fixnums,
         // though ~A/PRINT rendered them). (bliss-0mh7)
         ("(format nil \"~d\" (expt 2 70))", "\"1180591620717411303424\""),
