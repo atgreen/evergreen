@@ -3804,6 +3804,11 @@ fn char_string_and_list_functions() {
         ("(handler-case (make-list -1) (type-error () :ok))", ":OK"),
         ("(handler-case (make-array -1) (type-error () :ok))", ":OK"),
         ("(make-list 0)", "NIL"),
+        // ASSOC honors :test and :key (previously both were dropped, so a
+        // :test '= match on a float and a :key transform silently failed).
+        ("(assoc 2.0 '((1 . a) (2 . b)) :test '=)", "(2 . B)"),
+        ("(assoc 3 '((1 . a) (2 . b) (3 . c)) :key '1+)", "(2 . B)"),
+        ("(assoc 2 '((1 . a) (2 . b)) :test-not '=)", "(1 . A)"),
         ("(mapcan (function list) '(1 2 3))", "(1 2 3)"),
         ("(getf '(:a 1 :b 2) :b)", "2"),
         ("(nreverse (list 1 2 3))", "(3 2 1)"),

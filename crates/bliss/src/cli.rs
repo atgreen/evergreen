@@ -10694,21 +10694,55 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(NIL);
             }
             "ASSOC" => {
-                let (key_f, r) = cp(cdr);
-                bliss_rt::rooted!(alist_f = cp(r).0);
-                bliss_rt::rooted!(key = eval_form(key_f, env)?);
-                let alist = eval_form(*alist_f, env)?;
-                let key = *key;
-                let mut c = alist;
+                // (assoc item alist &key key test test-not) — previously the
+                // &key arguments were dropped entirely and every entry compared
+                // with vals_equal, so `(assoc 2.0 '((2 . b)) :test '=)` returned
+                // NIL and `:key` was ignored. Mirror MEMBER: honor :key/:test/
+                // :test-not, applying :key to each entry's CAR. GC-rooting mirrors
+                // MEMBER exactly (the :key/:test calls run arbitrary Lisp that can
+                // relocate the nursery; bliss-4bp).
+                let (item_f, r) = cp(cdr);
+                let (alist_f, kwrest) = cp(r);
+                bliss_rt::rooted!(alist_f = alist_f);
+                bliss_rt::rooted!(kwrest = kwrest);
+                bliss_rt::rooted!(item = eval_form(item_f, env)?);
+                bliss_rt::rooted!(c = eval_form(*alist_f, env)?);
+                let kwargs = eval_args(*kwrest, env)?;
+                let has_key = matches!(find_key_arg(&kwargs, "KEY"), Some(v) if v != NIL);
+                let has_test = find_key_arg(&kwargs, "TEST").is_some();
+                let has_test_not = find_key_arg(&kwargs, "TEST-NOT").is_some();
+                let mut fns = vec![
+                    find_key_arg(&kwargs, "KEY").unwrap_or(NIL),
+                    find_key_arg(&kwargs, "TEST").unwrap_or(NIL),
+                    find_key_arg(&kwargs, "TEST-NOT").unwrap_or(NIL),
+                ];
+                bliss_rt::rooted_ref!(_fns_root = &mut fns);
                 while c.is_cons() {
-                    let (pair, rest) = cp(c);
+                    let (pair, _) = cp(*c);
+                    // Skip NIL entries; only compare against real (cons) pairs.
                     if pair.is_cons() {
                         let (k, _) = cp(pair);
-                        if vals_equal(k, key) {
-                            return Ok(pair);
+                        let probe = if has_key {
+                            apply_function(fns[0], &[k], env)?
+                        } else {
+                            k
+                        };
+                        let matched = if has_test {
+                            apply_function(fns[1], &[*item, probe], env)? != NIL
+                        } else if has_test_not {
+                            apply_function(fns[2], &[*item, probe], env)? == NIL
+                        } else {
+                            vals_equal(probe, *item)
+                        };
+                        if matched {
+                            // Re-read the (rooted, GC-current) pair after the
+                            // allocating calls — a copy from before is stale.
+                            let (fresh_pair, _) = cp(*c);
+                            return Ok(fresh_pair);
                         }
                     }
-                    c = rest;
+                    let (_, next) = cp(*c);
+                    *c = next;
                 }
                 return Ok(NIL);
             }
