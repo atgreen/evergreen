@@ -1829,6 +1829,49 @@ fn print_length_and_level() {
     }
 }
 
+/// prin1/~S escape `"` and `\` inside a string so the printed form reads back
+/// (CLHS 22.1.3.4). The stdlib printer (prin1-to-string / write-to-string /
+/// FORMAT ~S) previously emitted the raw body, so the output did not round-trip
+/// and disagreed with the cli prin1 builtin. (bliss-i608)
+#[test]
+fn prin1_escapes_string_body_for_roundtrip() {
+    let cases = [
+        // read of the printed form equals the original string.
+        (
+            r#"(equal "a\"b" (read-from-string (prin1-to-string "a\"b")))"#,
+            "T",
+        ),
+        (
+            r#"(equal "back\\slash" (read-from-string (prin1-to-string "back\\slash")))"#,
+            "T",
+        ),
+        // stdlib (prin1-to-string) and cli (prin1 to a stream) paths agree.
+        (
+            r#"(equal (prin1-to-string "x\"y\\z") (with-output-to-string (o) (prin1 "x\"y\\z" o)))"#,
+            "T",
+        ),
+        // write-to-string escapes too; a plain string is unchanged.
+        (
+            r#"(equal "plain" (read-from-string (write-to-string "plain")))"#,
+            "T",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got}");
+    }
+}
+
 /// COERCE must not silently return a wrong value for a non-coercible target:
 /// an integer is not a character designator (65 was becoming #\6), and there is
 /// no coercion to INTEGER/RATIONAL/REAL/NUMBER — a mismatched object type-errors

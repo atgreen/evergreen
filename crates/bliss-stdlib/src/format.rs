@@ -641,6 +641,23 @@ fn cons_list_to_vec(v: BlissVal) -> Vec<BlissVal> {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
+/// Escape a string body for prin1/~S (`*print-escape*` true): precede each `"`
+/// and `\` with `\` so the printed `"…"` reads back as the same string
+/// (CLHS 22.1.3.4). Matches cli::print_val's SIMPLE_BASE_STRING escaping — the
+/// stdlib printer (prin1-to-string / write-to-string / FORMAT ~S) previously
+/// emitted the raw body, so `(prin1-to-string "a\"b")` did not round-trip
+/// (bliss-str-esc).
+fn escape_string_body(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
     // Establish (at the outermost level) the *print-circle* label table, so
     // shared/circular structure prints with #N=/#N# instead of looping.
@@ -763,9 +780,13 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
         if crate::pathnames::is_pathname(v) {
             if let Ok(ns) = crate::pathnames::namestring(v) {
                 if let Some(s) = extract_bliss_string(ns) {
-                    // Match cli's print_val: quoted namestring under prin1/~S,
-                    // bare namestring under princ/~A.
-                    return if escapep { format!("\"{}\"", s) } else { s };
+                    // Match cli's print_val: quoted (and body-escaped)
+                    // namestring under prin1/~S, bare namestring under princ/~A.
+                    return if escapep {
+                        format!("\"{}\"", escape_string_body(&s))
+                    } else {
+                        s
+                    };
                 }
             }
         }
@@ -774,7 +795,11 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
         // value whose `as_ptr()` must not be dereferenced (extract_bliss_string
         // resolves it via the registry); a real string is consumed here too.
         if let Some(s) = extract_bliss_string(v) {
-            return if escapep { format!("\"{}\"", s) } else { s };
+            return if escapep {
+                format!("\"{}\"", escape_string_body(&s))
+            } else {
+                s
+            };
         }
         // Heap-allocated numbers (bignum, ratio) render as digits, not
         // #<heap-object> (bliss-axe). Only real GC heap objects reach here now.
@@ -784,7 +809,11 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
         // A character-typed (fill-pointer / adjustable) array is a string and
         // prints as one, not as #(...) (bliss-9q4).
         if let Some(s) = crate::sequences::cvec_char_contents(v) {
-            return if escapep { format!("\"{}\"", s) } else { s };
+            return if escapep {
+                format!("\"{}\"", escape_string_body(&s))
+            } else {
+                s
+            };
         }
         // A bit-vector renders in `#*bits` syntax, not `#(…)` (bliss-zg9). Checked
         // before the general vector path since it is also a rank-1 array.
