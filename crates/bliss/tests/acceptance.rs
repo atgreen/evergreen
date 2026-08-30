@@ -1829,6 +1829,58 @@ fn print_length_and_level() {
     }
 }
 
+/// *PRINT-CIRCLE* t: shared and circular structure prints with #N=/#N# labels
+/// and terminates, instead of looping forever (bliss-dlil). Covers both the
+/// stdlib printer (prin1-to-string) and — via the returned string — the fact
+/// that a circular list no longer hangs the printer.
+#[test]
+fn print_circle_labels_shared_and_circular() {
+    let cases = [
+        // Circular list: the cdr of the last cons points back to the head.
+        (
+            "(let ((x (list 1 2 3))) (setf (cdddr x) x) (let ((*print-circle* t)) (prin1-to-string x)))",
+            "\"#1=(1 2 3 . #1#)\"",
+        ),
+        // Self-referential car.
+        (
+            "(let ((x (list 1))) (setf (car x) x) (let ((*print-circle* t)) (prin1-to-string x)))",
+            "\"#1=(#1#)\"",
+        ),
+        // Shared (non-circular) substructure: the same list appears twice.
+        (
+            "(let* ((y (list 1 2)) (z (list y y))) (let ((*print-circle* t)) (prin1-to-string z)))",
+            "\"(#1=(1 2) #1#)\"",
+        ),
+        // Two distinct shared subtrees get distinct labels, in first-print order.
+        (
+            "(let ((a (list 1)) (b (list 2))) (let ((*print-circle* t)) (prin1-to-string (list a b a b))))",
+            "\"(#1=(1) #2=(2) #1# #2#)\"",
+        ),
+        // A shared node used three times labels once, back-references twice.
+        (
+            "(let ((y (list 7))) (let ((*print-circle* t)) (prin1-to-string (list y y y))))",
+            "\"(#1=(7) #1# #1#)\"",
+        ),
+        // No shared structure under *print-circle* t: no labels appear.
+        (
+            "(let ((*print-circle* t)) (prin1-to-string (list 1 (list 2 3) 4)))",
+            "\"(1 (2 3) 4)\"",
+        ),
+        // Dotted pair is unaffected.
+        (
+            "(let ((*print-circle* t)) (prin1-to-string (cons 1 2)))",
+            "\"(1 . 2)\"",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// *PRINT-CASE* (was ignored) controls how symbol names are cased on output:
 /// :UPCASE (default), :DOWNCASE, :CAPITALIZE — in prin1/princ/format/write.
 #[test]

@@ -125,6 +125,178 @@ pub fn print_level() -> Option<usize> {
         .map(|v| v.as_fixnum().max(0) as usize)
 }
 
+/// `*PRINT-CIRCLE*`: when non-NIL, shared and circular structure is printed
+/// with `#N=`/`#N#` labels instead of looping forever.
+pub fn print_circle_active() -> bool {
+    bliss_rt::symbols::find_index("*PRINT-CIRCLE*")
+        .and_then(bliss_rt::symbols::symbol_value)
+        .map(|v| !v.is_nil())
+        .unwrap_or(false)
+}
+
+// ── *PRINT-CIRCLE* support (bliss-dlil) ──────────────────────────────────
+//
+// A two-pass scheme shared by BOTH printers (cli.rs `print_val` and this
+// module's `blissval_to_print_string`), so `princ`/`print`/`prin1` and
+// `prin1-to-string`/`format ~S` behave identically:
+//
+//   Pass 1 (`CircleTable::build`) walks the structure once, counting how many
+//   times each cons is reached by object identity (its `as_ptr()` address).
+//   Conses reached ≥2 times are "shared" (this includes a circular back-edge,
+//   which reaches the head a second time). Cycles can't diverge because the
+//   scan stops recursing the moment a cons is seen again.
+//
+//   Pass 2 is the normal recursive print, but each printer asks the table,
+//   per cons, whether to emit a `#N=` label (first visit of a shared node),
+//   a `#N#` back-reference (subsequent visit — do NOT recurse), or nothing.
+//
+// The table keys on raw addresses, holds no `BlissVal` roots, and is only
+// valid while a single print is in flight — printing plain lists/vectors does
+// not allocate, so nothing moves. (A user `print-object` method that both
+// allocates and is reached under `*print-circle*` t could invalidate an
+// address; that exotic combination is out of scope and matches the pre-existing
+// assumption that the printers deref cons pointers directly.)
+
+/// What to emit for a given cons under `*print-circle*`.
+pub enum CircleMark {
+    /// Not shared — print the cons normally.
+    NotShared,
+    /// First time this shared node is printed: emit `#N=` then its contents.
+    First(u32),
+    /// Already printed once: emit `#N#` and do not recurse.
+    Repeat(u32),
+}
+
+struct CircleTable {
+    /// address → times reached during the scan (retained only for count ≥ 2).
+    counts: std::collections::HashMap<usize, u32>,
+    /// address → label number, assigned lazily in first-print order.
+    labels: std::collections::HashMap<usize, u32>,
+    next_label: u32,
+}
+
+impl CircleTable {
+    fn build(root: BlissVal) -> Option<CircleTable> {
+        if !print_circle_active() {
+            return None;
+        }
+        let mut t = CircleTable {
+            counts: std::collections::HashMap::new(),
+            labels: std::collections::HashMap::new(),
+            next_label: 1,
+        };
+        t.scan(root);
+        // Keep only genuinely shared/circular conses.
+        t.counts.retain(|_, c| *c >= 2);
+        if t.counts.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    }
+
+    /// Count cons multiplicities. Recurses on cars (bounded by nesting depth)
+    /// and iterates the cdr spine (bounded by nothing, but adds no stack), and
+    /// stops at any cons seen a second time so cycles terminate.
+    fn scan(&mut self, root: BlissVal) {
+        let mut cur = root;
+        loop {
+            if !cur.is_cons() {
+                return;
+            }
+            let addr = unsafe { cur.as_ptr() } as usize;
+            let c = self.counts.entry(addr).or_insert(0);
+            *c += 1;
+            if *c > 1 {
+                return;
+            }
+            unsafe {
+                let ptr = cur.as_ptr() as *const bliss_rt::object::ConsCell;
+                self.scan((*ptr).car);
+                cur = (*ptr).cdr;
+            }
+        }
+    }
+
+    fn is_shared(&self, v: BlissVal) -> bool {
+        v.is_cons() && self.counts.contains_key(&(unsafe { v.as_ptr() } as usize))
+    }
+
+    fn visit(&mut self, v: BlissVal) -> CircleMark {
+        if !v.is_cons() {
+            return CircleMark::NotShared;
+        }
+        let addr = unsafe { v.as_ptr() } as usize;
+        if !self.counts.contains_key(&addr) {
+            return CircleMark::NotShared;
+        }
+        if let Some(&n) = self.labels.get(&addr) {
+            CircleMark::Repeat(n)
+        } else {
+            let n = self.next_label;
+            self.next_label += 1;
+            self.labels.insert(addr, n);
+            CircleMark::First(n)
+        }
+    }
+}
+
+thread_local! {
+    static CIRCLE: std::cell::RefCell<Option<CircleTable>> =
+        const { std::cell::RefCell::new(None) };
+    /// Re-entrancy depth so the table is built once at the outermost print and
+    /// torn down when it returns, even though the printers recurse through the
+    /// same entry points.
+    static CIRCLE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Enter a (possibly nested) print. At the outermost level, build the circle
+/// table from `root` if `*print-circle*` is active. Pair with [`circle_exit`].
+pub fn circle_enter(root: BlissVal) {
+    let d = CIRCLE_DEPTH.with(|c| {
+        let n = c.get() + 1;
+        c.set(n);
+        n
+    });
+    if d == 1 {
+        let table = CircleTable::build(root);
+        CIRCLE.with(|c| *c.borrow_mut() = table);
+    }
+}
+
+/// Leave a print level; drop the table when the outermost level returns.
+pub fn circle_exit() {
+    let d = CIRCLE_DEPTH.with(|c| {
+        let n = c.get().saturating_sub(1);
+        c.set(n);
+        n
+    });
+    if d == 0 {
+        CIRCLE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// True when a circle table is active (there is shared/circular structure).
+pub fn circle_active() -> bool {
+    CIRCLE.with(|c| c.borrow().is_some())
+}
+
+/// True when `v` is a shared/circular cons (used to force a dotted tail).
+pub fn circle_is_shared(v: BlissVal) -> bool {
+    CIRCLE.with(|c| c.borrow().as_ref().is_some_and(|t| t.is_shared(v)))
+}
+
+/// Register a visit to cons `v`, assigning a label on first sight.
+pub fn circle_visit(v: BlissVal) -> CircleMark {
+    CIRCLE.with(|c| {
+        let mut b = c.borrow_mut();
+        match b.as_mut() {
+            Some(t) => t.visit(v),
+            None => CircleMark::NotShared,
+        }
+    })
+}
+
 pub fn print_base() -> u32 {
     bliss_rt::symbols::find_index("*PRINT-BASE*")
         .and_then(bliss_rt::symbols::symbol_value)
@@ -470,6 +642,15 @@ fn cons_list_to_vec(v: BlissVal) -> Vec<BlissVal> {
 // ── Helpers ───────────────────────────────────────────────────────
 
 fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
+    // Establish (at the outermost level) the *print-circle* label table, so
+    // shared/circular structure prints with #N=/#N# instead of looping.
+    circle_enter(v);
+    let s = blissval_to_print_inner(v, escapep);
+    circle_exit();
+    s
+}
+
+fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
     if v.is_nil() {
         return "NIL".into();
     }
@@ -690,11 +871,35 @@ fn instance_class_tag(v: BlissVal) -> String {
 fn format_cons(v: BlissVal, escapep: bool) -> String {
     // *PRINT-LENGTH*: after this many elements, print `...` and stop.
     let limit = print_length();
-    let mut out = String::from("(");
+    let circle = circle_active();
+    let mut out = String::new();
+    // *PRINT-CIRCLE* head: a `#N#` back-reference replaces the whole list; a
+    // `#N=` label prefixes it on first sight.
+    if circle {
+        match circle_visit(v) {
+            CircleMark::Repeat(n) => return format!("#{n}#"),
+            CircleMark::First(n) => {
+                out.push('#');
+                out.push_str(&n.to_string());
+                out.push('=');
+            }
+            CircleMark::NotShared => {}
+        }
+    }
+    out.push('(');
     let mut current = v;
     let mut count = 0usize;
+    let mut first = true;
     loop {
         if current.is_cons() {
+            // A shared/circular cons reached in the cdr position prints as a
+            // dotted tail so its own #N=/#N# label appears (the head cons,
+            // `first`, was already labelled above).
+            if !first && circle && circle_is_shared(current) {
+                out.push_str(" . ");
+                out.push_str(&blissval_to_print_string(current, escapep));
+                break;
+            }
             if limit.is_some_and(|n| count >= n) {
                 if count > 0 {
                     out.push(' ');
@@ -711,6 +916,7 @@ fn format_cons(v: BlissVal, escapep: bool) -> String {
                 current = (*ptr).cdr;
             }
             count += 1;
+            first = false;
         } else if current.is_nil() {
             break;
         } else {

@@ -4318,6 +4318,15 @@ thread_local! {
 }
 
 fn print_val(val: BlissVal, out: &mut String) {
+    // Establish the *print-circle* label table at the outermost print so shared
+    // and circular structure prints as #N=/#N# instead of looping forever.
+    // Shared with the stdlib printer (bliss-dlil).
+    bliss_stdlib::format::circle_enter(val);
+    print_val_inner(val, out);
+    bliss_stdlib::format::circle_exit();
+}
+
+fn print_val_inner(val: BlissVal, out: &mut String) {
     if val.is_nil() {
         out.push_str("NIL");
     } else if val == T {
@@ -4399,6 +4408,24 @@ fn print_val(val: BlissVal, out: &mut String) {
         if bliss_stdlib::format::print_level().is_some_and(|lvl| depth >= lvl) {
             out.push('#');
         } else {
+            // *PRINT-CIRCLE*: a `#N#` back-reference replaces the whole list; a
+            // `#N=` label prefixes it on first sight (bliss-dlil).
+            if bliss_stdlib::format::circle_active() {
+                match bliss_stdlib::format::circle_visit(val) {
+                    bliss_stdlib::format::CircleMark::Repeat(n) => {
+                        out.push('#');
+                        out.push_str(&n.to_string());
+                        out.push('#');
+                        return;
+                    }
+                    bliss_stdlib::format::CircleMark::First(n) => {
+                        out.push('#');
+                        out.push_str(&n.to_string());
+                        out.push('=');
+                    }
+                    bliss_stdlib::format::CircleMark::NotShared => {}
+                }
+            }
             out.push('(');
             PRINT_DEPTH.with(|d| d.set(depth + 1));
             print_list_body(val, out);
@@ -4556,9 +4583,19 @@ fn print_val(val: BlissVal, out: &mut String) {
 fn print_list_body(val: BlissVal, out: &mut String) {
     // *PRINT-LENGTH*: after this many elements, print `...` and stop.
     let limit = bliss_stdlib::format::print_length();
+    let circle = bliss_stdlib::format::circle_active();
     let mut cur = val;
     let mut count = 0usize;
+    let mut first = true;
     while cur.is_cons() {
+        // *PRINT-CIRCLE*: a shared/circular cons in the cdr position prints as a
+        // dotted tail so its own #N=/#N# label appears (the head cons, `first`,
+        // was already labelled by the caller).
+        if !first && circle && bliss_stdlib::format::circle_is_shared(cur) {
+            out.push_str(" . ");
+            print_val(cur, out);
+            return;
+        }
         if limit.is_some_and(|n| count >= n) {
             if count > 0 {
                 out.push(' ');
@@ -4575,6 +4612,7 @@ fn print_list_body(val: BlissVal, out: &mut String) {
             cur = (*c).cdr;
         }
         count += 1;
+        first = false;
     }
     if !cur.is_nil() {
         out.push_str(" . ");
