@@ -1147,7 +1147,10 @@
        (if iel-cell (make-string size :initial-element iel) (make-string size)))
       (t
        (if iel-cell (make-array size :initial-element iel) (make-array size))))))
-(defun string-equal (a b) (string= (string-downcase a) (string-downcase b)))
+;; STRING-EQUAL is case-insensitive STRING=; forward the ANSI bounding keywords
+;; (:start1/:end1/:start2/:end2) after case-folding (which preserves indices).
+(defun string-equal (a b &rest keys)
+  (apply #'string= (string-downcase (string a)) (string-downcase (string b)) keys))
 
 ;; SUBST new old tree &key key test test-not — substitute NEW for every subtree
 ;; of TREE that satisfies the test against OLD. Full CL lambda list: cl-ppcre's

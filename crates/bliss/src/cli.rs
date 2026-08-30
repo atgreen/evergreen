@@ -13503,20 +13503,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "STRING=" => {
-                let (a, b) = {
-                    // Root both args across evaluation so a young arg list can't
-                    // dangle either (bliss-6b2 #2).
-                    let (af, r) = cp(cdr);
-                    bliss_rt::rooted!(bf = cp(r).0);
-                    bliss_rt::rooted!(a = eval_form(af, env)?);
-                    let b = eval_form(*bf, env)?;
-                    (*a, b)
-                };
-                return Ok(if val_as_str(a) == val_as_str(b) {
-                    T
-                } else {
-                    NIL
-                });
+                // ANSI: compare the (optionally :start1/:end1/:start2/:end2
+                // bounded) substrings for character equality. The bounds were
+                // previously ignored, so (string= "xabcy" "abc" :start1 1 :end1 4)
+                // returned NIL (bliss-cnzs).
+                let (a, b) = string_compare_bounds(cdr, env)?;
+                return Ok(if a == b { T } else { NIL });
             }
             "STRING<" => {
                 // ANSI: the mismatch index if string1 < string2, else NIL.
@@ -17867,6 +17859,39 @@ fn find_key_arg(plist: &[BlissVal], kw_bare: &str) -> Option<BlissVal> {
         i += 2;
     }
     None
+}
+
+/// Evaluate the operands of a two-string comparator and apply the ANSI
+/// `:start1/:end1/:start2/:end2` bounding keywords (defaults: 0 and the string
+/// length; a NIL `:endN` also means the length). Returns the two bounded
+/// substrings ready for character comparison. GC-safe: `eval_args` returns
+/// rooted values and no Bliss allocation happens after the string contents are
+/// copied into owned Rust `String`s (bliss-cnzs).
+fn string_compare_bounds(cdr: BlissVal, env: &mut Env) -> Result<(String, String), BlissError> {
+    let args = eval_args(cdr, env)?;
+    if args.len() < 2 {
+        return Err(BlissError::ProgramError(
+            "string comparison requires two string designators".into(),
+        ));
+    }
+    let s1: Vec<char> = val_as_str(args[0]).chars().collect();
+    let s2: Vec<char> = val_as_str(args[1]).chars().collect();
+    let kw = &args[2..];
+    // A present fixnum keyword wins; a missing keyword (or a NIL :endN) uses the
+    // default. Everything is clamped into range so a bad index can't panic.
+    let bound = |name: &str, default: usize| -> usize {
+        match find_key_arg(kw, name) {
+            Some(v) if v.is_fixnum() => v.as_fixnum().max(0) as usize,
+            _ => default,
+        }
+    };
+    let start1 = bound("START1", 0).min(s1.len());
+    let end1 = bound("END1", s1.len()).min(s1.len()).max(start1);
+    let start2 = bound("START2", 0).min(s2.len());
+    let end2 = bound("END2", s2.len()).min(s2.len()).max(start2);
+    let sub1: String = s1[start1..end1].iter().collect();
+    let sub2: String = s2[start2..end2].iter().collect();
+    Ok((sub1, sub2))
 }
 
 fn bind_lambda_list(

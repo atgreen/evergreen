@@ -4322,6 +4322,31 @@ fn setf_subseq_on_a_list() {
     }
 }
 
+/// STRING= / STRING-EQUAL honor the :start1/:end1/:start2/:end2 bounding
+/// keywords, comparing only the delimited substrings (they were ignored before,
+/// so a bounded compare of equal substrings returned NIL). (bliss-cnzs)
+#[test]
+fn string_equal_honors_bounds_keywords() {
+    let cases = [
+        ("(string= \"xabcy\" \"abc\" :start1 1 :end1 4)", "T"),
+        ("(string= \"abc\" \"xabcy\" :start2 1 :end2 4)", "T"),
+        ("(string= \"abcd\" \"abce\" :end1 3 :end2 3)", "T"),
+        ("(string= \"abc\" \"abd\")", "NIL"),
+        ("(string-equal \"XABCY\" \"abc\" :start1 1 :end1 4)", "T"),
+        ("(string-equal \"ABC\" \"abc\")", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got}");
+    }
+}
+
 /// WRITE-TO-STRING honors :base / :radix / :escape on a direct-form call, not
 /// just via FUNCALL/APPLY — the interpreter's builtin fast-path used to ignore
 /// the keywords and print in base 10. (bliss-xe2p)
