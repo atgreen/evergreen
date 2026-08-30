@@ -3841,6 +3841,14 @@ fn gcd_lcm_and_string_trim() {
         ("(string-trim \" \" \"  hi  \")", "\"hi\""),
         ("(string-left-trim \" x\" \"xx hi\")", "\"hi\""),
         ("(string-right-trim \" \" \"hi  \")", "\"hi\""),
+        // PARSE-INTEGER on non-integer junk signals a catchable PARSE-ERROR,
+        // not a plain SIMPLE-ERROR (bliss-dxyd). Valid parses are unaffected.
+        (
+            "(handler-case (parse-integer \"12x\") (parse-error () :ok))",
+            ":OK",
+        ),
+        ("(parse-integer \"  42  \")", "42"),
+        ("(parse-integer \"12x\" :junk-allowed t)", "12"),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin()

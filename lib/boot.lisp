@@ -2099,6 +2099,12 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; (values integer position). UIOP parses version strings with it.
 ;;; ---------------------------------------------------------------------------
 
+;; ANSI: PARSE-INTEGER with junk-allowed NIL must signal a PARSE-ERROR (not a
+;; plain SIMPLE-ERROR) when the substring is not an integer, so callers can
+;; (handler-case ... (parse-error ...)). SIMPLE-PARSE-ERROR mixes in
+;; SIMPLE-ERROR to carry a readable :format-control/:format-arguments report.
+(define-condition simple-parse-error (parse-error simple-error) ())
+
 (defun parse-integer (string &key (start 0) end (radix 10) junk-allowed)
   (let ((end (or end (length string)))
         (i start)
@@ -2121,4 +2127,6 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
       (cond
         (junk-allowed (values (if any (* sign value) nil) i))
         ((and any (>= i end)) (values (* sign value) i))
-        (t (error "PARSE-INTEGER: not an integer: ~s" (subseq string start end)))))))
+        (t (error 'simple-parse-error
+                  :format-control "PARSE-INTEGER: not an integer: ~s"
+                  :format-arguments (list (subseq string start end))))))))
