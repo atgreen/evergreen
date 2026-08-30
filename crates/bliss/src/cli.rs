@@ -6438,6 +6438,15 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
 /// SUBTYPEP core: returns `(subtype-p, certain-p)`. Handles built-in atomic type
 /// lattices and CLOS class subtyping via the class precedence list; returns
 /// `(false, false)` — "unknown" — for relationships it cannot decide.
+/// Coerce a pathname designator (an existing pathname, or a namestring string)
+/// to a pathname — the CLHS coercion the pathname functions accept.
+fn coerce_to_pathname(v: BlissVal) -> Result<BlissVal, BlissError> {
+    if bliss_stdlib::is_pathname(v) {
+        return Ok(v);
+    }
+    Ok(bliss_stdlib::parse_namestring(v, None, None)?.0)
+}
+
 fn subtypep_relation(t1: BlissVal, t2: BlissVal) -> (bool, bool) {
     // A compound (parameterized/bounded) SUBTYPE narrows its head type, so it is
     // a subtype of whatever its head type is a subtype of: (integer 0 10) ⊆
@@ -11098,11 +11107,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 });
             }
             "PATHNAME-MATCH-P" => {
-                // (pathname-match-p pathname wildcard)
+                // (pathname-match-p pathname wildcard) — both args are pathname
+                // designators (strings coerce to pathnames), not just pathnames.
                 let args = eval_args(cdr, env)?;
-                let pn = args.first().copied().unwrap_or(NIL);
-                let wc = args.get(1).copied().unwrap_or(NIL);
-                return Ok(if bliss_stdlib::pathname_match_p(pn, wc)? {
+                bliss_rt::rooted!(pn = coerce_to_pathname(args.first().copied().unwrap_or(NIL))?);
+                let wc = coerce_to_pathname(args.get(1).copied().unwrap_or(NIL))?;
+                return Ok(if bliss_stdlib::pathname_match_p(*pn, wc)? {
                     T
                 } else {
                     NIL

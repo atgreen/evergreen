@@ -365,6 +365,28 @@
 
 (defun identity (x) x)
 
+;; GET-DECODED-TIME (CLHS 25.1.4.1) — the current time as nine decoded values.
+(defun get-decoded-time ()
+  (decode-universal-time (get-universal-time)))
+
+;; UPGRADED-ARRAY-ELEMENT-TYPE (CLHS 15.1.1): the element type the implementation
+;; actually stores. bliss specialises only bit and character arrays; every other
+;; element type upgrades to T.
+(defun upgraded-array-element-type (type &optional environment)
+  (declare (ignore environment))
+  (cond ((eq type 'bit) 'bit)
+        ((member type '(character base-char standard-char)) 'character)
+        (t t)))
+
+;; UPGRADED-COMPLEX-PART-TYPE (CLHS 12.2.6): the part type used for a complex of
+;; the given part type. bliss stores complex parts unspecialised, so a float part
+;; keeps its float type and everything else upgrades to RATIONAL (CL default).
+(defun upgraded-complex-part-type (type &optional environment)
+  (declare (ignore environment))
+  (if (member type '(single-float double-float short-float long-float float))
+      type
+      'rational))
+
 ;; remove-duplicates: keeps the first occurrence and preserves order. The
 ;; keyword arguments (:test/:key/:from-end/...) are accepted but ignored for
 ;; now — the default EQL-style comparison via MEMBER covers the bootstrap uses

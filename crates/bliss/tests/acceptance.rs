@@ -1768,6 +1768,32 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-3bk3: GET-DECODED-TIME, UPGRADED-ARRAY-ELEMENT-TYPE,
+/// UPGRADED-COMPLEX-PART-TYPE (were undefined), and PATHNAME-MATCH-P coercing
+/// string designators (was a type-error on strings).
+#[test]
+fn misc_time_type_and_pathname_designators() {
+    let cases = [
+        ("(length (multiple-value-list (get-decoded-time)))", "9"),
+        ("(upgraded-array-element-type 'character)", "CHARACTER"),
+        ("(upgraded-array-element-type 'bit)", "BIT"),
+        ("(upgraded-array-element-type t)", "T"),
+        ("(upgraded-array-element-type '(unsigned-byte 8))", "T"),
+        ("(upgraded-complex-part-type 'single-float)", "SINGLE-FLOAT"),
+        ("(upgraded-complex-part-type 'integer)", "RATIONAL"),
+        // PATHNAME-MATCH-P coerces string designators.
+        ("(if (pathname-match-p \"/a/b.lisp\" \"/a/*.lisp\") t nil)", "T"),
+        ("(pathname-match-p \"/a/b.txt\" \"/a/*.lisp\")", "NIL"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// SUBTYPEP with a compound (parameterized/bounded) SUBTYPE: it narrows its head
 /// type, so it is a subtype of whatever the head is — (integer 0 10) ⊆ integer,
 /// (vector t 3) ⊆ array, (mod 5) ⊆ integer. Previously sym_name on the cons gave
