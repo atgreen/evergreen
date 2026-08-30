@@ -1768,6 +1768,39 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// EXPT of a negative real to a non-integer power, or of a complex base, returns
+/// a complex (real `powf` returned NaN, and a complex base errored). Integer
+/// powers of a complex base are exact via repeated multiplication.
+#[test]
+fn expt_complex_results() {
+    let cases = [
+        // Integer powers of complex — exact (canonicalise when real).
+        ("(expt #c(0 1) 2)", "-1"),
+        ("(expt #c(1 1) 2)", "#C(0 2)"),
+        ("(expt #c(0 1) 3)", "#C(0 -1)"),
+        ("(expt #c(2 0) -1)", "1/2"),
+        // Negative real to a non-integer power → complex.
+        ("(expt -8 1/3)", "#C(1.0 1.7320508)"),
+        // (expt -1 0.5) ≈ i (tiny float epsilon in the real part).
+        ("(if (< (abs (realpart (expt -1 0.5))) 1d-3) t nil)", "T"),
+        ("(if (< (abs (- (imagpart (expt -1 0.5)) 1.0)) 1d-3) t nil)", "T"),
+        // i*i via expt round-trips to ~-1.
+        ("(round (realpart (* (expt -1 0.5) (expt -1 0.5))))", "-1"),
+        // Real/integer cases unchanged.
+        ("(expt 2 3)", "8"),
+        ("(expt -2 3)", "-8"),
+        ("(expt 4 0.5)", "2.0"),
+        ("(expt 2 -3)", "1/8"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// *PRINT-LENGTH* (truncate a list with `...` after N elements) and *PRINT-LEVEL*
 /// (print `#` past a nesting depth) — both were ignored, so lists always printed
 /// in full.

@@ -11413,6 +11413,29 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                         return Ok(bigrat_div(&BigRat::from_i64(1), &p).to_val());
                     }
                 }
+                // A complex base with an integer exponent is exact repeated
+                // multiplication (e.g. i^2 = -1, canonicalised to the real -1).
+                if bliss_rt::types::complexp(a) && b.is_fixnum() {
+                    let e = b.as_fixnum();
+                    if e == 0 {
+                        return Ok(BlissVal::from_fixnum(1));
+                    }
+                    bliss_rt::rooted!(factors = vec![a; e.unsigned_abs() as usize]);
+                    bliss_rt::rooted!(pos = complex_arith(CxOp::Mul, &factors)?);
+                    if e < 0 {
+                        // Negative exponent: reciprocal 1 / base^|e|.
+                        return complex_arith(CxOp::Div, &[BlissVal::from_fixnum(1), *pos]);
+                    }
+                    return Ok(*pos);
+                }
+                // A complex base, or a negative real base with a non-integer
+                // exponent, gives a complex result (real `powf` returns NaN for
+                // the latter): base^power = exp(power · log base) (bliss-mg63 kin).
+                let base_negative =
+                    !bliss_rt::types::complexp(a) && num_val(a).map(|x| x < 0.0).unwrap_or(false);
+                if bliss_rt::types::complexp(a) || (base_negative && !b.is_fixnum()) {
+                    return complex_expt(a, b);
+                }
                 let av = num_val(a)?;
                 let bv = num_val(b)?;
                 return Ok(BlissVal::from_single_float(av.powf(bv) as f32));
@@ -15637,6 +15660,41 @@ fn complex_arith(op: CxOp, vals: &[BlissVal]) -> Result<BlissVal, BlissError> {
 /// Does any operand require the complex arithmetic fold?
 fn any_complex(vals: &[BlissVal]) -> bool {
     vals.iter().any(|v| bliss_rt::types::complexp(*v))
+}
+
+/// (re, im) of a real or complex number as f64.
+fn complex_parts_f64(v: BlissVal) -> Result<(f64, f64), BlissError> {
+    if let Some(re) = bliss_rt::types::complex_realpart(v) {
+        let im = bliss_rt::types::complex_imagpart(v).unwrap_or(NIL);
+        Ok((num_val(re)?, num_val(im)?))
+    } else {
+        Ok((num_val(v)?, 0.0))
+    }
+}
+
+/// General complex exponentiation `base^power = exp(power · log base)`, used by
+/// EXPT when the base is complex or a negative real raised to a non-integer
+/// power (where the real f64 `powf` returns NaN). Result is a single-float
+/// complex, canonicalised by `make_complex`.
+fn complex_expt(base: BlissVal, power: BlissVal) -> Result<BlissVal, BlissError> {
+    let (ar, ai) = complex_parts_f64(base)?;
+    let (pr, pi) = complex_parts_f64(power)?;
+    let modulus = ar.hypot(ai);
+    if modulus == 0.0 {
+        // 0^power: 0 for a positive real power, else undefined — return 0.
+        return Ok(BlissVal::from_single_float(0.0));
+    }
+    // log(base) = ln|base| + i·arg(base).
+    let (ln_r, arg) = (modulus.ln(), ai.atan2(ar));
+    // power · log(base) = (pr + pi·i)(ln_r + arg·i).
+    let x = pr * ln_r - pi * arg;
+    let y = pr * arg + pi * ln_r;
+    // exp(x + y·i) = e^x·(cos y + i·sin y).
+    let ex = x.exp();
+    make_complex(
+        BlissVal::from_single_float((ex * y.cos()) as f32),
+        BlissVal::from_single_float((ex * y.sin()) as f32),
+    )
 }
 
 // ── Multidimensional arrays (bliss-rh0t) ────────────────────────────
