@@ -1768,6 +1768,30 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// bliss-8zrb: FORMAT ~E/~G format a single-float from the f32 itself (shortest
+/// round-trip) rather than its widened f64, which exposed binary32 imprecision
+/// ((format nil "~e" 0.001) had been 1.0000000474974513E-3). ~E keeps a decimal
+/// point in the mantissa.
+#[test]
+fn format_exponential_shortest_float() {
+    let cases = [
+        ("(format nil \"~e\" 0.001)", "\"1.0E-3\""),
+        ("(format nil \"~e\" 1234.5)", "\"1.2345E3\""),
+        ("(format nil \"~e\" 1.0)", "\"1.0E0\""),
+        ("(format nil \"~e\" 0.1)", "\"1.0E-1\""),
+        ("(format nil \"~e\" -0.5)", "\"-5.0E-1\""),
+        ("(format nil \"~e\" 12)", "\"1.2E1\""),
+        ("(format nil \"~g\" 0.001)", "\"0.001\""),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// The float introspection/manipulation family (were undefined): DECODE-FLOAT,
 /// INTEGER-DECODE-FLOAT, SCALE-FLOAT, FLOAT-SIGN, FLOAT-RADIX/DIGITS/PRECISION,
 /// and FFLOOR/FCEILING/FTRUNCATE/FROUND (float-quotient rounding).

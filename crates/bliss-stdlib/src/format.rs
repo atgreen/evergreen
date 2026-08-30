@@ -387,6 +387,16 @@ fn is_closure_cons(v: BlissVal) -> bool {
         .unwrap_or(false)
 }
 
+/// Ensure the mantissa of a `{:E}`-formatted float carries a decimal point so it
+/// reads back as a float (CL ~E always shows one): "1E-3" → "1.0E-3";
+/// "1.2345E3" is unchanged.
+fn exp_with_decimal_point(s: &str) -> String {
+    match s.split_once('E') {
+        Some((mant, exp)) if !mant.contains('.') => format!("{mant}.0E{exp}"),
+        _ => s.to_string(),
+    }
+}
+
 /// Walk a cons-cell linked list and collect all car values into a Vec.
 fn cons_list_to_vec(v: BlissVal) -> Vec<BlissVal> {
     let mut result = Vec::new();
@@ -1465,17 +1475,20 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                let f = if val.is_single_float() {
-                    val.as_single_float() as f64
+                // Format a single-float from the f32 itself (shortest round-trip)
+                // rather than its widened f64, which exposed binary32 imprecision:
+                // (format nil "~e" 0.001) gave 1.0000000474974513E-3 (bliss-8zrb).
+                let s = if val.is_single_float() {
+                    format!("{:E}", val.as_single_float())
                 } else if val.is_fixnum() {
-                    val.as_fixnum() as f64
+                    format!("{:E}", val.as_fixnum() as f64)
                 } else {
                     return Err(BlissError::TypeError {
                         datum: val,
                         expected: "number".into(),
                     });
                 };
-                output.push_str(&format!("{:E}", f));
+                output.push_str(&exp_with_decimal_point(&s));
             }
             'G' => {
                 if *arg_idx >= args.len() {
@@ -1483,17 +1496,18 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                let f = if val.is_single_float() {
-                    val.as_single_float() as f64
+                // Shortest round-trip from the f32 for single-floats (bliss-8zrb).
+                let s = if val.is_single_float() {
+                    format!("{}", val.as_single_float())
                 } else if val.is_fixnum() {
-                    val.as_fixnum() as f64
+                    format!("{}", val.as_fixnum() as f64)
                 } else {
                     return Err(BlissError::TypeError {
                         datum: val,
                         expected: "number".into(),
                     });
                 };
-                output.push_str(&format!("{}", f));
+                output.push_str(&s);
             }
             '$' => {
                 if *arg_idx >= args.len() {
