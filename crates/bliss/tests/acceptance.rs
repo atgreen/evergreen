@@ -4386,6 +4386,40 @@ fn write_to_string_honors_print_control_keywords() {
     }
 }
 
+/// (setf (getf place indicator) val) updates the plist: overwrite an existing
+/// indicator's value in place, or prepend a new indicator/value pair and store
+/// the new head back into the place. Was an uncatchable "unsupported place".
+/// (bliss-ihqw)
+#[test]
+fn setf_getf_place() {
+    let cases = [
+        // New indicator: prepended (ANSI), place updated.
+        ("(let ((s (list :a 1))) (setf (getf s :b) 2) s)", "(:B 2 :A 1)"),
+        // Existing indicator: value replaced in place.
+        (
+            "(let ((s (list :a 1 :b 2))) (setf (getf s :a) 99) s)",
+            "(:A 99 :B 2)",
+        ),
+        // Empty plist.
+        ("(let ((s nil)) (setf (getf s :x) 10) s)", "(:X 10)"),
+        // Inside a DEFUN (compiled path).
+        (
+            "(progn (defun gtst () (let ((s (list :a 1))) (setf (getf s :c) 3) s)) (gtst))",
+            "(:C 3 :A 1)",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got}");
+    }
+}
+
 /// (setf (cXr place) v) works for composite CAR/CDR accessors even when the
 /// form is compiled (inside a defun) or run through EVAL — previously only the
 /// top-level interpreter path handled them and the rest hit "unsupported place".

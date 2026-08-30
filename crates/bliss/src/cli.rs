@@ -9562,6 +9562,55 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 let tbl = eval_form(tbl_form, env)?;
                                 bliss_stdlib::set_gethash(*key, tbl, *val)?;
                             }
+                            "GETF" => {
+                                // (setf (getf place indicator [default]) val):
+                                // update the plist stored in PLACE. If INDICATOR
+                                // (compared with EQ, like GETF) is already present,
+                                // overwrite its value cell in place; otherwise cons
+                                // INDICATOR+VAL onto the front and store the new
+                                // head back into PLACE (any settable place). Was
+                                // an uncatchable "unsupported place" (bliss-ihqw).
+                                bliss_rt::rooted!(place_form = tgt_form);
+                                let (ind_form, _) = cp(cp(*aargs).1);
+                                bliss_rt::rooted!(ind = eval_form(ind_form, env)?);
+                                bliss_rt::rooted!(plist = eval_form(*place_form, env)?);
+                                let mut c = *plist;
+                                let mut found = false;
+                                while c.is_cons() {
+                                    let (k, rest) = cp(c);
+                                    if !rest.is_cons() {
+                                        break;
+                                    }
+                                    if k == *ind {
+                                        // No allocation in this loop, so the raw
+                                        // cons pointer is valid; *val is rooted.
+                                        unsafe {
+                                            let vcell = rest.as_ptr() as *mut ConsCell;
+                                            bliss_rt::gc::store_ref(
+                                                std::ptr::addr_of_mut!((*vcell).car),
+                                                *val,
+                                            );
+                                        }
+                                        found = true;
+                                        break;
+                                    }
+                                    c = cp(rest).1;
+                                }
+                                if !found {
+                                    bliss_rt::rooted!(tail = arena_cons(*val, *plist));
+                                    bliss_rt::rooted!(newplist = arena_cons(*ind, *tail));
+                                    let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
+                                    bliss_rt::rooted!(
+                                        quoted = arena_cons(quote_sym, arena_cons(*newplist, NIL))
+                                    );
+                                    let setf_form = vec_to_list(&[
+                                        resolve_sym("SETF").unwrap_or(NIL),
+                                        *place_form,
+                                        *quoted,
+                                    ]);
+                                    eval_form(setf_form, env)?;
+                                }
+                            }
                             "GET" => {
                                 // (setf (get symbol indicator [default]) val)
                                 let sym = eval_form(tgt_form, env)?;
