@@ -9782,6 +9782,49 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                         args.push(*v);
                                     }
                                     invoke_generic_function(&key, &args, env)?;
+                                } else if let Some(mid) = other
+                                    .strip_prefix('C')
+                                    .and_then(|s| s.strip_suffix('R'))
+                                    .filter(|m| {
+                                        m.len() >= 2 && m.chars().all(|c| c == 'A' || c == 'D')
+                                    })
+                                {
+                                    // Composite CxR accessor place, e.g.
+                                    // (setf (caddr x) v). The interpreter's SETF
+                                    // handles only CAR/CDR directly, so a compiled
+                                    // /eval'd (setf (cXYr x) v) hit "unsupported
+                                    // place". Rewrite it as car/cdr of the inner
+                                    // accessor: caddr = (car (cddr x)) — the first
+                                    // letter picks the outer op, the rest form the
+                                    // inner CxR applied to the same subform, which
+                                    // is evaluated once (bliss-fpyw).
+                                    let outer_is_car = mid.starts_with('A');
+                                    let inner_name = format!("C{}R", &mid[1..]);
+                                    bliss_rt::rooted!(tf = tgt_form);
+                                    let inner_form = vec_to_list(&[
+                                        resolve_sym(&inner_name).unwrap_or(NIL),
+                                        *tf,
+                                    ]);
+                                    let inner_cons = eval_form(inner_form, env)?;
+                                    if inner_cons.is_cons() {
+                                        // No allocation between eval and the store,
+                                        // so the raw cons pointer stays valid; *val
+                                        // is rooted. Write through the GC barrier.
+                                        unsafe {
+                                            let cell = inner_cons.as_ptr() as *mut ConsCell;
+                                            let slot = if outer_is_car {
+                                                std::ptr::addr_of_mut!((*cell).car)
+                                            } else {
+                                                std::ptr::addr_of_mut!((*cell).cdr)
+                                            };
+                                            bliss_rt::gc::store_ref(slot, *val);
+                                        }
+                                    } else {
+                                        return Err(BlissError::TypeError {
+                                            datum: inner_cons,
+                                            expected: "cons".into(),
+                                        });
+                                    }
                                 } else {
                                     return Err(BlissError::Internal(format!(
                                         "SETF: unsupported place ({} ...)",

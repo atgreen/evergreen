@@ -4322,6 +4322,30 @@ fn setf_subseq_on_a_list() {
     }
 }
 
+/// (setf (cXr place) v) works for composite CAR/CDR accessors even when the
+/// form is compiled (inside a defun) or run through EVAL — previously only the
+/// top-level interpreter path handled them and the rest hit "unsupported place".
+/// (bliss-fpyw)
+#[test]
+fn setf_composite_cxr_accessors() {
+    // Exercised through a DEFUN so the compiled/lowered SETF path is used.
+    let prog = "(defun run () \
+                  (let ((a (list (list 1 2))) \
+                        (b (list 10 20 30 40 50))) \
+                    (setf (caar a) 9) \
+                    (setf (caddr b) 99) \
+                    (setf (cdddr b) (list 8)) \
+                    (list a b))) \
+                (print (run))";
+    let out = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("((9 2)) (10 20 99 8)"),
+        "composite cXr setf should mutate in place, got: {stdout}"
+    );
+}
+
 #[test]
 fn setf_of_a_setf_generic_function() {
     // bliss-lb6.14: (setf (place …) v) dispatches to a (defmethod (setf place) …)
