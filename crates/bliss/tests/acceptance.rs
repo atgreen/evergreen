@@ -4416,6 +4416,33 @@ fn write_to_string_honors_print_control_keywords() {
     }
 }
 
+/// EQUALP descends DEFSTRUCT instances slot-by-slot (same type + EQUALP slots),
+/// including :include inheritance and case-insensitive string slots, but does
+/// NOT descend general CLOS standard-objects (those stay identity-compared).
+/// (bliss-rup1)
+#[test]
+fn equalp_descends_structures_not_clos() {
+    let prog = "(defstruct pt a b) \
+                (defstruct (pt3 (:include pt)) c) \
+                (defclass cl () ((a :initarg :a))) \
+                (print (list \
+                  (equalp (make-pt :a 1 :b 2) (make-pt :a 1 :b 2)) \
+                  (equalp (make-pt :a 1 :b 2) (make-pt :a 1 :b 3)) \
+                  (equalp (make-pt :a \"X\" :b 2) (make-pt :a \"x\" :b 2)) \
+                  (equalp (make-pt3 :a 1 :b 2 :c 3) (make-pt3 :a 1 :b 2 :c 3)) \
+                  (equalp (make-pt3 :a 1 :b 2 :c 3) (make-pt3 :a 1 :b 2 :c 9)) \
+                  (equalp (make-pt :a 1 :b 2) (make-pt3 :a 1 :b 2 :c 3)) \
+                  (equalp (make-instance 'cl :a 1) (make-instance 'cl :a 1))))";
+    let out = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // same, diff-slot, ci-string, included-same, included-diff, cross-type, clos
+    assert!(
+        stdout.contains("(T NIL T T NIL NIL NIL)"),
+        "equalp struct semantics wrong, got: {stdout}"
+    );
+}
+
 /// PPRINT is bound and behaves as the degenerate (non-pretty) case: a leading
 /// fresh newline, the escaped representation, no trailing space, no values.
 /// (bliss-nopz — full XP pretty-printing remains a separate epic.)

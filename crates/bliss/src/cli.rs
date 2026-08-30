@@ -20043,6 +20043,9 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     bliss_rt::rooted!(clauses_list = vec_to_list(&slot_clauses));
     let defclass_form = vec_to_list(&[sym("DEFCLASS"), *name_sym_r, *supers, *clauses_list]);
     eval_form(defclass_form, env)?;
+    // Mark this class as a structure so EQUALP descends its instances slot-by-
+    // slot (unlike a plain DEFCLASS standard-object; bliss-rup1).
+    register_struct_class(&name_str);
 
     // Constructors. A keyword constructor forwards every initarg to
     // MAKE-INSTANCE (so inherited slots Just Work); a BOA constructor maps its
@@ -21860,11 +21863,50 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
     false
 }
 
+thread_local! {
+    /// Bare names of classes created by DEFSTRUCT. EQUALP descends structures
+    /// (comparing corresponding slots) but NOT general CLOS standard-objects
+    /// (CLHS 5.3); bliss implements DEFSTRUCT as DEFCLASS, so this set records
+    /// which instance classes are structures (bliss-rup1).
+    static STRUCT_CLASSES: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+fn register_struct_class(name: &str) {
+    STRUCT_CLASSES.with(|s| {
+        s.borrow_mut().insert(name.to_string());
+    });
+}
+fn is_struct_class_name(name: &str) -> bool {
+    STRUCT_CLASSES.with(|s| s.borrow().contains(name))
+}
+
 /// CL `EQUALP`: like `EQUAL` but numbers compare by value across types
-/// (`1` equalp `1.0`), characters and strings compare case-insensitively, and
-/// vectors/arrays compare element-wise (same length, elements `EQUALP`).
+/// (`1` equalp `1.0`), characters and strings compare case-insensitively,
+/// vectors/arrays compare element-wise, and structures compare slot-wise.
 fn vals_equalp(a: BlissVal, b: BlissVal) -> bool {
     if a == b {
+        return true;
+    }
+    // Structures (DEFSTRUCT instances): two structures of the same type are
+    // EQUALP iff their corresponding slots are EQUALP. Only DEFSTRUCT classes
+    // qualify — a general CLOS standard-object is compared by identity (handled
+    // by the `a == b` check above). No Bliss allocation happens here, so the
+    // recursion is GC-safe (bliss-rup1).
+    if bliss_stdlib::is_instance(a) && bliss_stdlib::is_instance(b) {
+        let na = symbol_bare_name(&sym_name(bliss_stdlib::class_name(bliss_stdlib::class_of(a))));
+        let nb = symbol_bare_name(&sym_name(bliss_stdlib::class_name(bliss_stdlib::class_of(b))));
+        if na != nb || !is_struct_class_name(&na) {
+            return false;
+        }
+        for slot in bliss_stdlib::class_slots(bliss_stdlib::class_of(a)) {
+            match (
+                bliss_stdlib::slot_value(a, slot).ok(),
+                bliss_stdlib::slot_value(b, slot).ok(),
+            ) {
+                (Some(x), Some(y)) if vals_equalp(x, y) => {}
+                _ => return false,
+            }
+        }
         return true;
     }
     if is_number_value(a) && is_number_value(b) {
