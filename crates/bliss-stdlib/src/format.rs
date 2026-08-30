@@ -2251,8 +2251,15 @@ fn format_impl(
                         });
                     }
                     let idx = val.as_fixnum() as usize;
-                    if idx < clauses.len() {
-                        format_impl(&clauses[idx], args, arg_idx, output)?;
+                    // An in-range index selects that clause; otherwise fall back
+                    // to the `~:;` default clause if the body has one (bliss-mrmv).
+                    let chosen = if idx < clauses.len() {
+                        Some(idx)
+                    } else {
+                        conditional_default_index(&body)
+                    };
+                    if let Some(c) = chosen {
+                        format_impl(&clauses[c], args, arg_idx, output)?;
                     }
                 }
             }
@@ -2494,6 +2501,59 @@ fn find_matching_close(chars: &[char], start: usize, open: char) -> Result<usize
         j += 1;
     }
     Err(BlissError::Internal(format!("unmatched ~{}", open)))
+}
+
+/// For a numeric `~[` body, return the index of the clause introduced by a
+/// depth-0 `~:;` separator — the default/else clause used when the selector is
+/// out of range. `None` if there is no `~:;`. `split_clauses` already splits the
+/// body at every `~;`/`~:;`; this only identifies WHICH clause is the default,
+/// which `split_clauses` discards (bliss-mrmv).
+fn conditional_default_index(body: &str) -> Option<usize> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut depth = 0i32;
+    let mut clause_idx = 0usize; // index of the clause AFTER the separators seen so far
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '~' {
+            i += 1;
+            let mut had_colon = false;
+            while i < chars.len()
+                && (chars[i].is_ascii_digit()
+                    || matches!(
+                        chars[i],
+                        ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'
+                    ))
+            {
+                // A quoted char param (`~'x`) — skip the quote and its char so a
+                // quoted ':' is not mistaken for the colon modifier.
+                if chars[i] == '\'' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == ':' {
+                    had_colon = true;
+                }
+                i += 1;
+            }
+            if i < chars.len() {
+                match chars[i] {
+                    '{' | '[' | '(' | '<' => depth += 1,
+                    '}' | ']' | ')' | '>' => depth -= 1,
+                    ';' if depth == 0 => {
+                        clause_idx += 1;
+                        if had_colon {
+                            return Some(clause_idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 fn split_clauses(body: &str) -> Vec<String> {

@@ -3961,6 +3961,13 @@ fn format_decimal_comma_params() {
         ("(format nil \"~,,'.:d\" 1234567)", "\"1.234.567\""),
         ("(format nil \"~,,,2:d\" 1234)", "\"12,34\""),
         ("(format nil \"~:d\" -1234567)", "\"-1,234,567\""),
+        // ~[ honors the ~:; default/else clause when the index is out of range
+        // (previously produced empty output). (bliss-mrmv)
+        ("(format nil \"~[zero~;one~:;many~]\" 5)", "\"many\""),
+        ("(format nil \"~[zero~;one~:;many~]\" 0)", "\"zero\""),
+        ("(format nil \"~[zero~;one~:;many~]\" 1)", "\"one\""),
+        // No ~:; default => an out-of-range index selects nothing.
+        ("(format nil \"~[a~;b~;c~]\" 9)", "\"\""),
         // ~D/~X/~B render bignums (previously type-errored on non-fixnums,
         // though ~A/PRINT rendered them). (bliss-0mh7)
         ("(format nil \"~d\" (expt 2 70))", "\"1180591620717411303424\""),
