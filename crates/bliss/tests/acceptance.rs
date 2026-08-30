@@ -4322,6 +4322,31 @@ fn setf_subseq_on_a_list() {
     }
 }
 
+/// WRITE-TO-STRING honors :base / :radix / :escape on a direct-form call, not
+/// just via FUNCALL/APPLY — the interpreter's builtin fast-path used to ignore
+/// the keywords and print in base 10. (bliss-xe2p)
+#[test]
+fn write_to_string_honors_print_control_keywords() {
+    let cases = [
+        ("(write-to-string 255 :base 16)", "\"FF\""),
+        ("(write-to-string 10 :radix t :base 2)", "\"#b1010\""),
+        ("(write-to-string 255 :base 16 :radix t)", "\"#xFF\""),
+        ("(write-to-string 255)", "\"255\""),
+        // Reached through EVAL (the path that previously ignored the keywords).
+        ("(eval '(write-to-string 255 :base 16))", "\"FF\""),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin()
+            .args(["--eval", &format!("(print {expr})")])
+            .output()
+            .expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got}");
+    }
+}
+
 /// (setf (cXr place) v) works for composite CAR/CDR accessors even when the
 /// form is compiled (inside a defun) or run through EVAL — previously only the
 /// top-level interpreter path handled them and the rest hit "unsupported place".

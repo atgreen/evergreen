@@ -11361,9 +11361,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(arena_str(&s));
             }
             "WRITE-TO-STRING" => {
-                // Fallback path (the boot.lisp WRITE-TO-STRING defun normally
-                // handles the print-control keywords, incl. :base/:escape —
-                // bliss-82lz). Reached only if that global is unavailable.
+                // The boot.lisp WRITE-TO-STRING defun honors the print-control
+                // keywords (:base/:radix/:escape). This builtin arm is hit for a
+                // direct-form call before the general defun dispatch, and the old
+                // inline body evaluated only the first argument and ignored the
+                // keywords — so (write-to-string 255 :base 16) printed "255"
+                // rather than "FF" (bliss-xe2p). Route to the global defun (as
+                // FUNCALL/APPLY already do) when it exists; only fall back to the
+                // bare escaped print when no global is defined.
+                if let Some(f) = global_fn("WRITE-TO-STRING") {
+                    let args = eval_args(cdr, env)?;
+                    return apply_function(f, &args, env);
+                }
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
                 return Ok(arena_str(&format_val_env(v, env, true)));
