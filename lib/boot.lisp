@@ -955,6 +955,19 @@
   (car lists))
 (defun mapcan (fn &rest lists)
   (apply (function append) (apply (function mapcar) fn lists)))
+;; MAP-INTO (CLHS 17.3): destructively store into RESULT-SEQUENCE the results of
+;; applying FUNCTION to successive elements of the argument SEQUENCES, up to the
+;; shortest length (or the whole result when there are no sequences). Returns
+;; RESULT-SEQUENCE.
+(defun map-into (result-sequence function &rest sequences)
+  (let ((n (if sequences
+               (apply (function min) (length result-sequence)
+                      (mapcar (function length) sequences))
+               (length result-sequence))))
+    (dotimes (i n)
+      (setf (elt result-sequence i)
+            (apply function (mapcar (lambda (s) (elt s i)) sequences))))
+    result-sequence))
 (defun getf (plist key &optional default)
   (do ((p plist (cddr p)))
       ((null p) default)

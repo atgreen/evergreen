@@ -1768,6 +1768,29 @@ fn typep_heap_numerics_and_complex_introspection() {
     }
 }
 
+/// MAP-INTO (was undefined) destructively fills the result sequence with the
+/// results of applying the function to successive elements, up to the shortest
+/// input length (or the whole result when there are no input sequences).
+#[test]
+fn map_into_sequence() {
+    let cases = [
+        ("(map-into (make-list 3) #'1+ '(10 20 30))", "(11 21 31)"),
+        ("(map-into (make-array 3) #'+ '(1 2 3) '(10 20 30))", "#(11 22 33)"),
+        // Shortest length wins; the trailing element keeps its value.
+        ("(map-into (vector 0 0 0 0) #'* '(1 2 3) '(4 5 6 7))", "#(4 10 18 0)"),
+        // No input sequences: fill the whole result by calling the function.
+        ("(let ((c 0)) (map-into (make-list 3) (lambda () (incf c))))", "(1 2 3)"),
+        ("(fboundp 'map-into)", "T"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+        assert_eq!(got, expected, "{expr} => expected {expected}, got: {got} (full: {stdout:?})");
+    }
+}
+
 /// Heap numerics (bignum/ratio/complex/double-float) hash and compare by VALUE,
 /// so they work as hash-table keys under EQL/EQUAL/EQUALP — previously SXHASH and
 /// the key comparison used the object's address, so two distinct-but-equal keys
