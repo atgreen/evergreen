@@ -5209,3 +5209,32 @@ fn make_thread_accepts_sharp_quote_global_and_rejects_capturing_closure() {
         "capturing closure should give the precise MAKE-THREAD error; got stderr: {stderr}"
     );
 }
+
+/// A spawned worker that allocates heavily enough to trigger its OWN minor GC
+/// (5M conses) runs to completion while the spawner blocks in JOIN-THREAD
+/// (bliss-bw3t). Previously this deadlocked: the joiner waited in a futex while
+/// still marked Running, so the worker's stop-the-world GC counted it as a
+/// participant and waited for it to reach a safepoint that never came. JOIN-THREAD
+/// now marks the caller Blocked (stack published) so the collector skips it.
+#[test]
+fn worker_can_gc_while_spawner_blocks_in_join() {
+    let output = bliss_bin()
+        .args([
+            "--no-init",
+            "--eval",
+            "(defun heavy (n) (let ((acc nil)) (dotimes (i n) (setq acc (cons i acc))) (length acc)))",
+            "--eval",
+            "(defun worker () (heavy 5000000))",
+            "--eval",
+            "(princ (bliss-thread:join-thread (bliss-thread:make-thread (quote worker))))",
+        ])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "exit code should be 0 (no deadlock)");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("5000000"),
+        "worker's own GC while the spawner joins must complete and return 5000000; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
