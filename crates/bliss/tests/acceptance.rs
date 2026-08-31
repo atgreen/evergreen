@@ -5170,3 +5170,42 @@ fn two_interpreter_threads_allocate_concurrently_under_gc_threshold() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// MAKE-THREAD accepts a non-capturing function OBJECT (#'global-defun, env
+/// NIL) as well as a symbol, and rejects a lexical-capturing closure with a
+/// precise error rather than a confusing "cannot apply" — a closure's captured
+/// frame lives in the spawner's thread_local CLOSURE_ENV, invisible to the
+/// worker (bliss-q9i1; cross-thread closures are bliss-nubv).
+#[test]
+fn make_thread_accepts_sharp_quote_global_and_rejects_capturing_closure() {
+    let ok = bliss_bin()
+        .args([
+            "--no-init",
+            "--eval",
+            "(defun w () 99)",
+            "--eval",
+            "(princ (bliss-thread:join-thread (bliss-thread:make-thread #'w)))",
+        ])
+        .output()
+        .expect("run bliss");
+    assert_eq!(ok.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&ok.stdout).contains("99"),
+        "non-capturing #'global should run on a thread; got: {}",
+        String::from_utf8_lossy(&ok.stdout)
+    );
+
+    let bad = bliss_bin()
+        .args([
+            "--no-init",
+            "--eval",
+            "(let ((x 5)) (bliss-thread:make-thread (lambda () x)))",
+        ])
+        .output()
+        .expect("run bliss");
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        stderr.contains("cannot yet cross threads") && !stderr.contains("cannot apply"),
+        "capturing closure should give the precise MAKE-THREAD error; got stderr: {stderr}"
+    );
+}

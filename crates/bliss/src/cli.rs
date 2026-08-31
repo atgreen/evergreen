@@ -9114,6 +9114,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (ff, _) = cp(cdr);
                 let mut fnv = eval_form(ff, env)?;
                 bliss_rt::rooted_ref!(_fnv_root = &mut fnv);
+                // Only entries that are safe to run on another thread are
+                // accepted for now (bliss-nubv). A SYMBOL is an immediate the
+                // worker resolves through the shared global function cell. A
+                // pinned interpreted-function object with NO captured lexical
+                // environment (a global defun, or a lambda closing over nothing)
+                // is likewise self-contained. REJECTED: an interpreter closure
+                // `(BLISS::CLOSURE . id)` — its captured frame lives in the
+                // spawner's thread_local CLOSURE_ENV, invisible to the worker, so
+                // it would fail with a confusing "cannot apply" (or, once GC
+                // relocates the cons, worse). Give a precise error instead.
+                let shareable = fnv.is_symbol()
+                    || (bliss_rt::function::is_interpreted_function(fnv)
+                        && bliss_rt::function::env(fnv).is_nil());
+                if !shareable {
+                    return Err(BlissError::ProgramError(
+                        "BLISS-THREAD:MAKE-THREAD entry must be a symbol naming a \
+                         global function or a non-capturing function; a closure that \
+                         captures lexical variables cannot yet cross threads \
+                         (bliss-nubv). Pass a symbol, e.g. (make-thread 'my-worker)."
+                            .to_string(),
+                    ));
+                }
                 let id = bliss_rt::make_thread(fnv)?;
                 return Ok(BlissVal::from_fixnum(id.0 as i64));
             }
