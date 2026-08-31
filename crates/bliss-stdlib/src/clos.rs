@@ -359,6 +359,10 @@ struct ClosState {
     /// freed), so this set never holds a stale entry. Slot *data* is inline in
     /// the heap object; this is only a liveness registry. See bliss-xyo.
     live_instances: HashSet<BlissVal>,
+    /// Class values created by DEFSTRUCT. Their instances are STRUCTURE-OBJECTs
+    /// (not STANDARD-OBJECTs) and EQUALP descends them / they print in #S(...)
+    /// syntax — none of which applies to a plain DEFCLASS class (bliss-i1i9).
+    structure_classes: HashSet<BlissVal>,
     // Built-in class values
     fixnum_class: BlissVal,
     character_class: BlissVal,
@@ -388,6 +392,7 @@ impl ClosState {
             next_em_key: 500_000,
             next_gf_id: 200_000,
             live_instances: HashSet::new(),
+            structure_classes: HashSet::new(),
             fixnum_class: NIL,
             character_class: NIL,
             symbol_class: NIL,
@@ -739,6 +744,21 @@ pub fn find_class(name: BlissVal) -> Option<BlissVal> {
     })
 }
 
+/// Mark `class` as a structure class (created by DEFSTRUCT). Idempotent.
+pub fn set_structure_class(class: BlissVal) {
+    with_state_mut(|st| {
+        st.structure_classes.insert(class);
+    });
+}
+
+/// Whether `class` is a structure class (DEFSTRUCT). NIL / unknown → false.
+pub fn is_structure_class(class: BlissVal) -> bool {
+    if class.is_nil() {
+        return false;
+    }
+    with_state(|st| st.structure_classes.contains(&class))
+}
+
 /// Register a class by name.
 pub fn set_find_class(name: BlissVal, class: BlissVal) -> Result<(), BlissError> {
     with_state_mut(|st| {
@@ -977,6 +997,28 @@ pub fn class_slots(class: BlissVal) -> Vec<BlissVal> {
             .map(|m| m.slots.clone())
             .unwrap_or_default()
     })
+}
+
+/// All effective slot names of `class` — its own direct slots plus every
+/// inherited slot — in precedence order (most-general superclass first, so an
+/// :include parent's slots precede the child's), de-duplicated. Used for #S
+/// structure printing and EQUALP structure comparison, which need the full
+/// slot set, not just the direct slots `class_slots` returns.
+pub fn effective_slots(class: BlissVal) -> Vec<BlissVal> {
+    let cpl = match compute_class_precedence_list(class) {
+        Ok(c) => c,
+        Err(_) => return class_slots(class),
+    };
+    let mut seen: HashSet<BlissVal> = HashSet::new();
+    let mut out: Vec<BlissVal> = Vec::new();
+    for c in cpl.into_iter().rev() {
+        for slot in class_slots(c) {
+            if seen.insert(slot) {
+                out.push(slot);
+            }
+        }
+    }
+    out
 }
 
 // ── C3 linearization ──────────────────────────────────────────────

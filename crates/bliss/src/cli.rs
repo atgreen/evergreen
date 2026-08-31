@@ -4346,6 +4346,25 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
             out.push_str(&rendered);
             return;
         }
+        // A DEFSTRUCT instance prints in readable #S(NAME :slot val …) syntax,
+        // matching the stdlib printer (bliss-i1i9).
+        let class = bliss_stdlib::class_of(val);
+        if bliss_stdlib::is_structure_class(class) {
+            out.push_str("#S(");
+            out.push_str(&symbol_bare_name(&sym_name(bliss_stdlib::class_name(class))));
+            let prev = PRINT_ESCAPE.with(|c| c.replace(true));
+            for slot in bliss_stdlib::effective_slots(class) {
+                if let Ok(sv) = bliss_stdlib::slot_value(val, slot) {
+                    out.push_str(" :");
+                    out.push_str(&symbol_bare_name(&sym_name(slot)));
+                    out.push(' ');
+                    print_val_inner(sv, out);
+                }
+            }
+            PRINT_ESCAPE.with(|c| c.set(prev));
+            out.push(')');
+            return;
+        }
         let name = instance_class_hierarchy_names(val)
             .as_ref()
             .and_then(|names| names.first())
@@ -6623,12 +6642,8 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             // A DEFSTRUCT instance is a STRUCTURE-OBJECT and NOT a
             // STANDARD-OBJECT (the two are disjoint), even though its CLOS
             // precedence list — bliss builds structs as DEFCLASSes — contains
-            // STANDARD-OBJECT. STRUCT_CLASSES records which class names are
-            // structs (bliss-ta0a).
-            let is_struct = hierarchy
-                .as_ref()
-                .map(|names| names.iter().any(|n| is_struct_class_name(n)))
-                .unwrap_or(false);
+            // STANDARD-OBJECT (bliss-ta0a).
+            let is_struct = bliss_stdlib::is_structure_class(bliss_stdlib::class_of(object));
             if type_name == "STRUCTURE-OBJECT" {
                 return Ok(is_struct);
             }
@@ -20058,9 +20073,12 @@ fn eval_defstruct(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> 
     bliss_rt::rooted!(clauses_list = vec_to_list(&slot_clauses));
     let defclass_form = vec_to_list(&[sym("DEFCLASS"), *name_sym_r, *supers, *clauses_list]);
     eval_form(defclass_form, env)?;
-    // Mark this class as a structure so EQUALP descends its instances slot-by-
-    // slot (unlike a plain DEFCLASS standard-object; bliss-rup1).
-    register_struct_class(&name_str);
+    // Mark this class as a structure so EQUALP descends its instances, TYPEP
+    // answers STRUCTURE-OBJECT, and it prints in #S(...) syntax — none of which
+    // holds for a plain DEFCLASS standard-object (bliss-rup1/ta0a/i1i9).
+    if let Some(class) = bliss_stdlib::find_class(*name_sym_r) {
+        bliss_stdlib::set_structure_class(class);
+    }
 
     // Constructors. A keyword constructor forwards every initarg to
     // MAKE-INSTANCE (so inherited slots Just Work); a BOA constructor maps its
@@ -21878,23 +21896,6 @@ fn vals_equal(a: BlissVal, b: BlissVal) -> bool {
     false
 }
 
-thread_local! {
-    /// Bare names of classes created by DEFSTRUCT. EQUALP descends structures
-    /// (comparing corresponding slots) but NOT general CLOS standard-objects
-    /// (CLHS 5.3); bliss implements DEFSTRUCT as DEFCLASS, so this set records
-    /// which instance classes are structures (bliss-rup1).
-    static STRUCT_CLASSES: std::cell::RefCell<std::collections::HashSet<String>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
-}
-fn register_struct_class(name: &str) {
-    STRUCT_CLASSES.with(|s| {
-        s.borrow_mut().insert(name.to_string());
-    });
-}
-fn is_struct_class_name(name: &str) -> bool {
-    STRUCT_CLASSES.with(|s| s.borrow().contains(name))
-}
-
 /// CL `EQUALP`: like `EQUAL` but numbers compare by value across types
 /// (`1` equalp `1.0`), characters and strings compare case-insensitively,
 /// vectors/arrays compare element-wise, and structures compare slot-wise.
@@ -21908,12 +21909,13 @@ fn vals_equalp(a: BlissVal, b: BlissVal) -> bool {
     // by the `a == b` check above). No Bliss allocation happens here, so the
     // recursion is GC-safe (bliss-rup1).
     if bliss_stdlib::is_instance(a) && bliss_stdlib::is_instance(b) {
-        let na = symbol_bare_name(&sym_name(bliss_stdlib::class_name(bliss_stdlib::class_of(a))));
+        let ca = bliss_stdlib::class_of(a);
+        let na = symbol_bare_name(&sym_name(bliss_stdlib::class_name(ca)));
         let nb = symbol_bare_name(&sym_name(bliss_stdlib::class_name(bliss_stdlib::class_of(b))));
-        if na != nb || !is_struct_class_name(&na) {
+        if na != nb || !bliss_stdlib::is_structure_class(ca) {
             return false;
         }
-        for slot in bliss_stdlib::class_slots(bliss_stdlib::class_of(a)) {
+        for slot in bliss_stdlib::effective_slots(ca) {
             match (
                 bliss_stdlib::slot_value(a, slot).ok(),
                 bliss_stdlib::slot_value(b, slot).ok(),

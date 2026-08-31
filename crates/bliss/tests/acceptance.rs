@@ -4416,6 +4416,31 @@ fn write_to_string_honors_print_control_keywords() {
     }
 }
 
+/// DEFSTRUCT instances print in readable #S(NAME :slot val …) syntax (both the
+/// prin1 builtin and prin1-to-string agree), with inherited :include slots
+/// included in precedence order. (bliss-i1i9)
+#[test]
+fn defstruct_prints_in_hash_s_syntax() {
+    let prog = "(defstruct pt a b) \
+                (defstruct (pt3 (:include pt)) c) \
+                (print (prin1-to-string (make-pt :a 1 :b 2))) \
+                (print (prin1-to-string (make-pt3 :a 1 :b 2 :c 3))) \
+                (print (prin1-to-string (make-pt :a \"hi\" :b (list 1 2)))) \
+                (print (equal (prin1-to-string (make-pt :a 1 :b 2)) \
+                              (with-output-to-string (s) (prin1 (make-pt :a 1 :b 2) s))))";
+    let out = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"#S(PT :A 1 :B 2)\""), "simple struct: {stdout}");
+    assert!(stdout.contains("\"#S(PT3 :A 1 :B 2 :C 3)\""), "included struct: {stdout}");
+    assert!(stdout.contains("\"#S(PT :A \\\"hi\\\" :B (1 2))\""), "escaped slots: {stdout}");
+    // prin1 builtin and prin1-to-string agree (the two printers don't diverge).
+    assert!(
+        stdout.lines().any(|l| l.trim() == "T"),
+        "cli and stdlib printers should agree: {stdout}"
+    );
+}
+
 /// TYPEP: a DEFSTRUCT instance is a STRUCTURE-OBJECT and NOT a STANDARD-OBJECT
 /// (disjoint), even though bliss builds structs as DEFCLASSes; a plain DEFCLASS
 /// instance is the reverse. (bliss-ta0a)

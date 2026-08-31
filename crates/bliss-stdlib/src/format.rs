@@ -858,6 +858,14 @@ fn format_instance(v: BlissVal) -> String {
         return instance_class_tag(v);
     }
     DEPTH.with(|d| d.set(d.get() + 1));
+    // A DEFSTRUCT instance prints in the readable #S(NAME :slot val …) syntax
+    // (CLHS 22.1.3.12), not the generic #<NAME> (bliss-i1i9).
+    let class = crate::clos::class_of(v);
+    if crate::clos::is_structure_class(class) {
+        let result = format_struct(v, class);
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        return result;
+    }
     let control_sym =
         BlissVal::from_symbol_index(bliss_compiler::reader::intern_symbol("FORMAT-CONTROL"));
     let result = match crate::clos::slot_value(v, control_sym) {
@@ -885,6 +893,27 @@ fn format_instance(v: BlissVal) -> String {
     };
     DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
     result
+}
+
+/// Render a DEFSTRUCT instance as `#S(NAME :slot val :slot val …)` — the
+/// readable structure syntax. Slot names print as keywords; slot values print
+/// escaped (prin1-style) so the form round-trips. Slots are emitted in the
+/// class's slot order (CLHS 22.1.3.12; bliss-i1i9).
+fn format_struct(v: BlissVal, class: BlissVal) -> String {
+    let name = crate::clos::class_name(class);
+    let mut out = String::from("#S(");
+    out.push_str(&blissval_to_print_string(name, false));
+    for slot in crate::clos::effective_slots(class) {
+        if let Ok(val) = crate::clos::slot_value(v, slot) {
+            out.push(' ');
+            out.push(':');
+            out.push_str(&blissval_to_print_string(slot, false));
+            out.push(' ');
+            out.push_str(&blissval_to_print_string(val, true));
+        }
+    }
+    out.push(')');
+    out
 }
 
 /// `#<CLASS-NAME>` tag for an instance with no printable report.

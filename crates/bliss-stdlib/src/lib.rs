@@ -39,9 +39,11 @@ pub mod time;
 pub use clos::{
     MethodCombinationType, MethodQualifier, allocate_instance, bootstrap_clos, change_class,
     class_direct_subclasses, class_direct_superclasses, class_name, class_of, class_slots,
+    effective_slots,
     compute_applicable_methods, compute_class_precedence_list, compute_effective_method,
     define_class, ensure_clos_bootstrapped, find_class, generic_function_name, initialize_instance,
-    is_instance, make_generic_function, make_instance, reinitialize_instance, set_find_class,
+    is_instance, is_structure_class, make_generic_function, make_instance, reinitialize_instance,
+    set_find_class, set_structure_class,
     set_method_specializers, set_slot_value, shared_initialize, shared_initialize_with_list,
     slot_boundp, slot_makunbound, slot_value,
 };
