@@ -87,7 +87,7 @@ pub use thread::{
     current_thread, current_thread_id, fiber_carrier_thread, fiber_state, fiber_yield,
     interrupt_fiber, interrupt_thread, join_fiber, join_thread, make_fiber, make_thread,
     park_current_fiber, poll_current_sandbox_cpu_deadline, post_current_pending_signal,
-    post_foreground_pending_signal, set_current_execution_foreground,
+    post_foreground_pending_signal, set_current_execution_foreground, set_thread_entry_runner,
     start_current_sandbox_cpu_deadline, submit_fiber, take_current_pending_signal,
     thread_is_carrier, thread_yield, with_current_condition_state_mut,
 };

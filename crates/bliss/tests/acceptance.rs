@@ -5083,3 +5083,59 @@ fn defun_establishes_implicit_block_for_return_from() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A Lisp function named by a symbol runs on a real spawned native thread and
+/// its value is returned by JOIN-THREAD (bliss-q9i1, epic bliss-jiwf). This is
+/// the foundational threading slice: the interpreter installs a thread-entry
+/// runner (bliss_rt::set_thread_entry_runner) so bliss-rt can run interpreted
+/// Lisp — not just bare native fn-pointers — on a worker thread. Passing a
+/// SYMBOL (an immediate) avoids sharing a nursery-allocated closure across
+/// threads (bliss-nubv). The spawner blocks in JOIN-THREAD, so only one
+/// interpreter thread runs at a time — the tree-walker does not yet poll GC
+/// safepoints, so true parallel allocation still deadlocks (bliss-bw3t).
+#[test]
+fn make_thread_runs_named_lisp_function_and_join_returns_its_value() {
+    let output = bliss_bin()
+        .args([
+            "--no-init",
+            "--eval",
+            "(defun worker () (+ 40 2))",
+            "--eval",
+            "(princ (bliss-thread:join-thread (bliss-thread:make-thread (quote worker))))",
+        ])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "exit code should be 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("42"),
+        "worker thread should compute (+ 40 2) and JOIN-THREAD return 42; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A worker thread that allocates heavily (2M conses → many natural minor GCs)
+/// while the spawner blocks in JOIN-THREAD completes correctly. Guards the
+/// single-active-mutator GC path for spawned interpreter threads (bliss-q9i1);
+/// concurrent multi-mutator allocation is a separate, still-open case
+/// (bliss-bw3t).
+#[test]
+fn spawned_thread_survives_natural_minor_gc_while_spawner_joins() {
+    let output = bliss_bin()
+        .args([
+            "--no-init",
+            "--eval",
+            "(defun heavy () (let ((acc nil)) (dotimes (i 2000000) (setq acc (cons i acc))) (length acc)))",
+            "--eval",
+            "(princ (bliss-thread:join-thread (bliss-thread:make-thread (quote heavy))))",
+        ])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "exit code should be 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("2000000"),
+        "heavy allocating worker should return list length 2000000; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

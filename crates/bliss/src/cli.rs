@@ -474,16 +474,22 @@ fn seed_standard_packages_registry() {
     let _ = bliss_stdlib::make_package("KEYWORD", &[], &[]);
     let _ = bliss_stdlib::make_package("BLISS-INTERNAL", &[], &[]);
     let _ = bliss_stdlib::make_package("BLISS-EXT", &[], &["COMMON-LISP"]);
+    // Native-thread API package (§13.9). BLISS-THREADS is the deprecated
+    // compatibility nickname (spec §13.9.1). Fibers get a separate BLISS-FIBER
+    // package (bliss-l3wy).
+    let _ = bliss_stdlib::make_package("BLISS-THREAD", &["BLISS-THREADS"], &["COMMON-LISP"]);
     for name in [
         "COMMON-LISP",
         "COMMON-LISP-USER",
         "KEYWORD",
         "BLISS-INTERNAL",
         "BLISS-EXT",
+        "BLISS-THREAD",
     ] {
         reader::register_package(name);
     }
     reader::register_package("CL-USER");
+    reader::register_package("BLISS-THREADS");
 }
 
 /// The canonical package object for `canonical_name` (nicknames resolved first).
@@ -3645,7 +3651,31 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
 
 fn install_evaluator_global_root_scanner() {
     static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| bliss_rt::gc::register_root_scanner(scan_evaluator_global_roots));
+    INSTALL.call_once(|| {
+        bliss_rt::gc::register_root_scanner(scan_evaluator_global_roots);
+        // Teach the runtime how to run a Lisp function on a spawned native
+        // thread (bliss-q9i1): bliss-rt is the lower layer and cannot call the
+        // interpreter directly, so it invokes this host callback.
+        bliss_rt::set_thread_entry_runner(thread_entry_runner);
+    });
+}
+
+/// Run a Lisp function value to completion on the *current* (freshly spawned)
+/// native thread and return its primary value. Registered with
+/// `bliss_rt::set_thread_entry_runner` (bliss-q9i1).
+///
+/// The parent's `Env` is `Rc<RefCell<…>>` (`!Send`) and must never cross the
+/// thread boundary; only `entry` (a `Copy` `BlissVal`) does. Here we build a
+/// *fresh* per-thread environment. Global definitional state that already lives
+/// in shared `bliss-rt` cells (function/value cells) is visible; state still
+/// held in `thread_local!`/`Rc`-local maps (CLOS classes, macros defined at the
+/// REPL) is NOT yet shared and so is invisible on the worker — that migration is
+/// tracked as bliss-nubv. Crucially we use the *non-resetting* constructor:
+/// `reset_clos=true` would wipe the parent thread's classes and packages.
+fn thread_entry_runner(mut entry: BlissVal) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted_ref!(_entry_root = &mut entry);
+    let mut env = Env::new_impl(false, false);
+    apply_function(entry, &[], &mut env)
 }
 
 impl Env {
@@ -9062,6 +9092,51 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     true
                 };
                 return Ok(if is_const { T } else { NIL });
+            }
+            "BLISS-THREAD::MAKE-THREAD" | "BLISS-THREAD:MAKE-THREAD" => {
+                // (bliss-thread:make-thread function &key name) — spawn a
+                // dedicated native OS thread that runs FUNCTION with no
+                // arguments and returns its value to a later JOIN-THREAD
+                // (bliss-q9i1, §13.5.3). NAME is accepted and currently ignored.
+                // The handle is presently the raw native-thread id as a fixnum;
+                // a distinct first-class THREAD object is tracked as bliss-8z5i.
+                //
+                // EXPERIMENTAL — foundational slice, not yet safe for general
+                // use (epic bliss-jiwf). Two known blockers: (1) FUNCTION must
+                // currently be a SYMBOL naming a global function or another
+                // non-capturing entry — a freshly consed closure/lambda lives in
+                // the parent's nursery and the worker reads a stale pointer
+                // (bliss-nubv). (2) The tree-walker does not poll GC safepoints,
+                // so two interpreter threads allocating *concurrently* deadlock
+                // at stop-the-world; today this is safe only when one interpreter
+                // thread runs at a time (e.g. the worker runs while the spawner
+                // blocks in JOIN-THREAD). Safepoint cooperation is bliss-bw3t.
+                let (ff, _) = cp(cdr);
+                let mut fnv = eval_form(ff, env)?;
+                bliss_rt::rooted_ref!(_fnv_root = &mut fnv);
+                let id = bliss_rt::make_thread(fnv)?;
+                return Ok(BlissVal::from_fixnum(id.0 as i64));
+            }
+            "BLISS-THREAD::JOIN-THREAD" | "BLISS-THREAD:JOIN-THREAD" => {
+                // (bliss-thread:join-thread thread) — block until THREAD's entry
+                // function returns, yielding that value (§13.5.3 Death).
+                let (tf, _) = cp(cdr);
+                let tv = eval_form(tf, env)?;
+                if !tv.is_fixnum() {
+                    return Err(BlissError::TypeError {
+                        datum: tv,
+                        expected: "a bliss-thread thread handle".to_string(),
+                    });
+                }
+                let id = bliss_rt::NativeThreadId(tv.as_fixnum() as u64);
+                return bliss_rt::join_thread(id);
+            }
+            "BLISS-THREAD::CURRENT-THREAD" | "BLISS-THREAD:CURRENT-THREAD" => {
+                // (bliss-thread:current-thread) — the running thread's handle.
+                let _ = eval_args(cdr, env)?;
+                return Ok(BlissVal::from_fixnum(
+                    bliss_rt::current_thread_id().0 as i64,
+                ));
             }
             "BLISS-INTERNAL::%MARK-CONSTANT"
             | "BLISS-INTERNAL:%MARK-CONSTANT"
@@ -20905,6 +20980,8 @@ fn is_builtin_function(name: &str) -> bool {
         name,
         // Introspection / devtools
         "DISASSEMBLE"
+            // Native threads (BLISS-THREAD, §13.9; bliss-q9i1)
+            | "MAKE-THREAD" | "JOIN-THREAD" | "CURRENT-THREAD"
             // Control / function application
             | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
             | "CONSTANTLY" | "NOT" | "EQ" | "EQL" | "EQUAL" | "EQUALP"

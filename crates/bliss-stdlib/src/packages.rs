@@ -683,7 +683,16 @@ impl Default for PackageRegistry {
 
 impl Drop for PackageRegistry {
     fn drop(&mut self) {
-        CURRENT_STORE.with(|cell| {
+        // Use `try_with`: at thread/process teardown the CURRENT_STORE
+        // thread-local may already be destroyed (a PackageRegistry lives *in*
+        // CURRENT_STORE, so its drop can run during that same TLS's
+        // destruction). `with` would panic there — `cannot access a Thread
+        // Local Storage value during or after destruction` — and a panic in a
+        // drop glue on a worker thread aborts the whole process (surfaced when
+        // spawning native threads, bliss-q9i1). There is nothing to restore once
+        // the TLS is gone, so silently skip. (Normal, non-teardown drops still
+        // restore the previous store.)
+        let _ = CURRENT_STORE.try_with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot
                 .as_ref()

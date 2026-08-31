@@ -1530,13 +1530,38 @@ fn run_fiber_entry(thread: &Fiber) -> Result<BlissVal, BlissError> {
     result
 }
 
+/// A callback, installed by the interpreter/runtime host, that runs a Lisp
+/// function value (interpreted closure, bytecode function, or symbol naming a
+/// function) to completion on the *current* thread and returns its primary
+/// value. `bliss-rt` cannot call the interpreter directly (it is the lower
+/// layer), so the host registers this hook at startup — mirroring
+/// `install_gc_hooks` (bliss-rt/lib.rs) and `set_runtime_init_hook`. Without it,
+/// only bare native `fn() -> BlissVal` entry points can run on a spawned thread
+/// (the pre-existing behaviour, used by the Rust-level threading tests).
+pub type ThreadEntryRunner = fn(BlissVal) -> Result<BlissVal, BlissError>;
+
+static THREAD_ENTRY_RUNNER: OnceLock<ThreadEntryRunner> = OnceLock::new();
+
+/// Install the host's Lisp thread-entry runner (see [`ThreadEntryRunner`]).
+/// Idempotent; a second call is ignored.
+pub fn set_thread_entry_runner(runner: ThreadEntryRunner) {
+    let _ = THREAD_ENTRY_RUNNER.set(runner);
+}
+
 fn run_entry(entry: BlissVal) -> Result<BlissVal, BlissError> {
     if entry.is_function() {
+        // A bare native code entry point (`TAG_FUNCTION` = an untagged code
+        // address). Interpreted/bytecode function objects are heap objects, not
+        // `TAG_FUNCTION`, so they fall through to the host runner below.
         let fn_addr = entry.0 & !crate::value::TAG_MASK;
         let function: fn() -> BlissVal = unsafe { std::mem::transmute(fn_addr) };
         Ok(function())
     } else if matches!(entry.0, crate::value::NIL_BITS | crate::value::T_BITS) {
         Ok(entry)
+    } else if let Some(runner) = THREAD_ENTRY_RUNNER.get() {
+        // A Lisp function value: hand it to the interpreter host, which builds a
+        // fresh per-thread environment and applies it (bliss-q9i1).
+        runner(entry)
     } else {
         Err(BlissError::TypeError {
             datum: entry,
