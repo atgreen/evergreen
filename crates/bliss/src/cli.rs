@@ -4125,9 +4125,22 @@ impl Env {
     }
 
     fn seed_standard_constant(&mut self, name: &str, val: BlissVal) {
-        self.define_local(name, val);
-        self.define_local(&format!("COMMON-LISP:{name}"), val);
-        self.define_local(&format!("CL:{name}"), val);
+        // Seed into the symbol's global value cell — the canonical global store
+        // (bliss-jtc.6 Stage C2), NOT a root-frame binding. `define_local` into
+        // the top-level frame *looks* global from an interpreted top-level read
+        // (which sees that frame) and from SYMBOL-VALUE, but a called function's
+        // activation env does NOT chain back to the root frame, so a COMPILED
+        // (bytecode) read of the constant fell through to the empty value cell
+        // and raised UNBOUND-VARIABLE — while the interpreted read worked
+        // (bliss-1i3q). The value cell is visible uniformly from interpreted and
+        // compiled code alike, so seeding it fixes both.
+        //
+        // `name` is a bare CL constant name; the reader canonicalizes the
+        // package-qualified forms (COMMON-LISP:NAME, CL:NAME) to this same
+        // interned symbol (verified EQ), so one cell serves all three. boot.lisp
+        // later DEFCONSTANT's most of these, writing the same cell.
+        let idx = bliss_rt::symbols::intern(name);
+        bliss_rt::symbols::set_symbol_value(idx, val);
     }
 
     fn lookup_frame(frame: &Rc<RefCell<EnvFrame>>, name: &str) -> Option<BlissVal> {
