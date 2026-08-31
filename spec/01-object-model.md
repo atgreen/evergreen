@@ -26,7 +26,7 @@ Source: `crates/bliss-rt/src/object.rs`, `crates/bliss-rt/src/types/`.
 | R1.11 | `NIL` MUST be encoded as the `BlissVal` bit pattern `0b111` (tag `111`, payload zero). |
 | R1.12 | `T` MUST be encoded as `BlissVal` with tag `111` and payload `1` (bit pattern `0b1_111` = `0x0F`). |
 | R1.13 | Cons cells MUST be exactly 16 bytes (two `BlissVal` fields: CAR, CDR), with no header. |
-| R1.14 | Strings MUST use UTF-8 internal encoding. |
+| R1.14 | Simple strings MUST use fixed-width, coder-tagged internal storage (§1.6.3): a per-string `coder` selects `LATIN1` (1 byte/char, code points < 256) or `UCS4` (4 bytes/char, full range), so `CHAR`/`SCHAR`/`AREF` are O(1) by character index. UTF-8 is an external-format encoding only, applied at I/O boundaries — NOT the internal representation. |
 | R1.15 | Arrays MUST support all element-type specialisations required by ANSI CL §15.1. |
 | R1.16 | Symbols MUST contain at least: name, value, function, plist, and package cells. |
 | R1.17 | The `UNBOUND` marker MUST be a unique `BlissVal` with tag `111` that is distinct from NIL, T, and every other value. |
@@ -296,30 +296,61 @@ Data region is packed and padded to the next 8-byte boundary (R1.20).
 
 ### 1.6.3  Strings — D1.06
 
-**Decision: UTF-8 internal encoding (R1.14).**
+**Decision: fixed-width, coder-tagged storage (compact strings), modelled
+on the JVM's Compact Strings (R1.14).** (Supersedes the original UTF-8-only
+decision; see D1.06-history below.)
 
-Rationale: UTF-8 is compact for ASCII-heavy Lisp source, interoperates
-with Rust `&str`, OS APIs, and network protocols without conversion.
-Random access by character index is O(n) but this matches the CL spec
-(no constant-time `CHAR` guarantee). When constant-time indexing is
-needed the compiler MAY build a stride table or promote to UCS-4.
+A simple string stores its characters in a fixed-width element array whose
+width is selected by a one-byte `coder`:
+
+| `coder` | Width | Range | Access |
+|---------|-------|-------|--------|
+| `0` `LATIN1` | 1 byte/char | code points 0–255 | `data[i]` |
+| `1` `UCS4`   | 4 bytes/char (`u32`, native-endian) | 0–`#x10FFFF` | `data[4·i]` |
+
+`length` is the **character** count (not a byte count). `CHAR`/`SCHAR`/
+`AREF` and `(SETF CHAR)`/`(SETF SCHAR)` are therefore **O(1)** by character
+index for every simple string.
 
 ```text
-Simple-Base-String (type_id=0x05):
+Simple string (type_id=0x05 base / 0x06 character):
   Offset  Size     Field
     0       8      ObjectHeader
-    8       8      byte_length: u64 (UTF-8 byte count)
-   16       N      data[0..N]: u8[] (UTF-8 bytes, NOT null-terminated)
-   16+N     pad    zero-padding to 8-byte boundary
-
-Simple-Character-String (type_id=0x06):
-  Same layout as Simple-Base-String but with type_id=0x06.
-  Content MAY include non-ASCII codepoints.
+    8       8      length: u64  (CHARACTER count)
+   16       1      coder: u8    (0=LATIN1, 1=UCS4)
+   17       7      padding (zero)
+   24       W·L    data: L elements of W bytes (W = 1 for LATIN1, 4 for UCS4)
+   24+W·L   pad    zero-padding to the next 8-byte boundary
 ```
 
-Both string types store UTF-8. The distinction exists for CL type
-dispatch: `BASE-STRING` guarantees `BASE-CHAR` elements (subset of
-ASCII), while `STRING` allows the full Unicode range.
+**Coder selection and promotion.** A fresh string uses the narrowest coder
+that fits its contents (`LATIN1` if every code point < 256, else `UCS4`).
+`(SETF CHAR)` that stores a code point ≥ 256 into a `LATIN1` string
+**promotes** it in place to `UCS4` (reallocate the data region 1→4 bytes/
+char, widen every element; identity is preserved via the standard
+forwarding path). Promotion never reverses — a string that once held a wide
+character stays `UCS4`. `SIMPLE-BASE-STRING` (type_id `0x05`) guarantees
+`BASE-CHAR` elements and is therefore always `LATIN1` and never promotes;
+storing a code point ≥ 256 into it is a `TYPE-ERROR`. `SIMPLE-CHARACTER-
+STRING` (type_id `0x06`) admits either coder and promotes as above.
+
+**Rationale.** Fixed-width storage gives constant-time character indexing
+(the UTF-8 layout was O(n) per `CHAR`, so an index loop was O(n²)) while
+`LATIN1` keeps the overwhelmingly common ASCII/Latin-1 case at 1 byte/char.
+We deviate from Java's UTF-16 wide coder deliberately: Java `charAt` returns
+a 16-bit code *unit* (astral characters are surrogate pairs, so code-*point*
+indexing is not O(1)), whereas Common Lisp `CHAR` returns a whole
+`CHARACTER` (a code point up to `#x10FFFF`). A fixed-width `UCS4` wide coder
+preserves O(1) *code-point* access; UTF-16 would not.
+
+**External format.** UTF-8 remains the default external format: streams
+encode on write and decode on read at the I/O boundary (§05-04 streams,
+external-format codecs). It is never the in-memory representation.
+
+**D1.06-history.** The original decision stored both string types as UTF-8
+bytes with an O(n) `CHAR`. That was revised (bliss-pd0) because CL strings
+are mutable char-indexed arrays; the compact-string layout above restores
+O(1) semantics while staying compact.
 
 ### 1.6.4  Complex Arrays — D1.07
 
