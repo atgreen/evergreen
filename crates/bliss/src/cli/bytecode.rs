@@ -9897,7 +9897,16 @@ enum Pending {
 fn visit_pending_roots(pending: &mut Pending, visit: &mut dyn FnMut(*mut BlissVal)) {
     match pending {
         Pending::Return { value, .. } => visit(value),
-        Pending::Token(_) | Pending::Go { .. } | Pending::Propagate(_) => {}
+        // A propagating error can carry movable BlissVals — TypeError.datum,
+        // UNBOUND-VARIABLE/UNDEFINED-FUNCTION names, or a Signalled condition
+        // (bliss-9kc). While it is parked in a CleanupCont::Resume during an
+        // UNWIND-PROTECT cleanup, that cleanup can allocate and move the nursery,
+        // so those roots must be traced or they go stale (bliss-3scj).
+        Pending::Propagate(error) => {
+            use bliss_rt::gc::TraceHostRoots;
+            error.trace_host_roots(visit);
+        }
+        Pending::Token(_) | Pending::Go { .. } => {}
     }
 }
 
