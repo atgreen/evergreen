@@ -21916,11 +21916,28 @@ fn vals_equalp(a: BlissVal, b: BlissVal) -> bool {
     if a == b {
         return true;
     }
+    if is_number_value(a) && is_number_value(b) {
+        // numeric_equal handles COMPLEX (unordered → numeric_cmp fails on it).
+        return numeric_equal(a, b).unwrap_or(false);
+    }
+    if a.is_character() && b.is_character() {
+        return a.as_char().eq_ignore_ascii_case(&b.as_char());
+    }
+    if is_string_value(a) && is_string_value(b) {
+        return val_as_str(a).eq_ignore_ascii_case(&val_as_str(b));
+    }
+    if a.is_cons() && b.is_cons() {
+        let (ac, ad) = cp(a);
+        let (bc, bd) = cp(b);
+        return vals_equalp(ac, bc) && vals_equalp(ad, bd);
+    }
     // Structures (DEFSTRUCT instances): two structures of the same type are
     // EQUALP iff their corresponding slots are EQUALP. Only DEFSTRUCT classes
     // qualify — a general CLOS standard-object is compared by identity (handled
-    // by the `a == b` check above). No Bliss allocation happens here, so the
-    // recursion is GC-safe (bliss-rup1).
+    // by the `a == b` check above). Placed after the number/char/string/cons
+    // fast paths (an instance is none of those) so the common cases don't pay
+    // the is_instance lookups. No Bliss allocation here, so the recursion is
+    // GC-safe (bliss-rup1).
     if bliss_stdlib::is_instance(a) && bliss_stdlib::is_instance(b) {
         let ca = bliss_stdlib::class_of(a);
         let na = symbol_bare_name(&sym_name(bliss_stdlib::class_name(ca)));
@@ -21938,21 +21955,6 @@ fn vals_equalp(a: BlissVal, b: BlissVal) -> bool {
             }
         }
         return true;
-    }
-    if is_number_value(a) && is_number_value(b) {
-        // numeric_equal handles COMPLEX (unordered → numeric_cmp fails on it).
-        return numeric_equal(a, b).unwrap_or(false);
-    }
-    if a.is_character() && b.is_character() {
-        return a.as_char().eq_ignore_ascii_case(&b.as_char());
-    }
-    if is_string_value(a) && is_string_value(b) {
-        return val_as_str(a).eq_ignore_ascii_case(&val_as_str(b));
-    }
-    if a.is_cons() && b.is_cons() {
-        let (ac, ad) = cp(a);
-        let (bc, bd) = cp(b);
-        return vals_equalp(ac, bc) && vals_equalp(ad, bd);
     }
     // Hash tables: same test, same count, and every entry's value EQUALP.
     if is_hash_table_value(a) && is_hash_table_value(b) {
