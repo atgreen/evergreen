@@ -11406,9 +11406,15 @@ fn initiate_unwind(
                 acts[top].handlers.pop();
                 env.handlers.truncate(cluster_base);
                 pop_condition_cluster_frame(stack, cluster_frame);
-                // Only an error (raw, or a host SIGNAL that selected one of this
-                // cluster's clauses) can be caught by HANDLER-CASE. Block/go/throw
-                // transfers pass straight through.
+                // Only an error can be caught by HANDLER-CASE; block/go/throw
+                // transfers pass straight through. Two shapes arrive here: (1) a
+                // control token naming one of this cluster's clauses — the normal
+                // case since bliss-9kc, where an ordinary condition (raw or
+                // SIGNAL/ERROR-raised) is signalled IN CONTEXT and a matching
+                // clause selected before the unwind reaches this frame; (2) a raw
+                // Propagate for a STORAGE condition (Oom / StackOverflow), which is
+                // excluded from the allocating in-context path and is matched to a
+                // clause here instead (verified reachable, bliss-j5fo).
                 let matched: Option<(RuntimeClause, BlissVal)> = match &pending {
                     Pending::Propagate(error) => {
                         if let Some(tok) = handler_case_token(error) {
@@ -11449,12 +11455,16 @@ fn initiate_unwind(
                 cluster_frame,
             }) => {
                 acts[top].handlers.pop();
-                // Mirror eval_handler_bind: only a *raw* structured error (one
-                // bliss_error_to_condition can denote) gives these handlers their
-                // turn here — conditions raised via SIGNAL/ERROR already ran the
-                // handler stack at signal time. A handler that declines lets the
-                // original error keep unwinding; one that transfers control
-                // replaces the pending transfer.
+                // Post-unwind handler turn. Since bliss-9kc, an ordinary raw
+                // error (TYPE-ERROR, UNBOUND-VARIABLE, arithmetic, …) is signalled
+                // IN CONTEXT at the top of initiate_unwind, so it reaches here
+                // already as a Signalled marker (bliss_error_to_condition → None)
+                // or as a transfer token — this branch does NOT re-run it. What
+                // *does* still arrive as a raw Propagate is a STORAGE condition
+                // (Oom / StackOverflow), which is deliberately excluded from the
+                // allocating in-context path and gets its handler turn here
+                // instead (verified: bliss-j5fo). A handler that declines lets the
+                // error keep unwinding; one that transfers replaces the pending.
                 if let Pending::Propagate(error) = &pending {
                     if let Ok(Some(cond)) = bliss_error_to_condition(env, error) {
                         match run_handler_bind_handlers(env, cond, cluster_base) {

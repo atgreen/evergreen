@@ -3863,6 +3863,39 @@ fn deep_recursion_raises_catchable_storage_condition_not_sigsegv() {
     );
 }
 
+/// bliss-j5fo: a HANDLER-BIND handler must fire for a STORAGE-CONDITION (stack
+/// overflow). Since bliss-9kc ordinary raw errors signal in-context, so the
+/// bytecode HandlerBind frame's post-unwind handler path is exercised *only* by
+/// storage conditions (Oom / StackOverflow), which are excluded from the
+/// allocating in-context signal. This locks that path in so it is not mistaken
+/// for dead code — the handler transfers out via THROW to prove it ran.
+#[test]
+fn handler_bind_handler_fires_for_storage_condition() {
+    let caught = bliss_bin()
+        .args([
+            "--eval",
+            "(catch 'out \
+               (handler-bind ((storage-condition \
+                                (lambda (c) (declare (ignore c)) (throw 'out :ovf)))) \
+                 (labels ((f (n) (+ 1 (f (+ n 1))))) (f 0))))",
+        ])
+        .output()
+        .expect("run bliss");
+    assert_eq!(
+        caught.status.code(),
+        Some(0),
+        "handler-bind on storage-condition should transfer out cleanly (stderr: {})",
+        String::from_utf8_lossy(&caught.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&caught.stdout)
+            .to_uppercase()
+            .contains("OVF"),
+        "handler-bind storage-condition handler should have fired: {}",
+        String::from_utf8_lossy(&caught.stdout)
+    );
+}
+
 /// Regression: PSETQ, DO, and DO* iteration macros (bliss-2pt.11).
 #[test]
 fn do_dostar_psetq() {
