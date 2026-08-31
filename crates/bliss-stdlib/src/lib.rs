@@ -102,7 +102,8 @@ pub use sequences::{
     cvec_adjustable, cvec_capacity, cvec_char_contents, cvec_fill_pointer, cvec_is_string, elt,
     find, is_complex_vector, length, map, nreverse,
     position, reduce, remove, reverse, set_elt, set_fill_pointer, sort, stable_sort,
-    string_set_char, subseq, substitute, vector_pop, vector_push, vector_push_extend,
+    string_char_at, string_char_count, string_set_char, subseq, substitute, vector_pop, vector_push,
+    vector_push_extend,
 };
 pub use streams::GrayStream;
 pub use streams::{

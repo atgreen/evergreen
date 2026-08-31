@@ -169,6 +169,16 @@ pub mod type_id {
     pub const SIMPLE_ARRAY: u8 = 0x04;
     pub const SIMPLE_BASE_STRING: u8 = 0x05;
     pub const SIMPLE_CHARACTER_STRING: u8 = 0x06;
+
+    /// Simple-string `coder` values (spec 01 §1.6.3, compact strings — bliss-pd0).
+    /// Selects the fixed-width element storage: `LATIN1` = 1 byte/char (code
+    /// points < 256), `UCS4` = 4 bytes/char (full range). NOT YET the live
+    /// storage — the runtime still holds UTF-8 pending the phased migration
+    /// (bliss-qsgq); these name the target layout.
+    pub mod string_coder {
+        pub const LATIN1: u8 = 0;
+        pub const UCS4: u8 = 1;
+    }
     pub const COMPLEX_ARRAY: u8 = 0x07;
     pub const BIGNUM: u8 = 0x08;
     pub const RATIO: u8 = 0x09;

@@ -113,6 +113,21 @@ fn string_content(v: BlissVal) -> Option<String> {
     v.is_string().then(|| v.as_string())
 }
 
+/// The character (not byte) at `index` of a string sequence, or `None` if `v`
+/// is not a string or `index` is out of range. This is the single choke point
+/// for character indexing (CHAR/SCHAR/ELT/AREF on a string): the compact-string
+/// layout (bliss-qsgq) will make the simple-string case O(1) by swapping only
+/// this function's implementation. Today it is O(n) over the UTF-8 storage.
+pub fn string_char_at(v: BlissVal, index: usize) -> Option<char> {
+    string_content(v).and_then(|s| s.chars().nth(index))
+}
+
+/// The character (not byte) length of a string sequence, or `None` if `v` is
+/// not a string. The other choke point Step B makes O(1).
+pub fn string_char_count(v: BlissVal) -> Option<usize> {
+    string_content(v).map(|s| s.chars().count())
+}
+
 /// True if `v` is a character string usable as a sequence — a real string, and
 /// NOT a pathname. Pathnames are registry-backed values whose BlissVal can pass
 /// `is_string()` (they carry a namestring), but they are not sequences; treating
@@ -941,13 +956,16 @@ pub fn elt(sequence: BlissVal, index: usize) -> Result<BlissVal, BlissError> {
         };
     }
     if is_char_seq(sequence) {
-        let s = string_content(sequence).unwrap_or_default();
-        match s.chars().nth(index) {
+        match string_char_at(sequence, index) {
             Some(c) => return Ok(BlissVal::from_char(c)),
             None => {
                 return Err(BlissError::TypeError {
                     datum: sequence,
-                    expected: format!("index {} in bounds (length {})", index, s.chars().count()),
+                    expected: format!(
+                        "index {} in bounds (length {})",
+                        index,
+                        string_char_count(sequence).unwrap_or(0)
+                    ),
                 });
             }
         }
