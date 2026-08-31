@@ -67,13 +67,9 @@ fn minimal_runtime_config() -> RuntimeConfig {
     }
 }
 
-fn bootstrap_string_bytes(value: BlissVal) -> Vec<u8> {
+fn bootstrap_string_content(value: BlissVal) -> String {
     assert!(types::stringp(value), "value must be a bootstrap string");
-    unsafe {
-        let ptr = value.as_ptr();
-        let len = *(ptr.add(8) as *const u64) as usize;
-        std::slice::from_raw_parts(ptr.add(16), len).to_vec()
-    }
+    unsafe { bliss_rt::object::read_simple_string(value.as_ptr()) }
 }
 
 fn sxhash_equivalent(
@@ -238,16 +234,30 @@ fn object_layouts_match_required_sizes_offsets_and_alignment() {
 }
 
 #[test]
-fn bootstrap_strings_store_utf8_bytes_and_round_trip_through_utf8_decoding() {
-    // Per R1.14, strings use UTF-8 internally.
+fn bootstrap_strings_store_fixed_width_ucs4_and_round_trip() {
+    // Per R1.14 / §1.6.3 (SBCL model): a constructed string is a fixed-width
+    // SIMPLE_CHARACTER_STRING — char_len@8 (CHARACTER count), 32-bit UCS-4
+    // elements @16 — NOT UTF-8 bytes.
     let mut runtime = Runtime::init(minimal_runtime_config()).unwrap();
     let source = "h\u{00e9}ll\u{03bb} \u{1f642}";
     let value = runtime.eval(&format!("{source:?}")).unwrap();
 
     assert!(types::stringp(value));
-    let stored = bootstrap_string_bytes(value);
-    assert_eq!(stored, source.as_bytes());
-    assert_eq!(std::str::from_utf8(&stored).unwrap(), source);
+    unsafe {
+        let ptr = value.as_ptr();
+        let tid = (*(ptr as *const ObjectHeader)).type_id();
+        assert_eq!(tid, type_id::SIMPLE_CHARACTER_STRING);
+        // length is the CHARACTER count, not the byte count.
+        let char_len = *(ptr.add(8) as *const u64) as usize;
+        assert_eq!(char_len, source.chars().count());
+        assert_ne!(char_len, source.len(), "must be char count, not byte count");
+        // Fixed-width 32-bit elements: element i is the i-th code point.
+        for (i, c) in source.chars().enumerate() {
+            assert_eq!(*(ptr.add(16).add(i * 4) as *const u32), c as u32);
+        }
+    }
+    // Round-trips through the decoder.
+    assert_eq!(bootstrap_string_content(value), source);
 
     runtime.shutdown().unwrap();
 }

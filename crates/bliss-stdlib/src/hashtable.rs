@@ -222,8 +222,10 @@ fn extract_string_bytes(v: BlissVal) -> Option<Vec<u8>> {
         if tid != type_id::SIMPLE_BASE_STRING && tid != type_id::SIMPLE_CHARACTER_STRING {
             return None;
         }
-        let len = *((ptr as *const u64).add(1)) as usize;
-        Some(std::slice::from_raw_parts(ptr.add(16), len).to_vec())
+        // The UTF-8 CONTENT bytes, not the raw fixed-width storage: string
+        // EQUAL/hashing is by character, so a base string and a character string
+        // with the same characters compare and hash alike.
+        Some(bliss_rt::object::read_simple_string(ptr).into_bytes())
     }
 }
 

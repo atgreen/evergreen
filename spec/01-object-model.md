@@ -26,7 +26,7 @@ Source: `crates/bliss-rt/src/object.rs`, `crates/bliss-rt/src/types/`.
 | R1.11 | `NIL` MUST be encoded as the `BlissVal` bit pattern `0b111` (tag `111`, payload zero). |
 | R1.12 | `T` MUST be encoded as `BlissVal` with tag `111` and payload `1` (bit pattern `0b1_111` = `0x0F`). |
 | R1.13 | Cons cells MUST be exactly 16 bytes (two `BlissVal` fields: CAR, CDR), with no header. |
-| R1.14 | Simple strings MUST use fixed-width, coder-tagged internal storage (§1.6.3): a per-string `coder` selects `LATIN1` (1 byte/char, code points < 256) or `UCS4` (4 bytes/char, full range), so `CHAR`/`SCHAR`/`AREF` are O(1) by character index. UTF-8 is an external-format encoding only, applied at I/O boundaries — NOT the internal representation. |
+| R1.14 | Simple strings MUST use fixed-width specialised-vector internal storage (§1.6.3), with the element width fixed at construction and encoded by the `type_id`: `SIMPLE_BASE_STRING` = 1 byte/char (`BASE-CHAR`, code points < 256), `SIMPLE_CHARACTER_STRING` = 4 bytes/char (`CHARACTER`, full range), so `CHAR`/`SCHAR`/`AREF` are O(1) by character index. There is no runtime coder promotion; growable strings use complex arrays (§1.6.4). UTF-8 is an external-format encoding only, applied at I/O boundaries — NOT the internal representation. |
 | R1.15 | Arrays MUST support all element-type specialisations required by ANSI CL §15.1. |
 | R1.16 | Symbols MUST contain at least: name, value, function, plist, and package cells. |
 | R1.17 | The `UNBOUND` marker MUST be a unique `BlissVal` with tag `111` that is distinct from NIL, T, and every other value. |
@@ -296,61 +296,70 @@ Data region is packed and padded to the next 8-byte boundary (R1.20).
 
 ### 1.6.3  Strings — D1.06
 
-**Decision: fixed-width, coder-tagged storage (compact strings), modelled
-on the JVM's Compact Strings (R1.14).** (Supersedes the original UTF-8-only
-decision; see D1.06-history below.)
+**Decision: fixed-width specialised simple-string vectors, modelled on SBCL
+(R1.14).** (Supersedes the original UTF-8-only decision; see D1.06-history.)
 
-A simple string stores its characters in a fixed-width element array whose
-width is selected by a one-byte `coder`:
+A **simple string** is a fixed-width array of characters. Its element width
+is fixed at construction and encoded by the object's `type_id` — the width
+*is* the type, and there is no runtime re-encoding:
 
-| `coder` | Width | Range | Access |
-|---------|-------|-------|--------|
-| `0` `LATIN1` | 1 byte/char | code points 0–255 | `data[i]` |
-| `1` `UCS4`   | 4 bytes/char (`u32`, native-endian) | 0–`#x10FFFF` | `data[4·i]` |
+| `type_id` | CL type | Width | Range |
+|-----------|---------|-------|-------|
+| `0x05` `SIMPLE_BASE_STRING` | `(simple-array base-char (*))` | 1 byte/char | code points 0–255 |
+| `0x06` `SIMPLE_CHARACTER_STRING` | `(simple-array character (*))` | 4 bytes/char (`u32`, native-endian) | 0–`#x10FFFF` |
 
-`length` is the **character** count (not a byte count). `CHAR`/`SCHAR`/
-`AREF` and `(SETF CHAR)`/`(SETF SCHAR)` are therefore **O(1)** by character
-index for every simple string.
+`length` is the **character** count. `CHAR`/`SCHAR`/`AREF` and
+`(SETF CHAR)`/`(SETF SCHAR)` are **O(1)** by character index.
 
 ```text
-Simple string (type_id=0x05 base / 0x06 character):
+Simple string (type_id 0x05 base / 0x06 character):
   Offset  Size     Field
     0       8      ObjectHeader
     8       8      length: u64  (CHARACTER count)
-   16       1      coder: u8    (0=LATIN1, 1=UCS4)
-   17       7      padding (zero)
-   24       W·L    data: L elements of W bytes (W = 1 for LATIN1, 4 for UCS4)
-   24+W·L   pad    zero-padding to the next 8-byte boundary
+   16       W·L    data: L elements of W bytes (W = 1 base, 4 character)
+   16+W·L   pad    zero-padding to the next 8-byte boundary
 ```
 
-**Coder selection and promotion.** A fresh string uses the narrowest coder
-that fits its contents (`LATIN1` if every code point < 256, else `UCS4`).
-`(SETF CHAR)` that stores a code point ≥ 256 into a `LATIN1` string
-**promotes** it in place to `UCS4` (reallocate the data region 1→4 bytes/
-char, widen every element; identity is preserved via the standard
-forwarding path). Promotion never reverses — a string that once held a wide
-character stays `UCS4`. `SIMPLE-BASE-STRING` (type_id `0x05`) guarantees
-`BASE-CHAR` elements and is therefore always `LATIN1` and never promotes;
-storing a code point ≥ 256 into it is a `TYPE-ERROR`. `SIMPLE-CHARACTER-
-STRING` (type_id `0x06`) admits either coder and promotes as above.
+**Element type is fixed at construction — no promotion.** `MAKE-STRING` (and
+general string construction) default to element type `CHARACTER`, i.e. a
+32-bit `SIMPLE-CHARACTER-STRING` that holds any code point and so is freely
+mutable by `(SETF CHAR)`. A `SIMPLE-BASE-STRING` (8-bit) is produced only
+when `BASE-CHAR` element type is requested or when the source is known to be
+all-`BASE-CHAR` and immutable (e.g. an interned reader literal, a compactness
+optimisation); storing a code point ≥ 256 into one is a `TYPE-ERROR`, never a
+promotion. This is SBCL's model: the two widths are distinct specialised
+vector types, chosen once, rather than a single string with a mutable coder
+flag (the JVM Compact-Strings scheme — appropriate for *immutable* Java
+strings, but a poor fit for CL's mutable char arrays).
 
-**Rationale.** Fixed-width storage gives constant-time character indexing
-(the UTF-8 layout was O(n) per `CHAR`, so an index loop was O(n²)) while
-`LATIN1` keeps the overwhelmingly common ASCII/Latin-1 case at 1 byte/char.
-We deviate from Java's UTF-16 wide coder deliberately: Java `charAt` returns
-a 16-bit code *unit* (astral characters are surrogate pairs, so code-*point*
-indexing is not O(1)), whereas Common Lisp `CHAR` returns a whole
-`CHARACTER` (a code point up to `#x10FFFF`). A fixed-width `UCS4` wide coder
-preserves O(1) *code-point* access; UTF-16 would not.
+**Growable strings.** Adjustable, fill-pointer, and displaced strings are NOT
+simple strings: they are complex arrays (§1.6.4, `type_id 0x07`) whose
+underlying store is a char-typed simple string. Growth (`ADJUST-ARRAY`,
+`VECTOR-PUSH-EXTEND`) reallocates that underlying store with identity
+preserved by the complex-array header, so a string only ever "grows" through
+this path — a simple string's length is immutable.
 
-**External format.** UTF-8 remains the default external format: streams
-encode on write and decode on read at the I/O boundary (§05-04 streams,
-external-format codecs). It is never the in-memory representation.
+**Equality.** `EQUAL`/`STRING=`/hashing compare by *character* (code point),
+so a base-char and a character with the same code point are equal and a base
+string and a character string with the same characters are `EQUAL` and hash
+alike, independent of storage width.
+
+**Rationale.** Fixed-width storage gives constant-time character indexing (the
+UTF-8 layout was O(n) per `CHAR`, so an index loop was O(n²)); the base-char
+width keeps the common ASCII/Latin-1 case at 1 byte/char. `CHARACTER` uses a
+fixed-width 32-bit `UCS4` element (not UTF-16) so that `CHAR` — which returns
+a whole code point up to `#x10FFFF`, unlike Java `charAt`'s 16-bit code unit —
+stays O(1).
+
+**External format.** UTF-8 remains the default external format: streams encode
+on write and decode on read at the I/O boundary (§05-04). It is never the
+in-memory representation.
 
 **D1.06-history.** The original decision stored both string types as UTF-8
-bytes with an O(n) `CHAR`. That was revised (bliss-pd0) because CL strings
-are mutable char-indexed arrays; the compact-string layout above restores
-O(1) semantics while staying compact.
+bytes with an O(n) `CHAR`; a first revision adopted the JVM Compact-Strings
+coder-flag scheme. Both were superseded (bliss-pd0) by the SBCL fixed-width
+model above: dynamic coder promotion does not fit CL's mutable, fixed-element-
+type strings, and growable strings already have a home in complex arrays.
 
 ### 1.6.4  Complex Arrays — D1.07
 

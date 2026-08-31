@@ -4485,21 +4485,16 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
             let ptr = val.as_ptr();
             let hdr = *(ptr as *const ObjectHeader);
             match hdr.type_id() {
-                type_id::SIMPLE_BASE_STRING => {
-                    let len = *(ptr.add(8) as *const u64) as usize;
-                    let data = std::slice::from_raw_parts(ptr.add(16), len);
-                    if let Ok(s) = std::str::from_utf8(data) {
-                        out.push('"');
-                        for c in s.chars() {
-                            if c == '"' || c == '\\' {
-                                out.push('\\');
-                            }
-                            out.push(c);
+                type_id::SIMPLE_BASE_STRING | type_id::SIMPLE_CHARACTER_STRING => {
+                    let s = bliss_rt::object::read_simple_string(ptr);
+                    out.push('"');
+                    for c in s.chars() {
+                        if c == '"' || c == '\\' {
+                            out.push('\\');
                         }
-                        out.push('"');
-                    } else {
-                        out.push_str("#<string>");
+                        out.push(c);
                     }
+                    out.push('"');
                 }
                 type_id::SIMPLE_VECTOR => {
                     let len = *(ptr.add(8) as *const u64) as usize;
@@ -4656,13 +4651,11 @@ fn princ_val(val: BlissVal, out: &mut String) {
         unsafe {
             let ptr = val.as_ptr();
             let hdr = *(ptr as *const ObjectHeader);
-            if hdr.type_id() == type_id::SIMPLE_BASE_STRING {
-                let len = *(ptr.add(8) as *const u64) as usize;
-                let data = std::slice::from_raw_parts(ptr.add(16), len);
-                if let Ok(s) = std::str::from_utf8(data) {
-                    out.push_str(s);
-                    return;
-                }
+            if hdr.type_id() == type_id::SIMPLE_BASE_STRING
+                || hdr.type_id() == type_id::SIMPLE_CHARACTER_STRING
+            {
+                out.push_str(&bliss_rt::object::read_simple_string(ptr));
+                return;
             }
         }
     }
@@ -7272,7 +7265,9 @@ fn eval_form(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     if form.is_heap_object() {
         unsafe {
             let hdr = *(form.as_ptr() as *const ObjectHeader);
-            if hdr.type_id() == type_id::SIMPLE_BASE_STRING {
+            if hdr.type_id() == type_id::SIMPLE_BASE_STRING
+                || hdr.type_id() == type_id::SIMPLE_CHARACTER_STRING
+            {
                 bliss_stdlib::register_string(form, &val_as_str(form));
                 return Ok(form);
             }
@@ -21821,12 +21816,10 @@ fn val_as_str(val: BlissVal) -> String {
         unsafe {
             let p = val.as_ptr();
             let h = *(p as *const ObjectHeader);
-            if h.type_id() == type_id::SIMPLE_BASE_STRING {
-                let len = *(p.add(8) as *const u64) as usize;
-                let data = std::slice::from_raw_parts(p.add(16), len);
-                if let Ok(s) = std::str::from_utf8(data) {
-                    return s.to_string();
-                }
+            if h.type_id() == type_id::SIMPLE_BASE_STRING
+                || h.type_id() == type_id::SIMPLE_CHARACTER_STRING
+            {
+                return bliss_rt::object::read_simple_string(p);
             }
         }
     }

@@ -1147,18 +1147,16 @@ fn boot_symbol_name(val: BlissVal) -> Option<String> {
 fn boot_make_string(s: &str) -> BlissVal {
     BOOT_STORE.with(|store| {
         let mut st = store.borrow_mut();
-        let bytes = s.as_bytes();
-        // Pad to an 8-byte boundary so the allocation matches the header's word
-        // count (the old unpadded size under-allocated by up to 7 bytes vs the
-        // div_ceil header). Single encoding via write_simple_base_string.
-        let padded = crate::object::padded_string_size(bytes.len());
+        // 32-bit SIMPLE_CHARACTER_STRING (SBCL model); the choke point sizes the
+        // block to match the header word count.
+        let padded = crate::object::character_string_alloc_size(s);
         let layout = std::alloc::Layout::from_size_align(padded, 8).unwrap();
         let ptr = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout);
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            crate::object::write_simple_base_string(ptr, bytes);
+            crate::object::write_character_string(ptr, s);
             ptr
         };
         let id = (ptr as u64) >> 3;

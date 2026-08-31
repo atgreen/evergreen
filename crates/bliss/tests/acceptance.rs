@@ -3856,6 +3856,37 @@ fn do_dostar_psetq() {
     }
 }
 
+/// Fixed-width simple strings (SBCL model, spec §1.6.3 / bliss-pd0): O(1)
+/// character indexing and mutation, and full Unicode — `LENGTH` counts
+/// characters, `CHAR` returns code points, `(SETF CHAR)` stores any code point,
+/// and content is preserved through read/print and reverse/concatenate.
+#[test]
+fn fixed_width_unicode_strings() {
+    let cases = [
+        ("(length \"héllo\")", "5"),
+        ("(char-code (char \"λμν\" 1))", "956"),
+        ("(char \"héllo\" 1)", "é"),
+        // (SETF CHAR) stores a wide code point into a (default character) string.
+        (
+            "(let ((s (make-string 3 :initial-element #\\a))) (setf (char s 1) #\\λ) s)",
+            "aλa",
+        ),
+        ("(reverse \"aλb\")", "bλa"),
+        ("(concatenate 'string \"ab\" \"λ\")", "abλ"),
+        // Content equality is by character, independent of storage.
+        ("(equal \"héllo\" (copy-seq \"héllo\"))", "T"),
+        ("(string= \"abλ\" (concatenate 'string \"ab\" \"λ\"))", "T"),
+        // Read/print round-trip of a Unicode literal.
+        ("(read-from-string (prin1-to-string \"héλλo\"))", "héλλo"),
+    ];
+    for (expr, expected) in cases {
+        let out = bliss_bin().args(["--eval", expr]).output().expect("run bliss");
+        assert_eq!(out.status.code(), Some(0), "{expr} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expected), "{expr} => want {expected}, got: {stdout}");
+    }
+}
+
 /// Regression: character functions (char-code/code-char + comparisons, case,
 /// predicates), string-upcase/downcase, and list fns (last/butlast/nthcdr/
 /// mapc/mapcan/getf/nreverse) were undefined. (bliss-2pt stdlib completeness.)

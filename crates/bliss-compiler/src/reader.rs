@@ -264,13 +264,17 @@ fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
 }
 
 fn alloc_string(s: &str) -> BlissVal {
-    // Layout: ObjectHeader (8 bytes) + length (u64, 8 bytes) + bytes
-    let bytes = s.as_bytes();
-    let total_size = 8 + 8 + bytes.len();
-    let ptr = gc_alloc(total_size, type_id::SIMPLE_BASE_STRING);
+    // Compact simple string (SBCL model, spec §1.6.3): a 32-bit
+    // SIMPLE_CHARACTER_STRING — ObjectHeader(8) + char_len(8) + u32 data@16.
+    let char_len = s.chars().count();
+    let total_size = bliss_rt::object::character_string_alloc_size(s);
+    let ptr = gc_alloc(total_size, type_id::SIMPLE_CHARACTER_STRING);
     unsafe {
-        *(ptr.add(8) as *mut u64) = bytes.len() as u64;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
+        *(ptr.add(8) as *mut u64) = char_len as u64;
+        let data = ptr.add(16) as *mut u32;
+        for (i, c) in s.chars().enumerate() {
+            *data.add(i) = c as u32;
+        }
         BlissVal::from_heap_ptr(ptr)
     }
 }
@@ -588,10 +592,11 @@ pub fn read(state: &mut ReaderState) -> Result<BlissVal, BlissError> {
         unsafe {
             let ptr = input.as_ptr();
             let header = *(ptr as *const ObjectHeader);
-            if header.type_id() == type_id::SIMPLE_BASE_STRING {
-                let len = *(ptr.add(8) as *const u64) as usize;
-                let data = std::slice::from_raw_parts(ptr.add(16), len);
-                if let Ok(s) = std::str::from_utf8(data) {
+            if header.type_id() == type_id::SIMPLE_BASE_STRING
+                || header.type_id() == type_id::SIMPLE_CHARACTER_STRING
+            {
+                {
+                    let s = bliss_rt::object::read_simple_string(ptr);
                     let chars: Vec<char> = s.chars().collect();
                     ensure_nesting_within_limit(&chars)?;
                     bliss_rt::rooted!(
@@ -2271,7 +2276,9 @@ pub fn eval_read_time_form(form: BlissVal) -> Result<BlissVal, BlissError> {
             unsafe {
                 let ptr = form.as_ptr();
                 let header = *(ptr as *const ObjectHeader);
-                if header.type_id() == type_id::SIMPLE_BASE_STRING {
+                if header.type_id() == type_id::SIMPLE_BASE_STRING
+                    || header.type_id() == type_id::SIMPLE_CHARACTER_STRING
+                {
                     return Ok(form);
                 }
             }

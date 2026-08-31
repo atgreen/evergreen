@@ -42,29 +42,21 @@ pub fn string_set_char(s: BlissVal, index: usize, ch: BlissVal) -> Result<BlissV
     let new_char = ch.as_char();
     unsafe {
         let ptr = s.as_ptr();
-        let header = *(ptr as *const ObjectHeader);
-        let capacity = (header.size_units() as usize) * 8 - 16;
-        let len = *((ptr as *const u64).add(1)) as usize;
-        let bytes = std::slice::from_raw_parts(ptr.add(16), len);
-        let text = std::str::from_utf8(bytes)
-            .map_err(|_| BlissError::StreamError("invalid UTF-8 in string".into()))?;
-        let mut chars: Vec<char> = text.chars().collect();
-        if index >= chars.len() {
+        let len = bliss_rt::object::simple_string_char_count(ptr);
+        if index >= len {
             return Err(BlissError::Internal(format!(
-                "index {index} out of bounds for string of length {}",
-                chars.len()
+                "index {index} out of bounds for string of length {len}"
             )));
         }
-        chars[index] = new_char;
-        let updated: String = chars.into_iter().collect();
-        let new_bytes = updated.as_bytes();
-        if new_bytes.len() > capacity {
-            return Err(BlissError::Internal(
-                "string mutation would exceed the allocated buffer".into(),
-            ));
+        // O(1) in-place store (SBCL model, spec §1.6.3). A CHARACTER string
+        // (the default) holds any code point; storing a code point >= 256 into
+        // a BASE string is a TYPE-ERROR (base strings never promote).
+        if !bliss_rt::object::simple_string_set_char(ptr, index, new_char) {
+            return Err(BlissError::TypeError {
+                datum: ch,
+                expected: "base-char (a character < code point 256) for a base string".into(),
+            });
         }
-        std::ptr::copy_nonoverlapping(new_bytes.as_ptr(), ptr.add(16), new_bytes.len());
-        *((ptr as *mut u64).add(1)) = new_bytes.len() as u64;
     }
     Ok(ch)
 }
@@ -119,6 +111,15 @@ fn string_content(v: BlissVal) -> Option<String> {
 /// layout (bliss-qsgq) will make the simple-string case O(1) by swapping only
 /// this function's implementation. Today it is O(n) over the UTF-8 storage.
 pub fn string_char_at(v: BlissVal, index: usize) -> Option<char> {
+    // O(1) for a real simple-string heap object; registry-backed sentinels and
+    // fill-pointer char vectors fall back to the decoded content.
+    if v.is_heap_object() && crate::pathnames::registered_string(v).is_none() {
+        let ptr = unsafe { v.as_ptr() };
+        let tid = unsafe { (*(ptr as *const ObjectHeader)).type_id() };
+        if tid == type_id::SIMPLE_BASE_STRING || tid == type_id::SIMPLE_CHARACTER_STRING {
+            return unsafe { bliss_rt::object::simple_string_char_at(ptr, index) };
+        }
+    }
     string_content(v).and_then(|s| s.chars().nth(index))
 }
 

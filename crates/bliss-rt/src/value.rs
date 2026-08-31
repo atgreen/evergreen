@@ -319,12 +319,7 @@ impl BlissVal {
     /// length, and then UTF-8 bytes starting at offset 16.
     pub fn as_string(self) -> String {
         assert!(self.is_string(), "as_string called on non-string value");
-        unsafe {
-            let ptr = self.as_ptr();
-            let len = *((ptr as *const u64).add(1)) as usize;
-            let bytes = std::slice::from_raw_parts(ptr.add(16), len);
-            String::from_utf8_lossy(bytes).into_owned()
-        }
+        unsafe { crate::object::read_simple_string(self.as_ptr()) }
     }
 
     /// Extract the raw pointer (mask off tag bits).

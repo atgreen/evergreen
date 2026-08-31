@@ -60,10 +60,7 @@ fn extract_bliss_string(v: BlissVal) -> Option<String> {
         if tid != type_id::SIMPLE_BASE_STRING && tid != type_id::SIMPLE_CHARACTER_STRING {
             return None;
         }
-        let length = *(ptr.add(8) as *const u64) as usize;
-        let data_ptr = ptr.add(16);
-        let bytes = std::slice::from_raw_parts(data_ptr, length);
-        Some(String::from_utf8_lossy(bytes).into_owned())
+        Some(bliss_rt::object::read_simple_string(ptr))
     }
 }
 

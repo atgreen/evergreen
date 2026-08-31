@@ -169,16 +169,6 @@ pub mod type_id {
     pub const SIMPLE_ARRAY: u8 = 0x04;
     pub const SIMPLE_BASE_STRING: u8 = 0x05;
     pub const SIMPLE_CHARACTER_STRING: u8 = 0x06;
-
-    /// Simple-string `coder` values (spec 01 §1.6.3, compact strings — bliss-pd0).
-    /// Selects the fixed-width element storage: `LATIN1` = 1 byte/char (code
-    /// points < 256), `UCS4` = 4 bytes/char (full range). NOT YET the live
-    /// storage — the runtime still holds UTF-8 pending the phased migration
-    /// (bliss-qsgq); these name the target layout.
-    pub mod string_coder {
-        pub const LATIN1: u8 = 0;
-        pub const UCS4: u8 = 1;
-    }
     pub const COMPLEX_ARRAY: u8 = 0x07;
     pub const BIGNUM: u8 = 0x08;
     pub const RATIO: u8 = 0x09;
@@ -203,35 +193,139 @@ pub mod type_id {
     pub const MD_ARRAY: u8 = 0x18;
 }
 
-// ── Simple string on-heap encoding ─────────────────────────────────
+// ── Simple string on-heap encoding (SBCL model, spec §1.6.3) ───────
+//
+// Layout: ObjectHeader(8) | char_len: u64 @8 | data @16. The element width is
+// fixed at construction and encoded by the `type_id`: SIMPLE_BASE_STRING (0x05)
+// = 1 byte/char (BASE-CHAR, code points < 256), SIMPLE_CHARACTER_STRING (0x06)
+// = 4 bytes/char (CHARACTER, native-endian u32, full range). CHAR/SCHAR/AREF
+// are O(1). There is no coder promotion; growable strings use complex arrays.
 
-/// Total padded byte size of a simple-string heap object holding `byte_len`
-/// content bytes: `ObjectHeader(8) + length(8) + bytes`, rounded up to an
-/// 8-byte boundary. The single definition of the simple-string footprint.
+/// Bytes per character for a simple-string `type_id` (base = 1, character = 4).
 #[inline]
-pub fn padded_string_size(byte_len: usize) -> usize {
-    (16 + byte_len + 7) & !7
+pub fn simple_string_width(tid: u8) -> usize {
+    if tid == type_id::SIMPLE_CHARACTER_STRING {
+        4
+    } else {
+        1
+    }
 }
 
-/// Write the `SIMPLE_BASE_STRING` object layout — header + byte length + the
-/// content bytes — into a zeroed, 8-aligned allocation of at least
-/// [`padded_string_size`]`(bytes.len())`. This is the single choke point for the
-/// simple-string on-heap *write*; [`type_id::SIMPLE_BASE_STRING`] readers are the
-/// matching read choke points. The compact-string layout (bliss-qsgq Step B)
-/// changes this function (and its readers) rather than each allocation site,
-/// which currently duplicate the encoding.
+/// Padded byte size of a simple string: `header(8) + char_len(8) + data`, where
+/// `data` is `char_len * width` bytes, rounded up to an 8-byte boundary.
+#[inline]
+pub fn simple_string_size(char_len: usize, width: usize) -> usize {
+    (16 + char_len * width + 7) & !7
+}
+
+/// Padded size to hold `s` as a 32-bit `SIMPLE_CHARACTER_STRING` — the default
+/// element type for constructed strings (holds any code point, mutable).
+#[inline]
+pub fn character_string_alloc_size(s: &str) -> usize {
+    simple_string_size(s.chars().count(), 4)
+}
+
+/// Write a 32-bit `SIMPLE_CHARACTER_STRING` for `s` into a zeroed, 8-aligned
+/// allocation of at least [`character_string_alloc_size`]`(s)` bytes. The single
+/// write choke point for constructed strings; `read_simple_string` /
+/// `simple_string_char_at` are the matching read choke points.
 ///
 /// # Safety
 /// `ptr` must point to a zeroed, 8-byte-aligned allocation of at least
-/// `padded_string_size(bytes.len())` bytes that outlives the returned object.
-#[inline]
-pub unsafe fn write_simple_base_string(ptr: *mut u8, bytes: &[u8]) {
-    let padded = padded_string_size(bytes.len());
+/// `character_string_alloc_size(s)` bytes that outlives the returned object.
+pub unsafe fn write_character_string(ptr: *mut u8, s: &str) {
+    let char_len = s.chars().count();
+    let padded = simple_string_size(char_len, 4);
     unsafe {
         *(ptr as *mut ObjectHeader) =
-            ObjectHeader::new(type_id::SIMPLE_BASE_STRING, (padded / 8) as u16);
-        *((ptr as *mut u64).add(1)) = bytes.len() as u64;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
+            ObjectHeader::new(type_id::SIMPLE_CHARACTER_STRING, (padded / 8) as u16);
+        *((ptr as *mut u64).add(1)) = char_len as u64;
+        let data = ptr.add(16) as *mut u32;
+        for (i, c) in s.chars().enumerate() {
+            *data.add(i) = c as u32;
+        }
+    }
+}
+
+/// The character (not byte) count of a simple string.
+///
+/// # Safety
+/// `ptr` must be a live `SIMPLE_BASE_STRING`/`SIMPLE_CHARACTER_STRING` object.
+#[inline]
+pub unsafe fn simple_string_char_count(ptr: *const u8) -> usize {
+    unsafe { *((ptr as *const u64).add(1)) as usize }
+}
+
+/// The character at `index` of a simple string, or `None` if out of range —
+/// O(1). Width is taken from the `type_id`.
+///
+/// # Safety
+/// `ptr` must be a live simple-string object.
+#[inline]
+pub unsafe fn simple_string_char_at(ptr: *const u8, index: usize) -> Option<char> {
+    unsafe {
+        if index >= simple_string_char_count(ptr) {
+            return None;
+        }
+        let tid = (*(ptr as *const ObjectHeader)).type_id();
+        let data = ptr.add(16);
+        let cp = if tid == type_id::SIMPLE_CHARACTER_STRING {
+            *(data.add(index * 4) as *const u32)
+        } else {
+            *data.add(index) as u32
+        };
+        char::from_u32(cp)
+    }
+}
+
+/// Store `ch` at `index` of a simple string, in place — O(1). Returns `false`
+/// (no write) if `index` is out of range, or if `ch` ≥ 256 does not fit a
+/// `SIMPLE_BASE_STRING` (the caller raises a TYPE-ERROR; a base string never
+/// promotes).
+///
+/// # Safety
+/// `ptr` must be a live simple-string object.
+#[inline]
+pub unsafe fn simple_string_set_char(ptr: *mut u8, index: usize, ch: char) -> bool {
+    unsafe {
+        if index >= simple_string_char_count(ptr) {
+            return false;
+        }
+        let tid = (*(ptr as *const ObjectHeader)).type_id();
+        let data = ptr.add(16);
+        if tid == type_id::SIMPLE_CHARACTER_STRING {
+            *(data.add(index * 4) as *mut u32) = ch as u32;
+            true
+        } else if (ch as u32) < 256 {
+            *data.add(index) = ch as u8;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Decode a simple string into an owned Rust `String`. Width from `type_id`.
+///
+/// # Safety
+/// `ptr` must be a live simple-string object.
+pub unsafe fn read_simple_string(ptr: *const u8) -> String {
+    unsafe {
+        let len = simple_string_char_count(ptr);
+        let tid = (*(ptr as *const ObjectHeader)).type_id();
+        let data = ptr.add(16);
+        let mut out = String::with_capacity(len);
+        if tid == type_id::SIMPLE_CHARACTER_STRING {
+            for i in 0..len {
+                let cp = *(data.add(i * 4) as *const u32);
+                out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            }
+        } else {
+            for i in 0..len {
+                out.push(*data.add(i) as char);
+            }
+        }
+        out
     }
 }
 

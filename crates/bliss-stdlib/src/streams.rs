@@ -354,10 +354,27 @@ fn file_flush_write_buf(
 
 // ── Helper: extract string as &str for character-index slicing ────
 
-fn extract_string_str(val: BlissVal) -> Result<&'static str, BlissError> {
-    let bytes = extract_string_bytes(val)?;
-    std::str::from_utf8(bytes)
-        .map_err(|_| BlissError::StreamError("invalid UTF-8 in string".into()))
+/// The content of a simple string as an owned Rust `String` (decoded from the
+/// fixed-width layout). Owned because the on-heap elements are the type's
+/// fixed-width chars, not UTF-8 bytes.
+fn extract_string_str(val: BlissVal) -> Result<String, BlissError> {
+    if !val.is_heap_object() {
+        return Err(BlissError::TypeError {
+            datum: val,
+            expected: "string".into(),
+        });
+    }
+    unsafe {
+        let ptr = val.as_ptr();
+        let tid = (*(ptr as *const ObjectHeader)).type_id();
+        if tid != type_id::SIMPLE_BASE_STRING && tid != type_id::SIMPLE_CHARACTER_STRING {
+            return Err(BlissError::TypeError {
+                datum: val,
+                expected: "string".into(),
+            });
+        }
+        Ok(bliss_rt::object::read_simple_string(ptr))
+    }
 }
 
 // ── GrayStream implementation on StreamMutableState ────────────────
@@ -1162,7 +1179,7 @@ pub fn make_lisp_string(s: &str) -> BlissVal {
     if let Some(&val) = table.get(bytes) {
         return val;
     }
-    let ptr = alloc_string_object(bytes);
+    let ptr = alloc_string_object(s);
     let val = unsafe { BlissVal::from_heap_ptr(ptr) };
     table.insert(bytes.to_vec(), val);
     val
@@ -1172,43 +1189,23 @@ pub fn make_lisp_string(s: &str) -> BlissVal {
 /// Two calls with the same content produce distinct BlissVal objects,
 /// preserving identity semantics for mutable strings. Issue #6.
 pub fn make_lisp_string_fresh(s: &str) -> BlissVal {
-    let ptr = alloc_string_object(s.as_bytes());
+    let ptr = alloc_string_object(s);
     unsafe { BlissVal::from_heap_ptr(ptr) }
 }
 
-fn alloc_string_object(bytes: &[u8]) -> *mut u8 {
-    // header(8) + length(8) + bytes, padded to 8. Encoding via the single
-    // bliss-rt choke point (write_simple_base_string) — the compact-string
-    // layout (bliss-qsgq Step B) changes that one function, not this site.
-    let padded = bliss_rt::object::padded_string_size(bytes.len());
+fn alloc_string_object(s: &str) -> *mut u8 {
+    // A constructed simple string is a 32-bit SIMPLE_CHARACTER_STRING (SBCL
+    // model, spec §1.6.3): holds any code point and is freely mutable. The
+    // bliss-rt choke point picks the width and writes the layout.
+    let padded = bliss_rt::object::character_string_alloc_size(s);
     let layout = Layout::from_size_align(padded, 8).unwrap();
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
-        bliss_rt::object::write_simple_base_string(ptr, bytes);
+        bliss_rt::object::write_character_string(ptr, s);
         ptr
     }
 }
 
-fn extract_string_bytes(val: BlissVal) -> Result<&'static [u8], BlissError> {
-    if !val.is_heap_object() {
-        return Err(BlissError::TypeError {
-            datum: val,
-            expected: "string".into(),
-        });
-    }
-    unsafe {
-        let ptr = val.as_ptr();
-        let header = *(ptr as *const ObjectHeader);
-        if header.type_id() != type_id::SIMPLE_BASE_STRING {
-            return Err(BlissError::TypeError {
-                datum: val,
-                expected: "string".into(),
-            });
-        }
-        let len = *((ptr as *const u64).add(1)) as usize;
-        Ok(std::slice::from_raw_parts(ptr.add(16), len))
-    }
-}
 
 // ── Synonym stream resolution ─────────────────────────────────────
 
@@ -1654,9 +1651,7 @@ pub fn make_string_input_stream(
     start: usize,
     end: Option<usize>,
 ) -> Result<BlissVal, BlissError> {
-    let bytes = extract_string_bytes(string)?;
-    let s = std::str::from_utf8(bytes)
-        .map_err(|_| BlissError::StreamError("invalid UTF-8 in string".into()))?;
+    let s = extract_string_str(string)?;
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len();
     if start > len {
