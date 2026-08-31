@@ -203,6 +203,38 @@ pub mod type_id {
     pub const MD_ARRAY: u8 = 0x18;
 }
 
+// ── Simple string on-heap encoding ─────────────────────────────────
+
+/// Total padded byte size of a simple-string heap object holding `byte_len`
+/// content bytes: `ObjectHeader(8) + length(8) + bytes`, rounded up to an
+/// 8-byte boundary. The single definition of the simple-string footprint.
+#[inline]
+pub fn padded_string_size(byte_len: usize) -> usize {
+    (16 + byte_len + 7) & !7
+}
+
+/// Write the `SIMPLE_BASE_STRING` object layout — header + byte length + the
+/// content bytes — into a zeroed, 8-aligned allocation of at least
+/// [`padded_string_size`]`(bytes.len())`. This is the single choke point for the
+/// simple-string on-heap *write*; [`type_id::SIMPLE_BASE_STRING`] readers are the
+/// matching read choke points. The compact-string layout (bliss-qsgq Step B)
+/// changes this function (and its readers) rather than each allocation site,
+/// which currently duplicate the encoding.
+///
+/// # Safety
+/// `ptr` must point to a zeroed, 8-byte-aligned allocation of at least
+/// `padded_string_size(bytes.len())` bytes that outlives the returned object.
+#[inline]
+pub unsafe fn write_simple_base_string(ptr: *mut u8, bytes: &[u8]) {
+    let padded = padded_string_size(bytes.len());
+    unsafe {
+        *(ptr as *mut ObjectHeader) =
+            ObjectHeader::new(type_id::SIMPLE_BASE_STRING, (padded / 8) as u16);
+        *((ptr as *mut u64).add(1)) = bytes.len() as u64;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
+    }
+}
+
 // ── Package ────────────────────────────────────────────────────────
 
 /// Heap layout for a package (56 bytes total). §1.12, D1.20.

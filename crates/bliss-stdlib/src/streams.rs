@@ -1177,15 +1177,14 @@ pub fn make_lisp_string_fresh(s: &str) -> BlissVal {
 }
 
 fn alloc_string_object(bytes: &[u8]) -> *mut u8 {
-    let total = 16 + bytes.len(); // header(8) + length(8) + bytes
-    let padded = (total + 7) & !7;
+    // header(8) + length(8) + bytes, padded to 8. Encoding via the single
+    // bliss-rt choke point (write_simple_base_string) — the compact-string
+    // layout (bliss-qsgq Step B) changes that one function, not this site.
+    let padded = bliss_rt::object::padded_string_size(bytes.len());
     let layout = Layout::from_size_align(padded, 8).unwrap();
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
-        let header = ObjectHeader::new(type_id::SIMPLE_BASE_STRING, (padded / 8) as u16);
-        *(ptr as *mut ObjectHeader) = header;
-        *((ptr as *mut u64).add(1)) = bytes.len() as u64;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
+        bliss_rt::object::write_simple_base_string(ptr, bytes);
         ptr
     }
 }

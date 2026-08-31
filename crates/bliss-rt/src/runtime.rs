@@ -4,7 +4,6 @@
 
 use crate::error::BlissError;
 use crate::gc::GcConfig;
-use crate::object::{ObjectHeader, type_id};
 use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::value::BlissVal;
 
@@ -1149,17 +1148,17 @@ fn boot_make_string(s: &str) -> BlissVal {
     BOOT_STORE.with(|store| {
         let mut st = store.borrow_mut();
         let bytes = s.as_bytes();
-        let size = 8 + 8 + bytes.len();
-        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+        // Pad to an 8-byte boundary so the allocation matches the header's word
+        // count (the old unpadded size under-allocated by up to 7 bytes vs the
+        // div_ceil header). Single encoding via write_simple_base_string.
+        let padded = crate::object::padded_string_size(bytes.len());
+        let layout = std::alloc::Layout::from_size_align(padded, 8).unwrap();
         let ptr = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout);
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            *(ptr as *mut ObjectHeader) =
-                ObjectHeader::new(type_id::SIMPLE_BASE_STRING, size.div_ceil(8) as u16);
-            *(ptr.add(8) as *mut u64) = bytes.len() as u64;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
+            crate::object::write_simple_base_string(ptr, bytes);
             ptr
         };
         let id = (ptr as u64) >> 3;
