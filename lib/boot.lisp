@@ -50,6 +50,18 @@
 ;; stored as n<<3, so the representable range is [-2^60, 2^60-1].
 (defconstant most-positive-fixnum 576460752303423487)
 (defconstant most-negative-fixnum -576460752303423488)
+;; Standard array/character limit constants. The interpreter seeds their values
+;; (seed_standard_constant), but that only creates name-keyed bindings — NOT real
+;; COMMON-LISP symbols — so a library package that (:use :cl) and references e.g.
+;; CHAR-CODE-LIMIT interns a fresh, unbound symbol under the compiled path.
+;; DEFCONSTANT here interns them as genuine external CL symbols (bliss-9m5c).
+;; CHAR-CODE-LIMIT = #x110000 (Unicode scalar upper bound); flexi-streams' .asd
+;; guards with (<= char-code-limit 65533) and errored → ASDF re-loaded the .asd
+;; in a tight loop to OOM without this.
+(defconstant char-code-limit 1114112)
+(defconstant array-rank-limit 8)
+(defconstant array-dimension-limit 1152921504606846975)
+(defconstant array-total-size-limit 1152921504606846975)
 ;; PI (a float approximation of π; bliss floats are single-precision, so the
 ;; long-float literal rounds to 3.1415927) and the single-float magnitude
 ;; extremes. The epsilon / least-positive / double-float constants are not yet
