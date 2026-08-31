@@ -5139,3 +5139,34 @@ fn spawned_thread_survives_natural_minor_gc_while_spawner_joins() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Two interpreter threads allocating concurrently both complete with correct
+/// results, as long as the workload stays under the minor-GC nursery threshold
+/// (bliss-q9i1). Above that threshold two mutators currently thrash in the
+/// stop-the-world minor GC (each safepoint retires the parked thread's TLAB, so
+/// the threads ping-pong collections) plus contend on the symbol registry lock —
+/// tracked as bliss-bw3t. This guards the working regime and documents the
+/// boundary: 200k conses/thread is comfortably under the default nursery.
+#[test]
+fn two_interpreter_threads_allocate_concurrently_under_gc_threshold() {
+    let output = bliss_bin()
+        .args([
+            "--eval",
+            "(defun heavy (k) (let ((acc nil)) (dotimes (i k) (setq acc (cons i acc))) (length acc)))",
+            "--eval",
+            "(defun worker () (heavy 200000))",
+            "--eval",
+            "(let ((w (bliss-thread:make-thread (quote worker)))) \
+               (let ((mine (heavy 200000))) \
+                 (format t \"CONC ~a ~a~%\" mine (bliss-thread:join-thread w))))",
+        ])
+        .output()
+        .expect("failed to run bliss");
+    assert_eq!(output.status.code(), Some(0), "exit code should be 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("CONC 200000 200000"),
+        "both threads should compute 200000 concurrently; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
