@@ -263,6 +263,41 @@ fn bootstrap_strings_store_fixed_width_ucs4_and_round_trip() {
 }
 
 #[test]
+fn all_base_char_literals_compact_to_8bit_base_strings() {
+    // Per §1.6.3 (bliss-em3p): an all-BASE-CHAR (code points < 256) reader
+    // literal is stored compactly as an 8-bit SIMPLE_BASE_STRING; a literal with
+    // a wider character stays a 32-bit SIMPLE_CHARACTER_STRING.
+    let mut runtime = Runtime::init(minimal_runtime_config()).unwrap();
+
+    let ascii = runtime.eval("\"hello world\"").unwrap();
+    assert!(types::stringp(ascii));
+    unsafe {
+        let ptr = ascii.as_ptr();
+        assert_eq!(
+            (*(ptr as *const ObjectHeader)).type_id(),
+            type_id::SIMPLE_BASE_STRING
+        );
+        assert_eq!(*(ptr.add(8) as *const u64) as usize, "hello world".len());
+        // 8-bit elements: element i is the i-th byte/code point.
+        for (i, b) in "hello world".bytes().enumerate() {
+            assert_eq!(*ptr.add(16).add(i), b);
+        }
+    }
+    assert_eq!(bootstrap_string_content(ascii), "hello world");
+
+    // A literal with a wide character stays 32-bit.
+    let wide = runtime.eval("\"h\u{03bb}\"").unwrap();
+    unsafe {
+        assert_eq!(
+            (*(wide.as_ptr() as *const ObjectHeader)).type_id(),
+            type_id::SIMPLE_CHARACTER_STRING
+        );
+    }
+
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn arrays_expose_all_ansi_required_element_specialisation_tags() {
     // Per R1.15, arrays support the ANSI-required element specialisations.
     let specialisations = [

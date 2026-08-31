@@ -225,6 +225,57 @@ pub fn character_string_alloc_size(s: &str) -> usize {
     simple_string_size(s.chars().count(), 4)
 }
 
+/// Whether every character of `s` is a `BASE-CHAR` (code point < 256), i.e.
+/// whether `s` fits an 8-bit `SIMPLE_BASE_STRING`.
+#[inline]
+pub fn is_all_base_char(s: &str) -> bool {
+    s.chars().all(|c| (c as u32) < 256)
+}
+
+/// The `type_id` and padded byte size for the NARROWEST simple string that holds
+/// `s`: `SIMPLE_BASE_STRING` (1 byte/char) when every code point < 256, else
+/// `SIMPLE_CHARACTER_STRING` (4 bytes/char). For strings that are safe to store
+/// compactly — reader literals and other immutable strings; a MUTABLE string
+/// must use [`character_string_alloc_size`] / [`write_character_string`] so that
+/// `(SETF CHAR)` of any code point stays legal (a base string can only hold
+/// base-chars).
+#[inline]
+pub fn narrowest_string_alloc(s: &str) -> (u8, usize) {
+    let n = s.chars().count();
+    if is_all_base_char(s) {
+        (type_id::SIMPLE_BASE_STRING, simple_string_size(n, 1))
+    } else {
+        (type_id::SIMPLE_CHARACTER_STRING, simple_string_size(n, 4))
+    }
+}
+
+/// Write `s` into a zeroed, 8-aligned allocation at the narrowest width — an
+/// 8-bit `SIMPLE_BASE_STRING` when every code point < 256, else a 32-bit
+/// `SIMPLE_CHARACTER_STRING`. For immutable/compactable strings only.
+///
+/// # Safety
+/// `ptr` must point to a zeroed, 8-byte-aligned allocation of at least
+/// `narrowest_string_alloc(s).1` bytes that outlives the returned object.
+pub unsafe fn write_narrowest_string(ptr: *mut u8, s: &str) {
+    let (tid, padded) = narrowest_string_alloc(s);
+    let char_len = s.chars().count();
+    unsafe {
+        *(ptr as *mut ObjectHeader) = ObjectHeader::new(tid, (padded / 8) as u16);
+        *((ptr as *mut u64).add(1)) = char_len as u64;
+        let data = ptr.add(16);
+        if tid == type_id::SIMPLE_CHARACTER_STRING {
+            let d = data as *mut u32;
+            for (i, c) in s.chars().enumerate() {
+                *d.add(i) = c as u32;
+            }
+        } else {
+            for (i, c) in s.chars().enumerate() {
+                *data.add(i) = c as u8;
+            }
+        }
+    }
+}
+
 /// Write a 32-bit `SIMPLE_CHARACTER_STRING` for `s` into a zeroed, 8-aligned
 /// allocation of at least [`character_string_alloc_size`]`(s)` bytes. The single
 /// write choke point for constructed strings; `read_simple_string` /

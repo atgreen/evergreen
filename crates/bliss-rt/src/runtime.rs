@@ -1147,16 +1147,18 @@ fn boot_symbol_name(val: BlissVal) -> Option<String> {
 fn boot_make_string(s: &str) -> BlissVal {
     BOOT_STORE.with(|store| {
         let mut st = store.borrow_mut();
-        // 32-bit SIMPLE_CHARACTER_STRING (SBCL model); the choke point sizes the
-        // block to match the header word count.
-        let padded = crate::object::character_string_alloc_size(s);
+        // Reader string literals are immutable, so (bliss-em3p) allocate the
+        // narrowest fixed-width representation: an 8-bit SIMPLE_BASE_STRING when
+        // every character is a BASE-CHAR, else a 32-bit SIMPLE_CHARACTER_STRING.
+        // The choke point sizes the block to match the header word count.
+        let (_tid, padded) = crate::object::narrowest_string_alloc(s);
         let layout = std::alloc::Layout::from_size_align(padded, 8).unwrap();
         let ptr = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout);
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            crate::object::write_character_string(ptr, s);
+            crate::object::write_narrowest_string(ptr, s);
             ptr
         };
         let id = (ptr as u64) >> 3;

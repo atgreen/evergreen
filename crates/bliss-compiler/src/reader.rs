@@ -264,16 +264,25 @@ fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
 }
 
 fn alloc_string(s: &str) -> BlissVal {
-    // Compact simple string (SBCL model, spec §1.6.3): a 32-bit
-    // SIMPLE_CHARACTER_STRING — ObjectHeader(8) + char_len(8) + u32 data@16.
+    // Compact simple string (SBCL model, spec §1.6.3). A reader literal is
+    // immutable (mutating an interned literal is undefined and rejected), so it
+    // is stored at the NARROWEST width — an 8-bit SIMPLE_BASE_STRING when every
+    // code point < 256, else a 32-bit SIMPLE_CHARACTER_STRING (bliss-em3p).
     let char_len = s.chars().count();
-    let total_size = bliss_rt::object::character_string_alloc_size(s);
-    let ptr = gc_alloc(total_size, type_id::SIMPLE_CHARACTER_STRING);
+    let (tid, total_size) = bliss_rt::object::narrowest_string_alloc(s);
+    let ptr = gc_alloc(total_size, tid);
     unsafe {
         *(ptr.add(8) as *mut u64) = char_len as u64;
-        let data = ptr.add(16) as *mut u32;
-        for (i, c) in s.chars().enumerate() {
-            *data.add(i) = c as u32;
+        let data = ptr.add(16);
+        if tid == type_id::SIMPLE_CHARACTER_STRING {
+            let d = data as *mut u32;
+            for (i, c) in s.chars().enumerate() {
+                *d.add(i) = c as u32;
+            }
+        } else {
+            for (i, c) in s.chars().enumerate() {
+                *data.add(i) = c as u8;
+            }
         }
         BlissVal::from_heap_ptr(ptr)
     }
