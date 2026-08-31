@@ -1631,7 +1631,23 @@ pub fn join_thread(id: NativeThreadId) -> Result<BlissVal, BlissError> {
             .cloned()
             .ok_or_else(|| BlissError::Internal(format!("no native thread with id {}", id.0)))?
     };
-    let value = thread.result.wait()?;
+    // Block for the joined thread's result. If that thread (or any peer)
+    // triggers a GC while we wait here, stop-the-world must be able to skip us:
+    // we are parked in a futex and will never reach a safepoint poll on our own,
+    // so leaving our state as Running would make the collector wait for us until
+    // its 1s handshake timeout — an effective deadlock when a spawned worker GCs
+    // while its spawner joins (bliss-bw3t). Publish our CL stack top and enter
+    // the Blocked state (scannable without cooperation, excluded from the
+    // handshake — §13.6.1 / R13.12), then restore Running. current_thread() is
+    // registered by the time we get here (we allocated to build the call).
+    let value = {
+        let me = current_thread();
+        me.stack.publish_top();
+        me.set_state(NativeThreadState::Blocked);
+        let waited = thread.result.wait();
+        me.set_state(NativeThreadState::Running);
+        waited
+    }?;
     if let Some(handle) = thread.join_handle.lock().unwrap().take() {
         handle
             .join()
