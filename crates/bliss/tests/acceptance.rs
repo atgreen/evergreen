@@ -4416,6 +4416,30 @@ fn write_to_string_honors_print_control_keywords() {
     }
 }
 
+/// #S(name :slot val …) reads back to a real DEFSTRUCT instance, so a struct
+/// round-trips: (equalp s (read (prin1 s))) and its accessors work. Unknown
+/// struct names fall back to the reader's legacy object (no crash). (bliss-ipn7)
+#[test]
+fn defstruct_reads_from_hash_s_syntax() {
+    let prog = "(defstruct pt a b) \
+                (defstruct (pt3 (:include pt)) c) \
+                (print (let ((s (read-from-string \"#S(PT :A 1 :B 2)\"))) \
+                         (list (pt-a s) (pt-b s) (typep s 'pt) (typep s 'structure-object)))) \
+                (print (let ((s (read-from-string \"#S(PT3 :A 1 :B 2 :C 3)\"))) \
+                         (list (pt-a s) (pt3-c s)))) \
+                (print (equalp (make-pt :a 1 :b 2) \
+                               (read-from-string (prin1-to-string (make-pt :a 1 :b 2)))))";
+    let out = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("(1 2 T T)"), "read #S accessors/typep: {stdout}");
+    assert!(stdout.contains("(1 3)"), "read #S inherited slots: {stdout}");
+    assert!(
+        stdout.lines().any(|l| l.trim() == "T"),
+        "print/read round-trip equalp: {stdout}"
+    );
+}
+
 /// DEFSTRUCT instances print in readable #S(NAME :slot val …) syntax (both the
 /// prin1 builtin and prin1-to-string agree), with inherited :include slots
 /// included in precedence order. (bliss-i1i9)

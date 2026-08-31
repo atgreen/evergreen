@@ -5323,6 +5323,18 @@ fn reader_pathname_constructor(namestring: BlissVal) -> Option<BlissVal> {
         .map(|(pathname, _)| pathname)
 }
 
+/// `#S(name :slot val …)` reader hook: build a real CLOS structure instance so
+/// it round-trips with DEFSTRUCT-made instances. Returns None (keeping the
+/// reader's legacy STRUCTURE object) when `name` is not a known structure class
+/// (bliss-ipn7). `slots` is the flat [key val key val …] initarg list.
+fn reader_struct_constructor(name: BlissVal, slots: &[BlissVal]) -> Option<BlissVal> {
+    let class = bliss_stdlib::find_class(name)?;
+    if !bliss_stdlib::is_structure_class(class) {
+        return None;
+    }
+    bliss_stdlib::make_instance(class, slots).ok()
+}
+
 fn read_time_eval(form: BlissVal) -> Result<BlissVal, BlissError> {
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() {
@@ -5389,6 +5401,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<BlissVal, BlissError
     reader::set_read_eval_hook(Some(read_time_eval));
     reader::set_symbol_resolver(Some(reader_symbol_resolver));
     reader::set_pathname_constructor(Some(reader_pathname_constructor));
+    reader::set_struct_constructor(Some(reader_struct_constructor));
     bliss_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     let chars: Vec<char> = source.chars().collect();
     register_declared_packages(&chars);

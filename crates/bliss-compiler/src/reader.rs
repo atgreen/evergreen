@@ -133,6 +133,19 @@ pub fn set_pathname_constructor(hook: Option<PathnameConstructor>) {
     *PATHNAME_CTOR.lock().unwrap() = hook;
 }
 
+/// `#S(name slot val …)` constructor hook: builds a real (CLOS) structure
+/// instance from the class name and flat slot key/value list, so a struct read
+/// back round-trips with DEFSTRUCT-made instances. `None` if the name is not a
+/// known structure class, in which case the reader keeps the legacy STRUCTURE
+/// heap object (bliss-ipn7).
+type StructConstructor = fn(BlissVal, &[BlissVal]) -> Option<BlissVal>;
+static STRUCT_CTOR: OrderedMutex<Option<StructConstructor>> =
+    OrderedMutex::new(LockLevel::CodeCache, 7, "reader struct constructor", None);
+
+pub fn set_struct_constructor(hook: Option<StructConstructor>) {
+    *STRUCT_CTOR.lock().unwrap() = hook;
+}
+
 fn construct_pathname(namestring: BlissVal) -> BlissVal {
     let hook = *PATHNAME_CTOR.lock().unwrap();
     hook.and_then(|h| h(namestring))
@@ -446,6 +459,15 @@ fn alloc_pathname(namestring: BlissVal) -> BlissVal {
 }
 
 fn alloc_structure(name: BlissVal, slots: &[BlissVal]) -> BlissVal {
+    // Prefer the CLOS constructor hook (bliss-ipn7): a real DEFSTRUCT instance
+    // so `(read (prin1 s))` round-trips. The caller roots `name`/`slots`, so
+    // they survive the hook's allocation. Fall back to the legacy STRUCTURE
+    // object when the name is not a known structure class.
+    if let Some(hook) = *STRUCT_CTOR.lock().unwrap() {
+        if let Some(inst) = hook(name, slots) {
+            return inst;
+        }
+    }
     // Root `name` across gc_alloc — see alloc_ratio (bliss-wlf). The `slots`
     // slice must point into rooted storage at the caller (the reader's slot
     // Vecs are HostRoot'ed), so its elements re-read post-GC values.
