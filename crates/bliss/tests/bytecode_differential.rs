@@ -184,6 +184,19 @@ const CORPUS: &[&str] = &[
     "(defun f (x) (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart (quote r) 3)))) (restart-case (error \"x\") (r (v) (+ v x))))) (f 10)",
     "(defun f () (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart (quote continue))))) (restart-case (progn (error \"x\") 5) (continue () 42)))) (f)",
     "(defun g (n) (if (< n 0) (error \"neg\") (* n 2))) (defun f () (handler-case (g -1) (error () (quote was-neg)))) (f)",
+    // bliss-9kc: a HANDLER-BIND handler must be able to INVOKE-RESTART a restart
+    // established INSIDE its body, even when the condition is a RAW evaluator error
+    // (TYPE-ERROR from (car 5)) — which never passed through SIGNAL. Both tiers must
+    // signal in-context, before the restart is disestablished.
+    "(defun f () (handler-bind ((type-error (lambda (e) (declare (ignore e)) (invoke-restart (quote k))))) (restart-case (car 5) (k () (quote ok))))) (f)",
+    // A declining HANDLER-BIND handler runs exactly once, then an outer HANDLER-CASE
+    // still catches the (raw) condition.
+    "(defvar *n* 0) (defun f () (setq *n* 0) (handler-case (handler-bind ((type-error (lambda (e) (declare (ignore e)) (incf *n*)))) (restart-case (car 5) (k () 1))) (type-error (e) (declare (ignore e)) (list :outer *n*)))) (f)",
+    // Invoke an OUTER restart from inside a nested RESTART-CASE body on a raw error.
+    "(defun f () (handler-bind ((type-error (lambda (e) (declare (ignore e)) (invoke-restart (quote outer))))) (restart-case (restart-case (car 5) (inner () :inner)) (outer () :outer)))) (f)",
+    // An unhandled raw error inside a RESTART-CASE still propagates (and is caught by
+    // an enclosing HANDLER-CASE) rather than vanishing.
+    "(defun f () (handler-case (restart-case (car 5) (k () 1)) (type-error (e) (declare (ignore e)) :caught))) (f)",
     // ── Multiple values on bytecode (nmq.5) ──
     "(values 1 2 3)",
     "(multiple-value-bind (a b) (values 1 2) (list a b))",

@@ -3661,6 +3661,16 @@ fn handler_bind_raw_errors_and_program_error() {
                (my-restart () 'restarted))",
             "RESTARTED",
         ),
+        // bliss-9kc: … and, crucially, a restart established INSIDE the handler-bind
+        // body, for a RAW evaluator error. The raw TYPE-ERROR is now signalled
+        // in-context (before the RESTART-CASE is disestablished), so the handler can
+        // reach the K restart established between it and the signal — which the old
+        // post-unwind handler path could not.
+        (
+            "(handler-bind ((type-error (lambda (e) (declare (ignore e)) (invoke-restart 'k)))) \
+               (restart-case (car 5) (k () :ok)))",
+            ":OK",
+        ),
         // Handler on UNBOUND-VARIABLE fires too.
         (
             "(let ((n 0)) \

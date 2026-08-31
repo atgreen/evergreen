@@ -75,6 +75,15 @@ pub enum BlissError {
     /// `CONTROL-ERROR`, so it is catchable — unlike `Internal`, which also
     /// carries the evaluator's live control-flow tokens and must keep propagating.
     ControlError(String),
+
+    /// A condition-denoting raw error that has ALREADY been signalled through the
+    /// live handler stack (bliss-9kc) and declined by every handler. Carries the
+    /// built condition (so it stays reachable/traced) plus a pre-rendered report
+    /// for display. Condition-conversion returns `None` for this variant, so an
+    /// enclosing handler frame that already had its in-context turn does not run
+    /// its handlers a second time. Constructed only from an already-allocated
+    /// condition, so producing it allocates nothing new.
+    Signalled { condition: BlissVal, report: String },
 }
 
 impl core::fmt::Display for BlissError {
@@ -105,6 +114,7 @@ impl core::fmt::Display for BlissError {
             BlissError::FileError(msg) => write!(f, "file error: {}", msg),
             BlissError::SandboxViolation(msg) => write!(f, "sandbox violation: {}", msg),
             BlissError::ControlError(msg) => write!(f, "control error: {}", msg),
+            BlissError::Signalled { report, .. } => write!(f, "{}", report),
         }
     }
 }

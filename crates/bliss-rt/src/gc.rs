@@ -2309,6 +2309,9 @@ impl TraceHostRoots for BlissError {
             BlissError::TypeError { datum, .. }
             | BlissError::UnboundVariable(datum)
             | BlissError::UndefinedFunction(datum) => datum.trace_host_roots(visit),
+            // The already-signalled condition is a live BlissVal and must be
+            // relocated with the moving GC (bliss-9kc).
+            BlissError::Signalled { condition, .. } => condition.trace_host_roots(visit),
             BlissError::Oom
             | BlissError::StackOverflow(_)
             | BlissError::InvalidImage(_)

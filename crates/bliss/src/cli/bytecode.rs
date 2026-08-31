@@ -45,8 +45,9 @@ use super::{
     DynBind, Env, EnvFrame, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry,
     RestartFunction, apply_function, arena_cons, arena_str, bliss_error_to_condition,
     condition_matches_handler, cp, eval_form, handler_case_token, list_to_vec, next_control_token,
-    resolve_sym, restart_invoked_name, run_handler_bind_handlers, store_control_value, sym_name,
-    symbol_bare_name, tag_key, take_control_value, val_as_str, vec_to_list,
+    resolve_sym, restart_invoked_name, run_handler_bind_handlers, signal_raw_error_in_context,
+    store_control_value, sym_name, symbol_bare_name, tag_key, take_control_value, val_as_str,
+    vec_to_list,
 };
 // Label-based assembler backing the native (T1) code emitter (see cli::asm).
 use bliss_rt::asm::{Asm, Cc, Label};
@@ -11266,6 +11267,24 @@ fn initiate_unwind(
     env: &mut Env,
     mut pending: Pending,
 ) -> Result<(), BlissError> {
+    // bliss-9kc: before the unwind loop disestablishes any RESTART-CASE frame
+    // (which truncates env.restarts) or runs a HANDLER-BIND handler post-unwind,
+    // give the live handler stack its turn on a RAW evaluator error IN CONTEXT —
+    // while every restart established between the signal and its handler is still
+    // live — so a handler can INVOKE-RESTART a restart established inside the
+    // handler-bind body. This mirrors the tree-walker's signal_raw_error_in_context
+    // and the ERROR/SIGNAL path (which already signals in-context). A handler that
+    // transfers control becomes the pending transfer (delivered to the establishing
+    // RESTART-CASE/HANDLER-CASE frame below); if all decline, the error comes back
+    // as BlissError::Signalled so the per-frame handler logic does not re-run it.
+    // Control tokens (Internal) and already-Signalled errors are left untouched.
+    if matches!(&pending, Pending::Propagate(e)
+        if !matches!(e, BlissError::Internal(_) | BlissError::Signalled { .. }))
+    {
+        if let Pending::Propagate(error) = pending {
+            pending = error_to_pending(signal_raw_error_in_context(env, error), env);
+        }
+    }
     loop {
         let top = acts.len() - 1;
         let handler = acts[top].handlers.last().cloned();

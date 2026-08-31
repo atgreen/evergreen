@@ -1948,6 +1948,58 @@ fn signal_and_raise(env: &mut Env, condition: BlissVal, msg: String) -> BlissErr
     }
 }
 
+/// bliss-9kc: signal a RAW evaluator error (a `TYPE-ERROR` from `(car 5)`,
+/// `UNBOUND-VARIABLE`, arithmetic, … — one that unwound the Rust stack *without*
+/// passing through `signal_condition_object`) through the live handler stack,
+/// while the enclosing dynamic environment is still intact. Called from
+/// `eval_restart_case`/`eval_restart_bind` on the unwind, BEFORE they truncate
+/// their restarts, so a HANDLER-BIND/HANDLER-CASE handler can `INVOKE-RESTART` a
+/// restart established *inside* the handler-bind body — which the post-unwind
+/// handler path (`eval_handler_bind`/`eval_handler_case`) cannot reach because
+/// that restart is already gone by the time it runs.
+///
+/// Returns the error to propagate:
+///  * the original error unchanged if it does not denote a fresh condition — a
+///    control-flow token (`Internal`), `Shutdown`, `Oom`/`StackOverflow` (which
+///    keep their existing no-allocation handling), or an already-[`Signalled`]
+///    error (so nested restart frames never signal it twice);
+///  * a transfer error (an `INVOKE-RESTART` / `HANDLER-CASE` token) when a
+///    handler transferred control — the establishing frame catches it;
+///  * [`BlissError::Signalled`] when every handler declined, so an enclosing
+///    handler frame that already had its in-context turn does not re-run.
+fn signal_raw_error_in_context(env: &mut Env, mut error: BlissError) -> BlissError {
+    // OOM and control-stack overflow use a preallocated STORAGE-CONDITION and a
+    // delicate no-allocation path; leave them to the existing post-unwind
+    // handling rather than running the allocating in-context signal here.
+    if matches!(error, BlissError::Oom | BlissError::StackOverflow(_)) {
+        return error;
+    }
+    // Render the report now (a plain Rust String, no GC alloc) so the declined
+    // Signalled error can be printed at top level without the interpreter.
+    let report = describe_err(&error);
+    let condition_result = {
+        // Root the error's payload (TypeError.datum, …) across the allocating
+        // condition build (moving GC; codex review of bliss-9kc).
+        bliss_rt::rooted_ref!(_error_root = &mut error);
+        bliss_error_to_condition(env, &error)
+    };
+    match condition_result {
+        Ok(Some(mut condition)) => {
+            bliss_rt::rooted_ref!(_condition_root = &mut condition);
+            match signal_condition_object(condition, env) {
+                // Every handler declined: mark it already-signalled so the
+                // enclosing HANDLER-BIND/HANDLER-CASE fallback skips it.
+                Ok(_) => BlissError::Signalled { condition, report },
+                // A handler transferred control (INVOKE-RESTART / HANDLER-CASE).
+                Err(transfer) => transfer,
+            }
+        }
+        // Not a condition-denoting error, or the condition build itself failed:
+        // propagate the original error unchanged.
+        _ => error,
+    }
+}
+
 fn condition_matches_type_spec(env: &Env, condition: BlissVal, type_spec: BlissVal) -> bool {
     if type_spec.is_nil() {
         return false;
@@ -21417,6 +21469,12 @@ fn eval_restart_bind(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     }
 
     let result = eval_progn(body, env);
+    // bliss-9kc: signal a raw error in-context before truncating our restarts,
+    // so an enclosing handler can invoke one of them (see eval_restart_case).
+    let result = match result {
+        Err(error) => Err(signal_raw_error_in_context(env, error)),
+        ok => ok,
+    };
     env.restarts.truncate(base_len);
     result
 }
@@ -21454,6 +21512,13 @@ fn eval_restart_case(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErro
     }
 
     let result = eval_form(restartable_form, env);
+    // bliss-9kc: on a RAW evaluator error, give the live handler stack its turn
+    // NOW — before the restarts we established are truncated below — so a handler
+    // can INVOKE-RESTART a restart established inside this RESTART-CASE.
+    let result = match result {
+        Err(error) => Err(signal_raw_error_in_context(env, error)),
+        ok => ok,
+    };
     env.restarts.truncate(base_len);
     match result {
         Ok(value) => Ok(value),
