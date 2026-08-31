@@ -2357,6 +2357,21 @@ fn typep_not_and_string_length_compounds() {
         ("(typep \"ab\" '(simple-string 2))", "T"),
         ("(typep \"abc\" '(string *))", "T"),
         ("(typep 5 '(string 3))", "NIL"),
+        // bliss-ajb3: BASE-STRING / SIMPLE-BASE-STRING match ONLY 8-bit base
+        // strings (all BASE-CHARs), not the 32-bit character strings STRING also
+        // covers. An all-ASCII literal is a base string; one with a wide char is
+        // not, though it is still a STRING.
+        ("(typep \"abc\" 'base-string)", "T"),
+        ("(typep \"abc\" 'simple-base-string)", "T"),
+        ("(typep \"hλ\" 'base-string)", "NIL"),
+        ("(typep \"hλ\" 'simple-base-string)", "NIL"),
+        ("(typep \"hλ\" 'string)", "T"),
+        ("(typep \"abc\" '(base-string 3))", "T"),
+        ("(typep \"hλ\" '(base-string 2))", "NIL"),
+        // A mutable (constructed) string is a 32-bit CHARACTER string, so it is a
+        // STRING but not a BASE-STRING.
+        ("(typep (make-string 3) 'string)", "T"),
+        ("(typep (make-string 3) 'base-string)", "NIL"),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");

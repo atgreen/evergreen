@@ -4861,6 +4861,30 @@ fn is_string_value(v: BlissVal) -> bool {
     v.is_string()
 }
 
+/// True if `v` is a BASE-STRING — a string whose characters are all BASE-CHARs
+/// and which is stored 8-bit (`SIMPLE_BASE_STRING`, type_id 0x05). This is a
+/// strict subset of [`is_string_value`], which matches any string regardless of
+/// element width (bliss-ajb3). Sentinel-safe: it never dereferences a registry
+/// sentinel or pathname as a heap object.
+fn is_base_string_value(v: BlissVal) -> bool {
+    // A pathname is never a string.
+    if bliss_stdlib::is_pathname(v) {
+        return false;
+    }
+    // A registry-backed sentinel carries its content as a Rust String; decode it
+    // and test whether every character is a BASE-CHAR.
+    if let Some(s) = bliss_stdlib::registered_string(v) {
+        return bliss_rt::object::is_all_base_char(&s);
+    }
+    // An adjustable / fill-pointer CHARACTER vector has element-type CHARACTER
+    // (32-bit), so it is a CHARACTER string, not a base string.
+    if bliss_stdlib::is_complex_vector(v) {
+        return false;
+    }
+    // A real heap string: only the 8-bit SIMPLE_BASE_STRING type_id qualifies.
+    v.is_base_string()
+}
+
 /// True if `v` is a registry-backed sentinel (a string/namestring hash wearing
 /// TAG_HEAP_OBJECT) — a value that is NOT a real heap pointer and must never be
 /// dereferenced via a raw `ObjectHeader` load.
@@ -6718,7 +6742,11 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
             "CONS" => object.is_cons(),
             "SYMBOL" => object.is_symbol(),
             "KEYWORD" => is_keyword_arg(object),
-            "STRING" | "SIMPLE-STRING" | "BASE-STRING" => is_string_value(object),
+            "STRING" | "SIMPLE-STRING" => is_string_value(object),
+            // BASE-STRING / SIMPLE-BASE-STRING match ONLY 8-bit base strings —
+            // every character a BASE-CHAR — not the 32-bit character strings a
+            // STRING can also be (bliss-ajb3).
+            "BASE-STRING" | "SIMPLE-BASE-STRING" => is_base_string_value(object),
             // Numeric lattice over the real heap numeric types (bignum, ratio,
             // double-float, complex), via the runtime predicates — the earlier
             // checks only recognised fixnum/single-float, so (typep (expt 2 100)
@@ -6962,8 +6990,16 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
         // (string size) / (simple-string size) / (base-string size): a string of
         // the given length (or `*`). The bare STRING/… symbols are handled by the
         // atom path; only the compound (with a size) reaches here.
-        "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING" => {
+        "STRING" | "SIMPLE-STRING" => {
             if !is_string_value(object) {
+                return Ok(false);
+            }
+            Ok(vector_length_matches(&list_to_vec(args), object))
+        }
+        // (base-string size) / (simple-base-string size): an 8-bit base string of
+        // the given length (bliss-ajb3).
+        "BASE-STRING" | "SIMPLE-BASE-STRING" => {
+            if !is_base_string_value(object) {
                 return Ok(false);
             }
             Ok(vector_length_matches(&list_to_vec(args), object))

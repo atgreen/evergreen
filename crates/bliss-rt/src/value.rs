@@ -247,6 +247,27 @@ impl BlissVal {
         }
     }
 
+    /// True if this value is a BASE-STRING specifically — a heap object whose
+    /// type_id is `SIMPLE_BASE_STRING` (8-bit BASE-CHAR storage). Returns false
+    /// for `SIMPLE_CHARACTER_STRING` (32-bit) and every non-heap tag. Distinct
+    /// from [`is_string`](Self::is_string), which matches either string width.
+    ///
+    /// # Safety note
+    /// Like [`is_string`](Self::is_string), this dereferences the heap pointer to
+    /// read the `ObjectHeader`, so it is safe only when the pointer is a valid,
+    /// live heap object (never a registry sentinel wearing `TAG_HEAP_OBJECT`).
+    pub fn is_base_string(self) -> bool {
+        if self.tag() != TAG_HEAP_OBJECT {
+            return false;
+        }
+        // SAFETY: caller guarantees the heap pointer is valid.
+        unsafe {
+            let ptr = self.as_ptr();
+            let header = *(ptr as *const crate::object::ObjectHeader);
+            header.type_id() == crate::object::type_id::SIMPLE_BASE_STRING
+        }
+    }
+
     /// True if this value is a CLOS standard-object instance (a heap object
     /// whose type_id is `STANDARD_OBJECT`). CLOS instances are heap objects
     /// laid out as `[ObjectHeader | wrapper ptr | inline slots]`.
