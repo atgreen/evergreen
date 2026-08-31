@@ -6620,6 +6620,21 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
                 .as_ref()
                 .map(|names| names.iter().any(|name| name == "CONDITION"))
                 .unwrap_or(false);
+            // A DEFSTRUCT instance is a STRUCTURE-OBJECT and NOT a
+            // STANDARD-OBJECT (the two are disjoint), even though its CLOS
+            // precedence list — bliss builds structs as DEFCLASSes — contains
+            // STANDARD-OBJECT. STRUCT_CLASSES records which class names are
+            // structs (bliss-ta0a).
+            let is_struct = hierarchy
+                .as_ref()
+                .map(|names| names.iter().any(|n| is_struct_class_name(n)))
+                .unwrap_or(false);
+            if type_name == "STRUCTURE-OBJECT" {
+                return Ok(is_struct);
+            }
+            if type_name == "STANDARD-OBJECT" && is_struct {
+                return Ok(false);
+            }
             return Ok(in_hierarchy || (type_name == "STANDARD-OBJECT" && !is_condition));
         }
         let matches = match type_name.as_str() {

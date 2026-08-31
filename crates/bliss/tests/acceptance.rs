@@ -4416,6 +4416,32 @@ fn write_to_string_honors_print_control_keywords() {
     }
 }
 
+/// TYPEP: a DEFSTRUCT instance is a STRUCTURE-OBJECT and NOT a STANDARD-OBJECT
+/// (disjoint), even though bliss builds structs as DEFCLASSes; a plain DEFCLASS
+/// instance is the reverse. (bliss-ta0a)
+#[test]
+fn typep_structure_object_vs_standard_object() {
+    let prog = "(defstruct pt a b) \
+                (defstruct (pt3 (:include pt)) c) \
+                (defclass cl () ()) \
+                (print (list \
+                  (typep (make-pt) 'structure-object) \
+                  (typep (make-pt) 'standard-object) \
+                  (typep (make-pt3) 'structure-object) \
+                  (typep (make-pt3) 'standard-object) \
+                  (typep (make-pt3) 'pt) \
+                  (typep (make-instance 'cl) 'standard-object) \
+                  (typep (make-instance 'cl) 'structure-object)))";
+    let out = bliss_bin().args(["--eval", prog]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // struct-so, struct-stdo, pt3-so, pt3-stdo, pt3-is-pt, clos-stdo, clos-so
+    assert!(
+        stdout.contains("(T NIL T NIL T T NIL)"),
+        "typep structure-object/standard-object wrong, got: {stdout}"
+    );
+}
+
 /// EQUALP descends DEFSTRUCT instances slot-by-slot (same type + EQUALP slots),
 /// including :include inheritance and case-insensitive string slots, but does
 /// NOT descend general CLOS standard-objects (those stay identity-compared).
