@@ -7986,10 +7986,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
             }
             "PRINT" => {
-                // (print object &optional stream): leading newline, then the
-                // prin1 representation — routed through the output stream.
-                // Preserves the historical trailing-newline behaviour that the
-                // stage-0 gate depends on.
+                // (print object &optional stream): per CLHS, PRINT is PRIN1
+                // preceded by a newline and followed by a SPACE (not a newline)
+                // — "the printed representation of object is preceded by a
+                // newline and followed by a space" (bliss-g5dg).
                 let args = eval_args(cdr, env)?;
                 if args.is_empty() {
                     return Err(BlissError::ProgramError("PRINT requires an object".into()));
@@ -8002,7 +8002,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let out = resolve_output_stream(stream, env);
                 write_str_to(out, "\n")?;
                 write_str_to(out, &rendered)?;
-                write_str_to(out, "\n")?;
+                write_str_to(out, " ")?;
                 return Ok(args[0]);
             }
             "PRINC" => {
@@ -22423,7 +22423,14 @@ fn run_load_report(path: &str, env: &mut Env) -> Result<i32, BlissError> {
 
 fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, BlissError> {
     match with_eval_context(env, EvalContext::Eval, |env| read_eval_all_env(expr, env)) {
-        Ok(result) => {
+        Ok(mut result) => {
+            bliss_rt::rooted_ref!(_result_root = &mut result);
+            // Echo the value on a fresh line, like a REPL: if the form left the
+            // cursor mid-line (e.g. PRINT ends with a space, PRINC with no
+            // newline), start the result on its own line so it is not run
+            // together with the form's own output (bliss-g5dg).
+            let out = resolve_output_stream(NIL, env);
+            let _ = bliss_stdlib::stream_fresh_line(out);
             println!("{}", format_val_env(result, env, true));
             // When the top-level form yielded multiple values, echo the
             // secondary values too (one per line). env.mv holds the full value

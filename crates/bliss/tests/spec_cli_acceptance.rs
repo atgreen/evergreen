@@ -236,7 +236,14 @@ fn stage_zero_gate_round_trips_core_datatypes_and_runs_a_nested_script() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let actual_lines: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
+    // PRINT ends each datum with a SPACE per CLHS (not a newline) — bliss-g5dg —
+    // so compare lines whitespace-insensitively. READ ignores trailing WS, so
+    // the round-trip intent of the gate (one readable datum per line) is intact.
+    let actual_lines: Vec<&str> = stdout
+        .lines()
+        .map(|line| line.trim_end())
+        .filter(|line| !line.is_empty())
+        .collect();
     let expected_lines = vec![
         "123",
         "3/4",
@@ -2200,15 +2207,20 @@ fn condition_format_control_uses_stdlib_format() {
 
 #[test]
 fn instance_without_report_prints_as_class_tag() {
+    // A STANDARD-OBJECT with no print-object method prints as the unreadable
+    // class tag #<POINT>.
     assert_eq!(
         eval_ok(
             "(progn (defclass point () ((x :initarg :x))) (format nil \"~a\" (make-instance 'point :x 1)))"
         ),
         "\"#<POINT>\""
     );
+    // A DEFSTRUCT instance with no print-object method prints in the *readable*
+    // #S(NAME :slot val …) syntax (CLHS 22.1.3.12), not the class tag — this is
+    // the conformant default the fixed-width string layout (bliss-pd0) unblocked.
     assert_eq!(
         eval_ok("(progn (defstruct pt x) (format nil \"~a\" (make-pt :x 1)))"),
-        "\"#<PT>\""
+        "\"#S(PT :X 1)\""
     );
 }
 
