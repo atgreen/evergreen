@@ -3675,6 +3675,18 @@ fn install_evaluator_global_root_scanner() {
 fn thread_entry_runner(mut entry: BlissVal) -> Result<BlissVal, BlissError> {
     bliss_rt::rooted_ref!(_entry_root = &mut entry);
     let mut env = Env::new_impl(false, false);
+    // Root the worker's whole Env in place, exactly as the main thread does at
+    // `read_eval_all_env` (bliss-bw3t). Without this the worker's environment —
+    // and every lexical value reachable from it (e.g. a list being consed up in
+    // a local variable) — is invisible to the collector. That was harmless only
+    // while the worker never triggered a GC, but the instant ANY thread collects
+    // while this worker is active (parked at a safepoint mid-build), the moving
+    // GC treats the worker's live data as garbage and reclaims/relocates it,
+    // aliasing freed nursery space and corrupting live lists into cycles — the
+    // intermittent hang under concurrent allocation. The Env's frames are host
+    // (Rc) objects scanned as roots each GC, so rooting the Env in place is what
+    // keeps them live and correctly relocated.
+    bliss_rt::rooted_ref!(_env_root = &mut env);
     apply_function(entry, &[], &mut env)
 }
 
