@@ -1553,6 +1553,35 @@ fn find_symbol_intern_accessibility() {
     }
 }
 
+/// Regression (bliss-nmhw, follow-up to bliss-xe2p): a builtin fast-path in the
+/// interpreter must not ignore keyword arguments that its boot.lisp defun
+/// honours — otherwise a DIRECT-FORM call `(fn … :kw v)` diverges from the same
+/// call made via FUNCALL/APPLY (which always routes to the defun). This guards
+/// the audited keyword-honouring builtins against future fast-path/defun drift.
+#[test]
+fn keyword_builtins_agree_direct_and_via_funcall() {
+    // Each conjunct compares the direct form against the FUNCALL form; the whole
+    // program prints T iff every builtin honours its keywords identically both
+    // ways. WRITE-TO-STRING (:base) is the original bliss-xe2p offender.
+    let expr = r#"(and
+      (equal (count 1 (list 1 2 1 3 1) :start 2) (funcall #'count 1 (list 1 2 1 3 1) :start 2))
+      (equal (count-if #'oddp (list 1 2 3 4 5) :start 2) (funcall #'count-if #'oddp (list 1 2 3 4 5) :start 2))
+      (equal (position 1 (list 1 2 1) :from-end t) (funcall #'position 1 (list 1 2 1) :from-end t))
+      (equal (remove 1 (list 1 2 1 1) :count 1) (funcall #'remove 1 (list 1 2 1 1) :count 1))
+      (equal (substitute 0 1 (list 1 1 1) :count 1) (funcall #'substitute 0 1 (list 1 1 1) :count 1))
+      (equal (fill (list 1 2 3 4) 0 :start 1 :end 3) (funcall #'fill (list 1 2 3 4) 0 :start 1 :end 3))
+      (equal (reduce #'cons (list 1 2 3) :from-end t) (funcall #'reduce #'cons (list 1 2 3) :from-end t))
+      (equal (string-upcase "abcdef" :start 2 :end 4) (funcall #'string-upcase "abcdef" :start 2 :end 4))
+      (equal (make-list 3 :initial-element 'x) (funcall #'make-list 3 :initial-element 'x))
+      (equal (parse-integer "42abc" :junk-allowed t) (funcall #'parse-integer "42abc" :junk-allowed t))
+      (equal (write-to-string 255 :base 16) (funcall #'write-to-string 255 :base 16)))"#;
+    let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "should exit 0 (stderr: {})", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let got = stdout.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+    assert_eq!(got, "T", "a keyword builtin diverges between direct and funcall call forms (full: {stdout:?})");
+}
+
 /// Regression (bliss-znib): FORMAT ~A/~S honour the minpad and padchar params
 /// (`~mincol,colinc,minpad,padchar`), which were ignored — padding always used a
 /// space. Width is measured in characters.
