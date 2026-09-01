@@ -72,10 +72,11 @@ fn cons_ptrs(mut list: BlissVal) -> Vec<usize> {
 }
 
 fn lisp_string_to_string(val: BlissVal) -> String {
-    let ptr = unsafe { val.as_ptr() };
-    let len = unsafe { *(ptr.add(8) as *const u64) as usize };
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.add(16), len) };
-    std::str::from_utf8(bytes).unwrap().to_string()
+    // Constructed strings are 32-bit SIMPLE_CHARACTER_STRINGs (write_character_string,
+    // spec §1.6.3): the payload is wide code points, not UTF-8 bytes. Decode with the
+    // production reader; the old byte-slice decode read wide "olleh" as "o\0\0\0l"
+    // (bliss-cizc).
+    unsafe { bliss_rt::object::read_simple_string(val.as_ptr()) }
 }
 
 fn vector_symbol() -> BlissVal {
