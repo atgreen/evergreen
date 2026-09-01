@@ -103,24 +103,11 @@
 ;;; Semaphores
 ;;;
 
-(defstruct (bliss-semaphore (:constructor %%make-bliss-semaphore (name count)))
-  (name nil)
-  (count 0))
-
-(deftype semaphore ()
-  'bliss-semaphore)
-
-(defun %make-semaphore (name count)
-  (%%make-bliss-semaphore name count))
-
-(defun %signal-semaphore (semaphore count)
-  (incf (bliss-semaphore-count semaphore) count))
-
-(defun %wait-on-semaphore (semaphore timeout)
-  (declare (ignore timeout))
-  (when (plusp (bliss-semaphore-count semaphore))
-    (decf (bliss-semaphore-count semaphore))
-    t))
+;; NOTE: bliss is NOT in api-semaphores.lisp's native-semaphore feature list, so
+;; that file defines the portable %SEMAPHORE struct + %MAKE-SEMAPHORE /
+;; %SIGNAL-SEMAPHORE / %WAIT-ON-SEMAPHORE fallback built on the lock and
+;; condition-variable SPI below. The backend must NOT define them here (doing so
+;; shadowed the portable struct and broke (%semaphore-lock …)).
 
 ;;;
 ;;; Condition variables

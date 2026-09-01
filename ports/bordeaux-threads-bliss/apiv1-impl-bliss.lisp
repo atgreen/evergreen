@@ -18,7 +18,6 @@
 ;;; Threads
 ;;;
 
-(deftype thread () 'integer)
 
 ;; Cosmetic thread names, keyed by native id. Weak so finished threads don't
 ;; pin their names forever (falls back to a strong table on Bliss).
@@ -55,8 +54,6 @@
 (defstruct (bliss-lock (:constructor %make-bliss-lock (name)))
   (name nil))
 
-(deftype lock () 'bliss-lock)
-(deftype recursive-lock () 'bliss-lock)
 
 (defun lock-p (object) (typep object 'bliss-lock))
 (defun recursive-lock-p (object) (typep object 'bliss-lock))
@@ -119,7 +116,6 @@
   (name nil)
   (count 0))
 
-(deftype semaphore () 'bliss-semaphore)
 
 (defun make-semaphore (&key name (count 0))
   (%make-bliss-semaphore name count))

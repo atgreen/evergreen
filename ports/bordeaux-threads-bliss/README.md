@@ -1,11 +1,12 @@
 # bordeaux-threads on Bliss
 
 A working port of [bordeaux-threads](https://github.com/sionescu/bordeaux-threads)
-(0.9.4) to Bliss. The classic v1 API (`bt:`) loads and runs: `make-thread` /
-`join-thread` (offload + join), `make-lock` / `with-lock-held`, semaphores,
-`threadp` / `current-thread` / `thread-name`.
+(0.9.4) to Bliss. **Both the classic v1 API (`bt:`) and the v2 API (`bt2:`)**
+load and run: `make-thread` / `join-thread` (offload + join), `make-lock` /
+`with-lock-held`, recursive locks, semaphores, `threadp` / `current-thread` /
+`thread-name`.
 
-Verified end to end:
+Verified end to end (v1):
 
 ```lisp
 (asdf:load-system :bordeaux-threads)
@@ -15,6 +16,17 @@ Verified end to end:
 ;; => (9 16 25)
 (let ((l (bt:make-lock))) (bt:with-lock-held (l) 42))       ; => 42
 (bt:join-thread (bt:make-thread (lambda () (+ 40 2))))      ; => 42
+```
+
+And v2 (`bt2:`):
+
+```lisp
+(bt2:join-thread (bt2:make-thread (lambda () (* 5 5))))     ; => 25
+(let ((l (bt2:make-lock))) (bt2:with-lock-held (l) 42))     ; => 42
+(let ((rl (bt2:make-recursive-lock)))
+  (bt2:with-recursive-lock-held (rl) (bt2:with-recursive-lock-held (rl) :ok))) ; => :OK
+(bt2:threadp (bt2:current-thread))                          ; => T
+(let ((s (bt2:make-semaphore :count 1))) (bt2:wait-on-semaphore s :timeout 0)) ; => T
 ```
 
 ## Execution model and limits
@@ -34,9 +46,9 @@ references only globals and its own parameters runs — `bliss-nubv`).
 - `apiv1-impl-bliss.lisp` — the v1 backend (installed as
   `ocicl/bordeaux-threads-0.9.4/apiv1/impl-bliss.lisp`).
 - `apiv2-impl-bliss.lisp` — the v2 backend (installed as
-  `ocicl/bordeaux-threads-0.9.4/apiv2/impl-bliss.lisp`). Note: the v2 (`bt2:`)
-  `make-thread` still hits a Bliss macroexpand issue; the v1 API is the working
-  surface.
+  `ocicl/bordeaux-threads-0.9.4/apiv2/impl-bliss.lisp`). It provides only the
+  primitive SPI (threads, locks, condition variables); the portable
+  `%semaphore` struct in `api-semaphores.lisp` builds semaphores on top of it.
 
 ## Applying the port (the `ocicl/` tree is gitignored)
 
@@ -55,13 +67,29 @@ references only globals and its own parameters runs — `bliss-nubv`).
    (`weakness-keyword-opt`): add `bliss` to the fallbacks so weak hash-tables
    degrade to ordinary (strong) tables instead of signalling
    "Your Lisp does not support weak … hash-tables."
+5. Patch `ocicl/bordeaux-threads-0.9.4/apiv2/api-threads.lisp` for the v2 API:
+   add a `#+bliss` branch to `establish-dynamic-env` that returns FUNCTION
+   directly (Bliss cannot carry a capturing wrapper's lexicals to the worker, nor
+   provide the real lock-synchronised handshake the wrapper relies on), and a
+   `#+bliss` branch to `join-thread` that returns `(%join-thread native-thread)`
+   (the worker's value; %return-values slots are unused on this path).
 
 ## Bliss runtime fixes this port depended on
 
 Landed in the Bliss tree (not here):
 - Compiled-macro `&whole` now binds the whole call form including the operator
   (was dropping the operator, breaking global-vars' `define-global-var*`).
+- Compiled-macro `&environment` now reaches `macroexpand-1` (was NIL), so v2's
+  `with-lock-held` works.
 - `*TYPE-DEFINITIONS*` / `*CONDITION-TYPES*` / `*CONDITION-DEFINITIONS*` seeded in
   the symbol value cell so compiled `deftype`/`define-condition` see them.
+- `(defun (setf place) …)` also installs the mangled `%SETF-WRITER-place`
+  function, so compiled `(setf (place …) v)` call sites resolve it.
+- `PROGV` implemented.
+- `(defvar name)` with no value leaves NAME unbound (interpreted and compiled).
+- A CLOS class type is not shadowed by a same-bare-name `deftype` in another
+  package.
+- `COPY-PPRINT-DISPATCH`, `MAKE-RANDOM-STATE`, `RANDOM-STATE-P`,
+  `COPY-READTABLE`, `*RANDOM-STATE*` stubs.
 - `MAKE-THREAD` reifies a lambda so non-capturing closures run on a worker.
 - `JOIN-THREAD` marks the joiner Blocked so a peer's GC can proceed.
