@@ -8429,6 +8429,76 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // (make-string-output-stream &key element-type)
                 return bliss_stdlib::make_string_output_stream(NIL);
             }
+            "MAKE-BROADCAST-STREAM" => {
+                // (make-broadcast-stream &rest streams) → output stream that fans
+                // each write out to all component streams. eval_args keeps the
+                // component streams rooted across the allocating constructor.
+                let args = eval_args(cdr, env)?;
+                return bliss_stdlib::make_broadcast_stream(&args);
+            }
+            "MAKE-CONCATENATED-STREAM" => {
+                // (make-concatenated-stream &rest streams) → input stream that
+                // reads successively from each component.
+                let args = eval_args(cdr, env)?;
+                return bliss_stdlib::make_concatenated_stream(&args);
+            }
+            "MAKE-TWO-WAY-STREAM" => {
+                // (make-two-way-stream input output)
+                let args = eval_args(cdr, env)?;
+                let input = args.first().copied().unwrap_or(NIL);
+                let output = args.get(1).copied().unwrap_or(NIL);
+                return bliss_stdlib::make_two_way_stream(input, output);
+            }
+            "MAKE-ECHO-STREAM" => {
+                // (make-echo-stream input output) → reads echo to output.
+                let args = eval_args(cdr, env)?;
+                let input = args.first().copied().unwrap_or(NIL);
+                let output = args.get(1).copied().unwrap_or(NIL);
+                return bliss_stdlib::make_echo_stream(input, output);
+            }
+            "MAKE-SYNONYM-STREAM" => {
+                // (make-synonym-stream symbol) → stream that forwards to the stream
+                // that is the current value of SYMBOL.
+                let args = eval_args(cdr, env)?;
+                let symbol = args.first().copied().unwrap_or(NIL);
+                return bliss_stdlib::make_synonym_stream(symbol);
+            }
+            "STREAMP" => {
+                // (streamp object) → T if object is a stream.
+                let args = eval_args(cdr, env)?;
+                let obj = args.first().copied().unwrap_or(NIL);
+                return Ok(if is_stream(obj) { T } else { NIL });
+            }
+            "INPUT-STREAM-P" => {
+                // (input-stream-p stream) → T if the stream can be read from.
+                let args = eval_args(cdr, env)?;
+                let obj = args.first().copied().unwrap_or(NIL);
+                return Ok(if bliss_stdlib::input_stream_p(obj) {
+                    T
+                } else {
+                    NIL
+                });
+            }
+            "OUTPUT-STREAM-P" => {
+                // (output-stream-p stream) → T if the stream can be written to.
+                let args = eval_args(cdr, env)?;
+                let obj = args.first().copied().unwrap_or(NIL);
+                return Ok(if bliss_stdlib::output_stream_p(obj) {
+                    T
+                } else {
+                    NIL
+                });
+            }
+            "OPEN-STREAM-P" => {
+                // (open-stream-p stream) → T if the stream is not closed.
+                let args = eval_args(cdr, env)?;
+                let obj = args.first().copied().unwrap_or(NIL);
+                return Ok(if bliss_stdlib::open_stream_p(obj) {
+                    T
+                } else {
+                    NIL
+                });
+            }
             "CLOSE" => {
                 // (close stream &key abort) → T. Closing a non-stream is a no-op.
                 let args = eval_args(cdr, env)?;
@@ -8732,6 +8802,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let args = eval_args(cdr, env)?;
                 let s = args.first().copied().unwrap_or(NIL);
                 if s.is_symbol() && is_ansi_special_operator(&symbol_bare_name(&sym_name(s))) {
+                    return Ok(T);
+                }
+                return Ok(NIL);
+            }
+            "COMPILER-MACRO-FUNCTION" => {
+                // (compiler-macro-function name &optional environment) → the
+                // compiler macro or NIL. Compiler macros are always optional
+                // (CLHS 3.2.2.1). Like MACRO-FUNCTION above, bliss compiler macros
+                // are not first-class function objects, so return T when one is
+                // registered for NAME and NIL otherwise (callers use it as a
+                // boolean existence check). A `(setf f)` name never has one (the
+                // definer skips non-symbol names), so NIL is correct there.
+                let args = eval_args(cdr, env)?;
+                let s = args.first().copied().unwrap_or(NIL);
+                if s.is_symbol() && compiler_macroexpand::has_compiler_macro(s) {
                     return Ok(T);
                 }
                 return Ok(NIL);
