@@ -5278,3 +5278,63 @@ fn compiled_macro_whole_includes_operator_and_all_args() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// PROGV dynamically binds a runtime list of special variables to a runtime
+/// list of values for the extent of its body, restoring them afterward (bliss-66ny;
+/// needed by bordeaux-threads v2's ESTABLISH-DYNAMIC-ENV).
+#[test]
+fn progv_binds_and_restores_special_variables() {
+    let output = bliss_bin()
+        .args([
+            "--no-init",
+            "--eval",
+            "(defvar *pv* 1)",
+            "--eval",
+            "(princ (progv (list '*pv*) (list 42) (symbol-value '*pv*)))",
+            "--eval",
+            "(princ *pv*)",
+        ])
+        .output()
+        .expect("run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("42") && stdout.trim_end().ends_with('1'),
+        "PROGV should bind *pv* to 42 in its body and restore 1 after; got: '{stdout}'"
+    );
+}
+
+/// A COMPILED macro whose lambda list has `&environment` and that passes the env
+/// to MACROEXPAND-1, when invoked FROM THE INTERPRETER, must receive a usable
+/// lexical environment. The bytecode macro-invocation path previously bound
+/// `&environment` to NIL, so `(macroexpand-1 form env)` failed with "MACROEXPAND:
+/// invalid lexical environment" — which blocked bordeaux-threads v2's
+/// WITH-LOCK-HELD (bliss-66ny).
+#[test]
+fn compiled_macro_environment_reaches_macroexpand() {
+    let dir = std::env::temp_dir().join(format!("bliss_test_menv_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create menv test dir");
+    let src = dir.join("m.lisp");
+    std::fs::write(
+        &src,
+        "(defmacro inner (x) (list 'quote (list :ex x)))\n\
+         (defmacro outer (x &environment env) (macroexpand-1 (list 'inner x) env))\n",
+    )
+    .expect("write env macro source");
+    let fasl = dir.join("m.fasl");
+    let prog = format!(
+        "(progn (compile-file #P\"{}\" :output-file #P\"{}\") (load #P\"{}\") \
+           (format t \"MENV=~a\" (outer 9)))",
+        src.to_str().unwrap(),
+        fasl.to_str().unwrap(),
+        fasl.to_str().unwrap()
+    );
+    let output = bliss_bin().args(["--eval", &prog]).output().expect("run bliss");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("MENV=(EX 9)"),
+        "compiled &environment must reach MACROEXPAND-1 from the interpreter; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

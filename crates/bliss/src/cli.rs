@@ -8030,6 +8030,42 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     other => return other,
                 }
             }
+            "PROGV" => {
+                // (progv symbols values body*) — evaluate SYMBOLS and VALUES (two
+                // lists), then dynamically bind each symbol to the corresponding
+                // value for the extent of BODY. Excess symbols become unbound;
+                // excess values are ignored (CLHS). Bindings are the symbols'
+                // global value cells, saved and restored (unwind-safe).
+                let (syms_form, rest) = cp(cdr);
+                let (vals_form, body) = cp(rest);
+                let mut syms_v = eval_form(syms_form, env)?;
+                bliss_rt::rooted_ref!(_syms_root = &mut syms_v);
+                let mut vals_v = eval_form(vals_form, env)?;
+                bliss_rt::rooted_ref!(_vals_root = &mut vals_v);
+                let syms = list_to_vec(syms_v);
+                let vals = list_to_vec(vals_v);
+                // The saved old values leave their value cells (a GC root) once we
+                // overwrite them, so they must be rooted across BODY's evaluation.
+                let mut saved_idx: Vec<u32> = Vec::new();
+                bliss_rt::rooted!(saved_val = Vec::<BlissVal>::new());
+                for (i, s) in syms.iter().enumerate() {
+                    if !s.is_symbol() {
+                        continue;
+                    }
+                    let idx = s.as_symbol_index();
+                    let old = bliss_rt::symbols::symbol_value(idx)
+                        .unwrap_or(bliss_rt::value::UNBOUND);
+                    saved_idx.push(idx);
+                    saved_val.push(old);
+                    let newv = vals.get(i).copied().unwrap_or(bliss_rt::value::UNBOUND);
+                    bliss_rt::symbols::set_symbol_value(idx, newv);
+                }
+                let result = eval_progn(body, env);
+                for k in (0..saved_idx.len()).rev() {
+                    bliss_rt::symbols::set_symbol_value(saved_idx[k], saved_val[k]);
+                }
+                return result;
+            }
             "THROW" => {
                 let (tag_form, rest) = cp(cdr);
                 let (val_form, _) = cp(rest);
@@ -17997,6 +18033,42 @@ fn eval_defun(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 },
             )
         });
+        // Also install the writer as an ordinary function on the mangled
+        // %SETF-WRITER-place symbol. GLOBAL_SETF_FNS serves the interpreted SETF
+        // path, but the bytecode lowerer emits a COMPILED `(setf (place …) v)`
+        // as a direct call to that symbol — so without this a compiled caller
+        // hit "%SETF-WRITER-place is undefined" (bliss-66ny: bordeaux-threads
+        // v2's compiled MAKE-THREAD calling (setf (thread-wrapper …) …)).
+        if name_form.is_cons() {
+            let (_setf, tail) = cp(name_form);
+            if tail.is_cons() {
+                let place = cp(tail).0;
+                if place.is_symbol() {
+                    if let Some(msym) = resolve_sym(&setf_writer_symbol_name(&sym_name(place))) {
+                        let midx = msym.as_symbol_index();
+                        match bliss_rt::symbols::symbol_function(midx) {
+                            Some(existing)
+                                if bliss_rt::function::is_interpreted_function(existing) =>
+                            {
+                                // SAFETY: `existing` is an interpreted-function object.
+                                unsafe {
+                                    bliss_rt::function::redefine(existing, params_form, body, NIL)
+                                };
+                            }
+                            _ => {
+                                let f = bliss_rt::function::alloc_interpreted(
+                                    params_form,
+                                    body,
+                                    NIL,
+                                    msym,
+                                );
+                                bliss_rt::symbols::set_symbol_function(midx, f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(name_form)
 }

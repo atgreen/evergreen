@@ -584,6 +584,27 @@
 ;; pprint dispatch, but the variable must be bound: ASDF's DEFINE-OP saves and
 ;; rebinds it around loading a .asd (bliss-lb6.17).
 (defvar *print-pprint-dispatch* nil)
+;; Bliss has no pretty-print dispatch table (the printer ignores it); provide
+;; COPY-PPRINT-DISPATCH so portable code that rebinds *PRINT-PPRINT-DISPATCH*
+;; around output loads and runs. With a NIL table there is nothing to copy, so
+;; return NIL (bordeaux-threads' +STANDARD-IO-BINDINGS+ uses this).
+(defun copy-pprint-dispatch (&optional table)
+  (declare (ignore table))
+  nil)
+;; Random-state and readtable copiers. Bliss's RANDOM uses a single global PRNG
+;; and its readtable is the immutable :STANDARD-READTABLE, so these return
+;; lightweight placeholders — enough for portable code (e.g. bordeaux-threads'
+;; +STANDARD-IO-BINDINGS+) that rebinds *RANDOM-STATE* / *READTABLE* to fresh
+;; copies around a computation.
+(defvar *random-state* (list :random-state))
+(defun make-random-state (&optional state)
+  (declare (ignore state))
+  (list :random-state))
+(defun random-state-p (object)
+  (and (consp object) (eq (car object) :random-state)))
+(defun copy-readtable (&optional from-readtable to-readtable)
+  (declare (ignore from-readtable to-readtable))
+  *readtable*)
 ;; The default pathname merged against by MERGE-PATHNAMES and friends; ANSI
 ;; requires it to be bound to a pathname. Initialize to the startup directory.
 (defvar *default-pathname-defaults* (truename "."))

@@ -10210,7 +10210,21 @@ fn bind_macro_variadic(
         }
         bliss_rt::rooted_ref!(_whole_root = &mut whole_val);
         let whole = if has_whole { Some(whole_val) } else { None };
-        if let Err(error) = super::bind_macro_lambda_list(func.params_form, args, env, None, whole) {
+        // If the macro lambda list has `&environment`, provide the current
+        // lexical environment so the (compiled) expander can pass it on to
+        // MACROEXPAND / MACROEXPAND-1 — exactly as the tree-walker's
+        // `expand_macro` does. Without this, `&environment` bound to NIL and a
+        // `(macroexpand-1 form env)` inside the expander failed with "MACROEXPAND:
+        // invalid lexical environment" (bliss-66ny; broke bordeaux-threads v2's
+        // WITH-LOCK-HELD, which macroexpands `%with-lock` through its env).
+        let menv = if super::params_form_uses_environment(func.params_form) {
+            Some(super::macroexpand_environment_from_cli(env))
+        } else {
+            None
+        };
+        if let Err(error) =
+            super::bind_macro_lambda_list(func.params_form, args, env, menv.as_ref(), whole)
+        {
             return Err(error);
         }
         env.clear_mv();
