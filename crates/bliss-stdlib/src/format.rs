@@ -131,6 +131,16 @@ pub fn print_circle_active() -> bool {
         .unwrap_or(false)
 }
 
+/// `*PRINT-GENSYM*` (default T): when true, an uninterned symbol prints with the
+/// `#:` prefix under escape printing so it reads back as a fresh symbol; NIL
+/// suppresses the prefix (CLHS 22.1.3.3).
+pub fn print_gensym() -> bool {
+    bliss_rt::symbols::find_index("*PRINT-GENSYM*")
+        .and_then(bliss_rt::symbols::symbol_value)
+        .map(|v| !v.is_nil())
+        .unwrap_or(true)
+}
+
 // ── *PRINT-CIRCLE* support (bliss-dlil) ──────────────────────────────────
 //
 // A two-pass scheme shared by BOTH printers (cli.rs `print_val` and this
@@ -785,7 +795,11 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
         // (make-symbol s)) 2)` strips the `#:` — without it that subseq errors.
         if bliss_compiler::reader::is_uninterned(idx) {
             let name = apply_print_case(&name);
-            return if escapep { format!("#:{}", name) } else { name };
+            return if escapep && print_gensym() {
+                format!("#:{}", name)
+            } else {
+                name
+            };
         }
         return apply_print_case(name.trim_start_matches("KEYWORD:"));
     }

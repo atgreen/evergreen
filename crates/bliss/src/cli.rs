@@ -4542,8 +4542,11 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
             out.push_str(&bliss_stdlib::format::apply_print_case(bare));
         } else {
             // Uninterned symbols (make-symbol/gensym) print with the `#:` prefix
-            // under prin1/~S so they read back as fresh uninterned symbols.
-            if bliss_compiler::reader::is_uninterned(val.as_symbol_index()) {
+            // under prin1/~S so they read back as fresh uninterned symbols, unless
+            // *PRINT-GENSYM* is NIL (CLHS 22.1.3.3).
+            if bliss_compiler::reader::is_uninterned(val.as_symbol_index())
+                && bliss_stdlib::format::print_gensym()
+            {
                 out.push_str("#:");
             }
             out.push_str(&bliss_stdlib::format::apply_print_case(&name));
