@@ -622,6 +622,42 @@ fn exp_with_decimal_point(s: &str) -> String {
     }
 }
 
+/// CL `~E` with an explicit fraction-digit count `d` (CLHS 22.3.3.2).
+/// `k` is the scale factor (default 1: `k` significant digits before the decimal
+/// point, `d` after); `e` zero-pads the exponent to that many digits. The
+/// exponent always carries a sign. Numbers are computed in f64 and rounded to `d`
+/// fraction digits, so binary32 imprecision beyond `d` is discarded (no bliss-8zrb
+/// regression on this path).
+fn format_e_fixed(f: f64, d: usize, e: Option<usize>, k: i64, exp_char: char) -> String {
+    let neg = f.is_sign_negative() && f != 0.0;
+    let af = f.abs();
+    let factor = 10f64.powi(d as i32);
+    let (mant, exp) = if af == 0.0 {
+        (0.0f64, 0i64)
+    } else {
+        // Exponent so the mantissa has `k` integer digits (k>=1): mantissa in
+        // [10^(k-1), 10^k). Scale factors <=0 shift the point left of the digits.
+        let mut exp = af.log10().floor() as i64 - (k - 1);
+        let mut mant = (af / 10f64.powi(exp as i32) * factor).round() / factor;
+        // A round-up can carry past the k-digit window (e.g. 9.99 -> 10.0): shift.
+        if k >= 1 && mant >= 10f64.powi(k as i32) {
+            mant = (mant / 10.0 * factor).round() / factor;
+            exp += 1;
+        }
+        (mant, exp)
+    };
+    let mant_str = format!("{:.*}", d, mant);
+    let exp_sign = if exp < 0 { '-' } else { '+' };
+    let exp_digits = match e {
+        Some(ee) => format!("{:0width$}", exp.unsigned_abs(), width = ee),
+        None => format!("{}", exp.unsigned_abs()),
+    };
+    format!(
+        "{}{mant_str}{exp_char}{exp_sign}{exp_digits}",
+        if neg { "-" } else { "" }
+    )
+}
+
 /// Walk a cons-cell linked list and collect all car values into a Vec.
 fn cons_list_to_vec(v: BlissVal) -> Vec<BlissVal> {
     let mut result = Vec::new();
@@ -1920,20 +1956,47 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                // Format a single-float from the f32 itself (shortest round-trip)
-                // rather than its widened f64, which exposed binary32 imprecision:
-                // (format nil "~e" 0.001) gave 1.0000000474974513E-3 (bliss-8zrb).
-                let s = if val.is_single_float() {
-                    format!("{:E}", val.as_single_float())
+                let f = if val.is_single_float() {
+                    val.as_single_float() as f64
                 } else if val.is_fixnum() {
-                    format!("{:E}", val.as_fixnum() as f64)
+                    val.as_fixnum() as f64
                 } else {
                     return Err(BlissError::TypeError {
                         datum: val,
                         expected: "number".into(),
                     });
                 };
-                output.push_str(&exp_with_decimal_point(&s));
+                // ~w,d,e,k,overflowchar,padchar,exponentcharE. Resolve params in
+                // order (a `v` param consumes the next arg, so order matters).
+                let _w = params.first().map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let d = params.get(1).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let e = params.get(2).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let k = params.get(3).map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
+                let _of = params.get(4).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let _pad = params.get(5).map_or(Ok(-1), |p| resolve_param(p, -1, arg_idx))?;
+                let expc = params
+                    .get(6)
+                    .map_or(Ok('e' as i64), |p| resolve_param(p, 'e' as i64, arg_idx))?;
+                let exp_char = char::from_u32(expc as u32).unwrap_or('e');
+                if d < 0 {
+                    // No explicit fraction-digit count: shortest round-trip. Format
+                    // a single-float from the f32 itself rather than its widened f64,
+                    // which exposed binary32 imprecision (bliss-8zrb).
+                    let s = if val.is_single_float() {
+                        format!("{:E}", val.as_single_float())
+                    } else {
+                        format!("{:E}", f)
+                    };
+                    output.push_str(&exp_with_decimal_point(&s));
+                } else {
+                    output.push_str(&format_e_fixed(
+                        f,
+                        d as usize,
+                        if e >= 0 { Some(e as usize) } else { None },
+                        k,
+                        exp_char,
+                    ));
+                }
             }
             'G' => {
                 if *arg_idx >= args.len() {
