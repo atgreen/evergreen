@@ -1108,6 +1108,63 @@ impl HeapCollector {
             .map(|(i, _)| i)
             .collect();
 
+        // (bliss-bw3t) Make every nursery region parseable base..alloc_top BEFORE
+        // any object-stride walk. `refill_tlab` advances a region's alloc_top past
+        // each carved TLAB, but a TLAB whose under-filled tail was never retired
+        // (filled) leaves a ZERO header gap. Every stride walk below (pinned scan,
+        // nursery_index build, the copy loop) treats a zero header as end-of-region
+        // and STOPS — hiding every object in a LATER TLAB carved from the same
+        // region (a concurrent peer thread's TLAB). Those live objects are then
+        // never marked, get reclaimed when the nursery resets, and their still-live
+        // references (e.g. a survivor cons's cdr) dangle: the concurrent-GC
+        // corruption. Reconstruct a filler object over each zero gap, spanning
+        // exactly to the next real object (probed through the zeroed tail) or to
+        // alloc_top — the collector-side equivalent of HotSpot filling all TLAB
+        // dead space at a stop-the-world so the heap stays walkable.
+        for &nursery_idx in &nursery_indices {
+            let base = state.regions[nursery_idx].base as usize;
+            let top = state.regions[nursery_idx].header.alloc_top as usize;
+            let mut cursor = base;
+            while cursor + OBJECT_HEADER_SIZE <= top {
+                let (type_id, body_size) = unsafe { read_object_header(cursor as *const u8) };
+                if type_id == 0 && body_size == 0 {
+                    // Zero gap (an unretired TLAB tail). Probe forward, object-
+                    // aligned, to the next non-zero header or alloc_top. The gap is
+                    // genuinely zeroed nursery space, so the first non-zero header
+                    // is the next TLAB's first live object.
+                    let mut probe = cursor + OBJECT_ALIGNMENT;
+                    while probe + OBJECT_HEADER_SIZE <= top {
+                        let (t, b) = unsafe { read_object_header(probe as *const u8) };
+                        if !(t == 0 && b == 0) {
+                            break;
+                        }
+                        probe += OBJECT_ALIGNMENT;
+                    }
+                    let gap_end = probe.min(top);
+                    let span = gap_end - cursor;
+                    if span >= OBJECT_ALIGNMENT {
+                        // Match retire_tlab's footprint math so the filler occupies
+                        // EXACTLY `span` bytes (normal vs large-object header).
+                        let normal_body = span - OBJECT_HEADER_SIZE;
+                        let (_, needs_large_header) = object_footprint(normal_body);
+                        let filler_body = if needs_large_header {
+                            span - LARGE_OBJECT_PAYLOAD_OFFSET
+                        } else {
+                            normal_body
+                        };
+                        debug_assert_eq!(object_footprint(filler_body).0, span);
+                        unsafe {
+                            write_object_header(cursor as *mut u8, 0, filler_body as u32);
+                        }
+                    }
+                    cursor = gap_end;
+                    continue;
+                }
+                let total = align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                cursor += total;
+            }
+        }
+
         // Nursery regions that hold a pinned object are retained in place: their
         // objects are not copied and the region is promoted to old-gen so it is
         // never treated as a copy space again (bliss-jtc.18).
@@ -1128,10 +1185,12 @@ impl HeapCollector {
             let base = state.regions[nursery_idx].base as usize;
             let top = state.regions[nursery_idx].header.alloc_top as usize;
             let mut cursor = base;
+            let mut stopped_at_zero = false;
             while cursor + OBJECT_HEADER_SIZE <= top {
                 let header_ptr = cursor as *const u8;
                 let (type_id, body_size) = unsafe { read_object_header(header_ptr) };
                 if body_size == 0 && type_id == 0 {
+                    stopped_at_zero = true;
                     break;
                 }
                 let total_size =
@@ -1143,6 +1202,16 @@ impl HeapCollector {
                     );
                 }
                 cursor += total_size;
+            }
+            // (bliss-bw3t) After the gap-fill pre-pass the walk must reach alloc_top;
+            // a residual zero gap would again hide later-TLAB objects. Guard the
+            // invariant under BLISS_GC_VERIFY.
+            if gc_verify_enabled() && stopped_at_zero {
+                panic!(
+                    "gc-verify(tlab-gap): nursery region {nursery_idx} walk stopped at ZERO \
+                     header {cursor:#x} before alloc_top {top:#x} (base {base:#x}) — an unfilled \
+                     TLAB gap still hides later objects from the collector (bliss-bw3t)"
+                );
             }
         }
 
