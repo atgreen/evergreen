@@ -1939,6 +1939,10 @@ fn format_impl(
                     Some(dd) => format!("{:.*}", dd, f),
                     None => format!("{}", f),
                 };
+                // ~@F prints a leading + on a non-negative value (CLHS 22.3.3.1).
+                if at_sign && f >= 0.0 {
+                    s.insert(0, '+');
+                }
                 let w = if !params.is_empty() {
                     resolve_param(&params[0], 0, arg_idx)? as usize
                 } else {
@@ -2033,10 +2037,58 @@ fn format_impl(
                         expected: "number".into(),
                     });
                 };
-                if at_sign && f >= 0.0 {
-                    output.push('+');
+                // ~d,n,w,padchar$: d = digits after the point (default 2), n = min
+                // digits before it (default 1, zero-padded), w = min field width.
+                let d = params
+                    .first()
+                    .map_or(Ok(2), |p| resolve_param(p, 2, arg_idx))?
+                    .max(0) as usize;
+                let n = params
+                    .get(1)
+                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?
+                    .max(1) as usize;
+                let w = params
+                    .get(2)
+                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .max(0) as usize;
+                let padchar = params.get(3).map_or(Ok(' '), |p| {
+                    resolve_param(p, ' ' as i64, arg_idx)
+                        .map(|c| char::from_u32(c as u32).unwrap_or(' '))
+                })?;
+                let body = format!("{:.*}", d, f.abs());
+                let (int_part, frac_part) = match body.split_once('.') {
+                    Some((i, fr)) => (i.to_string(), format!(".{fr}")),
+                    None => (body.clone(), String::new()),
+                };
+                let int_padded = if int_part.len() < n {
+                    format!("{}{int_part}", "0".repeat(n - int_part.len()))
+                } else {
+                    int_part
+                };
+                let sign = if f < 0.0 {
+                    "-"
+                } else if at_sign {
+                    "+"
+                } else {
+                    ""
+                };
+                let num = format!("{sign}{int_padded}{frac_part}");
+                let count = num.chars().count();
+                if count < w {
+                    // Default: right-justify (pad on the left). With `:`, the sign is
+                    // printed first, then padding, then the digits.
+                    let pad: String = std::iter::repeat_n(padchar, w - count).collect();
+                    if colon && !sign.is_empty() {
+                        output.push_str(sign);
+                        output.push_str(&pad);
+                        output.push_str(&num[sign.len()..]);
+                    } else {
+                        output.push_str(&pad);
+                        output.push_str(&num);
+                    }
+                } else {
+                    output.push_str(&num);
                 }
-                output.push_str(&format!("{:.2}", f));
             }
             '%' => {
                 let count = if !params.is_empty() {
