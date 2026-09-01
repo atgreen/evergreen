@@ -24,11 +24,14 @@
 ;; (bliss-av5). The %proclaim-special registry (bliss-7na) is consulted by
 ;; is_special_var (tree-walker) and is_special_name (compiler).
 (defmacro defvar (name &rest value)
+  ;; (defvar name) with no initial value only proclaims NAME special; it must
+  ;; NOT assign a value (NAME stays unbound if it was unbound). Only
+  ;; (defvar name value) initialises it, and only when currently unbound (CLHS).
   `(progn
      (bliss-internal::%proclaim-special (list ',name))
-     (if (boundp ',name)
-         ,name
-         (setq ,name ,(if value (car value) nil)))
+     ,@(when value
+         `((unless (boundp ',name)
+             (setq ,name ,(car value)))))
      ',name))
 
 (defmacro defparameter (name &rest value)

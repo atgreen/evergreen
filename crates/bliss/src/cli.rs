@@ -5659,13 +5659,21 @@ fn seed_compile_time_definitions(form: BlissVal, env: &mut Env) {
         match symbol_leaf_name(&op_name) {
             "DEFVAR" => {
                 let (symbol, rest) = cp(cdr);
-                if symbol.is_symbol() && env.lookup_var_symbol(symbol).is_none() {
-                    let value = if rest.is_cons() {
-                        eval_form(cp(rest).0, env).unwrap_or(NIL)
+                if symbol.is_symbol() {
+                    if rest.is_cons() {
+                        // (defvar name value): seed the binding if unbound.
+                        if env.lookup_var_symbol(symbol).is_none() {
+                            let value = eval_form(cp(rest).0, env).unwrap_or(NIL);
+                            seed_compile_time_binding(env, symbol, value);
+                        }
                     } else {
-                        NIL
-                    };
-                    seed_compile_time_binding(env, symbol, value);
+                        // (defvar name) with no value only proclaims NAME special;
+                        // it must NOT bind a value (NAME stays unbound, CLHS).
+                        // Seeding NIL here made a compiled `(defvar x)` spuriously
+                        // BOUNDP — e.g. bordeaux-threads v2's CURRENT-THREAD asserts
+                        // on `(boundp '*current-thread*)` (bliss-66ny).
+                        proclaim_special(symbol);
+                    }
                 }
                 return;
             }
@@ -6357,6 +6365,16 @@ fn plist_entry(list: BlissVal, key: &str) -> Option<BlissVal> {
 
 fn resolve_type_spec(env: &Env, type_spec: BlissVal) -> BlissVal {
     if type_spec.is_symbol() {
+        // A symbol that names a CLOS class is a class type and must NOT be
+        // expanded through the DEFTYPE registry: the registry is keyed by bare
+        // name, so a DEFTYPE of the same bare name in a *different* package would
+        // otherwise shadow this package's class (bliss-66ny: bordeaux-threads
+        // v1's `(deftype thread () 'integer)` shadowed v2's THREAD class, so
+        // `(typep 5 'bt2::thread)` wrongly returned T). find_class resolves the
+        // fully-qualified symbol, so it does not itself collide.
+        if bliss_stdlib::find_class(type_spec).is_some() {
+            return type_spec;
+        }
         let name = symbol_bare_name(&sym_name(type_spec));
         if let Some(expanded) =
             plist_get(env.lookup_var("*TYPE-DEFINITIONS*").unwrap_or(NIL), &name)
@@ -6780,6 +6798,25 @@ fn vector_length_matches(size_args: &[BlissVal], object: BlissVal) -> bool {
 }
 
 fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result<bool, BlissError> {
+    // A CLOS instance matches any type name in its class precedence list,
+    // regardless of a same-bare-name DEFTYPE in another package: a class name IS
+    // a type and DEFTYPE cannot shadow it. Check this against the UNRESOLVED
+    // spec, before deftype expansion — the deftype registry is keyed by bare
+    // name, so e.g. bordeaux-threads v1's `(deftype thread () 'integer)` would
+    // otherwise expand v2's THREAD *class* spec to INTEGER and make
+    // `(typep thread-instance 'thread)` wrongly NIL (bliss-66ny). The STANDARD-
+    // OBJECT / STRUCTURE-OBJECT / CONDITION distinctions are left to the general
+    // instance handling below.
+    if type_spec.is_symbol() && bliss_stdlib::is_instance(object) {
+        let orig = symbol_bare_name(&sym_name(type_spec));
+        if orig != "T" && orig != "STANDARD-OBJECT" && orig != "STRUCTURE-OBJECT" {
+            if let Some(names) = instance_class_hierarchy_names(object) {
+                if names.iter().any(|n| n == &orig) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
     let type_spec = resolve_type_spec(env, type_spec);
     if type_spec.is_symbol() {
         let type_name = symbol_bare_name(&sym_name(type_spec));

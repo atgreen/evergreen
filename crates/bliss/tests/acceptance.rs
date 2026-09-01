@@ -5338,3 +5338,66 @@ fn compiled_macro_environment_reaches_macroexpand() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// (DEFVAR name) with no value only proclaims NAME special — it must NOT assign
+/// a value (NAME stays unbound). bordeaux-threads v2's CURRENT-THREAD relies on
+/// `(boundp '*current-thread*)` being NIL after `(defvar *current-thread*)`
+/// (bliss-66ny).
+#[test]
+fn defvar_without_value_leaves_variable_unbound() {
+    let output = bliss_bin()
+        .args([
+            "--no-init",
+            "--eval",
+            "(defvar *no-val*)",
+            "--eval",
+            "(format t \"BOUND=~a\" (boundp '*no-val*))",
+            "--eval",
+            "(defvar *with-val* 7)",
+            "--eval",
+            "(format t \" WV=~a\" *with-val*)",
+        ])
+        .output()
+        .expect("run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("BOUND=NIL") && stdout.contains("WV=7"),
+        "(defvar x) must leave x unbound; (defvar x v) must set it; got: '{stdout}'"
+    );
+}
+
+/// A CLOS class name is a type and is NOT shadowed by a same-BARE-name DEFTYPE
+/// in a different package: TYPEP of an instance against its own class must be T
+/// even if another package DEFTYPE'd that bare name to a disjoint type. bliss's
+/// deftype registry is keyed by bare name, so bordeaux-threads v1's
+/// `(deftype thread () 'integer)` otherwise made `(typep v2-thread 'thread)` NIL
+/// (bliss-66ny).
+#[test]
+fn class_type_not_shadowed_by_same_name_deftype_in_other_package() {
+    let output = bliss_bin()
+        .args([
+            "--no-init",
+            "--eval",
+            "(defpackage :pa (:use :cl))",
+            "--eval",
+            "(defpackage :pb (:use :cl))",
+            "--eval",
+            "(deftype pa::widget () 'integer)",
+            "--eval",
+            "(defclass pb::widget () ())",
+            "--eval",
+            "(format t \"INST=~a NONINST=~a\" \
+               (typep (make-instance 'pb::widget) 'pb::widget) \
+               (typep 5 'pb::widget))",
+        ])
+        .output()
+        .expect("run bliss");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("INST=T") && stdout.contains("NONINST=NIL"),
+        "a class must not be shadowed by a same-bare-name deftype in another package; got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
