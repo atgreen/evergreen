@@ -1001,6 +1001,23 @@ pub fn set_elt(sequence: BlissVal, index: usize, value: BlissVal) -> Result<(), 
         vector_set_elt(cvec_storage(sequence), index, value);
         return Ok(());
     }
+    // A simple string is a mutable character vector: (SETF (ELT s i) c) stores a
+    // character in place. Fill-pointer / adjustable char vectors are handled by
+    // the is_complex_vector branch above; only simple strings reach here (bliss-2pt
+    // — SORT/(SETF ELT) on a string previously errored "mutable sequence
+    // (vector)"). string_set_char rejects interned literals and does an O(1) store,
+    // so no allocation happens across a live BlissVal — GC-safe.
+    if is_char_seq(sequence) {
+        let len = string_char_count(sequence).unwrap_or(0);
+        if index >= len {
+            return Err(BlissError::TypeError {
+                datum: sequence,
+                expected: format!("index {} in bounds (length {})", index, len),
+            });
+        }
+        string_set_char(sequence, index, value)?;
+        return Ok(());
+    }
     // Lists are not setf-elt-able
     Err(BlissError::TypeError {
         datum: sequence,
