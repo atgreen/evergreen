@@ -8724,6 +8724,18 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 return Ok(NIL);
             }
+            "SPECIAL-OPERATOR-P" => {
+                // (special-operator-p symbol) → generalized boolean. The 25 ANSI
+                // special operators (CLHS 3.1.2.1.2.1) that the evaluator handles
+                // as special forms. Lenient on a non-symbol argument (returns NIL),
+                // matching the sibling MACRO-FUNCTION arm above.
+                let args = eval_args(cdr, env)?;
+                let s = args.first().copied().unwrap_or(NIL);
+                if s.is_symbol() && is_ansi_special_operator(&symbol_bare_name(&sym_name(s))) {
+                    return Ok(T);
+                }
+                return Ok(NIL);
+            }
             "SYMBOL-PLIST" => {
                 // (symbol-plist symbol) → its property list
                 let (sf, _) = cp(cdr);
@@ -17469,6 +17481,39 @@ fn eval_args(args: BlissVal, env: &mut Env) -> Result<RootedVals, BlissError> {
 // ── COERCE ───────────────────────────────────────────────────────
 /// Extract a sequence (list, vector, or string) into a Vec of its elements.
 /// A symbol's property list, or NIL for a non-symbol.
+/// The 25 ANSI special operators (CLHS 3.1.2.1.2.1). `bare` is the uppercase,
+/// package-stripped symbol name. Used by SPECIAL-OPERATOR-P.
+fn is_ansi_special_operator(bare: &str) -> bool {
+    matches!(
+        bare,
+        "BLOCK"
+            | "CATCH"
+            | "EVAL-WHEN"
+            | "FLET"
+            | "FUNCTION"
+            | "GO"
+            | "IF"
+            | "LABELS"
+            | "LET"
+            | "LET*"
+            | "LOAD-TIME-VALUE"
+            | "LOCALLY"
+            | "MACROLET"
+            | "MULTIPLE-VALUE-CALL"
+            | "MULTIPLE-VALUE-PROG1"
+            | "PROGN"
+            | "PROGV"
+            | "QUOTE"
+            | "RETURN-FROM"
+            | "SETQ"
+            | "SYMBOL-MACROLET"
+            | "TAGBODY"
+            | "THE"
+            | "THROW"
+            | "UNWIND-PROTECT"
+    )
+}
+
 fn symbol_plist_of(sym: BlissVal) -> BlissVal {
     // symbol_index (not as_symbol_index): is_symbol reports NIL/T as symbols
     // but they carry no symbol-table index, so `(get nil …)` — legal CL,
