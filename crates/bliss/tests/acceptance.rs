@@ -5171,14 +5171,17 @@ fn two_interpreter_threads_allocate_concurrently_under_gc_threshold() {
     );
 }
 
-/// MAKE-THREAD accepts a non-capturing function OBJECT (#'global-defun, env
-/// NIL) as well as a symbol, and rejects a lexical-capturing closure with a
-/// precise error rather than a confusing "cannot apply" — a closure's captured
-/// frame lives in the spawner's thread_local CLOSURE_ENV, invisible to the
-/// worker (bliss-q9i1; cross-thread closures are bliss-nubv).
+/// MAKE-THREAD accepts a symbol, a function object (#'global-defun), AND a
+/// LAMBDA — the closure is reified into a self-contained function object so a
+/// body that references only globals/its own parameters runs on the worker (the
+/// common `(make-thread (lambda () (work)))` form that bordeaux-threads passes).
+/// A lambda that reads a *captured lexical* still finds it unbound on the worker
+/// (that frame is not shared across threads yet — bliss-nubv), which surfaces as
+/// a runtime unbound-variable rather than a MAKE-THREAD rejection (bliss-q9i1).
 #[test]
-fn make_thread_accepts_sharp_quote_global_and_rejects_capturing_closure() {
-    let ok = bliss_bin()
+fn make_thread_reifies_lambda_and_runs_non_capturing_body() {
+    // #'global works
+    let sharp = bliss_bin()
         .args([
             "--no-init",
             "--eval",
@@ -5188,25 +5191,25 @@ fn make_thread_accepts_sharp_quote_global_and_rejects_capturing_closure() {
         ])
         .output()
         .expect("run bliss");
-    assert_eq!(ok.status.code(), Some(0));
-    assert!(
-        String::from_utf8_lossy(&ok.stdout).contains("99"),
-        "non-capturing #'global should run on a thread; got: {}",
-        String::from_utf8_lossy(&ok.stdout)
-    );
+    assert_eq!(sharp.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&sharp.stdout).contains("99"));
 
-    let bad = bliss_bin()
+    // a lambda that references only a global runs on the worker
+    let lam = bliss_bin()
         .args([
             "--no-init",
             "--eval",
-            "(let ((x 5)) (bliss-thread:make-thread (lambda () x)))",
+            "(defun work () (* 7 6))",
+            "--eval",
+            "(princ (bliss-thread:join-thread (bliss-thread:make-thread (lambda () (work)))))",
         ])
         .output()
         .expect("run bliss");
-    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert_eq!(lam.status.code(), Some(0), "non-capturing lambda should run on a worker");
     assert!(
-        stderr.contains("cannot yet cross threads") && !stderr.contains("cannot apply"),
-        "capturing closure should give the precise MAKE-THREAD error; got stderr: {stderr}"
+        String::from_utf8_lossy(&lam.stdout).contains("42"),
+        "lambda calling a global should return 42; got: {}",
+        String::from_utf8_lossy(&lam.stdout)
     );
 }
 
