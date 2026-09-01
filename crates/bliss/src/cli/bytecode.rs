@@ -10168,6 +10168,17 @@ fn bind_variadic(
     })
 }
 
+/// True if a macro lambda list begins with `&whole` (which, if present, is
+/// always its first element). Used to decide whether to reconstruct the whole
+/// call form for a bytecode macro's `&whole` binding.
+fn macro_params_have_whole(params: BlissVal) -> bool {
+    if params.is_cons() {
+        let (first, _) = cp(params);
+        return first.is_symbol() && sym_name(first) == "&WHOLE";
+    }
+    false
+}
+
 fn bind_macro_variadic(
     func: &BytecodeFunction,
     frame: *mut Frame,
@@ -10177,9 +10188,29 @@ fn bind_macro_variadic(
 ) -> Result<(), BlissError> {
     let parent = Rc::clone(&env.frame);
     super::with_child_frame(env, parent, |env| {
-        // A bytecode (source-free) macro never has `&whole` — the lowerer bails
-        // it to the tree-walker — so no whole-form override is needed here.
-        if let Err(error) = super::bind_macro_lambda_list(func.params_form, args, env, None, None) {
+        // If the macro lambda list begins with `&whole`, that variable must bind
+        // to the ENTIRE macro call form INCLUDING the operator (CLHS 3.4.4). A
+        // bytecode macro receives only its argument list here, so reconstruct
+        // `(operator . args)`. Passing `None` bound `&whole` to the args WITHOUT
+        // the operator, so `(rest whole)` silently dropped the first argument —
+        // e.g. global-vars' `define-global-var*` expanded
+        // `(define-global-parameter* ,@(rest whole))` one argument short,
+        // failing to load bordeaux-threads with "too few arguments for macro
+        // lambda list" (bliss-66ny). (Compiled macros CAN reach here with
+        // `&whole`, contrary to the previous assumption.)
+        let mut whole_val = NIL;
+        let has_whole = macro_params_have_whole(func.params_form);
+        if has_whole {
+            let op = resolve_sym(&func.name).unwrap_or(NIL);
+            let mut whole_items = Vec::with_capacity(args.len() + 1);
+            whole_items.push(op);
+            whole_items.extend_from_slice(args);
+            bliss_rt::rooted!(whole_items = whole_items);
+            whole_val = vec_to_list(&whole_items);
+        }
+        bliss_rt::rooted_ref!(_whole_root = &mut whole_val);
+        let whole = if has_whole { Some(whole_val) } else { None };
+        if let Err(error) = super::bind_macro_lambda_list(func.params_form, args, env, None, whole) {
             return Err(error);
         }
         env.clear_mv();

@@ -5241,3 +5241,40 @@ fn worker_can_gc_while_spawner_blocks_in_join() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A COMPILED macro whose lambda list uses `&whole` binds the whole variable to
+/// the ENTIRE call form including the operator (CLHS 3.4.4). The bytecode
+/// macro-invocation path previously bound `&whole` to the argument list WITHOUT
+/// the operator, so `(rest whole)` silently dropped the first argument — which
+/// broke global-vars' DEFINE-GLOBAL-VAR* and blocked loading bordeaux-threads
+/// (bliss-66ny). Interpreted macros were unaffected; this exercises the compiled
+/// path via COMPILE-FILE + LOAD.
+#[test]
+fn compiled_macro_whole_includes_operator_and_all_args() {
+    let dir = std::env::temp_dir().join(format!("bliss_test_whole_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create whole test dir");
+    let src = dir.join("wm.lisp");
+    // The macro echoes (rest whole); a correct binding yields (A B), not (B).
+    std::fs::write(
+        &src,
+        "(defmacro wm (&whole whole a b) (declare (ignore a b)) \
+           (list 'quote (rest whole)))\n",
+    )
+    .expect("write whole macro source");
+    let fasl = dir.join("wm.fasl");
+    let prog = format!(
+        "(progn (compile-file #P\"{}\" :output-file #P\"{}\") (load #P\"{}\") \
+           (format t \"WHOLE=~a\" (wm x y)))",
+        src.to_str().unwrap(),
+        fasl.to_str().unwrap(),
+        fasl.to_str().unwrap()
+    );
+    let output = bliss_bin().args(["--eval", &prog]).output().expect("run bliss");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("WHOLE=(X Y)"),
+        "compiled &whole must bind the whole call form (rest -> (X Y)); got: '{stdout}', stderr: '{}'",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

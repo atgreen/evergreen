@@ -3946,6 +3946,20 @@ impl Env {
                 bliss_rt::symbols::set_symbol_value(s.as_symbol_index(), val);
             }
         };
+        // Initialise a special variable's global value cell only if it is not
+        // already bound, so re-entering `new_impl` (a fresh top-level env — e.g.
+        // a spawned worker thread, or a nested load) does not wipe accumulated
+        // process-global state. Used for the type/condition registries below.
+        let ensure_global = |name: &str, val: BlissVal| {
+            if let Some(s) = resolve_sym(name) {
+                let idx = s.as_symbol_index();
+                let bound = bliss_rt::symbols::symbol_value(idx)
+                    .is_some_and(|v| v != bliss_rt::value::UNBOUND);
+                if !bound {
+                    bliss_rt::symbols::set_symbol_value(idx, val);
+                }
+            }
+        };
         set_global("*STANDARD-INPUT*", *stdin_stream);
         set_global("*STANDARD-OUTPUT*", *stdout_stream);
         set_global("*ERROR-OUTPUT*", *stderr_stream);
@@ -3953,9 +3967,18 @@ impl Env {
         set_global("*TERMINAL-IO*", *stdout_stream);
         set_global("*QUERY-IO*", *stdout_stream);
         set_global("*DEBUG-IO*", *stdout_stream);
-        env.define_local("*TYPE-DEFINITIONS*", NIL);
-        env.define_local("*CONDITION-TYPES*", NIL);
-        env.define_local("*CONDITION-DEFINITIONS*", NIL);
+        // Type / condition registries are accumulation lists that DEFTYPE and
+        // DEFINE-CONDITION grow via `(setq *…* (cons … *…*))`. Compiled code
+        // (a .fasl produced by compile-file, e.g. a library's DEFTYPE forms)
+        // reads/writes them through the symbol's global value cell, NOT a
+        // frame binding — so seeding them with `define_local` left them unbound
+        // on the compiled path ("The variable *TYPE-DEFINITIONS* is unbound"
+        // when loading bordeaux-threads). Seed the value cell instead, once, so
+        // interpreted and compiled access agree and the registry persists across
+        // envs/threads (same fix class as bliss-1i3q).
+        ensure_global("*TYPE-DEFINITIONS*", NIL);
+        ensure_global("*CONDITION-TYPES*", NIL);
+        ensure_global("*CONDITION-DEFINITIONS*", NIL);
         env.define_local("*BREAK-ON-SIGNALS*", NIL);
 
         // bliss-5mf: reseed the STORAGE-CONDITION pool with CLI-native instances
