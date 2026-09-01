@@ -1,0 +1,156 @@
+;;;; -*- indent-tabs-mode: nil -*-
+;;;;
+;;;; Bordeaux-threads apiv2 backend for the Bliss Common Lisp system.
+;;;; See apiv1/impl-bliss.lisp for the rationale: Bliss runs one interpreter
+;;;; thread at a time (worker-offload + join), so the lock primitives are correct
+;;;; as no-ops. The api-v2 layer wraps these native values in its own THREAD /
+;;;; LOCK objects.
+
+(in-package :bordeaux-threads-2)
+
+;;;
+;;; Threads
+;;;
+;;; A Bliss native thread handle is an integer id (BLISS-THREAD:MAKE-THREAD).
+
+(deftype native-thread ()
+  'integer)
+
+(defun %make-thread (function name)
+  (declare (ignore name))
+  (bliss-thread:make-thread function))
+
+(defun %current-thread ()
+  (bliss-thread:current-thread))
+
+(defun %thread-name (thread)
+  (declare (ignore thread))
+  "bliss-thread")
+
+(defun %join-thread (thread)
+  (bliss-thread:join-thread thread))
+
+(defun %thread-yield ()
+  nil)
+
+;;;
+;;; Introspection/debugging
+;;;
+
+(defun %all-threads ()
+  (list (bliss-thread:current-thread)))
+
+(defun %interrupt-thread (thread function)
+  (declare (ignore thread function))
+  (error "Bliss bordeaux-threads: INTERRUPT-THREAD is not supported."))
+
+(defun %destroy-thread (thread)
+  (declare (ignore thread))
+  (error "Bliss bordeaux-threads: DESTROY-THREAD is not supported."))
+
+(defun %thread-alive-p (thread)
+  (declare (ignore thread))
+  t)
+
+;;;
+;;; Non-recursive locks (no-ops; see the file header)
+;;;
+
+(defstruct (bliss-lock (:constructor %%make-bliss-lock (name)))
+  (name nil))
+
+(deftype native-lock ()
+  'bliss-lock)
+
+(defun %make-lock (name)
+  (%%make-bliss-lock name))
+
+(defun %acquire-lock (lock waitp timeout)
+  (declare (ignore lock waitp timeout))
+  t)
+
+(defun %release-lock (lock)
+  (declare (ignore lock))
+  nil)
+
+(defmacro %with-lock ((place timeout) &body body)
+  (declare (ignore timeout))
+  `(progn ,place ,@body))
+
+;;;
+;;; Recursive locks (same no-op object)
+;;;
+
+(deftype native-recursive-lock ()
+  'bliss-lock)
+
+(defun %make-recursive-lock (name)
+  (%%make-bliss-lock name))
+
+(defun %acquire-recursive-lock (lock waitp timeout)
+  (declare (ignore lock waitp timeout))
+  t)
+
+(defun %release-recursive-lock (lock)
+  (declare (ignore lock))
+  nil)
+
+(defmacro %with-recursive-lock ((place timeout) &body body)
+  (declare (ignore timeout))
+  `(progn ,place ,@body))
+
+;;;
+;;; Semaphores
+;;;
+
+(defstruct (bliss-semaphore (:constructor %%make-bliss-semaphore (name count)))
+  (name nil)
+  (count 0))
+
+(deftype semaphore ()
+  'bliss-semaphore)
+
+(defun %make-semaphore (name count)
+  (%%make-bliss-semaphore name count))
+
+(defun %signal-semaphore (semaphore count)
+  (incf (bliss-semaphore-count semaphore) count))
+
+(defun %wait-on-semaphore (semaphore timeout)
+  (declare (ignore timeout))
+  (when (plusp (bliss-semaphore-count semaphore))
+    (decf (bliss-semaphore-count semaphore))
+    t))
+
+;;;
+;;; Condition variables
+;;;
+
+(defstruct (bliss-condition-variable (:constructor %%make-bliss-condition-variable (name)))
+  (name nil))
+
+(deftype condition-variable ()
+  'bliss-condition-variable)
+
+(defun %make-condition-variable (name)
+  (%%make-bliss-condition-variable name))
+
+(defun %condition-wait (cv lock timeout)
+  ;; No other interpreter thread can notify us; return NIL immediately.
+  (declare (ignore cv lock timeout))
+  nil)
+
+(defun %condition-notify (cv)
+  (declare (ignore cv))
+  nil)
+
+(defun %condition-broadcast (cv)
+  (declare (ignore cv))
+  nil)
+
+;;;
+;;; Timeouts
+;;;
+
+(defmacro with-timeout ((timeout) &body body)
+  `(progn ,timeout ,@body))
