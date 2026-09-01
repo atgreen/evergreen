@@ -1250,6 +1250,18 @@ pub fn remove_symbol_stream(symbol: BlissVal) {
 
 /// Resolve a synonym symbol to its target stream.
 fn resolve_synonym(symbol: BlissVal) -> Result<BlissVal, BlissError> {
+    // ANSI (CLHS make-synonym-stream): a synonym stream forwards to the CURRENT
+    // dynamic value of the symbol. Prefer symbol-value so any user special
+    // variable works — (make-synonym-stream '*my-out*) tracks *my-out*'s current
+    // binding. Fall back to the legacy synonym_table registry (pre-registered
+    // standard streams) only when the symbol's value is not itself a stream.
+    if let Some(idx) = symbol.symbol_index() {
+        if let Some(v) = bliss_rt::symbols::symbol_value(idx) {
+            if bliss_rt::types::streamp(v) {
+                return Ok(v);
+            }
+        }
+    }
     let table = synonym_table().lock().unwrap();
     table.get(&symbol.0).copied().ok_or_else(|| {
         BlissError::StreamError("synonym stream: symbol has no stream binding".into())
