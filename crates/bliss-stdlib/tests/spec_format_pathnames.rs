@@ -74,11 +74,14 @@ fn heap_string(val: BlissVal) -> String {
     assert!(val.is_heap_object(), "expected heap string");
     unsafe {
         let ptr = val.as_ptr();
-        let header = *(ptr as *const ObjectHeader);
-        assert_eq!(header.type_id(), type_id::SIMPLE_BASE_STRING);
-        let len = *(ptr.add(8) as *const u64) as usize;
-        let bytes = std::slice::from_raw_parts(ptr.add(16), len);
-        String::from_utf8(bytes.to_vec()).expect("utf8 string")
+        let tid = (*(ptr as *const ObjectHeader)).type_id();
+        // FORMAT produces wide SIMPLE_CHARACTER_STRINGs; decode with the production
+        // reader rather than reading the payload as UTF-8 bytes (bliss-cizc).
+        assert!(
+            tid == type_id::SIMPLE_BASE_STRING || tid == type_id::SIMPLE_CHARACTER_STRING,
+            "expected a simple string heap object, got type_id {tid:#x}"
+        );
+        bliss_rt::object::read_simple_string(ptr)
     }
 }
 

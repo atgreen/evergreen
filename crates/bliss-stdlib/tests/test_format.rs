@@ -60,9 +60,11 @@ fn bliss_string_to_rust(val: BlissVal) -> String {
             "expected a simple string heap object, got type_id {:#x}",
             tid
         );
-        let length = *(ptr.add(8) as *const u64) as usize;
-        let bytes = std::slice::from_raw_parts(ptr.add(16), length);
-        String::from_utf8_lossy(bytes).into_owned()
+        // FORMAT produces 32-bit SIMPLE_CHARACTER_STRINGs (wide code points), not
+        // UTF-8 bytes; decode with the production reader (bliss-cizc). The old
+        // `length` bytes-at-body+16 read decoded wide output as garbage, failing
+        // nearly every string-comparing FORMAT test.
+        bliss_rt::object::read_simple_string(ptr)
     }
 }
 
