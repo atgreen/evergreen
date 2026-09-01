@@ -2467,12 +2467,17 @@ fn format_impl(
                     // ~:<...~:> logical block: just format the body
                     format_impl(&body, args, arg_idx, output)?;
                 } else {
-                    // Justification
-                    let mincol = if !params.is_empty() {
-                        resolve_param(&params[0], 0, arg_idx)? as usize
-                    } else {
-                        0
-                    };
+                    // Justification: ~mincol,colinc,minpad,padchar<...~>.
+                    let mincol = params
+                        .first()
+                        .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                        as usize;
+                    let _colinc = params.get(1).map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
+                    let _minpad = params.get(2).map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?;
+                    let padchar = params.get(3).map_or(Ok(' '), |p| {
+                        resolve_param(p, ' ' as i64, arg_idx)
+                            .map(|c| char::from_u32(c as u32).unwrap_or(' '))
+                    })?;
                     let clauses = split_clauses(&body);
                     let mut parts = Vec::new();
                     for clause in &clauses {
@@ -2480,13 +2485,20 @@ fn format_impl(
                         format_impl(clause, args, arg_idx, &mut part)?;
                         parts.push(part);
                     }
-                    let total_len: usize = parts.iter().map(|p| p.len()).sum();
+                    let total_len: usize = parts.iter().map(|p| p.chars().count()).sum();
                     let width = mincol.max(total_len);
                     if parts.len() <= 1 {
                         let s = parts.first().map(|s| s.as_str()).unwrap_or("");
-                        output.push_str(s);
-                        for _ in s.len()..width {
-                            output.push(' ');
+                        let pad: String =
+                            std::iter::repeat_n(padchar, width - s.chars().count()).collect();
+                        // A single segment right-justifies by default (pad on the
+                        // left); ~@< left-justifies (pad on the right). CLHS 22.3.6.2.
+                        if at_sign {
+                            output.push_str(s);
+                            output.push_str(&pad);
+                        } else {
+                            output.push_str(&pad);
+                            output.push_str(s);
                         }
                     } else {
                         let gaps = parts.len() - 1;
@@ -2503,9 +2515,7 @@ fn format_impl(
                                     } else {
                                         0
                                     };
-                                for _ in 0..g {
-                                    output.push(' ');
-                                }
+                                output.extend(std::iter::repeat_n(padchar, g));
                             }
                         }
                     }
