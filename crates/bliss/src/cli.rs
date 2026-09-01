@@ -15145,6 +15145,9 @@ enum ForClause {
     Being {
         pat: BlissVal,
         source: LoopBeingSource,
+        /// `using (hash-value VAR)` / `using (hash-key VAR)`: a second variable
+        /// bound to the paired value/key each iteration (CLHS 6.1.2.1.3).
+        using: Option<BlissVal>,
     },
 }
 
@@ -15199,9 +15202,12 @@ impl bliss_rt::gc::TraceHostRoots for ForClause {
                 visit(pat);
                 visit(seq_form);
             }
-            ForClause::Being { pat, source } => {
+            ForClause::Being { pat, source, using } => {
                 visit(pat);
                 source.trace_host_roots(visit);
+                if let Some(u) = using {
+                    visit(u);
+                }
             }
         }
     }
@@ -15549,7 +15555,24 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                                 ));
                                 }
                             };
-                            for_clauses.push(ForClause::Being { pat, source });
+                            // Optional `using (hash-value VAR)` / `using (hash-key
+                            // VAR)` pairs a second variable with each iteration.
+                            // USING is not a general loop keyword (peek_kw would
+                            // miss it and end clause parsing), so match the bare
+                            // symbol here.
+                            let using = if p.at_sym("USING") {
+                                p.advance(); // consume USING
+                                let spec = p.read_form()?; // (accessor VAR)
+                                if spec.is_cons() {
+                                    let (_accessor, rest) = cp(spec);
+                                    rest.is_cons().then(|| cp(rest).0)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            for_clauses.push(ForClause::Being { pat, source, using });
                         }
                         // `:from`/`:upfrom` count up; `:downfrom` counts down. A
                         // numeric for may also OMIT the start, beginning with a
@@ -15848,31 +15871,43 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                     });
                     has_stepping_driver = true;
                 }
-                ForClause::Being { pat, source } => {
-                    let items = match source {
+                ForClause::Being { pat, source, using } => {
+                    // `items` drives `pat`; when a `using` clause is present,
+                    // `paired` holds the corresponding value/key for the second
+                    // variable, in the same (unspecified but consistent) order.
+                    let want_pair = using.is_some();
+                    let (items, paired): (Vec<BlissVal>, Vec<BlissVal>) = match source {
                         LoopBeingSource::Symbols(pkg_form) => {
                             let name =
                                 normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
-                            package_symbols(env, &name, true)
+                            (package_symbols(env, &name, true), Vec::new())
                         }
                         LoopBeingSource::OwnSymbols(pkg_form) => {
                             let name =
                                 normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
-                            package_symbols(env, &name, false)
+                            (package_symbols(env, &name, false), Vec::new())
                         }
                         LoopBeingSource::HashKeys(table_form) => {
                             let table = eval_form(*table_form, env)?;
-                            bliss_stdlib::hash_table_entries(table)?
-                                .into_iter()
-                                .map(|(key, _)| key)
-                                .collect()
+                            let entries = bliss_stdlib::hash_table_entries(table)?;
+                            let keys = entries.iter().map(|(k, _)| *k).collect();
+                            let vals = if want_pair {
+                                entries.iter().map(|(_, v)| *v).collect()
+                            } else {
+                                Vec::new()
+                            };
+                            (keys, vals)
                         }
                         LoopBeingSource::HashValues(table_form) => {
                             let table = eval_form(*table_form, env)?;
-                            bliss_stdlib::hash_table_entries(table)?
-                                .into_iter()
-                                .map(|(_, value)| value)
-                                .collect()
+                            let entries = bliss_stdlib::hash_table_entries(table)?;
+                            let vals = entries.iter().map(|(_, v)| *v).collect();
+                            let keys = if want_pair {
+                                entries.iter().map(|(k, _)| *k).collect()
+                            } else {
+                                Vec::new()
+                            };
+                            (vals, keys)
                         }
                     };
                     states.push(ForState::Being {
@@ -15880,6 +15915,15 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                         items,
                         idx: 0,
                     });
+                    // A `using` variable steps in lockstep over the paired list;
+                    // both lists have equal length, so they exhaust together.
+                    if let Some(uvar) = using {
+                        states.push(ForState::In {
+                            pat: *uvar,
+                            items: paired,
+                            idx: 0,
+                        });
+                    }
                     has_stepping_driver = true;
                 }
             }

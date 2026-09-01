@@ -3236,6 +3236,13 @@ impl<'e> Lowerer<'e> {
         if action.is_empty() {
             return Err(Bail);
         }
+        // A `using (hash-value|hash-key VAR)` clause pairs a second variable with
+        // each iteration; the plain `for ... in <snapshot>` normalization below
+        // can't express that. Bail (before emitting) so the full tree-walker LOOP,
+        // which handles `using`, runs it correctly.
+        if action[0].is_symbol() && symbol_bare_name(&sym_name(action[0])) == "USING" {
+            return Err(Bail);
+        }
 
         let snapshot_sym = resolve_sym(snapshot_fn).ok_or(Bail)?;
         let mut snapshot = form_list(&[snapshot_sym, table]);
