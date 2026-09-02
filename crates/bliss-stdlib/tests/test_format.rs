@@ -1370,3 +1370,73 @@ fn format_directive_tilde_at_dollar_forced_sign() {
         s
     );
 }
+
+// ── ~< justification against SBCL ground truth (bliss-0omm) ──────
+//
+// Every expectation below was captured from SBCL 2.x on the identical control
+// string, so this table is a conformance oracle rather than a record of what
+// bliss happens to do. The rules it pins down (CLHS 22.3.6.2):
+//   * padding is inserted into the gaps BETWEEN segments;
+//   * `:` adds a gap before the first segment, `@` one after the last;
+//   * a lone segment with neither modifier gets the leading gap anyway, which
+//     is what makes plain ~mincol<text~> right-justify;
+//   * the slack splits evenly with the remainder favouring the LATER gaps;
+//   * the field grows from mincol in whole multiples of colinc until the
+//     segments plus their minpad fit.
+#[test]
+fn format_tilde_angle_justification_matches_sbcl() {
+    for (control, want) in [
+        // Single segment: the four modifier combinations.
+        ("~10<abc~>", "       abc"),
+        ("~10:<abc~>", "       abc"),
+        ("~10@<abc~>", "abc       "),
+        ("~10:@<abc~>", "   abc    "),
+        // Two segments.
+        ("~10<abc~;de~>", "abc     de"),
+        ("~10:<abc~;de~>", "  abc   de"),
+        ("~10@<abc~;de~>", "abc  de   "),
+        ("~10:@<abc~;de~>", " abc  de  "),
+        // Three segments — remainder distribution is visible here.
+        ("~10<a~;b~;c~>", "a   b    c"),
+        ("~10:<a~;b~;c~>", "  a  b   c"),
+        ("~10@<a~;b~;c~>", "a  b  c   "),
+        ("~10:@<a~;b~;c~>", " a  b  c  "),
+        // Overflow: content wider than mincol is never truncated.
+        ("~2<abcdef~>", "abcdef"),
+        ("~5<abcdefgh~>", "abcdefgh"),
+        ("~11<one~;two~;three~>", "onetwothree"),
+        // padchar, colinc and minpad.
+        ("~10,,,'*<abc~>", "*******abc"),
+        ("~10,3<abc~>", "       abc"),
+        ("~,,2<ab~;cd~>", "ab  cd"),
+        ("~10,,3<a~;b~>", "a        b"),
+        ("~10,,,'.<x~;y~>", "x........y"),
+        ("~,,1,'-<a~;b~;c~>", "a-b-c"),
+        // colinc grows the field in whole steps past mincol.
+        ("~5,5<abc~>", "  abc"),
+        ("~6,4<abcdefg~>", "   abcdefg"),
+        // Degenerate fields.
+        ("~<abc~>", "abc"),
+        ("~0<abc~>", "abc"),
+        ("~10<~>", "          "),
+        ("~20:@<hi~;there~;you~>", "  hi  there   you   "),
+    ] {
+        assert_eq!(
+            format_nil_string(control, &[]),
+            want,
+            "FORMAT {control:?} should match SBCL"
+        );
+    }
+}
+
+/// A colon on the CLOSING directive (`~:>`) — not the opening one — is what
+/// makes `~<...~>` a pretty-printing logical block, which emits its segments
+/// with no justification padding. ASDF's condition reports are all of the
+/// `~@<...~@:>` shape, so this is the path they take.
+#[test]
+fn format_tilde_angle_logical_block_is_keyed_on_the_closing_colon() {
+    assert_eq!(format_nil_string("~@<plain block~@:>", &[]), "plain block");
+    assert_eq!(format_nil_string("~@<a~;b~@:>", &[]), "ab");
+    // Same text, closing WITHOUT a colon: justification, so mincol applies.
+    assert_eq!(format_nil_string("~20@<plain block~>", &[]), "plain block         ");
+}

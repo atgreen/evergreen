@@ -2476,18 +2476,45 @@ fn format_impl(
                 let body_start = i;
                 let body_end = find_matching_close(&chars, i, '<')?;
                 let body: String = chars[body_start..body_end].iter().collect();
+                // CLHS 22.3.6.2: it is the COLON ON THE CLOSING directive that
+                // turns ~<...~> into a pretty-printing logical block. A colon on
+                // the OPENING directive (~:<) is still justification — it asks
+                // for padding before the first segment. ASDF's `~@<...~@:>`
+                // blocks land here as logical blocks, which is what they are.
+                let close_is_colon = {
+                    let mut k = body_end + 1;
+                    let mut found = false;
+                    while k < chars.len() && chars[k] != '>' {
+                        if chars[k] == ':' {
+                            found = true;
+                        }
+                        k += 1;
+                    }
+                    found
+                };
                 i = skip_close_directive(&chars, body_end);
-                if colon {
-                    // ~:<...~:> logical block: just format the body
-                    format_impl(&body, args, arg_idx, output)?;
+                if close_is_colon {
+                    // Logical block: emit the segments with no justification
+                    // padding. (Splitting rather than formatting the raw body
+                    // keeps a `~;` inside the block from reaching the main
+                    // dispatch loop as an unknown directive.)
+                    for clause in &split_clauses(&body) {
+                        format_impl(clause, args, arg_idx, output)?;
+                    }
                 } else {
                     // Justification: ~mincol,colinc,minpad,padchar<...~>.
                     let mincol = params
                         .first()
                         .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
-                        as usize;
-                    let _colinc = params.get(1).map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
-                    let _minpad = params.get(2).map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?;
+                        .max(0) as usize;
+                    let colinc = params
+                        .get(1)
+                        .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?
+                        .max(1) as usize;
+                    let minpad = params
+                        .get(2)
+                        .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                        .max(0) as usize;
                     let padchar = params.get(3).map_or(Ok(' '), |p| {
                         resolve_param(p, ' ' as i64, arg_idx)
                             .map(|c| char::from_u32(c as u32).unwrap_or(' '))
@@ -2500,38 +2527,50 @@ fn format_impl(
                         parts.push(part);
                     }
                     let total_len: usize = parts.iter().map(|p| p.chars().count()).sum();
-                    let width = mincol.max(total_len);
-                    if parts.len() <= 1 {
-                        let s = parts.first().map(|s| s.as_str()).unwrap_or("");
-                        let pad: String =
-                            std::iter::repeat_n(padchar, width - s.chars().count()).collect();
-                        // A single segment right-justifies by default (pad on the
-                        // left); ~@< left-justifies (pad on the right). CLHS 22.3.6.2.
-                        if at_sign {
-                            output.push_str(s);
-                            output.push_str(&pad);
-                        } else {
-                            output.push_str(&pad);
-                            output.push_str(s);
-                        }
+
+                    // Padding goes into the gaps BETWEEN segments; `:` adds a gap
+                    // before the first segment and `@` one after the last. A lone
+                    // segment with neither modifier would have no gap at all, so
+                    // CLHS gives it the leading one — that is what makes plain
+                    // ~mincol<text~> right-justify.
+                    let pad_before = colon || (parts.len() == 1 && !at_sign);
+                    let pad_after = at_sign;
+                    let gaps = parts.len().saturating_sub(1)
+                        + usize::from(pad_before)
+                        + usize::from(pad_after);
+
+                    // Field width is mincol, grown by whole multiples of colinc
+                    // until the segments and their minimum padding fit.
+                    let needed = total_len + gaps * minpad;
+                    let width = if needed <= mincol {
+                        mincol
                     } else {
-                        let gaps = parts.len() - 1;
-                        let extra = width.saturating_sub(total_len);
-                        let per_gap = if gaps > 0 { extra / gaps } else { 0 };
-                        let mut remainder = if gaps > 0 { extra % gaps } else { 0 };
-                        for (j, part) in parts.iter().enumerate() {
-                            output.push_str(part);
-                            if j < gaps {
-                                let g = per_gap
-                                    + if remainder > 0 {
-                                        remainder -= 1;
-                                        1
-                                    } else {
-                                        0
-                                    };
-                                output.extend(std::iter::repeat_n(padchar, g));
-                            }
+                        mincol + (needed - mincol).div_ceil(colinc) * colinc
+                    };
+
+                    // Spread the slack evenly; the remainder favours the LATER
+                    // gaps (verified against SBCL: ~10:@<abc~> is "   abc    ").
+                    let extra = width - total_len - gaps * minpad;
+                    let per_gap = if gaps > 0 { extra / gaps } else { 0 };
+                    let rem = if gaps > 0 { extra % gaps } else { 0 };
+                    let gap_width = |g: usize| -> usize {
+                        minpad + per_gap + usize::from(g + rem >= gaps)
+                    };
+
+                    let mut g = 0usize;
+                    if pad_before {
+                        output.extend(std::iter::repeat_n(padchar, gap_width(g)));
+                        g += 1;
+                    }
+                    for (j, part) in parts.iter().enumerate() {
+                        output.push_str(part);
+                        if j + 1 < parts.len() {
+                            output.extend(std::iter::repeat_n(padchar, gap_width(g)));
+                            g += 1;
                         }
+                    }
+                    if pad_after {
+                        output.extend(std::iter::repeat_n(padchar, gap_width(g)));
                     }
                 }
             }
