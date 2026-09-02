@@ -254,17 +254,37 @@ impl<'a> Builder<'a> {
         Ok(self.f)
     }
 
-    /// Capture the live root-frame locals at empty-stack backward-GO targets.
-    /// These FrameStates participate in the ordinary optimizer rewrite path,
-    /// which keeps OSR entry state correct as phis and values are simplified.
+    /// Capture the live root-frame locals at every empty-stack BACKWARD BRANCH
+    /// target. These FrameStates participate in the ordinary optimizer rewrite
+    /// path, which keeps OSR entry state correct as phis and values are
+    /// simplified.
+    ///
+    /// The safety condition is the operand stack being empty at the target
+    /// (`entry_depth == 0`), which is what makes the state map trivial: locals
+    /// already live in shared BlissStack frame slots, so only the position has
+    /// to transfer. That condition is a property of the target, not of the
+    /// instruction that jumps to it — so every backward branch qualifies, not
+    /// just a tagbody `Go`.
+    ///
+    /// This used to look at `Go` alone, which meant DO/DOTIMES/DOLIST loops —
+    /// which lower to ordinary `Br`/`BrIfFalse` back-edges, not to tagbody
+    /// `Go` — got no OSR safepoint at all, and so could never be entered at T2
+    /// once already running. Those are precisely the loops OSR exists for
+    /// (bliss-izt.4).
     fn capture_osr_entries(&mut self) {
         let mut headers = BTreeSet::new();
         for (i, instr) in self.bf.code.iter().enumerate() {
-            if let Instr::Go { target_bcp, .. } = instr {
-                let target = *target_bcp as usize;
-                if target < i && self.entry_depth.get(&target) == Some(&0) {
-                    headers.insert(*target_bcp);
-                }
+            let target_bcp = match instr {
+                Instr::Go { target_bcp, .. } => *target_bcp,
+                // A conditional branch has already popped its test value by the
+                // time control reaches the target, so the target's own
+                // entry_depth is still the authority on stack emptiness.
+                Instr::Br(t) | Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => *t,
+                _ => continue,
+            };
+            let target = target_bcp as usize;
+            if target < i && self.entry_depth.get(&target) == Some(&0) {
+                headers.insert(target_bcp);
             }
         }
         for bcp in headers {

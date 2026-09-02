@@ -15,8 +15,8 @@
 use bliss_compiler::osr::ConversionKind;
 use bliss_compiler::t2::build::build_from_bytecode;
 use bliss_compiler::t2::deopt::{self, SlotDescriptor};
-use bliss_compiler::t2::mach::{Location, StackSlot};
 use bliss_compiler::t2::ir::ValueRepresentation;
+use bliss_compiler::t2::mach::{Location, StackSlot};
 use bliss_compiler::t2::slot_map;
 use bliss_rt::bytecode::{BytecodeFunction, Instr};
 use bliss_rt::value::BlissVal;
@@ -44,9 +44,10 @@ fn bf(name: &str, code: Vec<Instr>, constants: Vec<BlissVal>, n_locals: u16) -> 
     }
 }
 
-/// A counted loop written with an explicit backward `Go`, which is the shape
-/// `capture_osr_entries` recognises as an OSR safepoint (an empty-operand-stack
-/// backward branch target).
+/// A counted loop whose back-edge is `back`. Both an explicit tagbody `Go` and
+/// an ordinary `Br` must be recognised as OSR safepoints: the condition is that
+/// the *target* has an empty operand stack, not which instruction jumps to it
+/// (bliss-izt.4).
 ///
 ///   0: Const 0        ; i = 0
 ///   1: StoreLocal 0
@@ -57,7 +58,7 @@ fn bf(name: &str, code: Vec<Instr>, constants: Vec<BlissVal>, n_locals: u16) -> 
 ///   6: Go -> 2
 ///   7: LoadLocal 0
 ///   8: Return
-fn counted_loop_with_go() -> BytecodeFunction {
+fn counted_loop(back: Instr) -> BytecodeFunction {
     bf(
         "osr_loop",
         vec![
@@ -67,10 +68,7 @@ fn counted_loop_with_go() -> BytecodeFunction {
             Instr::BrIfFalse(7),
             Instr::Const(1),
             Instr::StoreLocal(0),
-            Instr::Go {
-                tagbody_id: 0,
-                target_bcp: 2,
-            },
+            back,
             Instr::LoadLocal(0),
             Instr::Return,
         ],
@@ -79,74 +77,111 @@ fn counted_loop_with_go() -> BytecodeFunction {
     )
 }
 
+/// The two back-edge shapes a counted loop can have: a tagbody `Go` and the
+/// ordinary `Br` that DO/DOTIMES/DOLIST lower to.
+fn back_edges() -> Vec<(&'static str, Instr)> {
+    vec![
+        (
+            "Go",
+            Instr::Go {
+                tagbody_id: 0,
+                target_bcp: 2,
+            },
+        ),
+        ("Br", Instr::Br(2)),
+    ]
+}
+
+/// An ordinary backward `Br` must yield an OSR safepoint just like a tagbody
+/// `Go`. Before bliss-izt.4 only `Go` was scanned for, so DO/DOTIMES/DOLIST
+/// loops — which lower to `Br` — got no OSR entry at all and could never be
+/// entered at T2 once already running.
+#[test]
+fn every_backward_branch_shape_yields_an_osr_safepoint() {
+    for (label, back) in back_edges() {
+        let f = build_from_bytecode(&counted_loop(back)).expect("builds");
+        assert_eq!(
+            f.osr_entries.len(),
+            1,
+            "a counted loop with a backward {label} must produce exactly one              OSR safepoint at the loop header"
+        );
+        assert_eq!(
+            f.osr_entries[0].bcp, 2,
+            "the OSR safepoint belongs at the loop header (bcp 2), not at the              back-edge, for a backward {label}"
+        );
+    }
+}
+
 /// The bead's explicit ask: for a given safepoint, the OSR import descriptor and
 /// the deopt export descriptor agree on slot count and per-slot representation.
 #[test]
 fn osr_import_and_deopt_export_agree_on_slot_count_and_representation() {
-    let f = build_from_bytecode(&counted_loop_with_go()).expect("builds");
-    assert!(
-        !f.osr_entries.is_empty(),
-        "the backward Go must be captured as an OSR safepoint, otherwise this \
-         test proves nothing"
-    );
-
-    for osr in &f.osr_entries {
-        let fs = f.frame_states.get(osr.frame_state);
-        let scope = fs.scopes.first().expect("OSR frame state has a scope");
-
-        // ── Import side: what OSR transfers in. ──
-        let imports = slot_map::slot_specs(scope, fs);
-
-        // ── Export side: what deopt writes back out. Every value is allocated
-        //    to a distinct stack location so lowering can succeed; the location
-        //    itself is irrelevant here, only the frame SHAPE is under test. ──
-        let exported = deopt::lower_one(0, fs, &|v| Some(Location::Stack(StackSlot(v.0))))
-            .expect("frame state lowers");
-        let exported_scope = exported.scopes.first().expect("one scope");
-
-        // (1) Same number of slots.
-        assert_eq!(
-            imports.len(),
-            exported_scope.slots.len(),
-            "OSR import and deopt export disagree on slot COUNT at bcp {}",
-            osr.bcp
+    for (label, back) in back_edges() {
+        let f = build_from_bytecode(&counted_loop(back)).expect("builds");
+        assert!(
+            !f.osr_entries.is_empty(),
+            "the backward {label} must be captured as an OSR safepoint, otherwise \
+         this test proves nothing"
         );
 
-        // (2) Same locals/stack split, so slot i means the same thing to both.
-        assert_eq!(
-            imports.iter().filter(|s| s.is_local).count(),
-            exported_scope.num_locals,
-            "OSR import and deopt export disagree on the locals/stack split at \
+        for osr in &f.osr_entries {
+            let fs = f.frame_states.get(osr.frame_state);
+            let scope = fs.scopes.first().expect("OSR frame state has a scope");
+
+            // ── Import side: what OSR transfers in. ──
+            let imports = slot_map::slot_specs(scope, fs);
+
+            // ── Export side: what deopt writes back out. Every value is allocated
+            //    to a distinct stack location so lowering can succeed; the location
+            //    itself is irrelevant here, only the frame SHAPE is under test. ──
+            let exported = deopt::lower_one(0, fs, &|v| Some(Location::Stack(StackSlot(v.0))))
+                .expect("frame state lowers");
+            let exported_scope = exported.scopes.first().expect("one scope");
+
+            // (1) Same number of slots.
+            assert_eq!(
+                imports.len(),
+                exported_scope.slots.len(),
+                "OSR import and deopt export disagree on slot COUNT at bcp {}",
+                osr.bcp
+            );
+
+            // (2) Same locals/stack split, so slot i means the same thing to both.
+            assert_eq!(
+                imports.iter().filter(|s| s.is_local).count(),
+                exported_scope.num_locals,
+                "OSR import and deopt export disagree on the locals/stack split at \
              bcp {}",
-            osr.bcp
-        );
+                osr.bcp
+            );
 
-        // (3) Per-slot representation: the import conversion must be the exact
-        //     inverse of the export rebox, slot by slot.
-        for (i, spec) in imports.iter().enumerate() {
-            let import = ConversionKind::for_repr(spec.repr);
-            let export = match &exported_scope.slots[i] {
-                SlotDescriptor::InLocation(_, rebox) => Some(*rebox),
-                // Const/Unbound/Remat slots are materialised, not transferred
-                // through a machine location, so they have no rebox to invert.
-                _ => None,
-            };
-            if let Some(rebox) = export {
-                assert_eq!(
-                    rebox,
-                    deopt::Rebox::for_repr(spec.repr),
-                    "slot {i} at bcp {}: deopt export rebox does not match the \
+            // (3) Per-slot representation: the import conversion must be the exact
+            //     inverse of the export rebox, slot by slot.
+            for (i, spec) in imports.iter().enumerate() {
+                let import = ConversionKind::for_repr(spec.repr);
+                let export = match &exported_scope.slots[i] {
+                    SlotDescriptor::InLocation(_, rebox) => Some(*rebox),
+                    // Const/Unbound/Remat slots are materialised, not transferred
+                    // through a machine location, so they have no rebox to invert.
+                    _ => None,
+                };
+                if let Some(rebox) = export {
+                    assert_eq!(
+                        rebox,
+                        deopt::Rebox::for_repr(spec.repr),
+                        "slot {i} at bcp {}: deopt export rebox does not match the \
                      representation the OSR import would use",
-                    osr.bcp
-                );
-                assert!(
-                    import.is_some(),
-                    "slot {i} at bcp {}: deopt can export representation {:?} \
+                        osr.bcp
+                    );
+                    assert!(
+                        import.is_some(),
+                        "slot {i} at bcp {}: deopt can export representation {:?} \
                      but OSR has no inverse import conversion — the OSR entry \
                      must be declined, not emitted",
-                    osr.bcp,
-                    spec.repr
-                );
+                        osr.bcp,
+                        spec.repr
+                    );
+                }
             }
         }
     }
@@ -160,27 +195,29 @@ fn osr_import_and_deopt_export_agree_on_slot_count_and_representation() {
 /// register the loop reads as a raw integer.
 #[test]
 fn osr_safepoint_slots_are_all_tagged_so_the_word_move_stub_is_valid() {
-    let f = build_from_bytecode(&counted_loop_with_go()).expect("builds");
-    for osr in &f.osr_entries {
-        let fs = f.frame_states.get(osr.frame_state);
-        let scope = fs.scopes.first().expect("scope");
-        for spec in slot_map::slot_specs(scope, fs) {
-            assert_eq!(
-                spec.repr,
-                ValueRepresentation::Tagged,
-                "slot {} at bcp {} is {:?}; the emit OSR stub moves a raw word \
+    for (_, back) in back_edges() {
+        let f = build_from_bytecode(&counted_loop(back)).expect("builds");
+        for osr in &f.osr_entries {
+            let fs = f.frame_states.get(osr.frame_state);
+            let scope = fs.scopes.first().expect("scope");
+            for spec in slot_map::slot_specs(scope, fs) {
+                assert_eq!(
+                    spec.repr,
+                    ValueRepresentation::Tagged,
+                    "slot {} at bcp {} is {:?}; the emit OSR stub moves a raw word \
                  out of the interpreter frame and can only do that for Tagged \
                  slots. Teach the stub the D4.09 conversion (or keep declining \
                  the entry) before allowing unboxed OSR slots.",
-                spec.index,
-                osr.bcp,
-                spec.repr
-            );
-            assert_eq!(
-                ConversionKind::for_repr(spec.repr),
-                Some(ConversionKind::None),
-                "a Tagged slot must need no import conversion"
-            );
+                    spec.index,
+                    osr.bcp,
+                    spec.repr
+                );
+                assert_eq!(
+                    ConversionKind::for_repr(spec.repr),
+                    Some(ConversionKind::None),
+                    "a Tagged slot must need no import conversion"
+                );
+            }
         }
     }
 }

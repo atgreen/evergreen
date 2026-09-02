@@ -181,7 +181,11 @@ mod tests {
         );
         // Representations are resolved per source kind, not assumed.
         assert_eq!(specs[0].repr, ValueRepresentation::UnboxedFixnum);
-        assert_eq!(specs[1].repr, ValueRepresentation::Tagged, "Const is tagged");
+        assert_eq!(
+            specs[1].repr,
+            ValueRepresentation::Tagged,
+            "Const is tagged"
+        );
         assert_eq!(
             specs[2].repr,
             ValueRepresentation::Tagged,

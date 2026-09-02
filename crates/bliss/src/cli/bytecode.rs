@@ -14922,7 +14922,7 @@ fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
     };
     let code = framed.code;
     t2_log!(
-        "{name}: T2 INSTALLED — {} bytes, compiled_entry=+{}, spill_slots={} (regalloc2={}), edits={}, gc_shadow_slots={}, safepoints={}",
+        "{name}: T2 INSTALLED — {} bytes, compiled_entry=+{}, spill_slots={} (regalloc2={}), edits={}, gc_shadow_slots={}, safepoints={}, osr_entries={}",
         code.len(),
         framed.compiled_entry,
         framed.native_spill_slots,
@@ -14930,6 +14930,10 @@ fn compile_t2_artifact(input: T2CompileInput) -> Option<T2Artifact> {
         framed.allocation_edits,
         framed.shadow_root_slots,
         framed.emitted_safepoints,
+        // Whether a loop actually got an OSR edge is otherwise invisible from
+        // outside the emitter, which made bliss-izt.4 (backward `Br` loops
+        // silently getting none) hard to notice.
+        framed.osr_entries.len(),
     );
 
     Some(T2Artifact {

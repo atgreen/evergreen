@@ -571,7 +571,9 @@ pub fn next_registered_macro_key() -> BlissVal {
     // expansion misread as a macro handle → wrong expander; same family as
     // bliss-6b2). `from_macro_handle` puts keys on a tag no literal — and no
     // CLOS meta handle — can occupy, making the conflation impossible.
-    BlissVal::from_macro_handle(MACRO_FUNCTION_KEY_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64)
+    BlissVal::from_macro_handle(
+        MACRO_FUNCTION_KEY_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) as i64,
+    )
 }
 
 /// Parse a macro definition into a lambda-expression suitable for `enclose`.
@@ -2421,11 +2423,13 @@ mod registry_key_tests {
             let k = next_registered_macro_key();
             // Keys must never carry the fixnum tag, or a plain integer could alias
             // them.
-            assert!(k.is_macro_handle(), "key must be a macro handle, not a fixnum");
+            assert!(
+                k.is_macro_handle(),
+                "key must be a macro handle, not a fixnum"
+            );
             assert!(!k.is_fixnum(), "macro key must not be fixnum-tagged");
             let sentinel = 900_000 + i; // distinct from any fixnum expander below
-            let f: Arc<MacroFn> =
-                Arc::new(move |_form, _env| Ok(BlissVal::from_fixnum(sentinel)));
+            let f: Arc<MacroFn> = Arc::new(move |_form, _env| Ok(BlissVal::from_fixnum(sentinel)));
             register_macro_function(k, f);
             keys.push(k);
         }

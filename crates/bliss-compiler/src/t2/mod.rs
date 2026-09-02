@@ -25,11 +25,11 @@
 
 pub mod frame_state;
 pub mod ir;
+pub mod mach;
+pub mod pass;
 /// The shared per-safepoint liveness+representation producer that the deopt
 /// export and the OSR import both read (bliss-ht4).
 pub mod slot_map;
-pub mod mach;
-pub mod pass;
 
 // ── Wave 1 parcels (one module per sub-agent; disjoint files) ─────
 pub mod build; // P1 — bytecode → SSA
