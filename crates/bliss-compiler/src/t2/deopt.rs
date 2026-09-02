@@ -203,18 +203,31 @@ pub fn lower_one(
 ) -> Result<LoweredDeopt, LowerError> {
     let mut scopes = Vec::with_capacity(fs.scopes.len());
     for scope in &fs.scopes {
-        let mut slots = Vec::with_capacity(scope.locals.len() + scope.stack.len());
-        let mut live_ref_bitmap = Vec::with_capacity(slots.capacity());
-        for source in scope.locals.iter().chain(scope.stack.iter()) {
-            let (desc, is_ref) = lower_source(source, fs, loc_of, 0)?;
+        // Enumerate through `slot_map` — the same producer the OSR import side
+        // reads — so the two directions cannot disagree about which slots are
+        // live, in what order, or in what representation (bliss-ht4).
+        let specs = crate::t2::slot_map::slot_specs(scope, fs);
+        let mut slots = Vec::with_capacity(specs.len());
+        let mut live_ref_bitmap = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let (desc, _) = lower_source(&spec.source, fs, loc_of, 0)?;
             slots.push(desc);
-            live_ref_bitmap.push(is_ref);
+            // A4.14 sets the live-ref bit only for a `Value` that is `Tagged`.
+            // Representation alone is NOT the rule: a `Const` heap literal is
+            // tagged but is rooted immortally in the constant pool, and a
+            // `Remat` slot is recomputed cold rather than scanned (see the
+            // module header). The representation half of the test comes from
+            // `slot_map`, so it agrees with the OSR import's conversion choice.
+            live_ref_bitmap.push(
+                matches!(spec.source, ValueSource::Value { .. })
+                    && spec.repr == ValueRepresentation::Tagged,
+            );
         }
         scopes.push(LoweredScope {
             resume_pc: scope.bcp,
             function: scope.function,
             slots,
-            num_locals: scope.locals.len(),
+            num_locals: crate::t2::slot_map::num_locals(scope),
             live_ref_bitmap,
         });
     }

@@ -25,6 +25,9 @@
 
 pub mod frame_state;
 pub mod ir;
+/// The shared per-safepoint liveness+representation producer that the deopt
+/// export and the OSR import both read (bliss-ht4).
+pub mod slot_map;
 pub mod mach;
 pub mod pass;
 

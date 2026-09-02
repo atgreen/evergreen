@@ -14,8 +14,10 @@
 
 use bliss_rt::asm::{Asm, Cc};
 
+use crate::osr::ConversionKind;
 use crate::t2::ir::Function;
 use crate::t2::mach::{EditPosition, Location, MachFunc, MachInst, PhysReg, RegClass, VReg};
+use crate::t2::slot_map;
 
 /// Why emission could not complete (the function stays at T1, spec R4.28/R4.42).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2824,6 +2826,25 @@ fn emit_framed_inner(
         if fs.scopes.len() != 1 || !scope.stack.is_empty() {
             continue;
         }
+        // bliss-ht4: the transfer below moves a RAW machine word out of the
+        // interpreter frame slot into the value's allocated home. A T0/T1
+        // interpreter slot always holds a tagged BlissVal, so that is correct
+        // only while every live slot's T2 representation is `Tagged`. If a pass
+        // has unboxed one, the correct transfer needs the D4.09 conversion this
+        // stub cannot emit — and emitting the plain move would hand the loop a
+        // tagged word it reads as a raw integer, a miscompile no non-OSR test
+        // can see. Decline the OSR entry instead: the loop loses its OSR fast
+        // path and still runs correctly at the lower tier.
+        //
+        // The representations come from `slot_map`, the same producer the deopt
+        // export reads, so import and export cannot disagree about this frame.
+        let specs = slot_map::slot_specs(scope, fs);
+        if specs
+            .iter()
+            .any(|s| ConversionKind::for_repr(s.repr) != Some(ConversionKind::None))
+        {
+            continue;
+        }
         let offset = a.here();
         for &r in &saved {
             push_reg(&mut a, r);
@@ -2838,8 +2859,9 @@ fn emit_framed_inner(
         if let Some(home) = frame_base_home {
             store_home(&mut a, home, 7 /* rdi */, 0);
         }
-        for (slot, src) in scope.locals.iter().enumerate() {
-            if let ValueSource::Value { value, .. } = src {
+        for spec in &specs {
+            let slot = spec.index as usize;
+            if let ValueSource::Value { value, .. } = &spec.source {
                 if let Some(&home) = homes.get(value) {
                     match home {
                         FramedHome::Reg(r) => mov_from_frame(&mut a, r, 7 /* rdi */, slot),

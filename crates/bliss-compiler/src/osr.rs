@@ -108,6 +108,33 @@ pub enum ConversionKind {
     WidenI32ToI64,
 }
 
+impl ConversionKind {
+    /// The OSR *import* conversion implied by a T2 value's machine
+    /// representation — the exact inverse of the deopt *export*
+    /// [`crate::t2::deopt::Rebox::for_repr`] (bliss-ht4).
+    ///
+    /// Both directions MUST be derived here and there rather than by separate
+    /// ad-hoc matches, or a representation one side learns about and the other
+    /// does not becomes a miscompile visible only on an OSR'd loop. See
+    /// [`crate::t2::slot_map`] for the shared liveness+representation producer.
+    ///
+    /// Returns `None` when D4.09's conversion vocabulary cannot express the
+    /// import. That is the case for `UnboxedF64`: export reboxes it by
+    /// heap-allocating a double-float, but `ConversionKind` distinguishes only
+    /// `UnboxFloat` (the single-float immediate), so there is no inverse. A
+    /// caller that gets `None` MUST decline the OSR entry rather than transfer
+    /// the slot unconverted.
+    pub fn for_repr(repr: crate::t2::ir::ValueRepresentation) -> Option<ConversionKind> {
+        use crate::t2::ir::ValueRepresentation as R;
+        match repr {
+            R::Tagged => Some(ConversionKind::None),
+            R::UnboxedFixnum => Some(ConversionKind::UnboxFixnum),
+            R::UnboxedF32 => Some(ConversionKind::UnboxFloat),
+            R::UnboxedF64 => None,
+        }
+    }
+}
+
 /// Expected type tag for a type guard check at OSR entry (spec D4.09).
 #[derive(Clone, Debug)]
 pub struct TypeGuard {
