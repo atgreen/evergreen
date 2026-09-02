@@ -14108,6 +14108,10 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     "SINGLE-FLOAT"
                 } else if v.is_character() {
                     "CHARACTER"
+                } else if is_keyword_arg(v) {
+                    // A keyword's most specific type is KEYWORD, not SYMBOL
+                    // (CLHS TYPE-OF; matches SBCL). bliss-54t8.
+                    "KEYWORD"
                 } else if v.is_symbol() {
                     "SYMBOL"
                 } else if is_function_value(v) {
