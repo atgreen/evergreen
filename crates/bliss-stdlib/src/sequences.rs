@@ -560,7 +560,23 @@ pub fn vector_push_extend(
             store.push(vector_elt(cvec_storage(v), i));
         }
         store.resize(new_cap, NIL);
-        cvec_set_storage(v, build_vector(&store));
+        // `build_vector` allocates and can fire a minor GC that relocates the
+        // nursery, so BOTH the vector we are about to mutate and the value we
+        // still have to store must be rooted across it — an unrooted local
+        // would be left pointing at the pre-move address (bliss-ez7w).
+        // (`store`'s elements need no rooting here: build_vector roots its own
+        // copy of them before allocating.)
+        bliss_rt::rooted!(v = v);
+        bliss_rt::rooted!(value = value);
+        // Allocate FIRST, then re-read `*v`. Writing it as
+        // `cvec_set_storage(*v, build_vector(&store))` would reload `*v` as the
+        // left argument *before* build_vector runs, handing the setter the very
+        // pre-move address the rooting exists to avoid.
+        let storage = build_vector(&store);
+        cvec_set_storage(*v, storage);
+        vector_set_elt(storage, fp, *value);
+        cvec_set_fill_pointer_raw(*v, fp + 1);
+        return Ok(BlissVal::from_fixnum(fp as i64));
     }
     vector_set_elt(cvec_storage(v), fp, value);
     cvec_set_fill_pointer_raw(v, fp + 1);
@@ -586,15 +602,27 @@ pub fn adjust_complex_vector(
         });
     }
     let cap = cvec_capacity(v);
+    let fp = fill_pointer.unwrap_or(new_size).min(new_size);
     if new_size > cap {
         let mut store: Vec<BlissVal> = Vec::with_capacity(new_size);
         for i in 0..cap {
             store.push(vector_elt(cvec_storage(v), i));
         }
         store.resize(new_size, initial_element);
-        cvec_set_storage(v, build_vector(&store));
+        // `build_vector` allocates and can fire a minor GC that relocates the
+        // nursery, so `v` must be rooted across it: otherwise we would write
+        // the new storage (and the fill pointer) into `v`'s pre-move address
+        // and the surviving array would silently keep its old, smaller
+        // storage (bliss-ez7w). `store`'s elements are rooted by build_vector
+        // itself, and `initial_element` is not used after the call.
+        bliss_rt::rooted!(v = v);
+        // Allocate FIRST, then re-read `*v` — see the note in
+        // `vector_push_extend` on argument-evaluation order.
+        let storage = build_vector(&store);
+        cvec_set_storage(*v, storage);
+        cvec_set_fill_pointer_raw(*v, fp);
+        return Ok(*v);
     }
-    let fp = fill_pointer.unwrap_or(new_size).min(new_size);
     cvec_set_fill_pointer_raw(v, fp);
     Ok(v)
 }
