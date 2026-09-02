@@ -1,0 +1,1 @@
+{"id":"int-1605e6d48467961dd0b6ae731d9dcea9","kind":"field_change","created_at":"2026-09-02T18:01:35.777102351Z","actor":"Anthony Green","issue_id":"bliss-54t8","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Fixed in caa7df1: TYPE-OF now returns KEYWORD for keyword symbols, matching SBCL/CLHS. TYPEP+SUBTYPEP already agreed."}}

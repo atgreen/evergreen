@@ -297,6 +297,11 @@ fn vector_set_elt(v: BlissVal, idx: usize, val: BlissVal) {
 //   word 0 (+8):  storage — a SIMPLE_VECTOR of capacity `array-total-size`
 //   word 1 (+16): fill-pointer, a fixnum (the active LENGTH)
 //   word 2 (+24): adjustable flag (T / NIL)
+//   word 3 (+32): element-type tag, a fixnum (1 = CHARACTER, 0 = general T)
+//   word 4 (+40): has-user-fill-pointer flag, a fixnum (1 = the user asked for
+//                 :fill-pointer, 0 = plain :adjustable array). Word 1 is the
+//                 active length either way, but ANSI says only the former
+//                 answers T to ARRAY-HAS-FILL-POINTER-P (bliss-0x9y).
 // The active length is the fill pointer; `array-total-size` is the storage's
 // length; growth (`vector-push-extend`) replaces the storage with a larger one.
 
@@ -345,13 +350,26 @@ pub fn cvec_adjustable(v: BlissVal) -> bool {
 /// Whether a complex vector has element-type CHARACTER — i.e. it is a
 /// (fill-pointer / adjustable) STRING and must answer STRINGP / TYPEP STRING /
 /// print as `"…"`. Encoded as an immediate fixnum tag in body word 3 (1 =
-/// character, 0/absent = general T). Word 3 is only present on 4-word
-/// COMPLEX_ARRAYs built by `build_complex_vector`; the reader is safe because
-/// every COMPLEX_ARRAY this crate allocates now carries it.
+/// character, 0/absent = general T). Words 3 and 4 are only present on the
+/// 5-word COMPLEX_ARRAYs built by `build_complex_vector`; the readers are safe
+/// because every COMPLEX_ARRAY this crate allocates now carries them.
 #[inline]
 pub fn cvec_is_string(v: BlissVal) -> bool {
     unsafe {
         let tag = *(v.as_ptr().add(32) as *const BlissVal);
+        tag.is_fixnum() && tag.as_fixnum() == 1
+    }
+}
+/// Whether a complex vector has a *user* fill pointer — i.e. it was created
+/// with a non-NIL `:fill-pointer`. A plain `(make-array n :adjustable t)` is
+/// also a COMPLEX_ARRAY and still stores its length in the fill-pointer word,
+/// but ANSI says it has no fill pointer, so `ARRAY-HAS-FILL-POINTER-P` (and
+/// `FILL-POINTER`/`VECTOR-PUSH`) must tell the two apart. Encoded as an
+/// immediate fixnum tag in body word 4 (1 = yes, 0/absent = no). bliss-0x9y.
+#[inline]
+pub fn cvec_has_fill_pointer(v: BlissVal) -> bool {
+    unsafe {
+        let tag = *(v.as_ptr().add(40) as *const BlissVal);
         tag.is_fixnum() && tag.as_fixnum() == 1
     }
 }
@@ -386,12 +404,16 @@ pub fn cvec_capacity(v: BlissVal) -> usize {
 /// `elements` seed positions `0..elements.len()` (rest NIL); `fill_pointer` is
 /// the active length; `adjustable` allows later growth. `element_is_char` marks
 /// element-type CHARACTER, i.e. a (fill-pointer / adjustable) STRING.
+/// `has_fill_pointer` records whether the user actually asked for
+/// `:fill-pointer`; a plain `:adjustable` array stores its length in the same
+/// word but has no fill pointer per ANSI (bliss-0x9y).
 pub fn build_complex_vector(
     elements: &[BlissVal],
     capacity: usize,
     fill_pointer: usize,
     adjustable: bool,
     element_is_char: bool,
+    has_fill_pointer: bool,
 ) -> BlissVal {
     let cap = capacity.max(elements.len());
     let mut store: Vec<BlissVal> = Vec::with_capacity(cap);
@@ -403,27 +425,32 @@ pub fn build_complex_vector(
     let adj = if adjustable { T } else { NIL };
     // Element-type tag: immediate fixnum, 1 = CHARACTER (a string), 0 = general.
     let elt = BlissVal::from_fixnum(if element_is_char { 1 } else { 0 });
+    // Has-user-fill-pointer tag: immediate fixnum, 1 = yes, 0 = no.
+    let hasfp = BlissVal::from_fixnum(if has_fill_pointer { 1 } else { 0 });
     // Body = [storage-ref | fill-pointer(fixnum) | adjustable(T/NIL) |
-    //         element-type(fixnum)]; only the storage word is a heap reference
-    //         (the GC's COMPLEX_ARRAY tracer visits word 0 only).
-    let body_size = 4 * 8;
+    //         element-type(fixnum) | has-fill-pointer(fixnum)]; only the storage
+    //         word is a heap reference (the GC's COMPLEX_ARRAY tracer visits
+    //         word 0 only), so the extra immediates are free of tracer changes.
+    let body_size = 5 * 8;
     if let Some(body) = bliss_rt::gc::alloc_typed(body_size, type_id::COMPLEX_ARRAY) {
         unsafe {
             *(body as *mut u64) = (*storage).to_raw();
             *(body.add(8) as *mut u64) = fp.to_raw();
             *(body.add(16) as *mut u64) = adj.to_raw();
             *(body.add(24) as *mut u64) = elt.to_raw();
+            *(body.add(32) as *mut u64) = hasfp.to_raw();
             return BlissVal::from_heap_ptr(body.sub(8));
         }
     }
-    // OOM fallback: a leaked block (header + 4 body words).
-    let mut buf: Vec<u64> = Vec::with_capacity(5);
-    let header = ObjectHeader::new(type_id::COMPLEX_ARRAY, 5);
+    // OOM fallback: a leaked block (header + 5 body words).
+    let mut buf: Vec<u64> = Vec::with_capacity(6);
+    let header = ObjectHeader::new(type_id::COMPLEX_ARRAY, 6);
     buf.push(header.0);
     buf.push((*storage).to_raw());
     buf.push(fp.to_raw());
     buf.push(adj.to_raw());
     buf.push(elt.to_raw());
+    buf.push(hasfp.to_raw());
     let ptr = buf.as_mut_ptr() as *mut u8;
     std::mem::forget(buf);
     unsafe { BlissVal::from_heap_ptr(ptr) }

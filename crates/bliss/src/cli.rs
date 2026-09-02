@@ -10631,6 +10631,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let iel = if args.len() > 3 { args[3] } else { NIL };
                 // 5th arg (optional): non-NIL ⇒ element-type CHARACTER (a string).
                 let element_is_char = args.len() > 4 && !args[4].is_nil();
+                // 6th arg (optional): non-NIL ⇒ the user asked for :fill-pointer,
+                // so ARRAY-HAS-FILL-POINTER-P answers T. A plain :adjustable
+                // array is a COMPLEX_ARRAY too but has no fill pointer
+                // (bliss-0x9y). Absent ⇒ NIL, matching the old callers.
+                let has_fill_pointer = args.len() > 5 && !args[5].is_nil();
                 let elems = vec![iel; size];
                 return Ok(bliss_stdlib::build_complex_vector(
                     &elems,
@@ -10638,6 +10643,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     fp,
                     adjustable,
                     element_is_char,
+                    has_fill_pointer,
                 ));
             }
             "BLISS-INTERNAL::%ADJUST-ARRAY"
@@ -10743,13 +10749,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 return Ok(if adj { T } else { NIL });
             }
             "ARRAY-HAS-FILL-POINTER-P" => {
+                // Only a vector created with a non-NIL :fill-pointer has one. A
+                // plain (make-array n :adjustable t) is the same COMPLEX_ARRAY
+                // representation but answers NIL per ANSI (bliss-0x9y).
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                return Ok(if bliss_stdlib::is_complex_vector(v) {
-                    T
-                } else {
-                    NIL
-                });
+                let has = bliss_stdlib::is_complex_vector(v)
+                    && bliss_stdlib::cvec_has_fill_pointer(v);
+                return Ok(if has { T } else { NIL });
             }
             "ARRAY-DISPLACEMENT" => {
                 // bliss has no displaced arrays: (values nil 0).

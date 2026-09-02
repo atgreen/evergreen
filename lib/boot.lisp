@@ -1153,7 +1153,11 @@
               (fpn (cond ((eq fp t) size)
                          ((integerp fp) fp)
                          (t size)))
-              (v (%make-complex-vector size fpn (and adjustable t) iel (and stringp t))))
+              ;; A fill pointer exists only if the user passed a non-NIL
+              ;; :fill-pointer; :adjustable alone gives a plain adjustable
+              ;; array with no fill pointer (bliss-0x9y).
+              (v (%make-complex-vector size fpn (and adjustable t) iel
+                                       (and stringp t) (and fp t))))
          (when ic-cell
            (let ((i 0))
              (dolist (e (coerce (car (cdr ic-cell)) 'list))
@@ -1179,20 +1183,14 @@
          (iel-cell (member :initial-element keys))
          (fp (and fp-cell (car (cdr fp-cell))))
          (iel (if iel-cell (car (cdr iel-cell)) nil))
-         ;; No :fill-pointer supplied. Bliss represents both plain adjustable
-         ;; arrays and fill-pointer arrays as complex vectors, so
-         ;; ARRAY-HAS-FILL-POINTER-P can't tell them apart (it answers T for
-         ;; both — see bliss-6wng). Heuristic: a plain adjustable array's length
-         ;; equals its total size, so if the current fill pointer already spans
-         ;; the whole storage, treat it as a plain array and let its length track
-         ;; the new SIZE; only a fill pointer strictly below capacity is a real
-         ;; (user) fill pointer worth preserving. Without this, growing a plain
-         ;; adjustable array left its length pinned at the old size (bliss-6wng).
+         ;; No :fill-pointer supplied. Per ANSI the array keeps its fill
+         ;; pointer if it has one; a plain adjustable array has none, so its
+         ;; length simply tracks the new SIZE. ARRAY-HAS-FILL-POINTER-P now
+         ;; distinguishes the two exactly (bliss-0x9y), replacing the old
+         ;; fp<total-size heuristic (bliss-6wng).
          (fpn (cond ((eq fp t) size)
                     ((integerp fp) fp)
-                    ((and (array-has-fill-pointer-p array)
-                          (< (fill-pointer array) (array-total-size array)))
-                     (fill-pointer array))
+                    ((array-has-fill-pointer-p array) (fill-pointer array))
                     (t size))))
     (%adjust-array array size fpn iel)))
 
