@@ -1440,3 +1440,75 @@ fn format_tilde_angle_logical_block_is_keyed_on_the_closing_colon() {
     // Same text, closing WITHOUT a colon: justification, so mincol applies.
     assert_eq!(format_nil_string("~20@<plain block~>", &[]), "plain block         ");
 }
+
+// ── ~T column tabulation against SBCL ground truth (bliss-a094) ──
+//
+// Captured from SBCL on the identical control strings. Covers both forms of
+// CLHS 22.3.6.1:
+//   ~colnum,colinc T   absolute — move to colnum, else the next colnum+k*colinc
+//   ~colrel,colinc @T  relative — emit colrel spaces, then the fewest more that
+//                      land on a multiple of colinc
+// The `@` form used to fall through to the absolute computation entirely, so
+// `ab~3@Tx` emitted one space instead of three.
+#[test]
+fn format_tilde_t_tabulation_matches_sbcl() {
+    for (control, want) in [
+        // Absolute, no parameters / one parameter.
+        ("~0Tx", " x"),
+        ("~1Tx", " x"),
+        ("~5Tx", "     x"),
+        ("ab~5Tx", "ab   x"),
+        ("abcdefg~5Tx", "abcdefg x"),
+        ("~T x", "  x"),
+        ("a~Tb", "a b"),
+        // Absolute, already at or past colnum: advance by whole colinc steps.
+        ("ab~2Tx", "ab x"),
+        ("abcd~2Tx", "abcd x"),
+        ("abcde~2,3Tx", "abcde   x"),
+        ("~2,4Tx", "  x"),
+        ("ab~2,4Tx", "ab    x"),
+        ("abc~2,4Tx", "abc   x"),
+        ("~0,5Tx", "     x"),
+        ("ab~0,5Tx", "ab   x"),
+        ("~5,3Tx", "     x"),
+        ("abcdefgh~5,3Tx", "abcdefgh   x"),
+        ("x~4,4Ty~4,4Tz", "x   y   z"),
+        ("~,3Tx", " x"),
+        ("ab~,3Tx", "ab  x"),
+        // Relative (~@T).
+        ("~@Tx", " x"),
+        ("a~@Tx", "a x"),
+        ("ab~3@Tx", "ab   x"),
+        ("ab~0@Tx", "abx"),
+        ("ab~1,3@Tx", "ab x"),
+        ("abc~1,3@Tx", "abc   x"),
+        ("ab~2,5@Tx", "ab   x"),
+        ("abcd~2,5@Tx", "abcd      x"),
+        ("ab~5@Tx~3@Ty", "ab     x   y"),
+        // Zero colinc must not divide by zero.
+        ("~0,0@Tx", "x"),
+        ("ab~0,0Tx", "abx"),
+        // A newline resets the column.
+        ("line1\nab~5Tx", "line1\nab   x"),
+    ] {
+        assert_eq!(
+            format_nil_string(control, &[]),
+            want,
+            "FORMAT {control:?} should match SBCL"
+        );
+    }
+}
+
+/// The current column is a count of CHARACTERS, not bytes: a byte count
+/// overshoots once any multibyte output is already on the line.
+#[test]
+fn format_tilde_t_counts_columns_in_characters_not_bytes() {
+    for (control, want) in [
+        ("\u{3b1}\u{3b2}~5Tx", "\u{3b1}\u{3b2}   x"),
+        ("\u{3b1}\u{3b2}\u{3b3}\u{3b4}\u{3b5}~3,4Tx", "\u{3b1}\u{3b2}\u{3b3}\u{3b4}\u{3b5}  x"),
+        ("\u{3b1}\u{3b2}~3@Tx", "\u{3b1}\u{3b2}   x"),
+        ("\u{65e5}\u{672c}~6Tx", "\u{65e5}\u{672c}    x"),
+    ] {
+        assert_eq!(format_nil_string(control, &[]), want, "FORMAT {control:?}");
+    }
+}

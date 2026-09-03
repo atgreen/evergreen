@@ -2154,29 +2154,48 @@ fn format_impl(
                 }
             }
             'T' => {
-                let colnum = if !params.is_empty() {
-                    resolve_param(&params[0], 1, arg_idx)? as usize
+                // ~colnum,colinc T  — absolute: move to column `colnum`, or if
+                //                    already at/past it, to the next
+                //                    `colnum + k*colinc`.
+                // ~colrel,colinc @T — relative: emit `colrel` spaces, then the
+                //                    fewest more that land on a multiple of
+                //                    `colinc` (CLHS 22.3.6.1). The `@` form was
+                //                    previously falling through to the absolute
+                //                    computation, so `ab~3@Tx` emitted one space
+                //                    instead of three.
+                let first = if !params.is_empty() {
+                    resolve_param(&params[0], 1, arg_idx)?.max(0) as usize
                 } else {
                     1
                 };
                 let colinc = if params.len() > 1 {
-                    resolve_param(&params[1], 1, arg_idx)? as usize
+                    resolve_param(&params[1], 1, arg_idx)?.max(0) as usize
                 } else {
                     1
                 };
-                let cur_col = output
-                    .rfind('\n')
-                    .map(|p| output.len() - p - 1)
-                    .unwrap_or(output.len());
-                if cur_col < colnum {
-                    for _ in 0..(colnum - cur_col) {
-                        output.push(' ');
-                    }
+                // Column is a CHARACTER count, not a byte count — the byte
+                // length overshoots on any multibyte output already on the line.
+                let cur_col = match output.rfind('\n') {
+                    Some(p) => output[p + 1..].chars().count(),
+                    None => output.chars().count(),
+                };
+                let spaces = if at_sign {
+                    let target = cur_col + first;
+                    let extra = if colinc > 0 && target % colinc != 0 {
+                        colinc - (target % colinc)
+                    } else {
+                        0
+                    };
+                    first + extra
+                } else if cur_col < first {
+                    first - cur_col
                 } else if colinc > 0 {
-                    let spaces = colinc - ((cur_col - colnum) % colinc);
-                    for _ in 0..spaces {
-                        output.push(' ');
-                    }
+                    colinc - ((cur_col - first) % colinc)
+                } else {
+                    0
+                };
+                for _ in 0..spaces {
+                    output.push(' ');
                 }
             }
             '*' => {
