@@ -109,9 +109,37 @@ fn with_registry_mut<R>(f: impl FnOnce(&mut PackageRegistry) -> R) -> R {
 }
 
 /// The package named (or nicknamed) `name`, if registered. Case-insensitive.
+/// Run `f` against the registry under a SHARED lock, or return `None` if the
+/// registry still needs its one-time seeding (which requires the write lock).
+fn with_registry<R>(f: impl FnOnce(&PackageRegistry) -> R) -> Option<R> {
+    let guard = REGISTRY.read().expect("package registry poisoned");
+    match guard.as_ref() {
+        Some(reg) if !reg.packages.is_empty() => Some(f(reg)),
+        _ => None,
+    }
+}
+
 pub fn find(name: &str) -> Option<BlissVal> {
-    let key = name.to_uppercase();
-    with_registry_mut(|reg| reg.name_to_package.get(&key).copied())
+    // Two costs mattered here: this was ~8% of an ASDF load, called once per
+    // package per symbol token.
+    //
+    //  * it took the registry's WRITE lock for a read-only lookup, serialising
+    //    every package resolution on it;
+    //  * it allocated an uppercased copy of the name just to hash it, even
+    //    though registry keys are stored uppercase and essentially every caller
+    //    already passes a canonical name.
+    let lookup = |reg: &PackageRegistry| -> Option<BlissVal> {
+        if name.is_ascii() && !name.bytes().any(|b| b.is_ascii_lowercase()) {
+            reg.name_to_package.get(name).copied()
+        } else {
+            reg.name_to_package.get(&name.to_uppercase()).copied()
+        }
+    };
+    // Shared-lock fast path; fall back to the write path only to seed.
+    match with_registry(lookup) {
+        Some(found) => found,
+        None => with_registry_mut(|reg| lookup(reg)),
+    }
 }
 
 /// Whether a package with this name or nickname exists. Case-insensitive.
