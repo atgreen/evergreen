@@ -1512,3 +1512,81 @@ fn format_tilde_t_counts_columns_in_characters_not_bytes() {
         assert_eq!(format_nil_string(control, &[]), want, "FORMAT {control:?}");
     }
 }
+
+// ── Float printed representation (CLHS 22.1.3.1.3) ───────────────
+//
+// A float prints in free format while 10^-3 <= |x| < 10^7 and in exponential
+// notation outside that band. Rust's `{}` never switches to an exponent, so
+// bliss used to print 10000000000.0 for 1.0e10 and 0.0000000001 for 1.0e-10 —
+// both read back correctly, but neither is the representation CL specifies.
+// Expectations captured from SBCL.
+#[test]
+fn single_float_printed_representation_matches_sbcl() {
+    for (x, want) in [
+        // Inside the free-format band.
+        (0.1f32, "0.1"),
+        (1.0, "1.0"),
+        (0.5, "0.5"),
+        (0.001, "0.001"),
+        (100000.0, "100000.0"),
+        (1000000.0, "1000000.0"),
+        // At and beyond the 10^7 boundary.
+        (1.0e7, "1.0e7"),
+        (1.0e10, "1.0e10"),
+        (123456789.0, "1.2345679e8"),
+        (3.4028235e38, "3.4028235e38"),
+        // Below the 10^-3 boundary.
+        (1.0e-4, "1.0e-4"),
+        (1.0e-10, "1.0e-10"),
+        (1.1754944e-38, "1.1754944e-38"),
+        // Zero stays in free format (the |x| != 0 guard).
+        (0.0, "0.0"),
+    ] {
+        assert_eq!(
+            bliss_stdlib::format::single_float_to_string(x),
+            want,
+            "printing {x:e}"
+        );
+    }
+}
+
+/// Whatever spelling is chosen, it must read back as the identical float —
+/// that is the property CL actually requires of the printer.
+#[test]
+fn single_float_printed_representation_round_trips() {
+    for x in [
+        0.1f32,
+        1.0,
+        0.5,
+        0.001,
+        1.0e7,
+        1.0e10,
+        123456789.0,
+        3.4028235e38,
+        1.0e-4,
+        1.0e-10,
+        1.1754944e-38,
+        f32::MIN_POSITIVE,
+        // Smallest subnormal: bliss prints 1.0e-45 where SBCL prints
+        // 1.4012985e-45. Both denote this same value — the shortest
+        // round-tripping decimal is not unique down here — so the round-trip,
+        // not the spelling, is what this asserts.
+        1.4012985e-45,
+        0.0,
+    ] {
+        let s = bliss_stdlib::format::single_float_to_string(x);
+        let back: f32 = s.parse().unwrap_or_else(|e| panic!("{s:?} must re-read: {e}"));
+        assert_eq!(back, x, "{s:?} must read back to the same float");
+    }
+}
+
+/// ~S and ~A go through the same printer, so they inherit the band.
+#[test]
+fn format_s_and_a_print_floats_in_the_clhs_band() {
+    let big = BlissVal::from_single_float(1.0e10);
+    assert_eq!(format_nil_string("~S", &[big]), "1.0e10");
+    assert_eq!(format_nil_string("~A", &[big]), "1.0e10");
+    let small = BlissVal::from_single_float(0.001);
+    assert_eq!(format_nil_string("~S", &[small]), "0.001");
+    assert_eq!(format_nil_string("~A", &[small]), "0.001");
+}

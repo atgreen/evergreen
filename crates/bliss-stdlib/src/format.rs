@@ -710,6 +710,39 @@ fn blissval_to_print_string(v: BlissVal, escapep: bool) -> String {
     s
 }
 
+/// Print a single-float the way CL requires (CLHS 22.1.3.1.3): free format
+/// while `10^-3 <= |x| < 10^7`, exponential notation outside that band, and
+/// always with a decimal point so the result reads back as a float.
+///
+/// Rust's `{}` never switches to an exponent, so bliss used to print
+/// `10000000000.0` for `1.0e10` and `0.0000000001` for `1.0e-10`. Both read
+/// back correctly, but neither is the printed representation CL specifies.
+///
+/// This is the single implementation for BOTH printers — `format`'s
+/// `blissval_to_print_inner` here and the interpreter's `print_val` — which
+/// have drifted before (bliss-i608).
+pub fn single_float_to_string(x: f32) -> String {
+    if x.is_nan() || x.is_infinite() {
+        // Leave the existing non-finite spellings alone; they are not CL
+        // external representations and nothing reads them back.
+        return format!("{x}");
+    }
+    let a = x.abs();
+    if a != 0.0 && (a < 1e-3 || a >= 1e7) {
+        // `{:e}` gives the shortest round-tripping mantissa, but spells a whole
+        // mantissa without a point ("1e10"); CL wants a digit on each side.
+        let s = format!("{x:e}");
+        return match s.split_once('e') {
+            Some((mantissa, exp)) if !mantissa.contains('.') => {
+                format!("{mantissa}.0e{exp}")
+            }
+            _ => s,
+        };
+    }
+    let s = format!("{x}");
+    if s.contains('.') { s } else { format!("{s}.0") }
+}
+
 fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
     if v.is_nil() {
         return "NIL".into();
@@ -760,14 +793,7 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
         };
     }
     if v.is_single_float() {
-        // A CL float always prints with a decimal point (2.0, not 2) so it reads
-        // back as a float — match cli print_val (bliss-kzhq).
-        let s = format!("{}", v.as_single_float());
-        return if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("NaN") {
-            s
-        } else {
-            format!("{s}.0")
-        };
+        return single_float_to_string(v.as_single_float());
     }
     if v.is_symbol() {
         let idx = v.as_symbol_index();

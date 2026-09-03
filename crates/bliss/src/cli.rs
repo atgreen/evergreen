@@ -4520,11 +4520,11 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
             out.push_str(&digits);
         }
     } else if val.is_single_float() {
-        let s = format!("{}", val.as_single_float());
-        out.push_str(&s);
-        if !s.contains('.') && !s.contains('e') {
-            out.push_str(".0");
-        }
+        // Delegate to the stdlib printer so both printers spell floats the same
+        // way (CLHS 22.1.3.1.3 exponential band); they have drifted before.
+        out.push_str(&bliss_stdlib::format::single_float_to_string(
+            val.as_single_float(),
+        ));
     } else if val.is_character() {
         out.push_str("#\\");
         match val.as_char() {
