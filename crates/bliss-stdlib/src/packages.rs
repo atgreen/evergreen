@@ -1107,6 +1107,28 @@ pub fn is_package(value: BlissVal) -> bool {
 }
 
 /// The canonical name of a package handle.
+/// True if `package`'s canonical name is exactly `candidate`.
+///
+/// The reader asks this once per reachable package per symbol token while
+/// walking a use-graph, and [`package_name`] answers it by CLONING the name —
+/// so the comparison cost was one heap allocation per package per token. This
+/// compares in place instead.
+pub fn package_name_eq(package: BlissVal, candidate: &str) -> bool {
+    if !bliss_rt::types::packagep(package) {
+        return false;
+    }
+    let Ok(store) = current_store() else {
+        return false;
+    };
+    let Ok(g) = store.state.read() else {
+        return false;
+    };
+    let Some(pkg) = g.packages.get(&pkg_id(package)) else {
+        return false;
+    };
+    pkg.read().map(|p| p.name == candidate).unwrap_or(false)
+}
+
 pub fn package_name(package: BlissVal) -> Option<String> {
     if !bliss_rt::types::packagep(package) {
         return None;

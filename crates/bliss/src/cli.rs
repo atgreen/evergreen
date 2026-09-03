@@ -5446,9 +5446,10 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
     // of each top-level read; reads never run concurrently and the interpreter is
     // single-threaded, so no other `&mut Env` is live across this call.
     let env = unsafe { &*ptr };
+    // Borrow rather than clone: this runs once per symbol token read.
     let pkg_name = match pkg {
-        Some(p) => resolve_package_name(env, p),
-        None => env.current_package.clone(),
+        Some(p) => resolve_package_name_cow(env, p),
+        None => std::borrow::Cow::Borrowed(env.current_package.as_str()),
     };
     if pkg.is_none() && (pkg_name == "COMMON-LISP" || pkg_name == "COMMON-LISP-USER") {
         return None;
@@ -5996,10 +5997,27 @@ fn default_asdf_output_translations() -> String {
     format!("{home}/.cache/bliss/asdf/")
 }
 
+/// Normalise a package designator: strip a `KEYWORD:`/`:` prefix and upcase.
+///
+/// Returns `Cow::Borrowed` when the input is already in that form, which is the
+/// overwhelmingly common case — package names in a use-graph are stored
+/// canonical, and this runs once per reachable package per symbol token while
+/// the reader resolves a symbol, so the unconditional `to_uppercase()`
+/// allocation was pure churn (it showed up as ~3% of an ASDF load).
 fn normalize_package_name(name: &str) -> String {
-    name.trim_start_matches("KEYWORD:")
-        .trim_start_matches(':')
-        .to_uppercase()
+    normalize_package_name_cow(name).into_owned()
+}
+
+/// Borrowing form of [`normalize_package_name`] for the reader's hot path.
+fn normalize_package_name_cow(name: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = name
+        .trim_start_matches("KEYWORD:")
+        .trim_start_matches(':');
+    if trimmed.bytes().any(|b| b.is_ascii_lowercase()) || !trimmed.is_ascii() {
+        std::borrow::Cow::Owned(trimmed.to_uppercase())
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    }
 }
 
 /// The home package encoded in a symbol's arena key. Mirrors the logic of the
@@ -6074,20 +6092,35 @@ fn name_owned_by_noncl_package(_env: &Env, bare_name: &str) -> bool {
 /// nicknames. Returns the canonical name of the registered package whose name or
 /// nicknames match; if none match, returns the normalized designator unchanged
 /// (so it can name a package about to be created).
-fn resolve_package_name(_env: &Env, raw: &str) -> String {
-    let normalized = normalize_package_name(raw);
+fn resolve_package_name(env: &Env, raw: &str) -> String {
+    resolve_package_name_cow(env, raw).into_owned()
+}
+
+/// Borrowing form of [`resolve_package_name`] for the reader's hot path: the
+/// use-graph walk resolves every reachable package once per symbol token, and
+/// the owned `String` was allocated and dropped immediately in almost every
+/// case.
+fn resolve_package_name_cow<'a>(_env: &Env, raw: &'a str) -> std::borrow::Cow<'a, str> {
+    let normalized = normalize_package_name_cow(raw);
     // Built-in nicknames that must resolve even before the registry is consulted.
-    match normalized.as_str() {
-        "CL" => return "COMMON-LISP".to_string(),
-        "CL-USER" => return "COMMON-LISP-USER".to_string(),
+    match &*normalized {
+        "CL" => return std::borrow::Cow::Borrowed("COMMON-LISP"),
+        "CL-USER" => return std::borrow::Cow::Borrowed("COMMON-LISP-USER"),
         _ => {}
     }
     // The registry resolves a name OR nickname to the package; take its canonical
     // name. If unknown, return the normalized designator unchanged so it can name
     // a package about to be created.
     if let Some(pkg) = bliss_stdlib::find_package(&normalized) {
+        // Usually the designator ALREADY is the canonical name (the use-graph
+        // stores canonical names), so ask whether it matches rather than
+        // cloning the name out to compare — that clone was one allocation per
+        // package per symbol token.
+        if bliss_stdlib::package_name_eq(pkg, &normalized) {
+            return normalized;
+        }
         if let Some(canonical) = bliss_stdlib::package_name(pkg) {
-            return canonical;
+            return std::borrow::Cow::Owned(canonical);
         }
     }
     normalized
@@ -6245,22 +6278,41 @@ fn find_symbol_in_package(
     // symbol while a package is being defined. Memoising collapses each lookup
     // to O(reachable packages) (bliss-lb6.5).
     let bare_upper = bare_name.to_uppercase();
-    let mut visited: HashSet<String> = HashSet::new();
-    find_symbol_in_package_rec(env, pkg_name, &bare_upper, &mut visited)
+    let mut visited: HashSet<u64> = HashSet::new();
+    let Some(root) = bliss_stdlib::find_package(&resolve_package_name_cow(env, pkg_name)) else {
+        return None;
+    };
+    // The special-cased packages are compared by IDENTITY during the walk, so
+    // resolve their handles once here rather than re-deriving a name per step.
+    let cl = bliss_stdlib::find_package("COMMON-LISP");
+    let keyword = bliss_stdlib::find_package("KEYWORD");
+    find_symbol_in_package_rec(env, root, cl, keyword, &bare_upper, &mut visited)
 }
 
+/// Walk a package's use-graph looking for `bare_upper`, recursing on package
+/// HANDLES rather than names.
+///
+/// The name-keyed version turned each used package handle back into a `String`
+/// (an allocation and two lock round-trips per used package, via
+/// `package_name`) only for the recursive call to turn that name straight back
+/// into a handle with `find_package`. Since this runs once per reachable
+/// package per symbol token read, that round-trip was one of the largest costs
+/// of loading a package-heavy file: `package_name` alone was ~5.5% of an ASDF
+/// load. Handles are pinned, so their raw value is a stable identity for the
+/// visited set.
 fn find_symbol_in_package_rec(
     env: &Env,
-    pkg_name: &str,
+    pkg: BlissVal,
+    cl: Option<BlissVal>,
+    keyword: Option<BlissVal>,
     bare_upper: &str,
-    visited: &mut HashSet<String>,
+    visited: &mut HashSet<u64>,
 ) -> Option<(BlissVal, &'static str)> {
-    let pkg_name = resolve_package_name(env, pkg_name);
-    if !visited.insert(pkg_name.clone()) {
+    if !visited.insert(pkg.to_raw()) {
         // Already explored this package on another use-path.
         return None;
     }
-    if pkg_name == "COMMON-LISP" {
+    if cl == Some(pkg) {
         // COMMON-LISP owns a bare name only if it is an already-interned symbol
         // that no user package homes. Never intern here: FIND-SYMBOL must have
         // no side effects, and fabricating a symbol would make COMMON-LISP
@@ -6276,7 +6328,7 @@ fn find_symbol_in_package_rec(
     // but CL-USER exports nothing by default. It now falls through to the general
     // present-symbol lookup below, so an unknown name yields (NIL NIL) and a homed
     // symbol yields :INTERNAL / inherited CL symbols :INHERITED (bliss-6w2y).)
-    if pkg_name == "KEYWORD" {
+    if keyword == Some(pkg) {
         if let Some(sym) = resolve_sym(&format!(":{}", bare_upper)) {
             return Some((sym, "EXTERNAL"));
         }
@@ -6286,23 +6338,18 @@ fn find_symbol_in_package_rec(
     // recurse. Cloning the whole PackageDef here — its entire `symbols` HashMap
     // — on every lookup was a dominant cost while defining ASDF's packages
     // (bliss-gq5.2).
-    let uses = {
-        let pkg = bliss_stdlib::find_package(&pkg_name)?;
-        if let Some(sym) = bliss_stdlib::find_present_symbol(pkg, bare_upper) {
-            let status = if bliss_stdlib::is_external_symbol(pkg, bare_upper) {
-                "EXTERNAL"
-            } else {
-                "INTERNAL"
-            };
-            return Some((sym, status));
-        }
-        bliss_stdlib::package_use_list(pkg)
-            .into_iter()
-            .filter_map(bliss_stdlib::package_name)
-            .collect::<Vec<_>>()
-    };
-    for used in &uses {
-        if let Some((sym, _)) = find_symbol_in_package_rec(env, used, bare_upper, visited) {
+    if let Some(sym) = bliss_stdlib::find_present_symbol(pkg, bare_upper) {
+        let status = if bliss_stdlib::is_external_symbol(pkg, bare_upper) {
+            "EXTERNAL"
+        } else {
+            "INTERNAL"
+        };
+        return Some((sym, status));
+    }
+    for used in bliss_stdlib::package_use_list(pkg) {
+        if let Some((sym, _)) =
+            find_symbol_in_package_rec(env, used, cl, keyword, bare_upper, visited)
+        {
             return Some((sym, "INHERITED"));
         }
     }
