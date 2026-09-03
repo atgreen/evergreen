@@ -385,6 +385,50 @@ static LOADED_COMPILER_MACRO_FUNCTIONS: LazyLock<
     Mutex<Vec<Weak<Mutex<bliss_rt::bytecode::BytecodeFunction>>>>,
 > = LazyLock::new(|| Mutex::new(Vec::new()));
 
+
+/// How many arguments a call can root on the stack before spilling to the heap.
+/// Calls with more than this are rare; 8 covers essentially all of them.
+const ROOTED_ARGS_INLINE: usize = 8;
+
+/// Root an argument slice for the rest of the enclosing scope WITHOUT
+/// heap-allocating for common arities, binding `$name` to the rooted slice.
+///
+/// The obvious spelling, `rooted!(args = args.to_vec())`, allocates a Vec on
+/// every call purely to have something the collector can own and rewrite — and
+/// a single interpreted call went through that three times over
+/// (`apply_function` -> `eval_lambda_call` -> `bind_lambda_list_ex`), so it was
+/// three mallocs per call. Measured at ~746 instructions per call for the
+/// `apply_function` one alone (bliss-lxpg.1).
+///
+/// Instead: copy into a stack array and root THAT, spilling to a heap Vec only
+/// beyond `ROOTED_ARGS_INLINE`. Both buffers and both guards are created before
+/// the branch so the guards outlive the borrow taken from whichever is used;
+/// creating a guard inside the `if` would drop it at the end of that block.
+/// `rooted!` (owning + `Deref`) is required rather than `rooted_ref!`, which
+/// holds a `&mut` that would conflict with the slice borrow taken afterwards.
+///
+/// Safety contract, unchanged from the `to_vec` form: the caller's slice must
+/// itself be reachable by the collector (its elements rewritten in place) for
+/// the copy below to read live values.
+macro_rules! rooted_args {
+    ($name:ident = $src:expr) => {
+        let src: &[BlissVal] = $src;
+        let n = src.len();
+        bliss_rt::rooted!(inline_buf = [NIL; ROOTED_ARGS_INLINE]);
+        bliss_rt::rooted!(spill_buf = Vec::<BlissVal>::new());
+        if n <= ROOTED_ARGS_INLINE {
+            inline_buf[..n].copy_from_slice(src);
+        } else {
+            *spill_buf = src.to_vec();
+        }
+        let $name: &[BlissVal] = if n <= ROOTED_ARGS_INLINE {
+            &inline_buf[..n]
+        } else {
+            &spill_buf
+        };
+    };
+}
+
 fn arena_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
     ARENA.with(|a| a.borrow_mut().alloc_cons(car, cdr))
 }
@@ -4396,9 +4440,9 @@ fn eval_lambda_call(
     // fallback for forms the compiler does not yet handle.
     bliss_rt::rooted!(params_form = params_form);
     bliss_rt::rooted!(body = body);
-    bliss_rt::rooted!(args = args.to_vec());
+    rooted_args!(args = args);
     with_child_frame(env, parent, |env| {
-        bind_lambda_list(*params_form, &args, env)?;
+        bind_lambda_list(*params_form, args, env)?;
         // Arguments are a single-value context; a producer evaluated as an
         // argument (or an &optional/&key default) must not leak its extra values
         // into the body. The body's tail form establishes this call's values.
@@ -18695,9 +18739,7 @@ fn bind_lambda_list_ex(
     // both the params cursor and the remaining unread args. The deferred &key
     // default forms are held in a separately-rooted Vec so they survive from
     // collection to the post-loop keyword pass.
-    let mut args_owned: Vec<BlissVal> = args.to_vec();
-    bliss_rt::rooted_ref!(_args_guard = &mut args_owned);
-    let args: &[BlissVal] = &args_owned;
+    rooted_args!(args = args);
     let mut key_default_forms: Vec<BlissVal> = Vec::new();
     bliss_rt::rooted_ref!(_key_defaults_guard = &mut key_default_forms);
     let mut key_specs: Vec<(String, String, usize, Option<String>)> = Vec::new();
@@ -21280,8 +21322,7 @@ fn apply_function(
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
     bliss_rt::rooted_ref!(_fn_val_root = &mut fn_val);
-    bliss_rt::rooted!(args = args.to_vec());
-    let args: &[BlissVal] = &args;
+    rooted_args!(args = args);
     // Function could be a lambda form, a symbol naming a function, or a closure
     if fn_val.is_symbol() {
         let name = sym_name_rc(fn_val);

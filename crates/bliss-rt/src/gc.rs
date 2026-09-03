@@ -2348,6 +2348,18 @@ impl<T: TraceHostRoots> TraceHostRoots for Vec<T> {
     }
 }
 
+/// Roots a fixed-size array in place, so a caller can root a small, stack-
+/// resident argument buffer instead of heap-allocating a `Vec` to root
+/// (bliss-lxpg.1). Every element is visited, so unused trailing slots must hold
+/// a traceable value — `NIL` is the natural filler.
+impl<T: TraceHostRoots, const N: usize> TraceHostRoots for [T; N] {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
+        for value in self {
+            value.trace_host_roots(visit);
+        }
+    }
+}
+
 impl<T: TraceHostRoots> TraceHostRoots for Option<T> {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
         if let Some(value) = self {
