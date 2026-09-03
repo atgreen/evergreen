@@ -625,11 +625,84 @@ fn is_closure_cons(v: BlissVal) -> bool {
 /// Ensure the mantissa of a `{:E}`-formatted float carries a decimal point so it
 /// reads back as a float (CL ~E always shows one): "1E-3" → "1.0E-3";
 /// "1.2345E3" is unchanged.
-fn exp_with_decimal_point(s: &str) -> String {
-    match s.split_once('E') {
-        Some((mant, exp)) if !mant.contains('.') => format!("{mant}.0E{exp}"),
-        _ => s.to_string(),
+/// Round/pad a plain decimal string to exactly `d` fraction digits.
+///
+/// `~F` must round the float's SHORTEST ROUND-TRIPPING DECIMAL, which is the
+/// float's printed value, not its exact binary value. Doing the rounding in
+/// f64 is not good enough at large magnitudes: the f32 3.4028235e38 has the
+/// shortest decimal 340282350000000000000000000000000000000, and neither that
+/// decimal nor the original binary value is exactly representable in f64, so
+/// `{:.3}` produced 340282349999999991754788743781432688640.000. Operating on
+/// the digit string sidesteps binary representation entirely.
+///
+/// `s` is a Rust `{}`-formatted float: never exponential, optional leading `-`,
+/// optional single `.`. Ties round away from zero.
+fn round_decimal_string(s: &str, d: usize) -> String {
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (body, ""),
+    };
+    let sign = if neg { "-" } else { "" };
+
+    if frac_part.len() <= d {
+        let pad = "0".repeat(d - frac_part.len());
+        return format!("{sign}{int_part}.{frac_part}{pad}");
     }
+
+    // A leading sentinel digit gives a carry out of the most significant place
+    // somewhere to land (9.6 -> 10 at d=0).
+    let mut digits: Vec<u8> = std::iter::once(0u8)
+        .chain(int_part.bytes().map(|b| b - b'0'))
+        .chain(frac_part.bytes().map(|b| b - b'0'))
+        .collect();
+    let int_len = int_part.len() + 1;
+    let cut = int_len + d;
+    let round_up = digits[cut] >= 5;
+    digits.truncate(cut);
+    if round_up {
+        let mut i = cut;
+        while i > 0 {
+            i -= 1;
+            if digits[i] == 9 {
+                digits[i] = 0;
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+    }
+
+    let to_str = |ds: &[u8]| -> String { ds.iter().map(|d| (d + b'0') as char).collect() };
+    let int_s = to_str(&digits[..int_len]);
+    let int_s = int_s.trim_start_matches('0');
+    let int_s = if int_s.is_empty() { "0" } else { int_s };
+    format!("{sign}{int_s}.{}", to_str(&digits[int_len..]))
+}
+
+fn exp_with_decimal_point(s: &str, exp_char: char) -> String {
+    let Some((mant, exp)) = s.split_once('E') else {
+        return s.to_string();
+    };
+    // CL always shows a digit on each side of the point, and the exponent
+    // ALWAYS carries its sign (CLHS 22.3.3.2) — Rust's `{:E}` writes neither,
+    // so `1E10` has to become `1.0e+10`. The marker case comes from the
+    // directive's exponent-char parameter (default lowercase `e`), not from
+    // Rust's formatter.
+    let mant = if mant.contains('.') {
+        mant.to_string()
+    } else {
+        format!("{mant}.0")
+    };
+    let exp = if exp.starts_with('-') || exp.starts_with('+') {
+        exp.to_string()
+    } else {
+        format!("+{exp}")
+    };
+    format!("{mant}{exp_char}{exp}")
 }
 
 /// CL `~E` with an explicit fraction-digit count `d` (CLHS 22.3.3.2).
@@ -1975,9 +2048,45 @@ fn format_impl(
                 } else {
                     None
                 };
+                let shortest = if val.is_single_float() {
+                    format!("{}", val.as_single_float())
+                } else {
+                    format!("{f}")
+                };
+                // With an explicit digit count there are two regimes, and CL
+                // uses both (verified against SBCL):
+                //
+                //  * asking for MORE fraction digits than the shortest decimal
+                //    carries is just padding — the extra digits are not
+                //    information the float has. ~,3F of 3.4028235e38 is
+                //    ...350000000000000000000000000000000.000, NOT the exact
+                //    binary value ...346638528859811704183484516925440.000.
+                //  * asking for FEWER means rounding, and that rounds the
+                //    float's EXACT value. f32 -> f64 is lossless and a binary
+                //    fraction always terminates in decimal, so `{:.150}` is the
+                //    exact expansion (150 places covers the smallest subnormal).
+                //    ~,2F of 1.005 is 1.00 because that f32 is really
+                //    1.00499999523162841796875 — rounding the shortest decimal
+                //    "1.005" would wrongly give 1.01. Ties go away from zero
+                //    (~,1F of 0.25 is 0.3); Rust's `{:.1}` rounds half to even
+                //    and would give 0.2.
+                let shortest_frac = shortest.split_once('.').map_or(0, |(_, fr)| fr.len());
                 let mut s = match d {
-                    Some(dd) => format!("{:.*}", dd, f),
-                    None => format!("{}", f),
+                    Some(dd) if shortest_frac <= dd => round_decimal_string(&shortest, dd),
+                    Some(dd) => round_decimal_string(&format!("{f:.150}"), dd),
+                    None => {
+                        // No fraction-digit count: the shortest decimal as-is.
+                        // Going via the widened f64 exposed binary32 noise, so
+                        // ~F of 1.0e-10 printed 0.0000000001000000013351432
+                        // (the trap bliss-8zrb fixed for ~E/~G). Rust's `{}`
+                        // never switches to an exponent, which is what ~F
+                        // wants; CL still requires the point.
+                        let mut t = shortest.clone();
+                        if !t.contains('.') {
+                            t.push_str(".0");
+                        }
+                        t
+                    }
                 };
                 // ~@F prints a leading + on a non-negative value (CLHS 22.3.3.1).
                 if at_sign && f >= 0.0 {
@@ -2031,7 +2140,7 @@ fn format_impl(
                     } else {
                         format!("{:E}", f)
                     };
-                    output.push_str(&exp_with_decimal_point(&s));
+                    output.push_str(&exp_with_decimal_point(&s, exp_char));
                 } else {
                     output.push_str(&format_e_fixed(
                         f,

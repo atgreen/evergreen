@@ -1590,3 +1590,70 @@ fn format_s_and_a_print_floats_in_the_clhs_band() {
     assert_eq!(format_nil_string("~S", &[small]), "0.001");
     assert_eq!(format_nil_string("~A", &[small]), "0.001");
 }
+
+// ── ~F / ~E against SBCL ground truth (bliss-pi0z) ───────────────
+//
+// ~F never uses an exponent and always shows the decimal point, including at
+// zero fraction digits ("4." not "4"). ~E's exponent always carries its sign
+// and uses a lowercase marker by default.
+//
+// The subtle part is WHICH value ~F rounds, and CL uses two regimes:
+//   * more fraction digits requested than the shortest decimal carries -> pad
+//     with zeros (the float has no more information), so ~,3F of 3.4028235e38
+//     is ...350000000000000000000000000000000.000, not the exact binary value
+//     ...346638528859811704183484516925440.000;
+//   * fewer -> round the EXACT binary value, ties away from zero. ~,2F of
+//     1.005 is 1.00 because that f32 is really 1.00499999523162841796875,
+//     while ~,1F of 0.25 is 0.3 because that f32 is exactly 0.25.
+#[test]
+fn format_fixed_and_exponential_floats_match_sbcl() {
+    let f = |x: f32| BlissVal::from_single_float(x);
+    for (control, x, want) in [
+        // ~F with no digit count: shortest decimal, never exponential.
+        ("~F", 1.0e10f32, "10000000000.0"),
+        ("~F", 1.0e-10, "0.0000000001"),
+        ("~F", 0.001, "0.001"),
+        ("~F", 123456789.0, "123456790.0"),
+        ("~F", 3.4028235e38, "340282350000000000000000000000000000000.0"),
+        ("~F", 0.0, "0.0"),
+        // Padding regime: fewer fraction digits available than requested.
+        ("~,3F", 123456789.0, "123456790.000"),
+        ("~,3F", 3.4028235e38, "340282350000000000000000000000000000000.000"),
+        ("~,3F", 0.5, "0.500"),
+        // Rounding regime, exact value, ties away from zero.
+        ("~,2F", 1.005, "1.00"),
+        ("~,1F", 0.25, "0.3"),
+        ("~,1F", 0.15, "0.2"),
+        ("~,1F", 9.96, "10.0"),
+        ("~,2F", 99.999, "100.00"),
+        ("~,2F", 12345.678, "12345.68"),
+        ("~,3F", 0.0001, "0.000"),
+        // Zero fraction digits still prints the point.
+        ("~,0F", 3.7, "4."),
+        ("~,0F", 3.2, "3."),
+        ("~,0F", -3.7, "-4."),
+        ("~,0F", 1.5, "2."),
+        ("~,0F", 2.5, "3."),
+        ("~,0F", 9.6, "10."),
+        // Width padding and the @ sign flag.
+        ("~10,2F", 1.0e-10, "      0.00"),
+        ("~@F", 0.5, "+0.5"),
+        ("~@F", -0.25, "-0.25"),
+        // ~E: signed exponent, lowercase marker.
+        ("~E", 1.0e10, "1.0e+10"),
+        ("~E", 1.0e-10, "1.0e-10"),
+        ("~E", 0.001, "1.0e-3"),
+        ("~E", 1.0e7, "1.0e+7"),
+        ("~E", 123456789.0, "1.2345679e+8"),
+        ("~E", 0.5, "5.0e-1"),
+        ("~E", 0.0, "0.0e+0"),
+        ("~,3E", 1.0e10, "1.000e+10"),
+        ("~,3E", 123456789.0, "1.235e+8"),
+    ] {
+        assert_eq!(
+            format_nil_string(control, &[f(x)]),
+            want,
+            "FORMAT {control:?} on {x:e} should match SBCL"
+        );
+    }
+}

@@ -2116,12 +2116,12 @@ fn uncaught_nonlocal_exit_is_catchable_control_error() {
 #[test]
 fn format_exponential_shortest_float() {
     let cases = [
-        ("(format nil \"~e\" 0.001)", "\"1.0E-3\""),
-        ("(format nil \"~e\" 1234.5)", "\"1.2345E3\""),
-        ("(format nil \"~e\" 1.0)", "\"1.0E0\""),
-        ("(format nil \"~e\" 0.1)", "\"1.0E-1\""),
-        ("(format nil \"~e\" -0.5)", "\"-5.0E-1\""),
-        ("(format nil \"~e\" 12)", "\"1.2E1\""),
+        ("(format nil \"~e\" 0.001)", "\"1.0e-3\""),
+        ("(format nil \"~e\" 1234.5)", "\"1.2345e+3\""),
+        ("(format nil \"~e\" 1.0)", "\"1.0e+0\""),
+        ("(format nil \"~e\" 0.1)", "\"1.0e-1\""),
+        ("(format nil \"~e\" -0.5)", "\"-5.0e-1\""),
+        ("(format nil \"~e\" 12)", "\"1.2e+1\""),
         ("(format nil \"~g\" 0.001)", "\"0.001\""),
     ];
     for (expr, expected) in cases {
@@ -4089,7 +4089,7 @@ fn format_fixed_float_directive() {
         ("(format nil \"~,2f\" 3.14159)", "\"3.14\""),
         ("(format nil \"~,3f\" 3.14159)", "\"3.142\""),
         ("(format nil \"~8,2f\" 3.14159)", "\"    3.14\""),
-        ("(format nil \"~,0f\" 3.7)", "\"4\""),
+        ("(format nil \"~,0f\" 3.7)", "\"4.\""),
         ("(format nil \"~f\" 2.5)", "\"2.5\""),
     ];
     for (expr, expected) in cases {
