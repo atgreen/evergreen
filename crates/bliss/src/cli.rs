@@ -9729,7 +9729,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let (val_form, r2) = cp(r);
                     bliss_rt::rooted!(r2 = r2);
                     if sym_form.is_symbol() {
-                        if let Some(expansion) = env.lookup_symbol_macro(sym_form) {
+                        if let Some(mut expansion) = env.lookup_symbol_macro(sym_form) {
+                            // `resolve_sym` interns, so it allocates and can fire a
+                            // relocating minor GC. It is evaluated as the FIRST
+                            // argument, i.e. before the inner conses run, so the
+                            // expansion and the value form must be rooted across it
+                            // — rooting them inside `arena_cons` would come too
+                            // late, it would only root already-stale copies
+                            // (bliss-6b2 #2).
+                            let mut val_form = val_form;
+                            bliss_rt::rooted_ref!(_exp_root = &mut expansion);
+                            bliss_rt::rooted_ref!(_vf_root = &mut val_form);
                             let setf_form = arena_cons(
                                 resolve_sym("SETF").unwrap_or(NIL),
                                 arena_cons(expansion, arena_cons(val_form, NIL)),
@@ -9768,7 +9778,11 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     bliss_rt::rooted!(r2 = r2);
                     bliss_rt::rooted!(val = eval_form(*val_form, env)?);
                     if place.is_symbol() {
-                        if let Some(expansion) = env.lookup_symbol_macro(*place) {
+                        if let Some(mut expansion) = env.lookup_symbol_macro(*place) {
+                            // `resolve_sym` interns and so can relocate the nursery
+                            // before the inner conses run; `val_form` is already
+                            // rooted above, `expansion` was not (bliss-6b2 #2).
+                            bliss_rt::rooted_ref!(_exp_root = &mut expansion);
                             let setf_form = arena_cons(
                                 resolve_sym("SETF").unwrap_or(NIL),
                                 arena_cons(expansion, arena_cons(*val_form, NIL)),
