@@ -871,6 +871,21 @@ pub(super) fn env_has_setf_writer(place_name: &str) -> bool {
 }
 
 fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
+    callable_body_inner(env, name, None)
+}
+
+/// [`callable_body`] for a call whose callee is a SYMBOL: identical resolution
+/// order, but the global-function step is reached from the symbol's registry
+/// INDEX instead of re-hashing its name.
+fn callable_body_of_symbol(env: &Env, sym: BlissVal, name: &str) -> Option<(BlissVal, BlissVal)> {
+    callable_body_inner(env, name, Some(sym.as_symbol_index()))
+}
+
+fn callable_body_inner(
+    env: &Env,
+    name: &str,
+    sym_idx: Option<u32>,
+) -> Option<(BlissVal, BlissVal)> {
     if let Some(fdef) = env.funs.borrow().get(name) {
         return Some((fdef.params_form, fdef.body));
     }
@@ -882,7 +897,13 @@ fn callable_body(env: &Env, name: &str) -> Option<(BlissVal, BlissVal)> {
     }) {
         return Some(pb);
     }
-    let f = global_fn(name)?;
+    let f = match sym_idx {
+        Some(idx) => {
+            let cell = bliss_rt::symbols::symbol_function(idx)?;
+            bliss_rt::function::is_interpreted_function(cell).then_some(cell)?
+        }
+        None => global_fn(name)?,
+    };
     if !bytecode::profiling_disabled() {
         bliss_rt::function::record_invocation(f);
     }
@@ -21224,7 +21245,7 @@ fn apply_function(
     // Function could be a lambda form, a symbol naming a function, or a closure
     if fn_val.is_symbol() {
         let name = sym_name(fn_val);
-        if let Some((mut params_form, mut body)) = callable_body(env, &name) {
+        if let Some((mut params_form, mut body)) = callable_body_of_symbol(env, fn_val, &name) {
             // Root across a possible lazy compile below (compile_function
             // allocates/GCs), since these locals feed eval_lambda_call later.
             bliss_rt::rooted_ref!(_params_form_root = &mut params_form);
