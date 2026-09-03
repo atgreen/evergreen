@@ -4838,6 +4838,46 @@ fn princ_val_env(val: BlissVal, env: &mut Env, out: &mut String) {
 }
 
 // ── Symbol name lookup ────────────────────────────────────────────
+thread_local! {
+    /// Interned symbol index -> its name, so the hot call path can borrow a
+    /// name instead of allocating one.
+    ///
+    /// `sym_name` returns an owned `String`, so every interpreted call through a
+    /// symbol callee paid a malloc + copy + free just to obtain a `&str` it uses
+    /// for a few map lookups and drops. A symbol's name never changes, and the
+    /// registry pins its objects, so the mapping is stable for the process.
+    /// Indices are dense and small for interned symbols, so a Vec is the right
+    /// shape; uninterned indices (the high range) are not cached.
+    static SYM_NAME_CACHE: RefCell<Vec<Option<std::rc::Rc<str>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// [`sym_name`] without the allocation: a shared, cached handle to the name.
+/// Use where the name is only borrowed (map keys, comparisons).
+fn sym_name_rc(val: BlissVal) -> std::rc::Rc<str> {
+    if !val.is_symbol() || val.is_nil() || val == T {
+        return std::rc::Rc::from(sym_name(val).as_str());
+    }
+    let idx = val.as_symbol_index();
+    // Uninterned symbols live at the top of the index space; caching them would
+    // size the Vec by the raw index.
+    if bliss_rt::symbols::is_uninterned(idx) {
+        return std::rc::Rc::from(sym_name(val).as_str());
+    }
+    SYM_NAME_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let i = idx as usize;
+        if i >= c.len() {
+            c.resize(i + 1, None);
+        }
+        if let Some(name) = &c[i] {
+            return std::rc::Rc::clone(name);
+        }
+        let name: std::rc::Rc<str> = std::rc::Rc::from(sym_name(val).as_str());
+        c[i] = Some(std::rc::Rc::clone(&name));
+        name
+    })
+}
+
 fn sym_name(val: BlissVal) -> String {
     if val.is_nil() {
         return "NIL".into();
@@ -21244,7 +21284,7 @@ fn apply_function(
     let args: &[BlissVal] = &args;
     // Function could be a lambda form, a symbol naming a function, or a closure
     if fn_val.is_symbol() {
-        let name = sym_name(fn_val);
+        let name = sym_name_rc(fn_val);
         if let Some((mut params_form, mut body)) = callable_body_of_symbol(env, fn_val, &name) {
             // Root across a possible lazy compile below (compile_function
             // allocates/GCs), since these locals feed eval_lambda_call later.
@@ -21261,7 +21301,7 @@ fn apply_function(
             // bliss-jtc.23.3). Guard on no lexical FLET/LABELS shadow so a local
             // binding is never redirected to the global registry entry.
             let mut call_parent = Rc::clone(&env.frame);
-            if !env.funs.borrow().contains_key(&name) {
+            if !env.funs.borrow().contains_key(&*name) {
                 // Lazy compile when hot (bliss-x5y) — this path handles a global
                 // function reached through funcall/apply or the c2i fallback from
                 // compiled code (e.g. a call inside a compiled top-level thunk).
@@ -21291,7 +21331,7 @@ fn apply_function(
             }
             return res;
         }
-        if env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name) {
+        if env.generics.borrow().contains_key(&*name) || env.methods.borrow().contains_key(&*name) {
             return invoke_generic_function(&name, args, env);
         }
         // Faithful fast path: the hot numeric/comparison builtins dispatch
@@ -21314,7 +21354,7 @@ fn apply_function(
         // conses for every unary call, which made shallow recursive list walks
         // consume memory in proportion to total calls (bliss-jql).
         if matches!(
-            name.as_str(),
+            &*name,
             "CAR" | "FIRST" | "CDR" | "REST" | "NULL" | "NOT" | "CONSP" | "ATOM" | "LISTP"
         ) {
             env.clear_mv();
