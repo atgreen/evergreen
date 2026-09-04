@@ -7468,7 +7468,10 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
         }
     } else if package_name == "KEYWORD" {
         for (idx, name) in bliss_rt::symbols::interned_names() {
-            if name.starts_with(':') {
+            // Keywords are interned under "KEYWORD:NAME" registry keys (see
+            // read_symbol_token), not a bare ":" prefix — matching ':' here
+            // enumerated nothing (bliss-u5vq).
+            if name.starts_with("KEYWORD:") {
                 seen.entry(name.clone())
                     .or_insert(BlissVal::from_symbol_index(idx));
             }

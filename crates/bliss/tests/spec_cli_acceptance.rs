@@ -2104,6 +2104,19 @@ fn package_storage_is_registry_backed() {
         ),
         "(NIL \"NEWP\")"
     );
+    // DO-EXTERNAL-SYMBOLS over KEYWORD enumerates interned keywords — the
+    // registry keys them "KEYWORD:NAME", not with a bare ":" prefix
+    // (bliss-u5vq, which made this enumeration silently empty).
+    assert_eq!(
+        eval_ok(
+            "(progn (list :u5vq-kw-a :u5vq-kw-b)
+                    (let ((a nil))
+                      (do-external-symbols (s :keyword) (push s a))
+                      (list (and (member :u5vq-kw-a a) t)
+                            (and (member :u5vq-kw-b a) t))))"
+        ),
+        "(T T)"
+    );
     // CLHS 11.1.1.2.1 (bliss-jnzb): a package inherits only the EXTERNAL
     // symbols of directly-used packages — internal symbols are not inherited,
     // use is not transitive, and DO-EXTERNAL-SYMBOLS enumerates exports only.
