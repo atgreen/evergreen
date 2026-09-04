@@ -145,6 +145,13 @@ fn large_object_is_never_moved_across_repeated_major_collections() {
     let large = alloc.alloc_large(2048).expect("large object");
     unsafe { *(large as *mut u64) = 0x00BA_DA55 };
     let large_addr = large as u64;
+    // Root the object so it legitimately SURVIVES the collections — an
+    // unreferenced large object (single- or multi-region) is now reclaimed
+    // (bliss-jg6g/bliss-hy5v). This test asserts a surviving large object is
+    // never MOVED (R3.19), not the old leak. 2048 bytes fits the inline size
+    // field, so the value is the small-header tagged pointer, body − 8.
+    let saved = bliss_rt::gc::get_entry_continuation();
+    bliss_rt::gc::set_entry_continuation(unsafe { BlissVal::from_heap_ptr(large.sub(8)) });
 
     // Churn the heap and force repeated major collections.
     for _ in 0..3 {
@@ -169,6 +176,7 @@ fn large_object_is_never_moved_across_repeated_major_collections() {
     })
     .expect("walk_heap");
     assert!(found, "large object still walkable at its original address");
+    bliss_rt::gc::set_entry_continuation(saved);
 }
 
 /// A PINNED large object must be retained across a major GC even with no
@@ -226,6 +234,68 @@ fn dead_single_region_large_object_is_reclaimed_by_a_major_gc() {
     assert_eq!(
         after, before,
         "large-object accounting should return to baseline after the dead object is freed"
+    );
+}
+
+#[test]
+fn multi_region_large_object_is_swept_as_a_unit() {
+    // bliss-hy5v: (a) a LIVE multi-region large object keeps its continuation
+    // regions across a major GC — the old per-region free arm freed a
+    // zero-live continuation out from under the live start, handing the
+    // object's tail to the next allocation; and (b) once dead, the whole span
+    // (start + continuations) is reclaimed together, closing the leak that the
+    // interim force-live workaround left.
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cfg = gc_config();
+    cfg.region_size = 2 * 1024 * 1024;
+    cfg.heap_size = 32 * 1024 * 1024;
+    cfg.heap_max = 64 * 1024 * 1024;
+    cfg.nursery_size = 4 * 1024 * 1024;
+    init_heap(&cfg).expect("init_heap");
+
+    let before = bliss_rt::heap_stats().large_object_bytes;
+    // A 5 MiB body spans 3 consecutive 2 MiB regions: 1 start + 2 continuations.
+    let body_size = 5 * 1024 * 1024;
+    let body = bliss_rt::gc::alloc_typed(body_size, type_id::SIMPLE_BASE_STRING)
+        .expect("alloc multi-region large object");
+    // Stamp the first and LAST payload bytes; the last lives in the final
+    // continuation region and detects tail reuse/zeroing.
+    unsafe {
+        *body.add(8) = 0xAB;
+        *body.add(body_size - 1) = 0xCD;
+    }
+    let during = bliss_rt::heap_stats().large_object_bytes;
+    assert!(during > before, "large object accounted after allocation");
+
+    // (a) Rooted via the entry continuation (large payload offset is 16, so
+    // the tagged value is body - 16), the object must survive a full GC with
+    // its continuation-region tail intact.
+    let saved = bliss_rt::gc::get_entry_continuation();
+    bliss_rt::gc::set_entry_continuation(unsafe { BlissVal::from_heap_ptr(body.sub(16)) });
+    full_gc().expect("full_gc (live)");
+    let live_after = bliss_rt::heap_stats().large_object_bytes;
+    assert_eq!(
+        live_after, during,
+        "a LIVE multi-region large object must stay fully accounted across a major GC"
+    );
+    unsafe {
+        assert_eq!(*body.add(8), 0xAB, "head byte survived");
+        assert_eq!(
+            *body.add(body_size - 1),
+            0xCD,
+            "tail byte in the last continuation region survived"
+        );
+    }
+
+    // (b) Unrooted, the whole span is reclaimed and accounting returns to
+    // baseline (previously it force-lived forever).
+    bliss_rt::gc::set_entry_continuation(saved);
+    full_gc().expect("full_gc (dead)");
+    let after = bliss_rt::heap_stats().large_object_bytes;
+    assert_eq!(
+        after, before,
+        "a dead multi-region large object must be reclaimed whole \
+         (before={before}, during={during}, after={after})"
     );
 }
 

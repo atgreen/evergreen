@@ -2137,19 +2137,17 @@ impl Collector for HeapCollector {
                         let _ = body_size;
                         if !unsafe { header_is_forwarded(header_ptr) } {
                             let body_addr = cursor + OBJECT_HEADER_SIZE;
-                            // bliss-jg6g: a single-region large object (footprint
-                            // within one region) is marked by reachability like
-                            // any other object, so an unreferenced one is
-                            // reclaimed by the LargeObject free arm below. A
-                            // MULTI-region large object stays force-live: its
-                            // continuation regions carry no header at their base,
-                            // so per-region liveness cannot be computed safely
-                            // (freeing a continuation while the start is live
-                            // would corrupt) — that is a separate, rarer case.
-                            let large_multiregion = region.header.kind
-                                == RegionKind::LargeObject
-                                && (top - base) > region_size;
-                            if large_multiregion || marked.contains(&body_addr) {
+                            // Large objects (single- AND multi-region) are
+                            // marked by reachability like any other object
+                            // (bliss-jg6g / bliss-hy5v): the start region's
+                            // live_bytes records the whole footprint, and the
+                            // unit-based large-object free pass below frees or
+                            // retains a multi-region object's continuation
+                            // regions together with their start — never
+                            // per-region (a continuation carries no header at
+                            // its base, so per-region liveness is meaningless
+                            // there).
+                            if marked.contains(&body_addr) {
                                 live += total_size as u32;
                             } else {
                                 // Object is dead — queue for finalization.
@@ -2318,6 +2316,66 @@ impl Collector for HeapCollector {
         let mut old_gen_used: u64 = 0;
         let mut regions_freed: u32 = 0;
 
+        // Large objects are freed as UNITS (bliss-hy5v): a multi-region large
+        // object's continuation regions carry no object header — their
+        // alloc_top stays at base — so per-region liveness is meaningless
+        // there, and the old per-region arm freed a zero-live continuation out
+        // from under a still-live start region (handing its tail to the next
+        // allocation). Walk regions by index: a LargeObject region with
+        // alloc_top > base is a START whose footprint spans
+        // ceil(footprint/region_size) CONSECUTIVE regions (alloc_large takes
+        // them contiguously); everything in that span lives or dies with the
+        // start's reachability-derived live_bytes.
+        let n_regions = state.regions.len();
+        let mut large_spans: Vec<(usize, usize, usize, bool)> = Vec::new();
+        {
+            let mut i = 0;
+            while i < n_regions {
+                let region = &state.regions[i];
+                if region.header.kind != RegionKind::LargeObject {
+                    i += 1;
+                    continue;
+                }
+                let base = region.base as usize;
+                let footprint = (region.header.alloc_top as usize).saturating_sub(base);
+                if footprint == 0 {
+                    // A continuation whose start was not seen (cannot happen for
+                    // a well-formed heap, since starts precede continuations);
+                    // leave it alone rather than freeing blind.
+                    i += 1;
+                    continue;
+                }
+                let span = footprint.div_ceil(region_size).max(1);
+                let pinned = unsafe { header_is_pinned(base as *const u8) };
+                let dead = region.header.live_bytes == 0 && !pinned;
+                large_spans.push((i, span, footprint, dead));
+                i += span;
+            }
+        }
+        for &(start, span, footprint, dead) in &large_spans {
+            if !dead {
+                continue;
+            }
+            state.stats.large_object_bytes = state
+                .stats
+                .large_object_bytes
+                .saturating_sub(footprint as u64);
+            // The span's regions are consecutive slices of one contiguous
+            // memory range starting at the start region's base; zero the whole
+            // footprint once.
+            unsafe {
+                std::ptr::write_bytes(state.regions[start].base, 0, footprint);
+            }
+            for j in start..start + span {
+                let region = &mut state.regions[j];
+                region.header.kind = RegionKind::Free;
+                region.header.alloc_top = region.base;
+                region.header.gen_age = 0;
+                region.header.live_bytes = 0;
+                regions_freed += 1;
+            }
+        }
+
         for region in state.regions.iter_mut() {
             match region.header.kind {
                 RegionKind::OldGen => {
@@ -2343,33 +2401,10 @@ impl Collector for HeapCollector {
                     }
                 }
                 RegionKind::LargeObject => {
-                    // A pinned large object (alloc_pinned_typed's large path sets
-                    // the PINNED bit on the object header at `base`) promises a
-                    // stable address, so its region must never be reclaimed —
-                    // even when the collector marks it dead. The OldGen and
-                    // Survivor arms already guard on this; the LargeObject arm
-                    // did not, so a dead-but-pinned large object (e.g. an
-                    // addressed FFI buffer no longer referenced from the heap)
-                    // would be zeroed and freed under the caller (bliss-7puh).
-                    // A large object occupies its region from `base`, so the
-                    // first header's bit is authoritative.
-                    let size =
-                        (region.header.alloc_top as usize).saturating_sub(region.base as usize);
-                    let pinned =
-                        size > 0 && unsafe { header_is_pinned(region.base as *const u8) };
-                    if region.header.live_bytes == 0 && !pinned {
-                        state.stats.large_object_bytes =
-                            state.stats.large_object_bytes.saturating_sub(size as u64);
-                        if size > 0 {
-                            unsafe {
-                                std::ptr::write_bytes(region.base, 0, size);
-                            }
-                        }
-                        region.header.kind = RegionKind::Free;
-                        region.header.alloc_top = region.base;
-                        region.header.gen_age = 0;
-                        regions_freed += 1;
-                    }
+                    // Handled by the unit-based large-object pass above
+                    // (bliss-hy5v), which frees a start region together with
+                    // its continuation regions and honours the pinned bit
+                    // (bliss-7puh) on the start header.
                 }
                 RegionKind::Survivor => {
                     let base = region.base as usize;
