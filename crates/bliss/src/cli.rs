@@ -337,7 +337,11 @@ impl Arena {
             unsafe {
                 *(body as *mut u64) = b.len() as u64;
                 std::ptr::copy_nonoverlapping(b.as_ptr(), body.add(8), b.len());
-                return BlissVal::from_heap_ptr(body.sub(8));
+                // A large (>~512KB) string has a 16-byte header; subtract the
+                // true header offset or the value points into the
+                // size-extension word and is misread (bliss-31x8/bliss-tjru).
+                let header_off = bliss_rt::gc::body_header_offset(8 + b.len());
+                return BlissVal::from_heap_ptr(body.sub(header_off));
             }
         }
         // Fallback: a local block freed on drop.
@@ -4699,13 +4703,16 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
                     out.push('"');
                 }
                 type_id::SIMPLE_VECTOR => {
-                    let len = *(ptr.add(8) as *const u64) as usize;
+                    // A large vector's payload sits at +16 behind its extended
+                    // header, not +8 (bliss-tjru; same family as bliss-31x8).
+                    let off = if hdr.is_large_object() { 16 } else { 8 };
+                    let len = *(ptr.add(off) as *const u64) as usize;
                     out.push_str("#(");
                     for i in 0..len {
                         if i > 0 {
                             out.push(' ');
                         }
-                        print_val(*(ptr.add(16 + i * 8) as *const BlissVal), out);
+                        print_val(*(ptr.add(off + 8 + i * 8) as *const BlissVal), out);
                     }
                     out.push(')');
                 }
@@ -4715,12 +4722,19 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
                     let fp = bliss_stdlib::cvec_fill_pointer(val);
                     let storage = *(ptr.add(8) as *const BlissVal);
                     let sptr = storage.as_ptr();
+                    // The backing SIMPLE_VECTOR may itself be a large object
+                    // with a 16-byte header (bliss-tjru).
+                    let soff = if (*(sptr as *const ObjectHeader)).is_large_object() {
+                        16
+                    } else {
+                        8
+                    };
                     out.push_str("#(");
                     for i in 0..fp {
                         if i > 0 {
                             out.push(' ');
                         }
-                        print_val(*(sptr.add(16 + i * 8) as *const BlissVal), out);
+                        print_val(*(sptr.add(soff + 8 + i * 8) as *const BlissVal), out);
                     }
                     out.push(')');
                 }

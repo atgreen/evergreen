@@ -238,12 +238,31 @@ fn gc_alloc(total_size: usize, type_id: u8) -> *mut u8 {
     let hdr = std::mem::size_of::<ObjectHeader>();
     let body_size = total_size.saturating_sub(hdr).max(1);
     match bliss_rt::gc::alloc_typed(body_size, type_id) {
-        // SAFETY: alloc_typed returns a pointer past an 8-byte header.
+        // SAFETY: the returned write base is body − 8, so the callers' body
+        // writes at offsets ≥ 8 land at the payload start regardless of header
+        // size. For a LARGE object (16-byte header) this base is NOT the object
+        // header — form the tagged value with [`gc_value`], never
+        // `from_heap_ptr` on this pointer, when `total_size` can exceed the
+        // large-object threshold (bliss-31x8).
         Some(body) => unsafe { body.sub(hdr) },
         None => std::alloc::handle_alloc_error(
             std::alloc::Layout::from_size_align(total_size.max(hdr), hdr).unwrap(),
         ),
     }
+}
+
+/// The tagged heap value for an object built on a [`gc_alloc`] write base: the
+/// true object header is at `payload − body_header_offset`, which for a large
+/// (>~512KB body) object is 16 bytes before the payload, not 8. Using
+/// `from_heap_ptr(ptr)` directly points a large object's value at its
+/// size-extension word, and it is then misread as a non-object (bliss-31x8,
+/// mirroring the bliss-tjru build_vector fix).
+fn gc_value(ptr: *mut u8, total_size: usize) -> BlissVal {
+    let hdr = std::mem::size_of::<ObjectHeader>();
+    let body_size = total_size.saturating_sub(hdr).max(1);
+    let off = bliss_rt::gc::body_header_offset(body_size);
+    // SAFETY: `ptr` is a gc_alloc write base (payload − 8).
+    unsafe { BlissVal::from_heap_ptr(ptr.add(hdr).sub(off)) }
 }
 
 fn alloc_cons(car: BlissVal, cdr: BlissVal) -> BlissVal {
@@ -284,7 +303,7 @@ fn alloc_string(s: &str) -> BlissVal {
                 *data.add(i) = c as u8;
             }
         }
-        BlissVal::from_heap_ptr(ptr)
+        gc_value(ptr, total_size)
     }
 }
 
@@ -296,7 +315,7 @@ fn alloc_vector(elements: &[BlissVal]) -> BlissVal {
         for (i, &elem) in elements.iter().enumerate() {
             *(ptr.add(16 + i * 8) as *mut BlissVal) = elem;
         }
-        BlissVal::from_heap_ptr(ptr)
+        gc_value(ptr, total_size)
     }
 }
 
@@ -438,7 +457,7 @@ fn alloc_bit_vector(bits: &[u8]) -> BlissVal {
                 *ptr.add(24 + byte_idx) |= 1 << bit_idx;
             }
         }
-        BlissVal::from_heap_ptr(ptr)
+        gc_value(ptr, total_size)
     }
 }
 
@@ -494,7 +513,7 @@ fn alloc_structure(name: BlissVal, slots: &[BlissVal]) -> BlissVal {
         for (i, &slot) in slots.iter().enumerate() {
             *(ptr.add(24 + i * 8) as *mut BlissVal) = slot;
         }
-        BlissVal::from_heap_ptr(ptr)
+        gc_value(ptr, total_size)
     }
 }
 
@@ -1503,7 +1522,7 @@ fn alloc_bignum(sign: i32, limbs: &[u64]) -> BlissVal {
         for (idx, &limb) in limbs.iter().enumerate() {
             *(ptr.add(16 + idx * 8) as *mut u64) = limb;
         }
-        BlissVal::from_heap_ptr(ptr)
+        gc_value(ptr, total_size)
     }
 }
 

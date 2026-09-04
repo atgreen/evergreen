@@ -298,13 +298,29 @@ pub unsafe fn write_character_string(ptr: *mut u8, s: &str) {
     }
 }
 
+/// The payload offset of a simple-string object: 8 for a small object, 16 for
+/// a large one, whose 16-byte header carries a size-extension word at +8
+/// (bliss-31x8, mirroring the bliss-tjru vector fix). The length word begins
+/// the payload; character data follows it.
+///
+/// # Safety
+/// `ptr` must point at a live object header.
+#[inline]
+unsafe fn simple_string_payload_offset(ptr: *const u8) -> usize {
+    if unsafe { *(ptr as *const ObjectHeader) }.is_large_object() {
+        16
+    } else {
+        8
+    }
+}
+
 /// The character (not byte) count of a simple string.
 ///
 /// # Safety
 /// `ptr` must be a live `SIMPLE_BASE_STRING`/`SIMPLE_CHARACTER_STRING` object.
 #[inline]
 pub unsafe fn simple_string_char_count(ptr: *const u8) -> usize {
-    unsafe { *((ptr as *const u64).add(1)) as usize }
+    unsafe { *(ptr.add(simple_string_payload_offset(ptr)) as *const u64) as usize }
 }
 
 /// The character at `index` of a simple string, or `None` if out of range —
@@ -319,7 +335,7 @@ pub unsafe fn simple_string_char_at(ptr: *const u8, index: usize) -> Option<char
             return None;
         }
         let tid = (*(ptr as *const ObjectHeader)).type_id();
-        let data = ptr.add(16);
+        let data = ptr.add(simple_string_payload_offset(ptr) + 8);
         let cp = if tid == type_id::SIMPLE_CHARACTER_STRING {
             *(data.add(index * 4) as *const u32)
         } else {
@@ -343,7 +359,7 @@ pub unsafe fn simple_string_set_char(ptr: *mut u8, index: usize, ch: char) -> bo
             return false;
         }
         let tid = (*(ptr as *const ObjectHeader)).type_id();
-        let data = ptr.add(16);
+        let data = ptr.add(simple_string_payload_offset(ptr) + 8);
         if tid == type_id::SIMPLE_CHARACTER_STRING {
             *(data.add(index * 4) as *mut u32) = ch as u32;
             true
@@ -364,7 +380,7 @@ pub unsafe fn read_simple_string(ptr: *const u8) -> String {
     unsafe {
         let len = simple_string_char_count(ptr);
         let tid = (*(ptr as *const ObjectHeader)).type_id();
-        let data = ptr.add(16);
+        let data = ptr.add(simple_string_payload_offset(ptr) + 8);
         let mut out = String::with_capacity(len);
         if tid == type_id::SIMPLE_CHARACTER_STRING {
             for i in 0..len {

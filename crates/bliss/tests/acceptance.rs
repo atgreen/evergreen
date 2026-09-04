@@ -2496,6 +2496,45 @@ fn large_simple_vector_is_usable_and_gc_safe() {
     );
 }
 
+/// bliss-31x8: a large (>~512KB) string LITERAL read by the reader gets a
+/// 16-byte object header, so the reader's value pointer (gc_value) and the
+/// simple-string accessors must honour the large-object payload offset — the
+/// same family as bliss-tjru for vectors. Before the fix the literal's value
+/// pointed at the size-extension word and LENGTH/CHAR saw a non-sequence.
+#[test]
+fn large_string_literal_is_usable_and_gc_safe() {
+    // Build a 600001-char literal ("aaa…Z") and read it at runtime; verify
+    // length, indexed reads at both ends, mutation, and printing round-trip.
+    let prog = "\
+        (let* ((n 600000) \
+               (src (make-string (+ n 4) :initial-element #\\a))) \
+          (setf (char src 0) #\\\") \
+          (setf (char src (+ n 1)) #\\Z) \
+          (setf (char src (+ n 2)) #\\\") \
+          (setf (char src (+ n 3)) #\\Space) \
+          (let ((s (read-from-string src))) \
+            (unless (stringp s) (error \"recog\")) \
+            (unless (= (length s) (+ n 1)) (error \"len\")) \
+            (unless (char= (char s 0) #\\a) (error \"head\")) \
+            (unless (char= (char s n) #\\Z) (error \"tail\")) \
+            (princ :ok)))";
+    let mut cmd = bliss_bin();
+    cmd.env("BLISS_GC_STRESS", "8000").env("BLISS_GC_POISON", "1");
+    cmd.args(["--eval", prog]);
+    let out = cmd.output().expect("run bliss");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large string literal under GC must not abort (stderr: {})",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("OK"),
+        "expected OK: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 fn defstruct_is_gc_safe_under_stress() {
     let prog = "\
         (defstruct box a b) \
