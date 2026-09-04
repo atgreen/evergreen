@@ -196,6 +196,11 @@ struct Builder<'a> {
     block_of: HashMap<usize, Block>,
     /// Operand-stack depth on entry to each leader's block.
     entry_depth: HashMap<usize, usize>,
+    /// `block_id` -> (`resume_bcp`, `sp_restore`) for each lexical BLOCK, from
+    /// its `PushBlock`. A `ReturnFrom` is a branch to that resume point after
+    /// resetting the operand stack to `sp_restore` and pushing the value
+    /// (bliss-8tlo).
+    block_exits: HashMap<u32, (u32, u16)>,
     /// Predecessor edges of a block: `(pred_block, target_index_in_pred_terminator)`.
     pred_edges: HashMap<Block, Vec<(Block, usize)>>,
     /// Total structural predecessor-edge count of each block (drives sealing).
@@ -232,6 +237,7 @@ impl<'a> Builder<'a> {
             leaders: Vec::new(),
             block_of: HashMap::new(),
             entry_depth: HashMap::new(),
+            block_exits: HashMap::new(),
             pred_edges: HashMap::new(),
             total_preds: Vec::new(),
             seen_preds: Vec::new(),
@@ -335,6 +341,17 @@ impl<'a> Builder<'a> {
                 Instr::Go { target_bcp, .. } => {
                     set.insert(*target_bcp as usize);
                 }
+                Instr::PushBlock {
+                    block_id,
+                    resume_bcp,
+                    sp_restore,
+                    ..
+                } => {
+                    // The resume point is where normal completion and every
+                    // `ReturnFrom` converge, so it begins a block.
+                    self.block_exits.insert(*block_id, (*resume_bcp, *sp_restore));
+                    set.insert(*resume_bcp as usize);
+                }
                 _ => {}
             }
         }
@@ -397,6 +414,21 @@ impl<'a> Builder<'a> {
                 Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => {
                     push(*t as usize, d - 1, &mut depth_at, &mut work);
                     push(i + 1, d - 1, &mut depth_at, &mut work);
+                }
+                Instr::ReturnFrom { block_id } => {
+                    // Transfers to the block's resume point with the operand
+                    // stack reset to `sp_restore` plus the returned value —
+                    // the same depth normal completion arrives with.
+                    let (resume_bcp, sp_restore) = *self
+                        .block_exits
+                        .get(block_id)
+                        .ok_or(BuildError::Unsupported("ReturnFrom to an unknown block"))?;
+                    push(
+                        resume_bcp as usize,
+                        sp_restore as i32 + 1,
+                        &mut depth_at,
+                        &mut work,
+                    );
                 }
                 Instr::Return => {}
                 _ => return Err(BuildError::UnsupportedInstr(instr_kind(&code[i]))),
@@ -474,6 +506,13 @@ impl<'a> Builder<'a> {
             match instr {
                 Instr::Br(t) => return Ok(vec![blk(*t as usize)?]),
                 Instr::Go { target_bcp, .. } => return Ok(vec![blk(*target_bcp as usize)?]),
+                Instr::ReturnFrom { block_id } => {
+                    let (resume_bcp, _) = *self
+                        .block_exits
+                        .get(block_id)
+                        .ok_or(BuildError::Unsupported("ReturnFrom to an unknown block"))?;
+                    return Ok(vec![blk(resume_bcp as usize)?]);
+                }
                 Instr::BrIfTrue(t) => return Ok(vec![blk(*t as usize)?, blk(end)?]),
                 Instr::BrIfFalse(t) => return Ok(vec![blk(end)?, blk(*t as usize)?]),
                 Instr::Return => return Ok(vec![]),
@@ -738,6 +777,34 @@ impl<'a> Builder<'a> {
                 }
                 Instr::Go { target_bcp, .. } => {
                     let s = self.block_of[&(*target_bcp as usize)];
+                    term = Some(Term::Jump(s));
+                    break;
+                }
+                Instr::ReturnFrom { block_id } => {
+                    // The runtime pops the value, unwinds to the block, resets
+                    // the operand stack to `sp_restore` and pushes the value
+                    // back. Mirror that here so the exit stack matches what
+                    // normal completion leaves, and the Braun merge at the
+                    // resume block sees one consistent slot from every edge.
+                    //
+                    // A direct jump is sound because the builder declines every
+                    // construct that would need real unwinding on the way out:
+                    // `PushUnwind` is not modelled at all, and `PushBlock` /
+                    // `PushTag` are accepted only with `sp_restore == 0`.
+                    let v = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (ReturnFrom)"))?;
+                    let (resume_bcp, sp_restore) = *self
+                        .block_exits
+                        .get(block_id)
+                        .ok_or(BuildError::Unsupported("ReturnFrom to an unknown block"))?;
+                    let restore = sp_restore as usize;
+                    if stack.len() < restore {
+                        return Err(BuildError::Unsupported("ReturnFrom below sp_restore"));
+                    }
+                    stack.truncate(restore);
+                    stack.push(v);
+                    let s = self.block_of[&(resume_bcp as usize)];
                     term = Some(Term::Jump(s));
                     break;
                 }

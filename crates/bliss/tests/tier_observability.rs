@@ -1760,7 +1760,8 @@ const T2_SHAPES: &[(&str, &str, &str)] = &[
 /// Shapes known NOT to reach T2 today, each with the bead that tracks it.
 /// Tightening this list is the point; every entry is a bug, not a policy.
 const T2_KNOWN_GAPS: &[&str] = &[
-    "COV-RETURN-FROM", // bliss-8tlo — T2 builder does not model Instr::ReturnFrom
+    // Empty. COV-RETURN-FROM was the last entry; the builder learned
+    // Instr::ReturnFrom in bliss-8tlo. Keep it that way.
 ];
 
 #[test]
