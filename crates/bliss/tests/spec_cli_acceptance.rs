@@ -2104,6 +2104,25 @@ fn package_storage_is_registry_backed() {
         ),
         "(NIL \"NEWP\")"
     );
+    // RENAME-PACKAGE follows through to already-interned symbols (bliss-9fi3):
+    // SYMBOL-PACKAGE reports the new package, the symbol prints with the new
+    // qualifier, identity is preserved, and definitions keyed under the old
+    // qualifier (a DEFUN of an exported symbol) remain callable.
+    assert_eq!(
+        eval_ok(
+            "(progn
+               (defpackage :ren9fi3 (:use :cl) (:export #:thing #:f))
+               (defvar *ren-s* 'ren9fi3::thing)
+               (eval (read-from-string \"(defun ren9fi3:f () 42)\"))
+               (rename-package :ren9fi3 :ren9fi3-new)
+               (list *ren-s*
+                     (package-name (symbol-package *ren-s*))
+                     (eq *ren-s* (find-symbol \"THING\" :ren9fi3-new))
+                     (funcall (read-from-string \"ren9fi3-new:f\"))
+                     (find-package :ren9fi3)))"
+        ),
+        "(REN9FI3-NEW:THING \"REN9FI3-NEW\" T 42 NIL)"
+    );
     // DELETE-PACKAGE removes it from the registry.
     assert_eq!(
         eval_ok("(progn (make-package \"DELP\") (delete-package :delp) (find-package :delp))"),

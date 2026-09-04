@@ -176,6 +176,90 @@ pub fn intern(name: &str) -> u32 {
     idx
 }
 
+/// Rewrite the package qualifier in the registry keys of every interned symbol
+/// keyed under `old_pkg` — `OLD:NAME` → `NEW:NAME`, `OLD::NAME` → `NEW::NAME` —
+/// and point each affected symbol's heap name cell at a fresh pinned string, so
+/// SYMBOL-NAME, printing, and home-package derivation all follow a
+/// RENAME-PACKAGE (bliss-9fi3). Symbol indices (identity) are unchanged.
+///
+/// Returns `(index, old_key, new_key)` for each rewritten symbol so the caller
+/// can re-key its own name-keyed tables and invalidate name caches.
+///
+/// The old pinned name strings are deliberately leaked (not unpinned): Lisp
+/// code may hold references to them (a captured SYMBOL-NAME result), and
+/// rename is rare — the same trade [`restore`] makes.
+pub fn rename_package_prefix(old_pkg: &str, new_pkg: &str) -> Vec<(u32, String, String)> {
+    let double = format!("{old_pkg}::");
+    let single = format!("{old_pkg}:");
+    // Phase 1 (read lock): collect the affected indices and their new keys.
+    let affected: Vec<(u32, String, String)> = with_registry(|reg| {
+        let Some(reg) = reg else {
+            return Vec::new();
+        };
+        reg.index_to_key
+            .iter()
+            .enumerate()
+            .filter_map(|(i, key)| {
+                let new_key = if let Some(rest) = key.strip_prefix(&double) {
+                    format!("{new_pkg}::{rest}")
+                } else if let Some(rest) = key.strip_prefix(&single) {
+                    format!("{new_pkg}:{rest}")
+                } else {
+                    return None;
+                };
+                Some((i as u32, key.clone(), new_key))
+            })
+            .collect()
+    });
+    if affected.is_empty() {
+        return affected;
+    }
+    // Phase 2: allocate the new pinned name strings OUTSIDE the registry lock —
+    // an allocation-triggered collection scans the registry under its own lock
+    // (`for_each_root_slot`), so allocating under the write lock would deadlock
+    // (same discipline as `intern`).
+    let new_names: Vec<BlissVal> = affected
+        .iter()
+        .map(|(_, _, new_key)| alloc_pinned_name(new_key))
+        .collect();
+    // Phase 3 (write lock): swap the map keys and heap name cells. No GC-heap
+    // calls under the lock (bliss-52k).
+    let mut renamed: Vec<(u32, String, String)> = Vec::with_capacity(affected.len());
+    let mut orphaned: Vec<BlissVal> = Vec::new();
+    with_registry_mut(|reg| {
+        for ((idx, old_key, new_key), &name_val) in affected.iter().zip(&new_names) {
+            // A symbol already interned under the new key would make the
+            // rewrite ambiguous; leave this one under its old key rather than
+            // merging two identities. Likewise skip if the old key no longer
+            // names this symbol (concurrent registry change).
+            if reg.name_to_index.contains_key(new_key)
+                || reg.name_to_index.get(old_key) != Some(idx)
+            {
+                orphaned.push(name_val);
+                continue;
+            }
+            reg.name_to_index.remove(old_key);
+            reg.name_to_index.insert(new_key.clone(), *idx);
+            reg.index_to_key[*idx as usize] = new_key.clone();
+            if let Some(obj) = object_for_index(reg, *idx) {
+                // SAFETY: registry objects are pinned live symbols; the name
+                // cell write happens under the registry write lock, mutually
+                // exclusive with the GC's cell scan (see `write_cell`).
+                unsafe {
+                    (*symbol_data(obj)).name = name_val;
+                }
+            }
+            renamed.push((*idx, old_key.clone(), new_key.clone()));
+        }
+    });
+    // Unpin only AFTER releasing the registry lock (lock-order discipline,
+    // bliss-52k). The orphaned strings were never published anywhere.
+    for name_val in orphaned {
+        crate::gc::unpin(name_val);
+    }
+    renamed
+}
+
 /// The exact registry key an interned symbol was created under (bliss-jtc.23).
 /// `intern(registry_key(idx))` returns `idx`, so this is a faithful,
 /// round-trippable identity for cross-process bytecode references. Returns

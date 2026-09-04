@@ -4892,8 +4892,10 @@ thread_local! {
     ///
     /// `sym_name` returns an owned `String`, so every interpreted call through a
     /// symbol callee paid a malloc + copy + free just to obtain a `&str` it uses
-    /// for a few map lookups and drops. A symbol's name never changes, and the
-    /// registry pins its objects, so the mapping is stable for the process.
+    /// for a few map lookups and drops. A symbol's name only changes when
+    /// RENAME-PACKAGE rewrites its qualifier (`rekey_renamed_symbols`
+    /// invalidates the affected entries on this thread), and the registry pins
+    /// its objects, so the mapping is otherwise stable for the process.
     /// Indices are dense and small for interned symbols, so a Vec is the right
     /// shape; uninterned indices (the high range) are not cached.
     static SYM_NAME_CACHE: RefCell<Vec<Option<std::rc::Rc<str>>>> = const { RefCell::new(Vec::new()) };
@@ -6176,6 +6178,50 @@ fn normalize_package_name_cow(name: &str) -> std::borrow::Cow<'_, str> {
     } else {
         std::borrow::Cow::Borrowed(trimmed)
     }
+}
+
+/// Follow a RENAME-PACKAGE through the interpreter's name-keyed state
+/// (bliss-9fi3): invalidate the per-thread symbol-name cache for each rewritten
+/// symbol, and re-key every definition map keyed by the full
+/// (package-qualified) symbol name. Value/function cells are keyed by symbol
+/// index and survive the rename untouched. `renamed` comes from
+/// [`bliss_rt::symbols::rename_package_prefix`]. GC-safe: pure Rust map
+/// surgery, no Bliss allocation, and no borrow is held across one.
+fn rekey_renamed_symbols(env: &Env, renamed: &[(u32, String, String)]) {
+    if renamed.is_empty() {
+        return;
+    }
+    SYM_NAME_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        for (idx, _, _) in renamed {
+            if let Some(slot) = c.get_mut(*idx as usize) {
+                *slot = None;
+            }
+        }
+    });
+    fn rekey<V>(map: &mut HashMap<String, V>, renamed: &[(u32, String, String)]) {
+        for (_, old_key, new_key) in renamed {
+            if let Some(v) = map.remove(old_key) {
+                map.entry(new_key.clone()).or_insert(v);
+            }
+        }
+    }
+    rekey(&mut env.funs.borrow_mut(), renamed);
+    rekey(&mut env.macros.borrow_mut(), renamed);
+    rekey(&mut env.setf_expanders.borrow_mut(), renamed);
+    rekey(&mut env.classes.borrow_mut(), renamed);
+    rekey(&mut env.generics.borrow_mut(), renamed);
+    rekey(&mut env.methods.borrow_mut(), renamed);
+    GLOBAL_MACROS.with(|m| rekey(&mut m.borrow_mut(), renamed));
+    GLOBAL_SETF_FNS.with(|m| rekey(&mut m.borrow_mut(), renamed));
+    // The macro-expander cache is keyed by macro name; entries under the old
+    // name are unreachable now — drop them rather than serving stale expanders.
+    MACRO_FN_CACHE.with(|m| {
+        let mut m = m.borrow_mut();
+        for (_, old_key, _) in renamed {
+            m.remove(old_key);
+        }
+    });
 }
 
 /// The home package encoded in a symbol's arena key. Mirrors the logic of the
@@ -13994,6 +14040,15 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     let _ = bliss_stdlib::rename_package(pkg, &new_name, &nick_refs);
                     for nick in &new_nicks {
                         reader::register_package(nick);
+                    }
+                    // Rewrite the old qualifier baked into affected symbols'
+                    // registry keys and re-key the interpreter's name-keyed
+                    // definition maps, so SYMBOL-PACKAGE, printing, and
+                    // function/macro lookup all follow the rename (bliss-9fi3).
+                    if old_name != new_name {
+                        let renamed =
+                            bliss_rt::symbols::rename_package_prefix(&old_name, &new_name);
+                        rekey_renamed_symbols(env, &renamed);
                     }
                 }
                 reader::register_package(&new_name);
