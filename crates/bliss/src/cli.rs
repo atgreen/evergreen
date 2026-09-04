@@ -3899,7 +3899,7 @@ impl Env {
             handlers: Vec::new(),
             mv: Vec::new(),
             mv_active: false,
-            closures: Rc::new(RefCell::new(HashMap::new())),
+            closures: CLOSURE_REGISTRY.with(Rc::clone),
             block_stack: Vec::new(),
             catch_stack: Vec::new(),
             tag_stack: Vec::new(),
@@ -5340,6 +5340,17 @@ fn eval_quasiquote_depth(
 thread_local! {
     static NEXT_CLOSURE_ID: RefCell<u64> = const { RefCell::new(1) };
     static NEXT_STDLIB_CLASS_ID: RefCell<i64> = const { RefCell::new(300_000) };
+    /// The PROCESS-WIDE (per-thread) closure table (bliss-w1sf). Closure ids
+    /// from `next_closure_id` are unique across the whole session, and a reified
+    /// `(BLISS::CLOSURE . id)` may be applied from ANY environment — including a
+    /// FRESH macro-expansion `Env` (`Env::new_for_macro_expansion`) that a macro
+    /// body funcalls into. Keying the table per-`Env` meant such an env had an
+    /// empty table and the application failed with "Cannot apply: Cons(..)" (it
+    /// broke the documented "one root map per process" invariant on the
+    /// BUILTIN_FN_WRAPPERS comment). Every `Env` now shares THIS one table by
+    /// Rc, so an id minted anywhere resolves everywhere.
+    static CLOSURE_REGISTRY: Rc<RefCell<HashMap<u64, Closure>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 }
 
 fn next_closure_id() -> u64 {
