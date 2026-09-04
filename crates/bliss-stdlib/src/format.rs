@@ -475,11 +475,12 @@ fn heap_number_string(v: BlissVal, escapep: bool) -> Option<String> {
         let ptr = v.as_ptr();
         match (*(ptr as *const ObjectHeader)).type_id() {
             type_id::BIGNUM => {
-                let sign = *(ptr.add(8) as *const i32);
-                let n = *(ptr.add(12) as *const u32) as usize;
+                let off = object_payload_offset(ptr);
+                let sign = *(ptr.add(off) as *const i32);
+                let n = *(ptr.add(off + 4) as *const u32) as usize;
                 let mut limbs = Vec::with_capacity(n);
                 for i in 0..n {
-                    limbs.push(*(ptr.add(16 + i * 8) as *const u64));
+                    limbs.push(*(ptr.add(off + 8 + i * 8) as *const u64));
                 }
                 let base = print_base();
                 let digits = bignum_to_radix(sign, &limbs, base);
@@ -523,6 +524,21 @@ fn heap_number_string(v: BlissVal, escapep: bool) -> Option<String> {
     }
 }
 
+/// The payload offset of a heap object: 8, or 16 for a large (>~512KB body)
+/// object whose 16-byte header carries a size-extension word at +8. Fixed-
+/// offset reads misread large objects — the extension word masquerades as the
+/// first payload field (bliss-e9hb, same family as bliss-tjru/bliss-31x8).
+///
+/// # Safety
+/// `ptr` must point at a live object header.
+unsafe fn object_payload_offset(ptr: *const u8) -> usize {
+    if unsafe { *(ptr as *const ObjectHeader) }.is_large_object() {
+        16
+    } else {
+        8
+    }
+}
+
 /// Render a heap vector — simple-vector or complex (fill-pointer / adjustable) —
 /// as `#(e0 e1 …)`. `None` for non-vector heap objects. A complex vector shows
 /// only its active elements (0..fill-pointer).
@@ -541,28 +557,37 @@ fn heap_vector_string(v: BlissVal, escapep: bool) -> Option<String> {
             let dims_vec = *(ptr.add(16) as *const BlissVal);
             let rank = (*(ptr.add(24) as *const BlissVal)).as_fixnum().max(0) as usize;
             let dbase = dims_vec.as_ptr();
-            let dn = *(dbase.add(8) as *const u64) as usize;
+            let doff = object_payload_offset(dbase);
+            let dn = *(dbase.add(doff) as *const u64) as usize;
             let mut dims = Vec::with_capacity(dn);
             for k in 0..dn {
-                dims.push((*(dbase.add(16 + k * 8) as *const BlissVal)).as_fixnum().max(0) as usize);
+                dims.push(
+                    (*(dbase.add(doff + 8 + k * 8) as *const BlissVal))
+                        .as_fixnum()
+                        .max(0) as usize,
+                );
             }
             let (nested, _) = md_render(storage.as_ptr(), &dims, 0, escapep);
             return Some(format!("#{rank}A{nested}"));
         }
         let (base, count) = match (*(ptr as *const ObjectHeader)).type_id() {
-            type_id::SIMPLE_VECTOR => (ptr, *(ptr.add(8) as *const u64) as usize),
+            type_id::SIMPLE_VECTOR => (
+                ptr,
+                *(ptr.add(object_payload_offset(ptr)) as *const u64) as usize,
+            ),
             type_id::COMPLEX_ARRAY => {
                 let storage = *(ptr.add(8) as *const BlissVal);
                 (storage.as_ptr(), crate::sequences::cvec_fill_pointer(v))
             }
             _ => return None,
         };
+        let boff = object_payload_offset(base);
         let mut s = String::from("#(");
         for i in 0..count {
             if i > 0 {
                 s.push(' ');
             }
-            let e = *(base.add(16 + i * 8) as *const BlissVal);
+            let e = *(base.add(boff + 8 + i * 8) as *const BlissVal);
             s.push_str(&blissval_to_print_string(e, escapep));
         }
         s.push(')');
@@ -578,12 +603,13 @@ fn heap_vector_string(v: BlissVal, escapep: bool) -> Option<String> {
 unsafe fn md_render(base: *const u8, dims: &[usize], start: usize, escapep: bool) -> (String, usize) {
     if dims.len() <= 1 {
         let n = dims.first().copied().unwrap_or(0);
+        let boff = unsafe { object_payload_offset(base) };
         let mut s = String::from("(");
         for i in 0..n {
             if i > 0 {
                 s.push(' ');
             }
-            let e = unsafe { *(base.add(16 + (start + i) * 8) as *const BlissVal) };
+            let e = unsafe { *(base.add(boff + 8 + (start + i) * 8) as *const BlissVal) };
             s.push_str(&blissval_to_print_string(e, escapep));
         }
         s.push(')');
@@ -1285,11 +1311,12 @@ fn integer_magnitude(val: BlissVal, radix: u32) -> Option<(bool, String)> {
         if (*(ptr as *const ObjectHeader)).type_id() != type_id::BIGNUM {
             return None;
         }
-        let sign = *(ptr.add(8) as *const i32);
-        let n = *(ptr.add(12) as *const u32) as usize;
+        let off = object_payload_offset(ptr);
+        let sign = *(ptr.add(off) as *const i32);
+        let n = *(ptr.add(off + 4) as *const u32) as usize;
         let mut limbs = Vec::with_capacity(n);
         for i in 0..n {
-            limbs.push(*(ptr.add(16 + i * 8) as *const u64));
+            limbs.push(*(ptr.add(off + 8 + i * 8) as *const u64));
         }
         // bignum_to_radix emits a leading '-' for negatives; split it back into
         // (negative, magnitude) so the ~D sign/comma/pad logic applies uniformly.
@@ -1672,22 +1699,29 @@ pub fn format(
         unsafe {
             let ptr = destination.as_ptr();
             let old_header = *(ptr as *const ObjectHeader);
-            let old_padded = (old_header.size_units() as usize) * 8;
-            let current_len = *(ptr.add(8) as *const u64) as usize;
+            // A large object's true footprint lives in the size-extension word
+            // at +8; size_units() is the 0xFFFF sentinel there (bliss-e9hb).
+            let off = object_payload_offset(ptr);
+            let old_padded = if old_header.is_large_object() {
+                *(ptr.add(8) as *const u64) as usize
+            } else {
+                (old_header.size_units() as usize) * 8
+            };
+            let current_len = *(ptr.add(off) as *const u64) as usize;
             let append_bytes = output.as_bytes();
             let new_len = current_len + append_bytes.len();
-            let new_total = 16 + new_len;
+            let new_total = off + 8 + new_len;
             let new_padded = (new_total + 7) & !7;
 
             if new_padded <= old_padded {
                 // Fits in existing allocation — append in place.
                 std::ptr::copy_nonoverlapping(
                     append_bytes.as_ptr(),
-                    ptr.add(16 + current_len),
+                    ptr.add(off + 8 + current_len),
                     append_bytes.len(),
                 );
                 // Update length field on the original pointer.
-                *(ptr.add(8) as *mut u64) = new_len as u64;
+                *(ptr.add(off) as *mut u64) = new_len as u64;
             } else {
                 // The formatted output does not fit in the original
                 // allocation.  Signal an error rather than risk UB
