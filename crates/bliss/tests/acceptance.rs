@@ -2408,6 +2408,29 @@ fn typep_not_and_string_length_compounds() {
 /// BlissStack frame per element and overflowed the default 512 KiB stack
 /// (needing BLISS_STACK_SIZE=64MB). They are now iterative and run on the
 /// default stack.
+/// bliss-tjrb: RPLACA/RPLACD (CLHS 14.2) destructively set a cons's car/cdr and
+/// return THE CONS (not the value, unlike setf), erroring on a non-cons.
+#[test]
+fn rplaca_rplacd_mutate_and_return_the_cons() {
+    let prog = "\
+        (let ((c (cons 1 2))) \
+          (unless (eq (rplaca c 9) c) (error \"rplaca-ret\")) \
+          (unless (and (eql (car c) 9) (eql (cdr c) 2)) (error \"rplaca-mut\")) \
+          (unless (eq (rplacd c 8) c) (error \"rplacd-ret\")) \
+          (unless (eql (cdr c) 8) (error \"rplacd-mut\"))) \
+        (let ((l (list 1 2 3))) \
+          (rplaca (cdr l) :x) \
+          (unless (equal l (quote (1 :x 3))) (error \"list-mut\"))) \
+        (unless (eq (handler-case (rplaca 5 1) (type-error () :caught)) :caught) \
+          (error \"non-cons\")) \
+        (princ :ok)";
+    let mut cmd = bliss_bin();
+    cmd.args(["--eval", prog]);
+    let out = cmd.output().expect("run bliss");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("OK"), "got: {}", String::from_utf8_lossy(&out.stdout));
+}
+
 #[test]
 fn long_list_ops_do_not_overflow_the_stack() {
     // Build a 40k-element list at runtime and exercise the rewritten functions;

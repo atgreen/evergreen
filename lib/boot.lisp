@@ -1297,6 +1297,19 @@
 
 ;;; --- list constructors / accessors -----------------------------------------
 
+;; RPLACA / RPLACD (CLHS 14.2): destructively set the car/cdr of a cons and
+;; return THE CONS (unlike (setf (car ..)) which returns the stored value).
+(defun rplaca (cons x)
+  (unless (consp cons)
+    (error 'type-error :datum cons :expected-type 'cons))
+  (setf (car cons) x)
+  cons)
+(defun rplacd (cons x)
+  (unless (consp cons)
+    (error 'type-error :datum cons :expected-type 'cons))
+  (setf (cdr cons) x)
+  cons)
+
 (defun copy-list (list)
   ;; Iterative (tail-pointer) copy so a long list does not recurse one stack
   ;; frame per element — deep lists (flexi-streams code-page tables, bliss-2r5)
