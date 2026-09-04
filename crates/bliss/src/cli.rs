@@ -12220,16 +12220,26 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // float prototype, the prototype's format. bliss floats are single;
             // route through num_val (bliss-apr).
             "FLOAT" => {
-                let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
-                if v.is_single_float() {
-                    return Ok(v);
-                }
-                if bliss_rt::types::realp(v) {
-                    return Ok(BlissVal::from_single_float(num_val(v)? as f32));
+                let (af, rest) = cp(cdr);
+                bliss_rt::rooted!(rest = rest);
+                bliss_rt::rooted!(v = eval_form(af, env)?);
+                // (FLOAT x prototype): the result takes the prototype's float
+                // format. (FLOAT x) with no prototype returns an already-float
+                // argument unchanged, else converts a rational to the default
+                // (SINGLE-FLOAT). CLHS FLOAT.
+                let kind = if rest.is_cons() {
+                    let proto = eval_form(cp(*rest).0, env)?;
+                    real_float_kind(proto)
+                } else if bliss_rt::types::floatp(*v) {
+                    return Ok(*v);
+                } else {
+                    FloatKind::Single
+                };
+                if bliss_rt::types::realp(*v) {
+                    return Ok(box_float(num_val(*v)?, kind));
                 }
                 return Err(BlissError::TypeError {
-                    datum: v,
+                    datum: *v,
                     expected: "real".into(),
                 });
             }
@@ -12365,7 +12375,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 }
                 let av = num_val(a)?;
                 let bv = num_val(b)?;
-                return Ok(BlissVal::from_single_float(av.powf(bv) as f32));
+                let kind = widen_float(real_float_kind(a), real_float_kind(b));
+                return Ok(box_float(av.powf(bv), kind));
             }
             "SQRT" => {
                 let (af, _) = cp(cdr);
@@ -12373,25 +12384,28 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 // Complex argument → principal complex square root (bliss-k0jg
                 // follow-up): sqrt(a+bi) = √((r+a)/2) + sign(b)·√((r−a)/2)·i.
                 if let Some(re) = bliss_rt::types::complex_realpart(v) {
+                    let imag = bliss_rt::types::complex_imagpart(v).unwrap_or(NIL);
                     let a = num_val(re)?;
-                    let b = num_val(bliss_rt::types::complex_imagpart(v).unwrap_or(NIL))?;
+                    let b = num_val(imag)?;
+                    let kind = widen_float(real_float_kind(re), real_float_kind(imag));
                     let r = a.hypot(b);
                     let re_out = ((r + a) / 2.0).sqrt();
                     let im_out = ((r - a) / 2.0).sqrt() * if b < 0.0 { -1.0 } else { 1.0 };
-                    return make_complex(
-                        BlissVal::from_single_float(re_out as f32),
-                        BlissVal::from_single_float(im_out as f32),
-                    );
+                    // box_float may allocate (double); root the real part across
+                    // the imaginary allocation and the COMPLEX build.
+                    bliss_rt::rooted!(re_v = box_float(re_out, kind));
+                    let im_v = box_float(im_out, kind);
+                    return make_complex(*re_v, im_v);
                 }
+                let kind = real_float_kind(v);
                 let nv = num_val(v)?;
                 // A negative real has a pure-imaginary root #C(0.0 √|x|), not NaN.
                 if nv < 0.0 {
-                    return make_complex(
-                        BlissVal::from_single_float(0.0),
-                        BlissVal::from_single_float((-nv).sqrt() as f32),
-                    );
+                    bliss_rt::rooted!(re_v = box_float(0.0, kind));
+                    let im_v = box_float((-nv).sqrt(), kind);
+                    return make_complex(*re_v, im_v);
                 }
-                return Ok(BlissVal::from_single_float(nv.sqrt() as f32));
+                return Ok(box_float(nv.sqrt(), kind));
             }
             // Transcendental functions on reals → single-float (bliss-44qp).
             // Computed in f64 then narrowed. Complex arguments and the complex
@@ -12491,7 +12505,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     "ATANH" => x.atanh(),
                     _ => unreachable!(),
                 };
-                return Ok(BlissVal::from_single_float(r as f32));
+                return Ok(box_float(r, real_float_kind(v)));
             }
             // (ATAN y) = arctangent; (ATAN y x) = phase of x+yi (atan2).
             "ATAN" => {
@@ -12499,10 +12513,12 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 bliss_rt::rooted!(yv = eval_form(yf, env)?);
                 let y = num_val(*yv)?;
                 if r.is_cons() {
-                    let x = num_val(eval_form(cp(r).0, env)?)?;
-                    return Ok(BlissVal::from_single_float(y.atan2(x) as f32));
+                    bliss_rt::rooted!(xv = eval_form(cp(r).0, env)?);
+                    let x = num_val(*xv)?;
+                    let kind = widen_float(real_float_kind(*yv), real_float_kind(*xv));
+                    return Ok(box_float(y.atan2(x), kind));
                 }
-                return Ok(BlissVal::from_single_float(y.atan() as f32));
+                return Ok(box_float(y.atan(), real_float_kind(*yv)));
             }
             // (LOG x) = natural log; (LOG x base) = log_base(x) = ln x / ln base.
             // A negative real has a complex log ln|x| + iπ (matches SQRT).
@@ -12510,18 +12526,21 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let (xf, r) = cp(cdr);
                 bliss_rt::rooted!(xv = eval_form(xf, env)?);
                 if r.is_cons() {
-                    let base = num_val(eval_form(cp(r).0, env)?)?;
+                    bliss_rt::rooted!(bv = eval_form(cp(r).0, env)?);
+                    let base = num_val(*bv)?;
                     let x = num_val(*xv)?;
-                    return Ok(BlissVal::from_single_float((x.ln() / base.ln()) as f32));
+                    let kind = widen_float(real_float_kind(*xv), real_float_kind(*bv));
+                    return Ok(box_float(x.ln() / base.ln(), kind));
                 }
+                let kind = real_float_kind(*xv);
                 let x = num_val(*xv)?;
                 if x < 0.0 {
-                    return make_complex(
-                        BlissVal::from_single_float(x.abs().ln() as f32),
-                        BlissVal::from_single_float(std::f32::consts::PI),
-                    );
+                    // ln|x| + iπ; π takes the argument's float format.
+                    bliss_rt::rooted!(re_v = box_float(x.abs().ln(), kind));
+                    let im_v = box_float(std::f64::consts::PI, kind);
+                    return make_complex(*re_v, im_v);
                 }
-                return Ok(BlissVal::from_single_float(x.ln() as f32));
+                return Ok(box_float(x.ln(), kind));
             }
             "RANDOM" => {
                 // (random limit &optional random-state) — a value in [0, limit)
@@ -12556,6 +12575,17 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     // 24 random mantissa bits give a uniform unit float in [0,1).
                     let unit = (next_random_u64() >> 40) as f32 / (1u64 << 24) as f32;
                     return Ok(BlissVal::from_single_float(unit * bound));
+                }
+                if limit.is_double_float() {
+                    let bound = limit.as_double_float();
+                    if bound <= 0.0 {
+                        return Err(BlissError::ProgramError(
+                            "RANDOM limit must be a positive number".into(),
+                        ));
+                    }
+                    // 53 random mantissa bits give a uniform unit double in [0,1).
+                    let unit = (next_random_u64() >> 11) as f64 / (1u64 << 53) as f64;
+                    return Ok(bliss_rt::gc::alloc_double_float(unit * bound));
                 }
                 return Err(BlissError::TypeError {
                     datum: limit,
@@ -17502,6 +17532,20 @@ fn box_float(x: f64, kind: FloatKind) -> BlissVal {
     match kind {
         FloatKind::Double => bliss_rt::gc::alloc_double_float(x),
         _ => BlissVal::from_single_float(x as f32),
+    }
+}
+
+/// The float format a real-valued math function (SQRT, SIN, EXP, LOG, EXPT, …)
+/// returns for a real argument `v`: DOUBLE-FLOAT if `v` is itself a double,
+/// otherwise SINGLE-FLOAT — a rational argument yields the default float format
+/// (SINGLE-FLOAT). Multi-argument functions widen over their arguments with
+/// [`widen_float`], so any double argument makes the result double (CLHS
+/// 12.1.4.1 float contagion).
+fn real_float_kind(v: BlissVal) -> FloatKind {
+    if v.is_double_float() {
+        FloatKind::Double
+    } else {
+        FloatKind::Single
     }
 }
 
