@@ -1721,3 +1721,94 @@ fn comparison_used_as_a_value_still_reaches_t2() {
         "T2 results differ from the expected interpreted values ({out:?})"
     );
 }
+
+// ── T2 coverage ratchet (bliss-jpd0.1) ───────────────────────────
+//
+// A tier loss is SILENT: the function returns the right answer and merely runs
+// at T1 forever. Nothing fails, so gaps are found by accident — two were, on
+// 2026-09-03 (bliss-n6d1 comparison-as-value, bliss-8tlo ReturnFrom), each
+// having quietly cost real time. This asserts the EXACT set of shapes that do
+// not reach T2, so a regression fails here, and so does an unrecorded fix
+// (which should tighten the list).
+
+/// `(name, definition, one call)` for each shape. Names are the Lisp function
+/// names, upcased by the reader, which is how `function-tier` sees them.
+const T2_SHAPES: &[(&str, &str, &str)] = &[
+    ("COV-ARITH", "(defun cov-arith (x y) (+ (* x 2) (- y 3)))", "(cov-arith k 7)"),
+    ("COV-CMP-FUSED", "(defun cov-cmp-fused (x y) (if (< x y) 1 0))", "(cov-cmp-fused k 7)"),
+    ("COV-CMP-VALUE", "(defun cov-cmp-value (x y) (< x y))", "(cov-cmp-value k 7)"),
+    ("COV-CMP-NOT", "(defun cov-cmp-not (x y) (if (not (< x y)) 1 0))", "(cov-cmp-not k 7)"),
+    ("COV-CMP-AND", "(defun cov-cmp-and (x y) (and (< x y) (> y 0)))", "(cov-cmp-and k 7)"),
+    ("COV-CMP-OR", "(defun cov-cmp-or (x y) (or (< x y) (= x 0)))", "(cov-cmp-or k 7)"),
+    ("COV-CARCDR", "(defun cov-carcdr (l) (car (cdr l)))", "(cov-carcdr (list 1 2 3))"),
+    ("COV-CONS", "(defun cov-cons (x) (cons x x))", "(cov-cons k)"),
+    ("COV-NULL", "(defun cov-null (x) (if (null x) 1 0))", "(cov-null nil)"),
+    ("COV-EQ", "(defun cov-eq (x y) (eq x y))", "(cov-eq k k)"),
+    ("COV-NESTED-IF", "(defun cov-nested-if (x) (if (< x 0) -1 (if (> x 10) 1 0)))", "(cov-nested-if k)"),
+    ("COV-LOOP", "(defun cov-loop (n) (let ((s 0)) (dotimes (i n) (setq s (+ s i))) s))", "(cov-loop 5)"),
+    ("COV-STRLEN", "(defun cov-strlen (s) (length s))", "(cov-strlen \"abc\")"),
+    ("COV-AREF", "(defun cov-aref (v i) (aref v i))", "(cov-aref (vector 1 2 3) 1)"),
+    ("COV-ZEROP", "(defun cov-zerop (x) (if (zerop x) 1 0))", "(cov-zerop k)"),
+    ("COV-MOD", "(defun cov-mod (x) (mod x 7))", "(cov-mod k)"),
+    ("COV-RECUR", "(defun cov-recur (n) (if (< n 2) n (+ (cov-recur (- n 1)) (cov-recur (- n 2)))))", "(cov-recur 6)"),
+    ("COV-MULTI", "(defun cov-multi (x) (values x (+ x 1)))", "(cov-multi k)"),
+    // Known gap: an explicit RETURN-FROM is not modelled by the T2 builder
+    // (bliss-8tlo). Listed so the ratchet records it rather than ignoring it.
+    ("COV-RETURN-FROM", "(defun cov-return-from (x) (block b (when (< x 0) (return-from b :neg)) :pos))", "(cov-return-from k)"),
+];
+
+/// Shapes known NOT to reach T2 today, each with the bead that tracks it.
+/// Tightening this list is the point; every entry is a bug, not a policy.
+const T2_KNOWN_GAPS: &[&str] = &[
+    "COV-RETURN-FROM", // bliss-8tlo — T2 builder does not model Instr::ReturnFrom
+];
+
+#[test]
+fn common_shapes_reach_t2() {
+    let mut program = String::new();
+    for (_, defn, _) in T2_SHAPES {
+        program.push_str(defn);
+        program.push(' ');
+    }
+    program.push_str("(dotimes (k 40) ");
+    for (_, _, call) in T2_SHAPES {
+        program.push_str(call);
+        program.push(' ');
+    }
+    program.push_str(") ");
+    // One line per shape: "NAME tier".
+    for (name, _, _) in T2_SHAPES {
+        program.push_str(&format!(
+            "(format t \"{name} ~a~%\" (bliss-ext:function-tier (quote {name}))) "
+        ));
+    }
+    let (out, ok) = run(
+        &program,
+        &[
+            ("BLISS_T0_T1_THRESHOLD", "2"),
+            ("BLISS_T1_T2_INVOKE_THRESHOLD", "2"),
+            ("BLISS_T1_T2_BACKEDGE_THRESHOLD", "2"),
+        ],
+    );
+    assert!(ok, "run failed: {out}");
+
+    let mut not_t2: Vec<&str> = Vec::new();
+    for (name, _, _) in T2_SHAPES {
+        let line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("no tier line for {name} in {out:?}"));
+        if line.split_whitespace().nth(1) != Some("2") {
+            not_t2.push(name);
+        }
+    }
+
+    let expected: Vec<&str> = T2_KNOWN_GAPS.to_vec();
+    assert_eq!(
+        not_t2, expected,
+        "T2 coverage changed.\n  not reaching T2: {not_t2:?}\n  expected gaps:   {expected:?}\n\
+         If a shape REGRESSED, that is a silent perf loss — fix it.\n\
+         If a shape was FIXED, tighten T2_KNOWN_GAPS and close its bead.\n\
+         Full output: {out:?}"
+    );
+}
