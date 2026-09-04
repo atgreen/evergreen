@@ -5670,10 +5670,28 @@ fn read_next_form_at(
     pos: usize,
     env: &mut Env,
 ) -> Result<(BlissVal, usize), BlissError> {
+    sync_reader_float_format(env);
     let prev = READ_EVAL_ENV.with(|c| c.replace(env as *mut Env));
     let result = reader::read_form_at(chars, pos, 10, true);
     READ_EVAL_ENV.with(|c| c.set(prev));
     result
+}
+
+/// Resolve `*READ-DEFAULT-FLOAT-FORMAT*` from the environment and tell the
+/// reader, so marker-less / e-marked float literals read in the bound format
+/// (bliss-un1x). Called before each toplevel read; DOUBLE-FLOAT and LONG-FLOAT
+/// (identified with double in bliss) select doubles, anything else singles.
+fn sync_reader_float_format(env: &Env) {
+    let double = env
+        .lookup_var("*READ-DEFAULT-FLOAT-FORMAT*")
+        .is_some_and(|v| {
+            v.is_symbol()
+                && matches!(
+                    symbol_bare_name(&sym_name(v)).as_str(),
+                    "DOUBLE-FLOAT" | "LONG-FLOAT"
+                )
+        });
+    reader::set_read_default_float_double(double);
 }
 
 /// `reader::read_from_string`, but with the current load environment parked in
@@ -5696,6 +5714,7 @@ fn read_from_string_in_env(source: &str, env: &mut Env) -> Result<(BlissVal, usi
         .map(|v| v.as_fixnum() as u32)
         .filter(|b| (2..=36).contains(b))
         .unwrap_or(10);
+    sync_reader_float_format(env);
     let prev = READ_EVAL_ENV.with(|c| c.replace(env as *mut Env));
     let result = reader::read_from_string_with_base(source, read_base, read_eval);
     READ_EVAL_ENV.with(|c| c.set(prev));

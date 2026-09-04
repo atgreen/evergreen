@@ -2178,6 +2178,26 @@ fn float_literal_overflow_signals_catchable_error() {
 }
 
 #[test]
+fn read_default_float_format_is_honored() {
+    // CLHS 2.3.2.2 (bliss-un1x): marker-less and e/E-marked literals read in
+    // *READ-DEFAULT-FLOAT-FORMAT*; f/s markers force single, d/l double; the
+    // binding is dynamic (restored after the LET); and a literal that fits the
+    // bound format no longer overflows (1e40 as a double).
+    assert_eq!(
+        eval_ok(
+            "(list (read-from-string \"1.5\")
+                   (let ((*read-default-float-format* 'double-float))
+                     (list (read-from-string \"1.5\")
+                           (read-from-string \"1.5e0\")
+                           (read-from-string \"1.5f0\")
+                           (read-from-string \"1e40\")))
+                   (read-from-string \"2.5\"))"
+        ),
+        "(1.5 (1.5d0 1.5d0 1.5 1.0d40) 2.5)"
+    );
+}
+
+#[test]
 fn macro_lambda_list_supports_nested_destructuring() {
     // ASDF's (defmacro with-upgradability ((&optional) &body body) ...) shape:
     // a nested destructuring pattern with lambda-list keywords must expand.

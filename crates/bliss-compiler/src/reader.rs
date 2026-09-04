@@ -1423,6 +1423,21 @@ fn fits_fixnum(n: i64) -> bool {
 /// `Some((value, is_double))`, or `None` for non-floats. The value is always
 /// parsed at `f64` precision so a double literal keeps full precision; the
 /// caller narrows to `f32` for the single-float case.
+thread_local! {
+    /// CLHS `*READ-DEFAULT-FLOAT-FORMAT*` as seen by the reader: `true` means
+    /// DOUBLE-FLOAT (or LONG-FLOAT, which bliss identifies with double). The
+    /// host resolves the dynamic variable and sets this before each toplevel
+    /// read (bliss-un1x); marker-less and e/E-marked literals read in this
+    /// format (CLHS 2.3.2.2 — `e` selects the DEFAULT format, not single).
+    static READ_DEFAULT_FLOAT_DOUBLE: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
+/// Set the reader's view of `*READ-DEFAULT-FLOAT-FORMAT*`: `true` = doubles.
+pub fn set_read_default_float_double(double: bool) {
+    READ_DEFAULT_FLOAT_DOUBLE.with(|c| c.set(double));
+}
+
 fn parse_decimal_float(s: &str) -> Option<(f64, bool)> {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(chars.len());
@@ -1430,7 +1445,9 @@ fn parse_decimal_float(s: &str) -> Option<(f64, bool)> {
     let mut has_digit = false;
     let mut has_dot = false;
     let mut has_exp = false;
-    let mut is_double = false;
+    // Marker-less and e/E-marked literals read in the DEFAULT format
+    // (bliss-un1x); s/S/f/F force single, d/D/l/L force double.
+    let mut is_double = READ_DEFAULT_FLOAT_DOUBLE.with(|c| c.get());
     let mut prev_digit = false;
 
     if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
@@ -1454,7 +1471,11 @@ fn parse_decimal_float(s: &str) -> Option<(f64, bool)> {
             && matches!(c, 'e' | 'E' | 's' | 'S' | 'f' | 'F' | 'd' | 'D' | 'l' | 'L')
         {
             has_exp = true;
-            is_double = matches!(c, 'd' | 'D' | 'l' | 'L');
+            if matches!(c, 'd' | 'D' | 'l' | 'L') {
+                is_double = true;
+            } else if matches!(c, 's' | 'S' | 'f' | 'F') {
+                is_double = false;
+            }
             out.push('e');
             i += 1;
             if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
