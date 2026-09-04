@@ -14984,6 +14984,17 @@ thread_local! {
     /// Compiled OSR code per function symbol (bliss-izt.1).
     static OSR_REGISTRY: RefCell<HashMap<u32, Option<Rc<OsrCode>>>> =
         RefCell::new(HashMap::new());
+    /// How many times each function ENTERED native code via OSR. FnMeta's tier
+    /// does not reflect OSR (OSR code lives here, not in NATIVE_REGISTRY), so
+    /// tests need this to assert promotion actually happened — output parity
+    /// alone masked OSR being structurally dead (bliss-j1o7 / bliss-f88w).
+    static OSR_ENTRY_COUNTS: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+}
+
+/// The number of OSR native entries recorded for `sym` on this thread
+/// (`bliss-ext:function-osr-count`).
+pub(super) fn osr_entry_count(sym: u32) -> u32 {
+    OSR_ENTRY_COUNTS.with(|c| c.borrow().get(&sym).copied().unwrap_or(0))
 }
 
 /// OSR promotion threshold: number of loop back-edges taken in a single running
@@ -15152,6 +15163,10 @@ fn maybe_osr(
             return None;
         }
     };
+    // Record the native entry so promotion is observable (bliss-f88w).
+    OSR_ENTRY_COUNTS.with(|c| {
+        *c.borrow_mut().entry(act.sym).or_insert(0) += 1;
+    });
     Some(run_native_osr(&osr, stub_off, act.frame, env))
 }
 

@@ -13448,6 +13448,20 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .map(|f| BlissVal::from_fixnum(bliss_rt::function::back_edge_count(f) as i64))
                     .unwrap_or(NIL));
             }
+            // How many times the named function entered native code via
+            // T0->T1 OSR on this thread. FUNCTION-TIER does NOT reflect OSR
+            // (OSR code lives in its own registry), so this is the observable
+            // for "a hot loop was promoted mid-run" (bliss-f88w; S5 gate).
+            "BLISS-EXT:FUNCTION-OSR-COUNT" => {
+                let (f_form, _) = cp(cdr);
+                let f = eval_form(f_form, env)?;
+                if !f.is_symbol() || f.is_nil() {
+                    return Ok(NIL);
+                }
+                return Ok(BlissVal::from_fixnum(
+                    bytecode::osr_entry_count(f.as_symbol_index()) as i64,
+                ));
+            }
             "BLISS-EXT:GENERIC-RECEIVER-PROFILE-COUNT" => {
                 let (name_form, _) = cp(cdr);
                 let name = sym_name(eval_form(name_form, env)?);

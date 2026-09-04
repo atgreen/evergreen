@@ -119,6 +119,48 @@ fn osr_matches_interpretation_across_loop_shapes() {
     }
 }
 
+/// PROMOTION must actually happen — output parity alone cannot see a dead OSR
+/// path (bliss-j1o7: the main dispatch path never threaded the registry
+/// symbol, so `maybe_osr` rejected every back-edge and every one of these
+/// differential tests still passed). `bliss-ext:function-osr-count` counts
+/// real native OSR entries (FUNCTION-TIER does not reflect OSR), so assert a
+/// cold first-call hot loop enters native code at least once (bliss-f88w).
+#[test]
+fn cold_hot_loop_enters_native_via_osr() {
+    let prog = "(defun sumto (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s i))))) \
+       (format t \"~a ~a~%\" (sumto 5000) (bliss-ext:function-osr-count 'sumto))";
+    let out = Command::new(BIN)
+        .args(["--eval", prog])
+        .env("BLISS_OSR_THRESHOLD", "50")
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("12497500 1"),
+        "cold hot loop must compute the right sum AND enter OSR native code \
+         exactly once (got: {stdout:?})"
+    );
+}
+
+/// The same regression guard at the DEFAULT OSR threshold: the tiny-threshold
+/// tests exercise the machinery, but bliss-j1o7 would have slipped past them
+/// even if they had asserted promotion under an overridden threshold only.
+/// 200k iterations cross the default 100k back-edge threshold mid-run.
+#[test]
+fn cold_hot_loop_enters_native_at_default_threshold() {
+    let prog = "(defun dsum (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s i))))) \
+       (format t \"~a ~a~%\" (dsum 200000) (bliss-ext:function-osr-count 'dsum))";
+    let out = Command::new(BIN)
+        .args(["--eval", prog])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("19999900000 1"),
+        "default-threshold hot loop must OSR exactly once (got: {stdout:?})"
+    );
+}
+
 /// A deeply-iterating loop that raises a catchable condition inside the loop
 /// body (via a c2i error) must surface identically under OSR and interpretation.
 #[test]
