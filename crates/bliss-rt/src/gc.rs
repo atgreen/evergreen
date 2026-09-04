@@ -2313,9 +2313,21 @@ impl Collector for HeapCollector {
                     }
                 }
                 RegionKind::LargeObject => {
-                    if region.header.live_bytes == 0 {
-                        let size =
-                            (region.header.alloc_top as usize).saturating_sub(region.base as usize);
+                    // A pinned large object (alloc_pinned_typed's large path sets
+                    // the PINNED bit on the object header at `base`) promises a
+                    // stable address, so its region must never be reclaimed —
+                    // even when the collector marks it dead. The OldGen and
+                    // Survivor arms already guard on this; the LargeObject arm
+                    // did not, so a dead-but-pinned large object (e.g. an
+                    // addressed FFI buffer no longer referenced from the heap)
+                    // would be zeroed and freed under the caller (bliss-7puh).
+                    // A large object occupies its region from `base`, so the
+                    // first header's bit is authoritative.
+                    let size =
+                        (region.header.alloc_top as usize).saturating_sub(region.base as usize);
+                    let pinned =
+                        size > 0 && unsafe { header_is_pinned(region.base as *const u8) };
+                    if region.header.live_bytes == 0 && !pinned {
                         state.stats.large_object_bytes =
                             state.stats.large_object_bytes.saturating_sub(size as u64);
                         if size > 0 {

@@ -170,3 +170,60 @@ fn large_object_is_never_moved_across_repeated_major_collections() {
     .expect("walk_heap");
     assert!(found, "large object still walkable at its original address");
 }
+
+/// A PINNED large object must be retained across a major GC even with no
+/// references to it — pinning promises a stable address, so an addressed buffer
+/// (e.g. handed to FFI) unreachable from the heap must not be freed under the
+/// caller (bliss-7puh). NOTE: today large objects are unconditionally marked
+/// live in the major GC (never reclaimed at all — see the follow-up bead), so
+/// this retention holds by that rule; the PINNED guard added to the LargeObject
+/// sweep arm is defense-in-depth that becomes load-bearing once large objects
+/// become collectible. This test pins the RETENTION GUARANTEE regardless of
+/// which mechanism provides it.
+#[test]
+fn pinned_large_object_survives_a_major_gc_with_no_references() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&gc_config()).expect("init_heap");
+
+    // A "large" object exceeds the header's inline size field: body ≥ 0xFFFF
+    // words. Allocate one PINNED and deliberately keep only a raw pointer to it
+    // (no BlissVal root), so the collector marks it dead.
+    let body_size = 0xFFFF * 8; // comfortably over the large-object threshold
+    let body = bliss_rt::gc::alloc_pinned_typed(body_size, type_id::SIMPLE_BASE_STRING)
+        .expect("alloc pinned large object");
+    // Stamp a recognizable byte so we can confirm the payload is not zeroed.
+    unsafe {
+        *body = 0xAB;
+    }
+    // A large object's payload offset is 16 (LARGE_OBJECT_PAYLOAD_OFFSET), so
+    // its header sits at body - 16, not body - 8.
+    let header = unsafe { body.sub(16) };
+    let type_before = unsafe { (*(header as *const ObjectHeader)).type_id() };
+    assert_eq!(type_before, type_id::SIMPLE_BASE_STRING);
+    assert!(
+        bliss_rt::heap_stats().large_object_bytes > 0,
+        "the pinned large object should be accounted before GC"
+    );
+
+    // Force a full (minor + major) collection. Nothing references the object.
+    full_gc().expect("full_gc");
+
+    // The region must be retained: header intact, payload not zeroed, and the
+    // large-object accounting unchanged. Before the fix the region was freed
+    // and zeroed here.
+    let type_after = unsafe { (*(header as *const ObjectHeader)).type_id() };
+    assert_eq!(
+        type_after,
+        type_id::SIMPLE_BASE_STRING,
+        "a pinned large object's header was cleared — its region was wrongly freed"
+    );
+    assert_eq!(
+        unsafe { *body },
+        0xAB,
+        "a pinned large object's payload was zeroed — its region was wrongly freed"
+    );
+    assert!(
+        bliss_rt::heap_stats().large_object_bytes > 0,
+        "a pinned large object was subtracted from large-object accounting — freed"
+    );
+}
