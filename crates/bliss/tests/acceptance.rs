@@ -2402,6 +2402,43 @@ fn typep_not_and_string_length_compounds() {
 /// GC scanned its element slots 8 bytes off (reading the size-extension word as
 /// the element count). This exercises usability AND that heap references held
 /// only by a large vector survive collection.
+/// bliss-2r5: the core list functions (copy-list, copy-tree, nthcdr, and
+/// therefore last/butlast) were non-tail recursive in boot.lisp, so a long flat
+/// list — e.g. the ~22000-entry flexi-streams code-page tables — recursed one
+/// BlissStack frame per element and overflowed the default 512 KiB stack
+/// (needing BLISS_STACK_SIZE=64MB). They are now iterative and run on the
+/// default stack.
+#[test]
+fn long_list_ops_do_not_overflow_the_stack() {
+    // Build a 40k-element list at runtime and exercise the rewritten functions;
+    // recursive versions overflow well below this length.
+    let prog = "\
+        (let ((l (loop for i from 0 below 40000 collect i))) \
+          (let ((c (copy-list l))) \
+            (unless (and (= (length c) 40000) (= (car (last c)) 39999)) (error \"copy-list\"))) \
+          (unless (= (car (nthcdr 39999 l)) 39999) (error \"nthcdr\")) \
+          (unless (= (car (last l)) 39999) (error \"last\")) \
+          (let ((tr (copy-tree l))) \
+            (unless (= (car (last tr)) 39999) (error \"copy-tree\"))) \
+          (unless (equal (copy-list (quote (1 2 . 3))) (quote (1 2 . 3))) (error \"dotted\")) \
+          (princ :ok))";
+    let mut cmd = bliss_bin();
+    // Explicitly the DEFAULT stack — no BLISS_STACK_SIZE override.
+    cmd.args(["--eval", prog]);
+    let out = cmd.output().expect("run bliss");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "long-list ops overflowed the default stack (stderr: {})",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("OK"),
+        "expected OK: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn large_simple_vector_is_usable_and_gc_safe() {
     // Fire a minor GC roughly every 8000 allocations so several collections

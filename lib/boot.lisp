@@ -1009,7 +1009,11 @@
   ;; (previously (<= n 0) silently returned the whole list).
   (unless (and (integerp n) (>= n 0))
     (error 'type-error :datum n :expected-type '(integer 0)))
-  (if (or (= n 0) (null list)) list (nthcdr (- n 1) (cdr list))))
+  ;; Iterative walk so (last long-list) / (nthcdr big-n list) do not recurse
+  ;; one frame per step (bliss-2r5).
+  (do ((i n (- i 1))
+       (l list (cdr l)))
+      ((or (= i 0) (null l)) l)))
 (defun last (list &optional (n 1))
   (nthcdr (max 0 (- (length list) n)) list))
 (defun butlast (list &optional (n 1))
@@ -1294,21 +1298,51 @@
 ;;; --- list constructors / accessors -----------------------------------------
 
 (defun copy-list (list)
+  ;; Iterative (tail-pointer) copy so a long list does not recurse one stack
+  ;; frame per element — deep lists (flexi-streams code-page tables, bliss-2r5)
+  ;; overflowed the default BlissStack. A dotted tail is preserved.
   (if (consp list)
-      (cons (car list) (copy-list (cdr list)))
+      (let* ((head (cons (car list) nil))
+             (tail head))
+        (do ((rest (cdr list) (cdr rest)))
+            ((not (consp rest))
+             (unless (null rest) (setf (cdr tail) rest))
+             head)
+          (let ((new (cons (car rest) nil)))
+            (setf (cdr tail) new)
+            (setq tail new))))
       list))
 
 (defun copy-tree (tree)
+  ;; Iterate down the cdr spine (the deep direction for list-shaped data such as
+  ;; the flexi-streams tables, bliss-2r5); car recursion handles nested subtrees.
   (if (consp tree)
-      (cons (copy-tree (car tree)) (copy-tree (cdr tree)))
+      (let* ((head (cons (copy-tree (car tree)) nil))
+             (tail head))
+        (do ((rest (cdr tree) (cdr rest)))
+            ((not (consp rest))
+             (unless (null rest) (setf (cdr tail) (copy-tree rest)))
+             head)
+          (let ((new (cons (copy-tree (car rest)) nil)))
+            (setf (cdr tail) new)
+            (setq tail new))))
       tree))
 
 (defun copy-seq (seq) (subseq seq 0))
 
 (defun list* (&rest args)
+  ;; Iterative build so a very long argument list does not recurse (bliss-2r5).
   (if (null (cdr args))
       (car args)
-      (cons (car args) (apply (function list*) (cdr args)))))
+      (let* ((head (cons (car args) nil))
+             (tail head))
+        (do ((rest (cdr args) (cdr rest)))
+            ((null (cdr rest))
+             (setf (cdr tail) (car rest))
+             head)
+          (let ((new (cons (car rest) nil)))
+            (setf (cdr tail) new)
+            (setq tail new))))))
 
 (defun nbutlast (list &optional (n 1)) (butlast list n))
 
