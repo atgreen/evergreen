@@ -121,16 +121,12 @@ struct ClassWrapper {
 /// `inst` must be a live STANDARD_OBJECT heap value.
 #[inline]
 unsafe fn resolve_forwarding(inst: BlissVal) -> BlissVal {
-    unsafe {
-        let mut cur = inst;
-        loop {
-            let hdr = *(cur.as_ptr() as *const ObjectHeader);
-            if hdr.gc_bits() & (1 << bliss_rt::object::gc_bit::FORWARDED) == 0 {
-                return cur;
-            }
-            cur = *(cur.as_ptr().add(8) as *const BlissVal);
-        }
-    }
+    // Delegates to the collector's forwarding resolution: CHANGE-CLASS stubs
+    // now use the SAME layout as evacuation forwarding (untagged new-body
+    // address in the first payload word), so the GC's relocate pass rewrites
+    // stub-holding slots itself and this lazy chase is only needed between a
+    // migration and the next collection (bliss-334).
+    bliss_rt::gc::resolve_forwarded(inst)
 }
 
 /// Mark `old` as forwarded to `new` (used by `change-class` growth).
@@ -140,13 +136,11 @@ unsafe fn resolve_forwarding(inst: BlissVal) -> BlissVal {
 /// forwarded.
 #[inline]
 unsafe fn forward_instance(old: BlissVal, new: BlissVal) {
-    unsafe {
-        let hdr_ptr = old.as_ptr() as *mut ObjectHeader;
-        let mut hdr = *hdr_ptr;
-        hdr.set_gc_bits(hdr.gc_bits() | (1 << bliss_rt::object::gc_bit::FORWARDED));
-        *hdr_ptr = hdr;
-        *(old.as_ptr().add(8) as *mut BlissVal) = new;
-    }
+    // The collector's forwarding layout — NOT a tagged BlissVal in the payload
+    // word. relocate_slot reads that word as an untagged body address; the old
+    // CLOS-private tagged scheme made it compute a wild pointer whenever a GC
+    // relocation pass encountered a slot still holding the stub (bliss-334).
+    unsafe { bliss_rt::gc::forward_object_to(old, new) };
 }
 
 /// Lazily migrate an instance whose wrapper is obsolete (its class was
@@ -178,6 +172,15 @@ unsafe fn update_if_obsolete(inst: BlissVal) {
         }
         // Allocate a fresh instance in the class's current layout and copy
         // surviving slots by name, then forward the old object to it.
+        //
+        // GC safety (bliss-334): allocate_instance can fire a relocating minor
+        // GC, so both the OLD instance and the snapshotted slot values must be
+        // rooted across it — an unrooted `live` would forward a stale address,
+        // and unrooted snap values would be copied stale into the new layout.
+        let mut live = live;
+        let mut snap = snap;
+        bliss_rt::rooted_ref!(_live_root = &mut live);
+        bliss_rt::rooted_ref!(_snap_root = &mut snap);
         let new_inst = match allocate_instance(class) {
             Ok(i) => i,
             Err(_) => return,
@@ -351,14 +354,6 @@ struct ClosState {
     /// Counter for internal effective-method HashMap keys (not Lisp-visible).
     next_em_key: i64,
     next_gf_id: i64,
-    /// Pointers of live standard-object instances. Used to discriminate
-    /// instances WITHOUT dereferencing an arbitrary value: the tree-walker's
-    /// arena can present dangling or garbage heap-tagged `BlissVal`s (e.g. a
-    /// freed string, or a raw sentinel) to `typep`/`class-of`, and reading a
-    /// type_id from such a pointer would segfault. Instances are leaked (never
-    /// freed), so this set never holds a stale entry. Slot *data* is inline in
-    /// the heap object; this is only a liveness registry. See bliss-xyo.
-    live_instances: HashSet<BlissVal>,
     /// Class values created by DEFSTRUCT. Their instances are STRUCTURE-OBJECTs
     /// (not STANDARD-OBJECTs) and EQUALP descends them / they print in #S(...)
     /// syntax — none of which applies to a plain DEFCLASS class (bliss-i1i9).
@@ -391,7 +386,6 @@ impl ClosState {
             short_form_methods: HashMap::new(),
             next_em_key: 500_000,
             next_gf_id: 200_000,
-            live_instances: HashSet::new(),
             structure_classes: HashSet::new(),
             fixnum_class: NIL,
             character_class: NIL,
@@ -506,33 +500,11 @@ fn scan_clos_state_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
                 visit(value);
             }
         }
-        // Every live instance's inline slot cells are GC roots (bliss-4bp).
-        // Instances are std::alloc'd outside the GC regions, so nothing else
-        // marks or relocates the BlissVals stored in their slots — a minor GC
-        // moved a slot-held cons and left the cell stale, which is how ASDF's
-        // session/component state corrupted mid plan-traversal (false
-        // circular-dependency detection, freed-nursery reads). Mirror the
-        // hash-table entry scanner: yield every slot cell of every live
-        // instance so the collector marks and rewrites them like any root.
-        for inst in state.live_instances.iter() {
-            // SAFETY: live_instances holds live STANDARD_OBJECT allocations
-            // for the process lifetime; slot cells are inline behind the
-            // header+wrapper words. resolve_forwarding chases change-class
-            // stubs to the live copy (idempotent if several keys forward to
-            // the same object).
-            unsafe {
-                let live = resolve_forwarding(*inst);
-                let w = *(live.as_ptr().add(8) as *const *mut ClassWrapper);
-                if w.is_null() {
-                    continue;
-                }
-                let n = (*w).slot_count as usize;
-                let cells = live.as_ptr().add(16) as *mut BlissVal;
-                for idx in 0..n {
-                    visit(cells.add(idx));
-                }
-            }
-        }
+        // Instance slot cells are NOT yielded here (bliss-334): instances are
+        // ordinary GC-heap objects now, so the collector's own STANDARD_OBJECT
+        // tracer marks and rewrites their slots. The old `live_instances`
+        // slot-yield existed because instances were std::alloc'd off-heap —
+        // and it force-rooted every instance forever.
         for (_, class) in &mut state.fixnum_registrations {
             visit(class);
         }
@@ -917,15 +889,19 @@ fn finalize_class_layout(st: &mut ClosState, class: BlissVal) {
 /// garbage heap-tagged values that must not be dereferenced (see
 /// `ClosState.live_instances`).
 pub fn is_instance(object: BlissVal) -> bool {
-    with_state(|st| st.live_instances.contains(&object))
+    // A bounds-checked header read replaces the old `live_instances` registry
+    // (bliss-334): an instance is any heap value whose object header says
+    // STANDARD_OBJECT. Dangling values get the same staleness contract as
+    // every other heap reference under the moving collector.
+    bliss_rt::gc::heap_object_type_id(object) == Some(type_id::STANDARD_OBJECT)
 }
 
 /// Get the class of an object.
 pub fn class_of(object: BlissVal) -> BlissVal {
     with_state(|st| {
-        // Live instances carry their class via the offset-8 wrapper. Gate the
-        // deref on the liveness set so a garbage heap value can't crash us.
-        if st.live_instances.contains(&object) {
+        // Instances carry their class via the offset-8 wrapper. Gate the deref
+        // on the bounds-checked header type (bliss-334).
+        if bliss_rt::gc::heap_object_type_id(object) == Some(type_id::STANDARD_OBJECT) {
             return unsafe { (*instance_wrapper(object)).class };
         }
         if object == NIL {
@@ -1209,20 +1185,22 @@ pub fn allocate_instance(class: BlissVal) -> Result<BlissVal, BlissError> {
         size / 8 <= 0xFFFE,
         "instance too large for header size field"
     );
+    // Ordinary instances are ORDINARY HEAP OBJECTS (bliss-334): nursery-born,
+    // movable, and collectible, like any cons. They used to be std::alloc'd
+    // off-heap and recorded in a `live_instances` registry that (a) leaked
+    // every instance forever and (b) force-rooted all their slots via the CLOS
+    // root scanner. The GC already knows the STANDARD_OBJECT layout (word 0 is
+    // the raw wrapper pointer, the rest are traced slot values), so instances
+    // need no side-table at all.
+    let body = bliss_rt::gc::alloc_typed(size - 8, type_id::STANDARD_OBJECT)
+        .ok_or_else(|| BlissError::Internal("GC heap unavailable for instance".into()))?;
     unsafe {
-        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
-        let ptr = std::alloc::alloc_zeroed(layout);
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        *(ptr as *mut ObjectHeader) =
-            ObjectHeader::new(type_id::STANDARD_OBJECT, (size / 8) as u16);
+        let ptr = body.sub(8);
         let inst = BlissVal::from_heap_ptr(ptr);
         set_instance_wrapper(inst, wrapper);
         for i in 0..slot_count {
             *slot_cell(inst, i) = UNBOUND;
         }
-        with_state_mut(|st| st.live_instances.insert(inst));
         Ok(inst)
     }
 }
@@ -1286,7 +1264,6 @@ pub fn allocate_instance_pinned_gc(class: BlissVal) -> Result<BlissVal, BlissErr
         for i in 0..slot_count {
             *slot_cell(inst, i) = UNBOUND;
         }
-        with_state_mut(|st| st.live_instances.insert(inst));
         Ok(inst)
     }
 }
@@ -1301,8 +1278,14 @@ pub fn make_instance(class: BlissVal, initargs: &[BlissVal]) -> Result<BlissVal,
         }
         Ok(())
     })?;
+    // `allocate_instance` allocates on the GC heap (bliss-334) and can fire a
+    // relocating minor GC; the caller's initarg storage may not be rooted, so
+    // root a copy here and initialize from THAT. Rooting inside the entry
+    // point protects every caller (the interpreter, conditions.rs, the #S
+    // reader constructor) at once.
+    bliss_rt::rooted!(initargs_rooted = initargs.to_vec());
     let inst = allocate_instance(class)?;
-    initialize_instance(inst, initargs)?;
+    initialize_instance(inst, &initargs_rooted)?;
     Ok(inst)
 }
 
@@ -1617,7 +1600,7 @@ pub fn compute_applicable_methods(generic_function: BlissVal, args: &[BlissVal])
             .iter()
             .map(|a| {
                 // Inline class_of logic (we already hold the borrow)
-                if st.live_instances.contains(a) {
+                if bliss_rt::gc::heap_object_type_id(*a) == Some(type_id::STANDARD_OBJECT) {
                     unsafe { (*instance_wrapper(*a)).class }
                 } else if *a == NIL {
                     st.null_class
@@ -1927,6 +1910,13 @@ pub fn change_class(instance: BlissVal, new_class: BlissVal) -> Result<(), Bliss
         // allocation holds. Allocate a fresh larger instance, copy shared slots
         // by name, then forward the old object to it so pointer identity is
         // preserved (spec R5.69 forwarding word).
+        //
+        // GC safety (bliss-334): the allocation can relocate both the old
+        // instance and the snapshotted slot values; root them across it.
+        let mut instance = instance;
+        let mut snapshot = snapshot;
+        bliss_rt::rooted_ref!(_inst_root = &mut instance);
+        bliss_rt::rooted_ref!(_snap_root = &mut snapshot);
         let new_inst = allocate_instance(new_class)?;
         unsafe {
             let nl = &*(*new_wrapper).layout;

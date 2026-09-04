@@ -625,6 +625,82 @@ pub struct HeapCollector {
 /// Public: code generators must know which values may MOVE under the minor GC
 /// (a movable value can never be embedded as a raw immediate in native code —
 /// it must be loaded through a GC-visible slot; bliss-d0b T1 constants).
+/// Live heap bounds, published at init for lock-free membership tests.
+/// (0, 0) until the heap exists. Read with Relaxed: the values are written once
+/// per heap lifetime, before any allocation is possible.
+static HEAP_RANGE_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HEAP_RANGE_END: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Bounds-checked object type read for an ARBITRARY value (bliss-334): `None`
+/// unless `v` is heap-tagged and its object header lies inside the managed
+/// heap, else the header's type_id. Reading a header anywhere inside the
+/// mapping is memory-safe (the heap is one live mmap), so this can classify
+/// untrusted values without a liveness side-table. A DANGLING in-heap value
+/// yields whatever occupies that address now — the same staleness contract as
+/// every heap reference under a moving collector.
+pub fn heap_object_type_id(v: BlissVal) -> Option<u8> {
+    if !is_heap_ref(v) {
+        return None;
+    }
+    let base = HEAP_RANGE_BASE.load(std::sync::atomic::Ordering::Relaxed);
+    let end = HEAP_RANGE_END.load(std::sync::atomic::Ordering::Relaxed);
+    let body = ref_body_addr(v);
+    if base == 0 || body < base + OBJECT_HEADER_SIZE || body >= end {
+        return None;
+    }
+    let header = (body - OBJECT_HEADER_SIZE) as *const u8;
+    // SAFETY: header lies inside the live heap mapping (bounds above).
+    let (type_id, _) = unsafe { read_object_header(header) };
+    Some(type_id)
+}
+
+/// Install a PERSISTENT forwarding pointer from `old` to `new` (both values of
+/// the same heap-object kind), using the collector's own forwarding layout —
+/// FORWARDED gc-bit plus the new BODY address in the first payload word. Used
+/// by CHANGE-CLASS / class-redefinition instance migration (bliss-334).
+///
+/// Layout compatibility is the point: `relocate_slot` and the mark pass treat
+/// these stubs exactly like evacuation forwarding, so every reachable slot
+/// holding `old` is rewritten to the final target at the next collection and
+/// the stub then dies. The previous CLOS-private scheme stored a TAGGED
+/// `BlissVal` in that word, which `relocate_slot` (reading an untagged body
+/// pointer) would have turned into a wild pointer.
+///
+/// # Safety
+/// `old` and `new` must reference live objects; `old` must not be reachable as
+/// a plain object afterwards (its payload word is overwritten).
+pub unsafe fn forward_object_to(old: BlissVal, new: BlissVal) {
+    let old_body = ref_body_addr(old);
+    let new_body = ref_body_addr(new);
+    let header = (old_body - OBJECT_HEADER_SIZE) as *mut u8;
+    unsafe { header_set_forwarded(header, new_body as *mut u8) };
+}
+
+/// Follow forwarding (persistent CHANGE-CLASS stubs and, transiently during a
+/// collection, evacuation forwarding) from `v` to the final live object,
+/// preserving `v`'s tag. Returns `v` unchanged when it is not a forwarded
+/// in-heap reference.
+pub fn resolve_forwarded(v: BlissVal) -> BlissVal {
+    let base = HEAP_RANGE_BASE.load(std::sync::atomic::Ordering::Relaxed);
+    let end = HEAP_RANGE_END.load(std::sync::atomic::Ordering::Relaxed);
+    if base == 0 || !is_heap_ref(v) {
+        return v;
+    }
+    let tag = v.0 & crate::value::TAG_MASK;
+    let mut body = ref_body_addr(v);
+    let offset = body - ((v.0 & !crate::value::TAG_MASK) as usize);
+    loop {
+        if body < base + OBJECT_HEADER_SIZE || body >= end {
+            return BlissVal((body - offset) as u64 | tag);
+        }
+        let header = (body - OBJECT_HEADER_SIZE) as *const u8;
+        if !unsafe { header_is_forwarded(header) } {
+            return BlissVal((body - offset) as u64 | tag);
+        }
+        body = unsafe { header_forwarding_addr(header) } as usize;
+    }
+}
+
 #[inline]
 pub fn is_heap_ref(v: BlissVal) -> bool {
     matches!(
@@ -674,14 +750,30 @@ unsafe fn relocate_slot(slot: *mut BlissVal, heap_base: usize, heap_end: usize) 
     if body < heap_base + OBJECT_HEADER_SIZE || body >= heap_end {
         return;
     }
-    let header = (body - OBJECT_HEADER_SIZE) as *const u8;
-    // SAFETY: `body` lies within the managed heap; its header precedes it.
-    if unsafe { header_is_forwarded(header) } {
-        let new_body = unsafe { header_forwarding_addr(header) } as usize;
+    let mut body = body;
+    let offset = body - v_ptr;
+    let mut hops = 0usize;
+    loop {
+        let header = (body - OBJECT_HEADER_SIZE) as *const u8;
+        // SAFETY: `body` lies within the managed heap; its header precedes it.
+        if !unsafe { header_is_forwarded(header) } {
+            break;
+        }
+        // Follow CHAINS, not just one hop: a persistent CHANGE-CLASS stub
+        // (bliss-334) can point at an object that was itself evacuated this
+        // cycle, so stub -> old target -> new target must resolve fully or the
+        // slot is rewritten to an address about to be reset.
+        body = unsafe { header_forwarding_addr(header) } as usize;
+        hops += 1;
+        debug_assert!(hops < 64, "forwarding chain too long — cycle?");
+        if body < heap_base + OBJECT_HEADER_SIZE || body >= heap_end {
+            break;
+        }
+    }
+    if hops > 0 {
         // Preserve the value's offset from the object header (0 for a cons that
         // points at its body, OBJECT_HEADER_SIZE for a header-pointing object).
-        let offset = body - v_ptr;
-        unsafe { *slot = BlissVal(((new_body - offset) as u64) | tag) };
+        unsafe { *slot = BlissVal(((body - offset) as u64) | tag) };
     }
 }
 
@@ -871,7 +963,9 @@ impl HeapCollector {
             // SAFETY: `fp` is a valid frame chain (live or published).
             unsafe {
                 crate::stack::visit_stack_refs(fp, |slot| {
-                    let addr = ref_body_addr(*slot);
+                    // Resolve persistent (CHANGE-CLASS) forwarding before the
+                    // index lookup, as in mark_ref (bliss-334).
+                    let addr = ref_body_addr(resolve_forwarded(*slot));
                     if object_index.contains_key(&addr) && marked.insert(addr) {
                         worklist.push(addr);
                     }
@@ -1238,6 +1332,13 @@ impl HeapCollector {
                         marked: &mut std::collections::HashSet<usize>,
                         worklist: &mut Vec<usize>| {
             if is_heap_ref(v) {
+                // Resolve PERSISTENT forwarding (a CHANGE-CLASS stub) before
+                // the index lookup: the stub's header is forwarded so the
+                // index excludes it, and without resolution the migrated
+                // TARGET was never marked — relocate would then rewrite
+                // stub-holding slots to a dead nursery address (bliss-334;
+                // caught by gc-verify's holder trace).
+                let v = resolve_forwarded(v);
                 let target = ref_body_addr(v);
                 if nursery_index.contains_key(&target) && marked.insert(target) {
                     worklist.push(target);
@@ -1775,7 +1876,6 @@ impl HeapCollector {
                 RegionKind::Survivor => survivor += 1,
                 RegionKind::OldGen => old += 1,
                 RegionKind::LargeObject => large += 1,
-                _ => {}
             }
             let base = r.base as usize;
             let top = r.header.alloc_top as usize;
@@ -1945,6 +2045,9 @@ impl Collector for HeapCollector {
                         marked: &mut std::collections::HashSet<usize>,
                         worklist: &mut Vec<usize>| {
             if is_heap_ref(v) {
+                // Resolve persistent (CHANGE-CLASS) forwarding first, as in
+                // the minor collector's mark_ref (bliss-334).
+                let v = resolve_forwarded(v);
                 let target = ref_body_addr(v);
                 if object_index.contains_key(&target) && marked.insert(target) {
                     worklist.push(target);
@@ -3170,7 +3273,7 @@ fn verify_rooted_lists_naming(
                      (slide = runtime_anchor - nm_anchor; holder type = nm symbol at \
                      trace_fn - slide) [{}] [{}]",
                     node as usize,
-                    scan_rooted_lists as usize,
+                    scan_rooted_lists as *const () as usize,
                     verify_trace_report(slot_addr),
                     describe_target(BlissVal(value)),
                 );
@@ -4425,6 +4528,8 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
         remembered: std::collections::HashSet::new(),
         satb_log: Vec::new(),
     };
+    HEAP_RANGE_BASE.store(heap_base as usize, std::sync::atomic::Ordering::Relaxed);
+    HEAP_RANGE_END.store(heap_base as usize + config.heap_size, std::sync::atomic::Ordering::Relaxed);
     *heap_state().lock().unwrap() = Some(state);
     GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
 
