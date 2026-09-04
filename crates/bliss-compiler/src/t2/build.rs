@@ -42,6 +42,23 @@ use bliss_rt::bytecode::{BytecodeFunction, DeclaredType, Instr, VarLoc};
 #[derive(Clone, Debug)]
 pub enum BuildError {
     Unsupported(&'static str),
+    /// An instruction the builder does not model, named by its `Instr`
+    /// discriminant. The bare `Unsupported("opcode not modelled by T2 builder")`
+    /// gave no way to tell WHICH instruction stopped a function from reaching
+    /// T2, which made a silent tier loss (e.g. CHAR= stuck at T1) take a
+    /// disassembly to diagnose.
+    UnsupportedInstr(String),
+}
+
+/// The `Instr` variant name, for diagnostics. `Debug` renders the whole
+/// instruction including operands; the discriminant alone is what identifies
+/// the missing builder case.
+fn instr_kind(instr: &Instr) -> String {
+    let full = format!("{instr:?}");
+    match full.find(['(', ' ', '{']) {
+        Some(i) => full[..i].to_string(),
+        None => full,
+    }
 }
 
 /// A Braun variable: either a lexical local slot or an operand-stack position.
@@ -382,7 +399,7 @@ impl<'a> Builder<'a> {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
                 Instr::Return => {}
-                _ => return Err(BuildError::Unsupported("opcode not modelled by T2 builder")),
+                _ => return Err(BuildError::UnsupportedInstr(instr_kind(&code[i]))),
             }
         }
 
@@ -750,7 +767,7 @@ impl<'a> Builder<'a> {
                     term = Some(Term::Ret(v));
                     break;
                 }
-                _ => return Err(BuildError::Unsupported("opcode not modelled by T2 builder")),
+                _ => return Err(BuildError::UnsupportedInstr(instr_kind(&code[i]))),
             }
         }
 
@@ -1813,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_opcode_is_reported() {
+    fn unsupported_opcode_is_reported_and_names_the_instruction() {
         // `Throw` is a deferred opcode → the builder must decline, not panic.
         let r = build_from_bytecode(&bf(
             "nlx",
@@ -1823,7 +1840,13 @@ mod tests {
             0,
             2,
         ));
-        assert!(matches!(r, Err(BuildError::Unsupported(_))));
+        // Naming the instruction is the point: a bare "not modelled" message
+        // gives no way to tell WHICH instruction kept a function at T1, and a
+        // tier loss is silent — correct output, just slower.
+        match r {
+            Err(BuildError::UnsupportedInstr(kind)) => assert_eq!(kind, "Throw"),
+            other => panic!("expected UnsupportedInstr(\"Throw\"), got {other:?}"),
+        }
     }
 
     #[test]
