@@ -4897,15 +4897,17 @@ thread_local! {
 
 /// [`sym_name`] without the allocation: a shared, cached handle to the name.
 /// Use where the name is only borrowed (map keys, comparisons).
+
+
 fn sym_name_rc(val: BlissVal) -> std::rc::Rc<str> {
     if !val.is_symbol() || val.is_nil() || val == T {
-        return std::rc::Rc::from(sym_name(val).as_str());
+        return std::rc::Rc::from(sym_name_uncached(val).as_str());
     }
     let idx = val.as_symbol_index();
     // Uninterned symbols live at the top of the index space; caching them would
     // size the Vec by the raw index.
     if bliss_rt::symbols::is_uninterned(idx) {
-        return std::rc::Rc::from(sym_name(val).as_str());
+        return std::rc::Rc::from(sym_name_uncached(val).as_str());
     }
     SYM_NAME_CACHE.with(|c| {
         let mut c = c.borrow_mut();
@@ -4916,13 +4918,30 @@ fn sym_name_rc(val: BlissVal) -> std::rc::Rc<str> {
         if let Some(name) = &c[i] {
             return std::rc::Rc::clone(name);
         }
-        let name: std::rc::Rc<str> = std::rc::Rc::from(sym_name(val).as_str());
+        let name: std::rc::Rc<str> = std::rc::Rc::from(sym_name_uncached(val).as_str());
         c[i] = Some(std::rc::Rc::clone(&name));
         name
     })
 }
 
+/// The owned-`String` form of a symbol's name.
+///
+/// Served from the same per-thread cache `sym_name_rc` fills, so the common
+/// path is a `Vec` index plus one `String` copy rather than a symbol-registry
+/// lock and lookup. The ASDF load makes 6.8M of these calls across ~150 sites,
+/// so paying the registry walk at each was worth removing even though the
+/// `String` itself remains.
 fn sym_name(val: BlissVal) -> String {
+    if val.is_symbol() && !val.is_nil() && val != T && !bliss_rt::symbols::is_uninterned(val.as_symbol_index())
+    {
+        return sym_name_rc(val).to_string();
+    }
+    sym_name_uncached(val)
+}
+
+/// The registry lookup itself, with no caching — the source `sym_name_rc` fills
+/// its cache from. Kept separate so the two cannot recurse into each other.
+fn sym_name_uncached(val: BlissVal) -> String {
     if val.is_nil() {
         return "NIL".into();
     }
