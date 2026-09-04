@@ -67,11 +67,25 @@
 (defconstant array-total-size-limit 1152921504606846975)
 ;; PI (a float approximation of π; bliss floats are single-precision, so the
 ;; long-float literal rounds to 3.1415927) and the single-float magnitude
-;; extremes. The epsilon / least-positive / double-float constants are not yet
-;; defined (bliss has no distinct double-float) — see bliss follow-up.
+;; extremes, plus the least-positive / normalized / epsilon family for both
+;; float formats (bliss-pzz4; values match SBCL / IEEE-754 binary32 & binary64).
 (defconstant pi 3.141592653589793d0)
 (defconstant most-positive-single-float 3.4028235e38)
 (defconstant most-negative-single-float -3.4028235e38)
+(defconstant least-positive-single-float 1.4012985e-45)
+(defconstant least-positive-normalized-single-float 1.1754944e-38)
+(defconstant least-negative-single-float -1.4012985e-45)
+(defconstant least-negative-normalized-single-float -1.1754944e-38)
+(defconstant single-float-epsilon 5.960465e-8)
+(defconstant single-float-negative-epsilon 2.9802326e-8)
+(defconstant most-positive-double-float 1.7976931348623157d308)
+(defconstant most-negative-double-float -1.7976931348623157d308)
+(defconstant least-positive-double-float 4.9406564584124654d-324)
+(defconstant least-positive-normalized-double-float 2.2250738585072014d-308)
+(defconstant least-negative-double-float -4.9406564584124654d-324)
+(defconstant least-negative-normalized-double-float -2.2250738585072014d-308)
+(defconstant double-float-epsilon 1.1102230246251568d-16)
+(defconstant double-float-negative-epsilon 5.551115123125784d-17)
 (defconstant lambda-list-keywords
   '(&optional &rest &key &allow-other-keys &aux &body &whole &environment))
 ;; Implementation limits: bliss caps these at MOST-POSITIVE-FIXNUM so they are
