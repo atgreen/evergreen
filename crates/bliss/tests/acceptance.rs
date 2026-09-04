@@ -1541,8 +1541,15 @@ fn find_symbol_intern_accessibility() {
         ("(nth-value 1 (intern \"CONS\" :common-lisp))", ":EXTERNAL"),
         // A CL symbol inherited into CL-USER is :INHERITED.
         ("(nth-value 1 (find-symbol \"CAR\" :cl-user))", ":INHERITED"),
-        // Keywords are external.
-        ("(nth-value 1 (find-symbol \"SOME-KW\" :keyword))", ":EXTERNAL"),
+        // An EXISTING keyword is external (`:foo` reader-interns it first).
+        ("(progn :some-kw (nth-value 1 (find-symbol \"SOME-KW\" :keyword)))", ":EXTERNAL"),
+        // FIND-SYMBOL of an ABSENT keyword returns NIL and must NOT intern it —
+        // CLHS forbids the side effect. Previously bliss went through the reader
+        // (interning) and reported :EXTERNAL for any name (bliss-2evi).
+        ("(nth-value 1 (find-symbol \"NEVER-KW-QQ\" :keyword))", "NIL"),
+        // No side effect: a second lookup of the same absent name is still NIL
+        // (it was not fabricated by the first).
+        ("(progn (find-symbol \"ALSO-NEVER-KW\" :keyword) (nth-value 1 (find-symbol \"ALSO-NEVER-KW\" :keyword)))", "NIL"),
     ];
     for (expr, expected) in cases {
         let out = bliss_bin().args(["--eval", &format!("(print {expr})")]).output().expect("run bliss");

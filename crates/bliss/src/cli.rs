@@ -6483,9 +6483,15 @@ fn find_symbol_in_package_rec(
     // present-symbol lookup below, so an unknown name yields (NIL NIL) and a homed
     // symbol yields :INTERNAL / inherited CL symbols :INHERITED (bliss-6w2y).)
     if keyword == Some(pkg) {
-        if let Some(sym) = resolve_sym(&format!(":{}", bare_upper)) {
-            return Some((sym, "EXTERNAL"));
-        }
+        // A keyword is EXTERNAL in the KEYWORD package iff it already exists —
+        // probe the reader's symbol index WITHOUT interning. The old
+        // `resolve_sym(":NAME")` went through `read_symbol_token`, which
+        // INTERNS, so (find-symbol "ZZ" :keyword) fabricated the keyword and
+        // reported :EXTERNAL where CLHS requires NIL and no side effect
+        // (bliss-2evi). `find_symbol_index` is the same non-interning lookup the
+        // COMMON-LISP arm above uses.
+        return reader::find_symbol_index(&format!("KEYWORD:{bare_upper}"))
+            .map(|idx| (BlissVal::from_symbol_index(idx), "EXTERNAL"));
     }
     // Borrow the package briefly: resolve the symbol directly, and only clone
     // the small `uses` list (package names, not the symbols map) if we must
