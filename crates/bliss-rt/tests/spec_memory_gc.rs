@@ -1,8 +1,9 @@
 use bliss_rt::WriteBarrier;
 use bliss_rt::gc::{
     Allocator, Collector, GcConfig, HeapAllocator, HeapCollector, SatbCardBarrier, WeakPointer,
-    full_gc, gc_marking_in_progress, heap_stats, init_heap, record_object, register_finalizer,
-    register_weak_pointer, set_finalizer_dispatch, set_gc_marking_in_progress, walk_heap,
+    full_gc, gc_marking_in_progress, get_entry_continuation, heap_stats, init_heap, record_object,
+    register_finalizer, register_weak_pointer, set_entry_continuation, set_finalizer_dispatch,
+    set_gc_marking_in_progress, walk_heap,
 };
 use bliss_rt::value::BlissVal;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,6 +108,11 @@ fn spec_gc_large_objects_minor_gc_and_full_gc_use_real_collector_paths() {
     let mut allocator = HeapAllocator::new().expect("allocator");
     let _small = allocator.alloc_fast(24).expect("nursery object");
     let large = allocator.alloc_large(700).expect("large object");
+    // Keep the large object reachable so it survives full_gc (unreferenced large
+    // objects are now reclaimed, bliss-jg6g); this test checks it stays walkable
+    // and in a dedicated region, not that it leaks.
+    let saved = get_entry_continuation();
+    set_entry_continuation(unsafe { BlissVal::from_heap_ptr((large as *mut u8).sub(8)) });
 
     let before = heap_stats();
     assert!(before.large_object_bytes >= 720);
@@ -129,6 +135,7 @@ fn spec_gc_large_objects_minor_gc_and_full_gc_use_real_collector_paths() {
             .any(|(ptr, _, size)| *ptr == large as usize && *size == 700),
         "large object should remain walkable after collection"
     );
+    set_entry_continuation(saved);
 }
 
 #[test]
@@ -253,6 +260,12 @@ fn spec_gc_large_object_is_not_moved_by_major_gc() {
     unsafe {
         std::ptr::write_unaligned(ptr as *mut u64, ptr as u64);
     }
+    // Root the object so it legitimately SURVIVES the collection (an
+    // unreferenced large object is now reclaimed, bliss-jg6g); the point of this
+    // test is that a surviving large object is not MOVED (R3.19). The value is
+    // the tagged header pointer, body - OBJECT_HEADER_SIZE.
+    let saved = get_entry_continuation();
+    set_entry_continuation(unsafe { BlissVal::from_heap_ptr((ptr as *mut u8).sub(8)) });
 
     HeapCollector::new().major_gc().expect("major_gc");
 
@@ -263,4 +276,5 @@ fn spec_gc_large_object_is_not_moved_by_major_gc() {
             .any(|(obj_ptr, _, size)| *obj_ptr == ptr as usize && *size == 700),
         "surviving large object address changed across major GC"
     );
+    set_entry_continuation(saved);
 }

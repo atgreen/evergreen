@@ -181,6 +181,55 @@ fn large_object_is_never_moved_across_repeated_major_collections() {
 /// become collectible. This test pins the RETENTION GUARANTEE regardless of
 /// which mechanism provides it.
 #[test]
+fn dead_single_region_large_object_is_reclaimed_by_a_major_gc() {
+    // bliss-jg6g: a single-region large object that becomes unreachable must be
+    // reclaimed by the major GC. Previously the sweep force-marked every
+    // LargeObject region live, so a dead large object leaked forever.
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
+    // Regions large enough that the ~524 KB object occupies a SINGLE region;
+    // the shared gc_config() uses 512-byte regions, which would make it a
+    // multi-region large object (intentionally kept force-live by the fix).
+    let mut cfg = gc_config();
+    cfg.region_size = 2 * 1024 * 1024;
+    cfg.heap_size = 16 * 1024 * 1024;
+    cfg.heap_max = 32 * 1024 * 1024;
+    cfg.nursery_size = 4 * 1024 * 1024;
+    init_heap(&cfg).expect("init_heap");
+
+    let before = bliss_rt::heap_stats().large_object_bytes;
+
+    // A large (single-region) reference-free leaf, kept only in a raw pointer —
+    // no BlissVal root — so the collector sees it as garbage.
+    // Body > region_size/2 forces a dedicated LargeObject region (alloc_large);
+    // < region_size keeps it to ONE region. 1.2 MiB in a 2 MiB region does both.
+    let body_size = 1_200_000;
+    let body = bliss_rt::gc::alloc_typed(body_size, type_id::SIMPLE_BASE_STRING)
+        .expect("alloc large object");
+    unsafe {
+        *body = 0xCD;
+    }
+    let during = bliss_rt::heap_stats().large_object_bytes;
+    assert!(
+        during > before,
+        "the large object should be accounted before GC (before={before}, during={during})"
+    );
+
+    // Force a full collection. Nothing references the object.
+    full_gc().expect("full_gc");
+
+    let after = bliss_rt::heap_stats().large_object_bytes;
+    assert!(
+        after < during,
+        "a dead single-region large object was not reclaimed \
+         (before={before}, during={during}, after={after})"
+    );
+    assert_eq!(
+        after, before,
+        "large-object accounting should return to baseline after the dead object is freed"
+    );
+}
+
+#[test]
 fn pinned_large_object_survives_a_major_gc_with_no_references() {
     let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
     init_heap(&gc_config()).expect("init_heap");

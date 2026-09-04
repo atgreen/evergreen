@@ -2111,6 +2111,7 @@ impl Collector for HeapCollector {
         // Compute live_bytes per region from mark results.
         // Also run finalizers for dead objects and break their weak pointers.
         let mut dead_object_vals: Vec<BlissVal> = Vec::new();
+        let region_size = state.config.region_size;
         for (idx, region) in state.regions.iter_mut().enumerate() {
             match region.header.kind {
                 RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject => {
@@ -2136,9 +2137,19 @@ impl Collector for HeapCollector {
                         let _ = body_size;
                         if !unsafe { header_is_forwarded(header_ptr) } {
                             let body_addr = cursor + OBJECT_HEADER_SIZE;
-                            if region.header.kind == RegionKind::LargeObject
-                                || marked.contains(&body_addr)
-                            {
+                            // bliss-jg6g: a single-region large object (footprint
+                            // within one region) is marked by reachability like
+                            // any other object, so an unreferenced one is
+                            // reclaimed by the LargeObject free arm below. A
+                            // MULTI-region large object stays force-live: its
+                            // continuation regions carry no header at their base,
+                            // so per-region liveness cannot be computed safely
+                            // (freeing a continuation while the start is live
+                            // would corrupt) — that is a separate, rarer case.
+                            let large_multiregion = region.header.kind
+                                == RegionKind::LargeObject
+                                && (top - base) > region_size;
+                            if large_multiregion || marked.contains(&body_addr) {
                                 live += total_size as u32;
                             } else {
                                 // Object is dead — queue for finalization.
