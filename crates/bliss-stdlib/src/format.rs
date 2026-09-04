@@ -2065,6 +2065,8 @@ fn format_impl(
                 *arg_idx += 1;
                 let f = if val.is_single_float() {
                     val.as_single_float() as f64
+                } else if val.is_double_float() {
+                    val.as_double_float()
                 } else if val.is_fixnum() {
                     val.as_fixnum() as f64
                 } else {
@@ -2143,6 +2145,8 @@ fn format_impl(
                 *arg_idx += 1;
                 let f = if val.is_single_float() {
                     val.as_single_float() as f64
+                } else if val.is_double_float() {
+                    val.as_double_float()
                 } else if val.is_fixnum() {
                     val.as_fixnum() as f64
                 } else {
@@ -2192,6 +2196,8 @@ fn format_impl(
                 // Shortest round-trip from the f32 for single-floats (bliss-8zrb).
                 let s = if val.is_single_float() {
                     format!("{}", val.as_single_float())
+                } else if val.is_double_float() {
+                    format!("{}", val.as_double_float())
                 } else if val.is_fixnum() {
                     format!("{}", val.as_fixnum() as f64)
                 } else {
@@ -2210,6 +2216,8 @@ fn format_impl(
                 *arg_idx += 1;
                 let f = if val.is_single_float() {
                     val.as_single_float() as f64
+                } else if val.is_double_float() {
+                    val.as_double_float()
                 } else if val.is_fixnum() {
                     val.as_fixnum() as f64
                 } else {
