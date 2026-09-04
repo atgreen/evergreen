@@ -5867,7 +5867,7 @@ fn seed_compile_time_binding(env: &mut Env, symbol: BlissVal, value: BlissVal) {
 /// shadowed by a present copy). GC-safe: symbol handles are immediates and the
 /// package registry stores them directly — no Bliss allocation.
 fn home_defined_symbol(env: &Env, name_sym: BlissVal) {
-    if !name_sym.is_symbol() || env.current_package != "COMMON-LISP-USER" {
+    if !name_sym.is_symbol() {
         return;
     }
     // The bootstrap prelude defines the standard library in the CL-USER context
@@ -5876,22 +5876,41 @@ fn home_defined_symbol(env: &Env, name_sym: BlissVal) {
     if !BOOT_COMPLETE.with(|c| c.get()) {
         return;
     }
+    // The package the definition (DEFUN/DEFVAR/DEFMACRO/…) is being established
+    // in — canonicalized, since `current_package` may be a nickname ("CL-USER").
+    let pkg_name = resolve_package_name_cow(env, &env.current_package).into_owned();
     let full = sym_name(name_sym);
     let bare = symbol_bare_name(&full);
     if full != bare {
-        // Package-qualified (or keyword) print name: homed by whoever interned
-        // it; do not re-home into CL-USER.
+        // A package-qualified (or keyword) print name: the symbol was interned
+        // by whoever qualified it; do not re-home it here.
         return;
     }
     if let Some(cl) = bliss_stdlib::find_package("COMMON-LISP") {
         if bliss_stdlib::find_present_symbol(cl, &bare).is_some() {
-            // A standard CL symbol inherited into CL-USER stays inherited.
+            // A standard CL symbol inherited into the definition package stays
+            // inherited — never re-homed by a user (re)definition.
             return;
         }
     }
-    if let Some(pkg) = bliss_stdlib::find_package("COMMON-LISP-USER") {
-        let _ = bliss_stdlib::intern_present(pkg, &bare, name_sym);
-    }
+    let Some(pkg) = bliss_stdlib::find_package(&pkg_name) else {
+        return;
+    };
+    // Register the symbol PRESENT in the definition package so FIND-SYMBOL
+    // reports :INTERNAL / :EXTERNAL rather than walking the use-graph and
+    // reporting :INHERITED (bliss-i2pu). Previously this only fired for
+    // COMMON-LISP-USER; a DEFUN/DEFVAR in any other user package left its symbol
+    // unregistered there, so a definition made inside a package looked inherited
+    // from outside it.
+    let _ = bliss_stdlib::intern_present(pkg, &bare, name_sym);
+    // NOTE: SYMBOL-PACKAGE still reports COMMON-LISP for such a symbol, because
+    // the reader defaults a bare name's home to COMMON-LISP (and even leaks it
+    // present there) before this runs — the same representation issue behind
+    // bliss-9fi3 (RENAME-PACKAGE). Correcting the home cell here is not reliable
+    // while the leak stands (the "stays inherited" check above cannot tell a
+    // genuine inherited CL symbol from a leaked one), so the home fix is left to
+    // that representation work. FIND-SYMBOL status — this bead's symptom — is
+    // now correct.
 }
 
 fn symbol_leaf_name(name: &str) -> &str {
