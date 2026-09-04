@@ -535,7 +535,10 @@
   (let ((var (car binding))
         (package (if (cdr binding) (car (cdr binding)) '*package*))
         (result (if (cdr (cdr binding)) (car (cdr (cdr binding))) nil)))
-    `(dolist (,var (bliss-internal::package-symbols ,package nil) ,result)
+    ;; :external — only the package's exported symbols (CLHS); passing NIL here
+    ;; enumerated every PRESENT symbol, which broke UIOP's ensure-package
+    ;; export bookkeeping (bliss-jnzb).
+    `(dolist (,var (bliss-internal::package-symbols ,package :external) ,result)
        ,@body)))
 
 (defmacro do-symbols (binding &rest body)

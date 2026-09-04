@@ -2104,6 +2104,24 @@ fn package_storage_is_registry_backed() {
         ),
         "(NIL \"NEWP\")"
     );
+    // CLHS 11.1.1.2.1 (bliss-jnzb): a package inherits only the EXTERNAL
+    // symbols of directly-used packages — internal symbols are not inherited,
+    // use is not transitive, and DO-EXTERNAL-SYMBOLS enumerates exports only.
+    assert_eq!(
+        eval_ok(
+            "(progn
+               (defpackage :jnzb-a (:use :cl) (:export #:ex))
+               (defpackage :jnzb-b (:use :cl :jnzb-a))
+               (defpackage :jnzb-c (:use :cl :jnzb-b))
+               (eval (read-from-string \"(progn (in-package :jnzb-a) (defun int-fn () 2) (in-package :cl-user))\"))
+               (list (nth-value 1 (find-symbol \"INT-FN\" :jnzb-b))   ; NIL — internal not inherited
+                     (nth-value 1 (find-symbol \"EX\" :jnzb-b))       ; :INHERITED
+                     (nth-value 1 (find-symbol \"EX\" :jnzb-c))       ; NIL — use not transitive
+                     (nth-value 1 (find-symbol \"INT-FN\" :jnzb-a))   ; :INTERNAL
+                     (let ((acc nil)) (do-external-symbols (s :jnzb-a) (push s acc)) (length acc))))"
+        ),
+        "(NIL :INHERITED NIL :INTERNAL 1)"
+    );
     // RENAME-PACKAGE follows through to already-interned symbols (bliss-9fi3):
     // SYMBOL-PACKAGE reports the new package, the symbol prints with the new
     // qualifier, identity is preserved, and definitions keyed under the old

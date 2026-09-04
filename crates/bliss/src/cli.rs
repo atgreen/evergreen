@@ -6257,6 +6257,7 @@ fn home_package_of_name(name: &str) -> String {
 /// [`name_owned_by_noncl_package`], computed once so COMMON-LISP enumeration is
 /// O(all-package-symbols) instead of O(symbols × packages) (bliss-gq5.5).
 fn noncl_owned_names(_env: &Env) -> std::collections::HashSet<String> {
+    let cl = bliss_stdlib::find_package("COMMON-LISP");
     let mut owned = std::collections::HashSet::new();
     for pkg in bliss_stdlib::list_all_packages() {
         let Some(pkg_name) = bliss_stdlib::package_name(pkg) else {
@@ -6267,15 +6268,34 @@ fn noncl_owned_names(_env: &Env) -> std::collections::HashSet<String> {
         }
         for sym in bliss_stdlib::present_symbols(pkg) {
             let name = sym_name(sym);
-            if home_package_of_name(&name) == pkg_name {
-                owned.insert(symbol_bare_name(&name));
+            let bare = symbol_bare_name(&name);
+            if noncl_owns(cl, &pkg_name, &name, &bare) {
+                owned.insert(bare);
             }
         }
     }
     owned
 }
 
+/// Ownership test shared by [`noncl_owned_names`] / [`name_owned_by_noncl_package`]:
+/// package `pkg_name` (non-CL) owns a present symbol either when its registry
+/// key homes it there, or when the key is BARE and the name is not a genuine
+/// COMMON-LISP-table symbol — i.e. a definition made in that package that the
+/// reader mis-homed to COMMON-LISP (the bliss-xmxf representation leak).
+/// Without the second arm, such a symbol counts as CL's, so COMMON-LISP claims
+/// it external and every package using CL wrongly inherits it (bliss-jnzb).
+fn noncl_owns(cl: Option<BlissVal>, pkg_name: &str, full_name: &str, bare: &str) -> bool {
+    let home = home_package_of_name(full_name);
+    if home == pkg_name {
+        return true;
+    }
+    home == "COMMON-LISP"
+        && full_name == bare
+        && !cl.is_some_and(|cl| bliss_stdlib::find_present_symbol(cl, bare).is_some())
+}
+
 fn name_owned_by_noncl_package(_env: &Env, bare_name: &str) -> bool {
+    let cl = bliss_stdlib::find_package("COMMON-LISP");
     for pkg in bliss_stdlib::list_all_packages() {
         let Some(pkg_name) = bliss_stdlib::package_name(pkg) else {
             continue;
@@ -6284,7 +6304,7 @@ fn name_owned_by_noncl_package(_env: &Env, bare_name: &str) -> bool {
             continue;
         }
         if let Some(sym) = bliss_stdlib::find_present_symbol(pkg, bare_name) {
-            if home_package_of_name(&sym_name(sym)) == pkg_name {
+            if noncl_owns(cl, &pkg_name, &sym_name(sym), bare_name) {
                 return true;
             }
         }
@@ -6475,47 +6495,46 @@ fn find_symbol_in_package(
     pkg_name: &str,
     bare_name: &str,
 ) -> Option<(BlissVal, &'static str)> {
-    // Uppercase the name once, then walk the use-graph with a visited set. ASDF's
-    // package graph is dense with diamonds (uiop is used by nearly everything and
-    // itself uses ~15 uiop/* packages), so an un-memoised DFS re-walked shared
-    // packages combinatorially — and FIND-SYMBOL is called once per inherited
-    // symbol while a package is being defined. Memoising collapses each lookup
-    // to O(reachable packages) (bliss-lb6.5).
     let bare_upper = bare_name.to_uppercase();
-    let mut visited: HashSet<u64> = HashSet::new();
     let Some(root) = bliss_stdlib::find_package(&resolve_package_name_cow(env, pkg_name)) else {
         return None;
     };
-    // The special-cased packages are compared by IDENTITY during the walk, so
-    // resolve their handles once here rather than re-deriving a name per step.
+    // The special-cased packages are compared by IDENTITY, so resolve their
+    // handles once here rather than re-deriving a name per step.
     let cl = bliss_stdlib::find_package("COMMON-LISP");
     let keyword = bliss_stdlib::find_package("KEYWORD");
-    find_symbol_in_package_rec(env, root, cl, keyword, &bare_upper, &mut visited)
+    // A symbol present in (or specially owned by) the package itself.
+    if let Some(hit) = present_symbol_with_status(env, root, cl, keyword, &bare_upper) {
+        return Some(hit);
+    }
+    // CLHS 11.1.1.2.1: a package inherits only the EXTERNAL symbols of the
+    // packages it uses, and use is NOT transitive — PB using PA does not see
+    // PA's internal or inherited symbols (bliss-jnzb; previously this walked
+    // the whole use-graph and accepted any present symbol). Re-exporting an
+    // inherited symbol (UIOP's :use-reexport) records it in the re-exporting
+    // package's external table (`add_symbol` external=true), so one level over
+    // the direct use-list is the complete CLHS-visible set.
+    for used in bliss_stdlib::package_use_list(root) {
+        if let Some((sym, "EXTERNAL")) =
+            present_symbol_with_status(env, used, cl, keyword, &bare_upper)
+        {
+            return Some((sym, "INHERITED"));
+        }
+    }
+    None
 }
 
-/// Walk a package's use-graph looking for `bare_upper`, recursing on package
-/// HANDLES rather than names.
-///
-/// The name-keyed version turned each used package handle back into a `String`
-/// (an allocation and two lock round-trips per used package, via
-/// `package_name`) only for the recursive call to turn that name straight back
-/// into a handle with `find_package`. Since this runs once per reachable
-/// package per symbol token read, that round-trip was one of the largest costs
-/// of loading a package-heavy file: `package_name` alone was ~5.5% of an ASDF
-/// load. Handles are pinned, so their raw value is a stable identity for the
-/// visited set.
-fn find_symbol_in_package_rec(
+/// The symbol `bare_upper` names in `pkg` itself — present in its tables, or
+/// specially owned for COMMON-LISP / KEYWORD — with its :INTERNAL/:EXTERNAL
+/// status. Inheritance from used packages is the caller's job
+/// ([`find_symbol_in_package`]); this never walks a use-list.
+fn present_symbol_with_status(
     env: &Env,
     pkg: BlissVal,
     cl: Option<BlissVal>,
     keyword: Option<BlissVal>,
     bare_upper: &str,
-    visited: &mut HashSet<u64>,
 ) -> Option<(BlissVal, &'static str)> {
-    if !visited.insert(pkg.to_raw()) {
-        // Already explored this package on another use-path.
-        return None;
-    }
     if cl == Some(pkg) {
         // COMMON-LISP owns a bare name only if it is an already-interned symbol
         // that no user package homes. Never intern here: FIND-SYMBOL must have
@@ -6543,11 +6562,9 @@ fn find_symbol_in_package_rec(
         return reader::find_symbol_index(&format!("KEYWORD:{bare_upper}"))
             .map(|idx| (BlissVal::from_symbol_index(idx), "EXTERNAL"));
     }
-    // Borrow the package briefly: resolve the symbol directly, and only clone
-    // the small `uses` list (package names, not the symbols map) if we must
-    // recurse. Cloning the whole PackageDef here — its entire `symbols` HashMap
-    // — on every lookup was a dominant cost while defining ASDF's packages
-    // (bliss-gq5.2).
+    // Borrow the package briefly: resolve the symbol directly. Cloning the
+    // whole PackageDef here — its entire `symbols` HashMap — on every lookup
+    // was a dominant cost while defining ASDF's packages (bliss-gq5.2).
     if let Some(sym) = bliss_stdlib::find_present_symbol(pkg, bare_upper) {
         let status = if bliss_stdlib::is_external_symbol(pkg, bare_upper) {
             "EXTERNAL"
@@ -6555,13 +6572,6 @@ fn find_symbol_in_package_rec(
             "INTERNAL"
         };
         return Some((sym, status));
-    }
-    for used in bliss_stdlib::package_use_list(pkg) {
-        if let Some((sym, _)) =
-            find_symbol_in_package_rec(env, used, cl, keyword, bare_upper, visited)
-        {
-            return Some((sym, "INHERITED"));
-        }
     }
     None
 }
@@ -7381,6 +7391,27 @@ fn typep_matches(env: &mut Env, object: BlissVal, type_spec: BlissVal) -> Result
         }
         _ => Ok(false),
     }
+}
+
+/// The package's EXTERNAL symbols only — what DO-EXTERNAL-SYMBOLS and
+/// `loop :being :the :external-symbols` enumerate, and exactly what a using
+/// package inherits (CLHS 11.1.1.2.1). Previously these enumerated every
+/// present symbol, so UIOP's ensure-package treated internal symbols of used
+/// packages as inheritable and its export bookkeeping broke once FIND-SYMBOL
+/// became external-only (bliss-jnzb). The special packages' externals are
+/// fabricated from the interned table (they have no external-table entries),
+/// so route them through [`package_symbols`], which models that set.
+fn package_external_symbols(env: &Env, package_name: &str) -> Vec<BlissVal> {
+    let package_name = normalize_package_name(package_name);
+    if package_name == "COMMON-LISP"
+        || package_name == "COMMON-LISP-USER"
+        || package_name == "KEYWORD"
+    {
+        return package_symbols(env, &package_name, false);
+    }
+    bliss_stdlib::find_package(&package_name)
+        .map(bliss_stdlib::external_symbols_of)
+        .unwrap_or_default()
 }
 
 fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Vec<BlissVal> {
@@ -13976,16 +14007,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 } else {
                     normalize_package_name(&val_as_str(args[0]))
                 };
-                let include_inherited = if let Some(arg) = args.get(1) {
-                    !arg.is_nil()
-                } else {
-                    false
-                };
-                return Ok(vec_to_list(&package_symbols(
-                    env,
-                    &package,
-                    include_inherited,
-                )));
+                // 2nd arg: NIL → present symbols, :EXTERNAL → external symbols
+                // only (DO-EXTERNAL-SYMBOLS), any other true value → accessible
+                // (present + inherited) symbols.
+                let mode = args.get(1).copied().unwrap_or(NIL);
+                if mode.is_symbol() && symbol_bare_name(&sym_name(mode)) == "EXTERNAL" {
+                    return Ok(vec_to_list(&package_external_symbols(env, &package)));
+                }
+                return Ok(vec_to_list(&package_symbols(env, &package, !mode.is_nil())));
             }
             "USE-PACKAGE" => {
                 let args = eval_args(cdr, env)?;
@@ -15479,6 +15508,7 @@ impl bliss_rt::gc::TraceHostRoots for LoopBeingSource {
         match self {
             LoopBeingSource::Symbols(form)
             | LoopBeingSource::OwnSymbols(form)
+            | LoopBeingSource::ExternalSymbols(form)
             | LoopBeingSource::HashKeys(form)
             | LoopBeingSource::HashValues(form) => visit(form),
         }
@@ -15584,10 +15614,12 @@ enum LoopForLimit {
 enum LoopBeingSource {
     /// `:being :the :symbols :in pkg` — all accessible symbols (incl. inherited).
     Symbols(BlissVal),
-    /// `:being :the {:external-symbols | :present-symbols} :in pkg` — the package's
-    /// own symbols (matching DO-EXTERNAL-SYMBOLS; ASDF DEFINE-PACKAGE exports what
-    /// it homes here).
+    /// `:being :the :present-symbols :in pkg` — the package's own (present)
+    /// symbols, internal and external.
     OwnSymbols(BlissVal),
+    /// `:being :the :external-symbols :in pkg` — exported symbols only
+    /// (matching DO-EXTERNAL-SYMBOLS; CLHS 6.1.2.1.7 / bliss-jnzb).
+    ExternalSymbols(BlissVal),
     HashKeys(BlissVal),
     HashValues(BlissVal),
 }
@@ -15833,10 +15865,12 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                                         ));
                                     }
                                     let pkg = p.read_form()?;
-                                    if kind_bare == "SYMBOLS" {
-                                        LoopBeingSource::Symbols(pkg)
-                                    } else {
-                                        LoopBeingSource::OwnSymbols(pkg)
+                                    match kind_bare {
+                                        "SYMBOLS" => LoopBeingSource::Symbols(pkg),
+                                        "EXTERNAL-SYMBOLS" => {
+                                            LoopBeingSource::ExternalSymbols(pkg)
+                                        }
+                                        _ => LoopBeingSource::OwnSymbols(pkg),
                                     }
                                 }
                                 "HASH-KEYS" => {
@@ -16209,6 +16243,11 @@ fn eval_loop_extended(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissErr
                             let name =
                                 normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
                             (package_symbols(env, &name, false), Vec::new())
+                        }
+                        LoopBeingSource::ExternalSymbols(pkg_form) => {
+                            let name =
+                                normalize_package_name(&val_as_str(eval_form(*pkg_form, env)?));
+                            (package_external_symbols(env, &name), Vec::new())
                         }
                         LoopBeingSource::HashKeys(table_form) => {
                             let table = eval_form(*table_form, env)?;
@@ -22559,6 +22598,15 @@ fn eval_with_open_file(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissEr
 }
 
 // ── DEFPACKAGE ──────────────────────────────────────────────────
+
+/// Append the external-symbol names of `from` to a DEFPACKAGE export list
+/// (:REEXPORT / UIOP's :USE-REEXPORT and :MIX-REEXPORT).
+fn push_reexports(env: &Env, from: &str, exports: &mut Vec<String>) {
+    for sym in package_external_symbols(env, from) {
+        exports.push(symbol_bare_name(&sym_name(sym)));
+    }
+}
+
 fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
     let (name_form, mut opts) = cp(cdr);
     bliss_rt::rooted_ref!(_opts_root = &mut opts);
@@ -22599,20 +22647,22 @@ fn eval_defpackage(cdr: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
                 .trim_start_matches("KEYWORD:")
                 .trim_start_matches(':');
             match key_bare {
-                "USE" | "USE-REEXPORT" | "MIX" | "MIX-REEXPORT" => {
+                "USE" | "MIX" => {
                     for v in list_to_vec(val_list) {
                         uses.push(resolve_package_name(env, &val_as_str(v)));
                     }
                 }
-                "REEXPORT" => {
+                "USE-REEXPORT" | "MIX-REEXPORT" | "REEXPORT" => {
+                    // UIOP define-package: use the packages AND re-export their
+                    // external symbols from this one. The re-export must be
+                    // recorded in THIS package's external table: inheritance is
+                    // one level deep (CLHS 11.1.1.2.1, bliss-jnzb), so a
+                    // package using this one only sees what is external HERE —
+                    // the previous transitive use-graph walk masked this.
                     for v in list_to_vec(val_list) {
                         let from = resolve_package_name(env, &val_as_str(v));
-                        uses.push(from.clone());
-                        if let Some(pkg) = bliss_stdlib::find_package(&from) {
-                            for sym in bliss_stdlib::external_symbols_of(pkg) {
-                                exports.push(symbol_bare_name(&sym_name(sym)));
-                            }
-                        }
+                        push_reexports(env, &from, &mut exports);
+                        uses.push(from);
                     }
                 }
                 "EXPORT" => {
