@@ -248,8 +248,12 @@ fn build_vector(vals: &[BlissVal]) -> BlissVal {
             for (i, value) in vals.iter().enumerate() {
                 *(body.add(8 + i * 8) as *mut u64) = value.to_raw();
             }
-            // Value points at the object header (body − 8), like alloc_str.
-            return BlissVal::from_heap_ptr(body.sub(8));
+            // Value points at the object header. For a small object that is
+            // body − 8; a large SIMPLE_VECTOR has a 16-byte header prefix, so
+            // subtract the true header offset or the value points into the
+            // size-extension word and the vector is misread (bliss-tjru).
+            let header_off = bliss_rt::gc::body_header_offset(body_size);
+            return BlissVal::from_heap_ptr(body.sub(header_off));
         }
     }
     // OOM fallback: a leaked block, so vector allocation never fails.
@@ -268,24 +272,38 @@ fn build_vector(vals: &[BlissVal]) -> BlissVal {
 
 /// Get vector length from a heap-object BlissVal known to be a vector.
 #[inline]
+fn vector_payload_offset(ptr: *const u8) -> usize {
+    // The length word begins the payload, at header + 8 (small) or + 16 (large).
+    let header = unsafe { *(ptr as *const ObjectHeader) };
+    if header.is_large_object() {
+        16
+    } else {
+        8
+    }
+}
+
+#[inline]
 fn vector_length(v: BlissVal) -> usize {
     let ptr = unsafe { v.as_ptr() };
-    unsafe { *(ptr.add(8) as *const u64) as usize }
+    let off = vector_payload_offset(ptr);
+    unsafe { *(ptr.add(off) as *const u64) as usize }
 }
 
 /// Get vector element at index from a heap-object BlissVal.
 #[inline]
 fn vector_elt(v: BlissVal, idx: usize) -> BlissVal {
     let ptr = unsafe { v.as_ptr() };
-    unsafe { *(ptr.add(16 + idx * 8) as *const BlissVal) }
+    let off = vector_payload_offset(ptr);
+    unsafe { *(ptr.add(off + 8 + idx * 8) as *const BlissVal) }
 }
 
 /// Set vector element at index.
 #[inline]
 fn vector_set_elt(v: BlissVal, idx: usize, val: BlissVal) {
     let ptr = unsafe { v.as_ptr() };
+    let off = vector_payload_offset(ptr);
     unsafe {
-        *(ptr.add(16 + idx * 8) as *mut BlissVal) = val;
+        *(ptr.add(off + 8 + idx * 8) as *mut BlissVal) = val;
     }
 }
 

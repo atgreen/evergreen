@@ -1405,12 +1405,18 @@ impl HeapCollector {
                 if body_size == 0 && type_id == 0 {
                     break;
                 }
-                let total_size =
-                    align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                // Stride and payload must honour the large-object 16-byte header
+                // (bliss-tjru): a large SIMPLE_VECTOR's payload is at cursor+16,
+                // and its footprint is the stored u64 total, not
+                // align_up(8+body). Reading fields at cursor+8 would treat the
+                // size-extension word as the element count and scan far past the
+                // object.
+                let total_size = unsafe { header_total_bytes(header_ptr) };
                 if !unsafe { header_is_forwarded(header_ptr) } {
+                    let body_off = unsafe { body_offset(header_ptr) };
                     unsafe {
                         trace_object(
-                            (cursor + OBJECT_HEADER_SIZE) as *mut u8,
+                            (cursor + body_off) as *mut u8,
                             type_id,
                             body_size as usize,
                             |slot| mark_ref(*slot, &mut marked, &mut mark_worklist),
@@ -2022,8 +2028,11 @@ impl Collector for HeapCollector {
                         if body_size == 0 && type_id == 0 {
                             break;
                         }
-                        let total_size =
-                            align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                        // Footprint from the header so large objects (16-byte
+                        // header + u64 size extension) stride correctly
+                        // (bliss-tjru). The index key stays cursor+8 to match
+                        // ref_body_addr's identity for every heap reference.
+                        let total_size = unsafe { header_total_bytes(header_ptr) };
                         if !unsafe { header_is_forwarded(header_ptr) } {
                             let body_addr = cursor + OBJECT_HEADER_SIZE;
                             object_index
@@ -2083,9 +2092,16 @@ impl Collector for HeapCollector {
         // object, following its type_id-specific layout.
         while let Some(obj_addr) = scan_worklist.pop() {
             if let Some(&(_total, _idx, type_id, body_len)) = object_index.get(&obj_addr) {
-                // SAFETY: obj_addr is an indexed live object body of body_len bytes.
+                // The index key is the header+8 identity; the real payload is
+                // header + body_offset (8, or 16 for a large object). Trace the
+                // real payload so a large object's fields are read at the right
+                // offset rather than 8 bytes into its size-extension word
+                // (bliss-tjru).
+                let header_ptr = (obj_addr - OBJECT_HEADER_SIZE) as *const u8;
+                let payload = (obj_addr - OBJECT_HEADER_SIZE) + unsafe { body_offset(header_ptr) };
+                // SAFETY: payload is a live object body of body_len bytes.
                 unsafe {
-                    trace_object(obj_addr as *mut u8, type_id, body_len, |slot| {
+                    trace_object(payload as *mut u8, type_id, body_len, |slot| {
                         mark_ref(*slot, &mut marked, &mut scan_worklist);
                     });
                 }
@@ -2113,8 +2129,11 @@ impl Collector for HeapCollector {
                         if body_size == 0 && type_id == 0 {
                             break;
                         }
-                        let total_size =
-                            align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                        // Stride by the true footprint so large objects are
+                        // walked correctly (bliss-tjru); the marked-set key is
+                        // the cursor+8 identity, matching object_index.
+                        let total_size = unsafe { header_total_bytes(header_ptr) };
+                        let _ = body_size;
                         if !unsafe { header_is_forwarded(header_ptr) } {
                             let body_addr = cursor + OBJECT_HEADER_SIZE;
                             if region.header.kind == RegionKind::LargeObject
@@ -3866,6 +3885,22 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
 /// GC-safety: takes an `f64` (no `BlissVal` inputs), so there is nothing to
 /// root across the allocation. Callers that hold live `BlissVal`s across this
 /// call must root those as usual.
+/// The header→payload offset (`OBJECT_HEADER_SIZE`, or `LARGE_OBJECT_PAYLOAD_OFFSET`
+/// for large objects) that [`alloc_typed`] used for a body of `body_size` bytes.
+/// A builder that constructs an object with `alloc_typed` and then forms the
+/// tagged heap value MUST subtract THIS from the returned body pointer, not a
+/// hardcoded 8 — otherwise a large object's value points 8 bytes past its real
+/// header (into the size-extension word) and is misread as the wrong type
+/// (bliss-tjru).
+pub fn body_header_offset(body_size: usize) -> usize {
+    let (_total, large) = object_footprint(body_size);
+    if large {
+        LARGE_OBJECT_PAYLOAD_OFFSET
+    } else {
+        OBJECT_HEADER_SIZE
+    }
+}
+
 pub fn alloc_double_float(value: f64) -> BlissVal {
     let body = alloc_typed(8, crate::object::type_id::DOUBLE_FLOAT)
         .expect("GC heap unavailable for double-float");

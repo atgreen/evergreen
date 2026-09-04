@@ -2395,6 +2395,45 @@ fn typep_not_and_string_length_compounds() {
 /// forms were corrupted — (make-NAME …) aborted with "undefined function: &REST".
 /// This exercises the whole defstruct surface under GC stress; it must not abort.
 #[test]
+/// bliss-tjru: a large SIMPLE-VECTOR (body >= the large-object threshold, ~65534
+/// elements) has a 16-byte object header, so its value pointer, element
+/// accessors, and the GC's field-tracing must all honour the large-object
+/// payload offset. Before the fix aref/setf saw it as "not a vector", and the
+/// GC scanned its element slots 8 bytes off (reading the size-extension word as
+/// the element count). This exercises usability AND that heap references held
+/// only by a large vector survive collection.
+#[test]
+fn large_simple_vector_is_usable_and_gc_safe() {
+    // Fire a minor GC roughly every 8000 allocations so several collections
+    // land DURING the fill: each must trace the large vector to keep the conses
+    // it already holds alive, exactly the path the fix repairs. make-sequence
+    // avoids make-array's (apply #'vector (make-list n)) so the build is cheap.
+    let prog = "\
+        (let* ((n 65540) (v (make-sequence (quote vector) n))) \
+          (unless (and (vectorp v) (= (length v) n)) (error \"recog\")) \
+          (dotimes (i n) (setf (aref v i) (cons i (- 0 i)))) \
+          (dotimes (i n) \
+            (let ((c (aref v i))) \
+              (unless (and (consp c) (= (car c) i) (= (cdr c) (- 0 i))) \
+                (error \"corrupt\")))) \
+          (princ :ok))";
+    let mut cmd = bliss_bin();
+    cmd.env("BLISS_GC_STRESS", "8000").env("BLISS_GC_POISON", "1");
+    cmd.args(["--eval", prog]);
+    let out = cmd.output().expect("run bliss");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "large vector under GC must not abort (stderr: {})",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("OK"),
+        "expected OK: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 fn defstruct_is_gc_safe_under_stress() {
     let prog = "\
         (defstruct box a b) \
