@@ -2031,8 +2031,31 @@ fn emit_framed_inner(
                 (Opcode::ConstSymbol, AuxData::SymbolRef(idx)) => {
                     const_tagged.insert(r, bliss_rt::value::BlissVal::from_symbol_index(*idx).0);
                 }
-                (Opcode::ConstHeapObj, AuxData::HeapLiteral(v)) => {
-                    const_tagged.insert(r, v.0);
+                (Opcode::ConstHeapObj, AuxData::HeapLiteral(_)) => {
+                    // FAIL-SAFE, not dead code (bliss-8nl). Baking a heap
+                    // literal's tagged pointer as an imm64 is a CORRUPTION bug:
+                    // the moving minor GC rewrites the registry-rooted
+                    // `BytecodeFunction.constants` slots but cannot patch
+                    // emitted code, so the function would later read freed
+                    // nursery — zeroed (values like `(0 . 0)`) or, with
+                    // poisoning, a segfault. T1 had the identical bug
+                    // (bliss-d0b).
+                    //
+                    // Today `background_safe_body` keeps such bodies at T1, so
+                    // this arm is unreachable: a probe here counted ZERO hits
+                    // across the whole test suite, an ASDF load, and a
+                    // deliberate caller/callee inlining case. But that guard
+                    // inspects only the ROOT body's constants, while T2 inlines
+                    // callee bodies whose constants it never examines — so the
+                    // guard is not structurally airtight, and it is exactly the
+                    // kind of hole that reopens silently.
+                    //
+                    // Declining turns any such regression into a T1 fallback
+                    // (slow, correct) instead of heap corruption. Remove this
+                    // only together with a GC-visible constant slot — load
+                    // through the stable `&bf.constants[k]` address the way T1
+                    // does — under bliss-u1x.
+                    return Err(EmitError::UnsupportedOp(op_tag(Opcode::ConstHeapObj)));
                 }
                 (Opcode::ConstNil, _) => {
                     const_tagged.insert(r, bliss_rt::value::NIL.0);
