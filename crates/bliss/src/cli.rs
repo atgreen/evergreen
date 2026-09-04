@@ -11963,6 +11963,16 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     bliss_stdlib::time::get_universal_time(),
                 ));
             }
+            "GET-INTERNAL-REAL-TIME" => {
+                return Ok(BlissVal::from_fixnum(
+                    bliss_stdlib::time::get_internal_real_time(),
+                ));
+            }
+            "GET-INTERNAL-RUN-TIME" => {
+                return Ok(BlissVal::from_fixnum(
+                    bliss_stdlib::time::get_internal_run_time(),
+                ));
+            }
             "ENCODE-UNIVERSAL-TIME" => {
                 // (encode-universal-time second minute hour date month year
                 //  &optional time-zone)
@@ -21891,6 +21901,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "COMPILE-FILE" | "COMPILE-FILE-PATHNAME" | "FILE-WRITE-DATE"
             // Time
             | "GET-UNIVERSAL-TIME" | "ENCODE-UNIVERSAL-TIME" | "DECODE-UNIVERSAL-TIME"
+            | "GET-INTERNAL-REAL-TIME" | "GET-INTERNAL-RUN-TIME"
             // I/O
             | "PRINT" | "PRIN1" | "PRINC" | "WRITE" | "WRITE-STRING" | "WRITE-LINE"
             | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"

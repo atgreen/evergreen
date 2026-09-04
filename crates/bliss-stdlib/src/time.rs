@@ -105,6 +105,28 @@ pub fn get_universal_time() -> i64 {
     unix + DAYS_1900_TO_1970 * SECS_PER_DAY
 }
 
+/// `get-internal-real-time`: milliseconds of wall-clock time since an
+/// arbitrary fixed origin (process start), matching bliss's
+/// `INTERNAL-TIME-UNITS-PER-SECOND` of 1000 (CLHS 25.1.4.3 leaves the origin
+/// unspecified; a process-start origin keeps values small fixnums). Monotonic,
+/// so benchmark deltas are immune to wall-clock adjustments (bliss-jpd0).
+pub fn get_internal_real_time() -> i64 {
+    use std::sync::OnceLock;
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+    let origin = *ORIGIN.get_or_init(std::time::Instant::now);
+    origin.elapsed().as_millis() as i64
+}
+
+/// `get-internal-run-time`: CLHS 25.1.4.3 leaves the meaning
+/// implementation-defined; bliss currently reports elapsed REAL time from the
+/// same origin. (Process-CPU time would need a libc clock_gettime call, and
+/// stdlib deliberately carries no libc dependency — bliss-bca.5 is removing it
+/// for fully static builds. Swap the body when a std/bliss-rt CPU-time source
+/// exists.)
+pub fn get_internal_run_time() -> i64 {
+    get_internal_real_time()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
