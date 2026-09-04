@@ -2420,6 +2420,8 @@ fn long_list_ops_do_not_overflow_the_stack() {
           (unless (= (car (last l)) 39999) (error \"last\")) \
           (let ((tr (copy-tree l))) \
             (unless (= (car (last tr)) 39999) (error \"copy-tree\"))) \
+          (unless (tree-equal l (copy-list l)) (error \"tree-equal\")) \
+          (when (tree-equal l (cons 99 (cdr (copy-list l)))) (error \"tree-equal-ne\")) \
           (unless (equal (copy-list (quote (1 2 . 3))) (quote (1 2 . 3))) (error \"dotted\")) \
           (princ :ok))";
     let mut cmd = bliss_bin();

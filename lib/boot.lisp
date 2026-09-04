@@ -1432,12 +1432,19 @@
       (return pair))))
 
 (defun %tree-equal (a b testfn neg)
-  (if (and (consp a) (consp b))
-      (and (%tree-equal (car a) (car b) testfn neg)
-           (%tree-equal (cdr a) (cdr b) testfn neg))
-      (if (or (consp a) (consp b))
-          nil
-          (let ((r (funcall testfn a b))) (if neg (not r) r)))))
+  ;; Iterate the cdr spine (the deep direction for list-shaped trees) and recurse
+  ;; only into cars, so comparing long flat lists does not overflow the stack
+  ;; (bliss-2r5 kin). An explicit flag drives the loop rather than RETURN.
+  (let ((result t) (running t))
+    (do () ((not running) result)
+      (cond ((and (consp a) (consp b))
+             (if (%tree-equal (car a) (car b) testfn neg)
+                 (setq a (cdr a) b (cdr b))
+                 (setq result nil running nil)))
+            ((or (consp a) (consp b))
+             (setq result nil running nil))
+            (t (let ((r (funcall testfn a b)))
+                 (setq result (if neg (not r) r) running nil)))))))
 
 (defun tree-equal (a b &key (test (function eql)) test-not)
   (%tree-equal a b (or test-not test) (if test-not t nil)))
