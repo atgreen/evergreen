@@ -313,7 +313,7 @@ pub fn call_registered(
         Some(nc) if NATIVE_DEPTH.with(|d| d.get()) < native_depth_cap() => {
             Some(run_native(&nc, sym, args, env))
         }
-        _ => Some(run(callee, args, fn_val, env)),
+        _ => Some(run_with_sym(callee, args, fn_val, sym, env)),
     }
 }
 
@@ -10268,7 +10268,24 @@ pub(super) fn run(
     entry_fn_val: BlissVal,
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
-    run_with_binding(entry, args, entry_fn_val, env, false)
+    run_with_sym(entry, args, entry_fn_val, u32::MAX, env)
+}
+
+/// [`run`], with the callee's registry symbol threaded explicitly for OSR
+/// keying. The main dispatch path (`call_registered`) passes the function
+/// OBJECT as `entry_fn_val` — deliberately, for closure-environment and alias
+/// resolution (bliss-57m/bliss-jtc.23.3) — so deriving the OSR symbol from
+/// `entry_fn_val` left every such activation at `u32::MAX` and made T0→T1 OSR
+/// unreachable in practice: a first-call hot loop interpreted forever
+/// (bliss-j1o7).
+pub(super) fn run_with_sym(
+    entry: Rc<BytecodeFunction>,
+    args: &[BlissVal],
+    entry_fn_val: BlissVal,
+    sym: u32,
+    env: &mut Env,
+) -> Result<BlissVal, BlissError> {
+    run_with_binding(entry, args, entry_fn_val, sym, env, false)
 }
 
 pub(super) fn run_macro(
@@ -10276,13 +10293,14 @@ pub(super) fn run_macro(
     args: &[BlissVal],
     env: &mut Env,
 ) -> Result<BlissVal, BlissError> {
-    run_with_binding(entry, args, NIL, env, true)
+    run_with_binding(entry, args, NIL, u32::MAX, env, true)
 }
 
 fn run_with_binding(
     entry: Rc<BytecodeFunction>,
     args: &[BlissVal],
     entry_fn_val: BlissVal,
+    entry_sym: u32,
     env: &mut Env,
     macro_lambda_list: bool,
 ) -> Result<BlissVal, BlissError> {
@@ -10348,9 +10366,13 @@ fn run_with_binding(
         cleanup_conts: Vec::new(),
         dyn_binds: Vec::new(),
         fn_obj: entry_obj,
-        // is_symbol() is true for the NIL/T constants too, but as_symbol_index
-        // only accepts a TAG_SYMBOL value — thunks pass NIL here, so exclude them.
-        sym: if entry_fn_val.is_symbol() && !entry_fn_val.is_nil() && entry_fn_val != T {
+        // The explicitly-threaded registry symbol wins (bliss-j1o7); fall back
+        // to a symbol-valued entry_fn_val. is_symbol() is true for the NIL/T
+        // constants too, but as_symbol_index only accepts a TAG_SYMBOL value —
+        // thunks pass NIL here, so exclude them.
+        sym: if entry_sym != u32::MAX {
+            entry_sym
+        } else if entry_fn_val.is_symbol() && !entry_fn_val.is_nil() && entry_fn_val != T {
             entry_fn_val.as_symbol_index()
         } else {
             u32::MAX
@@ -15086,15 +15108,50 @@ fn maybe_osr(
     env: &mut Env,
 ) -> Option<Result<OsrOutcome, BlissError>> {
     // Backward edge into an empty-operand-stack header, in a named function.
+    // BLISS_OSR_DEBUG=1 traces why edges are rejected (bliss-j1o7 was found
+    // this way: every activation ran with sym == u32::MAX). Cached: this runs
+    // on every backward jump of interpreted code.
+    fn osr_debug() -> bool {
+        use std::sync::OnceLock;
+        static D: OnceLock<bool> = OnceLock::new();
+        *D.get_or_init(|| std::env::var_os("BLISS_OSR_DEBUG").is_some())
+    }
+    let dbg = osr_debug();
     if (target_bcp as usize) >= act.bcp || act.sp_top != 0 || act.sym == u32::MAX {
+        if dbg {
+            eprintln!(
+                "[osr] reject pre: target {} bcp {} sp_top {} sym {:#x}",
+                target_bcp, act.bcp, act.sp_top, act.sym
+            );
+        }
         return None;
     }
     let fn_obj = act.fn_obj?;
     if bliss_rt::function::back_edge_count(fn_obj) < osr_threshold() {
         return None;
     }
-    let osr = compile_osr(act.sym)?;
-    let stub_off = *osr.entries.get(&target_bcp)?;
+    let osr = match compile_osr(act.sym) {
+        Some(o) => o,
+        None => {
+            if dbg {
+                eprintln!("[osr] compile_osr failed for sym {}", act.sym);
+            }
+            return None;
+        }
+    };
+    let stub_off = match osr.entries.get(&target_bcp) {
+        Some(&s) => s,
+        None => {
+            if dbg {
+                eprintln!(
+                    "[osr] no entry for target {} (entries: {:?})",
+                    target_bcp,
+                    osr.entries.keys().collect::<Vec<_>>()
+                );
+            }
+            return None;
+        }
+    };
     Some(run_native_osr(&osr, stub_off, act.frame, env))
 }
 
