@@ -2162,6 +2162,22 @@ fn package_storage_is_registry_backed() {
 }
 
 #[test]
+fn float_literal_overflow_signals_catchable_error() {
+    // CLHS 2.3.2.2 (bliss-37sr): a float literal outside the target format's
+    // range signals a catchable error (SBCL: FLOATING-POINT-OVERFLOW) rather
+    // than reading as infinity; in-range literals are unaffected.
+    assert_eq!(
+        eval_ok(
+            "(list (handler-case (read-from-string \"1e40\") (error () :overflow))
+                   (handler-case (read-from-string \"1d400\") (error () :overflow))
+                   (read-from-string \"1e38\")
+                   (read-from-string \"1d308\"))"
+        ),
+        "(:OVERFLOW :OVERFLOW 1.0e38 1.0d308)"
+    );
+}
+
+#[test]
 fn macro_lambda_list_supports_nested_destructuring() {
     // ASDF's (defmacro with-upgradability ((&optional) &body body) ...) shape:
     // a nested destructuring pattern with lambda-list keywords must expand.

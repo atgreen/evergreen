@@ -1368,11 +1368,27 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
     // (e.g. `FACE` in a base-16 context) are not misread as floats.
     if read_base == 10 {
         if let Some((f, is_double)) = parse_decimal_float(s) {
-            return Ok(Some(if is_double {
-                bliss_rt::gc::alloc_double_float(f)
-            } else {
-                BlissVal::from_single_float(f as f32)
-            }));
+            // CLHS 2.3.2.2: a literal outside the target format's range must
+            // signal an error, not read as infinity (bliss-37sr; SBCL signals
+            // FLOATING-POINT-OVERFLOW). The token grammar admits no "inf"
+            // spelling, so a non-finite result here is always overflow — of
+            // the f64 parse for a double literal, or of the f32 narrowing for
+            // a single one.
+            if is_double {
+                if f.is_infinite() {
+                    return Err(BlissError::ArithmeticError(format!(
+                        "floating-point overflow reading double-float literal {s}"
+                    )));
+                }
+                return Ok(Some(bliss_rt::gc::alloc_double_float(f)));
+            }
+            let narrowed = f as f32;
+            if narrowed.is_infinite() {
+                return Err(BlissError::ArithmeticError(format!(
+                    "floating-point overflow reading single-float literal {s}"
+                )));
+            }
+            return Ok(Some(BlissVal::from_single_float(narrowed)));
         }
     }
     // Integer with read_base. Integers that fit the 61-bit fixnum range are
