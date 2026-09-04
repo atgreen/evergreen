@@ -286,6 +286,25 @@ impl BlissVal {
             header.type_id() == crate::object::type_id::STANDARD_OBJECT
         }
     }
+
+    /// True if this value is a heap-allocated DOUBLE-FLOAT (type_id
+    /// `DOUBLE_FLOAT`). Single-floats are immediates (tag `100`) and return
+    /// false here; use [`is_single_float`](Self::is_single_float) for those.
+    ///
+    /// # Safety note
+    /// Dereferences the heap pointer to read the `ObjectHeader`; safe only when
+    /// the pointer is valid and live. Returns `false` for non-heap-object tags.
+    pub fn is_double_float(self) -> bool {
+        if self.tag() != TAG_HEAP_OBJECT {
+            return false;
+        }
+        // SAFETY: caller guarantees the heap pointer is valid.
+        unsafe {
+            let ptr = self.as_ptr();
+            let header = *(ptr as *const crate::object::ObjectHeader);
+            header.type_id() == crate::object::type_id::DOUBLE_FLOAT
+        }
+    }
 }
 
 // ── Extraction ─────────────────────────────────────────────────────
@@ -313,6 +332,21 @@ impl BlissVal {
         );
         let bits = (self.0 >> 32) as u32;
         f32::from_bits(bits)
+    }
+
+    /// Extract the DOUBLE-FLOAT value. Panics if not a heap double-float.
+    /// The `f64` lives in the object body, one word past the header
+    /// (`OBJECT_HEADER_SIZE`), written by [`crate::gc::alloc_double_float`].
+    pub fn as_double_float(self) -> f64 {
+        assert!(
+            self.is_double_float(),
+            "as_double_float called on non-double-float value"
+        );
+        // SAFETY: a live DOUBLE_FLOAT body holds an f64 at header + 8 bytes.
+        unsafe {
+            let body = self.as_ptr().add(8) as *const f64;
+            *body
+        }
     }
 
     /// Extract the symbol table index. Panics if not a symbol.

@@ -69,7 +69,7 @@
 ;; long-float literal rounds to 3.1415927) and the single-float magnitude
 ;; extremes. The epsilon / least-positive / double-float constants are not yet
 ;; defined (bliss has no distinct double-float) — see bliss follow-up.
-(defconstant pi 3.141592653589793)
+(defconstant pi 3.141592653589793d0)
 (defconstant most-positive-single-float 3.4028235e38)
 (defconstant most-negative-single-float -3.4028235e38)
 (defconstant lambda-list-keywords

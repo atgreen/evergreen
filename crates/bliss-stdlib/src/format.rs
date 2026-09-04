@@ -816,6 +816,35 @@ pub fn single_float_to_string(x: f32) -> String {
     if s.contains('.') { s } else { format!("{s}.0") }
 }
 
+/// Print a DOUBLE-FLOAT in CL external syntax. Because bliss's
+/// `*read-default-float-format*` is SINGLE-FLOAT, a double always carries an
+/// explicit `d` exponent marker so it reads back as a double (CLHS 22.1.3.1.3):
+/// `1.0d0`, `3.141592653589793d0`, `1.5d-10`. Kept in lockstep with
+/// [`single_float_to_string`] so `prin1`/`~S` and the interpreter's `print_val`
+/// spell doubles identically.
+pub fn double_float_to_string(x: f64) -> String {
+    if x.is_nan() || x.is_infinite() {
+        return format!("{x}");
+    }
+    let a = x.abs();
+    if a != 0.0 && (a < 1e-3 || a >= 1e7) {
+        let s = format!("{x:e}");
+        return match s.split_once('e') {
+            Some((mantissa, exp)) if !mantissa.contains('.') => {
+                format!("{mantissa}.0d{exp}")
+            }
+            Some((mantissa, exp)) => format!("{mantissa}d{exp}"),
+            None => s,
+        };
+    }
+    let s = format!("{x}");
+    if s.contains('.') {
+        format!("{s}d0")
+    } else {
+        format!("{s}.0d0")
+    }
+}
+
 fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
     if v.is_nil() {
         return "NIL".into();
@@ -867,6 +896,9 @@ fn blissval_to_print_inner(v: BlissVal, escapep: bool) -> String {
     }
     if v.is_single_float() {
         return single_float_to_string(v.as_single_float());
+    }
+    if v.is_double_float() {
+        return double_float_to_string(v.as_double_float());
     }
     if v.is_symbol() {
         let idx = v.as_symbol_index();

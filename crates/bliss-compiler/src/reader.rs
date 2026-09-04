@@ -1348,8 +1348,12 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<BlissVal
     // symbol. parse_decimal_float validates the grammar so hex-like symbols
     // (e.g. `FACE` in a base-16 context) are not misread as floats.
     if read_base == 10 {
-        if let Some(f) = parse_decimal_float(s) {
-            return Ok(Some(BlissVal::from_single_float(f)));
+        if let Some((f, is_double)) = parse_decimal_float(s) {
+            return Ok(Some(if is_double {
+                bliss_rt::gc::alloc_double_float(f)
+            } else {
+                BlissVal::from_single_float(f as f32)
+            }));
         }
     }
     // Integer with read_base. Integers that fit the 61-bit fixnum range are
@@ -1377,15 +1381,21 @@ fn fits_fixnum(n: i64) -> bool {
     (MIN..=MAX).contains(&n)
 }
 
-/// Parse a base-10 float literal following CL float syntax, normalizing any
-/// exponent marker (e/s/f/d/l) to `e`. Returns `None` for non-floats.
-fn parse_decimal_float(s: &str) -> Option<f32> {
+/// Parse a base-10 float literal following CL float syntax. The exponent
+/// markers select the float format (CLHS 2.3.2.2): `d`/`D` and `l`/`L` are
+/// DOUBLE-FLOAT; `e`/`E`, `s`/`S`, `f`/`F`, and a marker-less `d.dd` default to
+/// SINGLE-FLOAT (bliss's `*read-default-float-format*` default). Returns
+/// `Some((value, is_double))`, or `None` for non-floats. The value is always
+/// parsed at `f64` precision so a double literal keeps full precision; the
+/// caller narrows to `f32` for the single-float case.
+fn parse_decimal_float(s: &str) -> Option<(f64, bool)> {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(chars.len());
     let mut i = 0;
     let mut has_digit = false;
     let mut has_dot = false;
     let mut has_exp = false;
+    let mut is_double = false;
     let mut prev_digit = false;
 
     if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
@@ -1409,6 +1419,7 @@ fn parse_decimal_float(s: &str) -> Option<f32> {
             && matches!(c, 'e' | 'E' | 's' | 'S' | 'f' | 'F' | 'd' | 'D' | 'l' | 'L')
         {
             has_exp = true;
+            is_double = matches!(c, 'd' | 'D' | 'l' | 'L');
             out.push('e');
             i += 1;
             if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
@@ -1432,7 +1443,7 @@ fn parse_decimal_float(s: &str) -> Option<f32> {
     if !has_digit || (!has_dot && !has_exp) {
         return None;
     }
-    out.parse::<f32>().ok()
+    out.parse::<f64>().ok().map(|v| (v, is_double))
 }
 
 /// Allocate a bignum from an i64 that does not fit the fixnum range.

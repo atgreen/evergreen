@@ -4590,6 +4590,10 @@ fn print_val_inner(val: BlissVal, out: &mut String) {
         out.push_str(&bliss_stdlib::format::single_float_to_string(
             val.as_single_float(),
         ));
+    } else if val.is_double_float() {
+        out.push_str(&bliss_stdlib::format::double_float_to_string(
+            val.as_double_float(),
+        ));
     } else if val.is_character() {
         out.push_str("#\\");
         match val.as_char() {
@@ -14334,6 +14338,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     "FIXNUM"
                 } else if v.is_single_float() {
                     "SINGLE-FLOAT"
+                } else if v.is_double_float() {
+                    "DOUBLE-FLOAT"
                 } else if v.is_character() {
                     "CHARACTER"
                 } else if is_keyword_arg(v) {
@@ -16411,7 +16417,7 @@ fn is_rational_zero(v: BlissVal) -> bool {
 
 /// A real number (rational or float) — anything valid as a COMPLEX part.
 fn is_real_number(v: BlissVal) -> bool {
-    v.is_single_float() || as_bigrat(v).is_some()
+    bliss_rt::types::floatp(v) || as_bigrat(v).is_some()
 }
 
 /// The CL `COMPLEX` constructor with type-contagion + canonicalisation (CLHS
@@ -16433,10 +16439,15 @@ fn make_complex(real: BlissVal, imag: BlissVal) -> Result<BlissVal, BlissError> 
     }
     // Float contagion: a float in either part makes both parts single-floats,
     // and floats never canonicalise (even a 0.0 imaginary part stays).
-    if real.is_single_float() || imag.is_single_float() {
-        let r = BlissVal::from_single_float(num_val(real)? as f32);
-        let i = BlissVal::from_single_float(num_val(imag)? as f32);
-        return Ok(alloc_complex_cli(r, i));
+    let fkind = widen_float(float_kind_of(real), float_kind_of(imag));
+    if fkind != FloatKind::None {
+        let rf = num_val(real)?;
+        let imf = num_val(imag)?;
+        // box_float may allocate (DOUBLE-FLOAT), so root the first part across
+        // the second allocation and both across the COMPLEX allocation.
+        bliss_rt::rooted!(r = box_float(rf, fkind));
+        bliss_rt::rooted!(i = box_float(imf, fkind));
+        return Ok(alloc_complex_cli(*r, *i));
     }
     // Both rational: a zero imaginary part collapses to the real part.
     if is_rational_zero(imag) {
@@ -16484,12 +16495,13 @@ fn rmul(a: BlissVal, b: BlissVal) -> Result<BlissVal, BlissError> {
 /// Real division `a / b` (rational-exact or float-contagious), matching the
 /// two-argument behaviour of [`eval_arith_div`]. Errors on a zero divisor.
 fn rdiv(a: BlissVal, b: BlissVal) -> Result<BlissVal, BlissError> {
-    if a.is_single_float() || b.is_single_float() {
+    let fkind = widen_float(float_kind_of(a), float_kind_of(b));
+    if fkind != FloatKind::None {
         let bv = num_val(b)?;
         if bv == 0.0 {
             return Err(BlissError::ArithmeticError("division by zero".into()));
         }
-        return Ok(BlissVal::from_single_float((num_val(a)? / bv) as f32));
+        return Ok(box_float(num_val(a)? / bv, fkind));
     }
     match (as_bigrat(a), as_bigrat(b)) {
         (Some(ra), Some(rb)) => {
@@ -17438,9 +17450,66 @@ fn as_bigrat(v: BlissVal) -> Option<BigRat> {
     None
 }
 
+/// The float format an operand carries, for CL float contagion (CLHS 12.1.4.4):
+/// a DOUBLE-FLOAT operand widens the whole expression to double, else a
+/// SINGLE-FLOAT operand keeps it single, else the result stays exact.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloatKind {
+    None,
+    Single,
+    Double,
+}
+
+/// The float format of `v` (`None` if `v` is not a float).
+fn float_kind_of(v: BlissVal) -> FloatKind {
+    if v.is_single_float() {
+        FloatKind::Single
+    } else if v.is_double_float() {
+        FloatKind::Double
+    } else {
+        FloatKind::None
+    }
+}
+
+/// Contagion join: double dominates single dominates none.
+fn widen_float(a: FloatKind, b: FloatKind) -> FloatKind {
+    if a == FloatKind::Double || b == FloatKind::Double {
+        FloatKind::Double
+    } else if a == FloatKind::Single || b == FloatKind::Single {
+        FloatKind::Single
+    } else {
+        FloatKind::None
+    }
+}
+
+/// The `f64` value of a float operand (single-floats widen exactly to `f64`).
+/// Caller guarantees `v` is a single- or double-float.
+fn float_f64(v: BlissVal) -> f64 {
+    if v.is_single_float() {
+        v.as_single_float() as f64
+    } else {
+        v.as_double_float()
+    }
+}
+
+/// Box an `f64` result as the requested float format. DOUBLE-FLOAT allocates a
+/// heap object; SINGLE-FLOAT (and `None`, defensively) narrows to an immediate.
+///
+/// GC-safety: allocates only for `Double`, and takes an `f64` (no live
+/// `BlissVal` inputs), so there is nothing to root here; callers holding other
+/// live values across this call root those as usual.
+fn box_float(x: f64, kind: FloatKind) -> BlissVal {
+    match kind {
+        FloatKind::Double => bliss_rt::gc::alloc_double_float(x),
+        _ => BlissVal::from_single_float(x as f32),
+    }
+}
+
 fn num_val(v: BlissVal) -> Result<f64, BlissError> {
     if v.is_single_float() {
         Ok(v.as_single_float() as f64)
+    } else if v.is_double_float() {
+        Ok(v.as_double_float())
     } else if let Some(r) = as_bigrat(v) {
         Ok(r.to_f64())
     } else {
@@ -17474,7 +17543,7 @@ fn numeric_cmp(a: BlissVal, b: BlissVal) -> Result<Ordering, BlissError> {
     if a.is_fixnum() && b.is_fixnum() {
         return Ok(a.as_fixnum().cmp(&b.as_fixnum()));
     }
-    if a.is_single_float() || b.is_single_float() {
+    if bliss_rt::types::floatp(a) || bliss_rt::types::floatp(b) {
         let av = num_val(a)?;
         let bv = num_val(b)?;
         return Ok(av.partial_cmp(&bv).unwrap_or(Ordering::Equal));
@@ -17557,16 +17626,17 @@ fn fold_arith_vals(
     }
     let mut acc = BigRat::from_i64(acc_i as i64);
     let mut acc_f = init_f;
-    let mut is_float = false;
+    let mut fkind = FloatKind::None;
     for &v in &vals[idx..] {
-        if v.is_single_float() {
-            if !is_float {
-                is_float = true;
+        let k = float_kind_of(v);
+        if k != FloatKind::None {
+            if fkind == FloatKind::None {
                 acc_f = acc.to_f64();
             }
-            acc_f = op_f(acc_f, v.as_single_float() as f64);
+            fkind = widen_float(fkind, k);
+            acc_f = op_f(acc_f, float_f64(v));
         } else if let Some(rv) = as_bigrat(v) {
-            if is_float {
+            if fkind != FloatKind::None {
                 acc_f = op_f(acc_f, rv.to_f64());
             } else {
                 acc = op_r(&acc, &rv);
@@ -17578,8 +17648,8 @@ fn fold_arith_vals(
             });
         }
     }
-    Ok(if is_float {
-        BlissVal::from_single_float(acc_f as f32)
+    Ok(if fkind != FloatKind::None {
+        box_float(acc_f, fkind)
     } else {
         acc.to_val()
     })
@@ -17628,8 +17698,9 @@ fn sub_vals(vals: &[BlissVal]) -> Result<BlissVal, BlissError> {
         }
     }
     if vals.len() == 1 {
-        if vals[0].is_single_float() {
-            return Ok(BlissVal::from_single_float(-vals[0].as_single_float()));
+        let k = float_kind_of(vals[0]);
+        if k != FloatKind::None {
+            return Ok(box_float(-float_f64(vals[0]), k));
         }
         if let Some(r) = as_bigrat(vals[0]) {
             return Ok(bigrat_neg(&r).to_val());
@@ -17639,18 +17710,19 @@ fn sub_vals(vals: &[BlissVal]) -> Result<BlissVal, BlissError> {
             expected: "number".into(),
         });
     }
-    let mut is_float = vals[0].is_single_float();
+    let mut fkind = float_kind_of(vals[0]);
     let mut acc_f = num_val(vals[0])?;
     let mut acc = as_bigrat(vals[0]).unwrap_or_else(|| BigRat::from_i64(0));
     for v in &vals[1..] {
-        if v.is_single_float() {
-            if !is_float {
-                is_float = true;
+        let k = float_kind_of(*v);
+        if k != FloatKind::None {
+            if fkind == FloatKind::None {
                 acc_f = acc.to_f64();
             }
-            acc_f -= v.as_single_float() as f64;
+            fkind = widen_float(fkind, k);
+            acc_f -= float_f64(*v);
         } else if let Some(rv) = as_bigrat(*v) {
-            if is_float {
+            if fkind != FloatKind::None {
                 acc_f -= rv.to_f64();
             } else {
                 acc = bigrat_sub(&acc, &rv);
@@ -17662,8 +17734,8 @@ fn sub_vals(vals: &[BlissVal]) -> Result<BlissVal, BlissError> {
             });
         }
     }
-    Ok(if is_float {
-        BlissVal::from_single_float(acc_f as f32)
+    Ok(if fkind != FloatKind::None {
+        box_float(acc_f, fkind)
     } else {
         acc.to_val()
     })
@@ -17689,12 +17761,13 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
         return complex_arith(CxOp::Div, &vals);
     }
     if vals.len() == 1 {
-        if vals[0].is_single_float() {
-            let v = vals[0].as_single_float();
+        let k = float_kind_of(vals[0]);
+        if k != FloatKind::None {
+            let v = float_f64(vals[0]);
             if v == 0.0 {
                 return Err(BlissError::ArithmeticError("division by zero".into()));
             }
-            return Ok(BlissVal::from_single_float(1.0 / v));
+            return Ok(box_float(1.0 / v, k));
         }
         if let Some(r) = as_bigrat(vals[0]) {
             if r.num.is_zero() {
@@ -17708,25 +17781,26 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             expected: "number".into(),
         });
     }
-    let mut is_float = vals[0].is_single_float();
+    let mut fkind = float_kind_of(vals[0]);
     let mut acc_f = num_val(vals[0])?;
     let mut acc = as_bigrat(vals[0]).unwrap_or_else(|| BigRat::from_i64(0));
     for v in &vals[1..] {
-        if v.is_single_float() {
-            let dv = v.as_single_float() as f64;
+        let k = float_kind_of(*v);
+        if k != FloatKind::None {
+            let dv = float_f64(*v);
             if dv == 0.0 {
                 return Err(BlissError::ArithmeticError("division by zero".into()));
             }
-            if !is_float {
-                is_float = true;
+            if fkind == FloatKind::None {
                 acc_f = acc.to_f64();
             }
+            fkind = widen_float(fkind, k);
             acc_f /= dv;
         } else if let Some(rv) = as_bigrat(*v) {
             if rv.num.is_zero() {
                 return Err(BlissError::ArithmeticError("division by zero".into()));
             }
-            if is_float {
+            if fkind != FloatKind::None {
                 acc_f /= rv.to_f64();
             } else {
                 acc = bigrat_div(&acc, &rv);
@@ -17738,8 +17812,8 @@ fn eval_arith_div(args: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError>
             });
         }
     }
-    if is_float {
-        Ok(BlissVal::from_single_float(acc_f as f32))
+    if fkind != FloatKind::None {
+        Ok(box_float(acc_f, fkind))
     } else {
         Ok(acc.to_val())
     }
@@ -18017,8 +18091,18 @@ fn coerce_value(value: BlissVal, type_val: BlissVal) -> Result<BlissVal, BlissEr
                 }),
             }
         }
-        "FLOAT" | "SINGLE-FLOAT" | "DOUBLE-FLOAT" | "SHORT-FLOAT" | "LONG-FLOAT" => {
+        "SINGLE-FLOAT" | "SHORT-FLOAT" => {
             Ok(BlissVal::from_single_float(num_val(value)? as f32))
+        }
+        "DOUBLE-FLOAT" | "LONG-FLOAT" => Ok(bliss_rt::gc::alloc_double_float(num_val(value)?)),
+        // Bare FLOAT: coerce to the default float format (SINGLE-FLOAT), but
+        // preserve an already-double argument rather than narrowing it.
+        "FLOAT" => {
+            if value.is_double_float() {
+                Ok(value)
+            } else {
+                Ok(BlissVal::from_single_float(num_val(value)? as f32))
+            }
         }
         // COERCE performs no conversion TO these numeric types: it returns the
         // object when it is already of the type, else signals a type-error

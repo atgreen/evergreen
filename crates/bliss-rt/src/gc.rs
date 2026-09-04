@@ -3858,6 +3858,25 @@ pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
     })
 }
 
+/// Allocate a heap DOUBLE-FLOAT boxing `value` and return it as a tagged
+/// heap-object `BlissVal`. The body is a single raw `f64` word (a
+/// reference-free leaf the GC never scans for pointers, §1.8.4); the tagged
+/// value points at the header, with the payload one word past it.
+///
+/// GC-safety: takes an `f64` (no `BlissVal` inputs), so there is nothing to
+/// root across the allocation. Callers that hold live `BlissVal`s across this
+/// call must root those as usual.
+pub fn alloc_double_float(value: f64) -> BlissVal {
+    let body = alloc_typed(8, crate::object::type_id::DOUBLE_FLOAT)
+        .expect("GC heap unavailable for double-float");
+    // SAFETY: `body` is a freshly allocated 8-byte DOUBLE_FLOAT body; the header
+    // precedes it by OBJECT_HEADER_SIZE, so the tagged value is `body - 8`.
+    unsafe {
+        *(body as *mut f64) = value;
+        BlissVal::from_heap_ptr(body.sub(8))
+    }
+}
+
 /// Allocate an immortal pinned object directly in old-gen.
 ///
 /// This is for process-lifetime objects whose raw addresses are cached outside
