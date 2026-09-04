@@ -995,13 +995,25 @@ impl HeapCollector {
         state: &mut HeapState,
         kind: RegionKind,
         gen_age: u8,
+        needed: usize,
     ) -> Option<usize> {
-        // First, look for an existing region of the right kind with space.
+        // First, look for an existing region of the right kind with space for
+        // the OBJECT BEING PLACED. The old fixed `> header + alignment` test
+        // could return a region with a sliver of free space smaller than the
+        // object; copy_object would then fail, the retry would pick the same
+        // region again, and the live object was silently dropped even with
+        // Free regions available (bliss-wc4t).
         for (idx, region) in state.regions.iter().enumerate() {
             if region.header.kind == kind {
+                // Never place ordinary (reclaimable) data in a pinned-host
+                // region: the pins make the region unreclaimable, so anything
+                // co-located with them becomes permanent garbage (bliss-wc4t).
+                if state.pinned_hosts.contains(&idx) {
+                    continue;
+                }
                 let top = region.header.alloc_top as usize;
                 let limit = region.header.alloc_limit as usize;
-                if limit.saturating_sub(top) > OBJECT_HEADER_SIZE + OBJECT_ALIGNMENT {
+                if limit.saturating_sub(top) >= needed {
                     return Some(idx);
                 }
             }
@@ -1088,7 +1100,12 @@ impl HeapCollector {
         let promotion_threshold = self.promotion_threshold;
 
         // Phase 1: Ensure we have a survivor region to copy into.
-        let survivor_idx = Self::find_or_create_target_region(state, RegionKind::Survivor, 1);
+        let survivor_idx = Self::find_or_create_target_region(
+            state,
+            RegionKind::Survivor,
+            1,
+            OBJECT_HEADER_SIZE + OBJECT_ALIGNMENT,
+        );
 
         // Phase 2: Build the precise young-generation live set.  A nursery
         // collection must not copy every allocated object: doing so merely
@@ -1231,11 +1248,27 @@ impl HeapCollector {
         // Direct roots shared with the major collector.
         mark_ref(get_entry_continuation(), &mut marked, &mut mark_worklist);
         Self::scan_cl_stack_roots(&mut marked, &mut mark_worklist, &nursery_index);
+        let tracing = gc_verify_enabled();
+        if tracing {
+            VERIFY_TRACE.with(|t| {
+                let mut t = t.borrow_mut();
+                t.mark.clear();
+                t.reloc.clear();
+            });
+        }
         crate::symbols::for_each_root_slot(|slot| {
-            mark_ref(unsafe { *slot }, &mut marked, &mut mark_worklist);
+            let v = unsafe { *slot };
+            if tracing {
+                VERIFY_TRACE.with(|t| t.borrow_mut().mark.insert(slot as usize, v.0));
+            }
+            mark_ref(v, &mut marked, &mut mark_worklist);
         });
         scan_external_roots(|slot| {
-            mark_ref(unsafe { *slot }, &mut marked, &mut mark_worklist);
+            let v = unsafe { *slot };
+            if tracing {
+                VERIFY_TRACE.with(|t| t.borrow_mut().mark.insert(slot as usize, v.0));
+            }
+            mark_ref(v, &mut marked, &mut mark_worklist);
         });
 
         // Barrier-recorded old-to-young slots are roots even when their holder
@@ -1362,7 +1395,7 @@ impl HeapCollector {
                 let mut target_idx_opt = if target_kind == RegionKind::Survivor {
                     survivor_idx
                 } else {
-                    Self::find_or_create_target_region(state, target_kind, target_gen_age)
+                    Self::find_or_create_target_region(state, target_kind, target_gen_age, total_size)
                 };
 
                 // Try to copy the object.
@@ -1373,14 +1406,45 @@ impl HeapCollector {
                     }
                 }
 
-                // If copy failed (target full), get a new target region and retry.
+                // If copy failed (target full), get a target that FITS and retry.
                 if !copied {
-                    target_idx_opt =
-                        Self::find_or_create_target_region(state, target_kind, target_gen_age);
+                    target_idx_opt = Self::find_or_create_target_region(
+                        state,
+                        target_kind,
+                        target_gen_age,
+                        total_size,
+                    );
                     if let Some(tidx) = target_idx_opt {
-                        Self::copy_object(state, header_ptr, body_size, tidx);
+                        if Self::copy_object(state, header_ptr, body_size, tidx).is_some() {
+                            copied = true;
+                        }
                     }
-                    // If still no space, the object is lost (OOM during GC).
+                }
+                if !copied {
+                    // A live object the collector cannot place. Silently dropping
+                    // it — what this branch used to do, with a comment reading
+                    // "the object is lost (OOM during GC)" — is deferred heap
+                    // corruption: every root keeps the stale pointer, the
+                    // nursery is reset underneath it, and the mutator later
+                    // reads zeros through it (bliss-wc4t manifested exactly
+                    // that as `unbound variable: CONS`). With the
+                    // old-occupancy major-GC trigger this should be
+                    // unreachable; if it fires, dying loudly with a heap
+                    // picture beats corrupting silently.
+                    let free_regions = state
+                        .regions
+                        .iter()
+                        .filter(|r| r.header.kind == RegionKind::Free)
+                        .count();
+                    panic!(
+                        "GC minor evacuation exhausted regions: live object at {body_addr:#x} \
+                         (type {type_id}, {total_size} bytes, target {target_kind:?}) cannot be \
+                         placed; {free_regions} free of {} regions [{}]. Increase BLISS_HEAP_MB, \
+                         or report a bead: the old-occupancy major-GC trigger should have \
+                         prevented this (bliss-wc4t).",
+                        state.regions.len(),
+                        Self::region_census(state),
+                    );
                 }
 
                 bytes_promoted += total_size as u64;
@@ -1408,6 +1472,29 @@ impl HeapCollector {
             region.header.kind = RegionKind::OldGen;
             region.header.gen_age = 0;
             region.header.live_bytes = live as u32;
+            // A retained region holds a pinned object: record it as a pinned
+            // host so ordinary evacuation never adds reclaimable data to it.
+            state.pinned_hosts.insert(idx);
+            if std::env::var_os("BLISS_GC_CENSUS").is_some() {
+                // Name WHAT pinned this region: type_id histogram of its
+                // pinned objects (diagnostic for bliss-wc4t).
+                let base = region.base as usize;
+                let top = region.header.alloc_top as usize;
+                let mut kinds: Vec<u8> = Vec::new();
+                let mut cursor = base;
+                while cursor + OBJECT_HEADER_SIZE <= top {
+                    let ptr = cursor as *const u8;
+                    let (type_id, body_size) = unsafe { read_object_header(ptr) };
+                    if body_size == 0 && type_id == 0 {
+                        break;
+                    }
+                    if unsafe { !header_is_forwarded(ptr) && header_is_pinned(ptr) } {
+                        kinds.push(type_id);
+                    }
+                    cursor += align_up(OBJECT_HEADER_SIZE + body_size as usize, OBJECT_ALIGNMENT);
+                }
+                eprintln!("[GC-RETAIN] region {idx} retained; pinned type_ids {kinds:?}");
+            }
         }
 
         // Relocate old→young references recorded by the write barrier (jtc.21).
@@ -1445,9 +1532,21 @@ impl HeapCollector {
         // reachable only from a global symbol's cell; rewrite those cells to the
         // evacuated location while forwarding is intact.
         crate::symbols::for_each_root_slot(|slot| unsafe {
-            relocate_slot(slot, heap_base_addr, heap_end)
+            let before = (*slot).0;
+            relocate_slot(slot, heap_base_addr, heap_end);
+            if tracing {
+                let after = (*slot).0;
+                VERIFY_TRACE.with(|t| t.borrow_mut().reloc.insert(slot as usize, (before, after)));
+            }
         });
-        scan_external_roots(|slot| unsafe { relocate_slot(slot, heap_base_addr, heap_end) });
+        scan_external_roots(|slot| unsafe {
+            let before = (*slot).0;
+            relocate_slot(slot, heap_base_addr, heap_end);
+            if tracing {
+                let after = (*slot).0;
+                VERIFY_TRACE.with(|t| t.borrow_mut().reloc.insert(slot as usize, (before, after)));
+            }
+        });
 
         // Forward finalizer-registry keys and weak-pointer referents for every
         // object promoted out of the nursery this cycle, while the forwarding
@@ -1494,13 +1593,38 @@ impl HeapCollector {
             };
             let check = |v: BlissVal, holder: &str, slot_addr: usize| {
                 if stale(v) {
+                    // Diagnose the asymmetry directly (bliss-wc4t): mark_ref
+                    // requires the EXACT body address to be a nursery_index key,
+                    // while this range check does not — so an interior/mistagged
+                    // pointer or an index-excluded object is mark-missed,
+                    // relocate-no-op'd, and flagged only here.
+                    let body = ref_body_addr(v);
+                    let indexed = nursery_index.contains_key(&body);
+                    let header_ptr = (body - OBJECT_HEADER_SIZE) as *const u8;
+                    let header_word = unsafe { *(header_ptr as *const u64) };
+                    let forwarded = unsafe { header_is_forwarded(header_ptr) };
                     panic!(
                         "gc-verify: reference {:#x} into evacuated nursery survives minor GC \
-                         in {holder} slot {slot_addr:#x}",
-                        v.to_raw()
+                         in {holder} slot {slot_addr:#x} [{}] \
+                         [target body {body:#x}: in nursery_index={indexed}, \
+                         header={header_word:#x}, forwarded={forwarded}]",
+                        v.to_raw(),
+                        verify_trace_report(slot_addr)
                     );
                 }
             };
+            let describe_target = |v: BlissVal| -> String {
+                let body = ref_body_addr(v);
+                let indexed = nursery_index.contains_key(&body);
+                let header_ptr = (body - OBJECT_HEADER_SIZE) as *const u8;
+                let header_word = unsafe { *(header_ptr as *const u64) };
+                let forwarded = unsafe { header_is_forwarded(header_ptr) };
+                format!(
+                    "target body {body:#x}: in nursery_index={indexed}, \
+                     header={header_word:#x}, forwarded={forwarded}"
+                )
+            };
+            verify_rooted_lists_naming(&stale, &describe_target);
             check(get_entry_continuation(), "entry-continuation", 0);
             crate::symbols::for_each_root_slot(|slot| {
                 check(unsafe { *slot }, "symbol-root", slot as usize);
@@ -1634,15 +1758,98 @@ impl HeapCollector {
     }
 }
 
+impl HeapCollector {
+    /// One-line region census for diagnostics: counts per kind plus how many
+    /// regions hold a pinned object (and so are unreclaimable).
+    fn region_census(state: &HeapState) -> String {
+        let mut free = 0usize;
+        let mut nursery = 0usize;
+        let mut survivor = 0usize;
+        let mut old = 0usize;
+        let mut large = 0usize;
+        let mut pinned = 0usize;
+        for r in state.regions.iter() {
+            match r.header.kind {
+                RegionKind::Free => free += 1,
+                RegionKind::Nursery => nursery += 1,
+                RegionKind::Survivor => survivor += 1,
+                RegionKind::OldGen => old += 1,
+                RegionKind::LargeObject => large += 1,
+                _ => {}
+            }
+            let base = r.base as usize;
+            let top = r.header.alloc_top as usize;
+            if top > base && unsafe { region_has_pinned(base, top) } {
+                pinned += 1;
+            }
+        }
+        format!(
+            "free={free} nursery={nursery} survivor={survivor} oldgen={old} large={large} \
+             with-pinned={pinned} total={}",
+            state.regions.len()
+        )
+    }
+
+    /// Fraction of heap regions not currently Free, against
+    /// `config.old_occupancy_trigger`. Consulted after each minor collection to
+    /// decide whether a major collection should reclaim old-gen garbage.
+    fn occupancy_exceeds_trigger() -> bool {
+        let guard = heap_state().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = guard.as_ref() else {
+            return false;
+        };
+        let total = state.regions.len();
+        if total == 0 {
+            return false;
+        }
+        let non_free = state
+            .regions
+            .iter()
+            .filter(|r| r.header.kind != RegionKind::Free)
+            .count();
+        (non_free as f64 / total as f64) > state.config.old_occupancy_trigger
+    }
+}
+
 impl Collector for HeapCollector {
     /// Stop-the-world minor (nursery) collection.
     /// Cheney-style scavenge: copies live nursery objects into survivor space
     /// or promotes to old-gen based on gen_age vs promotion_threshold.
     fn minor_gc(&mut self) -> Result<(), BlissError> {
-        let _gc_cycle = gc_cycle_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        self.minor_gc_stop_the_world()
+        let needs_major = {
+            let _gc_cycle = gc_cycle_lock()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.minor_gc_stop_the_world()?;
+            // `old_occupancy_trigger` was a config knob wired to NOTHING: no
+            // automatic major collection existed, so old-gen garbage accumulated
+            // until evacuation ran out of regions mid-minor-GC and silently
+            // dropped live objects — the heap corruption behind bliss-wc4t
+            // ("unbound variable: CONS" after enough stress-mode collections).
+            // Honor the knob: when the non-Free region fraction crosses it,
+            // run a major collection to sweep old-gen garbage back to Free.
+            Self::occupancy_exceeds_trigger()
+        };
+        // Outside the cycle lock: major_gc takes it itself (as full_gc does).
+        // No retrigger loop: major_gc drains the nursery via
+        // minor_gc_stop_the_world directly, not through this wrapper.
+        if needs_major {
+            let census = std::env::var_os("BLISS_GC_CENSUS").is_some();
+            if census {
+                let guard = heap_state().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(state) = guard.as_ref() {
+                    eprintln!("[GC-CENSUS] before-major: {}", Self::region_census(state));
+                }
+            }
+            self.major_gc()?;
+            if census {
+                let guard = heap_state().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(state) = guard.as_ref() {
+                    eprintln!("[GC-CENSUS] after-major:  {}", Self::region_census(state));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Concurrent old-gen marking + evacuation cycle (A3.02).
@@ -1842,7 +2049,17 @@ impl Collector for HeapCollector {
         // A region is a candidate if live_bytes < 50% of used bytes (i.e. mostly garbage).
         let mut evacuation_set: Vec<usize> = Vec::new();
         for (idx, region) in state.regions.iter().enumerate() {
-            if region.header.kind != RegionKind::OldGen {
+            // Survivor regions are candidates too: minor collections do not
+            // re-collect them (nursery_indices is Nursery-kind only), and the
+            // sweep below used to skip them as well, so survivor garbage was
+            // PERMANENT — under allocation churn survivor regions accumulated
+            // until evacuation ran out of regions and dropped live objects
+            // (bliss-wc4t). A survivor object still marked live at a major has
+            // survived long enough that copying it to OldGen is its promotion.
+            if !matches!(
+                region.header.kind,
+                RegionKind::OldGen | RegionKind::Survivor
+            ) {
                 continue;
             }
             let base = region.base as usize;
@@ -1868,16 +2085,18 @@ impl Collector for HeapCollector {
             }
         }
 
-        // Phase 3: Evacuation — copy live objects from selected regions to fresh ones.
+        // Phase 3: Evacuation — copy live objects from selected regions to fresh
+        // ones. A region may only be freed afterwards if EVERY live object in it
+        // was successfully copied; the old code freed the region unconditionally
+        // even when a copy silently failed (`let _ = copy_object(...)`), which
+        // zeroed a still-referenced live object — the same corruption class as
+        // the minor-evacuation loss (bliss-wc4t), and newly reachable now that
+        // major collections run automatically.
+        let mut fully_evacuated: Vec<usize> = Vec::with_capacity(evacuation_set.len());
         for &evac_idx in &evacuation_set {
-            let target_idx = Self::find_or_create_target_region(state, RegionKind::OldGen, 0);
-            let target_idx = match target_idx {
-                Some(idx) if idx != evac_idx => idx,
-                _ => continue, // No space for evacuation, skip this region.
-            };
-
             let base = state.regions[evac_idx].base as usize;
             let top = state.regions[evac_idx].header.alloc_top as usize;
+            let mut all_copied = true;
 
             let mut cursor = base;
             while cursor + OBJECT_HEADER_SIZE <= top {
@@ -1894,19 +2113,25 @@ impl Collector for HeapCollector {
                 // Only copy non-forwarded, marked (live) objects.
                 let body_addr = cursor + OBJECT_HEADER_SIZE;
                 if !unsafe { header_is_forwarded(header_ptr) } && marked.contains(&body_addr) {
-                    // Try to copy; if target fills up, find another.
-                    if Self::copy_object(state, header_ptr, body_size, target_idx).is_none() {
-                        if let Some(new_target) =
-                            Self::find_or_create_target_region(state, RegionKind::OldGen, 0)
+                    let mut copied = false;
+                    if let Some(tidx) =
+                        Self::find_or_create_target_region(state, RegionKind::OldGen, 0, total_size)
+                    {
+                        if tidx != evac_idx
+                            && Self::copy_object(state, header_ptr, body_size, tidx).is_some()
                         {
-                            if new_target != evac_idx {
-                                let _ = Self::copy_object(state, header_ptr, body_size, new_target);
-                            }
+                            copied = true;
                         }
+                    }
+                    if !copied {
+                        all_copied = false;
                     }
                 }
 
                 cursor += total_size;
+            }
+            if all_copied {
+                fully_evacuated.push(evac_idx);
             }
         }
 
@@ -1936,8 +2161,11 @@ impl Collector for HeapCollector {
         relocate_side_tables(heap_base_addr, heap_end);
 
         // Now free the evacuated regions — their forwarding pointers are no
-        // longer needed.
-        for &evac_idx in &evacuation_set {
+        // longer needed. Only regions whose every live object copied out; a
+        // region with a stranded live object stays OldGen (its forwarded husks
+        // are skipped by every walk, and the stranded object remains valid in
+        // place).
+        for &evac_idx in &fully_evacuated {
             let region = &mut state.regions[evac_idx];
             let region_used =
                 (region.header.alloc_top as usize).saturating_sub(region.base as usize);
@@ -1999,15 +2227,30 @@ impl Collector for HeapCollector {
                     }
                 }
                 RegionKind::Survivor => {
-                    // Promote survivors that have aged past threshold to OldGen.
-                    if region.header.gen_age >= self.promotion_threshold {
-                        region.header.kind = RegionKind::OldGen;
-                        region.header.gen_age = 0;
-                    }
                     let base = region.base as usize;
                     let top = region.header.alloc_top as usize;
-                    if top > base {
-                        old_gen_used += region.header.live_bytes as u64;
+                    let used = top.saturating_sub(base);
+                    let pinned = used > 0 && unsafe { region_has_pinned(base, top) };
+                    if region.header.live_bytes == 0 && used > 0 && !pinned {
+                        // Entirely garbage: reclaim, exactly as for OldGen.
+                        // Survivor regions were previously never freed at all
+                        // (bliss-wc4t).
+                        unsafe {
+                            std::ptr::write_bytes(region.base, 0, used);
+                        }
+                        region.header.kind = RegionKind::Free;
+                        region.header.alloc_top = region.base;
+                        region.header.gen_age = 0;
+                        regions_freed += 1;
+                    } else {
+                        // Promote survivors that have aged past threshold to OldGen.
+                        if region.header.gen_age >= self.promotion_threshold {
+                            region.header.kind = RegionKind::OldGen;
+                            region.header.gen_age = 0;
+                        }
+                        if top > base {
+                            old_gen_used += region.header.live_bytes as u64;
+                        }
                     }
                 }
                 _ => {}
@@ -2894,6 +3137,50 @@ impl Drop for RootedHeadRegistration {
     }
 }
 
+/// BLISS_GC_VERIFY only (bliss-wc4t): walk the intrusive rooted lists like
+/// [`scan_rooted_lists`], but per NODE, so a stale slot can be attributed to
+/// its holder. Each node's `trace` fn is monomorphized per rooted type
+/// (`trace_rooted::<T>` / `trace_rooted_ref::<T>`), so its address names `T`:
+/// resolve it in the binary with nm, using the printed address of
+/// `scan_rooted_lists` itself as the anchor to compute the load slide.
+fn verify_rooted_lists_naming(
+    stale: &dyn Fn(BlissVal) -> bool,
+    describe_target: &dyn Fn(BlissVal) -> String,
+) {
+    let heads = rooted_heads().lock().unwrap_or_else(|e| e.into_inner());
+    for &head_address in heads.iter() {
+        let mut node = unsafe { (*(head_address as *const std::cell::Cell<*mut RootLink>)).get() };
+        let mut node_index = 0usize;
+        while !node.is_null() {
+            let trace_fn = unsafe { (*node).trace } as usize;
+            let mut hit: Option<(usize, u64)> = None;
+            unsafe {
+                ((*node).trace)(node, &mut |slot: *mut BlissVal| {
+                    let v = *slot;
+                    if hit.is_none() && stale(v) {
+                        hit = Some((slot as usize, v.0));
+                    }
+                });
+            }
+            if let Some((slot_addr, value)) = hit {
+                panic!(
+                    "gc-verify(holder): stale {value:#x} in slot {slot_addr:#x} held by rooted \
+                     node {:#x} (index {node_index} from head {head_address:#x}), trace fn \
+                     {trace_fn:#x}; anchor scan_rooted_lists={:#x} \
+                     (slide = runtime_anchor - nm_anchor; holder type = nm symbol at \
+                     trace_fn - slide) [{}] [{}]",
+                    node as usize,
+                    scan_rooted_lists as usize,
+                    verify_trace_report(slot_addr),
+                    describe_target(BlissVal(value)),
+                );
+            }
+            node = unsafe { (*node).next };
+            node_index += 1;
+        }
+    }
+}
+
 fn scan_rooted_lists(visit: &mut dyn FnMut(*mut BlissVal)) {
     let heads = rooted_heads().lock().unwrap_or_else(|e| e.into_inner());
     for &head_address in heads.iter() {
@@ -3347,6 +3634,44 @@ fn gc_poison_enabled() -> bool {
 /// collector failed to trace or update — the direct cause of the "stale value
 /// read from freed nursery" corruption class (bliss-4bp) — and this names the
 /// holder at the exact collection that orphaned it.
+/// BLISS_GC_VERIFY diagnostics (bliss-wc4t): per-cycle record of every root
+/// slot the mark pass and the relocate pass visited, so a verify failure can
+/// say WHICH pass lost the slot. Cleared at the start of each verified minor
+/// collection; only touched under gc_verify_enabled().
+struct VerifyTrace {
+    /// slot address -> value seen when the MARK pass visited it.
+    mark: std::collections::HashMap<usize, u64>,
+    /// slot address -> (value before, value after) at the RELOCATE pass.
+    reloc: std::collections::HashMap<usize, (u64, u64)>,
+}
+thread_local! {
+    static VERIFY_TRACE: std::cell::RefCell<VerifyTrace> =
+        std::cell::RefCell::new(VerifyTrace {
+            mark: std::collections::HashMap::new(),
+            reloc: std::collections::HashMap::new(),
+        });
+}
+
+fn verify_trace_report(slot_addr: usize) -> String {
+    VERIFY_TRACE.with(|t| {
+        let t = t.borrow();
+        let mark = match t.mark.get(&slot_addr) {
+            Some(v) => format!("mark saw {v:#x}"),
+            None => "NOT VISITED by mark pass".to_string(),
+        };
+        let reloc = match t.reloc.get(&slot_addr) {
+            Some((b, a)) if b == a => format!("relocate saw {b:#x}, left unchanged (no forwarding)"),
+            Some((b, a)) => format!("relocate rewrote {b:#x} -> {a:#x}"),
+            None => "NOT VISITED by relocate pass".to_string(),
+        };
+        format!(
+            "{mark}; {reloc}; mark visited {} slots, relocate visited {} slots",
+            t.mark.len(),
+            t.reloc.len()
+        )
+    })
+}
+
 fn gc_verify_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("BLISS_GC_VERIFY").is_some())
@@ -3473,8 +3798,16 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         return None;
     }
 
+    // Pack pinned allocations into DEDICATED host regions (bliss-wc4t). A
+    // region hosting even one pinned object can never be evacuated or freed,
+    // so first-fitting pins into arbitrary OldGen regions poisoned each such
+    // region forever: under macroexpansion churn every gensym (a pinned
+    // symbol + a pinned name) landed in whatever region had space, until
+    // hundreds of regions were unreclaimable and evacuation ran out of space.
+    // Packing bounds the poisoned area to ceil(total pinned bytes / region).
     let mut target_idx = None;
-    for (idx, region) in state.regions.iter().enumerate() {
+    for &idx in state.pinned_hosts.iter() {
+        let region = &state.regions[idx];
         if region.header.kind != RegionKind::OldGen {
             continue;
         }
@@ -3496,6 +3829,7 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
             region.header.alloc_top = region.base;
             region.header.live_bytes = 0;
             state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
+            state.pinned_hosts.insert(idx);
             target_idx = Some(idx);
             break;
         }
@@ -3929,6 +4263,13 @@ struct HeapState {
     /// while concurrent old-gen marking is active, so the marker traces the
     /// snapshot-at-the-beginning graph (§3.6.2).
     satb_log: Vec<BlissVal>,
+    /// Region indices hosting PINNED allocations (bliss-wc4t). A region with a
+    /// pinned object can never be evacuated or freed, so pinned allocations are
+    /// PACKED into dedicated host regions instead of first-fitting into any
+    /// OldGen region: co-locating ordinary (reclaimable) data with immortal
+    /// pins was turning every OldGen region unreclaimable one gensym at a time
+    /// until the heap ran out of regions.
+    pinned_hosts: std::collections::HashSet<usize>,
 }
 
 // Safety: HeapState is only accessed under the global mutex.
@@ -4075,6 +4416,7 @@ pub fn init_heap(config: &GcConfig) -> Result<(), BlissError> {
     // for relocation tracking.  This gives a deterministic, non-zero value that
     // changes across processes, which is exactly what the image format needs.
     let state = HeapState {
+        pinned_hosts: std::collections::HashSet::new(),
         config: config.clone(),
         stats,
         regions,

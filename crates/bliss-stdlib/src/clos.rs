@@ -1267,7 +1267,17 @@ pub fn allocate_instance_pinned_gc(class: BlissVal) -> Result<BlissVal, BlissErr
     );
     // The GC allocator writes an 8-byte STANDARD_OBJECT header and returns the
     // body pointer; the instance value points at the header (body − 8).
-    let body = bliss_rt::gc::alloc_typed(size - 8, type_id::STANDARD_OBJECT)
+    //
+    // Allocated PINNED — directly into the collector's packed pinned-host
+    // regions — rather than into the nursery and pinned afterwards. A pinned
+    // NURSERY object forces the collector to retain its entire region in place
+    // at the next minor GC, so every nursery-born instance cost a full region
+    // of heap permanently; under allocation churn that exhausted the heap and
+    // evacuation began dropping live objects (bliss-wc4t: ~316 instances had
+    // poisoned 316 x 1MB regions). Until instances become movable and
+    // collectible (bliss-334) they are immortal either way; packed host
+    // regions bound the cost to the instances' own bytes.
+    let body = bliss_rt::gc::alloc_pinned_typed(size - 8, type_id::STANDARD_OBJECT)
         .ok_or_else(|| BlissError::Internal("GC heap unavailable for pooled instance".into()))?;
     unsafe {
         let ptr = body.sub(8);
@@ -1277,8 +1287,6 @@ pub fn allocate_instance_pinned_gc(class: BlissVal) -> Result<BlissVal, BlissErr
             *slot_cell(inst, i) = UNBOUND;
         }
         with_state_mut(|st| st.live_instances.insert(inst));
-        // Pin so the collector never moves or frees this pooled instance.
-        bliss_rt::gc::pin(inst);
         Ok(inst)
     }
 }
