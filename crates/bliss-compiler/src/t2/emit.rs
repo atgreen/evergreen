@@ -1454,6 +1454,44 @@ fn emit_generic_eq(
     Ok(())
 }
 
+
+/// Emit a fixnum comparison whose result is used as a VALUE rather than fused
+/// into a branch — guard the operands, `cmp`, then select `T`/`NIL`. The
+/// value-producing mirror of the fused `emit_fused_compare` path, exactly as
+/// `emit_generic_eq` mirrors the fused `EQ` path.
+///
+/// Without this the emitter could only lower a fixnum comparison that a `Brif`
+/// consumed directly, so any comparison reaching an ordinary use — `(not (< y
+/// x))`, or simply returning `(< y x)` — failed the whole function out of T2
+/// and left it at T1. That knocked TAK, a canonical Gabriel benchmark, off T2
+/// entirely (bliss-n6d1).
+fn emit_fixnum_cmp_value(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
+    pool: &mut Vec<u8>,
+    consts: &std::collections::HashMap<crate::t2::ir::Value, i64>,
+    proven: &std::collections::HashSet<crate::t2::ir::Value>,
+    deopt: bliss_rt::asm::Label,
+) -> Result<(), EmitError> {
+    if data.results.is_empty() {
+        return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+    }
+    // Guards the operands and emits `cmp`, returning the condition under which
+    // the comparison is TRUE.
+    let cc = emit_fused_compare(a, data, reg, consts, proven, deopt)?;
+    // `mov`-immediate does not disturb the flags set above, so allocating `dst`
+    // after the compare is safe even when it aliases an operand register — the
+    // same ordering `emit_generic_eq` relies on.
+    let dst = framed_alloc(reg, pool, data.results[0])?;
+    mov_imm64(a, dst, bliss_rt::value::T.0 as i64);
+    let done = a.label();
+    a.jcc(cc, done);
+    mov_imm64(a, dst, bliss_rt::value::NIL.0 as i64);
+    a.bind(done);
+    Ok(())
+}
+
 /// Emit `TypeCheck` type-predicate intrinsics as inline tests producing
 /// `T`/`NIL` — no runtime call. Single-tag predicates
 /// (fixnum tag 000, cons tag 001) are one `and`+`cmp`; `symbolp` also accepts
@@ -2474,6 +2512,18 @@ fn emit_framed_inner(
                 emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
                 emit_type_check(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
+            } else if fixnum_cmp_cc(d.opcode).is_some() {
+                // A comparison the branch did not fuse: produce T/NIL.
+                let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
+                emit_fixnum_cmp_value(
+                    &mut a,
+                    &d,
+                    &mut inst_reg,
+                    &mut inst_pool,
+                    &consts,
+                    &proven,
+                    label,
+                )?;
             } else if d.opcode == Opcode::Guard {
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
                 match d.aux {

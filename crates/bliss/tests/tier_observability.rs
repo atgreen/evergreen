@@ -1666,3 +1666,58 @@ fn nested_definitions_in_progn_compile() {
         "nested-def results must match the tree-walker"
     );
 }
+
+/// A fixnum comparison whose result is used as a VALUE — not fused into a
+/// branch — must still reach T2 (bliss-n6d1).
+///
+/// The emitter originally lowered a comparison only when a `Brif` consumed it
+/// directly, so `(not (< x y))` or simply returning `(< x y)` failed the whole
+/// function out of T2 and left it at T1. That silently knocked TAK — a
+/// canonical Gabriel benchmark — off T2 entirely, costing ~5x on that workload
+/// with no error and no test failure, which is exactly why this asserts the
+/// TIER and not just the result.
+#[test]
+fn comparison_used_as_a_value_still_reaches_t2() {
+    let program = "\
+        (defun cmp-fused (x y) (if (< x y) 1 0)) \
+        (defun cmp-negated (x y) (if (not (< x y)) 1 0)) \
+        (defun cmp-value (x y) (< x y)) \
+        (defun cmp-const (x) (< x 5)) \
+        (dotimes (k 40) (cmp-fused k 7) (cmp-negated k 7) (cmp-value k 7) (cmp-const k)) \
+        (format t \"~a ~a ~a ~a | ~a ~a ~a ~a~%\" \
+          (bliss-ext:function-tier (quote cmp-fused)) \
+          (bliss-ext:function-tier (quote cmp-negated)) \
+          (bliss-ext:function-tier (quote cmp-value)) \
+          (bliss-ext:function-tier (quote cmp-const)) \
+          (cmp-fused 1 2) (cmp-negated 1 2) (cmp-value 1 2) (cmp-const 1))";
+    let envs = [
+        ("BLISS_T0_T1_THRESHOLD", "2"),
+        ("BLISS_T1_T2_INVOKE_THRESHOLD", "2"),
+        ("BLISS_T1_T2_BACKEDGE_THRESHOLD", "2"),
+    ];
+    let (out, ok) = run(program, &envs);
+    assert!(ok, "run failed: {out}");
+    // The last line is the interpreter's value echo; take the format line.
+    let line = out
+        .lines()
+        .find(|l| l.contains('|'))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let (tiers, results) = line.split_once('|').unwrap_or(("", ""));
+    for (name, tier) in ["cmp-fused", "cmp-negated", "cmp-value", "cmp-const"]
+        .iter()
+        .zip(tiers.split_whitespace())
+    {
+        assert_eq!(
+            tier, "2",
+            "{name} should reach T2, got tier {tier} (full output: {out:?})"
+        );
+    }
+    // The values must be what interpretation gives, not merely self-consistent.
+    assert_eq!(
+        results.split_whitespace().collect::<Vec<_>>(),
+        ["1", "0", "T", "T"],
+        "T2 results differ from the expected interpreted values ({out:?})"
+    );
+}
