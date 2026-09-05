@@ -12295,7 +12295,54 @@ enum NativeDeoptResume {
 ///
 /// Returns 1 when T1 must return through its normal epilogue (T2 completed,
 /// errored, or deoptimized), and 0 when the branch should remain in T1.
+/// Whether a hot native loop should leave through its epilogue at a back-edge so
+/// a pending error/signal is delivered (bliss-7rdu). Returns 1 when:
+///  - a callee already stashed an error in `NATIVE_ERROR` (e.g. a nested
+///    `run_native` consumed SIGTERM and returned `Shutdown`, which `c2i_call`
+///    stashed): a spinning outer loop never returns on its own, so the stashed
+///    error would otherwise never be re-raised; or
+///  - a new process signal (SIGTERM/SIGINT/…) is pending — stash it
+///    (first-error-wins) so the Rust caller re-raises it.
+/// Returns 0 to keep looping. Leaving early is observably equivalent to running
+/// to the function's return: `run_native`/`run_native_osr` re-raise the stashed
+/// error regardless; this only makes it prompt instead of never.
+fn native_loop_should_exit() -> u64 {
+    if NATIVE_ERROR.with(|c| c.borrow().is_some()) {
+        return 1;
+    }
+    if let Some(error) = pending_signal_error_for_current_execution() {
+        NATIVE_ERROR.with(|c| {
+            let mut slot = c.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(error);
+            }
+        });
+        return 1;
+    }
+    0
+}
+
+/// Signal-only loop back-edge poll for OSR-compiled loops (bliss-7rdu). OSR code
+/// is emitted with `sym == u32::MAX` (no T2 escalation from an OSR loop), so it
+/// cannot use `c2i_t1_backedge`; without any back-edge poll a hot OSR loop
+/// ignores SIGTERM and GC stop-the-world forever (the observed `timeout` hang).
+extern "C" fn c2i_osr_backedge() -> u64 {
+    native_loop_should_exit()
+}
+
 extern "C" fn c2i_t1_backedge(sym: u64, header_bcp: u64, slots: *mut u64) -> u64 {
+    // A loop back-edge is the one place a hot NATIVE loop reliably re-enters
+    // Rust, so it is where such a loop must poll for a pending signal or a
+    // callee-stashed error — SIGTERM above all (bliss-7rdu): without a poll here,
+    // a native T1 loop (with or without calls) ignores `timeout(1)`/CI SIGTERM
+    // and GC stop-the-world indefinitely. The T0 interpreter polls every
+    // instruction; this gives native loops the equivalent at each sampled
+    // back-edge. Return 1 so T1 leaves through its epilogue, where `run_native`
+    // re-raises the error. Checked before the T2-promotion bookkeeping (and its
+    // `!t2_enabled()` early return) so the poll runs regardless of tier state.
+    if native_loop_should_exit() != 0 {
+        return 1;
+    }
     let sym = sym as u32;
     let header_bcp = header_bcp as u32;
     let Some(body) = registry_get(sym) else {
@@ -14120,6 +14167,7 @@ fn emit_native_x86(
     let deopt_state_addr = c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64;
     let t2_backedge_addr =
         c2i_t1_backedge as extern "C" fn(u64, u64, *mut u64) -> u64 as usize as u64;
+    let osr_backedge_addr = c2i_osr_backedge as extern "C" fn() -> u64 as usize as u64;
     let values_sym = resolve_sym("VALUES")?.as_symbol_index();
 
     let mut c = Asm::new();
@@ -14695,34 +14743,50 @@ fn emit_native_x86(
                 }
                 if (*target_bcp as usize) < bcp_idx
                     && tag_sp.get(tagbody_id) == Some(&0)
-                    && sym != u32::MAX
                     && backedge_counter != 0
                 {
-                    let keep_t1 = c.label();
+                    // Sampled loop back-edge poll. For a normal T1 function
+                    // (sym != MAX) this drives T1→T2 promotion AND polls process
+                    // signals (SIGTERM). For OSR-compiled code (sym == MAX) it is
+                    // a signal-ONLY poll so a hot OSR loop is still terminable and
+                    // still reaches GC stop-the-world (bliss-7rdu). Either helper
+                    // returns non-zero to say "leave the loop through the function
+                    // epilogue"; run_native/run_native_osr then re-raises any
+                    // stashed error.
+                    let keep = c.label();
                     c.extend_from_slice(&[0x48, 0xB8]); // mov rax, counter
                     c.extend_from_slice(&backedge_counter.to_le_bytes());
                     c.extend_from_slice(&[0x83, 0x00, 0x01]); // add dword [rax],1
                     c.extend_from_slice(&[0x81, 0x38]); // cmp dword [rax],imm32
                     c.extend_from_slice(&t2_backedge_threshold().to_le_bytes());
-                    c.jcc(Cc::L, keep_t1);
+                    c.jcc(Cc::L, keep);
                     c.extend_from_slice(&[0xC7, 0x00, 0, 0, 0, 0]); // reset sample
-                    c.push(0xBF); // mov edi,sym
-                    c.extend_from_slice(&sym.to_le_bytes());
-                    c.push(0xBE); // mov esi,header bcp
-                    c.extend_from_slice(&target_bcp.to_le_bytes());
-                    c.extend_from_slice(&[0x4C, 0x89, 0xF2]); // mov rdx,r14 slots
-                    c.extend_from_slice(&[0x48, 0xB8]);
-                    c.extend_from_slice(&t2_backedge_addr.to_le_bytes());
+                    if sym != u32::MAX {
+                        c.push(0xBF); // mov edi,sym
+                        c.extend_from_slice(&sym.to_le_bytes());
+                        c.push(0xBE); // mov esi,header bcp
+                        c.extend_from_slice(&target_bcp.to_le_bytes());
+                        c.extend_from_slice(&[0x4C, 0x89, 0xF2]); // mov rdx,r14 slots
+                        c.extend_from_slice(&[0x48, 0xB8]);
+                        c.extend_from_slice(&t2_backedge_addr.to_le_bytes());
+                    } else {
+                        // OSR: no args — signal-only poll.
+                        c.extend_from_slice(&[0x48, 0xB8]);
+                        c.extend_from_slice(&osr_backedge_addr.to_le_bytes());
+                    }
                     emit_c2i_helper_call(&mut c);
                     c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax,rax
-                    c.jcc(Cc::E, keep_t1);
-                    // T2 finished or deoptimized. Its result/dummy result was
-                    // stored in the first operand slot for the shared epilogue.
+                    c.jcc(Cc::E, keep);
+                    // Leaving the loop: T2 finished/deopt (T1) or a pending signal
+                    // (either tier). The result/dummy result is in the first
+                    // operand slot for the shared epilogue; a stashed error, if
+                    // any, is re-raised by the Rust caller before this value is
+                    // used.
                     c.extend_from_slice(&[0x49, 0x8B, 0x86]);
                     c.extend_from_slice(&(8 * n_locals).to_le_bytes());
                     c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
                     c.extend_from_slice(&[0x41, 0x5F, 0x41, 0x5E, 0xC3]);
-                    c.bind(keep_t1);
+                    c.bind(keep);
                 }
                 c.jmp(*bcp_labels.get(*target_bcp as usize)?);
             }
@@ -15306,7 +15370,15 @@ fn compile_osr(sym: u32) -> Option<Rc<OsrCode>> {
         // the loop runs at full native speed until (if ever) a value leaves the
         // fixnum domain. Speculation only actually engages for `deopt_safe`
         // functions (every call a pure primitive); others fall back to c2i.
-        let (code, osr) = emit_native_x86(&bf, true, u32::MAX, 0)?;
+        //
+        // A leaked, non-zero back-edge counter makes the emitter install the
+        // sampled back-edge poll even though sym == u32::MAX keeps OSR out of
+        // T2 escalation: with sym == MAX the poll is the signal-only
+        // `c2i_osr_backedge`, so a hot OSR loop stays terminable (SIGTERM) and
+        // reachable by GC stop-the-world (bliss-7rdu).
+        let backedge_counter = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(0)))
+            as *mut std::sync::atomic::AtomicU32 as usize as u64;
+        let (code, osr) = emit_native_x86(&bf, true, u32::MAX, backedge_counter)?;
         if osr.is_empty() {
             return None;
         }
