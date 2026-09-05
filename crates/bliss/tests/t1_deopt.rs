@@ -362,3 +362,27 @@ fn pure_fixnum_loop_is_never_blacklisted() {
     );
     assert_eq!(fields.get(2).copied(), Some("328350"), "result correct");
 }
+
+/// bliss-r8pt (S5 gate — "deopt must return the correct result"): a T2 function
+/// that deoptimizes while a live Tagged (list) local is on the frame currently
+/// reconstructs that slot as Fixnum(0), so REDUCE's subsequent list walk raises
+/// "Fixnum(0) is not of type list". The minimal trigger is `reduce` with a
+/// variadic-arithmetic reducer: `logand` re-enters `reduce`/`%logand2` (both
+/// T2), so the reducer call forces a nested T2 deopt while the outer REDUCE's
+/// `items` list is live across the guard. `reduce #'+` does not deopt and is
+/// unaffected. Expected 12; under T2 today it errors. Ignored until the T2
+/// per-guard deopt frame-state reconstruction preserves live Tagged slots.
+#[test]
+#[ignore = "bliss-r8pt: T2 deopt corrupts a live Tagged (list) frame slot"]
+fn t2_deopt_preserves_live_list_local() {
+    let program = "(defun rr (l) (reduce (function logand) l)) \
+                   (dotimes (k 20000) (rr (list 255 254 253 15))) \
+                   (format t \"~a~%\" (rr (list 255 254 253 15)))";
+    let tw = eval(program, &[("BLISS_BACKEND", "tree-walker")]);
+    assert_eq!(tw, "12", "sanity: interpreter result");
+    let t2 = eval(program, &[]); // default tiering reaches T2
+    assert_eq!(
+        t2, tw,
+        "T2 (which deopts here) must return the interpreter's result (bliss-r8pt)"
+    );
+}
