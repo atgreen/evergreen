@@ -24044,6 +24044,9 @@ mod env_gc_root_tests {
         });
 
         let expected: HashSet<i64> = (BASE..BASE + ROOT_COUNT).collect();
+        // Start a fresh scan pass so this walk's dedup set is independent of any
+        // pass state another unit test left behind (bliss-s56e).
+        bliss_rt::gc::advance_root_scan_pass();
         let mut rewritten = HashSet::new();
         env.visit_gc_roots(&mut |slot| unsafe {
             let value = &mut *slot;
@@ -24056,6 +24059,16 @@ mod env_gc_root_tests {
             }
         });
         assert_eq!(rewritten, expected, "every seeded Env root must be yielded");
+
+        // The env-frame visitor shares one visited-set per root-scan pass
+        // (bliss-s56e), so a frame reachable from many roots is walked once per
+        // collection, not once per root. Both walks above and below run outside a
+        // real collection, so they would share a pass id and the second walk's
+        // frame slots would be (correctly) suppressed as already-visited. Advance
+        // the pass so the second walk is a fresh collection that re-reads every
+        // slot — which is exactly what proves the visitor exposed the live
+        // mutable slots (the relocation from the first pass is still there).
+        bliss_rt::gc::advance_root_scan_pass();
 
         let relocated_expected: HashSet<i64> =
             expected.iter().map(|n| n + RELOCATION_DELTA).collect();

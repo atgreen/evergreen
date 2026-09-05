@@ -2747,6 +2747,16 @@ pub fn root_scan_pass() -> u64 {
     SCAN_PASS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Advance the root-scan pass id by one and return the new value. The collector
+/// bumps [`SCAN_PASS`] itself at the start of each real scan; this is for code
+/// that drives the host root visitors OUTSIDE a collection (e.g. a test that
+/// invokes `visit_gc_roots` directly and needs a *fresh* per-pass visited-set so
+/// a second manual walk is not suppressed by the first walk's dedup state).
+#[doc(hidden)]
+pub fn advance_root_scan_pass() -> u64 {
+    SCAN_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// Invoke every registered external root scanner with `visit`.
 fn scan_external_roots(mut visit: impl FnMut(*mut BlissVal)) {
     SCAN_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
