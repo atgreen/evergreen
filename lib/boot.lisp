@@ -625,6 +625,20 @@
 (defun copy-readtable (&optional from-readtable to-readtable)
   (declare (ignore from-readtable to-readtable))
   *readtable*)
+(defun readtablep (object)
+  (eq object :standard-readtable))
+;; Bliss has a single immutable standard readtable; its case mode is :UPCASE
+;; (CLHS 23.1.2 default). Portable code (e.g. chunga) reads READTABLE-CASE to
+;; decide how to case-fold tokens; supporting the reader — and a SETF that
+;; accepts the one mode we implement — is enough to load such systems.
+(defun readtable-case (readtable)
+  (declare (ignore readtable))
+  :upcase)
+(defun (setf readtable-case) (mode readtable)
+  (declare (ignore readtable))
+  (unless (eq mode :upcase)
+    (error "Bliss supports only the :UPCASE readtable-case; requested ~S." mode))
+  mode)
 ;; The default pathname merged against by MERGE-PATHNAMES and friends; ANSI
 ;; requires it to be bound to a pathname. Initialize to the startup directory.
 (defvar *default-pathname-defaults* (truename "."))
