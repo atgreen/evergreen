@@ -2162,6 +2162,30 @@ fn package_storage_is_registry_backed() {
 }
 
 #[test]
+fn destructuring_key_matches_bare_keyword_for_qualified_vars() {
+    // bliss-dyh2: the &key indicator is the variable's BARE name (ANSI:
+    // (intern (symbol-name var) :keyword)) even when the variable's symbol
+    // resolved package-qualified (an exported symbol read inside its own
+    // package). Deriving it from the full name made ASDF's
+    // parse-component-form destructure :components to NIL, so every defsystem
+    // parsed to zero children and load-system silently loaded nothing.
+    assert_eq!(
+        eval_ok(
+            "(progn
+               (defpackage :kwq (:use :cl) (:export #:components))
+               (eval (read-from-string \"
+                 (progn (in-package :kwq)
+                   (cl:defmacro kwq-probe (cl:&rest opts)
+                     (cl:destructuring-bind (cl:&key components serial) opts
+                       (cl:list 'cl:quote (cl:list components serial))))
+                   (in-package :cl-user))\"))
+               (eval (read-from-string \"(kwq::kwq-probe :components (1 2) :serial t)\")))"
+        ),
+        "((1 2) T)"
+    );
+}
+
+#[test]
 fn ansi_special_operators_are_external_in_common_lisp() {
     // bliss-xmxf step (a): the 25 ANSI special operators are seeded PRESENT +
     // EXTERNAL in the COMMON-LISP package table (they are compiler-handled by

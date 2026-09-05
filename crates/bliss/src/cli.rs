@@ -19519,8 +19519,18 @@ fn bind_macro_lambda_list(
                 rest_bound = true;
             }
             Mode::Key => {
+                // The keyword indicator is the variable's *bare* name (ANSI:
+                // `(intern (symbol-name var) :keyword)`), independent of the
+                // symbol's home package — a `&key components` variable whose
+                // symbol resolved package-qualified (an exported symbol read
+                // inside its own package) must still match a bare `:components`
+                // call keyword. Using the full name here made ASDF's
+                // parse-component-form destructure `components`/`pathname` to
+                // NIL, so every defsystem parsed to ZERO children and
+                // load-system silently loaded nothing (bliss-dyh2; mirrors
+                // parse_key_spec / bliss-lb6.12 on the function binder).
                 let (kw_bare, pattern, default_form, supp) = if elem.is_symbol() {
-                    let bare = sym_name(elem);
+                    let bare = symbol_bare_name(&sym_name(elem));
                     (bare, elem, NIL, None)
                 } else if elem.is_cons() {
                     let (head, r) = cp(elem);
@@ -19531,7 +19541,7 @@ fn bind_macro_lambda_list(
                         None
                     };
                     if head.is_symbol() {
-                        (sym_name(head), head, default, supp)
+                        (symbol_bare_name(&sym_name(head)), head, default, supp)
                     } else if head.is_cons() {
                         let (kw_sym, r3) = cp(head);
                         let pattern = if r3.is_cons() { cp(r3).0 } else { NIL };
