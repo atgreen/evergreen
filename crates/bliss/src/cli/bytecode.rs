@@ -13944,12 +13944,23 @@ fn run_native(
         if let Some(resume) = resume {
             return match resume {
                 NativeDeoptResume::Single { bcp, sp_top } => {
+                    if std::env::var_os("BLISS_DEOPT_PATH_DBG").is_some() {
+                        eprintln!("[deopt-path] Single sym={sym} bcp={bcp} sp_top={sp_top}");
+                    }
                     // State-transfer: resume T0 on this frame; `resume_in_t0`
                     // owns the frame's lifecycle from here (do NOT pop it first).
                     resume_in_t0(entry, frame, bcp, sp_top, sym, env_frame, env)
                 }
-                NativeDeoptResume::Inlined(scopes) => resume_inlined_in_t0(scopes, env),
+                NativeDeoptResume::Inlined(scopes) => {
+                    if std::env::var_os("BLISS_DEOPT_PATH_DBG").is_some() {
+                        eprintln!("[deopt-path] Inlined sym={sym} scopes={}", scopes.len());
+                    }
+                    resume_inlined_in_t0(scopes, env)
+                }
             };
+        }
+        if std::env::var_os("BLISS_DEOPT_PATH_DBG").is_some() {
+            eprintln!("[deopt-path] Rerun sym={sym}");
         }
         stack.pop_frame();
         return run(entry, args, BlissVal::from_symbol_index(sym), env);
