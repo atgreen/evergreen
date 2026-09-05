@@ -543,6 +543,22 @@ fn seed_standard_packages_registry() {
     let _ = bliss_stdlib::seed_ansi_special_operators();
 }
 
+/// Keep the *PACKAGE* global value cell in sync with `env.current_package`
+/// (bliss-gis4). Interpreted reads resolve *PACKAGE* through the root-frame
+/// lexical copy, but COMPILED tiers (bytecode LoadGlobal / native
+/// c2i_load_global) read only the symbol's value cell — which nothing wrote,
+/// so any bytecode-tier `*package*` read signalled UNBOUND-VARIABLE (this is
+/// what broke `asdf:load-system` of real systems). An active LET of *PACKAGE*
+/// (DynBind, as ASDF's DEFINE-OP makes) temporarily overwrites the cell and
+/// restores it on exit; under this sync the restore reinstates the
+/// then-current package, so the two sources stay consistent.
+fn sync_package_value_cell(canonical_name: &str) {
+    if let Some(s) = resolve_sym("*PACKAGE*") {
+        let pkg = package_object(canonical_name);
+        bliss_rt::symbols::set_symbol_value(s.as_symbol_index(), pkg);
+    }
+}
+
 /// The canonical package object for `canonical_name` (nicknames resolved first).
 /// Find-or-create against the registry, so `*PACKAGE*` and package designators
 /// always yield an object; interned by the registry: same name ⇒ same handle.
@@ -3955,6 +3971,7 @@ impl Env {
         }
         env.define_local("*MODULES*", NIL); // names of REQUIRE'd/PROVIDE'd modules
         env.define_local("*PACKAGE*", package_object("COMMON-LISP-USER"));
+        sync_package_value_cell("COMMON-LISP-USER");
         env.seed_standard_constant(
             "MOST-POSITIVE-FIXNUM",
             BlissVal::from_fixnum((1_i64 << 60) - 1),
@@ -7599,6 +7616,7 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
             let pkg_name = resolve_package_name(env, &val_as_str(pkg_val));
             if !pkg_name.is_empty() {
                 env.current_package = pkg_name;
+                sync_package_value_cell(&env.current_package);
             }
         }
     }
@@ -7634,6 +7652,7 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<BlissVal, BlissError>
     if env.current_package != saved_package {
         env.current_package = saved_package.clone();
         env.define_local("*PACKAGE*", package_object(&saved_package));
+        sync_package_value_cell(&saved_package);
     }
     result
 }
@@ -13332,6 +13351,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 if env.current_package != saved_package {
                     env.current_package = saved_package.clone();
                     env.define_local("*PACKAGE*", package_object(&saved_package));
+                    sync_package_value_cell(&saved_package);
                 }
                 let image = image?;
                 // Create the output directory if needed. ASDF's output-translations
@@ -13891,6 +13911,7 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     .to_uppercase();
                 env.current_package = pkg_name;
                 env.define_local("*PACKAGE*", package_object(&env.current_package));
+                sync_package_value_cell(&env.current_package);
                 return Ok(T);
             }
             "MAKE-PACKAGE" => {
