@@ -123,6 +123,19 @@ struct HashTableInner {
     rehash_threshold: f64,
     synchronized: bool,
     weakness: Option<Weakness>,
+    /// True once a key has been inserted whose hash falls through to an
+    /// object's ADDRESS (a movable, non-pinned heap object under the table's
+    /// test — e.g. a CLOS instance under EQ/EQL/EQUAL). The moving GC relocates
+    /// such a key and rewrites the stored pointer, but the key then sits in the
+    /// bucket for its OLD address; a fresh `gethash` probes the NEW-address
+    /// bucket and misses a live key. Tables that never hold such a key
+    /// (fixnum/char/string/symbol/cons-of-stable keys) stay `false` and are
+    /// never rehashed for GC (bliss-jtc.22 / bliss-cpje).
+    address_sensitive: bool,
+    /// The `gc_move_epoch()` at which this table's bucket placement was last
+    /// valid. When it differs from the current generation and the table is
+    /// `address_sensitive`, the next access rehashes in place first.
+    gc_gen: u64,
 }
 
 /// Round up to the next power of two. If already a power of two, returns it.
@@ -591,6 +604,127 @@ fn hash_for_test(object: BlissVal, test: HashTest) -> u64 {
     }
 }
 
+// ── Moving-GC hash stability (bliss-jtc.22 / bliss-cpje) ──────────────
+//
+// `hash_for_test` falls through to `hash_u64(object.0)` — the raw BlissVal bits,
+// i.e. the object's ADDRESS — for any heap object it can't hash structurally
+// (a CLOS instance, a function, a cons under EQ, …). The moving GC relocates
+// such objects and rewrites the pointer stored in the table's entry, but never
+// recomputes the entry's bucket, so a later probe (which hashes the NEW address)
+// looks in the wrong bucket and misses a live key. We detect keys that hash by a
+// *movable* address and rehash the whole table in place the first time it is
+// touched in a new GC generation. Symbols and their name strings are pinned and
+// immortal, so symbol/string keys are stable and never trigger a rehash.
+
+/// True if `object` is a heap pointer the GC may relocate: a cons (never
+/// pinned), or a `TAG_HEAP_OBJECT` whose header is not pinned. Immediates
+/// (fixnum/char/nil/t/single-float) are stable.
+fn is_movable_pointer(object: BlissVal) -> bool {
+    if object.tag() == TAG_CONS {
+        return true;
+    }
+    if object.is_heap_object() {
+        // Safety: a TAG_HEAP_OBJECT value points at an ObjectHeader.
+        return unsafe { !(*(object.as_ptr() as *const ObjectHeader)).is_pinned() };
+    }
+    false
+}
+
+/// Whether hashing `object` under `test` would depend on a movable object's
+/// address (mirrors the address fall-throughs in `equal_hash`/`equalp_hash`/
+/// `hash_for_test`). If so, a table holding this key must be rehashed after the
+/// GC relocates it.
+fn key_address_sensitive(object: BlissVal, test: HashTest) -> bool {
+    fn structural(object: BlissVal, depth: usize, equalp: bool) -> bool {
+        if depth == 0 {
+            return false; // hash returns a constant here too — stable
+        }
+        // Value-hashed leaves never depend on an address.
+        if numeric_value_hash(object, depth).is_some() {
+            return false;
+        }
+        if equalp && (object.is_character() || object.is_fixnum() || object.is_single_float()) {
+            return false;
+        }
+        if object.tag() == TAG_CONS {
+            // Safety: TAG_CONS points at a ConsCell.
+            let cell = unsafe { &*(object.as_ptr() as *const ConsCell) };
+            return structural(cell.car, depth - 1, equalp) || structural(cell.cdr, depth - 1, equalp);
+        }
+        if object.is_heap_object() {
+            if extract_string_bytes(object).is_some() {
+                return false; // content-hashed
+            }
+            if is_simple_vector(object) {
+                for i in 0..vector_length(object) {
+                    if structural(vector_elt(object, i), depth - 1, equalp) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+        // Fall-through: hashed by address iff it is a movable pointer.
+        is_movable_pointer(object)
+    }
+    match test {
+        HashTest::Eq => is_movable_pointer(object),
+        HashTest::Eql => numeric_value_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT).is_none()
+            && is_movable_pointer(object),
+        HashTest::Equal => structural(object, STRUCTURAL_HASH_DEPTH_LIMIT, false),
+        HashTest::Equalp => structural(object, STRUCTURAL_HASH_DEPTH_LIMIT, true),
+    }
+}
+
+/// Rebuild the table's bucket placement at the current capacity from the live
+/// entries' *current* key hashes. Pure reordering of existing `BlissVal`s — no
+/// Bliss allocation — so it is GC-safe (no collection can fire during it).
+fn rehash_in_place(inner: &mut HashTableInner) {
+    let cap = inner.capacity;
+    let mut new_entries: Vec<Option<RHEntry>> = vec![None; cap];
+    for e in inner.entries.iter().flatten() {
+        let mut idx = probe_index(hash_for_test(e.key, inner.test), cap);
+        let mut incoming = RHEntry {
+            key: e.key,
+            value: e.value,
+            probe_dist: 0,
+        };
+        loop {
+            match &new_entries[idx] {
+                None => {
+                    new_entries[idx] = Some(incoming);
+                    break;
+                }
+                Some(occupant) => {
+                    if incoming.probe_dist > occupant.probe_dist {
+                        let displaced = *occupant;
+                        new_entries[idx] = Some(incoming);
+                        incoming = displaced;
+                    }
+                }
+            }
+            incoming.probe_dist += 1;
+            idx = (idx + 1) & (cap - 1);
+        }
+    }
+    inner.entries = new_entries;
+}
+
+/// If this table hashes any key by a movable address and the GC has run since it
+/// was last valid, rehash it in place so bucket positions match current key
+/// hashes. Must be called at the start of every access that probes by hash
+/// (bliss-jtc.22 / bliss-cpje).
+fn maybe_rehash_for_gc(inner: &mut HashTableInner) {
+    if !inner.address_sensitive {
+        return;
+    }
+    let epoch = bliss_rt::gc::gc_move_epoch();
+    if inner.gc_gen != epoch {
+        rehash_in_place(inner);
+        inner.gc_gen = epoch;
+    }
+}
+
 // ── Hash table operations ──────────────────────────────────────────
 
 /// Create a new hash table (CL `MAKE-HASH-TABLE`). R5.31, R5.33.
@@ -623,6 +757,8 @@ pub fn make_hash_table(options: &MakeHashTableOptions) -> Result<BlissVal, Bliss
         rehash_threshold: options.rehash_threshold,
         synchronized: options.synchronized,
         weakness: options.weakness,
+        address_sensitive: false,
+        gc_gen: bliss_rt::gc::gc_move_epoch(),
     });
 
     let ptr = Box::into_raw(inner) as *mut u8;
@@ -642,6 +778,7 @@ pub fn gethash(
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
     // We create exactly one &mut reference from the raw pointer per call.
     let inner = unsafe { &mut *ptr };
+    maybe_rehash_for_gc(inner);
     let cap = inner.capacity;
     let test = inner.test;
     let key_hash = hash_for_test(key, test);
@@ -712,6 +849,13 @@ pub fn set_gethash(key: BlissVal, table: BlissVal, value: BlissVal) -> Result<()
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
     // We create exactly one &mut reference from the raw pointer per call.
     let inner = unsafe { &mut *ptr };
+    maybe_rehash_for_gc(inner);
+    // A key hashed by a movable object's address makes this table need
+    // rehashing after every GC that relocates it (bliss-jtc.22 / bliss-cpje).
+    if !inner.address_sensitive && key_address_sensitive(key, inner.test) {
+        inner.address_sensitive = true;
+        inner.gc_gen = bliss_rt::gc::gc_move_epoch();
+    }
     let test = inner.test;
     let key_hash = hash_for_test(key, test);
 
@@ -781,6 +925,7 @@ pub fn remhash(key: BlissVal, table: BlissVal) -> Result<bool, BlissError> {
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
     // We create exactly one &mut reference from the raw pointer per call.
     let inner = unsafe { &mut *ptr };
+    maybe_rehash_for_gc(inner);
     let cap = inner.capacity;
     let test = inner.test;
     let key_hash = hash_for_test(key, test);

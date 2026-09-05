@@ -3793,6 +3793,16 @@ thread_local! {
 /// the region's walkable reservation frontier.
 static GC_MOVE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
+/// Monotone counter bumped on every collection that may relocate objects
+/// (minor and major). Host data structures that hash by object address — e.g.
+/// `bliss-stdlib` hash tables — read this cheaply (a plain atomic load, no lock)
+/// to detect when their address-based bucket placement has gone stale and needs
+/// rehashing (bliss-jtc.22 / bliss-cpje). Unlike [`gc_generation`], it counts
+/// minor GCs too (which relocate nursery keys) and takes no lock.
+pub fn gc_move_epoch() -> u64 {
+    GC_MOVE_EPOCH.load(Ordering::Acquire)
+}
+
 /// Overwrite the type_id of a freshly-allocated object (its size/hash are
 /// already set by the allocator's placeholder header).
 ///
