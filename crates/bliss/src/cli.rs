@@ -3349,6 +3349,34 @@ struct EnvRootVisitState {
     class_slot_cells: HashSet<usize>,
 }
 
+thread_local! {
+    /// The per-scan-pass SHARED visit state (bliss-s56e): keyed by
+    /// `bliss_rt::gc::root_scan_pass()`, cleared when the pass id changes.
+    /// Every GC trace site walks env frames through this one state, so a frame
+    /// chain reachable from MANY roots (each nested LOAD roots an Env sharing
+    /// ancestry) is walked once per collection pass instead of once per root —
+    /// per-root fresh states made visit_env_frame_roots dominate every minor
+    /// GC of an allocation-heavy load (babel). Use ONLY from GC scan
+    /// callbacks: outside a pass the id is stale and the set would wrongly
+    /// suppress visits.
+    static ENV_VISIT_STATE: RefCell<(u64, EnvRootVisitState)> =
+        RefCell::new((u64::MAX, EnvRootVisitState::default()));
+}
+
+/// Run `f` with the scan-pass-shared [`EnvRootVisitState`] (bliss-s56e).
+pub(crate) fn with_env_visit_state<R>(f: impl FnOnce(&mut EnvRootVisitState) -> R) -> R {
+    ENV_VISIT_STATE.with(|c| {
+        let mut c = c.borrow_mut();
+        let pass = bliss_rt::gc::root_scan_pass();
+        if c.0 != pass {
+            c.0 = pass;
+            c.1.frames.clear();
+            c.1.class_slot_cells.clear();
+        }
+        f(&mut c.1)
+    })
+}
+
 fn visit_env_frame_roots(
     frame: &Rc<RefCell<EnvFrame>>,
     state: &mut EnvRootVisitState,
@@ -3564,8 +3592,7 @@ fn visit_handler_roots(
 /// handler clauses (HANDLER-CASE/HANDLER-BIND) and method specializers.
 impl bliss_rt::gc::TraceHostRoots for HandlerEntry {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
-        let mut state = EnvRootVisitState::default();
-        visit_handler_roots(&mut self.handler, &mut state, visit);
+        with_env_visit_state(|state| visit_handler_roots(&mut self.handler, state, visit));
     }
 }
 
@@ -3654,13 +3681,14 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
         }
     });
 
-    let mut state = EnvRootVisitState::default();
+    // Shared per-pass visit state (bliss-s56e).
+    with_env_visit_state(|state| {
     // Lexical frames captured by DEFMETHODs defined inside binding forms
     // (bliss-sdd) are roots: the moving collector must rewrite the BlissVals they
     // hold (e.g. cl-ppcre's REG-SCANNER) so the method body reads live pointers.
     METHOD_CAPTURED_ENV.with(|m| {
         for frame in m.borrow().values() {
-            visit_env_frame_roots(frame, &mut state, visit);
+            visit_env_frame_roots(frame, state, visit);
         }
     });
     // Keep each method's compiled body object live (bliss-x5y.20).
@@ -3671,7 +3699,7 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
     });
     GLOBAL_MACROS.with(|macros| {
         for definition in macros.borrow_mut().values_mut() {
-            visit_macro_def_roots(definition, &mut state, visit);
+            visit_macro_def_roots(definition, state, visit);
         }
     });
     GLOBAL_SETF_FNS.with(|functions| {
@@ -3710,7 +3738,7 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
             visit_fun_def_roots(definition, visit);
         }
         for class in capture.classes.values_mut() {
-            visit_class_def_roots(class, &mut state, visit);
+            visit_class_def_roots(class, state, visit);
         }
         for methods in capture.methods.values_mut() {
             for method in methods {
@@ -3735,6 +3763,7 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut BlissVal)) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         visit_bytecode_function_roots(&mut function, visit);
     }
+    }); // with_env_visit_state (bliss-s56e)
 }
 
 fn install_evaluator_global_root_scanner() {
@@ -3810,24 +3839,32 @@ impl Env {
     /// evaluator's global/static scanners and scoped roots for transient Rust
     /// locals.
     fn visit_gc_roots(&mut self, visit: &mut dyn FnMut(*mut BlissVal)) {
-        let mut state = EnvRootVisitState::default();
+        // Shared per-pass visit state (bliss-s56e): frames reachable from many
+        // rooted Envs are walked once per collection pass, not once per root.
+        with_env_visit_state(|state| self.visit_gc_roots_with(state, visit))
+    }
 
-        visit_env_frame_roots(&self.frame, &mut state, visit);
+    fn visit_gc_roots_with(
+        &mut self,
+        state: &mut EnvRootVisitState,
+        visit: &mut dyn FnMut(*mut BlissVal),
+    ) {
+        visit_env_frame_roots(&self.frame, state, visit);
 
         for def in self.funs.borrow_mut().values_mut() {
             visit_fun_def_roots(def, visit);
         }
         for def in self.macros.borrow_mut().values_mut() {
-            visit_macro_def_roots(def, &mut state, visit);
+            visit_macro_def_roots(def, state, visit);
         }
         for expander in self.setf_expanders.borrow_mut().values_mut() {
-            visit_setf_expander_roots(expander, &mut state, visit);
+            visit_setf_expander_roots(expander, state, visit);
         }
         for expansion in self.symbol_macros.borrow_mut().values_mut() {
             visit(expansion);
         }
         for class in self.classes.borrow_mut().values_mut() {
-            visit_class_def_roots(class, &mut state, visit);
+            visit_class_def_roots(class, state, visit);
         }
         for generic in self.generics.borrow_mut().values_mut() {
             visit(&mut generic.generic_function);
@@ -3838,17 +3875,17 @@ impl Env {
             }
         }
         for restart in &mut self.restarts {
-            visit_restart_function_roots(&mut restart.function, &mut state, visit);
+            visit_restart_function_roots(&mut restart.function, state, visit);
             if let Some(function) = &mut restart.interactive_function {
-                visit_restart_function_roots(function, &mut state, visit);
+                visit_restart_function_roots(function, state, visit);
             }
             if let Some(function) = &mut restart.test_function {
-                visit_restart_function_roots(function, &mut state, visit);
+                visit_restart_function_roots(function, state, visit);
             }
         }
         for cluster in &mut self.handlers {
             for entry in &mut cluster.entries {
-                visit_handler_roots(&mut entry.handler, &mut state, visit);
+                visit_handler_roots(&mut entry.handler, state, visit);
             }
         }
         for value in &mut self.mv {
@@ -3857,7 +3894,7 @@ impl Env {
         for closure in self.closures.borrow_mut().values_mut() {
             visit(&mut closure.params_form);
             visit(&mut closure.body);
-            visit_env_frame_roots(&closure.captured_frame, &mut state, visit);
+            visit_env_frame_roots(&closure.captured_frame, state, visit);
         }
         for context in &mut self.method_context {
             for arg in &mut context.args {
@@ -4397,10 +4434,12 @@ thread_local! {
 fn scan_suspended_frames(visit: &mut dyn FnMut(*mut BlissVal)) {
     SUSPENDED_FRAMES.with(|s| {
         let frames = s.borrow();
-        let mut state = EnvRootVisitState::default();
-        for frame in frames.iter() {
-            visit_env_frame_roots(frame, &mut state, visit);
-        }
+        // Shared per-pass visit state (bliss-s56e).
+        with_env_visit_state(|state| {
+            for frame in frames.iter() {
+                visit_env_frame_roots(frame, state, visit);
+            }
+        });
     });
 }
 

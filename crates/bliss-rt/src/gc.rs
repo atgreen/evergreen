@@ -2733,8 +2733,23 @@ pub fn register_root_scanner(f: RootScanner) {
     }
 }
 
+/// Monotone id of the current external-root scan pass. Bumped once each time
+/// the collector begins a full pass over the registered scanners, so host-side
+/// visitors can share one visited set per pass — deduplicating structures (env
+/// frame chains) reachable from many roots — and know exactly when to reset it
+/// (bliss-s56e: without this, every rooted Env re-walked shared frame chains on
+/// every minor GC, dominating allocation-heavy loads).
+static SCAN_PASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current root-scan pass id (see [`SCAN_PASS`]). Only meaningful while a
+/// collection is scanning; host visitors compare it against their cached id.
+pub fn root_scan_pass() -> u64 {
+    SCAN_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Invoke every registered external root scanner with `visit`.
 fn scan_external_roots(mut visit: impl FnMut(*mut BlissVal)) {
+    SCAN_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scanners = root_scanners().lock().unwrap().clone();
     for s in scanners {
         s(&mut visit);

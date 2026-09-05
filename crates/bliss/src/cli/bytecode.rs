@@ -9977,8 +9977,11 @@ impl bliss_rt::gc::TraceHostRoots for Activation {
             binding.trace_host_roots(visit);
         }
         if let Some(env_frame) = &self.env_frame {
-            let mut state = super::EnvRootVisitState::default();
-            super::visit_env_frame_roots(env_frame, &mut state, visit);
+            // Shared per-pass visit state (bliss-s56e): activations deep in a
+            // load recursion share frame ancestry; walk it once per pass.
+            super::with_env_visit_state(|state| {
+                super::visit_env_frame_roots(env_frame, state, visit);
+            });
         }
     }
 }
