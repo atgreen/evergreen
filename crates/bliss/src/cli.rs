@@ -10683,15 +10683,30 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                                 // returns the assigned value.
                             }
                             other => {
+                                // Match the accessor by symbol identity, not the
+                                // context-dependent printed name: at a SETF site in
+                                // a package that only imports (or references
+                                // qualified) the accessor symbol, `other` arrives
+                                // package-qualified (ASDF/COMPONENT:%FOO) while the
+                                // slot stored the bare accessor name (%FOO). Compare
+                                // bare names too so the accessor resolves regardless
+                                // of the caller's *PACKAGE* (bliss-d0b family; this
+                                // is the same fix already used for reader dispatch at
+                                // the FUNCTION handler below). Without it, e.g.
+                                // ASDF's `(push … (%additional-input-files c))`
+                                // raised "SETF: unsupported place", blocking
+                                // (asdf:load-system :split-sequence).
+                                let bare_other = symbol_bare_name(other);
+                                let name_matches = |n: &str| n == other || symbol_bare_name(n) == bare_other;
                                 let reader_slot = env.classes.borrow().values().find_map(|class| {
                                     class.slots.iter().find_map(|slot| {
                                         let matches_reader = slot
                                             .accessor
                                             .as_ref()
-                                            .map(|acc| acc == other)
+                                            .map(|acc| name_matches(acc))
                                             .unwrap_or(false)
-                                            || slot.readers.iter().any(|reader| reader == other)
-                                            || slot.writers.iter().any(|writer| writer == other);
+                                            || slot.readers.iter().any(|reader| name_matches(reader))
+                                            || slot.writers.iter().any(|writer| name_matches(writer));
                                         if matches_reader {
                                             Some(slot.name.clone())
                                         } else {

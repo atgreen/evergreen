@@ -2583,3 +2583,23 @@ fn clos_next_method_p_reflects_chain() {
         "NONE"
     );
 }
+
+#[test]
+fn setf_of_package_qualified_class_accessor() {
+    // A SETF of a DEFCLASS :accessor whose symbol is referenced package-qualified
+    // at the call site (a different *PACKAGE* than where the class was defined)
+    // must resolve the writer. bliss matched the accessor by printed name, so the
+    // qualified "PKG:ACC" at the setf site missed the bare "ACC" the slot stored
+    // and raised "SETF: unsupported place" — which blocked ASDF's
+    // (push … (%additional-input-files c)) and (asdf:load-system :split-sequence).
+    // Verified against SBCL: 42.
+    assert_eq!(
+        eval_ok(
+            "(progn \
+               (defpackage :sqa (:use :cl) (:export #:acc #:kls)) \
+               (defclass sqa:kls () ((s :accessor sqa:acc :initform 0))) \
+               (let ((o (make-instance 'sqa:kls))) (setf (sqa:acc o) 42) (sqa:acc o)))"
+        ),
+        "42"
+    );
+}
