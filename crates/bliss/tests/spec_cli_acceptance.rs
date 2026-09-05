@@ -2162,6 +2162,25 @@ fn package_storage_is_registry_backed() {
 }
 
 #[test]
+fn ansi_special_operators_are_external_in_common_lisp() {
+    // bliss-xmxf step (a): the 25 ANSI special operators are seeded PRESENT +
+    // EXTERNAL in the COMMON-LISP package table (they are compiler-handled by
+    // name and previously had no table entry — (find-symbol "EVAL-WHEN" :cl)
+    // was NIL in a bare session). Identity must match the read symbol, and a
+    // package using CL inherits them.
+    assert_eq!(
+        eval_ok(
+            "(list (nth-value 1 (find-symbol \"EVAL-WHEN\" :common-lisp))
+                   (nth-value 1 (find-symbol \"LET*\" :common-lisp))
+                   (nth-value 1 (find-symbol \"UNWIND-PROTECT\" :common-lisp))
+                   (nth-value 1 (find-symbol \"THE\" :cl-user))
+                   (eq 'the (find-symbol \"THE\" :common-lisp)))"
+        ),
+        "(:EXTERNAL :EXTERNAL :EXTERNAL :INHERITED T)"
+    );
+}
+
+#[test]
 fn float_literal_overflow_signals_catchable_error() {
     // CLHS 2.3.2.2 (bliss-37sr): a float literal outside the target format's
     // range signals a catchable error (SBCL: FLOATING-POINT-OVERFLOW) rather

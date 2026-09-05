@@ -327,6 +327,13 @@ impl PackageRegistry {
         self.ensure_package_alias("KEYWORD", keyword)?;
         self.ensure_package_alias("BLISS-INTERNAL", bliss_internal)?;
         self.ensure_package_alias("BLISS-EXT", bliss_ext)?;
+
+        // NOTE: the ANSI special operators are NOT seeded here.
+        // seed_ansi_special_operators interns symbols on the shared GC heap,
+        // and this initializer doubles as a heap-free store fixture for the
+        // package unit tests, which run in parallel — concurrent interning
+        // from test threads segfaults. The host runtime seeds after creating
+        // its registry (cli.rs seed_standard_packages_registry).
         Ok(())
     }
 
@@ -1327,6 +1334,56 @@ pub fn add_symbol(
         pkg.external_symbols.insert(bare_name, sym);
     } else if !pkg.external_symbols.contains_key(bare_name) {
         pkg.internal_symbols.insert(bare_name, sym);
+    }
+    Ok(())
+}
+
+/// Seed the 25 ANSI special operators (CLHS 3.1.2.1.2.1) PRESENT and EXTERNAL
+/// in the active registry's COMMON-LISP package, with each symbol's heap
+/// home-package cell pointing at CL. They are compiler-handled by name and
+/// previously had no package-table entry at all, so (find-symbol "EVAL-WHEN"
+/// :cl) was NIL until something happened to intern the name, and the "genuine
+/// CL symbol" checks (the stays-inherited guard, COMMON-LISP ownership) could
+/// not see them. This is step (a) of the bliss-xmxf plan: with the operator
+/// surface complete in the CL table, the reader can intern bare names into the
+/// CURRENT package (step b) without breaking operator dispatch by full name
+/// ("undefined function: UIOP/PACKAGE:EVAL-WHEN"). Idempotent; callers seed
+/// after the COMMON-LISP package exists.
+pub fn seed_ansi_special_operators() -> Result<(), BlissError> {
+    const ANSI_SPECIAL_OPERATORS: [&str; 25] = [
+        "BLOCK",
+        "CATCH",
+        "EVAL-WHEN",
+        "FLET",
+        "FUNCTION",
+        "GO",
+        "IF",
+        "LABELS",
+        "LET",
+        "LET*",
+        "LOAD-TIME-VALUE",
+        "LOCALLY",
+        "MACROLET",
+        "MULTIPLE-VALUE-CALL",
+        "MULTIPLE-VALUE-PROG1",
+        "PROGN",
+        "PROGV",
+        "QUOTE",
+        "RETURN-FROM",
+        "SETQ",
+        "SYMBOL-MACROLET",
+        "TAGBODY",
+        "THE",
+        "THROW",
+        "UNWIND-PROTECT",
+    ];
+    let Some(common_lisp) = find_package("COMMON-LISP") else {
+        return Ok(());
+    };
+    for name in ANSI_SPECIAL_OPERATORS {
+        let sym = BlissVal::from_symbol_index(bliss_rt::symbols::intern(name));
+        add_symbol(common_lisp, name, sym, true)?;
+        bliss_rt::symbols::set_symbol_package(sym.as_symbol_index(), common_lisp);
     }
     Ok(())
 }

@@ -85,7 +85,7 @@ pub use packages::{
     intern_present, is_external_symbol, is_package, list_all_packages, make_package, package_name,
     package_name_eq,
     package_nicknames, package_shadowing_symbols, package_use_list, present_symbols,
-    rename_package, shadow, shadowing_import,
+    rename_package, seed_ansi_special_operators, shadow, shadowing_import,
     unexport, unintern, unuse_package, use_package, use_package_by_name,
 };
 pub use pathnames::{

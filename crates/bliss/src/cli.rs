@@ -538,6 +538,9 @@ fn seed_standard_packages_registry() {
     }
     reader::register_package("CL-USER");
     reader::register_package("BLISS-THREADS");
+    // ANSI special operators live present+external in the COMMON-LISP table
+    // (bliss-xmxf step a) — see seed_ansi_special_operators.
+    let _ = bliss_stdlib::seed_ansi_special_operators();
 }
 
 /// The canonical package object for `canonical_name` (nicknames resolved first).
