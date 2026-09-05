@@ -2806,6 +2806,23 @@ fn emit_framed_inner(
         if fs.scopes.is_empty() {
             return Err(EmitError::UnsupportedOp(0xF4));
         }
+        if std::env::var_os("BLISS_FRAMESTATE_DBG").is_some() {
+            for (si, scope) in fs.scopes.iter().enumerate() {
+                eprintln!(
+                    "[fs] inst={inst:?} scope#{si} fn={} bcp={} nlocals={} nstack={}",
+                    scope.function,
+                    scope.bcp,
+                    scope.locals.len(),
+                    scope.stack.len()
+                );
+                for (li, vs) in scope.locals.iter().enumerate() {
+                    eprintln!("[fs]   local[{li}] = {vs:?}");
+                }
+                for (sti, vs) in scope.stack.iter().enumerate() {
+                    eprintln!("[fs]   stack[{sti}] = {vs:?}");
+                }
+            }
+        }
         // Serialized virtual-frame stream: for each outer-to-inner scope,
         // [function, bcp, nlocals, nstack, locals..., stack...].
         let n_words: usize = fs
