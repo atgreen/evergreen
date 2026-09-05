@@ -2205,6 +2205,30 @@ fn ansi_special_operators_are_external_in_common_lisp() {
 }
 
 #[test]
+fn return_from_through_closure_is_lexical() {
+    // CLHS 3.1: BLOCK/RETURN-FROM (and TAGBODY/GO) are LEXICAL. A closure that
+    // does (return-from tag …) must exit the block it was written inside, even
+    // when it is invoked while another block of the same name is dynamically
+    // active in an intervening frame — e.g. a (return) funcalled inside another
+    // function's LOOP, whose implicit `block nil` is on the stack. bliss
+    // resolved return-from by name against the shared dynamic block stack, so
+    // the closure returned from the wrong frame (bliss-4u5u root cause; a
+    // closure now captures its lexical block/tag exit points). Verified against
+    // SBCL: both cases yield :FROM-OUTER.
+    assert_eq!(
+        eval_ok(
+            "(progn
+               (defun run-in-loop (fn) (loop :repeat 1 :do (funcall fn)))
+               (defun outer-nil () (block nil (run-in-loop (lambda () (return :from-outer))) :normal))
+               (defun run (fn) (block tag (funcall fn) :run))
+               (defun outer-tag () (block tag (run (lambda () (return-from tag :from-outer))) :normal))
+               (list (outer-nil) (outer-tag)))"
+        ),
+        "(:FROM-OUTER :FROM-OUTER)"
+    );
+}
+
+#[test]
 fn float_literal_overflow_signals_catchable_error() {
     // CLHS 2.3.2.2 (bliss-37sr): a float literal outside the target format's
     // range signals a catchable error (SBCL: FLOATING-POINT-OVERFLOW) rather

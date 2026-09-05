@@ -1050,6 +1050,22 @@ struct Closure {
     params_form: BlissVal,
     body: BlissVal,
     captured_frame: Rc<RefCell<EnvFrame>>,
+    /// The lexically-enclosing BLOCK and TAGBODY exit points, captured at
+    /// closure-creation time. CL specifies BLOCK/RETURN-FROM and TAGBODY/GO as
+    /// LEXICAL: a closure that does `(return-from tag …)` must target the block
+    /// it was written inside, regardless of what blocks are dynamically active
+    /// where it is later invoked. The evaluator tracks these on `Env`
+    /// (block_stack / tag_stack) and resolves them by name, so without capturing
+    /// them a closure invoked while another same-named block is active (e.g. a
+    /// `(return)` funcalled inside another function's LOOP — LOOP establishes an
+    /// implicit `block nil`) returns from the wrong frame. This broke ASDF's
+    /// traverse-action (its guard `(return)` runs in a closure invoked inside
+    /// map-direct-dependencies' loop), silently truncating every load plan
+    /// (bliss-4u5u). The captured tokens' native frames must still be live when
+    /// the closure runs, which holds for a downward funarg (the ASDF case);
+    /// invoking an escaped upward closure's return-from is undefined in CL.
+    captured_blocks: Vec<(String, String)>,
+    captured_tags: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -8183,6 +8199,8 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: BlissVal, bare: &str) -> BlissVal
         params_form: *params_form,
         body: *body,
         captured_frame: Rc::clone(&env.frame),
+        captured_blocks: env.block_stack.clone(),
+        captured_tags: env.tag_stack.clone(),
     };
     // Once inserted, params_form/body are rooted via the GC scan of env.closures.
     env.closures.borrow_mut().insert(id, closure);
@@ -10813,6 +10831,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                             params_form,
                             body,
                             captured_frame: Rc::clone(&env.frame),
+                            captured_blocks: env.block_stack.clone(),
+                            captured_tags: env.tag_stack.clone(),
                         };
                         let id = next_closure_id();
                         env.closures.borrow_mut().insert(id, closure);
@@ -10830,6 +10850,8 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     params_form,
                     body,
                     captured_frame: Rc::clone(&env.frame),
+                    captured_blocks: env.block_stack.clone(),
+                    captured_tags: env.tag_stack.clone(),
                 };
                 let id = next_closure_id();
                 env.closures.borrow_mut().insert(id, closure);
@@ -18890,6 +18912,8 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<BlissVal> {
         params_form,
         body,
         captured_frame: Rc::clone(&env.frame),
+        captured_blocks: env.block_stack.clone(),
+        captured_tags: env.tag_stack.clone(),
     };
     let id = next_closure_id();
     env.closures.borrow_mut().insert(id, closure);
@@ -21856,13 +21880,25 @@ fn apply_function(
             let id = lr.as_fixnum() as u64;
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
-                return eval_lambda_call(
+                // Run the body against the closure's LEXICAL block/tagbody exit
+                // points, not the caller's dynamic ones (bliss-4u5u): a
+                // `(return-from tag …)` in the body must target the block the
+                // lambda was written inside. Save and restore the caller's
+                // stacks around the call.
+                let saved_blocks =
+                    std::mem::replace(&mut env.block_stack, closure.captured_blocks.clone());
+                let saved_tags =
+                    std::mem::replace(&mut env.tag_stack, closure.captured_tags.clone());
+                let result = eval_lambda_call(
                     env,
                     closure.params_form,
                     closure.body,
                     args,
                     Rc::clone(&closure.captured_frame),
                 );
+                env.block_stack = saved_blocks;
+                env.tag_stack = saved_tags;
+                return result;
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
