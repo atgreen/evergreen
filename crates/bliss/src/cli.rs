@@ -1765,6 +1765,14 @@ fn condition_report_string(env: &Env, cond: BlissVal) -> Option<String> {
             .and_then(|s| read_slot_value(cond, s, env).ok())
             .filter(|v| !v.is_nil())
     };
+    // Like `read`, but keeps a bound NIL value — for required slots (e.g.
+    // TYPE-ERROR's DATUM) where NIL is a legitimate value, not "unprovided".
+    // Without this a `(the number nil)` failure reports "The value ? is not of
+    // type NUMBER" instead of "NIL", masking the real datum (bliss self-host
+    // debugging hit exactly this).
+    let read_bound = |slot: &str| -> Option<BlissVal> {
+        resolve_sym(slot).and_then(|s| read_slot_value(cond, s, env).ok())
+    };
     // Simple conditions carry a format control + arguments.
     if let Some(fc) = read("FORMAT-CONTROL") {
         if is_string_value(fc) {
@@ -1777,8 +1785,8 @@ fn condition_report_string(env: &Env, cond: BlissVal) -> Option<String> {
     }
     let is = |t: &str| names.iter().any(|n| n == t);
     if is("TYPE-ERROR") {
-        let datum = read("DATUM").map(format_val).unwrap_or_else(|| "?".into());
-        let expected = read("EXPECTED-TYPE")
+        let datum = read_bound("DATUM").map(format_val).unwrap_or_else(|| "?".into());
+        let expected = read_bound("EXPECTED-TYPE")
             .map(format_val)
             .unwrap_or_else(|| "?".into());
         return Some(format!("The value {datum} is not of type {expected}."));
