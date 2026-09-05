@@ -1036,6 +1036,30 @@ pub fn macroexpand_all(form: BlissVal, env: &Environment) -> Result<BlissVal, Bl
         return Ok(expanded);
     }
 
+    // Quasiquote: the template is DATA, not code. Expand ONLY the argument of
+    // each UNQUOTE / UNQUOTE-SPLICING (depth-aware for nested quasiquotes), and
+    // preserve all template structure plus the quasiquote/unquote markers. The
+    // generic walk below would treat template sub-forms as code and macroexpand
+    // them — e.g. a template `(defvar ,x 0)` would expand the DEFVAR macro, which
+    // quotes its name argument, dropping the unquote and losing any symbol-macro
+    // substitution on `x`. That is bliss-jmde: WITH-SLOTS / SYMBOL-MACROLET used
+    // inside a macro's backquote produced "variable X unbound" (broke trivia,
+    // lisp-namespace, serapeum).
+    if is_symbol_named(operator, "BLISS::QUASIQUOTE") {
+        let arg = unsafe { cons_cdr(expanded) };
+        let template = if arg.is_cons() {
+            unsafe { cons_car(arg) }
+        } else {
+            bliss_rt::value::NIL
+        };
+        let mut new_template = expand_quasiquote_template(template, env, 1)?;
+        bliss_rt::rooted_ref!(_new_template_root = &mut new_template);
+        return Ok(alloc_cons(
+            operator,
+            alloc_cons(new_template, bliss_rt::value::NIL),
+        ));
+    }
+
     // Step 3.b: Special operator dispatch (spec §4.2.7).
     // Special operators have structural subforms (binding names, block names,
     // tag labels) that must NOT be expanded as expressions.
@@ -1143,6 +1167,56 @@ fn is_known_special_operator(val: BlissVal) -> bool {
 }
 
 /// Dispatch to the correct special-form expansion handler (spec §4.2.7).
+/// Walk a quasiquote template as data, macroexpanding ONLY the argument of each
+/// UNQUOTE / UNQUOTE-SPLICING at the outermost level. Nested BLISS::QUASIQUOTE
+/// raises the depth; an UNQUOTE lowers it, so only a `depth == 1` unquote holds
+/// code to expand. All structure — including the quasiquote/unquote markers — is
+/// rebuilt unchanged (bliss-jmde).
+fn expand_quasiquote_template(
+    mut form: BlissVal,
+    env: &Environment,
+    depth: u32,
+) -> Result<BlissVal, BlissError> {
+    bliss_rt::rooted_ref!(_form_root = &mut form);
+    if !form.is_cons() {
+        return Ok(form);
+    }
+    let mut op = unsafe { cons_car(form) };
+    bliss_rt::rooted_ref!(_op_root = &mut op);
+    if is_symbol_named(op, "BLISS::UNQUOTE") || is_symbol_named(op, "BLISS::UNQUOTE-SPLICING") {
+        let rest = unsafe { cons_cdr(form) };
+        let arg = if rest.is_cons() {
+            unsafe { cons_car(rest) }
+        } else {
+            bliss_rt::value::NIL
+        };
+        let mut new_arg = if depth <= 1 {
+            macroexpand_all(arg, env)?
+        } else {
+            expand_quasiquote_template(arg, env, depth - 1)?
+        };
+        bliss_rt::rooted_ref!(_new_arg_root = &mut new_arg);
+        return Ok(alloc_cons(op, alloc_cons(new_arg, bliss_rt::value::NIL)));
+    }
+    if is_symbol_named(op, "BLISS::QUASIQUOTE") {
+        let rest = unsafe { cons_cdr(form) };
+        let arg = if rest.is_cons() {
+            unsafe { cons_car(rest) }
+        } else {
+            bliss_rt::value::NIL
+        };
+        let mut new_arg = expand_quasiquote_template(arg, env, depth + 1)?;
+        bliss_rt::rooted_ref!(_new_arg_root = &mut new_arg);
+        return Ok(alloc_cons(op, alloc_cons(new_arg, bliss_rt::value::NIL)));
+    }
+    // Ordinary template cons: walk car and cdr as data.
+    let mut new_car = expand_quasiquote_template(unsafe { cons_car(form) }, env, depth)?;
+    bliss_rt::rooted_ref!(_new_car_root = &mut new_car);
+    let mut new_cdr = expand_quasiquote_template(unsafe { cons_cdr(form) }, env, depth)?;
+    bliss_rt::rooted_ref!(_new_cdr_root = &mut new_cdr);
+    Ok(alloc_cons(new_car, new_cdr))
+}
+
 fn expand_special_form(
     operator: BlissVal,
     form: BlissVal,

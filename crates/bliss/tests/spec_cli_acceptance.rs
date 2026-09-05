@@ -2603,3 +2603,25 @@ fn setf_of_package_qualified_class_accessor() {
         "42"
     );
 }
+
+#[test]
+fn quasiquote_template_expands_only_unquotes_not_data() {
+    // bliss-jmde: macroexpand-all must treat a quasiquote template as DATA and
+    // expand only the argument of each unquote — never the template's own forms.
+    // A macro whose backquote template contains a form like (defvar ,x 0) with a
+    // SYMBOL-MACRO x (from with-slots/symbol-macrolet) previously had the DEFVAR
+    // macro expanded inside the template, which quoted its name arg and dropped
+    // the unquote, so x was lost -> "variable X unbound". This blocked trivia,
+    // lisp-namespace, serapeum. Here H is a symbol-macro for a compound form;
+    // the template's DEFVAR must survive as data with ,H substituted. SBCL: the
+    // expansion is (DEFVAR 99 0).
+    assert_eq!(
+        eval_ok(
+            "(progn \
+               (defmacro dtq (n) (declare (ignore n)) \
+                 (let ((v 99)) (symbol-macrolet ((h (+ v 0))) `(defvar ,h 0)))) \
+               (nth-value 0 (macroexpand-1 '(dtq foo))))"
+        ),
+        "(DEFVAR 99 0)"
+    );
+}
