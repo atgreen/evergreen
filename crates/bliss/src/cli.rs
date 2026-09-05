@@ -4505,12 +4505,43 @@ fn with_block_nil(
     }
 }
 
+/// How a called function body inherits BLOCK/TAGBODY exit points from the
+/// caller. CL specifies these as LEXICAL, but the evaluator tracks them on a
+/// single shared, dynamic `env.block_stack`/`tag_stack` that accumulates every
+/// enclosing frame's blocks. Left un-reset, a called function sees the caller's
+/// blocks, so `(return-from name …)` / `(go tag)` resolve by NAME to the
+/// dynamically-nearest match rather than the lexically-correct one — and in
+/// recursion the stack holds many same-named blocks, so resolution is
+/// ambiguous (bliss-4u5u / bliss-140o). The invocation therefore installs the
+/// callee's OWN lexical scope for the body and restores the caller's after.
+enum LexicalControl {
+    /// Keep the caller's stacks — the callee is lexically enclosed by them (a
+    /// bare `((lambda …) …)` written inline at the call site).
+    Inherit,
+    /// A fresh, empty scope — a top-level named function/method has no enclosing
+    /// blocks (its own implicit `(block name …)` is inside its body).
+    Fresh,
+    /// The blocks/tags lexically in scope where a closure was created.
+    Captured(Vec<(String, String)>, Vec<(String, String)>),
+}
+
 fn eval_lambda_call(
     env: &mut Env,
     params_form: BlissVal,
     body: BlissVal,
     args: &[BlissVal],
     parent: Rc<RefCell<EnvFrame>>,
+) -> Result<BlissVal, BlissError> {
+    eval_lambda_call_ex(env, params_form, body, args, parent, LexicalControl::Inherit)
+}
+
+fn eval_lambda_call_ex(
+    env: &mut Env,
+    params_form: BlissVal,
+    body: BlissVal,
+    args: &[BlissVal],
+    parent: Rc<RefCell<EnvFrame>>,
+    control: LexicalControl,
 ) -> Result<BlissVal, BlissError> {
     // The interim host-stack depth guard (commit ddba528) is retired (nmq.6):
     // with the bytecode backend the default, deep recursion runs on the
@@ -4520,14 +4551,32 @@ fn eval_lambda_call(
     bliss_rt::rooted!(params_form = params_form);
     bliss_rt::rooted!(body = body);
     rooted_args!(args = args);
-    with_child_frame(env, parent, |env| {
+    // Install the callee's lexical BLOCK/TAGBODY scope for the body (bliss-4u5u),
+    // saving the caller's to restore afterward. `Inherit` leaves them as-is.
+    let saved: Option<(Vec<(String, String)>, Vec<(String, String)>)> = match control {
+        LexicalControl::Inherit => None,
+        LexicalControl::Fresh => Some((
+            std::mem::take(&mut env.block_stack),
+            std::mem::take(&mut env.tag_stack),
+        )),
+        LexicalControl::Captured(blocks, tags) => Some((
+            std::mem::replace(&mut env.block_stack, blocks),
+            std::mem::replace(&mut env.tag_stack, tags),
+        )),
+    };
+    let result = with_child_frame(env, parent, |env| {
         bind_lambda_list(*params_form, args, env)?;
         // Arguments are a single-value context; a producer evaluated as an
         // argument (or an &optional/&key default) must not leak its extra values
         // into the body. The body's tail form establishes this call's values.
         env.clear_mv();
         eval_progn(*body, env)
-    })
+    });
+    if let Some((blocks, tags)) = saved {
+        env.block_stack = blocks;
+        env.tag_stack = tags;
+    }
+    result
 }
 
 fn with_eval_context<T>(
@@ -14702,8 +14751,9 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             // tree-walked code (e.g. a `loop`, which never compiles to bytecode).
             // Guard on no lexical shadow — never redirect an FLET/LABELS binding
             // to the global registry entry of the same name.
+            let is_local_fn = env.funs.borrow().contains_key(&name);
             let mut call_parent = Rc::clone(&env.frame);
-            if !env.funs.borrow().contains_key(&name) {
+            if !is_local_fn {
                 maybe_lazy_compile(&name, *params_form, *body, env);
                 // Dispatch through the resolved function OBJECT, mirroring the
                 // funcall-object path: key the registry on its OWN name (so an
@@ -14740,9 +14790,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                     call_parent = Rc::new(RefCell::new(EnvFrame::default()));
                 }
             }
+            // A GLOBAL named function has no lexically-enclosing BLOCK/TAGBODY
+            // (its own implicit block is inside its body), so it runs in a FRESH
+            // exit scope — not the caller's dynamic one (bliss-4u5u). A local
+            // FLET/LABELS name is lexically nested in the caller, so it inherits.
+            let control = if is_local_fn {
+                LexicalControl::Inherit
+            } else {
+                LexicalControl::Fresh
+            };
             // The rooted argument vector is rewritten in place by any collection
             // (call_registered may have collected), so it is always current.
-            let res = eval_lambda_call(env, *params_form, *body, &rooted_args, call_parent);
+            let res =
+                eval_lambda_call_ex(env, *params_form, *body, &rooted_args, call_parent, control);
             if let Err(e) = &res {
                 calltrace_note(&name, e);
             }
@@ -21775,8 +21835,9 @@ fn apply_function(
             // closure's environment is installed when its body runs (bliss-57m /
             // bliss-jtc.23.3). Guard on no lexical FLET/LABELS shadow so a local
             // binding is never redirected to the global registry entry.
+            let is_local_fn = env.funs.borrow().contains_key(&*name);
             let mut call_parent = Rc::clone(&env.frame);
-            if !env.funs.borrow().contains_key(&*name) {
+            if !is_local_fn {
                 // Lazy compile when hot (bliss-x5y) — this path handles a global
                 // function reached through funcall/apply or the c2i fallback from
                 // compiled code (e.g. a call inside a compiled top-level thunk).
@@ -21800,7 +21861,14 @@ fn apply_function(
                     call_parent = Rc::new(RefCell::new(EnvFrame::default()));
                 }
             }
-            let res = eval_lambda_call(env, params_form, body, args, call_parent);
+            // Fresh BLOCK/TAGBODY exit scope for a global named function; a local
+            // FLET/LABELS name is lexically nested and inherits (bliss-4u5u).
+            let control = if is_local_fn {
+                LexicalControl::Inherit
+            } else {
+                LexicalControl::Fresh
+            };
+            let res = eval_lambda_call_ex(env, params_form, body, args, call_parent, control);
             if let Err(e) = &res {
                 calltrace_note(&name, e);
             }
@@ -21883,22 +21951,18 @@ fn apply_function(
                 // Run the body against the closure's LEXICAL block/tagbody exit
                 // points, not the caller's dynamic ones (bliss-4u5u): a
                 // `(return-from tag …)` in the body must target the block the
-                // lambda was written inside. Save and restore the caller's
-                // stacks around the call.
-                let saved_blocks =
-                    std::mem::replace(&mut env.block_stack, closure.captured_blocks.clone());
-                let saved_tags =
-                    std::mem::replace(&mut env.tag_stack, closure.captured_tags.clone());
-                let result = eval_lambda_call(
+                // lambda was written inside.
+                return eval_lambda_call_ex(
                     env,
                     closure.params_form,
                     closure.body,
                     args,
                     Rc::clone(&closure.captured_frame),
+                    LexicalControl::Captured(
+                        closure.captured_blocks.clone(),
+                        closure.captured_tags.clone(),
+                    ),
                 );
-                env.block_stack = saved_blocks;
-                env.tag_stack = saved_tags;
-                return result;
             }
         }
         if lh.is_symbol() && sym_name(lh) == "LAMBDA" {
@@ -21928,10 +21992,13 @@ fn apply_function(
         let params_form = bliss_rt::function::lambda_list(fn_val);
         let body = bliss_rt::function::body(fn_val);
         // A reified capturing closure runs its interpreted body against the
-        // captured environment, not the caller's frame (bliss-jtc.23.3).
+        // captured environment, not the caller's frame (bliss-jtc.23.3). Its
+        // BLOCK/TAGBODY exit scope is fresh: a heap interpreted-function is a
+        // top-level defun or a reified closure whose own implicit block lives in
+        // its body — it must not inherit the caller's dynamic exits (bliss-4u5u).
         let parent =
             bytecode::closure_captured_env(fn_val).unwrap_or_else(|| Rc::clone(&env.frame));
-        return eval_lambda_call(env, params_form, body, args, parent);
+        return eval_lambda_call_ex(env, params_form, body, args, parent, LexicalControl::Fresh);
     }
     Err(BlissError::Internal(format!("Cannot apply: {:?}", fn_val)))
 }
@@ -23956,6 +24023,8 @@ mod env_gc_root_tests {
                 params_form: marker(25),
                 body: marker(26),
                 captured_frame: Rc::clone(&parent),
+                captured_blocks: Vec::new(),
+                captured_tags: Vec::new(),
             },
         );
         env.method_context.push(MethodContext {

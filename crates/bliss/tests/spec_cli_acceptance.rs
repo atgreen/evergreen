@@ -2229,6 +2229,35 @@ fn return_from_through_closure_is_lexical() {
 }
 
 #[test]
+fn return_from_through_closure_is_lexical_when_compiled() {
+    // bliss-4u5u, compiled tiers: the same lexical BLOCK/RETURN-FROM contract must
+    // hold once the enclosing function is JIT-compiled. A closure that does
+    // `(return …)` must exit the block it was written inside even when funcalled
+    // by an intervening function whose own `block nil` is active. Two failure
+    // modes this guards: (1) T0/native `env.block_stack` was a shared dynamic
+    // accumulation, so the exit resolved to the intervening frame's same-named
+    // block; (2) native lowers PushBlock to a no-op, so a compiled `outer` never
+    // published its `block nil` for the closure to find. The fix resets the
+    // block/tag scope on every call, has closures capture their creation scope,
+    // and keeps functions whose closures escape their own blocks at T0. The
+    // `dotimes` drives `outer` past the tiering threshold so this exercises the
+    // compiled path, not just the tree-walker. Verified against SBCL: (50 70).
+    assert_eq!(
+        eval_ok(
+            "(progn
+               (defun helper (fn) (block nil (funcall fn) :helper-fell-through))
+               (defun outer (x)
+                 (block nil
+                   (helper (lambda () (return (* x 10))))
+                   :outer-fell-through))
+               (dotimes (i 300) (outer i))
+               (list (outer 5) (outer 7)))"
+        ),
+        "(50 70)"
+    );
+}
+
+#[test]
 fn float_literal_overflow_signals_catchable_error() {
     // CLHS 2.3.2.2 (bliss-37sr): a float literal outside the target format's
     // range signals a catchable error (SBCL: FLOATING-POINT-OVERFLOW) rather

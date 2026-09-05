@@ -261,6 +261,7 @@ fn registry_remove(sym: u32) {
     DEOPT_BLACKLIST.with(|s| s.borrow_mut().remove(&sym));
     PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
     LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
+    CLOSURE_CONTROL.with(|m| m.borrow_mut().remove(&sym));
 }
 
 /// Call a registered GLOBAL bytecode function `sym` from the tree-walker,
@@ -8662,6 +8663,52 @@ thread_local! {
     /// removed from the registry.
     static CLOSURE_ENV: RefCell<HashMap<u32, Rc<RefCell<EnvFrame>>>> =
         RefCell::new(HashMap::new());
+
+    /// Lexical BLOCK/TAGBODY exit scope captured by a `MakeClosure`/
+    /// `MakeClosureEnv`, keyed by the closure's private symbol index. A closure's
+    /// non-local `(return-from NAME)` / `(go TAG)` must resolve against the
+    /// block/tag tokens that were lexically in scope where the closure was
+    /// *created*, not the dynamic accumulation on `env.block_stack` at the point
+    /// it is *called* (bliss-4u5u). `run_with_binding`/`run_native` install this
+    /// snapshot as the callee's block/tag scope so `ReturnFromNamed`/`GoNamed`
+    /// find the correct enclosing token. Only recorded when the creating scope is
+    /// non-empty; an absent entry means "fresh (empty) scope", the correct base
+    /// for a top-level defun.
+    static CLOSURE_CONTROL: RefCell<HashMap<u32, (Vec<(String, String)>, Vec<(String, String)>)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Snapshot the lexical block/tag scope for a freshly-created bytecode closure so
+/// its non-local exits resolve lexically (bliss-4u5u). `closure` is the
+/// interpreted-function object returned by [`make_bytecode_closure`]; its name is
+/// the closure's private uninterned symbol. Only records a non-empty scope.
+fn register_closure_control(closure: BlissVal, env: &Env) {
+    if env.block_stack.is_empty() && env.tag_stack.is_empty() {
+        return;
+    }
+    let name = bliss_rt::function::name(closure);
+    if !name.is_symbol() {
+        return;
+    }
+    let sym_idx = name.as_symbol_index();
+    let blocks = env.block_stack.clone();
+    let tags = env.tag_stack.clone();
+    CLOSURE_CONTROL.with(|m| m.borrow_mut().insert(sym_idx, (blocks, tags)));
+}
+
+/// The captured lexical block/tag scope for a closure, if any. Callers install it
+/// as the callee's `env.block_stack`/`env.tag_stack` on entry.
+fn closure_captured_control(
+    fn_val: BlissVal,
+) -> Option<(Vec<(String, String)>, Vec<(String, String)>)> {
+    if !fn_val.is_heap_object() || !bliss_rt::function::is_interpreted_function(fn_val) {
+        return None;
+    }
+    let name = bliss_rt::function::name(fn_val);
+    if !name.is_symbol() {
+        return None;
+    }
+    CLOSURE_CONTROL.with(|m| m.borrow().get(&name.as_symbol_index()).cloned())
 }
 
 /// The heap environment an env-capturing closure was created in, if any.
@@ -8691,6 +8738,7 @@ pub(super) fn register_closure_env(sym_idx: u32, frame: Rc<RefCell<EnvFrame>>) {
 /// earlier definition inside a `let` does not linger (bliss-sdd).
 pub(super) fn clear_closure_env(sym_idx: u32) {
     CLOSURE_ENV.with(|m| m.borrow_mut().remove(&sym_idx));
+    CLOSURE_CONTROL.with(|m| m.borrow_mut().remove(&sym_idx));
 }
 
 /// Materialize a callable value for a nested-lambda `MakeClosure`. Each
@@ -8819,6 +8867,162 @@ fn body_may_capture_closure(items: &[BlissVal]) -> bool {
         false
     }
     items.iter().any(|it| walk(*it, 0))
+}
+
+/// True if `form` (a closure body / source form) can perform a non-local
+/// `(return[-from])` to a block in `blocks` or a `(go)` to a tag in `tags`,
+/// where those names denote blocks/tags established by an *enclosing* function.
+/// Respects lexical shadowing for BLOCK names (a nested `(block N …)` shadows N
+/// for its body). Tag shadowing inside TAGBODY is not modelled — a false match
+/// there only makes the enclosing function conservatively stay at T0, never a
+/// correctness problem (bliss-4u5u).
+fn form_escapes_to_control(
+    form: BlissVal,
+    blocks: &std::collections::HashSet<String>,
+    tags: &std::collections::HashSet<String>,
+) -> bool {
+    fn walk(
+        v: BlissVal,
+        depth: u32,
+        blocks: &std::collections::HashSet<String>,
+        tags: &std::collections::HashSet<String>,
+        shadowed: &std::collections::HashSet<String>,
+    ) -> bool {
+        if depth > 400 {
+            return true; // deep/odd form — err toward staying at T0 (safe)
+        }
+        if !v.is_cons() {
+            return false;
+        }
+        let (car, cdr) = cp(v);
+        if car.is_symbol() {
+            match symbol_bare_name(&sym_name(car)).as_str() {
+                "QUOTE" => return false, // quoted data is not code
+                "RETURN" => {
+                    if !shadowed.contains("NIL") && blocks.contains("NIL") {
+                        return true;
+                    }
+                    // still walk the (optional) result expression
+                    return walk(cdr, depth + 1, blocks, tags, shadowed);
+                }
+                "RETURN-FROM" => {
+                    let (name_form, rest) = cp(cdr);
+                    let name = sym_name(name_form);
+                    if !shadowed.contains(&name) && blocks.contains(&name) {
+                        return true;
+                    }
+                    return walk(rest, depth + 1, blocks, tags, shadowed);
+                }
+                "GO" => {
+                    let (tag_form, _) = cp(cdr);
+                    let tag = sym_name(tag_form);
+                    return !shadowed.contains(&tag) && tags.contains(&tag);
+                }
+                "BLOCK" => {
+                    let (name_form, body) = cp(cdr);
+                    let name = sym_name(name_form);
+                    let mut sh = shadowed.clone();
+                    sh.insert(name);
+                    return walk(body, depth + 1, blocks, tags, &sh);
+                }
+                _ => {}
+            }
+        }
+        walk(car, depth + 1, blocks, tags, shadowed)
+            || walk(cdr, depth + 1, blocks, tags, shadowed)
+    }
+    walk(
+        form,
+        0,
+        blocks,
+        tags,
+        &std::collections::HashSet::new(),
+    )
+}
+
+/// True if `bf` (a compiled nested closure) contains a `ReturnFromNamed` /
+/// `GoNamed` targeting a block/tag in `blocks`/`tags`, recursing into its own
+/// nested closures and opaque (source-form) closures (bliss-4u5u).
+fn bf_escapes_to_control(
+    bf: &BytecodeFunction,
+    blocks: &std::collections::HashSet<String>,
+    tags: &std::collections::HashSet<String>,
+) -> bool {
+    for instr in &bf.code {
+        match instr {
+            Instr::ReturnFromNamed { name_idx } => {
+                if blocks.contains(&bf.names[*name_idx as usize]) {
+                    return true;
+                }
+            }
+            Instr::GoNamed { name_idx } => {
+                if tags.contains(&bf.names[*name_idx as usize]) {
+                    return true;
+                }
+            }
+            Instr::MakeClosureEnv(c) | Instr::EvalHost(c) => {
+                if form_escapes_to_control(bf.constants[*c as usize], blocks, tags) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    bf.nested_functions
+        .iter()
+        .any(|n| bf_escapes_to_control(n, blocks, tags))
+}
+
+/// True if compiling `bf` to native (T1/T2) would break a closure's non-local
+/// exit. Native lowers `PushBlock`/`PushTag` to no-ops (local returns become
+/// jumps), so a block/tag this function establishes is never published on
+/// `env.block_stack`/`env.tag_stack`. That is fine unless a closure created in
+/// this body captures that block/tag for a non-local `return-from`/`go`: the
+/// closure (which runs later, elsewhere) resolves the exit by name against the
+/// shared stack and would not find it. Such functions must stay at T0 bytecode,
+/// where `PushBlock`/`PushTag` really publish the token (bliss-4u5u). This is the
+/// ASDF `traverse-action` case: `(block nil … (while-visiting-action …
+/// (return)))` — the `(return)` lives in the `#'(lambda …)` handed to
+/// `call-while-visiting-action`.
+fn native_would_lose_captured_control(bf: &BytecodeFunction) -> bool {
+    // Blocks/tags this function itself establishes.
+    let mut own_blocks = std::collections::HashSet::new();
+    let mut own_tags = std::collections::HashSet::new();
+    for instr in &bf.code {
+        match instr {
+            Instr::PushBlock { name_idx, .. } => {
+                own_blocks.insert(bf.names[*name_idx as usize].clone());
+            }
+            Instr::NamedTag { name_idx, .. } => {
+                own_tags.insert(bf.names[*name_idx as usize].clone());
+            }
+            _ => {}
+        }
+    }
+    if own_blocks.is_empty() && own_tags.is_empty() {
+        return false;
+    }
+    // Does any closure created here capture one of those blocks/tags?
+    for instr in &bf.code {
+        match instr {
+            Instr::MakeClosure { func, .. } => {
+                if bf_escapes_to_control(
+                    &bf.nested_functions[*func as usize],
+                    &own_blocks,
+                    &own_tags,
+                ) {
+                    return true;
+                }
+            }
+            Instr::MakeClosureEnv(c) | Instr::EvalHost(c) => {
+                if form_escapes_to_control(bf.constants[*c as usize], &own_blocks, &own_tags) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Reset lazy-compile bookkeeping for a (re)defined DEFUN: drop any stale
@@ -10383,6 +10587,26 @@ fn run_with_binding(
     }];
     bliss_rt::rooted_ref!(_acts_root = &mut acts);
 
+    // Install this callee's lexical BLOCK/TAGBODY scope for the duration of its
+    // body, then restore the caller's on exit (bliss-4u5u). A closure runs with
+    // the scope captured where it was created; any other function (a top-level
+    // defun) starts fresh. Without this, `env.block_stack`/`env.tag_stack` are a
+    // shared dynamic accumulation and a closure's `(return-from NAME)` resolves
+    // by name to the WRONG same-named enclosing block under recursion (the ASDF
+    // traverse-action plan truncation). The saved stacks are restored by value so
+    // an unwind that exits `run_loop` as `BlissError::Internal(token)` leaves the
+    // caller's `error_to_pending` seeing the caller's own block/tag tokens.
+    let (saved_blocks, saved_tags) = match closure_captured_control(entry_fn_val) {
+        Some((blocks, tags)) => (
+            std::mem::replace(&mut env.block_stack, blocks),
+            std::mem::replace(&mut env.tag_stack, tags),
+        ),
+        None => (
+            std::mem::take(&mut env.block_stack),
+            std::mem::take(&mut env.tag_stack),
+        ),
+    };
+
     // Ensure the whole control stack is popped on any early return (error).
     let result = run_loop(&mut acts, env);
     // Unwind any frames still live (error path); the normal path leaves none.
@@ -10390,6 +10614,8 @@ fn run_with_binding(
         stack.pop_frame();
         acts.pop();
     }
+    env.block_stack = saved_blocks;
+    env.tag_stack = saved_tags;
     result
 }
 
@@ -10677,6 +10903,10 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<BlissVal, Bliss
                     None
                 };
                 let closure = make_bytecode_closure(&nested, captured);
+                // Capture the lexical block/tag scope so the closure's non-local
+                // exits resolve against the tokens visible where it was created,
+                // not the dynamic stack where it is later called (bliss-4u5u).
+                register_closure_control(closure, env);
                 acts[top_idx].push_op(closure);
             }
             Instr::AllocCons => {
@@ -13444,6 +13674,26 @@ fn native_for_dispatch(
 /// arguments into its leading local slots, run the installed native code (which
 /// addresses the frame through rdi), then pop the frame. The native frame and
 /// any interpreter frames a c2i callback pushes all live on the one BlissStack.
+/// Restores a saved BLOCK/TAGBODY scope onto `env` when dropped, covering the
+/// many exit paths of [`run_native`] (deopt, error, normal). Holds a raw pointer
+/// because the guarded call reborrows `env` for nested calls (bliss-4u5u).
+struct BlockScopeGuard {
+    env: *mut Env,
+    blocks: Vec<(String, String)>,
+    tags: Vec<(String, String)>,
+}
+
+impl Drop for BlockScopeGuard {
+    fn drop(&mut self) {
+        // SAFETY: the `env` reference passed to `run_native` outlives this guard
+        // (the guard is dropped as `run_native` returns), and no other borrow of
+        // `env.block_stack`/`env.tag_stack` is live at drop time.
+        let env = unsafe { &mut *self.env };
+        env.block_stack = std::mem::take(&mut self.blocks);
+        env.tag_stack = std::mem::take(&mut self.tags);
+    }
+}
+
 fn run_native(
     nc: &NativeCode,
     sym: u32,
@@ -13454,6 +13704,25 @@ fn run_native(
     if let Some(body) = bf.as_ref() {
         validate_declared_args(body, args)?;
     }
+    // Install this callee's lexical BLOCK/TAGBODY scope (fresh for a top-level
+    // defun; the captured scope for a closure) and restore the caller's on every
+    // exit via the guard (bliss-4u5u). Mirrors `run_with_binding`; closure scope
+    // is keyed by the closure's own symbol, this activation's `sym`.
+    let (saved_blocks, saved_tags) = match CLOSURE_CONTROL.with(|m| m.borrow().get(&sym).cloned()) {
+        Some((blocks, tags)) => (
+            std::mem::replace(&mut env.block_stack, blocks),
+            std::mem::replace(&mut env.tag_stack, tags),
+        ),
+        None => (
+            std::mem::take(&mut env.block_stack),
+            std::mem::take(&mut env.tag_stack),
+        ),
+    };
+    let _block_scope_guard = BlockScopeGuard {
+        env: env as *mut Env,
+        blocks: saved_blocks,
+        tags: saved_tags,
+    };
     // A function call starts a fresh multiple-values context. Argument
     // evaluation may have left secondary values active (for example GETHASH's
     // present-p value), but a native callee that simply returns its argument
@@ -14699,6 +14968,13 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         return None;
     }
     let bf = registry_get(sym)?;
+    // Keep functions whose closures make non-local exits to their own blocks/tags
+    // at T0: native no-ops PushBlock/PushTag, so the captured block/tag would
+    // never be published for the closure's `return-from`/`go` to find (bliss-4u5u,
+    // the ASDF traverse-action plan truncation).
+    if native_would_lose_captured_control(&bf) {
+        return None;
+    }
     // Non-leaf functions promote too (bliss-x5y.4): a T1 function's CallNamed to
     // another user function crosses c2i into `apply_function`, which runs the
     // callee in the interpreter (NOT via `run_native`), so the native call path
