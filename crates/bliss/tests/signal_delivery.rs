@@ -183,6 +183,82 @@ fn sigterm_requests_shutdown_not_interrupt_condition() {
 }
 
 #[test]
+fn sigterm_stops_a_hot_native_loop() {
+    // bliss-7rdu: a hot NATIVE loop (T1/OSR) must still honor SIGTERM. The T0
+    // interpreter polls every instruction, but compiled loops only re-enter Rust
+    // at sampled back-edges — and OSR code emitted no back-edge poll at all, so a
+    // call-free native loop ignored SIGTERM (and GC stop-the-world) forever. The
+    // warmup promotes `spin` to native before the long loop runs, so this
+    // exercises the native back-edge signal poll, not the interpreter. Before the
+    // fix the child spins past SIGTERM and is SIGKILLed at the deadline, leaving
+    // `status.code()` == None; the fix makes it shut down with an exit code.
+    //
+    // T2 is disabled here: the back-edge signal poll lives in the T0/T1/OSR
+    // emitter, so the framed T2 emitter still lacks it (a T2 loop that finishes
+    // background compilation stays uninterruptible — tracked as a separate
+    // follow-up). Disabling T2 makes this test deterministic and scoped to the
+    // tier the fix actually covers.
+    let program = "\
+        (handler-case \
+            (progn \
+              (defun spin (n) \
+                (let ((s 0)) (dotimes (i n s) (setq s (the fixnum (+ s i)))))) \
+              (dotimes (w 20) (spin 100000)) \
+              (format t \"READY~%\") \
+              (force-output) \
+              (spin 1000000000000) \
+              (format t \"FELL-THROUGH~%\") \
+              (force-output)) \
+          (interrupt-condition () \
+            (format t \"INTERRUPT~%\") \
+            (force-output)))";
+
+    let mut child = Command::new(BIN)
+        .args(["--no-init", "--eval", program])
+        .env("BLISS_DISABLE_T2", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bliss-cli");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let ready = lines
+        .next()
+        .expect("child should print readiness")
+        .expect("read readiness");
+    assert_eq!(ready, "READY", "child should reach the hot loop");
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "kill -TERM should succeed");
+
+    // Generous window: the loop must be terminated by the SIGTERM shutdown, not
+    // by wait_for_child's SIGKILL at the deadline.
+    let output = wait_for_child(child, Duration::from_secs(8));
+    let mut text = String::new();
+    text.push_str(&ready);
+    text.push('\n');
+    for line in lines.map_while(Result::ok) {
+        text.push_str(&line);
+        text.push('\n');
+    }
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        !text.contains("FELL-THROUGH"),
+        "the loop cannot complete 1e12 iterations; it must be interrupted; output:\n{text}"
+    );
+    assert!(
+        output.status.code().is_some(),
+        "a hot native loop must shut down on SIGTERM (exit code), not be SIGKILLed \
+         at the deadline (bliss-7rdu); output:\n{text}"
+    );
+}
+
+#[test]
 fn sigfpe_is_delivered_as_catchable_arithmetic_error() {
     let program = "\
         (handler-case \
