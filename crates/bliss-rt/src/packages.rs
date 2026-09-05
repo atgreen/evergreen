@@ -60,8 +60,8 @@ fn alloc_pinned_name(s: &str) -> BlissVal {
     unsafe {
         *(body as *mut u64) = bytes.len() as u64;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), body.add(8), bytes.len());
-        let v = BlissVal::from_heap_ptr(body.sub(header_size()));
-        v
+        
+        BlissVal::from_heap_ptr(body.sub(header_size()))
     }
 }
 
@@ -82,8 +82,8 @@ fn alloc_pinned_package(name: &str) -> BlissVal {
         (*pkg).use_list = NIL;
         (*pkg).nicknames = NIL;
         (*pkg).lock = std::ptr::null_mut();
-        let v = BlissVal::from_heap_ptr(header);
-        v
+        
+        BlissVal::from_heap_ptr(header)
     }
 }
 

@@ -898,13 +898,13 @@ pub fn handler_bind(
     // (function tag), otherwise return it directly.  This provides backward
     // compat for tests that pass a pre-evaluated BlissVal while supporting
     // real thunks when the evaluator wraps the body in a closure.
-    let result = if body.is_function() {
+    
+
+    if body.is_function() {
         funcall(body, &[])
     } else {
         Ok(body)
-    };
-
-    result
+    }
 }
 
 /// Establish handler bindings with a Rust closure body (HANDLER-BIND). R5.19.
@@ -917,9 +917,9 @@ pub fn handler_bind_fn(
 ) -> Result<BlissVal, BlissError> {
     let _cluster = establish_handler_cluster(bindings)?;
 
-    let result = body();
+    
 
-    result
+    body()
 }
 
 /// Establish handler case (unwind before handler — HANDLER-CASE). R5.19.
@@ -1034,13 +1034,13 @@ pub fn restart_bind(restarts: &[RestartSpec], body: BlissVal) -> Result<BlissVal
 
     // Evaluate the body.  If it's a function, invoke it via funcall;
     // otherwise return the pre-evaluated value directly.
-    let result = if body.is_function() {
+    
+
+    if body.is_function() {
         funcall(body, &[])
     } else {
         Ok(body)
-    };
-
-    result
+    }
 }
 
 /// Establish restart bindings with a Rust closure body (RESTART-BIND). R5.20.
@@ -1053,9 +1053,9 @@ pub fn restart_bind_fn(
 ) -> Result<BlissVal, BlissError> {
     let _cluster = establish_restart_cluster(restarts)?;
 
-    let result = body();
+    
 
-    result
+    body()
 }
 
 /// Compute available restarts for a condition.

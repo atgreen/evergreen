@@ -26,7 +26,9 @@ pub const NULL: Context = core::ptr::null_mut();
 /// Save the current context into `*from` and resume `to`. Returns when some
 /// later `swap` switches back into `*from`.
 ///
-/// SAFETY: `from` must point to a writable `Context`; `to` must be a context
+/// # Safety
+///
+/// `from` must point to a writable `Context`; `to` must be a context
 /// produced by [`make`] or a previous `swap`, over a stack that is still alive.
 #[cfg(all(target_arch = "x86_64", unix))]
 #[inline]

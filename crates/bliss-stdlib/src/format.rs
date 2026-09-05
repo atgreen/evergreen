@@ -827,7 +827,7 @@ pub fn single_float_to_string(x: f32) -> String {
         return format!("{x}");
     }
     let a = x.abs();
-    if a != 0.0 && (a < 1e-3 || a >= 1e7) {
+    if a != 0.0 && !(1e-3..1e7).contains(&a) {
         // `{:e}` gives the shortest round-tripping mantissa, but spells a whole
         // mantissa without a point ("1e10"); CL wants a digit on each side.
         let s = format!("{x:e}");
@@ -853,7 +853,7 @@ pub fn double_float_to_string(x: f64) -> String {
         return format!("{x}");
     }
     let a = x.abs();
-    if a != 0.0 && (a < 1e-3 || a >= 1e7) {
+    if a != 0.0 && !(1e-3..1e7).contains(&a) {
         let s = format!("{x:e}");
         return match s.split_once('e') {
             Some((mantissa, exp)) if !mantissa.contains('.') => {

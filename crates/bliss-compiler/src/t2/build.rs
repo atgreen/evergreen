@@ -381,8 +381,8 @@ impl<'a> Builder<'a> {
                     if idx >= code.len() {
                         return;
                     }
-                    if !depth_at.contains_key(&idx) {
-                        depth_at.insert(idx, nd);
+                    if let std::collections::hash_map::Entry::Vacant(e) = depth_at.entry(idx) {
+                        e.insert(nd);
                         work.push(idx);
                     }
                 };
@@ -915,7 +915,8 @@ impl<'a> Builder<'a> {
             return phi;
         }
         let preds = self.pred_edges.get(&block).cloned().unwrap_or_default();
-        let v = if preds.len() == 1 {
+        
+        if preds.len() == 1 {
             let val = self.read_var(var, preds[0].0);
             self.current_def.insert((var, block), val);
             val
@@ -927,8 +928,7 @@ impl<'a> Builder<'a> {
             self.current_def.insert((var, block), phi); // break cycles first
             self.add_phi_operands(var, block, phi);
             phi
-        };
-        v
+        }
     }
 
     fn add_phi_operands(&mut self, var: Var, block: Block, _phi: Value) {

@@ -80,8 +80,8 @@ pub fn alloc_interpreted(
         (*d).entry = AtomicPtr::new(std::ptr::null_mut());
         (*d).tier = 0.into();
         (*d).flags = 0.into();
-        let v = BlissVal::from_heap_ptr(header);
-        v
+        
+        BlissVal::from_heap_ptr(header)
     }
 }
 

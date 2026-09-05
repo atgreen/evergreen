@@ -365,7 +365,7 @@ impl BlissVal {
     /// backtrace where a foreign frame is marked with `T`) don't panic.
     #[inline]
     pub fn symbol_index(self) -> Option<u32> {
-        (self.tag() == TAG_SYMBOL).then(|| (self.0 >> 3) as u32)
+        (self.tag() == TAG_SYMBOL).then_some((self.0 >> 3) as u32)
     }
 
     /// Extract a heap string as a Rust `String`.

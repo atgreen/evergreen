@@ -81,8 +81,8 @@ fn alloc_pinned_name(s: &str) -> BlissVal {
         *(body as *mut u64) = bytes.len() as u64;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), body.add(8), bytes.len());
         let header = body.sub(header_size());
-        let v = BlissVal::from_heap_ptr(header);
-        v
+        
+        BlissVal::from_heap_ptr(header)
     }
 }
 
@@ -105,8 +105,8 @@ fn alloc_pinned_symbol(name: BlissVal, package: BlissVal) -> BlissVal {
         (*sym).package = *package;
         (*sym).flags = 0;
         (*sym).tls_index = 0;
-        let v = BlissVal::from_heap_ptr(header);
-        v
+        
+        BlissVal::from_heap_ptr(header)
     }
 }
 

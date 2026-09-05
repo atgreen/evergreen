@@ -134,11 +134,7 @@ fn to_location(a: Allocation) -> Option<Location> {
             class: our_class(preg.class()),
             encoding: preg.hw_enc() as u8,
         }))
-    } else if let Some(slot) = a.as_stack() {
-        Some(Location::Stack(StackSlot(slot.index() as u32)))
-    } else {
-        None
-    }
+    } else { a.as_stack().map(|slot| Location::Stack(StackSlot(slot.index() as u32))) }
 }
 
 /// Build the machine environment: `N_GPR` allocatable Int registers plus one

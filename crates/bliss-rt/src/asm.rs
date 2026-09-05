@@ -97,6 +97,12 @@ pub struct Asm {
     fixups: Vec<Fixup>,
 }
 
+impl Default for Asm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Asm {
     pub fn new() -> Self {
         Asm {

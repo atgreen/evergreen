@@ -49,7 +49,9 @@ pub mod nr {
 // ── Raw syscall entry (x86-64) ───────────────────────────────────────────────
 // The kernel returns -errno in [-4095, -1]; callers convert that to Err.
 
-/// SAFETY: caller must pass a valid syscall number and arguments whose pointer
+/// # Safety
+///
+/// caller must pass a valid syscall number and arguments whose pointer
 /// operands (if any) are valid for the syscall's duration.
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -64,6 +66,12 @@ pub unsafe fn syscall0(n: usize) -> isize {
     ret
 }
 
+/// Raw 1-argument syscall.
+///
+/// # Safety
+///
+/// Same contract as [`syscall0`]: the syscall number must be valid and any
+/// pointer operands must be valid for the syscall's duration.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn syscall1(n: usize, a1: usize) -> isize {
@@ -78,6 +86,12 @@ pub unsafe fn syscall1(n: usize, a1: usize) -> isize {
     ret
 }
 
+/// Raw 2-argument syscall.
+///
+/// # Safety
+///
+/// Same contract as [`syscall0`]: the syscall number must be valid and any
+/// pointer operands must be valid for the syscall's duration.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> isize {
@@ -92,6 +106,12 @@ pub unsafe fn syscall2(n: usize, a1: usize, a2: usize) -> isize {
     ret
 }
 
+/// Raw 3-argument syscall.
+///
+/// # Safety
+///
+/// Same contract as [`syscall0`]: the syscall number must be valid and any
+/// pointer operands must be valid for the syscall's duration.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> isize {
@@ -106,6 +126,12 @@ pub unsafe fn syscall3(n: usize, a1: usize, a2: usize, a3: usize) -> isize {
     ret
 }
 
+/// Raw 4-argument syscall.
+///
+/// # Safety
+///
+/// Same contract as [`syscall0`]: the syscall number must be valid and any
+/// pointer operands must be valid for the syscall's duration.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
@@ -120,6 +146,12 @@ pub unsafe fn syscall4(n: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> 
     ret
 }
 
+/// Raw 6-argument syscall.
+///
+/// # Safety
+///
+/// Same contract as [`syscall0`]: the syscall number must be valid and any
+/// pointer operands must be valid for the syscall's duration.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub unsafe fn syscall6(
@@ -173,7 +205,9 @@ pub const MAP_FIXED: i32 = 0x10;
 /// `mmap(2)`. Returns the mapped address or `Err(errno)`. Unlike libc there is no
 /// `MAP_FAILED` sentinel: the kernel returns `-errno`, which `check` converts.
 ///
-/// SAFETY: `addr`/`len`/`prot`/`flags`/`fd`/`offset` must form a valid mmap
+/// # Safety
+///
+/// `addr`/`len`/`prot`/`flags`/`fd`/`offset` must form a valid mmap
 /// request; the returned mapping is unmanaged (free with [`munmap`]).
 #[inline]
 pub unsafe fn mmap(
@@ -198,7 +232,9 @@ pub unsafe fn mmap(
 
 /// `munmap(2)`.
 ///
-/// SAFETY: `addr`/`len` must name a mapping previously returned by [`mmap`].
+/// # Safety
+///
+/// `addr`/`len` must name a mapping previously returned by [`mmap`].
 #[inline]
 pub unsafe fn munmap(addr: *mut u8, len: usize) -> Result<(), i32> {
     check(syscall2(nr::MUNMAP, addr as usize, len)).map(|_| ())
@@ -206,7 +242,9 @@ pub unsafe fn munmap(addr: *mut u8, len: usize) -> Result<(), i32> {
 
 /// `mprotect(2)`.
 ///
-/// SAFETY: `addr`/`len` must name a valid mapping.
+/// # Safety
+///
+/// `addr`/`len` must name a valid mapping.
 #[inline]
 pub unsafe fn mprotect(addr: *mut u8, len: usize, prot: i32) -> Result<(), i32> {
     check(syscall3(nr::MPROTECT, addr as usize, len, prot as usize)).map(|_| ())
@@ -346,7 +384,9 @@ unsafe extern "C" fn restore_rt() {
 /// into the action flags (e.g. `SA_RESTART`); `SA_RESTORER` and the restorer are
 /// always supplied. The signal mask is empty. Returns `Err(errno)` on failure.
 ///
-/// SAFETY: `handler` must be a valid `extern "C" fn(i32)` (or `SIG_DFL`/`SIG_IGN`
+/// # Safety
+///
+/// `handler` must be a valid `extern "C" fn(i32)` (or `SIG_DFL`/`SIG_IGN`
 /// sentinel) appropriate for `sig`.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn rt_sigaction(sig: i32, handler: usize, extra_flags: u64) -> Result<(), i32> {
@@ -368,7 +408,9 @@ pub unsafe fn rt_sigaction(sig: i32, handler: usize, extra_flags: u64) -> Result
 
 /// Install a three-argument SA_SIGINFO handler for `sig`.
 ///
-/// SAFETY: `handler` must be a valid
+/// # Safety
+///
+/// `handler` must be a valid
 /// `extern "C" fn(i32, *mut SigInfo, *mut core::ffi::c_void)` appropriate for
 /// `sig`.
 #[cfg(target_arch = "x86_64")]
@@ -386,7 +428,9 @@ pub struct StackT {
 
 /// `sigaltstack(2)`.
 ///
-/// SAFETY: `new` and `old` must be null or valid pointers for the syscall's
+/// # Safety
+///
+/// `new` and `old` must be null or valid pointers for the syscall's
 /// duration.
 #[inline]
 pub unsafe fn sigaltstack(new: *const StackT, old: *mut StackT) -> Result<(), i32> {
@@ -412,7 +456,9 @@ pub struct TimeSpec {
 
 /// `clock_gettime(2)`.
 ///
-/// SAFETY: `ts` must point at writable `TimeSpec` storage.
+/// # Safety
+///
+/// `ts` must point at writable `TimeSpec` storage.
 #[inline]
 pub unsafe fn clock_gettime(clock_id: i32, ts: *mut TimeSpec) -> Result<(), i32> {
     check(syscall2(
@@ -453,7 +499,9 @@ pub struct PollFd {
 /// `poll(2)`. `timeout` is milliseconds (-1 = block). Returns the number of ready
 /// descriptors (0 on timeout).
 ///
-/// SAFETY: `fds`/`nfds` must describe a valid, writable slice of `PollFd`.
+/// # Safety
+///
+/// `fds`/`nfds` must describe a valid, writable slice of `PollFd`.
 #[inline]
 pub unsafe fn poll(fds: *mut PollFd, nfds: usize, timeout_ms: i32) -> Result<usize, i32> {
     let r = syscall3(nr::POLL, fds as usize, nfds, timeout_ms as isize as usize);
@@ -489,7 +537,9 @@ pub fn epoll_create1(flags: i32) -> Result<i32, i32> {
 
 /// `epoll_ctl(2)`. `event` may be null for `EPOLL_CTL_DEL`.
 ///
-/// SAFETY: `event` (if non-null) must point to a valid `EpollEvent`.
+/// # Safety
+///
+/// `event` (if non-null) must point to a valid `EpollEvent`.
 #[inline]
 pub unsafe fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: *mut EpollEvent) -> Result<(), i32> {
     let r = syscall4(
@@ -504,7 +554,9 @@ pub unsafe fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: *mut EpollEvent) -> 
 
 /// `epoll_wait(2)`. Returns the number of ready events written to `events`.
 ///
-/// SAFETY: `events`/`maxevents` must describe a valid, writable buffer.
+/// # Safety
+///
+/// `events`/`maxevents` must describe a valid, writable buffer.
 #[inline]
 pub unsafe fn epoll_wait(
     epfd: i32,

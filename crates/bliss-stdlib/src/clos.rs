@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use bliss_rt::error::BlissError;
-use bliss_rt::object::{ObjectHeader, type_id};
+use bliss_rt::object::type_id;
 use bliss_rt::value::{BlissVal, NIL, T, UNBOUND};
 
 // ── Method combination ─────────────────────────────────────────────
