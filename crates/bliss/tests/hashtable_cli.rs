@@ -47,3 +47,41 @@ fn sxhash_is_equal_consistent() {
         "T"
     );
 }
+
+/// bliss-jtc.22 / bliss-cpje: an EQUAL hash table keyed by a movable object
+/// (a CLOS instance, hashed by address) must still find its live keys after the
+/// moving GC relocates them. Before the rehash-on-move fix, gethash probed the
+/// bucket for the key's NEW address while the entry sat in its OLD-address
+/// bucket, so lookups silently missed — which broke ASDF's visited-actions and
+/// blocked real-library self-host loads. GC stress relocates the keys between
+/// insertion and lookup; all 40 must still be found.
+#[test]
+fn equal_hash_instance_keys_survive_moving_gc() {
+    let out = Command::new(BIN)
+        .args([
+            "--no-init",
+            "--eval",
+            "(progn (defclass k () ()) \
+               (let ((h (make-hash-table :test 'equal)) (keys nil)) \
+                 (dotimes (i 40) \
+                   (let ((key (cons i (make-instance 'k)))) \
+                     (push key keys) (setf (gethash key h) i))) \
+                 (dotimes (i 60) (make-instance 'k)) \
+                 (let ((hits 0)) \
+                   (dolist (key keys) (when (nth-value 1 (gethash key h)) (incf hits))) \
+                   hits)))",
+        ])
+        .env("BLISS_GC_STRESS", "1")
+        .output()
+        .expect("spawn bliss-cli");
+    assert!(
+        out.status.success(),
+        "program failed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "40",
+        "all instance keys must be found after GC relocation (bliss-jtc.22)"
+    );
+}
