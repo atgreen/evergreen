@@ -2686,3 +2686,27 @@ fn make_array_element_type_bit_builds_a_bit_vector() {
         ":CAUGHT"
     );
 }
+
+#[test]
+fn compile_produces_a_callable_function() {
+    // bliss-uhuw: COMPILE was undefined. Minimal conforming COMPILE — bliss
+    // functions are already compiled/callable, so it yields a callable function
+    // (or recompiles a named one) and returns (values result nil nil).
+    assert_eq!(eval_ok("(funcall (compile nil (lambda (x) (* x 2))) 21)"), "42");
+    // A quoted lambda EXPRESSION (a list) must be compiled, not returned as data.
+    assert_eq!(eval_ok("(funcall (compile nil '(lambda (x) (+ x 100))) 5)"), "105");
+    // (compile name) recompiles/returns the named function; call still works.
+    assert_eq!(
+        eval_ok("(progn (defun cpf-sq (x) (* x x)) (compile 'cpf-sq) (cpf-sq 9))"),
+        "81"
+    );
+    assert_eq!(eval_ok("(fboundp 'compile)"), "T");
+    // Standard 3-value consumer: (fn warnings-p failure-p) with no problems.
+    assert_eq!(
+        eval_ok(
+            "(multiple-value-bind (fn w f) (compile nil (lambda () 1)) \
+               (list (functionp fn) w f))"
+        ),
+        "(T NIL NIL)"
+    );
+}

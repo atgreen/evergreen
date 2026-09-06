@@ -10946,6 +10946,58 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 env.clear_mv();
                 return eval_form(form, env);
             }
+            "COMPILE" => {
+                // (compile name &optional definition) — CLHS 3.2. bliss functions
+                // are already compiled/callable, so COMPILE produces a callable
+                // function rather than running a separate pass: it evaluates the
+                // definition (a lambda expression compiles via eval; a function
+                // value passes through) or, with no definition, takes the function
+                // currently named by NAME. When NAME is a non-nil symbol the
+                // result is installed in its function cell. Returns
+                // (values result nil nil): the function when NAME is nil, else
+                // NAME. GC-safe: name/def/func are rooted across the evals and the
+                // (possibly allocating) install.
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal("COMPILE requires a name argument".into()));
+                }
+                bliss_rt::rooted!(name = eval_form(args[0], env)?);
+                let func = if args.len() >= 2 {
+                    bliss_rt::rooted!(def = eval_form(args[1], env)?);
+                    if is_function_value(*def) {
+                        *def
+                    } else if def.is_cons()
+                        && cp(*def).0.is_symbol()
+                        && sym_name(cp(*def).0) == "LAMBDA"
+                    {
+                        // A lambda expression: compile it by evaluating the form.
+                        eval_form(*def, env)?
+                    } else {
+                        return Err(BlissError::TypeError {
+                            datum: *def,
+                            expected: "a lambda expression or function".into(),
+                        });
+                    }
+                } else {
+                    match symbol_function_object(env, *name) {
+                        Some(f) => f,
+                        None => {
+                            return Err(BlissError::Internal(format!(
+                                "COMPILE: {} is not fbound",
+                                format_val(*name)
+                            )));
+                        }
+                    }
+                };
+                bliss_rt::rooted!(func = func);
+                if name.is_symbol() && !name.is_nil() {
+                    let fnval = coerce_installed_function(env, *func);
+                    bliss_rt::symbols::set_symbol_function(name.as_symbol_index(), fnval);
+                }
+                let primary = if name.is_nil() { *func } else { *name };
+                env.set_mv(vec![primary, NIL, NIL]);
+                return Ok(primary);
+            }
             "FUNCALL" => {
                 // Root the callee across argument evaluation: eval_args allocates
                 // and can fire a relocating minor GC, leaving an unrooted `fn_val`
@@ -22105,6 +22157,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "MAKE-THREAD" | "JOIN-THREAD" | "CURRENT-THREAD"
             // Control / function application
             | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
+            | "COMPILE"
             | "CONSTANTLY" | "NOT" | "EQ" | "EQL" | "EQUAL" | "EQUALP"
             // Conses / lists
             | "CONS" | "CAR" | "CDR" | "FIRST" | "REST" | "SECOND" | "THIRD" | "FOURTH"
