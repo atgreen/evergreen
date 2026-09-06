@@ -69,11 +69,12 @@ run:
 # result, so `sudo make install` needs no cargo in root's PATH.
 image: $(BLISS_EXE)
 
-$(BLISS_EXE): $(RELEASE_BIN) scripts/build-image.lisp
+# Depends on the phony `release` so cargo (the source of truth for freshness)
+# always runs — a bare file dependency on $(RELEASE_BIN) would let make skip the
+# rebuild after Rust sources change. `install` does NOT depend on this, so it
+# needs no cargo.
+$(BLISS_EXE): release scripts/build-image.lisp
 	BLISS_IMAGE_OUT=$(BLISS_EXE) $(RELEASE_BIN) --no-init --load scripts/build-image.lisp
-
-$(RELEASE_BIN):
-	$(CARGO) build --workspace --release
 
 ## install: install `bliss` (ASDF-preloaded executable) to $(DESTDIR)$(PREFIX)/bin
 # Build first with `make image` (as your user), then `sudo make install`. This
