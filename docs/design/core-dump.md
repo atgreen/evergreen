@@ -197,6 +197,54 @@ buffer**; the CLI drains that buffer right after it builds the top-level `Env`,
 constructing each `MacroDef` with `captured_frame = the fresh root frame`. Same
 shape for `GLOBAL_SETF_FNS` (a `FunDef`) and for CLOS tables.
 
+## M3 integration constraints (discovered reading the CLI save/load paths)
+
+Two dispatch points already exist and are where M3 hooks in:
+- **Save:** the `SAVE-LISP-AND-DIE` builtin (cli.rs ~14307) currently always calls
+  `bytecode::build_image_from_runtime` (source-form `.bfasl`), then optionally
+  `wrap_executable`. M3 adds a core path: run a compacting `major_gc`, set the
+  entry continuation (+ `:toplevel`), call `bliss_rt::image::save_image(path,
+  opts)`; reuse `wrap_executable` for `:executable t`. Select via `:format :core`
+  (default stays `.bfasl` until the core path is proven).
+- **Load:** `run()` dispatches both `embedded_image()` (~23841) and `--image`
+  (~23863) on `BFASL_MAGIC`. M3 adds an `IMAGE_MAGIC` (`BLISSIMG`) branch →
+  `image::load_image(path)` then `drain_pending_host_registries(&env.frame)`.
+
+**The hard constraint: a core loads into a FRESH runtime, before bootstrap.**
+By the time `run()` reaches the `--image` branch it has already built `Env` and
+evaluated the bootstrap prelude, so the heap is populated. `restore_heap` calls
+`clear_heap_objects` and re-materializes the snapshot — loading a core *over* a
+live heap would strand every `BlissVal` the Rust-side `Env` (frame vars, funs,
+macros, closures) holds, because `load_image` remaps heap objects and the
+symbol/package registries but NOT the interpreter's `Env` (it is Rust state it
+cannot see). So the core branch must run EARLY:
+
+1. Detect a core image (appended `embedded_image()` or `--image`) *before*
+   `Env::new` + bootstrap.
+2. Ensure the heap is initialized, then `image::load_image` (restores heap +
+   symbol value/function cells + packages; drains host macros/setf into the
+   pending buffer).
+3. `Env::new` for a fresh empty frame; `drain_pending_host_registries(&env.frame)`
+   to install macros/setf bound to that frame.
+4. SKIP the bootstrap prelude — the core already contains it.
+5. Run `:toplevel` or the REPL against the restored world. Global functions and
+   `defvar` values resolve through the restored symbol cells; packages through
+   the restored registry.
+
+Open risks specific to this integration (validate before trusting a core):
+- **Whole-heap walk vs off-heap bodies.** `serialize_heap_objects` walks the real
+  runtime heap (not synthetic `record_object`s). Objects with off-heap Rust
+  bodies (streams, finalizers — risk #4) must be enumerated and forbidden/re-opened.
+- **CLOS_STATE** (classes/generics/methods) is not yet carried by the host hook
+  (only macros/setf are, 0d31d18); a core needs it too, or CLOS breaks after load.
+- **Env caches.** Confirm `Env::new` does not pre-cache globals that the core
+  expects to resolve lazily through the registries.
+
+Recommended first done-signal for M3 (smaller than the ASDF goal): a
+`defvar`-holding-a-`make-hash-table` world saved as a core and restored in a
+fresh process, with the hash-table readable — proves the whole-heap snapshot +
+symbol-value-cell restore end-to-end before tackling ASDF.
+
 ## Risks / open points
 
 - **Fixed-base availability.** MAP_FIXED_NOREPLACE can fail under ASLR; the delta
