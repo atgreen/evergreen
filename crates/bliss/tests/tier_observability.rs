@@ -1813,3 +1813,38 @@ fn common_shapes_reach_t2() {
          Full output: {out:?}"
     );
 }
+
+/// Regression for bliss-r8pt: a T2 deopt reconstructed a corrupt frame because
+/// the safepoint GC-root set omitted a value that is live ACROSS a call but not
+/// USED at it (a "live-through" value). `(reduce #'logand list)` keeps the loop
+/// list in a callee-saved register across the reducer call; with the roots bug a
+/// moving GC during that call left the register stale, so the next iteration's
+/// cons-guard saw a fixnum and deopted to `(car <fixnum>)` -> "not of type list".
+///
+/// #[ignore]d: reproducing needs REDUCE to reach T2 AND a (background-compiler-
+/// triggered) minor GC to land during a T2 reduce call, which only happens after
+/// a few thousand default-tier warm-up calls (~1 min in a debug build) and is
+/// timing-dependent — unsuitable for the routine suite, but a faithful on-demand
+/// reproducer. The fix (ProgPoint-correct safepoint liveness) makes the result
+/// correct regardless of GC timing, so this never spuriously fails once fixed.
+#[test]
+#[ignore = "slow (~1min) timing-dependent T2+GC reproducer; run on demand"]
+fn r8pt_reduce_logand_live_through_list_survives_gc_across_reducer_call() {
+    // Default tiering (no threshold envs) — the trigger depends on the real
+    // promotion/background-GC cadence.
+    let program = "\
+        (defun rr (l) (reduce (function logand) l)) \
+        (dotimes (k 6000) (rr (list 255 254 253 15))) \
+        (format t \"result=~a\" (rr (list 255 254 253 15)))";
+    let (out, ok) = run(program, &[]);
+    // The bug deopts to `(car <fixnum>)`, raising a type-error and exiting
+    // non-zero — so success + the right fold value is the signal.
+    assert!(
+        ok && !out.contains("not of type"),
+        "reduce repro deopted to a corrupt frame: {out:?}"
+    );
+    assert!(
+        out.contains("result=12"),
+        "logand-reduce must fold to 12; got: {out:?}"
+    );
+}

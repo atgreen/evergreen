@@ -1920,6 +1920,29 @@ fn emit_framed_inner(
     use std::collections::{HashMap, HashSet};
 
     let entry = f.entry();
+    if std::env::var_os("BLISS_IR_FULL").is_some() {
+        eprintln!("[ir] ===== function {} (entry b{}) =====", f.name(), entry.index());
+        for &b in f.block_order() {
+            let bd = f.block(b);
+            let params: Vec<String> = bd.params.iter().map(|v| format!("v{}", v.0)).collect();
+            eprintln!("[ir] b{}({}):", b.index(), params.join(", "));
+            for &inst in &bd.insts {
+                let d = f.inst(inst);
+                let res: Vec<String> = d.results.iter().map(|v| format!("v{}", v.0)).collect();
+                let args: Vec<String> = d.args.iter().map(|v| format!("v{}", v.0)).collect();
+                let lhs = if res.is_empty() { String::new() } else { format!("{} <- ", res.join(",")) };
+                let fs = d.frame_state.map(|id| {
+                    f.frame_states.get(id).scopes.last().map(|s| s.bcp).unwrap_or(u32::MAX)
+                });
+                let fstr = fs.map(|b| format!("  fs@bcp={b}")).unwrap_or_default();
+                eprintln!("[ir]   {}{:?}({}){}", lhs, d.opcode, args.join(","), fstr);
+                for tc in &d.targets {
+                    let ta: Vec<String> = tc.args.iter().map(|v| format!("v{}", v.0)).collect();
+                    eprintln!("[ir]     -> b{}({})", tc.block.index(), ta.join(", "));
+                }
+            }
+        }
+    }
     // Does the function make a call? If so, its live values must survive the call,
     // so they go in callee-saved registers behind a small pushed frame.
     // "Makes a call" for register-allocation purposes: a plain Call, plus the
@@ -2256,9 +2279,25 @@ fn emit_framed_inner(
             let source = machine_inst
                 .source_inst
                 .ok_or(EmitError::UnsupportedOp(0xFD))?;
+            // `value_locations` ranges are in regalloc2 ProgPoint units
+            // (`ProgPoint::to_index()` == inst*2 + pos; see regalloc.rs), NOT raw
+            // MachInst indices. A value must be a GC root here if it is live
+            // ACROSS this safepoint call — i.e. live at the point just after the
+            // call (its next use is later), which is program point `mi*2 + 1`.
+            // Comparing the ProgPoint ranges against the bare inst index `mi` (as
+            // the old code did) is a ~2x scale mismatch that silently dropped
+            // every live-through value, leaving only call *args* (rooted via the
+            // uses loop below) in the map. A moving GC during the call then left a
+            // live-through Tagged value — e.g. a loop-carried list held in a
+            // callee-saved register — stale, deopting to a corrupt frame
+            // (bliss-r8pt). Over-including a root is safe (its stable home holds a
+            // valid pointer); under-including corrupts the heap.
+            let pp_after = mi_u32 * 2 + 1;
             let mut live = HashSet::new();
             for range in &machine.value_locations {
-                if range.vreg.class != RegClass::Gpr || range.start > mi_u32 || mi_u32 >= range.end
+                if range.vreg.class != RegClass::Gpr
+                    || range.start > pp_after
+                    || pp_after >= range.end
                 {
                     continue;
                 }
@@ -2289,7 +2328,32 @@ fn emit_framed_inner(
             }
             let mut live: Vec<_> = live.into_iter().collect();
             live.sort_by_key(|value| value.0);
+            if std::env::var_os("BLISS_SAFEPOINT_DBG").is_some() {
+                let src = machine_inst.source_inst;
+                let bcp = src
+                    .and_then(|i| f.inst(i).frame_state)
+                    .map(|id| f.frame_states.get(id).scopes.last().map(|s| s.bcp).unwrap_or(u32::MAX));
+                eprintln!(
+                    "[sp] fn={} mi={} src={:?} bcp={:?} roots={:?}",
+                    f.name(), mi, src, bcp,
+                    live.iter().map(|v| v.0).collect::<Vec<_>>()
+                );
+            }
             safepoint_roots.insert(source, live);
+        }
+    }
+    if std::env::var_os("BLISS_SAFEPOINT_DBG").is_some() {
+        for range in &machine.value_locations {
+            if range.vreg.class == RegClass::Gpr {
+                eprintln!(
+                    "[sp-range] fn={} v{} [{}, {}) loc={:?}",
+                    f.name(),
+                    range.vreg.num,
+                    range.start,
+                    range.end,
+                    range.location
+                );
+            }
         }
     }
     let shadow_root_slots = safepoint_roots.values().map(Vec::len).max().unwrap_or(0);
@@ -3209,7 +3273,6 @@ mod tests {
             imm,
             frame_state: None,
             safepoint: false,
-            deopt_uses: Vec::new(),
         }
     }
 
