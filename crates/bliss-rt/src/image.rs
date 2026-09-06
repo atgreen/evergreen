@@ -102,6 +102,10 @@ pub enum SectionType {
     /// hook because `bliss-rt` cannot see it. Restored after the heap so its saved
     /// pointers can be remapped through the heap old→new map.
     HostRegistries = 8,
+    /// Off-heap object bodies (bliss-x0f2 M3): hash-tables and other VALUEs whose
+    /// real body is a Box'd Rust struct off the GC heap. Restored INSIDE
+    /// `restore_heap`, between its two passes, so references to them relocate.
+    OffHeap = 9,
 }
 
 /// Host-crate registry serialization hooks (bliss-x0f2 M2). The `bliss` crate
@@ -452,6 +456,10 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
     };
     let host_uncompressed_size = host_raw.len();
 
+    // Off-heap object bodies (bliss-x0f2 M3): hash-tables etc.
+    let offheap_raw: Vec<u8> = crate::gc::serialize_offheap_objects();
+    let offheap_uncompressed_size = offheap_raw.len();
+
     // Apply compression if requested.
     let heap_data = if use_compression {
         compress_data(&heap_data_raw)
@@ -488,9 +496,14 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
     } else {
         host_raw
     };
+    let offheap_data = if use_compression {
+        compress_data(&offheap_raw)
+    } else {
+        offheap_raw
+    };
 
-    // Section count: Heap, Symbols, Packages, Code, Reloc, GcMeta, HostRegistries
-    let section_count: u32 = 7;
+    // Sections: Heap, Symbols, Packages, Code, Reloc, GcMeta, HostRegistries, OffHeap
+    let section_count: u32 = 8;
 
     // Page alignment constant (4 KiB) — §7.2.2 requires sections after
     // the directory to be page-aligned to allow mmap with MAP_FIXED (R7.02).
@@ -573,6 +586,15 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         size: host_data.len() as u64,
         uncompressed_size: host_uncompressed_size as u64,
     };
+    current_offset = align_to_page(current_offset + host_data.len());
+
+    let offheap_section = SectionEntry {
+        section_type: SectionType::OffHeap as u32,
+        flags: 0,
+        file_offset: current_offset as u64,
+        size: offheap_data.len() as u64,
+        uncompressed_size: offheap_uncompressed_size as u64,
+    };
 
     // Get the actual heap base address for relocation tracking (R7.03).
     let original_base = crate::gc::heap_base_address();
@@ -620,6 +642,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
             reloc_section,
             gc_meta_section,
             host_section,
+            offheap_section,
         ];
         for section in &sections {
             let section_bytes = struct_to_bytes(section);
@@ -631,7 +654,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
         // Write section data with page-alignment padding between sections.
         // Each section's file_offset was computed with page alignment, so
         // we pad to match those offsets.
-        let section_data_slices: [&[u8]; 7] = [
+        let section_data_slices: [&[u8]; 8] = [
             &heap_data,
             &symbol_data,
             &package_data,
@@ -639,6 +662,7 @@ pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), BlissErr
             &reloc_data,
             &gc_meta_data,
             &host_data,
+            &offheap_data,
         ];
         let mut write_pos = section_dir_offset + sections.len() * SECTION_ENTRY_SIZE;
         for (idx, data) in section_data_slices.iter().enumerate() {
@@ -792,6 +816,7 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<BlissVal, BlissError> {
     let mut reloc_entry: Option<SectionEntry> = None;
     let mut gc_meta_entry: Option<SectionEntry> = None;
     let mut host_entry: Option<SectionEntry> = None;
+    let mut offheap_entry: Option<SectionEntry> = None;
 
     for i in 0..header.section_count as usize {
         let entry_offset = section_dir_start + i * SECTION_ENTRY_SIZE;
@@ -806,6 +831,7 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<BlissVal, BlissError> {
             t if t == SectionType::Reloc as u32 => reloc_entry = Some(entry),
             t if t == SectionType::GcMeta as u32 => gc_meta_entry = Some(entry),
             t if t == SectionType::HostRegistries as u32 => host_entry = Some(entry),
+            t if t == SectionType::OffHeap as u32 => offheap_entry = Some(entry),
             _ => {
                 // Unknown section type — skip for forward compatibility.
             }
@@ -818,6 +844,18 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<BlissVal, BlissError> {
     } else {
         Vec::new()
     };
+
+    // Stash the off-heap-body section so restore_heap can re-materialize those
+    // objects between its two passes (bliss-x0f2 M3), then clear it afterward.
+    let offheap_bytes = match offheap_entry {
+        Some(entry) => read_section_data(&entry)?,
+        None => Vec::new(),
+    };
+    crate::gc::set_pending_offheap(if offheap_bytes.is_empty() {
+        None
+    } else {
+        Some(offheap_bytes)
+    });
 
     // Restore the heap section.
     let heap_entry = heap_entry
@@ -845,10 +883,16 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<BlissVal, BlissError> {
             crate::gc::restore_heap(object_data)?;
         }
     } else if !heap_bytes.is_empty() {
+        crate::gc::set_pending_offheap(None);
         return Err(BlissError::InvalidImage(
             "heap section too small to contain entry continuation".into(),
         ));
     }
+    // Phase 2 of off-heap restore: now that restore_heap has released the heap
+    // lock and set the final relocation map, populate the off-heap object bodies
+    // (hash-table contents). Then clear the stash.
+    crate::gc::run_offheap_populate();
+    crate::gc::set_pending_offheap(None);
 
     // Restore the symbol table (§7.2.7).
     if let Some(entry) = symbol_entry {

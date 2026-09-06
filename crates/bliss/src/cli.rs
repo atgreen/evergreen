@@ -1781,6 +1781,13 @@ fn drain_pending_host_registries(root_frame: &Rc<RefCell<EnvFrame>>) {
 /// stores the last registration); call once at CLI startup.
 pub(crate) fn register_host_registry_hooks() {
     bliss_rt::image::set_host_registry_hooks(host_serialize_registries, host_restore_registries);
+    // Off-heap-body VALUE objects (hash-tables) are carried in their own image
+    // section and re-materialized mid-restore (bliss-x0f2 M3).
+    bliss_rt::gc::set_offheap_hooks(
+        bliss_stdlib::hashtable::serialize_live_tables,
+        bliss_stdlib::hashtable::allocate_live_tables,
+        bliss_stdlib::hashtable::populate_live_tables,
+    );
 }
 
 fn install_loaded_macro(

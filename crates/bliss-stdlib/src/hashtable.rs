@@ -767,6 +767,201 @@ pub fn make_hash_table(options: &MakeHashTableOptions) -> Result<BlissVal, Bliss
     Ok(val)
 }
 
+// ── Core-image (off-heap) serialization (bliss-x0f2 M3) ────────────────
+//
+// A hash-table body is a Box'd `HashTableInner` OFF the GC heap, so a heap
+// snapshot cannot capture it (walk_heap never visits it) and the restored
+// heap-tagged reference dangles in a fresh process. These two functions let the
+// image system carry hash-tables in a dedicated section: `serialize_live_tables`
+// writes every live table's test/entries keyed by its old address;
+// `restore_live_tables` re-creates each table, remapping its keys/values through
+// the heap old→new map, and returns (old_addr, new_addr) so the loader relocates
+// every reference to it. Registered with `bliss_rt::gc::set_offheap_hooks`.
+
+fn test_to_u8(t: HashTest) -> u8 {
+    match t {
+        HashTest::Eq => 0,
+        HashTest::Eql => 1,
+        HashTest::Equal => 2,
+        HashTest::Equalp => 3,
+    }
+}
+
+fn u8_to_test(b: u8) -> HashTest {
+    match b {
+        0 => HashTest::Eq,
+        2 => HashTest::Equal,
+        3 => HashTest::Equalp,
+        _ => HashTest::Eql,
+    }
+}
+
+fn weakness_to_u8(w: Option<Weakness>) -> u8 {
+    match w {
+        None => 0,
+        Some(Weakness::Key) => 1,
+        Some(Weakness::Value) => 2,
+        Some(Weakness::KeyAndValue) => 3,
+    }
+}
+
+fn u8_to_weakness(b: u8) -> Option<Weakness> {
+    match b {
+        1 => Some(Weakness::Key),
+        2 => Some(Weakness::Value),
+        3 => Some(Weakness::KeyAndValue),
+        _ => None,
+    }
+}
+
+/// Serialize every live hash table for a core image. Record layout:
+/// `[n u32]` then per table `[old_addr u64][test u8][weakness u8][sync u8]
+/// [n_entries u32]([key u64][value u64])*`.
+pub fn serialize_live_tables() -> Vec<u8> {
+    let mut out = Vec::new();
+    let addrs: Vec<usize> = {
+        let guard = LIVE_TABLES.lock().unwrap();
+        match guard.as_ref() {
+            Some(t) => t.iter().copied().collect(),
+            None => Vec::new(),
+        }
+    };
+    out.extend_from_slice(&(addrs.len() as u32).to_le_bytes());
+    for addr in addrs {
+        // SAFETY: LIVE_TABLES holds leaked HashTableInner allocations valid for
+        // the process; we only read fields here.
+        let inner = addr as *const HashTableInner;
+        unsafe {
+            out.extend_from_slice(&(addr as u64).to_le_bytes());
+            out.push(test_to_u8((*inner).test));
+            out.push(weakness_to_u8((*inner).weakness));
+            out.push((*inner).synchronized as u8);
+            let live: Vec<(u64, u64)> = (*inner)
+                .entries
+                .iter()
+                .filter_map(|e| e.as_ref().map(|e| (e.key.to_raw(), e.value.to_raw())))
+                .collect();
+            out.extend_from_slice(&(live.len() as u32).to_le_bytes());
+            for (k, v) in live {
+                out.extend_from_slice(&k.to_le_bytes());
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+fn read_u32_at(data: &[u8], off: &mut usize) -> Option<u32> {
+    if data.len() < *off + 4 {
+        return None;
+    }
+    let v = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
+    *off += 4;
+    Some(v)
+}
+
+fn read_u64_at(data: &[u8], off: &mut usize) -> Option<u64> {
+    if data.len() < *off + 8 {
+        return None;
+    }
+    let v = u64::from_le_bytes(data[*off..*off + 8].try_into().unwrap());
+    *off += 8;
+    Some(v)
+}
+
+// Restore is two-phase (see bliss_rt::gc::set_offheap_hooks): `allocate` creates
+// the empty tables (so references to them can be relocated in the heap's Pass 2)
+// and stashes their entry lists; `populate` fills them once Pass 2 has made every
+// key object structurally hashable.
+thread_local! {
+    static PENDING_TABLES: std::cell::RefCell<Vec<(BlissVal, Vec<(u64, u64)>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Phase 1: create an empty table per serialized record, stashing its (raw) key/
+/// value pairs for `populate_live_tables`. Returns (old_addr, new_addr) so the
+/// loader folds each into the heap old→new map. GC-safe: only off-heap (Box)
+/// allocation, no key hashing yet.
+pub fn allocate_live_tables(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    let mut off = 0usize;
+    let Some(n) = read_u32_at(data, &mut off) else {
+        return pairs;
+    };
+    for _ in 0..n {
+        let Some(old_addr) = read_u64_at(data, &mut off) else {
+            break;
+        };
+        if data.len() < off + 3 {
+            break;
+        }
+        let test = u8_to_test(data[off]);
+        let weakness = u8_to_weakness(data[off + 1]);
+        let synchronized = data[off + 2] != 0;
+        off += 3;
+        let Some(m) = read_u32_at(data, &mut off) else {
+            break;
+        };
+        let opts = MakeHashTableOptions {
+            test,
+            size: (m as usize).saturating_mul(2).max(16),
+            rehash_size: 2.0,
+            rehash_threshold: 0.75,
+            synchronized,
+            weakness,
+        };
+        let table = match make_hash_table(&opts) {
+            Ok(t) => t,
+            Err(_) => return pairs,
+        };
+        let mut entries = Vec::with_capacity(m as usize);
+        for _ in 0..m {
+            let (Some(k), Some(v)) = (read_u64_at(data, &mut off), read_u64_at(data, &mut off))
+            else {
+                break;
+            };
+            entries.push((k, v));
+        }
+        let new_addr = unsafe { table.as_ptr() } as usize;
+        PENDING_TABLES.with(|p| p.borrow_mut().push((table, entries)));
+        pairs.push((old_addr as usize, new_addr));
+    }
+    pairs
+}
+
+/// Phase 2: fill every table allocated by `allocate_live_tables`, remapping each
+/// stored key/value reference through `remap` (the now-final heap old→new map).
+/// GC-safe: `set_gethash` stores already-remapped values and never allocates on
+/// the GC heap; key objects' internals are remapped by now, so hashing is valid.
+pub fn populate_live_tables(remap: &dyn Fn(u64) -> u64) {
+    let mut skipped = 0usize;
+    let pending = PENDING_TABLES.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for (table, entries) in pending {
+        for (k, v) in entries {
+            let rk = BlissVal::from_raw(remap(k));
+            let rv = BlissVal::from_raw(remap(v));
+            // A reference that did not relocate into the restored heap points at
+            // an object we could not carry — e.g. a key/value whose body is itself
+            // OFF the GC heap and not yet serialized (package-internal symbol
+            // tables key on off-heap strings; bliss-x0f2 follow-up). Skip it rather
+            // than dereference a stale pointer while hashing the key.
+            let bad = |x: BlissVal| {
+                x.is_heap_object() && !bliss_rt::gc::is_in_heap(unsafe { x.as_ptr() } as usize)
+            };
+            if bad(rk) || bad(rv) {
+                skipped += 1;
+                continue;
+            }
+            let _ = set_gethash(rk, table, rv);
+        }
+    }
+    if skipped > 0 && std::env::var_os("BLISS_OFFHEAP_DBG").is_some() {
+        eprintln!(
+            ";; core load: {skipped} hash-table entries with off-heap-body keys/values skipped"
+        );
+    }
+}
+
 /// Get a value from a hash table (CL `GETHASH`).
 /// Returns `(value, present-p)`.
 pub fn gethash(

@@ -4952,6 +4952,61 @@ pub fn remap_saved_pointer(raw: u64) -> u64 {
     }
 }
 
+// ── Off-heap-body object serialization (bliss-x0f2 M3) ─────────────────
+//
+// Some Lisp VALUES (hash-tables) keep their real body in a Box'd Rust struct OFF
+// the GC heap; the heap only sees a header-tagged pointer to that Box, and
+// `walk_heap` never visits it. Such a body cannot be snapshotted with the heap.
+// The host (the `bliss`/`bliss-stdlib` layer) registers hooks to serialize these
+// bodies to their own image section and re-materialize them on load. The RESTORE
+// hook runs INSIDE `restore_heap`, BETWEEN Pass 1 (objects materialized, old→new
+// heap map built) and Pass 2 (pointer remap): it re-creates each off-heap object
+// — remapping the heap references it holds through the Pass-1 map — and returns
+// each object's (old_body_addr, new_body_addr) so `restore_heap` folds them into
+// the map. Pass 2 (and the later symbol/package remaps) then relocate every
+// reference TO an off-heap object, exactly like an on-heap one.
+// Restore is TWO-PHASE to break a circular dependency: the objects' new
+// addresses must be folded into the heap map BEFORE Pass 2 (so references TO
+// them relocate), but their contents can only be populated AFTER Pass 2 (a
+// hash-table hashes each key, which for EQUAL/EQUALP recurses into the key's
+// structure — valid only once Pass 2 has remapped the key object's internal
+// pointers). So `allocate` creates the empty bodies + returns old→new; `populate`
+// fills them once the final map is in place.
+type OffHeapSerializeHook = fn() -> Vec<u8>;
+type OffHeapAllocateHook = fn(&[u8]) -> Vec<(usize, usize)>;
+type OffHeapPopulateHook = fn(&dyn Fn(u64) -> u64);
+static OFFHEAP_SERIALIZE: std::sync::Mutex<Option<OffHeapSerializeHook>> =
+    std::sync::Mutex::new(None);
+static OFFHEAP_ALLOCATE: std::sync::Mutex<Option<OffHeapAllocateHook>> = std::sync::Mutex::new(None);
+static OFFHEAP_POPULATE: std::sync::Mutex<Option<OffHeapPopulateHook>> = std::sync::Mutex::new(None);
+/// Off-heap section bytes, stashed by `load_image` before it calls `restore_heap`
+/// so the restore hooks (invoked mid-restore) can read them.
+static PENDING_OFFHEAP: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// Register the off-heap-body (de)serialization hooks (called once at startup).
+pub fn set_offheap_hooks(
+    serialize: OffHeapSerializeHook,
+    allocate: OffHeapAllocateHook,
+    populate: OffHeapPopulateHook,
+) {
+    *OFFHEAP_SERIALIZE.lock().unwrap() = Some(serialize);
+    *OFFHEAP_ALLOCATE.lock().unwrap() = Some(allocate);
+    *OFFHEAP_POPULATE.lock().unwrap() = Some(populate);
+}
+
+/// Serialize the off-heap object bodies for the image (empty if no hook).
+pub fn serialize_offheap_objects() -> Vec<u8> {
+    match *OFFHEAP_SERIALIZE.lock().unwrap() {
+        Some(hook) => hook(),
+        None => Vec::new(),
+    }
+}
+
+/// Stash (or clear) the off-heap section bytes for the next `restore_heap`.
+pub fn set_pending_offheap(data: Option<Vec<u8>>) {
+    *PENDING_OFFHEAP.lock().unwrap() = data;
+}
+
 fn remap_pointer_with(map: &std::collections::HashMap<usize, usize>, raw: u64) -> u64 {
     use crate::value::{TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK};
     let tag = raw & TAG_MASK;
@@ -4981,6 +5036,13 @@ pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
         .as_mut()
         .ok_or_else(|| BlissError::Internal("heap not initialized".into()))?;
     clear_heap_objects(state);
+    // The pre-restore region set is gone: every cached per-thread T0 allocator
+    // still holds a TLAB carved from it, and the reset region alloc_tops will
+    // hand that same space out again — so a post-restore allocation from a stale
+    // TLAB (e.g. the re-opened stdio streams) is silently overwritten by a later
+    // one (bliss-64r1). Bump the move epoch so each thread lazily discards its
+    // allocator and refills from the restored region state.
+    GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
 
     // Pass 1: materialize every object, recording old-body → new-body.
     let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -5008,6 +5070,35 @@ pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
         offset += size;
     }
 
+    // Interlude (phase 1 — ALLOCATE): create the empty OFF-HEAP object bodies
+    // (hash-tables) now and fold each (old_body, new_body) into the map BEFORE
+    // Pass 2, so Pass 2 and the later symbol/package remaps relocate every
+    // reference TO an off-heap object like an on-heap one. Contents are filled
+    // AFTER Pass 2 (phase 2 — POPULATE), once key objects' internals are remapped
+    // and therefore hashable. The hook allocates only off the GC heap (Box), so
+    // holding the heap lock across it is safe (no GC, no heap_state re-entry).
+    // `map` holds only GC-heap objects (Pass 1). `full_map` additionally holds the
+    // off-heap object addresses; it is used for POINTER LOOKUPS (remap), while the
+    // Pass-2 pin/field-walk below iterates only `map` (real GC-heap objects).
+    let mut full_map = map.clone();
+    let have_offheap = {
+        let pend = PENDING_OFFHEAP.lock().unwrap();
+        pend.as_ref().is_some_and(|b| !b.is_empty())
+    };
+    if have_offheap {
+        if let Some(alloc_hook) = *OFFHEAP_ALLOCATE.lock().unwrap() {
+            let bytes = PENDING_OFFHEAP.lock().unwrap().clone().unwrap_or_default();
+            let pairs = alloc_hook(&bytes);
+            for (old_body, new_body) in pairs {
+                // Off-heap objects follow the header-based convention: a
+                // reference's masked address is the header, body = header +
+                // OBJECT_HEADER_SIZE — the key remap_pointer_with looks up for a
+                // TAG_HEAP_OBJECT reference.
+                full_map.insert(old_body + OBJECT_HEADER_SIZE, new_body + OBJECT_HEADER_SIZE);
+            }
+        }
+    }
+
     // Pass 2: remap every pointer field of every restored object via the map,
     // and PIN each object. A loaded core is the immortal base world: the rebuilt
     // symbol/package/macro registries and the RELOC_MAP hold its post-restore
@@ -5026,7 +5117,7 @@ pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
         while fo + 8 <= body_size as usize {
             let field = unsafe { (new_body as *mut u8).add(fo) as *mut u64 };
             let raw = unsafe { std::ptr::read_unaligned(field) };
-            let new_raw = remap_pointer_with(&map, raw);
+            let new_raw = remap_pointer_with(&full_map, raw);
             if new_raw != raw {
                 unsafe { std::ptr::write_unaligned(field, new_raw) };
             }
@@ -5034,8 +5125,27 @@ pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
         }
     }
 
-    *RELOC_MAP.lock().unwrap() = Some(map);
+    *RELOC_MAP.lock().unwrap() = Some(full_map);
     Ok(())
+}
+
+/// Phase 2 of off-heap restore (POPULATE): fill the off-heap objects allocated by
+/// `restore_heap`, remapping their stored references through the now-final map.
+/// MUST run AFTER `restore_heap` returns — it releases the heap-state lock, and
+/// populate calls back into the collector (hashing keys, `is_in_heap`,
+/// `gc_move_epoch`) which re-acquires that lock. By now Pass 2 has remapped every
+/// heap object's internals, so key objects are structurally hashable.
+pub fn run_offheap_populate() {
+    let have = {
+        let pend = PENDING_OFFHEAP.lock().unwrap();
+        pend.as_ref().is_some_and(|b| !b.is_empty())
+    };
+    if !have {
+        return;
+    }
+    if let Some(pop_hook) = *OFFHEAP_POPULATE.lock().unwrap() {
+        pop_hook(&remap_saved_pointer);
+    }
 }
 
 // A whole-heap image (§7) already snapshots the SymbolData/PackageData objects
