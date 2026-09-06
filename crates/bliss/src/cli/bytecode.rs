@@ -12674,6 +12674,21 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
             pushed += 1;
             frame
         };
+        if std::env::var_os("BLISS_DEOPT_T2_DBG").is_some() {
+            eprintln!(
+                "[deopt-t2] scope#{scope_index} fn={function} bcp={bcp} nlocals={n_locals} nstack={sp_top}"
+            );
+            for (slot, &bits) in words[at..at + n_slots].iter().enumerate() {
+                let v = BlissVal(bits);
+                eprintln!(
+                    "[deopt-t2]   slot[{slot}] bits={bits:#x} fixnum={} nil={} cons={} heap={}",
+                    v.is_fixnum(),
+                    v.is_nil(),
+                    v.is_cons(),
+                    v.is_heap_object()
+                );
+            }
+        }
         for (slot, &bits) in words[at..at + n_slots].iter().enumerate() {
             unsafe { slot_set(frame, slot as u16, BlissVal(bits)) };
         }
