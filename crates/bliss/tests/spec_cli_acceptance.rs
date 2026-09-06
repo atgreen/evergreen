@@ -2654,3 +2654,35 @@ fn file_position_query_and_set_on_streams() {
         "WORLD"
     );
 }
+
+#[test]
+fn make_array_element_type_bit_builds_a_bit_vector() {
+    // Regression: (make-array n :element-type 'bit) returned a general T-vector
+    // of NILs instead of a SIMPLE-BIT-VECTOR initialised to 0 (bliss-51f3
+    // follow-up). It must be a real bit-vector, defaulting to 0, honouring
+    // :initial-element and :initial-contents, with ARRAY-ELEMENT-TYPE => BIT.
+    assert_eq!(eval_ok("(bit-vector-p (make-array 4 :element-type 'bit))"), "T");
+    assert_eq!(eval_ok("(make-array 4 :element-type 'bit)"), "#*0000");
+    assert_eq!(eval_ok("(aref (make-array 4 :element-type 'bit) 0)"), "0");
+    assert_eq!(
+        eval_ok("(make-array 3 :element-type 'bit :initial-element 1)"),
+        "#*111"
+    );
+    assert_eq!(
+        eval_ok("(make-array 4 :element-type 'bit :initial-contents '(1 0 1 0))"),
+        "#*1010"
+    );
+    assert_eq!(
+        eval_ok("(array-element-type (make-array 4 :element-type 'bit))"),
+        "BIT"
+    );
+    assert_eq!(eval_ok("(array-element-type #*1010)"), "BIT");
+    // A non-bit initial-element is a type error, not a silent bad vector.
+    assert_eq!(
+        eval_ok(
+            "(handler-case (make-array 2 :element-type 'bit :initial-element 5) \
+               (type-error () :caught))"
+        ),
+        ":CAUGHT"
+    );
+}

@@ -1167,6 +1167,7 @@
          (et-cell (member :element-type keys))
          (et (if et-cell (car (cdr et-cell)) t))
          (stringp (member et '(character base-char standard-char)))
+         (bitp (eq et 'bit))
          (fp-cell (member :fill-pointer keys))
          (adj-cell (member :adjustable keys))
          (fp (and fp-cell (car (cdr fp-cell))))
@@ -1200,9 +1201,16 @@
                (setq i (+ i 1)))))
          v))
       (ic-cell
-       (coerce (car (cdr ic-cell)) (if stringp 'string 'vector)))
+       (cond (bitp (%bit-vector-from-bits (coerce (car (cdr ic-cell)) 'list)))
+             (stringp (coerce (car (cdr ic-cell)) 'string))
+             (t (coerce (car (cdr ic-cell)) 'vector))))
       (stringp
        (if iel-cell (make-string size :initial-element (car (cdr iel-cell))) (make-string size)))
+      ;; A BIT array is a real SIMPLE-BIT-VECTOR (bliss builds these immutably,
+      ;; so the whole content is supplied at construction). Default fill 0.
+      (bitp
+       (%bit-vector-from-bits
+        (make-list size :initial-element (if iel-cell (car (cdr iel-cell)) 0))))
       (t
        (apply (function vector)
               (make-list size :initial-element (if iel-cell (car (cdr iel-cell)) nil)))))))

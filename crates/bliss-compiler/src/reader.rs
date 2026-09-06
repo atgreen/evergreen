@@ -439,6 +439,14 @@ fn alloc_complex(real: BlissVal, imag: BlissVal) -> BlissVal {
     }
 }
 
+/// Build a simple bit-vector from a slice of bit values (each 0 or non-zero).
+/// Public entry point for the interpreter's `MAKE-ARRAY :element-type bit`
+/// (bliss-51f3 follow-up); mirrors the reader's own `#*` construction so the
+/// two produce identical `SIMPLE_ARRAY`/BIT objects.
+pub fn make_bit_vector(bits: &[u8]) -> BlissVal {
+    alloc_bit_vector(bits)
+}
+
 fn alloc_bit_vector(bits: &[u8]) -> BlissVal {
     // Layout: ObjectHeader (8) + element_type_tag byte + padding (7) + length (8) + data
     let data_bytes = bits.len().div_ceil(8);

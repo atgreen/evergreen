@@ -11234,6 +11234,32 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let v = eval_form(af, env)?;
                 return Ok(if bliss_rt::types::bit_vector_p(v) { T } else { NIL });
             }
+            "%BIT-VECTOR-FROM-BITS" => {
+                // (%bit-vector-from-bits list) — build a SIMPLE bit-vector from a
+                // list of bits (each 0 or 1). The one-shot constructor MAKE-ARRAY
+                // :element-type bit uses (boot.lisp); bliss bit-vectors are
+                // immutable after construction, so the whole content is supplied
+                // here. Bits are read into a native Vec<u8> before the single
+                // allocation, so no BlissVal is held live across a GC (the source
+                // list holds only fixnums, which never move); GC-safe.
+                let (af, _) = cp(cdr);
+                let lst = eval_form(af, env)?;
+                let elems = list_to_vec(lst);
+                let mut bits: Vec<u8> = Vec::with_capacity(elems.len());
+                for e in &elems {
+                    match if e.is_fixnum() { e.as_fixnum() } else { -1 } {
+                        0 => bits.push(0),
+                        1 => bits.push(1),
+                        _ => {
+                            return Err(BlissError::TypeError {
+                                datum: *e,
+                                expected: "BIT (0 or 1)".into(),
+                            });
+                        }
+                    }
+                }
+                return Ok(bliss_compiler::reader::make_bit_vector(&bits));
+            }
             "ADJUSTABLE-ARRAY-P" => {
                 // Only a COMPLEX_ARRAY created :adjustable is adjustable.
                 let (af, _) = cp(cdr);
@@ -11261,8 +11287,14 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "ARRAY-ELEMENT-TYPE" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                // Strings hold CHARACTER; simple-vectors hold T.
-                let ty = if is_string_value(v) { "CHARACTER" } else { "T" };
+                // Strings hold CHARACTER; bit-vectors hold BIT; everything else T.
+                let ty = if is_string_value(v) {
+                    "CHARACTER"
+                } else if bliss_rt::types::bit_vector_p(v) {
+                    "BIT"
+                } else {
+                    "T"
+                };
                 return Ok(resolve_sym(ty).unwrap_or(T));
             }
             "ARRAY-RANK" => {
