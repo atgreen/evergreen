@@ -5006,16 +5006,41 @@ pub fn serialize_relocation_table() -> Vec<u8> {
         true
     });
 
+    // A field needs relocation if it holds a reference to another heap object —
+    // whether a raw (untagged) body pointer OR a TAGGED Lisp value (cons=|001,
+    // heap-object=|010, function=|110). The earlier scan only matched raw body
+    // pointers (`raw % 16 == 8`), silently missing every tagged pointer, so a
+    // real Lisp graph (cons cars/cdrs, symbol value/function cells) did NOT
+    // relocate across a base change (bliss-x0f2). Normalise each field to the
+    // object BODY address it would denote and record it if that is a known
+    // object. `apply_relocations` adds the (page-aligned) delta to the whole
+    // word, preserving the low tag bits, so no per-entry tag is needed.
+    use crate::value::{TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK};
     let mut relocs = Vec::new();
     let mut object_offset = 0usize;
     let _ = walk_heap(|ptr, _type_id, size| {
         let mut field_offset = 0usize;
         while field_offset + 8 <= size {
             let field_ptr = unsafe { ptr.add(field_offset) };
-            let raw = unsafe { std::ptr::read_unaligned(field_ptr as *const u64) } as usize;
-            if raw >= heap_base
-                && raw % OBJECT_ALIGNMENT == OBJECT_HEADER_SIZE
-                && object_addresses.contains(&raw)
+            let raw = unsafe { std::ptr::read_unaligned(field_ptr as *const u64) };
+            let untagged = (raw & !TAG_MASK) as usize;
+            let candidate_body = match raw & TAG_MASK {
+                // Cons references point directly at the body.
+                TAG_CONS => untagged,
+                // Other heap references and functions point at the header; the
+                // body (what walk_heap records) is one header further on.
+                TAG_HEAP_OBJECT | TAG_FUNCTION => untagged + OBJECT_HEADER_SIZE,
+                // A bare (untagged) body pointer, e.g. an internal raw slot.
+                0 => raw as usize,
+                // Any other tag (fixnum/char/symbol/immediate) is not a pointer.
+                _ => {
+                    field_offset += 8;
+                    continue;
+                }
+            };
+            if candidate_body >= heap_base
+                && candidate_body % OBJECT_ALIGNMENT == OBJECT_HEADER_SIZE
+                && object_addresses.contains(&candidate_body)
             {
                 relocs.push((object_offset + 1 + 4 + field_offset) as u64);
             }

@@ -98,6 +98,64 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
 }
 
 #[test]
+fn spec_image_loader_relocates_tagged_lisp_pointers_when_base_changes() {
+    // bliss-x0f2: real Lisp slots hold TAGGED values (cons=|001, heap-object=
+    // |010), not raw body pointers. The relocation scan must catch these or a
+    // Lisp graph breaks across a base change. Store a tagged cons ref (points at
+    // the body) and a tagged heap-object ref (points at the header) to a target,
+    // then verify both relocate.
+    use bliss_rt::value::{TAG_CONS, TAG_HEAP_OBJECT};
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_test_heap();
+    let path = temp_path("reloc-tagged.bimg");
+    let _ = fs::remove_file(&path);
+
+    record_object(0x81, vec![0xBB; 8]);
+    let target_body = walk_objects_with_data()
+        .into_iter()
+        .find(|(_, type_id, _)| *type_id == 0x81)
+        .map(|(ptr, _, _)| ptr as u64)
+        .expect("target object");
+    let header_size = 8u64; // OBJECT_HEADER_SIZE
+    let cons_ref = target_body | TAG_CONS; // cons points at the body
+    let heapobj_ref = (target_body - header_size) | TAG_HEAP_OBJECT; // points at header
+
+    let mut holder = vec![0u8; 16];
+    holder[..8].copy_from_slice(&cons_ref.to_le_bytes());
+    holder[8..].copy_from_slice(&heapobj_ref.to_le_bytes());
+    record_object(0x82, holder);
+    set_entry_continuation(BlissVal::from_fixnum(1));
+
+    save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
+    init_test_heap();
+    load_image(path.to_str().unwrap()).expect("load_image");
+
+    let restored = walk_objects_with_data();
+    let new_body = restored
+        .iter()
+        .find(|(_, t, _)| *t == 0x81)
+        .map(|(ptr, _, _)| *ptr as u64)
+        .expect("restored target");
+    let holder_data = restored
+        .iter()
+        .find(|(_, t, _)| *t == 0x82)
+        .map(|(_, _, data)| data.clone())
+        .expect("restored holder");
+    let restored_cons = u64::from_le_bytes(holder_data[..8].try_into().unwrap());
+    let restored_heapobj = u64::from_le_bytes(holder_data[8..16].try_into().unwrap());
+    assert_eq!(
+        restored_cons,
+        new_body | TAG_CONS,
+        "tagged cons ref must relocate to the new body, preserving its tag"
+    );
+    assert_eq!(
+        restored_heapobj,
+        (new_body - header_size) | TAG_HEAP_OBJECT,
+        "tagged heap-object ref must relocate to the new header, preserving its tag"
+    );
+}
+
+#[test]
 fn spec_image_loader_relocates_heap_pointers_when_base_changes() {
     let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // Per R7.03, a loaded image must relocate pointer fields when the heap
