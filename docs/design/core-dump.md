@@ -40,9 +40,47 @@ whole live world byte-for-byte, so any value round-trips.
   (SBCL keeps symbols/packages/functions *on* the Lisp heap, so its core is just
   the heap; bliss's hybrid model makes the registries extra work.)
 
+## What already exists (discovered during M1)
+
+A spec §7.2–7.3 heap-image system is **implemented and unit-tested in-process,
+but not wired to the CLI**:
+
+- `bliss_rt::image::save_image` / `load_image` — full file format: `ImageHeader`
+  (magic `BLISSIMG`), section table, sha256 checksums, optional zstd, and
+  `find_appended_image` (already supports the executable-append case for M4).
+- `bliss_rt::gc::serialize_heap_objects` / `restore_heap` — walk every live
+  object (`walk_heap`) and re-materialize it (`append_serialized_object`); a
+  **relocating** restore, fixed up by `serialize_relocation_table`.
+- `serialize_code_cache` / `restore_code_cache` — the compiled bytecode.
+- 24 passing tests (`test_image.rs`, `spec_image_ops.rs`) — all **in-process**
+  (save then load in the same process).
+
+The gaps that keep it from being a cross-process core dump (what
+`save-lisp-and-die` / an installed executable actually need):
+
+1. **Not wired.** `save-lisp-and-die` / `--image` use the source-form path
+   (`build_image_from_runtime`), never `save_image`/`load_image`.
+2. **Symbols/packages are stubbed for cross-process.** `serialize_symbols` /
+   `serialize_packages` return empty by design — they rely on the Rust-side
+   symbol/package registry *surviving in-process*. A fresh process has an empty
+   registry, so a loaded heap's `SymbolData`/`PackageData` objects exist but
+   nothing indexes them. Real cross-process serialization
+   (`crate::symbols::serialize`/`restore`, per the code comment) must be used.
+3. **bliss-crate registries are invisible to bliss-rt.** `GLOBAL_MACROS`,
+   `GLOBAL_SETF_FNS`, setf-expanders, `CLOS_STATE`, class/generic/method tables
+   live in the `bliss` crate; `image.rs` (in `bliss-rt`) can't see them. Needs a
+   registration hook (like the existing root-scanner registration) so the CLI
+   contributes extra image sections.
+4. **Off-heap object bodies.** Streams and similar hold raw pointers to off-heap
+   Rust allocations that can't be snapshotted — enumerate and forbid/re-open.
+
+So the plan below is **wire + complete the existing system**, not build anew.
+
 ## Approach
 
-Fixed-base snapshot with a relocation fallback:
+Fixed-base snapshot with a relocation fallback (note: the existing `restore_heap`
+already RE-MATERIALIZES objects and fixes pointers via the relocation table, so
+"relocation" is the default path, not just a fallback):
 
 **Dump** (`save-lisp-and-die`, core format):
 1. `major_gc` to compact — live data becomes a dense prefix of the heap.
