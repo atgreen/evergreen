@@ -30,12 +30,23 @@ set -u
 MEM="${BLISS_MEM_MAX:-4G}"
 TIMEOUT="${BLISS_TIMEOUT:-600}"
 
+# --kill-after: T2 native loops can ignore SIGTERM (bliss-siv7), so follow the
+# TERM with a KILL or a hung run escapes the timeout entirely. A KILLed timeout
+# exits 137 like an OOM kill; disambiguate by elapsed wall-clock below.
+start=$SECONDS
 systemd-run --user --scope --quiet -p MemoryMax="$MEM" -p MemorySwapMax=0 \
-  -- timeout "$TIMEOUT" "$@"
+  -- timeout --kill-after=30 "$TIMEOUT" "$@"
 rc=$?
+elapsed=$((SECONDS - start))
 if [ "$rc" -eq 137 ]; then
-  echo "[bliss-limited] exit 137 (SIGKILL): memory cap MemoryMax=$MEM hit —" \
-    "cgroup OOM kill, NOT a GC/memory-corruption bug." >&2
+  if [ "$elapsed" -ge "$TIMEOUT" ]; then
+    echo "[bliss-limited] exit 137 after ${elapsed}s >= ${TIMEOUT}s timeout:" \
+      "hung run ignored SIGTERM (cf. bliss-siv7) and was KILLed — a hang," \
+      "NOT a memory-cap kill, NOT a GC bug." >&2
+  else
+    echo "[bliss-limited] exit 137 (SIGKILL) after ${elapsed}s: memory cap" \
+      "MemoryMax=$MEM hit — cgroup OOM kill, NOT a GC/memory-corruption bug." >&2
+  fi
 elif [ "$rc" -eq 124 ]; then
   echo "[bliss-limited] exit 124: wall-clock timeout (${TIMEOUT}s) — hang or" \
     "runaway loop, NOT a memory-cap kill." >&2
