@@ -2735,3 +2735,25 @@ fn bit_vector_boolean_operations() {
         "#*010"
     );
 }
+
+#[test]
+fn builtins_are_first_class_functions() {
+    // bliss-dnst: FDEFINITION/SYMBOL-FUNCTION returned the bare symbol for
+    // builtins (not FUNCTIONP, diverging from #'), and several standard math
+    // functions were absent from the builtin table entirely (#'sinh etc. were
+    // not functions). Both are fixed: every standard function is now first-class.
+    assert_eq!(eval_ok("(functionp (fdefinition 'car))"), "T");
+    assert_eq!(eval_ok("(functionp (symbol-function '+))"), "T");
+    assert_eq!(eval_ok("(funcall (fdefinition 'list) 1 2 3)"), "(1 2 3)");
+    assert_eq!(eval_ok("(mapcar (fdefinition '1+) '(1 2 3))"), "(2 3 4)");
+    // Previously-unregistered functions are now first-class + fbound.
+    assert_eq!(eval_ok("(list (fboundp 'sinh) (functionp #'sinh))"), "(T T)");
+    assert_eq!(eval_ok("(mapcar #'rational '(0.5 0.25))"), "(1/2 1/4)");
+    assert_eq!(eval_ok("(functionp #'array-rank)"), "T");
+    assert_eq!(eval_ok("(functionp #'asin)"), "T");
+    // A user DEFUN is first-class through FDEFINITION too.
+    assert_eq!(
+        eval_ok("(progn (defun fcf (x) (* x 3)) (funcall (fdefinition 'fcf) 5))"),
+        "15"
+    );
+}

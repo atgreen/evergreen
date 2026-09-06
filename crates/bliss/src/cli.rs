@@ -9880,20 +9880,19 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
             "FDEFINITION" | "SYMBOL-FUNCTION" => {
                 let (sf, _) = cp(cdr);
                 let spec = eval_form(sf, env)?;
-                // A function name is a symbol or `(setf f)`. Return a callable
-                // designator: the heap function object when one is bound (so it
-                // is FUNCTIONP), otherwise the name itself (funcall/apply accept
-                // a symbol / `(setf f)` designator).
                 if spec.is_symbol() {
-                    let n = sym_name(spec);
-                    // A local flet/labels function shadows any global; return a
-                    // closure so it survives the flet scope.
-                    if let Some(c) = local_fn_closure(env, &n) {
-                        return Ok(c);
-                    }
-                    if let Some(f) = global_fn(&n) {
+                    // Return the SAME first-class function object `#'name` yields
+                    // (bliss-dnst): a builtin is reified to its FUNCTIONP wrapper,
+                    // not the bare symbol, so (functionp (fdefinition 'car)) is T
+                    // and it behaves like #'car. symbol_function_object covers
+                    // local flet/labels closures, global functions, and builtins.
+                    if let Some(f) = symbol_function_object(env, spec) {
                         return Ok(f);
                     }
+                    // Generic functions, methods, and macros are fbound but have
+                    // no plain function object here; return the name designator
+                    // (funcall/apply accept it), preserving prior behaviour.
+                    let n = sym_name(spec);
                     if fn_bound(env, &n)
                         || env.methods.borrow().contains_key(&n)
                         || env.generics.borrow().contains_key(&n)
@@ -22192,6 +22191,12 @@ fn is_builtin_function(name: &str) -> bool {
             | "COMPLEXP" | "REALPART" | "IMAGPART"
             | "LOGAND" | "LOGIOR" | "LOGXOR" | "LOGNOT" | "ASH" | "LOGBITP" | "BOOLE"
             | "INTEGER-LENGTH" | "RANDOM" | "EXP" | "LOG" | "SIN" | "COS" | "TAN"
+            // Inverse / hyperbolic trig and exact rationals: callable via the
+            // evaluator but were missing from this table, so #'/FBOUNDP/FDEFINITION
+            // reported them as non-functions (bliss-dnst).
+            | "ASIN" | "ACOS" | "ATAN" | "SINH" | "COSH" | "TANH"
+            | "ASINH" | "ACOSH" | "ATANH" | "RATIONAL" | "RATIONALIZE"
+            | "SXHASH" | "ARRAY-RANK" | "CLASS-PRECEDENCE-LIST"
             // Characters
             | "CHAR" | "CHAR-CODE" | "CODE-CHAR" | "CHAR-UPCASE" | "CHAR-DOWNCASE"
             | "CHARACTERP" | "CHAR=" | "CHAR<" | "CHAR>" | "CHAR<=" | "CHAR>=" | "CHAR/="
