@@ -340,6 +340,82 @@ fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, BlissError> {
     Ok(v)
 }
 
+fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64, BlissError> {
+    let end = pos
+        .checked_add(8)
+        .filter(|&e| e <= data.len())
+        .ok_or_else(|| BlissError::Internal("truncated package image u64".into()))?;
+    let v = u64::from_le_bytes(data[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(v)
+}
+
+// ── Cross-process image serialization (bliss-x0f2 M2) ────────────────────────
+//
+// Like symbols: the PACKAGE objects ride in the heap section; this saves the
+// registry mapping (distinct objects + name→object) and rebuilds it against the
+// RESTORED, relocated objects. Each restored PackageData's off-heap `lock`
+// pointer cannot be snapshotted, so it is reset to null (re-created lazily).
+// Format: `[n_pkgs u32][obj_raw u64]* [n_names u32][(name, obj_raw u64)]*`.
+pub fn serialize_objects() -> Vec<u8> {
+    let mut buf = Vec::new();
+    let done = with_registry(|reg| {
+        buf.extend_from_slice(&(reg.packages.len() as u32).to_le_bytes());
+        for &obj in &reg.packages {
+            buf.extend_from_slice(&obj.to_raw().to_le_bytes());
+        }
+        buf.extend_from_slice(&(reg.name_to_package.len() as u32).to_le_bytes());
+        for (name, &obj) in &reg.name_to_package {
+            encode_str(&mut buf, name);
+            buf.extend_from_slice(&obj.to_raw().to_le_bytes());
+        }
+    });
+    if done.is_none() {
+        buf.clear();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+    }
+    buf
+}
+
+/// Rebuild the package registry from [`serialize_objects`] output, remapping each
+/// object address through the restore_heap old→new map, nulling the off-heap
+/// lock, and re-pinning the restored regions.
+pub fn restore_objects(data: &[u8]) -> Result<(), BlissError> {
+    let remap = |raw: u64| BlissVal::from_raw(crate::gc::remap_saved_pointer(raw));
+    let mut pos = 0usize;
+    let n_pkgs = read_u32(data, &mut pos)? as usize;
+    let mut packages = Vec::with_capacity(n_pkgs);
+    for _ in 0..n_pkgs {
+        let obj = remap(read_u64(data, &mut pos)?);
+        // Only touch a genuine restored PACKAGE object; skip a dangling entry
+        // (see the symbol restore for the rationale).
+        if crate::gc::heap_object_type_id(obj) == Some(type_id::PACKAGE) {
+            // SAFETY: in-heap restored PACKAGE object; reset its off-heap lock.
+            unsafe {
+                (*(obj.as_ptr() as *mut PackageData)).lock = std::ptr::null_mut();
+            }
+            let untagged = (obj.to_raw() & !crate::value::TAG_MASK) as usize;
+            crate::gc::pin_region_containing(untagged);
+            let name = unsafe { (*(obj.as_ptr() as *const PackageData)).name };
+            crate::gc::pin_region_containing((name.to_raw() & !crate::value::TAG_MASK) as usize);
+        }
+        packages.push(obj);
+    }
+    let n_names = read_u32(data, &mut pos)? as usize;
+    let mut name_to_package = HashMap::with_capacity(n_names);
+    for _ in 0..n_names {
+        let name = read_str(data, &mut pos)?;
+        let obj = remap(read_u64(data, &mut pos)?);
+        name_to_package.insert(name, obj);
+    }
+    with_registry_mut(|reg| {
+        reg.packages = packages;
+        reg.name_to_package = name_to_package;
+    });
+    Ok(())
+}
+
 fn read_str(data: &[u8], pos: &mut usize) -> Result<String, BlissError> {
     let len = read_u32(data, pos)? as usize;
     let end = pos

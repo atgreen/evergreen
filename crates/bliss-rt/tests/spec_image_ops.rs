@@ -100,6 +100,35 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
 }
 
 #[test]
+fn spec_image_round_trip_rebuilds_package_registry_cross_process() {
+    // bliss-x0f2 M2: packages mirror symbols (heap-resident, pinned, name→object
+    // registry). After a load the package must resolve by name against the
+    // restored object, and its off-heap lock must be reset (not a stale pointer).
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_test_heap();
+    let _pkg = bliss_rt::packages::find_or_create("COREDUMP-PKG");
+    set_entry_continuation(BlissVal::from_fixnum(1));
+
+    let path = temp_path("packages.bimg");
+    let _ = fs::remove_file(&path);
+    save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
+
+    init_test_heap();
+    load_image(path.to_str().unwrap()).expect("load_image");
+
+    let found = bliss_rt::packages::find("COREDUMP-PKG");
+    assert!(
+        found.is_some(),
+        "package must resolve by name after cross-process image load"
+    );
+    assert_eq!(
+        bliss_rt::packages::package_name(found.unwrap()).as_deref(),
+        Some("COREDUMP-PKG"),
+        "restored package name must be readable"
+    );
+}
+
+#[test]
 fn spec_image_round_trip_rebuilds_symbol_registry_cross_process() {
     // bliss-x0f2 M2: a fresh process (re-inited heap) has an empty symbol
     // registry. After an image load, restore_symbols rebuilds the registry to

@@ -5048,11 +5048,11 @@ pub fn restore_symbols(data: &[u8]) -> Result<(), BlissError> {
 }
 
 pub fn serialize_packages() -> Vec<u8> {
-    Vec::new()
+    crate::packages::serialize_objects()
 }
 
-pub fn restore_packages(_data: &[u8]) -> Result<(), BlissError> {
-    Ok(())
+pub fn restore_packages(data: &[u8]) -> Result<(), BlissError> {
+    crate::packages::restore_objects(data)
 }
 
 pub fn serialize_code_cache() -> Vec<u8> {

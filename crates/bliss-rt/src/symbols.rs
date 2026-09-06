@@ -511,27 +511,27 @@ pub fn restore_objects(data: &[u8]) -> Result<(), BlissError> {
     let mut name_to_index: HashMap<String, u32> = HashMap::with_capacity(interned.len());
     let mut index_to_key: Vec<String> = Vec::with_capacity(interned.len());
     for (i, &obj) in interned.iter().enumerate() {
-        let untagged = (obj.to_raw() & !crate::value::TAG_MASK) as usize;
-        // A registry entry whose remapped object is not in the current heap is a
-        // dangling reference (e.g. a symbol from an earlier heap not present in
-        // this image); keep its slot to preserve dense indices, but never
-        // dereference it. Real images map every registry symbol.
-        if !crate::gc::is_in_heap(untagged) {
+        // Only dereference an entry that remaps to a genuine SYMBOL object in the
+        // current heap. A dangling entry (e.g. a symbol left in the global
+        // registry by an earlier heap and absent from this image — or one whose
+        // stale address happens to land in the new heap but on non-symbol bytes)
+        // keeps its slot to preserve dense indices but is never dereferenced.
+        // Real images map every registry symbol to a valid SYMBOL object.
+        if crate::gc::heap_object_type_id(obj) != Some(type_id::SYMBOL) {
             index_to_key.push(String::new());
             continue;
         }
-        // SAFETY: `obj` is a restored, remapped, in-heap pinned symbol object.
+        // SAFETY: `obj` is a restored, remapped, in-heap SYMBOL object.
         let name = unsafe { (*symbol_data(obj)).name }.as_string();
         name_to_index.insert(name.clone(), i as u32);
         index_to_key.push(name);
-        crate::gc::pin_region_containing(untagged);
+        crate::gc::pin_region_containing((obj.to_raw() & !crate::value::TAG_MASK) as usize);
         let name_obj = unsafe { (*symbol_data(obj)).name };
         crate::gc::pin_region_containing((name_obj.to_raw() & !crate::value::TAG_MASK) as usize);
     }
     for &obj in uninterned.values() {
-        let untagged = (obj.to_raw() & !crate::value::TAG_MASK) as usize;
-        if crate::gc::is_in_heap(untagged) {
-            crate::gc::pin_region_containing(untagged);
+        if crate::gc::heap_object_type_id(obj) == Some(type_id::SYMBOL) {
+            crate::gc::pin_region_containing((obj.to_raw() & !crate::value::TAG_MASK) as usize);
         }
     }
     with_registry_mut(|reg| {
