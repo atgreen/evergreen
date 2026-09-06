@@ -1083,6 +1083,7 @@ impl<'e> Lowerer<'e> {
                 "MULTIPLE-VALUE-CALL" => self.lower_multiple_value_call(rest),
                 "MULTIPLE-VALUE-BIND" => self.lower_mvb(rest),
                 "MULTIPLE-VALUE-LIST" => self.lower_mvlist(rest),
+                "NTH-VALUE" => self.lower_nth_value(rest),
                 "LAMBDA" => self.lower_lambda(op, rest),
                 "FUNCTION" => self.lower_function(rest),
                 "FLET" => self.lower_flet(rest, false),
@@ -3883,6 +3884,36 @@ impl<'e> Lowerer<'e> {
         self.lower_expr(form)?; // primary (+1), mv set
         self.emit(Instr::ValuesToList); // pop primary, push list
         Ok(())
+    }
+
+    /// `(nth-value n form)` — the n-th value (0-based) of `form`'s multiple
+    /// values, or NIL if `form` yields fewer. NTH-VALUE is a special operator
+    /// (not a macro), so the lowerer must handle it: without this it fell through
+    /// to `lower_call`, which evaluates `form` in single-value context and calls a
+    /// nonexistent NTH-VALUE function — silently yielding NIL for every n>0 (a
+    /// miscompile that broke every compiled `(nth-value k …)`, k>0, e.g. cl-cookie
+    /// / any date code reading `(nth-value 5 (get-decoded-time))`). Lower to the
+    /// equivalent `(nth n (multiple-value-list form))`, which compiles correctly.
+    fn lower_nth_value(&mut self, rest: BlissVal) -> LowerResult<()> {
+        if !self.portable {
+            return Err(Bail);
+        }
+        if !rest.is_cons() {
+            return Err(Bail);
+        }
+        let (mut n_form, after) = cp(rest);
+        if !after.is_cons() {
+            return Err(Bail);
+        }
+        let (mut form, _) = cp(after);
+        // Root heap subforms across the allocating rebuild (moving GC; bliss-wlf);
+        // symbols are immediate and need no root.
+        bliss_rt::rooted_ref!(_n_root = &mut n_form);
+        bliss_rt::rooted_ref!(_form_root = &mut form);
+        let mut mvl = form_list(&[resolve_sym("MULTIPLE-VALUE-LIST").ok_or(Bail)?, form]);
+        bliss_rt::rooted_ref!(_mvl_root = &mut mvl);
+        let nth = form_list(&[resolve_sym("NTH").ok_or(Bail)?, n_form, mvl]);
+        self.lower_expr(nth)
     }
 
     /// `(ignore-errors body...)` — a builtin macro the lowerer's user-macro

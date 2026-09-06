@@ -737,3 +737,23 @@ fn gc_stress_mx_clean_macrolet_symbol_macrolet_labels() {
         );
     }
 }
+
+/// Regression for the NTH-VALUE miscompile: NTH-VALUE is a special operator, but
+/// the bytecode lowerer had no case for it, so it fell through to a plain call —
+/// evaluating the form in single-value context and yielding NIL for every index
+/// > 0 (index 0 worked by luck). This silently broke compiled `(nth-value k …)`,
+/// k>0 — e.g. cl-cookie's `(nth-value 5 (get-decoded-time))` at load. The
+/// bytecode backend must agree with the tree-walker.
+#[test]
+fn nth_value_compiles_to_the_right_value() {
+    assert_agree("(princ (nth-value 0 (values 10 20 30 40)))");
+    assert_agree("(princ (nth-value 2 (values 10 20 30 40)))");
+    assert_agree("(princ (nth-value 1 (floor 17 5)))");
+    assert_agree("(princ (nth-value 3 (values 1 2 3 4 5)))");
+    // Index past the produced values yields NIL, not an error.
+    assert_agree("(princ (nth-value 9 (values 1 2 3)))");
+    // In a function body (the real miscompile site was a compiled defun).
+    assert_agree(
+        "(defun f (x) (nth-value 1 (floor x 5))) (princ (list (f 17) (f 23) (f 100)))",
+    );
+}
