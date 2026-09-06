@@ -2044,9 +2044,91 @@ pub fn set_file_position(stream: BlissVal, position: BlissVal) -> Result<BlissVa
                 .map_err(|e| BlissError::StreamError(format!("set-file-position error: {}", e)))?;
             Ok(T)
         }
+        StreamInner::StringInput {
+            position: pos,
+            end,
+            unread,
+            ..
+        } => {
+            // Seek within an in-memory input string (R5.124). Clamp to [0, end];
+            // a negative or unparseable index is a failed positioning (NIL).
+            let requested = position.as_fixnum();
+            if requested < 0 {
+                return Ok(NIL);
+            }
+            *pos = (requested as usize).min(*end);
+            *unread = None;
+            Ok(T)
+        }
         StreamInner::Synonym => {
             let target = resolve_synonym(comps[0])?;
             set_file_position(target, position)
+        }
+        _ => Ok(NIL),
+    }
+}
+
+/// Position a stream at its end — the `:end` designator of `(setf file-position)`
+/// (R5.124). Kept in the stdlib because only it knows each stream variant's end.
+/// Returns `T` on success, `NIL` for a non-positionable stream.
+pub fn set_file_position_to_end(stream: BlissVal) -> Result<BlissVal, BlissError> {
+    let mut guard = lock_stream(stream)?;
+    guard.check_open()?;
+    let comps = guard.components();
+    match &mut guard.inner {
+        StreamInner::StringInput {
+            position: pos,
+            end,
+            unread,
+            ..
+        } => {
+            *pos = *end;
+            *unread = None;
+            Ok(T)
+        }
+        StreamInner::FileInput {
+            file,
+            buf_pos,
+            buf_fill,
+            unread,
+            ..
+        } => {
+            *buf_pos = 0;
+            *buf_fill = 0;
+            *unread = None;
+            file.seek(std::io::SeekFrom::End(0))
+                .map_err(|e| BlissError::StreamError(format!("set-file-position error: {}", e)))?;
+            Ok(T)
+        }
+        StreamInner::FileOutput {
+            file, write_buf, ..
+        } => {
+            file_flush_write_buf(file, write_buf)?;
+            file.seek(std::io::SeekFrom::End(0))
+                .map_err(|e| BlissError::StreamError(format!("set-file-position error: {}", e)))?;
+            Ok(T)
+        }
+        StreamInner::FileIo {
+            file,
+            buf_pos,
+            buf_fill,
+            write_buf,
+            unread,
+            ..
+        } => {
+            file_flush_write_buf(file, write_buf)?;
+            *buf_pos = 0;
+            *buf_fill = 0;
+            *unread = None;
+            file.seek(std::io::SeekFrom::End(0))
+                .map_err(|e| BlissError::StreamError(format!("set-file-position error: {}", e)))?;
+            Ok(T)
+        }
+        // A string-output stream is always logically at its end.
+        StreamInner::StringOutput { .. } => Ok(T),
+        StreamInner::Synonym => {
+            let target = resolve_synonym(comps[0])?;
+            set_file_position_to_end(target)
         }
         _ => Ok(NIL),
     }

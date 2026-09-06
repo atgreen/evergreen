@@ -13897,6 +13897,39 @@ fn eval_list(form: BlissVal, env: &mut Env) -> Result<BlissVal, BlissError> {
                 let stream = eval_form(args[0], env)?;
                 return bliss_stdlib::file_length_fn(stream);
             }
+            "FILE-POSITION" => {
+                // (file-position stream) => current position, or NIL if unknown.
+                // (file-position stream spec) => set position; T on success, NIL
+                // if not positionable. spec is an integer, :START (=0), or :END.
+                // Delegates all per-stream logic to bliss-stdlib (R5.124).
+                let args = list_to_vec(cdr);
+                if args.is_empty() {
+                    return Err(BlissError::Internal(
+                        "FILE-POSITION requires a stream".into(),
+                    ));
+                }
+                let stream = eval_form(args[0], env)?;
+                if args.len() < 2 {
+                    return bliss_stdlib::file_position(stream);
+                }
+                // Root the stream across evaluating the position spec — that eval
+                // can allocate and fire a relocating minor GC (GC-safety).
+                bliss_rt::rooted!(stream = stream);
+                let spec = eval_form(args[1], env)?;
+                if spec.is_symbol() {
+                    match symbol_bare_name(&sym_name(spec)).as_str() {
+                        "END" => return bliss_stdlib::set_file_position_to_end(*stream),
+                        "START" => {
+                            return bliss_stdlib::set_file_position(
+                                *stream,
+                                BlissVal::from_fixnum(0),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                return bliss_stdlib::set_file_position(*stream, spec);
+            }
             "SAVE-IMAGE" => {
                 let (path_form, _) = cp(cdr);
                 let path_val = eval_form(path_form, env)?;
@@ -22123,7 +22156,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "SCALE-FLOAT" | "DECODE-FLOAT" | "INTEGER-DECODE-FLOAT"
             | "READ-FROM-STRING" | "FORMAT" | "PRIN1-TO-STRING" | "PRINC-TO-STRING"
             | "WRITE-TO-STRING" | "FORCE-OUTPUT" | "FINISH-OUTPUT" | "CLEAR-OUTPUT"
-            | "FILE-LENGTH" | "READ-SEQUENCE" | "WRITE-SEQUENCE"
+            | "FILE-LENGTH" | "FILE-POSITION" | "READ-SEQUENCE" | "WRITE-SEQUENCE"
             // Misc
             | "ERROR" | "WARN" | "SIGNAL" | "CERROR" | "MAKE-CONDITION" | "MUFFLE-WARNING"
             | "INVOKE-RESTART" | "FIND-RESTART" | "COMPUTE-RESTARTS" | "ABORT" | "CONTINUE"

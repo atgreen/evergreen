@@ -2625,3 +2625,32 @@ fn quasiquote_template_expands_only_unquotes_not_data() {
         "(DEFVAR 99 0)"
     );
 }
+
+#[test]
+fn file_position_query_and_set_on_streams() {
+    // R5.124: FILE-POSITION was undefined at the CL level even though the stdlib
+    // implemented it (bliss-51f3 follow-up). The builtin now delegates to
+    // bliss-stdlib for both the query and the (setf) forms, incl. :START/:END.
+    assert_eq!(eval_ok("(fboundp 'file-position)"), "T");
+    // Query advances with reads.
+    assert_eq!(
+        eval_ok("(with-input-from-string (s \"abc\") (read-char s) (read-char s) (file-position s))"),
+        "2"
+    );
+    // Integer set returns T and repositions; :START and :END designators work.
+    assert_eq!(
+        eval_ok(
+            "(let ((s (make-string-input-stream \"0123456789\"))) \
+               (list (file-position s 5) (read-char s) (file-position s :start) (read-char s) \
+                     (file-position s :end) (file-position s)))"
+        ),
+        "(T #\\5 T #\\0 T 10)"
+    );
+    // File streams: seek then read.
+    assert_eq!(
+        eval_ok(
+            "(with-input-from-string (s \"hello world\") (file-position s 6) (read s))"
+        ),
+        "WORLD"
+    );
+}
