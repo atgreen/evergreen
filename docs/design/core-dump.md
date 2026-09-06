@@ -152,6 +152,51 @@ Blocker found (a symbol-registry rebuild attempt SIGSEGV'd and was reverted):
   heap section format and several §7 tests, so it is its own focused change and
   the prerequisite for M2's registry rebuild, M3, and M4.
 
+## M2 done + the reframing that shrinks M3 (discovered while wiring the host hook)
+
+Committed since the blocker note above:
+- **Per-object relocation map** (8ee6282): `serialize_heap_objects` prepends each
+  record with its OLD body address; `restore_heap` builds `old_body → new_body`
+  and remaps every pointer field tag-aware (`remap_saved_pointer`). Replaces the
+  uniform-delta relocation the blocker identified as unsound.
+- **Symbol registry cross-process rebuild** (8ee6282): `symbols::restore_objects`
+  re-indexes the RESTORED symbol objects; **value cells survive** (test:
+  `symbol_value` → 42 after reload).
+- **Package registry cross-process rebuild** (2985bf2): mirrors symbols;
+  off-heap `lock` reset; type-checked registry guards.
+- **HostRegistries section + hook** (b47dd86): `set_host_registry_hooks`; a
+  section written from the serialize hook and restored LAST (after
+  heap/symbols/packages) so the hook can `remap_saved_pointer` its saved
+  pointers. Dummy round-trip test proves the plumbing + remap.
+
+**The reframing.** The bug (`*OPERATIONS* is unbound` from a saved image) is a
+non-serializable global *value* — a hash-table. That value is a heap object
+reachable from the symbol's **value cell**. Both now round-trip: `restore_heap`
+re-materializes the hash-table, `restore_symbols` rebuilds the value cell pointing
+at it (remapped). **So the heap snapshot already closes the actual gap** — the
+thing the source-form path structurally could not do. The remaining registries
+(`GLOBAL_MACROS`, `GLOBAL_SETF_FNS`, `CLOS_STATE`) are Rust-side *code* tables,
+not on the heap; they are what the host hook must carry.
+
+**Consequence for M3 — one world, not two.** A core image restores the heap
+wholesale; it must NOT also *replay source-form load actions*, because replaying
+`(defmacro …)`/`(defun …)` RE-ALLOCATES bodies on the fresh heap and diverges
+from the snapshot. So the core-format path is pure heap-snapshot: heap + symbols +
+packages + host-registry section. The existing `build_image_from_runtime`
+source-form path stays as the *legacy* format (selectable), not mixed in.
+
+**`captured_frame` resolution (the earlier worry).** `MacroDef.captured_frame`
+is a Rust-side `Rc<RefCell<EnvFrame>>`, not a heap value, so it cannot be a
+remapped pointer. For **global** (top-level `defmacro`) macros the captured frame
+is just the root env shell — global bindings resolve through the symbol registry,
+not the frame. So the host hook serializes only `(name, params_form, body)` with
+pointers remapped on restore; `bytecode = None` (recompile on demand). The
+restore hook cannot see the fresh interpreter's root frame (it runs inside
+`load_image`), so it **stashes the remapped records in a thread-local pending
+buffer**; the CLI drains that buffer right after it builds the top-level `Env`,
+constructing each `MacroDef` with `captured_frame = the fresh root frame`. Same
+shape for `GLOBAL_SETF_FNS` (a `FunDef`) and for CLOS tables.
+
 ## Risks / open points
 
 - **Fixed-base availability.** MAP_FIXED_NOREPLACE can fail under ASLR; the delta
