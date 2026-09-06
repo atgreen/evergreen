@@ -75,9 +75,11 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
     save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
     let header = validate_image_header(path.to_str().unwrap()).expect("validate header");
     assert_eq!(header.entry_continuation, entry.to_raw());
+    // Per-object record is [old_body u64][type u8][size u32][data] = 8+1+4+size
+    // (bliss-x0f2 M2.0 added the old-body address); plus the 8-byte entry word.
     assert_eq!(
         header.heap_size,
-        8 + (1 + 4 + 4) as u64 + (1 + 4 + 5) as u64
+        8 + (8 + 1 + 4 + 4) as u64 + (8 + 1 + 4 + 5) as u64
     );
 
     init_test_heap();
@@ -94,6 +96,42 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
         restored_objects
             .iter()
             .any(|(_, t, data)| *t == 0x62 && data == &vec![5, 6, 7, 8, 9])
+    );
+}
+
+#[test]
+fn spec_image_round_trip_rebuilds_symbol_registry_cross_process() {
+    // bliss-x0f2 M2: a fresh process (re-inited heap) has an empty symbol
+    // registry. After an image load, restore_symbols rebuilds the registry to
+    // index the RESTORED symbol objects (addresses remapped via the per-object
+    // old→new map), so the symbol resolves by name and its value cell survives.
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_test_heap();
+    let idx = bliss_rt::symbols::intern("COREDUMP-RT-SYM");
+    bliss_rt::symbols::set_symbol_value(idx, BlissVal::from_fixnum(42));
+    set_entry_continuation(BlissVal::from_fixnum(1));
+
+    let path = temp_path("symbols.bimg");
+    let _ = fs::remove_file(&path);
+    save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
+
+    init_test_heap();
+    load_image(path.to_str().unwrap()).expect("load_image");
+
+    assert_eq!(
+        bliss_rt::symbols::find_index("COREDUMP-RT-SYM"),
+        Some(idx),
+        "symbol must resolve by name after cross-process image load"
+    );
+    assert_eq!(
+        bliss_rt::symbols::symbol_name(idx).as_deref(),
+        Some("COREDUMP-RT-SYM"),
+        "symbol name (relocated name string) must be readable after load"
+    );
+    assert_eq!(
+        bliss_rt::symbols::symbol_value(idx),
+        Some(BlissVal::from_fixnum(42)),
+        "symbol value cell (in the relocated object) must survive the load"
     );
 }
 

@@ -447,6 +447,102 @@ fn decode_names(data: &[u8]) -> Result<Vec<String>, BlissError> {
     Ok(names)
 }
 
+// ── Cross-process image serialization (bliss-x0f2) ──────────────────────────
+//
+// Unlike `serialize`/`restore` (names + re-intern), these save the registry
+// MAPPING (index → object address). The symbol objects themselves ride in the
+// heap image section and are restored + remapped there; `restore_objects` then
+// rebuilds the registry to index those RESTORED objects — remapping each saved
+// address through the heap's per-object old→new map (`gc::remap_saved_pointer`),
+// NOT a uniform delta — so each symbol keeps its heap identity and cells.
+
+/// `[interned u32][obj_raw u64]*[uninterned u32][(idx u32, obj_raw u64)]*`.
+pub fn serialize_objects() -> Vec<u8> {
+    let mut buf = Vec::new();
+    with_registry(|reg| {
+        let Some(reg) = reg else {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            return;
+        };
+        buf.extend_from_slice(&(reg.interned.len() as u32).to_le_bytes());
+        for &obj in &reg.interned {
+            buf.extend_from_slice(&obj.to_raw().to_le_bytes());
+        }
+        buf.extend_from_slice(&(reg.uninterned.len() as u32).to_le_bytes());
+        for (&idx, &obj) in &reg.uninterned {
+            buf.extend_from_slice(&idx.to_le_bytes());
+            buf.extend_from_slice(&obj.to_raw().to_le_bytes());
+        }
+    });
+    buf
+}
+
+/// Rebuild the registry from [`serialize_objects`] output, remapping each object
+/// address through the restore_heap old→new map and re-pinning restored regions.
+pub fn restore_objects(data: &[u8]) -> Result<(), BlissError> {
+    let remap = |raw: u64| BlissVal::from_raw(crate::gc::remap_saved_pointer(raw));
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, n: usize| -> Result<&[u8], BlissError> {
+        let end = pos
+            .checked_add(n)
+            .filter(|&e| e <= data.len())
+            .ok_or_else(|| BlissError::Internal("truncated symbol-object image section".into()))?;
+        let s = &data[*pos..end];
+        *pos = end;
+        Ok(s)
+    };
+    let n_interned = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+    let mut interned: Vec<BlissVal> = Vec::with_capacity(n_interned);
+    for _ in 0..n_interned {
+        let raw = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+        interned.push(remap(raw));
+    }
+    let n_un = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()) as usize;
+    let mut uninterned: HashMap<u32, BlissVal> = HashMap::with_capacity(n_un);
+    for _ in 0..n_un {
+        let idx = u32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap());
+        let raw = u64::from_le_bytes(take(&mut pos, 8)?.try_into().unwrap());
+        uninterned.insert(idx, remap(raw));
+    }
+
+    // Read names + re-pin BEFORE taking the registry write lock (lock ordering:
+    // the heap lock is below the registry lock).
+    let mut name_to_index: HashMap<String, u32> = HashMap::with_capacity(interned.len());
+    let mut index_to_key: Vec<String> = Vec::with_capacity(interned.len());
+    for (i, &obj) in interned.iter().enumerate() {
+        let untagged = (obj.to_raw() & !crate::value::TAG_MASK) as usize;
+        // A registry entry whose remapped object is not in the current heap is a
+        // dangling reference (e.g. a symbol from an earlier heap not present in
+        // this image); keep its slot to preserve dense indices, but never
+        // dereference it. Real images map every registry symbol.
+        if !crate::gc::is_in_heap(untagged) {
+            index_to_key.push(String::new());
+            continue;
+        }
+        // SAFETY: `obj` is a restored, remapped, in-heap pinned symbol object.
+        let name = unsafe { (*symbol_data(obj)).name }.as_string();
+        name_to_index.insert(name.clone(), i as u32);
+        index_to_key.push(name);
+        crate::gc::pin_region_containing(untagged);
+        let name_obj = unsafe { (*symbol_data(obj)).name };
+        crate::gc::pin_region_containing((name_obj.to_raw() & !crate::value::TAG_MASK) as usize);
+    }
+    for &obj in uninterned.values() {
+        let untagged = (obj.to_raw() & !crate::value::TAG_MASK) as usize;
+        if crate::gc::is_in_heap(untagged) {
+            crate::gc::pin_region_containing(untagged);
+        }
+    }
+    with_registry_mut(|reg| {
+        reg.interned = interned;
+        reg.uninterned = uninterned;
+        reg.name_to_index = name_to_index;
+        reg.index_to_key = index_to_key;
+    });
+    Ok(())
+}
+
 // ── Cell accessors (used by later staging; symbols carry their own cells) ────
 
 /// Read one of a symbol's cells by field, or `None` if the index is unknown.

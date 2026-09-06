@@ -779,19 +779,12 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
             ));
         }
 
-        // Apply pointer relocations if the current heap base differs
-        // from the original base recorded in the header (R7.03).
-        let current_base = crate::gc::heap_base_address();
-        if current_base != 0 && header.original_base != 0 && current_base != header.original_base {
-            let delta = current_base as i64 - header.original_base as i64;
-            // Apply relocations to the object data portion (after the 8-byte entry continuation).
-            if heap_bytes.len() > 8 {
-                crate::gc::apply_relocations(&mut heap_bytes[8..], &reloc_data, delta)?;
-            }
-        }
-
-        // Restore heap objects (bytes after the entry continuation word)
-        // into the GC subsystem so they are accessible at runtime.
+        // Restore heap objects (bytes after the entry continuation word).
+        // restore_heap now relocates every pointer field per-object via the
+        // old→new map it builds while materializing, so no separate uniform-delta
+        // apply_relocations pass is needed (bliss-x0f2 M2.0); `reloc_data` is
+        // retained in the format but unused here.
+        let _ = &reloc_data;
         let object_data = &heap_bytes[8..];
         if !object_data.is_empty() {
             crate::gc::restore_heap(object_data)?;
@@ -826,8 +819,9 @@ pub fn load_image(path: &str) -> Result<BlissVal, BlissError> {
         crate::gc::restore_gc_metadata(&gc_meta_bytes)?;
     }
 
-    // Store the restored entry continuation so the runtime can retrieve it.
-    let entry_cont = BlissVal::from_raw(header.entry_continuation);
+    // Store the restored entry continuation, remapped through the heap's old→new
+    // map (it is itself a saved pointer into the relocated heap).
+    let entry_cont = BlissVal::from_raw(crate::gc::remap_saved_pointer(header.entry_continuation));
     crate::gc::set_entry_continuation(entry_cont);
 
     Ok(entry_cont)

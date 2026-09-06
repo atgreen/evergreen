@@ -4814,11 +4814,13 @@ fn clear_heap_objects(state: &mut HeapState) {
     state.stats.regions_free = state.regions.len() as u32;
 }
 
+/// Append one restored object and return its new BODY address (header +
+/// header_size), so the image loader can build an old→new relocation map.
 fn append_serialized_object(
     state: &mut HeapState,
     type_id: u8,
     body: &[u8],
-) -> Result<(), BlissError> {
+) -> Result<usize, BlissError> {
     let (total_size, _) = object_footprint(body.len());
     let region_limit = state.config.region_size / 2;
     let desired_kind = if total_size > region_limit {
@@ -4854,7 +4856,7 @@ fn append_serialized_object(
     let idx = target_idx.ok_or(BlissError::Oom)?;
     let region = &mut state.regions[idx];
     let header_ptr = region.header.alloc_top;
-    unsafe {
+    let body_addr = unsafe {
         let body_off = write_object_header(header_ptr, type_id, body.len() as u32);
         std::ptr::copy_nonoverlapping(body.as_ptr(), header_ptr.add(body_off), body.len());
         if total_size > body_off + body.len() {
@@ -4864,7 +4866,8 @@ fn append_serialized_object(
                 total_size - body_off - body.len(),
             );
         }
-    }
+        header_ptr.add(body_off) as usize
+    };
     region.header.alloc_top = unsafe { region.header.alloc_top.add(total_size) };
     region.header.live_bytes = region.header.live_bytes.saturating_add(total_size as u32);
 
@@ -4874,7 +4877,7 @@ fn append_serialized_object(
         _ => {}
     }
     state.stats.bytes_allocated += total_size as u64;
-    Ok(())
+    Ok(body_addr)
 }
 
 pub fn record_object(type_id: u8, data: Vec<u8>) {
@@ -4902,9 +4905,14 @@ pub fn full_gc() -> Result<(), BlissError> {
     collector.full_gc()
 }
 
+/// Per-object record: `[old_body u64][type_id u8][size u32][body bytes]`. The old
+/// body address lets the loader build an old→new map so pointers relocate
+/// per-object (not by a single uniform delta, which only worked when the restored
+/// heap reproduced the saved layout exactly — bliss-x0f2 M2.0).
 pub fn serialize_heap_objects() -> Vec<u8> {
     let mut out = Vec::new();
     let _ = walk_heap(|ptr, type_id, size| {
+        out.extend_from_slice(&(ptr as u64).to_le_bytes());
         out.push(type_id);
         out.extend_from_slice(&(size as u32).to_le_bytes());
         let data = unsafe { std::slice::from_raw_parts(ptr, size) };
@@ -4914,6 +4922,46 @@ pub fn serialize_heap_objects() -> Vec<u8> {
     out
 }
 
+/// The old→new object-body map from the most recent [`restore_heap`], consulted
+/// by registry restores (symbols/packages) to remap their saved object addresses.
+static RELOC_MAP: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Remap one saved pointer value through the last restore's old→new map,
+/// tag-aware: a cons ref (|001) points at the body; a heap-object/function ref
+/// (|010/|110) at the header; a bare value at the body. Unmapped or non-pointer
+/// values pass through. Registry restores use this for their saved `BlissVal`s.
+pub fn remap_saved_pointer(raw: u64) -> u64 {
+    let guard = RELOC_MAP.lock().unwrap();
+    match guard.as_ref() {
+        Some(map) => remap_pointer_with(map, raw),
+        None => raw,
+    }
+}
+
+fn remap_pointer_with(map: &std::collections::HashMap<usize, usize>, raw: u64) -> u64 {
+    use crate::value::{TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK};
+    let tag = raw & TAG_MASK;
+    match tag {
+        TAG_CONS => match map.get(&((raw & !TAG_MASK) as usize)) {
+            Some(&new_body) => (new_body as u64) | TAG_CONS,
+            None => raw,
+        },
+        TAG_HEAP_OBJECT | TAG_FUNCTION => {
+            let old_body = (raw & !TAG_MASK) as usize + OBJECT_HEADER_SIZE;
+            match map.get(&old_body) {
+                Some(&new_body) => ((new_body - OBJECT_HEADER_SIZE) as u64) | tag,
+                None => raw,
+            }
+        }
+        0 => match map.get(&(raw as usize)) {
+            Some(&new_body) => new_body as u64,
+            None => raw,
+        },
+        _ => raw,
+    }
+}
+
 pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
     let mut guard = heap_state().lock().unwrap();
     let state = guard
@@ -4921,46 +4969,82 @@ pub fn restore_heap(data: &[u8]) -> Result<(), BlissError> {
         .ok_or_else(|| BlissError::Internal("heap not initialized".into()))?;
     clear_heap_objects(state);
 
+    // Pass 1: materialize every object, recording old-body → new-body.
+    let mut map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut offset = 0usize;
     while offset < data.len() {
-        if data.len() - offset < 5 {
+        if data.len() - offset < 13 {
             return Err(BlissError::InvalidImage(
                 "truncated heap object record".into(),
             ));
         }
+        let old_body = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
         let type_id = data[offset];
         offset += 1;
-        let size = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as usize;
+        let size =
+            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if data.len() - offset < size {
             return Err(BlissError::InvalidImage(
                 "truncated heap object payload".into(),
             ));
         }
-        append_serialized_object(state, type_id, &data[offset..offset + size])?;
+        let new_body = append_serialized_object(state, type_id, &data[offset..offset + size])?;
+        map.insert(old_body, new_body);
         offset += size;
     }
+
+    // Pass 2: remap every pointer field of every restored object via the map.
+    for &new_body in map.values() {
+        let header = (new_body - OBJECT_HEADER_SIZE) as *const u8;
+        let (_type_id, body_size) = unsafe { read_object_header(header) };
+        let mut fo = 0usize;
+        while fo + 8 <= body_size as usize {
+            let field = unsafe { (new_body as *mut u8).add(fo) as *mut u64 };
+            let raw = unsafe { std::ptr::read_unaligned(field) };
+            let new_raw = remap_pointer_with(&map, raw);
+            if new_raw != raw {
+                unsafe { std::ptr::write_unaligned(field, new_raw) };
+            }
+            fo += 8;
+        }
+    }
+
+    *RELOC_MAP.lock().unwrap() = Some(map);
     Ok(())
 }
 
 // A whole-heap image (§7) already snapshots the SymbolData/PackageData objects
-// themselves — they live on the GC heap and are restored in place — and the
-// process-local registry (a Rust-side index → pinned-object map) survives an
-// in-process round-trip unchanged. So the image path must NOT re-serialize and
-// re-intern the registry: doing so allocates fresh symbols into the just-
-// restored heap and corrupts it. Portable, cross-process symbol identity (e.g.
-// for .bfasl) uses `crate::symbols::serialize`/`restore` directly instead.
-pub fn serialize_symbols() -> Vec<u8> {
-    Vec::new()
+// Cross-process image restore rebuilds the Rust-side symbol registry to index the
+// RESTORED symbol objects, remapping each saved object address through the
+// restore_heap old→new map (bliss-x0f2 M2). The objects (with their cells) ride
+// in the heap section; this only re-establishes the index→object mapping and
+// re-pins the immortal symbol/name regions in the fresh process.
+
+/// Mark the region containing `addr` as a pinned host so restored immortal
+/// objects (symbols and their name strings) are never reclaimed or relocated in
+/// the fresh process. No-op outside the heap.
+pub fn pin_region_containing(addr: usize) {
+    let mut guard = heap_state().lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        let base = state.heap_base as usize;
+        if addr < base || addr >= base + state.config.heap_size {
+            return;
+        }
+        let idx = (addr - base) / state.config.region_size;
+        if idx < state.regions.len() {
+            state.pinned_hosts.insert(idx);
+        }
+    }
 }
 
-pub fn restore_symbols(_data: &[u8]) -> Result<(), BlissError> {
-    Ok(())
+pub fn serialize_symbols() -> Vec<u8> {
+    crate::symbols::serialize_objects()
+}
+
+pub fn restore_symbols(data: &[u8]) -> Result<(), BlissError> {
+    crate::symbols::restore_objects(data)
 }
 
 pub fn serialize_packages() -> Vec<u8> {
@@ -4985,6 +5069,21 @@ pub fn heap_base_address() -> u64 {
     guard
         .as_ref()
         .map_or(0, |state| state.heap_base as usize as u64)
+}
+
+/// Whether `addr` lies within the current managed heap span. Registry restores
+/// use this to skip dangling addresses (e.g. a symbol left in the global registry
+/// by an earlier heap that this fresh heap does not contain) before dereferencing
+/// them — dereferencing an address outside the live mmap would fault.
+pub fn is_in_heap(addr: usize) -> bool {
+    let guard = heap_state().lock().unwrap();
+    match guard.as_ref() {
+        Some(state) => {
+            let base = state.heap_base as usize;
+            addr >= base && addr < base + state.config.heap_size
+        }
+        None => false,
+    }
 }
 
 pub fn gc_generation() -> u32 {
