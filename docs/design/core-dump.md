@@ -245,6 +245,48 @@ Recommended first done-signal for M3 (smaller than the ASDF goal): a
 fresh process, with the hash-table readable — proves the whole-heap snapshot +
 symbol-value-cell restore end-to-end before tackling ASDF.
 
+## M3/M4 LANDED + the two concrete remaining blockers (a0573b1)
+
+The save/load/executable machinery is implemented and proven cross-process
+(including under `BLISS_GC_STRESS`+`POISON`) for heap-resident, non-CLOS values:
+
+- **`%save-core path [:executable t]`** — compacting `full_gc`, `save_image`, exit.
+  `:executable t` appends the core to a runtime copy (existing `BLISSEXE` wrap).
+- **`--image` / appended-image fast path** — a `BLISSIMG`-magic image is restored
+  into a fresh runtime BEFORE bootstrap (`load_core_image_bytes`), then bootstrap
+  and the source-form image paths are skipped.
+- **`restore_heap` pins every restored object** (immortal base world; a minor GC
+  must not relocate it out from under the rebuilt registries / RELOC_MAP).
+- **Streams are skipped by `serialize_heap_objects`** and re-opened on load — a
+  pinned nursery region is marked live wholesale, so a restored STREAM (whose GC
+  trace derefs a process-local, now-freed Rust block) would fault when traced.
+- **`global_macro_insert` installs the evaluator global-root scanner** so a source
+  DEFMACRO body survives the save-time `full_gc`.
+
+Verified round-trip (defvar values, lists, defun, symbols, packages, PRINT) both
+non-stress and under GC stress; M4 standalone executable restores its world.
+
+Two well-scoped blockers remain before the ASDF done-signal, each found by an
+actual crash backtrace, each with a filed bead:
+
+1. **CLOS_STATE restoration (bliss-x0f2.7).** After a core load, macro expansion
+   builds a fresh `Env` → `initialize_condition_runtime_support` → `class_of` →
+   null, because `bliss-stdlib::clos::CLOS_STATE` (class_registry, class_meta,
+   generic_functions, method_meta, effective/short-form methods, structure_classes,
+   the built-in class values, counters) is NOT serialized — bootstrap, which
+   normally populates it, is skipped on a core load. This is a large structure;
+   serializing it needs the same host-hook + remap treatment as macros/setf, plus
+   restoring CLOS instances' wrapper/`class_of` (instances are STANDARD_OBJECT heap
+   objects discriminated via a live-instance mechanism). Blocks all macro/condition/
+   CLOS use in a core, hence ASDF.
+2. **Off-heap-body VALUE objects (new bead).** Hash-tables (type 0x0C) box their
+   body off the GC heap; the restored heap object holds a freed process-local Box
+   pointer, so a *use* (gethash) faults cross-process (their GC trace visits
+   nothing, so unlike streams they do NOT fault during tracing — only on use).
+   ASDF's `*OPERATIONS*`/`*DEFINED-SYSTEMS*` are hash-tables, so this is required
+   too. Approach: serialize off-heap bodies via their live registries; re-Box +
+   re-register + remap keys/values on restore.
+
 ## Risks / open points
 
 - **Fixed-base availability.** MAP_FIXED_NOREPLACE can fail under ASLR; the delta
